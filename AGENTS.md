@@ -715,3 +715,38 @@ Stack for the new repo is not yet locked. Consider:
 | 10 | **`promotionEvaluationStatus: needs_human_review`** | Design choice | Catalog search always returns `needs_human_review` for promo pricing. The bot should use `evaluate-cart` for accurate pricing and still handle `needs_human_review` gracefully. |
 | 11 | **WhatsApp message cost** | Low risk | Service conversations (user-initiated) are free within 24h window. Marketing templates ~$0.04 USD/msg MX. Keep bot reactive, not proactive, to control costs. |
 | 12 | **Receipt image hosting** | Design decision | `attachReceipt` expects a `mediaUrl`. The chatbot needs to either: (a) host the WhatsApp-received image and provide a URL, or (b) use the Meta media download URL directly. Consider URL expiration. |
+
+---
+
+## 12. Session Log — Latest Decisions (2026-06-22)
+
+> Appended after the seed was first generated. These decisions are program-critical and supersede any earlier assumptions.
+
+### 12.1 Meta App & Test Number
+
+- The Meta Developer Console **app is already created** by the owner.
+- **Plan**: Use the **free Meta test number** (Dashboard → WhatsApp → API Setup) to build and validate the bot NOW, in development mode (sends to up to 5 verified recipients, temporary 24h token). This unblocks development without waiting for business verification.
+- **Business verification** runs in parallel via Business Manager → Security Center → Start Verification. Mexico document checklist was prepared and a client-facing message (Spanish) requesting documents was drafted/sent.
+
+### 12.2 Existing Number — Migration Decision (IMPORTANT, corrects earlier assumption)
+
+Earlier it was assumed a brand-new number from scratch was MANDATORY. **That is not accurate.** The facts and the resulting decision:
+
+- **A number lives in only ONE WhatsApp surface at a time**: the WhatsApp Business App OR the Cloud API — not both. Migrating the client's existing number to the Cloud API **removes it from the WhatsApp Business App** (all traffic then flows through the bot/API).
+- **Conversations (chat history) do NOT migrate to the Cloud API.** The API only sees messages from registration onward. History can only be exported per-chat (manual, not bulk) and/or backed up (Google Drive/iCloud) as a read-only record — it cannot be imported into the bot.
+- **Contacts ARE preservable**: they live in the device address book, not in WhatsApp. Export to CSV/vCard (Google Contacts / iCloud) and load later (maps to the `Customer` model).
+
+**DECISION — phased approach:**
+1. Build/validate the entire bot on the **test number**; do NOT touch the client's live number yet.
+2. Defer the real-number choice (migrate existing number vs. use a new dedicated number) until the bot **and** human-handoff are production-ready, then do a planned cutover with a full backup beforehand.
+3. Meanwhile, the client should **export contacts** (CSV/vCard) and **back up conversations** now, so they are covered for either path.
+
+The client was informed in simple terms: **contacts are guaranteed, conversations are backed up (not inside the bot), and the number is decided without rush once the bot works.**
+
+### 12.3 Backend State Reminder
+
+- `houndfe-backend` `main` is **8 commits ahead of origin** (tech-debt cleanup W-001/W-002/S-001/S-002/S-003 merged locally). The owner must `git push origin main` when SSH/gh credentials are available in the environment. Engram observation: `bug/cleaned-chatbot-api-tech-debt-...` (#2385).
+
+### 12.4 Separate Workstream (NOT part of this chatbot repo)
+
+- A parallel effort is remodeling the POS **product creation form** (in `houndfe-backend` + `frontend-houndfe`). A full form spec was produced at `frontend-houndfe/docs/product-creation-form-spec.md` (Engram topic `products/create-form-spec`). This is unrelated to the chatbot program and does not affect `houndfe-chatbot`.
