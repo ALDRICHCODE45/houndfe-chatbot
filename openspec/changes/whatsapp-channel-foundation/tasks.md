@@ -30,15 +30,15 @@ Chain strategy: N/A
 
 ## Phase 1: Config Foundation
 
-- [ ] 1.1 Install dependencies: `pnpm add @nestjs/config @nestjs/axios axios joi`
-- [ ] 1.2 TEST: Create `src/config/env.validation.spec.ts` — assert Joi schema rejects missing `META_VERIFY_TOKEN`
-- [ ] 1.3 TEST: Assert schema rejects invalid `CHATBOT_API_BASE_URL` (non-URL)
-- [ ] 1.4 TEST: Assert schema rejects `SERVICE_KEY` not starting with `svc_`
-- [ ] 1.5 CODE: Create `src/config/env.validation.ts` with Joi schema for all required env vars
-- [ ] 1.6 CODE: Create `src/config/configuration.ts` typed config factory
-- [ ] 1.7 CODE: Create `src/config/config.module.ts` importing `@nestjs/config` with validation
-- [ ] 1.8 TEST: Integration test — ConfigService returns typed values when env is valid
-- [ ] 1.9 TEST: Integration test — app refuses to start with missing env (expect boot error)
+- [x] 1.1 Install dependencies: `pnpm add @nestjs/config @nestjs/axios axios joi`
+- [x] 1.2 TEST: Create `src/config/env.validation.spec.ts` — assert Joi schema rejects missing `META_VERIFY_TOKEN`
+- [x] 1.3 TEST: Assert schema rejects invalid `CHATBOT_API_BASE_URL` (non-URL)
+- [x] 1.4 TEST: Assert schema rejects `SERVICE_KEY` not starting with `svc_`
+- [x] 1.5 CODE: Create `src/config/env.validation.ts` with Joi schema for all required env vars
+- [x] 1.6 CODE: Create `src/config/configuration.ts` typed config factory
+- [x] 1.7 CODE: Create `src/config/config.module.ts` importing `@nestjs/config` with validation
+- [x] 1.8 TEST: Integration test — ConfigService returns typed values when env is valid
+- [x] 1.9 TEST: Integration test — app refuses to start with missing env (expect boot error)
 
 ## Phase 2: Conversation Store
 
