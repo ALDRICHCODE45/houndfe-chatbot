@@ -42,13 +42,13 @@ Chain strategy: N/A
 
 ## Phase 2: Conversation Store
 
-- [ ] 2.1 CODE: Create `src/conversation/domain/conversation-store.ts` port interface + `CONVERSATION_STORE` Symbol token
-- [ ] 2.2 CODE: Define `ConversationState` interface with `senderId`, `lastMessageAt`, `data: Record<string, unknown>`
-- [ ] 2.3 TEST: Create `src/conversation/infrastructure/in-memory-conversation.store.spec.ts` — new sender creates state
-- [ ] 2.4 TEST: Assert read unknown sender returns null
-- [ ] 2.5 TEST: Assert update existing sender patches state and preserves senderId
-- [ ] 2.6 CODE: Create `src/conversation/infrastructure/in-memory-conversation.store.ts` using `Map<string, ConversationState>`
-- [ ] 2.7 CODE: Create `src/conversation/conversation.module.ts` providing `CONVERSATION_STORE` → InMemoryConversationStore
+- [x] 2.1 CODE: Create `src/conversation/domain/conversation-store.ts` port interface + `CONVERSATION_STORE` Symbol token
+- [x] 2.2 CODE: Define `ConversationState` interface with `senderId`, `lastMessageAt`, `data: Record<string, unknown>`
+- [x] 2.3 TEST: Create `src/conversation/infrastructure/in-memory-conversation.store.spec.ts` — new sender creates state
+- [x] 2.4 TEST: Assert read unknown sender returns null
+- [x] 2.5 TEST: Assert update existing sender patches state and preserves senderId
+- [x] 2.6 CODE: Create `src/conversation/infrastructure/in-memory-conversation.store.ts` using `Map<string, ConversationState>`
+- [x] 2.7 CODE: Create `src/conversation/conversation.module.ts` providing `CONVERSATION_STORE` → InMemoryConversationStore
 
 ## Phase 3: WhatsApp Sender Port
 
