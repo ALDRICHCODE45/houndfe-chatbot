@@ -11,6 +11,7 @@ describe('envValidationSchema', () => {
     META_VERIFY_TOKEN: 'my_verify_token',
     META_APP_SECRET: 'my_app_secret',
     META_ACCESS_TOKEN: 'my_access_token',
+    META_PHONE_NUMBER_ID: '1234567890',
     CHATBOT_API_BASE_URL: 'https://api.example.com',
     SERVICE_KEY: 'svc_my_service_key',
     CHATBOT_API_BRANCH_ID: 'branch-uuid-1234',
@@ -86,6 +87,14 @@ describe('envValidationSchema', () => {
       const { error } = envValidationSchema.validate(env, { abortEarly: false });
       expect(error).toBeDefined();
       expect(error!.details.some((d) => d.path.includes('META_ACCESS_TOKEN'))).toBe(true);
+    });
+
+    it('rejects when META_PHONE_NUMBER_ID is missing', () => {
+      const env = { ...validEnv };
+      delete (env as Partial<typeof validEnv>).META_PHONE_NUMBER_ID;
+      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes('META_PHONE_NUMBER_ID'))).toBe(true);
     });
 
     it('rejects when CHATBOT_API_BRANCH_ID is missing', () => {

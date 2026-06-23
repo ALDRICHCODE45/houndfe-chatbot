@@ -52,21 +52,21 @@ Chain strategy: N/A
 
 ## Phase 3: WhatsApp Sender Port
 
-- [ ] 3.1 CODE: Create `src/whatsapp/domain/whatsapp-sender.port.ts` with `WHATSAPP_SENDER` Symbol, `OutboundText`, `SendResult`, `WhatsappSenderPort` interface
-- [ ] 3.2 CODE: Create `src/whatsapp/domain/inbound-message.ts` normalized envelope interface
-- [ ] 3.3 TEST: Create `src/whatsapp/infrastructure/meta-whatsapp.sender.spec.ts` — mock `HttpService`, assert text send produces Graph request
-- [ ] 3.4 TEST: Assert non-text payload throws `UnsupportedOutboundError`
-- [ ] 3.5 CODE: Create `src/whatsapp/infrastructure/meta-whatsapp.sender.ts` adapter implementing `WhatsappSenderPort`
-- [ ] 3.6 CODE: Inject `HttpService`, implement `sendText()` calling Meta Graph API `/messages` endpoint
+- [x] 3.1 CODE: Create `src/whatsapp/domain/whatsapp-sender.port.ts` with `WHATSAPP_SENDER` Symbol, `OutboundText`, `SendResult`, `WhatsappSenderPort` interface
+- [x] 3.2 CODE: Create `src/whatsapp/domain/inbound-message.ts` normalized envelope interface
+- [x] 3.3 TEST: Create `src/whatsapp/infrastructure/meta-whatsapp.sender.spec.ts` — mock `HttpService`, assert text send produces Graph request
+- [x] 3.4 TEST: Assert non-text payload throws `UnsupportedOutboundError`
+- [x] 3.5 CODE: Create `src/whatsapp/infrastructure/meta-whatsapp.sender.ts` adapter implementing `WhatsappSenderPort`
+- [x] 3.6 CODE: Inject `HttpService`, implement `sendText()` calling Meta Graph API `/messages` endpoint
 
 ## Phase 4: Signature Guard
 
-- [ ] 4.1 TEST: Create `src/whatsapp/presentation/signature.guard.spec.ts` — sign fixture with known appSecret, assert guard passes
-- [ ] 4.2 TEST: Assert guard rejects missing `X-Hub-Signature-256` header with 401
-- [ ] 4.3 TEST: Assert guard rejects invalid MAC with 401
-- [ ] 4.4 TEST: Assert guard uses `crypto.timingSafeEqual` for MAC comparison
-- [ ] 4.5 CODE: Create `src/whatsapp/presentation/signature.guard.ts` implementing `CanActivate`
-- [ ] 4.6 CODE: Extract `req.rawBody`, compute HMAC-SHA256 with appSecret, compare via `timingSafeEqual`
+- [x] 4.1 TEST: Create `src/whatsapp/presentation/signature.guard.spec.ts` — sign fixture with known appSecret, assert guard passes
+- [x] 4.2 TEST: Assert guard rejects missing `X-Hub-Signature-256` header with 401
+- [x] 4.3 TEST: Assert guard rejects invalid MAC with 401
+- [x] 4.4 TEST: Assert guard uses `crypto.timingSafeEqual` for MAC comparison
+- [x] 4.5 CODE: Create `src/whatsapp/presentation/signature.guard.ts` implementing `CanActivate`
+- [x] 4.6 CODE: Extract `req.rawBody`, compute HMAC-SHA256 with appSecret, compare via `timingSafeEqual`
 
 ## Phase 5: Webhook Controller
 

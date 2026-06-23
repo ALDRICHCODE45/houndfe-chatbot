@@ -17,6 +17,7 @@ describe('AppConfigModule integration', () => {
     META_VERIFY_TOKEN: 'test_verify_token',
     META_APP_SECRET: 'test_app_secret',
     META_ACCESS_TOKEN: 'test_access_token',
+    META_PHONE_NUMBER_ID: '1234567890',
     CHATBOT_API_BASE_URL: 'https://api.houndfe.com',
     SERVICE_KEY: 'svc_test_service_key',
     CHATBOT_API_BRANCH_ID: 'branch-test-uuid',
@@ -57,6 +58,10 @@ describe('AppConfigModule integration', () => {
       expect(config.get<string>('meta.verifyToken')).toBe('test_verify_token');
       expect(config.get<string>('meta.appSecret')).toBe('test_app_secret');
       expect(config.get<string>('meta.accessToken')).toBe('test_access_token');
+      expect(config.get<string>('meta.phoneNumberId')).toBe('1234567890');
+      expect(config.get<string>('meta.graphApiBaseUrl')).toBe(
+        'https://graph.facebook.com/v23.0',
+      );
       expect(config.get<string>('chatbotApi.baseUrl')).toBe('https://api.houndfe.com');
       expect(config.get<string>('chatbotApi.serviceKey')).toBe('svc_test_service_key');
       expect(config.get<string>('chatbotApi.branchId')).toBe('branch-test-uuid');
