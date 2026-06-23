@@ -1,0 +1,77 @@
+# openspec/config.yaml — SDD project config for houndfe-chatbot
+# Generated: 2026-06-23
+schema: spec-driven
+
+context: |
+  Project: houndfe-chatbot — WhatsApp AI sales chatbot (Mexico, HoundFe POS)
+  Runtime: Node.js · Framework: NestJS 11 · Language: TypeScript 5.7
+  Package manager: pnpm · Test runner: Jest 30 + @nestjs/testing + supertest
+  Architecture: NestJS feature-module (screaming layout: src/<feature>/{domain,application,infrastructure,presentation})
+  Backend API: houndfe-backend chatbot-api (Bearer svc_<key>, 9 endpoints)
+  Commit style: Conventional Commits (no AI attribution)
+
+testing:
+  strict_tdd: true
+  test_command: "pnpm test"
+  coverage_command: "pnpm test:cov"
+  e2e_command: "pnpm test:e2e"
+  unit:
+    available: true
+    tool: "Jest 30 + @nestjs/testing"
+    pattern: "**/*.spec.ts"
+  integration:
+    available: true
+    tool: "@nestjs/testing (TestingModule)"
+  e2e:
+    available: true
+    tool: "Jest + supertest (test/jest-e2e.json)"
+  coverage:
+    available: true
+    command: "pnpm test:cov"
+    directory: "coverage/"
+
+quality:
+  lint:
+    available: true
+    command: "pnpm lint"
+    tool: "ESLint 9 + typescript-eslint + eslint-plugin-prettier"
+  type_check:
+    available: true
+    command: "pnpm build"
+    tool: "tsc (via nest build)"
+  format:
+    available: true
+    command: "pnpm format"
+    tool: "Prettier 3 (singleQuote, trailingComma: all)"
+  build:
+    command: "pnpm build"
+
+rules:
+  proposal:
+    - State the WhatsApp conversation flows affected (reference R1–R16 in docs/conversation-analysis.md)
+    - Include rollback plan for risky changes
+    - Verify against chatbot-api contract in AGENTS.md before proposing new endpoint calls
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Reference backend chatbot-api endpoint numbers (4.4.x) when the spec touches API calls
+  design:
+    - Include sequence diagrams for webhook flows
+    - Document architecture decisions with rationale
+    - Respect the chatbot-is-consumer-only constraint (no direct DB writes)
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+    - Always include a task for writing/updating tests before implementation (TDD)
+  apply:
+    - Follow existing NestJS module patterns (module / controller / service / dto)
+    - tdd: true
+    - test_command: "pnpm test"
+  verify:
+    - test_command: "pnpm test"
+    - e2e_command: "pnpm test:e2e"
+    - build_command: "pnpm build"
+    - coverage_threshold: 80
+  archive:
+    - Warn before merging destructive deltas
+    - Sync with houndfe-backend Engram observations (project: houndfe-backend)
