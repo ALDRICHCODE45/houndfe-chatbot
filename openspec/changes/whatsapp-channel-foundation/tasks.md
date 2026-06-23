@@ -70,24 +70,24 @@ Chain strategy: N/A
 
 ## Phase 5: Webhook Controller
 
-- [ ] 5.1 CODE: Create `src/whatsapp/presentation/dto/webhook-verify.dto.ts` for GET query params
-- [ ] 5.2 CODE: Create `src/whatsapp/presentation/dto/webhook-event.dto.ts` for POST inbound payload
-- [ ] 5.3 TEST: Create `src/whatsapp/presentation/webhook.controller.spec.ts` (unit) — GET verify with valid token returns challenge
-- [ ] 5.4 TEST: Assert GET verify with invalid token returns 403
-- [ ] 5.5 CODE: Create `src/whatsapp/presentation/webhook.controller.ts` with `@Get('webhook')` verify method
-- [ ] 5.6 CODE: Implement `@Post('webhook')` with `@UseGuards(SignatureGuard)` annotation
-- [ ] 5.7 TEST: Integration test with supertest — GET `/webhook?hub.verify_token=valid&hub.challenge=test` returns `test`
-- [ ] 5.8 TEST: Integration test — GET with wrong token returns 403
+- [x] 5.1 CODE: Create `src/whatsapp/presentation/dto/webhook-verify.dto.ts` for GET query params
+- [x] 5.2 CODE: Create `src/whatsapp/presentation/dto/webhook-event.dto.ts` for POST inbound payload
+- [x] 5.3 TEST: Create `src/whatsapp/presentation/webhook.controller.spec.ts` (unit) — GET verify with valid token returns challenge
+- [x] 5.4 TEST: Assert GET verify with invalid token returns 403
+- [x] 5.5 CODE: Create `src/whatsapp/presentation/webhook.controller.ts` with `@Get('webhook')` verify method
+- [x] 5.6 CODE: Implement `@Post('webhook')` with `@UseGuards(SignatureGuard)` annotation
+- [x] 5.7 TEST: Integration test with supertest — GET `/webhook?hub.verify_token=valid&hub.challenge=test` returns `test`
+- [x] 5.8 TEST: Integration test — GET with wrong token returns 403
 
 ## Phase 6: Webhook Dispatcher (Echo Logic)
 
-- [ ] 6.1 TEST: Create `src/whatsapp/application/webhook-dispatcher.service.spec.ts` — mock ConversationStore and WhatsappSenderPort
-- [ ] 6.2 TEST: Assert inbound text normalizes envelope and calls sender with echo reply
-- [ ] 6.3 TEST: Assert dispatcher upserts conversation state with `lastMessageAt`
-- [ ] 6.4 CODE: Create `src/whatsapp/application/webhook-dispatcher.service.ts`
-- [ ] 6.5 CODE: Inject `CONVERSATION_STORE` and `WHATSAPP_SENDER` tokens
-- [ ] 6.6 CODE: Implement `dispatch(event)` — normalize envelope → upsert state → send echo via port
-- [ ] 6.7 CODE: Create `src/whatsapp/whatsapp.module.ts` wiring controller, guard, dispatcher, sender
+- [x] 6.1 TEST: Create `src/whatsapp/application/webhook-dispatcher.service.spec.ts` — mock ConversationStore and WhatsappSenderPort
+- [x] 6.2 TEST: Assert inbound text normalizes envelope and calls sender with echo reply
+- [x] 6.3 TEST: Assert dispatcher upserts conversation state with `lastMessageAt`
+- [x] 6.4 CODE: Create `src/whatsapp/application/webhook-dispatcher.service.ts`
+- [x] 6.5 CODE: Inject `CONVERSATION_STORE` and `WHATSAPP_SENDER` tokens
+- [x] 6.6 CODE: Implement `dispatch(event)` — normalize envelope → upsert state → send echo via port
+- [x] 6.7 CODE: Create `src/whatsapp/whatsapp.module.ts` wiring controller, guard, dispatcher, sender
 
 ## Phase 7: ChatbotApiClient
 
