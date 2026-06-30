@@ -91,28 +91,28 @@ Chain strategy: N/A
 
 ## Phase 7: ChatbotApiClient
 
-- [ ] 7.1 CODE: Create `src/chatbot-api/domain/chatbot-api.client.ts` interface with 9 typed methods (§4.4.1–4.4.9)
-- [ ] 7.2 CODE: Create `src/chatbot-api/domain/dtos/*.ts` for request/response types per AGENTS.md contract
-- [ ] 7.3 CODE: Create `src/chatbot-api/domain/errors.ts` typed errors: `AuthError`, `ForbiddenError`, `NotFoundError`, `RateLimitError`, `UpstreamError`
-- [ ] 7.4 TEST: Create `src/chatbot-api/infrastructure/chatbot-api-http.client.spec.ts` — mock axios, assert Bearer + X-Branch-Id headers
-- [ ] 7.5 TEST: Assert branch mismatch throws before sending request
-- [ ] 7.6 TEST: Assert GET retries on 5xx with exponential backoff (max 3)
-- [ ] 7.7 TEST: Assert POST does NOT retry on 5xx
-- [ ] 7.8 TEST: Assert 429 response throws `RateLimitError` with `retryAfterSeconds` from header
-- [ ] 7.9 TEST: Assert 401 → `AuthError`, 403 → `ForbiddenError`, 404 → `NotFoundError`
-- [ ] 7.10 CODE: Create `src/chatbot-api/infrastructure/chatbot-api-http.client.ts` wrapping `HttpService`
-- [ ] 7.11 CODE: Implement request interceptor injecting `Authorization: Bearer svc_<key>` + `X-Branch-Id`
-- [ ] 7.12 CODE: Implement retry logic for idempotent GETs only
-- [ ] 7.13 CODE: Implement response interceptor mapping status codes to typed errors
-- [ ] 7.14 CODE: Create `src/chatbot-api/chatbot-api.module.ts` providing `ChatbotApiClient`
+- [x] 7.1 CODE: Create `src/chatbot-api/domain/chatbot-api.client.ts` interface with 9 typed methods (§4.4.1–4.4.9)
+- [x] 7.2 CODE: Create `src/chatbot-api/domain/dtos/*.ts` for request/response types per AGENTS.md contract
+- [x] 7.3 CODE: Create `src/chatbot-api/domain/errors.ts` typed errors: `AuthError`, `ForbiddenError`, `NotFoundError`, `RateLimitError`, `UpstreamError`
+- [x] 7.4 TEST: Create `src/chatbot-api/infrastructure/chatbot-api-http.client.spec.ts` — mock axios, assert Bearer + X-Branch-Id headers
+- [x] 7.5 TEST: Assert branch mismatch throws before sending request
+- [x] 7.6 TEST: Assert GET retries on 5xx with exponential backoff (max 3)
+- [x] 7.7 TEST: Assert POST does NOT retry on 5xx
+- [x] 7.8 TEST: Assert 429 response throws `RateLimitError` with `retryAfterSeconds` from header
+- [x] 7.9 TEST: Assert 401 → `AuthError`, 403 → `ForbiddenError`, 404 → `NotFoundError`
+- [x] 7.10 CODE: Create `src/chatbot-api/infrastructure/chatbot-api-http.client.ts` wrapping `HttpService`
+- [x] 7.11 CODE: Implement request interceptor injecting `Authorization: Bearer svc_<key>` + `X-Branch-Id`
+- [x] 7.12 CODE: Implement retry logic for idempotent GETs only
+- [x] 7.13 CODE: Implement response interceptor mapping status codes to typed errors
+- [x] 7.14 CODE: Create `src/chatbot-api/chatbot-api.module.ts` providing `ChatbotApiClient`
 
 ## Phase 8: App Wiring & E2E Echo
 
-- [ ] 8.1 CODE: Modify `src/main.ts` — add `rawBody: true` to `NestFactory.create()` options
-- [ ] 8.2 CODE: Add global `ValidationPipe` with `whitelist: true, transform: true`
-- [ ] 8.3 CODE: Modify `src/app.module.ts` — import `ConfigModule`, `WhatsappModule`, `ConversationModule`, `ChatbotApiModule`
-- [ ] 8.4 TEST: Create `test/echo.e2e-spec.ts` — sign fixture inbound text with known appSecret
-- [ ] 8.5 TEST: Assert POST `/webhook` with signed payload calls sender port with echo message
-- [ ] 8.6 TEST: Mock `WHATSAPP_SENDER` in TestingModule, assert `sendText({ to: senderId, text: 'Echo: <original>' })`
-- [ ] 8.7 TEST: Assert conversation state is upserted during echo flow
-- [ ] 8.8 VERIFY: Run `pnpm test` — all tests green, coverage >= 80%
+- [x] 8.1 CODE: Modify `src/main.ts` — add `rawBody: true` to `NestFactory.create()` options
+- [x] 8.2 CODE: Add global `ValidationPipe` with `whitelist: true, transform: true`
+- [x] 8.3 CODE: Modify `src/app.module.ts` — import `ConfigModule`, `WhatsappModule`, `ConversationModule`, `ChatbotApiModule`
+- [x] 8.4 TEST: Create `test/echo.e2e-spec.ts` — sign fixture inbound text with known appSecret
+- [x] 8.5 TEST: Assert POST `/webhook` with signed payload calls sender port with echo message
+- [x] 8.6 TEST: Mock `WHATSAPP_SENDER` in TestingModule, assert `sendText({ to: senderId, text: 'Echo: <original>' })`
+- [x] 8.7 TEST: Assert conversation state is upserted during echo flow
+- [x] 8.8 VERIFY: Run `pnpm test` — all tests green, coverage >= 80%
