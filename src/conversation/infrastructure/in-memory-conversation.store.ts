@@ -38,10 +38,20 @@ export class InMemoryConversationStore implements ConversationStore {
     // and is what the dispatcher / agent runner rely on so that one
     // write path handles both first contact and follow-ups.
     const existing = this.map.get(senderId);
-    const updated: ConversationState = existing
-      ? { ...existing, ...patch }
-      : { senderId, ...patch };
-    this.map.set(senderId, updated);
-    return updated;
+    const merged = existing ? { ...existing, ...patch } : { senderId, ...patch };
+    // Re-assert required fields after merge; the caller is responsible
+    // for supplying lastMessageAt (the dispatcher / runner always do).
+    if (typeof merged.lastMessageAt !== 'string') {
+      throw new Error(
+        `ConversationStore.update requires lastMessageAt for senderId: ${senderId}`,
+      );
+    }
+    const finalState: ConversationState = {
+      senderId: merged.senderId,
+      lastMessageAt: merged.lastMessageAt,
+      data: merged.data ?? {},
+    };
+    this.map.set(senderId, finalState);
+    return finalState;
   }
 }
