@@ -6,9 +6,12 @@ import { CostGuardService } from './application/cost-guard.service';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { TOOL_REGISTRY } from './domain/tool-registry.port';
 import { InMemoryToolRegistry } from './infrastructure/in-memory-tool-registry';
-import { GENERATE_TEXT } from './infrastructure/generate-text.provider';
+import {
+  GENERATE_TEXT,
+  generateTextImpl,
+  type GenerateTextFn,
+} from './infrastructure/generate-text.provider';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
-import { generateText } from 'ai';
 
 /**
  * LlmAgentModule
@@ -16,7 +19,7 @@ import { generateText } from 'ai';
  * Wires the LLM agent feature:
  *   - LLM_AGENT  → VercelAiLlmAgent (calls the SDK via the GENERATE_TEXT seam)
  *   - TOOL_REGISTRY → InMemoryToolRegistry (placeholder tools only)
- *   - GENERATE_TEXT → real `generateText` from the `ai` package
+ *   - GENERATE_TEXT → `generateTextImpl` re-exported from the infra provider
  *   - CostGuardService (process-local monthly token counter)
  *   - AgentRunner (load → idle → truncate → port → cost-guard → persist)
  *
@@ -28,12 +31,12 @@ import { generateText } from 'ai';
   providers: [
     {
       provide: GENERATE_TEXT,
-      useValue: generateText,
+      useValue: generateTextImpl,
     },
     {
       provide: LLM_AGENT,
       inject: [GENERATE_TEXT, ConfigService],
-      useFactory: (generateTextFn: typeof generateText, config: ConfigService) => {
+      useFactory: (generateTextFn: GenerateTextFn, config: ConfigService) => {
         const llm = config.get<{
           model: string;
           maxSteps: number;

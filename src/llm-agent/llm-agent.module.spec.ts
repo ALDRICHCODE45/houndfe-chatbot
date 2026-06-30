@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { AppConfigModule } from '../config/config.module';
@@ -90,5 +92,13 @@ describe('LlmAgentModule integration', () => {
     expect(config.get<number>('llm.maxSteps')).toBe(3);
 
     await moduleRef.close();
+  });
+
+  it('confines the `ai` SDK to infrastructure/ (the module itself never imports it)', () => {
+    // Spec (llm-agent): "no file outside src/llm-agent/infrastructure/ imports from `ai`".
+    // The module is the composition root but must reach the runtime `generateText`
+    // through the infrastructure provider seam, not via a direct `from 'ai'` import.
+    const moduleSource = readFileSync(join(__dirname, 'llm-agent.module.ts'), 'utf8');
+    expect(moduleSource).not.toMatch(/from\s+['"]ai['"]/);
   });
 });
