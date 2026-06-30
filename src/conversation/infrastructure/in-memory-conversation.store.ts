@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import {
   ConversationState,
   ConversationStore,
@@ -33,13 +33,14 @@ export class InMemoryConversationStore implements ConversationStore {
     senderId: string,
     patch: Partial<Omit<ConversationState, 'senderId'>>,
   ): Promise<ConversationState> {
+    // UPSERT: if no record exists, create one from the supplied patch.
+    // This is a strict superset of the previous throw-on-missing contract
+    // and is what the dispatcher / agent runner rely on so that one
+    // write path handles both first contact and follow-ups.
     const existing = this.map.get(senderId);
-    if (!existing) {
-      throw new NotFoundException(
-        `ConversationState not found for senderId: ${senderId}`,
-      );
-    }
-    const updated: ConversationState = { ...existing, ...patch };
+    const updated: ConversationState = existing
+      ? { ...existing, ...patch }
+      : { senderId, ...patch };
     this.map.set(senderId, updated);
     return updated;
   }

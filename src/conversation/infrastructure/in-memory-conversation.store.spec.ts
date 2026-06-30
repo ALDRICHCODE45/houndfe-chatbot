@@ -1,5 +1,5 @@
-import { NotFoundException } from '@nestjs/common';
 import { InMemoryConversationStore } from './in-memory-conversation.store';
+import { readMessages, type AgentMessage } from '../domain/conversation-store';
 
 /**
  * Unit tests for InMemoryConversationStore.
@@ -8,7 +8,8 @@ import { InMemoryConversationStore } from './in-memory-conversation.store';
  *   - New sender state is created and read back            (create + get)
  *   - Unknown sender has no state                          (get → null)
  *   - Existing sender state is updated, senderId preserved (update patch)
- *   - Update on unknown sender throws                      (guard behavior)
+ *   - Update on unknown sender UPSERTs (no exception)      (UPSERT contract)
+ *   - messages field defaults to [] when absent            (AgentMessage[])
  */
 describe('InMemoryConversationStore', () => {
   let store: InMemoryConversationStore;
@@ -122,12 +123,57 @@ describe('InMemoryConversationStore', () => {
       expect(found!.lastMessageAt).toBe('2026-06-23T09:00:00.000Z');
     });
 
-    it('throws NotFoundException when sender does not exist', async () => {
-      await expect(
-        store.update('ghost-sender', {
-          lastMessageAt: '2026-06-23T10:00:00.000Z',
-        }),
-      ).rejects.toThrow(NotFoundException);
+    it('UPSERTs when sender does not exist (no exception thrown)', async () => {
+      const created = await store.update('ghost-sender', {
+        lastMessageAt: '2026-06-23T10:00:00.000Z',
+        data: { messages: [] },
+      });
+
+      expect(created.senderId).toBe('ghost-sender');
+      expect(created.lastMessageAt).toBe('2026-06-23T10:00:00.000Z');
+      expect(created.data).toEqual({ messages: [] });
+
+      // A subsequent get must reflect the new record.
+      const found = await store.get('ghost-sender');
+      expect(found).toEqual(created);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────
+  // Scenario: AgentMessage round-trip + missing-field default
+  // ──────────────────────────────────────────────────────────────
+  describe('messages field', () => {
+    it('readMessages() defaults to [] when the field is absent', async () => {
+      await store.create('wa-empty-msg', {
+        lastMessageAt: '2026-06-23T10:00:00.000Z',
+        data: { step: 'init' },
+      });
+
+      const state = await store.get('wa-empty-msg');
+      expect(readMessages(state!)).toEqual([]);
+    });
+
+    it('round-trips AgentMessage[] through update', async () => {
+      await store.create('wa-msgs', {
+        lastMessageAt: '2026-06-23T10:00:00.000Z',
+        data: {},
+      });
+
+      const transcript: AgentMessage[] = [
+        { role: 'user', content: 'hola' },
+        { role: 'assistant', content: 'Hola' },
+        { role: 'tool', toolCallId: 'call-1', content: { now: '2026-06-23T11:00:00.000Z' } },
+      ];
+
+      await store.update('wa-msgs', {
+        lastMessageAt: '2026-06-23T11:00:00.000Z',
+        data: { messages: transcript },
+      });
+
+      const state = await store.get('wa-msgs');
+      expect((state!.data as { messages: AgentMessage[] }).messages).toEqual(
+        transcript,
+      );
     });
   });
 });
