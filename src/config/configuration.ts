@@ -32,6 +32,27 @@ const configuration = () => ({
     /** Branch ID sent as X-Branch-Id on every chatbot-api request */
     branchId: process.env.CHATBOT_API_BRANCH_ID as string,
   },
+
+  llm: {
+    /** Vercel AI Gateway API key. */
+    gatewayApiKey: process.env.AI_GATEWAY_API_KEY as string,
+    /** Model identifier served by the gateway (provider/model form). */
+    model: process.env.LLM_MODEL as string,
+    /** Hard cap on agent step loops (one tool round-trip + final answer). */
+    maxSteps: parseInt(process.env.LLM_MAX_STEPS ?? '3', 10),
+    /** Number of recent user/assistant turns forwarded in the prompt. */
+    historyTurns: parseInt(process.env.LLM_HISTORY_TURNS ?? '12', 10),
+    /** Soft monthly token aggregate; warn at 80% / 100% (never hard-fail). */
+    monthlyTokenCeiling: parseInt(
+      process.env.LLM_MONTHLY_TOKEN_CEILING ?? '8000000',
+      10,
+    ),
+    /** Idle window before a sender's history is reset (3h default). */
+    idleTimeoutMs: parseInt(
+      process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000',
+      10,
+    ),
+  },
 });
 
 export default configuration;

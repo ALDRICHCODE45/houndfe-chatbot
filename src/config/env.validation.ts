@@ -37,4 +37,15 @@ export const envValidationSchema = Joi.object({
   }),
   CHATBOT_API_BRANCH_ID: Joi.string().required(),
   PORT: Joi.number().integer().min(1).max(65535).default(3000),
+
+  // ─── LLM agent slice ────────────────────────────────────────────────────
+  AI_GATEWAY_API_KEY: Joi.string().required(),
+  LLM_MODEL: Joi.string().required(),
+  LLM_MAX_STEPS: Joi.number().integer().min(1).default(3),
+  LLM_HISTORY_TURNS: Joi.number().integer().min(1).default(12),
+  LLM_MONTHLY_TOKEN_CEILING: Joi.number()
+    .integer()
+    .min(1)
+    .default(8_000_000),
+  LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),
 }).options({ allowUnknown: true });

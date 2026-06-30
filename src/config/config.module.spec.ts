@@ -21,6 +21,8 @@ describe('AppConfigModule integration', () => {
     CHATBOT_API_BASE_URL: 'https://api.houndfe.com',
     SERVICE_KEY: 'svc_test_service_key',
     CHATBOT_API_BRANCH_ID: 'branch-test-uuid',
+    AI_GATEWAY_API_KEY: 'test-gateway-key',
+    LLM_MODEL: 'anthropic/claude-sonnet-4.5',
   };
 
   const MANAGED_KEYS = Object.keys(VALID_ENV);
@@ -71,6 +73,12 @@ describe('AppConfigModule integration', () => {
       expect(config.get<string>('chatbotApi.branchId')).toBe(
         'branch-test-uuid',
       );
+      expect(config.get<string>('llm.gatewayApiKey')).toBe('test-gateway-key');
+      expect(config.get<string>('llm.model')).toBe('anthropic/claude-sonnet-4.5');
+      expect(config.get<number>('llm.maxSteps')).toBe(3);
+      expect(config.get<number>('llm.historyTurns')).toBe(12);
+      expect(config.get<number>('llm.monthlyTokenCeiling')).toBe(8_000_000);
+      expect(config.get<number>('llm.idleTimeoutMs')).toBe(10_800_000);
 
       await moduleRef.close();
     });
@@ -92,6 +100,28 @@ describe('AppConfigModule integration', () => {
     it('throws a configuration error when SERVICE_KEY has wrong format', async () => {
       Object.assign(process.env, VALID_ENV);
       process.env.SERVICE_KEY = 'bad_key_without_svc_prefix';
+
+      await expect(
+        Test.createTestingModule({
+          imports: [AppConfigModule.forRoot()],
+        }).compile(),
+      ).rejects.toThrow();
+    });
+
+    it('throws a configuration error when AI_GATEWAY_API_KEY is missing', async () => {
+      Object.assign(process.env, VALID_ENV);
+      delete process.env.AI_GATEWAY_API_KEY;
+
+      await expect(
+        Test.createTestingModule({
+          imports: [AppConfigModule.forRoot()],
+        }).compile(),
+      ).rejects.toThrow();
+    });
+
+    it('throws a configuration error when LLM_MODEL is missing', async () => {
+      Object.assign(process.env, VALID_ENV);
+      delete process.env.LLM_MODEL;
 
       await expect(
         Test.createTestingModule({

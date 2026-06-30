@@ -15,6 +15,8 @@ describe('envValidationSchema', () => {
     CHATBOT_API_BASE_URL: 'https://api.example.com',
     SERVICE_KEY: 'svc_my_service_key',
     CHATBOT_API_BRANCH_ID: 'branch-uuid-1234',
+    AI_GATEWAY_API_KEY: 'gateway-key-abc',
+    LLM_MODEL: 'anthropic/claude-sonnet-4.5',
   };
 
   // ─── Task 1.2 ─────────────────────────────────────────────────────────────
@@ -177,6 +179,66 @@ describe('envValidationSchema', () => {
       }) as { error?: undefined; value: Record<string, unknown> };
       expect(error).toBeUndefined();
       expect(value.PORT).toBe(3000);
+    });
+  });
+
+  // ─── LLM agent env vars ───────────────────────────────────────────────────
+  describe('LLM env vars', () => {
+    it('rejects when AI_GATEWAY_API_KEY is absent', () => {
+      const env = { ...validEnv };
+      delete (env as Partial<typeof validEnv>).AI_GATEWAY_API_KEY;
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('AI_GATEWAY_API_KEY')),
+      ).toBe(true);
+    });
+
+    it('rejects when LLM_MODEL is absent', () => {
+      const env = { ...validEnv };
+      delete (env as Partial<typeof validEnv>).LLM_MODEL;
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes('LLM_MODEL'))).toBe(
+        true,
+      );
+    });
+
+    it('rejects LLM_MAX_STEPS below 1', () => {
+      const env = { ...validEnv, LLM_MAX_STEPS: '0' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes('LLM_MAX_STEPS'))).toBe(
+        true,
+      );
+    });
+
+    it('rejects non-integer LLM_HISTORY_TURNS', () => {
+      const env = { ...validEnv, LLM_HISTORY_TURNS: '3.5' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('LLM_HISTORY_TURNS')),
+      ).toBe(true);
+    });
+
+    it('applies defaults for optional LLM knobs when absent', () => {
+      const { error, value } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value.LLM_MAX_STEPS).toBe(3);
+      expect(value.LLM_HISTORY_TURNS).toBe(12);
+      expect(value.LLM_MONTHLY_TOKEN_CEILING).toBe(8_000_000);
+      expect(value.LLM_IDLE_TIMEOUT_MS).toBe(10_800_000);
     });
   });
 });
