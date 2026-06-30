@@ -23,14 +23,20 @@ describe('envValidationSchema', () => {
       const env = { ...validEnv };
       delete (env as Partial<typeof validEnv>).META_VERIFY_TOKEN;
 
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
 
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('META_VERIFY_TOKEN'))).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('META_VERIFY_TOKEN')),
+      ).toBe(true);
     });
 
     it('accepts when META_VERIFY_TOKEN is a non-empty string', () => {
-      const { error } = envValidationSchema.validate(validEnv, { abortEarly: false });
+      const { error } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      });
       expect(error).toBeUndefined();
     });
   });
@@ -40,15 +46,24 @@ describe('envValidationSchema', () => {
     it('rejects when CHATBOT_API_BASE_URL is not a valid URL', () => {
       const env = { ...validEnv, CHATBOT_API_BASE_URL: 'not-a-url' };
 
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
 
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('CHATBOT_API_BASE_URL'))).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('CHATBOT_API_BASE_URL')),
+      ).toBe(true);
     });
 
     it('accepts when CHATBOT_API_BASE_URL is a valid HTTPS URL', () => {
-      const env = { ...validEnv, CHATBOT_API_BASE_URL: 'https://backend.houndfe.com' };
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const env = {
+        ...validEnv,
+        CHATBOT_API_BASE_URL: 'https://backend.houndfe.com',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
       expect(error).toBeUndefined();
     });
   });
@@ -58,15 +73,21 @@ describe('envValidationSchema', () => {
     it('rejects when SERVICE_KEY does not start with svc_', () => {
       const env = { ...validEnv, SERVICE_KEY: 'invalid_key_without_prefix' };
 
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
 
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('SERVICE_KEY'))).toBe(true);
+      expect(error!.details.some((d) => d.path.includes('SERVICE_KEY'))).toBe(
+        true,
+      );
     });
 
     it('accepts when SERVICE_KEY starts with svc_', () => {
       const env = { ...validEnv, SERVICE_KEY: 'svc_abc123' };
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
       expect(error).toBeUndefined();
     });
   });
@@ -76,37 +97,84 @@ describe('envValidationSchema', () => {
     it('rejects when META_APP_SECRET is missing', () => {
       const env = { ...validEnv };
       delete (env as Partial<typeof validEnv>).META_APP_SECRET;
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('META_APP_SECRET'))).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('META_APP_SECRET')),
+      ).toBe(true);
     });
 
     it('rejects when META_ACCESS_TOKEN is missing', () => {
       const env = { ...validEnv };
       delete (env as Partial<typeof validEnv>).META_ACCESS_TOKEN;
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('META_ACCESS_TOKEN'))).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('META_ACCESS_TOKEN')),
+      ).toBe(true);
     });
 
     it('rejects when META_PHONE_NUMBER_ID is missing', () => {
       const env = { ...validEnv };
       delete (env as Partial<typeof validEnv>).META_PHONE_NUMBER_ID;
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('META_PHONE_NUMBER_ID'))).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('META_PHONE_NUMBER_ID')),
+      ).toBe(true);
     });
 
     it('rejects when CHATBOT_API_BRANCH_ID is missing', () => {
       const env = { ...validEnv };
       delete (env as Partial<typeof validEnv>).CHATBOT_API_BRANCH_ID;
-      const { error } = envValidationSchema.validate(env, { abortEarly: false });
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
       expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes('CHATBOT_API_BRANCH_ID'))).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('CHATBOT_API_BRANCH_ID')),
+      ).toBe(true);
+    });
+  });
+
+  // ─── Optional vars defaults ────────────────────────────────────────────────
+  describe('optional vars', () => {
+    it('rejects when META_GRAPH_API_BASE_URL is not a valid URI', () => {
+      const env = {
+        ...validEnv,
+        META_GRAPH_API_BASE_URL: 'not-a-uri',
+      };
+
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('META_GRAPH_API_BASE_URL')),
+      ).toBe(true);
+    });
+
+    it('applies META_GRAPH_API_BASE_URL default when absent', () => {
+      const { error, value } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value.META_GRAPH_API_BASE_URL).toBe(
+        'https://graph.facebook.com/v23.0',
+      );
     });
 
     it('allows PORT to be absent (defaults to 3000)', () => {
-      const { error, value } = envValidationSchema.validate(validEnv, { abortEarly: false });
+      const { error, value } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
       expect(error).toBeUndefined();
       expect(value.PORT).toBe(3000);
     });

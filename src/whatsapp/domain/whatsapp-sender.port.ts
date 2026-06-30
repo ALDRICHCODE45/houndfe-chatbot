@@ -14,7 +14,9 @@ export interface SendResult {
 
 /** Error raised when a caller tries to send anything other than text. */
 export class UnsupportedOutboundError extends Error {
-  constructor(message = 'Only outbound text messages are supported in this slice') {
+  constructor(
+    message = 'Only outbound text messages are supported in this slice',
+  ) {
     super(message);
     this.name = 'UnsupportedOutboundError';
   }

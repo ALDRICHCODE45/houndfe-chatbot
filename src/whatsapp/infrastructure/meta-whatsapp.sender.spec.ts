@@ -102,7 +102,9 @@ describe('MetaWhatsappSender', () => {
       image: { id: 'media-123' },
     } as unknown as OutboundText;
 
-    await expect(sender.sendText(outbound)).rejects.toThrow(UnsupportedOutboundError);
+    await expect(sender.sendText(outbound)).rejects.toThrow(
+      UnsupportedOutboundError,
+    );
     expect(httpService.post).not.toHaveBeenCalled();
   });
 

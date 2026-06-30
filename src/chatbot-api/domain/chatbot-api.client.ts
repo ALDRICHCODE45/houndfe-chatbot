@@ -20,10 +20,19 @@ export interface ChatbotApiClient {
   searchCatalog(q: string, limit?: number): Promise<CatalogItemResponse[]>;
   getStock(productId: string): Promise<StockCheckResponse>;
   evaluateCart(items: CartItemInput[]): Promise<CartEvaluationResult>;
-  getCustomerByPhone(cc: string, phone: string): Promise<CustomerLookupResponse>;
+  getCustomerByPhone(
+    cc: string,
+    phone: string,
+  ): Promise<CustomerLookupResponse>;
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse>;
-  createSale(dto: CreateSaleInput, idempotencyKey: string): Promise<BotSaleResponse>;
-  attachReceipt(saleId: string, dto: AttachReceiptInput): Promise<AttachReceiptResponse>;
+  createSale(
+    dto: CreateSaleInput,
+    idempotencyKey: string,
+  ): Promise<BotSaleResponse>;
+  attachReceipt(
+    saleId: string,
+    dto: AttachReceiptInput,
+  ): Promise<AttachReceiptResponse>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
 }

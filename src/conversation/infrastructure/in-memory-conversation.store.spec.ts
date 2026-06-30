@@ -33,8 +33,14 @@ describe('InMemoryConversationStore', () => {
     });
 
     it('allows independent records for distinct senders', async () => {
-      await store.create('wa-001', { lastMessageAt: '2026-06-23T10:00:00.000Z', data: {} });
-      await store.create('wa-002', { lastMessageAt: '2026-06-23T10:01:00.000Z', data: {} });
+      await store.create('wa-001', {
+        lastMessageAt: '2026-06-23T10:00:00.000Z',
+        data: {},
+      });
+      await store.create('wa-002', {
+        lastMessageAt: '2026-06-23T10:01:00.000Z',
+        data: {},
+      });
 
       const first = await store.get('wa-001');
       const second = await store.get('wa-002');

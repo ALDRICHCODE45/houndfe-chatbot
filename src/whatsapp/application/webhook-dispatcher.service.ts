@@ -1,11 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
-import {
-  CONVERSATION_STORE,
-} from '../../conversation/domain/conversation-store';
+import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
 import { InboundMessage } from '../domain/inbound-message';
-import {
-  WHATSAPP_SENDER,
-} from '../domain/whatsapp-sender.port';
+import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';

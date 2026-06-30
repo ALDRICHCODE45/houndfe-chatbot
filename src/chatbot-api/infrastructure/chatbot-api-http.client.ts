@@ -4,16 +4,20 @@ import { ConfigService } from '@nestjs/config';
 import type { AxiosRequestConfig } from 'axios';
 import { lastValueFrom } from 'rxjs';
 import type { AppConfig } from '../../config/configuration';
-import {
-  ChatbotApiClient,
-} from '../domain/chatbot-api.client';
-import type { CatalogItemResponse, StockCheckResponse } from '../domain/dtos/catalog.dto';
+import { ChatbotApiClient } from '../domain/chatbot-api.client';
+import type {
+  CatalogItemResponse,
+  StockCheckResponse,
+} from '../domain/dtos/catalog.dto';
 import type {
   CustomerLookupResponse,
   CustomerUpsertInput,
   CustomerUpsertResponse,
 } from '../domain/dtos/customers.dto';
-import type { CartEvaluationResult, CartItemInput } from '../domain/dtos/pricing.dto';
+import type {
+  CartEvaluationResult,
+  CartItemInput,
+} from '../domain/dtos/pricing.dto';
 import type {
   AttachReceiptInput,
   AttachReceiptResponse,
@@ -70,7 +74,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return this.request<StockCheckResponse>(
       {
         method: 'GET',
-        url: `/chatbot-api/catalog/${productId}/stock`,
+        url: `/chatbot-api/catalog/${encodeURIComponent(productId)}/stock`,
       },
       { retryable: true },
     );
@@ -84,7 +88,10 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     });
   }
 
-  getCustomerByPhone(cc: string, phone: string): Promise<CustomerLookupResponse> {
+  getCustomerByPhone(
+    cc: string,
+    phone: string,
+  ): Promise<CustomerLookupResponse> {
     return this.request<CustomerLookupResponse>(
       {
         method: 'GET',
@@ -106,7 +113,10 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     });
   }
 
-  createSale(dto: CreateSaleInput, idempotencyKey: string): Promise<BotSaleResponse> {
+  createSale(
+    dto: CreateSaleInput,
+    idempotencyKey: string,
+  ): Promise<BotSaleResponse> {
     return this.request<BotSaleResponse>({
       method: 'POST',
       url: '/chatbot-api/sales',
@@ -117,18 +127,24 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     });
   }
 
-  attachReceipt(saleId: string, dto: AttachReceiptInput): Promise<AttachReceiptResponse> {
+  attachReceipt(
+    saleId: string,
+    dto: AttachReceiptInput,
+  ): Promise<AttachReceiptResponse> {
     return this.request<AttachReceiptResponse>({
       method: 'POST',
-      url: `/chatbot-api/sales/${saleId}/receipts`,
+      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
       data: dto,
     });
   }
 
-  async updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void> {
+  async updateDelivery(
+    saleId: string,
+    dto: UpdateDeliveryInput,
+  ): Promise<void> {
     await this.request<Record<string, never>>({
       method: 'PATCH',
-      url: `/chatbot-api/sales/${saleId}/delivery`,
+      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/delivery`,
       data: dto,
     });
   }
@@ -137,7 +153,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return this.request<OrderHistoryResponse[]>(
       {
         method: 'GET',
-        url: `/chatbot-api/customers/by-phone/${phone}/orders`,
+        url: `/chatbot-api/customers/by-phone/${encodeURIComponent(phone)}/orders`,
         params: {
           phoneCountryCode: cc,
         },
@@ -146,10 +162,13 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     );
   }
 
-  private async request<T>(config: AxiosRequestConfig, options: RequestOptions = {}): Promise<T> {
-    const configuredBranchId = this.configService.getOrThrow<AppConfig['chatbotApi']['branchId']>(
-      'chatbotApi.branchId',
-    );
+  private async request<T>(
+    config: AxiosRequestConfig,
+    options: RequestOptions = {},
+  ): Promise<T> {
+    const configuredBranchId = this.configService.getOrThrow<
+      AppConfig['chatbotApi']['branchId']
+    >('chatbotApi.branchId');
     const branchId = options.branchId ?? configuredBranchId;
 
     if (branchId !== configuredBranchId) {
@@ -158,7 +177,10 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
 
     const requestConfig: AxiosRequestConfig = {
       ...config,
-      baseURL: this.configService.getOrThrow<AppConfig['chatbotApi']['baseUrl']>('chatbotApi.baseUrl'),
+      baseURL:
+        this.configService.getOrThrow<AppConfig['chatbotApi']['baseUrl']>(
+          'chatbotApi.baseUrl',
+        ),
       headers: {
         ...(config.headers ?? {}),
         Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['chatbotApi']['serviceKey']>('chatbotApi.serviceKey')}`,
@@ -170,11 +192,15 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        const response = await lastValueFrom(this.httpService.request<T>(requestConfig));
+        const response = await lastValueFrom(
+          this.httpService.request<T>(requestConfig),
+        );
 
         return response.data;
       } catch (error) {
-        if (this.shouldRetry(requestConfig.method, error, attempt, maxAttempts)) {
+        if (
+          this.shouldRetry(requestConfig.method, error, attempt, maxAttempts)
+        ) {
           await this.sleep(this.getBackoffDelay(attempt));
           continue;
         }
@@ -209,7 +235,9 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       return status >= 500;
     }
 
-    return typeof maybeAxiosError.code === 'string' || !maybeAxiosError.response;
+    return (
+      typeof maybeAxiosError.code === 'string' || !maybeAxiosError.response
+    );
   }
 
   private getBackoffDelay(attempt: number): number {
@@ -230,16 +258,35 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
 
     switch (status) {
       case 401:
-        return new AuthError('Chatbot API authentication failed', status, responseBody);
+        return new AuthError(
+          'Chatbot API authentication failed',
+          status,
+          responseBody,
+        );
       case 403:
-        return new ForbiddenError('Chatbot API request was forbidden', status, responseBody);
+        return new ForbiddenError(
+          'Chatbot API request was forbidden',
+          status,
+          responseBody,
+        );
       case 404:
-        return new NotFoundError('Chatbot API resource was not found', status, responseBody);
+        return new NotFoundError(
+          'Chatbot API resource was not found',
+          status,
+          responseBody,
+        );
       case 429:
-        return new RateLimitError(this.parseRetryAfter(maybeAxiosError.response?.headers), responseBody);
+        return new RateLimitError(
+          this.parseRetryAfter(maybeAxiosError.response?.headers),
+          responseBody,
+        );
       default:
         if (typeof status === 'number' && status >= 500) {
-          return new UpstreamError('Chatbot API upstream failure', status, responseBody);
+          return new UpstreamError(
+            'Chatbot API upstream failure',
+            status,
+            responseBody,
+          );
         }
 
         return new UpstreamError(
@@ -257,7 +304,11 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     const value = Array.isArray(rawValue) ? rawValue[0] : rawValue;
     const parsed = Number(value);
 
-    return Number.isFinite(parsed) ? parsed : null;
+    if (!Number.isFinite(parsed)) {
+      return null;
+    }
+
+    return Math.max(0, parsed);
   }
 }
 

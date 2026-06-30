@@ -14,7 +14,7 @@ import { ExecutionContext } from '@nestjs/common';
 import { SignatureGuard } from './signature.guard';
 
 type MockRequest = {
-  rawBody: Buffer;
+  rawBody?: Buffer;
   headers: Record<string, string | undefined>;
 };
 
@@ -22,7 +22,17 @@ describe('SignatureGuard', () => {
   const appSecret = 'meta-app-secret-for-tests';
   const payload = Buffer.from(
     JSON.stringify({
-      entry: [{ changes: [{ value: { messages: [{ from: '5215550001111', text: { body: 'hola' } }] } }] }],
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [{ from: '5215550001111', text: { body: 'hola' } }],
+              },
+            },
+          ],
+        },
+      ],
     }),
     'utf8',
   );
@@ -70,18 +80,25 @@ describe('SignatureGuard', () => {
       headers: {},
     };
 
-    expect(() => guard.canActivate(executionContextFor(request))).toThrow(UnauthorizedException);
+    expect(() => guard.canActivate(executionContextFor(request))).toThrow(
+      UnauthorizedException,
+    );
   });
 
   it('rejects a tampered body when the signature was computed for different bytes', () => {
     const request: MockRequest = {
-      rawBody: Buffer.from(payload.toString('utf8').replace('hola', 'adios'), 'utf8'),
+      rawBody: Buffer.from(
+        payload.toString('utf8').replace('hola', 'adios'),
+        'utf8',
+      ),
       headers: {
         'x-hub-signature-256': sign(payload),
       },
     };
 
-    expect(() => guard.canActivate(executionContextFor(request))).toThrow(UnauthorizedException);
+    expect(() => guard.canActivate(executionContextFor(request))).toThrow(
+      UnauthorizedException,
+    );
   });
 
   it('rejects an equal-length but invalid MAC with 401', () => {
@@ -92,7 +109,9 @@ describe('SignatureGuard', () => {
       },
     };
 
-    expect(() => guard.canActivate(executionContextFor(request))).toThrow(UnauthorizedException);
+    expect(() => guard.canActivate(executionContextFor(request))).toThrow(
+      UnauthorizedException,
+    );
   });
 
   it('rejects a different-length MAC before timingSafeEqual and does not throw from buffer mismatch', () => {
@@ -103,7 +122,28 @@ describe('SignatureGuard', () => {
       },
     };
 
-    expect(() => guard.canActivate(executionContextFor(request))).toThrow(UnauthorizedException);
+    expect(() => guard.canActivate(executionContextFor(request))).toThrow(
+      UnauthorizedException,
+    );
+    expect(crypto.timingSafeEqual).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when rawBody is absent even if the signature header looks valid', () => {
+    // The signature header is a correctly-formatted sha256=... value so that the
+    // header-parsing path does not short-circuit; the guard must still deny the
+    // request because there is no raw body bytes to HMAC against. This is the
+    // "fail closed" requirement from the webhook spec.
+    const request: MockRequest = {
+      headers: {
+        'x-hub-signature-256': sign(payload),
+      },
+    };
+
+    expect(() => guard.canActivate(executionContextFor(request))).toThrow(
+      UnauthorizedException,
+    );
+    // rawBody absence must be caught BEFORE constant-time MAC comparison to avoid
+    // any timing oracle on body availability.
     expect(crypto.timingSafeEqual).not.toHaveBeenCalled();
   });
 });

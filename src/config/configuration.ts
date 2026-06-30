@@ -20,7 +20,8 @@ const configuration = () => ({
     /** WhatsApp phone number id used by the Graph send endpoint */
     phoneNumberId: process.env.META_PHONE_NUMBER_ID as string,
     /** Graph API base URL */
-    graphApiBaseUrl: process.env.META_GRAPH_API_BASE_URL ?? META_GRAPH_API_BASE_URL_DEFAULT,
+    graphApiBaseUrl:
+      process.env.META_GRAPH_API_BASE_URL ?? META_GRAPH_API_BASE_URL_DEFAULT,
   },
 
   chatbotApi: {

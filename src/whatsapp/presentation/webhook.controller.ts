@@ -23,7 +23,8 @@ export class WebhookController {
 
   @Get('webhook')
   verify(@Query() query: WebhookVerifyDto): string {
-    const expectedToken = this.configService.getOrThrow<string>('meta.verifyToken');
+    const expectedToken =
+      this.configService.getOrThrow<string>('meta.verifyToken');
 
     if (
       query['hub.mode'] === 'subscribe' &&
@@ -38,7 +39,9 @@ export class WebhookController {
   @Post('webhook')
   @HttpCode(200)
   @UseGuards(SignatureGuard)
-  async handleEvent(@Body() event: WebhookEventDto): Promise<{ received: true }> {
+  async handleEvent(
+    @Body() event: WebhookEventDto,
+  ): Promise<{ received: true }> {
     await this.webhookDispatcher.dispatch(event);
 
     return { received: true };

@@ -62,9 +62,15 @@ describe('AppConfigModule integration', () => {
       expect(config.get<string>('meta.graphApiBaseUrl')).toBe(
         'https://graph.facebook.com/v23.0',
       );
-      expect(config.get<string>('chatbotApi.baseUrl')).toBe('https://api.houndfe.com');
-      expect(config.get<string>('chatbotApi.serviceKey')).toBe('svc_test_service_key');
-      expect(config.get<string>('chatbotApi.branchId')).toBe('branch-test-uuid');
+      expect(config.get<string>('chatbotApi.baseUrl')).toBe(
+        'https://api.houndfe.com',
+      );
+      expect(config.get<string>('chatbotApi.serviceKey')).toBe(
+        'svc_test_service_key',
+      );
+      expect(config.get<string>('chatbotApi.branchId')).toBe(
+        'branch-test-uuid',
+      );
 
       await moduleRef.close();
     });

@@ -3,7 +3,10 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
+import type { AppModule as AppModuleStatic } from '../src/app.module';
 import type { ConversationStore } from '../src/conversation/domain/conversation-store';
+import type { CONVERSATION_STORE as CONVERSATION_STORE_MODULE } from '../src/conversation/domain/conversation-store';
+import type { WHATSAPP_SENDER as WHATSAPP_SENDER_MODULE } from '../src/whatsapp/domain/whatsapp-sender.port';
 
 describe('Webhook echo flow (e2e)', () => {
   const verifyToken = 'verify-token';
@@ -11,7 +14,12 @@ describe('Webhook echo flow (e2e)', () => {
 
   let app: INestApplication<App>;
   let conversationStore: ConversationStore;
-  let sender: { sendText: jest.Mock<Promise<{ providerMessageId: string }>, [{ to: string; text: string }]> };
+  let sender: {
+    sendText: jest.Mock<
+      Promise<{ providerMessageId: string }>,
+      [{ to: string; text: string }]
+    >;
+  };
   let conversationStoreToken: symbol;
   let whatsappSenderToken: symbol;
 
@@ -25,14 +33,28 @@ describe('Webhook echo flow (e2e)', () => {
     process.env.SERVICE_KEY = 'svc_test_key';
     process.env.CHATBOT_API_BRANCH_ID = 'branch-123';
 
-    jest.isolateModules(() => undefined);
-    const { AppModule } = require('../src/app.module') as typeof import('../src/app.module');
-    ({ CONVERSATION_STORE: conversationStoreToken } = require('../src/conversation/domain/conversation-store') as typeof import('../src/conversation/domain/conversation-store'));
-    ({ WHATSAPP_SENDER: whatsappSenderToken } = require('../src/whatsapp/domain/whatsapp-sender.port') as typeof import('../src/whatsapp/domain/whatsapp-sender.port'));
+    // NOTE: dynamic require() below is intentional. NestJS's @nestjs/config runs
+    // env validation eagerly inside ConfigModule.forRoot(), so AppModule must be
+    // loaded AFTER process.env is populated in this beforeEach. Static ES
+    // imports would hoist module evaluation above the env assignment.
 
-    sender = {
-      sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid.reply' }),
-    };
+    const { AppModule } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/app.module') as typeof AppModuleStatic;
+    ({ CONVERSATION_STORE: conversationStoreToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/conversation/domain/conversation-store') as typeof CONVERSATION_STORE_MODULE);
+    ({ WHATSAPP_SENDER: whatsappSenderToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/whatsapp/domain/whatsapp-sender.port') as typeof WHATSAPP_SENDER_MODULE);
+
+    const mockedSendText = jest
+      .fn<
+        Promise<{ providerMessageId: string }>,
+        [{ to: string; text: string }]
+      >()
+      .mockResolvedValue({ providerMessageId: 'wamid.reply' });
+    sender = { sendText: mockedSendText };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
@@ -50,7 +72,9 @@ describe('Webhook echo flow (e2e)', () => {
     );
     await app.init();
 
-    conversationStore = app.get<ConversationStore>(conversationStoreToken, { strict: false });
+    conversationStore = app.get<ConversationStore>(conversationStoreToken, {
+      strict: false,
+    });
   });
 
   afterEach(async () => {
@@ -70,7 +94,9 @@ describe('Webhook echo flow (e2e)', () => {
 
   it('keeps GET /webhook verification working', async () => {
     await request(app.getHttpServer())
-      .get('/webhook?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=challenge-1')
+      .get(
+        '/webhook?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=challenge-1',
+      )
       .expect(200)
       .expect('challenge-1');
   });

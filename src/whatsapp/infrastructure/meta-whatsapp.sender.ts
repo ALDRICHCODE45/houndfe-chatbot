@@ -53,7 +53,9 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     return { providerMessageId };
   }
 
-  private async postTextMessage(message: OutboundText): Promise<MetaSendResponse> {
+  private async postTextMessage(
+    message: OutboundText,
+  ): Promise<MetaSendResponse> {
     try {
       const response = await lastValueFrom(
         this.httpService.post<MetaSendResponse>(
@@ -82,12 +84,13 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   }
 
   private buildMessagesUrl(): string {
-    const baseUrl = this.configService.getOrThrow<AppConfig['meta']['graphApiBaseUrl']>(
-      'meta.graphApiBaseUrl',
-    );
-    const phoneNumberId = this.configService.getOrThrow<AppConfig['meta']['phoneNumberId']>(
-      'meta.phoneNumberId',
-    );
+    const baseUrl = this.configService.getOrThrow<
+      AppConfig['meta']['graphApiBaseUrl']
+    >('meta.graphApiBaseUrl');
+    const phoneNumberId =
+      this.configService.getOrThrow<AppConfig['meta']['phoneNumberId']>(
+        'meta.phoneNumberId',
+      );
 
     return `${baseUrl}/${phoneNumberId}/messages`;
   }

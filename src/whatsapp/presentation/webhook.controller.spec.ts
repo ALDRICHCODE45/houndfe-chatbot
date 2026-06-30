@@ -56,7 +56,9 @@ describe('WebhookController', () => {
       'hub.challenge': 'challenge-token',
     };
 
-    expect(() => controller.verify(query)).toThrow('Invalid webhook verify token');
+    expect(() => controller.verify(query)).toThrow(
+      'Invalid webhook verify token',
+    );
   });
 
   it('dispatches inbound events and returns a fast acknowledgement', async () => {
@@ -65,7 +67,9 @@ describe('WebhookController', () => {
       entry: [],
     };
 
-    await expect(controller.handleEvent(payload)).resolves.toEqual({ received: true });
+    await expect(controller.handleEvent(payload)).resolves.toEqual({
+      received: true,
+    });
     expect(dispatcher.dispatch).toHaveBeenCalledWith(payload);
   });
 
@@ -103,14 +107,18 @@ describe('WebhookController', () => {
 
     it('returns the challenge via GET /webhook when the token is valid', async () => {
       await request(app.getHttpServer())
-        .get('/webhook?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=test')
+        .get(
+          '/webhook?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=test',
+        )
         .expect(200)
         .expect('test');
     });
 
     it('returns 403 via GET /webhook when the token is wrong', async () => {
       await request(app.getHttpServer())
-        .get('/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=test')
+        .get(
+          '/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=test',
+        )
         .expect(403);
     });
 

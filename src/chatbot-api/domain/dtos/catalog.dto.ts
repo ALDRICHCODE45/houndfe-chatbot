@@ -1,4 +1,8 @@
-export type StockStatus = 'available' | 'low_stock' | 'out_of_stock' | 'not_managed';
+export type StockStatus =
+  | 'available'
+  | 'low_stock'
+  | 'out_of_stock'
+  | 'not_managed';
 
 export interface CatalogItemVariantResponse {
   variantId: string;

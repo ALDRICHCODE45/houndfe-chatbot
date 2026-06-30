@@ -1,14 +1,8 @@
-import { ConfigService } from '@nestjs/config';
 import {
-  CONVERSATION_STORE,
   ConversationState,
   ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import {
-  SendResult,
-  WHATSAPP_SENDER,
-  WhatsappSenderPort,
-} from '../domain/whatsapp-sender.port';
+import { SendResult, WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 import { WebhookDispatcherService } from './webhook-dispatcher.service';
 
@@ -25,7 +19,10 @@ describe('WebhookDispatcherService', () => {
     };
 
     sender = {
-      sendText: jest.fn<Promise<SendResult>, [Parameters<WhatsappSenderPort['sendText']>[0]]>(),
+      sendText: jest.fn<
+        Promise<SendResult>,
+        [Parameters<WhatsappSenderPort['sendText']>[0]]
+      >(),
     };
     sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.reply' });
 
