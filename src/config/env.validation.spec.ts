@@ -4,7 +4,7 @@ import { envValidationSchema } from './env.validation';
  * Unit tests for the Joi env validation schema.
  * These exercise the schema directly — no NestJS wiring needed.
  *
- * Tasks: 1.2, 1.3, 1.4
+ * Tasks: 1.2, 1.3, 1.4, 2.1
  */
 describe('envValidationSchema', () => {
   const validEnv = {
@@ -17,6 +17,7 @@ describe('envValidationSchema', () => {
     CHATBOT_API_BRANCH_ID: 'branch-uuid-1234',
     AI_GATEWAY_API_KEY: 'gateway-key-abc',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
+    DATABASE_URL: 'postgres://houndfe:houndfe@localhost:5432/houndfe_chatbot',
   };
 
   // ─── Task 1.2 ─────────────────────────────────────────────────────────────
@@ -239,6 +240,66 @@ describe('envValidationSchema', () => {
       expect(value.LLM_HISTORY_TURNS).toBe(12);
       expect(value.LLM_MONTHLY_TOKEN_CEILING).toBe(8_000_000);
       expect(value.LLM_IDLE_TIMEOUT_MS).toBe(10_800_000);
+    });
+  });
+
+  // ─── Task 2.1: Database env vars (durable conversation store) ───────────
+  describe('DATABASE_URL / DB_POOL_MAX', () => {
+    it('rejects when DATABASE_URL is absent', () => {
+      const env = { ...validEnv };
+      delete (env as Partial<typeof validEnv>).DATABASE_URL;
+
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes('DATABASE_URL'))).toBe(
+        true,
+      );
+    });
+
+    it('rejects when DATABASE_URL is malformed (not a URI)', () => {
+      const env = { ...validEnv, DATABASE_URL: 'not-a-uri' };
+
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes('DATABASE_URL'))).toBe(
+        true,
+      );
+    });
+
+    it('applies DB_POOL_MAX default of 5 when absent', () => {
+      const { error, value } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value.DB_POOL_MAX).toBe(5);
+    });
+
+    it('accepts DATABASE_URL as a valid URI', () => {
+      const env = {
+        ...validEnv,
+        DATABASE_URL: 'postgres://u:p@db.example.com:5432/x',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('rejects DB_POOL_MAX below 1', () => {
+      const env = { ...validEnv, DB_POOL_MAX: '0' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes('DB_POOL_MAX'))).toBe(
+        true,
+      );
     });
   });
 });

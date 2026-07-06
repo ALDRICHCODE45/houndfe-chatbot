@@ -53,6 +53,13 @@ const configuration = () => ({
       10,
     ),
   },
+
+  database: {
+    /** Postgres connection string for the durable conversation store. */
+    url: process.env.DATABASE_URL as string,
+    /** Maximum pool size; tune per VPS resource budget. */
+    poolMax: parseInt(process.env.DB_POOL_MAX ?? '5', 10),
+  },
 });
 
 export default configuration;

@@ -23,6 +23,7 @@ describe('AppConfigModule integration', () => {
     CHATBOT_API_BRANCH_ID: 'branch-test-uuid',
     AI_GATEWAY_API_KEY: 'test-gateway-key',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
+    DATABASE_URL: 'postgres://u:p@localhost:5432/d',
   };
 
   const MANAGED_KEYS = Object.keys(VALID_ENV);

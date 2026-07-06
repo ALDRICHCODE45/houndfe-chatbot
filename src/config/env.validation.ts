@@ -22,6 +22,7 @@ export const META_GRAPH_API_BASE_URL_DEFAULT =
  * Optional vars:
  *   META_GRAPH_API_BASE_URL — Graph API base URL, defaults to v23.0
  *   PORT                    — HTTP listening port, defaults to 3000
+ *   DB_POOL_MAX             — Postgres pool size, defaults to 5
  */
 export const envValidationSchema = Joi.object({
   META_VERIFY_TOKEN: Joi.string().required(),
@@ -48,4 +49,8 @@ export const envValidationSchema = Joi.object({
     .min(1)
     .default(8_000_000),
   LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),
+
+  // ─── Durable conversation store (Postgres) ──────────────────────────────
+  DATABASE_URL: Joi.string().uri().required(),
+  DB_POOL_MAX: Joi.number().integer().min(1).default(5),
 }).options({ allowUnknown: true });

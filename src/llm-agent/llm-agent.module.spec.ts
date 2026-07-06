@@ -40,6 +40,7 @@ describe('LlmAgentModule integration', () => {
     CHATBOT_API_BRANCH_ID: 'b',
     AI_GATEWAY_API_KEY: 'gk',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
+    DATABASE_URL: 'postgres://u:p@localhost:5432/d',
   };
   const MANAGED_KEYS = Object.keys(VALID_ENV);
 
