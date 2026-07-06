@@ -10,6 +10,9 @@ async function bootstrap() {
       transform: true,
     }),
   );
+  // Enables SIGTERM/SIGINT to trigger OnModuleDestroy on every provider,
+  // closing the Postgres pool before process exit (R8).
+  app.enableShutdownHooks();
   await app.listen(process.env.PORT ?? 3000);
 }
 bootstrap();
