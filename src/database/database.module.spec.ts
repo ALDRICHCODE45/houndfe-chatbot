@@ -88,8 +88,25 @@ ddescribe('DatabaseModule integration (Testcontainers)', () => {
   let container: StartedPostgreSqlContainer;
   let moduleRef: Awaited<ReturnType<typeof Test.createTestingModule['prototype']['compile']>>;
   let pool: Pool;
+  const savedEnv: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
+    const REQUIRED: Record<string, string> = {
+      META_VERIFY_TOKEN: 'stub-verify',
+      META_APP_SECRET: 'stub-secret',
+      META_ACCESS_TOKEN: 'stub-access',
+      META_PHONE_NUMBER_ID: '1234567890',
+      CHATBOT_API_BASE_URL: 'https://api.example.com',
+      SERVICE_KEY: 'svc_stub',
+      CHATBOT_API_BRANCH_ID: 'stub-branch',
+      AI_GATEWAY_API_KEY: 'stub-gateway',
+      LLM_MODEL: 'anthropic/claude-sonnet-4.5',
+    };
+    for (const [key, fallback] of Object.entries(REQUIRED)) {
+      savedEnv[key] = process.env[key];
+      process.env[key] = process.env[key] ?? fallback;
+    }
+
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
     process.env.DATABASE_URL = container.getConnectionUri();
     process.env.DB_POOL_MAX = '4';
@@ -107,6 +124,13 @@ ddescribe('DatabaseModule integration (Testcontainers)', () => {
     }
     if (container) {
       await container.stop();
+    }
+    for (const [key, saved] of Object.entries(savedEnv)) {
+      if (saved === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved;
+      }
     }
     delete process.env.DATABASE_URL;
     delete process.env.DB_POOL_MAX;
