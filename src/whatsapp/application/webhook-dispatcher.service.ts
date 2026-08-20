@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
-import type { AgentRunner } from '../../llm-agent/application/agent-runner.service';
+import { Inject, Injectable } from '@nestjs/common';
+import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
 import type { AgentMessage } from '../../conversation/domain/conversation-store';
 import { InboundMessage } from '../domain/inbound-message';
+import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 
@@ -25,6 +26,7 @@ import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 export class WebhookDispatcherService {
   constructor(
     private readonly agentRunner: AgentRunner,
+    @Inject(WHATSAPP_SENDER)
     private readonly whatsappSender: WhatsappSenderPort,
   ) {}
 
