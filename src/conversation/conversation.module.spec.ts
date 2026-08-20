@@ -27,7 +27,7 @@ describe('ConversationModule binding', () => {
     'CHATBOT_API_BASE_URL',
     'SERVICE_KEY',
     'CHATBOT_API_BRANCH_ID',
-    'AI_GATEWAY_API_KEY',
+    'OPENAI_API_KEY',
     'LLM_MODEL',
     'DATABASE_URL',
   ];
@@ -44,7 +44,7 @@ describe('ConversationModule binding', () => {
       CHATBOT_API_BASE_URL: 'https://api.example.com',
       SERVICE_KEY: 'svc_x',
       CHATBOT_API_BRANCH_ID: 'b',
-      AI_GATEWAY_API_KEY: 'g',
+      OPENAI_API_KEY: 'g',
       LLM_MODEL: 'm',
       DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     });

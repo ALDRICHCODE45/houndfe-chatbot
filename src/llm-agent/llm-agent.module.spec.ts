@@ -38,7 +38,7 @@ describe('LlmAgentModule integration', () => {
     CHATBOT_API_BASE_URL: 'https://api.houndfe.com',
     SERVICE_KEY: 'svc_x',
     CHATBOT_API_BRANCH_ID: 'b',
-    AI_GATEWAY_API_KEY: 'gk',
+    OPENAI_API_KEY: 'ok',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
   };

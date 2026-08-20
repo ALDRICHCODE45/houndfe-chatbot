@@ -31,7 +31,7 @@ describe('DatabaseModule unit wiring', () => {
     'CHATBOT_API_BASE_URL',
     'SERVICE_KEY',
     'CHATBOT_API_BRANCH_ID',
-    'AI_GATEWAY_API_KEY',
+    'OPENAI_API_KEY',
     'LLM_MODEL',
   ];
 
@@ -47,7 +47,7 @@ describe('DatabaseModule unit wiring', () => {
       CHATBOT_API_BASE_URL: 'https://x.example.com',
       SERVICE_KEY: 'svc_x',
       CHATBOT_API_BRANCH_ID: 'b',
-      AI_GATEWAY_API_KEY: 'g',
+      OPENAI_API_KEY: 'g',
       LLM_MODEL: 'm',
       DATABASE_URL: 'postgres://u:p@localhost:5432/d',
       DB_POOL_MAX: '3',
@@ -99,7 +99,7 @@ ddescribe('DatabaseModule integration (Testcontainers)', () => {
       CHATBOT_API_BASE_URL: 'https://api.example.com',
       SERVICE_KEY: 'svc_stub',
       CHATBOT_API_BRANCH_ID: 'stub-branch',
-      AI_GATEWAY_API_KEY: 'stub-gateway',
+      OPENAI_API_KEY: 'stub-openai',
       LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     };
     for (const [key, fallback] of Object.entries(REQUIRED)) {

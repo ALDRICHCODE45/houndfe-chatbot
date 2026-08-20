@@ -21,7 +21,7 @@ describe('AppConfigModule integration', () => {
     CHATBOT_API_BASE_URL: 'https://api.houndfe.com',
     SERVICE_KEY: 'svc_test_service_key',
     CHATBOT_API_BRANCH_ID: 'branch-test-uuid',
-    AI_GATEWAY_API_KEY: 'test-gateway-key',
+    OPENAI_API_KEY: 'test-openai-key',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
   };
@@ -74,7 +74,7 @@ describe('AppConfigModule integration', () => {
       expect(config.get<string>('chatbotApi.branchId')).toBe(
         'branch-test-uuid',
       );
-      expect(config.get<string>('llm.gatewayApiKey')).toBe('test-gateway-key');
+      expect(config.get<string>('llm.openaiApiKey')).toBe('test-openai-key');
       expect(config.get<string>('llm.model')).toBe('anthropic/claude-sonnet-4.5');
       expect(config.get<number>('llm.maxSteps')).toBe(3);
       expect(config.get<number>('llm.historyTurns')).toBe(12);
@@ -109,9 +109,9 @@ describe('AppConfigModule integration', () => {
       ).rejects.toThrow();
     });
 
-    it('throws a configuration error when AI_GATEWAY_API_KEY is missing', async () => {
+    it('throws a configuration error when OPENAI_API_KEY is missing', async () => {
       Object.assign(process.env, VALID_ENV);
-      delete process.env.AI_GATEWAY_API_KEY;
+      delete process.env.OPENAI_API_KEY;
 
       await expect(
         Test.createTestingModule({

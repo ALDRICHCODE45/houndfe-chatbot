@@ -34,9 +34,9 @@ const configuration = () => ({
   },
 
   llm: {
-    /** Vercel AI Gateway API key. */
-    gatewayApiKey: process.env.AI_GATEWAY_API_KEY as string,
-    /** Model identifier served by the gateway (provider/model form). */
+    /** OpenAI API key. */
+    openaiApiKey: process.env.OPENAI_API_KEY as string,
+    /** Model identifier (e.g. gpt-4o-mini). */
     model: process.env.LLM_MODEL as string,
     /** Hard cap on agent step loops (one tool round-trip + final answer). */
     maxSteps: parseInt(process.env.LLM_MAX_STEPS ?? '3', 10),

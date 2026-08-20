@@ -40,7 +40,7 @@ export const envValidationSchema = Joi.object({
   PORT: Joi.number().integer().min(1).max(65535).default(3000),
 
   // ─── LLM agent slice ────────────────────────────────────────────────────
-  AI_GATEWAY_API_KEY: Joi.string().required(),
+  OPENAI_API_KEY: Joi.string().required(),
   LLM_MODEL: Joi.string().required(),
   LLM_MAX_STEPS: Joi.number().integer().min(1).default(3),
   LLM_HISTORY_TURNS: Joi.number().integer().min(1).default(12),

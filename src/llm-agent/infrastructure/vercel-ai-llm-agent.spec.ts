@@ -1,5 +1,5 @@
 import { stepCountIs } from 'ai';
-import { gateway } from 'ai';
+import { openai } from '@ai-sdk/openai';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import {
   GENERATE_TEXT,
@@ -86,7 +86,7 @@ describe('VercelAiLlmAgent', () => {
       expect(stopWhen({ steps: fakeSteps })).toBe(true);
     });
 
-    it('forwards model via gateway(MODEL), system, messages, and tools', async () => {
+    it('forwards model via openai(MODEL), system, messages, and tools', async () => {
       generateTextFn.mockResolvedValueOnce({
         text: 'Hola',
         usage: { inputTokens: 10, outputTokens: 5 },
@@ -122,11 +122,11 @@ describe('VercelAiLlmAgent', () => {
       });
 
       const callArgs = generateTextFn.mock.calls[0]![0] as Record<string, unknown>;
-      // Model forwarded via the gateway provider (assert modelId, since
-      // gateway() returns a fresh LanguageModelV4 reference each call).
+      // Model forwarded via the openai provider (assert modelId, since
+      // openai() returns a fresh LanguageModelV4 reference each call).
       const model = callArgs.model as { modelId?: string; provider?: string };
       expect(model.modelId).toBe('anthropic/claude-sonnet-4.5');
-      expect(model.provider).toBe('gateway');
+      expect(model.provider).toBe('openai.responses');
       // System prompt forwarded verbatim.
       expect(callArgs.system).toBe(SYSTEM_PROMPT);
       // Messages forwarded including the new user turn.
@@ -311,10 +311,10 @@ describe('VercelAiLlmAgent', () => {
         GENERATE_TEXT: symbol;
       };
       expect(providerModule.GENERATE_TEXT).toBe(GENERATE_TEXT);
-      // gateway() from the SDK returns a model reference (proves the
+      // openai() from the SDK returns a model reference (proves the
       // SDK is loaded and the call typechecks).
-      const m = gateway('anthropic/claude-sonnet-4.5') as { provider: string };
-      expect(m.provider).toBe('gateway');
+      const m = openai('anthropic/claude-sonnet-4.5') as { provider: string };
+      expect(m.provider).toBe('openai.responses');
     });
   });
 });

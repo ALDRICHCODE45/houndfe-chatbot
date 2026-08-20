@@ -15,7 +15,7 @@ describe('envValidationSchema', () => {
     CHATBOT_API_BASE_URL: 'https://api.example.com',
     SERVICE_KEY: 'svc_my_service_key',
     CHATBOT_API_BRANCH_ID: 'branch-uuid-1234',
-    AI_GATEWAY_API_KEY: 'gateway-key-abc',
+    OPENAI_API_KEY: 'openai-key-abc',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://houndfe:houndfe@localhost:5432/houndfe_chatbot',
   };
@@ -185,15 +185,15 @@ describe('envValidationSchema', () => {
 
   // ─── LLM agent env vars ───────────────────────────────────────────────────
   describe('LLM env vars', () => {
-    it('rejects when AI_GATEWAY_API_KEY is absent', () => {
+    it('rejects when OPENAI_API_KEY is absent', () => {
       const env = { ...validEnv };
-      delete (env as Partial<typeof validEnv>).AI_GATEWAY_API_KEY;
+      delete (env as Partial<typeof validEnv>).OPENAI_API_KEY;
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
       });
       expect(error).toBeDefined();
       expect(
-        error!.details.some((d) => d.path.includes('AI_GATEWAY_API_KEY')),
+        error!.details.some((d) => d.path.includes('OPENAI_API_KEY')),
       ).toBe(true);
     });
 

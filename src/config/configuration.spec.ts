@@ -18,7 +18,7 @@ describe('configuration()', () => {
     'CHATBOT_API_BASE_URL',
     'SERVICE_KEY',
     'CHATBOT_API_BRANCH_ID',
-    'AI_GATEWAY_API_KEY',
+    'OPENAI_API_KEY',
     'LLM_MODEL',
     'LLM_MAX_STEPS',
     'LLM_HISTORY_TURNS',

@@ -28,6 +28,7 @@
     "checkOrder": true
   },
   "dependencies": {
+    "@ai-sdk/openai": "^4.0.20",
     "@nestjs/axios": "^4.0.1",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.4",

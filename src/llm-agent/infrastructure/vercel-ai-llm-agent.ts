@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { gateway, stepCountIs } from 'ai';
+import { stepCountIs } from 'ai';
 import type { ModelMessage } from 'ai';
+import { openai } from '@ai-sdk/openai';
 import type { AgentMessage } from '../domain/agent-message';
 import type {
   LlmAgentPort,
@@ -34,7 +35,7 @@ export class VercelAiLlmAgent implements LlmAgentPort {
   async run(input: LlmRunInput): Promise<LlmRunResult> {
     const messages = assembleModelMessages(input.history, input.text);
     const result = await this.generateTextFn({
-      model: gateway(this.modelId),
+      model: openai(this.modelId),
       system: input.systemPrompt,
       messages,
       tools: input.tools as never,
