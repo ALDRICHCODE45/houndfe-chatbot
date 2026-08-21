@@ -7,7 +7,11 @@ import {
   UnsupportedOutboundError,
   WHATSAPP_SENDER,
 } from '../domain/whatsapp-sender.port';
-import { MetaWhatsappSender, WhatsappSendError } from './meta-whatsapp.sender';
+import {
+  MetaWhatsappSender,
+  normalizeSandboxRecipient,
+  WhatsappSendError,
+} from './meta-whatsapp.sender';
 
 describe('MetaWhatsappSender', () => {
   let httpService: jest.Mocked<Pick<HttpService, 'post'>>;
@@ -82,7 +86,7 @@ describe('MetaWhatsappSender', () => {
       {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
-        to: '5215550001111',
+        to: '525550001111',
         type: 'text',
         text: {
           body: 'Echo: hola',
@@ -142,5 +146,25 @@ describe('MetaWhatsappSender', () => {
     expect((thrown as WhatsappSendError).status).toBe(400);
     expect(JSON.stringify(thrown)).not.toContain(token);
     expect(JSON.stringify(thrown)).not.toContain('Authorization');
+  });
+});
+
+describe('normalizeSandboxRecipient (TEMPORARY sandbox workaround)', () => {
+  it('strips the Mexican national trunk 1 from a 521XXXXXXXXXX number', () => {
+    expect(normalizeSandboxRecipient('5215585876245')).toBe('525585876245');
+  });
+
+  it('leaves non-Mexican numbers unchanged', () => {
+    expect(normalizeSandboxRecipient('15550001111')).toBe('15550001111');
+    expect(normalizeSandboxRecipient('44235550001111')).toBe('44235550001111');
+  });
+
+  it('leaves Mexican numbers without the trunk 1 unchanged', () => {
+    expect(normalizeSandboxRecipient('525585876245')).toBe('525585876245');
+  });
+
+  it('leaves malformed numbers unchanged', () => {
+    expect(normalizeSandboxRecipient('52155858762')).toBe('52155858762');
+    expect(normalizeSandboxRecipient('not-a-number')).toBe('not-a-number');
   });
 });

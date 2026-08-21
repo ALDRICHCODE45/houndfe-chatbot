@@ -42,7 +42,13 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   async sendText(message: OutboundText): Promise<SendResult> {
     this.assertTextMessage(message);
 
-    const response = await this.postTextMessage(message);
+    // TEMPORARY SANDBOX WORKAROUND — REMOVE FOR PRODUCTION (see below)
+    const normalizedMessage = {
+      ...message,
+      to: normalizeSandboxRecipient(message.to),
+    };
+
+    const response = await this.postTextMessage(normalizedMessage);
 
     const providerMessageId = response.messages?.[0]?.id;
 
@@ -116,4 +122,41 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       throw new UnsupportedOutboundError();
     }
   }
+}
+
+/**
+ * TEMPORARY SANDBOX WORKAROUND — REMOVE FOR PRODUCTION ⚠️
+ *
+ * Context: Meta's TEST phone number (the sandbox number, not a real
+ * registered number) only permits replying to phone numbers that appear
+ * in its "allowed recipients" list. When a customer messages the bot,
+ * the webhook `from` field uses the E.164 Mexico format WITH the national
+ * trunk prefix `1` (e.g. `5215585876245`). However, the sandbox allowed
+ * list only contains the format WITHOUT that trunk prefix (e.g.
+ * `525585876245`), so replying to the `from` number as-is fails with
+ * Meta error 131030 "Recipient phone number not in allowed list".
+ *
+ * This function strips the Mexican national trunk `1` (the digit after
+ * the `52` country code) so the bot can reply to test recipients.
+ *
+ * WHEN TO REMOVE:
+ * - Once the production WhatsApp Business number is registered (real
+ *   numbers do NOT have the allowed-recipient restriction), this
+ *   normalization MUST be deleted. The E.164 format WITH the trunk `1`
+ *   is the correct format for Mexico in production.
+ * - Do NOT ship this to production.
+ *
+ * This is scoped narrowly: only numbers matching the Mexico pattern
+ * `521` + 10 digits are touched. Any other number is passed through
+ * unchanged.
+ */
+export function normalizeSandboxRecipient(to: string): string {
+  const MEXICO_TRUNK_1_PATTERN = /^521\d{10}$/;
+
+  if (MEXICO_TRUNK_1_PATTERN.test(to)) {
+    // "521" + 10 digits → "52" + 10 digits (drop the national trunk 1)
+    return `52${to.slice(3)}`;
+  }
+
+  return to;
 }
