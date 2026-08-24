@@ -34,11 +34,22 @@ export class VercelAiLlmAgent implements LlmAgentPort {
 
   async run(input: LlmRunInput): Promise<LlmRunResult> {
     const messages = assembleModelMessages(input.history, input.text);
+    // toolsContext — per-tool runtime values the LLM must NOT see in
+    // the prompt. The cart-touching tools (evaluateCart, createSale)
+    // declare `contextSchema: z.object({ senderId: z.string() })` and
+    // receive `options.context.senderId` inside `execute`. Stateless
+    // tools don't appear here — the SDK only requires an entry for
+    // tools that declare a contextSchema.
+    const toolsContext = {
+      evaluateCart: { senderId: input.senderId },
+      createSale: { senderId: input.senderId },
+    };
     const result = await this.generateTextFn({
       model: openai(this.modelId),
       system: input.systemPrompt,
       messages,
       tools: input.tools as never,
+      toolsContext,
       stopWhen: stepCountIs(this.maxSteps),
     } as never);
 
@@ -101,5 +112,9 @@ function assembleAgentMessages(
   userText: string,
   assistantText: string,
 ): AgentMessage[] {
-  return [...history, { role: 'user', content: userText }, { role: 'assistant', content: assistantText }];
+  return [
+    ...history,
+    { role: 'user', content: userText },
+    { role: 'assistant', content: assistantText },
+  ];
 }

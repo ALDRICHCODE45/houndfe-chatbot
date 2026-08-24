@@ -18,6 +18,7 @@ describe('configuration()', () => {
     'CHATBOT_API_BASE_URL',
     'SERVICE_KEY',
     'CHATBOT_API_BRANCH_ID',
+    'CHATBOT_API_CASHIER_USER_ID',
     'OPENAI_API_KEY',
     'LLM_MODEL',
     'LLM_MAX_STEPS',
@@ -75,5 +76,20 @@ describe('configuration()', () => {
     };
 
     expect(cfg.database.poolMax).toBe(12);
+  });
+
+  // Task 1.3/1.4: cashierUserId surfaces on chatbotApi
+  it('exposes chatbotApi.cashierUserId sourced from CHATBOT_API_CASHIER_USER_ID', () => {
+    const uuid = '00000000-0000-4000-8000-000000000001';
+    process.env.CHATBOT_API_CASHIER_USER_ID = uuid;
+
+    const cfg = configuration() as {
+      chatbotApi: { cashierUserId: string };
+    };
+
+    expect(cfg.chatbotApi.cashierUserId).toBe(uuid);
+    expect(cfg.chatbotApi.cashierUserId).toBe(
+      process.env.CHATBOT_API_CASHIER_USER_ID,
+    );
   });
 });

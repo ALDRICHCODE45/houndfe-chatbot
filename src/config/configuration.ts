@@ -31,6 +31,12 @@ const configuration = () => ({
     serviceKey: process.env.SERVICE_KEY as string,
     /** Branch ID sent as X-Branch-Id on every chatbot-api request */
     branchId: process.env.CHATBOT_API_BRANCH_ID as string,
+    /**
+     * UUID of the seeded bot-dedicated cashier User record (AGENTS.md
+     * §5.3). Surfaced on every `POST /chatbot-api/sales` request via
+     * the createSale tool — the model can never pick this id.
+     */
+    cashierUserId: process.env.CHATBOT_API_CASHIER_USER_ID as string,
   },
 
   llm: {
@@ -48,10 +54,7 @@ const configuration = () => ({
       10,
     ),
     /** Idle window before a sender's history is reset (3h default). */
-    idleTimeoutMs: parseInt(
-      process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000',
-      10,
-    ),
+    idleTimeoutMs: parseInt(process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000', 10),
   },
 
   database: {

@@ -1,10 +1,7 @@
 import { stepCountIs } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
-import {
-  GENERATE_TEXT,
-  type GenerateTextFn,
-} from './generate-text.provider';
+import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
 import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
 
 /**
@@ -34,6 +31,61 @@ describe('VercelAiLlmAgent', () => {
   // Scenario: Adapter returns usage and forwards the step cap
   // ────────────────────────────────────────────────────────────────────
   describe('run (happy path)', () => {
+    it('forwards toolsContext with { senderId: input.senderId } for the cart-touching tools', async () => {
+      generateTextFn.mockResolvedValueOnce({
+        text: 'Hola',
+        usage: { inputTokens: 10, outputTokens: 5 },
+        content: [],
+        files: [],
+        reasoning: [],
+        reasoningText: undefined,
+        sources: [],
+        toolCalls: [],
+        staticToolCalls: [],
+        dynamicToolCalls: [],
+        toolResults: [],
+        staticToolResults: [],
+        dynamicToolResults: [],
+        finishReason: 'stop',
+        rawFinishReason: undefined,
+        totalUsage: { inputTokens: 10, outputTokens: 5 },
+        warnings: undefined,
+        request: {} as never,
+        response: {} as never,
+        providerMetadata: undefined,
+        responseMessages: [],
+        steps: [],
+        finalStep: {} as never,
+      } as never);
+
+      await agent.run({
+        senderId: '5215550001111',
+        text: 'hola',
+        history: [],
+        systemPrompt: SYSTEM_PROMPT,
+        tools: {
+          evaluateCart: {
+            description: 'e',
+            inputSchema: {},
+            execute: () => {},
+          },
+          createSale: { description: 's', inputSchema: {}, execute: () => {} },
+        },
+      });
+
+      const callArgs = generateTextFn.mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
+      // toolsContext is a per-tool map keyed by tool name. The cart
+      // tools (evaluateCart, createSale) need { senderId }; the
+      // stateless tools don't need context, so the map is sparse.
+      expect(callArgs.toolsContext).toEqual({
+        evaluateCart: { senderId: '5215550001111' },
+        createSale: { senderId: '5215550001111' },
+      });
+    });
+
     it('forwards the configured stopWhen: stepCountIs(MAX_STEPS)', async () => {
       generateTextFn.mockResolvedValueOnce({
         text: 'Hola',
@@ -72,11 +124,16 @@ describe('VercelAiLlmAgent', () => {
       });
 
       expect(generateTextFn).toHaveBeenCalledTimes(1);
-      const callArgs = generateTextFn.mock.calls[0]![0] as Record<string, unknown>;
+      const callArgs = generateTextFn.mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
       // stopWhen forwarding is the critical cap (runaway loop guard).
       // stepCountIs(N) returns a fresh closure each call, so we assert
       // shape (function) and behavioural equivalence via the SDK helper.
-      const stopWhen = callArgs.stopWhen as { (s: { steps: unknown[] }): boolean };
+      const stopWhen = callArgs.stopWhen as {
+        (s: { steps: unknown[] }): boolean;
+      };
       expect(typeof stopWhen).toBe('function');
       const reference = stepCountIs(3) as (s: { steps: unknown[] }) => boolean;
       // Same step count and same trigger result for empty steps.
@@ -121,7 +178,10 @@ describe('VercelAiLlmAgent', () => {
         tools: { getCurrentTime: { description: 't' } },
       });
 
-      const callArgs = generateTextFn.mock.calls[0]![0] as Record<string, unknown>;
+      const callArgs = generateTextFn.mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
       // Model forwarded via the openai provider (assert modelId, since
       // openai() returns a fresh LanguageModelV4 reference each call).
       const model = callArgs.model as { modelId?: string; provider?: string };
@@ -130,7 +190,10 @@ describe('VercelAiLlmAgent', () => {
       // System prompt forwarded verbatim.
       expect(callArgs.system).toBe(SYSTEM_PROMPT);
       // Messages forwarded including the new user turn.
-      const messages = callArgs.messages as Array<{ role: string; content: string }>;
+      const messages = callArgs.messages as Array<{
+        role: string;
+        content: string;
+      }>;
       expect(messages).toContainEqual({ role: 'user', content: 'hola' });
       // Tools forwarded.
       expect(callArgs.tools).toEqual({ getCurrentTime: { description: 't' } });
@@ -298,7 +361,11 @@ describe('VercelAiLlmAgent', () => {
 
       expect(result.usage).toEqual({ promptTokens: 0, completionTokens: 0 });
       // No NaN: aggregate must be finite.
-      expect(Number.isFinite(result.usage.promptTokens + result.usage.completionTokens)).toBe(true);
+      expect(
+        Number.isFinite(
+          result.usage.promptTokens + result.usage.completionTokens,
+        ),
+      ).toBe(true);
     });
   });
 
@@ -307,9 +374,9 @@ describe('VercelAiLlmAgent', () => {
   // ────────────────────────────────────────────────────────────────────
   describe('GENERATE_TEXT provider', () => {
     it('is exported as the same symbol from the provider module', () => {
-      const providerModule = jest.requireActual('./generate-text.provider') as {
-        GENERATE_TEXT: symbol;
-      };
+      const providerModule = jest.requireActual<{ GENERATE_TEXT: unknown }>(
+        './generate-text.provider',
+      );
       expect(providerModule.GENERATE_TEXT).toBe(GENERATE_TEXT);
       // openai() from the SDK returns a model reference (proves the
       // SDK is loaded and the call typechecks).

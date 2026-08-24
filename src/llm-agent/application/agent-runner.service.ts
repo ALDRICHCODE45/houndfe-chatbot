@@ -6,15 +6,9 @@ import {
   type AgentMessage,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import {
-  LLM_AGENT,
-  type LlmAgentPort,
-} from '../domain/llm-agent.port';
-import {
-  TOOL_REGISTRY,
-  type ToolRegistry,
-} from '../domain/tool-registry.port';
-import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { LLM_AGENT, type LlmAgentPort } from '../domain/llm-agent.port';
+import { TOOL_REGISTRY, type ToolRegistry } from '../domain/tool-registry.port';
+import { LLM_AGENT_SYSTEM_PROMPT } from '../domain/system-prompt';
 import { CostGuardService } from './cost-guard.service';
 
 export interface AgentRunnerConfig {
@@ -58,13 +52,18 @@ export class AgentRunner {
     @Inject(LLM_AGENT) private readonly llm: LlmAgentPort,
     @Inject(TOOL_REGISTRY) private readonly tools: ToolRegistry,
     private readonly costGuard: CostGuardService,
+    @Inject(LLM_AGENT_SYSTEM_PROMPT) systemPrompt: string,
     configService: ConfigService,
   ) {
+    // Composition happens once at module boot (LlmAgentModule factory).
+    // The runner never overrides the prompt at runtime — that contract
+    // is preserved (spec llm-agent: "MUST NOT override the prompt at
+    // runtime").
+    this.systemPrompt = systemPrompt;
     const llmCfg = configService.get<{
       historyTurns: number;
       idleTimeoutMs: number;
     }>('llm')!;
-    this.systemPrompt = SYSTEM_PROMPT;
     this.historyTurns = llmCfg.historyTurns;
     this.idleTimeoutMs = llmCfg.idleTimeoutMs;
   }
@@ -90,7 +89,14 @@ export class AgentRunner {
         return undefined;
       },
     } as unknown as ConfigService;
-    return new AgentRunner(store, llm, tools, costGuard, stub);
+    return new AgentRunner(
+      store,
+      llm,
+      tools,
+      costGuard,
+      config.systemPrompt,
+      stub,
+    );
   }
 
   async handle(input: AgentRunnerHandleInput): Promise<{ reply: string }> {
@@ -103,9 +109,11 @@ export class AgentRunner {
     // 2) Idle-check + 3) truncate in memory.
     const idleExpired =
       state !== null &&
-      now.getTime() - new Date(state.lastMessageAt).getTime() > this.idleTimeoutMs;
+      now.getTime() - new Date(state.lastMessageAt).getTime() >
+        this.idleTimeoutMs;
 
-    const allTurns: AgentMessage[] = state === null || idleExpired ? [] : readMessages(state);
+    const allTurns: AgentMessage[] =
+      state === null || idleExpired ? [] : readMessages(state);
     const truncated = allTurns.slice(-this.historyTurns);
 
     // 4) Run the agent.
@@ -137,5 +145,6 @@ export class AgentRunner {
 }
 
 // Keep config-shape exports silent under strict TS.
-export const __agentRunnerConfigBrand: AgentRunnerConfig | undefined = undefined;
+export const __agentRunnerConfigBrand: AgentRunnerConfig | undefined =
+  undefined;
 void __agentRunnerConfigBrand;

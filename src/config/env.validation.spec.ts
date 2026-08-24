@@ -18,6 +18,7 @@ describe('envValidationSchema', () => {
     OPENAI_API_KEY: 'openai-key-abc',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://houndfe:houndfe@localhost:5432/houndfe_chatbot',
+    CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
   };
 
   // ─── Task 1.2 ─────────────────────────────────────────────────────────────
@@ -300,6 +301,54 @@ describe('envValidationSchema', () => {
       expect(error!.details.some((d) => d.path.includes('DB_POOL_MAX'))).toBe(
         true,
       );
+    });
+  });
+
+  // CHATBOT_API_CASHIER_USER_ID -- task 1.1
+  describe('CHATBOT_API_CASHIER_USER_ID', () => {
+    it('rejects when CHATBOT_API_CASHIER_USER_ID is absent', () => {
+      const env = { ...validEnv };
+      delete (env as Partial<typeof validEnv>).CHATBOT_API_CASHIER_USER_ID;
+
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) =>
+          d.path.includes('CHATBOT_API_CASHIER_USER_ID'),
+        ),
+      ).toBe(true);
+    });
+
+    it('rejects when CHATBOT_API_CASHIER_USER_ID is not a valid UUID', () => {
+      const env = {
+        ...validEnv,
+        CHATBOT_API_CASHIER_USER_ID: 'cashier-1',
+      };
+
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) =>
+          d.path.includes('CHATBOT_API_CASHIER_USER_ID'),
+        ),
+      ).toBe(true);
+    });
+
+    it('accepts a valid UUID v4', () => {
+      const env = {
+        ...validEnv,
+        CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
     });
   });
 });

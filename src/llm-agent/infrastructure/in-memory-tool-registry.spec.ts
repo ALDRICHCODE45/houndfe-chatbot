@@ -35,7 +35,9 @@ describe('InMemoryToolRegistry', () => {
 
   it('the getCurrentTime execute function returns an ISO 8601 timestamp', async () => {
     const tools = registry.getTools();
-    const tool = tools.getCurrentTime as { execute: () => Promise<{ now: string }> };
+    const tool = tools.getCurrentTime as {
+      execute: () => Promise<{ now: string }>;
+    };
 
     const result = await tool.execute();
 

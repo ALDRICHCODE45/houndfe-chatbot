@@ -4,6 +4,19 @@ import configuration from './configuration';
 import { envValidationSchema } from './env.validation';
 
 /**
+ * Options accepted by `AppConfigModule.forRoot()`.
+ *
+ * `ignoreEnvFile` is intended for tests that want a *process.env-only*
+ * environment (the working directory `.env` file in this repo masks
+ * `delete process.env.X` because @nestjs/config auto-loads it). Production
+ * callers should leave this default `false` so the `.env` file is read on
+ * boot as designed.
+ */
+export interface AppConfigModuleOptions {
+  ignoreEnvFile?: boolean;
+}
+
+/**
  * Global config module.
  *
  * Exposes a static `forRoot()` factory so the module can be initialised
@@ -16,16 +29,17 @@ import { envValidationSchema } from './env.validation';
  *   imports: [AppConfigModule.forRoot()]
  *
  * Usage in tests:
- *   imports: [AppConfigModule.forRoot()]  ← called after process.env is set
+ *   imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })] ← process.env only
  */
 @Module({})
 export class AppConfigModule {
-  static forRoot(): DynamicModule {
+  static forRoot(options: AppConfigModuleOptions = {}): DynamicModule {
     return {
       module: AppConfigModule,
       imports: [
         ConfigModule.forRoot({
           isGlobal: true,
+          ignoreEnvFile: options.ignoreEnvFile ?? false,
           load: [configuration],
           validationSchema: envValidationSchema,
           validationOptions: {

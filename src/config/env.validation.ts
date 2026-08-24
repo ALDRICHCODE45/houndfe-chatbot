@@ -37,6 +37,12 @@ export const envValidationSchema = Joi.object({
     'string.pattern.base': '"SERVICE_KEY" must start with "svc_"',
   }),
   CHATBOT_API_BRANCH_ID: Joi.string().required(),
+  /**
+   * UUID of the seeded bot-dedicated cashier User record (AGENTS.md §5.3).
+   * Boot fails-fast when missing or malformed, matching the existing
+   * LLM env pattern — never bind a port without a valid cashier id.
+   */
+  CHATBOT_API_CASHIER_USER_ID: Joi.string().uuid().required(),
   PORT: Joi.number().integer().min(1).max(65535).default(3000),
 
   // ─── LLM agent slice ────────────────────────────────────────────────────
@@ -44,10 +50,7 @@ export const envValidationSchema = Joi.object({
   LLM_MODEL: Joi.string().required(),
   LLM_MAX_STEPS: Joi.number().integer().min(1).default(3),
   LLM_HISTORY_TURNS: Joi.number().integer().min(1).default(12),
-  LLM_MONTHLY_TOKEN_CEILING: Joi.number()
-    .integer()
-    .min(1)
-    .default(8_000_000),
+  LLM_MONTHLY_TOKEN_CEILING: Joi.number().integer().min(1).default(8_000_000),
   LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),
 
   // ─── Durable conversation store (Postgres) ──────────────────────────────

@@ -7,15 +7,8 @@ import {
   type ConversationState,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import {
-  LLM_AGENT,
-  type LlmAgentPort,
-  type LlmRunResult,
-} from '../domain/llm-agent.port';
-import {
-  TOOL_REGISTRY,
-  type ToolRegistry,
-} from '../domain/tool-registry.port';
+import { LLM_AGENT, type LlmAgentPort } from '../domain/llm-agent.port';
+import { TOOL_REGISTRY, type ToolRegistry } from '../domain/tool-registry.port';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 
 /**
@@ -55,7 +48,7 @@ describe('AgentRunner', () => {
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
-    } as unknown as jest.Mocked<ConversationStore>;
+    };
     // Cast to the typed shape for ease.
     store.get = jest.fn();
     store.create = jest.fn();
@@ -69,30 +62,18 @@ describe('AgentRunner', () => {
     };
     costGuard = new CostGuardService(1_000_000);
 
-    runner = AgentRunner.forTest(
-      store as unknown as ConversationStore,
-      llm as unknown as { run: (i: unknown) => Promise<LlmRunResult> } as LlmAgentPort,
-      tools as unknown as ToolRegistry,
-      costGuard,
-      {
-        systemPrompt: SYSTEM_PROMPT,
-        historyTurns: 4,
-        idleTimeoutMs: TEN_MIN_MS,
-      },
-    );
+    runner = AgentRunner.forTest(store, llm, tools, costGuard, {
+      systemPrompt: SYSTEM_PROMPT,
+      historyTurns: 4,
+      idleTimeoutMs: TEN_MIN_MS,
+    });
 
     // A second runner with a 1-minute ceiling for the idle-boundary spec.
-    runner60s = AgentRunner.forTest(
-      store as unknown as ConversationStore,
-      llm as unknown as { run: (i: unknown) => Promise<LlmRunResult> } as LlmAgentPort,
-      tools as unknown as ToolRegistry,
-      costGuard,
-      {
-        systemPrompt: SYSTEM_PROMPT,
-        historyTurns: 4,
-        idleTimeoutMs: ONE_MIN_MS,
-      },
-    );
+    runner60s = AgentRunner.forTest(store, llm, tools, costGuard, {
+      systemPrompt: SYSTEM_PROMPT,
+      historyTurns: 4,
+      idleTimeoutMs: ONE_MIN_MS,
+    });
   });
 
   afterEach(() => {
@@ -119,12 +100,15 @@ describe('AgentRunner', () => {
         usage: { promptTokens: 5, completionTokens: 7 },
       });
 
-      const result = await runner.handle({ senderId: '5215550001111', text: 'hola' });
+      const result = await runner.handle({
+        senderId: '5215550001111',
+        text: 'hola',
+      });
 
       expect(result).toEqual({ reply: 'Hola, ¿en qué te puedo ayudar?' });
 
       // First run gets no prior history.
-      const llmInput = llm.run.mock.calls[0]![0] as { history: AgentMessage[] };
+      const llmInput = llm.run.mock.calls[0][0] as { history: AgentMessage[] };
       expect(llmInput.history).toEqual([]);
 
       // Persisted: user + assistant turn appended.
@@ -139,7 +123,7 @@ describe('AgentRunner', () => {
       });
     });
 
-    it('forwards SYSTEM_PROMPT verbatim and does NOT override it', async () => {
+    it('forwards the composed system prompt verbatim (config.systemPrompt) and never overrides it', async () => {
       store.get.mockResolvedValue(null);
       store.update.mockResolvedValue({
         senderId: 's',
@@ -155,10 +139,26 @@ describe('AgentRunner', () => {
         usage: { promptTokens: 1, completionTokens: 1 },
       });
 
-      await runner.handle({ senderId: 's', text: 'hola' });
+      // Use a sentinel composed prompt (the production
+      // LLM_AGENT_SYSTEM_PROMPT token is bound to a once-computed string
+      // at module boot).
+      const sentinel = 'BASE_SENTINEL + SALE_FLOW_SLICE_SENTINEL';
+      const sentinelRunner = AgentRunner.forTest(store, llm, tools, costGuard, {
+        systemPrompt: sentinel,
+        historyTurns: 4,
+        idleTimeoutMs: TEN_MIN_MS,
+      });
 
-      const llmInput = llm.run.mock.calls[0]![0] as { systemPrompt: string };
-      expect(llmInput.systemPrompt).toBe(SYSTEM_PROMPT);
+      await sentinelRunner.handle({ senderId: 's', text: 'hola' });
+      await sentinelRunner.handle({ senderId: 's', text: 'segundo' });
+
+      // Every handle() call forwards the SAME composed string -- the
+      // composition-once contract holds; no per-turn override.
+      const llmInputs = llm.run.mock.calls.map(
+        (c) => (c[0] as { systemPrompt: string }).systemPrompt,
+      );
+      expect(llmInputs).toEqual([sentinel, sentinel]);
+      expect(llmInputs[0]).not.toBe(SYSTEM_PROMPT);
     });
   });
 
@@ -184,7 +184,7 @@ describe('AgentRunner', () => {
 
       await runner.handle({ senderId: '5215550001111', text: 'nueva' });
 
-      const llmInput = llm.run.mock.calls[0]![0] as { history: AgentMessage[] };
+      const llmInput = llm.run.mock.calls[0][0] as { history: AgentMessage[] };
       // Runner truncated in-memory: only last 4 turns passed.
       expect(llmInput.history).toHaveLength(4);
 
@@ -210,7 +210,9 @@ describe('AgentRunner', () => {
 
       await runner.handle({ senderId: 's', text: 'hora?' });
 
-      const llmInput = llm.run.mock.calls[0]![0] as { tools: Record<string, unknown> };
+      const llmInput = llm.run.mock.calls[0][0] as {
+        tools: Record<string, unknown>;
+      };
       expect(llmInput.tools).toHaveProperty('getCurrentTime');
     });
   });
@@ -221,7 +223,9 @@ describe('AgentRunner', () => {
   describe('idle-timeout edge', () => {
     it('treats 5-min idle (>1min ceiling) as fresh session: empty history, lastMessageAt updated', async () => {
       const stored = existingState({
-        lastMessageAt: new Date(Date.now() - FIVE_MIN_MS - TEN_S_MS).toISOString(),
+        lastMessageAt: new Date(
+          Date.now() - FIVE_MIN_MS - TEN_S_MS,
+        ).toISOString(),
         turns: 2,
       });
       store.get.mockResolvedValue(stored);
@@ -237,7 +241,7 @@ describe('AgentRunner', () => {
 
       await runner60s.handle({ senderId: '5215550001111', text: 'hola' });
 
-      const llmInput = llm.run.mock.calls[0]![0] as { history: AgentMessage[] };
+      const llmInput = llm.run.mock.calls[0][0] as { history: AgentMessage[] };
       expect(llmInput.history).toEqual([]);
       // lastMessageAt advanced to now.
       expect(store.update).toHaveBeenCalledWith(
@@ -266,7 +270,7 @@ describe('AgentRunner', () => {
 
       await runner60s.handle({ senderId: '5215550001111', text: 'mas' });
 
-      const llmInput = llm.run.mock.calls[0]![0] as { history: AgentMessage[] };
+      const llmInput = llm.run.mock.calls[0][0] as { history: AgentMessage[] };
       // Within window: full (truncated) history forwarded.
       expect(llmInput.history.length).toBeGreaterThan(0);
       expect(llmInput.history).toEqual(stored.data.messages!.slice(-4));
@@ -314,7 +318,9 @@ describe('AgentRunner', () => {
         usage: { promptTokens: 0, completionTokens: 0 },
       });
 
-      await expect(runner.handle({ senderId: 's', text: 'a' })).resolves.toBeDefined();
+      await expect(
+        runner.handle({ senderId: 's', text: 'a' }),
+      ).resolves.toBeDefined();
     });
   });
 

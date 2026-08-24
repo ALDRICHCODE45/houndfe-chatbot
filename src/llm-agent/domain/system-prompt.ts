@@ -1,5 +1,16 @@
 import { z } from 'zod';
 
+/**
+ * DI token for the composed sale-flow system prompt.
+ *
+ * The runtime value is bound at module boot by an async factory that
+ * consults `BankDetailsProvider.get()` ONCE (per design §BankDetailsProvider
+ * Seam). Composed string is `SYSTEM_PROMPT + '\n\n' + SALE_FLOW_INSTRUCTIONS`
+ * (plus the optional bank-details block). `AgentRunner` injects the
+ * token and caches it — composition happens at boot, never per turn.
+ */
+export const LLM_AGENT_SYSTEM_PROMPT = Symbol('LLM_AGENT_SYSTEM_PROMPT');
+
 const systemPromptLiteral = z
   .object({
     prompt: z.string(),

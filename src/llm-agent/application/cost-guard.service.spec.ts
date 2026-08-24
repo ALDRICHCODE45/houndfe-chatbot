@@ -16,7 +16,9 @@ describe('CostGuardService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
   });
 
   afterEach(() => {
@@ -88,7 +90,10 @@ describe('CostGuardService', () => {
     // The adapter contract guarantees this is unreachable, but cost guard
     // is the last line of defence.
     expect(() =>
-      guard.record({ promptTokens: undefined as unknown as number, completionTokens: undefined as unknown as number }),
+      guard.record({
+        promptTokens: undefined as unknown as number,
+        completionTokens: undefined as unknown as number,
+      }),
     ).not.toThrow();
     expect(guard.currentAggregate).toBe(0);
   });

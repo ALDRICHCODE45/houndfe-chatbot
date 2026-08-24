@@ -24,6 +24,7 @@ describe('AppConfigModule integration', () => {
     OPENAI_API_KEY: 'test-openai-key',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
+    CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
   };
 
   const MANAGED_KEYS = Object.keys(VALID_ENV);
@@ -53,7 +54,7 @@ describe('AppConfigModule integration', () => {
       Object.assign(process.env, VALID_ENV);
 
       const moduleRef = await Test.createTestingModule({
-        imports: [AppConfigModule.forRoot()],
+        imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
       }).compile();
 
       const config = moduleRef.get(ConfigService);
@@ -75,7 +76,9 @@ describe('AppConfigModule integration', () => {
         'branch-test-uuid',
       );
       expect(config.get<string>('llm.openaiApiKey')).toBe('test-openai-key');
-      expect(config.get<string>('llm.model')).toBe('anthropic/claude-sonnet-4.5');
+      expect(config.get<string>('llm.model')).toBe(
+        'anthropic/claude-sonnet-4.5',
+      );
       expect(config.get<number>('llm.maxSteps')).toBe(3);
       expect(config.get<number>('llm.historyTurns')).toBe(12);
       expect(config.get<number>('llm.monthlyTokenCeiling')).toBe(8_000_000);
@@ -93,7 +96,7 @@ describe('AppConfigModule integration', () => {
 
       await expect(
         Test.createTestingModule({
-          imports: [AppConfigModule.forRoot()],
+          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
         }).compile(),
       ).rejects.toThrow();
     });
@@ -104,7 +107,7 @@ describe('AppConfigModule integration', () => {
 
       await expect(
         Test.createTestingModule({
-          imports: [AppConfigModule.forRoot()],
+          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
         }).compile(),
       ).rejects.toThrow();
     });
@@ -115,7 +118,7 @@ describe('AppConfigModule integration', () => {
 
       await expect(
         Test.createTestingModule({
-          imports: [AppConfigModule.forRoot()],
+          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
         }).compile(),
       ).rejects.toThrow();
     });
@@ -126,7 +129,7 @@ describe('AppConfigModule integration', () => {
 
       await expect(
         Test.createTestingModule({
-          imports: [AppConfigModule.forRoot()],
+          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
         }).compile(),
       ).rejects.toThrow();
     });

@@ -10,7 +10,11 @@ describe('Tool registry port', () => {
   });
 
   it('a fake registry returning getCurrentTime satisfies the contract', () => {
-    const fakeTimeTool = { description: 'time', inputSchema: {}, execute: jest.fn() };
+    const fakeTimeTool = {
+      description: 'time',
+      inputSchema: {},
+      execute: jest.fn(),
+    };
     const registry: ToolRegistry = {
       getTools: () => ({ getCurrentTime: fakeTimeTool }),
     };
