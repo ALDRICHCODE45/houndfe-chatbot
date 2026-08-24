@@ -1,40 +1,30 @@
-# llm-agent Spec
+# Delta for llm-agent
 
-## Purpose
+## Out of Scope (non-goals)
 
-Provide a pluggable LLM agent loop that the chatbot's webhook dispatcher can call for every
-inbound WhatsApp message. The agent owns its own conversation history (loaded from
-`ConversationStore`, truncated in memory), an idle-timeout session window, a soft monthly
-cost guard, and a tools registry through which future slices plug real
-catalog/pricing/customer/sales capabilities. The LLM provider (Vercel AI SDK + AI Gateway)
-lives behind `LlmAgentPort` (Symbol DI) so the SDK never leaks into `application/` or
-`domain/` layers; provider swap = env change, no code change.
+This delta does NOT modify:
 
-## Requirements
+- LLM provider requirements. The `VercelAiLlmAgent` adapter continues to call
+  the `generateText` provider seam configured for the implementation in the
+  repository (`@ai-sdk/openai` + `OPENAI_API_KEY`). The pre-existing spec drift
+  between this file and the shipped provider (`gateway()` + `AI_GATEWAY_API_KEY`
+  in `openspec/specs/llm-agent/spec.md` vs. shipped `openai(model)` + `OPENAI_API_KEY`)
+  is logged as a follow-up slice (`llm-agent-provider-spec-sync`) and is NOT
+  resolved here.
+- The `AgentRunner` idle-timeout, in-memory history truncation, or monthly cost
+  guard semantics. Those scenarios are preserved verbatim.
+- The chatbot-api contract or the `ChatbotApiClient` port surface. This delta
+  only changes what the agent's `TOOL_REGISTRY` binding resolves to and how the
+  system prompt is composed at module boot.
 
-### Requirement: Hide LLM provider behind a port
+## REMOVED Requirements
 
-The system MUST expose `LlmAgentPort` (Symbol DI) consumed by `application/` and `domain/`.
-Port signature: `run({ senderId, text, history, systemPrompt, tools })` returns `{ reply, messages, usage: { promptTokens, completionTokens } }`.
-Imports from `ai` MUST stay inside `infrastructure/`.
+None.
 
-#### Scenario: Application consumes the port symbol only
+`## RENAMED Requirements` is intentionally unsupported in `openspec-deltas`
+until executable rename semantics land.
 
-- GIVEN the dispatcher in `application/`
-- WHEN TypeScript compiles the agent wiring
-- THEN no file outside `src/llm-agent/infrastructure/` imports from `ai`
-- AND the dispatcher injects `LLM_AGENT` by Symbol.
-
-### Requirement: AI SDK adapter calls generateText via AI Gateway
-
-`VercelAiLlmAgent` MUST implement `LlmAgentPort` by calling `generateText` with the `gateway` provider, the model string from `LLM_MODEL`, the assembled history, the system prompt, the registered tools, and `stopWhen: stepCountIs(LLM_MAX_STEPS)`.
-
-#### Scenario: Adapter returns usage and forwards the step cap
-
-- GIVEN `LLM_MAX_STEPS=3` and a mocked `generateText` resolving with `{ text: "Hola", usage: { promptTokens: 10, completionTokens: 5 } }`
-- WHEN the adapter runs
-- THEN `run` resolves with `reply: "Hola"` and `usage: { promptTokens: 10, completionTokens: 5 }`
-- AND `generateText` was called with `stopWhen: stepCountIs(3)`.
+## MODIFIED Requirements
 
 ### Requirement: AgentRunner drives the tool-calling loop
 
@@ -71,35 +61,6 @@ through `RealToolRegistry`.)
 - THEN the result is empty or not found
 - AND the tool registry is still asked for tools (which MUST resolve, even with
   no prior state).
-
-### Requirement: Enforce idle-timeout session window
-
-The system MUST read `LLM_IDLE_TIMEOUT_MS` at boot.
-For each inbound, the runner MUST compare stored `lastMessageAt` against the timeout.
-If the gap exceeds the timeout, the runner MUST treat the call as a fresh session (empty history, `lastMessageAt` overwritten).
-Within the window, prior history MUST be preserved.
-
-#### Scenario: Boundary behavior at the idle-timeout edge
-
-- GIVEN `LLM_IDLE_TIMEOUT_MS=60000`
-- WHEN an inbound arrives 5 minutes after the stored `lastMessageAt`
-- THEN the runner MUST pass empty history and overwrite `lastMessageAt`.
-- AND WHEN an inbound arrives 10 seconds after the stored `lastMessageAt`
-- THEN the runner MUST pass the prior (truncated) history.
-
-### Requirement: Enforce soft monthly cost guard
-
-The system MUST count `promptTokens + completionTokens` per `run()`, maintain a process-local monthly aggregate, and compare it against `LLM_MONTHLY_TOKEN_CEILING`.
-The runner MUST emit a structured `warn` log when the aggregate crosses 80% and another at 100%.
-The system MUST NOT hard-fail when the ceiling is exceeded.
-
-#### Scenario: 80% and 100% thresholds log warn without blocking
-
-- GIVEN the aggregate is 79% of the ceiling
-- WHEN a turn pushes the aggregate to 81%
-- THEN exactly one `warn` log tagged `>=80%` MUST be emitted and the runner still returns a reply.
-- AND WHEN the aggregate equals the ceiling and another turn runs
-- THEN a `warn` log tagged `>=100%` MUST be emitted and the runner still returns a reply.
 
 ### Requirement: No-hallucination contract in the system prompt
 
@@ -139,19 +100,7 @@ final prompt is built.)
   (call `createSale` at `originalPriceCents`, never at a discounted
   `finalPriceCents`).
 
-### Requirement: Fail fast on missing LLM env
-
-The application MUST refuse to boot when `AI_GATEWAY_API_KEY` is absent or `LLM_MODEL` is unset.
-Joi MUST validate both alongside the existing app-config schema.
-The failure MUST surface before any webhook or agent traffic is accepted.
-
-#### Scenario: Missing key or model blocks boot
-
-- GIVEN `AI_GATEWAY_API_KEY` is unset (other required env present)
-- WHEN the application starts
-- THEN boot MUST fail with a configuration error mentioning the missing variable.
-- AND WHEN `LLM_MODEL` is unset
-- THEN boot MUST fail with a configuration error mentioning `LLM_MODEL`.
+## ADDED Requirements
 
 ### Requirement: LlmAgentModule resolves the real sale-flow tool set and ChatbotApiClient
 
