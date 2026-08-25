@@ -1,5 +1,5 @@
 import { HttpService } from '@nestjs/axios';
-import { Inject, Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { AxiosRequestConfig } from 'axios';
 import { lastValueFrom } from 'rxjs';
@@ -14,6 +14,7 @@ import type {
   CustomerUpsertInput,
   CustomerUpsertResponse,
 } from '../domain/dtos/customers.dto';
+import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
 import type {
   CartEvaluationResult,
   CartItemInput,
@@ -26,6 +27,7 @@ import type {
   OrderHistoryResponse,
   UpdateDeliveryInput,
 } from '../domain/dtos/sales.dto';
+import { CreateSaleInputSchema } from '../domain/dtos/sales.dto';
 import {
   AuthError,
   BranchMismatchError,
@@ -117,14 +119,45 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     dto: CreateSaleInput,
     idempotencyKey: string,
   ): Promise<BotSaleResponse> {
+    // Q2 / R13: validate `expectedTotalCents` before the request goes out.
+    // The schema accepts `null | undefined | non-negative integer`; the wire
+    // strips absent values so the JSON body never carries the key (no `0`,
+    // no `null` to mean "absent").
+    const parsed = CreateSaleInputSchema.parse(dto);
+    const expectedTotalCents = parsed.expectedTotalCents;
+    const wireDto: CreateSaleInput = {
+      cashierUserId: parsed.cashierUserId,
+      customerId: parsed.customerId,
+      shippingAddressId: parsed.shippingAddressId ?? null,
+      items: parsed.items,
+      ...(typeof expectedTotalCents === 'number' ? { expectedTotalCents } : {}),
+    };
     return this.request<BotSaleResponse>({
       method: 'POST',
       url: '/chatbot-api/sales',
-      data: dto,
+      data: wireDto,
       headers: {
         'X-Idempotency-Key': idempotencyKey,
       },
-    });
+    }).then((sale) => this.normalizeSaleResponse(sale));
+  }
+
+  /**
+   * Normalize the resolved `BotSaleResponse`: default `discountCents` to `0`
+   * when the body omits it (legacy backend). Emits a one-time debug-level
+   * warning so the field-set drift is observable in logs (ADR-11).
+   */
+  private normalizeSaleResponse(sale: BotSaleResponse): BotSaleResponse {
+    if (sale.discountCents === undefined || sale.discountCents === null) {
+      if (!discountCentsWarned) {
+        discountCentsWarned = true;
+        new Logger(ChatbotApiHttpClient.name).debug(
+          'chatbot-api `discountCents` omitted on createSale response; defaulting to 0 (legacy backend).',
+        );
+      }
+      return { ...sale, discountCents: 0 };
+    }
+    return sale;
   }
 
   attachReceipt(
@@ -158,6 +191,13 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           phoneCountryCode: cc,
         },
       },
+      { retryable: true },
+    );
+  }
+
+  getPaymentDetails(): Promise<PaymentDetail> {
+    return this.request<PaymentDetail>(
+      { method: 'GET', url: '/chatbot-api/payment-details' },
       { retryable: true },
     );
   }
@@ -255,6 +295,10 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     };
     const status = maybeAxiosError.response?.status;
     const responseBody = maybeAxiosError.response?.data;
+    // Q3 errorCode passthrough: populate `errorCode` from `responseBody.error`
+    // (verbatim, no transformation). `null` when the body is missing, not
+    // JSON, or has no string `error` field (ADR-1 / ADR-2).
+    const errorCode = extractErrorCode(responseBody);
 
     switch (status) {
       case 401:
@@ -262,23 +306,27 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           'Chatbot API authentication failed',
           status,
           responseBody,
+          errorCode,
         );
       case 403:
         return new ForbiddenError(
           'Chatbot API request was forbidden',
           status,
           responseBody,
+          errorCode,
         );
       case 404:
         return new NotFoundError(
           'Chatbot API resource was not found',
           status,
           responseBody,
+          errorCode,
         );
       case 429:
         return new RateLimitError(
           this.parseRetryAfter(maybeAxiosError.response?.headers),
           responseBody,
+          errorCode,
         );
       default:
         if (typeof status === 'number' && status >= 500) {
@@ -286,6 +334,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
             'Chatbot API upstream failure',
             status,
             responseBody,
+            errorCode,
           );
         }
 
@@ -293,6 +342,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           maybeAxiosError.message ?? 'Chatbot API request failed',
           status ?? null,
           responseBody,
+          errorCode,
         );
     }
   }
@@ -316,4 +366,22 @@ function defaultSleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
+}
+
+/** Module-level flag so the legacy-omission warning logs at most once. */
+let discountCentsWarned = false;
+
+/**
+ * Pull the backend envelope's `error` field into a typed string code (ADR-1).
+ * Returns `null` when the body is not an object, has no `error` field, or
+ * the `error` is not a non-empty string (ADR-2 — verbatim, no transforms).
+ */
+function extractErrorCode(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) {
+    return null;
+  }
+  const candidate = (body as { error?: unknown }).error;
+  return typeof candidate === 'string' && candidate.length > 0
+    ? candidate
+    : null;
 }

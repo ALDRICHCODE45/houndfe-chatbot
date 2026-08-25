@@ -21,6 +21,10 @@ export interface CartItem {
 export interface CartState {
   items: CartItem[];
   idempotencyKey: string;
+  /** Optional: persisted by `evaluateCart` on success, read by `createSale`.
+   *  Absent on legacy carts; `createSale` MUST omit the field on the wire
+   *  when undefined (Q2 / R13 promo contract). */
+  expectedTotalCents?: number;
 }
 
 /** Default empty cart — same shape every caller can deep-equal against. */

@@ -15,6 +15,13 @@ describe('cart-state', () => {
       expect(readCart(null)).toEqual(EMPTY_CART);
     });
 
+    it('yields expectedTotalCents: undefined when no cart key exists', () => {
+      const result = readCart(null);
+      // expectedTotalCents is optional; absent is treated as undefined.
+      expect(result).toEqual({ items: [], idempotencyKey: '' });
+      expect(result.expectedTotalCents).toBeUndefined();
+    });
+
     it('returns EMPTY_CART when state has no data.cart key', () => {
       const state: ConversationState = {
         senderId: '5215550001111',
@@ -74,6 +81,55 @@ describe('cart-state', () => {
       });
       // writeCart is pure: state.data.messages is preserved untouched.
       expect(state.data.messages).toEqual([{ role: 'user', content: 'hola' }]);
+    });
+
+    it('round-trips an expectedTotalCents patch through readCart', () => {
+      const state: ConversationState = {
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { messages: [] },
+      };
+      const written = writeCart(state, {
+        items: [{ productId: 'p1', quantity: 1, unitPriceCents: 1500 }],
+        idempotencyKey: 'fresh-uuid',
+        expectedTotalCents: 1500,
+      });
+      expect(written).toEqual({
+        items: [{ productId: 'p1', quantity: 1, unitPriceCents: 1500 }],
+        idempotencyKey: 'fresh-uuid',
+        expectedTotalCents: 1500,
+      });
+      // Round-trip: readCart sees the same value.
+      const state2: ConversationState = {
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: written },
+      };
+      expect(readCart(state2)).toEqual({
+        items: [{ productId: 'p1', quantity: 1, unitPriceCents: 1500 }],
+        idempotencyKey: 'fresh-uuid',
+        expectedTotalCents: 1500,
+      });
+    });
+
+    it('isCartState accepts a legacy cart without expectedTotalCents', () => {
+      const state = {
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {
+          cart: {
+            items: [{ productId: 'p1', quantity: 2, unitPriceCents: 1000 }],
+            idempotencyKey: 'legacy-key',
+            // no expectedTotalCents on purpose
+          },
+        },
+      };
+      // readCart must NOT throw and must NOT default to {} — legacy
+      // carts read with the missing field intact.
+      expect(readCart(state)).toEqual({
+        items: [{ productId: 'p1', quantity: 2, unitPriceCents: 1000 }],
+        idempotencyKey: 'legacy-key',
+      });
     });
 
     it('preserves existing cart fields when patch only overrides some keys', () => {

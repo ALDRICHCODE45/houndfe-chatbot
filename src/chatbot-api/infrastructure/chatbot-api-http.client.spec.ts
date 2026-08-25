@@ -5,6 +5,7 @@ import type { AppConfig } from '../../config/configuration';
 import {
   AuthError,
   BranchMismatchError,
+  ChatbotApiError,
   ForbiddenError,
   NotFoundError,
   RateLimitError,
@@ -410,6 +411,395 @@ describe('ChatbotApiHttpClient', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(RateLimitError);
       expect((error as RateLimitError).retryAfterSeconds).toBe(0);
+    }
+  });
+
+  // ─── Q3 errorCode passthrough + expectedTotalCents wire / discountCents / getPaymentDetails
+
+  it('surfaces errorCode=PROMO_RE_QUOTE on the thrown ChatbotApiError with statusCode 409 and the three numeric payload fields', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: {
+          status: 409,
+          data: {
+            statusCode: 409,
+            error: 'PROMO_RE_QUOTE',
+            message: 'Price changed',
+            recomputedTotalCents: 900,
+            expectedTotalCents: 1000,
+            discountCents: 100,
+          },
+        },
+      })),
+    );
+
+    try {
+      await client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          items: [
+            {
+              productId: 'product-1',
+              productName: 'Croquetas',
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+          expectedTotalCents: 1000,
+        },
+        'idem-pr',
+      );
+      fail('Expected ChatbotApiError to be thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect((error as ChatbotApiError).statusCode).toBe(409);
+      expect((error as ChatbotApiError).errorCode).toBe('PROMO_RE_QUOTE');
+      expect((error as ChatbotApiError).responseBody).toEqual({
+        statusCode: 409,
+        error: 'PROMO_RE_QUOTE',
+        message: 'Price changed',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      });
+    }
+  });
+
+  it('sets errorCode=null when the 422 body has no error field (legacy backend)', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: {
+          status: 422,
+          data: { statusCode: 422, message: 'Validation failed' },
+        },
+      })),
+    );
+
+    try {
+      await client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          items: [
+            {
+              productId: 'product-1',
+              productName: 'Croquetas',
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+        'idem-422',
+      );
+      fail('Expected ChatbotApiError to be thrown');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect((error as ChatbotApiError).statusCode).toBe(422);
+      expect((error as ChatbotApiError).errorCode).toBeNull();
+    }
+  });
+
+  it('populates errorCode on every status-mapped error subclass when the body carries it', async () => {
+    const cases: Array<[number, unknown, string]> = [
+      [401, { error: 'AUTH_REQUIRED' }, 'AUTH_REQUIRED'],
+      [403, { error: 'FORBIDDEN' }, 'FORBIDDEN'],
+      [404, { error: 'NO_ACTIVE_PAYMENT_DETAIL' }, 'NO_ACTIVE_PAYMENT_DETAIL'],
+      [429, { error: 'RATE_LIMIT' }, 'RATE_LIMIT'],
+      [503, { error: 'BOOM' }, 'BOOM'],
+    ];
+    for (const [status, body, code] of cases) {
+      httpService.request.mockReturnValue(
+        throwError(() => ({ response: { status, data: body } })),
+      );
+      try {
+        await client.getStock('product-x');
+        fail(`Expected error for status ${status}`);
+      } catch (error) {
+        expect((error as ChatbotApiError).errorCode).toBe(code);
+      }
+    }
+  });
+
+  it('transport-level failure yields an UpstreamError without errorCode on it', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({ code: 'ECONNRESET', message: 'socket hang up' })),
+    );
+    try {
+      await client.getStock('product-1');
+      fail('Expected UpstreamError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect((error as ChatbotApiError).statusCode).toBeNull();
+      expect((error as ChatbotApiError).errorCode).toBeNull();
+    }
+  });
+
+  it('forwards expectedTotalCents when present in the createSale DTO', async () => {
+    httpService.request.mockReturnValue(
+      of({
+        data: {
+          saleId: 'sale-1',
+          folio: null,
+          paymentStatus: 'CREDIT',
+          channel: 'ONLINE',
+          deliveryStatus: 'PENDING',
+          totalCents: 1000,
+          paidCents: 0,
+          debtCents: 1000,
+          confirmedAt: null,
+          discountCents: 0,
+        },
+      }),
+    );
+    await client.createSale(
+      {
+        cashierUserId: 'cashier-1',
+        customerId: 'customer-1',
+        expectedTotalCents: 1500,
+        items: [
+          {
+            productId: 'product-1',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1500,
+          },
+        ],
+      },
+      'idem-fwd',
+    );
+    const cfg = httpService.request.mock.calls[0]?.[0] as { data: unknown };
+    expect(cfg.data).toMatchObject({ expectedTotalCents: 1500 });
+  });
+
+  it('omits expectedTotalCents entirely when absent or null in the DTO (no key, no 0, no null)', async () => {
+    httpService.request.mockReturnValue(
+      of({
+        data: {
+          saleId: 'sale-1',
+          folio: null,
+          paymentStatus: 'CREDIT',
+          channel: 'ONLINE',
+          deliveryStatus: 'PENDING',
+          totalCents: 1000,
+          paidCents: 0,
+          debtCents: 1000,
+          confirmedAt: null,
+          discountCents: 0,
+        },
+      }),
+    );
+    await client.createSale(
+      {
+        cashierUserId: 'cashier-1',
+        customerId: 'customer-1',
+        expectedTotalCents: null,
+        items: [
+          {
+            productId: 'product-1',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      'idem-null',
+    );
+    const cfg = httpService.request.mock.calls[0]?.[0] as { data: unknown };
+    const serialized = JSON.stringify(cfg.data);
+    expect(serialized).not.toContain('expectedTotalCents');
+  });
+
+  it('rejects negative expectedTotalCents via Zod before any HTTP call is made', async () => {
+    let rejected = false;
+    try {
+      await client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          expectedTotalCents: -10,
+          items: [
+            {
+              productId: 'product-1',
+              productName: 'Croquetas',
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+        'idem-neg',
+      );
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+    expect(httpService.request).not.toHaveBeenCalled();
+  });
+
+  it('resolves BotSaleResponse.discountCents from the body (100) and defaults to 0 when the body omits it', async () => {
+    httpService.request.mockReturnValueOnce(
+      of({
+        data: {
+          saleId: 'sale-1',
+          folio: null,
+          paymentStatus: 'CREDIT',
+          channel: 'ONLINE',
+          deliveryStatus: 'PENDING',
+          totalCents: 900,
+          paidCents: 0,
+          debtCents: 900,
+          confirmedAt: null,
+          discountCents: 100,
+        },
+      }),
+    );
+    await expect(
+      client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          items: [
+            {
+              productId: 'product-1',
+              productName: 'Croquetas',
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+        'idem-d100',
+      ),
+    ).resolves.toEqual(expect.objectContaining({ discountCents: 100 }));
+
+    httpService.request.mockReturnValueOnce(
+      of({
+        data: {
+          saleId: 'sale-2',
+          folio: null,
+          paymentStatus: 'CREDIT',
+          channel: 'ONLINE',
+          deliveryStatus: 'PENDING',
+          totalCents: 1000,
+          paidCents: 0,
+          debtCents: 1000,
+          confirmedAt: null,
+          // no discountCents in the body
+        },
+      }),
+    );
+    await expect(
+      client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          items: [
+            {
+              productId: 'product-1',
+              productName: 'Croquetas',
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+        'idem-d0',
+      ),
+    ).resolves.toEqual(expect.objectContaining({ discountCents: 0 }));
+  });
+
+  it('getPaymentDetails issues GET /chatbot-api/payment-details with no params and no body, returns the PaymentDetail projection', async () => {
+    httpService.request.mockReturnValue(
+      of({
+        data: {
+          id: 'p-1',
+          bankName: 'AFIRME',
+          beneficiary: 'HUN F.E. COMERCIALIZADORA SA DE CV',
+          clabe: '012345678901234567',
+          accountNumber: '1234567890',
+          isActive: true,
+          updatedAt: '2026-08-24T12:00:00.000Z',
+        },
+      }),
+    );
+    await expect(client.getPaymentDetails()).resolves.toEqual({
+      id: 'p-1',
+      bankName: 'AFIRME',
+      beneficiary: 'HUN F.E. COMERCIALIZADORA SA DE CV',
+      clabe: '012345678901234567',
+      accountNumber: '1234567890',
+      isActive: true,
+      updatedAt: '2026-08-24T12:00:00.000Z',
+    });
+    expect(httpService.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'GET',
+        url: '/chatbot-api/payment-details',
+        headers: {
+          Authorization: 'Bearer svc_test_key',
+          'X-Branch-Id': 'branch-123',
+        },
+      }),
+    );
+    const callArgs = httpService.request.mock.calls[0]?.[0] as {
+      data?: unknown;
+      params?: unknown;
+    };
+    // The GET sends no params and no body (axios strips undefined).
+    expect(callArgs.data).toBeUndefined();
+    expect(callArgs.params).toBeUndefined();
+  });
+
+  it('getPaymentDetails surfaces 404 NO_ACTIVE_PAYMENT_DETAIL as ChatbotApiError(errorCode)', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: {
+          status: 404,
+          data: {
+            statusCode: 404,
+            error: 'NO_ACTIVE_PAYMENT_DETAIL',
+            message: 'No active payment detail configured',
+          },
+        },
+      })),
+    );
+    try {
+      await client.getPaymentDetails();
+      fail('Expected ChatbotApiError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(NotFoundError);
+      expect((error as ChatbotApiError).statusCode).toBe(404);
+      expect((error as ChatbotApiError).errorCode).toBe(
+        'NO_ACTIVE_PAYMENT_DETAIL',
+      );
+    }
+  });
+
+  it('getPaymentDetails maps 401 to AuthError with errorCode=null', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: { status: 401, data: { message: 'no auth' } },
+      })),
+    );
+    try {
+      await client.getPaymentDetails();
+      fail('Expected AuthError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(AuthError);
+      expect((error as ChatbotApiError).errorCode).toBeNull();
+    }
+  });
+
+  it('getPaymentDetails maps 503 to UpstreamError with errorCode from the body when present', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: { status: 503, data: { error: 'BOOM' } },
+      })),
+    );
+    try {
+      await client.getPaymentDetails();
+      fail('Expected UpstreamError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect((error as ChatbotApiError).errorCode).toBe('BOOM');
     }
   });
 });

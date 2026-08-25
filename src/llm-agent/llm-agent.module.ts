@@ -68,9 +68,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
       // Evaluated ONCE at module boot; AgentRunner injects the resolved
       // string and never overrides it per turn.
       provide: LLM_AGENT_SYSTEM_PROMPT,
-      inject: [BANK_DETAILS_PROVIDER],
-      useFactory: async (bankDetails: BankDetailsProvider) =>
-        composeSaleFlowSystemPrompt(SYSTEM_PROMPT, await bankDetails.get()),
+      // Commit 2 of this slice drops the BANK_DETAILS_PROVIDER injection.
+      useFactory: () => composeSaleFlowSystemPrompt(SYSTEM_PROMPT),
     },
     {
       provide: CostGuardService,

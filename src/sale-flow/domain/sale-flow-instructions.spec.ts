@@ -1,18 +1,21 @@
 import {
   SALE_FLOW_INSTRUCTIONS,
   composeSaleFlowSystemPrompt,
-  renderBankDetailsBlock,
-  type BankDetails,
 } from './sale-flow-instructions';
 
 /**
  * Contract tests for the composed sale-flow system prompt.
  *
- * Spec scenarios:
- *   - composed prompt contains the four contractual strings
- *   - composed prompt is `base + '\n\n' + slice` when BankDetails is null
- *   - composed prompt appends a rendered bank block when BankDetails is set
+ * Spec scenarios (Q1/Q2/Q3 slice):
+ *   - composed prompt is `base + '\n\n' + slice` (one-arg composer; the
+ *     boot-time bank-details seam has been deleted)
  *   - composition happens at boot, not per turn (literal is constant)
+ *   - step 12 gates `getPaymentDetails` to "after `createSale` succeeds"
+ *   - the human-handoff phrase is byte-identical, wrapped in a
+ *     `noActivePaymentDetail` branch
+ *   - step 11 carries the `promoReQuote` re-confirmation + fresh-UUID rule
+ *   - marker order covers the 10-tool registry (getPaymentDetails between
+ *     createSale and attachReceipt)
  */
 describe('sale-flow-instructions', () => {
   const base = 'BASE_PROMPT_PLACEHOLDER';
@@ -35,7 +38,7 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('encodes the 14-step escrow flow markers in order', () => {
+    it('encodes the 14-step escrow flow markers in order (with getPaymentDetails between createSale and attachReceipt)', () => {
       const stepOrder = [
         'searchCatalog',
         'checkStock',
@@ -43,6 +46,7 @@ describe('sale-flow-instructions', () => {
         'getCustomerByPhone',
         'upsertCustomer',
         'createSale',
+        'getPaymentDetails',
         'attachReceipt',
       ];
       let lastIndex = -1;
@@ -60,68 +64,51 @@ describe('sale-flow-instructions', () => {
       expect(SALE_FLOW_INSTRUCTIONS).toContain('needs_human_review');
     });
 
-    it('contains the human-handoff phrase for the bank-details-null case', () => {
+    it('step 11 carries the promoReQuote re-confirmation + fresh-UUID-v4 rule', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('promoReQuote');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('recomputedTotalCents');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('expectedTotalCents');
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/UUID v4/i);
+    });
+
+    it('step 12 contains the getPaymentDetails-after-createSale gating rule', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Llama a `getPaymentDetails` después de que `createSale` confirme',
+      );
+    });
+
+    it('contains the human-handoff phrase (byte-identical snapshot)', () => {
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'en un momento un agente te comparte los datos de pago',
       );
     });
+
+    it('the human-handoff phrase appears inside a noActivePaymentDetail branch', () => {
+      // Verify the byte-identical phrase is gated by the new discriminated
+      // kind, not exposed unconditionally.
+      const phrase = 'en un momento un agente te comparte los datos de pago';
+      const phraseIdx = SALE_FLOW_INSTRUCTIONS.indexOf(phrase);
+      const kindIdx = SALE_FLOW_INSTRUCTIONS.indexOf('noActivePaymentDetail');
+      expect(phraseIdx).toBeGreaterThan(-1);
+      expect(kindIdx).toBeGreaterThan(-1);
+      // The kind label appears before the phrase (the gate is announced first).
+      expect(kindIdx).toBeLessThan(phraseIdx);
+    });
   });
 
   describe('composeSaleFlowSystemPrompt', () => {
-    it('returns base + "\\n\\n" + slice when BankDetails is null (v1 default)', () => {
-      expect(composeSaleFlowSystemPrompt(base, null)).toBe(
+    it('returns base + "\\n\\n" + slice (one-arg composer)', () => {
+      expect(composeSaleFlowSystemPrompt(base)).toBe(
         base + '\n\n' + SALE_FLOW_INSTRUCTIONS,
       );
     });
 
-    it('appends a rendered bank block AFTER the slice when BankDetails is set', () => {
-      const details: BankDetails = {
-        bankName: 'AFIRME',
-        beneficiary: 'HUN F.E. COMERCIALIZADORA SA DE CV',
-        clabe: '062580000000000001',
-        accountNumber: '00000000001',
-      };
-      const composed = composeSaleFlowSystemPrompt(base, details);
-
-      expect(composed.startsWith(base + '\n\n' + SALE_FLOW_INSTRUCTIONS)).toBe(
-        true,
-      );
-      expect(composed).toContain('Datos bancarios para la transferencia');
-      expect(composed).toContain(details.bankName);
-      expect(composed).toContain(details.beneficiary);
-      expect(composed).toContain(details.clabe);
-      expect(composed).toContain(details.accountNumber);
-    });
-
-    it('composed prompt with BankDetails still contains the four contract strings', () => {
-      const details: BankDetails = {
-        bankName: 'AFIRME',
-        beneficiary: 'X',
-        clabe: '1',
-        accountNumber: '2',
-      };
-      const composed = composeSaleFlowSystemPrompt(base, details);
+    it('composed prompt still contains the four contract strings', () => {
+      const composed = composeSaleFlowSystemPrompt(base);
       expect(composed).toContain('esa función aún no está disponible');
       expect(composed).toMatch(/voseo/i);
       expect(composed).toContain('originalPriceCents');
       expect(composed).toContain('searchCatalog');
-    });
-  });
-
-  describe('renderBankDetailsBlock', () => {
-    it('formats the four fields into a Spanish-readable block', () => {
-      const block = renderBankDetailsBlock({
-        bankName: 'AFIRME',
-        beneficiary: 'HUN F.E. COMERCIALIZADORA SA DE CV',
-        clabe: '062580000000000001',
-        accountNumber: '00000000001',
-      });
-      expect(block).toContain('AFIRME');
-      expect(block).toContain('HUN F.E. COMERCIALIZADORA SA DE CV');
-      expect(block).toContain('062580000000000001');
-      expect(block).toContain('00000000001');
-      expect(block).toContain('CLABE');
-      expect(block).toContain('Beneficiario');
     });
   });
 });

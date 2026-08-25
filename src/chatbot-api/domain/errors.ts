@@ -3,6 +3,7 @@ export class ChatbotApiError extends Error {
     message: string,
     public readonly statusCode: number | null,
     public readonly responseBody?: unknown,
+    public readonly errorCode: string | null = null,
   ) {
     super(message);
     this.name = new.target.name;
@@ -18,8 +19,12 @@ export class NotFoundError extends ChatbotApiError {}
 export class UpstreamError extends ChatbotApiError {}
 
 export class RateLimitError extends ChatbotApiError {
-  constructor(retryAfterSeconds: number | null, responseBody?: unknown) {
-    super('Chatbot API rate limit exceeded', 429, responseBody);
+  constructor(
+    retryAfterSeconds: number | null,
+    responseBody?: unknown,
+    errorCode: string | null = null,
+  ) {
+    super('Chatbot API rate limit exceeded', 429, responseBody, errorCode);
     this.retryAfterSeconds = retryAfterSeconds;
   }
 

@@ -23,6 +23,135 @@ import { mapChatbotError } from './error-mapping';
  *   - Unknown / non-ChatbotApiError -> rethrow
  */
 describe('mapChatbotError', () => {
+  function apiError(
+    statusCode: number | null,
+    responseBody: unknown,
+    errorCode: string | null,
+  ): ChatbotApiError {
+    return new ChatbotApiError('x', statusCode, responseBody, errorCode);
+  }
+
+  it('PROMO_RE_QUOTE (409 + well-formed payload) → {promoReQuote, retryable:false, 3 numeric fields}', () => {
+    const err = apiError(
+      409,
+      {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      },
+      'PROMO_RE_QUOTE',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: {
+        kind: 'promoReQuote',
+        retryable: false,
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      },
+    });
+  });
+
+  it('NO_ACTIVE_PAYMENT_DETAIL (404) → {noActivePaymentDetail, false}', () => {
+    const err = apiError(
+      404,
+      { error: 'NO_ACTIVE_PAYMENT_DETAIL' },
+      'NO_ACTIVE_PAYMENT_DETAIL',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'noActivePaymentDetail', retryable: false },
+    });
+  });
+
+  it('IDEMPOTENCY_KEY_IN_FLIGHT (409) → {idempotencyInFlight, true}', () => {
+    const err = apiError(
+      409,
+      { error: 'IDEMPOTENCY_KEY_IN_FLIGHT' },
+      'IDEMPOTENCY_KEY_IN_FLIGHT',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'idempotencyInFlight', retryable: true },
+    });
+  });
+
+  it('IDEMPOTENCY_KEY_CONFLICT (409) → {idempotencyConflict, false}', () => {
+    const err = apiError(
+      409,
+      { error: 'IDEMPOTENCY_KEY_CONFLICT' },
+      'IDEMPOTENCY_KEY_CONFLICT',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'idempotencyConflict', retryable: false },
+    });
+  });
+
+  it('PRICE_OUT_OF_DATE (409) → {priceOutOfDate, false}', () => {
+    const err = apiError(
+      409,
+      { error: 'PRICE_OUT_OF_DATE' },
+      'PRICE_OUT_OF_DATE',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'priceOutOfDate', retryable: false },
+    });
+  });
+
+  it('INVALID_IDEMPOTENCY_KEY (400) → {validation, false}', () => {
+    const err = apiError(
+      400,
+      { error: 'INVALID_IDEMPOTENCY_KEY' },
+      'INVALID_IDEMPOTENCY_KEY',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'validation', retryable: false },
+    });
+  });
+
+  it('legacy backend: 422 with errorCode=null → {validation, false}', () => {
+    const err = apiError(422, { message: 'Validation failed' }, null);
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'validation', retryable: false },
+    });
+  });
+
+  it('PROMO_RE_QUOTE with a malformed payload falls through to status mapping', () => {
+    const err = apiError(
+      409,
+      { error: 'PROMO_RE_QUOTE', recomputedTotalCents: 'not-a-number' },
+      'PROMO_RE_QUOTE',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'validation', retryable: false },
+    });
+  });
+
+  it('PROMO_RE_QUOTE with a missing payload falls through to status mapping', () => {
+    const err = apiError(409, { error: 'PROMO_RE_QUOTE' }, 'PROMO_RE_QUOTE');
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'validation', retryable: false },
+    });
+  });
+
+  it('rethrows a non-ChatbotApi error (BranchMismatchError etc.)', () => {
+    class BranchMismatchError extends Error {}
+    const err = new BranchMismatchError('boom');
+    expect(() => mapChatbotError(err)).toThrow(BranchMismatchError);
+  });
+
+  it('rethrows a plain Error', () => {
+    expect(() => mapChatbotError(new Error('boom'))).toThrow(Error);
+  });
+
   it('maps AuthError to {auth, false}', () => {
     expect(mapChatbotError(new AuthError('x', 401))).toEqual({
       ok: false,

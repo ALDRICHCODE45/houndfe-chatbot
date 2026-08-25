@@ -1,27 +1,23 @@
 /**
- * Bank-details shape (Q1 in `docs/backend-questions-sale-flow.md`).
- *
- * The chatbot NEVER hardcodes these values: they come from the swappable
- * `BankDetailsProvider` port. The v1 default returns `null`, which triggers
- * the human-handoff phrase encoded in `SALE_FLOW_INSTRUCTIONS`.
- */
-export interface BankDetails {
-  bankName: string;
-  beneficiary: string;
-  clabe: string;
-  accountNumber: string;
-}
-
-/**
  * Sale-flow slice instructions, concatenated with the base `SYSTEM_PROMPT`
  * exactly once at module boot. Encodes the 14-step escrow-style sale flow
  * (greet → search → stock → cart → evaluate → customer → summary →
- * createSale → bank details → receipt → end) and re-states every
+ * createSale → getPaymentDetails → receipt → end) and re-states every
  * non-negotiable base contract (refusal phrase, no voseo, no fabrication,
  * list-price-only rule).
  *
- * The literal MUST stay verbatim in the four assertions
+ * The literal MUST stay verbatim in the byte-identical assertions
  * (`sale-flow-instructions.spec.ts`) — silent drift here is a spec break.
+ *
+ * Q1/Q2/Q3 contract changes (this slice):
+ *  - The boot-time `BankDetailsProvider` port + `renderBankDetailsBlock`
+ *    are gone; the new 10th AI-SDK tool `getPaymentDetails` is the runtime
+ *    source of bank data.
+ *  - Step 11 now carries the `promoReQuote` re-confirmation + fresh-UUID-v4
+ *    rule (Q2 / R13).
+ *  - Step 12 calls `getPaymentDetails` after `createSale` succeeds; the
+ *    `noActivePaymentDetail` branch emits the byte-identical human-handoff
+ *    phrase `en un momento un agente te comparte los datos de pago`.
  */
 export const SALE_FLOW_INSTRUCTIONS = `
 
@@ -50,14 +46,16 @@ herramienta puede confirmar.
 
 10. Envía un resumen estructurado del pedido (viñetas: productos, cantidades, precios, total, datos del cliente, dirección de envío). No digas "transferencia" todavía.
 
-11. Llama a \`createSale\` al **precio de lista**. Regla obligatoria:
-    - Pasa \`unitPriceCents = originalPriceCents\` para cada línea (NUNCA \`finalPriceCents\`).
-    - Si \`evaluateCart\` devolvió \`promotionEvaluationStatus === 'needs_human_review'\` y \`finalPriceCents < originalPriceCents\`, NO registres la venta al precio descontado: o bien la registras al precio de lista, o bien pausas para revisión humana. NUNCA inventes un precio ni fabriques un descuento.
+11. Llama a \`createSale\` pasando \`expectedTotalCents\` desde el carrito (el total que le mostraste al cliente en el paso 8). Reglas:
+    - Pasa \`unitPriceCents = originalPriceCents\` para cada línea (NUNCA \`finalPriceCents\`). El backend re-evalúa las promociones server-side.
+    - Si \`evaluateCart\` devolvió \`promotionEvaluationStatus === 'needs_human_review'\`, NO registres la venta: deriva a revisión humana.
+    - Si \`createSale\` devuelve \`{ ok: false, error: { kind: 'promoReQuote', recomputedTotalCents, expectedTotalCents, discountCents } }\`, es flujo normal (no un error): muestra al cliente el nuevo total \`recomputedTotalCents\`, pide confirmación EXPLÍCITA y, si acepta, re-emite \`createSale\` con una \`X-Idempotency-Key\` NUEVA (UUID v4). NUNCA reutilices la key anterior después de un \`promoReQuote\`.
 
 12. Mensaje de datos bancarios (solo si \`createSale\` tuvo éxito):
-    - **Nunca** inventes un banco, beneficiario, CLABE o número de cuenta. Esos datos solo los tiene el sistema o un humano.
-    - Si la sección "Datos bancarios" aparece abajo de este bloque, reléyale al cliente EXACTAMENTE esos datos y pídele que envíe su comprobante de transferencia (imagen o captura).
-    - Si la sección "Datos bancarios" NO aparece (proveedor nulo), responde EXACTAMENTE: "en un momento un agente te comparte los datos de pago" y pausa. No continúes hasta que un humano te indique los datos por otro canal.
+    - Llama a \`getPaymentDetails\` después de que \`createSale\` confirme (devuelva \`ok: true\`), exactamente una vez por venta confirmada. NUNCA llames a \`getPaymentDetails\` antes de que \`createSale\` confirme una venta.
+    - Si \`getPaymentDetails\` devuelve \`{ ok: false, error: { kind: 'noActivePaymentDetail' } }\`, responde EXACTAMENTE: "en un momento un agente te comparte los datos de pago" y pausa. No continúes hasta que un humano te indique los datos por otro canal.
+    - Si \`getPaymentDetails\` devuelve \`{ ok: true, paymentDetail: {...} }\`, reléyale al cliente EXACTAMENTE los datos devueltos (\`bankName\`, \`beneficiary\`, \`clabe\`, \`accountNumber\`) y pídele que envíe su comprobante de transferencia (imagen o captura).
+    - **Nunca** inventes un banco, beneficiario, CLABE o número de cuenta. Esos datos solo los devuelve \`getPaymentDetails\`.
 
 13. Cuando el cliente envíe la imagen del comprobante, llama a \`attachReceipt(saleId, mediaUrl, declaredAmountCents, declaredDate?, declaredReference?)\` con la URL de la imagen, el monto declarado y (si los conoces) la fecha y referencia.
 
@@ -69,43 +67,34 @@ Recordatorios finales:
 `;
 
 /**
- * Compose the system prompt: base `SYSTEM_PROMPT` + '\n\n' + slice, then
- * (only if a non-null BankDetails was provided) append the rendered bank
- * block. When `bankDetails === null`, the result is exactly
- * `base + '\n\n' + slice` — the human-handoff phrase lives in the slice
- * literal itself so a future swap to a real source "just works".
+ * Compose the system prompt: base `SYSTEM_PROMPT` + '\n\n' + slice. The
+ * one-arg signature collapses the boot-time bank-details seam (Q1); the
+ * runtime `getPaymentDetails` tool is now the source of truth for bank data.
+ *
+ * The literal `SALE_FLOW_INSTRUCTIONS` keeps the byte-identical human-handoff
+ * phrase `en un momento un agente te comparte los datos de pago` inside the
+ * `noActivePaymentDetail` branch so the v1 behaviour is preserved even when
+ * the runtime tool returns 404.
  */
-export function composeSaleFlowSystemPrompt(
-  base: string,
-  bankDetails: BankDetails | null,
-): string {
-  const prompt = base + '\n\n' + SALE_FLOW_INSTRUCTIONS;
-  if (bankDetails === null) {
-    return prompt;
-  }
-  return prompt + '\n\n' + renderBankDetailsBlock(bankDetails);
+export function composeSaleFlowSystemPrompt(base: string): string {
+  return base + '\n\n' + SALE_FLOW_INSTRUCTIONS;
 }
 
 /**
- * Render a Spanish-language block describing the bank account the customer
- * should transfer to. The block is appended after the slice only when the
- * BankDetailsProvider returns a non-null value (i.e., a future slice that
- * supplies a real source replaces the null-default implementation).
+ * Bank-details shape (Q1 / R11).
  *
- * NOTE: the `mediaUrl` host for receipts must come from Meta or the
- * chatbot's image-hosting layer (see Open Question R12 in AGENTS.md).
+ * Kept exported (no runtime `renderBankDetailsBlock`) so the deprecated
+ * boot-time `BankDetailsProvider` seam in `sale-flow/infrastructure/` can
+ * still compile until Commit 2 of this slice deletes the seam files. The
+ * runtime `getPaymentDetails` tool returns the same fields via the
+ * `PaymentDetail` DTO (chatbot-api `payment-details.dto.ts`); this alias
+ * will be deleted in Commit 2.
+ *
+ * @deprecated use `PaymentDetail` from `chatbot-api/domain/dtos/payment-details.dto`.
  */
-export function renderBankDetailsBlock(details: BankDetails): string {
-  return [
-    '# Datos bancarios para la transferencia',
-    '',
-    `- Banco: ${details.bankName}`,
-    `- Beneficiario: ${details.beneficiary}`,
-    `- CLABE: ${details.clabe}`,
-    `- Número de cuenta: ${details.accountNumber}`,
-    '',
-    'Por favor realiza la transferencia por el monto total del pedido y',
-    'envía el comprobante (imagen o captura) como respuesta a este',
-    'mensaje. Un humano confirmará tu pago lo antes posible.',
-  ].join('\n');
+export interface BankDetails {
+  bankName: string;
+  beneficiary: string;
+  clabe: string;
+  accountNumber: string;
 }

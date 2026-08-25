@@ -4,6 +4,7 @@ import {
   CustomerUpsertInput,
   CustomerUpsertResponse,
 } from './dtos/customers.dto';
+import type { PaymentDetail } from './dtos/payment-details.dto';
 import { CartEvaluationResult, CartItemInput } from './dtos/pricing.dto';
 import {
   AttachReceiptInput,
@@ -29,6 +30,10 @@ export interface ChatbotApiClient {
     dto: CreateSaleInput,
     idempotencyKey: string,
   ): Promise<BotSaleResponse>;
+  /** Q1 / R11: `GET /chatbot-api/payment-details` (scope `payment-details:read`).
+   *  Returns the active `PaymentDetail` or rejects with
+   *  `ChatbotApiError { statusCode: 404, errorCode: 'NO_ACTIVE_PAYMENT_DETAIL' }`. */
+  getPaymentDetails(): Promise<PaymentDetail>;
   attachReceipt(
     saleId: string,
     dto: AttachReceiptInput,
