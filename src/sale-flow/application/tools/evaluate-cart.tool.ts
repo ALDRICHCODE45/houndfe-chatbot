@@ -58,11 +58,22 @@ export function makeEvaluateCartTool(deps: ToolDeps) {
           quantity: i.quantity,
           unitPriceCents: i.originalPriceCents,
         }));
+        // Q2 / R13: compute Σ(finalPriceCents × quantity) — the
+        // discounted total the bot quoted at step 8. ADR-6 — the
+        // CartEvaluationResult DTO has no top-level `totalCents`, so
+        // the client sums it from per-line fields. The result is
+        // persisted on the cart so a later `createSale` can send it
+        // as the top-level `expectedTotalCents` guard.
+        const expectedTotalCents = evaluation.items.reduce(
+          (sum, i) => sum + i.finalPriceCents * i.quantity,
+          0,
+        );
         const state = await deps.store.get(senderId);
         const existingCart = readCart(state);
         await persistCart(deps.store, senderId, state, {
           items,
           idempotencyKey: existingCart.idempotencyKey,
+          expectedTotalCents,
         });
         return { ok: true, ...evaluation };
       } catch (err) {

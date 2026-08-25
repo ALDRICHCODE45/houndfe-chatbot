@@ -7,7 +7,6 @@ import type {
   ConversationStore,
   ConversationState,
 } from '../../../conversation/domain/conversation-store';
-import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 import type { CartEvaluationResult } from '../../../chatbot-api/domain/dtos/pricing.dto';
 
 /**
@@ -24,7 +23,6 @@ import type { CartEvaluationResult } from '../../../chatbot-api/domain/dtos/pric
 describe('makeEvaluateCartTool', () => {
   const baseDeps = {
     chatbotApi: {} as ChatbotApiClient,
-    bankDetails: { get: async () => null } as BankDetailsProvider,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
   };
 
@@ -197,5 +195,140 @@ describe('makeEvaluateCartTool', () => {
       ],
     });
     expect(r.success).toBe(false);
+  });
+
+  it('persists expectedTotalCents = Σ finalPriceCents × quantity on the cart (legacy carts also gain the field)', async () => {
+    const evaluation: CartEvaluationResult = {
+      items: [
+        {
+          productId: 'p-uuid-1',
+          variantId: null,
+          quantity: 2,
+          unitPriceCents: 1000,
+          originalPriceCents: 1000,
+          finalPriceCents: 800,
+          appliedPromotionTitle: 'PROMO_X',
+          discountAmountCents: 400,
+        },
+      ],
+      promotionEvaluationStatus: 'fully_evaluated',
+    };
+    const evaluateCart = jest.fn().mockResolvedValue(evaluation);
+    const existingState: ConversationState = {
+      senderId: 's',
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: { cart: { items: [], idempotencyKey: 'k' } },
+    };
+    const get = jest.fn().mockResolvedValue(existingState);
+    const update = jest
+      .fn()
+      .mockImplementation(async (senderId: string, patch: object) => ({
+        senderId,
+        lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+        data: (patch as { data: object }).data,
+      }));
+    const store = { get, update } as unknown as ConversationStore;
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { evaluateCart } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeEvaluateCartTool(deps);
+    await tool.execute(
+      {
+        items: [
+          {
+            productId: '00000000-0000-4000-8000-000000000001',
+            quantity: 2,
+            unitPriceCents: 500,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(update).toHaveBeenCalledTimes(1);
+    const [, patch] = update.mock.calls[0]!;
+    expect(patch).toMatchObject({
+      data: {
+        cart: {
+          items: [
+            {
+              productId: 'p-uuid-1',
+              variantId: undefined,
+              quantity: 2,
+              unitPriceCents: 1000,
+            },
+          ],
+          idempotencyKey: 'k',
+          expectedTotalCents: 1600,
+        },
+      },
+    });
+  });
+
+  it('preserves the existing idempotencyKey when persisting expectedTotalCents on top of a pre-existing cart', async () => {
+    const evaluation: CartEvaluationResult = {
+      items: [
+        {
+          productId: 'p-uuid-1',
+          variantId: null,
+          quantity: 3,
+          unitPriceCents: 1000,
+          originalPriceCents: 1000,
+          finalPriceCents: 900,
+          appliedPromotionTitle: null,
+          discountAmountCents: 100,
+        },
+      ],
+      promotionEvaluationStatus: 'fully_evaluated',
+    };
+    const evaluateCart = jest.fn().mockResolvedValue(evaluation);
+    const existingState: ConversationState = {
+      senderId: 's',
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: {
+        cart: {
+          items: [{ productId: 'old', quantity: 1, unitPriceCents: 100 }],
+          idempotencyKey: 'existing-key',
+          expectedTotalCents: 100,
+        },
+      },
+    };
+    const get = jest.fn().mockResolvedValue(existingState);
+    const update = jest
+      .fn()
+      .mockImplementation(async (senderId: string, patch: object) => ({
+        senderId,
+        lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+        data: (patch as { data: object }).data,
+      }));
+    const store = { get, update } as unknown as ConversationStore;
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { evaluateCart } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeEvaluateCartTool(deps);
+    await tool.execute(
+      {
+        items: [
+          {
+            productId: '00000000-0000-4000-8000-000000000001',
+            quantity: 3,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    const [, patch] = update.mock.calls[0]!;
+    expect(patch).toMatchObject({
+      data: {
+        cart: {
+          idempotencyKey: 'existing-key',
+          expectedTotalCents: 2700,
+        },
+      },
+    });
   });
 });

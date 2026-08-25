@@ -1,10 +1,9 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/require-await */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
 import { makeUpdateDeliveryTool } from './update-delivery.tool';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
-import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 
 /**
  * Unit tests for the updateDelivery tool factory.
@@ -18,7 +17,6 @@ import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 describe('makeUpdateDeliveryTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
-    bankDetails: { get: async () => null } as BankDetailsProvider,
     cashierUserId: '00000000-4000-9000-0000-000000000001',
   };
 

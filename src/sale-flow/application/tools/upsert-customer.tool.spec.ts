@@ -1,10 +1,9 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/require-await */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
 import { makeUpsertCustomerTool } from './upsert-customer.tool';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
-import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 import type { CustomerUpsertResponse } from '../../../chatbot-api/domain/dtos/customers.dto';
 
 /**
@@ -20,7 +19,6 @@ import type { CustomerUpsertResponse } from '../../../chatbot-api/domain/dtos/cu
 describe('makeUpsertCustomerTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
-    bankDetails: { get: async () => null } as BankDetailsProvider,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
   };
 

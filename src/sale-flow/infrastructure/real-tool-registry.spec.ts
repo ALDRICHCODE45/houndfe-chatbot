@@ -2,18 +2,18 @@ import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
-import { BANK_DETAILS_PROVIDER } from '../domain/bank-details.provider';
 import { RealToolRegistry } from './real-tool-registry';
 
 /**
  * Integration tests for RealToolRegistry wiring.
  *
  * Spec scenarios:
- *   - getTools() returns exactly the 9 keys (searchCatalog, checkStock,
+ *   - getTools() returns exactly the 10 keys (searchCatalog, checkStock,
  *     evaluateCart, getCustomerByPhone, upsertCustomer, createSale,
- *     attachReceipt, updateDelivery, getOrderHistory).
+ *     attachReceipt, updateDelivery, getOrderHistory, getPaymentDetails).
  *   - Each entry is an AI-SDK tool with a Zod object inputSchema.
- *   - DI resolves RealToolRegistry with the injected deps.
+ *   - DI resolves RealToolRegistry with only CHATBOT_API_CLIENT +
+ *     CONVERSATION_STORE + ConfigService.
  */
 describe('RealToolRegistry', () => {
   const stubChatbotApi = {
@@ -26,13 +26,13 @@ describe('RealToolRegistry', () => {
     attachReceipt: jest.fn(),
     updateDelivery: jest.fn(),
     getOrderHistory: jest.fn(),
+    getPaymentDetails: jest.fn(),
   };
   const stubStore = {
     get: jest.fn(),
     create: jest.fn(),
     update: jest.fn(),
   };
-  const stubBankDetails = { get: jest.fn().mockResolvedValue(null) };
 
   async function buildRegistry(): Promise<RealToolRegistry> {
     const moduleRef = await Test.createTestingModule({
@@ -40,7 +40,6 @@ describe('RealToolRegistry', () => {
         RealToolRegistry,
         { provide: CHATBOT_API_CLIENT, useValue: stubChatbotApi },
         { provide: CONVERSATION_STORE, useValue: stubStore },
-        { provide: BANK_DETAILS_PROVIDER, useValue: stubBankDetails },
         {
           provide: ConfigService,
           useValue: {
@@ -57,12 +56,12 @@ describe('RealToolRegistry', () => {
     return moduleRef.get(RealToolRegistry);
   }
 
-  it('resolves through Nest DI with CHATBOT_API_CLIENT + CONVERSATION_STORE + BANK_DETAILS_PROVIDER', async () => {
+  it('resolves through Nest DI with only CHATBOT_API_CLIENT + CONVERSATION_STORE (no bank provider)', async () => {
     const registry = await buildRegistry();
     expect(registry).toBeInstanceOf(RealToolRegistry);
   });
 
-  it('getTools() returns exactly the 9 sale-flow tool keys', async () => {
+  it('getTools() returns exactly the 10 sale-flow tool keys including getPaymentDetails', async () => {
     const registry = await buildRegistry();
     const tools = registry.getTools();
     expect(Object.keys(tools).sort()).toEqual(
@@ -76,6 +75,7 @@ describe('RealToolRegistry', () => {
         'attachReceipt',
         'updateDelivery',
         'getOrderHistory',
+        'getPaymentDetails',
       ].sort(),
     );
   });

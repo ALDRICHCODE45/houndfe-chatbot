@@ -10,6 +10,7 @@ import {
   writeCart,
   type CartState,
 } from '../../domain/cart-state';
+import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
 
 /**
  * createSale — AI-SDK tool factory.
@@ -26,7 +27,12 @@ import {
  *   2. Idempotency key: client-side UUID v4 (`crypto.randomUUID()`).
  *      - First attempt: mint + persist on cart.
  *      - Retry within the session: reuse the persisted key.
- *      - Success: clear the cart (items + key).
+ *      - Success: clear the cart (items + key + expectedTotalCents).
+ *      - PROMO_RE_QUOTE: clear the key (payload changed); preserve items +
+ *        expectedTotalCents; the next customer-acceptance call mints fresh.
+ *      - IDEMPOTENCY_KEY_CONFLICT: clear the key (the key is poisoned).
+ *      - IDEMPOTENCY_KEY_IN_FLIGHT: preserve the key (same payload, retry
+ *        later).
  *      The backend's `SaleIdempotency` table keys on the header value,
  *      so a stable client UUID is enough — no env var needed.
  *
@@ -43,13 +49,22 @@ import {
  *      `productName` / `variantName` are borrowed from the model's
  *      matched input line (the backend requires `productName`).
  *
+ *   6. `expectedTotalCents` is sourced from the persisted cart, NEVER
+ *      from the model's input. The wire omits the key when the cart has
+ *      none (legacy carts). The HTTP client normalises this via the
+ *      `CreateSaleInputSchema` — the tool just forwards the cart value.
+ *
+ *   7. The error→cart-mutation side effect is owned here, NOT in
+ *      `mapChatbotError`: the mapper is pure (no store / senderId) and
+ *      `createSale` re-inspects `err.errorCode` for the cart write.
+ *
  * `contextSchema: { senderId }` is the per-tool runtime seam; the
  * sender id never enters the prompt.
  */
 export function makeCreateSaleTool(deps: ToolDeps) {
   return tool({
     description:
-      'Registra la venta al precio de lista (NO al precio con descuento). Usa una UUID v4 como X-Idempotency-Key (generada la primera vez, reusada en retries, limpiada en éxito). El cashierUserId se inyecta del servidor.',
+      'Registra la venta. Envía expectedTotalCents desde el carrito (NO desde el modelo). Usa una UUID v4 como X-Idempotency-Key (generada la primera vez, reusada en retries, rotada en promoReQuote/conflict, preservada en in-flight, limpiada en éxito). El cashierUserId se inyecta del servidor.',
     inputSchema: z.object({
       customerId: z.uuid(),
       shippingAddressId: z.uuid().nullish(),
@@ -128,25 +143,57 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         });
       }
 
-      // 5) Outgoing DTO — cashierUserId is injected from deps.
-      const dto = {
+      // 5) Outgoing DTO — cashierUserId is injected from deps; the
+      //    top-level `expectedTotalCents` is forwarded only when the
+      //    persisted cart carries it (legacy carts omit the key).
+      const dto: Parameters<typeof deps.chatbotApi.createSale>[0] = {
         cashierUserId: deps.cashierUserId,
         customerId: input.customerId,
         shippingAddressId: input.shippingAddressId ?? null,
         items,
+        ...(cart.expectedTotalCents !== undefined
+          ? { expectedTotalCents: cart.expectedTotalCents }
+          : {}),
       };
 
       try {
         const sale = await deps.chatbotApi.createSale(dto, idempotencyKey);
-        // 6) Clear cart on success (includes idempotency key).
-        const cleared: CartState = { items: [], idempotencyKey: '' };
-        await persistCart(deps.store, senderId, state, cleared);
+        // 6) Clear cart on success (items + idempotencyKey +
+        //    expectedTotalCents). EMPTY_CART leaves the optional field
+        //    absent — backwards-compatible with legacy readers.
+        await persistCart(deps.store, senderId, state, EMPTY_CART);
         // Touch EMPTY_CART to keep the import non-removable (compile guard).
         void EMPTY_CART;
         return { ok: true as const, ...sale };
       } catch (err) {
+        // Q3 errorCode-first cart-mutation policy: re-inspect the error
+        // here because mapChatbotError has no access to the store.
+        // (ADR-9 — the mapper is pure; the tool owns cart writes.)
+        if (err instanceof ChatbotApiError) {
+          switch (err.errorCode) {
+            case 'PROMO_RE_QUOTE':
+            case 'IDEMPOTENCY_KEY_CONFLICT':
+              // Payload changed (promo) or key poisoned (conflict) — clear
+              // the key so the next call mints fresh. Preserve items +
+              // expectedTotalCents so the customer's intent survives.
+              await persistCart(deps.store, senderId, state, {
+                ...cart,
+                idempotencyKey: '',
+              });
+              break;
+            case 'IDEMPOTENCY_KEY_IN_FLIGHT':
+            case 'PRICE_OUT_OF_DATE':
+            case 'INVALID_IDEMPOTENCY_KEY':
+            default:
+              // Preserve the key (retry the same call later) — no write.
+              break;
+          }
+        }
         return mapChatbotError(err);
       }
     },
   });
 }
+
+// Re-export CartState type so the file is self-contained for imports.
+export type { CartState };

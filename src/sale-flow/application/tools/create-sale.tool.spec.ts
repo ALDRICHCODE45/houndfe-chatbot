@@ -6,7 +6,7 @@ import type {
   ConversationStore,
   ConversationState,
 } from '../../../conversation/domain/conversation-store';
-import type { BankDetailsProvider } from '../../domain/bank-details.provider';
+import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { BotSaleResponse } from '../../../chatbot-api/domain/dtos/sales.dto';
 
 /**
@@ -26,7 +26,6 @@ describe('makeCreateSaleTool', () => {
   const CASHIER = '00000000-4000-9000-0000-000000000001';
   const baseDeps = {
     chatbotApi: {} as ChatbotApiClient,
-    bankDetails: { get: async () => null } as BankDetailsProvider,
     cashierUserId: CASHIER,
   };
 
@@ -398,5 +397,617 @@ describe('makeCreateSaleTool', () => {
       ],
     });
     expect(r.success).toBe(false);
+  });
+
+  it('forwards expectedTotalCents sourced from the cart (never from model input)', async () => {
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'k',
+      expectedTotalCents: 1500,
+    };
+    const store = stubStoreWithCart(cart);
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1500,
+      paidCents: 0,
+      debtCents: 1500,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(createSale).toHaveBeenCalledTimes(1);
+    const dto = createSale.mock.calls[0]![0];
+    expect(dto.expectedTotalCents).toBe(1500);
+  });
+
+  it('legacy cart (no expectedTotalCents) → outgoing DTO omits the key (no 0, no null)', async () => {
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'k',
+      // no expectedTotalCents on purpose
+    };
+    const store = stubStoreWithCart(cart);
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1000,
+      paidCents: 0,
+      debtCents: 1000,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    const dto = createSale.mock.calls[0]![0];
+    expect(dto.expectedTotalCents).toBeUndefined();
+    expect(JSON.stringify(dto)).not.toContain('expectedTotalCents');
+  });
+
+  it('PROMO_RE_QUOTE → {promoReQuote} envelope, cart items + expectedTotalCents preserved, idempotencyKey cleared', async () => {
+    const promoErr = new UpstreamError(
+      'Price changed',
+      409,
+      {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      },
+      'PROMO_RE_QUOTE',
+    );
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'pre-key',
+      expectedTotalCents: 1000,
+    };
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const createSale = jest.fn().mockRejectedValue(promoErr);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: 'promoReQuote',
+        retryable: false,
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      },
+    });
+    // items + expectedTotalCents preserved, key cleared
+    expect(currentCart.items).toEqual(cart.items);
+    expect(currentCart.expectedTotalCents).toBe(1000);
+    expect(currentCart.idempotencyKey).toBe('');
+  });
+
+  it('IDEMPOTENCY_KEY_IN_FLIGHT → {idempotencyInFlight, retryable:true}, key preserved', async () => {
+    const err = new UpstreamError(
+      'in-flight',
+      409,
+      { error: 'IDEMPOTENCY_KEY_IN_FLIGHT' },
+      'IDEMPOTENCY_KEY_IN_FLIGHT',
+    );
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'preserved-key',
+    };
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const createSale = jest.fn().mockRejectedValue(err);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: 'idempotencyInFlight', retryable: true },
+    });
+    expect(currentCart.idempotencyKey).toBe('preserved-key');
+  });
+
+  it('IDEMPOTENCY_KEY_CONFLICT → {idempotencyConflict, retryable:false}, key cleared', async () => {
+    const err = new UpstreamError(
+      'conflict',
+      409,
+      { error: 'IDEMPOTENCY_KEY_CONFLICT' },
+      'IDEMPOTENCY_KEY_CONFLICT',
+    );
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'conflicted-key',
+    };
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const createSale = jest.fn().mockRejectedValue(err);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: 'idempotencyConflict', retryable: false },
+    });
+    expect(currentCart.idempotencyKey).toBe('');
+  });
+
+  it('PRICE_OUT_OF_DATE → {priceOutOfDate, retryable:false}, key preserved', async () => {
+    const err = new UpstreamError(
+      'stale',
+      409,
+      { error: 'PRICE_OUT_OF_DATE' },
+      'PRICE_OUT_OF_DATE',
+    );
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'pre-key',
+    };
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const createSale = jest.fn().mockRejectedValue(err);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: 'priceOutOfDate', retryable: false },
+    });
+    expect(currentCart.idempotencyKey).toBe('pre-key');
+  });
+
+  it('INVALID_IDEMPOTENCY_KEY → {validation, retryable:false}, key preserved', async () => {
+    const err = new UpstreamError(
+      'bad-key',
+      400,
+      { error: 'INVALID_IDEMPOTENCY_KEY' },
+      'INVALID_IDEMPOTENCY_KEY',
+    );
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'pre-key',
+    };
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const createSale = jest.fn().mockRejectedValue(err);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: 'validation', retryable: false },
+    });
+    expect(currentCart.idempotencyKey).toBe('pre-key');
+  });
+
+  it('success with discountCents=250 → success envelope surfaces it; cart cleared (expectedTotalCents undefined)', async () => {
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'pre-key',
+      expectedTotalCents: 750,
+    };
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 750,
+      paidCents: 0,
+      debtCents: 750,
+      confirmedAt: null,
+      discountCents: 250,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({ ok: true, ...sale });
+    expect(currentCart.items).toEqual([]);
+    expect(currentCart.idempotencyKey).toBe('');
+    expect(currentCart.expectedTotalCents).toBeUndefined();
+  });
+
+  it('success with discountCents=0 → success envelope includes 0', async () => {
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: '',
+    };
+    const store = stubStoreWithCart(cart);
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1000,
+      paidCents: 0,
+      debtCents: 1000,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+    expect(result).toEqual({ ok: true, ...sale });
+    expect((result as { discountCents: number }).discountCents).toBe(0);
+  });
+
+  it('after PROMO_RE_QUOTE clears the key, the next createSale mints a fresh UUID v4', async () => {
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: '',
+      expectedTotalCents: 1000,
+    };
+    const promoErr = new UpstreamError(
+      'promo',
+      409,
+      {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      },
+      'PROMO_RE_QUOTE',
+    );
+    let currentCart = cart;
+    const store = {
+      get: jest.fn().mockImplementation(async () => ({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: currentCart },
+      })),
+      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
+        const d = (patch as { data: { cart?: typeof currentCart } }).data;
+        if (d.cart) currentCart = d.cart;
+        return { senderId: 's', ...patch };
+      }),
+    } as unknown as ConversationStore;
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1000,
+      paidCents: 0,
+      debtCents: 1000,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest
+      .fn()
+      .mockRejectedValueOnce(promoErr)
+      .mockResolvedValueOnce(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+    const inputArgs = {
+      customerId: '00000000-4000-9000-0000-000000000099',
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          productName: 'Croquetas',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+    };
+    // First call: PROMO_RE_QUOTE → mints K1, persists, fails with promoReQuote, clears key.
+    const r1 = await tool.execute(inputArgs, {
+      toolCallId: 't',
+      messages: [],
+      context: { senderId: 's' },
+    });
+    expect(r1).toMatchObject({ ok: false, error: { kind: 'promoReQuote' } });
+    const firstKey = createSale.mock.calls[0]![1];
+    // After PROMO_RE_QUOTE, key is cleared.
+    expect(currentCart.idempotencyKey).toBe('');
+    // Second call: mints a fresh UUID v4 structurally different from firstKey.
+    await tool.execute(inputArgs, {
+      toolCallId: 't',
+      messages: [],
+      context: { senderId: 's' },
+    });
+    const secondKey = createSale.mock.calls[1]![1];
+    expect(secondKey).not.toBe(firstKey);
+    expect(secondKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
   });
 });

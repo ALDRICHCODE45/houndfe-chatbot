@@ -1,10 +1,9 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument */
 
 import { makeSearchCatalogTool } from './search-catalog.tool';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
-import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 import type { CatalogItemResponse } from '../../../chatbot-api/domain/dtos/catalog.dto';
 
 /**
@@ -20,7 +19,6 @@ import type { CatalogItemResponse } from '../../../chatbot-api/domain/dtos/catal
 describe('makeSearchCatalogTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
-    bankDetails: { get: async () => null } as BankDetailsProvider,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
   };
 

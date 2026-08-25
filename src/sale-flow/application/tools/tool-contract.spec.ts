@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/require-await */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
 import { makeAttachReceiptTool } from './attach-receipt.tool';
 import { makeCheckStockTool } from './check-stock.tool';
@@ -11,7 +11,6 @@ import { makeUpdateDeliveryTool } from './update-delivery.tool';
 import { makeUpsertCustomerTool } from './upsert-customer.tool';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
-import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 
 /**
  * Shared contract suite that asserts every sale-flow tool exposes the
@@ -25,7 +24,6 @@ import type { BankDetailsProvider } from '../../domain/bank-details.provider';
 type Factory = (deps: {
   chatbotApi: ChatbotApiClient;
   store: ConversationStore;
-  bankDetails: BankDetailsProvider;
   cashierUserId: string;
 }) => {
   description: string;
@@ -38,11 +36,9 @@ type Factory = (deps: {
 
 const stubChatbotApi = {} as ChatbotApiClient;
 const stubStore = {} as ConversationStore;
-const stubBankDetails = { get: async () => null } as BankDetailsProvider;
 const deps = {
   chatbotApi: stubChatbotApi,
   store: stubStore,
-  bankDetails: stubBankDetails,
   cashierUserId: '00000000-0000-4000-8000-000000000001',
 };
 

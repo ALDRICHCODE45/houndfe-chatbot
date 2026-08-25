@@ -10,7 +10,7 @@
  * (`sale-flow-instructions.spec.ts`) — silent drift here is a spec break.
  *
  * Q1/Q2/Q3 contract changes (this slice):
- *  - The boot-time `BankDetailsProvider` port + `renderBankDetailsBlock`
+ *  - The boot-time bank-details port + rendered-block helper
  *    are gone; the new 10th AI-SDK tool `getPaymentDetails` is the runtime
  *    source of bank data.
  *  - Step 11 now carries the `promoReQuote` re-confirmation + fresh-UUID-v4
@@ -78,23 +78,4 @@ Recordatorios finales:
  */
 export function composeSaleFlowSystemPrompt(base: string): string {
   return base + '\n\n' + SALE_FLOW_INSTRUCTIONS;
-}
-
-/**
- * Bank-details shape (Q1 / R11).
- *
- * Kept exported (no runtime `renderBankDetailsBlock`) so the deprecated
- * boot-time `BankDetailsProvider` seam in `sale-flow/infrastructure/` can
- * still compile until Commit 2 of this slice deletes the seam files. The
- * runtime `getPaymentDetails` tool returns the same fields via the
- * `PaymentDetail` DTO (chatbot-api `payment-details.dto.ts`); this alias
- * will be deleted in Commit 2.
- *
- * @deprecated use `PaymentDetail` from `chatbot-api/domain/dtos/payment-details.dto`.
- */
-export interface BankDetails {
-  bankName: string;
-  beneficiary: string;
-  clabe: string;
-  accountNumber: string;
 }

@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { HttpModule } from '@nestjs/axios';
@@ -8,8 +6,6 @@ import { ChatbotApiHttpClient } from '../chatbot-api/infrastructure/chatbot-api-
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { PostgresConversationStore } from '../conversation/infrastructure/postgres-conversation.store';
 import { AppConfigModule } from '../config/config.module';
-import { BANK_DETAILS_PROVIDER } from './domain/bank-details.provider';
-import { NullBankDetailsProvider } from './infrastructure/null-bank-details.provider';
 import { RealToolRegistry } from './infrastructure/real-tool-registry';
 import { SaleFlowModule } from './sale-flow.module';
 
@@ -18,7 +14,7 @@ import { SaleFlowModule } from './sale-flow.module';
  *
  * Spec scenarios:
  *   - RealToolRegistry is provided by SaleFlowModule and resolves.
- *   - BANK_DETAILS_PROVIDER is bound to NullBankDetailsProvider.
+ *   - the boot-time bank-details seam is gone (no provider binding).
  *   - ChatbotApiModule + ConversationModule are transitively imported
  *     (CHATBOT_API_CLIENT + CONVERSATION_STORE resolve through the module).
  */
@@ -113,7 +109,7 @@ describe('SaleFlowModule', () => {
   // AppConfigModule.forRoot({ ignoreEnvFile: true }) keeps the test
   // hermetic — it does NOT read the repo's .env file.
 
-  it('resolves RealToolRegistry through the module', async () => {
+  it('resolves RealToolRegistry through the module with exactly 10 tools', async () => {
     const moduleRef = await buildModule();
     const registry = moduleRef.get(RealToolRegistry);
     expect(registry).toBeInstanceOf(RealToolRegistry);
@@ -128,16 +124,19 @@ describe('SaleFlowModule', () => {
         'attachReceipt',
         'updateDelivery',
         'getOrderHistory',
+        'getPaymentDetails',
       ].sort(),
     );
     await moduleRef.close();
   });
 
-  it('binds BANK_DETAILS_PROVIDER to NullBankDetailsProvider', async () => {
+  it('does not bind the boot-time bank-details seam (only the runtime registry)', async () => {
     const moduleRef = await buildModule();
-    const provider = moduleRef.get(BANK_DETAILS_PROVIDER);
-    expect(provider).toBeInstanceOf(NullBankDetailsProvider);
-    await expect(provider.get()).resolves.toBeNull();
+    // Probe the registry only — the boot-time bank-details symbol +
+    // provider file no longer exist. The 10-tool registry is the
+    // single SaleFlowModule export.
+    const registry = moduleRef.get(RealToolRegistry);
+    expect(Object.keys(registry.getTools())).toHaveLength(10);
     await moduleRef.close();
   });
 });

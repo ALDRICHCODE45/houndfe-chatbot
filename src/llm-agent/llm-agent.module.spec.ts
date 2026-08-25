@@ -134,17 +134,23 @@ describe('LlmAgentModule integration', () => {
         'attachReceipt',
         'updateDelivery',
         'getOrderHistory',
+        'getPaymentDetails',
       ].sort(),
     );
     // The placeholder tool is no longer the production binding.
     expect(tools.getTools()).not.toHaveProperty('getCurrentTime');
 
-    // LLM_AGENT_SYSTEM_PROMPT is composed at boot (base + slice) and
-    // contains the refusal phrase + the sale-flow slice instruction markers.
+    // LLM_AGENT_SYSTEM_PROMPT is composed at boot (base + slice, NO bank
+    // block appended because the seam is gone) and contains the refusal
+    // phrase + the sale-flow slice instruction markers + the new
+    // step-12 getPaymentDetails gating substring.
     const composed = moduleRef.get<string>(LLM_AGENT_SYSTEM_PROMPT);
     expect(composed).toContain('esa función aún no está disponible');
     expect(composed).toContain('searchCatalog');
     expect(composed).toContain('originalPriceCents');
+    expect(composed).toContain(
+      'Llama a `getPaymentDetails` después de que `createSale` confirme',
+    );
 
     const generateTextFn = moduleRef.get(GENERATE_TEXT);
     expect(typeof generateTextFn).toBe('function');
