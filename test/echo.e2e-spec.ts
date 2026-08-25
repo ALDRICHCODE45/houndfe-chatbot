@@ -7,8 +7,13 @@ import type { AppModule as AppModuleStatic } from '../src/app.module';
 import type { ConversationStore } from '../src/conversation/domain/conversation-store';
 import type { CONVERSATION_STORE as CONVERSATION_STORE_MODULE } from '../src/conversation/domain/conversation-store';
 import type { WHATSAPP_SENDER as WHATSAPP_SENDER_MODULE } from '../src/whatsapp/domain/whatsapp-sender.port';
+import { InMemoryConversationStore } from '../src/conversation/infrastructure/in-memory-conversation.store';
+import { InMemoryWebhookDedupStore } from '../src/whatsapp/infrastructure/in-memory-webhook-dedup.store';
+import type { WEBHOOK_DEDUP as WEBHOOK_DEDUP_MODULE } from '../src/whatsapp/domain/webhook-dedup.store';
+import type { LLM_AGENT as LLM_AGENT_MODULE } from '../src/llm-agent/domain/llm-agent.port';
+import type { LlmAgentPort } from '../src/llm-agent/domain/llm-agent.port';
 
-describe('Webhook echo flow (e2e)', () => {
+describe('Webhook agent flow (e2e)', () => {
   const verifyToken = 'verify-token';
   const appSecret = 'meta-app-secret';
 
@@ -22,6 +27,9 @@ describe('Webhook echo flow (e2e)', () => {
   };
   let conversationStoreToken: symbol;
   let whatsappSenderToken: symbol;
+  let webhookDedupToken: symbol;
+  let llmAgentToken: symbol;
+  let llmAgent: LlmAgentPort;
 
   beforeEach(async () => {
     process.env.META_VERIFY_TOKEN = verifyToken;
@@ -32,6 +40,11 @@ describe('Webhook echo flow (e2e)', () => {
     process.env.CHATBOT_API_BASE_URL = 'https://backend.example.com';
     process.env.SERVICE_KEY = 'svc_test_key';
     process.env.CHATBOT_API_BRANCH_ID = 'branch-123';
+    process.env.CHATBOT_API_CASHIER_USER_ID =
+      '00000000-0000-4000-8000-000000000001';
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    process.env.LLM_MODEL = 'test-model';
+    process.env.DATABASE_URL = 'postgres://localhost:5432/test';
 
     // NOTE: dynamic require() below is intentional. NestJS's @nestjs/config runs
     // env validation eagerly inside ConfigModule.forRoot(), so AppModule must be
@@ -47,6 +60,12 @@ describe('Webhook echo flow (e2e)', () => {
     ({ WHATSAPP_SENDER: whatsappSenderToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../src/whatsapp/domain/whatsapp-sender.port') as typeof WHATSAPP_SENDER_MODULE);
+    ({ WEBHOOK_DEDUP: webhookDedupToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/whatsapp/domain/webhook-dedup.store') as typeof WEBHOOK_DEDUP_MODULE);
+    ({ LLM_AGENT: llmAgentToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/llm-agent/domain/llm-agent.port') as typeof LLM_AGENT_MODULE);
 
     const mockedSendText = jest
       .fn<
@@ -56,11 +75,31 @@ describe('Webhook echo flow (e2e)', () => {
       .mockResolvedValue({ providerMessageId: 'wamid.reply' });
     sender = { sendText: mockedSendText };
 
+    llmAgent = {
+      run: jest.fn().mockResolvedValue({
+        reply: 'Hola, ¿en qué puedo ayudarte?',
+        messages: [
+          { role: 'user', content: 'hola mundo' },
+          {
+            role: 'assistant',
+            content: 'Hola, ¿en qué puedo ayudarte?',
+          },
+        ],
+        usage: { promptTokens: 5, completionTokens: 8 },
+      }),
+    };
+
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     })
       .overrideProvider(whatsappSenderToken)
       .useValue(sender)
+      .overrideProvider(conversationStoreToken)
+      .useValue(new InMemoryConversationStore())
+      .overrideProvider(webhookDedupToken)
+      .useValue(new InMemoryWebhookDedupStore())
+      .overrideProvider(llmAgentToken)
+      .useValue(llmAgent)
       .compile();
 
     app = moduleFixture.createNestApplication({ rawBody: true });
@@ -90,6 +129,10 @@ describe('Webhook echo flow (e2e)', () => {
     delete process.env.CHATBOT_API_BASE_URL;
     delete process.env.SERVICE_KEY;
     delete process.env.CHATBOT_API_BRANCH_ID;
+    delete process.env.CHATBOT_API_CASHIER_USER_ID;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.LLM_MODEL;
+    delete process.env.DATABASE_URL;
   });
 
   it('keeps GET /webhook verification working', async () => {
@@ -101,7 +144,7 @@ describe('Webhook echo flow (e2e)', () => {
       .expect('challenge-1');
   });
 
-  it('accepts a signed inbound text event, acknowledges it, and sends an echo reply', async () => {
+  it('accepts a signed inbound text event, acknowledges it, and sends the agent reply', async () => {
     const body = JSON.stringify({
       object: 'whatsapp_business_account',
       entry: [
@@ -137,16 +180,17 @@ describe('Webhook echo flow (e2e)', () => {
 
     expect(sender.sendText).toHaveBeenCalledWith({
       to: '5215550001111',
-      text: 'Echo: hola mundo',
+      text: 'Hola, ¿en qué puedo ayudarte?',
     });
 
-    await expect(conversationStore.get('5215550001111')).resolves.toEqual({
-      senderId: '5215550001111',
-      lastMessageAt: '2024-06-21T20:00:00.000Z',
-      data: {
-        lastInboundMessageId: 'wamid.inbound',
-        lastInboundText: 'hola mundo',
+    const state = await conversationStore.get('5215550001111');
+    expect(state?.senderId).toBe('5215550001111');
+    expect(state?.data.messages).toEqual([
+      { role: 'user', content: 'hola mundo' },
+      {
+        role: 'assistant',
+        content: 'Hola, ¿en qué puedo ayudarte?',
       },
-    });
+    ]);
   });
 });
