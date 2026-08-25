@@ -80,8 +80,8 @@ Chain strategy: size-exception
 
 ## Parent (post-apply lifecycle gates)
 
-- [ ] Start or reuse bounded review: single-PR bounded review with the accepted `size:exception` (forecast ~950–1200 lines vs. the 400-line budget); review the two-commit split (Domain+DTO/Client, Tools+Wiring+Seams+Docs); verify both rollback paths — behaviour rollback (restore the boot seam, keep `getPaymentDetails` registered but inert → archived list-price + human-handoff behaviour, no data loss) and code rollback (revert the merge commit; git tracks renames, no destructive deletes). <!-- sdd-owner: parent -->
-- [ ] Lifecycle gate: confirm follow-up backlog items exist in Engram (project `houndfe-chatbot`): `chatbot-api-doc-sync` (AGENTS.md §4.4), `llm-agent-provider-spec-sync`, `evaluate-cart-coverage-expansion`, `partial-customer-dto`, `order-history-phone-country-code-validation`, `cancel-endpoint-conversational`; then proceed to `sdd-verify`/archive. <!-- sdd-owner: parent -->
+- [x] ~~Start or reuse bounded review~~ NOT APPLICABLE: receipt-driven development is OFF (decided global; `gentle-ai review mode status` = off). Delivery follows ordinary repository policy; the quality gate for this slice is the sdd-verify phase. Both rollback paths were reviewed at design level (design.md §Rollback Design): behaviour rollback (restore boot seam, keep getPaymentDetails inert) and code rollback (revert merge commit; git tracks renames). <!-- sdd-owner: parent -->
+- [x] Lifecycle gate: follow-up backlog confirmed in Engram (project `houndfe-chatbot`): `chatbot-api-doc-sync` (#3959), `evaluate-cart-coverage-expansion` (#3960), `partial-customer-dto` (#3961), `order-history-phone-country-code-validation` (#3962), `cancel-endpoint-conversational` (#3963), `e2e-transform-fix` (#3964); `llm-agent-provider-spec-sync` pre-existed (#3929), `meta-media-cdn-url-expiry` (#3930). Backlog items from the archived sale-flow slice now closed by this slice: `bank-details-source-impl` (#3928) and `promo-discounted createSale` (#3927). Proceeding to `sdd-verify`/archive. <!-- sdd-owner: parent -->
 
 ## Spec Scenario → Test Task Mapping
 
