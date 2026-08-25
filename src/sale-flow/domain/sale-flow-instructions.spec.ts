@@ -38,7 +38,7 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('encodes the 14-step escrow flow markers in order (with getPaymentDetails between createSale and attachReceipt)', () => {
+    it('encodes the 15-step escrow flow markers in order (with getPaymentDetails between createSale and attachReceipt, cancelSale after attachReceipt)', () => {
       const stepOrder = [
         'searchCatalog',
         'checkStock',
@@ -48,6 +48,7 @@ describe('sale-flow-instructions', () => {
         'createSale',
         'getPaymentDetails',
         'attachReceipt',
+        'cancelSale',
       ];
       let lastIndex = -1;
       for (const step of stepOrder) {
@@ -93,6 +94,20 @@ describe('sale-flow-instructions', () => {
       expect(kindIdx).toBeGreaterThan(-1);
       // The kind label appears before the phrase (the gate is announced first).
       expect(kindIdx).toBeLessThan(phraseIdx);
+    });
+
+    it('step 14 gated cancelSale to just-confirmed sale with explicit confirm phrase (byte-identical)', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        '¿Confirmas la cancelación? Sí/No',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('saleNotCancellable');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('missingPlacedSaleId');
+      const confirmIdx = SALE_FLOW_INSTRUCTIONS.indexOf(
+        '¿Confirmas la cancelación? Sí/No',
+      );
+      const historyIdx = SALE_FLOW_INSTRUCTIONS.indexOf('getOrderHistory');
+      expect(confirmIdx).toBeGreaterThan(-1);
+      expect(historyIdx).toBeGreaterThan(-1);
     });
   });
 
