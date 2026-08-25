@@ -19,7 +19,7 @@ import { makeUpdateDeliveryTool } from '../application/tools/update-delivery.too
 import { makeUpsertCustomerTool } from '../application/tools/upsert-customer.tool';
 
 /**
- * Production `ToolRegistry` for the ten sale-flow tools.
+ * Production `ToolRegistry` for the eleven sale-flow tools.
  *
  * Replaces the historical `InMemoryToolRegistry` placeholder in the
  * production wiring of `LlmAgentModule`. The ToolSet is built ONCE in the
@@ -29,6 +29,11 @@ import { makeUpsertCustomerTool } from '../application/tools/upsert-customer.too
  * Q1 / R11: the 10th tool `getPaymentDetails` is the runtime source of
  * bank data. Bank data flows through `chatbotApi.getPaymentDetails()`
  * at the per-turn step after `createSale` succeeds.
+ *
+ * Q8: the 11th tool `cancelSale` unwinds the just-confirmed-session
+ * sale via `chatbotApi.cancelSale()` (backend POST
+ * /chatbot-api/sales/:saleId/cancel); it reads the durable
+ * `placedSaleId` and clears it on success/permanent failure.
  *
  * `cashierUserId` is sourced from typed `AppConfig.chatbotApi.cashierUserId`
  * and injected into the tool deps so the model can never pick it.
