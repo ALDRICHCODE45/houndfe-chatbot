@@ -109,7 +109,7 @@ describe('SaleFlowModule', () => {
   // AppConfigModule.forRoot({ ignoreEnvFile: true }) keeps the test
   // hermetic — it does NOT read the repo's .env file.
 
-  it('resolves RealToolRegistry through the module with exactly 10 tools', async () => {
+  it('resolves RealToolRegistry through the module with exactly 11 tools', async () => {
     const moduleRef = await buildModule();
     const registry = moduleRef.get(RealToolRegistry);
     expect(registry).toBeInstanceOf(RealToolRegistry);
@@ -125,6 +125,7 @@ describe('SaleFlowModule', () => {
         'updateDelivery',
         'getOrderHistory',
         'getPaymentDetails',
+        'cancelSale',
       ].sort(),
     );
     await moduleRef.close();
@@ -133,10 +134,10 @@ describe('SaleFlowModule', () => {
   it('does not bind the boot-time bank-details seam (only the runtime registry)', async () => {
     const moduleRef = await buildModule();
     // Probe the registry only — the boot-time bank-details symbol +
-    // provider file no longer exist. The 10-tool registry is the
+    // provider file no longer exist. The 11-tool registry is the
     // single SaleFlowModule export.
     const registry = moduleRef.get(RealToolRegistry);
-    expect(Object.keys(registry.getTools())).toHaveLength(10);
+    expect(Object.keys(registry.getTools())).toHaveLength(11);
     await moduleRef.close();
   });
 });

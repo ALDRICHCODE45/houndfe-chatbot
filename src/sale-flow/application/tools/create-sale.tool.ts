@@ -4,12 +4,8 @@ import { z } from 'zod';
 import type { ToolDeps } from '../tool-deps';
 import { mapChatbotError } from '../error-mapping';
 import { persistCart } from '../cart-persistence';
-import {
-  EMPTY_CART,
-  readCart,
-  writeCart,
-  type CartState,
-} from '../../domain/cart-state';
+import { persistConfirmedSale } from '../placed-sale-persistence';
+import { readCart, writeCart, type CartState } from '../../domain/cart-state';
 import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
 
 /**
@@ -33,6 +29,10 @@ import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
  *      - IDEMPOTENCY_KEY_CONFLICT: clear the key (the key is poisoned).
  *      - IDEMPOTENCY_KEY_IN_FLIGHT: preserve the key (same payload, retry
  *        later).
+ *      - Success: clear the cart (items + key + expectedTotalCents) AND
+ *        SET `data.placedSaleId = sale.saleId` (used by `cancelSale`).
+ *        Both happen in ONE atomic `ConversationStore.update` via
+ *        `persistConfirmedSale` (ADR-13; cancel-endpoint-conversational).
  *      The backend's `SaleIdempotency` table keys on the header value,
  *      so a stable client UUID is enough — no env var needed.
  *
@@ -57,6 +57,12 @@ import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
  *   7. The error→cart-mutation side effect is owned here, NOT in
  *      `mapChatbotError`: the mapper is pure (no store / senderId) and
  *      `createSale` re-inspects `err.errorCode` for the cart write.
+ *
+ *   8. On success, the tool persists `data.cart = EMPTY_CART` AND
+ *      `data.placedSaleId = sale.saleId` atomically via
+ *      `persistConfirmedSale` (single `ConversationStore.update`).
+ *      A new `createSale` overwrites any prior `placedSaleId`;
+ *      `cancelSale` reads / clears it (cancel-endpoint-conversational).
  *
  * `contextSchema: { senderId }` is the per-tool runtime seam; the
  * sender id never enters the prompt.
@@ -158,12 +164,11 @@ export function makeCreateSaleTool(deps: ToolDeps) {
 
       try {
         const sale = await deps.chatbotApi.createSale(dto, idempotencyKey);
-        // 6) Clear cart on success (items + idempotencyKey +
-        //    expectedTotalCents). EMPTY_CART leaves the optional field
+        // 6) Atomic cart clear + placedSaleId set (ONE store.update
+        //    write). Replaces the old persistCart(EMPTY_CART) flow.
+        //    EMPTY_CART leaves the optional `expectedTotalCents` field
         //    absent — backwards-compatible with legacy readers.
-        await persistCart(deps.store, senderId, state, EMPTY_CART);
-        // Touch EMPTY_CART to keep the import non-removable (compile guard).
-        void EMPTY_CART;
+        await persistConfirmedSale(deps.store, senderId, state, sale.saleId);
         return { ok: true as const, ...sale };
       } catch (err) {
         // Q3 errorCode-first cart-mutation policy: re-inspect the error

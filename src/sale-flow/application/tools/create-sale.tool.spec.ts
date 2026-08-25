@@ -264,6 +264,168 @@ describe('makeCreateSaleTool', () => {
     expect(dto.cashierUserId).toBe(CASHIER);
   });
 
+  it('clears the cart to EMPTY_CART and sets placedSaleId atomically after a successful createSale (one ConversationStore.update write)', async () => {
+    // T3.3 (cancel-endpoint-conversational): `createSale` success MUST persist
+    // `data.cart = EMPTY_CART` AND `data.placedSaleId = sale.saleId` in a
+    // SINGLE `ConversationStore.update` (ADR-13). A second sequential write
+    // would clobber the first's cart clear.
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'existing-key',
+    };
+    const updateCalls: Array<{ senderId: string; patch: object }> = [];
+    const state: ConversationState = {
+      senderId: 's',
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: { cart },
+    };
+    const update = jest
+      .fn()
+      .mockImplementation(async (senderId: string, patch: object) => {
+        updateCalls.push({ senderId, patch });
+        return {
+          senderId,
+          lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+          data: (patch as { data: object }).data,
+        };
+      });
+    const store = {
+      get: jest.fn().mockResolvedValue(state),
+      update,
+    } as unknown as ConversationStore;
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1000,
+      paidCents: 0,
+      debtCents: 1000,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+
+    // Exactly ONE store.update write on the success path (cart clear +
+    // placedSaleId set are atomic — never two sequential writes).
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, ...sale });
+
+    // The single patch contains cart=EMPTY_CART AND placedSaleId='sale-1'.
+    const firstCall = updateCalls[0];
+    expect(firstCall.senderId).toBe('s');
+    const patch = firstCall.patch as {
+      data: {
+        cart: { items: unknown[]; idempotencyKey: string };
+        placedSaleId: string;
+      };
+    };
+    expect(patch.data.cart.items).toEqual([]);
+    expect(patch.data.cart.idempotencyKey).toBe('');
+    expect(patch.data.placedSaleId).toBe('sale-1');
+  });
+
+  it('a new createSale overwrites the prior placedSaleId atomically with the cart clear', async () => {
+    // T3.3 (b): subsequent createSale overwrites any prior placedSaleId.
+    const cart = {
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: 'k',
+    };
+    const state: ConversationState = {
+      senderId: 's',
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: { cart, placedSaleId: 'sale-1' }, // prior placedSaleId present
+    };
+    const update = jest.fn().mockResolvedValue({});
+    const store = {
+      get: jest.fn().mockResolvedValue(state),
+      update,
+    } as unknown as ConversationStore;
+    const sale: BotSaleResponse = {
+      saleId: 'sale-2',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1000,
+      paidCents: 0,
+      debtCents: 1000,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeCreateSaleTool(deps);
+
+    await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+
+    // Single atomic write overwrites placedSaleId + clears cart.
+    expect(update).toHaveBeenCalledTimes(1);
+    const [, patch] = update.mock.calls[0]! as [
+      string,
+      {
+        data: {
+          cart: { items: unknown[]; idempotencyKey: string };
+          placedSaleId: string;
+        };
+      },
+    ];
+    expect(patch.data.placedSaleId).toBe('sale-2');
+    expect(patch.data.cart.items).toEqual([]);
+    expect(patch.data.cart.idempotencyKey).toBe('');
+  });
+
   it('clears the cart to EMPTY_CART after a successful createSale', async () => {
     const cart = {
       items: [

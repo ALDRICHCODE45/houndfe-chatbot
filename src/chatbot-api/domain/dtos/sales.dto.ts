@@ -1,6 +1,70 @@
 import { z } from 'zod';
 
 /**
+ * Zod schema for `CancelSaleInput` (chatbot-api
+ * `POST /chatbot-api/sales/:saleId/cancel`, scope `sales:write`).
+ *
+ * `reason` is the full 5-value enum (chatbot-api spec §4.4.10); the
+ * `cancelSale` tool layer always sends `CUSTOMER_REQUEST` (ADR-21), but
+ * the wire contract stays complete so future relaxations don't churn the
+ * DTO.
+ *
+ * `cashierUserId` is server-injected (`CHATBOT_API_CASHIER_USER_ID`); the
+ * tool never accepts a model-supplied value.
+ */
+export const CancelSaleInputSchema = z.object({
+  reason: z.enum([
+    'CUSTOMER_REQUEST',
+    'ORDER_ERROR',
+    'OUT_OF_STOCK',
+    'DUPLICATE_SALE',
+    'OTHER',
+  ]),
+  cashierUserId: z.string().min(1),
+});
+
+export interface CancelSaleInput {
+  reason:
+    | 'CUSTOMER_REQUEST'
+    | 'ORDER_ERROR'
+    | 'OUT_OF_STOCK'
+    | 'DUPLICATE_SALE'
+    | 'OTHER';
+  /** UUID of the cashier / bot identity. Injected from
+   *  `CHATBOT_API_CASHIER_USER_ID`; never model-supplied. */
+  cashierUserId: string;
+}
+
+/**
+ * Cancel endpoint response projection (`CancelSaleResult`).
+ *
+ * NOT `BotSaleResponse` — the backend `cancelBotSale` → `SalesService.cancelSale`
+ * returns a different shape (no `deliveryStatus` / `totalCents` /
+ * `subtotalCents`; carries `refundedCents` + `restockedItems` +
+ * `canceledAt`). Reusing `BotSaleResponse` would be a deserialization
+ * lie (ADR-19).
+ *
+ * Plain interface (matches the existing response-DTO style — responses
+ * are not Zod-validated today); only the INPUT carries a Zod schema.
+ */
+export interface CancelSaleResult {
+  /** UUID of the canceled sale. */
+  saleId: string;
+  /** Literal `'CANCELED'` — a `CANCELED` sale returns a 200 replay
+   *  success (no distinct "already canceled" code, ADR-20). */
+  status: 'CANCELED';
+  /** Non-negative integer cents. */
+  refundedCents: number;
+  restockedItems: Array<{
+    productId: string;
+    variantId: string | null;
+    quantity: number;
+  }>;
+  /** ISO 8601 timestamp of the cancel operation. */
+  canceledAt: string;
+}
+
+/**
  * Zod schema for `CreateSaleInput` (chatbot-api `POST /chatbot-api/sales`).
  *
  * `expectedTotalCents` is OPTIONAL on the wire — the bot MUST omit the key

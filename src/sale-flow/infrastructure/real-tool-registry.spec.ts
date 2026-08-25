@@ -27,6 +27,7 @@ describe('RealToolRegistry', () => {
     updateDelivery: jest.fn(),
     getOrderHistory: jest.fn(),
     getPaymentDetails: jest.fn(),
+    cancelSale: jest.fn(),
   };
   const stubStore = {
     get: jest.fn(),
@@ -61,7 +62,7 @@ describe('RealToolRegistry', () => {
     expect(registry).toBeInstanceOf(RealToolRegistry);
   });
 
-  it('getTools() returns exactly the 10 sale-flow tool keys including getPaymentDetails', async () => {
+  it('getTools() returns exactly the 11 sale-flow tool keys including getPaymentDetails and cancelSale', async () => {
     const registry = await buildRegistry();
     const tools = registry.getTools();
     expect(Object.keys(tools).sort()).toEqual(
@@ -76,6 +77,7 @@ describe('RealToolRegistry', () => {
         'updateDelivery',
         'getOrderHistory',
         'getPaymentDetails',
+        'cancelSale',
       ].sort(),
     );
   });

@@ -7,11 +7,16 @@
  * means the request is unfixable and the model should surface it to the
  * customer (or fall through to the refusal phrase).
  *
- * The eleven `kind` literals partition into two shapes:
- *   - The 10 "simple" kinds carry exactly `{ kind, retryable }`.
+ * The fourteen `kind` literals partition into two shapes:
+ *   - The 13 "simple" kinds carry exactly `{ kind, retryable }`.
  *   - The `promoReQuote` kind carries the three numeric cents fields the
  *     model needs to re-confirm with the customer (Q2 / R13).
  * The discriminated union below encodes both shapes verbatim.
+ *
+ * The three cancel kinds (`saleNotFound`, `saleNotCancellable`,
+ * `missingPlacedSaleId`) are produced by `cancelSale` / the cancel
+ * `errorCode`-first mapping. `missingPlacedSaleId` is NEVER emitted by
+ * `mapChatbotError` — only by the tool's client-side guard.
  */
 export type ToolErrorKind =
   | 'auth'
@@ -24,7 +29,10 @@ export type ToolErrorKind =
   | 'promoReQuote'
   | 'idempotencyInFlight'
   | 'idempotencyConflict'
-  | 'priceOutOfDate';
+  | 'priceOutOfDate'
+  | 'saleNotFound'
+  | 'saleNotCancellable'
+  | 'missingPlacedSaleId';
 
 export interface SimpleToolError {
   kind: Exclude<ToolErrorKind, 'promoReQuote'>;

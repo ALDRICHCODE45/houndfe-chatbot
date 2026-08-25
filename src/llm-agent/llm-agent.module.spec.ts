@@ -119,7 +119,7 @@ describe('LlmAgentModule integration', () => {
     const llm = moduleRef.get<LlmAgentPort>(LLM_AGENT);
     expect(llm).toBeInstanceOf(VercelAiLlmAgent);
 
-    // TOOL_REGISTRY resolves to RealToolRegistry with the 9 sale-flow tools.
+    // TOOL_REGISTRY resolves to RealToolRegistry with the 11 sale-flow tools.
     const tools = moduleRef.get<ToolRegistry>(TOOL_REGISTRY);
     expect(tools).toBeInstanceOf(RealToolRegistry);
     const toolKeys = Object.keys(tools.getTools()).sort();
@@ -135,6 +135,7 @@ describe('LlmAgentModule integration', () => {
         'updateDelivery',
         'getOrderHistory',
         'getPaymentDetails',
+        'cancelSale',
       ].sort(),
     );
     // The placeholder tool is no longer the production binding.

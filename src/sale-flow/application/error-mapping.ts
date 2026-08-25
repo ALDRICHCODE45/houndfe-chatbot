@@ -54,6 +54,9 @@ function readPromoPayload(err: ChatbotApiError): {
  *   errorCode === 'IDEMPOTENCY_KEY_CONFLICT' (409)  -> { idempotencyConflict, false }
  *   errorCode === 'PRICE_OUT_OF_DATE' (409)       -> { priceOutOfDate, false }
  *   errorCode === 'INVALID_IDEMPOTENCY_KEY' (400) -> { validation, false }
+ *   errorCode === 'SALE_NOT_FOUND' (404) -> { saleNotFound, false }
+ *   errorCode === 'SALE_NOT_CANCELLABLE' (409) -> { saleNotCancellable, false }
+ *   errorCode === 'SALE_DELIVERED_CANNOT_CANCEL' (409) -> { saleNotCancellable, false }
  *   errorCode === null (legacy) ->
  *      AuthError(401)         -> { auth,     false }
  *      ForbiddenError(403)    -> { forbidden, false }
@@ -65,6 +68,11 @@ function readPromoPayload(err: ChatbotApiError): {
  *      ChatbotApiError(4xx)   -> { validation,false }
  *      ChatbotApiError(5xx)   -> { upstream,  true  }
  *   anything else          -> rethrow (infra / config defect)
+ *
+ * `missingPlacedSaleId` is NEVER emitted here — it is produced only by the
+ * `cancelSale` tool's client-side guard. Unknown cancel codes fall through
+ * to the existing status/subclass mapping so a code mismatch degrades
+ * safely (sale-flow-tools spec §"unknown cancel errorCode").
  */
 export function mapChatbotError(err: unknown): ToolErrorResult {
   if (err instanceof ChatbotApiError) {
@@ -111,6 +119,17 @@ export function mapChatbotError(err: unknown): ToolErrorResult {
         return {
           ok: false,
           error: { kind: 'validation', retryable: false },
+        };
+      case 'SALE_NOT_FOUND':
+        return {
+          ok: false,
+          error: { kind: 'saleNotFound', retryable: false },
+        };
+      case 'SALE_NOT_CANCELLABLE':
+      case 'SALE_DELIVERED_CANNOT_CANCEL':
+        return {
+          ok: false,
+          error: { kind: 'saleNotCancellable', retryable: false },
         };
       default:
         break;

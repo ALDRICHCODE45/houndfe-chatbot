@@ -7,6 +7,7 @@ import { CONVERSATION_STORE as CONVERSATION_STORE_TOKEN } from '../../conversati
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import type { ToolDeps } from '../application/tool-deps';
 import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
+import { makeCancelSaleTool } from '../application/tools/cancel-sale.tool';
 import { makeCheckStockTool } from '../application/tools/check-stock.tool';
 import { makeCreateSaleTool } from '../application/tools/create-sale.tool';
 import { makeEvaluateCartTool } from '../application/tools/evaluate-cart.tool';
@@ -58,6 +59,7 @@ export class RealToolRegistry implements ToolRegistry {
       updateDelivery: makeUpdateDeliveryTool(deps),
       getOrderHistory: makeGetOrderHistoryTool(deps),
       getPaymentDetails: makeGetPaymentDetailsTool(deps),
+      cancelSale: makeCancelSaleTool(deps),
     };
   }
 

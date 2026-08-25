@@ -102,6 +102,53 @@ describe('mapChatbotError', () => {
     });
   });
 
+  it('SALE_NOT_FOUND (404) → {saleNotFound, false}', () => {
+    const err = apiError(404, { error: 'SALE_NOT_FOUND' }, 'SALE_NOT_FOUND');
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'saleNotFound', retryable: false },
+    });
+  });
+
+  it('SALE_NOT_CANCELLABLE (409) → {saleNotCancellable, false}', () => {
+    const err = apiError(
+      409,
+      { error: 'SALE_NOT_CANCELLABLE' },
+      'SALE_NOT_CANCELLABLE',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'saleNotCancellable', retryable: false },
+    });
+  });
+
+  it('SALE_DELIVERED_CANNOT_CANCEL (409) → {saleNotCancellable, false}', () => {
+    const err = apiError(
+      409,
+      { error: 'SALE_DELIVERED_CANNOT_CANCEL' },
+      'SALE_DELIVERED_CANNOT_CANCEL',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'saleNotCancellable', retryable: false },
+    });
+  });
+
+  it('unrecognized errorCode with 4xx status → falls back to status mapping (validation)', () => {
+    // A future / unknown backend code MUST degrade safely to the existing
+    // status-keyed mapping rather than the mapper guessing a kind. 422
+    // maps to `validation` per the 4xx fallback.
+    const err = apiError(
+      422,
+      { error: 'SOME_FUTURE_CODE' },
+      'SOME_FUTURE_CODE',
+    );
+    expect(mapChatbotError(err)).toEqual({
+      ok: false,
+      error: { kind: 'validation', retryable: false },
+    });
+  });
+
   it('INVALID_IDEMPOTENCY_KEY (400) → {validation, false}', () => {
     const err = apiError(
       400,

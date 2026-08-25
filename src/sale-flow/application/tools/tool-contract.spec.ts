@@ -1,11 +1,13 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
 import { makeAttachReceiptTool } from './attach-receipt.tool';
+import { makeCancelSaleTool } from './cancel-sale.tool';
 import { makeCheckStockTool } from './check-stock.tool';
 import { makeCreateSaleTool } from './create-sale.tool';
 import { makeEvaluateCartTool } from './evaluate-cart.tool';
 import { makeGetCustomerByPhoneTool } from './get-customer-by-phone.tool';
 import { makeGetOrderHistoryTool } from './get-order-history.tool';
+import { makeGetPaymentDetailsTool } from './get-payment-details.tool';
 import { makeSearchCatalogTool } from './search-catalog.tool';
 import { makeUpdateDeliveryTool } from './update-delivery.tool';
 import { makeUpsertCustomerTool } from './upsert-customer.tool';
@@ -52,6 +54,8 @@ const factories: Array<[string, Factory]> = [
   ['attachReceipt', makeAttachReceiptTool as Factory],
   ['updateDelivery', makeUpdateDeliveryTool as Factory],
   ['getOrderHistory', makeGetOrderHistoryTool as Factory],
+  ['getPaymentDetails', makeGetPaymentDetailsTool as Factory],
+  ['cancelSale', makeCancelSaleTool as Factory],
 ];
 
 describe('sale-flow tool contract (T4.1 / T4.12)', () => {

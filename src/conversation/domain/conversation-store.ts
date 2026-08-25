@@ -23,6 +23,8 @@ export type AgentMessage =
  */
 export interface ConversationStateData {
   messages?: AgentMessage[];
+  /** Sale id persisted by createSale success; read/cleared by cancelSale. */
+  placedSaleId?: string;
   [key: string]: unknown;
 }
 

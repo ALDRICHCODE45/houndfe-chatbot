@@ -12,6 +12,7 @@ import {
   UpstreamError,
 } from '../domain/errors';
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
+import { CancelSaleInputSchema } from '../domain/dtos/sales.dto';
 
 describe('ChatbotApiHttpClient', () => {
   let httpService: jest.Mocked<Pick<HttpService, 'request'>>;
@@ -801,5 +802,200 @@ describe('ChatbotApiHttpClient', () => {
       expect(error).toBeInstanceOf(UpstreamError);
       expect((error as ChatbotApiError).errorCode).toBe('BOOM');
     }
+  });
+
+  // ─── cancelSale (POST /chatbot-api/sales/:saleId/cancel) — design §b
+
+  it('cancelSale POSTs to /chatbot-api/sales/:saleId/cancel with the DTO body and NO X-Idempotency-Key header', async () => {
+    const body = {
+      saleId: 'sale-1',
+      status: 'CANCELED',
+      refundedCents: 0,
+      restockedItems: [{ productId: 'p-1', variantId: null, quantity: 2 }],
+      canceledAt: '2026-08-25T12:00:00.000Z',
+    };
+    httpService.request.mockReturnValue(of({ data: body }));
+
+    await expect(
+      client.cancelSale('sale-1', {
+        reason: 'CUSTOMER_REQUEST',
+        cashierUserId: '00000000-0000-4000-8000-000000000001',
+      }),
+    ).resolves.toEqual(body);
+
+    expect(httpService.request).toHaveBeenCalledTimes(1);
+    const cfg = httpService.request.mock.calls[0][0] as {
+      method: string;
+      url: string;
+      data: unknown;
+      headers: Record<string, string>;
+    };
+    expect(cfg.method).toBe('POST');
+    expect(cfg.url).toBe('/chatbot-api/sales/sale-1/cancel');
+    expect(cfg.data).toEqual({
+      reason: 'CUSTOMER_REQUEST',
+      cashierUserId: '00000000-0000-4000-8000-000000000001',
+    });
+    // NO X-Idempotency-Key header (ADR-16: backend-derived idempotency).
+    expect(cfg.headers['X-Idempotency-Key']).toBeUndefined();
+    // Standard auth + branch headers MUST still be applied.
+    expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+    expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+  });
+
+  it('cancelSale percent-encodes the saleId path segment', async () => {
+    httpService.request.mockReturnValue(
+      of({
+        data: {
+          saleId: 'sale+id/1',
+          status: 'CANCELED',
+          refundedCents: 0,
+          restockedItems: [],
+          canceledAt: '2026-08-25T12:00:00.000Z',
+        },
+      }),
+    );
+    await client.cancelSale('sale+id/1', {
+      reason: 'CUSTOMER_REQUEST',
+      cashierUserId: 'cashier-1',
+    });
+    const url = (httpService.request.mock.calls[0]?.[0] as { url: string }).url;
+    expect(url).toBe('/chatbot-api/sales/sale%2Bid%2F1/cancel');
+  });
+
+  it('cancelSale resolves 200 with the CancelSaleResult projection — NOT BotSaleResponse fields', async () => {
+    const projection = {
+      saleId: 'sale-1',
+      status: 'CANCELED',
+      refundedCents: 0,
+      restockedItems: [{ productId: 'p-1', variantId: null, quantity: 2 }],
+      canceledAt: '2026-08-25T12:00:00.000Z',
+    };
+    httpService.request.mockReturnValue(of({ data: projection }));
+    const resolved = await client.cancelSale('sale-1', {
+      reason: 'CUSTOMER_REQUEST',
+      cashierUserId: 'cashier-1',
+    });
+    expect(resolved).toEqual(projection);
+    expect(
+      (resolved as unknown as Record<string, unknown>)['deliveryStatus'],
+    ).toBeUndefined();
+    expect(
+      (resolved as unknown as Record<string, unknown>)['totalCents'],
+    ).toBeUndefined();
+    expect(
+      (resolved as unknown as Record<string, unknown>)['subtotalCents'],
+    ).toBeUndefined();
+  });
+
+  it('cancelSale 409 SALE_NOT_CANCELLABLE surfaces ChatbotApiError with verbatim errorCode', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: {
+          status: 409,
+          data: {
+            statusCode: 409,
+            error: 'SALE_NOT_CANCELLABLE',
+            message: 'Sale is not cancellable',
+          },
+        },
+      })),
+    );
+    try {
+      await client.cancelSale('sale-1', {
+        reason: 'CUSTOMER_REQUEST',
+        cashierUserId: 'cashier-1',
+      });
+      fail('Expected ChatbotApiError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect((error as ChatbotApiError).statusCode).toBe(409);
+      expect((error as ChatbotApiError).errorCode).toBe('SALE_NOT_CANCELLABLE');
+    }
+  });
+
+  it('cancelSale 409 SALE_DELIVERED_CANNOT_CANCEL surfaces ChatbotApiError with verbatim errorCode', async () => {
+    httpService.request.mockReturnValue(
+      throwError(() => ({
+        response: {
+          status: 409,
+          data: {
+            statusCode: 409,
+            error: 'SALE_DELIVERED_CANNOT_CANCEL',
+            message: 'Sale already delivered',
+          },
+        },
+      })),
+    );
+    try {
+      await client.cancelSale('sale-1', {
+        reason: 'CUSTOMER_REQUEST',
+        cashierUserId: 'cashier-1',
+      });
+      fail('Expected ChatbotApiError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect((error as ChatbotApiError).statusCode).toBe(409);
+      expect((error as ChatbotApiError).errorCode).toBe(
+        'SALE_DELIVERED_CANNOT_CANCEL',
+      );
+    }
+  });
+
+  it('cancelSale 200 with status: CANCELED for an already-canceled sale resolves as success (replay)', async () => {
+    const replay = {
+      saleId: 'sale-1',
+      status: 'CANCELED',
+      refundedCents: 0,
+      restockedItems: [],
+      canceledAt: '2026-08-24T10:00:00.000Z',
+    };
+    httpService.request.mockReturnValue(of({ data: replay }));
+    const resolved = await client.cancelSale('sale-1', {
+      reason: 'CUSTOMER_REQUEST',
+      cashierUserId: 'cashier-1',
+    });
+    expect(resolved).toEqual(replay);
+  });
+
+  describe('CancelSaleInputSchema', () => {
+    it('accepts each of the five reason values', () => {
+      for (const reason of [
+        'CUSTOMER_REQUEST',
+        'ORDER_ERROR',
+        'OUT_OF_STOCK',
+        'DUPLICATE_SALE',
+        'OTHER',
+      ]) {
+        const r = CancelSaleInputSchema.safeParse({
+          reason,
+          cashierUserId: 'cashier-1',
+        });
+        expect(r.success).toBe(true);
+      }
+    });
+
+    it('rejects an unknown reason', () => {
+      const r = CancelSaleInputSchema.safeParse({
+        reason: 'NOT_A_REASON',
+        cashierUserId: 'cashier-1',
+      });
+      expect(r.success).toBe(false);
+    });
+
+    it('rejects when cashierUserId is missing', () => {
+      const r = CancelSaleInputSchema.safeParse({
+        reason: 'CUSTOMER_REQUEST',
+      });
+      expect(r.success).toBe(false);
+    });
+
+    it('rejects an empty cashierUserId', () => {
+      const r = CancelSaleInputSchema.safeParse({
+        reason: 'CUSTOMER_REQUEST',
+        cashierUserId: '',
+      });
+      expect(r.success).toBe(false);
+    });
   });
 });

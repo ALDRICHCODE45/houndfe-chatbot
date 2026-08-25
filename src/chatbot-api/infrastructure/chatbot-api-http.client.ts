@@ -23,11 +23,16 @@ import type {
   AttachReceiptInput,
   AttachReceiptResponse,
   BotSaleResponse,
+  CancelSaleInput,
+  CancelSaleResult,
   CreateSaleInput,
   OrderHistoryResponse,
   UpdateDeliveryInput,
 } from '../domain/dtos/sales.dto';
-import { CreateSaleInputSchema } from '../domain/dtos/sales.dto';
+import {
+  CancelSaleInputSchema,
+  CreateSaleInputSchema,
+} from '../domain/dtos/sales.dto';
 import {
   AuthError,
   BranchMismatchError,
@@ -200,6 +205,26 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       { method: 'GET', url: '/chatbot-api/payment-details' },
       { retryable: true },
     );
+  }
+
+  /**
+   * `POST /chatbot-api/sales/:saleId/cancel` (chatbot-api §4.4.10,
+   * scope `sales:write`).
+   *
+   * No client `X-Idempotency-Key` header — the backend derives the
+   * idempotency key from `sale:cancel:<saleId>` (SHA-256 of
+   * `{saleId, actorId, reason}`); a client-minted header would be
+   * ignored / cause a `IDEMPOTENCY_KEY_CONFLICT`. The standard
+   * single-branch auth headers (`Authorization` + `X-Branch-Id`)
+   * apply as usual (ADR-16).
+   */
+  cancelSale(saleId: string, dto: CancelSaleInput): Promise<CancelSaleResult> {
+    const parsed = CancelSaleInputSchema.parse(dto);
+    return this.request<CancelSaleResult>({
+      method: 'POST',
+      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/cancel`,
+      data: { reason: parsed.reason, cashierUserId: parsed.cashierUserId },
+    });
   }
 
   private async request<T>(
