@@ -56,8 +56,8 @@ import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
  *      successful send, so a failed send lets Meta re-deliver and retry.
  *
  * Spec: `openspec/changes/human-handoff/specs/whatsapp-webhook/delta.md`.
- * Test: `webhook-dispatcher.service.spec.ts` (eight new scenarios + the
- * existing agent-path scenarios).
+ * Test: `webhook-dispatcher.service.spec.ts` (15 it() blocks: 8 agent-path
+ * + 3 metadata + 4 ops-path/pending-marker short-circuit).
  */
 @Injectable()
 export class WebhookDispatcherService {

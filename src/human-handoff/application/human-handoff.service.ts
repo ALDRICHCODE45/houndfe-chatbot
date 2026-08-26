@@ -185,9 +185,16 @@ export class HumanHandoffService {
     from: string;
   }): Promise<HumanHandoffResolveReplyResult> {
     const refMatch = /\bHF-([A-Za-z0-9_-]{4,32})\b/i.exec(args.text);
-    const target = refMatch
+    let target = refMatch
       ? await this.store.findByRef(`HF-${refMatch[1]}`)
-      : await this.store.findLatestPendingForAgent(args.from);
+      : null;
+
+    if (!target) {
+      // Newest-pending fallback (spec step 2): when no token is present
+      // OR the token returned no row, try the agent's newest pending
+      // request. Only when BOTH lookups miss do we answer no_pending.
+      target = await this.store.findLatestPendingForAgent(args.from);
+    }
 
     if (!target) {
       return { kind: 'no_pending', reply: ASK_FOR_REF };

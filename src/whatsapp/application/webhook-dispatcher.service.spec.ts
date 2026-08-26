@@ -22,6 +22,11 @@ import {
   WebhookDispatcherService,
 } from './webhook-dispatcher.service';
 import type { InboundMessage } from '../domain/inbound-message';
+import {
+  ASK_FOR_REF,
+  PENDING_HUMAN_REQUEST_REPLY,
+  type HumanHandoffService,
+} from '../../human-handoff/application/human-handoff.service';
 
 /**
  * Spec rewrite: the dispatcher MUST replace the echo path with
@@ -48,6 +53,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   let service: WebhookDispatcherService;
   let dedup: jest.Mocked<WebhookDedupStore>;
   let recentOutbound: jest.Mocked<RecentOutboundStore>;
+  let humanHandoff: jest.Mocked<
+    Pick<HumanHandoffService, 'isOpsSender' | 'create' | 'resolveReply'>
+  >;
+  let conversationStore: jest.Mocked<ConversationStore>;
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -499,6 +508,193 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect.objectContaining({ text: 'nuevo' }),
     );
     expect(sender.sendText).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── Ops pre-routing hook + pending-marker short-circuit ──────────────
+  // human-handoff slice (spec whatsapp-webhook delta §"Ops pre-routing
+  // hook" + §"pendingHumanRequest short-circuit"). These scenarios were
+  // the verify blocker: the ops path and the short-circuit had ZERO
+  // coverage in this file. The hook runs AFTER echo + dedup and BEFORE
+  // the runner; the short-circuit runs only for customer-side inbounds.
+  describe('ops pre-routing hook + pending-marker short-circuit', () => {
+    const OPS = '5219999888777';
+    const CUSTOMER = '5215550001111';
+
+    const opsEvent = (messageId: string, body: string): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id: messageId,
+                    from: OPS,
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    it('resolved outcome: resolveReply → synthetic customer turn via AgentRunner → reply sent to the CUSTOMER', async () => {
+      humanHandoff.isOpsSender.mockReturnValue(true);
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'resolved',
+        customerId: CUSTOMER,
+        ref: 'HF-abc123def456',
+        resolution: { decision: 'YES_RESTOCK_IN_X_DAYS', days: 3 },
+        syntheticUserText:
+          '[Resolución del agente humano (HF-abc123def456)] El producto estará disponible nuevamente en 3 día(s).',
+      });
+      // The runner processes the synthetic turn as a normal customer
+      // turn (first contact — the marker was already cleared by
+      // resolveReply, so the runner's ADR-29 gate does not fire).
+      store.get.mockResolvedValue(null);
+      store.update.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { messages: [] },
+      });
+      llm.run.mockResolvedValue({
+        reply: '¡Claro! El producto estará disponible en 3 días.',
+        messages: [
+          {
+            role: 'user',
+            content:
+              '[Resolución del agente humano (HF-abc123def456)] El producto estará disponible nuevamente en 3 día(s).',
+          },
+          {
+            role: 'assistant',
+            content: '¡Claro! El producto estará disponible en 3 días.',
+          },
+        ],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+
+      await service.dispatch(
+        opsEvent('wamid.ops-resolve', 'HF-abc123def456 YES_RESTOCK_IN_X_DAYS:3'),
+      );
+
+      expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
+        text: 'HF-abc123def456 YES_RESTOCK_IN_X_DAYS:3',
+        from: OPS,
+      });
+      // The synthetic turn runs through the runner as a CUSTOMER turn
+      // (NOT the ops phone).
+      expect(llm.run).toHaveBeenCalledTimes(1);
+      expect(llm.run).toHaveBeenCalledWith(
+        expect.objectContaining({
+          senderId: CUSTOMER,
+          text: expect.stringContaining('HF-abc123def456'),
+        }),
+      );
+      // The assistant reply goes to the CUSTOMER, never to ops.
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: '¡Claro! El producto estará disponible en 3 días.',
+      });
+      expect(sender.sendText).not.toHaveBeenCalledWith(
+        expect.objectContaining({ to: OPS }),
+      );
+      // The ops inbound is still marked seen (dedup bookkeeping).
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-resolve');
+    });
+
+    it('no_pending outcome: ASK_FOR_REF goes back to the OPS number, no agent run', async () => {
+      humanHandoff.isOpsSender.mockReturnValue(true);
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'no_pending',
+        reply: ASK_FOR_REF,
+      });
+
+      await service.dispatch(opsEvent('wamid.ops-nopending', 'hola'));
+
+      expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
+        text: 'hola',
+        from: OPS,
+      });
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: OPS,
+        text: ASK_FOR_REF,
+      });
+      expect(llm.run).not.toHaveBeenCalled();
+      // The ops path short-circuits BEFORE the pending-marker read.
+      expect(conversationStore.get).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-nopending');
+    });
+
+    it('dedup applies to ops inbounds unchanged: a duplicate ops wamid never reaches resolveReply', async () => {
+      dedup.isDuplicate.mockResolvedValue(true);
+      humanHandoff.isOpsSender.mockReturnValue(true);
+
+      await service.dispatch(
+        opsEvent('wamid.ops-dup', 'HF-abc123def456 NO_RESTOCK'),
+      );
+
+      expect(dedup.isDuplicate).toHaveBeenCalledWith('wamid.ops-dup');
+      expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('customer inbound with pending marker: canned reply, NO AgentRunner call, no transcript write', async () => {
+      // Default humanHandoff.isOpsSender → false: customer-side inbound.
+      conversationStore.get.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {
+          pendingHumanRequest: {
+            requestId: 'abc123def456',
+            ref: 'HF-abc123def456',
+            createdAt: '2026-06-23T12:00:00.000Z',
+            customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+          },
+        },
+      });
+
+      const event: WebhookEventDto = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  messages: [
+                    {
+                      id: 'wamid.cust-pending',
+                      from: CUSTOMER,
+                      timestamp: '1719000000',
+                      type: 'text',
+                      text: { body: '¿siguen?' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      };
+
+      await service.dispatch(event);
+
+      expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: PENDING_HUMAN_REQUEST_REPLY,
+      });
+      expect(llm.run).not.toHaveBeenCalled(); // runner never invoked
+      expect(store.update).not.toHaveBeenCalled(); // no transcript write
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reply');
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cust-pending');
+    });
   });
 });
 

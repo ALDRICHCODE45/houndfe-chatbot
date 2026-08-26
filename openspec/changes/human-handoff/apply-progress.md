@@ -105,7 +105,7 @@ None. The persisted-task checkboxes are updated inline as commits land.
 | T4.5–T4.6 | `AgentRunner` short-circuit (ADR-29) + fresh-state spread (ADR-28) + idle-reset marker preservation | ✅ | RED: new first-contact regression test failed (`store.update` not called when post-run re-fetch returns null); GREEN: runner spec 14/14 + e2e green (see below) |
 | T4.7–T4.8 | `toolsContext.requestHumanAssistance.senderId` in `vercel-ai-llm-agent.ts` | ✅ | runner-level tool spec validates `options.context.senderId` |
 | T5.1–T5.2 | `WebhookMetadataDto` + `WebhookValueDto.metadata` + `InboundMessage.receivingPhoneNumberId` | ✅ | RED: normalizer tests failed (`normalizeInboundMessages is not a function` — export + interface field absent); GREEN: dispatcher spec 11/11 |
-| T5.3–T5.4 | Ops pre-routing hook + pending-marker short-circuit + synthetic-turn injection | ✅ | dispatcher spec covers 8 scenarios; RED/GREEN per scenario set |
+| T5.3–T5.4 | Ops pre-routing hook + pending-marker short-circuit + synthetic-turn injection | ✅ | dispatcher spec 15 it() blocks (8 agent-path + 3 metadata + 4 ops-path/short-circuit added by the verify fix: ops-resolved synthetic turn to the customer, ops no_pending ASK_FOR_REF to ops, ops dedup, customer pending-marker canned reply) |
 | T5.5–T5.6 | `WhatsappModule` imports `HumanHandoffModule` | ✅ | `pnpm build` + full suite green |
 
 ### Deviation fixed during apply (first-contact ADR-28 regression)

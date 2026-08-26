@@ -362,6 +362,50 @@ describe('HumanHandoffService', () => {
       }
     });
 
+    it('ref token present but no row: falls back to the newest pending for the agent', async () => {
+      // Spec step 2 (human-handoff §"resolveReply parses the HF-<id> token
+      // and falls back to newest-pending"): a token that finds NO row must
+      // fall back to findLatestPendingForAgent(from) instead of returning
+      // no_pending immediately.
+      const fallback: HumanHandoffRequest = {
+        ...baseRequest,
+        id: 'fbabc0000001',
+        createdAt: '2026-06-23T12:30:00.000Z',
+      };
+      store.findByRef.mockResolvedValue(null);
+      store.findLatestPendingForAgent.mockResolvedValue(fallback);
+      store.resolve.mockImplementation(async (id, resolution) => ({
+        ...fallback,
+        id,
+        status: 'resolved',
+        resolution,
+        resolvedAt: '2026-06-23T12:35:00.000Z',
+      }));
+      conversationStore.get.mockResolvedValue(
+        customerStateFor(CUSTOMER, {
+          requestId: 'fbabc0000001',
+          ref: 'HF-fbabc0000001',
+          createdAt: '2026-06-23T12:30:00.000Z',
+          customerNotifiedAt: '2026-06-23T12:30:00.000Z',
+        }),
+      );
+
+      const result = await service.resolveReply({
+        text: 'HF-unknown000000 NO_RESTOCK',
+        from: OPS,
+      });
+
+      expect(store.findByRef).toHaveBeenCalledWith('HF-unknown000000');
+      expect(store.findLatestPendingForAgent).toHaveBeenCalledWith(OPS);
+      expect(store.resolve).toHaveBeenCalledWith('fbabc0000001', {
+        decision: 'NO_RESTOCK',
+      });
+      expect(result.kind).toBe('resolved');
+      if (result.kind === 'resolved') {
+        expect(result.customerId).toBe(CUSTOMER);
+      }
+    });
+
     it('no-token fallback: picks the newest pending request for the agent', async () => {
       const newer: HumanHandoffRequest = {
         ...baseRequest,
@@ -395,6 +439,21 @@ describe('HumanHandoffService', () => {
         decision: 'NO_RESTOCK',
       });
       expect(result.kind).toBe('resolved');
+    });
+
+    it('ref token present but BOTH lookups miss: returns no_pending and does not resolve', async () => {
+      store.findByRef.mockResolvedValue(null);
+      store.findLatestPendingForAgent.mockResolvedValue(null);
+
+      const result = await service.resolveReply({
+        text: 'HF-unknown000000 ok',
+        from: OPS,
+      });
+
+      expect(store.findByRef).toHaveBeenCalledWith('HF-unknown000000');
+      expect(store.findLatestPendingForAgent).toHaveBeenCalledWith(OPS);
+      expect(result).toEqual({ kind: 'no_pending', reply: ASK_FOR_REF });
+      expect(store.resolve).not.toHaveBeenCalled();
     });
 
     it('no token + no pending: returns { kind: "no_pending", reply: ASK_FOR_REF }', async () => {
