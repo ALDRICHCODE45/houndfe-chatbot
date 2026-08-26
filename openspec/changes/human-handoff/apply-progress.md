@@ -146,3 +146,23 @@ The staged runner skipped the persist whenever the post-`run` `get` returned `nu
 3. `feat(sale-flow): human-handoff triggers (R7, promo review, R14) + prompt step 16` (check-stock.tool.*, evaluate-cart.tool.*, sale-flow-instructions.ts + spec).
 
 Commit SHAs are recorded in the apply-phase handoff (this file cannot reference commit 1's SHA before commit 1 exists; the log above lists messages + scope).
+
+## Addendum — final commit SHAs + post-fix lint (orchestrator close-out)
+
+Commits created on `feat/human-handoff` (off `main` @ 27f2774), working tree clean:
+
+1. `49cf3bd` — feat(human-handoff): foundation channel — module, migration, service, 12th tool, config (47 files, +6644/−37)
+2. `0a334fa` — feat(whatsapp): ops reply routing, pending-marker short-circuit, fresh-state spread (13 files, +884/−55)
+3. `c71d505` — feat(sale-flow): human-handoff triggers (R7, promo review, R14) + prompt step 16 (6 files, +446/−5)
+
+Final gates (post-`eslint --fix` on all changed files):
+
+| Gate | Result |
+|---|---|
+| `pnpm test` | green — 426 passed, 26 skipped, 48 suites (0 failures) |
+| `pnpm test:e2e` | green — 2/2 passed |
+| `pnpm build` | clean |
+| `pnpm test:cov` | 87.69% statements overall (≥80 ✓) |
+| Scoped lint (after --fix) | 97 problems on changed files; on the 38 tracked-modified files: 44 vs 48 at baseline (HEAD 27f2774) — modified files are lint-cleaner than the pre-change state; remaining errors are the repo's known-broken lint classes (unbound-method in specs, no-unsafe-*, require-await). Prettier/format issues fully auto-fixed. |
+
+Bounded review: NOT APPLICABLE (receipt-driven development OFF — `gentle-ai review status` reports `rdd_disabled`). Delivery follows ordinary repository policy; the quality gate for this slice is the `sdd-verify` phase. Lifecycle commits were created via direct `git -C <repo> commit` (the harness rejects compound/wrapped lifecycle commands).
