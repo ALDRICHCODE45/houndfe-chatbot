@@ -8,6 +8,7 @@ import { makeEvaluateCartTool } from './evaluate-cart.tool';
 import { makeGetCustomerByPhoneTool } from './get-customer-by-phone.tool';
 import { makeGetOrderHistoryTool } from './get-order-history.tool';
 import { makeGetPaymentDetailsTool } from './get-payment-details.tool';
+import { makeRequestHumanAssistanceTool } from './request-human-assistance.tool';
 import { makeSearchCatalogTool } from './search-catalog.tool';
 import { makeUpdateDeliveryTool } from './update-delivery.tool';
 import { makeUpsertCustomerTool } from './upsert-customer.tool';
@@ -38,10 +39,16 @@ type Factory = (deps: {
 
 const stubChatbotApi = {} as ChatbotApiClient;
 const stubStore = {} as ConversationStore;
+const stubHumanHandoffService = {
+  create: jest.fn(),
+  resolveReply: jest.fn(),
+  isOpsSender: jest.fn(),
+};
 const deps = {
   chatbotApi: stubChatbotApi,
   store: stubStore,
   cashierUserId: '00000000-0000-4000-8000-000000000001',
+  humanHandoffService: stubHumanHandoffService as never,
 };
 
 const factories: Array<[string, Factory]> = [
@@ -56,6 +63,7 @@ const factories: Array<[string, Factory]> = [
   ['getOrderHistory', makeGetOrderHistoryTool as Factory],
   ['getPaymentDetails', makeGetPaymentDetailsTool as Factory],
   ['cancelSale', makeCancelSaleTool as Factory],
+  ['requestHumanAssistance', makeRequestHumanAssistanceTool as Factory],
 ];
 
 describe('sale-flow tool contract (T4.1 / T4.12)', () => {

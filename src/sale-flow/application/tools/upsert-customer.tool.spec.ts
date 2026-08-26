@@ -20,6 +20,7 @@ describe('makeUpsertCustomerTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
+    humanHandoffService: {} as never,
   };
 
   it('forwards the full DTO to chatbotApi.upsertCustomer', async () => {

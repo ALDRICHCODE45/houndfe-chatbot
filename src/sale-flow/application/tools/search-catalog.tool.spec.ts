@@ -20,6 +20,7 @@ describe('makeSearchCatalogTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
+    humanHandoffService: {} as never,
   };
 
   it('forwards q + limit (default 10) to chatbotApi.searchCatalog and returns { ok: true, results }', async () => {

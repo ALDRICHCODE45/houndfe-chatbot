@@ -19,10 +19,13 @@ export const META_GRAPH_API_BASE_URL_DEFAULT =
  *   SERVICE_KEY            — ServiceCredential raw key; MUST start with "svc_"
  *   CHATBOT_API_BRANCH_ID  — tenant branch id sent as X-Branch-Id header
  *
- * Optional vars:
- *   META_GRAPH_API_BASE_URL — Graph API base URL, defaults to v23.0
- *   PORT                    — HTTP listening port, defaults to 3000
- *   DB_POOL_MAX             — Postgres pool size, defaults to 5
+ * Conditional vars (human-handoff slice):
+ *   HUMAN_HANDOFF_ENABLED  — boolean, default true. Kill-switch for the
+ *                             human-handoff channel.
+ *   OPS_CHANNEL_PHONE      — REQUIRED when HUMAN_HANDOFF_ENABLED=true.
+ *                             Wa_id of the human agent who receives
+ *                             digests and replies to them. Joi accepts an
+ *                             optional leading `+` (E.164).
  */
 export const envValidationSchema = Joi.object({
   META_VERIFY_TOKEN: Joi.string().required(),
@@ -53,7 +56,42 @@ export const envValidationSchema = Joi.object({
   LLM_MONTHLY_TOKEN_CEILING: Joi.number().integer().min(1).default(8_000_000),
   LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),
 
+  // ─── Human-handoff slice (R7 + needs_human_review + R14) ─────────────────
+  /**
+   * Kill-switch for the human-handoff channel. When `false`,
+   * `HumanHandoffService.create` short-circuits with a `disabled`
+   * envelope before any write/send; the 12th tool
+   * `requestHumanAssistance` returns the same disabled envelope.
+   * Default: true.
+   */
+  HUMAN_HANDOFF_ENABLED: Joi.boolean().default(true),
+  /**
+   * WhatsApp senderId (wa_id) of the human agent who receives digests
+   * and replies to them. Required when `HUMAN_HANDOFF_ENABLED=true`;
+   * optional otherwise (enforced by the `.custom()` block below).
+   * Joi accepts an optional leading `+` (E.164); the runtime normalizer
+   * further strips the Mexican trunk-1 in dev-mode test numbers.
+   */
+  OPS_CHANNEL_PHONE: Joi.string()
+    .pattern(/^\+?\d+$/)
+    .optional(),
+
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),
   DB_POOL_MAX: Joi.number().integer().min(1).default(5),
-}).options({ allowUnknown: true });
+})
+  .custom((value, helpers) => {
+    const enabled = value.HUMAN_HANDOFF_ENABLED !== false;
+    const ops = value.OPS_CHANNEL_PHONE;
+    if (enabled && (typeof ops !== 'string' || ops.length === 0)) {
+      // Joi's `helpers.error` doesn't apply the supplied `message`
+      // context directly to the error message; we throw with the
+      // explicit message appended so the boot log carries the
+      // actionable text.
+      const err = helpers.error('any.custom');
+      err.message = `"OPS_CHANNEL_PHONE" is required when "HUMAN_HANDOFF_ENABLED" is true`;
+      throw err;
+    }
+    return value;
+  })
+  .options({ allowUnknown: true });

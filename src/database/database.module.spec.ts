@@ -1,5 +1,8 @@
 import { Test } from '@nestjs/testing';
-import { PostgreSqlContainer, StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import {
+  PostgreSqlContainer,
+  StartedPostgreSqlContainer,
+} from '@testcontainers/postgresql';
 import { Pool } from 'pg';
 import { AppConfigModule } from '../config/config.module';
 import { DatabaseModule } from './database.module';
@@ -33,6 +36,7 @@ describe('DatabaseModule unit wiring', () => {
     'CHATBOT_API_BRANCH_ID',
     'OPENAI_API_KEY',
     'LLM_MODEL',
+    'OPS_CHANNEL_PHONE',
   ];
 
   beforeEach(() => {
@@ -50,8 +54,9 @@ describe('DatabaseModule unit wiring', () => {
       OPENAI_API_KEY: 'g',
       LLM_MODEL: 'm',
       DATABASE_URL: 'postgres://u:p@localhost:5432/d',
-          CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+      CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
       DB_POOL_MAX: '3',
+      OPS_CHANNEL_PHONE: '5215500000000',
     });
   });
 
@@ -87,7 +92,9 @@ describe('DatabaseModule unit wiring', () => {
 ddescribe('DatabaseModule integration (Testcontainers)', () => {
   jest.setTimeout(60_000);
   let container: StartedPostgreSqlContainer;
-  let moduleRef: Awaited<ReturnType<typeof Test.createTestingModule['prototype']['compile']>>;
+  let moduleRef: Awaited<
+    ReturnType<(typeof Test.createTestingModule)['prototype']['compile']>
+  >;
   let pool: Pool;
   const savedEnv: Record<string, string | undefined> = {};
 

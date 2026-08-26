@@ -25,6 +25,7 @@ describe('AppConfigModule integration', () => {
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+    OPS_CHANNEL_PHONE: '5215500000000',
   };
 
   const MANAGED_KEYS = Object.keys(VALID_ENV);

@@ -23,6 +23,7 @@ describe('makeGetPaymentDetailsTool', () => {
   const baseDeps = {
     store: {} as never,
     cashierUserId: '00000000-4000-9000-0000-000000000001',
+    humanHandoffService: {} as never,
   };
 
   const sample: PaymentDetail = {

@@ -27,6 +27,7 @@ describe('makeCreateSaleTool', () => {
   const baseDeps = {
     chatbotApi: {} as ChatbotApiClient,
     cashierUserId: CASHIER,
+    humanHandoffService: {} as never,
   };
 
   function stubStoreWithCart(cart: unknown): jest.Mocked<ConversationStore> {

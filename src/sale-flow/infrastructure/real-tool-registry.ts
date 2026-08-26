@@ -4,6 +4,7 @@ import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.clie
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
 import { CHATBOT_API_CLIENT as CHATBOT_API_CLIENT_TOKEN } from '../../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE as CONVERSATION_STORE_TOKEN } from '../../conversation/domain/conversation-store';
+import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import type { ToolDeps } from '../application/tool-deps';
 import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
@@ -14,26 +15,28 @@ import { makeEvaluateCartTool } from '../application/tools/evaluate-cart.tool';
 import { makeGetCustomerByPhoneTool } from '../application/tools/get-customer-by-phone.tool';
 import { makeGetOrderHistoryTool } from '../application/tools/get-order-history.tool';
 import { makeGetPaymentDetailsTool } from '../application/tools/get-payment-details.tool';
+import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import { makeSearchCatalogTool } from '../application/tools/search-catalog.tool';
 import { makeUpdateDeliveryTool } from '../application/tools/update-delivery.tool';
 import { makeUpsertCustomerTool } from '../application/tools/upsert-customer.tool';
 
+export const HUMAN_HANDOFF_SERVICE_TOKEN = Symbol('HUMAN_HANDOFF_SERVICE');
+
 /**
- * Production `ToolRegistry` for the eleven sale-flow tools.
+ * Production `ToolRegistry` for the twelve sale-flow tools.
  *
  * Replaces the historical `InMemoryToolRegistry` placeholder in the
  * production wiring of `LlmAgentModule`. The ToolSet is built ONCE in the
  * constructor — every `getTools()` call returns the SAME frozen
  * reference, so the AI-SDK never observes tool-definition churn.
  *
- * Q1 / R11: the 10th tool `getPaymentDetails` is the runtime source of
- * bank data. Bank data flows through `chatbotApi.getPaymentDetails()`
- * at the per-turn step after `createSale` succeeds.
- *
- * Q8: the 11th tool `cancelSale` unwinds the just-confirmed-session
- * sale via `chatbotApi.cancelSale()` (backend POST
- * /chatbot-api/sales/:saleId/cancel); it reads the durable
- * `placedSaleId` and clears it on success/permanent failure.
+ * Inventory (12):
+ *   - searchCatalog, checkStock, evaluateCart
+ *   - getCustomerByPhone, upsertCustomer
+ *   - createSale, attachReceipt, updateDelivery, getOrderHistory
+ *   - getPaymentDetails  (Q1 / R11)
+ *   - cancelSale         (Q8)
+ *   - requestHumanAssistance (12th, human-handoff slice — R7 + needs_human_review + R14)
  *
  * `cashierUserId` is sourced from typed `AppConfig.chatbotApi.cashierUserId`
  * and injected into the tool deps so the model can never pick it.
@@ -45,13 +48,20 @@ export class RealToolRegistry implements ToolRegistry {
   constructor(
     @Inject(CHATBOT_API_CLIENT_TOKEN) chatbotApi: ChatbotApiClient,
     @Inject(CONVERSATION_STORE_TOKEN) store: ConversationStore,
+    @Inject(HUMAN_HANDOFF_SERVICE_TOKEN)
+    humanHandoffService: HumanHandoffService,
     configService: ConfigService,
   ) {
     const cashierUserId = configService.get<string>(
       'chatbotApi.cashierUserId',
     ) as string;
 
-    const deps: ToolDeps = { chatbotApi, store, cashierUserId };
+    const deps: ToolDeps = {
+      chatbotApi,
+      store,
+      cashierUserId,
+      humanHandoffService,
+    };
 
     this.tools = {
       searchCatalog: makeSearchCatalogTool(deps),
@@ -65,6 +75,7 @@ export class RealToolRegistry implements ToolRegistry {
       getOrderHistory: makeGetOrderHistoryTool(deps),
       getPaymentDetails: makeGetPaymentDetailsTool(deps),
       cancelSale: makeCancelSaleTool(deps),
+      requestHumanAssistance: makeRequestHumanAssistanceTool(deps),
     };
   }
 

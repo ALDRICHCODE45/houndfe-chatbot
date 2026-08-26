@@ -19,6 +19,7 @@ describe('makeGetOrderHistoryTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
     cashierUserId: '00000000-4000-9000-0000-000000000001',
+    humanHandoffService: {} as never,
   };
 
   it('forwards phone + phoneCountryCode to chatbotApi.getOrderHistory', async () => {

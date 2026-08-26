@@ -19,6 +19,7 @@ describe('envValidationSchema', () => {
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://houndfe:houndfe@localhost:5432/houndfe_chatbot',
     CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+    OPS_CHANNEL_PHONE: '5219999888777',
   };
 
   // ─── Task 1.2 ─────────────────────────────────────────────────────────────
@@ -344,11 +345,84 @@ describe('envValidationSchema', () => {
       const env = {
         ...validEnv,
         CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+        OPS_CHANNEL_PHONE: '5219999888777',
       };
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
       });
       expect(error).toBeUndefined();
+    });
+  });
+
+  // ─── Task T3.1 / T3.2: human-handoff env vars ─────────────────────────
+  describe('OPS_CHANNEL_PHONE / HUMAN_HANDOFF_ENABLED', () => {
+    it('rejects when HUMAN_HANDOFF_ENABLED=true and OPS_CHANNEL_PHONE is missing', () => {
+      const env: Record<string, string> = {
+        ...validEnv,
+        HUMAN_HANDOFF_ENABLED: 'true',
+      };
+      delete env.OPS_CHANNEL_PHONE;
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.message.includes('OPS_CHANNEL_PHONE')),
+      ).toBe(true);
+    });
+
+    it('rejects when OPS_CHANNEL_PHONE is an empty string (HUMAN_HANDOFF_ENABLED=true)', () => {
+      const env = { ...validEnv, OPS_CHANNEL_PHONE: '' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects when OPS_CHANNEL_PHONE is not a digits-only string', () => {
+      const env = { ...validEnv, OPS_CHANNEL_PHONE: 'not-a-phone' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('accepts OPS_CHANNEL_PHONE with an optional + prefix', () => {
+      const env = { ...validEnv, OPS_CHANNEL_PHONE: '+5219999888777' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('accepts a valid OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is true (default)', () => {
+      const env = { ...validEnv, OPS_CHANNEL_PHONE: '5219999888777' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('accepts missing OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is false', () => {
+      const env: Record<string, string> = {
+        ...validEnv,
+        HUMAN_HANDOFF_ENABLED: 'false',
+      };
+      delete env.OPS_CHANNEL_PHONE;
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('applies HUMAN_HANDOFF_ENABLED default true when absent', () => {
+      const env: Record<string, string> = { ...validEnv };
+      delete env.OPS_CHANNEL_PHONE;
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      // Default is true so missing OPS_CHANNEL_PHONE is rejected.
+      expect(error).toBeDefined();
     });
   });
 });

@@ -1,4 +1,5 @@
 import { META_GRAPH_API_BASE_URL_DEFAULT } from './env.validation';
+import { normalizeSandboxRecipient } from '../whatsapp/infrastructure/meta-whatsapp.sender';
 
 /**
  * Typed configuration factory loaded by ConfigModule.
@@ -62,6 +63,22 @@ const configuration = () => ({
     url: process.env.DATABASE_URL as string,
     /** Maximum pool size; tune per VPS resource budget. */
     poolMax: parseInt(process.env.DB_POOL_MAX ?? '5', 10),
+  },
+
+  /**
+   * Human-handoff channel knobs (R7 + needs_human_review + R14).
+   *
+   * `enabled` is the env-driven kill-switch; default true (matches Joi
+   * default). `opsChannelPhone` is the WhatsApp wa_id of the human agent
+   * who receives digests and replies to them — sandbox trunk-1 normalized
+   * at boot so it matches inbounds whose trunk-1 has already been stripped.
+   * When `HUMAN_HANDOFF_ENABLED=false`, `opsChannelPhone` is undefined.
+   */
+  humanHandoff: {
+    enabled: process.env.HUMAN_HANDOFF_ENABLED !== 'false',
+    opsChannelPhone: process.env.OPS_CHANNEL_PHONE
+      ? normalizeSandboxRecipient(process.env.OPS_CHANNEL_PHONE)
+      : undefined,
   },
 });
 

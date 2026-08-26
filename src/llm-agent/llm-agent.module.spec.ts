@@ -48,6 +48,7 @@ describe('LlmAgentModule integration', () => {
     OPENAI_API_KEY: 'ok',
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
+    OPS_CHANNEL_PHONE: '5215500000000',
   };
   const MANAGED_KEYS = Object.keys(VALID_ENV);
 
@@ -119,7 +120,7 @@ describe('LlmAgentModule integration', () => {
     const llm = moduleRef.get<LlmAgentPort>(LLM_AGENT);
     expect(llm).toBeInstanceOf(VercelAiLlmAgent);
 
-    // TOOL_REGISTRY resolves to RealToolRegistry with the 11 sale-flow tools.
+    // TOOL_REGISTRY resolves to RealToolRegistry with the 12 sale-flow tools.
     const tools = moduleRef.get<ToolRegistry>(TOOL_REGISTRY);
     expect(tools).toBeInstanceOf(RealToolRegistry);
     const toolKeys = Object.keys(tools.getTools()).sort();
@@ -136,6 +137,7 @@ describe('LlmAgentModule integration', () => {
         'getOrderHistory',
         'getPaymentDetails',
         'cancelSale',
+        'requestHumanAssistance',
       ].sort(),
     );
     // The placeholder tool is no longer the production binding.

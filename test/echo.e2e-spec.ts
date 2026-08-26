@@ -45,6 +45,7 @@ describe('Webhook agent flow (e2e)', () => {
     process.env.OPENAI_API_KEY = 'test-openai-key';
     process.env.LLM_MODEL = 'test-model';
     process.env.DATABASE_URL = 'postgres://localhost:5432/test';
+    process.env.OPS_CHANNEL_PHONE = '5215500000000';
 
     // NOTE: dynamic require() below is intentional. NestJS's @nestjs/config runs
     // env validation eagerly inside ConfigModule.forRoot(), so AppModule must be
