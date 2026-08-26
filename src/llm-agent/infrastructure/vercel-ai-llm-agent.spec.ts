@@ -83,6 +83,8 @@ describe('VercelAiLlmAgent', () => {
       expect(callArgs.toolsContext).toEqual({
         evaluateCart: { senderId: '5215550001111' },
         createSale: { senderId: '5215550001111' },
+        // Human-handoff slice: 12th tool needs senderId context too.
+        requestHumanAssistance: { senderId: '5215550001111' },
       });
     });
 

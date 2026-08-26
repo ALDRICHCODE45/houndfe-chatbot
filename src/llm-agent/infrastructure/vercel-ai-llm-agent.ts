@@ -43,6 +43,12 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     const toolsContext = {
       evaluateCart: { senderId: input.senderId },
       createSale: { senderId: input.senderId },
+      // Human-handoff slice: the 12th tool `requestHumanAssistance`
+      // declares `contextSchema: z.object({ senderId: z.string() })`
+      // and reads `options.context.senderId`. The context envelope key
+      // matches the tool name; the AI-SDK only requires entries for
+      // tools that declare a contextSchema.
+      requestHumanAssistance: { senderId: input.senderId },
     };
     const result = await this.generateTextFn({
       model: openai(this.modelId),

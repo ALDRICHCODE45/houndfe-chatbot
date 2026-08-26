@@ -1,11 +1,13 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   CONVERSATION_STORE,
   readMessages,
+  readPendingHumanRequest,
   type AgentMessage,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
+import { PENDING_HUMAN_REQUEST_REPLY } from '../../human-handoff/application/human-handoff.service';
 import { LLM_AGENT, type LlmAgentPort } from '../domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from '../domain/tool-registry.port';
 import { LLM_AGENT_SYSTEM_PROMPT } from '../domain/system-prompt';
@@ -16,6 +18,14 @@ export interface AgentRunnerConfig {
   historyTurns: number;
   idleTimeoutMs: number;
 }
+
+/**
+ * Byte-identical canned reply used by the runner's pending-marker
+ * short-circuit and by the dispatcher's pre-routing hook when the
+ * customer's `pendingHumanRequest` marker is set. Re-exported here so the
+ * runner + the dispatcher share one constant.
+ */
+export { PENDING_HUMAN_REQUEST_REPLY };
 
 export interface AgentRunnerHandleInput {
   senderId: string;
@@ -106,6 +116,18 @@ export class AgentRunner {
     // 1) Load state.
     const state = await this.store.get(input.senderId);
 
+    // 1a) Short-circuit on the human-handoff marker (ADR-29).
+    // If a `pendingHumanRequest` marker is set on the loaded state we
+    // are still waiting for the human agent's reply; we MUST skip the
+    // LLM turn entirely (no `llm.run`, no `costGuard.record`, no
+    // `store.update`). The dispatcher pre-routing hook returns the canned
+    // reply before reaching here for dispatcher-owned inbounds, but the
+    // runner keeps the gate as defense-in-depth so any downstream caller
+    // of `AgentRunner.handle` honours the contract.
+    if (readPendingHumanRequest(state) !== null) {
+      return { reply: PENDING_HUMAN_REQUEST_REPLY };
+    }
+
     // 2) Idle-check + 3) truncate in memory.
     const idleExpired =
       state !== null &&
@@ -128,16 +150,45 @@ export class AgentRunner {
     // 5) Cost guard.
     this.costGuard.record(result.usage);
 
-    // 6) Persist user + assistant turns via UPSERT.
+    // 6) Persist user + assistant turns via UPSERT (ADR-28 + ADR-29).
+    // Re-fetch the freshly-written state after `llm.run` so we can
+    // spread its `data` bag over the messages update. Tools that ran
+    // during the LLM turn may have written sibling keys (cart,
+    // placedSaleId, pendingHumanRequest); writing `data: { messages }`
+    // alone would clobber those siblings via the store's data-replace
+    // UPSERT semantics.
+    const freshState = await this.store.get(input.senderId);
+
+    if (freshState === null && state !== null) {
+      // Race: the state record existed at step 1 but was deleted during
+      // the LLM turn. Skip the persist (a null-spread `update` would
+      // fabricate an empty bag); the LLM reply is still returned for the
+      // dispatcher.
+      Logger.error(
+        `[state-deleted-during-run] senderId=${input.senderId}`,
+        'AgentRunner',
+      );
+      return { reply: result.reply };
+    }
+
     const nextTurns: AgentMessage[] = [
       ...allTurns,
       { role: 'user', content: input.text },
       { role: 'assistant', content: result.reply },
     ];
 
+    // ADR-28 fresh-state spread: preserve sibling `data` keys (cart,
+    // placedSaleId, pendingHumanRequest) written by tools during the
+    // turn. First contact (both reads null) falls back to a plain
+    // `{ messages }` write — the UPSERT creates the record.
+    const data =
+      freshState === null
+        ? { messages: nextTurns }
+        : { ...freshState.data, messages: nextTurns };
+
     await this.store.update(input.senderId, {
       lastMessageAt: nowIso,
-      data: { messages: nextTurns },
+      data,
     });
 
     return { reply: result.reply };

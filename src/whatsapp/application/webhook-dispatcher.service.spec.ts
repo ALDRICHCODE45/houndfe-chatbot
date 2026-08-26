@@ -12,14 +12,16 @@ import {
   type LlmAgentPort,
   type LlmRunResult,
 } from '../../llm-agent/domain/llm-agent.port';
-import {
-  type ToolRegistry,
-} from '../../llm-agent/domain/tool-registry.port';
+import { type ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import { SendResult, WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import type { WebhookDedupStore } from '../domain/webhook-dedup.store';
 import type { RecentOutboundStore } from '../domain/recent-outbound.store';
 import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
-import { WebhookDispatcherService } from './webhook-dispatcher.service';
+import {
+  normalizeInboundMessages,
+  WebhookDispatcherService,
+} from './webhook-dispatcher.service';
+import type { InboundMessage } from '../domain/inbound-message';
 
 /**
  * Spec rewrite: the dispatcher MUST replace the echo path with
@@ -55,11 +57,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
-    } as unknown as jest.Mocked<ConversationStore>;
+    };
 
     sender = {
       sendText: jest
-        .fn<Promise<SendResult>, [Parameters<WhatsappSenderPort['sendText']>[0]]>()
+        .fn<
+          Promise<SendResult>,
+          [Parameters<WhatsappSenderPort['sendText']>[0]]
+        >()
         .mockResolvedValue({ providerMessageId: 'wamid.reply' }),
     };
 
@@ -78,13 +83,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       historyTurns: 12,
       idleTimeoutMs: 3 * 60 * 60 * 1000,
     };
-    runner = AgentRunner.forTest(
-      store as unknown as ConversationStore,
-      llm as unknown as LlmAgentPort,
-      tools as unknown as ToolRegistry,
-      costGuard,
-      cfg,
-    );
+    runner = AgentRunner.forTest(store, llm, tools, costGuard, cfg);
 
     dedup = {
       isDuplicate: jest.fn().mockResolvedValue(false),
@@ -96,11 +95,31 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       isKnown: jest.fn().mockReturnValue(false),
     };
 
+    // Human-handoff slice: stubbed service. Tests that exercise the ops
+    // pre-routing hook override `.isOpsSender` or `.resolveReply`
+    // per-scenario.
+    humanHandoff = {
+      isOpsSender: jest.fn().mockReturnValue(false),
+      resolveReply: jest.fn(),
+      create: jest.fn(),
+    };
+
+    // ConversationStore is used by the dispatcher to read
+    // `data.pendingHumanRequest` for the customer's pending-marker
+    // short-circuit (step 4). Default: returns null (no marker).
+    conversationStore = {
+      get: jest.fn().mockResolvedValue(null),
+      create: jest.fn(),
+      update: jest.fn(),
+    };
+
     service = new WebhookDispatcherService(
       runner,
       sender,
-      dedup as unknown as WebhookDedupStore,
-      recentOutbound as unknown as RecentOutboundStore,
+      dedup,
+      recentOutbound,
+      humanHandoff,
+      conversationStore,
     );
   });
 
@@ -110,7 +129,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
   // ─── Scenario: Signed inbound text reaches agent dispatch ───────────
   it('invokes the agent, persists the assistant turn, and sends the reply', async () => {
-    store.get.mockResolvedValue(null);
+    // ADR-28: after `llm.run` the runner re-fetches state. First
+    // call returns null (first contact); second returns the
+    // just-written state with empty messages.
+    store.get.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      senderId: '5215550001111',
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: { messages: [] },
+    });
     store.update.mockResolvedValue({
       senderId: '5215550001111',
       lastMessageAt: '2026-06-23T12:00:00.000Z',
@@ -123,7 +149,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
       ],
       usage: { promptTokens: 1, completionTokens: 1 },
-    } as LlmRunResult);
+    });
 
     const event: WebhookEventDto = {
       object: 'whatsapp_business_account',
@@ -213,7 +239,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         { role: 'assistant', content: 'precio: $100' },
       ],
       usage: { promptTokens: 1, completionTokens: 1 },
-    } as LlmRunResult);
+    });
 
     const event: WebhookEventDto = {
       object: 'whatsapp_business_account',
@@ -346,7 +372,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         { role: 'assistant', content: 'Hola' },
       ],
       usage: { promptTokens: 1, completionTokens: 1 },
-    } as LlmRunResult);
+    });
 
     const event: WebhookEventDto = {
       object: 'whatsapp_business_account',
@@ -389,7 +415,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       reply: 'Hola',
       messages: [],
       usage: { promptTokens: 1, completionTokens: 1 },
-    } as LlmRunResult);
+    });
     sender.sendText.mockRejectedValue(new Error('Meta 131030'));
 
     const event: WebhookEventDto = {
@@ -431,8 +457,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       reply: 'Hola',
       messages: [],
       usage: { promptTokens: 1, completionTokens: 1 },
-    } as LlmRunResult);
-    dedup.isDuplicate.mockImplementation(async (id: string) => id === 'wamid.dup');
+    });
+    dedup.isDuplicate.mockImplementation(
+      async (id: string) => id === 'wamid.dup',
+    );
 
     const event: WebhookEventDto = {
       object: 'whatsapp_business_account',
@@ -471,5 +499,93 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect.objectContaining({ text: 'nuevo' }),
     );
     expect(sender.sendText).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── whatsapp-webhook spec §"InboundMessage.receivingPhoneNumberId" ──────────
+// The spec delta requires the normalizer to capture
+// `value.metadata.phone_number_id` (defensive + observable only; the ops
+// discriminator stays `isOpsSender(from)` per ADR-22) and the
+// `InboundMessage` interface to carry the typed optional field.
+describe('normalizeInboundMessages (metadata → receivingPhoneNumberId)', () => {
+  const textMessage = (id: string) => ({
+    id,
+    from: '5215550001111',
+    timestamp: '1719000000',
+    type: 'text',
+    text: { body: 'hola' },
+  });
+
+  it('populates receivingPhoneNumberId from value.metadata.phone_number_id when present', () => {
+    const event: WebhookEventDto = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: {
+                  display_phone_number: '5219999888777',
+                  phone_number_id: '1234567890',
+                },
+                messages: [textMessage('wamid.meta-1')],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const messages: InboundMessage[] = normalizeInboundMessages(event);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].receivingPhoneNumberId).toBe('1234567890');
+  });
+
+  it('leaves receivingPhoneNumberId undefined when value.metadata is absent', () => {
+    const event: WebhookEventDto = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [textMessage('wamid.meta-2')],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const messages: InboundMessage[] = normalizeInboundMessages(event);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].receivingPhoneNumberId).toBeUndefined();
+  });
+
+  it('propagates the field to EVERY message produced from one event', () => {
+    const event: WebhookEventDto = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: '999888777' },
+                messages: [
+                  textMessage('wamid.meta-3'),
+                  textMessage('wamid.meta-4'),
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const messages: InboundMessage[] = normalizeInboundMessages(event);
+    expect(messages).toHaveLength(2);
+    for (const message of messages) {
+      expect(message.receivingPhoneNumberId).toBe('999888777');
+    }
   });
 });

@@ -36,12 +36,34 @@ export class WebhookContactDto {
   wa_id?: string;
 }
 
+/**
+ * Metadata block Meta attaches to every webhook value. It carries the
+ * `phone_number_id` and `display_phone_number` of the receiving WhatsApp
+ * Business number — the human-handoff slice uses `phone_number_id` only
+ * for observability; the discriminator remains `isOpsSender(from)` per
+ * ADR-22.
+ */
+export class WebhookMetadataDto {
+  @IsOptional()
+  @IsString()
+  display_phone_number?: string;
+
+  @IsOptional()
+  @IsString()
+  phone_number_id?: string;
+}
+
 export class WebhookValueDto {
   @IsOptional()
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => WebhookContactDto)
   contacts?: WebhookContactDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMetadataDto)
+  metadata?: WebhookMetadataDto;
 
   @IsOptional()
   @IsArray()

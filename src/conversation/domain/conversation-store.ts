@@ -15,16 +15,51 @@ export type AgentMessage =
   | { role: 'tool'; toolCallId: string; content: unknown };
 
 /**
+ * Pending-human-request marker persisted under `ConversationStateData.pendingHumanRequest`.
+ *
+ * Holds the bookkeeping the runner / dispatcher need to:
+ *   - Skip the LLM turn when the customer sends another inbound while we
+ *     are still waiting for the human agent's reply (ADR-29).
+ *   - Re-fetch the durable row by `requestId` once the agent replies.
+ *   - Carry the "we already notified the customer" timestamp so a stale
+ *     marker never re-issues the under-review notice.
+ *
+ * The marker is set by `HumanHandoffService.create` and cleared by
+ * `HumanHandoffService.resolveReply`. Idle-reset UPSERTs MUST preserve
+ * the marker (the agent could be mid-reply); see AgentRunner §"fresh-state
+ * spread write (ADR-28)".
+ */
+export interface PendingHumanRequest {
+  /** 12 lowercase hex chars; the row id in `human_handoff_requests`. */
+  requestId: string;
+  /** Public ref = `HF-${requestId}`. */
+  ref: string;
+  /** ISO 8601 — when the row was created. */
+  createdAt: string;
+  /** ISO 8601 — when the customer was first told "we notified an agent". */
+  customerNotifiedAt: string;
+}
+
+/**
  * Typed `data` payload carried by ConversationState.
  *
  * `messages` is optional at the storage level so legacy records that
  * predate the LLM slice still round-trip cleanly; callers should always
  * go through `readMessages(state)` to receive `[]` when missing.
+ *
+ * `pendingHumanRequest?` is the human-handoff slice's bookmark. Sibling
+ * of `placedSaleId`; the agent runner reads it before each LLM turn to
+ * short-circuit the canned "we are still waiting" reply when present
+ * (ADR-29). Idempotency on `HumanHandoffService.create` relies on this
+ * field too — a second call for a sender with a marker set returns the
+ * existing ref without writing a new row.
  */
 export interface ConversationStateData {
   messages?: AgentMessage[];
   /** Sale id persisted by createSale success; read/cleared by cancelSale. */
   placedSaleId?: string;
+  /** Human-handoff marker; null when no escalation is pending. */
+  pendingHumanRequest?: PendingHumanRequest | null;
   [key: string]: unknown;
 }
 
@@ -38,6 +73,44 @@ export interface ConversationState {
   lastMessageAt: string;
   /** Typed context bag — schema owned by the LLM slice. */
   data: ConversationStateData;
+}
+
+/**
+ * Pure structural read of the human-handoff marker on a conversation state.
+ *
+ * The runner calls this BEFORE any LLM turn. A non-null return short-circuits
+ * the runner (no `llm.run`, no `costGuard.record`, no `store.update`); the
+ * canned "seguimos esperando respuesta del agente, te avisamos en cuanto
+ * tengamos" reply is sent by the dispatcher pre-routing hook instead.
+ *
+ * Defensive defaults: returns `null` for missing fields, for structurally
+ * malformed shapes, or when the value is explicitly `null` (the cleared
+ * marker). Returns the typed object when ALL four required fields are
+ * structurally valid (non-empty strings). Does NOT mutate the input.
+ */
+export function readPendingHumanRequest(
+  state: ConversationState | null,
+): PendingHumanRequest | null {
+  const raw = state?.data?.pendingHumanRequest;
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object') return null;
+  const candidate = raw as unknown as Record<string, unknown>;
+  if (
+    typeof candidate.requestId !== 'string' ||
+    candidate.requestId.length === 0
+  ) {
+    return null;
+  }
+  if (typeof candidate.ref !== 'string' || candidate.ref.length === 0) {
+    return null;
+  }
+  if (typeof candidate.createdAt !== 'string') {
+    return null;
+  }
+  if (typeof candidate.customerNotifiedAt !== 'string') {
+    return null;
+  }
+  return candidate as unknown as PendingHumanRequest;
 }
 
 /**

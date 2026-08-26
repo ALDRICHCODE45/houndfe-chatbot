@@ -1,6 +1,16 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
+import {
+  CONVERSATION_STORE,
+  readPendingHumanRequest,
+  type ConversationStore,
+} from '../../conversation/domain/conversation-store';
 import type { AgentMessage } from '../../conversation/domain/conversation-store';
+import {
+  HumanHandoffService,
+  PENDING_HUMAN_REQUEST_REPLY,
+} from '../../human-handoff/application/human-handoff.service';
+import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
+import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
 import { InboundMessage } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
@@ -11,21 +21,43 @@ import type { WebhookDedupStore } from '../domain/webhook-dedup.store';
 import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 
 /**
- * WebhookDispatcherService (agent-aware)
+ * WebhookDispatcherService (agent + human-handoff router)
  *
- * For each normalized inbound text message:
- *   1. skip echoes of the bot's own outbound messages (RECENT_OUTBOUND)
- *   2. skip re-deliveries of already-processed messages (WEBHOOK_DEDUP)
- *   3. delegate to AgentRunner.handle({ senderId, text })
- *      (the runner owns idle-check, in-memory history truncation,
- *      cost-guard, and UPSERT-persistence of user + assistant turns).
- *   4. send the assistant reply via WhatsappSenderPort.
- *   5. remember the outbound wamid (echo filter) and mark the message
- *      seen (dedup) — only AFTER a successful send, so a failed send
- *      still lets a Meta re-delivery retry it.
+ * Inbound-driven dispatch order (each step is conditional on the prior):
  *
- * No proactive sends anywhere — outbound traffic only flows inside
- * this inbound-driven path.
+ *   1. RECENT_OUTBOUND — skip echoes of the bot's own outbound.
+ *   2. WEBHOOK_DEDUP   — skip re-deliveries of already-processed msgs.
+ *   3. **Ops pre-routing hook** (new, human-handoff slice) —
+ *      when `message.senderId` matches the configured OPS_CHANNEL_PHONE
+ *      (sandbox trunk-1 normalized on both sides per ADR-22), the inbound
+ *      is an ops reply to a previous escalation, NOT a customer message:
+ *        - `humanHandoff.resolveReply({ text, from })` parses the agent's
+ *          decision (or `HF-<id>` token, or newest-pending fallback) and
+ *          resolves the durable row + clears the customer's marker.
+ *        - `{ kind: 'resolved', customerId, syntheticUserText, ... }` →
+ *          inject the synthetic user turn into `AgentRunner.handle` with
+ *          `senderId = customerId` (NOT the ops phone) so the customer's
+ *          resume gets the right transcript context. The runner's reply
+ *          is then sent to the customer (NOT the ops phone).
+ *        - `{ kind: 'no_pending', reply }` → reply to the ops phone with
+ *          the ASK_FOR_REF message.
+ *        - The hook `continue`s past the pending-marker short-circuit +
+ *          customer runner path.
+ *   4. **Pending-marker short-circuit** (new, ADR-29 defense-in-depth) —
+ *      when the customer's `data.pendingHumanRequest` is set, send the
+ *      canned byte-identical "seguimos esperando respuesta del agente,
+ *      te avisamos en cuanto tengamos" reply and `continue`. No LLM call.
+ *   5. `AgentRunner.handle({ senderId, text })` — runner owns idle-check,
+ *      history truncation, cost-guard, fresh-state spread (ADR-28), and
+ *      UPSERT-persistence of user + assistant turns (with the pending-marker
+ *      short-circuit gate inside).
+ *   6. WhatsappSenderPort.sendText — send the reply.
+ *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
+ *      successful send, so a failed send lets Meta re-deliver and retry.
+ *
+ * Spec: `openspec/changes/human-handoff/specs/whatsapp-webhook/delta.md`.
+ * Test: `webhook-dispatcher.service.spec.ts` (eight new scenarios + the
+ * existing agent-path scenarios).
  */
 @Injectable()
 export class WebhookDispatcherService {
@@ -39,13 +71,17 @@ export class WebhookDispatcherService {
     private readonly dedup: WebhookDedupStore,
     @Inject(RECENT_OUTBOUND)
     private readonly recentOutbound: RecentOutboundStore,
+    @Inject(HUMAN_HANDOFF_SERVICE_TOKEN)
+    private readonly humanHandoff: HumanHandoffService,
+    @Inject(CONVERSATION_STORE)
+    private readonly conversationStore: ConversationStore,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
     const messages = normalizeInboundMessages(event);
 
     for (const message of messages) {
-      // Echo of a message the bot itself sent — never answer ourselves.
+      // ─── (1) Echo filter ────────────────────────────────────────────
       if (this.recentOutbound.isKnown(message.messageId)) {
         this.logger.log(
           `skip echo ${message.messageId} from ${message.senderId}`,
@@ -53,7 +89,7 @@ export class WebhookDispatcherService {
         continue;
       }
 
-      // Meta re-delivery of a message already answered — never answer twice.
+      // ─── (2) Dedup ──────────────────────────────────────────────────
       if (await this.dedup.isDuplicate(message.messageId)) {
         this.logger.log(
           `skip duplicate ${message.messageId} from ${message.senderId}`,
@@ -66,6 +102,79 @@ export class WebhookDispatcherService {
       );
 
       try {
+        // ─── (3) Ops pre-routing hook (ADR-22) ─────────────────────────
+        // Inbound from the ops phone is an agent reply to a previous
+        // escalation, NOT a customer message. Route to
+        // `humanHandoff.resolveReply` BEFORE the customer runner path so
+        // we never LLM-process an ops message.
+        if (this.humanHandoff.isOpsSender(message.senderId)) {
+          const result = await this.humanHandoff.resolveReply({
+            text: message.text,
+            from: message.senderId,
+          });
+
+          if (result.kind === 'resolved') {
+            // Synthetic-turn injection through the runner. The marker
+            // was cleared by `resolveReply` so the runner's gate
+            // (ADR-29) does NOT suppress this turn; the customer resumes
+            // normally and the runner's reply is sent to the customer
+            // (NOT the ops phone).
+            const { reply } = await this.agentRunner.handle({
+              senderId: result.customerId,
+              text: result.syntheticUserText,
+            });
+            const { providerMessageId } = await this.whatsappSender.sendText({
+              to: result.customerId,
+              text: reply,
+            });
+            this.recentOutbound.remember(providerMessageId);
+          } else {
+            // `no_pending` → reply to the ops phone asking for a ref.
+            const { providerMessageId } = await this.whatsappSender.sendText({
+              to: message.senderId,
+              text: result.reply,
+            });
+            this.recentOutbound.remember(providerMessageId);
+          }
+
+          try {
+            await this.dedup.markSeen(message.messageId);
+          } catch (error) {
+            this.logger.warn(
+              `markSeen failed for ${message.messageId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          continue;
+        }
+
+        // ─── (4) Pending-marker short-circuit (ADR-29 defense-in-depth)
+        // The runner has the same gate; this branch keeps the dispatcher
+        // consistent even if a caller bypasses the runner.
+        const custState = await this.conversationStore.get(message.senderId);
+        if (readPendingHumanRequest(custState) !== null) {
+          this.logger.log(
+            `short-circuit pending-marker for ${message.messageId} from ${message.senderId}`,
+          );
+          const { providerMessageId } = await this.whatsappSender.sendText({
+            to: message.senderId,
+            text: PENDING_HUMAN_REQUEST_REPLY,
+          });
+          this.recentOutbound.remember(providerMessageId);
+          try {
+            await this.dedup.markSeen(message.messageId);
+          } catch (error) {
+            this.logger.warn(
+              `markSeen failed for ${message.messageId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          continue;
+        }
+
+        // ─── (5) Normal agent dispatch ─────────────────────────────────
         const { reply } = await this.agentRunner.handle({
           senderId: message.senderId,
           text: message.text,
@@ -102,13 +211,19 @@ export class WebhookDispatcherService {
   }
 }
 
-function normalizeInboundMessages(event: WebhookEventDto): InboundMessage[] {
+export function normalizeInboundMessages(
+  event: WebhookEventDto,
+): InboundMessage[] {
   const entry = event.entry ?? [];
 
   return entry.flatMap((item) =>
     (item.changes ?? []).flatMap((change) => {
       const value = change.value;
       const fallbackSenderId = value?.contacts?.[0]?.wa_id;
+      const receivingPhoneNumberId =
+        typeof value?.metadata?.phone_number_id === 'string'
+          ? value.metadata.phone_number_id
+          : undefined;
 
       return (value?.messages ?? []).flatMap((message) => {
         if (
@@ -131,6 +246,7 @@ function normalizeInboundMessages(event: WebhookEventDto): InboundMessage[] {
             text: message.text.body,
             messageId: message.id,
             timestamp: normalizeTimestamp(message.timestamp),
+            receivingPhoneNumberId,
           },
         ];
       });

@@ -30,6 +30,7 @@ describe('ConversationModule binding', () => {
     'OPENAI_API_KEY',
     'LLM_MODEL',
     'DATABASE_URL',
+    'OPS_CHANNEL_PHONE',
   ];
 
   beforeEach(() => {
@@ -47,7 +48,8 @@ describe('ConversationModule binding', () => {
       OPENAI_API_KEY: 'g',
       LLM_MODEL: 'm',
       DATABASE_URL: 'postgres://u:p@localhost:5432/d',
-          CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+      CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
+      OPS_CHANNEL_PHONE: '5215500000000',
     });
   });
 

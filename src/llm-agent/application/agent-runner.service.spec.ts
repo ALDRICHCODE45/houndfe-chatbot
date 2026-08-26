@@ -85,7 +85,14 @@ describe('AgentRunner', () => {
   // ────────────────────────────────────────────────────────────────────
   describe('first contact (empty store)', () => {
     it('passes empty history and persists user+assistant on first inbound', async () => {
-      store.get.mockResolvedValue(null);
+      // ADR-28: after `llm.run` the runner re-fetches state. First
+      // call returns null (first contact); second returns the
+      // just-written state with empty messages.
+      store.get.mockResolvedValueOnce(null).mockResolvedValueOnce({
+        senderId: '5215550001111',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { messages: [] },
+      });
       store.update.mockResolvedValue({
         senderId: '5215550001111',
         lastMessageAt: '2026-06-23T12:00:00.000Z',
@@ -321,6 +328,247 @@ describe('AgentRunner', () => {
       await expect(
         runner.handle({ senderId: 's', text: 'a' }),
       ).resolves.toBeDefined();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Scenario: human-handoff marker short-circuit (ADR-29)
+  // ────────────────────────────────────────────────────────────────────
+  describe('human-handoff pending-marker short-circuit (ADR-29)', () => {
+    const pendingMarker = {
+      requestId: 'abc123def456',
+      ref: 'HF-abc123def456',
+      createdAt: '2026-06-23T12:00:00.000Z',
+      customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+    };
+
+    it('returns the canned literal reply when pendingHumanRequest is set; no LLM, no costGuard, no store write', async () => {
+      store.get.mockResolvedValue({
+        senderId: '5215550001111',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { pendingHumanRequest: pendingMarker },
+      });
+
+      const result = await runner.handle({
+        senderId: '5215550001111',
+        text: '¿siguen?',
+      });
+
+      expect(result).toEqual({
+        reply:
+          'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+      });
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(costGuard.currentAggregate).toBe(0);
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    it('short-circuit fires regardless of lastMessageAt (marker is the discriminator, not the idle boundary)', async () => {
+      const oldTs = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString();
+      store.get.mockResolvedValue({
+        senderId: '5215550001111',
+        lastMessageAt: oldTs,
+        data: {
+          pendingHumanRequest: pendingMarker,
+          messages: [{ role: 'user', content: 'old' }],
+        },
+      });
+
+      const result = await runner.handle({
+        senderId: '5215550001111',
+        text: '¿siguen?',
+      });
+
+      expect(result.reply).toBe(
+        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+      );
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Scenario: fresh-state spread write (ADR-28)
+  // ────────────────────────────────────────────────────────────────────
+  describe('fresh-state spread write (ADR-28)', () => {
+    it('persists messages + tool-written siblings (cart, placedSaleId, pendingHumanRequest marker) — does NOT clobber them', async () => {
+      const marker = {
+        requestId: 'abc123def456',
+        ref: 'HF-abc123def456',
+        createdAt: '2026-06-23T12:00:00.000Z',
+        customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+      };
+
+      const prior: ConversationState = {
+        senderId: '5215550001111',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: { items: [], idempotencyKey: 'k' } },
+      };
+      const freshPostLlm: ConversationState = {
+        senderId: '5215550001111',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {
+          cart: { items: [], idempotencyKey: 'k' },
+          pendingHumanRequest: marker,
+        },
+      };
+
+      store.get
+        .mockResolvedValueOnce(prior)
+        .mockResolvedValueOnce(freshPostLlm);
+      store.update.mockResolvedValue(freshPostLlm);
+      llm.run.mockResolvedValue({
+        reply: 'Listo.',
+        messages: [
+          { role: 'user', content: 'ok' },
+          { role: 'assistant', content: 'Listo.' },
+        ],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+
+      await runner.handle({
+        senderId: '5215550001111',
+        text: 'ok',
+      });
+
+      expect(store.update).toHaveBeenCalledTimes(1);
+      const [, patch] = store.update.mock.calls[0];
+      expect(patch).toMatchObject({
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {
+          cart: freshPostLlm.data.cart,
+          pendingHumanRequest: marker,
+          messages: [
+            { role: 'user', content: 'ok' },
+            { role: 'assistant', content: 'Listo.' },
+          ],
+        },
+      });
+    });
+
+    it('logs a structured error and returns the LLM reply when post-run get returns null (state deleted during run)', async () => {
+      const prior: ConversationState = {
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {},
+      };
+      store.get.mockResolvedValueOnce(prior).mockResolvedValueOnce(null); // race: state deleted during run
+      llm.run.mockResolvedValue({
+        reply: 'ok',
+        messages: [
+          { role: 'user', content: 'a' },
+          { role: 'assistant', content: 'ok' },
+        ],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+
+      const result = await runner.handle({
+        senderId: 's',
+        text: 'a',
+      });
+      expect(result.reply).toBe('ok');
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    it('idle reset path spreads a marker written by a tool during the run (ADR-28)', async () => {
+      // Idle-expired prior state — no marker initially (so the
+      // short-circuit gate does NOT trip). A tool running during the
+      // LLM turn writes the marker (mirroring the runtime path where
+      // `requestHumanAssistance` would set the marker via
+      // ConversationStore.update). The fresh-state spread must carry
+      // the marker into the final write alongside the new transcript.
+      const oldTs = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString();
+      const prior: ConversationState = {
+        senderId: '5215550001111',
+        lastMessageAt: oldTs,
+        data: { messages: [{ role: 'user', content: 'old' }] },
+      };
+      const marker = {
+        requestId: 'abc123def456',
+        ref: 'HF-abc123def456',
+        createdAt: '2026-06-23T12:00:00.000Z',
+        customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+      };
+      const freshPostLlm: ConversationState = {
+        senderId: '5215550001111',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {
+          messages: [{ role: 'user', content: 'hola' }],
+          pendingHumanRequest: marker,
+        },
+      };
+      store.get
+        .mockResolvedValueOnce(prior)
+        .mockResolvedValueOnce(freshPostLlm);
+      store.update.mockResolvedValue(freshPostLlm);
+      llm.run.mockResolvedValue({
+        reply: 'Bienvenido de vuelta.',
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Bienvenido de vuelta.' },
+        ],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+
+      await runner.handle({
+        senderId: '5215550001111',
+        text: 'hola',
+      });
+
+      expect(store.update).toHaveBeenCalledTimes(1);
+      const [, patch] = store.update.mock.calls[0];
+      // Spread: messages overwrite (from the LLM turn), but the
+      // marker is carried forward from the freshly-written state.
+      expect(patch).toMatchObject({
+        data: {
+          pendingHumanRequest: marker,
+          messages: expect.arrayContaining([
+            { role: 'user', content: 'hola' },
+            { role: 'assistant', content: 'Bienvenido de vuelta.' },
+          ]),
+        },
+      });
+    });
+
+    it('persists the transcript on first contact even when the post-run re-fetch returns null (no tool wrote state during the turn)', async () => {
+      // A REAL store returns null for BOTH reads on first contact (nothing
+      // has been written yet — `update` is the only write and it happens
+      // after the re-fetch). The race-skip must NOT fire here: the pre-run
+      // state was ALSO null, so this is first contact, not a mid-run
+      // deletion. The transcript must still be persisted (UPSERT creates
+      // the record) — this is the "assistant turn is persisted after a
+      // successful run" contract.
+      store.get.mockResolvedValue(null);
+      store.update.mockResolvedValue({
+        senderId: '5215550001111',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { messages: [] },
+      });
+      llm.run.mockResolvedValue({
+        reply: 'Hola, ¿en qué te puedo ayudar?',
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
+        ],
+        usage: { promptTokens: 5, completionTokens: 7 },
+      });
+
+      const result = await runner.handle({
+        senderId: '5215550001111',
+        text: 'hola',
+      });
+
+      expect(result.reply).toBe('Hola, ¿en qué te puedo ayudar?');
+      expect(store.update).toHaveBeenCalledTimes(1);
+      const [, patch] = store.update.mock.calls[0];
+      expect(patch).toMatchObject({
+        data: {
+          messages: [
+            { role: 'user', content: 'hola' },
+            { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
+          ],
+        },
+      });
     });
   });
 
