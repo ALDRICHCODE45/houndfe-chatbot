@@ -126,4 +126,93 @@ describe('sale-flow-instructions', () => {
       expect(composed).toContain('searchCatalog');
     });
   });
+
+  describe('human-handoff prompt contract (sale-flow-tools spec)', () => {
+    it('step 5 (R7) names humanAssistance + kind out_of_stock and the escalation call', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('humanAssistance');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain("kind: 'out_of_stock'");
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        "requestHumanAssistance({ kind: 'out_of_stock'",
+      );
+    });
+
+    it('step 8 (needs_human_review) renders the quote first and escalates on customer acceptance', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain("kind: 'needs_human_review'");
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('humanAssistance');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        "requestHumanAssistance({ kind: 'needs_human_review'",
+      );
+      // "render quote first, escalate only when the customer decides to
+      // proceed" semantics are encoded verbatim.
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'cuando el cliente decida continuar',
+      );
+    });
+
+    it('step 16 (R14) names requestHumanAssistance with kind expiration_date and preserves the refusal phrase for non-tooled features only', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        "requestHumanAssistance({ kind: 'expiration_date', digest: { productId, name, question } })",
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('expiration_date');
+      // The refusal phrase stays byte-identical but is explicitly NOT the
+      // R14 reply (it is reserved for features we never plan to tool).
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'esa función aún no está disponible',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/zonas de env\u00edo/i);
+    });
+
+    it('encodes the awaiting-human posture rule with the runner canned reply', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('{ ok: true }');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('espera indefinidamente');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/NO sigas intentando avanzar/i);
+    });
+
+    it('keeps every byte-identical preserved string untouched', () => {
+      for (const literal of [
+        'esa función aún no está disponible',
+        'en un momento un agente te comparte los datos de pago',
+        // The prompt references the error KIND (camelCase `promoReQuote`, the
+        // pre-existing literal); `PROMO_RE_QUOTE` is the backend error code.
+        'promoReQuote',
+        'needs_human_review',
+        '¿Confirmas la cancelación? Sí/No',
+        'no hay una venta reciente por cancelar',
+        'deriva a revisión humana',
+      ]) {
+        expect(SALE_FLOW_INSTRUCTIONS).toContain(literal);
+      }
+    });
+
+    it('marks the 12-tool order with requestHumanAssistance after cancelSale (step 16)', () => {
+      const stepOrder = [
+        'searchCatalog',
+        'checkStock',
+        'evaluateCart',
+        'getCustomerByPhone',
+        'upsertCustomer',
+        'createSale',
+        'getPaymentDetails',
+        'attachReceipt',
+        'cancelSale',
+        'requestHumanAssistance',
+      ];
+      let lastIndex = -1;
+      for (const step of stepOrder) {
+        // `requestHumanAssistance` first appears in the step-5 R7 rule; the
+        // step-16 occurrence is the one that must trail `cancelSale`, so use
+        // the LAST occurrence for the final marker.
+        const idx =
+          step === 'requestHumanAssistance'
+            ? SALE_FLOW_INSTRUCTIONS.lastIndexOf(step)
+            : SALE_FLOW_INSTRUCTIONS.indexOf(step);
+        expect(idx).toBeGreaterThan(-1);
+        expect(idx).toBeGreaterThan(lastIndex);
+        lastIndex = idx;
+      }
+    });
+  });
 });

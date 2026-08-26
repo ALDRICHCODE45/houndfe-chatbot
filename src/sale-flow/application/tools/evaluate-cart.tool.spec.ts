@@ -24,6 +24,7 @@ describe('makeEvaluateCartTool', () => {
   const baseDeps = {
     chatbotApi: {} as ChatbotApiClient,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
+    humanHandoffService: {} as never,
   };
 
   it('contextSchema declares { senderId: string }', () => {
@@ -329,6 +330,177 @@ describe('makeEvaluateCartTool', () => {
           expectedTotalCents: 2700,
         },
       },
+    });
+  });
+
+  // ─── sale-flow-tools spec §"evaluateCart returns a humanAssistance
+  // envelope on needs_human_review" ────────────────────────────────────
+  describe('humanAssistance envelope (needs_human_review)', () => {
+    const uuid1 = '00000000-0000-4000-8000-000000000001';
+
+    it('adds the envelope on needs_human_review with the persisted list-price items', async () => {
+      const evaluation: CartEvaluationResult = {
+        items: [
+          {
+            productId: uuid1,
+            variantId: null,
+            quantity: 2,
+            unitPriceCents: 1000,
+            originalPriceCents: 1000,
+            finalPriceCents: 800,
+            appliedPromotionTitle: null,
+            discountAmountCents: 200,
+          },
+        ],
+        promotionEvaluationStatus: 'needs_human_review',
+      };
+      const evaluateCart = jest.fn().mockResolvedValue(evaluation);
+      const existingState: ConversationState = {
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { cart: { items: [], idempotencyKey: 'k' } },
+      };
+      const get = jest.fn().mockResolvedValue(existingState);
+      const update = jest
+        .fn()
+        .mockImplementation(async (senderId: string, patch: object) => ({
+          senderId,
+          lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+          data: (patch as { data: object }).data,
+        }));
+      const store = { get, update } as unknown as ConversationStore;
+      const deps = {
+        ...baseDeps,
+        chatbotApi: { evaluateCart } as unknown as ChatbotApiClient,
+        store,
+      };
+      const tool = makeEvaluateCartTool(deps);
+
+      const result = await tool.execute(
+        {
+          items: [
+            {
+              productId: uuid1,
+              quantity: 2,
+              unitPriceCents: 500,
+            },
+          ],
+        },
+        { toolCallId: 't', messages: [], context: { senderId: 's' } },
+      );
+
+      // Existing payload preserved + envelope added. digest.items mirrors
+      // the persisted cart at LIST price (originalPriceCents), never the
+      // discounted finalPriceCents. `originalTotalCents` is optional in the
+      // spec union; the backend CartEvaluationResult DTO carries no
+      // top-level totals, so the digest omits it (design intent: the
+      // list-price lines are the review payload).
+      expect(result).toEqual({
+        ok: true,
+        ...evaluation,
+        humanAssistance: {
+          kind: 'needs_human_review',
+          digest: {
+            items: [
+              {
+                productId: uuid1,
+                variantId: undefined,
+                quantity: 2,
+                unitPriceCents: 1000,
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('does NOT carry the envelope for fully_evaluated (ok / rejected branches)', async () => {
+      for (const promotionEvaluationStatus of ['fully_evaluated'] as const) {
+        const evaluation: CartEvaluationResult = {
+          items: [
+            {
+              productId: uuid1,
+              variantId: null,
+              quantity: 1,
+              unitPriceCents: 1000,
+              originalPriceCents: 1000,
+              finalPriceCents: 900,
+              appliedPromotionTitle: null,
+              discountAmountCents: 100,
+            },
+          ],
+          promotionEvaluationStatus,
+        };
+        const evaluateCart = jest.fn().mockResolvedValue(evaluation);
+        const get = jest.fn().mockResolvedValue(null);
+        const update = jest.fn();
+        const store = { get, update } as unknown as ConversationStore;
+        const tool = makeEvaluateCartTool({
+          ...baseDeps,
+          chatbotApi: { evaluateCart } as unknown as ChatbotApiClient,
+          store,
+        });
+
+        const result = await tool.execute(
+          {
+            items: [
+              {
+                productId: uuid1,
+                quantity: 1,
+                unitPriceCents: 1000,
+              },
+            ],
+          },
+          { toolCallId: 't', messages: [], context: { senderId: 's' } },
+        );
+
+        expect(result).toEqual({ ok: true, ...evaluation });
+        expect(result).not.toHaveProperty('humanAssistance');
+      }
+    });
+
+    it('does NOT call HumanHandoffService — the envelope is a signal only', async () => {
+      const evaluation: CartEvaluationResult = {
+        items: [
+          {
+            productId: uuid1,
+            variantId: null,
+            quantity: 1,
+            unitPriceCents: 1000,
+            originalPriceCents: 1000,
+            finalPriceCents: 900,
+            appliedPromotionTitle: null,
+            discountAmountCents: 100,
+          },
+        ],
+        promotionEvaluationStatus: 'needs_human_review',
+      };
+      const evaluateCart = jest.fn().mockResolvedValue(evaluation);
+      const get = jest.fn().mockResolvedValue(null);
+      const update = jest.fn();
+      const store = { get, update } as unknown as ConversationStore;
+      const humanHandoffService = { create: jest.fn() };
+      const tool = makeEvaluateCartTool({
+        ...baseDeps,
+        humanHandoffService: humanHandoffService as never,
+        chatbotApi: { evaluateCart } as unknown as ChatbotApiClient,
+        store,
+      });
+
+      await tool.execute(
+        {
+          items: [
+            {
+              productId: uuid1,
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+        { toolCallId: 't', messages: [], context: { senderId: 's' } },
+      );
+
+      expect(humanHandoffService.create).not.toHaveBeenCalled();
     });
   });
 });

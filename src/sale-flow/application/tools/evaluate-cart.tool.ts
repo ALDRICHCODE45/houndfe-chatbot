@@ -75,7 +75,28 @@ export function makeEvaluateCartTool(deps: ToolDeps) {
           idempotencyKey: existingCart.idempotencyKey,
           expectedTotalCents,
         });
-        return { ok: true, ...evaluation };
+        // Non-trigger branches keep the existing shape byte-identically.
+        const success = { ok: true as const, ...evaluation };
+        if (evaluation.promotionEvaluationStatus !== 'needs_human_review') {
+          return success;
+        }
+        // `needs_human_review` signal envelope (spec §"evaluateCart returns
+        // a humanAssistance envelope"): the tool ONLY signals — the model
+        // renders the existing quote first and escalates via
+        // `requestHumanAssistance` when the customer wants to proceed. The
+        // digest mirrors the persisted cart at LIST price
+        // (`unitPriceCents = originalPriceCents`), never the discounted
+        // `finalPriceCents`. The backend CartEvaluationResult DTO carries no
+        // top-level totals, so the optional `originalTotalCents` /
+        // `recomputedTotalCents` digest fields are omitted (design intent:
+        // the list-price lines are the review payload).
+        return {
+          ...success,
+          humanAssistance: {
+            kind: 'needs_human_review' as const,
+            digest: { items },
+          },
+        };
       } catch (err) {
         return mapChatbotError(err);
       }
