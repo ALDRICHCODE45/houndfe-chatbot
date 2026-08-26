@@ -45,14 +45,20 @@ message list.
 The `TOOL_REGISTRY` provider MUST supply the real sale-flow tool set
 (`searchCatalog`, `checkStock`, `evaluateCart`, `getCustomerByPhone`,
 `upsertCustomer`, `createSale`, `attachReceipt`, `updateDelivery`,
-`getOrderHistory`) bound from `RealToolRegistry`. The registry MUST inject
-`CHATBOT_API_CLIENT` and `CONVERSATION_STORE`. A historical placeholder
-(`getCurrentTime`) MAY remain in the repository as a test fixture but MUST NOT
-be the production binding.
-(Previously: `A ToolRegistry provider MUST supply at least one placeholder tool
-(getCurrentTime).` — the getCurrentTime-only placeholder constraint has been
-relaxed; the production binding is now the real sale-flow tool set wired
-through `RealToolRegistry`.)
+`getOrderHistory`, `getPaymentDetails`, `cancelSale`, `requestHumanAssistance`)
+bound from `RealToolRegistry`. The registry MUST inject `CHATBOT_API_CLIENT`,
+`CONVERSATION_STORE`, and `HUMAN_HANDOFF_SERVICE`.
+
+When `readPendingHumanRequest(state)` returns a non-null marker AND the inbound's
+`senderId` matches the customer's `pendingHumanRequest` customerId, the runner MUST
+short-circuit: return the canned literal reply `seguimos esperando respuesta del
+agente, te avisamos en cuanto tengamos`, skip `LlmAgentPort.run(...)`, skip
+`costGuard.record(...)`, and skip the per-turn `ConversationStore.update(...)` write
+(transcript stays clean so the awaited-human turn doesn't bloat history).
+
+(Previously: registry listed eleven sale-flow tools without `requestHumanAssistance`;
+no short-circuit path existed; the runner always executed an LLM turn for every
+customer-side inbound.)
 
 #### Scenario: History truncates in memory and tool result round-trips
 
@@ -72,12 +78,48 @@ through `RealToolRegistry`.)
 - AND the tool registry is still asked for tools (which MUST resolve, even with
   no prior state).
 
+#### Scenario: pendingHumanRequest is present triggers a short-circuit reply
+
+- GIVEN a sender S whose `data.pendingHumanRequest` is set to
+  `{ requestId: 'abc123def456', ref: 'HF-abc123def456', createdAt,
+    customerNotifiedAt }`
+- AND an inbound from S (customer-side) with `text = '¿siguen?'`
+- WHEN the runner handles the inbound
+- THEN `LlmAgentPort.run(...)` MUST NOT be called (no LLM turn)
+- AND `costGuard.record(...)` MUST NOT be called (no token accounting for this turn)
+- AND `ConversationStore.update(...)` MUST NOT be called (no transcript append)
+- AND the returned `reply` MUST equal the literal
+  `seguimos esperando respuesta del agente, te avisamos en cuanto tengamos`
+  byte-identical (whitespace, final period, no trailing newline).
+
+#### Scenario: pendingHumanRequest absent follows the normal LLM path
+
+- GIVEN a sender S whose `data.pendingHumanRequest` is `null`
+- WHEN the runner handles an inbound from S
+- THEN the runner MUST follow the normal flow: load history, truncate to
+  `LLM_HISTORY_TURNS`, invoke `LlmAgentPort.run(...)`, record cost, persist user +
+  assistant turns.
+
+#### Scenario: ops-side inbound never reaches the runner
+
+- GIVEN an inbound with `from = OPS_CHANNEL_PHONE` (after normalization)
+- WHEN the dispatcher classifies the inbound
+- THEN `WebhookDispatcherService` MUST route the inbound to
+  `HumanHandoffService.resolveReply(...)` BEFORE `AgentRunner.handle(...)`
+- AND `AgentRunner.handle(...)` MUST NOT be called for ops-side inbounds.
+
 ### Requirement: Enforce idle-timeout session window
 
 The system MUST read `LLM_IDLE_TIMEOUT_MS` at boot.
 For each inbound, the runner MUST compare stored `lastMessageAt` against the timeout.
 If the gap exceeds the timeout, the runner MUST treat the call as a fresh session (empty history, `lastMessageAt` overwritten).
 Within the window, prior history MUST be preserved.
+
+When `data.pendingHumanRequest` is set on a sender whose `lastMessageAt` is older than
+`LLM_IDLE_TIMEOUT_MS`, the idle-reset path MUST preserve the marker: the freshly loaded
+`data` already carries the marker (because `HumanHandoffService.create(...)` wrote it on
+a prior turn), and the runner's idle-reset UPSERT MUST carry `pendingHumanRequest` equal
+to that freshly read value (ADR-28 — fresh-state spread write, see below).
 
 #### Scenario: Boundary behavior at the idle-timeout edge
 
@@ -86,6 +128,15 @@ Within the window, prior history MUST be preserved.
 - THEN the runner MUST pass empty history and overwrite `lastMessageAt`.
 - AND WHEN an inbound arrives 10 seconds after the stored `lastMessageAt`
 - THEN the runner MUST pass the prior (truncated) history.
+
+#### Scenario: idle reset preserves the pendingHumanRequest marker
+
+- GIVEN a sender S whose `pendingHumanRequest` is set
+- AND `LLM_IDLE_TIMEOUT_MS` has elapsed since `lastMessageAt`
+- WHEN the runner's idle-reset path runs
+- THEN the new `lastMessageAt` is set (idle boundary)
+- AND the persisted `data.pendingHumanRequest` MUST equal the pre-reset value
+  (no clobbering, no fabrication of a fresh marker).
 
 ### Requirement: Enforce soft monthly cost guard
 
@@ -112,10 +163,15 @@ supports the request, answer exactly `esa función aún no está disponible`.
 `AgentRunner` MUST NOT override the composed prompt at runtime — composition
 happens at module boot, not per turn. The base `SYSTEM_PROMPT` MUST be
 appended unmodified (`SALE_FLOW_INSTRUCTIONS` adds to it, never replaces).
-(Previously: `The system prompt MUST instruct the model to ...` and `The
-runner MUST NOT override this prompt at runtime.` — the contract is preserved
-in full and tightened: composition at boot is now the only point where the
-final prompt is built.)
+
+The short-circuit reply is OUTSIDE the composed system prompt — it is the
+runner returning a hard-coded canned string when `pendingHumanRequest` is set,
+NOT a model-generated response. The composed prompt is unchanged by this slice
+beyond the new step and the three edits documented in the `sale-flow-tools`
+delta.
+
+(Previously: no short-circuit reply path; the composed prompt was the only
+mechanism.)
 
 #### Scenario: Refusal phrase and language contract are asserted (base layer)
 
@@ -138,6 +194,15 @@ final prompt is built.)
   (iv) the explicit list-price-only instruction
   (call `createSale` at `originalPriceCents`, never at a discounted
   `finalPriceCents`).
+
+#### Scenario: short-circuit reply is a hard-coded runner string, not a model reply
+
+- GIVEN a sender S with `pendingHumanRequest` set
+- WHEN the runner short-circuits
+- THEN the canned reply MUST be the literal
+  `seguimos esperando respuesta del agente, te avisamos en cuanto tengamos`
+- AND the canned reply MUST be returned without invoking the SDK
+- AND the canned reply MUST NOT be added to `data.messages`.
 
 ### Requirement: Fail fast on missing LLM env
 
@@ -178,3 +243,112 @@ drift on the provider is logged as a follow-up.
 - WHEN the runner is constructed
 - THEN the runner MUST consume the stub registry (not `RealToolRegistry`)
 - AND other DI bindings MUST remain intact.
+
+### Requirement: AgentRunner final write spreads fresh state (ADR-28)
+
+After `LlmAgentPort.run(...)` returns, the runner MUST re-fetch the durable state via
+`ConversationStore.get(senderId)` and persist
+`data: { ...freshState.data, messages: nextTurns }` (fresh-state spread). The pre-LLM
+state MUST NOT be spread over the post-LLM write, because tools executed during the LLM
+turn can persist typed convenience fields (`cart`, `placedSaleId`,
+`pendingHumanRequest`, future siblings) that the runner's current
+`data: { messages: nextTurns }` write would otherwise clobber.
+
+The fresh-state spread write MUST preserve the byte-identical values of every sibling
+key the tools wrote during the LLM turn. The runner MUST emit a structured `error` log
+when the post-`run` `get` returns `null` (a race where the state was deleted during the
+LLM turn) and MUST NOT attempt a `null`-spread write in that case.
+
+#### Scenario: cart written by a tool during the turn survives the post-run write
+
+- GIVEN a sender S with a pre-LLM state whose `data` has `cart: undefined`
+- AND a tool invoked during the LLM turn persists
+  `data: { ..., cart: { items: [{ productId: 'p-1', quantity: 1, unitPriceCents: 1000 }],
+                            idempotencyKey: '', expectedTotalCents: undefined } }`
+- WHEN the LLM turn completes
+- THEN the runner's post-`run` `get(S)` MUST return `state.data.cart === <the tool's cart>`
+- AND the runner's final UPSERT MUST carry `data.cart === <the tool's cart>` (fresh-state
+  spread, no clobbering back to the pre-LLM `undefined`).
+
+#### Scenario: pendingHumanRequest written by requestHumanAssistance survives the post-run write
+
+- GIVEN a sender S with no prior `pendingHumanRequest`
+- AND `requestHumanAssistance` invoked during the LLM turn persists the marker on
+  `data.pendingHumanRequest`
+- WHEN the LLM turn completes
+- THEN the runner's post-`run` `get(S).data.pendingHumanRequest` MUST equal the
+  marker the tool wrote
+- AND the runner's final UPSERT MUST carry that marker (not `null` and not the
+  pre-LLM absent state).
+
+#### Scenario: post-run get returning null logs an error and skips the spread write
+
+- GIVEN a sender S whose state was deleted between `llm.run` and the post-`run` `get`
+- WHEN the post-`run` `get(S)` returns `null`
+- THEN the runner MUST emit a structured `error` log tagged `state-deleted-during-run`
+  with `senderId`
+- AND the runner MUST NOT perform a `null`-spread `update` (no key collision, no
+  UPSERT of an empty record).
+
+#### Scenario: pendingHumanRequest is not cleared by the runner
+
+- GIVEN a sender S with `pendingHumanRequest` set BEFORE the LLM turn
+- AND no tool in the turn touches `pendingHumanRequest`
+- WHEN the LLM turn completes
+- THEN the persisted `data.pendingHumanRequest` MUST equal the pre-LLM value
+  (no automatic clearing by the runner; clearing is the
+  `HumanHandoffService.resolveReply(...)` responsibility, NOT the runner's).
+
+### Requirement: toolsContext gains requestHumanAssistance.senderId
+
+The `VercelAiLlmAgent` infrastructure adapter MUST expose a `toolsContext` object whose
+shape is the union of `{ senderId: string }` (already in place for the other tools)
+plus the new field `requestHumanAssistance: { senderId: string }`. The `requestHumanAssistance`
+factory reads `options.context.senderId` (NOT `options.context.requestHumanAssistance.senderId`)
+because the tool schema declares `contextSchema: z.object({ senderId: z.string().min(1) })`
+— the context envelope key matches the tool name, but the inner schema is uniform.
+
+#### Scenario: toolsContext exposes the requestHumanAssistance.senderId field
+
+- GIVEN a registered `RealToolRegistry` with the 12th tool
+- WHEN the runner builds the toolsContext for an inbound from sender S
+- THEN `toolsContext.requestHumanAssistance.senderId` MUST equal S
+- AND `toolsContext.senderId` MUST equal S (the canonical field used by every other tool).
+
+#### Scenario: requestHumanAssistance.execute uses options.context.senderId
+
+- GIVEN the tool is invoked with
+  `input = { kind: 'out_of_stock', digest: {...} }` and
+  `options.context = { senderId: '521...' }`
+- WHEN `execute(input, options)` runs
+- THEN the tool MUST call
+  `service.create({ senderId: options.context.senderId, ... })`
+  (NOT `options.context.requestHumanAssistance.senderId`).
+
+### Requirement: AgentRunner does not enter the LLM path while pendingHumanRequest is set
+
+The short-circuit branch MUST run BEFORE any LLM-side work (history load, truncation,
+`llm.run(...)`, `costGuard.record(...)`, `ConversationStore.update(...)`). When the
+marker is set on a customer-side inbound, the runner MUST return within one
+`readPendingHumanRequest(state)` + canned-reply assignment cycle — no other side
+effects.
+
+#### Scenario: short-circuit path has zero LLM and zero store side effects
+
+- GIVEN a sender S with `pendingHumanRequest` set
+- WHEN the runner handles a customer-side inbound from S
+- THEN the runner MUST NOT call `LlmAgentPort.run(...)`
+- AND the runner MUST NOT call `costGuard.record(...)`
+- AND the runner MUST NOT call `ConversationStore.update(...)` for this turn
+- AND the runner MUST return `{ reply: <canned>, messages: <unchanged> }`.
+
+#### Scenario: short-circuit does not depend on LLM_IDLE_TIMEOUT_MS
+
+- GIVEN a sender S with `pendingHumanRequest` set
+- AND `lastMessageAt` is fresh (well within `LLM_IDLE_TIMEOUT_MS`)
+- WHEN the runner handles an inbound from S
+- THEN the runner MUST still short-circuit (marker presence is the discriminator, NOT
+  the idle boundary).
+- AND WHEN `lastMessageAt` is older than `LLM_IDLE_TIMEOUT_MS`
+- THEN the runner MUST still short-circuit (the idle path also preserves the marker
+  per the fresh-state spread write).
