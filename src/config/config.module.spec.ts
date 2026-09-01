@@ -26,6 +26,13 @@ describe('AppConfigModule integration', () => {
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
     OPS_CHANNEL_PHONE: '5215500000000',
+    // WU1B receipt media
+    RECEIPT_MEDIA_ENABLED: 'false',
+    RECEIPT_MEDIA_MAX_BYTES: '10485760',
+    RECEIPT_STORAGE_FORCE_PATH_STYLE: 'false',
+    RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
+    RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
+    RECEIPT_MEDIA_METRICS_ENABLED: 'false',
   };
 
   const MANAGED_KEYS = Object.keys(VALID_ENV);
@@ -134,5 +141,63 @@ describe('AppConfigModule integration', () => {
         }).compile(),
       ).rejects.toThrow();
     });
+  });
+
+  // WU1B RED: receiptMedia subtree absent → test fails until GREEN
+  describe('receiptMedia disabled-default', () => {
+    it.each([
+      { enabled: undefined, label: 'omitted RECEIPT_MEDIA_ENABLED' },
+      { enabled: 'false', label: 'explicit false' },
+    ])(
+      '$label boots and ConfigService returns disabled-default receiptMedia',
+      async ({ enabled }) => {
+        Object.assign(process.env, VALID_ENV);
+        if (enabled === undefined) {
+          delete process.env.RECEIPT_MEDIA_ENABLED;
+        } else {
+          process.env.RECEIPT_MEDIA_ENABLED = enabled;
+        }
+
+        const moduleRef = await Test.createTestingModule({
+          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
+        }).compile();
+
+        const config = moduleRef.get(ConfigService);
+
+        const disabledDefault = {
+          enabled: false,
+          maxBytes: 10_485_760,
+          meta: {
+            allowedHosts: [] as string[],
+            metadataTimeoutMs: undefined,
+            downloadTimeoutMs: undefined,
+          },
+          storage: {
+            endpoint: undefined,
+            region: undefined,
+            bucket: undefined,
+            accessKeyId: undefined,
+            secretAccessKey: undefined,
+            forcePathStyle: false,
+          },
+          publicBaseUrl: undefined,
+          capability: {
+            keys: undefined,
+            activeVersion: undefined,
+          },
+          attachTimeoutMs: undefined,
+          worker: {
+            concurrency: 2,
+            leaseMs: 60_000,
+            pollIntervalMs: undefined,
+          },
+          metricsEnabled: false,
+        };
+
+        expect(config.get('receiptMedia')).toEqual(disabledDefault);
+
+        await moduleRef.close();
+      },
+    );
   });
 });

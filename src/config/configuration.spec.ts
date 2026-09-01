@@ -27,6 +27,26 @@ describe('configuration()', () => {
     'LLM_IDLE_TIMEOUT_MS',
     'DATABASE_URL',
     'DB_POOL_MAX',
+    // WU1B receipt media
+    'RECEIPT_MEDIA_ENABLED',
+    'RECEIPT_MEDIA_MAX_BYTES',
+    'META_MEDIA_ALLOWED_HOSTS',
+    'META_MEDIA_METADATA_TIMEOUT_MS',
+    'META_MEDIA_DOWNLOAD_TIMEOUT_MS',
+    'RECEIPT_STORAGE_ENDPOINT',
+    'RECEIPT_STORAGE_REGION',
+    'RECEIPT_STORAGE_BUCKET',
+    'RECEIPT_STORAGE_ACCESS_KEY_ID',
+    'RECEIPT_STORAGE_SECRET_ACCESS_KEY',
+    'RECEIPT_STORAGE_FORCE_PATH_STYLE',
+    'RECEIPT_MEDIA_PUBLIC_BASE_URL',
+    'RECEIPT_CAPABILITY_KEYS',
+    'RECEIPT_CAPABILITY_ACTIVE_VERSION',
+    'CHATBOT_API_ATTACH_TIMEOUT_MS',
+    'RECEIPT_MEDIA_WORKER_CONCURRENCY',
+    'RECEIPT_MEDIA_WORKER_LEASE_MS',
+    'RECEIPT_MEDIA_WORKER_POLL_MS',
+    'RECEIPT_MEDIA_METRICS_ENABLED',
   ];
 
   beforeEach(() => {
@@ -48,48 +68,72 @@ describe('configuration()', () => {
 
   it('exposes database.url sourced from DATABASE_URL', () => {
     process.env.DATABASE_URL = 'postgres://u:p@h:5432/d';
-
     const cfg = configuration() as {
       database: { url: string; poolMax: number };
     };
-
     expect(cfg.database.url).toBe('postgres://u:p@h:5432/d');
   });
 
   it('defaults database.poolMax to 5 when DB_POOL_MAX is absent', () => {
     delete process.env.DB_POOL_MAX;
     process.env.DATABASE_URL = 'postgres://u:p@h:5432/d';
-
     const cfg = configuration() as {
       database: { url: string; poolMax: number };
     };
-
     expect(cfg.database.poolMax).toBe(5);
   });
 
   it('honours DB_POOL_MAX when provided as an integer string', () => {
     process.env.DATABASE_URL = 'postgres://u:p@h:5432/d';
     process.env.DB_POOL_MAX = '12';
-
     const cfg = configuration() as {
       database: { url: string; poolMax: number };
     };
-
     expect(cfg.database.poolMax).toBe(12);
   });
 
   // Task 1.3/1.4: cashierUserId surfaces on chatbotApi
-  it('exposes chatbotApi.cashierUserId sourced from CHATBOT_API_CASHIER_USER_ID', () => {
+  it('exposes chatbotApi.cashashierUserId from CHATBOT_API_CASHIER_USER_ID', () => {
     const uuid = '00000000-0000-4000-8000-000000000001';
     process.env.CHATBOT_API_CASHIER_USER_ID = uuid;
-
     const cfg = configuration() as {
       chatbotApi: { cashierUserId: string };
     };
-
     expect(cfg.chatbotApi.cashierUserId).toBe(uuid);
     expect(cfg.chatbotApi.cashierUserId).toBe(
       process.env.CHATBOT_API_CASHIER_USER_ID,
     );
+  });
+
+  // WU1B
+  describe('receiptMedia', () => {
+    it.each([
+      { env: undefined, expected: false, label: 'omitted defaults' },
+      { env: 'false', expected: false, label: 'explicit false' },
+      { env: 'true', expected: true, label: 'exact true' },
+    ])('$label', ({ env, expected }) => {
+      if (env === undefined) {
+        delete process.env.RECEIPT_MEDIA_ENABLED;
+      } else {
+        process.env.RECEIPT_MEDIA_ENABLED = env;
+      }
+      const cfg = configuration() as unknown as {
+        receiptMedia: {
+          enabled: boolean;
+          maxBytes: number;
+          meta: { allowedHosts: string[] };
+          storage: { forcePathStyle: boolean };
+          worker: { concurrency: number; leaseMs: number };
+          metricsEnabled: boolean;
+        };
+      };
+      expect(cfg.receiptMedia.enabled).toBe(expected);
+      expect(cfg.receiptMedia.maxBytes).toBe(10_485_760);
+      expect(cfg.receiptMedia.meta.allowedHosts).toEqual([]);
+      expect(cfg.receiptMedia.storage.forcePathStyle).toBe(false);
+      expect(cfg.receiptMedia.worker.concurrency).toBe(2);
+      expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
+      expect(cfg.receiptMedia.metricsEnabled).toBe(false);
+    });
   });
 });
