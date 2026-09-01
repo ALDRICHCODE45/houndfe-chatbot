@@ -9,6 +9,20 @@ export const META_GRAPH_API_BASE_URL_DEFAULT =
 // replacement; applying a typed base (`Joi.boolean()` etc.) would validate
 // the value before the branch could decide permissiveness.
 const RECEIPT_MAX_BYTES_VALUE = 10_485_760;
+// WU1C2A numeric relations: lease is the 60-second safety window every external operation must stay strictly inside.
+const RECEIPT_LEASE_MS_VALUE = 60_000;
+const RECEIPT_MAX_WORKER_CONCURRENCY = 8;
+const RECEIPT_MAX_ATTACH_TIMEOUT_MS = 30_000;
+
+// Positive integer in (0, max] required schema (used for timeouts + concurrency); `<` lease variants share this base.
+const receiptBoundedPositiveInt = (max: number) =>
+  Joi.number().integer().min(1).max(max).required();
+// Strictly-less-than-lease required schema for poll/attach where the lease boundary itself is forbidden.
+const receiptLessThanLease = Joi.number()
+  .integer()
+  .min(1)
+  .less(RECEIPT_LEASE_MS_VALUE)
+  .required();
 
 const httpsUrlSchema = Joi.string()
   .uri({ scheme: ['https'] })
@@ -154,6 +168,24 @@ export const envValidationSchema = Joi.object({
   RECEIPT_STORAGE_FORCE_PATH_STYLE: receiptConditional(Joi.boolean()),
   RECEIPT_MEDIA_PUBLIC_BASE_URL: receiptConditional(httpsUrlSchema),
   RECEIPT_MEDIA_METRICS_ENABLED: receiptConditional(Joi.boolean()),
+  // WU1C2A numeric relations: same `receiptConditional` shape; all fields bounded by the 60s lease window, attach adds a 30s cap.
+  META_MEDIA_METADATA_TIMEOUT_MS: receiptConditional(receiptLessThanLease),
+  META_MEDIA_DOWNLOAD_TIMEOUT_MS: receiptConditional(receiptLessThanLease),
+  RECEIPT_MEDIA_WORKER_CONCURRENCY: receiptConditional(
+    receiptBoundedPositiveInt(RECEIPT_MAX_WORKER_CONCURRENCY),
+  ),
+  RECEIPT_MEDIA_WORKER_LEASE_MS: receiptConditional(
+    Joi.number().integer().valid(RECEIPT_LEASE_MS_VALUE).required(),
+  ),
+  RECEIPT_MEDIA_WORKER_POLL_MS: receiptConditional(receiptLessThanLease),
+  CHATBOT_API_ATTACH_TIMEOUT_MS: receiptConditional(
+    Joi.number()
+      .integer()
+      .min(1)
+      .max(RECEIPT_MAX_ATTACH_TIMEOUT_MS)
+      .less(RECEIPT_LEASE_MS_VALUE)
+      .required(),
+  ),
 })
   .custom((value: Record<string, unknown>, helpers) => {
     const enabled = value.HUMAN_HANDOFF_ENABLED !== false;
@@ -166,6 +198,16 @@ export const envValidationSchema = Joi.object({
       const err = helpers.error('any.custom');
       err.message = `"OPS_CHANNEL_PHONE" is required when "HUMAN_HANDOFF_ENABLED" is true`;
       throw err;
+    }
+    // WU1C2A cross-field rule: download timeout must be at least as large as metadata timeout; only enforced when receipt-media is enabled.
+    if (value.RECEIPT_MEDIA_ENABLED === true) {
+      const meta = Number(value.META_MEDIA_METADATA_TIMEOUT_MS);
+      const dl = Number(value.META_MEDIA_DOWNLOAD_TIMEOUT_MS);
+      if (Number.isFinite(meta) && Number.isFinite(dl) && dl < meta) {
+        const err = helpers.error('any.custom');
+        err.message = `"META_MEDIA_DOWNLOAD_TIMEOUT_MS" must be >= "META_MEDIA_METADATA_TIMEOUT_MS"`;
+        throw err;
+      }
     }
     return value;
   })

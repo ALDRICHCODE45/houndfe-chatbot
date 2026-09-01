@@ -426,10 +426,12 @@ describe('envValidationSchema', () => {
     });
   });
 
-  // ─── WU1C1: Receipt media conditional validation foundation ─────────────
+  // ─── WU1C1 + WU1C2A: Receipt media conditional validation foundation ───
   // Disabled (default) MUST be permissive; enabled MUST strictly validate
-  // the listed receipt-media fields. One compact describe block, table-driven.
-  describe('RECEIPT_MEDIA_* conditional foundation (WU1C1)', () => {
+  // the listed receipt-media fields. WU1C2A extends enabledBase once with
+  // numeric timeout/concurrency/lease/poll/attach values and proves the
+  // relational bounds at the same compactness budget.
+  describe('RECEIPT_MEDIA_* conditional foundation (WU1C1+WU1C2A)', () => {
     const enabledBase = {
       ...validEnv,
       RECEIPT_MEDIA_ENABLED: 'true',
@@ -441,6 +443,14 @@ describe('envValidationSchema', () => {
       RECEIPT_STORAGE_ACCESS_KEY_ID: 'AKIAEXAMPLE',
       RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'redacted-secret-value',
       RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
+      // WU1C2A numeric relations: metadata=5s, download=30s,
+      // concurrency=2, lease=exactly 60s, poll=1s, attach=30s.
+      META_MEDIA_METADATA_TIMEOUT_MS: '5000',
+      META_MEDIA_DOWNLOAD_TIMEOUT_MS: '30000',
+      RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
+      RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
+      RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
+      CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
     };
 
     // ─── Disabled permissiveness ───────────────────────────────────────
@@ -616,6 +626,106 @@ describe('envValidationSchema', () => {
       });
       expect(error).toBeDefined();
     });
+
+    // ─── WU1C2A: Numeric relational bounds (compact table-driven) ────────
+    // Every numeric env var is mutated in isolation against enabledBase.
+    // The relational case (download smaller than metadata) and lease/attach
+    // boundary cases are tested via the same path-targeted it.each plus a
+    // tiny message-targeted assertion for the cross-field rule.
+    const invalidNumericCases: Array<[string, string, string]> = [
+      // META_MEDIA_METADATA_TIMEOUT_MS: positive integer, < lease.
+      ['meta=0', 'META_MEDIA_METADATA_TIMEOUT_MS', '0'],
+      ['meta=-1', 'META_MEDIA_METADATA_TIMEOUT_MS', '-1'],
+      ['meta=60000 (=lease)', 'META_MEDIA_METADATA_TIMEOUT_MS', '60000'],
+      ['meta=abc', 'META_MEDIA_METADATA_TIMEOUT_MS', 'abc'],
+      // META_MEDIA_DOWNLOAD_TIMEOUT_MS: positive integer, < lease.
+      ['down=0', 'META_MEDIA_DOWNLOAD_TIMEOUT_MS', '0'],
+      ['down=60000 (=lease)', 'META_MEDIA_DOWNLOAD_TIMEOUT_MS', '60000'],
+      // RECEIPT_MEDIA_WORKER_CONCURRENCY: integer 1..8.
+      ['conc=0', 'RECEIPT_MEDIA_WORKER_CONCURRENCY', '0'],
+      ['conc=9 (max+1)', 'RECEIPT_MEDIA_WORKER_CONCURRENCY', '9'],
+      ['conc=1.5', 'RECEIPT_MEDIA_WORKER_CONCURRENCY', '1.5'],
+      ['conc=abc', 'RECEIPT_MEDIA_WORKER_CONCURRENCY', 'abc'],
+      // RECEIPT_MEDIA_WORKER_LEASE_MS: exactly 60000.
+      ['lease=0', 'RECEIPT_MEDIA_WORKER_LEASE_MS', '0'],
+      ['lease=59999', 'RECEIPT_MEDIA_WORKER_LEASE_MS', '59999'],
+      ['lease=60001', 'RECEIPT_MEDIA_WORKER_LEASE_MS', '60001'],
+      // RECEIPT_MEDIA_WORKER_POLL_MS: positive integer, < lease.
+      ['poll=0', 'RECEIPT_MEDIA_WORKER_POLL_MS', '0'],
+      ['poll=60000 (=lease)', 'RECEIPT_MEDIA_WORKER_POLL_MS', '60000'],
+      // CHATBOT_API_ATTACH_TIMEOUT_MS: positive integer, <=30000, < lease.
+      ['attach=0', 'CHATBOT_API_ATTACH_TIMEOUT_MS', '0'],
+      ['attach=30001 (max+1)', 'CHATBOT_API_ATTACH_TIMEOUT_MS', '30001'],
+      ['attach=60000 (=lease)', 'CHATBOT_API_ATTACH_TIMEOUT_MS', '60000'],
+    ];
+    it.each(invalidNumericCases)('rejects %s', (_label, field, value) => {
+      const env = { ...enabledBase, [field]: value };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes(field))).toBe(true);
+    });
+
+    // Cross-field relation: metadata_timeout <= download_timeout. The
+    // violation surfaces from the object-level custom check, so the
+    // failure path targets the custom-key frame but the message names
+    // both fields.
+    it('rejects when META_MEDIA_DOWNLOAD_TIMEOUT_MS < META_MEDIA_METADATA_TIMEOUT_MS', () => {
+      const env = {
+        ...enabledBase,
+        META_MEDIA_METADATA_TIMEOUT_MS: '5000',
+        META_MEDIA_DOWNLOAD_TIMEOUT_MS: '1000',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      const allText = error!.details.map((d) => d.message).join(' | ');
+      expect(allText).toMatch(/META_MEDIA_DOWNLOAD_TIMEOUT_MS/);
+      expect(allText).toMatch(/META_MEDIA_METADATA_TIMEOUT_MS/);
+    });
+
+    // Valid boundary table: min, max, equality, and exact attach cap.
+    const validNumericBoundaryCases: Array<[string, Record<string, string>]> = [
+      [
+        'min boundaries',
+        {
+          META_MEDIA_METADATA_TIMEOUT_MS: '1',
+          META_MEDIA_DOWNLOAD_TIMEOUT_MS: '2',
+          RECEIPT_MEDIA_WORKER_CONCURRENCY: '1',
+          RECEIPT_MEDIA_WORKER_POLL_MS: '1',
+          CHATBOT_API_ATTACH_TIMEOUT_MS: '1',
+        },
+      ],
+      [
+        'max boundaries',
+        {
+          META_MEDIA_METADATA_TIMEOUT_MS: '59999',
+          META_MEDIA_DOWNLOAD_TIMEOUT_MS: '59999',
+          RECEIPT_MEDIA_WORKER_CONCURRENCY: '8',
+          RECEIPT_MEDIA_WORKER_POLL_MS: '59999',
+          CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
+        },
+      ],
+      [
+        'metadata equals download',
+        {
+          META_MEDIA_METADATA_TIMEOUT_MS: '5000',
+          META_MEDIA_DOWNLOAD_TIMEOUT_MS: '5000',
+        },
+      ],
+    ];
+    it.each(validNumericBoundaryCases)(
+      'accepts numeric boundary: %s',
+      (_label, overrides) => {
+        const env = { ...enabledBase, ...overrides };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(error).toBeUndefined();
+      },
+    );
 
     // ─── Existing & multi-field regression ────────────────────────────
     it('preserves existing validEnv compatibility', () => {
