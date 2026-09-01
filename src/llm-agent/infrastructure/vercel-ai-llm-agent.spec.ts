@@ -77,12 +77,15 @@ describe('VercelAiLlmAgent', () => {
         string,
         unknown
       >;
-      // toolsContext is a per-tool map keyed by tool name. The cart
-      // tools (evaluateCart, createSale) need { senderId }; the
-      // stateless tools don't need context, so the map is sparse.
+      // toolsContext is a per-tool map keyed by tool name. Every tool
+      // that declares `contextSchema: z.object({ senderId })` MUST have
+      // its own entry here — the SDK scopes `execute`'s `options.context`
+      // to the matching tool name. The map is sparse: stateless tools
+      // are omitted.
       expect(callArgs.toolsContext).toEqual({
         evaluateCart: { senderId: '5215550001111' },
         createSale: { senderId: '5215550001111' },
+        cancelSale: { senderId: '5215550001111' },
         // Human-handoff slice: 12th tool needs senderId context too.
         requestHumanAssistance: { senderId: '5215550001111' },
       });

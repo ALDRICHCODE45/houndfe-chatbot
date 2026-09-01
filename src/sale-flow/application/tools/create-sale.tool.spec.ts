@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/require-await, @typescript-eslint/unbound-method */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/require-await, @typescript-eslint/unbound-method */
 
 import { makeCreateSaleTool } from './create-sale.tool';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
@@ -41,11 +41,13 @@ describe('makeCreateSaleTool', () => {
       create: jest.fn(),
       update: jest
         .fn()
-        .mockImplementation(async (senderId: string, patch: object) => ({
-          senderId,
-          lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
-          data: (patch as { data: object }).data,
-        })),
+        .mockImplementation(
+          async (senderId: string, patch: Record<string, unknown>) => ({
+            senderId,
+            lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+            data: (patch as { data: object }).data,
+          }),
+        ),
     };
   }
 
@@ -92,13 +94,17 @@ describe('makeCreateSaleTool', () => {
       paidCents: 0,
       debtCents: 1000,
       confirmedAt: null,
+      discountCents: 0,
     };
     // First call: succeeds -> cart cleared.
     // Second call: cart is empty after clear -> validation envelope (we assert
     // that the FIRST call used the persisted key on the SECOND outgoing HTTP).
     // Use a more useful scenario: keep cart populated across two createSale calls
     // by clearing the cart only AFTER the call resolves.
-    const updateCalls: Array<{ senderId: string; patch: object }> = [];
+    const updateCalls: Array<{
+      senderId: string;
+      patch: Record<string, unknown>;
+    }> = [];
     const initialCart = {
       items: [
         {
@@ -117,15 +123,17 @@ describe('makeCreateSaleTool', () => {
     }));
     const update = jest
       .fn()
-      .mockImplementation(async (senderId: string, patch: object) => {
-        updateCalls.push({ senderId, patch });
-        // Persist the cart key after first createSale so a second call reuses it.
-        const data = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (data.cart) {
-          currentCart = data.cart;
-        }
-        return { senderId, ...patch };
-      });
+      .mockImplementation(
+        async (senderId: string, patch: Record<string, unknown>) => {
+          updateCalls.push({ senderId, patch });
+          // Persist the cart key after first createSale so a second call reuses it.
+          const data = (patch as { data: { cart?: typeof currentCart } }).data;
+          if (data.cart) {
+            currentCart = data.cart;
+          }
+          return { senderId, ...patch };
+        },
+      );
     const createSale = jest
       .fn()
       .mockResolvedValueOnce(sale)
@@ -231,6 +239,7 @@ describe('makeCreateSaleTool', () => {
       paidCents: 0,
       debtCents: 1000,
       confirmedAt: null,
+      discountCents: 0,
     };
     const createSale = jest.fn().mockResolvedValue(sale);
     const deps = {
@@ -280,7 +289,10 @@ describe('makeCreateSaleTool', () => {
       ],
       idempotencyKey: 'existing-key',
     };
-    const updateCalls: Array<{ senderId: string; patch: object }> = [];
+    const updateCalls: Array<{
+      senderId: string;
+      patch: Record<string, unknown>;
+    }> = [];
     const state: ConversationState = {
       senderId: 's',
       lastMessageAt: '2026-06-23T12:00:00.000Z',
@@ -288,14 +300,16 @@ describe('makeCreateSaleTool', () => {
     };
     const update = jest
       .fn()
-      .mockImplementation(async (senderId: string, patch: object) => {
-        updateCalls.push({ senderId, patch });
-        return {
-          senderId,
-          lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
-          data: (patch as { data: object }).data,
-        };
-      });
+      .mockImplementation(
+        async (senderId: string, patch: Record<string, unknown>) => {
+          updateCalls.push({ senderId, patch });
+          return {
+            senderId,
+            lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+            data: (patch as { data: object }).data,
+          };
+        },
+      );
     const store = {
       get: jest.fn().mockResolvedValue(state),
       update,
@@ -458,6 +472,7 @@ describe('makeCreateSaleTool', () => {
       paidCents: 0,
       debtCents: 1000,
       confirmedAt: null,
+      discountCents: 0,
     };
     const createSale = jest.fn().mockResolvedValue(sale);
     const deps = {
@@ -548,7 +563,10 @@ describe('makeCreateSaleTool', () => {
       ...baseDeps,
       store: {} as ConversationStore,
     });
-    const r = tool.inputSchema.safeParse({
+    const inputSchema = tool.inputSchema as {
+      safeParse(input: unknown): { success: boolean };
+    };
+    const r = inputSchema.safeParse({
       customerId: '00000000-4000-9000-0000-000000000099',
       items: [
         {
@@ -664,7 +682,7 @@ describe('makeCreateSaleTool', () => {
     expect(JSON.stringify(dto)).not.toContain('expectedTotalCents');
   });
 
-  it('PROMO_RE_QUOTE → {promoReQuote} envelope, cart items + expectedTotalCents preserved, idempotencyKey cleared', async () => {
+  it('PROMO_RE_QUOTE → {promoReQuote} envelope unchanged; cart items preserved, expectedTotalCents replaced by recomputedTotalCents, idempotencyKey cleared', async () => {
     const promoErr = new UpstreamError(
       'Price changed',
       409,
@@ -694,11 +712,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const createSale = jest.fn().mockRejectedValue(promoErr);
     const deps = {
@@ -731,11 +753,135 @@ describe('makeCreateSaleTool', () => {
         discountCents: 100,
       },
     });
-    // items + expectedTotalCents preserved, key cleared
     expect(currentCart.items).toEqual(cart.items);
-    expect(currentCart.expectedTotalCents).toBe(1000);
+    expect(currentCart.expectedTotalCents).toBe(900);
     expect(currentCart.idempotencyKey).toBe('');
   });
+
+  // R-D2 / ADR-5 contract: when the PROMO_RE_QUOTE body is malformed
+  // (any of `recomputedTotalCents`, `expectedTotalCents`, or
+  // `discountCents` is missing or not a non-negative integer), the
+  // mapper falls through to `{validation, false}` AND the cart mutation
+  // must agree: items + `expectedTotalCents` stay intact (no fabricated
+  // total), only the `idempotencyKey` is cleared. State mutation and
+  // returned envelope must NEVER disagree.
+  const malformedPromoCases: ReadonlyArray<{
+    label: string;
+    body: Record<string, unknown>;
+  }> = [
+    {
+      label: 'recomputedTotalCents missing entirely',
+      body: {
+        error: 'PROMO_RE_QUOTE',
+        expectedTotalCents: 1000,
+        discountCents: 100,
+      },
+    },
+    {
+      label: 'expectedTotalCents is a string',
+      body: {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 'not-a-number',
+        discountCents: 100,
+      },
+    },
+    {
+      label: 'expectedTotalCents is negative',
+      body: {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: -1,
+        discountCents: 100,
+      },
+    },
+    {
+      label: 'discountCents is a string',
+      body: {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: 'not-a-number',
+      },
+    },
+    {
+      label: 'discountCents is null',
+      body: {
+        error: 'PROMO_RE_QUOTE',
+        recomputedTotalCents: 900,
+        expectedTotalCents: 1000,
+        discountCents: null,
+      },
+    },
+  ];
+
+  it.each(malformedPromoCases)(
+    'PROMO_RE_QUOTE with malformed body ($label) → envelope falls through to {validation,false}; cart preserves items + expectedTotalCents and clears key (no fabricated total)',
+    async ({ body }) => {
+      const malformedErr = new UpstreamError(
+        'bad promo body',
+        409,
+        body,
+        'PROMO_RE_QUOTE',
+      );
+      const cart = {
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
+        idempotencyKey: 'pre-key',
+        expectedTotalCents: 1000,
+      };
+      let currentCart = cart;
+      const store = {
+        get: jest.fn().mockImplementation(async () => ({
+          senderId: 's',
+          lastMessageAt: '2026-06-23T12:00:00.000Z',
+          data: { cart: currentCart },
+        })),
+        update: jest
+          .fn()
+          .mockImplementation(
+            async (_: string, patch: Record<string, unknown>) => {
+              const d = (patch as { data: { cart?: typeof currentCart } }).data;
+              if (d.cart) currentCart = d.cart;
+              return { senderId: 's', ...patch };
+            },
+          ),
+      } as unknown as ConversationStore;
+      const createSale = jest.fn().mockRejectedValue(malformedErr);
+      const deps = {
+        ...baseDeps,
+        chatbotApi: { createSale } as unknown as ChatbotApiClient,
+        store,
+      };
+      const tool = makeCreateSaleTool(deps);
+      const result = await tool.execute(
+        {
+          customerId: '00000000-4000-9000-0000-000000000099',
+          items: [
+            {
+              productId: '00000000-4000-9000-0000-000000000001',
+              productName: 'Croquetas',
+              quantity: 1,
+              unitPriceCents: 1000,
+            },
+          ],
+        },
+        { toolCallId: 't', messages: [], context: { senderId: 's' } },
+      );
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: 'validation', retryable: false },
+      });
+      expect(currentCart.items).toEqual(cart.items);
+      expect(currentCart.expectedTotalCents).toBe(1000);
+      expect(currentCart.idempotencyKey).toBe('');
+    },
+  );
 
   it('IDEMPOTENCY_KEY_IN_FLIGHT → {idempotencyInFlight, retryable:true}, key preserved', async () => {
     const err = new UpstreamError(
@@ -761,11 +907,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const createSale = jest.fn().mockRejectedValue(err);
     const deps = {
@@ -819,11 +969,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const createSale = jest.fn().mockRejectedValue(err);
     const deps = {
@@ -877,11 +1031,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const createSale = jest.fn().mockRejectedValue(err);
     const deps = {
@@ -935,11 +1093,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const createSale = jest.fn().mockRejectedValue(err);
     const deps = {
@@ -988,11 +1150,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const sale: BotSaleResponse = {
       saleId: 'sale-1',
@@ -1112,11 +1278,15 @@ describe('makeCreateSaleTool', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: { cart: currentCart },
       })),
-      update: jest.fn().mockImplementation(async (_: string, patch: object) => {
-        const d = (patch as { data: { cart?: typeof currentCart } }).data;
-        if (d.cart) currentCart = d.cart;
-        return { senderId: 's', ...patch };
-      }),
+      update: jest
+        .fn()
+        .mockImplementation(
+          async (_: string, patch: Record<string, unknown>) => {
+            const d = (patch as { data: { cart?: typeof currentCart } }).data;
+            if (d.cart) currentCart = d.cart;
+            return { senderId: 's', ...patch };
+          },
+        ),
     } as unknown as ConversationStore;
     const sale: BotSaleResponse = {
       saleId: 'sale-1',
@@ -1158,8 +1328,12 @@ describe('makeCreateSaleTool', () => {
       context: { senderId: 's' },
     });
     expect(r1).toMatchObject({ ok: false, error: { kind: 'promoReQuote' } });
+    const firstDto = createSale.mock.calls[0]![0];
     const firstKey = createSale.mock.calls[0]![1];
-    // After PROMO_RE_QUOTE, key is cleared.
+    // First outgoing DTO carried the cart's 1000.
+    expect(firstDto.expectedTotalCents).toBe(1000);
+    // After PROMO_RE_QUOTE: recomputed total persisted, key cleared.
+    expect(currentCart.expectedTotalCents).toBe(900);
     expect(currentCart.idempotencyKey).toBe('');
     // Second call: mints a fresh UUID v4 structurally different from firstKey.
     await tool.execute(inputArgs, {
@@ -1167,7 +1341,10 @@ describe('makeCreateSaleTool', () => {
       messages: [],
       context: { senderId: 's' },
     });
+    const secondDto = createSale.mock.calls[1]![0];
     const secondKey = createSale.mock.calls[1]![1];
+    // Second outgoing DTO carries the recomputed 900 (no stale-total loop).
+    expect(secondDto.expectedTotalCents).toBe(900);
     expect(secondKey).not.toBe(firstKey);
     expect(secondKey).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,

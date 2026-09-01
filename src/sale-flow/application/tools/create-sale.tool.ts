@@ -24,9 +24,24 @@ import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
  *      - First attempt: mint + persist on cart.
  *      - Retry within the session: reuse the persisted key.
  *      - Success: clear the cart (items + key + expectedTotalCents).
- *      - PROMO_RE_QUOTE: clear the key (payload changed); preserve items +
- *        expectedTotalCents; the next customer-acceptance call mints fresh.
- *      - IDEMPOTENCY_KEY_CONFLICT: clear the key (the key is poisoned).
+ *      - PROMO_RE_QUOTE: clear the key (payload changed) AND replace
+ *        `expectedTotalCents` with the backend's `recomputedTotalCents`
+ *        so the next customer-acceptance call (a fresh UUID + the
+ *        recomputed total on the wire) cannot loop on the stale total.
+ *        Items are preserved. When the PROMO_RE_QUOTE body is malformed
+ *        (any of `recomputedTotalCents`, `expectedTotalCents`, or
+ *        `discountCents` is missing or not a non-negative integer — the
+ *        same shape `mapChatbotError`'s `readPromoPayload` validates)
+ *        the cart does NOT adopt a fabricated value — items + prior
+ *        `expectedTotalCents` stay intact, only the key is cleared
+ *        (R-D2 / ADR-5: never invent totals). The durable replacement
+ *        happens ONLY when the SAME mapped result returned to the
+ *        caller is `{error.kind:'promoReQuote', ...}` from the canonical
+ *        parser — state mutation and returned envelope can never
+ *        disagree.
+ *      - IDEMPOTENCY_KEY_CONFLICT: clear the key (the key is poisoned);
+ *        preserve items + the current `expectedTotalCents` (the conflict
+ *        is unrelated to the total).
  *      - IDEMPOTENCY_KEY_IN_FLIGHT: preserve the key (same payload, retry
  *        later).
  *      - Success: clear the cart (items + key + expectedTotalCents) AND
@@ -171,16 +186,55 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         await persistConfirmedSale(deps.store, senderId, state, sale.saleId);
         return { ok: true as const, ...sale };
       } catch (err) {
-        // Q3 errorCode-first cart-mutation policy: re-inspect the error
-        // here because mapChatbotError has no access to the store.
-        // (ADR-9 — the mapper is pure; the tool owns cart writes.)
+        // Single source of truth: call the canonical mapper once and
+        // drive BOTH the cart mutation AND the returned envelope from
+        // the SAME result. State mutation and envelope MUST agree: a
+        // durable `expectedTotalCents` replacement only happens when the
+        // mapper accepted the payload and returned a `promoReQuote`
+        // envelope. For every other error kind (including a malformed
+        // PROMO_RE_QUOTE body the mapper rejects) we never invent a
+        // total — items + prior `expectedTotalCents` stay intact and
+        // only the `idempotencyKey` is cleared when the key is unsafe
+        // to reuse (R-D2 / ADR-5).
+        //
+        // The mapper rethrows non-ChatbotApiError; assigning its result
+        // never completes in that case, so the cart-switch below is
+        // naturally skipped.
+        const result = mapChatbotError(err);
         if (err instanceof ChatbotApiError) {
           switch (err.errorCode) {
             case 'PROMO_RE_QUOTE':
+              if (result.error.kind === 'promoReQuote') {
+                // Backend rejected the stale total and the payload was
+                // well-formed: persist the recomputed total so the
+                // customer-acceptance retry sends 900 (not the stale
+                // 1000), and clear the key so that retry mints a fresh
+                // UUID v4. Items stay intact (the customer's order
+                // survives). The recomputed value is read off the
+                // canonical `result.error.recomputedTotalCents` — no
+                // duplicated payload validation here.
+                await persistCart(deps.store, senderId, state, {
+                  ...cart,
+                  idempotencyKey: '',
+                  expectedTotalCents: result.error.recomputedTotalCents,
+                });
+              } else {
+                // Malformed PROMO_RE_QUOTE body — the mapper fell
+                // through to status mapping. We DO NOT fabricate a
+                // total: items + prior `expectedTotalCents` stay
+                // intact and only the key is cleared (the payload
+                // still changed, so the prior key is unsafe to reuse).
+                await persistCart(deps.store, senderId, state, {
+                  ...cart,
+                  idempotencyKey: '',
+                });
+              }
+              break;
             case 'IDEMPOTENCY_KEY_CONFLICT':
-              // Payload changed (promo) or key poisoned (conflict) — clear
-              // the key so the next call mints fresh. Preserve items +
-              // expectedTotalCents so the customer's intent survives.
+              // Key is poisoned (backend saw this key with a different
+              // payload). Clear the key, but preserve items + the
+              // current `expectedTotalCents` — the conflict is
+              // unrelated to the total.
               await persistCart(deps.store, senderId, state, {
                 ...cart,
                 idempotencyKey: '',
@@ -194,7 +248,7 @@ export function makeCreateSaleTool(deps: ToolDeps) {
               break;
           }
         }
-        return mapChatbotError(err);
+        return result;
       }
     },
   });

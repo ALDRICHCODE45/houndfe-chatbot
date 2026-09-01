@@ -43,6 +43,11 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     const toolsContext = {
       evaluateCart: { senderId: input.senderId },
       createSale: { senderId: input.senderId },
+      // cancelSale declares `contextSchema: z.object({ senderId })` and
+      // reads `options.context.senderId` in `execute` (cancel-endpoint
+      // slice). The context envelope key MUST match the tool name so
+      // the SDK scopes the entry into its `options.context` arg.
+      cancelSale: { senderId: input.senderId },
       // Human-handoff slice: the 12th tool `requestHumanAssistance`
       // declares `contextSchema: z.object({ senderId: z.string() })`
       // and reads `options.context.senderId`. The context envelope key
