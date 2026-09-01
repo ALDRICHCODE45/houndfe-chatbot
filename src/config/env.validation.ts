@@ -63,6 +63,71 @@ const receiptMediaHostsSchema = Joi.string()
     return value;
   }, 'meta media allowed hosts');
 
+// WU1C2B1: strict canonical base64 (RFC 4648 §4), unique positive versions, >=32-byte keys, active must be a member.
+const RECEIPT_KEYRING_VERSION_RE = /^[1-9]\d*$/;
+const STRICT_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const isStrictBase64Key = (raw: string): boolean => {
+  if (raw.length === 0 || raw.length % 4 !== 0 || !STRICT_BASE64_RE.test(raw)) {
+    return false;
+  }
+  const decoded = Buffer.from(raw, 'base64');
+  return decoded.length >= 32 && decoded.toString('base64') === raw;
+};
+const parseReceiptCapabilityKeyring = (raw: string): Set<string> | null => {
+  const versions = new Set<string>();
+  for (const entry of raw.split(',')) {
+    const colon = entry.indexOf(':');
+    if (colon < 1) return null;
+    const versionToken = entry.slice(0, colon);
+    if (
+      !RECEIPT_KEYRING_VERSION_RE.test(versionToken) ||
+      !isStrictBase64Key(entry.slice(colon + 1))
+    ) {
+      return null;
+    }
+    if (versions.has(versionToken)) return null;
+    versions.add(versionToken);
+  }
+  return versions;
+};
+const receiptCapabilityKeysSchema = Joi.string()
+  .required()
+  .custom((value: unknown, helpers) => {
+    const versions =
+      typeof value === 'string' ? parseReceiptCapabilityKeyring(value) : null;
+    if (versions === null) {
+      const err = helpers.error('any.custom');
+      err.message =
+        '"RECEIPT_CAPABILITY_KEYS" must be comma-separated version:base64 entries (unique positive versions, canonical base64 keys >=32 bytes)';
+      throw err;
+    }
+    return value;
+  }, 'receipt capability keys');
+const receiptCapabilityActiveVersionSchema = Joi.string()
+  .required()
+  .custom((value: unknown, helpers) => {
+    const fail = (msg: string): never => {
+      throw Object.assign(helpers.error('any.custom'), { message: msg });
+    };
+    if (typeof value !== 'string' || !RECEIPT_KEYRING_VERSION_RE.test(value)) {
+      fail(`"RECEIPT_CAPABILITY_ACTIVE_VERSION" must be a positive integer`);
+    }
+    const ancestors = helpers.state.ancestors as unknown as
+      | Array<Record<string, unknown>>
+      | undefined;
+    const parent = ancestors?.[0];
+    const keys = parent?.RECEIPT_CAPABILITY_KEYS;
+    if (typeof keys === 'string') {
+      const versions = parseReceiptCapabilityKeyring(keys);
+      if (versions !== null && !versions.has(value as string)) {
+        fail(
+          `"RECEIPT_CAPABILITY_ACTIVE_VERSION" must be present in "RECEIPT_CAPABILITY_KEYS"`,
+        );
+      }
+    }
+    return value;
+  }, 'receipt capability active version');
+
 const receiptConditional = (then: Joi.Schema) =>
   Joi.any().when('RECEIPT_MEDIA_ENABLED', {
     is: true,
@@ -185,6 +250,11 @@ export const envValidationSchema = Joi.object({
       .max(RECEIPT_MAX_ATTACH_TIMEOUT_MS)
       .less(RECEIPT_LEASE_MS_VALUE)
       .required(),
+  ),
+  // WU1C2B1 capability keyring + active version membership.
+  RECEIPT_CAPABILITY_KEYS: receiptConditional(receiptCapabilityKeysSchema),
+  RECEIPT_CAPABILITY_ACTIVE_VERSION: receiptConditional(
+    receiptCapabilityActiveVersionSchema,
   ),
 })
   .custom((value: Record<string, unknown>, helpers) => {

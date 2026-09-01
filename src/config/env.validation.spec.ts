@@ -451,6 +451,10 @@ describe('envValidationSchema', () => {
       RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
       RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
       CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
+      // WU1C2B1: versioned keyring v1=32-byte "A" key, v2=32-byte "B" key; active=v2.
+      RECEIPT_CAPABILITY_KEYS:
+        '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=,2:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=',
+      RECEIPT_CAPABILITY_ACTIVE_VERSION: '2',
     };
 
     // ─── Disabled permissiveness ───────────────────────────────────────
@@ -470,6 +474,15 @@ describe('envValidationSchema', () => {
           ...validEnv,
           RECEIPT_MEDIA_ENABLED: 'false',
           META_MEDIA_ALLOWED_HOSTS: 'http://example.com:443/path',
+        },
+      ],
+      [
+        'enabled=false with malformed capability keyring + active version',
+        {
+          ...validEnv,
+          RECEIPT_MEDIA_ENABLED: 'false',
+          RECEIPT_CAPABILITY_KEYS: 'not-a-keyring',
+          RECEIPT_CAPABILITY_ACTIVE_VERSION: 'not-an-int',
         },
       ],
     ];
@@ -498,6 +511,8 @@ describe('envValidationSchema', () => {
       'RECEIPT_STORAGE_ACCESS_KEY_ID',
       'RECEIPT_STORAGE_SECRET_ACCESS_KEY',
       'RECEIPT_MEDIA_PUBLIC_BASE_URL',
+      'RECEIPT_CAPABILITY_KEYS',
+      'RECEIPT_CAPABILITY_ACTIVE_VERSION',
     ];
     it.each(enabledRequiredFields)(
       'rejects enabled with missing %s',
@@ -720,6 +735,95 @@ describe('envValidationSchema', () => {
       'accepts numeric boundary: %s',
       (_label, overrides) => {
         const env = { ...enabledBase, ...overrides };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(error).toBeUndefined();
+      },
+    );
+
+    // WU1C2B1: comma-separated version:base64 with unique positive versions; canonical base64 keys (RFC 4648 §4) >=32 bytes; active must be a member.
+    const INVALID_KEYRING_32A = 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=';
+    const INVALID_KEYRING_32B = 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=';
+    const KEYRING_TOO_SHORT_31 = 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==';
+    const KEY_WITH_INTERNAL_WS = `1:QUFB QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=`;
+    const KEY_DUP_VERSIONS = `1:${INVALID_KEYRING_32A},1:${INVALID_KEYRING_32B}`;
+    const hasFieldError = (err: unknown, field: string): boolean => {
+      const d = (err as { details?: Array<{ path: Array<string | number> }> })
+        ?.details;
+      return !!d?.some((p) => p.path.includes(field));
+    };
+
+    const invalidKeyringCases: Array<[string, string]> = [
+      ['only colon', ':'],
+      ['missing colon', `1${INVALID_KEYRING_32A}`],
+      ['empty version', `:${INVALID_KEYRING_32A}`],
+      ['non-integer version', `abc:${INVALID_KEYRING_32A}`],
+      ['zero version', `0:${INVALID_KEYRING_32A}`],
+      ['negative version', `-1:${INVALID_KEYRING_32A}`],
+      ['decimal version', `1.5:${INVALID_KEYRING_32A}`],
+      ['leading zero version', `01:${INVALID_KEYRING_32A}`],
+      ['empty base64', '1:'],
+      ['non-base64 alphabet', `1:${'@'.repeat(44)}`],
+      ['whitespace around entry', ` 1:${INVALID_KEYRING_32A}`],
+      ['internal whitespace in key', KEY_WITH_INTERNAL_WS],
+      ['length not multiple of 4', '1:QUFB'],
+      ['31-byte key (too short)', `1:${KEYRING_TOO_SHORT_31}`],
+      ['duplicate version', KEY_DUP_VERSIONS],
+      ['trailing comma', `1:${INVALID_KEYRING_32A},`],
+      ['leading comma', `,1:${INVALID_KEYRING_32A}`],
+      ['double comma', `1:${INVALID_KEYRING_32A},,2:${INVALID_KEYRING_32B}`],
+    ];
+    it.each(invalidKeyringCases)(
+      'rejects enabled with malformed RECEIPT_CAPABILITY_KEYS: %s',
+      (_label, keys) => {
+        const env = { ...enabledBase, RECEIPT_CAPABILITY_KEYS: keys };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(hasFieldError(error, 'RECEIPT_CAPABILITY_KEYS')).toBe(true);
+      },
+    );
+
+    const invalidActiveVersionCases: Array<[string, string, string]> = [
+      ['zero active version', '0', `1:${INVALID_KEYRING_32A}`],
+      ['negative active version', '-1', `1:${INVALID_KEYRING_32A}`],
+      ['non-integer active version', 'abc', `1:${INVALID_KEYRING_32A}`],
+      ['non-member active version', '99', `1:${INVALID_KEYRING_32A}`],
+    ];
+    it.each(invalidActiveVersionCases)(
+      'rejects enabled with %s',
+      (_label, active, keys) => {
+        const env = {
+          ...enabledBase,
+          RECEIPT_CAPABILITY_KEYS: keys,
+          RECEIPT_CAPABILITY_ACTIVE_VERSION: active,
+        };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(hasFieldError(error, 'RECEIPT_CAPABILITY_ACTIVE_VERSION')).toBe(
+          true,
+        );
+      },
+    );
+
+    const KEY_V1_V2 = `1:${INVALID_KEYRING_32A},2:${INVALID_KEYRING_32B}`;
+    const HUGE_KEYRING = `1:${INVALID_KEYRING_32A},9007199254740992:${INVALID_KEYRING_32B},9007199254740993:${INVALID_KEYRING_32A}`;
+    const validKeyringCases: Array<[string, string, string]> = [
+      ['single 32-byte key, active=v1', `1:${INVALID_KEYRING_32A}`, '1'],
+      ['two 32-byte keys, active=v2', KEY_V1_V2, '2'],
+      ['huge versions, active=lower', HUGE_KEYRING, '9007199254740992'],
+      ['huge versions, active=higher', HUGE_KEYRING, '9007199254740993'],
+    ];
+    it.each(validKeyringCases)(
+      'accepts enabled keyring: %s',
+      (_label, keys, active) => {
+        const env = {
+          ...enabledBase,
+          RECEIPT_CAPABILITY_KEYS: keys,
+          RECEIPT_CAPABILITY_ACTIVE_VERSION: active,
+        };
         const { error } = envValidationSchema.validate(env, {
           abortEarly: false,
         });
