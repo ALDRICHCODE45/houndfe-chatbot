@@ -3,6 +3,59 @@ import * as Joi from 'joi';
 export const META_GRAPH_API_BASE_URL_DEFAULT =
   'https://graph.facebook.com/v23.0';
 
+// ─── Receipt-media helpers (WU1C1) ─────────────────────────────────────────
+// Local field-level helpers for the conditional receipt-media foundation.
+// The base schema is `Joi.any()` so the `.when(...)` branch is a complete
+// replacement; applying a typed base (`Joi.boolean()` etc.) would validate
+// the value before the branch could decide permissiveness.
+const RECEIPT_MAX_BYTES_VALUE = 10_485_760;
+
+const httpsUrlSchema = Joi.string()
+  .uri({ scheme: ['https'] })
+  .required();
+
+const receiptMediaHostsSchema = Joi.string()
+  .required()
+  .custom((value: unknown, helpers) => {
+    if (typeof value !== 'string') {
+      return helpers.error('any.invalid');
+    }
+    const labels = value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (labels.length === 0) {
+      return helpers.error('any.invalid');
+    }
+    // RFC 1123 hostname label: alphanum, internal hyphens allowed,
+    // no leading/trailing hyphen. Total length <=253, each label <=63.
+    const labelRe = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+    for (const raw of labels) {
+      // Reject protocol, userinfo, port, path, query, fragment.
+      if (/[:/?#@]/.test(raw)) {
+        return helpers.error('any.invalid');
+      }
+      const normalized = raw.startsWith('.') ? raw.slice(1) : raw;
+      if (normalized.length === 0 || normalized.length > 253) {
+        return helpers.error('any.invalid');
+      }
+      const parts = normalized.split('.');
+      for (const part of parts) {
+        if (part.length === 0 || part.length > 63 || !labelRe.test(part)) {
+          return helpers.error('any.invalid');
+        }
+      }
+    }
+    return value;
+  }, 'meta media allowed hosts');
+
+const receiptConditional = (then: Joi.Schema) =>
+  Joi.any().when('RECEIPT_MEDIA_ENABLED', {
+    is: true,
+    then,
+    otherwise: Joi.any(),
+  });
+
 /**
  * Joi validation schema for all required environment variables.
  *
@@ -79,8 +132,30 @@ export const envValidationSchema = Joi.object({
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),
   DB_POOL_MAX: Joi.number().integer().min(1).default(5),
+
+  // ─── Receipt media slice (WU1C1 conditional foundation) ───────────
+  // `RECEIPT_MEDIA_ENABLED` is the kill-switch (defaults to false).
+  // All other receipt fields are conditionally permissive via
+  // `receiptConditional`: when enabled, strict schemas validate;
+  // when disabled or missing, the field is `Joi.any()`. The base
+  // MUST stay `Joi.any()` so the when-branch fully replaces it.
+  RECEIPT_MEDIA_ENABLED: Joi.boolean().default(false),
+  RECEIPT_MEDIA_MAX_BYTES: receiptConditional(
+    Joi.number().integer().valid(RECEIPT_MAX_BYTES_VALUE).required(),
+  ),
+  META_MEDIA_ALLOWED_HOSTS: receiptConditional(receiptMediaHostsSchema),
+  RECEIPT_STORAGE_ENDPOINT: receiptConditional(httpsUrlSchema),
+  RECEIPT_STORAGE_REGION: receiptConditional(Joi.string().required()),
+  RECEIPT_STORAGE_BUCKET: receiptConditional(Joi.string().required()),
+  RECEIPT_STORAGE_ACCESS_KEY_ID: receiptConditional(Joi.string().required()),
+  RECEIPT_STORAGE_SECRET_ACCESS_KEY: receiptConditional(
+    Joi.string().required(),
+  ),
+  RECEIPT_STORAGE_FORCE_PATH_STYLE: receiptConditional(Joi.boolean()),
+  RECEIPT_MEDIA_PUBLIC_BASE_URL: receiptConditional(httpsUrlSchema),
+  RECEIPT_MEDIA_METRICS_ENABLED: receiptConditional(Joi.boolean()),
 })
-  .custom((value, helpers) => {
+  .custom((value: Record<string, unknown>, helpers) => {
     const enabled = value.HUMAN_HANDOFF_ENABLED !== false;
     const ops = value.OPS_CHANNEL_PHONE;
     if (enabled && (typeof ops !== 'string' || ops.length === 0)) {

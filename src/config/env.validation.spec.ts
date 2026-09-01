@@ -425,4 +425,217 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
   });
+
+  // ─── WU1C1: Receipt media conditional validation foundation ─────────────
+  // Disabled (default) MUST be permissive; enabled MUST strictly validate
+  // the listed receipt-media fields. One compact describe block, table-driven.
+  describe('RECEIPT_MEDIA_* conditional foundation (WU1C1)', () => {
+    const enabledBase = {
+      ...validEnv,
+      RECEIPT_MEDIA_ENABLED: 'true',
+      RECEIPT_MEDIA_MAX_BYTES: '10485760',
+      META_MEDIA_ALLOWED_HOSTS: 'graph.facebook.com,.meta.com',
+      RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
+      RECEIPT_STORAGE_REGION: 'us-east-1',
+      RECEIPT_STORAGE_BUCKET: 'houndfe-receipts',
+      RECEIPT_STORAGE_ACCESS_KEY_ID: 'AKIAEXAMPLE',
+      RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'redacted-secret-value',
+      RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
+    };
+
+    // ─── Disabled permissiveness ───────────────────────────────────────
+    const disabledCases: Array<[string, Record<string, unknown>]> = [
+      ['no receipt fields at all', { ...validEnv }],
+      [
+        'enabled=false with malformed max bytes',
+        {
+          ...validEnv,
+          RECEIPT_MEDIA_ENABLED: 'false',
+          RECEIPT_MEDIA_MAX_BYTES: 'not-an-int',
+        },
+      ],
+      [
+        'enabled=false with malformed allowed hosts',
+        {
+          ...validEnv,
+          RECEIPT_MEDIA_ENABLED: 'false',
+          META_MEDIA_ALLOWED_HOSTS: 'http://example.com:443/path',
+        },
+      ],
+    ];
+    it.each(disabledCases)('disabled accepts: %s', (_label, env) => {
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    // ─── Valid enabled fixture ─────────────────────────────────────────
+    it('accepts a complete valid enabled environment', () => {
+      const { error } = envValidationSchema.validate(enabledBase, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    // ─── Missing required enabled fields ──────────────────────────────
+    const enabledRequiredFields = [
+      'RECEIPT_MEDIA_MAX_BYTES',
+      'META_MEDIA_ALLOWED_HOSTS',
+      'RECEIPT_STORAGE_ENDPOINT',
+      'RECEIPT_STORAGE_REGION',
+      'RECEIPT_STORAGE_BUCKET',
+      'RECEIPT_STORAGE_ACCESS_KEY_ID',
+      'RECEIPT_STORAGE_SECRET_ACCESS_KEY',
+      'RECEIPT_MEDIA_PUBLIC_BASE_URL',
+    ];
+    it.each(enabledRequiredFields)(
+      'rejects enabled with missing %s',
+      (field) => {
+        const env: Record<string, unknown> = { ...enabledBase };
+        delete env[field];
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(error).toBeDefined();
+        expect(error!.details.some((d) => d.path.includes(field))).toBe(true);
+      },
+    );
+    it.each(enabledRequiredFields)('rejects enabled with empty %s', (field) => {
+      const env = { ...enabledBase, [field]: '' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(error!.details.some((d) => d.path.includes(field))).toBe(true);
+    });
+
+    // ─── Exact max bytes ──────────────────────────────────────────────
+    it.each(['10485759', '10485761', '0', 'abc'])(
+      'rejects RECEIPT_MEDIA_MAX_BYTES=%s',
+      (value) => {
+        const env = { ...enabledBase, RECEIPT_MEDIA_MAX_BYTES: value };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(error).toBeDefined();
+      },
+    );
+    it('accepts RECEIPT_MEDIA_MAX_BYTES=10485760 exactly', () => {
+      const env = { ...enabledBase, RECEIPT_MEDIA_MAX_BYTES: '10485760' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    // ─── HTTPS-only URLs ──────────────────────────────────────────────
+    const urlFields = [
+      'RECEIPT_STORAGE_ENDPOINT',
+      'RECEIPT_MEDIA_PUBLIC_BASE_URL',
+    ];
+    it.each(urlFields)('rejects http:// scheme for %s', (field) => {
+      const env = { ...enabledBase, [field]: 'http://example.com' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+    it.each(urlFields)('rejects malformed %s', (field) => {
+      const env = { ...enabledBase, [field]: 'not-a-url' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    // ─── Host labels: exact vs leading-dot suffix vs malformed ────────
+    const acceptedHosts = [
+      'graph.facebook.com',
+      '.meta.com',
+      'a.b.c.example.com',
+      'sub.example.com,.suffix.example',
+      'localhost',
+    ];
+    const rejectedHosts = [
+      'https://example.com',
+      'example.com:443',
+      'user@example.com',
+      'example.com/path',
+      '-bad.example.com',
+      'example..com',
+      'invalid*char.example.com',
+      '',
+      '.',
+      'example.com.',
+      'a-.example.com',
+    ];
+    it.each(acceptedHosts)('accepts META_MEDIA_ALLOWED_HOSTS=%s', (value) => {
+      const env = { ...enabledBase, META_MEDIA_ALLOWED_HOSTS: value };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+    it.each(rejectedHosts)('rejects META_MEDIA_ALLOWED_HOSTS=%s', (value) => {
+      const env = { ...enabledBase, META_MEDIA_ALLOWED_HOSTS: value };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    // ─── Booleans: canonical vs arbitrary vs empty ─────────────────────
+    const booleanFields = [
+      'RECEIPT_STORAGE_FORCE_PATH_STYLE',
+      'RECEIPT_MEDIA_METRICS_ENABLED',
+    ];
+    it.each(['true', 'false'] as const)(
+      'accepts %s canonical booleans',
+      (value) => {
+        for (const field of booleanFields) {
+          const env = { ...enabledBase, [field]: value };
+          const { error } = envValidationSchema.validate(env, {
+            abortEarly: false,
+          });
+          expect(error).toBeUndefined();
+        }
+      },
+    );
+    it.each(booleanFields)('rejects empty %s', (field) => {
+      const env = { ...enabledBase, [field]: '' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+    it.each(booleanFields)('rejects arbitrary value for %s', (field) => {
+      const env = { ...enabledBase, [field]: 'yes' };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    // ─── Existing & multi-field regression ────────────────────────────
+    it('preserves existing validEnv compatibility', () => {
+      const { error } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+    it('does not interpolate the storage secret in validation errors', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_STORAGE_ENDPOINT: 'not-a-url',
+        RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'super-secret-sentinel',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      const allText = error!.details.map((d) => d.message).join(' | ');
+      expect(allText).not.toContain('super-secret-sentinel');
+    });
+  });
 });
