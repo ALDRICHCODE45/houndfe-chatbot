@@ -1,6 +1,12 @@
 import { execSync } from 'node:child_process';
 import type { PoolClient } from 'pg';
 import { Pool } from 'pg';
+import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
+import type {
+  OutboxIntentInput,
+  ReservationOutcome,
+  ReserveInput,
+} from '../domain/receipt-media-store.port';
 import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
@@ -163,6 +169,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
   let container: StartedPostgreSqlContainer;
   let pool: Pool;
+  let store: PostgresReceiptMediaStore;
 
   const migrate = (args: string) =>
     execSync(`pnpm ${args}`, {
@@ -176,6 +183,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     delete process.env.DB_POOL_MAX;
     migrate('migrate');
     pool = new Pool({ connectionString: container.getConnectionUri() });
+    store = new PostgresReceiptMediaStore(pool);
   });
 
   afterAll(async () => {
@@ -666,6 +674,119 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     );
     expect(rows[0]).toMatchObject({ a: true, b: true });
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+  });
+
+  // --- WU2B1 reservation arbitration and intent dedupe (RM1, RM3) ---
+
+  describe('WU2B1 reservation arbitration and intent dedupe', () => {
+    beforeEach(async () => {
+      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    });
+
+    const reserveInput = (over: Row = {}): ReserveInput => ({
+      id: UUID_A,
+      webhookMessageId: 'wamid.r1',
+      providerMediaId: 'media.r1',
+      senderId: 'sender.r1',
+      capturedSaleId: UUID_B,
+      objectKey: `receipts/${UUID_A}`,
+      ...over,
+    });
+
+    const rivalInput = (over: Row = {}): ReserveInput =>
+      reserveInput({ id: UUID_B, objectKey: `receipts/${UUID_B}`, ...over });
+
+    it('reserves with declared MIME and replays the exact webhook once', async () => {
+      const first = await store.reserve(
+        reserveInput({ declaredMimeType: 'image/jpeg' }),
+      );
+      if (first.kind !== 'created') throw new Error('expected created');
+      expect(first.receipt.declaredMimeType).toBe('image/jpeg');
+      const replay = await store.reserve(reserveInput());
+      if (replay.kind !== 'webhook-replayed')
+        throw new Error('expected replay');
+      expect(replay.receipt.id).toBe(first.receipt.id);
+    });
+
+    it('rethrows unrelated constraint violations', async () => {
+      await store.reserve(reserveInput());
+      await expect(
+        store.reserve(
+          rivalInput({
+            webhookMessageId: 'wamid.x',
+            providerMediaId: 'media.x',
+            senderId: 'sender.x',
+            objectKey: `receipts/${UUID_A}`,
+          }),
+        ),
+      ).rejects.toThrow();
+    });
+
+    it('parameter-binds adversarial values without altering SQL structure', async () => {
+      const nasty = "wamid'); DROP TABLE receipt_media;--";
+      const out = await store.reserve(
+        reserveInput({ webhookMessageId: nasty }),
+      );
+      if (out.kind !== 'created') throw new Error('expected created');
+      expect(out.receipt.webhookMessageId).toBe(nasty);
+    });
+
+    it.each<[Row, ReservationOutcome['kind']]>([
+      [{}, 'webhook-replayed'],
+      [{ webhookMessageId: 'wamid.r2' }, 'provider-media-reused'],
+      [{ providerMediaId: 'media.r2' }, 'webhook-media-conflict'],
+      [
+        { webhookMessageId: 'wamid.r2', providerMediaId: 'media.r2' },
+        'sender-active',
+      ],
+    ])('concurrently classifies %j', async (over, kind) => {
+      const rival = rivalInput(over);
+      const [x, y] = await Promise.all([
+        store.reserve(reserveInput()),
+        store.reserve(rival),
+      ]);
+      expect([x.kind, y.kind].sort()).toEqual(['created', kind]);
+      const { rows } = await pool.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM receipt_media',
+      );
+      expect(rows[0].n).toBe(1);
+    });
+
+    const outboxInput = (over: Partial<OutboxIntentInput> = {}) => ({
+      dedupeKey: 'dk.r1',
+      receiptMediaId: null,
+      receiptStateVersion: null,
+      sourceWebhookMessageId: 'wamid.r1',
+      recipientId: 'sender.r1',
+      templateKey: 'RECEIPT_AMOUNT_PROMPT' as const,
+      templateArgs: { cents: 1250 },
+      ...over,
+    });
+
+    it('dedupes repeated keys, supporting nullable receipt linkage', async () => {
+      const first = await store.insertOutboxIntent(outboxInput());
+      expect(first.created).toBe(true);
+      expect(first.intent).toMatchObject({
+        status: 'PENDING',
+        receiptMediaId: null,
+      });
+      const replay = await store.insertOutboxIntent(
+        outboxInput({ templateArgs: { cents: 999 } }),
+      );
+      expect(replay.created).toBe(false);
+      expect(replay.intent.id).toBe(first.intent.id);
+      expect(replay.intent.templateArgs).toEqual({ cents: 1250 });
+    });
+
+    it('returns the same original id and payload for concurrent duplicate keys', async () => {
+      const [x, y] = await Promise.all([
+        store.insertOutboxIntent(outboxInput()),
+        store.insertOutboxIntent(outboxInput()),
+      ]);
+      expect(x.intent.id).toBe(y.intent.id);
+      expect(x.intent.templateArgs).toEqual(y.intent.templateArgs);
+      expect([x.created, y.created].sort()).toEqual([false, true]);
+    });
   });
 
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
