@@ -50,6 +50,74 @@ const outboxRow = (over: Row = {}): Row => ({
   ...over,
 });
 
+// --- WU2A2A cross-field lifecycle/evidence/lease fixtures (RM1, RM3) ---
+const T0 = new Date('2025-01-01T00:00:00Z');
+const downloadEvidence: Row = {
+  downloaded_at: T0,
+  response_mime_type: 'image/jpeg',
+  detected_mime_type: 'image/jpeg',
+  byte_count: 1024,
+  content_sha256: Buffer.alloc(32, 1),
+};
+const acceptedEvidence: Row = {
+  stored_at: T0,
+  object_etag: 'etag.core',
+  capability_token_hash: Buffer.alloc(32, 2),
+  capability_key_version: 1,
+  capability_issued_at: T0,
+};
+const attachEvidence: Row = {
+  attach_started_at: T0,
+  attach_attempts: 1,
+  attach_attempt_id: UUID_B,
+  attach_request_started_at: T0,
+};
+const downstreamStatuses =
+  'STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING ATTACHED CANCELLED ATTACH_OUTCOME_UNKNOWN'.split(
+    ' ',
+  );
+
+const lifeRow = (status: string, stage: string | null, over: Row = {}): Row => {
+  const definite = stage === 'ATTACH_DEFINITE';
+  const row: Row = { status, failure_stage: stage };
+  if (
+    status === 'DOWNLOADED' ||
+    downstreamStatuses.includes(status) ||
+    definite
+  )
+    Object.assign(row, downloadEvidence);
+  if (downstreamStatuses.includes(status) || definite)
+    Object.assign(row, acceptedEvidence);
+  if (
+    [
+      'AWAITING_CONFIRMATION',
+      'ATTACHING',
+      'ATTACHED',
+      'ATTACH_OUTCOME_UNKNOWN',
+    ].includes(status) ||
+    definite
+  )
+    row.declared_amount_cents = 1250;
+  if (status === 'ATTACHING') row.attach_started_at = T0;
+  if (['ATTACHED', 'ATTACH_OUTCOME_UNKNOWN'].includes(status) || definite)
+    Object.assign(row, attachEvidence);
+  if (status === 'ATTACHED')
+    Object.assign(row, {
+      backend_receipt_id: UUID_B,
+      backend_receipt_status: 'PENDING',
+      attached_at: T0,
+    });
+  if (status === 'ATTACH_OUTCOME_UNKNOWN')
+    Object.assign(row, {
+      attach_outcome_observed_at: T0,
+      attach_http_status: 408,
+    });
+  if (stage === 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE')
+    Object.assign(row, downloadEvidence);
+  if (definite) row.attach_http_status = 400;
+  return receiptRow({ ...row, ...over });
+};
+
 // [column, data_type, is_nullable] triplets; compared as an order-insensitive
 // multiset against information_schema (timestamptz is normalized).
 const RECEIPT_MEDIA_COLUMNS = `
@@ -259,30 +327,30 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
   it.each([
     ['status', 'PARKED', false],
-    ['status', 'ATTACH_OUTCOME_UNKNOWN', true],
+    ['status', 'ATTACH_OUTCOME_UNKNOWN', false],
     ['declared_mime_type', 'image/gif', false],
     ['declared_mime_type', 'image/jpeg', true],
     ['response_mime_type', 'image/gif', false],
-    ['response_mime_type', 'image/png', true],
+    ['response_mime_type', 'image/png', false],
     ['detected_mime_type', 'image/gif', false],
     ['failure_stage', 'REBOOT', false],
-    ['failure_stage', 'MEDIA_VALIDATION_PRE_STORAGE', true],
+    ['failure_stage', 'MEDIA_VALIDATION_PRE_STORAGE', false],
     ['backend_receipt_status', 'APPROVED', false],
-    ['backend_receipt_status', 'PENDING', true],
+    ['backend_receipt_status', 'PENDING', false],
     ['reconciliation_disposition', 'MAYBE', false],
     ['reconciliation_disposition', 'UNRESOLVED', true],
     ['byte_count', 0, false],
-    ['byte_count', 1, true],
-    ['byte_count', 10_485_760, true],
+    ['byte_count', 1, false],
+    ['byte_count', 10_485_760, false],
     ['byte_count', 10_485_761, false],
     ['provider_declared_bytes', 0, false],
     ['provider_declared_bytes', 10_485_761, false],
     ['capability_key_version', 0, false],
-    ['capability_key_version', 1, true],
+    ['capability_key_version', 1, false],
     ['declared_amount_cents', 0, false],
     ['declared_amount_cents', 1, true],
     ['attach_attempts', 2, false],
-    ['attach_attempts', 1, true],
+    ['attach_attempts', 1, false],
     ['meta_attempts', -1, false],
     ['meta_attempts', 4, false],
     ['meta_attempts', 3, true],
@@ -293,9 +361,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   });
 
   it.each([
-    ['content_sha256', 32, true],
+    ['content_sha256', 32, false],
     ['content_sha256', 31, false],
-    ['capability_token_hash', 32, true],
+    ['capability_token_hash', 32, false],
     ['capability_token_hash', 31, false],
   ])('%s enforces its 32-byte length (%d)', async (col, len, ok) => {
     await expectInserts([
@@ -314,6 +382,140 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     await expectInserts([
       ['receipt_media_outbox', outboxRow({ [col]: value }), ok],
     ]);
+  });
+
+  // --- WU2A2A cross-field lifecycle/evidence/lease predicates (RM1, RM3) ---
+
+  type InsertCase = [string, string, Row, boolean];
+  const receiptCase = (
+    label: string,
+    status: string,
+    stage: string | null,
+    over: Row,
+    ok: boolean,
+  ): InsertCase => [label, 'receipt_media', lifeRow(status, stage, over), ok];
+
+  const validStates: Array<[string, string | null]> = [
+    ...'RESERVED DOWNLOADED'.split(' ').map((s) => [s, null] as [string, null]),
+    ...downstreamStatuses.map((s) => [s, null] as [string, null]),
+    ...RECEIPT_FAILURE_STAGES.map(
+      (stage) => ['FAILED', stage] as [string, string],
+    ),
+  ];
+  const invalidReceipts: Array<[string, string, string | null, Row]> = [
+    ['no object pre-store', 'RESERVED', null, acceptedEvidence],
+    ['object required', 'STORED', null, { object_etag: null }],
+    ['bytes required', 'DOWNLOADED', null, { byte_count: null }],
+    ['no download early', 'RESERVED', null, { downloaded_at: T0 }],
+    ['amount blocked', 'AWAITING_AMOUNT', null, { declared_amount_cents: 100 }],
+    ['amount required', 'ATTACHING', null, { declared_amount_cents: null }],
+    ['start required', 'ATTACHING', null, { attach_started_at: null }],
+    ['request id paired', 'ATTACHED', null, { attach_attempt_id: null }],
+    ['no request early', 'STORED', null, { attach_attempt_id: UUID_B }],
+    ['backend id required', 'ATTACHED', null, { backend_receipt_id: null }],
+    [
+      'no success errors',
+      'ATTACHED',
+      null,
+      { last_error_category: 'TRANSPORT' },
+    ],
+    [
+      'definite no 500',
+      'FAILED',
+      'ATTACH_DEFINITE',
+      { attach_http_status: 500 },
+    ],
+    [
+      'definite no backend',
+      'FAILED',
+      'ATTACH_DEFINITE',
+      { backend_receipt_status: 'PENDING' },
+    ],
+    [
+      'unknown no 400',
+      'ATTACH_OUTCOME_UNKNOWN',
+      null,
+      { attach_http_status: 400 },
+    ],
+    [
+      'unknown observed',
+      'ATTACH_OUTCOME_UNKNOWN',
+      null,
+      { attach_outcome_observed_at: null },
+    ],
+    ['cleanup after object', 'STORED', null, { cleanup_pending: true }],
+    ['failed staged', 'FAILED', null, {}],
+    ['nonfailed unstaged', 'RESERVED', 'META_EXHAUSTED_PRE_STORAGE', {}],
+  ];
+  const validReceipts: Array<[string, string, string | null, Row]> = [
+    ['pre-request ok', 'ATTACHING', null, {}],
+    ['request ok', 'ATTACHING', null, attachEvidence],
+    [
+      'definite 429 ok',
+      'FAILED',
+      'ATTACH_DEFINITE',
+      { attach_http_status: 429 },
+    ],
+    [
+      'unknown code ok',
+      'ATTACH_OUTCOME_UNKNOWN',
+      null,
+      { attach_http_status: null, attach_transport_code: 'TIMEOUT' },
+    ],
+    [
+      'cleanup pre-store ok',
+      'FAILED',
+      'MEDIA_VALIDATION_PRE_STORAGE',
+      { cleanup_pending: true },
+    ],
+  ];
+
+  it.each<InsertCase>([
+    ...validStates.map(([s, st]) =>
+      receiptCase(`valid ${s}/${st}`, s, st, {}, true),
+    ),
+    ...invalidReceipts.map(([label, s, st, over]) =>
+      receiptCase(label, s, st, over, false),
+    ),
+    ...validReceipts.map(([label, s, st, over]) =>
+      receiptCase(label, s, st, over, true),
+    ),
+    [
+      'media lease ok',
+      'receipt_media',
+      receiptRow({ lease_owner: 'worker-1', lease_expires_at: T0 }),
+      true,
+    ],
+    [
+      'media lease bad',
+      'receipt_media',
+      receiptRow({ lease_owner: 'worker-1' }),
+      false,
+    ],
+    [
+      'outbox lease ok',
+      'receipt_media_outbox',
+      outboxRow({ lease_owner: 'worker-2', lease_expires_at: T0 }),
+      true,
+    ],
+    [
+      'outbox lease bad',
+      'receipt_media_outbox',
+      outboxRow({ lease_expires_at: T0 }),
+      false,
+    ],
+  ])('%s', async (_label, table, row, ok) => {
+    await expectInserts([[table, row, ok]]);
+  });
+
+  it('defers partial indexes and non-empty down guards to WU2A2B', async () => {
+    const { rows } = await pool.query<{ indpred: string | null }>(
+      `SELECT i.indpred::text AS indpred
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+         WHERE c.relname LIKE 'receipt_media%'`,
+    );
+    expect(rows.every((r) => r.indpred === null)).toBe(true);
   });
 
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {

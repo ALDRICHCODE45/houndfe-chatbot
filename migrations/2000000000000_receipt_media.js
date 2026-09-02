@@ -74,6 +74,95 @@ const ATTEMPTS_0_3_CHECK = 'attempts BETWEEN 0 AND 3';
 
 const NOW = (pgm) => pgm.func('now()');
 
+// WU2A2A cross-field predicates: exact set membership, no ordering.
+const implies = (a, b) => `(NOT (${a}) OR (${b}))`;
+const DEFINITE =
+  "status = 'FAILED' AND failure_stage IS NOT DISTINCT FROM 'ATTACH_DEFINITE'";
+const words = (text) => text.split(' ');
+const oneOfStatus = (values) => oneOf('status', values);
+const allSet = (cols) => cols.map((c) => `${c} IS NOT NULL`).join(' AND ');
+const allClear = (cols) => cols.map((c) => `${c} IS NULL`).join(' AND ');
+
+const OBJECT_COLS = words(
+  'stored_at object_etag capability_token_hash capability_key_version capability_issued_at',
+);
+const DOWNLOAD_COLS = words(
+  'downloaded_at response_mime_type detected_mime_type byte_count content_sha256',
+);
+const ATTACH_COLS = words(
+  'attach_started_at attach_attempt_id attach_request_started_at',
+);
+const DOWNSTREAM = words(
+  'STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING ATTACHED CANCELLED ATTACH_OUTCOME_UNKNOWN',
+);
+
+const ACCEPTED_OBJECT = `(${oneOfStatus(DOWNSTREAM)} OR (${DEFINITE}))`;
+const HAS_DOWNLOAD = `(${oneOfStatus(['DOWNLOADED', ...DOWNSTREAM])} OR COALESCE(failure_stage IN ('STORAGE_EXHAUSTED_PRE_ACCEPTANCE', 'ATTACH_DEFINITE'), false))`;
+const NEEDS_AMOUNT = `(${oneOfStatus(words('AWAITING_CONFIRMATION ATTACHING ATTACHED ATTACH_OUTCOME_UNKNOWN'))} OR (${DEFINITE}))`;
+const ATTACH_TERMINAL = `(${oneOfStatus(words('ATTACHED ATTACH_OUTCOME_UNKNOWN'))} OR (${DEFINITE}))`;
+const PRE_ATTACH = `(NOT (${ATTACH_TERMINAL}) AND status <> 'ATTACHING')`;
+
+const CHECKS = [
+  [
+    'receipt_media_accepted_object_evidence',
+    `${implies(ACCEPTED_OBJECT, allSet(OBJECT_COLS))} AND ${implies(
+      `NOT ${ACCEPTED_OBJECT}`,
+      allClear(OBJECT_COLS),
+    )}`,
+  ],
+  [
+    'receipt_media_download_evidence',
+    `${implies(HAS_DOWNLOAD, allSet(DOWNLOAD_COLS))} AND ${implies(
+      `NOT ${HAS_DOWNLOAD}`,
+      allClear(DOWNLOAD_COLS),
+    )}`,
+  ],
+  [
+    'receipt_media_amount_evidence',
+    `${implies(NEEDS_AMOUNT, 'declared_amount_cents IS NOT NULL')} AND ${implies(
+      "status = 'AWAITING_AMOUNT'",
+      'declared_amount_cents IS NULL',
+    )}`,
+  ],
+  [
+    'receipt_media_request_start_evidence',
+    `${implies("status = 'ATTACHING'", `attach_started_at IS NOT NULL AND ((attach_attempts = 0 AND ${allClear(ATTACH_COLS.slice(1))}) OR (attach_attempts = 1 AND ${allSet(ATTACH_COLS.slice(1))}))`)} AND ${implies(ATTACH_TERMINAL, `attach_attempts = 1 AND ${allSet(ATTACH_COLS)}`)} AND ${implies(PRE_ATTACH, `attach_attempts = 0 AND ${allClear(ATTACH_COLS)}`)}`,
+  ],
+  [
+    'receipt_media_attached_success',
+    `${implies(
+      "status = 'ATTACHED'",
+      "backend_receipt_id IS NOT NULL AND backend_receipt_status = 'PENDING' AND attached_at IS NOT NULL AND last_error_category IS NULL AND last_error_code IS NULL AND attach_http_status IS NULL AND attach_transport_code IS NULL AND attach_outcome_observed_at IS NULL",
+    )} AND ${implies(
+      "status <> 'ATTACHED'",
+      'backend_receipt_status IS NULL AND attached_at IS NULL',
+    )}`,
+  ],
+  [
+    'receipt_media_definite_attach_failure',
+    `${implies(DEFINITE, 'backend_receipt_id IS NULL AND backend_receipt_status IS NULL AND cleanup_pending = false AND attach_http_status IN (400, 401, 403, 404, 409, 422, 429) AND attach_transport_code IS NULL AND attach_outcome_observed_at IS NULL')} AND ${implies("status = 'FAILED' AND failure_stage IS DISTINCT FROM 'ATTACH_DEFINITE'", 'backend_receipt_id IS NULL AND backend_receipt_status IS NULL AND attach_http_status IS NULL AND attach_transport_code IS NULL AND attach_outcome_observed_at IS NULL')}`,
+  ],
+  [
+    'receipt_media_unknown_attach_outcome',
+    implies(
+      "status = 'ATTACH_OUTCOME_UNKNOWN'",
+      'attach_outcome_observed_at IS NOT NULL AND backend_receipt_id IS NULL AND ((attach_http_status IS NOT NULL AND (attach_http_status < 200 OR attach_http_status > 299) AND attach_http_status NOT IN (400, 401, 403, 404, 409, 422, 429)) OR attach_transport_code IS NOT NULL)',
+    ),
+  ],
+  [
+    'receipt_media_cleanup_stage',
+    "cleanup_pending = false OR (status = 'FAILED' AND failure_stage IN ('MEDIA_VALIDATION_PRE_STORAGE', 'META_EXHAUSTED_PRE_STORAGE', 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'))",
+  ],
+  [
+    'receipt_media_failure_stage_iff_failed',
+    "(status = 'FAILED') = (failure_stage IS NOT NULL)",
+  ],
+  [
+    'receipt_media_paired_lease',
+    '(lease_owner IS NULL) = (lease_expires_at IS NULL)',
+  ],
+];
+
 exports.up = (pgm) => {
   pgm.createTable('receipt_media', {
     id: { type: 'uuid', primaryKey: true },
@@ -203,6 +292,14 @@ exports.up = (pgm) => {
     updated_at: { type: 'timestamptz', notNull: true, default: NOW(pgm) },
     sent_at: { type: 'timestamptz' },
   });
+
+  for (const [name, def] of CHECKS)
+    pgm.addConstraint('receipt_media', name, `CHECK (${def})`);
+  pgm.addConstraint(
+    'receipt_media_outbox',
+    'receipt_media_outbox_paired_lease',
+    'CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))',
+  );
 };
 
 exports.down = (pgm) => {
