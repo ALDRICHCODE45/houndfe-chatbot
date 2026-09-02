@@ -1,3 +1,5 @@
+import * as Joi from 'joi';
+
 import { envValidationSchema } from './env.validation';
 
 /**
@@ -850,6 +852,106 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
       const allText = error!.details.map((d) => d.message).join(' | ');
       expect(allText).not.toContain('super-secret-sentinel');
+    });
+
+    // ─── WU1C2B2: validation error redaction ───────────────────────────
+    // Two distinct sentinels are placed in credential-bearing and keyring-
+    // bearing fields and intentionally force a Joi failure on the same
+    // surface (URI for the endpoint, custom keyring parse). Every
+    // observable error projection — top-level message, detail/context
+    // serialization, and String(error) — MUST scrub both values before
+    // the error leaves the validation wrapper.
+    const STORAGE_CREDENTIAL_SENTINEL =
+      'wu1c2b2-storage-credential-sentinel-9af3';
+    const KEYRING_SENTINEL = 'wu1c2b2-keyring-sentinel-DEF456==';
+    const assertValidationErrorRedacted = (
+      error: Joi.ValidationError,
+    ): void => {
+      const detailsJson = JSON.stringify(error.details);
+      const stringified = String(error);
+      for (const sentinel of [STORAGE_CREDENTIAL_SENTINEL, KEYRING_SENTINEL]) {
+        expect(error.message).not.toContain(sentinel);
+        expect(detailsJson).not.toContain(sentinel);
+        expect(stringified).not.toContain(sentinel);
+      }
+    };
+
+    // Credential-only invalid: malformed URI carries the sentinel as its
+    // `context.value` (and the value sits inside `_original`). The
+    // keyring fields stay valid so the only failure path is the URI rule.
+    it('redacts credential value from invalid RECEIPT_STORAGE_ENDPOINT', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_STORAGE_ENDPOINT: STORAGE_CREDENTIAL_SENTINEL,
+        RECEIPT_STORAGE_ACCESS_KEY_ID: STORAGE_CREDENTIAL_SENTINEL,
+        RECEIPT_STORAGE_SECRET_ACCESS_KEY: STORAGE_CREDENTIAL_SENTINEL,
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      assertValidationErrorRedacted(error!);
+      // Field category is preserved for diagnostics.
+      expect(
+        error!.details.some((d) => d.path.includes('RECEIPT_STORAGE_ENDPOINT')),
+      ).toBe(true);
+    });
+
+    // Keyring-only invalid: forcing the keyring to be malformed surfaces
+    // the raw keyring sentinel through the custom throw and `_original`.
+    // The redaction must scrub both surfaces.
+    it('redacts keyring value from invalid RECEIPT_CAPABILITY_KEYS', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_CAPABILITY_KEYS: KEYRING_SENTINEL,
+        RECEIPT_CAPABILITY_ACTIVE_VERSION: KEYRING_SENTINEL,
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      assertValidationErrorRedacted(error!);
+    });
+
+    // Both invalid simultaneously: multi-error aggregation must scrub
+    // every detail independently — a single shared scrubber pass that
+    // only inspects the first detail would miss this case.
+    it('redacts both sentinels when credential and keyring fail together', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_STORAGE_ENDPOINT: STORAGE_CREDENTIAL_SENTINEL,
+        RECEIPT_STORAGE_SECRET_ACCESS_KEY: STORAGE_CREDENTIAL_SENTINEL,
+        RECEIPT_CAPABILITY_KEYS: KEYRING_SENTINEL,
+        RECEIPT_CAPABILITY_ACTIVE_VERSION: KEYRING_SENTINEL,
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      // Multi-error aggregation: at least one detail per failing field.
+      expect(
+        error!.details.some((d) => d.path.includes('RECEIPT_STORAGE_ENDPOINT')),
+      ).toBe(true);
+      expect(
+        error!.details.some((d) => d.path.includes('RECEIPT_CAPABILITY_KEYS')),
+      ).toBe(true);
+      assertValidationErrorRedacted(error!);
+    });
+
+    // Active-version-only invalid: the keyring parses fine but the
+    // active version is not a member, exercising a different throw site
+    // inside the same custom helper. The sentinel must still be scrubbed.
+    it('redacts sentinel passed as RECEIPT_CAPABILITY_ACTIVE_VERSION', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_CAPABILITY_KEYS: `1:${INVALID_KEYRING_32A}`,
+        RECEIPT_CAPABILITY_ACTIVE_VERSION: KEYRING_SENTINEL,
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      assertValidationErrorRedacted(error!);
     });
   });
 });

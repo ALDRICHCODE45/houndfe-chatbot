@@ -128,6 +128,42 @@ const receiptCapabilityActiveVersionSchema = Joi.string()
     return value;
   }, 'receipt capability active version');
 
+// WU1C2B2: scrub the failing field value from every place Joi may retain it.
+// Joi's built-in rules (`string.uri`, `string.pattern.base`, `string.empty`,
+// `any.required`, etc.) thread the original value into `details[*].context`,
+// and Joi itself keeps the full input under `error._original`. Both are
+// observable through `error.message`, `JSON.stringify(error.details)`, and
+// `String(error)`. Custom rules that re-throw with `helpers.error('any.custom')`
+// inherit the same retention surface. The redactor walks the validation error
+// in place so the schema can stay Joi-native while still guaranteeing that no
+// storage credential, keyring material, or other secret value ever leaves the
+// wrapper — the field `path` and `type` are kept for diagnostics.
+const stripContextValueRecursive = (node: unknown): void => {
+  if (!node || typeof node !== 'object') return;
+  const record = node as Record<string, unknown>;
+  if ('value' in record) {
+    delete record.value;
+  }
+  if ('error' in record) {
+    delete record.error;
+  }
+  for (const key of Object.keys(record)) {
+    stripContextValueRecursive(record[key]);
+  }
+};
+const redactValidationError = (error: Joi.ValidationError): void => {
+  // Joi retains the entire original input here; drop it so the secret-bearing
+  // originals never appear in logs or JSON serialization.
+  delete (error as { _original?: unknown })._original;
+  for (const detail of error.details) {
+    stripContextValueRecursive(detail.context);
+  }
+  // Rebuild the top-level message from redacted detail messages so any cached
+  // value interpolation (e.g., `string.pattern.base` includes the value text
+  // in the rendered message) is removed.
+  error.message = error.details.map((d) => d.message).join('. ');
+};
+
 const receiptConditional = (then: Joi.Schema) =>
   Joi.any().when('RECEIPT_MEDIA_ENABLED', {
     is: true,
@@ -159,7 +195,7 @@ const receiptConditional = (then: Joi.Schema) =>
  *                             digests and replies to them. Joi accepts an
  *                             optional leading `+` (E.164).
  */
-export const envValidationSchema = Joi.object({
+const innerEnvValidationSchema = Joi.object({
   META_VERIFY_TOKEN: Joi.string().required(),
   META_APP_SECRET: Joi.string().required(),
   META_ACCESS_TOKEN: Joi.string().required(),
@@ -282,3 +318,15 @@ export const envValidationSchema = Joi.object({
     return value;
   })
   .options({ allowUnknown: true });
+
+export type EnvValidationResult = Joi.ValidationResult;
+
+export const envValidationSchema = {
+  validate(env: unknown, options?: Joi.ValidationOptions): EnvValidationResult {
+    const result = innerEnvValidationSchema.validate(env, options);
+    if (result.error) {
+      redactValidationError(result.error);
+    }
+    return result;
+  },
+};
