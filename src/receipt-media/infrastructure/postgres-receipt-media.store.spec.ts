@@ -3,10 +3,12 @@ import type { PoolClient } from 'pg';
 import { Pool } from 'pg';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import type {
+  AttemptStartResult,
   LeaseFenceInput,
   OutboxIntentInput,
   ReservationOutcome,
   ReserveInput,
+  StatusCasInput,
 } from '../domain/receipt-media-store.port';
 import {
   PostgreSqlContainer,
@@ -826,7 +828,8 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     const state = (id: string) =>
       pool
         .query<Row>(
-          'SELECT version, lease_owner, lease_expires_at, ' +
+          'SELECT status, version, meta_attempts, storage_attempts, ' +
+            'lease_owner, lease_expires_at, ' +
             'extract(epoch FROM lease_expires_at - now()) AS lease_secs ' +
             'FROM receipt_media WHERE id = $1',
           [id],
@@ -951,7 +954,131 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       expect(await store.releaseLease(f)).toBe(false);
       expect((await state(stale.id)).version).toBe('2');
     });
+
+    // --- WU2B2B status CAS and bounded pre-call attempts (RM1, RM3) ---
+
+    describe('WU2B2B status CAS and bounded pre-call attempts', () => {
+      beforeEach(async () => {
+        await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      });
+
+      type Counter = 'meta' | 'storage';
+      const COL = { meta: 'meta_attempts', storage: 'storage_attempts' };
+      const cas = (
+        over: { id: string } & Partial<StatusCasInput>,
+      ): StatusCasInput => ({
+        owner: 'w1',
+        expectedStatus: 'STORED',
+        expectedVersion: '1',
+        nextStatus: 'AWAITING_AMOUNT',
+        ...over,
+      });
+      const start = (
+        counter: Counter,
+        f: LeaseFenceInput,
+      ): Promise<AttemptStartResult | null> =>
+        counter === 'meta'
+          ? store.startMetaAttempt(f)
+          : store.startStorageAttempt(f);
+      const expire = (id: string): Promise<unknown> =>
+        pool.query(
+          'UPDATE receipt_media SET lease_expires_at = ' +
+            "now() - interval '1s' WHERE id = $1",
+          [id],
+        );
+
+      it('transitions only through the fenced status CAS', async () => {
+        await insert(claimRow('STORED'));
+        const claimed = await claim();
+        const f = { id: claimed.id };
+        const losers = [
+          { owner: 'w0' },
+          { expectedStatus: 'RESERVED' },
+          { expectedVersion: '9' },
+        ] as const;
+        for (const over of losers) {
+          expect(await store.transitionStatus(cas({ ...f, ...over }))).toBe(
+            false,
+          );
+          expect(await state(claimed.id)).toMatchObject({ status: 'STORED' });
+          expect((await state(claimed.id)).version).toBe('1');
+        }
+        await expire(claimed.id);
+        expect(await store.transitionStatus(cas(f))).toBe(false);
+        expect((await claim('w2')).id).toBe(claimed.id);
+        expect(await store.transitionStatus(cas(f))).toBe(false);
+        expect(await state(claimed.id)).toMatchObject({
+          status: 'STORED',
+          version: '2',
+        });
+        expect(
+          await store.transitionStatus(
+            cas({ ...f, owner: 'w2', expectedVersion: '2' }),
+          ),
+        ).toBe(true);
+        expect(await state(claimed.id)).toMatchObject({
+          status: 'AWAITING_AMOUNT',
+          version: '3',
+        });
+      });
+
+      it.each<Counter>(['meta', 'storage'])(
+        'isolates fenced %s attempt-start losers before and after reclaim',
+        async (counter) => {
+          await insert(
+            claimRow(counter === 'meta' ? 'RESERVED' : 'DOWNLOADED'),
+          );
+          const claimed = await claim();
+          const f = fence(claimed);
+          expect(await start(counter, { ...f, owner: 'w0' })).toBeNull();
+          expect(
+            await start(counter, { ...f, expectedVersion: '9' }),
+          ).toBeNull();
+          await expire(claimed.id);
+          expect(await start(counter, f)).toBeNull();
+          expect((await claim('w2')).id).toBe(claimed.id);
+          expect(await start(counter, f)).toBeNull();
+          await insert(claimRow(counter === 'meta' ? 'STORED' : 'RESERVED'));
+          const staged = await claim('w3');
+          expect(await start(counter, fence(staged, 'w3'))).toBeNull();
+          expect(await state(claimed.id)).toMatchObject({
+            [COL[counter]]: 0,
+            version: '2',
+          });
+          expect(await state(staged.id)).toMatchObject({
+            [COL[counter]]: 0,
+            version: '1',
+          });
+        },
+      );
+
+      it.each<[Counter, string]>([
+        ['meta', 'RESERVED'],
+        ['storage', 'DOWNLOADED'],
+      ])(
+        'starts three %s attempts and refuses a fourth',
+        async (counter, status) => {
+          await insert(claimRow(status));
+          const claimed = await claim();
+          const f = fence(claimed);
+          for (let i = 1, v = claimed.version; i <= 3; i++, v = String(i)) {
+            expect(await start(counter, { ...f, expectedVersion: v })).toEqual({
+              attempt: i,
+              version: String(i + 1),
+            });
+          }
+          expect(
+            await start(counter, { ...f, expectedVersion: '4' }),
+          ).toBeNull();
+          expect(await state(claimed.id)).toMatchObject({
+            [COL[counter]]: 3,
+            version: '4',
+          });
+        },
+      );
+    });
   });
+
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
     migrate('migrate:down');

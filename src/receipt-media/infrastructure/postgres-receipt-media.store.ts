@@ -5,12 +5,14 @@ import type {
   ReceiptMediaRow,
 } from '../domain/receipt-media.types';
 import type {
+  AttemptStartResult,
   DedupeOutcome,
   LeaseFenceInput,
   OutboxIntentInput,
   ReceiptMediaStorePort,
   ReservationOutcome,
   ReserveInput,
+  StatusCasInput,
 } from '../domain/receipt-media-store.port';
 
 type Row = Record<string, unknown>;
@@ -25,6 +27,23 @@ const RELEASE_SQL = `UPDATE receipt_media SET lease_owner = NULL, lease_expires_
      updated_at = now()
    WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
      AND lease_expires_at > now()`;
+
+const CAS_SQL = `UPDATE receipt_media SET status = $5, version = version + 1,
+     updated_at = now() WHERE id = $1 AND lease_owner = $2 AND status = $3
+     AND version = $4::bigint AND lease_expires_at > now()`;
+
+const META_ATTEMPT_SQL = `UPDATE receipt_media
+   SET meta_attempts = meta_attempts + 1, version = version + 1, updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+     AND lease_expires_at > now() AND status IN ('RESERVED', 'DOWNLOADED')
+     AND meta_attempts < 3 RETURNING meta_attempts AS attempt, version`;
+
+const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
+   SET storage_attempts = storage_attempts + 1, version = version + 1,
+     updated_at = now() WHERE id = $1 AND lease_owner = $2
+     AND version = $3::bigint AND lease_expires_at > now()
+     AND status = 'DOWNLOADED' AND storage_attempts < 3
+     RETURNING storage_attempts AS attempt, version`;
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -209,5 +228,52 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
 
   async releaseLease(input: LeaseFenceInput): Promise<boolean> {
     return this.leaseCas(input, RELEASE_SQL);
+  }
+
+  /** WU2B2B fenced status CAS (RM1, RM3): zero-row loser returns false. */
+  async transitionStatus(input: StatusCasInput): Promise<boolean> {
+    return this.withTx(async (c) => {
+      const { rowCount } = await c.query(CAS_SQL, [
+        input.id,
+        input.owner,
+        input.expectedStatus,
+        input.expectedVersion,
+        input.nextStatus,
+      ]);
+      return rowCount === 1;
+    });
+  }
+
+  /** Atomic attempt start: one UPDATE bumps counter + version, fenced by
+   * id + owner + version + live lease + allowed status + < 3. */
+  private async startAttempt(
+    sql: string,
+    input: LeaseFenceInput,
+  ): Promise<AttemptStartResult | null> {
+    return this.withTx(async (c) => {
+      const { rows, rowCount } = await c.query<Row>(sql, [
+        input.id,
+        input.owner,
+        input.expectedVersion,
+      ]);
+      return rowCount === 1
+        ? {
+            attempt: rows[0].attempt as number,
+            version: rows[0].version as string,
+          }
+        : null;
+    });
+  }
+
+  async startMetaAttempt(
+    input: LeaseFenceInput,
+  ): Promise<AttemptStartResult | null> {
+    return this.startAttempt(META_ATTEMPT_SQL, input);
+  }
+
+  async startStorageAttempt(
+    input: LeaseFenceInput,
+  ): Promise<AttemptStartResult | null> {
+    return this.startAttempt(STORAGE_ATTEMPT_SQL, input);
   }
 }

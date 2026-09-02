@@ -1,10 +1,10 @@
-/** WU2B2A store port (RM1, RM3): reservation, outbox, and leased claim
- * primitives. Domain conflicts and lost lease fences are returned as values
- * (false/null), never thrown. CAS and attempt-start primitives arrive with
- * WU2B2B. */
+/** WU2B2A store port (RM1, RM3): reservation, outbox, claim/lease, CAS,
+ * and bounded attempt primitives. Conflicts/lost fences return as values
+ * (false/null), never thrown. */
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
+  ReceiptMediaStatus,
   ReceiptTemplateKey,
 } from './receipt-media.types';
 
@@ -45,6 +45,21 @@ export interface LeaseFenceInput {
   expectedVersion: string;
 }
 
+/** CAS fence: id + matching owner + expected status/version + live lease. */
+export interface StatusCasInput {
+  id: string;
+  owner: string;
+  expectedStatus: ReceiptMediaStatus;
+  expectedVersion: string;
+  nextStatus: ReceiptMediaStatus;
+}
+
+/** Pre-call attempt start: the 1-based attempt and resulting version. */
+export interface AttemptStartResult {
+  attempt: number;
+  version: string;
+}
+
 export interface ReceiptMediaStorePort {
   reserve(input: ReserveInput): Promise<ReservationOutcome>;
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
@@ -55,4 +70,12 @@ export interface ReceiptMediaStorePort {
   renewLease(input: LeaseFenceInput): Promise<boolean>;
   /** Clears a live owned lease (no version change). */
   releaseLease(input: LeaseFenceInput): Promise<boolean>;
+  /** Fenced status CAS: sets next status, bumps version; loser false. */
+  transitionStatus(input: StatusCasInput): Promise<boolean>;
+  /** Atomic pre-call Meta attempt start (max 3); loser null. */
+  startMetaAttempt(input: LeaseFenceInput): Promise<AttemptStartResult | null>;
+  /** Atomic pre-call storage attempt start (max 3); loser null. */
+  startStorageAttempt(
+    input: LeaseFenceInput,
+  ): Promise<AttemptStartResult | null>;
 }
