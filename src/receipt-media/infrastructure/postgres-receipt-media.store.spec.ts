@@ -18,8 +18,9 @@ import {
  * Gated by RUN_DOCKER_TESTS=1 like the other Testcontainers suites. Proves
  * the two table/column sets, field-local enum/range/byte-length/nullability
  * checks, foreign keys, basic uniques, durable defaults, and empty-table
- * up/down. Cross-field lifecycle predicates, partial indexes, and non-empty
- * down refusal are deferred to WU2A2 and intentionally absent here.
+ * up/down. WU2A2A adds cross-field lifecycle predicates; WU2A2B adds the
+ * design-required partial/lookup indexes and independent non-empty down
+ * refusal.
  */
 
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
@@ -508,14 +509,163 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     await expectInserts([[table, row, ok]]);
   });
 
-  it('defers partial indexes and non-empty down guards to WU2A2B', async () => {
-    const { rows } = await pool.query<{ indpred: string | null }>(
-      `SELECT i.indpred::text AS indpred
-         FROM pg_index i
-         JOIN pg_class c ON c.oid = i.indexrelid
-         WHERE c.relname LIKE 'receipt_media%'`,
+  // --- WU2A2B partial/lookup indexes and non-empty down guards (RM1, RM3) ---
+
+  const altRow = (over: Row = {}): Row =>
+    receiptRow({
+      id: UUID_B,
+      webhook_message_id: 'wamid.alt',
+      provider_media_id: 'media.alt',
+      object_key: `receipts/${UUID_B}`,
+      ...over,
+    });
+
+  /** Strips casts/parens/whitespace so deparser formatting cannot lie. */
+  const norm = (def: string): string =>
+    def.replace(/::[a-z]+/gi, '').replace(/[()\s]/g, '');
+
+  type IndexRow = { relname: string; indisunique: boolean; indexdef: string };
+
+  const loadIndexes = async (): Promise<Map<string, IndexRow>> => {
+    const { rows } = await pool.query<IndexRow>(
+      `SELECT c.relname, i.indisunique,
+                  pg_get_indexdef(i.indexrelid) AS indexdef
+             FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             JOIN pg_class t ON t.oid = i.indrelid
+            WHERE t.relname IN ('receipt_media', 'receipt_media_outbox')`,
     );
-    expect(rows.every((r) => r.indpred === null)).toBe(true);
+    return new Map(rows.map((r) => [r.relname, r]));
+  };
+
+  const defOf = async (name: string): Promise<IndexRow> => {
+    const def = (await loadIndexes()).get(name);
+    expect(def).toBeDefined();
+    return def as IndexRow;
+  };
+
+  const REQUIRED_INDEXES = (
+    'receipt_media_active_sender_idx receipt_media_claim_idx ' +
+    'receipt_media_capability_lookup_idx receipt_media_status_updated_idx ' +
+    'receipt_media_unknown_outcome_idx receipt_media_webhook_message_id_key ' +
+    'receipt_media_provider_media_id_key receipt_media_object_key_key ' +
+    'receipt_media_pkey receipt_media_outbox_claim_idx ' +
+    'receipt_media_outbox_dedupe_key_key receipt_media_outbox_pkey'
+  ).split(' ');
+
+  it('creates exactly the design-required index inventory', async () => {
+    const names = [...(await loadIndexes()).keys()].sort();
+    expect(names.filter((n) => !REQUIRED_INDEXES.includes(n))).toEqual([]);
+    expect(REQUIRED_INDEXES.filter((n) => !names.includes(n))).toEqual([]);
+  });
+
+  it('active-sender partial unique enforces one active flow per sender', async () => {
+    await expectInserts([
+      ['receipt_media', receiptRow(), true],
+      ['receipt_media', altRow({ status: 'STORED' }), false],
+    ]);
+    await expectInserts([
+      ['receipt_media', receiptRow(), true],
+      ['receipt_media', altRow({ sender_id: 'sender.other' }), true],
+    ]);
+  });
+
+  it.each([
+    ['FAILED', 'META_EXHAUSTED_PRE_STORAGE'],
+    ['CANCELLED', null],
+    ['ATTACHED', null],
+    ['ATTACH_OUTCOME_UNKNOWN', null],
+  ])('active-sender partial unique excludes terminal %s', async (s, st) => {
+    await expectInserts([
+      ['receipt_media', lifeRow(s, st, {}), true],
+      ['receipt_media', altRow(), true],
+    ]);
+  });
+
+  it('capability lookup partial unique enforces hash uniqueness', async () => {
+    await expectInserts([
+      ['receipt_media', lifeRow('STORED', null, {}), true],
+      [
+        'receipt_media',
+        lifeRow('STORED', null, {
+          id: UUID_B,
+          webhook_message_id: 'wamid.alt',
+          provider_media_id: 'media.alt',
+          object_key: `receipts/${UUID_B}`,
+        }),
+        false,
+      ],
+    ]);
+  });
+
+  it('capability lookup partial unique excludes null hashes', async () => {
+    await expectInserts([
+      ['receipt_media', receiptRow(), true],
+      ['receipt_media', altRow({ sender_id: 'sender.nullhash' }), true],
+    ]);
+  });
+
+  it.each([
+    [
+      'claim queue',
+      'receipt_media_claim_idx',
+      [
+        'next_attempt_at,created_at',
+        "status='RESERVED'ANDmeta_attempts<3",
+        "status='DOWNLOADED'ANDstorage_attempts<3ANDmeta_attempts<3",
+        "status='STORED'",
+        "status='ATTACHING'ANDattach_attempts=0ANDattach_request_started_atISNULLANDattach_attempt_idISNULL",
+      ],
+      [],
+    ],
+    [
+      'status/updated backlog lookup',
+      'receipt_media_status_updated_idx',
+      ['status,updated_at'],
+      ['WHERE'],
+    ],
+    [
+      'unknown-outcome reconciliation',
+      'receipt_media_unknown_outcome_idx',
+      ["status='ATTACH_OUTCOME_UNKNOWN'"],
+      ["'FAILED'"],
+    ],
+    [
+      'outbox claim',
+      'receipt_media_outbox_claim_idx',
+      ['next_attempt_at,created_at', "'PENDING'", "'SENDING'"],
+      ["'SENT'", "'FAILED'"],
+    ],
+  ])('%s index definition', async (_label, name, has, not) => {
+    const { indisunique, indexdef } = await defOf(name);
+    expect(indisunique).toBe(false);
+    const def = norm(indexdef);
+    for (const fragment of has) expect(def).toContain(fragment);
+    for (const fragment of not) expect(def).not.toContain(fragment);
+  });
+
+  const tryMigrateDown = (): string => {
+    try {
+      migrate('migrate:down');
+      return '';
+    } catch (err) {
+      return String((err as { stderr?: Buffer }).stderr ?? err);
+    }
+  };
+
+  it.each([
+    ['receipt_media', lifeRow('RESERVED', null, {})],
+    ['receipt_media_outbox', outboxRow()],
+  ])('down refuses when only %s is populated', async (table, row) => {
+    await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    await pool.query(insertSql(table, row), Object.values(row));
+    expect(tryMigrateDown()).toMatch(/refus/i);
+    const { rows } = await pool.query<{ a: boolean; b: boolean }>(
+      "SELECT to_regclass('receipt_media') IS NOT NULL AS a, " +
+        "to_regclass('receipt_media_outbox') IS NOT NULL AS b",
+    );
+    expect(rows[0]).toMatchObject({ a: true, b: true });
+    await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
   });
 
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {

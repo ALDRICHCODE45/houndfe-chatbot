@@ -4,10 +4,11 @@
  * Creates `receipt_media` (durable job/state table per ADR-2) and
  * `receipt_media_outbox` (committed deterministic notification intents).
  * This slice owns only field-local checks (enums, ranges, byte lengths,
- * nullability), foreign keys, and basic uniques; cross-field lifecycle/
- * evidence/lease predicates, partial indexes, and non-empty down refusal
- * are deferred to WU2A2. No caption, URL, filename, raw token, or error
- * body is ever persisted.
+ * nullability), foreign keys, and basic uniques; WU2A2A added cross-field
+ * lifecycle/evidence/lease predicates. WU2A2B adds the design-required
+ * partial/lookup indexes and makes `down` refuse while either table holds
+ * rows (rollback is development-only). No caption, URL, filename, raw
+ * token, or error body is ever persisted.
  */
 
 const RECEIPT_STATUSES = [
@@ -101,6 +102,18 @@ const HAS_DOWNLOAD = `(${oneOfStatus(['DOWNLOADED', ...DOWNSTREAM])} OR COALESCE
 const NEEDS_AMOUNT = `(${oneOfStatus(words('AWAITING_CONFIRMATION ATTACHING ATTACHED ATTACH_OUTCOME_UNKNOWN'))} OR (${DEFINITE}))`;
 const ATTACH_TERMINAL = `(${oneOfStatus(words('ATTACHED ATTACH_OUTCOME_UNKNOWN'))} OR (${DEFINITE}))`;
 const PRE_ATTACH = `(NOT (${ATTACH_TERMINAL}) AND status <> 'ATTACHING')`;
+
+// WU2A2B design-required partial/lookup indexes (design: Indexes and claims).
+const ACTIVE_STATUSES = words(
+  'RESERVED DOWNLOADED STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING',
+);
+const CLAIM_PREDICATE = `(${[
+  `(${oneOfStatus(['RESERVED'])} AND meta_attempts < 3)`,
+  "(status = 'DOWNLOADED' AND storage_attempts < 3 AND meta_attempts < 3)",
+  "status = 'STORED'",
+  "(status = 'ATTACHING' AND attach_attempts = 0 AND " +
+    'attach_request_started_at IS NULL AND attach_attempt_id IS NULL)',
+].join(' OR ')})`;
 
 const CHECKS = [
   [
@@ -300,9 +313,44 @@ exports.up = (pgm) => {
     'receipt_media_outbox_paired_lease',
     'CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))',
   );
+
+  pgm.createIndex('receipt_media', 'sender_id', {
+    name: 'receipt_media_active_sender_idx',
+    unique: true,
+    where: oneOf('status', ACTIVE_STATUSES),
+  });
+  pgm.createIndex('receipt_media', ['next_attempt_at', 'created_at'], {
+    name: 'receipt_media_claim_idx',
+    where: CLAIM_PREDICATE,
+  });
+  pgm.createIndex('receipt_media', 'capability_token_hash', {
+    name: 'receipt_media_capability_lookup_idx',
+    unique: true,
+    where: 'capability_token_hash IS NOT NULL',
+  });
+  pgm.createIndex('receipt_media', ['status', 'updated_at'], {
+    name: 'receipt_media_status_updated_idx',
+  });
+  pgm.createIndex('receipt_media', 'updated_at', {
+    name: 'receipt_media_unknown_outcome_idx',
+    where: "status = 'ATTACH_OUTCOME_UNKNOWN'",
+  });
+  pgm.createIndex('receipt_media_outbox', ['next_attempt_at', 'created_at'], {
+    name: 'receipt_media_outbox_claim_idx',
+    where: "status IN ('PENDING', 'SENDING')",
+  });
 };
 
-exports.down = (pgm) => {
+exports.down = async (pgm) => {
+  const { rows } = await pgm.db.query(
+    'SELECT EXISTS (SELECT 1 FROM receipt_media) AS media, ' +
+      'EXISTS (SELECT 1 FROM receipt_media_outbox) AS outbox',
+  );
+  if (rows[0].media || rows[0].outbox)
+    throw new Error(
+      'refusing to roll back receipt-media migration: receipt_media and/or ' +
+        'receipt_media_outbox is non-empty',
+    );
   pgm.dropTable('receipt_media_outbox');
   pgm.dropTable('receipt_media');
 };
