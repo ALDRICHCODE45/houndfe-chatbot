@@ -6,6 +6,7 @@ import type {
 } from '../domain/receipt-media.types';
 import type {
   DedupeOutcome,
+  LeaseFenceInput,
   OutboxIntentInput,
   ReceiptMediaStorePort,
   ReservationOutcome,
@@ -14,6 +15,16 @@ import type {
 
 type Row = Record<string, unknown>;
 type Media = ReceiptMediaRow;
+
+const RENEW_SQL = `UPDATE receipt_media SET lease_expires_at = now() + interval '60 seconds',
+     updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+     AND lease_expires_at > now()`;
+
+const RELEASE_SQL = `UPDATE receipt_media SET lease_owner = NULL, lease_expires_at = NULL,
+     updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+     AND lease_expires_at > now()`;
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -47,7 +58,7 @@ const classify = (hit: Row, input: ReserveInput): ReservationOutcome =>
       : { kind: 'webhook-media-conflict' }
     : { kind: 'provider-media-reused', receipt: camelize<Media>(hit) };
 
-/** WU2B1 PostgreSQL primitives (RM1, RM3) over the WU2A1/WU2A2A/WU2A2B
+/** WU2B2A PostgreSQL primitives (RM1, RM3) over the WU2A1/WU2A2A/WU2A2B
  * schema. Every external value is parameter-bound; no caption, URL, token,
  * response body, raw error, or diagnostic PII is persisted. */
 export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
@@ -137,5 +148,66 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         intent: camelize<ReceiptMediaOutboxRow>(row),
       };
     });
+  }
+
+  /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE
+   * SKIP LOCKED, bounded batch, deterministic next_attempt_at/created_at
+   * ordering, 60-second lease, and version increment. Eligibility exactly:
+   * RESERVED with meta<3; DOWNLOADED with storage<3 and meta<3; plain STORED
+   * regardless of counters; pre-request ATTACHING. */
+  async claimBatch(limit: number, owner: string): Promise<Media[]> {
+    return this.withTx(async (c) => {
+      const { rows } = await c.query<Row>(
+        `WITH candidate AS (
+           SELECT id FROM receipt_media
+           WHERE next_attempt_at <= now()
+             AND (lease_expires_at IS NULL OR lease_expires_at < now())
+             AND ((status = 'RESERVED' AND meta_attempts < 3)
+               OR (status = 'DOWNLOADED'
+                 AND storage_attempts < 3 AND meta_attempts < 3)
+               OR status = 'STORED'
+               OR (status = 'ATTACHING' AND attach_attempts = 0
+                 AND attach_request_started_at IS NULL))
+           ORDER BY next_attempt_at, created_at
+           FOR UPDATE SKIP LOCKED LIMIT $1
+         )
+         UPDATE receipt_media r
+         SET lease_owner = $2, lease_expires_at = now() + interval '60 seconds',
+           version = version + 1, updated_at = now()
+         FROM candidate c WHERE r.id = c.id
+         RETURNING r.*`,
+        [limit, owner],
+      );
+      return rows
+        .map((r) => camelize<Media>(r))
+        .sort(
+          (a, b) =>
+            +a.nextAttemptAt - +b.nextAttemptAt || +a.createdAt - +b.createdAt,
+        );
+    });
+  }
+
+  /** Fenced lease bookkeeping over a live lease (id + owner + expected
+   * version); renewal extends, release clears; neither changes the version. */
+  private async leaseCas(
+    input: LeaseFenceInput,
+    sql: string,
+  ): Promise<boolean> {
+    return this.withTx(async (c) => {
+      const { rowCount } = await c.query(sql, [
+        input.id,
+        input.owner,
+        input.expectedVersion,
+      ]);
+      return rowCount === 1;
+    });
+  }
+
+  async renewLease(input: LeaseFenceInput): Promise<boolean> {
+    return this.leaseCas(input, RENEW_SQL);
+  }
+
+  async releaseLease(input: LeaseFenceInput): Promise<boolean> {
+    return this.leaseCas(input, RELEASE_SQL);
   }
 }

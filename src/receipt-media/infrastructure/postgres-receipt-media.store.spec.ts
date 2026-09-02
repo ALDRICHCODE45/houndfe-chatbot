@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 import { Pool } from 'pg';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import type {
+  LeaseFenceInput,
   OutboxIntentInput,
   ReservationOutcome,
   ReserveInput,
@@ -789,6 +790,168 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     });
   });
 
+  // --- WU2B2A leased claims and fenced lease bookkeeping (RM1, RM3) ---
+
+  describe('WU2B2A leased claims and fenced lease bookkeeping', () => {
+    beforeEach(async () => {
+      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    });
+
+    const FUTURE = new Date(Date.now() + 60_000);
+    const PAST = new Date(Date.now() - 60_000);
+    let seq = 0;
+    const claimRow = (status: string, over: Row = {}): Row =>
+      lifeRow(status, null, {
+        id: `00000000-0000-4000-8000-${String(++seq).padStart(12, '0')}`,
+        webhook_message_id: `wamid.c${seq}`,
+        provider_media_id: `media.c${seq}`,
+        sender_id: `sender.c${seq}`,
+        object_key: `receipts/c${seq}`,
+        ...over,
+      });
+
+    const insert = (row: Row): Promise<unknown> =>
+      pool.query(insertSql('receipt_media', row), Object.values(row));
+
+    const claimedIds = async (limit: number, owner: string) =>
+      (await store.claimBatch(limit, owner)).map((r) => r.id);
+
+    const claim = async (owner = 'w1') => (await store.claimBatch(1, owner))[0];
+
+    const fence = (
+      r: { id: string; version: string },
+      owner = 'w1',
+    ): LeaseFenceInput => ({ id: r.id, owner, expectedVersion: r.version });
+
+    const state = (id: string) =>
+      pool
+        .query<Row>(
+          'SELECT version, lease_owner, lease_expires_at, ' +
+            'extract(epoch FROM lease_expires_at - now()) AS lease_secs ' +
+            'FROM receipt_media WHERE id = $1',
+          [id],
+        )
+        .then((r) => r.rows[0]);
+
+    it.each<[string, Row, boolean]>([
+      ['RESERVED', {}, true],
+      ['RESERVED', { meta_attempts: 3 }, false],
+      ['DOWNLOADED', {}, true],
+      ['DOWNLOADED', { meta_attempts: 3 }, false],
+      ['DOWNLOADED', { storage_attempts: 3 }, false],
+      ['STORED', { meta_attempts: 3, storage_attempts: 3 }, true],
+      ['ATTACHING', {}, true],
+      ['ATTACHING', attachEvidence, false],
+      ['RESERVED', { next_attempt_at: FUTURE }, false],
+      ['RESERVED', { lease_owner: 'w0', lease_expires_at: FUTURE }, false],
+      ['RESERVED', { lease_owner: 'w0', lease_expires_at: PAST }, true],
+    ])('claim eligibility: %s %j', async (status, over, expectClaim) => {
+      const row = claimRow(status, over);
+      await insert(row);
+      expect(await claimedIds(5, 'w1')).toEqual(expectClaim ? [row.id] : []);
+    });
+
+    it('orders claims by next_attempt_at, created_at', async () => {
+      const at = new Date(Date.now() - 120_000);
+      const r1 = claimRow('RESERVED', { next_attempt_at: at, created_at: at });
+      const r2 = claimRow('RESERVED', {
+        next_attempt_at: at,
+        created_at: new Date(+at + 1_000),
+      });
+      const r3 = claimRow('RESERVED', {
+        next_attempt_at: new Date(+at + 30_000),
+      });
+      for (const row of [r3, r2, r1]) await insert(row);
+      expect(await claimedIds(3, 'w1')).toEqual([r1.id, r2.id, r3.id]);
+    });
+
+    it('splits eligible rows between concurrent workers', async () => {
+      const [a, b] = [claimRow('RESERVED'), claimRow('RESERVED')];
+      for (const row of [a, b]) await insert(row);
+      const [x, y] = await Promise.all([
+        store.claimBatch(1, 'w1'),
+        store.claimBatch(1, 'w2'),
+      ]);
+      expect([x.length, y.length]).toEqual([1, 1]);
+      expect([x[0].id, y[0].id].sort()).toEqual([a.id, b.id].sort());
+    });
+
+    it('skips a locked row and reclaims it after lock release', async () => {
+      const [a, b] = [claimRow('RESERVED'), claimRow('RESERVED')];
+      for (const row of [a, b]) await insert(row);
+      await withTx(async (c) => {
+        await c.query('SELECT id FROM receipt_media WHERE id = $1 FOR UPDATE', [
+          a.id,
+        ]);
+        expect(await claimedIds(5, 'w1')).toEqual([b.id]);
+      });
+      expect(await claimedIds(5, 'w2')).toEqual([a.id]);
+    });
+
+    it('claims with an approximately 60-second lease from DB time', async () => {
+      await insert(claimRow('RESERVED'));
+      const claimed = await claim();
+      const s = await state(claimed.id);
+      expect(+(s.lease_secs as string)).toBeGreaterThan(55);
+      expect(+(s.lease_secs as string)).toBeLessThanOrEqual(60);
+      expect(s.version).toBe('1');
+    });
+
+    it('renews only the live owner at the expected version, preserving it', async () => {
+      await insert(claimRow('RESERVED'));
+      const claimed = await claim();
+      const f = fence(claimed);
+      expect(await store.renewLease({ ...f, owner: 'w0' })).toBe(false);
+      expect(await store.renewLease({ ...f, expectedVersion: '9' })).toBe(
+        false,
+      );
+      const s = await state(claimed.id);
+      expect(s.version).toBe('1');
+      expect(s.lease_owner).toBe('w1');
+      expect(await store.renewLease(f)).toBe(true);
+      const renewed = await state(claimed.id);
+      expect(renewed.version).toBe('1');
+      expect(+(renewed.lease_secs as string)).toBeGreaterThan(55);
+      expect(+(renewed.lease_secs as string)).toBeLessThanOrEqual(60);
+    });
+
+    it('releases only the live owner at the expected version, preserving it', async () => {
+      await insert(claimRow('RESERVED'));
+      const claimed = await claim();
+      const f = fence(claimed);
+      expect(await store.releaseLease({ ...f, owner: 'w0' })).toBe(false);
+      expect(await store.releaseLease({ ...f, expectedVersion: '9' })).toBe(
+        false,
+      );
+      const s = await state(claimed.id);
+      expect(s.version).toBe('1');
+      expect(s.lease_owner).toBe('w1');
+      expect(await store.releaseLease(f)).toBe(true);
+      const released = await state(claimed.id);
+      expect(released.version).toBe('1');
+      expect(released.lease_owner).toBeNull();
+      expect(released.lease_expires_at).toBeNull();
+      expect((await claim('w2')).id).toBe(claimed.id);
+    });
+
+    it('an expired owner cannot renew or release before or after reclaim', async () => {
+      await insert(claimRow('RESERVED'));
+      const stale = await claim();
+      const f = fence(stale);
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' " +
+          'WHERE id = $1',
+        [stale.id],
+      );
+      expect(await store.renewLease(f)).toBe(false);
+      expect(await store.releaseLease(f)).toBe(false);
+      expect((await state(stale.id)).version).toBe('1');
+      expect((await claim('w2')).id).toBe(stale.id);
+      expect(await store.renewLease(f)).toBe(false);
+      expect(await store.releaseLease(f)).toBe(false);
+      expect((await state(stale.id)).version).toBe('2');
+    });
+  });
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
     migrate('migrate:down');
