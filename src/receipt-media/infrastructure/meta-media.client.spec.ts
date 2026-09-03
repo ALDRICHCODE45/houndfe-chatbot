@@ -55,9 +55,12 @@ function makeClient(options: {
   return { client, calls, token, destroy, agent, createAgent };
 }
 
-const req = (providerMediaId = 'media-123'): MetaMediaRequest => ({
+const req = (
+  providerMediaId = 'media-123',
+  declaredMimeType = 'image/jpeg', // runtime-invalid values must reject
+): MetaMediaRequest => ({
   providerMediaId,
-  declaredMimeType: 'image/jpeg',
+  declaredMimeType: declaredMimeType as MetaMediaRequest['declaredMimeType'],
   signal: new AbortController().signal,
 });
 
@@ -170,6 +173,133 @@ describe('MetaMediaClient.resolveDownloadUrl', () => {
         expect(destroy).toHaveBeenCalledTimes(1);
       }
     },
+  );
+});
+
+/** WU4B3B1a projection proofs: the infrastructure-local metadata contract
+ *  (download URL + canonical MIME + provider-declared bytes) validated on
+ *  the metadata body before any download request exists. */
+describe('MetaMediaClient.resolveMetadata (WU4B3B1a metadata projection)', () => {
+  const bodyWith = (fields: Record<string, unknown>) => {
+    const body: Record<string, unknown> = {
+      url: DOWNLOAD_URL,
+      mime_type: 'image/jpeg',
+      file_size: 1234,
+    };
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined) delete body[key];
+      else body[key] = value;
+    }
+    return body;
+  };
+
+  /** Shared projection rejection proof: the fixed safe error, exactly the
+   *  expected call/bearer/teardown counts (default: one metadata call and
+   *  never a download request), and no detail leakage. The declared MIME
+   *  parameter accepts runtime-invalid values on purpose. */
+  const expectMetadataRejection = async (
+    data: unknown,
+    category: 'MEDIA_VALIDATION' | 'META_TRANSPORT',
+    code: string,
+    declared = 'image/jpeg',
+    expectedCalls = 1,
+  ) => {
+    const { client, calls, destroy, token } = makeClient({ data });
+    const err: unknown = await client
+      .resolveMetadata(req('media-123', declared))
+      .catch((error: unknown) => error);
+    expect(err).toBeInstanceOf(MetaMediaError);
+    expect(err).toMatchObject({
+      category,
+      code,
+      message: `receipt-media:${category}/${code}`,
+    });
+    expect(JSON.stringify(err)).not.toMatch(LEAKY);
+    expect(calls).toHaveLength(expectedCalls);
+    expect(destroy).toHaveBeenCalledTimes(expectedCalls);
+    expect(token).toHaveBeenCalledTimes(expectedCalls);
+  };
+
+  it.each([
+    ['image/jpeg', 1234],
+    ['image/png', 1234],
+    ['image/jpeg', 1],
+    ['image/png', 10_485_760],
+  ])(
+    'projects valid %s metadata with providerDeclaredBytes %i',
+    async (mime, file_size) => {
+      const { client, calls } = makeClient({
+        data: bodyWith({ mime_type: mime, file_size }),
+      });
+      await expect(
+        client.resolveMetadata(req('media-123', mime)),
+      ).resolves.toEqual({
+        downloadUrl: DOWNLOAD_URL,
+        mimeType: mime,
+        providerDeclaredBytes: file_size,
+      });
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it('rejects runtime-invalid declared MIME before any bearer or request', () =>
+    expectMetadataRejection(
+      {},
+      'MEDIA_VALIDATION',
+      'UNSUPPORTED_MIME',
+      'image/webp',
+      0,
+    ));
+
+  it.each([
+    ['missing', { mime_type: undefined }],
+    ['unsupported', { mime_type: 'image/webp' }],
+    ['non-string', { mime_type: 42 }],
+  ])('rejects %s metadata mime_type with UNSUPPORTED_MIME', (_label, fields) =>
+    expectMetadataRejection(
+      bodyWith(fields),
+      'MEDIA_VALIDATION',
+      'UNSUPPORTED_MIME',
+    ),
+  );
+
+  it('rejects declared-vs-provider MIME disagreement with MIME_MISMATCH', () =>
+    expectMetadataRejection(
+      bodyWith({ mime_type: 'image/png' }),
+      'MEDIA_VALIDATION',
+      'MIME_MISMATCH',
+    ));
+
+  it.each([
+    ['missing', { file_size: undefined }],
+    ['wrong type', { file_size: '1234' }],
+    ['non-integer', { file_size: 1.5 }],
+    ['non-safe', { file_size: Number.MAX_SAFE_INTEGER + 1 }],
+    ['zero', { file_size: 0 }],
+    ['negative', { file_size: -1 }],
+    ['one over the limit', { file_size: 10_485_761 }],
+  ])(
+    'rejects %s provider file_size with INVALID_MEDIA_SIZE',
+    (_label, fields) =>
+      expectMetadataRejection(
+        bodyWith(fields),
+        'MEDIA_VALIDATION',
+        'INVALID_MEDIA_SIZE',
+      ),
+  );
+
+  it.each([
+    ['missing', { url: undefined }],
+    ['empty', { url: '' }],
+    ['non-string', { url: 5 }],
+  ])(
+    'rejects %s download URL with the permanent safe error',
+    (_label, fields) =>
+      expectMetadataRejection(
+        bodyWith(fields),
+        'META_TRANSPORT',
+        'HTTP_PERMANENT',
+      ),
   );
 });
 

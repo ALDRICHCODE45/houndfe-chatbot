@@ -2,14 +2,16 @@
  *  Provider-id-only: the Graph metadata URL is derived internally from the
  *  configured origin and the encoded id, every failure maps to a fixed safe
  *  MetaMediaError, and the returned download URL is never followed here.
- *  Manual redirect transport (WU4B2) and the stream/temp pipeline (WU4B3) are
- *  later slices on this same client surface. */
+ *  WU4B2 added manual redirect download transport; WU4B3B1a adds the
+ *  infrastructure-local metadata projection consumed by the later B3B1b
+ *  stream pipeline on this same client surface. */
 import * as https from 'node:https';
 import type { LookupFunction } from 'node:net';
 import axios, { type AxiosRequestConfig } from 'axios';
 import {
   MetaMediaError,
   type MetaMediaRequest,
+  type ReceiptMimeType,
 } from '../domain/meta-media.port';
 import {
   defaultResolver,
@@ -54,8 +56,26 @@ export interface MetaMediaClientDeps {
   createAgent?: MetaAgentFactory;
 }
 
+/** WU4B3B1a infrastructure-local metadata projection: only the returned
+ *  download URL, the canonical declared MIME, and the provider-declared byte
+ *  size — everything the B3B1b stream pipeline may rely on, and nothing more. */
+export interface MetaMediaMetadata {
+  downloadUrl: string;
+  mimeType: ReceiptMimeType;
+  providerDeclaredBytes: number;
+}
+
 const transportFailure = (): MetaMediaError =>
   new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE');
+
+/** The only canonical media types the whole pipeline accepts. */
+const CANONICAL_MIME_TYPES: ReadonlySet<string> = new Set([
+  'image/jpeg',
+  'image/png',
+]);
+
+/** Design byte bound: provider-declared size must be 1..10_485_760. */
+const MAX_PROVIDER_BYTES = 10_485_760;
 
 /** Only the pinned lookup is customized; TLS naming and ordinary hostname
  *  verification are never overridden. */
@@ -99,16 +119,67 @@ function httpStatusError(status: number): MetaMediaError {
   );
 }
 
+function metadataString(data: unknown, field: string): string | undefined {
+  if (typeof data !== 'object' || data === null) return undefined;
+  const value = (data as Record<string, unknown>)[field];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function metadataNumber(data: unknown, field: string): number | undefined {
+  if (typeof data !== 'object' || data === null) return undefined;
+  const value = (data as Record<string, unknown>)[field];
+  return typeof value === 'number' ? value : undefined;
+}
+
 /** Only a non-empty returned download URL is projected; it is never followed
  *  or validated for transport here (that is the next hop's own policy). */
 function extractDownloadUrl(data: unknown): string {
-  const url =
-    typeof data === 'object' && data !== null
-      ? (data as { url?: unknown }).url
-      : undefined;
-  if (typeof url === 'string' && url !== '') return url;
+  const url = metadataString(data, 'url');
+  if (url !== undefined && url !== '') return url;
   // 200 without a usable download URL: permanent, never network-retryable.
   throw new MetaMediaError('META_TRANSPORT', 'HTTP_PERMANENT');
+}
+
+/** The metadata mime_type must already be a canonical media type; anything
+ *  missing, non-string, or unsupported fails closed. */
+function extractMetadataMime(data: unknown): ReceiptMimeType {
+  const mime = metadataString(data, 'mime_type');
+  if (mime !== undefined && CANONICAL_MIME_TYPES.has(mime))
+    return mime as ReceiptMimeType;
+  throw new MetaMediaError('MEDIA_VALIDATION', 'UNSUPPORTED_MIME');
+}
+
+/** The provider-declared size must be a safe integer within the design
+ *  bounds; missing, mistyped, fractional, non-safe, zero, negative, and
+ *  over-limit values all fail closed. */
+function extractProviderBytes(data: unknown): number {
+  const size = metadataNumber(data, 'file_size');
+  if (
+    size === undefined ||
+    !Number.isSafeInteger(size) ||
+    size < 1 ||
+    size > MAX_PROVIDER_BYTES
+  )
+    throw new MetaMediaError('MEDIA_VALIDATION', 'INVALID_MEDIA_SIZE');
+  return size;
+}
+
+/** WU4B3B1a: validates the metadata body against the declared MIME and
+ *  projects the B3B1b contract; declared/provider disagreement and any
+ *  invalid size are rejected before any download request can exist. */
+function projectMetadata(
+  data: unknown,
+  declaredMimeType: ReceiptMimeType,
+): MetaMediaMetadata {
+  const downloadUrl = extractDownloadUrl(data);
+  const mimeType = extractMetadataMime(data);
+  if (mimeType !== declaredMimeType)
+    throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
+  return {
+    downloadUrl,
+    mimeType,
+    providerDeclaredBytes: extractProviderBytes(data),
+  };
 }
 
 /** Exactly the statuses this client follows manually; Axios auto redirects
@@ -156,9 +227,10 @@ export class MetaMediaClient {
     this.createAgent = deps.createAgent ?? defaultAgentFactory;
   }
 
-  /** Resolves the provider media id to its returned download URL; the
-   *  authenticated download hop is WU4B2's and is never issued here. */
-  async resolveDownloadUrl(request: MetaMediaRequest): Promise<string> {
+  /** One composed, policy-validated, bearer-after-pinning metadata hop
+   *  returning the raw 2xx body; shared by the WU4B1B URL resolution and
+   *  the WU4B3B1a projection. */
+  private async fetchMetadata(request: MetaMediaRequest): Promise<unknown> {
     try {
       const url = composeMetadataUrl(
         this.config.graphApiBaseUrl,
@@ -189,10 +261,32 @@ export class MetaMediaClient {
         });
         if (response.status < 200 || response.status > 299)
           throw httpStatusError(response.status);
-        return extractDownloadUrl(response.data);
+        return response.data;
       } finally {
         agent.destroy(); // every path: success, status, body, abort, timeout
       }
+    } catch (error) {
+      throw mapTransportError(error);
+    }
+  }
+
+  /** Resolves the provider media id to its returned download URL; the
+   *  authenticated download hop is WU4B2's and is never issued here. */
+  async resolveDownloadUrl(request: MetaMediaRequest): Promise<string> {
+    return extractDownloadUrl(await this.fetchMetadata(request));
+  }
+
+  /** WU4B3B1a: one metadata hop whose body is validated into the projection
+   *  before returning; no download request is ever issued here. A runtime-
+   *  invalid declared MIME is rejected before any bearer or request. */
+  async resolveMetadata(request: MetaMediaRequest): Promise<MetaMediaMetadata> {
+    if (!CANONICAL_MIME_TYPES.has(request.declaredMimeType))
+      throw new MetaMediaError('MEDIA_VALIDATION', 'UNSUPPORTED_MIME');
+    try {
+      return projectMetadata(
+        await this.fetchMetadata(request),
+        request.declaredMimeType,
+      );
     } catch (error) {
       throw mapTransportError(error);
     }
