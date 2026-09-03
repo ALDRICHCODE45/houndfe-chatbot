@@ -2,17 +2,24 @@
  *  Provider-id-only: the Graph metadata URL is derived internally from the
  *  configured origin and the encoded id, every failure maps to a fixed safe
  *  MetaMediaError, and the returned download URL is never followed here.
- *  WU4B2 added manual redirect download transport; WU4B3B1a adds the
- *  infrastructure-local metadata projection consumed by the later B3B1b
- *  stream pipeline on this same client surface. */
+ *  WU4B2 added manual redirect download transport; WU4B3B1a added the
+ *  infrastructure-local metadata projection; WU4B3B1b adds the successful
+ *  bounded stream/temp-file pipeline on this same client surface. */
 import * as https from 'node:https';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import type { Readable } from 'node:stream';
 import type { LookupFunction } from 'node:net';
 import axios, { type AxiosRequestConfig } from 'axios';
 import {
   MetaMediaError,
   type MetaMediaRequest,
   type ReceiptMimeType,
+  type ValidatedMediaFile,
 } from '../domain/meta-media.port';
+import { validateMediaStructure } from './media-structure.validator';
 import {
   defaultResolver,
   pinnedLookup,
@@ -54,6 +61,9 @@ export interface MetaMediaClientDeps {
   http?: MetaHttp;
   resolve?: MetaDnsResolver;
   createAgent?: MetaAgentFactory;
+  /** Narrow WU4B3 seam: injectable only so a later slice can drive
+   *  deterministic I/O failures; success paths always use the real default. */
+  createTempFile?: MetaTempFileFactory;
 }
 
 /** WU4B3B1a infrastructure-local metadata projection: only the returned
@@ -67,6 +77,67 @@ export interface MetaMediaMetadata {
 
 const transportFailure = (): MetaMediaError =>
   new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE');
+
+/** Stream/temp pipeline bound (design: 10 MiB, enforced while streaming). */
+const MAX_MEDIA_BYTES = 10_485_760;
+
+const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex');
+
+const invalidSize = (): MetaMediaError =>
+  new MetaMediaError('MEDIA_VALIDATION', 'INVALID_MEDIA_SIZE');
+
+/** Narrow WU4B3 seam: one open exclusive temp file handle. write resolves to
+ *  the bytesWritten count actually persisted for the given chunk; a void
+ *  result reports no progress and fails closed. */
+export interface MetaTempFile {
+  filePath: string;
+  write: (chunk: Buffer) => Promise<number | void>;
+  close: () => Promise<void>;
+}
+
+export type MetaTempFileFactory = (dir: string) => Promise<MetaTempFile>;
+
+/** Real random exclusive ('wx') file under dir, created with mode 0600. */
+export const defaultTempFileFactory: MetaTempFileFactory = async (dir) => {
+  const filePath = path.join(
+    dir,
+    `receipt-media-${randomBytes(12).toString('hex')}`,
+  );
+  const handle = await fs.promises.open(filePath, 'wx', 0o600);
+  return {
+    filePath,
+    write: async (chunk) => (await handle.write(chunk)).bytesWritten,
+    close: () => handle.close(),
+  };
+};
+
+/** Magic-byte sniffing over the bounded read-back; anything else is unknown. */
+function detectMagic(bytes: Buffer): ReceiptMimeType | undefined {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(PNG_SIGNATURE))
+    return 'image/png';
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8)
+    return 'image/jpeg';
+  return undefined;
+}
+
+/** Persists every chunk byte through the seam before returning: honest partial
+ *  progress is retried on the unwritten remainder, while void, zero, negative,
+ *  non-safe-integer, or over-length progress fails closed immediately so no
+ *  write loop can ever hang. */
+async function writeAll(temp: MetaTempFile, chunk: Buffer): Promise<void> {
+  let written = 0;
+  while (written < chunk.length) {
+    const progress = await temp.write(chunk.subarray(written));
+    if (
+      typeof progress !== 'number' ||
+      !Number.isSafeInteger(progress) ||
+      progress < 1 ||
+      progress > chunk.length - written
+    )
+      throw new MetaMediaError('META_TRANSPORT', 'FILE_IO_FAILURE');
+    written += progress;
+  }
+}
 
 /** The only canonical media types the whole pipeline accepts. */
 const CANONICAL_MIME_TYPES: ReadonlySet<string> = new Set([
@@ -216,6 +287,7 @@ export class MetaMediaClient {
   private readonly http: MetaHttp;
   private readonly resolve: MetaDnsResolver;
   private readonly createAgent: MetaAgentFactory;
+  private readonly createTempFile: MetaTempFileFactory;
 
   constructor(
     private readonly config: MetaMediaClientConfig,
@@ -225,6 +297,7 @@ export class MetaMediaClient {
     this.http = deps.http ?? ((request) => axios.request(request));
     this.resolve = deps.resolve ?? defaultResolver();
     this.createAgent = deps.createAgent ?? defaultAgentFactory;
+    this.createTempFile = deps.createTempFile ?? defaultTempFileFactory;
   }
 
   /** One composed, policy-validated, bearer-after-pinning metadata hop
@@ -366,6 +439,76 @@ export class MetaMediaClient {
       }
     } catch (error) {
       throw mapTransportError(error);
+    }
+  }
+
+  /** WU4B3B1b: one logical Meta attempt — exactly one metadata resolution
+   *  (B3B1a projection) then the verified B2 download chain — returning the
+   *  WU4B3A validated-file contract. The stream is consumed with backpressure,
+   *  bounded at 10 MiB before any overflowing byte is written, hashed
+   *  incrementally, and stored in a real random exclusive mode-0600 temp file
+   *  under the OS temp directory. The final agent is released exactly once
+   *  after settlement; every failure path unlinks any partial temp file and
+   *  releases the agent. */
+  async resolveAndDownload(
+    request: MetaMediaRequest,
+  ): Promise<ValidatedMediaFile> {
+    let handle: MetaDownloadHandle | undefined;
+    let source: Readable | undefined;
+    let temp: MetaTempFile | undefined;
+    let succeeded = false;
+    try {
+      const metadata = await this.resolveMetadata(request);
+      handle = await this.downloadStream(request, metadata.downloadUrl);
+      source = handle.response.data as Readable;
+      temp = await this.createTempFile(os.tmpdir());
+      const tempPath = temp.filePath;
+      const hash = createHash('sha256');
+      let byteCount = 0;
+      // Async iteration keeps the source paused between awaited writes, so the
+      // provider stream is consumed with backpressure.
+      for await (const chunk of source) {
+        const buffer = Buffer.isBuffer(chunk)
+          ? chunk
+          : Buffer.from(chunk as string);
+        byteCount += buffer.length;
+        // The bound is enforced before any overflowing byte is written.
+        if (byteCount > MAX_MEDIA_BYTES) throw invalidSize();
+        hash.update(buffer);
+        // Every byte must be on disk before the next chunk is read.
+        await writeAll(temp, buffer);
+      }
+      await temp.close();
+      // Bounded read-back: the enforced cap guarantees at most 10 MiB here.
+      const bytes = await fs.promises.readFile(tempPath);
+      if (detectMagic(bytes) !== metadata.mimeType)
+        throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
+      validateMediaStructure(bytes, metadata.mimeType);
+      handle.release(); // settlement complete: final agent released exactly once
+      succeeded = true;
+      return {
+        filePath: tempPath,
+        mimeType: metadata.mimeType,
+        byteCount,
+        providerDeclaredBytes: metadata.providerDeclaredBytes,
+        sha256: hash.digest(),
+        // Caller-owned idempotent technical cleanup of the validated file.
+        cleanup: () => fs.promises.rm(tempPath, { force: true }),
+      };
+    } catch (error) {
+      source?.destroy();
+      throw mapTransportError(error);
+    } finally {
+      if (!succeeded) {
+        handle?.release();
+        // Release the descriptor and unlink any partial temp file. A repeated
+        // close after an in-flight close is swallowed by the catch.
+        if (temp !== undefined) await temp.close().catch(() => undefined);
+        if (temp !== undefined)
+          await fs.promises
+            .rm(temp.filePath, { force: true })
+            .catch(() => undefined);
+      }
     }
   }
 }

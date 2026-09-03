@@ -1,4 +1,9 @@
-/** WU4B1B spec: metadata request composition proofs over the WU4B1A policy. */
+/** WU4B1B/WU4B2/WU4B3B1b spec: metadata composition, manual-redirect download
+ *  transport, and the successful bounded stream/temp-file pipeline proofs. */
+import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { Readable } from 'node:stream';
 import type { Agent } from 'node:https';
 import type { LookupAddress } from 'node:dns';
 import type { LookupFunction } from 'node:net';
@@ -11,7 +16,9 @@ import { pinnedLookup } from './meta-media-origin.policy';
 import {
   MetaMediaClient,
   defaultAgentFactory,
+  defaultTempFileFactory,
   type MetaHttp,
+  type MetaTempFileFactory,
 } from './meta-media.client';
 
 const BASE = 'https://graph.facebook.com/v23.0';
@@ -66,13 +73,17 @@ const req = (
 
 const LEAKY = /facebook|8\.8\.8\.8|media-123|sentinel|attacker/i;
 
-const safeError = async (promise: Promise<unknown>, code: string) => {
+const safeError = async (
+  promise: Promise<unknown>,
+  code: string,
+  category = 'META_TRANSPORT',
+) => {
   const err: unknown = await promise.catch((error: unknown) => error);
   expect(err).toBeInstanceOf(MetaMediaError);
   expect(err).toMatchObject({
-    category: 'META_TRANSPORT',
+    category,
     code,
-    message: `receipt-media:META_TRANSPORT/${code}`,
+    message: `receipt-media:${category}/${code}`,
   });
   expect(JSON.stringify(err)).not.toMatch(LEAKY);
 };
@@ -581,4 +592,236 @@ describe('MetaMediaClient.downloadStream', () => {
   ])('maps non-redirect download status %i to safe %s', (status, expected) =>
     expectRejected([{ status }], expected),
   );
+});
+
+/** WU4B3B1b pipeline fixtures: structurally valid minimal images (the PNG is
+ *  a precomputed minimal signature/IHDR/IDAT/IEND image). */
+const MIN_JPEG = Buffer.from(
+  'ffd8ffc0000b080001000101011100ffda000801010000000012ffd9',
+  'hex',
+);
+const MIN_PNG = Buffer.from(
+  '89504e470d0a1a0a0000000d4948445200000001000000010800000000' +
+    '3a7e9b5500000001494441540028387de80000000049454e44ae426082',
+  'hex',
+);
+
+const sha256Matches = (file: { sha256: Buffer }, bytes: Buffer) =>
+  file.sha256.equals(createHash('sha256').update(bytes).digest());
+
+const META_OK = {
+  url: DOWNLOAD_URL,
+  mime_type: 'image/jpeg',
+  file_size: 4321,
+};
+
+const streamOf = (chunks: Buffer[]): Readable => Readable.from(chunks);
+
+const LOOKASIDE_HOST = 'lookaside.fbsbx.com';
+
+type Hop = { data?: unknown };
+
+/** Every real temp path created through the pipeline harness across the whole
+ *  suite; the describe-level residue guard proves each one is unlinked. */
+const CREATED: string[] = [];
+
+/** Pipeline harness: the first call is the single metadata hop, later calls
+ *  are stream download hops on the allowed lookaside host. */
+function makePipeline(
+  options: {
+    metadata?: unknown;
+    hops?: Hop[];
+    createTempFile?: MetaTempFileFactory;
+  } = {},
+) {
+  const calls: AxiosRequestConfig[] = [];
+  const created: string[] = [];
+  let hopIndex = 0;
+  const http: MetaHttp = (config) => {
+    calls.push(config);
+    if (config.responseType !== 'stream')
+      return Promise.resolve({
+        status: 200,
+        data: options.metadata ?? META_OK,
+      });
+    const hop = options.hops ? options.hops[hopIndex++] : {};
+    if (hop === undefined)
+      return Promise.reject(new Error('unexpected additional hop'));
+    return Promise.resolve({
+      status: 200,
+      data: hop.data === undefined ? streamOf([MIN_JPEG]) : hop.data,
+    });
+  };
+  const token = jest.fn(() => TOKEN);
+  const destroyFns: Array<jest.Mock> = [];
+  const createAgent = jest.fn<Agent, [LookupFunction]>(() => {
+    const destroy = jest.fn();
+    destroyFns.push(destroy);
+    return { destroy } as unknown as Agent;
+  });
+  const client = new MetaMediaClient(
+    {
+      graphApiBaseUrl: BASE,
+      allowedHosts: [HOST, LOOKASIDE_HOST],
+      metadataTimeoutMs: 5000,
+      downloadTimeoutMs: 20000,
+    },
+    token,
+    {
+      http,
+      resolve: publicDns,
+      createAgent,
+      createTempFile: async (dir: string) => {
+        const file = await (options.createTempFile ?? defaultTempFileFactory)(
+          dir,
+        );
+        created.push(file.filePath);
+        CREATED.push(file.filePath);
+        return file;
+      },
+    },
+  );
+  return { client, calls, token, destroyFns, created };
+}
+
+const expectUnlinked = (filePath: string) =>
+  expect(fs.promises.stat(filePath)).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+
+/** Shared pipeline rejection proof: fixed safe error, final agent released
+ *  exactly once, and every created temp file unlinked. */
+const expectRejectedFile = async (
+  options: Partial<Parameters<typeof makePipeline>[0]>,
+  code: string,
+  category: 'MEDIA_VALIDATION' | 'META_TRANSPORT' = 'MEDIA_VALIDATION',
+) => {
+  const { client, destroyFns, created } = makePipeline(options);
+  await safeError(resolveAndDownload(client)(req()), code, category);
+  expect(destroyFns.at(-1)?.mock.calls.length).toBe(1);
+  for (const filePath of created) await expectUnlinked(filePath);
+};
+
+const resolveAndDownload = (client: MetaMediaClient) =>
+  client.resolveAndDownload.bind(client);
+
+describe('MetaMediaClient.resolveAndDownload (WU4B3B1b stream pipeline)', () => {
+  it('performs exactly one metadata resolution then the verified download chain and returns the validated file', async () => {
+    // Declared file_size differs from the real byte count on purpose: the
+    // contract reports both independently; B3B2 owns response-header guards.
+    const { client, calls, token, destroyFns } = makePipeline();
+    const result = await resolveAndDownload(client)(req());
+    try {
+      expect(calls).toHaveLength(2);
+      // method/timeout defaults are proven verbatim in the B1/B2 describes.
+      expect(calls[0].url).toBe(`${BASE}/media-123`);
+      expect(calls[1].url).toBe(DOWNLOAD_URL);
+      expect(calls[1].responseType).toBe('stream');
+      expect(token).toHaveBeenCalledTimes(2);
+      expect(destroyFns.map((d) => d.mock.calls.length)).toEqual([1, 1]);
+      expect(result.mimeType).toBe('image/jpeg');
+      expect(result.byteCount).toBe(MIN_JPEG.length);
+      expect(result.providerDeclaredBytes).toBe(4321);
+      expect(sha256Matches(result, MIN_JPEG)).toBe(true);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('streams into a real random mode-0600 exclusive temp file under the OS tmpdir and cleans up idempotently', async () => {
+    const { client } = makePipeline();
+    const first = await resolveAndDownload(client)(req());
+    const second = await resolveAndDownload(client)(req());
+    try {
+      expect(first.filePath).not.toBe(second.filePath);
+      for (const file of [first, second]) {
+        expect(file.filePath.startsWith(`${os.tmpdir()}/`)).toBe(true);
+        const stats = await fs.promises.stat(file.filePath);
+        expect(stats.mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      for (const file of [first, second]) await file.cleanup();
+      // Repeated and concurrent cleanup calls stay idempotent.
+      await Promise.all([first.cleanup(), second.cleanup()]);
+    }
+    for (const file of [first, second])
+      await expect(fs.promises.stat(file.filePath)).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+  });
+
+  it('accepts a minimal PNG stream and succeeds with counted bytes alone', async () => {
+    // No response header is asserted: B3B2 owns canonical response-header guards.
+    const { client } = makePipeline({
+      metadata: { ...META_OK, mime_type: 'image/png' },
+      hops: [{ data: streamOf([MIN_PNG]) }],
+    });
+    const result = await resolveAndDownload(client)(
+      req('media-123', 'image/png'),
+    );
+    try {
+      expect(result.byteCount).toBe(MIN_PNG.length);
+      expect(sha256Matches(result, MIN_PNG)).toBe(true);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  /** Progress seam: every write persists at most 5 bytes and reports what
+   *  the fake disk accepted; a fixed override simulates a stuck/lying disk
+   *  that reports progress without persisting anything. */
+  const progressFactory =
+    (override?: number): MetaTempFileFactory =>
+    async (dir) => {
+      const real = await defaultTempFileFactory(dir);
+      const handle = await fs.promises.open(real.filePath, 'r+');
+      return {
+        filePath: real.filePath,
+        write: async (chunk: Buffer) =>
+          override ?? (await handle.write(chunk.subarray(0, 5))).bytesWritten,
+        close: async () => {
+          await handle.close();
+          await real.close();
+        },
+      };
+    };
+
+  it('repeats partial writes until every chunk byte is persisted', async () => {
+    const { client } = makePipeline({ createTempFile: progressFactory() });
+    const result = await resolveAndDownload(client)(req());
+    try {
+      expect(result.byteCount).toBe(MIN_JPEG.length);
+      expect(await fs.promises.readFile(result.filePath)).toEqual(MIN_JPEG);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1] as const)(
+    'fails closed on %j write progress without looping',
+    (reported) =>
+      expectRejectedFile(
+        { createTempFile: progressFactory(reported) },
+        'FILE_IO_FAILURE',
+        'META_TRANSPORT',
+      ),
+  );
+
+  it('rejects a detected MIME mismatch with source stop, partial unlink, and single release', async () => {
+    // Declared JPEG metadata but PNG bytes: the magic disagrees.
+    const data = streamOf([MIN_PNG]);
+    await expectRejectedFile({ hops: [{ data }] }, 'MIME_MISMATCH');
+    expect(data.destroyed).toBe(true);
+  });
+
+  it('rejects a stream overflowing the 10 MiB bound before writing the excess byte', async () => {
+    const data = streamOf([Buffer.alloc(10_485_760, 1), Buffer.alloc(1, 2)]);
+    await expectRejectedFile({ hops: [{ data }] }, 'INVALID_MEDIA_SIZE');
+    expect(data.destroyed).toBe(true);
+  });
+
+  afterAll(async () => {
+    // Residue guard: every real temp path this suite created is unlinked.
+    for (const filePath of CREATED) await expectUnlinked(filePath);
+  });
 });
