@@ -11,7 +11,14 @@ export interface ValidatedMediaFile {
   filePath: string;
   mimeType: ReceiptMimeType;
   byteCount: number;
+  /** Provider-declared size from the metadata hop, before download-time validation. */
+  providerDeclaredBytes: number;
   sha256: Buffer;
+  /**
+   * Caller-owned technical cleanup of the validated temp file.
+   * Idempotent: after a successful return, repeating the call is a no-op.
+   */
+  cleanup(): Promise<void>;
 }
 export interface MetaMediaPort {
   resolveAndDownload(input: MetaMediaRequest): Promise<ValidatedMediaFile>;
@@ -20,8 +27,11 @@ export interface MetaMediaPort {
 export type MetaMediaErrorCategory = 'MEDIA_VALIDATION' | 'META_TRANSPORT';
 export type MetaMediaErrorCode =
   | 'UNSUPPORTED_MIME'
+  | 'INVALID_MEDIA_SIZE'
+  | 'MIME_MISMATCH'
   | 'PNG_STRUCTURE_INVALID'
   | 'JPEG_STRUCTURE_INVALID'
+  | 'FILE_IO_FAILURE'
   | 'NETWORK_FAILURE'
   | 'HTTP_RETRYABLE'
   | 'HTTP_PERMANENT'

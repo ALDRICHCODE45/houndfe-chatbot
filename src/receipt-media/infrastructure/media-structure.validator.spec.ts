@@ -1,6 +1,7 @@
 import {
   MetaMediaError,
   type MetaMediaPort,
+  type ValidatedMediaFile,
   META_MEDIA,
 } from '../domain/meta-media.port';
 import { validateMediaStructure } from './media-structure.validator';
@@ -84,7 +85,9 @@ describe('provider-id-only Meta media contract', () => {
           filePath: '/opaque/temp',
           mimeType: request.declaredMimeType,
           byteCount: 4,
+          providerDeclaredBytes: 4,
           sha256: Buffer.alloc(32),
+          cleanup: () => Promise.resolve(),
         }),
     };
 
@@ -104,6 +107,40 @@ describe('provider-id-only Meta media contract', () => {
       'Error: receipt-media:META_TRANSPORT/NETWORK_FAILURE',
     );
     expect(Object.keys(error).sort()).toEqual(['category', 'code']);
+  });
+});
+
+describe('validated media file contract', () => {
+  // These fixtures prove only the port surface, not the future B3
+  // filesystem/temp-file implementation (WU4B3B owns that behavior).
+  it('requires providerDeclaredBytes and a caller-owned cleanup seam', async () => {
+    let cleanupCalls = 0;
+    const file: ValidatedMediaFile = {
+      filePath: '/opaque/temp',
+      mimeType: 'image/png',
+      byteCount: 4,
+      providerDeclaredBytes: 4,
+      sha256: Buffer.alloc(32),
+      cleanup: () => {
+        cleanupCalls += 1;
+        return Promise.resolve();
+      },
+    };
+    expect(file.providerDeclaredBytes).toBe(4);
+    await expect(file.cleanup()).resolves.toBeUndefined();
+    await file.cleanup();
+    expect(cleanupCalls).toBe(2);
+  });
+
+  it.each([
+    ['MEDIA_VALIDATION', 'INVALID_MEDIA_SIZE'],
+    ['MEDIA_VALIDATION', 'MIME_MISMATCH'],
+    ['META_TRANSPORT', 'FILE_IO_FAILURE'],
+  ] as const)('constructs the fixed safe error %s/%s', (category, code) => {
+    const error = new MetaMediaError(category, code);
+    expect(error.category).toBe(category);
+    expect(error.code).toBe(code);
+    expect(String(error)).toBe(`Error: receipt-media:${category}/${code}`);
   });
 });
 
