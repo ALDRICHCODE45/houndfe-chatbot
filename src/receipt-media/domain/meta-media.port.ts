@@ -23,6 +23,8 @@ export type MetaMediaErrorCode =
   | 'PNG_STRUCTURE_INVALID'
   | 'JPEG_STRUCTURE_INVALID'
   | 'NETWORK_FAILURE'
+  | 'HTTP_RETRYABLE'
+  | 'HTTP_PERMANENT'
   | 'TIMEOUT'
   | 'ABORTED';
 
