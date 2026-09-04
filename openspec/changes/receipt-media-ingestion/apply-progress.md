@@ -1650,3 +1650,28 @@ Failed evidence `sha256:2ff77ced903ce21d10230040c6229ca7191e50265a26562fd2debeb0
 - `tasks.md`: during this remediation `WU4B3B2R2.1`, `WU4B3B2.1`/`WU4B3B2.2`, `WU4B3.1`/`WU4B3.2`, and the original aggregate WU4 steps 1–5 were re-opened `[ ]`; after the final green evidence all ten rows were re-closed `[x]` truthfully with the remediation/evidence note. WU5+ untouched.
 - Final scope audit: exactly four tracked modifications — the two owned files (`meta-media.client.ts`, `meta-media.client.spec.ts`) plus the OpenSpec `tasks.md`/`apply-progress.md` (all four tracked; the working tree also carries pre-existing untracked artifacts outside this surface, preserved untouched); nothing staged; no commit, push, PR, review, merge, branch switch, and no native attempt acquire/settle/reset/rescope/grant/review command (parent owns token `sha256:e8abd69d…`); no `.env`/secret/backend access; no model/SDD config, port, validator, policy, package, lockfile, migration, worker, or other OpenSpec artifact edits; R1A/R1B committed behavior and all prior R2 behavior preserved (all 128 focused assertions green from the final bytes); controlled runs created 0 `/tmp/receipt-media-*` residue and deleted 0 files; no live test/lint/tsc process remains.
 - This passing settlement remediates failed evidence `sha256:2ff77ced…` with distinct evidence `sha256:ba1f90a2…`; the parent handles native settlement.
+
+---
+
+## WU5A1 — narrow canonical key + private one-shot PutObject (maintainer-authorized split WU5A1 → WU5A2 → WU5B)
+
+**Branch:** `feat/receipt-media-ingestion-wu05-private-s3-adapter` | **Base HEAD:** `b9ca8f5d2981fe16a35b7329b550cdde8ab9a8bc` | **Disposition:** applied and verified green; aggregate WU5 remains pending — WU5A2/WU5B not started, no WU5A2/WU5B tests or production retained.
+
+- **Scope:** only the three owned files, rewritten from the preserved broader WU5A draft to the narrow contract; WU5A2 (DeleteObject, abort classification, stream counting/verification, compensation, HTTP/network mapping, cleanup-pending) and WU5B (get/head/public delete/retention) fully deferred; WU8/WU14 absent.
+- **TDD:** RED 6 failed / 1 passed against unchanged production (missing `OBJECT_STORAGE_PORT` Symbol token, missing `put` method, strict-config assertion); GREEN after two honest spec refinements (SDK resolved-credentials `$source` marker; provider-normalized region) → focused 7/7; TRIANGULATE covers exact PutObject composition (Body identity, exact signal identity, ACL absent, no delete), required non-empty ETag + nullable VersionId, caller key reuse on safe retry, 7-case pre-send validation matrix; REFACTOR needed no further compaction.
+- **Verification:** focused Jest twice 7/7; scoped ESLint (port/adapter/spec) clean; Prettier clean (3 code files); `git diff --check` clean; whitespace/CR/tab scan 0 matches; non-incremental tsc 0 errors; static audits clean (no AWS types in port; no delete/get/head/multipart/ACL/logs/raw causes in adapter); tmp `receipt-media-*` 0 before/after every run, 0 deleted; preserved untracked artifacts byte-identical.
+- **Line accounting (vs base `b9ca8f5`):** port 48 + adapter 80 + spec 174 = **302 new lines**; docs delta 20 (tasks.md 5−/3+, apply-progress.md 12+/0−); five-path total 322 ≤ 400; native rewrite 302 ≤ 400.
+- **Hashes:** port `sha256:cf86072ee365f96dc8ad7999eab63be1e69792418e1a5b8c79ef62681a25ffde`; adapter `sha256:ba26fbf5f5c591e9827000c1c3e8db5dc67aa80f7178e1dc6d3713f8fbbdbec9`; spec `sha256:54fbcb03a344607c08323449f879c07ee38ed85f2356018bd4742df6e43c099f`.
+
+### WU5A1 coverage remediation (maintainer-authorized, spec-only)
+
+Remediates failed evidence `sha256:38d704209f751fd94c1d1b4db061095240795ab9dbf133c19e98dced7406be9d` (five assertion gaps). **Truthfully a GREEN coverage remediation: no RED was produced or fabricated — static inspection predicted the assertions pass, and they did, immediately, against unchanged production.**
+
+- Gap 1: `callPut` now assigns the adapter to `const asPort: port.ObjectStoragePort` and calls `put` through it; the ad-hoc `unknown`→`{put}` cast path is removed, so the spec fails compilation if adapter/port diverge.
+- Gap 2: `await client.config.endpoint()` asserted to resolve `{ hostname: 's3.internal', protocol: 'https:' }` alongside existing region/credentials/forcePathStyle and command Bucket evidence.
+- Gap 3: `expect(sent[0].opts?.abortSignal).toBe(input.abortSignal)` — referential signal identity added beside the structural `toEqual`.
+- Gap 4: new test composes a successful PNG PutObject (`ContentType: 'image/png'`, Bucket/Key/ContentLength/ChecksumSHA256/Body identity, no ACL).
+- Gap 5: new test accepts byteCount exactly 1 and 10_485_760 with valid 32-byte digest, asserting command ContentLength evidence, exactly one send, and no delete command.
+- **Production edits: ZERO.** `object-storage.port.ts` and `s3-object-storage.adapter.ts` untouched (read-only, hashes below unchanged from the applied candidate).
+- Evidence: focused Jest **9/9 passed twice**; scoped ESLint (port/adapter/spec) clean; Prettier clean on all 5 candidate paths; `git diff --check` clean; tab/trailing-space matches 0; CR lines 0; non-incremental `tsc -p tsconfig.build.json --noEmit` 0 errors; tmp `receipt-media-*` 0 before and after every run, 0 deleted; WU5A2/WU5B remain absent.
+- Line accounting vs base `b9ca8f5`: port 48 + adapter 80 + spec 229 = 357 code lines; docs delta tasks.md 3+/5− (8) + apply-progress.md 25+/0− (25) = 33; **five-path total 390 ≤ 400**; remediation delta (spec +55, apply-progress +25, tasks note in-place) well ≤ 400.
