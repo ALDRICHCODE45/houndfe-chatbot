@@ -78,7 +78,7 @@ const safeError = async (
   promise: Promise<unknown>,
   code: string,
   category = 'META_TRANSPORT',
-) => {
+): Promise<MetaMediaError> => {
   const err: unknown = await promise.catch((error: unknown) => error);
   expect(err).toBeInstanceOf(MetaMediaError);
   expect(err).toMatchObject({
@@ -87,6 +87,7 @@ const safeError = async (
     message: `receipt-media:${category}/${code}`,
   });
   expect(JSON.stringify(err)).not.toMatch(LEAKY);
+  return err as MetaMediaError;
 };
 
 /** Shared rejection proof: one composed hop, the fixed safe error, and agent
@@ -703,11 +704,16 @@ const expectRejectedFile = async (
   options: Partial<Parameters<typeof makePipeline>[0]>,
   code: string,
   category: 'MEDIA_VALIDATION' | 'META_TRANSPORT' = 'MEDIA_VALIDATION',
-) => {
+): Promise<{ created: string[]; err: MetaMediaError }> => {
   const { client, destroyFns, created } = makePipeline(options);
-  await safeError(resolveAndDownload(client)(req()), code, category);
+  const err = await safeError(
+    resolveAndDownload(client)(req()),
+    code,
+    category,
+  );
   expect(destroyFns.at(-1)?.mock.calls.length).toBe(1);
   for (const filePath of created) await expectUnlinked(filePath);
+  return { created, err };
 };
 
 const resolveAndDownload = (client: MetaMediaClient) =>
@@ -807,7 +813,7 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B1b stream pipeline)', () => 
     }
   });
 
-  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1] as const)(
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 29] as const)(
     'fails closed on %j write progress without looping',
     (reported) =>
       expectRejectedFile(
@@ -1061,6 +1067,136 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
         'META_TRANSPORT',
       ),
   );
+
+  /** Overflow primary: a clean domain rejection (INVALID_MEDIA_SIZE) raised
+   *  while a real populated temp file already exists, so the failure-path
+   *  close and unlink steps of the cleanup-projection tests are genuine. */
+  const OVERFLOW = [Buffer.alloc(10_485_760, 1), Buffer.alloc(1, 2)];
+
+  /** Real unlink-failure seam: the failure-path close closes the real file,
+   *  then replaces it with a non-empty directory at the same path, so the
+   *  pipeline's own rm fails for real instead of via a stubbed rejection. */
+  const dirSwapFactory: MetaTempFileFactory = async (dir) => {
+    const file = await defaultTempFileFactory(dir);
+    return {
+      filePath: file.filePath,
+      write: (chunk: Buffer) => file.write(chunk),
+      close: async () => {
+        await file.close();
+        await fs.promises.rm(file.filePath, { force: true });
+        await fs.promises.mkdir(file.filePath);
+        await fs.promises.writeFile(path.join(file.filePath, 'inner'), 'x');
+      },
+    };
+  };
+
+  it('surfaces FILE_IO_FAILURE when failure-path close fails and still unlinks', () =>
+    // The primary INVALID_MEDIA_SIZE must not mask the real cleanup close
+    // failure; the unlink step still runs and removes the temp file.
+    expectRejectedFile(
+      {
+        hops: [{ data: streamOf(OVERFLOW) }],
+        createTempFile: closedFdFactory,
+      },
+      'FILE_IO_FAILURE',
+      'META_TRANSPORT',
+    ));
+
+  it('surfaces FILE_IO_FAILURE when failure-path unlink fails and leaks no temp detail', async () => {
+    const { client, destroyFns, created } = makePipeline({
+      hops: [{ data: streamOf(OVERFLOW) }],
+      createTempFile: dirSwapFactory,
+    });
+    try {
+      const err = await safeError(
+        resolveAndDownload(client)(req()),
+        'FILE_IO_FAILURE',
+        'META_TRANSPORT',
+      );
+      expect(destroyFns.at(-1)?.mock.calls.length).toBe(1);
+      for (const filePath of created)
+        expect(JSON.stringify(err)).not.toContain(filePath);
+    } finally {
+      // The failed real unlink leaves the swapped path: the test owns it.
+      for (const filePath of created) {
+        await fs.promises.rm(filePath, { recursive: true, force: true });
+        await expectUnlinked(filePath);
+      }
+    }
+  });
+
+  /** WU4B3B2 remediation: real Readable.from source whose public destroy()
+   *  is counted. Both Node's async-iterator completion (which destroys the
+   *  source on abrupt loop failure, mid-stream error, and normal end) and
+   *  the client's catch-path teardown are observable here, so exactly-once
+   *  source destruction is provable instead of assumed. */
+  const destroyCountingStream = (chunks: Buffer[]) => {
+    const data = streamOf(chunks);
+    const originalDestroy = data.destroy.bind(data);
+    const destroyCalls: Array<Error | null> = [];
+    data.destroy = (error?: Error) => {
+      destroyCalls.push(error ?? null);
+      return originalDestroy(error);
+    };
+    return { data, destroyCalls };
+  };
+
+  it('destroys the source exactly once when the stream loop fails abruptly on overflow', async () => {
+    const { data, destroyCalls } = destroyCountingStream(OVERFLOW);
+    await expectRejectedFile({ hops: [{ data }] }, 'INVALID_MEDIA_SIZE');
+    // The async iterator already destroyed the source during the abrupt
+    // loop exit; the catch path must not invoke destroy a second time.
+    expect(destroyCalls).toHaveLength(1);
+    expect(data.destroyed).toBe(true);
+  });
+
+  it('destroys the source exactly once when a post-loop validation fails', async () => {
+    const { data, destroyCalls } = destroyCountingStream([MIN_JPEG]);
+    await expectRejectedFile(
+      { hops: [{ data, headers: { 'content-length': '26' } }] },
+      'INVALID_MEDIA_SIZE',
+    );
+    // Normal loop completion also makes the async iterator destroy the
+    // source; the later Content-Length rejection must not re-destroy.
+    expect(destroyCalls).toHaveLength(1);
+    expect(data.destroyed).toBe(true);
+  });
+
+  it('still explicitly destroys an undestroyed source on a pre-loop response-header failure', async () => {
+    const { data, destroyCalls } = destroyCountingStream([MIN_JPEG]);
+    await expectRejectedFile(
+      { hops: [{ data, headers: { 'content-type': 'image/png' } }] },
+      'MIME_MISMATCH',
+    );
+    // The loop never consumed a byte, so Node has not destroyed the
+    // source: the catch-path teardown itself must destroy exactly once.
+    expect(destroyCalls).toHaveLength(1);
+    expect(data.destroyed).toBe(true);
+  });
+
+  it('projects a real cleanup unlink failure to the fixed safe FILE_IO_FAILURE projection', async () => {
+    const { client } = makePipeline();
+    const result = await resolveAndDownload(client)(req());
+    // Swap the validated file for a non-empty directory at the same path so
+    // the caller-owned cleanup rm fails for real instead of via a stub.
+    await fs.promises.rm(result.filePath, { force: true });
+    await fs.promises.mkdir(result.filePath);
+    await fs.promises.writeFile(path.join(result.filePath, 'inner'), 'x');
+    try {
+      const err = await safeError(
+        result.cleanup(),
+        'FILE_IO_FAILURE',
+        'META_TRANSPORT',
+      );
+      expect(JSON.stringify(err)).not.toContain(result.filePath);
+    } finally {
+      await fs.promises.rm(result.filePath, {
+        recursive: true,
+        force: true,
+      });
+      await expectUnlinked(result.filePath);
+    }
+  });
 
   afterAll(async () => {
     // Residue guard: every real temp path this describe created is unlinked.

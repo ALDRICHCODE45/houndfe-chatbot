@@ -4,7 +4,8 @@
  *  MetaMediaError, and the returned download URL is never followed here.
  *  WU4B2 added manual redirect download transport; WU4B3B1a added the
  *  infrastructure-local metadata projection; WU4B3B1b adds the successful
- *  bounded stream/temp-file pipeline on this same client surface. */
+ *  bounded stream/temp-file pipeline and WU4B3B2R1B the safe cleanup
+ *  projection on this same client surface. */
 import * as https from 'node:https';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -149,6 +150,17 @@ async function ioStep<T>(step: () => Promise<T>): Promise<T> {
     if (error instanceof MetaMediaError) throw error;
     throw new MetaMediaError('META_TRANSPORT', 'FILE_IO_FAILURE');
   }
+}
+
+/** One failure-path cleanup step: resolves false when the real close/unlink
+ *  step succeeds and true when it fails, so the caller can attempt every step
+ *  even after one fails, surface exactly one fixed safe FILE_IO_FAILURE, and
+ *  never recurse into further cleanup. */
+function failedStep(step: () => Promise<unknown>): Promise<boolean> {
+  return step().then(
+    () => false,
+    () => true,
+  );
 }
 
 /** WU4B3B2 response-header guards: the only allowed Content-Type
@@ -483,14 +495,14 @@ export class MetaMediaClient {
    *  incrementally, and stored in a real random exclusive mode-0600 temp file
    *  under the OS temp directory. The final agent is released exactly once
    *  after settlement; every failure path unlinks any partial temp file and
-   *  releases the agent. */
+   *  releases the agent, and a real failure-path close/unlink failure is
+   *  surfaced as the fixed safe FILE_IO_FAILURE instead of being swallowed. */
   async resolveAndDownload(
     request: MetaMediaRequest,
   ): Promise<ValidatedMediaFile> {
     let handle: MetaDownloadHandle | undefined;
     let source: Readable | undefined;
     let temp: MetaTempFile | undefined;
-    let succeeded = false;
     try {
       const metadata = await this.resolveMetadata(request);
       handle = await this.downloadStream(request, metadata.downloadUrl);
@@ -528,30 +540,45 @@ export class MetaMediaClient {
         throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
       validateMediaStructure(bytes, metadata.mimeType);
       handle.release(); // settlement complete: final agent released exactly once
-      succeeded = true;
       return {
         filePath: tempPath,
         mimeType: metadata.mimeType,
         byteCount,
         providerDeclaredBytes: metadata.providerDeclaredBytes,
         sha256: hash.digest(),
-        // Caller-owned idempotent technical cleanup of the validated file.
-        cleanup: () => fs.promises.rm(tempPath, { force: true }),
+        // Caller-owned idempotent technical cleanup of the validated file:
+        // a real unlink failure is projected to the fixed safe
+        // FILE_IO_FAILURE, never any raw path, errno, or system detail.
+        cleanup: () => ioStep(() => fs.promises.rm(tempPath, { force: true })),
       };
     } catch (error) {
-      source?.destroy();
-      throw mapTransportError(error);
-    } finally {
-      if (!succeeded) {
-        handle?.release();
-        // Release the descriptor and unlink any partial temp file. A repeated
-        // close after an in-flight close is swallowed by the catch.
-        if (temp !== undefined) await temp.close().catch(() => undefined);
-        if (temp !== undefined)
-          await fs.promises
-            .rm(temp.filePath, { force: true })
-            .catch(() => undefined);
+      // Exactly-once source teardown: once the for-await loop has consumed
+      // the source, Node's async-iterator completion (abrupt failure, mid-
+      // stream error, or normal end) has already destroyed it, and a second
+      // explicit destroy would invoke the stream's destroy again. Only a
+      // failure before the loop consumed a byte leaves the source
+      // undestroyed, and that teardown stays explicitly ours here.
+      if (source !== undefined && !source.destroyed) source.destroy();
+      handle?.release(); // exactly once: settlement never reaches here
+      let cleanupFailed = false;
+      if (temp !== undefined) {
+        const pending = temp;
+        // Close then unlink even after one step fails; each real failure is
+        // captured, never recursively cleaned, and surfaced once below.
+        if (await failedStep(() => pending.close())) cleanupFailed = true;
+        if (
+          await failedStep(() =>
+            fs.promises.rm(pending.filePath, { force: true }),
+          )
+        )
+          cleanupFailed = true;
       }
+      // A real cleanup failure replaces the primary error so a caller can
+      // never believe a temp file was removed when it was not; otherwise
+      // the original safe domain error is preserved unchanged.
+      if (cleanupFailed)
+        throw new MetaMediaError('META_TRANSPORT', 'FILE_IO_FAILURE');
+      throw mapTransportError(error);
     }
   }
 }
