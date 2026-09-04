@@ -87,6 +87,10 @@ const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex');
 const invalidSize = (): MetaMediaError =>
   new MetaMediaError('MEDIA_VALIDATION', 'INVALID_MEDIA_SIZE');
 
+/** Fixed safe cancellation marker: maps a caller abort to the fixed safe ABORTED. */
+const canceled = (): Error =>
+  Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' });
+
 /** Narrow WU4B3 seam: one open exclusive temp file handle. write resolves to
  *  the bytesWritten count actually persisted for the given chunk; a void
  *  result reports no progress and fails closed. */
@@ -512,45 +516,66 @@ export class MetaMediaClient {
       if (responseMimeOf(handle.response.headers) !== metadata.mimeType)
         throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
       const contentLength = responseLengthOf(handle.response.headers);
-      const tempFile = await ioStep(() => this.createTempFile(os.tmpdir()));
-      temp = tempFile;
-      const tempPath = tempFile.filePath;
-      const hash = createHash('sha256');
-      let byteCount = 0;
-      // Async iteration keeps the source paused between awaited writes, so the
-      // provider stream is consumed with backpressure.
-      for await (const chunk of source) {
-        const buffer = Buffer.isBuffer(chunk)
-          ? chunk
-          : Buffer.from(chunk as string);
-        byteCount += buffer.length;
-        // The bound is enforced before any overflowing byte is written.
-        if (byteCount > MAX_MEDIA_BYTES) throw invalidSize();
-        hash.update(buffer);
-        // Every byte must be on disk before the next chunk is read.
-        await writeAll(temp, buffer);
-      }
-      await ioStep(() => tempFile.close());
-      // A present Content-Length must equal the final counted bytes.
-      if (contentLength !== undefined && contentLength !== byteCount)
-        throw invalidSize();
-      // Bounded read-back: the enforced cap guarantees at most 10 MiB here.
-      const bytes = await ioStep(() => fs.promises.readFile(tempPath));
-      if (detectMagic(bytes) !== metadata.mimeType)
-        throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
-      validateMediaStructure(bytes, metadata.mimeType);
-      handle.release(); // settlement complete: final agent released exactly once
-      return {
-        filePath: tempPath,
-        mimeType: metadata.mimeType,
-        byteCount,
-        providerDeclaredBytes: metadata.providerDeclaredBytes,
-        sha256: hash.digest(),
-        // Caller-owned idempotent technical cleanup of the validated file:
-        // a real unlink failure is projected to the fixed safe
-        // FILE_IO_FAILURE, never any raw path, errno, or system detail.
-        cleanup: () => ioStep(() => fs.promises.rm(tempPath, { force: true })),
+      // WU4B3B2R2 source-error-lifecycle: the observation is registered BEFORE
+      // the first awaited window after the active body and replays an
+      // already-fired abort right after registration. An abort destroys the
+      // source exactly once WITHOUT an error (a pre-iterator destroy needs no
+      // late consumer); signal-state checks at each later window keep ABORTED.
+      const onAbort = (): void => {
+        if (source !== undefined && !source.destroyed) source.destroy();
       };
+      request.signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        if (request.signal.aborted) throw canceled(); // replay a fired abort
+        const tempFile = await ioStep(() => this.createTempFile(os.tmpdir()));
+        temp = tempFile;
+        // Post-create re-check: an abort in the awaited creation window must stop.
+        if (request.signal.aborted) throw canceled();
+        const tempPath = tempFile.filePath;
+        const hash = createHash('sha256');
+        let byteCount = 0;
+        // Async iteration keeps the source paused between awaited writes,
+        // so the provider stream is consumed with backpressure.
+        for await (const chunk of source) {
+          const buffer = Buffer.isBuffer(chunk)
+            ? chunk
+            : Buffer.from(chunk as string);
+          byteCount += buffer.length;
+          // The bound is enforced before any overflowing byte is written.
+          if (byteCount > MAX_MEDIA_BYTES) throw invalidSize();
+          hash.update(buffer);
+          // Every byte must be on disk before the next chunk is read.
+          await writeAll(temp, buffer);
+        }
+        // Loop-completion boundary: even a clean iterator end must stay ABORTED.
+        if (request.signal.aborted) throw canceled();
+        await ioStep(() => tempFile.close());
+        // A present Content-Length must equal the final counted bytes.
+        if (contentLength !== undefined && contentLength !== byteCount)
+          throw invalidSize();
+        // Bounded read-back: the enforced cap guarantees at most 10 MiB here.
+        const bytes = await ioStep(() => fs.promises.readFile(tempPath));
+        // A live abort in the close/read-back windows must still settle ABORTED.
+        if (request.signal.aborted) throw canceled();
+        if (detectMagic(bytes) !== metadata.mimeType)
+          throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
+        validateMediaStructure(bytes, metadata.mimeType);
+        handle.release(); // settlement complete: final agent released exactly once
+        return {
+          filePath: tempPath,
+          mimeType: metadata.mimeType,
+          byteCount,
+          providerDeclaredBytes: metadata.providerDeclaredBytes,
+          sha256: hash.digest(),
+          // Caller-owned idempotent technical cleanup of the validated file:
+          // a real unlink failure is projected to the fixed safe
+          // FILE_IO_FAILURE, never any raw path, errno, or system detail.
+          cleanup: () =>
+            ioStep(() => fs.promises.rm(tempPath, { force: true })),
+        };
+      } finally {
+        request.signal.removeEventListener('abort', onAbort);
+      }
     } catch (error) {
       // Exactly-once source teardown: once the for-await loop has consumed
       // the source, Node's async-iterator completion (abrupt failure, mid-
@@ -578,6 +603,10 @@ export class MetaMediaClient {
       // the original safe domain error is preserved unchanged.
       if (cleanupFailed)
         throw new MetaMediaError('META_TRANSPORT', 'FILE_IO_FAILURE');
+      // Catch boundary: a live caller abort after any registered window must
+      // surface the fixed safe ABORTED, never a raw premature-close reason.
+      if (request.signal.aborted)
+        throw new MetaMediaError('META_TRANSPORT', 'ABORTED');
       throw mapTransportError(error);
     }
   }

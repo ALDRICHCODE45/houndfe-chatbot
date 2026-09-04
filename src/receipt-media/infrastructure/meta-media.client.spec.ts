@@ -1,6 +1,7 @@
 /** WU4B1B/WU4B2/WU4B3B1b spec: metadata composition, manual-redirect download
  *  transport, and the successful bounded stream/temp-file pipeline proofs. */
 import { createHash } from 'node:crypto';
+import { getEventListeners } from 'node:events';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -979,6 +980,7 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
       'META_TRANSPORT',
     );
     expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(1); // no persistent consumer
   });
 
   it('maps a mid-stream abort to ABORTED with the same stop and cleanup guarantees', async () => {
@@ -987,6 +989,291 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
     );
     await expectRejectedFile({ hops: [{ data }] }, 'ABORTED', 'META_TRANSPORT');
     expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(1); // no persistent consumer
+  });
+
+  /** WU4B3B2R2 real mid-stream abort: a live AbortController transitions from
+   *  not-aborted to aborted only after streaming has begun, so production must
+   *  observe it; the second read then offers a never-consumed trailing chunk. */
+  const abortingStream = (controller: AbortController): Readable => {
+    let reads = 0;
+    return new Readable({
+      read() {
+        reads += 1;
+        if (reads === 1) {
+          this.push(MIN_JPEG);
+          return;
+        }
+        if (reads > 2) {
+          this.push(null);
+          return;
+        }
+        setImmediate(() => {
+          controller.abort();
+          setImmediate(() => this.push(Buffer.from('trailing-after-abort')));
+        });
+      },
+    });
+  };
+
+  it('observes a real mid-stream AbortController transition and stops without writing any byte after abort', async () => {
+    const controller = new AbortController();
+    const data = abortingStream(controller);
+    const originalDestroy = data.destroy.bind(data);
+    const destroyCalls: Array<Error | null> = [];
+    data.destroy = (error?: Error) => {
+      destroyCalls.push(error ?? null);
+      return originalDestroy(error);
+    };
+    const written: Buffer[] = [];
+    const capturingFactory: MetaTempFileFactory = async (dir) => {
+      const file = await defaultTempFileFactory(dir);
+      return {
+        filePath: file.filePath,
+        write: async (chunk: Buffer) => {
+          written.push(chunk);
+          return file.write(chunk);
+        },
+        close: () => file.close(),
+      };
+    };
+    const { client, destroyFns, created } = makePipeline({
+      hops: [{ data }],
+      createTempFile: capturingFactory,
+    });
+    await safeError(
+      resolveAndDownload(client)({ ...req(), signal: controller.signal }),
+      'ABORTED',
+    );
+    expect(data.destroyed).toBe(true);
+    expect(destroyCalls).toHaveLength(1); // exactly-once source teardown
+    expect(data.listenerCount('error')).toBe(1); // only Node's iterator handler
+    expect(written).toEqual([MIN_JPEG]); // trailing byte never written/hashed
+    expect(destroyFns.at(-1)?.mock.calls.length).toBe(1);
+    for (const filePath of created) await expectUnlinked(filePath);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('surfaces the truthful FILE_IO_FAILURE when a real mid-stream abort and a cleanup failure coincide', async () => {
+    const controller = new AbortController();
+    const data = abortingStream(controller);
+    const written: Buffer[] = [];
+    const createTempFile: MetaTempFileFactory = async (dir) => {
+      const file = await closedFdFactory(dir);
+      return {
+        ...file,
+        write: async (chunk: Buffer) => {
+          written.push(chunk);
+          return file.write(chunk);
+        },
+      };
+    };
+    const { client, destroyFns, created } = makePipeline({
+      hops: [{ data }],
+      createTempFile,
+    });
+    await safeError(
+      resolveAndDownload(client)({ ...req(), signal: controller.signal }),
+      'FILE_IO_FAILURE',
+      'META_TRANSPORT',
+    );
+    // The real transition must still have been observed mid-stream: only the
+    // first chunk may be written, then the close failure takes precedence.
+    expect(written).toEqual([MIN_JPEG]);
+    expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(1); // no persistent consumer
+    expect(destroyFns.at(-1)?.mock.calls.length).toBe(1);
+    for (const filePath of created) await expectUnlinked(filePath);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  /** WU4B3B2R2 pre-registration-abort race: the awaited temp-file creation is
+   *  the first window after the body is active where an abort can fire while no
+   *  body observation exists, so production registering only after creation
+   *  misses it and consumes the trailing body (the factory gates on abort). */
+  it('replays an abort that fires during the awaited temp-file creation window and stops before any trailing body read', async () => {
+    const controller = new AbortController();
+    const trailing = Buffer.from('trailing-after-temp-create-abort');
+    let reads = 0;
+    const data = new Readable({
+      read() {
+        reads += 1;
+        if (reads === 1) {
+          this.push(MIN_JPEG);
+          return;
+        }
+        if (reads > 2) {
+          this.push(null);
+          return;
+        }
+        // Only reached if production resumes the loop after the abort.
+        this.push(trailing);
+      },
+    });
+    const originalDestroy = data.destroy.bind(data);
+    const destroyCalls: Array<Error | null> = [];
+    data.destroy = (error?: Error) => {
+      destroyCalls.push(error ?? null);
+      return originalDestroy(error);
+    };
+    const written: Buffer[] = [];
+    let gated = false;
+    let openGate: (() => void) | undefined;
+    const gatedFactory: MetaTempFileFactory = async (dir) => {
+      const file = await defaultTempFileFactory(dir);
+      gated = true;
+      await new Promise<void>((resolve) => {
+        openGate = resolve;
+      });
+      return {
+        filePath: file.filePath,
+        write: async (chunk: Buffer) => {
+          written.push(chunk);
+          return file.write(chunk);
+        },
+        close: () => file.close(),
+      };
+    };
+    const { client, destroyFns, created } = makePipeline({
+      hops: [{ data }],
+      createTempFile: gatedFactory,
+    });
+    const pending = safeError(
+      resolveAndDownload(client)({ ...req(), signal: controller.signal }),
+      'ABORTED',
+    );
+    // Abort once creation is pending and the awaited window can miss the signal.
+    for (let i = 0; i < 10_000 && !gated; i += 1)
+      await new Promise((resolve) => setImmediate(resolve));
+    expect(gated).toBe(true);
+    controller.abort();
+    // Hold the gate: a pre-iterator destroy must not rely on a later consumer.
+    for (let i = 0; i < 5; i += 1)
+      await new Promise((resolve) => setImmediate(resolve));
+    openGate?.();
+    await pending;
+    expect(reads).toBe(0); // no trailing body read after the abort
+    expect(written).toEqual([]); // no body byte written or hashed after abort
+    expect(data.destroyed).toBe(true);
+    expect(destroyCalls).toHaveLength(1); // exactly-once source teardown
+    expect(data.listenerCount('error')).toBe(0); // loop never attached
+    expect(destroyFns.at(-1)?.mock.calls.length).toBe(1); // agent released once
+    for (const filePath of created) await expectUnlinked(filePath);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  /** WU4B3B2R2 post-temp-create abort recheck: if the source is ALREADY
+   *  destroyed when the abort fires, the onAbort observation intentionally does
+   *  nothing (a destroyed source is never re-destroyed), so production without
+   *  a post-await re-check would resume the stream loop instead of returning
+   *  the fixed safe ABORTED; the gate pauses creation until the source is
+   *  destroyed and the controller has aborted, then resolves. */
+  it('returns the fixed safe ABORTED when the source is destroyed and the signal aborts during the awaited temp-file creation window', async () => {
+    const controller = new AbortController();
+    let reads = 0;
+    const data = new Readable({
+      read() {
+        reads += 1;
+        if (reads === 1) {
+          this.push(MIN_JPEG);
+          return;
+        }
+        this.push(null);
+      },
+    });
+    const originalDestroy = data.destroy.bind(data);
+    const destroyCalls: Array<Error | null> = [];
+    data.destroy = (error?: Error) => {
+      destroyCalls.push(error ?? null);
+      return originalDestroy(error);
+    };
+    const written: Buffer[] = [];
+    let gated = false;
+    let openGate: (() => void) | undefined;
+    const gatedFactory: MetaTempFileFactory = async (dir) => {
+      const file = await defaultTempFileFactory(dir);
+      gated = true;
+      await new Promise<void>((resolve) => {
+        openGate = resolve;
+      });
+      return {
+        filePath: file.filePath,
+        write: async (chunk: Buffer) => {
+          written.push(chunk);
+          return file.write(chunk);
+        },
+        close: () => file.close(),
+      };
+    };
+    const { client, destroyFns, created } = makePipeline({
+      hops: [{ data }],
+      createTempFile: gatedFactory,
+    });
+    const pending = safeError(
+      resolveAndDownload(client)({ ...req(), signal: controller.signal }),
+      'ABORTED',
+    );
+    for (let i = 0; i < 10_000 && !gated; i += 1)
+      await new Promise((resolve) => setImmediate(resolve));
+    expect(gated).toBe(true);
+    data.destroy(); // the source is gone before the abort fires
+    controller.abort(); // onAbort sees a destroyed source and does nothing
+    openGate?.();
+    await pending;
+    expect(reads).toBe(0); // no body read at all
+    expect(written).toEqual([]); // no body byte written or hashed
+    expect(data.destroyed).toBe(true);
+    expect(destroyCalls).toHaveLength(1); // exactly-once: only the test's destroy
+    expect(data.listenerCount('error')).toBe(0); // no persistent consumer
+    expect(destroyFns.at(-1)?.mock.calls.length).toBe(1); // agent released once
+    for (const filePath of created) await expectUnlinked(filePath);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  /** WU4B3B2R2 post-loop abort settlement: a live abort firing inside the
+   *  awaited post-loop windows must still settle as the fixed safe ABORTED. */
+  it('returns the fixed safe ABORTED when a live abort fires during the awaited post-loop close window', async () => {
+    const controller = new AbortController();
+    const { data, destroyCalls } = destroyCountingStream([MIN_JPEG]);
+    const abortingCloseFactory: MetaTempFileFactory = async (dir) => {
+      const file = await defaultTempFileFactory(dir);
+      return {
+        ...file,
+        close: () => {
+          controller.abort(); // live abort inside the awaited close window
+          return file.close();
+        },
+      };
+    };
+    const { client, destroyFns, created } = makePipeline({
+      hops: [{ data }],
+      createTempFile: abortingCloseFactory,
+    });
+    await safeError(
+      resolveAndDownload(client)({ ...req(), signal: controller.signal }),
+      'ABORTED',
+    );
+    expect(destroyCalls).toHaveLength(1); // exactly-once source teardown
+    expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(1); // no persistent consumer
+    expect(destroyFns.at(-1)?.mock.calls.length).toBe(1); // agent released once
+    for (const filePath of created) await expectUnlinked(filePath);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes the abort observation after a successful pipeline (no listener leak)', async () => {
+    const controller = new AbortController();
+    const { client } = makePipeline();
+    const result = await resolveAndDownload(client)({
+      ...req(),
+      signal: controller.signal,
+    });
+    try {
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+      expect(result.byteCount).toBe(MIN_JPEG.length);
+    } finally {
+      await result.cleanup();
+    }
   });
 
   it('rejects an already-active abort signal with no download request and no temp', async () => {
@@ -1000,6 +1287,8 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
     expect(calls).toHaveLength(1); // metadata hop only, no download request
     expect(destroyFns[0]).toHaveBeenCalledTimes(1);
     expect(created).toHaveLength(0);
+    // A pre-aborted signal never registers the abort observation.
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
   });
 
   /** Real-fs failure seams: every simulated I/O failure below is produced by
@@ -1148,6 +1437,7 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
     // loop exit; the catch path must not invoke destroy a second time.
     expect(destroyCalls).toHaveLength(1);
     expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(1); // no persistent consumer
   });
 
   it('destroys the source exactly once when a post-loop validation fails', async () => {
@@ -1160,6 +1450,7 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
     // source; the later Content-Length rejection must not re-destroy.
     expect(destroyCalls).toHaveLength(1);
     expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(1); // no persistent consumer
   });
 
   it('still explicitly destroys an undestroyed source on a pre-loop response-header failure', async () => {
@@ -1169,9 +1460,11 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
       'MIME_MISMATCH',
     );
     // The loop never consumed a byte, so Node has not destroyed the
-    // source: the catch-path teardown itself must destroy exactly once.
+    // source: the catch-path teardown itself must destroy exactly once,
+    // leaving zero source-error listeners (no iterator ever attached).
     expect(destroyCalls).toHaveLength(1);
     expect(data.destroyed).toBe(true);
+    expect(data.listenerCount('error')).toBe(0);
   });
 
   it('projects a real cleanup unlink failure to the fixed safe FILE_IO_FAILURE projection', async () => {
