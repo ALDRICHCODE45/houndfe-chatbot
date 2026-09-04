@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import { Readable } from 'node:stream';
 import type { Agent } from 'node:https';
 import type { LookupAddress } from 'node:dns';
@@ -619,7 +620,7 @@ const streamOf = (chunks: Buffer[]): Readable => Readable.from(chunks);
 
 const LOOKASIDE_HOST = 'lookaside.fbsbx.com';
 
-type Hop = { data?: unknown };
+type Hop = { data?: unknown; headers?: Record<string, unknown> };
 
 /** Every real temp path created through the pipeline harness across the whole
  *  suite; the describe-level residue guard proves each one is unlinked. */
@@ -639,6 +640,11 @@ function makePipeline(
   let hopIndex = 0;
   const http: MetaHttp = (config) => {
     calls.push(config);
+    // Real Axios behavior mirrored: a pre-aborted signal rejects the hop.
+    if (config.signal?.aborted)
+      return Promise.reject(
+        Object.assign(new Error('aborted'), { code: 'ERR_CANCELED' }),
+      );
     if (config.responseType !== 'stream')
       return Promise.resolve({
         status: 200,
@@ -649,6 +655,8 @@ function makePipeline(
       return Promise.reject(new Error('unexpected additional hop'));
     return Promise.resolve({
       status: 200,
+      // Default agreed Content-Type; explicit hop headers may override.
+      headers: { 'content-type': 'image/jpeg', ...hop.headers },
       data: hop.data === undefined ? streamOf([MIN_JPEG]) : hop.data,
     });
   };
@@ -754,7 +762,9 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B1b stream pipeline)', () => 
     // No response header is asserted: B3B2 owns canonical response-header guards.
     const { client } = makePipeline({
       metadata: { ...META_OK, mime_type: 'image/png' },
-      hops: [{ data: streamOf([MIN_PNG]) }],
+      hops: [
+        { data: streamOf([MIN_PNG]), headers: { 'content-type': 'image/png' } },
+      ],
     });
     const result = await resolveAndDownload(client)(
       req('media-123', 'image/png'),
@@ -807,6 +817,21 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B1b stream pipeline)', () => 
       ),
   );
 
+  /** Genuine void progress: reports undefined without ever touching the real
+   *  write path, so the regression cannot pass through a helper default
+   *  parameter that falls back to a real write. */
+  const voidProgressFactory: MetaTempFileFactory = async (dir) => ({
+    ...(await defaultTempFileFactory(dir)),
+    write: () => Promise.resolve(undefined),
+  });
+
+  it('fails closed on a genuine void write progress without looping', () =>
+    expectRejectedFile(
+      { createTempFile: voidProgressFactory },
+      'FILE_IO_FAILURE',
+      'META_TRANSPORT',
+    ));
+
   it('rejects a detected MIME mismatch with source stop, partial unlink, and single release', async () => {
     // Declared JPEG metadata but PNG bytes: the magic disagrees.
     const data = streamOf([MIN_PNG]);
@@ -822,6 +847,223 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B1b stream pipeline)', () => 
 
   afterAll(async () => {
     // Residue guard: every real temp path this suite created is unlinked.
+    for (const filePath of CREATED) await expectUnlinked(filePath);
+  });
+});
+
+/** WU4B3B2 failure matrix: response-header agreement, structure rejections,
+ *  abort/error stream stops, deterministic real-I/O failure mapping, and
+ *  every-path technical cleanup. Cases the 418829f baseline already satisfies
+ *  are kept alongside the RED gaps as regression proof of the full matrix. */
+describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup)', () => {
+  it.each([
+    ['missing', { 'content-type': undefined }],
+    ['unsupported', { 'content-type': 'image/webp' }],
+    ['declared-mismatching', { 'content-type': 'image/png' }],
+  ])(
+    'rejects a %s response Content-Type with MIME_MISMATCH',
+    (_label, headers) =>
+      expectRejectedFile({ hops: [{ headers }] }, 'MIME_MISMATCH'),
+  );
+
+  it.each(['image/jpeg; charset=binary', 'image/jpeg ;charset=binary'])(
+    'accepts the parameterized matching response Content-Type %j',
+    async (value) => {
+      const { client } = makePipeline({
+        hops: [{ headers: { 'content-type': value } }],
+      });
+      const result = await resolveAndDownload(client)(req());
+      try {
+        expect(result.mimeType).toBe('image/jpeg');
+        expect(result.byteCount).toBe(MIN_JPEG.length);
+      } finally {
+        await result.cleanup();
+      }
+    },
+  );
+
+  it.each([
+    ['malformed', 'abc'],
+    ['empty', ''],
+    ['negative', '-1'],
+    ['fractional', '1.5'],
+    ['non-string', 27],
+    ['unsafe', '9007199254740993'],
+    ['over the limit', '10485761'],
+    ['final-count mismatching', '26'],
+  ])(
+    'rejects a %s response Content-Length with INVALID_MEDIA_SIZE',
+    (_label, value: unknown) =>
+      expectRejectedFile(
+        { hops: [{ headers: { 'content-length': value } }] },
+        'INVALID_MEDIA_SIZE',
+      ),
+  );
+
+  it('accepts a present matching and an absent Content-Length independently of providerDeclaredBytes', async () => {
+    const matched = makePipeline({
+      hops: [{ headers: { 'content-length': String(MIN_JPEG.length) } }],
+    });
+    const present = await resolveAndDownload(matched.client)(req());
+    try {
+      expect(present.byteCount).toBe(MIN_JPEG.length);
+      expect(present.providerDeclaredBytes).toBe(4321);
+    } finally {
+      await present.cleanup();
+    }
+    const absent = await resolveAndDownload(makePipeline().client)(req());
+    try {
+      expect(absent.byteCount).toBe(MIN_JPEG.length);
+    } finally {
+      await absent.cleanup();
+    }
+  });
+
+  // Truncated SOI-only JPEG (no SOF/SOS/EOI) and a truncated PNG IHDR chunk.
+  const MALFORMED_JPEG = Buffer.from(
+    'ffd8000000000000000000000000000000000000000000',
+    'hex',
+  );
+  const MALFORMED_PNG = Buffer.from(
+    '89504e470d0a1a0a0000000d4948445200000001000000010800',
+    'hex',
+  );
+
+  it('rejects a malformed JPEG body with JPEG_STRUCTURE_INVALID', () =>
+    expectRejectedFile(
+      { hops: [{ data: streamOf([MALFORMED_JPEG]) }] },
+      'JPEG_STRUCTURE_INVALID',
+    ));
+
+  it('rejects a malformed PNG body with PNG_STRUCTURE_INVALID', async () => {
+    // Declared PNG throughout: the rejection must come from the structure
+    // validator, not from the metadata/magic agreement guards.
+    const { client, destroyFns, created } = makePipeline({
+      metadata: { ...META_OK, mime_type: 'image/png' },
+      hops: [
+        {
+          data: streamOf([MALFORMED_PNG]),
+          headers: { 'content-type': 'image/png' },
+        },
+      ],
+    });
+    await safeError(
+      resolveAndDownload(client)(req('media-123', 'image/png')),
+      'PNG_STRUCTURE_INVALID',
+      'MEDIA_VALIDATION',
+    );
+    expect(destroyFns.at(-1)?.mock.calls.length).toBe(1);
+    for (const filePath of created) await expectUnlinked(filePath);
+  });
+
+  /** Real mid-stream stop: one chunk is delivered, then the source fails. */
+  const erroredStream = (error: Error): Readable =>
+    new Readable({
+      read() {
+        setImmediate(() => this.destroy(error));
+        this.push(MIN_JPEG);
+      },
+    });
+
+  it('stops reading on a mid-stream error: source destroyed, agent released once, temp removed', async () => {
+    const data = erroredStream(new Error('stream failed'));
+    await expectRejectedFile(
+      { hops: [{ data }] },
+      'NETWORK_FAILURE',
+      'META_TRANSPORT',
+    );
+    expect(data.destroyed).toBe(true);
+  });
+
+  it('maps a mid-stream abort to ABORTED with the same stop and cleanup guarantees', async () => {
+    const data = erroredStream(
+      Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }),
+    );
+    await expectRejectedFile({ hops: [{ data }] }, 'ABORTED', 'META_TRANSPORT');
+    expect(data.destroyed).toBe(true);
+  });
+
+  it('rejects an already-active abort signal with no download request and no temp', async () => {
+    const { client, calls, destroyFns, created } = makePipeline();
+    const controller = new AbortController();
+    controller.abort();
+    await safeError(
+      resolveAndDownload(client)({ ...req(), signal: controller.signal }),
+      'ABORTED',
+    );
+    expect(calls).toHaveLength(1); // metadata hop only, no download request
+    expect(destroyFns[0]).toHaveBeenCalledTimes(1);
+    expect(created).toHaveLength(0);
+  });
+
+  /** Real-fs failure seams: every simulated I/O failure below is produced by
+   *  a genuine fs rejection, never a stubbed throw. */
+  const openMissingDirFactory: MetaTempFileFactory = async (dir) => {
+    await fs.promises.open(
+      path.join(dir, 'receipt-media-no-such-dir', 'x'),
+      'wx',
+      0o600,
+    );
+    throw new Error('unreachable');
+  };
+
+  const readOnlyFactory: MetaTempFileFactory = async (dir) => {
+    const file = await defaultTempFileFactory(dir);
+    const handle = await fs.promises.open(file.filePath, 'r');
+    return {
+      filePath: file.filePath,
+      write: async (chunk: Buffer) => (await handle.write(chunk)).bytesWritten, // real EBADF on 'r' fd
+      close: async () => {
+        await handle.close();
+        await file.close();
+      },
+    };
+  };
+
+  const closedFdFactory: MetaTempFileFactory = async (dir) => {
+    const file = await defaultTempFileFactory(dir);
+    const handle = await fs.promises.open(file.filePath, 'r+');
+    return {
+      ...file,
+      close: async () => {
+        // Every real FileHandle is explicitly closed before the real
+        // EBADF, so no descriptor is ever left to the garbage collector.
+        await file.close();
+        const fd = handle.fd;
+        await handle.close();
+        fs.closeSync(fd); // real EBADF: the fd was already closed
+      },
+    };
+  };
+
+  const selfDeletingFactory: MetaTempFileFactory = async (dir) => {
+    const file = await defaultTempFileFactory(dir);
+    return {
+      ...file,
+      close: async () => {
+        await file.close();
+        await fs.promises.rm(file.filePath, { force: true });
+      },
+    };
+  };
+
+  it.each([
+    ['open', openMissingDirFactory],
+    ['write', readOnlyFactory],
+    ['close', closedFdFactory],
+    ['read-back', selfDeletingFactory],
+  ] as const)(
+    'maps a real temp-%s failure to FILE_IO_FAILURE with zero residue',
+    (_label, factory) =>
+      expectRejectedFile(
+        { createTempFile: factory },
+        'FILE_IO_FAILURE',
+        'META_TRANSPORT',
+      ),
+  );
+
+  afterAll(async () => {
+    // Residue guard: every real temp path this describe created is unlinked.
     for (const filePath of CREATED) await expectUnlinked(filePath);
   });
 });

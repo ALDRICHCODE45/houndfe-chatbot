@@ -127,7 +127,7 @@ function detectMagic(bytes: Buffer): ReceiptMimeType | undefined {
 async function writeAll(temp: MetaTempFile, chunk: Buffer): Promise<void> {
   let written = 0;
   while (written < chunk.length) {
-    const progress = await temp.write(chunk.subarray(written));
+    const progress = await ioStep(() => temp.write(chunk.subarray(written)));
     if (
       typeof progress !== 'number' ||
       !Number.isSafeInteger(progress) ||
@@ -137,6 +137,40 @@ async function writeAll(temp: MetaTempFile, chunk: Buffer): Promise<void> {
       throw new MetaMediaError('META_TRANSPORT', 'FILE_IO_FAILURE');
     written += progress;
   }
+}
+
+/** WU4B3B2: temp-pipeline I/O failures (open/write/close/read-back) map to
+ *  the fixed safe FILE_IO_FAILURE; projected rejections pass through and no
+ *  I/O detail (path, fd, errno, cause) reaches any caller-visible error. */
+async function ioStep<T>(step: () => Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    if (error instanceof MetaMediaError) throw error;
+    throw new MetaMediaError('META_TRANSPORT', 'FILE_IO_FAILURE');
+  }
+}
+
+/** WU4B3B2 response-header guards: the only allowed Content-Type
+ *  normalization is parameter stripping and the value must equal the agreed
+ *  canonical MIME; an absent Content-Length is accepted, a present one must
+ *  be a valid safe non-negative decimal within the design bound and is later
+ *  required to equal the final counted byte total exactly. */
+function responseMimeOf(headers: unknown): string | undefined {
+  if (typeof headers !== 'object' || headers === null) return undefined;
+  const raw = (headers as Record<string, unknown>)['content-type'];
+  return typeof raw === 'string' ? raw.split(';')[0].trim() : undefined;
+}
+
+function responseLengthOf(headers: unknown): number | undefined {
+  if (typeof headers !== 'object' || headers === null) return undefined;
+  const raw = (headers as Record<string, unknown>)['content-length'];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) throw invalidSize();
+  const length = Number(raw);
+  if (!Number.isSafeInteger(length) || length > MAX_MEDIA_BYTES)
+    throw invalidSize();
+  return length;
 }
 
 /** The only canonical media types the whole pipeline accepts. */
@@ -461,8 +495,14 @@ export class MetaMediaClient {
       const metadata = await this.resolveMetadata(request);
       handle = await this.downloadStream(request, metadata.downloadUrl);
       source = handle.response.data as Readable;
-      temp = await this.createTempFile(os.tmpdir());
-      const tempPath = temp.filePath;
+      // WU4B3B2 header agreement guards, before any byte is consumed: the
+      // response Content-Type must strip to exactly the agreed metadata MIME.
+      if (responseMimeOf(handle.response.headers) !== metadata.mimeType)
+        throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
+      const contentLength = responseLengthOf(handle.response.headers);
+      const tempFile = await ioStep(() => this.createTempFile(os.tmpdir()));
+      temp = tempFile;
+      const tempPath = tempFile.filePath;
       const hash = createHash('sha256');
       let byteCount = 0;
       // Async iteration keeps the source paused between awaited writes, so the
@@ -478,9 +518,12 @@ export class MetaMediaClient {
         // Every byte must be on disk before the next chunk is read.
         await writeAll(temp, buffer);
       }
-      await temp.close();
+      await ioStep(() => tempFile.close());
+      // A present Content-Length must equal the final counted bytes.
+      if (contentLength !== undefined && contentLength !== byteCount)
+        throw invalidSize();
       // Bounded read-back: the enforced cap guarantees at most 10 MiB here.
-      const bytes = await fs.promises.readFile(tempPath);
+      const bytes = await ioStep(() => fs.promises.readFile(tempPath));
       if (detectMagic(bytes) !== metadata.mimeType)
         throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
       validateMediaStructure(bytes, metadata.mimeType);
