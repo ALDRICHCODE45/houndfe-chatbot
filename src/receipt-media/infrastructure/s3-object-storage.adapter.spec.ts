@@ -1,8 +1,10 @@
-/** WU5A1 + WU5A2a spec: neutral private object-storage port + one-shot
- *  private S3 PutObject — exact composition, safe errors, caller-reserved
- *  key reuse, streamed integrity, abort registration before pipeline flow,
- *  and compensation on distinct upload/cleanup signals. Detailed taxonomy
- *  and CLEANUP_PENDING are WU5A2b; get/head/delete are WU5B. Fakes only. */
+/** WU5A1 + WU5A2a + WU5A2b spec: neutral private object-storage port +
+ *  one-shot private S3 PutObject — exact composition, safe errors,
+ *  caller-reserved key reuse, streamed integrity, abort registration before
+ *  pipeline flow, structured-field failure taxonomy with deterministic
+ *  retryable/cleanupPending flags, fail-closed reads, required distinct
+ *  signal types, CLEANUP_PENDING incl. cleanup-abort during successful
+ *  delete. get/head/delete are WU5B. Fakes only. */
 import { createHash } from 'node:crypto';
 import { getEventListeners } from 'node:events';
 import { readFileSync } from 'node:fs';
@@ -79,13 +81,26 @@ function makeAdapter(put?: (cmd: Cmd) => unknown, drain = true) {
   };
 }
 
-const expectCode = async (p: Promise<unknown>, code: string) => {
+const expectCode = async (
+  p: Promise<unknown>,
+  code: string,
+  retryable?: boolean,
+) => {
   const e = (await p.catch((x: unknown) => x)) as ObjectStorageError;
   expect(e).toBeInstanceOf(ObjectStorageError);
   expect(e).toMatchObject({ category: 'OBJECT_STORAGE', code });
   expect(e.message).toBe(`receipt-media:OBJECT_STORAGE/${code}`);
   expect(e.cause).toBeUndefined();
   expect(e.message).not.toMatch(LEAKY);
+  expect(JSON.stringify(e)).not.toMatch(LEAKY);
+  if (retryable !== undefined) {
+    const flags = e as unknown as {
+      retryable?: unknown;
+      cleanupPending?: unknown;
+    };
+    expect(flags.retryable).toBe(retryable);
+    expect(flags.cleanupPending).toBe(code === 'CLEANUP_PENDING');
+  }
   return e;
 };
 
@@ -107,6 +122,39 @@ describe('WU5A1 object-storage port', () => {
     expect(
       readFileSync(join(__dirname, '../domain/object-storage.port.ts'), 'utf8'),
     ).not.toContain('@aws-sdk');
+  });
+
+  it('carries deterministic retryable/cleanupPending flags per fixed code', () => {
+    const flags: [string, boolean, boolean][] = [
+      ['OBJECT_KEY_INVALID', false, false],
+      ['REQUEST_INVALID', false, false],
+      ['RESPONSE_INVALID', false, false],
+      ['ABORTED', true, false],
+      ['HTTP_RETRYABLE', true, false],
+      ['HTTP_PERMANENT', false, false],
+      ['NETWORK_FAILURE', true, false],
+      ['CLEANUP_PENDING', true, true],
+      ['PERMANENT_FAILURE', false, false],
+    ];
+    for (const [code, retryable, cleanupPending] of flags) {
+      const e = new port.ObjectStorageError('OBJECT_STORAGE', code as never);
+      const projected = e as unknown as {
+        retryable?: unknown;
+        cleanupPending?: unknown;
+      };
+      expect(projected.retryable).toBe(retryable);
+      expect(projected.cleanupPending).toBe(cleanupPending);
+      expect(e.message).toBe(`receipt-media:OBJECT_STORAGE/${code}`);
+      expect(e.cause).toBeUndefined();
+    }
+  });
+
+  it('requires distinct abortSignal and cleanupSignal at the type boundary', () => {
+    type Req<K extends keyof port.PutObjectInput> =
+      undefined extends port.PutObjectInput[K] ? false : true;
+    const upload: Req<'abortSignal'> = true;
+    const cleanup: Req<'cleanupSignal'> = true;
+    expect(upload && cleanup).toBe(true);
   });
 
   it('generates random canonical non-PII uuid-v4 keys', () => {
@@ -272,29 +320,213 @@ describe('WU5A2a integrity, abort registration, and compensation', () => {
   it('rejects aliased, missing, and pre-aborted upload/cleanup signals before any send', async () => {
     const { adapter, sent } = makeAdapter();
     const alias = new AbortController().signal;
-    const cases: [Record<string, unknown>, string][] = [
+    const cases: [Record<string, unknown>, string, boolean?][] = [
       [{ abortSignal: alias, cleanupSignal: alias }, 'REQUEST_INVALID'],
       [{ cleanupSignal: aborted() }, 'REQUEST_INVALID'],
       [{ cleanupSignal: undefined }, 'REQUEST_INVALID'],
       [{ abortSignal: undefined }, 'REQUEST_INVALID'],
-      [{ abortSignal: aborted() }, 'ABORTED'],
+      [{ abortSignal: aborted() }, 'ABORTED', true],
+    ];
+    for (const [over, code, retryable] of cases)
+      await expectCode(callPut(adapter, putInput(over)), code, retryable);
+    expect(sent).toEqual([]);
+  });
+
+  it('fails closed on truthy malformed upload/cleanup signals before any send or listener registration', async () => {
+    const { adapter, sent } = makeAdapter();
+    const throwAborted = () => ({
+      get aborted(): boolean {
+        throw new Error('signal-fault');
+      },
+    });
+    const trap = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error('proxy-fault');
+        },
+      },
+    );
+    const cases: [Record<string, unknown>, string][] = [
+      [{ abortSignal: { aborted: false } }, 'REQUEST_INVALID'],
+      [{ abortSignal: { aborted: true } }, 'REQUEST_INVALID'],
+      [{ abortSignal: throwAborted() }, 'REQUEST_INVALID'],
+      [{ abortSignal: trap }, 'REQUEST_INVALID'],
+      [{ cleanupSignal: { aborted: false } }, 'REQUEST_INVALID'],
+      [{ cleanupSignal: { aborted: true } }, 'REQUEST_INVALID'],
+      [{ cleanupSignal: throwAborted() }, 'REQUEST_INVALID'],
+      [{ cleanupSignal: trap }, 'REQUEST_INVALID'],
     ];
     for (const [over, code] of cases)
       await expectCode(callPut(adapter, putInput(over)), code);
     expect(sent).toEqual([]);
   });
 
-  it('maps generic SDK rejections to the fixed generic failure and compensates', async () => {
-    for (const props of [
-      {},
-      { $metadata: { httpStatusCode: 400 } },
-      { name: 'NetworkingError' },
-    ]) {
+  it('fails closed on forged callable-looking methods, shifting method getters, and delayed/stateful aborted accessors before any send', async () => {
+    const { adapter, sent } = makeAdapter();
+    const throwsOnAdd = () => ({
+      aborted: false,
+      addEventListener() {
+        throw new Error('add-fault');
+      },
+      removeEventListener() {},
+    });
+    const shiftingGetter = () => {
+      let reads = 0;
+      return {
+        get aborted(): boolean {
+          return false;
+        },
+        get addEventListener() {
+          if (++reads === 1) return () => undefined;
+          throw new Error('shifted-method-getter');
+        },
+        removeEventListener() {},
+      };
+    };
+    const delayedAborted = () => {
+      let reads = 0;
+      return {
+        get aborted(): boolean {
+          if (++reads === 1) return false;
+          throw new Error('delayed-abort-fault');
+        },
+        addEventListener() {},
+        removeEventListener() {},
+      };
+    };
+    const protoSpoof = (): unknown => Object.create(AbortSignal.prototype);
+    const cases: Record<string, unknown>[] = [
+      { abortSignal: throwsOnAdd() },
+      { cleanupSignal: throwsOnAdd() },
+      { abortSignal: shiftingGetter() },
+      { cleanupSignal: shiftingGetter() },
+      { abortSignal: delayedAborted() },
+      { cleanupSignal: delayedAborted() },
+      { abortSignal: protoSpoof() },
+      { cleanupSignal: protoSpoof() },
+    ];
+    for (const over of cases)
+      await expectCode(callPut(adapter, putInput(over)), 'REQUEST_INVALID');
+    expect(sent).toEqual([]);
+  });
+
+  it('rejects a Proxy around a genuine AbortSignal that spoofs aborted and listener methods before any send', async () => {
+    const { adapter, sent } = makeAdapter();
+    const calls: string[] = [];
+    const spoofingProxy = (real: AbortSignal): AbortSignal =>
+      new Proxy(real, {
+        get(target, prop) {
+          if (prop === 'aborted') return false;
+          if (prop === 'addEventListener')
+            return () => {
+              calls.push('add');
+            };
+          if (prop === 'removeEventListener')
+            return () => {
+              calls.push('remove');
+            };
+          const v: unknown = Reflect.get(target, prop, target);
+          return typeof v === 'function'
+            ? (v as () => unknown).bind(target)
+            : v;
+        },
+      });
+    const uploadProxy = spoofingProxy(new AbortController().signal);
+    const cleanupProxy = spoofingProxy(new AbortController().signal);
+    expect(uploadProxy instanceof AbortSignal).toBe(true);
+    expect((uploadProxy as { aborted: boolean }).aborted).toBe(false);
+    await expectCode(
+      callPut(adapter, putInput({ abortSignal: uploadProxy })),
+      'REQUEST_INVALID',
+    );
+    await expectCode(
+      callPut(adapter, putInput({ cleanupSignal: cleanupProxy })),
+      'REQUEST_INVALID',
+    );
+    expect(sent).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it('classifies upload failures from structured fields only and compensates', async () => {
+    const cases: [Record<string, unknown>, string, boolean][] = [
+      [{}, 'PERMANENT_FAILURE', false],
+      [{ message: 'go away', stack: 'at x' }, 'PERMANENT_FAILURE', false],
+      [{ $metadata: { httpStatusCode: 400 } }, 'HTTP_PERMANENT', false],
+      [{ $metadata: { httpStatusCode: 404 } }, 'HTTP_PERMANENT', false],
+      [{ $metadata: { httpStatusCode: 100 } }, 'HTTP_PERMANENT', false],
+      [{ $metadata: { httpStatusCode: 418 } }, 'HTTP_PERMANENT', false],
+      [{ $metadata: { httpStatusCode: 599 } }, 'HTTP_RETRYABLE', true],
+      [{ $metadata: { httpStatusCode: 600 } }, 'PERMANENT_FAILURE', false],
+      [
+        { $metadata: { httpStatusCode: 600 }, name: 'NetworkingError' },
+        'PERMANENT_FAILURE',
+        false,
+      ],
+      [{ $metadata: { httpStatusCode: 408 } }, 'HTTP_RETRYABLE', true],
+      [{ $metadata: { httpStatusCode: 429 } }, 'HTTP_RETRYABLE', true],
+      [{ $metadata: { httpStatusCode: 500 } }, 'HTTP_RETRYABLE', true],
+      [{ $metadata: { httpStatusCode: 503 } }, 'HTTP_RETRYABLE', true],
+      [{ $metadata: { httpStatusCode: '400' } }, 'PERMANENT_FAILURE', false],
+      [{ $metadata: {} }, 'PERMANENT_FAILURE', false],
+      [{ $metadata: {}, name: 'NetworkingError' }, 'PERMANENT_FAILURE', false],
+      [
+        { $metadata: null, name: 'NetworkingError' },
+        'PERMANENT_FAILURE',
+        false,
+      ],
+      [
+        { $metadata: { httpStatusCode: '400' }, code: 'ECONNRESET' },
+        'PERMANENT_FAILURE',
+        false,
+      ],
+      [{ name: 'NetworkingError' }, 'NETWORK_FAILURE', true],
+      [{ name: 'TimeoutError' }, 'NETWORK_FAILURE', true],
+      [{ code: 'ECONNRESET' }, 'NETWORK_FAILURE', true],
+      [{ code: 'ETIMEDOUT' }, 'NETWORK_FAILURE', true],
+      [{ name: 'Unknown' }, 'PERMANENT_FAILURE', false],
+      [{ code: 'EPERM' }, 'PERMANENT_FAILURE', false],
+    ];
+    for (const [props, code, retryable] of cases) {
       const { adapter, sent } = makeAdapter((cmd) => {
         if (/put/i.test(cmd.constructor.name)) throw boom(props);
       });
       const input = putInput();
-      await expectCode(callPut(adapter, input), 'PERMANENT_FAILURE');
+      await expectCode(callPut(adapter, input), code, retryable);
+      expectDelete(sent, input);
+    }
+  });
+
+  it('never leaks a throwing structured-field accessor and fail-closes present-but-invalid HTTP metadata', async () => {
+    const throwGet = (o: Record<string, unknown>, key: string) => {
+      Object.defineProperty(o, key, {
+        get: () => {
+          throw new Error('accessor-fault');
+        },
+      });
+      return o;
+    };
+    const err = (base: Record<string, unknown> = {}) =>
+      Object.assign(new Error('boom'), base);
+    const net = { name: 'NetworkingError' };
+    const badMeta = throwGet({}, 'httpStatusCode');
+    const cases: [() => unknown, string, boolean][] = [
+      [() => throwGet(err(net), '$metadata'), 'PERMANENT_FAILURE', false],
+      [() => err({ ...net, $metadata: badMeta }), 'PERMANENT_FAILURE', false],
+      [() => throwGet(err(), 'name'), 'PERMANENT_FAILURE', false],
+      [() => throwGet(err(), 'code'), 'PERMANENT_FAILURE', false],
+      [
+        () => throwGet(err({ code: 'ECONNRESET' }), 'name'),
+        'NETWORK_FAILURE',
+        true,
+      ],
+    ];
+    for (const [make, code, retryable] of cases) {
+      const { adapter, sent } = makeAdapter((cmd) => {
+        if (/put/i.test(cmd.constructor.name)) throw make();
+      });
+      const input = putInput();
+      await expectCode(callPut(adapter, input), code, retryable);
       expectDelete(sent, input);
     }
   });
@@ -330,7 +562,7 @@ describe('WU5A2a integrity, abort registration, and compensation', () => {
       abortSignal: ctrl.signal,
     });
     const { adapter, sent } = makeAdapter();
-    await expectCode(callPut(adapter, input), 'ABORTED');
+    await expectCode(callPut(adapter, input), 'ABORTED', true);
     expectDelete(sent, input);
   });
 
@@ -341,7 +573,7 @@ describe('WU5A2a integrity, abort registration, and compensation', () => {
       return { ETag: '"etag-1"', VersionId: 'v-1' };
     });
     const input = putInput({ abortSignal: ctrl.signal });
-    await expectCode(callPut(adapter, input), 'ABORTED');
+    await expectCode(callPut(adapter, input), 'ABORTED', true);
     expectDelete(sent, input);
   });
 
@@ -416,25 +648,64 @@ describe('WU5A2a integrity, abort registration, and compensation', () => {
     expect(content.destroyed).toBe(true);
   });
 
-  it('stays fail-closed when compensation fails or the cleanup signal aborts', async () => {
-    const { adapter, sent } = makeAdapter(() => {
-      throw boom();
+  it('maps cleanup failure or aborted cleanup to CLEANUP_PENDING hiding both failures', async () => {
+    const { adapter, sent } = makeAdapter((cmd) => {
+      if (/put/i.test(cmd.constructor.name))
+        throw boom({ $metadata: { httpStatusCode: 503 } });
+      throw boom({ $metadata: { httpStatusCode: 400 } });
     });
-    await expectCode(callPut(adapter, putInput()), 'PERMANENT_FAILURE');
+    const e = await expectCode(
+      callPut(adapter, putInput()),
+      'CLEANUP_PENDING',
+      true,
+    );
+    expect((e as { cleanupPending?: unknown }).cleanupPending).toBe(true);
     expect(sent).toHaveLength(2);
     const cleanupCtrl = new AbortController();
     const mid = makeAdapter((cmd) => {
       if (/put/i.test(cmd.constructor.name)) {
         cleanupCtrl.abort();
-        throw boom();
+        throw boom({ $metadata: { httpStatusCode: 503 } });
       }
-      throw boom();
+      throw boom({ $metadata: { httpStatusCode: 400 } });
     });
-    await expectCode(
+    const e2 = await expectCode(
       callPut(mid.adapter, putInput({ cleanupSignal: cleanupCtrl.signal })),
-      'PERMANENT_FAILURE',
+      'CLEANUP_PENDING',
+      true,
     );
+    expect((e2 as { cleanupPending?: unknown }).cleanupPending).toBe(true);
     expect(mid.sent).toHaveLength(1);
+  });
+
+  it('maps a cleanup abort during a successful compensation to fixed CLEANUP_PENDING', async () => {
+    const cleanupCtrl = new AbortController();
+    const { adapter, sent } = makeAdapter((cmd) => {
+      if (/put/i.test(cmd.constructor.name))
+        throw boom({ $metadata: { httpStatusCode: 400 } });
+      cleanupCtrl.abort();
+      return {};
+    });
+    const input = putInput({ cleanupSignal: cleanupCtrl.signal });
+    await expectCode(callPut(adapter, input), 'CLEANUP_PENDING', true);
+    expectDelete(sent, input);
+  });
+
+  it('preserves the original classified failure when compensation succeeds', async () => {
+    const cases: [Record<string, unknown>, string, boolean][] = [
+      [{ $metadata: { httpStatusCode: 429 } }, 'HTTP_RETRYABLE', true],
+      [{ code: 'ECONNRESET' }, 'NETWORK_FAILURE', true],
+      [{ $metadata: { httpStatusCode: 400 } }, 'HTTP_PERMANENT', false],
+      [{}, 'PERMANENT_FAILURE', false],
+    ];
+    for (const [props, code, retryable] of cases) {
+      const { adapter, sent } = makeAdapter((cmd) => {
+        if (/put/i.test(cmd.constructor.name)) throw boom(props);
+      });
+      const input = putInput();
+      await expectCode(callPut(adapter, input), code, retryable);
+      expectDelete(sent, input);
+    }
   });
 
   it('keeps exact signals, removes listeners, and never deletes on success', async () => {

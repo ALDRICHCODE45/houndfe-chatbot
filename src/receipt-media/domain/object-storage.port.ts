@@ -2,8 +2,11 @@
  *  domain; keys and errors stay safe. The canonical `receipts/<uuid-v4>` key
  *  is random non-PII, reserved by the caller before upload and reused on safe
  *  retries. WU5A2a maps real caller aborts to fixed ABORTED and every generic
- *  failure to one fixed permanent code (detailed taxonomy/cleanup: WU5A2b);
- *  get/head/delete are WU5B. */
+ *  failure to one fixed permanent code. WU5A2b adds the structured-field
+ *  upload taxonomy (HTTP 408/429/5xx retryable; other HTTP, malformed, and
+ *  unclassified permanent; allowlisted network/timeout names), deterministic
+ *  `retryable`/`cleanupPending` flags, and fixed CLEANUP_PENDING (get/head/
+ *  delete are WU5B). */
 import { randomUUID } from 'node:crypto';
 import type { Readable } from 'node:stream';
 import type { ReceiptMimeType } from './receipt-media.types';
@@ -26,7 +29,7 @@ export interface PutObjectInput {
   mimeType: ReceiptMimeType;
   sha256: Buffer;
   abortSignal: AbortSignal;
-  cleanupSignal?: AbortSignal;
+  cleanupSignal: AbortSignal;
 }
 
 export interface ObjectStoragePort {
@@ -40,14 +43,31 @@ export type ObjectStorageErrorCode =
   | 'REQUEST_INVALID'
   | 'RESPONSE_INVALID'
   | 'ABORTED'
+  | 'HTTP_RETRYABLE'
+  | 'HTTP_PERMANENT'
+  | 'NETWORK_FAILURE'
+  | 'CLEANUP_PENDING'
   | 'PERMANENT_FAILURE';
 
-/** Safe projection: fixed category/code only; no raw cause retained. */
+const RETRYABLE_CODES: ReadonlySet<ObjectStorageErrorCode> = new Set([
+  'ABORTED',
+  'HTTP_RETRYABLE',
+  'NETWORK_FAILURE',
+  'CLEANUP_PENDING',
+]);
+
+/** Safe projection: fixed category/code plus deterministic retry/cleanup
+ *  flags only; no raw cause, stack, provider message, or metadata. */
 export class ObjectStorageError extends Error {
+  readonly retryable: boolean;
+  readonly cleanupPending: boolean;
+
   constructor(
     readonly category: 'OBJECT_STORAGE',
     readonly code: ObjectStorageErrorCode,
   ) {
     super(`receipt-media:${category}/${code}`);
+    this.retryable = RETRYABLE_CODES.has(code);
+    this.cleanupPending = code === 'CLEANUP_PENDING';
   }
 }
