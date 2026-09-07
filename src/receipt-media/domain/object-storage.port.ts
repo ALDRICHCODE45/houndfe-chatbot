@@ -39,6 +39,9 @@ export interface ObjectStoragePort {
   /** WU5B1a2: private streaming GetObject; fixed nonretryable
    *  OBJECT_NOT_FOUND for exact structured `$metadata.httpStatusCode===404`. */
   getStream(input: GetObjectInput): Promise<GetObjectResult>;
+  /** WU5B1b: private metadata HeadObject; same safe result/taxonomy
+   *  mapping as `getStream` without any body surface. */
+  head(input: HeadObjectInput): Promise<HeadObjectResult>;
 }
 
 /** WU5B1a1: neutral private-read input/result shapes. WU5B1a2 integrates
@@ -50,6 +53,20 @@ export interface GetObjectInput {
 
 export interface GetObjectResult {
   stream: Readable;
+  byteCount: number;
+  mimeType: ReceiptMimeType;
+  etag: string;
+  versionId: string | null;
+}
+
+/** WU5B1b: neutral private metadata-read input/result shapes; identical
+ *  safe metadata fields as `GetObjectResult` minus the stream. */
+export interface HeadObjectInput {
+  key: string;
+  abortSignal: AbortSignal;
+}
+
+export interface HeadObjectResult {
   byteCount: number;
   mimeType: ReceiptMimeType;
   etag: string;

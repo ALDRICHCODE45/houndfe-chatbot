@@ -30,19 +30,19 @@ import type { GetObjectResult } from '../domain/object-storage.port';
 
 export type SafeObjectReadFailureReason = 'ABORTED' | 'RESPONSE_INVALID';
 
-export interface SafeObjectReadFields {
-  /** Raw provider response body; guarded here, never returned. */
-  readonly body: unknown;
-  readonly byteCount: unknown;
-  readonly mimeType: unknown;
-  readonly etag: unknown;
-  readonly versionId: unknown;
-  readonly abortSignal: unknown;
+/** Exact validated safe metadata shared by `assembleSafeObjectReadResult`
+ *  (WU5B1a1) and the WU5B1b private HeadObject path; no coercion, no trim
+ *  acceptance, no raw retention. */
+export interface SafeObjectMetadata {
+  readonly byteCount: number;
+  readonly mimeType: ReceiptMimeType;
+  readonly etag: string;
+  readonly versionId: string | null;
 }
 
-export type SafeObjectReadResult =
-  | { readonly ok: true; readonly value: GetObjectResult }
-  | { readonly ok: false; readonly reason: SafeObjectReadFailureReason };
+export type SafeObjectMetadataResult =
+  | { readonly ok: true; readonly metadata: SafeObjectMetadata }
+  | { readonly ok: false };
 
 const RECEIPT_MIME_TYPES: readonly string[] = ['image/jpeg', 'image/png'];
 
@@ -59,6 +59,47 @@ const validVersionId = (value: unknown): value is string | null =>
   value === null ||
   value === undefined ||
   (typeof value === 'string' && value.length > 0);
+
+/** WU5B1b: the exact shared metadata validator — normalized fields on
+ *  success, `{ok:false}` (→ fixed RESPONSE_INVALID at the adapter) on any
+ *  invalid field; nullish versionId normalizes to `null`. */
+export function validateSafeObjectMetadata(
+  byteCount: unknown,
+  mimeType: unknown,
+  etag: unknown,
+  versionId: unknown,
+): SafeObjectMetadataResult {
+  if (
+    !validByteCount(byteCount) ||
+    !validMimeType(mimeType) ||
+    !validEtag(etag) ||
+    !validVersionId(versionId)
+  )
+    return { ok: false };
+  return {
+    ok: true,
+    metadata: {
+      byteCount,
+      mimeType,
+      etag,
+      versionId: versionId === undefined ? null : versionId,
+    },
+  };
+}
+
+export interface SafeObjectReadFields {
+  /** Raw provider response body; guarded here, never returned. */
+  readonly body: unknown;
+  readonly byteCount: unknown;
+  readonly mimeType: unknown;
+  readonly etag: unknown;
+  readonly versionId: unknown;
+  readonly abortSignal: unknown;
+}
+
+export type SafeObjectReadResult =
+  | { readonly ok: true; readonly value: GetObjectResult }
+  | { readonly ok: false; readonly reason: SafeObjectReadFailureReason };
 
 export function assembleSafeObjectReadResult(
   fields: SafeObjectReadFields,
@@ -77,12 +118,13 @@ export function assembleSafeObjectReadResult(
     destroy();
     return { ok: false, reason: 'ABORTED' };
   }
-  if (
-    !validByteCount(fields.byteCount) ||
-    !validMimeType(fields.mimeType) ||
-    !validEtag(fields.etag) ||
-    !validVersionId(fields.versionId)
-  ) {
+  const metadata = validateSafeObjectMetadata(
+    fields.byteCount,
+    fields.mimeType,
+    fields.etag,
+    fields.versionId,
+  );
+  if (!metadata.ok) {
     destroy();
     return { ok: false, reason: 'RESPONSE_INVALID' };
   }
@@ -96,10 +138,7 @@ export function assembleSafeObjectReadResult(
     ok: true,
     value: {
       stream: stream.stream,
-      byteCount: fields.byteCount,
-      mimeType: fields.mimeType,
-      etag: fields.etag,
-      versionId: fields.versionId === undefined ? null : fields.versionId,
+      ...metadata.metadata,
     },
   };
 }

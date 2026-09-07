@@ -30,6 +30,7 @@ import { types as utilTypes } from 'node:util';
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
@@ -38,6 +39,8 @@ import {
   ObjectStorageError,
   type GetObjectInput,
   type GetObjectResult,
+  type HeadObjectInput,
+  type HeadObjectResult,
   type ObjectStorageErrorCode,
   type ObjectStoragePort,
   type PutObjectInput,
@@ -51,7 +54,10 @@ import {
   guardObjectReadBody,
   guardObjectReadSignal,
 } from './safe-object-read-guards';
-import { assembleSafeObjectReadResult } from './safe-object-read-result';
+import {
+  assembleSafeObjectReadResult,
+  validateSafeObjectMetadata,
+} from './safe-object-read-result';
 
 const MIME_TYPES: readonly ReceiptMimeType[] = ['image/jpeg', 'image/png'];
 
@@ -475,6 +481,61 @@ export class S3ObjectStorageAdapter implements ObjectStoragePort {
       });
       if (!assembled.ok) throw safe(assembled.reason);
       return assembled.value;
+    } finally {
+      signal.removeAbortListener(onCallerAbort);
+    }
+  }
+
+  /** WU5B1b: one private HeadObject — the exact getStream safe-read
+   *  boundary without any body surface: signal/key validated and the
+   *  guarded abort listener registered before send (add failure →
+   *  REQUEST_INVALID, no send; listener always removed), exactly private
+   *  `HeadObjectCommand({Bucket, Key})` with `{abortSignal:
+   *  guarded.signal}`, no ACL/public URL/body/download; the same
+   *  Proxy-first own-DATA-descriptor fail-closed extraction reused for
+   *  ContentLength/ContentType/ETag/VersionId (no accessors, inherited
+   *  fields, or non-trap-executing proxies; raw response never retained)
+   *  and the shared exact metadata validator (integer 1..RECEIPT_MAX_BYTES,
+   *  exact two MIME types, nonempty etag, nullish version → null; invalid
+   *  → fixed RESPONSE_INVALID); provider rejection: caller abort wins,
+   *  exact structured 404 → nonretryable OBJECT_NOT_FOUND, existing
+   *  taxonomy otherwise. Put/getStream behavior unchanged. */
+  async head(input: HeadObjectInput): Promise<HeadObjectResult> {
+    const signal = guardObjectReadSignal(input.abortSignal);
+    if (!signal) throw safe('REQUEST_INVALID');
+    if (signal.aborted) throw safe('ABORTED');
+    if (!isCanonicalObjectKey(input.key)) throw safe('OBJECT_KEY_INVALID');
+    let callerAborted = false;
+    const onCallerAbort = () => {
+      callerAborted = true;
+    };
+    if (!signal.addAbortListener(onCallerAbort)) throw safe('REQUEST_INVALID');
+    try {
+      let response: unknown;
+      try {
+        response = await this.client.send(
+          new HeadObjectCommand({
+            Bucket: this.config.bucket,
+            Key: input.key,
+          }),
+          { abortSignal: signal.signal },
+        );
+      } catch (err) {
+        if (callerAborted) throw safe('ABORTED');
+        if (isStructuredNotFound(err)) throw safe('OBJECT_NOT_FOUND');
+        throw classifyProvider(err);
+      }
+      if (callerAborted) throw safe('ABORTED');
+      const extracted = extractResponseFields(response);
+      if (!extracted.ok) throw safe('RESPONSE_INVALID');
+      const metadata = validateSafeObjectMetadata(
+        extracted.fields.ContentLength,
+        extracted.fields.ContentType,
+        extracted.fields.ETag,
+        extracted.fields.VersionId,
+      );
+      if (!metadata.ok) throw safe('RESPONSE_INVALID');
+      return { ...metadata.metadata };
     } finally {
       signal.removeAbortListener(onCallerAbort);
     }
