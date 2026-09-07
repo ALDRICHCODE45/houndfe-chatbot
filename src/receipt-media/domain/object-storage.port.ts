@@ -9,7 +9,11 @@
  *  delete are WU5B). */
 import { randomUUID } from 'node:crypto';
 import type { Readable } from 'node:stream';
-import type { ReceiptMimeType } from './receipt-media.types';
+import type {
+  ReceiptFailureStage,
+  ReceiptMediaStatus,
+  ReceiptMimeType,
+} from './receipt-media.types';
 
 const OBJECT_KEY_PATTERN =
   /^receipts\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -42,6 +46,9 @@ export interface ObjectStoragePort {
   /** WU5B1b: private metadata HeadObject; same safe result/taxonomy
    *  mapping as `getStream` without any body surface. */
   head(input: HeadObjectInput): Promise<HeadObjectResult>;
+  /** WU5B2: retention-gated private technical delete; exact structured
+   *  404 is idempotent success; resolves void. */
+  deleteTechnicalObject(input: DeleteTechnicalObjectInput): Promise<void>;
 }
 
 /** WU5B1a1: neutral private-read input/result shapes. WU5B1a2 integrates
@@ -65,13 +72,48 @@ export interface HeadObjectInput {
   key: string;
   abortSignal: AbortSignal;
 }
-
 export interface HeadObjectResult {
   byteCount: number;
   mimeType: ReceiptMimeType;
   etag: string;
   versionId: string | null;
 }
+
+/** WU5B2: neutral technical-delete input. The retention gate is exact set
+ *  membership over the `(status, failureStage)` pair — never status
+ *  ordering — and is enforced before any provider side effect. */
+export interface DeleteTechnicalObjectInput {
+  key: string;
+  status: ReceiptMediaStatus;
+  failureStage: ReceiptFailureStage | null;
+  abortSignal: AbortSignal;
+}
+
+/** WU5B2: the only `(status, failureStage)` pairs whose objects may still
+ *  be technically deleted; every other pair is denied `REQUEST_INVALID`
+ *  before any send. Membership is over the exact runtime strings, so
+ *  forged/mismatched/undefined values never match. */
+const TECHNICAL_DELETE_ALLOWED: ReadonlySet<string> = new Set([
+  'RESERVED|',
+  'DOWNLOADED|',
+  'FAILED|MEDIA_VALIDATION_PRE_STORAGE',
+  'FAILED|META_EXHAUSTED_PRE_STORAGE',
+  'FAILED|STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+]);
+
+export const isTechnicalDeleteAllowed = (
+  status: ReceiptMediaStatus,
+  failureStage: ReceiptFailureStage | null,
+): boolean => {
+  // Fail-closed string gate BEFORE any allow-set key construction: forged
+  // non-string status values (objects/Symbols) never coerce or throw.
+  if (typeof status !== 'string') return false;
+  // Exactly null means "no failure stage"; forged undefined/non-string
+  // values never match the allow-set.
+  if (failureStage === null) return TECHNICAL_DELETE_ALLOWED.has(`${status}|`);
+  if (typeof failureStage !== 'string') return false;
+  return TECHNICAL_DELETE_ALLOWED.has(`${status}|${failureStage}`);
+};
 
 export type ObjectStorageErrorCode =
   | 'OBJECT_KEY_INVALID'

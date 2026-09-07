@@ -24,6 +24,10 @@ import {
   ObjectStorageError,
 } from '../domain/object-storage.port';
 import { S3ObjectStorageAdapter } from './s3-object-storage.adapter';
+import {
+  RECEIPT_FAILURE_STAGES,
+  RECEIPT_MEDIA_STATUSES,
+} from '../domain/receipt-media.types';
 
 const BUCKET = 'private-bucket';
 const KEY = 'receipts/123e4567-e89b-42d3-a456-426614174000';
@@ -44,6 +48,7 @@ const boom = (props: Record<string, unknown> = {}) =>
   Object.assign(new Error('boom'), props);
 const sourceOf = (b: unknown) => (b as { source?: unknown }).source;
 const listenerCount = (s: AbortSignal) => getEventListeners(s, 'abort').length;
+const gate: (s: unknown, f: unknown) => boolean = port.isTechnicalDeleteAllowed;
 const putInput = (over: Record<string, unknown> = {}) => ({
   key: KEY,
   content: stream('hello'),
@@ -1162,5 +1167,269 @@ describe('WU5B1b S3 adapter head', () => {
       const { adapter } = makeAdapter(() => headResponse(over));
       await expectCode(callHead(adapter, headInput()), 'RESPONSE_INVALID');
     }
+  });
+});
+
+// WU5B2: the five retention-allowed (status, failureStage) pairs, expressed
+// as fixed literals so the exact allow-set is asserted independently of any
+// production gate implementation.
+const WU5B2_ALLOWED = new Set([
+  'RESERVED|',
+  'DOWNLOADED|',
+  'FAILED|MEDIA_VALIDATION_PRE_STORAGE',
+  'FAILED|META_EXHAUSTED_PRE_STORAGE',
+  'FAILED|STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+]);
+
+describe('WU5B2 S3 adapter deleteTechnicalObject', () => {
+  const delInput = (over: Record<string, unknown> = {}) => ({
+    key: KEY,
+    status: 'RESERVED',
+    failureStage: null,
+    abortSignal: new AbortController().signal,
+    ...over,
+  });
+  type DelInput = ReturnType<typeof delInput>;
+  const callDelete = (
+    adapter: S3ObjectStorageAdapter,
+    input: DelInput,
+  ): Promise<unknown> =>
+    (
+      adapter as unknown as {
+        deleteTechnicalObject?: (i: DelInput) => Promise<unknown>;
+      }
+    ).deleteTechnicalObject!(input);
+  const cmdNames = (sent: { cmd: Cmd }[]) =>
+    sent.map((s) => s.cmd.constructor.name);
+
+  it('sends exactly for the five retention-allowed pairs and denies every other status × stage pair before any send', async () => {
+    let allowedRows = 0;
+    for (const status of RECEIPT_MEDIA_STATUSES)
+      for (const failureStage of [null, ...RECEIPT_FAILURE_STAGES] as const) {
+        const allowed = WU5B2_ALLOWED.has(`${status}|${failureStage ?? ''}`);
+        const { adapter, sent } = makeAdapter();
+        if (allowed) {
+          allowedRows++;
+          await expect(
+            callDelete(adapter, delInput({ status, failureStage })),
+          ).resolves.toBeUndefined();
+          expect(sent).toHaveLength(1);
+          expect(cmdNames(sent)).toEqual(['DeleteObjectCommand']);
+        } else {
+          await expectCode(
+            callDelete(adapter, delInput({ status, failureStage })),
+            'REQUEST_INVALID',
+            false,
+          );
+          expect(sent).toEqual([]);
+        }
+      }
+    expect(allowedRows).toBe(5);
+  });
+
+  it('denies forged, mismatched, and undefined status/stage strings before any send', async () => {
+    const { adapter, sent } = makeAdapter();
+    const rows: Record<string, unknown>[] = [
+      { status: undefined, failureStage: null },
+      { status: 'RESERVED', failureStage: undefined },
+      { status: 'reserved', failureStage: null },
+      { status: 'FAILED', failureStage: 'media_validation_pre_storage' },
+      { status: 'RESERVED ', failureStage: null },
+      { status: 'RESERVED|META_EXHAUSTED_PRE_STORAGE', failureStage: null },
+    ];
+    for (const row of rows)
+      await expectCode(
+        callDelete(adapter, delInput(row)),
+        'REQUEST_INVALID',
+        false,
+      );
+    expect(sent).toEqual([]);
+  });
+
+  it('rejects a forged non-string status object with zero coercion and zero sends', async () => {
+    let coercions = 0;
+    const forged = {
+      toString: () => {
+        coercions++;
+        return 'RESERVED';
+      },
+    };
+    const { adapter, sent } = makeAdapter();
+    await expectCode(
+      callDelete(adapter, delInput({ status: forged, failureStage: null })),
+      'REQUEST_INVALID',
+      false,
+    );
+    expect(gate(forged, null)).toBe(false);
+    expect(gate(forged, 'MEDIA_VALIDATION_PRE_STORAGE')).toBe(false);
+    expect(coercions).toBe(0);
+    expect(sent).toEqual([]);
+  });
+
+  it('rejects every non-string status primitive before any coercion or send', async () => {
+    const rows: Record<string, unknown>[] = [
+      { status: undefined, failureStage: null },
+      { status: null, failureStage: null },
+      { status: 42, failureStage: null },
+      { status: Symbol('RESERVED'), failureStage: null },
+    ];
+    for (const row of rows) {
+      const { adapter, sent } = makeAdapter();
+      await expectCode(
+        callDelete(adapter, delInput(row)),
+        'REQUEST_INVALID',
+        false,
+      );
+      expect(sent).toEqual([]);
+    }
+    expect(gate(Symbol('RESERVED'), null)).toBe(false);
+  });
+
+  it('sends exactly one private DeleteObjectCommand with only Bucket/Key and the caller signal, resolving void', async () => {
+    const { adapter, sent } = makeAdapter();
+    const input = delInput({
+      status: 'FAILED',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+    });
+    await expect(callDelete(adapter, input)).resolves.toBeUndefined();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].cmd).toBeInstanceOf(DeleteObjectCommand);
+    expect(Object.keys(sent[0].cmd.input)).toEqual(['Bucket', 'Key']);
+    expect(sent[0].cmd.input).toEqual({ Bucket: BUCKET, Key: KEY });
+    expect(sent[0].cmd.input.ACL).toBeUndefined();
+    expect(sent[0].opts).toEqual({ abortSignal: input.abortSignal });
+    expect(sent[0].opts?.abortSignal).toBe(input.abortSignal);
+    expect(listenerCount(input.abortSignal)).toBe(0);
+  });
+
+  it('rejects invalid signal/key, pre-abort, and forged signals before any send', async () => {
+    const { adapter, sent } = makeAdapter();
+    const spoof = new Proxy(new AbortController().signal, {
+      get: (t, p) => {
+        const v: unknown = Reflect.get(t, p, t);
+        return typeof v === 'function' ? (v as () => unknown).bind(t) : v;
+      },
+    });
+    const cases: [Record<string, unknown>, string, boolean?][] = [
+      [{ key: 'receipts/not-a-uuid' }, 'OBJECT_KEY_INVALID'],
+      [{ abortSignal: undefined }, 'REQUEST_INVALID'],
+      [{ abortSignal: { aborted: false } }, 'REQUEST_INVALID'],
+      [{ abortSignal: spoof }, 'REQUEST_INVALID'],
+      [{ abortSignal: aborted() }, 'ABORTED', true],
+    ];
+    for (const [over, code, retryable] of cases)
+      await expectCode(callDelete(adapter, delInput(over)), code, retryable);
+    expect(sent).toEqual([]);
+  });
+
+  it('maps a failed abort-listener registration to REQUEST_INVALID before any send', async () => {
+    const original =
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; restored in finally
+      EventTarget.prototype.addEventListener;
+    let settle: (value: unknown) => void = () => undefined;
+    const outcome = new Promise<unknown>((resolve) => {
+      settle = resolve;
+    });
+    const send = jest.fn();
+    jest.isolateModules(() => {
+      (
+        EventTarget.prototype as unknown as Record<string, unknown>
+      ).addEventListener = () => {
+        throw new Error('add-fault');
+      };
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- fresh module evaluation is required so the adapter re-captures the patched native listener seam
+        const freshModule = require('./s3-object-storage.adapter') as {
+          S3ObjectStorageAdapter: typeof S3ObjectStorageAdapter;
+        };
+        const adapter = new freshModule.S3ObjectStorageAdapter(CFG, {
+          send,
+        });
+        callDelete(adapter, delInput()).then(settle, settle);
+      } finally {
+        EventTarget.prototype.addEventListener = original;
+      }
+    });
+    expect(await outcome).toMatchObject({
+      category: 'OBJECT_STORAGE',
+      code: 'REQUEST_INVALID',
+      message: 'receipt-media:OBJECT_STORAGE/REQUEST_INVALID',
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('lets a caller abort win over provider rejection and over a resolved response', async () => {
+    const responds: (() => unknown)[] = [
+      () => {
+        throw boom({ $metadata: { httpStatusCode: 404 } });
+      },
+      () => ({}),
+    ];
+    for (const respond of responds) {
+      const ctrl = new AbortController();
+      const { adapter } = makeAdapter(() => {
+        ctrl.abort();
+        return respond();
+      });
+      await expectCode(
+        callDelete(adapter, delInput({ abortSignal: ctrl.signal })),
+        'ABORTED',
+        true,
+      );
+    }
+  });
+
+  it('treats exact structured 404 as idempotent success and keeps the taxonomy for other errors', async () => {
+    const notFound = makeAdapter(() => {
+      throw boom({ $metadata: { httpStatusCode: 404 } });
+    });
+    await expect(
+      callDelete(notFound.adapter, delInput()),
+    ).resolves.toBeUndefined();
+    expect(notFound.sent).toHaveLength(1);
+    const cases: [Record<string, unknown>, string, boolean?][] = [
+      [{ $metadata: { httpStatusCode: '404' } }, 'PERMANENT_FAILURE'],
+      [{ $metadata: {} }, 'PERMANENT_FAILURE'],
+      [{ name: 'NetworkingError' }, 'NETWORK_FAILURE', true],
+      [{ code: 'ECONNRESET' }, 'NETWORK_FAILURE', true],
+      [{ $metadata: { httpStatusCode: 400 } }, 'HTTP_PERMANENT', false],
+      [{ $metadata: { httpStatusCode: 503 } }, 'HTTP_RETRYABLE', true],
+      [{}, 'PERMANENT_FAILURE', false],
+    ];
+    for (const [props, code, retryable] of cases) {
+      const next = makeAdapter(() => {
+        throw boom(props);
+      });
+      await expectCode(callDelete(next.adapter, delInput()), code, retryable);
+    }
+  });
+
+  it('never issues a delete from successful put, getStream, or head flows', async () => {
+    const putRun = makeAdapter();
+    await (putRun.adapter as unknown as port.ObjectStoragePort).put(putInput());
+    expect(cmdNames(putRun.sent)).toEqual(['PutObjectCommand']);
+    const getRun = makeAdapter(() => ({
+      Body: Readable.from([Buffer.from('hello')]),
+      ContentLength: 5,
+      ContentType: 'image/jpeg',
+      ETag: '"etag-1"',
+      VersionId: null,
+    }));
+    const got = await (
+      getRun.adapter as unknown as port.ObjectStoragePort
+    ).getStream({ key: KEY, abortSignal: new AbortController().signal });
+    await (got as { stream: Readable }).stream.toArray();
+    expect(cmdNames(getRun.sent)).toEqual(['GetObjectCommand']);
+    const headRun = makeAdapter(() => ({
+      ContentLength: 5,
+      ContentType: 'image/png',
+      ETag: '"etag-1"',
+      VersionId: null,
+    }));
+    await (headRun.adapter as unknown as port.ObjectStoragePort).head({
+      key: KEY,
+      abortSignal: new AbortController().signal,
+    });
+    expect(cmdNames(headRun.sent)).toEqual(['HeadObjectCommand']);
   });
 });

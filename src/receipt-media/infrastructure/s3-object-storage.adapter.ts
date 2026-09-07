@@ -36,7 +36,9 @@ import {
 } from '@aws-sdk/client-s3';
 import {
   isCanonicalObjectKey,
+  isTechnicalDeleteAllowed,
   ObjectStorageError,
+  type DeleteTechnicalObjectInput,
   type GetObjectInput,
   type GetObjectResult,
   type HeadObjectInput,
@@ -538,6 +540,52 @@ export class S3ObjectStorageAdapter implements ObjectStoragePort {
       return { ...metadata.metadata };
     } finally {
       signal.removeAbortListener(onCallerAbort);
+    }
+  }
+
+  /** WU5B2: one private retention-gated technical delete — the put-verified
+   *  genuine-signal boundary with the exact retention allow-set (set
+   *  membership, never status ordering) evaluated before any side effect:
+   *  guard → pre-abort → key → retention pair → guarded listener add (add
+   *  failure → REQUEST_INVALID with no send; always removed in finally).
+   *  Exactly private `DeleteObjectCommand({Bucket, Key})` with
+   *  `{abortSignal: guarded.signal}` only — no ACL/public URL/list/body/
+   *  automatic deletion. Caller abort wins over provider rejection and
+   *  over a resolved response; exact structured 404 is idempotent success;
+   *  every other error keeps the existing taxonomy. Nothing raw
+   *  (cause/message/stack/metadata/provider response) is retained. Put,
+   *  getStream, and head behavior unchanged. */
+  async deleteTechnicalObject(
+    input: DeleteTechnicalObjectInput,
+  ): Promise<void> {
+    const signal = guardSignal(input.abortSignal);
+    if (!signal) throw safe('REQUEST_INVALID');
+    if (signal.aborted) throw safe('ABORTED');
+    if (!isCanonicalObjectKey(input.key)) throw safe('OBJECT_KEY_INVALID');
+    if (!isTechnicalDeleteAllowed(input.status, input.failureStage))
+      throw safe('REQUEST_INVALID');
+    let callerAborted = false;
+    const onCallerAbort = () => {
+      callerAborted = true;
+    };
+    if (!signal.onAbort(onCallerAbort)) throw safe('REQUEST_INVALID');
+    try {
+      try {
+        await this.client.send(
+          new DeleteObjectCommand({
+            Bucket: this.config.bucket,
+            Key: input.key,
+          }),
+          { abortSignal: signal.signal },
+        );
+      } catch (err) {
+        if (callerAborted) throw safe('ABORTED');
+        if (isStructuredNotFound(err)) return;
+        throw classifyProvider(err);
+      }
+      if (callerAborted) throw safe('ABORTED');
+    } finally {
+      signal.offAbort(onCallerAbort);
     }
   }
 }
