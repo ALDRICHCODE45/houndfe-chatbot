@@ -1,12 +1,30 @@
 /** WU5B1a0a1 spec: provider-neutral genuine-AbortSignal guard foundation for
  *  WU5B private object reads. Fail-closed boundary only — no body, readable,
  *  lifecycle, or getStream behavior. Fakes and node:events accounting only;
- *  no AWS/network/storage access. */
+ *  no AWS/network/storage access.
+ *  WU5B1a0a2a1 spec (R3): trusted-provider structural body boundary — an
+ *  own data-descriptor `_readableState` is required; NOT an unforgeable
+ *  brand (a sufficiently forged structural object passes by design).
+ *  Fail-closed boundary only — no state snapshot, listener/resume/destroy
+ *  wrapper, lifecycle, getStream, HeadObject, or AWS surface. Fakes and
+ *  node:events accounting only. The body guard binding is intentionally
+ *  optional so the RED run fails only the new tests against unchanged
+ *  production. */
 import { getEventListeners } from 'node:events';
+import { Readable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import {
   guardObjectReadSignal,
   type GuardedObjectReadSignal,
 } from './safe-object-read-guards';
+
+type GuardedBody = { readonly body: Readable };
+const guardsModule: Record<string, unknown> = jest.requireActual(
+  './safe-object-read-guards',
+);
+const guardObjectReadBody = guardsModule.guardObjectReadBody as
+  | ((value: unknown) => GuardedBody | null)
+  | undefined;
 
 const abortCount = (s: AbortSignal) => getEventListeners(s, 'abort').length;
 
@@ -259,5 +277,301 @@ describe('guardObjectReadSignal', () => {
     g1.removeAbortListener(l1);
     g2.removeAbortListener(l2);
     expect(abortCount(c.signal)).toBe(0);
+  });
+});
+
+/** Genuine subclass whose own shadowed state accessors and operations are
+ *  hostile: throwing/changing/counting and never to be invoked by the guard. */
+class HostileBody extends Readable {
+  counts: Record<
+    | 'destroyed'
+    | 'readableEnded'
+    | 'on'
+    | 'off'
+    | 'resume'
+    | 'destroy'
+    | 'pipe',
+    number
+  > = {
+    destroyed: 0,
+    readableEnded: 0,
+    on: 0,
+    off: 0,
+    resume: 0,
+    destroy: 0,
+    pipe: 0,
+  };
+
+  constructor() {
+    super({ read() {} });
+    Object.defineProperty(this, 'destroyed', {
+      configurable: true,
+      get: () => {
+        this.counts.destroyed++;
+        throw new Error('attacker');
+      },
+    });
+    Object.defineProperty(this, 'readableEnded', {
+      configurable: true,
+      get: () => {
+        this.counts.readableEnded++;
+        return this.counts.readableEnded > 3;
+      },
+    });
+    const bomb = (key: 'on' | 'off' | 'resume' | 'destroy' | 'pipe') => {
+      this.counts[key]++;
+      throw new Error('attacker');
+    };
+    Object.defineProperty(this, 'on', {
+      configurable: true,
+      value: () => bomb('on'),
+    });
+    Object.defineProperty(this, 'off', {
+      configurable: true,
+      value: () => bomb('off'),
+    });
+    Object.defineProperty(this, 'resume', {
+      configurable: true,
+      value: () => bomb('resume'),
+    });
+    Object.defineProperty(this, 'destroy', {
+      configurable: true,
+      value: () => bomb('destroy'),
+    });
+    Object.defineProperty(this, 'pipe', {
+      configurable: true,
+      value: (dest: never) => {
+        bomb('pipe');
+        return dest;
+      },
+    });
+  }
+}
+
+describe('guardObjectReadBody', () => {
+  it('fails closed on every non-body shape', () => {
+    const shapes: unknown[] = [
+      undefined,
+      null,
+      true,
+      1,
+      'x',
+      {},
+      [],
+      () => {},
+      Symbol('s'),
+    ];
+    for (const v of shapes) expect(guardObjectReadBody!(v)).toBeNull();
+  });
+
+  it('accepts an active paused genuine Readable with exact identity and no listener or flow side effects', () => {
+    const r = new Readable({ read() {} });
+    const events = ['data', 'readable', 'end', 'close', 'error'] as const;
+    const before = events.map((e) => getEventListeners(r, e).length);
+    const g = guardObjectReadBody!(r);
+    expect(g!.body).toBe(r);
+    expect(events.map((e) => getEventListeners(r, e).length)).toEqual(before);
+    expect(r.readableFlowing).toBeNull();
+    expect(r.readableEnded).toBe(false);
+    expect(r.destroyed).toBe(false);
+  });
+
+  it('accepts a genuine already-destroyed Readable with exact identity', () => {
+    const r = new Readable({ read() {} });
+    r.destroy();
+    expect(r.destroyed).toBe(true);
+    const g = guardObjectReadBody!(r);
+    expect(g!.body).toBe(r);
+  });
+
+  it('accepts a genuine already-ended Readable with exact identity', async () => {
+    const r = new Readable({
+      read() {
+        this.push(null);
+      },
+      autoDestroy: false,
+    });
+    r.resume();
+    await finished(r);
+    expect(r.readableEnded).toBe(true);
+    const g = guardObjectReadBody!(r);
+    expect(g!.body).toBe(r);
+  });
+
+  it('rejects a direct Proxy before any instanceof evaluation or trap run', () => {
+    let traps = 0;
+    const p = new Proxy(new Readable({ read() {} }), {
+      getPrototypeOf: () => {
+        traps++;
+        return Readable.prototype;
+      },
+      get: () => {
+        traps++;
+        return undefined;
+      },
+    });
+    expect(guardObjectReadBody!(p)).toBeNull();
+    expect(traps).toBe(0);
+  });
+
+  it('rejects a non-Proxy value with a Proxy anywhere in its prototype chain before any trap or property access', () => {
+    let traps = 0;
+    const protoProxy = new Proxy(Readable.prototype, {
+      getPrototypeOf: (t) => {
+        traps++;
+        return Reflect.getPrototypeOf(t);
+      },
+      get: (t, p) => {
+        traps++;
+        return Reflect.get(t, p) as unknown;
+      },
+    });
+    const immediate = Object.create(protoProxy) as object;
+    const ancestor = Object.create(
+      Object.create(protoProxy) as object,
+    ) as object;
+    for (const v of [immediate, ancestor]) {
+      expect(guardObjectReadBody!(v)).toBeNull();
+      expect(traps).toBe(0);
+    }
+  });
+
+  it('fails closed on a prototype spoof that passes instanceof', () => {
+    expect(guardObjectReadBody!(Object.create(Readable.prototype))).toBeNull();
+  });
+
+  it('WU5B1a0a2a1-R3 RED→GREEN: a hostile own _readableState accessor fails closed with zero invocation; hostile state/flow shadows are never read', () => {
+    const hostile: object = Object.create(Readable.prototype) as object;
+    const hits = poison(hostile as Record<string, unknown>, [
+      '_readableState',
+      'readable',
+      'destroyed',
+      'readableFinished',
+      'pipe',
+      'on',
+      'resume',
+    ]);
+    expect(guardObjectReadBody!(hostile)).toBeNull();
+    expect(hits).toEqual([]);
+  });
+
+  it('fails closed on duck-typed lookalikes without invoking attacker accessors', () => {
+    const lookalike: Record<string, unknown> = {};
+    const hits: string[] = [];
+    for (const p of [
+      'readable',
+      'destroyed',
+      'readableEnded',
+      'on',
+      'off',
+      'resume',
+      'destroy',
+      'pipe',
+    ])
+      Object.defineProperty(lookalike, p, {
+        configurable: true,
+        get: () => {
+          hits.push(p);
+          return p === 'readable' || p === 'readableEnded';
+        },
+      });
+    expect(guardObjectReadBody!(lookalike)).toBeNull();
+    expect(hits).toEqual([]);
+  });
+
+  it('accepts a hostile genuine subclass that shadows state and operations; attacker counters stay zero', () => {
+    const h = new HostileBody();
+    const g = guardObjectReadBody!(h);
+    expect(g!.body).toBe(h);
+    for (const count of Object.values(h.counts)) expect(count).toBe(0);
+  });
+
+  it('WU5B1a0a2a1-R3: trusted structural boundary — own data-descriptor _readableState required; forged data passes by design (not an unforgeable brand)', () => {
+    const real = new Readable({ read() {} });
+    const stateProto: object = Object.getPrototypeOf(
+      Object.getOwnPropertyDescriptor(real, '_readableState')!.value as object,
+    ) as object;
+    const rejected: unknown[] = [
+      new Proxy(real, {}), // Proxy state
+      Object.create(new Proxy(stateProto, {})) as object, // Proxy link in state prototype chain
+      null, // null state
+      7, // primitive state
+    ];
+    for (const state of rejected) {
+      const r = new Readable({ read() {} });
+      Object.defineProperty(r, '_readableState', {
+        configurable: true,
+        value: state,
+      });
+      expect(guardObjectReadBody!(r)).toBeNull();
+    }
+    expect(rejected.length).toBe(4);
+    // Trusted-provider structural boundary, NOT an unforgeable brand:
+    // a sufficiently forged plain-data _readableState passes by design.
+    const forged = new Readable({ read() {} });
+    Object.defineProperty(forged, '_readableState', {
+      configurable: true,
+      value: { readable: false },
+    });
+    expect(guardObjectReadBody!(forged)!.body).toBe(forged);
+  });
+
+  it('guarding pushes no data, adds no listener, resumes or destroys nothing', () => {
+    const r = new Readable({
+      read() {
+        this.push('x');
+      },
+    });
+    const events = ['data', 'readable', 'end', 'close', 'error'] as const;
+    const before = events.map((e) => getEventListeners(r, e).length);
+    expect(guardObjectReadBody!(r)).not.toBeNull();
+    expect(events.map((e) => getEventListeners(r, e).length)).toEqual(before);
+    expect(r.readableFlowing).toBeNull();
+    expect(r.readableEnded).toBe(false);
+    expect(r.destroyed).toBe(false);
+    const hostile = new HostileBody();
+    expect(guardObjectReadBody!(hostile)).not.toBeNull();
+    for (const count of Object.values(hostile.counts)) expect(count).toBe(0);
+  });
+
+  it('exposes only the exact body identity; no state snapshot or operation surface', () => {
+    const g = guardObjectReadBody!(new Readable({ read() {} }))!;
+    expect(Object.keys(g)).toEqual(['body']);
+    const surface = g as unknown as Record<string, unknown>;
+    for (const absent of [
+      'initialState',
+      'readState',
+      'on',
+      'off',
+      'resume',
+      'destroy',
+      'addBodyListener',
+      'removeBodyListener',
+      'getStream',
+    ])
+      expect(surface[absent]).toBeUndefined();
+  });
+
+  it('triangulation: invalid inputs are indistinguishably null with zero side effects; re-guarding preserves identity', () => {
+    const r = new Readable({ read() {} });
+    const invalid: unknown[] = [
+      undefined,
+      null,
+      0,
+      'x',
+      {},
+      Object.create(Readable.prototype),
+      new Proxy(r, {}),
+    ];
+    for (const v of invalid) {
+      expect(guardObjectReadBody!(v)).toBeNull();
+      expect(r.destroyed).toBe(false);
+      expect(r.readableFlowing).toBeNull();
+    }
+    const g1 = guardObjectReadBody!(r)!;
+    const g2 = guardObjectReadBody!(r)!;
+    expect(g1.body).toBe(r);
+    expect(g2.body).toBe(r);
+    expect(g1).not.toBe(g2);
   });
 });
