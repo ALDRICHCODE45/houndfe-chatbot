@@ -15,6 +15,22 @@
  *  listeners) and removal failures are swallowed so teardown can never
  *  override a safe result. Raw errors, messages, stacks, and causes are never
  *  retained. Guarding alone adds no listeners and causes no side effects.
+ *  WU5B1a0a2a2 (trusted-provider Readable state snapshots): the body guard
+ *  additionally captures an immutable entry snapshot (`initialState`) once
+ *  and offers `readState()` fresh dynamic snapshots, using module-captured
+ *  native `Readable.prototype` `destroyed`/`readableEnded` getters invoked
+ *  with the validated body as receiver — body own shadow getters are never
+ *  dynamically read. Because the boundary is explicitly trusted SDK
+ *  structural (not unforgeable), internal ReadableState getters are
+ *  trusted; but before EVERY state read the body chain is revalidated
+ *  Proxy-free and the own `_readableState` DATA descriptor rechecked
+ *  (non-null, Proxy-free object/prototype chain), preventing later
+ *  accessor/proxy substitution from reaching the trusted getters. Exact
+ *  booleans are required and a fresh plain snapshot is returned; every
+ *  failure collapses to `null` with no raw error retained. The guard
+ *  captures `initialState` once and returns null if it cannot. No
+ *  listener/flow/resume/destroy operations, lifecycle, or getStream
+ *  behavior here.
  *  WU5B1a0a2a1 (R3): trusted-provider structural body boundary — an own
  *  `_readableState` DATA descriptor (captured non-invoking
  *  `Object.getOwnPropertyDescriptor`) whose value is non-null, non-Proxy,
@@ -122,7 +138,82 @@ const NATIVE_GET_OWN_PROPERTY_DESCRIPTOR: typeof Object.getOwnPropertyDescriptor
 
 export interface GuardedObjectReadBody {
   readonly body: Readable;
+  /** Immutable entry snapshot captured exactly once at guard time. */
+  readonly initialState: ObjectReadBodyState;
+  /** Fresh dynamic snapshot; null on every failure. */
+  readState(): ObjectReadBodyState | null;
 }
+
+/** WU5B1a0a2a2 snapshot shape: plain, fresh, exact booleans only. */
+export type ObjectReadBodyState = {
+  readonly destroyed: boolean;
+  readonly readableEnded: boolean;
+};
+
+/** Module-captured native `Readable.prototype` state getters, always
+ *  invoked with the validated body as receiver so body own shadow getters
+ *  are never dynamically read. */
+const NATIVE_READABLE_DESTROYED_GETTER:
+  | ((this: Readable) => boolean)
+  | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Object.getOwnPropertyDescriptor(Readable.prototype, 'destroyed')?.get;
+const NATIVE_READABLE_ENDED_GETTER: ((this: Readable) => boolean) | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Object.getOwnPropertyDescriptor(Readable.prototype, 'readableEnded')?.get;
+
+/** Chain-wide proxy rejection (trap-count 0): every prototype-chain link is
+ *  proven non-Proxy BEFORE any captured-native `getPrototypeOf` call. */
+const isProxyFreePrototypeChain = (value: NonNullObject): boolean => {
+  let current: object | null = value;
+  while (current !== null) {
+    if (utilTypes.isProxy(current)) return false;
+    current = NATIVE_GET_PROTOTYPE_OF(current);
+  }
+  return true;
+};
+
+/** Trusted structural body boundary, revalidated before EVERY state read:
+ *  an OWN `_readableState` DATA descriptor whose value is a non-null,
+ *  non-Proxy object with a Proxy-free prototype chain; accessor
+ *  descriptors are rejected without invocation. NOT an unforgeable brand. */
+const hasTrustedReadableStateShape = (body: NonNullObject): boolean => {
+  if (typeof NATIVE_GET_OWN_PROPERTY_DESCRIPTOR !== 'function') return false;
+  const desc = NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(body, '_readableState');
+  if (desc === undefined) return false;
+  if (desc.get !== undefined || desc.set !== undefined) return false;
+  const stateValue: unknown = desc.value;
+  if (typeof stateValue !== 'object' || stateValue === null) return false;
+  if (utilTypes.isProxy(stateValue)) return false;
+  let stateLink: object | null = stateValue;
+  while (stateLink !== null) {
+    if (utilTypes.isProxy(stateLink)) return false;
+    stateLink = NATIVE_GET_PROTOTYPE_OF(stateLink);
+  }
+  return true;
+};
+
+/** Reads one fresh trusted-provider state snapshot. Structural revalidation
+ *  runs before EVERY read so later accessor/proxy substitution cannot reach
+ *  the trusted internal getters; exact booleans are required; every
+ *  failure — including trusted internal getter failures — collapses to
+ *  null with no raw error, message, stack, or cause retained. Causes no
+ *  listener, flow, resume, or destroy operation. */
+const readTrustedBodyState = (body: Readable): ObjectReadBodyState | null => {
+  try {
+    if (typeof NATIVE_READABLE_DESTROYED_GETTER !== 'function') return null;
+    if (typeof NATIVE_READABLE_ENDED_GETTER !== 'function') return null;
+    if (!isProxyFreePrototypeChain(body)) return null;
+    if (!hasTrustedReadableStateShape(body)) return null;
+    const destroyed = NATIVE_READABLE_DESTROYED_GETTER.call(body);
+    if (typeof destroyed !== 'boolean') return null;
+    const readableEnded = NATIVE_READABLE_ENDED_GETTER.call(body);
+    if (typeof readableEnded !== 'boolean') return null;
+    return { destroyed, readableEnded };
+  } catch {
+    return null;
+  }
+};
 
 export function guardObjectReadBody(
   value: unknown,
@@ -132,33 +223,22 @@ export function guardObjectReadBody(
     // Chain-wide proxy rejection BEFORE brand checking, reused from the
     // verified signal guard: every prototype-chain link is proven non-Proxy
     // first (trap-count 0), so the instanceof below never walks a Proxy.
-    let current: object | null = value;
-    while (current !== null) {
-      if (utilTypes.isProxy(current)) return null;
-      current = NATIVE_GET_PROTOTYPE_OF(current);
-    }
+    if (!isProxyFreePrototypeChain(value)) return null;
     if (!(value instanceof Readable)) return null;
     // Trusted structural boundary, fail-closed: require an OWN
-    // `_readableState` DATA descriptor whose value is a non-null,
-    // non-Proxy object with a Proxy-free prototype chain. Accessor
-    // descriptors are rejected without invocation; no helper, helper
-    // getter, or state getter ever runs, so hostile own
-    // readable/destroyed/readableFinished/pipe/on shadows are never read
-    // and no flow/listener/resume/destroy is caused. NOT an unforgeable
-    // brand: a sufficiently forged structural object passes by design.
-    if (typeof NATIVE_GET_OWN_PROPERTY_DESCRIPTOR !== 'function') return null;
-    const desc = NATIVE_GET_OWN_PROPERTY_DESCRIPTOR(value, '_readableState');
-    if (desc === undefined) return null;
-    if (desc.get !== undefined || desc.set !== undefined) return null;
-    const stateValue: unknown = desc.value;
-    if (typeof stateValue !== 'object' || stateValue === null) return null;
-    if (utilTypes.isProxy(stateValue)) return null;
-    let stateLink: object | null = stateValue;
-    while (stateLink !== null) {
-      if (utilTypes.isProxy(stateLink)) return null;
-      stateLink = NATIVE_GET_PROTOTYPE_OF(stateLink);
-    }
-    return { body: value };
+    // `_readableState` DATA descriptor (see hasTrustedReadableStateShape).
+    // NOT an unforgeable brand: a sufficiently forged structural object
+    // passes by design.
+    if (!hasTrustedReadableStateShape(value)) return null;
+    // WU5B1a0a2a2: capture the immutable entry snapshot exactly once; the
+    // guard fails closed to null if the snapshot cannot be captured.
+    const initialState = readTrustedBodyState(value);
+    if (initialState === null) return null;
+    return {
+      body: value,
+      initialState,
+      readState: () => readTrustedBodyState(value),
+    };
   } catch {
     return null;
   }
