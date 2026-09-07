@@ -40,9 +40,10 @@
  *  runtime event/listener values are whitelisted/callability-checked
  *  fail-closed. Add failure tries the captured native off with the same
  *  args and returns false; every error is swallowed; removal failures are
- *  swallowed. No resume/destroy/lifecycle/getStream/AWS behavior and no
- *  raw error retention; `data` flow semantics are the caller's choice via
- *  the native add.
+ *  swallowed. No lifecycle/getStream/AWS behavior and no raw error
+ *  retention in this surface (resume/destroy controls are the WU5B1a0a2b2
+ *  surface below); `data` flow semantics are the caller's choice via the
+ *  native add.
  *  WU5B1a0a2a1 (R3): trusted-provider structural body boundary — an own
  *  `_readableState` DATA descriptor (captured non-invoking
  *  `Object.getOwnPropertyDescriptor`) whose value is non-null, non-Proxy,
@@ -52,7 +53,28 @@
  *  getter runs, so hostile own accessors and readable/destroyed/
  *  readableFinished/pipe/on shadows are never read; guarding adds no
  *  listener, starts no flow, resumes/destroys nothing, and exposes only
- *  the exact body identity. No lifecycle or getStream behavior here. */
+ *  the exact body identity. No lifecycle or getStream behavior in this
+ *  surface. WU5B1a0a2b2 (trusted-provider Readable resume/destroy
+ *  controls): the body wrapper extends with exactly `resume(): boolean`
+ *  and `destroy(error?: Error): boolean`. Module-captured native
+ *  `Readable.prototype` `resume`/`destroy` are invoked with the validated
+ *  body as receiver — hostile own resume/destroy/pipe shadows are never
+ *  read or invoked. Before EVERY call the trusted structural validation is
+ *  rerun (Proxy-free chain + own `_readableState` DATA descriptor) and
+ *  after every returned call the trusted post-guard state is rechecked;
+ *  true only when the native call returned without throwing against a
+ *  still-valid body, false on any throw or invalid post-guard state; every
+ *  error is swallowed and no raw error is retained. `destroy` accepts only
+ *  an internal fixed genuine `Error` or omission: runtime values are
+ *  validated with zero user-observable property access — non-objects and
+ *  objects whose chain contains a Proxy are rejected, and the
+ *  module-captured native `Error.isError` `[[ErrorData]]` internal-slot
+ *  check (Node 24 runtime) authenticates the fixed internal `Error` with
+ *  no attacker-code path: `Symbol.toStringTag` is never invoked (unlike
+ *  `Object.prototype.toString`, whose `@@toStringTag` read runs hostile
+ *  getters), so prototype spoofs are rejected fail-closed. Guarding itself causes no control action: it neither
+ *  resumes nor destroys the body; no lifecycle/getStream/HeadObject/AWS
+ *  behavior is added. */
 import { Readable } from 'node:stream';
 import { types as utilTypes } from 'node:util';
 
@@ -157,8 +179,15 @@ export interface GuardedObjectReadBody {
   /** WU5B1a0a2a3: captured-native listener add for `data|end|error|close`;
    *  false on every failure, never throws, unwinds partial registration. */
   addListener(event: ObjectReadBodyListenEvent, listener: () => void): boolean;
-  /** WU5B1a0a2a3: captured-native listener removal; never throws. */
+  /** WU5B1a0a2b3: captured-native listener removal; never throws. */
   removeListener(event: ObjectReadBodyListenEvent, listener: () => void): void;
+  /** WU5B1a0a2b2: captured-native explicit flow start; true only when the
+   *  native call returns without throwing against a still-valid body. */
+  resume(): boolean;
+  /** WU5B1a0a2b2: captured-native explicit destroy; `error` must be an
+   *  internal fixed genuine `Error` or omitted. True only when the native
+   *  call returns without throwing against a still-valid body. */
+  destroy(error?: Error): boolean;
 }
 
 /** WU5B1a0a2a3: exact runtime listener-event whitelist for body listeners. */
@@ -188,6 +217,43 @@ const NATIVE_READABLE_ON: NativeBodyListenOp | undefined =
 const NATIVE_READABLE_OFF: NativeBodyListenOp | undefined =
   // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
   Readable.prototype.off;
+
+/** WU5B1a0a2b2: module-captured native `Readable.prototype` control ops,
+ *  always invoked with the validated body receiver so hostile own
+ *  resume/destroy shadows are never dynamically read or invoked. */
+const NATIVE_READABLE_RESUME: ((this: Readable) => unknown) | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Readable.prototype.resume;
+const NATIVE_READABLE_DESTROY:
+  | ((this: Readable, error?: Error) => unknown)
+  | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Readable.prototype.destroy;
+
+/** WU5B1a0a2b2: runtime validation for the internal fixed destroy error
+ *  with zero user-observable property access — objectness, chain-wide
+ *  Proxy rejection, and the module-captured native `Error.isError`
+ *  `[[ErrorData]]` internal-slot check (R1: unlike
+ *  `Object.prototype.toString`, whose `@@toStringTag` read executes
+ *  hostile own getters, `Error.isError` reads only the internal slot, so
+ *  prototype spoofs are rejected fail-closed with no attacker-code
+ *  path). */
+// lib types predate the runtime proposal; the Node 24 runtime provides
+// `Error.isError`, read through a structural seam and fail-closed when absent.
+// SAFETY: TypeScript's lib declarations predate the `Error.isError` runtime
+// proposal, so the structurally-typed access below is the only way to bind
+// the real runtime function; the type asserts exactly the signature the
+// runtime proposal guarantees (`(value: unknown) => boolean`, no `this`),
+// and absence falls back to `undefined` so validation fails closed.
+const NATIVE_ERROR_IS_ERROR: ((value: unknown) => boolean) | undefined = (
+  Error as unknown as { isError?: (value: unknown) => boolean }
+).isError;
+const isInternalFixedDestroyError = (value: unknown): boolean => {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!isProxyFreePrototypeChain(value)) return false;
+  if (typeof NATIVE_ERROR_IS_ERROR !== 'function') return false;
+  return NATIVE_ERROR_IS_ERROR(value);
+};
 
 /** WU5B1a0a2a2 snapshot shape: plain, fresh, exact booleans only. */
 export type ObjectReadBodyState = {
@@ -324,6 +390,37 @@ export function guardObjectReadBody(
           NATIVE_READABLE_OFF.call(value, event, listener);
         } catch {
           /* fail-closed: removal failure never overrides safe teardown */
+        }
+      },
+      resume: () => {
+        try {
+          if (typeof NATIVE_READABLE_RESUME !== 'function') return false;
+          // Trusted structural revalidation before EVERY call.
+          if (!isProxyFreePrototypeChain(value)) return false;
+          if (!hasTrustedReadableStateShape(value)) return false;
+          NATIVE_READABLE_RESUME.call(value);
+          // Invalid post-guard state collapses to false.
+          if (readTrustedBodyState(value) === null) return false;
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      destroy: (error?: Error) => {
+        try {
+          if (typeof NATIVE_READABLE_DESTROY !== 'function') return false;
+          // Runtime destroy-argument validation with zero property access.
+          if (error !== undefined && !isInternalFixedDestroyError(error))
+            return false;
+          // Trusted structural revalidation before EVERY call.
+          if (!isProxyFreePrototypeChain(value)) return false;
+          if (!hasTrustedReadableStateShape(value)) return false;
+          NATIVE_READABLE_DESTROY.call(value, error);
+          // Invalid post-guard state collapses to false.
+          if (readTrustedBodyState(value) === null) return false;
+          return true;
+        } catch {
+          return false;
         }
       },
     };

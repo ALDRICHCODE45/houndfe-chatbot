@@ -18,7 +18,25 @@
  *  removeListener for exactly `data|end|error|close` via module-captured
  *  native `Readable.prototype` on/off; per-operation structural
  *  revalidation; fail-closed runtime values; unwind-on-add-failure;
- *  swallowed removal. Fakes and node:events accounting only. */
+ *  swallowed removal. Fakes and node:events accounting only.
+ *  WU5B1a0a2b2 spec: trusted-provider Readable resume/destroy controls —
+ *  the body wrapper extends with exactly `resume(): boolean` and
+ *  `destroy(error?: Error): boolean`; module-captured native
+ *  `Readable.prototype` resume/destroy are invoked with the validated body
+ *  receiver (hostile own resume/destroy/pipe shadows are never read or
+ *  invoked); before EVERY call the trusted structural validation is rerun
+ *  and after every returned call the trusted post-guard state is rechecked;
+ *  true only when the native call returned without throwing against a
+ *  still-valid body, false on any throw or invalid post-guard state, all
+ *  errors swallowed, no raw error retained; `destroy` accepts only an
+ *  internal fixed genuine `Error` — authenticated by the module-captured
+ *  native `Error.isError` `[[ErrorData]]` internal-slot check (Node 24
+ *  runtime; `Symbol.toStringTag` is never invoked, unlike
+ *  `Object.prototype.toString`, whose `@@toStringTag` read runs hostile
+ *  getters), with chain-proxy/hostile rejections and zero user-observable
+ *  property access — or omission. Guarding itself causes no control
+ *  action; no lifecycle/getStream/HeadObject/AWS surface; fakes and
+ *  node:events accounting only. */
 import { getEventListeners } from 'node:events';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
@@ -38,6 +56,8 @@ type GuardedBody = {
   readState(): ObjectReadBodyState | null;
   addListener(event: ObjectReadBodyListenEvent, listener: () => void): boolean;
   removeListener(event: ObjectReadBodyListenEvent, listener: () => void): void;
+  resume(): boolean;
+  destroy(error?: Error): boolean;
 };
 const guardsModule: Record<string, unknown> = jest.requireActual(
   './safe-object-read-guards',
@@ -558,7 +578,7 @@ describe('guardObjectReadBody', () => {
     for (const count of Object.values(hostile.counts)) expect(count).toBe(0);
   });
 
-  it('WU5B1a0a2a3: exposes the exact surface {body, initialState, readState, addListener, removeListener}; no operation/lifecycle surface', () => {
+  it('WU5B1a0a2a3: exposes the exact surface {body, initialState, readState, addListener, removeListener, resume, destroy}; no other operation/lifecycle surface', () => {
     const g = guardObjectReadBody!(new Readable({ read() {} }))!;
     expect(Object.keys(g)).toEqual([
       'body',
@@ -566,6 +586,8 @@ describe('guardObjectReadBody', () => {
       'readState',
       'addListener',
       'removeListener',
+      'resume',
+      'destroy',
     ]);
     expect(typeof (g as unknown as { readState: unknown }).readState).toBe(
       'function',
@@ -574,12 +596,15 @@ describe('guardObjectReadBody', () => {
     for (const absent of [
       'on',
       'off',
-      'resume',
-      'destroy',
       'addBodyListener',
       'removeBodyListener',
       'getStream',
       'headObject',
+      'pipe',
+      'unpipe',
+      'read',
+      'write',
+      'lifecycle',
     ])
       expect(surface[absent]).toBeUndefined();
   });
@@ -946,5 +971,230 @@ describe('guardObjectReadBody listeners', () => {
     expect(g2.addListener('data', () => {})).toBe(false);
     expect(() => g2.removeListener('data', () => {})).not.toThrow();
     expect(traps).toBe(0);
+  });
+});
+
+/** WU5B1a0a2b2: trusted-provider Readable resume/destroy controls. */
+describe('guardObjectReadBody controls', () => {
+  it('WU5B1a0a2b2 RED→GREEN: guard itself causes no control action; surface extends with exactly {resume, destroy}', () => {
+    const r = new Readable({ read() {} });
+    const events = ['data', 'readable', 'end', 'close', 'error'] as const;
+    const before = events.map((e) => getEventListeners(r, e).length);
+    const g = guardObjectReadBody!(r)!;
+    expect(typeof g.resume).toBe('function');
+    expect(typeof g.destroy).toBe('function');
+    expect(events.map((e) => getEventListeners(r, e).length)).toEqual(before);
+    expect(r.readableFlowing).toBeNull();
+    expect(r.readableEnded).toBe(false);
+    expect(r.destroyed).toBe(false);
+    const hostile = new HostileBody();
+    const hg = guardObjectReadBody!(hostile)!;
+    expect(hg.body).toBe(hostile);
+    for (const count of Object.values(hostile.counts)) expect(count).toBe(0);
+    expect(hostile.readableFlowing).toBeNull();
+  });
+
+  it('WU5B1a0a2b2: resume starts flow only when explicitly called and returns true', () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    expect(r.readableFlowing).toBeNull();
+    expect(g.resume()).toBe(true);
+    expect(r.readableFlowing).toBe(true);
+  });
+
+  it('WU5B1a0a2b2: destroy changes dynamic state only when explicitly called; a fixed Error is handled safely via the error event', async () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    expect(r.destroyed).toBe(false);
+    let errors = 0;
+    expect(g.addListener('error', () => errors++)).toBe(true);
+    expect(g.destroy(new Error('fixed internal'))).toBe(true);
+    expect(r.destroyed).toBe(true);
+    expect(g.readState()).toEqual({ destroyed: true, readableEnded: false });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(errors).toBe(1);
+  });
+
+  it('WU5B1a0a2b2: hostile own resume/destroy/pipe shadows are never read or invoked; captured native controls run', () => {
+    const h = new HostileBody();
+    const g = guardObjectReadBody!(h)!;
+    expect(g.resume()).toBe(true);
+    expect(g.destroy()).toBe(true);
+    expect(h.counts.resume).toBe(0);
+    expect(h.counts.destroy).toBe(0);
+    expect(h.counts.pipe).toBe(0);
+    expect(h.readableFlowing).toBe(true);
+    expect(g.readState()).toEqual({ destroyed: true, readableEnded: false });
+  });
+
+  it('WU5B1a0a2b2 seam: throwing captured resume/destroy return false and are restored', () => {
+    const resumeSpy = jest.spyOn(
+      Readable.prototype,
+      'resume',
+    ) as unknown as jest.Mock;
+    const destroySpy = jest.spyOn(
+      Readable.prototype,
+      'destroy',
+    ) as unknown as jest.Mock;
+    resumeSpy.mockImplementation(() => {
+      throw new Error('resume boom');
+    });
+    try {
+      const r = new Readable({ read() {} });
+      const holder: { guarded: GuardedBody | null } = { guarded: null };
+      jest.isolateModules(() => {
+        const mod = jest.requireActual<
+          typeof import('./safe-object-read-guards')
+        >('./safe-object-read-guards');
+        holder.guarded = mod.guardObjectReadBody(r);
+      });
+      expect(holder.guarded).not.toBeNull();
+      expect(holder.guarded!.resume()).toBe(false);
+      expect(r.readableFlowing).toBeNull();
+    } finally {
+      resumeSpy.mockRestore();
+    }
+    destroySpy.mockImplementation(() => {
+      throw new Error('destroy boom');
+    });
+    try {
+      const r2 = new Readable({ read() {} });
+      const holder2: { guarded: GuardedBody | null } = { guarded: null };
+      jest.isolateModules(() => {
+        const mod = jest.requireActual<
+          typeof import('./safe-object-read-guards')
+        >('./safe-object-read-guards');
+        holder2.guarded = mod.guardObjectReadBody(r2);
+      });
+      expect(holder2.guarded).not.toBeNull();
+      expect(holder2.guarded!.destroy(new Error('fixed'))).toBe(false);
+      expect(r2.destroyed).toBe(false);
+    } finally {
+      destroySpy.mockRestore();
+    }
+    const r3 = new Readable({ read() {} });
+    const g3 = guardObjectReadBody!(r3)!;
+    expect(g3.resume()).toBe(true);
+    expect(g3.destroy()).toBe(true);
+    expect(r3.destroyed).toBe(true);
+  });
+
+  it('WU5B1a0a2b2: post-guard accessor/Proxy state substitution fails both controls closed with zero traps/getter', () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    expect(r.readableFlowing).toBeNull();
+    expect(r.destroyed).toBe(false);
+    const hits = poison(r as unknown as Record<string, unknown>, [
+      '_readableState',
+    ]);
+    expect(g.resume()).toBe(false);
+    expect(g.destroy()).toBe(false);
+    expect(hits).toEqual([]);
+    let traps = 0;
+    const trapHandler = {
+      get: () => {
+        traps++;
+        return undefined;
+      },
+      getPrototypeOf: (t: object) => {
+        traps++;
+        return Reflect.getPrototypeOf(t);
+      },
+    };
+    const r2 = new Readable({ read() {} });
+    const g2 = guardObjectReadBody!(r2)!;
+    Object.defineProperty(r2, '_readableState', {
+      configurable: true,
+      value: new Proxy({}, trapHandler),
+    });
+    expect(g2.resume()).toBe(false);
+    expect(g2.destroy()).toBe(false);
+    expect(traps).toBe(0);
+  });
+
+  it('WU5B1a0a2b2: invalid destroy arguments fail closed with zero native destroy calls', () => {
+    const destroySpy = jest.spyOn(
+      Readable.prototype,
+      'destroy',
+    ) as unknown as jest.Mock;
+    try {
+      let traps = 0;
+      const trapHandler = {
+        get: () => {
+          traps++;
+          return undefined;
+        },
+        getPrototypeOf: (t: object) => {
+          traps++;
+          return Reflect.getPrototypeOf(t);
+        },
+      };
+      const hostile = new Error('hostile');
+      Object.setPrototypeOf(hostile, new Proxy(Error.prototype, trapHandler));
+      const invalid: unknown[] = [
+        null,
+        123,
+        'x',
+        {},
+        [],
+        true,
+        Symbol('e'),
+        Object.create(Error.prototype),
+        new Proxy(new Error('attacker'), {}),
+        hostile,
+      ];
+      const r = new Readable({ read() {} });
+      const holder: { guarded: GuardedBody | null } = { guarded: null };
+      jest.isolateModules(() => {
+        const mod = jest.requireActual<
+          typeof import('./safe-object-read-guards')
+        >('./safe-object-read-guards');
+        holder.guarded = mod.guardObjectReadBody(r);
+      });
+      expect(holder.guarded).not.toBeNull();
+      for (const v of invalid)
+        expect(holder.guarded!.destroy(v as Error)).toBe(false);
+      expect(destroySpy).not.toHaveBeenCalled();
+      expect(r.destroyed).toBe(false);
+      expect(traps).toBe(0);
+    } finally {
+      destroySpy.mockRestore();
+    }
+  });
+
+  it('WU5B1a0a2b2: repeated destroy is safe and error handling stays exactly-once', async () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    let errors = 0;
+    expect(g.addListener('error', () => errors++)).toBe(true);
+    const fixed = new Error('fixed internal');
+    expect(g.destroy(fixed)).toBe(true);
+    expect(g.destroy(fixed)).toBe(true);
+    expect(g.destroy()).toBe(true);
+    expect(r.destroyed).toBe(true);
+    expect(g.readState()!.destroyed).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(errors).toBe(1);
+  });
+
+  it('WU5B1a0a2b2-R1 RED→GREEN: a hostile own Symbol.toStringTag accessor is never invoked; internal-slot authentication needs no attacker code', async () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    let getterHits = 0;
+    const hostile = new Error('fixed internal');
+    Object.defineProperty(hostile, Symbol.toStringTag, {
+      configurable: true,
+      get: () => {
+        getterHits++;
+        throw new Error('attacker');
+      },
+    });
+    let errors = 0;
+    expect(g.addListener('error', () => errors++)).toBe(true);
+    expect(g.destroy(hostile)).toBe(true);
+    expect(getterHits).toBe(0);
+    expect(r.destroyed).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(errors).toBe(1);
   });
 });
