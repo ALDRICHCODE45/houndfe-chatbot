@@ -36,10 +36,13 @@ export interface ObjectStoragePort {
   put(
     input: PutObjectInput,
   ): Promise<{ etag: string; versionId: string | null }>;
+  /** WU5B1a2: private streaming GetObject; fixed nonretryable
+   *  OBJECT_NOT_FOUND for exact structured `$metadata.httpStatusCode===404`. */
+  getStream(input: GetObjectInput): Promise<GetObjectResult>;
 }
 
-/** WU5B1a1: neutral private-read input/result shapes. Port-level `getStream`
- *  integration is WU5B1a2 (adapter + 404 mapping); these types only. */
+/** WU5B1a1: neutral private-read input/result shapes. WU5B1a2 integrates
+ *  the port-level `getStream` (adapter + 404 mapping). */
 export interface GetObjectInput {
   key: string;
   abortSignal: AbortSignal;
@@ -62,7 +65,8 @@ export type ObjectStorageErrorCode =
   | 'HTTP_PERMANENT'
   | 'NETWORK_FAILURE'
   | 'CLEANUP_PENDING'
-  | 'PERMANENT_FAILURE';
+  | 'PERMANENT_FAILURE'
+  | 'OBJECT_NOT_FOUND';
 
 const RETRYABLE_CODES: ReadonlySet<ObjectStorageErrorCode> = new Set([
   'ABORTED',

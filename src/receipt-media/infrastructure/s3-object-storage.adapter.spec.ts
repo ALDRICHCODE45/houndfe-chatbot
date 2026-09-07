@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import {
   DeleteObjectCommand,
+  GetObjectCommand,
   PutObjectCommand,
   type S3Client,
 } from '@aws-sdk/client-s3';
@@ -135,6 +136,7 @@ describe('WU5A1 object-storage port', () => {
       ['NETWORK_FAILURE', true, false],
       ['CLEANUP_PENDING', true, true],
       ['PERMANENT_FAILURE', false, false],
+      ['OBJECT_NOT_FOUND', false, false],
     ];
     for (const [code, retryable, cleanupPending] of flags) {
       const e = new port.ObjectStorageError('OBJECT_STORAGE', code as never);
@@ -719,5 +721,240 @@ describe('WU5A2a integrity, abort registration, and compensation', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0].opts?.abortSignal).toBe(signal);
     expect(input.content.destroyed).toBe(true);
+  });
+});
+
+describe('WU5B1a2 S3 adapter getStream', () => {
+  const getResponse = (over: Record<string, unknown> = {}) => ({
+    Body: Readable.from([Buffer.from('hello')]),
+    ContentLength: 5,
+    ContentType: 'image/jpeg',
+    ETag: '"etag-1"',
+    VersionId: 'v-1',
+    ...over,
+  });
+  const getInput = (over: Record<string, unknown> = {}) => ({
+    key: KEY,
+    abortSignal: new AbortController().signal,
+    ...over,
+  });
+  type GetInput = ReturnType<typeof getInput>;
+  const callGet = (
+    adapter: S3ObjectStorageAdapter,
+    input: GetInput,
+  ): Promise<unknown> => {
+    const asPort: port.ObjectStoragePort = adapter;
+    return asPort.getStream(input);
+  };
+
+  it('sends one private GetObject and streams the internal safe result, never the provider body', async () => {
+    const body = Readable.from([Buffer.from('hello')]);
+    const { adapter, sent } = makeAdapter(() => ({
+      ...getResponse(),
+      Body: body,
+    }));
+    const input = getInput();
+    const result = (await callGet(adapter, input)) as {
+      stream: Readable;
+      byteCount: number;
+      mimeType: string;
+      etag: string;
+      versionId: string | null;
+    };
+    expect(sent).toHaveLength(1);
+    expect(sent[0].cmd).toBeInstanceOf(GetObjectCommand);
+    expect(sent[0].cmd.input).toEqual({ Bucket: BUCKET, Key: KEY });
+    expect(sent[0].cmd.input.ACL).toBeUndefined();
+    expect(sent[0].opts).toEqual({ abortSignal: input.abortSignal });
+    expect(result.byteCount).toBe(5);
+    expect(result.mimeType).toBe('image/jpeg');
+    expect(result.etag).toBe('"etag-1"');
+    expect(result.versionId).toBe('v-1');
+    expect(result.stream).not.toBe(body);
+    expect((await result.stream.toArray()).toString()).toBe('hello');
+    expect(listenerCount(input.abortSignal)).toBe(0);
+  });
+
+  it('rejects invalid signal/key and pre-abort before any send', async () => {
+    const { adapter, sent } = makeAdapter();
+    const spoof = new Proxy(new AbortController().signal, {
+      get: (t, p) => {
+        const v: unknown = Reflect.get(t, p, t);
+        return typeof v === 'function' ? (v as () => unknown).bind(t) : v;
+      },
+    });
+    const cases: [Record<string, unknown>, string, boolean?][] = [
+      [{ key: 'receipts/not-a-uuid' }, 'OBJECT_KEY_INVALID'],
+      [{ abortSignal: undefined }, 'REQUEST_INVALID'],
+      [{ abortSignal: { aborted: false } }, 'REQUEST_INVALID'],
+      [{ abortSignal: spoof }, 'REQUEST_INVALID'],
+      [{ abortSignal: aborted() }, 'ABORTED', true],
+    ];
+    for (const [over, code, retryable] of cases)
+      await expectCode(callGet(adapter, getInput(over)), code, retryable);
+    expect(sent).toEqual([]);
+  });
+
+  it('maps a failed abort-listener registration to REQUEST_INVALID before any send', async () => {
+    const original =
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; restored in finally
+      EventTarget.prototype.addEventListener;
+    let settle: (value: unknown) => void = () => undefined;
+    const outcome = new Promise<unknown>((resolve) => {
+      settle = resolve;
+    });
+    const send = jest.fn();
+    jest.isolateModules(() => {
+      (
+        EventTarget.prototype as unknown as Record<string, unknown>
+      ).addEventListener = () => {
+        throw new Error('add-fault');
+      };
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- fresh module evaluation is required so the adapter re-captures the patched native listener seam
+        const freshModule = require('./s3-object-storage.adapter') as {
+          S3ObjectStorageAdapter: typeof S3ObjectStorageAdapter;
+        };
+        const adapter = new freshModule.S3ObjectStorageAdapter(CFG, {
+          send,
+        });
+        (adapter as port.ObjectStoragePort)
+          .getStream(getInput())
+          .then(settle, settle);
+      } finally {
+        EventTarget.prototype.addEventListener = original;
+      }
+    });
+    expect(await outcome).toMatchObject({
+      category: 'OBJECT_STORAGE',
+      code: 'REQUEST_INVALID',
+      message: 'receipt-media:OBJECT_STORAGE/REQUEST_INVALID',
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('lets a caller abort win over provider rejection and over a resolved response', async () => {
+    const responds: (() => unknown)[] = [
+      () => {
+        throw boom({ $metadata: { httpStatusCode: 404 } });
+      },
+      () => getResponse(),
+    ];
+    for (const respond of responds) {
+      const ctrl = new AbortController();
+      const { adapter } = makeAdapter(() => {
+        ctrl.abort();
+        return respond();
+      });
+      await expectCode(
+        callGet(adapter, getInput({ abortSignal: ctrl.signal })),
+        'ABORTED',
+        true,
+      );
+    }
+  });
+
+  it('maps exact structured 404 to nonretryable OBJECT_NOT_FOUND and keeps the taxonomy', async () => {
+    const { adapter, sent } = makeAdapter(() => {
+      throw boom({ $metadata: { httpStatusCode: 404 } });
+    });
+    const e = await expectCode(
+      callGet(adapter, getInput()),
+      'OBJECT_NOT_FOUND',
+      false,
+    );
+    expect((e as { cleanupPending?: unknown }).cleanupPending).toBe(false);
+    expect(sent).toHaveLength(1);
+    const cases: [Record<string, unknown>, string, boolean?][] = [
+      [{ $metadata: { httpStatusCode: '404' } }, 'PERMANENT_FAILURE'],
+      [{ $metadata: {} }, 'PERMANENT_FAILURE'],
+      [{ name: 'NetworkingError' }, 'NETWORK_FAILURE'],
+      [{ $metadata: { httpStatusCode: 400 } }, 'HTTP_PERMANENT', false],
+      [{ $metadata: { httpStatusCode: 503 } }, 'HTTP_RETRYABLE', true],
+      [{}, 'PERMANENT_FAILURE', false],
+      [{ code: 'ECONNRESET' }, 'NETWORK_FAILURE', true],
+    ];
+    for (const [props, code, retryable] of cases) {
+      const next = makeAdapter(() => {
+        throw boom(props);
+      });
+      await expectCode(callGet(next.adapter, getInput()), code, retryable);
+    }
+  });
+
+  it('rejects Proxy and prototype-only response fields with zero trap or getter execution', async () => {
+    let traps = 0;
+    // Plain send (no jest.fn): jest-mock bookkeeping would itself read a
+    // property of the returned proxy, so the zero-trap assertion needs an
+    // un-instrumented return path.
+    const sent: unknown[] = [];
+    const proxyAdapter = new S3ObjectStorageAdapter(CFG, {
+      send: (cmd: Cmd) => {
+        sent.push(cmd);
+        const response = new Proxy(getResponse(), {
+          get: (t, p) => {
+            // The JS promise-resolution protocol itself reads `.then` once
+            // when the fake send's promise settles; that lookup is runtime,
+            // not adapter code, so it is exempt from the zero-trap count.
+            if (p !== 'then') traps++;
+            const value: unknown = Reflect.get(t, p, t);
+            return value;
+          },
+        });
+        return Promise.resolve(response);
+      },
+    });
+    await expectCode(callGet(proxyAdapter, getInput()), 'RESPONSE_INVALID');
+    expect(traps).toBe(0);
+    expect(sent).toHaveLength(1);
+    let getterCalls = 0;
+    const proto = {
+      get ContentType(): string {
+        getterCalls++;
+        return 'image/jpeg';
+      },
+      get Body(): Readable {
+        getterCalls++;
+        return Readable.from(['x']);
+      },
+    };
+    const protoAdapter = makeAdapter(() => Object.create(proto));
+    await expectCode(
+      callGet(protoAdapter.adapter, getInput()),
+      'RESPONSE_INVALID',
+    );
+    expect(getterCalls).toBe(0);
+  });
+
+  it('rejects own accessor fields without invocation and destroys bodies under malformed metadata', async () => {
+    let calls = 0;
+    const accessorResponse = {
+      get ContentType(): string {
+        calls++;
+        return 'image/jpeg';
+      },
+      Body: Readable.from(['x']),
+      ContentLength: 1,
+      ETag: '"e"',
+    };
+    const accessor = makeAdapter(() => accessorResponse);
+    await expectCode(callGet(accessor.adapter, getInput()), 'RESPONSE_INVALID');
+    expect(calls).toBe(0);
+    const cases: Record<string, unknown>[] = [
+      { ContentLength: '5' },
+      { ContentType: 'image/gif' },
+      { ETag: '' },
+      { VersionId: 42 },
+    ];
+    for (const over of cases) {
+      const body = Readable.from([Buffer.from('hello')]);
+      const { adapter } = makeAdapter(() => ({
+        ...getResponse(),
+        Body: body,
+        ...over,
+      }));
+      await expectCode(callGet(adapter, getInput()), 'RESPONSE_INVALID');
+      expect(body.destroyed).toBe(true);
+    }
   });
 });

@@ -17,20 +17,29 @@
  *  prototype-captured native operations so no attacker-shadowed signal
  *  property is ever dynamically read or invoked. `aborted` is read once;
  *  listener add/remove is fail-closed.
- *  WU5B: get/head/delete. */
+ *  WU5B1a2 getStream: one private GetObject via the verified safe-read
+ *  boundary (genuine-signal guard + listener before send, exactly
+ *  `{Bucket, Key}`, own-DATA-descriptor-only fail-closed extraction, verified
+ *  assembler, caller-abort-wins, exact structured 404 → fixed nonretryable
+ *  OBJECT_NOT_FOUND, existing taxonomy otherwise). No ACL/public URL/pipe/
+ *  buffering/compensation/raw retention. HeadObject/delete are later WU5B. */
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { types as utilTypes } from 'node:util';
 import {
   DeleteObjectCommand,
+  GetObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
 import {
   isCanonicalObjectKey,
   ObjectStorageError,
+  type GetObjectInput,
+  type GetObjectResult,
   type ObjectStorageErrorCode,
+  type ObjectStoragePort,
   type PutObjectInput,
 } from '../domain/object-storage.port';
 import {
@@ -38,6 +47,11 @@ import {
   RECEIPT_SHA256_BYTES,
   type ReceiptMimeType,
 } from '../domain/receipt-media.types';
+import {
+  guardObjectReadBody,
+  guardObjectReadSignal,
+} from './safe-object-read-guards';
+import { assembleSafeObjectReadResult } from './safe-object-read-result';
 
 const MIME_TYPES: readonly ReceiptMimeType[] = ['image/jpeg', 'image/png'];
 
@@ -212,7 +226,81 @@ const classifyProvider = (err: unknown): ObjectStorageError => {
   return safe('PERMANENT_FAILURE');
 };
 
-export class S3ObjectStorageAdapter {
+/** WU5B1a2: exact structured 404 only; malformed fields fall through to the
+ *  existing taxonomy; messages/stacks/causes never read. */
+const isStructuredNotFound = (err: unknown): boolean => {
+  const meta = read(err, '$metadata');
+  if (meta === ABSENT || meta === INVALID) return false;
+  return read(meta, 'httpStatusCode') === 404;
+};
+
+/** Captured non-invoking native descriptor/prototype reads for fail-closed
+ *  GetObject response-field extraction; `NonNullObject` mirrors the
+ *  guards-module alias (prototype links are genuinely shapeless). */
+type NonNullObject = object;
+const NATIVE_GET_OWN_DESCRIPTOR: typeof Object.getOwnPropertyDescriptor =
+  Object.getOwnPropertyDescriptor;
+const NATIVE_GET_PROTOTYPE_OF: (target: NonNullObject) => NonNullObject | null =
+  Object.getPrototypeOf;
+
+const RESPONSE_FIELD_KEYS: readonly string[] = [
+  'Body',
+  'ContentLength',
+  'ContentType',
+  'ETag',
+  'VersionId',
+];
+
+/** Normalized invalid sentinel for accessor-descriptor fields; the
+ *  assembler's exact validators reject it. */
+const UNUSABLE = Symbol('unusable');
+
+/** Chain-wide proxy rejection before any property access (trap-count 0). */
+const proxyFreeChain = (value: NonNullObject): boolean => {
+  let link: object | null = value;
+  while (link !== null) {
+    if (utilTypes.isProxy(link)) return false;
+    link = NATIVE_GET_PROTOTYPE_OF(link);
+  }
+  return true;
+};
+
+type ExtractedResponse =
+  | { ok: true; fields: Record<string, unknown> }
+  | { ok: false; body: unknown };
+
+/** Fail-closed extraction of raw response fields: own DATA descriptors
+ *  only, one read per field, no getter invocation, no prototype fields, no
+ *  coercion; absent → undefined, accessor/unsafe → UNUSABLE; on failure the
+ *  already-extracted body (if guardable) is returned for destruction; the
+ *  raw response is never retained. */
+const extractResponseFields = (response: unknown): ExtractedResponse => {
+  let body: unknown;
+  try {
+    if (typeof response !== 'object' || response === null)
+      return { ok: false, body };
+    if (!proxyFreeChain(response)) return { ok: false, body };
+    const fields: Record<string, unknown> = {};
+    for (const key of RESPONSE_FIELD_KEYS) {
+      const desc = NATIVE_GET_OWN_DESCRIPTOR(response, key);
+      if (desc === undefined) {
+        fields[key] = undefined;
+        continue;
+      }
+      if (desc.get !== undefined || desc.set !== undefined) {
+        fields[key] = UNUSABLE;
+        continue;
+      }
+      fields[key] = desc.value;
+      if (key === 'Body') body = desc.value;
+    }
+    return { ok: true, fields };
+  } catch {
+    return { ok: false, body };
+  }
+};
+
+export class S3ObjectStorageAdapter implements ObjectStoragePort {
   private readonly client: Pick<S3Client, 'send'>;
 
   constructor(
@@ -341,6 +429,54 @@ export class S3ObjectStorageAdapter {
       input.content.removeListener('error', destroyBody);
       counter.destroy();
       await settled;
+    }
+  }
+
+  /** WU5B1a2: one private streaming GetObject — signal/key validated and
+   *  listener registered before send, exactly `{Bucket, Key}`, fail-closed
+   *  extraction + verified assembler, caller abort wins, exact structured
+   *  404 → OBJECT_NOT_FOUND, taxonomy otherwise; never the provider Body. */
+  async getStream(input: GetObjectInput): Promise<GetObjectResult> {
+    const signal = guardObjectReadSignal(input.abortSignal);
+    if (!signal) throw safe('REQUEST_INVALID');
+    if (signal.aborted) throw safe('ABORTED');
+    if (!isCanonicalObjectKey(input.key)) throw safe('OBJECT_KEY_INVALID');
+    let callerAborted = false;
+    const onCallerAbort = () => {
+      callerAborted = true;
+    };
+    if (!signal.addAbortListener(onCallerAbort)) throw safe('REQUEST_INVALID');
+    try {
+      let response: unknown;
+      try {
+        response = await this.client.send(
+          new GetObjectCommand({ Bucket: this.config.bucket, Key: input.key }),
+          { abortSignal: signal.signal },
+        );
+      } catch (err) {
+        if (callerAborted) throw safe('ABORTED');
+        if (isStructuredNotFound(err)) throw safe('OBJECT_NOT_FOUND');
+        throw classifyProvider(err);
+      }
+      if (callerAborted) throw safe('ABORTED');
+      const extracted = extractResponseFields(response);
+      if (!extracted.ok) {
+        const guarded = guardObjectReadBody(extracted.body);
+        if (guarded) guarded.destroy();
+        throw safe('RESPONSE_INVALID');
+      }
+      const assembled = assembleSafeObjectReadResult({
+        body: extracted.fields.Body,
+        byteCount: extracted.fields.ContentLength,
+        mimeType: extracted.fields.ContentType,
+        etag: extracted.fields.ETag,
+        versionId: extracted.fields.VersionId,
+        abortSignal: input.abortSignal,
+      });
+      if (!assembled.ok) throw safe(assembled.reason);
+      return assembled.value;
+    } finally {
+      signal.removeAbortListener(onCallerAbort);
     }
   }
 }
