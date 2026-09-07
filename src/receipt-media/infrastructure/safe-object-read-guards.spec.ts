@@ -13,7 +13,12 @@
  *  listener/flow/resume/destroy operations, lifecycle, getStream,
  *  HeadObject, or AWS surface. Fakes and node:events accounting only. The
  *  body guard binding is intentionally optional so the RED run fails only
- *  the new tests against unchanged production. */
+ *  the new tests against unchanged production.
+ *  WU5B1a0a2a3 spec: trusted-provider body listeners — addListener/
+ *  removeListener for exactly `data|end|error|close` via module-captured
+ *  native `Readable.prototype` on/off; per-operation structural
+ *  revalidation; fail-closed runtime values; unwind-on-add-failure;
+ *  swallowed removal. Fakes and node:events accounting only. */
 import { getEventListeners } from 'node:events';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
@@ -26,10 +31,13 @@ type ObjectReadBodyState = {
   readonly destroyed: boolean;
   readonly readableEnded: boolean;
 };
+type ObjectReadBodyListenEvent = 'data' | 'end' | 'error' | 'close';
 type GuardedBody = {
   readonly body: Readable;
   readonly initialState: ObjectReadBodyState;
   readState(): ObjectReadBodyState | null;
+  addListener(event: ObjectReadBodyListenEvent, listener: () => void): boolean;
+  removeListener(event: ObjectReadBodyListenEvent, listener: () => void): void;
 };
 const guardsModule: Record<string, unknown> = jest.requireActual(
   './safe-object-read-guards',
@@ -550,9 +558,15 @@ describe('guardObjectReadBody', () => {
     for (const count of Object.values(hostile.counts)) expect(count).toBe(0);
   });
 
-  it('WU5B1a0a2a2: exposes the exact snapshot surface {body, initialState, readState}; no operation/lifecycle surface', () => {
+  it('WU5B1a0a2a3: exposes the exact surface {body, initialState, readState, addListener, removeListener}; no operation/lifecycle surface', () => {
     const g = guardObjectReadBody!(new Readable({ read() {} }))!;
-    expect(Object.keys(g)).toEqual(['body', 'initialState', 'readState']);
+    expect(Object.keys(g)).toEqual([
+      'body',
+      'initialState',
+      'readState',
+      'addListener',
+      'removeListener',
+    ]);
     expect(typeof (g as unknown as { readState: unknown }).readState).toBe(
       'function',
     );
@@ -748,5 +762,189 @@ describe('guardObjectReadBody', () => {
     expect(g1.body).toBe(r);
     expect(g2.body).toBe(r);
     expect(g1).not.toBe(g2);
+  });
+});
+
+/** WU5B1a0a2a3: trusted-provider body listeners. */
+describe('guardObjectReadBody listeners', () => {
+  const FOUR = ['data', 'end', 'error', 'close'] as const;
+  const counts = (r: Readable) =>
+    FOUR.map((e) => getEventListeners(r, e).length);
+
+  it('WU5B1a0a2a3 RED→GREEN: invalid runtime event/listener values fail closed with zero registration and silent remove', () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    const onSpy = jest.spyOn(Readable.prototype, 'on') as unknown as jest.Mock;
+    const offSpy = jest.spyOn(
+      Readable.prototype,
+      'off',
+    ) as unknown as jest.Mock;
+    try {
+      const badEvents: unknown[] = [
+        'readable',
+        '',
+        'DATA',
+        'pipe',
+        123,
+        null,
+        undefined,
+        Symbol('e'),
+      ];
+      const badListeners: unknown[] = [null, undefined, 123, 'x', {}, true];
+      for (const ev of badEvents)
+        for (const l of badListeners)
+          expect(g.addListener(ev as never, l as () => void)).toBe(false);
+      expect(counts(r)).toEqual([0, 0, 0, 0]);
+      for (const ev of badEvents)
+        expect(() =>
+          g.removeListener(ev as never, undefined as never),
+        ).not.toThrow();
+      expect(counts(r)).toEqual([0, 0, 0, 0]);
+      expect(r.readableFlowing).toBeNull();
+      expect(onSpy).not.toHaveBeenCalled();
+      expect(offSpy).not.toHaveBeenCalled();
+    } finally {
+      onSpy.mockRestore();
+      offSpy.mockRestore();
+    }
+  });
+
+  it('WU5B1a0a2a3: registers all four events with exact counts; a registered error listener is invoked exactly once', () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    let errors = 0;
+    expect(g.addListener('data', () => {})).toBe(true);
+    expect(g.addListener('end', () => {})).toBe(true);
+    expect(g.addListener('error', () => errors++)).toBe(true);
+    expect(g.addListener('close', () => {})).toBe(true);
+    expect(counts(r)).toEqual([1, 1, 1, 1]);
+    r.emit('error', new Error('x'));
+    expect(errors).toBe(1);
+    expect(counts(r)).toEqual([1, 1, 1, 1]);
+    r.destroy();
+  });
+
+  it('WU5B1a0a2a3: remove and repeated remove are silent and idempotent; re-guarded bodies stay independent', () => {
+    const r = new Readable({ read() {} });
+    const g1 = guardObjectReadBody!(r)!;
+    const g2 = guardObjectReadBody!(r)!;
+    const l = () => {};
+    expect(g1.addListener('end', l)).toBe(true);
+    expect(g1.addListener('close', l)).toBe(true);
+    expect(counts(r)).toEqual([0, 1, 0, 1]);
+    g1.removeListener('end', l);
+    g1.removeListener('end', l);
+    g1.removeListener('data', l);
+    expect(counts(r)).toEqual([0, 0, 0, 1]);
+    g2.removeListener('close', l);
+    expect(counts(r)).toEqual([0, 0, 0, 0]);
+  });
+
+  it('WU5B1a0a2a3: hostile own on/off shadows are never invoked; captured native ops register and remove', () => {
+    const h = new HostileBody();
+    const g = guardObjectReadBody!(h)!;
+    const l = () => {};
+    expect(g.addListener('error', l)).toBe(true);
+    expect(getEventListeners(h, 'error').length).toBe(1);
+    g.removeListener('error', l);
+    expect(getEventListeners(h, 'error').length).toBe(0);
+    for (const count of Object.values(h.counts)) expect(count).toBe(0);
+  });
+
+  it('WU5B1a0a2a3 seam: post-registration add failure unwinds to zero listeners and reports false', () => {
+    const original: unknown =
+      // eslint-disable-next-line @typescript-eslint/unbound-method -- pristine native detached for the seam fixture
+      Readable.prototype.on;
+    const r = new Readable({ read() {} });
+    const spy = jest.spyOn(Readable.prototype, 'on') as unknown as jest.Mock;
+    spy.mockImplementation(function (this: Readable, ...args: unknown[]) {
+      (original as (...a: unknown[]) => unknown).apply(this, args);
+      throw new Error('post-registration failure');
+    });
+    try {
+      const holder: { guarded: GuardedBody | null } = { guarded: null };
+      jest.isolateModules(() => {
+        const mod = jest.requireActual<
+          typeof import('./safe-object-read-guards')
+        >('./safe-object-read-guards');
+        holder.guarded = mod.guardObjectReadBody(r);
+      });
+      expect(holder.guarded).not.toBeNull();
+      expect(holder.guarded!.addListener('error', () => {})).toBe(false);
+      expect(counts(r)).toEqual([0, 0, 0, 0]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('WU5B1a0a2a3 seam: throwing native off is swallowed by remove', () => {
+    const r = new Readable({ read() {} });
+    const spy = jest.spyOn(Readable.prototype, 'off') as unknown as jest.Mock;
+    spy.mockImplementation(() => {
+      throw new Error('off boom');
+    });
+    try {
+      const holder: { guarded: GuardedBody | null } = { guarded: null };
+      jest.isolateModules(() => {
+        const mod = jest.requireActual<
+          typeof import('./safe-object-read-guards')
+        >('./safe-object-read-guards');
+        holder.guarded = mod.guardObjectReadBody(r);
+      });
+      expect(holder.guarded).not.toBeNull();
+      const l = () => {};
+      expect(holder.guarded!.addListener('end', l)).toBe(true);
+      expect(getEventListeners(r, 'end').length).toBe(1);
+      expect(() => holder.guarded!.removeListener('end', l)).not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('WU5B1a0a2a3: post-guard _readableState accessor substitution fails listener ops closed with zero registration', () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    const hits = poison(r as unknown as Record<string, unknown>, [
+      '_readableState',
+    ]);
+    const l = () => {};
+    expect(g.addListener('error', l)).toBe(false);
+    expect(getEventListeners(r, 'error').length).toBe(0);
+    expect(() => g.removeListener('error', l)).not.toThrow();
+    expect(getEventListeners(r, 'error').length).toBe(0);
+    expect(hits).toEqual([]);
+    expect(g.readState()).toBeNull();
+  });
+
+  it('WU5B1a0a2a3: post-guard Proxy state value or prototype mutation fails listener ops closed with zero traps', () => {
+    let traps = 0;
+    const trapHandler = {
+      get: () => {
+        traps++;
+        return undefined;
+      },
+      getPrototypeOf: (t: object) => {
+        traps++;
+        return Reflect.getPrototypeOf(t);
+      },
+    };
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    Object.defineProperty(r, '_readableState', {
+      configurable: true,
+      value: new Proxy({}, trapHandler),
+    });
+    expect(g.addListener('close', () => {})).toBe(false);
+    expect(getEventListeners(r, 'close').length).toBe(0);
+    expect(traps).toBe(0);
+    const r2 = new Readable({ read() {} });
+    const g2 = guardObjectReadBody!(r2)!;
+    Object.setPrototypeOf(
+      r2,
+      new Proxy(Object.getPrototypeOf(r2) as object, trapHandler),
+    );
+    expect(g2.addListener('data', () => {})).toBe(false);
+    expect(() => g2.removeListener('data', () => {})).not.toThrow();
+    expect(traps).toBe(0);
   });
 });

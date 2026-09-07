@@ -29,8 +29,20 @@
  *  booleans are required and a fresh plain snapshot is returned; every
  *  failure collapses to `null` with no raw error retained. The guard
  *  captures `initialState` once and returns null if it cannot. No
- *  listener/flow/resume/destroy operations, lifecycle, or getStream
- *  behavior here.
+ *  resume/destroy/lifecycle/getStream behavior here.
+ *  WU5B1a0a2a3 (trusted-provider body listeners): the body guard adds
+ *  `addListener(event, listener): boolean` and `removeListener(event,
+ *  listener): void` for exactly `data|end|error|close`. Module-captured
+ *  native `Readable.prototype` `on`/`off` are invoked with the validated
+ *  body receiver — hostile own on/off/pipe shadows are never read or
+ *  invoked. Before EVERY operation the trusted structural validation is
+ *  rerun (Proxy-free chain + own `_readableState` DATA descriptor) and
+ *  runtime event/listener values are whitelisted/callability-checked
+ *  fail-closed. Add failure tries the captured native off with the same
+ *  args and returns false; every error is swallowed; removal failures are
+ *  swallowed. No resume/destroy/lifecycle/getStream/AWS behavior and no
+ *  raw error retention; `data` flow semantics are the caller's choice via
+ *  the native add.
  *  WU5B1a0a2a1 (R3): trusted-provider structural body boundary — an own
  *  `_readableState` DATA descriptor (captured non-invoking
  *  `Object.getOwnPropertyDescriptor`) whose value is non-null, non-Proxy,
@@ -142,7 +154,40 @@ export interface GuardedObjectReadBody {
   readonly initialState: ObjectReadBodyState;
   /** Fresh dynamic snapshot; null on every failure. */
   readState(): ObjectReadBodyState | null;
+  /** WU5B1a0a2a3: captured-native listener add for `data|end|error|close`;
+   *  false on every failure, never throws, unwinds partial registration. */
+  addListener(event: ObjectReadBodyListenEvent, listener: () => void): boolean;
+  /** WU5B1a0a2a3: captured-native listener removal; never throws. */
+  removeListener(event: ObjectReadBodyListenEvent, listener: () => void): void;
 }
+
+/** WU5B1a0a2a3: exact runtime listener-event whitelist for body listeners. */
+export type ObjectReadBodyListenEvent = 'data' | 'end' | 'error' | 'close';
+
+const BODY_LISTEN_EVENTS: readonly string[] = ['data', 'end', 'error', 'close'];
+const isBodyListenEvent = (
+  value: unknown,
+): value is ObjectReadBodyListenEvent =>
+  typeof value === 'string' && BODY_LISTEN_EVENTS.includes(value);
+
+/** Module-captured native `Readable.prototype` listener ops, always invoked
+ *  with the validated body receiver so hostile own on/off shadows are never
+ *  dynamically read or invoked. */
+type NativeBodyListenOp = (
+  this: Readable,
+  event: string,
+  listener: () => void,
+) => unknown;
+// SAFETY: the EventEmitter on/off overload family is narrowed to the exact
+// (event, listener) call shape used here; the narrowed signature matches the
+// runtime overload actually resolved for these four string events.
+const NATIVE_READABLE_ON: NativeBodyListenOp | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Readable.prototype.on;
+// SAFETY: same narrowing invariant as the captured on op above.
+const NATIVE_READABLE_OFF: NativeBodyListenOp | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Readable.prototype.off;
 
 /** WU5B1a0a2a2 snapshot shape: plain, fresh, exact booleans only. */
 export type ObjectReadBodyState = {
@@ -238,6 +283,49 @@ export function guardObjectReadBody(
       body: value,
       initialState,
       readState: () => readTrustedBodyState(value),
+      addListener: (event, listener) => {
+        try {
+          if (!isBodyListenEvent(event)) return false;
+          if (typeof listener !== 'function') return false;
+          if (
+            typeof NATIVE_READABLE_ON !== 'function' ||
+            typeof NATIVE_READABLE_OFF !== 'function'
+          )
+            return false;
+          // Trusted structural revalidation before EVERY operation.
+          if (!isProxyFreePrototypeChain(value)) return false;
+          if (!hasTrustedReadableStateShape(value)) return false;
+          NATIVE_READABLE_ON.call(value, event, listener);
+          return true;
+        } catch {
+          try {
+            // Unwind a partial registration with the same args; all
+            // errors swallowed.
+            if (
+              isBodyListenEvent(event) &&
+              typeof listener === 'function' &&
+              typeof NATIVE_READABLE_OFF === 'function'
+            )
+              NATIVE_READABLE_OFF.call(value, event, listener);
+          } catch {
+            /* fail-closed: unwind failure stays concealed */
+          }
+          return false;
+        }
+      },
+      removeListener: (event, listener) => {
+        try {
+          if (!isBodyListenEvent(event)) return;
+          if (typeof listener !== 'function') return;
+          if (typeof NATIVE_READABLE_OFF !== 'function') return;
+          // Trusted structural revalidation before EVERY operation.
+          if (!isProxyFreePrototypeChain(value)) return;
+          if (!hasTrustedReadableStateShape(value)) return;
+          NATIVE_READABLE_OFF.call(value, event, listener);
+        } catch {
+          /* fail-closed: removal failure never overrides safe teardown */
+        }
+      },
     };
   } catch {
     return null;
