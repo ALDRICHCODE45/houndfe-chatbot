@@ -36,7 +36,10 @@
  *  getters), with chain-proxy/hostile rejections and zero user-observable
  *  property access — or omission. Guarding itself causes no control
  *  action; no lifecycle/getStream/HeadObject/AWS surface; fakes and
- *  node:events accounting only. */
+ *  node:events accounting only.
+ *  WU5B1a0a2b3 spec: trusted-provider Readable pause control — `pause()`
+ *  is captured from `Readable.prototype`, structurally revalidated on every
+ *  call, and fail-closed without reading hostile own pause/pipe shadows. */
 import { getEventListeners } from 'node:events';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
@@ -57,6 +60,7 @@ type GuardedBody = {
   addListener(event: ObjectReadBodyListenEvent, listener: () => void): boolean;
   removeListener(event: ObjectReadBodyListenEvent, listener: () => void): void;
   resume(): boolean;
+  pause(): boolean;
   destroy(error?: Error): boolean;
 };
 const guardsModule: Record<string, unknown> = jest.requireActual(
@@ -329,6 +333,7 @@ class HostileBody extends Readable {
     | 'on'
     | 'off'
     | 'resume'
+    | 'pause'
     | 'destroy'
     | 'pipe',
     number
@@ -338,6 +343,7 @@ class HostileBody extends Readable {
     on: 0,
     off: 0,
     resume: 0,
+    pause: 0,
     destroy: 0,
     pipe: 0,
   };
@@ -358,7 +364,9 @@ class HostileBody extends Readable {
         return this.counts.readableEnded > 3;
       },
     });
-    const bomb = (key: 'on' | 'off' | 'resume' | 'destroy' | 'pipe') => {
+    const bomb = (
+      key: 'on' | 'off' | 'resume' | 'pause' | 'destroy' | 'pipe',
+    ) => {
       this.counts[key]++;
       throw new Error('attacker');
     };
@@ -373,6 +381,10 @@ class HostileBody extends Readable {
     Object.defineProperty(this, 'resume', {
       configurable: true,
       value: () => bomb('resume'),
+    });
+    Object.defineProperty(this, 'pause', {
+      configurable: true,
+      value: () => bomb('pause'),
     });
     Object.defineProperty(this, 'destroy', {
       configurable: true,
@@ -578,7 +590,7 @@ describe('guardObjectReadBody', () => {
     for (const count of Object.values(hostile.counts)) expect(count).toBe(0);
   });
 
-  it('WU5B1a0a2a3: exposes the exact surface {body, initialState, readState, addListener, removeListener, resume, destroy}; no other operation/lifecycle surface', () => {
+  it('WU5B1a0a2b3: exposes the exact surface {body, initialState, readState, addListener, removeListener, resume, pause, destroy}; no other operation/lifecycle surface', () => {
     const g = guardObjectReadBody!(new Readable({ read() {} }))!;
     expect(Object.keys(g)).toEqual([
       'body',
@@ -587,6 +599,7 @@ describe('guardObjectReadBody', () => {
       'addListener',
       'removeListener',
       'resume',
+      'pause',
       'destroy',
     ]);
     expect(typeof (g as unknown as { readState: unknown }).readState).toBe(
@@ -975,6 +988,83 @@ describe('guardObjectReadBody listeners', () => {
 });
 
 /** WU5B1a0a2b2: trusted-provider Readable resume/destroy controls. */
+describe('guardObjectReadBody pause control', () => {
+  it('WU5B1a0a2b3 RED: pause is explicit, stops flow until resume, and repeats safely', () => {
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    expect(r.readableFlowing).toBeNull();
+    expect(typeof g.pause).toBe('function');
+    expect(g.resume()).toBe(true);
+    expect(r.readableFlowing).toBe(true);
+    expect(g.pause()).toBe(true);
+    expect(r.readableFlowing).toBe(false);
+    expect(g.pause()).toBe(true);
+    expect(r.readableFlowing).toBe(false);
+    expect(g.resume()).toBe(true);
+    expect(r.readableFlowing).toBe(true);
+  });
+
+  it('WU5B1a0a2b3: captured native pause bypasses hostile own pause/pipe shadows and guarding itself never pauses', () => {
+    const h = new HostileBody();
+    const g = guardObjectReadBody!(h)!;
+    expect(h.readableFlowing).toBeNull();
+    expect(g.pause()).toBe(true);
+    expect(h.readableFlowing).toBe(false);
+    expect(h.counts.pause).toBe(0);
+    expect(h.counts.pipe).toBe(0);
+  });
+
+  it('WU5B1a0a2b3: a throwing captured pause returns false without leaking and later captured calls remain safe', () => {
+    const pauseSpy = jest.spyOn(
+      Readable.prototype,
+      'pause',
+    ) as unknown as jest.Mock;
+    pauseSpy.mockImplementation(() => {
+      throw new Error('pause boom');
+    });
+    try {
+      const r = new Readable({ read() {} });
+      const holder: { guarded: GuardedBody | null } = { guarded: null };
+      jest.isolateModules(() => {
+        const mod = jest.requireActual<
+          typeof import('./safe-object-read-guards')
+        >('./safe-object-read-guards');
+        holder.guarded = mod.guardObjectReadBody(r);
+      });
+      expect(holder.guarded).not.toBeNull();
+      expect(holder.guarded!.pause()).toBe(false);
+    } finally {
+      pauseSpy.mockRestore();
+    }
+    const r = new Readable({ read() {} });
+    expect(guardObjectReadBody!(r)!.pause()).toBe(true);
+  });
+
+  it('WU5B1a0a2b3: post-guard Proxy state mutation fails pause closed with zero traps', () => {
+    let traps = 0;
+    const r = new Readable({ read() {} });
+    const g = guardObjectReadBody!(r)!;
+    Object.defineProperty(r, '_readableState', {
+      configurable: true,
+      value: new Proxy(
+        {},
+        {
+          get: () => {
+            traps++;
+            return undefined;
+          },
+          getPrototypeOf: (target: object) => {
+            traps++;
+            return Reflect.getPrototypeOf(target);
+          },
+        },
+      ),
+    });
+    expect(g.pause()).toBe(false);
+    expect(traps).toBe(0);
+  });
+});
+
 describe('guardObjectReadBody controls', () => {
   it('WU5B1a0a2b2 RED→GREEN: guard itself causes no control action; surface extends with exactly {resume, destroy}', () => {
     const r = new Readable({ read() {} });

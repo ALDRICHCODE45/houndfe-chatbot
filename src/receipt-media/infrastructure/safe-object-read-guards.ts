@@ -184,6 +184,9 @@ export interface GuardedObjectReadBody {
   /** WU5B1a0a2b2: captured-native explicit flow start; true only when the
    *  native call returns without throwing against a still-valid body. */
   resume(): boolean;
+  /** WU5B1a0a2b3: captured-native explicit flow pause. True only when the
+   *  native call returns without throwing against a still-valid body. */
+  pause(): boolean;
   /** WU5B1a0a2b2: captured-native explicit destroy; `error` must be an
    *  internal fixed genuine `Error` or omitted. True only when the native
    *  call returns without throwing against a still-valid body. */
@@ -224,6 +227,9 @@ const NATIVE_READABLE_OFF: NativeBodyListenOp | undefined =
 const NATIVE_READABLE_RESUME: ((this: Readable) => unknown) | undefined =
   // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
   Readable.prototype.resume;
+const NATIVE_READABLE_PAUSE: ((this: Readable) => unknown) | undefined =
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; always invoked with the validated body receiver
+  Readable.prototype.pause;
 const NATIVE_READABLE_DESTROY:
   | ((this: Readable, error?: Error) => unknown)
   | undefined =
@@ -401,6 +407,17 @@ export function guardObjectReadBody(
           NATIVE_READABLE_RESUME.call(value);
           // Invalid post-guard state collapses to false.
           if (readTrustedBodyState(value) === null) return false;
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      pause: () => {
+        try {
+          if (typeof NATIVE_READABLE_PAUSE !== 'function') return false;
+          if (!isProxyFreePrototypeChain(value)) return false;
+          if (!hasTrustedReadableStateShape(value)) return false;
+          NATIVE_READABLE_PAUSE.call(value);
           return true;
         } catch {
           return false;
