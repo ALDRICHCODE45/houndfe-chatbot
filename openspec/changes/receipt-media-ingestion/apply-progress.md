@@ -2101,3 +2101,19 @@ Applied under parent token `sha256:9ccc26fd7ee2bf245debc345f350e8650d4eef3cf3af3
 Checks: adapter 52/52 ×2 and result9+lifecycle6+guard59 74/74 ×2 (`pnpm exec jest --runInBand --no-cache --detectOpenHandles`); scoped ESLint (port/adapter/spec) clean; Prettier (5 paths incl. port) clean; non-incremental tsc (`tsconfig.build.json --noEmit --incremental false`) 0 errors; `git diff --check` clean; added whitespace/tab/CR 0; tmp `receipt-media-*` 0→0 (pre-existing `/tmp/dbg-receipt*.ts` untouched); no stray jest/eslint/tsc/prettier processes; ambient untracked returned to the 14-path baseline after harness preflight cleanup (no `.pi/tmp`); nothing staged; HEAD unchanged `cabf6694`.
 
 Delta accounting vs HEAD `cabf6694` (5 paths, tree-verified numstat): port 44+/2− (prior WU5B2 + helper gate), adapter 48+/0−, spec 269+/0−, tasks.md 2+/0− (WU5B2 + WU5B2a rows), apply-progress.md 30+/0− (WU5B2 + WU5B2a self-referential appends) → final total **395/400** ≤ 400. `WU5B2a` checked/provisional pending full independent reverification; `WU5B2` stays checked; aggregate `WU5B` and `WU5` remain `[ ]`; WU6+ unaffected; no staging, commit, push, PR, or delivery action.
+
+### WU5B/WU5 aggregate closure (docs-only)
+
+Docs-only bookkeeping under parent token `sha256:0ceefd97665ca9c11424db7d1ccf987d72e3a63261500ed826a33c4c0e5b4f8e`; attempt 1/2 (max2); no native/review/push/PR/delivery. Every earlier WU5 child row keeps its valid historical RED/GREEN/TRIANGULATE/REFACTOR evidence, but its "complete/provisional pending independent (re-)verification" label is superseded by this final independent closure; no historical evidence text was rewritten.
+
+Final WU5B2 evidence `sha256:7d0da900d46a9994b57f4a21f3657637d444be0bb7319792f4930971710548d4` on verified checkpoint `5b48c1dc6919023b995039fd3c999474993357e3`. Final verified counts, all twice: adapter 52, result 9, lifecycle 6, guard 59.
+
+| Gate      | Final result (recorded, exact)                                                                                                          |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| tsc       | `pnpm exec tsc -p tsconfig.build.json --noEmit --incremental false` → 0 errors (fresh re-run at closure)                                |
+| ESLint    | scoped ESLint (port/adapter/spec) clean per final WU5B2 evidence                                                                        |
+| Prettier  | per final WU5B2 evidence clean; fresh `pnpm exec prettier --check` on tasks.md + apply-progress.md clean at closure                     |
+| Static    | WU5B `[x]` exactly once; every WU5 child row `[x]`; WU6's five implementation rows all `[ ]`; no `.pi/**`, temp, or process residue     |
+| Integrity | `git diff --check` clean; docs-only delta (tasks.md + apply-progress.md) vs checkpoint `5b48c1dc…`; untracked tree unchanged (14 paths) |
+
+The WU5 section is now complete because every WU5 checklist row is `[x]`; the aggregate WU5 header deliberately has no synthetic checkbox. WU6 (Capability access) stays entirely pending and untouched. Note: "public delete" in the WU5B row means the exported `ObjectStoragePort.deleteTechnicalObject` port method only (retention-gated internal technical cleanup), not HTTP or public-object deletion behavior.
