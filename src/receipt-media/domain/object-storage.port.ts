@@ -38,6 +38,21 @@ export interface ObjectStoragePort {
   ): Promise<{ etag: string; versionId: string | null }>;
 }
 
+/** WU5B1a1: neutral private-read input/result shapes. Port-level `getStream`
+ *  integration is WU5B1a2 (adapter + 404 mapping); these types only. */
+export interface GetObjectInput {
+  key: string;
+  abortSignal: AbortSignal;
+}
+
+export interface GetObjectResult {
+  stream: Readable;
+  byteCount: number;
+  mimeType: ReceiptMimeType;
+  etag: string;
+  versionId: string | null;
+}
+
 export type ObjectStorageErrorCode =
   | 'OBJECT_KEY_INVALID'
   | 'REQUEST_INVALID'
