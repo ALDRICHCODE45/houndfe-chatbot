@@ -2019,3 +2019,7 @@ Applied under parent proceed token `sha256:b93d6ee2b44a40604b5f7b8d7b7c79ec2362b
 | REFACTOR    | Kept existing structural helpers and thin wrapper; 59/59 guard passed.                                                                         |
 
 Final focused runs A/B: guard 59/59 ×2; adapter 28/28 ×2. ESLint (guard/spec), Prettier check (guard/spec/tasks/progress), and `tsc -p tsconfig.build.json --noEmit --incremental false` passed. The persisted WU5B1a0a2b3 checkbox is `[x]`; aggregate WU5B remains `[ ]` for Get/Head/delete/retention work. Review boundary: 4 allowed files, below 400 changed lines. Independent verification remains pending.
+
+### WU5B1a0b1 — first-registration no-error setup teardown (complete/provisional)
+
+Fresh RED failed at the actual first `addListener('error')` registration (1 failed/5 passed); GREEN/TRIANGULATE replaces setup rejection's error destruction/wait with no-error destruction plus immediate idempotent cleanup, preserving async post-success fixed errors; lifecycle 6/6 ×2, guard 59/59 ×2, adapter 28/28 ×2, scoped ESLint, four-path Prettier, exact non-incremental tsc, and diff/static/integrity checks passed. `WU5B` remains `[ ]` (`getStream`/`HeadObject`/delete/retention); WU6+, native review, staging, commit, and delivery remain out of scope, and the full-envelope independent reverification is pending.
