@@ -1216,6 +1216,144 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       }
     });
 
+    // --- WU6C capability revocation (store-only mutation) ---
+
+    describe('WU6C capability revocation', () => {
+      beforeEach(async () => {
+        await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      });
+
+      const KNOWN_HASH = Buffer.alloc(32, 2); // acceptedEvidence default
+      const insertRevocable = async (over: Row = {}): Promise<void> => {
+        const row = lifeRow('STORED', null, over);
+        await pool.query(insertSql('receipt_media', row), Object.values(row));
+      };
+      const rawRow = async (id: string): Promise<Row> =>
+        (
+          await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+            id,
+          ])
+        ).rows[0];
+      const count = async (): Promise<number> =>
+        (
+          await pool.query<{ n: number }>(
+            'SELECT count(*)::int AS n FROM receipt_media',
+          )
+        ).rows[0].n;
+
+      it('revokes an accepted capability and stamps both timestamps', async () => {
+        await insertRevocable({ updated_at: T0 });
+        await expect(store.revokeCapability(UUID_A)).resolves.toBe(true);
+        const row = await rawRow(UUID_A);
+        expect(row.capability_revoked_at).toBeInstanceOf(Date);
+        // Both columns are stamped by the same now() call inside the
+        // single revocation statement, so they must be identical.
+        expect(row.updated_at).toEqual(row.capability_revoked_at);
+        expect((row.updated_at as Date).getTime()).toBeGreaterThan(
+          T0.getTime(),
+        );
+      });
+
+      it('exposes the revocation timestamp through the capability lookup', async () => {
+        await insertRevocable();
+        await store.revokeCapability(UUID_A);
+        const hit = await store.lookupByCapabilityHash(KNOWN_HASH);
+        expect(hit?.capabilityRevokedAt).toBeInstanceOf(Date);
+      });
+
+      it('a repeat revocation returns false and preserves the first timestamps', async () => {
+        await insertRevocable();
+        await store.revokeCapability(UUID_A);
+        const first = await rawRow(UUID_A);
+        await expect(store.revokeCapability(UUID_A)).resolves.toBe(false);
+        const second = await rawRow(UUID_A);
+        expect(second.capability_revoked_at).toEqual(
+          first.capability_revoked_at,
+        );
+        expect(second.updated_at).toEqual(first.updated_at);
+      });
+
+      it('returns false for an unknown id and touches no row', async () => {
+        await insertRevocable();
+        await expect(store.revokeCapability(UUID_B)).resolves.toBe(false);
+        expect(await rawRow(UUID_A)).toMatchObject({
+          capability_revoked_at: null,
+        });
+        expect(await count()).toBe(1);
+      });
+
+      it('returns false and leaves the row untouched without capability evidence', async () => {
+        const capabilityLess = receiptRow();
+        await pool.query(
+          insertSql('receipt_media', capabilityLess),
+          Object.values(capabilityLess),
+        );
+        await expect(store.revokeCapability(UUID_A)).resolves.toBe(false);
+        const row = await rawRow(UUID_A);
+        expect(row.capability_revoked_at).toBeNull();
+        expect(row.status).toBe('RESERVED');
+      });
+
+      it('concurrent revocations mutate exactly once with one timestamp', async () => {
+        await insertRevocable();
+        const [a, b] = await Promise.all([
+          store.revokeCapability(UUID_A),
+          store.revokeCapability(UUID_A),
+        ]);
+        expect([a, b].filter(Boolean)).toHaveLength(1);
+        const row = await rawRow(UUID_A);
+        expect(row.capability_revoked_at).toBeInstanceOf(Date);
+      });
+
+      it('preserves all other lifecycle and accepted-object evidence', async () => {
+        await insertRevocable();
+        const before = await rawRow(UUID_A);
+        await store.revokeCapability(UUID_A);
+        const after = await rawRow(UUID_A);
+        for (const col of [
+          'status',
+          'version',
+          'object_key',
+          'stored_at',
+          'object_etag',
+          'capability_token_hash',
+          'capability_key_version',
+          'capability_issued_at',
+          'webhook_message_id',
+          'provider_media_id',
+        ])
+          expect(after[col]).toEqual(before[col]);
+        expect(
+          Buffer.compare(after.capability_token_hash as Buffer, KNOWN_HASH),
+        ).toBe(0);
+      });
+
+      it('parameter-binds the id: a malformed uuid is a type error, never SQL alteration', async () => {
+        await insertRevocable();
+        await expect(
+          store.revokeCapability(`"${UUID_A}' OR '1'='1"`),
+        ).rejects.toThrow(/invalid input syntax for type uuid/);
+        expect(await count()).toBe(1);
+        expect(await rawRow(UUID_A)).toMatchObject({
+          capability_revoked_at: null,
+        });
+        await expect(store.revokeCapability(UUID_A)).resolves.toBe(true);
+      });
+
+      it('propagates database errors without swallowing them', async () => {
+        await insertRevocable();
+        const spy = jest.spyOn(pool, 'query') as jest.Mock;
+        spy.mockRejectedValueOnce(new Error('db unavailable'));
+        try {
+          await expect(store.revokeCapability(UUID_A)).rejects.toThrow(
+            'db unavailable',
+          );
+        } finally {
+          spy.mockRestore();
+        }
+      });
+    });
+
     it('parameter-binds adversarial hash bytes without altering SQL', async () => {
       await insertAccess(accessRow());
       const nasty = Buffer.from("'; DROP TABLE receipt_media;--aa", 'utf8');

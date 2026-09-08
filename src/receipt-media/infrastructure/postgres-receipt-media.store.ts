@@ -51,8 +51,17 @@ const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
  * no sender, sale, provider, or raw-token data. Parameter-bound equality
  * rides the partial unique capability lookup index. */
 const CAPABILITY_LOOKUP_SQL = `SELECT id, object_key, capability_token_hash,
-     capability_revoked_at
-   FROM receipt_media WHERE capability_token_hash = $1`;
+         capability_revoked_at
+       FROM receipt_media WHERE capability_token_hash = $1`;
+
+/** WU6C revocation: atomically stamp both timestamps only when the
+ * internal id matches, capability evidence exists, and the capability is
+ * not already revoked; the predicate re-check under row locking makes a
+ * concurrent loser see zero rows (first timestamp preserved). */
+const REVOKE_CAPABILITY_SQL = `UPDATE receipt_media
+       SET capability_revoked_at = now(), updated_at = now()
+       WHERE id = $1 AND capability_token_hash IS NOT NULL
+         AND capability_revoked_at IS NULL`;
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -320,5 +329,20 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             (row.capability_revoked_at as Date | null) ?? null,
         }
       : null;
+  }
+
+  /** WU6C capability revocation: one static parameter-bound atomic UPDATE
+   * keyed by the internal id only. Both timestamps are stamped exactly when
+   * the row carries capability evidence and is not already revoked; a
+   * zero-row match (unknown id, capability-less row, or an already-revoked
+   * row — including the loser of a concurrent race) returns false and
+   * touches nothing, preserving the first revocation timestamp. No version,
+   * status, object key, hash, or accepted-object evidence column is
+   * written; database errors propagate. */
+  async revokeCapability(receiptMediaId: string): Promise<boolean> {
+    const { rowCount } = await this.pool.query(REVOKE_CAPABILITY_SQL, [
+      receiptMediaId,
+    ]);
+    return rowCount === 1;
   }
 }

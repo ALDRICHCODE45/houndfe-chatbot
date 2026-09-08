@@ -97,4 +97,15 @@ export interface ReceiptMediaStorePort {
    * hashes; revoked rows are returned with their timestamp so later
    * authorization denies them. */
   lookupByCapabilityHash(hash: Buffer): Promise<CapabilityAccessRow | null>;
+
+  /** WU6C capability revocation (store-only mutation): one atomic,
+   * parameter-bound UPDATE stamping capability_revoked_at (and
+   * updated_at) for the row with this internal id — only when capability
+   * evidence exists and the capability is not already revoked. True for
+   * the single winning mutation; false for unknown ids, capability-less
+   * rows, and already-revoked rows. Concurrent calls yield exactly one
+   * true, preserving the first revocation timestamp. Lifecycle version,
+   * status, object key, hash, and accepted-object evidence are never
+   * written; database errors propagate. */
+  revokeCapability(receiptMediaId: string): Promise<boolean>;
 }
