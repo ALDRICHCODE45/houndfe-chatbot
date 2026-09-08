@@ -1079,6 +1079,156 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     });
   });
 
+  // --- WU6B capability access lookup (RMA2, RMA3) ---
+
+  describe('WU6B capability access lookup', () => {
+    beforeEach(async () => {
+      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    });
+
+    const KNOWN_HASH = Buffer.alloc(32, 2); // acceptedEvidence default
+    const accessRow = (over: Row = {}): Row => lifeRow('STORED', null, over);
+    const insertAccess = async (row: Row): Promise<void> => {
+      await pool.query(insertSql('receipt_media', row), Object.values(row));
+    };
+
+    it('projects only id/object key/stored hash/revocation for a known hash', async () => {
+      await insertAccess(accessRow());
+      const hit = await store.lookupByCapabilityHash(KNOWN_HASH);
+      expect(hit).not.toBeNull();
+      expect(Object.keys(hit as object).sort()).toEqual([
+        'capabilityRevokedAt',
+        'capabilityTokenHash',
+        'id',
+        'objectKey',
+      ]);
+      expect(hit?.id).toBe(UUID_A);
+      expect(hit?.objectKey).toBe(`receipts/${UUID_C}`);
+      expect(
+        Buffer.compare(hit?.capabilityTokenHash ?? Buffer.alloc(0), KNOWN_HASH),
+      ).toBe(0);
+      expect(hit?.capabilityRevokedAt).toBeNull();
+    });
+
+    it('returns null for unknown and altered hashes', async () => {
+      await insertAccess(accessRow());
+      expect(
+        await store.lookupByCapabilityHash(Buffer.alloc(32, 9)),
+      ).toBeNull();
+      const altered = Buffer.from(KNOWN_HASH);
+      altered[7] = 0xff;
+      expect(await store.lookupByCapabilityHash(altered)).toBeNull();
+    });
+
+    it('returns revoked rows carrying their revocation timestamp', async () => {
+      await insertAccess(accessRow({ capability_revoked_at: T0 }));
+      const hit = await store.lookupByCapabilityHash(KNOWN_HASH);
+      expect(hit).not.toBeNull();
+      expect(hit?.capabilityRevokedAt).toEqual(T0);
+      expect(hit?.id).toBe(UUID_A);
+    });
+
+    it.each([31, 33, 0])(
+      'fails closed to null for a %d-byte hash without a query',
+      async (len) => {
+        await insertAccess(accessRow());
+        const spy = jest.spyOn(pool, 'query');
+        try {
+          expect(
+            await store.lookupByCapabilityHash(Buffer.alloc(len, 2)),
+          ).toBeNull();
+          expect(spy.mock.calls).toEqual([]);
+        } finally {
+          spy.mockRestore();
+        }
+      },
+    );
+
+    // WU6B R2 regression: any throw while recognizing the hash input
+    // must fail closed to null before the query. A Proxy can pass
+    // Buffer.isBuffer while its actual view throws on recognition reads
+    // — even a fully transparent one, because TypedArray prototype
+    // getters brand-check the receiver and reject proxy receivers.
+    type ProxyDef = { target: object; traps?: ProxyHandler<object> };
+    const lengthThrows: ProxyHandler<object> = {
+      get: (t, prop, recv) => {
+        if (prop === 'length') throw new Error('length trap');
+        return Reflect.get(t, prop, recv) as unknown;
+      },
+    };
+    const getThrows: ProxyHandler<object> = {
+      get: () => {
+        throw new Error('get trap');
+      },
+    };
+    const protoThrows: ProxyHandler<object> = {
+      getPrototypeOf: () => {
+        throw new Error('proto trap');
+      },
+    };
+    const lengthSpoofs: ProxyHandler<object> = {
+      get: (t, prop, recv) =>
+        prop === 'length' ? 32 : (Reflect.get(t, prop, recv) as unknown),
+    };
+
+    it.each<[string, ProxyDef]>([
+      ['transparent real-buffer proxy', { target: Buffer.from(KNOWN_HASH) }],
+      [
+        'length-get-throws proxy',
+        { target: Buffer.from(KNOWN_HASH), traps: lengthThrows },
+      ],
+      [
+        'all-get-throws proxy',
+        { target: Buffer.from(KNOWN_HASH), traps: getThrows },
+      ],
+      [
+        'getPrototypeOf-throws proxy',
+        { target: Buffer.from(KNOWN_HASH), traps: protoThrows },
+      ],
+      ['non-buffer plain-object proxy', { target: {} }],
+      [
+        'length-spoofing real-buffer proxy',
+        { target: Buffer.from(KNOWN_HASH), traps: lengthSpoofs },
+      ],
+    ])('fails closed to null without a query for a %s', async (_label, def) => {
+      await insertAccess(accessRow());
+      const spy = jest.spyOn(pool, 'query') as jest.Mock;
+      spy.mockResolvedValue({ rows: [], rowCount: 0 });
+      try {
+        const input = new Proxy(def.target, def.traps ?? {}) as Buffer;
+        await expect(store.lookupByCapabilityHash(input)).resolves.toBeNull();
+        expect(spy.mock.calls).toEqual([]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('propagates database errors without swallowing them', async () => {
+      await insertAccess(accessRow());
+      const spy = jest.spyOn(pool, 'query') as jest.Mock;
+      spy.mockRejectedValueOnce(new Error('db unavailable'));
+      try {
+        await expect(store.lookupByCapabilityHash(KNOWN_HASH)).rejects.toThrow(
+          'db unavailable',
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('parameter-binds adversarial hash bytes without altering SQL', async () => {
+      await insertAccess(accessRow());
+      const nasty = Buffer.from("'; DROP TABLE receipt_media;--aa", 'utf8');
+      expect(nasty.length).toBe(32);
+      expect(await store.lookupByCapabilityHash(nasty)).toBeNull();
+      const { rows } = await pool.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM receipt_media',
+      );
+      expect(rows[0].n).toBe(1);
+      expect((await store.lookupByCapabilityHash(KNOWN_HASH))?.id).toBe(UUID_A);
+    });
+  });
+
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
     migrate('migrate:down');

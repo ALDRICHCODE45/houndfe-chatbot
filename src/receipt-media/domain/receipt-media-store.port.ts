@@ -1,6 +1,7 @@
 /** WU2B2A store port (RM1, RM3): reservation, outbox, claim/lease, CAS,
  * and bounded attempt primitives. Conflicts/lost fences return as values
- * (false/null), never thrown. */
+ * (false/null), never thrown. WU6B adds the hash-indexed capability access
+ * lookup (RMA2, RMA3). */
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -60,6 +61,18 @@ export interface AttemptStartResult {
   version: string;
 }
 
+/** WU6B minimal access projection for the capability lookup path: exactly
+ * the receipt id, opaque object key, stored capability token hash, and
+ * revocation timestamp. No sender, sale, provider, or raw-token data
+ * crosses the port; a later authorization step consumes the stored hash
+ * and revocation timestamp. */
+export interface CapabilityAccessRow {
+  id: string;
+  objectKey: string;
+  capabilityTokenHash: Buffer;
+  capabilityRevokedAt: Date | null;
+}
+
 export interface ReceiptMediaStorePort {
   reserve(input: ReserveInput): Promise<ReservationOutcome>;
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
@@ -78,4 +91,10 @@ export interface ReceiptMediaStorePort {
   startStorageAttempt(
     input: LeaseFenceInput,
   ): Promise<AttemptStartResult | null>;
+
+  /** WU6B capability access lookup (RMA2, RMA3): parameter-bound equality
+   * over the partial unique capability index. Null for unknown or altered
+   * hashes; revoked rows are returned with their timestamp so later
+   * authorization denies them. */
+  lookupByCapabilityHash(hash: Buffer): Promise<CapabilityAccessRow | null>;
 }

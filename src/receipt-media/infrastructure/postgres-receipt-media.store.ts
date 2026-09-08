@@ -6,6 +6,7 @@ import type {
 } from '../domain/receipt-media.types';
 import type {
   AttemptStartResult,
+  CapabilityAccessRow,
   DedupeOutcome,
   LeaseFenceInput,
   OutboxIntentInput,
@@ -14,6 +15,7 @@ import type {
   ReserveInput,
   StatusCasInput,
 } from '../domain/receipt-media-store.port';
+import { RECEIPT_SHA256_BYTES } from '../domain/receipt-media.types';
 
 type Row = Record<string, unknown>;
 type Media = ReceiptMediaRow;
@@ -44,6 +46,13 @@ const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
      AND version = $3::bigint AND lease_expires_at > now()
      AND status = 'DOWNLOADED' AND storage_attempts < 3
      RETURNING storage_attempts AS attempt, version`;
+
+/** WU6B access projection (RMA2, RMA3): exactly the four access columns —
+ * no sender, sale, provider, or raw-token data. Parameter-bound equality
+ * rides the partial unique capability lookup index. */
+const CAPABILITY_LOOKUP_SQL = `SELECT id, object_key, capability_token_hash,
+     capability_revoked_at
+   FROM receipt_media WHERE capability_token_hash = $1`;
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -275,5 +284,41 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     input: LeaseFenceInput,
   ): Promise<AttemptStartResult | null> {
     return this.startAttempt(STORAGE_ATTEMPT_SQL, input);
+  }
+
+  /** WU6B capability access lookup (RMA2, RMA3): a non-32-byte input
+   * fails closed to null without a query; unknown and altered hashes
+   * match no row and return null. Revoked rows are returned with their
+   * revocation timestamp — denial belongs to the later authorization
+   * step. Any throw while recognizing the input (a Proxy can pass
+   * Buffer.isBuffer while its actual view throws) also fails closed
+   * before the query, and the genuine-view `ArrayBuffer.isView` brand
+   * check runs FIRST (it reads no attacker property; every Proxy fails
+   * it) so no Proxy — including one spoofing `length` — is ever read or
+   * bound into the query; database errors still propagate. */
+  async lookupByCapabilityHash(
+    hash: Buffer,
+  ): Promise<CapabilityAccessRow | null> {
+    try {
+      if (
+        !ArrayBuffer.isView(hash) ||
+        !Buffer.isBuffer(hash) ||
+        hash.length !== RECEIPT_SHA256_BYTES
+      )
+        return null;
+    } catch {
+      return null;
+    }
+    const { rows } = await this.pool.query<Row>(CAPABILITY_LOOKUP_SQL, [hash]);
+    const row = rows[0];
+    return row
+      ? {
+          id: row.id as string,
+          objectKey: row.object_key as string,
+          capabilityTokenHash: row.capability_token_hash as Buffer,
+          capabilityRevokedAt:
+            (row.capability_revoked_at as Date | null) ?? null,
+        }
+      : null;
   }
 }
