@@ -25,7 +25,9 @@ const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 
 interface StoreCtor {
-  new (pool: Pool): import('./postgres-conversation.store').PostgresConversationStore;
+  new (
+    pool: Pool,
+  ): import('./postgres-conversation.store').PostgresConversationStore;
 }
 
 ddescribe('PostgresConversationStore (Testcontainers)', () => {

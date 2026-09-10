@@ -11,10 +11,9 @@ import { runConversationStoreContract } from './conversation-store.contract';
  * Port contract: realised through the shared `runConversationStoreContract`
  * factory, ensuring byte-identical parity with the Postgres adapter.
  */
-runConversationStoreContract(
-  'InMemoryConversationStore',
-  async () => ({ store: new InMemoryConversationStore() }),
-);
+runConversationStoreContract('InMemoryConversationStore', async () => ({
+  store: new InMemoryConversationStore(),
+}));
 
 describe('InMemoryConversationStore', () => {
   let store: InMemoryConversationStore;

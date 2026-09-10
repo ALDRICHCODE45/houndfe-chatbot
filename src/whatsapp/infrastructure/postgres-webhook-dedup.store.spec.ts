@@ -21,7 +21,9 @@ const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 
 interface StoreCtor {
-  new (pool: Pool): import('./postgres-webhook-dedup.store').PostgresWebhookDedupStore;
+  new (
+    pool: Pool,
+  ): import('./postgres-webhook-dedup.store').PostgresWebhookDedupStore;
 }
 
 ddescribe('PostgresWebhookDedupStore (Testcontainers)', () => {
@@ -72,7 +74,9 @@ ddescribe('PostgresWebhookDedupStore (Testcontainers)', () => {
       await writer.markSeen('wamid.restart');
 
       const freshReader = new Store(pool);
-      await expect(freshReader.isDuplicate('wamid.restart')).resolves.toBe(true);
+      await expect(freshReader.isDuplicate('wamid.restart')).resolves.toBe(
+        true,
+      );
     });
   });
 });

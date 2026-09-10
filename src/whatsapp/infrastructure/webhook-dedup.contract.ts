@@ -9,7 +9,10 @@ import type { WebhookDedupStore } from '../domain/webhook-dedup.store';
  */
 export function runWebhookDedupContract(
   label: string,
-  factory: () => Promise<{ store: WebhookDedupStore; cleanup: () => Promise<void> }>,
+  factory: () => Promise<{
+    store: WebhookDedupStore;
+    cleanup: () => Promise<void>;
+  }>,
 ): void {
   describe(`${label} (dedup contract)`, () => {
     let store: WebhookDedupStore;

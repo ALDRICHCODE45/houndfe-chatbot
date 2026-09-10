@@ -32,7 +32,11 @@ describe('PG_POOL provider', () => {
     expect(pool).toBeInstanceOf(Pool);
     expect(get).toHaveBeenCalledWith('database.url');
     expect(get).toHaveBeenCalledWith('database.poolMax');
-    const options = (pool as unknown as { options: { connectionString?: string; max?: number } }).options;
+    const options = (
+      pool as unknown as {
+        options: { connectionString?: string; max?: number };
+      }
+    ).options;
     expect(options.connectionString).toBe('postgres://u:p@db:5432/x');
     expect(options.max).toBe(7);
   });

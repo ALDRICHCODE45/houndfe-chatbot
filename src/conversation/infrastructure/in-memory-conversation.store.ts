@@ -38,7 +38,9 @@ export class InMemoryConversationStore implements ConversationStore {
     // and is what the dispatcher / agent runner rely on so that one
     // write path handles both first contact and follow-ups.
     const existing = this.map.get(senderId);
-    const merged = existing ? { ...existing, ...patch } : { senderId, ...patch };
+    const merged = existing
+      ? { ...existing, ...patch }
+      : { senderId, ...patch };
     // Re-assert required fields after merge; the caller is responsible
     // for supplying lastMessageAt (the dispatcher / runner always do).
     if (typeof merged.lastMessageAt !== 'string') {

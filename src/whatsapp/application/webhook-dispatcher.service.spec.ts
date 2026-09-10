@@ -579,7 +579,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
 
       await service.dispatch(
-        opsEvent('wamid.ops-resolve', 'HF-abc123def456 YES_RESTOCK_IN_X_DAYS:3'),
+        opsEvent(
+          'wamid.ops-resolve',
+          'HF-abc123def456 YES_RESTOCK_IN_X_DAYS:3',
+        ),
       );
 
       expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
