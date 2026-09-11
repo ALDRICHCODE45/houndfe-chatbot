@@ -60,6 +60,25 @@ export type AmountProposalOutcome =
     }
   | { kind: 'fenced' };
 
+/** One immutable amount-rejection command for the currently proposed amount. */
+export interface AmountRejectionInput {
+  sourceWebhookMessageId: string;
+  senderId: string;
+  receiptMediaId: string;
+  capturedSaleId: string;
+  expectedReceiptStatus: 'AWAITING_CONFIRMATION';
+  expectedReceiptVersion: string;
+  expectedPointer: ReceiptAmountPointer;
+}
+
+export type AmountRejectionOutcome =
+  | {
+      kind: 'rejected' | 'replayed';
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -100,6 +119,10 @@ export interface ReceiptMediaStorePort {
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
   /** Atomically persist one amount proposal, successor pointer, and intent. */
   proposeAmount(input: AmountProposalInput): Promise<AmountProposalOutcome>;
+  /** Atomically clear a proposed amount, advance the pointer, and insert a reask intent. */
+  rejectProposedAmount(
+    input: AmountRejectionInput,
+  ): Promise<AmountRejectionOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment. */
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;
