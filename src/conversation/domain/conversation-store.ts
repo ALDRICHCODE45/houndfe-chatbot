@@ -54,7 +54,35 @@ export interface PendingHumanRequest {
  * field too — a second call for a sender with a marker set returns the
  * existing ref without writing a new row.
  */
+export type ReceiptAmountPointer = Readonly<{
+  receiptMediaId: string;
+  saleId: string;
+  receiptVersion: string;
+}>;
+
+export function isReceiptAmountPointer(
+  value: unknown,
+): value is ReceiptAmountPointer {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const pointer = value as Record<string, unknown>;
+  return (
+    Object.keys(pointer).length === 3 &&
+    Object.hasOwn(pointer, 'receiptMediaId') &&
+    Object.hasOwn(pointer, 'saleId') &&
+    Object.hasOwn(pointer, 'receiptVersion') &&
+    typeof pointer.receiptMediaId === 'string' &&
+    pointer.receiptMediaId.length > 0 &&
+    typeof pointer.saleId === 'string' &&
+    pointer.saleId.length > 0 &&
+    typeof pointer.receiptVersion === 'string' &&
+    /^[1-9]\d*$/.test(pointer.receiptVersion)
+  );
+}
+
 export interface ConversationStateData {
+  receiptAmountPointer?: ReceiptAmountPointer;
   messages?: AgentMessage[];
   /** Sale id persisted by createSale success; read/cleared by cancelSale. */
   placedSaleId?: string;
@@ -94,6 +122,7 @@ export function readPendingHumanRequest(
   const raw = state?.data?.pendingHumanRequest;
   if (raw === null || raw === undefined) return null;
   if (typeof raw !== 'object') return null;
+  // SAFETY: object narrowing above excludes null; fields are validated below.
   const candidate = raw as unknown as Record<string, unknown>;
   if (
     typeof candidate.requestId !== 'string' ||
@@ -110,6 +139,7 @@ export function readPendingHumanRequest(
   if (typeof candidate.customerNotifiedAt !== 'string') {
     return null;
   }
+  // SAFETY: every required field was structurally validated above.
   return candidate as unknown as PendingHumanRequest;
 }
 
@@ -129,6 +159,16 @@ export function readMessages(state: ConversationState): AgentMessage[] {
  * the CONVERSATION_STORE Symbol token.
  */
 export interface ConversationStore {
+  setReceiptAmountPointer(
+    senderId: string,
+    pointer: ReceiptAmountPointer,
+  ): Promise<boolean>;
+
+  clearReceiptAmountPointer(
+    senderId: string,
+    pointer: ReceiptAmountPointer,
+  ): Promise<boolean>;
+
   /**
    * Returns the current state for a sender, or null if none exists.
    */

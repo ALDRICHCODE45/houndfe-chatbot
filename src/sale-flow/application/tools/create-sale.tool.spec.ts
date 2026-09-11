@@ -39,6 +39,8 @@ describe('makeCreateSaleTool', () => {
     return {
       get: jest.fn().mockResolvedValue(state),
       create: jest.fn(),
+      setReceiptAmountPointer: jest.fn(),
+      clearReceiptAmountPointer: jest.fn(),
       update: jest
         .fn()
         .mockImplementation(

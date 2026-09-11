@@ -3,6 +3,8 @@ import { Pool } from 'pg';
 import {
   ConversationState,
   ConversationStore,
+  isReceiptAmountPointer,
+  ReceiptAmountPointer,
 } from '../domain/conversation-store';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 
@@ -41,6 +43,92 @@ interface ConversationRow {
 @Injectable()
 export class PostgresConversationStore implements ConversationStore {
   constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+
+  async setReceiptAmountPointer(
+    senderId: string,
+    pointer: ReceiptAmountPointer,
+  ): Promise<boolean> {
+    if (
+      typeof senderId !== 'string' ||
+      senderId.length === 0 ||
+      !isReceiptAmountPointer(pointer)
+    ) {
+      return false;
+    }
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = jsonb_set(data, '{receiptAmountPointer}',
+         jsonb_build_object('receiptMediaId', $2::text,
+           'saleId', $3::text, 'receiptVersion', $4::text), true)
+       WHERE sender_id = $1 AND (
+         NOT (data ? 'receiptAmountPointer') OR (
+           jsonb_typeof(data->'receiptAmountPointer') = 'object'
+           AND data->'receiptAmountPointer' = jsonb_build_object(
+             'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
+             'saleId', data->'receiptAmountPointer'->'saleId',
+             'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
+           AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
+           AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
+           AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
+           AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
+           AND data->'receiptAmountPointer'->>'saleId' = $3
+           AND data->'receiptAmountPointer'->>'receiptVersion' ~ '^[1-9][0-9]*$'
+           AND (
+             length($4::text) > length(data->'receiptAmountPointer'->>'receiptVersion')
+             OR (
+               length($4::text) = length(data->'receiptAmountPointer'->>'receiptVersion')
+               AND $4::text COLLATE "C" >
+                 (data->'receiptAmountPointer'->>'receiptVersion') COLLATE "C"
+             )
+           )
+         )
+       )`,
+      [
+        senderId,
+        pointer.receiptMediaId,
+        pointer.saleId,
+        pointer.receiptVersion,
+      ],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  async clearReceiptAmountPointer(
+    senderId: string,
+    pointer: ReceiptAmountPointer,
+  ): Promise<boolean> {
+    if (
+      typeof senderId !== 'string' ||
+      senderId.length === 0 ||
+      !isReceiptAmountPointer(pointer)
+    ) {
+      return false;
+    }
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = data - 'receiptAmountPointer'
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'receiptAmountPointer') = 'object'
+         AND data->'receiptAmountPointer' = jsonb_build_object(
+           'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
+           'saleId', data->'receiptAmountPointer'->'saleId',
+           'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
+         AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
+         AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
+         AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
+         AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
+         AND data->'receiptAmountPointer'->>'saleId' = $3
+         AND data->'receiptAmountPointer'->>'receiptVersion' ~ '^[1-9][0-9]*$'
+         AND data->'receiptAmountPointer'->>'receiptVersion' = $4`,
+      [
+        senderId,
+        pointer.receiptMediaId,
+        pointer.saleId,
+        pointer.receiptVersion,
+      ],
+    );
+    return (rowCount ?? 0) === 1;
+  }
 
   async get(senderId: string): Promise<ConversationState | null> {
     const { rows } = await this.pool.query<ConversationRow>(
@@ -88,14 +176,20 @@ export class PostgresConversationStore implements ConversationStore {
         `ConversationStore.update requires lastMessageAt for senderId: ${senderId}`,
       );
     }
-    const data = merged.data ?? {};
+    const data = { ...(merged.data ?? {}) };
+    delete data.receiptAmountPointer;
 
     const { rows } = await this.pool.query<ConversationRow>(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
        VALUES ($1, $2::timestamptz, $3::jsonb)
        ON CONFLICT (sender_id) DO UPDATE
          SET last_message_at = EXCLUDED.last_message_at,
-             data = EXCLUDED.data
+                 data = CASE
+                   WHEN conversation_state.data ? 'receiptAmountPointer'
+                   THEN jsonb_set(EXCLUDED.data - 'receiptAmountPointer',
+                     '{receiptAmountPointer}', conversation_state.data->'receiptAmountPointer')
+                   ELSE EXCLUDED.data - 'receiptAmountPointer'
+                 END
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );

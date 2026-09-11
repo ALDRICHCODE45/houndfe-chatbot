@@ -66,6 +66,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      setReceiptAmountPointer: jest.fn(),
+      clearReceiptAmountPointer: jest.fn(),
     };
 
     sender = {
@@ -120,6 +122,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       get: jest.fn().mockResolvedValue(null),
       create: jest.fn(),
       update: jest.fn(),
+      setReceiptAmountPointer: jest.fn(),
+      clearReceiptAmountPointer: jest.fn(),
     };
 
     service = new WebhookDispatcherService(
