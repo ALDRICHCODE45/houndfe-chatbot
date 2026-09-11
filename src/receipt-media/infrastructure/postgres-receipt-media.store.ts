@@ -4,7 +4,10 @@ import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
 } from '../domain/receipt-media.types';
+import { isReceiptAmountPointer } from '../../conversation/domain/conversation-store';
 import type {
+  AmountProposalInput,
+  AmountProposalOutcome,
   AttemptStartResult,
   CapabilityAccessRow,
   DedupeOutcome,
@@ -62,6 +65,70 @@ const REVOKE_CAPABILITY_SQL = `UPDATE receipt_media
        SET capability_revoked_at = now(), updated_at = now()
        WHERE id = $1 AND capability_token_hash IS NOT NULL
          AND capability_revoked_at IS NULL`;
+
+const MAX_INT32 = 2_147_483_647;
+const MAX_BIGINT = 9_223_372_036_854_775_807n;
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/;
+const isRecord = (value: unknown): value is Row =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+class ProposalFencedError extends Error {}
+const FENCED = new ProposalFencedError();
+
+const successorVersion = (value: string): string | null => {
+  if (!/^[1-9]\d*(?![\s\S])/.test(value)) return null;
+  const parsed = BigInt(value);
+  return parsed < MAX_BIGINT ? String(parsed + 1n) : null;
+};
+
+const samePointer = (
+  value: unknown,
+  expected: AmountProposalInput['expectedPointer'],
+) =>
+  isReceiptAmountPointer(value) &&
+  value.receiptMediaId === expected.receiptMediaId &&
+  value.saleId === expected.saleId &&
+  value.receiptVersion === expected.receiptVersion;
+
+const isProposalInput = (
+  input: AmountProposalInput,
+  successor: string | null,
+): successor is string =>
+  successor !== null &&
+  input.expectedReceiptStatus === 'AWAITING_AMOUNT' &&
+  typeof input.sourceWebhookMessageId === 'string' &&
+  input.sourceWebhookMessageId.length > 0 &&
+  typeof input.senderId === 'string' &&
+  input.senderId.length > 0 &&
+  typeof input.receiptMediaId === 'string' &&
+  UUID.test(input.receiptMediaId) &&
+  typeof input.capturedSaleId === 'string' &&
+  UUID.test(input.capturedSaleId) &&
+  isReceiptAmountPointer(input.expectedPointer) &&
+  input.expectedPointer.receiptMediaId === input.receiptMediaId &&
+  input.expectedPointer.saleId === input.capturedSaleId &&
+  input.expectedPointer.receiptVersion === input.expectedReceiptVersion &&
+  Number.isInteger(input.cents) &&
+  input.cents > 0 &&
+  input.cents <= MAX_INT32;
+
+const intentMatches = (
+  row: Row | undefined,
+  input: AmountProposalInput,
+  successor: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === input.receiptMediaId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === input.sourceWebhookMessageId &&
+  row.recipient_id === input.senderId &&
+  row.template_key === 'RECEIPT_AMOUNT_CONFIRM' &&
+  typeof row.template_args === 'object' &&
+  row.template_args !== null &&
+  Object.keys(row.template_args).length === 1 &&
+  (row.template_args as Row).cents === input.cents;
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -185,6 +252,136 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         intent: camelize<ReceiptMediaOutboxRow>(row),
       };
     });
+  }
+
+  /** C1: one transaction owns the receipt CAS, structurally exact JSONB
+   * pointer successor, and confirmation intent. A replay is conservative: it
+   * is returned only while the durable successor pointer remains current. */
+  async proposeAmount(
+    input: AmountProposalInput,
+  ): Promise<AmountProposalOutcome> {
+    const successor = successorVersion(input.expectedReceiptVersion);
+    if (!isProposalInput(input, successor)) return { kind: 'fenced' };
+    const nextPointer = { ...input.expectedPointer, receiptVersion: successor };
+    const dedupeKey = `receipt-amount-confirm:${input.receiptMediaId}:${input.expectedReceiptVersion}:${input.sourceWebhookMessageId}`;
+    try {
+      return await this.withTx(async (c) => {
+        const receipt = (
+          await c.query<Row>(
+            'SELECT * FROM receipt_media WHERE id = $1 FOR UPDATE',
+            [input.receiptMediaId],
+          )
+        ).rows[0];
+        const conversation = (
+          await c.query<Row>(
+            'SELECT data FROM conversation_state WHERE sender_id = $1 FOR UPDATE',
+            [input.senderId],
+          )
+        ).rows[0];
+        if (!receipt || !conversation || !isRecord(conversation.data))
+          throw FENCED;
+        const data = conversation.data;
+        const receiptMatches =
+          receipt.sender_id === input.senderId &&
+          receipt.captured_sale_id === input.capturedSaleId;
+        const currentPointer = data.receiptAmountPointer;
+        if (
+          receiptMatches &&
+          receipt.status === 'AWAITING_CONFIRMATION' &&
+          receipt.version === successor &&
+          receipt.declared_amount_cents === input.cents &&
+          receipt.amount_proposed_at !== null &&
+          samePointer(currentPointer, nextPointer)
+        ) {
+          const intent = (
+            await c.query<Row>(
+              'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+              [dedupeKey],
+            )
+          ).rows[0];
+          if (!intentMatches(intent, input, successor, dedupeKey)) throw FENCED;
+          return {
+            kind: 'replayed',
+            receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
+          };
+        }
+        if (
+          !receiptMatches ||
+          receipt.status !== input.expectedReceiptStatus ||
+          receipt.version !== input.expectedReceiptVersion ||
+          receipt.declared_amount_cents !== null ||
+          !samePointer(currentPointer, input.expectedPointer)
+        )
+          throw FENCED;
+        const updated = await c.query<Row>(
+          `UPDATE receipt_media SET status = 'AWAITING_CONFIRMATION',
+             declared_amount_cents = $2, amount_proposed_at = now(),
+             version = version + 1, updated_at = now()
+           WHERE id = $1 AND sender_id = $3 AND captured_sale_id = $4
+             AND status = 'AWAITING_AMOUNT' AND version = $5::bigint
+             AND declared_amount_cents IS NULL RETURNING *`,
+          [
+            input.receiptMediaId,
+            input.cents,
+            input.senderId,
+            input.capturedSaleId,
+            input.expectedReceiptVersion,
+          ],
+        );
+        if (updated.rowCount !== 1) throw FENCED;
+        const pointer = await c.query(
+          `UPDATE conversation_state SET data = jsonb_set(data,
+             '{receiptAmountPointer}', jsonb_build_object('receiptMediaId', $2::text,
+             'saleId', $3::text, 'receiptVersion', $4::text), true)
+           WHERE sender_id = $1
+             AND jsonb_typeof(data->'receiptAmountPointer') = 'object'
+             AND data->'receiptAmountPointer' = jsonb_build_object(
+               'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
+               'saleId', data->'receiptAmountPointer'->'saleId',
+               'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
+             AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
+             AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
+             AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
+             AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
+             AND data->'receiptAmountPointer'->>'saleId' = $3
+             AND data->'receiptAmountPointer'->>'receiptVersion' = $5`,
+          [
+            input.senderId,
+            input.receiptMediaId,
+            input.capturedSaleId,
+            successor,
+            input.expectedReceiptVersion,
+          ],
+        );
+        if (pointer.rowCount !== 1) throw FENCED;
+        const intent = await c.query<Row>(
+          `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+             receipt_state_version, source_webhook_message_id, recipient_id,
+             template_key, template_args)
+           VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_AMOUNT_CONFIRM', $7::jsonb)
+           ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+          [
+            randomUUID(),
+            dedupeKey,
+            input.receiptMediaId,
+            successor,
+            input.sourceWebhookMessageId,
+            input.senderId,
+            JSON.stringify({ cents: input.cents }),
+          ],
+        );
+        if (intent.rowCount !== 1) throw FENCED;
+        return {
+          kind: 'proposed',
+          receipt: camelize<Media>(updated.rows[0]),
+          intent: camelize<ReceiptMediaOutboxRow>(intent.rows[0]),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      throw err;
+    }
   }
 
   /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE

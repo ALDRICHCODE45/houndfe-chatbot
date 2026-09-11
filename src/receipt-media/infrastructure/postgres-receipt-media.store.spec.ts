@@ -3,9 +3,11 @@ import type { PoolClient } from 'pg';
 import { Pool } from 'pg';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import type {
+  AmountProposalInput,
   AttemptStartResult,
   LeaseFenceInput,
   OutboxIntentInput,
+  ReceiptMediaStorePort,
   ReservationOutcome,
   ReserveInput,
   StatusCasInput,
@@ -1364,6 +1366,397 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       );
       expect(rows[0].n).toBe(1);
       expect((await store.lookupByCapabilityHash(KNOWN_HASH))?.id).toBe(UUID_A);
+    });
+  });
+
+  // --- WU10C1 atomic receipt amount proposal (PostgreSQL only) ---
+
+  describe('WU10C1 atomic amount proposal', () => {
+    const proposalStore: Pick<ReceiptMediaStorePort, 'proposeAmount'> = {
+      proposeAmount: (input) => store.proposeAmount(input),
+    };
+    const SENDER = 'sender.amount';
+    const POINTER = {
+      receiptMediaId: UUID_A,
+      saleId: UUID_B,
+      receiptVersion: '2',
+    };
+    const command = (over: Partial<AmountProposalInput> = {}) => ({
+      sourceWebhookMessageId: 'wamid.amount.1',
+      senderId: SENDER,
+      receiptMediaId: UUID_A,
+      capturedSaleId: UUID_B,
+      expectedReceiptStatus: 'AWAITING_AMOUNT' as const,
+      expectedReceiptVersion: '2',
+      expectedPointer: POINTER,
+      cents: 1250,
+      ...over,
+    });
+    const seed = async (
+      data: Row = { sibling: { keep: true }, receiptAmountPointer: POINTER },
+      receiptOver: Row = {},
+    ) => {
+      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query('DELETE FROM conversation_state WHERE sender_id = $1', [
+        SENDER,
+      ]);
+      await pool.query(
+        insertSql(
+          'receipt_media',
+          lifeRow('AWAITING_AMOUNT', null, {
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            version: '2',
+            ...receiptOver,
+          }),
+        ),
+        Object.values(
+          lifeRow('AWAITING_AMOUNT', null, {
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            version: '2',
+            ...receiptOver,
+          }),
+        ),
+      );
+      await pool.query(
+        `INSERT INTO conversation_state (sender_id, last_message_at, data)
+             VALUES ($1, now(), $2::jsonb)`,
+        [SENDER, JSON.stringify(data)],
+      );
+    };
+    const rawReceipt = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const rawConversation = async () =>
+      (
+        await pool.query<Row>(
+          'SELECT data FROM conversation_state WHERE sender_id = $1',
+          [SENDER],
+        )
+      ).rows[0].data as Row;
+
+    it('commits receipt evidence, the exact successor pointer, siblings, and one confirmation intent together', async () => {
+      await seed();
+      const outcome = await proposalStore.proposeAmount(command());
+      expect(outcome.kind).toBe('proposed');
+      if (outcome.kind === 'fenced') throw new Error('expected proposal');
+      expect(outcome.receipt).toMatchObject({
+        id: UUID_A,
+        status: 'AWAITING_CONFIRMATION',
+        declaredAmountCents: 1250,
+        version: '3',
+      });
+      expect(outcome.intent).toMatchObject({
+        receiptMediaId: UUID_A,
+        receiptStateVersion: '3',
+        sourceWebhookMessageId: 'wamid.amount.1',
+        recipientId: SENDER,
+        templateKey: 'RECEIPT_AMOUNT_CONFIRM',
+        templateArgs: { cents: 1250 },
+      });
+      expect((await rawReceipt()).amount_proposed_at).toBeInstanceOf(Date);
+      expect(await rawConversation()).toEqual({
+        sibling: { keep: true },
+        receiptAmountPointer: { ...POINTER, receiptVersion: '3' },
+      });
+      const { rows } = await pool.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM receipt_media_outbox WHERE receipt_media_id = $1',
+        [UUID_A],
+      );
+      expect(rows[0].n).toBe(1);
+    });
+
+    it.each<[string, Row]>([
+      ['absent', { sibling: true }],
+      ['null', { receiptAmountPointer: null }],
+      ['scalar', { receiptAmountPointer: 'bad' }],
+      ['extra key', { receiptAmountPointer: { ...POINTER, extra: true } }],
+      [
+        'wrong receipt',
+        { receiptAmountPointer: { ...POINTER, receiptMediaId: UUID_C } },
+      ],
+      ['wrong sale', { receiptAmountPointer: { ...POINTER, saleId: UUID_C } }],
+      [
+        'wrong version',
+        { receiptAmountPointer: { ...POINTER, receiptVersion: '3' } },
+      ],
+    ])(
+      'fences a %s conversation pointer without changing receipt or outbox',
+      async (_label, data) => {
+        await seed(data);
+        await expect(proposalStore.proposeAmount(command())).resolves.toEqual({
+          kind: 'fenced',
+        });
+        expect(await rawReceipt()).toMatchObject({
+          status: 'AWAITING_AMOUNT',
+          declared_amount_cents: null,
+          version: '2',
+        });
+        expect(await rawConversation()).toEqual(data);
+        expect(
+          (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+        ).toBe(0);
+      },
+    );
+
+    it.each<[string, Partial<AmountProposalInput>, Row]>([
+      ['wrong sender', { senderId: 'sender.other' }, {}],
+      ['wrong captured sale', { capturedSaleId: UUID_C }, {}],
+      [
+        'malformed receipt id',
+        {
+          receiptMediaId: 'not-a-uuid',
+          expectedPointer: { ...POINTER, receiptMediaId: 'not-a-uuid' },
+        },
+        {},
+      ],
+      ['wrong stored status', {}, { status: 'STORED' }],
+      ['wrong receipt version', { expectedReceiptVersion: '1' }, {}],
+      [
+        'oversized receipt version',
+        { expectedReceiptVersion: '9223372036854775808' },
+        {},
+      ],
+    ])(
+      'fences a %s receipt command without retargeting it',
+      async (_label, over, receiptOver) => {
+        await seed(undefined, receiptOver);
+        await expect(
+          proposalStore.proposeAmount(command(over)),
+        ).resolves.toEqual({
+          kind: 'fenced',
+        });
+        expect(await rawReceipt()).toMatchObject({
+          status: receiptOver.status ?? 'AWAITING_AMOUNT',
+          declared_amount_cents: null,
+          version: '2',
+        });
+        expect(
+          (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+        ).toBe(0);
+      },
+    );
+
+    it.each<[number, 'proposed' | 'fenced']>([
+      [1, 'proposed'],
+      [2_147_483_647, 'proposed'],
+      [1.5, 'fenced'],
+      [0, 'fenced'],
+      [-1, 'fenced'],
+      [2_147_483_648, 'fenced'],
+    ])('accepts only positive int32 cents: %i', async (cents, kind) => {
+      await seed();
+      await expect(
+        proposalStore.proposeAmount(command({ cents })),
+      ).resolves.toMatchObject({
+        kind,
+      });
+    });
+
+    it.each([
+      [`${UUID_A}\n`, UUID_B],
+      [`{${UUID_A}}`, UUID_B],
+      [UUID_A, UUID_B.replaceAll('-', '')],
+      [UUID_A, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'.toUpperCase()],
+    ])(
+      'fences noncanonical command identities before SQL',
+      async (receiptMediaId, capturedSaleId) => {
+        await seed();
+        const connect = jest.spyOn(pool, 'connect');
+        await expect(
+          proposalStore.proposeAmount(
+            command({
+              receiptMediaId,
+              capturedSaleId,
+              expectedPointer: {
+                ...POINTER,
+                receiptMediaId,
+                saleId: capturedSaleId,
+              },
+            }),
+          ),
+        ).resolves.toEqual({ kind: 'fenced' });
+        expect(connect).not.toHaveBeenCalled();
+        connect.mockRestore();
+      },
+    );
+
+    it('fences an outer null conversation payload without querying a malformed state', async () => {
+      await seed(null as unknown as Row);
+      await expect(proposalStore.proposeAmount(command())).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await rawReceipt()).toMatchObject({
+        status: 'AWAITING_AMOUNT',
+        version: '2',
+      });
+    });
+
+    it('rolls back receipt and pointer when the confirmation outbox insert fails', async () => {
+      await seed();
+      await pool.query(`CREATE FUNCTION receipt_amount_outbox_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'receipt amount outbox failure'; END;
+        $$`);
+      await pool.query(`CREATE TRIGGER receipt_amount_outbox_failure
+        BEFORE INSERT ON receipt_media_outbox
+        FOR EACH ROW EXECUTE FUNCTION receipt_amount_outbox_failure()`);
+      try {
+        await expect(proposalStore.proposeAmount(command())).rejects.toThrow(
+          'receipt amount outbox failure',
+        );
+        expect(await rawReceipt()).toMatchObject({
+          status: 'AWAITING_AMOUNT',
+          declared_amount_cents: null,
+          version: '2',
+        });
+        expect(await rawConversation()).toEqual({
+          sibling: { keep: true },
+          receiptAmountPointer: POINTER,
+        });
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS receipt_amount_outbox_failure ON receipt_media_outbox',
+        );
+        await pool.query(
+          'DROP FUNCTION IF EXISTS receipt_amount_outbox_failure()',
+        );
+      }
+    });
+
+    it('rolls back the receipt when the post-mutation pointer CAS returns zero', async () => {
+      await seed();
+      await pool.query(`CREATE FUNCTION receipt_amount_pointer_fence()
+        RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$`);
+      await pool.query(`CREATE TRIGGER receipt_amount_pointer_fence
+        BEFORE UPDATE ON conversation_state FOR EACH ROW
+        EXECUTE FUNCTION receipt_amount_pointer_fence()`);
+      try {
+        await expect(proposalStore.proposeAmount(command())).resolves.toEqual({
+          kind: 'fenced',
+        });
+        expect(await rawReceipt()).toMatchObject({
+          status: 'AWAITING_AMOUNT',
+          declared_amount_cents: null,
+          version: '2',
+        });
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS receipt_amount_pointer_fence ON conversation_state',
+        );
+        await pool.query(
+          'DROP FUNCTION IF EXISTS receipt_amount_pointer_fence()',
+        );
+      }
+    });
+
+    it('fences a retry after the pointer advances without further mutation', async () => {
+      await seed();
+      const first = command();
+      await proposalStore.proposeAmount(first);
+      await pool.query(
+        `UPDATE conversation_state SET data = jsonb_set(data,
+           '{receiptAmountPointer,receiptVersion}', '"4"'::jsonb)
+         WHERE sender_id = $1`,
+        [SENDER],
+      );
+      await expect(proposalStore.proposeAmount(first)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await rawReceipt()).toMatchObject({ version: '3' });
+      expect(
+        (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+      ).toBe(1);
+    });
+
+    it('advances MAX_BIGINT minus one once and fences successor overflow', async () => {
+      const prior = '9223372036854775806';
+      const pointer = { ...POINTER, receiptVersion: prior };
+      await seed(
+        { sibling: { keep: true }, receiptAmountPointer: pointer },
+        { version: prior },
+      );
+      await expect(
+        proposalStore.proposeAmount(
+          command({ expectedReceiptVersion: prior, expectedPointer: pointer }),
+        ),
+      ).resolves.toMatchObject({
+        kind: 'proposed',
+        receipt: { version: '9223372036854775807' },
+      });
+      const max = '9223372036854775807';
+      await seed(
+        {
+          sibling: { keep: true },
+          receiptAmountPointer: { ...POINTER, receiptVersion: max },
+        },
+        { version: max },
+      );
+      await expect(
+        proposalStore.proposeAmount(
+          command({
+            expectedReceiptVersion: max,
+            expectedPointer: { ...POINTER, receiptVersion: max },
+          }),
+        ),
+      ).resolves.toEqual({ kind: 'fenced' });
+    });
+
+    it('replays only the same amount webhook across adapter recreation and rejects new-webhook or amount rivals', async () => {
+      await seed();
+      const first = command();
+      expect((await proposalStore.proposeAmount(first)).kind).toBe('proposed');
+      const recreated = new PostgresReceiptMediaStore(pool);
+      expect((await recreated.proposeAmount(first)).kind).toBe('replayed');
+      await expect(
+        recreated.proposeAmount(
+          command({ sourceWebhookMessageId: 'wamid.amount.2' }),
+        ),
+      ).resolves.toEqual({
+        kind: 'fenced',
+      });
+      await expect(
+        recreated.proposeAmount(command({ cents: 999 })),
+      ).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(
+        (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+      ).toBe(1);
+    });
+
+    it('serializes concurrent duplicate proposals to one proposal and one replay', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        proposalStore.proposeAmount(command()),
+        proposalStore.proposeAmount(command()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['proposed', 'replayed']);
+      expect(
+        (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+      ).toBe(1);
+    });
+
+    it('serializes concurrent rival proposals without replacement or partial durable state', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        proposalStore.proposeAmount(command()),
+        proposalStore.proposeAmount(
+          command({ sourceWebhookMessageId: 'wamid.amount.2' }),
+        ),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['fenced', 'proposed']);
+      expect(await rawReceipt()).toMatchObject({
+        status: 'AWAITING_CONFIRMATION',
+        version: '3',
+      });
+      expect(
+        (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+      ).toBe(1);
     });
   });
 

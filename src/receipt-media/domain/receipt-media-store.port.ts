@@ -2,6 +2,7 @@
  * and bounded attempt primitives. Conflicts/lost fences return as values
  * (false/null), never thrown. WU6B adds the hash-indexed capability access
  * lookup (RMA2, RMA3). */
+import type { ReceiptAmountPointer } from '../../conversation/domain/conversation-store';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -37,6 +38,27 @@ export interface OutboxIntentInput {
 }
 
 export type DedupeOutcome = { created: boolean; intent: ReceiptMediaOutboxRow };
+
+/** One immutable inbound amount command. The stored receipt remains the source
+ * of truth for sender, sale, status, and prior version. */
+export interface AmountProposalInput {
+  sourceWebhookMessageId: string;
+  senderId: string;
+  receiptMediaId: string;
+  capturedSaleId: string;
+  expectedReceiptStatus: 'AWAITING_AMOUNT';
+  expectedReceiptVersion: string;
+  expectedPointer: ReceiptAmountPointer;
+  cents: number;
+}
+
+export type AmountProposalOutcome =
+  | {
+      kind: 'proposed' | 'replayed';
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
 
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
@@ -76,6 +98,8 @@ export interface CapabilityAccessRow {
 export interface ReceiptMediaStorePort {
   reserve(input: ReserveInput): Promise<ReservationOutcome>;
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
+  /** Atomically persist one amount proposal, successor pointer, and intent. */
+  proposeAmount(input: AmountProposalInput): Promise<AmountProposalOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment. */
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;
