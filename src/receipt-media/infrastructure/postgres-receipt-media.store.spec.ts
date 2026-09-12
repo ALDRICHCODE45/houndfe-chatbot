@@ -1,13 +1,17 @@
 import { execSync } from 'node:child_process';
-import type { PoolClient } from 'pg';
+import type { PoolClient, QueryResultRow } from 'pg';
 import { Pool } from 'pg';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import type {
   AmountProposalInput,
+  AmountProposalOutcome,
   AmountRejectionInput,
+  AmountRejectionOutcome,
   AttemptStartResult,
   LeaseFenceInput,
   OutboxIntentInput,
+  ReceiptCancellationInput,
+  ReceiptCancellationOutcome,
   ReceiptMediaStorePort,
   ReservationOutcome,
   ReserveInput,
@@ -188,7 +192,10 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     process.env.DATABASE_URL = container.getConnectionUri();
     delete process.env.DB_POOL_MAX;
     migrate('migrate');
-    pool = new Pool({ connectionString: container.getConnectionUri() });
+    pool = new Pool({
+      connectionString: container.getConnectionUri(),
+      options: '-c statement_timeout=8000',
+    });
     store = new PostgresReceiptMediaStore(pool);
   });
 
@@ -661,9 +668,12 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   const tryMigrateDown = (): string => {
     try {
       migrate('migrate:down');
+      migrate('migrate:down');
       return '';
     } catch (err) {
       return String((err as { stderr?: Buffer }).stderr ?? err);
+    } finally {
+      migrate('migrate');
     }
   };
 
@@ -671,7 +681,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     ['receipt_media', lifeRow('RESERVED', null, {})],
     ['receipt_media_outbox', outboxRow()],
   ])('down refuses when only %s is populated', async (table, row) => {
-    await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    await pool.query(
+      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+    );
     await pool.query(insertSql(table, row), Object.values(row));
     expect(tryMigrateDown()).toMatch(/refus/i);
     const { rows } = await pool.query<{ a: boolean; b: boolean }>(
@@ -679,14 +691,18 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         "to_regclass('receipt_media_outbox') IS NOT NULL AS b",
     );
     expect(rows[0]).toMatchObject({ a: true, b: true });
-    await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    await pool.query(
+      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+    );
   });
 
   // --- WU2B1 reservation arbitration and intent dedupe (RM1, RM3) ---
 
   describe('WU2B1 reservation arbitration and intent dedupe', () => {
     beforeEach(async () => {
-      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
     });
 
     const reserveInput = (over: Row = {}): ReserveInput => ({
@@ -799,7 +815,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
   describe('WU2B2A leased claims and fenced lease bookkeeping', () => {
     beforeEach(async () => {
-      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
     });
 
     const FUTURE = new Date(Date.now() + 60_000);
@@ -962,7 +980,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
     describe('WU2B2B status CAS and bounded pre-call attempts', () => {
       beforeEach(async () => {
-        await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+        await pool.query(
+          'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+        );
       });
 
       type Counter = 'meta' | 'storage';
@@ -1086,7 +1106,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
   describe('WU6B capability access lookup', () => {
     beforeEach(async () => {
-      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
     });
 
     const KNOWN_HASH = Buffer.alloc(32, 2); // acceptedEvidence default
@@ -1223,7 +1245,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
     describe('WU6C capability revocation', () => {
       beforeEach(async () => {
-        await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+        await pool.query(
+          'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+        );
       });
 
       const KNOWN_HASH = Buffer.alloc(32, 2); // acceptedEvidence default
@@ -1397,7 +1421,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       data: Row = { sibling: { keep: true }, receiptAmountPointer: POINTER },
       receiptOver: Row = {},
     ) => {
-      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
       await pool.query('DELETE FROM conversation_state WHERE sender_id = $1', [
         SENDER,
       ]);
@@ -1789,7 +1815,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       },
       receiptOver: Row = {},
     ) => {
-      await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
       await pool.query('DELETE FROM conversation_state WHERE sender_id = $1', [
         SENDER,
       ]);
@@ -2072,9 +2100,1043 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ).resolves.toEqual({ kind: 'fenced' });
     });
   });
-
+  describe('WU10C2B atomic cancellation with durable command provenance', () => {
+    type CancellationInput = ReceiptCancellationInput;
+    type CancellationOutcome = ReceiptCancellationOutcome;
+    type CancellationStore = {
+      cancelReceipt(input: CancellationInput): Promise<CancellationOutcome>;
+    };
+    const CANCELLATION_TABLE = 'receipt_media_cancellation_commands';
+    const UUID_D = '33333333-3333-4333-8333-333333333333';
+    const SENDER = 'sender.amount-cancel';
+    const POINTER = {
+      receiptMediaId: UUID_A,
+      saleId: UUID_B,
+      receiptVersion: '2',
+    };
+    const COMMAND_COLUMNS = `receipt_media_id uuid NO source_webhook_message_id text NO
+      sender_id text NO captured_sale_id uuid NO expected_receipt_status text NO
+      expected_receipt_version bigint NO expected_pointer_receipt_media_id uuid NO
+      expected_pointer_sale_id uuid NO expected_pointer_receipt_version bigint NO
+      successor_receipt_version bigint NO cancellation_outbox_id uuid NO created_at timestamptz NO`;
+    const cancel = (target: CancellationStore, input: CancellationInput) =>
+      Promise.resolve().then(() => target.cancelReceipt(input));
+    const cancellationStore: CancellationStore = {
+      cancelReceipt: (input) => store.cancelReceipt(input),
+    };
+    const command = (
+      over: Partial<CancellationInput> = {},
+    ): CancellationInput => ({
+      sourceWebhookMessageId: 'wamid.amount-cancel.1',
+      senderId: SENDER,
+      receiptMediaId: UUID_A,
+      capturedSaleId: UUID_B,
+      expectedReceiptStatus: 'AWAITING_AMOUNT',
+      expectedReceiptVersion: '2',
+      expectedPointer: POINTER,
+      ...over,
+    });
+    const commandRow = (over: Row = {}): Row => ({
+      receipt_media_id: UUID_A,
+      source_webhook_message_id: 'wamid.amount-cancel.1',
+      sender_id: SENDER,
+      captured_sale_id: UUID_B,
+      expected_receipt_status: 'AWAITING_AMOUNT',
+      expected_receipt_version: '2',
+      expected_pointer_receipt_media_id: UUID_A,
+      expected_pointer_sale_id: UUID_B,
+      expected_pointer_receipt_version: '2',
+      successor_receipt_version: '3',
+      cancellation_outbox_id: UUID_C,
+      ...over,
+    });
+    const hasCancellationTable = async (): Promise<boolean> =>
+      (
+        await pool.query<{ table: string | null }>(
+          'SELECT to_regclass($1) AS table',
+          [CANCELLATION_TABLE],
+        )
+      ).rows[0].table === CANCELLATION_TABLE;
+    const reset = async (): Promise<void> => {
+      if (await hasCancellationTable())
+        await pool.query(
+          'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+        );
+      else await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+      await pool.query('DELETE FROM conversation_state WHERE sender_id = $1', [
+        SENDER,
+      ]);
+    };
+    const seed = async (
+      status: CancellationInput['expectedReceiptStatus'] = 'AWAITING_AMOUNT',
+      data: unknown = {
+        sibling: { keep: true },
+        receiptAmountPointer: POINTER,
+      },
+      receiptOver: Row = {},
+    ): Promise<void> => {
+      await reset();
+      const receipt = lifeRow(status, null, {
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        version: '2',
+        ...(status === 'AWAITING_CONFIRMATION'
+          ? { amount_proposed_at: T0 }
+          : {}),
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      await pool.query(
+        `INSERT INTO conversation_state (sender_id, last_message_at, data)
+             VALUES ($1, now(), $2::jsonb)`,
+        [SENDER, JSON.stringify(data)],
+      );
+    };
+    const snapshot = async (id = UUID_A) => {
+      const commandRows = (await hasCancellationTable())
+        ? await pool.query<Row>(
+            'SELECT * FROM receipt_media_cancellation_commands WHERE receipt_media_id = $1',
+            [id],
+          )
+        : { rows: [] as Row[] };
+      const [receipt, conversation, outbox] = await Promise.all([
+        pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [id]),
+        pool.query<Row>(
+          'SELECT data FROM conversation_state WHERE sender_id = $1',
+          [SENDER],
+        ),
+        pool.query<Row>('SELECT * FROM receipt_media_outbox'),
+      ]);
+      return {
+        receipt: receipt.rows[0],
+        conversation: conversation.rows[0]?.data as Row | undefined,
+        outbox: outbox.rows,
+        command: commandRows.rows,
+      };
+    };
+    const expectFenced = async (
+      input: CancellationInput,
+      target: CancellationStore = cancellationStore,
+    ) => {
+      const before = await snapshot(input.receiptMediaId);
+      await expect(cancel(target, input)).resolves.toEqual({ kind: 'fenced' });
+      expect(await snapshot(input.receiptMediaId)).toEqual(before);
+    };
+    it('enforces command identity checks, linked intent FK, and sender/webhook uniqueness', async () => {
+      expect(await actualColumns(CANCELLATION_TABLE)).toEqual(
+        expectedColumns(COMMAND_COLUMNS),
+      );
+      await reset();
+      const terminal = async (id: string, sale: string, outboxId: string) => {
+        const receipt = lifeRow('CANCELLED', null, {
+          id,
+          webhook_message_id: `wamid.cancel.${id}`,
+          provider_media_id: `media.cancel.${id}`,
+          captured_sale_id: sale,
+          object_key: `receipts/${id}`,
+          terminal_at: T0,
+          capability_token_hash: Buffer.alloc(32, id === UUID_A ? 3 : 4),
+          version: '3',
+        });
+        await pool.query(
+          insertSql('receipt_media', receipt),
+          Object.values(receipt),
+        );
+        const intent = outboxRow({
+          id: outboxId,
+          dedupe_key: `cancel.${id}`,
+          receipt_media_id: id,
+          receipt_state_version: '3',
+          source_webhook_message_id: 'wamid.amount-cancel.1',
+          recipient_id: SENDER,
+          template_key: 'RECEIPT_CANCELLED',
+          template_args: {},
+        });
+        await pool.query(
+          insertSql('receipt_media_outbox', intent),
+          Object.values(intent),
+        );
+      };
+      await terminal(UUID_A, UUID_B, UUID_C);
+      const badPointer = commandRow({ expected_pointer_sale_id: UUID_C });
+      await expect(
+        pool.query(
+          insertSql(CANCELLATION_TABLE, badPointer),
+          Object.values(badPointer),
+        ),
+      ).rejects.toThrow();
+      await pool.query(
+        insertSql(CANCELLATION_TABLE, commandRow()),
+        Object.values(commandRow()),
+      );
+      await expect(
+        pool.query('DELETE FROM receipt_media_outbox WHERE id = $1', [UUID_C]),
+      ).rejects.toThrow();
+      await terminal(UUID_D, UUID_C, UUID_B);
+      const duplicate = commandRow({
+        receipt_media_id: UUID_D,
+        captured_sale_id: UUID_C,
+        expected_pointer_receipt_media_id: UUID_D,
+        expected_pointer_sale_id: UUID_C,
+        cancellation_outbox_id: UUID_B,
+      });
+      await expect(
+        pool.query(
+          insertSql(CANCELLATION_TABLE, duplicate),
+          Object.values(duplicate),
+        ),
+      ).rejects.toThrow();
+      await expect(
+        pool.query(
+          insertSql(CANCELLATION_TABLE, {
+            ...duplicate,
+            sender_id: 'sender.other',
+          }),
+          Object.values({ ...duplicate, sender_id: 'sender.other' }),
+        ),
+      ).resolves.toBeDefined();
+      expect(tryMigrateDown()).toMatch(/refus/i);
+    });
+    it.each(['AWAITING_AMOUNT', 'AWAITING_CONFIRMATION'] as const)(
+      'cancels %s atomically while preserving evidence and siblings',
+      async (status) => {
+        await seed(status);
+        const before = await snapshot();
+        const outcome = await cancel(
+          cancellationStore,
+          command({
+            expectedReceiptStatus: status,
+          }),
+        );
+        expect(outcome).toMatchObject({
+          kind: 'cancelled',
+          receipt: { id: UUID_A, status: 'CANCELLED', version: '3' },
+          intent: {
+            receiptMediaId: UUID_A,
+            receiptStateVersion: '3',
+            sourceWebhookMessageId: 'wamid.amount-cancel.1',
+            recipientId: SENDER,
+            templateKey: 'RECEIPT_CANCELLED',
+            templateArgs: {},
+          },
+        });
+        if (outcome.kind === 'fenced') throw new Error('expected cancellation');
+        expect(outcome.receipt.terminalAt).toBeInstanceOf(Date);
+        const after = await snapshot();
+        expect(after.receipt).toMatchObject({
+          status: 'CANCELLED',
+          version: '3',
+          declared_amount_cents:
+            status === 'AWAITING_AMOUNT'
+              ? null
+              : before.receipt.declared_amount_cents,
+          amount_proposed_at:
+            status === 'AWAITING_AMOUNT'
+              ? null
+              : before.receipt.amount_proposed_at,
+        });
+        expect(after.receipt.terminal_at).toBeInstanceOf(Date);
+        const evidence = Object.fromEntries(
+          Object.entries(before.receipt).filter(
+            ([key]) =>
+              !['status', 'version', 'updated_at', 'terminal_at'].includes(key),
+          ),
+        );
+        expect(after.receipt).toMatchObject(evidence);
+        expect(after.conversation).toEqual({ sibling: { keep: true } });
+        expect(after.outbox).toHaveLength(1);
+        expect(after.command).toEqual([
+          expect.objectContaining({
+            receipt_media_id: UUID_A,
+            source_webhook_message_id: 'wamid.amount-cancel.1',
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            expected_receipt_status: status,
+            expected_receipt_version: '2',
+            expected_pointer_receipt_media_id: UUID_A,
+            expected_pointer_sale_id: UUID_B,
+            expected_pointer_receipt_version: '2',
+            successor_receipt_version: '3',
+            cancellation_outbox_id: after.outbox[0].id,
+          }),
+        ]);
+      },
+    );
+    it.each<[string, Partial<CancellationInput>]>([
+      ['same webhook with wrong sender', { senderId: 'sender.other' }],
+      ['same webhook with wrong receipt', { receiptMediaId: UUID_C }],
+      ['same webhook with wrong sale', { capturedSaleId: UUID_C }],
+      [
+        'same webhook with wrong source status',
+        { expectedReceiptStatus: 'AWAITING_CONFIRMATION' },
+      ],
+      [
+        'same webhook with wrong source version',
+        { expectedReceiptVersion: '1' },
+      ],
+      [
+        'same webhook with wrong pointer',
+        { expectedPointer: { ...POINTER, saleId: UUID_C } },
+      ],
+    ])(
+      'fences a %s instead of replaying altered command identity',
+      async (_label, over) => {
+        await seed();
+        const input = command();
+        await cancel(cancellationStore, input);
+        await expectFenced(command(over));
+      },
+    );
+    it.each<[string, unknown]>([
+      ['absent pointer before cancellation', { sibling: true }],
+      ['null pointer before cancellation', { receiptAmountPointer: null }],
+      [
+        'array pointer before cancellation',
+        { receiptAmountPointer: [POINTER] },
+      ],
+      [
+        'malformed pointer before cancellation',
+        { receiptAmountPointer: { ...POINTER, extra: true } },
+      ],
+    ])('fences a %s without durable mutation', async (_label, data) => {
+      await seed('AWAITING_AMOUNT', data);
+      await expectFenced(command());
+    });
+    it.each<[string, string]>([
+      ['null', 'null'],
+      ['array', '[]'],
+      ['malformed object', JSON.stringify({ ...POINTER, extra: true })],
+      ['new pointer', JSON.stringify({ ...POINTER, receiptVersion: '4' })],
+    ])(
+      'replay requires an absent pointer, fencing a %s pointer',
+      async (_label, raw) => {
+        await seed();
+        const input = command();
+        await cancel(cancellationStore, input);
+        await pool.query(
+          `UPDATE conversation_state SET data = jsonb_set(data,
+               '{receiptAmountPointer}', $2::jsonb, true) WHERE sender_id = $1`,
+          [SENDER, raw],
+        );
+        await expectFenced(input);
+      },
+    );
+    it('replays only exact durable provenance after adapter recreation and fences legacy or malformed evidence', async () => {
+      await seed('AWAITING_CONFIRMATION');
+      const input = command({ expectedReceiptStatus: 'AWAITING_CONFIRMATION' });
+      expect((await cancel(cancellationStore, input)).kind).toBe('cancelled');
+      const recreated = new PostgresReceiptMediaStore(
+        pool,
+      ) as unknown as CancellationStore;
+      expect((await cancel(recreated, input)).kind).toBe('replayed');
+      await pool.query(
+        "UPDATE receipt_media_outbox SET template_args = '[]'::jsonb",
+      );
+      await expectFenced(input, recreated);
+      await seed(
+        'AWAITING_AMOUNT',
+        { sibling: true },
+        {
+          status: 'CANCELLED',
+          version: '3',
+          terminal_at: T0,
+        },
+      );
+      await expectFenced(input, recreated);
+    });
+    it('fences noncanonical identities and successor overflow before mutation', async () => {
+      await seed();
+      await expectFenced(
+        command({
+          receiptMediaId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA',
+          expectedPointer: {
+            ...POINTER,
+            receiptMediaId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA',
+          },
+        }),
+      );
+      const max = '9223372036854775807';
+      await seed(
+        'AWAITING_AMOUNT',
+        {
+          sibling: { keep: true },
+          receiptAmountPointer: { ...POINTER, receiptVersion: max },
+        },
+        { version: max },
+      );
+      await expectFenced(
+        command({
+          expectedReceiptVersion: max,
+          expectedPointer: { ...POINTER, receiptVersion: max },
+        }),
+      );
+    });
+    it.each<[string, string, string, 'fenced' | 'throws']>([
+      [
+        'pointer update',
+        'conversation_state',
+        'BEGIN RETURN NULL; END;',
+        'fenced',
+      ],
+      [
+        'outbox insert',
+        'receipt_media_outbox',
+        "BEGIN RAISE EXCEPTION 'cancel outbox failure'; END;",
+        'throws',
+      ],
+      [
+        'command insert',
+        CANCELLATION_TABLE,
+        "BEGIN RAISE EXCEPTION 'cancel command failure'; END;",
+        'throws',
+      ],
+      [
+        'command suppression',
+        CANCELLATION_TABLE,
+        'BEGIN RETURN NULL; END;',
+        'fenced',
+      ],
+    ])(
+      'rolls back receipt, pointer, outbox, and command when %s fails',
+      async (_label, table, body, expectation) => {
+        await seed();
+        const before = await snapshot();
+        const trigger = `receipt_cancel_${table.replaceAll('_', '')}_failure`;
+        await pool.query(
+          `CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ ${body} $$`,
+        );
+        await pool.query(
+          `CREATE TRIGGER ${trigger} BEFORE UPDATE OR INSERT ON ${table}
+             FOR EACH ROW EXECUTE FUNCTION ${trigger}()`,
+        );
+        try {
+          if (expectation === 'fenced')
+            await expect(cancel(cancellationStore, command())).resolves.toEqual(
+              {
+                kind: 'fenced',
+              },
+            );
+          else
+            await expect(
+              cancel(cancellationStore, command()),
+            ).rejects.toThrow();
+          expect(await snapshot()).toEqual(before);
+        } finally {
+          await pool.query(`DROP TRIGGER IF EXISTS ${trigger} ON ${table}`);
+          await pool.query(`DROP FUNCTION IF EXISTS ${trigger}()`);
+        }
+      },
+    );
+    it('serializes duplicate and distinct cancellation webhooks', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        cancel(cancellationStore, command()),
+        cancel(cancellationStore, command()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['cancelled', 'replayed']);
+      await seed();
+      const [first, rival] = await Promise.all([
+        cancel(cancellationStore, command()),
+        cancel(
+          cancellationStore,
+          command({ sourceWebhookMessageId: 'wamid.amount-cancel.2' }),
+        ),
+      ]);
+      expect([first.kind, rival.kind].sort()).toEqual(['cancelled', 'fenced']);
+    });
+    // prettier-ignore
+    it('allows concurrent same-webhook cancellation records for different senders', async () => {
+          await seed();
+          const sender = 'sender.amount-cancel.other';
+          const other = lifeRow('AWAITING_AMOUNT', null, {
+            id: UUID_D,
+            webhook_message_id: 'wamid.cancel.other',
+            provider_media_id: 'media.cancel.other',
+            sender_id: sender,
+            captured_sale_id: UUID_C,
+            object_key: `receipts/${UUID_D}`,
+            capability_token_hash: Buffer.alloc(32, 6),
+            version: '2',
+          });
+          await pool.query(insertSql('receipt_media', other), Object.values(other));
+          await pool.query(
+            'INSERT INTO conversation_state (sender_id, last_message_at, data) VALUES ($1, now(), $2::jsonb)',
+            [
+              sender,
+              JSON.stringify({
+                receiptAmountPointer: {
+                  receiptMediaId: UUID_D,
+                  saleId: UUID_C,
+                  receiptVersion: '2',
+                },
+              }),
+            ],
+          );
+          const otherCommand = command({
+            senderId: sender,
+            receiptMediaId: UUID_D,
+            capturedSaleId: UUID_C,
+            expectedPointer: {
+              receiptMediaId: UUID_D,
+              saleId: UUID_C,
+              receiptVersion: '2',
+            },
+          });
+          const outcomes = await Promise.all([
+            cancel(cancellationStore, command()),
+            cancel(cancellationStore, otherCommand),
+          ]);
+          expect(outcomes.map((outcome) => outcome.kind)).toEqual([
+            'cancelled',
+            'cancelled',
+          ]);
+          const { rows } = await pool.query<Row>(
+            `SELECT r.id receipt_id, r.sender_id receipt_sender_id, r.status receipt_status, r.version receipt_version, r.terminal_at receipt_terminal_at, c.sender_id command_sender_id, c.source_webhook_message_id, c.captured_sale_id, c.expected_receipt_status, c.expected_receipt_version, c.expected_pointer_receipt_media_id, c.expected_pointer_sale_id, c.expected_pointer_receipt_version, c.successor_receipt_version, c.cancellation_outbox_id, o.id outbox_id, o.receipt_media_id outbox_receipt_media_id, o.source_webhook_message_id outbox_source_webhook_message_id, o.recipient_id outbox_recipient_id, o.receipt_state_version outbox_receipt_state_version, o.template_key outbox_template_key, o.template_args outbox_template_args FROM receipt_media r JOIN receipt_media_cancellation_commands c ON c.receipt_media_id = r.id JOIN receipt_media_outbox o ON o.id = c.cancellation_outbox_id WHERE r.id IN ($1, $2)`,
+            [UUID_A, UUID_D],
+          );
+          const expected = {
+            [UUID_A]: { id: UUID_A, sender: SENDER, sale: UUID_B },
+            [UUID_D]: { id: UUID_D, sender, sale: UUID_C },
+          };
+          expect(rows).toHaveLength(2);
+          for (const row of rows) {
+            const outcome = expected[row.receipt_id as keyof typeof expected];
+            if (!outcome) throw new Error('unexpected cancellation receipt');
+            expect(row).toMatchObject({ receipt_id: outcome.id, receipt_sender_id: outcome.sender, receipt_status: 'CANCELLED', receipt_version: '3', command_sender_id: outcome.sender, source_webhook_message_id: 'wamid.amount-cancel.1', captured_sale_id: outcome.sale, expected_receipt_status: 'AWAITING_AMOUNT', expected_receipt_version: '2', expected_pointer_receipt_media_id: row.receipt_id, expected_pointer_sale_id: outcome.sale, expected_pointer_receipt_version: '2', successor_receipt_version: '3', outbox_receipt_media_id: row.receipt_id, outbox_source_webhook_message_id: 'wamid.amount-cancel.1', outbox_recipient_id: outcome.sender, outbox_receipt_state_version: '3', outbox_template_key: 'RECEIPT_CANCELLED' });
+            expect(row.receipt_terminal_at).toBeInstanceOf(Date);
+            expect(row.cancellation_outbox_id).toBe(row.outbox_id);
+            expect(row.outbox_template_args).toEqual({});
+          }
+          const conversations = Object.fromEntries(
+            (
+              await pool.query<Row>(
+                'SELECT sender_id, data FROM conversation_state WHERE sender_id IN ($1, $2)',
+                [SENDER, sender],
+              )
+            ).rows.map((row) => [row.sender_id as string, row.data]),
+          );
+          expect(conversations).toEqual({
+            [SENDER]: { sibling: { keep: true } },
+            [sender]: {},
+          });
+        });
+    it('fences a sequential cross-receipt same-sender webhook', async () => {
+      await seed();
+      expect((await cancel(cancellationStore, command())).kind).toBe(
+        'cancelled',
+      );
+      const alternate = lifeRow('AWAITING_AMOUNT', null, {
+        id: UUID_D,
+        webhook_message_id: 'wamid.cancel.alternate',
+        provider_media_id: 'media.cancel.alternate',
+        sender_id: SENDER,
+        captured_sale_id: UUID_C,
+        object_key: `receipts/${UUID_D}`,
+        capability_token_hash: Buffer.alloc(32, 5),
+        version: '2',
+      });
+      await pool.query(
+        insertSql('receipt_media', alternate),
+        Object.values(alternate),
+      );
+      await pool.query(
+        `UPDATE conversation_state SET data = jsonb_set(data, '{receiptAmountPointer}',
+             $2::jsonb, true) WHERE sender_id = $1`,
+        [
+          SENDER,
+          JSON.stringify({
+            receiptMediaId: UUID_D,
+            saleId: UUID_C,
+            receiptVersion: '2',
+          }),
+        ],
+      );
+      await expectFenced(
+        command({
+          receiptMediaId: UUID_D,
+          capturedSaleId: UUID_C,
+          expectedPointer: {
+            receiptMediaId: UUID_D,
+            saleId: UUID_C,
+            receiptVersion: '2',
+          },
+        }),
+      );
+    });
+    type RaceKind = 'amount proposal' | 'amount rejection';
+    type RaceWinner = 'cancellation' | 'competing';
+    type RaceOutcome =
+      | AmountProposalOutcome
+      | AmountRejectionOutcome
+      | ReceiptCancellationOutcome;
+    type WinnerGate = readonly [string, number, string];
+    const RACE_STATEMENT_TIMEOUT_MS = 1_000;
+    const RACE_OPERATION_TIMEOUT_MS = 1_500;
+    const RACE_SETTLEMENT_TIMEOUT_MS = 10_000;
+    const withDeadline = async <T>(
+      label: string,
+      operation: Promise<T>,
+      timeout = RACE_OPERATION_TIMEOUT_MS,
+    ): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          operation,
+          new Promise<T>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`timed out ${label}`)),
+              timeout,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const queryBounded = <T extends QueryResultRow>(
+      client: PoolClient,
+      label: string,
+      text: string,
+      values?: unknown[],
+    ) => withDeadline(label, client.query<T>(text, values));
+    const GATES = {
+      proposal: ['proposal', 710_001, 'AWAITING_CONFIRMATION'],
+      cancelAmount: ['cancel_amount', 710_002, 'CANCELLED'],
+      rejection: ['rejection', 710_003, 'AWAITING_AMOUNT'],
+      cancelConfirmation: ['cancel_confirmation', 710_004, 'CANCELLED'],
+    } as const;
+    const asError = (error: unknown): Error =>
+      error instanceof Error ? error : new Error(String(error));
+    const acquireRaceClient = async (label: string): Promise<PoolClient> => {
+      const acquisition = pool.connect();
+      let client: PoolClient | undefined;
+      try {
+        client = await withDeadline(`${label} client acquisition`, acquisition);
+        await queryBounded(
+          client,
+          `${label} statement timeout setup`,
+          `SET statement_timeout = '${RACE_STATEMENT_TIMEOUT_MS}ms'`,
+        );
+        return client;
+      } catch (error) {
+        const failure = asError(error);
+        if (client) {
+          client.release(failure);
+        } else {
+          void acquisition
+            .then((late) => late.release(failure))
+            .catch(() => {});
+        }
+        throw error;
+      }
+    };
+    const releaseRaceClient = async (client?: PoolClient, failure?: Error) => {
+      if (!client) return;
+      if (failure) return client.release(failure);
+      try {
+        await queryBounded(client, 'reset', "SET statement_timeout='8s'");
+        client.release();
+      } catch (error) {
+        client.release(asError(error));
+        throw error;
+      }
+    };
+    const withRaceClient = async <T>(
+      label: string,
+      operation: (client: PoolClient) => Promise<T>,
+    ): Promise<T> => {
+      let client: PoolClient | undefined;
+      let failure: Error | undefined;
+      try {
+        client = await acquireRaceClient(label);
+        return await operation(client);
+      } catch (error) {
+        failure = asError(error);
+        throw error;
+      } finally {
+        await releaseRaceClient(client, failure);
+      }
+    };
+    const gateName = (name: string) => `receipt_media_wu10c2b_${name}_gate`;
+    const installWinnerGate = async (gate: WinnerGate) => {
+      const [name, key, status] = gate;
+      const functionName = gateName(name);
+      await withRaceClient('winner gate installation', async (client) => {
+        await queryBounded(
+          client,
+          'winner gate function installation',
+          `CREATE FUNCTION ${functionName}()
+            RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+              IF NEW.status = '${status}' THEN
+                PERFORM pg_advisory_xact_lock(${key});
+              END IF;
+              RETURN NEW;
+            END; $$`,
+        );
+        await queryBounded(
+          client,
+          'winner gate trigger installation',
+          `CREATE TRIGGER ${functionName}
+            BEFORE UPDATE ON receipt_media FOR EACH ROW
+            EXECUTE FUNCTION ${functionName}()`,
+        );
+      });
+    };
+    const removeWinnerTrigger = ([name]: WinnerGate) =>
+      withRaceClient('winner gate trigger removal', (client) =>
+        queryBounded(
+          client,
+          'winner gate trigger removal query',
+          `DROP TRIGGER IF EXISTS ${gateName(name)} ON receipt_media`,
+        ),
+      );
+    const removeWinnerFunction = ([name]: WinnerGate) =>
+      withRaceClient('winner gate function removal', (client) =>
+        queryBounded(
+          client,
+          'winner gate function removal query',
+          `DROP FUNCTION IF EXISTS ${gateName(name)}()`,
+        ),
+      );
+    const waitForWinnerGate = async (
+      observer: PoolClient,
+      key: number,
+    ): Promise<void> => {
+      const deadline = Date.now() + RACE_SETTLEMENT_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const { rows } = await queryBounded<{ waiting: boolean }>(
+          observer,
+          'winner gate observation',
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_locks
+              WHERE locktype = 'advisory' AND NOT granted
+                AND database = (SELECT oid FROM pg_database
+                                  WHERE datname = current_database())
+                AND classid = 0 AND objid = $1::oid AND objsubid = 1
+           ) AS waiting`,
+          [key],
+        );
+        if (rows[0].waiting) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      throw new Error(`timed out waiting for advisory gate ${key}`);
+    };
+    // prettier-ignore
+    it.each<[
+              string,
+          CancellationInput['expectedReceiptStatus'],
+          RaceKind,
+          RaceWinner,
+          WinnerGate,
+        ]>([
+          [
+            'proposal wins',
+            'AWAITING_AMOUNT',
+            'amount proposal',
+            'competing',
+            GATES.proposal,
+          ],
+          [
+            'cancel wins versus proposal',
+            'AWAITING_AMOUNT',
+            'amount proposal',
+            'cancellation',
+            GATES.cancelAmount,
+          ],
+          [
+            'rejection wins',
+            'AWAITING_CONFIRMATION',
+            'amount rejection',
+            'competing',
+            GATES.rejection,
+          ],
+          [
+            'cancel wins versus rejection',
+            'AWAITING_CONFIRMATION',
+            'amount rejection',
+            'cancellation',
+            GATES.cancelConfirmation,
+          ],
+        ])(
+          '%s through a trigger-gated receipt update',
+          async (_label, status, kind, intendedWinner, gate) => {
+            await seed(status);
+            let control: PoolClient | undefined;
+            let controlFailure: Error | undefined;
+            let observer: PoolClient | undefined;
+            let observerFailure: Error | undefined;
+            let locked = false;
+            let winner: Promise<RaceOutcome> | undefined;
+            let loser: Promise<RaceOutcome> | undefined;
+            const unlockControl = async (): Promise<void> => {
+              if (!control || !locked) return;
+              try {
+                await queryBounded(
+                  control,
+                  'winner gate unlock',
+                  'SELECT pg_advisory_unlock($1)',
+                  [gate[1]],
+                );
+                locked = false;
+              } catch (error) {
+                controlFailure = asError(error);
+                control.release(controlFailure);
+                control = undefined;
+                locked = false;
+                throw error;
+              }
+            };
+            const releaseControl = async (failure?: Error) => {
+              const client = control;
+              control = undefined;
+              await releaseRaceClient(client, failure);
+            };
+            let primaryFailure: unknown;
+            let hasPrimaryFailure = false;
+            try {
+              await installWinnerGate(gate);
+              control = await acquireRaceClient('winner gate control');
+              observer = await acquireRaceClient('winner gate observer');
+              try {
+                await queryBounded(
+                  control,
+                  'winner gate lock',
+                  'SELECT pg_advisory_lock($1)',
+                  [gate[1]],
+                );
+                locked = true;
+              } catch (error) {
+                controlFailure = asError(error);
+                throw error;
+              }
+              const startCompeting = (): Promise<RaceOutcome> =>
+                kind === 'amount proposal'
+                  ? store.proposeAmount({
+                      sourceWebhookMessageId: 'wamid.amount.propose.race',
+                      senderId: SENDER,
+                      receiptMediaId: UUID_A,
+                      capturedSaleId: UUID_B,
+                      expectedReceiptStatus: 'AWAITING_AMOUNT',
+                      expectedReceiptVersion: '2',
+                      expectedPointer: POINTER,
+                      cents: 1250,
+                    })
+                  : store.rejectProposedAmount({
+                      sourceWebhookMessageId: 'wamid.amount.reject.race',
+                      senderId: SENDER,
+                      receiptMediaId: UUID_A,
+                      capturedSaleId: UUID_B,
+                      expectedReceiptStatus: 'AWAITING_CONFIRMATION',
+                      expectedReceiptVersion: '2',
+                      expectedPointer: POINTER,
+                    });
+              const cancellation = (): Promise<RaceOutcome> =>
+                cancel(
+                  cancellationStore,
+                  command({ expectedReceiptStatus: status }),
+                );
+              winner =
+                intendedWinner === 'cancellation'
+                  ? cancellation()
+                  : startCompeting();
+              try {
+                await waitForWinnerGate(observer, gate[1]);
+              } catch (error) {
+                observerFailure = asError(error);
+                throw error;
+              }
+              loser =
+                intendedWinner === 'cancellation'
+                  ? startCompeting()
+                  : cancellation();
+              await unlockControl();
+              await releaseControl();
+                  if (winner === undefined || loser === undefined) throw new Error('race did not start');
+              const settled = await withDeadline(
+                'winner/loser settlement',
+                Promise.allSettled([winner, loser]),
+                RACE_SETTLEMENT_TIMEOUT_MS,
+              );
+              const [winnerResult, loserResult] = settled;
+              if (winnerResult.status === 'rejected') throw winnerResult.reason;
+              if (loserResult.status === 'rejected') throw loserResult.reason;
+              const winnerOutcome = winnerResult.value;
+              const loserOutcome = loserResult.value;
+              expect(winnerOutcome.kind).toBe(
+                intendedWinner === 'cancellation'
+                  ? 'cancelled'
+                  : kind === 'amount proposal'
+                    ? 'proposed'
+                    : 'rejected',
+              );
+              expect(loserOutcome).toEqual({ kind: 'fenced' });
+              const [cancelled, competing] =
+                intendedWinner === 'cancellation'
+                  ? [winnerOutcome, loserOutcome]
+                  : [loserOutcome, winnerOutcome];
+              const durable = await snapshot();
+              expect(durable.outbox).toHaveLength(1);
+              expect(durable.receipt).toMatchObject({
+                id: UUID_A,
+                sender_id: SENDER,
+                captured_sale_id: UUID_B,
+                ...downloadEvidence,
+                ...acceptedEvidence,
+                version: '3',
+              });
+              const [outbox] = durable.outbox;
+              if (cancelled.kind === 'cancelled') {
+                expect(competing).toEqual({ kind: 'fenced' });
+                expect(durable.receipt).toMatchObject({
+                  status: 'CANCELLED',
+                  declared_amount_cents:
+                    status === 'AWAITING_AMOUNT' ? null : 1250,
+                });
+                expect(durable.receipt.terminal_at).toBeInstanceOf(Date);
+                if (status === 'AWAITING_AMOUNT') {
+                  expect(durable.receipt.amount_proposed_at).toBeNull();
+                } else {
+                  expect(durable.receipt.amount_proposed_at).toEqual(T0);
+                }
+                expect(durable.conversation).toEqual({ sibling: { keep: true } });
+                expect(outbox).toMatchObject({
+                  receipt_media_id: UUID_A,
+                  receipt_state_version: '3',
+                  source_webhook_message_id: 'wamid.amount-cancel.1',
+                  recipient_id: SENDER,
+                  template_key: 'RECEIPT_CANCELLED',
+                  dedupe_key: `receipt-cancel:${UUID_A}:2:wamid.amount-cancel.1`,
+                });
+                expect(outbox.id).toBe(cancelled.intent.id);
+                expect(outbox.template_args).toEqual({});
+                expect(durable.command).toHaveLength(1);
+                const [provenance] = durable.command;
+                expect(provenance).toMatchObject({
+                  receipt_media_id: UUID_A,
+                  sender_id: SENDER,
+                  source_webhook_message_id: 'wamid.amount-cancel.1',
+                  captured_sale_id: UUID_B,
+                  expected_receipt_status: status,
+                  expected_receipt_version: '2',
+                  expected_pointer_receipt_media_id: UUID_A,
+                  expected_pointer_sale_id: UUID_B,
+                  expected_pointer_receipt_version: '2',
+                  successor_receipt_version: '3',
+                });
+                expect(provenance.cancellation_outbox_id).toBe(outbox.id);
+              } else {
+                expect(cancelled).toEqual({ kind: 'fenced' });
+                expect(competing.kind).toBe(
+                  kind === 'amount proposal' ? 'proposed' : 'rejected',
+                );
+                expect(durable.receipt).toMatchObject(
+                  kind === 'amount proposal'
+                    ? {
+                    status: 'AWAITING_CONFIRMATION',
+                    declared_amount_cents: 1250,
+                    terminal_at: null,
+                      }
+                    : {
+                    status: 'AWAITING_AMOUNT',
+                    declared_amount_cents: null,
+                    amount_proposed_at: null,
+                    terminal_at: null,
+                      },
+                );
+                if (kind === 'amount proposal') expect(durable.receipt.amount_proposed_at).toBeInstanceOf(Date);
+                expect(durable.conversation).toEqual({
+                  sibling: { keep: true },
+                  receiptAmountPointer: { ...POINTER, receiptVersion: '3' },
+                });
+                expect(outbox).toMatchObject({
+                  receipt_media_id: UUID_A,
+                  receipt_state_version: '3',
+                  source_webhook_message_id:
+                    kind === 'amount proposal'
+                      ? 'wamid.amount.propose.race'
+                      : 'wamid.amount.reject.race',
+                  recipient_id: SENDER,
+                  template_key:
+                    kind === 'amount proposal'
+                      ? 'RECEIPT_AMOUNT_CONFIRM'
+                      : 'RECEIPT_AMOUNT_REASK',
+                  dedupe_key:
+                    kind === 'amount proposal'
+                      ? `receipt-amount-confirm:${UUID_A}:2:wamid.amount.propose.race`
+                      : `receipt-amount-reask:${UUID_A}:2:wamid.amount.reject.race`,
+                });
+                    if (
+                      competing.kind !== 'proposed' &&
+                      competing.kind !== 'rejected'
+                    ) {
+                      throw new Error('competing race operation did not win');
+                    }
+                    expect(outbox.id).toBe(competing.intent.id);
+                    expect(outbox.template_args).toEqual(
+                  kind === 'amount proposal' ? { cents: 1250 } : {},
+                );
+                expect(durable.command).toEqual([]);
+              }
+            } catch (error) {
+              hasPrimaryFailure = true;
+              primaryFailure = error;
+            }
+            const cleanupErrors: Error[] = [];
+                const clean = async (
+                  label: string,
+                  operation: () => unknown,
+                ) => {
+              try {
+                await operation();
+              } catch (error) {
+                cleanupErrors.push(new Error(`${label}: ${asError(error).message}`));
+              }
+            };
+            await clean('unlock/control release', async () => {
+              await unlockControl();
+              await releaseControl(controlFailure);
+            });
+            await clean('winner/loser settlement', async () => {
+              const operations = [winner, loser].filter(
+                (promise): promise is Promise<RaceOutcome> => promise !== undefined,
+              );
+              await withDeadline(
+                'cleanup winner/loser settlement',
+                Promise.allSettled(operations),
+                RACE_SETTLEMENT_TIMEOUT_MS,
+              );
+            });
+            await clean('winner gate trigger removal', () =>
+              removeWinnerTrigger(gate),
+            );
+            await clean('winner gate function removal', () =>
+              removeWinnerFunction(gate),
+            );
+            await clean('observer release', async () => {
+              const client = observer;
+              observer = undefined;
+              await releaseRaceClient(client, observerFailure);
+            });
+            if (hasPrimaryFailure) throw primaryFailure;
+            if (cleanupErrors.length > 0) {
+              throw new AggregateError(cleanupErrors, 'race cleanup failed');
+            }
+          },
+          );
+    afterAll(reset);
+  });
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
-    await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
+    await pool.query(
+      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+    );
+    migrate('migrate:down');
+    const { rows: cancellationTables } = await pool.query<{ t: string | null }>(
+      "SELECT to_regclass('receipt_media_cancellation_commands') AS t",
+    );
+    expect(cancellationTables[0].t).toBeNull();
     migrate('migrate:down');
     for (const table of ['receipt_media', 'receipt_media_outbox']) {
       const { rows } = await pool.query<{ t: string | null }>(

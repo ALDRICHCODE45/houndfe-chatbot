@@ -79,6 +79,25 @@ export type AmountRejectionOutcome =
     }
   | { kind: 'fenced' };
 
+/** One immutable cancellation command for an active receipt amount flow. */
+export interface ReceiptCancellationInput {
+  sourceWebhookMessageId: string;
+  senderId: string;
+  receiptMediaId: string;
+  capturedSaleId: string;
+  expectedReceiptStatus: 'AWAITING_AMOUNT' | 'AWAITING_CONFIRMATION';
+  expectedReceiptVersion: string;
+  expectedPointer: ReceiptAmountPointer;
+}
+
+export type ReceiptCancellationOutcome =
+  | {
+      kind: 'cancelled' | 'replayed';
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -123,6 +142,10 @@ export interface ReceiptMediaStorePort {
   rejectProposedAmount(
     input: AmountRejectionInput,
   ): Promise<AmountRejectionOutcome>;
+  /** Atomically cancel an active amount flow and persist command provenance. */
+  cancelReceipt(
+    input: ReceiptCancellationInput,
+  ): Promise<ReceiptCancellationOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment. */
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;

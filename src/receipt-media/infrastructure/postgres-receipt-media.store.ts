@@ -19,6 +19,8 @@ import type {
   LeaseFenceInput,
   OutboxIntentInput,
   ReceiptMediaStorePort,
+  ReceiptCancellationInput,
+  ReceiptCancellationOutcome,
   ReservationOutcome,
   ReserveInput,
   StatusCasInput,
@@ -164,6 +166,51 @@ const rejectionIntentMatches = (
   row.source_webhook_message_id === input.sourceWebhookMessageId &&
   row.recipient_id === input.senderId &&
   row.template_key === 'RECEIPT_AMOUNT_REASK' &&
+  isRecord(row.template_args) &&
+  Object.keys(row.template_args).length === 0;
+
+const isCancellationInput = (
+  input: ReceiptCancellationInput,
+  successor: string | null,
+): successor is string =>
+  successor !== null &&
+  (input.expectedReceiptStatus === 'AWAITING_AMOUNT' ||
+    input.expectedReceiptStatus === 'AWAITING_CONFIRMATION') &&
+  typeof input.sourceWebhookMessageId === 'string' &&
+  input.sourceWebhookMessageId.length > 0 &&
+  typeof input.senderId === 'string' &&
+  input.senderId.length > 0 &&
+  typeof input.receiptMediaId === 'string' &&
+  UUID.test(input.receiptMediaId) &&
+  typeof input.capturedSaleId === 'string' &&
+  UUID.test(input.capturedSaleId) &&
+  isReceiptAmountPointer(input.expectedPointer) &&
+  input.expectedPointer.receiptMediaId === input.receiptMediaId &&
+  input.expectedPointer.saleId === input.capturedSaleId &&
+  input.expectedPointer.receiptVersion === input.expectedReceiptVersion;
+
+const amountStateMatches = (row: Row, status: string): boolean =>
+  status === 'AWAITING_AMOUNT'
+    ? row.declared_amount_cents === null && row.amount_proposed_at === null
+    : typeof row.declared_amount_cents === 'number' &&
+      Number.isInteger(row.declared_amount_cents) &&
+      row.declared_amount_cents > 0 &&
+      row.declared_amount_cents <= MAX_INT32 &&
+      row.amount_proposed_at instanceof Date;
+
+const cancellationIntentMatches = (
+  row: Row | undefined,
+  input: ReceiptCancellationInput,
+  successor: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === input.receiptMediaId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === input.sourceWebhookMessageId &&
+  row.recipient_id === input.senderId &&
+  row.template_key === 'RECEIPT_CANCELLED' &&
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
 
@@ -553,6 +600,192 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       });
     } catch (err) {
       if (err === FENCED) return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** One receipt-first transaction atomically cancels an active amount flow,
+   * removes its exact pointer, records the committed intent, and preserves the
+   * command needed for conservative replay validation. */
+  async cancelReceipt(
+    input: ReceiptCancellationInput,
+  ): Promise<ReceiptCancellationOutcome> {
+    const successor = successorVersion(input.expectedReceiptVersion);
+    if (!isCancellationInput(input, successor)) return { kind: 'fenced' };
+    const dedupeKey = `receipt-cancel:${input.receiptMediaId}:${input.expectedReceiptVersion}:${input.sourceWebhookMessageId}`;
+    try {
+      return await this.withTx(async (c) => {
+        const receipt = (
+          await c.query<Row>(
+            'SELECT * FROM receipt_media WHERE id = $1 FOR UPDATE',
+            [input.receiptMediaId],
+          )
+        ).rows[0];
+        const conversation = (
+          await c.query<Row>(
+            'SELECT data FROM conversation_state WHERE sender_id = $1 FOR UPDATE',
+            [input.senderId],
+          )
+        ).rows[0];
+        if (!receipt || !conversation || !isRecord(conversation.data))
+          throw FENCED;
+        const command = (
+          await c.query<Row>(
+            `SELECT * FROM receipt_media_cancellation_commands
+             WHERE receipt_media_id = $1 FOR UPDATE`,
+            [input.receiptMediaId],
+          )
+        ).rows[0];
+        const receiptMatches =
+          receipt.sender_id === input.senderId &&
+          receipt.captured_sale_id === input.capturedSaleId;
+        const commandMatches =
+          !!command &&
+          command.receipt_media_id === input.receiptMediaId &&
+          command.source_webhook_message_id === input.sourceWebhookMessageId &&
+          command.sender_id === input.senderId &&
+          command.captured_sale_id === input.capturedSaleId &&
+          command.expected_receipt_status === input.expectedReceiptStatus &&
+          command.expected_receipt_version === input.expectedReceiptVersion &&
+          command.expected_pointer_receipt_media_id ===
+            input.expectedPointer.receiptMediaId &&
+          command.expected_pointer_sale_id === input.expectedPointer.saleId &&
+          command.expected_pointer_receipt_version ===
+            input.expectedPointer.receiptVersion &&
+          command.successor_receipt_version === successor;
+        if (command) {
+          if (
+            !commandMatches ||
+            !receiptMatches ||
+            receipt.status !== 'CANCELLED' ||
+            receipt.version !== successor ||
+            !(receipt.terminal_at instanceof Date) ||
+            !amountStateMatches(receipt, input.expectedReceiptStatus) ||
+            Object.prototype.hasOwnProperty.call(
+              conversation.data,
+              'receiptAmountPointer',
+            )
+          )
+            throw FENCED;
+          const intent = (
+            await c.query<Row>(
+              'SELECT * FROM receipt_media_outbox WHERE id = $1 FOR UPDATE',
+              [command.cancellation_outbox_id],
+            )
+          ).rows[0];
+          if (!cancellationIntentMatches(intent, input, successor, dedupeKey))
+            throw FENCED;
+          return {
+            kind: 'replayed',
+            receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
+          };
+        }
+        if (
+          !receiptMatches ||
+          receipt.status !== input.expectedReceiptStatus ||
+          receipt.version !== input.expectedReceiptVersion ||
+          !amountStateMatches(receipt, input.expectedReceiptStatus) ||
+          !samePointer(
+            conversation.data.receiptAmountPointer,
+            input.expectedPointer,
+          )
+        )
+          throw FENCED;
+        const updated = await c.query<Row>(
+          `UPDATE receipt_media SET status = 'CANCELLED', terminal_at = now(),
+             version = version + 1, updated_at = now()
+           WHERE id = $1 AND sender_id = $2 AND captured_sale_id = $3
+             AND status = $4 AND version = $5::bigint
+             AND (($4 = 'AWAITING_AMOUNT' AND declared_amount_cents IS NULL
+                   AND amount_proposed_at IS NULL)
+               OR ($4 = 'AWAITING_CONFIRMATION' AND declared_amount_cents > 0
+                   AND amount_proposed_at IS NOT NULL)) RETURNING *`,
+          [
+            input.receiptMediaId,
+            input.senderId,
+            input.capturedSaleId,
+            input.expectedReceiptStatus,
+            input.expectedReceiptVersion,
+          ],
+        );
+        if (updated.rowCount !== 1) throw FENCED;
+        const pointer = await c.query(
+          `UPDATE conversation_state SET data = data - 'receiptAmountPointer'
+           WHERE sender_id = $1
+             AND jsonb_typeof(data->'receiptAmountPointer') = 'object'
+             AND data->'receiptAmountPointer' = jsonb_build_object(
+               'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
+               'saleId', data->'receiptAmountPointer'->'saleId',
+               'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
+             AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
+             AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
+             AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
+             AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
+             AND data->'receiptAmountPointer'->>'saleId' = $3
+             AND data->'receiptAmountPointer'->>'receiptVersion' = $4`,
+          [
+            input.senderId,
+            input.receiptMediaId,
+            input.capturedSaleId,
+            input.expectedReceiptVersion,
+          ],
+        );
+        if (pointer.rowCount !== 1) throw FENCED;
+        const intent = await c.query<Row>(
+          `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+             receipt_state_version, source_webhook_message_id, recipient_id,
+             template_key, template_args)
+           VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_CANCELLED', $7::jsonb)
+           ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+          [
+            randomUUID(),
+            dedupeKey,
+            input.receiptMediaId,
+            successor,
+            input.sourceWebhookMessageId,
+            input.senderId,
+            JSON.stringify({}),
+          ],
+        );
+        if (intent.rowCount !== 1) throw FENCED;
+        const provenance = await c.query(
+          `INSERT INTO receipt_media_cancellation_commands (
+             receipt_media_id, source_webhook_message_id, sender_id,
+             captured_sale_id, expected_receipt_status, expected_receipt_version,
+             expected_pointer_receipt_media_id, expected_pointer_sale_id,
+             expected_pointer_receipt_version, successor_receipt_version,
+             cancellation_outbox_id)
+           VALUES ($1, $2, $3, $4, $5, $6::bigint, $7, $8, $9::bigint,
+             $10::bigint, $11)`,
+          [
+            input.receiptMediaId,
+            input.sourceWebhookMessageId,
+            input.senderId,
+            input.capturedSaleId,
+            input.expectedReceiptStatus,
+            input.expectedReceiptVersion,
+            input.expectedPointer.receiptMediaId,
+            input.expectedPointer.saleId,
+            input.expectedPointer.receiptVersion,
+            successor,
+            intent.rows[0].id,
+          ],
+        );
+        if (provenance.rowCount !== 1) throw FENCED;
+        return {
+          kind: 'cancelled',
+          receipt: camelize<Media>(updated.rows[0]),
+          intent: camelize<ReceiptMediaOutboxRow>(intent.rows[0]),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      if (
+        (err as { constraint?: string }).constraint ===
+        'receipt_media_cancellation_commands_sender_webhook_key'
+      )
+        return { kind: 'fenced' };
       throw err;
     }
   }
