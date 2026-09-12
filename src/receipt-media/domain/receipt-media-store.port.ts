@@ -115,6 +115,19 @@ export interface StatusCasInput {
   nextStatus: ReceiptMediaStatus;
 }
 
+/** Fenced, evidence-complete RESERVED → DOWNLOADED commit. */
+export interface DownloadCommitInput extends LeaseFenceInput {
+  responseMimeType: 'image/jpeg' | 'image/png';
+  detectedMimeType: 'image/jpeg' | 'image/png';
+  byteCount: number;
+  contentSha256: Buffer;
+}
+
+/** A replay proves the exact durable successor; every other loser is fenced. */
+export type DownloadCommitOutcome = {
+  kind: 'committed' | 'replayed' | 'fenced';
+};
+
 /** Pre-call attempt start: the 1-based attempt and resulting version. */
 export interface AttemptStartResult {
   attempt: number;
@@ -155,6 +168,8 @@ export interface ReceiptMediaStorePort {
   releaseLease(input: LeaseFenceInput): Promise<boolean>;
   /** Fenced status CAS: sets next status, bumps version; loser false. */
   transitionStatus(input: StatusCasInput): Promise<boolean>;
+  /** Atomically persist download evidence while advancing the RESERVED successor. */
+  commitDownload(input: DownloadCommitInput): Promise<DownloadCommitOutcome>;
   /** Atomic pre-call Meta attempt start (max 3); loser null. */
   startMetaAttempt(input: LeaseFenceInput): Promise<AttemptStartResult | null>;
   /** Atomic pre-call storage attempt start (max 3); loser null. */

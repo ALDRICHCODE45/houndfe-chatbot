@@ -1099,6 +1099,161 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           });
         },
       );
+
+      type DownloadOutcome = { kind: 'committed' | 'replayed' | 'fenced' };
+      const download = (input: Row): Promise<DownloadOutcome> =>
+        (
+          store as unknown as {
+            commitDownload(input: Row): Promise<DownloadOutcome>;
+          }
+        ).commitDownload(input);
+      const evidence = () => ({
+        responseMimeType: 'image/jpeg',
+        detectedMimeType: 'image/jpeg',
+        byteCount: 1024,
+        contentSha256: Buffer.alloc(32, 7),
+      });
+      const downloadState = (id: string) =>
+        pool
+          .query<Row>(
+            `SELECT status, version, downloaded_at, response_mime_type,
+                   detected_mime_type, byte_count, content_sha256
+                 FROM receipt_media WHERE id = $1`,
+            [id],
+          )
+          .then((result) => result.rows[0]);
+
+      it('proves generic status CAS cannot create a schema-valid DOWNLOADED row', async () => {
+        await insert(claimRow('RESERVED'));
+        const claimed = await claim();
+        await expect(
+          store.transitionStatus({
+            id: claimed.id,
+            owner: 'w1',
+            expectedStatus: 'RESERVED',
+            expectedVersion: claimed.version,
+            nextStatus: 'DOWNLOADED',
+          }),
+        ).rejects.toThrow();
+        expect(await state(claimed.id)).toMatchObject({
+          status: 'RESERVED',
+          version: '1',
+        });
+      });
+
+      it('atomically commits complete download evidence and only exact retries replay', async () => {
+        await insert(claimRow('RESERVED'));
+        const claimed = await claim();
+        const input = { ...fence(claimed), ...evidence() };
+        await expect(download(input)).resolves.toEqual({ kind: 'committed' });
+        const committed = await downloadState(claimed.id);
+        expect(committed).toMatchObject({
+          status: 'DOWNLOADED',
+          version: '2',
+          response_mime_type: input.responseMimeType,
+          detected_mime_type: input.detectedMimeType,
+          byte_count: input.byteCount,
+          content_sha256: input.contentSha256,
+        });
+        expect(committed.downloaded_at).toBeInstanceOf(Date);
+        await expect(download(input)).resolves.toEqual({ kind: 'replayed' });
+        await expect(
+          download({ ...input, byteCount: input.byteCount + 1 }),
+        ).resolves.toEqual({ kind: 'fenced' });
+      });
+
+      it.each([
+        { expectedVersion: '9' },
+        { owner: 'w0' },
+        { responseMimeType: 'image/gif' },
+        { detectedMimeType: 'image/gif' },
+        { byteCount: 0 },
+        { contentSha256: Buffer.alloc(31, 7) },
+      ])('fences invalid evidence or a rival fence: %j', async (over) => {
+        await insert(claimRow('RESERVED'));
+        const claimed = await claim();
+        await expect(
+          download({ ...fence(claimed), ...evidence(), ...over }),
+        ).resolves.toEqual({ kind: 'fenced' });
+        expect(await state(claimed.id)).toMatchObject({
+          status: 'RESERVED',
+          version: '1',
+        });
+      });
+
+      it('rolls back the complete commit when a receipt trigger fails', async () => {
+        await insert(claimRow('RESERVED'));
+        const claimed = await claim();
+        const before = await downloadState(claimed.id);
+        await pool.query(`CREATE FUNCTION receipt_download_failure()
+          RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'receipt download failure'; END; $$`);
+        await pool.query(`CREATE TRIGGER receipt_download_failure
+          BEFORE UPDATE ON receipt_media FOR EACH ROW
+          EXECUTE FUNCTION receipt_download_failure()`);
+        try {
+          await expect(
+            download({ ...fence(claimed), ...evidence() }),
+          ).rejects.toThrow('receipt download failure');
+          expect(await downloadState(claimed.id)).toEqual(before);
+        } finally {
+          await pool.query(
+            'DROP TRIGGER IF EXISTS receipt_download_failure ON receipt_media',
+          );
+          await pool.query(
+            'DROP FUNCTION IF EXISTS receipt_download_failure()',
+          );
+        }
+      });
+
+      it('serializes duplicate commits and rejects an altered rival', async () => {
+        await insert(claimRow('RESERVED'));
+        const claimed = await claim();
+        const input = { ...fence(claimed), ...evidence() };
+        const outcomes = await Promise.all([download(input), download(input)]);
+        expect(outcomes.map((outcome) => outcome.kind).sort()).toEqual([
+          'committed',
+          'replayed',
+        ]);
+        await expect(
+          download({ ...input, contentSha256: Buffer.alloc(32, 8) }),
+        ).resolves.toEqual({ kind: 'fenced' });
+      });
+
+      it('fences expired and wrong-starting rows without partial evidence', async () => {
+        await insert(claimRow('RESERVED'));
+        const expired = await claim();
+        await expire(expired.id);
+        await expect(
+          download({ ...fence(expired), ...evidence() }),
+        ).resolves.toEqual({ kind: 'fenced' });
+        const wrong = claimRow('STORED');
+        const wrongId = wrong.id as string;
+        await insert(wrong);
+        await pool.query(
+          "UPDATE receipt_media SET lease_owner = 'w2', " +
+            "lease_expires_at = now() + interval '60 seconds' WHERE id = $1",
+          [wrongId],
+        );
+        const before = await downloadState(wrongId);
+        await expect(
+          download({
+            id: wrongId,
+            owner: 'w2',
+            expectedVersion: '0',
+            ...evidence(),
+          }),
+        ).resolves.toEqual({ kind: 'fenced' });
+
+        expect(await downloadState(expired.id)).toMatchObject({
+          downloaded_at: null,
+          response_mime_type: null,
+          detected_mime_type: null,
+          byte_count: null,
+          content_sha256: null,
+        });
+        expect(await downloadState(wrongId)).toEqual(before);
+      });
     });
   });
 

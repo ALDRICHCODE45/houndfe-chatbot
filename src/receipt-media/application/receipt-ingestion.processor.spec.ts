@@ -10,6 +10,8 @@ import {
 import { ReceiptMediaError } from '../domain/receipt-media.errors';
 import type {
   AttemptStartResult,
+  DownloadCommitInput,
+  DownloadCommitOutcome,
   LeaseFenceInput,
   OutboxIntentInput,
   StatusCasInput,
@@ -89,7 +91,12 @@ const fixture = (over: Partial<ReceiptMediaRow> = {}) => {
     transitionStatus: jest.fn<Promise<boolean>, [StatusCasInput]>(() =>
       Promise.resolve(true),
     ),
+    commitDownload: jest.fn<
+      Promise<DownloadCommitOutcome>,
+      [DownloadCommitInput]
+    >(() => Promise.resolve({ kind: 'committed' })),
   };
+
   const processor = new ReceiptIngestionProcessor(meta, storage, store, tx2);
   return {
     receipt,
@@ -134,7 +141,7 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
     release({ attempt: 1, version: '2' });
     await flush();
     expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(f.store.transitionStatus).not.toHaveBeenCalled();
+    expect(f.store.commitDownload).not.toHaveBeenCalled();
     expect(settled).toBe(false);
     releaseCleanup();
     const seq = [
@@ -143,10 +150,49 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
     ];
     seq.push(
       f.cleanup.mock.invocationCallOrder[0],
-      f.store.transitionStatus.mock.invocationCallOrder[0],
+      f.store.commitDownload.mock.invocationCallOrder[0],
     );
     expect([...seq].sort((a, b) => a - b)).toEqual(seq);
     await expect(run).resolves.toEqual({ kind: 'downloaded' });
+  });
+
+  it('commits only validated download evidence after cleanup with no R2 behavior', async () => {
+    const f = fixture();
+    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
+      kind: 'downloaded',
+    });
+    expect(f.store.commitDownload).toHaveBeenCalledWith({
+      id: 'r1',
+      owner: 'w1',
+      expectedVersion: '2',
+      responseMimeType: 'image/jpeg',
+      detectedMimeType: 'image/jpeg',
+      byteCount: 5,
+      contentSha256: Buffer.alloc(32, 7),
+    });
+    expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
+    expect(f.store.transitionStatus).not.toHaveBeenCalled();
+  });
+
+  it('propagates a store error only after required cleanup', async () => {
+    const f = fixture();
+    f.store.commitDownload.mockRejectedValue(new Error('db-down'));
+    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
+      'db-down',
+    );
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.storage.put).not.toHaveBeenCalled();
+  });
+
+  it('treats a proven store replay as a closed download success', async () => {
+    const f = fixture();
+    f.store.commitDownload.mockResolvedValue({ kind: 'replayed' });
+    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
+      kind: 'downloaded',
+    });
+    expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
   });
 
   it('runs Meta on attempts 1/2/3 and a null CAS blocks the fourth', async () => {
@@ -163,7 +209,7 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
     });
     expect(f.store.startMetaAttempt).toHaveBeenCalledTimes(4);
     expect(f.meta.resolveAndDownload).toHaveBeenCalledTimes(3);
-    expect(f.store.transitionStatus).toHaveBeenCalledTimes(3);
+    expect(f.store.commitDownload).toHaveBeenCalledTimes(3);
   });
 
   it('fails safe with no transition when temp cleanup rejects', async () => {
@@ -172,19 +218,19 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
     await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
       kind: 'cleanup-failed',
     });
-    expect(f.store.transitionStatus).not.toHaveBeenCalled();
+    expect(f.store.commitDownload).not.toHaveBeenCalled();
   });
 
   it('cleans up and stops without stale mutation when the fence is lost', async () => {
     const f = fixture();
-    f.store.transitionStatus.mockResolvedValue(false);
+    f.store.commitDownload.mockResolvedValue({ kind: 'fenced' });
     expect(await f.processor.process(f.receipt, 'w1')).toEqual({
       kind: 'fence-lost',
       stage: 'download',
     });
     expect(f.cleanup).toHaveBeenCalledTimes(1);
     expect(f.store.startMetaAttempt).toHaveBeenCalledTimes(1);
-    expect(f.store.transitionStatus).toHaveBeenCalledTimes(1);
+    expect(f.store.commitDownload).toHaveBeenCalledTimes(1);
   });
 
   it('maps Meta validation failure to a fixed meta-failed stage', async () => {
@@ -197,7 +243,7 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
       code: 'MIME_MISMATCH',
     });
     expect(f.cleanup).not.toHaveBeenCalled();
-    expect(f.store.transitionStatus).not.toHaveBeenCalled();
+    expect(f.store.commitDownload).not.toHaveBeenCalled();
   });
 });
 
@@ -431,7 +477,7 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
       await f.processor.process(f.receipt, 'w1', controller.signal),
     ).toEqual({ kind: 'aborted', stage: 'meta' });
     expect(seen).toBe(controller.signal);
-    expect(f.store.transitionStatus).not.toHaveBeenCalled();
+    expect(f.store.commitDownload).not.toHaveBeenCalled();
   });
 
   it('aborts the storage retry loop without consuming further attempts', async () => {

@@ -39,7 +39,7 @@ export class ReceiptIngestionProcessor {
     private readonly storage: Pick<ObjectStoragePort, 'put'>,
     private readonly store: Pick<
       ReceiptMediaStorePort,
-      'startMetaAttempt' | 'startStorageAttempt' | 'transitionStatus'
+      'startMetaAttempt' | 'startStorageAttempt' | 'commitDownload'
     >,
     private readonly tx2: ReceiptTx2CommitPort,
   ) {
@@ -100,13 +100,15 @@ export class ReceiptIngestionProcessor {
     } catch {
       return { kind: 'cleanup-failed' };
     }
-    const moved = await this.store.transitionStatus({
+    const moved = await this.store.commitDownload({
       ...fence,
       expectedVersion: start.version,
-      expectedStatus: 'RESERVED',
-      nextStatus: 'DOWNLOADED',
+      responseMimeType: file.mimeType,
+      detectedMimeType: file.mimeType,
+      byteCount: file.byteCount,
+      contentSha256: file.sha256,
     });
-    return moved
+    return moved.kind === 'committed' || moved.kind === 'replayed'
       ? { kind: 'downloaded' }
       : { kind: 'fence-lost', stage: 'download' };
   }

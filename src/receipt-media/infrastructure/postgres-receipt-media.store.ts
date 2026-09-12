@@ -15,6 +15,8 @@ import type {
   AmountRejectionOutcome,
   AttemptStartResult,
   CapabilityAccessRow,
+  DownloadCommitInput,
+  DownloadCommitOutcome,
   DedupeOutcome,
   LeaseFenceInput,
   OutboxIntentInput,
@@ -43,6 +45,13 @@ const RELEASE_SQL = `UPDATE receipt_media SET lease_owner = NULL, lease_expires_
 const CAS_SQL = `UPDATE receipt_media SET status = $5, version = version + 1,
      updated_at = now() WHERE id = $1 AND lease_owner = $2 AND status = $3
      AND version = $4::bigint AND lease_expires_at > now()`;
+
+const DOWNLOAD_COMMIT_SQL = `UPDATE receipt_media
+  SET status = 'DOWNLOADED', downloaded_at = now(), response_mime_type = $4,
+      detected_mime_type = $5, byte_count = $6, content_sha256 = $7,
+      version = version + 1, updated_at = now()
+  WHERE id = $1 AND lease_owner = $2 AND status = 'RESERVED'
+    AND version = $3::bigint AND lease_expires_at > now() RETURNING *`;
 
 const META_ATTEMPT_SQL = `UPDATE receipt_media
    SET meta_attempts = meta_attempts + 1, version = version + 1, updated_at = now()
@@ -87,6 +96,40 @@ const successorVersion = (value: string): string | null => {
   const parsed = BigInt(value);
   return parsed < MAX_BIGINT ? String(parsed + 1n) : null;
 };
+
+const isDownloadInput = (
+  input: DownloadCommitInput,
+  successor: string | null,
+): successor is string => {
+  try {
+    return (
+      successor !== null &&
+      typeof input.id === 'string' &&
+      input.id.length > 0 &&
+      typeof input.owner === 'string' &&
+      input.owner.length > 0 &&
+      (input.responseMimeType === 'image/jpeg' ||
+        input.responseMimeType === 'image/png') &&
+      (input.detectedMimeType === 'image/jpeg' ||
+        input.detectedMimeType === 'image/png') &&
+      Number.isInteger(input.byteCount) &&
+      input.byteCount > 0 &&
+      input.byteCount <= MAX_INT32 &&
+      ArrayBuffer.isView(input.contentSha256) &&
+      Buffer.isBuffer(input.contentSha256) &&
+      input.contentSha256.length === RECEIPT_SHA256_BYTES
+    );
+  } catch {
+    return false;
+  }
+};
+
+const sameDownloadEvidence = (row: Row, input: DownloadCommitInput) =>
+  row.response_mime_type === input.responseMimeType &&
+  row.detected_mime_type === input.detectedMimeType &&
+  row.byte_count === input.byteCount &&
+  Buffer.isBuffer(row.content_sha256) &&
+  Buffer.compare(row.content_sha256, input.contentSha256) === 0;
 
 const samePointer = (value: unknown, expected: ReceiptAmountPointer) =>
   isReceiptAmountPointer(value) &&
@@ -862,6 +905,41 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         input.nextStatus,
       ]);
       return rowCount === 1;
+    });
+  }
+
+  /** WU8R1: one evidence-complete fenced commit. Only a durable successor
+   * with the same lease identity and byte-exact evidence is a replay. */
+  async commitDownload(
+    input: DownloadCommitInput,
+  ): Promise<DownloadCommitOutcome> {
+    const successor = successorVersion(input.expectedVersion);
+    if (!isDownloadInput(input, successor)) return { kind: 'fenced' };
+    return this.withTx(async (c) => {
+      const params = [
+        input.id,
+        input.owner,
+        input.expectedVersion,
+        input.responseMimeType,
+        input.detectedMimeType,
+        input.byteCount,
+        input.contentSha256,
+      ];
+      const updated = await c.query<Row>(DOWNLOAD_COMMIT_SQL, params);
+      if (updated.rowCount === 1) return { kind: 'committed' };
+      const current = (
+        await c.query<Row>(
+          `SELECT status, version, response_mime_type, detected_mime_type,
+             byte_count, content_sha256 FROM receipt_media
+           WHERE id = $1 AND lease_owner = $2 AND lease_expires_at > now()`,
+          [input.id, input.owner],
+        )
+      ).rows[0];
+      return current?.status === 'DOWNLOADED' &&
+        current.version === successor &&
+        sameDownloadEvidence(current, input)
+        ? { kind: 'replayed' }
+        : { kind: 'fenced' };
     });
   }
 
