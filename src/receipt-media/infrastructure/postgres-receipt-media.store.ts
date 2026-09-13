@@ -15,6 +15,8 @@ import type {
   AmountProposalOutcome,
   AmountRejectionInput,
   AmountRejectionOutcome,
+  AttachRequestStartInput,
+  AttachRequestStartOutcome,
   AttachStartInput,
   AttachStartOutcome,
   AttemptStartResult,
@@ -88,6 +90,21 @@ const REVOKE_CAPABILITY_SQL = `UPDATE receipt_media
        SET capability_revoked_at = now(), updated_at = now()
        WHERE id = $1 AND capability_token_hash IS NOT NULL
          AND capability_revoked_at IS NULL`;
+
+const ATTACH_REQUEST_START_SQL = `UPDATE receipt_media
+           SET attach_request_started_at = now(),
+             attach_attempt_id = $4, attach_attempts = attach_attempts + 1,
+             version = version + 1, updated_at = now()
+           WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+             AND lease_expires_at > now() AND status = 'ATTACHING'
+             AND attach_attempts = 0 AND attach_request_started_at IS NULL
+             AND attach_attempt_id IS NULL RETURNING *`;
+
+const ATTACH_REQUEST_LOOK_SQL = `SELECT * FROM receipt_media
+           WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+             AND lease_expires_at > now() AND status = 'ATTACHING'
+             AND attach_attempt_id IS NOT NULL
+             AND attach_request_started_at IS NOT NULL`;
 
 const MAX_INT32 = 2_147_483_647;
 const MAX_BIGINT = 9_223_372_036_854_775_807n;
@@ -1068,11 +1085,71 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     }
   }
 
+  /** WU11A1: one atomic, parameter-bound fenced UPDATE stamps request
+   * evidence exactly when the row is the exact active ATTACHING receipt
+   * under the caller's live lease with no prior request evidence; every
+   * other caller — including the loser of a concurrent race or an exact
+   * repeat — is fenced or surfaces the crash window (never re-POSTs).
+   * Unrelated durable fields are never written; DB errors propagate. */
+  async startAttachRequest(
+    input: AttachRequestStartInput,
+  ): Promise<AttachRequestStartOutcome> {
+    const evidenceComplete =
+      typeof input?.id === 'string' &&
+      UUID.test(input.id) &&
+      typeof input?.owner === 'string' &&
+      input.owner.length > 0 &&
+      typeof input?.attachAttemptId === 'string' &&
+      UUID.test(input.attachAttemptId) &&
+      /^[1-9]\d*(?![\s\S])/.test(String(input?.expectedVersion ?? ''));
+    if (!evidenceComplete) return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const updated = await c.query<Row>(ATTACH_REQUEST_START_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          input.attachAttemptId,
+        ]);
+        if (updated.rowCount !== 1) {
+          const crashed = (
+            await c.query<Row>(ATTACH_REQUEST_LOOK_SQL, [
+              input.id,
+              input.owner,
+              input.expectedVersion,
+            ])
+          ).rows[0];
+          if (crashed)
+            return {
+              kind: 'crashed-before-post',
+              attachAttemptId: crashed.attach_attempt_id as string,
+              version: String(crashed.version),
+              receipt: camelize<Media>(crashed),
+            };
+          return { kind: 'fenced' };
+        }
+        const receipt = updated.rows[0];
+        return {
+          kind: 'started',
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
+        };
+      });
+    } catch (err) {
+      if (
+        typeof (err as { code?: string }).code === 'string' &&
+        (err as { code?: string }).code === '22P02'
+      )
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
   /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE
    * SKIP LOCKED, bounded batch, deterministic next_attempt_at/created_at
    * ordering, 60-second lease, and version increment. Eligibility exactly:
    * RESERVED with meta<3; DOWNLOADED with storage<3 and meta<3; plain STORED
-   * regardless of counters; pre-request ATTACHING. */
+   * regardless of counters; ATTACHING (post-crash included) for fix-forward. */
   async claimBatch(limit: number, owner: string): Promise<Media[]> {
     return this.withTx(async (c) => {
       const { rows } = await c.query<Row>(
@@ -1084,8 +1161,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
                OR (status = 'DOWNLOADED'
                  AND storage_attempts < 3 AND meta_attempts < 3)
                OR status = 'STORED'
-               OR (status = 'ATTACHING' AND attach_attempts = 0
-                 AND attach_request_started_at IS NULL))
+               OR (status = 'ATTACHING'))
            ORDER BY next_attempt_at, created_at
            FOR UPDATE SKIP LOCKED LIMIT $1
          )

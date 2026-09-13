@@ -8,6 +8,7 @@ import type {
   AmountProposalOutcome,
   AmountRejectionInput,
   AmountRejectionOutcome,
+  AttachRequestStartInput,
   AttachStartInput,
   AttachStartOutcome,
   AttemptStartResult,
@@ -868,7 +869,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ['DOWNLOADED', { storage_attempts: 3 }, false],
       ['STORED', { meta_attempts: 3, storage_attempts: 3 }, true],
       ['ATTACHING', {}, true],
-      ['ATTACHING', attachEvidence, false],
+      ['ATTACHING', { ...attachEvidence, next_attempt_at: FUTURE }, false],
       ['RESERVED', { next_attempt_at: FUTURE }, false],
       ['RESERVED', { lease_owner: 'w0', lease_expires_at: FUTURE }, false],
       ['RESERVED', { lease_owner: 'w0', lease_expires_at: PAST }, true],
@@ -3987,6 +3988,205 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       });
       expect(durable.conversation).toEqual({ sibling: { keep: true } });
       expect(durable.outbox).toHaveLength(1);
+    });
+  });
+  describe('WU11A1 atomic attach request start', () => {
+    const OWNER = 'worker.request-start';
+    const REQUEST_ID = UUID_B;
+    const command = (
+      over: Partial<AttachRequestStartInput> = {},
+    ): AttachRequestStartInput => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '4',
+      attachAttemptId: REQUEST_ID,
+      ...over,
+    });
+    const seed = async (receiptOver: Row = {}) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const receipt = lifeRow('ATTACHING', null, {
+        sender_id: 'sender.request-start',
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '4',
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const expectFenced = async (input: AttachRequestStartInput) => {
+      const before = await row();
+      await expect(store.startAttachRequest(input)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await row()).toEqual(before);
+    };
+    const expectRecovery = async (
+      input: AttachRequestStartInput,
+      expectedAttemptId: string,
+    ) => {
+      const before = await row();
+      const outcome = await store.startAttachRequest(input);
+      expect(outcome).toMatchObject({
+        kind: 'crashed-before-post',
+        attachAttemptId: expectedAttemptId,
+        version: before.version,
+        receipt: { id: before.id, status: 'ATTACHING' },
+      });
+      expect(await row()).toEqual(before);
+    };
+
+    it('persists request evidence exactly once and returns the successor to the winner', async () => {
+      await seed();
+      const outcome = await store.startAttachRequest(command());
+      expect(outcome).toMatchObject({
+        kind: 'started',
+        version: '5',
+        receipt: {
+          id: UUID_A,
+          status: 'ATTACHING',
+          version: '5',
+          attachAttempts: 1,
+          attachAttemptId: REQUEST_ID,
+        },
+      });
+      if (outcome.kind !== 'started') throw new Error('expected start');
+      expect(outcome.receipt.attachRequestStartedAt).toBeInstanceOf(Date);
+      const after = await row();
+      expect(after).toMatchObject({
+        attach_attempts: 1,
+        version: '5',
+        attach_attempt_id: REQUEST_ID,
+      });
+      expect(after.attach_request_started_at).toBeInstanceOf(Date);
+    });
+
+    it('preserves captured sale, object, amount, and every unrelated durable field', async () => {
+      const seeded = await seed();
+      const outcome = await store.startAttachRequest(command());
+      expect(outcome.kind).toBe('started');
+      const after = await row();
+      for (const key of Object.keys(seeded)) {
+        if (
+          [
+            'version',
+            'updated_at',
+            'attach_attempts',
+            'attach_attempt_id',
+            'attach_request_started_at',
+          ].includes(key)
+        )
+          continue;
+        expect(after[key]).toEqual(seeded[key]);
+      }
+    });
+
+    it('fences wrong and rival fences without durable mutation', async () => {
+      await seed();
+      await expectFenced(command({ owner: 'worker.rival' }));
+      await expectFenced(command({ expectedVersion: '3' }));
+      await expectFenced(command({ expectedVersion: '9' }));
+      await expectFenced(command({ id: UUID_C }));
+      await expectFenced(command({ attachAttemptId: 'not-a-uuid' }));
+      await expectFenced(command({ attachAttemptId: '' }));
+    });
+
+    it('fences non-pre-request states without durable mutation', async () => {
+      await seed({ status: 'STORED', attach_started_at: null });
+      await expectFenced(command());
+      await seed({ lease_expires_at: new Date(Date.now() - 60_000) });
+      await expectFenced(command());
+      await seed({
+        status: 'ATTACHED',
+        attach_attempt_id: UUID_C,
+        attach_request_started_at: T0,
+        attach_attempts: 1,
+        attached_at: T0,
+        backend_receipt_id: UUID_B,
+        backend_receipt_status: 'PENDING',
+      });
+      await expectFenced(command());
+      await seed({
+        status: 'ATTACHING',
+        attach_attempt_id: UUID_C,
+        attach_request_started_at: T0,
+        attach_attempts: 1,
+        lease_expires_at: new Date(Date.now() - 60_000),
+      });
+      await expectFenced(command());
+    });
+
+    it('fences an exact repeat and never authorizes a second POST', async () => {
+      await seed();
+      expect((await store.startAttachRequest(command())).kind).toBe('started');
+      await expectFenced(command());
+      expect(await row()).toMatchObject({
+        attach_attempts: 1,
+        version: '5',
+        attach_attempt_id: REQUEST_ID,
+      });
+    });
+
+    it('arbitrates concurrent duplicates to exactly one winner', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        store.startAttachRequest(command()),
+        store.startAttachRequest(command({ attachAttemptId: UUID_C })),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['fenced', 'started']);
+      expect(await row()).toMatchObject({ attach_attempts: 1, version: '5' });
+      await seed();
+      const [c, d] = await Promise.all([
+        store.startAttachRequest(command()),
+        store.startAttachRequest(command()),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['fenced', 'started']);
+      const after = await row();
+      expect(after).toMatchObject({
+        attach_attempts: 1,
+        version: '5',
+        attach_attempt_id: REQUEST_ID,
+      });
+    });
+
+    it('recovers the crash window without ever re-authorizing the POST', async () => {
+      // Same-owner repeat at the successor version: non-POST recovery,
+      // stable across repeats, original attempt identity preserved.
+      await seed();
+      expect((await store.startAttachRequest(command())).kind).toBe('started');
+      await expectRecovery(command({ expectedVersion: '5' }), REQUEST_ID);
+      await expectRecovery(command({ expectedVersion: '5' }), REQUEST_ID);
+      await expectFenced(command());
+      // Simulated crash → lease expiry → reclaim by a new owner → the
+      // new owner receives the same non-POST recovery outcome with the
+      // preserved attempt identity; rivals and stale fences stay fenced.
+      await seed();
+      expect((await store.startAttachRequest(command())).kind).toBe('started');
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      const [reclaimed] = await store.claimBatch(1, 'worker.r2');
+      // prettier-ignore
+      expect(reclaimed).toMatchObject({ id: UUID_A, status: 'ATTACHING', version: '6', attachAttempts: 1, attachAttemptId: REQUEST_ID });
+      await expectRecovery(
+        command({ owner: 'worker.r2', expectedVersion: '6' }),
+        REQUEST_ID,
+      );
+      await expectFenced(command({ owner: 'worker.r3', expectedVersion: '6' }));
     });
   });
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {

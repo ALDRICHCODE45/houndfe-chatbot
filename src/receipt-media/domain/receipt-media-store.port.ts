@@ -119,6 +119,25 @@ export type AttachStartOutcome =
     }
   | { kind: 'fenced' };
 
+/** One immutable pre-request evidence command for the exact active
+ * ATTACHING receipt. The caller supplies only the fresh request UUID;
+ * every fence comes from the durable row. */
+export interface AttachRequestStartInput extends LeaseFenceInput {
+  attachAttemptId: string;
+}
+
+/** One winner; everyone else — including a lease-fence holder over
+ * already-persisted request evidence — is non-POST (never re-POSTs). */
+export type AttachRequestStartOutcome =
+  | { kind: 'started'; version: string; receipt: ReceiptMediaRow }
+  | {
+      kind: 'crashed-before-post';
+      attachAttemptId: string;
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -200,8 +219,18 @@ export interface ReceiptMediaStorePort {
   /** Atomically start the attachment (AWAITING_CONFIRMATION → ATTACHING),
    * clear the exact pointer, and insert the in-progress intent. */
   startAttachment(input: AttachStartInput): Promise<AttachStartOutcome>;
+  /** WU11A1 pre-request evidence: atomically stamp
+   * attach_request_started_at, persist the request UUID, and increment
+   * attach_attempts exactly once. Losers return fenced and never
+   * authorize another POST; a live-lease holder over persisted request
+   * evidence (crash before POST) gets the non-POST recovery outcome
+   * carrying the durable attempt identity. */
+  startAttachRequest(
+    input: AttachRequestStartInput,
+  ): Promise<AttachRequestStartOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
-   * next_attempt_at/created_at order, 60-second lease, version increment. */
+   * next_attempt_at/created_at order, 60-second lease, version increment;
+   * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;
   /** Extends a live owned lease (no version change). */
   renewLease(input: LeaseFenceInput): Promise<boolean>;
