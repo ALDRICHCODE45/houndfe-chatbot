@@ -275,8 +275,6 @@ const isCancellationInput = (
   successor: string | null,
 ): successor is string =>
   successor !== null &&
-  (input.expectedReceiptStatus === 'AWAITING_AMOUNT' ||
-    input.expectedReceiptStatus === 'AWAITING_CONFIRMATION') &&
   typeof input.sourceWebhookMessageId === 'string' &&
   input.sourceWebhookMessageId.length > 0 &&
   typeof input.senderId === 'string' &&
@@ -317,6 +315,17 @@ const amountStateMatches = (row: Row, status: string): boolean =>
       row.declared_amount_cents > 0 &&
       row.declared_amount_cents <= MAX_INT32 &&
       row.amount_proposed_at instanceof Date;
+
+/** Derives the one active amount phase a row's evidence belongs to; null
+ * means the evidence matches neither active state and must fence. */
+const activeAmountStatus = (
+  row: Row,
+): 'AWAITING_AMOUNT' | 'AWAITING_CONFIRMATION' | null =>
+  amountStateMatches(row, 'AWAITING_AMOUNT')
+    ? 'AWAITING_AMOUNT'
+    : amountStateMatches(row, 'AWAITING_CONFIRMATION')
+      ? 'AWAITING_CONFIRMATION'
+      : null;
 
 const cancellationIntentMatches = (
   row: Row | undefined,
@@ -740,9 +749,12 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     }
   }
 
-  /** One receipt-first transaction atomically cancels an active amount flow,
-   * removes its exact pointer, records the committed intent, and preserves the
-   * command needed for conservative replay validation. */
+  /** One receipt-first transaction atomically cancels whichever active
+   * amount flow the locked receipt proves, removes its exact pointer,
+   * records the committed intent, and preserves the command needed for
+   * conservative replay validation. The caller supplies no phase: the
+   * active state is derived inside the transaction and never retried
+   * once fenced. */
   async cancelReceipt(
     input: ReceiptCancellationInput,
   ): Promise<ReceiptCancellationOutcome> {
@@ -775,13 +787,15 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         const receiptMatches =
           receipt.sender_id === input.senderId &&
           receipt.captured_sale_id === input.capturedSaleId;
+        const cancelledAmountStatus =
+          receipt.status === 'CANCELLED' ? activeAmountStatus(receipt) : null;
         const commandMatches =
           !!command &&
           command.receipt_media_id === input.receiptMediaId &&
           command.source_webhook_message_id === input.sourceWebhookMessageId &&
           command.sender_id === input.senderId &&
           command.captured_sale_id === input.capturedSaleId &&
-          command.expected_receipt_status === input.expectedReceiptStatus &&
+          command.expected_receipt_status === cancelledAmountStatus &&
           command.expected_receipt_version === input.expectedReceiptVersion &&
           command.expected_pointer_receipt_media_id ===
             input.expectedPointer.receiptMediaId &&
@@ -796,7 +810,6 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             receipt.status !== 'CANCELLED' ||
             receipt.version !== successor ||
             !(receipt.terminal_at instanceof Date) ||
-            !amountStateMatches(receipt, input.expectedReceiptStatus) ||
             Object.prototype.hasOwnProperty.call(
               conversation.data,
               'receiptAmountPointer',
@@ -819,15 +832,17 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         }
         if (
           !receiptMatches ||
-          receipt.status !== input.expectedReceiptStatus ||
+          (receipt.status !== 'AWAITING_AMOUNT' &&
+            receipt.status !== 'AWAITING_CONFIRMATION') ||
+          activeAmountStatus(receipt) !== receipt.status ||
           receipt.version !== input.expectedReceiptVersion ||
-          !amountStateMatches(receipt, input.expectedReceiptStatus) ||
           !samePointer(
             conversation.data.receiptAmountPointer,
             input.expectedPointer,
           )
         )
           throw FENCED;
+        const activeStatus = receipt.status;
         const updated = await c.query<Row>(
           `UPDATE receipt_media SET status = 'CANCELLED', terminal_at = now(),
              version = version + 1, updated_at = now()
@@ -841,7 +856,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             input.receiptMediaId,
             input.senderId,
             input.capturedSaleId,
-            input.expectedReceiptStatus,
+            activeStatus,
             input.expectedReceiptVersion,
           ],
         );
@@ -899,7 +914,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             input.sourceWebhookMessageId,
             input.senderId,
             input.capturedSaleId,
-            input.expectedReceiptStatus,
+            activeStatus,
             input.expectedReceiptVersion,
             input.expectedPointer.receiptMediaId,
             input.expectedPointer.saleId,

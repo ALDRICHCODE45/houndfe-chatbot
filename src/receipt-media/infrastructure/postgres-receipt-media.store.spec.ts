@@ -2774,7 +2774,6 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       senderId: SENDER,
       receiptMediaId: UUID_A,
       capturedSaleId: UUID_B,
-      expectedReceiptStatus: 'AWAITING_AMOUNT',
       expectedReceiptVersion: '2',
       expectedPointer: POINTER,
       ...over,
@@ -2811,7 +2810,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ]);
     };
     const seed = async (
-      status: CancellationInput['expectedReceiptStatus'] = 'AWAITING_AMOUNT',
+      status: 'AWAITING_AMOUNT' | 'AWAITING_CONFIRMATION' = 'AWAITING_AMOUNT',
       data: unknown = {
         sibling: { keep: true },
         receiptAmountPointer: POINTER,
@@ -2948,12 +2947,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       async (status) => {
         await seed(status);
         const before = await snapshot();
-        const outcome = await cancel(
-          cancellationStore,
-          command({
-            expectedReceiptStatus: status,
-          }),
-        );
+        const outcome = await cancel(cancellationStore, command());
         expect(outcome).toMatchObject({
           kind: 'cancelled',
           receipt: { id: UUID_A, status: 'CANCELLED', version: '3' },
@@ -3013,10 +3007,6 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ['same webhook with wrong receipt', { receiptMediaId: UUID_C }],
       ['same webhook with wrong sale', { capturedSaleId: UUID_C }],
       [
-        'same webhook with wrong source status',
-        { expectedReceiptStatus: 'AWAITING_CONFIRMATION' },
-      ],
-      [
         'same webhook with wrong source version',
         { expectedReceiptVersion: '1' },
       ],
@@ -3067,9 +3057,32 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         await expectFenced(input);
       },
     );
+    it.each<[string, 'AWAITING_AMOUNT' | 'AWAITING_CONFIRMATION', Row]>([
+      [
+        'AWAITING_AMOUNT row with a stray proposal timestamp',
+        'AWAITING_AMOUNT',
+        { amount_proposed_at: T0 },
+      ],
+      [
+        'AWAITING_CONFIRMATION row without a proposal timestamp',
+        'AWAITING_CONFIRMATION',
+        { amount_proposed_at: null },
+      ],
+      ['non-active STORED receipt', 'AWAITING_AMOUNT', { status: 'STORED' }],
+    ])(
+      'fences a %s whose phase cannot be derived from the locked row',
+      async (_label, status, receiptOver) => {
+        await seed(
+          status,
+          { sibling: { keep: true }, receiptAmountPointer: POINTER },
+          receiptOver,
+        );
+        await expectFenced(command());
+      },
+    );
     it('replays only exact durable provenance after adapter recreation and fences legacy or malformed evidence', async () => {
       await seed('AWAITING_CONFIRMATION');
-      const input = command({ expectedReceiptStatus: 'AWAITING_CONFIRMATION' });
+      const input = command();
       expect((await cancel(cancellationStore, input)).kind).toBe('cancelled');
       const recreated = new PostgresReceiptMediaStore(
         pool,
@@ -3470,7 +3483,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     // prettier-ignore
     it.each<[
               string,
-          CancellationInput['expectedReceiptStatus'],
+          'AWAITING_AMOUNT' | 'AWAITING_CONFIRMATION',
           RaceKind,
           RaceWinner,
           WinnerGate,
@@ -3577,10 +3590,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
                       expectedPointer: POINTER,
                     });
               const cancellation = (): Promise<RaceOutcome> =>
-                cancel(
-                  cancellationStore,
-                  command({ expectedReceiptStatus: status }),
-                );
+                cancel(cancellationStore, command());
               winner =
                 intendedWinner === 'cancellation'
                   ? cancellation()

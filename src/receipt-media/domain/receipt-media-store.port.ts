@@ -79,13 +79,15 @@ export type AmountRejectionOutcome =
     }
   | { kind: 'fenced' };
 
-/** One immutable cancellation command for an active receipt amount flow. */
+/** One immutable cancellation command for an active receipt amount flow.
+ * The caller never selects the phase: the store derives and validates the
+ * active amount state (AWAITING_AMOUNT or AWAITING_CONFIRMATION) inside
+ * its locked transaction; every other state is fenced. */
 export interface ReceiptCancellationInput {
   sourceWebhookMessageId: string;
   senderId: string;
   receiptMediaId: string;
   capturedSaleId: string;
-  expectedReceiptStatus: 'AWAITING_AMOUNT' | 'AWAITING_CONFIRMATION';
   expectedReceiptVersion: string;
   expectedPointer: ReceiptAmountPointer;
 }
