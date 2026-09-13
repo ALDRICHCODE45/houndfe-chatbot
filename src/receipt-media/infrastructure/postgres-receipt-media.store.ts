@@ -15,6 +15,8 @@ import type {
   AmountProposalOutcome,
   AmountRejectionInput,
   AmountRejectionOutcome,
+  AttachCommitSuccessInput,
+  AttachCommitSuccessOutcome,
   AttachRequestStartInput,
   AttachRequestStartOutcome,
   AttachStartInput,
@@ -105,6 +107,21 @@ const ATTACH_REQUEST_LOOK_SQL = `SELECT * FROM receipt_media
              AND lease_expires_at > now() AND status = 'ATTACHING'
              AND attach_attempt_id IS NOT NULL
              AND attach_request_started_at IS NOT NULL`;
+
+const ATTACH_COMMIT_SUCCESS_SQL = `UPDATE receipt_media
+           SET status = 'ATTACHED', backend_receipt_id = $5,
+             backend_receipt_status = 'PENDING', attached_at = now(),
+             version = version + 1, updated_at = now()
+           WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+             AND lease_expires_at > now() AND status = 'ATTACHING'
+             AND attach_attempts = 1 AND attach_attempt_id = $4
+             AND attach_request_started_at IS NOT NULL
+             AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
+             AND attached_at IS NULL RETURNING *`;
+
+const ATTACH_SUCCESS_LOOK_SQL = `SELECT * FROM receipt_media
+           WHERE id = $1 AND lease_owner = $2
+             AND lease_expires_at > now()`;
 
 const MAX_INT32 = 2_147_483_647;
 const MAX_BIGINT = 9_223_372_036_854_775_807n;
@@ -1134,6 +1151,77 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           version: String(receipt.version),
           receipt: camelize<Media>(receipt),
         };
+      });
+    } catch (err) {
+      if (
+        typeof (err as { code?: string }).code === 'string' &&
+        (err as { code?: string }).code === '22P02'
+      )
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** WU11A2: one atomic, parameter-bound fenced UPDATE transitions the exact
+   * active ATTACHING row with prior request evidence and the matching
+   * durable attach-attempt identity to ATTACHED under the caller's live
+   * lease, persisting only backend_receipt_id, the fixed PENDING backend
+   * status, and attached_at. Only the exact durable successor with the
+   * same attempt identity, backend evidence, and successor version replays
+   * (the original stale fence replays too: the same command retried after
+   * a crash-after-commit resolves against the same successor); every other
+   * caller is fenced without mutation. Lease fields are retained per the
+   * established terminal-transition convention; no response body, auth,
+   * URL, capability, or diagnostic PII is ever persisted; DB errors
+   * propagate. */
+  async commitAttachSuccess(
+    input: AttachCommitSuccessInput,
+  ): Promise<AttachCommitSuccessOutcome> {
+    const successor = successorVersion(input?.expectedVersion);
+    if (
+      successor === null ||
+      typeof input?.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input?.owner !== 'string' ||
+      input.owner.length === 0 ||
+      typeof input?.attachAttemptId !== 'string' ||
+      !UUID.test(input.attachAttemptId) ||
+      typeof input?.backendReceiptId !== 'string' ||
+      !UUID.test(input.backendReceiptId)
+    )
+      return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const updated = await c.query<Row>(ATTACH_COMMIT_SUCCESS_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          input.attachAttemptId,
+          input.backendReceiptId,
+        ]);
+        if (updated.rowCount === 1) {
+          const receipt = updated.rows[0];
+          return {
+            kind: 'committed',
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const current = (
+          await c.query<Row>(ATTACH_SUCCESS_LOOK_SQL, [input.id, input.owner])
+        ).rows[0];
+        return current?.status === 'ATTACHED' &&
+          String(current.version) === successor &&
+          current.attach_attempt_id === input.attachAttemptId &&
+          current.backend_receipt_id === input.backendReceiptId &&
+          current.backend_receipt_status === 'PENDING' &&
+          current.attached_at instanceof Date
+          ? {
+              kind: 'replayed',
+              version: successor,
+              receipt: camelize<Media>(current),
+            }
+          : { kind: 'fenced' };
       });
     } catch (err) {
       if (

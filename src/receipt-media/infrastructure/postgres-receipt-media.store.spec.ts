@@ -8,6 +8,7 @@ import type {
   AmountProposalOutcome,
   AmountRejectionInput,
   AmountRejectionOutcome,
+  AttachCommitSuccessInput,
   AttachRequestStartInput,
   AttachStartInput,
   AttachStartOutcome,
@@ -4187,6 +4188,228 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         REQUEST_ID,
       );
       await expectFenced(command({ owner: 'worker.r3', expectedVersion: '6' }));
+    });
+  });
+  describe('WU11A2 atomic attach success commit', () => {
+    const OWNER = 'worker.attach-success';
+    const REQUEST_ID = UUID_B;
+    const BACKEND_ID = UUID_C;
+    const RIVAL_ID = '33333333-3333-4333-8333-333333333333';
+    const command = (
+      over: Partial<AttachCommitSuccessInput> = {},
+    ): AttachCommitSuccessInput => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '4',
+      attachAttemptId: REQUEST_ID,
+      backendReceiptId: BACKEND_ID,
+      ...over,
+    });
+    const seed = async (receiptOver: Row = {}) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const receipt = lifeRow('ATTACHING', null, {
+        sender_id: 'sender.attach-success',
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '4',
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        attach_attempts: 1,
+        attach_attempt_id: REQUEST_ID,
+        attach_request_started_at: T0,
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const expectFenced = async (input: AttachCommitSuccessInput) => {
+      const before = await row();
+      await expect(store.commitAttachSuccess(input)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await row()).toEqual(before);
+    };
+
+    it('commits the success terminal transition and returns the successor', async () => {
+      const seeded = await seed();
+      const outcome = await store.commitAttachSuccess(command());
+      expect(outcome).toMatchObject({
+        kind: 'committed',
+        version: '5',
+        receipt: {
+          id: UUID_A,
+          status: 'ATTACHED',
+          version: '5',
+          backendReceiptId: BACKEND_ID,
+          backendReceiptStatus: 'PENDING',
+          attachAttempts: 1,
+          attachAttemptId: REQUEST_ID,
+        },
+      });
+      if (outcome.kind === 'fenced') throw new Error('expected commit');
+      expect(outcome.receipt.attachedAt).toBeInstanceOf(Date);
+      const after = await row();
+      expect(after).toMatchObject({
+        status: 'ATTACHED',
+        version: '5',
+        backend_receipt_id: BACKEND_ID,
+        backend_receipt_status: 'PENDING',
+        attach_attempt_id: REQUEST_ID,
+        attach_attempts: 1,
+        lease_owner: OWNER,
+      });
+      expect(after.attached_at).toBeInstanceOf(Date);
+      expect(after.attach_request_started_at).toEqual(T0);
+      for (const key of Object.keys(seeded)) {
+        if (
+          [
+            'version',
+            'updated_at',
+            'status',
+            'backend_receipt_id',
+            'backend_receipt_status',
+            'attached_at',
+          ].includes(key)
+        )
+          continue;
+        expect(after[key]).toEqual(seeded[key]);
+      }
+    });
+
+    it('fences wrong fences, malformed inputs, and missing or mismatched request evidence without durable mutation', async () => {
+      await seed();
+      await expectFenced(command({ owner: 'worker.rival' }));
+      await expectFenced(command({ expectedVersion: '3' }));
+      await expectFenced(command({ expectedVersion: '5' }));
+      await expectFenced(command({ id: UUID_C }));
+      await expectFenced(command({ attachAttemptId: 'not-a-uuid' }));
+      await expectFenced(command({ attachAttemptId: '' }));
+      await expectFenced(command({ backendReceiptId: 'not-a-uuid' }));
+      await expectFenced(command({ backendReceiptId: '' }));
+      await seed({
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+      await seed({ attach_attempt_id: RIVAL_ID });
+      await expectFenced(command());
+      await seed({ lease_expires_at: new Date(Date.now() - 60_000) });
+      await expectFenced(command());
+      await seed({
+        status: 'AWAITING_CONFIRMATION',
+        attach_started_at: null,
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+    });
+
+    it('replays only the exact durable successor and fences every rival', async () => {
+      await seed();
+      expect((await store.commitAttachSuccess(command())).kind).toBe(
+        'committed',
+      );
+      const successor = await row();
+      // The exact original command replays: same receipt, attempt
+      // identity, backend evidence, and expected successor version.
+      const replay = await new PostgresReceiptMediaStore(
+        pool,
+      ).commitAttachSuccess(command());
+      expect(replay).toMatchObject({
+        kind: 'replayed',
+        version: '5',
+        receipt: {
+          id: UUID_A,
+          status: 'ATTACHED',
+          version: '5',
+          backendReceiptId: BACKEND_ID,
+          backendReceiptStatus: 'PENDING',
+        },
+      });
+      if (replay.kind === 'fenced') throw new Error('expected replay');
+      expect(replay.receipt.attachedAt).toBeInstanceOf(Date);
+      expect(await row()).toEqual(successor);
+      // A fence whose successor no longer matches the durable successor
+      // is a different logical operation and is fenced.
+      await expectFenced(command({ expectedVersion: '5' }));
+      // Rival evidence at the matching successor fence never mutates.
+      await expectFenced(command({ backendReceiptId: RIVAL_ID }));
+      await expectFenced(command({ attachAttemptId: RIVAL_ID }));
+      await expectFenced(command({ owner: 'worker.rival' }));
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      await expectFenced(command());
+      // A rival ATTACHED successor with different backend evidence at the
+      // exact expected successor version is fenced, never mutated.
+      await seed({
+        status: 'ATTACHED',
+        version: '5',
+        attached_at: T0,
+        backend_receipt_id: RIVAL_ID,
+        backend_receipt_status: 'PENDING',
+      });
+      await expectFenced(command());
+    });
+
+    it('rolls back the complete commit when the receipt update fails', async () => {
+      await seed();
+      const before = await row();
+      await pool.query(`CREATE FUNCTION receipt_attach_success_failure()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'attach success failure'; END; $$`);
+      await pool.query(`CREATE TRIGGER receipt_attach_success_failure
+                BEFORE UPDATE ON receipt_media FOR EACH ROW
+                EXECUTE FUNCTION receipt_attach_success_failure()`);
+      try {
+        await expect(store.commitAttachSuccess(command())).rejects.toThrow(
+          'attach success failure',
+        );
+        expect(await row()).toEqual(before);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS
+              receipt_attach_success_failure ON receipt_media;
+              DROP FUNCTION IF EXISTS receipt_attach_success_failure()`);
+      }
+    });
+
+    it('serializes duplicate commits and rejects an altered rival', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        store.commitAttachSuccess(command()),
+        store.commitAttachSuccess(command()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['committed', 'replayed']);
+      expect(await row()).toMatchObject({
+        status: 'ATTACHED',
+        version: '5',
+        backend_receipt_id: BACKEND_ID,
+      });
+      await seed();
+      const [c, d] = await Promise.all([
+        store.commitAttachSuccess(command()),
+        store.commitAttachSuccess(command({ backendReceiptId: RIVAL_ID })),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['committed', 'fenced']);
+      expect(await row()).toMatchObject({
+        status: 'ATTACHED',
+        version: '5',
+        backend_receipt_id: BACKEND_ID,
+      });
     });
   });
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {

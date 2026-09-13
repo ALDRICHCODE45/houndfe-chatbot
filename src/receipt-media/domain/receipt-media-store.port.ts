@@ -138,6 +138,25 @@ export type AttachRequestStartOutcome =
     }
   | { kind: 'fenced' };
 
+/** One immutable successful-attachment terminal command for the exact active
+ * ATTACHING receipt that already carries request-start evidence. The caller
+ * supplies only the durable attach-attempt identity it started and the safe
+ * backend receipt id; the backend status is fixed to PENDING and the store
+ * stamps attached_at itself. */
+export interface AttachCommitSuccessInput extends LeaseFenceInput {
+  attachAttemptId: string;
+  backendReceiptId: string;
+}
+
+/** A replay proves the exact durable successor; every other loser is fenced. */
+export type AttachCommitSuccessOutcome =
+  | {
+      kind: 'committed' | 'replayed';
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -228,6 +247,17 @@ export interface ReceiptMediaStorePort {
   startAttachRequest(
     input: AttachRequestStartInput,
   ): Promise<AttachRequestStartOutcome>;
+  /** WU11A2 successful attachment terminal commit: atomically transition
+   * the exact active ATTACHING row with prior request evidence and the
+   * matching durable attach-attempt identity to ATTACHED under the
+   * caller's live lease, persisting only backend_receipt_id, the fixed
+   * PENDING backend status, and attached_at. Only the exact durable
+   * successor with the same attempt identity, backend evidence, and
+   * successor version replays; every other caller is fenced without
+   * mutation. */
+  commitAttachSuccess(
+    input: AttachCommitSuccessInput,
+  ): Promise<AttachCommitSuccessOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment;
    * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */
