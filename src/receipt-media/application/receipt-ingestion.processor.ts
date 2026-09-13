@@ -12,10 +12,7 @@ import {
 } from '../domain/object-storage.port';
 import type { ReceiptMediaStorePort } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
-import {
-  ReceiptOutboxService,
-  type ReceiptTx2CommitPort,
-} from './receipt-outbox.service';
+import type { CapabilityService } from './capability.service';
 
 export type ReceiptIngestionOutcome =
   | { kind: 'downloaded' }
@@ -31,20 +28,28 @@ export type ReceiptIngestionOutcome =
 
 const PROCESSABLE: ReadonlySet<string> = new Set(['RESERVED', 'DOWNLOADED']);
 
-export class ReceiptIngestionProcessor {
-  private readonly outbox: ReceiptOutboxService;
+type StoredPassOutcome =
+  | Exclude<ReceiptIngestionOutcome, { kind: 'uploaded' }>
+  | {
+      kind: 'uploaded';
+      version: string;
+      objectEtag: string;
+      objectVersionId: string | null;
+    };
 
+export class ReceiptIngestionProcessor {
   constructor(
     private readonly meta: MetaMediaPort,
     private readonly storage: Pick<ObjectStoragePort, 'put'>,
     private readonly store: Pick<
       ReceiptMediaStorePort,
-      'startMetaAttempt' | 'startStorageAttempt' | 'commitDownload'
+      | 'startMetaAttempt'
+      | 'startStorageAttempt'
+      | 'commitDownload'
+      | 'bootstrapAmount'
     >,
-    private readonly tx2: ReceiptTx2CommitPort,
-  ) {
-    this.outbox = new ReceiptOutboxService(tx2);
-  }
+    private readonly capability: Pick<CapabilityService, 'issue'>,
+  ) {}
 
   async process(
     receipt: ReceiptMediaRow,
@@ -79,21 +84,19 @@ export class ReceiptIngestionProcessor {
         abort,
       );
       if (stored.kind !== 'uploaded') return stored;
-      const tx2 = await this.outbox.commit({
-        transition: {
-          id: fence.id,
-          owner: fence.owner,
-          expectedStatus: 'DOWNLOADED',
-          expectedVersion: stored.version,
-          nextStatus: 'STORED',
-        },
-        sourceWebhookMessageId: receipt.webhookMessageId,
-        recipientId: receipt.senderId,
-        templateKey: 'RECEIPT_AMOUNT_PROMPT',
+      const { tokenHash, keyVersion } = this.capability.issue(receipt.id);
+      const bootstrapped = await this.store.bootstrapAmount({
+        id: fence.id,
+        owner: fence.owner,
+        expectedVersion: stored.version,
+        objectEtag: stored.objectEtag,
+        objectVersionId: stored.objectVersionId,
+        capabilityTokenHash: tokenHash,
+        capabilityKeyVersion: keyVersion,
       });
-      return tx2.kind === 'committed'
-        ? { kind: 'stored' }
-        : { kind: 'fence-lost', stage: 'tx2' };
+      return bootstrapped.kind === 'fenced'
+        ? { kind: 'fence-lost', stage: 'tx2' }
+        : { kind: 'stored' };
     }
     try {
       await file.cleanup();
@@ -118,8 +121,8 @@ export class ReceiptIngestionProcessor {
     file: ValidatedMediaFile,
     objectKey: string,
     signal: AbortSignal,
-  ): Promise<ReceiptIngestionOutcome> {
-    let done: ReceiptIngestionOutcome = { kind: 'blocked', stage: 'storage' };
+  ): Promise<StoredPassOutcome> {
+    let done: StoredPassOutcome = { kind: 'blocked', stage: 'storage' };
     let thrown: Error | null = null;
     try {
       for (;;) {
@@ -137,7 +140,7 @@ export class ReceiptIngestionProcessor {
         const stream = createReadStream(file.filePath);
         const cleanupSignal = new AbortController().signal;
         try {
-          await this.storage.put({
+          const object = await this.storage.put({
             key: objectKey,
             content: stream,
             byteCount: file.byteCount,
@@ -146,7 +149,12 @@ export class ReceiptIngestionProcessor {
             abortSignal: signal,
             cleanupSignal,
           });
-          done = { kind: 'uploaded', version: start.version };
+          done = {
+            kind: 'uploaded',
+            version: start.version,
+            objectEtag: object.etag,
+            objectVersionId: object.versionId,
+          };
           break;
         } catch (err) {
           stream.destroy();

@@ -7,23 +7,22 @@ import {
   ObjectStorageError,
   type PutObjectInput,
 } from '../domain/object-storage.port';
-import { ReceiptMediaError } from '../domain/receipt-media.errors';
 import type {
+  AmountBootstrapInput,
+  AmountBootstrapOutcome,
   AttemptStartResult,
   DownloadCommitInput,
   DownloadCommitOutcome,
   LeaseFenceInput,
-  OutboxIntentInput,
-  StatusCasInput,
 } from '../domain/receipt-media-store.port';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
 } from '../domain/receipt-media.types';
-import type {
-  ReceiptTx2CommitResult,
-  ReceiptTx2Request,
-} from './receipt-outbox.service';
+import {
+  CapabilityService,
+  type CapabilityTokenResult,
+} from './capability.service';
 import { ReceiptIngestionProcessor } from './receipt-ingestion.processor';
 
 const flush = () => new Promise<void>((r) => setImmediate(r));
@@ -41,7 +40,16 @@ const row = (over: Partial<ReceiptMediaRow> = {}): ReceiptMediaRow =>
     ...over,
   }) as ReceiptMediaRow;
 
-const fixture = (over: Partial<ReceiptMediaRow> = {}) => {
+const fixture = (
+  over: Partial<ReceiptMediaRow> = {},
+  capability: Pick<CapabilityService, 'issue'> = {
+    issue: jest.fn<CapabilityTokenResult, [string]>(() => ({
+      token: 'raw-capability-token',
+      tokenHash: Buffer.alloc(32, 8),
+      keyVersion: 2,
+    })),
+  },
+) => {
   const receipt = row(over);
   const cleanup = jest.fn(() => Promise.resolve());
   const file = {
@@ -67,18 +75,6 @@ const fixture = (over: Partial<ReceiptMediaRow> = {}) => {
       return Promise.resolve({ etag: 'e', versionId: null });
     }),
   };
-  const tx2 = {
-    commitTransitionWithIntent: jest.fn<
-      Promise<ReceiptTx2CommitResult>,
-      [ReceiptTx2Request & { intent: OutboxIntentInput }]
-    >(() => {
-      return Promise.resolve({
-        kind: 'committed',
-        created: true,
-        intent: {} as ReceiptMediaOutboxRow,
-      });
-    }),
-  };
   const store = {
     startMetaAttempt: jest.fn<
       Promise<AttemptStartResult | null>,
@@ -88,16 +84,28 @@ const fixture = (over: Partial<ReceiptMediaRow> = {}) => {
       Promise<AttemptStartResult | null>,
       [LeaseFenceInput]
     >(() => Promise.resolve({ attempt: 1, version: '3' })),
-    transitionStatus: jest.fn<Promise<boolean>, [StatusCasInput]>(() =>
-      Promise.resolve(true),
-    ),
     commitDownload: jest.fn<
       Promise<DownloadCommitOutcome>,
       [DownloadCommitInput]
     >(() => Promise.resolve({ kind: 'committed' })),
+    bootstrapAmount: jest.fn<
+      Promise<AmountBootstrapOutcome>,
+      [AmountBootstrapInput]
+    >(() =>
+      Promise.resolve({
+        kind: 'bootstrapped',
+        receipt,
+        intent: {} as ReceiptMediaOutboxRow,
+      }),
+    ),
   };
 
-  const processor = new ReceiptIngestionProcessor(meta, storage, store, tx2);
+  const processor = new ReceiptIngestionProcessor(
+    meta,
+    storage,
+    store,
+    capability,
+  );
   return {
     receipt,
     cleanup,
@@ -106,7 +114,7 @@ const fixture = (over: Partial<ReceiptMediaRow> = {}) => {
     meta,
     storage,
     store,
-    tx2,
+    capability,
   };
 };
 
@@ -171,8 +179,7 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
       contentSha256: Buffer.alloc(32, 7),
     });
     expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
-    expect(f.store.transitionStatus).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
   });
 
   it('propagates a store error only after required cleanup', async () => {
@@ -192,7 +199,7 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
       kind: 'downloaded',
     });
     expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
   });
 
   it('runs Meta on attempts 1/2/3 and a null CAS blocks the fourth', async () => {
@@ -248,12 +255,51 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
 });
 
 describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
-  it('re-downloads a DOWNLOADED row and uploads once on the reserved key', async () => {
+  it('bootstraps hash-only capability evidence after cleanup', async () => {
+    const id = '1c0fac1e-5f0e-4a1e-9c1d-2b3c4d5e6f70';
+    const capability = new CapabilityService(
+      new Map([[1, Buffer.alloc(32, 1)]]),
+      1,
+    );
+    const issue = jest.spyOn(capability, 'issue');
+    const f = fixture({ id, status: 'DOWNLOADED' }, capability);
+    f.storage.put.mockResolvedValue({ etag: 'first-etag', versionId: 'v1' });
+
+    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
+      kind: 'stored',
+    });
+
+    const issued = issue.mock.results[0]?.value as CapabilityTokenResult;
+    const input = f.store.bootstrapAmount.mock.calls[0][0];
+    expect(input).toEqual({
+      id,
+      owner: 'w1',
+      expectedVersion: '3',
+      objectEtag: 'first-etag',
+      objectVersionId: 'v1',
+      capabilityTokenHash: issued.tokenHash,
+      capabilityKeyVersion: 1,
+    });
+    expect(input).not.toHaveProperty('token');
+    const reconstructed = capability.reconstruct(
+      id,
+      input.capabilityKeyVersion,
+      input.capabilityTokenHash,
+    );
+    expect(reconstructed?.token).toBe(issued.token);
+    expect(f.cleanup.mock.invocationCallOrder[0]).toBeLessThan(
+      issue.mock.invocationCallOrder[0],
+    );
+    expect(issue.mock.invocationCallOrder[0]).toBeLessThan(
+      f.store.bootstrapAmount.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('uses the retry winner evidence and a fresh stream', async () => {
     const f = fixture({ status: 'DOWNLOADED' });
+    const issue = jest.spyOn(f.capability, 'issue');
     let firstStream: PutObjectInput['content'] | null = null;
-    const destroyedAtRetry: boolean[] = [];
-    f.storage.put.mockImplementation((input: PutObjectInput) => {
-      destroyedAtRetry.push(firstStream?.destroyed ?? false);
+    f.storage.put.mockImplementation((input) => {
       if (firstStream === null) {
         firstStream = input.content;
         return Promise.reject(
@@ -261,192 +307,113 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
         );
       }
       input.content.destroy();
-      return Promise.resolve({ etag: 'e', versionId: null });
+      return Promise.resolve({ etag: 'retry-etag', versionId: null });
     });
-    let release!: (value: AttemptStartResult | null) => void;
-    const gate = new Promise<AttemptStartResult | null>((r) => (release = r));
-    f.store.startStorageAttempt
-      .mockImplementationOnce(() => gate)
-      .mockResolvedValueOnce({ attempt: 2, version: '4' });
-    let releaseCleanup!: () => void;
-    const cleanupGate = new Promise<void>((r) => (releaseCleanup = r));
-    f.cleanup.mockImplementation(() => cleanupGate);
-    const run = f.processor.process(f.receipt, 'w1');
-    await flush();
-    expect(f.storage.put).not.toHaveBeenCalled();
-    release({ attempt: 1, version: '3' });
-    await flush();
-    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
-    releaseCleanup();
-    await expect(run).resolves.toEqual({ kind: 'stored' });
-    expect(destroyedAtRetry[1]).toBe(true);
-    const tx2 = f.tx2.commitTransitionWithIntent.mock.calls[0][0];
-    expect(tx2.transition).toEqual({
-      id: 'r1',
-      owner: 'w1',
-      expectedStatus: 'DOWNLOADED',
-      expectedVersion: '4',
-      nextStatus: 'STORED',
-    });
-    expect(tx2).toMatchObject({
-      templateKey: 'RECEIPT_AMOUNT_PROMPT',
-      sourceWebhookMessageId: 'wamid',
-      recipientId: 's1',
-    });
-    expect(tx2.intent.dedupeKey).toBe(
-      'receipt:RECEIPT_AMOUNT_PROMPT:wamid:r1:4',
-    );
-    expect(f.storage.put.mock.calls.map(([input]) => input.key)).toEqual([
-      f.receipt.objectKey,
-      f.receipt.objectKey,
-    ]);
-    const seq = [
-      f.store.startMetaAttempt.mock.invocationCallOrder[0],
-      f.meta.resolveAndDownload.mock.invocationCallOrder[0],
-      f.store.startStorageAttempt.mock.invocationCallOrder[0],
-      f.storage.put.mock.invocationCallOrder[0],
-      f.cleanup.mock.invocationCallOrder[0],
-    ];
-    expect(seq).toEqual([...seq].sort((a, b) => a - b));
-    const put = f.storage.put.mock.calls[0][0];
-    expect(put).toMatchObject({
-      key: f.receipt.objectKey,
-      byteCount: 5,
-      mimeType: 'image/jpeg',
-      sha256: Buffer.alloc(32, 7),
-    });
-    expect((put.content as unknown as { path: unknown }).path).toBe(
-      'package.json',
-    );
-    expect(put.abortSignal).toBeInstanceOf(AbortSignal);
-    expect(put.cleanupSignal).toBeInstanceOf(AbortSignal);
-    expect(put.abortSignal).not.toBe(put.cleanupSignal);
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-  });
-
-  it('blocks Meta and storage on a null reconstruction CAS', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.store.startMetaAttempt.mockResolvedValue(null);
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'blocked',
-      stage: 'meta',
-    });
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.cleanup).not.toHaveBeenCalled();
-  });
-
-  it('consumes storage attempts 1/2/3; a null CAS blocks the fourth put', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'PERMANENT_FAILURE'),
-    );
     f.store.startStorageAttempt
       .mockResolvedValueOnce({ attempt: 1, version: '3' })
-      .mockResolvedValueOnce({ attempt: 2, version: '4' })
-      .mockResolvedValueOnce({ attempt: 3, version: '5' })
-      .mockResolvedValue(null);
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-failed',
-      code: 'PERMANENT_FAILURE',
+      .mockResolvedValueOnce({ attempt: 2, version: '4' });
+
+    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
+      kind: 'stored',
     });
-    for (let i = 0; i < 2; i += 1) await f.processor.process(f.receipt, 'w1');
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'blocked',
-      stage: 'storage',
+
+    const streams = f.storage.put.mock.calls.map(([input]) => input.content);
+    expect(streams[0].destroyed).toBe(true);
+    expect(new Set(streams).size).toBe(2);
+    expect(f.store.bootstrapAmount).toHaveBeenCalledWith({
+      id: 'r1',
+      owner: 'w1',
+      expectedVersion: '4',
+      objectEtag: 'retry-etag',
+      objectVersionId: null,
+      capabilityTokenHash: Buffer.alloc(32, 8),
+      capabilityKeyVersion: 2,
     });
-    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(4);
-    expect(f.storage.put).toHaveBeenCalledTimes(3);
-    expect(f.meta.resolveAndDownload).toHaveBeenCalledTimes(4);
-    expect(f.cleanup).toHaveBeenCalledTimes(4);
+    expect(f.cleanup.mock.invocationCallOrder[0]).toBeLessThan(
+      issue.mock.invocationCallOrder[0],
+    );
   });
 
-  it('returns cleanup-failed with no retry when temp cleanup rejects', async () => {
+  it('maps bootstrap replay to stored and a fenced bootstrap to fence-lost/tx2', async () => {
+    const replayed = fixture({ status: 'DOWNLOADED' });
+    replayed.store.bootstrapAmount.mockResolvedValue({
+      kind: 'replayed',
+      receipt: replayed.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    await expect(
+      replayed.processor.process(replayed.receipt, 'w1'),
+    ).resolves.toEqual({ kind: 'stored' });
+
+    const fenced = fixture({ status: 'DOWNLOADED' });
+    fenced.store.bootstrapAmount.mockResolvedValue({ kind: 'fenced' });
+    await expect(
+      fenced.processor.process(fenced.receipt, 'w1'),
+    ).resolves.toEqual({
+      kind: 'fence-lost',
+      stage: 'tx2',
+    });
+  });
+
+  it('stops after cleanup failure without issuing or bootstrapping', async () => {
     const f = fixture({ status: 'DOWNLOADED' });
+    const issue = jest.spyOn(f.capability, 'issue');
     f.cleanup.mockRejectedValue(new Error('raw-unlink-diagnostics'));
     await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
       kind: 'cleanup-failed',
     });
-    expect(f.storage.put).toHaveBeenCalledTimes(1);
-    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
+    expect(issue).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
   });
 
-  it('yields fence-lost/tx2 without stale follow-up when TX2 loses', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.tx2.commitTransitionWithIntent.mockResolvedValue({
-      kind: 'transition-lost',
+  it('propagates capability and bootstrap failures only after cleanup', async () => {
+    const capabilityFailure = fixture({ status: 'DOWNLOADED' });
+    const issue = jest
+      .spyOn(capabilityFailure.capability, 'issue')
+      .mockImplementation(() => {
+        throw new Error('capability-down');
+      });
+    await expect(
+      capabilityFailure.processor.process(capabilityFailure.receipt, 'w1'),
+    ).rejects.toThrow('capability-down');
+    expect(capabilityFailure.cleanup).toHaveBeenCalledTimes(1);
+    expect(capabilityFailure.store.bootstrapAmount).not.toHaveBeenCalled();
+    expect(issue.mock.invocationCallOrder[0]).toBeGreaterThan(
+      capabilityFailure.cleanup.mock.invocationCallOrder[0],
+    );
+
+    const bootstrapFailure = fixture({ status: 'DOWNLOADED' });
+    bootstrapFailure.store.bootstrapAmount.mockRejectedValue(
+      new Error('bootstrap-down'),
+    );
+    await expect(
+      bootstrapFailure.processor.process(bootstrapFailure.receipt, 'w1'),
+    ).rejects.toThrow('bootstrap-down');
+    expect(bootstrapFailure.cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves null-meta, retry, and storage fence gates before bootstrap', async () => {
+    const meta = fixture({ status: 'DOWNLOADED' });
+    meta.store.startMetaAttempt.mockResolvedValue(null);
+    await expect(meta.processor.process(meta.receipt, 'w1')).resolves.toEqual({
+      kind: 'blocked',
+      stage: 'meta',
     });
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'fence-lost',
-      stage: 'tx2',
-    });
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(f.tx2.commitTransitionWithIntent).toHaveBeenCalledTimes(1);
-    expect(f.storage.put).toHaveBeenCalledTimes(1);
-    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
-  });
+    expect(meta.cleanup).not.toHaveBeenCalled();
 
-  it('propagates TX2 commit failures after cleanup for the worker retry', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.tx2.commitTransitionWithIntent.mockRejectedValue(
-      new ReceiptMediaError('RECEIPT_OUTBOX_TX2_FAILED', 'TX2_COMMIT_FAILED'),
-    );
-    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
-      'receipt-media:RECEIPT_OUTBOX_TX2_FAILED/TX2_COMMIT_FAILED',
-    );
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-  });
-
-  it('awaits cleanup exactly once and rethrows unexpected post-Meta errors', async () => {
-    const cas = fixture({ status: 'DOWNLOADED' });
-    cas.store.startStorageAttempt.mockRejectedValue(new Error('db-down'));
-    await expect(cas.processor.process(cas.receipt, 'w1')).rejects.toThrow(
-      'db-down',
-    );
-    expect(cas.cleanup).toHaveBeenCalledTimes(1);
-    const str = fixture({ status: 'DOWNLOADED' });
-    str.file.filePath = Number.NaN as unknown as string;
-    await expect(str.processor.process(str.receipt, 'w1')).rejects.toThrow(
-      'path',
-    );
-    expect(str.cleanup).toHaveBeenCalledTimes(1);
-    const put = fixture({ status: 'DOWNLOADED' });
-    put.storage.put.mockRejectedValue(new Error('s3-sdk-boom'));
-    await expect(put.processor.process(put.receipt, 'w1')).rejects.toThrow(
-      's3-sdk-boom',
-    );
-    expect(put.cleanup).toHaveBeenCalledTimes(1);
-  });
-
-  it('exhausts three same-key puts then blocks on a null CAS', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
+    const retry = fixture({ status: 'DOWNLOADED' });
+    retry.storage.put.mockRejectedValue(
       new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
     );
-    f.store.startStorageAttempt
+    retry.store.startStorageAttempt
       .mockResolvedValueOnce({ attempt: 1, version: '3' })
       .mockResolvedValueOnce({ attempt: 2, version: '4' })
       .mockResolvedValueOnce({ attempt: 3, version: '5' })
       .mockResolvedValue(null);
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'blocked',
-      stage: 'storage',
-    });
-    expect(f.store.startStorageAttempt.mock.calls).toEqual([
-      [{ id: 'r1', owner: 'w1', expectedVersion: '2' }],
-      [{ id: 'r1', owner: 'w1', expectedVersion: '3' }],
-      [{ id: 'r1', owner: 'w1', expectedVersion: '4' }],
-      [{ id: 'r1', owner: 'w1', expectedVersion: '5' }],
-    ]);
-    const streams = f.storage.put.mock.calls.map(([input]) => input.content);
-    expect(new Set(streams).size).toBe(3);
-    streams.forEach((s) => expect(s.destroyed).toBe(true));
-    expect(f.storage.put.mock.calls.map(([input]) => input.key)).toEqual([
-      f.receipt.objectKey,
-      f.receipt.objectKey,
-      f.receipt.objectKey,
-    ]);
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
+    await expect(retry.processor.process(retry.receipt, 'w1')).resolves.toEqual(
+      { kind: 'blocked', stage: 'storage' },
+    );
+    expect(retry.store.bootstrapAmount).not.toHaveBeenCalled();
   });
 });
 
@@ -497,7 +464,7 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
     ).toEqual({ kind: 'aborted', stage: 'storage' });
     expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
     expect(f.storage.put).toHaveBeenCalledTimes(1);
-    expect(f.tx2.commitTransitionWithIntent).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
     expect(f.cleanup).toHaveBeenCalledTimes(1);
     expect(put.abortSignal).toBe(controller.signal);
     expect(put.cleanupSignal).not.toBe(controller.signal);
