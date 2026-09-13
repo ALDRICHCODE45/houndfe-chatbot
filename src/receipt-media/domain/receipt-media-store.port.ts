@@ -128,6 +128,23 @@ export type DownloadCommitOutcome = {
   kind: 'committed' | 'replayed' | 'fenced';
 };
 
+/** Fenced DOWNLOADED → AWAITING_AMOUNT bootstrap input. Capability evidence is
+ * hash-only; receipt-owned sender, sale, webhook, and pointer are derived. */
+export interface AmountBootstrapInput extends LeaseFenceInput {
+  objectEtag: string;
+  objectVersionId: string | null;
+  capabilityTokenHash: Buffer;
+  capabilityKeyVersion: number;
+}
+
+export type AmountBootstrapOutcome =
+  | {
+      kind: 'bootstrapped' | 'replayed';
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Pre-call attempt start: the 1-based attempt and resulting version. */
 export interface AttemptStartResult {
   attempt: number;
@@ -170,6 +187,9 @@ export interface ReceiptMediaStorePort {
   transitionStatus(input: StatusCasInput): Promise<boolean>;
   /** Atomically persist download evidence while advancing the RESERVED successor. */
   commitDownload(input: DownloadCommitInput): Promise<DownloadCommitOutcome>;
+  /** Atomically store accepted object/capability evidence, create the initial
+   * pointer and deterministic empty amount prompt from the locked receipt. */
+  bootstrapAmount(input: AmountBootstrapInput): Promise<AmountBootstrapOutcome>;
   /** Atomic pre-call Meta attempt start (max 3); loser null. */
   startMetaAttempt(input: LeaseFenceInput): Promise<AttemptStartResult | null>;
   /** Atomic pre-call storage attempt start (max 3); loser null. */

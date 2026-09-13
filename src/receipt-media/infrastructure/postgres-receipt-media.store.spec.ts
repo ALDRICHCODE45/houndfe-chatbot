@@ -3,6 +3,7 @@ import type { PoolClient, QueryResultRow } from 'pg';
 import { Pool } from 'pg';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import type {
+  AmountBootstrapInput,
   AmountProposalInput,
   AmountProposalOutcome,
   AmountRejectionInput,
@@ -1546,6 +1547,491 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       );
       expect(rows[0].n).toBe(1);
       expect((await store.lookupByCapabilityHash(KNOWN_HASH))?.id).toBe(UUID_A);
+    });
+  });
+
+  // --- WU8R2 atomic DOWNLOADED → AWAITING_AMOUNT bootstrap ---
+
+  describe('WU8R2 atomic amount bootstrap', () => {
+    type BootstrapInput = AmountBootstrapInput;
+    type BootstrapOutcome =
+      | { kind: 'bootstrapped' | 'replayed'; receipt: Row; intent: Row }
+      | { kind: 'fenced' };
+    type BootstrapStore = {
+      bootstrapAmount(input: BootstrapInput): Promise<BootstrapOutcome>;
+    };
+    const SENDER = 'sender.amount-bootstrap';
+    const OWNER = 'worker.amount-bootstrap';
+    const CAPABILITY_HASH = Buffer.alloc(32, 8);
+    const bootstrap = (target: BootstrapStore, input: BootstrapInput) =>
+      target.bootstrapAmount(input);
+    const command = (over: Partial<BootstrapInput> = {}): BootstrapInput => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '2',
+      objectEtag: 'etag.amount-bootstrap',
+      objectVersionId: 'version.amount-bootstrap',
+      capabilityTokenHash: CAPABILITY_HASH,
+      capabilityKeyVersion: 1,
+      ...over,
+    });
+    const seed = async (
+      data: unknown = { sibling: { keep: true } },
+      over: Row = {},
+    ) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      await pool.query('DELETE FROM conversation_state WHERE sender_id = $1', [
+        SENDER,
+      ]);
+      const receipt = lifeRow('DOWNLOADED', null, {
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        webhook_message_id: 'wamid.amount-bootstrap',
+        version: '2',
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        ...over,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      if (typeof data !== 'symbol')
+        await pool.query(
+          'INSERT INTO conversation_state (sender_id, last_message_at, data) VALUES ($1, now(), $2::jsonb)',
+          [SENDER, JSON.stringify(data)],
+        );
+    };
+    const snapshot = async () => {
+      const [receipt, conversation, outbox] = await Promise.all([
+        pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [UUID_A]),
+        pool.query<Row>(
+          'SELECT data FROM conversation_state WHERE sender_id = $1',
+          [SENDER],
+        ),
+        pool.query<Row>('SELECT * FROM receipt_media_outbox'),
+      ]);
+      return {
+        receipt: receipt.rows[0],
+        conversation: conversation.rows[0]?.data,
+        outbox: outbox.rows,
+      };
+    };
+    const expectFenced = async (
+      input = command(),
+      target: BootstrapStore = store as unknown as BootstrapStore,
+    ) => {
+      const before = await snapshot();
+      await expect(bootstrap(target, input)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await snapshot()).toEqual(before);
+    };
+
+    it('atomically derives the initial pointer and empty prompt from the locked receipt while preserving siblings', async () => {
+      await seed();
+      const outcome = await bootstrap(
+        store as unknown as BootstrapStore,
+        {
+          ...command(),
+          senderId: 'attacker',
+          capturedSaleId: UUID_C,
+          sourceWebhookMessageId: 'wamid.attacker',
+        } as BootstrapInput,
+      );
+      expect(outcome).toMatchObject({
+        kind: 'bootstrapped',
+        receipt: {
+          id: UUID_A,
+          status: 'AWAITING_AMOUNT',
+          version: '3',
+          objectEtag: 'etag.amount-bootstrap',
+          objectVersionId: 'version.amount-bootstrap',
+          capabilityTokenHash: CAPABILITY_HASH,
+          capabilityKeyVersion: 1,
+        },
+        intent: {
+          receiptMediaId: UUID_A,
+          receiptStateVersion: '3',
+          sourceWebhookMessageId: 'wamid.amount-bootstrap',
+          recipientId: SENDER,
+          templateKey: 'RECEIPT_AMOUNT_PROMPT',
+          templateArgs: {},
+        },
+      });
+      const durable = await snapshot();
+      expect(durable.receipt.stored_at).toBeInstanceOf(Date);
+      expect(durable.receipt.capability_issued_at).toBeInstanceOf(Date);
+      expect(durable.conversation).toEqual({
+        sibling: { keep: true },
+        receiptAmountPointer: {
+          receiptMediaId: UUID_A,
+          saleId: UUID_B,
+          receiptVersion: '3',
+        },
+      });
+      expect(durable.outbox).toHaveLength(1);
+    });
+
+    it.each<[string, Partial<BootstrapInput>]>([
+      ['nullable object version', { objectVersionId: null }],
+      [
+        'max int32 capability key version',
+        { capabilityKeyVersion: 2_147_483_647 },
+      ],
+    ])('accepts %s', async (_label, over) => {
+      await seed();
+      await expect(
+        bootstrap(store as unknown as BootstrapStore, command(over)),
+      ).resolves.toMatchObject({ kind: 'bootstrapped' });
+    });
+
+    it.each<[string, Partial<BootstrapInput>, Row]>([
+      ['malformed object etag', { objectEtag: '' }, {}],
+      ['non-string object etag', { objectEtag: 1 as never }, {}],
+      ['malformed object version', { objectVersionId: '' }, {}],
+      ['non-string object version', { objectVersionId: 1 as never }, {}],
+      ['short capability hash', { capabilityTokenHash: Buffer.alloc(31) }, {}],
+      ['long capability hash', { capabilityTokenHash: Buffer.alloc(33) }, {}],
+      ['zero capability key version', { capabilityKeyVersion: 0 }, {}],
+      ['fractional capability key version', { capabilityKeyVersion: 1.5 }, {}],
+      [
+        'unsafe capability key version',
+        { capabilityKeyVersion: Number.MAX_SAFE_INTEGER + 1 },
+        {},
+      ],
+      [
+        'database-overflow key version',
+        { capabilityKeyVersion: 2_147_483_648 },
+        {},
+      ],
+      ['wrong owner', { owner: 'worker.rival' }, {}],
+      ['wrong version', { expectedVersion: '1' }, {}],
+      ['wrong state', {}, { status: 'STORED', ...acceptedEvidence }],
+    ])('fences %s without mutation', async (_label, over, receiptOver) => {
+      await seed({ sibling: { keep: true } }, receiptOver);
+      await expectFenced(command(over));
+    });
+
+    it.each<[string, unknown]>([
+      ['missing conversation', Symbol('missing conversation')],
+      ['null conversation', null],
+      ['array conversation', []],
+      [
+        'malformed pointer',
+        { receiptAmountPointer: { receiptMediaId: UUID_A } },
+      ],
+      [
+        'already-bearing pointer',
+        {
+          receiptAmountPointer: {
+            receiptMediaId: UUID_A,
+            saleId: UUID_B,
+            receiptVersion: '2',
+          },
+        },
+      ],
+    ])('fences a %s without mutation', async (_label, data) => {
+      await seed(data);
+      await expectFenced();
+    });
+
+    it('fences expired or lost leases and successor overflow', async () => {
+      await seed(undefined, { lease_expires_at: new Date(Date.now() - 1_000) });
+      await expectFenced();
+      const max = '9223372036854775807';
+      await seed({ sibling: true }, { version: max });
+      await expectFenced(command({ expectedVersion: max }));
+    });
+
+    it('replays only the exact durable successor across adapter recreation', async () => {
+      await seed();
+      const input = command();
+      expect(
+        (await bootstrap(store as unknown as BootstrapStore, input)).kind,
+      ).toBe('bootstrapped');
+      const recreated = new PostgresReceiptMediaStore(
+        pool,
+      ) as unknown as BootstrapStore;
+      expect((await bootstrap(recreated, input)).kind).toBe('replayed');
+      for (const changed of [
+        command({ objectEtag: 'etag.changed' }),
+        command({ objectVersionId: null }),
+        command({ capabilityTokenHash: Buffer.alloc(32, 9) }),
+        command({ capabilityKeyVersion: 2 }),
+      ])
+        await expectFenced(changed, recreated);
+      await pool.query(
+        "UPDATE conversation_state SET data = data - 'receiptAmountPointer'",
+      );
+      await expectFenced(input);
+      await pool.query(
+        "UPDATE conversation_state SET data = jsonb_set(data, '{receiptAmountPointer}', $1::jsonb)",
+        [
+          JSON.stringify({
+            receiptMediaId: UUID_A,
+            saleId: UUID_B,
+            receiptVersion: '3',
+          }),
+        ],
+      );
+      await pool.query(
+        'UPDATE receipt_media_outbox SET template_args = \'{"extra":1}\'::jsonb',
+      );
+      await expectFenced(input);
+    });
+
+    it.each<['receipt' | 'pointer' | 'intent']>([
+      ['receipt'],
+      ['pointer'],
+      ['intent'],
+    ])('rolls back all mutations when %s persistence fails', async (part) => {
+      await seed();
+      const before = await snapshot();
+      const table =
+        part === 'receipt'
+          ? 'receipt_media'
+          : part === 'pointer'
+            ? 'conversation_state'
+            : 'receipt_media_outbox';
+      const trigger = `receipt_amount_bootstrap_${part}_failure`;
+      const body =
+        part === 'pointer'
+          ? 'BEGIN RETURN NULL; END;'
+          : `BEGIN RAISE EXCEPTION 'bootstrap ${part} failure'; END;`;
+      await pool.query(
+        `CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ ${body} $$`,
+      );
+      await pool.query(
+        `CREATE TRIGGER ${trigger} BEFORE ${part === 'intent' ? 'INSERT' : 'UPDATE'} ON ${table} FOR EACH ROW EXECUTE FUNCTION ${trigger}()`,
+      );
+      try {
+        if (part === 'pointer') await expectFenced();
+        else
+          await expect(
+            bootstrap(store as unknown as BootstrapStore, command()),
+          ).rejects.toThrow(`bootstrap ${part} failure`);
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS ${trigger} ON ${table}`);
+        await pool.query(`DROP FUNCTION IF EXISTS ${trigger}()`);
+      }
+    });
+
+    it('fences a replay with a missing intent or altered successor pointer', async () => {
+      await seed();
+      const input = command();
+      await bootstrap(store as unknown as BootstrapStore, input);
+      await pool.query('DELETE FROM receipt_media_outbox');
+      await expectFenced(input);
+      await seed();
+      await bootstrap(store as unknown as BootstrapStore, input);
+      await pool.query(
+        `UPDATE conversation_state SET data = jsonb_set(data,
+         '{receiptAmountPointer}', $1::jsonb)`,
+        [
+          JSON.stringify({
+            receiptMediaId: UUID_A,
+            saleId: UUID_C,
+            receiptVersion: '3',
+          }),
+        ],
+      );
+      await expectFenced(input);
+    });
+
+    it('accepts MAX_BIGINT minus one once and fences a reclaimed lease', async () => {
+      const prior = '9223372036854775806';
+      await seed({ sibling: true }, { version: prior });
+      await expect(
+        bootstrap(
+          store as unknown as BootstrapStore,
+          command({ expectedVersion: prior }),
+        ),
+      ).resolves.toMatchObject({
+        kind: 'bootstrapped',
+        receipt: { version: '9223372036854775807' },
+      });
+      await seed();
+      await store.releaseLease({
+        id: UUID_A,
+        owner: OWNER,
+        expectedVersion: '2',
+      });
+      expect((await store.claimBatch(1, 'worker.reclaimed'))[0].id).toBe(
+        UUID_A,
+      );
+      await expectFenced();
+    });
+
+    it.each<[string, () => Promise<unknown>]>([
+      [
+        'changed object evidence',
+        () =>
+          pool.query("UPDATE receipt_media SET object_etag = 'etag.changed'"),
+      ],
+      [
+        'changed capability evidence',
+        () => pool.query('UPDATE receipt_media SET capability_key_version = 2'),
+      ],
+      [
+        'revoked capability',
+        () =>
+          pool.query('UPDATE receipt_media SET capability_revoked_at = now()'),
+      ],
+      [
+        'wrong prompt source',
+        () =>
+          pool.query(
+            "UPDATE receipt_media_outbox SET source_webhook_message_id = 'wamid.rival'",
+          ),
+      ],
+      [
+        'wrong prompt recipient',
+        () =>
+          pool.query(
+            "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+          ),
+      ],
+      [
+        'wrong prompt version',
+        () =>
+          pool.query(
+            'UPDATE receipt_media_outbox SET receipt_state_version = 2',
+          ),
+      ],
+      [
+        'malformed prompt arguments',
+        () =>
+          pool.query(
+            "UPDATE receipt_media_outbox SET template_args = '[]'::jsonb",
+          ),
+      ],
+    ])('fences replay with %s', async (_label, mutate) => {
+      await seed();
+      const input = command();
+      await bootstrap(store as unknown as BootstrapStore, input);
+      await mutate();
+      await expectFenced(input);
+    });
+
+    it.each<[string, boolean]>([
+      ['initial bootstrap', false],
+      ['durable replay', true],
+    ])(
+      'fences %s after its conversation lock wait outlives the lease',
+      async (_label, replay) => {
+        await seed();
+        const input = command();
+        if (replay)
+          await expect(
+            bootstrap(store as unknown as BootstrapStore, input),
+          ).resolves.toMatchObject({ kind: 'bootstrapped' });
+        await pool.query(
+          "UPDATE receipt_media SET lease_expires_at = clock_timestamp() + interval '200 milliseconds'",
+        );
+        const before = await snapshot();
+        const locker = await pool.connect();
+        let inTransaction = false;
+        try {
+          await locker.query('BEGIN');
+          inTransaction = true;
+          await locker.query(
+            'SELECT sender_id FROM conversation_state WHERE sender_id = $1 FOR UPDATE',
+            [SENDER],
+          );
+          let settled = false;
+          const operation = bootstrap(
+            store as unknown as BootstrapStore,
+            input,
+          );
+          void operation.finally(() => {
+            settled = true;
+          });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(settled).toBe(false);
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          await locker.query('COMMIT');
+          inTransaction = false;
+          await expect(operation).resolves.toEqual({ kind: 'fenced' });
+          expect(await snapshot()).toEqual(before);
+        } finally {
+          if (inTransaction)
+            await locker.query('ROLLBACK').catch(() => undefined);
+          locker.release();
+        }
+      },
+    );
+
+    it.each<[string, BootstrapInput]>([
+      ['null input', null as unknown as BootstrapInput],
+      [
+        'symbol expected version',
+        command({ expectedVersion: Symbol('version') as never }),
+      ],
+    ])('fails closed without opening SQL for %s', async (_label, input) => {
+      const connect = jest.spyOn(pool, 'connect');
+      try {
+        await expect(
+          bootstrap(store as unknown as BootstrapStore, input),
+        ).resolves.toEqual({ kind: 'fenced' });
+        expect(connect).not.toHaveBeenCalled();
+      } finally {
+        connect.mockRestore();
+      }
+    });
+
+    it('serializes duplicate and rival bootstraps with one durable winner', async () => {
+      await seed();
+      const duplicate = await Promise.all([
+        bootstrap(store as unknown as BootstrapStore, command()),
+        bootstrap(store as unknown as BootstrapStore, command()),
+      ]);
+      expect(duplicate.map((outcome) => outcome.kind).sort()).toEqual([
+        'bootstrapped',
+        'replayed',
+      ]);
+      await seed();
+      const rival = await Promise.all([
+        bootstrap(store as unknown as BootstrapStore, command()),
+        bootstrap(
+          store as unknown as BootstrapStore,
+          command({ objectEtag: 'etag.rival' }),
+        ),
+      ]);
+      expect(rival.map((outcome) => outcome.kind).sort()).toEqual([
+        'bootstrapped',
+        'fenced',
+      ]);
+    });
+
+    it('propagates a capability-hash uniqueness collision and rolls back', async () => {
+      await seed();
+      const collision = lifeRow('STORED', null, {
+        id: UUID_C,
+        webhook_message_id: 'wamid.amount-bootstrap.collision',
+        provider_media_id: 'media.amount-bootstrap.collision',
+        sender_id: 'sender.amount-bootstrap.collision',
+        captured_sale_id: UUID_C,
+        object_key: 'receipts/amount-bootstrap-collision',
+        capability_token_hash: CAPABILITY_HASH,
+      });
+      await pool.query(
+        insertSql('receipt_media', collision),
+        Object.values(collision),
+      );
+      await expect(
+        bootstrap(store as unknown as BootstrapStore, command()),
+      ).rejects.toThrow();
+      expect((await snapshot()).receipt).toMatchObject({
+        status: 'DOWNLOADED',
+        version: '2',
+      });
+      const durable = await snapshot();
+      expect(durable.conversation).toEqual({ sibling: { keep: true } });
+      expect(durable.outbox).toEqual([]);
     });
   });
 

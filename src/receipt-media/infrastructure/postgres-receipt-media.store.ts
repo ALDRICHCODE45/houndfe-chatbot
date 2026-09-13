@@ -9,6 +9,8 @@ import {
   type ReceiptAmountPointer,
 } from '../../conversation/domain/conversation-store';
 import type {
+  AmountBootstrapInput,
+  AmountBootstrapOutcome,
   AmountProposalInput,
   AmountProposalOutcome,
   AmountRejectionInput,
@@ -27,7 +29,10 @@ import type {
   ReserveInput,
   StatusCasInput,
 } from '../domain/receipt-media-store.port';
-import { RECEIPT_SHA256_BYTES } from '../domain/receipt-media.types';
+import {
+  RECEIPT_MAX_BYTES,
+  RECEIPT_SHA256_BYTES,
+} from '../domain/receipt-media.types';
 
 type Row = Record<string, unknown>;
 type Media = ReceiptMediaRow;
@@ -130,6 +135,57 @@ const sameDownloadEvidence = (row: Row, input: DownloadCommitInput) =>
   row.byte_count === input.byteCount &&
   Buffer.isBuffer(row.content_sha256) &&
   Buffer.compare(row.content_sha256, input.contentSha256) === 0;
+
+const isBootstrapInput = (
+  input: AmountBootstrapInput,
+  successor: string | null,
+): successor is string => {
+  try {
+    return (
+      successor !== null &&
+      typeof input.id === 'string' &&
+      UUID.test(input.id) &&
+      typeof input.owner === 'string' &&
+      input.owner.length > 0 &&
+      typeof input.objectEtag === 'string' &&
+      input.objectEtag.length > 0 &&
+      (input.objectVersionId === null ||
+        (typeof input.objectVersionId === 'string' &&
+          input.objectVersionId.length > 0)) &&
+      ArrayBuffer.isView(input.capabilityTokenHash) &&
+      Buffer.isBuffer(input.capabilityTokenHash) &&
+      input.capabilityTokenHash.length === RECEIPT_SHA256_BYTES &&
+      Number.isSafeInteger(input.capabilityKeyVersion) &&
+      input.capabilityKeyVersion > 0 &&
+      input.capabilityKeyVersion <= MAX_INT32
+    );
+  } catch {
+    return false;
+  }
+};
+
+const hasDownloadEvidence = (row: Row) =>
+  row.downloaded_at instanceof Date &&
+  (row.response_mime_type === 'image/jpeg' ||
+    row.response_mime_type === 'image/png') &&
+  (row.detected_mime_type === 'image/jpeg' ||
+    row.detected_mime_type === 'image/png') &&
+  Number.isInteger(row.byte_count) &&
+  typeof row.byte_count === 'number' &&
+  row.byte_count > 0 &&
+  row.byte_count <= RECEIPT_MAX_BYTES &&
+  Buffer.isBuffer(row.content_sha256) &&
+  row.content_sha256.length === RECEIPT_SHA256_BYTES;
+
+const sameBootstrapEvidence = (row: Row, input: AmountBootstrapInput) =>
+  row.stored_at instanceof Date &&
+  row.object_etag === input.objectEtag &&
+  row.object_version_id === input.objectVersionId &&
+  Buffer.isBuffer(row.capability_token_hash) &&
+  Buffer.compare(row.capability_token_hash, input.capabilityTokenHash) === 0 &&
+  row.capability_key_version === input.capabilityKeyVersion &&
+  row.capability_issued_at instanceof Date &&
+  row.capability_revoked_at === null;
 
 const samePointer = (value: unknown, expected: ReceiptAmountPointer) =>
   isReceiptAmountPointer(value) &&
@@ -906,6 +962,157 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       ]);
       return rowCount === 1;
     });
+  }
+
+  /** WU8R2: receipt-first atomic accepted-object bootstrap. The receipt owns
+   * all routing values; only S3/capability evidence enters this operation. */
+  async bootstrapAmount(
+    input: AmountBootstrapInput,
+  ): Promise<AmountBootstrapOutcome> {
+    let successor: string | null;
+    try {
+      successor = successorVersion(input?.expectedVersion);
+    } catch {
+      return { kind: 'fenced' };
+    }
+    if (!isBootstrapInput(input, successor)) return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const receipt = (
+          await c.query<Row>(
+            'SELECT * FROM receipt_media WHERE id = $1 AND lease_owner = $2 FOR UPDATE',
+            [input.id, input.owner],
+          )
+        ).rows[0];
+        if (!receipt) throw FENCED;
+        const conversation = (
+          await c.query<Row>(
+            'SELECT data FROM conversation_state WHERE sender_id = $1 FOR UPDATE',
+            [receipt.sender_id],
+          )
+        ).rows[0];
+        if (
+          !conversation ||
+          !isRecord(conversation.data) ||
+          !hasDownloadEvidence(receipt)
+        )
+          throw FENCED;
+        const receiptId = receipt.id as string;
+        const senderId = receipt.sender_id as string;
+        const saleId = receipt.captured_sale_id as string;
+        const sourceWebhookMessageId = receipt.webhook_message_id as string;
+        const pointer = {
+          receiptMediaId: receiptId,
+          saleId,
+          receiptVersion: successor,
+        };
+        const dedupeKey = `receipt-amount-prompt:${receiptId}:${input.expectedVersion}:${sourceWebhookMessageId}`;
+        if (
+          receipt.status === 'AWAITING_AMOUNT' &&
+          receipt.version === successor &&
+          sameBootstrapEvidence(receipt, input) &&
+          samePointer(conversation.data.receiptAmountPointer, pointer)
+        ) {
+          const intent = (
+            await c.query<Row>(
+              'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+              [dedupeKey],
+            )
+          ).rows[0];
+          if (
+            !intent ||
+            intent.receipt_media_id !== receipt.id ||
+            intent.receipt_state_version !== successor ||
+            intent.source_webhook_message_id !== receipt.webhook_message_id ||
+            intent.recipient_id !== receipt.sender_id ||
+            intent.template_key !== 'RECEIPT_AMOUNT_PROMPT' ||
+            !isRecord(intent.template_args) ||
+            Object.keys(intent.template_args).length !== 0
+          )
+            throw FENCED;
+          const liveLease = (
+            await c.query<Row>(
+              `SELECT lease_expires_at > clock_timestamp() AS live
+                   FROM receipt_media WHERE id = $1 AND lease_owner = $2`,
+              [input.id, input.owner],
+            )
+          ).rows[0]?.live;
+          if (liveLease !== true) throw FENCED;
+          return {
+            kind: 'replayed',
+            receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
+          };
+        }
+        if (
+          receipt.status !== 'DOWNLOADED' ||
+          receipt.version !== input.expectedVersion ||
+          Object.hasOwn(conversation.data, 'receiptAmountPointer') ||
+          [
+            'stored_at',
+            'object_etag',
+            'object_version_id',
+            'capability_token_hash',
+            'capability_key_version',
+            'capability_issued_at',
+            'capability_revoked_at',
+          ].some((key) => receipt[key] !== null)
+        )
+          throw FENCED;
+        const updated = await c.query<Row>(
+          `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
+             object_etag = $4, object_version_id = $5, capability_token_hash = $6,
+             capability_key_version = $7, capability_issued_at = now(),
+             version = version + 1, updated_at = now()
+           WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
+             AND version = $3::bigint AND lease_expires_at > clock_timestamp()
+             RETURNING *`,
+          [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+            input.objectEtag,
+            input.objectVersionId,
+            input.capabilityTokenHash,
+            input.capabilityKeyVersion,
+          ],
+        );
+        if (updated.rowCount !== 1) throw FENCED;
+        const pointerWrite = await c.query(
+          `UPDATE conversation_state SET data = jsonb_set(data,
+             '{receiptAmountPointer}', jsonb_build_object('receiptMediaId', $2::text,
+             'saleId', $3::text, 'receiptVersion', $4::text), true)
+           WHERE sender_id = $1 AND NOT (data ? 'receiptAmountPointer')`,
+          [receipt.sender_id, receipt.id, receipt.captured_sale_id, successor],
+        );
+        if (pointerWrite.rowCount !== 1) throw FENCED;
+        const intent = await c.query<Row>(
+          `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+             receipt_state_version, source_webhook_message_id, recipient_id,
+             template_key, template_args)
+           VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_AMOUNT_PROMPT', $7::jsonb)
+           ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+          [
+            randomUUID(),
+            dedupeKey,
+            receiptId,
+            successor,
+            sourceWebhookMessageId,
+            senderId,
+            JSON.stringify({}),
+          ],
+        );
+        if (intent.rowCount !== 1) throw FENCED;
+        return {
+          kind: 'bootstrapped',
+          receipt: camelize<Media>(updated.rows[0]),
+          intent: camelize<ReceiptMediaOutboxRow>(intent.rows[0]),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      throw err;
+    }
   }
 
   /** WU8R1: one evidence-complete fenced commit. Only a durable successor
