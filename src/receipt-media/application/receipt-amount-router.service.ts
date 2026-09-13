@@ -126,7 +126,8 @@ export class ReceiptAmountRouterService {
       input.senderId.length > 0 &&
       typeof input.sourceWebhookMessageId === 'string' &&
       input.sourceWebhookMessageId.length > 0;
-    const plan = identityValid ? planRoute(input.text) : null;
+    const textValid = typeof input.text === 'string';
+    const plan = identityValid && textValid ? planRoute(input.text) : null;
     if (plan === null) return { kind: 'fenced' };
     const pointer = await this.readPointer(input.senderId);
     if (pointer === null) return { kind: 'fenced' };

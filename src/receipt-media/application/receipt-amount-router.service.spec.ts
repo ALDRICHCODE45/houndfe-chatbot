@@ -221,4 +221,24 @@ describe('ReceiptAmountRouterService.route', () => {
     expect(conversations.get).not.toHaveBeenCalled();
     for (const op of Object.values(store)) expect(op).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['an object', { toString: () => 'sí' }],
+    ['an array', ['sí']],
+    ['a number', 1234.5],
+    ['a boolean', true],
+    ['a symbol', Symbol('sí')],
+  ])('fences closed for non-string text %s', async (_label, text) => {
+    const { router, store, conversations } = routerFixture();
+    const input = {
+      senderId: SENDER,
+      sourceWebhookMessageId: WEBHOOK,
+      text,
+    } as unknown as ReceiptAmountRouteInput;
+    expect(await router.route(input)).toEqual({ kind: 'fenced' });
+    expect(conversations.get).not.toHaveBeenCalled();
+    for (const op of Object.values(store)) expect(op).not.toHaveBeenCalled();
+  });
 });
