@@ -9,6 +9,7 @@ import type {
   AmountRejectionInput,
   AmountRejectionOutcome,
   AttachCommitSuccessInput,
+  AttachDefiniteFailureInput,
   AttachRequestStartInput,
   AttachStartInput,
   AttachStartOutcome,
@@ -4412,6 +4413,287 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       });
     });
   });
+
+  describe('WU11A3A atomic attach definite failure commit', () => {
+    const OWNER = 'worker.attach-definite';
+    const REQUEST_ID = UUID_B;
+    const RIVAL_ID = '33333333-3333-4333-8333-333333333333';
+    const command = (
+      over: Partial<AttachDefiniteFailureInput> = {},
+    ): AttachDefiniteFailureInput => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '4',
+      attachAttemptId: REQUEST_ID,
+      httpStatus: 400,
+      ...over,
+    });
+    const seed = async (receiptOver: Row = {}) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const receipt = lifeRow('ATTACHING', null, {
+        sender_id: 'sender.attach-definite',
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '4',
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        attach_attempts: 1,
+        attach_attempt_id: REQUEST_ID,
+        attach_request_started_at: T0,
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const expectFenced = async (input: AttachDefiniteFailureInput) => {
+      const before = await row();
+      await expect(store.commitAttachDefiniteFailure(input)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await row()).toEqual(before);
+    };
+
+    it('fails the exact active ATTACHING row and persists only safe evidence', async () => {
+      const seeded = await seed();
+      const outcome = await store.commitAttachDefiniteFailure(command());
+      expect(outcome).toMatchObject({
+        kind: 'failed',
+        version: '5',
+        receipt: {
+          id: UUID_A,
+          status: 'FAILED',
+          version: '5',
+          failureStage: 'ATTACH_DEFINITE',
+          attachHttpStatus: 400,
+          attachAttemptId: REQUEST_ID,
+        },
+      });
+      if (outcome.kind === 'fenced') throw new Error('expected failure commit');
+      expect(outcome.receipt.terminalAt).toBeInstanceOf(Date);
+      expect(outcome.receipt.attachOutcomeObservedAt).toBeNull();
+      const after = await row();
+      expect(after).toMatchObject({
+        status: 'FAILED',
+        failure_stage: 'ATTACH_DEFINITE',
+        version: '5',
+        attach_http_status: 400,
+        attach_attempt_id: REQUEST_ID,
+        attach_attempts: 1,
+        lease_owner: OWNER,
+        cleanup_pending: false,
+      });
+      expect(after.terminal_at).toBeInstanceOf(Date);
+      expect(after.attach_outcome_observed_at).toBeNull();
+      for (const key of Object.keys(seeded)) {
+        if (
+          [
+            'version',
+            'updated_at',
+            'status',
+            'failure_stage',
+            'attach_http_status',
+            'terminal_at',
+          ].includes(key)
+        )
+          continue;
+        expect(after[key]).toEqual(seeded[key]);
+      }
+    });
+
+    it('accepts exactly the proven non-committing allowlisted statuses', async () => {
+      for (const httpStatus of [400, 401, 403, 404, 409, 422, 429]) {
+        await seed();
+        const outcome = await store.commitAttachDefiniteFailure(
+          command({ httpStatus }),
+        );
+        expect(outcome).toMatchObject({
+          kind: 'failed',
+          version: '5',
+          receipt: { status: 'FAILED', attachHttpStatus: httpStatus },
+        });
+        expect(await row()).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'ATTACH_DEFINITE',
+          version: '5',
+          attach_http_status: httpStatus,
+        });
+      }
+    });
+
+    it('fences every disallowed status without durable mutation', async () => {
+      await seed();
+      for (const httpStatus of [
+        200,
+        201,
+        204,
+        299,
+        302,
+        399,
+        407,
+        408,
+        418,
+        499,
+        500,
+        502,
+        503,
+        599,
+        600,
+        0,
+        -400,
+        3999,
+        400.5,
+        NaN,
+        Infinity,
+      ]) {
+        await expectFenced(command({ httpStatus }));
+      }
+    });
+
+    it('fences wrong fences, malformed inputs, and missing or mismatched request evidence without durable mutation', async () => {
+      await seed();
+      await expectFenced(command({ owner: 'worker.rival' }));
+      await expectFenced(command({ expectedVersion: '3' }));
+      await expectFenced(command({ expectedVersion: '5' }));
+      await expectFenced(command({ expectedVersion: '4.5' }));
+      await expectFenced(command({ expectedVersion: '0' }));
+      await expectFenced(command({ id: UUID_C }));
+      await expectFenced(command({ id: 'not-a-uuid' }));
+      await expectFenced(command({ owner: '' }));
+      await expectFenced(command({ attachAttemptId: 'not-a-uuid' }));
+      await expectFenced(command({ attachAttemptId: '' }));
+      await expectFenced(command({ attachAttemptId: RIVAL_ID }));
+      await seed({ lease_expires_at: new Date(Date.now() - 60_000) });
+      await expectFenced(command());
+      await seed({ attach_attempt_id: RIVAL_ID });
+      await expectFenced(command());
+      await seed({
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+      await seed({
+        status: 'AWAITING_CONFIRMATION',
+        attach_started_at: null,
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+      await seed({
+        status: 'ATTACHED',
+        attach_attempt_id: UUID_C,
+        attached_at: T0,
+        backend_receipt_id: UUID_B,
+        backend_receipt_status: 'PENDING',
+      });
+      await expectFenced(command());
+    });
+
+    it('replays only the exact durable successor and fences every rival', async () => {
+      await seed();
+      expect((await store.commitAttachDefiniteFailure(command())).kind).toBe(
+        'failed',
+      );
+      const successor = await row();
+      const replay = await new PostgresReceiptMediaStore(
+        pool,
+      ).commitAttachDefiniteFailure(command());
+      expect(replay).toMatchObject({
+        kind: 'replayed',
+        version: '5',
+        receipt: {
+          id: UUID_A,
+          status: 'FAILED',
+          version: '5',
+          failureStage: 'ATTACH_DEFINITE',
+          attachHttpStatus: 400,
+        },
+      });
+      if (replay.kind === 'fenced') throw new Error('expected replay');
+      expect(replay.receipt.terminalAt).toBeInstanceOf(Date);
+      expect(await row()).toEqual(successor);
+      await expectFenced(command({ expectedVersion: '5' }));
+      await expectFenced(command({ httpStatus: 401 }));
+      await expectFenced(command({ attachAttemptId: RIVAL_ID }));
+      await expectFenced(command({ owner: 'worker.rival' }));
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      await expectFenced(command());
+      await seed({
+        status: 'FAILED',
+        failure_stage: 'ATTACH_DEFINITE',
+        version: '5',
+        terminal_at: T0,
+        attach_http_status: 429,
+      });
+      await expectFenced(command());
+    });
+
+    it('rolls back the complete failure commit when the receipt update fails', async () => {
+      await seed();
+      const before = await row();
+      await pool.query(
+        `CREATE FUNCTION receipt_attach_definite_failure()
+                    RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN RAISE EXCEPTION 'attach definite failure'; END; $$`,
+      );
+      await pool.query(`CREATE TRIGGER receipt_attach_definite_failure
+                    BEFORE UPDATE ON receipt_media FOR EACH ROW
+                    EXECUTE FUNCTION receipt_attach_definite_failure()`);
+      try {
+        await expect(
+          store.commitAttachDefiniteFailure(command()),
+        ).rejects.toThrow('attach definite failure');
+        expect(await row()).toEqual(before);
+      } finally {
+        await pool.query(
+          `DROP TRIGGER IF EXISTS
+                  receipt_attach_definite_failure ON receipt_media;
+                  DROP FUNCTION IF EXISTS receipt_attach_definite_failure()`,
+        );
+      }
+    });
+
+    it('serializes duplicate failure commits and rejects a rival', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        store.commitAttachDefiniteFailure(command()),
+        store.commitAttachDefiniteFailure(command()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['failed', 'replayed']);
+      expect(await row()).toMatchObject({
+        status: 'FAILED',
+        version: '5',
+        attach_http_status: 400,
+      });
+      await seed();
+      const [c, d] = await Promise.all([
+        store.commitAttachDefiniteFailure(command()),
+        store.commitAttachDefiniteFailure(command({ httpStatus: 401 })),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['failed', 'fenced']);
+      expect(await row()).toMatchObject({
+        status: 'FAILED',
+        version: '5',
+        attach_http_status: 400,
+      });
+    });
+  });
+
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query(
       'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',

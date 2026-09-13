@@ -17,6 +17,8 @@ import type {
   AmountRejectionOutcome,
   AttachCommitSuccessInput,
   AttachCommitSuccessOutcome,
+  AttachDefiniteFailureInput,
+  AttachDefiniteFailureOutcome,
   AttachRequestStartInput,
   AttachRequestStartOutcome,
   AttachStartInput,
@@ -120,10 +122,31 @@ const ATTACH_COMMIT_SUCCESS_SQL = `UPDATE receipt_media
              AND attached_at IS NULL RETURNING *`;
 
 const ATTACH_SUCCESS_LOOK_SQL = `SELECT * FROM receipt_media
-           WHERE id = $1 AND lease_owner = $2
-             AND lease_expires_at > now()`;
+               WHERE id = $1 AND lease_owner = $2
+                 AND lease_expires_at > now()`;
+
+/** WU11A3A: one atomic, parameter-bound fenced UPDATE to FAILED /
+ * ATTACH_DEFINITE with the allowlisted HTTP status and terminal_at;
+ * observed-at stays null per the schema convention, lease fields are
+ * retained per the terminal-transition convention, and no body, auth,
+ * URL, capability, or diagnostic PII is ever persisted. */
+const ATTACH_DEFINITE_FAILURE_SQL = `UPDATE receipt_media
+               SET status = 'FAILED', failure_stage = 'ATTACH_DEFINITE',
+                 attach_http_status = $5, terminal_at = now(),
+                 version = version + 1, updated_at = now()
+               WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+                 AND lease_expires_at > now() AND status = 'ATTACHING'
+                 AND attach_attempts = 1 AND attach_attempt_id = $4
+                 AND attach_request_started_at IS NOT NULL
+                 AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
+                 AND attached_at IS NULL AND attach_http_status IS NULL
+                 AND attach_transport_code IS NULL
+                 AND attach_outcome_observed_at IS NULL RETURNING *`;
 
 const MAX_INT32 = 2_147_483_647;
+
+/** WU11A3A proven non-committing outcomes: the safe allowlisted statuses. */
+const ATTACH_DEFINITE_HTTP_STATUSES = [400, 401, 403, 404, 409, 422, 429];
 const MAX_BIGINT = 9_223_372_036_854_775_807n;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/;
@@ -1216,6 +1239,68 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           current.backend_receipt_id === input.backendReceiptId &&
           current.backend_receipt_status === 'PENDING' &&
           current.attached_at instanceof Date
+          ? {
+              kind: 'replayed',
+              version: successor,
+              receipt: camelize<Media>(current),
+            }
+          : { kind: 'fenced' };
+      });
+    } catch (err) {
+      if (
+        typeof (err as { code?: string }).code === 'string' &&
+        (err as { code?: string }).code === '22P02'
+      )
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** WU11A3A terminal failure commit; see ATTACH_DEFINITE_FAILURE_SQL. */
+  async commitAttachDefiniteFailure(
+    input: AttachDefiniteFailureInput,
+  ): Promise<AttachDefiniteFailureOutcome> {
+    const successor = successorVersion(input?.expectedVersion);
+    if (
+      successor === null ||
+      typeof input?.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input?.owner !== 'string' ||
+      input.owner.length === 0 ||
+      typeof input?.attachAttemptId !== 'string' ||
+      !UUID.test(input.attachAttemptId) ||
+      typeof input?.httpStatus !== 'number' ||
+      !Number.isInteger(input.httpStatus) ||
+      !ATTACH_DEFINITE_HTTP_STATUSES.includes(input.httpStatus)
+    )
+      return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const updated = await c.query<Row>(ATTACH_DEFINITE_FAILURE_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          input.attachAttemptId,
+          input.httpStatus,
+        ]);
+        if (updated.rowCount === 1) {
+          const receipt = updated.rows[0];
+          return {
+            kind: 'failed',
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const current = (
+          await c.query<Row>(ATTACH_SUCCESS_LOOK_SQL, [input.id, input.owner])
+        ).rows[0];
+        return current?.status === 'FAILED' &&
+          current.failure_stage === 'ATTACH_DEFINITE' &&
+          String(current.version) === successor &&
+          current.attach_attempt_id === input.attachAttemptId &&
+          current.attach_http_status === input.httpStatus &&
+          current.attach_outcome_observed_at === null &&
+          current.terminal_at instanceof Date
           ? {
               kind: 'replayed',
               version: successor,

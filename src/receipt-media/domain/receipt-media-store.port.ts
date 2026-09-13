@@ -148,6 +148,24 @@ export interface AttachCommitSuccessInput extends LeaseFenceInput {
   backendReceiptId: string;
 }
 
+/** One immutable definite-attachment-failure terminal command for the exact
+ * active ATTACHING receipt with request-start evidence: the durable
+ * attach-attempt identity plus a proven allowlisted backend HTTP status
+ * (400/401/403/404/409/422/429). */
+export interface AttachDefiniteFailureInput extends LeaseFenceInput {
+  attachAttemptId: string;
+  httpStatus: number;
+}
+
+/** A replay proves the exact durable successor; every other loser is fenced. */
+export type AttachDefiniteFailureOutcome =
+  | {
+      kind: 'failed' | 'replayed';
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | { kind: 'fenced' };
+
 /** A replay proves the exact durable successor; every other loser is fenced. */
 export type AttachCommitSuccessOutcome =
   | {
@@ -258,6 +276,15 @@ export interface ReceiptMediaStorePort {
   commitAttachSuccess(
     input: AttachCommitSuccessInput,
   ): Promise<AttachCommitSuccessOutcome>;
+  /** WU11A3A definite attachment failure terminal commit: atomically
+   * transition the exact active ATTACHING row with request-start evidence
+   * and the matching attempt identity to FAILED under the caller's live
+   * lease, persisting only failure_stage = ATTACH_DEFINITE, the safe
+   * allowlisted HTTP status, and terminal_at; only the exact durable
+   * successor replays; everything else is fenced without mutation. */
+  commitAttachDefiniteFailure(
+    input: AttachDefiniteFailureInput,
+  ): Promise<AttachDefiniteFailureOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment;
    * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */
