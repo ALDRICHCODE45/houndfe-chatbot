@@ -1,7 +1,7 @@
 /** WU2B2A store port (RM1, RM3): reservation, outbox, claim/lease, CAS,
  * and bounded attempt primitives. Conflicts/lost fences return as values
  * (false/null), never thrown. WU6B adds the hash-indexed capability access
- * lookup (RMA2, RMA3). */
+ * lookup (RMA2, RMA3); WU10C3A adds the fenced attachment start. */
 import type { ReceiptAmountPointer } from '../../conversation/domain/conversation-store';
 import type {
   ReceiptMediaOutboxRow,
@@ -98,6 +98,25 @@ export type ReceiptCancellationOutcome =
     }
   | { kind: 'fenced' };
 
+/** One immutable attachment-start command for a confirmed amount. */
+export interface AttachStartInput {
+  sourceWebhookMessageId: string;
+  senderId: string;
+  receiptMediaId: string;
+  capturedSaleId: string;
+  expectedReceiptStatus: 'AWAITING_CONFIRMATION';
+  expectedReceiptVersion: string;
+  expectedPointer: ReceiptAmountPointer;
+}
+
+export type AttachStartOutcome =
+  | {
+      kind: 'started' | 'replayed';
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -176,6 +195,9 @@ export interface ReceiptMediaStorePort {
   cancelReceipt(
     input: ReceiptCancellationInput,
   ): Promise<ReceiptCancellationOutcome>;
+  /** Atomically start the attachment (AWAITING_CONFIRMATION → ATTACHING),
+   * clear the exact pointer, and insert the in-progress intent. */
+  startAttachment(input: AttachStartInput): Promise<AttachStartOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment. */
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;

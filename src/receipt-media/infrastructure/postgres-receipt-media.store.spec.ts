@@ -8,6 +8,8 @@ import type {
   AmountProposalOutcome,
   AmountRejectionInput,
   AmountRejectionOutcome,
+  AttachStartInput,
+  AttachStartOutcome,
   AttemptStartResult,
   LeaseFenceInput,
   OutboxIntentInput,
@@ -3768,6 +3770,214 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           },
           );
     afterAll(reset);
+  });
+
+  // --- WU10C3A atomic attachment start (confirmation → attaching) ---
+
+  describe('WU10C3A atomic attachment start', () => {
+    const start = (input: AttachStartInput): Promise<AttachStartOutcome> =>
+      store.startAttachment(input);
+    const SENDER = 'sender.attach-start';
+    const POINTER = {
+      receiptMediaId: UUID_A,
+      saleId: UUID_B,
+      receiptVersion: '3',
+    };
+    const command = (
+      over: Partial<AttachStartInput> = {},
+    ): AttachStartInput => ({
+      sourceWebhookMessageId: 'wamid.attach-start.1',
+      senderId: SENDER,
+      receiptMediaId: UUID_A,
+      capturedSaleId: UUID_B,
+      expectedReceiptStatus: 'AWAITING_CONFIRMATION' as const,
+      expectedReceiptVersion: '3',
+      expectedPointer: POINTER,
+      ...over,
+    });
+    const seed = async (
+      data: unknown = {
+        sibling: { keep: true },
+        receiptAmountPointer: POINTER,
+      },
+      receiptOver: Row = {},
+    ) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      await pool.query('DELETE FROM conversation_state WHERE sender_id = $1', [
+        SENDER,
+      ]);
+      const receipt = lifeRow('AWAITING_CONFIRMATION', null, {
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        version: '3',
+        amount_proposed_at: T0,
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      await pool.query(
+        `INSERT INTO conversation_state (sender_id, last_message_at, data)
+                 VALUES ($1, now(), $2::jsonb)`,
+        [SENDER, JSON.stringify(data)],
+      );
+    };
+    const snapshot = async () => {
+      const [receipt, conversation, outbox] = await Promise.all([
+        pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [UUID_A]),
+        pool.query<Row>(
+          'SELECT data FROM conversation_state WHERE sender_id = $1',
+          [SENDER],
+        ),
+        pool.query<Row>('SELECT * FROM receipt_media_outbox'),
+      ]);
+      return {
+        receipt: receipt.rows[0],
+        conversation: conversation.rows[0]?.data as Row | undefined,
+        outbox: outbox.rows,
+      };
+    };
+    const expectFenced = async (input: AttachStartInput = command()) => {
+      const before = await snapshot();
+      await expect(start(input)).resolves.toEqual({ kind: 'fenced' });
+      expect(await snapshot()).toEqual(before);
+    };
+
+    it('starts the attachment and clears the exact pointer', async () => {
+      const LEASE_END = new Date(Date.now() + 60_000);
+      await seed(undefined, {
+        lease_owner: 'worker.attach-start',
+        lease_expires_at: LEASE_END,
+      });
+      const outcome = await start(command());
+      expect(outcome.kind).toBe('started');
+      if (outcome.kind === 'fenced') throw new Error('expected start');
+      // prettier-ignore
+      expect(outcome.receipt).toMatchObject({ id: UUID_A, status: 'ATTACHING', declaredAmountCents: 1250, attachAttempts: 0, attachRequestStartedAt: null, attachAttemptId: null, version: '4' });
+      // prettier-ignore
+      expect(outcome.intent).toMatchObject({ receiptMediaId: UUID_A, receiptStateVersion: '4', sourceWebhookMessageId: 'wamid.attach-start.1', recipientId: SENDER, templateKey: 'RECEIPT_IN_PROGRESS', templateArgs: {} });
+      const after = await snapshot();
+      expect(after.conversation).toEqual({ sibling: { keep: true } });
+      expect(after.outbox).toHaveLength(1);
+      // prettier-ignore
+      expect(after.receipt).toMatchObject({ declared_amount_cents: 1250, amount_proposed_at: T0, lease_owner: 'worker.attach-start', lease_expires_at: LEASE_END });
+      expect(after.receipt.attach_started_at).toBeInstanceOf(Date);
+    });
+
+    // prettier-ignore
+    it.each([
+          ['wrong sender', undefined, { senderId: 'sender.other' }, {}],
+          ['wrong receipt', undefined, { receiptMediaId: UUID_C, expectedPointer: { ...POINTER, receiptMediaId: UUID_C } }, {}],
+          ['wrong sale', undefined, { capturedSaleId: UUID_C, expectedPointer: { ...POINTER, saleId: UUID_C } }, {}],
+          ['wrong version', undefined, { expectedReceiptVersion: '2', expectedPointer: { ...POINTER, receiptVersion: '2' } }, {}],
+          ['wrong stored status', undefined, {}, { status: 'STORED', declared_amount_cents: null, amount_proposed_at: null }],
+          ['missing proposal timestamp', undefined, {}, { amount_proposed_at: null }],
+          ['absent pointer', { sibling: true }, {}, {}],
+          ['extra-key pointer', { receiptAmountPointer: { ...POINTER, extra: true } }, {}, {}],
+          ['wrong-version pointer', { receiptAmountPointer: { ...POINTER, receiptVersion: '4' } }, {}, {}],
+        ])('%s fences without durable mutation', async (_label, data, over, receiptOver) => {
+          await seed(data, receiptOver);
+          await expectFenced(command(over));
+        });
+
+    it('rolls back receipt and pointer when the intent insert fails', async () => {
+      await seed();
+      const before = await snapshot();
+      await pool.query(`CREATE FUNCTION receipt_attach_start_outbox_failure()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'attach start outbox failure'; END; $$`);
+      await pool.query(`CREATE TRIGGER receipt_attach_start_outbox_failure
+            BEFORE INSERT ON receipt_media_outbox
+            FOR EACH ROW EXECUTE FUNCTION receipt_attach_start_outbox_failure()`);
+      try {
+        await expect(start(command())).rejects.toThrow(
+          'attach start outbox failure',
+        );
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS
+          receipt_attach_start_outbox_failure ON receipt_media_outbox;
+          DROP FUNCTION IF EXISTS receipt_attach_start_outbox_failure()`);
+      }
+    });
+
+    it('rolls back the receipt when the pointer update is suppressed', async () => {
+      await seed();
+      const before = await snapshot();
+      await pool.query(`CREATE FUNCTION receipt_attach_start_pointer_fence()
+            RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RETURN NULL; END; $$`);
+      await pool.query(`CREATE TRIGGER receipt_attach_start_pointer_fence
+            BEFORE UPDATE ON conversation_state FOR EACH ROW
+            EXECUTE FUNCTION receipt_attach_start_pointer_fence()`);
+      try {
+        await expect(start(command())).resolves.toEqual({ kind: 'fenced' });
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS
+          receipt_attach_start_pointer_fence ON conversation_state;
+          DROP FUNCTION IF EXISTS receipt_attach_start_pointer_fence()`);
+      }
+    });
+
+    it('replays only the exact durable successor and fences every rival', async () => {
+      await seed();
+      const first = command();
+      expect((await start(first)).kind).toBe('started');
+      const replay = await new PostgresReceiptMediaStore(pool).startAttachment(
+        first,
+      );
+      // prettier-ignore
+      expect(replay).toMatchObject({ kind: 'replayed', receipt: { id: UUID_A, status: 'ATTACHING', version: '4', declaredAmountCents: 1250 }, intent: { templateKey: 'RECEIPT_IN_PROGRESS', templateArgs: {} } });
+      await expectFenced(
+        command({ sourceWebhookMessageId: 'wamid.attach-start.2' }),
+      );
+      await pool.query(
+        "UPDATE conversation_state SET data = jsonb_set(data, '{receiptAmountPointer}', $1::jsonb, true) WHERE sender_id = $2",
+        [JSON.stringify({ ...POINTER, receiptVersion: '4' }), SENDER],
+      );
+      await expectFenced(first);
+      await pool.query(
+        "UPDATE conversation_state SET data = data - 'receiptAmountPointer' WHERE sender_id = $1",
+        [SENDER],
+      );
+      await pool.query(
+        "UPDATE receipt_media_outbox SET template_args = '[]'::jsonb",
+      );
+      await expectFenced(first);
+      await pool.query(
+        "UPDATE receipt_media_outbox SET template_args = '{}'::jsonb",
+      );
+      await pool.query(
+        "UPDATE receipt_media SET attach_attempts = 1, attach_request_started_at = now(), attach_attempt_id = '11111111-1111-4111-8111-111111111111'",
+      );
+      await expectFenced(first);
+      expect((await snapshot()).outbox).toHaveLength(1);
+    });
+
+    it('serializes concurrent duplicate and rival starts', async () => {
+      await seed();
+      const [a, b] = await Promise.all([start(command()), start(command())]);
+      expect([a.kind, b.kind].sort()).toEqual(['replayed', 'started']);
+      expect((await snapshot()).outbox).toHaveLength(1);
+      await seed();
+      const [first, rival] = await Promise.all([
+        start(command()),
+        start(command({ sourceWebhookMessageId: 'wamid.attach-start.2' })),
+      ]);
+      expect([first.kind, rival.kind].sort()).toEqual(['fenced', 'started']);
+      const durable = await snapshot();
+      expect(durable.receipt).toMatchObject({
+        status: 'ATTACHING',
+        declared_amount_cents: 1250,
+        version: '4',
+      });
+      expect(durable.conversation).toEqual({ sibling: { keep: true } });
+      expect(durable.outbox).toHaveLength(1);
+    });
   });
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query(

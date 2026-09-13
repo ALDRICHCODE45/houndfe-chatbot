@@ -15,6 +15,8 @@ import type {
   AmountProposalOutcome,
   AmountRejectionInput,
   AmountRejectionOutcome,
+  AttachStartInput,
+  AttachStartOutcome,
   AttemptStartResult,
   CapabilityAccessRow,
   DownloadCommitInput,
@@ -288,6 +290,25 @@ const isCancellationInput = (
   input.expectedPointer.saleId === input.capturedSaleId &&
   input.expectedPointer.receiptVersion === input.expectedReceiptVersion;
 
+const isAttachStartInput = (
+  input: AttachStartInput,
+  successor: string | null,
+): successor is string =>
+  successor !== null &&
+  input.expectedReceiptStatus === 'AWAITING_CONFIRMATION' &&
+  typeof input.sourceWebhookMessageId === 'string' &&
+  input.sourceWebhookMessageId.length > 0 &&
+  typeof input.senderId === 'string' &&
+  input.senderId.length > 0 &&
+  typeof input.receiptMediaId === 'string' &&
+  UUID.test(input.receiptMediaId) &&
+  typeof input.capturedSaleId === 'string' &&
+  UUID.test(input.capturedSaleId) &&
+  isReceiptAmountPointer(input.expectedPointer) &&
+  input.expectedPointer.receiptMediaId === input.receiptMediaId &&
+  input.expectedPointer.saleId === input.capturedSaleId &&
+  input.expectedPointer.receiptVersion === input.expectedReceiptVersion;
+
 const amountStateMatches = (row: Row, status: string): boolean =>
   status === 'AWAITING_AMOUNT'
     ? row.declared_amount_cents === null && row.amount_proposed_at === null
@@ -310,6 +331,22 @@ const cancellationIntentMatches = (
   row.source_webhook_message_id === input.sourceWebhookMessageId &&
   row.recipient_id === input.senderId &&
   row.template_key === 'RECEIPT_CANCELLED' &&
+  isRecord(row.template_args) &&
+  Object.keys(row.template_args).length === 0;
+
+const attachStartIntentMatches = (
+  row: Row | undefined,
+  input: AttachStartInput,
+  successor: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === input.receiptMediaId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === input.sourceWebhookMessageId &&
+  row.recipient_id === input.senderId &&
+  row.template_key === 'RECEIPT_IN_PROGRESS' &&
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
 
@@ -885,6 +922,133 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         'receipt_media_cancellation_commands_sender_webhook_key'
       )
         return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** WU10C3A: receipt-first atomic attach start; only the exact durable
+   * successor (ATTACHING, retained amount, absent pointer, intent) replays. */
+  async startAttachment(input: AttachStartInput): Promise<AttachStartOutcome> {
+    const successor = successorVersion(input.expectedReceiptVersion);
+    if (!isAttachStartInput(input, successor)) return { kind: 'fenced' };
+    const dedupeKey = `receipt-in-progress:${input.receiptMediaId}:${input.expectedReceiptVersion}:${input.sourceWebhookMessageId}`;
+    try {
+      return await this.withTx(async (c) => {
+        const receipt = (
+          await c.query<Row>(
+            'SELECT * FROM receipt_media WHERE id = $1 FOR UPDATE',
+            [input.receiptMediaId],
+          )
+        ).rows[0];
+        const conversation = (
+          await c.query<Row>(
+            'SELECT data FROM conversation_state WHERE sender_id = $1 FOR UPDATE',
+            [input.senderId],
+          )
+        ).rows[0];
+        if (!receipt || !conversation || !isRecord(conversation.data))
+          throw FENCED;
+        const data = conversation.data;
+        const receiptMatches =
+          receipt.sender_id === input.senderId &&
+          receipt.captured_sale_id === input.capturedSaleId;
+        if (
+          receiptMatches &&
+          receipt.status === 'ATTACHING' &&
+          receipt.version === successor &&
+          amountStateMatches(receipt, 'AWAITING_CONFIRMATION') &&
+          receipt.attach_started_at instanceof Date &&
+          receipt.attach_attempts === 0 &&
+          receipt.attach_request_started_at === null &&
+          receipt.attach_attempt_id === null &&
+          !Object.hasOwn(data, 'receiptAmountPointer')
+        ) {
+          const intent = (
+            await c.query<Row>(
+              'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+              [dedupeKey],
+            )
+          ).rows[0];
+          if (!attachStartIntentMatches(intent, input, successor, dedupeKey))
+            throw FENCED;
+          return {
+            kind: 'replayed',
+            receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
+          };
+        }
+        if (
+          !receiptMatches ||
+          receipt.status !== input.expectedReceiptStatus ||
+          receipt.version !== input.expectedReceiptVersion ||
+          !amountStateMatches(receipt, input.expectedReceiptStatus) ||
+          !samePointer(data.receiptAmountPointer, input.expectedPointer)
+        )
+          throw FENCED;
+        const updated = await c.query<Row>(
+          `UPDATE receipt_media SET status = 'ATTACHING',
+                 attach_started_at = now(), version = version + 1,
+                 updated_at = now()
+               WHERE id = $1 AND sender_id = $2 AND captured_sale_id = $3
+                 AND status = 'AWAITING_CONFIRMATION' AND version = $4::bigint
+                 AND declared_amount_cents > 0 AND amount_proposed_at IS NOT NULL
+                 AND attach_attempts = 0 AND attach_request_started_at IS NULL
+                 AND attach_attempt_id IS NULL RETURNING *`,
+          [
+            input.receiptMediaId,
+            input.senderId,
+            input.capturedSaleId,
+            input.expectedReceiptVersion,
+          ],
+        );
+        if (updated.rowCount !== 1) throw FENCED;
+        const pointer = await c.query(
+          `UPDATE conversation_state SET data = data - 'receiptAmountPointer'
+               WHERE sender_id = $1
+                 AND jsonb_typeof(data->'receiptAmountPointer') = 'object'
+                 AND data->'receiptAmountPointer' = jsonb_build_object(
+                   'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
+                   'saleId', data->'receiptAmountPointer'->'saleId',
+                   'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
+                 AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
+                 AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
+                 AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
+                 AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
+                 AND data->'receiptAmountPointer'->>'saleId' = $3
+                 AND data->'receiptAmountPointer'->>'receiptVersion' = $4`,
+          [
+            input.senderId,
+            input.receiptMediaId,
+            input.capturedSaleId,
+            input.expectedReceiptVersion,
+          ],
+        );
+        if (pointer.rowCount !== 1) throw FENCED;
+        const intent = await c.query<Row>(
+          `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+                 receipt_state_version, source_webhook_message_id, recipient_id,
+                 template_key, template_args)
+               VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_IN_PROGRESS', $7::jsonb)
+               ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+          [
+            randomUUID(),
+            dedupeKey,
+            input.receiptMediaId,
+            successor,
+            input.sourceWebhookMessageId,
+            input.senderId,
+            JSON.stringify({}),
+          ],
+        );
+        if (intent.rowCount !== 1) throw FENCED;
+        return {
+          kind: 'started',
+          receipt: camelize<Media>(updated.rows[0]),
+          intent: camelize<ReceiptMediaOutboxRow>(intent.rows[0]),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
       throw err;
     }
   }
