@@ -33,7 +33,7 @@ documented in `AGENTS.md` §4.4.x verbatim. The registry docstring MUST read "tw
 sale-flow tools" (bumped from eleven).
 
 | Tool | Backend endpoint (`AGENTS.md` § / backend `PROGRAM-CONTEXT.md`) | Scope |
-|---|---|---|
+| --- | --- | --- |
 | `searchCatalog` | §4.4.1 `GET /chatbot-api/catalog/search` | `catalog:read` |
 | `checkStock` | §4.4.2 `GET /chatbot-api/catalog/:productId/stock` | `catalog:read` |
 | `evaluateCart` | §4.4.3 `POST /chatbot-api/pricing/evaluate-cart` | `pricing:evaluate` |
@@ -103,13 +103,66 @@ Each tool's `inputSchema` (Zod object) MUST enforce the validations declared in
   described in the human-handoff spec (3 active kinds today; `shipping_approval` is
   reserved for the future R6 slice and is NOT in the union yet).
 
-#### Scenario: A representative schema rejects malformed inputs
+#### Requirement: `attachReceipt` is a terminal compatibility tool with no backend attachment path
 
-- GIVEN the `attachReceipt` tool
-- WHEN the model invokes it with `{ saleId: "not-a-uuid", mediaUrl: "not-a-url",
-  declaredAmountCents: 0 }`
-- THEN the schema parse MUST fail with a Zod error
+The `attachReceipt` tool MUST NOT call `POST /chatbot-api/sales/:saleId/receipts` (§4.4.7). It exists solely to suppress model-direct `attachReceipt` calls that would bypass the server-owned `ReceiptAttachmentService` — the sole §4.4.7 path, which sources `capturedSaleId`/`capturedObjectKey`/`capturedAmount` from the durable `Started` successor created by `SaleConfirmedEvent`. Without this compatibility tool, the LLM would attempt to call `attachReceipt` directly with model-supplied `saleId`/`mediaUrl`/`declaredAmountCents`, creating a conflict with the server-owned durable workflow that already owns those fields.
+
+The `ReceiptAttachmentService` is the sole owner of §4.4.7. It is not triggered by a tool call from the LLM; it is triggered by a WhatsApp webhook event that signals a new media message, correlated to an active sale session via `startedSaleId`. It captures the sale ID, object key, and amount from the `Started` successor record — not from LLM-supplied parameters. If the LLM were to call `attachReceipt` with a fabricated `saleId` and `mediaUrl`, two competing attachment records would be created for the same sale, breaking the idempotent receipt workflow. The compatibility tool prevents this by returning terminal guidance on any input, so the LLM never calls the underlying API. The guidance is also deliberately un-actionable: it tells the LLM what not to do and where the real path is, without providing a tool-callable substitute.
+
+The tool guarantees idempotency: since it never calls the backend, it can never produce a conflicting outcome. The LLM always receives terminal guidance that redirects the customer to the server-owned workflow, which is the only path that can successfully attach a receipt. The LLM also MUST NOT keep asking the customer for sale identifiers or media URLs after receiving the terminal result — the guidance explicitly forbids collecting or deriving any of the nine protected fields.
+
+The bot's posture after receiving the terminal result is reactive: it acknowledges the customer's receipt image, confirms pending human review, and waits for the next customer message. The bot does not poll for confirmation, does not re-call `attachReceipt`, and does not attempt any alternative path. The guidance uses the word "terminal" to signal that no further tool-call loop should be entered for this topic.
+
+If the LLM has an active sale context (i.e., the customer is mid-flow and a sale has been confirmed), the receipt image is automatically received by the `ReceiptAttachmentService` via the WhatsApp webhook without any tool call. If no active sale context exists, the terminal guidance still applies — the LLM should not attempt to locate or resume a sale, and should inform the customer that receipt handling is in progress.
+
+The following fields MUST NOT be collected, derived, or sent by the LLM for receipt attachment: `saleId`, `mediaUrl`, `objectKey`, `token`, `capability`, `pendingMedia`, `amount`, `date`, `reference`. Any attempt to do so violates the terminal guidance and the LLM MUST receive the terminal result instead.
+
+**Scope.** The compatibility tool is a signal-only terminal guard: it does not call the backend, does not read conversation state, and does not attempt receipt attachment through any path. The `ReceiptAttachmentService` handles the actual receipt workflow and is not modified by this change. The tool exists at the AI-SDK tool registration layer only.
+
+**Non-Goals.** This tool does not upload receipts, does not handle WhatsApp media webhook events, does not confirm receipts, does not send proactive messages, does not modify the `ReceiptAttachmentService`, and does not provide any path for the LLM to attach a receipt directly. The guidance is intentionally un-actionable: it names what the LLM must not do and where the real path is, without offering a tool-callable substitute.
+
+**Idempotency.** Because the tool never calls the backend, repeated calls produce no side effects and always return the same terminal result. The LLM receives consistent guidance on every invocation, regardless of session state, sale context, or prior tool-call history.
+
+**Bot posture.** After delivering the terminal guidance, the bot acknowledges the customer's receipt image, confirms pending human review, and waits. The bot does not poll for confirmation, does not re-call `attachReceipt`, and does not attempt alternative paths.
+
+- The input schema MUST be `z.object({}).strict()`: unknown fields (e.g. `saleId`, `mediaUrl`, `declaredAmountCents`) MUST be rejected, not stripped.
+- If called with a `saleId` UUID, `mediaUrl`, or `declaredAmountCents`, the schema parse MUST fail with a Zod error.
+- On any valid input, the `execute` MUST return the canonical terminal guidance `{ ok: true, terminal: true, guidance: "Receipt images are handled by the server-owned durable receipt workflow. Do not retry this tool, and do not request or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference." }`.
+- No code path makes a call to `chatbotApi.attachReceipt` or any `POST /chatbot-api/sales/:saleId/receipts` equivalent.
+- The `makeAttachReceiptTool` factory takes zero deps (no `ChatbotApiClient`, no `ConversationStore`).
+
+#### Scenario: strict unknown-field rejection returns the exact terminal guidance result
+
+- GIVEN the `attachReceipt` tool is registered in the `RealToolRegistry` (the AI-SDK ToolSet registry that resolves all 12 tools including this one)
+- WHEN the model invokes it with an empty object `{}`
+- THEN the schema `parse({})` MUST succeed and return `{}`
+- AND `execute({})` MUST return the canonical terminal guidance `{ ok: true, terminal: true, guidance: "Receipt images are handled by the server-owned durable receipt workflow. Do not retry this tool, and do not request or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference." }`
+- AND the result MUST equal the exported `TERMINAL_RECEIPT_GUIDANCE` constant from `src/sale-flow/application/tools/attach-receipt.tool.ts`
+- AND no backend call of any kind is made.
+
+#### Scenario: protected fields and sale-B payloads are rejected at input validation
+
+- GIVEN the `attachReceipt` tool is registered in the `RealToolRegistry`
+- WHEN the model invokes it with a payload containing any of `saleId`, `mediaUrl`, `declaredAmountCents`, `declaredDate`, or `declaredReference`
+- THEN the schema `safeParse(payload)` MUST return `{ success: false }` (rejected, not stripped)
+- AND the schema `parse(payload)` MUST throw a Zod error listing the unexpected keys
+- AND `execute` MUST NOT be called
 - AND the underlying `chatbotApi.attachReceipt` MUST NOT be called.
+
+#### Scenario: every path makes zero chatbotApi.attachReceipt calls
+
+- GIVEN the `attachReceipt` tool registered in the `RealToolRegistry` with a DI-resolved (stubbed) `ChatbotApiClient`
+- WHEN `execute` is called with `{}`, a protected-field payload, or any other input including no active sale context
+- THEN `chatbotApi.attachReceipt` MUST NOT be called on any code path
+- AND `conversationStore.get` MUST NOT be called on any code path.
+
+#### Scenario: use the server-owned receipt workflow, not direct attachReceipt
+
+- GIVEN a customer sends a transfer receipt image during an active sale session
+- WHEN the LLM invokes `attachReceipt` (direct or via any path)
+- THEN the LLM SHOULD receive terminal guidance directing it to the server-owned workflow
+- AND the LLM SHOULD acknowledge receipt to the customer and explain that the receipt is pending human review.
+- The `ReceiptAttachmentService` (`src/receipt-media/application/receipt-attachment.service.ts`) remains the sole §4.4.7 path: it is not modified by this change and continues operating independently of any AI direct-attachment calls.
 
 #### Scenario: requestHumanAssistance input schema rejects shipping_approval today
 
@@ -138,7 +191,7 @@ on the `ChatbotApiError.errorCode` FIRST, and MUST fall back to the HTTP-status-
 mapping only when `errorCode` is `null`:
 
 | Backend `errorCode` (or HTTP status when `errorCode` is absent) | `kind` | `retryable` |
-|---|---|---|
+| --- | --- | --- |
 | `NO_ACTIVE_PAYMENT_DETAIL` (404) | `noActivePaymentDetail` | `false` |
 | `PROMO_RE_QUOTE` (409) | `promoReQuote` | `false` |
 | `IDEMPOTENCY_KEY_IN_FLIGHT` (409) | `idempotencyInFlight` | `true` |
@@ -165,6 +218,7 @@ NEVER parse the `message` string for branching.
 
 The `requestHumanAssistance` tool is NOT a chatbot-api caller; it does NOT produce any
 of the HTTP-driven kinds above. Its only failure kinds are:
+
 - `disabled` (`retryable: false`) when `HUMAN_HANDOFF_ENABLED === false`.
 - `validation` (`retryable: false`) when the discriminated-union Zod parse fails or
   when the `shipping_approval` kind is presented.
@@ -321,7 +375,7 @@ The tool MUST branch on `ChatbotApiError.errorCode` for the four new codes plus
 `idempotencyKey` per the contract:
 
 | Backend `errorCode` (`statusCode`) | Returned `kind` | `retryable` | Cart `items` | Cart `idempotencyKey` | Surface `discountCents`? |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `PROMO_RE_QUOTE` (409) | `promoReQuote` | `false` | preserved | cleared | yes (in error envelope) |
 | `IDEMPOTENCY_KEY_IN_FLIGHT` (409) | `idempotencyInFlight` | `true` | preserved | preserved | n/a |
 | `IDEMPOTENCY_KEY_CONFLICT` (409) | `idempotencyConflict` | `false` | preserved | cleared | n/a |
@@ -427,7 +481,7 @@ sale flow:
     pause. Otherwise render the bank-details block (bankName, beneficiary, clabe,
     accountNumber) and ask for the transfer receipt. Never call `getPaymentDetails`
     before `createSale` confirms a sale.
-13. On receipt image, call `attachReceipt`.
+13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT call `attachReceipt` and do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference. The server-owned workflow attaches the receipt automatically after the sale is confirmed; acknowledge that the receipt was received and is pending human review, and if `attachReceipt` ever returns a result, treat it as terminal guidance — never retry it and never ask the customer for any protected identifier.
 14. On a customer cancel request, cancel ONLY the sale just confirmed in this
     session. Never cancel historical or multi-order sales; never derive a `saleId`
     from `getOrderHistory`. Re-show the sale summary (folio + total + status from
