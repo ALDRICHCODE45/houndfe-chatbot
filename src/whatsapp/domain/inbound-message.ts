@@ -16,4 +16,24 @@ export interface InboundMessage {
    * at the same bot number).
    */
   receivingPhoneNumberId?: string;
+  /**
+   * Optional normalized media envelope for `type: 'image'` and
+   * `type: 'document'` inbound messages. Present only when the payload
+   * is structurally valid (id + mime present and type matches payload).
+   */
+  media?: InboundMedia;
+}
+
+/**
+ * Immutable optional media envelope for image/document inbound messages.
+ * All fields are narrow and optional except `kind`, `providerMediaId`,
+ * and `declaredMimeType` which are always populated for a valid envelope.
+ */
+export interface InboundMedia {
+  readonly kind: 'image' | 'document';
+  readonly providerMediaId: string;
+  readonly declaredMimeType: string;
+  readonly caption?: string;
+  readonly filename?: string;
+  readonly sha256?: string;
 }

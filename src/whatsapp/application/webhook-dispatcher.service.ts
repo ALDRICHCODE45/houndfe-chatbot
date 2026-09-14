@@ -11,14 +11,17 @@ import {
 } from '../../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
-import { InboundMessage } from '../domain/inbound-message';
+import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import { RECENT_OUTBOUND } from '../domain/recent-outbound.store';
 import type { RecentOutboundStore } from '../domain/recent-outbound.store';
 import { WEBHOOK_DEDUP } from '../domain/webhook-dedup.store';
 import type { WebhookDedupStore } from '../domain/webhook-dedup.store';
-import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
+import {
+  WebhookEventDto,
+  WebhookMessageDto,
+} from '../presentation/dto/webhook-event.dto';
 
 /**
  * WebhookDispatcherService (agent + human-handoff router)
@@ -211,6 +214,43 @@ export class WebhookDispatcherService {
   }
 }
 
+// ── WU13-A2: normalizeInboundMessages media helper ───────────────────────
+function normalizeMediaPayload(
+  message: WebhookMessageDto,
+  kind: 'image' | 'document',
+): InboundMedia | null {
+  const payload = kind === 'image' ? message.image : message.document;
+
+  if (
+    !payload ||
+    typeof payload.id !== 'string' ||
+    payload.id.length === 0 ||
+    typeof payload.mime_type !== 'string' ||
+    payload.mime_type.length === 0
+  ) {
+    return null;
+  }
+
+  // Drop if the declared type does not match the actual payload MIME category.
+  // Guard against a structurally anomalous DTO where `type` claims 'document'
+  // but the actual payload is an image (or vice versa).
+  if (kind === 'image' && !payload.mime_type.startsWith('image/')) {
+    return null;
+  }
+  if (kind === 'document' && !payload.mime_type.startsWith('application/pdf')) {
+    return null;
+  }
+
+  return {
+    kind,
+    providerMediaId: payload.id,
+    declaredMimeType: payload.mime_type,
+    caption: payload.caption,
+    filename: payload.filename,
+    sha256: payload.sha256,
+  };
+}
+
 export function normalizeInboundMessages(
   event: WebhookEventDto,
 ): InboundMessage[] {
@@ -225,30 +265,61 @@ export function normalizeInboundMessages(
           ? value.metadata.phone_number_id
           : undefined;
 
-      return (value?.messages ?? []).flatMap((message) => {
+      return (value?.messages ?? []).flatMap((message): InboundMessage[] => {
         if (
-          message.type !== 'text' ||
-          typeof message.text?.body !== 'string' ||
-          typeof message.id !== 'string' ||
-          typeof message.timestamp !== 'string'
+          message.type === 'text' &&
+          typeof message.text?.body === 'string' &&
+          typeof message.id === 'string' &&
+          typeof message.timestamp === 'string'
         ) {
-          return [];
+          const senderId = message.from ?? fallbackSenderId;
+          if (typeof senderId !== 'string' || senderId.length === 0) {
+            return [];
+          }
+          return [
+            {
+              senderId,
+              text: message.text.body,
+              messageId: message.id,
+              timestamp: normalizeTimestamp(message.timestamp),
+              receivingPhoneNumberId,
+            },
+          ];
         }
 
-        const senderId = message.from ?? fallbackSenderId;
-        if (typeof senderId !== 'string' || senderId.length === 0) {
-          return [];
+        // ── WU13-A2: image / document media ──────────────────────
+        if (
+          (message.type === 'image' || message.type === 'document') &&
+          typeof message.id === 'string' &&
+          typeof message.timestamp === 'string'
+        ) {
+          // Drop structural anomaly: both image and document payloads present
+          // (the declared type does not match the "present payload").
+          if (message.image && message.document) {
+            return [];
+          }
+
+          const media = normalizeMediaPayload(message, message.type);
+          if (media === null) return [];
+
+          const senderId = message.from ?? fallbackSenderId;
+          if (typeof senderId !== 'string' || senderId.length === 0) {
+            return [];
+          }
+
+          return [
+            {
+              senderId,
+              text: media.caption ?? '',
+              messageId: message.id,
+              timestamp: normalizeTimestamp(message.timestamp),
+              receivingPhoneNumberId,
+              media,
+            },
+          ];
         }
 
-        return [
-          {
-            senderId,
-            text: message.text.body,
-            messageId: message.id,
-            timestamp: normalizeTimestamp(message.timestamp),
-            receivingPhoneNumberId,
-          },
-        ];
+        return [];
       });
     }),
   );

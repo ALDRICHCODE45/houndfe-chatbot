@@ -703,6 +703,193 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cust-pending');
     });
   });
+
+  // ─── WU13-A2: normalizeInboundMessages — image / document media ───────────
+  describe('normalizeInboundMessages (image + document media)', () => {
+    // Shared sender/metadata anchors
+    const SENDER = '5215550001111';
+    const PHONE_ID = '1234567890';
+
+    const baseEvent = (
+      messages: Record<string, unknown>[],
+    ): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: PHONE_ID },
+                contacts: [{ wa_id: SENDER }],
+                messages,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const baseMessage = (
+      overrides: Record<string, unknown>,
+    ): Record<string, unknown> => ({
+      id: 'wamid.media-1',
+      from: SENDER,
+      timestamp: '1719000000',
+      ...overrides,
+    });
+
+    it('normalizes an image message WITH caption into the domain envelope', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({
+          type: 'image',
+          image: {
+            id: 'media-img-001',
+            mime_type: 'image/jpeg',
+            caption: 'Mira este producto',
+            sha256: 'abc123',
+          },
+        }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].text).toBe('Mira este producto');
+      expect(messages[0].media).toEqual({
+        kind: 'image',
+        providerMediaId: 'media-img-001',
+        declaredMimeType: 'image/jpeg',
+        caption: 'Mira este producto',
+        filename: undefined,
+        sha256: 'abc123',
+      });
+      expect(messages[0].senderId).toBe(SENDER);
+      expect(messages[0].messageId).toBe('wamid.media-1');
+      expect(messages[0].receivingPhoneNumberId).toBe(PHONE_ID);
+    });
+
+    it('normalizes an image message WITHOUT caption as text empty string', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({
+          type: 'image',
+          image: { id: 'media-img-002', mime_type: 'image/png' },
+        }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].text).toBe('');
+      expect(messages[0].media).toEqual({
+        kind: 'image',
+        providerMediaId: 'media-img-002',
+        declaredMimeType: 'image/png',
+        caption: undefined,
+        filename: undefined,
+        sha256: undefined,
+      });
+    });
+
+    it('normalizes a PDF document with filename into the domain envelope', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({
+          type: 'document',
+          document: {
+            id: 'media-doc-001',
+            mime_type: 'application/pdf',
+            filename: 'comprobante.pdf',
+          },
+        }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].text).toBe('');
+      expect(messages[0].media).toEqual({
+        kind: 'document',
+        providerMediaId: 'media-doc-001',
+        declaredMimeType: 'application/pdf',
+        caption: undefined,
+        filename: 'comprobante.pdf',
+        sha256: undefined,
+      });
+    });
+
+    it('uses sender fallback when message.from is absent', () => {
+      const event: WebhookEventDto = baseEvent([
+        {
+          id: 'wamid.media-2',
+          // from omitted — uses contacts[0].wa_id
+          timestamp: '1719000000',
+          type: 'image',
+          image: { id: 'media-img-003', mime_type: 'image/jpeg' },
+        },
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].senderId).toBe(SENDER);
+      expect(messages[0].media?.providerMediaId).toBe('media-img-003');
+    });
+
+    it('drops media message whose image payload is missing', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({ type: 'image' }), // image key absent
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(0);
+    });
+
+    it('drops media message whose id field is missing', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({
+          type: 'image',
+          image: { mime_type: 'image/jpeg' }, // id absent
+        }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(0);
+    });
+
+    it('drops media message whose mime_type is empty string', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({
+          type: 'image',
+          image: { id: 'media-img-004', mime_type: '' },
+        }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(0);
+    });
+
+    it('drops document type whose type field does not match the present payload', () => {
+      // DTO declares type=document but the actual payload is 'image'
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({
+          type: 'document',
+          document: { id: 'media-doc-002', mime_type: 'application/pdf' },
+          image: { id: 'media-img-005', mime_type: 'image/jpeg' },
+        }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      // No message emitted because type=document but image payload is present
+      // (a mismatched structural anomaly — drops the message per spec)
+      expect(messages).toHaveLength(0);
+    });
+
+    it('preserves existing text normalization unchanged', () => {
+      const event: WebhookEventDto = baseEvent([
+        baseMessage({ type: 'text', text: { body: 'hola mundo' } }),
+      ]);
+
+      const messages: InboundMessage[] = normalizeInboundMessages(event);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].text).toBe('hola mundo');
+      expect(messages[0].media).toBeUndefined();
+    });
+  });
 });
 
 // ─── whatsapp-webhook spec §"InboundMessage.receivingPhoneNumberId" ──────────
