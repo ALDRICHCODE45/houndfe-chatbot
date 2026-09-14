@@ -1,10 +1,38 @@
 import { Type } from 'class-transformer';
-import { IsArray, IsOptional, IsString, ValidateNested } from 'class-validator';
+import {
+  IsArray,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  ValidateNested,
+} from 'class-validator';
 
 export class WebhookMessageTextDto {
   @IsOptional()
   @IsString()
   body?: string;
+}
+
+export class WebhookMessageMediaDto {
+  @IsNotEmpty()
+  @IsString()
+  id!: string;
+
+  @IsNotEmpty()
+  @IsString()
+  mime_type!: string;
+
+  @IsOptional()
+  @IsString()
+  caption?: string;
+
+  @IsOptional()
+  @IsString()
+  filename?: string;
+
+  @IsOptional()
+  @IsString()
+  sha256?: string;
 }
 
 export class WebhookMessageDto {
@@ -28,6 +56,16 @@ export class WebhookMessageDto {
   @ValidateNested()
   @Type(() => WebhookMessageTextDto)
   text?: WebhookMessageTextDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMessageMediaDto)
+  image?: WebhookMessageMediaDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMessageMediaDto)
+  document?: WebhookMessageMediaDto;
 }
 
 export class WebhookContactDto {
