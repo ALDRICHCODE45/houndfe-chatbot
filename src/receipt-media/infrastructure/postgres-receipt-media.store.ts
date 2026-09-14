@@ -17,6 +17,8 @@ import type {
   AmountRejectionOutcome,
   AttachCommitSuccessInput,
   AttachCommitSuccessOutcome,
+  AttachCommitUnknownOutcomeInput,
+  AttachCommitUnknownOutcomeOutcome,
   AttachDefiniteFailureInput,
   AttachDefiniteFailureOutcome,
   AttachRequestStartInput,
@@ -141,12 +143,50 @@ const ATTACH_DEFINITE_FAILURE_SQL = `UPDATE receipt_media
                  AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
                  AND attached_at IS NULL AND attach_http_status IS NULL
                  AND attach_transport_code IS NULL
-                 AND attach_outcome_observed_at IS NULL RETURNING *`;
+                   AND attach_outcome_observed_at IS NULL RETURNING *`;
+
+/** WU11A3B: one atomic, parameter-bound fenced UPDATE to the terminal
+ * ATTACH_OUTCOME_UNKNOWN status with exactly one validated evidence
+ * channel; no body, auth, URL, capability, or PII is ever persisted. */
+const ATTACH_UNKNOWN_OUTCOME_SQL = `UPDATE receipt_media
+      SET status = 'ATTACH_OUTCOME_UNKNOWN', attach_http_status = $5,
+        attach_transport_code = $6, attach_outcome_observed_at = now(),
+        terminal_at = now(), version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp() AND status = 'ATTACHING'
+        AND attach_attempts = 1 AND attach_attempt_id = $4
+        AND attach_request_started_at IS NOT NULL
+        AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
+        AND attached_at IS NULL AND attach_http_status IS NULL
+        AND attach_transport_code IS NULL AND attach_outcome_observed_at IS NULL
+      RETURNING *`;
 
 const MAX_INT32 = 2_147_483_647;
 
 /** WU11A3A proven non-committing outcomes: the safe allowlisted statuses. */
 const ATTACH_DEFINITE_HTTP_STATUSES = [400, 401, 403, 404, 409, 422, 429];
+
+/** WU11A3B evidence XOR: exactly one safe channel — an integer HTTP status
+ * 100..599 outside 2xx and the definite allowlist, or the single generic
+ * TRANSPORT_FAILURE code — else null (both/neither/invalid channels). */
+const attachUnknownEvidence = (
+  httpStatus: number | null | undefined,
+  transportCode: string | null | undefined,
+): [number | null, string | null] | null => {
+  const hasHttp = httpStatus !== undefined && httpStatus !== null;
+  const hasTransport = transportCode !== undefined && transportCode !== null;
+  if (hasHttp === hasTransport) return null;
+  if (hasHttp)
+    return typeof httpStatus === 'number' &&
+      Number.isInteger(httpStatus) &&
+      httpStatus >= 100 &&
+      httpStatus <= 599 &&
+      !(httpStatus >= 200 && httpStatus <= 299) &&
+      !ATTACH_DEFINITE_HTTP_STATUSES.includes(httpStatus)
+      ? [httpStatus, null]
+      : null;
+  return transportCode === 'TRANSPORT_FAILURE' ? [null, transportCode] : null;
+};
 const MAX_BIGINT = 9_223_372_036_854_775_807n;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/;
@@ -1316,6 +1356,63 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         return { kind: 'fenced' };
       throw err;
     }
+  }
+
+  /** WU11A3B unknown-outcome terminal commit; see
+   * ATTACH_UNKNOWN_OUTCOME_SQL and attachUnknownEvidence. */
+  async commitAttachUnknownOutcome(
+    input: AttachCommitUnknownOutcomeInput,
+  ): Promise<AttachCommitUnknownOutcomeOutcome> {
+    const successor = successorVersion(input?.expectedVersion);
+    const evidence = attachUnknownEvidence(
+      input?.httpStatus,
+      input?.transportCode,
+    );
+    if (
+      successor === null ||
+      typeof input?.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input?.owner !== 'string' ||
+      input.owner.length === 0 ||
+      typeof input?.attachAttemptId !== 'string' ||
+      !UUID.test(input.attachAttemptId) ||
+      evidence === null
+    )
+      return { kind: 'fenced' };
+    return this.withTx(async (c) => {
+      const updated = await c.query<Row>(ATTACH_UNKNOWN_OUTCOME_SQL, [
+        input.id,
+        input.owner,
+        input.expectedVersion,
+        input.attachAttemptId,
+        evidence[0],
+        evidence[1],
+      ]);
+      if (updated.rowCount === 1) {
+        const receipt = updated.rows[0];
+        return {
+          kind: 'unknown',
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
+        };
+      }
+      const current = (
+        await c.query<Row>(ATTACH_SUCCESS_LOOK_SQL, [input.id, input.owner])
+      ).rows[0];
+      return current?.status === 'ATTACH_OUTCOME_UNKNOWN' &&
+        String(current.version) === successor &&
+        current.attach_attempt_id === input.attachAttemptId &&
+        current.attach_http_status === evidence[0] &&
+        current.attach_transport_code === evidence[1] &&
+        current.attach_outcome_observed_at instanceof Date &&
+        current.terminal_at instanceof Date
+        ? {
+            kind: 'replayed',
+            version: successor,
+            receipt: camelize<Media>(current),
+          }
+        : { kind: 'fenced' };
+    });
   }
 
   /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE

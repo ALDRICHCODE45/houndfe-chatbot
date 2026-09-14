@@ -9,6 +9,7 @@ import type {
   AmountRejectionInput,
   AmountRejectionOutcome,
   AttachCommitSuccessInput,
+  AttachCommitUnknownOutcomeInput,
   AttachDefiniteFailureInput,
   AttachRequestStartInput,
   AttachStartInput,
@@ -4691,6 +4692,277 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         version: '5',
         attach_http_status: 400,
       });
+    });
+  });
+
+  describe('WU11A3B atomic attach unknown-outcome commit', () => {
+    const OWNER = 'worker.attach-unknown';
+    const REQUEST_ID = UUID_B;
+    const RIVAL_ID = '33333333-3333-4333-8333-333333333333';
+    const UNKNOWN_408 = {
+      status: 'ATTACH_OUTCOME_UNKNOWN',
+      version: '5',
+      attach_http_status: 408,
+    };
+    const command = (
+      over: Partial<AttachCommitUnknownOutcomeInput> = {},
+    ): AttachCommitUnknownOutcomeInput => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '4',
+      attachAttemptId: REQUEST_ID,
+      httpStatus: 408,
+      ...over,
+    });
+    const transportCommand = (
+      over: Partial<AttachCommitUnknownOutcomeInput> = {},
+    ): AttachCommitUnknownOutcomeInput =>
+      command({
+        httpStatus: null,
+        transportCode: 'TRANSPORT_FAILURE',
+        ...over,
+      });
+    const seed = async (receiptOver: Row = {}) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const receipt = lifeRow('ATTACHING', null, {
+        sender_id: 'sender.attach-unknown',
+        version: '4',
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        attach_attempts: 1,
+        attach_attempt_id: REQUEST_ID,
+        attach_request_started_at: T0,
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const expectFenced = async (input: AttachCommitUnknownOutcomeInput) => {
+      const before = await row();
+      await expect(store.commitAttachUnknownOutcome(input)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await row()).toEqual(before);
+    };
+    const expectTerminal = async (seeded: Row, evidence: Row) => {
+      const after = await row();
+      expect(after).toMatchObject({ ...seeded, ...evidence });
+      expect(after.attach_outcome_observed_at).toBeInstanceOf(Date);
+      expect(after.terminal_at).toBeInstanceOf(Date);
+    };
+
+    it.each([
+      ...[100, 101, 199, 300, 407, 408, 500, 599].map((httpStatus) => ({
+        input: command({ httpStatus }),
+      })),
+      {
+        input: transportCommand(),
+      },
+    ])(
+      'commits each unknown terminal transition with only safe evidence',
+      async ({ input }) => {
+        const seeded = await seed();
+        await expect(
+          store.commitAttachUnknownOutcome(input),
+        ).resolves.toMatchObject({
+          kind: 'unknown',
+          receipt: {
+            status: 'ATTACH_OUTCOME_UNKNOWN',
+          },
+        });
+        await expectTerminal(seeded, {
+          status: 'ATTACH_OUTCOME_UNKNOWN',
+          version: '5',
+          attach_http_status: input.httpStatus ?? null,
+          attach_transport_code: input.transportCode ?? null,
+          failure_stage: null,
+          backend_receipt_id: null,
+          backend_receipt_status: null,
+        });
+      },
+    );
+
+    it('fences invalid evidence values and both/neither channels without mutation', async () => {
+      await seed();
+      for (const input of [
+        ...[
+          200,
+          299,
+          400,
+          401,
+          403,
+          404,
+          409,
+          422,
+          429,
+          99,
+          400.5,
+          NaN,
+          null,
+          '408',
+        ].map((httpStatus) => ({ httpStatus: httpStatus as number | null })),
+        ...[
+          'TRANSPORT_TIMEOUT',
+          'TRANSPORT_FAILURE ',
+          '',
+          null,
+          408,
+          true,
+          {},
+        ].map((transportCode) => ({
+          httpStatus: null,
+          transportCode: transportCode as string | null,
+        })),
+        { transportCode: 'TRANSPORT_FAILURE' },
+        { httpStatus: null, transportCode: null },
+      ]) {
+        await expectFenced(command(input));
+      }
+    });
+
+    it('fences wrong fences, malformed inputs, and missing or mismatched request evidence without durable mutation', async () => {
+      await seed();
+      for (const over of [
+        { owner: 'worker.rival' },
+        { expectedVersion: '3' },
+        { expectedVersion: '5' },
+        { id: UUID_C },
+        { id: 'not-a-uuid' },
+        { attachAttemptId: 'not-a-uuid' },
+        { attachAttemptId: RIVAL_ID },
+      ]) {
+        await expectFenced(command(over));
+      }
+      await seed({ lease_expires_at: new Date(Date.now() - 60_000) });
+      await expectFenced(command());
+      await seed({ attach_attempt_id: RIVAL_ID });
+      await expectFenced(command());
+      await seed({
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+      await seed({
+        status: 'AWAITING_CONFIRMATION',
+        attach_started_at: null,
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+    });
+
+    it('replays only the exact durable successor and fences every rival', async () => {
+      await seed();
+      expect((await store.commitAttachUnknownOutcome(command())).kind).toBe(
+        'unknown',
+      );
+      const successor = await row();
+      await expect(
+        new PostgresReceiptMediaStore(pool).commitAttachUnknownOutcome(
+          command(),
+        ),
+      ).resolves.toMatchObject({
+        kind: 'replayed',
+        version: '5',
+        receipt: {
+          status: 'ATTACH_OUTCOME_UNKNOWN',
+          attachHttpStatus: 408,
+          attachTransportCode: null,
+        },
+      });
+      expect(await row()).toEqual(successor);
+      for (const over of [{ httpStatus: 500 }, { attachAttemptId: RIVAL_ID }]) {
+        await expectFenced(command(over));
+      }
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      await expectFenced(command());
+      const unknownSeed = (transport: string) => ({
+        status: 'ATTACH_OUTCOME_UNKNOWN',
+        version: '5',
+        terminal_at: T0,
+        attach_outcome_observed_at: T0,
+        attach_transport_code: transport,
+      });
+      await seed(unknownSeed('TRANSPORT_FAILURE'));
+      expect(
+        (await store.commitAttachUnknownOutcome(transportCommand())).kind,
+      ).toBe('replayed');
+      await expectFenced(command());
+      await seed(unknownSeed('TRANSPORT_TIMEOUT'));
+      await expectFenced(transportCommand());
+    });
+
+    it('rolls back the complete unknown commit when the receipt update fails', async () => {
+      await seed();
+      const before = await row();
+      await pool.query(`CREATE FUNCTION receipt_attach_unknown_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'attach unknown failure'; END; $$;
+      CREATE TRIGGER receipt_attach_unknown_failure BEFORE UPDATE ON receipt_media
+        FOR EACH ROW EXECUTE FUNCTION receipt_attach_unknown_failure()`);
+      try {
+        await expect(
+          store.commitAttachUnknownOutcome(command()),
+        ).rejects.toThrow('attach unknown failure');
+        expect(await row()).toEqual(before);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS receipt_attach_unknown_failure
+          ON receipt_media; DROP FUNCTION IF EXISTS receipt_attach_unknown_failure()`);
+      }
+    });
+
+    it('serializes duplicate unknown commits and rejects a rival', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        store.commitAttachUnknownOutcome(command()),
+        store.commitAttachUnknownOutcome(command()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['replayed', 'unknown']);
+      expect(await row()).toMatchObject(UNKNOWN_408);
+      await seed();
+      const [c, d] = await Promise.all([
+        store.commitAttachUnknownOutcome(command()),
+        store.commitAttachUnknownOutcome(command({ httpStatus: 500 })),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['fenced', 'unknown']);
+      expect(await row()).toMatchObject(UNKNOWN_408);
+    });
+    it('fences a commit whose lock wait outlives the lease', async () => {
+      await seed({ lease_expires_at: new Date(Date.now() + 250) });
+      const before = await row();
+      const locker = await pool.connect();
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+          [UUID_A],
+        );
+        const pending = store.commitAttachUnknownOutcome(command());
+        while (Date.now() < +(before.lease_expires_at as number) + 20)
+          await new Promise((r) => setTimeout(r, 20));
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await row()).toEqual(before);
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+      }
     });
   });
 
