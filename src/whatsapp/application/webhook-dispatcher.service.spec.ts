@@ -27,6 +27,7 @@ import {
   PENDING_HUMAN_REQUEST_REPLY,
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
+import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 
 /**
  * Spec rewrite: the dispatcher MUST replace the echo path with
@@ -57,6 +58,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     Pick<HumanHandoffService, 'isOpsSender' | 'create' | 'resolveReply'>
   >;
   let conversationStore: jest.Mocked<ConversationStore>;
+  let amountRouter: jest.Mocked<ReceiptAmountRouterService>;
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -126,6 +128,15 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       clearReceiptAmountPointer: jest.fn(),
     };
 
+    // WU13-B1: ReceiptAmountRouter mock. Default fenced so the ordinary
+    // agent path runs. Tests override per scenario.
+    amountRouter = {
+      route: jest.fn().mockResolvedValue({ kind: 'fenced' }),
+    } as unknown as jest.Mocked<ReceiptAmountRouterService>;
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars --
+    // humanHandoff is deliberately a partial mock (Pick<>) per existing spec pattern
+
     service = new WebhookDispatcherService(
       runner,
       sender,
@@ -133,6 +144,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       recentOutbound,
       humanHandoff,
       conversationStore,
+      amountRouter,
     );
   });
 
@@ -888,6 +900,235 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(messages).toHaveLength(1);
       expect(messages[0].text).toBe('hola mundo');
       expect(messages[0].media).toBeUndefined();
+    });
+  });
+
+  // ─── WU13-B1: ReceiptAmountRouter integration ──────────────────────────────
+  describe('WU13-B1: ReceiptAmountRouter customer-text routing', () => {
+    const CUSTOMER = '5215550001111';
+
+    const textEvent = (messageId: string, body: string): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id: messageId,
+                    from: CUSTOMER,
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    beforeEach(() => {
+      amountRouter.route.mockResolvedValue({ kind: 'fenced' });
+      store.get.mockResolvedValue(null);
+      store.update.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { messages: [] },
+      });
+      llm.run.mockResolvedValue({
+        reply: 'Hola!',
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Hola!' },
+        ],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+    });
+
+    it('calls amountRouter for customer text before agentRunner', async () => {
+      await service.dispatch(textEvent('wamid.route-order', '500 pesos'));
+      expect(amountRouter.route).toHaveBeenCalled();
+      expect(llm.run).toHaveBeenCalled();
+    });
+
+    it('fenced: calls AgentRunner and sends reply normally', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'fenced' });
+      await service.dispatch(textEvent('wamid.fenced', 'hola'));
+      expect(llm.run).toHaveBeenCalledWith(
+        expect.objectContaining({ senderId: CUSTOMER, text: 'hola' }),
+      );
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: 'Hola!',
+      });
+    });
+
+    it('proposed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+      amountRouter.route.mockResolvedValue({
+        kind: 'proposed',
+        receipt: { id: 'r1' } as any,
+        intent: { id: 'i1' } as any,
+      });
+      await service.dispatch(textEvent('wamid.proposed', '500 pesos'));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.proposed');
+    });
+
+    it('started: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+      amountRouter.route.mockResolvedValue({
+        kind: 'started',
+        receipt: { id: 'r2' } as any,
+        intent: { id: 'i2' } as any,
+      });
+      await service.dispatch(textEvent('wamid.started', 'si'));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.started');
+    });
+
+    it('rejected: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+      amountRouter.route.mockResolvedValue({
+        kind: 'rejected',
+        receipt: { id: 'r3' } as any,
+        intent: { id: 'i3' } as any,
+      });
+      await service.dispatch(textEvent('wamid.rejected', 'no'));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.rejected');
+    });
+
+    it('cancelled: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+      amountRouter.route.mockResolvedValue({
+        kind: 'cancelled',
+        receipt: { id: 'r4' } as any,
+        intent: { id: 'i4' } as any,
+      });
+      await service.dispatch(textEvent('wamid.cancelled', 'cancelar'));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cancelled');
+    });
+
+    it('replayed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+      amountRouter.route.mockResolvedValue({
+        kind: 'replayed',
+        receipt: { id: 'r5' } as any,
+        intent: { id: 'i5' } as any,
+      });
+      await service.dispatch(textEvent('wamid.replayed', '500 pesos'));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.replayed');
+    });
+
+    it('terminal outcome with markSeen failure does not throw', async () => {
+      amountRouter.route.mockResolvedValue({
+        kind: 'proposed',
+        receipt: { id: 'r6' } as any,
+        intent: { id: 'i6' } as any,
+      });
+      dedup.markSeen.mockRejectedValue(new Error('dedup write failed'));
+      await expect(
+        service.dispatch(
+          textEvent('wamid.terminal-markseen-fail', '500 pesos'),
+        ),
+      ).resolves.toBeUndefined();
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith(
+        'wamid.terminal-markseen-fail',
+      );
+    });
+
+    it('ops inbound: amountRouter is NEVER called', async () => {
+      humanHandoff.isOpsSender.mockReturnValue(true);
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'no_pending',
+        reply: ASK_FOR_REF,
+      });
+      await service.dispatch({
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  messages: [
+                    {
+                      id: 'wamid.ops-bypass',
+                      from: '5219999888777',
+                      timestamp: '1719000000',
+                      type: 'text',
+                      text: { body: 'HF-abc123def456 YES_RESTOCK' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+      expect(amountRouter.route).not.toHaveBeenCalled();
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).toHaveBeenCalled();
+    });
+
+    it('pending-human short-circuit: amountRouter is NEVER called', async () => {
+      conversationStore.get.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {
+          pendingHumanRequest: {
+            requestId: 'abc123def456',
+            ref: 'HF-abc123def456',
+            createdAt: '2026-06-23T12:00:00.000Z',
+            customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+          },
+        },
+      });
+      await service.dispatch(textEvent('wamid.pending-bypass', '¿siguen?'));
+      expect(amountRouter.route).not.toHaveBeenCalled();
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: PENDING_HUMAN_REQUEST_REPLY,
+      });
+    });
+
+    it('media message: amountRouter is NEVER called (media ingress is WU13-B2)', async () => {
+      await service.dispatch({
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  messages: [
+                    {
+                      id: 'wamid.media-bypass',
+                      from: CUSTOMER,
+                      timestamp: '1719000000',
+                      type: 'image',
+                      image: {
+                        id: 'media-img-bypass',
+                        mime_type: 'image/jpeg',
+                        caption: 'comprobante',
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+      expect(amountRouter.route).not.toHaveBeenCalled();
+      expect(llm.run).toHaveBeenCalled();
     });
   });
 });

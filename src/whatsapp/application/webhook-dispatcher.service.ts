@@ -5,6 +5,7 @@ import {
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import type { AgentMessage } from '../../conversation/domain/conversation-store';
+import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
@@ -78,6 +79,7 @@ export class WebhookDispatcherService {
     private readonly humanHandoff: HumanHandoffService,
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore: ConversationStore,
+    private readonly amountRouter: ReceiptAmountRouterService,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -175,6 +177,31 @@ export class WebhookDispatcherService {
             );
           }
           continue;
+        }
+
+        // ─── WU13-B1: ReceiptAmountRouter — customer text only ─────────────
+        if (message.media == null) {
+          const outcome = await this.amountRouter.route({
+            senderId: message.senderId,
+            text: message.text,
+            sourceWebhookMessageId: message.messageId,
+          });
+          if (outcome.kind !== 'fenced') {
+            this.logger.log(
+              `amount router terminal [${outcome.kind}] for ${message.messageId}`,
+            );
+            try {
+              await this.dedup.markSeen(message.messageId);
+            } catch (error) {
+              this.logger.warn(
+                `markSeen failed for ${message.messageId}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+            continue;
+          }
+          // Fenced → fall through to the ordinary agent path below.
         }
 
         // ─── (5) Normal agent dispatch ─────────────────────────────────
