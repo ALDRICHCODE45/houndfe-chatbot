@@ -225,9 +225,12 @@ describe('sale-flow-instructions', () => {
       return line as string;
     }
 
-    it('replaces step 13 with the exact canonical terminal-guidance literal (byte-identical, forbids direct attachReceipt use and protected identifier collection/derivation)', () => {
+    it('replaces step 13 with the exact canonical terminal-guidance literal (WU12: server-owned evidence gates acknowledgement; without evidence, state could-not-be-associated + offer assistance; valid empty attachReceipt returns terminal guidance)', () => {
+      // Canonical spec step 13: server-owned evidence gates "acknowledge pending review";
+      // without evidence: state "could not be associated" + offer assistance; valid
+      // empty attachReceipt result = terminal guidance, never retry, never ask protected ids.
       expect(step13()).toBe(
-        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT call `attachReceipt` and do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference. The server-owned workflow attaches the receipt automatically after the sale is confirmed; acknowledge that the receipt was received and is pending human review, and if `attachReceipt` ever returns a result, treat it as terminal guidance — never retry it and never ask the customer for any protected identifier.',
+        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT call `attachReceipt` and do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference. Only explicit server-owned evidence that the image was correlated to an active confirmed sale permits acknowledging that it is pending human review. Without that evidence, state that the receipt could not be associated and offer human assistance — do not claim attachment or pending review. If `attachReceipt` ever returns a result from a valid empty invocation, treat it as terminal guidance — never retry it and never ask the customer for any protected identifier.',
       );
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredAmountCents');
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredReference');
