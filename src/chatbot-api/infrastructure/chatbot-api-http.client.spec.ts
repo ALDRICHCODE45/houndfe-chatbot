@@ -1,7 +1,6 @@
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { of, throwError } from 'rxjs';
-import type { AppConfig } from '../../config/configuration';
 import {
   AuthError,
   BranchMismatchError,
@@ -26,7 +25,7 @@ describe('ChatbotApiHttpClient', () => {
     };
 
     configService = {
-      getOrThrow: jest.fn((key: keyof AppConfig | string) => {
+      getOrThrow: jest.fn((key: string) => {
         const values: Record<string, string | number> = {
           'chatbotApi.baseUrl': 'https://backend.example.com',
           'chatbotApi.serviceKey': 'svc_test_key',
@@ -38,7 +37,7 @@ describe('ChatbotApiHttpClient', () => {
       }),
     };
 
-    sleep = jest.fn().mockResolvedValue(undefined);
+    sleep = jest.fn<Promise<void>, [number]>().mockResolvedValue(undefined);
 
     client = new ChatbotApiHttpClient(
       httpService as HttpService,
@@ -272,7 +271,7 @@ describe('ChatbotApiHttpClient', () => {
         url: '/chatbot-api/sales',
         headers: expect.objectContaining({
           'X-Idempotency-Key': 'idem-3',
-        }),
+        }) as Record<string, string>,
       }),
     );
   });
