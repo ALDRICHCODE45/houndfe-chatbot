@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
 import { makeAttachReceiptTool } from './attach-receipt.tool';
 import { makeCancelSaleTool } from './cancel-sale.tool';
 import { makeCheckStockTool } from './check-stock.tool';
@@ -52,18 +50,21 @@ const deps = {
 };
 
 const factories: Array<[string, Factory]> = [
-  ['searchCatalog', makeSearchCatalogTool as Factory],
-  ['checkStock', makeCheckStockTool as Factory],
-  ['evaluateCart', makeEvaluateCartTool as Factory],
-  ['getCustomerByPhone', makeGetCustomerByPhoneTool as Factory],
-  ['upsertCustomer', makeUpsertCustomerTool as Factory],
-  ['createSale', makeCreateSaleTool as Factory],
-  ['attachReceipt', makeAttachReceiptTool as Factory],
-  ['updateDelivery', makeUpdateDeliveryTool as Factory],
-  ['getOrderHistory', makeGetOrderHistoryTool as Factory],
-  ['getPaymentDetails', makeGetPaymentDetailsTool as Factory],
-  ['cancelSale', makeCancelSaleTool as Factory],
-  ['requestHumanAssistance', makeRequestHumanAssistanceTool as Factory],
+  ['searchCatalog', makeSearchCatalogTool as unknown as Factory],
+  ['checkStock', makeCheckStockTool as unknown as Factory],
+  ['evaluateCart', makeEvaluateCartTool as unknown as Factory],
+  ['getCustomerByPhone', makeGetCustomerByPhoneTool as unknown as Factory],
+  ['upsertCustomer', makeUpsertCustomerTool as unknown as Factory],
+  ['createSale', makeCreateSaleTool as unknown as Factory],
+  ['attachReceipt', makeAttachReceiptTool as unknown as Factory],
+  ['updateDelivery', makeUpdateDeliveryTool as unknown as Factory],
+  ['getOrderHistory', makeGetOrderHistoryTool as unknown as Factory],
+  ['getPaymentDetails', makeGetPaymentDetailsTool as unknown as Factory],
+  ['cancelSale', makeCancelSaleTool as unknown as Factory],
+  [
+    'requestHumanAssistance',
+    makeRequestHumanAssistanceTool as unknown as Factory,
+  ],
 ];
 
 describe('sale-flow tool contract (T4.1 / T4.12)', () => {
@@ -90,23 +91,18 @@ describe('sale-flow tool contract (T4.1 / T4.12)', () => {
     },
   );
 
-  it('attachReceipt rejects saleId / mediaUrl / declaredAmountCents malformed', () => {
-    const tool = makeAttachReceiptTool(deps);
-    const result = tool.inputSchema.safeParse({
-      saleId: 'not-a-uuid',
-      mediaUrl: 'not-a-url',
-      declaredAmountCents: 0,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('attachReceipt accepts a valid UUID saleId + URL mediaUrl + positive declaredAmountCents', () => {
-    const tool = makeAttachReceiptTool(deps);
-    const result = tool.inputSchema.safeParse({
+  it('attachReceipt is the strict empty-object compatibility tool ({} parses, saleId payload is rejected)', () => {
+    const tool = makeAttachReceiptTool();
+    const schema = tool.inputSchema as unknown as {
+      safeParse: (data: unknown) => { success: boolean };
+    };
+    const r = schema.safeParse({});
+    expect(r.success).toBe(true);
+    const result = schema.safeParse({
       saleId: '00000000-0000-4000-8000-000000000001',
       mediaUrl: 'https://example.com/receipt.jpg',
       declaredAmountCents: 50000,
     });
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
   });
 });

@@ -5,9 +5,10 @@ import type { HumanHandoffService } from '../../human-handoff/application/human-
 /**
  * Shared dependencies injected into every sale-flow tool factory.
  *
- * Every factory exposes the SAME deps shape so `RealToolRegistry` can
- * wire them uniformly. `cashierUserId` is only consumed by `createSale`;
- * bank data flows through the runtime `getPaymentDetails` tool (Q1 / R11);
+ * Every factory except the zero-dep `attachReceipt` compatibility tool
+ * exposes the SAME deps shape so `RealToolRegistry` can wire them
+ * uniformly. `cashierUserId` is only consumed by `createSale`; bank data
+ * flows through the runtime `getPaymentDetails` tool (Q1 / R11);
  * `humanHandoffService` is consumed only by `requestHumanAssistance`
  * (the 12th tool) — the other 11 are signal-only and never call the
  * handoff service directly (ADR-27).

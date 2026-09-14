@@ -40,6 +40,11 @@ export const HUMAN_HANDOFF_SERVICE_TOKEN = Symbol('HUMAN_HANDOFF_SERVICE');
  *
  * `cashierUserId` is sourced from typed `AppConfig.chatbotApi.cashierUserId`
  * and injected into the tool deps so the model can never pick it.
+ *
+ * `attachReceipt` is the one exception: it stays a registry key but is
+ * factory-instantiated with NO deps — it is a terminal compatibility tool
+ * (strict `{}` schema, zero backend attachment calls; the server-owned
+ * `ReceiptAttachmentService` is the sole §4.4.7 attachment path).
  */
 @Injectable()
 export class RealToolRegistry implements ToolRegistry {
@@ -70,7 +75,10 @@ export class RealToolRegistry implements ToolRegistry {
       getCustomerByPhone: makeGetCustomerByPhoneTool(deps),
       upsertCustomer: makeUpsertCustomerTool(deps),
       createSale: makeCreateSaleTool(deps),
-      attachReceipt: makeAttachReceiptTool(deps),
+      // attachReceipt is a compatibility key wired WITHOUT any
+      // model-controlled or backend-attachment dependency (WU12):
+      // zero-arg factory, terminal guidance only.
+      attachReceipt: makeAttachReceiptTool(),
       updateDelivery: makeUpdateDeliveryTool(deps),
       getOrderHistory: makeGetOrderHistoryTool(deps),
       getPaymentDetails: makeGetPaymentDetailsTool(deps),

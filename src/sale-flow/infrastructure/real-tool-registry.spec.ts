@@ -1,5 +1,6 @@
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import { TERMINAL_RECEIPT_GUIDANCE } from '../application/tools/attach-receipt.tool';
 import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
 import {
@@ -18,7 +19,11 @@ import {
  *   - Each entry is an AI-SDK tool with a Zod object inputSchema.
  *   - DI resolves RealToolRegistry with CHATBOT_API_CLIENT +
  *     CONVERSATION_STORE + HUMAN_HANDOFF_SERVICE_TOKEN + ConfigService.
+ *   - attachReceipt is wired WITHOUT the backend-attachment dependency
+ *     (zero chatbotApi.attachReceipt calls; the server-owned
+ *     ReceiptAttachmentService stays the sole §4.4.7 attachment path).
  */
+
 describe('RealToolRegistry', () => {
   const stubChatbotApi = {
     searchCatalog: jest.fn(),
@@ -116,5 +121,53 @@ describe('RealToolRegistry', () => {
     const a = registry.getTools();
     const b = registry.getTools();
     expect(a).toBe(b);
+  });
+
+  describe('attachReceipt compatibility wiring (WU12)', () => {
+    type AttachTool = {
+      inputSchema: {
+        parse: (data: unknown) => unknown;
+        safeParse: (data: unknown) => { success: boolean };
+      };
+      execute: (input: unknown, options: unknown) => Promise<unknown>;
+    };
+
+    const EXECUTE_OPTIONS = {
+      toolCallId: 't',
+      messages: [],
+      context: undefined,
+    } as unknown as Record<string, unknown>;
+
+    async function getAttachTool(): Promise<AttachTool> {
+      const registry = await buildRegistry();
+      return registry.getTools()['attachReceipt'] as AttachTool;
+    }
+
+    it('strict {} input succeeds with the exact terminal guidance result and makes zero chatbotApi.attachReceipt calls', async () => {
+      stubChatbotApi.attachReceipt.mockClear();
+      stubStore.get.mockClear();
+      const tool = await getAttachTool();
+      const parsed = tool.inputSchema.parse({});
+      expect(parsed).toEqual({});
+      await expect(tool.execute(parsed, EXECUTE_OPTIONS)).resolves.toEqual(
+        // Canonical terminal guidance contract (mirrors the tracked
+        // canonical spec): exact machine shape + exact English wording,
+        // asserted against the canonical constant in the tool unit spec.
+        TERMINAL_RECEIPT_GUIDANCE,
+      );
+      expect(stubChatbotApi.attachReceipt).not.toHaveBeenCalled();
+      expect(stubStore.get).not.toHaveBeenCalled();
+    });
+
+    it('rejects a sale-B payload at input validation (rejected, not stripped)', async () => {
+      const tool = await getAttachTool();
+      const result = tool.inputSchema.safeParse({
+        saleId: '00000000-0000-4000-8000-000000000002',
+        mediaUrl: 'https://example.com/receipt-b.jpg',
+        declaredAmountCents: 1,
+      });
+      expect(result.success).toBe(false);
+      expect(stubChatbotApi.attachReceipt).not.toHaveBeenCalled();
+    });
   });
 });

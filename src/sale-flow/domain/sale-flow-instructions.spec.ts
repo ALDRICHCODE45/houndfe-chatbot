@@ -215,4 +215,44 @@ describe('sale-flow-instructions', () => {
       }
     });
   });
+
+  describe('step 13 terminal receipt guidance (WU12, server-owned workflow)', () => {
+    function step13(): string {
+      const line = SALE_FLOW_INSTRUCTIONS.split('\n').find((l) =>
+        l.startsWith('13. '),
+      );
+      expect(line).toBeDefined();
+      return line as string;
+    }
+
+    it('replaces step 13 with the exact canonical terminal-guidance literal (byte-identical, forbids direct attachReceipt use and protected identifier collection/derivation)', () => {
+      expect(step13()).toBe(
+        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT call `attachReceipt` and do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference. The server-owned workflow attaches the receipt automatically after the sale is confirmed; acknowledge that the receipt was received and is pending human review, and if `attachReceipt` ever returns a result, treat it as terminal guidance — never retry it and never ask the customer for any protected identifier.',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredAmountCents');
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredReference');
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredDate');
+    });
+
+    it('preserved R7/R14 and steps 12/14 composed-once strings remain byte-identical', () => {
+      for (const preserved of [
+        "requestHumanAssistance({ kind: 'out_of_stock'",
+        'en un momento un agente te comparte los datos de pago',
+        '¿Confirmas la cancelación? Sí/No',
+        'no hay una venta reciente por cancelar',
+        "requestHumanAssistance({ kind: 'expiration_date', digest: { productId, name, question } })",
+      ]) {
+        expect(SALE_FLOW_INSTRUCTIONS).toContain(preserved);
+      }
+      // Each protected string is composed exactly once in the literal.
+      const composed = composeSaleFlowSystemPrompt('BASE_PLACEHOLDER');
+      expect(
+        composed.split('en un momento un agente te comparte los datos de pago')
+          .length - 1,
+      ).toBe(1);
+      expect(
+        composed.split('¿Confirmas la cancelación? Sí/No').length - 1,
+      ).toBe(1);
+    });
+  });
 });

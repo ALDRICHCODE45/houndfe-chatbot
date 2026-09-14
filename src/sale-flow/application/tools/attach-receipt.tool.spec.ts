@@ -1,105 +1,93 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeAttachReceiptTool } from './attach-receipt.tool';
-import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
-import { UpstreamError } from '../../../chatbot-api/domain/errors';
-import type { ConversationStore } from '../../../conversation/domain/conversation-store';
-import type { AttachReceiptResponse } from '../../../chatbot-api/domain/dtos/sales.dto';
+import {
+  TERMINAL_RECEIPT_GUIDANCE,
+  makeAttachReceiptTool,
+} from './attach-receipt.tool';
 
 /**
- * Unit tests for the attachReceipt tool factory.
- *
- * Spec scenarios:
- *   - Maps saleId / mediaUrl / declaredAmountCents (+ optional declaredDate
- *     ISO datetime, declaredReference) to chatbotApi.attachReceipt
- *   - Rejects non-URL mediaUrl, zero declaredAmountCents, non-UUID saleId
- *   - Catches UpstreamError into a retryable upstream envelope
+ * Unit tests for the attachReceipt compatibility tool (WU12) — spec
+ * scenarios: strict `{}` input with the exact terminal guidance result;
+ * protected fields and sale-B payloads rejected at input validation; zero
+ * chatbotApi.attachReceipt calls on every path; zero-dep factory.
  */
-describe('makeAttachReceiptTool', () => {
-  const baseDeps = {
-    store: {} as ConversationStore,
-    cashierUserId: '00000000-4000-9000-0000-000000000001',
-    humanHandoffService: {} as never,
+
+type AttachToolShape = {
+  inputSchema: {
+    parse: (data: unknown) => unknown;
+    safeParse: (data: unknown) => { success: boolean };
   };
+  execute: (
+    input: unknown,
+    options: { toolCallId: string; messages: unknown[]; context: undefined },
+  ) => Promise<unknown>;
+};
 
-  it('forwards saleId + mediaUrl + declaredAmountCents to chatbotApi.attachReceipt', async () => {
-    const attachReceiptResponse: AttachReceiptResponse = {
-      receiptId: 'receipt-1',
-      status: 'PENDING',
-    };
-    const attachReceipt = jest.fn().mockResolvedValue(attachReceiptResponse);
-    const deps = {
-      ...baseDeps,
-      chatbotApi: { attachReceipt } as unknown as ChatbotApiClient,
-    };
-    const tool = makeAttachReceiptTool(deps);
+const makeTool = makeAttachReceiptTool as unknown as () => AttachToolShape;
+const TERMINAL = TERMINAL_RECEIPT_GUIDANCE as unknown;
 
-    const result = await tool.execute(
-      {
-        saleId: '00000000-4000-9000-0000-000000000001',
-        mediaUrl: 'https://example.com/receipt.jpg',
-        declaredAmountCents: 50000,
-      },
-      { toolCallId: 't', messages: [], context: undefined },
+const EXECUTE_OPTIONS = {
+  toolCallId: 't',
+  messages: [],
+  context: undefined,
+};
+
+// Canonical terminal guidance contract (mirrors the tracked canonical spec).
+const EXPECTED_TERMINAL_GUIDANCE = {
+  ok: true,
+  terminal: true,
+  guidance:
+    'Receipt images are handled by the server-owned durable receipt workflow. Do not retry this tool, and do not request or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference.',
+};
+
+describe('makeAttachReceiptTool (terminal compatibility tool)', () => {
+  it('strict {} input succeeds with the exact terminal guidance result', async () => {
+    expect(TERMINAL).toEqual(EXPECTED_TERMINAL_GUIDANCE);
+    const tool = makeTool();
+    const parsed = tool.inputSchema.parse({});
+    expect(parsed).toEqual({});
+    await expect(tool.execute(parsed, EXECUTE_OPTIONS)).resolves.toEqual(
+      EXPECTED_TERMINAL_GUIDANCE,
     );
-    expect(attachReceipt).toHaveBeenCalledWith(
-      '00000000-4000-9000-0000-000000000001',
-      expect.objectContaining({
-        mediaUrl: 'https://example.com/receipt.jpg',
-        declaredAmountCents: 50000,
-      }),
-    );
-    expect(result).toEqual({ ok: true, ...attachReceiptResponse });
   });
 
-  it('rejects a non-URL mediaUrl at the schema layer', () => {
-    const tool = makeAttachReceiptTool({
-      ...baseDeps,
-      chatbotApi: {} as ChatbotApiClient,
-    });
-    const r = tool.inputSchema.safeParse({
-      saleId: '00000000-4000-9000-0000-000000000001',
-      mediaUrl: 'not-a-url',
+  it('rejects every protected model-supplied field at input validation (unknown fields are rejected, not stripped)', () => {
+    const tool = makeTool();
+    const protectedPayloads = [
+      { saleId: '00000000-0000-4000-8000-000000000001' },
+      { mediaUrl: 'https://example.com/receipt.jpg' },
+      { objectKey: 'receipts/sale-a/receipt-1.jpg' },
+      { token: 'tok-1' },
+      { capability: 'receipt:attach' },
+      { pendingMedia: { id: 'pm-1' } },
+      { declaredAmountCents: 50000 },
+      { declaredDate: '2026-06-01T00:00:00.000Z' },
+      { declaredReference: 'REF-1' },
+      // A full legacy-shaped (sale-B) invocation is rejected whole.
+      {
+        saleId: '00000000-0000-4000-8000-000000000002',
+        mediaUrl: 'https://example.com/receipt-b.jpg',
+        declaredAmountCents: 1,
+      },
+    ];
+    for (const payload of protectedPayloads) {
+      const result = tool.inputSchema.safeParse(payload);
+      expect(result.success).toBe(false);
+    }
+  });
+
+  it('missing sale context makes zero calls: valid and rejected paths make zero chatbotApi.attachReceipt calls and the factory takes no deps', async () => {
+    // No deps, no store, no sender context — the tool cannot know a sale.
+    const attachReceipt = jest.fn(); // zero-call witness
+    const tool = makeTool();
+    expect(makeAttachReceiptTool.length).toBe(0);
+    await tool.execute(tool.inputSchema.parse({}), EXECUTE_OPTIONS);
+    tool.inputSchema.safeParse({
+      saleId: '00000000-0000-4000-8000-000000000002',
+      mediaUrl: 'https://example.com/receipt-b.jpg',
       declaredAmountCents: 1,
     });
-    expect(r.success).toBe(false);
-  });
-
-  it('rejects declaredAmountCents: 0 at the schema layer (AGENTS.md §4.4.7 @Min(1))', () => {
-    const tool = makeAttachReceiptTool({
-      ...baseDeps,
-      chatbotApi: {} as ChatbotApiClient,
-    });
-    const r = tool.inputSchema.safeParse({
-      saleId: '00000000-4000-9000-0000-000000000001',
-      mediaUrl: 'https://example.com/x.jpg',
-      declaredAmountCents: 0,
-    });
-    expect(r.success).toBe(false);
-  });
-
-  it('catches UpstreamError(500) into a retryable upstream envelope', async () => {
-    const attachReceipt = jest
-      .fn()
-      .mockRejectedValue(new UpstreamError('x', 500));
-    const deps = {
-      ...baseDeps,
-      chatbotApi: { attachReceipt } as unknown as ChatbotApiClient,
-    };
-    const tool = makeAttachReceiptTool(deps);
-
-    await expect(
-      tool.execute(
-        {
-          saleId: '00000000-4000-9000-0000-000000000001',
-          mediaUrl: 'https://example.com/x.jpg',
-          declaredAmountCents: 1000,
-        },
-        { toolCallId: 't', messages: [], context: undefined },
-      ),
-    ).resolves.toEqual({
-      ok: false,
-      error: { kind: 'upstream', retryable: true },
-    });
+    expect(attachReceipt).not.toHaveBeenCalled();
+    await expect(tool.execute({}, EXECUTE_OPTIONS)).resolves.toEqual(
+      EXPECTED_TERMINAL_GUIDANCE,
+    );
   });
 });
