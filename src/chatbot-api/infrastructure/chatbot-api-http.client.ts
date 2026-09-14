@@ -5,6 +5,7 @@ import type { AxiosRequestConfig } from 'axios';
 import { lastValueFrom } from 'rxjs';
 import type { AppConfig } from '../../config/configuration';
 import { ChatbotApiClient } from '../domain/chatbot-api.client';
+import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
 import type {
   CatalogItemResponse,
   StockCheckResponse,
@@ -168,12 +169,16 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   attachReceipt(
     saleId: string,
     dto: AttachReceiptInput,
+    options: AttachReceiptTransportOptions = {},
   ): Promise<AttachReceiptResponse> {
-    return this.request<AttachReceiptResponse>({
-      method: 'POST',
-      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
-      data: dto,
-    });
+    return this.requestAttachReceipt(
+      {
+        method: 'POST',
+        url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
+        data: dto,
+      },
+      options,
+    );
   }
 
   async updateDelivery(
@@ -227,6 +232,85 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     });
   }
 
+  /**
+   * Attachment-only (WU11B) transport: exactly one POST, no retries, no
+   * sleeps. The timeout is owned by this client
+   * (`receiptMedia.attachTimeoutMs`, forwarded as the Axios `timeout`) and
+   * a caller-supplied `AbortSignal` is forwarded verbatim as the Axios
+   * `signal`. Axios rejections keep flowing through `mapError()` with
+   * status/body/errorCode evidence; only *fulfilled* responses with an
+   * unexpected status or body are converted here to an `UpstreamError`
+   * that keeps the same evidence — this error is thrown out of this
+   * private seam and never re-mapped, so no evidence is lost.
+   */
+  private async requestAttachReceipt(
+    config: AxiosRequestConfig,
+    options: AttachReceiptTransportOptions,
+  ): Promise<AttachReceiptResponse> {
+    const timeoutMs = this.configService.getOrThrow<
+      NonNullable<AppConfig['receiptMedia']['attachTimeoutMs']>
+    >('receiptMedia.attachTimeoutMs');
+
+    const requestConfig = this.buildAuthedRequestConfig({
+      ...config,
+      timeout: timeoutMs,
+      signal: options.signal,
+    });
+
+    let response;
+    try {
+      response = await lastValueFrom(
+        this.httpService.request<AttachReceiptResponse>(requestConfig),
+      );
+    } catch (error) {
+      throw this.mapError(error);
+    }
+
+    const body = response.data;
+    const isValid =
+      response.status === 201 &&
+      typeof body === 'object' &&
+      body !== null &&
+      !Array.isArray(body) &&
+      typeof (body as { receiptId?: unknown }).receiptId === 'string' &&
+      (body as { status?: unknown }).status === 'PENDING';
+
+    if (!isValid) {
+      throw new UpstreamError(
+        'Chatbot API attach-receipt response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return body;
+  }
+
+  /**
+   * Shared single-branch auth envelope: base URL + `Authorization` and
+   * `X-Branch-Id` headers (ADR-16), applied identically to every
+   * chatbot-api request including the attachment-only transport.
+   */
+  private buildAuthedRequestConfig(
+    config: AxiosRequestConfig,
+  ): AxiosRequestConfig {
+    return {
+      ...config,
+      baseURL:
+        this.configService.getOrThrow<AppConfig['chatbotApi']['baseUrl']>(
+          'chatbotApi.baseUrl',
+        ),
+      headers: {
+        ...(config.headers ?? {}),
+        Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['chatbotApi']['serviceKey']>('chatbotApi.serviceKey')}`,
+        'X-Branch-Id': this.configService.getOrThrow<
+          AppConfig['chatbotApi']['branchId']
+        >('chatbotApi.branchId'),
+      },
+    };
+  }
+
   private async request<T>(
     config: AxiosRequestConfig,
     options: RequestOptions = {},
@@ -240,18 +324,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       throw new BranchMismatchError(configuredBranchId, branchId);
     }
 
-    const requestConfig: AxiosRequestConfig = {
-      ...config,
-      baseURL:
-        this.configService.getOrThrow<AppConfig['chatbotApi']['baseUrl']>(
-          'chatbotApi.baseUrl',
-        ),
-      headers: {
-        ...(config.headers ?? {}),
-        Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['chatbotApi']['serviceKey']>('chatbotApi.serviceKey')}`,
-        'X-Branch-Id': configuredBranchId,
-      },
-    };
+    const requestConfig = this.buildAuthedRequestConfig(config);
 
     const maxAttempts = options.retryable ? MAX_GET_ATTEMPTS : 1;
 

@@ -19,6 +19,15 @@ import {
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
+/**
+ * Transport-level options for attachment-only receipt upload (WU11B).
+ * `signal` is caller-owned and forwarded verbatim to the HTTP layer as the
+ * Axios `signal`; the request timeout is owned by the HTTP client config.
+ */
+export interface AttachReceiptTransportOptions {
+  signal?: AbortSignal;
+}
+
 export interface ChatbotApiClient {
   searchCatalog(q: string, limit?: number): Promise<CatalogItemResponse[]>;
   getStock(productId: string): Promise<StockCheckResponse>;
@@ -45,6 +54,7 @@ export interface ChatbotApiClient {
   attachReceipt(
     saleId: string,
     dto: AttachReceiptInput,
+    options?: AttachReceiptTransportOptions,
   ): Promise<AttachReceiptResponse>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;

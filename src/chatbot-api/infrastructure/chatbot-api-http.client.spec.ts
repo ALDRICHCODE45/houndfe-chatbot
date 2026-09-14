@@ -27,10 +27,11 @@ describe('ChatbotApiHttpClient', () => {
 
     configService = {
       getOrThrow: jest.fn((key: keyof AppConfig | string) => {
-        const values: Record<string, string> = {
+        const values: Record<string, string | number> = {
           'chatbotApi.baseUrl': 'https://backend.example.com',
           'chatbotApi.serviceKey': 'svc_test_key',
           'chatbotApi.branchId': 'branch-123',
+          'receiptMedia.attachTimeoutMs': 15000,
         };
 
         return values[key];
@@ -956,6 +957,155 @@ describe('ChatbotApiHttpClient', () => {
       cashierUserId: 'cashier-1',
     });
     expect(resolved).toEqual(replay);
+  });
+
+  // ─── attachReceipt abortable attachment-only HTTP transport (WU11B)
+
+  describe('attachReceipt (WU11B)', () => {
+    const attachDto = {
+      mediaUrl: 'https://example.com/r.jpg',
+      declaredAmountCents: 1000,
+    };
+    const validBody = { receiptId: 'receipt-1', status: 'PENDING' };
+
+    function mockFulfilled(status: number, data: unknown): void {
+      httpService.request.mockReturnValue(of({ status, data }));
+    }
+
+    it('resolves a valid 201 PENDING body', async () => {
+      mockFulfilled(201, validBody);
+
+      await expect(client.attachReceipt('sale-1', attachDto)).resolves.toEqual(
+        validBody,
+      );
+    });
+
+    it('sends exactly one POST with the configured timeout, the same caller AbortSignal, and auth/branch headers', async () => {
+      mockFulfilled(201, validBody);
+      const controller = new AbortController();
+
+      await client.attachReceipt('sale-1', attachDto, {
+        signal: controller.signal,
+      });
+
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      const cfg = httpService.request.mock.calls[0][0] as {
+        method: string;
+        url: string;
+        data: unknown;
+        timeout: number;
+        signal: AbortSignal;
+        headers: Record<string, string>;
+      };
+      expect(cfg.method).toBe('POST');
+      expect(cfg.url).toBe('/chatbot-api/sales/sale-1/receipts');
+      expect(cfg.data).toEqual(attachDto);
+      expect(cfg.timeout).toBe(15000);
+      expect(cfg.signal).toBe(controller.signal);
+      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+    });
+
+    it('stays compatible when called without options: no signal is forwarded and the request still succeeds', async () => {
+      mockFulfilled(201, validBody);
+
+      await expect(client.attachReceipt('sale-1', attachDto)).resolves.toEqual(
+        validBody,
+      );
+
+      const cfg = httpService.request.mock.calls[0][0] as {
+        timeout: number;
+        signal?: AbortSignal;
+      };
+      expect(cfg.signal).toBeUndefined();
+      expect(cfg.timeout).toBe(15000);
+    });
+
+    it.each([200, 202])(
+      'rejects a fulfilled HTTP %i response with UpstreamError carrying the observed status and body',
+      async (status) => {
+        mockFulfilled(status, validBody);
+
+        try {
+          await client.attachReceipt('sale-1', attachDto);
+          fail('Expected UpstreamError');
+        } catch (error) {
+          expect(error).toBeInstanceOf(UpstreamError);
+          expect((error as ChatbotApiError).statusCode).toBe(status);
+          expect((error as ChatbotApiError).responseBody).toEqual(validBody);
+        }
+      },
+    );
+
+    it.each([
+      ['missing receiptId', { status: 'PENDING' }],
+      ['non-string receiptId', { receiptId: 123, status: 'PENDING' }],
+      ['non-PENDING status', { receiptId: 'r-1', status: 'CONFIRMED' }],
+      ['null body', null],
+      ['array body', [validBody]],
+    ])(
+      'rejects malformed 201 body (%s) with UpstreamError evidence',
+      async (_label, body) => {
+        mockFulfilled(201, body);
+
+        try {
+          await client.attachReceipt('sale-1', attachDto);
+          fail('Expected UpstreamError');
+        } catch (error) {
+          expect(error).toBeInstanceOf(UpstreamError);
+          expect((error as ChatbotApiError).statusCode).toBe(201);
+          expect((error as ChatbotApiError).responseBody).toEqual(body);
+        }
+      },
+    );
+
+    it('preserves the errorCode evidence from the body on a fulfilled invalid response', async () => {
+      const body = { error: 'ATTACH_REJECTED', receiptId: 5 };
+      mockFulfilled(201, body);
+
+      try {
+        await client.attachReceipt('sale-1', attachDto);
+        fail('Expected UpstreamError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect((error as ChatbotApiError).errorCode).toBe('ATTACH_REJECTED');
+      }
+    });
+
+    it('maps a 5xx rejection through the existing error mapping with exactly one request and no sleep', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: { status: 503, data: { error: 'BOOM' } },
+        })),
+      );
+
+      try {
+        await client.attachReceipt('sale-1', attachDto);
+        fail('Expected UpstreamError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect((error as ChatbotApiError).statusCode).toBe(503);
+        expect((error as ChatbotApiError).errorCode).toBe('BOOM');
+      }
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('maps an abort/transport rejection through the existing error mapping with exactly one request and no sleep', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({ code: 'ERR_CANCELED', message: 'canceled' })),
+      );
+
+      try {
+        await client.attachReceipt('sale-1', attachDto);
+        fail('Expected UpstreamError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect((error as ChatbotApiError).statusCode).toBeNull();
+      }
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
   });
 
   describe('CancelSaleInputSchema', () => {
