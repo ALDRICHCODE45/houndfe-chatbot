@@ -31,11 +31,11 @@ describe('WebhookController', () => {
 
         return values[key];
       }),
-    };
+    } as unknown as jest.Mocked<Pick<ConfigService, 'getOrThrow'>>;
 
     controller = new WebhookController(
-      configService as ConfigService,
-      dispatcher as WebhookDispatcherService,
+      configService as unknown as ConfigService,
+      dispatcher as unknown as WebhookDispatcherService,
     );
   });
 
@@ -70,6 +70,20 @@ describe('WebhookController', () => {
     await expect(controller.handleEvent(payload)).resolves.toEqual({
       received: true,
     });
+    expect(dispatcher.dispatch).toHaveBeenCalledWith(payload);
+  });
+
+  it('rejects when dispatch rejects instead of acknowledging early', async () => {
+    const payload: WebhookEventDto = {
+      object: 'whatsapp_business_account',
+      entry: [],
+    };
+
+    dispatcher.dispatch.mockRejectedValueOnce(new Error('admission failed'));
+
+    await expect(controller.handleEvent(payload)).rejects.toThrow(
+      'admission failed',
+    );
     expect(dispatcher.dispatch).toHaveBeenCalledWith(payload);
   });
 
@@ -158,6 +172,64 @@ describe('WebhookController', () => {
       expect(dispatchSpy).toHaveBeenCalledWith(
         expect.objectContaining({ object: 'whatsapp_business_account' }),
       );
+    });
+
+    const sign = (body: string): string =>
+      `sha256=${crypto.createHmac('sha256', appSecret).update(body).digest('hex')}`;
+
+    // Exact-byte whitespace-rich body; the HMAC must match these raw bytes.
+    const whitespaceRichBody = (): string => `{
+  "object": "whatsapp_business_account",
+  "entry": [ { "changes": [ { "value": { "messages": [ { "id": "wamid.deferred", "type": "text", "text": { "body": "hola" } } ] } } ] } ]
+}`;
+
+    const postSigned = (body: string) =>
+      request(app.getHttpServer())
+        .post('/webhook')
+        .set('content-type', 'application/json')
+        .set('x-hub-signature-256', sign(body));
+
+    it('leaves the HTTP acknowledgement unsettled until dispatch settles', async () => {
+      const body = whitespaceRichBody();
+
+      let releaseDispatch!: () => void;
+      let signalEntered!: () => void;
+      const dispatchEntered = new Promise<void>((resolve) => {
+        signalEntered = resolve;
+      });
+
+      dispatchSpy.mockImplementationOnce(() => {
+        signalEntered();
+        return new Promise<void>((resolve) => (releaseDispatch = resolve));
+      });
+
+      let responseSettled = false;
+      const httpSettled = postSigned(body)
+        .send(body)
+        .expect(200)
+        .expect({ received: true })
+        .then(() => (responseSettled = true));
+      try {
+        await dispatchEntered;
+        expect(responseSettled).toBe(false);
+
+        releaseDispatch();
+        await httpSettled;
+
+        expect(responseSettled).toBe(true);
+        expect(dispatchSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ object: 'whatsapp_business_account' }),
+        );
+      } finally {
+        releaseDispatch?.();
+      }
+    });
+
+    it('returns 500 when dispatch rejects during the POST lifecycle', async () => {
+      const body = whitespaceRichBody();
+      dispatchSpy.mockRejectedValueOnce(new Error('dispatch failed'));
+
+      await postSigned(body).send(body).expect(500);
     });
   });
 });
