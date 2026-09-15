@@ -28,6 +28,10 @@ import {
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
 import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import {
+  type ReceiptIngressDecision,
+  type ReceiptIngressService,
+} from '../../receipt-media/application/receipt-ingress.service';
 
 /**
  * Spec rewrite: the dispatcher MUST replace the echo path with
@@ -59,6 +63,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   >;
   let conversationStore: jest.Mocked<ConversationStore>;
   let amountRouter: jest.Mocked<ReceiptAmountRouterService>;
+  let ingress: jest.Mocked<ReceiptIngressService>;
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -137,14 +142,25 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars --
     // humanHandoff is deliberately a partial mock (Pick<>) per existing spec pattern
 
+    // WU13-B2: ReceiptIngressService mock. Default reserved with a minimal
+    // receipt fixture — the only valid closed terminal decision that carries
+    // a receipt; guidance and other silent outcomes carry no receipt field.
+    ingress = {
+      admit: jest.fn().mockResolvedValue({
+        kind: 'reserved',
+        receipt: { id: 'r-default' },
+      }),
+    } as unknown as jest.Mocked<ReceiptIngressService>;
+
     service = new WebhookDispatcherService(
       runner,
       sender,
       dedup,
       recentOutbound,
-      humanHandoff,
+      humanHandoff as unknown as HumanHandoffService,
       conversationStore,
       amountRouter,
+      ingress,
     );
   });
 
@@ -1128,7 +1144,308 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ],
       });
       expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).toHaveBeenCalled();
+      expect(llm.run).not.toHaveBeenCalled();
+    });
+
+    // ─── WU13-B2: ReceiptIngressService customer media routing ─────────────────
+    describe('WU13-B2: ReceiptIngressService customer media routing', () => {
+      const mediaEvent = (
+        messageId: string,
+        mediaType: 'image' | 'document',
+        overrides: Record<string, unknown> = {},
+      ): WebhookEventDto => ({
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  messages: [
+                    {
+                      id: messageId,
+                      from: CUSTOMER,
+                      timestamp: '1719000000',
+                      type: mediaType,
+                      ...(mediaType === 'image'
+                        ? {
+                            image: {
+                              id: 'media-001',
+                              mime_type: 'image/jpeg',
+                              ...overrides,
+                            },
+                          }
+                        : {
+                            document: {
+                              id: 'media-001',
+                              mime_type: 'application/pdf',
+                              ...overrides,
+                            },
+                          }),
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      // admit receives exactly 4 fields; caption/filename/sha256 are NOT forwarded.
+      // Also proves captioned media never reaches the LLM.
+      it('admit: 4-field contract + captioned image skips LLM', async () => {
+        let captured:
+          | Parameters<jest.Mocked<ReceiptIngressService>['admit']>[0]
+          | undefined;
+        (ingress.admit as jest.Mock).mockImplementationOnce(async (input) => {
+          captured = input;
+          return { kind: 'reserved', receipt: { id: 'r-admit' } };
+        });
+        await service.dispatch(
+          mediaEvent('wamid.strict', 'image', {
+            caption: 'komprobante.png',
+            filename: 'evil.pdf',
+            sha256: 'deadbeef',
+          }),
+        );
+        expect(captured).toEqual({
+          webhookMessageId: 'wamid.strict',
+          providerMediaId: 'media-001',
+          senderId: CUSTOMER,
+          declaredMimeType: 'image/jpeg',
+        });
+        expect(llm.run).not.toHaveBeenCalled();
+      });
+
+      // Guidance: customer sees guidance text, no agent, dedup marked
+      const guidanceCases: Array<{
+        decision: { kind: string; text: string };
+        expected: string;
+      }> = [
+        {
+          decision: {
+            kind: 'disabled',
+            text: 'El servicio no está disponible. Intenta más tarde.',
+          },
+          expected: 'El servicio no está disponible. Intenta más tarde.',
+        },
+        {
+          decision: {
+            kind: 'unsupported-media',
+            text: 'Formato no soportado. Envía JPEG o PNG.',
+          },
+          expected: 'Formato no soportado. Envía JPEG o PNG.',
+        },
+        {
+          decision: {
+            kind: 'no-placed-sale',
+            text: 'Primero registra la venta en el sistema.',
+          },
+          expected: 'Primero registra la venta en el sistema.',
+        },
+        {
+          decision: {
+            kind: 'sender-active',
+            text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+          },
+          expected: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+        },
+      ];
+
+      test.each(guidanceCases)(
+        '%s: sends guidance and marks seen',
+        async (c) => {
+          (ingress.admit as jest.Mock).mockResolvedValueOnce(c.decision);
+          await service.dispatch(
+            mediaEvent(
+              `wamid.${c.decision.kind}`,
+              c.decision.kind === 'unsupported-media' ? 'document' : 'image',
+            ),
+          );
+          expect(sender.sendText).toHaveBeenCalledWith({
+            to: CUSTOMER,
+            text: c.expected,
+          });
+          expect(llm.run).not.toHaveBeenCalled();
+          expect(dedup.markSeen).toHaveBeenCalled();
+        },
+      );
+
+      // Silent terminal: no send, no agent, dedup marked
+      const silentCases: Array<{
+        decision: { kind: string; receiptId?: string };
+        wamid: string;
+      }> = [
+        {
+          decision: { kind: 'reserved', receiptId: 'r-s1' },
+          wamid: 'wamid.reserved',
+        },
+        {
+          decision: { kind: 'webhook-replayed', receiptId: 'r-s2' },
+          wamid: 'wamid.webhookreplayed',
+        },
+        {
+          decision: { kind: 'provider-media-reused', receiptId: 'r-s3' },
+          wamid: 'wamid.providermediareused',
+        },
+        {
+          decision: { kind: 'webhook-media-conflict' },
+          wamid: 'wamid.webhookmediaconflict',
+        },
+      ];
+
+      test.each(silentCases)(
+        '%s: no sendText, no LLM, marks seen',
+        async (c) => {
+          const decision = c.decision.receiptId
+            ? { kind: c.decision.kind, receipt: { id: c.decision.receiptId } }
+            : { kind: c.decision.kind };
+          (ingress.admit as jest.Mock).mockResolvedValueOnce(decision);
+          await service.dispatch(mediaEvent(c.wamid, 'image'));
+          expect(sender.sendText).not.toHaveBeenCalled();
+          expect(llm.run).not.toHaveBeenCalled();
+          expect(dedup.markSeen).toHaveBeenCalledWith(c.wamid);
+        },
+      );
+
+      // Error: admit rejection propagates; no send, no markSeen
+      it('admit rejection: propagates, no sendText, no markSeen', async () => {
+        (ingress.admit as jest.Mock).mockRejectedValueOnce(
+          new Error('admission unavailable'),
+        );
+        await expect(
+          service.dispatch(mediaEvent('wamid.fail', 'image')),
+        ).rejects.toThrow('admission unavailable');
+        expect(sender.sendText).not.toHaveBeenCalled();
+        expect(dedup.markSeen).not.toHaveBeenCalled();
+      });
+
+      // Ops media bypasses ingress entirely
+      it('ops media: ingress.admit is NEVER called', async () => {
+        (humanHandoff.isOpsSender as jest.Mock).mockReturnValueOnce(true);
+        (humanHandoff.resolveReply as jest.Mock).mockResolvedValueOnce({
+          kind: 'no_pending',
+          reply: 'ACK',
+        });
+        await service.dispatch({
+          object: 'whatsapp_business_account',
+          entry: [
+            {
+              changes: [
+                {
+                  value: {
+                    messages: [
+                      {
+                        id: 'wamid.ops-media',
+                        from: '5219999888777',
+                        timestamp: '1719000000',
+                        type: 'image',
+                        image: { id: 'media-ops', mime_type: 'image/jpeg' },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        });
+        expect(ingress.admit).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalled();
+      });
+
+      // Pending-human media bypasses ingress entirely
+      it('pending-human media: ingress.admit is NEVER called', async () => {
+        (conversationStore.get as jest.Mock).mockResolvedValueOnce({
+          senderId: CUSTOMER,
+          lastMessageAt: '2026-06-23T12:00:00.000Z',
+          data: {
+            pendingHumanRequest: {
+              requestId: 'abc',
+              ref: 'HF-abc',
+              createdAt: '2026-06-23T12:00:00.000Z',
+              customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+            },
+          },
+        });
+        await service.dispatch(mediaEvent('wamid.pending', 'image'));
+        expect(ingress.admit).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: PENDING_HUMAN_REQUEST_REPLY,
+        });
+      });
+
+      // Pre-ingress guards: echo and duplicate skip ingress
+      it('echo: ingress not called', async () => {
+        (recentOutbound.isKnown as jest.Mock).mockReturnValueOnce(true);
+        await service.dispatch(mediaEvent('wamid.echo', 'image'));
+        expect(ingress.admit).not.toHaveBeenCalled();
+      });
+
+      it('duplicate: ingress not called', async () => {
+        (dedup.isDuplicate as jest.Mock).mockResolvedValueOnce(true);
+        await service.dispatch(mediaEvent('wamid.dup', 'image'));
+        expect(ingress.admit).not.toHaveBeenCalled();
+      });
+
+      it('orders guidance collaborators and remembers the outbound id', async () => {
+        ingress.admit.mockResolvedValueOnce({ kind: 'disabled' });
+        sender.sendText.mockResolvedValueOnce({
+          providerMessageId: 'wamid.out',
+        });
+
+        await service.dispatch(mediaEvent('wamid.guidance-order', 'image'));
+
+        const order = [
+          dedup.isDuplicate,
+          humanHandoff.isOpsSender,
+          conversationStore.get,
+          ingress.admit,
+          sender.sendText,
+          recentOutbound.remember as jest.Mock,
+          dedup.markSeen as jest.Mock,
+        ].map((mock) => mock.mock.invocationCallOrder[0]);
+        expect(order).toEqual([...order].sort((left, right) => left - right));
+        expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
+          'wamid.out',
+        );
+      });
+
+      test.each([
+        [{ kind: 'disabled' } as const, 1],
+        [
+          {
+            kind: 'reserved',
+            receipt: { id: 'r-res' },
+          } as unknown as ReceiptIngressDecision,
+          0,
+        ],
+      ])(
+        'markSeen failure after $kind remains terminal',
+        async (decision, sends) => {
+          ingress.admit.mockResolvedValueOnce(decision);
+          dedup.markSeen.mockRejectedValueOnce(new Error('dedup write failed'));
+
+          await expect(
+            service.dispatch(mediaEvent('wamid.markseen-fail', 'image')),
+          ).resolves.toBeUndefined();
+          expect(sender.sendText as jest.Mock).toHaveBeenCalledTimes(sends);
+          expect(llm.run.mock.calls).toHaveLength(0);
+          expect(amountRouter.route.mock.calls).toHaveLength(0);
+        },
+      );
+
+      it('does not remember or mark seen when guidance delivery fails', async () => {
+        ingress.admit.mockResolvedValueOnce({ kind: 'disabled' });
+        sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
+
+        await expect(
+          service.dispatch(mediaEvent('wamid.guidance-fail', 'image')),
+        ).rejects.toThrow('Meta 131030');
+        expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
+        expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
+        expect(llm.run.mock.calls).toHaveLength(0);
+        expect(amountRouter.route.mock.calls).toHaveLength(0);
+      });
     });
   });
 });

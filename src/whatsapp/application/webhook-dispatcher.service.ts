@@ -7,6 +7,10 @@ import {
 import type { AgentMessage } from '../../conversation/domain/conversation-store';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import {
+  ReceiptIngressService,
+  type ReceiptIngressDecision,
+} from '../../receipt-media/application/receipt-ingress.service';
+import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
 } from '../../human-handoff/application/human-handoff.service';
@@ -80,6 +84,7 @@ export class WebhookDispatcherService {
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore: ConversationStore,
     private readonly amountRouter: ReceiptAmountRouterService,
+    private readonly ingress: ReceiptIngressService,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -202,6 +207,35 @@ export class WebhookDispatcherService {
             continue;
           }
           // Fenced → fall through to the ordinary agent path below.
+        }
+
+        // ─── WU13-B2: ReceiptIngressService — customer media only ─────────────
+        if (message.media != null) {
+          const { kind } = await this.ingress.admit({
+            webhookMessageId: message.messageId,
+            providerMediaId: message.media.providerMediaId,
+            senderId: message.senderId,
+            declaredMimeType: message.media.declaredMimeType,
+          });
+          const guidance = ingressGuidance(kind);
+
+          if (guidance !== undefined) {
+            const { providerMessageId } = await this.whatsappSender.sendText({
+              to: message.senderId,
+              text: guidance,
+            });
+            this.recentOutbound.remember(providerMessageId);
+          }
+          try {
+            await this.dedup.markSeen(message.messageId);
+          } catch (error) {
+            this.logger.warn(
+              `markSeen failed for ${message.messageId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          continue;
         }
 
         // ─── (5) Normal agent dispatch ─────────────────────────────────
@@ -360,6 +394,29 @@ function normalizeTimestamp(timestamp: string): string {
   }
 
   return new Date(seconds * 1000).toISOString();
+}
+
+// WU13-B2: maps each closed ReceiptIngressDecision kind to customer-facing
+// guidance text. Silent variants return undefined — no reply is sent and
+// media never reaches the amount router or AgentRunner.
+function ingressGuidance(
+  kind: ReceiptIngressDecision['kind'],
+): string | undefined {
+  switch (kind) {
+    case 'disabled':
+      return 'El servicio no está disponible. Intenta más tarde.';
+    case 'unsupported-media':
+      return 'Formato no soportado. Envía JPEG o PNG.';
+    case 'no-placed-sale':
+      return 'Primero registra la venta en el sistema.';
+    case 'sender-active':
+      return 'Tienes un proceso abierto: finalízalo o cancélalo.';
+    case 'reserved':
+    case 'webhook-replayed':
+    case 'provider-media-reused':
+    case 'webhook-media-conflict':
+      return undefined;
+  }
 }
 
 // Re-export the AgentMessage type for any downstream consumers that
