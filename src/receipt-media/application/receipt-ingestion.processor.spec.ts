@@ -46,7 +46,7 @@ const fixture = (
     issue: jest.fn<CapabilityTokenResult, [string]>(() => ({
       token: 'raw-capability-token',
       tokenHash: Buffer.alloc(32, 8),
-      keyVersion: 2,
+      keyVersion: '2',
     })),
   },
 ) => {
@@ -258,8 +258,8 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
   it('bootstraps hash-only capability evidence after cleanup', async () => {
     const id = '1c0fac1e-5f0e-4a1e-9c1d-2b3c4d5e6f70';
     const capability = new CapabilityService(
-      new Map([[1, Buffer.alloc(32, 1)]]),
-      1,
+      new Map([['1', Buffer.alloc(32, 1)]]),
+      '1',
     );
     const issue = jest.spyOn(capability, 'issue');
     const f = fixture({ id, status: 'DOWNLOADED' }, capability);
@@ -278,7 +278,7 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
       objectEtag: 'first-etag',
       objectVersionId: 'v1',
       capabilityTokenHash: issued.tokenHash,
-      capabilityKeyVersion: 1,
+      capabilityKeyVersion: '1',
     });
     expect(input).not.toHaveProperty('token');
     const reconstructed = capability.reconstruct(
@@ -327,7 +327,7 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
       objectEtag: 'retry-etag',
       objectVersionId: null,
       capabilityTokenHash: Buffer.alloc(32, 8),
-      capabilityKeyVersion: 2,
+      capabilityKeyVersion: '2',
     });
     expect(f.cleanup.mock.invocationCallOrder[0]).toBeLessThan(
       issue.mock.invocationCallOrder[0],

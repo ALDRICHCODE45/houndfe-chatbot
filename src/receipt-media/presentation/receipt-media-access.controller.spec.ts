@@ -24,7 +24,7 @@ import {
 const KEY = Buffer.alloc(32, 7);
 const UUID = '00000000-0000-4000-8000-000000000000';
 const OBJECT_KEY = `receipts/${UUID}`;
-const ISSUER = new CapabilityService(new Map([[1, KEY]]), 1);
+const ISSUER = new CapabilityService(new Map([['1', KEY]]), '1');
 const VALID_TOKEN = ISSUER.issue(UUID).token;
 const NOT_FOUND = new ObjectStorageError('OBJECT_STORAGE', 'OBJECT_NOT_FOUND');
 const NETWORK_FAILURE = new ObjectStorageError(

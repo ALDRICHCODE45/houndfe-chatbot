@@ -17,6 +17,8 @@ import {
 
 const flush = () => new Promise<void>((r) => setImmediate(r));
 
+const LEASE = new Date(1_700_000_000_000);
+
 const intent = (over: Partial<ReceiptMediaOutboxRow> = {}) =>
   ({
     id: 'i1',
@@ -25,6 +27,7 @@ const intent = (over: Partial<ReceiptMediaOutboxRow> = {}) =>
     templateArgs: { amountCents: 123456 },
     status: 'PENDING',
     attempts: 0,
+    leaseExpiresAt: LEASE,
     ...over,
   }) as unknown as ReceiptMediaOutboxRow;
 
@@ -108,7 +111,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     h.worker.onApplicationBootstrap();
     await flush();
     expect(order).toEqual(['send', 'mark']);
-    expect(h.markSent).toHaveBeenCalledWith('i1', 'wn', 'wamid.XYZ');
+    expect(h.markSent).toHaveBeenCalledWith('i1', 'wn', 'wamid.XYZ', LEASE);
   });
 
   it('requeues attempts 1-2 and exhausts with exactly one alert on the third', async () => {
@@ -128,9 +131,9 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     await flush();
     expect(h.sendText).toHaveBeenCalledTimes(3);
     expect(h.reschedule.mock.calls).toEqual([
-      ['i2', 'wn', RETRY_DELAY_MS],
-      ['i2', 'wn', RETRY_DELAY_MS],
-      ['i2', 'wn', RETRY_DELAY_MS],
+      ['i2', 'wn', RETRY_DELAY_MS, LEASE],
+      ['i2', 'wn', RETRY_DELAY_MS, LEASE],
+      ['i2', 'wn', RETRY_DELAY_MS, LEASE],
     ]);
     expect(h.markSent).not.toHaveBeenCalled();
     expect(h.onExhausted).toHaveBeenCalledTimes(1);
@@ -143,7 +146,12 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     h.reschedule.mockResolvedValue('lost');
     h.worker.onApplicationBootstrap();
     await flush();
-    expect(h.reschedule).toHaveBeenCalledWith('i3', 'wn', RETRY_DELAY_MS);
+    expect(h.reschedule).toHaveBeenCalledWith(
+      'i3',
+      'wn',
+      RETRY_DELAY_MS,
+      LEASE,
+    );
     expect(h.markSent).not.toHaveBeenCalled();
     expect(h.onExhausted).not.toHaveBeenCalled();
   });
@@ -159,6 +167,12 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     crashed.worker.onApplicationBootstrap();
     await flush();
     expect(crashed.sendText).toHaveBeenCalledTimes(1);
+    expect(crashed.markSent).toHaveBeenCalledWith(
+      'i1',
+      'wn',
+      'wamid.OK',
+      new Date(0),
+    );
     expect(crashed.reschedule).not.toHaveBeenCalled();
     expect(crashed.onExhausted).not.toHaveBeenCalled();
     await crashed.worker.onModuleDestroy();
@@ -214,8 +228,18 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(h.claimBatch).toHaveBeenCalledTimes(1); // no claims after stop
     release();
     await stopped;
-    expect(h.markSent).toHaveBeenCalledWith('i1', 'wn', 'wamid.9');
+    expect(h.markSent).toHaveBeenCalledWith('i1', 'wn', 'wamid.9', LEASE);
     expect(h.worker.onModuleDestroy()).toBe(stopped);
+  });
+
+  it('fails closed on a missing lease token: no send, no bookkeeping', async () => {
+    const h = harness([[intent({ leaseExpiresAt: undefined })]]);
+    h.worker.onApplicationBootstrap();
+    await flush();
+    expect(h.sendText).not.toHaveBeenCalled();
+    expect(h.markSent).not.toHaveBeenCalled();
+    expect(h.reschedule).not.toHaveBeenCalled();
+    expect(h.onExhausted).not.toHaveBeenCalled();
   });
 
   it('carries no LLM or AgentRunner authority', () => {

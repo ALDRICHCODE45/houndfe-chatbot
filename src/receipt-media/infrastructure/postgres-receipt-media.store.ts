@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import { asCanonicalVersion } from '../application/capability.service';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -254,9 +255,7 @@ const isBootstrapInput = (
       ArrayBuffer.isView(input.capabilityTokenHash) &&
       Buffer.isBuffer(input.capabilityTokenHash) &&
       input.capabilityTokenHash.length === RECEIPT_SHA256_BYTES &&
-      Number.isSafeInteger(input.capabilityKeyVersion) &&
-      input.capabilityKeyVersion > 0 &&
-      input.capabilityKeyVersion <= MAX_INT32
+      asCanonicalVersion(input.capabilityKeyVersion) !== null
     );
   } catch {
     return false;
@@ -276,13 +275,33 @@ const hasDownloadEvidence = (row: Row) =>
   Buffer.isBuffer(row.content_sha256) &&
   row.content_sha256.length === RECEIPT_SHA256_BYTES;
 
+/** WU14B-R expand-phase read: canonical text evidence wins; legacy integer
+ *  evidence normalizes to its exact int32 canonical string (String() of an
+ *  int32-range JS number is lossless — no numeric parsing), so rows written
+ *  by old binaries stay replayable. */
+const capabilityVersionOf = (row: Row): string | null =>
+  typeof row.capability_key_version_text === 'string'
+    ? row.capability_key_version_text
+    : typeof row.capability_key_version === 'number'
+      ? String(row.capability_key_version)
+      : null;
+
+/** Lexical int32 compatibility for the legacy channel (WU14B-R): a canonical
+ *  decimal string fits the legacy signed int32 column iff it has fewer than
+ *  10 digits or, at exactly 10 digits, is lexically ≤ '2147483647'. Pure
+ *  string comparison — never numeric parsing. */
+const int32CompatibleVersion = (version: string): string | null =>
+  version.length < 10 || (version.length === 10 && version <= '2147483647')
+    ? version
+    : null;
+
 const sameBootstrapEvidence = (row: Row, input: AmountBootstrapInput) =>
   row.stored_at instanceof Date &&
   row.object_etag === input.objectEtag &&
   row.object_version_id === input.objectVersionId &&
   Buffer.isBuffer(row.capability_token_hash) &&
   Buffer.compare(row.capability_token_hash, input.capabilityTokenHash) === 0 &&
-  row.capability_key_version === input.capabilityKeyVersion &&
+  capabilityVersionOf(row) === input.capabilityKeyVersion &&
   row.capability_issued_at instanceof Date &&
   row.capability_revoked_at === null;
 
@@ -458,10 +477,12 @@ const attachStartIntentMatches = (
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
-    Object.entries(row).map(([k, v]) => [
-      k.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase()),
-      v,
-    ]),
+    Object.entries(row)
+      .filter(([k]) => k !== 'capability_key_version_text')
+      .map(([k, v]) => [
+        k.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase()),
+        k === 'capability_key_version' ? capabilityVersionOf(row) : v,
+      ]),
   ) as T;
 
 const loadHit = async (
@@ -1579,6 +1600,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             'object_version_id',
             'capability_token_hash',
             'capability_key_version',
+            'capability_key_version_text',
             'capability_issued_at',
             'capability_revoked_at',
           ].some((key) => receipt[key] !== null)
@@ -1587,7 +1609,8 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         const updated = await c.query<Row>(
           `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
              object_etag = $4, object_version_id = $5, capability_token_hash = $6,
-             capability_key_version = $7, capability_issued_at = now(),
+             capability_key_version_text = $7, capability_key_version = $8,
+             capability_issued_at = now(),
              version = version + 1, updated_at = now()
            WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
              AND version = $3::bigint AND lease_expires_at > clock_timestamp()
@@ -1600,6 +1623,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             input.objectVersionId,
             input.capabilityTokenHash,
             input.capabilityKeyVersion,
+            int32CompatibleVersion(input.capabilityKeyVersion),
           ],
         );
         if (updated.rowCount !== 1) throw FENCED;

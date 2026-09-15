@@ -230,7 +230,9 @@ export interface AmountBootstrapInput extends LeaseFenceInput {
   objectEtag: string;
   objectVersionId: string | null;
   capabilityTokenHash: Buffer;
-  capabilityKeyVersion: number;
+  /** Canonical positive decimal string (`^[1-9][0-9]*$`), arbitrary
+   *  magnitude (WU14B); never numeric or bigint. */
+  capabilityKeyVersion: string;
 }
 
 export type AmountBootstrapOutcome =

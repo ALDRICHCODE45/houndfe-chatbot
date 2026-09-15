@@ -135,5 +135,28 @@ describe('configuration()', () => {
       expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
       expect(cfg.receiptMedia.metricsEnabled).toBe(false);
     });
+
+    // WU14B: capability versions are canonical decimal strings of arbitrary
+    // magnitude; configuration passes the raw env string through verbatim
+    // (never numeric, never bounded by Number.MAX_SAFE_INTEGER).
+    it.each([
+      '1',
+      '2147483647',
+      '2147483648',
+      '9007199254740991',
+      '9007199254740992',
+      '9223372036854775808',
+    ])(
+      'passes RECEIPT_CAPABILITY_ACTIVE_VERSION %s through verbatim',
+      (env) => {
+        process.env.RECEIPT_CAPABILITY_ACTIVE_VERSION = env;
+        const cfg = configuration() as {
+          receiptMedia: {
+            capability: { activeVersion: string; keys?: string[] };
+          };
+        };
+        expect(cfg.receiptMedia.capability.activeVersion).toBe(env);
+      },
+    );
   });
 });

@@ -12,7 +12,7 @@ import {
 } from './receipt-capability-authorizer.service';
 import type { CapabilityAccessRow } from '../domain/receipt-media-store.port';
 
-const KEY = new Map([[1, new Uint8Array(nodeCrypto.randomBytes(32))]]);
+const KEY = new Map([['1', new Uint8Array(nodeCrypto.randomBytes(32))]]);
 const UUID = '5f0d5c1e-8a5b-4c9d-9e2f-3a4b5c6d7e8f';
 const OTHER_UUID = '0f8e7d6c-5b4a-4938-8271-6a5b4c3d2e1f';
 const OBJECT_KEY = `receipts/${UUID}`;
@@ -28,7 +28,7 @@ const rowFor = (
 });
 
 const buildHarness = (row: CapabilityAccessRow | null, reject = false) => {
-  const capabilityService = new CapabilityService(KEY, 1);
+  const capabilityService = new CapabilityService(KEY, '1');
   const verifySpy = jest.spyOn(capabilityService, 'verify');
   const lookupSpy = reject
     ? jest
@@ -78,7 +78,7 @@ describe('ReceiptCapabilityAuthorizerService', () => {
   });
 
   it('authorizes a known valid token with only the objectKey', async () => {
-    const capabilityService = new CapabilityService(KEY, 1);
+    const capabilityService = new CapabilityService(KEY, '1');
     const issued = capabilityService.issue(UUID);
     const { service, verifySpy, lookupSpy } = buildHarness(
       rowFor(issued.tokenHash),
@@ -93,7 +93,7 @@ describe('ReceiptCapabilityAuthorizerService', () => {
   });
 
   it('verifies an unknown token against the fixed dummy BEFORE the row decision', async () => {
-    const capabilityService = new CapabilityService(KEY, 1);
+    const capabilityService = new CapabilityService(KEY, '1');
     const issued = capabilityService.issue(OTHER_UUID);
     const { service, verifySpy, lookupSpy } = buildHarness(null);
     await expect(service.authorize(issued.token)).resolves.toEqual({
@@ -107,7 +107,7 @@ describe('ReceiptCapabilityAuthorizerService', () => {
   });
 
   it('denies a known token whose stored hash does not match', async () => {
-    const capabilityService = new CapabilityService(KEY, 1);
+    const capabilityService = new CapabilityService(KEY, '1');
     const issued = capabilityService.issue(UUID);
     const { service, verifySpy } = buildHarness(
       rowFor(issued.tokenHash.slice()),
@@ -120,7 +120,7 @@ describe('ReceiptCapabilityAuthorizerService', () => {
   });
 
   it('denies a well-formed token against a malformed 31-byte stored hash', async () => {
-    const capabilityService = new CapabilityService(KEY, 1);
+    const capabilityService = new CapabilityService(KEY, '1');
     const issued = capabilityService.issue(UUID);
     const shortHash = Buffer.alloc(31);
     const { service, verifySpy, lookupSpy } = buildHarness(rowFor(shortHash));
@@ -133,7 +133,7 @@ describe('ReceiptCapabilityAuthorizerService', () => {
   });
 
   it('denies a revoked row and verifies before the revocation decision', async () => {
-    const capabilityService = new CapabilityService(KEY, 1);
+    const capabilityService = new CapabilityService(KEY, '1');
     const issued = capabilityService.issue(UUID);
     const { service, verifySpy } = buildHarness(
       rowFor(issued.tokenHash, new Date('2026-01-01T00:00:00Z')),
@@ -145,7 +145,7 @@ describe('ReceiptCapabilityAuthorizerService', () => {
   });
 
   it('maps a database rejection to unavailable with no exception detail', async () => {
-    const capabilityService = new CapabilityService(KEY, 1);
+    const capabilityService = new CapabilityService(KEY, '1');
     const issued = capabilityService.issue(UUID);
     const { service, verifySpy, lookupSpy } = buildHarness(null, true);
     const outcome = await service.authorize(issued.token);

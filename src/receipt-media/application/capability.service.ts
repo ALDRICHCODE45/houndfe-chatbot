@@ -2,7 +2,10 @@
  *  issuance, strict canonical parsing, hash-only lookup input, fixed-dummy
  *  timing-safe comparison, and version-safe reconstruction over a decoded
  *  keyring. Pure constructor-input service: no Nest, config, database, storage,
- *  URL, logging, or lookup dependency; failures never carry secret material. */
+ *  URL, logging, or lookup dependency; failures never carry secret material.
+ *  WU14B (RMA2, RMA3): capability versions are canonical positive decimal
+ *  strings (`^[1-9][0-9]*$`) of arbitrary magnitude — never numbers, bigints,
+ *  or bounded integers. */
 import * as nodeCrypto from 'node:crypto';
 
 const TOKEN_ALPHABET_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -20,11 +23,17 @@ const DUMMY_HASH = Buffer.alloc(HASH_BYTES);
 export interface CapabilityTokenResult {
   token: string;
   tokenHash: Buffer;
-  keyVersion: number;
+  keyVersion: string;
 }
 
-const isPositiveInt = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+/** Single canonical positive decimal-string version gate (WU14B): a version
+ *  is accepted only as a string matching ^[1-9][0-9]*$ — no leading zeros,
+ *  sign, whitespace, fraction, or exponent; numeric, bigint, and padded
+ *  representations fail closed. Shared by config, tokens, durable rows, and
+ *  the store port without any numeric or bigint fallback. */
+const CANONICAL_VERSION_RE = /^[1-9][0-9]*$/;
+export const asCanonicalVersion = (value: unknown): string | null =>
+  typeof value === 'string' && CANONICAL_VERSION_RE.test(value) ? value : null;
 
 /** Fail-closed stored-hash candidate. Recognition runs entirely inside
  *  the try: the Object.prototype.toString tag read executes attacker
@@ -47,19 +56,21 @@ const asHashCandidate = (value: unknown): Uint8Array | null => {
 };
 
 export class CapabilityService {
-  private readonly keys: Map<number, Buffer>;
+  private readonly keys: Map<string, Buffer>;
 
   constructor(
-    keys: ReadonlyMap<number, Uint8Array>,
-    private readonly activeVersion: number,
+    keys: ReadonlyMap<string, Uint8Array>,
+    private readonly activeVersion: string,
   ) {
-    if (!(keys instanceof Map) || keys.size === 0) {
+    const active = asCanonicalVersion(activeVersion);
+    if (!(keys instanceof Map) || keys.size === 0 || active === null) {
       throw new Error(KEYRING_INVALID);
     }
     this.keys = new Map();
     for (const [version, key] of keys) {
+      const canonical = asCanonicalVersion(version);
       if (
-        !isPositiveInt(version) ||
+        canonical === null ||
         !(key instanceof Uint8Array) ||
         key.length < HASH_BYTES
       ) {
@@ -67,9 +78,9 @@ export class CapabilityService {
       }
       // Defensive copy keeps each version's material stable against later
       // mutation of the caller's buffers.
-      this.keys.set(version, Buffer.from(key));
+      this.keys.set(canonical, Buffer.from(key));
     }
-    if (!this.keys.has(activeVersion)) {
+    if (!this.keys.has(active)) {
       throw new Error(KEYRING_INVALID);
     }
   }
@@ -115,26 +126,27 @@ export class CapabilityService {
     return nodeCrypto.timingSafeEqual(actual, candidate);
   }
 
-  /** Rebuilds the token from the persisted key version and verifies it
-   *  timing-safely; missing/changed keys, unknown versions, and mismatches
+  /** Rebuilds the token from the persisted canonical key version and verifies
+   *  it timing-safely; missing/changed keys, unknown versions, and mismatches
    *  all fail closed to null. */
   reconstruct(
     receiptUuid: string,
-    keyVersion: number,
+    keyVersion: string,
     storedHash: unknown,
   ): CapabilityTokenResult | null {
     if (typeof receiptUuid !== 'string' || !RECEIPT_UUID_RE.test(receiptUuid)) {
       return null;
     }
-    if (!isPositiveInt(keyVersion) || !this.keys.has(keyVersion)) return null;
-    const derived = this.derive(receiptUuid, keyVersion);
+    const version = asCanonicalVersion(keyVersion);
+    if (version === null || !this.keys.has(version)) return null;
+    const derived = this.derive(receiptUuid, version);
     if (!this.verify(derived.token, storedHash)) return null;
-    return { ...derived, keyVersion };
+    return { ...derived, keyVersion: version };
   }
 
   private derive(
     receiptUuid: string,
-    keyVersion: number,
+    keyVersion: string,
   ): Omit<CapabilityTokenResult, 'keyVersion'> {
     const mac = nodeCrypto
       .createHmac('sha256', this.keys.get(keyVersion) as Buffer)

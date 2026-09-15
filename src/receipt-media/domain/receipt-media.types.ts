@@ -98,9 +98,11 @@ export interface ReceiptMediaRow {
   contentSha256: Buffer | null;
   objectEtag: string | null;
   objectVersionId: string | null;
-  /** SHA-256 of the capability token; the token itself is never stored. */
+  /** SHA-256 of the capability token; the token itself is never stored.
+   *  WU14B: the version is a canonical positive decimal string
+   *  (`^[1-9][0-9]*$`), arbitrary magnitude, never numeric. */
   capabilityTokenHash: Buffer | null;
-  capabilityKeyVersion: number | null;
+  capabilityKeyVersion: string | null;
   capabilityIssuedAt: Date | null;
   capabilityRevokedAt: Date | null;
   declaredAmountCents: number | null;

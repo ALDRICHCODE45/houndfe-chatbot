@@ -24,18 +24,22 @@ import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.p
 
 export interface NotificationStoreSeam {
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaOutboxRow[]>;
-  /** Fenced CAS after provider success; loser false. */
+  /** Fenced CAS after provider success; loser false. The claimed row's
+   * exact leaseExpiresAt rides along as the ABA fence token. */
   markSent(
     id: string,
     owner: string,
     providerMessageId: string,
+    leaseExpiresAt: Date,
   ): Promise<boolean>;
   /** Fenced requeue: attempts+1, PENDING at nextAttemptAt; the third failed
-   * attempt becomes FAILED and yields 'exhausted'. Loser 'lost'. */
+   * attempt becomes FAILED and yields 'exhausted'. Loser 'lost'. The
+   * exact claimed leaseExpiresAt is the ABA fence token. */
   reschedule(
     id: string,
     owner: string,
     delayMs: number,
+    leaseExpiresAt: Date,
   ): Promise<'rescheduled' | 'exhausted' | 'lost'>;
 }
 
@@ -200,7 +204,18 @@ export class ReceiptMediaNotificationWorker
     this.inFlight.add(settled);
   }
 
+  /** Fail closed: a claimed intent without a valid lease-expiration token
+   * cannot be fenced, so nothing is sent and nothing is bookkept. */
+  private leaseToken(intent: ReceiptMediaOutboxRow): Date | null {
+    return intent.leaseExpiresAt instanceof Date &&
+      !Number.isNaN(intent.leaseExpiresAt.getTime())
+      ? intent.leaseExpiresAt
+      : null;
+  }
+
   private async deliver(intent: ReceiptMediaOutboxRow): Promise<void> {
+    const lease = this.leaseToken(intent);
+    if (lease === null) return;
     let wamid: string;
     try {
       ({ providerMessageId: wamid } = await this.sender.sendText({
@@ -209,7 +224,7 @@ export class ReceiptMediaNotificationWorker
       }));
     } catch {
       const outcome = await this.store
-        .reschedule(intent.id, this.owner, RETRY_DELAY_MS)
+        .reschedule(intent.id, this.owner, RETRY_DELAY_MS, lease)
         .catch(() => 'lost' as const);
       if (outcome === 'exhausted')
         await this.alert.onExhausted(intent).catch(() => undefined);
@@ -217,6 +232,8 @@ export class ReceiptMediaNotificationWorker
     }
     // Fenced CAS after provider success only; a loser (false) mutates
     // nothing further — at-least-once replay covers the unmarked send.
-    await this.store.markSent(intent.id, this.owner, wamid).catch(() => false);
+    await this.store
+      .markSent(intent.id, this.owner, wamid, lease)
+      .catch(() => false);
   }
 }

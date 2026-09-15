@@ -87,7 +87,10 @@ const acceptedEvidence: Row = {
   stored_at: T0,
   object_etag: 'etag.core',
   capability_token_hash: Buffer.alloc(32, 2),
+  // Legacy integer channel fixture (WU14B-R expand phase): read back as a
+  // number; the canonical text channel is the app-facing representation.
   capability_key_version: 1,
+  capability_key_version_text: '1',
   capability_issued_at: T0,
 };
 const attachEvidence: Row = {
@@ -157,6 +160,7 @@ response_mime_type text YES detected_mime_type text YES
 provider_declared_bytes integer YES byte_count integer YES
 content_sha256 bytea YES object_etag text YES object_version_id text YES
 capability_token_hash bytea YES capability_key_version integer YES
+capability_key_version_text text YES
 capability_issued_at timestamptz YES capability_revoked_at timestamptz YES
 declared_amount_cents integer YES backend_receipt_id uuid YES
 backend_receipt_status text YES attach_attempt_id uuid YES
@@ -374,8 +378,8 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     ['byte_count', 10_485_761, false],
     ['provider_declared_bytes', 0, false],
     ['provider_declared_bytes', 10_485_761, false],
-    ['capability_key_version', 0, false],
-    ['capability_key_version', 1, false],
+    ['capability_key_version', '01', false],
+    ['capability_key_version', '1', false],
     ['declared_amount_cents', 0, false],
     ['declared_amount_cents', 1, true],
     ['attach_attempts', 2, false],
@@ -672,10 +676,12 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     for (const fragment of not) expect(def).not.toContain(fragment);
   });
 
+  // WU14B: the down chain is 2200 (capability string versions, type-only)
+  // → 2100 (cancellation commands) → 2000 (receipt media), so reaching
+  // the 2000 refusal takes three single-step downs.
   const tryMigrateDown = (): string => {
     try {
-      migrate('migrate:down');
-      migrate('migrate:down');
+      for (let i = 0; i < 3; i += 1) migrate('migrate:down');
       return '';
     } catch (err) {
       return String((err as { stderr?: Buffer }).stderr ?? err);
@@ -1578,7 +1584,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       objectEtag: 'etag.amount-bootstrap',
       objectVersionId: 'version.amount-bootstrap',
       capabilityTokenHash: CAPABILITY_HASH,
-      capabilityKeyVersion: 1,
+      capabilityKeyVersion: '1',
       ...over,
     });
     const seed = async (
@@ -1656,7 +1662,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           objectEtag: 'etag.amount-bootstrap',
           objectVersionId: 'version.amount-bootstrap',
           capabilityTokenHash: CAPABILITY_HASH,
-          capabilityKeyVersion: 1,
+          capabilityKeyVersion: '1',
         },
         intent: {
           receiptMediaId: UUID_A,
@@ -1685,7 +1691,19 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ['nullable object version', { objectVersionId: null }],
       [
         'max int32 capability key version',
-        { capabilityKeyVersion: 2_147_483_647 },
+        { capabilityKeyVersion: '2147483647' },
+      ],
+      [
+        'MAX_SAFE_INTEGER capability key version',
+        { capabilityKeyVersion: '9007199254740991' },
+      ],
+      [
+        'MAX_SAFE_INTEGER + 1 capability key version',
+        { capabilityKeyVersion: '9007199254740992' },
+      ],
+      [
+        'above signed bigint64 capability key version',
+        { capabilityKeyVersion: '9223372036854775808' },
       ],
     ])('accepts %s', async (_label, over) => {
       await seed();
@@ -1701,16 +1719,33 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ['non-string object version', { objectVersionId: 1 as never }, {}],
       ['short capability hash', { capabilityTokenHash: Buffer.alloc(31) }, {}],
       ['long capability hash', { capabilityTokenHash: Buffer.alloc(33) }, {}],
-      ['zero capability key version', { capabilityKeyVersion: 0 }, {}],
-      ['fractional capability key version', { capabilityKeyVersion: 1.5 }, {}],
+      ['zero capability key version', { capabilityKeyVersion: '0' }, {}],
       [
-        'unsafe capability key version',
-        { capabilityKeyVersion: Number.MAX_SAFE_INTEGER + 1 },
+        'fractional capability key version',
+        { capabilityKeyVersion: '1.5' },
         {},
       ],
       [
-        'database-overflow key version',
-        { capabilityKeyVersion: 2_147_483_648 },
+        'zero-padded capability key version',
+        { capabilityKeyVersion: '01' },
+        {},
+      ],
+      ['empty capability key version', { capabilityKeyVersion: '' }, {}],
+      ['whitespace capability key version', { capabilityKeyVersion: ' 1' }, {}],
+      [
+        'plus-signed capability key version',
+        { capabilityKeyVersion: '+1' },
+        {},
+      ],
+      ['negative capability key version', { capabilityKeyVersion: '-1' }, {}],
+      [
+        'numeric capability key version',
+        { capabilityKeyVersion: 1 as never },
+        {},
+      ],
+      [
+        'bigint capability key version',
+        { capabilityKeyVersion: BigInt(1) as never },
         {},
       ],
       ['wrong owner', { owner: 'worker.rival' }, {}],
@@ -1766,7 +1801,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         command({ objectEtag: 'etag.changed' }),
         command({ objectVersionId: null }),
         command({ capabilityTokenHash: Buffer.alloc(32, 9) }),
-        command({ capabilityKeyVersion: 2 }),
+        command({ capabilityKeyVersion: '2' }),
       ])
         await expectFenced(changed, recreated);
       await pool.query(
@@ -1880,7 +1915,10 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ],
       [
         'changed capability evidence',
-        () => pool.query('UPDATE receipt_media SET capability_key_version = 2'),
+        () =>
+          pool.query(
+            "UPDATE receipt_media SET capability_key_version_text = '2'",
+          ),
       ],
       [
         'revoked capability',
@@ -2038,6 +2076,76 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       const durable = await snapshot();
       expect(durable.conversation).toEqual({ sibling: { keep: true } });
       expect(durable.outbox).toEqual([]);
+    });
+
+    // --- WU14B-R expand/contract overlap (native R4) ---
+
+    it('dual-writes int32 versions and keeps huge versions text-only', async () => {
+      await seed();
+      await expect(
+        bootstrap(store as unknown as BootstrapStore, command()),
+      ).resolves.toMatchObject({ kind: 'bootstrapped' });
+      expect(
+        (
+          await pool.query<Row>(
+            'SELECT capability_key_version, capability_key_version_text FROM receipt_media',
+          )
+        ).rows[0],
+      ).toEqual({
+        capability_key_version: 1,
+        capability_key_version_text: '1',
+      });
+      await seed();
+      await expect(
+        bootstrap(
+          store as unknown as BootstrapStore,
+          command({ capabilityKeyVersion: '9223372036854775808' }),
+        ),
+      ).resolves.toMatchObject({ kind: 'bootstrapped' });
+      expect(
+        (
+          await pool.query<Row>(
+            'SELECT capability_key_version, capability_key_version_text FROM receipt_media',
+          )
+        ).rows[0],
+      ).toEqual({
+        capability_key_version: null,
+        capability_key_version_text: '9223372036854775808',
+      });
+    });
+
+    it('replays legacy-only old-binary evidence through the canonical read', async () => {
+      await seed();
+      // Old-binary bootstrap: legacy integer channel only, text null.
+      await pool.query(
+        `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
+           object_etag = 'etag.amount-bootstrap',
+           object_version_id = 'version.amount-bootstrap',
+           capability_token_hash = $1, capability_key_version = 1,
+           capability_issued_at = now(), version = 3 WHERE id = $2`,
+        [CAPABILITY_HASH, UUID_A],
+      );
+      await pool.query(
+        `UPDATE conversation_state SET data = jsonb_set(data,
+             '{receiptAmountPointer}', jsonb_build_object('receiptMediaId',
+             $2::text, 'saleId', $3::text, 'receiptVersion', '3'::text), true)
+           WHERE sender_id = $1`,
+        [SENDER, UUID_A, UUID_B],
+      );
+      const intent = outboxRow({
+        dedupe_key: `receipt-amount-prompt:${UUID_A}:2:wamid.amount-bootstrap`,
+        receipt_media_id: UUID_A,
+        receipt_state_version: '3',
+        source_webhook_message_id: 'wamid.amount-bootstrap',
+        recipient_id: SENDER,
+      });
+      await pool.query(
+        insertSql('receipt_media_outbox', intent),
+        Object.values(intent),
+      );
+      await expect(
+        bootstrap(store as unknown as BootstrapStore, command()),
+      ).resolves.toMatchObject({ kind: 'replayed' });
     });
   });
 
@@ -4966,10 +5074,245 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     });
   });
 
+  // --- WU14B canonical decimal-string capability versions (RMA2, RMA3) ---
+
+  describe('WU14B canonical decimal-string capability versions', () => {
+    beforeEach(async () => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+    });
+
+    let versionSeq = 0;
+    const versionedRow = (version: string, over: Row = {}): Row =>
+      lifeRow('STORED', null, {
+        id: `00000000-0000-4000-8000-${String(++versionSeq).padStart(12, '0')}`,
+        webhook_message_id: `wamid.cap-version-${versionSeq}`,
+        provider_media_id: `media.cap-version-${versionSeq}`,
+        object_key: `receipts/cap-version-${versionSeq}`,
+        sender_id: `sender.cap-version-${versionSeq}`,
+        capability_token_hash: Buffer.alloc(32, versionSeq),
+        capability_key_version_text: version,
+        ...over,
+      });
+    const seedVersionRow = async (
+      version: string,
+      over: Row = {},
+    ): Promise<void> => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const row = versionedRow(version, over);
+      await pool.query(insertSql('receipt_media', row), Object.values(row));
+    };
+    const columnMeta = async (column: string): Promise<Row> =>
+      (
+        await pool.query<Row>(
+          `SELECT data_type, is_nullable FROM information_schema.columns
+             WHERE table_name = 'receipt_media' AND column_name = $1`,
+          [column],
+        )
+      ).rows[0];
+    const versionColumn = (): Promise<Row> =>
+      columnMeta('capability_key_version');
+    const textVersionColumn = (): Promise<Row> =>
+      columnMeta('capability_key_version_text');
+    const singleColumnVersionChecks = async (column: string): Promise<Row[]> =>
+      (
+        await pool.query<Row>(
+          `SELECT con.conname, pg_get_constraintdef(con.oid) AS def
+             FROM pg_constraint con
+             JOIN pg_attribute att ON att.attrelid = con.conrelid
+               AND att.attname = $1 AND NOT att.attisdropped
+             WHERE con.conrelid = 'receipt_media'::regclass
+               AND con.contype = 'c'
+               AND con.conkey = ARRAY[att.attnum]::smallint[]`,
+          [column],
+        )
+      ).rows;
+
+    it('keeps the legacy channel and adds the constrained canonical text channel', async () => {
+      expect(await versionColumn()).toMatchObject({
+        data_type: 'integer',
+      });
+      expect(await textVersionColumn()).toMatchObject({
+        data_type: 'text',
+        is_nullable: 'YES',
+      });
+      const textChecks = await singleColumnVersionChecks(
+        'capability_key_version_text',
+      );
+      expect(textChecks).toHaveLength(1);
+      const def = (textChecks[0].def as string).replace(/\s+/g, ' ');
+      expect(def).toContain("capability_key_version_text ~ '^[1-9][0-9]*$'");
+      expect((textChecks[0].conname as string).endsWith('_canonical')).toBe(
+        true,
+      );
+      const legacyChecks = await singleColumnVersionChecks(
+        'capability_key_version',
+      );
+      expect(legacyChecks).toHaveLength(1);
+      expect((legacyChecks[0].def as string).replace(/\s+/g, ' ')).toContain(
+        'capability_key_version > 0',
+      );
+    });
+
+    it('accepts either capability evidence channel under the composite check', async () => {
+      await expectInserts([
+        // legacy-only: old-binary evidence stays valid after migration.
+        [
+          'receipt_media',
+          versionedRow('1', { capability_key_version_text: null }),
+          true,
+        ],
+        // text-only: huge-version canonical evidence.
+        [
+          'receipt_media',
+          versionedRow('9223372036854775808', {
+            capability_key_version: null,
+          }),
+          true,
+        ],
+        // neither channel: rejected.
+        [
+          'receipt_media',
+          versionedRow('1', {
+            capability_key_version_text: null,
+            capability_key_version: null,
+          }),
+          false,
+        ],
+      ]);
+    });
+
+    it.each([
+      ['1', true],
+      ['2147483647', true],
+      ['2147483648', true],
+      ['9007199254740991', true],
+      ['9007199254740992', true],
+      ['9223372036854775808', true],
+      ['0', false],
+      ['01', false],
+      [' 1', false],
+      ['+1', false],
+      ['-1', false],
+      ['', false],
+      ['1.0', false],
+      ['1e3', false],
+      ['abc', false],
+    ])('enforces the canonical check on %j', async (version, ok) => {
+      await expectInserts([['receipt_media', versionedRow(version), ok]]);
+    });
+
+    it('round-trips safely: down synchronizes legacy, up backfills text', async () => {
+      await seedVersionRow('2147483647', {
+        capability_key_version: '2147483647',
+      });
+      // Old-binary row written after migration: legacy only, text null.
+      const legacyOnly = versionedRow('1', {
+        capability_key_version_text: null,
+      });
+      await pool.query(
+        insertSql('receipt_media', legacyOnly),
+        Object.values(legacyOnly),
+      );
+      migrate('migrate:down');
+      expect(await textVersionColumn()).toBeUndefined();
+      expect(await versionColumn()).toMatchObject({ data_type: 'integer' });
+      expect(
+        (
+          await pool.query<Row>(
+            'SELECT capability_key_version FROM receipt_media ORDER BY id',
+          )
+        ).rows.map((r) => r.capability_key_version),
+      ).toEqual([2147483647, 1]);
+      migrate('migrate');
+      expect(await textVersionColumn()).toMatchObject({
+        data_type: 'text',
+      });
+      expect(
+        (
+          await pool.query<Row>(
+            'SELECT capability_key_version_text FROM receipt_media ORDER BY id',
+          )
+        ).rows.map((r) => r.capability_key_version_text),
+      ).toEqual(['2147483647', '1']);
+      expect(
+        await singleColumnVersionChecks('capability_key_version_text'),
+      ).toHaveLength(1);
+    });
+
+    it.each<[string, string, Row]>([
+      [
+        'beyond the legacy int32 range',
+        '2147483648',
+        { capability_key_version: null },
+      ],
+      ['divergent from legacy evidence', '2', { capability_key_version: '1' }],
+    ])(
+      'down refuses canonical text %s',
+      async (_label, version, legacyOver) => {
+        await seedVersionRow(version, legacyOver);
+        expect(() => migrate('migrate:down')).toThrow(/refus/i);
+        expect(await textVersionColumn()).toMatchObject({
+          data_type: 'text',
+        });
+      },
+    );
+
+    it('down fails closed when a stored text value is non-canonical', async () => {
+      await seedVersionRow('1');
+      // Simulate un-enforced data by lifting the canonical text check,
+      // writing a non-canonical value, and restoring before the refusal run.
+      await pool.query(
+        'ALTER TABLE receipt_media DROP CONSTRAINT ' +
+          'receipt_media_capability_key_version_text_canonical',
+      );
+      try {
+        const row = versionedRow('01');
+        await pool.query(insertSql('receipt_media', row), Object.values(row));
+        // The refusal must happen while the un-enforced value exists; the
+        // failed down aborts its transaction and keeps the migration applied.
+        expect(() => migrate('migrate:down')).toThrow(/refus/i);
+        expect(await textVersionColumn()).toMatchObject({
+          data_type: 'text',
+        });
+      } finally {
+        // Remove the simulated bad row before restoring the check.
+        await pool.query(
+          "DELETE FROM receipt_media WHERE capability_key_version_text = '01'",
+        );
+        await pool.query(
+          'ALTER TABLE receipt_media ADD CONSTRAINT ' +
+            'receipt_media_capability_key_version_text_canonical ' +
+            'CHECK (capability_key_version_text IS NULL OR ' +
+            "capability_key_version_text ~ '^[1-9][0-9]*$')",
+        );
+      }
+      await pool.query('DELETE FROM receipt_media');
+    });
+  });
+
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query(
       'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
     );
+    // WU14B: 2200 is type-only, so the first down keeps every table and
+    // merely restores integer capability versions; 2100 then drops the
+    // cancellation commands; 2000 drops the core tables.
+    migrate('migrate:down');
+    for (const table of [
+      'receipt_media',
+      'receipt_media_outbox',
+      'receipt_media_cancellation_commands',
+    ]) {
+      const { rows } = await pool.query<{ t: string | null }>(
+        'SELECT to_regclass($1) AS t',
+        [table],
+      );
+      expect(rows[0].t).toBe(table);
+    }
     migrate('migrate:down');
     const { rows: cancellationTables } = await pool.query<{ t: string | null }>(
       "SELECT to_regclass('receipt_media_cancellation_commands') AS t",
@@ -4984,7 +5327,11 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       expect(rows[0].t).toBeNull();
     }
     migrate('migrate');
-    for (const table of ['receipt_media', 'receipt_media_outbox']) {
+    for (const table of [
+      'receipt_media',
+      'receipt_media_outbox',
+      'receipt_media_cancellation_commands',
+    ]) {
       const { rows } = await pool.query<{ t: string | null }>(
         'SELECT to_regclass($1) AS t',
         [table],

@@ -27,30 +27,33 @@ const VECTOR_HASH = Buffer.from(
 const SPOOF = { [Symbol.toStringTag]: 'Uint8Array', length: 32 };
 const KEYRING_INVALID = 'RECEIPT_CAPABILITY_KEYRING_INVALID';
 const INPUT_INVALID = 'RECEIPT_CAPABILITY_INPUT_INVALID';
+// WU14B decimal-string version boundaries (RMA2, RMA3).
+const MAX_SAFE_INTEGER_PLUS_1 = '9007199254740992';
+const MAX_SAFE_INTEGER = '9007199254740991';
 const make = (
-  keys: ReadonlyMap<number, Buffer>,
-  activeVersion = 1,
+  keys: ReadonlyMap<string, Buffer>,
+  activeVersion = '1',
 ): CapabilityService => new CapabilityService(keys, activeVersion);
 const rotated = (): CapabilityService =>
   make(
     new Map([
-      [1, KEY_V1],
-      [2, KEY_V2],
+      ['1', KEY_V1],
+      ['2', KEY_V2],
     ]),
-    2,
+    '2',
   );
 
 describe('CapabilityService', () => {
   it('issues the fixed vector deterministically and differently per id', () => {
-    const issued = make(new Map([[1, KEY_V1]])).issue(UUID_A);
+    const issued = make(new Map([['1', KEY_V1]])).issue(UUID_A);
     expect(issued.token).toBe(VECTOR_TOKEN);
     expect(issued.token.length).toBe(43);
     expect(issued.tokenHash.equals(VECTOR_HASH)).toBe(true);
-    expect(issued.keyVersion).toBe(1);
-    const restarted = make(new Map([[1, Buffer.from(KEY_V1)]])).issue(UUID_A);
+    expect(issued.keyVersion).toBe('1');
+    const restarted = make(new Map([['1', Buffer.from(KEY_V1)]])).issue(UUID_A);
     expect(restarted.token).toBe(issued.token);
     expect(restarted.tokenHash.equals(issued.tokenHash)).toBe(true);
-    const other = make(new Map([[1, KEY_V1]])).issue(UUID_B);
+    const other = make(new Map([['1', KEY_V1]])).issue(UUID_B);
     expect(other.token).not.toBe(issued.token);
     expect(other.tokenHash.equals(issued.tokenHash)).toBe(false);
   });
@@ -58,36 +61,36 @@ describe('CapabilityService', () => {
   it('rotates additively, retains old keys, and copies key buffers', () => {
     const service = rotated();
     const fresh = service.issue(UUID_A);
-    expect(fresh.keyVersion).toBe(2);
+    expect(fresh.keyVersion).toBe('2');
     expect(fresh.token).not.toBe(VECTOR_TOKEN);
-    const legacy = make(new Map([[1, KEY_V1]])).issue(UUID_A);
-    const back = service.reconstruct(UUID_A, 1, legacy.tokenHash);
+    const legacy = make(new Map([['1', KEY_V1]])).issue(UUID_A);
+    const back = service.reconstruct(UUID_A, '1', legacy.tokenHash);
     expect(back?.token).toBe(legacy.token);
-    expect(back?.keyVersion).toBe(1);
+    expect(back?.keyVersion).toBe('1');
     const mutable = Buffer.from(KEY_V1);
-    const copying = make(new Map([[1, mutable]]));
+    const copying = make(new Map([['1', mutable]]));
     const before = copying.issue(UUID_A);
     mutable.fill(0xff);
     expect(copying.issue(UUID_A).token).toBe(before.token);
   });
 
   it('fails closed when a historical key is absent or replaced', () => {
-    const legacy = make(new Map([[1, KEY_V1]])).issue(UUID_A);
-    const withoutOld = make(new Map([[2, KEY_V2]]), 2);
-    expect(withoutOld.reconstruct(UUID_A, 1, legacy.tokenHash)).toBeNull();
-    expect(withoutOld.reconstruct(UUID_A, 3, legacy.tokenHash)).toBeNull();
+    const legacy = make(new Map([['1', KEY_V1]])).issue(UUID_A);
+    const withoutOld = make(new Map([['2', KEY_V2]]), '2');
+    expect(withoutOld.reconstruct(UUID_A, '1', legacy.tokenHash)).toBeNull();
+    expect(withoutOld.reconstruct(UUID_A, '3', legacy.tokenHash)).toBeNull();
     const replaced = make(
       new Map([
-        [1, KEY_V2],
-        [2, Buffer.alloc(32, 0xcd)],
+        ['1', KEY_V2],
+        ['2', Buffer.alloc(32, 0xcd)],
       ]),
-      2,
+      '2',
     );
-    expect(replaced.reconstruct(UUID_A, 1, legacy.tokenHash)).toBeNull();
+    expect(replaced.reconstruct(UUID_A, '1', legacy.tokenHash)).toBeNull();
   });
 
   describe('token parsing', () => {
-    const service = make(new Map([[1, KEY_V1]]));
+    const service = make(new Map([['1', KEY_V1]]));
     it('accepts only the canonical 43-char base64url token', () => {
       expect(service.parseToken(VECTOR_TOKEN)).toBe(VECTOR_TOKEN);
       // Same decoded bytes as the canonical token, but trailing bits differ.
@@ -115,7 +118,7 @@ describe('CapabilityService', () => {
   });
 
   describe('hash and verify', () => {
-    const service = make(new Map([[1, KEY_V1]]));
+    const service = make(new Map([['1', KEY_V1]]));
     const lastArgs = (): [Buffer, Buffer] =>
       safeEqual.mock.calls[safeEqual.mock.calls.length - 1] as [Buffer, Buffer];
     it('produces the lookup input consistently and rejects alterations', () => {
@@ -165,7 +168,7 @@ describe('CapabilityService', () => {
       expect(service.verify(VECTOR_TOKEN, new Uint8Array(VECTOR_HASH))).toBe(
         true,
       );
-      expect(service.reconstruct(UUID_A, 1, hostile)).toBeNull();
+      expect(service.reconstruct(UUID_A, '1', hostile)).toBeNull();
     });
     it('fails closed on malformed tokens without throwing or comparing', () => {
       safeEqual.mockClear();
@@ -176,42 +179,101 @@ describe('CapabilityService', () => {
   });
 
   describe('reconstruction', () => {
-    const service = make(new Map([[1, KEY_V1]]));
+    const service = make(new Map([['1', KEY_V1]]));
     it('matches the issued token and fails closed on tampering', () => {
       const issued = service.issue(UUID_A);
-      const back = service.reconstruct(UUID_A, 1, issued.tokenHash);
+      const back = service.reconstruct(UUID_A, '1', issued.tokenHash);
       expect(back?.token).toBe(issued.token);
       expect(back?.tokenHash.equals(issued.tokenHash)).toBe(true);
-      expect(back?.keyVersion).toBe(1);
+      expect(back?.keyVersion).toBe('1');
       const tampered = Buffer.from(issued.tokenHash);
       tampered[0] ^= 0x01;
-      expect(service.reconstruct(UUID_A, 1, tampered)).toBeNull();
+      expect(service.reconstruct(UUID_A, '1', tampered)).toBeNull();
       for (const uuid of [null, 'not-a-uuid', 'receipts/' + UUID_A])
         expect(
-          service.reconstruct(uuid as string, 1, issued.tokenHash),
+          service.reconstruct(uuid as string, '1', issued.tokenHash),
         ).toBeNull();
-      expect(service.reconstruct(UUID_A, 0, issued.tokenHash)).toBeNull();
-      expect(service.reconstruct(UUID_A, 1.5, issued.tokenHash)).toBeNull();
+      for (const badVersion of ['0', '1.5', '01', ' 1', '+1', '', 1, BigInt(1)])
+        expect(
+          service.reconstruct(UUID_A, badVersion as never, issued.tokenHash),
+        ).toBeNull();
+    });
+  });
+
+  describe('canonical decimal-string capability versions (WU14B)', () => {
+    it.each([
+      ['1', 1],
+      ['2147483647', 2147483647],
+      ['2147483648', 2147483648],
+      [MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+      [MAX_SAFE_INTEGER_PLUS_1, Number.MAX_SAFE_INTEGER + 1],
+      ['9223372036854775808', 9_223_372_036_854_775_808],
+    ] as Array<[string, number]>)(
+      'issues and reconstructs under arbitrary canonical version %s',
+      (version) => {
+        const key = Buffer.alloc(32, 7);
+        const service = make(new Map([[version, key]]), version);
+        const issued = service.issue(UUID_A);
+        expect(issued.keyVersion).toBe(version);
+        const back = service.reconstruct(UUID_A, version, issued.tokenHash);
+        expect(back?.keyVersion).toBe(version);
+        expect(back?.token).toBe(issued.token);
+      },
+    );
+
+    it.each([
+      '0',
+      '00',
+      '01',
+      ' 1',
+      '1 ',
+      '+1',
+      '-1',
+      '',
+      '1.0',
+      '1e3',
+      'abc',
+      '1,000',
+    ])('rejects non-canonical keyring version %j', (version) => {
+      expect(() => make(new Map([[version, KEY_V1]]), version)).toThrow(
+        KEYRING_INVALID,
+      );
+    });
+
+    it.each([0, 1, 1.5, Number.MAX_SAFE_INTEGER, BigInt(1)])(
+      'rejects numeric/bigint keyring version %p',
+      (version) => {
+        expect(() =>
+          make(new Map([[version as never, KEY_V1]]), version as never),
+        ).toThrow(KEYRING_INVALID);
+      },
+    );
+
+    it('rejects an active version that is canonical but unknown', () => {
+      expect(() =>
+        make(new Map([['1', KEY_V1]]), MAX_SAFE_INTEGER_PLUS_1),
+      ).toThrow(KEYRING_INVALID);
+      expect(() => make(new Map(), '1')).toThrow(KEYRING_INVALID);
     });
   });
 
   describe('fail-closed validation', () => {
     it('rejects invalid keyrings without exposing key material', () => {
-      const cases: Array<[ReadonlyMap<number, Buffer>, number]> = [
-        [new Map(), 1],
-        [new Map([[1, Buffer.alloc(31, 0x01)]]), 1],
-        [new Map([[1, KEY_V1]]), 2],
-        [new Map([[0, KEY_V1]]), 0],
-        [new Map([[1.5, KEY_V1]]), 1.5],
+      const cases: Array<[ReadonlyMap<string, Buffer>, string]> = [
+        [new Map(), '1'],
+        [new Map([['1', Buffer.alloc(31, 0x01)]]), '1'],
+        [new Map([['1', KEY_V1]]), '2'],
+        [new Map([['0', KEY_V1]]), '0'],
+        [new Map([['1.5', KEY_V1]]), '1.5'],
       ];
       for (const [keys, active] of cases)
         expect(() => make(keys, active)).toThrow(KEYRING_INVALID);
-      expect(() => make(new Map([[1, Buffer.alloc(31, 0x01)]]), 1)).toThrow(
+      expect(() => make(new Map([['1', Buffer.alloc(31, 0x01)]]), '1')).toThrow(
         new Error(KEYRING_INVALID),
       );
     });
     it('rejects non-canonical receipt uuids at issuance', () => {
-      const service = make(new Map([[1, KEY_V1]]));
+      const service = make(new Map([['1', KEY_V1]]));
       const cases = [
         'not-a-uuid',
         '00000000-0000-4000-8000-00000000000G',
@@ -228,10 +290,10 @@ describe('CapabilityService', () => {
       );
     });
     it('performs no logging and carries no logger dependency', () => {
-      const service = make(new Map([[1, KEY_V1]]));
+      const service = make(new Map([['1', KEY_V1]]));
       expect(Object.keys(service).sort()).toEqual(['activeVersion', 'keys']);
       expect(service.parseToken('')).toBeNull();
-      expect(service.reconstruct(UUID_A, 99, null)).toBeNull();
+      expect(service.reconstruct(UUID_A, '99', null)).toBeNull();
     });
   });
 });
