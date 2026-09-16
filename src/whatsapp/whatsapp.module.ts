@@ -3,6 +3,7 @@ import { ConversationModule } from '../conversation/conversation.module';
 import { DatabaseModule } from '../database/database.module';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
+import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
 import { WebhookDispatcherService } from './application/webhook-dispatcher.service';
 import { RECENT_OUTBOUND } from './domain/recent-outbound.store';
 import { WEBHOOK_DEDUP } from './domain/webhook-dedup.store';
@@ -37,6 +38,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
     DatabaseModule,
     HumanHandoffModule,
     WhatsappSenderModule,
+    ReceiptMediaModule,
   ],
   controllers: [WebhookController],
   providers: [
