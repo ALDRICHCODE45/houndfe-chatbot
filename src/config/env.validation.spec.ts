@@ -445,6 +445,10 @@ describe('envValidationSchema', () => {
       RECEIPT_STORAGE_ACCESS_KEY_ID: 'AKIAEXAMPLE',
       RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'redacted-secret-value',
       RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
+      RECEIPT_MEDIA_METRICS_ENABLED: 'true',
+      // WU15-1: dedicated metrics Bearer token — 64 hex chars from 32 random bytes.
+      RECEIPT_MEDIA_METRICS_TOKEN:
+        'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
       // WU1C2A numeric relations: metadata=5s, download=30s,
       // concurrency=2, lease=exactly 60s, poll=1s, attach=30s.
       META_MEDIA_METADATA_TIMEOUT_MS: '5000',
@@ -642,6 +646,259 @@ describe('envValidationSchema', () => {
         abortEarly: false,
       });
       expect(error).toBeDefined();
+    });
+
+    // ─── WU15-1: Independent metrics flag + dedicated token validation ─────
+    // RECEIPT_MEDIA_METRICS_ENABLED is independently validated (not keyed on
+    // RECEIPT_MEDIA_ENABLED); token is required ONLY when metrics is enabled.
+
+    // Metrics disabled: any supplied token must still be valid 64hex.
+    // RED: current schema accepts malformed tokens when disabled.
+    it('rejects disabled metrics with supplied invalid-token (too short)', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_TOKEN: 'too-short',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects disabled metrics with supplied invalid-token (non-hex chars)', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects disabled metrics with supplied 65-char token', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(65),
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('accepts disabled metrics with absent RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('accepts disabled metrics with valid 64hex RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    // Metrics disabled + enabled flag independently: valid token supplied with metrics=false → OK
+    it('accepts disabled metrics with valid token even when metricsEnabled absent', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('accepts enabled metrics with valid token when RECEIPT_MEDIA_ENABLED=false', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_ENABLED: 'false',
+        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    // Metrics enabled: token is required
+    it('rejects enabled metrics with missing RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...enabledBase,
+      };
+      delete (env as Record<string, unknown>).RECEIPT_MEDIA_METRICS_TOKEN;
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) =>
+          d.path.includes('RECEIPT_MEDIA_METRICS_TOKEN'),
+        ),
+      ).toBe(true);
+    });
+
+    it('rejects enabled metrics with empty RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: '',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects enabled metrics with whitespace-only RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: '   ',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('accepts enabled metrics with valid RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    // Exact-length boundary: pattern-only without .length(64) may admit 64hex + trailing newline.
+    it('rejects 64hex followed by trailing newline (JavaScript $ can match before \\n)', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(64) + '\n',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects 64hex followed by trailing carriage-return newline (\\r\\n)', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(64) + '\r\n',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects exactly 65 hex characters (one over)', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(65),
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    it('rejects exactly 63 hex characters (one short)', () => {
+      const env = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(63),
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+    });
+
+    // WU15-1 redaction: metrics token must not appear in validation errors
+    it('redacts RECEIPT_MEDIA_METRICS_TOKEN from validation error when malformed', () => {
+      const TOKEN_SENTINEL =
+        'wu15t1-token-redaction-test-sentinel-9a3f' + 'Z'.repeat(43);
+      const env: Record<string, unknown> = {
+        ...enabledBase,
+        RECEIPT_MEDIA_METRICS_TOKEN: TOKEN_SENTINEL,
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) =>
+          d.path.includes('RECEIPT_MEDIA_METRICS_TOKEN'),
+        ),
+      ).toBe(true);
+      const detailsText = error!.details.map((d) => d.message).join(' | ');
+      const detailsJson = JSON.stringify(error!.details);
+      const stringified = String(error);
+      const original = (error as { _original?: unknown })._original;
+      for (const surface of [detailsText, detailsJson, stringified]) {
+        expect(surface).not.toContain(TOKEN_SENTINEL);
+      }
+      // _original is deleted by redactValidationError; undefined → "undefined"
+      expect(String(original)).not.toContain(TOKEN_SENTINEL);
+    });
+
+    // Metrics flag is independently validated (not keyed on RECEIPT_MEDIA_ENABLED)
+    it('accepts RECEIPT_MEDIA_METRICS_ENABLED=true without RECEIPT_MEDIA_ENABLED=true', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('rejects RECEIPT_MEDIA_METRICS_ENABLED=true without RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) =>
+          d.path.includes('RECEIPT_MEDIA_METRICS_TOKEN'),
+        ),
+      ).toBe(true);
     });
 
     // ─── WU1C2A: Numeric relational bounds (compact table-driven) ────────

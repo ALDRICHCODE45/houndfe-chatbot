@@ -82,6 +82,7 @@ const configuration = () => ({
       pollIntervalMs: int(process.env.RECEIPT_MEDIA_WORKER_POLL_MS),
     },
     metricsEnabled: process.env.RECEIPT_MEDIA_METRICS_ENABLED === 'true',
+    metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
   },
 });
 

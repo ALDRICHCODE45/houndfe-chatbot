@@ -47,6 +47,7 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_LEASE_MS',
     'RECEIPT_MEDIA_WORKER_POLL_MS',
     'RECEIPT_MEDIA_METRICS_ENABLED',
+    'RECEIPT_MEDIA_METRICS_TOKEN',
   ];
 
   beforeEach(() => {
@@ -134,6 +135,37 @@ describe('configuration()', () => {
       expect(cfg.receiptMedia.worker.concurrency).toBe(2);
       expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
       expect(cfg.receiptMedia.metricsEnabled).toBe(false);
+    });
+
+    // WU15-1: metricsToken surfaces independently on receiptMedia
+    it('exposes metricsToken from RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      process.env.RECEIPT_MEDIA_METRICS_TOKEN = 'abc123-token-value';
+      const cfg = configuration() as unknown as {
+        receiptMedia: { metricsToken: string | undefined };
+      };
+      expect(cfg.receiptMedia.metricsToken).toBe('abc123-token-value');
+    });
+
+    it('defaults metricsToken to undefined when absent', () => {
+      delete process.env.RECEIPT_MEDIA_METRICS_TOKEN;
+      const cfg = configuration() as unknown as {
+        receiptMedia: { metricsToken: string | undefined };
+      };
+      expect(cfg.receiptMedia.metricsToken).toBeUndefined();
+    });
+
+    // WU15-1: metricsToken is independent of receiptMedia.enabled
+    it('exposes metricsToken when receiptMedia is disabled', () => {
+      process.env.RECEIPT_MEDIA_ENABLED = 'false';
+      process.env.RECEIPT_MEDIA_METRICS_TOKEN = 'independent-token';
+      const cfg = configuration() as unknown as {
+        receiptMedia: {
+          enabled: boolean;
+          metricsToken: string | undefined;
+        };
+      };
+      expect(cfg.receiptMedia.enabled).toBe(false);
+      expect(cfg.receiptMedia.metricsToken).toBe('independent-token');
     });
 
     // WU14B: capability versions are canonical decimal strings of arbitrary

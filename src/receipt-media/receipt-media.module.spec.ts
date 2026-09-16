@@ -15,7 +15,13 @@
  * duplicate-import singularity, and a constant non-PII exhaustion alert. */
 import { Test } from '@nestjs/testing';
 import { ConfigModule } from '@nestjs/config';
-import { Module, Logger, type INestApplicationContext } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Module,
+  Logger,
+  type INestApplicationContext,
+} from '@nestjs/common';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import { AppConfigModule } from '../config/config.module';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
@@ -44,12 +50,26 @@ import { ReceiptMediaIngestionWorker } from './infrastructure/receipt-media-inge
 import { ReceiptMediaNotificationWorker } from './infrastructure/receipt-media-notification.worker';
 import { S3ObjectStorageAdapter } from './infrastructure/s3-object-storage.adapter';
 import { ReceiptMediaAccessController } from './presentation/receipt-media-access.controller';
+import { ReceiptMetricsController } from './presentation/receipt-metrics.controller';
+import {
+  PrometheusReceiptTelemetry,
+  RECEIPT_TELEMETRY,
+} from './infrastructure/prometheus-receipt-telemetry';
 import { ReceiptMediaModule } from './receipt-media.module';
 
 /** One extra import edge over the receipt module: any duplicate import
  * still resolves to the SAME Nest module instance, so the lifecycle
  * coordinator (and its claim loop) must exist exactly once. */
-@Module({ imports: [ReceiptMediaModule] })
+const DIRECT_TELEMETRY_CONSUMER = Symbol('DIRECT_TELEMETRY_CONSUMER');
+
+@Injectable()
+class TelemetryConsumer {
+  constructor(
+    @Inject(RECEIPT_TELEMETRY) readonly telemetry: PrometheusReceiptTelemetry,
+  ) {}
+}
+
+@Module({ imports: [ReceiptMediaModule], providers: [TelemetryConsumer] })
 class ReceiptMediaHostWrapper {}
 
 /** Tokens the module must never register, in either mode: the ingestion
@@ -462,6 +482,76 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       .useValue(stubPool());
     Object.assign(process.env, RECEIPT_ENABLED_ENV);
     await expect(builder.compile()).rejects.toThrow(/ConfigService/);
+  });
+
+  describe('ReceiptMediaModule WU15-2 telemetry composition', () => {
+    it('registers the metrics controller', async () => {
+      await withModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
+        expect(moduleRef.get(ReceiptMetricsController)).toBeInstanceOf(
+          ReceiptMetricsController,
+        );
+      });
+    });
+
+    it('registers the telemetry adapter as RECEIPT_TELEMETRY', async () => {
+      await withModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
+        const adapter =
+          moduleRef.get<PrometheusReceiptTelemetry>(RECEIPT_TELEMETRY);
+        expect(adapter).toBeInstanceOf(PrometheusReceiptTelemetry);
+        expect(typeof adapter.record).toBe('function');
+        expect(typeof adapter.metrics).toBe('function');
+      });
+    });
+
+    it('exports RECEIPT_TELEMETRY from the module', () => {
+      const meta = (key: string): unknown[] =>
+        (Reflect.getMetadata(key, ReceiptMediaModule) as unknown[]) ?? [];
+      expect(meta('exports')).toContain(RECEIPT_TELEMETRY);
+    });
+
+    it('the telemetry adapter is a singleton — duplicate module imports resolve the same instance', async () => {
+      const pool = stubPool();
+      applyEnv({
+        ...RECEIPT_ENABLED_ENV,
+        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
+        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(64),
+      });
+      const builder = Test.createTestingModule({
+        imports: [
+          AppConfigModule.forRoot({ ignoreEnvFile: true }),
+          ReceiptMediaModule,
+          ReceiptMediaHostWrapper,
+        ],
+        providers: [
+          { provide: DIRECT_TELEMETRY_CONSUMER, useClass: TelemetryConsumer },
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(pool)
+        .overrideProvider(CONVERSATION_STORE)
+        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .overrideProvider(CHATBOT_API_CLIENT)
+        .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) });
+      const moduleRef = await builder.compile();
+      try {
+        const direct = moduleRef.get<TelemetryConsumer>(
+          DIRECT_TELEMETRY_CONSUMER,
+        );
+        const wrapped = moduleRef
+          .select(ReceiptMediaHostWrapper)
+          .get(TelemetryConsumer, { strict: true });
+        expect(direct).not.toBe(wrapped);
+        expect(direct.telemetry).toBe(wrapped.telemetry);
+        direct.telemetry.record('receipt_outbox_tx2_committed');
+        wrapped.telemetry.record('receipt_outbox_tx2_committed');
+        expect((await direct.telemetry.metrics()).split('\n')).toContain(
+          'receipt_outbox_tx2_committed_total 2',
+        );
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
   });
 
   describe('ReceiptMediaModule notification lifecycle (WU14E)', () => {

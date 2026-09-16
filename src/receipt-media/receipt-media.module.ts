@@ -74,6 +74,12 @@ import {
   type NotificationAlertSeam,
 } from './infrastructure/receipt-media-notification.worker';
 import { ReceiptMediaAccessController } from './presentation/receipt-media-access.controller';
+import { ReceiptMetricsAuthGuard } from './presentation/receipt-metrics-auth.guard';
+import { ReceiptMetricsController } from './presentation/receipt-metrics.controller';
+import {
+  PrometheusReceiptTelemetry,
+  RECEIPT_TELEMETRY,
+} from './infrastructure/prometheus-receipt-telemetry';
 
 /** Decodes validated `version:base64` keyring entries into raw key bytes. */
 const decodeKeyring = (
@@ -229,7 +235,7 @@ class ReceiptMediaNotificationLifecycle
     ChatbotApiModule,
     WhatsappSenderModule,
   ],
-  controllers: [ReceiptMediaAccessController],
+  controllers: [ReceiptMediaAccessController, ReceiptMetricsController],
   providers: [
     // One shared store singleton; the capability lookup aliases it.
     {
@@ -358,7 +364,25 @@ class ReceiptMediaNotificationLifecycle
     // notification drain; never exported — worker/store stay unexposed
     // as DI tokens. In disabled mode its hooks are fully inert.
     ReceiptMediaNotificationLifecycle,
+    // WU15-2 telemetry: singleton adapter + guard. The telemetry adapter
+    // carries its own isolated Registry; two instances with the same Registry
+    // resolve to the same object (singleton DI). The adapter's record()
+    // method is a no-op when metricsFlag is false and never escapes failures.
+    // No Prometheus scrape causes storage/provider I/O.
+    ReceiptMetricsAuthGuard,
+    {
+      provide: RECEIPT_TELEMETRY,
+      useFactory: (config: ConfigService): PrometheusReceiptTelemetry =>
+        new PrometheusReceiptTelemetry(
+          config.get<boolean>('receiptMedia.metricsEnabled') === true,
+        ),
+      inject: [ConfigService],
+    },
   ],
-  exports: [ReceiptIngressService, ReceiptAmountRouterService],
+  exports: [
+    ReceiptIngressService,
+    ReceiptAmountRouterService,
+    RECEIPT_TELEMETRY,
+  ],
 })
 export class ReceiptMediaModule {}
