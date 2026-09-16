@@ -1,16 +1,21 @@
-/** WU14D host composition spec: proves the real WhatsappModule graph boots
- * through the Nest testing module once ReceiptMediaModule is imported, so the
+/** WU14D host composition spec, transitioned to WU14E lifecycle behavior:
+ * proves the real WhatsappModule graph boots through the Nest testing
+ * module once ReceiptMediaModule is imported, so the
  * WebhookDispatcherService's mandatory receipt dependencies (ReceiptIngress
  * Service, ReceiptAmountRouterService) resolve. External edges are stubbed
  * only (no live PostgreSQL, backend, Meta, S3, or LLM requests). Proven: the
  * host graph composes in enabled mode with dispatcher/ingress/router all
  * resolvable and the WHATSAPP_SENDER alias intact; the same graph composes in
  * a genuinely receipt-setting-free disabled environment where the ingress
- * outcome remains `disabled`; the host registers neither receipt worker nor
- * the receipt-outbox path; and the host declares ReceiptMediaModule among its
- * imports. The full ReceiptMediaModule-internal graph contract (singleton
- * lookup aliasing, keyring rejection, inert disabled seams) stays covered by
- * the WU14C module spec and is not duplicated here. */
+ * outcome remains `disabled`; the host registers neither the ingestion
+ * worker nor the receipt-outbox path (the WU14E notification drain is
+ * privately owned — no DI token — and its behavior is proven through real
+ * init()/close(): claims through the SAME injected pool and drain-before
+ * pool.end); and the host declares ReceiptMediaModule among its imports.
+ * The full ReceiptMediaModule-internal graph contract (singleton lookup
+ * aliasing, keyring rejection, inert disabled seams, validated worker
+ * options/owner, duplicate-import singularity, exhaustion alert) stays
+ * covered by the WU14C module spec and is not duplicated here. */
 import { Test } from '@nestjs/testing';
 import type { INestApplicationContext } from '@nestjs/common';
 import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
@@ -28,8 +33,11 @@ import { WebhookDispatcherService } from './application/webhook-dispatcher.servi
 import { WHATSAPP_SENDER } from './domain/whatsapp-sender.port';
 import { WhatsappModule } from './whatsapp.module';
 
-/** Tokens the non-worker receipt composition must never register, in either
- * mode, including when composed through the host. */
+/** Tokens the receipt composition must never register, in either mode,
+ * including when composed through the host. The WU14E notification worker
+ * is also token-less (privately owned by the lifecycle coordinator) — but
+ * token absence alone does not prove a privately owned worker did not
+ * run, so its behavior is proven through real init()/close() below. */
 const FORBIDDEN_NONWORKER_TOKENS = [
   ReceiptMediaIngestionWorker,
   ReceiptMediaNotificationWorker,
@@ -105,6 +113,117 @@ const stubPool = () => ({
   end: jest.fn().mockResolvedValue(undefined),
 });
 
+/** Bounded microtask drain: deterministic, no real timers/sleeps. */
+const drainMicrotasks = async (): Promise<void> => {
+  for (let i = 0; i < 50; i++) await Promise.resolve();
+};
+
+/** Waits (microtask hops only, bounded) until a condition holds. */
+const untilMicrotask = async (condition: () => boolean): Promise<void> => {
+  for (let i = 0; i < 300 && !condition(); i++) await Promise.resolve();
+};
+
+/** Snake_case receipt_media_outbox row exactly as pg would deliver it. */
+const outboxRow = (
+  over: Partial<Record<string, unknown>> = {},
+): Record<string, unknown> => ({
+  id: '00000000-0000-4000-8000-0000000000aa',
+  recipient_id: '+525500000000',
+  template_key: 'RECEIPT_AMOUNT_CONFIRM',
+  template_args: { amountCents: 123456 },
+  status: 'PENDING',
+  attempts: 0,
+  lease_expires_at: new Date(1_700_000_000_000),
+  ...over,
+});
+
+type OutboxPool = {
+  pool: {
+    query: jest.Mock;
+    connect: jest.Mock;
+    end: jest.Mock;
+  };
+  claims: Array<{ limit: unknown; owner: unknown }>;
+  marks: string[];
+  reschedules: number[];
+  sequence: string[];
+  queriesAfterEnd: () => number;
+};
+
+/** Instrumented fake pool for the REAL PostgresReceiptOutboxStore (same
+ * fixture family as the WU14C module spec, kept local to this spec): `end`
+ * records closure in the sequence; any query performed after closure is
+ * counted and rejected, so a post-close claim/mark can never pass
+ * silently through the REAL host graph. */
+const makeOutboxPool = (
+  batches: Array<Record<string, unknown>[]> = [],
+): OutboxPool => {
+  const pending = [...batches];
+  const claims: Array<{ limit: unknown; owner: unknown }> = [];
+  const marks: string[] = [];
+  const reschedules: number[] = [];
+  const sequence: string[] = [];
+  let queriesAfterEnd = 0;
+  let ended = false;
+  const clientQuery = async (
+    text: unknown,
+    params?: unknown[],
+  ): Promise<{ rows: unknown[]; rowCount: number }> => {
+    if (ended) {
+      queriesAfterEnd++;
+      throw new Error('receipt-media test: pool already ended');
+    }
+    const sql =
+      typeof text === 'string'
+        ? text
+        : ((text as { text?: string }).text ?? '');
+    // One deterministic microtask hop per query keeps this async fixture
+    // honest and satisfies the require-await invariant.
+    await Promise.resolve();
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [], rowCount: 0 };
+    if (/FOR UPDATE SKIP LOCKED/.test(sql)) {
+      sequence.push('claim');
+      claims.push({ limit: params?.[0], owner: params?.[1] });
+      const rows = pending.length > 0 ? (pending.shift() as unknown[]) : [];
+      return { rows, rowCount: rows.length };
+    }
+    if (sql.includes("status = 'SENT'")) {
+      sequence.push('mark');
+      marks.push(String(params?.[2]));
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes('attempts = attempts + 1')) {
+      sequence.push('reschedule');
+      reschedules.push(reschedules.length + 1);
+      return { rows: [{ attempts: reschedules.length }], rowCount: 1 };
+    }
+    if (/INSERT\s+INTO\s+receipt_media_outbox/i.test(sql)) {
+      sequence.push('insert');
+      return { rows: [], rowCount: 0 };
+    }
+    sequence.push('other');
+    return { rows: [], rowCount: 0 };
+  };
+  const client = { query: jest.fn(clientQuery), release: jest.fn() };
+  const pool = {
+    query: jest.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+    connect: jest.fn(() => Promise.resolve(client)),
+    end: jest.fn(() => {
+      sequence.push('end');
+      ended = true;
+      return Promise.resolve();
+    }),
+  };
+  return {
+    pool,
+    claims,
+    marks,
+    reschedules,
+    sequence,
+    queriesAfterEnd: () => queriesAfterEnd,
+  };
+};
+
 /** Boots the real host module with stubbed edges, runs the test, closes it.
  * An explicit pool may be passed so the caller can observe the SAME injected
  * PG_POOL instance (boot work and shutdown) instead of an unrelated stub. */
@@ -165,7 +284,7 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
   });
 
   it('composes the host graph in a receipt-setting-free disabled environment', async () => {
-    const pool = stubPool();
+    const outbox = makeOutboxPool();
     await withHostModule(
       RECEIPT_DISABLED_ENV,
       async (moduleRef) => {
@@ -193,20 +312,95 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         // graph in disabled mode either.
         expectNoReceiptWorkerProviders(moduleRef);
       },
-      pool,
+      outbox.pool,
     );
-    // Boot performed no database work, and shutdown closed the SAME
-    // injected pool (PostgresPoolLifecycle.onModuleDestroy). The pool
-    // passed to withHostModule is the one the graph actually received.
-    expect(pool.query).not.toHaveBeenCalled();
-    expect(pool.connect).not.toHaveBeenCalled();
-    expect(pool.end).toHaveBeenCalled();
+    // Boot performed no database work, no notification claims, and no
+    // sends; shutdown closed the SAME injected pool
+    // (PostgresPoolLifecycle.onModuleDestroy). The pool passed to
+    // withHostModule is the one the graph actually received.
+    expect(outbox.pool.query).not.toHaveBeenCalled();
+    expect(outbox.pool.connect).not.toHaveBeenCalled();
+    expect(outbox.claims).toHaveLength(0); // disabled lifecycle is fully inert
+    // Shutdown closed the SAME injected pool through the real lifecycle,
+    // and nothing else ever touched it — only the pool.end event ran.
+    expect(outbox.pool.end).toHaveBeenCalledTimes(1);
+    expect(outbox.sequence).toEqual(['end']);
   });
 
-  it('registers neither receipt worker nor the receipt outbox path in the host', async () => {
+  it('registers neither the ingestion worker nor the receipt outbox path in the host', async () => {
     await withHostModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
       expectNoReceiptWorkerProviders(moduleRef);
+      // The WU14E notification drain is privately owned (no DI token), but
+      // token absence alone proves nothing — its enabled behavior is
+      // proven through real init()/close() in the lifecycle test below.
     });
+  });
+
+  it('starts the enabled notification drain through the host graph and drains it before pool.end', async () => {
+    jest.useFakeTimers();
+    const outbox = makeOutboxPool([[outboxRow()]]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const sendText = jest.fn(() =>
+      gate.then(() => ({ providerMessageId: 'wamid.GATE' })),
+    );
+    // Deterministic clear-then-overlay receipt env isolation (WU14C fix).
+    for (const key of Object.keys(RECEIPT_ENABLED_ENV))
+      if (!(key in BASE_ENV)) delete process.env[key];
+    Object.assign(process.env, RECEIPT_ENABLED_ENV);
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        AppConfigModule.forRoot({ ignoreEnvFile: true }),
+        WhatsappModule,
+      ],
+    })
+      .overrideProvider(PG_POOL)
+      .useValue(outbox.pool)
+      .overrideProvider(CONVERSATION_STORE)
+      .useValue({
+        get: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+        update: jest.fn(),
+        setReceiptAmountPointer: jest.fn(),
+        clearReceiptAmountPointer: jest.fn(),
+      })
+      .overrideProvider(CHATBOT_API_CLIENT)
+      .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+      .overrideProvider(WHATSAPP_SENDER)
+      .useValue({ sendText })
+      .compile();
+    try {
+      await moduleRef.init();
+      await untilMicrotask(() => outbox.claims.length >= 1);
+      // The host graph's private lifecycle claimed through the SAME
+      // injected PG_POOL (single in-flight claim; its by-design wake
+      // re-poll follows once the gated send below resolves).
+      expect(outbox.claims).toHaveLength(1);
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(sendText).toHaveBeenCalledWith({
+        to: '+525500000000',
+        text: 'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
+      });
+      const closing = moduleRef.close(); // destroy waits for the drain
+      await drainMicrotasks();
+      // CRITICAL SHUTDOWN-ORDERING PROOF (WU14E gate): while the send is
+      // still in flight, the REAL host lifecycle has NOT ended the pool.
+      expect(outbox.sequence).not.toContain('end');
+      release();
+      await closing;
+      await drainMicrotasks();
+      // Drain-before-pool.end: the fenced CAS mark happens strictly
+      // BEFORE the real PostgresPoolLifecycle closes the pool.
+      expect(outbox.sequence).toEqual(['claim', 'mark', 'end']);
+      expect(outbox.marks).toEqual(['wamid.GATE']);
+      // No notification transaction ever ran against a closed pool.
+      expect(outbox.queriesAfterEnd()).toBe(0);
+    } finally {
+      release();
+      jest.useRealTimers();
+      await moduleRef.close().catch(() => undefined);
+      await drainMicrotasks();
+    }
   });
 
   it('declares ReceiptMediaModule among the host imports', () => {

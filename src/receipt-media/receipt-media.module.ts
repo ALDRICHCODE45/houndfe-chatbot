@@ -1,16 +1,31 @@
-/** WU14C non-worker composition root: composes the existing adapters (WU2B
- * store, WU4B Meta client, WU5A S3 adapter), the WU7/WU10C/WU11C application
- * services, the WU8A processor, the WU6D1 authorizer, and the WU6D2 access
- * controller behind validated receipt-media configuration. No worker
- * registration, no receipt-outbox composition, and no `ReceiptTx2CommitPort`
- * path — that work stays deferred. Enabled mode decodes the configured
- * base64 keyring exactly here; absent/malformed keyrings fail closed at boot
- * via CapabilityService validation. Disabled mode (`RECEIPT_MEDIA_ENABLED`
- * `=false` with no receipt-specific settings) boots inert: module-local
- * fail-closed Meta/S3/lookup seams replace the configured adapters and the
- * authorizer maps every lookup rejection to its existing `unavailable`
- * result without touching storage. */
+/** WU14C composition root, extended by WU14E: composes the existing
+ * adapters (WU2B store, WU4B Meta client, WU5A S3 adapter), the
+ * WU7/WU10C/WU11C application services, the WU8A processor, the WU6D1
+ * authorizer, and the WU6D2 access controller behind validated
+ * receipt-media configuration — and, when enabled, starts the WU9
+ * notification drain through a module-local lifecycle coordinator that
+ * privately owns the WU14A outbox store and notification worker. No
+ * ingestion wiring, no `ReceiptOutboxService`/`ReceiptTx2CommitPort` path,
+ * and no outbox intent production — the notification drain consumes
+ * already-committed intents only. Enabled mode decodes the configured
+ * base64 keyring exactly here; absent/malformed keyrings fail closed at
+ * boot via CapabilityService validation. Disabled mode
+ * (`RECEIPT_MEDIA_ENABLED=false` with no receipt-specific settings) boots
+ * inert: module-local fail-closed Meta/S3/lookup seams replace the
+ * configured adapters, the authorizer maps every lookup rejection to its
+ * existing `unavailable` result without touching storage, and the
+ * notification lifecycle performs no claims, polling, sends, or alerts.
+ * Enable/disable takes effect by graceful restart/redeploy, never by live
+ * runtime toggling. */
 import { Module } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnApplicationBootstrap,
+  OnModuleDestroy,
+} from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
@@ -21,6 +36,8 @@ import type { ConversationStore } from '../conversation/domain/conversation-stor
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
+import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
+import type { WhatsappSenderPort } from '../whatsapp/domain/whatsapp-sender.port';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { CapabilityService } from './application/capability.service';
 import { ReceiptAmountRouterService } from './application/receipt-amount-router.service';
@@ -51,6 +68,11 @@ import {
   S3ObjectStorageAdapter,
   type S3ObjectStorageConfig,
 } from './infrastructure/s3-object-storage.adapter';
+import { PostgresReceiptOutboxStore } from './infrastructure/postgres-receipt-outbox.store';
+import {
+  ReceiptMediaNotificationWorker,
+  type NotificationAlertSeam,
+} from './infrastructure/receipt-media-notification.worker';
 import { ReceiptMediaAccessController } from './presentation/receipt-media-access.controller';
 
 /** Decodes validated `version:base64` keyring entries into raw key bytes. */
@@ -105,6 +127,99 @@ const disabledCapabilityLookup: ReceiptCapabilityLookup = {
   lookupByCapabilityHash: () =>
     Promise.reject(new Error('RECEIPT_MEDIA_DISABLED')),
 };
+
+/** Constant, non-PII exhaustion alert: no row, sender, or provider/error
+ * content ever leaves through this seam. */
+const EXHAUSTION_ALERT_TEXT =
+  'receipt-media: notification intent exhausted after max attempts';
+
+/** WU14E approved poll floor (confirmed by the maintainer, not inferred):
+ * the validated receipt-media environment accepts a poll interval in
+ * [1, 59999) ms and the worker's own invariant requires at least 50 ms,
+ * so configured 1–49 ms is normalized UP to 50 ms and any configured
+ * value at or above 50 ms is preserved unchanged. Proven at the 1/49/50
+ * boundaries and above-floor by observed claim timing in the spec. */
+const WORKER_MIN_POLL_MS = 50;
+
+/** WU14E module-local singleton lifecycle coordinator: when the validated
+ * receipt-media configuration is enabled, it privately constructs the
+ * WU14A outbox drain store and the WU9 notification worker (they are never
+ * registered as DI tokens) and forwards start/drain exactly once — the
+ * start guard makes repeated bootstrap invocations AND a bootstrap after
+ * shutdown no-ops, so no second claim loop can be orphaned and no restart
+ * can happen after stop. On Nest shutdown its `onModuleDestroy` awaits
+ * the worker's in-flight sends and stops the claim loop BEFORE the real
+ * PostgresPoolLifecycle (in DatabaseModule, strictly farther from the
+ * root) invokes `pool.end`, so no notification transaction can run
+ * against a closed pool. In disabled mode both hooks are inert: no
+ * worker, no store, no claims, no timers, no sends, no alerts. Enable/
+ * disable is configuration + graceful restart/redeploy, never a live
+ * runtime toggle. */
+@Injectable()
+class ReceiptMediaNotificationLifecycle
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
+  private worker: ReceiptMediaNotificationWorker | undefined;
+  private started = false;
+
+  constructor(
+    private readonly config: ConfigService,
+    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(WHATSAPP_SENDER)
+    private readonly sender: Pick<WhatsappSenderPort, 'sendText'>,
+  ) {}
+
+  /** Starts the drain exactly once per coordinator instance — repeated
+   * and post-shutdown invocations are no-ops (the worker reference alone
+   * cannot protect a NEW instance, so a latched flag guards both).
+   * Disabled mode constructs nothing and performs no I/O. */
+  onApplicationBootstrap(): void {
+    if (this.started || !isEnabled(this.config)) return;
+    this.started = true;
+    // Validated worker fields only: concurrency supplies batch size and
+    // max concurrency; the validated poll interval (normalized up to
+    // the maintainer-approved 50 ms floor) supplies polling; the fixed
+    // 60-second lease lives in the adapter's SQL alone — no second
+    // lease knob exists here.
+    const concurrency =
+      this.config.get<number>('receiptMedia.worker.concurrency') ?? 0;
+    const pollIntervalMs = Math.max(
+      WORKER_MIN_POLL_MS,
+      this.config.get<number>('receiptMedia.worker.pollIntervalMs') ?? 0,
+    );
+    this.worker = new ReceiptMediaNotificationWorker(
+      new PostgresReceiptOutboxStore(this.pool),
+      this.sender,
+      this.exhaustionAlert(),
+      {
+        // Stable per process-instance coordinator: one owner for every
+        // claim this instance ever makes.
+        owner: `receipt-media:${randomUUID()}`,
+        pollIntervalMs,
+        batchSize: concurrency,
+        maxConcurrency: concurrency,
+      },
+    );
+    this.worker.onApplicationBootstrap();
+  }
+
+  /** Drains in-flight sends and stops claims exactly once; disabled mode
+   * has nothing to drain. */
+  onModuleDestroy(): Promise<void> {
+    return this.worker?.onModuleDestroy() ?? Promise.resolve();
+  }
+
+  /** Constant non-PII exhaustion alert: never the row, sender, or
+   * provider/error content. */
+  private exhaustionAlert(): NotificationAlertSeam {
+    return {
+      onExhausted: (): Promise<void> => {
+        Logger.error(EXHAUSTION_ALERT_TEXT);
+        return Promise.resolve();
+      },
+    };
+  }
+}
 
 @Module({
   imports: [
@@ -239,6 +354,10 @@ const disabledCapabilityLookup: ReceiptCapabilityLookup = {
         ),
       inject: [ConfigService, CapabilityService, RECEIPT_CAPABILITY_LOOKUP],
     },
+    // WU14E module-local lifecycle coordinator: privately owns the
+    // notification drain; never exported — worker/store stay unexposed
+    // as DI tokens. In disabled mode its hooks are fully inert.
+    ReceiptMediaNotificationLifecycle,
   ],
   exports: [ReceiptIngressService, ReceiptAmountRouterService],
 })
