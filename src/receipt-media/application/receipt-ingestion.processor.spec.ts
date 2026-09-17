@@ -98,6 +98,9 @@ const fixture = (
         intent: {} as ReceiptMediaOutboxRow,
       }),
     ),
+    // ODD-2C: durable Meta failure disposition. Tests that read the outcome
+    // install an explicit resolution; the ABORTED path never reads it.
+    commitMetaFailureDisposition: jest.fn(),
   };
 
   const processor = new ReceiptIngestionProcessor(
@@ -240,13 +243,28 @@ describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
     expect(f.store.commitDownload).toHaveBeenCalledTimes(1);
   });
 
-  it('maps Meta validation failure to a fixed meta-failed stage', async () => {
+  it('durably commits a permanent Meta validation failure and reports its terminal stage', async () => {
     const f = fixture();
     f.meta.resolveAndDownload.mockRejectedValue(
       new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH'),
     );
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'MEDIA_VALIDATION_PRE_STORAGE',
+      version: '3',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
     expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-failed',
+      kind: 'meta-terminal',
+      failureStage: 'MEDIA_VALIDATION_PRE_STORAGE',
+      code: 'MIME_MISMATCH',
+    });
+    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith({
+      id: 'r1',
+      owner: 'w1',
+      expectedVersion: '2',
+      category: 'MEDIA_VALIDATION',
       code: 'MIME_MISMATCH',
     });
     expect(f.cleanup).not.toHaveBeenCalled();
@@ -432,7 +450,7 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
     expect(f.cleanup).not.toHaveBeenCalled();
   });
 
-  it('passes the parent signal to Meta and maps ABORTED to aborted/meta', async () => {
+  it('passes the parent signal to Meta, commits the disposition, and maps ABORTED to aborted/meta', async () => {
     const f = fixture();
     const controller = new AbortController();
     let seen!: AbortSignal;
@@ -444,7 +462,15 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
       await f.processor.process(f.receipt, 'w1', controller.signal),
     ).toEqual({ kind: 'aborted', stage: 'meta' });
     expect(seen).toBe(controller.signal);
+    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith({
+      id: 'r1',
+      owner: 'w1',
+      expectedVersion: '2',
+      category: 'META_TRANSPORT',
+      code: 'ABORTED',
+    });
     expect(f.store.commitDownload).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
   });
 
   it('aborts the storage retry loop without consuming further attempts', async () => {
@@ -469,5 +495,152 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
     expect(put.abortSignal).toBe(controller.signal);
     expect(put.cleanupSignal).not.toBe(controller.signal);
     expect(put.cleanupSignal.aborted).toBe(false);
+  });
+});
+
+// ODD-2C: every caught Meta failure is durably committed through the narrow
+// disposition seam; the processor never performs a storage or capability
+// action on a Meta failure, and a claimed meta_attempts=3 row is
+// terminalized before any fourth Meta call.
+describe('ReceiptIngestionProcessor durable Meta failure disposition (ODD-2C)', () => {
+  const disposition = (over: Record<string, unknown> = {}) => ({
+    id: 'r1',
+    owner: 'w1',
+    expectedVersion: '2',
+    category: 'META_TRANSPORT',
+    code: 'NETWORK_FAILURE',
+    ...over,
+  });
+
+  it('schedules a durable retry without downstream action for a transient attempt 1/2 failure', async () => {
+    const f = fixture();
+    f.store.startMetaAttempt.mockResolvedValue({ attempt: 2, version: '3' });
+    f.meta.resolveAndDownload.mockRejectedValue(
+      new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE'),
+    );
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'retry-scheduled',
+      attempt: 2,
+      version: '4',
+      receipt: f.receipt,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'meta-retry-scheduled',
+      attempt: 2,
+      code: 'NETWORK_FAILURE',
+    });
+    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith(
+      disposition({ expectedVersion: '3' }),
+    );
+    expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.capability.issue).not.toHaveBeenCalled();
+    expect(f.store.commitDownload).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+    expect(f.cleanup).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes attempt 3 as META_EXHAUSTED_PRE_STORAGE with the fixed identity', async () => {
+    const f = fixture();
+    f.store.startMetaAttempt.mockResolvedValue({ attempt: 3, version: '4' });
+    f.meta.resolveAndDownload.mockRejectedValue(
+      new MetaMediaError('META_TRANSPORT', 'TIMEOUT'),
+    );
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      version: '5',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'meta-terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      code: 'TIMEOUT',
+    });
+    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith(
+      disposition({ expectedVersion: '4', code: 'TIMEOUT' }),
+    );
+    expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.capability.issue).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+  });
+
+  it('reports a stable fence outcome with no downstream action when the disposition fences', async () => {
+    const f = fixture();
+    f.meta.resolveAndDownload.mockRejectedValue(
+      new MetaMediaError('META_TRANSPORT', 'HTTP_RETRYABLE'),
+    );
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'fenced',
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'meta-fenced',
+      code: 'HTTP_RETRYABLE',
+    });
+    expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.store.commitDownload).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes a reclaimed meta_attempts=3 row before any Meta call', async () => {
+    const f = fixture({ status: 'RESERVED', metaAttempts: 3 });
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      version: '2',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'meta-terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      code: 'META_EXHAUSTED',
+    });
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
+    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith(
+      disposition({ expectedVersion: '1', code: 'META_EXHAUSTED' }),
+    );
+  });
+
+  it('fences a reclaimed count-3 recovery without a fourth Meta call', async () => {
+    const f = fixture({ status: 'RESERVED', metaAttempts: 3 });
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'fenced',
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'meta-fenced',
+      code: 'META_EXHAUSTED',
+    });
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
+  });
+
+  it('processes a claimed DOWNLOADED count-3 row through the exhaustion disposition', async () => {
+    const f = fixture({ status: 'DOWNLOADED', metaAttempts: 3 });
+    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      version: '2',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'meta-terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      code: 'META_EXHAUSTED',
+    });
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.store.startStorageAttempt).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
+  });
+
+  it('still rethrows a non-Meta error without any disposition', async () => {
+    const f = fixture();
+    f.meta.resolveAndDownload.mockRejectedValue(new Error('raw-transport'));
+    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
+      'raw-transport',
+    );
+    expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
   });
 });

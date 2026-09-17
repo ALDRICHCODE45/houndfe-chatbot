@@ -4,6 +4,10 @@
  * lookup (RMA2, RMA3); WU10C3A adds the fenced attachment start. */
 import type { ReceiptAmountPointer } from '../../conversation/domain/conversation-store';
 import type {
+  MetaMediaErrorCategory,
+  MetaMediaErrorCode,
+} from './meta-media.port';
+import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
   ReceiptMediaStatus,
@@ -205,6 +209,46 @@ export type AttachCommitSuccessOutcome =
     }
   | { kind: 'fenced' };
 
+/** Fixed internal exhaustion code for a reclaimed row already at
+ * `meta_attempts = 3`: it terminalizes without a fourth Meta call. */
+export const META_EXHAUSTED_CODE = 'META_EXHAUSTED';
+export type MetaDispositionCode =
+  | MetaMediaErrorCode
+  | typeof META_EXHAUSTED_CODE;
+
+/** One immutable pre-storage Meta failure disposition command: the existing
+ * lease/version fence plus the fixed safe Meta category/code only. Every
+ * routing, state, attempt, status, deadline, and intent value is derived
+ * from the locked durable row — never from the caller. */
+export interface MetaFailureDispositionInput extends LeaseFenceInput {
+  category: MetaMediaErrorCategory;
+  code: MetaDispositionCode;
+}
+
+/** The two terminal pre-storage failure stages a Meta failure can reach. */
+export type MetaTerminalFailureStage =
+  | 'MEDIA_VALIDATION_PRE_STORAGE'
+  | 'META_EXHAUSTED_PRE_STORAGE';
+
+/** Transient attempts 1/2 schedule a durable retry with no intent;
+ * permanent and exhausted outcomes terminalize and own exactly one
+ * row-derived deterministic intent; every other caller is fenced. */
+export type MetaFailureDispositionOutcome =
+  | {
+      kind: 'retry-scheduled';
+      attempt: number;
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | {
+      kind: 'terminal' | 'replayed';
+      failureStage: MetaTerminalFailureStage;
+      version: string;
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -349,6 +393,28 @@ export interface ReceiptMediaStorePort {
   commitAttachUnknownOutcome(
     input: AttachCommitUnknownOutcomeInput,
   ): Promise<AttachCommitUnknownOutcomeOutcome>;
+  /** ODD-2C durable Meta failure disposition (pre-storage): under the
+   * caller's exact lease/version fence and a live `clock_timestamp()` lease,
+   * the locked RESERVED/DOWNLOADED row with a started Meta attempt decides
+   * its own outcome from its stored `meta_attempts`. Transient retryable
+   * attempts 1/2 retain the processing status, persist only the safe
+   * category/code, set `next_attempt_at` from a documented 1s/4s base with
+   * bounded positive jitter, clear both lease fields, bump the version, and
+   * return a retry with no intent. Permanent validation/HTTP failures and
+   * attempt-3 (or internal `META_EXHAUSTED`) exhaustion atomically set FAILED
+   * with `MEDIA_VALIDATION_PRE_STORAGE` / `META_EXHAUSTED_PRE_STORAGE`, clear
+   * every superseded download and accepted-object column, and own exactly one
+   * row-derived deterministic `RECEIPT_UNAVAILABLE_LATER` intent keyed
+   * `receipt-unavailable-later:<receiptId>:<successorVersion>:
+   * <storedWebhookMessageId>` with row-derived routing and exactly `{}` args
+   * in the same transaction. Only the exact terminal successor replaying the
+   * exact persisted intent replays — an otherwise exact legacy successor
+   * missing only that intent is repaired under the same live lease — and a
+   * mismatched/foreign intent, rival terminal evidence, or lost/expired lease
+   * fences without replacement. */
+  commitMetaFailureDisposition(
+    input: MetaFailureDispositionInput,
+  ): Promise<MetaFailureDispositionOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment;
    * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */

@@ -10,7 +10,10 @@ import {
   ObjectStorageError,
   type ObjectStoragePort,
 } from '../domain/object-storage.port';
-import type { ReceiptMediaStorePort } from '../domain/receipt-media-store.port';
+import type {
+  MetaTerminalFailureStage,
+  ReceiptMediaStorePort,
+} from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 import type { CapabilityService } from './capability.service';
 
@@ -22,7 +25,13 @@ export type ReceiptIngestionOutcome =
   | { kind: 'aborted'; stage: 'meta' | 'storage' }
   | { kind: 'blocked'; stage: 'meta' | 'storage' }
   | { kind: 'fence-lost'; stage: 'download' | 'tx2' }
-  | { kind: 'meta-failed'; code: string }
+  | { kind: 'meta-retry-scheduled'; attempt: number; code: string }
+  | {
+      kind: 'meta-terminal';
+      failureStage: MetaTerminalFailureStage;
+      code: string;
+    }
+  | { kind: 'meta-fenced'; code: string }
   | { kind: 'storage-failed'; code: string }
   | { kind: 'unsupported-claimed-status'; status: string };
 
@@ -47,6 +56,7 @@ export class ReceiptIngestionProcessor {
       | 'startStorageAttempt'
       | 'commitDownload'
       | 'bootstrapAmount'
+      | 'commitMetaFailureDisposition'
     >,
     private readonly capability: Pick<CapabilityService, 'issue'>,
   ) {}
@@ -61,6 +71,20 @@ export class ReceiptIngestionProcessor {
       return { kind: 'unsupported-claimed-status', status: receipt.status };
     if (abort.aborted) return { kind: 'aborted', stage: 'meta' };
     const fence = { id: receipt.id, owner, expectedVersion: receipt.version };
+    if (receipt.metaAttempts >= 3) {
+      const disposition = await this.store.commitMetaFailureDisposition({
+        ...fence,
+        category: 'META_TRANSPORT',
+        code: 'META_EXHAUSTED',
+      });
+      return disposition.kind === 'terminal' || disposition.kind === 'replayed'
+        ? {
+            kind: 'meta-terminal',
+            failureStage: disposition.failureStage,
+            code: 'META_EXHAUSTED',
+          }
+        : { kind: 'meta-fenced', code: 'META_EXHAUSTED' };
+    }
     const start = await this.store.startMetaAttempt(fence);
     if (start === null) return { kind: 'blocked', stage: 'meta' };
     fence.expectedVersion = start.version;
@@ -73,8 +97,25 @@ export class ReceiptIngestionProcessor {
       });
     } catch (err) {
       if (!(err instanceof MetaMediaError)) throw err;
+      const disposition = await this.store.commitMetaFailureDisposition({
+        ...fence,
+        category: err.category,
+        code: err.code,
+      });
       if (err.code === 'ABORTED') return { kind: 'aborted', stage: 'meta' };
-      return { kind: 'meta-failed', code: err.code };
+      if (disposition.kind === 'terminal' || disposition.kind === 'replayed')
+        return {
+          kind: 'meta-terminal',
+          failureStage: disposition.failureStage,
+          code: err.code,
+        };
+      if (disposition.kind === 'retry-scheduled')
+        return {
+          kind: 'meta-retry-scheduled',
+          attempt: disposition.attempt,
+          code: err.code,
+        };
+      return { kind: 'meta-fenced', code: err.code };
     }
     if (receipt.status !== 'RESERVED') {
       const stored = await this.storedPass(

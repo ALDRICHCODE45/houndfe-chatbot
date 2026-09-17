@@ -999,9 +999,12 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
     it.each<[string, Row, boolean]>([
       ['RESERVED', {}, true],
-      ['RESERVED', { meta_attempts: 3 }, false],
+      // ODD-2C: exhausted count-3 rows are reclaimable only so the processor
+      // can terminalize them; startMetaAttempt still refuses a fourth call.
+      ['RESERVED', { meta_attempts: 3 }, true],
       ['DOWNLOADED', {}, true],
-      ['DOWNLOADED', { meta_attempts: 3 }, false],
+      ['DOWNLOADED', { meta_attempts: 3 }, true],
+      ['DOWNLOADED', { meta_attempts: 3, storage_attempts: 3 }, false],
       ['DOWNLOADED', { storage_attempts: 3 }, false],
       // STORED-1: STORED rows are held from automatic claim eligibility;
       // they remain durable and are reserved for separately authorized reconciliation.
@@ -5933,6 +5936,634 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         recipient_id: 'sender.rival',
         template_key: 'RECEIPT_AMOUNT_PROMPT',
       });
+    });
+  });
+
+  describe('ODD-2C durable Meta retry and finalization', () => {
+    const OWNER = 'worker.meta-failure';
+    const SENDER = 'sender.meta-failure';
+    /** The new primitive is called through a structural seam so this spec
+     * stays runnable before the port surface exists; the durable behavior is
+     * proven against the real PostgreSQL store either way. */
+    const metaStore = () =>
+      store as unknown as {
+        commitMetaFailureDisposition(input: Row): Promise<Row>;
+      };
+    const command = (over: Row = {}): Row => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '2',
+      category: 'META_TRANSPORT',
+      code: 'NETWORK_FAILURE',
+      ...over,
+    });
+    const commit = (over: Row = {}) =>
+      metaStore().commitMetaFailureDisposition(command(over));
+    const seedRow = async (receipt: Row) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    const seed = (status: string, over: Row = {}) =>
+      seedRow(
+        lifeRow(status, null, {
+          id: UUID_A,
+          sender_id: SENDER,
+          captured_sale_id: UUID_B,
+          object_key: `receipts/${UUID_C}`,
+          version: '2',
+          lease_owner: OWNER,
+          lease_expires_at: new Date(Date.now() + 60_000),
+          ...over,
+        }),
+      );
+    /** A legacy terminal successor written before Meta intent ownership: the
+     * exact durable terminal evidence with no `RECEIPT_UNAVAILABLE_LATER`
+     * intent. */
+    const legacyTerminal = (over: Row = {}): Row =>
+      lifeRow('FAILED', 'META_EXHAUSTED_PRE_STORAGE', {
+        id: UUID_A,
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '3',
+        meta_attempts: 3,
+        last_error_category: 'META_TRANSPORT',
+        last_error_code: 'META_EXHAUSTED',
+        terminal_at: T0,
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        ...over,
+      });
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const outboxRows = async () =>
+      (await pool.query<Row>('SELECT * FROM receipt_media_outbox')).rows;
+    const intentKey = (version: string) =>
+      `receipt-unavailable-later:${UUID_A}:${version}:wamid.core`;
+    const remainingMs = async () =>
+      Number(
+        (
+          await pool.query<Row>(
+            `SELECT (extract(epoch from next_attempt_at - clock_timestamp()) * 1000)::int AS ms
+               FROM receipt_media WHERE id = $1`,
+            [UUID_A],
+          )
+        ).rows[0].ms,
+      );
+    const expectFenced = async (input: Row) => {
+      const before = await row();
+      await expect(
+        metaStore().commitMetaFailureDisposition(input),
+      ).resolves.toEqual({ kind: 'fenced' });
+      expect(await row()).toEqual(before);
+    };
+
+    it('schedules attempts 1/2 with retained status, cleared lease, bounded positive jitter, and no intent', async () => {
+      const cases: Array<[string, number, number]> = [
+        ['RESERVED', 1, 1000],
+        ['RESERVED', 2, 4000],
+        ['DOWNLOADED', 1, 1000],
+        ['DOWNLOADED', 2, 4000],
+      ];
+      for (const [status, attempt, base] of cases) {
+        await seed(status, { meta_attempts: attempt });
+        const outcome = await commit();
+        expect(outcome).toMatchObject({
+          kind: 'retry-scheduled',
+          attempt,
+          version: '3',
+          receipt: {
+            status,
+            metaAttempts: attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastErrorCategory: 'META_TRANSPORT',
+            lastErrorCode: 'NETWORK_FAILURE',
+          },
+        });
+        const stored = await row();
+        expect(stored).toMatchObject({
+          status,
+          version: '3',
+          meta_attempts: attempt,
+          lease_owner: null,
+          lease_expires_at: null,
+          last_error_category: 'META_TRANSPORT',
+          last_error_code: 'NETWORK_FAILURE',
+        });
+        expect(await remainingMs()).toBeGreaterThan(base - 500);
+        expect(await remainingMs()).toBeLessThanOrEqual(base * 1.25 + 100);
+        if (status === 'DOWNLOADED') {
+          expect(stored.downloaded_at).toBeInstanceOf(Date);
+          expect(stored.response_mime_type).toBe('image/jpeg');
+          expect(stored.detected_mime_type).toBe('image/jpeg');
+          expect(stored.byte_count).toBe(1024);
+          expect(Buffer.isBuffer(stored.content_sha256)).toBe(true);
+        } else expect(stored.downloaded_at).toBeNull();
+        expect(await outboxRows()).toHaveLength(0);
+      }
+    });
+
+    it('retries every retryable transport code below the limit and terminalizes attempt 3', async () => {
+      for (const code of [
+        'FILE_IO_FAILURE',
+        'NETWORK_FAILURE',
+        'HTTP_RETRYABLE',
+        'TIMEOUT',
+        'ABORTED',
+      ]) {
+        await seed('RESERVED', { meta_attempts: 1 });
+        expect((await commit({ code })).kind).toBe('retry-scheduled');
+        expect(await outboxRows()).toHaveLength(0);
+        await seed('RESERVED', { meta_attempts: 3 });
+        const outcome = await commit({ code });
+        expect(outcome).toMatchObject({
+          kind: 'terminal',
+          failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+          version: '3',
+          intent: {
+            dedupeKey: intentKey('3'),
+            receiptMediaId: UUID_A,
+            receiptStateVersion: '3',
+            sourceWebhookMessageId: 'wamid.core',
+            recipientId: SENDER,
+            templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+            templateArgs: {},
+          },
+        });
+        expect(await row()).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'META_EXHAUSTED_PRE_STORAGE',
+          last_error_category: 'META_TRANSPORT',
+          last_error_code: code,
+        });
+        expect((await row()).terminal_at).toBeInstanceOf(Date);
+        expect(await outboxRows()).toHaveLength(1);
+      }
+    });
+
+    it('terminalizes MEDIA_VALIDATION and HTTP_PERMANENT as validation pre-storage with one exact intent', async () => {
+      const cases: Array<[string, string]> = [
+        ['MEDIA_VALIDATION', 'UNSUPPORTED_MIME'],
+        ['MEDIA_VALIDATION', 'INVALID_MEDIA_SIZE'],
+        ['MEDIA_VALIDATION', 'MIME_MISMATCH'],
+        ['MEDIA_VALIDATION', 'PNG_STRUCTURE_INVALID'],
+        ['MEDIA_VALIDATION', 'JPEG_STRUCTURE_INVALID'],
+        ['META_TRANSPORT', 'HTTP_PERMANENT'],
+      ];
+      for (const [category, code] of cases) {
+        await seed('RESERVED', { meta_attempts: 2 });
+        const outcome = await commit({ category, code });
+        expect(outcome).toMatchObject({
+          kind: 'terminal',
+          failureStage: 'MEDIA_VALIDATION_PRE_STORAGE',
+          version: '3',
+          intent: {
+            dedupeKey: intentKey('3'),
+            receiptMediaId: UUID_A,
+            receiptStateVersion: '3',
+            sourceWebhookMessageId: 'wamid.core',
+            recipientId: SENDER,
+            templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+            templateArgs: {},
+          },
+        });
+        expect(await row()).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'MEDIA_VALIDATION_PRE_STORAGE',
+          last_error_category: category,
+          last_error_code: code,
+          meta_attempts: 2,
+        });
+        expect((await row()).terminal_at).toBeInstanceOf(Date);
+        expect(await outboxRows()).toHaveLength(1);
+      }
+    });
+
+    it('terminalizes the internal exhaustion code for a reclaimed meta_attempts=3 row and clears DOWNLOADED evidence', async () => {
+      for (const status of ['RESERVED', 'DOWNLOADED']) {
+        await seed(status, { meta_attempts: 3 });
+        const outcome = await commit({ code: 'META_EXHAUSTED' });
+        expect(outcome).toMatchObject({
+          kind: 'terminal',
+          failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+          version: '3',
+          intent: {
+            dedupeKey: intentKey('3'),
+            templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+            templateArgs: {},
+          },
+        });
+        const stored = await row();
+        expect(stored).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'META_EXHAUSTED_PRE_STORAGE',
+          last_error_category: 'META_TRANSPORT',
+          last_error_code: 'META_EXHAUSTED',
+          meta_attempts: 3,
+          downloaded_at: null,
+          response_mime_type: null,
+          detected_mime_type: null,
+          byte_count: null,
+          content_sha256: null,
+          stored_at: null,
+          object_etag: null,
+          object_version_id: null,
+          capability_token_hash: null,
+          capability_key_version: null,
+          capability_key_version_text: null,
+          capability_issued_at: null,
+          capability_revoked_at: null,
+        });
+        expect(stored.terminal_at).toBeInstanceOf(Date);
+        expect(await outboxRows()).toHaveLength(1);
+      }
+    });
+
+    it('validates the exact persisted intent on replay, repairs a legacy successor missing only its intent, and fences foreign or rival evidence', async () => {
+      await seed('RESERVED', { meta_attempts: 3 });
+      expect((await commit({ code: 'META_EXHAUSTED' })).kind).toBe('terminal');
+      const successor = await row();
+      const [owned] = await outboxRows();
+      expect(await commit({ code: 'META_EXHAUSTED' })).toMatchObject({
+        kind: 'replayed',
+        version: '3',
+        intent: { id: owned.id },
+      });
+      expect(await outboxRows()).toHaveLength(1);
+      expect(await row()).toEqual(successor);
+      // A mismatch in the persisted intent is foreign evidence: fence, never
+      // replace it.
+      await pool.query(
+        "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+      );
+      await expectFenced(command({ code: 'META_EXHAUSTED' }));
+      expect((await outboxRows())[0].recipient_id).toBe('sender.rival');
+      // Rival terminal evidence fences before any intent repair.
+      await seedRow(
+        legacyTerminal({
+          failure_stage: 'MEDIA_VALIDATION_PRE_STORAGE',
+          last_error_category: 'MEDIA_VALIDATION',
+          last_error_code: 'MIME_MISMATCH',
+          meta_attempts: 1,
+        }),
+      );
+      await expectFenced(command({ code: 'META_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(0);
+      // A deterministic key publicly owned by a foreign intent fences.
+      await seedRow(legacyTerminal());
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key,
+           source_webhook_message_id, recipient_id, template_key, template_args)
+         VALUES ($1, $2, 'wamid.core', 'sender.rival',
+           'RECEIPT_AMOUNT_PROMPT', '{}'::jsonb)`,
+        [UUID_C, intentKey('3')],
+      );
+      await expectFenced(command({ code: 'META_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(1);
+      expect((await outboxRows())[0]).toMatchObject({
+        recipient_id: 'sender.rival',
+      });
+      // A legacy FAILED successor missing only its deterministic intent is
+      // repaired under the exact command and live-lease replay fence.
+      await seedRow(legacyTerminal());
+      const repaired = await commit({ code: 'META_EXHAUSTED' });
+      expect(repaired).toMatchObject({
+        kind: 'replayed',
+        version: '3',
+        failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+        intent: {
+          dedupeKey: intentKey('3'),
+          templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+          templateArgs: {},
+        },
+      });
+      const repairedRows = await outboxRows();
+      expect(repairedRows).toHaveLength(1);
+      expect(repairedRows[0]).toMatchObject({
+        dedupe_key: intentKey('3'),
+        receipt_media_id: UUID_A,
+        receipt_state_version: '3',
+        source_webhook_message_id: 'wamid.core',
+        recipient_id: SENDER,
+        template_key: 'RECEIPT_UNAVAILABLE_LATER',
+        template_args: {},
+      });
+      expect(await commit({ code: 'META_EXHAUSTED' })).toMatchObject({
+        kind: 'replayed',
+        version: '3',
+        intent: { id: repairedRows[0].id },
+      });
+      expect(await outboxRows()).toHaveLength(1);
+      // A dead lease never repairs a legacy terminal successor.
+      await seedRow(legacyTerminal());
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      await expectFenced(command({ code: 'META_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('treats every mismatched persisted intent field as foreign evidence and never replaces it', async () => {
+      const commitThenAlter = async (sql: string) => {
+        await seed('RESERVED', { meta_attempts: 3 });
+        expect((await commit({ code: 'META_EXHAUSTED' })).kind).toBe(
+          'terminal',
+        );
+        await pool.query(sql);
+        await expectFenced(command({ code: 'META_EXHAUSTED' }));
+        expect(await outboxRows()).toHaveLength(1);
+      };
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+      );
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET source_webhook_message_id = 'wamid.rival'",
+      );
+      await commitThenAlter(
+        'UPDATE receipt_media_outbox SET receipt_state_version = 2',
+      );
+      await commitThenAlter(
+        'UPDATE receipt_media_outbox SET receipt_media_id = NULL',
+      );
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET template_key = 'RECEIPT_AMOUNT_PROMPT'",
+      );
+      await commitThenAlter(
+        `UPDATE receipt_media_outbox SET template_args = '{"extra":1}'::jsonb`,
+      );
+    });
+
+    it('fences a terminal transition and a transient retry whose lock wait outlives the lease', async () => {
+      for (const input of [
+        command({ code: 'META_EXHAUSTED' }),
+        command({ code: 'NETWORK_FAILURE' }),
+      ]) {
+        await seed('RESERVED', {
+          meta_attempts: input.code === 'META_EXHAUSTED' ? 3 : 1,
+          lease_expires_at: new Date(Date.now() + 250),
+        });
+        const before = await row();
+        const locker = await pool.connect();
+        let observedPending: Promise<unknown> | undefined;
+        try {
+          await locker.query('BEGIN');
+          await locker.query(
+            'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+            [UUID_A],
+          );
+          const pending = metaStore().commitMetaFailureDisposition(input);
+          observedPending = pending.catch(() => undefined);
+          while (Date.now() < +(before.lease_expires_at as number) + 20)
+            await new Promise((r) => setTimeout(r, 20));
+          await locker.query('COMMIT');
+          await expect(pending).resolves.toEqual({ kind: 'fenced' });
+          expect(await row()).toEqual(before);
+          expect(await outboxRows()).toHaveLength(0);
+        } finally {
+          await locker.query('ROLLBACK').catch(() => undefined);
+          locker.release();
+          await observedPending;
+        }
+      }
+    });
+
+    it('serializes exact replay intent validation against a concurrent foreign alteration and never replaces it', async () => {
+      await seed('RESERVED', { meta_attempts: 3 });
+      expect((await commit({ code: 'META_EXHAUSTED' })).kind).toBe('terminal');
+      const [owned] = await outboxRows();
+      const locker = await pool.connect();
+      let observedPending: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [intentKey('3')],
+        );
+        let settled = false;
+        const pending = (async () => {
+          const outcome = await commit({ code: 'META_EXHAUSTED' });
+          settled = true;
+          return outcome;
+        })();
+        observedPending = pending.catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 150));
+        expect(settled).toBe(false);
+        await locker.query(
+          "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival' WHERE dedupe_key = $1",
+          [intentKey('3')],
+        );
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await outboxRows()).toHaveLength(1);
+        expect((await outboxRows())[0]).toMatchObject({
+          id: owned.id,
+          recipient_id: 'sender.rival',
+        });
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observedPending;
+      }
+    });
+
+    it('serializes duplicate transient retries to one scheduled successor and fences the loser', async () => {
+      await seed('RESERVED', { meta_attempts: 1 });
+      const [a, b] = await Promise.all([commit(), commit()]);
+      expect([a.kind, b.kind].sort()).toEqual(['fenced', 'retry-scheduled']);
+      const stored = await row();
+      expect(stored).toMatchObject({
+        status: 'RESERVED',
+        version: '3',
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('serializes duplicate terminal commits to one state and one intent and fences a rival', async () => {
+      await seed('RESERVED', { meta_attempts: 3 });
+      const [a, b] = await Promise.all([
+        commit({ code: 'META_EXHAUSTED' }),
+        commit({ code: 'META_EXHAUSTED' }),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['replayed', 'terminal']);
+      expect(await row()).toMatchObject({
+        status: 'FAILED',
+        version: '3',
+        failure_stage: 'META_EXHAUSTED_PRE_STORAGE',
+      });
+      const intents = await outboxRows();
+      expect(intents).toHaveLength(1);
+      expect(intents[0]).toMatchObject({
+        dedupe_key: intentKey('3'),
+        template_key: 'RECEIPT_UNAVAILABLE_LATER',
+        template_args: {},
+      });
+      await seed('RESERVED', { meta_attempts: 3 });
+      const [c, d] = await Promise.all([
+        commit({ code: 'META_EXHAUSTED' }),
+        commit({ category: 'MEDIA_VALIDATION', code: 'MIME_MISMATCH' }),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['fenced', 'terminal']);
+      expect(await row()).toMatchObject({ status: 'FAILED', version: '3' });
+      expect(await outboxRows()).toHaveLength(1);
+    });
+
+    it('rolls back both terminal state and its intent when the outbox insert fails', async () => {
+      await seed('RESERVED', { meta_attempts: 3 });
+      const before = await row();
+      await pool.query(`CREATE FUNCTION receipt_meta_outbox_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'meta outbox failure'; END; $$;
+      CREATE TRIGGER receipt_meta_outbox_failure
+        BEFORE INSERT ON receipt_media_outbox FOR EACH ROW
+        EXECUTE FUNCTION receipt_meta_outbox_failure()`);
+      try {
+        await expect(commit({ code: 'META_EXHAUSTED' })).rejects.toThrow(
+          'meta outbox failure',
+        );
+        expect(await row()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS
+          receipt_meta_outbox_failure ON receipt_media_outbox;
+          DROP FUNCTION IF EXISTS receipt_meta_outbox_failure()`);
+      }
+      // A pre-existing foreign intent at the deterministic key also rolls the
+      // fresh FAILED transition back instead of replacing that evidence.
+      await seed('RESERVED', { meta_attempts: 3 });
+      const seeded = await row();
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key,
+           source_webhook_message_id, recipient_id, template_key, template_args)
+         VALUES ($1, $2, 'wamid.core', 'sender.rival',
+           'RECEIPT_AMOUNT_PROMPT', '{}'::jsonb)`,
+        [UUID_C, intentKey('3')],
+      );
+      await expectFenced(command({ code: 'META_EXHAUSTED' }));
+      expect(await row()).toEqual(seeded);
+      const [foreign] = await outboxRows();
+      expect(foreign).toMatchObject({
+        dedupe_key: intentKey('3'),
+        recipient_id: 'sender.rival',
+        template_key: 'RECEIPT_AMOUNT_PROMPT',
+      });
+    });
+
+    it('fences wrong fences, malformed categories/codes, and non-eligible states without durable mutation', async () => {
+      await seed('RESERVED', { meta_attempts: 1 });
+      for (const over of [
+        { owner: 'worker.rival' },
+        { expectedVersion: '1' },
+        { expectedVersion: '4' },
+        { expectedVersion: '2.5' },
+        { expectedVersion: '0' },
+        { id: UUID_C },
+        { id: 'not-a-uuid' },
+        { owner: '' },
+        { category: 'MEDIA_VALIDATION', code: 'NETWORK_FAILURE' },
+        { category: 'META_TRANSPORT', code: 'MIME_MISMATCH' },
+        { category: 'META_TRANSPORT', code: 'META_EXHAUSTED' },
+        { category: 'MEDIA_VALIDATION', code: 'META_EXHAUSTED' },
+        { category: 'META_TRANSPORT', code: 'UNKNOWN' },
+        { category: 'META_TRANSPORT', code: '' },
+        { category: 'OTHER', code: 'NETWORK_FAILURE' },
+      ]) {
+        await expectFenced(command(over));
+      }
+      expect(await outboxRows()).toHaveLength(0);
+      // meta_attempts = 0 has no attempt evidence to dispose.
+      await seed('RESERVED', { meta_attempts: 0 });
+      await expectFenced(command());
+      // STORED and ATTACHING are never Meta-disposition eligible.
+      await seed('STORED', { meta_attempts: 1 });
+      await expectFenced(command());
+      await seed('ATTACHING', { meta_attempts: 1 });
+      await expectFenced(command());
+      // A released lease never authorizes a disposition.
+      await seed('RESERVED', { meta_attempts: 1 });
+      await pool.query(
+        'UPDATE receipt_media SET lease_owner = NULL, lease_expires_at = NULL WHERE id = $1',
+        [UUID_A],
+      );
+      await expectFenced(command());
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('reclaims exhausted count-3 rows for terminalization while refusing a fourth Meta attempt and holding STORED', async () => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const reserved = lifeRow('RESERVED', null, {
+        id: UUID_A,
+        webhook_message_id: 'wamid.rec-r',
+        provider_media_id: 'media.rec-r',
+        sender_id: 'sender.rec-r',
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_A}`,
+        meta_attempts: 3,
+        next_attempt_at: T0,
+      });
+      const downloaded = lifeRow('DOWNLOADED', null, {
+        id: UUID_B,
+        webhook_message_id: 'wamid.rec-d',
+        provider_media_id: 'media.rec-d',
+        sender_id: 'sender.rec-d',
+        captured_sale_id: UUID_C,
+        object_key: `receipts/${UUID_B}`,
+        meta_attempts: 3,
+        next_attempt_at: T0,
+      });
+      const exhaustedStorage = lifeRow('DOWNLOADED', null, {
+        id: UUID_C,
+        webhook_message_id: 'wamid.rec-s',
+        provider_media_id: 'media.rec-s',
+        sender_id: 'sender.rec-s',
+        captured_sale_id: UUID_A,
+        object_key: `receipts/${UUID_C}`,
+        meta_attempts: 3,
+        storage_attempts: 3,
+        next_attempt_at: T0,
+      });
+      const stored = lifeRow('STORED', null, {
+        id: '33333333-3333-4333-8333-333333333333',
+        webhook_message_id: 'wamid.rec-t',
+        provider_media_id: 'media.rec-t',
+        sender_id: 'sender.rec-t',
+        captured_sale_id: UUID_B,
+        object_key: 'receipts/stored-rec',
+        meta_attempts: 3,
+        next_attempt_at: T0,
+      });
+      for (const receipt of [reserved, downloaded, exhaustedStorage, stored])
+        await pool.query(
+          insertSql('receipt_media', receipt),
+          Object.values(receipt),
+        );
+      const claimed = await store.claimBatch(5, OWNER);
+      expect(claimed.map((r) => r.id).sort()).toEqual([UUID_A, UUID_B]);
+      for (const receipt of claimed) {
+        expect(receipt.metaAttempts).toBe(3);
+        expect(
+          await store.startMetaAttempt({
+            id: receipt.id,
+            owner: OWNER,
+            expectedVersion: receipt.version,
+          }),
+        ).toBeNull();
+      }
     });
   });
 

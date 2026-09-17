@@ -32,6 +32,9 @@ import type {
   DownloadCommitOutcome,
   DedupeOutcome,
   LeaseFenceInput,
+  MetaFailureDispositionInput,
+  MetaFailureDispositionOutcome,
+  MetaTerminalFailureStage,
   OutboxIntentInput,
   ReceiptMediaStorePort,
   ReceiptCancellationInput,
@@ -186,7 +189,129 @@ const ATTACH_DEFINITE_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
       WHERE id = $1 AND lease_owner = $2
         AND lease_expires_at > clock_timestamp() FOR UPDATE`;
 
+/** ODD-2C fresh Meta disposition lock: the exact owned, live-leased
+ * RESERVED/DOWNLOADED row at the caller's expected version read under
+ * `clock_timestamp()` and a row lock, so every routing, state, attempt,
+ * status, and deadline value comes from the durable row and a lease that
+ * expires while this transaction waits can never authorize a mutation. */
+const META_FAILURE_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status IN ('RESERVED', 'DOWNLOADED') FOR UPDATE`;
+
+/** ODD-2C terminal replay/repair fence: the exact owned, live-leased
+ * terminal successor read under `clock_timestamp()` and a row lock, so a
+ * lease that expires or is released while this transaction waits on a
+ * concurrent writer can never authorize a replay or a legacy
+ * missing-intent repair. */
+const META_FAILURE_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2
+        AND lease_expires_at > clock_timestamp() FOR UPDATE`;
+
+/** ODD-2C transient retry schedule: retain the processing status, persist
+ * only the safe category/code, set the deadline from DB clock time, clear
+ * both lease fields, and bump the version; no intent is created. */
+const META_RETRY_SQL = `UPDATE receipt_media
+      SET last_error_category = $5, last_error_code = $6,
+        next_attempt_at = clock_timestamp() + ($7::int * interval '1 millisecond'),
+        lease_owner = NULL, lease_expires_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status IN ('RESERVED', 'DOWNLOADED') AND meta_attempts = $4::int
+      RETURNING *`;
+
+/** ODD-2C permanent/exhausted terminal transition: one atomic, parameter-
+ * bound fenced UPDATE to FAILED with the derived failure stage, safe error
+ * evidence, terminal_at, and every superseded download and accepted-object
+ * column cleared; the terminal lease is retained per the established
+ * replay convention. ODD-2C fences with `clock_timestamp()` so a row-lock
+ * wait that outlives the lease cannot commit. */
+const META_TERMINAL_SQL = `UPDATE receipt_media
+      SET status = 'FAILED', failure_stage = $5, last_error_category = $6,
+        last_error_code = $7, terminal_at = clock_timestamp(),
+        downloaded_at = NULL, response_mime_type = NULL, detected_mime_type = NULL,
+        byte_count = NULL, content_sha256 = NULL, stored_at = NULL,
+        object_etag = NULL, object_version_id = NULL, capability_token_hash = NULL,
+        capability_key_version = NULL, capability_key_version_text = NULL,
+        capability_issued_at = NULL, capability_revoked_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status IN ('RESERVED', 'DOWNLOADED') AND meta_attempts = $4::int
+        AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
+        AND attach_http_status IS NULL AND attach_transport_code IS NULL
+        AND attach_outcome_observed_at IS NULL RETURNING *`;
+
 const MAX_INT32 = 2_147_483_647;
+
+/** ODD-2C fixed Meta disposition taxonomy. MEDIA_VALIDATION codes are
+ * always permanent pre-storage validation failures; HTTP_PERMANENT is a
+ * permanent transport failure classified at the same pre-storage stage;
+ * the retryable transport codes schedule attempts 1/2 and terminalize
+ * attempt 3 as META_EXHAUSTED_PRE_STORAGE; META_EXHAUSTED is the fixed
+ * internal code for a reclaimed row already at meta_attempts = 3. */
+const META_VALIDATION_CODES = new Set<string>([
+  'UNSUPPORTED_MIME',
+  'INVALID_MEDIA_SIZE',
+  'MIME_MISMATCH',
+  'PNG_STRUCTURE_INVALID',
+  'JPEG_STRUCTURE_INVALID',
+]);
+const META_RETRYABLE_CODES = new Set<string>([
+  'FILE_IO_FAILURE',
+  'NETWORK_FAILURE',
+  'HTTP_RETRYABLE',
+  'TIMEOUT',
+  'ABORTED',
+]);
+const META_EXHAUSTED = 'META_EXHAUSTED';
+
+/** Documented bounded positive retry jitter for pre-storage Meta failures:
+ * attempt 1 waits 1s plus 0..250ms, attempt 2 waits 4s plus 0..1000ms
+ * (25% of the base), so a retry deadline is never earlier than its base. */
+const META_RETRY_BASE_MS = [1000, 4000];
+const META_RETRY_JITTER_RATIO = 0.25;
+const metaRetryDelayMs = (attempt: number): number => {
+  const base = META_RETRY_BASE_MS[attempt - 1];
+  return (
+    base + Math.floor(Math.random() * (base * META_RETRY_JITTER_RATIO + 1))
+  );
+};
+
+/** The fixed safe command taxonomy; unknown category/code pairs never reach
+ * the database. */
+const isMetaFailureCommand = (category: unknown, code: unknown): boolean =>
+  category === 'MEDIA_VALIDATION'
+    ? typeof code === 'string' && META_VALIDATION_CODES.has(code)
+    : category === 'META_TRANSPORT'
+      ? typeof code === 'string' &&
+        (META_RETRYABLE_CODES.has(code) ||
+          code === 'HTTP_PERMANENT' ||
+          code === META_EXHAUSTED)
+      : false;
+
+/** Terminal stage for the locked row's fixed disposition, or `retry` for a
+ * retryable transport code below the attempt limit; null fences. */
+const metaFailureDecision = (
+  category: string,
+  code: string,
+  attempts: number,
+): MetaTerminalFailureStage | 'retry' | null => {
+  if (attempts < 1 || attempts > 3) return null;
+  if (category === 'MEDIA_VALIDATION')
+    return META_VALIDATION_CODES.has(code)
+      ? 'MEDIA_VALIDATION_PRE_STORAGE'
+      : null;
+  if (code === META_EXHAUSTED)
+    return attempts === 3 ? 'META_EXHAUSTED_PRE_STORAGE' : null;
+  if (code === 'HTTP_PERMANENT') return 'MEDIA_VALIDATION_PRE_STORAGE';
+  return META_RETRYABLE_CODES.has(code)
+    ? attempts < 3
+      ? 'retry'
+      : 'META_EXHAUSTED_PRE_STORAGE'
+    : null;
+};
 
 /** WU11A3A proven non-committing outcomes: the safe allowlisted statuses. */
 const ATTACH_DEFINITE_HTTP_STATUSES = [400, 401, 403, 404, 409, 422, 429];
@@ -590,6 +715,37 @@ const attachDefiniteFailureIntentMatches = (
   row.source_webhook_message_id === webhookMessageId &&
   row.recipient_id === senderId &&
   row.template_key === 'RECEIPT_ATTACH_DEFINITE_FAILURE' &&
+  isRecord(row.template_args) &&
+  Object.keys(row.template_args).length === 0;
+
+/** Row-derived identity of the single unavailable-later intent: receipt
+ * id, FAILED successor version, and stored webhook message only — never a
+ * caller value, object key, URL, capability, or free text. */
+const metaFailureIntentKey = (
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+): string =>
+  `receipt-unavailable-later:${receiptId}:${successor}:${webhookMessageId}`;
+
+/** Exact structural ownership proof for the `RECEIPT_UNAVAILABLE_LATER`
+ * intent: the deterministic key plus every row-derived column, with the
+ * single bounded empty-args shape. */
+const metaFailureIntentMatches = (
+  row: Row | undefined,
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+  senderId: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === receiptId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === webhookMessageId &&
+  row.recipient_id === senderId &&
+  row.template_key === 'RECEIPT_UNAVAILABLE_LATER' &&
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
 
@@ -1803,14 +1959,221 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     }
   }
 
+  /** Owns the single deterministic, row-derived
+   * `RECEIPT_UNAVAILABLE_LATER` intent for the locked terminal receipt. Its
+   * identity and every column come from the durable row — receipt id,
+   * FAILED successor version, stored webhook message, and stored sender —
+   * never from the caller. Returns the durable row when this call persists
+   * it or when an existing row is structurally exact; null when a
+   * rival/foreign intent already owns the deterministic key so the caller
+   * rolls back instead of replacing evidence. */
+  private async ownMetaFailureIntent(
+    c: PoolClient,
+    receipt: Row,
+  ): Promise<Row | null> {
+    const receiptId = receipt.id as string;
+    const successor = String(receipt.version);
+    const webhookMessageId = receipt.webhook_message_id as string;
+    const senderId = receipt.sender_id as string;
+    const dedupeKey = metaFailureIntentKey(
+      receiptId,
+      successor,
+      webhookMessageId,
+    );
+    const inserted = await c.query<Row>(
+      `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+         receipt_state_version, source_webhook_message_id, recipient_id,
+         template_key, template_args)
+       VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_UNAVAILABLE_LATER', $7::jsonb)
+       ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+      [
+        randomUUID(),
+        dedupeKey,
+        receiptId,
+        successor,
+        webhookMessageId,
+        senderId,
+        JSON.stringify({}),
+      ],
+    );
+    const owned =
+      inserted.rows[0] ??
+      (
+        await c.query<Row>(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [dedupeKey],
+        )
+      ).rows[0];
+    return metaFailureIntentMatches(
+      owned,
+      receiptId,
+      successor,
+      webhookMessageId,
+      senderId,
+      dedupeKey,
+    )
+      ? owned
+      : null;
+  }
+
+  /** ODD-2C terminal replay/legacy repair validation; see
+   * META_FAILURE_REPLAY_LOOK_SQL. The exact owned, live-leased terminal
+   * successor must prove every deterministic field and cleared superseded
+   * evidence; only then is the single row-derived intent owned (repairing
+   * an otherwise exact legacy successor missing it). */
+  private async replayMetaFailure(
+    c: PoolClient,
+    current: Row,
+    input: MetaFailureDispositionInput,
+    successor: string,
+  ): Promise<MetaFailureDispositionOutcome> {
+    const decision = metaFailureDecision(
+      input.category,
+      input.code,
+      current.meta_attempts as number,
+    );
+    if (decision === null || decision === 'retry') return { kind: 'fenced' };
+    if (
+      current.status !== 'FAILED' ||
+      current.failure_stage !== decision ||
+      String(current.version) !== successor ||
+      current.last_error_category !== input.category ||
+      current.last_error_code !== input.code ||
+      !(current.terminal_at instanceof Date) ||
+      current.downloaded_at !== null ||
+      current.response_mime_type !== null ||
+      current.detected_mime_type !== null ||
+      current.byte_count !== null ||
+      current.content_sha256 !== null ||
+      current.stored_at !== null ||
+      current.object_etag !== null ||
+      current.object_version_id !== null ||
+      current.capability_token_hash !== null ||
+      current.capability_key_version !== null ||
+      current.capability_key_version_text !== null ||
+      current.capability_issued_at !== null ||
+      current.capability_revoked_at !== null
+    )
+      return { kind: 'fenced' };
+    const intent = await this.ownMetaFailureIntent(c, current);
+    if (!intent) throw FENCED;
+    return {
+      kind: 'replayed',
+      failureStage: decision,
+      version: successor,
+      receipt: camelize<Media>(current),
+      intent: camelize<ReceiptMediaOutboxRow>(intent),
+    };
+  }
+
+  /** ODD-2C durable Meta failure disposition; see META_FAILURE_LOOK_SQL,
+   * META_RETRY_SQL, and META_TERMINAL_SQL. The caller supplies only the
+   * lease/version fence plus the fixed safe category/code; the locked row
+   * owns every routing, state, attempt, status, deadline, and intent value.
+   * A row already at `meta_attempts = 3` is terminalized through the fixed
+   * internal exhaustion code with no fourth Meta call. */
+  async commitMetaFailureDisposition(
+    input: MetaFailureDispositionInput,
+  ): Promise<MetaFailureDispositionOutcome> {
+    let successor: string | null;
+    try {
+      successor = successorVersion(input?.expectedVersion);
+    } catch {
+      return { kind: 'fenced' };
+    }
+    if (
+      successor === null ||
+      typeof input?.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input?.owner !== 'string' ||
+      input.owner.length === 0 ||
+      !isMetaFailureCommand(input?.category, input?.code)
+    )
+      return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const locked = (
+          await c.query<Row>(META_FAILURE_LOOK_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+          ])
+        ).rows[0];
+        if (!locked) {
+          const current = (
+            await c.query<Row>(META_FAILURE_REPLAY_LOOK_SQL, [
+              input.id,
+              input.owner,
+            ])
+          ).rows[0];
+          if (!current) return { kind: 'fenced' };
+          return await this.replayMetaFailure(c, current, input, successor);
+        }
+        const attempts = locked.meta_attempts as number;
+        const decision = metaFailureDecision(
+          input.category,
+          input.code,
+          attempts,
+        );
+        if (decision === null) return { kind: 'fenced' };
+        if (decision === 'retry') {
+          const updated = await c.query<Row>(META_RETRY_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+            attempts,
+            input.category,
+            input.code,
+            metaRetryDelayMs(attempts),
+          ]);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'retry-scheduled',
+            attempt: attempts,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const updated = await c.query<Row>(META_TERMINAL_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          attempts,
+          decision,
+          input.category,
+          input.code,
+        ]);
+        if (updated.rowCount !== 1) throw FENCED;
+        const receipt = updated.rows[0];
+        const intent = await this.ownMetaFailureIntent(c, receipt);
+        if (!intent) throw FENCED;
+        return {
+          kind: 'terminal',
+          failureStage: decision,
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
+          intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      if ((err as { code?: string }).code === '22P02')
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
   /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE
    * SKIP LOCKED, bounded batch, deterministic next_attempt_at/created_at
    * ordering, 60-second lease, and version increment. Eligibility exactly:
-   * RESERVED with meta<3; DOWNLOADED with storage<3 and meta<3; ATTACHING
-   * (post-crash included) for fix-forward. STORED rows are held from
-   * automatic eligibility — they are durable and retained for separately
-   * authorized reconciliation; this worker never claims them automatically.
-   * (STORED hold: STORED-1.) */
+   * RESERVED with meta<=3; DOWNLOADED with storage<3 and meta<=3; ATTACHING
+   * (post-crash included) for fix-forward. ODD-2C admits exhausted
+   * `meta_attempts = 3` rows only so the processor can terminalize them; a
+   * fourth Meta attempt is still refused by `startMetaAttempt`. STORED rows
+   * are held from automatic eligibility — they are durable and retained for
+   * separately authorized reconciliation; this worker never claims them
+   * automatically. (STORED hold: STORED-1.) */
   async claimBatch(limit: number, owner: string): Promise<Media[]> {
     return this.withTx(async (c) => {
       const { rows } = await c.query<Row>(
@@ -1818,9 +2181,11 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
            SELECT id FROM receipt_media
            WHERE next_attempt_at <= now()
              AND (lease_expires_at IS NULL OR lease_expires_at < now())
-             AND ((status = 'RESERVED' AND meta_attempts < 3)
+             AND ((status = 'RESERVED'
+                 AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'DOWNLOADED'
-                 AND storage_attempts < 3 AND meta_attempts < 3)
+                 AND storage_attempts < 3
+                 AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'ATTACHING'))
            ORDER BY next_attempt_at, created_at
            FOR UPDATE SKIP LOCKED LIMIT $1
