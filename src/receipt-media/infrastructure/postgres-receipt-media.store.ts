@@ -124,21 +124,19 @@ const ATTACH_COMMIT_SUCCESS_SQL = `UPDATE receipt_media
              AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
              AND attached_at IS NULL RETURNING *`;
 
-const ATTACH_SUCCESS_LOOK_SQL = `SELECT * FROM receipt_media
-               WHERE id = $1 AND lease_owner = $2
-                 AND lease_expires_at > now()`;
-
 /** WU11A3A: one atomic, parameter-bound fenced UPDATE to FAILED /
  * ATTACH_DEFINITE with the allowlisted HTTP status and terminal_at;
  * observed-at stays null per the schema convention, lease fields are
  * retained per the terminal-transition convention, and no body, auth,
- * URL, capability, or diagnostic PII is ever persisted. */
+ * URL, capability, or diagnostic PII is ever persisted. ODD-2B2 fences the
+ * fresh transition with `clock_timestamp()` so a row-lock wait that
+ * outlives the lease cannot commit. */
 const ATTACH_DEFINITE_FAILURE_SQL = `UPDATE receipt_media
                SET status = 'FAILED', failure_stage = 'ATTACH_DEFINITE',
                  attach_http_status = $5, terminal_at = now(),
                  version = version + 1, updated_at = now()
                WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
-                 AND lease_expires_at > now() AND status = 'ATTACHING'
+                 AND lease_expires_at > clock_timestamp() AND status = 'ATTACHING'
                  AND attach_attempts = 1 AND attach_attempt_id = $4
                  AND attach_request_started_at IS NOT NULL
                  AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
@@ -176,6 +174,15 @@ const ATTACH_UNKNOWN_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
  * concurrent writer can never authorize a replay or a legacy
  * missing-intent repair. */
 const ATTACH_SUCCESS_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2
+        AND lease_expires_at > clock_timestamp() FOR UPDATE`;
+
+/** ODD-2B2 definite-failure replay/repair fence: the exact owned,
+ * live-leased terminal successor read under `clock_timestamp()` and a row
+ * lock, so a lease that expires or is released while this transaction
+ * waits on a concurrent writer can never authorize a replay or a legacy
+ * missing-intent repair. */
+const ATTACH_DEFINITE_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
       WHERE id = $1 AND lease_owner = $2
         AND lease_expires_at > clock_timestamp() FOR UPDATE`;
 
@@ -554,6 +561,37 @@ const attachSuccessIntentMatches = (
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 1 &&
   row.template_args.backendStatus === 'PENDING';
+
+/** Row-derived identity of the single definite-failure intent: receipt id,
+ * FAILED successor version, and stored webhook message only — never a
+ * caller value, object key, URL, capability, or free text. */
+const attachDefiniteFailureIntentKey = (
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+): string =>
+  `receipt-attach-definite-failure:${receiptId}:${successor}:${webhookMessageId}`;
+
+/** Exact structural ownership proof for the
+ * `RECEIPT_ATTACH_DEFINITE_FAILURE` intent: the deterministic key plus
+ * every row-derived column, with the single bounded empty-args shape. */
+const attachDefiniteFailureIntentMatches = (
+  row: Row | undefined,
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+  senderId: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === receiptId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === webhookMessageId &&
+  row.recipient_id === senderId &&
+  row.template_key === 'RECEIPT_ATTACH_DEFINITE_FAILURE' &&
+  isRecord(row.template_args) &&
+  Object.keys(row.template_args).length === 0;
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -1430,7 +1468,14 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     }
   }
 
-  /** WU11A3A terminal failure commit; see ATTACH_DEFINITE_FAILURE_SQL. */
+  /** WU11A3A definite-failure terminal commit with ODD-2B2 intent
+   * ownership; see ATTACH_DEFINITE_FAILURE_SQL. The terminal transition
+   * and its single row-derived `RECEIPT_ATTACH_DEFINITE_FAILURE` intent
+   * commit in one transaction; a foreign/rival intent rolls both back and
+   * fences. An exact replay must prove the exact persisted intent; a
+   * legacy terminal successor missing only that intent is repaired under
+   * the same live-lease fence, while rival terminal evidence or a foreign
+   * intent fences without replacement. */
   async commitAttachDefiniteFailure(
     input: AttachDefiniteFailureInput,
   ): Promise<AttachDefiniteFailureOutcome> {
@@ -1459,30 +1504,44 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         ]);
         if (updated.rowCount === 1) {
           const receipt = updated.rows[0];
+          const intent = await this.ownAttachDefiniteFailureIntent(c, receipt);
+          if (!intent) throw FENCED;
           return {
             kind: 'failed',
             version: String(receipt.version),
             receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
           };
         }
         const current = (
-          await c.query<Row>(ATTACH_SUCCESS_LOOK_SQL, [input.id, input.owner])
+          await c.query<Row>(ATTACH_DEFINITE_REPLAY_LOOK_SQL, [
+            input.id,
+            input.owner,
+          ])
         ).rows[0];
-        return current?.status === 'FAILED' &&
-          current.failure_stage === 'ATTACH_DEFINITE' &&
-          String(current.version) === successor &&
-          current.attach_attempt_id === input.attachAttemptId &&
-          current.attach_http_status === input.httpStatus &&
-          current.attach_outcome_observed_at === null &&
-          current.terminal_at instanceof Date
-          ? {
-              kind: 'replayed',
-              version: successor,
-              receipt: camelize<Media>(current),
-            }
-          : { kind: 'fenced' };
+        if (
+          !(
+            current?.status === 'FAILED' &&
+            current.failure_stage === 'ATTACH_DEFINITE' &&
+            String(current.version) === successor &&
+            current.attach_attempt_id === input.attachAttemptId &&
+            current.attach_http_status === input.httpStatus &&
+            current.attach_outcome_observed_at === null &&
+            current.terminal_at instanceof Date
+          )
+        )
+          return { kind: 'fenced' };
+        const intent = await this.ownAttachDefiniteFailureIntent(c, current);
+        if (!intent) throw FENCED;
+        return {
+          kind: 'replayed',
+          version: successor,
+          receipt: camelize<Media>(current),
+          intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
       });
     } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
       if (
         typeof (err as { code?: string }).code === 'string' &&
         (err as { code?: string }).code === '22P02'
@@ -1490,6 +1549,63 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         return { kind: 'fenced' };
       throw err;
     }
+  }
+
+  /** Owns the single deterministic, row-derived
+   * `RECEIPT_ATTACH_DEFINITE_FAILURE` intent for the locked terminal
+   * receipt. Its identity and every column come from the durable row —
+   * receipt id, FAILED successor version, stored webhook message, and
+   * stored sender — never from the caller. Returns the durable row when
+   * this call persists it or when an existing row is structurally exact;
+   * null when a rival/foreign intent already owns the deterministic key so
+   * the caller rolls back instead of replacing evidence. */
+  private async ownAttachDefiniteFailureIntent(
+    c: PoolClient,
+    receipt: Row,
+  ): Promise<Row | null> {
+    const receiptId = receipt.id as string;
+    const successor = String(receipt.version);
+    const webhookMessageId = receipt.webhook_message_id as string;
+    const senderId = receipt.sender_id as string;
+    const dedupeKey = attachDefiniteFailureIntentKey(
+      receiptId,
+      successor,
+      webhookMessageId,
+    );
+    const inserted = await c.query<Row>(
+      `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+         receipt_state_version, source_webhook_message_id, recipient_id,
+         template_key, template_args)
+       VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_ATTACH_DEFINITE_FAILURE', $7::jsonb)
+       ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+      [
+        randomUUID(),
+        dedupeKey,
+        receiptId,
+        successor,
+        webhookMessageId,
+        senderId,
+        JSON.stringify({}),
+      ],
+    );
+    const owned =
+      inserted.rows[0] ??
+      (
+        await c.query<Row>(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [dedupeKey],
+        )
+      ).rows[0];
+    return attachDefiniteFailureIntentMatches(
+      owned,
+      receiptId,
+      successor,
+      webhookMessageId,
+      senderId,
+      dedupeKey,
+    )
+      ? owned
+      : null;
   }
 
   /** Owns the single deterministic, row-derived `RECEIPT_ATTACH_UNKNOWN`

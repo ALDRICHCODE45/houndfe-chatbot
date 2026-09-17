@@ -65,6 +65,26 @@ const FAKE_ATTACHED_INTENT: ReceiptMediaOutboxRow = {
   sentAt: null,
 };
 
+const FAKE_DEFINITE_INTENT: ReceiptMediaOutboxRow = {
+  id: 'intent-3',
+  dedupeKey: `receipt-attach-definite-failure:${RECEIPT_ID}:9:durable-wamid`,
+  receiptMediaId: RECEIPT_ID,
+  receiptStateVersion: '9',
+  sourceWebhookMessageId: 'durable-wamid',
+  recipientId: 'durable-sender',
+  templateKey: 'RECEIPT_ATTACH_DEFINITE_FAILURE',
+  templateArgs: {},
+  status: 'PENDING',
+  attempts: 0,
+  nextAttemptAt: new Date(0),
+  leaseOwner: null,
+  leaseExpiresAt: null,
+  providerMessageId: null,
+  createdAt: new Date(0),
+  updatedAt: new Date(0),
+  sentAt: null,
+};
+
 const FENCED_START: AttachRequestStartOutcome = { kind: 'fenced' };
 // prettier-ignore
 const CRASHED_START: AttachRequestStartOutcome = { kind: 'crashed-before-post', attachAttemptId: DURABLE_ATTEMPT_ID, version: '8', receipt: makeReceipt({ version: '8' }) };
@@ -120,7 +140,7 @@ describe('ReceiptAttachmentService (WU11C)', () => {
       store.commitAttachSuccess.mockResolvedValue({ kind: 'committed', version: '9', receipt, intent: FAKE_ATTACHED_INTENT });
     } else if (outcome === 'definite') {
       // prettier-ignore
-      store.commitAttachDefiniteFailure.mockResolvedValue({ kind: 'failed', version: '9', receipt });
+      store.commitAttachDefiniteFailure.mockResolvedValue({ kind: 'failed', version: '9', receipt, intent: FAKE_DEFINITE_INTENT });
     } else {
       // prettier-ignore
       store.commitAttachUnknownOutcome.mockResolvedValue({ kind: 'unknown', version: '9', receipt, intent: FAKE_INTENT });

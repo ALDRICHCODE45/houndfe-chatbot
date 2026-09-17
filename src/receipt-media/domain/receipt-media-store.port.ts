@@ -157,12 +157,15 @@ export interface AttachDefiniteFailureInput extends LeaseFenceInput {
   httpStatus: number;
 }
 
-/** A replay proves the exact durable successor; every other loser is fenced. */
+/** A replay proves the exact durable successor and its exact row-derived
+ * `RECEIPT_ATTACH_DEFINITE_FAILURE` intent; every other loser is fenced.
+ * Every non-fenced outcome carries the one persisted intent. */
 export type AttachDefiniteFailureOutcome =
   | {
       kind: 'failed' | 'replayed';
       version: string;
       receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
     }
   | { kind: 'fenced' };
 
@@ -313,12 +316,22 @@ export interface ReceiptMediaStorePort {
   commitAttachSuccess(
     input: AttachCommitSuccessInput,
   ): Promise<AttachCommitSuccessOutcome>;
-  /** WU11A3A definite attachment failure terminal commit: atomically
-   * transition the exact active ATTACHING row with request-start evidence
-   * and the matching attempt identity to FAILED under the caller's live
-   * lease, persisting only failure_stage = ATTACH_DEFINITE, the safe
-   * allowlisted HTTP status, and terminal_at; only the exact durable
-   * successor replays; everything else is fenced without mutation. */
+  /** WU11A3A definite attachment failure terminal commit (ODD-2B2: intent
+   * ownership): atomically transition the exact active ATTACHING row with
+   * request-start evidence and the matching attempt identity to FAILED under
+   * the caller's live lease fenced with `clock_timestamp()`, persisting only
+   * failure_stage = ATTACH_DEFINITE, the safe allowlisted HTTP status, and
+   * terminal_at together with exactly one row-derived deterministic
+   * `RECEIPT_ATTACH_DEFINITE_FAILURE` intent in the same transaction. The
+   * intent identity is `receipt-attach-definite-failure:<receiptId>:
+   * <successorVersion>:<storedWebhookMessageId>` with row-derived
+   * receipt/sender and exactly `{}` args — never a caller value. Only the
+   * exact durable successor replaying the exact persisted intent is
+   * replayed — an otherwise exact legacy successor missing only that intent
+   * is repaired under the exact original command, owner, and a live lease
+   * proven with `clock_timestamp()` plus `FOR UPDATE` — and a
+   * mismatched/foreign intent or rival terminal evidence fences without
+   * replacement, rolling back any terminal write. */
   commitAttachDefiniteFailure(
     input: AttachDefiniteFailureInput,
   ): Promise<AttachDefiniteFailureOutcome>;
