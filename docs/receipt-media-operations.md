@@ -79,6 +79,7 @@ hostname with the approved TLS endpoint and mount the token through your secret
 manager into the Prometheus process/container.
 
 ```yaml
+# @ts-check
 scrape_configs:
   - job_name: 'houndfe-chatbot-receipt-media'
     scheme: https
@@ -164,6 +165,48 @@ nothing. Preserve the attempt and obtain human reconciliation against backend
 receipt/audit evidence through approved access. Reconciliation tooling and the
 production drill are deferred; this runbook authorizes no state repair or second
 POST.
+
+## STORED-1: excluded from automatic claim eligibility
+
+**STORED rows are held out of automatic worker dispatch.** The `claimBatch` SQL
+does not include `status = 'STORED'` in its candidate predicate. This means the
+background worker never automatically claims STORED rows for processing.
+
+| Status     | claimBatch eligible | Worker dispatched | Notes                                          |
+| ---------- | ------------------- | ----------------- | ---------------------------------------------- |
+| RESERVED   | ✅                  | ✅                | Processed through ingestion pipeline           |
+| DOWNLOADED | ✅                  | ✅                | Processed through ingestion pipeline           |
+| ATTACHING  | ✅                  | ✅                | Processed through receipt attachment pipeline  |
+| STORED     | ❌                  | ❌                | Held; requires separate reconciliation process |
+
+**Why STORED is excluded:** Once a receipt is marked STORED, it has already been
+successfully processed through the ingestion pipeline. Re-processing a STORED row
+through the standard dispatch path is unnecessary and could cause duplicate
+processing or state corruption.
+
+**If a STORED row needs re-processing:** A separate, explicitly-authorized process
+must handle STORED rows. Do not attempt to reset a STORED row's status manually
+and re-enter the automatic claim path without a clear reconciliation protocol.
+
+**Dispatcher behavior:** The `ReceiptProcessingDispatcher` receives all claimed rows
+from the worker. For STORED rows, it returns `{ kind: 'non-dispatched', status: 'STORED' }`
+without calling any downstream collaborator (processor, attachment service, etc.).
+
+**Verification:** The claim-contract spec (`postgres-receipt-media.store.claim-contract.spec.ts`)
+exercises `claimBatch` with a Pool/PoolClient double and asserts that the issued SQL
+does not include the STORED status. This is a unit-level contract test; it does not
+exercise a real PostgreSQL connection and does not validate SQL runtime behavior,
+concurrency, or predicate selectivity. The existing database test suite
+(`postgres-receipt-media.store.spec.ts`) additionally asserts STORED exclusion against
+a real Testcontainers instance when `RUN_DOCKER_TESTS=1`.
+
+```
+# Claim-contract unit test (no DB required)
+node ./node_modules/jest/bin/jest.js --config ./jest.isolated.config.cjs \
+  --runInBand --runTestsByPath \
+  ./src/receipt-media/infrastructure/postgres-receipt-media.store.claim-contract.spec.ts \
+  --no-cache
+```
 
 ## Evidence boundary and references
 

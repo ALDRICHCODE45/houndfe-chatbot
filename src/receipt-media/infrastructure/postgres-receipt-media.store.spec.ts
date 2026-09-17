@@ -876,7 +876,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ['DOWNLOADED', {}, true],
       ['DOWNLOADED', { meta_attempts: 3 }, false],
       ['DOWNLOADED', { storage_attempts: 3 }, false],
-      ['STORED', { meta_attempts: 3, storage_attempts: 3 }, true],
+      // STORED-1: STORED rows are held from automatic claim eligibility;
+      // they remain durable and are reserved for separately authorized reconciliation.
+      ['STORED', { meta_attempts: 3, storage_attempts: 3 }, false],
       ['ATTACHING', {}, true],
       ['ATTACHING', { ...attachEvidence, next_attempt_at: FUTURE }, false],
       ['RESERVED', { next_attempt_at: FUTURE }, false],

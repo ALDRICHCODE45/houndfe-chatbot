@@ -1,5 +1,5 @@
 /** WU8B2 lifecycle worker: claims durable eligible receipt-media rows through
- * the WU2B `claimBatch` seam and drives the WU8B1 processor with a per-task
+ * the WU2B `claimBatch` seam and drives the STORED-1 dispatcher with a per-task
  * abort signal. Nest lifecycle conventions: `onApplicationBootstrap` starts
  * exactly one poll loop (idempotent); `onModuleDestroy` (via
  * `enableShutdownHooks()` in main.ts) marks stopping, wakes the poll wait,
@@ -9,7 +9,14 @@
  * The exact safe contract is WU2B claim/reclaim: an expired lease simply
  * becomes reclaimable by any worker, and the stale caller loses its
  * post-call fenced CAS (`startStorageAttempt`/`transitionStatus`/TX2),
- * receiving safe value outcomes — no heartbeat exists or is faked here. */
+ * receiving safe value outcomes — no heartbeat exists or is faked here.
+ *
+ * STORED-1: the second constructor argument is the state-aware dispatcher,
+ * not the raw processor. The dispatcher routes RESERVED/DOWNLOADED to ingestion,
+ * ATTACHING to attachment, and all other statuses to a no-op non-dispatch
+ * result. STORED rows are held from automatic claim eligibility and are
+ * never dispatched by this worker.
+ */
 import {
   Injectable,
   OnApplicationBootstrap,
@@ -17,7 +24,7 @@ import {
 } from '@nestjs/common';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 import type { ReceiptMediaStorePort } from '../domain/receipt-media-store.port';
-import type { ReceiptIngestionProcessor } from '../application/receipt-ingestion.processor';
+import type { ReceiptProcessingDispatcher } from '../application/receipt-processing-dispatcher.service';
 
 /** Wait seams must always resolve (wake/shutdown abort them); never reject. */
 export type IngestionWaitPort = (
@@ -65,7 +72,7 @@ export class ReceiptMediaIngestionWorker
 
   constructor(
     private readonly store: Pick<ReceiptMediaStorePort, 'claimBatch'>,
-    private readonly processor: Pick<ReceiptIngestionProcessor, 'process'>,
+    private readonly dispatcher: Pick<ReceiptProcessingDispatcher, 'dispatch'>,
     options: IngestionWorkerOptions,
     private readonly wait: IngestionWaitPort = waitWithSignal,
   ) {
@@ -150,7 +157,7 @@ export class ReceiptMediaIngestionWorker
     this.active.add(controller);
     const settled = Promise.resolve()
       .then(() =>
-        this.processor.process(receipt, this.owner, controller.signal),
+        this.dispatcher.dispatch(receipt, this.owner, controller.signal),
       )
       .then(
         () => undefined,

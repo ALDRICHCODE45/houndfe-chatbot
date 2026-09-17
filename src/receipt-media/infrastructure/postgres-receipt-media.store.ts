@@ -1439,8 +1439,11 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
   /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE
    * SKIP LOCKED, bounded batch, deterministic next_attempt_at/created_at
    * ordering, 60-second lease, and version increment. Eligibility exactly:
-   * RESERVED with meta<3; DOWNLOADED with storage<3 and meta<3; plain STORED
-   * regardless of counters; ATTACHING (post-crash included) for fix-forward. */
+   * RESERVED with meta<3; DOWNLOADED with storage<3 and meta<3; ATTACHING
+   * (post-crash included) for fix-forward. STORED rows are held from
+   * automatic eligibility — they are durable and retained for separately
+   * authorized reconciliation; this worker never claims them automatically.
+   * (STORED hold: STORED-1.) */
   async claimBatch(limit: number, owner: string): Promise<Media[]> {
     return this.withTx(async (c) => {
       const { rows } = await c.query<Row>(
@@ -1451,7 +1454,6 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
              AND ((status = 'RESERVED' AND meta_attempts < 3)
                OR (status = 'DOWNLOADED'
                  AND storage_attempts < 3 AND meta_attempts < 3)
-               OR status = 'STORED'
                OR (status = 'ATTACHING'))
            ORDER BY next_attempt_at, created_at
            FOR UPDATE SKIP LOCKED LIMIT $1
