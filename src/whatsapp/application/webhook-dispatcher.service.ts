@@ -226,14 +226,16 @@ export class WebhookDispatcherService {
             });
             this.recentOutbound.remember(providerMessageId);
           }
-          try {
-            await this.dedup.markSeen(message.messageId);
-          } catch (error) {
-            this.logger.warn(
-              `markSeen failed for ${message.messageId}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
+          if (!receiptAdmissionAtomicallyMarksSeen(kind)) {
+            try {
+              await this.dedup.markSeen(message.messageId);
+            } catch (error) {
+              this.logger.warn(
+                `markSeen failed for ${message.messageId}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
           }
           continue;
         }
@@ -417,6 +419,17 @@ function ingressGuidance(
     case 'webhook-media-conflict':
       return undefined;
   }
+}
+
+function receiptAdmissionAtomicallyMarksSeen(
+  kind: ReceiptIngressDecision['kind'],
+): boolean {
+  return (
+    kind === 'reserved' ||
+    kind === 'webhook-replayed' ||
+    kind === 'provider-media-reused' ||
+    kind === 'webhook-media-conflict'
+  );
 }
 
 // Re-export the AgentMessage type for any downstream consumers that

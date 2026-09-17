@@ -75,7 +75,7 @@ Current composition evidence:
 
 - [ ] **ODD-1 — Reconcile receipt admission causality**
   - [x] **ODD-1A — Atomic receipt-admission persistence:** verified atomic receipt-plus-marker commit, rollback, concurrent convergence, legacy replay, provider reuse, conflict, active-sender behavior, and unrelated-error propagation.
-  - [ ] **ODD-1B — Dispatcher adoption and acknowledgement proof:** adopt the atomic result, remove the separate successful-receipt `markSeen()` path, and prove HTTP `200` waits for durable admission but not worker-side processing.
+  - [x] **ODD-1B — Dispatcher adoption and acknowledgement proof:** verified conditional marker ownership, marker-only replay short-circuiting, all eight admission outcomes, and receipt-media HTTP settlement/failure behavior.
   - [ ] **ODD-1C — Cross-boundary resilience evidence:** prove concurrent same-message admission, rollback of both durable artifacts, and replay after adapter recreation with PostgreSQL-backed tests.
   - Preserve raw Meta signature verification, existing message precedence, the STORED hold, and the current caption boundary.
 
@@ -156,4 +156,10 @@ ODD-1A implementation and verification are complete on five changed source/spec 
 
 The store itself intentionally does not classify a marker-only row: direct `admit()` can create a receipt when a durable marker exists without a receipt. Current runtime remains safe because the dispatcher checks durable deduplication before ingress. This is a recorded non-blocking ODD-1A evidence limit and a required ODD-1B adoption case, not a production-readiness claim.
 
-No worker composition, wake-up, outbox intent, caption parsing, lifecycle transition, migration, external call, STORED claim change, commit, or push occurred. ODD-1A is verified but awaits explicit authorization for its local work-unit commit and subsequent commit-boundary review.
+No worker composition, wake-up, outbox intent, caption parsing, lifecycle transition, migration, external call, or STORED claim change occurred. The maintainer authorized the seven-path local work-unit commit `520651f` (`feat(receipt-media): make admission atomic`), which contains 363 insertions and 34 deletions and leaves local `main` 105 commits ahead of the local `origin/main` tracking ref. No push occurred.
+
+Native review START for the explicit prior-boundary range failed closed before lineage creation with `candidate-target-projection-drift`; no native mutation or review authority was created. Native ASSESS was also unavailable/unassessable and prescribed the high-risk fallback: writer self-verification plus an independent verifier. Both passed, and the parent spot check passed. ODD-1A is therefore accepted under the documented unavailable-review fallback.
+
+ODD-1B implementation and verification are complete across exactly `src/whatsapp/application/webhook-dispatcher.service.ts`, its spec, and `src/whatsapp/presentation/webhook.controller.spec.ts`: 75 additions and 40 deletions. Writer evidence passed 55/55 dispatcher, 9/9 controller, 81/81 combined, scoped ESLint, Prettier, diff check, and non-emitting TypeScript. Independent verification initially required one test-only correction because four guidance cases asserted only that `markSeen()` was called; the parent strengthened them to `toHaveBeenCalledTimes(1)` and repeated 55/55 plus static checks. Independent reverification repeated all seven checks and returned PASS.
+
+The dispatcher now omits the separate marker write only for `reserved`, `webhook-replayed`, `provider-media-reused`, and `webhook-media-conflict`; it retains exactly one best-effort marker write after successful guidance for `disabled`, `unsupported-media`, `no-placed-sale`, and `sender-active`. The top-level duplicate pre-check protects marker-only replay. Controller evidence composes with ODD-1A rather than using a real persistent dispatcher graph; full signed-HTTP persistence remains deferred to ODD-1C. No worker, outbox, migration, commit, or push occurred. ODD-1B awaits explicit authorization for its local work-unit commit.

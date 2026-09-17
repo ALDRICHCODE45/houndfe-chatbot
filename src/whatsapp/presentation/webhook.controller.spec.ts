@@ -180,20 +180,41 @@ describe('WebhookController', () => {
     const sign = (body: string): string =>
       `sha256=${crypto.createHmac('sha256', appSecret).update(body).digest('hex')}`;
 
-    // Exact-byte whitespace-rich body; the HMAC must match these raw bytes.
-    const whitespaceRichBody = (): string => `{
-  "object": "whatsapp_business_account",
-  "entry": [ { "changes": [ { "value": { "messages": [ { "id": "wamid.deferred", "type": "text", "text": { "body": "hola" } } ] } } ] } ]
-}`;
-
     const postSigned = (body: string) =>
       request(requestServer())
         .post('/webhook')
         .set('content-type', 'application/json')
         .set('x-hub-signature-256', sign(body));
 
-    it('leaves the HTTP acknowledgement unsettled until dispatch settles', async () => {
-      const body = whitespaceRichBody();
+    const signedReceiptMediaBody = (): string =>
+      JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            changes: [
+              {
+                value: {
+                  messages: [
+                    {
+                      id: 'wamid.receipt-pending',
+                      from: '5215550001111',
+                      timestamp: '1719000000',
+                      type: 'image',
+                      image: {
+                        id: 'media-receipt-pending',
+                        mime_type: 'image/jpeg',
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+    it('waits for receipt-media admission before acknowledging a signed webhook', async () => {
+      const body = signedReceiptMediaBody();
 
       let releaseDispatch!: () => void;
       let signalEntered!: () => void;
@@ -228,9 +249,9 @@ describe('WebhookController', () => {
       }
     });
 
-    it('returns 500 when dispatch rejects during the POST lifecycle', async () => {
-      const body = whitespaceRichBody();
-      dispatchSpy.mockRejectedValueOnce(new Error('dispatch failed'));
+    it('returns 500 when receipt-media admission rejects during the POST lifecycle', async () => {
+      const body = signedReceiptMediaBody();
+      dispatchSpy.mockRejectedValueOnce(new Error('admission failed'));
 
       await postSigned(body).send(body).expect(500);
     });

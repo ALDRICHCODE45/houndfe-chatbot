@@ -29,10 +29,7 @@ import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
 } from '../../receipt-media/domain/receipt-media.types';
-import {
-  type ReceiptIngressDecision,
-  type ReceiptIngressService,
-} from '../../receipt-media/application/receipt-ingress.service';
+import { type ReceiptIngressService } from '../../receipt-media/application/receipt-ingress.service';
 
 const receiptMediaRowFixture = (id: string): ReceiptMediaRow =>
   ({ id }) as unknown as ReceiptMediaRow;
@@ -1270,11 +1267,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
             text: c.expected,
           });
           expect(llm.run).not.toHaveBeenCalled();
-          expect(dedup.markSeen).toHaveBeenCalled();
+          expect(dedup.markSeen).toHaveBeenCalledTimes(1);
         },
       );
 
-      // Silent terminal: no send, no agent, dedup marked
+      // Atomic outcomes: no send, no agent, no extra dedup write. Their
+      // admission transaction already persists the inbound marker.
       const silentCases: Array<{
         decision: { kind: string; receiptId?: string };
         wamid: string;
@@ -1298,7 +1296,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       ];
 
       test.each(silentCases)(
-        '%s: no sendText, no LLM, marks seen',
+        '$decision.kind: no sendText, no LLM, no extra marker write',
         async (c) => {
           const decision = c.decision.receiptId
             ? { kind: c.decision.kind, receipt: { id: c.decision.receiptId } }
@@ -1307,7 +1305,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           await service.dispatch(mediaEvent(c.wamid, 'image'));
           expect(sender.sendText).not.toHaveBeenCalled();
           expect(llm.run).not.toHaveBeenCalled();
-          expect(dedup.markSeen).toHaveBeenCalledWith(c.wamid);
+          expect(dedup.markSeen).not.toHaveBeenCalled();
         },
       );
 
@@ -1378,17 +1376,23 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         });
       });
 
-      // Pre-ingress guards: echo and duplicate skip ingress
+      // Pre-ingress guards: echo and durable marker-only replay skip ingress.
       it('echo: ingress not called', async () => {
         (recentOutbound.isKnown as jest.Mock).mockReturnValueOnce(true);
         await service.dispatch(mediaEvent('wamid.echo', 'image'));
         expect(ingress.admit).not.toHaveBeenCalled();
       });
 
-      it('duplicate: ingress not called', async () => {
+      it('marker-only duplicate: skips ingress and every downstream processor', async () => {
         (dedup.isDuplicate as jest.Mock).mockResolvedValueOnce(true);
-        await service.dispatch(mediaEvent('wamid.dup', 'image'));
+
+        await service.dispatch(mediaEvent('wamid.marker-only', 'image'));
+
         expect(ingress.admit).not.toHaveBeenCalled();
+        expect(sender.sendText).not.toHaveBeenCalled();
+        expect(amountRouter.route).not.toHaveBeenCalled();
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(dedup.markSeen).not.toHaveBeenCalled();
       });
 
       it('orders guidance collaborators and remembers the outbound id', async () => {
@@ -1415,24 +1419,21 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
 
       test.each([
-        [{ kind: 'disabled' } as const, 1],
-        [
-          {
-            kind: 'reserved',
-            receipt: { id: 'r-res' },
-          } as unknown as ReceiptIngressDecision,
-          0,
-        ],
+        { kind: 'disabled' } as const,
+        { kind: 'unsupported-media' } as const,
+        { kind: 'no-placed-sale' } as const,
+        { kind: 'sender-active' } as const,
       ])(
-        'markSeen failure after $kind remains terminal',
-        async (decision, sends) => {
+        'guidance marker-write failure after $kind remains terminal',
+        async (decision) => {
           ingress.admit.mockResolvedValueOnce(decision);
           dedup.markSeen.mockRejectedValueOnce(new Error('dedup write failed'));
 
           await expect(
             service.dispatch(mediaEvent('wamid.markseen-fail', 'image')),
           ).resolves.toBeUndefined();
-          expect(sender.sendText as jest.Mock).toHaveBeenCalledTimes(sends);
+          expect(sender.sendText as jest.Mock).toHaveBeenCalledTimes(1);
+          expect(dedup.markSeen).toHaveBeenCalledWith('wamid.markseen-fail');
           expect(llm.run.mock.calls).toHaveLength(0);
           expect(amountRouter.route.mock.calls).toHaveLength(0);
         },
