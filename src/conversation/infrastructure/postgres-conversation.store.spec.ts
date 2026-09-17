@@ -97,11 +97,8 @@ describe('PostgresConversationStore receipt amount pointer SQL', () => {
   });
 });
 
-interface StoreCtor {
-  new (
-    pool: Pool,
-  ): import('./postgres-conversation.store').PostgresConversationStore;
-}
+type StoreCtor =
+  typeof import('./postgres-conversation.store').PostgresConversationStore;
 
 ddescribe('PostgresConversationStore (Testcontainers)', () => {
   jest.setTimeout(60_000);
@@ -111,8 +108,9 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
   let Store: StoreCtor;
 
   beforeAll(async () => {
-    const require = createRequire(__filename);
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+    const require = createRequire(__filename) as (
+      moduleName: string,
+    ) => typeof import('./postgres-conversation.store');
     Store = require('./postgres-conversation.store').PostgresConversationStore;
 
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
@@ -139,7 +137,6 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
     delete process.env.DATABASE_URL;
   });
 
-  // eslint-disable-next-line @typescript-eslint/require-await
   runConversationStoreContract('PostgresConversationStore', async () => ({
     store: new Store(pool),
     cleanup: async () => {

@@ -91,6 +91,9 @@ describe('WebhookController', () => {
     let app: INestApplication;
     let dispatchSpy: jest.MockedFunction<WebhookDispatcherService['dispatch']>;
 
+    const requestServer = (): Parameters<typeof request>[0] =>
+      app.getHttpServer() as Parameters<typeof request>[0];
+
     beforeEach(async () => {
       dispatchSpy = jest.fn().mockResolvedValue(undefined);
 
@@ -120,7 +123,7 @@ describe('WebhookController', () => {
     });
 
     it('returns the challenge via GET /webhook when the token is valid', async () => {
-      await request(app.getHttpServer())
+      await request(requestServer())
         .get(
           '/webhook?hub.mode=subscribe&hub.verify_token=verify-token&hub.challenge=test',
         )
@@ -129,7 +132,7 @@ describe('WebhookController', () => {
     });
 
     it('returns 403 via GET /webhook when the token is wrong', async () => {
-      await request(app.getHttpServer())
+      await request(requestServer())
         .get(
           '/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=test',
         )
@@ -161,7 +164,7 @@ describe('WebhookController', () => {
       });
       const signature = `sha256=${crypto.createHmac('sha256', appSecret).update(body).digest('hex')}`;
 
-      await request(app.getHttpServer())
+      await request(requestServer())
         .post('/webhook')
         .set('content-type', 'application/json')
         .set('x-hub-signature-256', signature)
@@ -184,7 +187,7 @@ describe('WebhookController', () => {
 }`;
 
     const postSigned = (body: string) =>
-      request(app.getHttpServer())
+      request(requestServer())
         .post('/webhook')
         .set('content-type', 'application/json')
         .set('x-hub-signature-256', sign(body));

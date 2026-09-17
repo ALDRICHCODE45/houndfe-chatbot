@@ -45,7 +45,7 @@ describe('CostGuardService', () => {
 
     guard.record({ promptTokens: 210, completionTokens: 0 }); // 81%
     expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0]![0]).toMatch(/>=80%/);
+    expect(warnSpy).toHaveBeenLastCalledWith(expect.stringMatching(/>=80%/));
   });
 
   it('does NOT re-emit the >=80% warn on subsequent turns above 80%', () => {
@@ -64,7 +64,7 @@ describe('CostGuardService', () => {
     guard.record({ promptTokens: 200, completionTokens: 0 }); // 101% → 100% warn
 
     expect(warnSpy).toHaveBeenCalledTimes(2);
-    expect(warnSpy.mock.calls[1]![0]).toMatch(/>=100%/);
+    expect(warnSpy).toHaveBeenLastCalledWith(expect.stringMatching(/>=100%/));
   });
 
   it('does NOT throw when the ceiling is exceeded (soft-only contract)', () => {

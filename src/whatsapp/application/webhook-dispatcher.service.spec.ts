@@ -8,10 +8,7 @@ import {
   type ConversationState,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import {
-  type LlmAgentPort,
-  type LlmRunResult,
-} from '../../llm-agent/domain/llm-agent.port';
+import { type LlmAgentPort } from '../../llm-agent/domain/llm-agent.port';
 import { type ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import { SendResult, WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import type { WebhookDedupStore } from '../domain/webhook-dedup.store';
@@ -28,10 +25,20 @@ import {
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
 import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import type {
+  ReceiptMediaOutboxRow,
+  ReceiptMediaRow,
+} from '../../receipt-media/domain/receipt-media.types';
 import {
   type ReceiptIngressDecision,
   type ReceiptIngressService,
 } from '../../receipt-media/application/receipt-ingress.service';
+
+const receiptMediaRowFixture = (id: string): ReceiptMediaRow =>
+  ({ id }) as unknown as ReceiptMediaRow;
+
+const receiptMediaOutboxRowFixture = (id: string): ReceiptMediaOutboxRow =>
+  ({ id }) as unknown as ReceiptMediaOutboxRow;
 
 /**
  * Spec rewrite: the dispatcher MUST replace the echo path with
@@ -138,9 +145,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     amountRouter = {
       route: jest.fn().mockResolvedValue({ kind: 'fenced' }),
     } as unknown as jest.Mocked<ReceiptAmountRouterService>;
-
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars --
-    // humanHandoff is deliberately a partial mock (Pick<>) per existing spec pattern
 
     // WU13-B2: ReceiptIngressService mock. Default reserved with a minimal
     // receipt fixture — the only valid closed terminal decision that carries
@@ -624,12 +628,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       // The synthetic turn runs through the runner as a CUSTOMER turn
       // (NOT the ops phone).
       expect(llm.run).toHaveBeenCalledTimes(1);
-      expect(llm.run).toHaveBeenCalledWith(
-        expect.objectContaining({
-          senderId: CUSTOMER,
-          text: expect.stringContaining('HF-abc123def456'),
-        }),
-      );
+      const [syntheticTurn] = llm.run.mock.calls[0];
+      expect(syntheticTurn.senderId).toBe(CUSTOMER);
+      expect(syntheticTurn.text).toContain('HF-abc123def456');
       // The assistant reply goes to the CUSTOMER, never to ops.
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
@@ -985,8 +986,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('proposed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'proposed',
-        receipt: { id: 'r1' } as any,
-        intent: { id: 'i1' } as any,
+        receipt: receiptMediaRowFixture('r1'),
+        intent: receiptMediaOutboxRowFixture('i1'),
       });
       await service.dispatch(textEvent('wamid.proposed', '500 pesos'));
       expect(llm.run).not.toHaveBeenCalled();
@@ -997,8 +998,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('started: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'started',
-        receipt: { id: 'r2' } as any,
-        intent: { id: 'i2' } as any,
+        receipt: receiptMediaRowFixture('r2'),
+        intent: receiptMediaOutboxRowFixture('i2'),
       });
       await service.dispatch(textEvent('wamid.started', 'si'));
       expect(llm.run).not.toHaveBeenCalled();
@@ -1009,8 +1010,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('rejected: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'rejected',
-        receipt: { id: 'r3' } as any,
-        intent: { id: 'i3' } as any,
+        receipt: receiptMediaRowFixture('r3'),
+        intent: receiptMediaOutboxRowFixture('i3'),
       });
       await service.dispatch(textEvent('wamid.rejected', 'no'));
       expect(llm.run).not.toHaveBeenCalled();
@@ -1021,8 +1022,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('cancelled: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'cancelled',
-        receipt: { id: 'r4' } as any,
-        intent: { id: 'i4' } as any,
+        receipt: receiptMediaRowFixture('r4'),
+        intent: receiptMediaOutboxRowFixture('i4'),
       });
       await service.dispatch(textEvent('wamid.cancelled', 'cancelar'));
       expect(llm.run).not.toHaveBeenCalled();
@@ -1033,8 +1034,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('replayed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'replayed',
-        receipt: { id: 'r5' } as any,
-        intent: { id: 'i5' } as any,
+        receipt: receiptMediaRowFixture('r5'),
+        intent: receiptMediaOutboxRowFixture('i5'),
       });
       await service.dispatch(textEvent('wamid.replayed', '500 pesos'));
       expect(llm.run).not.toHaveBeenCalled();
@@ -1045,8 +1046,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('terminal outcome with markSeen failure does not throw', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'proposed',
-        receipt: { id: 'r6' } as any,
-        intent: { id: 'i6' } as any,
+        receipt: receiptMediaRowFixture('r6'),
+        intent: receiptMediaOutboxRowFixture('i6'),
       });
       dedup.markSeen.mockRejectedValue(new Error('dedup write failed'));
       await expect(
@@ -1196,9 +1197,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         let captured:
           | Parameters<jest.Mocked<ReceiptIngressService>['admit']>[0]
           | undefined;
-        (ingress.admit as jest.Mock).mockImplementationOnce(async (input) => {
+        ingress.admit.mockImplementationOnce(async (input) => {
           captured = input;
-          return { kind: 'reserved', receipt: { id: 'r-admit' } };
+          return {
+            kind: 'reserved',
+            receipt: receiptMediaRowFixture('r-admit'),
+          };
         });
         await service.dispatch(
           mediaEvent('wamid.strict', 'image', {

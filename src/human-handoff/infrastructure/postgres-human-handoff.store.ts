@@ -19,7 +19,7 @@ interface HumanHandoffRow {
   kind: string;
   digest: unknown;
   status: string;
-  resolution: unknown | null;
+  resolution: unknown;
   created_at: Date;
   resolved_at: Date | null;
 }

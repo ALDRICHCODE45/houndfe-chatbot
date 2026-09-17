@@ -25,11 +25,8 @@ import {
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 
-interface StoreCtor {
-  new (
-    pool: Pool,
-  ): import('./postgres-human-handoff.store').PostgresHumanHandoffStore;
-}
+type StoreCtor =
+  typeof import('./postgres-human-handoff.store').PostgresHumanHandoffStore;
 
 ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
   jest.setTimeout(60_000);
@@ -40,7 +37,9 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
   let store: import('./postgres-human-handoff.store').PostgresHumanHandoffStore;
 
   beforeAll(async () => {
-    const require = createRequire(__filename);
+    const require = createRequire(__filename) as (
+      moduleName: string,
+    ) => typeof import('./postgres-human-handoff.store');
     Store = require('./postgres-human-handoff.store').PostgresHumanHandoffStore;
 
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
@@ -74,7 +73,12 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'CUST',
       agentId: 'OPS',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'X', quantity: 1 },
+      digest: {
+        kind: 'out_of_stock',
+        productId: 'p1',
+        name: 'X',
+        quantity: 1,
+      },
     });
     expect(created.id).toBe('abc123def456');
     expect(created.customerId).toBe('CUST');
@@ -92,7 +96,7 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'CUST',
       agentId: 'OPS',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'X' },
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'X' },
     });
     const row = await store.findById('abc123def456');
     expect(row).not.toBeNull();
@@ -106,7 +110,7 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'CUST',
       agentId: 'OPS',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'X' },
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'X' },
     });
     const row = await store.findByRef('HF-abc123def456');
     expect(row).not.toBeNull();
@@ -119,7 +123,7 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'CUST',
       agentId: 'OPS',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'X' },
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'X' },
     });
     const row = await store.findByRef('hf-abc123def456');
     expect(row).not.toBeNull();
@@ -137,7 +141,7 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'C1',
       agentId: 'OPS-2',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'A' },
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'A' },
     });
     await new Promise((r) => setTimeout(r, 5));
     await store.create({
@@ -145,7 +149,12 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'C2',
       agentId: 'OPS-2',
       kind: 'expiration_date',
-      digest: { productId: 'p2', name: 'B', question: 'q' },
+      digest: {
+        kind: 'expiration_date',
+        productId: 'p2',
+        name: 'B',
+        question: 'q',
+      },
     });
     const row = await store.findLatestPendingForAgent('OPS-2');
     expect(row).not.toBeNull();
@@ -163,7 +172,7 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'CUST',
       agentId: 'OPS',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'X' },
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'X' },
     });
     const row = await store.resolve('abc123def456', {
       decision: 'YES_RESTOCK_IN_X_DAYS',
@@ -191,7 +200,7 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       customerId: 'CUST',
       agentId: 'OPS',
       kind: 'out_of_stock',
-      digest: { productId: 'p1', name: 'X' },
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'X' },
     });
     await store.resolve('abc123def456', { decision: 'NO_RESTOCK' });
     const row = await store.findLatestPendingForAgent('OPS');

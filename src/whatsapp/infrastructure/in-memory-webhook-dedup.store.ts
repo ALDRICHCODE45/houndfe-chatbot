@@ -10,11 +10,12 @@ import { WebhookDedupStore } from '../domain/webhook-dedup.store';
 export class InMemoryWebhookDedupStore implements WebhookDedupStore {
   private readonly seen = new Set<string>();
 
-  async isDuplicate(messageId: string): Promise<boolean> {
-    return this.seen.has(messageId);
+  isDuplicate(messageId: string): Promise<boolean> {
+    return Promise.resolve(this.seen.has(messageId));
   }
 
-  async markSeen(messageId: string): Promise<void> {
+  markSeen(messageId: string): Promise<void> {
     this.seen.add(messageId);
+    return Promise.resolve();
   }
 }

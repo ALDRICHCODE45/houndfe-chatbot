@@ -3,7 +3,10 @@ import { AppConfigModule } from '../config/config.module';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { ConversationModule } from './conversation.module';
-import { CONVERSATION_STORE } from './domain/conversation-store';
+import {
+  CONVERSATION_STORE,
+  type ConversationStore,
+} from './domain/conversation-store';
 import { PostgresConversationStore } from './infrastructure/postgres-conversation.store';
 
 /**
@@ -77,7 +80,7 @@ describe('ConversationModule binding', () => {
       })
       .compile();
 
-    const store = moduleRef.get(CONVERSATION_STORE);
+    const store = moduleRef.get<ConversationStore>(CONVERSATION_STORE);
     expect(store).toBeInstanceOf(PostgresConversationStore);
 
     await moduleRef.close();

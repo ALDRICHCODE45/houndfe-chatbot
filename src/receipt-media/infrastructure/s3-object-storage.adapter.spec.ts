@@ -803,7 +803,7 @@ describe('WU5B1a2 S3 adapter getStream', () => {
 
   it('maps a failed abort-listener registration to REQUEST_INVALID before any send', async () => {
     const original =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; restored in finally
+      // Intentional detach; restored in finally.
       EventTarget.prototype.addEventListener;
     let settle: (value: unknown) => void = () => undefined;
     const outcome = new Promise<unknown>((resolve) => {
@@ -1036,7 +1036,7 @@ describe('WU5B1b S3 adapter head', () => {
 
   it('maps a failed abort-listener registration to REQUEST_INVALID before any send', async () => {
     const original =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; restored in finally
+      // Intentional detach; restored in finally.
       EventTarget.prototype.addEventListener;
     let settle: (value: unknown) => void = () => undefined;
     const outcome = new Promise<unknown>((resolve) => {
@@ -1072,7 +1072,7 @@ describe('WU5B1b S3 adapter head', () => {
     });
     expect(e.cause).toBeUndefined();
     expect(listenerCount(input.abortSignal)).toBe(0);
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional read proving the patched seam was restored in the finally block
+    // Intentional read proving the patched seam was restored in the finally block.
     expect(EventTarget.prototype.addEventListener).toBe(original);
   });
 
@@ -1324,7 +1324,7 @@ describe('WU5B2 S3 adapter deleteTechnicalObject', () => {
 
   it('maps a failed abort-listener registration to REQUEST_INVALID before any send', async () => {
     const original =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach; restored in finally
+      // Intentional detach; restored in finally.
       EventTarget.prototype.addEventListener;
     let settle: (value: unknown) => void = () => undefined;
     const outcome = new Promise<unknown>((resolve) => {

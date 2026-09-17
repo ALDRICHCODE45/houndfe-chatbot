@@ -1026,9 +1026,23 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         );
 
       it('transitions only through the fenced status CAS', async () => {
-        await insert(claimRow('STORED'));
-        const claimed = await claim();
-        const f = { id: claimed.id };
+        // Seed a STORED row with an explicit valid w1 lease/version directly —
+        // STORED is excluded from automatic claim eligibility (ST-1), so we
+        // bypass claim() and insert the lease fixture as if w1 obtained it
+        // through an authorized reconciliation path.
+        const storedId = claimRow('STORED').id as string;
+        await insert(
+          lifeRow('STORED', null, {
+            id: storedId,
+            webhook_message_id: 'wamid.stored-cas',
+            provider_media_id: 'media.stored-cas',
+            object_key: `receipts/${storedId}`,
+            version: '1',
+            lease_owner: 'w1',
+            lease_expires_at: FUTURE,
+          }),
+        );
+        const f = { id: storedId };
         const losers = [
           { owner: 'w0' },
           { expectedStatus: 'RESERVED' },
@@ -1038,23 +1052,31 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           expect(await store.transitionStatus(cas({ ...f, ...over }))).toBe(
             false,
           );
-          expect(await state(claimed.id)).toMatchObject({ status: 'STORED' });
-          expect((await state(claimed.id)).version).toBe('1');
+          expect(await state(storedId)).toMatchObject({ status: 'STORED' });
+          expect((await state(storedId)).version).toBe('1');
         }
-        await expire(claimed.id);
-        expect(await store.transitionStatus(cas(f))).toBe(false);
-        expect((await claim('w2')).id).toBe(claimed.id);
-        expect(await store.transitionStatus(cas(f))).toBe(false);
-        expect(await state(claimed.id)).toMatchObject({
+        // Expire the w1 lease and authorize w2 as the new owner via SQL:
+        // live lease + version bump, exactly as a reconciliation worker does.
+        await expire(storedId);
+        await pool.query(
+          "UPDATE receipt_media SET lease_owner = 'w2', lease_expires_at = $2, version = '2' WHERE id = $1",
+          [storedId, FUTURE],
+        );
+        expect(await store.transitionStatus(cas(f))).toBe(false); // stale w1 fence
+        // STORED remains excluded from claim_batch; w2 holds it via SQL.
+        expect(await claim('w2')).toBeUndefined();
+        expect(await store.transitionStatus(cas(f))).toBe(false); // stale w1 fence again
+        expect(await state(storedId)).toMatchObject({
           status: 'STORED',
           version: '2',
         });
+        // w2's fence succeeds with the correct owner and expectedVersion.
         expect(
           await store.transitionStatus(
             cas({ ...f, owner: 'w2', expectedVersion: '2' }),
           ),
         ).toBe(true);
-        expect(await state(claimed.id)).toMatchObject({
+        expect(await state(storedId)).toMatchObject({
           status: 'AWAITING_AMOUNT',
           version: '3',
         });
@@ -1076,7 +1098,10 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           expect(await start(counter, f)).toBeNull();
           expect((await claim('w2')).id).toBe(claimed.id);
           expect(await start(counter, f)).toBeNull();
-          await insert(claimRow(counter === 'meta' ? 'STORED' : 'RESERVED'));
+          // ATTACHING is claimable but neither startMetaAttempt nor
+          // startStorageAttempt transitions from it; both return null.
+          // STORED stays excluded from claim_batch.
+          await insert(claimRow('ATTACHING'));
           const staged = await claim('w3');
           expect(await start(counter, fence(staged, 'w3'))).toBeNull();
           expect(await state(claimed.id)).toMatchObject({

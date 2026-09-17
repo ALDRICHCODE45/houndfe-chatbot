@@ -13,5 +13,5 @@ import { z } from 'zod';
 export const getCurrentTime = tool({
   description: 'Return the current server time as an ISO 8601 string.',
   inputSchema: z.object({}),
-  execute: async () => ({ now: new Date().toISOString() }),
+  execute: () => Promise.resolve({ now: new Date().toISOString() }),
 });

@@ -5,6 +5,18 @@ import {
 } from '../../../human-handoff/application/human-handoff.service';
 import { makeRequestHumanAssistanceTool } from './request-human-assistance.tool';
 
+type SafeParseSchema = {
+  safeParse(input: unknown): { success: boolean };
+};
+
+type SchemaToolView = {
+  inputSchema: SafeParseSchema;
+  contextSchema?: SafeParseSchema;
+};
+
+const schemaToolView = (tool: object): SchemaToolView =>
+  tool as unknown as SchemaToolView;
+
 /**
  * Contract tests for the 12th sale-flow tool `requestHumanAssistance`.
  *
@@ -98,8 +110,9 @@ describe('makeRequestHumanAssistanceTool', () => {
       humanHandoffService: svc,
     };
     const tool = makeRequestHumanAssistanceTool(deps);
+    const schemas = schemaToolView(tool);
 
-    const r = tool.inputSchema.safeParse({
+    const r = schemas.inputSchema.safeParse({
       kind: 'out_of_stock',
       digest: { productId: 'not-a-uuid', name: 'X' },
     });
@@ -115,8 +128,9 @@ describe('makeRequestHumanAssistanceTool', () => {
       humanHandoffService: svc,
     };
     const tool = makeRequestHumanAssistanceTool(deps);
+    const schemas = schemaToolView(tool);
 
-    const r = tool.inputSchema.safeParse({
+    const r = schemas.inputSchema.safeParse({
       kind: 'shipping_approval',
       digest: { productId: 'p', name: 'X' },
     });
@@ -184,8 +198,9 @@ describe('makeRequestHumanAssistanceTool', () => {
       humanHandoffService: svc,
     };
     const tool = makeRequestHumanAssistanceTool(deps);
+    const schemas = schemaToolView(tool);
 
-    const r = tool.inputSchema.safeParse({
+    const r = schemas.inputSchema.safeParse({
       kind: 'expiration_date',
       digest: {
         productId: '00000000-0000-4000-8000-000000000001',
@@ -205,8 +220,9 @@ describe('makeRequestHumanAssistanceTool', () => {
       humanHandoffService: svc,
     };
     const tool = makeRequestHumanAssistanceTool(deps);
-    expect(tool.contextSchema).toBeDefined();
-    const r = tool.contextSchema!.safeParse({ senderId: '5215550001111' });
+    const schemas = schemaToolView(tool);
+    expect(schemas.contextSchema).toBeDefined();
+    const r = schemas.contextSchema!.safeParse({ senderId: '5215550001111' });
     expect(r.success).toBe(true);
   });
 });

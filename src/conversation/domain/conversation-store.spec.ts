@@ -60,7 +60,7 @@ describe('readPendingHumanRequest', () => {
           ref: 'HF-abc',
           createdAt: '2026-06-23T12:00:00.000Z',
           customerNotifiedAt: '2026-06-23T12:00:00.000Z',
-        },
+        } as unknown as PendingHumanRequest,
       },
     };
     expect(readPendingHumanRequest(state)).toBeNull();
@@ -118,7 +118,7 @@ describe('readPendingHumanRequest', () => {
       ...baseState,
       data: { pendingHumanRequest: validMarker, placedSaleId: 'S-1' },
     };
-    const snapshotBefore = JSON.parse(JSON.stringify(state));
+    const snapshotBefore = structuredClone(state);
     readPendingHumanRequest(state);
     expect(state).toEqual(snapshotBefore);
   });
@@ -128,7 +128,7 @@ describe('readPendingHumanRequest', () => {
       ...baseState,
       data: { placedSaleId: 'S-2' },
     };
-    const snapshotBefore = JSON.parse(JSON.stringify(state));
+    const snapshotBefore = structuredClone(state);
     expect(readPendingHumanRequest(state)).toBeNull();
     expect(state).toEqual(snapshotBefore);
   });

@@ -262,7 +262,7 @@ describe('guardObjectReadSignal', () => {
       listener: () => void,
       options?: { once: boolean },
     ) => void =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- intentional detach of the pristine native add for the seam fixture
+      // Intentional detach of the pristine native add for the seam fixture.
       EventTarget.prototype.addEventListener;
     const c = new AbortController();
     let fired = 0;
@@ -891,7 +891,7 @@ describe('guardObjectReadBody listeners', () => {
 
   it('WU5B1a0a2a3 seam: post-registration add failure unwinds to zero listeners and reports false', () => {
     const original: unknown =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- pristine native detached for the seam fixture
+      // Pristine native detached for the seam fixture.
       Readable.prototype.on;
     const r = new Readable({ read() {} });
     const spy = jest.spyOn(Readable.prototype, 'on') as unknown as jest.Mock;

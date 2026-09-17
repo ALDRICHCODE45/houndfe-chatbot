@@ -32,6 +32,7 @@ describe('AgentRunner', () => {
   const TEN_S_MS = 10 * 1000;
   // Spec uses a 60-second window for the idle boundary scenario.
   const ONE_MIN_MS = 60 * 1000;
+  type ConversationStoreUpdate = Parameters<ConversationStore['update']>[1];
 
   let store: jest.Mocked<ConversationStore>;
   let llm: jest.Mocked<LlmAgentPort>;
@@ -434,7 +435,8 @@ describe('AgentRunner', () => {
       });
 
       expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch] = store.update.mock.calls[0];
+      const [, patch]: [string, ConversationStoreUpdate] =
+        store.update.mock.calls[0];
       expect(patch).toMatchObject({
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: {
@@ -518,18 +520,20 @@ describe('AgentRunner', () => {
       });
 
       expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch] = store.update.mock.calls[0];
+      const [, patch]: [string, ConversationStoreUpdate] =
+        store.update.mock.calls[0];
       // Spread: messages overwrite (from the LLM turn), but the
       // marker is carried forward from the freshly-written state.
       expect(patch).toMatchObject({
-        data: {
-          pendingHumanRequest: marker,
-          messages: expect.arrayContaining([
-            { role: 'user', content: 'hola' },
-            { role: 'assistant', content: 'Bienvenido de vuelta.' },
-          ]),
-        },
+        data: { pendingHumanRequest: marker },
       });
+      const messages = patch.data?.messages ?? [];
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Bienvenido de vuelta.' },
+        ]),
+      );
     });
 
     it('persists the transcript on first contact even when the post-run re-fetch returns null (no tool wrote state during the turn)', async () => {
@@ -562,7 +566,8 @@ describe('AgentRunner', () => {
 
       expect(result.reply).toBe('Hola, ¿en qué te puedo ayudar?');
       expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch] = store.update.mock.calls[0];
+      const [, patch]: [string, ConversationStoreUpdate] =
+        store.update.mock.calls[0];
       expect(patch).toMatchObject({
         data: {
           messages: [

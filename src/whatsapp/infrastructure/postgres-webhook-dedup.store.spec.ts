@@ -20,11 +20,8 @@ import { runWebhookDedupContract } from './webhook-dedup.contract';
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 
-interface StoreCtor {
-  new (
-    pool: Pool,
-  ): import('./postgres-webhook-dedup.store').PostgresWebhookDedupStore;
-}
+type StoreCtor =
+  typeof import('./postgres-webhook-dedup.store').PostgresWebhookDedupStore;
 
 ddescribe('PostgresWebhookDedupStore (Testcontainers)', () => {
   jest.setTimeout(60_000);
@@ -34,7 +31,9 @@ ddescribe('PostgresWebhookDedupStore (Testcontainers)', () => {
   let Store: StoreCtor;
 
   beforeAll(async () => {
-    const require = createRequire(__filename);
+    const require = createRequire(__filename) as (
+      moduleName: string,
+    ) => typeof import('./postgres-webhook-dedup.store');
     Store = require('./postgres-webhook-dedup.store').PostgresWebhookDedupStore;
 
     container = await new PostgreSqlContainer('postgres:16-alpine').start();

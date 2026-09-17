@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/require-await, @typescript-eslint/unbound-method */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 
 import { makeEvaluateCartTool } from './evaluate-cart.tool';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
@@ -8,6 +8,10 @@ import type {
   ConversationState,
 } from '../../../conversation/domain/conversation-store';
 import type { CartEvaluationResult } from '../../../chatbot-api/domain/dtos/pricing.dto';
+
+type SafeParseSchema = {
+  safeParse(input: unknown): { success: boolean };
+};
 
 /**
  * Unit tests for the evaluateCart tool factory.
@@ -33,7 +37,9 @@ describe('makeEvaluateCartTool', () => {
       store: {} as ConversationStore,
     });
     expect(tool.contextSchema).toBeDefined();
-    const r = tool.contextSchema!.safeParse({ senderId: '5215550001111' });
+    const r = (tool.contextSchema as unknown as SafeParseSchema).safeParse({
+      senderId: '5215550001111',
+    });
     expect(r.success).toBe(true);
   });
 
@@ -166,7 +172,9 @@ describe('makeEvaluateCartTool', () => {
       ...baseDeps,
       store: {} as ConversationStore,
     });
-    const r = tool.inputSchema.safeParse({ items: [] });
+    const r = (tool.inputSchema as unknown as SafeParseSchema).safeParse({
+      items: [],
+    });
     expect(r.success).toBe(false);
   });
 
@@ -175,7 +183,7 @@ describe('makeEvaluateCartTool', () => {
       ...baseDeps,
       store: {} as ConversationStore,
     });
-    const r = tool.inputSchema.safeParse({
+    const r = (tool.inputSchema as unknown as SafeParseSchema).safeParse({
       items: [{ productId: 'not-a-uuid', quantity: 1, unitPriceCents: 0 }],
     });
     expect(r.success).toBe(false);
@@ -186,7 +194,7 @@ describe('makeEvaluateCartTool', () => {
       ...baseDeps,
       store: {} as ConversationStore,
     });
-    const r = tool.inputSchema.safeParse({
+    const r = (tool.inputSchema as unknown as SafeParseSchema).safeParse({
       items: [
         {
           productId: '00000000-0000-4000-8000-000000000001',

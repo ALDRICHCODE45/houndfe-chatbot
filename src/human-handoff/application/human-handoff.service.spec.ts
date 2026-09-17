@@ -8,10 +8,7 @@ import type {
   CreateHumanHandoffInput,
   HumanHandoffStore,
 } from '../domain/human-handoff-store.port';
-import type {
-  HumanHandoffRequest,
-  HumanHandoffResolution,
-} from '../domain/human-handoff.types';
+import type { HumanHandoffRequest } from '../domain/human-handoff.types';
 import {
   UNDER_REVIEW_NOTICE,
   PENDING_HUMAN_REQUEST_REPLY,
@@ -299,7 +296,7 @@ describe('HumanHandoffService', () => {
   describe('resolveReply', () => {
     const customerStateFor = (
       customerId: string,
-      marker: unknown = null,
+      marker: ConversationState['data']['pendingHumanRequest'] = null,
     ): ConversationState => ({
       senderId: customerId,
       lastMessageAt: '2026-06-23T12:00:00.000Z',

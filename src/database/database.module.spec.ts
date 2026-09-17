@@ -1,4 +1,4 @@
-import { Test } from '@nestjs/testing';
+import { Test, type TestingModule } from '@nestjs/testing';
 import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
@@ -37,6 +37,7 @@ describe('DatabaseModule unit wiring', () => {
     'OPENAI_API_KEY',
     'LLM_MODEL',
     'OPS_CHANNEL_PHONE',
+    'CHATBOT_API_CASHIER_USER_ID',
   ];
 
   beforeEach(() => {
@@ -81,7 +82,9 @@ describe('DatabaseModule unit wiring', () => {
     const lifecycle = moduleRef.get(PostgresPoolLifecycle);
     expect(lifecycle).toBeInstanceOf(PostgresPoolLifecycle);
 
-    const endSpy = jest.spyOn(pool, 'end').mockResolvedValue(undefined);
+    const endSpy = jest
+      .spyOn(pool, 'end')
+      .mockResolvedValue(undefined as never);
 
     await moduleRef.close();
     // Shutdown runs OnModuleDestroy → pool.end()
@@ -92,9 +95,7 @@ describe('DatabaseModule unit wiring', () => {
 ddescribe('DatabaseModule integration (Testcontainers)', () => {
   jest.setTimeout(60_000);
   let container: StartedPostgreSqlContainer;
-  let moduleRef: Awaited<
-    ReturnType<(typeof Test.createTestingModule)['prototype']['compile']>
-  >;
+  let moduleRef: TestingModule;
   let pool: Pool;
   const savedEnv: Record<string, string | undefined> = {};
 
@@ -109,6 +110,8 @@ ddescribe('DatabaseModule integration (Testcontainers)', () => {
       CHATBOT_API_BRANCH_ID: 'stub-branch',
       OPENAI_API_KEY: 'stub-openai',
       LLM_MODEL: 'anthropic/claude-sonnet-4.5',
+      OPS_CHANNEL_PHONE: '5215500000000',
+      CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
     };
     for (const [key, fallback] of Object.entries(REQUIRED)) {
       savedEnv[key] = process.env[key];
@@ -148,7 +151,7 @@ ddescribe('DatabaseModule integration (Testcontainers)', () => {
     expect(pool).toBeInstanceOf(Pool);
 
     // sanity: a real round-trip query succeeds.
-    const result = await pool.query('SELECT 1 AS one');
+    const result = await pool.query<{ one: number }>('SELECT 1 AS one');
     expect(result.rows[0].one).toBe(1);
 
     // moduleRef.close() in afterAll triggers OnModuleDestroy → pool.end().
