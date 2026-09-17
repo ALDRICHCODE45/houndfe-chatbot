@@ -262,7 +262,8 @@ export interface CapabilityAccessRow {
 }
 
 export interface ReceiptMediaStorePort {
-  reserve(input: ReserveInput): Promise<ReservationOutcome>;
+  /** Atomically commits a receipt reservation and its inbound webhook marker. */
+  admit(input: ReserveInput): Promise<ReservationOutcome>;
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
   /** Atomically persist one amount proposal, successor pointer, and intent. */
   proposeAmount(input: AmountProposalInput): Promise<AmountProposalOutcome>;

@@ -49,7 +49,7 @@ const fixture = (
       : ({ data: { placedSaleId } } as ConversationState);
   const conversations = { getState: jest.fn(() => Promise.resolve(state)) };
   const service = new ReceiptIngressService({ enabled }, conversations, {
-    reserve,
+    admit: reserve,
   });
   return { service, conversations, reserve };
 };
@@ -83,6 +83,29 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
       kind: 'no-placed-sale',
     });
     expect(conversations.getState).toHaveBeenCalledWith(SENDER);
+    expect(reserve).not.toHaveBeenCalled();
+  });
+
+  it('waits for the atomic receipt admission operation rather than the legacy reservation path', async () => {
+    const admission = jest.fn<Promise<ReservationOutcome>, [ReserveInput]>(() =>
+      Promise.resolve(created()),
+    );
+    const reserve = jest.fn<Promise<ReservationOutcome>, [ReserveInput]>(() =>
+      Promise.reject(new Error('legacy reservation path used')),
+    );
+    const state = { data: { placedSaleId: SALE } } as ConversationState;
+    const ingressStore = { admit: admission, reserve };
+    const service = new ReceiptIngressService(
+      { enabled: true },
+      { getState: jest.fn(() => Promise.resolve(state)) },
+      ingressStore,
+    );
+
+    await expect(service.admit(input())).resolves.toEqual({
+      kind: 'reserved',
+      receipt: { id: 'r-1' },
+    });
+    expect(admission).toHaveBeenCalledTimes(1);
     expect(reserve).not.toHaveBeenCalled();
   });
 

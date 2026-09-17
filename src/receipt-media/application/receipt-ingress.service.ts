@@ -1,5 +1,6 @@
-/** WU7 receipt ingress admission service (RM1, WA2): TX1 is reservation-only.
- * Deterministic closed decisions (kill-switch disabled, unsupported media, no
+/** WU7 receipt ingress admission service (RM1, WA2): TX1 delegates one
+ * atomic receipt admission to the durable store. Deterministic closed
+ * decisions (kill-switch disabled, unsupported media, no
  * placed sale) return without touching the store; a supported JPEG/PNG with a
  * captured `placedSaleId` builds an immutable reservation identity, reserves
  * exactly once, and maps the store's resolved outcome exhaustively (the
@@ -35,9 +36,9 @@ export interface ReceiptIngressConversations {
   getState(senderId: string): Promise<ConversationState | null>;
 }
 
-/** Narrow reservation seam over the WU2B store port: reserve only. */
+/** Narrow receipt-admission seam over the store port: one atomic admission. */
 export interface ReceiptIngressStore {
-  reserve(input: ReserveInput): Promise<ReservationOutcome>;
+  admit(input: ReserveInput): Promise<ReservationOutcome>;
 }
 
 /** Normalized media envelope; identity pre-checks are store-owned. */
@@ -48,8 +49,8 @@ export interface ReceiptIngressInput {
   declaredMimeType: string;
 }
 
-/** Closed admission result: the three pre-reservation decisions never create
- * a row; every `ReceiptMediaStorePort.reserve()` outcome maps 1:1, carrying
+/** Closed admission result: the three pre-admission decisions never create
+ * a row; every `ReceiptMediaStorePort.admit()` outcome maps 1:1, carrying
  * the persisted receipt exactly when the store returned one. */
 export type ReceiptIngressDecision =
   | { kind: 'disabled' }
@@ -68,9 +69,10 @@ export class ReceiptIngressService {
     private readonly store: ReceiptIngressStore,
   ) {}
 
-  /** TX1 admission: reservation-only. Unsupported media is gated before the
-   * state read (media type is intrinsic to the message; sale context is
-   * transient); no sale context reserves nothing. */
+  /** TX1 admission: the store atomically persists the reservation and inbound
+   * marker. Unsupported media is gated before the state read (media type is
+   * intrinsic to the message; sale context is transient); no sale context
+   * reserves nothing. */
   async admit(input: ReceiptIngressInput): Promise<ReceiptIngressDecision> {
     if (!this.killSwitch.enabled) return { kind: 'disabled' };
     if (!SUPPORTED_MIME_TYPES.has(input.declaredMimeType))
@@ -79,7 +81,7 @@ export class ReceiptIngressService {
       await this.conversations.getState(input.senderId),
     );
     if (placedSaleId === null) return { kind: 'no-placed-sale' };
-    const reservation = await this.store.reserve({
+    const reservation = await this.store.admit({
       id: randomUUID(),
       webhookMessageId: input.webhookMessageId,
       providerMediaId: input.providerMediaId,

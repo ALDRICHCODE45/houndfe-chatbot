@@ -714,7 +714,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   describe('WU2B1 reservation arbitration and intent dedupe', () => {
     beforeEach(async () => {
       await pool.query(
-        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+        'TRUNCATE processed_webhook_messages, receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
       );
     });
 
@@ -731,22 +731,151 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     const rivalInput = (over: Row = {}): ReserveInput =>
       reserveInput({ id: UUID_B, objectKey: `receipts/${UUID_B}`, ...over });
 
-    it('reserves with declared MIME and replays the exact webhook once', async () => {
-      const first = await store.reserve(
-        reserveInput({ declaredMimeType: 'image/jpeg' }),
-      );
+    const admissionCounts = async (messageId: string) => {
+      const [receipts, markers] = await Promise.all([
+        pool.query<{ n: number }>(
+          'SELECT count(*)::int AS n FROM receipt_media WHERE webhook_message_id = $1',
+          [messageId],
+        ),
+        pool.query<{ n: number }>(
+          'SELECT count(*)::int AS n FROM processed_webhook_messages WHERE message_id = $1',
+          [messageId],
+        ),
+      ]);
+      return { receipts: receipts.rows[0].n, markers: markers.rows[0].n };
+    };
+
+    it('atomically admits one receipt reservation with one inbound marker', async () => {
+      const admission = reserveInput({ declaredMimeType: 'image/jpeg' });
+      const first = await store.admit(admission);
       if (first.kind !== 'created') throw new Error('expected created');
       expect(first.receipt.declaredMimeType).toBe('image/jpeg');
-      const replay = await store.reserve(reserveInput());
+      expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+        receipts: 1,
+        markers: 1,
+      });
+      const replay = await store.admit(reserveInput());
       if (replay.kind !== 'webhook-replayed')
         throw new Error('expected replay');
       expect(replay.receipt.id).toBe(first.receipt.id);
+      expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+        receipts: 1,
+        markers: 1,
+      });
+    });
+
+    it('rolls back both artifacts when receipt persistence fails', async () => {
+      await pool.query(`CREATE FUNCTION receipt_admission_receipt_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'receipt admission receipt failure'; END; $$`);
+      await pool.query(`CREATE TRIGGER receipt_admission_receipt_failure
+        BEFORE INSERT ON receipt_media FOR EACH ROW
+        EXECUTE FUNCTION receipt_admission_receipt_failure()`);
+      const admission = reserveInput({
+        webhookMessageId: 'wamid.rollback.receipt',
+        providerMediaId: 'media.rollback.receipt',
+      });
+      try {
+        await expect(store.admit(admission)).rejects.toThrow(
+          'receipt admission receipt failure',
+        );
+        expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+          receipts: 0,
+          markers: 0,
+        });
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS receipt_admission_receipt_failure ON receipt_media',
+        );
+        await pool.query(
+          'DROP FUNCTION IF EXISTS receipt_admission_receipt_failure()',
+        );
+      }
+    });
+
+    it('rolls back both artifacts when marker persistence fails', async () => {
+      await pool.query(`CREATE FUNCTION receipt_admission_marker_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'receipt admission marker failure'; END; $$`);
+      await pool.query(`CREATE TRIGGER receipt_admission_marker_failure
+        BEFORE INSERT ON processed_webhook_messages FOR EACH ROW
+        EXECUTE FUNCTION receipt_admission_marker_failure()`);
+      const admission = reserveInput({
+        webhookMessageId: 'wamid.rollback.marker',
+        providerMediaId: 'media.rollback.marker',
+      });
+      try {
+        await expect(store.admit(admission)).rejects.toThrow(
+          'receipt admission marker failure',
+        );
+        expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+          receipts: 0,
+          markers: 0,
+        });
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS receipt_admission_marker_failure ON processed_webhook_messages',
+        );
+        await pool.query(
+          'DROP FUNCTION IF EXISTS receipt_admission_marker_failure()',
+        );
+      }
+    });
+
+    it('concurrently converges same-message admissions on one receipt and marker', async () => {
+      const admission = reserveInput();
+      const [left, right] = await Promise.all([
+        store.admit(admission),
+        store.admit(admission),
+      ]);
+      expect([left.kind, right.kind].sort()).toEqual([
+        'created',
+        'webhook-replayed',
+      ]);
+      expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+        receipts: 1,
+        markers: 1,
+      });
+    });
+
+    it('adds a durable marker while replaying a legacy receipt row', async () => {
+      const admission = reserveInput();
+      await pool.query(
+        insertSql(
+          'receipt_media',
+          receiptRow({
+            id: admission.id,
+            webhook_message_id: admission.webhookMessageId,
+            provider_media_id: admission.providerMediaId,
+            sender_id: admission.senderId,
+            captured_sale_id: admission.capturedSaleId,
+            object_key: admission.objectKey,
+          }),
+        ),
+        [
+          admission.id,
+          admission.webhookMessageId,
+          admission.providerMediaId,
+          admission.senderId,
+          admission.capturedSaleId,
+          admission.objectKey,
+          'RESERVED',
+        ],
+      );
+      await expect(store.admit(admission)).resolves.toMatchObject({
+        kind: 'webhook-replayed',
+        receipt: { id: admission.id },
+      });
+      expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+        receipts: 1,
+        markers: 1,
+      });
     });
 
     it('rethrows unrelated constraint violations', async () => {
-      await store.reserve(reserveInput());
+      await store.admit(reserveInput());
       await expect(
-        store.reserve(
+        store.admit(
           rivalInput({
             webhookMessageId: 'wamid.x',
             providerMediaId: 'media.x',
@@ -759,9 +888,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
 
     it('parameter-binds adversarial values without altering SQL structure', async () => {
       const nasty = "wamid'); DROP TABLE receipt_media;--";
-      const out = await store.reserve(
-        reserveInput({ webhookMessageId: nasty }),
-      );
+      const out = await store.admit(reserveInput({ webhookMessageId: nasty }));
       if (out.kind !== 'created') throw new Error('expected created');
       expect(out.receipt.webhookMessageId).toBe(nasty);
     });
@@ -777,8 +904,8 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     ])('concurrently classifies %j', async (over, kind) => {
       const rival = rivalInput(over);
       const [x, y] = await Promise.all([
-        store.reserve(reserveInput()),
-        store.reserve(rival),
+        store.admit(reserveInput()),
+        store.admit(rival),
       ]);
       expect([x.kind, y.kind].sort()).toEqual(['created', kind]);
       const { rows } = await pool.query<{ n: number }>(

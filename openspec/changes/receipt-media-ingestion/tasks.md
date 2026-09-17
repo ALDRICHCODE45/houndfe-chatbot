@@ -1,5 +1,7 @@
 # Implementation Tasks: Receipt Media Ingestion
 
+> **Historical planning ledger — superseded for execution.** This file is preserved unchanged below as SDD/OpenSpec history and reference evidence. All current and future execution status is owned exclusively by `odd/tasks/receipt-media-ingestion-completion.md` under the repository's ODD-only workflow. Do not resume, synchronize, verify, or archive work through this ledger.
+
 Implement in dependency order under strict TDD. Each work unit is one independently reviewable slice: start only after dependencies are green, keep its listed tests with its implementation, record the focused result, and roll back only its listed surface. No task authorizes backend changes, secret inspection, commits, pushes, PRs, or production enablement.
 
 ## Review Workload Forecast

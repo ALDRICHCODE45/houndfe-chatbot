@@ -530,15 +530,26 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     }
   }
 
-  /** Reservation arbitration: pre-check committed state, insert under a
-   * savepoint; on a lost race, roll back only the insert and classify
-   * deterministically from reloaded committed state — never committing an
-   * aborted transaction. Unrelated constraints still throw. */
-  async reserve(input: ReserveInput): Promise<ReservationOutcome> {
+  /** Receipt admission atomically persists the reservation and its inbound
+   * marker. A lost receipt-insert race rolls back only the insert, reloads the
+   * winner, and converges on the existing closed outcome. Legacy receipt rows
+   * remain replay candidates: their marker is backfilled by this transaction.
+   * Unrelated constraints still throw. */
+  async admit(input: ReserveInput): Promise<ReservationOutcome> {
     return this.withTx(async (c) => {
+      const markInboundWebhook = () =>
+        c.query(
+          `INSERT INTO processed_webhook_messages (message_id)
+           VALUES ($1)
+           ON CONFLICT (message_id) DO NOTHING`,
+          [input.webhookMessageId],
+        );
       const hit = await loadHit(c, input);
-      if (hit) return classify(hit, input);
-      await c.query('SAVEPOINT reserve_insert');
+      if (hit) {
+        await markInboundWebhook();
+        return classify(hit, input);
+      }
+      await c.query('SAVEPOINT receipt_admission_insert');
       try {
         const inserted = await c.query<Row>(
           `INSERT INTO receipt_media (id, webhook_message_id, provider_media_id,
@@ -554,11 +565,15 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             input.declaredMimeType ?? null,
           ],
         );
+        await markInboundWebhook();
         return { kind: 'created', receipt: camelize<Media>(inserted.rows[0]) };
       } catch (err) {
-        await c.query('ROLLBACK TO SAVEPOINT reserve_insert');
+        await c.query('ROLLBACK TO SAVEPOINT receipt_admission_insert');
         const winner = await loadHit(c, input);
-        if (winner) return classify(winner, input);
+        if (winner) {
+          await markInboundWebhook();
+          return classify(winner, input);
+        }
         const constraint = (err as { constraint?: string }).constraint;
         if (constraint === 'receipt_media_active_sender_idx')
           return { kind: 'sender-active' };
