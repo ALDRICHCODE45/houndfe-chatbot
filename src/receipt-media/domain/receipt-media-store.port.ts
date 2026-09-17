@@ -176,12 +176,17 @@ export interface AttachCommitUnknownOutcomeInput extends LeaseFenceInput {
   transportCode?: string | null;
 }
 
-/** A replay proves the exact durable successor; every other loser is fenced. */
+/** A replay proves the exact durable successor and its exact row-derived
+ * `RECEIPT_ATTACH_UNKNOWN` intent — safely repairing a legacy successor
+ * that is missing only that deterministic intent under the same
+ * live-lease fence; every other loser is fenced. Every non-fenced outcome
+ * carries the one persisted intent. */
 export type AttachCommitUnknownOutcomeOutcome =
   | {
       kind: 'unknown' | 'replayed';
       version: string;
       receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
     }
   | { kind: 'fenced' };
 
@@ -311,8 +316,13 @@ export interface ReceiptMediaStorePort {
    * exact active ATTACHING row with request-start evidence and the matching
    * attempt identity to ATTACH_OUTCOME_UNKNOWN under the caller's live
    * lease, persisting exactly one safe evidence channel plus
-   * attach_outcome_observed_at and terminal_at; only the exact durable
-   * successor replays; everything else is fenced without mutation. */
+   * attach_outcome_observed_at and terminal_at together with exactly one
+   * row-derived deterministic `RECEIPT_ATTACH_UNKNOWN` intent in the same
+   * transaction; only the exact durable successor replaying the exact
+   * persisted intent is replayed — an otherwise exact legacy successor
+   * missing only that intent is repaired under the same live-lease fence —
+   * and mismatched/foreign intent or rival evidence fences without
+   * replacement. */
   commitAttachUnknownOutcome(
     input: AttachCommitUnknownOutcomeInput,
   ): Promise<AttachCommitUnknownOutcomeOutcome>;

@@ -162,6 +162,14 @@ const ATTACH_UNKNOWN_OUTCOME_SQL = `UPDATE receipt_media
         AND attach_transport_code IS NULL AND attach_outcome_observed_at IS NULL
       RETURNING *`;
 
+/** WU11A3B replay/repair fence: the exact owned, live-leased terminal row
+ * read under `clock_timestamp()` and a row lock, so a lease that expires
+ * or is released while this transaction waits on a concurrent writer can
+ * never authorize a replay or a legacy missing-intent repair. */
+const ATTACH_UNKNOWN_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2
+        AND lease_expires_at > clock_timestamp() FOR UPDATE`;
+
 const MAX_INT32 = 2_147_483_647;
 
 /** WU11A3A proven non-committing outcomes: the safe allowlisted statuses. */
@@ -472,6 +480,37 @@ const attachStartIntentMatches = (
   row.source_webhook_message_id === input.sourceWebhookMessageId &&
   row.recipient_id === input.senderId &&
   row.template_key === 'RECEIPT_IN_PROGRESS' &&
+  isRecord(row.template_args) &&
+  Object.keys(row.template_args).length === 0;
+
+/** Row-derived identity of the single unknown-outcome intent: receipt id,
+ * terminal successor version, and stored webhook message only — never a
+ * caller value, object key, URL, capability, or free text. */
+const attachUnknownIntentKey = (
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+): string =>
+  `receipt-attach-unknown:${receiptId}:${successor}:${webhookMessageId}`;
+
+/** Exact structural ownership proof for the `RECEIPT_ATTACH_UNKNOWN`
+ * intent: the deterministic key plus every row-derived column, with the
+ * single bounded empty-args shape. */
+const attachUnknownIntentMatches = (
+  row: Row | undefined,
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+  senderId: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === receiptId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === webhookMessageId &&
+  row.recipient_id === senderId &&
+  row.template_key === 'RECEIPT_ATTACH_UNKNOWN' &&
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
 
@@ -1394,8 +1433,71 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     }
   }
 
+  /** Owns the single deterministic, row-derived `RECEIPT_ATTACH_UNKNOWN`
+   * intent for the locked terminal receipt. Its identity and every column
+   * come from the durable row — receipt id, terminal successor version,
+   * stored webhook message, and sender — never from the caller. Returns
+   * the durable row when this call persists it or when an existing row is
+   * structurally exact; null when a rival/foreign intent already owns the
+   * deterministic key so the caller rolls back instead of replacing
+   * evidence. */
+  private async ownAttachUnknownIntent(
+    c: PoolClient,
+    receipt: Row,
+  ): Promise<Row | null> {
+    const receiptId = receipt.id as string;
+    const successor = String(receipt.version);
+    const webhookMessageId = receipt.webhook_message_id as string;
+    const senderId = receipt.sender_id as string;
+    const dedupeKey = attachUnknownIntentKey(
+      receiptId,
+      successor,
+      webhookMessageId,
+    );
+    const inserted = await c.query<Row>(
+      `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+         receipt_state_version, source_webhook_message_id, recipient_id,
+         template_key, template_args)
+       VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_ATTACH_UNKNOWN', $7::jsonb)
+       ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+      [
+        randomUUID(),
+        dedupeKey,
+        receiptId,
+        successor,
+        webhookMessageId,
+        senderId,
+        JSON.stringify({}),
+      ],
+    );
+    const owned =
+      inserted.rows[0] ??
+      (
+        await c.query<Row>(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [dedupeKey],
+        )
+      ).rows[0];
+    return attachUnknownIntentMatches(
+      owned,
+      receiptId,
+      successor,
+      webhookMessageId,
+      senderId,
+      dedupeKey,
+    )
+      ? owned
+      : null;
+  }
+
   /** WU11A3B unknown-outcome terminal commit; see
-   * ATTACH_UNKNOWN_OUTCOME_SQL and attachUnknownEvidence. */
+   * ATTACH_UNKNOWN_OUTCOME_SQL and attachUnknownEvidence. The terminal
+   * transition and its single row-derived `RECEIPT_ATTACH_UNKNOWN` intent
+   * commit in one transaction; a foreign/rival intent rolls both back and
+   * fences. An exact replay must prove the exact persisted intent; a legacy
+   * terminal successor missing only that intent is repaired under the same
+   * live-lease fence, while rival terminal evidence or a foreign intent
+   * fences without replacement. */
   async commitAttachUnknownOutcome(
     input: AttachCommitUnknownOutcomeInput,
   ): Promise<AttachCommitUnknownOutcomeOutcome> {
@@ -1415,40 +1517,58 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       evidence === null
     )
       return { kind: 'fenced' };
-    return this.withTx(async (c) => {
-      const updated = await c.query<Row>(ATTACH_UNKNOWN_OUTCOME_SQL, [
-        input.id,
-        input.owner,
-        input.expectedVersion,
-        input.attachAttemptId,
-        evidence[0],
-        evidence[1],
-      ]);
-      if (updated.rowCount === 1) {
-        const receipt = updated.rows[0];
+    try {
+      return await this.withTx(async (c) => {
+        const updated = await c.query<Row>(ATTACH_UNKNOWN_OUTCOME_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          input.attachAttemptId,
+          evidence[0],
+          evidence[1],
+        ]);
+        if (updated.rowCount === 1) {
+          const receipt = updated.rows[0];
+          const intent = await this.ownAttachUnknownIntent(c, receipt);
+          if (!intent) throw FENCED;
+          return {
+            kind: 'unknown',
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
+          };
+        }
+        const current = (
+          await c.query<Row>(ATTACH_UNKNOWN_REPLAY_LOOK_SQL, [
+            input.id,
+            input.owner,
+          ])
+        ).rows[0];
+        if (
+          !(
+            current?.status === 'ATTACH_OUTCOME_UNKNOWN' &&
+            String(current.version) === successor &&
+            current.attach_attempt_id === input.attachAttemptId &&
+            current.attach_http_status === evidence[0] &&
+            current.attach_transport_code === evidence[1] &&
+            current.attach_outcome_observed_at instanceof Date &&
+            current.terminal_at instanceof Date
+          )
+        )
+          return { kind: 'fenced' };
+        const intent = await this.ownAttachUnknownIntent(c, current);
+        if (!intent) throw FENCED;
         return {
-          kind: 'unknown',
-          version: String(receipt.version),
-          receipt: camelize<Media>(receipt),
+          kind: 'replayed',
+          version: successor,
+          receipt: camelize<Media>(current),
+          intent: camelize<ReceiptMediaOutboxRow>(intent),
         };
-      }
-      const current = (
-        await c.query<Row>(ATTACH_SUCCESS_LOOK_SQL, [input.id, input.owner])
-      ).rows[0];
-      return current?.status === 'ATTACH_OUTCOME_UNKNOWN' &&
-        String(current.version) === successor &&
-        current.attach_attempt_id === input.attachAttemptId &&
-        current.attach_http_status === evidence[0] &&
-        current.attach_transport_code === evidence[1] &&
-        current.attach_outcome_observed_at instanceof Date &&
-        current.terminal_at instanceof Date
-        ? {
-            kind: 'replayed',
-            version: successor,
-            receipt: camelize<Media>(current),
-          }
-        : { kind: 'fenced' };
-    });
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      throw err;
+    }
   }
 
   /** WU2B2A leased claims (RM1, RM3): short CTE transaction with FOR UPDATE

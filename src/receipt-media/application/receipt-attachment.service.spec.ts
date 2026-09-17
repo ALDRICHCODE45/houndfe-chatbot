@@ -1,7 +1,10 @@
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import type { AttachReceiptResponse } from '../../chatbot-api/domain/dtos/sales.dto';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
-import type { ReceiptMediaRow } from '../../receipt-media/domain/receipt-media.types';
+import type {
+  ReceiptMediaOutboxRow,
+  ReceiptMediaRow,
+} from '../../receipt-media/domain/receipt-media.types';
 import type {
   AttachRequestStartOutcome,
   ReceiptMediaStorePort,
@@ -13,6 +16,7 @@ const BASE_URL = 'https://media.example.com';
 const OBJECT_KEY = 'receipts/33333333-3333-4333-8333-333333333333';
 const SALE_ID = '22222222-2222-4222-8222-222222222222';
 const RECEIPT_ID = '11111111-1111-4111-8111-111111111111';
+const DURABLE_ATTEMPT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const UUID_PATTERN = /^[0-9a-f-]{36}$/;
 const TRANSPORT_UNKNOWN = {
   httpStatus: null,
@@ -21,9 +25,29 @@ const TRANSPORT_UNKNOWN = {
 
 type AttachableReceipt = ReceiptMediaRow & { declaredAmountCents: number };
 
+const FAKE_INTENT: ReceiptMediaOutboxRow = {
+  id: 'intent-1',
+  dedupeKey: `receipt-attach-unknown:${RECEIPT_ID}:9:durable-wamid`,
+  receiptMediaId: RECEIPT_ID,
+  receiptStateVersion: '9',
+  sourceWebhookMessageId: 'durable-wamid',
+  recipientId: 'durable-sender',
+  templateKey: 'RECEIPT_ATTACH_UNKNOWN',
+  templateArgs: {},
+  status: 'PENDING',
+  attempts: 0,
+  nextAttemptAt: new Date(0),
+  leaseOwner: null,
+  leaseExpiresAt: null,
+  providerMessageId: null,
+  createdAt: new Date(0),
+  updatedAt: new Date(0),
+  sentAt: null,
+};
+
 const FENCED_START: AttachRequestStartOutcome = { kind: 'fenced' };
 // prettier-ignore
-const CRASHED_START: AttachRequestStartOutcome = { kind: 'crashed-before-post', attachAttemptId: 'durable-attempt', version: '7', receipt: makeReceipt() };
+const CRASHED_START: AttachRequestStartOutcome = { kind: 'crashed-before-post', attachAttemptId: DURABLE_ATTEMPT_ID, version: '8', receipt: makeReceipt({ version: '8' }) };
 
 // prettier-ignore
 function makeReceipt(
@@ -79,7 +103,7 @@ describe('ReceiptAttachmentService (WU11C)', () => {
       store.commitAttachDefiniteFailure.mockResolvedValue({ kind: 'failed', version: '9', receipt });
     } else {
       // prettier-ignore
-      store.commitAttachUnknownOutcome.mockResolvedValue({ kind: 'unknown', version: '9', receipt });
+      store.commitAttachUnknownOutcome.mockResolvedValue({ kind: 'unknown', version: '9', receipt, intent: FAKE_INTENT });
     }
     return receipt;
   }
@@ -120,21 +144,60 @@ describe('ReceiptAttachmentService (WU11C)', () => {
     expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
   });
 
-  it.each([FENCED_START, CRASHED_START])(
-    'start outcome $kind is a non-POST result with zero transport calls',
-    async (outcome) => {
-      store.startAttachRequest.mockResolvedValue(outcome);
-      const report = await service.attach({
-        receipt: makeReceipt(),
-        owner: OWNER,
-      });
-      expect(report).toEqual({ kind: 'skipped', reason: outcome.kind });
-      expect(client.attachReceipt).not.toHaveBeenCalled();
-      expect(store.commitAttachSuccess).not.toHaveBeenCalled();
-      expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
-      expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
-    },
-  );
+  it('a fenced start is a non-POST skip with zero transport or terminal calls', async () => {
+    store.startAttachRequest.mockResolvedValue(FENCED_START);
+    const report = await service.attach({
+      receipt: makeReceipt(),
+      owner: OWNER,
+    });
+    expect(report).toEqual({ kind: 'skipped', reason: 'fenced' });
+    expect(client.attachReceipt).not.toHaveBeenCalled();
+    expect(store.commitAttachSuccess).not.toHaveBeenCalled();
+    expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
+    expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
+  });
+
+  it('fixes a crashed-before-post reclaim forward with zero POSTs to one unknown commit using the durable attempt identity and version', async () => {
+    store.startAttachRequest.mockResolvedValue(CRASHED_START);
+    store.commitAttachUnknownOutcome.mockResolvedValue({
+      kind: 'unknown',
+      version: '9',
+      receipt: makeReceipt({ version: '9' }),
+      intent: FAKE_INTENT,
+    });
+    const report = await service.attach({
+      receipt: makeReceipt(),
+      owner: OWNER,
+    });
+    expect(report).toEqual({
+      kind: 'outcome-unknown',
+      httpStatus: null,
+      transportCode: 'TRANSPORT_FAILURE',
+    });
+    expect(client.attachReceipt).not.toHaveBeenCalled();
+    expect(store.commitAttachUnknownOutcome).toHaveBeenCalledTimes(1);
+    expect(store.commitAttachUnknownOutcome).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '8',
+      attachAttemptId: DURABLE_ATTEMPT_ID,
+      httpStatus: null,
+      transportCode: 'TRANSPORT_FAILURE',
+    });
+    expect(store.commitAttachSuccess).not.toHaveBeenCalled();
+    expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
+  });
+
+  it('a fenced crashed-before-post fix-forward reports fence loss without a POST', async () => {
+    store.startAttachRequest.mockResolvedValue(CRASHED_START);
+    store.commitAttachUnknownOutcome.mockResolvedValue({ kind: 'fenced' });
+    const report = await service.attach({
+      receipt: makeReceipt(),
+      owner: OWNER,
+    });
+    expect(report).toEqual({ kind: 'terminal-fenced' });
+    expect(client.attachReceipt).not.toHaveBeenCalled();
+  });
 
   it.each([400, 401, 403, 404, 409, 422, 429])(
     'HTTP %i commits a definite failure with that status only',

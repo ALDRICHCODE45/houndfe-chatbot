@@ -10,7 +10,7 @@ const TRANSPORT_UNKNOWN = {
 } as const;
 
 export type AttachReport =
-  | { kind: 'skipped'; reason: 'fenced' | 'crashed-before-post' }
+  | { kind: 'skipped'; reason: 'fenced' }
   | { kind: 'attached'; backendReceiptId: string }
   | { kind: 'definite-failure'; httpStatus: number }
   | {
@@ -70,8 +70,24 @@ export class ReceiptAttachmentService {
       ...attempt,
       expectedVersion: receipt.version,
     });
-    if (started.kind !== 'started') {
-      return { kind: 'skipped', reason: started.kind };
+    if (started.kind === 'fenced') {
+      return { kind: 'skipped', reason: 'fenced' };
+    }
+    if (started.kind === 'crashed-before-post') {
+      // Request-start evidence already exists, so a POST would be a second
+      // request. Fix the reclaimed ATTACHING row forward through its single
+      // unknown terminal outcome using the durable attempt identity and
+      // version, never the fresh caller values.
+      const outcome = await this.store.commitAttachUnknownOutcome({
+        id: receipt.id,
+        owner,
+        expectedVersion: started.version,
+        attachAttemptId: started.attachAttemptId,
+        ...TRANSPORT_UNKNOWN,
+      });
+      return outcome.kind === 'fenced'
+        ? { kind: 'terminal-fenced' }
+        : { kind: 'outcome-unknown', ...TRANSPORT_UNKNOWN };
     }
     // The durable locked successor is the only POST source after start.
     if (started.receipt.declaredAmountCents === null) {
