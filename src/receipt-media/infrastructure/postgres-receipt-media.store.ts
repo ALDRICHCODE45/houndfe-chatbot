@@ -118,7 +118,7 @@ const ATTACH_COMMIT_SUCCESS_SQL = `UPDATE receipt_media
              backend_receipt_status = 'PENDING', attached_at = now(),
              version = version + 1, updated_at = now()
            WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
-             AND lease_expires_at > now() AND status = 'ATTACHING'
+             AND lease_expires_at > clock_timestamp() AND status = 'ATTACHING'
              AND attach_attempts = 1 AND attach_attempt_id = $4
              AND attach_request_started_at IS NOT NULL
              AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
@@ -167,6 +167,15 @@ const ATTACH_UNKNOWN_OUTCOME_SQL = `UPDATE receipt_media
  * or is released while this transaction waits on a concurrent writer can
  * never authorize a replay or a legacy missing-intent repair. */
 const ATTACH_UNKNOWN_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2
+        AND lease_expires_at > clock_timestamp() FOR UPDATE`;
+
+/** ODD-2B1 success replay/repair fence: the exact owned, live-leased
+ * terminal successor read under `clock_timestamp()` and a row lock, so a
+ * lease that expires or is released while this transaction waits on a
+ * concurrent writer can never authorize a replay or a legacy
+ * missing-intent repair. */
+const ATTACH_SUCCESS_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
       WHERE id = $1 AND lease_owner = $2
         AND lease_expires_at > clock_timestamp() FOR UPDATE`;
 
@@ -513,6 +522,38 @@ const attachUnknownIntentMatches = (
   row.template_key === 'RECEIPT_ATTACH_UNKNOWN' &&
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
+
+/** Row-derived identity of the single attached-pending intent: receipt id,
+ * ATTACHED successor version, and stored webhook message only — never a
+ * caller value, object key, URL, capability, or free text. */
+const attachSuccessIntentKey = (
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+): string =>
+  `receipt-attached-pending:${receiptId}:${successor}:${webhookMessageId}`;
+
+/** Exact structural ownership proof for the `RECEIPT_ATTACHED_PENDING`
+ * intent: the deterministic key plus every row-derived column, with the
+ * single bounded `{ backendStatus: 'PENDING' }` args shape. */
+const attachSuccessIntentMatches = (
+  row: Row | undefined,
+  receiptId: string,
+  successor: string,
+  webhookMessageId: string,
+  senderId: string,
+  dedupeKey: string,
+): row is Row =>
+  !!row &&
+  row.dedupe_key === dedupeKey &&
+  row.receipt_media_id === receiptId &&
+  row.receipt_state_version === successor &&
+  row.source_webhook_message_id === webhookMessageId &&
+  row.recipient_id === senderId &&
+  row.template_key === 'RECEIPT_ATTACHED_PENDING' &&
+  isRecord(row.template_args) &&
+  Object.keys(row.template_args).length === 1 &&
+  row.template_args.backendStatus === 'PENDING';
 
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
@@ -1304,11 +1345,15 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
    * active ATTACHING row with prior request evidence and the matching
    * durable attach-attempt identity to ATTACHED under the caller's live
    * lease, persisting only backend_receipt_id, the fixed PENDING backend
-   * status, and attached_at. Only the exact durable successor with the
-   * same attempt identity, backend evidence, and successor version replays
-   * (the original stale fence replays too: the same command retried after
-   * a crash-after-commit resolves against the same successor); every other
-   * caller is fenced without mutation. Lease fields are retained per the
+   * status, and attached_at together with exactly one row-derived
+   * deterministic `RECEIPT_ATTACHED_PENDING` intent in the same transaction
+   * (ODD-2B1). Only the exact durable successor replaying the exact
+   * persisted intent replays (the original stale fence replays too: the
+   * same command retried after a crash-after-commit resolves against the
+   * same successor); an otherwise exact legacy successor missing only that
+   * intent is repaired under the same live-lease fence. A rival terminal
+   * successor or a mismatched/foreign intent fences without replacement,
+   * rolling back any terminal write. Lease fields are retained per the
    * established terminal-transition convention; no response body, auth,
    * URL, capability, or diagnostic PII is ever persisted; DB errors
    * propagate. */
@@ -1339,29 +1384,43 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         ]);
         if (updated.rowCount === 1) {
           const receipt = updated.rows[0];
+          const intent = await this.ownAttachSuccessIntent(c, receipt);
+          if (!intent) throw FENCED;
           return {
             kind: 'committed',
             version: String(receipt.version),
             receipt: camelize<Media>(receipt),
+            intent: camelize<ReceiptMediaOutboxRow>(intent),
           };
         }
         const current = (
-          await c.query<Row>(ATTACH_SUCCESS_LOOK_SQL, [input.id, input.owner])
+          await c.query<Row>(ATTACH_SUCCESS_REPLAY_LOOK_SQL, [
+            input.id,
+            input.owner,
+          ])
         ).rows[0];
-        return current?.status === 'ATTACHED' &&
-          String(current.version) === successor &&
-          current.attach_attempt_id === input.attachAttemptId &&
-          current.backend_receipt_id === input.backendReceiptId &&
-          current.backend_receipt_status === 'PENDING' &&
-          current.attached_at instanceof Date
-          ? {
-              kind: 'replayed',
-              version: successor,
-              receipt: camelize<Media>(current),
-            }
-          : { kind: 'fenced' };
+        if (
+          !(
+            current?.status === 'ATTACHED' &&
+            String(current.version) === successor &&
+            current.attach_attempt_id === input.attachAttemptId &&
+            current.backend_receipt_id === input.backendReceiptId &&
+            current.backend_receipt_status === 'PENDING' &&
+            current.attached_at instanceof Date
+          )
+        )
+          return { kind: 'fenced' };
+        const intent = await this.ownAttachSuccessIntent(c, current);
+        if (!intent) throw FENCED;
+        return {
+          kind: 'replayed',
+          version: successor,
+          receipt: camelize<Media>(current),
+          intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
       });
     } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
       if (
         typeof (err as { code?: string }).code === 'string' &&
         (err as { code?: string }).code === '22P02'
@@ -1479,6 +1538,63 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         )
       ).rows[0];
     return attachUnknownIntentMatches(
+      owned,
+      receiptId,
+      successor,
+      webhookMessageId,
+      senderId,
+      dedupeKey,
+    )
+      ? owned
+      : null;
+  }
+
+  /** Owns the single deterministic, row-derived `RECEIPT_ATTACHED_PENDING`
+   * intent for the locked terminal receipt. Its identity and every column
+   * come from the durable row — receipt id, ATTACHED successor version,
+   * stored webhook message, stored sender, and the fixed `PENDING` backend
+   * status — never from the caller. Returns the durable row when this call
+   * persists it or when an existing row is structurally exact; null when a
+   * rival/foreign intent already owns the deterministic key so the caller
+   * rolls back instead of replacing evidence. */
+  private async ownAttachSuccessIntent(
+    c: PoolClient,
+    receipt: Row,
+  ): Promise<Row | null> {
+    const receiptId = receipt.id as string;
+    const successor = String(receipt.version);
+    const webhookMessageId = receipt.webhook_message_id as string;
+    const senderId = receipt.sender_id as string;
+    const dedupeKey = attachSuccessIntentKey(
+      receiptId,
+      successor,
+      webhookMessageId,
+    );
+    const inserted = await c.query<Row>(
+      `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+         receipt_state_version, source_webhook_message_id, recipient_id,
+         template_key, template_args)
+       VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_ATTACHED_PENDING', $7::jsonb)
+       ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+      [
+        randomUUID(),
+        dedupeKey,
+        receiptId,
+        successor,
+        webhookMessageId,
+        senderId,
+        JSON.stringify({ backendStatus: 'PENDING' }),
+      ],
+    );
+    const owned =
+      inserted.rows[0] ??
+      (
+        await c.query<Row>(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [dedupeKey],
+        )
+      ).rows[0];
+    return attachSuccessIntentMatches(
       owned,
       receiptId,
       successor,

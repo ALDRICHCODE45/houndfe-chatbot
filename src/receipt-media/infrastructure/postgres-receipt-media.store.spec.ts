@@ -4677,6 +4677,436 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     });
   });
 
+  describe('ODD-2B1 atomic attach success intent ownership', () => {
+    const OWNER = 'worker.attach-success';
+    const REQUEST_ID = UUID_B;
+    const BACKEND_ID = UUID_C;
+    const RIVAL_ID = '33333333-3333-4333-8333-333333333333';
+    const SENDER = 'sender.attach-success';
+    const command = (
+      over: Partial<AttachCommitSuccessInput> = {},
+    ): AttachCommitSuccessInput => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '4',
+      attachAttemptId: REQUEST_ID,
+      backendReceiptId: BACKEND_ID,
+      ...over,
+    });
+    const seed = async (receiptOver: Row = {}) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const receipt = lifeRow('ATTACHING', null, {
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '4',
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        attach_attempts: 1,
+        attach_attempt_id: REQUEST_ID,
+        attach_request_started_at: T0,
+        ...receiptOver,
+      });
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    /** A legacy `ATTACHED` successor written before intent ownership: the
+     * exact durable terminal evidence with no `RECEIPT_ATTACHED_PENDING`
+     * intent. */
+    const legacyAttached = (over: Row = {}): Row =>
+      lifeRow('ATTACHED', null, {
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '5',
+        attach_started_at: T0,
+        attach_attempts: 1,
+        attach_attempt_id: REQUEST_ID,
+        attach_request_started_at: T0,
+        backend_receipt_id: BACKEND_ID,
+        backend_receipt_status: 'PENDING',
+        attached_at: T0,
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        ...over,
+      });
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const outboxRows = async () =>
+      (await pool.query<Row>('SELECT * FROM receipt_media_outbox')).rows;
+    const intentKey = (version: string) =>
+      `receipt-attached-pending:${UUID_A}:${version}:wamid.core`;
+    const expectFenced = async (input: AttachCommitSuccessInput) => {
+      const before = await row();
+      await expect(store.commitAttachSuccess(input)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(await row()).toEqual(before);
+    };
+
+    it('owns exactly one row-derived deterministic RECEIPT_ATTACHED_PENDING intent in the same terminal transaction', async () => {
+      await seed();
+      const outcome = await store.commitAttachSuccess(command());
+      expect(outcome).toMatchObject({
+        kind: 'committed',
+        version: '5',
+        receipt: {
+          id: UUID_A,
+          status: 'ATTACHED',
+          version: '5',
+          backendReceiptId: BACKEND_ID,
+          backendReceiptStatus: 'PENDING',
+        },
+        intent: {
+          dedupeKey: intentKey('5'),
+          receiptMediaId: UUID_A,
+          receiptStateVersion: '5',
+          sourceWebhookMessageId: 'wamid.core',
+          recipientId: SENDER,
+          templateKey: 'RECEIPT_ATTACHED_PENDING',
+          templateArgs: { backendStatus: 'PENDING' },
+        },
+      });
+      const intents = await outboxRows();
+      expect(intents).toHaveLength(1);
+      expect(intents[0]).toMatchObject({
+        dedupe_key: intentKey('5'),
+        receipt_media_id: UUID_A,
+        receipt_state_version: '5',
+        source_webhook_message_id: 'wamid.core',
+        recipient_id: SENDER,
+        template_key: 'RECEIPT_ATTACHED_PENDING',
+        template_args: { backendStatus: 'PENDING' },
+      });
+    });
+
+    it('validates the exact persisted intent on replay, repairs a legacy ATTACHED successor missing only its intent, and fences foreign or rival evidence', async () => {
+      await seed();
+      expect((await store.commitAttachSuccess(command())).kind).toBe(
+        'committed',
+      );
+      const successor = await row();
+      const [owned] = await outboxRows();
+      expect(
+        await new PostgresReceiptMediaStore(pool).commitAttachSuccess(
+          command(),
+        ),
+      ).toMatchObject({
+        kind: 'replayed',
+        version: '5',
+        intent: { id: owned.id },
+      });
+      expect(await outboxRows()).toHaveLength(1);
+      expect(await row()).toEqual(successor);
+      // A mismatch in the persisted intent is foreign evidence: fence, never
+      // replace it.
+      await pool.query(
+        "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+      );
+      await expectFenced(command());
+      expect((await outboxRows())[0].recipient_id).toBe('sender.rival');
+      // Rival terminal evidence fences before any intent repair.
+      await seed(legacyAttached({ backend_receipt_id: RIVAL_ID }));
+      await expectFenced(command());
+      expect(await outboxRows()).toHaveLength(0);
+      // A deterministic key publicly owned by a foreign intent fences.
+      await seed(legacyAttached());
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key,
+           source_webhook_message_id, recipient_id, template_key, template_args)
+         VALUES ($1, $2, 'wamid.core', 'sender.rival',
+           'RECEIPT_AMOUNT_PROMPT', '{}'::jsonb)`,
+        [UUID_C, intentKey('5')],
+      );
+      await expectFenced(command());
+      expect(await outboxRows()).toHaveLength(1);
+      expect((await outboxRows())[0]).toMatchObject({
+        recipient_id: 'sender.rival',
+      });
+      // A legacy ATTACHED successor missing only its deterministic intent is
+      // repaired under the exact command and live-lease replay fence.
+      await seed(legacyAttached());
+      const repaired = await store.commitAttachSuccess(command());
+      expect(repaired).toMatchObject({
+        kind: 'replayed',
+        version: '5',
+        intent: {
+          dedupeKey: intentKey('5'),
+          templateKey: 'RECEIPT_ATTACHED_PENDING',
+          templateArgs: { backendStatus: 'PENDING' },
+        },
+      });
+      const repairedRows = await outboxRows();
+      expect(repairedRows).toHaveLength(1);
+      expect(repairedRows[0]).toMatchObject({
+        dedupe_key: intentKey('5'),
+        receipt_media_id: UUID_A,
+        receipt_state_version: '5',
+        source_webhook_message_id: 'wamid.core',
+        recipient_id: SENDER,
+        template_key: 'RECEIPT_ATTACHED_PENDING',
+        template_args: { backendStatus: 'PENDING' },
+      });
+      expect(await store.commitAttachSuccess(command())).toMatchObject({
+        kind: 'replayed',
+        version: '5',
+        intent: { id: repairedRows[0].id },
+      });
+      expect(await outboxRows()).toHaveLength(1);
+      // A dead lease never repairs a legacy terminal successor.
+      await seed(legacyAttached());
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      await expectFenced(command());
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('treats every mismatched persisted intent field as foreign evidence and never replaces it', async () => {
+      const commitThenAlter = async (sql: string) => {
+        await seed();
+        expect((await store.commitAttachSuccess(command())).kind).toBe(
+          'committed',
+        );
+        await pool.query(sql);
+        await expectFenced(command());
+        expect(await outboxRows()).toHaveLength(1);
+      };
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+      );
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET source_webhook_message_id = 'wamid.rival'",
+      );
+      await commitThenAlter(
+        'UPDATE receipt_media_outbox SET receipt_state_version = 4',
+      );
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET template_key = 'RECEIPT_AMOUNT_PROMPT'",
+      );
+      await commitThenAlter(
+        `UPDATE receipt_media_outbox SET template_args = '{"extra":1}'::jsonb`,
+      );
+      await commitThenAlter(
+        `UPDATE receipt_media_outbox SET template_args = '{"backendStatus":"SENT"}'::jsonb`,
+      );
+    });
+
+    it('fences a legacy missing-intent repair whose lock wait outlives the lease', async () => {
+      await seed(
+        legacyAttached({ lease_expires_at: new Date(Date.now() + 250) }),
+      );
+      const before = await row();
+      const locker = await pool.connect();
+      let observedPending: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+          [UUID_A],
+        );
+        const pending = store.commitAttachSuccess(command());
+        observedPending = pending.catch(() => undefined);
+        while (Date.now() < +(before.lease_expires_at as number) + 20)
+          await new Promise((r) => setTimeout(r, 20));
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await row()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observedPending;
+      }
+    });
+
+    it('fences a fresh success commit whose lock wait outlives the lease', async () => {
+      await seed({ lease_expires_at: new Date(Date.now() + 250) });
+      const before = await row();
+      const locker = await pool.connect();
+      let observedPending: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+          [UUID_A],
+        );
+        const pending = store.commitAttachSuccess(command());
+        observedPending = pending.catch(() => undefined);
+        while (Date.now() < +(before.lease_expires_at as number) + 20)
+          await new Promise((r) => setTimeout(r, 20));
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await row()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observedPending;
+      }
+    });
+
+    it('serializes existing-intent validation against a concurrent foreign alteration and never replaces it', async () => {
+      await seed();
+      expect((await store.commitAttachSuccess(command())).kind).toBe(
+        'committed',
+      );
+      const [owned] = await outboxRows();
+      const locker = await pool.connect();
+      let observedPending: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [intentKey('5')],
+        );
+        let settled = false;
+        const pending = (async () => {
+          const outcome = await store.commitAttachSuccess(command());
+          settled = true;
+          return outcome;
+        })();
+        observedPending = pending.catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 150));
+        expect(settled).toBe(false);
+        await locker.query(
+          "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival' WHERE dedupe_key = $1",
+          [intentKey('5')],
+        );
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await outboxRows()).toHaveLength(1);
+        expect((await outboxRows())[0]).toMatchObject({
+          id: owned.id,
+          recipient_id: 'sender.rival',
+        });
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observedPending;
+      }
+    });
+
+    it('fences wrong fences and malformed inputs without durable mutation or intent', async () => {
+      await seed();
+      for (const over of [
+        { owner: 'worker.rival' },
+        { expectedVersion: '3' },
+        { expectedVersion: '5' },
+        { id: UUID_C },
+        { id: 'not-a-uuid' },
+        { attachAttemptId: 'not-a-uuid' },
+        { attachAttemptId: RIVAL_ID },
+        { backendReceiptId: 'not-a-uuid' },
+        { backendReceiptId: '' },
+      ]) {
+        await expectFenced(command(over));
+      }
+      expect(await outboxRows()).toHaveLength(0);
+      await seed({ lease_expires_at: new Date(Date.now() - 60_000) });
+      await expectFenced(command());
+      await seed({
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+      await seed({
+        status: 'AWAITING_CONFIRMATION',
+        attach_started_at: null,
+        attach_attempts: 0,
+        attach_attempt_id: null,
+        attach_request_started_at: null,
+      });
+      await expectFenced(command());
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('serializes duplicate commits to one state and one intent and fences a rival', async () => {
+      await seed();
+      const [a, b] = await Promise.all([
+        store.commitAttachSuccess(command()),
+        store.commitAttachSuccess(command()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['committed', 'replayed']);
+      expect(await row()).toMatchObject({
+        status: 'ATTACHED',
+        version: '5',
+        backend_receipt_id: BACKEND_ID,
+      });
+      const intents = await outboxRows();
+      expect(intents).toHaveLength(1);
+      expect(intents[0]).toMatchObject({
+        dedupe_key: intentKey('5'),
+        template_key: 'RECEIPT_ATTACHED_PENDING',
+        template_args: { backendStatus: 'PENDING' },
+      });
+      await seed();
+      const [c, d] = await Promise.all([
+        store.commitAttachSuccess(command()),
+        store.commitAttachSuccess(command({ backendReceiptId: RIVAL_ID })),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['committed', 'fenced']);
+      expect(await row()).toMatchObject({
+        status: 'ATTACHED',
+        version: '5',
+        backend_receipt_id: BACKEND_ID,
+      });
+      expect(await outboxRows()).toHaveLength(1);
+    });
+
+    it('rolls back both terminal state and its intent when the outbox insert fails', async () => {
+      await seed();
+      const before = await row();
+      await pool.query(`CREATE FUNCTION receipt_attach_success_outbox_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'attach success outbox failure'; END; $$;
+      CREATE TRIGGER receipt_attach_success_outbox_failure
+        BEFORE INSERT ON receipt_media_outbox FOR EACH ROW
+        EXECUTE FUNCTION receipt_attach_success_outbox_failure()`);
+      try {
+        await expect(store.commitAttachSuccess(command())).rejects.toThrow(
+          'attach success outbox failure',
+        );
+        expect(await row()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS
+          receipt_attach_success_outbox_failure ON receipt_media_outbox;
+          DROP FUNCTION IF EXISTS receipt_attach_success_outbox_failure()`);
+      }
+      // A pre-existing foreign intent at the deterministic key also rolls the
+      // fresh ATTACHED transition back instead of replacing that evidence.
+      await seed();
+      const seeded = await row();
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key,
+           source_webhook_message_id, recipient_id, template_key, template_args)
+         VALUES ($1, $2, 'wamid.core', 'sender.rival',
+           'RECEIPT_AMOUNT_PROMPT', '{}'::jsonb)`,
+        [UUID_C, intentKey('5')],
+      );
+      await expectFenced(command());
+      expect(await row()).toEqual(seeded);
+      const [foreign] = await outboxRows();
+      expect(foreign).toMatchObject({
+        dedupe_key: intentKey('5'),
+        recipient_id: 'sender.rival',
+        template_key: 'RECEIPT_AMOUNT_PROMPT',
+      });
+    });
+  });
+
   describe('WU11A3A atomic attach definite failure commit', () => {
     const OWNER = 'worker.attach-definite';
     const REQUEST_ID = UUID_B;

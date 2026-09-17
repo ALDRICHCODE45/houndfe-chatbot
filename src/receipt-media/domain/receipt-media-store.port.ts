@@ -190,12 +190,15 @@ export type AttachCommitUnknownOutcomeOutcome =
     }
   | { kind: 'fenced' };
 
-/** A replay proves the exact durable successor; every other loser is fenced. */
+/** A replay proves the exact durable successor and its exact row-derived
+ * `RECEIPT_ATTACHED_PENDING` intent; every other loser is fenced. Every
+ * non-fenced outcome carries the one persisted intent. */
 export type AttachCommitSuccessOutcome =
   | {
       kind: 'committed' | 'replayed';
       version: string;
       receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
     }
   | { kind: 'fenced' };
 
@@ -292,14 +295,21 @@ export interface ReceiptMediaStorePort {
   startAttachRequest(
     input: AttachRequestStartInput,
   ): Promise<AttachRequestStartOutcome>;
-  /** WU11A2 successful attachment terminal commit: atomically transition
-   * the exact active ATTACHING row with prior request evidence and the
-   * matching durable attach-attempt identity to ATTACHED under the
-   * caller's live lease, persisting only backend_receipt_id, the fixed
-   * PENDING backend status, and attached_at. Only the exact durable
-   * successor with the same attempt identity, backend evidence, and
-   * successor version replays; every other caller is fenced without
-   * mutation. */
+  /** WU11A2 successful attachment terminal commit (ODD-2B1: intent
+   * ownership): atomically transition the exact active ATTACHING row with
+   * prior request evidence and the matching durable attach-attempt
+   * identity to ATTACHED under the caller's live lease, persisting only
+   * backend_receipt_id, the fixed PENDING backend status, and attached_at
+   * together with exactly one row-derived deterministic
+   * `RECEIPT_ATTACHED_PENDING` intent in the same transaction. The intent
+   * identity is `receipt-attached-pending:<receiptId>:<successorVersion>:
+   * <storedWebhookMessageId>` with row-derived receipt/sender and exactly
+   * `{ backendStatus: 'PENDING' }` args — never a caller value. Only the
+   * exact durable successor replaying the exact persisted intent is
+   * replayed — an otherwise exact legacy successor missing only that
+   * intent is repaired under the same live-lease fence — and a
+   * mismatched/foreign intent or rival terminal evidence fences without
+   * replacement, rolling back any terminal write. */
   commitAttachSuccess(
     input: AttachCommitSuccessInput,
   ): Promise<AttachCommitSuccessOutcome>;

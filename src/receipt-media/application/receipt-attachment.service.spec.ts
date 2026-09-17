@@ -45,6 +45,26 @@ const FAKE_INTENT: ReceiptMediaOutboxRow = {
   sentAt: null,
 };
 
+const FAKE_ATTACHED_INTENT: ReceiptMediaOutboxRow = {
+  id: 'intent-2',
+  dedupeKey: `receipt-attached-pending:${RECEIPT_ID}:9:durable-wamid`,
+  receiptMediaId: RECEIPT_ID,
+  receiptStateVersion: '9',
+  sourceWebhookMessageId: 'durable-wamid',
+  recipientId: 'durable-sender',
+  templateKey: 'RECEIPT_ATTACHED_PENDING',
+  templateArgs: { backendStatus: 'PENDING' },
+  status: 'PENDING',
+  attempts: 0,
+  nextAttemptAt: new Date(0),
+  leaseOwner: null,
+  leaseExpiresAt: null,
+  providerMessageId: null,
+  createdAt: new Date(0),
+  updatedAt: new Date(0),
+  sentAt: null,
+};
+
 const FENCED_START: AttachRequestStartOutcome = { kind: 'fenced' };
 // prettier-ignore
 const CRASHED_START: AttachRequestStartOutcome = { kind: 'crashed-before-post', attachAttemptId: DURABLE_ATTEMPT_ID, version: '8', receipt: makeReceipt({ version: '8' }) };
@@ -97,7 +117,7 @@ describe('ReceiptAttachmentService (WU11C)', () => {
     const receipt = arrangeStarted();
     if (outcome === 'success') {
       // prettier-ignore
-      store.commitAttachSuccess.mockResolvedValue({ kind: 'committed', version: '9', receipt });
+      store.commitAttachSuccess.mockResolvedValue({ kind: 'committed', version: '9', receipt, intent: FAKE_ATTACHED_INTENT });
     } else if (outcome === 'definite') {
       // prettier-ignore
       store.commitAttachDefiniteFailure.mockResolvedValue({ kind: 'failed', version: '9', receipt });
@@ -119,11 +139,16 @@ describe('ReceiptAttachmentService (WU11C)', () => {
     const receipt = arrangeCommit('success');
     // prettier-ignore
     client.attachReceipt.mockResolvedValue({ receiptId: 'backend-r-1', status: 'PENDING' });
-    await service.attach({
+    const report = await service.attach({
       receipt,
       owner: OWNER,
       signal: controller.signal,
     });
+    expect(report).toEqual({
+      kind: 'attached',
+      backendReceiptId: 'backend-r-1',
+    });
+    expect(report).not.toHaveProperty('intent');
     const startArgs = store.startAttachRequest.mock.calls[0][0];
     // prettier-ignore
     expect(startArgs).toMatchObject({ id: RECEIPT_ID, owner: OWNER, expectedVersion: '7' });
