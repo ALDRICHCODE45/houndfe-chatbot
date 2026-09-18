@@ -1188,9 +1188,19 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ],
       });
 
-      // admit receives exactly 4 fields; caption/filename/sha256 are NOT forwarded.
-      // Also proves captioned media never reaches the LLM.
-      it('admit: 4-field contract + captioned image skips LLM', async () => {
+      // admit receives exactly 5 fields: the normalized optional caption is
+      // the only added field. filename/sha256 and every other payload field
+      // are NOT forwarded, and captioned media never reaches the LLM or the
+      // amount router.
+      const ADMIT_FIELDS = [
+        'caption',
+        'declaredMimeType',
+        'providerMediaId',
+        'senderId',
+        'webhookMessageId',
+      ];
+
+      it('admit: caption-only 5-field contract skips LLM and amount router', async () => {
         let captured:
           | Parameters<jest.Mocked<ReceiptIngressService>['admit']>[0]
           | undefined;
@@ -1213,7 +1223,38 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           providerMediaId: 'media-001',
           senderId: CUSTOMER,
           declaredMimeType: 'image/jpeg',
+          caption: 'komprobante.png',
         });
+        expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
+        expect(amountRouter.route).not.toHaveBeenCalled();
+        expect(llm.run).not.toHaveBeenCalled();
+      });
+
+      it('admit: absent caption still forwards only the 5-field contract', async () => {
+        let captured:
+          | Parameters<jest.Mocked<ReceiptIngressService>['admit']>[0]
+          | undefined;
+        ingress.admit.mockImplementationOnce(async (input) => {
+          captured = input;
+          return {
+            kind: 'reserved',
+            receipt: receiptMediaRowFixture('r-nocaption'),
+          };
+        });
+        await service.dispatch(
+          mediaEvent('wamid.nocaption', 'image', {
+            filename: 'evil.pdf',
+            sha256: 'deadbeef',
+          }),
+        );
+        expect(captured).toEqual({
+          webhookMessageId: 'wamid.nocaption',
+          providerMediaId: 'media-001',
+          senderId: CUSTOMER,
+          declaredMimeType: 'image/jpeg',
+          caption: undefined,
+        });
+        expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
         expect(llm.run).not.toHaveBeenCalled();
       });
 

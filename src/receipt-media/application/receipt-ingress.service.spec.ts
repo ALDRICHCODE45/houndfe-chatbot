@@ -258,4 +258,85 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     expect(reserve.mock.calls[0][0].webhookMessageId).toBe(WAMID);
     expect(reserve.mock.calls[0][0].senderId).toBe(SENDER);
   });
+
+  // ── ODD-4A: caption → declaredAmountCents (CPU-only, store-bound only) ──
+  // The raw caption never leaves admit(); only the parsed positive integer
+  // cent value or null crosses into the store port.
+  const declaredCents = async (
+    caption: string | undefined,
+  ): Promise<number | null | undefined> => {
+    const { service, reserve } = fixture();
+    await service.admit(Object.freeze(input({ caption })));
+    expect(reserve).toHaveBeenCalledTimes(1);
+    return reserve.mock.calls[0][0].declaredAmountCents;
+  };
+
+  it.each<[string, number]>([
+    ['750', 75000],
+    ['1,500.00', 150000],
+    ['$1,234.50', 123450],
+    ['1500 pesos con 50 centavos', 150050],
+    ['1,500 pesos con 5 centavos', 150005],
+  ])(
+    'parses a %j caption into positive integer cents',
+    async (caption, cents) => {
+      await expect(declaredCents(caption)).resolves.toBe(cents);
+    },
+  );
+
+  it.each<[string, string | undefined]>([
+    ['absent', undefined],
+    ['empty', ''],
+    ['blank', '   '],
+    ['non-numeric', 'comprobante'],
+    ['zero', '0'],
+    ['zero cents', '0.00'],
+    ['negative', '-50'],
+    ['malformed trailing period', '500.'],
+    ['malformed multiple decimals', '1.2.3'],
+    ['unsupported suffix', '500€'],
+    ['unsupported spanish hint', '500 pesos con 50'],
+    ['ambiguous conjunction', '500 y 1000'],
+    ['multiple tokens', '500 1000'],
+    [
+      'multiple spanish amounts',
+      '500 pesos con 50 centavos y 1000 pesos con 10 centavos',
+    ],
+    ['beyond the persistable integer range', '99999999999'],
+  ])('persists null for a %s caption', async (_label, caption) => {
+    await expect(declaredCents(caption)).resolves.toBeNull();
+  });
+
+  it('passes only the declared cents to the store, never the raw caption', async () => {
+    const { service, reserve } = fixture();
+    await service.admit(
+      Object.freeze(
+        input({ caption: '1,500.00', declaredMimeType: 'image/png' }),
+      ),
+    );
+    const reserved = reserve.mock.calls[0][0];
+    expect(reserved).toMatchObject({
+      webhookMessageId: WAMID,
+      providerMediaId: MEDIA,
+      senderId: SENDER,
+      capturedSaleId: SALE,
+      declaredMimeType: 'image/png',
+      declaredAmountCents: 150000,
+    });
+    expect(reserved.id).toMatch(UUID);
+    expect(isCanonicalObjectKey(reserved.objectKey)).toBe(true);
+    expect(Object.keys(reserved).sort()).toEqual([
+      'capturedSaleId',
+      'declaredAmountCents',
+      'declaredMimeType',
+      'id',
+      'objectKey',
+      'providerMediaId',
+      'senderId',
+      'webhookMessageId',
+    ]);
+    expect(reserved).not.toHaveProperty('caption');
+    expect(reserved).not.toHaveProperty('filename');
+    expect(reserved).not.toHaveProperty('sha256');
+  });
 });

@@ -764,6 +764,68 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       });
     });
 
+    // --- ODD-4A: declared caption amount persisted atomically at admit ---
+    const durableCents = async (id = UUID_A): Promise<number | null> => {
+      const { rows } = await pool.query<{
+        declared_amount_cents: number | null;
+      }>('SELECT declared_amount_cents FROM receipt_media WHERE id = $1', [id]);
+      return rows[0]?.declared_amount_cents ?? null;
+    };
+
+    it('persists the declared caption amount with the reservation and marker', async () => {
+      const admission = reserveInput({ declaredAmountCents: 1250 });
+      const first = await store.admit(admission);
+      if (first.kind !== 'created') throw new Error('expected created');
+      expect(first.receipt.declaredAmountCents).toBe(1250);
+      expect(await durableCents()).toBe(1250);
+      expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+        receipts: 1,
+        markers: 1,
+      });
+    });
+
+    it('persists null when the reservation carries no declared amount', async () => {
+      const first = await store.admit(reserveInput());
+      if (first.kind !== 'created') throw new Error('expected created');
+      expect(first.receipt.declaredAmountCents).toBeNull();
+      expect(await durableCents()).toBeNull();
+    });
+
+    it('retains the first durable amount across webhook replay and provider reuse', async () => {
+      const first = await store.admit(
+        reserveInput({ declaredAmountCents: 1250 }),
+      );
+      if (first.kind !== 'created') throw new Error('expected created');
+      await expect(
+        store.admit(reserveInput({ declaredAmountCents: 999999 })),
+      ).resolves.toMatchObject({ kind: 'webhook-replayed' });
+      await expect(
+        store.admit(
+          reserveInput({
+            id: UUID_B,
+            webhookMessageId: 'wamid.reuse',
+            declaredAmountCents: 7777,
+          }),
+        ),
+      ).resolves.toMatchObject({ kind: 'provider-media-reused' });
+      expect(await durableCents()).toBe(1250);
+    });
+
+    it('concurrent same-message arbitration keeps the winner amount without overwrite', async () => {
+      const [left, right] = await Promise.all([
+        store.admit(reserveInput({ declaredAmountCents: 1250 })),
+        store.admit(reserveInput({ declaredAmountCents: 4200 })),
+      ]);
+      const winner = [left, right].find(
+        (o): o is Extract<ReservationOutcome, { kind: 'created' }> =>
+          o.kind === 'created',
+      );
+      if (!winner) throw new Error('expected one created');
+      const persisted = await durableCents();
+      expect([1250, 4200]).toContain(persisted);
+      expect(persisted).toBe(winner.receipt.declaredAmountCents);
+    });
+
     it('rolls back both artifacts when receipt persistence fails', async () => {
       await pool.query(`CREATE FUNCTION receipt_admission_receipt_failure()
         RETURNS trigger LANGUAGE plpgsql AS $$

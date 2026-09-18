@@ -1120,8 +1120,9 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       try {
         const inserted = await c.query<Row>(
           `INSERT INTO receipt_media (id, webhook_message_id, provider_media_id,
-             sender_id, captured_sale_id, object_key, declared_mime_type, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'RESERVED') RETURNING *`,
+             sender_id, captured_sale_id, object_key, declared_mime_type,
+             declared_amount_cents, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RESERVED') RETURNING *`,
           [
             input.id,
             input.webhookMessageId,
@@ -1130,6 +1131,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             input.capturedSaleId,
             input.objectKey,
             input.declaredMimeType ?? null,
+            input.declaredAmountCents ?? null,
           ],
         );
         await markInboundWebhook();

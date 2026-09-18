@@ -211,11 +211,16 @@ export class WebhookDispatcherService {
 
         // ─── WU13-B2: ReceiptIngressService — customer media only ─────────────
         if (message.media != null) {
+          // ODD-4A: the normalized optional caption is the only extra field
+          // forwarded. filename/sha256 and every other payload field are
+          // dropped, and the raw caption never reaches the amount router, the
+          // LLM, or any durable type.
           const { kind } = await this.ingress.admit({
             webhookMessageId: message.messageId,
             providerMediaId: message.media.providerMediaId,
             senderId: message.senderId,
             declaredMimeType: message.media.declaredMimeType,
+            caption: message.media.caption,
           });
           const guidance = ingressGuidance(kind);
 

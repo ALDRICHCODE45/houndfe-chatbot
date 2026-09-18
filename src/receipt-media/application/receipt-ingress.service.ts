@@ -13,6 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import { readPlacedSaleId } from '../../sale-flow/application/placed-sale-persistence';
+import { parseAmount } from '../domain/amount-parser';
 import { newObjectKey } from '../domain/object-storage.port';
 import type {
   ReservationOutcome,
@@ -25,6 +26,21 @@ const SUPPORTED_MIME_TYPES: ReadonlySet<string> = new Set([
   'image/jpeg',
   'image/png',
 ]);
+
+/** Largest declared amount the durable positive-int32 `declared_amount_cents`
+ * column can hold (mirrors the store's own evidence bound). */
+const MAX_DECLARED_AMOUNT_CENTS = 2_147_483_647;
+
+/** ODD-4A CPU-only caption mapping: the raw caption is consumed here and
+ * never leaves this frame. Only the parsed positive integer cent value within
+ * the persistable range, or `null`, is produced. */
+function declaredAmountCentsOf(caption: string | undefined): number | null {
+  if (caption === undefined) return null;
+  const parsed = parseAmount(caption);
+  return parsed.kind === 'parsed' && parsed.cents <= MAX_DECLARED_AMOUNT_CENTS
+    ? parsed.cents
+    : null;
+}
 
 /** Narrow kill-switch seam over the WU1B `receiptMedia` config subtree. */
 export interface ReceiptMediaKillSwitch {
@@ -41,12 +57,15 @@ export interface ReceiptIngressStore {
   admit(input: ReserveInput): Promise<ReservationOutcome>;
 }
 
-/** Normalized media envelope; identity pre-checks are store-owned. */
+/** Normalized media envelope; identity pre-checks are store-owned. The
+ * optional caption is transient: it is parsed CPU-only and only its bounded
+ * declared amount ever reaches the store port. */
 export interface ReceiptIngressInput {
   senderId: string;
   webhookMessageId: string;
   providerMediaId: string;
   declaredMimeType: string;
+  caption?: string;
 }
 
 /** Closed admission result: the three pre-admission decisions never create
@@ -89,6 +108,7 @@ export class ReceiptIngressService {
       capturedSaleId: placedSaleId,
       objectKey: newObjectKey(),
       declaredMimeType: input.declaredMimeType,
+      declaredAmountCents: declaredAmountCentsOf(input.caption),
     });
     switch (reservation.kind) {
       case 'created':

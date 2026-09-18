@@ -30,6 +30,10 @@ export interface ReserveInput {
   capturedSaleId: string;
   objectKey: string;
   declaredMimeType?: string;
+  /** ODD-4A: the bounded, caption-derived declared amount in integer cents
+   * (positive, persistable range) or `null`. Raw caption text never crosses
+   * this port. */
+  declaredAmountCents?: number | null;
 }
 
 export interface OutboxIntentInput {
