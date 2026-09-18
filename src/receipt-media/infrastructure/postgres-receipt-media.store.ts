@@ -28,6 +28,8 @@ import type {
   AttachStartOutcome,
   AttemptStartResult,
   CapabilityAccessRow,
+  CleanupDispositionInput,
+  CleanupDispositionOutcome,
   DownloadCommitInput,
   DownloadCommitOutcome,
   DedupeOutcome,
@@ -302,8 +304,99 @@ const STORAGE_TERMINAL_SQL = `UPDATE receipt_media
         AND attach_http_status IS NULL AND attach_transport_code IS NULL
         AND attach_outcome_observed_at IS NULL RETURNING *`;
 
-const MAX_INT32 = 2_147_483_647;
+/** ODD-2D2a narrow cleanup claim/start: only `FAILED`
+ * `STORAGE_EXHAUSTED_PRE_ACCEPTANCE` rows with `cleanup_pending = true`, a
+ * due deadline, no live lease, a backlog/retryable delete error code, and
+ * either a remaining logical attempt or an expired reclaimable lease. The
+ * logical attempt is row-derived: an initial backlog or lease-cleared row
+ * starts the next attempt; an expired non-null lease (attempts 1..3)
+ * reclaims the same ambiguous attempt without increment. The exact
+ * `OBJECT_STORAGE` category is required together with the allowlisted
+ * backlog/retryable delete error code, so a safe-looking code under another
+ * category is never claimed. Deterministic `next_attempt_at`/`created_at`
+ * order, `FOR UPDATE SKIP LOCKED`, bounded batch, 60-second lease, and a
+ * version bump. */
+const CLEANUP_CLAIM_SQL = `WITH candidate AS (
+     SELECT id FROM receipt_media
+     WHERE status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true
+       AND next_attempt_at <= now()
+       AND (lease_expires_at IS NULL OR lease_expires_at < now())
+       AND last_error_category = 'OBJECT_STORAGE'
+       AND last_error_code IN ('CLEANUP_PENDING', 'STORAGE_EXHAUSTED',
+         'ABORTED', 'HTTP_RETRYABLE', 'NETWORK_FAILURE')
+       AND (cleanup_attempts < 3
+         OR (cleanup_attempts = 3 AND lease_expires_at IS NOT NULL))
+     ORDER BY next_attempt_at, created_at
+     FOR UPDATE SKIP LOCKED LIMIT $1
+   )
+   UPDATE receipt_media r
+   SET cleanup_attempts = CASE
+         WHEN r.cleanup_attempts = 0 THEN 1
+         WHEN r.lease_expires_at IS NOT NULL THEN r.cleanup_attempts
+         ELSE r.cleanup_attempts + 1
+       END,
+     lease_owner = $2,
+     lease_expires_at = now() + interval '60 seconds',
+     version = version + 1, updated_at = now()
+   FROM candidate c WHERE r.id = c.id
+   RETURNING r.*`;
 
+/** ODD-2D2a fresh cleanup disposition lock: the exact owned, live-leased
+ * claimed cleanup row at the caller's expected version read under
+ * `clock_timestamp()` and a row lock, so the logical attempt and every
+ * derived value come from the durable row and a lease that expires while
+ * this transaction waits can never authorize a mutation. */
+const CLEANUP_DISPOSITION_LOOK_SQL = `SELECT * FROM receipt_media
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true
+       AND cleanup_attempts BETWEEN 1 AND 3 FOR UPDATE`;
+
+/** ODD-2D2a idempotent cleanup success: clear the backlog flag and the
+ * lease and bump the version while retaining the terminal
+ * `FAILED/STORAGE_EXHAUSTED_PRE_ACCEPTANCE` state, download evidence,
+ * object key, failure stage, safe error evidence, and the null
+ * accepted-object/capability boundary; no intent is created. */
+const CLEANUP_SUCCESS_SQL = `UPDATE receipt_media
+     SET cleanup_pending = false, lease_owner = NULL, lease_expires_at = NULL,
+       version = version + 1, updated_at = now()
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true AND cleanup_attempts = $4::int RETURNING *`;
+
+/** ODD-2D2a retryable cleanup failure at attempts 1/2: retain the backlog
+ * and every evidence column, persist only the safe category/code, set the
+ * deadline from a 1s/4s base with bounded positive jitter, clear both
+ * lease fields, and bump the version; no intent is created. */
+const CLEANUP_RETRY_SQL = `UPDATE receipt_media
+     SET last_error_category = $5, last_error_code = $6,
+       next_attempt_at = clock_timestamp() + ($7::int * interval '1 millisecond'),
+       lease_owner = NULL, lease_expires_at = NULL,
+       version = version + 1, updated_at = now()
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true AND cleanup_attempts = $4::int
+       AND cleanup_attempts < 3 RETURNING *`;
+
+/** ODD-2D2a manual hold: a permanent delete failure at any attempt or a
+ * retryable failure at attempt 3 retains the backlog flag, persists only
+ * the safe category/code, clears the lease, and bumps the version without
+ * scheduling any automatic eligibility. */
+const CLEANUP_HOLD_SQL = `UPDATE receipt_media
+     SET last_error_category = $5, last_error_code = $6,
+       lease_owner = NULL, lease_expires_at = NULL,
+       version = version + 1, updated_at = now()
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true AND cleanup_attempts = $4::int RETURNING *`;
+
+const MAX_INT32 = 2_147_483_647;
 /** ODD-2C fixed Meta disposition taxonomy. MEDIA_VALIDATION codes are
  * always permanent pre-storage validation failures; HTTP_PERMANENT is a
  * permanent transport failure classified at the same pre-storage stage;
@@ -434,6 +527,83 @@ const storageFailureDecision = (
     ? 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
     : null;
 };
+
+/** ODD-2D2a fixed cleanup technical-delete disposition taxonomy. The three
+ * retryable delete codes schedule attempts 1/2 and become a manual hold at
+ * attempt 3; the four permanent delete codes are an immediate manual hold
+ * at any attempt; every other category/code pair is malformed and never
+ * reaches the database. */
+const CLEANUP_RETRYABLE_CODES = new Set<string>([
+  'ABORTED',
+  'HTTP_RETRYABLE',
+  'NETWORK_FAILURE',
+]);
+const CLEANUP_PERMANENT_CODES = new Set<string>([
+  'OBJECT_KEY_INVALID',
+  'REQUEST_INVALID',
+  'HTTP_PERMANENT',
+  'PERMANENT_FAILURE',
+]);
+
+/** The fixed safe cleanup failure taxonomy; unknown category/code pairs
+ * fence without mutation. */
+const cleanupFailureCode = (category: unknown, code: unknown): string | null =>
+  category === 'OBJECT_STORAGE' &&
+  typeof code === 'string' &&
+  (CLEANUP_RETRYABLE_CODES.has(code) || CLEANUP_PERMANENT_CODES.has(code))
+    ? code
+    : null;
+
+/** One validated cleanup command, or null for a malformed caller. The
+ * logical attempt, state, and schedule are never caller values. */
+type CleanupCommand =
+  | { outcome: 'deleted' }
+  | { outcome: 'failed'; category: 'OBJECT_STORAGE'; code: string };
+
+const cleanupCommand = (
+  input: CleanupDispositionInput,
+  successor: string | null,
+): CleanupCommand | null => {
+  try {
+    if (
+      successor === null ||
+      typeof input !== 'object' ||
+      input === null ||
+      typeof input.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input.owner !== 'string' ||
+      input.owner.length === 0
+    )
+      return null;
+    const raw = input as {
+      outcome?: unknown;
+      category?: unknown;
+      code?: unknown;
+    };
+    if (raw.outcome === 'deleted') return { outcome: 'deleted' };
+    if (raw.outcome !== 'failed') return null;
+    const code = cleanupFailureCode(raw.category, raw.code);
+    return code === null
+      ? null
+      : { outcome: 'failed', category: 'OBJECT_STORAGE', code };
+  } catch {
+    return null;
+  }
+};
+
+/** ODD-2D2a fail-closed claim boundary, mirroring the established outbox
+ * boundary but robust to forged runtime types: a malformed `limit`/`owner`
+ * returns no rows before any SQL. `limit` must be a positive safe integer so
+ * `LIMIT NULL` can never widen the batch to every due row, and `owner` must
+ * be a bounded 1..100-character string so an empty or non-string owner can
+ * never create a lease that `commitCleanupDisposition` refuses. */
+const cleanupClaimInputOk = (limit: unknown, owner: unknown): boolean =>
+  typeof limit === 'number' &&
+  Number.isSafeInteger(limit) &&
+  limit > 0 &&
+  typeof owner === 'string' &&
+  owner.length >= 1 &&
+  owner.length <= 100;
 
 /** WU11A3A proven non-committing outcomes: the safe allowlisted statuses. */
 const ATTACH_DEFINITE_HTTP_STATUSES = [400, 401, 403, 404, 409, 422, 429];
@@ -2431,6 +2601,106 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           version: String(receipt.version),
           receipt: camelize<Media>(receipt),
           intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      if ((err as { code?: string }).code === '22P02')
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** ODD-2D2a narrow cleanup claim/start; see CLEANUP_CLAIM_SQL. Only
+   * durable FAILED/STORAGE_EXHAUSTED_PRE_ACCEPTANCE backlog rows are
+   * eligible; the logical attempt is derived inside the locked transaction
+   * and the returned rows carry their post-claim attempt. Never claims
+   * STORED, generic eligibility, or a fourth logical attempt, and never
+   * performs the external delete. */
+  async claimCleanupBatch(limit: number, owner: string): Promise<Media[]> {
+    if (!cleanupClaimInputOk(limit, owner)) return [];
+    return this.withTx(async (c) => {
+      const { rows } = await c.query<Row>(CLEANUP_CLAIM_SQL, [limit, owner]);
+      return rows
+        .map((r) => camelize<Media>(r))
+        .sort(
+          (a, b) =>
+            +a.nextAttemptAt - +b.nextAttemptAt || +a.createdAt - +b.createdAt,
+        );
+    });
+  }
+
+  /** ODD-2D2a fenced cleanup disposition; see CLEANUP_DISPOSITION_LOOK_SQL,
+   * CLEANUP_SUCCESS_SQL, CLEANUP_RETRY_SQL, and CLEANUP_HOLD_SQL. The caller
+   * supplies only the lease/version fence and, for a failure, the fixed safe
+   * category/code; the locked row owns the logical attempt and every derived
+   * routing, state, deadline, and backlog value. A permanent failure or a
+   * third retryable failure becomes a manual hold with no automatic
+   * eligibility, malformed/unknown commands and mismatched fences return
+   * `fenced` without mutation, and no intent is ever created. */
+  async commitCleanupDisposition(
+    input: CleanupDispositionInput,
+  ): Promise<CleanupDispositionOutcome> {
+    let successor: string | null;
+    try {
+      successor = successorVersion(input?.expectedVersion);
+    } catch {
+      return { kind: 'fenced' };
+    }
+    const command = cleanupCommand(input, successor);
+    if (command === null) return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const locked = (
+          await c.query<Row>(CLEANUP_DISPOSITION_LOOK_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+          ])
+        ).rows[0];
+        if (!locked) return { kind: 'fenced' };
+        const attempt = locked.cleanup_attempts as number;
+        const params = [input.id, input.owner, input.expectedVersion, attempt];
+        if (command.outcome === 'deleted') {
+          const updated = await c.query<Row>(CLEANUP_SUCCESS_SQL, params);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'cleaned',
+            attempt,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const retryable = CLEANUP_RETRYABLE_CODES.has(command.code);
+        if (retryable && attempt < 3) {
+          const updated = await c.query<Row>(CLEANUP_RETRY_SQL, [
+            ...params,
+            command.category,
+            command.code,
+            retryDelayMs(attempt),
+          ]);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'retry-scheduled',
+            attempt,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const updated = await c.query<Row>(CLEANUP_HOLD_SQL, [
+          ...params,
+          command.category,
+          command.code,
+        ]);
+        if (updated.rowCount !== 1) throw FENCED;
+        const receipt = updated.rows[0];
+        return {
+          kind: 'manual-hold',
+          attempt,
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
         };
       });
     } catch (err) {

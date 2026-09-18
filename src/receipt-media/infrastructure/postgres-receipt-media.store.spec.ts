@@ -7230,6 +7230,662 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     });
   });
 
+  describe('ODD-2D2a durable cleanup claim and disposition', () => {
+    const OWNER = 'worker.cleanup';
+    const RIVAL = 'worker.cleanup-rival';
+    const SENDER = 'sender.cleanup';
+    const RETRYABLE = ['ABORTED', 'HTTP_RETRYABLE', 'NETWORK_FAILURE'];
+    const PERMANENT = [
+      'OBJECT_KEY_INVALID',
+      'REQUEST_INVALID',
+      'HTTP_PERMANENT',
+      'PERMANENT_FAILURE',
+    ];
+    /** The new primitives are called through a structural seam so this spec
+     * stays runnable before the port surface exists; the durable behavior is
+     * proven against the real PostgreSQL store either way. */
+    const cleanupStore = () =>
+      store as unknown as {
+        claimCleanupBatch(limit: number, owner: string): Promise<Row[]>;
+        commitCleanupDisposition(input: Row): Promise<Row>;
+      };
+    const claim = (limit = 5, owner = OWNER) =>
+      cleanupStore().claimCleanupBatch(limit, owner);
+    /** Bypasses the default parameters so forged runtime inputs reach the
+     * store exactly as a malformed caller would supply them. */
+    const claimRaw = (limit: unknown, owner: unknown) =>
+      cleanupStore().claimCleanupBatch(limit as number, owner as string);
+    /** A post-claim row: live lease, claimed attempt, successor version. */
+    const live = (over: Row = {}): Row => ({
+      lease_owner: OWNER,
+      lease_expires_at: new Date(Date.now() + 60_000),
+      version: '5',
+      ...over,
+    });
+    const cleanupRow = (over: Row = {}): Row =>
+      lifeRow('FAILED', 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE', {
+        id: UUID_A,
+        webhook_message_id: 'wamid.cleanup',
+        provider_media_id: 'media.cleanup',
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '4',
+        storage_attempts: 3,
+        last_error_category: 'OBJECT_STORAGE',
+        last_error_code: 'STORAGE_EXHAUSTED',
+        cleanup_pending: true,
+        cleanup_attempts: 0,
+        next_attempt_at: T0,
+        terminal_at: T0,
+        lease_owner: null,
+        lease_expires_at: null,
+        ...over,
+      });
+    const seed = async (over: Row = {}): Promise<Row> => {
+      const row = cleanupRow(over);
+      await seeds([row]);
+      return row;
+    };
+    const seeds = async (rows: Row[]): Promise<void> => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      for (const row of rows)
+        await pool.query(insertSql('receipt_media', row), Object.values(row));
+    };
+    const rowOf = async (id = UUID_A): Promise<Row> =>
+      (await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [id]))
+        .rows[0];
+    const outboxRows = async (): Promise<Row[]> =>
+      (await pool.query<Row>('SELECT * FROM receipt_media_outbox')).rows;
+    const remainingMs = async (): Promise<number> =>
+      Number(
+        (
+          await pool.query<Row>(
+            `SELECT (extract(epoch from next_attempt_at - clock_timestamp()) * 1000)::int AS ms
+               FROM receipt_media WHERE id = $1`,
+            [UUID_A],
+          )
+        ).rows[0].ms,
+      );
+    const due = (id = UUID_A): Promise<unknown> =>
+      pool.query(
+        'UPDATE receipt_media SET next_attempt_at = $2 WHERE id = $1',
+        [id, T0],
+      );
+    const deleted = (over: Row = {}): Row => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '5',
+      outcome: 'deleted',
+      ...over,
+    });
+    const deleteFailed = (code: string, over: Row = {}): Row => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '5',
+      outcome: 'failed',
+      category: 'OBJECT_STORAGE',
+      code,
+      ...over,
+    });
+    const dispose = (input: Row) =>
+      cleanupStore().commitCleanupDisposition(input);
+    const expectFenced = async (input: Row): Promise<void> => {
+      const before = await rowOf();
+      await expect(dispose(input)).resolves.toEqual({ kind: 'fenced' });
+      expect(await rowOf()).toEqual(before);
+    };
+    const sleep = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+
+    it('starts attempt 1 from an initial backlog row, including an expired lease retained by ODD-2D1', async () => {
+      const initial: Array<[string, Row]> = [
+        ['a released lease', {}],
+        [
+          'an expired retained lease',
+          {
+            lease_owner: 'worker.storage-failure',
+            lease_expires_at: new Date(Date.now() - 1000),
+          },
+        ],
+      ];
+      for (const [label, over] of initial) {
+        await seed(over);
+        const claimed = await claim();
+        expect([label, claimed]).toHaveLength(2);
+        expect(claimed).toHaveLength(1);
+        expect(claimed[0]).toMatchObject({
+          id: UUID_A,
+          status: 'FAILED',
+          failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          cleanupPending: true,
+          cleanupAttempts: 1,
+          leaseOwner: OWNER,
+          version: '5',
+        });
+        expect(await rowOf()).toMatchObject({
+          cleanup_attempts: 1,
+          lease_owner: OWNER,
+          version: '5',
+        });
+        const expiry = Number((await rowOf()).lease_expires_at);
+        expect(expiry).toBeGreaterThan(Date.now() + 55_000);
+        expect(expiry).toBeLessThanOrEqual(Date.now() + 61_000);
+      }
+    });
+
+    it('claims only due cleanup backlog in deterministic order and honors the limit', async () => {
+      const id = (n: number) => `00000000-0000-4000-8000-00000000000${n}`;
+      const at = (iso: string) => new Date(iso);
+      const mk = (n: number, next: Date, created: Date): Row =>
+        cleanupRow({
+          id: id(n),
+          webhook_message_id: `wamid.o-${n}`,
+          provider_media_id: `media.o-${n}`,
+          object_key: `receipts/o-${n}`,
+          next_attempt_at: next,
+          created_at: created,
+        });
+      await seeds([
+        mk(3, at('2025-01-03T00:00:00Z'), at('2025-01-01T00:00:00Z')),
+        mk(1, at('2025-01-01T00:00:00Z'), at('2025-01-01T00:00:00Z')),
+        mk(2, at('2025-01-01T00:00:00Z'), at('2025-01-02T00:00:00Z')),
+      ]);
+      const claimed = await claim(2);
+      expect(claimed.map((r) => r.id)).toEqual([id(1), id(2)]);
+      expect(claimed.map((r) => r.cleanupAttempts)).toEqual([1, 1]);
+      expect((await rowOf(id(3))).cleanup_attempts).toBe(0);
+    });
+
+    it('excludes every non-eligible cleanup row and never widens generic claimBatch or STORED', async () => {
+      const expectNoCleanupClaim = async (row: Row) => {
+        await seeds([row]);
+        expect(await claim()).toHaveLength(0);
+      };
+      const cases: Array<[string, Row]> = [
+        ['a live lease', cleanupRow(live())],
+        [
+          'a future deadline',
+          cleanupRow({ next_attempt_at: new Date(Date.now() + 3_600_000) }),
+        ],
+        ['cleanup_pending false', cleanupRow({ cleanup_pending: false })],
+        ['a permanent code', cleanupRow({ last_error_code: 'HTTP_PERMANENT' })],
+        ['an unknown code', cleanupRow({ last_error_code: 'MYSTERY' })],
+        [
+          'a lease-cleared retryable attempt 3',
+          cleanupRow({
+            cleanup_attempts: 3,
+            last_error_code: 'NETWORK_FAILURE',
+          }),
+        ],
+        [
+          'a lease-cleared initial backlog attempt 3',
+          cleanupRow({ cleanup_attempts: 3 }),
+        ],
+        [
+          'a non-cleanup failure stage',
+          lifeRow('FAILED', 'META_EXHAUSTED_PRE_STORAGE', {
+            id: UUID_A,
+            webhook_message_id: 'wamid.cleanup',
+            provider_media_id: 'media.cleanup',
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            object_key: `receipts/${UUID_C}`,
+            last_error_category: 'META_TRANSPORT',
+            last_error_code: 'META_EXHAUSTED',
+            cleanup_pending: true,
+            next_attempt_at: T0,
+            terminal_at: T0,
+          }),
+        ],
+        [
+          'a non-cleanup status',
+          lifeRow('DOWNLOADED', null, {
+            id: UUID_A,
+            webhook_message_id: 'wamid.cleanup',
+            provider_media_id: 'media.cleanup',
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            object_key: `receipts/${UUID_C}`,
+            next_attempt_at: T0,
+          }),
+        ],
+      ];
+      for (const [label, row] of cases) {
+        await expectNoCleanupClaim(row);
+        expect([label, await rowOf()]).toHaveLength(2);
+      }
+      // Generic claims stay exactly as before: a FAILED cleanup row and a
+      // STORED row are both absent from automatic batch eligibility.
+      await seeds([
+        cleanupRow({ cleanup_attempts: 1, last_error_code: 'NETWORK_FAILURE' }),
+        lifeRow('STORED', null, {
+          id: '33333333-3333-4333-8333-333333333333',
+          webhook_message_id: 'wamid.cleanup-stored',
+          provider_media_id: 'media.cleanup-stored',
+          sender_id: 'sender.cleanup-stored',
+          captured_sale_id: UUID_B,
+          object_key: 'receipts/cleanup-stored',
+          next_attempt_at: T0,
+        }),
+      ]);
+      expect(await store.claimBatch(5, OWNER)).toHaveLength(0);
+      expect(await rowOf()).toMatchObject({
+        status: 'FAILED',
+        lease_owner: null,
+        cleanup_attempts: 1,
+        version: '4',
+      });
+      expect(await claim()).toHaveLength(1);
+    });
+
+    it('reclaims the same ambiguous logical attempt without increment when a non-null lease expired (attempts 1-3)', async () => {
+      for (const attempt of [1, 2, 3]) {
+        await seed({
+          cleanup_attempts: attempt,
+          last_error_code: 'NETWORK_FAILURE',
+          lease_owner: 'worker.crashed',
+          lease_expires_at: new Date(Date.now() - 1000),
+        });
+        const claimed = await claim();
+        expect(claimed).toHaveLength(1);
+        expect(claimed[0]).toMatchObject({
+          cleanupAttempts: attempt,
+          leaseOwner: OWNER,
+          version: '5',
+        });
+        expect((await rowOf()).cleanup_attempts).toBe(attempt);
+      }
+    });
+
+    it('excludes duplicate concurrent claims and skips a row locked by another transaction', async () => {
+      await seed();
+      const [a, b] = await Promise.all([claim(), claim()]);
+      expect([...a, ...b].map((r) => r.id)).toEqual([UUID_A]);
+      expect(await rowOf()).toMatchObject({
+        cleanup_attempts: 1,
+        version: '5',
+      });
+      await seed();
+      const locker = await pool.connect();
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'SELECT * FROM receipt_media WHERE id = $1 FOR UPDATE',
+          [UUID_A],
+        );
+        expect(await claim()).toHaveLength(0);
+        await locker.query('COMMIT');
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+      }
+      expect(await claim()).toHaveLength(1);
+    });
+
+    it('commits cleanup success by clearing flag and lease while preserving every terminal evidence boundary', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      const intentId = `receipt-unavailable-later:${UUID_A}:5:wamid.cleanup`;
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+           receipt_state_version, source_webhook_message_id, recipient_id,
+           template_key, template_args)
+         VALUES ($1, $2, $3, '5', 'wamid.cleanup', $4,
+           'RECEIPT_UNAVAILABLE_LATER', '{}'::jsonb)`,
+        [UUID_C, intentId, UUID_A, SENDER],
+      );
+      const before = await rowOf();
+      const [intentBefore] = await outboxRows();
+      const outcome = await dispose(deleted());
+      expect(outcome).toMatchObject({
+        kind: 'cleaned',
+        attempt: 1,
+        version: '6',
+        receipt: {
+          status: 'FAILED',
+          failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          cleanupPending: false,
+          cleanupAttempts: 1,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        },
+      });
+      const stored = await rowOf();
+      expect(stored).toMatchObject({
+        cleanup_pending: false,
+        cleanup_attempts: 1,
+        lease_owner: null,
+        lease_expires_at: null,
+        version: '6',
+      });
+      expect(stored.downloaded_at).toEqual(before.downloaded_at);
+      expect(stored.byte_count).toBe(1024);
+      expect(Buffer.isBuffer(stored.content_sha256)).toBe(true);
+      expect(stored.object_key).toBe(`receipts/${UUID_C}`);
+      expect(stored.failure_stage).toBe('STORAGE_EXHAUSTED_PRE_ACCEPTANCE');
+      expect(stored.terminal_at).toEqual(before.terminal_at);
+      expect(stored.last_error_code).toBe('STORAGE_EXHAUSTED');
+      for (const col of [
+        'stored_at',
+        'object_etag',
+        'object_version_id',
+        'capability_token_hash',
+        'capability_key_version',
+        'capability_key_version_text',
+        'capability_issued_at',
+        'capability_revoked_at',
+      ])
+        expect(stored[col]).toBeNull();
+      expect(await outboxRows()).toEqual([intentBefore]);
+      // A cleared row is never re-claimed, and a duplicate command at the
+      // stale version fences without a second bump.
+      expect(await claim()).toHaveLength(0);
+      await expectFenced(deleted());
+      expect((await rowOf()).version).toBe('6');
+    });
+
+    it('schedules retryable attempts 1/2 with a 1s/4s base plus bounded positive jitter and no intent', async () => {
+      for (const [attempt, base] of [
+        [1, 1000],
+        [2, 4000],
+      ] as Array<[number, number]>) {
+        for (const code of RETRYABLE) {
+          await seed(live({ cleanup_attempts: attempt }));
+          const outcome = await dispose(deleteFailed(code));
+          expect(outcome).toMatchObject({
+            kind: 'retry-scheduled',
+            attempt,
+            version: '6',
+            receipt: {
+              cleanupPending: true,
+              cleanupAttempts: attempt,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastErrorCategory: 'OBJECT_STORAGE',
+              lastErrorCode: code,
+            },
+          });
+          expect(await rowOf()).toMatchObject({
+            cleanup_pending: true,
+            cleanup_attempts: attempt,
+            lease_owner: null,
+            lease_expires_at: null,
+            last_error_category: 'OBJECT_STORAGE',
+            last_error_code: code,
+            version: '6',
+          });
+          expect((await rowOf()).downloaded_at).toBeInstanceOf(Date);
+          expect(await remainingMs()).toBeGreaterThan(base - 500);
+          expect(await remainingMs()).toBeLessThanOrEqual(base * 1.25 + 100);
+          expect(await outboxRows()).toHaveLength(0);
+        }
+      }
+    });
+
+    it('manually holds attempt-3 retryable failures and permanent failures at any attempt without automatic eligibility', async () => {
+      const holds: Array<[string, number]> = [
+        ...RETRYABLE.map((code): [string, number] => [code, 3]),
+        ...PERMANENT.map((code): [string, number] => [code, 1]),
+        ...PERMANENT.map((code): [string, number] => [code, 3]),
+      ];
+      for (const [code, attempt] of holds) {
+        await seed(live({ cleanup_attempts: attempt }));
+        const outcome = await dispose(deleteFailed(code));
+        expect(outcome).toMatchObject({
+          kind: 'manual-hold',
+          attempt,
+          version: '6',
+          receipt: {
+            cleanupPending: true,
+            cleanupAttempts: attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastErrorCode: code,
+          },
+        });
+        expect(await rowOf()).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          cleanup_pending: true,
+          cleanup_attempts: attempt,
+          lease_owner: null,
+          lease_expires_at: null,
+          last_error_category: 'OBJECT_STORAGE',
+          last_error_code: code,
+        });
+        expect(await claim()).toHaveLength(0);
+        expect(await outboxRows()).toHaveLength(0);
+      }
+    });
+
+    it('walks the full lifecycle to a manual hold and never authorizes a fourth logical attempt', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      const first = await dispose(deleteFailed('NETWORK_FAILURE'));
+      expect(first).toMatchObject({ kind: 'retry-scheduled', attempt: 1 });
+      expect(await claim()).toHaveLength(0);
+      await due();
+      const claim2 = (await claim())[0];
+      expect(claim2).toMatchObject({ cleanupAttempts: 2, version: '7' });
+      const second = await dispose(
+        deleteFailed('ABORTED', { expectedVersion: claim2.version }),
+      );
+      expect(second).toMatchObject({ kind: 'retry-scheduled', attempt: 2 });
+      await due();
+      const claim3 = (await claim())[0];
+      expect(claim3).toMatchObject({ cleanupAttempts: 3, version: '9' });
+      const third = await dispose(
+        deleteFailed('HTTP_RETRYABLE', { expectedVersion: claim3.version }),
+      );
+      expect(third).toMatchObject({ kind: 'manual-hold', attempt: 3 });
+      await due();
+      expect(await claim()).toHaveLength(0);
+      expect(await rowOf()).toMatchObject({
+        cleanup_attempts: 3,
+        cleanup_pending: true,
+        last_error_code: 'HTTP_RETRYABLE',
+      });
+    });
+
+    it('reissues a crashed attempt 3, converges on idempotent success, and never starts a fourth attempt', async () => {
+      await seed({
+        cleanup_attempts: 3,
+        last_error_code: 'NETWORK_FAILURE',
+        lease_owner: 'worker.crashed',
+        lease_expires_at: new Date(Date.now() - 1000),
+      });
+      const [claimed] = await claim();
+      expect(claimed).toMatchObject({ cleanupAttempts: 3, version: '5' });
+      const outcome = await dispose(
+        deleted({ expectedVersion: claimed.version }),
+      );
+      expect(outcome).toMatchObject({ kind: 'cleaned', attempt: 3 });
+      expect(await claim()).toHaveLength(0);
+      expect(await rowOf()).toMatchObject({
+        cleanup_pending: false,
+        cleanup_attempts: 3,
+        lease_owner: null,
+        lease_expires_at: null,
+        version: '6',
+      });
+    });
+
+    it('fences malformed commands, mismatched fences, and out-of-lifecycle rows without mutation', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      for (const over of [
+        { owner: RIVAL },
+        { expectedVersion: '4' },
+        { expectedVersion: '6' },
+        { expectedVersion: '0' },
+        { expectedVersion: '2.5' },
+        { expectedVersion: '' },
+        { id: UUID_C },
+        { id: 'not-a-uuid' },
+        { outcome: 'nope' },
+        { outcome: undefined },
+        { outcome: 'failed', code: undefined },
+        { outcome: 'failed', code: 'UNKNOWN' },
+        { outcome: 'failed', code: '' },
+        { outcome: 'failed', category: 'META_TRANSPORT' },
+        { outcome: 'failed', category: 'OTHER' },
+      ])
+        await expectFenced({ ...deleteFailed('NETWORK_FAILURE'), ...over });
+      for (const over of [
+        { cleanup_pending: false },
+        { cleanup_attempts: 0 },
+        { lease_owner: null, lease_expires_at: null },
+        { lease_expires_at: new Date(Date.now() - 1000) },
+      ]) {
+        await seed(live({ cleanup_attempts: 1, ...over }));
+        await expectFenced(deleteFailed('NETWORK_FAILURE'));
+      }
+      await seeds([
+        lifeRow('DOWNLOADED', null, {
+          id: UUID_A,
+          webhook_message_id: 'wamid.cleanup',
+          provider_media_id: 'media.cleanup',
+          sender_id: SENDER,
+          captured_sale_id: UUID_B,
+          object_key: `receipts/${UUID_C}`,
+          next_attempt_at: T0,
+          ...live(),
+        }),
+      ]);
+      await expectFenced(deleteFailed('NETWORK_FAILURE'));
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('fences a disposition whose row-lock wait outlives the lease', async () => {
+      await seed(
+        live({
+          cleanup_attempts: 1,
+          lease_expires_at: new Date(Date.now() + 250),
+        }),
+      );
+      const before = await rowOf();
+      const locker = await pool.connect();
+      let observed: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+          [UUID_A],
+        );
+        const pending = dispose(deleteFailed('NETWORK_FAILURE'));
+        observed = pending.catch(() => undefined);
+        while (Date.now() < +(before.lease_expires_at as number) + 20)
+          await sleep(20);
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await rowOf()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observed;
+      }
+    });
+
+    it('converges concurrent rival dispositions on one outcome with exactly one version bump', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      const [a, b] = await Promise.all([
+        dispose(deleted()),
+        dispose(deleted()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['cleaned', 'fenced']);
+      expect(await rowOf()).toMatchObject({
+        cleanup_pending: false,
+        cleanup_attempts: 1,
+        lease_owner: null,
+        version: '6',
+      });
+      // A rival failure racing a success cannot win any second write either.
+      await seed(live({ cleanup_attempts: 1 }));
+      const [c, d] = await Promise.all([
+        dispose(deleted()),
+        dispose(deleteFailed('NETWORK_FAILURE')),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['cleaned', 'fenced']);
+      expect(await rowOf()).toMatchObject({ version: '6' });
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('fails closed on a malformed runtime limit without claiming or mutating any row', async () => {
+      const malformed: unknown[] = [
+        null,
+        undefined,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        1.5,
+        0,
+        -1,
+        '5',
+        true,
+        2 ** 53,
+      ];
+      for (const limit of malformed) {
+        await seed();
+        const before = await rowOf();
+        await expect(claimRaw(limit, OWNER)).resolves.toEqual([]);
+        expect(await rowOf()).toEqual(before);
+      }
+      // A valid boundary limit still claims the eligible backlog.
+      await seed();
+      expect(await claimRaw(1, OWNER)).toHaveLength(1);
+    });
+
+    it('fails closed on a malformed runtime owner without claiming or mutating any row', async () => {
+      const malformed: unknown[] = [
+        null,
+        undefined,
+        '',
+        123,
+        true,
+        {},
+        'x'.repeat(101),
+      ];
+      for (const owner of malformed) {
+        await seed();
+        const before = await rowOf();
+        await expect(claimRaw(5, owner)).resolves.toEqual([]);
+        expect(await rowOf()).toEqual(before);
+      }
+      // A valid maximum-length owner still claims the eligible backlog.
+      await seed();
+      expect(await claimRaw(5, 'x'.repeat(100))).toHaveLength(1);
+    });
+
+    it('never claims a safe-looking delete code under a non-OBJECT_STORAGE category', async () => {
+      const safeLookingCodes = [
+        'STORAGE_EXHAUSTED',
+        'CLEANUP_PENDING',
+        'ABORTED',
+        'HTTP_RETRYABLE',
+        'NETWORK_FAILURE',
+      ];
+      for (const code of safeLookingCodes) {
+        for (const category of ['META_TRANSPORT', 'OTHER', '', null]) {
+          await seed({
+            last_error_category: category,
+            last_error_code: code,
+          });
+          expect(await claim()).toHaveLength(0);
+          expect(await rowOf()).toMatchObject({
+            cleanup_pending: true,
+            cleanup_attempts: 0,
+            lease_owner: null,
+            version: '4',
+          });
+        }
+      }
+      // Control: the exact OBJECT_STORAGE category with the same code claims.
+      await seed({ last_error_category: 'OBJECT_STORAGE' });
+      expect(await claim()).toHaveLength(1);
+    });
+  });
+
   describe('WU11A3B atomic attach unknown-outcome commit', () => {
     const OWNER = 'worker.attach-unknown';
     const REQUEST_ID = UUID_B;

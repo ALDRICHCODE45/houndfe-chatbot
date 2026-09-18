@@ -296,6 +296,43 @@ export interface LeaseFenceInput {
   expectedVersion: string;
 }
 
+/** ODD-2D2a fixed cleanup technical-delete failure taxonomy: the three
+ * retryable delete codes and the four permanent delete codes. Every other
+ * category/code pair is malformed and never reaches the database. */
+export type CleanupDispositionCode =
+  | 'ABORTED'
+  | 'HTTP_RETRYABLE'
+  | 'NETWORK_FAILURE'
+  | 'OBJECT_KEY_INVALID'
+  | 'REQUEST_INVALID'
+  | 'HTTP_PERMANENT'
+  | 'PERMANENT_FAILURE';
+
+/** ODD-2D2a cleanup command: either the idempotent delete succeeded (an
+ * exact 404 is success at the port) or it failed with one safe fixed
+ * category/code. Attempt, state, and scheduling are never caller values. */
+export type CleanupDispositionInput =
+  | (LeaseFenceInput & { outcome: 'deleted' })
+  | (LeaseFenceInput & {
+      outcome: 'failed';
+      category: 'OBJECT_STORAGE';
+      code: CleanupDispositionCode;
+    });
+
+/** ODD-2D2a one terminal outcome derived from the locked cleanup row:
+ * `cleaned` clears the backlog, `retry-scheduled` durably re-queues
+ * attempts 1/2, `manual-hold` parks a permanent failure or a third
+ * retryable failure with no automatic eligibility, and every malformed,
+ * mismatched, or out-of-lifecycle caller is `fenced`. */
+export type CleanupDispositionOutcome =
+  | {
+      kind: 'cleaned' | 'retry-scheduled' | 'manual-hold';
+      attempt: number;
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | { kind: 'fenced' };
+
 /** CAS fence: id + matching owner + expected status/version + live lease. */
 export interface StatusCasInput {
   id: string;
@@ -479,6 +516,36 @@ export interface ReceiptMediaStorePort {
   commitStorageFailureDisposition(
     input: StorageFailureDispositionInput,
   ): Promise<StorageFailureDispositionOutcome>;
+  /** ODD-2D2a narrow cleanup claim/start: a short `FOR UPDATE SKIP LOCKED`
+   * transaction over only `FAILED/STORAGE_EXHAUSTED_PRE_ACCEPTANCE` rows
+   * with `cleanup_pending = true`, a due `next_attempt_at`, no live lease,
+   * and a backlog/retryable delete error code. Deterministic
+   * `next_attempt_at`/`created_at` order, bounded batch, 60-second lease,
+   * and a version bump. The logical attempt is derived from the locked
+   * row: an initial backlog or lease-cleared row starts the next attempt
+   * (1..3); an expired non-null lease at attempts 1..3 reclaims the same
+   * ambiguous logical attempt without increment; a lease-cleared attempt 3
+   * and any permanent code stay held. Never claims STORED or generic
+   * eligibility, and never calls the external delete. */
+  claimCleanupBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;
+  /** ODD-2D2a fenced cleanup disposition: under the caller's exact
+   * lease/version fence and a live `clock_timestamp()` lease, the locked
+   * cleanup row decides its own outcome from its stored
+   * `cleanup_attempts`. Success keeps `FAILED`/`failure_stage`, clears
+   * `cleanup_pending` and the lease, and bumps the version with no intent
+   * and no accepted-object/capability mutation. A retryable delete failure
+   * (`ABORTED`, `HTTP_RETRYABLE`, `NETWORK_FAILURE`) at attempts 1/2 keeps
+   * the backlog and persists only the safe category/code plus a 1s/4s base
+   * with bounded positive jitter; at attempt 3 it becomes a manual hold.
+   * Every permanent delete failure (`OBJECT_KEY_INVALID`,
+   * `REQUEST_INVALID`, `HTTP_PERMANENT`, `PERMANENT_FAILURE`) at any
+   * attempt is a manual hold: backlog retained, safe error persisted, lease
+   * cleared, version bumped, and no automatic eligibility. Malformed
+   * commands, unknown category/code pairs, and mismatched fences return
+   * `fenced` without mutation. */
+  commitCleanupDisposition(
+    input: CleanupDispositionInput,
+  ): Promise<CleanupDispositionOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment;
    * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */
