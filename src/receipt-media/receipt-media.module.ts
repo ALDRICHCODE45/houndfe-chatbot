@@ -172,21 +172,23 @@ const WORKER_MIN_POLL_MS = 50;
  * WU14A outbox drain store and the WU9 notification worker (they are never
  * registered as DI tokens) and forwards start/drain exactly once — the
  * start guard makes repeated bootstrap invocations AND a bootstrap after
- * shutdown no-ops, so no second claim loop can be orphaned and no restart
- * can happen after stop. On Nest shutdown its `onModuleDestroy` awaits
- * the worker's in-flight sends and stops the claim loop BEFORE the real
- * PostgresPoolLifecycle (in DatabaseModule, strictly farther from the
- * root) invokes `pool.end`, so no notification transaction can run
- * against a closed pool. In disabled mode both hooks are inert: no
- * worker, no store, no claims, no timers, no sends, no alerts. Enable/
- * disable is configuration + graceful restart/redeploy, never a live
- * runtime toggle. */
+ * shutdown no-ops, and an independent `stopped` latch covers destruction
+ * BEFORE the first bootstrap, when no worker exists yet, so no second claim
+ * loop can be orphaned and no restart can happen after stop. On Nest
+ * shutdown its `onModuleDestroy` awaits the worker's in-flight sends and
+ * stops the claim loop BEFORE the real PostgresPoolLifecycle (in
+ * DatabaseModule, strictly farther from the root) invokes `pool.end`, so no
+ * notification transaction can run against a closed pool. In disabled mode
+ * both hooks are inert: no worker, no store, no claims, no timers, no
+ * sends, no alerts. Enable/disable is configuration + graceful restart/
+ * redeploy, never a live runtime toggle. */
 @Injectable()
 class ReceiptMediaNotificationLifecycle
   implements OnApplicationBootstrap, OnModuleDestroy
 {
   private worker: ReceiptMediaNotificationWorker | undefined;
   private started = false;
+  private stopped = false;
 
   constructor(
     private readonly config: ConfigService,
@@ -197,10 +199,12 @@ class ReceiptMediaNotificationLifecycle
 
   /** Starts the drain exactly once per coordinator instance — repeated
    * and post-shutdown invocations are no-ops (the worker reference alone
-   * cannot protect a NEW instance, so a latched flag guards both).
-   * Disabled mode constructs nothing and performs no I/O. */
+   * cannot protect a NEW instance, so a latched flag guards both; the
+   * `stopped` latch also covers destruction BEFORE the first bootstrap,
+   * when no worker exists yet). Disabled mode constructs nothing and
+   * performs no I/O. */
   onApplicationBootstrap(): void {
-    if (this.started || !isEnabled(this.config)) return;
+    if (this.started || this.stopped || !isEnabled(this.config)) return;
     this.started = true;
     // Validated worker fields only: concurrency supplies batch size and
     // max concurrency; the validated poll interval (normalized up to
@@ -230,8 +234,11 @@ class ReceiptMediaNotificationLifecycle
   }
 
   /** Drains in-flight sends and stops claims exactly once; disabled mode
-   * has nothing to drain. */
+   * has nothing to drain. The `stopped` latch is set even when no worker
+   * was ever constructed, so a later bootstrap cannot restart the lifecycle
+   * after shutdown/pool close. */
   onModuleDestroy(): Promise<void> {
+    this.stopped = true;
     return this.worker?.onModuleDestroy() ?? Promise.resolve();
   }
 

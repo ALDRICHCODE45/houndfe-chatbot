@@ -932,6 +932,48 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       }
     });
 
+    it('latches shutdown before any bootstrap so a later bootstrap cannot start a notification drain', async () => {
+      const outbox = makeOutboxPool([[outboxRow()]]);
+      const sendText = jest.fn(() =>
+        Promise.resolve({ providerMessageId: 'wamid.NEVER' }),
+      );
+      const { builder } = buildModule(
+        RECEIPT_ENABLED_ENV,
+        outbox.pool,
+        sendText,
+      );
+      const moduleRef = await builder.compile();
+      try {
+        const coordinator = resolveLifecycleCoordinator(moduleRef);
+        // Destruction happens BEFORE any bootstrap: the coordinator must
+        // latch terminated independently of whether a worker ever existed.
+        await coordinator.onModuleDestroy();
+        // Safe repeated destroy before bootstrap.
+        await coordinator.onModuleDestroy();
+        // A later bootstrap must NOT construct/start a worker: no claim, no
+        // timer/rearm, no send.
+        coordinator.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(outbox.claims).toHaveLength(0);
+        expect(sendText).not.toHaveBeenCalled();
+        // No notification claim/mark SQL ran before the pool lifecycle
+        // ended it: the sequence holds only the eventual `end` marker.
+        expect(outbox.sequence).toEqual([]);
+        expect(outbox.marks).toEqual([]);
+        // Still inert after another destroy and time advance.
+        await coordinator.onModuleDestroy();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(outbox.claims).toHaveLength(0);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+      // The real pool lifecycle closed the pool last; nothing ran after.
+      expect(outbox.queriesAfterEnd()).toBe(0);
+    });
+
     it('claims committed intents only after real init() through the real outbox store', async () => {
       const outbox = makeOutboxPool([[outboxRow()]]);
       const sendText = jest.fn(() =>
