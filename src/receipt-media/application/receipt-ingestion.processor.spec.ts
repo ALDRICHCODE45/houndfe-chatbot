@@ -5,6 +5,7 @@ import {
 } from '../domain/meta-media.port';
 import {
   ObjectStorageError,
+  type ObjectStorageErrorCode,
   type PutObjectInput,
 } from '../domain/object-storage.port';
 import type {
@@ -101,6 +102,9 @@ const fixture = (
     // ODD-2C: durable Meta failure disposition. Tests that read the outcome
     // install an explicit resolution; the ABORTED path never reads it.
     commitMetaFailureDisposition: jest.fn(),
+    // ODD-2D1: durable storage failure disposition. Tests that read the
+    // outcome install an explicit resolution.
+    commitStorageFailureDisposition: jest.fn(),
   };
 
   const processor = new ReceiptIngestionProcessor(
@@ -313,31 +317,59 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
     );
   });
 
-  it('uses the retry winner evidence and a fresh stream', async () => {
+  it('performs exactly one PutObject attempt per claim, durably schedules a retry, and destroys the failed stream', async () => {
     const f = fixture({ status: 'DOWNLOADED' });
     const issue = jest.spyOn(f.capability, 'issue');
-    let firstStream: PutObjectInput['content'] | null = null;
+    let stream!: PutObjectInput['content'];
+    f.storage.put.mockImplementationOnce((input) => {
+      stream = input.content;
+      return Promise.reject(
+        new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
+      );
+    });
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 1,
+      version: '3',
+    });
+    f.store.startStorageAttempt.mockResolvedValue(null);
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'retry-scheduled',
+      attempt: 1,
+      version: '4',
+      receipt: f.receipt,
+    });
+
+    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
+      kind: 'storage-retry-scheduled',
+      attempt: 1,
+      code: 'HTTP_RETRYABLE',
+    });
+    expect(f.storage.put).toHaveBeenCalledTimes(1);
+    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
+    expect(stream.destroyed).toBe(true);
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+    expect(issue).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+  });
+
+  it('uploads once on a later claim with a fresh stream and bootstraps', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    const issue = jest.spyOn(f.capability, 'issue');
     f.storage.put.mockImplementation((input) => {
-      if (firstStream === null) {
-        firstStream = input.content;
-        return Promise.reject(
-          new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
-        );
-      }
       input.content.destroy();
       return Promise.resolve({ etag: 'retry-etag', versionId: null });
     });
-    f.store.startStorageAttempt
-      .mockResolvedValueOnce({ attempt: 1, version: '3' })
-      .mockResolvedValueOnce({ attempt: 2, version: '4' });
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 2,
+      version: '4',
+    });
 
     await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
       kind: 'stored',
     });
 
     const streams = f.storage.put.mock.calls.map(([input]) => input.content);
-    expect(streams[0].destroyed).toBe(true);
-    expect(new Set(streams).size).toBe(2);
+    expect(streams).toHaveLength(1);
     expect(f.store.bootstrapAmount).toHaveBeenCalledWith({
       id: 'r1',
       owner: 'w1',
@@ -410,7 +442,7 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
     expect(bootstrapFailure.cleanup).toHaveBeenCalledTimes(1);
   });
 
-  it('preserves null-meta, retry, and storage fence gates before bootstrap', async () => {
+  it('preserves null-meta and storage fence gates before bootstrap', async () => {
     const meta = fixture({ status: 'DOWNLOADED' });
     meta.store.startMetaAttempt.mockResolvedValue(null);
     await expect(meta.processor.process(meta.receipt, 'w1')).resolves.toEqual({
@@ -419,19 +451,16 @@ describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
     });
     expect(meta.cleanup).not.toHaveBeenCalled();
 
-    const retry = fixture({ status: 'DOWNLOADED' });
-    retry.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
-    );
-    retry.store.startStorageAttempt
-      .mockResolvedValueOnce({ attempt: 1, version: '3' })
-      .mockResolvedValueOnce({ attempt: 2, version: '4' })
-      .mockResolvedValueOnce({ attempt: 3, version: '5' })
-      .mockResolvedValue(null);
-    await expect(retry.processor.process(retry.receipt, 'w1')).resolves.toEqual(
-      { kind: 'blocked', stage: 'storage' },
-    );
-    expect(retry.store.bootstrapAmount).not.toHaveBeenCalled();
+    const storage = fixture({ status: 'DOWNLOADED' });
+    storage.store.startStorageAttempt.mockResolvedValueOnce(null);
+    await expect(
+      storage.processor.process(storage.receipt, 'w1'),
+    ).resolves.toEqual({ kind: 'blocked', stage: 'storage' });
+    expect(storage.storage.put).not.toHaveBeenCalled();
+    expect(
+      storage.store.commitStorageFailureDisposition,
+    ).not.toHaveBeenCalled();
+    expect(storage.store.bootstrapAmount).not.toHaveBeenCalled();
   });
 });
 
@@ -473,7 +502,7 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
     expect(f.storage.put).not.toHaveBeenCalled();
   });
 
-  it('aborts the storage retry loop without consuming further attempts', async () => {
+  it('aborts a caller-cancelled upload after one attempt without consuming further attempts', async () => {
     const f = fixture({ status: 'DOWNLOADED' });
     const controller = new AbortController();
     let put!: PutObjectInput;
@@ -482,14 +511,27 @@ describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
       input.content.destroy();
       controller.abort();
       return Promise.reject(
-        new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
+        new ObjectStorageError('OBJECT_STORAGE', 'ABORTED'),
       );
+    });
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'retry-scheduled',
+      attempt: 1,
+      version: '4',
+      receipt: f.receipt,
     });
     expect(
       await f.processor.process(f.receipt, 'w1', controller.signal),
     ).toEqual({ kind: 'aborted', stage: 'storage' });
     expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
     expect(f.storage.put).toHaveBeenCalledTimes(1);
+    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith({
+      id: 'r1',
+      owner: 'w1',
+      expectedVersion: '3',
+      category: 'OBJECT_STORAGE',
+      code: 'ABORTED',
+    });
     expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
     expect(f.cleanup).toHaveBeenCalledTimes(1);
     expect(put.abortSignal).toBe(controller.signal);
@@ -615,8 +657,12 @@ describe('ReceiptIngestionProcessor durable Meta failure disposition (ODD-2C)', 
     expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
   });
 
-  it('processes a claimed DOWNLOADED count-3 row through the exhaustion disposition', async () => {
-    const f = fixture({ status: 'DOWNLOADED', metaAttempts: 3 });
+  it('processes a claimed DOWNLOADED row with metaAttempts=3 and storageAttempts<3 through the Meta exhaustion disposition', async () => {
+    const f = fixture({
+      status: 'DOWNLOADED',
+      metaAttempts: 3,
+      storageAttempts: 2,
+    });
     f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
       kind: 'terminal',
       failureStage: 'META_EXHAUSTED_PRE_STORAGE',
@@ -632,6 +678,7 @@ describe('ReceiptIngestionProcessor durable Meta failure disposition (ODD-2C)', 
     expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
     expect(f.store.startStorageAttempt).not.toHaveBeenCalled();
     expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.store.commitStorageFailureDisposition).not.toHaveBeenCalled();
   });
 
   it('still rethrows a non-Meta error without any disposition', async () => {
@@ -642,5 +689,295 @@ describe('ReceiptIngestionProcessor durable Meta failure disposition (ODD-2C)', 
     );
     expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
     expect(f.storage.put).not.toHaveBeenCalled();
+  });
+});
+
+// ODD-2D1: the storage retry loop is replaced by exactly one PutObject
+// attempt per claim; every caught ObjectStorageError is durably committed
+// through the narrow storage disposition seam, and a claimed
+// storage_attempts>=3 DOWNLOADED row is terminalized before any Meta or
+// storage call.
+describe('ReceiptIngestionProcessor durable storage failure disposition (ODD-2D1)', () => {
+  const command = (over: Record<string, unknown> = {}) => ({
+    id: 'r1',
+    owner: 'w1',
+    expectedVersion: '3',
+    category: 'OBJECT_STORAGE',
+    code: 'HTTP_RETRYABLE',
+    ...over,
+  });
+
+  it('durably schedules a retry after exactly one PutObject for a transient attempt 1/2 failure', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    f.storage.put.mockRejectedValue(
+      new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
+    );
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 2,
+      version: '4',
+    });
+    f.store.startStorageAttempt.mockResolvedValue(null);
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'retry-scheduled',
+      attempt: 2,
+      version: '5',
+      receipt: f.receipt,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'storage-retry-scheduled',
+      attempt: 2,
+      code: 'HTTP_RETRYABLE',
+    });
+    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
+      command({ expectedVersion: '4' }),
+    );
+    expect(f.storage.put).toHaveBeenCalledTimes(1);
+    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
+    expect(f.capability.issue).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes permanent and retryable attempt-3 storage failures with the fixed identity', async () => {
+    const cases: Array<[number, ObjectStorageErrorCode]> = [
+      [1, 'HTTP_PERMANENT'],
+      [1, 'PERMANENT_FAILURE'],
+      [2, 'OBJECT_NOT_FOUND'],
+      [3, 'HTTP_RETRYABLE'],
+      [3, 'NETWORK_FAILURE'],
+    ];
+    for (const [attempt, code] of cases) {
+      const f = fixture({ status: 'DOWNLOADED' });
+      f.storage.put.mockRejectedValue(
+        new ObjectStorageError('OBJECT_STORAGE', code),
+      );
+      f.store.startStorageAttempt.mockResolvedValueOnce({
+        attempt,
+        version: '4',
+      });
+      f.store.startStorageAttempt.mockResolvedValue(null);
+      f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+        kind: 'terminal',
+        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+        version: '5',
+        receipt: f.receipt,
+        intent: {} as ReceiptMediaOutboxRow,
+      });
+      expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+        kind: 'storage-terminal',
+        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+        code,
+      });
+      expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
+        command({ expectedVersion: '4', code }),
+      );
+      expect(f.storage.put).toHaveBeenCalledTimes(1);
+      expect(f.capability.issue).not.toHaveBeenCalled();
+      expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+    }
+  });
+
+  it('terminalizes CLEANUP_PENDING at attempt 1 with the safe cleanup backlog', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    f.storage.put.mockRejectedValue(
+      new ObjectStorageError('OBJECT_STORAGE', 'CLEANUP_PENDING'),
+    );
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 1,
+      version: '3',
+    });
+    f.store.startStorageAttempt.mockResolvedValue(null);
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      version: '4',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'storage-terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      code: 'CLEANUP_PENDING',
+    });
+    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
+      command({ code: 'CLEANUP_PENDING' }),
+    );
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+  });
+
+  it('reports a stable storage fence outcome with no capability or bootstrap action', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    f.storage.put.mockRejectedValue(
+      new ObjectStorageError('OBJECT_STORAGE', 'NETWORK_FAILURE'),
+    );
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 1,
+      version: '3',
+    });
+    f.store.startStorageAttempt.mockResolvedValue(null);
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'fenced',
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'storage-fenced',
+      code: 'NETWORK_FAILURE',
+    });
+    expect(f.capability.issue).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes a claimed DOWNLOADED storageAttempts>=3 row before any Meta or storage call', async () => {
+    const f = fixture({ status: 'DOWNLOADED', storageAttempts: 3 });
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      version: '2',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'storage-terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      code: 'STORAGE_EXHAUSTED',
+    });
+    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
+      command({ expectedVersion: '1', code: 'STORAGE_EXHAUSTED' }),
+    );
+    expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
+    expect(f.store.startStorageAttempt).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
+    expect(f.cleanup).not.toHaveBeenCalled();
+    expect(f.capability.issue).not.toHaveBeenCalled();
+  });
+
+  it('prefers storage exhaustion over Meta exhaustion when both counters are 3', async () => {
+    const f = fixture({
+      status: 'DOWNLOADED',
+      metaAttempts: 3,
+      storageAttempts: 3,
+    });
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      version: '2',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'storage-terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      code: 'STORAGE_EXHAUSTED',
+    });
+    expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
+  });
+
+  it('fences a reclaimed storage-exhausted recovery without a Meta or storage call', async () => {
+    const f = fixture({ status: 'DOWNLOADED', storageAttempts: 3 });
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'fenced',
+    });
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'storage-fenced',
+      code: 'STORAGE_EXHAUSTED',
+    });
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
+  });
+
+  it('leaves RESERVED behavior unchanged even when storageAttempts is at the cap', async () => {
+    const f = fixture({ status: 'RESERVED', storageAttempts: 3 });
+    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
+      kind: 'downloaded',
+    });
+    expect(f.store.commitStorageFailureDisposition).not.toHaveBeenCalled();
+    expect(f.store.startMetaAttempt).toHaveBeenCalledTimes(1);
+  });
+
+  it('destroys the stream and rethrows an unknown error only after cleanup', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    let stream!: PutObjectInput['content'];
+    f.storage.put.mockImplementation((input) => {
+      stream = input.content;
+      return Promise.reject(new Error('raw-storage-diagnostics'));
+    });
+    f.store.startStorageAttempt.mockResolvedValue({ attempt: 1, version: '3' });
+    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
+      'raw-storage-diagnostics',
+    );
+    expect(stream.destroyed).toBe(true);
+    expect(f.store.commitStorageFailureDisposition).not.toHaveBeenCalled();
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the durable disposition and reports cleanup-failed when temp cleanup fails', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    f.storage.put.mockRejectedValue(
+      new ObjectStorageError('OBJECT_STORAGE', 'HTTP_PERMANENT'),
+    );
+    f.store.startStorageAttempt.mockResolvedValue({ attempt: 1, version: '3' });
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      version: '4',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    f.cleanup.mockRejectedValue(new Error('raw-unlink-diagnostics'));
+    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
+      kind: 'cleanup-failed',
+    });
+    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledTimes(1);
+    expect(f.capability.issue).not.toHaveBeenCalled();
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+  });
+
+  it('cleans up once and rethrows when the disposition itself throws', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    f.storage.put.mockRejectedValue(
+      new ObjectStorageError('OBJECT_STORAGE', 'NETWORK_FAILURE'),
+    );
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 1,
+      version: '3',
+    });
+    f.store.startStorageAttempt.mockResolvedValue(null);
+    f.store.commitStorageFailureDisposition.mockRejectedValue(
+      new Error('disposition-down'),
+    );
+    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
+      'disposition-down',
+    );
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+    expect(f.capability.issue).not.toHaveBeenCalled();
+  });
+
+  it('never calls the technical delete while persisting the cleanup backlog', async () => {
+    const f = fixture({ status: 'DOWNLOADED' });
+    const deleteTechnicalObject = jest.fn();
+    (f.storage as unknown as Record<string, unknown>).deleteTechnicalObject =
+      deleteTechnicalObject;
+    f.storage.put.mockRejectedValue(
+      new ObjectStorageError('OBJECT_STORAGE', 'CLEANUP_PENDING'),
+    );
+    f.store.startStorageAttempt.mockResolvedValueOnce({
+      attempt: 1,
+      version: '3',
+    });
+    f.store.startStorageAttempt.mockResolvedValue(null);
+    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
+      kind: 'terminal',
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      version: '4',
+      receipt: f.receipt,
+      intent: {} as ReceiptMediaOutboxRow,
+    });
+    await f.processor.process(f.receipt, 'w1');
+    expect(deleteTechnicalObject).not.toHaveBeenCalled();
   });
 });

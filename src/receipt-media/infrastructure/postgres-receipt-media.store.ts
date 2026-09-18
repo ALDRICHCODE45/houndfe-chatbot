@@ -42,6 +42,8 @@ import type {
   ReservationOutcome,
   ReserveInput,
   StatusCasInput,
+  StorageFailureDispositionInput,
+  StorageFailureDispositionOutcome,
 } from '../domain/receipt-media-store.port';
 import {
   RECEIPT_MAX_BYTES,
@@ -243,6 +245,63 @@ const META_TERMINAL_SQL = `UPDATE receipt_media
         AND attach_http_status IS NULL AND attach_transport_code IS NULL
         AND attach_outcome_observed_at IS NULL RETURNING *`;
 
+/** ODD-2D1 fresh storage disposition lock: the exact owned, live-leased
+ * DOWNLOADED row at the caller's expected version read under
+ * `clock_timestamp()` and a row lock, so every routing, state, attempt,
+ * status, deadline, cleanup-flag, and intent value comes from the durable
+ * row and a lease that expires while this transaction waits can never
+ * authorize a mutation. */
+const STORAGE_FAILURE_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status = 'DOWNLOADED' FOR UPDATE`;
+
+/** ODD-2D1 storage terminal replay/repair fence: the exact owned,
+ * live-leased terminal successor read under `clock_timestamp()` and a row
+ * lock, so a lease that expires or is released while this transaction waits
+ * on a concurrent writer can never authorize a replay or a legacy
+ * missing-intent repair. */
+const STORAGE_FAILURE_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2
+        AND lease_expires_at > clock_timestamp() FOR UPDATE`;
+
+/** ODD-2D1 transient retry schedule: retain the DOWNLOADED status and every
+ * required download column, persist only the safe category/code, set the
+ * deadline from DB clock time, clear both lease fields, and bump the
+ * version; no intent is created. */
+const STORAGE_RETRY_SQL = `UPDATE receipt_media
+      SET last_error_category = $5, last_error_code = $6,
+        next_attempt_at = clock_timestamp() + ($7::int * interval '1 millisecond'),
+        lease_owner = NULL, lease_expires_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status = 'DOWNLOADED' AND storage_attempts = $4::int
+      RETURNING *`;
+
+/** ODD-2D1 permanent/exhausted terminal transition: one atomic, parameter-
+ * bound fenced UPDATE to FAILED with the derived failure stage, safe error
+ * evidence, the derived cleanup backlog flag, terminal_at, and every
+ * accepted-object/capability column cleared. Every required download column
+ * is retained — `STORAGE_EXHAUSTED_PRE_ACCEPTANCE` still owns its download
+ * evidence. ODD-2D1 fences with `clock_timestamp()` so a row-lock wait that
+ * outlives the lease cannot commit. */
+const STORAGE_TERMINAL_SQL = `UPDATE receipt_media
+      SET status = 'FAILED', failure_stage = $5, last_error_category = $6,
+        last_error_code = $7, cleanup_pending = $8::boolean,
+        terminal_at = clock_timestamp(), stored_at = NULL,
+        object_etag = NULL, object_version_id = NULL,
+        capability_token_hash = NULL, capability_key_version = NULL,
+        capability_key_version_text = NULL, capability_issued_at = NULL,
+        capability_revoked_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status = 'DOWNLOADED' AND storage_attempts = $4::int
+        AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
+        AND attach_http_status IS NULL AND attach_transport_code IS NULL
+        AND attach_outcome_observed_at IS NULL RETURNING *`;
+
 const MAX_INT32 = 2_147_483_647;
 
 /** ODD-2C fixed Meta disposition taxonomy. MEDIA_VALIDATION codes are
@@ -267,16 +326,15 @@ const META_RETRYABLE_CODES = new Set<string>([
 ]);
 const META_EXHAUSTED = 'META_EXHAUSTED';
 
-/** Documented bounded positive retry jitter for pre-storage Meta failures:
- * attempt 1 waits 1s plus 0..250ms, attempt 2 waits 4s plus 0..1000ms
- * (25% of the base), so a retry deadline is never earlier than its base. */
-const META_RETRY_BASE_MS = [1000, 4000];
-const META_RETRY_JITTER_RATIO = 0.25;
-const metaRetryDelayMs = (attempt: number): number => {
-  const base = META_RETRY_BASE_MS[attempt - 1];
-  return (
-    base + Math.floor(Math.random() * (base * META_RETRY_JITTER_RATIO + 1))
-  );
+/** Documented bounded positive retry jitter for pre-storage Meta and
+ * storage failures: attempt 1 waits 1s plus 0..250ms, attempt 2 waits 4s
+ * plus 0..1000ms (25% of the base), so a retry deadline is never earlier
+ * than its base. */
+const RETRY_BASE_MS = [1000, 4000];
+const RETRY_JITTER_RATIO = 0.25;
+const retryDelayMs = (attempt: number): number => {
+  const base = RETRY_BASE_MS[attempt - 1];
+  return base + Math.floor(Math.random() * (base * RETRY_JITTER_RATIO + 1));
 };
 
 /** The fixed safe command taxonomy; unknown category/code pairs never reach
@@ -310,6 +368,70 @@ const metaFailureDecision = (
     ? attempts < 3
       ? 'retry'
       : 'META_EXHAUSTED_PRE_STORAGE'
+    : null;
+};
+
+/** ODD-2D1 fixed storage disposition taxonomy. The retryable transport
+ * codes (`ABORTED`, `HTTP_RETRYABLE`, `NETWORK_FAILURE`) schedule attempts
+ * 1/2 and terminalize attempt 3; `CLEANUP_PENDING` is the safe cleanup
+ * backlog and terminalizes at any attempt with `cleanup_pending = true`;
+ * every other allowlisted code is a permanent pre-acceptance failure;
+ * `STORAGE_EXHAUSTED` is the fixed internal code for a reclaimed row
+ * already at `storage_attempts >= 3` and persists the same conservative
+ * `cleanup_pending = true` backlog. */
+const STORAGE_RETRYABLE_CODES = new Set<string>([
+  'ABORTED',
+  'HTTP_RETRYABLE',
+  'NETWORK_FAILURE',
+]);
+const STORAGE_PERMANENT_CODES = new Set<string>([
+  'OBJECT_KEY_INVALID',
+  'REQUEST_INVALID',
+  'RESPONSE_INVALID',
+  'HTTP_PERMANENT',
+  'PERMANENT_FAILURE',
+  'OBJECT_NOT_FOUND',
+]);
+const STORAGE_CLEANUP_PENDING = 'CLEANUP_PENDING';
+const STORAGE_EXHAUSTED = 'STORAGE_EXHAUSTED';
+
+/** The conservative terminal cleanup backlog flag: `CLEANUP_PENDING` is the
+ * observed backlog, and the fixed internal exhaustion code is treated the
+ * same because a reclaimed attempt-3 row may have uploaded before crashing.
+ * Every other terminal code persists no backlog. */
+const storageCleanupPending = (code: string): boolean =>
+  code === STORAGE_CLEANUP_PENDING || code === STORAGE_EXHAUSTED;
+
+/** The fixed safe storage command taxonomy; unknown category/code pairs
+ * never reach the database. */
+const isStorageFailureCommand = (category: unknown, code: unknown): boolean =>
+  category === 'OBJECT_STORAGE' &&
+  typeof code === 'string' &&
+  (STORAGE_RETRYABLE_CODES.has(code) ||
+    STORAGE_PERMANENT_CODES.has(code) ||
+    code === STORAGE_CLEANUP_PENDING ||
+    code === STORAGE_EXHAUSTED);
+
+/** Terminal stage for the locked row's fixed disposition, or `retry` for a
+ * retryable storage code below the attempt limit; null fences. The internal
+ * exhaustion code only terminalizes a genuinely exhausted row. */
+const storageFailureDecision = (
+  category: string,
+  code: string,
+  attempts: number,
+): 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE' | 'retry' | null => {
+  if (category !== 'OBJECT_STORAGE') return null;
+  if (code === STORAGE_EXHAUSTED)
+    return Number.isInteger(attempts) && attempts >= 3
+      ? 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+      : null;
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 3) return null;
+  if (code === STORAGE_CLEANUP_PENDING)
+    return 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+  if (STORAGE_RETRYABLE_CODES.has(code))
+    return attempts < 3 ? 'retry' : 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+  return STORAGE_PERMANENT_CODES.has(code)
+    ? 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
     : null;
 };
 
@@ -718,10 +840,11 @@ const attachDefiniteFailureIntentMatches = (
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
 
-/** Row-derived identity of the single unavailable-later intent: receipt
- * id, FAILED successor version, and stored webhook message only — never a
- * caller value, object key, URL, capability, or free text. */
-const metaFailureIntentKey = (
+/** Row-derived identity of the single unavailable-later intent shared by
+ * every pre-acceptance terminal failure: receipt id, FAILED successor
+ * version, and stored webhook message only — never a caller value, object
+ * key, URL, capability, or free text. */
+const unavailableLaterIntentKey = (
   receiptId: string,
   successor: string,
   webhookMessageId: string,
@@ -731,7 +854,7 @@ const metaFailureIntentKey = (
 /** Exact structural ownership proof for the `RECEIPT_UNAVAILABLE_LATER`
  * intent: the deterministic key plus every row-derived column, with the
  * single bounded empty-args shape. */
-const metaFailureIntentMatches = (
+const unavailableLaterIntentMatches = (
   row: Row | undefined,
   receiptId: string,
   successor: string,
@@ -1967,7 +2090,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
    * it or when an existing row is structurally exact; null when a
    * rival/foreign intent already owns the deterministic key so the caller
    * rolls back instead of replacing evidence. */
-  private async ownMetaFailureIntent(
+  private async ownUnavailableLaterIntent(
     c: PoolClient,
     receipt: Row,
   ): Promise<Row | null> {
@@ -1975,7 +2098,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     const successor = String(receipt.version);
     const webhookMessageId = receipt.webhook_message_id as string;
     const senderId = receipt.sender_id as string;
-    const dedupeKey = metaFailureIntentKey(
+    const dedupeKey = unavailableLaterIntentKey(
       receiptId,
       successor,
       webhookMessageId,
@@ -2004,7 +2127,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           [dedupeKey],
         )
       ).rows[0];
-    return metaFailureIntentMatches(
+    return unavailableLaterIntentMatches(
       owned,
       receiptId,
       successor,
@@ -2055,7 +2178,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       current.capability_revoked_at !== null
     )
       return { kind: 'fenced' };
-    const intent = await this.ownMetaFailureIntent(c, current);
+    const intent = await this.ownUnavailableLaterIntent(c, current);
     if (!intent) throw FENCED;
     return {
       kind: 'replayed',
@@ -2124,7 +2247,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             attempts,
             input.category,
             input.code,
-            metaRetryDelayMs(attempts),
+            retryDelayMs(attempts),
           ]);
           if (updated.rowCount !== 1) throw FENCED;
           const receipt = updated.rows[0];
@@ -2146,7 +2269,161 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         ]);
         if (updated.rowCount !== 1) throw FENCED;
         const receipt = updated.rows[0];
-        const intent = await this.ownMetaFailureIntent(c, receipt);
+        const intent = await this.ownUnavailableLaterIntent(c, receipt);
+        if (!intent) throw FENCED;
+        return {
+          kind: 'terminal',
+          failureStage: decision,
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
+          intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      if ((err as { code?: string }).code === '22P02')
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** ODD-2D1 storage terminal replay/legacy repair validation; see
+   * STORAGE_FAILURE_REPLAY_LOOK_SQL. The exact owned, live-leased terminal
+   * successor must prove every deterministic field, retained download
+   * evidence (never Meta's cleared-download shape), and cleared
+   * accepted-object/capability evidence; only then is the single row-derived
+   * intent owned (repairing an otherwise exact legacy successor missing
+   * it). */
+  private async replayStorageFailure(
+    c: PoolClient,
+    current: Row,
+    input: StorageFailureDispositionInput,
+    successor: string,
+  ): Promise<StorageFailureDispositionOutcome> {
+    const decision = storageFailureDecision(
+      input.category,
+      input.code,
+      current.storage_attempts as number,
+    );
+    if (decision === null || decision === 'retry') return { kind: 'fenced' };
+    if (
+      current.status !== 'FAILED' ||
+      current.failure_stage !== decision ||
+      String(current.version) !== successor ||
+      current.last_error_category !== input.category ||
+      current.last_error_code !== input.code ||
+      !(current.terminal_at instanceof Date) ||
+      !hasDownloadEvidence(current) ||
+      current.cleanup_pending !== storageCleanupPending(input.code) ||
+      current.stored_at !== null ||
+      current.object_etag !== null ||
+      current.object_version_id !== null ||
+      current.capability_token_hash !== null ||
+      current.capability_key_version !== null ||
+      current.capability_key_version_text !== null ||
+      current.capability_issued_at !== null ||
+      current.capability_revoked_at !== null ||
+      current.backend_receipt_id !== null ||
+      current.backend_receipt_status !== null ||
+      current.attach_http_status !== null ||
+      current.attach_transport_code !== null ||
+      current.attach_outcome_observed_at !== null
+    )
+      return { kind: 'fenced' };
+    const intent = await this.ownUnavailableLaterIntent(c, current);
+    if (!intent) throw FENCED;
+    return {
+      kind: 'replayed',
+      failureStage: decision,
+      version: successor,
+      receipt: camelize<Media>(current),
+      intent: camelize<ReceiptMediaOutboxRow>(intent),
+    };
+  }
+
+  /** ODD-2D1 durable storage failure disposition; see
+   * STORAGE_FAILURE_LOOK_SQL, STORAGE_RETRY_SQL, and STORAGE_TERMINAL_SQL.
+   * The caller supplies only the lease/version fence plus the fixed safe
+   * category/code; the locked DOWNLOADED row owns every routing, state,
+   * attempt, status, deadline, cleanup-flag, and intent value. A row already
+   * at `storage_attempts >= 3` is terminalized through the fixed internal
+   * exhaustion code with no fourth storage call. */
+  async commitStorageFailureDisposition(
+    input: StorageFailureDispositionInput,
+  ): Promise<StorageFailureDispositionOutcome> {
+    let successor: string | null;
+    try {
+      successor = successorVersion(input?.expectedVersion);
+    } catch {
+      return { kind: 'fenced' };
+    }
+    if (
+      successor === null ||
+      typeof input?.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input?.owner !== 'string' ||
+      input.owner.length === 0 ||
+      !isStorageFailureCommand(input?.category, input?.code)
+    )
+      return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const locked = (
+          await c.query<Row>(STORAGE_FAILURE_LOOK_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+          ])
+        ).rows[0];
+        if (!locked) {
+          const current = (
+            await c.query<Row>(STORAGE_FAILURE_REPLAY_LOOK_SQL, [
+              input.id,
+              input.owner,
+            ])
+          ).rows[0];
+          if (!current) return { kind: 'fenced' };
+          return await this.replayStorageFailure(c, current, input, successor);
+        }
+        const attempts = locked.storage_attempts as number;
+        const decision = storageFailureDecision(
+          input.category,
+          input.code,
+          attempts,
+        );
+        if (decision === null) return { kind: 'fenced' };
+        if (decision === 'retry') {
+          const updated = await c.query<Row>(STORAGE_RETRY_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+            attempts,
+            input.category,
+            input.code,
+            retryDelayMs(attempts),
+          ]);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'retry-scheduled',
+            attempt: attempts,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const updated = await c.query<Row>(STORAGE_TERMINAL_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          attempts,
+          decision,
+          input.category,
+          input.code,
+          storageCleanupPending(input.code),
+        ]);
+        if (updated.rowCount !== 1) throw FENCED;
+        const receipt = updated.rows[0];
+        const intent = await this.ownUnavailableLaterIntent(c, receipt);
         if (!intent) throw FENCED;
         return {
           kind: 'terminal',
@@ -2184,7 +2461,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
              AND ((status = 'RESERVED'
                  AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'DOWNLOADED'
-                 AND storage_attempts < 3
+                 AND (storage_attempts < 3 OR storage_attempts = 3)
                  AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'ATTACHING'))
            ORDER BY next_attempt_at, created_at

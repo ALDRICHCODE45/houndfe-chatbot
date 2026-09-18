@@ -7,6 +7,7 @@ import type {
   MetaMediaErrorCategory,
   MetaMediaErrorCode,
 } from './meta-media.port';
+import type { ObjectStorageErrorCode } from './object-storage.port';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -249,6 +250,44 @@ export type MetaFailureDispositionOutcome =
     }
   | { kind: 'fenced' };
 
+/** ODD-2D1 fixed internal exhaustion code for a reclaimed DOWNLOADED row
+ * already at `storage_attempts >= 3`: it terminalizes without a fourth
+ * storage call. */
+export const STORAGE_EXHAUSTED_CODE = 'STORAGE_EXHAUSTED';
+export type StorageDispositionCode =
+  | ObjectStorageErrorCode
+  | typeof STORAGE_EXHAUSTED_CODE;
+
+/** One immutable pre-acceptance storage failure disposition command: the
+ * existing lease/version fence plus the fixed safe object-storage
+ * category/code only. Every routing, state, attempt, status, deadline,
+ * cleanup flag, and intent value is derived from the locked durable row —
+ * never from the caller. */
+export interface StorageFailureDispositionInput extends LeaseFenceInput {
+  category: 'OBJECT_STORAGE';
+  code: StorageDispositionCode;
+}
+
+/** Transient attempts 1/2 schedule a durable retry with no intent;
+ * permanent, `CLEANUP_PENDING`, attempt-3, and internal exhaustion
+ * outcomes terminalize with exactly one row-derived deterministic intent;
+ * every other caller is fenced. */
+export type StorageFailureDispositionOutcome =
+  | {
+      kind: 'retry-scheduled';
+      attempt: number;
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | {
+      kind: 'terminal' | 'replayed';
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+      version: string;
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -415,6 +454,31 @@ export interface ReceiptMediaStorePort {
   commitMetaFailureDisposition(
     input: MetaFailureDispositionInput,
   ): Promise<MetaFailureDispositionOutcome>;
+  /** ODD-2D1 durable storage failure disposition (pre-acceptance): under
+   * the caller's exact lease/version fence and a live `clock_timestamp()`
+   * lease, the locked DOWNLOADED row with a started storage attempt decides
+   * its own outcome from its stored `storage_attempts`. Transient retryable
+   * attempts 1/2 retain the DOWNLOADED status and every required download
+   * column, persist only the safe category/code, set `next_attempt_at` from
+   * a documented 1s/4s base with bounded positive jitter, clear both lease
+   * fields, bump the version, and return a retry with no intent. Permanent
+   * codes, the cleanup-backlog code `CLEANUP_PENDING` at any attempt, and
+   * retryable/attempt-3 or internal `STORAGE_EXHAUSTED` exhaustion
+   * atomically set FAILED with `STORAGE_EXHAUSTED_PRE_ACCEPTANCE`, retain
+   * every required download column, keep accepted-object/capability
+   * evidence null, persist the derived `cleanup_pending` backlog flag, and
+   * own exactly one row-derived deterministic `RECEIPT_UNAVAILABLE_LATER`
+   * intent keyed `receipt-unavailable-later:<receiptId>:<successorVersion>:
+   * <storedWebhookMessageId>` with row-derived routing and exactly `{}`
+   * args in the same transaction. Only the exact terminal successor
+   * replaying the exact persisted intent replays — validating retained
+   * download evidence, never Meta's cleared-download shape — an otherwise
+   * exact legacy successor missing only that intent is repaired under the
+   * same live lease — and a mismatched/foreign intent, rival terminal
+   * evidence, or lost/expired lease fences without replacement. */
+  commitStorageFailureDisposition(
+    input: StorageFailureDispositionInput,
+  ): Promise<StorageFailureDispositionOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment;
    * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */
