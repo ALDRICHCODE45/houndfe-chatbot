@@ -359,8 +359,13 @@ export type DownloadCommitOutcome = {
   kind: 'committed' | 'replayed' | 'fenced';
 };
 
-/** Fenced DOWNLOADED → AWAITING_AMOUNT bootstrap input. Capability evidence is
- * hash-only; receipt-owned sender, sale, webhook, and pointer are derived. */
+/** Fenced DOWNLOADED → active-amount bootstrap input. The locked receipt's
+ * durable `declared_amount_cents` exclusively selects the successor: a null
+ * amount keeps `AWAITING_AMOUNT` with the empty `RECEIPT_AMOUNT_PROMPT`
+ * intent, while a valid positive int32 amount is retained and advances to
+ * `AWAITING_CONFIRMATION` with the `RECEIPT_AMOUNT_CONFIRM` `{ amountCents }`
+ * intent. Capability evidence is hash-only; receipt-owned sender, sale,
+ * webhook, and pointer are derived. */
 export interface AmountBootstrapInput extends LeaseFenceInput {
   objectEtag: string;
   objectVersionId: string | null;
@@ -562,8 +567,14 @@ export interface ReceiptMediaStorePort {
   transitionStatus(input: StatusCasInput): Promise<boolean>;
   /** Atomically persist download evidence while advancing the RESERVED successor. */
   commitDownload(input: DownloadCommitInput): Promise<DownloadCommitOutcome>;
-  /** Atomically store accepted object/capability evidence, create the initial
-   * pointer and deterministic empty amount prompt from the locked receipt. */
+  /** Atomically store accepted object/capability evidence and create the
+   * initial pointer from the locked receipt. The locked receipt's durable
+   * `declared_amount_cents` derives the successor: a null amount keeps the
+   * `AWAITING_AMOUNT` phase with the deterministic empty `RECEIPT_AMOUNT_PROMPT`
+   * intent, while a valid positive int32 amount is retained and advances to
+   * `AWAITING_CONFIRMATION` with `amount_proposed_at` stamped and the
+   * deterministic `RECEIPT_AMOUNT_CONFIRM` `{ amountCents }` intent. An
+   * out-of-contract durable amount fences without mutation. */
   bootstrapAmount(input: AmountBootstrapInput): Promise<AmountBootstrapOutcome>;
   /** Atomic pre-call Meta attempt start (max 3); loser null. */
   startMetaAttempt(input: LeaseFenceInput): Promise<AttemptStartResult | null>;

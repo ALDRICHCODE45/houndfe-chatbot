@@ -2370,6 +2370,223 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         bootstrap(store as unknown as BootstrapStore, command()),
       ).resolves.toMatchObject({ kind: 'replayed' });
     });
+
+    // --- ODD-4B caption-aware amount bootstrap ---
+
+    describe('ODD-4B caption-aware amount bootstrap', () => {
+      it('retains the null-amount prompt successor with no proposed timestamp', async () => {
+        await seed();
+        const outcome = await bootstrap(
+          store as unknown as BootstrapStore,
+          command(),
+        );
+        expect(outcome).toMatchObject({
+          kind: 'bootstrapped',
+          receipt: {
+            status: 'AWAITING_AMOUNT',
+            declaredAmountCents: null,
+            amountProposedAt: null,
+            version: '3',
+          },
+          intent: {
+            templateKey: 'RECEIPT_AMOUNT_PROMPT',
+            templateArgs: {},
+          },
+        });
+        const durable = await snapshot();
+        expect(durable.receipt).toMatchObject({
+          status: 'AWAITING_AMOUNT',
+          declared_amount_cents: null,
+          amount_proposed_at: null,
+        });
+        expect(durable.outbox).toHaveLength(1);
+      });
+
+      it('retains the durable caption amount and derives the confirmation successor', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const outcome = await bootstrap(
+          store as unknown as BootstrapStore,
+          command(),
+        );
+        expect(outcome.kind).toBe('bootstrapped');
+        if (outcome.kind === 'fenced') throw new Error('expected bootstrap');
+        expect(outcome.receipt).toMatchObject({
+          id: UUID_A,
+          status: 'AWAITING_CONFIRMATION',
+          declaredAmountCents: 1250,
+          version: '3',
+          attachStartedAt: null,
+          attachAttemptId: null,
+        });
+        expect(outcome.receipt.amountProposedAt).toBeInstanceOf(Date);
+        expect(outcome.intent).toMatchObject({
+          dedupeKey: `receipt-amount-confirm:${UUID_A}:2:wamid.amount-bootstrap`,
+          receiptMediaId: UUID_A,
+          receiptStateVersion: '3',
+          sourceWebhookMessageId: 'wamid.amount-bootstrap',
+          recipientId: SENDER,
+          templateKey: 'RECEIPT_AMOUNT_CONFIRM',
+          templateArgs: { amountCents: 1250 },
+        });
+        const durable = await snapshot();
+        expect(durable.receipt).toMatchObject({
+          status: 'AWAITING_CONFIRMATION',
+          declared_amount_cents: 1250,
+          version: '3',
+        });
+        expect(durable.receipt.amount_proposed_at).toBeInstanceOf(Date);
+        expect(durable.conversation).toEqual({
+          sibling: { keep: true },
+          receiptAmountPointer: {
+            receiptMediaId: UUID_A,
+            saleId: UUID_B,
+            receiptVersion: '3',
+          },
+        });
+        expect(durable.outbox).toHaveLength(1);
+        expect(durable.outbox[0].template_args).toEqual({ amountCents: 1250 });
+      });
+
+      it('replays the exact confirmation successor once without a second intent or version bump', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const input = command();
+        const first = await bootstrap(
+          store as unknown as BootstrapStore,
+          input,
+        );
+        expect(first.kind).toBe('bootstrapped');
+        const recreated = new PostgresReceiptMediaStore(
+          pool,
+        ) as unknown as BootstrapStore;
+        const replay = await bootstrap(recreated, input);
+        expect(replay.kind).toBe('replayed');
+        if (first.kind === 'fenced' || replay.kind === 'fenced')
+          throw new Error('expected bootstrap then replay');
+        expect(replay.intent).toEqual(first.intent);
+        expect(replay.receipt).toMatchObject({
+          status: 'AWAITING_CONFIRMATION',
+          declaredAmountCents: 1250,
+          version: '3',
+        });
+        const durable = await snapshot();
+        expect(durable.receipt.version).toBe('3');
+        expect(durable.outbox).toHaveLength(1);
+      });
+
+      type ConfirmationIntentCorruption =
+        | 'extra-argument'
+        | 'rival-amount'
+        | 'foreign-template'
+        | 'foreign-recipient'
+        | 'foreign-source'
+        | 'foreign-version'
+        | 'foreign-receipt-linkage';
+      const corruptConfirmationIntent = async (
+        corruption: ConfirmationIntentCorruption,
+      ): Promise<void> => {
+        switch (corruption) {
+          case 'extra-argument':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET template_args = '{"amountCents":1250,"extra":1}'::jsonb`,
+            );
+            return;
+          case 'rival-amount':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET template_args = '{"amountCents":999}'::jsonb`,
+            );
+            return;
+          case 'foreign-template':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET template_key = 'RECEIPT_AMOUNT_PROMPT'`,
+            );
+            return;
+          case 'foreign-recipient':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'`,
+            );
+            return;
+          case 'foreign-source':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET source_webhook_message_id = 'wamid.rival'`,
+            );
+            return;
+          case 'foreign-version':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET receipt_state_version = 2`,
+            );
+            return;
+          case 'foreign-receipt-linkage':
+            await pool.query(
+              'UPDATE receipt_media_outbox SET receipt_media_id = NULL',
+            );
+            return;
+        }
+      };
+
+      it.each<[string, ConfirmationIntentCorruption]>([
+        ['extra argument', 'extra-argument'],
+        ['rival amount', 'rival-amount'],
+        ['foreign template', 'foreign-template'],
+        ['foreign recipient', 'foreign-recipient'],
+        ['foreign source', 'foreign-source'],
+        ['foreign version', 'foreign-version'],
+        ['foreign receipt linkage', 'foreign-receipt-linkage'],
+      ])(
+        'fences a %s confirmation intent on replay with zero mutation',
+        async (_label, corruption) => {
+          await seed(undefined, { declared_amount_cents: 1250 });
+          const input = command();
+          await bootstrap(store as unknown as BootstrapStore, input);
+          await corruptConfirmationIntent(corruption);
+          await expectFenced(input);
+        },
+      );
+
+      it('rolls back the receipt, pointer, and confirmation intent when the outbox insert fails', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const before = await snapshot();
+        await pool.query(`CREATE FUNCTION odd4b_confirm_outbox_failure()
+          RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'odd4b confirm outbox failure'; END;
+          $$`);
+        await pool.query(`CREATE TRIGGER odd4b_confirm_outbox_failure
+          BEFORE INSERT ON receipt_media_outbox FOR EACH ROW
+          EXECUTE FUNCTION odd4b_confirm_outbox_failure()`);
+        try {
+          await expect(
+            bootstrap(store as unknown as BootstrapStore, command()),
+          ).rejects.toThrow('odd4b confirm outbox failure');
+          expect(await snapshot()).toEqual(before);
+        } finally {
+          await pool.query(
+            'DROP TRIGGER IF EXISTS odd4b_confirm_outbox_failure ON receipt_media_outbox',
+          );
+          await pool.query(
+            'DROP FUNCTION IF EXISTS odd4b_confirm_outbox_failure()',
+          );
+        }
+      });
+
+      it('converges duplicate concurrent bootstraps on one confirmation intent', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const outcomes = await Promise.all([
+          bootstrap(store as unknown as BootstrapStore, command()),
+          bootstrap(store as unknown as BootstrapStore, command()),
+        ]);
+        expect(outcomes.map((outcome) => outcome.kind).sort()).toEqual([
+          'bootstrapped',
+          'replayed',
+        ]);
+        const durable = await snapshot();
+        expect(durable.receipt).toMatchObject({
+          status: 'AWAITING_CONFIRMATION',
+          declared_amount_cents: 1250,
+          version: '3',
+        });
+        expect(durable.outbox).toHaveLength(1);
+        expect(durable.outbox[0].template_args).toEqual({ amountCents: 1250 });
+      });
+    });
   });
 
   // --- WU10C1 atomic receipt amount proposal (PostgreSQL only) ---
@@ -2461,7 +2678,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         sourceWebhookMessageId: 'wamid.amount.1',
         recipientId: SENDER,
         templateKey: 'RECEIPT_AMOUNT_CONFIRM',
-        templateArgs: { cents: 1250 },
+        templateArgs: { amountCents: 1250 },
       });
       expect((await rawReceipt()).amount_proposed_at).toBeInstanceOf(Date);
       expect(await rawConversation()).toEqual({
@@ -2727,6 +2944,35 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       await expect(
         recreated.proposeAmount(command({ cents: 999 })),
       ).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(
+        (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+      ).toBe(1);
+    });
+
+    it('persists and exactly replays the canonical amountCents confirmation args', async () => {
+      await seed();
+      const first = command();
+      const outcome = await proposalStore.proposeAmount(first);
+      expect(outcome.kind).toBe('proposed');
+      if (outcome.kind === 'fenced') throw new Error('expected proposal');
+      expect(outcome.intent.templateArgs).toEqual({ amountCents: 1250 });
+      const recreated = new PostgresReceiptMediaStore(pool);
+      const replay = await recreated.proposeAmount(first);
+      expect(replay.kind).toBe('replayed');
+      if (replay.kind === 'fenced') throw new Error('expected replay');
+      expect(replay.intent.templateArgs).toEqual({ amountCents: 1250 });
+      await pool.query(
+        `UPDATE receipt_media_outbox SET template_args = '{"cents":1250}'::jsonb`,
+      );
+      await expect(recreated.proposeAmount(first)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      await pool.query(
+        `UPDATE receipt_media_outbox SET template_args = '{"amountCents":999}'::jsonb`,
+      );
+      await expect(recreated.proposeAmount(first)).resolves.toEqual({
         kind: 'fenced',
       });
       expect(
@@ -4064,7 +4310,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
                     }
                     expect(outbox.id).toBe(competing.intent.id);
                     expect(outbox.template_args).toEqual(
-                  kind === 'amount proposal' ? { cents: 1250 } : {},
+                  kind === 'amount proposal' ? { amountCents: 1250 } : {},
                 );
                 expect(durable.command).toEqual([]);
               }

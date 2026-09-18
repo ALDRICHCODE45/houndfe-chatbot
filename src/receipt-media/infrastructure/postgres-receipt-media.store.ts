@@ -89,6 +89,31 @@ const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
      AND status = 'DOWNLOADED' AND storage_attempts < 3
      RETURNING storage_attempts AS attempt, version`;
 
+/** ODD-4B: the two receipt-first bootstrap successors. The locked receipt's
+ * durable `declared_amount_cents` exclusively selects the phase: a null
+ * amount keeps the `AWAITING_AMOUNT` prompt successor, while a valid positive
+ * int32 amount is retained and advances to `AWAITING_CONFIRMATION` with
+ * `amount_proposed_at` stamped. Both share the same accepted-object/capability
+ * evidence write and the same live-`clock_timestamp()` lease fence. */
+const BOOTSTRAP_PROMPT_SQL = `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
+     object_etag = $4, object_version_id = $5, capability_token_hash = $6,
+     capability_key_version_text = $7, capability_key_version = $8,
+     capability_issued_at = now(),
+     version = version + 1, updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
+     AND version = $3::bigint AND lease_expires_at > clock_timestamp()
+     RETURNING *`;
+
+const BOOTSTRAP_CONFIRM_SQL = `UPDATE receipt_media SET status = 'AWAITING_CONFIRMATION',
+     amount_proposed_at = now(), stored_at = now(), object_etag = $4,
+     object_version_id = $5, capability_token_hash = $6,
+     capability_key_version_text = $7, capability_key_version = $8,
+     capability_issued_at = now(),
+     version = version + 1, updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
+     AND version = $3::bigint AND lease_expires_at > clock_timestamp()
+     RETURNING *`;
+
 /** WU6B access projection (RMA2, RMA3): exactly the four access columns —
  * no sender, sale, provider, or raw-token data. Parameter-bound equality
  * rides the partial unique capability lookup index. */
@@ -752,6 +777,57 @@ const samePointer = (value: unknown, expected: ReceiptAmountPointer) =>
   value.saleId === expected.saleId &&
   value.receiptVersion === expected.receiptVersion;
 
+/** ODD-4B: the two bootstrap phases. The locked receipt's durable
+ *  `declared_amount_cents` exclusively selects the phase — a null amount is
+ *  the prompt phase and a valid positive int32 amount is the confirmation
+ *  phase. Any other out-of-contract value fences (`null`) rather than
+ *  choosing a branch, so a malformed durable amount never mutates state. */
+type BootstrapPhase = 'prompt' | 'confirm';
+const bootstrapPhase = (receipt: Row): BootstrapPhase | null => {
+  const cents = receipt.declared_amount_cents;
+  if (cents === null) return 'prompt';
+  return typeof cents === 'number' &&
+    Number.isInteger(cents) &&
+    cents > 0 &&
+    cents <= MAX_INT32
+    ? 'confirm'
+    : null;
+};
+
+/** ODD-4B: exact structural ownership proof for the one row-derived bootstrap
+ *  intent. The prompt phase owns `RECEIPT_AMOUNT_PROMPT` with exactly `{}`;
+ *  the confirmation phase owns `RECEIPT_AMOUNT_CONFIRM` with exactly
+ *  `{ amountCents }`, matching the wired notification renderer. */
+const bootstrapIntentMatches = (
+  intent: Row | undefined,
+  receipt: Row,
+  successor: string,
+  dedupeKey: string,
+  phase: BootstrapPhase,
+  cents: number | null,
+): intent is Row => {
+  if (
+    !intent ||
+    intent.dedupe_key !== dedupeKey ||
+    intent.receipt_media_id !== receipt.id ||
+    intent.receipt_state_version !== successor ||
+    intent.source_webhook_message_id !== receipt.webhook_message_id ||
+    intent.recipient_id !== receipt.sender_id ||
+    !isRecord(intent.template_args)
+  )
+    return false;
+  if (phase === 'prompt')
+    return (
+      intent.template_key === 'RECEIPT_AMOUNT_PROMPT' &&
+      Object.keys(intent.template_args).length === 0
+    );
+  return (
+    intent.template_key === 'RECEIPT_AMOUNT_CONFIRM' &&
+    Object.keys(intent.template_args).length === 1 &&
+    intent.template_args.amountCents === cents
+  );
+};
+
 const isProposalInput = (
   input: AmountProposalInput,
   successor: string | null,
@@ -790,7 +866,7 @@ const intentMatches = (
   typeof row.template_args === 'object' &&
   row.template_args !== null &&
   Object.keys(row.template_args).length === 1 &&
-  (row.template_args as Row).cents === input.cents;
+  (row.template_args as Row).amountCents === input.cents;
 
 const isRejectionInput = (
   input: AmountRejectionInput,
@@ -1299,7 +1375,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             successor,
             input.sourceWebhookMessageId,
             input.senderId,
-            JSON.stringify({ cents: input.cents }),
+            JSON.stringify({ amountCents: input.cents }),
           ],
         );
         if (intent.rowCount !== 1) throw FENCED;
@@ -2830,17 +2906,36 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         const senderId = receipt.sender_id as string;
         const saleId = receipt.captured_sale_id as string;
         const sourceWebhookMessageId = receipt.webhook_message_id as string;
+        const phase = bootstrapPhase(receipt);
+        if (phase === null) throw FENCED;
+        const confirmCents =
+          phase === 'confirm'
+            ? (receipt.declared_amount_cents as number)
+            : null;
+        const expectedStatus =
+          phase === 'prompt' ? 'AWAITING_AMOUNT' : 'AWAITING_CONFIRMATION';
+        const templateKey =
+          phase === 'prompt'
+            ? 'RECEIPT_AMOUNT_PROMPT'
+            : 'RECEIPT_AMOUNT_CONFIRM';
+        const templateArgs =
+          phase === 'prompt' ? {} : { amountCents: confirmCents as number };
+        const proposedAtMatches =
+          phase === 'prompt'
+            ? receipt.amount_proposed_at === null
+            : receipt.amount_proposed_at instanceof Date;
         const pointer = {
           receiptMediaId: receiptId,
           saleId,
           receiptVersion: successor,
         };
-        const dedupeKey = `receipt-amount-prompt:${receiptId}:${input.expectedVersion}:${sourceWebhookMessageId}`;
+        const dedupeKey = `receipt-amount-${phase}:${receiptId}:${input.expectedVersion}:${sourceWebhookMessageId}`;
         if (
-          receipt.status === 'AWAITING_AMOUNT' &&
+          receipt.status === expectedStatus &&
           receipt.version === successor &&
           sameBootstrapEvidence(receipt, input) &&
-          samePointer(conversation.data.receiptAmountPointer, pointer)
+          samePointer(conversation.data.receiptAmountPointer, pointer) &&
+          proposedAtMatches
         ) {
           const intent = (
             await c.query<Row>(
@@ -2849,14 +2944,14 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             )
           ).rows[0];
           if (
-            !intent ||
-            intent.receipt_media_id !== receipt.id ||
-            intent.receipt_state_version !== successor ||
-            intent.source_webhook_message_id !== receipt.webhook_message_id ||
-            intent.recipient_id !== receipt.sender_id ||
-            intent.template_key !== 'RECEIPT_AMOUNT_PROMPT' ||
-            !isRecord(intent.template_args) ||
-            Object.keys(intent.template_args).length !== 0
+            !bootstrapIntentMatches(
+              intent,
+              receipt,
+              successor,
+              dedupeKey,
+              phase,
+              confirmCents,
+            )
           )
             throw FENCED;
           const liveLease = (
@@ -2890,14 +2985,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         )
           throw FENCED;
         const updated = await c.query<Row>(
-          `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
-             object_etag = $4, object_version_id = $5, capability_token_hash = $6,
-             capability_key_version_text = $7, capability_key_version = $8,
-             capability_issued_at = now(),
-             version = version + 1, updated_at = now()
-           WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
-             AND version = $3::bigint AND lease_expires_at > clock_timestamp()
-             RETURNING *`,
+          phase === 'prompt' ? BOOTSTRAP_PROMPT_SQL : BOOTSTRAP_CONFIRM_SQL,
           [
             input.id,
             input.owner,
@@ -2922,7 +3010,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
              receipt_state_version, source_webhook_message_id, recipient_id,
              template_key, template_args)
-           VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_AMOUNT_PROMPT', $7::jsonb)
+           VALUES ($1, $2, $3, $4::bigint, $5, $6, $7, $8::jsonb)
            ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
           [
             randomUUID(),
@@ -2931,7 +3019,8 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             successor,
             sourceWebhookMessageId,
             senderId,
-            JSON.stringify({}),
+            templateKey,
+            JSON.stringify(templateArgs),
           ],
         );
         if (intent.rowCount !== 1) throw FENCED;
