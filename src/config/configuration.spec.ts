@@ -46,6 +46,7 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_CONCURRENCY',
     'RECEIPT_MEDIA_WORKER_LEASE_MS',
     'RECEIPT_MEDIA_WORKER_POLL_MS',
+    'RECEIPT_MEDIA_INGESTION_ENABLED',
     'RECEIPT_MEDIA_METRICS_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
   ];
@@ -135,6 +136,26 @@ describe('configuration()', () => {
       expect(cfg.receiptMedia.worker.concurrency).toBe(2);
       expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
       expect(cfg.receiptMedia.metricsEnabled).toBe(false);
+    });
+
+    // R3-cleanup-rollout-gate: the ingestion rollout gate is surfaced as
+    // `receiptMedia.worker.enabled` and is fail-closed: only the exact string
+    // 'true' enables it; omitted, 'false', and any other casing stay false.
+    it.each([
+      { env: undefined, expected: false, label: 'omitted defaults false' },
+      { env: 'false', expected: false, label: 'explicit false' },
+      { env: 'TRUE', expected: false, label: 'non-exact casing stays false' },
+      { env: 'true', expected: true, label: 'exact true enables' },
+    ])('exposes worker.enabled: $label', ({ env, expected }) => {
+      if (env === undefined) {
+        delete process.env.RECEIPT_MEDIA_INGESTION_ENABLED;
+      } else {
+        process.env.RECEIPT_MEDIA_INGESTION_ENABLED = env;
+      }
+      const cfg = configuration() as unknown as {
+        receiptMedia: { worker: { enabled: boolean } };
+      };
+      expect(cfg.receiptMedia.worker.enabled).toBe(expected);
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia

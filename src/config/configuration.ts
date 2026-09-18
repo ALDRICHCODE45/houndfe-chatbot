@@ -71,6 +71,9 @@ const configuration = () => ({
     },
     attachTimeoutMs: int(process.env.CHATBOT_API_ATTACH_TIMEOUT_MS),
     worker: {
+      // R3-cleanup-rollout-gate: dedicated, default-false ingestion rollout
+      // gate. Only the exact string 'true' enables it; omitted/false stay false.
+      enabled: process.env.RECEIPT_MEDIA_INGESTION_ENABLED === 'true',
       concurrency: parseInt(
         process.env.RECEIPT_MEDIA_WORKER_CONCURRENCY ?? '2',
         10,

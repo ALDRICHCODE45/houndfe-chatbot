@@ -648,6 +648,42 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
+    // ─── R3-cleanup-rollout-gate: independent default-false ingestion gate ─
+    // The gate is NOT keyed on RECEIPT_MEDIA_ENABLED (the accepts case below
+    // uses `validEnv`, which has no RECEIPT_MEDIA_ENABLED), so it can never be
+    // silently implied by the broad flag and always defaults fail-closed.
+    it('defaults RECEIPT_MEDIA_INGESTION_ENABLED to false when absent', () => {
+      const { error, value } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value.RECEIPT_MEDIA_INGESTION_ENABLED).toBe(false);
+    });
+
+    it.each(['true', 'false'] as const)(
+      'accepts canonical RECEIPT_MEDIA_INGESTION_ENABLED=%s without RECEIPT_MEDIA_ENABLED',
+      (flag) => {
+        const { error } = envValidationSchema.validate(
+          { ...validEnv, RECEIPT_MEDIA_INGESTION_ENABLED: flag },
+          { abortEarly: false },
+        );
+        expect(error).toBeUndefined();
+      },
+    );
+
+    it('rejects a non-boolean RECEIPT_MEDIA_INGESTION_ENABLED', () => {
+      const { error } = envValidationSchema.validate(
+        { ...validEnv, RECEIPT_MEDIA_INGESTION_ENABLED: 'yes' },
+        { abortEarly: false },
+      );
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) =>
+          d.path.includes('RECEIPT_MEDIA_INGESTION_ENABLED'),
+        ),
+      ).toBe(true);
+    });
+
     // ─── WU15-1: Independent metrics flag + dedicated token validation ─────
     // RECEIPT_MEDIA_METRICS_ENABLED is independently validated (not keyed on
     // RECEIPT_MEDIA_ENABLED); token is required ONLY when metrics is enabled.

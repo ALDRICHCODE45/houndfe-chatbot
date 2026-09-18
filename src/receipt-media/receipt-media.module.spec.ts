@@ -12,7 +12,15 @@
  * mode still fails without the capability keyring; and the WU14E lifecycle
  * coordinator privately runs the notification drain only when enabled,
  * with validated options/owner, drain-before-pool.end shutdown, no rearm,
- * duplicate-import singularity, and a constant non-PII exhaustion alert. */
+ * duplicate-import singularity, and a constant non-PII exhaustion alert.
+ * ODD-3A transitions the stale "no ingestion worker exists" assumption to
+ * the exact intended contract: the ingestion worker still has no DI token
+ * (the module-local lifecycle coordinator privately owns it and the
+ * dispatcher), while enabled/disabled ingestion runtime behavior — claim
+ * timing, the 50 ms poll floor, concurrency mapping, one stable owner,
+ * abort propagation, graceful drain before pool.end, contained claim/
+ * dispatch failures, and the absence of cleanup/outbox/STORED work — is
+ * proven through that coordinator. */
 import { Test } from '@nestjs/testing';
 import { ConfigModule } from '@nestjs/config';
 import {
@@ -160,6 +168,10 @@ const makeOutboxPool = (
     // The optional claim gate doubles as the single await this fixture needs;
     // awaiting `undefined` costs exactly one harmless microtask hop.
     if (/FOR UPDATE SKIP LOCKED/.test(sql)) {
+      // ODD-3A: the ingestion claim shares this injected pool but is NOT
+      // the notification path under test, so it is neutralized (empty)
+      // without touching the notification sequence or claim list.
+      if (!/receipt_media_outbox/.test(sql)) return { rows: [], rowCount: 0 };
       // Recorded BEFORE the optional gate so an in-flight claim is
       // observable while it is still unresolved.
       sequence.push('claim');
@@ -270,6 +282,7 @@ const RECEIPT_ENABLED_ENV: Record<string, string> = {
   RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
   RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
   RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
+  RECEIPT_MEDIA_INGESTION_ENABLED: 'true',
   CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
   RECEIPT_CAPABILITY_KEYS:
     '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=,2:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=',
@@ -1000,6 +1013,694 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       expect(disabled.pool.query).not.toHaveBeenCalled();
       expect(disabled.pool.connect).not.toHaveBeenCalled();
       expect(sendText).toHaveBeenCalledTimes(1); // only the enabled-mode send
+    });
+  });
+
+  describe('ReceiptMediaModule ingestion lifecycle (ODD-3A)', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    const OWNER_RE =
+      /^receipt-media:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+    type IngestionLifecycleHooks = {
+      onApplicationBootstrap(): void;
+      onModuleDestroy(): Promise<void>;
+    };
+
+    /** Resolves the module-local ingestion coordinator WITHOUT exporting the
+     * internal class: it is read from the module's DECLARED provider metadata
+     * (a public contract of ReceiptMediaModule) and resolved through real
+     * Nest DI, so tests can drive its hooks directly where Nest suppresses a
+     * repeated bootstrap hook. */
+    const resolveIngestionLifecycle = (
+      moduleRef: INestApplicationContext,
+    ): IngestionLifecycleHooks => {
+      const providers = (Reflect.getMetadata('providers', ReceiptMediaModule) ??
+        []) as unknown[];
+      const ctor = providers.find(
+        (provider) =>
+          typeof provider === 'function' &&
+          (provider as { name?: string }).name ===
+            'ReceiptMediaIngestionLifecycle',
+      ) as abstract new (...args: never[]) => IngestionLifecycleHooks;
+      expect(ctor).toBeDefined();
+      return moduleRef.get(ctor);
+    };
+
+    /** Instrumented fake pool for the REAL PostgresReceiptMediaStore claim
+     * path: ingestion claims are recorded (limit/owner/SQL), `end` records
+     * closure, and any query after closure is counted and rejected. The
+     * notification outbox drain shares this pool and is deliberately
+     * neutralized (empty) so both coordinators can boot together. */
+    type IngestionPool = {
+      pool: { query: jest.Mock; connect: jest.Mock; end: jest.Mock };
+      claims: Array<{ limit: unknown; owner: unknown; sql: string }>;
+      sequence: string[];
+      queriesAfterEnd: () => number;
+    };
+
+    const makeIngestionPool = (
+      batches: Array<Array<Record<string, unknown>>> = [],
+      opts: { claimGate?: Promise<void>; failFirstClaim?: boolean } = {},
+    ): IngestionPool => {
+      const pending = [...batches];
+      const claims: Array<{ limit: unknown; owner: unknown; sql: string }> = [];
+      const sequence: string[] = [];
+      let queriesAfterEnd = 0;
+      let ended = false;
+      let failClaim = opts.failFirstClaim === true;
+      const clientQuery = async (
+        text: unknown,
+        params?: unknown[],
+      ): Promise<{ rows: unknown[]; rowCount: number }> => {
+        if (ended) {
+          queriesAfterEnd++;
+          throw new Error('receipt-media test: pool already ended');
+        }
+        const sql =
+          typeof text === 'string'
+            ? text
+            : ((text as { text?: string }).text ?? '');
+        if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql))
+          return { rows: [], rowCount: 0 };
+        if (/FOR UPDATE SKIP LOCKED/.test(sql)) {
+          // The notification drain shares this pool; its outbox claim is
+          // neutralized so it never enters the ingestion observations.
+          if (/receipt_media_outbox/.test(sql))
+            return { rows: [], rowCount: 0 };
+          // Recorded BEFORE the optional gate so an in-flight claim is
+          // observable while it is still unresolved.
+          sequence.push('claim');
+          await opts.claimGate;
+          if (failClaim) {
+            failClaim = false;
+            throw new Error('receipt-media test: injected claim failure');
+          }
+          claims.push({ limit: params?.[0], owner: params?.[1], sql });
+          const rows = pending.length > 0 ? (pending.shift() as unknown[]) : [];
+          return { rows, rowCount: rows.length };
+        }
+        if (/INSERT\s+INTO\s+receipt_media_outbox/i.test(sql)) {
+          sequence.push('insert');
+          return { rows: [], rowCount: 0 };
+        }
+        sequence.push('other');
+        return { rows: [], rowCount: 0 };
+      };
+      const client = { query: jest.fn(clientQuery), release: jest.fn() };
+      const pool = {
+        query: jest.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+        connect: jest.fn(() => Promise.resolve(client)),
+        end: jest.fn(() => {
+          sequence.push('end');
+          ended = true;
+          return Promise.resolve();
+        }),
+      };
+      return { pool, claims, sequence, queriesAfterEnd: () => queriesAfterEnd };
+    };
+
+    /** Builds (not compiles) the receipt graph with stubbed edges plus
+     * optional instrumented ingestion collaborators. The dispatcher must be
+     * constructed from the REAL injected processor/attachment, so the fakes
+     * are injected at their DI tokens and never at the dispatcher. */
+    const buildIngestionModule = (
+      env: Record<string, string>,
+      pool: unknown,
+      overrides: { processor?: unknown; attachment?: unknown } = {},
+    ): ReturnType<typeof Test.createTestingModule> => {
+      applyEnv(env);
+      const builder = Test.createTestingModule({
+        imports: [
+          AppConfigModule.forRoot({ ignoreEnvFile: true }),
+          ReceiptMediaModule,
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(pool)
+        .overrideProvider(CONVERSATION_STORE)
+        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .overrideProvider(CHATBOT_API_CLIENT)
+        .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+        .overrideProvider(WHATSAPP_SENDER)
+        .useValue({
+          sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
+        });
+      if (overrides.processor)
+        builder
+          .overrideProvider(ReceiptIngestionProcessor)
+          .useValue(overrides.processor);
+      if (overrides.attachment)
+        builder
+          .overrideProvider(ReceiptAttachmentService)
+          .useValue(overrides.attachment);
+      return builder;
+    };
+
+    /** Boots through real init(), runs the test, and always closes. */
+    const runIngestion = async (
+      env: Record<string, string>,
+      pool: IngestionPool,
+      overrides: { processor?: unknown; attachment?: unknown },
+      run: (moduleRef: INestApplicationContext) => Promise<void> | void,
+    ): Promise<void> => {
+      const moduleRef = await buildIngestionModule(
+        env,
+        pool.pool,
+        overrides,
+      ).compile();
+      try {
+        await moduleRef.init();
+        await run(moduleRef);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    };
+
+    const makeProcessor = (): {
+      process: jest.Mock<Promise<unknown>, [unknown, string, AbortSignal?]>;
+    } => ({
+      process: jest.fn<Promise<unknown>, [unknown, string, AbortSignal?]>(() =>
+        Promise.resolve({ kind: 'downloaded' }),
+      ),
+    });
+
+    it('claims nothing while only compiled and begins claiming exactly at bootstrap', async () => {
+      const pool = makeIngestionPool();
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+      ).compile();
+      try {
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(0);
+        expect(pool.sequence).toEqual([]);
+        await moduleRef.init();
+        await untilMicrotask(() => pool.claims.length >= 1);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(1);
+        expect(pool.claims[0]?.limit).toBe(2); // default concurrency
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('is fully inert when disabled: no claim, no timer, no external call, only pool.end', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_DISABLED_ENV,
+        pool.pool,
+      ).compile();
+      try {
+        await moduleRef.init();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(0);
+        expect(pool.sequence).toEqual([]);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+      expect(pool.sequence).toEqual(['end']);
+      expect(pool.queriesAfterEnd()).toBe(0);
+    });
+
+    it.each(['omitted', 'false'] as const)(
+      'stays fully inert while receipt media is enabled but the ingestion gate is %s',
+      async (gate) => {
+        const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+        const processor = makeProcessor();
+        // Broad receipt media stays enabled (notification still runs); only
+        // the dedicated ingestion rollout gate is absent/false.
+        const env = { ...RECEIPT_ENABLED_ENV };
+        if (gate === 'omitted') delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
+        else env.RECEIPT_MEDIA_INGESTION_ENABLED = 'false';
+        const moduleRef = await buildIngestionModule(env, pool.pool, {
+          processor,
+        }).compile();
+        try {
+          await moduleRef.init();
+          await jest.advanceTimersByTimeAsync(3_600_000);
+          await drainMicrotasks();
+          expect(pool.claims).toHaveLength(0);
+          expect(pool.sequence).toEqual([]);
+          expect(processor.process).not.toHaveBeenCalled();
+        } finally {
+          await moduleRef.close().catch(() => undefined);
+          await drainMicrotasks();
+        }
+      },
+    );
+
+    it('keeps the worker unexposed as a DI token and latches one worker/owner on repeated bootstrap', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const processor = makeProcessor();
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+        { processor },
+      ).compile();
+      try {
+        expect(() => {
+          void moduleRef.get(ReceiptMediaIngestionWorker, { strict: true });
+        }).toThrow();
+        const coordinator = resolveIngestionLifecycle(moduleRef);
+        coordinator.onApplicationBootstrap();
+        // ACTUAL second bootstrap on the SAME coordinator (Nest suppresses
+        // the hook on re-init, so it is invoked directly). It must be a
+        // no-op, not a second worker loop with a new owner.
+        coordinator.onApplicationBootstrap();
+        // Exactly one loop: the row claim plus the dispatch-settle wake
+        // re-poll; a duplicated worker would add at least one more claim.
+        await untilMicrotask(() => pool.claims.length >= 2);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(2);
+        expect(
+          new Set(pool.claims.map((claim) => String(claim.owner))).size,
+        ).toBe(1);
+        expect(String(pool.claims[0]?.owner)).toMatch(OWNER_RE);
+        expect(processor.process).toHaveBeenCalledTimes(1);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('runs exactly one ingestion loop under duplicate module imports', async () => {
+      const pool = makeIngestionPool();
+      applyEnv(RECEIPT_ENABLED_ENV);
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          AppConfigModule.forRoot({ ignoreEnvFile: true }),
+          ReceiptMediaModule,
+          ReceiptMediaHostWrapper,
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(pool.pool)
+        .overrideProvider(CONVERSATION_STORE)
+        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .overrideProvider(CHATBOT_API_CLIENT)
+        .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+        .overrideProvider(WHATSAPP_SENDER)
+        .useValue({
+          sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
+        })
+        .compile();
+      try {
+        await moduleRef.init();
+        await drainMicrotasks();
+        // Any duplicate import resolves to the SAME Nest module instance, so
+        // the single private coordinator claims exactly once.
+        expect(pool.claims).toHaveLength(1);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('is idempotent on shutdown and never rearms on a post-shutdown bootstrap', async () => {
+      const pool = makeIngestionPool();
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+      ).compile();
+      try {
+        const coordinator = resolveIngestionLifecycle(moduleRef);
+        coordinator.onApplicationBootstrap();
+        await untilMicrotask(() => pool.claims.length >= 1);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(1);
+        await coordinator.onModuleDestroy();
+        await drainMicrotasks();
+        const stopped = pool.claims.length;
+        // ACTUAL post-shutdown bootstrap: it must NOT create a new worker.
+        coordinator.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(stopped);
+        // Repeated close must not rearm polling either.
+        await coordinator.onModuleDestroy();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(stopped);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('latches shutdown before any bootstrap so a later bootstrap cannot start a worker', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const processor = makeProcessor();
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+        { processor },
+      ).compile();
+      try {
+        const coordinator = resolveIngestionLifecycle(moduleRef);
+        // Destruction happens BEFORE any bootstrap: the coordinator must
+        // latch terminated independently of whether a worker ever existed.
+        await coordinator.onModuleDestroy();
+        // Safe repeated destroy before bootstrap.
+        await coordinator.onModuleDestroy();
+        // A later bootstrap must NOT construct/start a worker: no claim, no
+        // timer/rearm, no external call.
+        coordinator.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(0);
+        expect(pool.sequence).toEqual([]);
+        expect(processor.process).not.toHaveBeenCalled();
+        // Still inert after another destroy and time advance.
+        await coordinator.onModuleDestroy();
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(0);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('uses one stable, well-formed owner across every claim of one coordinator', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const processor = makeProcessor();
+      await runIngestion(RECEIPT_ENABLED_ENV, pool, { processor }, async () => {
+        await untilMicrotask(() => pool.claims.length >= 2);
+        await drainMicrotasks();
+        const owner = pool.claims[0]?.owner;
+        expect(String(owner)).toMatch(OWNER_RE);
+        expect(pool.claims.every((claim) => claim.owner === owner)).toBe(true);
+      });
+    });
+
+    it.each([
+      [1, 50],
+      [49, 50],
+      [50, 50],
+      [2000, 2000],
+    ] as const)(
+      'polls at its effective interval: configured %i ms -> effective %i ms',
+      async (configured, effective) => {
+        const pool = makeIngestionPool();
+        const env = {
+          ...RECEIPT_ENABLED_ENV,
+          RECEIPT_MEDIA_WORKER_POLL_MS: String(configured),
+        };
+        await runIngestion(env, pool, {}, async () => {
+          await drainMicrotasks();
+          expect(pool.claims).toHaveLength(1);
+          await jest.advanceTimersByTimeAsync(effective - 1);
+          await drainMicrotasks();
+          expect(pool.claims).toHaveLength(1);
+          await jest.advanceTimersByTimeAsync(1);
+          await untilMicrotask(() => pool.claims.length >= 2);
+          await drainMicrotasks();
+          expect(pool.claims).toHaveLength(2);
+        });
+      },
+    );
+
+    it('maps configured concurrency to both batch size and max concurrency', async () => {
+      const pool = makeIngestionPool([
+        [
+          { id: 'r1', status: 'RESERVED' },
+          { id: 'r2', status: 'RESERVED' },
+          { id: 'r3', status: 'RESERVED' },
+        ],
+      ]);
+      const gates: Array<() => void> = [];
+      const processor = {
+        process: jest.fn<Promise<unknown>, [unknown, string, AbortSignal?]>(
+          (_receipt, _owner, signal) =>
+            new Promise((resolve) => {
+              const done = (): void => resolve({ kind: 'downloaded' });
+              gates.push(done);
+              signal?.addEventListener('abort', done, { once: true });
+            }),
+        ),
+      };
+      const env = {
+        ...RECEIPT_ENABLED_ENV,
+        RECEIPT_MEDIA_WORKER_CONCURRENCY: '3',
+      };
+      await runIngestion(env, pool, { processor }, async () => {
+        await untilMicrotask(() => processor.process.mock.calls.length >= 3);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(1);
+        expect(pool.claims[0]?.limit).toBe(3);
+        // Capacity fully consumed: no claim while three dispatches are held.
+        await jest.advanceTimersByTimeAsync(10_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(1);
+        expect(gates).toHaveLength(3);
+      });
+    });
+
+    it('re-polls immediately when an in-flight dispatch settles, before the poll elapses', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const processor = makeProcessor();
+      const env = {
+        ...RECEIPT_ENABLED_ENV,
+        RECEIPT_MEDIA_WORKER_POLL_MS: '30000',
+      };
+      await runIngestion(env, pool, { processor }, async () => {
+        // The second claim is the dispatch-settle wake, reached with NO
+        // timer advance (poll interval is 30s; the poll path cannot fire).
+        await untilMicrotask(() => pool.claims.length >= 2);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(2);
+      });
+    });
+
+    it('aborts the same signal handed to an active processor collaborator on shutdown', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const signals: AbortSignal[] = [];
+      const processor = {
+        process: jest.fn<Promise<unknown>, [unknown, string, AbortSignal?]>(
+          (_receipt, _owner, signal) =>
+            new Promise((resolve) => {
+              if (signal) signals.push(signal);
+              signal?.addEventListener(
+                'abort',
+                () => resolve({ kind: 'aborted', stage: 'meta' }),
+                { once: true },
+              );
+            }),
+        ),
+      };
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+        { processor },
+      ).compile();
+      try {
+        await moduleRef.init();
+        await untilMicrotask(() => signals.length >= 1);
+        const closing = moduleRef.close();
+        await drainMicrotasks();
+        expect(signals[0]?.aborted).toBe(true);
+        await closing;
+        await drainMicrotasks();
+        expect(pool.queriesAfterEnd()).toBe(0);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('aborts the same signal handed to an active attachment collaborator on shutdown', async () => {
+      const pool = makeIngestionPool([[{ id: 'a1', status: 'ATTACHING' }]]);
+      const signals: AbortSignal[] = [];
+      const attachment = {
+        attach: jest.fn<
+          Promise<unknown>,
+          [{ receipt: unknown; owner: string; signal?: AbortSignal }]
+        >(
+          (input) =>
+            new Promise((resolve) => {
+              if (input.signal) signals.push(input.signal);
+              input.signal?.addEventListener(
+                'abort',
+                () => resolve({ kind: 'skipped', reason: 'fenced' }),
+                { once: true },
+              );
+            }),
+        ),
+      };
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+        { attachment },
+      ).compile();
+      try {
+        await moduleRef.init();
+        await untilMicrotask(() => signals.length >= 1);
+        const closing = moduleRef.close();
+        await drainMicrotasks();
+        expect(signals[0]?.aborted).toBe(true);
+        await closing;
+        await drainMicrotasks();
+        expect(pool.queriesAfterEnd()).toBe(0);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('drains a held in-flight dispatch before the pool closes and issues no query after end', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const completed: string[] = [];
+      const processor = {
+        process: jest.fn<Promise<unknown>, [unknown, string, AbortSignal?]>(
+          () =>
+            gate.then(() => {
+              completed.push('r1');
+              return { kind: 'downloaded' };
+            }),
+        ),
+      };
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+        { processor },
+      ).compile();
+      try {
+        await moduleRef.init();
+        await untilMicrotask(() => processor.process.mock.calls.length >= 1);
+        await drainMicrotasks();
+        const closing = moduleRef.close();
+        await drainMicrotasks();
+        // Still draining: the dispatch is held and the pool is NOT ended.
+        expect(pool.sequence).not.toContain('end');
+        expect(completed).toEqual([]);
+        release();
+        await closing;
+        await drainMicrotasks();
+        expect(completed).toEqual(['r1']);
+        expect(pool.sequence[pool.sequence.length - 1]).toBe('end');
+        expect(pool.queriesAfterEnd()).toBe(0);
+      } finally {
+        release();
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('dispatches nothing when an in-flight claim resolves after shutdown and does not rearm', async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]], {
+        claimGate: gate,
+      });
+      const processor = makeProcessor();
+      const moduleRef = await buildIngestionModule(
+        RECEIPT_ENABLED_ENV,
+        pool.pool,
+        { processor },
+      ).compile();
+      try {
+        await moduleRef.init();
+        await drainMicrotasks();
+        expect(pool.sequence).toEqual(['claim']);
+        expect(pool.claims).toHaveLength(0);
+        const closing = moduleRef.close(); // waits for the claim, not the poll
+        await drainMicrotasks();
+        expect(pool.sequence).not.toContain('end'); // pool NOT ended yet
+        release();
+        await closing;
+        await drainMicrotasks();
+        // The claim resolved after running=false: nothing is dispatched.
+        expect(processor.process).not.toHaveBeenCalled();
+        expect(pool.claims).toHaveLength(1);
+        const afterClose = pool.claims.length;
+        await jest.advanceTimersByTimeAsync(3_600_000);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(afterClose); // no rearm
+        expect(pool.queriesAfterEnd()).toBe(0);
+      } finally {
+        release();
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
+    it('contains a claim failure and keeps polling on the next interval', async () => {
+      const pool = makeIngestionPool([], { failFirstClaim: true });
+      const env = {
+        ...RECEIPT_ENABLED_ENV,
+        RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
+      };
+      await runIngestion(env, pool, {}, async () => {
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(0); // first claim threw
+        await jest.advanceTimersByTimeAsync(1000);
+        await untilMicrotask(() => pool.claims.length >= 1);
+        await drainMicrotasks();
+        expect(pool.claims).toHaveLength(1);
+      });
+    });
+
+    it('frees capacity after a dispatcher rejection and dispatches later claimed work', async () => {
+      const pool = makeIngestionPool([
+        [{ id: 'r1', status: 'RESERVED' }],
+        [{ id: 'r2', status: 'RESERVED' }],
+      ]);
+      const env = {
+        ...RECEIPT_ENABLED_ENV,
+        RECEIPT_MEDIA_WORKER_CONCURRENCY: '1',
+      };
+      const processor = {
+        process: jest
+          .fn<Promise<unknown>, [unknown, string, AbortSignal?]>()
+          .mockRejectedValueOnce(new Error('boom'))
+          .mockResolvedValue({ kind: 'downloaded' }),
+      };
+      await runIngestion(env, pool, { processor }, async () => {
+        await untilMicrotask(() => processor.process.mock.calls.length >= 2);
+        await drainMicrotasks();
+        // Two dispatches plus the post-settle wake re-poll (empty).
+        expect(pool.claims).toHaveLength(3);
+        expect(processor.process.mock.calls[0]?.[0]).toEqual(
+          expect.objectContaining({ id: 'r1' }),
+        );
+        expect(processor.process.mock.calls[1]?.[0]).toEqual(
+          expect.objectContaining({ id: 'r2' }),
+        );
+      });
+    });
+
+    it('runs only the existing ingestion claim: no cleanup, outbox intent, or STORED work', async () => {
+      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
+      const processor = makeProcessor();
+      await runIngestion(RECEIPT_ENABLED_ENV, pool, { processor }, async () => {
+        await untilMicrotask(() => pool.claims.length >= 1);
+        await drainMicrotasks();
+        const sql = String(pool.claims[0]?.sql);
+        expect(sql).toMatch(/status = 'RESERVED'/);
+        expect(sql).not.toMatch(/STORED/);
+        expect(sql).not.toMatch(/cleanup/i);
+        expect(sql).not.toMatch(/delete/i);
+        expect(sql).not.toMatch(/receipt_media_outbox/);
+        // No generic outbox intent production and no cleanup scheduling.
+        expect(
+          pool.sequence.filter(
+            (entry) => entry === 'insert' || entry === 'other',
+          ),
+        ).toEqual([]);
+      });
     });
   });
 });

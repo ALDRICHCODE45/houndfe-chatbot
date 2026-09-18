@@ -1,6 +1,6 @@
-/** WU14D host composition spec, transitioned to WU14E lifecycle behavior:
- * proves the real WhatsappModule graph boots through the Nest testing
- * module once ReceiptMediaModule is imported, so the
+/** WU14D host composition spec, transitioned to WU14E/WU14E-ODD-3A lifecycle
+ * behavior: proves the real WhatsappModule graph boots through the Nest
+ * testing module once ReceiptMediaModule is imported, so the
  * WebhookDispatcherService's mandatory receipt dependencies (ReceiptIngress
  * Service, ReceiptAmountRouterService) resolve. External edges are stubbed
  * only (no live PostgreSQL, backend, Meta, S3, or LLM requests). Proven: the
@@ -8,10 +8,11 @@
  * resolvable and the WHATSAPP_SENDER alias intact; the same graph composes in
  * a genuinely receipt-setting-free disabled environment where the ingress
  * outcome remains `disabled`; the host registers neither the ingestion
- * worker nor the receipt-outbox path (the WU14E notification drain is
- * privately owned — no DI token — and its behavior is proven through real
- * init()/close(): claims through the SAME injected pool and drain-before
- * pool.end); and the host declares ReceiptMediaModule among its imports.
+ * worker nor the receipt-outbox path (both the ODD-3A ingestion lifecycle and
+ * the WU14E notification drain are privately owned — no DI token — and their
+ * behavior is proven through real init()/close(): claims through the SAME
+ * injected pool and drain-before pool.end); and the host declares
+ * ReceiptMediaModule among its imports.
  * The full ReceiptMediaModule-internal graph contract (singleton lookup
  * aliasing, keyring rejection, inert disabled seams, validated worker
  * options/owner, duplicate-import singularity, exhaustion alert) stays
@@ -23,6 +24,7 @@ import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { AppConfigModule } from '../config/config.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { ReceiptAmountRouterService } from '../receipt-media/application/receipt-amount-router.service';
+import { ReceiptIngestionProcessor } from '../receipt-media/application/receipt-ingestion.processor';
 import { ReceiptIngressService } from '../receipt-media/application/receipt-ingress.service';
 import { ReceiptOutboxService } from '../receipt-media/application/receipt-outbox.service';
 import { PostgresReceiptOutboxStore } from '../receipt-media/infrastructure/postgres-receipt-outbox.store';
@@ -34,10 +36,11 @@ import { WHATSAPP_SENDER } from './domain/whatsapp-sender.port';
 import { WhatsappModule } from './whatsapp.module';
 
 /** Tokens the receipt composition must never register, in either mode,
- * including when composed through the host. The WU14E notification worker
- * is also token-less (privately owned by the lifecycle coordinator) — but
- * token absence alone does not prove a privately owned worker did not
- * run, so its behavior is proven through real init()/close() below. */
+ * including when composed through the host. Both the ODD-3A ingestion worker
+ * and the WU14E notification worker are token-less (privately owned by their
+ * module-local lifecycle coordinators) — but token absence alone does not
+ * prove a privately owned worker did not run, so their behavior is proven
+ * through real init()/close() below. */
 const FORBIDDEN_NONWORKER_TOKENS = [
   ReceiptMediaIngestionWorker,
   ReceiptMediaNotificationWorker,
@@ -90,6 +93,7 @@ const RECEIPT_ENABLED_ENV: Record<string, string> = {
   RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
   RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
   RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
+  RECEIPT_MEDIA_INGESTION_ENABLED: 'true',
   CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
   RECEIPT_CAPABILITY_KEYS:
     '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=,2:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=',
@@ -144,6 +148,7 @@ type OutboxPool = {
     end: jest.Mock;
   };
   claims: Array<{ limit: unknown; owner: unknown }>;
+  ingestionClaims: Array<{ limit: unknown; owner: unknown; sql: string }>;
   marks: string[];
   reschedules: number[];
   sequence: string[];
@@ -154,12 +159,22 @@ type OutboxPool = {
  * fixture family as the WU14C module spec, kept local to this spec): `end`
  * records closure in the sequence; any query performed after closure is
  * counted and rejected, so a post-close claim/mark can never pass
- * silently through the REAL host graph. */
+ * silently through the REAL host graph. ODD-3A: the ingestion claim shares
+ * this pool and is recorded separately (never in `sequence`) so the host
+ * notification observations stay unconflated while the host ingestion drain
+ * can still be observed. */
 const makeOutboxPool = (
   batches: Array<Record<string, unknown>[]> = [],
+  opts: { ingestion?: Array<Array<Record<string, unknown>>> } = {},
 ): OutboxPool => {
   const pending = [...batches];
+  const ingestionPending = [...(opts.ingestion ?? [])];
   const claims: Array<{ limit: unknown; owner: unknown }> = [];
+  const ingestionClaims: Array<{
+    limit: unknown;
+    owner: unknown;
+    sql: string;
+  }> = [];
   const marks: string[] = [];
   const reschedules: number[] = [];
   const sequence: string[] = [];
@@ -182,6 +197,16 @@ const makeOutboxPool = (
     await Promise.resolve();
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [], rowCount: 0 };
     if (/FOR UPDATE SKIP LOCKED/.test(sql)) {
+      if (!/receipt_media_outbox/.test(sql)) {
+        // ODD-3A ingestion claim: recorded on its own channel and never in
+        // the notification sequence.
+        ingestionClaims.push({ limit: params?.[0], owner: params?.[1], sql });
+        const rows =
+          ingestionPending.length > 0
+            ? (ingestionPending.shift() as unknown[])
+            : [];
+        return { rows, rowCount: rows.length };
+      }
       sequence.push('claim');
       claims.push({ limit: params?.[0], owner: params?.[1] });
       const rows = pending.length > 0 ? (pending.shift() as unknown[]) : [];
@@ -217,6 +242,7 @@ const makeOutboxPool = (
   return {
     pool,
     claims,
+    ingestionClaims,
     marks,
     reschedules,
     sequence,
@@ -330,10 +356,110 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
   it('registers neither the ingestion worker nor the receipt outbox path in the host', async () => {
     await withHostModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
       expectNoReceiptWorkerProviders(moduleRef);
-      // The WU14E notification drain is privately owned (no DI token), but
-      // token absence alone proves nothing — its enabled behavior is
-      // proven through real init()/close() in the lifecycle test below.
+      // Both the ODD-3A ingestion drain and the WU14E notification drain are
+      // privately owned (no DI token), but token absence alone proves nothing
+      // — their enabled behavior is proven through real init()/close() in the
+      // lifecycle tests below.
     });
+  });
+
+  it('starts the enabled ingestion drain through the host graph and drains it before pool.end', async () => {
+    jest.useFakeTimers();
+    const outbox = makeOutboxPool([], {
+      ingestion: [[{ id: 'r1', status: 'RESERVED' }]],
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const processed: string[] = [];
+    const processor = {
+      process: jest.fn<Promise<unknown>, [unknown, string, AbortSignal?]>(() =>
+        gate.then(() => {
+          processed.push('r1');
+          return { kind: 'downloaded' };
+        }),
+      ),
+    };
+    const sendText = jest.fn(() =>
+      Promise.resolve({ providerMessageId: 'wamid.OK' }),
+    );
+    // Deterministic clear-then-overlay receipt env isolation (WU14C fix).
+    for (const key of Object.keys(RECEIPT_ENABLED_ENV))
+      if (!(key in BASE_ENV)) delete process.env[key];
+    Object.assign(process.env, RECEIPT_ENABLED_ENV);
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        AppConfigModule.forRoot({ ignoreEnvFile: true }),
+        WhatsappModule,
+      ],
+    })
+      .overrideProvider(PG_POOL)
+      .useValue(outbox.pool)
+      .overrideProvider(CONVERSATION_STORE)
+      .useValue({
+        get: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+        update: jest.fn(),
+        setReceiptAmountPointer: jest.fn(),
+        clearReceiptAmountPointer: jest.fn(),
+      })
+      .overrideProvider(CHATBOT_API_CLIENT)
+      .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+      .overrideProvider(WHATSAPP_SENDER)
+      .useValue({ sendText })
+      .overrideProvider(ReceiptIngestionProcessor)
+      .useValue(processor)
+      .compile();
+    try {
+      await moduleRef.init();
+      await untilMicrotask(() => processor.process.mock.calls.length >= 1);
+      // The host graph's private ingestion lifecycle claimed through the SAME
+      // injected PG_POOL and dispatched the RESERVED row.
+      expect(outbox.ingestionClaims).toHaveLength(1);
+      const closing = moduleRef.close(); // destroy waits for the drain
+      await drainMicrotasks();
+      // CRITICAL SHUTDOWN-ORDERING PROOF: while the dispatch is held, the
+      // REAL host lifecycle has NOT ended the pool.
+      expect(outbox.sequence).not.toContain('end');
+      expect(processed).toEqual([]);
+      release();
+      await closing;
+      await drainMicrotasks();
+      // Drain-before-pool.end: the held dispatch completes strictly BEFORE
+      // the real PostgresPoolLifecycle closes the pool.
+      expect(processed).toEqual(['r1']);
+      expect(outbox.sequence[outbox.sequence.length - 1]).toBe('end');
+      expect(outbox.queriesAfterEnd()).toBe(0);
+    } finally {
+      release();
+      jest.useRealTimers();
+      await moduleRef.close().catch(() => undefined);
+      await drainMicrotasks();
+    }
+  });
+
+  it('keeps the host ingestion drain inert when the rollout gate is off', async () => {
+    jest.useFakeTimers();
+    const outbox = makeOutboxPool([], {
+      ingestion: [[{ id: 'r1', status: 'RESERVED' }]],
+    });
+    // Broad receipt media stays enabled; only the dedicated ingestion gate is
+    // omitted, so the host must not construct or start the ingestion drain.
+    const env = { ...RECEIPT_ENABLED_ENV };
+    delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
+    try {
+      await withHostModule(
+        env,
+        async (moduleRef) => {
+          await moduleRef.init();
+          await jest.advanceTimersByTimeAsync(3_600_000);
+          await drainMicrotasks();
+          expect(outbox.ingestionClaims).toHaveLength(0);
+        },
+        outbox.pool,
+      );
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('starts the enabled notification drain through the host graph and drains it before pool.end', async () => {

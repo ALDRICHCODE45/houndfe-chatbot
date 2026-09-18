@@ -260,6 +260,10 @@ const innerEnvValidationSchema = Joi.object({
   // when disabled or missing, the field is `Joi.any()`. The base
   // MUST stay `Joi.any()` so the when-branch fully replaces it.
   RECEIPT_MEDIA_ENABLED: Joi.boolean().default(false),
+  // R3-cleanup-rollout-gate: independent, default-false ingestion rollout
+  // gate. It is NOT keyed on RECEIPT_MEDIA_ENABLED; notification and every
+  // other receipt-media feature stay governed by RECEIPT_MEDIA_ENABLED alone.
+  RECEIPT_MEDIA_INGESTION_ENABLED: Joi.boolean().default(false),
   RECEIPT_MEDIA_MAX_BYTES: receiptConditional(
     Joi.number().integer().valid(RECEIPT_MAX_BYTES_VALUE).required(),
   ),
