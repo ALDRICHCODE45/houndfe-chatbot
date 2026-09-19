@@ -117,6 +117,9 @@ describe('MetaMediaClient.resolveDownloadUrl', () => {
       timeout: 5000,
       signal: request.signal,
     });
+    // G-6 receipt-media-access/R4/S1: the composed metadata hop carries the
+    // configured Meta bearer, created only after origin/address policy passed.
+    expect(calls[0].headers).toEqual({ Authorization: `Bearer ${TOKEN}` });
     expect(destroy).toHaveBeenCalledTimes(1);
 
     await client.resolveDownloadUrl(req('a b/c?d#e'));

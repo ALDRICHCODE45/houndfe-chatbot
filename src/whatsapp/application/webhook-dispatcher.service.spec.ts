@@ -24,7 +24,7 @@ import {
   PENDING_HUMAN_REQUEST_REPLY,
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
-import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import type {
   ReceiptMediaOutboxRow,
@@ -244,6 +244,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       to: '5215550001111',
       text: 'Hola, ¿en qué te puedo ayudar?',
     });
+
+    // G-11 whatsapp-webhook/R1/S5: a customer inbound with no pending marker
+    // takes the normal path and never routes to the ops resolveReply hook.
+    expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
   });
 
   it('does NOT send any message outside the inbound-driven path (no proactive sends)', async () => {
@@ -979,6 +983,78 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         to: CUSTOMER,
         text: 'Hola!',
       });
+    });
+
+    // ─── G-2 llm-agent/R2/S1: safe guidance after a terminal receipt ─────
+    it('llm-agent/R2/S1: a definite terminal receipt outcome reaches the normal AgentRunner path with no protected identifiers in the runner input', async () => {
+      // A receipt that already reached a terminal/raced state no longer accepts
+      // the customer's confirmation, so the real router fences it and the
+      // follow-up takes the ordinary LLM path. The canonical pointer's
+      // protected receipt/sale identifiers must reach the real routing
+      // boundary but never cross the llm.run port.
+      const protectedPointer = {
+        receiptMediaId: 'receipt-sentinel-9f2c',
+        saleId: 'sale-sentinel-9f2c',
+        receiptVersion: '7',
+      };
+      conversationStore.get.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T11:59:00.000Z',
+        data: { receiptAmountPointer: protectedPointer },
+      });
+      const routerStore = {
+        proposeAmount: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
+        rejectProposedAmount: jest
+          .fn()
+          .mockResolvedValue({ kind: 'fenced' as const }),
+        cancelReceipt: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
+        startAttachment: jest
+          .fn()
+          .mockResolvedValue({ kind: 'fenced' as const }),
+      };
+      const realRouter = new ReceiptAmountRouterService(
+        { get: conversationStore.get },
+        routerStore,
+      );
+      const realService = new WebhookDispatcherService(
+        runner,
+        sender,
+        dedup,
+        recentOutbound,
+        humanHandoff as unknown as HumanHandoffService,
+        conversationStore,
+        realRouter,
+        ingress,
+      );
+
+      await realService.dispatch(textEvent('wamid.terminal-followup', 'sí'));
+
+      // The real router propagated the protected identifiers to its store op,
+      // which fenced because the durable row is already terminal/raced.
+      expect(routerStore.startAttachment).toHaveBeenCalledTimes(1);
+      expect(routerStore.startAttachment).toHaveBeenCalledWith({
+        sourceWebhookMessageId: 'wamid.terminal-followup',
+        senderId: CUSTOMER,
+        receiptMediaId: protectedPointer.receiptMediaId,
+        capturedSaleId: protectedPointer.saleId,
+        expectedReceiptVersion: protectedPointer.receiptVersion,
+        expectedPointer: protectedPointer,
+        expectedReceiptStatus: 'AWAITING_CONFIRMATION',
+      });
+      // The fence fell through to the ordinary LLM path.
+      expect(llm.run).toHaveBeenCalledTimes(1);
+      const [runnerInput] = llm.run.mock.calls[0];
+      expect(runnerInput).toEqual({
+        senderId: CUSTOMER,
+        text: 'sí',
+        history: [],
+        systemPrompt: 'sys',
+        tools: {},
+      });
+      const serialized = JSON.stringify(runnerInput);
+      expect(serialized).not.toContain(protectedPointer.receiptMediaId);
+      expect(serialized).not.toContain(protectedPointer.saleId);
+      expect(runnerInput).not.toHaveProperty('receiptAmountPointer');
     });
 
     // ─── ODD-4D: deterministic active-text fallback ────────────────────
