@@ -126,6 +126,29 @@ describe('MetaMediaClient.resolveDownloadUrl', () => {
     expect(calls[1].url).toBe(`${BASE}/a%20b%2Fc%3Fd%23e`);
   });
 
+  it('treats a full hostile URL provider id as one encoded path segment under the pinned origin', async () => {
+    // G-7 receipt-media-access/R4/S3: a customer/model-supplied URL can only
+    // ever be one opaque path segment of the pinned Graph metadata hop.
+    const hostile =
+      'https://user:pass@169.254.169.254:8080/latest/meta-data/?x=1#f';
+    const resolve = jest.fn(publicDns);
+    const { client, calls, token, createAgent } = makeClient({ resolve });
+    await expect(client.resolveDownloadUrl(req(hostile))).resolves.toBe(
+      DOWNLOAD_URL,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(`${BASE}/${encodeURIComponent(hostile)}`);
+    const parsed = new URL(calls[0].url as string);
+    expect(parsed.hostname).toBe(HOST);
+    expect(parsed.hostname).not.toBe('attacker.example');
+    expect(parsed.hostname).not.toBe('169.254.169.254');
+    expect(calls[0].headers).toEqual({ Authorization: `Bearer ${TOKEN}` });
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(resolve).toHaveBeenCalledWith(HOST);
+    expect(token).toHaveBeenCalledTimes(1);
+    expect(createAgent).toHaveBeenCalledTimes(1);
+  });
+
   it('creates no bearer header before origin and address policy pass', async () => {
     const blank = makeClient({});
     await safeError(
