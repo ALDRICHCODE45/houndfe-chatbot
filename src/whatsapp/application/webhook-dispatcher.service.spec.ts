@@ -981,6 +981,66 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
+    // ─── ODD-4D: deterministic active-text fallback ────────────────────
+    // An active amount/confirmation flow with malformed or unrecognized
+    // text must never reach the LLM: the dispatcher sends the exact
+    // finish-or-cancel guidance deterministically.
+    const ACTIVE_FLOW_GUIDANCE =
+      'Tienes un proceso abierto: finalízalo o cancélalo.';
+
+    it('ODD-4D unrecognized: exact guidance, one send/remember/markSeen, no LLM', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
+      sender.sendText.mockResolvedValueOnce({
+        providerMessageId: 'wamid.unrecognized-out',
+      });
+      await service.dispatch(textEvent('wamid.unrecognized', 'hola'));
+
+      expect(sender.sendText).toHaveBeenCalledTimes(1);
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: ACTIVE_FLOW_GUIDANCE,
+      });
+      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
+      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
+        'wamid.unrecognized-out',
+      );
+      expect(dedup.markSeen as jest.Mock).toHaveBeenCalledTimes(1);
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.unrecognized');
+      const order = [
+        sender.sendText as jest.Mock,
+        recentOutbound.remember as jest.Mock,
+        dedup.markSeen as jest.Mock,
+      ].map((mock) => mock.mock.invocationCallOrder[0]);
+      expect(order).toEqual([...order].sort((left, right) => left - right));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    it('ODD-4D unrecognized: send failure propagates with no remember/markSeen/LLM', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
+      sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
+      await expect(
+        service.dispatch(textEvent('wamid.unrecognized-fail', 'hola')),
+      ).rejects.toThrow('Meta 131030');
+      expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
+      expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
+      expect(llm.run).not.toHaveBeenCalled();
+    });
+
+    it('ODD-4D unrecognized: markSeen failure is swallowed after a successful send', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
+      dedup.markSeen.mockRejectedValueOnce(new Error('dedup write failed'));
+      await expect(
+        service.dispatch(textEvent('wamid.unrecognized-markseen-fail', 'hola')),
+      ).resolves.toBeUndefined();
+      expect(sender.sendText).toHaveBeenCalledTimes(1);
+      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
+      expect(dedup.markSeen).toHaveBeenCalledWith(
+        'wamid.unrecognized-markseen-fail',
+      );
+      expect(llm.run).not.toHaveBeenCalled();
+    });
+
     it('proposed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'proposed',

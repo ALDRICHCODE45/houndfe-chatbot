@@ -192,6 +192,29 @@ export class WebhookDispatcherService {
             text: message.text,
             sourceWebhookMessageId: message.messageId,
           });
+          // ODD-4D: a valid active receipt pointer with no routing plan is
+          // deterministic — send the active-flow guidance and never call the
+          // LLM. Send failure propagates before remember/markSeen.
+          if (outcome.kind === 'unrecognized') {
+            this.logger.log(
+              `amount router terminal [unrecognized] for ${message.messageId}`,
+            );
+            const { providerMessageId } = await this.whatsappSender.sendText({
+              to: message.senderId,
+              text: ACTIVE_RECEIPT_GUIDANCE,
+            });
+            this.recentOutbound.remember(providerMessageId);
+            try {
+              await this.dedup.markSeen(message.messageId);
+            } catch (error) {
+              this.logger.warn(
+                `markSeen failed for ${message.messageId}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+            continue;
+          }
           if (outcome.kind !== 'fenced') {
             this.logger.log(
               `amount router terminal [${outcome.kind}] for ${message.messageId}`,
@@ -410,6 +433,14 @@ function normalizeTimestamp(timestamp: string): string {
 // sender-active decision carries its exact status, so the guidance reflects
 // whether the open flow still needs the customer's amount/confirmation or is
 // still being processed internally.
+
+/** ODD-4C/4D fixed Spanish guidance for a durable active amount or confirmation
+ * flow that still needs a customer decision. Shared by sender-active image
+ * guidance and the ODD-4D deterministic active-text fallback; defined locally
+ * so the dispatcher never imports notification internals. */
+const ACTIVE_RECEIPT_GUIDANCE =
+  'Tienes un proceso abierto: finalízalo o cancélalo.';
+
 function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
   switch (decision.kind) {
     case 'disabled':
@@ -435,7 +466,7 @@ function senderActiveGuidance(status: ActiveReceiptStatus): string {
   switch (status) {
     case 'AWAITING_AMOUNT':
     case 'AWAITING_CONFIRMATION':
-      return 'Tienes un proceso abierto: finalízalo o cancélalo.';
+      return ACTIVE_RECEIPT_GUIDANCE;
     case 'RESERVED':
     case 'DOWNLOADED':
     case 'STORED':

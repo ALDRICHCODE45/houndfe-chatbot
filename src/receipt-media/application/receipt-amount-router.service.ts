@@ -3,7 +3,10 @@
  * startAttachment, negative → rejectProposedAmount, explicit cancel → status-free
  * cancelReceipt; the persisted ReceiptAmountPointer is the fence; every fenced
  * outcome is terminal and exact store `replayed` outcomes pass through unchanged;
- * no messaging, LLM, backend, Meta/S3, dispatcher, or module wiring dependency. */
+ * ODD-4D adds a bare `unrecognized` outcome when a valid active pointer exists but
+ * the text yields no routing plan, so active-flow malformed text never falls
+ * through to the LLM; no messaging, LLM, backend, Meta/S3, dispatcher, or module
+ * wiring dependency. */
 import { isReceiptAmountPointer } from '../../conversation/domain/conversation-store';
 import type {
   ConversationState,
@@ -51,14 +54,17 @@ export interface ReceiptAmountRouteInput {
 
 /** Merged outcome: every non-fenced store member carries the exact receipt
  * and intent; `replayed` is the store's own conservative replay for any of
- * the four operations; `fenced` is terminal (router- or store-originated). */
+ * the four operations; `fenced` is terminal (router- or store-originated);
+ * ODD-4D `unrecognized` is a bare terminal signal that a valid active pointer
+ * exists while the text has no routing plan and carries no pointer/receipt data. */
 export type ReceiptAmountRouteOutcome =
   | {
       kind: 'proposed' | 'rejected' | 'cancelled' | 'started' | 'replayed';
       receipt: ReceiptMediaRow;
       intent: ReceiptMediaOutboxRow;
     }
-  | { kind: 'fenced' };
+  | { kind: 'fenced' }
+  | { kind: 'unrecognized' };
 
 const AFFIRMATIVE = new Set([
   'si',
@@ -116,8 +122,12 @@ export class ReceiptAmountRouterService {
     private readonly store: ReceiptAmountRouterStore,
   ) {}
 
-  /** Text first (pure, no I/O), then the pointer fence, then exactly one store
-   * operation; sender, webhook id, and pointer triple propagate unchanged. */
+  /** Identity/string validation stays I/O-free and fences closed. Otherwise the
+   * text is classified CPU-only, the durable pointer is read, and an absent or
+   * invalid pointer stays fenced (preserving LLM fallback). A valid pointer with
+   * no routing plan yields the bare `unrecognized` terminal; a valid plan runs
+   * exactly one store operation with sender, webhook id, and pointer propagated
+   * unchanged. */
   async route(
     input: ReceiptAmountRouteInput,
   ): Promise<ReceiptAmountRouteOutcome> {
@@ -127,10 +137,11 @@ export class ReceiptAmountRouterService {
       typeof input.sourceWebhookMessageId === 'string' &&
       input.sourceWebhookMessageId.length > 0;
     const textValid = typeof input.text === 'string';
-    const plan = identityValid && textValid ? planRoute(input.text) : null;
-    if (plan === null) return { kind: 'fenced' };
+    if (!identityValid || !textValid) return { kind: 'fenced' };
+    const plan = planRoute(input.text);
     const pointer = await this.readPointer(input.senderId);
     if (pointer === null) return { kind: 'fenced' };
+    if (plan === null) return { kind: 'unrecognized' };
     const shared = {
       sourceWebhookMessageId: input.sourceWebhookMessageId,
       senderId: input.senderId,
