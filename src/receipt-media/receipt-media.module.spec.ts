@@ -60,6 +60,7 @@ import { ReceiptIngressService } from './application/receipt-ingress.service';
 import { ReceiptOutboxService } from './application/receipt-outbox.service';
 import { META_MEDIA } from './domain/meta-media.port';
 import { OBJECT_STORAGE_PORT } from './domain/object-storage.port';
+import type { ReceiptMediaRow } from './domain/receipt-media.types';
 import { MetaMediaClient } from './infrastructure/meta-media.client';
 import { PostgresReceiptMediaStore } from './infrastructure/postgres-receipt-media.store';
 import { PostgresReceiptOutboxStore } from './infrastructure/postgres-receipt-outbox.store';
@@ -723,6 +724,87 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       .useValue(stubPool());
     Object.assign(process.env, RECEIPT_ENABLED_ENV);
     await expect(builder.compile()).rejects.toThrow(/ConfigService/);
+  });
+
+  describe('ReceiptMediaModule attachment capability composition (ODD-5A)', () => {
+    it('injects the module capability so the composed attachment service posts the reconstructed token URL without the private object key', async () => {
+      const receiptId = '11111111-1111-4111-8111-111111111111';
+      const privateObjectKey = 'receipts/private-object-key';
+      const attachReceipt = jest.fn<
+        Promise<{ receiptId: string; status: string }>,
+        [string, { mediaUrl: string; declaredAmountCents: number }]
+      >(() => Promise.resolve({ receiptId: 'backend-1', status: 'PENDING' }));
+      const startAttachRequest = jest.fn().mockResolvedValue({
+        kind: 'started',
+        version: '8',
+        receipt: {
+          id: receiptId,
+          capturedSaleId: 'sale-1',
+          objectKey: privateObjectKey,
+          version: '8',
+          declaredAmountCents: 15000,
+        },
+      });
+      // Broad enablement keeps the real CapabilityService alive while the
+      // dedicated ingestion rollout gate stays off, so no worker claims run.
+      const env = { ...RECEIPT_ENABLED_ENV };
+      delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
+      applyEnv(env);
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          AppConfigModule.forRoot({ ignoreEnvFile: true }),
+          ReceiptMediaModule,
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(makeOutboxPool().pool)
+        .overrideProvider(CONVERSATION_STORE)
+        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .overrideProvider(CHATBOT_API_CLIENT)
+        .useValue({ attachReceipt })
+        .overrideProvider(PostgresReceiptMediaStore)
+        .useValue({
+          startAttachRequest,
+          commitAttachSuccess: jest.fn().mockResolvedValue({
+            kind: 'committed',
+          }),
+          commitAttachDefiniteFailure: jest.fn(),
+          commitAttachUnknownOutcome: jest.fn(),
+        })
+        .overrideProvider(WHATSAPP_SENDER)
+        .useValue({
+          sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
+        })
+        .compile();
+      try {
+        const issued = moduleRef.get(CapabilityService).issue(receiptId);
+        const report = await moduleRef.get(ReceiptAttachmentService).attach({
+          receipt: {
+            id: receiptId,
+            capturedSaleId: 'sale-1',
+            objectKey: privateObjectKey,
+            version: '7',
+            declaredAmountCents: 15000,
+            capabilityTokenHash: issued.tokenHash,
+            capabilityKeyVersion: issued.keyVersion,
+          } as unknown as ReceiptMediaRow,
+          owner: 'owner-1',
+        });
+        expect(report).toEqual({
+          kind: 'attached',
+          backendReceiptId: 'backend-1',
+        });
+        const [saleId, body] = attachReceipt.mock.calls[0];
+        expect(saleId).toBe('sale-1');
+        expect(body.mediaUrl).toBe(
+          `https://media.example.com/media/receipts/${issued.token}`,
+        );
+        expect(body.mediaUrl).not.toContain(privateObjectKey);
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
   });
 
   describe('ReceiptMediaModule WU15-2 telemetry composition', () => {

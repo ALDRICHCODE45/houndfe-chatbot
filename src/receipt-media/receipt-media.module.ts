@@ -500,14 +500,25 @@ class ReceiptCleanupLifecycle
         store: PostgresReceiptMediaStore,
         client: ChatbotApiClient,
         config: ConfigService,
+        capability: CapabilityService,
       ): ReceiptAttachmentService =>
-        new ReceiptAttachmentService(store, client, {
-          receiptMedia: {
-            publicBaseUrl:
-              config.get<string>('receiptMedia.publicBaseUrl') ?? '',
+        new ReceiptAttachmentService(
+          store,
+          client,
+          {
+            receiptMedia: {
+              publicBaseUrl:
+                config.get<string>('receiptMedia.publicBaseUrl') ?? '',
+            },
           },
-        }),
-      inject: [PostgresReceiptMediaStore, CHATBOT_API_CLIENT, ConfigService],
+          capability,
+        ),
+      inject: [
+        PostgresReceiptMediaStore,
+        CHATBOT_API_CLIENT,
+        ConfigService,
+        CapabilityService,
+      ],
     },
     {
       provide: ReceiptIngestionProcessor,

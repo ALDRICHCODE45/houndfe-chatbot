@@ -2,12 +2,18 @@ import { randomUUID } from 'node:crypto';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { ReceiptMediaStorePort } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
+import type { CapabilityService } from './capability.service';
 
 const DEFINITE_FAILURE_STATUSES = new Set([400, 401, 403, 404, 409, 422, 429]);
 const TRANSPORT_UNKNOWN = {
   httpStatus: null,
   transportCode: 'TRANSPORT_FAILURE',
 } as const;
+
+/** Fixed, secret-free failure for persisted capability evidence that cannot
+ *  be reconstructed: it carries no token, hash, version, or object key. */
+const CAPABILITY_EVIDENCE_UNAVAILABLE =
+  'Receipt capability evidence is unavailable';
 
 export type AttachReport =
   | { kind: 'skipped'; reason: 'fenced' }
@@ -58,6 +64,7 @@ export class ReceiptAttachmentService {
     private readonly store: Pick<ReceiptMediaStorePort, StoreKeys>,
     private readonly client: Pick<ChatbotApiClient, 'attachReceipt'>,
     private readonly config: ReceiptAttachmentConfig,
+    private readonly capability: Pick<CapabilityService, 'reconstruct'>,
   ) {}
 
   async attach({
@@ -65,6 +72,20 @@ export class ReceiptAttachmentService {
     owner,
     signal,
   }: AttachInvocation): Promise<AttachReport> {
+    // ODD-5A: a FRESH row (no request-start evidence) must prove its immutable
+    // persisted capability evidence BEFORE the request-start fence; a null
+    // result fails closed before any durable mutation or POST, so no false
+    // request-start evidence can appear. An already request-evidenced row is
+    // owned by the store's recovery path: the historical capability key may
+    // have rotated or the evidence may be malformed, and such a row must still
+    // reach `startAttachRequest` so a reclaimed ATTACHING attempt can fix
+    // forward. The token is only required to actually POST; the private object
+    // key is never exposed.
+    const requestEvidenced = receipt.attachRequestStartedAt !== null;
+    let capability = requestEvidenced ? null : this.reconstructToken(receipt);
+    if (capability === null && !requestEvidenced) {
+      throw new Error(CAPABILITY_EVIDENCE_UNAVAILABLE);
+    }
     const attempt = { id: receipt.id, owner, attachAttemptId: randomUUID() };
     const started = await this.store.startAttachRequest({
       ...attempt,
@@ -89,6 +110,14 @@ export class ReceiptAttachmentService {
         ? { kind: 'terminal-fenced' }
         : { kind: 'outcome-unknown', ...TRANSPORT_UNKNOWN };
     }
+    // A request-evidenced caller should only ever reach recovery through the
+    // crashed-before-post branch above; a `started` successor here is an
+    // inconsistent durable load (the real store/version contract should
+    // prevent it), so never POST without a reconstructed token.
+    capability ??= this.reconstructToken(receipt);
+    if (capability === null) {
+      throw new Error(CAPABILITY_EVIDENCE_UNAVAILABLE);
+    }
     // The durable locked successor is the only POST source after start.
     if (started.receipt.declaredAmountCents === null) {
       throw new Error('Receipt has no persisted declared amount');
@@ -99,7 +128,7 @@ export class ReceiptAttachmentService {
       const response = await this.client.attachReceipt(
         started.receipt.capturedSaleId,
         {
-          mediaUrl: `${this.config.receiptMedia.publicBaseUrl}/${started.receipt.objectKey}`,
+          mediaUrl: `${this.config.receiptMedia.publicBaseUrl}/media/receipts/${capability}`,
           declaredAmountCents: started.receipt.declaredAmountCents,
         },
         { signal },
@@ -154,6 +183,18 @@ export class ReceiptAttachmentService {
       }
       return this.commitUnknown(fence, TRANSPORT_UNKNOWN);
     }
+  }
+
+  /** Rebuilds the public URL token from the loaded durable caller receipt;
+   *  null when the persisted evidence cannot be reconstructed. */
+  private reconstructToken(receipt: ReceiptMediaRow): string | null {
+    return (
+      this.capability.reconstruct(
+        receipt.id,
+        receipt.capabilityKeyVersion ?? '',
+        receipt.capabilityTokenHash,
+      )?.token ?? null
+    );
   }
 
   private async commitUnknown(
