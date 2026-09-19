@@ -10,6 +10,7 @@ import {
   ReceiptIngressService,
   type ReceiptIngressDecision,
 } from '../../receipt-media/application/receipt-ingress.service';
+import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
@@ -215,14 +216,14 @@ export class WebhookDispatcherService {
           // forwarded. filename/sha256 and every other payload field are
           // dropped, and the raw caption never reaches the amount router, the
           // LLM, or any durable type.
-          const { kind } = await this.ingress.admit({
+          const decision = await this.ingress.admit({
             webhookMessageId: message.messageId,
             providerMediaId: message.media.providerMediaId,
             senderId: message.senderId,
             declaredMimeType: message.media.declaredMimeType,
             caption: message.media.caption,
           });
-          const guidance = ingressGuidance(kind);
+          const guidance = ingressGuidance(decision);
 
           if (guidance !== undefined) {
             const { providerMessageId } = await this.whatsappSender.sendText({
@@ -231,7 +232,7 @@ export class WebhookDispatcherService {
             });
             this.recentOutbound.remember(providerMessageId);
           }
-          if (!receiptAdmissionAtomicallyMarksSeen(kind)) {
+          if (!receiptAdmissionAtomicallyMarksSeen(decision.kind)) {
             try {
               await this.dedup.markSeen(message.messageId);
             } catch (error) {
@@ -405,11 +406,12 @@ function normalizeTimestamp(timestamp: string): string {
 
 // WU13-B2: maps each closed ReceiptIngressDecision kind to customer-facing
 // guidance text. Silent variants return undefined — no reply is sent and
-// media never reaches the amount router or AgentRunner.
-function ingressGuidance(
-  kind: ReceiptIngressDecision['kind'],
-): string | undefined {
-  switch (kind) {
+// media never reaches the amount router or AgentRunner. ODD-4C: a durable
+// sender-active decision carries its exact status, so the guidance reflects
+// whether the open flow still needs the customer's amount/confirmation or is
+// still being processed internally.
+function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
+  switch (decision.kind) {
     case 'disabled':
       return 'El servicio no está disponible. Intenta más tarde.';
     case 'unsupported-media':
@@ -417,12 +419,28 @@ function ingressGuidance(
     case 'no-placed-sale':
       return 'Primero registra la venta en el sistema.';
     case 'sender-active':
-      return 'Tienes un proceso abierto: finalízalo o cancélalo.';
+      return senderActiveGuidance(decision.status);
     case 'reserved':
     case 'webhook-replayed':
     case 'provider-media-reused':
     case 'webhook-media-conflict':
       return undefined;
+  }
+}
+
+/** ODD-4C fixed Spanish guidance for a durable active receipt. An amount or
+ * confirmation flow needs a customer decision; every other active status is
+ * still processing internally. */
+function senderActiveGuidance(status: ActiveReceiptStatus): string {
+  switch (status) {
+    case 'AWAITING_AMOUNT':
+    case 'AWAITING_CONFIRMATION':
+      return 'Tienes un proceso abierto: finalízalo o cancélalo.';
+    case 'RESERVED':
+    case 'DOWNLOADED':
+    case 'STORED':
+    case 'ATTACHING':
+      return 'Estamos procesando tu comprobante.';
   }
 }
 

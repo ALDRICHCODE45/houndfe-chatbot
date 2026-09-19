@@ -8936,6 +8936,166 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     });
   });
 
+  // --- ODD-4C identity-aware durable active-image lookup (RM1, RM3) ---
+  describe('ODD-4C identity-aware durable active-image lookup', () => {
+    const SENDER = 'sender.active';
+    const ACTIVE =
+      'RESERVED DOWNLOADED STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING'.split(
+        ' ',
+      );
+    const TERMINAL = 'ATTACHED FAILED CANCELLED ATTACH_OUTCOME_UNKNOWN'.split(
+      ' ',
+    );
+    const unrelated = (sender = SENDER) => ({
+      senderId: sender,
+      webhookMessageId: 'wamid.unrelated',
+      providerMediaId: 'media.unrelated',
+    });
+    type Query = ReturnType<typeof unrelated>;
+    /** Structural seam keeps this spec runnable before the port method
+     * exists; the real PostgreSQL store is exercised either way. */
+    const findActive = (input: Query): Promise<string | null> =>
+      (
+        store as unknown as {
+          findActiveBySender(i: Query): Promise<string | null>;
+        }
+      ).findActiveBySender(input);
+    const admit = (over: Row): Promise<ReservationOutcome> =>
+      store.admit({
+        senderId: SENDER,
+        capturedSaleId: UUID_B,
+        ...over,
+      } as ReserveInput);
+    const count = async (sql: string): Promise<number> =>
+      (await pool.query<{ n: number }>(sql)).rows[0].n;
+    const receiptCount = () =>
+      count('SELECT count(*)::int AS n FROM receipt_media');
+    const markerCount = () =>
+      count('SELECT count(*)::int AS n FROM processed_webhook_messages');
+    const seed = async (status: string, sender = SENDER): Promise<void> => {
+      await pool.query(
+        'TRUNCATE processed_webhook_messages, receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const row = lifeRow(
+        status,
+        status === 'FAILED' ? 'ATTACH_DEFINITE' : null,
+        {
+          webhook_message_id: 'wamid.active',
+          provider_media_id: 'media.active',
+          sender_id: sender,
+        },
+      );
+      await pool.query(insertSql('receipt_media', row), Object.values(row));
+    };
+    it.each([
+      ...ACTIVE.map((s) => [s, s] as const),
+      ...TERMINAL.map((s) => [s, null] as const),
+    ])('projects %s to %s', async (status, expected) => {
+      await seed(status);
+      await expect(findActive(unrelated())).resolves.toBe(expected);
+    });
+    it('returns null for an absent sender', async () => {
+      await expect(findActive(unrelated('sender.missing'))).resolves.toBeNull();
+    });
+    it('parameter-binds adversarial sender values without altering SQL structure', async () => {
+      const nasty = "sender'); DROP TABLE receipt_media;--";
+      await seed('RESERVED', nasty);
+      await expect(findActive(unrelated(nasty))).resolves.toBe('RESERVED');
+      await expect(
+        findActive(unrelated("sender' OR '1'='1")),
+      ).resolves.toBeNull();
+      expect(await receiptCount()).toBe(1);
+    });
+    it('takes no row lock: an uncommitted writer does not block the lookup', async () => {
+      await seed('RESERVED');
+      const writer = await pool.connect();
+      try {
+        await writer.query('BEGIN');
+        await writer.query(
+          "UPDATE receipt_media SET sender_id = 'sender.locked' WHERE id = $1",
+          [UUID_A],
+        );
+        // The uncommitted writer holds the row lock; a plain read does not block.
+        const outcome = await Promise.race([
+          findActive(unrelated()),
+          new Promise((resolve) => setTimeout(() => resolve('blocked'), 1000)),
+        ]);
+        expect(outcome).toBe('RESERVED');
+      } finally {
+        await writer.query('ROLLBACK');
+        writer.release();
+      }
+    });
+    it.each<[string, string, Record<string, unknown>]>([
+      ['wamid.active', 'media.blank', { kind: 'webhook-media-conflict' }],
+      [
+        'wamid.blank',
+        'media.active',
+        { kind: 'provider-media-reused', receipt: expect.any(Object) },
+      ],
+    ])(
+      'excludes the identity overlap %s/%s from the lookup while admit owns its outcome',
+      async (webhookMessageId, providerMediaId, outcome) => {
+        await seed('RESERVED');
+        await expect(
+          findActive({ senderId: SENDER, webhookMessageId, providerMediaId }),
+        ).resolves.toBeNull();
+        await expect(
+          admit({
+            id: UUID_B,
+            webhookMessageId,
+            providerMediaId,
+            objectKey: `receipts/${UUID_B}`,
+          }),
+        ).resolves.toEqual(outcome);
+        expect(await receiptCount()).toBe(1);
+        expect(await markerCount()).toBe(1);
+      },
+    );
+    it('still projects an unrelated active row', async () => {
+      await seed('RESERVED');
+      await expect(findActive(unrelated())).resolves.toBe('RESERVED');
+    });
+    it('returns the committed winner status for a sender-active admit keeping one receipt', async () => {
+      await seed('DOWNLOADED');
+      await expect(
+        admit({
+          id: UUID_B,
+          webhookMessageId: 'wamid.rival',
+          providerMediaId: 'media.rival',
+          objectKey: `receipts/${UUID_B}`,
+        }),
+      ).resolves.toEqual({ kind: 'sender-active', status: 'DOWNLOADED' });
+      expect(await receiptCount()).toBe(1);
+    });
+    it('rethrows the original conflict when no active row survives', async () => {
+      await pool.query(
+        'TRUNCATE processed_webhook_messages, receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      // Force the active-sender conflict with no durable winner, so the
+      // post-conflict reload finds nothing and admit rethrows.
+      await pool.query(`CREATE FUNCTION forced_active_sender_conflict() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'forced active sender conflict' USING ERRCODE = '23505', CONSTRAINT = 'receipt_media_active_sender_idx'; END; $$;
+        CREATE TRIGGER forced_active_sender_conflict BEFORE INSERT ON receipt_media FOR EACH ROW EXECUTE FUNCTION forced_active_sender_conflict()`);
+      try {
+        await expect(
+          admit({
+            id: UUID_A,
+            webhookMessageId: 'wamid.gone',
+            providerMediaId: 'media.gone',
+            objectKey: `receipts/${UUID_A}`,
+          }),
+        ).rejects.toThrow('forced active sender conflict');
+        expect(await receiptCount()).toBe(0);
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS forced_active_sender_conflict ON receipt_media; DROP FUNCTION IF EXISTS forced_active_sender_conflict()',
+        );
+      }
+      expect(await markerCount()).toBe(0);
+    });
+  });
+
   it('rolls back and re-applies both empty tables (empty-table up/down)', async () => {
     await pool.query(
       'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',

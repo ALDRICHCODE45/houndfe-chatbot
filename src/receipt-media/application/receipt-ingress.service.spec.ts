@@ -1,6 +1,8 @@
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import { isCanonicalObjectKey } from '../domain/object-storage.port';
 import type {
+  ActiveReceiptStatus,
+  ActiveSenderIdentity,
   ReservationOutcome,
   ReserveInput,
 } from '../domain/receipt-media-store.port';
@@ -14,6 +16,11 @@ const SENDER = 'sender-1';
 const WAMID = 'wamid.ABC';
 const MEDIA = 'media-1';
 const SALE = 'sale-A';
+const IDENTITY: ActiveSenderIdentity = {
+  senderId: SENDER,
+  webhookMessageId: WAMID,
+  providerMediaId: MEDIA,
+};
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SEND = /send|notify|deliver|llm|agent|schedule|outbox|worker|prompt/i;
@@ -41,8 +48,13 @@ const fixture = (
   placedSaleId: string | null = SALE,
   reserveImpl: Reserve = () => Promise.resolve(created()),
   enabled = true,
+  activeStatus: ActiveReceiptStatus | null = null,
 ) => {
   const reserve = jest.fn(reserveImpl);
+  const findActive = jest.fn<
+    Promise<ActiveReceiptStatus | null>,
+    [ActiveSenderIdentity]
+  >(() => Promise.resolve(activeStatus));
   const state =
     placedSaleId === null
       ? null
@@ -50,8 +62,9 @@ const fixture = (
   const conversations = { getState: jest.fn(() => Promise.resolve(state)) };
   const service = new ReceiptIngressService({ enabled }, conversations, {
     admit: reserve,
+    findActiveBySender: findActive,
   });
-  return { service, conversations, reserve };
+  return { service, conversations, reserve, findActive };
 };
 const flush = () => new Promise<void>((r) => setImmediate(r));
 
@@ -94,7 +107,11 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
       Promise.reject(new Error('legacy reservation path used')),
     );
     const state = { data: { placedSaleId: SALE } } as ConversationState;
-    const ingressStore = { admit: admission, reserve };
+    const ingressStore = {
+      admit: admission,
+      reserve,
+      findActiveBySender: jest.fn(() => Promise.resolve(null)),
+    };
     const service = new ReceiptIngressService(
       { enabled: true },
       { getState: jest.fn(() => Promise.resolve(state)) },
@@ -173,12 +190,16 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     expect(decision).not.toHaveProperty('receipt');
   });
 
-  it('maps the overlapping second image to sender-active rejection', async () => {
+  it('maps the race-won overlapping second image to status-bearing sender-active', async () => {
     const { service } = fixture(SALE, () =>
-      Promise.resolve({ kind: 'sender-active' } as ReservationOutcome),
+      Promise.resolve({
+        kind: 'sender-active',
+        status: 'ATTACHING',
+      } as ReservationOutcome),
     );
     await expect(service.admit(input())).resolves.toEqual({
       kind: 'sender-active',
+      status: 'ATTACHING',
     });
   });
 
@@ -251,9 +272,11 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
   it('exposes no send/outbox/worker surface and preserves caller input', async () => {
     const { service, reserve } = fixture();
     await service.admit(Object.freeze(input()));
-    const methods = Object.getOwnPropertyNames(
-      Object.getPrototypeOf(service),
-    ).filter((name) => SEND.test(name));
+    const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(service))
+      // ODD-4C adds the read-only durable active-lookup seam; its name
+      // contains the noun "Sender" and is not a send/outbox/worker surface.
+      .filter((name) => name !== 'findActiveBySender')
+      .filter((name) => SEND.test(name));
     expect(methods).toEqual([]);
     expect(reserve.mock.calls[0][0].webhookMessageId).toBe(WAMID);
     expect(reserve.mock.calls[0][0].senderId).toBe(SENDER);
@@ -339,4 +362,102 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     expect(reserved).not.toHaveProperty('filename');
     expect(reserved).not.toHaveProperty('sha256');
   });
+
+  // ── ODD-4C: identity-aware active-image lookup (status-only projection) ─
+  const ACTIVE_STATUSES =
+    'RESERVED DOWNLOADED STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING'.split(
+      ' ',
+    );
+  it.each(ACTIVE_STATUSES)(
+    'returns status-bearing sender-active for an active %s before any conversation read or admit',
+    async (status) => {
+      const { service, conversations, reserve, findActive } = fixture(
+        SALE,
+        undefined,
+        true,
+        status as ActiveReceiptStatus,
+      );
+      await expect(service.admit(input())).resolves.toEqual({
+        kind: 'sender-active',
+        status,
+      });
+      expect(findActive).toHaveBeenCalledWith(IDENTITY);
+      expect(conversations.getState).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+    },
+  );
+  it.each([
+    ['webhook-replayed', { kind: 'webhook-replayed', receipt: { id: 'r-9' } }],
+    [
+      'provider-media-reused',
+      { kind: 'provider-media-reused', receipt: { id: 'r-9' } },
+    ],
+    ['webhook-media-conflict', { kind: 'webhook-media-conflict' }],
+  ] as const)(
+    'forwards identities and preserves the silent %s outcome on an overlap-null lookup',
+    async (kind, outcome) => {
+      const { service, findActive, reserve, conversations } = fixture(
+        SALE,
+        () => Promise.resolve(outcome as ReservationOutcome),
+      );
+      const decision = await service.admit(input());
+      expect(decision.kind).toBe(kind);
+      expect(decision).not.toHaveProperty('status');
+      expect(findActive).toHaveBeenCalledWith(IDENTITY);
+      expect(conversations.getState).toHaveBeenCalledWith(SENDER);
+      expect(reserve).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('returns sender-active before the transient placed-sale gate', async () => {
+    const { service, conversations, reserve } = fixture(
+      null,
+      undefined,
+      true,
+      'AWAITING_CONFIRMATION',
+    );
+    await expect(service.admit(input())).resolves.toEqual({
+      kind: 'sender-active',
+      status: 'AWAITING_CONFIRMATION',
+    });
+    expect(conversations.getState).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['reserved', SALE],
+    ['no-placed-sale', null],
+  ] as const)(
+    'continues to admit as %s when no unrelated active row exists',
+    async (kind, placedSaleId) => {
+      const { service, conversations, reserve, findActive } =
+        fixture(placedSaleId);
+      expect((await service.admit(input())).kind).toBe(kind);
+      expect(findActive).toHaveBeenCalledWith(IDENTITY);
+      expect(conversations.getState).toHaveBeenCalledWith(SENDER);
+      expect(reserve).toHaveBeenCalledTimes(kind === 'reserved' ? 1 : 0);
+    },
+  );
+
+  it.each([
+    ['disabled', false, 'image/jpeg'],
+    ['unsupported-media', true, 'application/pdf'],
+    ['unsupported-media', true, 'image/gif'],
+  ] as const)(
+    'gates %s before the active lookup for %s',
+    async (kind, enabled, declaredMimeType) => {
+      const { service, findActive, conversations, reserve } = fixture(
+        SALE,
+        undefined,
+        enabled,
+        'RESERVED',
+      );
+      await expect(service.admit(input({ declaredMimeType }))).resolves.toEqual(
+        { kind },
+      );
+      expect(findActive).not.toHaveBeenCalled();
+      expect(conversations.getState).not.toHaveBeenCalled();
+      expect(reserve).not.toHaveBeenCalled();
+    },
+  );
 });

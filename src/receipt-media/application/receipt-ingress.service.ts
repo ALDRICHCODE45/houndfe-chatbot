@@ -16,6 +16,8 @@ import { readPlacedSaleId } from '../../sale-flow/application/placed-sale-persis
 import { parseAmount } from '../domain/amount-parser';
 import { newObjectKey } from '../domain/object-storage.port';
 import type {
+  ActiveReceiptStatus,
+  ActiveSenderIdentity,
   ReservationOutcome,
   ReserveInput,
 } from '../domain/receipt-media-store.port';
@@ -52,9 +54,13 @@ export interface ReceiptIngressConversations {
   getState(senderId: string): Promise<ConversationState | null>;
 }
 
-/** Narrow receipt-admission seam over the store port: one atomic admission. */
+/** Narrow receipt-admission seam over the store port: one atomic admission
+ * plus the ODD-4C identity-aware durable active lookup. */
 export interface ReceiptIngressStore {
   admit(input: ReserveInput): Promise<ReservationOutcome>;
+  findActiveBySender(
+    input: ActiveSenderIdentity,
+  ): Promise<ActiveReceiptStatus | null>;
 }
 
 /** Normalized media envelope; identity pre-checks are store-owned. The
@@ -79,7 +85,7 @@ export type ReceiptIngressDecision =
   | { kind: 'webhook-replayed'; receipt: ReceiptMediaRow }
   | { kind: 'provider-media-reused'; receipt: ReceiptMediaRow }
   | { kind: 'webhook-media-conflict' }
-  | { kind: 'sender-active' };
+  | { kind: 'sender-active'; status: ActiveReceiptStatus };
 
 export class ReceiptIngressService {
   constructor(
@@ -91,11 +97,18 @@ export class ReceiptIngressService {
   /** TX1 admission: the store atomically persists the reservation and inbound
    * marker. Unsupported media is gated before the state read (media type is
    * intrinsic to the message; sale context is transient); no sale context
-   * reserves nothing. */
+   * reserves nothing. ODD-4C: the active lookup precedes the placed-sale read. */
   async admit(input: ReceiptIngressInput): Promise<ReceiptIngressDecision> {
     if (!this.killSwitch.enabled) return { kind: 'disabled' };
     if (!SUPPORTED_MIME_TYPES.has(input.declaredMimeType))
       return { kind: 'unsupported-media' };
+    const activeStatus = await this.store.findActiveBySender({
+      senderId: input.senderId,
+      webhookMessageId: input.webhookMessageId,
+      providerMediaId: input.providerMediaId,
+    });
+    if (activeStatus !== null)
+      return { kind: 'sender-active', status: activeStatus };
     const placedSaleId = readPlacedSaleId(
       await this.conversations.getState(input.senderId),
     );
@@ -117,8 +130,9 @@ export class ReceiptIngressService {
       case 'provider-media-reused':
         return { kind: reservation.kind, receipt: reservation.receipt };
       case 'webhook-media-conflict':
-      case 'sender-active':
         return { kind: reservation.kind };
+      case 'sender-active':
+        return { kind: 'sender-active', status: reservation.status };
     }
   }
 }

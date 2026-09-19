@@ -25,6 +25,7 @@ import {
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
 import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -1260,7 +1261,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
       // Guidance: customer sees guidance text, no agent, dedup marked
       const guidanceCases: Array<{
-        decision: { kind: string; text: string };
+        decision: { kind: string; text: string; status?: ActiveReceiptStatus };
         expected: string;
       }> = [
         {
@@ -1287,6 +1288,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         {
           decision: {
             kind: 'sender-active',
+            status: 'AWAITING_AMOUNT',
             text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
           },
           expected: 'Tienes un proceso abierto: finalízalo o cancélalo.',
@@ -1309,6 +1311,52 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           });
           expect(llm.run).not.toHaveBeenCalled();
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      // ── ODD-4C: active-image guidance text by durable status ──────────
+      const activeGuidanceCases: Array<{
+        status: ActiveReceiptStatus;
+        text: string;
+      }> = [
+        {
+          status: 'AWAITING_AMOUNT',
+          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+        },
+        {
+          status: 'AWAITING_CONFIRMATION',
+          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+        },
+        { status: 'RESERVED', text: 'Estamos procesando tu comprobante.' },
+        { status: 'DOWNLOADED', text: 'Estamos procesando tu comprobante.' },
+        { status: 'STORED', text: 'Estamos procesando tu comprobante.' },
+        { status: 'ATTACHING', text: 'Estamos procesando tu comprobante.' },
+      ];
+
+      test.each(activeGuidanceCases)(
+        'ODD-4C sender-active $status: exact guidance, one send/remember/markSeen, no router/LLM',
+        async ({ status, text }) => {
+          const wamid = `wamid.active.${status}`;
+          ingress.admit.mockResolvedValueOnce({
+            kind: 'sender-active',
+            status,
+          });
+          sender.sendText.mockResolvedValueOnce({
+            providerMessageId: 'wamid.active-out',
+          });
+
+          await service.dispatch(mediaEvent(wamid, 'image'));
+
+          expect(sender.sendText).toHaveBeenCalledTimes(1);
+          expect(sender.sendText).toHaveBeenCalledWith({ to: CUSTOMER, text });
+          expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
+          expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
+            'wamid.active-out',
+          );
+          expect(dedup.markSeen).toHaveBeenCalledTimes(1);
+          expect(dedup.markSeen).toHaveBeenCalledWith(wamid);
+          expect(amountRouter.route).not.toHaveBeenCalled();
+          expect(llm.run).not.toHaveBeenCalled();
         },
       );
 
@@ -1463,7 +1511,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         { kind: 'disabled' } as const,
         { kind: 'unsupported-media' } as const,
         { kind: 'no-placed-sale' } as const,
-        { kind: 'sender-active' } as const,
+        { kind: 'sender-active', status: 'AWAITING_AMOUNT' } as const,
       ])(
         'guidance marker-write failure after $kind remains terminal',
         async (decision) => {

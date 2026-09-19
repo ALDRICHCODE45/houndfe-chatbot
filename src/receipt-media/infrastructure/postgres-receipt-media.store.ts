@@ -10,6 +10,8 @@ import {
   type ReceiptAmountPointer,
 } from '../../conversation/domain/conversation-store';
 import type {
+  ActiveReceiptStatus,
+  ActiveSenderIdentity,
   AmountBootstrapInput,
   AmountBootstrapOutcome,
   AmountProposalInput,
@@ -1152,6 +1154,27 @@ const classify = (hit: Row, input: ReserveInput): ReservationOutcome =>
       : { kind: 'webhook-media-conflict' }
     : { kind: 'provider-media-reused', receipt: camelize<Media>(hit) };
 
+/** UNRELATED active row for the sender; identity overlaps belong to `admit`. */
+const UNRELATED_ACTIVE_SENDER_SQL = `SELECT status FROM receipt_media
+   WHERE sender_id = $1 AND status IN ('RESERVED', 'DOWNLOADED', 'STORED',
+     'AWAITING_AMOUNT', 'AWAITING_CONFIRMATION', 'ATTACHING')
+     AND webhook_message_id <> $2 AND provider_media_id <> $3`;
+
+/** Admission conflict reload: committed active winner, no identity exclusions. */
+const ACTIVE_SENDER_WINNER_SQL = `SELECT status FROM receipt_media
+   WHERE sender_id = $1 AND status IN ('RESERVED', 'DOWNLOADED', 'STORED',
+     'AWAITING_AMOUNT', 'AWAITING_CONFIRMATION', 'ATTACHING')`;
+
+const lookupActiveStatus = async (
+  run: (sql: string, params: unknown[]) => Promise<Array<{ status: string }>>,
+  sql: string,
+  params: unknown[],
+): Promise<ActiveReceiptStatus | null> => {
+  const rows = await run(sql, params);
+  const status = rows[0]?.status;
+  return status === undefined ? null : (status as ActiveReceiptStatus);
+};
+
 /** WU2B2A PostgreSQL primitives (RM1, RM3) over the WU2A1/WU2A2A/WU2A2B
  * schema. Every external value is parameter-bound; no caption, URL, token,
  * response body, raw error, or diagnostic PII is persisted. */
@@ -1220,11 +1243,33 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           return classify(winner, input);
         }
         const constraint = (err as { constraint?: string }).constraint;
-        if (constraint === 'receipt_media_active_sender_idx')
-          return { kind: 'sender-active' };
+        if (constraint === 'receipt_media_active_sender_idx') {
+          const status = await lookupActiveStatus(
+            async (sql, params) =>
+              (await c.query<{ status: string }>(sql, params)).rows,
+            ACTIVE_SENDER_WINNER_SQL,
+            [input.senderId],
+          );
+          // A vanished winner is never fabricated: rethrow the original
+          // conflict with zero mutation.
+          if (status === null) throw err;
+          return { kind: 'sender-active', status };
+        }
         throw err;
       }
     });
+  }
+
+  /** Plain status-only read; no lock or transaction. */
+  async findActiveBySender(
+    input: ActiveSenderIdentity,
+  ): Promise<ActiveReceiptStatus | null> {
+    return lookupActiveStatus(
+      async (sql, params) =>
+        (await this.pool.query<{ status: string }>(sql, params)).rows,
+      UNRELATED_ACTIVE_SENDER_SQL,
+      [input.senderId, input.webhookMessageId, input.providerMediaId],
+    );
   }
 
   async insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome> {

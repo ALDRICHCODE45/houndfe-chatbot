@@ -20,7 +20,25 @@ export type ReservationOutcome =
   | { kind: 'webhook-replayed'; receipt: ReceiptMediaRow }
   | { kind: 'provider-media-reused'; receipt: ReceiptMediaRow }
   | { kind: 'webhook-media-conflict' }
-  | { kind: 'sender-active' };
+  | { kind: 'sender-active'; status: ActiveReceiptStatus };
+
+/** The six `receipt_media_active_sender_idx` statuses; a lookup returns one or null. */
+export type ActiveReceiptStatus = Extract<
+  ReceiptMediaStatus,
+  | 'RESERVED'
+  | 'DOWNLOADED'
+  | 'STORED'
+  | 'AWAITING_AMOUNT'
+  | 'AWAITING_CONFIRMATION'
+  | 'ATTACHING'
+>;
+
+/** Overlapping an active row's webhook or provider identity defers to `admit`. */
+export interface ActiveSenderIdentity {
+  senderId: string;
+  webhookMessageId: string;
+  providerMediaId: string;
+}
 
 export interface ReserveInput {
   id: string;
@@ -404,6 +422,10 @@ export interface CapabilityAccessRow {
 export interface ReceiptMediaStorePort {
   /** Atomically commits a receipt reservation and its inbound webhook marker. */
   admit(input: ReserveInput): Promise<ReservationOutcome>;
+  /** UNRELATED active receipt status for the sender, or null; overlaps excluded. */
+  findActiveBySender(
+    input: ActiveSenderIdentity,
+  ): Promise<ActiveReceiptStatus | null>;
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
   /** Atomically persist one amount proposal, successor pointer, and intent. */
   proposeAmount(input: AmountProposalInput): Promise<AmountProposalOutcome>;
