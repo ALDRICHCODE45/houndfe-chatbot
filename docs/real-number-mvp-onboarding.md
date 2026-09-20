@@ -114,7 +114,10 @@ this number before cutover; do not assume inherited access or scope.
   - `META_ACCESS_TOKEN` — the permanent System User token.
   - `META_SANDBOX_RECIPIENT_NORMALIZATION=false` — production keeps the
     exact inbound `wa_id`.
-  - `OPS_CHANNEL_PHONE` — exact E.164 `wa_id` of the human agent.
+  - `OPS_CHANNEL_PHONE` — exact **digit-only** `wa_id` of the human agent
+    (copy the value Meta delivers in an inbound `wa_id`; never the E.164 form
+    with a leading `+`). Boot fails fast on a `+`/separator/whitespace form, so
+    ops handoff replies cannot be silently dropped.
   - `HUMAN_HANDOFF_ENABLED` — keep `true` for the pilot.
   - Receipt flags stay **false**: `RECEIPT_MEDIA_ENABLED=false`,
     `RECEIPT_MEDIA_INGESTION_ENABLED=false`,

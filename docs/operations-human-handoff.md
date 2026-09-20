@@ -10,10 +10,10 @@ operation, and during a behaviour rollback.
 
 ## TL;DR
 
-| Knob | Env var | Default | Purpose |
-|---|---|---|---|
-| Channel on/off | `HUMAN_HANDOFF_ENABLED` | `true` | Kill-switch — when `false`, `requestHumanAssistance` returns a `disabled` envelope and the bot never writes a row, never sends a digest, never sets the marker. One env flip, zero code. |
-| Ops phone | `OPS_CHANNEL_PHONE` | required when enabled | WhatsApp senderId (wa_id) of the human agent who receives digests and replies to them. Joi accepts the optional `+` (E.164). Comparison is exact by default; the Mexican trunk-1 rewrite runs **only** when `META_SANDBOX_RECIPIENT_NORMALIZATION=true` (Meta test number), never in production. |
+| Knob           | Env var                 | Default               | Purpose                                                                                                                                                                                                                                                                                                                                              |
+| -------------- | ----------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Channel on/off | `HUMAN_HANDOFF_ENABLED` | `true`                | Kill-switch — when `false`, `requestHumanAssistance` returns a `disabled` envelope and the bot never writes a row, never sends a digest, never sets the marker. One env flip, zero code.                                                                                                                                                             |
+| Ops phone      | `OPS_CHANNEL_PHONE`     | required when enabled | Exact digit-only Meta senderId (`wa_id`) of the human agent who receives digests and replies to them, 10-15 digits. A leading `+`, whitespace, or separator is rejected at boot. Comparison is exact by default; the Mexican trunk-1 rewrite runs **only** when `META_SANDBOX_RECIPIENT_NORMALIZATION=true` (Meta test number), never in production. |
 
 ## 1. Shift-start "ops on" pattern
 
@@ -53,12 +53,13 @@ the marker explicitly is helpful for traceability in the human chat.)
 The phone number that the bot will send digests TO must be configured before
 boot. Validate the format end-to-end:
 
-1. **Production (default):** set the exact E.164 `wa_id` Meta reports for
-   the human agent, e.g. `+5219999888777`. With
-   `META_SANDBOX_RECIPIENT_NORMALIZATION` unset (default `false`) the value
-   is retained verbatim and the sender/ops comparison is exact, so the
-   inbound `wa_id` is preserved. Joi accepts the optional `+`; the
-   underlying digit string is what gets compared.
+1. **Production (default):** copy and store the **exact digit-only `wa_id`**
+   Meta reports for the human agent, e.g. `5219999888777`; never the E.164
+   form with a `+`. With `META_SANDBOX_RECIPIENT_NORMALIZATION` unset
+   (default `false`) the value is retained verbatim and the sender/ops
+   comparison is an exact string match against the digit-only inbound
+   `wa_id`. Joi fails the boot on a `+`/separator/whitespace form or outside
+   10-15 digits — a `+` would never match, silently losing ops replies.
 2. **Meta test number only:** while building against the Meta test number,
    you may explicitly set `META_SANDBOX_RECIPIENT_NORMALIZATION=true`. Only
    then does the runtime rewrite `521` + 10-digit recipients (e.g.
@@ -75,7 +76,8 @@ boot. Validate the format end-to-end:
       bot is allowed to send it outbound messages).
 - [ ] After every change, restart the bot. Joi validation at boot fails
       fast when `HUMAN_HANDOFF_ENABLED=true` and `OPS_CHANNEL_PHONE` is
-      missing/empty/non-string.
+      missing/empty/non-string, or when it is not the exact digit-only
+      `wa_id` (leading `+`, whitespace, separators, or outside 10-15 digits).
 
 ### Test-number allowlist + 24h token cap
 

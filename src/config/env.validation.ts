@@ -196,9 +196,11 @@ const receiptConditional = (then: Joi.Schema) =>
  *   HUMAN_HANDOFF_ENABLED  — boolean, default true. Kill-switch for the
  *                             human-handoff channel.
  *   OPS_CHANNEL_PHONE      — REQUIRED when HUMAN_HANDOFF_ENABLED=true.
- *                             Wa_id of the human agent who receives
- *                             digests and replies to them. Joi accepts an
- *                             optional leading `+` (E.164).
+ *                             Exact digit-only Meta sender id (wa_id), same
+ *                             form Meta delivers in an inbound `wa_id`,
+ *                             10-15 digits. `+`/separators/whitespace are
+ *                             rejected at boot: the runtime compares it
+ *                             verbatim, so a `+` would silently drop replies.
  */
 const innerEnvValidationSchema = Joi.object({
   META_VERIFY_TOKEN: Joi.string().required(),
@@ -242,12 +244,13 @@ const innerEnvValidationSchema = Joi.object({
    * WhatsApp senderId (wa_id) of the human agent who receives digests
    * and replies to them. Required when `HUMAN_HANDOFF_ENABLED=true`;
    * optional otherwise (enforced by the `.custom()` block below).
-   * Joi accepts an optional leading `+` (E.164). The value is retained
-   * verbatim; sender/ops comparison honors
-   * `META_SANDBOX_RECIPIENT_NORMALIZATION`.
+   * Must be the exact digit-only Meta sender id (same form delivered in an
+   * inbound `wa_id`): 10-15 digits, no leading `+`, whitespace, or
+   * separators. The value is retained verbatim; sender/ops comparison
+   * honors `META_SANDBOX_RECIPIENT_NORMALIZATION`.
    */
   OPS_CHANNEL_PHONE: Joi.string()
-    .pattern(/^\+?\d+$/)
+    .pattern(/^\d{10,15}$/)
     .optional(),
   /**
    * Explicit Meta test-number recipient compatibility mode. Default: false.

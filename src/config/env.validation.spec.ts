@@ -389,13 +389,50 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
-    it('accepts OPS_CHANNEL_PHONE with an optional + prefix', () => {
-      const env = { ...validEnv, OPS_CHANNEL_PHONE: '+5219999888777' };
+    // MVP-5 ops-sender mismatch: production compares the stored value
+    // verbatim against the digit-only inbound `wa_id`. A leading `+`,
+    // whitespace, separator, or any non-digit form must fail at boot
+    // instead of silently breaking ops handoff reply routing.
+    it.each([
+      '+5219999888777',
+      ' 5219999888777',
+      '521 9998887777',
+      '521-9998-88777',
+    ])('rejects non digit-only OPS_CHANNEL_PHONE=%s', (value) => {
+      const env = { ...validEnv, OPS_CHANNEL_PHONE: value };
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
       });
-      expect(error).toBeUndefined();
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('OPS_CHANNEL_PHONE')),
+      ).toBe(true);
     });
+
+    it.each(['123456789', '1234567890123456'])(
+      'rejects OPS_CHANNEL_PHONE outside the 10-15 digit length=%s',
+      (value) => {
+        const env = { ...validEnv, OPS_CHANNEL_PHONE: value };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(error).toBeDefined();
+        expect(
+          error!.details.some((d) => d.path.includes('OPS_CHANNEL_PHONE')),
+        ).toBe(true);
+      },
+    );
+
+    it.each(['1234567890', '123456789012345'])(
+      'accepts digit-only OPS_CHANNEL_PHONE value=%s',
+      (value) => {
+        const env = { ...validEnv, OPS_CHANNEL_PHONE: value };
+        const { error } = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        expect(error).toBeUndefined();
+      },
+    );
 
     it('accepts a valid OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is true (default)', () => {
       const env = { ...validEnv, OPS_CHANNEL_PHONE: '5219999888777' };
