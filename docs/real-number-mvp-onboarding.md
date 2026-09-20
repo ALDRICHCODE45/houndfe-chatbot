@@ -179,3 +179,24 @@ Plan tentativo, siempre que Meta y los datos estén listos:
 
 El lunes hacemos la parte de Meta contigo presente. No compartas códigos ni
 tokens por chat: los ingresas tú directo en Meta y en el panel.
+
+## 12. Launch preflight (MVP-3, offline, no secrets)
+
+Run `pnpm preflight:launch` before cutover and after every config change. It
+prints one deterministic JSON report and exits `0` (pass), `1` (check
+failures), or `2` (usage/runtime error). It reads only environment variable
+names/presence, five posture flags, and `migrations/` filenames: no network,
+no `.env`, no Nest boot, and never a value, token, length, or hash.
+
+Report: `coreConfig` (`present|missing`); `posture` (`safe|unsafe|missing`
+against exact `META_SANDBOX_RECIPIENT_NORMALIZATION=false`,
+`HUMAN_HANDOFF_ENABLED=true`, and the three receipt flags `false`; missing or
+non-exact fails closed); `migrations` (`present_on_disk|missing_on_disk`);
+`clientRoutes`/`manualChecks` (always `manual_external`, never flipping `ok`).
+`ok` is false only for missing core names, unsafe/missing posture, or a missing
+migration file.
+
+Limitations: presence is not validity; a migration file on disk is not an
+applied migration; all reachability and data checks (backend, the 11 routes,
+cashier user, `ServiceCredential` with seven scopes including
+`payment-details:read`, active `PaymentDetail`, populated catalog) stay manual.
