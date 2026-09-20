@@ -54,7 +54,7 @@ Live activation remains blocked until all are observed:
 
 - [x] **SQ-0 — Freeze scope and isolate the branch:** branch `feat/shipping-quotes-skydropx` from local real-number delivery commit `65ecd5a`, preserve the canonical launch order, record quote-only scope, prerequisites, non-goals, and guardrails.
 - [x] **SQ-1A — Implement shipping credit rules:** add a pure value type and strict tests for threshold exclusivity (`unitPriceCents > 50_000`), summed credits, non-negative customer charge, money bounds, invalid input, and explicit overflow without floating money.
-- [ ] **SQ-1B — Implement package-readiness rules:** add a pure value type and strict tests for missing package data, quantity-weighted totals, the 25 kg boundary, minimum split count, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
+- [x] **SQ-1B — Implement package-readiness rules:** add a pure value type and strict tests for missing package data, quantity-weighted totals, the 25 kg boundary, minimum split count, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
 - [ ] **SQ-2 — Add default-off shipping configuration and provider contract:** introduce typed configuration/Joi validation, conditional credential/origin requirements only when enabled, normalized request/rate/error contracts, and dependency tokens without wiring a live tool.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
@@ -72,7 +72,19 @@ Live activation remains blocked until all are observed:
 - Production typecheck: `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0.
 - `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
 - Coverage: strict $500 boundary, quantity multiplication, summed credits, zero/full/partial/unused credit, invalid input with offending line index, and single-line plus accumulated credit overflow.
-- SQ-1B package readiness is not present in this candidate; checkbox stays open pending independent verification and native review.
+- SQ-1B was deliberately excluded from this candidate and delivered as the next bounded work unit.
+
+## SQ-1B evidence (independent `PASS`; native-approved as `review-74dbca8698bbdad7`; locally delivered in this work unit)
+
+- Work unit: `package-readiness` only — 316 complete changed lines (impl 148 + spec 168), within the 400-line guard.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache shipping/domain/package-readiness.spec.ts` failed with `Cannot find module './package-readiness'` (1 suite failed, 0 tests).
+- Focused TDD GREEN: same command — 1 suite passed, 29 tests passed.
+- Scoped ESLint: `pnpm exec eslint src/shipping/domain/package-readiness.ts src/shipping/domain/package-readiness.spec.ts` — exit 0.
+- Prettier: `pnpm exec prettier --check src/shipping/domain/package-readiness.ts src/shipping/domain/package-readiness.spec.ts` — clean.
+- Production typecheck: `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0.
+- `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
+- Coverage: missing/null/absent weight and dimensions, invalid dimensions and quantity, quantity-weighted totals, exact/over 25 kg boundary, minimum split count `ceil(total/25_000)`, `manual_unresolved` with no parcel assignment, and line plus summed weight overflow; `unavailable` limited to item/variant ids and missing fields.
+- Native advisory `R3-empty-cart` is non-blocking; SQ-4 orchestration must reject an empty cart before package assessment.
 
 ## Delivery gate
 
