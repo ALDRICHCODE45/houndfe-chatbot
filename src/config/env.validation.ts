@@ -190,6 +190,23 @@ const shippingConditional = (then: Joi.Schema) =>
     otherwise: Joi.any(),
   });
 
+// SQ-2A-H: canonical, case-sensitive flag. Joi's boolean rule folds case
+// (accepting 'TRUE'), which would disagree with the factory's exact `=== 'true'`
+// posture; `sensitive(true)` pins the spelling and the original-value guard
+// rejects surrounding whitespace. Output stays boolean with a false default.
+const shippingFlagSchema = Joi.boolean()
+  .sensitive(true)
+  .truthy('true')
+  .falsy('false')
+  .custom((value: boolean, helpers) => {
+    const original: unknown = helpers.original;
+    if (typeof original === 'string' && original !== original.trim()) {
+      return helpers.error('boolean.base');
+    }
+    return value;
+  }, 'canonical boolean')
+  .default(false);
+
 /**
  * Joi validation schema for all required environment variables.
  *
@@ -371,26 +388,32 @@ const innerEnvValidationSchema = Joi.object({
   // Kill-switch defaults to false; when enabled the strict Skydropx
   // requirements validate. Credentials stay plain non-empty strings so no
   // pattern can echo a secret into a validation message.
-  SHIPPING_QUOTES_ENABLED: Joi.boolean().default(false),
+  SHIPPING_QUOTES_ENABLED: shippingFlagSchema,
   SKYDROPX_BASE_URL: shippingConditional(
     Joi.string()
+      .trim(true)
       .uri({ scheme: ['https'] })
       .default(SKYDROPX_BASE_URL_DEFAULT),
   ),
-  SKYDROPX_CLIENT_ID: shippingConditional(Joi.string().required()),
-  SKYDROPX_CLIENT_SECRET: shippingConditional(Joi.string().required()),
+  SKYDROPX_CLIENT_ID: shippingConditional(Joi.string().trim(true).required()),
+  SKYDROPX_CLIENT_SECRET: shippingConditional(
+    Joi.string().trim(true).required(),
+  ),
   SKYDROPX_ORIGIN_POSTAL_CODE: shippingConditional(
     Joi.string()
+      .trim(true)
       .length(5)
       .pattern(/^[0-9]{5}$/)
       .required(),
   ),
-  SKYDROPX_ORIGIN_STATE: shippingConditional(Joi.string().max(100).required()),
+  SKYDROPX_ORIGIN_STATE: shippingConditional(
+    Joi.string().trim(true).max(100).required(),
+  ),
   SKYDROPX_ORIGIN_MUNICIPALITY: shippingConditional(
-    Joi.string().max(100).required(),
+    Joi.string().trim(true).max(100).required(),
   ),
   SKYDROPX_ORIGIN_NEIGHBORHOOD: shippingConditional(
-    Joi.string().max(100).required(),
+    Joi.string().trim(true).max(100).required(),
   ),
 })
   .custom((value: Record<string, unknown>, helpers) => {

@@ -281,7 +281,9 @@ describe('configuration()', () => {
       ['true', true],
       ['false', false],
       ['TRUE', false],
+      ['False', false],
       ['1', false],
+      [' true ', false],
     ])('maps SHIPPING_QUOTES_ENABLED=%s', (env, expected) => {
       if (env === undefined) {
         delete process.env.SHIPPING_QUOTES_ENABLED;
@@ -306,6 +308,31 @@ describe('configuration()', () => {
           baseUrl: 'https://sandbox.skydropx.test',
           clientId: 'client-id-raw',
           clientSecret: 'client-secret-raw',
+          originPostalCode: '06000',
+          originState: 'CDMX',
+          originMunicipality: 'Cuauhtemoc',
+          originNeighborhood: 'Centro',
+        },
+      });
+    });
+
+    // SQ-2A-H: accepted surrounding whitespace is normalized in the factory so
+    // ConfigService sees the same trimmed values that Joi validated.
+    it('trims surrounding whitespace on provider values', () => {
+      process.env.SHIPPING_QUOTES_ENABLED = 'true';
+      process.env.SKYDROPX_BASE_URL = '  https://sandbox.skydropx.test  ';
+      process.env.SKYDROPX_CLIENT_ID = '  client-id  ';
+      process.env.SKYDROPX_CLIENT_SECRET = '  client-secret  ';
+      process.env.SKYDROPX_ORIGIN_POSTAL_CODE = ' 06000 ';
+      process.env.SKYDROPX_ORIGIN_STATE = '  CDMX  ';
+      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = '  Cuauhtemoc  ';
+      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = '  Centro  ';
+      expect(shipping()).toEqual({
+        enabled: true,
+        skydropx: {
+          baseUrl: 'https://sandbox.skydropx.test',
+          clientId: 'client-id',
+          clientSecret: 'client-secret',
           originPostalCode: '06000',
           originState: 'CDMX',
           originMunicipality: 'Cuauhtemoc',

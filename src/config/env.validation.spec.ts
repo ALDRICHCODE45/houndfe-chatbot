@@ -1396,8 +1396,8 @@ describe('envValidationSchema', () => {
       },
     );
 
-    it.each(['yes', 'maybe', ''])(
-      'rejects non-boolean SHIPPING_QUOTES_ENABLED=%s',
+    it.each(['yes', 'maybe', '', 'TRUE', 'False', '1', '0', ' true '])(
+      'rejects noncanonical SHIPPING_QUOTES_ENABLED=%s',
       (flag) => {
         expectFieldError(
           { ...validEnv, SHIPPING_QUOTES_ENABLED: flag },
@@ -1436,6 +1436,32 @@ describe('envValidationSchema', () => {
     });
     it.each(requiredFields)('rejects enabled empty %s', (field) => {
       expectFieldError({ ...enabledBase, [field]: '' }, field);
+    });
+    it.each(requiredFields)('rejects enabled whitespace-only %s', (field) => {
+      expectFieldError({ ...enabledBase, [field]: '   ' }, field);
+    });
+
+    // SQ-2A-H: accepted surrounding whitespace is trimmed consistently so the
+    // validated output matches what the configuration factory exposes.
+    it('trims accepted surrounding whitespace in enabled values', () => {
+      const { error, value } = validate({
+        ...enabledBase,
+        SKYDROPX_BASE_URL: '  https://api-pro.skydropx.com  ',
+        SKYDROPX_CLIENT_ID: '  client-id  ',
+        SKYDROPX_CLIENT_SECRET: '  client-secret  ',
+        SKYDROPX_ORIGIN_POSTAL_CODE: ' 06000 ',
+        SKYDROPX_ORIGIN_STATE: '  Ciudad de Mexico  ',
+        SKYDROPX_ORIGIN_MUNICIPALITY: '  Cuauhtemoc  ',
+        SKYDROPX_ORIGIN_NEIGHBORHOOD: '  Centro  ',
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value.SKYDROPX_BASE_URL).toBe('https://api-pro.skydropx.com');
+      expect(value.SKYDROPX_CLIENT_ID).toBe('client-id');
+      expect(value.SKYDROPX_CLIENT_SECRET).toBe('client-secret');
+      expect(value.SKYDROPX_ORIGIN_POSTAL_CODE).toBe('06000');
+      expect(value.SKYDROPX_ORIGIN_STATE).toBe('Ciudad de Mexico');
+      expect(value.SKYDROPX_ORIGIN_MUNICIPALITY).toBe('Cuauhtemoc');
+      expect(value.SKYDROPX_ORIGIN_NEIGHBORHOOD).toBe('Centro');
     });
 
     it.each(['http://api-pro.skydropx.com', 'not-a-url', ''])(

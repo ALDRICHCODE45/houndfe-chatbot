@@ -56,6 +56,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-1A — Implement shipping credit rules:** add a pure value type and strict tests for threshold exclusivity (`unitPriceCents > 50_000`), summed credits, non-negative customer charge, money bounds, invalid input, and explicit overflow without floating money.
 - [x] **SQ-1B — Implement package-readiness rules:** add a pure value type and strict tests for missing package data, quantity-weighted totals, the 25 kg boundary, minimum split count, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
 - [x] **SQ-2A — Add default-off shipping-quote configuration:** typed `shippingQuotes` factory subtree plus conditional Joi validation (credentials/origin required only when enabled) with redacted secrets.
+- [x] **SQ-2A-H — Harden the SQ-2A configuration contract:** make `SHIPPING_QUOTES_ENABLED` canonical case-sensitive (reject `TRUE`/`False`/`1`/padded), reject whitespace-only required strings, and trim accepted provider values consistently in Joi and the factory.
 - [ ] **SQ-2B — Add provider-neutral shipping contracts:** normalized request/rate/error contracts and dependency tokens without wiring a live tool.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
@@ -96,6 +97,16 @@ Live activation remains blocked until all are observed:
 - Scoped ESLint over the five config files — exit 0; Prettier `--check` — clean; `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0; `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
 - Config behavior: `enabled` is exact `SHIPPING_QUOTES_ENABLED === 'true'`; `skydropx.baseUrl` defaults to exported `SKYDROPX_BASE_URL_DEFAULT` (`https://api-pro.skydropx.com`); remaining provider fields are raw optional env passthrough.
 - Native advisories `R3-boolean-contract-mismatch` and `R3-whitespace-required-values` are non-blocking and tracked for a separate bounded hardening work unit before adapter wiring.
+
+## SQ-2A-H evidence (independent `PASS_WITH_WARNINGS`; wording corrected; native-approved as `review-111bbc7c8a4f9b74`; locally delivered in this work unit)
+
+- Work unit: `shipping-quotes-config-hardening` only — 123 complete candidate lines = 55 implementation + 57 spec + 11 tracker, within the 220-line guard.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache config/env.validation.spec.ts config/configuration.spec.ts` — 2 suites failed, 10 failed / 255 passed (case-insensitive flag; untrimmed and whitespace-only strings).
+- Focused TDD GREEN: same command — 2 suites passed, 265 passed.
+- TRIANGULATE: flag rejects `TRUE`, `False`, `1`, `0`, `yes`, and padded `' true '`, accepts canonical `true`/`false`, defaults false; enabled credential/origin/postal reject whitespace-only and trim accepted surrounding whitespace; factory polarity stays exact `=== 'true'` and trims provider values; disabled permissiveness unchanged.
+- Joi API: `Joi.boolean().sensitive(true).truthy('true').falsy('false')` plus an `original`-value guard rejecting padded spellings; validated output stays boolean with a false default.
+- Scoped ESLint over the four TypeScript config paths — exit 0; Prettier `--check` covered those paths plus this tracker; `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0; `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
+- Independent verification passed all behavior and checks; its tracker-wording warning was corrected before the clean native approval.
 
 ## Delivery gate
 

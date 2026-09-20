@@ -12,6 +12,9 @@ const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   return r.length ? r : def;
 };
 const int = (v: string | undefined) => (v ? parseInt(v, 10) : undefined);
+// SQ-2A-H: normalize accepted surrounding whitespace so ConfigService sees the
+// same trimmed provider values that Joi validates.
+const trimmed = (v: string | undefined) => v?.trim();
 
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
@@ -93,17 +96,18 @@ const configuration = () => ({
     metricsEnabled: process.env.RECEIPT_MEDIA_METRICS_ENABLED === 'true',
     metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
   },
-  // SQ-2A: default-off shipping quotes; provider fields are raw env passthrough.
+  // SQ-2A-H: default-off shipping quotes; provider fields are trimmed env passthrough.
   shippingQuotes: {
     enabled: process.env.SHIPPING_QUOTES_ENABLED === 'true',
     skydropx: {
-      baseUrl: process.env.SKYDROPX_BASE_URL ?? SKYDROPX_BASE_URL_DEFAULT,
-      clientId: process.env.SKYDROPX_CLIENT_ID,
-      clientSecret: process.env.SKYDROPX_CLIENT_SECRET,
-      originPostalCode: process.env.SKYDROPX_ORIGIN_POSTAL_CODE,
-      originState: process.env.SKYDROPX_ORIGIN_STATE,
-      originMunicipality: process.env.SKYDROPX_ORIGIN_MUNICIPALITY,
-      originNeighborhood: process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD,
+      baseUrl:
+        trimmed(process.env.SKYDROPX_BASE_URL) ?? SKYDROPX_BASE_URL_DEFAULT,
+      clientId: trimmed(process.env.SKYDROPX_CLIENT_ID),
+      clientSecret: trimmed(process.env.SKYDROPX_CLIENT_SECRET),
+      originPostalCode: trimmed(process.env.SKYDROPX_ORIGIN_POSTAL_CODE),
+      originState: trimmed(process.env.SKYDROPX_ORIGIN_STATE),
+      originMunicipality: trimmed(process.env.SKYDROPX_ORIGIN_MUNICIPALITY),
+      originNeighborhood: trimmed(process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD),
     },
   },
 });
