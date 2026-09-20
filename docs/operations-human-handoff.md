@@ -13,7 +13,7 @@ operation, and during a behaviour rollback.
 | Knob | Env var | Default | Purpose |
 |---|---|---|---|
 | Channel on/off | `HUMAN_HANDOFF_ENABLED` | `true` | Kill-switch — when `false`, `requestHumanAssistance` returns a `disabled` envelope and the bot never writes a row, never sends a digest, never sets the marker. One env flip, zero code. |
-| Ops phone | `OPS_CHANNEL_PHONE` | required when enabled | WhatsApp senderId (wa_id) of the human agent who receives digests and replies to them. Joi accepts the optional `+` (E.164); the runtime additionally strips the Mexican trunk-1 in dev-mode test numbers via `normalizeSandboxRecipient`. |
+| Ops phone | `OPS_CHANNEL_PHONE` | required when enabled | WhatsApp senderId (wa_id) of the human agent who receives digests and replies to them. Joi accepts the optional `+` (E.164). Comparison is exact by default; the Mexican trunk-1 rewrite runs **only** when `META_SANDBOX_RECIPIENT_NORMALIZATION=true` (Meta test number), never in production. |
 
 ## 1. Shift-start "ops on" pattern
 
@@ -53,13 +53,18 @@ the marker explicitly is helpful for traceability in the human chat.)
 The phone number that the bot will send digests TO must be configured before
 boot. Validate the format end-to-end:
 
-1. **Sandbox (dev/test):** the number looks like `15219999888777` or
-   `5219999888777` (Mexican dev sandbox pattern). The runtime normalizes
-   both forms to `529999888777` (`normalizeSandboxRecipient` strips the
-   trunk-1). Use either form in the env — match works either way.
-2. **Production:** an E.164 number like `+5219999888777`. The `+` prefix is
-   accepted by Joi (per the spec) but the runtime strips it (no effect on
-   the underlying digit string).
+1. **Production (default):** set the exact E.164 `wa_id` Meta reports for
+   the human agent, e.g. `+5219999888777`. With
+   `META_SANDBOX_RECIPIENT_NORMALIZATION` unset (default `false`) the value
+   is retained verbatim and the sender/ops comparison is exact, so the
+   inbound `wa_id` is preserved. Joi accepts the optional `+`; the
+   underlying digit string is what gets compared.
+2. **Meta test number only:** while building against the Meta test number,
+   you may explicitly set `META_SANDBOX_RECIPIENT_NORMALIZATION=true`. Only
+   then does the runtime rewrite `521` + 10-digit recipients (e.g.
+   `5219999888777`) to `52` + 10 digits and apply the same conversion on
+   both sides of the sender/ops comparison. This compatibility mode is
+   opt-in and must return to `false` at real-number cutover.
 
 ### Env checklist
 

@@ -38,7 +38,8 @@ import {
  *   2. WEBHOOK_DEDUP   — skip re-deliveries of already-processed msgs.
  *   3. **Ops pre-routing hook** (new, human-handoff slice) —
  *      when `message.senderId` matches the configured OPS_CHANNEL_PHONE
- *      (sandbox trunk-1 normalized on both sides per ADR-22), the inbound
+ *      (exact by default; both sides apply the same trunk-1 rewrite only
+ *      when `META_SANDBOX_RECIPIENT_NORMALIZATION=true`, per ADR-22), the inbound
  *      is an ops reply to a previous escalation, NOT a customer message:
  *        - `humanHandoff.resolveReply({ text, from })` parses the agent's
  *          decision (or `HF-<id>` token, or newest-pending fallback) and
