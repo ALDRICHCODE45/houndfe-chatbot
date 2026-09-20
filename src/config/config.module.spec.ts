@@ -187,11 +187,13 @@ describe('AppConfigModule integration', () => {
           },
           attachTimeoutMs: undefined,
           worker: {
+            enabled: false,
             concurrency: 2,
             leaseMs: 60_000,
             pollIntervalMs: undefined,
           },
           metricsEnabled: false,
+          metricsToken: undefined,
         };
 
         expect(config.get('receiptMedia')).toEqual(disabledDefault);
