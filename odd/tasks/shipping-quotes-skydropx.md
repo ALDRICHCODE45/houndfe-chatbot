@@ -53,7 +53,8 @@ Live activation remains blocked until all are observed:
 ## Tasks
 
 - [x] **SQ-0 — Freeze scope and isolate the branch:** branch `feat/shipping-quotes-skydropx` from local real-number delivery commit `65ecd5a`, preserve the canonical launch order, record quote-only scope, prerequisites, non-goals, and guardrails.
-- [ ] **SQ-1 — Implement shipping credit and package-domain rules:** add pure value types and strict tests for threshold exclusivity, summed credits, non-negative customer charge, money bounds, missing package data, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
+- [x] **SQ-1A — Implement shipping credit rules:** add a pure value type and strict tests for threshold exclusivity (`unitPriceCents > 50_000`), summed credits, non-negative customer charge, money bounds, invalid input, and explicit overflow without floating money.
+- [ ] **SQ-1B — Implement package-readiness rules:** add a pure value type and strict tests for missing package data, quantity-weighted totals, the 25 kg boundary, minimum split count, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
 - [ ] **SQ-2 — Add default-off shipping configuration and provider contract:** introduce typed configuration/Joi validation, conditional credential/origin requirements only when enabled, normalized request/rate/error contracts, and dependency tokens without wiring a live tool.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
@@ -61,6 +62,18 @@ Live activation remains blocked until all are observed:
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
 
+## SQ-1A evidence (independent `PASS`; native-approved as `review-41c3378e455daa89`; locally delivered in this work unit)
+
+- Work unit: `shipping-credit` only — 220 complete changed lines (impl 100 + spec 120), within the 400-line guard.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache shipping/domain/shipping-credit.spec.ts` failed with `Cannot find module './shipping-credit'` (1 suite failed, 0 tests).
+- Focused TDD GREEN: same command — 1 suite passed, 24 tests passed.
+- Scoped ESLint: `pnpm exec eslint src/shipping/domain/shipping-credit.ts src/shipping/domain/shipping-credit.spec.ts` — exit 0.
+- Prettier: `pnpm exec prettier --check src/shipping/domain/shipping-credit.ts src/shipping/domain/shipping-credit.spec.ts` — clean.
+- Production typecheck: `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0.
+- `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
+- Coverage: strict $500 boundary, quantity multiplication, summed credits, zero/full/partial/unused credit, invalid input with offending line index, and single-line plus accumulated credit overflow.
+- SQ-1B package readiness is not present in this candidate; checkbox stays open pending independent verification and native review.
+
 ## Delivery gate
 
-This foundation is locally complete only when SQ-1 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
+This foundation is locally complete only when SQ-1A, SQ-1B, and SQ-2 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
