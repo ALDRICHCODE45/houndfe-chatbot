@@ -14,6 +14,35 @@ the Cloud API. Until that happens the bot keeps using the Meta test number.
 The bot code already supports the real number. Cutover is Meta work plus
 configuration, not a code change.
 
+## Canonical execution order after local delivery
+
+Keep this order even when other features are explored in parallel:
+
+1. **Deliver the branch** — inspect remote divergence, then push and integrate
+   `feat/real-number-mvp-launch` only with separate authorization. This does
+   not authorize deployment.
+2. **Owner-present readiness check** — confirm the SIM is active, can receive
+   SMS/voice, is not registered in WhatsApp Business App, has a physical
+   holder, and has an agreed display name.
+3. **Register in Meta** — add and verify the number, wait for display-name
+   approval when required, register the phone-number ID, create the permanent
+   System User token, and subscribe the WABA/app webhook `messages` field.
+4. **Configure Dokploy** — the owner enters secrets directly; use the exact
+   digit-only ops `wa_id`, keep sandbox normalization off, and keep every
+   receipt-media flag off.
+5. **Migrate and deploy** — apply target-database migrations, deploy the
+   reviewed commit, run `pnpm preflight:launch`, and confirm webhook health.
+6. **Run one synthetic journey** — use controlled test data for the complete
+   text-sales path before admitting any customer.
+7. **Open a limited pilot** — admit a small monitored client group with the
+   rollback path ready.
+8. **Resume ODD-8 after stability** — only then provision receipt-media
+   infrastructure and enable its flags gradually.
+
+Exploring another capability does not reorder or implicitly authorize any of
+these gates. New capabilities require their own disabled-by-default rollout
+and verification evidence before joining the pilot.
+
 ## 2. Official steps vs. project procedure
 
 Meta documents the platform behavior; HoundFe owns the project-specific
