@@ -1,5 +1,4 @@
 import { META_GRAPH_API_BASE_URL_DEFAULT } from './env.validation';
-import { normalizeSandboxRecipient } from '../whatsapp/infrastructure/meta-whatsapp.sender';
 
 const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   if (!v) return def;
@@ -20,6 +19,10 @@ const configuration = () => ({
     phoneNumberId: process.env.META_PHONE_NUMBER_ID as string,
     graphApiBaseUrl:
       process.env.META_GRAPH_API_BASE_URL ?? META_GRAPH_API_BASE_URL_DEFAULT,
+    // Explicit, default-off sandbox compatibility mode. Only the exact
+    // string 'true' enables the historical Mexican trunk-1 rewrite.
+    sandboxRecipientNormalizationEnabled:
+      process.env.META_SANDBOX_RECIPIENT_NORMALIZATION === 'true',
   },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,
@@ -44,9 +47,9 @@ const configuration = () => ({
   },
   humanHandoff: {
     enabled: process.env.HUMAN_HANDOFF_ENABLED !== 'false',
-    opsChannelPhone: process.env.OPS_CHANNEL_PHONE
-      ? normalizeSandboxRecipient(process.env.OPS_CHANNEL_PHONE)
-      : undefined,
+    // Retained exactly as supplied. The recipient normalization decision is
+    // applied explicitly at comparison/send time, never at boot.
+    opsChannelPhone: process.env.OPS_CHANNEL_PHONE,
   },
   receiptMedia: {
     enabled: process.env.RECEIPT_MEDIA_ENABLED === 'true',

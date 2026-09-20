@@ -242,12 +242,20 @@ const innerEnvValidationSchema = Joi.object({
    * WhatsApp senderId (wa_id) of the human agent who receives digests
    * and replies to them. Required when `HUMAN_HANDOFF_ENABLED=true`;
    * optional otherwise (enforced by the `.custom()` block below).
-   * Joi accepts an optional leading `+` (E.164); the runtime normalizer
-   * further strips the Mexican trunk-1 in dev-mode test numbers.
+   * Joi accepts an optional leading `+` (E.164). The value is retained
+   * verbatim; sender/ops comparison honors
+   * `META_SANDBOX_RECIPIENT_NORMALIZATION`.
    */
   OPS_CHANNEL_PHONE: Joi.string()
     .pattern(/^\+?\d+$/)
     .optional(),
+  /**
+   * Explicit Meta test-number recipient compatibility mode. Default: false.
+   * When true, Mexico `521` + 10-digit recipients are rewritten to `52` + 10
+   * digits and the ops sender/ops-phone comparison applies the same
+   * conversion on both sides. The default keeps the exact inbound `wa_id`.
+   */
+  META_SANDBOX_RECIPIENT_NORMALIZATION: Joi.boolean().default(false),
 
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),

@@ -87,8 +87,8 @@ export type HumanHandoffResolveReplyResult =
  *     clear the customer's marker, and produce a synthetic user turn
  *     for the runner to consume.
  *   - `isOpsSender(senderId)`: classify inbounds by senderId against
- *     the configured ops phone (sandbox trunk-1 normalized on both
- *     sides per ADR-22).
+ *     the configured ops phone, compared under the explicit
+ *     `META_SANDBOX_RECIPIENT_NORMALIZATION` mode (exact by default).
  */
 @Injectable()
 export class HumanHandoffService {
@@ -109,9 +109,13 @@ export class HumanHandoffService {
     if (!opsChannelPhone) {
       return false;
     }
+    const sandboxNormalization =
+      this.configService.get<boolean>(
+        'meta.sandboxRecipientNormalizationEnabled',
+      ) === true;
     return (
-      normalizeSandboxRecipient(senderId) ===
-      normalizeSandboxRecipient(opsChannelPhone)
+      normalizeSandboxRecipient(senderId, sandboxNormalization) ===
+      normalizeSandboxRecipient(opsChannelPhone, sandboxNormalization)
     );
   }
 

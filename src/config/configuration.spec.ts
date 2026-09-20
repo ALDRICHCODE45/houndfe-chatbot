@@ -49,6 +49,8 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_INGESTION_ENABLED',
     'RECEIPT_MEDIA_METRICS_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
+    'META_SANDBOX_RECIPIENT_NORMALIZATION',
+    'OPS_CHANNEL_PHONE',
   ];
 
   beforeEach(() => {
@@ -92,6 +94,32 @@ describe('configuration()', () => {
       database: { url: string; poolMax: number };
     };
     expect(cfg.database.poolMax).toBe(12);
+  });
+
+  it.each([
+    [undefined, false],
+    ['true', true],
+    ['false', false],
+    ['TRUE', false],
+  ])('maps META_SANDBOX_RECIPIENT_NORMALIZATION=%s', (env, expected) => {
+    if (env === undefined) {
+      delete process.env.META_SANDBOX_RECIPIENT_NORMALIZATION;
+    } else {
+      process.env.META_SANDBOX_RECIPIENT_NORMALIZATION = env;
+    }
+    const cfg = configuration() as unknown as {
+      meta: { sandboxRecipientNormalizationEnabled: boolean };
+    };
+    expect(cfg.meta.sandboxRecipientNormalizationEnabled).toBe(expected);
+  });
+
+  // MVP-1: the ops wa_id is retained verbatim; no boot-time rewrite.
+  it('retains humanHandoff.opsChannelPhone exactly as supplied', () => {
+    process.env.OPS_CHANNEL_PHONE = '5219999888777';
+    const cfg = configuration() as unknown as {
+      humanHandoff: { opsChannelPhone?: string };
+    };
+    expect(cfg.humanHandoff.opsChannelPhone).toBe('5219999888777');
   });
 
   // Task 1.3/1.4: cashierUserId surfaces on chatbotApi

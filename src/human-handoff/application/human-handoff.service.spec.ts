@@ -32,7 +32,8 @@ import { setPendingHumanRequest } from './pending-human-request-persistence';
  *   - (f) no-token + no pending returns { kind: 'no_pending', reply }.
  *   - (g) bare prose is GENERIC; per-kind phrasing carries the kind + text.
  *   - (h) case/whitespace tolerant parser.
- *   - (i) isOpsSender uses sandbox trunk-1 normalization on both sides.
+ *   - (i) isOpsSender compares sender and ops wa_id under the explicit
+ *       sandbox recipient normalization mode (exact by default).
  *   - byte-identical UNDER_REVIEW_NOTICE + PENDING_HUMAN_REQUEST_REPLY literals.
  */
 describe('HumanHandoffService', () => {
@@ -105,20 +106,9 @@ describe('HumanHandoffService', () => {
   });
 
   describe('isOpsSender', () => {
-    it('returns true when the senderId equals the opsChannelPhone (sandbox trunk-1 form matches)', () => {
-      // OPS = '5219999888777' (Mexico + trunk-1 form, 13 digits)
-      // normalizeSandboxRecipient on both sides strips the trunk-1 to
-      // '529999888777' — they match.
-      expect(service.isOpsSender('5219999888777')).toBe(true);
-    });
-
-    it('returns true when the senderId is the already-stripped form of the opsChannelPhone', () => {
-      // OPS = '5219999888777' (13 digits) → normalize → '529999888777'
-      // Sender already in stripped form → no further change → matches.
-      expect(service.isOpsSender('529999888777')).toBe(true);
-    });
-
-    it('returns false for an unrelated senderId', () => {
+    it('matches exact wa_id equality when sandbox normalization is disabled (default)', () => {
+      expect(service.isOpsSender(OPS)).toBe(true);
+      expect(service.isOpsSender('529999888777')).toBe(false);
       expect(service.isOpsSender('5215550001111')).toBe(false);
     });
 
@@ -133,6 +123,23 @@ describe('HumanHandoffService', () => {
         } as unknown as ConfigService,
       );
       expect(noOps.isOpsSender('5219999888777')).toBe(false);
+    });
+
+    it('supports the historical trunk-1 matching when sandbox normalization is enabled', () => {
+      const sandboxService = new HumanHandoffService(
+        store,
+        whatsappSender,
+        conversationStore,
+        {
+          get: (key: string) =>
+            key === 'humanHandoff.opsChannelPhone'
+              ? OPS
+              : key === 'meta.sandboxRecipientNormalizationEnabled',
+        } as unknown as ConfigService,
+      );
+
+      expect(sandboxService.isOpsSender('5219999888777')).toBe(true);
+      expect(sandboxService.isOpsSender('529999888777')).toBe(true);
     });
   });
 

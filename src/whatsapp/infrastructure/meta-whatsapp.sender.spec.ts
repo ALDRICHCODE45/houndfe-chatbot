@@ -14,11 +14,13 @@ import {
 } from './meta-whatsapp.sender';
 
 describe('MetaWhatsappSender', () => {
-  let httpService: jest.Mocked<Pick<HttpService, 'post'>>;
-  let configService: jest.Mocked<Pick<ConfigService, 'get' | 'getOrThrow'>>;
+  let httpService: { post: jest.Mock };
+  let configService: { get: jest.Mock; getOrThrow: jest.Mock };
   let sender: MetaWhatsappSender;
+  let sandboxRecipientNormalizationEnabled: boolean;
 
   beforeEach(() => {
+    sandboxRecipientNormalizationEnabled = false;
     httpService = {
       post: jest.fn(),
     };
@@ -27,6 +29,10 @@ describe('MetaWhatsappSender', () => {
       get: jest.fn((key: string) => {
         if (key === 'meta.graphApiBaseUrl') {
           return 'https://graph.facebook.com/v23.0';
+        }
+
+        if (key === 'meta.sandboxRecipientNormalizationEnabled') {
+          return sandboxRecipientNormalizationEnabled;
         }
 
         return undefined;
@@ -43,8 +49,8 @@ describe('MetaWhatsappSender', () => {
     };
 
     sender = new MetaWhatsappSender(
-      httpService as HttpService,
-      configService as ConfigService,
+      httpService as unknown as HttpService,
+      configService as unknown as ConfigService,
     );
   });
 
@@ -62,7 +68,7 @@ describe('MetaWhatsappSender', () => {
     expect(inbound.text).toBe('hola');
   });
 
-  it('sends one Graph API text request and returns the provider message id', async () => {
+  it('sends one Graph API text request preserving the exact wa_id by default and returns the provider message id', async () => {
     httpService.post.mockReturnValue(
       of({
         data: {
@@ -86,7 +92,7 @@ describe('MetaWhatsappSender', () => {
       {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
-        to: '525550001111',
+        to: '5215550001111',
         type: 'text',
         text: {
           body: 'Echo: hola',
@@ -97,6 +103,17 @@ describe('MetaWhatsappSender', () => {
           Authorization: 'Bearer meta-access-token',
         },
       },
+    );
+  });
+
+  it('rewrites the trunk-1 recipient only when normalization is enabled', async () => {
+    sandboxRecipientNormalizationEnabled = true;
+    httpService.post.mockReturnValue(of({ data: { messages: [{ id: 'w' }] } }));
+    await sender.sendText({ to: '5215550001111', text: 'Echo: hola' });
+    expect(httpService.post).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ to: '525550001111' }),
+      expect.anything(),
     );
   });
 
@@ -149,22 +166,20 @@ describe('MetaWhatsappSender', () => {
   });
 });
 
-describe('normalizeSandboxRecipient (TEMPORARY sandbox workaround)', () => {
-  it('strips the Mexican national trunk 1 from a 521XXXXXXXXXX number', () => {
-    expect(normalizeSandboxRecipient('5215585876245')).toBe('525585876245');
+describe('normalizeSandboxRecipient (explicit opt-in sandbox compatibility mode)', () => {
+  it('preserves 521XXXXXXXXXX when disabled and strips the trunk when enabled', () => {
+    const to = '5215585876245';
+    expect(normalizeSandboxRecipient(to, false)).toBe(to);
+    expect(normalizeSandboxRecipient(to, true)).toBe('525585876245');
   });
 
-  it('leaves non-Mexican numbers unchanged', () => {
-    expect(normalizeSandboxRecipient('15550001111')).toBe('15550001111');
-    expect(normalizeSandboxRecipient('44235550001111')).toBe('44235550001111');
-  });
-
-  it('leaves Mexican numbers without the trunk 1 unchanged', () => {
-    expect(normalizeSandboxRecipient('525585876245')).toBe('525585876245');
-  });
-
-  it('leaves malformed numbers unchanged', () => {
-    expect(normalizeSandboxRecipient('52155858762')).toBe('52155858762');
-    expect(normalizeSandboxRecipient('not-a-number')).toBe('not-a-number');
+  it.each([
+    ['non-Mexican', '15550001111'],
+    ['already stripped', '525585876245'],
+    ['truncated 521', '52155858762'],
+    ['malformed', 'not-a-number'],
+  ])('leaves %s unchanged in both modes', (_label, value) => {
+    expect(normalizeSandboxRecipient(value, false)).toBe(value);
+    expect(normalizeSandboxRecipient(value, true)).toBe(value);
   });
 });
