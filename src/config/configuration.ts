@@ -1,4 +1,7 @@
-import { META_GRAPH_API_BASE_URL_DEFAULT } from './env.validation';
+import {
+  META_GRAPH_API_BASE_URL_DEFAULT,
+  SKYDROPX_BASE_URL_DEFAULT,
+} from './env.validation';
 
 const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   if (!v) return def;
@@ -89,6 +92,19 @@ const configuration = () => ({
     },
     metricsEnabled: process.env.RECEIPT_MEDIA_METRICS_ENABLED === 'true',
     metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
+  },
+  // SQ-2A: default-off shipping quotes; provider fields are raw env passthrough.
+  shippingQuotes: {
+    enabled: process.env.SHIPPING_QUOTES_ENABLED === 'true',
+    skydropx: {
+      baseUrl: process.env.SKYDROPX_BASE_URL ?? SKYDROPX_BASE_URL_DEFAULT,
+      clientId: process.env.SKYDROPX_CLIENT_ID,
+      clientSecret: process.env.SKYDROPX_CLIENT_SECRET,
+      originPostalCode: process.env.SKYDROPX_ORIGIN_POSTAL_CODE,
+      originState: process.env.SKYDROPX_ORIGIN_STATE,
+      originMunicipality: process.env.SKYDROPX_ORIGIN_MUNICIPALITY,
+      originNeighborhood: process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD,
+    },
   },
 });
 

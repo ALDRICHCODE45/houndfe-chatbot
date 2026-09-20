@@ -33,6 +33,15 @@ describe('AppConfigModule integration', () => {
     RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
     RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
     RECEIPT_MEDIA_METRICS_ENABLED: 'false',
+    // SQ-2A shipping keys (managed; provider values cleared for default-off)
+    SHIPPING_QUOTES_ENABLED: 'false',
+    SKYDROPX_BASE_URL: 'https://api-pro.skydropx.com',
+    SKYDROPX_CLIENT_ID: 'test-client-id',
+    SKYDROPX_CLIENT_SECRET: 'test-client-secret',
+    SKYDROPX_ORIGIN_POSTAL_CODE: '06000',
+    SKYDROPX_ORIGIN_STATE: 'Ciudad de Mexico',
+    SKYDROPX_ORIGIN_MUNICIPALITY: 'Cuauhtemoc',
+    SKYDROPX_ORIGIN_NEIGHBORHOOD: 'Centro',
   };
 
   const MANAGED_KEYS = Object.keys(VALID_ENV);
@@ -198,6 +207,30 @@ describe('AppConfigModule integration', () => {
 
         expect(config.get('receiptMedia')).toEqual(disabledDefault);
 
+        await moduleRef.close();
+      },
+    );
+  });
+
+  // SQ-2A: shippingQuotes disabled-default boot with the Skydropx base URL default.
+  describe('shippingQuotes disabled-default', () => {
+    it.each([undefined, 'false'])(
+      'boots with disabled-default shippingQuotes for %s',
+      async (enabled) => {
+        Object.assign(process.env, VALID_ENV);
+        // Clear ambient provider values so disabled-default stays undefined.
+        for (const key of Object.keys(VALID_ENV))
+          if (key.startsWith('SKYDROPX_')) delete process.env[key];
+        delete process.env.SHIPPING_QUOTES_ENABLED;
+        if (enabled !== undefined)
+          process.env.SHIPPING_QUOTES_ENABLED = enabled;
+        const moduleRef = await Test.createTestingModule({
+          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
+        }).compile();
+        expect(moduleRef.get(ConfigService).get('shippingQuotes')).toEqual({
+          enabled: false,
+          skydropx: { baseUrl: 'https://api-pro.skydropx.com' },
+        });
         await moduleRef.close();
       },
     );

@@ -1307,4 +1307,211 @@ describe('envValidationSchema', () => {
       assertValidationErrorRedacted(error!);
     });
   });
+
+  // ── SQ-2A: default-off shipping-quote configuration ────────────────────
+  // `SHIPPING_QUOTES_ENABLED` gates every provider field through
+  // `shippingConditional`; when disabled the branch is fully permissive.
+  describe('SHIPPING_QUOTES_* conditional configuration (SQ-2A)', () => {
+    const enabledBase = {
+      ...validEnv,
+      SHIPPING_QUOTES_ENABLED: 'true',
+      SKYDROPX_BASE_URL: 'https://api-pro.skydropx.com',
+      SKYDROPX_CLIENT_ID: 'skydropx-client-id',
+      SKYDROPX_CLIENT_SECRET: 'skydropx-client-secret',
+      SKYDROPX_ORIGIN_POSTAL_CODE: '06000',
+      SKYDROPX_ORIGIN_STATE: 'Ciudad de Mexico',
+      SKYDROPX_ORIGIN_MUNICIPALITY: 'Cuauhtemoc',
+      SKYDROPX_ORIGIN_NEIGHBORHOOD: 'Centro',
+    };
+
+    const validate = (env: Record<string, unknown>) =>
+      envValidationSchema.validate(env, { abortEarly: false });
+    const expectValid = (env: Record<string, unknown>): void => {
+      expect(validate(env).error).toBeUndefined();
+    };
+    const expectFieldError = (
+      env: Record<string, unknown>,
+      field: string,
+    ): void => {
+      expect(
+        validate(env).error?.details.some((d) => d.path.includes(field)),
+      ).toBe(true);
+    };
+
+    // Disabled permissiveness: malformed/oversized provider values are fine.
+    it.each([
+      ['no shipping fields', { ...validEnv }],
+      ['explicit false', { ...validEnv, SHIPPING_QUOTES_ENABLED: 'false' }],
+      [
+        'malformed provider values',
+        {
+          ...validEnv,
+          SHIPPING_QUOTES_ENABLED: 'false',
+          SKYDROPX_BASE_URL: 'not-a-url',
+          SKYDROPX_CLIENT_ID: '',
+          SKYDROPX_CLIENT_SECRET: '',
+          SKYDROPX_ORIGIN_POSTAL_CODE: 'abc',
+          SKYDROPX_ORIGIN_STATE: '',
+          SKYDROPX_ORIGIN_MUNICIPALITY: '',
+          SKYDROPX_ORIGIN_NEIGHBORHOOD: '',
+        },
+      ],
+      [
+        'oversized provider value',
+        {
+          ...validEnv,
+          SHIPPING_QUOTES_ENABLED: 'false',
+          SKYDROPX_ORIGIN_STATE: 'x'.repeat(101),
+        },
+      ],
+    ] as Array<[string, Record<string, unknown>]>)(
+      'disabled accepts: %s',
+      (_label, env) => {
+        expectValid(env);
+      },
+    );
+
+    it('defaults SHIPPING_QUOTES_ENABLED to false when absent', () => {
+      const { error, value } = validate({ ...validEnv }) as {
+        error?: undefined;
+        value: Record<string, unknown>;
+      };
+      expect(error).toBeUndefined();
+      expect(value.SHIPPING_QUOTES_ENABLED).toBe(false);
+    });
+
+    it.each([
+      { flag: 'true', base: enabledBase, expected: true },
+      { flag: 'false', base: { ...validEnv }, expected: false },
+    ])(
+      'accepts canonical SHIPPING_QUOTES_ENABLED=$flag',
+      ({ flag, base, expected }) => {
+        // Enabling requires the full provider config; disabling is permissive.
+        const { error, value } = validate({
+          ...base,
+          SHIPPING_QUOTES_ENABLED: flag,
+        }) as { error?: undefined; value: Record<string, unknown> };
+        expect(error).toBeUndefined();
+        expect(value.SHIPPING_QUOTES_ENABLED).toBe(expected);
+      },
+    );
+
+    it.each(['yes', 'maybe', ''])(
+      'rejects non-boolean SHIPPING_QUOTES_ENABLED=%s',
+      (flag) => {
+        expectFieldError(
+          { ...validEnv, SHIPPING_QUOTES_ENABLED: flag },
+          'SHIPPING_QUOTES_ENABLED',
+        );
+      },
+    );
+
+    it('accepts a complete valid enabled environment', () => {
+      expectValid(enabledBase);
+    });
+
+    it('applies the Skydropx base URL default when enabled and absent', () => {
+      const env: Record<string, unknown> = { ...enabledBase };
+      delete env.SKYDROPX_BASE_URL;
+      const { error, value } = validate(env) as {
+        error?: undefined;
+        value: Record<string, unknown>;
+      };
+      expect(error).toBeUndefined();
+      expect(value.SKYDROPX_BASE_URL).toBe('https://api-pro.skydropx.com');
+    });
+
+    const requiredFields = [
+      'SKYDROPX_CLIENT_ID',
+      'SKYDROPX_CLIENT_SECRET',
+      'SKYDROPX_ORIGIN_POSTAL_CODE',
+      'SKYDROPX_ORIGIN_STATE',
+      'SKYDROPX_ORIGIN_MUNICIPALITY',
+      'SKYDROPX_ORIGIN_NEIGHBORHOOD',
+    ];
+    it.each(requiredFields)('rejects enabled missing %s', (field) => {
+      const env: Record<string, unknown> = { ...enabledBase };
+      delete env[field];
+      expectFieldError(env, field);
+    });
+    it.each(requiredFields)('rejects enabled empty %s', (field) => {
+      expectFieldError({ ...enabledBase, [field]: '' }, field);
+    });
+
+    it.each(['http://api-pro.skydropx.com', 'not-a-url', ''])(
+      'rejects SKYDROPX_BASE_URL=%s',
+      (value) => {
+        expectFieldError(
+          { ...enabledBase, SKYDROPX_BASE_URL: value },
+          'SKYDROPX_BASE_URL',
+        );
+      },
+    );
+
+    it.each(['0600', '060000', 'O6000', '0600 '])(
+      'rejects non-5-digit SKYDROPX_ORIGIN_POSTAL_CODE=%s',
+      (value) => {
+        expectFieldError(
+          { ...enabledBase, SKYDROPX_ORIGIN_POSTAL_CODE: value },
+          'SKYDROPX_ORIGIN_POSTAL_CODE',
+        );
+      },
+    );
+    it('accepts a five-digit SKYDROPX_ORIGIN_POSTAL_CODE', () => {
+      expectValid({ ...enabledBase, SKYDROPX_ORIGIN_POSTAL_CODE: '06000' });
+    });
+
+    const originTextFields = [
+      'SKYDROPX_ORIGIN_STATE',
+      'SKYDROPX_ORIGIN_MUNICIPALITY',
+      'SKYDROPX_ORIGIN_NEIGHBORHOOD',
+    ];
+    it.each(originTextFields)('rejects empty %s', (field) => {
+      expectFieldError({ ...enabledBase, [field]: '' }, field);
+    });
+    it.each(originTextFields)('rejects oversized %s', (field) => {
+      expectFieldError({ ...enabledBase, [field]: 'x'.repeat(101) }, field);
+    });
+    it.each(originTextFields)('accepts 100-char %s boundary', (field) => {
+      expectValid({ ...enabledBase, [field]: 'x'.repeat(100) });
+    });
+
+    // Client credentials must never survive into any validation-error surface.
+    const CLIENT_SENTINEL = 'sq2a-client-credential-sentinel-7c1f';
+    const assertRedacted = (error: Joi.ValidationError): void => {
+      for (const surface of [
+        error.message,
+        JSON.stringify(error.details),
+        String(error),
+      ]) {
+        expect(surface).not.toContain(CLIENT_SENTINEL);
+      }
+    };
+
+    it('redacts client credentials from a malformed-URL error surface', () => {
+      const { error } = validate({
+        ...enabledBase,
+        SKYDROPX_BASE_URL: 'not-a-url',
+        SKYDROPX_CLIENT_ID: CLIENT_SENTINEL,
+        SKYDROPX_CLIENT_SECRET: CLIENT_SENTINEL,
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('SKYDROPX_BASE_URL')),
+      ).toBe(true);
+      assertRedacted(error!);
+    });
+
+    it('redacts a sentinel carried inside a malformed credential value', () => {
+      const { error } = validate({
+        ...enabledBase,
+        SKYDROPX_CLIENT_SECRET: [CLIENT_SENTINEL],
+      });
+      expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('SKYDROPX_CLIENT_SECRET')),
+      ).toBe(true);
+      assertRedacted(error!);
+    });
+  });
 });

@@ -55,7 +55,8 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-0 — Freeze scope and isolate the branch:** branch `feat/shipping-quotes-skydropx` from local real-number delivery commit `65ecd5a`, preserve the canonical launch order, record quote-only scope, prerequisites, non-goals, and guardrails.
 - [x] **SQ-1A — Implement shipping credit rules:** add a pure value type and strict tests for threshold exclusivity (`unitPriceCents > 50_000`), summed credits, non-negative customer charge, money bounds, invalid input, and explicit overflow without floating money.
 - [x] **SQ-1B — Implement package-readiness rules:** add a pure value type and strict tests for missing package data, quantity-weighted totals, the 25 kg boundary, minimum split count, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
-- [ ] **SQ-2 — Add default-off shipping configuration and provider contract:** introduce typed configuration/Joi validation, conditional credential/origin requirements only when enabled, normalized request/rate/error contracts, and dependency tokens without wiring a live tool.
+- [x] **SQ-2A — Add default-off shipping-quote configuration:** typed `shippingQuotes` factory subtree plus conditional Joi validation (credentials/origin required only when enabled) with redacted secrets.
+- [ ] **SQ-2B — Add provider-neutral shipping contracts:** normalized request/rate/error contracts and dependency tokens without wiring a live tool.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
@@ -86,6 +87,16 @@ Live activation remains blocked until all are observed:
 - Coverage: missing/null/absent weight and dimensions, invalid dimensions and quantity, quantity-weighted totals, exact/over 25 kg boundary, minimum split count `ceil(total/25_000)`, `manual_unresolved` with no parcel assignment, and line plus summed weight overflow; `unavailable` limited to item/variant ids and missing fields.
 - Native advisory `R3-empty-cart` is non-blocking; SQ-4 orchestration must reject an empty cart before package assessment.
 
+## SQ-2A evidence (independent `PASS`; native-approved as `review-aaa78df31906e21d`; locally delivered in this work unit)
+
+- Work unit: `shipping-quotes-config` only — 387 complete candidate lines = 372 implementation/spec lines + 15 tracker lines, within the 400-line guard.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache config/env.validation.spec.ts config/configuration.spec.ts config/config.module.spec.ts` — 3 suites failed, 39 failed / 219 passed (missing `shippingQuotes`).
+- Focused TDD GREEN: same command — 3 suites passed, 259 passed.
+- TRIANGULATE: disabled absent/malformed/oversized provider values accepted; enabled valid accepted; every required field missing and empty; base URL HTTP/malformed reject, absent default applied; postal 4/6/non-digit reject and 5 accept; each origin text field empty/oversized reject and 100-char accept; credential sentinel absent from message/details/`String(error)`.
+- Scoped ESLint over the five config files — exit 0; Prettier `--check` — clean; `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0; `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
+- Config behavior: `enabled` is exact `SHIPPING_QUOTES_ENABLED === 'true'`; `skydropx.baseUrl` defaults to exported `SKYDROPX_BASE_URL_DEFAULT` (`https://api-pro.skydropx.com`); remaining provider fields are raw optional env passthrough.
+- Native advisories `R3-boolean-contract-mismatch` and `R3-whitespace-required-values` are non-blocking and tracked for a separate bounded hardening work unit before adapter wiring.
+
 ## Delivery gate
 
-This foundation is locally complete only when SQ-1A, SQ-1B, and SQ-2 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
+This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.

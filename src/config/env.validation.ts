@@ -3,6 +3,11 @@ import * as Joi from 'joi';
 export const META_GRAPH_API_BASE_URL_DEFAULT =
   'https://graph.facebook.com/v23.0';
 
+// SQ-2A: Skydropx Pro API host. Domestic quotes need country + postal code +
+// area_level1/2/3 for origin and destination, so a postal code alone is never
+// sufficient; origin address fields are required only when quotes are enabled.
+export const SKYDROPX_BASE_URL_DEFAULT = 'https://api-pro.skydropx.com';
+
 // ─── Receipt-media helpers (WU1C1) ─────────────────────────────────────────
 // Local field-level helpers for the conditional receipt-media foundation.
 // The base schema is `Joi.any()` so the `.when(...)` branch is a complete
@@ -171,6 +176,15 @@ const redactValidationError = (error: Joi.ValidationError): void => {
 
 const receiptConditional = (then: Joi.Schema) =>
   Joi.any().when('RECEIPT_MEDIA_ENABLED', {
+    is: true,
+    then,
+    otherwise: Joi.any(),
+  });
+
+// SQ-2A: same shape as `receiptConditional`; the base stays `Joi.any()` so the
+// when-branch fully replaces it and every provider field is permissive when off.
+const shippingConditional = (then: Joi.Schema) =>
+  Joi.any().when('SHIPPING_QUOTES_ENABLED', {
     is: true,
     then,
     otherwise: Joi.any(),
@@ -351,6 +365,32 @@ const innerEnvValidationSchema = Joi.object({
   RECEIPT_CAPABILITY_KEYS: receiptConditional(receiptCapabilityKeysSchema),
   RECEIPT_CAPABILITY_ACTIVE_VERSION: receiptConditional(
     receiptCapabilityActiveVersionSchema,
+  ),
+
+  // ─── Shipping quotes slice (SQ-2A default-off foundation) ────────────────
+  // Kill-switch defaults to false; when enabled the strict Skydropx
+  // requirements validate. Credentials stay plain non-empty strings so no
+  // pattern can echo a secret into a validation message.
+  SHIPPING_QUOTES_ENABLED: Joi.boolean().default(false),
+  SKYDROPX_BASE_URL: shippingConditional(
+    Joi.string()
+      .uri({ scheme: ['https'] })
+      .default(SKYDROPX_BASE_URL_DEFAULT),
+  ),
+  SKYDROPX_CLIENT_ID: shippingConditional(Joi.string().required()),
+  SKYDROPX_CLIENT_SECRET: shippingConditional(Joi.string().required()),
+  SKYDROPX_ORIGIN_POSTAL_CODE: shippingConditional(
+    Joi.string()
+      .length(5)
+      .pattern(/^[0-9]{5}$/)
+      .required(),
+  ),
+  SKYDROPX_ORIGIN_STATE: shippingConditional(Joi.string().max(100).required()),
+  SKYDROPX_ORIGIN_MUNICIPALITY: shippingConditional(
+    Joi.string().max(100).required(),
+  ),
+  SKYDROPX_ORIGIN_NEIGHBORHOOD: shippingConditional(
+    Joi.string().max(100).required(),
   ),
 })
   .custom((value: Record<string, unknown>, helpers) => {

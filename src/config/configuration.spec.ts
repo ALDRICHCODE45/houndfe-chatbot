@@ -51,6 +51,15 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_METRICS_TOKEN',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
     'OPS_CHANNEL_PHONE',
+    // SQ-2A shipping quotes
+    'SHIPPING_QUOTES_ENABLED',
+    'SKYDROPX_BASE_URL',
+    'SKYDROPX_CLIENT_ID',
+    'SKYDROPX_CLIENT_SECRET',
+    'SKYDROPX_ORIGIN_POSTAL_CODE',
+    'SKYDROPX_ORIGIN_STATE',
+    'SKYDROPX_ORIGIN_MUNICIPALITY',
+    'SKYDROPX_ORIGIN_NEIGHBORHOOD',
   ];
 
   beforeEach(() => {
@@ -239,5 +248,70 @@ describe('configuration()', () => {
         expect(cfg.receiptMedia.capability.activeVersion).toBe(env);
       },
     );
+  });
+
+  // SQ-2A: default-off shipping quotes; only exact 'true' enables the feature.
+  describe('shippingQuotes', () => {
+    type Shipping = {
+      shippingQuotes: {
+        enabled: boolean;
+        skydropx: Record<string, string | undefined>;
+      };
+    };
+    const shipping = () => (configuration() as Shipping).shippingQuotes;
+
+    it('returns the typed default-off subtree when SHIPPING_QUOTES_ENABLED is absent', () => {
+      delete process.env.SHIPPING_QUOTES_ENABLED;
+      expect(shipping()).toEqual({
+        enabled: false,
+        skydropx: {
+          baseUrl: 'https://api-pro.skydropx.com',
+          clientId: undefined,
+          clientSecret: undefined,
+          originPostalCode: undefined,
+          originState: undefined,
+          originMunicipality: undefined,
+          originNeighborhood: undefined,
+        },
+      });
+    });
+
+    it.each([
+      [undefined, false],
+      ['true', true],
+      ['false', false],
+      ['TRUE', false],
+      ['1', false],
+    ])('maps SHIPPING_QUOTES_ENABLED=%s', (env, expected) => {
+      if (env === undefined) {
+        delete process.env.SHIPPING_QUOTES_ENABLED;
+      } else {
+        process.env.SHIPPING_QUOTES_ENABLED = env;
+      }
+      expect(shipping().enabled).toBe(expected);
+    });
+
+    it('passes raw Skydropx provider env values through the factory', () => {
+      process.env.SHIPPING_QUOTES_ENABLED = 'true';
+      process.env.SKYDROPX_BASE_URL = 'https://sandbox.skydropx.test';
+      process.env.SKYDROPX_CLIENT_ID = 'client-id-raw';
+      process.env.SKYDROPX_CLIENT_SECRET = 'client-secret-raw';
+      process.env.SKYDROPX_ORIGIN_POSTAL_CODE = '06000';
+      process.env.SKYDROPX_ORIGIN_STATE = 'CDMX';
+      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = 'Cuauhtemoc';
+      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = 'Centro';
+      expect(shipping()).toEqual({
+        enabled: true,
+        skydropx: {
+          baseUrl: 'https://sandbox.skydropx.test',
+          clientId: 'client-id-raw',
+          clientSecret: 'client-secret-raw',
+          originPostalCode: '06000',
+          originState: 'CDMX',
+          originMunicipality: 'Cuauhtemoc',
+          originNeighborhood: 'Centro',
+        },
+      });
+    });
   });
 });
