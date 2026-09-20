@@ -1,4 +1,5 @@
 import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
@@ -14,6 +15,7 @@ import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client'
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 import { CapabilityService } from '../application/capability.service';
+import { ReceiptCleanupService } from '../application/receipt-cleanup.service';
 import {
   RECEIPT_CAPABILITY_LOOKUP,
   ReceiptCapabilityAuthorizerService,
@@ -81,14 +83,18 @@ const KEYRING_2 = new Map<string, Uint8Array>([['2', KEY_2]]);
 const RECEIPT_A = '00000000-0000-4000-8000-0000000000a1';
 const RECEIPT_B = '00000000-0000-4000-8000-0000000000b2';
 const OBJECT_A = 'receipts/00000000-0000-4000-8000-0000000000c3';
+const OBJECT_B = 'receipts/00000000-0000-4000-8000-0000000000c4';
 const SALE = '00000000-0000-4000-8000-0000000000d4';
+const ATTACH_ATTEMPT = '00000000-0000-4000-8000-0000000000e5';
+const BACKEND_RECEIPT = '00000000-0000-4000-8000-0000000000f6';
+const ATTACHED_AMOUNT = 15000;
 const T0 = new Date('2025-01-01T00:00:00Z');
 const ETAG = 'etag-access';
 const VERSION_ID = 'version-access';
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x10, 0x20, 0x30]);
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const RETRY = String(CAPABILITY_RETRY_AFTER_SECONDS);
-const CONTENT_SHA256 = Buffer.alloc(32, 0x33);
+const CONTENT_SHA256 = createHash('sha256').update(JPEG).digest();
 
 const SAFE_HEADERS = {
   'content-security-policy': "default-src 'none'; img-src 'self'; sandbox",
@@ -131,9 +137,8 @@ const ANCHORED_503_SHAPE = {
 /** Token issued under the version-1 key; the durable row keeps this evidence
  * even after the key is removed from a later keyring. */
 const ISSUED_A1 = new CapabilityService(KEYRING_1, '1').issue(RECEIPT_A);
-const UNKNOWN_TOKEN = new CapabilityService(KEYRING_1, '1').issue(
-  RECEIPT_B,
-).token;
+const ISSUED_B1 = new CapabilityService(KEYRING_1, '1').issue(RECEIPT_B);
+const UNKNOWN_TOKEN = ISSUED_B1.token;
 
 const INSERT_STORED_SQL = `INSERT INTO receipt_media (
   id, webhook_message_id, provider_media_id, sender_id, captured_sale_id,
@@ -144,6 +149,21 @@ const INSERT_STORED_SQL = `INSERT INTO receipt_media (
 ) VALUES (
   $1, $2, $3, $4, $5, $6, 'STORED', '3', $7, $8, $8, $9, $10, $7, $11,
   $12, $13, $14, $7
+)`;
+
+/** One valid ATTACHED row satisfying every migration CHECK: accepted-object
+ *  and download evidence, positive amount, one complete attach request. */
+const INSERT_ATTACHED_SQL = `INSERT INTO receipt_media (
+  id, webhook_message_id, provider_media_id, sender_id, captured_sale_id,
+  object_key, status, version, downloaded_at, response_mime_type,
+  detected_mime_type, byte_count, content_sha256, stored_at, object_etag, object_version_id,
+  capability_token_hash, capability_key_version, capability_key_version_text,
+  capability_issued_at, declared_amount_cents, attach_started_at,
+  attach_attempts, attach_attempt_id, attach_request_started_at, attached_at,
+  backend_receipt_id, backend_receipt_status
+) VALUES (
+  $1, $2, $3, $4, $5, $6, 'ATTACHED', '5', $7, $8, $8, $9, $10, $7, $11, $18,
+  $12, $13, $14, $7, $15, $7, 1, $16, $7, $7, $17, 'PENDING'
 )`;
 
 interface FakeStorage {
@@ -173,13 +193,16 @@ const makeStorage = (
     versionId: VERSION_ID,
   });
   const getStream = jest.fn<Promise<GetObjectResult>, [GetObjectInput]>();
-  getStream.mockResolvedValue({
-    stream: Readable.from([bytes]),
-    byteCount: bytes.length,
-    mimeType,
-    etag: ETAG,
-    versionId: VERSION_ID,
-  });
+  // A fresh stream per call: one app instance may serve more than one GET.
+  getStream.mockImplementation(() =>
+    Promise.resolve({
+      stream: Readable.from([bytes]),
+      byteCount: bytes.length,
+      mimeType,
+      etag: ETAG,
+      versionId: VERSION_ID,
+    }),
+  );
   const put = jest.fn();
   put.mockRejectedValue(new Error('unexpected storage call'));
   const deleteTechnicalObject = jest.fn();
@@ -359,6 +382,44 @@ ddescribe(
         keyVersion,
       ]);
     };
+
+    /** Seeds one valid ATTACHED receipt carrying the exact capability evidence. */
+    const seedAttached = async (
+      id: string,
+      objectKey: string,
+      tokenHash: Buffer,
+      keyVersion: string,
+    ): Promise<void> => {
+      await pool.query(INSERT_ATTACHED_SQL, [
+        id,
+        `wamid.${id}`,
+        `media.${id}`,
+        `sender.${id}`,
+        SALE,
+        objectKey,
+        T0,
+        'image/jpeg',
+        JPEG.length,
+        CONTENT_SHA256,
+        ETAG,
+        tokenHash,
+        Number(keyVersion),
+        keyVersion,
+        ATTACHED_AMOUNT,
+        ATTACH_ATTEMPT,
+        BACKEND_RECEIPT,
+        VERSION_ID,
+      ]);
+    };
+
+    /** Exact durable receipt row, used to prove ATTACHED evidence is stable. */
+    const rowOf = async (id: string): Promise<Record<string, unknown>> =>
+      (
+        await pool.query<Record<string, unknown>>(
+          'SELECT * FROM receipt_media WHERE id = $1',
+          [id],
+        )
+      ).rows[0];
 
     /** Real HTTP Nest app over the real access controller, real authorizer,
      * real capability service, real Postgres store, fake storage seam. */
@@ -725,7 +786,15 @@ ddescribe(
       expect(shapes[1]).toEqual(shapes[3]);
     });
 
-    it('preserves access and reconstruction across a restart and an additive key rotation', async () => {
+    it('preserves access and reconstruction across a restart and an additive key rotation while retaining exact ATTACHED evidence and never reclaiming it', async () => {
+      await seedAttached(
+        RECEIPT_B,
+        OBJECT_B,
+        ISSUED_B1.tokenHash,
+        ISSUED_B1.keyVersion,
+      );
+      // Exact durable ATTACHED evidence is snapshotted before its first GET.
+      const attachedBefore = await rowOf(RECEIPT_B);
       const first = await buildAccessApp(
         pool,
         KEYRING_1,
@@ -742,9 +811,29 @@ ddescribe(
         const served = await getUrl(first.app, ISSUED_A1.token);
         expect(served.status).toBe(200);
         expectNoSecretLeakage(served, { tokens: [ISSUED_A1.token] });
+        const attached = await getUrl(first.app, ISSUED_B1.token);
+        expect(attached.status).toBe(200);
+        expect(attached.body).toEqual(JPEG);
+        expectNoSecretLeakage(attached, { tokens: [ISSUED_B1.token] });
       } finally {
         await first.close();
       }
+
+      // Real cleanup and both claim primitives must leave ATTACHED untouched.
+      const store = new PostgresReceiptMediaStore(pool);
+      const storage = makeStorage(JPEG);
+      const cleanup = new ReceiptCleanupService(store, storage);
+      expect(await cleanup.runBatch(10, 'cleanup-probe')).toEqual({
+        claimed: 0,
+        cleaned: 0,
+        retryScheduled: 0,
+        manualHold: 0,
+        fenced: 0,
+      });
+      expect(storage.deleteTechnicalObject).not.toHaveBeenCalled();
+      expect(await store.claimCleanupBatch(10, 'cleanup-probe')).toEqual([]);
+      expect(await store.claimBatch(10, 'generic-probe')).toEqual([]);
+      expect(await rowOf(RECEIPT_B)).toEqual(attachedBefore);
 
       const restarted = await buildAccessApp(
         pool,
@@ -761,6 +850,17 @@ ddescribe(
             RECEIPT_A,
             ISSUED_A1.keyVersion,
             ISSUED_A1.tokenHash,
+          ),
+        ).not.toBeNull();
+        const attached = await getUrl(restarted.app, ISSUED_B1.token);
+        expect(attached.status).toBe(200);
+        expect(attached.body).toEqual(JPEG);
+        expectNoSecretLeakage(attached, { tokens: [ISSUED_B1.token] });
+        expect(
+          restarted.capability.reconstruct(
+            RECEIPT_B,
+            ISSUED_B1.keyVersion,
+            ISSUED_B1.tokenHash,
           ),
         ).not.toBeNull();
       } finally {
@@ -784,9 +884,31 @@ ddescribe(
         const served = await getUrl(rotated.app, ISSUED_A1.token);
         expect(served.status).toBe(200);
         expectNoSecretLeakage(served, { tokens: [ISSUED_A1.token] });
+        expect(
+          rotated.capability.reconstruct(
+            RECEIPT_B,
+            ISSUED_B1.keyVersion,
+            ISSUED_B1.tokenHash,
+          ),
+        ).not.toBeNull();
+        const attached = await getUrl(rotated.app, ISSUED_B1.token);
+        expect(attached.status).toBe(200);
+        expect(attached.body).toEqual(JPEG);
+        expectNoSecretLeakage(attached, { tokens: [ISSUED_B1.token] });
       } finally {
         await rotated.close();
       }
+
+      // Restart plus every probe leaves the exact durable ATTACHED row intact.
+      const attachedAfter = await rowOf(RECEIPT_B);
+      expect(attachedAfter).toEqual(attachedBefore);
+      expect(attachedAfter).toMatchObject({
+        status: 'ATTACHED',
+        object_key: OBJECT_B,
+        capability_key_version_text: '1',
+        backend_receipt_status: 'PENDING',
+        declared_amount_cents: ATTACHED_AMOUNT,
+      });
     });
 
     it('blocks reconstruction after the historical key is removed while the issued token still authorizes until explicit DB revocation', async () => {
