@@ -66,7 +66,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3A1 — Add the Skydropx OAuth token transport:** plain Nest-agnostic client with an injectable function transport, official `POST /api/v1/oauth/token` form-urlencoded request, fail-closed token/expires parsing with runtime clock validation, strict runtime status validation, standard AbortError timeout handling, bounded retry (max 2 attempts) for 429/5xx/network only, secret-safe finite result union, mocked HTTP only; `getToken()` acquires a fresh token on every call.
 - [x] **SQ-3A2 — Add the Skydropx OAuth token cache:** in-memory token cache reuse, expiry-skew refresh with an injectable clock, publish-before-transport single-flight, and epoch-guarded token-aware invalidation.
 - [x] **SQ-3B1 — Add the Skydropx quotation-creation core:** plain Nest-agnostic client with a typed provider-wire V1 body, a structural `getToken` dependency, JSON bearer `POST /api/v1/quotations` over the shared injectable HTTP seam, bounded timeout, strict 201 parsing, finite status/abort mapping, RFC 6750 bearer validation, no retries, and a finite no-leak result; mocked HTTP only.
-- [ ] **SQ-3B2 — Add one-time 401 recovery (in progress; candidate — not delivered):** on the first 401 only, call `invalidate(exactToken)`, obtain a token once more, and replay the POST exactly once; a second 401 returns `auth_failed`; a finite refresh-token error is returned unchanged; no refresh on 403 and no retry on ambiguous POST outcomes; hostile `invalidate`/token-refresh getters must not leak.
+- [x] **SQ-3B2 — Add one-time 401 recovery:** on the first 401 only, await `invalidate(exactToken)`, obtain a token once more, and replay the identical POST payload exactly once; a second 401 returns `auth_failed`; finite refresh-token errors pass through; no refresh on 403 or ambiguous POST outcomes; hostile synchronous or Promise-returning seams fail closed.
 - [ ] **SQ-3B3 — Add the Skydropx quotation polling transport (pending, bounded polling):** bounded GET polling with retry/timeout over the shared injectable HTTP seam that always polls even when create reports completion.
 - [ ] **SQ-3C — Add the Skydropx response mapper and provider adapter:** map/quotation responses into normalized quoted results and finite errors, filter rates, implement `ShippingQuoteProviderPort`.
 - [ ] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
@@ -200,6 +200,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Behavior: typed V1 wire body, JSON bearer POST, bounded timeout, exact 201, bounded plain `id`, boolean `is_completed`, strict runtime status mapping, no retries or raw response/error retention.
 - Security: the consumption boundary accepts only bounded RFC 6750 `b64token` characters with trailing padding; whitespace, controls, CRLF, non-ASCII, and misplaced padding fail before HTTP. Results never serialize token, payload/address, provider body, or thrown text.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, and `git diff --check` passed. Native advisory `R3-timeout-bounds` and independent boundary-test suggestions are non-blocking future hardening.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3B2 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-040a2fc8b2ce9db2`; locally delivered in commit `c98fce8`)
+
+- Work unit: one-time 401 recovery only — 223 complete changed lines after the async-invalidation correction, within the 400-line guard. GET polling remains SQ-3B3.
+- Focused TDD RED: 6 failures / 5 passes against B1. Correction RED then proved a rejected/deferred Promise invalidation escaped or allowed replay before settling. Final GREEN: 14/14 focused tests and 214/214 shipping tests.
+- Recovery: only a definite first 401 invalidates the exact token, obtains one refreshed token, and replays the identical payload reference once. A second 401 or either-stage 403 returns `auth_failed` without further attempts.
+- Safety: invalidation is assimilated and awaited before refresh; synchronous throws, rejected Promises, hostile getters, malformed refreshed tokens, and refresh failures produce finite no-leak results without unsafe replay. Network, timeout, abort, rate limit, 5xx, malformed, 400, and 422 outcomes are never replayed.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, and `git diff --check` passed. Repository-wide spec typecheck retains unrelated diagnostics; a never-settling hostile invalidation can wait indefinitely but cannot replay.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
