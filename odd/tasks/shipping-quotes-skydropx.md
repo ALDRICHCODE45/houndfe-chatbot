@@ -69,7 +69,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3B2 — Add one-time 401 recovery:** on the first 401 only, await `invalidate(exactToken)`, obtain a token once more, and replay the identical POST payload exactly once; a second 401 returns `auth_failed`; finite refresh-token errors pass through; no refresh on 403 or ambiguous POST outcomes; hostile synchronous or Promise-returning seams fail closed.
 - [x] **SQ-3B3a — Add the Skydropx quotation polling core:** bounded GET polling over the shared injectable HTTP seam with exported 5-attempt/1000ms cadence constants, an injectable no-real-timer sleep seam, path-safe id validation, strict 1..60,000ms runtime timeout, finite terminal status/network/timeout mapping, and a bounded shallow `providerRates` snapshot; always performs at least one GET even when create reported completion. B3b adds one-time GET 401 recovery.
 - [x] **SQ-3B3b — Add one-time polling 401 recovery:** on the first definite GET 401 only, await invalidation of the exact token, obtain one refreshed token, and replay the identical captured URL/id/timeout GET exactly once in the same poll attempt; a later 401 fails auth without another refresh.
-- [ ] **SQ-3C1 — Rate-element mapper (in progress/candidate):** pure, never-throwing `mapSkydropxRate(raw)` that maps one shallow Skydropx `/api/v1` rate element into `ShippingQuoteRate | null` with exact decimal-MXN-to-cents conversion (BigInt, no float), strict field guards, one-read snapshots, and secret-safe fresh output.
+- [x] **SQ-3C1 — Rate-element mapper:** pure, never-throwing `mapSkydropxRate(raw)` maps one shallow current Skydropx `/api/v1` rate element into `ShippingQuoteRate | null` using `total`, exact MXN decimal-to-cents conversion, adjacent-cent uniqueness for numeric JSON values, strict field guards, one-read snapshots, and secret-safe fresh output.
 - [ ] **SQ-3C2 — Quotation filter/envelope mapper:** filter invalid provider rates and build provider-neutral quotation results/delegated envelopes from mapped rates and finite errors.
 - [ ] **SQ-3C3 — Request-to-wire mapper:** convert the provider-neutral shipping request into the Skydropx V1 wire payload. Blocked/deferred: parcel unit conversion is blocked pending controlled provider validation, so request mapping must not guess units.
 - [ ] **SQ-3C4 — Provider adapter:** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
@@ -232,6 +232,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Safety: shared awaited invalidation preserves POST B2 behavior; synchronous throws, rejected/deferred Promises, hostile token seams, and refresh failures produce finite no-leak results without unsafe replay. A second/later 401 or either-stage 403 returns `auth_failed`; non-401 outcomes never recover.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, `git diff --check`, and a separate emitted-artifact incident check passed. A never-settling invalidation may wait indefinitely but cannot replay or leak; repository-wide spec typecheck retains unrelated diagnostics.
 - No generated `.js`/`.js.map` files remain under `src`; diagnostic spec checks must use `tsc --noEmit -p tsconfig.spec.json`.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3C1 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-c899037f588b96d7`; locally delivered in commit `37e0a1c`)
+
+- Work unit: one-rate trust-boundary mapper only — exactly 400 complete changed lines after monetary precision corrections, within the review guard.
+- Focused TDD RED: missing mapper module. Correction RED then proved numeric negative zero and adjacent-cent-collapsing large doubles were accepted. Final GREEN: 23/23 focused tests and 258/258 shipping tests.
+- Current API mapping: require `success === true`, exact `currency_code: MXN`, bounded `id`, `provider_display_name`, `provider_service_name`, and nonnegative safe-integer `days`; use documented `total`, ignore `amount`/fees/protection, and leave validity null because no expiry timestamp exists.
+- Money safety: canonical decimal strings support the full safe-cent boundary through BigInt; numeric examples are accepted only when the exact cent and adjacent cents map uniquely, with no float multiplication, coercion, exponent strings, arbitrary price cap, or negative zero.
+- Boundary safety: plain records only, every provider field read once, hostile getters/proxies fail closed, and successful output is fresh, frozen, exact-key, and strips every arbitrary/sensitive provider field. Missing/null `days` remains a deliberate fail-closed warning despite nullable provider-neutral ETA.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit` diagnostics, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
