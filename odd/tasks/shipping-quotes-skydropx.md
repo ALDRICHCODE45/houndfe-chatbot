@@ -65,7 +65,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-2B2B2 — Add the shipping-quote envelope and port:** `ShippingQuoteProviderResult`, the envelope normalizer, the `SHIPPING_QUOTE_PROVIDER` token, and the port interface.
 - [x] **SQ-3A1 — Add the Skydropx OAuth token transport:** plain Nest-agnostic client with an injectable function transport, official `POST /api/v1/oauth/token` form-urlencoded request, fail-closed token/expires parsing with runtime clock validation, strict runtime status validation, standard AbortError timeout handling, bounded retry (max 2 attempts) for 429/5xx/network only, secret-safe finite result union, mocked HTTP only; `getToken()` acquires a fresh token on every call.
 - [x] **SQ-3A2 — Add the Skydropx OAuth token cache:** in-memory token cache reuse, expiry-skew refresh with an injectable clock, publish-before-transport single-flight, and epoch-guarded token-aware invalidation.
-- [ ] **SQ-3B1 — Add the Skydropx quotation-creation core (in progress / candidate):** plain Nest-agnostic client with a typed provider-wire V1 body, a structural `getToken` dependency, JSON bearer `POST /api/v1/quotations` over the shared injectable HTTP seam, a bounded timeout, strict 201 `id`/`is_completed` parsing, finite status/abort mapping (400/422 `invalid_request`, 401/403 `auth_failed`, 429 Retry-After, 5xx/timeout, otherwise `malformed_response`), no retries, hostile getter safety, and a finite no-leak result; mocked HTTP only.
+- [x] **SQ-3B1 — Add the Skydropx quotation-creation core:** plain Nest-agnostic client with a typed provider-wire V1 body, a structural `getToken` dependency, JSON bearer `POST /api/v1/quotations` over the shared injectable HTTP seam, bounded timeout, strict 201 parsing, finite status/abort mapping, RFC 6750 bearer validation, no retries, and a finite no-leak result; mocked HTTP only.
 - [ ] **SQ-3B2 — Add one-time 401 recovery (pending):** on the first 401 only, call `invalidate(exactToken)`, obtain a token once more, and replay the POST exactly once; a second 401 returns `auth_failed`; a finite refresh-token error is returned unchanged; no refresh on 403 and no retry on ambiguous POST outcomes; hostile `invalidate`/token-refresh getters must not leak.
 - [ ] **SQ-3B3 — Add the Skydropx quotation polling transport (pending, bounded polling):** bounded GET polling with retry/timeout over the shared injectable HTTP seam that always polls even when create reports completion.
 - [ ] **SQ-3C — Add the Skydropx response mapper and provider adapter:** map/quotation responses into normalized quoted results and finite errors, filter rates, implement `ShippingQuoteProviderPort`.
@@ -191,6 +191,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Concurrency: the in-flight promise is published before injectable transport execution, so synchronous reentrancy shares one acquisition/retry sequence; guarded clearing prevents an older flight from clearing a newer one.
 - Invalidation: only the exact cached token clears; a generation epoch prevents an active refresh from repopulating cache after matching invalidation; an older token cannot clear a newer cache.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, and `git diff --check` passed. Clock rollback remains a non-blocking warning; repository-wide spec typecheck retains unrelated diagnostics.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3B1 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-0c21145eb5e46ebc`; locally delivered in commit `03a36b6`)
+
+- Work unit: quotation creation core only — 391 complete changed lines after the bearer-boundary correction, within the 400-line guard. One-time 401 recovery and GET polling remain SQ-3B2/SQ-3B3.
+- Focused TDD RED: missing module. Bearer hardening RED then proved padded/header-injection tokens reached HTTP before correction. Final GREEN: 5/5 focused tests and 205/205 shipping tests.
+- Behavior: typed V1 wire body, JSON bearer POST, bounded timeout, exact 201, bounded plain `id`, boolean `is_completed`, strict runtime status mapping, no retries or raw response/error retention.
+- Security: the consumption boundary accepts only bounded RFC 6750 `b64token` characters with trailing padding; whitespace, controls, CRLF, non-ASCII, and misplaced padding fail before HTTP. Results never serialize token, payload/address, provider body, or thrown text.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, and `git diff --check` passed. Native advisory `R3-timeout-bounds` and independent boundary-test suggestions are non-blocking future hardening.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
