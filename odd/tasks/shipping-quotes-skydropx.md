@@ -71,7 +71,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3B3b — Add one-time polling 401 recovery:** on the first definite GET 401 only, await invalidation of the exact token, obtain one refreshed token, and replay the identical captured URL/id/timeout GET exactly once in the same poll attempt; a later 401 fails auth without another refresh.
 - [x] **SQ-3C1 — Rate-element mapper:** pure, never-throwing `mapSkydropxRate(raw)` maps one shallow current Skydropx `/api/v1` rate element into `ShippingQuoteRate | null` using `total`, exact MXN decimal-to-cents conversion, adjacent-cent uniqueness for numeric JSON values, strict field guards, one-read snapshots, and secret-safe fresh output.
 - [x] **SQ-3C2 — Quotation filter/envelope mapper:** filter invalid provider rates and build provider-neutral quotation results/delegated envelopes from mapped rates and finite errors.
-- [ ] **SQ-3C3 (IN PROGRESS / candidate) — Request-to-wire mapper:** convert the provider-neutral shipping request into the Skydropx V1 wire payload. Sandbox UI evidence confirms dimensions in centimeters and weight in kilograms, so C3 maps `weightGrams/1000` and passes dimensions through; current official `POST /api/v1/quotations` V1 docs omit unit/package fields (`mass_unit`, `dimension_unit`, `package`/`package_type`), so the emitted wire body is addresses plus parcels only.
+- [x] **SQ-3C3 — Request-to-wire mapper:** convert the provider-neutral shipping request into the Skydropx V1 wire payload. Sandbox UI evidence confirms dimensions in centimeters and weight in kilograms, so C3 maps `weightGrams/1000` and passes dimensions through; current official `POST /api/v1/quotations` V1 docs omit unit/package fields (`mass_unit`, `dimension_unit`, `package`/`package_type`), so the emitted wire body is addresses plus parcels only.
 - [ ] **SQ-3C4 — Provider adapter:** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
 - [ ] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
@@ -253,6 +253,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Output safety: successful quotations are rebuilt through the provider-neutral normalizer with exact keys, fresh deep snapshots, and `expiresAt: null`; no raw provider element, arbitrary key, sensitive sentinel, or fabricated 24-hour timestamp escapes.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit` diagnostics, emitted-artifact checks, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3C3 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-2338a5bff679b639`; locally delivered in commit `273c0b6`)
+
+- Work unit: provider-neutral request trust-boundary snapshot and Skydropx V1 wire mapping — 397 complete changed lines, within the review guard.
+- Focused TDD RED: missing mapper module. Final GREEN: 7/7 mapper tests and 288/288 shipping tests.
+- Unit evidence: the official sandbox UI explicitly labels parcel dimensions as centimeters and weight as kilograms; C3 passes integer centimeter dimensions unchanged and divides integer grams by 1000 without rounding, stringification, or clamping.
+- Wire evidence: current official V1 quotation docs require address `country_code`, `postal_code`, `area_level1/2/3` plus parcel `length`, `width`, `height`, and `weight`; package presets, package type, explicit unit fields, protection, declared value, carriers, template/tax/contact fields, and arbitrary input keys are not emitted.
+- Boundary safety: raw request/address/parcel fields, array length, and every parcel index are snapshotted once; invalid, sparse, class, hostile, or stateful inputs fail closed; valid output is exact-key, fresh, ordered, and deeply frozen.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit`, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated. Native advisory `R3-unbounded-parcel-snapshot` is informational and belongs to later readiness/adapter bounds rather than this deterministic mapper.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred during implementation or verification; earlier separately authorized sandbox observations remain operational evidence only.
 
 ## Delivery gate
 
