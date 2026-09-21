@@ -71,9 +71,11 @@ const make = (
     (): Promise<SkydropxTokenResult> =>
       Promise.resolve(tokenResults[Math.min(t++, tokenResults.length - 1)]),
   );
-  const tokens = override ?? { getToken };
+  const invalidate = jest.fn();
+  const defaults = { getToken, invalidate };
+  const tokens: SkydropxQuotationTokenSource = override ?? defaults;
   const client = new SkydropxQuotationClient(CONFIG, tokens, http);
-  return { client, calls, getToken };
+  return { client, calls, getToken, invalidate };
 };
 const run = (script: Script, tokens?: SkydropxTokenResult[]) =>
   make(script, tokens).client.create(PAYLOAD);
@@ -82,7 +84,10 @@ it('creates over the default transport, returning only the id', async () => {
     status: 201,
     data: { id: 'q-1', is_completed: false },
   });
-  const tokens = { getToken: () => Promise.resolve(A(TOKEN)) };
+  const tokens = {
+    getToken: () => Promise.resolve(A(TOKEN)),
+    invalidate: () => undefined,
+  };
   const client = new SkydropxQuotationClient(CONFIG, tokens);
   await expect(client.create(PAYLOAD)).resolves.toEqual(created());
   const config = spy.mock.calls[0][0];
@@ -118,7 +123,7 @@ it('fails closed on malformed or hostile 201 payloads and strips extras', async 
 it('maps every status, abort, and ambiguous outcome without replaying', async () => {
   // prettier-ignore
   const cases: Array<[Script, unknown]> = [
-    [[r(400)], ireq], [[r(422)], ireq], [[r(401)], auth], [[r(403)], auth], [[r(200)], mal],
+    [[r(400)], ireq], [[r(422)], ireq], [[r(403)], auth], [[r(200)], mal],
     [[r(204)], mal], [[r(404)], mal], [[r(0)], mal], [[r(600)], mal], [[r(Number.NaN)], mal],
     [[r('201')], mal], [[hostile(r(201), 'status')], mal], [[hostile(r(201), 'data')], mal],
     [[r(500)], up(500)], [[r(503)], up(503)],
@@ -133,7 +138,144 @@ it('maps every status, abort, and ambiguous outcome without replaying', async ()
     const h = make(script);
     await expect(h.client.create(PAYLOAD)).resolves.toEqual(expected);
     expect(h.calls).toHaveLength(1);
+    expect(h.getToken).toHaveBeenCalledTimes(1);
+    expect(h.invalidate).not.toHaveBeenCalled();
   }
+});
+it('recovers once from a first 401 and replays the exact payload', async () => {
+  const h = make([r(401), ok()], [A(TOKEN), A('tok-2')]);
+  await expect(h.client.create(PAYLOAD)).resolves.toEqual(created());
+  expect(h.invalidate).toHaveBeenCalledTimes(1);
+  expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+  expect(h.getToken).toHaveBeenCalledTimes(2);
+  expect(h.calls).toHaveLength(2);
+  expect(h.calls[0].data).toBe(PAYLOAD);
+  expect(h.calls[1].data).toBe(PAYLOAD);
+  expect(h.calls[0].headers).toMatchObject({
+    authorization: `Bearer ${TOKEN}`,
+  });
+  expect(h.calls[1].headers).toMatchObject({ authorization: 'Bearer tok-2' });
+});
+it('fails closed on a second 401 without a third acquisition or POST', async () => {
+  const h = make([r(401), r(401)], [A(TOKEN), A('tok-2')]);
+  await expect(h.client.create(PAYLOAD)).resolves.toEqual(auth);
+  expect(h.invalidate).toHaveBeenCalledTimes(1);
+  expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+  expect(h.getToken).toHaveBeenCalledTimes(2);
+  expect(h.calls).toHaveLength(2);
+});
+it('never refreshes or retries a 403', async () => {
+  for (const script of [[r(403)], [r(401), r(403)]]) {
+    const h = make(script);
+    await expect(h.client.create(PAYLOAD)).resolves.toEqual(auth);
+    expect(h.invalidate).toHaveBeenCalledTimes(script.length - 1);
+    expect(h.getToken).toHaveBeenCalledTimes(script.length);
+    expect(h.calls).toHaveLength(script.length);
+  }
+});
+it('returns a finite refreshed-token error without a second POST', async () => {
+  // prettier-ignore
+  const errors: ShippingQuoteError[] = [
+    { kind: 'rate_limited', retryAfterSeconds: 7 }, { kind: 'provider_disabled' },
+    { kind: 'upstream_unavailable', httpStatus: 503 },
+  ];
+  for (const error of errors) {
+    const h = make([r(401), ok()], [A(TOKEN), { kind: 'error', error }]);
+    // prettier-ignore
+    await expect(h.client.create(PAYLOAD)).resolves.toEqual(e(error.kind, error));
+    expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+    expect(h.getToken).toHaveBeenCalledTimes(2);
+    expect(h.calls).toHaveLength(1);
+  }
+});
+it('fails closed on a malformed refreshed token before the second POST', async () => {
+  // prettier-ignore
+  const bad = [
+    { kind: 'token', accessToken: ' tok' }, { kind: 'token', accessToken: '' },
+    { kind: 'token', accessToken: 1 }, { kind: 'bogus' },
+  ];
+  for (const value of bad) {
+    const h = make([r(401), ok()], [A(TOKEN), value as SkydropxTokenResult]);
+    await expect(h.client.create(PAYLOAD)).resolves.toEqual(mal);
+    expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+    expect(h.getToken).toHaveBeenCalledTimes(2);
+    expect(h.calls).toHaveLength(1);
+  }
+});
+it('fails closed without replaying when invalidate throws or is hostile', async () => {
+  const boom = (): void => {
+    throw new Error(BODY);
+  };
+  const thrower = {
+    getToken: () => Promise.resolve(A(TOKEN)),
+    invalidate: boom,
+  };
+  const h1 = make([r(401), ok()], undefined, thrower);
+  await expect(h1.client.create(PAYLOAD)).resolves.toEqual(mal);
+  expect(h1.calls).toHaveLength(1);
+  const hostileInv = {
+    getToken: () => Promise.resolve(A(TOKEN)),
+    invalidate: (): void => undefined,
+  };
+  Object.defineProperty(hostileInv, 'invalidate', {
+    get: () => {
+      throw new Error(BODY);
+    },
+  });
+  const h2 = make([r(401), ok()], undefined, hostileInv);
+  await expect(h2.client.create(PAYLOAD)).resolves.toEqual(mal);
+  expect(h2.calls).toHaveLength(1);
+});
+it('fails closed when the refreshed token acquisition throws', async () => {
+  let n = 0;
+  const source = {
+    getToken: () => {
+      n += 1;
+      return n === 1
+        ? Promise.resolve(A(TOKEN))
+        : Promise.reject(new Error(BODY));
+    },
+    invalidate: () => undefined,
+  };
+  const h = make([r(401), ok()], undefined, source);
+  const result = await h.client.create(PAYLOAD);
+  expect(result).toEqual(mal);
+  expect(h.calls).toHaveLength(1);
+  expect(JSON.stringify(result)).not.toContain(BODY);
+});
+it('fails closed when invalidate returns a rejected promise', async () => {
+  const source = {
+    getToken: jest.fn(() => Promise.resolve(A(TOKEN))),
+    invalidate: jest.fn(() => Promise.reject(new Error(BODY))),
+  };
+  const h = make([r(401), ok()], undefined, source);
+  const result = await h.client.create(PAYLOAD);
+  expect(result).toEqual(mal);
+  expect(source.getToken).toHaveBeenCalledTimes(1);
+  expect(h.calls).toHaveLength(1);
+  expect(JSON.stringify(result)).not.toContain(BODY);
+});
+it('waits for a deferred invalidation before refreshing and replaying', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const source = {
+    getToken: jest.fn(() => Promise.resolve(A(TOKEN))),
+    invalidate: jest.fn(() => gate),
+  };
+  const h = make([r(401), ok()], undefined, source);
+  const pending = h.client.create(PAYLOAD);
+  await new Promise<void>((resolve) => setTimeout(() => resolve(), 0));
+  expect(source.invalidate).toHaveBeenCalledWith(TOKEN);
+  expect(source.getToken).toHaveBeenCalledTimes(1);
+  expect(h.calls).toHaveLength(1);
+  release();
+  await expect(pending).resolves.toEqual(created());
+  expect(source.getToken).toHaveBeenCalledTimes(2);
+  expect(h.calls).toHaveLength(2);
+  expect(h.calls[0].data).toBe(PAYLOAD);
+  expect(h.calls[1].data).toBe(PAYLOAD);
 });
 it('returns token errors unchanged and fails closed on hostile tokens', async () => {
   // prettier-ignore
@@ -150,8 +292,8 @@ it('returns token errors unchanged and fails closed on hostile tokens', async ()
     Promise.reject(new Error(BODY));
   // prettier-ignore
   const overrides: SkydropxQuotationTokenSource[] = [
-    { getToken: boom }, { getToken: rejects }, { getToken: () => Promise.resolve(hostileToken('kind')) },
-    { getToken: () => Promise.resolve(hostileToken('accessToken')) }, { getToken: () => Promise.resolve(hostileErr()) },
+    { getToken: boom, invalidate: () => undefined }, { getToken: rejects, invalidate: () => undefined }, { getToken: () => Promise.resolve(hostileToken('kind')), invalidate: () => undefined },
+    { getToken: () => Promise.resolve(hostileToken('accessToken')), invalidate: () => undefined }, { getToken: () => Promise.resolve(hostileErr()), invalidate: () => undefined },
   ];
   // prettier-ignore
   const tokens: unknown[] = [

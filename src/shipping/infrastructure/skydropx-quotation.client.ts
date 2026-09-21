@@ -33,7 +33,7 @@ export type SkydropxQuotationResult =
 /** Minimal structural view of the token client; it is never constructed here. */
 export type SkydropxQuotationTokenSource = Pick<
   SkydropxTokenClient,
-  'getToken'
+  'getToken' | 'invalidate'
 >;
 export interface SkydropxQuotationClientConfig {
   readonly baseUrl: string;
@@ -51,6 +51,13 @@ const TIMEOUT_CODES = new Set(['ECONNABORTED', 'ERR_CANCELED', 'ETIMEDOUT']);
 type TokenOutcome =
   | { readonly kind: 'token'; readonly accessToken: string }
   | { readonly kind: 'error'; readonly result: SkydropxQuotationResult };
+type PostOutcome =
+  | { readonly kind: 'done'; readonly result: SkydropxQuotationResult }
+  | { readonly kind: 'unauthorized' };
+const done = (result: SkydropxQuotationResult): PostOutcome => ({
+  kind: 'done',
+  result,
+});
 type WireValue = string | number | boolean | object | null | undefined;
 const isObject = (value: unknown): value is Record<string, unknown> => {
   if (typeof value !== 'object' || value === null || Array.isArray(value))
@@ -122,13 +129,36 @@ export class SkydropxQuotationClient {
     payload: SkydropxQuotationPayload,
   ): Promise<SkydropxQuotationResult> => {
     try {
-      const token = await this.token();
-      if (token.kind === 'error') return token.result;
-      return await this.post(payload, token.accessToken);
+      const initial = await this.token();
+      if (initial.kind === 'error') return initial.result;
+      const first = await this.post(payload, initial.accessToken);
+      if (first.kind === 'done') return first.result;
+      return await this.recover(payload, initial.accessToken);
     } catch {
       return er({ kind: 'upstream_unavailable', httpStatus: null });
     }
   };
+  /**
+   * One-time recovery after a definite 401; never replays with a stale token.
+   * The invalidation result is assimilated before refreshing so an async or
+   * deferred callback cannot let refresh/replay precede invalidation, and a
+   * rejected thenable fails closed instead of escaping as an unhandled
+   * rejection.
+   */
+  private async recover(
+    payload: SkydropxQuotationPayload,
+    staleAccessToken: string,
+  ): Promise<SkydropxQuotationResult> {
+    try {
+      await Promise.resolve(this.tokens.invalidate(staleAccessToken));
+    } catch {
+      return malformed();
+    }
+    const refreshed = await this.token();
+    if (refreshed.kind === 'error') return refreshed.result;
+    const replay = await this.post(payload, refreshed.accessToken);
+    return replay.kind === 'done' ? replay.result : er({ kind: 'auth_failed' });
+  }
   private async token(): Promise<TokenOutcome> {
     try {
       const raw: unknown = await this.tokens.getToken();
@@ -153,7 +183,7 @@ export class SkydropxQuotationClient {
   private async post(
     payload: SkydropxQuotationPayload,
     accessToken: string,
-  ): Promise<SkydropxQuotationResult> {
+  ): Promise<PostOutcome> {
     let response: SkydropxHttpResponse;
     try {
       response = await this.http({
@@ -167,22 +197,25 @@ export class SkydropxQuotationClient {
         data: payload,
       });
     } catch (thrown) {
-      if (isTimeout(thrown)) return er({ kind: 'timeout' });
-      return er({ kind: 'upstream_unavailable', httpStatus: null });
+      if (isTimeout(thrown)) return done(er({ kind: 'timeout' }));
+      return done(er({ kind: 'upstream_unavailable', httpStatus: null }));
     }
     const status = readStatus(response);
-    if (status === null) return malformed();
-    if (status === 201) return parseCreated(field(response, 'data'));
-    if (status === 401 || status === 403) return er({ kind: 'auth_failed' });
+    if (status === null) return done(malformed());
+    if (status === 201) return done(parseCreated(field(response, 'data')));
+    if (status === 401) return { kind: 'unauthorized' };
+    if (status === 403) return done(er({ kind: 'auth_failed' }));
     if (status === 400 || status === 422)
-      return er({ kind: 'invalid_request', field: 'unknown' });
+      return done(er({ kind: 'invalid_request', field: 'unknown' }));
     if (status === 429)
-      return er({
-        kind: 'rate_limited',
-        retryAfterSeconds: readRetryAfter(response),
-      });
+      return done(
+        er({
+          kind: 'rate_limited',
+          retryAfterSeconds: readRetryAfter(response),
+        }),
+      );
     if (status >= 500)
-      return er({ kind: 'upstream_unavailable', httpStatus: status });
-    return malformed();
+      return done(er({ kind: 'upstream_unavailable', httpStatus: status }));
+    return done(malformed());
   }
 }
