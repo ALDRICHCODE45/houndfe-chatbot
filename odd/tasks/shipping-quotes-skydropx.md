@@ -70,7 +70,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3B3a — Add the Skydropx quotation polling core:** bounded GET polling over the shared injectable HTTP seam with exported 5-attempt/1000ms cadence constants, an injectable no-real-timer sleep seam, path-safe id validation, strict 1..60,000ms runtime timeout, finite terminal status/network/timeout mapping, and a bounded shallow `providerRates` snapshot; always performs at least one GET even when create reported completion. B3b adds one-time GET 401 recovery.
 - [x] **SQ-3B3b — Add one-time polling 401 recovery:** on the first definite GET 401 only, await invalidation of the exact token, obtain one refreshed token, and replay the identical captured URL/id/timeout GET exactly once in the same poll attempt; a later 401 fails auth without another refresh.
 - [x] **SQ-3C1 — Rate-element mapper:** pure, never-throwing `mapSkydropxRate(raw)` maps one shallow current Skydropx `/api/v1` rate element into `ShippingQuoteRate | null` using `total`, exact MXN decimal-to-cents conversion, adjacent-cent uniqueness for numeric JSON values, strict field guards, one-read snapshots, and secret-safe fresh output.
-- [ ] **SQ-3C2 — Quotation filter/envelope mapper (IN PROGRESS / candidate; evidence pending):** filter invalid provider rates and build provider-neutral quotation results/delegated envelopes from mapped rates and finite errors.
+- [x] **SQ-3C2 — Quotation filter/envelope mapper:** filter invalid provider rates and build provider-neutral quotation results/delegated envelopes from mapped rates and finite errors.
 - [ ] **SQ-3C3 — Request-to-wire mapper:** convert the provider-neutral shipping request into the Skydropx V1 wire payload. Blocked/deferred: parcel unit conversion is blocked pending controlled provider validation, so request mapping must not guess units.
 - [ ] **SQ-3C4 — Provider adapter:** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
 - [ ] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
@@ -242,6 +242,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Money safety: canonical decimal strings support the full safe-cent boundary through BigInt; numeric examples are accepted only when the exact cent and adjacent cents map uniquely, with no float multiplication, coercion, exponent strings, arbitrary price cap, or negative zero.
 - Boundary safety: plain records only, every provider field read once, hostile getters/proxies fail closed, and successful output is fresh, frozen, exact-key, and strips every arbitrary/sensitive provider field. Missing/null `days` remains a deliberate fail-closed warning despite nullable provider-neutral ETA.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit` diagnostics, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3C2 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-2881b8c133a5889f`; locally delivered in commit `dbad71d`)
+
+- Work unit: quotation trust-boundary mapper plus a provider-neutral quote-ID normalizer export — 395 complete changed lines, within the review guard.
+- Focused TDD RED: missing mapper module. Correction RED then proved invalid quotation IDs were masked as `no_rates` when no rate survived. Final GREEN: 23/23 mapper tests, 21/21 quote-result tests, and 281/281 shipping tests.
+- Boundary safety: validate the quote ID independently through the shared provider-neutral rule; accept only dense plain arrays with a snapshotted safe length of 0–100; read every provider element once; hostile containers fail as `malformed_response`.
+- Filtering semantics: malformed, failed, and non-MXN elements are discarded through SQ-3C1 while valid elements retain order and duplicates; empty or all-invalid valid envelopes return exact `no_rates`.
+- Output safety: successful quotations are rebuilt through the provider-neutral normalizer with exact keys, fresh deep snapshots, and `expiresAt: null`; no raw provider element, arbitrary key, sensitive sentinel, or fabricated 24-hour timestamp escapes.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit` diagnostics, emitted-artifact checks, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
