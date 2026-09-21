@@ -68,7 +68,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3B1 — Add the Skydropx quotation-creation core:** plain Nest-agnostic client with a typed provider-wire V1 body, a structural `getToken` dependency, JSON bearer `POST /api/v1/quotations` over the shared injectable HTTP seam, bounded timeout, strict 201 parsing, finite status/abort mapping, RFC 6750 bearer validation, no retries, and a finite no-leak result; mocked HTTP only.
 - [x] **SQ-3B2 — Add one-time 401 recovery:** on the first 401 only, await `invalidate(exactToken)`, obtain a token once more, and replay the identical POST payload exactly once; a second 401 returns `auth_failed`; finite refresh-token errors pass through; no refresh on 403 or ambiguous POST outcomes; hostile synchronous or Promise-returning seams fail closed.
 - [x] **SQ-3B3a — Add the Skydropx quotation polling core:** bounded GET polling over the shared injectable HTTP seam with exported 5-attempt/1000ms cadence constants, an injectable no-real-timer sleep seam, path-safe id validation, strict 1..60,000ms runtime timeout, finite terminal status/network/timeout mapping, and a bounded shallow `providerRates` snapshot; always performs at least one GET even when create reported completion. B3b adds one-time GET 401 recovery.
-- [ ] **SQ-3B3b — Add one-time polling 401 recovery (in progress / candidate):** on a definite GET 401, invalidate the exact token, obtain one refreshed token, and replay the identical GET exactly once; the B3a terminal mapping deliberately does not invalidate or recover. Candidate under focused TDD; not yet complete and no final evidence recorded.
+- [x] **SQ-3B3b — Add one-time polling 401 recovery:** on the first definite GET 401 only, await invalidation of the exact token, obtain one refreshed token, and replay the identical captured URL/id/timeout GET exactly once in the same poll attempt; a later 401 fails auth without another refresh.
 - [ ] **SQ-3C — Add the Skydropx response mapper and provider adapter:** map/quotation responses into normalized quoted results and finite errors, filter rates, implement `ShippingQuoteProviderPort`.
 - [ ] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
@@ -219,6 +219,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Polling: strict path-safe IDs, at least one and at most five GETs, fixed 1000ms cadence only after valid incomplete responses, no final sleep, and deterministic timeout on exhaustion. Sleep failures stop requests instead of creating an unpaced burst.
 - Boundary: runtime timeout is read once and must be a primitive safe integer in 1..60,000ms before token/HTTP/sleep. Terminal responses map to finite errors; successful completion exports only the ID and a frozen dense 0..100 shallow rates snapshot for immediate SQ-3C normalization.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, and `git diff --check` passed. Raw rate elements remain an intentional internal trust boundary and must not be logged, serialized, or persisted before SQ-3C; a never-settling injected sleeper remains a non-blocking seam warning.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3B3b evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-f75ccfb4fc472aff`; locally delivered in commit `bde7a41`)
+
+- Work unit: one-time GET 401 recovery only — 253 complete changed lines, within the 400-line guard.
+- Focused TDD RED: 8 failures / 27 passes against B3a. Final GREEN: 35/35 focused tests and 235/235 shipping tests.
+- Recovery: one definite 401 invalidates the exact token, obtains one replacement, and replays the exact captured URL, quotation ID, validated timeout, and refreshed bearer header once in the same poll attempt. Total GETs remain bounded at normal attempts plus one.
+- Safety: shared awaited invalidation preserves POST B2 behavior; synchronous throws, rejected/deferred Promises, hostile token seams, and refresh failures produce finite no-leak results without unsafe replay. A second/later 401 or either-stage 403 returns `auth_failed`; non-401 outcomes never recover.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, `git diff --check`, and a separate emitted-artifact incident check passed. A never-settling invalidation may wait indefinitely but cannot replay or leak; repository-wide spec typecheck retains unrelated diagnostics.
+- No generated `.js`/`.js.map` files remain under `src`; diagnostic spec checks must use `tsc --noEmit -p tsconfig.spec.json`.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
