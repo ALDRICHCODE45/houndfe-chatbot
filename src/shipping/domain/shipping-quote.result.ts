@@ -39,6 +39,15 @@ function isQuoteString(value: unknown): value is string {
   );
 }
 
+/**
+ * Provider-neutral single-id rule reused by quoted-result normalization
+ * (SQ-3C2 correction): validates a quotation id before rate filtering so an
+ * invalid id can fail closed without a fabricated rate. Never throws.
+ */
+export function normalizeShippingQuoteId(value: unknown): string | null {
+  return isQuoteString(value) ? value : null;
+}
+
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
@@ -113,10 +122,10 @@ export function normalizeShippingQuoteQuotedResult(
   try {
     if (!isPlainObject(value)) return null;
     const kind: unknown = value.kind;
-    const quoteId: unknown = value.quoteId;
+    const quoteId = normalizeShippingQuoteId(value.quoteId);
     const rawRates: unknown = value.rates;
     const rawExpiresAt: unknown = value.expiresAt;
-    if (kind !== 'quoted' || !isQuoteString(quoteId)) return null;
+    if (kind !== 'quoted' || quoteId === null) return null;
     if (!Array.isArray(rawRates)) return null;
     const rawLength: unknown = rawRates.length;
     if (
