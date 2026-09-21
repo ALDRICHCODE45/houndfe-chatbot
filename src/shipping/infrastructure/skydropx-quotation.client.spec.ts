@@ -430,7 +430,7 @@ it('fails closed immediately when the sleep seam throws or rejects', async () =>
 it('maps every terminal GET status, abort, and network outcome to one no-sleep error', async () => {
   // prettier-ignore
   const cases: Array<[Script, unknown]> = [
-    [[r(400)], ireq], [[r(404)], ireq], [[r(422)], ireq], [[r(401)], auth], [[r(403)], auth],
+    [[r(400)], ireq], [[r(404)], ireq], [[r(422)], ireq], [[r(403)], auth],
     [[r(429, { 'retry-after': '30' })], rate(30)], [[r(429, { 'Retry-After': '7' })], rate(7)],
     [[r(429, { 'retry-after': 'soon' })], rate(null)], [[r(429)], rate(null)],
     [[r(500)], up(500)], [[r(503)], up(503)],
@@ -564,5 +564,193 @@ it('validates the runtime poll timeout before any seam and forwards the exact bo
     const h = mk(timeoutMs);
     await expect(h.client.poll(GID)).resolves.toEqual(completed([]));
     expect(h.calls.map((c) => c.timeout)).toEqual([timeoutMs]);
+  }
+});
+// prettier-ignore
+const GET_URL = 'https://api-pro.skydropx.com/api/v1/quotations/q-1';
+it('recovers once from a first GET 401 and replays the exact id, url, and timeout', async () => {
+  const h = make([r(401), comp([])], [A(TOKEN), A('tok-2')]);
+  await expect(h.client.poll(GID)).resolves.toEqual(completed([]));
+  expect(h.invalidate).toHaveBeenCalledTimes(1);
+  expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+  expect(h.getToken).toHaveBeenCalledTimes(2);
+  expect(h.calls).toHaveLength(2);
+  // prettier-ignore
+  expect(h.calls[0]).toMatchObject({ method: 'GET', url: GET_URL, timeout: 5_000, headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` } });
+  // prettier-ignore
+  expect(h.calls[1]).toMatchObject({ method: 'GET', url: GET_URL, timeout: 5_000, headers: { 'content-type': 'application/json', authorization: 'Bearer tok-2' } });
+  expect(h.calls[0].data).toBeUndefined();
+  expect(h.calls[1].data).toBeUndefined();
+  expect(h.sleep).not.toHaveBeenCalled();
+});
+it('keeps the auth replay outside the attempt budget and cadence', async () => {
+  const h = make([r(401), inc()], [A(TOKEN), A('tok-2')]);
+  await expect(h.client.poll(GID)).resolves.toEqual(
+    pollErr({ kind: 'timeout' }),
+  );
+  expect(h.calls).toHaveLength(SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS + 1);
+  // prettier-ignore
+  expect(h.sleep).toHaveBeenCalledTimes(SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS - 1);
+  expect(h.getToken).toHaveBeenCalledTimes(2);
+  expect(h.invalidate).toHaveBeenCalledTimes(1);
+});
+it('recovers at most once across the whole poll call', async () => {
+  const authErr = pollErr({ kind: 'auth_failed' });
+  // prettier-ignore
+  const cases: Array<[Script, unknown, number, number]> = [
+    [[inc(), r(401), comp([])], completed([]), 3, 1],
+    [[r(401), r(401)], authErr, 2, 0],
+    [[r(401), r(403)], authErr, 2, 0],
+    [[r(401), inc(), r(401)], authErr, 3, 1],
+  ];
+  for (const [script, expected, gets, sleeps] of cases) {
+    const h = make(script, [A(TOKEN), A('tok-2')]);
+    await expect(h.client.poll(GID)).resolves.toEqual(expected);
+    expect(h.invalidate).toHaveBeenCalledTimes(1);
+    expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+    expect(h.getToken).toHaveBeenCalledTimes(2);
+    expect(h.calls).toHaveLength(gets);
+    expect(h.sleep).toHaveBeenCalledTimes(sleeps);
+  }
+});
+it('fails closed on a refused or malformed refreshed GET token without replay', async () => {
+  // prettier-ignore
+  const errors: ShippingQuoteError[] = [
+    { kind: 'rate_limited', retryAfterSeconds: 7 }, { kind: 'provider_disabled' },
+    { kind: 'upstream_unavailable', httpStatus: 503 },
+  ];
+  for (const error of errors) {
+    const h = make([r(401), comp([])], [A(TOKEN), { kind: 'error', error }]);
+    await expect(h.client.poll(GID)).resolves.toEqual(pollErr(error));
+    expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+    expect(h.getToken).toHaveBeenCalledTimes(2);
+    expect(h.calls).toHaveLength(1);
+  }
+  // prettier-ignore
+  const bad = [
+    { kind: 'token', accessToken: ' tok' }, { kind: 'token', accessToken: '' },
+    { kind: 'token', accessToken: 1 }, { kind: 'bogus' },
+  ];
+  for (const value of bad) {
+    const h = make(
+      [r(401), comp([])],
+      [A(TOKEN), value as SkydropxTokenResult],
+    );
+    // prettier-ignore
+    await expect(h.client.poll(GID)).resolves.toEqual(pollErr({ kind: 'malformed_response' }));
+    expect(h.invalidate).toHaveBeenCalledWith(TOKEN);
+    expect(h.getToken).toHaveBeenCalledTimes(2);
+    expect(h.calls).toHaveLength(1);
+  }
+});
+it('fails closed when GET invalidation throws, is hostile, or rejects before replay', async () => {
+  const thrower = {
+    getToken: () => Promise.resolve(A(TOKEN)),
+    invalidate: (): void => {
+      throw new Error(BODY);
+    },
+  };
+  const hostileInv = {
+    getToken: () => Promise.resolve(A(TOKEN)),
+    invalidate: (): void => undefined,
+  };
+  Object.defineProperty(hostileInv, 'invalidate', {
+    get: () => {
+      throw new Error(BODY);
+    },
+  });
+  const rejects = {
+    getToken: jest.fn(() => Promise.resolve(A(TOKEN))),
+    invalidate: jest.fn(() => Promise.reject(new Error(BODY))),
+  };
+  for (const source of [thrower, hostileInv, rejects]) {
+    const h = make([r(401), comp([])], undefined, source);
+    const result = await h.client.poll(GID);
+    expect(result).toEqual(pollErr({ kind: 'malformed_response' }));
+    expect(h.calls).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain(BODY);
+  }
+});
+it('waits for a deferred GET invalidation before refreshing and replaying', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const source = {
+    getToken: jest.fn(() => Promise.resolve(A(TOKEN))),
+    invalidate: jest.fn(() => gate),
+  };
+  const h = make([r(401), comp([])], undefined, source);
+  const pending = h.client.poll(GID);
+  await new Promise<void>((resolve) => setTimeout(() => resolve(), 0));
+  expect(source.invalidate).toHaveBeenCalledWith(TOKEN);
+  expect(source.getToken).toHaveBeenCalledTimes(1);
+  expect(h.calls).toHaveLength(1);
+  release();
+  await expect(pending).resolves.toEqual(completed([]));
+  expect(source.getToken).toHaveBeenCalledTimes(2);
+  expect(h.calls).toHaveLength(2);
+});
+it('fails closed when the refreshed GET token acquisition rejects', async () => {
+  let n = 0;
+  const source = {
+    getToken: () => {
+      n += 1;
+      return n === 1
+        ? Promise.resolve(A(TOKEN))
+        : Promise.reject(new Error(BODY));
+    },
+    invalidate: () => undefined,
+  };
+  const h = make([r(401), comp([])], undefined, source);
+  const result = await h.client.poll(GID);
+  expect(result).toEqual(pollErr({ kind: 'malformed_response' }));
+  expect(h.calls).toHaveLength(1);
+  expect(JSON.stringify(result)).not.toContain(BODY);
+});
+it('never invalidates or refreshes on any non-401 poll outcome', async () => {
+  // prettier-ignore
+  const scripts: Script[] = [
+    [inc(), comp([])], [r(403)], [r(400)], [r(404)], [r(422)], [r(429)],
+    [r(500)], [fail('ECONNREFUSED')], [fail('ECONNABORTED')],
+    [g({ id: GID, is_completed: true, rates: 1 })],
+  ];
+  for (const script of scripts) {
+    const h = make(script);
+    await h.client.poll(GID);
+    expect(h.invalidate).not.toHaveBeenCalled();
+    expect(h.getToken).toHaveBeenCalledTimes(1);
+  }
+});
+it('preserves the exact id, url, and validated timeout across a mutable-config replay', async () => {
+  let reads = 0;
+  // prettier-ignore
+  const config = { get baseUrl() { reads += 1; return reads === 1 ? 'https://one.example/' : 'https://two.example/'; }, timeoutMs: 5_000 } as SkydropxQuotationClientConfig;
+  const h = make(
+    [r(401), comp([])],
+    [A(TOKEN), A('tok-2')],
+    undefined,
+    undefined,
+    config,
+  );
+  await expect(h.client.poll(GID)).resolves.toEqual(completed([]));
+  expect(reads).toBe(1);
+  expect(h.calls.map((c) => c.url)).toEqual([
+    'https://one.example/api/v1/quotations/q-1',
+    'https://one.example/api/v1/quotations/q-1',
+  ]);
+  expect(h.calls.map((c) => c.timeout)).toEqual([5_000, 5_000]);
+});
+it('never leaks tokens, provider text, or thrown text through a GET recovery', async () => {
+  const leaked = { kind: 'auth_failed', token: SECRET };
+  // prettier-ignore
+  const results: unknown[] = [
+    await make([r(401, {}, { body: BODY }), g({ id: GID, is_completed: true, rates: [{ service: 'x' }], address_to: BODY })], [A(TOKEN), A('tok-2')]).client.poll(GID),
+    await make([r(401), r(500, {}, { body: BODY })], [A(TOKEN), A('tok-2')]).client.poll(GID),
+    await make([r(401), comp([])], [A(TOKEN), { kind: 'error', error: leaked as ShippingQuoteError }]).client.poll(GID),
+  ];
+  for (const result of results) {
+    const text = JSON.stringify(result);
+    expect(text.includes(SECRET) || text.includes(BODY)).toBe(false);
   }
 });

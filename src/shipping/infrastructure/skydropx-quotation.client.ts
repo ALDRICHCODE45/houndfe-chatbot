@@ -1,4 +1,4 @@
-/** SQ-3B1/SQ-3B2/SQ-3B3a Skydropx V1 quotation lifecycle: injectable HTTP seam, structural getToken dependency, JSON bearer POST with one-time 401 recovery, plus bounded GET polling with a fixed cadence, path-safe ids, finite status/abort mapping, and a bounded shallow provider-rate snapshot. One-time GET 401 recovery remains SQ-3B3b. */
+/** SQ-3B1/SQ-3B2/SQ-3B3a/SQ-3B3b Skydropx V1 quotation lifecycle: injectable HTTP seam, structural getToken dependency, JSON bearer POST with one-time 401 recovery, plus bounded GET polling with a fixed cadence, path-safe ids, finite status/abort mapping, a bounded shallow provider-rate snapshot, and one-time GET 401 token recovery. */
 import type { ShippingQuoteError } from '../domain/shipping-quote.error';
 import { normalizeShippingQuoteError } from '../domain/shipping-quote.error';
 import {
@@ -79,6 +79,7 @@ type PostOutcome =
 type PollGet =
   | { readonly kind: 'complete'; readonly providerRates: readonly unknown[] }
   | { readonly kind: 'incomplete' }
+  | { readonly kind: 'unauthorized' }
   | { readonly kind: 'terminal'; readonly result: SkydropxQuotationPollResult };
 const done = (result: SkydropxQuotationResult): PostOutcome => ({
   kind: 'done',
@@ -196,9 +197,12 @@ export class SkydropxQuotationClient {
     }
   };
   /**
-   * SQ-3B3a bounded GET polling. Always performs at least one GET: the caller
-   * cannot skip polling from a create-time completion flag. A definite GET 401
-   * is terminal here; SQ-3B3b adds one-time recovery separately.
+   * SQ-3B3a/SQ-3B3b bounded GET polling with one-time 401 recovery. Always
+   * performs at least one GET: the caller cannot skip polling from a
+   * create-time completion flag. A definite GET 401 triggers a single
+   * invalidate/refresh/replay; the replay reuses the exact path and validated
+   * timeout, is outside the attempt budget, and never adds sleep, so the total
+   * GET bound across one poll call is at most the attempt cap plus one.
    */
   poll = async (quotationId: string): Promise<SkydropxQuotationPollResult> => {
     try {
@@ -206,13 +210,25 @@ export class SkydropxQuotationClient {
         return pollEr({ kind: 'invalid_request', field: 'unknown' });
       const timeoutMs = readPollTimeout(this.config);
       if (timeoutMs === null) return pollEr({ kind: 'provider_disabled' });
+      const baseUrl = this.config.baseUrl.replace(/\/+$/, '');
       const token = await this.token();
       if (token.kind === 'error') return pollEr(asError(token.result));
+      let accessToken = token.accessToken;
+      let recovered = false;
       let attempt = 0;
       while (attempt < SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS) {
         attempt += 1;
         // prettier-ignore
-        const outcome = await this.getQuotation(quotationId, token.accessToken, timeoutMs);
+        let outcome = await this.getQuotation(baseUrl, quotationId, accessToken, timeoutMs);
+        if (outcome.kind === 'unauthorized' && !recovered) {
+          recovered = true;
+          const refreshed = await this.refresh(accessToken);
+          if (refreshed.kind === 'error')
+            return pollEr(asError(refreshed.result));
+          accessToken = refreshed.accessToken;
+          // prettier-ignore
+          outcome = await this.getQuotation(baseUrl, quotationId, accessToken, timeoutMs);
+        }
         if (outcome.kind === 'terminal') return outcome.result;
         if (outcome.kind === 'complete')
           return {
@@ -220,6 +236,8 @@ export class SkydropxQuotationClient {
             quotationId,
             providerRates: outcome.providerRates,
           };
+        if (outcome.kind === 'unauthorized')
+          return pollEr({ kind: 'auth_failed' });
         if (attempt >= SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS) break;
         try {
           await this.sleep(SKYDROPX_QUOTATION_POLL_INTERVAL_MS);
@@ -237,25 +255,31 @@ export class SkydropxQuotationClient {
     }
   };
   /**
-   * One-time recovery after a definite 401; never replays with a stale token.
-   * The invalidation result is assimilated before refreshing so an async or
-   * deferred callback cannot let refresh/replay precede invalidation, and a
-   * rejected thenable fails closed instead of escaping as an unhandled
-   * rejection.
+   * One-time POST recovery after a definite 401; never replays with a stale
+   * token and returns auth_failed if the replay is unauthorized again.
    */
   private async recover(
     payload: SkydropxQuotationPayload,
     staleAccessToken: string,
   ): Promise<SkydropxQuotationResult> {
-    try {
-      await Promise.resolve(this.tokens.invalidate(staleAccessToken));
-    } catch {
-      return malformed();
-    }
-    const refreshed = await this.token();
+    const refreshed = await this.refresh(staleAccessToken);
     if (refreshed.kind === 'error') return refreshed.result;
     const replay = await this.post(payload, refreshed.accessToken);
     return replay.kind === 'done' ? replay.result : er({ kind: 'auth_failed' });
+  }
+  /**
+   * Assimilate the invalidation of exactly one stale token before acquiring a
+   * replacement, so a synchronous throw, hostile getter, rejected thenable, or
+   * deferred callback cannot let refresh/replay precede invalidation. Any
+   * invalidation failure yields a finite malformed error for the caller.
+   */
+  private async refresh(staleAccessToken: string): Promise<TokenOutcome> {
+    try {
+      await Promise.resolve(this.tokens.invalidate(staleAccessToken));
+    } catch {
+      return { kind: 'error', result: malformed() };
+    }
+    return this.token();
   }
   private async token(): Promise<TokenOutcome> {
     try {
@@ -317,6 +341,7 @@ export class SkydropxQuotationClient {
     return done(malformed());
   }
   private async getQuotation(
+    baseUrl: string,
     quotationId: string,
     accessToken: string,
     timeoutMs: number,
@@ -325,7 +350,7 @@ export class SkydropxQuotationClient {
     try {
       response = await this.http({
         method: 'GET',
-        url: `${this.config.baseUrl.replace(/\/+$/, '')}/api/v1/quotations/${quotationId}`,
+        url: `${baseUrl}/api/v1/quotations/${quotationId}`,
         headers: {
           'content-type': 'application/json',
           authorization: `Bearer ${accessToken}`,
@@ -341,8 +366,8 @@ export class SkydropxQuotationClient {
     const status = readStatus(response);
     if (status === null) return terminal(malformedPoll());
     if (status === 200) return this.readPolled(response, quotationId);
-    if (status === 401 || status === 403)
-      return terminal(pollEr({ kind: 'auth_failed' }));
+    if (status === 401) return { kind: 'unauthorized' };
+    if (status === 403) return terminal(pollEr({ kind: 'auth_failed' }));
     if (status === 400 || status === 404 || status === 422)
       return terminal(pollEr({ kind: 'invalid_request', field: 'unknown' }));
     if (status === 429)
