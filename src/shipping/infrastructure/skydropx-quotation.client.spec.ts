@@ -2,8 +2,13 @@
 import axios, { type AxiosRequestConfig } from 'axios';
 import type { ShippingQuoteError } from '../domain/shipping-quote.error';
 import {
+  SKYDROPX_QUOTATION_MAX_RATES,
+  SKYDROPX_QUOTATION_POLL_INTERVAL_MS,
+  SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS,
   SkydropxQuotationClient,
+  type SkydropxQuotationClientConfig,
   type SkydropxQuotationPayload,
+  type SkydropxQuotationPollResult,
   type SkydropxQuotationTokenSource,
 } from './skydropx-quotation.client';
 import type {
@@ -53,6 +58,10 @@ const make = (
   script: Script,
   tokenResults: SkydropxTokenResult[] = [A(TOKEN)],
   override?: SkydropxQuotationTokenSource,
+  sleep: (milliseconds: number) => Promise<void> = jest.fn(() =>
+    Promise.resolve(),
+  ),
+  config: SkydropxQuotationClientConfig = CONFIG,
 ) => {
   const calls: AxiosRequestConfig[] = [];
   let i = 0;
@@ -74,8 +83,8 @@ const make = (
   const invalidate = jest.fn();
   const defaults = { getToken, invalidate };
   const tokens: SkydropxQuotationTokenSource = override ?? defaults;
-  const client = new SkydropxQuotationClient(CONFIG, tokens, http);
-  return { client, calls, getToken, invalidate };
+  const client = new SkydropxQuotationClient(config, tokens, http, sleep);
+  return { client, calls, getToken, invalidate, sleep };
 };
 const run = (script: Script, tokens?: SkydropxTokenResult[]) =>
   make(script, tokens).client.create(PAYLOAD);
@@ -337,5 +346,223 @@ it('never leaks tokens, payload values, provider text, or thrown text', async ()
     const text = JSON.stringify(result);
     expect(text).not.toContain(SECRET);
     expect(text).not.toContain(BODY);
+  }
+});
+const GID = 'q-1';
+const g = (data: unknown): SkydropxHttpResponse => ({ status: 200, data });
+const inc = (id = GID): SkydropxHttpResponse => g({ id, is_completed: false });
+const comp = (rates: unknown, id = GID): SkydropxHttpResponse =>
+  g({ id, is_completed: true, rates });
+// prettier-ignore
+const completed = (providerRates: readonly unknown[], quotationId = GID): SkydropxQuotationPollResult => ({ kind: 'completed', quotationId, providerRates });
+// prettier-ignore
+const pollErr = (error: ShippingQuoteError): SkydropxQuotationPollResult => ({ kind: 'error', error });
+// prettier-ignore
+const nameAbort = (): Error => Object.assign(new Error(BODY), { name: 'AbortError' });
+// prettier-ignore
+const throwSleep = (thrown: Error): jest.Mock => jest.fn((): Promise<void> => { throw thrown; });
+// prettier-ignore
+const rejectSleep = (thrown: Error): jest.Mock => jest.fn(() => Promise.reject(thrown));
+// prettier-ignore
+const noSeams = (h: ReturnType<typeof make>) => { expect(h.getToken).not.toHaveBeenCalled(); expect(h.calls).toHaveLength(0); expect(h.sleep).not.toHaveBeenCalled(); };
+// prettier-ignore
+const terminalOnce = (result: unknown, expected: unknown, h: ReturnType<typeof make>) => { expect(result).toEqual(expected); expect(h.calls).toHaveLength(1); expect(h.getToken).toHaveBeenCalledTimes(1); expect(h.invalidate).not.toHaveBeenCalled(); expect(h.sleep).not.toHaveBeenCalled(); expect(JSON.stringify(result)).not.toContain(BODY); };
+// prettier-ignore
+const failedOnce = (result: unknown, expected: unknown, h: ReturnType<typeof make>, sleep: jest.Mock) => { expect(result).toEqual(expected); expect(h.calls).toHaveLength(1); expect(sleep).toHaveBeenCalledTimes(1); expect(JSON.stringify(result)).not.toContain(BODY); };
+it('rejects invalid poll ids without a token, GET, or sleep', async () => {
+  // prettier-ignore
+  const bad: unknown[] = [
+    '', '   ', ' q-1', 'q-1 ', 'q 1', 'a/b', 'a?b', 'a#b', '../x', '..',
+    'a.b', 'a\r\nb', 'a\tb', 'a\u0000b', 'a\u007fb', 'aé', 'q'.repeat(129),
+    1, null, undefined, {}, ['q-1'],
+  ];
+  for (const id of bad) {
+    const h = make([comp([])]);
+    // prettier-ignore
+    await expect(h.client.poll(id as string)).resolves.toEqual(pollErr({ kind: 'invalid_request', field: 'unknown' }));
+    noSeams(h);
+  }
+});
+it('always performs at least one GET and returns a bounded shallow rate snapshot', async () => {
+  const rates = [{ service: 'fedex' }, { service: 'dhl' }];
+  const body = { id: GID, is_completed: true, rates, address_to: BODY };
+  const h = make([g(body)]);
+  const result = await h.client.poll(GID);
+  expect(result).toEqual(completed(rates));
+  expect(h.getToken).toHaveBeenCalledTimes(1);
+  expect(h.calls).toHaveLength(1);
+  // prettier-ignore
+  expect(h.calls[0]).toMatchObject({ method: 'GET', url: 'https://api-pro.skydropx.com/api/v1/quotations/q-1', timeout: 5_000, headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` } });
+  expect(h.calls[0].data).toBeUndefined();
+  expect(h.sleep).not.toHaveBeenCalled();
+  expect(JSON.stringify(result)).not.toContain(BODY);
+  // prettier-ignore
+  if (result.kind === 'completed') { expect(result.providerRates).not.toBe(rates); expect(result.providerRates[0]).toBe(rates[0]); }
+});
+it('sleeps once between incomplete attempts until the response completes', async () => {
+  const h = make([inc(), inc(), comp([{ a: 1 }])]);
+  await expect(h.client.poll(GID)).resolves.toEqual(completed([{ a: 1 }]));
+  expect(h.calls).toHaveLength(3);
+  // prettier-ignore
+  expect((h.sleep as jest.Mock).mock.calls).toEqual([[SKYDROPX_QUOTATION_POLL_INTERVAL_MS], [SKYDROPX_QUOTATION_POLL_INTERVAL_MS]]);
+});
+it('times out after the bounded attempts without a final sleep', async () => {
+  const h = make([inc()]);
+  // prettier-ignore
+  await expect(h.client.poll(GID)).resolves.toEqual(pollErr({ kind: 'timeout' }));
+  expect(h.calls).toHaveLength(SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS);
+  // prettier-ignore
+  expect(h.sleep).toHaveBeenCalledTimes(SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS - 1);
+});
+it('fails closed immediately when the sleep seam throws or rejects', async () => {
+  // prettier-ignore
+  const cases: Array<[jest.Mock, unknown]> = [
+    [throwSleep(new Error(BODY)), up(null)], [throwSleep(nameAbort()), timeout],
+    [throwSleep(fail('ECONNABORTED')), timeout], [rejectSleep(new Error(BODY)), up(null)],
+    [rejectSleep(nameAbort()), timeout], [rejectSleep(fail('ETIMEDOUT')), timeout],
+  ];
+  for (const [sleep, expected] of cases) {
+    const h = make([inc(), comp([])], undefined, undefined, sleep);
+    const result = await h.client.poll(GID);
+    failedOnce(result, expected, h, sleep);
+  }
+});
+it('maps every terminal GET status, abort, and network outcome to one no-sleep error', async () => {
+  // prettier-ignore
+  const cases: Array<[Script, unknown]> = [
+    [[r(400)], ireq], [[r(404)], ireq], [[r(422)], ireq], [[r(401)], auth], [[r(403)], auth],
+    [[r(429, { 'retry-after': '30' })], rate(30)], [[r(429, { 'Retry-After': '7' })], rate(7)],
+    [[r(429, { 'retry-after': 'soon' })], rate(null)], [[r(429)], rate(null)],
+    [[r(500)], up(500)], [[r(503)], up(503)],
+    [[r(201)], mal], [[r(204)], mal], [[r(300)], mal], [[r(0)], mal], [[r(600)], mal],
+    [[r(Number.NaN)], mal], [[r('200')], mal], [[hostile(r(200, undefined, {}), 'status')], mal],
+    [[fail('ECONNREFUSED')], up(null)], [[fail('ECONNABORTED')], timeout],
+    [[fail('ETIMEDOUT')], timeout], [[fail('ERR_CANCELED')], timeout], [[{ name: 'AbortError' }], timeout],
+  ];
+  for (const [script, expected] of cases) {
+    const h = make(script);
+    const result = await h.client.poll(GID);
+    terminalOnce(result, expected, h);
+  }
+});
+it('rejects malformed, mismatched, hostile, sparse, and oversized poll bodies', async () => {
+  // prettier-ignore
+  const proxy = new Proxy([{ a: 1 }], { get: (target: unknown[], key: string | symbol): unknown => (key === 'length' ? SKYDROPX_QUOTATION_MAX_RATES + 1 : Reflect.get(target, key)) });
+  // prettier-ignore
+  const bad: unknown[] = [
+    'nope', [], null, {}, { id: GID }, { is_completed: true, rates: [] },
+    { id: '', is_completed: true, rates: [] }, { id: 'q-2', is_completed: true, rates: [] },
+    { id: 'q'.repeat(129), is_completed: true, rates: [] }, { id: GID, is_completed: 'true', rates: [] },
+    { id: GID, is_completed: true }, { id: GID, is_completed: true, rates: 'nope' },
+    { id: GID, is_completed: true, rates: Object.assign(new Array(3), { 0: { x: 1 } }) }, { id: GID, is_completed: true, rates: new Array(1) },
+    { id: GID, is_completed: true, rates: proxy },
+    { id: GID, is_completed: true, rates: new Array(SKYDROPX_QUOTATION_MAX_RATES + 1).fill({ a: 1 }) },
+    hostile({ id: GID, is_completed: true, rates: [] }, 'id'),
+    hostile({ id: GID, is_completed: true, rates: [] }, 'is_completed'),
+    hostile({ id: GID, is_completed: true, rates: [] }, 'rates'),
+    Object.create({ id: GID, is_completed: true, rates: [] }),
+  ];
+  for (const data of bad) {
+    const h = make([g(data)]);
+    await expect(h.client.poll(GID)).resolves.toEqual(mal);
+    expect(h.calls).toHaveLength(1);
+    expect(h.sleep).not.toHaveBeenCalled();
+  }
+  // prettier-ignore
+  const dense = new Array(SKYDROPX_QUOTATION_MAX_RATES).fill(0).map((_, i) => ({ i }));
+  // prettier-ignore
+  for (const r of [dense, []]) await expect(make([comp(r)]).client.poll(GID)).resolves.toEqual(completed(r));
+});
+it('snapshots each rate element exactly once', async () => {
+  let reads = 0;
+  const rates: unknown[] = [{}];
+  // prettier-ignore
+  Object.defineProperty(rates, 0, { configurable: true, get: () => { reads += 1; if (reads > 1) throw new Error(BODY); return { once: true }; } });
+  const result = await make([comp(rates)]).client.poll(GID);
+  expect(reads).toBe(1);
+  expect(result).toEqual(completed([{ once: true }]));
+});
+it('returns token errors unchanged and fails closed on hostile tokens with zero GET', async () => {
+  // prettier-ignore
+  const errs: ShippingQuoteError[] = [{ kind: 'provider_disabled' }, { kind: 'rate_limited', retryAfterSeconds: 7 }, { kind: 'auth_failed' }];
+  for (const error of errs) {
+    const h = make([comp([])], [{ kind: 'error', error }]);
+    await expect(h.client.poll(GID)).resolves.toEqual(pollErr(error));
+    expect(h.calls).toHaveLength(0);
+    expect(h.sleep).not.toHaveBeenCalled();
+  }
+  // prettier-ignore
+  const boom = (): never => { throw new Error(BODY); };
+  // prettier-ignore
+  const rejects = (): Promise<SkydropxTokenResult> => Promise.reject(new Error(BODY));
+  // prettier-ignore
+  const overrides: SkydropxQuotationTokenSource[] = [
+    { getToken: boom, invalidate: () => undefined }, { getToken: rejects, invalidate: () => undefined },
+    { getToken: () => Promise.resolve(hostileToken('kind')), invalidate: () => undefined },
+    { getToken: () => Promise.resolve(hostileToken('accessToken')), invalidate: () => undefined },
+    { getToken: () => Promise.resolve(hostileErr()), invalidate: () => undefined },
+  ];
+  // prettier-ignore
+  const tokens: unknown[] = [
+    'nope', null, {}, { kind: 'token' }, { kind: 'token', accessToken: 1 },
+    { kind: 'token', accessToken: '' }, { kind: 'token', accessToken: 'x'.repeat(4097) },
+    { kind: 'token', accessToken: ' tok' }, { kind: 'token', accessToken: 'tok\u0000' },
+    { kind: 'token', accessToken: 'toké' }, { kind: 'bogus' },
+  ];
+  const results: unknown[] = [];
+  for (const o of overrides) {
+    const h = make([comp([])], undefined, o);
+    results.push(await h.client.poll(GID));
+    expect(h.calls).toHaveLength(0);
+  }
+  for (const value of tokens) {
+    const h = make([comp([])], [value as SkydropxTokenResult]);
+    results.push(await h.client.poll(GID));
+    expect(h.calls).toHaveLength(0);
+  }
+  for (const result of results) {
+    expect(JSON.stringify(result)).toBe(JSON.stringify(mal));
+  }
+});
+it('never leaks tokens, payload, addresses, provider, or thrown text through poll results', async () => {
+  const leaked = { kind: 'auth_failed', token: SECRET };
+  // prettier-ignore
+  const results: unknown[] = [
+    await make([g({ id: GID, is_completed: true, rates: [{ service: 'x' }], address_to: BODY })]).client.poll(GID),
+    await make([inc(), g({ id: GID, is_completed: true, rates: [] })]).client.poll(GID),
+    await make([r(500, {}, { body: BODY })]).client.poll(GID),
+    await make([fail('ECONNREFUSED')]).client.poll(GID),
+    await make([comp([])], [{ kind: 'error', error: leaked as ShippingQuoteError }]).client.poll(GID),
+  ];
+  for (const result of results) {
+    const text = JSON.stringify(result);
+    expect(text.includes(SECRET) || text.includes(BODY)).toBe(false);
+  }
+});
+// prettier-ignore
+const mk = (timeoutMs: unknown) => make([comp([])], undefined, undefined, undefined, { baseUrl: CONFIG.baseUrl, timeoutMs: timeoutMs as number });
+it('validates the runtime poll timeout before any seam and forwards the exact boundaries', async () => {
+  // prettier-ignore
+  const bad: unknown[] = [
+    0, -1, -0, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1, 60_001, 60_000.5, '5000', null, undefined, true, {}, [],
+    new Number(5_000), { valueOf: () => 5_000 }, { valueOf: () => { throw new Error(BODY); } },
+  ];
+  for (const timeoutMs of bad) {
+    const h = mk(timeoutMs);
+    // prettier-ignore
+    await expect(h.client.poll(GID)).resolves.toEqual(pollErr({ kind: 'provider_disabled' }));
+    noSeams(h);
+  }
+  // prettier-ignore
+  const hostile: SkydropxQuotationClientConfig = Object.defineProperty({ baseUrl: CONFIG.baseUrl }, 'timeoutMs', { get: () => { throw new Error(BODY); } }) as SkydropxQuotationClientConfig;
+  const h = make([comp([])], undefined, undefined, undefined, hostile);
+  // prettier-ignore
+  await expect(h.client.poll(GID)).resolves.toEqual(pollErr({ kind: 'provider_disabled' }));
+  noSeams(h);
+  for (const timeoutMs of [1, 60_000]) {
+    const h = mk(timeoutMs);
+    await expect(h.client.poll(GID)).resolves.toEqual(completed([]));
+    expect(h.calls.map((c) => c.timeout)).toEqual([timeoutMs]);
   }
 });

@@ -1,4 +1,4 @@
-/** SQ-3B1 Skydropx V1 quotation-creation core: injectable HTTP seam, structural getToken dependency, JSON bearer POST, strict 201 parsing, finite status/abort mapping, no retries, and a fail-closed secret-safe result. One-time 401 recovery (SQ-3B2) and polling (SQ-3B3) live elsewhere. */
+/** SQ-3B1/SQ-3B2/SQ-3B3a Skydropx V1 quotation lifecycle: injectable HTTP seam, structural getToken dependency, JSON bearer POST with one-time 401 recovery, plus bounded GET polling with a fixed cadence, path-safe ids, finite status/abort mapping, and a bounded shallow provider-rate snapshot. One-time GET 401 recovery remains SQ-3B3b. */
 import type { ShippingQuoteError } from '../domain/shipping-quote.error';
 import { normalizeShippingQuoteError } from '../domain/shipping-quote.error';
 import {
@@ -30,6 +30,14 @@ export interface SkydropxQuotationPayload {
 export type SkydropxQuotationResult =
   | { readonly kind: 'created'; readonly quotationId: string }
   | { readonly kind: 'error'; readonly error: ShippingQuoteError };
+/** SQ-3B3a internal/provider-facing completed poll: only the id plus a shallow rate snapshot. SQ-3C normalizes the raw elements. */
+export type SkydropxQuotationPollResult =
+  | {
+      readonly kind: 'completed';
+      readonly quotationId: string;
+      readonly providerRates: readonly unknown[];
+    }
+  | { readonly kind: 'error'; readonly error: ShippingQuoteError };
 /** Minimal structural view of the token client; it is never constructed here. */
 export type SkydropxQuotationTokenSource = Pick<
   SkydropxTokenClient,
@@ -39,7 +47,16 @@ export interface SkydropxQuotationClientConfig {
   readonly baseUrl: string;
   readonly timeoutMs: number;
 }
+export const SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS = 5;
+export const SKYDROPX_QUOTATION_POLL_INTERVAL_MS = 1_000;
+export const SKYDROPX_QUOTATION_MAX_RATES = 100;
 const MAX_QUOTATION_ID_LENGTH = 128;
+const QUOTATION_ID = /^[A-Za-z0-9_-]+$/;
+const isPathSafeId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= MAX_QUOTATION_ID_LENGTH &&
+  QUOTATION_ID.test(value);
 const MAX_TOKEN_LENGTH = 4096;
 const BEARER_TOKEN = /^[A-Za-z0-9._~+/-]+=*$/;
 const isBearerToken = (value: unknown): value is string =>
@@ -47,6 +64,11 @@ const isBearerToken = (value: unknown): value is string =>
   value.length > 0 &&
   value.length <= MAX_TOKEN_LENGTH &&
   BEARER_TOKEN.test(value);
+const isRateCount = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const MAX_POLL_TIMEOUT_MS = 60_000;
+// prettier-ignore
+const readPollTimeout = (config: SkydropxQuotationClientConfig): number | null => { try { const v: unknown = config.timeoutMs; return typeof v === 'number' && Number.isSafeInteger(v) && v > 0 && v <= MAX_POLL_TIMEOUT_MS ? v : null; } catch { return null; } };
 const TIMEOUT_CODES = new Set(['ECONNABORTED', 'ERR_CANCELED', 'ETIMEDOUT']);
 type TokenOutcome =
   | { readonly kind: 'token'; readonly accessToken: string }
@@ -54,6 +76,10 @@ type TokenOutcome =
 type PostOutcome =
   | { readonly kind: 'done'; readonly result: SkydropxQuotationResult }
   | { readonly kind: 'unauthorized' };
+type PollGet =
+  | { readonly kind: 'complete'; readonly providerRates: readonly unknown[] }
+  | { readonly kind: 'incomplete' }
+  | { readonly kind: 'terminal'; readonly result: SkydropxQuotationPollResult };
 const done = (result: SkydropxQuotationResult): PostOutcome => ({
   kind: 'done',
   result,
@@ -107,23 +133,54 @@ const parseCreated = (data: unknown): SkydropxQuotationResult => {
     if (!isObject(data)) return malformed();
     const id: unknown = data.id;
     const done: unknown = data.is_completed;
-    if (typeof id !== 'string' || id.length === 0 || id !== id.trim())
-      return malformed();
-    if (id.length > MAX_QUOTATION_ID_LENGTH || typeof done !== 'boolean')
-      return malformed();
+    if (!isPathSafeId(id) || typeof done !== 'boolean') return malformed();
     return { kind: 'created', quotationId: id };
   } catch {
     return malformed();
   }
 };
+const pollEr = (error: ShippingQuoteError): SkydropxQuotationPollResult => ({
+  kind: 'error',
+  error,
+});
+const malformedPoll = (): SkydropxQuotationPollResult =>
+  pollEr({ kind: 'malformed_response' });
+const asError = (result: SkydropxQuotationResult): ShippingQuoteError =>
+  result.kind === 'error' ? result.error : { kind: 'malformed_response' };
+const terminal = (result: SkydropxQuotationPollResult): PollGet => ({
+  kind: 'terminal',
+  result,
+});
+/** Shallow-snapshot a dense provider rates array, reading each element once; sparse, proxied, or oversized arrays are rejected. */
+const snapshotRates = (value: unknown): readonly unknown[] | null => {
+  try {
+    if (!Array.isArray(value)) return null;
+    const source = value as readonly unknown[];
+    const rawLength: unknown = source.length;
+    if (!isRateCount(rawLength) || rawLength > SKYDROPX_QUOTATION_MAX_RATES)
+      return null;
+    const out: unknown[] = [];
+    for (let i = 0; i < rawLength; i += 1) {
+      if (!Object.prototype.hasOwnProperty.call(source, i)) return null;
+      out.push(source[i]);
+    }
+    return Object.freeze(out);
+  } catch {
+    return null;
+  }
+};
 export class SkydropxQuotationClient {
   private readonly http: SkydropxHttp;
+  private readonly sleep: (milliseconds: number) => Promise<void>;
   constructor(
     private readonly config: SkydropxQuotationClientConfig,
     private readonly tokens: SkydropxQuotationTokenSource,
     http?: SkydropxHttp,
+    sleep?: (milliseconds: number) => Promise<void>,
   ) {
     this.http = http ?? defaultSkydropxHttp;
+    this.sleep =
+      sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
   create = async (
     payload: SkydropxQuotationPayload,
@@ -136,6 +193,47 @@ export class SkydropxQuotationClient {
       return await this.recover(payload, initial.accessToken);
     } catch {
       return er({ kind: 'upstream_unavailable', httpStatus: null });
+    }
+  };
+  /**
+   * SQ-3B3a bounded GET polling. Always performs at least one GET: the caller
+   * cannot skip polling from a create-time completion flag. A definite GET 401
+   * is terminal here; SQ-3B3b adds one-time recovery separately.
+   */
+  poll = async (quotationId: string): Promise<SkydropxQuotationPollResult> => {
+    try {
+      if (!isPathSafeId(quotationId))
+        return pollEr({ kind: 'invalid_request', field: 'unknown' });
+      const timeoutMs = readPollTimeout(this.config);
+      if (timeoutMs === null) return pollEr({ kind: 'provider_disabled' });
+      const token = await this.token();
+      if (token.kind === 'error') return pollEr(asError(token.result));
+      let attempt = 0;
+      while (attempt < SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS) {
+        attempt += 1;
+        // prettier-ignore
+        const outcome = await this.getQuotation(quotationId, token.accessToken, timeoutMs);
+        if (outcome.kind === 'terminal') return outcome.result;
+        if (outcome.kind === 'complete')
+          return {
+            kind: 'completed',
+            quotationId,
+            providerRates: outcome.providerRates,
+          };
+        if (attempt >= SKYDROPX_QUOTATION_POLL_MAX_ATTEMPTS) break;
+        try {
+          await this.sleep(SKYDROPX_QUOTATION_POLL_INTERVAL_MS);
+        } catch (thrown) {
+          return pollEr(
+            isTimeout(thrown)
+              ? { kind: 'timeout' }
+              : { kind: 'upstream_unavailable', httpStatus: null },
+          );
+        }
+      }
+      return pollEr({ kind: 'timeout' });
+    } catch {
+      return pollEr({ kind: 'upstream_unavailable', httpStatus: null });
     }
   };
   /**
@@ -217,5 +315,62 @@ export class SkydropxQuotationClient {
     if (status >= 500)
       return done(er({ kind: 'upstream_unavailable', httpStatus: status }));
     return done(malformed());
+  }
+  private async getQuotation(
+    quotationId: string,
+    accessToken: string,
+    timeoutMs: number,
+  ): Promise<PollGet> {
+    let response: SkydropxHttpResponse;
+    try {
+      response = await this.http({
+        method: 'GET',
+        url: `${this.config.baseUrl.replace(/\/+$/, '')}/api/v1/quotations/${quotationId}`,
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${accessToken}`,
+        },
+        timeout: timeoutMs,
+      });
+    } catch (thrown) {
+      if (isTimeout(thrown)) return terminal(pollEr({ kind: 'timeout' }));
+      return terminal(
+        pollEr({ kind: 'upstream_unavailable', httpStatus: null }),
+      );
+    }
+    const status = readStatus(response);
+    if (status === null) return terminal(malformedPoll());
+    if (status === 200) return this.readPolled(response, quotationId);
+    if (status === 401 || status === 403)
+      return terminal(pollEr({ kind: 'auth_failed' }));
+    if (status === 400 || status === 404 || status === 422)
+      return terminal(pollEr({ kind: 'invalid_request', field: 'unknown' }));
+    if (status === 429)
+      return terminal(
+        pollEr({
+          kind: 'rate_limited',
+          retryAfterSeconds: readRetryAfter(response),
+        }),
+      );
+    if (status >= 500)
+      return terminal(
+        pollEr({ kind: 'upstream_unavailable', httpStatus: status }),
+      );
+    return terminal(malformedPoll());
+  }
+  private readPolled(response: unknown, quotationId: string): PollGet {
+    try {
+      const data = field(response, 'data');
+      if (!isObject(data)) return terminal(malformedPoll());
+      if (field(data, 'id') !== quotationId) return terminal(malformedPoll());
+      const complete: unknown = field(data, 'is_completed');
+      if (typeof complete !== 'boolean') return terminal(malformedPoll());
+      if (!complete) return { kind: 'incomplete' };
+      const providerRates = snapshotRates(field(data, 'rates'));
+      if (providerRates === null) return terminal(malformedPoll());
+      return { kind: 'complete', providerRates };
+    } catch {
+      return terminal(malformedPoll());
+    }
   }
 }
