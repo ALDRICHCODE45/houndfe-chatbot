@@ -59,7 +59,8 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-2A-H — Harden the SQ-2A configuration contract:** make `SHIPPING_QUOTES_ENABLED` canonical case-sensitive (reject `TRUE`/`False`/`1`/padded), reject whitespace-only required strings, and trim accepted provider values consistently in Joi and the factory.
 - [x] **SQ-2B1 — Add provider-neutral shipping-quote request contracts:** immutable address/parcel/request types, exact string normalization, plain-record guards, and a readonly nonempty parcel tuple.
 - [x] **SQ-2B1-H — Harden sparse parcels handling:** reject sparse parcel arrays whose holes `Array.prototype.every` skips by visiting every index in an indexed loop.
-- [ ] **SQ-2B2 — Add the shipping-quote output/error port:** `SHIPPING_QUOTE_PROVIDER` token, port interface, and normalized rate/result/error contracts with runtime boundary validation and normalization.
+- [x] **SQ-2B2A — Add shipping-quote result normalization:** immutable rate/quoted-result contracts plus the never-throwing `normalizeShippingQuoteQuotedResult` runtime boundary (plain-record only, exact key stripping, fresh objects, canonical ISO timestamps).
+- [ ] **SQ-2B2B — Add the shipping-quote error port:** normalized error union, `SHIPPING_QUOTE_PROVIDER` token, and port interface.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
@@ -132,6 +133,14 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Scoped ESLint and Prettier `--check` over both files exit 0; `tsc --noEmit -p tsconfig.build.json` exit 0; spec diagnostic scope `tsc -p tsconfig.spec.json` reports no `shipping-quote` diagnostics; `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
 - Nonempty tuple type, exact-string normalization, other guards, and no-mutation behavior are unchanged. Native advisory `R3-live-array-length` is non-blocking and assigned to SQ-2B2's runtime-boundary work.
 
+## SQ-2B2A evidence (independent `PASS`; native-approved as `review-a925facd828e45c8`; locally delivered in this work unit)
+
+- Work unit: `shipping-quote.result` only — 124 implementation + 222 spec = 346 source lines, plus this tracker block; additions+deletions churn 358, within the 360 hard stop. Scope is result normalization only; SQ-2B2B owns the error union, `SHIPPING_QUOTE_PROVIDER` token, and port.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache shipping/domain/shipping-quote.result.spec.ts` failed with `Cannot find module './shipping-quote.result'` (1 suite failed, 0 tests); GREEN: same command — 1 suite passed, 20 tests passed. Fix round 1 corrected strict timestamp validation and getter/proxy TOCTOU snapshotting.
+- Scoped ESLint exit 0; Prettier `--check` clean; `tsc --noEmit -p tsconfig.build.json` exit 0; `tsc -p tsconfig.spec.json` reports no `shipping-quote` diagnostics (repo-wide spec baseline has unrelated pre-existing errors); `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
+- Coverage: nonblank/no-padding 128-max rate strings, 100/101 rate-count boundary, nonnegative safe `priceCents`, nullable ETA (0 same-day), `MXN`, only zoned ISO date-times canonicalized (date-only, zone-less, locale, and rollover `2026-02-30` rejected), empty/sparse/oversized/non-array rates, non-plain/class/array/primitive/throwing-getter/proxy rejection, one-read field snapshots blocking stateful-getter secret injection, extra-key stripping with a sentinel secret, fresh result/rate objects, frozen no-mutation, and live-length snapshot bounding.
+- Native advisories `R3-array-length-validation` and `R3-timestamp-boundary` are non-blocking and assigned to a separate bounded hardening before SQ-2B2B.
+
 ## Delivery gate
 
-This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B1, SQ-2B1-H, SQ-2B2, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
+This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B1, SQ-2B1-H, SQ-2B2A, SQ-2B2B, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
