@@ -49,11 +49,25 @@ function canonicalIsoOrNull(value: unknown): string | null | undefined {
   if (typeof value !== 'string') return undefined;
   const match = ISO_DATE_TIME.exec(value);
   if (match === null) return undefined;
-  const parts = [match[1], match[2], match[3], match[4]].map(Number);
-  const [year, month, day, hour] = parts;
+  const parts = [match[1], match[2], match[3], match[4], match[5]].map(Number);
+  const [year, month, day, hour, minute] = parts;
+  const second = match[6] === undefined ? 0 : Number(match[6]);
+  const zone = match[7];
+  const offsetHour = zone === 'Z' ? 0 : Number(zone.slice(1, 3));
+  const offsetMinute = zone === 'Z' ? 0 : Number(zone.slice(4, 6));
   const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
   const maxDay = month === 2 ? (leap ? 29 : 28) : DAYS_IN_MONTH[month - 1];
-  if (month < 1 || month > 12 || day < 1 || day > maxDay || hour > 23) {
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > maxDay ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  ) {
     return undefined;
   }
   const epochMs = new Date(value).getTime();
@@ -104,8 +118,16 @@ export function normalizeShippingQuoteQuotedResult(
     const rawExpiresAt: unknown = value.expiresAt;
     if (kind !== 'quoted' || !isQuoteString(quoteId)) return null;
     if (!Array.isArray(rawRates)) return null;
-    const length = rawRates.length;
-    if (length === 0 || length > MAX_RATE_COUNT) return null;
+    const rawLength: unknown = rawRates.length;
+    if (
+      typeof rawLength !== 'number' ||
+      !Number.isSafeInteger(rawLength) ||
+      rawLength < 1 ||
+      rawLength > MAX_RATE_COUNT
+    ) {
+      return null;
+    }
+    const length = rawLength;
     const firstRate = normalizeRate(rawRates[0]);
     if (firstRate === null) return null;
     const rates: [ShippingQuoteRate, ...ShippingQuoteRate[]] = [firstRate];

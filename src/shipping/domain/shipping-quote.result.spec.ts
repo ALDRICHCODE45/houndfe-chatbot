@@ -30,6 +30,13 @@ const resultWith = (over: Rec) => normalize(make(over));
 const many = (count: number): Rec[] =>
   Array.from({ length: count }, (_, i) => rate({ rateId: `r-${i}` }));
 const keys = (value: object): string => Object.keys(value).sort().join();
+const withLength = (length: unknown): Rec[] =>
+  new Proxy([rate()], {
+    get(target, property, receiver) {
+      if (property === 'length') return length;
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  });
 
 const badTimestamps = [
   'not-a-date',
@@ -38,6 +45,10 @@ const badTimestamps = [
   'Jan 2, 2026',
   '2026-13-45T00:00:00Z',
   '2026-02-30T00:00:00Z',
+  '2026-01-02T03:60:05Z',
+  '2026-01-02T03:04:60Z',
+  '2026-01-02T03:04:05+24:00',
+  '2026-01-02T03:04:05+00:60',
 ];
 const badFields: Record<string, unknown[]> = {
   rateId: ['', ' r', 'r ', 'r'.repeat(129), 42],
@@ -70,6 +81,22 @@ describe('normalizeShippingQuoteQuotedResult', () => {
     expect(normalize(make({ rates: many(100) }))?.rates).toHaveLength(100);
     expect(normalize(make({ rates: many(101) }))).toBeNull();
     expect(normalize(make({ rates: [] }))).toBeNull();
+  });
+
+  it('rejects untrusted array lengths without indexing or looping', () => {
+    for (const length of [
+      NaN,
+      1.5,
+      -1,
+      0,
+      101,
+      MAX + 1,
+      Infinity,
+      '2',
+      undefined,
+    ]) {
+      expect(normalize(make({ rates: withLength(length) }))).toBeNull();
+    }
   });
 
   it('strips extra result and rate keys including sentinel secrets', () => {
@@ -108,6 +135,10 @@ describe('normalizeShippingQuoteQuotedResult', () => {
     );
     expect(out?.expiresAt).toBe(ISO);
     expect(out?.rates[0].validUntil).toBe(ISO);
+    const negative = normalize(
+      make({ expiresAt: '2026-01-01T22:04:05-05:00' }),
+    );
+    expect(negative?.expiresAt).toBe(ISO);
     const nulls = normalize(
       make({ expiresAt: null, rates: [rate({ validUntil: null })] }),
     );
