@@ -97,8 +97,15 @@ export function isShippingQuoteRequest(
   ) {
     return false;
   }
-  if (!Array.isArray(value.parcels) || value.parcels.length === 0) {
+  const parcels: unknown = value.parcels;
+  if (!Array.isArray(parcels) || parcels.length === 0) {
     return false;
   }
-  return value.parcels.every((parcel) => isShippingQuoteParcel(parcel));
+  for (let index = 0; index < parcels.length; index += 1) {
+    const parcel: unknown = parcels[index];
+    if (!isShippingQuoteParcel(parcel)) {
+      return false;
+    }
+  }
+  return true;
 }

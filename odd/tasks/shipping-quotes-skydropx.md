@@ -58,6 +58,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-2A — Add default-off shipping-quote configuration:** typed `shippingQuotes` factory subtree plus conditional Joi validation (credentials/origin required only when enabled) with redacted secrets.
 - [x] **SQ-2A-H — Harden the SQ-2A configuration contract:** make `SHIPPING_QUOTES_ENABLED` canonical case-sensitive (reject `TRUE`/`False`/`1`/padded), reject whitespace-only required strings, and trim accepted provider values consistently in Joi and the factory.
 - [x] **SQ-2B1 — Add provider-neutral shipping-quote request contracts:** immutable address/parcel/request types, exact string normalization, plain-record guards, and a readonly nonempty parcel tuple.
+- [x] **SQ-2B1-H — Harden sparse parcels handling:** reject sparse parcel arrays whose holes `Array.prototype.every` skips by visiting every index in an indexed loop.
 - [ ] **SQ-2B2 — Add the shipping-quote output/error port:** `SHIPPING_QUOTE_PROVIDER` token, port interface, and normalized rate/result/error contracts with runtime boundary validation and normalization.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
@@ -123,6 +124,14 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Boundary scope: SQ-2B1 intentionally contains no result/rate/error/port/token; SQ-2B2 owns those with required runtime boundary validation and normalization.
 - Native advisory `R3-sparse-parcels` is non-blocking and assigned to a separate bounded hardening before SQ-2B2.
 
+## SQ-2B1-H evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-fd3ace8187628253`; locally delivered in this work unit)
+
+- Work unit: `shipping-quote.request` sparse-parcels hardening only — 1 implementation hunk + 1 spec case + these tracker lines, within the 80-line guard.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache shipping/domain/shipping-quote.request.spec.ts` — the new sparse case failed: a length-2 array with a hole and a length-1 hole-only array were both accepted because `Array.prototype.every` skips holes (1 failed / 40 passed).
+- Focused TDD GREEN: same command — 1 suite passed, 41 tests passed; request validation now visits every index with a small indexed loop, so holes are validated as `undefined` and rejected.
+- Scoped ESLint and Prettier `--check` over both files exit 0; `tsc --noEmit -p tsconfig.build.json` exit 0; spec diagnostic scope `tsc -p tsconfig.spec.json` reports no `shipping-quote` diagnostics; `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
+- Nonempty tuple type, exact-string normalization, other guards, and no-mutation behavior are unchanged. Native advisory `R3-live-array-length` is non-blocking and assigned to SQ-2B2's runtime-boundary work.
+
 ## Delivery gate
 
-This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B1, SQ-2B2, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
+This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B1, SQ-2B1-H, SQ-2B2, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.

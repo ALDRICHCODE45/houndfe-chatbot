@@ -126,6 +126,16 @@ describe('isShippingQuoteRequest', () => {
     expect(isShippingQuoteRequest({ ...req(), parcels })).toBe(false);
   });
 
+  it('rejects sparse parcels arrays whose holes every() skips', () => {
+    const gapped: unknown[] = [];
+    gapped.length = 2;
+    gapped[0] = parcel();
+    const holeOnly: unknown[] = [];
+    holeOnly.length = 1;
+    expect(isShippingQuoteRequest({ ...req(), parcels: gapped })).toBe(false);
+    expect(isShippingQuoteRequest({ ...req(), parcels: holeOnly })).toBe(false);
+  });
+
   it.each([
     { ...addr(), state: '' },
     { ...addr(), countryCode: 'mx' },
