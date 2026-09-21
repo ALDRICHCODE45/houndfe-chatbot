@@ -5,6 +5,7 @@ import {
   SkydropxTokenClient,
   type SkydropxHttp,
   type SkydropxHttpResponse,
+  type SkydropxTokenResult,
 } from './skydropx-token.client';
 const SECRET = 'SECRET_SENTINEL_9f';
 const BODY = 'BODY_SENTINEL_7a';
@@ -215,4 +216,237 @@ it('default transport resolves non-2xx via always-true validateStatus', async ()
   expect([vs?.(404), vs?.(500)]).toEqual([true, true]);
   expect(res.status).toBe(500);
   spy.mockRestore();
+});
+/* SQ-3A2 token cache, single-flight, and token-aware invalidation (mocked HTTP only). */
+const at = (accessToken: string) => ({ kind: 'token', accessToken });
+const cacheClient = (script: Script, now: () => number) => {
+  const calls: AxiosRequestConfig[] = [];
+  let i = 0;
+  const http: SkydropxHttp = (c) => {
+    calls.push(c);
+    const next = script[Math.min(i, script.length - 1)];
+    i += 1;
+    return reject(next)
+      ? Promise.reject(next)
+      : Promise.resolve(next as SkydropxHttpResponse);
+  };
+  const sleep = jest.fn(async () => undefined);
+  const client = new SkydropxTokenClient(CONFIG, { http, now, sleep });
+  return { client, calls, sleep };
+};
+const gate = () => {
+  let settle!: (value: SkydropxHttpResponse) => void;
+  const promise = new Promise<SkydropxHttpResponse>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, settle };
+};
+it('reuses a cached token with zero HTTP calls and zero sleeps', async () => {
+  const h = make([ok()]);
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(h.calls).toHaveLength(1);
+  expect(h.sleep).toHaveBeenCalledTimes(0);
+});
+it('reuses only strictly before expiry minus the 30s skew and refreshes at the boundary', async () => {
+  let clock = 0;
+  const h = cacheClient([ok(b({ expires_in: 31 }))], () => clock);
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  clock = 999;
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(h.calls).toHaveLength(1);
+  clock = 1_000;
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(h.calls).toHaveLength(2);
+  clock = 1_999;
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(h.calls).toHaveLength(2);
+  clock = 2_000;
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(h.calls).toHaveLength(3);
+});
+it('never reuses a token whose lifetime does not exceed the skew', async () => {
+  for (const expires of [1, 30]) {
+    const h = cacheClient([ok(b({ expires_in: expires }))], () => 0);
+    await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+    await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+    expect(h.calls).toHaveLength(2);
+  }
+});
+it('fails closed without HTTP when the clock is invalid during a cache lookup', async () => {
+  let clock = 0;
+  let boom = false;
+  const h = cacheClient([ok()], () => {
+    if (boom) throw new Error(BODY);
+    return clock;
+  });
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  for (const value of [NaN, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    clock = value;
+    await expect(h.client.getToken()).resolves.toEqual(mal);
+  }
+  boom = true;
+  const thrown = await h.client.getToken();
+  expect(thrown).toEqual(mal);
+  expect(JSON.stringify(thrown)).not.toContain(BODY);
+  expect(h.calls).toHaveLength(1);
+});
+it('clears the cache only when the exact current token is invalidated', async () => {
+  const h = make([
+    ok(b({ access_token: 'tok-1' })),
+    ok(b({ access_token: 'tok-2' })),
+  ]);
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  h.client.invalidate('other');
+  h.client.invalidate('tok-1');
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-2'));
+  expect(h.calls).toHaveLength(2);
+});
+it('does not let an older token invalidate a newer cached token', async () => {
+  let clock = 0;
+  const h = cacheClient(
+    [
+      ok(b({ access_token: 'tok-1', expires_in: 31 })),
+      ok(b({ access_token: 'tok-2', expires_in: 31 })),
+    ],
+    () => clock,
+  );
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  clock = 1_000;
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-2'));
+  expect(h.calls).toHaveLength(2);
+  h.client.invalidate('tok-1');
+  clock = 1_001;
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-2'));
+  expect(h.calls).toHaveLength(2);
+  h.client.invalidate('tok-2');
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-2'));
+  expect(h.calls).toHaveLength(3);
+});
+it('does not cache errors and reacquires on the next call', async () => {
+  const h = make([r(400), ok()]);
+  await expect(h.client.getToken()).resolves.toEqual(
+    err({ kind: 'auth_failed' }),
+  );
+  await expect(h.client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(h.calls).toHaveLength(2);
+});
+it('single-flight shares one acquisition across concurrent callers', async () => {
+  const gates: Array<ReturnType<typeof gate>> = [];
+  const sleep = jest.fn(async () => undefined);
+  const client = new SkydropxTokenClient(CONFIG, {
+    http: () => {
+      const g = gate();
+      gates.push(g);
+      return g.promise;
+    },
+    now: () => 0,
+    sleep,
+  });
+  const p1 = client.getToken();
+  const p2 = client.getToken();
+  const p3 = client.getToken();
+  expect(gates).toHaveLength(1);
+  gates[0].settle(ok());
+  await expect(Promise.all([p1, p2, p3])).resolves.toEqual([
+    at('tok-1'),
+    at('tok-1'),
+    at('tok-1'),
+  ]);
+  expect(sleep).toHaveBeenCalledTimes(0);
+});
+it('single-flight shares the bounded retry sequence across concurrent callers', async () => {
+  const gates: Array<ReturnType<typeof gate>> = [];
+  const sleep = jest.fn(async () => undefined);
+  const client = new SkydropxTokenClient(CONFIG, {
+    http: () => {
+      const g = gate();
+      gates.push(g);
+      return g.promise;
+    },
+    now: () => 0,
+    sleep,
+  });
+  const p1 = client.getToken();
+  const p2 = client.getToken();
+  expect(gates).toHaveLength(1);
+  gates[0].settle(r(500));
+  await new Promise<void>((resolve) => {
+    setImmediate(() => resolve());
+  });
+  expect(gates).toHaveLength(2);
+  gates[1].settle(ok());
+  await expect(Promise.all([p1, p2])).resolves.toEqual([
+    at('tok-1'),
+    at('tok-1'),
+  ]);
+  expect(sleep).toHaveBeenCalledTimes(1);
+});
+it('clears the in-flight slot on rejection without leaking the error', async () => {
+  const calls: AxiosRequestConfig[] = [];
+  const client = new SkydropxTokenClient(CONFIG, {
+    http: (c) => {
+      calls.push(c);
+      return Promise.resolve(ok());
+    },
+    now: () => 0,
+    sleep: jest.fn(async () => undefined),
+  });
+  const internal = client as unknown as {
+    acquire: () => Promise<SkydropxTokenResult>;
+  };
+  jest.spyOn(internal, 'acquire').mockRejectedValueOnce(new Error(BODY));
+  const first = await client.getToken();
+  expect(first).toEqual(up(null));
+  expect(JSON.stringify(first)).not.toContain(BODY);
+  await expect(client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(calls).toHaveLength(1);
+});
+it('shares one acquisition when the transport synchronously re-enters getToken', async () => {
+  const calls: AxiosRequestConfig[] = [];
+  let reentered = false;
+  let reentrant: Promise<SkydropxTokenResult> | null = null;
+  const client: SkydropxTokenClient = new SkydropxTokenClient(CONFIG, {
+    http: (c) => {
+      calls.push(c);
+      if (!reentered) {
+        reentered = true;
+        reentrant = client.getToken();
+      }
+      return Promise.resolve(ok());
+    },
+    now: () => 0,
+    sleep: jest.fn(async () => undefined),
+  });
+  await expect(client.getToken()).resolves.toEqual(at('tok-1'));
+  expect(calls).toHaveLength(1);
+  await expect(reentrant).resolves.toEqual(at('tok-1'));
+});
+it('does not repopulate the cache when the current token is invalidated mid-refresh', async () => {
+  const gates: Array<ReturnType<typeof gate>> = [];
+  let clock = 0;
+  const client = new SkydropxTokenClient(CONFIG, {
+    http: () => {
+      const g = gate();
+      gates.push(g);
+      return g.promise;
+    },
+    now: () => clock,
+    sleep: jest.fn(async () => undefined),
+  });
+  const priming = client.getToken();
+  expect(gates).toHaveLength(1);
+  gates[0].settle(ok(b({ access_token: 'tok-1', expires_in: 31 })));
+  await expect(priming).resolves.toEqual(at('tok-1'));
+  clock = 1_000;
+  const refresh = client.getToken();
+  expect(gates).toHaveLength(2);
+  client.invalidate('tok-1');
+  gates[1].settle(ok(b({ access_token: 'tok-1', expires_in: 31 })));
+  await expect(refresh).resolves.toEqual(at('tok-1'));
+  clock = 1_001;
+  const next = client.getToken();
+  expect(gates).toHaveLength(3);
+  gates[2].settle(ok(b({ access_token: 'tok-2', expires_in: 31 })));
+  await expect(next).resolves.toEqual(at('tok-2'));
 });
