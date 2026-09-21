@@ -57,7 +57,8 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-1B — Implement package-readiness rules:** add a pure value type and strict tests for missing package data, quantity-weighted totals, the 25 kg boundary, minimum split count, and the explicit >25 kg balanced-split prerequisite without inventing dimensions.
 - [x] **SQ-2A — Add default-off shipping-quote configuration:** typed `shippingQuotes` factory subtree plus conditional Joi validation (credentials/origin required only when enabled) with redacted secrets.
 - [x] **SQ-2A-H — Harden the SQ-2A configuration contract:** make `SHIPPING_QUOTES_ENABLED` canonical case-sensitive (reject `TRUE`/`False`/`1`/padded), reject whitespace-only required strings, and trim accepted provider values consistently in Joi and the factory.
-- [ ] **SQ-2B — Add provider-neutral shipping contracts:** normalized request/rate/error contracts and dependency tokens without wiring a live tool.
+- [x] **SQ-2B1 — Add provider-neutral shipping-quote request contracts:** immutable address/parcel/request types, exact string normalization, plain-record guards, and a readonly nonempty parcel tuple.
+- [ ] **SQ-2B2 — Add the shipping-quote output/error port:** `SHIPPING_QUOTE_PROVIDER` token, port interface, and normalized rate/result/error contracts with runtime boundary validation and normalization.
 - [ ] **SQ-3 — Implement the Skydropx quote adapter:** add OAuth token caching, the current quotation request/polling flow, bounded retry/timeout behavior, response normalization, rate filtering, and secret-safe errors against mocked HTTP only.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
@@ -108,6 +109,20 @@ Live activation remains blocked until all are observed:
 - Scoped ESLint over the four TypeScript config paths — exit 0; Prettier `--check` covered those paths plus this tracker; `pnpm exec tsc --noEmit -p tsconfig.build.json` — exit 0; `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset.
 - Independent verification passed all behavior and checks; its tracker-wording warning was corrected before the clean native approval.
 
+## SQ-2B — rejected and replaced by SQ-2B1 + SQ-2B2
+
+The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.spec.ts`, 399 complete lines) failed independent verification as `NEEDS_CORRECTION` and was **not delivered**: quoted results allowed invalid/empty success, error secret safety and numeric bounds were not enforced at a runtime boundary, and the forced-cast `assertNever` test was weak. Both candidates were deleted from the worktree and the slice was split.
+
+## SQ-2B1 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-48aff6a5554ca6df`; locally delivered in this work unit)
+
+- Work unit: `shipping-quote.request` only — 104 implementation + 153 spec = 257 complete source lines, plus these tracker lines, within the 300-line guard.
+- Focused TDD RED: `pnpm exec jest --runInBand --no-cache shipping/domain/shipping-quote.request.spec.ts` failed with `Cannot find module './shipping-quote.request'` (1 suite failed, 0 tests).
+- Focused TDD GREEN: same command — 1 suite passed, 40 tests passed.
+- Scoped ESLint and Prettier `--check` over both files exit 0; `tsc --noEmit -p tsconfig.build.json` exit 0; spec typecheck `tsc -p tsconfig.spec.json` reports no `shipping-quote` diagnostics (repo-wide spec baseline has unrelated pre-existing errors); `git diff --check` clean; nothing staged; `DATABASE_URL`, `RUN_DOCKER_TESTS`, `RECEIPT_MEDIA_INGESTION_ENABLED` unset; old `shipping-quote.port.*` candidates absent.
+- Coverage: exact canonical strings (rejects leading/trailing whitespace plus padded/3-letter/lowercase country), postal <=12 and admin <=100 boundaries, per-field parcel matrix (0/negative/fraction/NaN/Infinity/MAX_SAFE+1/wrong type with 1 and MAX_SAFE accepted), nonempty tuple typing via `satisfies`, empty/missing/non-array/invalid parcels, invalid origin/destination, plain-record-only rejection of array/function/class/null, and frozen no-mutation.
+- Boundary scope: SQ-2B1 intentionally contains no result/rate/error/port/token; SQ-2B2 owns those with required runtime boundary validation and normalization.
+- Native advisory `R3-sparse-parcels` is non-blocking and assigned to a separate bounded hardening before SQ-2B2.
+
 ## Delivery gate
 
-This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
+This foundation is locally complete only when SQ-1A, SQ-1B, SQ-2A, SQ-2B1, SQ-2B2, and SQ-3 through SQ-7 have observed evidence. It is production-ready only after every activation prerequisite is satisfied separately; completing code does not authorize or imply live shipping quotes.
