@@ -64,7 +64,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-2B2B1 — Add the shipping-quote error normalizer:** `ShippingQuoteField`, the finite `ShippingQuoteError` union, and the never-throwing `normalizeShippingQuoteError` boundary.
 - [x] **SQ-2B2B2 — Add the shipping-quote envelope and port:** `ShippingQuoteProviderResult`, the envelope normalizer, the `SHIPPING_QUOTE_PROVIDER` token, and the port interface.
 - [x] **SQ-3A1 — Add the Skydropx OAuth token transport:** plain Nest-agnostic client with an injectable function transport, official `POST /api/v1/oauth/token` form-urlencoded request, fail-closed token/expires parsing with runtime clock validation, strict runtime status validation, standard AbortError timeout handling, bounded retry (max 2 attempts) for 429/5xx/network only, secret-safe finite result union, mocked HTTP only; `getToken()` acquires a fresh token on every call.
-- [~] **SQ-3A2 (in progress/candidate) — Add the Skydropx OAuth token cache:** deferred A1 behaviors to be delivered here (coverage deferred, not dropped): (a) in-memory token cache reuse across calls, (b) expiry-skew cache-hit refresh with an injectable clock, (c) single-flight sharing of one OAuth request across concurrent callers, (d) token-aware invalidation that clears only the matching token so an older 401 cannot drop a newer cached token.
+- [x] **SQ-3A2 — Add the Skydropx OAuth token cache:** in-memory token cache reuse, expiry-skew refresh with an injectable clock, publish-before-transport single-flight, and epoch-guarded token-aware invalidation.
 - [ ] **SQ-3B — Add the Skydropx quotation create/poll transport:** current quotation request and polling flow with bounded retry/timeout over the shared injectable HTTP seam.
 - [ ] **SQ-3C — Add the Skydropx response mapper and provider adapter:** map/quotation responses into normalized quoted results and finite errors, filter rates, implement `ShippingQuoteProviderPort`.
 - [ ] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
@@ -179,6 +179,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Hardening: runtime status requires a safe integer in 100..599; runtime clock values are guarded; hostile status/error getters cannot escape; default Axios transport forces `validateStatus: () => true` so the mapper receives non-2xx responses.
 - Scoped ESLint, Prettier, production typecheck, focused Jest, scoped spec diagnostics, and `git diff --check` passed; repository-wide spec typecheck retains unrelated pre-existing diagnostics.
 - Independent warnings (`ETIMEDOUT`, exact 599/600, sequential fresh acquisition, and combined clock-plus-expiry overflow tests) and native advisory `R3-token-control-characters` are non-blocking future hardening; no correction is open.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred.
+
+## SQ-3A2 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-1d89f6fb49b1e9be`; locally delivered in commit `eea9f73`)
+
+- Work unit: cache/single-flight/invalidation only — 337 complete changed lines after race corrections, within the 400-line guard.
+- Focused TDD: initial A2 RED had 7 failures / 11 passes; correction RED had 2 failures / 18 passes for synchronous transport reentrancy and invalidation during refresh. Final GREEN: 20/20 focused tests and 200/200 shipping tests.
+- Behavior: successful tokens cache only validated token/expiry metadata; a 30-second skew refreshes at the exact boundary; lifetimes at or below the skew are never reused; errors are never cached; cache hits perform no HTTP or sleep.
+- Concurrency: the in-flight promise is published before injectable transport execution, so synchronous reentrancy shares one acquisition/retry sequence; guarded clearing prevents an older flight from clearing a newer one.
+- Invalidation: only the exact cached token clears; a generation epoch prevents an active refresh from repopulating cache after matching invalidation; an older token cannot clear a newer cache.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped spec diagnostics, and `git diff --check` passed. Clock rollback remains a non-blocking warning; repository-wide spec typecheck retains unrelated diagnostics.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
