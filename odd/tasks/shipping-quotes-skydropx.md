@@ -75,7 +75,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3C4 — Provider adapter:** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
 - [x] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
-  - [ ] **SQ-4A — Draft selection and credit (IN PROGRESS — candidate):** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; strict focused TDD; no provider, persistence, or customer-facing output.
+  - [x] **SQ-4A — Draft selection and credit:** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; no provider, persistence, or customer-facing output.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
@@ -283,6 +283,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Focused module tests passed 10/10, the shipping suite passed 307/307, and the config suite passed 274/274 during independent verification. Scoped lint, format, production typecheck, spec diagnostics, and diff checks passed; unrelated repository-wide spec diagnostics remain.
 - Current `@nestjs/config` behavior was independently probed: dotenv assignment completes synchronously before the next AppModule imports-array entry evaluates, so `AppConfigModule.forRoot()` precedes the shipping gate without an observed bootstrap race.
 - Native advisory `R3-http-spy-callthrough` was removed in a separate approved follow-up: every axios spy now rejects safely before the test asserts zero calls (`review-ec4920f8b5e8c833`).
+- No provider/network call, credential access, push, deployment, or production configuration change occurred; shipping remains disabled by default.
+
+## SQ-4A evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-2dc5a1d31ecfec9f`; locally delivered in commit `ed87978`)
+
+- Added a pure internal draft boundary that selects one normalized rate deterministically by price, delivery days with null last, then code-unit carrier, service, and rate identifiers; it never applies an unapproved carrier policy.
+- The draft composes the committed shipping-credit calculator and copies its exact totals, applied/unused credit, qualifying-unit count, and customer-payable cents. Invalid quotes/carts and arithmetic overflow remain finite `unavailable`/`handoff` outcomes.
+- Public selector inputs are normalized once through the committed quote boundary before comparison. Stateful fields are read once; arbitrary, nested, malformed, secret-bearing, throwing, and revoked inputs cannot escape or remain referenced.
+- Outputs are exact-key, fresh, deeply frozen, and contain no customer-facing copy, approval signal, persistence mutation, provider call, or I/O.
+- Final verification: 33/33 focused tests and 340/340 shipping tests; scoped lint, format, production typecheck, shipping spec diagnostics, diff, index, artifact, and 396-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- Native advisory `R3-incomplete-rate-order` is informational: provider expiry is intentionally excluded from the approved business tie-break; otherwise-equal normalized rates preserve the first.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred; shipping remains disabled by default.
 
 ## Delivery gate
