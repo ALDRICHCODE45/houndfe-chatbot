@@ -77,6 +77,7 @@ Live activation remains blocked until all are observed:
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
   - [x] **SQ-4A — Draft selection and credit:** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; no provider, persistence, or customer-facing output.
   - [x] **SQ-4B — Exact request assembly:** build a bounded provider-neutral request only from exact MX addresses, readiness-approved items, and one explicit prepared parcel whose weight matches the cart.
+  - [ ] **SQ-4C — Provider-to-draft orchestration (IN PROGRESS — candidate)**
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
