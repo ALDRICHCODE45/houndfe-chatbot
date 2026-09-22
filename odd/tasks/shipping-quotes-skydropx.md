@@ -83,14 +83,14 @@ Live activation remains blocked until all are observed:
     - [x] **SQ-4D2 — Conversation lifecycle:** read/expire, persist, and clear the validated record through the existing ConversationStore while preserving sibling state.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path (IN PROGRESS):** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
   - [x] **SQ-5A — Enabled-only application wiring:** expose one `ShippingQuoteOrchestrator` only inside the exact enabled module graph and inject it optionally into the existing tool registry without changing the tool inventory.
-  - [ ] **SQ-5B — Internal quote tool:** register only when the orchestrator exists, reuse fresh drafts, persist bounded new drafts, and return no customer-visible price or provider detail to the model.
+  - [x] **SQ-5B — Internal quote tool:** register only when the orchestrator exists, reuse fresh drafts, persist bounded new drafts, and return no customer-visible price or provider detail to the model.
     - [x] **SQ-5B1 — Measured demo profile:** normalize one exact versioned real measured item/parcel profile and match it only to the identical bounded cart; fail closed everywhere else.
-    - [ ] **SQ-5B2 — Price-stripped quote tool:** resolve origin, stored customer destination, cart, and measured profile server-side; reuse fresh drafts, quote once, persist internally, and expose only finite non-price outcomes to the model.
+    - [x] **SQ-5B2 — Price-stripped quote tool:** resolve origin, stored customer destination, cart, and measured profile server-side; reuse fresh drafts, quote once, persist internally, and expose only finite non-price outcomes to the model.
       - [x] **SQ-5B2A — Private measured-profile configuration:** parse one optional private JSON profile and exact origin into safe normalized server-owned inputs only inside the enabled module graph.
-      - [ ] **SQ-5B2B — Tool execution and registration (IN PROGRESS):** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
+      - [x] **SQ-5B2B — Tool execution and registration:** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
         - [x] **SQ-5B2B1 — Strict Mexican sender identity:** accept only Meta digit-only `52` plus ten digits or legacy `521` plus ten digits, returning backend country code `52` and the exact ten-digit phone.
         - [x] **SQ-5B2B2 — Price-stripped tool core:** resolve state, fresh draft, measured cart, stored customer address, quote, and persistence with one server-owned clock and finite non-price results.
-        - [ ] **SQ-5B2B3 — Enabled-only registration (IN PROGRESS — candidate):** expose the tool only when orchestrator and measured config exist, add exact AI SDK runtime context, and preserve the disabled twelve-tool inventory.
+        - [x] **SQ-5B2B3 — Enabled-only registration:** expose the tool only when orchestrator and measured config exist, add exact AI SDK runtime context, and preserve the disabled twelve-tool inventory.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
@@ -390,6 +390,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Strict TDD process warning: the spec was authored first and a missing-module TypeScript RED was observed, but the exact focused Jest command was not captured until after implementation. No retroactive RED is claimed; candidate behavior received independent verification.
 - Native review could not complete because the package-local Gentle AI v3.4.0 binary disappeared before capture. The risk assessment therefore treated the candidate as unassessable/high-risk and required writer self-verification plus an independent verifier, both completed; no native approval is claimed and no package repair was authorized.
 - No registry/runtime-context change, real network/provider call, database access, customer message, push, deployment, or production configuration change occurred.
+
+## SQ-5B2B3 evidence (independent `PASS_WITH_WARNINGS`; native review unavailable; locally delivered in commit `f587b9c`)
+
+- Added the enabled-only registry boundary: `RealToolRegistry` optionally injects the exact measured-demo config token and registers `getShippingQuote` only when both that config and `ShippingQuoteOrchestrator` exist. Neither, orchestrator-only, and config-only graphs remain at exactly twelve tools; both dependencies produce exactly thirteen.
+- Added the exact AI SDK runtime context for the conditional tool. `getShippingQuote` receives only server-owned `{ senderId }` under its exact tool key when registered; the existing four context-bearing tools remain unchanged, and the disabled run omits the shipping context.
+- Strict TDD RED was observed before production edits: the focused two-spec run failed 4 tests with 17 passing. GREEN and post-GREEN refactor runs passed 21/21; the independent offline Nest DI/adapter harness passed 65/65 across five focused suites.
+- Scoped ESLint, Prettier, production typecheck, candidate diagnostics, `git diff --check`, hash stability, exact four-path scope, and the 185-line review guard passed. Repository-wide spec typecheck retains unrelated pre-existing diagnostics and reported none in the four candidate files.
+- Native review was unavailable for this candidate: intended-untracked exclusion reached native START but failed `schema-incompatible` with `lineage_created: false`; explicit unavailable assessment therefore required writer self-verification plus the independent verifier, both completed. No native approval is claimed.
+- Runtime harness: offline Nest DI and AI adapter Jest only. Rollback boundary: the four registry/adapter implementation and spec files in commit `f587b9c`; reverting them removes conditional registration without touching the committed tool core or shipping module.
+- No live provider/network call, database access, credential access, customer message, push, deployment, production configuration change, protected-path inspection, or stash mutation occurred. Shipping remains disabled by default, and human approval remains SQ-5C.
 
 ## Delivery gate
 
