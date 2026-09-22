@@ -77,7 +77,7 @@ Live activation remains blocked until all are observed:
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
   - [x] **SQ-4A — Draft selection and credit:** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; no provider, persistence, or customer-facing output.
   - [x] **SQ-4B — Exact request assembly:** build a bounded provider-neutral request only from exact MX addresses, readiness-approved items, and one explicit prepared parcel whose weight matches the cart.
-  - [ ] **SQ-4C — Provider-to-draft orchestration (IN PROGRESS — candidate)**
+  - [x] **SQ-4C — Provider-to-draft orchestration**
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
@@ -306,6 +306,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Ready outputs are exact-key, fresh, deeply frozen, bounded to 20 technical parcel entries, stripped of arbitrary/customer/secret fields, and contain no copy, state, provider call, or I/O.
 - Final verification: 54/54 focused tests and 394/394 shipping tests; scoped lint, format, production typecheck, shipping spec diagnostics, diff, index, artifact, and 386-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred; real shipping remains unavailable until an explicit prepared-parcel source exists and the feature is separately activated.
+
+## SQ-4C evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-b993db4b8e6ee277`; locally delivered in commit `abc0417`)
+
+- Added the provider-to-draft orchestrator: it delegates exact input validation to SQ-4B, calls `ShippingQuoteProviderPort.quote()` exactly once only for a ready request, and composes the result through SQ-4A without persistence or customer-facing copy.
+- Credit quantity and price now come from the same one-read item snapshots used for shipment readiness. Legacy independent credit fields are ignored and unread, closing the native critical finding that could otherwise inflate credit relative to the shipped quantity.
+- Provider responses cross a one-read runtime membrane before committed normalization; malformed, throwing, rejected, stateful, and secret-bearing responses become finite unavailable or handoff outcomes without leaking raw provider data.
+- Final verification: 71/71 focused tests and 465/465 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 395-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- Native advisory `R3-frozen-input-proxy-invariant` is informational and did not open a correction; the approved receipt stands.
+- No provider/network call, credential access, persistence mutation, customer message, push, deployment, or production configuration change occurred; shipping remains disabled by default.
 
 ## Delivery gate
 
