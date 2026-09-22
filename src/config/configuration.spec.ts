@@ -60,6 +60,8 @@ describe('configuration()', () => {
     'SKYDROPX_ORIGIN_STATE',
     'SKYDROPX_ORIGIN_MUNICIPALITY',
     'SKYDROPX_ORIGIN_NEIGHBORHOOD',
+    // SQ-5B2A private measured-demo profile passthrough
+    'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
   ];
 
   beforeEach(() => {
@@ -256,6 +258,7 @@ describe('configuration()', () => {
       shippingQuotes: {
         enabled: boolean;
         skydropx: Record<string, string | undefined>;
+        measuredDemoParcelProfileJson?: string;
       };
     };
     const shipping = () => (configuration() as Shipping).shippingQuotes;
@@ -339,6 +342,28 @@ describe('configuration()', () => {
           originNeighborhood: 'Centro',
         },
       });
+    });
+
+    // SQ-5B2A: optional private measured-demo profile JSON is a raw string
+    // passthrough; the factory never parses it and blanks become undefined.
+    it.each([undefined, '', '   ', '\n\t '])(
+      'maps absent or blank SHIPPING_DEMO_PARCEL_PROFILE_JSON=%# to undefined',
+      (env) => {
+        if (env === undefined) {
+          delete process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON;
+        } else {
+          process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON = env;
+        }
+        expect(shipping().measuredDemoParcelProfileJson).toBeUndefined();
+      },
+    );
+
+    it('preserves a bounded raw JSON string after outer trim without parsing it', () => {
+      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON =
+        '  {"version":1,"items":[]}  ';
+      expect(shipping().measuredDemoParcelProfileJson).toBe(
+        '{"version":1,"items":[]}',
+      );
     });
   });
 });

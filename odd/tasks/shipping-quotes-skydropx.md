@@ -86,6 +86,8 @@ Live activation remains blocked until all are observed:
   - [ ] **SQ-5B — Internal quote tool:** register only when the orchestrator exists, reuse fresh drafts, persist bounded new drafts, and return no customer-visible price or provider detail to the model.
     - [x] **SQ-5B1 — Measured demo profile:** normalize one exact versioned real measured item/parcel profile and match it only to the identical bounded cart; fail closed everywhere else.
     - [ ] **SQ-5B2 — Price-stripped quote tool:** resolve origin, stored customer destination, cart, and measured profile server-side; reuse fresh drafts, quote once, persist internally, and expose only finite non-price outcomes to the model.
+      - [ ] **SQ-5B2A — Private measured-profile configuration (IN PROGRESS — candidate):** parse one optional private JSON profile and exact origin into safe normalized server-owned inputs only inside the enabled module graph.
+      - [ ] **SQ-5B2B — Tool execution and registration:** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.

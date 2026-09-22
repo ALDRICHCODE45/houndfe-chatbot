@@ -15,6 +15,13 @@ const int = (v: string | undefined) => (v ? parseInt(v, 10) : undefined);
 // SQ-2A-H: normalize accepted surrounding whitespace so ConfigService sees the
 // same trimmed provider values that Joi validates.
 const trimmed = (v: string | undefined) => v?.trim();
+// SQ-5B2A: optional private measured-demo profile JSON. It is a raw, unparsed
+// passthrough so shipping can stay enabled when it is absent or invalid; the
+// shipping resolver fails closed later. Whitespace-only becomes undefined.
+const trimmedOrUndefined = (v: string | undefined) => {
+  const t = v?.trim();
+  return t ? t : undefined;
+};
 
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
@@ -99,6 +106,10 @@ const configuration = () => ({
   // SQ-2A-H: default-off shipping quotes; provider fields are trimmed env passthrough.
   shippingQuotes: {
     enabled: process.env.SHIPPING_QUOTES_ENABLED === 'true',
+    // SQ-5B2A: raw private measured-demo profile JSON, trimmed, never parsed at boot.
+    measuredDemoParcelProfileJson: trimmedOrUndefined(
+      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON,
+    ),
     skydropx: {
       baseUrl:
         trimmed(process.env.SKYDROPX_BASE_URL) ?? SKYDROPX_BASE_URL_DEFAULT,

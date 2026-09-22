@@ -3,9 +3,10 @@
  * dynamic `forRoot()` gate is exact and inert when disabled (no providers,
  * exports, imports, instantiation, or HTTP), that the enabled graph builds
  * exactly one token -> quotation -> provider -> orchestrator chain behind
- * the provider-port and orchestrator exports, and that `SaleFlowModule` owns
- * the dynamic import while `AppModule` has none. Fully offline: every HTTP
- * seam is observed through a spied `axios.request` that must never run.
+ * the provider-port and orchestrator exports plus one measured-demo config
+ * provider behind `MEASURED_DEMO_SHIPPING_CONFIG`, and that `SaleFlowModule`
+ * owns the dynamic import while `AppModule` has none. Fully offline: every
+ * HTTP seam is observed through a spied `axios.request` that must never run.
  */
 import axios from 'axios';
 import { Inject, Injectable, type DynamicModule } from '@nestjs/common';
@@ -25,6 +26,10 @@ import {
   SKYDROPX_TOKEN_TIMEOUT_MS,
 } from './shipping.module';
 import { ShippingQuoteOrchestrator } from './application/shipping-quote-orchestrator';
+import {
+  MEASURED_DEMO_SHIPPING_CONFIG,
+  type MeasuredDemoShippingConfig,
+} from './application/measured-demo-shipping-config';
 import { AppModule } from '../app.module';
 
 /** Stub the app config module so importing `AppModule` never boots the real
@@ -46,6 +51,31 @@ const CONFIG_VALUES: Record<string, string> = {
   'shippingQuotes.skydropx.baseUrl': 'https://api-pro.skydropx.com',
   'shippingQuotes.skydropx.clientId': 'client-id',
   'shippingQuotes.skydropx.clientSecret': 'client-secret',
+};
+
+/** Valid private measured-demo profile plus exact Skydropx origin. */
+const MEASURED_VALUES: Record<string, string> = {
+  'shippingQuotes.measuredDemoParcelProfileJson': JSON.stringify({
+    version: 1,
+    items: [
+      {
+        productId: '11111111-1111-1111-1111-111111111111',
+        variantId: null,
+        quantity: 1,
+        measurement: {
+          weightGrams: 500,
+          lengthCm: 10,
+          widthCm: 20,
+          heightCm: 30,
+        },
+      },
+    ],
+    parcel: { weightGrams: 500, lengthCm: 10, widthCm: 20, heightCm: 30 },
+  }),
+  'shippingQuotes.skydropx.originPostalCode': '06000',
+  'shippingQuotes.skydropx.originState': 'CDMX',
+  'shippingQuotes.skydropx.originMunicipality': 'Cuauhtemoc',
+  'shippingQuotes.skydropx.originNeighborhood': 'Centro',
 };
 
 const configStub = (values: Record<string, string | undefined> = {}) =>
@@ -187,6 +217,9 @@ describe('ShippingModule', () => {
         expect(() => {
           moduleRef.get(ShippingQuoteOrchestrator, { strict: false });
         }).toThrow();
+        expect(() => {
+          moduleRef.get(MEASURED_DEMO_SHIPPING_CONFIG, { strict: false });
+        }).toThrow();
         expect(spy).not.toHaveBeenCalled();
         await moduleRef.close();
       });
@@ -201,10 +234,11 @@ describe('ShippingModule', () => {
           .mockRejectedValue(new Error('network disabled in test'));
         const dynamic = ShippingModule.forRoot();
         expect(dynamic.imports).toEqual([ConfigModule]);
-        expect(dynamic.providers).toHaveLength(4);
+        expect(dynamic.providers).toHaveLength(5);
         expect(dynamic.exports).toEqual([
           SHIPPING_QUOTE_PROVIDER,
           ShippingQuoteOrchestrator,
+          MEASURED_DEMO_SHIPPING_CONFIG,
         ]);
 
         const get = configStub(CONFIG_VALUES);
@@ -256,6 +290,11 @@ describe('ShippingModule', () => {
         expect(httpSpy).not.toHaveBeenCalled();
 
         expect(get.mock.calls.map((call) => call[0])).toEqual([
+          'shippingQuotes.measuredDemoParcelProfileJson',
+          'shippingQuotes.skydropx.originPostalCode',
+          'shippingQuotes.skydropx.originState',
+          'shippingQuotes.skydropx.originMunicipality',
+          'shippingQuotes.skydropx.originNeighborhood',
           'shippingQuotes.skydropx.baseUrl',
           'shippingQuotes.skydropx.clientId',
           'shippingQuotes.skydropx.clientSecret',
@@ -305,6 +344,50 @@ describe('ShippingModule', () => {
           kind: 'error',
           error: { kind: 'provider_disabled' },
         });
+        expect(spy).not.toHaveBeenCalled();
+        await moduleRef.close();
+      });
+    });
+
+    it('resolves the measured-demo token to null without failing when the profile is absent', async () => {
+      await withFlag('true', async () => {
+        const moduleRef = await Test.createTestingModule({
+          imports: [ShippingModule.forRoot()],
+        })
+          .overrideProvider(ConfigService)
+          .useValue({ get: configStub() })
+          .compile();
+        expect(
+          moduleRef.get(MEASURED_DEMO_SHIPPING_CONFIG, { strict: false }),
+        ).toBeNull();
+        await moduleRef.close();
+      });
+    });
+
+    it('resolves the measured-demo token to one frozen safe value with valid config', async () => {
+      await withFlag('true', async () => {
+        const spy = jest
+          .spyOn(axios, 'request')
+          .mockRejectedValue(new Error('network disabled in test'));
+        const moduleRef = await Test.createTestingModule({
+          imports: [ShippingModule.forRoot()],
+        })
+          .overrideProvider(ConfigService)
+          .useValue({ get: configStub(MEASURED_VALUES) })
+          .compile();
+        const resolved = moduleRef.get<MeasuredDemoShippingConfig | null>(
+          MEASURED_DEMO_SHIPPING_CONFIG,
+          { strict: false },
+        );
+        expect(resolved).not.toBeNull();
+        expect(resolved!.profile.version).toBe(1);
+        expect(resolved!.origin).toEqual({
+          postalCode: '06000',
+          state: 'CDMX',
+          municipality: 'Cuauhtemoc',
+          neighborhood: 'Centro',
+        });
+        expect(Object.isFrozen(resolved)).toBe(true);
         expect(spy).not.toHaveBeenCalled();
         await moduleRef.close();
       });

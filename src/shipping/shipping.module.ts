@@ -12,22 +12,30 @@
  * change takes effect by graceful restart/redeploy.
  *
  * Disabled: the module declares `imports: []`, `providers: []` and
- * `exports: []`, so the `SHIPPING_QUOTE_PROVIDER` token, the concrete
- * Skydropx clients, and `ShippingQuoteOrchestrator` are never registered,
- * instantiated, or exported.
+ * `exports: []`, so the `SHIPPING_QUOTE_PROVIDER` and
+ * `MEASURED_DEMO_SHIPPING_CONFIG` tokens, the concrete Skydropx clients, and
+ * `ShippingQuoteOrchestrator` are never registered, instantiated, or exported.
  *
  * Enabled: the module composes exactly one singleton chain
  * `SkydropxTokenClient -> SkydropxQuotationClient -> SkydropxShippingQuoteProvider`
  * plus one singleton `ShippingQuoteOrchestrator` built from that exported
- * provider, and exports exactly `SHIPPING_QUOTE_PROVIDER` and
- * `ShippingQuoteOrchestrator`. Configuration is read through the injected
+ * provider, and one `MEASURED_DEMO_SHIPPING_CONFIG` provider that resolves the
+ * optional private measured-demo profile and exact origin through
+ * `resolveMeasuredDemoShippingConfig`. It exports exactly
+ * `SHIPPING_QUOTE_PROVIDER`, `ShippingQuoteOrchestrator`, and
+ * `MEASURED_DEMO_SHIPPING_CONFIG`. Configuration is read through the injected
  * `ConfigService`; a missing or non-string value becomes an empty string so
  * the clients fail closed (`provider_disabled`) instead of throwing or
- * logging. Module construction performs no I/O.
+ * logging, and an absent or invalid measured-demo profile resolves the config
+ * token to `null` without failing boot. Module construction performs no I/O.
  */
 import { DynamicModule, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ShippingQuoteOrchestrator } from './application/shipping-quote-orchestrator';
+import {
+  MEASURED_DEMO_SHIPPING_CONFIG,
+  resolveMeasuredDemoShippingConfig,
+} from './application/measured-demo-shipping-config';
 import {
   SHIPPING_QUOTE_PROVIDER,
   type ShippingQuoteProviderPort,
@@ -66,6 +74,12 @@ export class ShippingModule {
       module: ShippingModule,
       imports: [ConfigModule],
       providers: [
+        {
+          provide: MEASURED_DEMO_SHIPPING_CONFIG,
+          inject: [ConfigService],
+          useFactory: (config: ConfigService) =>
+            resolveMeasuredDemoShippingConfig(config),
+        },
         {
           provide: SkydropxTokenClient,
           inject: [ConfigService],
@@ -109,7 +123,8 @@ export class ShippingModule {
             new ShippingQuoteOrchestrator(provider),
         },
       ],
-      exports: [SHIPPING_QUOTE_PROVIDER, ShippingQuoteOrchestrator],
+      // prettier-ignore
+      exports: [SHIPPING_QUOTE_PROVIDER, ShippingQuoteOrchestrator, MEASURED_DEMO_SHIPPING_CONFIG],
     };
   }
 }
