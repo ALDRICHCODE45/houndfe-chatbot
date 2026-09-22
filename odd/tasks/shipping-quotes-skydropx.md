@@ -92,7 +92,7 @@ Live activation remains blocked until all are observed:
         - [x] **SQ-5B2B2 — Price-stripped tool core:** resolve state, fresh draft, measured cart, stored customer address, quote, and persistence with one server-owned clock and finite non-price results.
         - [x] **SQ-5B2B3 — Enabled-only registration:** expose the tool only when orchestrator and measured config exist, add exact AI SDK runtime context, and preserve the disabled twelve-tool inventory.
   - [ ] **SQ-5C — Structured shipping approval (IN PROGRESS):** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
-    - [ ] **SQ-5C1 — Redacted approval contract (IN PROGRESS):** define the exact safe digest and strict approve/reject parser from one unexpired draft; expose only net charge, total credit, carrier/service, ETA, and the draft-created pin.
+    - [x] **SQ-5C1 — Redacted approval contract:** define the exact safe digest and strict approve/reject parser from one unexpired draft; expose only net charge, total credit, carrier/service, ETA, and the draft-created pin.
     - [ ] **SQ-5C2 — Draft-pinned human resolution:** render the bounded ops request, accept only exact structured decisions, revalidate the pinned draft at resolution time, and persist a machine-readable local approval/rejection without exposing the amount to the customer/model.
     - [ ] **SQ-5C3 — Server-owned trigger and instructions:** create/reuse the shipping approval request from the enabled quote path, keep the model-facing handoff tool unable to forge `shipping_approval`, and update deterministic sale-flow guidance; expired drafts require re-quotation.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
@@ -403,6 +403,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Native review was unavailable for this candidate: intended-untracked exclusion reached native START but failed `schema-incompatible` with `lineage_created: false`; explicit unavailable assessment therefore required writer self-verification plus the independent verifier, both completed. No native approval is claimed.
 - Runtime harness: offline Nest DI and AI adapter Jest only. Rollback boundary: the four registry/adapter implementation and spec files in commit `f587b9c`; reverting them removes conditional registration without touching the committed tool core or shipping module.
 - No live provider/network call, database access, credential access, customer message, push, deployment, production configuration change, protected-path inspection, or stash mutation occurred. Shipping remains disabled by default, and human approval remains SQ-5C.
+
+## SQ-5C1 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-f4e6ad85098af58c`; locally delivered in commit `9904557`)
+
+- Added the exact redacted `shipping_approval` digest to the handoff domain while preserving four known kinds, the original three model-active kinds, and the unchanged human-resolution union. The current model-facing handoff tool still cannot create this server-owned request.
+- Added a pure builder that crosses only the committed draft-record normalizer, accepts exactly `createdAt <= now < expiresAt`, and emits a fresh frozen seven-field ops digest: draft-created pin, net customer charge, total credit, carrier/service, and ETA. IDs, address/phone/product/measurements, raw provider/error data, expiry/validity, gross/best/applied/unused amounts, and qualifying count do not escape.
+- Added a strict parser for case-insensitive, outer-whitespace-tolerant `APPROVE_SHIPPING` and `REJECT_SHIPPING`. Prefixes, suffixes, reasons, prose, combined commands, coercible values, and hostile inputs fail closed; structured service resolution remains SQ-5C2.
+- Strict TDD RED failed on the missing module with one suite failed, one passed, and five tests executed. GREEN passed 51/51; independent verification passed 106/106 across five suites. Scoped ESLint, Prettier, production typecheck, candidate diagnostics, diff/hash integrity, and the 365-line complete implementation review guard passed; repository-wide spec typecheck retains unrelated baseline diagnostics.
+- Native reliability review approved and was acknowledged/burned with target `sha256:6605dbc9ed04a5779d5f9249b0de5b3f48a64330ec731a1ef05e5639cbcffbcd`. Runtime harness: pure offline Jest only. Rollback boundary: the five paths in commit `9904557`; no migration or external runtime dependency was added.
+- No service/module/tool/instruction activation, persistence mutation, customer/model price surface, live provider/network/DB access, credential access, push, deployment, protected-path inspection, or stash mutation occurred.
 
 ## Delivery gate
 
