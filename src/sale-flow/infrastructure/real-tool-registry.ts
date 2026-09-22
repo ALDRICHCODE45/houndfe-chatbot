@@ -7,6 +7,10 @@ import { CONVERSATION_STORE as CONVERSATION_STORE_TOKEN } from '../../conversati
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import { ShippingQuoteOrchestrator } from '../../shipping/application/shipping-quote-orchestrator';
+import {
+  MEASURED_DEMO_SHIPPING_CONFIG,
+  type MeasuredDemoShippingConfig,
+} from '../../shipping/application/measured-demo-shipping-config';
 import type { ToolDeps } from '../application/tool-deps';
 import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
 import { makeCancelSaleTool } from '../application/tools/cancel-sale.tool';
@@ -15,6 +19,8 @@ import { makeCreateSaleTool } from '../application/tools/create-sale.tool';
 import { makeEvaluateCartTool } from '../application/tools/evaluate-cart.tool';
 import { makeGetCustomerByPhoneTool } from '../application/tools/get-customer-by-phone.tool';
 import { makeGetOrderHistoryTool } from '../application/tools/get-order-history.tool';
+// prettier-ignore
+import { makeGetShippingQuoteTool } from '../application/tools/get-shipping-quote.tool';
 import { makeGetPaymentDetailsTool } from '../application/tools/get-payment-details.tool';
 import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import { makeSearchCatalogTool } from '../application/tools/search-catalog.tool';
@@ -50,8 +56,13 @@ export const HUMAN_HANDOFF_SERVICE_TOKEN = Symbol('HUMAN_HANDOFF_SERVICE');
  * `ShippingQuoteOrchestrator` is injected as an OPTIONAL dependency (SQ-5A):
  * the default-off `ShippingModule` only exports it when shipping quotes are
  * enabled, so the parameter defaults to `null` and the registry keeps its
- * exact twelve-tool inventory in both states. SQ-5A stores the instance but
- * registers no shipping tool yet.
+ * exact twelve-tool inventory in both states.
+ *
+ * `MEASURED_DEMO_SHIPPING_CONFIG` is likewise injected as an OPTIONAL
+ * dependency (SQ-5B2B3) with a `null` default. The price-stripped
+ * `getShippingQuote` tool is registered as the 13th key ONLY when BOTH the
+ * orchestrator and the measured demo config are present; each alone (or
+ * neither) keeps the exact twelve-tool inventory.
  */
 @Injectable()
 export class RealToolRegistry implements ToolRegistry {
@@ -66,6 +77,9 @@ export class RealToolRegistry implements ToolRegistry {
     @Optional()
     @Inject(ShippingQuoteOrchestrator)
     private readonly shippingQuoteOrchestrator: ShippingQuoteOrchestrator | null = null,
+    @Optional()
+    @Inject(MEASURED_DEMO_SHIPPING_CONFIG)
+    private readonly measuredDemoShippingConfig: MeasuredDemoShippingConfig | null = null,
   ) {
     const cashierUserId = configService.get<string>(
       'chatbotApi.cashierUserId',
@@ -78,7 +92,7 @@ export class RealToolRegistry implements ToolRegistry {
       humanHandoffService,
     };
 
-    this.tools = {
+    const tools: Record<string, unknown> = {
       searchCatalog: makeSearchCatalogTool(deps),
       checkStock: makeCheckStockTool(deps),
       evaluateCart: makeEvaluateCartTool(deps),
@@ -95,6 +109,23 @@ export class RealToolRegistry implements ToolRegistry {
       cancelSale: makeCancelSaleTool(deps),
       requestHumanAssistance: makeRequestHumanAssistanceTool(deps),
     };
+
+    // SQ-5B2B3: register the price-stripped shipping-quote tool ONLY when
+    // BOTH the shipping orchestrator and the measured demo config are
+    // present. Every other combination keeps the exact twelve-tool set.
+    if (
+      this.shippingQuoteOrchestrator !== null &&
+      this.measuredDemoShippingConfig !== null
+    ) {
+      tools.getShippingQuote = makeGetShippingQuoteTool({
+        chatbotApi: deps.chatbotApi,
+        store: deps.store,
+        shippingQuoteOrchestrator: this.shippingQuoteOrchestrator,
+        measuredDemoConfig: this.measuredDemoShippingConfig,
+      });
+    }
+
+    this.tools = tools;
   }
 
   getTools(): Record<string, unknown> {

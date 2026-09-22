@@ -54,7 +54,15 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       // matches the tool name; the AI-SDK only requires entries for
       // tools that declare a contextSchema.
       requestHumanAssistance: { senderId: input.senderId },
-    };
+    } as Record<string, { senderId: string }>;
+
+    // SQ-5B2B3: the price-stripped `getShippingQuote` tool also declares
+    // `contextSchema: z.object({ senderId })`. The AI-SDK validates that
+    // every tool with a contextSchema has a matching map entry, so add it
+    // ONLY when the tool is actually present in this run's ToolSet.
+    if (input.tools !== null && 'getShippingQuote' in input.tools) {
+      toolsContext.getShippingQuote = { senderId: input.senderId };
+    }
     const result = await this.generateTextFn({
       model: openai(this.modelId),
       system: input.systemPrompt,

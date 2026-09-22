@@ -6,6 +6,10 @@ import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client'
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
 import { ShippingQuoteOrchestrator } from '../../shipping/application/shipping-quote-orchestrator';
 import {
+  MEASURED_DEMO_SHIPPING_CONFIG,
+  type MeasuredDemoShippingConfig,
+} from '../../shipping/application/measured-demo-shipping-config';
+import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
 } from './real-tool-registry';
@@ -14,10 +18,12 @@ import {
  * Integration tests for RealToolRegistry wiring.
  *
  * Spec scenarios:
- *   - getTools() returns exactly the 12 keys (searchCatalog, checkStock,
- *     evaluateCart, getCustomerByPhone, upsertCustomer, createSale,
- *     attachReceipt, updateDelivery, getOrderHistory, getPaymentDetails,
- *     cancelSale, requestHumanAssistance).
+ *   - getTools() returns exactly the 12 keys by default (searchCatalog,
+ *     checkStock, evaluateCart, getCustomerByPhone, upsertCustomer,
+ *     createSale, attachReceipt, updateDelivery, getOrderHistory,
+ *     getPaymentDetails, cancelSale, requestHumanAssistance) and a 13th
+ *     `getShippingQuote` ONLY when both the shipping orchestrator and the
+ *     measured demo config are injected.
  *   - Each entry is an AI-SDK tool with a Zod object inputSchema.
  *   - DI resolves RealToolRegistry with CHATBOT_API_CLIENT +
  *     CONVERSATION_STORE + HUMAN_HANDOFF_SERVICE_TOKEN + ConfigService.
@@ -51,8 +57,15 @@ describe('RealToolRegistry', () => {
     isOpsSender: jest.fn(),
   };
 
+  // DI wiring stub: the shipping tool core has its own tests; here we only
+  // assert registration gating, never execution.
+  const stubMeasuredDemoConfig = Object.freeze(
+    {},
+  ) as unknown as MeasuredDemoShippingConfig;
+
   async function buildRegistry(
     orchestrator?: ShippingQuoteOrchestrator,
+    measuredDemoConfig?: MeasuredDemoShippingConfig,
   ): Promise<RealToolRegistry> {
     const providers: Provider[] = [
       RealToolRegistry,
@@ -80,6 +93,12 @@ describe('RealToolRegistry', () => {
         useValue: orchestrator,
       });
     }
+    if (measuredDemoConfig !== undefined) {
+      providers.push({
+        provide: MEASURED_DEMO_SHIPPING_CONFIG,
+        useValue: measuredDemoConfig,
+      });
+    }
     const moduleRef = await Test.createTestingModule({ providers }).compile();
     return moduleRef.get(RealToolRegistry);
   }
@@ -87,6 +106,10 @@ describe('RealToolRegistry', () => {
   const orchestratorOf = (registry: RealToolRegistry): unknown =>
     (registry as unknown as { shippingQuoteOrchestrator: unknown })
       .shippingQuoteOrchestrator;
+
+  const measuredDemoConfigOf = (registry: RealToolRegistry): unknown =>
+    (registry as unknown as { measuredDemoShippingConfig: unknown })
+      .measuredDemoShippingConfig;
 
   it('resolves through Nest DI with CHATBOT_API_CLIENT + CONVERSATION_STORE + HUMAN_HANDOFF_SERVICE_TOKEN + ConfigService', async () => {
     const registry = await buildRegistry();
@@ -147,6 +170,56 @@ describe('RealToolRegistry', () => {
     const registry = await buildRegistry(orchestrator);
     expect(orchestratorOf(registry)).toBe(orchestrator);
     expect(Object.keys(registry.getTools())).toHaveLength(12);
+  });
+
+  it('stores an injected measured demo config as null-by-default in the neither case', async () => {
+    const registry = await buildRegistry();
+    expect(measuredDemoConfigOf(registry)).toBeNull();
+    expect(Object.keys(registry.getTools())).toHaveLength(12);
+  });
+
+  it('does not register getShippingQuote with only the measured demo config (12 keys)', async () => {
+    const registry = await buildRegistry(undefined, stubMeasuredDemoConfig);
+    expect(measuredDemoConfigOf(registry)).toBe(stubMeasuredDemoConfig);
+    expect(orchestratorOf(registry)).toBeNull();
+    const tools = registry.getTools();
+    expect(Object.keys(tools)).toHaveLength(12);
+    expect(tools).not.toHaveProperty('getShippingQuote');
+  });
+
+  it('registers getShippingQuote when BOTH the orchestrator and the measured demo config are present (13 keys)', async () => {
+    const orchestrator = new ShippingQuoteOrchestrator({ quote: jest.fn() });
+    const registry = await buildRegistry(orchestrator, stubMeasuredDemoConfig);
+    expect(orchestratorOf(registry)).toBe(orchestrator);
+    expect(measuredDemoConfigOf(registry)).toBe(stubMeasuredDemoConfig);
+    const tools = registry.getTools() as Record<
+      string,
+      { description?: string; inputSchema?: unknown; execute?: unknown }
+    >;
+    expect(Object.keys(tools).sort()).toEqual(
+      [
+        'searchCatalog',
+        'checkStock',
+        'evaluateCart',
+        'getCustomerByPhone',
+        'upsertCustomer',
+        'createSale',
+        'attachReceipt',
+        'updateDelivery',
+        'getOrderHistory',
+        'getPaymentDetails',
+        'cancelSale',
+        'requestHumanAssistance',
+        'getShippingQuote',
+      ].sort(),
+    );
+    // Registered tool is the real AI-SDK tool (never executed here).
+    const shipping = tools.getShippingQuote;
+    expect(typeof shipping.description).toBe('string');
+    expect(shipping.inputSchema).toBeDefined();
+    expect(typeof shipping.execute).toBe('function');
+    // Same ToolSet reference across repeated getTools() calls.
+    expect(registry.getTools()).toBe(registry.getTools());
   });
 
   describe('attachReceipt compatibility wiring (WU12)', () => {
