@@ -78,6 +78,9 @@ Live activation remains blocked until all are observed:
   - [x] **SQ-4A — Draft selection and credit:** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; no provider, persistence, or customer-facing output.
   - [x] **SQ-4B — Exact request assembly:** build a bounded provider-neutral request only from exact MX addresses, readiness-approved items, and one explicit prepared parcel whose weight matches the cart.
   - [x] **SQ-4C — Provider-to-draft orchestration**
+  - [ ] **SQ-4D — Bounded draft persistence:** persist one validated internal quote draft in existing conversation JSONB with a 30-minute chatbot TTL, earlier provider-expiry cap, fail-closed reads, and explicit clear semantics; no migration or customer visibility.
+    - [ ] **SQ-4D1 — Bounded record construction (IN PROGRESS — candidate):** normalize the full safe draft, enforce financial identities, and cap a versioned record to the 30-minute or earlier provider expiry without I/O.
+    - [ ] **SQ-4D2 — Conversation lifecycle:** read/expire, persist, and clear the validated record through the existing ConversationStore while preserving sibling state.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
