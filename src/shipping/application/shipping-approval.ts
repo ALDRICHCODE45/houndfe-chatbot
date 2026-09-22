@@ -20,11 +20,12 @@
  * surface. Resolution and exhaustion are owned by SQ-5C2.
  */
 import type { ShippingApprovalDigest } from '../../human-handoff/domain/human-handoff.types';
+import type { ShippingApprovalDecision } from '../../human-handoff/domain/shipping-approval-policy.port';
 import { normalizeShippingQuoteDraftRecord } from './shipping-quote-draft-record';
 
-export type ShippingApprovalDecision =
-  | { readonly decision: 'SHIPPING_APPROVED' }
-  | { readonly decision: 'SHIPPING_REJECTED' };
+/** Canonical union lives in the human-handoff policy port (SQ-5C2a);
+ *  re-exported here so existing C1 consumers keep their import path. */
+export type { ShippingApprovalDecision } from '../../human-handoff/domain/shipping-approval-policy.port';
 
 const APPROVED: ShippingApprovalDecision = Object.freeze({
   decision: 'SHIPPING_APPROVED',
