@@ -2,9 +2,9 @@
  * SQ-3D default-off composition wiring spec. Proves the `ShippingModule`
  * dynamic `forRoot()` gate is exact and inert when disabled (no providers,
  * exports, imports, instantiation, or HTTP), that the enabled graph builds
- * exactly one token -> quotation -> provider chain behind only the
- * `SHIPPING_QUOTE_PROVIDER` export, and that `AppModule` embeds that dynamic
- * module without booting real config or network. Fully offline: every HTTP
+ * exactly one token -> quotation -> provider -> orchestrator chain behind
+ * the provider-port and orchestrator exports, and that `SaleFlowModule` owns
+ * the dynamic import while `AppModule` has none. Fully offline: every HTTP
  * seam is observed through a spied `axios.request` that must never run.
  */
 import axios from 'axios';
@@ -24,6 +24,7 @@ import {
   SKYDROPX_QUOTATION_TIMEOUT_MS,
   SKYDROPX_TOKEN_TIMEOUT_MS,
 } from './shipping.module';
+import { ShippingQuoteOrchestrator } from './application/shipping-quote-orchestrator';
 import { AppModule } from '../app.module';
 
 /** Stub the app config module so importing `AppModule` never boots the real
@@ -83,6 +84,26 @@ const VALID_REQUEST: ShippingQuoteRequest = {
   parcels: [{ lengthCm: 20, widthCm: 15, heightCm: 10, weightGrams: 1500 }],
 };
 
+/** Minimal valid orchestration input that reaches the provider exactly once. */
+const ORCH_INPUT = {
+  origin: { postalCode: '1', state: 'S', municipality: 'M', neighborhood: 'N' },
+  destination: {
+    zipCode: '2',
+    state: 'T',
+    municipality: 'U',
+    neighborhood: 'V',
+  },
+  items: [
+    {
+      productId: 'p',
+      quantity: 1,
+      measurement: { weightGrams: 500, lengthCm: 1, widthCm: 1, heightCm: 1 },
+      unitPriceCents: 1,
+    },
+  ],
+  parcels: [{ lengthCm: 1, widthCm: 1, heightCm: 1, weightGrams: 500 }],
+};
+
 @Injectable()
 class PortConsumer {
   constructor(
@@ -97,7 +118,7 @@ class TokenClientConsumer {
 }
 
 /** Host consumer module that imports the enabled graph; the provider token
- * must resolve only because the module exports exactly that token. */
+ * must resolve because the module includes it in the bounded public exports. */
 const portConsumerModule = (): DynamicModule => ({
   module: class PortConsumerHostModule {},
   imports: [ShippingModule.forRoot()],
@@ -149,7 +170,7 @@ describe('ShippingModule', () => {
         const dynamic = ShippingModule.forRoot();
         expect(dynamic.providers).toEqual([]);
         expect(dynamic.exports).toEqual([]);
-        expect(dynamic.imports ?? []).toEqual([]);
+        expect(dynamic.imports).toEqual([]);
 
         const moduleRef = await Test.createTestingModule({
           imports: [dynamic],
@@ -163,6 +184,9 @@ describe('ShippingModule', () => {
         expect(() => {
           moduleRef.get(SkydropxQuotationClient, { strict: false });
         }).toThrow();
+        expect(() => {
+          moduleRef.get(ShippingQuoteOrchestrator, { strict: false });
+        }).toThrow();
         expect(spy).not.toHaveBeenCalled();
         await moduleRef.close();
       });
@@ -172,10 +196,16 @@ describe('ShippingModule', () => {
   describe('enabled exact true', () => {
     it('builds one private chain behind the exported port token', async () => {
       await withFlag('true', async () => {
+        const httpSpy = jest
+          .spyOn(axios, 'request')
+          .mockRejectedValue(new Error('network disabled in test'));
         const dynamic = ShippingModule.forRoot();
         expect(dynamic.imports).toEqual([ConfigModule]);
-        expect(dynamic.providers).toHaveLength(3);
-        expect(dynamic.exports).toEqual([SHIPPING_QUOTE_PROVIDER]);
+        expect(dynamic.providers).toHaveLength(4);
+        expect(dynamic.exports).toEqual([
+          SHIPPING_QUOTE_PROVIDER,
+          ShippingQuoteOrchestrator,
+        ]);
 
         const get = configStub(CONFIG_VALUES);
         const moduleRef = await Test.createTestingModule({
@@ -206,6 +236,24 @@ describe('ShippingModule', () => {
         expect(moduleRef.get(SkydropxQuotationClient, { strict: false })).toBe(
           quotation,
         );
+
+        const orchestrator = moduleRef.get<ShippingQuoteOrchestrator>(
+          ShippingQuoteOrchestrator,
+        );
+        expect(orchestrator).toBeInstanceOf(ShippingQuoteOrchestrator);
+        expect(moduleRef.get(ShippingQuoteOrchestrator)).toBe(orchestrator);
+        const quoteSpy = jest.spyOn(provider, 'quote').mockResolvedValue({
+          kind: 'error',
+          error: { kind: 'provider_disabled' },
+        });
+        await expect(
+          orchestrator.quote({ requestInput: ORCH_INPUT }),
+        ).resolves.toEqual({
+          kind: 'unavailable',
+          reason: 'provider_disabled',
+        });
+        expect(quoteSpy).toHaveBeenCalledTimes(1);
+        expect(httpSpy).not.toHaveBeenCalled();
 
         expect(get.mock.calls.map((call) => call[0])).toEqual([
           'shippingQuotes.skydropx.baseUrl',
@@ -263,23 +311,13 @@ describe('ShippingModule', () => {
     });
   });
 
-  it('embeds the ShippingModule dynamic import in AppModule', () => {
+  it('declares no direct ShippingModule import in AppModule', () => {
     const imports =
       (Reflect.getMetadata('imports', AppModule) as
         | DynamicImportEntry[]
         | undefined) ?? [];
-    const shipping = imports.filter(
-      (entry) => entry?.module === ShippingModule,
+    expect(imports.some((entry) => entry?.module === ShippingModule)).toBe(
+      false,
     );
-    expect(shipping).toHaveLength(1);
-    expect(Array.isArray(shipping[0].providers)).toBe(true);
-    expect(
-      imports.some(
-        (entry) =>
-          (entry?.module as { name?: string } | undefined)?.name ===
-          'AppConfigStubModule',
-      ),
-    ).toBe(true);
-    expect(imports.some((entry) => entry?.module === AppModule)).toBe(false);
   });
 });

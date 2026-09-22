@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
@@ -6,6 +6,7 @@ import { CHATBOT_API_CLIENT as CHATBOT_API_CLIENT_TOKEN } from '../../chatbot-ap
 import { CONVERSATION_STORE as CONVERSATION_STORE_TOKEN } from '../../conversation/domain/conversation-store';
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
+import { ShippingQuoteOrchestrator } from '../../shipping/application/shipping-quote-orchestrator';
 import type { ToolDeps } from '../application/tool-deps';
 import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
 import { makeCancelSaleTool } from '../application/tools/cancel-sale.tool';
@@ -45,6 +46,12 @@ export const HUMAN_HANDOFF_SERVICE_TOKEN = Symbol('HUMAN_HANDOFF_SERVICE');
  * factory-instantiated with NO deps — it is a terminal compatibility tool
  * (strict `{}` schema, zero backend attachment calls; the server-owned
  * `ReceiptAttachmentService` is the sole §4.4.7 attachment path).
+ *
+ * `ShippingQuoteOrchestrator` is injected as an OPTIONAL dependency (SQ-5A):
+ * the default-off `ShippingModule` only exports it when shipping quotes are
+ * enabled, so the parameter defaults to `null` and the registry keeps its
+ * exact twelve-tool inventory in both states. SQ-5A stores the instance but
+ * registers no shipping tool yet.
  */
 @Injectable()
 export class RealToolRegistry implements ToolRegistry {
@@ -56,6 +63,9 @@ export class RealToolRegistry implements ToolRegistry {
     @Inject(HUMAN_HANDOFF_SERVICE_TOKEN)
     humanHandoffService: HumanHandoffService,
     configService: ConfigService,
+    @Optional()
+    @Inject(ShippingQuoteOrchestrator)
+    private readonly shippingQuoteOrchestrator: ShippingQuoteOrchestrator | null = null,
   ) {
     const cashierUserId = configService.get<string>(
       'chatbotApi.cashierUserId',

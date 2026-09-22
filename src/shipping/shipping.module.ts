@@ -2,25 +2,32 @@
  * SQ-3D default-off shipping-quote composition root.
  *
  * `ShippingModule.forRoot()` is a static dynamic-module factory consumed once
- * by `AppModule`. The enable/disable decision is the exact, case-sensitive
+ * by `SaleFlowModule`. SQ-5A moved it out of the direct `AppModule` imports so
+ * the whole application graph keeps exactly one dynamic shipping import
+ * (reachable from `AppModule` transitively through `LlmAgentModule`).
+ * The enable/disable decision is the exact, case-sensitive
  * `process.env.SHIPPING_QUOTES_ENABLED === 'true'` gate, mirrored from
  * `configuration.ts`, and is evaluated when `forRoot()` runs (module
  * metadata build time, before boot) — never toggled at live runtime; a
  * change takes effect by graceful restart/redeploy.
  *
- * Disabled: the module declares `providers: []` and `exports: []`, so the
- * `SHIPPING_QUOTE_PROVIDER` token and the concrete Skydropx clients are
- * never registered, instantiated, or exported.
+ * Disabled: the module declares `imports: []`, `providers: []` and
+ * `exports: []`, so the `SHIPPING_QUOTE_PROVIDER` token, the concrete
+ * Skydropx clients, and `ShippingQuoteOrchestrator` are never registered,
+ * instantiated, or exported.
  *
  * Enabled: the module composes exactly one singleton chain
  * `SkydropxTokenClient -> SkydropxQuotationClient -> SkydropxShippingQuoteProvider`
- * and exports only `SHIPPING_QUOTE_PROVIDER`. Configuration is read through
- * the injected `ConfigService`; a missing or non-string value becomes an
- * empty string so the clients fail closed (`provider_disabled`) instead of
- * throwing or logging. Module construction performs no I/O.
+ * plus one singleton `ShippingQuoteOrchestrator` built from that exported
+ * provider, and exports exactly `SHIPPING_QUOTE_PROVIDER` and
+ * `ShippingQuoteOrchestrator`. Configuration is read through the injected
+ * `ConfigService`; a missing or non-string value becomes an empty string so
+ * the clients fail closed (`provider_disabled`) instead of throwing or
+ * logging. Module construction performs no I/O.
  */
 import { DynamicModule, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { ShippingQuoteOrchestrator } from './application/shipping-quote-orchestrator';
 import {
   SHIPPING_QUOTE_PROVIDER,
   type ShippingQuoteProviderPort,
@@ -48,7 +55,12 @@ const readString = (config: ConfigService, key: string): string => {
 export class ShippingModule {
   static forRoot(): DynamicModule {
     if (!isShippingQuotesEnabled()) {
-      return { module: ShippingModule, providers: [], exports: [] };
+      return {
+        module: ShippingModule,
+        imports: [],
+        providers: [],
+        exports: [],
+      };
     }
     return {
       module: ShippingModule,
@@ -88,8 +100,16 @@ export class ShippingModule {
           ): ShippingQuoteProviderPort =>
             new SkydropxShippingQuoteProvider(client),
         },
+        {
+          provide: ShippingQuoteOrchestrator,
+          inject: [SHIPPING_QUOTE_PROVIDER],
+          useFactory: (
+            provider: ShippingQuoteProviderPort,
+          ): ShippingQuoteOrchestrator =>
+            new ShippingQuoteOrchestrator(provider),
+        },
       ],
-      exports: [SHIPPING_QUOTE_PROVIDER],
+      exports: [SHIPPING_QUOTE_PROVIDER, ShippingQuoteOrchestrator],
     };
   }
 }

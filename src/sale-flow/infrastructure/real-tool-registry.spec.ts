@@ -1,8 +1,10 @@
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import type { Provider } from '@nestjs/common';
 import { TERMINAL_RECEIPT_GUIDANCE } from '../application/tools/attach-receipt.tool';
 import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
+import { ShippingQuoteOrchestrator } from '../../shipping/application/shipping-quote-orchestrator';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
@@ -49,31 +51,42 @@ describe('RealToolRegistry', () => {
     isOpsSender: jest.fn(),
   };
 
-  async function buildRegistry(): Promise<RealToolRegistry> {
-    const moduleRef = await Test.createTestingModule({
-      providers: [
-        RealToolRegistry,
-        { provide: CHATBOT_API_CLIENT, useValue: stubChatbotApi },
-        { provide: CONVERSATION_STORE, useValue: stubStore },
-        {
-          provide: HUMAN_HANDOFF_SERVICE_TOKEN,
-          useValue: stubHumanHandoffService,
-        },
-        {
-          provide: ConfigService,
-          useValue: {
-            get: (key: string) => {
-              if (key === 'chatbotApi.cashierUserId') {
-                return '00000000-4000-9000-0000-000000000001';
-              }
-              return undefined;
-            },
+  async function buildRegistry(
+    orchestrator?: ShippingQuoteOrchestrator,
+  ): Promise<RealToolRegistry> {
+    const providers: Provider[] = [
+      RealToolRegistry,
+      { provide: CHATBOT_API_CLIENT, useValue: stubChatbotApi },
+      { provide: CONVERSATION_STORE, useValue: stubStore },
+      {
+        provide: HUMAN_HANDOFF_SERVICE_TOKEN,
+        useValue: stubHumanHandoffService,
+      },
+      {
+        provide: ConfigService,
+        useValue: {
+          get: (key: string) => {
+            if (key === 'chatbotApi.cashierUserId') {
+              return '00000000-4000-9000-0000-000000000001';
+            }
+            return undefined;
           },
         },
-      ],
-    }).compile();
+      },
+    ];
+    if (orchestrator !== undefined) {
+      providers.push({
+        provide: ShippingQuoteOrchestrator,
+        useValue: orchestrator,
+      });
+    }
+    const moduleRef = await Test.createTestingModule({ providers }).compile();
     return moduleRef.get(RealToolRegistry);
   }
+
+  const orchestratorOf = (registry: RealToolRegistry): unknown =>
+    (registry as unknown as { shippingQuoteOrchestrator: unknown })
+      .shippingQuoteOrchestrator;
 
   it('resolves through Nest DI with CHATBOT_API_CLIENT + CONVERSATION_STORE + HUMAN_HANDOFF_SERVICE_TOKEN + ConfigService', async () => {
     const registry = await buildRegistry();
@@ -121,6 +134,19 @@ describe('RealToolRegistry', () => {
     const a = registry.getTools();
     const b = registry.getTools();
     expect(a).toBe(b);
+  });
+
+  it('stores an omitted shipping orchestrator as null without changing the 12 keys', async () => {
+    const registry = await buildRegistry();
+    expect(orchestratorOf(registry)).toBeNull();
+    expect(Object.keys(registry.getTools())).toHaveLength(12);
+  });
+
+  it('stores an injected shipping orchestrator without changing the 12 keys', async () => {
+    const orchestrator = new ShippingQuoteOrchestrator({ quote: jest.fn() });
+    const registry = await buildRegistry(orchestrator);
+    expect(orchestratorOf(registry)).toBe(orchestrator);
+    expect(Object.keys(registry.getTools())).toHaveLength(12);
   });
 
   describe('attachReceipt compatibility wiring (WU12)', () => {
