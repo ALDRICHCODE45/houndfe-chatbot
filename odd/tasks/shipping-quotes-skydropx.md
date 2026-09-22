@@ -74,13 +74,13 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3C3 — Request-to-wire mapper:** convert the provider-neutral shipping request into the Skydropx V1 wire payload. Sandbox UI evidence confirms dimensions in centimeters and weight in kilograms, so C3 maps `weightGrams/1000` and passes dimensions through; current official `POST /api/v1/quotations` V1 docs omit unit/package fields (`mass_unit`, `dimension_unit`, `package`/`package_type`), so the emitted wire body is addresses plus parcels only.
 - [x] **SQ-3C4 — Provider adapter:** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
 - [x] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
-- [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
+- [x] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
   - [x] **SQ-4A — Draft selection and credit:** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; no provider, persistence, or customer-facing output.
   - [x] **SQ-4B — Exact request assembly:** build a bounded provider-neutral request only from exact MX addresses, readiness-approved items, and one explicit prepared parcel whose weight matches the cart.
   - [x] **SQ-4C — Provider-to-draft orchestration**
-  - [ ] **SQ-4D — Bounded draft persistence:** persist one validated internal quote draft in existing conversation JSONB with a 30-minute chatbot TTL, earlier provider-expiry cap, fail-closed reads, and explicit clear semantics; no migration or customer visibility.
+  - [x] **SQ-4D — Bounded draft persistence:** persist one validated internal quote draft in existing conversation JSONB with a 30-minute chatbot TTL, earlier provider-expiry cap, fail-closed reads, and explicit clear semantics; no migration or customer visibility.
     - [x] **SQ-4D1 — Bounded record construction:** normalize the full safe draft, enforce financial identities, and cap a versioned record to the 30-minute or earlier provider expiry without I/O.
-    - [ ] **SQ-4D2 — Conversation lifecycle (IN PROGRESS — candidate):** read/expire, persist, and clear the validated record through the existing ConversationStore while preserving sibling state.
+    - [x] **SQ-4D2 — Conversation lifecycle:** read/expire, persist, and clear the validated record through the existing ConversationStore while preserving sibling state.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
@@ -327,6 +327,14 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Final verification: 24/24 focused tests and 489/489 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 398-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - Native lineage `review-2ccdaaacf909c608` could not admit its materialized reviewer after the model change: exact fresh provider bindings were repeatedly rejected as belonging to another session route. The read-only assessment therefore reported native review unavailable and required the independent verifier, which passed; no native approval is claimed.
 - No conversation write, migration, provider/network call, credential access, customer message, push, deployment, or production configuration change occurred; shipping remains disabled by default and SQ-4D2 still owns persistence.
+
+## SQ-4D2 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-13204c0ac1e60657`; locally delivered in commit `192ffd3`)
+
+- Added pure fail-closed draft reads with runtime clock validation, structural normalization through SQ-4D1, pre-creation rejection, and expiry at the exact boundary. Reads never mutate state or perform store I/O.
+- Added one-update persistence and clear operations through the existing `ConversationStore`. Both preserve sibling JSONB state and existing `lastMessageAt`; null-state fallbacks use the canonical injected clock, and clear deletes the owned key rather than storing `null` or `undefined`.
+- Invalid drafts, clocks, states, hostile getters, and proxies fail before I/O. Store rejections propagate, the exact sender ID argument is preserved, and whole-bag read/modify/write remains intentionally bounded to the accepted single-writer-per-sender model.
+- Final verification: 25/25 focused tests and 514/514 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and exact 400-line complete review guard passed. Repository-wide spec diagnostics remain unrelated.
+- No migration, store-port change, provider/network call, credential access, customer message, push, deployment, or production configuration change occurred. Persistence remains internal and does not authorize customer visibility; shipping remains disabled by default.
 
 ## Delivery gate
 
