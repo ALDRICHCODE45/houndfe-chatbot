@@ -143,7 +143,9 @@ describe('ShippingModule', () => {
       { label: 'padded value', value: ' true ' },
     ])('stays inert when $label', async ({ value }) => {
       await withFlag(value, async () => {
-        const spy = jest.spyOn(axios, 'request');
+        const spy = jest
+          .spyOn(axios, 'request')
+          .mockRejectedValue(new Error('network disabled in test'));
         const dynamic = ShippingModule.forRoot();
         expect(dynamic.providers).toEqual([]);
         expect(dynamic.exports).toEqual([]);
@@ -238,7 +240,9 @@ describe('ShippingModule', () => {
 
     it('fails closed with blank config and performs no construction I/O', async () => {
       await withFlag('true', async () => {
-        const spy = jest.spyOn(axios, 'request');
+        const spy = jest
+          .spyOn(axios, 'request')
+          .mockRejectedValue(new Error('network disabled in test'));
         const moduleRef = await Test.createTestingModule({
           imports: [ShippingModule.forRoot()],
         })
