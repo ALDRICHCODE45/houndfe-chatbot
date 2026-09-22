@@ -89,8 +89,8 @@ Live activation remains blocked until all are observed:
       - [x] **SQ-5B2A — Private measured-profile configuration:** parse one optional private JSON profile and exact origin into safe normalized server-owned inputs only inside the enabled module graph.
       - [ ] **SQ-5B2B — Tool execution and registration (IN PROGRESS):** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
         - [x] **SQ-5B2B1 — Strict Mexican sender identity:** accept only Meta digit-only `52` plus ten digits or legacy `521` plus ten digits, returning backend country code `52` and the exact ten-digit phone.
-        - [ ] **SQ-5B2B2 — Price-stripped tool core (IN PROGRESS — candidate):** resolve state, fresh draft, measured cart, stored customer address, quote, and persistence with one server-owned clock and finite non-price results.
-        - [ ] **SQ-5B2B3 — Enabled-only registration:** expose the tool only when orchestrator and measured config exist, add exact AI SDK runtime context, and preserve the disabled twelve-tool inventory.
+        - [x] **SQ-5B2B2 — Price-stripped tool core:** resolve state, fresh draft, measured cart, stored customer address, quote, and persistence with one server-owned clock and finite non-price results.
+        - [ ] **SQ-5B2B3 — Enabled-only registration (IN PROGRESS — candidate):** expose the tool only when orchestrator and measured config exist, add exact AI SDK runtime context, and preserve the disabled twelve-tool inventory.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
@@ -380,6 +380,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Final verification: 40/40 focused tests and 247/247 sale-flow tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 170-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - Native advisory `R3-leading-zero-contract` is informational and matches the explicitly selected strict Mexico-only rule; the approved receipt stands.
 - No backend lookup, tool registration, network call, database access, customer message, push, deployment, or production configuration change occurred.
+
+## SQ-5B2B2 evidence (independent `PASS_WITH_WARNINGS`; native review unavailable; locally delivered in commit `7742d94`)
+
+- Added an isolated AI SDK tool core with strict empty model input and server-owned sender context. It captures one clock value, reads one conversation snapshot, reuses a fresh internal draft first, and otherwise derives the strict Mexican phone, exact measured cart, stored backend address, one quote, and one persistence update in that order.
+- The backend destination is reduced to zip code, state, municipality, and neighborhood before orchestration. Street, names, phone, references, carrier phone, arbitrary fields, and source references never cross into the request.
+- Model-visible results are frozen finite status-only unions. They expose no money, credit, rate, carrier, service, quote/provider ID, expiry, address, phone, product, measurement, parcel, raw error, or secret. The tool remains unregistered until SQ-5B2B3.
+- Final verification: 29/29 focused tests and 929/929 combined sale-flow-plus-shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 367-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- Strict TDD process warning: the spec was authored first and a missing-module TypeScript RED was observed, but the exact focused Jest command was not captured until after implementation. No retroactive RED is claimed; candidate behavior received independent verification.
+- Native review could not complete because the package-local Gentle AI v3.4.0 binary disappeared before capture. The risk assessment therefore treated the candidate as unassessable/high-risk and required writer self-verification plus an independent verifier, both completed; no native approval is claimed and no package repair was authorized.
+- No registry/runtime-context change, real network/provider call, database access, customer message, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
 
