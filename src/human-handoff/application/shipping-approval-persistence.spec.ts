@@ -82,12 +82,16 @@ describe('shipping-approval-persistence', () => {
   });
 
   // prettier-ignore
-  it('keeps the shipping shapes inactive in HumanHandoffResolution until C2c', () => {
-    const union: HumanHandoffResolution[] = [{ decision: 'NO_RESTOCK' }];
+  it('activates the shipping shapes in HumanHandoffResolution', () => {
+    const union: HumanHandoffResolution[] = [
+      { decision: 'SHIPPING_APPROVED', draftCreatedAt: T0 },
+      { decision: 'SHIPPING_REJECTED', draftCreatedAt: T0 },
+      { decision: 'SHIPPING_EXPIRED', draftCreatedAt: T0, reason: 'draft_missing' },
+    ];
     type ShippingInUnion = Extract<HumanHandoffResolution, { decision: 'SHIPPING_APPROVED' }>;
-    type Inactive = ShippingInUnion extends never ? true : never;
-    const inactive: Inactive = true;
-    expect([union, inactive]).toEqual([[{ decision: 'NO_RESTOCK' }], true]);
+    type Active = ShippingInUnion extends never ? never : true;
+    const active: Active = true;
+    expect([union, active]).toEqual([[union[0], union[1], union[2]], true]);
   });
 
   // prettier-ignore

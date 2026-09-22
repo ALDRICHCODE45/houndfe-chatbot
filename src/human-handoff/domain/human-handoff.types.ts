@@ -16,9 +16,10 @@
  *     future R6 slice can lift the gate without re-exporting the type.
  *   - `HumanHandoffDigest` — per-kind payload; persisted under
  *     `human_handoff_requests.digest` as jsonb.
- *   - `HumanHandoffResolution` — five-member discriminated union parsed
- *     from the human's free-text reply. The structured shipping resolution
- *     shapes are exported separately below and activate in SQ-5C2c.
+ *   - `HumanHandoffResolution` — eight-member discriminated union parsed
+ *     from the human's free-text reply: five free-text decisions plus the
+ *     three structured shipping decisions (`SHIPPING_APPROVED`,
+ *     `SHIPPING_REJECTED`, `SHIPPING_EXPIRED`).
  *   - `HumanHandoffRequest` — full lifecycle row.
  */
 
@@ -100,13 +101,17 @@ export interface ShippingApprovalDigest {
 }
 
 /** Discriminated union of valid agent decisions, parsed from the
- *  agent's free-text reply (case/whitespace tolerant). */
+ *  agent's free-text reply (case/whitespace tolerant) or produced by the
+ *  structured shipping-approval policy. Eight members. */
 export type HumanHandoffResolution =
   | YesRestockInXDaysResolution
   | NoRestockResolution
   | ApprovedPromoResolution
   | ExpirationResolution
-  | GenericResolution;
+  | GenericResolution
+  | ShippingApprovedResolution
+  | ShippingRejectedResolution
+  | ShippingExpiredResolution;
 
 export interface YesRestockInXDaysResolution {
   decision: 'YES_RESTOCK_IN_X_DAYS';
@@ -137,8 +142,8 @@ export interface GenericResolution {
  * only: the draft-created pin plus, for expiry, the stale reason. No price,
  * credit, carrier/service, ETA, provider, customer/address/phone, reason, or
  * free text is carried on approve/reject; expired carries only the finite
- * reason. SQ-5C2c activates these atomically once the exhaustive service
- * formatter/resolver handles them.
+ * reason. Activated as `HumanHandoffResolution` members in SQ-5C2c1; the
+ * exhaustive service formatter handles all three.
  */
 export interface ShippingApprovedResolution {
   readonly decision: 'SHIPPING_APPROVED';

@@ -8,12 +8,18 @@ import type {
   CreateHumanHandoffInput,
   HumanHandoffStore,
 } from '../domain/human-handoff-store.port';
-import type { HumanHandoffRequest } from '../domain/human-handoff.types';
+import type {
+  HumanHandoffDigest,
+  HumanHandoffResolution,
+  HumanHandoffRequest,
+  ShippingApprovalDigest,
+} from '../domain/human-handoff.types';
 import {
   UNDER_REVIEW_NOTICE,
   PENDING_HUMAN_REQUEST_REPLY,
   ASK_FOR_REF,
   HumanHandoffService,
+  formatResolutionAsUserTurn,
 } from './human-handoff.service';
 import { setPendingHumanRequest } from './pending-human-request-persistence';
 
@@ -297,6 +303,193 @@ describe('HumanHandoffService', () => {
       expect(store.create).not.toHaveBeenCalled();
       expect(whatsappSender.sendText).not.toHaveBeenCalled();
       expect(conversationStore.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('shipping_approval ops rendering', () => {
+    const now = '2026-06-23T12:00:00.000Z';
+
+    const shippingDigest = (
+      overrides: Partial<ShippingApprovalDigest> = {},
+    ): ShippingApprovalDigest => ({
+      kind: 'shipping_approval',
+      draftCreatedAt: now,
+      customerPaysCents: 6_901,
+      totalCreditCents: 12_000,
+      carrierName: 'Skydropx Express',
+      serviceName: 'DHL Express',
+      estimatedDeliveryDays: 3,
+      ...overrides,
+    });
+
+    const runCreate = async (digest: HumanHandoffDigest) => {
+      jest.useFakeTimers().setSystemTime(new Date(now));
+      conversationStore.get.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: now,
+        data: {},
+      });
+      store.create.mockImplementation(
+        async (input: CreateHumanHandoffInput) => ({
+          id: input.id,
+          customerId: input.customerId,
+          agentId: input.agentId,
+          kind: input.kind,
+          digest: input.digest,
+          status: 'pending',
+          resolution: null,
+          createdAt: now,
+          resolvedAt: null,
+        }),
+      );
+      await service.create({
+        senderId: CUSTOMER,
+        kind: 'shipping_approval',
+        digest,
+      });
+      jest.useRealTimers();
+      const ref = `HF-${store.create.mock.calls[0][0].id}`;
+      const opsText = whatsappSender.sendText.mock.calls.find(
+        (c) => c[0].to === OPS,
+      )![0].text;
+      const customerText = whatsappSender.sendText.mock.calls.find(
+        (c) => c[0].to === CUSTOMER,
+      )![0].text;
+      return { ref, opsText, customerText };
+    };
+
+    it('renders the exact redacted lines and the pending customer notice', async () => {
+      const { ref, opsText, customerText } = await runCreate(shippingDigest());
+      expect(opsText).toBe(
+        [
+          '🔔 HoundFe — solicitud de agente humano',
+          `Ref: ${ref}`,
+          'Tipo: shipping_approval',
+          'Cobro de envío: 69.01 MXN',
+          'Crédito total: 120.00 MXN',
+          'Paquetería: Skydropx Express',
+          'Servicio: DHL Express',
+          'Entrega estimada: 3 día(s)',
+          `Responde con "${ref}: APPROVE_SHIPPING" o "${ref}: REJECT_SHIPPING"`,
+        ].join('\n'),
+      );
+      expect(customerText).toBe(UNDER_REVIEW_NOTICE);
+    });
+
+    it('formats zero amounts as 0.00 and a null ETA as no disponible', async () => {
+      const { opsText } = await runCreate(
+        shippingDigest({
+          customerPaysCents: 0,
+          totalCreditCents: 0,
+          estimatedDeliveryDays: null,
+        }),
+      );
+      expect(opsText).toContain('Cobro de envío: 0.00 MXN');
+      expect(opsText).toContain('Crédito total: 0.00 MXN');
+      expect(opsText).toContain('Entrega estimada: no disponible');
+    });
+
+    it('renders only allowed fields, ignoring hostile digest keys', async () => {
+      const hostile = {
+        ...shippingDigest(),
+        draftCreatedAt: 'HOSTILE_DRAFT_PIN',
+        quoteId: 'QUOTE_SECRET',
+        rateId: 'RATE_SECRET',
+        address: 'ADDRESS_SECRET',
+        phone: 'PHONE_SECRET',
+        product: 'PRODUCT_SECRET',
+        measurements: 'MEASUREMENTS_SECRET',
+        provider: 'PROVIDER_SECRET',
+        error: 'ERROR_SECRET',
+        expiresAt: 'EXPIRES_SECRET',
+        grossCents: 111,
+        bestCents: 222,
+        appliedCents: 333,
+        unusedCents: 444,
+        qualifyingCount: 555,
+        customerId: 'CUSTOMER_SECRET',
+        arbitrary: 'ARBITRARY_SECRET',
+      } as unknown as HumanHandoffDigest;
+      const before = structuredClone(hostile);
+      const { opsText } = await runCreate(hostile);
+      for (const leaked of [
+        'QUOTE_SECRET',
+        'RATE_SECRET',
+        'ADDRESS_SECRET',
+        'PHONE_SECRET',
+        'PRODUCT_SECRET',
+        'MEASUREMENTS_SECRET',
+        'PROVIDER_SECRET',
+        'ERROR_SECRET',
+        'EXPIRES_SECRET',
+        'HOSTILE_DRAFT_PIN',
+        'CUSTOMER_SECRET',
+        'ARBITRARY_SECRET',
+      ]) {
+        expect(opsText).not.toContain(leaked);
+      }
+      expect(hostile).toEqual(before);
+    });
+  });
+
+  describe('formatResolutionAsUserTurn shipping decisions', () => {
+    const now = '2026-06-23T12:00:00.000Z';
+    const ref = `HF-${REF_ID}`;
+    const shippingRequest: HumanHandoffRequest = {
+      id: REF_ID,
+      customerId: CUSTOMER,
+      agentId: OPS,
+      kind: 'shipping_approval',
+      digest: {
+        kind: 'shipping_approval',
+        draftCreatedAt: now,
+        customerPaysCents: 6_901,
+        totalCreditCents: 12_000,
+        carrierName: 'CARRIER_LEAK',
+        serviceName: 'SERVICE_LEAK',
+        estimatedDeliveryDays: 3,
+      },
+      status: 'pending',
+      resolution: null,
+      createdAt: now,
+      resolvedAt: null,
+    };
+    const cases: Array<[HumanHandoffResolution, string]> = [
+      [
+        { decision: 'SHIPPING_APPROVED', draftCreatedAt: now },
+        `[Resolución del agente humano (${ref})] El agente aprobó el envío.`,
+      ],
+      [
+        { decision: 'SHIPPING_REJECTED', draftCreatedAt: now },
+        `[Resolución del agente humano (${ref})] El agente rechazó el envío.`,
+      ],
+      [
+        {
+          decision: 'SHIPPING_EXPIRED',
+          draftCreatedAt: now,
+          reason: 'draft_expired',
+        },
+        `[Resolución del agente humano (${ref})] La cotización de envío ya no es válida.`,
+      ],
+    ];
+
+    it('renders exact amount-free turns leaking no pin/money/carrier/ETA/reason', () => {
+      for (const [resolution, expected] of cases) {
+        const text = formatResolutionAsUserTurn(shippingRequest, resolution);
+        expect(text).toBe(expected);
+        for (const leaked of [
+          '6901',
+          '69.01',
+          '12000',
+          '120.00',
+          'CARRIER_LEAK',
+          'SERVICE_LEAK',
+          'draft_expired',
+          now.slice(0, 10),
+        ]) {
+          expect(text).not.toContain(leaked);
+        }
+      }
     });
   });
 

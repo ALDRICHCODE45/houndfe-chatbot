@@ -286,12 +286,39 @@ function renderDigest(request: HumanHandoffRequest): string {
       break;
     }
     case 'shipping_approval': {
-      lines.push(`Responde con "${ref}: GENERIC:<texto>"`);
+      const d = request.digest as Extract<
+        HumanHandoffDigest,
+        { kind: 'shipping_approval' }
+      >;
+      lines.push(`Cobro de envío: ${formatCents(d.customerPaysCents)} MXN`);
+      lines.push(`Crédito total: ${formatCents(d.totalCreditCents)} MXN`);
+      lines.push(`Paquetería: ${d.carrierName}`);
+      lines.push(`Servicio: ${d.serviceName}`);
+      lines.push(
+        `Entrega estimada: ${
+          typeof d.estimatedDeliveryDays === 'number'
+            ? `${d.estimatedDeliveryDays} día(s)`
+            : 'no disponible'
+        }`,
+      );
+      lines.push(
+        `Responde con "${ref}: APPROVE_SHIPPING" o "${ref}: REJECT_SHIPPING"`,
+      );
       break;
     }
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Deterministic integer-cents money formatting (no `Intl`/locale): always
+ * exactly two decimals, so `0` → `0.00` and `6901` → `69.01`.
+ */
+function formatCents(cents: number): string {
+  const sign = cents < 0 ? '-' : '';
+  const abs = Math.abs(Math.trunc(cents));
+  return `${sign}${Math.trunc(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
 }
 
 /**
@@ -350,9 +377,10 @@ function parseResolution(
  * Format the resolution as a synthetic user turn that the runner can
  * forward into the customer's next LLM turn. The text carries the kind
  * + the resolved value in Mexican Spanish so the model can phrase a
- * coherent reply without needing the prior transcript.
+ * coherent reply without needing the prior transcript. The structured
+ * shipping decisions emit amount-free, decision-only turns (SQ-5C2c1).
  */
-function formatResolutionAsUserTurn(
+export function formatResolutionAsUserTurn(
   request: HumanHandoffRequest,
   resolution: HumanHandoffResolution,
 ): string {
@@ -368,5 +396,11 @@ function formatResolutionAsUserTurn(
       return `[Resolución del agente humano (${ref})] Sobre la fecha de caducidad, el agente responde: "${resolution.text}". Comparte esa respuesta con el cliente.`;
     case 'GENERIC':
       return `[Resolución del agente humano (${ref})] El agente responde: "${resolution.text}". Comparte esa respuesta con el cliente.`;
+    case 'SHIPPING_APPROVED':
+      return `[Resolución del agente humano (${ref})] El agente aprobó el envío.`;
+    case 'SHIPPING_REJECTED':
+      return `[Resolución del agente humano (${ref})] El agente rechazó el envío.`;
+    case 'SHIPPING_EXPIRED':
+      return `[Resolución del agente humano (${ref})] La cotización de envío ya no es válida.`;
   }
 }

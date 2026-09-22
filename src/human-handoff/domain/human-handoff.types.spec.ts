@@ -14,7 +14,7 @@ import {
  * Spec scenarios (human-handoff §"HumanHandoffKind discriminated union"):
  *   - HumanHandoffKind has four members (three active + one reserved for R6).
  *   - HumanHandoffDigest is a discriminated union with one shape per kind.
- *   - HumanHandoffResolution is a five-member discriminated union.
+ *   - HumanHandoffResolution is an eight-member discriminated union.
  *   - HumanHandoffRequest carries the full lifecycle record shape.
  */
 describe('human-handoff.domain.types', () => {
@@ -89,7 +89,7 @@ describe('human-handoff.domain.types', () => {
     ]);
   });
 
-  it('HumanHandoffResolution union has five members', () => {
+  it('HumanHandoffResolution union has eight members (five free-text + three shipping)', () => {
     const restock: HumanHandoffResolution = {
       decision: 'YES_RESTOCK_IN_X_DAYS',
       days: 3,
@@ -107,14 +107,30 @@ describe('human-handoff.domain.types', () => {
       decision: 'GENERIC',
       text: 'alguna nota',
     };
+    const shippingApproved: HumanHandoffResolution = {
+      decision: 'SHIPPING_APPROVED',
+      draftCreatedAt: '2026-06-23T12:00:00.000Z',
+    };
+    const shippingRejected: HumanHandoffResolution = {
+      decision: 'SHIPPING_REJECTED',
+      draftCreatedAt: '2026-06-23T12:00:00.000Z',
+    };
+    const shippingExpired: HumanHandoffResolution = {
+      decision: 'SHIPPING_EXPIRED',
+      draftCreatedAt: '2026-06-23T12:00:00.000Z',
+      reason: 'draft_expired',
+    };
     const resolutions: HumanHandoffResolution[] = [
       restock,
       noRestock,
       approvedPromo,
       expiration,
       generic,
+      shippingApproved,
+      shippingRejected,
+      shippingExpired,
     ];
-    expect(resolutions).toHaveLength(5);
+    expect(resolutions).toHaveLength(8);
   });
 
   it('HumanHandoffRequest carries the full lifecycle record shape', () => {
