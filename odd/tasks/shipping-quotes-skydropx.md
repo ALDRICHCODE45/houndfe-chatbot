@@ -82,7 +82,7 @@ Live activation remains blocked until all are observed:
     - [x] **SQ-4D1 — Bounded record construction:** normalize the full safe draft, enforce financial identities, and cap a versioned record to the 30-minute or earlier provider expiry without I/O.
     - [x] **SQ-4D2 — Conversation lifecycle:** read/expire, persist, and clear the validated record through the existing ConversationStore while preserving sibling state.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path (IN PROGRESS):** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
-  - [ ] **SQ-5A — Enabled-only application wiring (IN PROGRESS — candidate):** expose one `ShippingQuoteOrchestrator` only inside the exact enabled module graph and inject it optionally into the existing tool registry without changing the tool inventory.
+  - [x] **SQ-5A — Enabled-only application wiring:** expose one `ShippingQuoteOrchestrator` only inside the exact enabled module graph and inject it optionally into the existing tool registry without changing the tool inventory.
   - [ ] **SQ-5B — Internal quote tool:** register only when the orchestrator exists, reuse fresh drafts, persist bounded new drafts, and return no customer-visible price or provider detail to the model.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
@@ -339,6 +339,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Invalid drafts, clocks, states, hostile getters, and proxies fail before I/O. Store rejections propagate, the exact sender ID argument is preserved, and whole-bag read/modify/write remains intentionally bounded to the accepted single-writer-per-sender model.
 - Final verification: 25/25 focused tests and 514/514 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and exact 400-line complete review guard passed. Repository-wide spec diagnostics remain unrelated.
 - No migration, store-port change, provider/network call, credential access, customer message, push, deployment, or production configuration change occurred. Persistence remains internal and does not authorize customer visibility; shipping remains disabled by default.
+
+## SQ-5A evidence (independent `PASS`; native-approved as `review-405982314812c360`; locally delivered in commit `882ab41`)
+
+- Extended the exact enabled `ShippingModule.forRoot()` graph with one singleton `ShippingQuoteOrchestrator` built from the provider-neutral port. The disabled branch still exposes empty imports, providers, and exports and instantiates no shipping component.
+- Moved the single dynamic shipping import from `AppModule` into `SaleFlowModule`, avoiding duplicate provider graphs while making the optional orchestrator available to `RealToolRegistry` through the existing module boundary.
+- Added optional registry injection with a safe `null` default. SQ-5A intentionally keeps the tool inventory and model behavior unchanged at exactly 12 tools; customer-visible shipping remains impossible.
+- Final verification: 21/21 focused tests and 525/525 shipping-plus-focused-sale-flow tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 236-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- An accidental plain `stash@{0}` created by a baseline diagnostic contains a byte-equivalent safety copy of the committed candidate and no protected untracked inventory. It remains untouched because dropping it is destructive and was not authorized.
+- No provider/network call, database access, credential access, customer message, push, deployment, or production configuration change occurred; the exact default-off gate remains authoritative.
 
 ## Delivery gate
 
