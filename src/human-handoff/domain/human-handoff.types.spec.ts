@@ -1,9 +1,11 @@
 import {
+  ACTIVE_HUMAN_HANDOFF_KINDS,
   HUMAN_HANDOFF_KINDS,
   type HumanHandoffDigest,
   type HumanHandoffKind,
   type HumanHandoffRequest,
   type HumanHandoffResolution,
+  type ShippingApprovalDigest,
 } from './human-handoff.types';
 
 /**
@@ -25,13 +27,25 @@ describe('human-handoff.domain.types', () => {
     ]);
   });
 
-  it('HumanHandoffDigest discriminated union accepts all three active-kind shapes', () => {
+  it('ACTIVE_HUMAN_HANDOFF_KINDS keeps the three model-facing kinds (shipping_approval stays reserved)', () => {
+    expect(HUMAN_HANDOFF_KINDS).toHaveLength(4);
+    expect([...ACTIVE_HUMAN_HANDOFF_KINDS]).toEqual([
+      'out_of_stock',
+      'needs_human_review',
+      'expiration_date',
+    ]);
+    expect([...ACTIVE_HUMAN_HANDOFF_KINDS]).not.toContain('shipping_approval');
+  });
+
+  it('HumanHandoffDigest discriminated union accepts every known-kind shape', () => {
     const outOfStock: HumanHandoffDigest = {
+      kind: 'out_of_stock',
       productId: '00000000-0000-4000-8000-000000000001',
       name: 'Croquetas',
       quantity: 2,
     };
     const needsHumanReview: HumanHandoffDigest = {
+      kind: 'needs_human_review',
       items: [
         {
           productId: '00000000-0000-4000-8000-000000000001',
@@ -42,17 +56,37 @@ describe('human-handoff.domain.types', () => {
       originalTotalCents: 100,
     };
     const expirationDate: HumanHandoffDigest = {
+      kind: 'expiration_date',
       productId: '00000000-0000-4000-8000-000000000001',
       name: 'Croquetas',
       question: '¿cuál es la fecha de caducidad?',
+    };
+    const shippingApproval: ShippingApprovalDigest = {
+      kind: 'shipping_approval',
+      draftCreatedAt: '2026-06-23T12:00:00.000Z',
+      customerPaysCents: 6_900,
+      totalCreditCents: 12_000,
+      carrierName: 'Skydropx Express',
+      serviceName: 'DHL Express',
+      estimatedDeliveryDays: 3,
     };
     // Compile-time check: each variant satisfies the union.
     const digests: HumanHandoffDigest[] = [
       outOfStock,
       needsHumanReview,
       expirationDate,
+      shippingApproval,
     ];
-    expect(digests).toHaveLength(3);
+    expect(digests).toHaveLength(4);
+    expect(Object.keys(shippingApproval).sort()).toEqual([
+      'carrierName',
+      'customerPaysCents',
+      'draftCreatedAt',
+      'estimatedDeliveryDays',
+      'kind',
+      'serviceName',
+      'totalCreditCents',
+    ]);
   });
 
   it('HumanHandoffResolution union has five members', () => {
@@ -90,6 +124,7 @@ describe('human-handoff.domain.types', () => {
       agentId: 'OPS',
       kind: 'out_of_stock' satisfies HumanHandoffKind,
       digest: {
+        kind: 'out_of_stock',
         productId: '00000000-0000-4000-8000-000000000001',
         name: 'Croquetas',
       },

@@ -46,7 +46,8 @@ export type ActiveHumanHandoffKind =
 export type HumanHandoffDigest =
   | OutOfStockDigest
   | NeedsHumanReviewDigest
-  | ExpirationDateDigest;
+  | ExpirationDateDigest
+  | ShippingApprovalDigest;
 
 export interface OutOfStockDigest {
   kind: 'out_of_stock';
@@ -76,6 +77,23 @@ export interface ExpirationDateDigest {
   productId: string;
   name: string;
   question: string;
+}
+
+/**
+ * Redacted ops digest for the structured shipping-approval request (SQ-5C1).
+ * Exact server-owned fields only: net charge, total credit, carrier/service,
+ * estimated delivery days, and the draft-created pin. No quote/rate IDs,
+ * address, phone, product, measurements, raw provider/error, expiry/validity,
+ * best/gross/applied/unused amounts, or qualifying-unit count may escape.
+ */
+export interface ShippingApprovalDigest {
+  kind: 'shipping_approval';
+  draftCreatedAt: string;
+  customerPaysCents: number;
+  totalCreditCents: number;
+  carrierName: string;
+  serviceName: string;
+  estimatedDeliveryDays: number | null;
 }
 
 /** Discriminated union of valid agent decisions, parsed from the
