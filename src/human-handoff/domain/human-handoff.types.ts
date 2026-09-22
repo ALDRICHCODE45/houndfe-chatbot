@@ -17,9 +17,12 @@
  *   - `HumanHandoffDigest` — per-kind payload; persisted under
  *     `human_handoff_requests.digest` as jsonb.
  *   - `HumanHandoffResolution` — five-member discriminated union parsed
- *     from the human's free-text reply.
+ *     from the human's free-text reply. The structured shipping resolution
+ *     shapes are exported separately below and activate in SQ-5C2c.
  *   - `HumanHandoffRequest` — full lifecycle row.
  */
+
+import type { ShippingApprovalStaleKind } from './shipping-approval-policy.port';
 
 /** All known kinds. `shipping_approval` is reserved for the future R6
  *  slice; the tool's inputSchema rejects it today. */
@@ -127,6 +130,30 @@ export interface ExpirationResolution {
 export interface GenericResolution {
   decision: 'GENERIC';
   text: string;
+}
+
+/**
+ * Standalone structured shipping-approval decisions (SQ-5C2b). Exact fields
+ * only: the draft-created pin plus, for expiry, the stale reason. No price,
+ * credit, carrier/service, ETA, provider, customer/address/phone, reason, or
+ * free text is carried on approve/reject; expired carries only the finite
+ * reason. SQ-5C2c activates these atomically once the exhaustive service
+ * formatter/resolver handles them.
+ */
+export interface ShippingApprovedResolution {
+  readonly decision: 'SHIPPING_APPROVED';
+  readonly draftCreatedAt: string;
+}
+
+export interface ShippingRejectedResolution {
+  readonly decision: 'SHIPPING_REJECTED';
+  readonly draftCreatedAt: string;
+}
+
+export interface ShippingExpiredResolution {
+  readonly decision: 'SHIPPING_EXPIRED';
+  readonly draftCreatedAt: string;
+  readonly reason: ShippingApprovalStaleKind;
 }
 
 /** Full lifecycle record for a single handoff request. */

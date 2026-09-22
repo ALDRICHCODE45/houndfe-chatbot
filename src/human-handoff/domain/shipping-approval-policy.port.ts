@@ -26,6 +26,26 @@ export type ShippingApprovalPinResult =
 /** Finite verdict kinds, exported for exhaustive consumers. */
 export type ShippingApprovalPinKind = ShippingApprovalPinResult['kind'];
 
+/** Canonical decision tokens; readonly alias of the decision discriminant. */
+export type ShippingApprovalDecisionKind = ShippingApprovalDecision['decision'];
+
+/** Stale/exhaustion reason kinds: every pin verdict except `valid`. */
+export type ShippingApprovalStaleKind = Exclude<
+  ShippingApprovalPinKind,
+  'valid'
+>;
+
+/** Frozen local approval marker stored under the `shippingApproval`
+ *  conversation key. Exact fields only — no price, credit, carrier/
+ *  service, ETA, provider IDs/data, customer/address/phone, reason, or
+ *  free text may escape. */
+export interface ShippingApprovalMarker {
+  readonly requestId: string;
+  readonly draftCreatedAt: string;
+  readonly decision: ShippingApprovalDecisionKind;
+  readonly decidedAt: string;
+}
+
 /** Port implemented by the shipping application's pure adapter:
  *  `parseDecision` strictly parses one ops decision (never throws);
  *  `verifyDraftPin` verifies one draft-created pin against the current
