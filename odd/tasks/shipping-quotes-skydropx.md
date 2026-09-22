@@ -72,7 +72,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3C1 — Rate-element mapper:** pure, never-throwing `mapSkydropxRate(raw)` maps one shallow current Skydropx `/api/v1` rate element into `ShippingQuoteRate | null` using `total`, exact MXN decimal-to-cents conversion, adjacent-cent uniqueness for numeric JSON values, strict field guards, one-read snapshots, and secret-safe fresh output.
 - [x] **SQ-3C2 — Quotation filter/envelope mapper:** filter invalid provider rates and build provider-neutral quotation results/delegated envelopes from mapped rates and finite errors.
 - [x] **SQ-3C3 — Request-to-wire mapper:** convert the provider-neutral shipping request into the Skydropx V1 wire payload. Sandbox UI evidence confirms dimensions in centimeters and weight in kilograms, so C3 maps `weightGrams/1000` and passes dimensions through; current official `POST /api/v1/quotations` V1 docs omit unit/package fields (`mass_unit`, `dimension_unit`, `package`/`package_type`), so the emitted wire body is addresses plus parcels only.
-- [ ] **SQ-3C4 — Provider adapter (IN PROGRESS — candidate):** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
+- [x] **SQ-3C4 — Provider adapter:** implement `ShippingQuoteProviderPort` over token/creation/poll/mapping and return `no_rates` when no rate survives filtering.
 - [ ] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
@@ -263,6 +263,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Boundary safety: raw request/address/parcel fields, array length, and every parcel index are snapshotted once; invalid, sparse, class, hostile, or stateful inputs fail closed; valid output is exact-key, fresh, ordered, and deeply frozen.
 - Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit`, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated. Native advisory `R3-unbounded-parcel-snapshot` is informational and belongs to later readiness/adapter bounds rather than this deterministic mapper.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred during implementation or verification; earlier separately authorized sandbox observations remain operational evidence only.
+
+## SQ-3C4 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-f656da960b012172`; locally delivered in commit `02d4613`)
+
+- Work unit: stateless provider-port orchestration over the committed request mapper, quotation create/poll client, and quotation mapper — 398 complete changed lines, within the review guard.
+- Focused TDD RED: missing provider module. Final GREEN: 9/9 adapter tests and 297/297 shipping tests.
+- Control flow: invalid neutral input fails before I/O; create runs once; only a validated path-safe created ID reaches one bounded poll call; completed poll IDs must match exactly; rates are delegated once to C2.
+- Boundary safety: runtime create/poll outcomes are snapshotted once; finite errors are normalized; malformed or hostile structures fail closed; synchronous throws and rejected calls return secret-safe `upstream_unavailable`; raw rates and arbitrary fields never escape or remain referenced.
+- Determinism: empty/all-invalid rates return `no_rates`, valid survivors preserve provider order, dependency ordering is exact, and concurrent requests cannot cross IDs, payloads, or results.
+- Scoped ESLint, Prettier, production typecheck, focused/shipping Jest, scoped `tsc --noEmit`, and `git diff --check` passed; repository-wide spec diagnostics remain unrelated. Native advisory `R3-revoked-proxy` is informational and does not reopen the approved candidate.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred during C4 implementation or verification; the earlier corrected sandbox component flow remains the live evidence.
 
 ## Delivery gate
 
