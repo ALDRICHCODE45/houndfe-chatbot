@@ -79,7 +79,7 @@ Live activation remains blocked until all are observed:
   - [x] **SQ-4B — Exact request assembly:** build a bounded provider-neutral request only from exact MX addresses, readiness-approved items, and one explicit prepared parcel whose weight matches the cart.
   - [x] **SQ-4C — Provider-to-draft orchestration**
   - [ ] **SQ-4D — Bounded draft persistence:** persist one validated internal quote draft in existing conversation JSONB with a 30-minute chatbot TTL, earlier provider-expiry cap, fail-closed reads, and explicit clear semantics; no migration or customer visibility.
-    - [ ] **SQ-4D1 — Bounded record construction (IN PROGRESS — candidate):** normalize the full safe draft, enforce financial identities, and cap a versioned record to the 30-minute or earlier provider expiry without I/O.
+    - [x] **SQ-4D1 — Bounded record construction:** normalize the full safe draft, enforce financial identities, and cap a versioned record to the 30-minute or earlier provider expiry without I/O.
     - [ ] **SQ-4D2 — Conversation lifecycle:** read/expire, persist, and clear the validated record through the existing ConversationStore while preserving sibling state.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
@@ -318,6 +318,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Final verification: 71/71 focused tests and 465/465 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 395-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - Native advisory `R3-frozen-input-proxy-invariant` is informational and did not open a correction; the approved receipt stands.
 - No provider/network call, credential access, persistence mutation, customer message, push, deployment, or production configuration change occurred; shipping remains disabled by default.
+
+## SQ-4D1 evidence (independent `PASS_WITH_WARNINGS`; native review unavailable; locally delivered in commit `618e80b`)
+
+- Added a pure version-1 internal draft record with a fixed 30-minute chatbot TTL capped by either earlier provider expiry. Provider boundaries at or before creation, invalid clocks, malformed drafts, and inconsistent financial identities fail closed.
+- The record preserves the full normalized provider-neutral draft, enforces qualifying-unit credit, applied/unused/customer-payment identities, strips arbitrary data, and returns fresh exact-key deeply frozen copies without source references.
+- Structural normalization validates schema version, canonical timestamps, creation-before-expiry, maximum TTL, provider caps, and the embedded draft without reading the current clock or performing I/O.
+- Final verification: 24/24 focused tests and 489/489 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 398-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- Native lineage `review-2ccdaaacf909c608` could not admit its materialized reviewer after the model change: exact fresh provider bindings were repeatedly rejected as belonging to another session route. The read-only assessment therefore reported native review unavailable and required the independent verifier, which passed; no native approval is claimed.
+- No conversation write, migration, provider/network call, credential access, customer message, push, deployment, or production configuration change occurred; shipping remains disabled by default and SQ-4D2 still owns persistence.
 
 ## Delivery gate
 
