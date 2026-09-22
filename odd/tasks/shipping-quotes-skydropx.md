@@ -86,8 +86,8 @@ Live activation remains blocked until all are observed:
   - [ ] **SQ-5B — Internal quote tool:** register only when the orchestrator exists, reuse fresh drafts, persist bounded new drafts, and return no customer-visible price or provider detail to the model.
     - [x] **SQ-5B1 — Measured demo profile:** normalize one exact versioned real measured item/parcel profile and match it only to the identical bounded cart; fail closed everywhere else.
     - [ ] **SQ-5B2 — Price-stripped quote tool:** resolve origin, stored customer destination, cart, and measured profile server-side; reuse fresh drafts, quote once, persist internally, and expose only finite non-price outcomes to the model.
-      - [ ] **SQ-5B2A — Private measured-profile configuration (IN PROGRESS — candidate):** parse one optional private JSON profile and exact origin into safe normalized server-owned inputs only inside the enabled module graph.
-      - [ ] **SQ-5B2B — Tool execution and registration:** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
+      - [x] **SQ-5B2A — Private measured-profile configuration:** parse one optional private JSON profile and exact origin into safe normalized server-owned inputs only inside the enabled module graph.
+      - [ ] **SQ-5B2B — Tool execution and registration (IN PROGRESS):** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
@@ -360,6 +360,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Outputs are fresh exact-key deeply frozen objects in SQ-4B-compatible shape. Arbitrary extras, secrets, and source references are removed; missing or invalid profiles never inspect the cart and never quote.
 - Final verification: 102/102 focused tests and 616/616 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 359-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - No environment/config wiring, provider/network call, database access, customer message, push, deployment, or production configuration change occurred. Actual physical measurements remain separately required before the demo profile can be configured.
+
+## SQ-5B2A evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-9ea2b669f4b72edd`; locally delivered in commit `734cfa9`)
+
+- Added optional private `SHIPPING_DEMO_PARCEL_PROFILE_JSON` passthrough to the configuration factory. Blank input becomes absent; JSON parsing is intentionally deferred so a missing or malformed demo profile never makes application boot fatal.
+- Added a never-throwing application membrane that reads the raw profile and four configured origin fields once each, bounds raw JSON to 16,384 code units, normalizes only through SQ-5B1, and returns a fresh exact-key deeply frozen `{ profile, origin }` or `null` without logging or retaining the raw source.
+- Registered and exported one `MEASURED_DEMO_SHIPPING_CONFIG` provider only inside the exact enabled `ShippingModule` graph. The disabled graph remains empty, and enabled startup can safely resolve the token to `null` when the profile is unavailable.
+- Final verification: 87/87 focused tests and 693/693 shipping-plus-configuration tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 398-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- Native advisory `R3-profile-size-cap-bypass` is informational: the factory can momentarily retain a larger raw environment string, but the only consumer rejects anything beyond the bounded membrane before parsing or use; the approved receipt stands.
+- No actual measurements, tool registration, provider/network call, database access, customer message, push, deployment, or production configuration change occurred. Shipping remains disabled by default.
 
 ## Delivery gate
 
