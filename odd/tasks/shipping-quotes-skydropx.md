@@ -84,7 +84,7 @@ Live activation remains blocked until all are observed:
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path (IN PROGRESS):** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
   - [x] **SQ-5A — Enabled-only application wiring:** expose one `ShippingQuoteOrchestrator` only inside the exact enabled module graph and inject it optionally into the existing tool registry without changing the tool inventory.
   - [ ] **SQ-5B — Internal quote tool:** register only when the orchestrator exists, reuse fresh drafts, persist bounded new drafts, and return no customer-visible price or provider detail to the model.
-    - [ ] **SQ-5B1 — Measured demo profile (IN PROGRESS — candidate):** normalize one exact versioned real measured item/parcel profile and match it only to the identical bounded cart; fail closed everywhere else.
+    - [x] **SQ-5B1 — Measured demo profile:** normalize one exact versioned real measured item/parcel profile and match it only to the identical bounded cart; fail closed everywhere else.
     - [ ] **SQ-5B2 — Price-stripped quote tool:** resolve origin, stored customer destination, cart, and measured profile server-side; reuse fresh drafts, quote once, persist internally, and expose only finite non-price outcomes to the model.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
@@ -350,6 +350,14 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Final verification: 21/21 focused tests and 525/525 shipping-plus-focused-sale-flow tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 236-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - An accidental plain `stash@{0}` created by a baseline diagnostic contains a byte-equivalent safety copy of the committed candidate and no protected untracked inventory. It remains untouched because dropping it is destructive and was not authorized.
 - No provider/network call, database access, credential access, customer message, push, deployment, or production configuration change occurred; the exact default-off gate remains authoritative.
+
+## SQ-5B1 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-538b9b82f6ef705e`; locally delivered in commit `4ddb89a`)
+
+- Added a pure version-1 runtime membrane for one real measured demo-cart profile with one to twenty exact item lines and one explicit parcel. It validates generic UUIDs, positive safe measurements and quantities, unique item identities, overflow-safe total weight, exact parcel-weight identity, and the committed 25 kg one-parcel cap.
+- Added exact cart matching by product, normalized variant, and quantity multiset. Reordered carts are accepted; subsets, supersets, duplicates, sparse/inherited arrays, hostile values, and weight-only matches fail closed. Current cart prices are copied only after identity matches.
+- Outputs are fresh exact-key deeply frozen objects in SQ-4B-compatible shape. Arbitrary extras, secrets, and source references are removed; missing or invalid profiles never inspect the cart and never quote.
+- Final verification: 102/102 focused tests and 616/616 shipping tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 359-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- No environment/config wiring, provider/network call, database access, customer message, push, deployment, or production configuration change occurred. Actual physical measurements remain separately required before the demo profile can be configured.
 
 ## Delivery gate
 
