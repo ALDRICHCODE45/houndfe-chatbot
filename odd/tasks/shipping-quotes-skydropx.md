@@ -76,7 +76,7 @@ Live activation remains blocked until all are observed:
 - [x] **SQ-3D — Add default-off module wiring:** register the provider/adapter only when `shippingQuotes.enabled` is true.
 - [ ] **SQ-4 — Build draft quote orchestration:** validate origin/destination/package inputs, call the provider, choose the best eligible rate deterministically, apply credit, persist bounded quote state/expiry, and return structured unavailable/handoff results.
   - [x] **SQ-4A — Draft selection and credit:** pure deterministic best-rate selection and credit composition over the committed quote normalizer and credit rule; no provider, persistence, or customer-facing output.
-  - [ ] **SQ-4B — Exact request assembly (IN PROGRESS — candidate)**
+  - [x] **SQ-4B — Exact request assembly:** build a bounded provider-neutral request only from exact MX addresses, readiness-approved items, and one explicit prepared parcel whose weight matches the cart.
 - [ ] **SQ-5 — Add the disabled conversation and human-approval path:** register the tool only when enabled, update deterministic sale-flow instructions, activate `shipping_approval`, prevent customer-facing quote claims before approval, and block sale continuation where shipping cannot be persisted honestly.
 - [ ] **SQ-6 — Add operations evidence:** add redacted telemetry/logging, offline preflight coverage, provider/setup runbook, sandbox smoke procedure, rollback, and explicit activation blockers.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
@@ -295,6 +295,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Final verification: 33/33 focused tests and 340/340 shipping tests; scoped lint, format, production typecheck, shipping spec diagnostics, diff, index, artifact, and 396-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - Native advisory `R3-incomplete-rate-order` is informational: provider expiry is intentionally excluded from the approved business tie-break; otherwise-equal normalized rates preserve the first.
 - No provider/network call, credential access, push, deployment, or production configuration change occurred; shipping remains disabled by default.
+
+## SQ-4B evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-bfd0433472a71f79`; locally delivered in commit `b903d00`)
+
+- Added a pure request assembler that maps exact origin/destination fields to MX addresses, maps destination postal code only from `zipCode`, and never substitutes city or other customer fields.
+- Product measurements are readiness evidence only: the assembler never infers packing dimensions or treats a single-package candidate as packed. A quote requires one explicit prepared parcel whose exact weight matches the readiness total.
+- Empty, sparse, inherited-index, malformed, hostile, or over-bound item/parcel collections fail closed. More than 25 kg returns manual packing with the minimum package count before parcels are read; automatic splitting remains forbidden.
+- Validation is stage-lazy and deterministic: invalid origin does not read destination/items/parcels; invalid destination does not read items/parcels; readiness failures do not read parcels. Runtime fields and own array indexes are read once and never retained.
+- Ready outputs are exact-key, fresh, deeply frozen, bounded to 20 technical parcel entries, stripped of arbitrary/customer/secret fields, and contain no copy, state, provider call, or I/O.
+- Final verification: 54/54 focused tests and 394/394 shipping tests; scoped lint, format, production typecheck, shipping spec diagnostics, diff, index, artifact, and 386-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- No provider/network call, credential access, push, deployment, or production configuration change occurred; real shipping remains unavailable until an explicit prepared-parcel source exists and the feature is separately activated.
 
 ## Delivery gate
 
