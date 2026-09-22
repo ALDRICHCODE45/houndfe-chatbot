@@ -88,8 +88,8 @@ Live activation remains blocked until all are observed:
     - [ ] **SQ-5B2 — Price-stripped quote tool:** resolve origin, stored customer destination, cart, and measured profile server-side; reuse fresh drafts, quote once, persist internally, and expose only finite non-price outcomes to the model.
       - [x] **SQ-5B2A — Private measured-profile configuration:** parse one optional private JSON profile and exact origin into safe normalized server-owned inputs only inside the enabled module graph.
       - [ ] **SQ-5B2B — Tool execution and registration (IN PROGRESS):** derive strict Mexican phone identity, resolve stored cart/address, reuse or create one internal draft, and expose no monetary, carrier, address, or provider detail to the model.
-        - [ ] **SQ-5B2B1 — Strict Mexican sender identity (IN PROGRESS — candidate):** accept only Meta digit-only `52` plus ten digits or legacy `521` plus ten digits, returning backend country code `52` and the exact ten-digit phone.
-        - [ ] **SQ-5B2B2 — Price-stripped tool core:** resolve state, fresh draft, measured cart, stored customer address, quote, and persistence with one server-owned clock and finite non-price results.
+        - [x] **SQ-5B2B1 — Strict Mexican sender identity:** accept only Meta digit-only `52` plus ten digits or legacy `521` plus ten digits, returning backend country code `52` and the exact ten-digit phone.
+        - [ ] **SQ-5B2B2 — Price-stripped tool core (IN PROGRESS — candidate):** resolve state, fresh draft, measured cart, stored customer address, quote, and persistence with one server-owned clock and finite non-price results.
         - [ ] **SQ-5B2B3 — Enabled-only registration:** expose the tool only when orchestrator and measured config exist, add exact AI SDK runtime context, and preserve the disabled twelve-tool inventory.
   - [ ] **SQ-5C — Structured shipping approval:** activate a bounded redacted `shipping_approval` request and pin approval to an unexpired internal draft; no arbitrary approval text or address/secret exposure.
   - [ ] **SQ-5D — Honest sale-continuation gate:** refuse sale continuation while shipping is unresolved or its approved charge cannot be persisted by the backend contract.
@@ -372,6 +372,14 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Final verification: 87/87 focused tests and 693/693 shipping-plus-configuration tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 398-line review guard passed. Repository-wide spec diagnostics remain unrelated.
 - Native advisory `R3-profile-size-cap-bypass` is informational: the factory can momentarily retain a larger raw environment string, but the only consumer rejects anything beyond the bounded membrane before parsing or use; the approved receipt stands.
 - No actual measurements, tool registration, provider/network call, database access, customer message, push, deployment, or production configuration change occurred. Shipping remains disabled by default.
+
+## SQ-5B2B1 evidence (independent `PASS_WITH_WARNINGS`; native-approved as `review-e920e874266cebed`; locally delivered in commit `71b13ae`)
+
+- Added a pure server-identity boundary for Meta sender IDs. It accepts only primitive ASCII digit strings in modern `52` plus ten digits or legacy `521` plus ten digits, normalizing both to backend country code `52` and the exact ten-digit national phone.
+- Every other country, prefix, length, encoding, whitespace/punctuation form, coercible value, and non-string fails closed without property access, logging, or I/O. Outputs are fresh exact-key frozen values; internal zeros are preserved and an ambiguous leading zero is rejected for the approved Mexico-only demo scope.
+- Final verification: 40/40 focused tests and 247/247 sale-flow tests; scoped lint, format, production typecheck, candidate spec diagnostics, diff, index, artifact, and 170-line review guard passed. Repository-wide spec diagnostics remain unrelated.
+- Native advisory `R3-leading-zero-contract` is informational and matches the explicitly selected strict Mexico-only rule; the approved receipt stands.
+- No backend lookup, tool registration, network call, database access, customer message, push, deployment, or production configuration change occurred.
 
 ## Delivery gate
 
