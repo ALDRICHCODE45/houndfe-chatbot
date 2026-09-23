@@ -20,6 +20,10 @@ import type {
   HumanHandoffResolution,
 } from '../domain/human-handoff.types';
 import {
+  SHIPPING_APPROVAL_POLICY,
+  type ShippingApprovalPolicy,
+} from '../domain/shipping-approval-policy.port';
+import {
   clearPendingHumanRequest,
   readPendingHumanRequest,
   setPendingHumanRequest,
@@ -100,6 +104,8 @@ export class HumanHandoffService {
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore: ConversationStore,
     private readonly configService: ConfigService,
+    @Inject(SHIPPING_APPROVAL_POLICY)
+    private readonly shippingApprovalPolicy: ShippingApprovalPolicy,
   ) {}
 
   isOpsSender(senderId: string): boolean {

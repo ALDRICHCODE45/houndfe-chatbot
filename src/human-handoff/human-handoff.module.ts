@@ -4,8 +4,10 @@ import { DatabaseModule } from '../database/database.module';
 import { ConversationModule } from '../conversation/conversation.module';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
+import { shippingApprovalPolicyAdapter } from '../shipping/application/shipping-approval-policy.adapter';
 import { HumanHandoffService } from './application/human-handoff.service';
 import { HUMAN_HANDOFF_STORE } from './domain/human-handoff-store.port';
+import { SHIPPING_APPROVAL_POLICY } from './domain/shipping-approval-policy.port';
 import { PostgresHumanHandoffStore } from './infrastructure/postgres-human-handoff.store';
 
 /**
@@ -40,6 +42,13 @@ import { PostgresHumanHandoffStore } from './infrastructure/postgres-human-hando
   ],
   providers: [
     { provide: HUMAN_HANDOFF_STORE, useClass: PostgresHumanHandoffStore },
+    // Bind the domain-owned policy token to the committed frozen adapter
+    // (identity via `useValue`); the token stays module-private and is
+    // never exported to model-facing consumers.
+    {
+      provide: SHIPPING_APPROVAL_POLICY,
+      useValue: shippingApprovalPolicyAdapter,
+    },
     HumanHandoffService,
     // Re-export the service under the symbol the registry / dispatcher
     // resolve, so consumers don't have to import the internal class.

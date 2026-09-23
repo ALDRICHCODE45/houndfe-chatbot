@@ -4,6 +4,7 @@ import type {
   ConversationState,
 } from '../../conversation/domain/conversation-store';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import { shippingApprovalPolicyAdapter } from '../../shipping/application/shipping-approval-policy.adapter';
 import type {
   CreateHumanHandoffInput,
   HumanHandoffStore,
@@ -89,6 +90,7 @@ describe('HumanHandoffService', () => {
       whatsappSender,
       conversationStore,
       configService,
+      shippingApprovalPolicyAdapter,
     );
   });
 
@@ -127,6 +129,7 @@ describe('HumanHandoffService', () => {
           get: (key: string) =>
             key === 'humanHandoff.enabled' ? true : undefined,
         } as unknown as ConfigService,
+        shippingApprovalPolicyAdapter,
       );
       expect(noOps.isOpsSender('5219999888777')).toBe(false);
     });
@@ -142,6 +145,7 @@ describe('HumanHandoffService', () => {
               ? OPS
               : key === 'meta.sandboxRecipientNormalizationEnabled',
         } as unknown as ConfigService,
+        shippingApprovalPolicyAdapter,
       );
 
       expect(sandboxService.isOpsSender('5219999888777')).toBe(true);
@@ -284,6 +288,7 @@ describe('HumanHandoffService', () => {
         whatsappSender,
         conversationStore,
         disabledConfig,
+        shippingApprovalPolicyAdapter,
       );
 
       const result = await disabled.create({
@@ -752,6 +757,7 @@ describe('HumanHandoffService', () => {
           whatsappSender,
           conversationStore,
           procCfg,
+          shippingApprovalPolicyAdapter,
         );
         expect(svc.isOpsSender('5219999888777')).toBe(true);
       } finally {
