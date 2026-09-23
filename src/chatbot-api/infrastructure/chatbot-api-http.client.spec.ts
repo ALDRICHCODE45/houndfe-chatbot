@@ -1,5 +1,6 @@
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
+import { AxiosHeaders, type AxiosResponse } from 'axios';
 import { of, throwError } from 'rxjs';
 import {
   AuthError,
@@ -13,45 +14,58 @@ import {
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
 import { CancelSaleInputSchema } from '../domain/dtos/sales.dto';
 
+function axiosResponse<T>(data: T, status = 200): AxiosResponse<T> {
+  return {
+    data,
+    status,
+    statusText: '',
+    headers: {},
+    config: { headers: new AxiosHeaders() },
+  };
+}
+
 describe('ChatbotApiHttpClient', () => {
-  let httpService: jest.Mocked<Pick<HttpService, 'request'>>;
-  let configService: jest.Mocked<Pick<ConfigService, 'getOrThrow'>>;
+  // Test-only DI bridge: the client requires a full `HttpService`, so a partial
+  // Jest mock cannot be handed to it without an unsafe cast. We build a real
+  // `HttpService`, install the `request` spy before the client is constructed
+  // (so no test can reach the network), pass the real service to the client,
+  // and keep a typed handle to that same spy as `httpService`.
+  let httpService: { request: jest.SpiedFunction<HttpService['request']> };
+  let configService: ConfigService;
   let sleep: jest.Mock<Promise<void>, [number]>;
   let client: ChatbotApiHttpClient;
 
   beforeEach(() => {
+    const service = new HttpService();
+
     httpService = {
-      request: jest.fn(),
+      request: jest
+        .spyOn(service, 'request')
+        .mockImplementation(() =>
+          throwError(() => new Error('unexpected network request')),
+        ),
     };
 
-    configService = {
-      getOrThrow: jest.fn((key: string) => {
-        const values: Record<string, string | number> = {
-          'chatbotApi.baseUrl': 'https://backend.example.com',
-          'chatbotApi.serviceKey': 'svc_test_key',
-          'chatbotApi.branchId': 'branch-123',
-          'receiptMedia.attachTimeoutMs': 15000,
-        };
-
-        return values[key];
-      }),
-    };
+    // Real in-memory `ConfigService`: `chatbotApi.*` and
+    // `receiptMedia.attachTimeoutMs` resolve through the internal config via
+    // dot-notation, matching the production runtime contract instead of a
+    // partial mock of the overloaded `getOrThrow`.
+    configService = new ConfigService({
+      chatbotApi: {
+        baseUrl: 'https://backend.example.com',
+        serviceKey: 'svc_test_key',
+        branchId: 'branch-123',
+      },
+      receiptMedia: { attachTimeoutMs: 15000 },
+    });
 
     sleep = jest.fn<Promise<void>, [number]>().mockResolvedValue(undefined);
 
-    client = new ChatbotApiHttpClient(
-      httpService as HttpService,
-      configService as ConfigService,
-      sleep,
-    );
+    client = new ChatbotApiHttpClient(service, configService, sleep);
   });
 
   it('sends Bearer and X-Branch-Id headers on read requests', async () => {
-    httpService.request.mockReturnValue(
-      of({
-        data: [],
-      }),
-    );
+    httpService.request.mockReturnValue(of(axiosResponse([])));
 
     await expect(client.searchCatalog('croquetas', 5)).resolves.toEqual([]);
 
@@ -109,8 +123,8 @@ describe('ChatbotApiHttpClient', () => {
         })),
       )
       .mockReturnValueOnce(
-        of({
-          data: {
+        of(
+          axiosResponse({
             found: true,
             customer: {
               customerId: 'customer-1',
@@ -121,8 +135,8 @@ describe('ChatbotApiHttpClient', () => {
               preferredPaymentMethod: null,
               address: null,
             },
-          },
-        }),
+          }),
+        ),
       );
 
     await expect(
@@ -234,8 +248,8 @@ describe('ChatbotApiHttpClient', () => {
 
   it('sets X-Idempotency-Key when creating a sale', async () => {
     httpService.request.mockReturnValue(
-      of({
-        data: {
+      of(
+        axiosResponse({
           saleId: 'sale-1',
           folio: 'F-001',
           paymentStatus: 'CREDIT',
@@ -245,8 +259,8 @@ describe('ChatbotApiHttpClient', () => {
           paidCents: 0,
           debtCents: 10000,
           confirmedAt: null,
-        },
-      }),
+        }),
+      ),
     );
 
     await client.createSale(
@@ -299,7 +313,7 @@ describe('ChatbotApiHttpClient', () => {
   });
 
   it('percent-encodes the phone path segment in getOrderHistory', async () => {
-    httpService.request.mockReturnValue(of({ data: [] }));
+    httpService.request.mockReturnValue(of(axiosResponse([])));
 
     await client.getOrderHistory('+5215550001111', '52');
 
@@ -311,7 +325,7 @@ describe('ChatbotApiHttpClient', () => {
   });
 
   it('percent-encodes a phone containing a slash to block path traversal', async () => {
-    httpService.request.mockReturnValue(of({ data: [] }));
+    httpService.request.mockReturnValue(of(axiosResponse([])));
 
     await client.getOrderHistory('/555/0001111', '52');
 
@@ -323,7 +337,7 @@ describe('ChatbotApiHttpClient', () => {
   });
 
   it('percent-encodes productId, saleId, and order-history phone segments', async () => {
-    httpService.request.mockReturnValue(of({ data: {} }));
+    httpService.request.mockReturnValue(of(axiosResponse({})));
 
     await client.getStock('prod+with/slash');
     await client
@@ -538,8 +552,8 @@ describe('ChatbotApiHttpClient', () => {
 
   it('forwards expectedTotalCents when present in the createSale DTO', async () => {
     httpService.request.mockReturnValue(
-      of({
-        data: {
+      of(
+        axiosResponse({
           saleId: 'sale-1',
           folio: null,
           paymentStatus: 'CREDIT',
@@ -550,8 +564,8 @@ describe('ChatbotApiHttpClient', () => {
           debtCents: 1000,
           confirmedAt: null,
           discountCents: 0,
-        },
-      }),
+        }),
+      ),
     );
     await client.createSale(
       {
@@ -575,8 +589,8 @@ describe('ChatbotApiHttpClient', () => {
 
   it('omits expectedTotalCents entirely when absent or null in the DTO (no key, no 0, no null)', async () => {
     httpService.request.mockReturnValue(
-      of({
-        data: {
+      of(
+        axiosResponse({
           saleId: 'sale-1',
           folio: null,
           paymentStatus: 'CREDIT',
@@ -587,8 +601,8 @@ describe('ChatbotApiHttpClient', () => {
           debtCents: 1000,
           confirmedAt: null,
           discountCents: 0,
-        },
-      }),
+        }),
+      ),
     );
     await client.createSale(
       {
@@ -639,8 +653,8 @@ describe('ChatbotApiHttpClient', () => {
 
   it('resolves BotSaleResponse.discountCents from the body (100) and defaults to 0 when the body omits it', async () => {
     httpService.request.mockReturnValueOnce(
-      of({
-        data: {
+      of(
+        axiosResponse({
           saleId: 'sale-1',
           folio: null,
           paymentStatus: 'CREDIT',
@@ -651,8 +665,8 @@ describe('ChatbotApiHttpClient', () => {
           debtCents: 900,
           confirmedAt: null,
           discountCents: 100,
-        },
-      }),
+        }),
+      ),
     );
     await expect(
       client.createSale(
@@ -673,8 +687,8 @@ describe('ChatbotApiHttpClient', () => {
     ).resolves.toEqual(expect.objectContaining({ discountCents: 100 }));
 
     httpService.request.mockReturnValueOnce(
-      of({
-        data: {
+      of(
+        axiosResponse({
           saleId: 'sale-2',
           folio: null,
           paymentStatus: 'CREDIT',
@@ -685,8 +699,8 @@ describe('ChatbotApiHttpClient', () => {
           debtCents: 1000,
           confirmedAt: null,
           // no discountCents in the body
-        },
-      }),
+        }),
+      ),
     );
     await expect(
       client.createSale(
@@ -709,8 +723,8 @@ describe('ChatbotApiHttpClient', () => {
 
   it('getPaymentDetails issues GET /chatbot-api/payment-details with no params and no body, returns the PaymentDetail projection', async () => {
     httpService.request.mockReturnValue(
-      of({
-        data: {
+      of(
+        axiosResponse({
           id: 'p-1',
           bankName: 'AFIRME',
           beneficiary: 'HUN F.E. COMERCIALIZADORA SA DE CV',
@@ -718,8 +732,8 @@ describe('ChatbotApiHttpClient', () => {
           accountNumber: '1234567890',
           isActive: true,
           updatedAt: '2026-08-24T12:00:00.000Z',
-        },
-      }),
+        }),
+      ),
     );
     await expect(client.getPaymentDetails()).resolves.toEqual({
       id: 'p-1',
@@ -814,7 +828,7 @@ describe('ChatbotApiHttpClient', () => {
       restockedItems: [{ productId: 'p-1', variantId: null, quantity: 2 }],
       canceledAt: '2026-08-25T12:00:00.000Z',
     };
-    httpService.request.mockReturnValue(of({ data: body }));
+    httpService.request.mockReturnValue(of(axiosResponse(body)));
 
     await expect(
       client.cancelSale('sale-1', {
@@ -845,15 +859,15 @@ describe('ChatbotApiHttpClient', () => {
 
   it('cancelSale percent-encodes the saleId path segment', async () => {
     httpService.request.mockReturnValue(
-      of({
-        data: {
+      of(
+        axiosResponse({
           saleId: 'sale+id/1',
           status: 'CANCELED',
           refundedCents: 0,
           restockedItems: [],
           canceledAt: '2026-08-25T12:00:00.000Z',
-        },
-      }),
+        }),
+      ),
     );
     await client.cancelSale('sale+id/1', {
       reason: 'CUSTOMER_REQUEST',
@@ -871,7 +885,7 @@ describe('ChatbotApiHttpClient', () => {
       restockedItems: [{ productId: 'p-1', variantId: null, quantity: 2 }],
       canceledAt: '2026-08-25T12:00:00.000Z',
     };
-    httpService.request.mockReturnValue(of({ data: projection }));
+    httpService.request.mockReturnValue(of(axiosResponse(projection)));
     const resolved = await client.cancelSale('sale-1', {
       reason: 'CUSTOMER_REQUEST',
       cashierUserId: 'cashier-1',
@@ -950,7 +964,7 @@ describe('ChatbotApiHttpClient', () => {
       restockedItems: [],
       canceledAt: '2026-08-24T10:00:00.000Z',
     };
-    httpService.request.mockReturnValue(of({ data: replay }));
+    httpService.request.mockReturnValue(of(axiosResponse(replay)));
     const resolved = await client.cancelSale('sale-1', {
       reason: 'CUSTOMER_REQUEST',
       cashierUserId: 'cashier-1',
@@ -968,7 +982,7 @@ describe('ChatbotApiHttpClient', () => {
     const validBody = { receiptId: 'receipt-1', status: 'PENDING' };
 
     function mockFulfilled(status: number, data: unknown): void {
-      httpService.request.mockReturnValue(of({ status, data }));
+      httpService.request.mockReturnValue(of(axiosResponse(data, status)));
     }
 
     it('resolves a valid 201 PENDING body', async () => {
