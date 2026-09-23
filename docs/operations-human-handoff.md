@@ -135,9 +135,15 @@ If the entire slice needs to be reverted:
 
 ## 5. Open follow-ups (non-blocking)
 
-- **R6 shipping-quote approval gate.** The `shipping_approval` kind is
-  reserved in the union but the tool's inputSchema rejects it today. Lift
-  the gate when the shipping slice lands.
+- **R6 shipping-quote approval gate (updated).** The `shipping_approval`
+  kind is now served by the gated shipping flow: the shipping quote path
+  creates the request server-side and ops resolves it with the structured
+  `APPROVE_SHIPPING`/`REJECT_SHIPPING` grammar documented in
+  `docs/shipping-quotes-operations.md`. The model-facing
+  `requestHumanAssistance` schema still rejects `shipping_approval`, so the
+  model cannot forge it. Shipping quotes remain default-off, and sale
+  continuation for any conversation carrying a shipping marker stays blocked
+  until the backend can persist the approved charge (SQ-5D).
 - **Scheduler-based nudge / expiry.** The current design waits indefinitely
   for the agent reply (no scheduler, no expiry). If operationally noisy,
   add a follow-up slice for an optional `expiresAt` column + a cron nudger.
