@@ -759,7 +759,8 @@ function isResolvedShippingExpiry(value: unknown, pin: string): boolean {
  * Strict runtime guard for one persisted decided JSONB resolution: a plain
  * exact two-key object (`decision`/`draftCreatedAt`) with the pinned creation
  * time, returning a fresh resolution or `null`. Hostile inputs fail closed.
- * b4c2a recognizes only `SHIPPING_REJECTED`; b4c2b extends this to approval.
+ * b4c2a recognizes `SHIPPING_REJECTED`; b4c2b extends the same exact shape to
+ * `SHIPPING_APPROVED` so the guarded caller can complete either decision.
  */
 function readResolvedShippingDecision(
   value: unknown,
@@ -781,8 +782,11 @@ function readResolvedShippingDecision(
       return null;
     }
     if (record.draftCreatedAt !== pin) return null;
-    if (record.decision === 'SHIPPING_REJECTED') {
-      return { decision: 'SHIPPING_REJECTED', draftCreatedAt: pin };
+    if (
+      record.decision === 'SHIPPING_REJECTED' ||
+      record.decision === 'SHIPPING_APPROVED'
+    ) {
+      return { decision: record.decision, draftCreatedAt: pin };
     }
     return null;
   } catch {

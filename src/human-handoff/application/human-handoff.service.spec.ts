@@ -1702,15 +1702,6 @@ describe('HumanHandoffService', () => {
         noReplay();
       });
 
-      it('approved resolved row stays closed with no clear or synthetic (b4c2b)', async () => {
-        store.findByRef.mockResolvedValue(decidedRequest('SHIPPING_APPROVED'));
-        conversationStore.get.mockResolvedValue(
-          stateWith(goodMarker({ decision: 'SHIPPING_APPROVED' })),
-        );
-        await closed(() => run(`HF-${REF_ID}: APPROVE_SHIPPING`));
-        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
-      });
-
       it.each([
         ['absent ref', 'APPROVE_SHIPPING', OPS],
         ['mismatched ref', 'HF-ffffffffffff: APPROVE_SHIPPING', OPS],
@@ -1834,6 +1825,230 @@ describe('HumanHandoffService', () => {
           'resolved',
         );
         expect(await run(`HF-${REF_ID}: REJECT_SHIPPING`)).toEqual(OPS_ERROR);
+        expect(
+          conversationStore.clearPendingHumanRequest,
+        ).toHaveBeenCalledTimes(2);
+        noReplay();
+      });
+    });
+
+    describe('b4c2b approved-row completion', () => {
+      const DECIDED_AT = '2026-06-23T12:04:00.000Z';
+      const NOW = new Date('2026-06-23T12:05:00.000Z');
+      const OTHER_PIN = '2026-06-23T11:00:00.000Z';
+      const APPROVAL_TURN = `[Resolución del agente humano (HF-${REF_ID})] El agente aprobó el envío.`;
+      const OPS_ERROR = {
+        kind: 'ops_error',
+        reply: SHIPPING_RETRY_REPLY,
+      } as const;
+      const REQUOTE = {
+        kind: 'needs_requote',
+        reply: SHIPPING_REQUOTE_REPLY,
+      } as const;
+
+      const approvedRequest = (
+        resolution: unknown = {
+          decision: 'SHIPPING_APPROVED',
+          draftCreatedAt: PIN,
+        },
+      ): HumanHandoffRequest => ({
+        ...shippingRequest(),
+        status: 'resolved',
+        resolution: resolution as never,
+        resolvedAt: DECIDED_AT,
+      });
+      const goodMarker = (overrides: Record<string, unknown> = {}) => ({
+        requestId: REF_ID,
+        draftCreatedAt: PIN,
+        decision: 'SHIPPING_APPROVED',
+        decidedAt: DECIDED_AT,
+        ...overrides,
+      });
+      const stateWith = (
+        rawMarker: unknown,
+        requestId: string | null = REF_ID,
+      ): ConversationState => ({
+        ...st(requestId),
+        data: { ...st(requestId).data, shippingApproval: rawMarker },
+      });
+      const primeApproved = (rawMarker: unknown = goodMarker()) => {
+        store.findByRef.mockResolvedValue(approvedRequest());
+        conversationStore.get.mockResolvedValue(stateWith(rawMarker));
+        conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
+      };
+      // b4c2b must never resolve, update, or parse a new operator decision.
+      const noReplay = () => {
+        expect(store.resolve).not.toHaveBeenCalled();
+        expect(conversationStore.update).not.toHaveBeenCalled();
+        expect(policy.parseDecision).not.toHaveBeenCalled();
+      };
+      const closed = async (runner: () => Promise<unknown>) => {
+        const result = await runner();
+        expect(result).toEqual(OPS_ERROR);
+        expect(result).not.toHaveProperty('syntheticUserText');
+        expect(
+          conversationStore.clearPendingHumanRequest,
+        ).not.toHaveBeenCalled();
+        noReplay();
+      };
+
+      beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+      afterEach(() => jest.useRealTimers());
+
+      it('recovered approval: the winning clear emits the persisted amount-free turn once', async () => {
+        primeApproved();
+        const result = await run(`HF-${REF_ID}: totally bogus`);
+        expect(policy.verifyDraftPin).toHaveBeenCalledWith(
+          stateWith(goodMarker()),
+          PIN,
+          NOW.getTime(),
+        );
+        expect(conversationStore.clearPendingHumanRequest).toHaveBeenCalledWith(
+          CUSTOMER,
+          REF_ID,
+        );
+        expect(result).toEqual({
+          kind: 'resolved',
+          customerId: CUSTOMER,
+          ref: `HF-${REF_ID}`,
+          resolution: { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN },
+          syntheticUserText: APPROVAL_TURN,
+        });
+        noReplay();
+      });
+
+      it('opposite REJECT_SHIPPING text does not overwrite the persisted approval', async () => {
+        primeApproved();
+        const result = await run(`HF-${REF_ID}: REJECT_SHIPPING`);
+        expect(result).toMatchObject({
+          kind: 'resolved',
+          resolution: { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN },
+          syntheticUserText: APPROVAL_TURN,
+        });
+        noReplay();
+      });
+
+      it('draft_expired clears once and re-quotes without a synthetic turn', async () => {
+        primeApproved();
+        policy.verifyDraftPin.mockReturnValue({ kind: 'draft_expired' });
+        const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+        expect(result).toEqual(REQUOTE);
+        expect(result).not.toHaveProperty('syntheticUserText');
+        expect(conversationStore.clearPendingHumanRequest).toHaveBeenCalledWith(
+          CUSTOMER,
+          REF_ID,
+        );
+        noReplay();
+      });
+
+      it.each([
+        'invalid_clock',
+        'draft_missing',
+        'draft_pin_mismatch',
+      ] as const)('closes on a %s verdict without clearing', async (kind) => {
+        primeApproved();
+        policy.verifyDraftPin.mockReturnValue({ kind });
+        await closed(() => run(`HF-${REF_ID}: APPROVE_SHIPPING`));
+      });
+
+      it.each([
+        ['valid', 'false'],
+        ['draft_expired', 'reject'],
+      ] as const)(
+        'closes when a %s verdict loses the %s clear',
+        async (kind, mode) => {
+          primeApproved();
+          policy.verifyDraftPin.mockReturnValue({ kind });
+          if (mode === 'false') {
+            conversationStore.clearPendingHumanRequest.mockResolvedValueOnce(
+              false,
+            );
+          } else {
+            conversationStore.clearPendingHumanRequest.mockRejectedValueOnce(
+              new Error('db down'),
+            );
+          }
+          const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+          expect(result).toEqual(OPS_ERROR);
+          expect(result).not.toHaveProperty('syntheticUserText');
+          noReplay();
+        },
+      );
+
+      it.each([
+        ['absent ref', 'APPROVE_SHIPPING', OPS],
+        ['mismatched ref', 'HF-ffffffffffff: APPROVE_SHIPPING', OPS],
+        ['uppercase ref', `HF-${REF_ID.toUpperCase()}: APPROVE_SHIPPING`, OPS],
+        ['foreign sender', `HF-${REF_ID}: APPROVE_SHIPPING`, '5215550001111'],
+      ])('closes on a %s without clearing', async (_label, text, from) => {
+        primeApproved();
+        store.findLatestPendingForAgent.mockResolvedValue(approvedRequest());
+        await closed(() => run(text, from));
+        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
+      });
+
+      it.each<[string, unknown]>([
+        ['null', null],
+        ['missing key', { decision: 'SHIPPING_APPROVED' }],
+        [
+          'extra key',
+          { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN, extra: 1 },
+        ],
+        ['non-decided', { decision: 'GENERIC', text: 'x' }],
+        [
+          'mismatched pin',
+          { decision: 'SHIPPING_APPROVED', draftCreatedAt: OTHER_PIN },
+        ],
+      ])('closes on a %s persisted resolution', async (_label, resolution) => {
+        primeApproved();
+        store.findByRef.mockResolvedValue(approvedRequest(resolution));
+        await closed(() => run(`HF-${REF_ID}: APPROVE_SHIPPING`));
+        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
+      });
+
+      it.each<[string, unknown, string | null]>([
+        ['missing pending marker', goodMarker(), null],
+        ['mismatched pending marker', goodMarker(), 'ffffffffffff'],
+        ['missing marker', undefined, REF_ID],
+        ['malformed marker', { requestId: REF_ID, junk: true }, REF_ID],
+        [
+          'marker wrong request',
+          goodMarker({ requestId: 'ffffffffffff' }),
+          REF_ID,
+        ],
+        ['marker wrong pin', goodMarker({ draftCreatedAt: OTHER_PIN }), REF_ID],
+        [
+          'marker wrong decision',
+          goodMarker({ decision: 'SHIPPING_REJECTED' }),
+          REF_ID,
+        ],
+      ])('closes on a %s without clearing', async (_label, raw, requestId) => {
+        primeApproved();
+        conversationStore.get.mockResolvedValue(stateWith(raw, requestId));
+        await closed(() => run(`HF-${REF_ID}: APPROVE_SHIPPING`));
+        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
+      });
+
+      it('contains a store read rejection and a verifyDraftPin throw', async () => {
+        primeApproved();
+        conversationStore.get.mockRejectedValueOnce(new Error('db down'));
+        await closed(() => run(`HF-${REF_ID}: APPROVE_SHIPPING`));
+        primeApproved();
+        policy.verifyDraftPin.mockImplementation(() => {
+          throw new Error('verify down');
+        });
+        await closed(() => run(`HF-${REF_ID}: APPROVE_SHIPPING`));
+      });
+
+      it('is idempotent: the winner resolves once and the losing clear emits nothing', async () => {
+        primeApproved();
+        conversationStore.clearPendingHumanRequest
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(false);
+        expect((await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).kind).toBe(
+          'resolved',
+        );
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual(OPS_ERROR);
         expect(
           conversationStore.clearPendingHumanRequest,
         ).toHaveBeenCalledTimes(2);
