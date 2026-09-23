@@ -143,6 +143,7 @@ Live activation remains blocked until all are observed:
   - [ ] **SQ-7B — Clean spec typecheck (IN PROGRESS):** fix 86 type errors in test mocks/fixtures by root class, not by waiving/suppressing diagnostics or dropping tests. User authorized parallel writes only across isolated backend worktree and this chatbot repo; chatbot units stay serial and ≤390 complete changed lines.
     - [ ] **SQ-7B1 — Typed AI-SDK spec boundary:** preserve the inferred `execute` type while narrowing runtime Zod schema/description safely in a focused helper and the first three sale-flow tool specs; run non-incremental tsc and focused Jest.
     - [ ] **SQ-7B2 — Remaining sale-flow specs:** apply the same boundary to four no-context tools, then the cancel-sale deps outlier as bounded independently green units.
+      - [ ] **SQ-7B2a — Four no-context AI-SDK specs:** wrap the actual factories with `asSchemaVerifiedTool`, pass `context: {}`, and preserve the search-catalog default-`limit` semantics via `inputSchema.parse`. See the SQ-7B2a evidence block below.
     - [ ] **SQ-7B3 — HTTP and isolated fixtures:** correct AxiosResponse mocks and the remaining human-handoff, LLM, receipt-media, and WhatsApp spec fixtures without weakening production contracts.
     - [ ] **SQ-7B4 — Full closure:** non-incremental spec typecheck exit 0, full offline Jest, scoped lint/format/build, native review and local work-unit commits; no live activation claim.
 
@@ -506,6 +507,15 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Focused Jest: `pnpm exec jest --runInBand --no-cache sale-flow/application/tools/check-stock.tool.spec.ts sale-flow/application/tools/get-customer-by-phone.tool.spec.ts sale-flow/application/tools/get-order-history.tool.spec.ts` — 3 suites, 18 tests passed (17 original + 1 new same-reference assertion).
 - Checks: scoped ESLint exit 0; Prettier `--check` clean (three specs, helper, and tracker); `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0; `git diff --check` clean; nothing staged. No production source change, tsconfig change, `any`/`as never`/`ts-ignore` addition, test deletion, or production type weakening.
 - B1 stays unchecked because the global non-incremental spec typecheck still exits 2. This is partial evidence for the unit, not SQ-7 closure.
+
+## SQ-7B2a evidence (partial; strict type-level TDD; not delivered)
+
+- RED (before edits): `pnpm exec tsc --noEmit --incremental false --pretty false -p tsconfig.spec.json` exited 2 with the 69-diagnostic baseline. The four target specs held 26 of them: `get-payment-details.tool.spec.ts` 7, `search-catalog.tool.spec.ts` 8, `update-delivery.tool.spec.ts` 4, `upsert-customer.tool.spec.ts` 7 (TS2322×11, TS2339×12, TS2345×2, TS18048×1).
+- Applied the SQ-7B1 boundary to the four specs: aliased each factory and wrapped once with `asSchemaVerifiedTool`, then replaced `context: undefined` with typed `context: {}`. The committed helper `test/fixtures/sale-flow-tool-schema.ts` was reused unchanged. Execute inference is preserved (the wrapper returns the same tool object), and no `any`, `as never`, `ts-ignore`, new suppression, test removal, or tsconfig/config change was added; every existing assertion is intact. Removed the four now-dead `eslint-disable` directives (the boundary eliminated the unsafe `any` surface they suppressed), matching SQ-7B1; scoped ESLint now reports zero problems.
+- search-catalog default semantics: the two `tool.execute({ q: 'x' }, …)` calls that were missing `limit` now pass `tool.inputSchema.parse({ q: 'x' })`, so schema defaults still apply. `limit: 10` is never hardcoded in those calls, preserving the schema-default test's meaning.
+- GREEN (after edits): the same uncached spec tsc still exits 2 but falls from 69 to 43 diagnostics, with zero remaining in the four target specs. The remaining 43 belong to the SQ-7B3 HTTP/isolated-fixture baseline.
+- Focused Jest: `pnpm exec jest --runInBand --no-cache sale-flow/application/tools/get-payment-details.tool.spec.ts sale-flow/application/tools/search-catalog.tool.spec.ts sale-flow/application/tools/update-delivery.tool.spec.ts sale-flow/application/tools/upsert-customer.tool.spec.ts` — 4 suites, 25 tests passed.
+- Checks: scoped ESLint exit 0; Prettier `--check` clean (four specs and this tracker); `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0; `git diff --check` clean; nothing staged. SQ-7B2, SQ-7B, and SQ-7 remain unchecked while the global non-incremental spec typecheck still exits 2; this is partial evidence for the unit, not SQ-7 closure.
 
 ## Delivery gate
 

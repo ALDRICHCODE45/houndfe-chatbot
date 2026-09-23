@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeUpdateDeliveryTool } from './update-delivery.tool';
+import { makeUpdateDeliveryTool as makeUpdateDeliveryToolRaw } from './update-delivery.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
@@ -14,6 +14,9 @@ import type { ConversationStore } from '../../../conversation/domain/conversatio
  *   - Registered only; not exercised end-to-end by the slice's flow
  *   - Catches UpstreamError into a retryable upstream envelope
  */
+const makeUpdateDeliveryTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeUpdateDeliveryToolRaw(deps));
+
 describe('makeUpdateDeliveryTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
@@ -36,7 +39,7 @@ describe('makeUpdateDeliveryTool', () => {
         trackingRef: 'TRACK-1',
         estimatedDeliveryAt: '2026-07-01T12:00:00Z',
       },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(updateDelivery).toHaveBeenCalledWith(
       '00000000-4000-9000-0000-000000000001',
@@ -61,7 +64,7 @@ describe('makeUpdateDeliveryTool', () => {
       {
         saleId: '00000000-4000-9000-0000-000000000001',
       },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(updateDelivery).toHaveBeenCalledWith(
       '00000000-4000-9000-0000-000000000001',
@@ -91,7 +94,7 @@ describe('makeUpdateDeliveryTool', () => {
     await expect(
       tool.execute(
         { saleId: '00000000-4000-9000-0000-000000000001' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,

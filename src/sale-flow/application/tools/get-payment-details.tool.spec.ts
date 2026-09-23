@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeGetPaymentDetailsTool } from './get-payment-details.tool';
+import { makeGetPaymentDetailsTool as makeGetPaymentDetailsToolRaw } from './get-payment-details.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import {
   ChatbotApiError,
@@ -19,6 +19,9 @@ import type { PaymentDetail } from '../../../chatbot-api/domain/dtos/payment-det
  *   - chatbotApi.getPaymentDetails() called exactly once with no arguments.
  *   - Non-ChatbotApiError rethrows (BranchMismatchError etc.).
  */
+const makeGetPaymentDetailsTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeGetPaymentDetailsToolRaw(deps));
+
 describe('makeGetPaymentDetailsTool', () => {
   const baseDeps = {
     store: {} as never,
@@ -56,7 +59,7 @@ describe('makeGetPaymentDetailsTool', () => {
     const tool = makeGetPaymentDetailsTool(deps);
     const result = await tool.execute(
       {},
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(getPaymentDetails).toHaveBeenCalledTimes(1);
     expect(getPaymentDetails).toHaveBeenCalledWith();
@@ -82,7 +85,7 @@ describe('makeGetPaymentDetailsTool', () => {
     const tool = makeGetPaymentDetailsTool(deps);
     const result = await tool.execute(
       {},
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(result).toEqual({
       ok: false,
@@ -119,7 +122,7 @@ describe('makeGetPaymentDetailsTool', () => {
     };
     const tool = makeGetPaymentDetailsTool(deps);
     await expect(
-      tool.execute({}, { toolCallId: 't', messages: [], context: undefined }),
+      tool.execute({}, { toolCallId: 't', messages: [], context: {} }),
     ).rejects.toBeInstanceOf(BranchMismatchError);
   });
 
@@ -133,7 +136,7 @@ describe('makeGetPaymentDetailsTool', () => {
     const tool = makeGetPaymentDetailsTool(deps);
     const result = await tool.execute(
       {},
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(result).toEqual({
       ok: false,

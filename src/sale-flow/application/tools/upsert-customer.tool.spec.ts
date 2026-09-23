@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeUpsertCustomerTool } from './upsert-customer.tool';
+import { makeUpsertCustomerTool as makeUpsertCustomerToolRaw } from './upsert-customer.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
@@ -16,6 +16,9 @@ import type { CustomerUpsertResponse } from '../../../chatbot-api/domain/dtos/cu
  *   - Validates optional preferredPaymentMethod max 50
  *   - Catches UpstreamError into a retryable upstream envelope
  */
+const makeUpsertCustomerTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeUpsertCustomerToolRaw(deps));
+
 describe('makeUpsertCustomerTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
@@ -52,7 +55,7 @@ describe('makeUpsertCustomerTool', () => {
     const result = await tool.execute(dto, {
       toolCallId: 't',
       messages: [],
-      context: undefined,
+      context: {},
     });
     expect(upsertCustomer).toHaveBeenCalledWith(dto);
     expect(result).toEqual({ ok: true, ...upsertResponse });
@@ -147,7 +150,7 @@ describe('makeUpsertCustomerTool', () => {
           phone: '5550001111',
           address: { street: 'Calle 1' },
         },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,

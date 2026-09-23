@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument */
-
-import { makeSearchCatalogTool } from './search-catalog.tool';
+import { makeSearchCatalogTool as makeSearchCatalogToolRaw } from './search-catalog.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
@@ -16,6 +16,9 @@ import type { CatalogItemResponse } from '../../../chatbot-api/domain/dtos/catal
  *   - Returns { ok: false, error: { kind: 'upstream', retryable: true } } on 5xx
  *   - Does not propagate the thrown ChatbotApiError
  */
+const makeSearchCatalogTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeSearchCatalogToolRaw(deps));
+
 describe('makeSearchCatalogTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
@@ -51,7 +54,7 @@ describe('makeSearchCatalogTool', () => {
 
     const result = await tool.execute(
       { q: 'croquetas', limit: 5 },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(searchCatalog).toHaveBeenCalledWith('croquetas', 5);
     expect(result).toEqual({ ok: true, results });
@@ -72,7 +75,7 @@ describe('makeSearchCatalogTool', () => {
     await tool.execute(parsed, {
       toolCallId: 't',
       messages: [],
-      context: undefined,
+      context: {},
     });
     expect(searchCatalog).toHaveBeenCalledWith('croquetas', 10);
   });
@@ -115,10 +118,11 @@ describe('makeSearchCatalogTool', () => {
     const tool = makeSearchCatalogTool(deps);
 
     await expect(
-      tool.execute(
-        { q: 'x' },
-        { toolCallId: 't', messages: [], context: undefined },
-      ),
+      tool.execute(tool.inputSchema.parse({ q: 'x' }), {
+        toolCallId: 't',
+        messages: [],
+        context: {},
+      }),
     ).resolves.toEqual({
       ok: false,
       error: { kind: 'upstream', retryable: true },
@@ -137,10 +141,11 @@ describe('makeSearchCatalogTool', () => {
     const tool = makeSearchCatalogTool(deps);
 
     await expect(
-      tool.execute(
-        { q: 'x' },
-        { toolCallId: 't', messages: [], context: undefined },
-      ),
+      tool.execute(tool.inputSchema.parse({ q: 'x' }), {
+        toolCallId: 't',
+        messages: [],
+        context: {},
+      }),
     ).resolves.toEqual({
       ok: false,
       error: { kind: 'upstream', retryable: true },
