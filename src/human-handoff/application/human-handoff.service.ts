@@ -275,11 +275,14 @@ export class HumanHandoffService {
    * Shipping-approval resolution. Guards: identity (status/agent/sender/id/
    * digest/canonical pin) → strict grammar (`parseDecision` only) →
    * pending-marker → draft pin verify. A stale verdict resolves
-   * SHIPPING_EXPIRED and clears pending (needs_requote). A valid verdict
-   * persists the local `shippingApproval` marker BEFORE resolving the row,
-   * then clears pending against the marker-write state and returns an
-   * amount-free synthetic turn. No direct customer outbound. Cross-store
-   * recovery (partial writes) is deferred to b4.
+   * SHIPPING_EXPIRED and then clears pending via the request-ID-matched
+   * primitive (needs_requote only when it reports true; false/rejection
+   * fails closed). A valid verdict persists the local `shippingApproval`
+   * marker BEFORE resolving the row, then clears pending with the same
+   * primitive and returns an amount-free synthetic turn. The post-marker
+   * state is retained solely to compensate the marker when row resolution
+   * fails. There is no cross-store transaction; b4 owns partial-write
+   * recovery. No direct customer outbound.
    */
   private async resolveShippingReply(
     args: { text: string; from: string },
@@ -372,17 +375,16 @@ export class HumanHandoffService {
         return opsError;
       }
 
-      let cleared: ConversationState | null;
+      let cleared: boolean;
       try {
-        cleared = await clearPendingHumanRequest(
-          this.conversationStore,
+        cleared = await this.conversationStore.clearPendingHumanRequest(
           target.customerId,
-          afterMarker,
+          target.id,
         );
       } catch {
-        cleared = null;
+        cleared = false;
       }
-      if (cleared === null) {
+      if (!cleared) {
         return opsError;
       }
 
@@ -409,13 +411,16 @@ export class HumanHandoffService {
     if (!stale) {
       return opsError;
     }
+    let cleared: boolean;
     try {
-      await clearPendingHumanRequest(
-        this.conversationStore,
+      cleared = await this.conversationStore.clearPendingHumanRequest(
         target.customerId,
-        customerState,
+        target.id,
       );
     } catch {
+      cleared = false;
+    }
+    if (!cleared) {
       return opsError;
     }
     return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };

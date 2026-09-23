@@ -861,6 +861,7 @@ describe('HumanHandoffService', () => {
     const noWrites = () => {
       expect(store.resolve).not.toHaveBeenCalled();
       expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(conversationStore.clearPendingHumanRequest).not.toHaveBeenCalled();
     };
 
     beforeEach(() => {
@@ -1078,11 +1079,12 @@ describe('HumanHandoffService', () => {
       beforeEach(() => {
         jest.useFakeTimers().setSystemTime(NOW);
         conversationStore.update.mockResolvedValue(st());
+        conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
       });
       afterEach(() => jest.useRealTimers());
 
       it.each(STALE_KINDS)(
-        '%s → resolves SHIPPING_EXPIRED, clears pending, no marker, needs_requote',
+        '%s → resolves SHIPPING_EXPIRED, request-ID-matched pending clear, no marker, needs_requote',
         async (kind) => {
           prime();
           store.findByRef.mockResolvedValue(shippingRequest());
@@ -1101,13 +1103,17 @@ describe('HumanHandoffService', () => {
             draftCreatedAt: PIN,
             reason: kind,
           });
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).toHaveBeenCalledTimes(1);
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).toHaveBeenCalledWith(CUSTOMER, REF_ID);
           expect(store.resolve.mock.invocationCallOrder[0]).toBeLessThan(
-            conversationStore.update.mock.invocationCallOrder[0],
+            conversationStore.clearPendingHumanRequest.mock
+              .invocationCallOrder[0],
           );
-          expect(conversationStore.update).toHaveBeenCalledTimes(1);
-          const [, patch] = conversationStore.update.mock.calls[0];
-          expect(patch.data?.pendingHumanRequest).toBeNull();
-          expect(patch.data).not.toHaveProperty('shippingApproval');
+          expect(conversationStore.update).not.toHaveBeenCalled();
           expect(result).toEqual({
             kind: 'needs_requote',
             reply: SHIPPING_REQUOTE_REPLY,
@@ -1149,22 +1155,41 @@ describe('HumanHandoffService', () => {
             reply: SHIPPING_RETRY_REPLY,
           });
           expect(conversationStore.update).not.toHaveBeenCalled();
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).not.toHaveBeenCalled();
         },
       );
 
-      it('pending clear rejection → ops_error with no synthetic turn', async () => {
-        prime();
-        store.findByRef.mockResolvedValue(shippingRequest());
-        resolveRow();
-        policy.verifyDraftPin.mockReturnValue({ kind: 'draft_pin_mismatch' });
-        conversationStore.update.mockRejectedValueOnce(new Error('db down'));
-        const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
-        expect(result).toEqual({
-          kind: 'ops_error',
-          reply: SHIPPING_RETRY_REPLY,
-        });
-        expect(result).not.toHaveProperty('syntheticUserText');
-      });
+      it.each(['false', 'reject'] as const)(
+        'pending clear %s → ops_error, no needs_requote, no synthetic turn',
+        async (mode) => {
+          prime();
+          store.findByRef.mockResolvedValue(shippingRequest());
+          resolveRow();
+          policy.verifyDraftPin.mockReturnValue({
+            kind: 'draft_pin_mismatch',
+          });
+          if (mode === 'false') {
+            conversationStore.clearPendingHumanRequest.mockResolvedValueOnce(
+              false,
+            );
+          } else {
+            conversationStore.clearPendingHumanRequest.mockRejectedValueOnce(
+              new Error('db down'),
+            );
+          }
+          const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+          expect(result).toEqual({
+            kind: 'ops_error',
+            reply: SHIPPING_RETRY_REPLY,
+          });
+          expect(result).not.toHaveProperty('syntheticUserText');
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).toHaveBeenCalledWith(CUSTOMER, REF_ID);
+        },
+      );
     });
 
     describe('b3 valid-decision persistence', () => {
@@ -1205,6 +1230,7 @@ describe('HumanHandoffService', () => {
             data: patch.data ?? {},
           };
         });
+        conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
         store.findByRef.mockResolvedValue(shippingRequest());
         policy.verifyDraftPin.mockReturnValue({ kind: 'valid' });
         store.resolve.mockImplementation(async (id, resolution) => {
@@ -1230,7 +1256,7 @@ describe('HumanHandoffService', () => {
         ['APPROVE_SHIPPING', 'SHIPPING_APPROVED', 'aprobó'],
         ['REJECT_SHIPPING', 'SHIPPING_REJECTED', 'rechazó'],
       ] as const)(
-        '%s → exact 4-field marker, row resolve, pending clear against marker state, amount-free synthetic',
+        '%s → exact 4-field marker, row resolve, request-ID-matched pending clear, amount-free synthetic',
         async (command, decision, verb) => {
           const customerState = setup();
 
@@ -1247,7 +1273,7 @@ describe('HumanHandoffService', () => {
             decision,
             decidedAt: DECIDED_AT,
           };
-          expect(conversationStore.update).toHaveBeenCalledTimes(2);
+          expect(conversationStore.update).toHaveBeenCalledTimes(1);
           expect(
             conversationStore.update.mock.calls[0][1].data?.shippingApproval,
           ).toEqual(expectedMarker);
@@ -1255,18 +1281,16 @@ describe('HumanHandoffService', () => {
             conversationStore.update.mock.invocationCallOrder[0],
           ).toBeLessThan(store.resolve.mock.invocationCallOrder[0]);
           expect(store.resolve.mock.invocationCallOrder[0]).toBeLessThan(
-            conversationStore.update.mock.invocationCallOrder[1],
+            conversationStore.clearPendingHumanRequest.mock
+              .invocationCallOrder[0],
           );
           expect(store.resolve).toHaveBeenCalledWith(REF_ID, {
             decision,
             draftCreatedAt: PIN,
           });
-
-          const pendingPatch = conversationStore.update.mock.calls[1][1];
-          expect(pendingPatch.data?.shippingApproval).toEqual(expectedMarker);
-          expect(pendingPatch.data?.pendingHumanRequest).toBeNull();
-          expect(pendingPatch.data?.cart).toEqual(customerState.data.cart);
-          expect(pendingPatch.data?.placedSaleId).toBe('sale-1');
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).toHaveBeenCalledWith(CUSTOMER, REF_ID);
 
           expect(result.kind).toBe('resolved');
           if (result.kind !== 'resolved') throw new Error('expected resolved');
@@ -1303,6 +1327,9 @@ describe('HumanHandoffService', () => {
           });
           expect(store.resolve).not.toHaveBeenCalled();
           expect(conversationStore.update).toHaveBeenCalledTimes(1);
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).not.toHaveBeenCalled();
         },
       );
 
@@ -1324,6 +1351,9 @@ describe('HumanHandoffService', () => {
           expect(compensationPatch.data?.pendingHumanRequest).toMatchObject({
             requestId: REF_ID,
           });
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).not.toHaveBeenCalled();
         },
       );
 
@@ -1335,16 +1365,26 @@ describe('HumanHandoffService', () => {
         });
       });
 
-      it.each(['null', 'reject'] as const)(
+      it.each(['false', 'reject'] as const)(
         'pending clear %s → ops_error with no synthetic turn',
         async (mode) => {
-          setup([undefined, mode === 'null' ? null : new Error('db down')]);
+          setup();
+          if (mode === 'false') {
+            conversationStore.clearPendingHumanRequest.mockResolvedValueOnce(
+              false,
+            );
+          } else {
+            conversationStore.clearPendingHumanRequest.mockRejectedValueOnce(
+              new Error('db down'),
+            );
+          }
           const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
           expect(result).toEqual({
             kind: 'ops_error',
             reply: SHIPPING_RETRY_REPLY,
           });
           expect(result).not.toHaveProperty('syntheticUserText');
+          expect(conversationStore.update).toHaveBeenCalledTimes(1);
         },
       );
     });
