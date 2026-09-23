@@ -85,8 +85,8 @@ describe('evaluateShippingSaleGate', () => {
 
   it('returns frozen, exact-key verdicts', () => {
     const pass = evaluateShippingSaleGate(null);
-    expect(pass).toEqual({ kind: 'pass' });
-    expect(Object.keys(pass)).toEqual(['kind']);
+    expect(pass).toEqual({ kind: 'pass', data: null });
+    expect(Object.keys(pass)).toEqual(['kind', 'data']);
     expect(Object.isFrozen(pass)).toBe(true);
     expect(evaluateShippingSaleGate('nope')).toEqual({
       kind: 'malformed_state',
@@ -99,8 +99,11 @@ describe('evaluateShippingSaleGate', () => {
     ).toBe(true);
   });
 
-  it('passes a null state (gate runs after the cart read in D2)', () => {
-    expect(evaluateShippingSaleGate(null)).toEqual({ kind: 'pass' });
+  it('passes a null state (gate runs before the cart read in D2)', () => {
+    expect(evaluateShippingSaleGate(null)).toEqual({
+      kind: 'pass',
+      data: null,
+    });
   });
 
   it.each([
@@ -117,21 +120,24 @@ describe('evaluateShippingSaleGate', () => {
       { cart: { items: [], idempotencyKey: '' }, messages: [] },
     ],
   ])('passes when no non-null marker is present (%s)', (_label, data) => {
-    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({ kind: 'pass' });
+    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({
+      kind: 'pass',
+      data,
+    });
   });
 
   it('passes an address-only order; a delivery address is not a quote signal', () => {
-    expect(
-      evaluateShippingSaleGate(
-        stateWith({ shippingAddressId: 'addr-1', placedSaleId: 'sale-1' }),
-      ),
-    ).toEqual({ kind: 'pass' });
+    const data = { shippingAddressId: 'addr-1', placedSaleId: 'sale-1' };
+    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({
+      kind: 'pass',
+      data,
+    });
   });
 
   it('does not mutate a frozen state', () => {
     const data = Object.freeze({ messages: Object.freeze([]) });
     const state = Object.freeze({ senderId: 's', lastMessageAt: ISO, data });
-    expect(evaluateShippingSaleGate(state)).toEqual({ kind: 'pass' });
+    expect(evaluateShippingSaleGate(state)).toEqual({ kind: 'pass', data });
     expect(state).toEqual({ senderId: 's', lastMessageAt: ISO, data });
   });
 
@@ -168,15 +174,66 @@ describe('evaluateShippingSaleGate', () => {
     });
   });
 
-  it('blocks when a marker getter returns a non-null value', () => {
+  it('rejects an own accessor marker (getter) as malformed_state without invoking it', () => {
     expect(
       evaluateShippingSaleGate(stateWith(withGetter(DRAFT_KEY, () => ({})))),
-    ).toEqual({ kind: 'blocked' });
+    ).toEqual({ kind: 'malformed_state' });
+  });
+
+  it('rejects an own setter-only marker accessor as malformed_state', () => {
+    const data: Record<string, unknown> = {};
+    Object.defineProperty(data, APPROVAL_KEY, {
+      enumerable: true,
+      configurable: true,
+      set: () => undefined,
+    });
+    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({
+      kind: 'malformed_state',
+    });
+  });
+
+  it('rejects an accessor state.data (getter or setter) as malformed_state', () => {
+    const state: Record<string, unknown> = {
+      senderId: 's',
+      lastMessageAt: ISO,
+    };
+    Object.defineProperty(state, 'data', {
+      enumerable: true,
+      configurable: true,
+      set: () => undefined,
+    });
+    expect(evaluateShippingSaleGate(state)).toEqual({
+      kind: 'malformed_state',
+    });
+  });
+
+  it('rejects a proxy whose own data descriptor is clean but whose get("data") is marked', () => {
+    // A plain prototype passes the plain-object check, and the own `data`
+    // descriptor is a marker-free bag — but the `get` trap hands a marked bag
+    // to any plain read. Reading only the descriptor would `pass`; reading only
+    // `get` would `blocked`. The gate must see the divergence and fail closed.
+    const target = {
+      senderId: 's',
+      lastMessageAt: ISO,
+      data: { messages: [] },
+    };
+    const state = new Proxy(target, {
+      get: (inner, key): unknown => {
+        if (key === 'data') return { [DRAFT_KEY]: canonicalDraft() };
+        return Reflect.get(inner, key) as unknown;
+      },
+    });
+    expect(evaluateShippingSaleGate(state)).toEqual({
+      kind: 'malformed_state',
+    });
   });
 
   it('ignores hostile getters on keys it never inspects', () => {
     const data = withGetter('messages', boom);
-    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({ kind: 'pass' });
+    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({
+      kind: 'pass',
+      data,
+    });
   });
 
   it.each([
@@ -206,28 +263,43 @@ describe('evaluateShippingSaleGate', () => {
     });
   });
 
-  it('fails closed when reading state.data throws', () => {
+  it('rejects an accessor state.data without executing the throwing getter', () => {
+    let invoked = false;
     const state = { senderId: 's', lastMessageAt: ISO };
-    Object.defineProperty(state, 'data', { get: boom });
+    Object.defineProperty(state, 'data', {
+      get: () => {
+        invoked = true;
+        return boom();
+      },
+    });
     expect(evaluateShippingSaleGate(state)).toEqual({
       kind: 'malformed_state',
     });
+    expect(invoked).toBe(false);
   });
 
-  it('fails closed when a marker getter throws', () => {
-    expect(
-      evaluateShippingSaleGate(stateWith(withGetter(APPROVAL_KEY, boom))),
-    ).toEqual({ kind: 'malformed_state' });
+  it('rejects a throwing accessor marker without executing it', () => {
+    let invoked = false;
+    const data = withGetter(APPROVAL_KEY, () => {
+      invoked = true;
+      return boom();
+    });
+    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({
+      kind: 'malformed_state',
+    });
+    expect(invoked).toBe(false);
   });
 
-  it('reads each marker value exactly once so a stateful getter cannot flip the verdict', () => {
+  it('rejects a stateful marker accessor without invoking it (no read can flip the verdict)', () => {
     let reads = 0;
     const data = withGetter(DRAFT_KEY, () => (reads++ === 0 ? null : 'late'));
-    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({ kind: 'pass' });
-    expect(reads).toBe(1);
+    expect(evaluateShippingSaleGate(stateWith(data))).toEqual({
+      kind: 'malformed_state',
+    });
+    expect(reads).toBe(0);
   });
 
-  it('reads state.data exactly once', () => {
+  it('rejects a stateful accessor state.data without invoking it', () => {
     let reads = 0;
     const state = {
       senderId: 's',
@@ -236,7 +308,9 @@ describe('evaluateShippingSaleGate', () => {
         return reads++ === 0 ? {} : { [DRAFT_KEY]: 'late' };
       },
     };
-    expect(evaluateShippingSaleGate(state)).toEqual({ kind: 'pass' });
-    expect(reads).toBe(1);
+    expect(evaluateShippingSaleGate(state)).toEqual({
+      kind: 'malformed_state',
+    });
+    expect(reads).toBe(0);
   });
 });
