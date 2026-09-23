@@ -1030,6 +1030,129 @@ describe('HumanHandoffService', () => {
       expect(policy.parseDecision).toHaveBeenCalledWith('APPROVE_SHIPPING');
       noWrites();
     });
+
+    describe('b2 stale-draft expiry', () => {
+      const NOW = new Date('2026-06-23T12:05:00.000Z');
+      // The port has no `draft_malformed`; the four non-valid verdicts are:
+      const STALE_KINDS = [
+        'invalid_clock',
+        'draft_missing',
+        'draft_expired',
+        'draft_pin_mismatch',
+      ] as const;
+
+      const resolveRow = () =>
+        store.resolve.mockImplementation(async (id, resolution) => ({
+          ...shippingRequest(),
+          id,
+          status: 'resolved',
+          resolution,
+          resolvedAt: NOW.toISOString(),
+        }));
+
+      beforeEach(() => {
+        jest.useFakeTimers().setSystemTime(NOW);
+        conversationStore.update.mockResolvedValue(st());
+      });
+      afterEach(() => jest.useRealTimers());
+
+      it.each(STALE_KINDS)(
+        '%s → resolves SHIPPING_EXPIRED, clears pending, no marker, needs_requote',
+        async (kind) => {
+          prime();
+          store.findByRef.mockResolvedValue(shippingRequest());
+          resolveRow();
+          policy.verifyDraftPin.mockReturnValue({ kind });
+
+          const result = await run(`HF-${REF_ID}: REJECT_SHIPPING`);
+
+          expect(policy.verifyDraftPin).toHaveBeenCalledWith(
+            st(),
+            PIN,
+            NOW.getTime(),
+          );
+          expect(store.resolve).toHaveBeenCalledWith(REF_ID, {
+            decision: 'SHIPPING_EXPIRED',
+            draftCreatedAt: PIN,
+            reason: kind,
+          });
+          expect(store.resolve.mock.invocationCallOrder[0]).toBeLessThan(
+            conversationStore.update.mock.invocationCallOrder[0],
+          );
+          expect(conversationStore.update).toHaveBeenCalledTimes(1);
+          const [, patch] = conversationStore.update.mock.calls[0];
+          expect(patch.data?.pendingHumanRequest).toBeNull();
+          expect(patch.data).not.toHaveProperty('shippingApproval');
+          expect(result).toEqual({
+            kind: 'needs_requote',
+            reply: SHIPPING_REQUOTE_REPLY,
+          });
+          expect(result).not.toHaveProperty('syntheticUserText');
+        },
+      );
+
+      it('valid verdict remains a write-free ops_error (b3 owns persistence)', async () => {
+        prime();
+        store.findByRef.mockResolvedValue(shippingRequest());
+        policy.verifyDraftPin.mockReturnValue({ kind: 'valid' });
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
+          kind: 'ops_error',
+          reply: SHIPPING_RETRY_REPLY,
+        });
+        expect(policy.verifyDraftPin).toHaveBeenCalledTimes(1);
+        noWrites();
+      });
+
+      it('malformed grammar never reaches verifyDraftPin', async () => {
+        prime();
+        store.findByRef.mockResolvedValue(shippingRequest());
+        expect(await run('sí, adelante')).toEqual({
+          kind: 'needs_decision',
+          reply: SHIPPING_DECISION_GRAMMAR,
+        });
+        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
+        noWrites();
+      });
+
+      it('wrong sender never verifies the pin', async () => {
+        prime();
+        store.findByRef.mockResolvedValue(shippingRequest());
+        expect(
+          await run(`HF-${REF_ID}: APPROVE_SHIPPING`, '5215550001111'),
+        ).toEqual({ kind: 'ops_error', reply: SHIPPING_RETRY_REPLY });
+        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
+      });
+
+      it.each(['null', 'reject'] as const)(
+        'row resolve %s → ops_error and pending untouched',
+        async (mode) => {
+          prime();
+          store.findByRef.mockResolvedValue(shippingRequest());
+          policy.verifyDraftPin.mockReturnValue({ kind: 'draft_expired' });
+          if (mode === 'null') store.resolve.mockResolvedValue(null);
+          else store.resolve.mockRejectedValueOnce(new Error('db down'));
+          expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
+            kind: 'ops_error',
+            reply: SHIPPING_RETRY_REPLY,
+          });
+          expect(conversationStore.update).not.toHaveBeenCalled();
+        },
+      );
+
+      it('pending clear rejection → ops_error with no synthetic turn', async () => {
+        prime();
+        store.findByRef.mockResolvedValue(shippingRequest());
+        resolveRow();
+        policy.verifyDraftPin.mockReturnValue({ kind: 'draft_pin_mismatch' });
+        conversationStore.update.mockRejectedValueOnce(new Error('db down'));
+        const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+        expect(result).toEqual({
+          kind: 'ops_error',
+          reply: SHIPPING_RETRY_REPLY,
+        });
+        expect(result).not.toHaveProperty('syntheticUserText');
+      });
+    });
   });
 });
 

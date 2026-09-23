@@ -260,9 +260,13 @@ export class HumanHandoffService {
 
   /**
    * b1 shipping guard/grammar slice: identity guards → strict grammar
-   * (`parseDecision` only) → pending-marker guard. Malformed → needs_decision;
-   * bad identity/agent/sender/pending → ops_error; all write-free. Valid
-   * commands stop at ops_error until b2/b3 own expiration/approval.
+   * (`parseDecision` only) → pending-marker guard. b2 adds draft-pin
+   * verification: a stale verdict resolves the row as SHIPPING_EXPIRED and
+   * clears the pending marker (needs_requote); a valid verdict stays a
+   * write-free ops_error until b3 owns persistence. No `shippingApproval`
+   * marker is written and no synthetic turn is produced here. Null/rejected
+   * row resolve is fail-closed; a rejected pending clear is surfaced as
+   * ops_error (cross-store recovery is deferred to b4).
    */
   private async resolveShippingReply(
     args: { text: string; from: string },
@@ -300,8 +304,42 @@ export class HumanHandoffService {
       return opsError;
     }
 
-    // b2/b3 verify the draft pin and persist the decision here.
-    return opsError;
+    const pin = digest.draftCreatedAt;
+    const now = Date.now();
+    const verdict = this.shippingApprovalPolicy.verifyDraftPin(
+      customerState,
+      pin,
+      now,
+    );
+    if (verdict.kind === 'valid') {
+      // b3 persists the valid decision; b2 keeps the write-free stub.
+      return opsError;
+    }
+
+    const expired: HumanHandoffResolution = {
+      decision: 'SHIPPING_EXPIRED',
+      draftCreatedAt: pin,
+      reason: verdict.kind,
+    };
+    let stale: HumanHandoffRequest | null;
+    try {
+      stale = await this.store.resolve(target.id, expired);
+    } catch {
+      stale = null;
+    }
+    if (!stale) {
+      return opsError;
+    }
+    try {
+      await clearPendingHumanRequest(
+        this.conversationStore,
+        target.customerId,
+        customerState,
+      );
+    } catch {
+      return opsError;
+    }
+    return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
   }
 }
 
