@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeCancelSaleTool } from './cancel-sale.tool';
+import { makeCancelSaleTool as makeCancelSaleToolRaw } from './cancel-sale.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import type { CancelSaleResult } from '../../../chatbot-api/domain/dtos/sales.dto';
 import {
@@ -9,8 +9,10 @@ import {
 } from '../../../chatbot-api/domain/errors';
 import type {
   ConversationState,
+  ConversationStateData,
   ConversationStore,
 } from '../../../conversation/domain/conversation-store';
+import type { HumanHandoffService } from '../../../human-handoff/application/human-handoff.service';
 
 /**
  * Unit tests for the 11th AI-SDK tool factory `cancelSale` (design.md §e).
@@ -29,6 +31,32 @@ import type {
 describe('makeCancelSaleTool', () => {
   const CASHIER = '00000000-4000-9000-0000-000000000001';
 
+  /**
+   * Narrow test-local tool factory.
+   *
+   * `makeCancelSaleTool` never reads `humanHandoffService` (ADR-27: only the
+   * `requestHumanAssistance` tool consumes it), so a minimal inert fake is
+   * injected once here instead of repeating a cast at all 14 call sites; the
+   * fake is asserted untouched in the happy path rather than implemented. The
+   * committed `asSchemaVerifiedTool` boundary narrows only `description` and
+   * `inputSchema`, returning the same tool object so `execute` keeps its
+   * inferred input/output/context types.
+   */
+  const humanHandoffService = {
+    create: jest.fn(),
+    resolveReply: jest.fn(),
+    isOpsSender: jest.fn(),
+  };
+
+  const makeCancelSaleTool = (deps: Omit<ToolDeps, 'humanHandoffService'>) =>
+    asSchemaVerifiedTool(
+      makeCancelSaleToolRaw({
+        ...deps,
+        humanHandoffService:
+          humanHandoffService as unknown as HumanHandoffService,
+      }),
+    );
+
   function stubStore(initial: ConversationState | null): {
     store: jest.Mocked<ConversationStore>;
     update: jest.Mock;
@@ -40,7 +68,7 @@ describe('makeCancelSaleTool', () => {
         const next = {
           senderId,
           lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
-          data: (patch as { data: object }).data,
+          data: (patch as { data: ConversationStateData }).data,
         };
         current = next;
         return next;
@@ -130,6 +158,8 @@ describe('makeCancelSaleTool', () => {
       { data: Record<string, unknown> },
     ];
     expect('placedSaleId' in patch.data).toBe(false);
+    // The injected handoff dependency is unused: cancelSale never calls it.
+    expect(humanHandoffService.create).not.toHaveBeenCalled();
   });
 
   it('(b) missing-placedSaleId guard returns {missingPlacedSaleId, false} without any HTTP call', async () => {
