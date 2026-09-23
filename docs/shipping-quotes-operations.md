@@ -21,6 +21,14 @@ authorizes a live provider call or a customer-facing shipping price.
   live toggle — changing it needs a graceful restart/redeploy. It is
   case-sensitive: only the exact lowercase `true` enables quotes.
 - No customer-facing shipping amount is produced by the current flow.
+- **The launch preflight requires an explicit `false`, which is stricter than
+  the runtime default.** At runtime an unset flag is simply "off", which is a
+  safe default. The offline launch preflight (`pnpm preflight:launch`,
+  `src/preflight/`) is deliberately stricter: `SHIPPING_QUOTES_ENABLED` must be
+  present and exactly `false`. An unset or blank value reports `missing`, and
+  `true`, `TRUE`, `False`, `' false '`, `1`, or `yes` report `unsafe`; either
+  makes the report `ok: false`. This prevents shipping from ever being switched
+  on implicitly during a launch.
 
 ## 2. Configuration (names only — never paste values)
 
@@ -112,6 +120,11 @@ default-off contract and fail-closed behavior.
 
 - **Default-off boot:** with `SHIPPING_QUOTES_ENABLED` unset, the shipping
   module graph is empty and the tool inventory is twelve.
+- **Launch-preflight posture:** `pnpm preflight:launch` requires the flag to be
+  exactly `false` (see §1) and lists the seven shipping activation
+  preconditions from §10 as `manual_external` checks. Those manual checks are
+  never counted as automatic failures, and no credential value is read or
+  printed.
 - **Flag/config:** `TRUE`, `False`, `1`, `yes`, and padded `' true '` do not
   enable; only `true` does. When enabled, missing/blank credentials or origin
   (or a non-5-digit postal code) fail boot fast.

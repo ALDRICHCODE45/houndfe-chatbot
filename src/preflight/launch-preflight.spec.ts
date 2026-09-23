@@ -134,6 +134,13 @@ describe('runLaunchPreflight', () => {
       'service_credential',
       'active_payment_detail',
       'populated_catalog',
+      'shipping_origin_authoritative',
+      'shipping_backend_measurements',
+      'shipping_sandbox_host_credentials',
+      'shipping_backend_charge_persistence',
+      'shipping_cdmx_zone_service_policy',
+      'shipping_approval_workflow_e2e',
+      'shipping_synthetic_journey',
     ]);
     expect(
       first.manualChecks.every(
@@ -176,5 +183,87 @@ describe('runLaunchPreflight', () => {
       ...report.manualChecks,
     ].map((c: { status: string }) => c.status);
     expect(statuses.every((s) => allowed.has(s))).toBe(true);
+  });
+});
+
+describe('shipping launch preflight', () => {
+  const shippingPosture = (env: Env) =>
+    run(env).posture.find((c) => c.name === 'SHIPPING_QUOTES_ENABLED');
+
+  const SHIPPING_MANUAL_IDS = [
+    'shipping_origin_authoritative',
+    'shipping_backend_measurements',
+    'shipping_sandbox_host_credentials',
+    'shipping_backend_charge_persistence',
+    'shipping_cdmx_zone_service_policy',
+    'shipping_approval_workflow_e2e',
+    'shipping_synthetic_journey',
+  ] as const;
+
+  it('requires an explicit false shipping posture at launch', () => {
+    const env = safeEnv();
+    env.SHIPPING_QUOTES_ENABLED = 'false';
+    const report = run(env);
+    expect(shippingPosture(env)).toEqual({
+      name: 'SHIPPING_QUOTES_ENABLED',
+      expected: 'false',
+      status: 'safe',
+    });
+    expect(report.ok).toBe(true);
+  });
+
+  it('fails closed when the shipping flag is absent', () => {
+    const env = safeEnv();
+    delete env.SHIPPING_QUOTES_ENABLED;
+    const report = run(env);
+    expect(report.ok).toBe(false);
+    expect(shippingPosture(env)?.status).toBe('missing');
+    expect(report.failures).toContainEqual({
+      area: 'posture',
+      name: 'SHIPPING_QUOTES_ENABLED',
+      status: 'missing',
+    });
+
+    const blank = safeEnv();
+    blank.SHIPPING_QUOTES_ENABLED = '';
+    expect(run(blank).ok).toBe(false);
+    expect(shippingPosture(blank)?.status).toBe('missing');
+  });
+
+  it('rejects an enabled or non-canonical shipping flag', () => {
+    for (const raw of ['true', 'TRUE', 'False', ' false ', '1', 'yes']) {
+      const env = safeEnv();
+      env.SHIPPING_QUOTES_ENABLED = raw;
+      const report = run(env);
+      expect(report.ok).toBe(false);
+      expect(shippingPosture(env)?.status).toBe('unsafe');
+      expect(report.failures).toContainEqual({
+        area: 'posture',
+        name: 'SHIPPING_QUOTES_ENABLED',
+        status: 'unsafe',
+      });
+    }
+  });
+
+  it('lists the seven shipping manual prerequisites without verifying them', () => {
+    const report = run(safeEnv());
+    const ids = report.manualChecks.map((c) => c.id);
+    for (const id of SHIPPING_MANUAL_IDS) expect(ids).toContain(id);
+    expect(report.ok).toBe(true);
+    for (const check of report.manualChecks) {
+      expect(check.status).toBe('manual_external');
+      expect(report.failures.some((f) => f.name === check.id)).toBe(false);
+    }
+  });
+
+  it('never leaks shipping credential values into the report', () => {
+    const env = safeEnv();
+    env.SHIPPING_QUOTES_ENABLED = 'false';
+    env.SKYDROPX_CLIENT_SECRET = `sk_${CANARY}`;
+    env.SKYDROPX_BASE_URL = `https://sandbox.example/${CANARY}`;
+    const serialized = JSON.stringify(run(env));
+    expect(serialized).not.toContain(CANARY);
+    expect(serialized).not.toContain('sk_');
+    expect(serialized).not.toContain('sandbox.example');
   });
 });
