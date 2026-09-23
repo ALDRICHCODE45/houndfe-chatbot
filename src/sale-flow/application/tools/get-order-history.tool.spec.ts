@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeGetOrderHistoryTool } from './get-order-history.tool';
+import { makeGetOrderHistoryTool as makeGetOrderHistoryToolRaw } from './get-order-history.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
@@ -15,6 +15,9 @@ import type { OrderHistoryResponse } from '../../../chatbot-api/domain/dtos/sale
  *   - Rejects empty/over-long phone or phoneCountryCode
  *   - Catches UpstreamError into a retryable upstream envelope
  */
+const makeGetOrderHistoryTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeGetOrderHistoryToolRaw(deps));
+
 describe('makeGetOrderHistoryTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
@@ -48,7 +51,7 @@ describe('makeGetOrderHistoryTool', () => {
 
     const result = await tool.execute(
       { phone: '5550001111', phoneCountryCode: '+52' },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(getOrderHistory).toHaveBeenCalledWith('5550001111', '+52');
     expect(result).toEqual({ ok: true, results });
@@ -91,7 +94,7 @@ describe('makeGetOrderHistoryTool', () => {
     await expect(
       tool.execute(
         { phone: '5550001111', phoneCountryCode: '+52' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,

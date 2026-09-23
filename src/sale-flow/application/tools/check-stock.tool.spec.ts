@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeCheckStockTool } from './check-stock.tool';
+import { makeCheckStockTool as makeCheckStockToolRaw } from './check-stock.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import {
   NotFoundError,
@@ -19,12 +19,26 @@ import type { StockCheckResponse } from '../../../chatbot-api/domain/dtos/catalo
  *   - 5xx -> { ok: false, error: { kind: 'upstream', retryable: true } }
  *   - Rejects non-UUID productId at the schema layer
  */
+const makeCheckStockTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeCheckStockToolRaw(deps));
+
 describe('makeCheckStockTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
     cashierUserId: '00000000-0000-4000-8000-000000000001',
     humanHandoffService: {} as never,
   };
+
+  it('returns the same tool and inputSchema references without reimplementing the schema', () => {
+    const rawTool = makeCheckStockToolRaw({
+      ...baseDeps,
+      chatbotApi: {} as ChatbotApiClient,
+    });
+    const verified = asSchemaVerifiedTool(rawTool);
+
+    expect(verified).toBe(rawTool);
+    expect(verified.inputSchema).toBe(rawTool.inputSchema);
+  });
 
   it('forwards productId to chatbotApi.getStock and returns { ok: true, ... }', async () => {
     const stock: StockCheckResponse = {
@@ -42,7 +56,7 @@ describe('makeCheckStockTool', () => {
 
     const result = await tool.execute(
       { productId: '00000000-0000-4000-8000-000000000001' },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
 
     expect(getStock).toHaveBeenCalledWith(
@@ -71,7 +85,7 @@ describe('makeCheckStockTool', () => {
     await expect(
       tool.execute(
         { productId: '00000000-0000-4000-8000-000000000001' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,
@@ -90,7 +104,7 @@ describe('makeCheckStockTool', () => {
     await expect(
       tool.execute(
         { productId: '00000000-0000-4000-8000-000000000001' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,
@@ -120,7 +134,7 @@ describe('makeCheckStockTool', () => {
 
       const result = await tool.execute(
         { productId: uuid1, variantId: uuid2 },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       );
 
       expect(result).toEqual({
@@ -153,7 +167,7 @@ describe('makeCheckStockTool', () => {
 
       const result = await tool.execute(
         { productId: uuid1, name: 'Nombre del input' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       );
 
       expect(result).toEqual({
@@ -182,7 +196,7 @@ describe('makeCheckStockTool', () => {
 
         const result = await tool.execute(
           { productId: uuid1 },
-          { toolCallId: 't', messages: [], context: undefined },
+          { toolCallId: 't', messages: [], context: {} },
         );
 
         expect(result).toEqual({ ok: true, ...stock });
@@ -207,7 +221,7 @@ describe('makeCheckStockTool', () => {
 
       await tool.execute(
         { productId: uuid1 },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       );
 
       expect(humanHandoffService.create).not.toHaveBeenCalled();

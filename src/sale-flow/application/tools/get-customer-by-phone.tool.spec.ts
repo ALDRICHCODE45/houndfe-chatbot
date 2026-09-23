@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeGetCustomerByPhoneTool } from './get-customer-by-phone.tool';
+import { makeGetCustomerByPhoneTool as makeGetCustomerByPhoneToolRaw } from './get-customer-by-phone.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
@@ -15,6 +15,9 @@ import type { CustomerLookupResponse } from '../../../chatbot-api/domain/dtos/cu
  *   - Rejects empty / over-long phoneCountryCode or phone at the schema layer
  *   - Catches thrown UpstreamError into a retryable upstream envelope
  */
+const makeGetCustomerByPhoneTool = (deps: ToolDeps) =>
+  asSchemaVerifiedTool(makeGetCustomerByPhoneToolRaw(deps));
+
 describe('makeGetCustomerByPhoneTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
@@ -36,7 +39,7 @@ describe('makeGetCustomerByPhoneTool', () => {
 
     const result = await tool.execute(
       { phoneCountryCode: '+52', phone: '5550001111' },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(getCustomerByPhone).toHaveBeenCalledWith('+52', '5550001111');
     expect(result).toEqual({ ok: true, ...lookup });
@@ -88,7 +91,7 @@ describe('makeGetCustomerByPhoneTool', () => {
     await expect(
       tool.execute(
         { phoneCountryCode: '+52', phone: '5550001111' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,
