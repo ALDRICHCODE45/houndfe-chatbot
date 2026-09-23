@@ -38,14 +38,16 @@ const freshDraft = (): ConversationState => stateOf({ [KEY]: buildShippingQuoteD
 const withAddress = (address: unknown): unknown => ({ ...LOOKUP, customer: { ...LOOKUP.customer, address } });
 
 // prettier-ignore
-function setup(over: { state?: unknown; lookup?: unknown; outcome?: unknown; update?: jest.Mock; now?: jest.Mock } = {}) {
+function setup(over: { state?: unknown; lookup?: unknown; outcome?: unknown; update?: jest.Mock; now?: jest.Mock; approval?: jest.Mock | null; approvalThrows?: boolean } = {}) {
   const get = jest.fn().mockResolvedValue(over.state === undefined ? cartState() : over.state);
   const update = over.update ?? jest.fn().mockResolvedValue(cartState());
   const getCustomerByPhone = jest.fn().mockResolvedValue(over.lookup ?? LOOKUP);
   const quote = jest.fn().mockResolvedValue(over.outcome ?? { kind: 'draft', draft: DRAFT });
   const now = over.now ?? jest.fn().mockReturnValue(MS);
-  const deps: GetShippingQuoteToolDeps = { chatbotApi: { getCustomerByPhone }, store: { get, update }, shippingQuoteOrchestrator: { quote }, measuredDemoConfig: CONFIG, now };
-  return { tool: makeGetShippingQuoteTool(deps), get, update, getCustomerByPhone, quote, now };
+  const requestShippingApproval = over.approval === null ? undefined : over.approval ?? jest.fn().mockResolvedValue({ ok: true });
+  const deps = { chatbotApi: { getCustomerByPhone }, store: { get, update }, shippingQuoteOrchestrator: { quote }, measuredDemoConfig: CONFIG, now, requestShippingApproval } as unknown as GetShippingQuoteToolDeps;
+  if (over.approvalThrows === true) Object.defineProperty(deps, 'requestShippingApproval', { get() { throw new Error('hostile deps'); } });
+  return { tool: makeGetShippingQuoteTool(deps), get, update, getCustomerByPhone, quote, now, requestShippingApproval };
 }
 // prettier-ignore
 const run = async (tool: ReturnType<typeof makeGetShippingQuoteTool>, senderId = SENDER): Promise<GetShippingQuoteToolResult> => (await tool.execute({}, { toolCallId: 't', messages: [], context: { senderId } })) as GetShippingQuoteToolResult;
@@ -234,6 +236,117 @@ describe('makeGetShippingQuoteTool', () => {
   });
 
   // prettier-ignore
+  it('requests approval once after reusing a fresh draft', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: freshDraft(), approval });
+    expect(await run(m.tool)).toEqual({ ok: true, status: 'reused' });
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(approval).toHaveBeenCalledWith(SENDER);
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('requests approval once after persisting a new draft', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ approval });
+    expect(await run(m.tool)).toEqual({ ok: true, status: 'quoted' });
+    expect(m.update).toHaveBeenCalledTimes(1);
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(approval).toHaveBeenCalledWith(SENDER);
+  });
+
+  // prettier-ignore
+  it('fails closed when approval is absent on the reuse path', async () => {
+    const m = setup({ state: freshDraft(), approval: null });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('fails closed when approval is absent on the persist path', async () => {
+    const m = setup({ approval: null });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(m.update).toHaveBeenCalledTimes(1);
+  });
+
+  // prettier-ignore
+  it.each<[string, unknown]>([
+    ['declined', { ok: false, reason: 'pending_handoff' }],
+    ['malformed', { reason: 'unavailable' }],
+    ['non-object', 'ok'],
+  ])('approval %s on the reuse path is a price-free handoff', async (_l, approvalResult) => {
+    const approval = jest.fn().mockResolvedValue(approvalResult);
+    const m = setup({ state: freshDraft(), approval });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('approval failure on the persist path is a price-free handoff', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: false, reason: 'handoff_failed' });
+    const m = setup({ approval });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(m.update).toHaveBeenCalledTimes(1);
+    expect(approval).toHaveBeenCalledTimes(1);
+  });
+
+  // prettier-ignore
+  it('approval rejection and hostile result are redacted handoffs', async () => {
+    const rejected = setup({
+      state: freshDraft(),
+      approval: jest.fn().mockRejectedValue(new Error('svc_secret')),
+    });
+    const rejectedResult = await run(rejected.tool);
+    expect(JSON.stringify(rejectedResult)).not.toContain('svc_secret');
+    expectHandoff(rejectedResult, 'approval_unavailable');
+    const hostile = new Proxy({}, { get: () => { throw new Error('boom'); } });
+    const m = setup({ state: freshDraft(), approval: jest.fn().mockResolvedValue(hostile) });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+  });
+
+  // prettier-ignore
+  it('does not request approval when an earlier gate fails', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    await run(setup({ now: jest.fn().mockReturnValue(NaN), approval }).tool);
+    await run(setup({ outcome: { kind: 'handoff', reason: 'no_rates' }, approval }).tool);
+    await run(setup({ update: jest.fn().mockResolvedValue(null), approval }).tool);
+    expect(approval).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it.each<[string, unknown]>([
+    ['contradictory reason', { ok: true, reason: 'verification_failed' }],
+    ['leaked digest', { ok: true, digest: { customerPaysCents: 900 } }],
+    ['extra key', { ok: true, extra: 1 }],
+    ['non-enumerable digest', (() => { const r = { ok: true }; Object.defineProperty(r, 'digest', { value: { customerPaysCents: 900 }, enumerable: false }); return r; })()],
+    ['symbol metadata', { ok: true, [Symbol('digest')]: { customerPaysCents: 900 } }],
+    ['accessor ok', (() => { const r = {}; Object.defineProperty(r, 'ok', { get: () => true, enumerable: true, configurable: true }); return r; })()],
+  ])('approval ok with %s is rejected as a price-free handoff', async (_l, approvalResult) => {
+    const approval = jest.fn().mockResolvedValue(approvalResult);
+    const m = setup({ state: freshDraft(), approval });
+    const result = await run(m.tool);
+    expectHandoff(result, 'approval_unavailable');
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(m.update).not.toHaveBeenCalled();
+    const serialized = JSON.stringify(result);
+    for (const leaked of ['digest', '900', 'verification_failed']) expect(serialized).not.toContain(leaked);
+  });
+
+  // prettier-ignore
+  it('fails closed when the approval dependency getter throws', async () => {
+    const m = setup({ approvalThrows: true });
+    const result = await run(m.tool);
+    expectHandoff(result, 'approval_unavailable');
+    expect(m.update).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(result)).not.toContain('hostile deps');
+  });
+
+  // prettier-ignore
   it('every result is frozen, exact-key, and free of secret/monetary detail', async () => {
     const badClock = setup({ now: jest.fn().mockReturnValue(NaN) });
     const outcomes: GetShippingQuoteToolResult[] = [
@@ -243,6 +356,8 @@ describe('makeGetShippingQuoteTool', () => {
       await run(setup({ outcome: { kind: 'handoff', reason: 'no_rates' } }).tool),
       await run(setup({ lookup: { found: false, customer: null } }).tool),
       await run(setup({ state: stateOf({ cart: 'x' }) }).tool),
+      await run(setup({ state: freshDraft(), approval: null }).tool),
+      await run(setup({ approval: null }).tool),
       await run(setup().tool, 'bad'),
       await run(badClock.tool),
     ];

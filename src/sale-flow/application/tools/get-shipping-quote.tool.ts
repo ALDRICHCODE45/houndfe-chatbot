@@ -25,6 +25,7 @@ import type { MeasuredDemoShippingConfig } from '../../../shipping/application/m
 import { matchMeasuredDemoParcelProfile, type MeasuredDemoPreparedInput } from '../../../shipping/application/measured-demo-parcel-profile';
 // prettier-ignore
 import { persistShippingQuoteDraft, readShippingQuoteDraft } from '../../../shipping/application/shipping-quote-draft-persistence';
+import type { ShippingApprovalRequestResult } from '../../../shipping/application/shipping-approval-request';
 import type { ShippingQuoteOrchestrator } from '../../../shipping/application/shipping-quote-orchestrator';
 import { isShippingQuoteAddress } from '../../../shipping/domain/shipping-quote.request';
 import { readCart } from '../../domain/cart-state';
@@ -33,7 +34,7 @@ import { parseMexicanWhatsAppPhone } from '../../domain/mexican-whatsapp-phone';
 // prettier-ignore
 export type GetShippingQuoteUnavailableReason = 'invalid_clock' | 'unsupported_sender' | 'cart_mismatch' | 'address_unavailable' | 'quote_unavailable';
 // prettier-ignore
-export type GetShippingQuoteHandoffReason = 'state_failure' | 'customer_lookup_failure' | 'quote_review_required' | 'persistence_failure';
+export type GetShippingQuoteHandoffReason = 'state_failure' | 'customer_lookup_failure' | 'quote_review_required' | 'persistence_failure' | 'approval_unavailable';
 // prettier-ignore
 export type GetShippingQuoteToolResult = { readonly ok: true; readonly status: 'reused' | 'quoted' } | { readonly ok: false; readonly status: 'unavailable'; readonly reason: GetShippingQuoteUnavailableReason } | { readonly ok: false; readonly status: 'handoff_required'; readonly reason: GetShippingQuoteHandoffReason };
 export interface GetShippingQuoteToolDeps {
@@ -42,6 +43,12 @@ export interface GetShippingQuoteToolDeps {
   shippingQuoteOrchestrator: Pick<ShippingQuoteOrchestrator, 'quote'>;
   measuredDemoConfig: MeasuredDemoShippingConfig;
   now?: () => number;
+  /** Optional narrow seam over the SQ-5C3b approval lifecycle; C3c2 wires the
+   *  real wrapper. Absent, failing, or hostile results fail closed and never
+   *  let a price-free status reach the model without approval. */
+  requestShippingApproval?: (
+    senderId: string,
+  ) => Promise<ShippingApprovalRequestResult>;
 }
 // prettier-ignore
 const REUSED: GetShippingQuoteToolResult = Object.freeze({ ok: true, status: 'reused' });
@@ -69,11 +76,58 @@ type DestinationRead = { readonly kind: 'ok'; readonly destination: ShippingDest
 // prettier-ignore
 function readDestination(lookup: unknown): DestinationRead { if (!isPlainRecord(lookup)) return { kind: 'hostile' }; try { if (lookup.found !== true) return { kind: 'invalid' }; const customer: unknown = lookup.customer; if (!isPlainRecord(customer)) return { kind: 'invalid' }; const address: unknown = customer.address; if (!isPlainRecord(address)) return { kind: 'invalid' }; const zipCode: unknown = address.zipCode, state: unknown = address.state, municipality: unknown = address.municipality, neighborhood: unknown = address.neighborhood; if (typeof zipCode !== 'string' || typeof state !== 'string' || typeof municipality !== 'string' || typeof neighborhood !== 'string') return { kind: 'invalid' }; const candidate = Object.freeze({ countryCode: 'MX', postalCode: zipCode, state, municipality, neighborhood }); if (!isShippingQuoteAddress(candidate)) return { kind: 'invalid' }; return { kind: 'ok', destination: Object.freeze({ zipCode, state, municipality, neighborhood }) }; } catch { return { kind: 'hostile' }; } }
 
+/**
+ * Accepts only an exact approval success: a plain object whose sole own key is
+ * the data property `ok` set to `true`. Non-enumerable keys, symbol keys, and
+ * accessor `ok` properties are rejected so hidden metadata can never
+ * masquerade as approval. Hostile proxy traps that throw fail closed.
+ */
+function isExactApprovalOk(value: unknown): boolean {
+  try {
+    if (!isPlainRecord(value)) return false;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== 1 || keys[0] !== 'ok') return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'ok');
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return false;
+    }
+    return descriptor.value === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Guards the optional approval lifecycle seam. Returns `true` only when the
+ * seam resolves an exact plain one-key `{ ok: true }` data property; an absent
+ * seam, a throwing dependency getter, a rejected invocation, or any extra,
+ * contradictory, hidden, or hostile field all return `false` so the caller
+ * hands off with a price-free status. A `reused`/`quoted` result therefore
+ * means the approval REQUEST was created, never that a human approved it.
+ */
+async function requestApproval(
+  deps: GetShippingQuoteToolDeps,
+  senderId: string,
+): Promise<boolean> {
+  try {
+    const request = deps.requestShippingApproval;
+    if (request === undefined) return false;
+    const result: unknown = await request(senderId);
+    return isExactApprovalOk(result);
+  } catch {
+    return false;
+  }
+}
+
 export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
   const now = deps.now ?? Date.now;
   return tool({
     description:
-      'Cotiza el envío de forma interna (sin exponer precios al cliente). Resuelve carrito y dirección guardados en el servidor; devuelve un estado finito de reuso, cotización o derivación. No acepta ni muestra teléfono, dirección, producto, medidas, precio, tarifa o transportista.',
+      'Cotiza el envío de forma interna (sin exponer precios al cliente). Resuelve carrito y dirección guardados en el servidor; devuelve un estado finito de reuso, cotización o derivación. Un estado de reuso o cotización significa que la solicitud de aprobación se registró correctamente, no que un humano ya la aprobó. No acepta ni muestra teléfono, dirección, producto, medidas, precio, tarifa o transportista.',
     inputSchema: z.object({}).strict(),
     contextSchema: z.object({ senderId: z.string().min(1) }),
     // prettier-ignore
@@ -83,7 +137,7 @@ export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
       const senderId = options.context.senderId;
       let state: ConversationState | null;
       try { state = await deps.store.get(senderId); } catch { return handoff('state_failure'); }
-      if (readShippingQuoteDraft(state, nowMs) !== null) return REUSED;
+      if (readShippingQuoteDraft(state, nowMs) !== null) return (await requestApproval(deps, senderId)) ? REUSED : handoff('approval_unavailable');
       const phone = parseMexicanWhatsAppPhone(senderId);
       if (phone === null) return unavailable('unsupported_sender');
       let prepared: MeasuredDemoPreparedInput | null;
@@ -104,7 +158,7 @@ export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
       let stored: unknown;
       // SAFETY: the persistence boundary only uses `get`/`update`; the injected narrow store satisfies the full ConversationStore at runtime.
       try { stored = await persistShippingQuoteDraft(deps.store as ConversationStore, senderId, state, outcome.draft, nowMs); } catch { return handoff('persistence_failure'); }
-      return stored === null ? handoff('persistence_failure') : QUOTED;
+      return stored === null ? handoff('persistence_failure') : (await requestApproval(deps, senderId)) ? QUOTED : handoff('approval_unavailable');
     },
   });
 }
