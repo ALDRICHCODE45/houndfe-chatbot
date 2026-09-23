@@ -16,6 +16,7 @@ import {
  *   - findLatestPendingForAgent returns the newest pending row (newest wins).
  *   - resolve sets status='resolved' + the supplied resolution + resolvedAt.
  *   - resolve on an unknown id returns null and does not insert.
+ *   - resolve a second time returns null and preserves the first decision.
  *   - findByRef on an unknown id returns null.
  *
  * Gated by RUN_DOCKER_TESTS=1 (matches the existing
@@ -192,6 +193,28 @@ ddescribe('PostgresHumanHandoffStore (Testcontainers)', () => {
       decision: 'NO_RESTOCK',
     });
     expect(row).toBeNull();
+  });
+
+  it('resolve a second time returns null and preserves the first decision', async () => {
+    await store.create({
+      id: 'abc123def456',
+      customerId: 'CUST',
+      agentId: 'OPS',
+      kind: 'out_of_stock',
+      digest: { kind: 'out_of_stock', productId: 'p1', name: 'X' },
+    });
+    const first = await store.resolve('abc123def456', {
+      decision: 'NO_RESTOCK',
+    });
+    expect(first).not.toBeNull();
+    const second = await store.resolve('abc123def456', {
+      decision: 'APPROVED_PROMO',
+      totalCents: 100,
+    });
+    expect(second).toBeNull();
+    const persisted = await store.findById('abc123def456');
+    expect(persisted!.status).toBe('resolved');
+    expect(persisted!.resolution).toEqual({ decision: 'NO_RESTOCK' });
   });
 
   it('findLatestPendingForAgent excludes already-resolved rows', async () => {

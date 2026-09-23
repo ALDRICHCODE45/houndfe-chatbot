@@ -96,12 +96,16 @@ export class PostgresHumanHandoffStore implements HumanHandoffStore {
     id: string,
     resolution: HumanHandoffResolution,
   ): Promise<HumanHandoffRequest | null> {
+    // Compare-and-set: only a pending row transitions. A concurrent reply
+    // that already resolved the row updates nothing, so `rows[0]` is
+    // undefined and the caller sees `null` instead of an overwritten
+    // decision (SQ-5C2c2b4a).
     const { rows } = await this.pool.query<HumanHandoffRow>(
       `UPDATE human_handoff_requests
        SET status = 'resolved',
            resolution = $2::jsonb,
            resolved_at = now()
-       WHERE id = $1
+       WHERE id = $1 AND status = 'pending'
        RETURNING id, customer_id, agent_id, kind, digest, status, resolution,
                  created_at, resolved_at`,
       [id, JSON.stringify(resolution)],

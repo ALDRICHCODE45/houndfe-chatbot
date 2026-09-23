@@ -246,7 +246,14 @@ export class HumanHandoffService {
     }
 
     const resolution = parseResolution(args.text, target.kind);
-    await this.store.resolve(target.id, resolution);
+    // SQ-5C2c2b4a: compare-and-set — the store transitions only a still-pending
+    // row. A losing resolve (a concurrent reply already resolved it) returns
+    // null; fail closed without clearing the customer marker or emitting a
+    // synthetic losing decision.
+    const resolved = await this.store.resolve(target.id, resolution);
+    if (resolved === null) {
+      return { kind: 'no_pending', reply: ASK_FOR_REF };
+    }
 
     const customerState = await this.conversationStore.get(target.customerId);
     await clearPendingHumanRequest(

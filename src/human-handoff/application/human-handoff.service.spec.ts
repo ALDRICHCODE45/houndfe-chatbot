@@ -574,6 +574,34 @@ describe('HumanHandoffService', () => {
       }
     });
 
+    it('nonshipping resolve loses CAS (null): fails closed with no_pending and clears nothing', async () => {
+      // SQ-5C2c2b4a: a losing resolve (row already resolved by a concurrent
+      // reply) returns null. The service MUST NOT clear the customer marker,
+      // emit a synthetic losing decision, or report a resolved envelope.
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockResolvedValue(null);
+      conversationStore.get.mockResolvedValue(
+        customerStateFor(CUSTOMER, {
+          requestId: REF_ID,
+          ref: `HF-${REF_ID}`,
+          createdAt: '2026-06-23T12:00:00.000Z',
+          customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+        }),
+      );
+
+      const result = await service.resolveReply({
+        text: `HF-${REF_ID} NO_RESTOCK`,
+        from: OPS,
+      });
+
+      expect(store.resolve).toHaveBeenCalledWith(REF_ID, {
+        decision: 'NO_RESTOCK',
+      });
+      expect(result).toEqual({ kind: 'no_pending', reply: ASK_FOR_REF });
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(whatsappSender.sendText).not.toHaveBeenCalled();
+    });
+
     it('ref token present but no row: falls back to the newest pending for the agent', async () => {
       // Spec step 2 (human-handoff §"resolveReply parses the HF-<id> token
       // and falls back to newest-pending"): a token that finds NO row must
