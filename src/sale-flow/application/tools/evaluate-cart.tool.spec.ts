@@ -17,8 +17,8 @@ type SafeParseSchema = {
  * Unit tests for the evaluateCart tool factory.
  *
  * Spec scenarios:
- *   - Persists the cart with `unitPriceCents = originalPriceCents`
- *     (list price enforcement; never the model's input price or finalPriceCents).
+ *   - Persists the per-unit `unitPriceCents` from the response (the backend
+ *     echoes the caller's input), never an extended LINE total.
  *   - Keeps an existing `idempotencyKey` on the cart across writes.
  *   - contextSchema carries { senderId } and is forwarded into the cart write.
  *   - Success returns { ok: true, ...CartEvaluationResult }.
@@ -43,7 +43,11 @@ describe('makeEvaluateCartTool', () => {
     expect(r.success).toBe(true);
   });
 
-  it('persists the cart with unitPriceCents = originalPriceCents and keeps existing idempotencyKey', async () => {
+  it('persists the per-unit unitPriceCents from the response (never an extended LINE total) and keeps existing idempotencyKey', async () => {
+    // Backend shape (`evaluate-cart-promotions.use-case.ts`): with qty=2 and
+    // unitPriceCents=1000, `originalPriceCents`/`finalPriceCents` are extended
+    // LINE totals (2000 / 1800), NOT unit prices. The backend echoes the
+    // caller's input, so the request carries the same unit price (1000).
     const evaluation: CartEvaluationResult = {
       items: [
         {
@@ -51,8 +55,8 @@ describe('makeEvaluateCartTool', () => {
           variantId: null,
           quantity: 2,
           unitPriceCents: 1000,
-          originalPriceCents: 1000,
-          finalPriceCents: 800,
+          originalPriceCents: 2000,
+          finalPriceCents: 1800,
           appliedPromotionTitle: 'PROMO_X',
           discountAmountCents: 200,
         },
@@ -92,7 +96,7 @@ describe('makeEvaluateCartTool', () => {
       {
         productId: '00000000-0000-4000-8000-000000000001',
         quantity: 2,
-        unitPriceCents: 500,
+        unitPriceCents: 1000,
       },
     ];
     const result = await tool.execute(
@@ -106,7 +110,8 @@ describe('makeEvaluateCartTool', () => {
 
     expect(result).toEqual({ ok: true, ...evaluation });
 
-    // Persisted cart uses originalPriceCents (1000), NOT 500 nor 800.
+    // Persisted cart uses the response's per-unit unitPriceCents (1000), NOT
+    // the extended original 2000 or the extended discounted final 1800.
     expect(update).toHaveBeenCalledTimes(1);
     const [, patch] = update.mock.calls[0]!;
     expect(patch).toMatchObject({
@@ -117,7 +122,7 @@ describe('makeEvaluateCartTool', () => {
               productId: 'p-uuid-1',
               variantId: undefined,
               quantity: 2,
-              unitPriceCents: 1000, // list price (originalPriceCents)
+              unitPriceCents: 1000, // per-unit value from the response
             },
           ],
           // existing-key preserved across writes (writeCart shallow merge)
@@ -125,9 +130,13 @@ describe('makeEvaluateCartTool', () => {
         },
       },
     });
-    // The serialized payload must not contain the discounted 800 anywhere.
-    const serialized = JSON.stringify(patch);
-    expect(serialized).not.toContain('800');
+    // No extended LINE total leaks into the persisted unit price.
+    const persistedUnitPrices = (
+      patch as { data: { cart: { items: Array<{ unitPriceCents: number }> } } }
+    ).data.cart.items.map((i) => i.unitPriceCents);
+    expect(persistedUnitPrices).toEqual([1000]);
+    expect(persistedUnitPrices).not.toContain(1800);
+    expect(persistedUnitPrices).not.toContain(2000);
   });
 
   it('throws (rethrows via mapChatbotError) when the upstream call rejects with NotFoundError -> notFound envelope', async () => {
@@ -206,7 +215,8 @@ describe('makeEvaluateCartTool', () => {
     expect(r.success).toBe(false);
   });
 
-  it('persists expectedTotalCents = Σ finalPriceCents × quantity on the cart (legacy carts also gain the field)', async () => {
+  it('persists expectedTotalCents = Σ finalPriceCents once per LINE on the cart (legacy carts also gain the field)', async () => {
+    // Backend LINE totals: qty=2, unit 1000 → original 2000, final 1800.
     const evaluation: CartEvaluationResult = {
       items: [
         {
@@ -214,10 +224,10 @@ describe('makeEvaluateCartTool', () => {
           variantId: null,
           quantity: 2,
           unitPriceCents: 1000,
-          originalPriceCents: 1000,
-          finalPriceCents: 800,
+          originalPriceCents: 2000,
+          finalPriceCents: 1800,
           appliedPromotionTitle: 'PROMO_X',
-          discountAmountCents: 400,
+          discountAmountCents: 200,
         },
       ],
       promotionEvaluationStatus: 'fully_evaluated',
@@ -249,7 +259,7 @@ describe('makeEvaluateCartTool', () => {
           {
             productId: '00000000-0000-4000-8000-000000000001',
             quantity: 2,
-            unitPriceCents: 500,
+            unitPriceCents: 1000,
           },
         ],
       },
@@ -269,13 +279,14 @@ describe('makeEvaluateCartTool', () => {
             },
           ],
           idempotencyKey: 'k',
-          expectedTotalCents: 1600,
+          expectedTotalCents: 1800,
         },
       },
     });
   });
 
   it('preserves the existing idempotencyKey when persisting expectedTotalCents on top of a pre-existing cart', async () => {
+    // Backend LINE totals: qty=3, unit 1000 → original 3000, final 2700.
     const evaluation: CartEvaluationResult = {
       items: [
         {
@@ -283,10 +294,10 @@ describe('makeEvaluateCartTool', () => {
           variantId: null,
           quantity: 3,
           unitPriceCents: 1000,
-          originalPriceCents: 1000,
-          finalPriceCents: 900,
-          appliedPromotionTitle: null,
-          discountAmountCents: 100,
+          originalPriceCents: 3000,
+          finalPriceCents: 2700,
+          appliedPromotionTitle: 'PROMO_X',
+          discountAmountCents: 300,
         },
       ],
       promotionEvaluationStatus: 'fully_evaluated',
@@ -341,12 +352,131 @@ describe('makeEvaluateCartTool', () => {
     });
   });
 
+  it('sums each LINE finalPriceCents once and persists the response per-unit prices for a multi-line cart with an active PRODUCT_DISCOUNT (qty>1)', async () => {
+    // Realistic backend-shaped multi-line result: line 1 is a qty=2
+    // PRODUCT_DISCOUNT (extended original 2000 → final 1800); line 2 is a
+    // plain qty=1 line. The correct cart total is 1800 + 500 = 2300, never
+    // 1800*2 + 500.
+    const evaluation: CartEvaluationResult = {
+      items: [
+        {
+          productId: 'p-uuid-1',
+          variantId: null,
+          quantity: 2,
+          unitPriceCents: 1000,
+          originalPriceCents: 2000,
+          finalPriceCents: 1800,
+          appliedPromotionTitle: 'PROMO_X',
+          discountAmountCents: 200,
+        },
+        {
+          productId: 'p-uuid-2',
+          variantId: null,
+          quantity: 1,
+          unitPriceCents: 500,
+          originalPriceCents: 500,
+          finalPriceCents: 500,
+          appliedPromotionTitle: null,
+          discountAmountCents: 0,
+        },
+      ],
+      promotionEvaluationStatus: 'fully_evaluated',
+    };
+    const evaluateCart = jest.fn().mockResolvedValue(evaluation);
+    const existingState: ConversationState = {
+      senderId: 's',
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: {
+        cart: {
+          items: [{ productId: 'old', quantity: 1, unitPriceCents: 100 }],
+          idempotencyKey: 'existing-key',
+        },
+      },
+    };
+    const get = jest.fn().mockResolvedValue(existingState);
+    const update = jest
+      .fn()
+      .mockImplementation(async (senderId: string, patch: object) => ({
+        senderId,
+        lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
+        data: (patch as { data: object }).data,
+      }));
+    const store = { get, update } as unknown as ConversationStore;
+    const deps = {
+      ...baseDeps,
+      chatbotApi: { evaluateCart } as unknown as ChatbotApiClient,
+      store,
+    };
+    const tool = makeEvaluateCartTool(deps);
+
+    // The backend echoes the caller's input, so the request carries the same
+    // per-unit prices (1000/500) that come back in the response.
+    await tool.execute(
+      {
+        items: [
+          {
+            productId: '00000000-0000-4000-8000-000000000001',
+            quantity: 2,
+            unitPriceCents: 1000,
+          },
+          {
+            productId: '00000000-0000-4000-8000-000000000002',
+            quantity: 1,
+            unitPriceCents: 500,
+          },
+        ],
+      },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
+    );
+
+    expect(update).toHaveBeenCalledTimes(1);
+    const [, patch] = update.mock.calls[0]!;
+    expect(patch).toMatchObject({
+      data: {
+        cart: {
+          items: [
+            {
+              productId: 'p-uuid-1',
+              variantId: undefined,
+              quantity: 2,
+              unitPriceCents: 1000,
+            },
+            {
+              productId: 'p-uuid-2',
+              variantId: undefined,
+              quantity: 1,
+              unitPriceCents: 500,
+            },
+          ],
+          idempotencyKey: 'existing-key',
+          expectedTotalCents: 2300,
+        },
+      },
+    });
+    const persistedCart = (
+      patch as {
+        data: {
+          cart: {
+            items: Array<{ unitPriceCents: number }>;
+            expectedTotalCents: number;
+          };
+        };
+      }
+    ).data.cart;
+    expect(persistedCart.items.map((i) => i.unitPriceCents)).toEqual([
+      1000, 500,
+    ]);
+    expect(persistedCart.expectedTotalCents).toBe(2300);
+    // Guard against the qty double-count regression (1800*2 + 500).
+    expect(persistedCart.expectedTotalCents).not.toBe(4100);
+  });
+
   // ─── sale-flow-tools spec §"evaluateCart returns a humanAssistance
   // envelope on needs_human_review" ────────────────────────────────────
   describe('humanAssistance envelope (needs_human_review)', () => {
     const uuid1 = '00000000-0000-4000-8000-000000000001';
 
-    it('adds the envelope on needs_human_review with the persisted list-price items', async () => {
+    it('adds the envelope on needs_human_review with the persisted per-unit items', async () => {
       const evaluation: CartEvaluationResult = {
         items: [
           {
@@ -354,9 +484,9 @@ describe('makeEvaluateCartTool', () => {
             variantId: null,
             quantity: 2,
             unitPriceCents: 1000,
-            originalPriceCents: 1000,
-            finalPriceCents: 800,
-            appliedPromotionTitle: null,
+            originalPriceCents: 2000,
+            finalPriceCents: 1800,
+            appliedPromotionTitle: 'PROMO_X',
             discountAmountCents: 200,
           },
         ],
@@ -390,19 +520,18 @@ describe('makeEvaluateCartTool', () => {
             {
               productId: uuid1,
               quantity: 2,
-              unitPriceCents: 500,
+              unitPriceCents: 1000,
             },
           ],
         },
         { toolCallId: 't', messages: [], context: { senderId: 's' } },
       );
 
-      // Existing payload preserved + envelope added. digest.items mirrors
-      // the persisted cart at LIST price (originalPriceCents), never the
-      // discounted finalPriceCents. `originalTotalCents` is optional in the
-      // spec union; the backend CartEvaluationResult DTO carries no
-      // top-level totals, so the digest omits it (design intent: the
-      // list-price lines are the review payload).
+      // Existing payload preserved + envelope added. digest.items mirrors the
+      // persisted cart at per-unit `unitPriceCents`, never an extended line
+      // total. `originalTotalCents` is optional in the spec union; the backend
+      // CartEvaluationResult DTO carries no top-level totals, so the digest
+      // omits it (design intent: the per-unit lines are the review payload).
       expect(result).toEqual({
         ok: true,
         ...evaluation,
@@ -433,7 +562,7 @@ describe('makeEvaluateCartTool', () => {
               unitPriceCents: 1000,
               originalPriceCents: 1000,
               finalPriceCents: 900,
-              appliedPromotionTitle: null,
+              appliedPromotionTitle: 'PROMO_X',
               discountAmountCents: 100,
             },
           ],
@@ -477,7 +606,7 @@ describe('makeEvaluateCartTool', () => {
             unitPriceCents: 1000,
             originalPriceCents: 1000,
             finalPriceCents: 900,
-            appliedPromotionTitle: null,
+            appliedPromotionTitle: 'PROMO_X',
             discountAmountCents: 100,
           },
         ],

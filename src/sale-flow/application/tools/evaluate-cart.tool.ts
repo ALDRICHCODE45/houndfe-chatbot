@@ -11,14 +11,17 @@ import type { CartItem } from '../../domain/cart-state';
  *
  * AGENTS.md §4.4.3: POST `/chatbot-api/pricing/evaluate-cart`
  * (`pricing:evaluate`). Stateful — quotes the cart AND persists the
- * canonical list-price (`originalPriceCents`) under `data.cart.items`.
+ * per-unit `unitPriceCents` under `data.cart.items`.
  *
- * The persisted `unitPriceCents` is the *list price* the backend
- * returned (`originalPriceCents`), never the model's input price or
- * the discounted `finalPriceCents`. This is the list-price enforcement
- * pinned in the spec (Q2 of `docs/backend-questions-sale-flow.md`):
- * later `createSale` overrides each line from the persisted cart, so
- * the tool, not the model, owns the price.
+ * Backend price shape (`evaluate-cart-promotions.use-case.ts`): the DTO's
+ * `originalPriceCents`, `finalPriceCents`, and `discountAmountCents` are
+ * EXTENDED LINE totals (`unitPriceCents * quantity`, discounted per line),
+ * while `unitPriceCents` is per unit. The backend spreads the caller's input
+ * into each result line, so the response `unitPriceCents` is normally an ECHO
+ * of this tool's input — not independent list-price validation. Authoritative
+ * repricing happens server-side in `confirmBotSale` (engine recompute, then
+ * `PROMO_RE_QUOTE` on an `expectedTotalCents` mismatch); this tool only
+ * persists the per-unit field and sums each line's final total once.
  *
  * The existing `idempotencyKey` is preserved across writes (only
  * `createSale` mints a new UUID v4 on first attempt). Read-then-write
@@ -31,7 +34,7 @@ import type { CartItem } from '../../domain/cart-state';
 export function makeEvaluateCartTool(deps: ToolDeps) {
   return tool({
     description:
-      'Cotiza el carrito contra el backend. Devuelve el precio de lista original y, si aplica, el precio con descuento. Persiste el carrito en ConversationState.data.cart.',
+      'Cotiza el carrito contra el backend con el precio unitario proporcionado; devuelve totales por renglón con descuentos aplicables. La venta verifica precios y promociones nuevamente. Persiste el carrito en ConversationState.data.cart.',
     inputSchema: z.object({
       items: z
         .array(
@@ -49,23 +52,24 @@ export function makeEvaluateCartTool(deps: ToolDeps) {
       const senderId = options.context.senderId;
       try {
         const evaluation = await deps.chatbotApi.evaluateCart(input.items);
-        // List-price enforcement: persist `originalPriceCents` as
-        // `unitPriceCents`, NOT the model's input price nor the
-        // discounted `finalPriceCents`.
+        // Persist the response's PER-UNIT `unitPriceCents`, NOT an extended
+        // line total (`originalPriceCents`/`finalPriceCents`). The backend
+        // echoes the caller's input here, so this is not list-price
+        // validation; `confirmBotSale` owns authoritative repricing.
         const items: CartItem[] = evaluation.items.map((i) => ({
           productId: i.productId,
           variantId: i.variantId ?? undefined,
           quantity: i.quantity,
-          unitPriceCents: i.originalPriceCents,
+          unitPriceCents: i.unitPriceCents,
         }));
-        // Q2 / R13: compute Σ(finalPriceCents × quantity) — the
-        // discounted total the bot quoted at step 8. ADR-6 — the
-        // CartEvaluationResult DTO has no top-level `totalCents`, so
-        // the client sums it from per-line fields. The result is
-        // persisted on the cart so a later `createSale` can send it
-        // as the top-level `expectedTotalCents` guard.
+        // Q2 / R13: sum each LINE `finalPriceCents` ONCE (it is already the
+        // extended line total; multiplying by quantity double-counts).
+        // ADR-6 — the CartEvaluationResult DTO has no top-level
+        // `totalCents`, so the client sums it from per-line fields. This is
+        // only a client-side conversation total; the backend recomputes and
+        // returns `PROMO_RE_QUOTE` on mismatch.
         const expectedTotalCents = evaluation.items.reduce(
-          (sum, i) => sum + i.finalPriceCents * i.quantity,
+          (sum, i) => sum + i.finalPriceCents,
           0,
         );
         const state = await deps.store.get(senderId);
@@ -83,13 +87,13 @@ export function makeEvaluateCartTool(deps: ToolDeps) {
         // `needs_human_review` signal envelope (spec §"evaluateCart returns
         // a humanAssistance envelope"): the tool ONLY signals — the model
         // renders the existing quote first and escalates via
-        // `requestHumanAssistance` when the customer wants to proceed. The
-        // digest mirrors the persisted cart at LIST price
-        // (`unitPriceCents = originalPriceCents`), never the discounted
-        // `finalPriceCents`. The backend CartEvaluationResult DTO carries no
-        // top-level totals, so the optional `originalTotalCents` /
-        // `recomputedTotalCents` digest fields are omitted (design intent:
-        // the list-price lines are the review payload).
+        // `requestHumanAssistance` when the customer wants to proceed. This is
+        // a conversation-level signal only; it does not block `createSale`.
+        // The digest mirrors the persisted cart at per-unit `unitPriceCents`,
+        // never an extended line total. The backend CartEvaluationResult DTO
+        // carries no top-level totals, so the optional `originalTotalCents` /
+        // `recomputedTotalCents` digest fields are omitted (design intent: the
+        // per-unit lines are the review payload).
         return {
           ...success,
           humanAssistance: {
