@@ -9,6 +9,10 @@
  * The literal MUST stay verbatim in the byte-identical assertions
  * (`sale-flow-instructions.spec.ts`) — silent drift here is a spec break.
  *
+ * SQ-5C3d1 adds an opt-in `SHIPPING_QUOTE_GUIDANCE_FRAGMENT` behind the
+ * second optional `composeSaleFlowSystemPrompt` parameter; the default/off
+ * output stays byte-identical and never mentions `getShippingQuote`.
+ *
  * Q1/Q2/Q3 contract changes (this slice):
  *  - The boot-time bank-details port + rendered-block helper
  *    are gone; the new 10th AI-SDK tool `getPaymentDetails` is the runtime
@@ -73,15 +77,82 @@ Recordatorios finales:
 `;
 
 /**
+ * SQ-5C3d1 opt-in shipping guidance fragment.
+ *
+ * Appended ONLY when composition is told the `getShippingQuote` tool is
+ * available (SQ-5C3d2 binds that flag from the registered tool key). It is
+ * written in Spanish to match the surrounding sale-flow instructions and
+ * explicitly supersedes the step-15 note `este slice no cotiza envíos`.
+ *
+ * The fragment is deliberately price-free: the tool itself never returns a
+ * price, so the model can never relay an amount, credit, carrier, quote,
+ * reference, or digest before a human confirms. A `reused`/`quoted` result
+ * means the server created an approval REQUEST, never that a human approved.
+ */
+export const SHIPPING_QUOTE_GUIDANCE_FRAGMENT = `
+
+# Cotización de envío (reemplaza la nota del paso 15)
+
+El paso 15 dice "este slice no cotiza envíos"; este bloque reemplaza esa nota cuando la herramienta \`getShippingQuote\` está disponible.
+
+- Llama a \`getShippingQuote\` sin argumentos: el servidor resuelve por su cuenta el carrito y la dirección guardados. Nunca le pases teléfono, dirección, producto, medidas, precio, tarifa ni transportista.
+- Un resultado \`reused\` o \`quoted\` significa únicamente que el servidor registró una SOLICITUD de aprobación de envío; NO significa que un humano ya la aprobó.
+- Nunca inventes ni repitas al cliente el monto, el crédito, el transportista, la cotización, la referencia ni el digest: la herramienta no devuelve ninguno de esos datos. Espera la confirmación humana antes de decir cualquier cosa sobre el envío.
+- Nunca llames a \`requestHumanAssistance\` con \`kind: 'shipping_approval'\`: esa aprobación la genera el servidor y la herramienta del modelo rechaza ese kind.
+- Si el resultado es \`unavailable\`, \`handoff_required\`, o choca con una solicitud pendiente, espera y ofrece ayuda humana; nunca reutilices ni inventes una referencia de aprobación.
+- Si el borrador de cotización expiró, vuelve a llamar a \`getShippingQuote\` para obtener una cotización fresca; nunca repitas ni reutilices una aprobación vencida.
+- No llames a \`createSale\` para un pedido con envío, ni siquiera si operaciones lo aprueba, hasta que la puerta server-side de SQ-5D y el cargo de envío del backend puedan persistirse de forma honesta.
+`;
+
+/**
+ * SQ-5C3d1 boot-time availability input. Shaped as an options object so
+ * SQ-5C3d2 can bind `shippingQuoteAvailable` from the registered tool key
+ * without changing the composer signature again. A bare `boolean` is also
+ * accepted for ergonomics; only the exact value `true` enables the fragment.
+ */
+export interface SaleFlowInstructionOptions {
+  readonly shippingQuoteAvailable?: boolean;
+}
+
+/**
+ * Fails closed: only the exact value `true` (bare boolean or the options
+ * field) enables the shipping fragment. Any other value, a throwing getter,
+ * or a non-object input leaves the composed prompt byte-identical to the
+ * disabled default.
+ */
+function isShippingQuoteAvailable(
+  availability: boolean | SaleFlowInstructionOptions | undefined,
+): boolean {
+  try {
+    if (availability === true) return true;
+    if (typeof availability !== 'object' || availability === null) return false;
+    return availability.shippingQuoteAvailable === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Compose the system prompt: base `SYSTEM_PROMPT` + '\n\n' + slice. The
  * one-arg signature collapses the boot-time bank-details seam (Q1); the
  * runtime `getPaymentDetails` tool is now the source of truth for bank data.
+ *
+ * The second optional parameter is the SQ-5C3d1 shipping availability seam:
+ * when it resolves to `true` the `SHIPPING_QUOTE_GUIDANCE_FRAGMENT` is
+ * appended; otherwise the result stays byte-identical to
+ * `base + '\n\n' + SALE_FLOW_INSTRUCTIONS`.
  *
  * The literal `SALE_FLOW_INSTRUCTIONS` keeps the byte-identical human-handoff
  * phrase `en un momento un agente te comparte los datos de pago` inside the
  * `noActivePaymentDetail` branch so the v1 behaviour is preserved even when
  * the runtime tool returns 404.
  */
-export function composeSaleFlowSystemPrompt(base: string): string {
-  return base + '\n\n' + SALE_FLOW_INSTRUCTIONS;
+export function composeSaleFlowSystemPrompt(
+  base: string,
+  availability?: boolean | SaleFlowInstructionOptions,
+): string {
+  const shippingFragment = isShippingQuoteAvailable(availability)
+    ? SHIPPING_QUOTE_GUIDANCE_FRAGMENT
+    : '';
+  return base + '\n\n' + SALE_FLOW_INSTRUCTIONS + shippingFragment;
 }
