@@ -7,8 +7,8 @@
  * means the request is unfixable and the model should surface it to the
  * customer (or fall through to the refusal phrase).
  *
- * The fourteen `kind` literals partition into two shapes:
- *   - The 13 "simple" kinds carry exactly `{ kind, retryable }`.
+ * The fifteen `kind` literals partition into two shapes:
+ *   - The 14 "simple" kinds carry exactly `{ kind, retryable }`.
  *   - The `promoReQuote` kind carries the three numeric cents fields the
  *     model needs to re-confirm with the customer (Q2 / R13).
  * The discriminated union below encodes both shapes verbatim.
@@ -17,6 +17,11 @@
  * `missingPlacedSaleId`) are produced by `cancelSale` / the cancel
  * `errorCode`-first mapping. `missingPlacedSaleId` is NEVER emitted by
  * `mapChatbotError` — only by the tool's client-side guard.
+ * `shippingUnpersistable` is likewise tool-emitted only: `createSale`'s
+ * client-side shipping marker gate (SQ-5D2) returns it before any backend
+ * call when the conversation carries a server-written shipping marker that
+ * the backend `CreateSaleInput` cannot yet price; `mapChatbotError` never
+ * emits it.
  */
 export type ToolErrorKind =
   | 'auth'
@@ -32,7 +37,8 @@ export type ToolErrorKind =
   | 'priceOutOfDate'
   | 'saleNotFound'
   | 'saleNotCancellable'
-  | 'missingPlacedSaleId';
+  | 'missingPlacedSaleId'
+  | 'shippingUnpersistable';
 
 export interface SimpleToolError {
   kind: Exclude<ToolErrorKind, 'promoReQuote'>;

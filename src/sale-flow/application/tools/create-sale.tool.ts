@@ -6,7 +6,9 @@ import { mapChatbotError } from '../error-mapping';
 import { persistCart } from '../cart-persistence';
 import { persistConfirmedSale } from '../placed-sale-persistence';
 import { readCart, writeCart, type CartState } from '../../domain/cart-state';
+import type { ConversationState } from '../../../conversation/domain/conversation-store';
 import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
+import { evaluateShippingSaleGate } from '../shipping-sale-gate';
 
 /**
  * createSale — AI-SDK tool factory.
@@ -106,8 +108,38 @@ export function makeCreateSaleTool(deps: ToolDeps) {
     execute: async (input, options) => {
       const senderId = options.context.senderId;
 
-      // 1) Load cart from the durable store.
-      const state = await deps.store.get(senderId);
+      // 1) Load the sender state from the durable store.
+      const storedState = await deps.store.get(senderId);
+
+      // Shipping marker gate (SQ-5D2): the backend `CreateSaleInput` has no
+      // shipping-charge field, so a sale can be registered honestly only while
+      // the conversation carries no server-written shipping marker. The gate
+      // fails closed on hostile state and rejects a descriptor/`get` divergent
+      // `data` BEFORE any idempotency-key mint / store write / backend call.
+      // It returns the ONE validated `data` snapshot; every later cart read and
+      // persistence path uses `state` below and never re-reads
+      // `storedState.data`, so a stateful `get('data')` cannot flip the verdict.
+      // A delivery address is not a quote signal, so an address-only sale
+      // still passes.
+      const gate = evaluateShippingSaleGate(storedState);
+      if (gate.kind !== 'pass') {
+        return {
+          ok: false as const,
+          error: {
+            kind: 'shippingUnpersistable' as const,
+            retryable: false,
+          },
+        };
+      }
+      const state: ConversationState | null =
+        storedState === null || gate.data === null
+          ? null
+          : {
+              senderId: storedState.senderId,
+              lastMessageAt: storedState.lastMessageAt,
+              data: gate.data,
+            };
+
       const cart = readCart(state);
 
       // 2) Empty-cart guard.
