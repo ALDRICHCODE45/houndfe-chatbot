@@ -21,6 +21,7 @@ import type {
 } from '../domain/human-handoff.types';
 import {
   SHIPPING_APPROVAL_POLICY,
+  type ShippingApprovalDecision,
   type ShippingApprovalPolicy,
 } from '../domain/shipping-approval-policy.port';
 import {
@@ -56,6 +57,18 @@ export const PENDING_HUMAN_REQUEST_REPLY =
 export const ASK_FOR_REF =
   'No encontré una solicitud pendiente. Incluye el código HF-xxxx de la solicitud (está en el mensaje que te envié).';
 
+/** Data-free ops reply for a missing/malformed shipping decision. */
+export const SHIPPING_DECISION_GRAMMAR =
+  'No pude interpretar tu decisión de envío. Responde con "APPROVE_SHIPPING" o "REJECT_SHIPPING" (opcionalmente con el código HF-xxxx de la solicitud antes de los dos puntos).';
+
+/** Data-free ops reply for a stale draft; the row resolves as expired. */
+export const SHIPPING_REQUOTE_REPLY =
+  'La cotización de envío ya no es válida. Se requiere una nueva cotización antes de continuar.';
+
+/** Data-free ops reply for any fail-closed shipping error. */
+export const SHIPPING_RETRY_REPLY =
+  'No pude procesar la respuesta del envío. Revisa la solicitud e inténtalo de nuevo.';
+
 export interface HumanHandoffCreateInput {
   senderId: string;
   kind: HumanHandoffKind;
@@ -74,7 +87,10 @@ export type HumanHandoffResolveReplyResult =
       resolution: HumanHandoffResolution;
       syntheticUserText: string;
     }
-  | { kind: 'no_pending'; reply: string };
+  | { kind: 'no_pending'; reply: string }
+  | { kind: 'needs_decision'; reply: string }
+  | { kind: 'needs_requote'; reply: string }
+  | { kind: 'ops_error'; reply: string };
 
 /**
  * Application-layer service for the human-handoff channel.
@@ -109,19 +125,26 @@ export class HumanHandoffService {
   ) {}
 
   isOpsSender(senderId: string): boolean {
+    return this.isOpsPhone(senderId);
+  }
+
+  /** Same ops-phone comparison as `isOpsSender`; used for the assigned agent. */
+  private isOpsPhone(candidate: string): boolean {
     const opsChannelPhone = this.configService.get<string>(
       'humanHandoff.opsChannelPhone',
     );
-    if (!opsChannelPhone) {
-      return false;
-    }
-    const sandboxNormalization =
+    return !!opsChannelPhone && this.phoneMatches(candidate, opsChannelPhone);
+  }
+
+  /** Equality of two wa_ids under the explicit sandbox-recipient mode. */
+  private phoneMatches(a: string, b: string): boolean {
+    const sandbox =
       this.configService.get<boolean>(
         'meta.sandboxRecipientNormalizationEnabled',
       ) === true;
     return (
-      normalizeSandboxRecipient(senderId, sandboxNormalization) ===
-      normalizeSandboxRecipient(opsChannelPhone, sandboxNormalization)
+      normalizeSandboxRecipient(a, sandbox) ===
+      normalizeSandboxRecipient(b, sandbox)
     );
   }
 
@@ -210,6 +233,12 @@ export class HumanHandoffService {
       return { kind: 'no_pending', reply: ASK_FOR_REF };
     }
 
+    // SQ-5C2c2b: structured, fail-closed path; the generic parser below
+    // must never see a shipping request.
+    if (target.kind === 'shipping_approval') {
+      return this.resolveShippingReply(args, target);
+    }
+
     const resolution = parseResolution(args.text, target.kind);
     await this.store.resolve(target.id, resolution);
 
@@ -227,6 +256,52 @@ export class HumanHandoffService {
       resolution,
       syntheticUserText: formatResolutionAsUserTurn(target, resolution),
     };
+  }
+
+  /**
+   * b1 shipping guard/grammar slice: identity guards → strict grammar
+   * (`parseDecision` only) → pending-marker guard. Malformed → needs_decision;
+   * bad identity/agent/sender/pending → ops_error; all write-free. Valid
+   * commands stop at ops_error until b2/b3 own expiration/approval.
+   */
+  private async resolveShippingReply(
+    args: { text: string; from: string },
+    target: HumanHandoffRequest,
+  ): Promise<HumanHandoffResolveReplyResult> {
+    const opsError: HumanHandoffResolveReplyResult = {
+      kind: 'ops_error',
+      reply: SHIPPING_RETRY_REPLY,
+    };
+    const { digest } = target;
+    if (
+      target.status !== 'pending' ||
+      !this.isOpsPhone(target.agentId) ||
+      !this.phoneMatches(args.from, target.agentId) ||
+      !/^[0-9a-f]{12}$/.test(target.id) ||
+      !digest ||
+      digest.kind !== 'shipping_approval' ||
+      !isCanonicalIso(digest.draftCreatedAt)
+    ) {
+      return opsError;
+    }
+
+    const parsed = parseShippingGrammar(
+      args.text,
+      target.id,
+      this.shippingApprovalPolicy,
+    );
+    if (parsed === null) {
+      return { kind: 'needs_decision', reply: SHIPPING_DECISION_GRAMMAR };
+    }
+
+    const customerState = await this.conversationStore.get(target.customerId);
+    const pendingMarker = readPendingHumanRequest(customerState);
+    if (!pendingMarker || pendingMarker.requestId !== target.id) {
+      return opsError;
+    }
+
+    // b2/b3 verify the draft pin and persist the decision here.
+    return opsError;
   }
 }
 
@@ -325,6 +400,38 @@ function formatCents(cents: number): string {
   const sign = cents < 0 ? '-' : '';
   const abs = Math.abs(Math.trunc(cents));
   return `${sign}${Math.trunc(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+}
+
+/** Strict anchored grammar: tokenless = exact command; with ref = only
+ *  `HF-<id>: <command>` (i, outer-whitespace tolerant). Command parsed ONLY
+ *  via `policy.parseDecision`; wrong/multiple/embedded refs, extra colon,
+ *  prose, reasons, suffixes, coercible non-strings → null. */
+function parseShippingGrammar(
+  text: unknown,
+  targetId: string,
+  policy: ShippingApprovalPolicy,
+): ShippingApprovalDecision | null {
+  if (typeof text !== 'string') return null;
+  if (!/\bHF-[A-Za-z0-9_-]{4,32}\b/i.test(text)) {
+    return policy.parseDecision(text.trim());
+  }
+  const escaped = targetId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`^\\s*HF-${escaped}\\s*:\\s*(.+?)\\s*$`, 'i').exec(
+    text,
+  );
+  return match ? policy.parseDecision(match[1]) : null;
+}
+
+/** Canonical ISO: equal to its own round-tripped `toISOString()`. */
+function isCanonicalIso(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms) || ms < 0) return false;
+  try {
+    return new Date(ms).toISOString() === value;
+  } catch {
+    return false;
+  }
 }
 
 /**

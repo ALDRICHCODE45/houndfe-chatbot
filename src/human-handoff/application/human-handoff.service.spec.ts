@@ -6,6 +6,11 @@ import type {
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import { shippingApprovalPolicyAdapter } from '../../shipping/application/shipping-approval-policy.adapter';
 import type {
+  ShippingApprovalDecision,
+  ShippingApprovalPinResult,
+  ShippingApprovalPolicy,
+} from '../domain/shipping-approval-policy.port';
+import type {
   CreateHumanHandoffInput,
   HumanHandoffStore,
 } from '../domain/human-handoff-store.port';
@@ -19,6 +24,9 @@ import {
   UNDER_REVIEW_NOTICE,
   PENDING_HUMAN_REQUEST_REPLY,
   ASK_FOR_REF,
+  SHIPPING_DECISION_GRAMMAR,
+  SHIPPING_REQUOTE_REPLY,
+  SHIPPING_RETRY_REPLY,
   HumanHandoffService,
   formatResolutionAsUserTurn,
 } from './human-handoff.service';
@@ -767,6 +775,260 @@ describe('HumanHandoffService', () => {
           process.env.OPS_CHANNEL_PHONE = original;
         }
       }
+    });
+  });
+
+  describe('resolveReply shipping_approval (SQ-5C2c2b1)', () => {
+    const PIN = '2026-06-23T12:00:00.000Z';
+    let policy: jest.Mocked<ShippingApprovalPolicy>;
+    let shipping: HumanHandoffService;
+
+    const baseDigest: ShippingApprovalDigest = {
+      kind: 'shipping_approval',
+      draftCreatedAt: PIN,
+      customerPaysCents: 6_901,
+      totalCreditCents: 12_000,
+      carrierName: 'CARRIER_SECRET',
+      serviceName: 'SERVICE_SECRET',
+      estimatedDeliveryDays: 3,
+    };
+
+    const shippingRequest = (
+      overrides: Partial<HumanHandoffRequest> = {},
+    ): HumanHandoffRequest => ({
+      id: REF_ID,
+      customerId: CUSTOMER,
+      agentId: OPS,
+      kind: 'shipping_approval',
+      digest: { ...baseDigest },
+      status: 'pending',
+      resolution: null,
+      createdAt: PIN,
+      resolvedAt: null,
+      ...overrides,
+    });
+
+    const st = (requestId: string | null = REF_ID): ConversationState => ({
+      senderId: CUSTOMER,
+      lastMessageAt: PIN,
+      data:
+        requestId === null
+          ? {}
+          : {
+              pendingHumanRequest: {
+                requestId,
+                ref: `HF-${requestId}`,
+                createdAt: PIN,
+                customerNotifiedAt: PIN,
+              },
+            },
+    });
+    const prime = (target = shippingRequest()) => {
+      conversationStore.get.mockResolvedValue(st());
+      store.findLatestPendingForAgent.mockResolvedValue(target);
+    };
+    const run = (text: unknown, from = OPS) =>
+      shipping.resolveReply({ text: text as string, from });
+    const noWrites = () => {
+      expect(store.resolve).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+    };
+
+    beforeEach(() => {
+      policy = {
+        parseDecision: jest.fn<
+          ShippingApprovalDecision | null,
+          [value: unknown]
+        >((value) => shippingApprovalPolicyAdapter.parseDecision(value)),
+        verifyDraftPin: jest.fn<
+          ShippingApprovalPinResult,
+          [state: unknown, draftCreatedAt: string, nowMs: number]
+        >(() => ({ kind: 'valid' })),
+      };
+      shipping = new HumanHandoffService(
+        store,
+        whatsappSender,
+        conversationStore,
+        configService,
+        policy,
+      );
+    });
+
+    it('pins the three ops replies byte-identically and leaks no forbidden data', () => {
+      expect(SHIPPING_DECISION_GRAMMAR).toBe(
+        'No pude interpretar tu decisión de envío. Responde con "APPROVE_SHIPPING" o "REJECT_SHIPPING" (opcionalmente con el código HF-xxxx de la solicitud antes de los dos puntos).',
+      );
+      expect(SHIPPING_REQUOTE_REPLY).toBe(
+        'La cotización de envío ya no es válida. Se requiere una nueva cotización antes de continuar.',
+      );
+      expect(SHIPPING_RETRY_REPLY).toBe(
+        'No pude procesar la respuesta del envío. Revisa la solicitud e inténtalo de nuevo.',
+      );
+      const leaked = [
+        '6901',
+        '69.01',
+        '12000',
+        '120.00',
+        'CARRIER_SECRET',
+        'SERVICE_SECRET',
+        PIN,
+        `HF-${REF_ID}`,
+        CUSTOMER,
+        OPS,
+      ];
+      for (const reply of [
+        SHIPPING_DECISION_GRAMMAR,
+        SHIPPING_REQUOTE_REPLY,
+        SHIPPING_RETRY_REPLY,
+      ]) {
+        for (const token of leaked) expect(reply).not.toContain(token);
+      }
+    });
+
+    it.each([
+      ['wrong ref', 'HF-fffeeeddddcc: APPROVE_SHIPPING'],
+      ['missing colon', `HF-${REF_ID} APPROVE_SHIPPING`],
+      ['extra colon', `HF-${REF_ID}: APPROVE_SHIPPING: extra`],
+      ['prose suffix', `HF-${REF_ID}: APPROVE_SHIPPING por favor`],
+      ['reason suffix', `HF-${REF_ID}: APPROVE_SHIPPING porque sí`],
+      ['prose prefix', `HF-${REF_ID}: autorizo APPROVE_SHIPPING`],
+      ['multiple refs', `HF-${REF_ID}: APPROVE_SHIPPING HF-fffeeeddddcc`],
+      ['embedded ref', `HF-${REF_ID}: APPROVE_SHIPPINGHF-fffeeeddddcc`],
+      ['empty command', `HF-${REF_ID}: `],
+      ['both commands', `HF-${REF_ID}: APPROVE_SHIPPING REJECT_SHIPPING`],
+      ['unknown command', `HF-${REF_ID}: SHIP_IT`],
+      ['tokenless prose', 'sí, adelante'],
+    ])('%s → needs_decision with zero writes', async (label, text) => {
+      prime();
+      store.findByRef.mockResolvedValue(
+        label === 'wrong ref' ? null : shippingRequest(),
+      );
+      expect(await run(text)).toEqual({
+        kind: 'needs_decision',
+        reply: SHIPPING_DECISION_GRAMMAR,
+      });
+      if (label === 'wrong ref') {
+        expect(store.findLatestPendingForAgent).toHaveBeenCalledWith(OPS);
+      }
+      noWrites();
+    });
+
+    it.each([
+      ['tokenless', '  approve_shipping  ', 'approve_shipping'],
+      ['exact ref', `HF-${REF_ID}: REJECT_SHIPPING`, 'REJECT_SHIPPING'],
+    ])(
+      'valid %s command reaches fail-closed ops_error without writes',
+      async (_label, text, command) => {
+        prime();
+        store.findByRef.mockResolvedValue(shippingRequest());
+        expect(await run(text)).toEqual({
+          kind: 'ops_error',
+          reply: SHIPPING_RETRY_REPLY,
+        });
+        expect(policy.parseDecision).toHaveBeenCalledWith(command);
+        noWrites();
+      },
+    );
+
+    it('rejects a coercible non-string as needs_decision with zero writes', async () => {
+      prime();
+      store.findByRef.mockResolvedValue(shippingRequest());
+      expect(await run({ toString: () => 'APPROVE_SHIPPING' })).toEqual({
+        kind: 'needs_decision',
+        reply: SHIPPING_DECISION_GRAMMAR,
+      });
+      noWrites();
+      expect(policy.parseDecision).not.toHaveBeenCalled();
+    });
+
+    it('never calls the policy for non-shipping requests', async () => {
+      store.findByRef.mockResolvedValue({
+        ...shippingRequest(),
+        kind: 'out_of_stock',
+        digest: { kind: 'out_of_stock', productId: 'p', name: 'x' },
+      });
+      conversationStore.get.mockResolvedValue(st());
+      const result = await run(`HF-${REF_ID} NO_RESTOCK`);
+      expect(result.kind).toBe('resolved');
+      expect(policy.parseDecision).not.toHaveBeenCalled();
+    });
+
+    const identityCases: Array<[string, Partial<HumanHandoffRequest>]> = [
+      ['nonpending', { status: 'resolved' }],
+      ['wrong stored agent', { agentId: '5215550001111' }],
+      ['invalid id', { id: 'NOT-HEX-0000' }],
+      [
+        'wrong digest',
+        { digest: { kind: 'out_of_stock', productId: 'p', name: 'x' } },
+      ],
+      [
+        'invalid pin',
+        { digest: { ...baseDigest, draftCreatedAt: 'HOSTILE_PIN' } },
+      ],
+    ];
+
+    it.each(identityCases)(
+      'guard %s → ops_error with zero writes and no policy parse',
+      async (_label, over) => {
+        store.findByRef.mockResolvedValue(shippingRequest(over));
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
+          kind: 'ops_error',
+          reply: SHIPPING_RETRY_REPLY,
+        });
+        noWrites();
+        expect(policy.parseDecision).not.toHaveBeenCalled();
+      },
+    );
+
+    it('guard wrong sender with a valid ref → ops_error, no parse, no writes', async () => {
+      prime();
+      store.findByRef.mockResolvedValue(shippingRequest());
+      expect(
+        await run(`HF-${REF_ID}: APPROVE_SHIPPING`, '5215550001111'),
+      ).toEqual({ kind: 'ops_error', reply: SHIPPING_RETRY_REPLY });
+      expect(policy.parseDecision).not.toHaveBeenCalled();
+      noWrites();
+    });
+
+    it.each([
+      ['missing marker', null],
+      ['mismatched marker', 'ffffffffffff'],
+    ])('guard %s → ops_error with zero writes', async (_label, requestId) => {
+      conversationStore.get.mockResolvedValue(st(requestId));
+      store.findByRef.mockResolvedValue(shippingRequest());
+      expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
+        kind: 'ops_error',
+        reply: SHIPPING_RETRY_REPLY,
+      });
+      noWrites();
+    });
+
+    it('accepts a sandbox-normalized sender matching the assigned agent', async () => {
+      const sandboxConfig = {
+        get: (key: string) =>
+          key === 'humanHandoff.opsChannelPhone'
+            ? OPS
+            : key === 'meta.sandboxRecipientNormalizationEnabled',
+      } as unknown as ConfigService;
+      const sandbox = new HumanHandoffService(
+        store,
+        whatsappSender,
+        conversationStore,
+        sandboxConfig,
+        policy,
+      );
+      prime();
+      store.findByRef.mockResolvedValue(
+        shippingRequest({ agentId: '529999888777' }),
+      );
+      expect(
+        await sandbox.resolveReply({
+          text: `HF-${REF_ID}: APPROVE_SHIPPING`,
+          from: OPS,
+        }),
+      ).toEqual({ kind: 'ops_error', reply: SHIPPING_RETRY_REPLY });
+      expect(policy.parseDecision).toHaveBeenCalledWith('APPROVE_SHIPPING');
+      noWrites();
     });
   });
 });
