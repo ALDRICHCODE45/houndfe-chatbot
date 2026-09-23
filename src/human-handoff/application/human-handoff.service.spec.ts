@@ -1388,6 +1388,235 @@ describe('HumanHandoffService', () => {
         },
       );
     });
+
+    describe('b4c1 expired-row completion', () => {
+      const EXPIRED_AT = '2026-06-23T12:05:00.000Z';
+      const expiredRequest = (
+        overrides: Partial<HumanHandoffRequest> = {},
+      ): HumanHandoffRequest => ({
+        ...shippingRequest(),
+        status: 'resolved',
+        resolution: {
+          decision: 'SHIPPING_EXPIRED',
+          draftCreatedAt: PIN,
+          reason: 'draft_expired',
+        },
+        resolvedAt: EXPIRED_AT,
+        ...overrides,
+      });
+
+      const primeExpired = (overrides: Partial<HumanHandoffRequest> = {}) => {
+        store.findByRef.mockResolvedValue(expiredRequest(overrides));
+        conversationStore.get.mockResolvedValue(st());
+        conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
+      };
+
+      // b4c1 must never resolve, update, or parse/verify a decision.
+      const noCompletionWrites = () => {
+        expect(store.resolve).not.toHaveBeenCalled();
+        expect(conversationStore.update).not.toHaveBeenCalled();
+        expect(policy.parseDecision).not.toHaveBeenCalled();
+        expect(policy.verifyDraftPin).not.toHaveBeenCalled();
+      };
+      const OPS_ERROR = {
+        kind: 'ops_error',
+        reply: SHIPPING_RETRY_REPLY,
+      } as const;
+      const REQUOTE = {
+        kind: 'needs_requote',
+        reply: SHIPPING_REQUOTE_REPLY,
+      } as const;
+      const noClear = () =>
+        expect(
+          conversationStore.clearPendingHumanRequest,
+        ).not.toHaveBeenCalled();
+
+      it('completes an expired row: clears the matching pending marker once and asks for requote', async () => {
+        primeExpired();
+        const result = await run(`HF-${REF_ID}: REJECT_SHIPPING`);
+        expect(result).toEqual(REQUOTE);
+        expect(conversationStore.clearPendingHumanRequest).toHaveBeenCalledWith(
+          CUSTOMER,
+          REF_ID,
+        );
+        noCompletionWrites();
+      });
+
+      it.each([
+        ['absent ref', 'APPROVE_SHIPPING'],
+        ['mismatched ref', 'HF-ffffffffffff: APPROVE_SHIPPING'],
+        ['uppercase ref', `HF-${REF_ID.toUpperCase()}: APPROVE_SHIPPING`],
+      ])('fails closed on %s without clearing', async (_label, text) => {
+        store.findByRef.mockResolvedValue(expiredRequest());
+        store.findLatestPendingForAgent.mockResolvedValue(expiredRequest());
+        conversationStore.get.mockResolvedValue(st());
+        expect(await run(text)).toEqual(OPS_ERROR);
+        noClear();
+        noCompletionWrites();
+      });
+
+      it('fails closed when the sender is not the assigned ops agent', async () => {
+        primeExpired();
+        expect(
+          await run(`HF-${REF_ID}: APPROVE_SHIPPING`, '5215550001111'),
+        ).toEqual(OPS_ERROR);
+        noClear();
+        noCompletionWrites();
+      });
+
+      it.each<[string, Partial<HumanHandoffRequest>]>([
+        ['non-assigned stored agent', { agentId: '5215550001111' }],
+        ['invalid target id', { id: 'NOT-HEX-0000' }],
+        [
+          'wrong digest kind',
+          { digest: { kind: 'out_of_stock', productId: 'p', name: 'x' } },
+        ],
+        [
+          'noncanonical digest pin',
+          { digest: { ...baseDigest, draftCreatedAt: 'HOSTILE_PIN' } },
+        ],
+        ['malformed status', { status: 'garbage' as never }],
+      ])('fails closed on %s without clearing', async (_label, over) => {
+        primeExpired(over);
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual(OPS_ERROR);
+        noClear();
+        noCompletionWrites();
+      });
+
+      it.each([
+        ['missing pending marker', st(null)],
+        ['mismatched pending marker', st('ffffffffffff')],
+      ])('fails closed on a %s without clearing', async (_label, state) => {
+        store.findByRef.mockResolvedValue(expiredRequest());
+        conversationStore.get.mockResolvedValue(state);
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual(OPS_ERROR);
+        noClear();
+        noCompletionWrites();
+      });
+
+      it.each<[string, HumanHandoffRequest['resolution']]>([
+        ['null resolution', null],
+        [
+          'approved decision',
+          { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN },
+        ],
+        [
+          'rejected decision',
+          { decision: 'SHIPPING_REJECTED', draftCreatedAt: PIN },
+        ],
+        [
+          'mismatched pin',
+          {
+            decision: 'SHIPPING_EXPIRED',
+            draftCreatedAt: '2026-06-23T11:00:00.000Z',
+            reason: 'draft_expired',
+          },
+        ],
+        [
+          'invalid stale reason',
+          {
+            decision: 'SHIPPING_EXPIRED',
+            draftCreatedAt: PIN,
+            reason: 'whenever' as never,
+          },
+        ],
+        [
+          'extra key',
+          {
+            decision: 'SHIPPING_EXPIRED',
+            draftCreatedAt: PIN,
+            reason: 'draft_missing',
+            extra: 1,
+          } as never,
+        ],
+      ])('fails closed on %s without clearing', async (_label, resolution) => {
+        primeExpired({ resolution });
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual(OPS_ERROR);
+        noClear();
+        noCompletionWrites();
+      });
+
+      it.each<[string, unknown, boolean]>([
+        [
+          'valid same-request',
+          {
+            requestId: REF_ID,
+            draftCreatedAt: PIN,
+            decision: 'SHIPPING_APPROVED',
+            decidedAt: PIN,
+          },
+          false,
+        ],
+        ['malformed same-request', { requestId: REF_ID, junk: true }, false],
+        [
+          'valid sibling request',
+          {
+            requestId: 'ffffffffffff',
+            draftCreatedAt: PIN,
+            decision: 'SHIPPING_REJECTED',
+            decidedAt: PIN,
+          },
+          true,
+        ],
+      ])(
+        'approval marker %s → requote=%s',
+        async (_label, shippingApproval, requote) => {
+          primeExpired();
+          conversationStore.get.mockResolvedValue({
+            ...st(),
+            data: { ...st().data, shippingApproval },
+          });
+          const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+          expect(result.kind).toBe(requote ? 'needs_requote' : 'ops_error');
+          expect(
+            conversationStore.clearPendingHumanRequest,
+          ).toHaveBeenCalledTimes(requote ? 1 : 0);
+          noCompletionWrites();
+        },
+      );
+
+      it('contains a conversation get rejection as ops_error', async () => {
+        store.findByRef.mockResolvedValue(expiredRequest());
+        conversationStore.get.mockRejectedValueOnce(new Error('db down'));
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual(OPS_ERROR);
+        noClear();
+        noCompletionWrites();
+      });
+
+      it.each(['false', 'reject'] as const)(
+        'conditional clear %s → ops_error with no synthetic turn',
+        async (mode) => {
+          primeExpired();
+          if (mode === 'false') {
+            conversationStore.clearPendingHumanRequest.mockResolvedValueOnce(
+              false,
+            );
+          } else {
+            conversationStore.clearPendingHumanRequest.mockRejectedValueOnce(
+              new Error('db down'),
+            );
+          }
+          const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+          expect(result).toEqual(OPS_ERROR);
+          noCompletionWrites();
+        },
+      );
+
+      it('is safe for concurrent retries: the winning clear completes, the loser emits no synthetic', async () => {
+        primeExpired();
+        conversationStore.clearPendingHumanRequest
+          .mockResolvedValueOnce(true)
+          .mockResolvedValueOnce(false);
+        const first = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+        const second = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+        expect(first).toEqual(REQUOTE);
+        expect(second).toEqual(OPS_ERROR);
+        expect(
+          conversationStore.clearPendingHumanRequest,
+        ).toHaveBeenCalledTimes(2);
+        noCompletionWrites();
+      });
+    });
   });
 });
 

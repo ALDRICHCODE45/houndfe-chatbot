@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import {
   CONVERSATION_STORE,
+  isPendingHumanRequest,
   type ConversationState,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
@@ -33,6 +34,7 @@ import {
 } from './pending-human-request-persistence';
 import {
   clearShippingApprovalMarker,
+  readShippingApprovalMarker,
   setShippingApprovalMarker,
 } from './shipping-approval-persistence';
 
@@ -294,7 +296,6 @@ export class HumanHandoffService {
     };
     const { digest } = target;
     if (
-      target.status !== 'pending' ||
       !this.isOpsPhone(target.agentId) ||
       !this.phoneMatches(args.from, target.agentId) ||
       !/^[0-9a-f]{12}$/.test(target.id) ||
@@ -303,6 +304,17 @@ export class HumanHandoffService {
       !isCanonicalIso(digest.draftCreatedAt)
     ) {
       return opsError;
+    }
+    // b4c1: complete only an already-resolved shipping row; a malformed
+    // non-pending status fails closed without a decision replay.
+    if (target.status !== 'pending') {
+      return target.status === 'resolved'
+        ? this.completeResolvedShippingExpiry(
+            args,
+            target,
+            digest.draftCreatedAt,
+          )
+        : opsError;
     }
 
     const parsed = parseShippingGrammar(
@@ -411,6 +423,61 @@ export class HumanHandoffService {
     if (!stale) {
       return opsError;
     }
+    let cleared: boolean;
+    try {
+      cleared = await this.conversationStore.clearPendingHumanRequest(
+        target.customerId,
+        target.id,
+      );
+    } catch {
+      cleared = false;
+    }
+    if (!cleared) {
+      return opsError;
+    }
+    return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
+  }
+
+  /**
+   * b4c1 completion of an already-resolved `SHIPPING_EXPIRED` row: require the
+   * exact canonical `HF-<target.id>` ref and a persisted expiry (pin + finite
+   * reason) with no same-request or malformed `shippingApproval` marker, then
+   * finish the idempotent pending clear (`true` → `needs_requote`, else
+   * `ops_error`). Never resolves, updates, parses, verifies, or writes a
+   * marker, and contains a conversation-store read failure.
+   */
+  private async completeResolvedShippingExpiry(
+    args: { text: string; from: string },
+    target: HumanHandoffRequest,
+    pin: string,
+  ): Promise<HumanHandoffResolveReplyResult> {
+    const opsError: HumanHandoffResolveReplyResult = {
+      kind: 'ops_error',
+      reply: SHIPPING_RETRY_REPLY,
+    };
+    if (
+      !referencesExactRef(args.text, target.id) ||
+      !isResolvedShippingExpiry(target.resolution, pin)
+    ) {
+      return opsError;
+    }
+
+    let customerState: ConversationState | null;
+    try {
+      customerState = await this.conversationStore.get(target.customerId);
+    } catch {
+      return opsError;
+    }
+    const pending = customerState?.data?.pendingHumanRequest;
+    if (!isPendingHumanRequest(pending) || pending.requestId !== target.id) {
+      return opsError;
+    }
+    const rawMarker: unknown = customerState?.data?.shippingApproval;
+    if (rawMarker !== null && rawMarker !== undefined) {
+      const marker = readShippingApprovalMarker(customerState);
+      if (marker === null || marker.requestId === target.id) return opsError;
+    }
+
     let cleared: boolean;
     try {
       cleared = await this.conversationStore.clearPendingHumanRequest(
@@ -554,6 +621,60 @@ function isCanonicalIso(value: unknown): value is string {
   } catch {
     return false;
   }
+}
+
+/** Finite stale reasons a persisted `SHIPPING_EXPIRED` resolution may carry. */
+const RESOLVED_STALE_REASONS: ReadonlySet<string> = new Set([
+  'invalid_clock',
+  'draft_missing',
+  'draft_expired',
+  'draft_pin_mismatch',
+]);
+
+/**
+ * Conservative runtime guard for one persisted `SHIPPING_EXPIRED` JSONB
+ * resolution: a plain object with exactly the three own keys
+ * `decision`/`draftCreatedAt`/`reason`, the pinned creation time, and a finite
+ * stale reason. Hostile prototypes, getters, extra keys, and noncanonical
+ * values fail closed without throwing.
+ */
+function isResolvedShippingExpiry(value: unknown, pin: string): boolean {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return false;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== 3 ||
+      !Object.hasOwn(record, 'decision') ||
+      !Object.hasOwn(record, 'draftCreatedAt') ||
+      !Object.hasOwn(record, 'reason')
+    ) {
+      return false;
+    }
+    return (
+      record.decision === 'SHIPPING_EXPIRED' &&
+      record.draftCreatedAt === pin &&
+      typeof record.reason === 'string' &&
+      RESOLVED_STALE_REASONS.has(record.reason)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Exact, case-sensitive `HF-<targetId>` reference to this row: a word-boundary
+ * `HF-` prefix, the literal id, and no further id character. Any other,
+ * embedded, or differently-cased ref fails closed.
+ */
+function referencesExactRef(text: unknown, targetId: string): boolean {
+  if (typeof text !== 'string') return false;
+  const escaped = targetId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\bHF-${escaped}(?![A-Za-z0-9_-])`).test(text);
 }
 
 /**
