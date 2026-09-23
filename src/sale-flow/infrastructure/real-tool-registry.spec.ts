@@ -3,12 +3,25 @@ import { ConfigService } from '@nestjs/config';
 import type { Provider } from '@nestjs/common';
 import { TERMINAL_RECEIPT_GUIDANCE } from '../application/tools/attach-receipt.tool';
 import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client';
-import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
+import {
+  CONVERSATION_STORE,
+  type ConversationState,
+} from '../../conversation/domain/conversation-store';
+import {
+  HUMAN_HANDOFF_STORE,
+  type HumanHandoffStore,
+} from '../../human-handoff/domain/human-handoff-store.port';
+import type { HumanHandoffRequest } from '../../human-handoff/domain/human-handoff.types';
 import { ShippingQuoteOrchestrator } from '../../shipping/application/shipping-quote-orchestrator';
 import {
   MEASURED_DEMO_SHIPPING_CONFIG,
   type MeasuredDemoShippingConfig,
 } from '../../shipping/application/measured-demo-shipping-config';
+import {
+  buildShippingQuoteDraftRecord,
+  SHIPPING_QUOTE_DRAFT_KEY,
+} from '../../shipping/application/shipping-quote-draft-record';
+import type { ShippingQuoteDraft } from '../../shipping/application/shipping-quote-draft';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
@@ -63,17 +76,30 @@ describe('RealToolRegistry', () => {
     {},
   ) as unknown as MeasuredDemoShippingConfig;
 
+  type StoreStub = { get: jest.Mock; create: jest.Mock; update: jest.Mock };
+  type ServiceStub = {
+    create: jest.Mock;
+    resolveReply: jest.Mock;
+    isOpsSender: jest.Mock;
+  };
+  interface RegistryExtras {
+    store?: StoreStub;
+    humanHandoffService?: ServiceStub;
+    humanHandoffStore?: HumanHandoffStore;
+  }
+
   async function buildRegistry(
     orchestrator?: ShippingQuoteOrchestrator,
     measuredDemoConfig?: MeasuredDemoShippingConfig,
+    extras: RegistryExtras = {},
   ): Promise<RealToolRegistry> {
     const providers: Provider[] = [
       RealToolRegistry,
       { provide: CHATBOT_API_CLIENT, useValue: stubChatbotApi },
-      { provide: CONVERSATION_STORE, useValue: stubStore },
+      { provide: CONVERSATION_STORE, useValue: extras.store ?? stubStore },
       {
         provide: HUMAN_HANDOFF_SERVICE_TOKEN,
-        useValue: stubHumanHandoffService,
+        useValue: extras.humanHandoffService ?? stubHumanHandoffService,
       },
       {
         provide: ConfigService,
@@ -97,6 +123,12 @@ describe('RealToolRegistry', () => {
       providers.push({
         provide: MEASURED_DEMO_SHIPPING_CONFIG,
         useValue: measuredDemoConfig,
+      });
+    }
+    if (extras.humanHandoffStore !== undefined) {
+      providers.push({
+        provide: HUMAN_HANDOFF_STORE,
+        useValue: extras.humanHandoffStore,
       });
     }
     const moduleRef = await Test.createTestingModule({ providers }).compile();
@@ -267,6 +299,278 @@ describe('RealToolRegistry', () => {
       });
       expect(result.success).toBe(false);
       expect(stubChatbotApi.attachReceipt).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('SQ-5C3c2 enabled-only shipping-approval wiring', () => {
+    const SENDER = '525551234567';
+    const ISO = '2026-06-23T12:00:00.000Z';
+    const MS = Date.parse(ISO);
+    const REQUEST_ID = 'abcdef012345';
+    const REF = `HF-${REQUEST_ID}`;
+    const DRAFT: ShippingQuoteDraft = {
+      quoteId: 'q1',
+      selectedRate: {
+        rateId: 'r1',
+        carrierName: 'Carrier',
+        serviceName: 'Service',
+        priceCents: 12900,
+        currency: 'MXN',
+        estimatedDeliveryDays: 2,
+        validUntil: null,
+      },
+      providerExpiresAt: null,
+      bestRateCents: 12900,
+      totalCreditCents: 12000,
+      appliedCreditCents: 12000,
+      unusedCreditCents: 0,
+      qualifyingUnitCount: 1,
+      customerPaysCents: 900,
+    };
+    const DIGEST = {
+      kind: 'shipping_approval' as const,
+      draftCreatedAt: ISO,
+      customerPaysCents: 900,
+      totalCreditCents: 12000,
+      carrierName: 'Carrier',
+      serviceName: 'Service',
+      estimatedDeliveryDays: 2,
+    };
+
+    const draftRecord = (): unknown => buildShippingQuoteDraftRecord(DRAFT, MS);
+    const draftState = (): ConversationState => ({
+      senderId: SENDER,
+      lastMessageAt: ISO,
+      data: { [SHIPPING_QUOTE_DRAFT_KEY]: draftRecord() },
+    });
+    const pendingState = (id: string): ConversationState => ({
+      senderId: SENDER,
+      lastMessageAt: ISO,
+      data: {
+        [SHIPPING_QUOTE_DRAFT_KEY]: draftRecord(),
+        pendingHumanRequest: {
+          requestId: id,
+          ref: `HF-${id}`,
+          createdAt: ISO,
+          customerNotifiedAt: ISO,
+        },
+      },
+    });
+    const row = (over: Record<string, unknown> = {}): HumanHandoffRequest =>
+      ({
+        id: REQUEST_ID,
+        customerId: SENDER,
+        agentId: 'ops',
+        kind: 'shipping_approval',
+        digest: DIGEST,
+        status: 'pending',
+        resolution: null,
+        createdAt: ISO,
+        resolvedAt: null,
+        ...over,
+      }) as unknown as HumanHandoffRequest;
+    const storeStub = (): StoreStub => ({
+      get: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    });
+    const serviceStub = (create: jest.Mock): ServiceStub => ({
+      create,
+      resolveReply: jest.fn(),
+      isOpsSender: jest.fn(),
+    });
+    const configStub = Object.freeze(
+      {},
+    ) as unknown as MeasuredDemoShippingConfig;
+    const rowStore = (findById: jest.Mock): HumanHandoffStore =>
+      ({ findById }) as unknown as HumanHandoffStore;
+    const callQuote = async (registry: RealToolRegistry): Promise<unknown> => {
+      const tool = registry.getTools()['getShippingQuote'] as {
+        execute: (i: unknown, o: unknown) => Promise<unknown>;
+      };
+      return tool.execute(
+        {},
+        { toolCallId: 't', messages: [], context: { senderId: SENDER } },
+      );
+    };
+    const OK_CREATE = {
+      ok: true,
+      requestId: REQUEST_ID,
+      ref: REF,
+      customerNotified: true,
+    };
+    const FROZEN_HANDOFF = {
+      ok: false,
+      status: 'handoff_required',
+      reason: 'approval_unavailable',
+    };
+
+    it('keeps exactly the twelve keys when shipping is disabled even with no handoff store', async () => {
+      const registry = await buildRegistry();
+      expect(Object.keys(registry.getTools()).sort()).toHaveLength(12);
+      expect(registry.getTools()).not.toHaveProperty('getShippingQuote');
+    });
+
+    it('registers the 13th key when enabled with a handoff row store', async () => {
+      const registry = await buildRegistry(
+        new ShippingQuoteOrchestrator({ quote: jest.fn() }),
+        configStub,
+        {
+          humanHandoffStore: rowStore(jest.fn()),
+        },
+      );
+      expect(Object.keys(registry.getTools())).toHaveLength(13);
+      expect(registry.getTools()).toHaveProperty('getShippingQuote');
+    });
+
+    it('registers the 13th key but fails closed when enabled without a handoff row store', async () => {
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(MS);
+      try {
+        const store = storeStub();
+        store.get.mockResolvedValue(draftState());
+        const registry = await buildRegistry(
+          new ShippingQuoteOrchestrator({ quote: jest.fn() }),
+          configStub,
+          { store },
+        );
+        expect(Object.keys(registry.getTools())).toHaveLength(13);
+        const result = await callQuote(registry);
+        expect(result).toEqual(FROZEN_HANDOFF);
+        expect(Object.isFrozen(result)).toBe(true);
+        expect(store.get).toHaveBeenCalledTimes(1);
+        expect(store.update).not.toHaveBeenCalled();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('executes a fresh stored draft through the real wrapper: creates the redacted request, verifies row/ref/marker, returns reused', async () => {
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(MS);
+      try {
+        const store = storeStub();
+        store.get
+          .mockResolvedValueOnce(draftState())
+          .mockResolvedValueOnce(draftState())
+          .mockResolvedValueOnce(pendingState(REQUEST_ID));
+        const create = jest.fn().mockResolvedValue(OK_CREATE);
+        const findById = jest.fn().mockResolvedValue(row());
+        const quote = jest.fn();
+        const registry = await buildRegistry(
+          new ShippingQuoteOrchestrator({ quote }),
+          configStub,
+          {
+            store,
+            humanHandoffService: serviceStub(create),
+            humanHandoffStore: rowStore(findById),
+          },
+        );
+        const result = await callQuote(registry);
+        expect(result).toEqual({ ok: true, status: 'reused' });
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(create).toHaveBeenCalledWith({
+          senderId: SENDER,
+          kind: 'shipping_approval',
+          digest: DIGEST,
+        });
+        expect(findById).toHaveBeenCalledTimes(1);
+        expect(findById).toHaveBeenCalledWith(REQUEST_ID);
+        expect(store.get).toHaveBeenCalledTimes(3);
+        expect(store.update).not.toHaveBeenCalled();
+        expect(quote).not.toHaveBeenCalled();
+        expect(stubChatbotApi.getCustomerByPhone).not.toHaveBeenCalled();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('fails closed with a price-free handoff when the created row is the wrong kind', async () => {
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(MS);
+      try {
+        const store = storeStub();
+        store.get.mockResolvedValue(draftState());
+        const create = jest.fn().mockResolvedValue(OK_CREATE);
+        const findById = jest
+          .fn()
+          .mockResolvedValue(row({ kind: 'needs_human_review' }));
+        const registry = await buildRegistry(
+          new ShippingQuoteOrchestrator({ quote: jest.fn() }),
+          configStub,
+          {
+            store,
+            humanHandoffService: serviceStub(create),
+            humanHandoffStore: rowStore(findById),
+          },
+        );
+        const result = await callQuote(registry);
+        expect(result).toEqual(FROZEN_HANDOFF);
+        expect(Object.isFrozen(result)).toBe(true);
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(findById).toHaveBeenCalledTimes(1);
+        const wire = JSON.stringify(result);
+        for (const leaked of [REF, '900', '12000', 'Carrier', 'Service']) {
+          expect(wire).not.toContain(leaked);
+        }
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('fails closed with a price-free handoff on a pending collision without leaking the existing ref', async () => {
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(MS);
+      try {
+        const collisionId = 'ffeeddccbbaa';
+        const store = storeStub();
+        store.get
+          .mockResolvedValueOnce(draftState())
+          .mockResolvedValueOnce(pendingState(collisionId));
+        const create = jest.fn();
+        const registry = await buildRegistry(
+          new ShippingQuoteOrchestrator({ quote: jest.fn() }),
+          configStub,
+          {
+            store,
+            humanHandoffService: serviceStub(create),
+            humanHandoffStore: rowStore(jest.fn()),
+          },
+        );
+        const result = await callQuote(registry);
+        expect(result).toEqual(FROZEN_HANDOFF);
+        expect(Object.isFrozen(result)).toBe(true);
+        expect(create).not.toHaveBeenCalled();
+        const wire = JSON.stringify(result);
+        for (const leaked of [
+          `HF-${collisionId}`,
+          collisionId,
+          '900',
+          '12000',
+        ]) {
+          expect(wire).not.toContain(leaked);
+        }
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('keeps the model-facing requestHumanAssistance schema unable to forge shipping_approval', async () => {
+      const registry = await buildRegistry();
+      const tool = registry.getTools()['requestHumanAssistance'] as {
+        inputSchema: { safeParse: (v: unknown) => { success: boolean } };
+      };
+      expect(
+        tool.inputSchema.safeParse({
+          kind: 'shipping_approval',
+          digest: DIGEST,
+        }).success,
+      ).toBe(false);
+      expect(
+        tool.inputSchema.safeParse({
+          kind: 'out_of_stock',
+          digest: {
+            productId: '11111111-1111-4111-8111-111111111111',
+            name: 'X',
+          },
+        }).success,
+      ).toBe(true);
     });
   });
 });
