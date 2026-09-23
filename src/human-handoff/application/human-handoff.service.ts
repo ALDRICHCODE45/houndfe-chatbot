@@ -25,6 +25,7 @@ import {
   SHIPPING_APPROVAL_POLICY,
   type ShippingApprovalDecision,
   type ShippingApprovalMarker,
+  type ShippingApprovalPinResult,
   type ShippingApprovalPolicy,
 } from '../domain/shipping-approval-policy.port';
 import {
@@ -305,16 +306,29 @@ export class HumanHandoffService {
     ) {
       return opsError;
     }
-    // b4c1: complete only an already-resolved shipping row; a malformed
-    // non-pending status fails closed without a decision replay.
+    // b4c1/b4c2a: only a resolved row continues past this point. A strict
+    // rejected decision recovers the rejected path; anything else (including an
+    // approved row, which b4c2b owns) uses the expired-row completion, which
+    // fails closed on a non-expiry shape. A malformed non-pending status fails
+    // closed without a replay.
     if (target.status !== 'pending') {
-      return target.status === 'resolved'
+      if (target.status !== 'resolved') return opsError;
+      const decided = readResolvedShippingDecision(
+        target.resolution,
+        digest.draftCreatedAt,
+      );
+      return decided === null
         ? this.completeResolvedShippingExpiry(
             args,
             target,
             digest.draftCreatedAt,
           )
-        : opsError;
+        : this.completeResolvedShippingDecision(
+            args,
+            target,
+            digest.draftCreatedAt,
+            decided,
+          );
     }
 
     const parsed = parseShippingGrammar(
@@ -492,6 +506,81 @@ export class HumanHandoffService {
     }
     return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
   }
+
+  /**
+   * b4c2 completion of an already-resolved decided row: exact ref, strict
+   * persisted decision plus matching pending/`shippingApproval` marker and
+   * pin, then the persisted amount-free turn (`valid`) or a re-quote
+   * (`draft_expired`); else fails closed. No new parse, row write, or marker
+   * rewrite.
+   */
+  private async completeResolvedShippingDecision(
+    args: { text: string; from: string },
+    target: HumanHandoffRequest,
+    pin: string,
+    persisted: HumanHandoffResolution,
+  ): Promise<HumanHandoffResolveReplyResult> {
+    const opsError: HumanHandoffResolveReplyResult = {
+      kind: 'ops_error',
+      reply: SHIPPING_RETRY_REPLY,
+    };
+    if (!referencesExactRef(args.text, target.id)) return opsError;
+
+    let customerState: ConversationState | null;
+    try {
+      customerState = await this.conversationStore.get(target.customerId);
+    } catch {
+      return opsError;
+    }
+    const pending = customerState?.data?.pendingHumanRequest;
+    const marker = readShippingApprovalMarker(customerState);
+    if (
+      !isPendingHumanRequest(pending) ||
+      pending.requestId !== target.id ||
+      marker === null ||
+      marker.requestId !== target.id ||
+      marker.draftCreatedAt !== pin ||
+      marker.decision !== persisted.decision
+    ) {
+      return opsError;
+    }
+
+    let verdict: ShippingApprovalPinResult;
+    try {
+      verdict = this.shippingApprovalPolicy.verifyDraftPin(
+        customerState,
+        pin,
+        Date.now(),
+      );
+    } catch {
+      return opsError;
+    }
+    if (verdict.kind !== 'valid' && verdict.kind !== 'draft_expired') {
+      return opsError;
+    }
+
+    let cleared: boolean;
+    try {
+      cleared = await this.conversationStore.clearPendingHumanRequest(
+        target.customerId,
+        target.id,
+      );
+    } catch {
+      cleared = false;
+    }
+    if (!cleared) return opsError;
+    if (verdict.kind === 'draft_expired') {
+      return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
+    }
+
+    return {
+      kind: 'resolved',
+      customerId: target.customerId,
+      ref: `HF-${target.id}`,
+      resolution: persisted,
+      syntheticUserText: formatResolutionAsUserTurn(target, persisted),
+    };
+  }
 }
 
 /**
@@ -663,6 +752,41 @@ function isResolvedShippingExpiry(value: unknown, pin: string): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+/**
+ * Strict runtime guard for one persisted decided JSONB resolution: a plain
+ * exact two-key object (`decision`/`draftCreatedAt`) with the pinned creation
+ * time, returning a fresh resolution or `null`. Hostile inputs fail closed.
+ * b4c2a recognizes only `SHIPPING_REJECTED`; b4c2b extends this to approval.
+ */
+function readResolvedShippingDecision(
+  value: unknown,
+  pin: string,
+): HumanHandoffResolution | null {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return null;
+    }
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return null;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== 2 ||
+      !Object.hasOwn(record, 'decision') ||
+      !Object.hasOwn(record, 'draftCreatedAt')
+    ) {
+      return null;
+    }
+    if (record.draftCreatedAt !== pin) return null;
+    if (record.decision === 'SHIPPING_REJECTED') {
+      return { decision: 'SHIPPING_REJECTED', draftCreatedAt: pin };
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
