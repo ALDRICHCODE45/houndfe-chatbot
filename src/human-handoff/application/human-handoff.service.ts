@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import {
   CONVERSATION_STORE,
+  type ConversationState,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import { normalizeSandboxRecipient } from '../../whatsapp/infrastructure/meta-whatsapp.sender';
@@ -22,6 +23,7 @@ import type {
 import {
   SHIPPING_APPROVAL_POLICY,
   type ShippingApprovalDecision,
+  type ShippingApprovalMarker,
   type ShippingApprovalPolicy,
 } from '../domain/shipping-approval-policy.port';
 import {
@@ -29,6 +31,10 @@ import {
   readPendingHumanRequest,
   setPendingHumanRequest,
 } from './pending-human-request-persistence';
+import {
+  clearShippingApprovalMarker,
+  setShippingApprovalMarker,
+} from './shipping-approval-persistence';
 
 /**
  * Byte-identical customer-facing "under review" notice.
@@ -259,14 +265,14 @@ export class HumanHandoffService {
   }
 
   /**
-   * b1 shipping guard/grammar slice: identity guards → strict grammar
-   * (`parseDecision` only) → pending-marker guard. b2 adds draft-pin
-   * verification: a stale verdict resolves the row as SHIPPING_EXPIRED and
-   * clears the pending marker (needs_requote); a valid verdict stays a
-   * write-free ops_error until b3 owns persistence. No `shippingApproval`
-   * marker is written and no synthetic turn is produced here. Null/rejected
-   * row resolve is fail-closed; a rejected pending clear is surfaced as
-   * ops_error (cross-store recovery is deferred to b4).
+   * Shipping-approval resolution. Guards: identity (status/agent/sender/id/
+   * digest/canonical pin) → strict grammar (`parseDecision` only) →
+   * pending-marker → draft pin verify. A stale verdict resolves
+   * SHIPPING_EXPIRED and clears pending (needs_requote). A valid verdict
+   * persists the local `shippingApproval` marker BEFORE resolving the row,
+   * then clears pending against the marker-write state and returns an
+   * amount-free synthetic turn. No direct customer outbound. Cross-store
+   * recovery (partial writes) is deferred to b4.
    */
   private async resolveShippingReply(
     args: { text: string; from: string },
@@ -312,8 +318,74 @@ export class HumanHandoffService {
       now,
     );
     if (verdict.kind === 'valid') {
-      // b3 persists the valid decision; b2 keeps the write-free stub.
-      return opsError;
+      const decidedAt = new Date(now).toISOString();
+      let afterMarker: ConversationState | null;
+      try {
+        afterMarker = await setShippingApprovalMarker(
+          this.conversationStore,
+          target.customerId,
+          customerState,
+          {
+            requestId: target.id,
+            draftCreatedAt: pin,
+            decision: parsed.decision,
+            decidedAt,
+          } satisfies ShippingApprovalMarker,
+          decidedAt,
+        );
+      } catch {
+        afterMarker = null;
+      }
+      if (afterMarker === null) {
+        return opsError;
+      }
+
+      const resolution: HumanHandoffResolution = {
+        decision: parsed.decision,
+        draftCreatedAt: pin,
+      };
+      let resolved: HumanHandoffRequest | null;
+      try {
+        resolved = await this.store.resolve(target.id, resolution);
+      } catch {
+        resolved = null;
+      }
+      if (!resolved) {
+        // No cross-store transaction: best-effort marker compensation; a
+        // failure here is swallowed so it never surfaces as a rejection.
+        try {
+          await clearShippingApprovalMarker(
+            this.conversationStore,
+            target.customerId,
+            afterMarker,
+          );
+        } catch {
+          // Best-effort only.
+        }
+        return opsError;
+      }
+
+      let cleared: ConversationState | null;
+      try {
+        cleared = await clearPendingHumanRequest(
+          this.conversationStore,
+          target.customerId,
+          afterMarker,
+        );
+      } catch {
+        cleared = null;
+      }
+      if (cleared === null) {
+        return opsError;
+      }
+
+      return {
+        kind: 'resolved',
+        customerId: target.customerId,
+        ref: `HF-${target.id}`,
+        resolution,
+        syntheticUserText: formatResolutionAsUserTurn(target, resolution),
+      };
     }
 
     const expired: HumanHandoffResolution = {

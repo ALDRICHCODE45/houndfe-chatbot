@@ -921,12 +921,10 @@ describe('HumanHandoffService', () => {
       async (_label, text, command) => {
         prime();
         store.findByRef.mockResolvedValue(shippingRequest());
-        expect(await run(text)).toEqual({
-          kind: 'ops_error',
-          reply: SHIPPING_RETRY_REPLY,
-        });
+        // Full valid persistence is covered by the b3 suite.
+        await run(text);
         expect(policy.parseDecision).toHaveBeenCalledWith(command);
-        noWrites();
+        expect(policy.verifyDraftPin).toHaveBeenCalledTimes(1);
       },
     );
 
@@ -1021,14 +1019,12 @@ describe('HumanHandoffService', () => {
       store.findByRef.mockResolvedValue(
         shippingRequest({ agentId: '529999888777' }),
       );
-      expect(
-        await sandbox.resolveReply({
-          text: `HF-${REF_ID}: APPROVE_SHIPPING`,
-          from: OPS,
-        }),
-      ).toEqual({ kind: 'ops_error', reply: SHIPPING_RETRY_REPLY });
+      await sandbox.resolveReply({
+        text: `HF-${REF_ID}: APPROVE_SHIPPING`,
+        from: OPS,
+      });
       expect(policy.parseDecision).toHaveBeenCalledWith('APPROVE_SHIPPING');
-      noWrites();
+      expect(policy.verifyDraftPin).toHaveBeenCalledTimes(1);
     });
 
     describe('b2 stale-draft expiry', () => {
@@ -1091,18 +1087,6 @@ describe('HumanHandoffService', () => {
         },
       );
 
-      it('valid verdict remains a write-free ops_error (b3 owns persistence)', async () => {
-        prime();
-        store.findByRef.mockResolvedValue(shippingRequest());
-        policy.verifyDraftPin.mockReturnValue({ kind: 'valid' });
-        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
-          kind: 'ops_error',
-          reply: SHIPPING_RETRY_REPLY,
-        });
-        expect(policy.verifyDraftPin).toHaveBeenCalledTimes(1);
-        noWrites();
-      });
-
       it('malformed grammar never reaches verifyDraftPin', async () => {
         prime();
         store.findByRef.mockResolvedValue(shippingRequest());
@@ -1152,6 +1136,188 @@ describe('HumanHandoffService', () => {
         });
         expect(result).not.toHaveProperty('syntheticUserText');
       });
+    });
+
+    describe('b3 valid-decision persistence', () => {
+      const NOW = new Date('2026-06-23T12:05:00.000Z');
+      const DECIDED_AT = NOW.toISOString();
+
+      const richState = (): ConversationState => ({
+        senderId: CUSTOMER,
+        lastMessageAt: PIN,
+        data: {
+          cart: { items: [{ sku: 'x' }], idempotencyKey: 'k' },
+          placedSaleId: 'sale-1',
+          pendingHumanRequest: {
+            requestId: REF_ID,
+            ref: `HF-${REF_ID}`,
+            createdAt: PIN,
+            customerNotifiedAt: PIN,
+          },
+        },
+      });
+
+      const setup = (
+        updateOutcomes: Array<undefined | null | Error> = [
+          undefined,
+          undefined,
+        ],
+        resolveOutcome: undefined | null | Error = undefined,
+      ): ConversationState => {
+        const customerState = richState();
+        conversationStore.get.mockResolvedValue(customerState);
+        conversationStore.update.mockImplementation(async (senderId, patch) => {
+          const next = updateOutcomes.shift();
+          if (next instanceof Error) throw next;
+          if (next === null) return null as unknown as ConversationState;
+          return {
+            senderId,
+            lastMessageAt: patch.lastMessageAt ?? PIN,
+            data: patch.data ?? {},
+          };
+        });
+        store.findByRef.mockResolvedValue(shippingRequest());
+        policy.verifyDraftPin.mockReturnValue({ kind: 'valid' });
+        store.resolve.mockImplementation(async (id, resolution) => {
+          if (resolveOutcome instanceof Error) throw resolveOutcome;
+          if (resolveOutcome === null) return null;
+          return {
+            ...shippingRequest(),
+            id,
+            status: 'resolved',
+            resolution,
+            resolvedAt: DECIDED_AT,
+          };
+        });
+        return customerState;
+      };
+
+      beforeEach(() => {
+        jest.useFakeTimers().setSystemTime(NOW);
+      });
+      afterEach(() => jest.useRealTimers());
+
+      it.each([
+        ['APPROVE_SHIPPING', 'SHIPPING_APPROVED', 'aprobó'],
+        ['REJECT_SHIPPING', 'SHIPPING_REJECTED', 'rechazó'],
+      ] as const)(
+        '%s → exact 4-field marker, row resolve, pending clear against marker state, amount-free synthetic',
+        async (command, decision, verb) => {
+          const customerState = setup();
+
+          const result = await run(`HF-${REF_ID}: ${command}`);
+
+          expect(policy.verifyDraftPin).toHaveBeenCalledWith(
+            customerState,
+            PIN,
+            NOW.getTime(),
+          );
+          const expectedMarker = {
+            requestId: REF_ID,
+            draftCreatedAt: PIN,
+            decision,
+            decidedAt: DECIDED_AT,
+          };
+          expect(conversationStore.update).toHaveBeenCalledTimes(2);
+          expect(
+            conversationStore.update.mock.calls[0][1].data?.shippingApproval,
+          ).toEqual(expectedMarker);
+          expect(
+            conversationStore.update.mock.invocationCallOrder[0],
+          ).toBeLessThan(store.resolve.mock.invocationCallOrder[0]);
+          expect(store.resolve.mock.invocationCallOrder[0]).toBeLessThan(
+            conversationStore.update.mock.invocationCallOrder[1],
+          );
+          expect(store.resolve).toHaveBeenCalledWith(REF_ID, {
+            decision,
+            draftCreatedAt: PIN,
+          });
+
+          const pendingPatch = conversationStore.update.mock.calls[1][1];
+          expect(pendingPatch.data?.shippingApproval).toEqual(expectedMarker);
+          expect(pendingPatch.data?.pendingHumanRequest).toBeNull();
+          expect(pendingPatch.data?.cart).toEqual(customerState.data.cart);
+          expect(pendingPatch.data?.placedSaleId).toBe('sale-1');
+
+          expect(result.kind).toBe('resolved');
+          if (result.kind !== 'resolved') throw new Error('expected resolved');
+          expect(result.customerId).toBe(CUSTOMER);
+          expect(result.ref).toBe(`HF-${REF_ID}`);
+          expect(result.resolution).toEqual({
+            decision,
+            draftCreatedAt: PIN,
+          });
+          expect(result.syntheticUserText).toBe(
+            `[Resolución del agente humano (HF-${REF_ID})] El agente ${verb} el envío.`,
+          );
+          for (const leaked of [
+            '6901',
+            '69.01',
+            '12000',
+            '120.00',
+            'CARRIER_SECRET',
+            'SERVICE_SECRET',
+            PIN,
+          ]) {
+            expect(result.syntheticUserText).not.toContain(leaked);
+          }
+        },
+      );
+
+      it.each(['null', 'reject'] as const)(
+        'marker write %s → ops_error with no row resolve and no pending clear',
+        async (mode) => {
+          setup([mode === 'null' ? null : new Error('db down')]);
+          expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
+            kind: 'ops_error',
+            reply: SHIPPING_RETRY_REPLY,
+          });
+          expect(store.resolve).not.toHaveBeenCalled();
+          expect(conversationStore.update).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      it.each(['null', 'reject'] as const)(
+        'row resolve %s → compensation clear, ops_error, no synthetic, pending untouched',
+        async (mode) => {
+          setup(
+            [undefined, undefined],
+            mode === 'null' ? null : new Error('db down'),
+          );
+          const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+          expect(result).toEqual({
+            kind: 'ops_error',
+            reply: SHIPPING_RETRY_REPLY,
+          });
+          expect(result).not.toHaveProperty('syntheticUserText');
+          const compensationPatch = conversationStore.update.mock.calls[1][1];
+          expect(compensationPatch.data?.shippingApproval).toBeNull();
+          expect(compensationPatch.data?.pendingHumanRequest).toMatchObject({
+            requestId: REF_ID,
+          });
+        },
+      );
+
+      it('compensation rejection is swallowed → still ops_error', async () => {
+        setup([undefined, new Error('comp down')], null);
+        expect(await run(`HF-${REF_ID}: APPROVE_SHIPPING`)).toEqual({
+          kind: 'ops_error',
+          reply: SHIPPING_RETRY_REPLY,
+        });
+      });
+
+      it.each(['null', 'reject'] as const)(
+        'pending clear %s → ops_error with no synthetic turn',
+        async (mode) => {
+          setup([undefined, mode === 'null' ? null : new Error('db down')]);
+          const result = await run(`HF-${REF_ID}: APPROVE_SHIPPING`);
+          expect(result).toEqual({
+            kind: 'ops_error',
+            reply: SHIPPING_RETRY_REPLY,
+          });
+          expect(result).not.toHaveProperty('syntheticUserText');
+        },
+      );
     });
   });
 });
