@@ -48,7 +48,13 @@ const boom = (props: Record<string, unknown> = {}) =>
   Object.assign(new Error('boom'), props);
 const sourceOf = (b: unknown) => (b as { source?: unknown }).source;
 const listenerCount = (s: AbortSignal) => getEventListeners(s, 'abort').length;
-const gate: (s: unknown, f: unknown) => boolean = port.isTechnicalDeleteAllowed;
+// Explicit reflective boundary: the fail-closed tests must feed forged
+// `unknown` values to the real, unmodified production gate. `Reflect.apply`
+// accepts an untyped argument list at runtime, and `=== true` preserves this
+// gate's strict boolean contract.
+const gate = (status: unknown, stage: unknown): boolean =>
+  Reflect.apply(port.isTechnicalDeleteAllowed, undefined, [status, stage]) ===
+  true;
 const putInput = (over: Record<string, unknown> = {}) => ({
   key: KEY,
   content: stream('hello'),

@@ -167,10 +167,22 @@ describe('pending-human-request-persistence', () => {
     });
 
     it('returns null when the marker is malformed (missing ref)', () => {
+      // Persisted conversation rows arrive as untyped JSONB, so a stored
+      // marker can be missing `ref` even though the compile-time contract
+      // requires it. Populate the raw value through Object.assign instead of
+      // asserting completeness with a cast, keeping the malformed shape honest.
+      const data: ConversationState['data'] = { messages: [] };
+      Object.assign(data, {
+        pendingHumanRequest: {
+          requestId: 'x',
+          createdAt: now,
+          customerNotifiedAt: now,
+        },
+      });
       const state: ConversationState = {
         senderId: 'S',
         lastMessageAt: now,
-        data: { pendingHumanRequest: { requestId: 'x', createdAt: now } },
+        data,
       };
       expect(readPendingHumanRequest(state)).toBeNull();
     });

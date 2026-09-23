@@ -68,11 +68,11 @@ describe('LLM agent port', () => {
   describe('mockability', () => {
     it('a jest.fn implementing LlmAgentPort satisfies the type', async () => {
       const fake: jest.Mocked<LlmAgentPort> = {
-        run: jest.fn(async () => ({
+        run: jest.fn<Promise<LlmRunResult>, [LlmRunInput]>().mockResolvedValue({
           reply: 'mock reply',
           messages: [{ role: 'assistant', content: 'mock reply' }],
           usage: { promptTokens: 1, completionTokens: 1 },
-        })),
+        }),
       };
 
       const result = await fake.run({

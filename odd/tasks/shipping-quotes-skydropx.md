@@ -145,6 +145,7 @@ Live activation remains blocked until all are observed:
     - [ ] **SQ-7B2 — Remaining sale-flow specs:** apply the same boundary to four no-context tools, then the cancel-sale deps outlier as bounded independently green units.
       - [ ] **SQ-7B2a — Four no-context AI-SDK specs:** wrap the actual factories with `asSchemaVerifiedTool`, pass `context: {}`, and preserve the search-catalog default-`limit` semantics via `inputSchema.parse`. See the SQ-7B2a evidence block below.
     - [ ] **SQ-7B3 — HTTP and isolated fixtures:** correct AxiosResponse mocks and the remaining human-handoff, LLM, receipt-media, and WhatsApp spec fixtures without weakening production contracts.
+      - [ ] **SQ-7B3a — Isolated fixture/mock contracts:** correct the human-handoff, LLM, receipt-media, and WhatsApp fixtures by fixing the mocked contract (no cast, suppression, or production change); the AxiosResponse HTTP mocks stay in SQ-7B3. See the SQ-7B3a evidence block below.
     - [ ] **SQ-7B4 — Full closure:** non-incremental spec typecheck exit 0, full offline Jest, scoped lint/format/build, native review and local work-unit commits; no live activation claim.
 
 ## SQ-1A evidence (independent `PASS`; native-approved as `review-41c3378e455daa89`; locally delivered in this work unit)
@@ -524,6 +525,16 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Repaired the `update` mock's `data: object` cast to `ConversationStateData`; no production code changed. Removed the now-dead `eslint-disable` directive (the boundary removed the unsafe-`any` surface it suppressed), matching SQ-7B1/SQ-7B2a. No `any`, new `as never`, `ts-ignore`, new suppression, removed assertion, removed test, or tsconfig change.
 - GREEN (after edits): the same uncached spec tsc still exits 2 but falls 43 → 24 diagnostics with zero remaining in `cancel-sale.tool.spec.ts`. Focused Jest: 1 suite, 14/14 tests passed. Scoped ESLint exit 0. `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0.
 - SQ-7B2, SQ-7B, and SQ-7 remain unchecked: the global non-incremental spec typecheck still exits 2 with 24 diagnostics in the HTTP/isolated-fixture baseline owned by SQ-7B3. Nothing staged; no commit, push, deploy, provider, network, DB, or live call.
+
+## SQ-7B3a evidence (partial; strict type-level TDD; not delivered)
+
+- RED (before edits): `pnpm exec tsc --noEmit --incremental false --pretty false -p tsconfig.spec.json` exited 2 with the 24-diagnostic SQ-7B2b baseline. The four target specs held 5: `pending-human-request-persistence.spec.ts` 1 (TS2739 malformed marker missing `ref`/`customerNotifiedAt`), `llm-agent.port.spec.ts` 1 (TS2322 mock `messages` widened `role: string`), `s3-object-storage.adapter.spec.ts` 1 (TS2322 narrow `isTechnicalDeleteAllowed` assigned to an `unknown`-param alias), `signature.guard.spec.ts` 2 (TS2322 overloaded `getOrThrow` mock plus TS2352 cast to `ConfigService`).
+- `pending-human-request-persistence.spec.ts`: kept the missing-`ref` malformed case; assembled the raw marker through `Object.assign` into a `ConversationState['data']` bag (persisted rows arrive as untyped JSONB) so the shape includes the real `customerNotifiedAt` without a contract-erasing cast.
+- `llm-agent.port.spec.ts`: replaced the untyped `jest.fn` mock with `jest.fn<Promise<LlmRunResult>, [LlmRunInput]>().mockResolvedValue({...})`, giving the `messages` literal the real `LlmRunResult` context so roles narrow to valid literals.
+- `s3-object-storage.adapter.spec.ts`: replaced the fail-closed `gate` alias with an explicit reflective boundary (`Reflect.apply` on the real, unmodified `isTechnicalDeleteAllowed`, result normalized with `=== true`) so the negative tests still feed forged `unknown` values and assert only the strict boolean contract; no bivariance loophole, cast, suppression, or production change.
+- `signature.guard.spec.ts`: replaced the partial `getOrThrow` mock and `as ConfigService` cast with a real in-memory `new ConfigService({ meta: { appSecret } })` that resolves `meta.appSecret` by dot-notation, matching the production runtime contract.
+- GREEN (after edits): the same uncached spec tsc still exits 2 but falls 24 → 19 with zero remaining in the four target specs; the 19 are all in the out-of-scope `chatbot-api/infrastructure/chatbot-api-http.client.spec.ts` (SQ-7B3 AxiosResponse mocks).
+- Focused Jest: `pnpm exec jest --runInBand --no-cache <four specs>` — 4 suites, 71/71 tests passed. Scoped ESLint exit 0; Prettier `--check` clean (four specs plus this tracker); `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0; `git diff --check` clean; nothing staged. SQ-7B3, SQ-7B, and SQ-7 remain unchecked while the global non-incremental spec typecheck still exits 2; no commit, push, deploy, provider, network, DB, or live call.
 
 ## Delivery gate
 
