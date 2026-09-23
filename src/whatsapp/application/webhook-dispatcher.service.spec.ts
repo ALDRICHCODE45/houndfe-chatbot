@@ -22,6 +22,9 @@ import type { InboundMessage } from '../domain/inbound-message';
 import {
   ASK_FOR_REF,
   PENDING_HUMAN_REQUEST_REPLY,
+  SHIPPING_DECISION_GRAMMAR,
+  SHIPPING_REQUOTE_REPLY,
+  SHIPPING_RETRY_REPLY,
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
@@ -669,6 +672,42 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(conversationStore.get).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-nopending');
     });
+
+    // SQ-5C2d: the dispatcher already hands every non-`resolved` ops outcome
+    // the same way (reply to ops, no runner). Characterize the three
+    // data-free shipping outcomes so their exact SHIPPING_* copy is pinned
+    // and can never leak to the customer.
+    it.each([
+      ['needs_decision', SHIPPING_DECISION_GRAMMAR],
+      ['needs_requote', SHIPPING_REQUOTE_REPLY],
+      ['ops_error', SHIPPING_RETRY_REPLY],
+    ] as const)(
+      '%s outcome: the exact data-free SHIPPING_* reply goes to the OPS number with no runner call',
+      async (kind, reply) => {
+        humanHandoff.isOpsSender.mockReturnValue(true);
+        humanHandoff.resolveReply.mockResolvedValue({ kind, reply });
+        const messageId = `wamid.ops-${kind}`;
+
+        await service.dispatch(opsEvent(messageId, 'APPROVE_SHIPPING'));
+
+        expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
+          text: 'APPROVE_SHIPPING',
+          from: OPS,
+        });
+        // Ops-only: the canned shipping reply never reaches the customer.
+        expect(sender.sendText).toHaveBeenCalledTimes(1);
+        expect(sender.sendText).toHaveBeenCalledWith({ to: OPS, text: reply });
+        expect(sender.sendText).not.toHaveBeenCalledWith(
+          expect.objectContaining({ to: CUSTOMER }),
+        );
+        // No customer synthetic turn and no LLM/runner invocation.
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        // The ops path short-circuits BEFORE the pending-marker read.
+        expect(conversationStore.get).not.toHaveBeenCalled();
+        expect(dedup.markSeen).toHaveBeenCalledWith(messageId);
+      },
+    );
 
     it('dedup applies to ops inbounds unchanged: a duplicate ops wamid never reaches resolveReply', async () => {
       dedup.isDuplicate.mockResolvedValue(true);
