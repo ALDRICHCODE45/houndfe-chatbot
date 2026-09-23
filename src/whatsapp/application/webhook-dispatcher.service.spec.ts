@@ -80,6 +80,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       update: jest.fn(),
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
+      clearPendingHumanRequest: jest.fn(),
     };
 
     sender = {
@@ -136,6 +137,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       update: jest.fn(),
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
+      clearPendingHumanRequest: jest.fn(),
     };
 
     // WU13-B1: ReceiptAmountRouter mock. Default fenced so the ordinary

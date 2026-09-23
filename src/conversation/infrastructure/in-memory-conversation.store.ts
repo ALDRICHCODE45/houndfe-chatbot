@@ -3,6 +3,8 @@ import { Injectable } from '@nestjs/common';
 import {
   ConversationState,
   ConversationStore,
+  isPendingHumanRequest,
+  isPendingHumanRequestId,
   isReceiptAmountPointer,
   ReceiptAmountPointer,
 } from '../domain/conversation-store';
@@ -72,6 +74,27 @@ export class InMemoryConversationStore implements ConversationStore {
 
   async get(senderId: string): Promise<ConversationState | null> {
     return this.map.get(senderId) ?? null;
+  }
+
+  async clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+  ): Promise<boolean> {
+    const state = this.map.get(senderId);
+    const current = state?.data.pendingHumanRequest;
+    if (
+      typeof senderId !== 'string' ||
+      senderId.length === 0 ||
+      !isPendingHumanRequestId(requestId) ||
+      !state ||
+      !Object.hasOwn(state.data, 'pendingHumanRequest') ||
+      !isPendingHumanRequest(current) ||
+      current.requestId !== requestId
+    ) {
+      return false;
+    }
+    state.data = { ...state.data, pendingHumanRequest: null };
+    return true;
   }
 
   async create(

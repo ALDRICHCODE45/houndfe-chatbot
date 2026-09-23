@@ -83,6 +83,7 @@ describe('HumanHandoffService', () => {
       update: jest.fn(),
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
+      clearPendingHumanRequest: jest.fn(),
     };
 
     configService = {

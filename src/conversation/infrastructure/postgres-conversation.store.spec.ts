@@ -97,6 +97,53 @@ describe('PostgresConversationStore receipt amount pointer SQL', () => {
   });
 });
 
+describe('PostgresConversationStore pending human request SQL', () => {
+  const REQUEST_ID = 'abc123def456';
+
+  it.each([
+    [1, true],
+    [0, false],
+  ] as const)(
+    'clearPendingHumanRequest maps rowCount %i to %s with one UPDATE',
+    async (count, expected) => {
+      const pool = new FakePool(count);
+      const store = new PostgresConversationStore(pool as unknown as Pool);
+      expect(await store.clearPendingHumanRequest('sender-a', REQUEST_ID)).toBe(
+        expected,
+      );
+      expect(pool.calls).toHaveLength(1);
+      const { sql, params } = pool.calls[0];
+      expect(sql).toMatch(/^\s*UPDATE\s+conversation_state\b/i);
+      expect(sql).toMatch(/\bWHERE\b[\s\S]*\bsender_id\s*=\s*\$\d+/i);
+      expect(sql).not.toMatch(/\bSELECT\b|ON\s+CONFLICT/i);
+      expect(sql).toContain('pendingHumanRequest');
+      expect(sql).toMatch(/jsonb_set\s*\(/i);
+      expect(sql).toMatch(/'null'::jsonb/);
+      expect(sql).toMatch(/jsonb_typeof\s*\(/i);
+      expect(params).toEqual(expect.arrayContaining(['sender-a', REQUEST_ID]));
+    },
+  );
+
+  it.each(['', 'ABC123DEF456', 'abc123', 'zzzzzzzzzzzz'])(
+    'clearPendingHumanRequest rejects %p without querying',
+    async (requestId) => {
+      const pool = new FakePool(1);
+      const store = new PostgresConversationStore(pool as unknown as Pool);
+      expect(await store.clearPendingHumanRequest('sender-a', requestId)).toBe(
+        false,
+      );
+      expect(pool.calls).toHaveLength(0);
+    },
+  );
+
+  it('clearPendingHumanRequest rejects an empty sender without querying', async () => {
+    const pool = new FakePool(1);
+    const store = new PostgresConversationStore(pool as unknown as Pool);
+    expect(await store.clearPendingHumanRequest('', REQUEST_ID)).toBe(false);
+    expect(pool.calls).toHaveLength(0);
+  });
+});
+
 type StoreCtor =
   typeof import('./postgres-conversation.store').PostgresConversationStore;
 

@@ -75,10 +75,7 @@ convenience fields; today `pendingHumanRequest` joins them as a fourth named key
 
 #### Scenario: pendingHumanRequest is preserved through a data-replacing update
 
-- GIVEN an existing sender S with
-  `data = { messages: [m1, m2], pendingHumanRequest: { requestId: 'abc123def456',
-    ref: 'HF-abc123def456', createdAt: '2026-09-01T00:00:00.000Z',
-    customerNotifiedAt: '2026-09-01T00:00:01.000Z' } }`
+- GIVEN an existing sender S with `data = { messages: [m1, m2], pendingHumanRequest: { requestId: 'abc123def456', ref: 'HF-abc123def456', createdAt: '2026-09-01T00:00:00.000Z', customerNotifiedAt: '2026-09-01T00:00:01.000Z' } }`
 - WHEN the runner performs
   `update(S, { lastMessageAt: T2, data: { messages: [m1, m2, m3], pendingHumanRequest: <preserved> } })`
 - THEN a subsequent `get(S).data.pendingHumanRequest` MUST deep-equal the prior value
@@ -252,9 +249,7 @@ loaded state (after the existing idle check) so the marker is always current.
 
 #### Scenario: readPendingHumanRequest returns the typed object
 
-- GIVEN a state with `data.pendingHumanRequest = { requestId: 'abc123def456',
-  ref: 'HF-abc123def456', createdAt: '2026-09-01T00:00:00.000Z',
-  customerNotifiedAt: '2026-09-01T00:00:01.000Z' }`
+- GIVEN a state with `data.pendingHumanRequest = { requestId: 'abc123def456', ref: 'HF-abc123def456', createdAt: '2026-09-01T00:00:00.000Z', customerNotifiedAt: '2026-09-01T00:00:01.000Z' }`
 - WHEN `readPendingHumanRequest(state)` is called
 - THEN the result MUST deep-equal that object.
 
@@ -271,6 +266,50 @@ loaded state (after the existing idle check) so the marker is always current.
 - WHEN `readPendingHumanRequest(state)` is called
 - THEN the input state's `data.pendingHumanRequest` MUST remain set (no mutation, no
   deletion).
+
+### Requirement: Atomic conditional pendingHumanRequest clear
+
+The `ConversationStore` port MUST expose
+`clearPendingHumanRequest(senderId, requestId): Promise<boolean>`, implemented
+byte-identically by every bound adapter (durable Postgres — the runtime default — and
+in-memory). It MUST reject an empty `senderId` or a `requestId` that is not exactly
+twelve lowercase hex characters, and MUST transition the stored marker only when
+`data.pendingHumanRequest` is a CANONICAL marker: exactly the four keys
+`requestId`/`ref`/`createdAt`/`customerNotifiedAt`, all non-empty strings, a valid
+twelve-lowercase-hex `requestId`, `ref === 'HF-' + requestId`, and the stored `requestId`
+equal to the supplied `requestId`. On a match it MUST set `data.pendingHumanRequest` to
+JSON `null` while RETAINING the key, and MUST preserve every sibling `data` key
+(including `receiptAmountPointer` and `shippingApproval`) plus `lastMessageAt`. On any
+absent, malformed, extended, or mismatched marker it MUST return `false` and perform no
+write. The durable adapter MUST implement this as a single conditional `UPDATE` that
+sets the key with `jsonb_set` to JSON `null`, and MUST derive success from the
+affected-row count only. This primitive MUST NOT be described or relied upon as
+cross-store atomic.
+
+#### Scenario: Canonical matching marker is cleared to JSON null
+
+- GIVEN a sender S whose `data.pendingHumanRequest` is a canonical marker for
+  `requestId = 'abc123def456'`
+- WHEN `clearPendingHumanRequest(S, 'abc123def456')` is called
+- THEN the result MUST be `true`
+- AND `data.pendingHumanRequest` MUST be JSON `null` with the key still present
+- AND every sibling `data` key and `lastMessageAt` MUST be unchanged.
+
+#### Scenario: Absent, malformed, or mismatched marker is left untouched
+
+- GIVEN a sender S whose stored `pendingHumanRequest` is absent, is not a plain object,
+  is missing a required key, carries an extra key, has a malformed `ref` or id, or is a
+  canonical marker with a different `requestId`
+- WHEN `clearPendingHumanRequest(S, 'abc123def456')` is called
+- THEN the result MUST be `false`
+- AND the stored marker MUST be unchanged (no write).
+
+#### Scenario: Invalid arguments never touch the store
+
+- GIVEN any stored state
+- WHEN `clearPendingHumanRequest` is called with an empty sender or a `requestId` that is
+  not exactly twelve lowercase hex characters
+- THEN the result MUST be `false` with no write.
 
 ### Requirement: pendingHumanRequest survives an LLM_IDLE_TIMEOUT_MS reset
 

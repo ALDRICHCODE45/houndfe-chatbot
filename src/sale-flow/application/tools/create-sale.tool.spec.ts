@@ -41,6 +41,7 @@ describe('makeCreateSaleTool', () => {
       create: jest.fn(),
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
+      clearPendingHumanRequest: jest.fn(),
       update: jest
         .fn()
         .mockImplementation(

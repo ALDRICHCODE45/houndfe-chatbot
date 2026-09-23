@@ -144,6 +144,57 @@ export function readPendingHumanRequest(
 }
 
 /**
+ * Exact id shape a `PendingHumanRequest.requestId` must have: 12
+ * lowercase hex characters (the `human_handoff_requests` row id).
+ */
+export function isPendingHumanRequestId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{12}$/.test(value);
+}
+
+/**
+ * Structural guard for a CANONICAL `pendingHumanRequest` marker: exactly
+ * the four keys `requestId`/`ref`/`createdAt`/`customerNotifiedAt`, all
+ * non-empty strings, `requestId` a valid id, and `ref === 'HF-' + requestId`.
+ *
+ * Distinction from `readPendingHumanRequest`: the reader checks that each
+ * of the four fields is present with the required type (and that
+ * `requestId`/`ref` are non-empty) but tolerates extra keys and
+ * noncanonical ids/refs; this strict guard additionally requires exactly
+ * four keys, a valid 12-lowercase-hex `requestId`, and
+ * `ref === 'HF-' + requestId`, so the conditional clear refuses any
+ * drifted or extended marker.
+ */
+export function isPendingHumanRequest(
+  value: unknown,
+): value is PendingHumanRequest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const marker = value as Record<string, unknown>;
+  if (Object.keys(marker).length !== 4) return false;
+  if (
+    !Object.hasOwn(marker, 'requestId') ||
+    !Object.hasOwn(marker, 'ref') ||
+    !Object.hasOwn(marker, 'createdAt') ||
+    !Object.hasOwn(marker, 'customerNotifiedAt')
+  ) {
+    return false;
+  }
+  if (!isPendingHumanRequestId(marker.requestId)) return false;
+  if (marker.ref !== `HF-${marker.requestId}`) return false;
+  if (typeof marker.createdAt !== 'string' || marker.createdAt.length === 0) {
+    return false;
+  }
+  if (
+    typeof marker.customerNotifiedAt !== 'string' ||
+    marker.customerNotifiedAt.length === 0
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Default accessor used by the agent runner to obtain the message
  * transcript without having to repeat the nullish-coalescing dance.
  * Missing field → empty array.
@@ -167,6 +218,19 @@ export interface ConversationStore {
   clearReceiptAmountPointer(
     senderId: string,
     pointer: ReceiptAmountPointer,
+  ): Promise<boolean>;
+
+  /**
+   * Atomically clears `data.pendingHumanRequest` (SET to JSON `null`,
+   * retaining the key) iff the stored marker is canonical AND its
+   * `requestId` equals the supplied id. Returns true iff exactly one row
+   * transitioned; false with no writes otherwise. Sibling `data` keys
+   * (incl. `receiptAmountPointer`, `shippingApproval`) and `lastMessageAt`
+   * are preserved.
+   */
+  clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
   ): Promise<boolean>;
 
   /**
