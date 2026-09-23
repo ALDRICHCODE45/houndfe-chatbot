@@ -11,6 +11,7 @@
  */
 import type { ShippingCreditLine } from '../domain/shipping-credit';
 import type { ShippingQuoteError } from '../domain/shipping-quote.error';
+import type { ShippingQuoteTelemetryPort } from '../domain/shipping-telemetry.port';
 // prettier-ignore
 import { normalizeShippingQuoteProviderResult, type ShippingQuoteProviderPort } from '../domain/shipping-quote.port';
 // prettier-ignore
@@ -116,8 +117,27 @@ function snapshotProviderResponse(value: unknown): Record<string, unknown> {
 // prettier-ignore
 /** Stateless: no per-call state, so concurrent requests stay isolated. */
 export class ShippingQuoteOrchestrator {
-  constructor(private readonly provider: ShippingQuoteOrchestratorProvider) {}
+  constructor(
+    private readonly provider: ShippingQuoteOrchestratorProvider,
+    private readonly telemetry?: ShippingQuoteTelemetryPort,
+  ) {}
   async quote(value: unknown): Promise<ShippingQuoteOrchestrationResult> {
+    const result = await this.evaluate(value);
+    this.record(result);
+    return result;
+  }
+  // prettier-ignore
+  /** One non-throwing redacted record per final outcome; never changes it. */
+  private record(result: ShippingQuoteOrchestrationResult): void {
+    try {
+      if (result.kind === 'draft') this.telemetry?.record('draft');
+      else this.telemetry?.record(result.kind, result.reason);
+    } catch {
+      // Telemetry is best-effort and cannot alter the quote outcome.
+    }
+  }
+  // prettier-ignore
+  private async evaluate(value: unknown): Promise<ShippingQuoteOrchestrationResult> {
     let requestInput: unknown;
     try { requestInput = isPlainRecord(value) ? value.requestInput : undefined; } catch { requestInput = undefined; }
     const capture: CreditCapture = { lines: null };

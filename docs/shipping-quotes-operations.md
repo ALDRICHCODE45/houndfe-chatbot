@@ -182,6 +182,16 @@ present/absent (never the value), finite outcome labels
 `ops_error`), HTTP status **class** only, ops request references of the form
 `HF-<12 hex>`, and expiry as a relative time.
 
+When the shipping graph is enabled, `ShippingQuoteOutcomeLogger` emits one
+finite result label per orchestrator outcome (`draft`, or
+`unavailable:<reason>` / `handoff:<reason>`) through the Nest logger. It reads
+only those two allowlisted labels and never a request payload, raw provider
+error, price, address, reference, or token; anything outside the allowlist is
+silently dropped. When shipping is disabled the module graph is empty and no
+such logger is registered, so nothing is emitted. Recording an outcome label
+is **not** evidence of a live provider call, a persisted approval, or a
+customer-facing shipping quote.
+
 Never capture: customer phone/`wa_id`, full or partial address, product
 names/ids, measurements or parcel values, customer-facing monetary amounts,
 client id/secret/bearer tokens, full provider URLs, raw provider request or

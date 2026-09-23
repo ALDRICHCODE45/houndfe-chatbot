@@ -137,7 +137,7 @@ Live activation remains blocked until all are observed:
 - [ ] **SQ-6 — Add operations evidence (IN PROGRESS):** complete three independently verified/reviewed work units, each at most 390 changed lines (including tracker and untracked), without claiming live readiness.
   - [x] **SQ-6A — Operator runbook:** provider/setup, offline sandbox smoke checklist, immediate rollback, explicit activation blockers; correct stale handoff note. Delivered `docs/shipping-quotes-operations.md` (227 lines: default-off posture, config/env names without values, owner-confirmed provider origin + measured demo profile, human approval before any customer price, 25 kg manual balanced split, sandbox smoke PLAN not performed, offline negative checks, rollback scope incl. persisted rows/already-sent messages, no-PII evidence, seven activation blockers incl. backend charge contract and CDMX policy, no live readiness claim); corrected the stale R6 handoff note to the gated `shipping_approval` flow with sale still blocked. `prettier --check` clean on both docs; `git diff --check` clean; no live network/provider/DB.
   - [x] **SQ-6B — Offline launch preflight:** default-off posture and manual activation dependencies without reading or exposing secret values; strict RED→GREEN. See the SQ-6B evidence block below.
-  - [ ] **SQ-6C — Redacted operational signal:** finite non-sensitive shipping outcome/event labels with default-off behavior, scoped tests, and no customer/package/token/reference leakage; split again if 390-line cap requires it.
+  - [x] **SQ-6C — Redacted operational signal:** finite non-sensitive shipping outcome labels with default-off behavior, scoped tests, and no customer/package/token/reference leakage; delivered within the 390-line cap without a Prometheus/HTTP/env/metrics addition. See the SQ-6C evidence block below.
 - [ ] **SQ-7 — Reconcile and deliver locally:** run focused/full non-network checks, verify default-off behavior and secret redaction, reconcile scope, obtain native review, and create authorized local work-unit commits without push or deployment.
 
 ## SQ-1A evidence (independent `PASS`; native-approved as `review-41c3378e455daa89`; locally delivered in this work unit)
@@ -463,6 +463,23 @@ The combined SQ-2B candidate (`shipping-quote.port.ts` + `shipping-quote.port.sp
 - Checks: scoped ESLint (both preflight files) exit 0; Prettier `--check` clean (two preflight files plus this runbook); `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0; `git diff --check` clean. Nothing staged; no commit, push, deploy, provider, network, or DB access.
 - Line budget: 147 additions + 1 deletion = 148 complete changed lines across the two preflight files, the runbook, and this tracker block (spec 89, implementation 34, runbook 13, tracker 11+1) — within the ≤390-line unit cap.
 - Unrelated untracked files (`.codegraph/**`, `odd/tasks/receipt-media-stored-worker.md`, `openspec/changes/receipt-media-ingestion/**`) were preserved untouched.
+
+## SQ-6C evidence (strict RED→GREEN; operator self-checks; no native review run)
+
+- Added `ShippingQuoteTelemetryPort.record(kind, reason?)` with finite allowlisted kinds (`draft`/`unavailable`/`handoff`) and reasons. Added the `ShippingQuoteOutcomeLogger` production adapter: Nest `Logger.log` of only `shipping_quote_outcome kind=<kind>[ reason=<reason>]`, validated against frozen per-kind allowlists — `draft` requires an absent reason, `unavailable` accepts only its exact ten reasons, `handoff` only its exact five; an unknown value or a kind/reason mismatch is silently dropped without coercion, and a throwing sink is swallowed.
+- `ShippingQuoteOrchestrator` takes an optional telemetry port and wraps its body in a private `evaluate()`, so exactly one non-throwing `record` runs after the final frozen result on every return branch and cannot change the outcome.
+- The enabled `ShippingModule.forRoot()` factory injects one `ShippingQuoteOutcomeLogger` into the orchestrator; the disabled graph stays empty (no providers/imports/exports, logger unresolvable). No Prometheus, HTTP endpoint, env flag, or metrics consumer was added.
+- Strict TDD RED: logger `pnpm exec jest --runInBand --no-cache shipping/infrastructure/shipping-quote-outcome.logger.spec.ts` — 1 suite failed, 0 tests (missing module); orchestrator spec — 10 failed / 72 passed; module spec — 2 failed / 11 passed. GREEN: logger 22/22; orchestrator+logger 104/104; module 13/13.
+- SQ-6C correction (independent verifier found mismatched direct kind/reason pairs were logged): the strengthened logger spec RED was 9 failed / 29 passed (38 total) on seven cross-kind pairs (`draft`+`provider_failure`/`invalid_input`, `unavailable`+`no_rates`/`manual_packing_required`/`credit_overflow`, `handoff`+`invalid_input`/`provider_disabled`) and two missing non-draft reasons (`unavailable`/`handoff` with no reason). GREEN after the per-kind guard: logger 38/38; logger+orchestrator+module+registry 151/151.
+- Checks: scoped ESLint over the seven shipping source/spec files exit 0; Prettier `--check` clean (seven shipping files, the runbook, and this tracker); `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0; `git diff --check` clean. Nothing staged; no commit, push, deploy, provider, network, or DB access.
+- Line budget: 213 new-file lines (39 port + 78 adapter + 96 spec) + 149 added + 6 deleted tracked lines = 368 complete changed lines before this sentence — within the ≤390-line unit cap. Unrelated untracked files were preserved untouched.
+
+## Key Learnings
+
+- A telemetry seam is safest as an optional, best-effort port: validate the finite labels against frozen allowlists _before_ emitting anything, and swallow the sink so logging can never become a behavior path.
+- A single flat reason allowlist is not enough: validate each reason against its own kind so a mismatched pair (`draft`+reason, wrong-kind reason, non-draft without a reason) is dropped instead of emitting misleading ops telemetry.
+- Wrapping the orchestrator body in a private `evaluate()` lets a single post-result `record` cover every return branch without duplicating calls or risking an outcome change.
+- Default-off stays honest when the disabled branch openly registers nothing at all: the adapter itself is only reachable in the enabled graph, so "disabled" and "no telemetry" are the same observable state.
 
 ## Delivery gate
 

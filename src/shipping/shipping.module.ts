@@ -19,7 +19,8 @@
  * Enabled: the module composes exactly one singleton chain
  * `SkydropxTokenClient -> SkydropxQuotationClient -> SkydropxShippingQuoteProvider`
  * plus one singleton `ShippingQuoteOrchestrator` built from that exported
- * provider, and one `MEASURED_DEMO_SHIPPING_CONFIG` provider that resolves the
+ * provider and one private `ShippingQuoteOutcomeLogger` redacted outcome
+ * adapter, and one `MEASURED_DEMO_SHIPPING_CONFIG` provider that resolves the
  * optional private measured-demo profile and exact origin through
  * `resolveMeasuredDemoShippingConfig`. It exports exactly
  * `SHIPPING_QUOTE_PROVIDER`, `ShippingQuoteOrchestrator`, and
@@ -43,6 +44,7 @@ import {
 import { SkydropxQuotationClient } from './infrastructure/skydropx-quotation.client';
 import { SkydropxShippingQuoteProvider } from './infrastructure/skydropx-shipping-quote.provider';
 import { SkydropxTokenClient } from './infrastructure/skydropx-token.client';
+import { ShippingQuoteOutcomeLogger } from './infrastructure/shipping-quote-outcome.logger';
 
 /** Bounded OAuth token request timeout (positive safe integer). */
 export const SKYDROPX_TOKEN_TIMEOUT_MS = 10_000;
@@ -114,13 +116,15 @@ export class ShippingModule {
           ): ShippingQuoteProviderPort =>
             new SkydropxShippingQuoteProvider(client),
         },
+        ShippingQuoteOutcomeLogger,
         {
           provide: ShippingQuoteOrchestrator,
-          inject: [SHIPPING_QUOTE_PROVIDER],
+          inject: [SHIPPING_QUOTE_PROVIDER, ShippingQuoteOutcomeLogger],
           useFactory: (
             provider: ShippingQuoteProviderPort,
+            telemetry: ShippingQuoteOutcomeLogger,
           ): ShippingQuoteOrchestrator =>
-            new ShippingQuoteOrchestrator(provider),
+            new ShippingQuoteOrchestrator(provider, telemetry),
         },
       ],
       // prettier-ignore

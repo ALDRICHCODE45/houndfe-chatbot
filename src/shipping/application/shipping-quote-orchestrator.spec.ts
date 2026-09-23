@@ -1,5 +1,6 @@
 // prettier-ignore
 import { ShippingQuoteOrchestrator as Orchestrator, type ShippingQuoteOrchestrationResult, type ShippingQuoteOrchestratorProvider } from './shipping-quote-orchestrator';
+import type { ShippingQuoteTelemetryPort } from '../domain/shipping-telemetry.port';
 
 type Rec = Record<string, unknown>;
 const SECRET = 'svc_super_secret_token_value';
@@ -25,6 +26,8 @@ const quoted = (x: Rec = {}): Rec => ({ kind: 'quoted', quoteId: 'quote-1', rate
 const err = (error: unknown): Rec => ({ kind: 'error', error });
 // prettier-ignore
 const go = (value: unknown, provider: unknown): Promise<ShippingQuoteOrchestrationResult> => new Orchestrator(provider as ShippingQuoteOrchestratorProvider).quote(value);
+// prettier-ignore
+const goT = (value: unknown, provider: unknown, port: unknown): Promise<ShippingQuoteOrchestrationResult> => new Orchestrator(provider as ShippingQuoteOrchestratorProvider, port as ShippingQuoteTelemetryPort).quote(value);
 const ok = (): Promise<Rec> => Promise.resolve(quoted());
 // prettier-ignore
 const boom = (): never => { throw new Error('x'); };
@@ -255,5 +258,54 @@ describe('SQ-4C isolation and output safety', () => {
     expect(Object.keys(a).sort()).toEqual(['kind', 'reason']);
     expect(c).toEqual({ kind: 'handoff', reason: 'no_rates' });
     expect(Object.keys(c).sort()).toEqual(['kind', 'reason']);
+  });
+});
+
+describe('SQ-6C redacted outcome telemetry', () => {
+  // prettier-ignore
+  const table: Array<[string, unknown, Rec, Rec]> = [
+    ['draft', ready(), withProvider(quoted()), { kind: 'draft' }],
+    ['unavailable/invalid_input', { requestInput: undefined, creditLines: [line(1, 1)] }, spy(), { kind: 'unavailable', reason: 'invalid_input' }],
+    ['unavailable/invalid_cart', ready({ items: [el({ unitPriceCents: -1 })] }), spy(), { kind: 'unavailable', reason: 'invalid_cart' }],
+    ['unavailable/provider_disabled', ready(), withProvider(err({ kind: 'provider_disabled' })), { kind: 'unavailable', reason: 'provider_disabled' }],
+    ['handoff/manual_packing_required', cart([line(1, 1)], { items: [el({ quantity: 6, measurement: { ...M, weightGrams: 5000 } })] }), spy(), { kind: 'handoff', reason: 'manual_packing_required' }],
+    ['handoff/no_rates', ready(), withProvider(err({ kind: 'no_rates' })), { kind: 'handoff', reason: 'no_rates' }],
+    ['handoff/provider_rejected_request', ready(), withProvider(err({ kind: 'invalid_request', field: 'destination' })), { kind: 'handoff', reason: 'provider_rejected_request' }],
+    ['handoff/provider_failure', ready(), withProvider(err({ kind: 'mystery' })), { kind: 'handoff', reason: 'provider_failure' }],
+  ];
+  // prettier-ignore
+  it.each(table)('records exactly one finite label for %s', async (_n, value, provider, expected) => {
+    calls.length = 0;
+    const seen: unknown[][] = [];
+    const out = await goT(value, provider, { record: (kind: unknown, reason?: unknown) => { seen.push([kind, reason]); } });
+    expect(out).toMatchObject(expected);
+    expect(seen).toEqual([[out.kind, 'reason' in out ? out.reason : undefined]]);
+    expect(JSON.stringify(seen)).not.toContain(SECRET);
+  });
+  // prettier-ignore
+  it('swallows a hostile logger and returns the unchanged frozen result', async () => {
+    const expected = await go(ready(), withProvider(quoted()));
+    let attempts = 0;
+    const out = await goT(ready(), withProvider(quoted()), { record: () => { attempts += 1; throw new Error(SECRET); } });
+    expect(out).toEqual(expected);
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(attempts).toBe(1);
+    expect(JSON.stringify(out)).not.toContain(SECRET);
+  });
+  // prettier-ignore
+  it('tolerates a hostile record getter without changing the result', async () => {
+    const expected = await go(ready(), withProvider(err({ kind: 'no_rates' })));
+    const hostile = new Proxy({}, { get: () => { throw new Error(SECRET); } });
+    const out = await goT(ready(), withProvider(err({ kind: 'no_rates' })), hostile);
+    expect(out).toEqual(expected);
+    expect(JSON.stringify(out)).not.toContain(SECRET);
+  });
+  // prettier-ignore
+  it('passes only labels, never payload or secret, to the sink', async () => {
+    const seen: unknown[][] = [];
+    await goT(ready({ items: [el({ unitPriceCents: 60_000 })] }), withProvider(quoted()), { record: (kind: unknown, reason?: unknown) => { seen.push([kind, reason]); } });
+    expect(JSON.stringify(seen)).not.toContain(SECRET);
+    expect(seen.every((entry) => entry.length <= 2)).toBe(true);
+    expect(seen).toEqual([['draft', undefined]]);
   });
 });

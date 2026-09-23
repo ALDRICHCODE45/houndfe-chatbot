@@ -26,6 +26,7 @@ import {
   SKYDROPX_TOKEN_TIMEOUT_MS,
 } from './shipping.module';
 import { ShippingQuoteOrchestrator } from './application/shipping-quote-orchestrator';
+import { ShippingQuoteOutcomeLogger } from './infrastructure/shipping-quote-outcome.logger';
 import {
   MEASURED_DEMO_SHIPPING_CONFIG,
   type MeasuredDemoShippingConfig,
@@ -220,6 +221,9 @@ describe('ShippingModule', () => {
         expect(() => {
           moduleRef.get(MEASURED_DEMO_SHIPPING_CONFIG, { strict: false });
         }).toThrow();
+        expect(() => {
+          moduleRef.get(ShippingQuoteOutcomeLogger, { strict: false });
+        }).toThrow();
         expect(spy).not.toHaveBeenCalled();
         await moduleRef.close();
       });
@@ -234,7 +238,7 @@ describe('ShippingModule', () => {
           .mockRejectedValue(new Error('network disabled in test'));
         const dynamic = ShippingModule.forRoot();
         expect(dynamic.imports).toEqual([ConfigModule]);
-        expect(dynamic.providers).toHaveLength(5);
+        expect(dynamic.providers).toHaveLength(6);
         expect(dynamic.exports).toEqual([
           SHIPPING_QUOTE_PROVIDER,
           ShippingQuoteOrchestrator,
@@ -300,6 +304,42 @@ describe('ShippingModule', () => {
           'shippingQuotes.skydropx.clientSecret',
           'shippingQuotes.skydropx.baseUrl',
         ]);
+        await moduleRef.close();
+      });
+    });
+
+    it('passes one outcome-logger adapter into the orchestrator', async () => {
+      await withFlag('true', async () => {
+        const record = jest
+          .spyOn(ShippingQuoteOutcomeLogger.prototype, 'record')
+          .mockImplementation(() => undefined);
+        const moduleRef = await Test.createTestingModule({
+          imports: [ShippingModule.forRoot()],
+        })
+          .overrideProvider(ConfigService)
+          .useValue({ get: configStub(CONFIG_VALUES) })
+          .compile();
+        const adapter = moduleRef.get(ShippingQuoteOutcomeLogger, {
+          strict: false,
+        });
+        expect(adapter).toBeInstanceOf(ShippingQuoteOutcomeLogger);
+        const provider = moduleRef.get<ShippingQuoteProviderPort>(
+          SHIPPING_QUOTE_PROVIDER,
+        );
+        jest.spyOn(provider, 'quote').mockResolvedValue({
+          kind: 'error',
+          error: { kind: 'provider_disabled' },
+        });
+        await expect(
+          moduleRef
+            .get<ShippingQuoteOrchestrator>(ShippingQuoteOrchestrator)
+            .quote({ requestInput: ORCH_INPUT }),
+        ).resolves.toEqual({
+          kind: 'unavailable',
+          reason: 'provider_disabled',
+        });
+        expect(record).toHaveBeenCalledTimes(1);
+        expect(record).toHaveBeenCalledWith('unavailable', 'provider_disabled');
         await moduleRef.close();
       });
     });
