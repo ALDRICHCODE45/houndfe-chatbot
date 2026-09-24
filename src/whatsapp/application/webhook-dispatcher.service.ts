@@ -28,6 +28,13 @@ import {
   WebhookEventDto,
   WebhookMessageDto,
 } from '../presentation/dto/webhook-event.dto';
+import { prepareShippingCustomerDisclosure } from '../../shipping/application/shipping-customer-disclosure';
+import { persistSentShippingCustomerOffer } from '../../shipping/application/shipping-customer-offer-persistence';
+import {
+  normalizeShippingCustomerOffer,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+  type ShippingCustomerOffer,
+} from '../../shipping/application/shipping-customer-acceptance';
 
 /**
  * WebhookDispatcherService (agent + human-handoff router)
@@ -126,20 +133,28 @@ export class WebhookDispatcherService {
           });
 
           if (result.kind === 'resolved') {
-            // Synthetic-turn injection through the runner. The marker
-            // was cleared by `resolveReply` so the runner's gate
-            // (ADR-29) does NOT suppress this turn; the customer resumes
-            // normally and the runner's reply is sent to the customer
-            // (NOT the ops phone).
-            const { reply } = await this.agentRunner.handle({
-              senderId: result.customerId,
-              text: result.syntheticUserText,
-            });
-            const { providerMessageId } = await this.whatsappSender.sendText({
-              to: result.customerId,
-              text: reply,
-            });
-            this.recentOutbound.remember(providerMessageId);
+            // SCA-3b2: a structured SHIPPING_APPROVED resolution is NEVER a
+            // synthetic LLM turn. The dispatcher discloses the server-derived
+            // price deterministically and only a successful send can persist
+            // the pending customer-response marker.
+            if (result.resolution.decision === 'SHIPPING_APPROVED') {
+              await this.discloseApprovedShippingPrice(result.customerId);
+            } else {
+              // Synthetic-turn injection through the runner. The marker
+              // was cleared by `resolveReply` so the runner's gate
+              // (ADR-29) does NOT suppress this turn; the customer resumes
+              // normally and the runner's reply is sent to the customer
+              // (NOT the ops phone).
+              const { reply } = await this.agentRunner.handle({
+                senderId: result.customerId,
+                text: result.syntheticUserText,
+              });
+              const { providerMessageId } = await this.whatsappSender.sendText({
+                to: result.customerId,
+                text: reply,
+              });
+              this.recentOutbound.remember(providerMessageId);
+            }
           } else {
             // `no_pending` → reply to the ops phone asking for a ref.
             const { providerMessageId } = await this.whatsappSender.sendText({
@@ -305,6 +320,81 @@ export class WebhookDispatcherService {
       }
     }
   }
+
+  /**
+   * SCA-3b2: deterministic post-`SHIPPING_APPROVED` price disclosure.
+   *
+   * Reads the current customer state and prepares the server-derived price;
+   * only then does it send the fixed Spanish disclosure to the CUSTOMER and
+   * remember the outbound id. It re-reads fresh state and persists the sent
+   * offer built from the prepared fields plus the real provider message id
+   * (SCA-3b1). A valid active offer on the same approved request/pin/amounts
+   * is treated as a replay: no re-send. Any null/throw fails closed (no
+   * dedup mark), so delivery uncertainty can never enable acceptance.
+   */
+  private async discloseApprovedShippingPrice(
+    customerId: string,
+  ): Promise<void> {
+    const nowMs = Date.now();
+    const state = await this.conversationStore.get(customerId);
+    const prepared = prepareShippingCustomerDisclosure(
+      state?.data ?? null,
+      nowMs,
+    );
+    if (prepared === null) {
+      throw new Error('shipping disclosure unavailable');
+    }
+    const existing = normalizeShippingCustomerOffer(
+      state?.data?.[SHIPPING_CUSTOMER_OFFER_KEY],
+    );
+    if (
+      existing !== null &&
+      isActiveMatchingShippingOffer(existing, prepared.offer, nowMs)
+    ) {
+      this.logger.log(
+        `shipping disclosure replay for ${customerId}: re-send skipped`,
+      );
+      return;
+    }
+    const { providerMessageId } = await this.whatsappSender.sendText({
+      to: customerId,
+      text: prepared.text,
+    });
+    // Remember the confirmed send immediately: even if persistence fails,
+    // the outbound id must be filtered as an echo.
+    this.recentOutbound.remember(providerMessageId);
+    const freshState = await this.conversationStore.get(customerId);
+    const offer = { ...prepared.offer, providerMessageId };
+    const persisted = await persistSentShippingCustomerOffer(
+      this.conversationStore,
+      customerId,
+      freshState,
+      offer,
+      nowMs,
+    );
+    if (persisted === null) {
+      throw new Error('shipping disclosure persistence failed');
+    }
+  }
+}
+
+// SCA-3b2: replay predicate — a persisted offer is only trusted when it pins
+// the same approved request, draft and disclosed amounts and is still active.
+function isActiveMatchingShippingOffer(
+  existing: ShippingCustomerOffer,
+  prepared: Omit<ShippingCustomerOffer, 'providerMessageId'>,
+  nowMs: number,
+): boolean {
+  return (
+    existing.requestId === prepared.requestId &&
+    existing.draftCreatedAt === prepared.draftCreatedAt &&
+    existing.expiresAt === prepared.expiresAt &&
+    existing.merchandiseCents === prepared.merchandiseCents &&
+    existing.chargeCents === prepared.chargeCents &&
+    existing.expectedTotalCents === prepared.expectedTotalCents &&
+    Date.parse(existing.offeredAt) <= nowMs &&
+    nowMs < Date.parse(existing.expiresAt)
+  );
 }
 
 // ── WU13-A2: normalizeInboundMessages media helper ───────────────────────

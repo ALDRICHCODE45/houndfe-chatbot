@@ -6,6 +6,7 @@ import { CostGuardService } from '../../llm-agent/application/cost-guard.service
 import {
   type AgentMessage,
   type ConversationState,
+  type ConversationStateData,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import { type LlmAgentPort } from '../../llm-agent/domain/llm-agent.port';
@@ -29,6 +30,14 @@ import {
 } from '../../human-handoff/application/human-handoff.service';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
+import {
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+} from '../../shipping/application/shipping-customer-acceptance';
+import {
+  shippingCustomerAcceptance,
+  shippingCustomerOffer,
+} from '../../../test/fixtures/shipping-customer-acceptance-fixture';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -773,6 +782,260 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(conversationStore.update).not.toHaveBeenCalled();
       expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reply');
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cust-pending');
+    });
+  });
+
+  // ─── SCA-3b2: post-approval deterministic shipping disclosure ─────────────
+  describe('SCA-3b2: SHIPPING_APPROVED deterministic price disclosure', () => {
+    const OPS = '5219999888777';
+    const CUSTOMER = '5215550001111';
+    const PIN = '2026-06-23T12:00:00.000Z';
+    const EXPIRES = '2026-06-23T12:30:00.000Z';
+    const REQUEST = 'abcdef123456';
+    const MERCH = 60_000;
+    const CHARGE = 6_900;
+    const CUSTOMER_UUID = '11111111-1111-1111-1111-111111111111';
+    const ADDR = '22222222-2222-2222-2222-222222222222';
+    const PRODUCT = '33333333-3333-3333-3333-333333333333';
+    // Exact deterministic disclosure bytes (merchandise + freight + total).
+    const TEXT = [
+      'Detalle de tu envío (producto medido):',
+      'Mercancía: $600.00 MXN',
+      'Envío: $69.00 MXN',
+      'Total: $669.00 MXN',
+      '',
+      'Verificaremos el precio antes de registrar tu pedido. Si cambia, te mostraremos el nuevo total para que lo confirmes otra vez.',
+      '',
+      'Responde exactamente "SÍ" para aceptar o "NO" para rechazar.',
+    ].join('\n');
+
+    const line = (unitPriceCents = MERCH) => ({
+      productId: PRODUCT,
+      variantId: null,
+      quantity: 1,
+      unitPriceCents,
+    });
+    const data = (
+      over: Record<string, unknown> = {},
+    ): ConversationStateData => ({
+      shippingQuoteDraft: {
+        schemaVersion: 1,
+        draft: {
+          quoteId: 'quote-1',
+          selectedRate: {
+            rateId: 'rate-1',
+            carrierName: 'Skydropx',
+            serviceName: 'Express',
+            priceCents: CHARGE + 12_000,
+            currency: 'MXN',
+            estimatedDeliveryDays: 3,
+            validUntil: null,
+          },
+          providerExpiresAt: null,
+          bestRateCents: CHARGE + 12_000,
+          totalCreditCents: 12_000,
+          appliedCreditCents: 12_000,
+          unusedCreditCents: 0,
+          qualifyingUnitCount: 1,
+          customerPaysCents: CHARGE,
+        },
+        createdAt: PIN,
+        expiresAt: EXPIRES,
+      },
+      shippingQuoteDraftContext: {
+        schemaVersion: 1,
+        draftCreatedAt: PIN,
+        customerId: CUSTOMER_UUID,
+        shippingAddressId: ADDR,
+        cart: [line()],
+        destination: {
+          zipCode: '06700',
+          state: 'Ciudad de México',
+          municipality: 'Cuauhtémoc',
+          neighborhood: 'Roma Norte',
+        },
+      },
+      shippingApproval: {
+        requestId: REQUEST,
+        draftCreatedAt: PIN,
+        decision: 'SHIPPING_APPROVED',
+        decidedAt: '2026-06-23T12:05:00.000Z',
+      },
+      cart: {
+        items: [line()],
+        idempotencyKey: 'key-1',
+        expectedTotalCents: MERCH,
+      },
+      ...over,
+    });
+    const state = (over: Record<string, unknown> = {}): ConversationState => ({
+      senderId: CUSTOMER,
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: data(over),
+    });
+    const opsEvent = (): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id: 'wamid.ops-ship-approve',
+                    from: OPS,
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body: 'HF-abcdef123456 APPROVE_SHIPPING' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    beforeEach(() => {
+      jest.setSystemTime(new Date('2026-06-23T12:10:00.000Z'));
+      humanHandoff.isOpsSender.mockReturnValue(true);
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'resolved',
+        customerId: CUSTOMER,
+        ref: 'HF-abcdef123456',
+        resolution: { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN },
+        syntheticUserText: '[Resolución del agente humano]',
+      });
+      conversationStore.update.mockImplementation(
+        (
+          senderId: string,
+          patch: Partial<Omit<ConversationState, 'senderId'>>,
+        ) => Promise.resolve({ senderId, ...patch } as ConversationState),
+      );
+    });
+
+    it('sends the price to the CUSTOMER first, then persists the sent offer with the real provider id', async () => {
+      conversationStore.get.mockResolvedValue(state());
+      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.offer' });
+
+      await service.dispatch(opsEvent());
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: TEXT,
+      });
+      const sendOrder = sender.sendText.mock.invocationCallOrder[0];
+      const persistOrder = conversationStore.update.mock.invocationCallOrder[0];
+      expect(sendOrder).toBeLessThan(persistOrder);
+      const [, patch] = conversationStore.update.mock.calls[0];
+      expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toEqual({
+        schemaVersion: 1,
+        requestId: REQUEST,
+        draftCreatedAt: PIN,
+        offeredAt: '2026-06-23T12:10:00.000Z',
+        expiresAt: EXPIRES,
+        merchandiseCents: MERCH,
+        chargeCents: CHARGE,
+        expectedTotalCents: MERCH + CHARGE,
+        providerMessageId: 'wamid.offer',
+      });
+      expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.offer');
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
+    });
+
+    it('never routes the approval through the LLM runner or the transcript store', async () => {
+      conversationStore.get.mockResolvedValue(state());
+
+      await service.dispatch(opsEvent());
+
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+      expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
+        text: 'HF-abcdef123456 APPROVE_SHIPPING',
+        from: OPS,
+      });
+    });
+
+    it('send failure fails closed: no persist, no remember and no dedup mark', async () => {
+      conversationStore.get.mockResolvedValue(state());
+      sender.sendText.mockRejectedValue(new Error('send-down'));
+
+      await expect(service.dispatch(opsEvent())).rejects.toThrow('send-down');
+
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(recentOutbound.remember).not.toHaveBeenCalled();
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('persist failure fails closed: the send is remembered but never marked seen', async () => {
+      conversationStore.get.mockResolvedValue(state());
+      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.offer' });
+      conversationStore.update.mockResolvedValueOnce(
+        null as unknown as ConversationState,
+      );
+
+      await expect(service.dispatch(opsEvent())).rejects.toThrow();
+
+      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.offer');
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('replay: an active persisted offer on the same request/pin/amounts skips re-send and marks seen', async () => {
+      conversationStore.get.mockResolvedValue(
+        state({ [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer() }),
+      );
+
+      await service.dispatch(opsEvent());
+
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(recentOutbound.remember).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
+    });
+
+    it('stale cart fails closed: no send, no persist and no dedup mark', async () => {
+      conversationStore.get.mockResolvedValue(
+        state({
+          cart: {
+            items: [line(MERCH + 100)],
+            idempotencyKey: 'key-1',
+            expectedTotalCents: MERCH + 100,
+          },
+        }),
+      );
+
+      await expect(service.dispatch(opsEvent())).rejects.toThrow();
+
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('changed price: distrusts the stale offer, re-sends and clears any prior acceptance', async () => {
+      const stale = shippingCustomerOffer({ chargeCents: CHARGE - 100 });
+      const prior = shippingCustomerAcceptance({ chargeCents: CHARGE - 100 });
+      conversationStore.get.mockResolvedValue(
+        state({
+          [SHIPPING_CUSTOMER_OFFER_KEY]: stale,
+          [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: prior,
+        }),
+      );
+      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.reprice' });
+
+      await service.dispatch(opsEvent());
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: TEXT,
+      });
+      const [, patch] = conversationStore.update.mock.calls[0];
+      expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+        chargeCents: CHARGE,
+        expectedTotalCents: MERCH + CHARGE,
+        providerMessageId: 'wamid.reprice',
+      });
+      expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
     });
   });
 
