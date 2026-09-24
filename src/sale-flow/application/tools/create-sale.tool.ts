@@ -8,7 +8,32 @@ import { persistConfirmedSale } from '../placed-sale-persistence';
 import { readCart, writeCart, type CartState } from '../../domain/cart-state';
 import type { ConversationState } from '../../../conversation/domain/conversation-store';
 import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
-import { evaluateShippingSaleGate } from '../shipping-sale-gate';
+import { snapshotShippingSaleState } from '../shipping-sale-gate';
+import {
+  evaluateShippingSaleRevalidation,
+  type ShippingSaleChargedVerdict,
+} from '../shipping-sale-revalidation';
+import { resolveShippingSaleDestination } from '../shipping-sale-destination';
+
+/** Finite, price-free fail-closed envelope shared by every guarded branch. */
+const SHIPPING_UNPERSISTABLE = Object.freeze({
+  ok: false as const,
+  error: { kind: 'shippingUnpersistable' as const, retryable: false },
+});
+
+const canonicalUuidEqual = (a: string, b: string): boolean =>
+  a.toLowerCase() === b.toLowerCase();
+
+/** One clock read; invalid/hostile values become `NaN`, so the verdict fails
+ *  closed for any shipping marker (a marker-free snapshot ignores it). */
+const readClock = (now: () => number): number => {
+  try {
+    const value = now();
+    return Number.isSafeInteger(value) && value >= 0 ? value : Number.NaN;
+  } catch {
+    return Number.NaN;
+  }
+};
 
 /**
  * createSale — AI-SDK tool factory.
@@ -84,7 +109,10 @@ import { evaluateShippingSaleGate } from '../shipping-sale-gate';
  * `contextSchema: { senderId }` is the per-tool runtime seam; the
  * sender id never enters the prompt.
  */
-export function makeCreateSaleTool(deps: ToolDeps) {
+export function makeCreateSaleTool(
+  deps: ToolDeps,
+  now: () => number = Date.now,
+) {
   return tool({
     description:
       'Registra la venta. Envía expectedTotalCents desde el carrito (NO desde el modelo). Usa una UUID v4 como X-Idempotency-Key (generada la primera vez, reusada en retries, rotada en promoReQuote/conflict, preservada en in-flight, limpiada en éxito). El cashierUserId se inyecta del servidor.',
@@ -111,34 +139,54 @@ export function makeCreateSaleTool(deps: ToolDeps) {
       // 1) Load the sender state from the durable store.
       const storedState = await deps.store.get(senderId);
 
-      // Shipping marker gate (SQ-5D2): the backend `CreateSaleInput` has no
-      // shipping-charge field, so a sale can be registered honestly only while
-      // the conversation carries no server-written shipping marker. The gate
-      // fails closed on hostile state and rejects a descriptor/`get` divergent
-      // `data` BEFORE any idempotency-key mint / store write / backend call.
-      // It returns the ONE validated `data` snapshot; every later cart read and
-      // persistence path uses `state` below and never re-reads
-      // `storedState.data`, so a stateful `get('data')` cannot flip the verdict.
-      // A delivery address is not a quote signal, so an address-only sale
-      // still passes.
-      const gate = evaluateShippingSaleGate(storedState);
-      if (gate.kind !== 'pass') {
-        return {
-          ok: false as const,
-          error: {
-            kind: 'shippingUnpersistable' as const,
-            retryable: false,
-          },
-        };
+      // E4-2a: ONE validated `state.data` snapshot drives the marker decision,
+      // verdict, cart read, and persistence; a charged verdict is the only
+      // marker-bearing path that may register a sale.
+      const snapshot = snapshotShippingSaleState(storedState);
+      if (snapshot.kind !== 'snapshot') {
+        return SHIPPING_UNPERSISTABLE;
       }
+      const data = snapshot.data;
       const state: ConversationState | null =
-        storedState === null || gate.data === null
+        storedState === null || data === null
           ? null
           : {
               senderId: storedState.senderId,
               lastMessageAt: storedState.lastMessageAt,
-              data: gate.data,
+              data,
             };
+
+      const verdict = evaluateShippingSaleRevalidation(data, readClock(now));
+      if (verdict.kind === 'blocked') {
+        return SHIPPING_UNPERSISTABLE;
+      }
+      const charged: ShippingSaleChargedVerdict | null =
+        verdict.kind === 'charged' ? verdict : null;
+
+      // Charged sales: the model never chooses identity, address, or money;
+      // drift and a stale/absent lookup fail closed before key/store/HTTP.
+      if (charged !== null) {
+        if (!canonicalUuidEqual(input.customerId, charged.customerId)) {
+          return SHIPPING_UNPERSISTABLE;
+        }
+        if (
+          input.shippingAddressId != null &&
+          !canonicalUuidEqual(
+            input.shippingAddressId,
+            charged.shippingAddressId,
+          )
+        ) {
+          return SHIPPING_UNPERSISTABLE;
+        }
+        const destination = await resolveShippingSaleDestination(
+          senderId,
+          charged,
+          deps.chatbotApi,
+        );
+        if (destination.kind !== 'match') {
+          return SHIPPING_UNPERSISTABLE;
+        }
+      }
 
       const cart = readCart(state);
 
@@ -196,17 +244,27 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         });
       }
 
-      // 5) Outgoing DTO — cashierUserId is injected from deps; the
-      //    top-level `expectedTotalCents` is forwarded only when the
-      //    persisted cart carries it (legacy carts omit the key).
+      // 5) Outgoing DTO — a charged sale takes identity, address, freight,
+      //    and the freight-inclusive total solely from the pinned verdict; an
+      //    ordinary sale forwards the cart total only when present.
       const dto: Parameters<typeof deps.chatbotApi.createSale>[0] = {
         cashierUserId: deps.cashierUserId,
-        customerId: input.customerId,
-        shippingAddressId: input.shippingAddressId ?? null,
+        customerId: charged?.customerId ?? input.customerId,
+        shippingAddressId:
+          charged?.shippingAddressId ?? input.shippingAddressId ?? null,
+        ...(charged !== null
+          ? {
+              shipping: {
+                chargeCents: charged.chargeCents,
+                approvalId: charged.approvalId,
+                quoteId: charged.quoteId,
+              },
+              expectedTotalCents: charged.expectedTotalCents,
+            }
+          : cart.expectedTotalCents !== undefined
+            ? { expectedTotalCents: cart.expectedTotalCents }
+            : {}),
         items,
-        ...(cart.expectedTotalCents !== undefined
-          ? { expectedTotalCents: cart.expectedTotalCents }
-          : {}),
       };
 
       try {
@@ -236,6 +294,16 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         if (err instanceof ChatbotApiError) {
           switch (err.errorCode) {
             case 'PROMO_RE_QUOTE':
+              if (charged !== null) {
+                // E4-2a interim: the recomputed total already includes freight;
+                // preserve the pinned total and fail closed (E4-2b owns the
+                // merchandise remainder).
+                await persistCart(deps.store, senderId, state, {
+                  ...cart,
+                  idempotencyKey: '',
+                });
+                return SHIPPING_UNPERSISTABLE;
+              }
               if (result.error.kind === 'promoReQuote') {
                 // Backend rejected the stale total and the payload was
                 // well-formed: persist the recomputed total so the
