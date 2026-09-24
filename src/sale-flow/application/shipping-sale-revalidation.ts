@@ -3,7 +3,8 @@
  * plain JSONB `data` snapshot: `ordinary_free` (no shipping marker), `charged`
  * (fresh draft + pinned context + approved marker on one `draftCreatedAt` pin,
  * cart matching the stored context, charge in 1..int32, merchandise total >= 0,
- * safe positive freight-inclusive total), or `blocked` (all else, fail closed).
+ * safe positive freight-inclusive total bounded to the backend int32 max), or
+ * `blocked` (all else, fail closed).
  * Pure: no I/O, backend lookup, provider, store, or mutation, and never a
  * model-supplied customer/money/address/identity. Point-in-time only: no
  * cross-store CAS or freshness claim; SQ-5E2 re-fetches before key/store.
@@ -63,7 +64,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 const present = (value: unknown): boolean =>
   value !== null && value !== undefined;
 
-const CHARGE_MAX = 2_147_483_647;
+const INT32_MAX_CENTS = 2_147_483_647;
 const safeCents = (value: unknown, min: number): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
 
@@ -96,7 +97,9 @@ export function evaluateShippingSaleRevalidation(
     }
     if (marker.draftCreatedAt !== record.createdAt) return BLOCKED;
     const chargeCents = record.draft.customerPaysCents;
-    if (!safeCents(chargeCents, 1) || chargeCents > CHARGE_MAX) return BLOCKED;
+    if (!safeCents(chargeCents, 1) || chargeCents > INT32_MAX_CENTS) {
+      return BLOCKED;
+    }
     // A persisted cart line may omit `variantId` (JSON drops `undefined`) while
     // the shared builder requires the exact key; normalize it to `null`.
     const cart = readCart(state);
@@ -124,7 +127,14 @@ export function evaluateShippingSaleRevalidation(
     const merchandiseTotalCents = cart.expectedTotalCents;
     if (!safeCents(merchandiseTotalCents, 0)) return BLOCKED;
     const expectedTotalCents = merchandiseTotalCents + chargeCents;
-    if (!Number.isSafeInteger(expectedTotalCents)) return BLOCKED;
+    // The final backend `confirmBotSale` rejects a freight-inclusive total
+    // above signed int32, so block it here before key mint/store/HTTP.
+    if (
+      !Number.isSafeInteger(expectedTotalCents) ||
+      expectedTotalCents > INT32_MAX_CENTS
+    ) {
+      return BLOCKED;
+    }
     return Object.freeze({
       kind: 'charged',
       customerId: context.customerId,

@@ -219,6 +219,22 @@ describe('makeCreateSaleTool shipping charge (SQ-5E4 E4-2a)', () => {
     await expectDenied(data, opts);
   });
 
+  it('fails closed before lookup/key/store for a pinned total above int32', async () => {
+    const h = setup(
+      bag({
+        cart: {
+          items: [LINE],
+          idempotencyKey: '',
+          expectedTotalCents: 2_147_483_648 - 6_900,
+        },
+      }),
+    );
+    expect(await run(h)).toEqual(DENIED);
+    expect(h.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(h.update).not.toHaveBeenCalled();
+    expect(h.createSale).not.toHaveBeenCalled();
+  });
+
   it('leaves an ordinary address-only sale unchanged', async () => {
     const h = setup({ cart: cart('k') });
     expect(await run(h)).toEqual({ ok: true, ...SALE });

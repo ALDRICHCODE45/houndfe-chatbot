@@ -167,6 +167,14 @@ const blockedCases: Array<[string, ConversationStateData]> = [
   ['fractional merchandise total', withCart({ expectedTotalCents: 60000.5 })],
   ['invalid merchandise total', withCart({ expectedTotalCents: 'x' })],
   ['total overflow', withCart({ expectedTotalCents: Number.MAX_SAFE_INTEGER })],
+  [
+    'total one above int32 max',
+    withCart({ expectedTotalCents: 2_147_483_648 - 6_900 }),
+  ],
+  [
+    'safe total above int32 max',
+    withCart({ expectedTotalCents: 3_000_000_000 - 6_900 }),
+  ],
   ['pending handoff', data({ pendingHumanRequest: pendingHandoff })],
   ['malformed approval marker', withApproval({ requestId: 'nope' })],
   [
@@ -196,6 +204,13 @@ describe('evaluateShippingSaleRevalidation', () => {
     expect(revalidate(withCart({ expectedTotalCents: 0 }))).toEqual(
       chargedVerdict(0),
     );
+  });
+
+  it('accepts the exact int32 backend total boundary', () => {
+    const merchandiseTotalCents = 2_147_483_647 - 6_900;
+    expect(
+      revalidate(withCart({ expectedTotalCents: merchandiseTotalCents })),
+    ).toEqual(chargedVerdict(merchandiseTotalCents));
   });
 
   it('matches canonical cart lines in any order with normalized variants', () => {
