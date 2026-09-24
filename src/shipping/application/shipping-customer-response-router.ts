@@ -5,9 +5,11 @@
  * `fenced` means "not this flow" so the caller falls through; every other
  * terminal kind is authoritative and never reaches the LLM. A decline cancels
  * offer/acceptance/approval and drops draft/context in ONE write before any
- * acknowledgment; a malformed or drifted active flow blocks without a write.
- * Store failures propagate. No cross-store compare-and-swap is claimed: the
- * read and the single update are not atomic against a concurrent writer.
+ * acknowledgment; a malformed or drifted active flow blocks without a write,
+ * as does a present row whose `data` is not a plain object (never a fence); a
+ * throwing `state.data` accessor propagates. Store failures propagate. No
+ * cross-store compare-and-swap is claimed: the read and the single update are
+ * not atomic against a concurrent writer.
  */
 import {
   readPendingHumanRequest,
@@ -109,7 +111,11 @@ export class ShippingCustomerResponseRouter {
     }
     // Store failures propagate: a caller must never read them as accepted.
     const state = await this.conversations.get(input.senderId);
-    if (state === null || !isPlainObject(state.data)) return { kind: 'fenced' };
+    if (state === null) return { kind: 'fenced' };
+    // A present row with non-plain `data` is malformed durable state, which is
+    // authoritative and must fail closed: never fall through to the LLM.
+    // Accessing `state.data` deliberately propagates a throwing getter.
+    if (!isPlainObject(state.data)) return { kind: 'blocked' };
     const data = state.data;
     const lastMessageAt = state.lastMessageAt;
     const rawReceipt = data[SHIPPING_CUSTOMER_DECLINE_RECEIPT_KEY];

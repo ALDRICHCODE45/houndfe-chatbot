@@ -6,6 +6,10 @@
  * decline replay, malformed-offer no-clear, pending human, store failure).
  * Consumes the shared b0 fixture and b1 harness; adds no production behavior.
  */
+import type {
+  ConversationState,
+  ConversationStateData,
+} from '../../conversation/domain/conversation-store';
 import {
   ACCEPT_KEY,
   APPROVAL,
@@ -20,6 +24,7 @@ import {
   PIN,
   PENDING,
   RECEIPT_KEY,
+  SENDER,
   SIBLINGS,
   TOTAL,
   YES,
@@ -30,13 +35,17 @@ import {
   input,
   offer,
   receipt,
+  stateOf,
 } from '../../../test/fixtures/shipping-customer-response-router-fixture';
 import {
   failingConversations,
   route,
   setup,
 } from '../../../test/fixtures/shipping-customer-response-router-harness';
-import { ShippingCustomerResponseRouter as Router } from './shipping-customer-response-router';
+import {
+  ShippingCustomerResponseRouter as Router,
+  type ShippingCustomerResponseConversations,
+} from './shipping-customer-response-router';
 
 describe('ShippingCustomerResponseRouter (adversarial)', () => {
   it('fences an invalid identity without touching the store', async () => {
@@ -164,5 +173,68 @@ describe('ShippingCustomerResponseRouter (adversarial)', () => {
         Date.parse(NOW),
       ).route(input()),
     ).rejects.toThrow('write-boom');
+  });
+});
+
+/**
+ * SCA-4b3: a present row whose `data` is not a plain object is malformed
+ * durable state and must fail closed as a terminal `blocked` — never the
+ * `fenced` fall-through that would hand the turn to the LLM. Only a genuinely
+ * absent row (`get` → null) fences. A throwing `state.data` accessor must
+ * propagate instead of being swallowed as a fence or block.
+ */
+const withState = (state: ConversationState) => {
+  const conversations: ShippingCustomerResponseConversations = {
+    get: jest.fn(async () => state),
+    update: jest.fn(async () => stateOf(base())),
+  };
+  return {
+    router: new Router(conversations, () => Date.parse(NOW)),
+    conversations,
+  };
+};
+
+const withData = (data: unknown) =>
+  withState({
+    senderId: SENDER,
+    lastMessageAt: NOW,
+    // SAFETY: casts deliberately-malformed bytes into the typed row the store
+    // would hand back, so the router guard itself is what is exercised.
+    data: data as ConversationStateData,
+  });
+
+describe('ShippingCustomerResponseRouter (malformed durable data)', () => {
+  it('fences an absent row but blocks a present row with null data', async () => {
+    const absent = await route(null);
+    expect(absent.out).toEqual({ kind: 'fenced' });
+    expect(absent.updates).toHaveLength(0);
+    const present = withData(null);
+    expect(await present.router.route(input())).toEqual({ kind: 'blocked' });
+    expect(present.conversations.update).not.toHaveBeenCalled();
+  });
+
+  const TABLE: [string, unknown][] = [
+    ['null', null],
+    ['a string', 'not-an-object'],
+    ['an array', ['malformed']],
+    ['a class instance', new Set<number>([1])],
+  ];
+  it.each(TABLE)('blocks %s data with no write', async (_label, data) => {
+    const ctx = withData(data);
+    expect(await ctx.router.route(input())).toEqual({ kind: 'blocked' });
+    expect(ctx.conversations.update).not.toHaveBeenCalled();
+  });
+
+  it('propagates a throwing data getter instead of fencing or blocking', async () => {
+    const state: ConversationState = {
+      senderId: SENDER,
+      lastMessageAt: NOW,
+      get data(): ConversationStateData {
+        throw new Error('data-boom');
+      },
+    };
+    const ctx = withState(state);
+    await expect(ctx.router.route(input())).rejects.toThrow('data-boom');
+    expect(ctx.conversations.update).not.toHaveBeenCalled();
   });
 });
