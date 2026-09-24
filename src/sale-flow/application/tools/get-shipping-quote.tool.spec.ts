@@ -10,6 +10,8 @@ import { buildShippingQuoteDraftRecord, SHIPPING_QUOTE_DRAFT_KEY as KEY } from '
 // prettier-ignore
 import { buildShippingQuoteDraftContext, SHIPPING_QUOTE_DRAFT_CONTEXT_KEY as CONTEXT_KEY } from '../../../shipping/application/shipping-quote-draft-context';
 // prettier-ignore
+import { SHIPPING_APPROVAL_KEY as APPROVAL_KEY } from '../../../human-handoff/application/shipping-approval-persistence';
+// prettier-ignore
 import { makeGetShippingQuoteTool, type GetShippingQuoteToolDeps, type GetShippingQuoteToolResult } from './get-shipping-quote.tool';
 
 /** SQ-5B2B2 core: server-owned inputs, finite non-price results, exact ordering, strict schema. Mocks only; axios blocked. */
@@ -40,7 +42,7 @@ const stateOf = (data: Record<string, unknown>): ConversationState => ({ senderI
 const cartState = (): ConversationState => stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' } });
 // prettier-ignore
 const legacyDraft = (): ConversationState => stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: buildShippingQuoteDraftRecord(DRAFT, MS)! });
-const freshDraft = (): ConversationState => {
+const draftParts = () => {
   const record = buildShippingQuoteDraftRecord(DRAFT, MS)!;
   const context = buildShippingQuoteDraftContext(
     {
@@ -51,8 +53,26 @@ const freshDraft = (): ConversationState => {
     },
     record.createdAt,
   )!;
+  return { record, context };
+};
+const freshDraft = (): ConversationState => {
+  const { record, context } = draftParts();
   return stateOf({ [KEY]: record, [CONTEXT_KEY]: context });
 };
+// prettier-ignore
+const MARKER = { requestId: 'abcdef012345', draftCreatedAt: ISO, decision: 'SHIPPING_APPROVED', decidedAt: ISO };
+// prettier-ignore
+const PENDING = { requestId: 'abcdef012345', ref: 'HF-abcdef012345', createdAt: ISO, customerNotifiedAt: ISO };
+// prettier-ignore
+const approvedDraft = (): ConversationState => { const { record, context } = draftParts(); return stateOf({ [KEY]: record, [CONTEXT_KEY]: context, [APPROVAL_KEY]: MARKER }); };
+// prettier-ignore
+const pendingDraft = (): ConversationState => { const { record, context } = draftParts(); return stateOf({ [KEY]: record, [CONTEXT_KEY]: context, pendingHumanRequest: PENDING }); };
+// prettier-ignore
+const mismatchedDraft = (): ConversationState => { const { record, context } = draftParts(); return stateOf({ [KEY]: record, [CONTEXT_KEY]: { ...context, draftCreatedAt: '2026-06-23T11:00:00.000Z' } }); };
+// prettier-ignore
+const orphanContext = (): ConversationState => { const { context } = draftParts(); return stateOf({ [CONTEXT_KEY]: context }); };
+// prettier-ignore
+const malformedContext = (): ConversationState => { const { record } = draftParts(); return stateOf({ [KEY]: record, [CONTEXT_KEY]: { schemaVersion: 1, draftCreatedAt: record.createdAt } }); };
 // prettier-ignore
 const withAddress = (address: unknown): unknown => ({ ...LOOKUP, customer: { ...LOOKUP.customer, address } });
 
@@ -182,6 +202,195 @@ describe('makeGetShippingQuoteTool', () => {
   });
 
   // prettier-ignore
+  it('a preexisting shipping approval blocks a new quote before every seam', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: approvedDraft(), approval });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('any pending human handoff blocks a new quote before every seam', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: pendingDraft(), approval });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it.each<[string, ConversationState]>([
+    ['mismatched context pin', mismatchedDraft()],
+    ['orphan context', orphanContext()],
+    ['malformed context', malformedContext()],
+  ])('a %s fails closed before every seam', async (_label, state) => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('hostile state.data fails closed before every seam', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const hostile = { senderId: SENDER, lastMessageAt: ISO, get data(): never { throw new Error('x'); } };
+    const m = setup({ state: hostile, approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a descriptor/get divergence on state.data fails closed', async () => {
+    const clean = cartState();
+    const divergent = new Proxy(clean, {
+      get(target, key, receiver) {
+        if (key === 'data') return { ...target.data, [APPROVAL_KEY]: MARKER };
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const m = setup({ state: divergent });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('an explicitly cleared approval/pending marker still allows reuse', async () => {
+    const { record, context } = draftParts();
+    const state = stateOf({ [KEY]: record, [CONTEXT_KEY]: context, [APPROVAL_KEY]: null, pendingHumanRequest: null });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    expect(await run(m.tool)).toEqual({ ok: true, status: 'reused' });
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a legacy draft without context is blocked when an approval marker survives', async () => {
+    const { record } = draftParts();
+    const state = stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: record, [APPROVAL_KEY]: MARKER });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it.each<[string, Record<string, unknown>]>([
+    ['malformed pending marker', { cart: { items: [{ ...LINE }], idempotencyKey: '' }, pendingHumanRequest: { foo: 1 } }],
+    ['malformed approval marker', { cart: { items: [{ ...LINE }], idempotencyKey: '' }, [APPROVAL_KEY]: { foo: 1 } }],
+  ])('any non-null %s fails closed regardless of its shape', async (_label, data) => {
+    const m = setup({ state: stateOf(data) });
+    expectHandoff(await run(m.tool), 'approval_unavailable');
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('an expired pinned context fails closed instead of claiming a re-quote', async () => {
+    const record = buildShippingQuoteDraftRecord(DRAFT, MS - 40 * 60 * 1000)!;
+    const context = buildShippingQuoteDraftContext({ customerId: CID, shippingAddressId: AID, destination: QDEST, cart: [{ ...LINE }] }, record.createdAt)!;
+    const state = stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: record, [CONTEXT_KEY]: context });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a stateful draft proxy cannot serve a fresh record after the checked read', async () => {
+    const expired = buildShippingQuoteDraftRecord(DRAFT, MS - 40 * 60 * 1000)!;
+    const freshRecord = buildShippingQuoteDraftRecord(DRAFT, MS)!;
+    const context = buildShippingQuoteDraftContext({ customerId: CID, shippingAddressId: AID, destination: QDEST, cart: [{ ...LINE }] }, expired.createdAt)!;
+    let draftReads = 0;
+    const bag = { [KEY]: expired, [CONTEXT_KEY]: context };
+    const stateful = new Proxy(bag, {
+      get(target, key, receiver) {
+        if (key === KEY) {
+          draftReads += 1;
+          return draftReads === 1 ? target[KEY] : freshRecord;
+        }
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: stateOf(stateful), approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(draftReads).toBe(1);
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it.each<[string, unknown]>([
+    ['null', null],
+    ['undefined', undefined],
+  ])('a present %s context with a fresh draft fails closed', async (_label, contextValue) => {
+    const { record } = draftParts();
+    const state = stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: record, [CONTEXT_KEY]: contextValue });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a malformed non-null draft with absent context fails closed', async () => {
+    const state = stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: { quoteId: 'q1' } });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('an expired legacy draft with absent context fails closed', async () => {
+    const record = buildShippingQuoteDraftRecord(DRAFT, MS - 40 * 60 * 1000)!;
+    const state = stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: record });
+    const m = setup({ state });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a non-plain conversation state fails closed before every seam', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: 'not-a-state', approval });
+    expectHandoff(await run(m.tool), 'state_failure');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
   it('unsupported sender is rejected before the backend', async () => {
     const m = setup();
     expectUnavailable(await run(m.tool, '+52 555 123 4567'), 'unsupported_sender');
@@ -196,7 +405,6 @@ describe('makeGetShippingQuoteTool', () => {
     ['empty cart', stateOf({ cart: { items: [], idempotencyKey: '' } })],
     ['malformed cart', stateOf({ cart: 'x' })],
     ['mismatched quantity', stateOf({ cart: { items: [{ ...LINE, quantity: 2 }], idempotencyKey: '' } })],
-    ['hostile state', { senderId: SENDER, lastMessageAt: ISO, get data(): never { throw new Error('x'); } }],
   ])('cart mismatch (%s) short-circuits before the backend', async (_l, state) => {
     const m = setup({ state });
     expectUnavailable(await run(m.tool), 'cart_mismatch');

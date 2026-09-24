@@ -18,13 +18,20 @@ import { z } from 'zod';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import type {
   ConversationState,
+  ConversationStateData,
   ConversationStore,
 } from '../../../conversation/domain/conversation-store';
 import type { MeasuredDemoShippingConfig } from '../../../shipping/application/measured-demo-shipping-config';
 // prettier-ignore
 import { matchMeasuredDemoParcelProfile, type MeasuredDemoPreparedInput } from '../../../shipping/application/measured-demo-parcel-profile';
 // prettier-ignore
-import { persistShippingQuoteDraftWithContext, readShippingQuoteDraftContext } from '../../../shipping/application/shipping-quote-draft-persistence';
+import { SHIPPING_APPROVAL_KEY } from '../../../human-handoff/application/shipping-approval-persistence';
+// prettier-ignore
+import { normalizeShippingQuoteDraftContext, SHIPPING_QUOTE_DRAFT_CONTEXT_KEY } from '../../../shipping/application/shipping-quote-draft-context';
+// prettier-ignore
+import { normalizeShippingQuoteDraftRecord, SHIPPING_QUOTE_DRAFT_KEY } from '../../../shipping/application/shipping-quote-draft-record';
+// prettier-ignore
+import { persistShippingQuoteDraftWithContext, readShippingQuoteDraft } from '../../../shipping/application/shipping-quote-draft-persistence';
 import type { ShippingApprovalRequestResult } from '../../../shipping/application/shipping-approval-request';
 import type { ShippingQuoteOrchestrator } from '../../../shipping/application/shipping-quote-orchestrator';
 import { isShippingQuoteAddress } from '../../../shipping/domain/shipping-quote.request';
@@ -129,6 +136,140 @@ async function requestApproval(
   }
 }
 
+/** Own-key read that never executes an accessor: `absent` for a missing key,
+ *  `unsafe` for an own getter/setter, a throwing descriptor, or a
+ *  descriptor/`get` divergence (a hostile Proxy), and `value` for a consistent
+ *  own data property. Reading through the descriptor is what keeps a stateful
+ *  or throwing `state.data` from flipping the guard's verdict. */
+type OwnRead =
+  | { readonly kind: 'value'; readonly value: unknown }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unsafe' };
+const ABSENT_READ: OwnRead = Object.freeze({ kind: 'absent' });
+const UNSAFE_READ: OwnRead = Object.freeze({ kind: 'unsafe' });
+
+function readOwnRecord(target: Record<string, unknown>, key: string): OwnRead {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor === undefined) return ABSENT_READ;
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      return UNSAFE_READ;
+    }
+    if (!Object.is(descriptor.value, target[key])) return UNSAFE_READ;
+    return { kind: 'value', value: descriptor.value };
+  } catch {
+    return UNSAFE_READ;
+  }
+}
+
+/** Markers treat a missing key and an explicit JSON `null`/`undefined` as
+ *  absent. Draft/context presence instead uses `kind`, so a present `null` key
+ *  is never mistaken for a clean legacy record. */
+function isAbsentRead(read: OwnRead): boolean {
+  return (
+    read.kind === 'absent' ||
+    (read.kind === 'value' && (read.value === null || read.value === undefined))
+  );
+}
+
+type QuoteDraftGuard =
+  | { readonly kind: 'reuse' }
+  | { readonly kind: 'quote' }
+  | {
+      readonly kind: 'handoff';
+      readonly reason: 'state_failure' | 'approval_unavailable';
+    };
+
+const REUSE_GUARD: QuoteDraftGuard = Object.freeze({ kind: 'reuse' });
+const QUOTE_GUARD: QuoteDraftGuard = Object.freeze({ kind: 'quote' });
+const STATE_FAILURE_GUARD: QuoteDraftGuard = Object.freeze({
+  kind: 'handoff',
+  reason: 'state_failure',
+});
+const APPROVAL_GUARD: QuoteDraftGuard = Object.freeze({
+  kind: 'handoff',
+  reason: 'approval_unavailable',
+});
+
+const PENDING_HUMAN_REQUEST_KEY = 'pendingHumanRequest';
+
+/**
+ * SQ-5E2a1 fail-closed classification before any new quote or overwrite.
+ *
+ * `readShippingQuoteDraftContext(...) === null` conflates a truly absent
+ * quote, a fresh legacy draft, a malformed/mismatched/orphan context, an
+ * expired draft, and hostile state. Falling straight into
+ * `persistShippingQuoteDraftWithContext` could then overwrite a draft that an
+ * unchanged approval/pending marker still pins.
+ *
+ * Only a truly absent quote (no draft key and no context key) or a fresh,
+ * well-formed draft with an ABSENT context key and no approval/pending marker
+ * may re-quote. A present context key must normalize and pin the exact present
+ * draft to reuse it; an expired or malformed draft, a mismatched, orphan,
+ * null, or otherwise unverifiable context, and a hostile state all fail
+ * closed. A preexisting `shippingApproval` or any `pendingHumanRequest` fails
+ * closed as `approval_unavailable`; everything else unverifiable fails closed
+ * as `state_failure`.
+ *
+ * `state.data` and every marker key are read exactly once through own data
+ * descriptors, so an accessor or a descriptor/`get` divergence is rejected
+ * instead of being re-read. Pure: no clock, I/O, provider, or mutation.
+ */
+function classifyQuoteDraftGuard(
+  state: unknown,
+  nowMs: number,
+): QuoteDraftGuard {
+  if (state === null) return QUOTE_GUARD;
+  if (!isPlainRecord(state)) return STATE_FAILURE_GUARD;
+  const stateData = readOwnRecord(state, 'data');
+  if (stateData.kind !== 'value' || !isPlainRecord(stateData.value)) {
+    return STATE_FAILURE_GUARD;
+  }
+  const data = stateData.value as ConversationStateData;
+  const pending = readOwnRecord(data, PENDING_HUMAN_REQUEST_KEY);
+  const approval = readOwnRecord(data, SHIPPING_APPROVAL_KEY);
+  if (pending.kind === 'unsafe' || approval.kind === 'unsafe') {
+    return STATE_FAILURE_GUARD;
+  }
+  if (!isAbsentRead(pending) || !isAbsentRead(approval)) return APPROVAL_GUARD;
+  const context = readOwnRecord(data, SHIPPING_QUOTE_DRAFT_CONTEXT_KEY);
+  const draft = readOwnRecord(data, SHIPPING_QUOTE_DRAFT_KEY);
+  if (context.kind === 'unsafe' || draft.kind === 'unsafe') {
+    return STATE_FAILURE_GUARD;
+  }
+  // No draft key: re-quote only when no context key is present either.
+  if (draft.kind === 'absent') {
+    return context.kind === 'absent' ? QUOTE_GUARD : STATE_FAILURE_GUARD;
+  }
+  // A present draft key must be a well-formed record; a malformed non-null
+  // draft is never treated as a clean legacy draft.
+  const record = normalizeShippingQuoteDraftRecord(draft.value);
+  if (record === null) return STATE_FAILURE_GUARD;
+  // Freshness is decided from the already-normalized, descriptor-checked
+  // `record`, never a second read of the original `data` bag: a stateful Proxy
+  // could otherwise serve an expired draft to the checked read and a fresh one
+  // here, turning a fail-closed expiry into a false reuse. The draft reader
+  // ignores `lastMessageAt`; the plain snapshot holds only the validated record.
+  const snapshot: ConversationState = {
+    senderId: '',
+    lastMessageAt: '',
+    data: { [SHIPPING_QUOTE_DRAFT_KEY]: record },
+  };
+  const fresh = readShippingQuoteDraft(snapshot, nowMs) !== null;
+  // An absent context key permits only a fresh legacy draft to re-quote.
+  if (context.kind === 'absent') {
+    return fresh ? QUOTE_GUARD : STATE_FAILURE_GUARD;
+  }
+  // A present context key (even `null`/`undefined`) must normalize and pin the
+  // exact present draft; anything unverifiable is not a reuse.
+  const normalized = normalizeShippingQuoteDraftContext(context.value);
+  if (normalized === null || normalized.draftCreatedAt !== record.createdAt) {
+    return STATE_FAILURE_GUARD;
+  }
+  // The pin matches; only a fresh draft may be reused, an expired one fails.
+  return fresh ? REUSE_GUARD : STATE_FAILURE_GUARD;
+}
+
 export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
   const now = deps.now ?? Date.now;
   return tool({
@@ -143,7 +284,9 @@ export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
       const senderId = options.context.senderId;
       let state: ConversationState | null;
       try { state = await deps.store.get(senderId); } catch { return handoff('state_failure'); }
-      if (readShippingQuoteDraftContext(state, nowMs) !== null) return (await requestApproval(deps, senderId)) ? REUSED : handoff('approval_unavailable');
+      const guard = classifyQuoteDraftGuard(state, nowMs);
+      if (guard.kind === 'reuse') return (await requestApproval(deps, senderId)) ? REUSED : handoff('approval_unavailable');
+      if (guard.kind === 'handoff') return handoff(guard.reason);
       const phone = parseMexicanWhatsAppPhone(senderId);
       if (phone === null) return unavailable('unsupported_sender');
       let prepared: MeasuredDemoPreparedInput | null;
