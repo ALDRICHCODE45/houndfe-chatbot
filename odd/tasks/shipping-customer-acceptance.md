@@ -15,7 +15,7 @@ Complete the missing post-human-approval customer journey for the **one measured
 
 ## Tasks
 
-- [x] **SCA-0 — Freeze pilot scope and tasks:** record verified backend/cap uncertainty, deterministic acceptance requirement and offline-first delivery order in this tracker. Evidence: this plan; local commit and review to be recorded after delivery.
+- [x] **SCA-0 — Freeze pilot scope and tasks:** record verified backend/cap uncertainty, deterministic acceptance requirement and offline-first delivery order in this tracker. Evidence: local `599e2f6`, native `review-9b04735790b55fd2` approved/acknowledged; Prettier and diff checks clean.
 - [ ] **SCA-1 — Pure offer and acceptance contracts:** exact-key, bounded, server-owned disclosure/acceptance marker shapes pinned to approval request, draft creation and disclosed merchandise/freight/total; canonical cents/expiry; deterministic Spanish price/yes-no grammar. Invalid, expired, malformed or hostile state fails closed. Split implementation/spec if over budget.
 - [ ] **SCA-2 — Server-side sale gate:** without a matching durable acceptance marker, any shipping quote/approval/pending marker blocks before idempotency key, store or HTTP. Match the current approved draft, cart, address context and the _same disclosed totals_; retain address-only default-off behavior. Handle existing charged test fixtures in bounded steps; characterize no accept, wrong price and stale pin before GREEN.
 - [ ] **SCA-3 — Durable disclosure lifecycle:** after an actual structured `SHIPPING_APPROVED` resolution, compute the presentable amount from the server-pinned fresh state; send a deterministic price/total message to the customer outside the LLM; only successful outbound send can enable the exact pending customer-response marker. Failure and replay remain safe; other ops handoffs unchanged.
@@ -31,5 +31,5 @@ Complete the missing post-human-approval customer journey for the **one measured
 
 ## Evidence ledger
 
-- SCA-0: pending local commit/review.
+- SCA-0: `599e2f6` (35 changed lines), `review-9b04735790b55fd2` approved/acknowledged.
 - SCA-1+: pending.
