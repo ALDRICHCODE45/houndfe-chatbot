@@ -1,15 +1,18 @@
 # Shipping Quotes (Skydropx) — Operations Runbook
 
 > Tracker: `odd/tasks/shipping-quotes-skydropx.md` (SQ-6A).
-> Scope: quote-only shipping foundation with a Skydropx adapter.
+> Scope: default-off quote intake and guarded shipping-sale code; no live sale authorization.
 
 Operator guide for the shipping-quotes slice: default-off posture,
 configuration names, the human approval gate, the 25 kg rule, the sandbox
 smoke plan, offline checks, rollback, and activation blockers.
 
 **Status: not live-ready.** Quotes are default-off, no sandbox smoke has been
-run from this unit, and all seven blockers in §10 remain open. Nothing here
-authorizes a live provider call or a customer-facing shipping price.
+run from this unit, and all seven blockers in §10 remain open. The chatbot can
+construct a guarded shipping sale for a fresh approved marker in offline tests,
+but its enabled prompt still forbids that conversational call; no approved
+customer-facing freight quote or explicit customer acceptance path exists.
+Nothing here authorizes a live provider call or a customer-facing shipping price.
 
 ## 1. Current posture (default off)
 
@@ -20,7 +23,10 @@ authorizes a live provider call or a customer-facing shipping price.
 - The flag is read once at module-metadata build (boot), so it is **not** a
   live toggle — changing it needs a graceful restart/redeploy. It is
   case-sensitive: only the exact lowercase `true` enables quotes.
-- No customer-facing shipping amount is produced by the current flow.
+- No customer-facing shipping amount is produced by the current flow. The
+  switch removes quote intake, **not** the `createSale` handler: a preexisting
+  fresh approved marker can still pass its server-side sale guard. See §11;
+  `false` alone is not a complete emergency sale kill switch.
 - **The launch preflight requires an explicit `false`, which is stricter than
   the runtime default.** At runtime an unset flag is simply "off", which is a
   safe default. The offline launch preflight (`pnpm preflight:launch`,
@@ -99,6 +105,13 @@ closed.
 - The model cannot forge `shipping_approval`: `requestHumanAssistance`
   rejects that kind. No approval amount is relayed to the customer or model.
 - An expired draft must be re-quoted, never reused.
+- The backend-shaped charge DTO and guarded `createSale` are implemented locally:
+  only a fresh approved marker, pinned cart/context, current customer/address,
+  positive charge, and int32-bounded total may reach sale HTTP. But the enabled
+  prompt still says not to call `createSale` for shipping, because the bot
+  cannot yet disclose the approved charge/total and obtain explicit customer
+  acceptance. Do not remove that instruction merely because the guarded tool
+  has offline tests.
 
 ## 6. 25 kg rule and the credit rule
 
@@ -130,10 +143,13 @@ default-off contract and fail-closed behavior.
   (or a non-5-digit postal code) fail boot fast.
 - **Malformed profile:** enabled boot with an absent/malformed/oversized
   `SHIPPING_DEMO_PARCEL_PROFILE_JSON` does not fail and resolves to `null`.
-- **Sale gate:** any non-null server-written `shippingQuoteDraft` or
-  `shippingApproval` marker makes `createSale` return `shippingUnpersistable`
-  before the idempotency key is minted or the backend is called. An
-  address-only sale still passes.
+- **Sale gate:** malformed, pending, rejected, expired, context-drifted,
+  zero-charge, address-drifted, or over-int32 shipping fails price-free before
+  key/store/sale HTTP. A fresh approved, matched state can reach the backend
+  with its pinned charge and freight-inclusive total; a validated promo 409
+  persists only the merchandise remainder and rotates the key before retry.
+  An address-only sale still passes. This is an offline guard contract, **not**
+  proof of a live backend acceptance or a customer-accepted shipping price.
 - **Credit boundary:** 50,000 cents is exclusive; the customer payment is
   never negative; overflow fails explicitly.
 - **Readiness:** missing measurements return `unavailable`; >25 kg returns
@@ -168,11 +184,15 @@ Plan:
    charge, credit, carrier, service, and pin, and no address/phone/product.
 4. Reply `APPROVE_SHIPPING`; confirm the decision is validated against the
    current unexpired draft.
-5. Attempt `createSale` for the shipping cart and confirm
-   `shippingUnpersistable` (sale remains blocked).
+5. In isolated offline mocks, exercise the guarded sale DTO, promo 409 retry,
+   zero-charge/expiry/drift denial, and an address-only legacy sale. Do **not**
+   perform a sandbox sale until the backend charge contract is deployed and
+   the approved freight-inclusive price has been shown to and accepted by the
+   customer; the current enabled prompt forbids `createSale` for shipping.
 6. Perform the §11 rollback (flag off + restart) and confirm the newly
-   booted graph cannot initiate provider calls or approval requests; separately
-   account for any requests already in flight before the restart.
+   booted graph cannot initiate provider calls or approval requests. Separately
+   account for in-flight requests **and preexisting approved markers**; flag
+   off alone does not block their guarded sale path.
 
 ## 9. Evidence capture (no PII)
 
@@ -206,13 +226,16 @@ Live activation remains blocked until **all seven** are observed:
    backend instead of `packageInfo: null`.
 3. Skydropx sandbox/production credentials and the allowlisted provider host
    are owner-provisioned.
-4. The backend can persist the approved shipping charge with the sale or a
-   separately agreed domain path. The current backend `CreateSaleInput` has
-   no shipping-charge field, so a shipping sale cannot be completed honestly.
+4. The backend charge contract is deployed and configured. An isolated local
+   backend branch accepts the shipping DTO and enforces its owner-set cap, but
+   it is not merged/deployed here. The current production backend contract
+   must not be assumed to accept a shipping sale.
 5. CDMX free-zone rules and the service-selection policy are approved.
 6. The human shipping-approval workflow is proven end to end.
 7. A controlled synthetic shipping journey passes before any customer sees a
-   quote.
+   quote, including post-approval price disclosure, explicit customer
+   acceptance, and a rollback that also stops preexisting approved sales.
+   None of those three is proven by the current offline sale-tool tests.
 
 ## 11. Rollback — `SHIPPING_QUOTES_ENABLED=false` + restart
 
@@ -231,10 +254,12 @@ What it **does not** do:
 
 - It does not delete or rewrite persisted conversation state. Existing
   `shippingQuoteDraft` and `shippingApproval` keys in conversation JSONB stay
-  in place, and the sale gate still blocks `createSale` for those
-  conversations (the gate ignores the flag). An expired draft is not reused,
-  but the marker keeps blocking until the normal clear/lifecycle path removes
-  it.
+  in place. The sale guard ignores the flag: **a fresh, matched approved
+  marker can still authorize a shipping `createSale`** if invoked, while stale,
+  invalid, or rejected markers fail closed. Thus flag off + restart is not an
+  emergency stop for previously approved sales. Before any live activation,
+  design and test a sale-side kill switch or an authorized marker-drain path;
+  do not clear production rows by hand or claim this rollback covers them.
 - It does not recall or un-send messages already delivered to the customer
   or ops, does not delete pending `human_handoff_requests` rows, and does not
   undo a persisted approval/rejection decision.
@@ -244,7 +269,8 @@ commits; that is a separate, explicitly authorized action.
 
 ## 12. Status
 
-Shipping quotes remain default-off and **not live-ready**. Completing SQ-6A
-authorizes no live provider call, no deployment, and no customer-facing
-shipping price. All seven blockers in §10 must be satisfied separately before
-any customer journey depends on a quote.
+Shipping quotes remain default-off and **not live-ready**. Local guarded sale
+wiring and offline tests authorize no live provider call, deployment, or
+customer-facing shipping price. The post-approval customer acceptance and
+sale-side rollback gap remain open under §10. All seven blockers must be
+satisfied separately before any customer journey depends on a quote.
