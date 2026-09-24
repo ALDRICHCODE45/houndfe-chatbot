@@ -6,12 +6,17 @@
  * to the approval and the offer window containing now, cart matching the stored
  * context, charge in 1..int32, merchandise total >= 0, safe positive
  * freight-inclusive total bounded to the backend int32 max), or
- * `blocked` (all else, fail closed).
+ * `blocked` (all else, fail closed). A structurally valid receipt amount
+ * pointer coexisting with a non-null shipping offer marker also blocks
+ * (SCA-4c2 two-flow collision).
  * Pure: no I/O, backend lookup, provider, store, or mutation, and never a
  * model-supplied customer/money/address/identity. Point-in-time only: no
  * cross-store CAS or freshness claim; SQ-5E2 re-fetches before key/store.
  */
-import type { ConversationStateData } from '../../conversation/domain/conversation-store';
+import {
+  isReceiptAmountPointer,
+  type ConversationStateData,
+} from '../../conversation/domain/conversation-store';
 import {
   SHIPPING_APPROVAL_KEY,
   readShippingApprovalMarker,
@@ -104,6 +109,16 @@ export function evaluateShippingSaleRevalidation(
       return ORDINARY_FREE;
     }
     if (present(data.pendingHumanRequest)) return BLOCKED;
+    // SCA-4c2: a non-null shipping offer marker coexisting with a structurally
+    // valid receipt amount pointer is a genuine two-flow collision that the
+    // inbound router hands to a human. The sale gate must also fail closed
+    // before the charged return, so a prior accepted shipping pair can never
+    // mint a sale while the receipt flow is live. An absent offer, or an
+    // invalid pointer, is not a collision: the receipt flow alone stays
+    // ordinary and is never charged as shipping.
+    if (hasOffer && isReceiptAmountPointer(data.receiptAmountPointer)) {
+      return BLOCKED;
+    }
     if (
       !hasDraft ||
       !hasContext ||

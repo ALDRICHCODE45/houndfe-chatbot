@@ -26,6 +26,13 @@ const VARIANT = '44444444-4444-4444-4444-444444444444';
 const REQUEST_ID = 'abcdef123456';
 type Over = Record<string, unknown>;
 
+// SCA-4c2: an exact, structurally valid receipt amount pointer (3 keys).
+const RECEIPT_POINTER = {
+  receiptMediaId: 'm1',
+  saleId: 's1',
+  receiptVersion: '1',
+} as const;
+
 const item = (
   productId: string,
   variantId: string | null | undefined,
@@ -277,6 +284,21 @@ const blockedCases: Array<[string, ConversationStateData]> = [
       }),
     }),
   ],
+  // SCA-4c2: a charged pair coexisting with a valid receipt pointer is a
+  // genuine two-flow collision and must never mint a shipping sale.
+  [
+    'a valid charged pair while a receipt pointer is present',
+    accepted(data({ receiptAmountPointer: RECEIPT_POINTER })),
+  ],
+  [
+    'a valid charged pair while a receipt pointer and a handoff are present',
+    accepted(
+      data({
+        receiptAmountPointer: RECEIPT_POINTER,
+        pendingHumanRequest: pendingHandoff,
+      }),
+    ),
+  ],
 ];
 
 describe('evaluateShippingSaleRevalidation', () => {
@@ -351,6 +373,42 @@ describe('evaluateShippingSaleRevalidation', () => {
   it('blocks an invalid clock while a quote is present', () => {
     expect(revalidate(data(), Number.NaN).kind).toBe('blocked');
     expect(revalidate(data(), -1).kind).toBe('blocked');
+  });
+
+  it('ignores a structurally invalid receipt pointer', () => {
+    const invalidPointers: unknown[] = [
+      null,
+      undefined,
+      {},
+      { receiptMediaId: '', saleId: 's1', receiptVersion: '1' },
+      { receiptMediaId: 'm1', saleId: '', receiptVersion: '1' },
+      { receiptMediaId: 'm1', saleId: 's1', receiptVersion: '0' },
+      { receiptMediaId: 'm1', saleId: 's1', receiptVersion: '1', extra: 1 },
+      'm1',
+    ];
+    for (const pointer of invalidPointers) {
+      expect(
+        revalidate(accepted(data({ receiptAmountPointer: pointer }))),
+      ).toEqual(chargedVerdict(60000));
+    }
+  });
+
+  it('keeps a receipt pointer without a shipping marker ordinary free', () => {
+    expect(
+      revalidate({ receiptAmountPointer: RECEIPT_POINTER, cart: baseCart() })
+        .kind,
+    ).toBe('ordinary_free');
+  });
+
+  it('blocks a charged pair when the pointer accessor is hostile', () => {
+    const snapshot = accepted(data());
+    Object.defineProperty(snapshot, 'receiptAmountPointer', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(revalidate(snapshot).kind).toBe('blocked');
   });
 
   it('blocks a non-plain or hostile snapshot', () => {
