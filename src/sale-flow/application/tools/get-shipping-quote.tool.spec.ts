@@ -21,6 +21,7 @@ const SENDER = '525551234567',
 const P = '11111111-1111-1111-1111-111111111111';
 const CID = '22222222-2222-2222-2222-222222222222';
 const AID = '33333333-3333-3333-3333-333333333333';
+const OTHER = '44444444-4444-4444-4444-444444444444';
 const M = { weightGrams: 500, lengthCm: 10, widthCm: 20, heightCm: 30 };
 // prettier-ignore
 const ORIGIN = { postalCode: '06000', state: 'CDMX', municipality: 'Cuauhtémoc', neighborhood: 'Centro' };
@@ -55,10 +56,15 @@ const draftParts = () => {
   )!;
   return { record, context };
 };
-const freshDraft = (): ConversationState => {
+// The stored context is only reusable while the live cart, customer, address,
+// and destination still match. `pinnedData` keeps the pinned draft/context and
+// varies the live `data.cart` the reuse drift check rereads.
+const pinnedData = (cart: unknown): ConversationState => {
   const { record, context } = draftParts();
-  return stateOf({ [KEY]: record, [CONTEXT_KEY]: context });
+  return stateOf({ cart, [KEY]: record, [CONTEXT_KEY]: context });
 };
+const freshDraft = (): ConversationState =>
+  pinnedData({ items: [{ ...LINE }], idempotencyKey: '' });
 // prettier-ignore
 const MARKER = { requestId: 'abcdef012345', draftCreatedAt: ISO, decision: 'SHIPPING_APPROVED', decidedAt: ISO };
 // prettier-ignore
@@ -184,21 +190,165 @@ describe('makeGetShippingQuoteTool', () => {
   });
 
   // prettier-ignore
-  it('reuses a fresh draft with zero phone/cart/backend/orchestrator/update calls', async () => {
-    const m = setup({ state: freshDraft() });
+  it('reuses a fresh draft after one backend reread and no quote/update', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: freshDraft(), approval });
     expect(await run(m.tool)).toEqual({ ok: true, status: 'reused' });
     expect(m.get).toHaveBeenCalledTimes(1);
+    expect(m.getCustomerByPhone).toHaveBeenCalledTimes(1);
+    expect(m.getCustomerByPhone).toHaveBeenCalledWith('52', '5551234567');
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('an unsupported sender can no longer reuse a fresh draft', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: freshDraft(), approval });
+    expectUnavailable(await run(m.tool, 'x'), 'unsupported_sender');
+    expect(m.get).toHaveBeenCalledWith('x');
+    expect(approval).not.toHaveBeenCalled();
     expect(m.getCustomerByPhone).not.toHaveBeenCalled();
     expect(m.quote).not.toHaveBeenCalled();
     expect(m.update).not.toHaveBeenCalled();
   });
 
   // prettier-ignore
-  it('reuse precedes sender parsing', async () => {
-    const m = setup({ state: freshDraft() });
-    expect(await run(m.tool, 'x')).toEqual({ ok: true, status: 'reused' });
-    expect(m.get).toHaveBeenCalledWith('x');
+  it.each<[string, unknown, string]>([
+    ['quantity drift', { items: [{ ...LINE, quantity: 2 }], idempotencyKey: '' }, 'cart_mismatch'],
+    ['product drift', { items: [{ ...LINE, productId: OTHER }], idempotencyKey: '' }, 'cart_mismatch'],
+    ['empty current cart', { items: [], idempotencyKey: '' }, 'cart_mismatch'],
+    ['malformed current cart', 'x', 'cart_mismatch'],
+    ['unit price drift', { items: [{ ...LINE, unitPriceCents: 1600 }], idempotencyKey: '' }, 'context_mismatch'],
+  ])('reuse cart drift (%s) fails closed', async (_l, cart, reason) => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: pinnedData(cart), approval });
+    expectUnavailable(await run(m.tool), reason);
+    expect(approval).not.toHaveBeenCalled();
     expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it.each<[string, unknown, string]>([
+    ['customer id drift', { ...LOOKUP, customer: { ...LOOKUP.customer, customerId: OTHER } }, 'context_mismatch'],
+    ['address id drift', withAddress({ ...DEST, id: OTHER }), 'context_mismatch'],
+    ['destination zip drift', withAddress({ ...DEST, zipCode: '99999' }), 'context_mismatch'],
+    ['destination locality drift', withAddress({ ...DEST, neighborhood: 'Juárez' }), 'context_mismatch'],
+  ])('reuse identity/destination drift (%s) fails closed', async (_l, lookup, reason) => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: freshDraft(), lookup, approval });
+    expectUnavailable(await run(m.tool), reason);
+    expect(m.getCustomerByPhone).toHaveBeenCalledTimes(1);
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('reuse fails closed when the backend reread rejects or is hostile', async () => {
+    const rejected = setup({ state: freshDraft() });
+    rejected.getCustomerByPhone.mockRejectedValue(new Error('backend'));
+    expectHandoff(await run(rejected.tool), 'customer_lookup_failure');
+    expect(rejected.requestShippingApproval).not.toHaveBeenCalled();
+    expect(rejected.quote).not.toHaveBeenCalled();
+    expect(rejected.update).not.toHaveBeenCalled();
+    const hostile = new Proxy({}, { get: () => { throw new Error('boom'); } });
+    const m = setup({ state: freshDraft(), lookup: hostile });
+    expectHandoff(await run(m.tool), 'customer_lookup_failure');
+    expect(m.requestShippingApproval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('reuse fails closed when the current stored address is invalid', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: freshDraft(), lookup: withAddress({ ...DEST, zipCode: null }), approval });
+    expectUnavailable(await run(m.tool), 'address_unavailable');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a hostile current cart getter fails closed on reuse', async () => {
+    const { record, context } = draftParts();
+    const data: Record<string, unknown> = { [KEY]: record, [CONTEXT_KEY]: context };
+    Object.defineProperty(data, 'cart', { get() { throw new Error('cart'); }, enumerable: true, configurable: true });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: stateOf(data), approval });
+    expectUnavailable(await run(m.tool), 'cart_mismatch');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('reuse fails closed when the current destination cannot be re-pinned', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: freshDraft(), lookup: withAddress({ ...DEST, zipCode: 'ABCDE' }), approval });
+    expectUnavailable(await run(m.tool), 'context_mismatch');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('reuse reads the original state.data exactly once before the drift verdict', async () => {
+    const inner = freshDraft();
+    let dataReads = 0;
+    const proxied = new Proxy(inner, {
+      get(target, key, receiver) {
+        if (key === 'data') dataReads += 1;
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: proxied, approval });
+    expect(await run(m.tool)).toEqual({ ok: true, status: 'reused' });
+    expect(dataReads).toBe(1);
+    expect(approval).toHaveBeenCalledTimes(1);
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
+  });
+
+  // prettier-ignore
+  it('a stateful top-level state proxy cannot smuggle a marker into a new-quote overwrite', async () => {
+    const clean: Record<string, unknown> = { cart: { items: [{ ...LINE }], idempotencyKey: '' } };
+    const poisoned: Record<string, unknown> = { ...clean, [APPROVAL_KEY]: MARKER };
+    let dataReads = 0;
+    const state = new Proxy({ senderId: SENDER, lastMessageAt: ISO, data: clean }, {
+      get(target, key, receiver) {
+        if (key === 'data') { dataReads += 1; return dataReads === 1 ? clean : poisoned; }
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state, approval });
+    const result = await run(m.tool);
+    expect(result).toEqual({ ok: true, status: 'quoted' });
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(dataReads).toBe(1);
+    expect(m.update).toHaveBeenCalledTimes(1);
+    const patch = (m.update.mock.calls[0] as [string, { data: Record<string, unknown> }])[1];
+    expect(patch.data[APPROVAL_KEY]).toBeUndefined();
+    expect(patch.data.pendingHumanRequest).toBeUndefined();
+    expect(patch.data[KEY]).toBeDefined();
+    expect(patch.data[CONTEXT_KEY]).toBeDefined();
+    expect(JSON.stringify(result)).not.toContain('cents');
+    for (const secret of ['Calle Falsa', 'Ana', 'portón', '5512340000']) expect(JSON.stringify(patch.data)).not.toContain(secret);
+  });
+
+  // prettier-ignore
+  it('a null conversation still re-quotes from an empty cart with no backend', async () => {
+    const approval = jest.fn().mockResolvedValue({ ok: true });
+    const m = setup({ state: null, approval });
+    expectUnavailable(await run(m.tool), 'cart_mismatch');
+    expect(approval).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.quote).not.toHaveBeenCalled();
+    expect(m.update).not.toHaveBeenCalled();
   });
 
   // prettier-ignore
@@ -269,7 +419,7 @@ describe('makeGetShippingQuoteTool', () => {
   // prettier-ignore
   it('an explicitly cleared approval/pending marker still allows reuse', async () => {
     const { record, context } = draftParts();
-    const state = stateOf({ [KEY]: record, [CONTEXT_KEY]: context, [APPROVAL_KEY]: null, pendingHumanRequest: null });
+    const state = stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: record, [CONTEXT_KEY]: context, [APPROVAL_KEY]: null, pendingHumanRequest: null });
     const approval = jest.fn().mockResolvedValue({ ok: true });
     const m = setup({ state, approval });
     expect(await run(m.tool)).toEqual({ ok: true, status: 'reused' });
@@ -486,7 +636,7 @@ describe('makeGetShippingQuoteTool', () => {
     expect(await run(m.tool)).toEqual({ ok: true, status: 'reused' });
     expect(approval).toHaveBeenCalledTimes(1);
     expect(approval).toHaveBeenCalledWith(SENDER);
-    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).toHaveBeenCalledTimes(1);
     expect(m.quote).not.toHaveBeenCalled();
     expect(m.update).not.toHaveBeenCalled();
   });
@@ -505,7 +655,7 @@ describe('makeGetShippingQuoteTool', () => {
   it('fails closed when approval is absent on the reuse path', async () => {
     const m = setup({ state: freshDraft(), approval: null });
     expectHandoff(await run(m.tool), 'approval_unavailable');
-    expect(m.getCustomerByPhone).not.toHaveBeenCalled();
+    expect(m.getCustomerByPhone).toHaveBeenCalledTimes(1);
     expect(m.quote).not.toHaveBeenCalled();
     expect(m.update).not.toHaveBeenCalled();
   });
