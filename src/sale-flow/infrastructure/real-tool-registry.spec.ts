@@ -21,6 +21,10 @@ import {
   buildShippingQuoteDraftRecord,
   SHIPPING_QUOTE_DRAFT_KEY,
 } from '../../shipping/application/shipping-quote-draft-record';
+import {
+  buildShippingQuoteDraftContext,
+  SHIPPING_QUOTE_DRAFT_CONTEXT_KEY,
+} from '../../shipping/application/shipping-quote-draft-context';
 import type { ShippingQuoteDraft } from '../../shipping/application/shipping-quote-draft';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
@@ -337,25 +341,110 @@ describe('RealToolRegistry', () => {
       estimatedDeliveryDays: 2,
     };
 
-    const draftRecord = (): unknown => buildShippingQuoteDraftRecord(DRAFT, MS);
-    const draftState = (): ConversationState => ({
-      senderId: SENDER,
-      lastMessageAt: ISO,
-      data: { [SHIPPING_QUOTE_DRAFT_KEY]: draftRecord() },
-    });
-    const pendingState = (id: string): ConversationState => ({
-      senderId: SENDER,
-      lastMessageAt: ISO,
-      data: {
-        [SHIPPING_QUOTE_DRAFT_KEY]: draftRecord(),
-        pendingHumanRequest: {
-          requestId: id,
-          ref: `HF-${id}`,
-          createdAt: ISO,
-          customerNotifiedAt: ISO,
-        },
+    const P = '11111111-1111-1111-1111-111111111111';
+    const CID = '22222222-2222-2222-2222-222222222222';
+    const AID = '33333333-3333-3333-3333-333333333333';
+    const M = {
+      weightGrams: 500,
+      lengthCm: 10,
+      widthCm: 20,
+      heightCm: 30,
+    };
+    const ORIGIN = {
+      postalCode: '06000',
+      state: 'CDMX',
+      municipality: 'Cuauhtémoc',
+      neighborhood: 'Centro',
+    };
+    const LINE = {
+      productId: P,
+      variantId: null,
+      quantity: 1,
+      unitPriceCents: 1500,
+    };
+    const QDEST = {
+      zipCode: '06700',
+      state: 'CDMX',
+      municipality: 'Cuauhtémoc',
+      neighborhood: 'Roma',
+    };
+    const DEST = {
+      id: AID,
+      label: null,
+      street: 'Calle Falsa 123',
+      exteriorNumber: '1',
+      interiorNumber: null,
+      zipCode: '06700',
+      neighborhood: 'Roma',
+      municipality: 'Cuauhtémoc',
+      state: 'CDMX',
+      visualReferences: 'portón azul',
+      carrierPhone: '5512340000',
+    };
+    const LOOKUP = {
+      found: true,
+      customer: {
+        customerId: CID,
+        firstName: 'Ana',
+        lastName: null,
+        phoneCountryCode: '52',
+        phone: '5551234567',
+        preferredPaymentMethod: null,
+        address: DEST,
       },
-    });
+    };
+    // Real matched measured-demo profile/config plus a live cart and pinned
+    // context: the wrapper only reaches the approval seam when the stored
+    // draft, its context pin, the current cart, and the backend reread all
+    // agree. A contextless draft or an empty config fails closed earlier.
+    const CONFIG: MeasuredDemoShippingConfig = {
+      profile: {
+        version: 1,
+        items: [{ productId: P, variantId: null, quantity: 1, measurement: M }],
+        parcel: M,
+      },
+      origin: ORIGIN,
+    };
+    const draftParts = () => {
+      const record = buildShippingQuoteDraftRecord(DRAFT, MS)!;
+      const context = buildShippingQuoteDraftContext(
+        {
+          customerId: CID,
+          shippingAddressId: AID,
+          destination: QDEST,
+          cart: [{ ...LINE }],
+        },
+        record.createdAt,
+      )!;
+      return { record, context };
+    };
+    const draftState = (): ConversationState => {
+      const { record, context } = draftParts();
+      return {
+        senderId: SENDER,
+        lastMessageAt: ISO,
+        data: {
+          cart: { items: [{ ...LINE }], idempotencyKey: '' },
+          [SHIPPING_QUOTE_DRAFT_KEY]: record,
+          [SHIPPING_QUOTE_DRAFT_CONTEXT_KEY]: context,
+        },
+      };
+    };
+    const pendingState = (id: string): ConversationState => {
+      const base = draftState();
+      return {
+        ...base,
+        data: {
+          ...base.data,
+          pendingHumanRequest: {
+            requestId: id,
+            ref: `HF-${id}`,
+            createdAt: ISO,
+            customerNotifiedAt: ISO,
+          },
+        },
+      };
+    };
     const row = (over: Record<string, unknown> = {}): HumanHandoffRequest =>
       ({
         id: REQUEST_ID,
@@ -379,9 +468,7 @@ describe('RealToolRegistry', () => {
       resolveReply: jest.fn(),
       isOpsSender: jest.fn(),
     });
-    const configStub = Object.freeze(
-      {},
-    ) as unknown as MeasuredDemoShippingConfig;
+    const configStub = CONFIG;
     const rowStore = (findById: jest.Mock): HumanHandoffStore =>
       ({ findById }) as unknown as HumanHandoffStore;
     const callQuote = async (registry: RealToolRegistry): Promise<unknown> => {
@@ -405,10 +492,18 @@ describe('RealToolRegistry', () => {
       reason: 'approval_unavailable',
     };
 
+    // Each test owns its backend reread stub: resetting here keeps a lookup
+    // resolved in one case from leaking a call count or implementation into
+    // the next, so the exactly-once assertions stay meaningful.
+    beforeEach(() => {
+      stubChatbotApi.getCustomerByPhone.mockReset();
+    });
+
     it('keeps exactly the twelve keys when shipping is disabled even with no handoff store', async () => {
       const registry = await buildRegistry();
       expect(Object.keys(registry.getTools()).sort()).toHaveLength(12);
       expect(registry.getTools()).not.toHaveProperty('getShippingQuote');
+      expect(stubChatbotApi.getCustomerByPhone).not.toHaveBeenCalled();
     });
 
     it('registers the 13th key when enabled with a handoff row store', async () => {
@@ -428,6 +523,7 @@ describe('RealToolRegistry', () => {
       try {
         const store = storeStub();
         store.get.mockResolvedValue(draftState());
+        stubChatbotApi.getCustomerByPhone.mockResolvedValue(LOOKUP);
         const registry = await buildRegistry(
           new ShippingQuoteOrchestrator({ quote: jest.fn() }),
           configStub,
@@ -439,6 +535,11 @@ describe('RealToolRegistry', () => {
         expect(Object.isFrozen(result)).toBe(true);
         expect(store.get).toHaveBeenCalledTimes(1);
         expect(store.update).not.toHaveBeenCalled();
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledTimes(1);
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledWith(
+          '52',
+          '5551234567',
+        );
       } finally {
         nowSpy.mockRestore();
       }
@@ -455,6 +556,7 @@ describe('RealToolRegistry', () => {
         const create = jest.fn().mockResolvedValue(OK_CREATE);
         const findById = jest.fn().mockResolvedValue(row());
         const quote = jest.fn();
+        stubChatbotApi.getCustomerByPhone.mockResolvedValue(LOOKUP);
         const registry = await buildRegistry(
           new ShippingQuoteOrchestrator({ quote }),
           configStub,
@@ -477,7 +579,11 @@ describe('RealToolRegistry', () => {
         expect(store.get).toHaveBeenCalledTimes(3);
         expect(store.update).not.toHaveBeenCalled();
         expect(quote).not.toHaveBeenCalled();
-        expect(stubChatbotApi.getCustomerByPhone).not.toHaveBeenCalled();
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledTimes(1);
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledWith(
+          '52',
+          '5551234567',
+        );
       } finally {
         nowSpy.mockRestore();
       }
@@ -492,6 +598,7 @@ describe('RealToolRegistry', () => {
         const findById = jest
           .fn()
           .mockResolvedValue(row({ kind: 'needs_human_review' }));
+        stubChatbotApi.getCustomerByPhone.mockResolvedValue(LOOKUP);
         const registry = await buildRegistry(
           new ShippingQuoteOrchestrator({ quote: jest.fn() }),
           configStub,
@@ -506,6 +613,11 @@ describe('RealToolRegistry', () => {
         expect(Object.isFrozen(result)).toBe(true);
         expect(create).toHaveBeenCalledTimes(1);
         expect(findById).toHaveBeenCalledTimes(1);
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledTimes(1);
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledWith(
+          '52',
+          '5551234567',
+        );
         const wire = JSON.stringify(result);
         for (const leaked of [REF, '900', '12000', 'Carrier', 'Service']) {
           expect(wire).not.toContain(leaked);
@@ -524,6 +636,7 @@ describe('RealToolRegistry', () => {
           .mockResolvedValueOnce(draftState())
           .mockResolvedValueOnce(pendingState(collisionId));
         const create = jest.fn();
+        stubChatbotApi.getCustomerByPhone.mockResolvedValue(LOOKUP);
         const registry = await buildRegistry(
           new ShippingQuoteOrchestrator({ quote: jest.fn() }),
           configStub,
@@ -537,6 +650,11 @@ describe('RealToolRegistry', () => {
         expect(result).toEqual(FROZEN_HANDOFF);
         expect(Object.isFrozen(result)).toBe(true);
         expect(create).not.toHaveBeenCalled();
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledTimes(1);
+        expect(stubChatbotApi.getCustomerByPhone).toHaveBeenCalledWith(
+          '52',
+          '5551234567',
+        );
         const wire = JSON.stringify(result);
         for (const leaked of [
           `HF-${collisionId}`,
