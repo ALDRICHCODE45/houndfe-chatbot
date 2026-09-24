@@ -14,6 +14,7 @@ import {
   type ShippingSaleChargedVerdict,
 } from '../shipping-sale-revalidation';
 import { resolveShippingSaleDestination } from '../shipping-sale-destination';
+import { bindShippingPromoReQuote } from '../shipping-promo-requote';
 
 /** Finite, price-free fail-closed envelope shared by every guarded branch. */
 const SHIPPING_UNPERSISTABLE = Object.freeze({
@@ -51,21 +52,29 @@ const readClock = (now: () => number): number => {
  *      - First attempt: mint + persist on cart.
  *      - Retry within the session: reuse the persisted key.
  *      - Success: clear the cart (items + key + expectedTotalCents).
- *      - PROMO_RE_QUOTE: clear the key (payload changed) AND replace
- *        `expectedTotalCents` with the backend's `recomputedTotalCents`
- *        so the next customer-acceptance call (a fresh UUID + the
- *        recomputed total on the wire) cannot loop on the stale total.
- *        Items are preserved. When the PROMO_RE_QUOTE body is malformed
- *        (any of `recomputedTotalCents`, `expectedTotalCents`, or
- *        `discountCents` is missing or not a non-negative integer — the
- *        same shape `mapChatbotError`'s `readPromoPayload` validates)
- *        the cart does NOT adopt a fabricated value — items + prior
- *        `expectedTotalCents` stay intact, only the key is cleared
- *        (R-D2 / ADR-5: never invent totals). The durable replacement
- *        happens ONLY when the SAME mapped result returned to the
- *        caller is `{error.kind:'promoReQuote', ...}` from the canonical
- *        parser — state mutation and returned envelope can never
- *        disagree.
+ *      - PROMO_RE_QUOTE (ordinary, no shipping marker): clear the key
+ *        (payload changed) AND replace `expectedTotalCents` with the
+ *        backend's `recomputedTotalCents` so the next customer-acceptance
+ *        call (a fresh UUID + the recomputed total on the wire) cannot
+ *        loop on the stale total. Items are preserved. When the
+ *        PROMO_RE_QUOTE body is malformed (any of `recomputedTotalCents`,
+ *        `expectedTotalCents`, or `discountCents` is missing or not a
+ *        non-negative integer — the same shape `mapChatbotError`'s
+ *        `readPromoPayload` validates) the cart does NOT adopt a
+ *        fabricated value — items + prior `expectedTotalCents` stay
+ *        intact, only the key is cleared (R-D2 / ADR-5: never invent
+ *        totals). The durable replacement happens ONLY when the SAME
+ *        mapped result returned to the caller is
+ *        `{error.kind:'promoReQuote', ...}` from the canonical parser —
+ *        state mutation and returned envelope can never disagree.
+ *      - PROMO_RE_QUOTE (charged sale): `bindShippingPromoReQuote(result,
+ *        err.responseBody, charged)` must agree (mapped + raw + pinned)
+ *        before persisting. Only a `merchandise_remainder` writes
+ *        `expectedTotalCents = recomputedTotalCents - freight` (freight
+ *        subtracted once), clears the key, and returns the canonical
+ *        `promoReQuote` for fresh customer acceptance; a `blocked` binding
+ *        clears only the key, preserves prior merchandise, and returns
+ *        price-free `shippingUnpersistable`.
  *      - IDEMPOTENCY_KEY_CONFLICT: clear the key (the key is poisoned);
  *        preserve items + the current `expectedTotalCents` (the conflict
  *        is unrelated to the total).
@@ -280,12 +289,11 @@ export function makeCreateSaleTool(
         // drive BOTH the cart mutation AND the returned envelope from
         // the SAME result. State mutation and envelope MUST agree: a
         // durable `expectedTotalCents` replacement only happens when the
-        // mapper accepted the payload and returned a `promoReQuote`
-        // envelope. For every other error kind (including a malformed
-        // PROMO_RE_QUOTE body the mapper rejects) we never invent a
-        // total — items + prior `expectedTotalCents` stay intact and
-        // only the `idempotencyKey` is cleared when the key is unsafe
-        // to reuse (R-D2 / ADR-5).
+        // canonical payload was accepted (an ordinary `promoReQuote`
+        // envelope, or the charged freight binding below). For every
+        // other error kind we never invent a total — items + prior
+        // `expectedTotalCents` stay intact and only the `idempotencyKey`
+        // is cleared when the key is unsafe to reuse (R-D2 / ADR-5).
         //
         // The mapper rethrows non-ChatbotApiError; assigning its result
         // never completes in that case, so the cart-switch below is
@@ -295,9 +303,24 @@ export function makeCreateSaleTool(
           switch (err.errorCode) {
             case 'PROMO_RE_QUOTE':
               if (charged !== null) {
-                // E4-2a interim: the recomputed total already includes freight;
-                // preserve the pinned total and fail closed (E4-2b owns the
-                // merchandise remainder).
+                // E4-2b2: the recomputed total already includes the pinned
+                // freight. Bind the canonical result, raw body, and
+                // server-owned pin; only agreement persists the merchandise
+                // remainder. A blocked binding clears the key but preserves
+                // the prior merchandise total.
+                const binding = bindShippingPromoReQuote(
+                  result,
+                  err.responseBody,
+                  charged,
+                );
+                if (binding.kind === 'merchandise_remainder') {
+                  await persistCart(deps.store, senderId, state, {
+                    ...cart,
+                    idempotencyKey: '',
+                    expectedTotalCents: binding.merchandiseTotalCents,
+                  });
+                  return result;
+                }
                 await persistCart(deps.store, senderId, state, {
                   ...cart,
                   idempotencyKey: '',
