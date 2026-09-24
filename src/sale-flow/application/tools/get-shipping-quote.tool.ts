@@ -24,7 +24,7 @@ import type { MeasuredDemoShippingConfig } from '../../../shipping/application/m
 // prettier-ignore
 import { matchMeasuredDemoParcelProfile, type MeasuredDemoPreparedInput } from '../../../shipping/application/measured-demo-parcel-profile';
 // prettier-ignore
-import { persistShippingQuoteDraft, readShippingQuoteDraft } from '../../../shipping/application/shipping-quote-draft-persistence';
+import { persistShippingQuoteDraftWithContext, readShippingQuoteDraftContext } from '../../../shipping/application/shipping-quote-draft-persistence';
 import type { ShippingApprovalRequestResult } from '../../../shipping/application/shipping-approval-request';
 import type { ShippingQuoteOrchestrator } from '../../../shipping/application/shipping-quote-orchestrator';
 import { isShippingQuoteAddress } from '../../../shipping/domain/shipping-quote.request';
@@ -65,16 +65,22 @@ function readClock(now: () => number): number | null { try { const value: unknow
 // prettier-ignore
 interface ShippingDestination { readonly zipCode: string; readonly state: string; readonly municipality: string; readonly neighborhood: string; }
 // prettier-ignore
-type DestinationRead = { readonly kind: 'ok'; readonly destination: ShippingDestination } | { readonly kind: 'invalid' } | { readonly kind: 'hostile' };
+type DestinationRead = { readonly kind: 'ok'; readonly customerId: string; readonly shippingAddressId: string; readonly destination: ShippingDestination } | { readonly kind: 'invalid' } | { readonly kind: 'hostile' };
+// prettier-ignore
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/i;
+// prettier-ignore
+const canonicalUuid = (value: unknown): string | null => typeof value === 'string' && UUID.test(value) ? value.toLowerCase() : null;
 
 /**
- * Reads only the four safe destination fields from the stored customer
- * address. Street, names, phone, references, carrier phone, and every other
- * address field are never copied or passed on; a hostile/throwing response is
- * classified separately so the caller can hand off instead of inventing data.
+ * Reads only the four safe destination fields plus the canonical customer and
+ * address UUIDs from the stored customer address. Street, names, phone,
+ * references, carrier phone, and every other address field are never copied or
+ * passed on; a missing/invalid UUID is `invalid` (finite address_unavailable)
+ * and a hostile/throwing response is classified separately so the caller can
+ * hand off instead of inventing data.
  */
 // prettier-ignore
-function readDestination(lookup: unknown): DestinationRead { if (!isPlainRecord(lookup)) return { kind: 'hostile' }; try { if (lookup.found !== true) return { kind: 'invalid' }; const customer: unknown = lookup.customer; if (!isPlainRecord(customer)) return { kind: 'invalid' }; const address: unknown = customer.address; if (!isPlainRecord(address)) return { kind: 'invalid' }; const zipCode: unknown = address.zipCode, state: unknown = address.state, municipality: unknown = address.municipality, neighborhood: unknown = address.neighborhood; if (typeof zipCode !== 'string' || typeof state !== 'string' || typeof municipality !== 'string' || typeof neighborhood !== 'string') return { kind: 'invalid' }; const candidate = Object.freeze({ countryCode: 'MX', postalCode: zipCode, state, municipality, neighborhood }); if (!isShippingQuoteAddress(candidate)) return { kind: 'invalid' }; return { kind: 'ok', destination: Object.freeze({ zipCode, state, municipality, neighborhood }) }; } catch { return { kind: 'hostile' }; } }
+function readDestination(lookup: unknown): DestinationRead { if (!isPlainRecord(lookup)) return { kind: 'hostile' }; try { if (lookup.found !== true) return { kind: 'invalid' }; const customer: unknown = lookup.customer; if (!isPlainRecord(customer)) return { kind: 'invalid' }; const address: unknown = customer.address; if (!isPlainRecord(address)) return { kind: 'invalid' }; const customerId = canonicalUuid(customer.customerId); const shippingAddressId = canonicalUuid(address.id); if (customerId === null || shippingAddressId === null) return { kind: 'invalid' }; const zipCode: unknown = address.zipCode, state: unknown = address.state, municipality: unknown = address.municipality, neighborhood: unknown = address.neighborhood; if (typeof zipCode !== 'string' || typeof state !== 'string' || typeof municipality !== 'string' || typeof neighborhood !== 'string') return { kind: 'invalid' }; const candidate = Object.freeze({ countryCode: 'MX', postalCode: zipCode, state, municipality, neighborhood }); if (!isShippingQuoteAddress(candidate)) return { kind: 'invalid' }; return { kind: 'ok', customerId, shippingAddressId, destination: Object.freeze({ zipCode, state, municipality, neighborhood }) }; } catch { return { kind: 'hostile' }; } }
 
 /**
  * Accepts only an exact approval success: a plain object whose sole own key is
@@ -137,7 +143,7 @@ export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
       const senderId = options.context.senderId;
       let state: ConversationState | null;
       try { state = await deps.store.get(senderId); } catch { return handoff('state_failure'); }
-      if (readShippingQuoteDraft(state, nowMs) !== null) return (await requestApproval(deps, senderId)) ? REUSED : handoff('approval_unavailable');
+      if (readShippingQuoteDraftContext(state, nowMs) !== null) return (await requestApproval(deps, senderId)) ? REUSED : handoff('approval_unavailable');
       const phone = parseMexicanWhatsAppPhone(senderId);
       if (phone === null) return unavailable('unsupported_sender');
       let prepared: MeasuredDemoPreparedInput | null;
@@ -156,8 +162,9 @@ export function makeGetShippingQuoteTool(deps: GetShippingQuoteToolDeps) {
       if (kind === 'unavailable') return unavailable('quote_unavailable');
       if (kind !== 'draft') return handoff('quote_review_required');
       let stored: unknown;
+      const quoteContext = Object.freeze({ customerId: destinationRead.customerId, shippingAddressId: destinationRead.shippingAddressId, destination: destinationRead.destination, cart: Object.freeze(prepared.items.map((item) => Object.freeze({ productId: item.productId, variantId: item.variantId, quantity: item.quantity, unitPriceCents: item.unitPriceCents }))) });
       // SAFETY: the persistence boundary only uses `get`/`update`; the injected narrow store satisfies the full ConversationStore at runtime.
-      try { stored = await persistShippingQuoteDraft(deps.store as ConversationStore, senderId, state, outcome.draft, nowMs); } catch { return handoff('persistence_failure'); }
+      try { stored = await persistShippingQuoteDraftWithContext(deps.store as ConversationStore, senderId, state, outcome.draft, quoteContext, nowMs); } catch { return handoff('persistence_failure'); }
       return stored === null ? handoff('persistence_failure') : (await requestApproval(deps, senderId)) ? QUOTED : handoff('approval_unavailable');
     },
   });

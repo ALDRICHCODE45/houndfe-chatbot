@@ -8,6 +8,8 @@ import type { ShippingQuoteDraft } from '../../../shipping/application/shipping-
 // prettier-ignore
 import { buildShippingQuoteDraftRecord, SHIPPING_QUOTE_DRAFT_KEY as KEY } from '../../../shipping/application/shipping-quote-draft-record';
 // prettier-ignore
+import { buildShippingQuoteDraftContext, SHIPPING_QUOTE_DRAFT_CONTEXT_KEY as CONTEXT_KEY } from '../../../shipping/application/shipping-quote-draft-context';
+// prettier-ignore
 import { makeGetShippingQuoteTool, type GetShippingQuoteToolDeps, type GetShippingQuoteToolResult } from './get-shipping-quote.tool';
 
 /** SQ-5B2B2 core: server-owned inputs, finite non-price results, exact ordering, strict schema. Mocks only; axios blocked. */
@@ -15,6 +17,8 @@ const SENDER = '525551234567',
   ISO = '2026-06-23T12:00:00.000Z',
   MS = Date.parse(ISO);
 const P = '11111111-1111-1111-1111-111111111111';
+const CID = '22222222-2222-2222-2222-222222222222';
+const AID = '33333333-3333-3333-3333-333333333333';
 const M = { weightGrams: 500, lengthCm: 10, widthCm: 20, heightCm: 30 };
 // prettier-ignore
 const ORIGIN = { postalCode: '06000', state: 'CDMX', municipality: 'Cuauhtémoc', neighborhood: 'Centro' };
@@ -23,9 +27,11 @@ const CONFIG: MeasuredDemoShippingConfig = { profile: { version: 1, items: [{ pr
 // prettier-ignore
 const LINE = { productId: P, variantId: null, quantity: 1, unitPriceCents: 1500 };
 // prettier-ignore
-const DEST = { id: 'a', label: null, street: 'Calle Falsa 123', exteriorNumber: '1', interiorNumber: null, zipCode: '06700', neighborhood: 'Roma', municipality: 'Cuauhtémoc', state: 'CDMX', visualReferences: 'portón azul', carrierPhone: '5512340000' };
+const QDEST = { zipCode: '06700', state: 'CDMX', municipality: 'Cuauhtémoc', neighborhood: 'Roma' };
 // prettier-ignore
-const LOOKUP = { found: true, customer: { customerId: 'c', firstName: 'Ana', lastName: null, phoneCountryCode: '52', phone: '5551234567', preferredPaymentMethod: null, address: DEST } };
+const DEST = { id: AID, label: null, street: 'Calle Falsa 123', exteriorNumber: '1', interiorNumber: null, zipCode: '06700', neighborhood: 'Roma', municipality: 'Cuauhtémoc', state: 'CDMX', visualReferences: 'portón azul', carrierPhone: '5512340000' };
+// prettier-ignore
+const LOOKUP = { found: true, customer: { customerId: CID, firstName: 'Ana', lastName: null, phoneCountryCode: '52', phone: '5551234567', preferredPaymentMethod: null, address: DEST } };
 // prettier-ignore
 const DRAFT: ShippingQuoteDraft = { quoteId: 'q1', selectedRate: { rateId: 'r1', carrierName: 'Carrier', serviceName: 'Service', priceCents: 12900, currency: 'MXN', estimatedDeliveryDays: 2, validUntil: null }, providerExpiresAt: null, bestRateCents: 12900, totalCreditCents: 12000, appliedCreditCents: 12000, unusedCreditCents: 0, qualifyingUnitCount: 1, customerPaysCents: 900 };
 // prettier-ignore
@@ -33,7 +39,20 @@ const stateOf = (data: Record<string, unknown>): ConversationState => ({ senderI
 // prettier-ignore
 const cartState = (): ConversationState => stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' } });
 // prettier-ignore
-const freshDraft = (): ConversationState => stateOf({ [KEY]: buildShippingQuoteDraftRecord(DRAFT, MS)! });
+const legacyDraft = (): ConversationState => stateOf({ cart: { items: [{ ...LINE }], idempotencyKey: '' }, [KEY]: buildShippingQuoteDraftRecord(DRAFT, MS)! });
+const freshDraft = (): ConversationState => {
+  const record = buildShippingQuoteDraftRecord(DRAFT, MS)!;
+  const context = buildShippingQuoteDraftContext(
+    {
+      customerId: CID,
+      shippingAddressId: AID,
+      destination: QDEST,
+      cart: [{ ...LINE }],
+    },
+    record.createdAt,
+  )!;
+  return stateOf({ [KEY]: record, [CONTEXT_KEY]: context });
+};
 // prettier-ignore
 const withAddress = (address: unknown): unknown => ({ ...LOOKUP, customer: { ...LOOKUP.customer, address } });
 
@@ -100,6 +119,20 @@ describe('makeGetShippingQuoteTool', () => {
     expect(patch.lastMessageAt).toBe(ISO);
     expect(patch.data.cart).toEqual({ items: [{ ...LINE }], idempotencyKey: '' });
     expect(patch.data[KEY]).toBeDefined();
+    const context = patch.data[CONTEXT_KEY] as Record<string, unknown>;
+    expect(context.customerId).toBe(CID);
+    expect(context.shippingAddressId).toBe(AID);
+    expect(context.destination).toEqual(QDEST);
+    expect(context.cart).toEqual([{ ...LINE }]);
+  });
+
+  // prettier-ignore
+  it('legacy fresh draft without context falls through to a new quote', async () => {
+    const m = setup({ state: legacyDraft() });
+    expect(await run(m.tool)).toEqual({ ok: true, status: 'quoted' });
+    expect(m.getCustomerByPhone).toHaveBeenCalledTimes(1);
+    expect(m.quote).toHaveBeenCalledTimes(1);
+    expect(m.update).toHaveBeenCalledTimes(1);
   });
 
   // prettier-ignore
@@ -189,6 +222,9 @@ describe('makeGetShippingQuoteTool', () => {
   it.each<[string, unknown]>([
     ['not found', { found: false, customer: null }],
     ['null customer', { found: true, customer: null }],
+    ['missing customer id', { ...LOOKUP, customer: { ...LOOKUP.customer, customerId: 'nope' } }],
+    ['missing address id', withAddress({ ...DEST, id: null })],
+    ['invalid address id', withAddress({ ...DEST, id: 'x' })],
     ['null address', withAddress(null)],
     ['missing zip', withAddress({ ...DEST, zipCode: null })],
     ['empty zip', withAddress({ ...DEST, zipCode: '' })],
