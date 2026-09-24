@@ -4,7 +4,10 @@ import {
   readPendingHumanRequest,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import type { AgentMessage } from '../../conversation/domain/conversation-store';
+import type {
+  AgentMessage,
+  ConversationStateData,
+} from '../../conversation/domain/conversation-store';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import {
   ReceiptIngressService,
@@ -32,9 +35,11 @@ import { prepareShippingCustomerDisclosure } from '../../shipping/application/sh
 import { persistSentShippingCustomerOffer } from '../../shipping/application/shipping-customer-offer-persistence';
 import {
   normalizeShippingCustomerOffer,
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
   SHIPPING_CUSTOMER_OFFER_KEY,
   type ShippingCustomerOffer,
 } from '../../shipping/application/shipping-customer-acceptance';
+import { evaluateShippingSaleRevalidation } from '../../sale-flow/application/shipping-sale-revalidation';
 
 /**
  * WebhookDispatcherService (agent + human-handoff router)
@@ -349,7 +354,8 @@ export class WebhookDispatcherService {
     );
     if (
       existing !== null &&
-      isActiveMatchingShippingOffer(existing, prepared.offer, nowMs)
+      isActiveMatchingShippingOffer(existing, prepared.offer, nowMs) &&
+      isAcceptanceAbsentOrCharged(state?.data ?? null, nowMs)
     ) {
       this.logger.log(
         `shipping disclosure replay for ${customerId}: re-send skipped`,
@@ -363,6 +369,10 @@ export class WebhookDispatcherService {
     // Remember the confirmed send immediately: even if persistence fails,
     // the outbound id must be filtered as an echo.
     this.recentOutbound.remember(providerMessageId);
+    // SCA-3b3: the clock can advance while `sendText` is in flight. Sample it
+    // AFTER the confirmed send and BEFORE persistence so an offer that expires
+    // mid-send fails closed with no marker write and no `markSeen`.
+    const persistNowMs = Date.now();
     const freshState = await this.conversationStore.get(customerId);
     const offer = { ...prepared.offer, providerMessageId };
     const persisted = await persistSentShippingCustomerOffer(
@@ -370,7 +380,7 @@ export class WebhookDispatcherService {
       customerId,
       freshState,
       offer,
-      nowMs,
+      persistNowMs,
     );
     if (persisted === null) {
       throw new Error('shipping disclosure persistence failed');
@@ -395,6 +405,21 @@ function isActiveMatchingShippingOffer(
     Date.parse(existing.offeredAt) <= nowMs &&
     nowMs < Date.parse(existing.expiresAt)
   );
+}
+
+// SCA-3b3: an active matching offer is only a replay candidate when no
+// acceptance is stored yet OR the stored acceptance is fully valid for this
+// exact offer at the current clock and cart (the SCA-2 revalidation's
+// `charged` verdict). Malformed, orphan or future acceptances fail closed to
+// re-disclosure, and the persistence then clears the prior acceptance.
+function isAcceptanceAbsentOrCharged(
+  data: ConversationStateData | null,
+  nowMs: number,
+): boolean {
+  if (data === null) return true;
+  const rawAcceptance = data[SHIPPING_CUSTOMER_ACCEPTANCE_KEY];
+  if (rawAcceptance === null || rawAcceptance === undefined) return true;
+  return evaluateShippingSaleRevalidation(data, nowMs).kind === 'charged';
 }
 
 // ── WU13-A2: normalizeInboundMessages media helper ───────────────────────

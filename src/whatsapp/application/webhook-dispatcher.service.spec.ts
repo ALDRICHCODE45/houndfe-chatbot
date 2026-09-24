@@ -35,6 +35,7 @@ import {
   SHIPPING_CUSTOMER_OFFER_KEY,
 } from '../../shipping/application/shipping-customer-acceptance';
 import {
+  shippingAcceptancePair,
   shippingCustomerAcceptance,
   shippingCustomerOffer,
 } from '../../../test/fixtures/shipping-customer-acceptance-fixture';
@@ -1036,6 +1037,124 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         providerMessageId: 'wamid.reprice',
       });
       expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+    });
+
+    // ─── SCA-3b3: replay fencing + post-send clock ─────────────────────────
+    describe('SCA-3b3: replay fence and post-send clock', () => {
+      it('re-discloses when the persisted acceptance is malformed, clearing it', async () => {
+        conversationStore.get.mockResolvedValue(
+          state({
+            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: { schemaVersion: 1 },
+          }),
+        );
+        sender.sendText.mockResolvedValue({
+          providerMessageId: 'wamid.reaccept',
+        });
+
+        await service.dispatch(opsEvent());
+
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        const [, patch] = conversationStore.update.mock.calls[0];
+        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+          chargeCents: CHARGE,
+          providerMessageId: 'wamid.reaccept',
+        });
+        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+        expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reaccept');
+      });
+
+      it('re-discloses when the persisted acceptance is orphaned from the offer', async () => {
+        conversationStore.get.mockResolvedValue(
+          state({
+            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
+              requestId: 'ffffffffffff',
+            }),
+          }),
+        );
+        sender.sendText.mockResolvedValue({
+          providerMessageId: 'wamid.reaccept',
+        });
+
+        await service.dispatch(opsEvent());
+
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        const [, patch] = conversationStore.update.mock.calls[0];
+        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+          providerMessageId: 'wamid.reaccept',
+        });
+        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+      });
+
+      it('re-discloses when the persisted acceptance is dated in the future', async () => {
+        conversationStore.get.mockResolvedValue(
+          state({
+            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
+              acceptedAt: '2026-06-23T12:20:00.000Z',
+            }),
+          }),
+        );
+        sender.sendText.mockResolvedValue({
+          providerMessageId: 'wamid.reaccept',
+        });
+
+        await service.dispatch(opsEvent());
+
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        const [, patch] = conversationStore.update.mock.calls[0];
+        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+          providerMessageId: 'wamid.reaccept',
+        });
+        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+      });
+
+      it('replay: a fully valid charged acceptance keeps the active offer and skips re-send', async () => {
+        conversationStore.get.mockResolvedValue(
+          state(shippingAcceptancePair()),
+        );
+
+        await service.dispatch(opsEvent());
+
+        expect(sender.sendText).not.toHaveBeenCalled();
+        expect(conversationStore.update).not.toHaveBeenCalled();
+        expect(recentOutbound.remember).not.toHaveBeenCalled();
+        expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
+      });
+
+      it('clock advance during send fails closed: send remembered, no marker write and no markSeen', async () => {
+        conversationStore.get.mockResolvedValue(state());
+        sender.sendText.mockImplementation(async () => {
+          jest.setSystemTime(new Date('2026-06-23T12:31:00.000Z'));
+          return { providerMessageId: 'wamid.late' };
+        });
+
+        await expect(service.dispatch(opsEvent())).rejects.toThrow();
+
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.late');
+        expect(conversationStore.update).not.toHaveBeenCalled();
+        expect(dedup.markSeen).not.toHaveBeenCalled();
+      });
     });
   });
 
