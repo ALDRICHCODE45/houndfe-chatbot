@@ -15,6 +15,7 @@ const MXN_GROUP = /\B(?=(\d{3})+(?!\d))/g;
 const DECISION = /^(?:si|sí|no)\.?$/i;
 const OUTER_SPACING = /^[ \t]+|[ \t]+$/g;
 const NEWLINES = /[\r\n]/;
+const INT32_MAX_CENTS = 2_147_483_647;
 
 /** Format nonnegative integer cents as `$#,###.## MXN` without locale APIs. */
 function formatMxnCents(cents: number): string {
@@ -22,6 +23,54 @@ function formatMxnCents(cents: number): string {
   const decimals = cents % 100;
   const grouped = String(whole).replace(MXN_GROUP, ',');
   return `$${grouped}.${String(decimals).padStart(2, '0')} MXN`;
+}
+
+/** Same fail-closed amount contract as the committed SCA-1a1 offer. */
+function normalizeAmounts(
+  merchandise: unknown,
+  charge: unknown,
+  total: unknown,
+): readonly [number, number, number] | null {
+  const isCents = (value: unknown, min: number): value is number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
+  if (!isCents(merchandise, 0) || !isCents(charge, 1) || !isCents(total, 1)) {
+    return null;
+  }
+  if (total !== merchandise + charge || total > INT32_MAX_CENTS) return null;
+  return [merchandise, charge, total];
+}
+
+/**
+ * Deterministic disclosure for amounts already owned by a server-side caller.
+ * Exposed so a pre-send preparation can render the price WITHOUT inventing a
+ * provider message id or normalizing a fabricated marker; malformed values
+ * fail closed.
+ */
+export function renderShippingCustomerAmounts(
+  merchandiseCents: unknown,
+  chargeCents: unknown,
+  expectedTotalCents: unknown,
+): string | null {
+  try {
+    const amounts = normalizeAmounts(
+      merchandiseCents,
+      chargeCents,
+      expectedTotalCents,
+    );
+    if (amounts === null) return null;
+    return [
+      'Detalle de tu envío (producto medido):',
+      `Mercancía: ${formatMxnCents(amounts[0])}`,
+      `Envío: ${formatMxnCents(amounts[1])}`,
+      `Total: ${formatMxnCents(amounts[2])}`,
+      '',
+      'Verificaremos el precio antes de registrar tu pedido. Si cambia, te mostraremos el nuevo total para que lo confirmes otra vez.',
+      '',
+      'Responde exactamente "SÍ" para aceptar o "NO" para rechazar.',
+    ].join('\n');
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -36,16 +85,11 @@ export function renderShippingCustomerOffer(rawOffer: unknown): string | null {
   try {
     const offer = normalizeShippingCustomerOffer(rawOffer);
     if (offer === null) return null;
-    return [
-      'Detalle de tu envío (producto medido):',
-      `Mercancía: ${formatMxnCents(offer.merchandiseCents)}`,
-      `Envío: ${formatMxnCents(offer.chargeCents)}`,
-      `Total: ${formatMxnCents(offer.expectedTotalCents)}`,
-      '',
-      'Verificaremos el precio antes de registrar tu pedido. Si cambia, te mostraremos el nuevo total para que lo confirmes otra vez.',
-      '',
-      'Responde exactamente "SÍ" para aceptar o "NO" para rechazar.',
-    ].join('\n');
+    return renderShippingCustomerAmounts(
+      offer.merchandiseCents,
+      offer.chargeCents,
+      offer.expectedTotalCents,
+    );
   } catch {
     return null;
   }
