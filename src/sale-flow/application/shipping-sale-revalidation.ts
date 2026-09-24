@@ -2,8 +2,10 @@
  * SQ-5E4a pure local shipping-sale snapshot revalidation of ONE already-validated
  * plain JSONB `data` snapshot: `ordinary_free` (no shipping marker), `charged`
  * (fresh draft + pinned context + approved marker on one `draftCreatedAt` pin,
- * cart matching the stored context, charge in 1..int32, merchandise total >= 0,
- * safe positive freight-inclusive total bounded to the backend int32 max), or
+ * an exact matching server-owned offer/acceptance pair with `requestId` bound
+ * to the approval and the offer window containing now, cart matching the stored
+ * context, charge in 1..int32, merchandise total >= 0, safe positive
+ * freight-inclusive total bounded to the backend int32 max), or
  * `blocked` (all else, fail closed).
  * Pure: no I/O, backend lookup, provider, store, or mutation, and never a
  * model-supplied customer/money/address/identity. Point-in-time only: no
@@ -22,6 +24,13 @@ import {
   type ShippingQuoteDraftDestination,
 } from '../../shipping/application/shipping-quote-draft-context';
 import { readShippingQuoteDraft } from '../../shipping/application/shipping-quote-draft-persistence';
+import {
+  matchShippingCustomerAcceptance,
+  normalizeShippingCustomerAcceptance,
+  normalizeShippingCustomerOffer,
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+} from '../../shipping/application/shipping-customer-acceptance';
 import { SHIPPING_QUOTE_DRAFT_KEY } from '../../shipping/application/shipping-quote-draft-record';
 import { readCart } from '../domain/cart-state';
 
@@ -78,12 +87,32 @@ export function evaluateShippingSaleRevalidation(
     const draftValue = data[SHIPPING_QUOTE_DRAFT_KEY];
     const contextValue = data[SHIPPING_QUOTE_DRAFT_CONTEXT_KEY];
     const approvalValue = data[SHIPPING_APPROVAL_KEY];
+    const offerValue = data[SHIPPING_CUSTOMER_OFFER_KEY];
+    const acceptanceValue = data[SHIPPING_CUSTOMER_ACCEPTANCE_KEY];
     const hasDraft = present(draftValue);
     const hasContext = present(contextValue);
     const hasApproval = present(approvalValue);
-    if (!hasDraft && !hasContext && !hasApproval) return ORDINARY_FREE;
+    const hasOffer = present(offerValue);
+    const hasAcceptance = present(acceptanceValue);
+    if (
+      !hasDraft &&
+      !hasContext &&
+      !hasApproval &&
+      !hasOffer &&
+      !hasAcceptance
+    ) {
+      return ORDINARY_FREE;
+    }
     if (present(data.pendingHumanRequest)) return BLOCKED;
-    if (!hasDraft || !hasContext || !hasApproval) return BLOCKED;
+    if (
+      !hasDraft ||
+      !hasContext ||
+      !hasApproval ||
+      !hasOffer ||
+      !hasAcceptance
+    ) {
+      return BLOCKED;
+    }
     const state = { senderId: '', lastMessageAt: '', data };
     const record = readShippingQuoteDraft(state, nowMs);
     if (record === null) return BLOCKED;
@@ -96,6 +125,30 @@ export function evaluateShippingSaleRevalidation(
       return BLOCKED;
     }
     if (marker.draftCreatedAt !== record.createdAt) return BLOCKED;
+    // SCA-2b: the server-owned disclosure/acceptance pair is the only charge
+    // authority. Any orphan, malformed, drifted, or out-of-window pair fails
+    // closed, and no model-supplied field can grant consent.
+    const offer = normalizeShippingCustomerOffer(offerValue);
+    const acceptance = normalizeShippingCustomerAcceptance(acceptanceValue);
+    if (offer === null || acceptance === null) return BLOCKED;
+    if (!matchShippingCustomerAcceptance(offer, acceptance)) return BLOCKED;
+    if (
+      offer.requestId !== marker.requestId ||
+      offer.draftCreatedAt !== record.createdAt
+    ) {
+      return BLOCKED;
+    }
+    const offeredMs = Date.parse(offer.offeredAt);
+    const offerExpiresMs = Date.parse(offer.expiresAt);
+    if (
+      offeredMs < Date.parse(marker.decidedAt) ||
+      offerExpiresMs > Date.parse(record.expiresAt) ||
+      nowMs < offeredMs ||
+      nowMs >= offerExpiresMs ||
+      Date.parse(acceptance.acceptedAt) > nowMs
+    ) {
+      return BLOCKED;
+    }
     const chargeCents = record.draft.customerPaysCents;
     if (!safeCents(chargeCents, 1) || chargeCents > INT32_MAX_CENTS) {
       return BLOCKED;
@@ -126,6 +179,10 @@ export function evaluateShippingSaleRevalidation(
     }
     const merchandiseTotalCents = cart.expectedTotalCents;
     if (!safeCents(merchandiseTotalCents, 0)) return BLOCKED;
+    // The disclosed pair must price the exact current server cart and pinned
+    // freight; the acceptance is already bound to the offer amounts above.
+    if (offer.merchandiseCents !== merchandiseTotalCents) return BLOCKED;
+    if (offer.chargeCents !== chargeCents) return BLOCKED;
     const expectedTotalCents = merchandiseTotalCents + chargeCents;
     // The final backend `confirmBotSale` rejects a freight-inclusive total
     // above signed int32, so block it here before key mint/store/HTTP.

@@ -1,8 +1,14 @@
 import type { ConversationStateData } from '../../conversation/domain/conversation-store';
 import {
   shippingAcceptancePair,
+  shippingCustomerAcceptance,
+  shippingCustomerOffer,
   type ShippingAcceptanceOverrides,
 } from '../../../test/fixtures/shipping-customer-acceptance-fixture';
+import {
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+} from '../../shipping/application/shipping-customer-acceptance';
 import { evaluateShippingSaleRevalidation } from './shipping-sale-revalidation';
 
 // SQ-5E4a fail-closed revalidation of one already-validated plain JSONB snapshot.
@@ -195,6 +201,82 @@ const blockedCases: Array<[string, ConversationStateData]> = [
   ],
   ['bad draft', withDraft({ draft: { appliedCreditCents: 1 } })],
   ['non-canonical draft', withDraft({ createdAt: '2026-06-23T12:00:00Z' })],
+  // SCA-2b: a shipping snapshot is never `ordinary_free` once a lone customer
+  // offer/acceptance marker exists, and an approved draft carries no charge
+  // authority without the exact matching pair.
+  [
+    'a lone customer offer marker',
+    {
+      [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+      cart: baseCart(),
+    },
+  ],
+  [
+    'a lone customer acceptance marker',
+    {
+      [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance(),
+      cart: baseCart(),
+    },
+  ],
+  ['approved draft with no customer pair', data()],
+  [
+    'customer offer without acceptance',
+    data({ [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer() }),
+  ],
+  [
+    'customer acceptance without offer',
+    data({
+      [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance(),
+    }),
+  ],
+  [
+    'pair merchandise drift from cart',
+    accepted(data(), { merchandiseCents: 59000 }),
+  ],
+  ['pair charge drift from draft', accepted(data(), { chargeCents: 7000 })],
+  [
+    'pair request drift from approval',
+    accepted(data(), { requestId: 'deadbeef0000' }),
+  ],
+  [
+    'pair draft pin drift',
+    accepted(data(), { draftCreatedAt: '2026-06-23T11:59:00.000Z' }),
+  ],
+  [
+    'pair offered before the approval',
+    accepted(data(), {
+      offeredAt: '2026-06-23T12:04:00.000Z',
+      acceptedAt: '2026-06-23T12:04:30.000Z',
+    }),
+  ],
+  [
+    'pair offer already expired at now',
+    accepted(data(), { expiresAt: '2026-06-23T12:08:00.000Z' }),
+  ],
+  [
+    'pair offer in the future',
+    accepted(data(), {
+      offeredAt: '2026-06-23T12:20:00.000Z',
+      acceptedAt: '2026-06-23T12:21:00.000Z',
+    }),
+  ],
+  [
+    'pair offer beyond the draft window',
+    accepted(data(), { expiresAt: '2026-06-23T12:45:00.000Z' }),
+  ],
+  [
+    'pair acceptance in the future',
+    accepted(data(), { acceptedAt: '2026-06-23T12:20:00.000Z' }),
+  ],
+  [
+    'acceptance amounts drifting from the offer',
+    data({
+      [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+      [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
+        merchandiseCents: 59000,
+      }),
+    }),
+  ],
 ];
 
 describe('evaluateShippingSaleRevalidation', () => {

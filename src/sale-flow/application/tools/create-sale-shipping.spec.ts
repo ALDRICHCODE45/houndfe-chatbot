@@ -215,17 +215,58 @@ describe('makeCreateSaleTool shipping charge (SQ-5E4 E4-2a)', () => {
 
   it.each<[string, ConversationStateData, Options?]>([
     ['an invalid approval', bag({ [SHIPPING_APPROVAL_KEY]: null }), {}],
-    ['a rejected approval', bag({}, draftRecord(), 'SHIPPING_REJECTED'), {}],
-    ['an expired draft', bag({}, expired()), {}],
-    ['a zero charge', bag({}, zeroCharge()), {}],
+    [
+      'a rejected approval',
+      bag(shippingAcceptancePair(), draftRecord(), 'SHIPPING_REJECTED'),
+      {},
+    ],
+    ['an expired draft', bag(shippingAcceptancePair(), expired()), {}],
+    ['a zero charge', bag(shippingAcceptancePair(), zeroCharge()), {}],
     ['a pending handoff', bag({ pendingHumanRequest: PENDING }), {}],
-    ['model customer drift', bag(), { input: { customerId: OTHER } }],
-    ['model address drift', bag(), { input: { shippingAddressId: OTHER } }],
-    ['a hostile clock', bag(), { clock: boom }],
-    ['destination drift', bag(), { lookup: () => lookup('06701') }],
+    [
+      'model customer drift',
+      bag(shippingAcceptancePair()),
+      { input: { customerId: OTHER } },
+    ],
+    [
+      'model address drift',
+      bag(shippingAcceptancePair()),
+      { input: { shippingAddressId: OTHER } },
+    ],
+    ['a hostile clock', bag(shippingAcceptancePair()), { clock: boom }],
+    [
+      'destination drift',
+      bag(shippingAcceptancePair()),
+      { lookup: () => lookup('06701') },
+    ],
   ])('fails closed with zero store/sale for %s', async (_l, data, opts) => {
     await expectDenied(data, opts);
   });
+
+  it('fails closed on destination drift after exactly one sender lookup', async () => {
+    const h = setup(bag(shippingAcceptancePair()), {
+      lookup: () => lookup('06701'),
+    });
+    expect(await run(h)).toEqual(DENIED);
+    expect(h.getCustomerByPhone).toHaveBeenCalledTimes(1);
+    expect(h.getCustomerByPhone).toHaveBeenCalledWith('52', PHONE);
+    expect(h.createSale).not.toHaveBeenCalled();
+    expect(h.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['customer drift', { customerId: OTHER }],
+    ['address drift', { shippingAddressId: OTHER }],
+  ] as Array<[string, Partial<SaleInput>]>)(
+    'fails closed on model %s before any destination lookup',
+    async (_label, drift) => {
+      const h = setup(bag(shippingAcceptancePair()));
+      expect(await run(h, input(drift))).toEqual(DENIED);
+      expect(h.getCustomerByPhone).not.toHaveBeenCalled();
+      expect(h.createSale).not.toHaveBeenCalled();
+      expect(h.update).not.toHaveBeenCalled();
+    },
+  );
 
   it('fails closed before lookup/key/store for a pinned total above int32', async () => {
     const h = setup(
@@ -266,9 +307,17 @@ describe('makeCreateSaleTool shipping charge (SQ-5E4 E4-2a)', () => {
       },
       'PROMO_RE_QUOTE',
     );
-    const h = setup(bag({}, draftRecord(), 'SHIPPING_APPROVED', 'pre-key'), {
-      reject: promo,
-    });
+    const h = setup(
+      bag(
+        shippingAcceptancePair(),
+        draftRecord(),
+        'SHIPPING_APPROVED',
+        'pre-key',
+      ),
+      {
+        reject: promo,
+      },
+    );
     const result = await run(h);
     expect(result).toEqual(DENIED);
     expect(h.update).toHaveBeenCalledTimes(1);

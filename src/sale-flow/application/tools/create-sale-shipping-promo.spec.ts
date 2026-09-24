@@ -26,7 +26,14 @@ import {
   NOW_MS,
   draftRecord,
 } from '../../../../test/fixtures/shipping-approval-request-fixture';
-import { shippingAcceptancePair } from '../../../../test/fixtures/shipping-customer-acceptance-fixture';
+import {
+  shippingAcceptancePair,
+  type ShippingAcceptanceOverrides,
+} from '../../../../test/fixtures/shipping-customer-acceptance-fixture';
+import {
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+} from '../../../shipping/application/shipping-customer-acceptance';
 
 // E4-2b2: freight-safe promotion retry on a charged (approved-shipping) sale.
 // The backend PROMO_RE_QUOTE recomputed total already includes freight, so the
@@ -42,6 +49,23 @@ const CHARGE = 6_900;
 const SENT_TOTAL = MERCH + CHARGE; // 66_900 freight-inclusive first send
 const RECOMPUTED = 65_000; // 58_100 merchandise + 6_900 freight
 const REMAINDER = RECOMPUTED - CHARGE; // 58_100
+// A genuinely new disclosure/reply must carry a later timeline and fresh
+// bounded message ids; reusing the original pair's 12:06/12:07 defaults (or its
+// provider/inbound ids) would only re-assert the stale pair, not new consent.
+const FRESH_OFFERED_AT = '2026-06-23T12:08:00.000Z';
+const FRESH_ACCEPTED_AT = '2026-06-23T12:09:00.000Z';
+const FRESH_PROVIDER_MESSAGE_ID = 'wamid.HBgLc2NhLW9mZmVyLTI=';
+const FRESH_INBOUND_MESSAGE_ID = 'wamid.HBgLc2NhLXllcy0y';
+const ORIGINAL_PROVIDER_MESSAGE_ID = (
+  shippingAcceptancePair()[SHIPPING_CUSTOMER_OFFER_KEY] as {
+    providerMessageId: string;
+  }
+).providerMessageId;
+const ORIGINAL_INBOUND_MESSAGE_ID = (
+  shippingAcceptancePair()[SHIPPING_CUSTOMER_ACCEPTANCE_KEY] as {
+    inboundMessageId: string;
+  }
+).inboundMessageId;
 const DEST = {
   zipCode: '06700',
   state: 'Ciudad de México',
@@ -161,6 +185,7 @@ function setup(
     createSale,
     getCustomerByPhone,
     update,
+    data: () => current.data ?? {},
     cart: () => current.data?.cart as CartState,
   };
 }
@@ -171,6 +196,47 @@ const run = (h: Harness, modelInput: SaleInput = input()) =>
     messages: [],
     context: { senderId: SENDER },
   });
+// SCA-2b: the deterministic disclosure/router that would persist a fresh
+// server-owned pair after a merchandise change is NOT implemented yet (SCA-3/4
+// own it). The harness simulates that later server write so a charged retry is
+// exercised end to end.
+const writeFreshAcceptancePair = async (
+  h: Harness,
+  over: ShippingAcceptanceOverrides = {},
+) => {
+  await h.update(SENDER, {
+    data: {
+      ...h.data(),
+      ...shippingAcceptancePair({
+        offeredAt: FRESH_OFFERED_AT,
+        acceptedAt: FRESH_ACCEPTED_AT,
+        providerMessageId: FRESH_PROVIDER_MESSAGE_ID,
+        inboundMessageId: FRESH_INBOUND_MESSAGE_ID,
+        ...over,
+      }),
+    },
+  });
+};
+const expectFreshAcceptancePair = (h: Harness) => {
+  const offer = h.data()[SHIPPING_CUSTOMER_OFFER_KEY] as {
+    offeredAt: string;
+    merchandiseCents: number;
+    providerMessageId: string;
+  };
+  const acceptance = h.data()[SHIPPING_CUSTOMER_ACCEPTANCE_KEY] as {
+    acceptedAt: string;
+    merchandiseCents: number;
+    inboundMessageId: string;
+  };
+  expect(offer.offeredAt).toBe(FRESH_OFFERED_AT);
+  expect(acceptance.acceptedAt).toBe(FRESH_ACCEPTED_AT);
+  expect(offer.providerMessageId).toBe(FRESH_PROVIDER_MESSAGE_ID);
+  expect(acceptance.inboundMessageId).toBe(FRESH_INBOUND_MESSAGE_ID);
+  expect(offer.providerMessageId).not.toBe(ORIGINAL_PROVIDER_MESSAGE_ID);
+  expect(acceptance.inboundMessageId).not.toBe(ORIGINAL_INBOUND_MESSAGE_ID);
+  expect(offer.merchandiseCents).toBe(REMAINDER);
+  expect(acceptance.merchandiseCents).toBe(REMAINDER);
+};
 const renderedPromo = {
   ok: false,
   error: {
@@ -199,6 +265,11 @@ describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
       expectedTotalCents: REMAINDER,
     });
 
+    // The changed merchandise invalidates the original 60_000 disclosure;
+    // simulate the not-yet-implemented router writing a fresh 58_100 pair.
+    await writeFreshAcceptancePair(h, { merchandiseCents: REMAINDER });
+    expectFreshAcceptancePair(h);
+
     const second = await run(h);
     expect(second).toEqual({ ok: true, ...SALE, totalCents: RECOMPUTED });
     expect(h.createSale).toHaveBeenCalledTimes(2);
@@ -219,6 +290,33 @@ describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
     expect(h.getCustomerByPhone).toHaveBeenCalledTimes(2);
     expect(h.getCustomerByPhone).toHaveBeenNthCalledWith(1, '52', PHONE);
     expect(h.getCustomerByPhone).toHaveBeenNthCalledWith(2, '52', PHONE);
+  });
+
+  it('blocks the retry on the stale pair before lookup/key/store/HTTP', async () => {
+    const h = setup(chargedBag('first-key', shippingAcceptancePair()), [
+      promoErr(),
+      { ...SALE, totalCents: RECOMPUTED },
+    ]);
+    const first = await run(h);
+    expect(first).toEqual(renderedPromo);
+    expect(h.cart()).toEqual({
+      items: [LINE],
+      idempotencyKey: '',
+      expectedTotalCents: REMAINDER,
+    });
+
+    // The original 60_000 disclosure no longer matches the 58_100 remainder,
+    // so the second call is denied before any lookup, key mint, or HTTP.
+    const second = await run(h);
+    expect(second).toEqual(DENIED);
+    expect(h.getCustomerByPhone).toHaveBeenCalledTimes(1);
+    expect(h.createSale).toHaveBeenCalledTimes(1);
+    expect(h.update).toHaveBeenCalledTimes(1);
+    expect(h.cart()).toEqual({
+      items: [LINE],
+      idempotencyKey: '',
+      expectedTotalCents: REMAINDER,
+    });
   });
 
   it('allows a zero merchandise remainder when freight is the whole total', async () => {
@@ -269,7 +367,9 @@ describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
   it.each(blockedBodies)(
     'fails price-free and cannot persist the recomputed total on %s',
     async (_label, body) => {
-      const h = setup(chargedBag('first-key'), [promoErr(body)]);
+      const h = setup(chargedBag('first-key', shippingAcceptancePair()), [
+        promoErr(body),
+      ]);
       const result = await run(h);
       expect(result).toEqual(DENIED);
       expect(JSON.stringify(result)).not.toContain(String(RECOMPUTED));
@@ -294,11 +394,20 @@ describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
     expect(h.cart().expectedTotalCents).toBe(REMAINDER);
     expect(h.cart().idempotencyKey).toBe('');
 
+    // The gate re-reads the current cart, so the retry needs a fresh matching
+    // pair (not-yet-implemented router simulation) to reach the address lookup;
+    // otherwise the denial would come from the stale pair and prove nothing
+    // about destination drift.
+    await writeFreshAcceptancePair(h, { merchandiseCents: REMAINDER });
+    expectFreshAcceptancePair(h);
+    const writesBeforeRetry = h.update.mock.calls.length;
+
     const second = await run(h);
     expect(second).toEqual(DENIED);
     // The drifted destination is rejected before a fresh key mint or any HTTP.
+    expect(h.getCustomerByPhone).toHaveBeenCalledTimes(2);
     expect(h.createSale).toHaveBeenCalledTimes(1);
-    expect(h.update).toHaveBeenCalledTimes(1);
+    expect(h.update).toHaveBeenCalledTimes(writesBeforeRetry);
     expect(h.cart().expectedTotalCents).toBe(REMAINDER);
     expect(h.cart().idempotencyKey).toBe('');
   });
