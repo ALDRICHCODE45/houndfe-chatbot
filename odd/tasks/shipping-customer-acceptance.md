@@ -12,6 +12,7 @@ Complete the missing post-human-approval customer journey for the **one measured
 - Preserve unrelated untracked `.codegraph/**`, `odd/tasks/receipt-media-stored-worker.md`, and `openspec/changes/receipt-media-ingestion/**`.
 - Strict offline RED→GREEN for new executable behavior; bounded single-writer units of at most 390 complete diff lines each. Independent verification, native review and acknowledgement, then local Conventional Commit per unit. Keep test/docs with behavior and record hashes below.
 - Model text is **not** an acceptance authority. Only a deterministic router observing a later raw inbound customer message can record acceptance. A send failure or uncertain delivery must not authorize acceptance or sale; repeated events fail closed. No cross-store CAS claim.
+- Product decision for `NO` (2026-09-24): cancel the displayed offer, customer acceptance and shipping approval; require a new quote and fresh human approval before another offer. Clearing the old draft/context is necessary to allow re-quote. Do not keep a declined approval reusable.
 
 ## Tasks
 
