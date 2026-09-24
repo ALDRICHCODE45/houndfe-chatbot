@@ -168,6 +168,14 @@ Live activation remains blocked until all are observed:
       - [x] **SQ-7B3b — HTTP response/mock contracts:** `52da28f`, native `review-71227f5524d30969` approved/ack; global uncached spec tsc exits 0, focused 51/51 and full default-off 2,950 passing tests.
     - [ ] **SQ-7B4 — Full closure:** non-incremental spec typecheck exit 0, full offline Jest, scoped lint/format/build, native review and local work-unit commits; no live activation claim.
 
+## SQ-5E3 evidence (candidate; pending independent verification and native review; not delivered)
+
+- Typed the final backend bot-sale shipping contract in `src/chatbot-api/domain/dtos/sales.dto.ts`: an optional `shipping` object (`chargeCents` int32 1..2_147_483_647, `approvalId` non-whitespace 1..200, optional `quoteId` non-whitespace 1..200), a `CreateSaleInputSchema` cross-field rule requiring a positive safe-integer `expectedTotalCents` when shipping is present, and optional `subtotalCents`/`shippingChargeCents` on `BotSaleResponse`. The legacy no-shipping path and `expectedTotalCents` `0` remain unchanged.
+- `chatbot-api-http.client.ts` now forwards `shipping` only when present (key omitted when absent/null) and omits `shipping.quoteId` when null/undefined; `X-Idempotency-Key`, response normalization (`discountCents`), legacy response passthrough, and error mapping are untouched. Optional response freight fields are forwarded verbatim and never fabricated.
+- Strict focused TDD RED first: `pnpm exec jest --runInBand --no-cache chatbot-api/infrastructure/chatbot-api-http.client.spec.ts` — 1 suite failed, 12 failed / 61 passed (73 total) on the missing `shipping` contract. GREEN after implementation: 1 suite passed, 73/73. Triangulation uses the committed negative/alternate matrices (null/undefined omission, int32 overflow, whitespace/oversized ids, 409/422 errorCode). No separate refactor was needed after GREEN.
+- Checks: `pnpm exec tsc --noEmit --incremental false -p tsconfig.spec.json` exit 0; `pnpm exec tsc --noEmit -p tsconfig.build.json` exit 0; scoped ESLint exit 0; Prettier `--check` clean (three source/spec paths plus this tracker); `git diff --check` clean. Nothing staged; no commit, push, provider/network/DB access, `createSale`/E4 change, or backend edit.
+- E3 stays unchecked: independent verification and native review are still pending. No shipping-enabled, shipped, or live-sale claim; E4 owns computing and wiring the charge, address, and final total.
+
 ## SQ-1A evidence (independent `PASS`; native-approved as `review-41c3378e455daa89`; locally delivered in this work unit)
 
 - Work unit: `shipping-credit` only — 220 complete changed lines (impl 100 + spec 120), within the 400-line guard.

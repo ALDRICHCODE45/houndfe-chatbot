@@ -24,6 +24,7 @@ import type {
   AttachReceiptInput,
   AttachReceiptResponse,
   BotSaleResponse,
+  BotSaleShippingInput,
   CancelSaleInput,
   CancelSaleResult,
   CreateSaleInput,
@@ -131,12 +132,27 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     // no `null` to mean "absent").
     const parsed = CreateSaleInputSchema.parse(dto);
     const expectedTotalCents = parsed.expectedTotalCents;
+    const shipping = parsed.shipping;
+    // SQ-5E3: `shipping` is omitted entirely when absent/null, and its own
+    // optional `quoteId` is omitted when absent/null (the backend rejects a
+    // literal `null` on the wire). The conditional positive-`expectedTotalCents`
+    // rule is already enforced by `CreateSaleInputSchema`.
+    const wireShipping: BotSaleShippingInput | null = shipping
+      ? {
+          chargeCents: shipping.chargeCents,
+          approvalId: shipping.approvalId,
+          ...(typeof shipping.quoteId === 'string'
+            ? { quoteId: shipping.quoteId }
+            : {}),
+        }
+      : null;
     const wireDto: CreateSaleInput = {
       cashierUserId: parsed.cashierUserId,
       customerId: parsed.customerId,
       shippingAddressId: parsed.shippingAddressId ?? null,
       items: parsed.items,
       ...(typeof expectedTotalCents === 'number' ? { expectedTotalCents } : {}),
+      ...(wireShipping ? { shipping: wireShipping } : {}),
     };
     return this.request<BotSaleResponse>({
       method: 'POST',

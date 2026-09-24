@@ -65,6 +65,31 @@ export interface CancelSaleResult {
 }
 
 /**
+ * Zod schema for the optional `shipping` object on `CreateSaleInput`
+ * (chatbot-api `POST /chatbot-api/sales`).
+ *
+ * Mirrors the backend `BotSaleShippingDto`: `chargeCents` is a positive
+ * int32 cents value, while `approvalId` and `quoteId` are non-whitespace
+ * strings of at most 200 characters. `quoteId` is optional and the HTTP
+ * client OMITS it when absent or null because the backend rejects a
+ * literal `null` on the wire.
+ */
+export const BotSaleShippingInputSchema = z.object({
+  chargeCents: z.number().int().min(1).max(2_147_483_647),
+  approvalId: z.string().min(1).max(200).regex(/\S/),
+  quoteId: z.string().min(1).max(200).regex(/\S/).nullish(),
+});
+
+export interface BotSaleShippingInput {
+  /** Approved freight in integer cents (int32 range). */
+  chargeCents: number;
+  /** Human-approval reference; forwarded verbatim, trimmed by the backend. */
+  approvalId: string;
+  /** Optional provider quote reference; omitted when absent or null. */
+  quoteId?: string | null;
+}
+
+/**
  * Zod schema for `CreateSaleInput` (chatbot-api `POST /chatbot-api/sales`).
  *
  * `expectedTotalCents` is OPTIONAL on the wire — the bot MUST omit the key
@@ -72,25 +97,44 @@ export interface CancelSaleResult {
  * (legacy carts, fresh first attempt). The schema accepts `null` /
  * `undefined` for ergonomics; the HTTP client strips them before sending so
  * the JSON body never carries the key in that case.
+ *
+ * When `shipping` is present (`SQ-5E3`) the backend requires a positive,
+ * freight-inclusive `expectedTotalCents`; that cross-field rule is enforced
+ * here before any HTTP call.
  */
-export const CreateSaleInputSchema = z.object({
-  cashierUserId: z.string().min(1),
-  customerId: z.string().min(1),
-  shippingAddressId: z.string().nullish(),
-  expectedTotalCents: z.number().int().min(0).nullish(),
-  items: z
-    .array(
-      z.object({
-        productId: z.string().min(1),
-        variantId: z.string().nullish(),
-        productName: z.string().min(1),
-        variantName: z.string().nullish(),
-        quantity: z.number().int().min(1),
-        unitPriceCents: z.number().int().min(0),
-      }),
-    )
-    .min(1),
-});
+export const CreateSaleInputSchema = z
+  .object({
+    cashierUserId: z.string().min(1),
+    customerId: z.string().min(1),
+    shippingAddressId: z.string().nullish(),
+    expectedTotalCents: z.number().int().min(0).nullish(),
+    shipping: BotSaleShippingInputSchema.nullish(),
+    items: z
+      .array(
+        z.object({
+          productId: z.string().min(1),
+          variantId: z.string().nullish(),
+          productName: z.string().min(1),
+          variantName: z.string().nullish(),
+          quantity: z.number().int().min(1),
+          unitPriceCents: z.number().int().min(0),
+        }),
+      )
+      .min(1),
+  })
+  .refine(
+    (value) =>
+      value.shipping === null ||
+      value.shipping === undefined ||
+      (typeof value.expectedTotalCents === 'number' &&
+        Number.isSafeInteger(value.expectedTotalCents) &&
+        value.expectedTotalCents > 0),
+    {
+      path: ['expectedTotalCents'],
+      message:
+        'expectedTotalCents must be a positive safe integer when shipping is charged',
+    },
+  );
 
 export interface CreateSaleInput {
   cashierUserId: string;
@@ -101,6 +145,10 @@ export interface CreateSaleInput {
    *  the HTTP client strips `null`/`undefined` so the JSON body omits the key
    *  entirely when absent. */
   expectedTotalCents?: number | null;
+  /** Optional approved shipping charge (SQ-5E3). The HTTP client omits the
+   *  `shipping` key entirely when absent or null; `shipping.quoteId` is
+   *  omitted when absent or null. */
+  shipping?: BotSaleShippingInput | null;
   items: Array<{
     productId: string;
     variantId?: string | null;
@@ -118,6 +166,12 @@ export interface BotSaleResponse {
   channel: string;
   deliveryStatus: string;
   totalCents: number;
+  /** Merchandise subtotal; present only on charged shipping sales. Forwarded
+   *  verbatim from the body — never fabricated when the backend omits it. */
+  subtotalCents?: number;
+  /** Approved shipping charge; present only on charged shipping sales.
+   *  Forwarded verbatim from the body — never fabricated when omitted. */
+  shippingChargeCents?: number;
   paidCents: number;
   debtCents: number;
   confirmedAt: string | null;
