@@ -9,9 +9,16 @@ import {
   type ShippingQuoteDraftRecord,
 } from './shipping-quote-draft-record';
 import {
+  buildShippingQuoteDraftContext,
+  SHIPPING_QUOTE_DRAFT_CONTEXT_KEY as CXT_KEY,
+  type ShippingQuoteDraftContext,
+} from './shipping-quote-draft-context';
+import {
   clearShippingQuoteDraft,
   persistShippingQuoteDraft,
+  persistShippingQuoteDraftWithContext,
   readShippingQuoteDraft,
+  readShippingQuoteDraftContext,
 } from './shipping-quote-draft-persistence';
 import type { ShippingQuoteDraft } from './shipping-quote-draft';
 
@@ -55,6 +62,31 @@ const TTL_EXCEEDED = {
   expiresAt: new Date(MS + TTL + 1).toISOString(),
 };
 const TAMPERED = { ...record(), draft: { ...BASE, customerPaysCents: 1 } };
+const CUST = '11111111-1111-1111-1111-111111111111';
+const ADDR = '22222222-2222-2222-2222-222222222222';
+const PROD = '33333333-3333-3333-3333-333333333333';
+const DEST = {
+  zipCode: '06700',
+  state: 'CDMX',
+  municipality: 'Cuauhtémoc',
+  neighborhood: 'Roma Norte',
+};
+const context = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  customerId: CUST,
+  shippingAddressId: ADDR,
+  cart: [
+    { productId: PROD, variantId: null, quantity: 1, unitPriceCents: 12_900 },
+  ],
+  destination: { ...DEST },
+  ...overrides,
+});
+const builtContext = (createdAt = NOW): ShippingQuoteDraftContext =>
+  buildShippingQuoteDraftContext(context(), createdAt)!;
+const CXT_KEYS =
+  'cart,customerId,destination,draftCreatedAt,schemaVersion,shippingAddressId';
+const FULL_KEYS = ['cart', 'messages', KEY, CXT_KEY].sort().join();
 const stateOf = (
   stored: unknown,
   data: Record<string, unknown> = {},
@@ -273,6 +305,36 @@ describe('shipping-quote-draft-persistence', () => {
       expect(failing).toHaveBeenCalledTimes(1);
     });
 
+    it('removes both the draft and its context in one update', async () => {
+      const [store, update] = okStore();
+      const state = stateOf(record(), {
+        ...SIBLINGS,
+        [CXT_KEY]: builtContext(),
+      });
+      const result = await clearShippingQuoteDraft(store, 'target', state, NaN);
+      expect(update).toHaveBeenCalledTimes(1);
+      const [senderId, patch] = call(update);
+      expect([senderId, patch.lastMessageAt]).toEqual(['target', NOW]);
+      expect(KEY in patch.data).toBe(false);
+      expect(CXT_KEY in patch.data).toBe(false);
+      expect(patch.data.cart).toEqual(SIBLINGS.cart);
+      expect(patch.data.messages).toEqual(SIBLINGS.messages);
+      expect(result).toMatchObject({ senderId: 'target', lastMessageAt: NOW });
+    });
+
+    it('removes an orphan context when no draft key is present', async () => {
+      const [store, update] = okStore();
+      const state = stateOf(undefined, {
+        ...SIBLINGS,
+        [CXT_KEY]: builtContext(),
+      });
+      await clearShippingQuoteDraft(store, 's', state, MS);
+      const [, patch] = call(update);
+      expect(CXT_KEY in patch.data).toBe(false);
+      expect(KEY in patch.data).toBe(false);
+      expect(patch.data.cart).toEqual(SIBLINGS.cart);
+    });
+
     it('returns null without writing for invalid fallback clock or hostile state', async () => {
       const [store, update] = okStore();
       const results = await Promise.all([
@@ -281,6 +343,178 @@ describe('shipping-quote-draft-persistence', () => {
       ]);
       expect(results).toEqual(results.map(() => null));
       expect(update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('persistShippingQuoteDraftWithContext', () => {
+    it('atomically writes draft and context preserving siblings and lastMessageAt', async () => {
+      const [store, update] = okStore();
+      const state = stateOf(undefined, { ...SIBLINGS });
+      const result = await persistShippingQuoteDraftWithContext(
+        store,
+        's',
+        state,
+        draft(),
+        context(),
+        MS,
+      );
+      expect(update).toHaveBeenCalledTimes(1);
+      const [senderId, patch] = call(update);
+      expect([senderId, patch.lastMessageAt]).toEqual(['s', NOW]);
+      expect(Object.keys(patch.data).sort().join()).toBe(FULL_KEYS);
+      expect(patch.data.cart).toEqual(SIBLINGS.cart);
+      expect(patch.data.messages).toEqual(SIBLINGS.messages);
+      expect(patch.data[KEY]).toEqual(record());
+      expect(patch.data[CXT_KEY]).toEqual(builtContext());
+      expect(result).toMatchObject({ senderId: 's', lastMessageAt: NOW });
+      expect(patch.data === state.data).toBe(false);
+    });
+
+    it('pins context to the draft createdAt and rejects raw context extras', async () => {
+      const [store, update] = okStore();
+      await persistShippingQuoteDraftWithContext(
+        store,
+        's',
+        null,
+        draft(),
+        context(),
+        MS,
+      );
+      const [, patch] = call(update);
+      const persisted = patch.data[CXT_KEY] as ShippingQuoteDraftContext;
+      expect(patch.lastMessageAt).toBe(NOW);
+      expect(Object.keys(patch.data).sort().join()).toBe(
+        [KEY, CXT_KEY].sort().join(),
+      );
+      expect(persisted.draftCreatedAt).toBe(NOW);
+      expect(Object.keys(persisted).sort().join()).toBe(CXT_KEYS);
+
+      const [extraStore, extraUpdate] = okStore();
+      const extra = await persistShippingQuoteDraftWithContext(
+        extraStore,
+        's',
+        null,
+        draft(),
+        { ...context(), token: SEC },
+        MS,
+      );
+      expect(extra).toBeNull();
+      expect(extraUpdate).not.toHaveBeenCalled();
+    });
+
+    it('returns null and never reads state or store when draft or context is invalid', async () => {
+      const [store, update] = okStore();
+      let reads = 0;
+      const spy = new Proxy(stateOf(record()), {
+        get: (target, key) => {
+          if (key === 'data') reads += 1;
+          return Reflect.get(target, key) as unknown;
+        },
+      });
+      const results = await Promise.all([
+        persistShippingQuoteDraftWithContext(
+          store,
+          's',
+          null,
+          draft(),
+          { customerId: 'x' },
+          MS,
+        ),
+        persistShippingQuoteDraftWithContext(
+          store,
+          's',
+          null,
+          { token: SEC },
+          context(),
+          MS,
+        ),
+        persistShippingQuoteDraftWithContext(
+          store,
+          's',
+          null,
+          draft(),
+          context(),
+          NaN,
+        ),
+        persistShippingQuoteDraftWithContext(
+          store,
+          's',
+          spy,
+          draft(),
+          { customerId: 'x' },
+          MS,
+        ),
+        ...hostile().map((v) =>
+          persistShippingQuoteDraftWithContext(
+            store,
+            's',
+            v,
+            draft(),
+            context(),
+            MS,
+          ),
+        ),
+      ]);
+      expect(results).toEqual(results.map(() => null));
+      expect(update).not.toHaveBeenCalled();
+      expect(reads).toBe(0);
+    });
+  });
+
+  describe('readShippingQuoteDraftContext', () => {
+    it('returns the exact pinned context for a fresh matching draft', () => {
+      const built = builtContext();
+      const state = stateOf(record(), { ...SIBLINGS, [CXT_KEY]: built });
+      const got = readShippingQuoteDraftContext(state, MS);
+      expect(got).toEqual(built);
+      expect(got === built).toBe(false);
+    });
+
+    it.each<[string, ConversationState, number]>([
+      ['absent context', stateOf(record(), { ...SIBLINGS }), MS],
+      [
+        'context without draft',
+        stateOf(undefined, { ...SIBLINGS, [CXT_KEY]: builtContext() }),
+        MS,
+      ],
+      [
+        'mismatched pin',
+        stateOf(record(), {
+          ...SIBLINGS,
+          [CXT_KEY]: builtContext('2026-06-23T11:00:00.000Z'),
+        }),
+        MS,
+      ],
+      [
+        'expired draft',
+        stateOf(record(), { ...SIBLINGS, [CXT_KEY]: builtContext() }),
+        MS + TTL,
+      ],
+      [
+        'malformed context',
+        stateOf(record(), {
+          ...SIBLINGS,
+          [CXT_KEY]: { schemaVersion: 2 },
+        }),
+        MS,
+      ],
+    ])('returns null for %s', (_label, state, now) => {
+      expect(readShippingQuoteDraftContext(state, now)).toBeNull();
+    });
+
+    it('fails closed for hostile states and invalid clocks', () => {
+      const state = stateOf(record(), {
+        ...SIBLINGS,
+        [CXT_KEY]: builtContext(),
+      });
+      const hostileOut = hostile().map((v) =>
+        readShippingQuoteDraftContext(v, MS),
+      );
+      expect(hostileOut).toEqual(hostile().map(() => null));
+      const clockOut = CLOCKS.map((now) =>
+        readShippingQuoteDraftContext(state, now),
+      );
+      expect(clockOut).toEqual(CLOCKS.map(() => null));
     });
   });
 });

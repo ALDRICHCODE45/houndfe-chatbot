@@ -9,6 +9,12 @@ import {
   SHIPPING_QUOTE_DRAFT_KEY,
   type ShippingQuoteDraftRecord,
 } from './shipping-quote-draft-record';
+import {
+  buildShippingQuoteDraftContext,
+  normalizeShippingQuoteDraftContext,
+  SHIPPING_QUOTE_DRAFT_CONTEXT_KEY,
+  type ShippingQuoteDraftContext,
+} from './shipping-quote-draft-context';
 
 // Bounded SQ-4D2 lifecycle over SQ-4D1: no migration, no store-port change,
 // no atomic helper. Whole `data` replacement (ADR-13) stays the accepted
@@ -88,6 +94,61 @@ export async function persistShippingQuoteDraft(
   });
 }
 
+export async function persistShippingQuoteDraftWithContext(
+  store: ConversationStore,
+  senderId: string,
+  state: ConversationState | null,
+  rawDraft: unknown,
+  rawContext: unknown,
+  nowMs: number,
+): Promise<ConversationState | null> {
+  const record = buildShippingQuoteDraftRecord(rawDraft, nowMs);
+  if (record === null) return null;
+  const context = buildShippingQuoteDraftContext(rawContext, record.createdAt);
+  if (context === null) return null;
+  const snapshot = state === null ? null : snapshotRuntimeState(state);
+  if (state !== null && snapshot === null) return null;
+  const data: ConversationStateData = {
+    ...(snapshot?.data ?? {}),
+    [SHIPPING_QUOTE_DRAFT_KEY]: record,
+    [SHIPPING_QUOTE_DRAFT_CONTEXT_KEY]: context,
+  };
+  return store.update(senderId, {
+    lastMessageAt: snapshot?.lastMessageAt ?? record.createdAt,
+    data,
+  });
+}
+
+/**
+ * Reads the context sibling only when it pins the exact still-fresh draft in
+ * the same snapshotted `data` bag. Legacy contextless drafts, orphan contexts,
+ * mismatched pins, expiry, and hostile state all return `null` without I/O.
+ */
+export function readShippingQuoteDraftContext(
+  state: ConversationState | null,
+  nowMs: number,
+): ShippingQuoteDraftContext | null {
+  if (state === null) return null;
+  const snapshot = snapshotRuntimeState(state);
+  if (snapshot === null) return null;
+  const draft = readShippingQuoteDraft(
+    {
+      senderId: '',
+      lastMessageAt: snapshot.lastMessageAt,
+      data: snapshot.data,
+    },
+    nowMs,
+  );
+  if (draft === null) return null;
+  const context = normalizeShippingQuoteDraftContext(
+    snapshot.data[SHIPPING_QUOTE_DRAFT_CONTEXT_KEY],
+  );
+  if (context === null || context.draftCreatedAt !== draft.createdAt) {
+    return null;
+  }
+  return context;
+}
+
 export async function clearShippingQuoteDraft(
   store: ConversationStore,
   senderId: string,
@@ -105,6 +166,7 @@ export async function clearShippingQuoteDraft(
   if (snapshot === null) return null;
   const data: ConversationStateData = { ...snapshot.data };
   delete data[SHIPPING_QUOTE_DRAFT_KEY];
+  delete data[SHIPPING_QUOTE_DRAFT_CONTEXT_KEY];
   return store.update(senderId, {
     lastMessageAt: snapshot.lastMessageAt,
     data,
