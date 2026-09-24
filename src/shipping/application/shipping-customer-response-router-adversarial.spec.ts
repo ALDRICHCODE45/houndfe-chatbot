@@ -24,6 +24,7 @@ import {
   PIN,
   PENDING,
   RECEIPT_KEY,
+  RECEIPT_POINTER,
   SENDER,
   SIBLINGS,
   TOTAL,
@@ -139,7 +140,7 @@ describe('ShippingCustomerResponseRouter (adversarial)', () => {
     expect(patch?.[APPROVAL]).toBeNull();
     expect(Object.hasOwn(patch ?? {}, DRAFT)).toBe(false);
     expect(Object.hasOwn(patch ?? {}, CONTEXT)).toBe(false);
-    expect(patch?.receiptAmountPointer).toEqual(SIBLINGS.receiptAmountPointer);
+    expect(patch?.keepMe).toEqual(SIBLINGS.keepMe);
     expect(patch?.messages).toEqual(SIBLINGS.messages);
   });
 
@@ -173,6 +174,58 @@ describe('ShippingCustomerResponseRouter (adversarial)', () => {
         Date.parse(NOW),
       ).route(input()),
     ).rejects.toThrow('write-boom');
+  });
+});
+
+/**
+ * SCA-4c: a non-null active shipping offer coexisting with a valid
+ * `receiptAmountPointer` is a genuine two-flow collision. Bare SÍ/NO, a
+ * preexisting acceptance and even a matching decline replay must not mutate
+ * either flow; the router returns terminal `blocked` with zero writes, and it
+ * must do so BEFORE the decline-tombstone replay. Only an absent offer fences
+ * so the receipt flow can route. Dedicated human handoff remains pending.
+ */
+describe('ShippingCustomerResponseRouter (offer + receipt pointer collision)', () => {
+  const collision = (over: Record<string, unknown> = {}) =>
+    base({ receiptAmountPointer: RECEIPT_POINTER, ...over });
+
+  it('blocks a fresh YES with no write', async () => {
+    const r = await route(collision(), { text: 'SÍ' });
+    expect(r.out).toEqual({ kind: 'blocked' });
+    expect(r.updates).toHaveLength(0);
+  });
+
+  it('blocks NO with no write', async () => {
+    const r = await route(collision(), { text: 'NO' });
+    expect(r.out).toEqual({ kind: 'blocked' });
+    expect(r.updates).toHaveLength(0);
+  });
+
+  it('blocks a preexisting acceptance with no write', async () => {
+    const r = await route(collision({ [ACCEPT_KEY]: acceptance() }));
+    expect(r.out).toEqual({ kind: 'blocked' });
+    expect(r.updates).toHaveLength(0);
+  });
+
+  it('blocks a malformed offer with no write', async () => {
+    const r = await route(
+      collision({ [OFFER_KEY]: offer({ expiresAt: PIN }) }),
+      { text: 'NO' },
+    );
+    expect(r.out).toEqual({ kind: 'blocked' });
+    expect(r.updates).toHaveLength(0);
+  });
+
+  it('fences when the offer is absent so the receipt flow can route', async () => {
+    const r = await route(collision({ [OFFER_KEY]: null }));
+    expect(r.out).toEqual({ kind: 'fenced' });
+    expect(r.updates).toHaveLength(0);
+  });
+
+  it('wins over a matching decline replay without a false replay', async () => {
+    const r = await route(collision({ [RECEIPT_KEY]: receipt() }));
+    expect(r.out).toEqual({ kind: 'blocked' });
+    expect(r.updates).toHaveLength(0);
   });
 });
 

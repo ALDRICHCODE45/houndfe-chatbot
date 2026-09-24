@@ -8,6 +8,7 @@ import type {
   AgentMessage,
   ConversationState,
   ConversationStateData,
+  ReceiptAmountPointer,
 } from '../../src/conversation/domain/conversation-store';
 import {
   SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
@@ -129,13 +130,18 @@ export const receipt = (over: Obj = {}) => ({
   ...over,
 });
 const MESSAGES: AgentMessage[] = [{ role: 'user', content: 'hola' }];
+/** Explicit valid receipt amount pointer. `base()` intentionally omits it so an
+ *  active shipping offer alone never trips the SCA-4c two-flow collision guard;
+ *  collision tests opt in by spreading this builder. */
+export const RECEIPT_POINTER: ReceiptAmountPointer = {
+  receiptMediaId: 'm1',
+  saleId: 's1',
+  receiptVersion: '1',
+};
+/** Sibling keys preserved across writes; no receipt flow by default. */
 export const SIBLINGS = {
-  receiptAmountPointer: {
-    receiptMediaId: 'm1',
-    saleId: 's1',
-    receiptVersion: '1',
-  },
   messages: MESSAGES,
+  keepMe: { untouched: true },
 };
 export const base = (over: Obj = {}): ConversationStateData => ({
   [DRAFT]: draft(),

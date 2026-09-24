@@ -7,11 +7,15 @@
  * offer/acceptance/approval and drops draft/context in ONE write before any
  * acknowledgment; a malformed or drifted active flow blocks without a write,
  * as does a present row whose `data` is not a plain object (never a fence); a
- * throwing `state.data` accessor propagates. Store failures propagate. No
- * cross-store compare-and-swap is claimed: the read and the single update are
- * not atomic against a concurrent writer.
+ * throwing `state.data` accessor propagates. SCA-4c: an active offer together
+ * with a valid `receiptAmountPointer` is a two-flow collision that blocks
+ * before the decline replay and before any classification or write, so no bare
+ * SÍ/NO can mutate either flow; an absent offer still fences. Store failures
+ * propagate. No cross-store compare-and-swap is claimed: the read and the single
+ * update are not atomic against a concurrent writer.
  */
 import {
+  isReceiptAmountPointer,
   readPendingHumanRequest,
   type ConversationState,
   type ConversationStateData,
@@ -118,6 +122,20 @@ export class ShippingCustomerResponseRouter {
     if (!isPlainObject(state.data)) return { kind: 'blocked' };
     const data = state.data;
     const lastMessageAt = state.lastMessageAt;
+    const rawOffer = data[SHIPPING_CUSTOMER_OFFER_KEY];
+    // SCA-4c: an active shipping offer coexisting with a valid receipt amount
+    // pointer is a genuine two-flow collision. Neither a bare SÍ/NO, a
+    // preexisting acceptance nor a matching decline replay may mutate either
+    // flow; fail closed here — before the tombstone replay and before any
+    // YES/NO classification or write. Dedicated human handoff is pending. An
+    // absent offer still fences so the receipt flow can route.
+    if (
+      rawOffer !== null &&
+      rawOffer !== undefined &&
+      isReceiptAmountPointer(data.receiptAmountPointer)
+    ) {
+      return { kind: 'blocked' };
+    }
     const rawReceipt = data[SHIPPING_CUSTOMER_DECLINE_RECEIPT_KEY];
     if (
       matchShippingCustomerDeclineReceipt(
@@ -130,7 +148,6 @@ export class ShippingCustomerResponseRouter {
         ? { kind: 'fenced' }
         : { kind: 'replayed_decline', receipt: stored };
     }
-    const rawOffer = data[SHIPPING_CUSTOMER_OFFER_KEY];
     const rawAcceptance = data[SHIPPING_CUSTOMER_ACCEPTANCE_KEY];
     const offerFilled = rawOffer !== null && rawOffer !== undefined;
     const acceptanceFilled =
