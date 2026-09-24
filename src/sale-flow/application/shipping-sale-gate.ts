@@ -33,6 +33,11 @@
  * therefore compares the own-data descriptor with the `get` result and treats
  * a mismatch as `malformed_state` — checked BEFORE the key mint / backend call.
  *
+ * `snapshotShippingSaleState` owns the ONE validated read of `state.data`
+ * (own `data` descriptor, no accessor, descriptor/`get` agreement, plain data)
+ * and returns that snapshot even when the bag carries shipping markers;
+ * `evaluateShippingSaleGate` consumes it and owns the marker decision.
+ *
  * Known limitation (NOT claimed as universal Proxy detection): a `data` bag
  * that is itself a `Proxy` whose descriptor and `get` agree is snapshotted by
  * identity like plain JSON; a stateful or divergent bag nested INSIDE `data`
@@ -52,8 +57,19 @@ export type ShippingSaleGateVerdict =
   | { readonly kind: 'blocked' }
   | { readonly kind: 'malformed_state' };
 
+/**
+ * One validated read of `state.data`: `snapshot` carries the SAME plain data
+ * bag (or `null` for a `null` state) that later readers must thread through,
+ * and is returned even when the bag carries server-written shipping
+ * draft/approval/context markers. `malformed_state` is the fail-closed verdict
+ * for a hostile/unreadable state or a non-plain `data`.
+ */
+export type ShippingSaleStateSnapshotVerdict =
+  | { readonly kind: 'snapshot'; readonly data: ConversationStateData | null }
+  | { readonly kind: 'malformed_state' };
+
 const BLOCKED: ShippingSaleGateVerdict = Object.freeze({ kind: 'blocked' });
-const MALFORMED: ShippingSaleGateVerdict = Object.freeze({
+const MALFORMED: Readonly<{ kind: 'malformed_state' }> = Object.freeze({
   kind: 'malformed_state',
 });
 
@@ -96,17 +112,33 @@ const readOwn = (target: Record<string, unknown>, key: string): OwnRead => {
   return { kind: 'value', value: descriptor.value };
 };
 
-export function evaluateShippingSaleGate(
+export function snapshotShippingSaleState(
   state: unknown,
-): ShippingSaleGateVerdict {
+): ShippingSaleStateSnapshotVerdict {
   try {
-    if (state === null) return Object.freeze({ kind: 'pass', data: null });
+    if (state === null) {
+      return Object.freeze({ kind: 'snapshot', data: null });
+    }
     if (!isPlainObject(state)) return MALFORMED;
     const stateData = readOwn(state, 'data');
     if (stateData.kind === 'unsafe') return MALFORMED;
     const data: unknown =
       stateData.kind === 'value' ? stateData.value : undefined;
     if (!isPlainObject(data)) return MALFORMED;
+    return Object.freeze({ kind: 'snapshot', data });
+  } catch {
+    return MALFORMED;
+  }
+}
+
+export function evaluateShippingSaleGate(
+  state: unknown,
+): ShippingSaleGateVerdict {
+  try {
+    const snapshot = snapshotShippingSaleState(state);
+    if (snapshot.kind === 'malformed_state') return MALFORMED;
+    const data = snapshot.data;
+    if (data === null) return Object.freeze({ kind: 'pass', data: null });
     const draft = readOwn(data, SHIPPING_QUOTE_DRAFT_KEY);
     const approval = readOwn(data, SHIPPING_APPROVAL_KEY);
     if (draft.kind === 'unsafe' || approval.kind === 'unsafe') {

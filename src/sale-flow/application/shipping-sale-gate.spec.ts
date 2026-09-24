@@ -1,6 +1,7 @@
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import {
   evaluateShippingSaleGate,
+  snapshotShippingSaleState,
   type ShippingSaleGateVerdict,
 } from './shipping-sale-gate';
 
@@ -312,5 +313,129 @@ describe('evaluateShippingSaleGate', () => {
       kind: 'malformed_state',
     });
     expect(reads).toBe(0);
+  });
+});
+
+describe('snapshotShippingSaleState', () => {
+  it('snapshots a null state as null data', () => {
+    expect(snapshotShippingSaleState(null)).toEqual({
+      kind: 'snapshot',
+      data: null,
+    });
+  });
+
+  it('snapshots the same plain data identity for an ordinary state', () => {
+    const data = { messages: [], placedSaleId: 'sale-1' };
+    const snapshot = snapshotShippingSaleState(stateWith(data));
+    expect(snapshot.kind).toBe('snapshot');
+    expect(snapshot.kind === 'snapshot' ? snapshot.data : null).toBe(data);
+  });
+
+  it('snapshots state that carries shipping draft/approval/context markers', () => {
+    const data = {
+      [DRAFT_KEY]: canonicalDraft(),
+      [APPROVAL_KEY]: approvalMarker('SHIPPING_APPROVED'),
+      shippingQuoteDraftContext: { draftCreatedAt: ISO },
+    };
+    const snapshot = snapshotShippingSaleState(stateWith(data));
+    expect(snapshot.kind).toBe('snapshot');
+    expect(snapshot.kind === 'snapshot' ? snapshot.data : null).toBe(data);
+  });
+
+  it('reads a Proxy get("data") exactly once', () => {
+    const bag = { messages: [] };
+    let dataReads = 0;
+    const state = new Proxy(
+      { senderId: 's', lastMessageAt: ISO, data: bag },
+      {
+        get: (inner, key, receiver): unknown => {
+          if (key === 'data') dataReads += 1;
+          return Reflect.get(inner, key, receiver) as unknown;
+        },
+      },
+    );
+    expect(snapshotShippingSaleState(state)).toEqual({
+      kind: 'snapshot',
+      data: bag,
+    });
+    expect(dataReads).toBe(1);
+  });
+
+  it('rejects a descriptor/get("data") divergence as malformed_state', () => {
+    const target = {
+      senderId: 's',
+      lastMessageAt: ISO,
+      data: { messages: [] },
+    };
+    const state = new Proxy(target, {
+      get: (inner, key): unknown => {
+        if (key === 'data') return { [DRAFT_KEY]: canonicalDraft() };
+        return Reflect.get(inner, key) as unknown;
+      },
+    });
+    expect(snapshotShippingSaleState(state)).toEqual({
+      kind: 'malformed_state',
+    });
+  });
+
+  it('rejects an accessor state.data without invoking the getter', () => {
+    let invoked = false;
+    const state = { senderId: 's', lastMessageAt: ISO };
+    Object.defineProperty(state, 'data', {
+      get: () => {
+        invoked = true;
+        return {};
+      },
+    });
+    expect(snapshotShippingSaleState(state)).toEqual({
+      kind: 'malformed_state',
+    });
+    expect(invoked).toBe(false);
+  });
+
+  it.each([
+    ['undefined state', undefined],
+    ['array state', []],
+    ['string state', 'state'],
+    ['array data', stateWith([])],
+    ['undefined data', stateWith(undefined)],
+  ])('fails closed on an invalid snapshot input (%s)', (_label, state) => {
+    expect(snapshotShippingSaleState(state)).toEqual({
+      kind: 'malformed_state',
+    });
+  });
+
+  it('exposes a frozen snapshot verdict', () => {
+    expect(Object.isFrozen(snapshotShippingSaleState(null))).toBe(true);
+  });
+});
+
+describe('evaluateShippingSaleGate snapshot integration', () => {
+  it('accepts a marker-bearing snapshot while the D2 gate still blocks', () => {
+    const data = { [DRAFT_KEY]: canonicalDraft() };
+    const state = stateWith(data);
+    const snapshot = snapshotShippingSaleState(state);
+    expect(snapshot.kind).toBe('snapshot');
+    expect(snapshot.kind === 'snapshot' ? snapshot.data : null).toBe(data);
+    expect(evaluateShippingSaleGate(state)).toEqual({ kind: 'blocked' });
+  });
+
+  it('reads state.data exactly once per gate call', () => {
+    const bag = { messages: [] };
+    let dataReads = 0;
+    const state = new Proxy(
+      { senderId: 's', lastMessageAt: ISO, data: bag },
+      {
+        get: (inner, key, receiver): unknown => {
+          if (key === 'data') dataReads += 1;
+          return Reflect.get(inner, key, receiver) as unknown;
+        },
+      },
+    );
+    expect(evaluateShippingSaleGate(state)).toEqual({
+      kind: 'pass',
+      data: bag,
+    });
+    expect(dataReads).toBe(1);
   });
 });
