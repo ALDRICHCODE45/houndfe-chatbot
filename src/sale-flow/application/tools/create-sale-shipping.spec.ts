@@ -28,6 +28,7 @@ import {
   PENDING,
   draftRecord,
 } from '../../../../test/fixtures/shipping-approval-request-fixture';
+import { shippingAcceptancePair } from '../../../../test/fixtures/shipping-customer-acceptance-fixture';
 
 // SQ-5E4 E4-2a guarded createSale charge wiring, fully offline.
 const CUSTOMER = '11111111-1111-1111-1111-111111111111';
@@ -182,7 +183,14 @@ const expectDenied = async (data: unknown, opts: Options = {}) => {
 
 describe('makeCreateSaleTool shipping charge (SQ-5E4 E4-2a)', () => {
   it('sends the exact pinned shipping DTO and reuses the existing key', async () => {
-    const h = setup(bag({}, draftRecord(), 'SHIPPING_APPROVED', 'pinned-key'));
+    const h = setup(
+      bag(
+        shippingAcceptancePair(),
+        draftRecord(),
+        'SHIPPING_APPROVED',
+        'pinned-key',
+      ),
+    );
     const result = await run(
       h,
       input({

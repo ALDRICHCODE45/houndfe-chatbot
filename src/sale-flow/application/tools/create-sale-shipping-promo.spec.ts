@@ -26,6 +26,7 @@ import {
   NOW_MS,
   draftRecord,
 } from '../../../../test/fixtures/shipping-approval-request-fixture';
+import { shippingAcceptancePair } from '../../../../test/fixtures/shipping-customer-acceptance-fixture';
 
 // E4-2b2: freight-safe promotion retry on a charged (approved-shipping) sale.
 // The backend PROMO_RE_QUOTE recomputed total already includes freight, so the
@@ -75,13 +76,14 @@ const approval = (createdAt: string): Over => ({
   decision: 'SHIPPING_APPROVED',
   decidedAt: createdAt,
 });
-const chargedBag = (key = ''): ConversationStateData => {
+const chargedBag = (key = '', over: Over = {}): ConversationStateData => {
   const record = draftRecord();
   return {
     [SHIPPING_QUOTE_DRAFT_KEY]: record,
     [SHIPPING_QUOTE_DRAFT_CONTEXT_KEY]: contexts(record.createdAt),
     [SHIPPING_APPROVAL_KEY]: approval(record.createdAt),
     cart: { items: [LINE], idempotencyKey: key, expectedTotalCents: MERCH },
+    ...over,
   };
 };
 const lookup = (zipCode = DEST.zipCode): Over => ({
@@ -182,7 +184,7 @@ const renderedPromo = {
 
 describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
   it('persists the merchandise remainder, rotates the key, and resends freight once', async () => {
-    const h = setup(chargedBag('first-key'), [
+    const h = setup(chargedBag('first-key', shippingAcceptancePair()), [
       promoErr(),
       { ...SALE, totalCents: RECOMPUTED },
     ]);
@@ -220,7 +222,7 @@ describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
   });
 
   it('allows a zero merchandise remainder when freight is the whole total', async () => {
-    const h = setup(chargedBag('first-key'), [
+    const h = setup(chargedBag('first-key', shippingAcceptancePair()), [
       promoErr(
         promoBody({
           recomputedTotalCents: CHARGE,
@@ -283,7 +285,7 @@ describe('makeCreateSaleTool charged PROMO_RE_QUOTE retry (E4-2b2)', () => {
 
   it('blocks a retry on destination drift before the second key or HTTP call', async () => {
     const h = setup(
-      chargedBag('first-key'),
+      chargedBag('first-key', shippingAcceptancePair()),
       [promoErr(), { ...SALE, totalCents: RECOMPUTED }],
       [() => lookup(), () => lookup('06701')],
     );

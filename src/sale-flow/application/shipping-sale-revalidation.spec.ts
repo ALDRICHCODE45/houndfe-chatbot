@@ -1,4 +1,8 @@
 import type { ConversationStateData } from '../../conversation/domain/conversation-store';
+import {
+  shippingAcceptancePair,
+  type ShippingAcceptanceOverrides,
+} from '../../../test/fixtures/shipping-customer-acceptance-fixture';
 import { evaluateShippingSaleRevalidation } from './shipping-sale-revalidation';
 
 // SQ-5E4a fail-closed revalidation of one already-validated plain JSONB snapshot.
@@ -111,6 +115,14 @@ const pinnedTo = (createdAt: string, expiresAt: string) =>
 const revalidate = (snapshot: ConversationStateData | null, nowMs = NOW) =>
   evaluateShippingSaleRevalidation(snapshot, nowMs);
 
+// SCA-2a: the committed disclosed offer/YES pair a future gate must match.
+// Only the legitimate charged happy-path snapshots carry it; blocked cases do
+// not, so a missing/stale acceptance stays fail-closed.
+const accepted = (
+  snapshot: ConversationStateData,
+  over: ShippingAcceptanceOverrides = {},
+): ConversationStateData => ({ ...snapshot, ...shippingAcceptancePair(over) });
+
 const pendingHandoff = {
   requestId: REQUEST_ID,
   ref: `HF-${REQUEST_ID}`,
@@ -197,42 +209,56 @@ describe('evaluateShippingSaleRevalidation', () => {
   });
 
   it('returns the exact server-derived charge for a fresh pinned approval', () => {
-    expect(revalidate(data())).toEqual(chargedVerdict(60000));
+    expect(revalidate(accepted(data()))).toEqual(chargedVerdict(60000));
   });
 
   it('charges when a full promo leaves a zero merchandise total', () => {
-    expect(revalidate(withCart({ expectedTotalCents: 0 }))).toEqual(
-      chargedVerdict(0),
-    );
+    expect(
+      revalidate(
+        accepted(withCart({ expectedTotalCents: 0 }), {
+          merchandiseCents: 0,
+        }),
+      ),
+    ).toEqual(chargedVerdict(0));
   });
 
   it('accepts the exact int32 backend total boundary', () => {
     const merchandiseTotalCents = 2_147_483_647 - 6_900;
     expect(
-      revalidate(withCart({ expectedTotalCents: merchandiseTotalCents })),
+      revalidate(
+        accepted(withCart({ expectedTotalCents: merchandiseTotalCents }), {
+          merchandiseCents: merchandiseTotalCents,
+        }),
+      ),
     ).toEqual(chargedVerdict(merchandiseTotalCents));
   });
 
   it('matches canonical cart lines in any order with normalized variants', () => {
-    const two = data({
-      [CONTEXT_KEY]: context({ cart: [item(PRODUCT, null, 2, 60000)] }),
-      cart: baseCart({
-        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 60000 }],
-        expectedTotalCents: 120000,
+    const two = accepted(
+      data({
+        [CONTEXT_KEY]: context({ cart: [item(PRODUCT, null, 2, 60000)] }),
+        cart: baseCart({
+          items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 60000 }],
+          expectedTotalCents: 120000,
+        }),
       }),
-    });
+      { merchandiseCents: 120000 },
+    );
     expect(revalidate(two).kind).toBe('charged');
     const lines = [
       item(PRODUCT, null, 1, 60000),
       item(PRODUCT_2, VARIANT, 1, 8000),
     ];
-    const reordered = data({
-      [CONTEXT_KEY]: context({ cart: lines }),
-      cart: baseCart({
-        items: [...lines].reverse(),
-        expectedTotalCents: 68000,
+    const reordered = accepted(
+      data({
+        [CONTEXT_KEY]: context({ cart: lines }),
+        cart: baseCart({
+          items: [...lines].reverse(),
+          expectedTotalCents: 68000,
+        }),
       }),
-    });
+      { merchandiseCents: 68000 },
+    );
     expect(revalidate(reordered).kind).toBe('charged');
   });
 
