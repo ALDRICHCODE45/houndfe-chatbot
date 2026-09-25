@@ -3,7 +3,10 @@ import { Injectable } from '@nestjs/common';
 import {
   ConversationState,
   ConversationStore,
+  isNonEmptyString,
+  isPendingHumanRequest,
   isReceiptAmountPointer,
+  PendingHumanRequest,
   ReceiptAmountPointer,
 } from '../domain/conversation-store';
 
@@ -18,6 +21,76 @@ import {
 @Injectable()
 export class InMemoryConversationStore implements ConversationStore {
   private readonly map = new Map<string, ConversationState>();
+
+  async setPendingHumanRequest(
+    senderId: string,
+    marker: PendingHumanRequest,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    if (
+      !isNonEmptyString(senderId) ||
+      !isNonEmptyString(lastMessageAt) ||
+      !isPendingHumanRequest(marker)
+    ) {
+      return false;
+    }
+    // Clone so a caller mutating `marker` can never rewrite stored state.
+    const copy: PendingHumanRequest = {
+      requestId: marker.requestId,
+      ref: marker.ref,
+      createdAt: marker.createdAt,
+      customerNotifiedAt: marker.customerNotifiedAt,
+    };
+    const state = this.map.get(senderId);
+    if (state && Object.hasOwn(state.data, 'pendingHumanRequest')) {
+      const current = state.data.pendingHumanRequest;
+      const same =
+        isPendingHumanRequest(current) &&
+        current.requestId === copy.requestId &&
+        current.ref === copy.ref &&
+        current.createdAt === copy.createdAt &&
+        current.customerNotifiedAt === copy.customerNotifiedAt;
+      if (current !== null && !same) return false;
+    }
+    if (state) {
+      state.lastMessageAt = lastMessageAt;
+      state.data = { ...state.data, pendingHumanRequest: copy };
+    } else {
+      this.map.set(senderId, {
+        senderId,
+        lastMessageAt,
+        data: { pendingHumanRequest: copy },
+      });
+    }
+    return true;
+  }
+
+  async clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    if (
+      !isNonEmptyString(senderId) ||
+      !isNonEmptyString(requestId) ||
+      !isNonEmptyString(lastMessageAt)
+    ) {
+      return false;
+    }
+    const state = this.map.get(senderId);
+    const current = state?.data.pendingHumanRequest;
+    if (
+      !state ||
+      !Object.hasOwn(state.data, 'pendingHumanRequest') ||
+      !isPendingHumanRequest(current) ||
+      current.requestId !== requestId
+    ) {
+      return false;
+    }
+    state.lastMessageAt = lastMessageAt;
+    state.data = { ...state.data, pendingHumanRequest: null };
+    return true;
+  }
 
   async setReceiptAmountPointer(
     senderId: string,

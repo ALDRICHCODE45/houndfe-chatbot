@@ -3,7 +3,10 @@ import { Pool } from 'pg';
 import {
   ConversationState,
   ConversationStore,
+  isNonEmptyString,
+  isPendingHumanRequest,
   isReceiptAmountPointer,
+  PendingHumanRequest,
   ReceiptAmountPointer,
 } from '../domain/conversation-store';
 import { PG_POOL } from '../../database/postgres-pool.provider';
@@ -43,6 +46,74 @@ interface ConversationRow {
 @Injectable()
 export class PostgresConversationStore implements ConversationStore {
   constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+
+  async setPendingHumanRequest(
+    senderId: string,
+    marker: PendingHumanRequest,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    if (
+      !isNonEmptyString(senderId) ||
+      !isNonEmptyString(lastMessageAt) ||
+      !isPendingHumanRequest(marker)
+    ) {
+      return false;
+    }
+    const { rowCount } = await this.pool.query(
+      `INSERT INTO conversation_state (sender_id, last_message_at, data)
+       VALUES ($1, $2::timestamptz,
+         jsonb_build_object('pendingHumanRequest', $3::jsonb))
+       ON CONFLICT (sender_id) DO UPDATE
+         SET last_message_at = EXCLUDED.last_message_at,
+             data = conversation_state.data
+               || jsonb_build_object('pendingHumanRequest', $3::jsonb)
+         WHERE NOT (conversation_state.data ? 'pendingHumanRequest')
+            OR conversation_state.data->'pendingHumanRequest' = 'null'::jsonb
+            OR (
+              jsonb_typeof(conversation_state.data->'pendingHumanRequest') = 'object'
+              AND conversation_state.data->'pendingHumanRequest' = $3::jsonb
+            )`,
+      [senderId, lastMessageAt, JSON.stringify(marker)],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  async clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    if (
+      !isNonEmptyString(senderId) ||
+      !isNonEmptyString(requestId) ||
+      !isNonEmptyString(lastMessageAt)
+    ) {
+      return false;
+    }
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET last_message_at = $3::timestamptz,
+           data = jsonb_set(data, '{pendingHumanRequest}', 'null'::jsonb, true)
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'pendingHumanRequest') = 'object'
+         AND data->'pendingHumanRequest' = jsonb_build_object(
+           'requestId', data->'pendingHumanRequest'->'requestId',
+           'ref', data->'pendingHumanRequest'->'ref',
+           'createdAt', data->'pendingHumanRequest'->'createdAt',
+           'customerNotifiedAt', data->'pendingHumanRequest'->'customerNotifiedAt')
+         AND jsonb_typeof(data->'pendingHumanRequest'->'requestId') = 'string'
+         AND jsonb_typeof(data->'pendingHumanRequest'->'ref') = 'string'
+         AND jsonb_typeof(data->'pendingHumanRequest'->'createdAt') = 'string'
+         AND jsonb_typeof(data->'pendingHumanRequest'->'customerNotifiedAt') = 'string'
+         AND length(data->'pendingHumanRequest'->>'requestId') > 0
+         AND length(data->'pendingHumanRequest'->>'ref') > 0
+         AND length(data->'pendingHumanRequest'->>'createdAt') > 0
+         AND length(data->'pendingHumanRequest'->>'customerNotifiedAt') > 0
+         AND data->'pendingHumanRequest'->>'requestId' = $2`,
+      [senderId, requestId, lastMessageAt],
+    );
+    return (rowCount ?? 0) === 1;
+  }
 
   async setReceiptAmountPointer(
     senderId: string,

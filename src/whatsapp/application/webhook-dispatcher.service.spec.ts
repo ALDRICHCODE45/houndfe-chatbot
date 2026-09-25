@@ -77,6 +77,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      setPendingHumanRequest: jest.fn(),
+      clearPendingHumanRequest: jest.fn(),
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
     };
@@ -133,6 +135,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       get: jest.fn().mockResolvedValue(null),
       create: jest.fn(),
       update: jest.fn(),
+      setPendingHumanRequest: jest.fn(),
+      clearPendingHumanRequest: jest.fn(),
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
     };

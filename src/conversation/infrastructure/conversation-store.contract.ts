@@ -3,6 +3,10 @@ import type {
   ConversationState,
   ConversationStore,
 } from '../domain/conversation-store';
+import {
+  readPendingHumanRequest,
+  type PendingHumanRequest,
+} from '../domain/conversation-store';
 
 /**
  * Shared contract-suite factory for `ConversationStore`.
@@ -211,6 +215,87 @@ export function runConversationStoreContract(
         data: { step: 'cart' },
       };
       expect(fetched).toEqual(expected);
+    });
+
+    // CAS parity for the human-handoff marker (T3a). Legacy `update()` is
+    // deliberately not involved here (T3b changes its marker preservation).
+    const T = '2026-07-01T08:00:00.000Z';
+    const casMarker = (id: string): PendingHumanRequest => ({
+      requestId: id,
+      ref: `HF-${id}`,
+      createdAt: T,
+      customerNotifiedAt: T,
+    });
+    const setCas = (s: string, m: PendingHumanRequest) =>
+      store.setPendingHumanRequest(s, m, T);
+    const clearCas = (s: string, requestId: string) =>
+      store.clearPendingHumanRequest(s, requestId, T);
+
+    it('setPendingHumanRequest() inserts first-contact and replays exactly', async () => {
+      const m = casMarker('aaaa11112222');
+      await expect(setCas('c1', m)).resolves.toBe(true);
+      await expect(setCas('c1', m)).resolves.toBe(true);
+      const fetched = await store.get('c1');
+      expect(readPendingHumanRequest(fetched)).toEqual(m);
+      expect(fetched!.lastMessageAt).toBe(T);
+    });
+
+    it('setPendingHumanRequest() preserves siblings and refuses a conflict', async () => {
+      await store.create('c2', { lastMessageAt: T, data: { cart: ['sku-1'] } });
+      const m1 = casMarker('bbbb11112222');
+      const m2 = casMarker('cccc11112222');
+      await expect(setCas('c2', m1)).resolves.toBe(true);
+      await expect(setCas('c2', m2)).resolves.toBe(false);
+      const fetched = await store.get('c2');
+      expect(readPendingHumanRequest(fetched)).toEqual(m1);
+      expect(fetched!.data.cart).toEqual(['sku-1']);
+    });
+
+    it('clearPendingHumanRequest() nulls the marker and allows a fresh set', async () => {
+      const m1 = casMarker('dddd11112222');
+      await setCas('c3', m1);
+      await expect(clearCas('c3', m1.requestId)).resolves.toBe(true);
+      const cleared = await store.get('c3');
+      expect(readPendingHumanRequest(cleared)).toBeNull();
+      expect(Object.hasOwn(cleared!.data, 'pendingHumanRequest')).toBe(true);
+      expect(cleared!.data.pendingHumanRequest).toBeNull();
+      const m2 = casMarker('eeee11112222');
+      await expect(setCas('c3', m2)).resolves.toBe(true);
+      expect(readPendingHumanRequest(await store.get('c3'))).toEqual(m2);
+    });
+
+    it('both CAS primitives fail closed on malformed state and invalid args', async () => {
+      await store.create('c4', {
+        lastMessageAt: T,
+        data: {
+          // SAFETY: deliberately malformed on-disk shape to prove fail-closed.
+          pendingHumanRequest: {
+            requestId: 'x',
+          } as unknown as PendingHumanRequest,
+        },
+      });
+      const m = casMarker('ffff11112222');
+      await expect(setCas('c4', m)).resolves.toBe(false);
+      await expect(setCas('c4', { ...m, ref: '' })).resolves.toBe(false);
+      await expect(store.setPendingHumanRequest('', m, T)).resolves.toBe(false);
+      await expect(store.setPendingHumanRequest('c4', m, '')).resolves.toBe(
+        false,
+      );
+      await expect(clearCas('c4', 'x')).resolves.toBe(false);
+      await expect(clearCas('c-absent', m.requestId)).resolves.toBe(false);
+      await store.create('c6', {
+        lastMessageAt: T,
+        data: {
+          // SAFETY: four valid fields plus a hostile extra key.
+          pendingHumanRequest: {
+            ...casMarker('gggg11112222'),
+            x: 1,
+          } as unknown as PendingHumanRequest,
+        },
+      });
+      await expect(clearCas('c6', 'gggg11112222')).resolves.toBe(false);
+      await setCas('c5', m);
+      await expect(clearCas('c5', 'wrong-id')).resolves.toBe(false);
     });
   });
 }

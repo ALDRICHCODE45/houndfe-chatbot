@@ -5,7 +5,10 @@ import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
-import type { ReceiptAmountPointer } from '../domain/conversation-store';
+import type {
+  PendingHumanRequest,
+  ReceiptAmountPointer,
+} from '../domain/conversation-store';
 import { PostgresConversationStore } from './postgres-conversation.store';
 import { runConversationStoreContract } from './conversation-store.contract';
 
@@ -94,6 +97,78 @@ describe('PostgresConversationStore receipt amount pointer SQL', () => {
     expect(sql).toMatch(/-\s*'receiptAmountPointer'/);
     expect(sql).toMatch(/conversation_state\.data/);
     expect(sql).toMatch(/jsonb_set\s*\(/i);
+  });
+});
+
+describe('PostgresConversationStore pending human request CAS SQL', () => {
+  const marker: PendingHumanRequest = {
+    requestId: 'abc123def456',
+    ref: 'HF-abc123def456',
+    createdAt: '2026-07-01T08:00:00.000Z',
+    customerNotifiedAt: '2026-07-01T08:01:00.000Z',
+  };
+  const T = '2026-07-01T09:00:00.000Z';
+  const casStore = (count: number) => {
+    const pool = new FakePool(count);
+    // SAFETY: FakePool implements the only `query` surface the store calls.
+    const store = new PostgresConversationStore(pool as unknown as Pool);
+    return { pool, store };
+  };
+
+  it.each([
+    [1, true],
+    [0, false],
+  ] as const)(
+    'setPendingHumanRequest maps rowCount %i to %s with one guarded UPSERT',
+    async (count, expected) => {
+      const { pool, store } = casStore(count);
+      expect(await store.setPendingHumanRequest('sender-a', marker, T)).toBe(
+        expected,
+      );
+      expect(pool.calls).toHaveLength(1);
+      const { sql, params } = pool.calls[0];
+      expect(sql).toMatch(/^\s*INSERT\s+INTO\s+conversation_state\b/i);
+      expect(sql).toMatch(/ON CONFLICT\s*\(\s*sender_id\s*\)\s*DO UPDATE/i);
+      expect(sql).toMatch(/\?\s*'pendingHumanRequest'/);
+      expect(sql).toMatch(/'null'::jsonb/i);
+      expect(sql).toMatch(/->'pendingHumanRequest'\s*=\s*\$3::jsonb/i);
+      expect(sql).toMatch(/conversation_state\.data\s*\|\|/);
+      expect(sql).not.toMatch(/\bSELECT\b/i);
+      expect(params).toEqual(['sender-a', T, JSON.stringify(marker)]);
+    },
+  );
+
+  it('clearPendingHumanRequest writes explicit JSON null via one conditional UPDATE', async () => {
+    const { pool, store } = casStore(1);
+    expect(
+      await store.clearPendingHumanRequest('sender-a', marker.requestId, T),
+    ).toBe(true);
+    expect(pool.calls).toHaveLength(1);
+    const { sql, params } = pool.calls[0];
+    expect(sql).toMatch(/^\s*UPDATE\s+conversation_state\b/i);
+    expect(sql).toMatch(/jsonb_set\s*\(\s*data,\s*'\{pendingHumanRequest\}'/i);
+    expect(sql).toMatch(/'null'::jsonb/i);
+    expect(sql).toMatch(/jsonb_typeof\s*\(/i);
+    expect(sql).toMatch(/->>'requestId'\s*=\s*\$2/);
+    expect(sql).toMatch(
+      /data->'pendingHumanRequest'\s*=\s*jsonb_build_object\(\s*'requestId'/i,
+    );
+    expect(sql).not.toMatch(/\bINSERT\b|\bON CONFLICT\b/i);
+    expect(params).toEqual(['sender-a', marker.requestId, T]);
+  });
+
+  it('rejects malformed markers and invalid args without touching the pool', async () => {
+    const { pool, store } = casStore(1);
+    await expect(
+      store.setPendingHumanRequest('sender-a', { ...marker, ref: '' }, T),
+    ).resolves.toBe(false);
+    await expect(
+      store.clearPendingHumanRequest('sender-a', '', T),
+    ).resolves.toBe(false);
+    await expect(store.setPendingHumanRequest('', marker, T)).resolves.toBe(
+      false,
+    );
+    expect(pool.calls).toHaveLength(0);
   });
 });
 

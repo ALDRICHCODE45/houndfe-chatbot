@@ -143,6 +143,33 @@ export function readPendingHumanRequest(
   return candidate as unknown as PendingHumanRequest;
 }
 
+/** Fail-closed guard for the non-empty key arguments used by the CAS writers. */
+export function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * Strict structural guard for a persisted human-handoff marker.
+ *
+ * Stricter than `readPendingHumanRequest`, which stays lenient for legacy
+ * reads: the CAS writers must fail closed on any partial, empty,
+ * extra-keyed, or prototype-inherited blob, so all four fields must be
+ * non-empty OWN string properties and no other own enumerable key may be
+ * present.
+ */
+export function isPendingHumanRequest(
+  value: unknown,
+): value is PendingHumanRequest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const marker = value as Record<string, unknown>;
+  if (Object.keys(marker).length !== 4) return false;
+  return (
+    ['requestId', 'ref', 'createdAt', 'customerNotifiedAt'] as const
+  ).every((key) => Object.hasOwn(marker, key) && isNonEmptyString(marker[key]));
+}
+
 /**
  * Default accessor used by the agent runner to obtain the message
  * transcript without having to repeat the nullish-coalescing dance.
@@ -159,6 +186,37 @@ export function readMessages(state: ConversationState): AgentMessage[] {
  * the CONVERSATION_STORE Symbol token.
  */
 export interface ConversationStore {
+  /**
+   * First-contact-safe CAS set of `data.pendingHumanRequest`.
+   *
+   * Returns true only when the sender has no row, has no marker, has
+   * explicit JSON null, or already holds exactly this marker (idempotent
+   * replay). A different or corrupt active marker is never overwritten.
+   * Existing `data` keys are preserved; `update()` is deliberately NOT
+   * reused here so the legacy marker writer stays byte-compatible until
+   * the T3b cutover.
+   *
+   * `lastMessageAt` is validated as a non-empty string; the marker must
+   * pass `isPendingHumanRequest` (all four fields non-empty OWN strings).
+   */
+  setPendingHumanRequest(
+    senderId: string,
+    marker: PendingHumanRequest,
+    lastMessageAt: string,
+  ): Promise<boolean>;
+
+  /**
+   * Conditional CAS clear: sets `data.pendingHumanRequest` to explicit JSON
+   * null (the key is never removed) when the stored marker is structurally
+   * complete and its `requestId` matches. No UPSERT; a missing row, wrong
+   * id, or malformed marker returns false.
+   */
+  clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+    lastMessageAt: string,
+  ): Promise<boolean>;
+
   setReceiptAmountPointer(
     senderId: string,
     pointer: ReceiptAmountPointer,
