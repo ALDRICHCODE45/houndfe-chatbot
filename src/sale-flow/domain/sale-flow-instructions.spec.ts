@@ -1,3 +1,4 @@
+import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import {
   SALE_FLOW_INSTRUCTIONS,
   composeSaleFlowSystemPrompt,
@@ -163,7 +164,11 @@ describe('sale-flow-instructions', () => {
     });
 
     it('encodes the awaiting-human posture rule with the runner canned reply', () => {
-      expect(SALE_FLOW_INSTRUCTIONS).toContain('{ ok: true }');
+      // T2b: the indefinite wait is gated on the LEGACY success shape, never a
+      // bare `{ ok: true }` (the RESTOCK route also returns `ok: true`).
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        '{ ok: true, customerNotified: true }',
+      );
       expect(SALE_FLOW_INSTRUCTIONS).toContain('espera indefinidamente');
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
@@ -213,6 +218,75 @@ describe('sale-flow-instructions', () => {
         expect(idx).toBeGreaterThan(lastIndex);
         lastIndex = idx;
       }
+    });
+  });
+
+  describe('RESTOCK outcome disambiguation (T2b: historical record is never a notice)', () => {
+    it('step 5 distinguishes the RESTOCK historical record from the legacy customerNotified: true escalation', () => {
+      for (const marker of [
+        "outcome: 'historical_intake_recorded'",
+        'customerNotified: false',
+        'customerNotified: true',
+        'restock_unavailable',
+      ]) {
+        expect(SALE_FLOW_INSTRUCTIONS).toContain(marker);
+      }
+    });
+
+    it('RESTOCK success proves no resolution, ETA, human response, future notification or provider delivery, and promises no follow-up', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/no hay resolución actual/i);
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(
+        /respuesta humana, notificación futura ni entrega del proveedor/i,
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/no prometas seguimiento/i);
+    });
+
+    it('RESTOCK blocked says the request could not be confirmed and forbids legacy retry/escalation or any implied notice', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/no pudo confirmarse/i);
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/NO reintentes/i);
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/NO escales por la vía legado/i);
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(
+        /NO impliques que se envió un aviso/i,
+      );
+    });
+
+    it('rejects the old unconditional ok:true => notified posture and keeps the wait branch-qualified', () => {
+      // The previous wording treated ANY `{ ok: true }` as "customer notified +
+      // wait indefinitely" — including RESTOCK. That unconditional claim is gone.
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain(
+        'devuelva `{ ok: true }`, NO sigas intentando avanzar',
+      );
+      const legacyGate = SALE_FLOW_INSTRUCTIONS.indexOf(
+        '`{ ok: true, customerNotified: true }`',
+      );
+      const waitClaim = SALE_FLOW_INSTRUCTIONS.indexOf(
+        'espera indefinidamente',
+      );
+      const restockCarveOut = SALE_FLOW_INSTRUCTIONS.indexOf(
+        'Esta espera indefinida aplica SOLO a la ruta legado',
+      );
+      expect(legacyGate).toBeGreaterThan(-1);
+      expect(waitClaim).toBeGreaterThan(legacyGate);
+      expect(restockCarveOut).toBeGreaterThan(waitClaim);
+    });
+
+    it('legacy kinds (including default-off out_of_stock) keep the escalation + canned waiting semantics', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toMatch(
+        /kind: 'out_of_stock', digest: { productId, name, variantId\?, quantity\? }/,
+      );
+    });
+
+    it('the requestHumanAssistance tool description distinguishes the RESTOCK record from the legacy notice', () => {
+      const tool = makeRequestHumanAssistanceTool({} as never);
+      expect(tool.description).toContain(
+        "outcome: 'historical_intake_recorded'",
+      );
+      expect(tool.description).toContain('customerNotified: false');
+      expect(tool.description).toContain('customerNotified: true');
+      expect(tool.description).toContain('restock_unavailable');
     });
   });
 

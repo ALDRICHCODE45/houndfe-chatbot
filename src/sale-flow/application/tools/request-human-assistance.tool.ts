@@ -115,7 +115,7 @@ async function runRestockRoute(
 export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
   return tool({
     description:
-      'Escala el caso a un agente humano. SOLO llámala cuando `checkStock` / `evaluateCart` / la conversación lo indiquen. NO la uses para derivaciones que no correspondan a un caso explícito.',
+      "Escala el caso a un agente humano. SOLO llámala cuando `checkStock` / `evaluateCart` / la conversación lo indiquen. NO la uses para derivaciones que no correspondan a un caso explícito. Distingue el resultado EXACTO: `{ ok: true, customerNotified: true }` es la ruta legado y sí notifica al cliente; en `kind: 'out_of_stock'` la ruta RESTOCK devuelve `{ ok: true, outcome: 'historical_intake_recorded', customerNotified: false }`, que SOLO registra un reporte histórico sin resolución actual, ETA, respuesta humana, notificación futura ni entrega del proveedor: NO lo presentes como un escalado ni prometas seguimiento. Si devuelve `{ ok: false, error: { kind: 'restock_unavailable', retryable: false } }`, di que la solicitud no pudo confirmarse: NO reintentes, NO escales por la vía legado y NO impliques que se envió un aviso.",
     inputSchema: z.discriminatedUnion('kind', [
       z.object({
         kind: z.literal('out_of_stock'),
