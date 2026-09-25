@@ -1398,6 +1398,252 @@ describe('ChatbotApiHttpClient', () => {
     });
   });
 
+  // ─── getRestockDecision (GET /chatbot-api/human-decisions/:id) — T4b1
+
+  describe('getRestockDecision (T4b1)', () => {
+    const decisionId = '77777777-7777-4777-8777-777777777777';
+
+    const currentDecision = (overrides: Record<string, unknown> = {}) => ({
+      id: decisionId,
+      sourceRequestId: '11111111-1111-4111-8111-111111111111',
+      type: 'RESTOCK',
+      status: 'PENDING',
+      version: 1,
+      createdAt: '2026-08-25T12:00:01.000Z',
+      snapshot: {
+        branchId: '55555555-5555-4555-8555-555555555555',
+        branchName: 'Sucursal Centro',
+        productId: '22222222-2222-4222-8222-222222222222',
+        productName: 'Croquetas Premium',
+        variantId: null,
+        sku: 'SKU-1',
+        requestedQuantity: 2,
+        observedStockAtRequest: 0,
+        stockObservedAt: '2026-08-25T12:00:00.000Z',
+      },
+      supersedesDecisionId: null,
+      resolution: null,
+      applyBefore: null,
+      ...overrides,
+    });
+
+    const resolvedDecision = () => ({
+      ...currentDecision(),
+      status: 'RESOLVED',
+      version: 2,
+      resolution: {
+        action: 'PROVIDE_RESTOCK_ESTIMATE',
+        restockDays: 3,
+        resolvedAt: '2026-08-25T13:00:00.000Z',
+      },
+      applyBefore: '2026-08-25T14:00:00.000Z',
+    });
+
+    const poll = () =>
+      client.getRestockDecision(decisionId).then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (error: ChatbotApiError) => error,
+      );
+
+    it('GETs the encoded decision URL with auth headers and parses PENDING and RESOLVED current states', async () => {
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(currentDecision())))
+        .mockReturnValueOnce(of(axiosResponse(resolvedDecision())));
+
+      const pending = await client.getRestockDecision(decisionId);
+      expect(pending.status).toBe('PENDING');
+      expect(pending.resolution).toBeNull();
+      expect(pending.applyBefore).toBeNull();
+
+      const resolved = await client.getRestockDecision(decisionId);
+      expect(resolved.status).toBe('RESOLVED');
+      expect(resolved.resolution).toEqual({
+        action: 'PROVIDE_RESTOCK_ESTIMATE',
+        restockDays: 3,
+        resolvedAt: '2026-08-25T13:00:00.000Z',
+      });
+
+      const cfg = httpService.request.mock.calls[0][0] as {
+        method: string;
+        url: string;
+        headers: Record<string, string>;
+      };
+      expect(cfg.method).toBe('GET');
+      expect(cfg.url).toBe(`/chatbot-api/human-decisions/${decisionId}`);
+      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-UUID decision id before any HTTP request', async () => {
+      await expect(
+        client.getRestockDecision('not-a-uuid'),
+      ).rejects.toBeInstanceOf(ChatbotApiError);
+      expect(httpService.request).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed, extra-key and wrong-id current bodies as UpstreamError with body evidence', async () => {
+      const bodies: unknown[] = [
+        currentDecision({ extra: true }),
+        currentDecision({ status: 'RESOLVED', version: 2 }),
+        currentDecision({ id: '99999999-9999-4999-8999-999999999999' }),
+        {
+          ...currentDecision(),
+          snapshot: { ...currentDecision().snapshot, productName: '   ' },
+        },
+      ];
+
+      for (const body of bodies) {
+        httpService.request.mockReturnValueOnce(of(axiosResponse(body)));
+        const error = await poll();
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error.statusCode).toBe(200);
+        expect(error.responseBody).toEqual(body);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(bodies.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('never interprets an immutable POST-only receipt replay as current RESOLVED state', async () => {
+      const receipt = currentDecision();
+      httpService.request.mockReturnValue(of(axiosResponse(receipt)));
+
+      const decision = await client.getRestockDecision(decisionId);
+      expect(decision.status).toBe('PENDING');
+      expect(decision.version).toBe(1);
+      expect(decision.resolution).toBeNull();
+      expect(decision.applyBefore).toBeNull();
+    });
+
+    it('rejects a fulfilled unexpected 201 status with UpstreamError evidence', async () => {
+      const body = currentDecision();
+      httpService.request.mockReturnValueOnce(of(axiosResponse(body, 201)));
+
+      const error = await poll();
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect(error.statusCode).toBe(201);
+      expect(error.responseBody).toEqual(body);
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('retries network/5xx failures with bounded backoff and returns the later success', async () => {
+      httpService.request
+        .mockReturnValueOnce(
+          throwError(() => ({
+            response: {
+              status: 503,
+              data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+            },
+          })),
+        )
+        .mockReturnValueOnce(
+          throwError(() => ({ code: 'ECONNRESET', message: 'socket down' })),
+        )
+        .mockReturnValueOnce(of(axiosResponse(currentDecision())));
+
+      await expect(
+        client.getRestockDecision(decisionId),
+      ).resolves.toMatchObject({ status: 'PENDING' });
+
+      expect(httpService.request).toHaveBeenCalledTimes(3);
+      expect(sleep).toHaveBeenNthCalledWith(1, 100);
+      expect(sleep).toHaveBeenNthCalledWith(2, 200);
+    });
+
+    it('exhausts the bounded 3-attempt retry on persistent 5xx and maps the final error', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 503,
+            data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+          },
+        })),
+      );
+
+      const error = await poll();
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect(error.statusCode).toBe(503);
+      expect(error.errorCode).toBe('UPSTREAM_DOWN');
+      expect(httpService.request).toHaveBeenCalledTimes(3);
+      expect(sleep).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a 4xx, mapping it in a single request', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 409,
+            data: {
+              statusCode: 409,
+              code: 'VERSION_CONFLICT',
+              message: 'x',
+            },
+          },
+        })),
+      );
+
+      const error = await poll();
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect(error.statusCode).toBe(409);
+      expect(error.errorCode).toBe('VERSION_CONFLICT');
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [401, 'UNAUTHORIZED', AuthError],
+      [403, 'FORBIDDEN', ForbiddenError],
+      [404, 'NOT_FOUND', NotFoundError],
+    ])(
+      'maps a %i scoped code envelope to %p without retry',
+      async (status, code, ErrorType) => {
+        httpService.request.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status,
+              data: { statusCode: status, code, message: 'nope' },
+            },
+          })),
+        );
+
+        const error = await poll();
+        expect(error).toBeInstanceOf(ErrorType);
+        expect(error.statusCode).toBe(status);
+        expect(error.errorCode).toBe(code);
+        expect(httpService.request).toHaveBeenCalledTimes(1);
+        expect(sleep).not.toHaveBeenCalled();
+      },
+    );
+
+    it('maps 429 to RateLimitError with Retry-After and no retry', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 429,
+            headers: { 'retry-after': '7' },
+            data: {
+              statusCode: 429,
+              code: 'RATE_LIMITED',
+              message: 'slow down',
+            },
+          },
+        })),
+      );
+
+      const error = await poll();
+      expect(error).toBeInstanceOf(RateLimitError);
+      expect((error as RateLimitError).retryAfterSeconds).toBe(7);
+      expect(error.errorCode).toBe('RATE_LIMITED');
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
   describe('CancelSaleInputSchema', () => {
     it('accepts each of the five reason values', () => {
       for (const reason of [

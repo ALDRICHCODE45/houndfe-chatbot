@@ -1,7 +1,7 @@
 import { HttpService } from '@nestjs/axios';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { AxiosRequestConfig } from 'axios';
+import type { AxiosRequestConfig, AxiosResponse } from 'axios';
 import { lastValueFrom } from 'rxjs';
 import type { AppConfig } from '../../config/configuration';
 import { ChatbotApiClient } from '../domain/chatbot-api.client';
@@ -35,10 +35,12 @@ import {
   CreateSaleInputSchema,
 } from '../domain/dtos/sales.dto';
 import {
+  normalizeRestockDecision,
   normalizeRestockIntake,
   normalizeRestockIntakeReceipt,
 } from '../domain/dtos/human-decisions.dto';
 import type {
+  RestockDecision,
   RestockIntakeInput,
   RestockIntakeReceipt,
 } from '../domain/dtos/human-decisions.dto';
@@ -61,6 +63,8 @@ type RequestOptions = {
 
 const MAX_GET_ATTEMPTS = 3;
 const INITIAL_BACKOFF_MS = 100;
+const DECISION_ID_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const CHATBOT_API_SLEEP = Symbol('CHATBOT_API_SLEEP');
 
 @Injectable()
@@ -242,6 +246,57 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   }
 
   /**
+   * `GET /chatbot-api/human-decisions/:id` current-state poll (contract v1,
+   * scope `human-decisions:read`).
+   *
+   * The bot-only GET is the only source of current `PENDING`/`RESOLVED`
+   * state; the immutable POST receipt never is. The decision id is validated
+   * as a UUID before any request. It reuses the safe GET retry policy
+   * (network/5xx only, bounded to three attempts) and requires an HTTP 200
+   * whose body parses as a current decision bound to the requested UUID
+   * (case-insensitive). Any unexpected status or malformed/mismatched body
+   * throws `UpstreamError` with status, raw body and `errorCode` evidence;
+   * transport failures keep flowing through `mapError`. No business-state
+   * change or customer notification occurs here.
+   */
+  async getRestockDecision(decisionId: string): Promise<RestockDecision> {
+    if (!DECISION_ID_UUID.test(decisionId)) {
+      throw new ChatbotApiError(
+        'RESTOCK decision id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: `/chatbot-api/human-decisions/${encodeURIComponent(decisionId)}`,
+      },
+      { retryable: true },
+    );
+
+    const body = response.data;
+    const decision = normalizeRestockDecision(body);
+
+    if (
+      response.status !== 200 ||
+      decision === null ||
+      decision.id.toLowerCase() !== decisionId.toLowerCase()
+    ) {
+      throw new UpstreamError(
+        'Chatbot API current decision poll response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return decision;
+  }
+
+  /**
    * `POST /chatbot-api/human-decisions` RESTOCK intake (contract v1, scope
    * `human-decisions:create`).
    *
@@ -392,10 +447,26 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     };
   }
 
+  /** Body-only facade preserving the existing methods' return semantics. */
   private async request<T>(
     config: AxiosRequestConfig,
     options: RequestOptions = {},
   ): Promise<T> {
+    const response = await this.requestWithResponse<T>(config, options);
+    return response.data;
+  }
+
+  /**
+   * Full-response seam shared with `request`: identical single-branch guard
+   * and safe retry policy (network/5xx only, bounded to three attempts),
+   * exposing the HTTP status and raw body so the current-decision poll can
+   * require `200` and keep evidence on unexpected or malformed bodies. Only
+   * the returned shape changes; existing methods still receive the body.
+   */
+  private async requestWithResponse<T>(
+    config: AxiosRequestConfig,
+    options: RequestOptions = {},
+  ): Promise<AxiosResponse<T>> {
     const configuredBranchId = this.configService.getOrThrow<
       AppConfig['chatbotApi']['branchId']
     >('chatbotApi.branchId');
@@ -415,7 +486,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           this.httpService.request<T>(requestConfig),
         );
 
-        return response.data;
+        return response;
       } catch (error) {
         if (
           this.shouldRetry(requestConfig.method, error, attempt, maxAttempts)

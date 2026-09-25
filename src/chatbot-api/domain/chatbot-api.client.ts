@@ -6,6 +6,7 @@ import {
 } from './dtos/customers.dto';
 import type { PaymentDetail } from './dtos/payment-details.dto';
 import type {
+  RestockDecision,
   RestockIntakeInput,
   RestockIntakeReceipt,
 } from './dtos/human-decisions.dto';
@@ -67,4 +68,12 @@ export interface ChatbotApiClient {
    *  `201`/`200` with a strictly validated immutable historical receipt
    *  (`PENDING`/v1), never on inferred current decision state. */
   submitRestockIntake(dto: RestockIntakeInput): Promise<RestockIntakeReceipt>;
+  /** T4b1: `GET /chatbot-api/human-decisions/:id` RESTOCK current-state poll
+   *  (scope `human-decisions:read`). The only source of current
+   *  `PENDING`/`RESOLVED` state; the immutable POST receipt never is. Validates
+   *  the decision id as a UUID before any request, uses the safe GET retry
+   *  policy (network/5xx only, bounded to three attempts), requires HTTP 200
+   *  and binds the parsed current decision to the requested UUID
+   *  (case-insensitive). */
+  getRestockDecision(decisionId: string): Promise<RestockDecision>;
 }
