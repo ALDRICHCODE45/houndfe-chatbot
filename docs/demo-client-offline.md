@@ -1,7 +1,8 @@
 # Demo offline para el cliente — Decisiones humanas (RESTOCK)
 
 Recorrido **sin servicios en vivo** por la evidencia ya probada de este
-repositorio: solo comandos locales y un tablero HTML autocontenido.
+repositorio: comandos locales y un tablero HTML autocontenido. El POS dispone,
+además, de un **harness visual sintético separado** que no realiza HTTP.
 
 - Alcance: un caso RESTOCK offline y la ingeniería que lo respalda.
 - No es: integración de extremo a extremo ni demostración de producto real.
@@ -10,13 +11,13 @@ repositorio: solo comandos locales y un tablero HTML autocontenido.
 
 ## Leyenda de estado (usar en toda la charla)
 
-| Etiqueta                        | Significado en esta demo                                                      |
-| ------------------------------- | ----------------------------------------------------------------------------- |
-| **IMPLEMENTED OFFLINE**         | Código del bot probado en este repositorio, sin red ni backend real.          |
-| **SIMULATION**                  | Ruta con cliente/backend _falso_ y base **desechable** (Testcontainers).      |
-| **PROBADO OFFLINE · OTRA RAMA** | Implementado y probado, pero en otra rama; **no** integrado aquí.             |
-| **EVIDENCIA SEPARADA**          | Suites/ramas reportadas por otros equipos; se citan, **no** se ejecutan aquí. |
-| **PLANNED**                     | Integración ausente: GET/ACK del bot, entrega al dispositivo, montaje del FE. |
+| Etiqueta                        | Significado en esta demo                                                        |
+| ------------------------------- | ------------------------------------------------------------------------------- |
+| **IMPLEMENTED OFFLINE**         | Código del bot probado en este repositorio, sin red ni backend real.            |
+| **SIMULATION**                  | Ruta con cliente/backend _falso_ y base **desechable** (Testcontainers).        |
+| **PROBADO OFFLINE · OTRA RAMA** | Implementado y probado, pero en otra rama; **no** integrado aquí.               |
+| **EVIDENCIA SEPARADA**          | Suites/ramas reportadas por otros equipos; se citan, **no** se ejecutan aquí.   |
+| **PLANNED**                     | Integración ausente: GET/ACK del bot, entrega al dispositivo y FE→backend real. |
 
 `HUMAN_DECISIONS_RESTOCK_ENABLED` **por defecto es `false`**. Reserva, ledger y
 coordinador existen y están probados; el coordinador **sí** compone reserva y
@@ -41,10 +42,11 @@ RECEIPT_RECORDED | UNKNOWN`. Un resultado ambiguo queda en **espera**, nunca
    PostgreSQL **desechable** con Testcontainers (`postgres:16-alpine`). Prueba la
    ruta durable, no un backend real."
 6. **(30 s) Segundo caso y evidencia.** Envío (otra rama): `SHIPPING_APPROVAL`
-   (aprobar/rechazar/expirado), offline. Backend y frontend: **evidencia
-   separada**, no ejecutada aquí.
+   (aprobar/rechazar/expirado), offline. Backend: evidencia separada. Frontend:
+   bandeja POS sintética lista→detalle→resolución, **sin HTTP**.
 7. **(30 s) Cierre.** "El preflight y el coordinador no están conectados entre sí
-   ni al webhook. Todo está etiquetado; nada de esto es una integración viva."
+   ni al webhook; la resolución del POS simulado tampoco notifica al cliente.
+   Todo está etiquetado: no es una integración viva."
 
 ## Preflight (antes de la reunión)
 
@@ -101,7 +103,7 @@ cableados entre sí).
 
 - Sin Docker: omitir el **Comando 3** y declararlo "no ejecutado"; los Comandos 1
   y 2 no requieren contenedores.
-- Sin navegador: mostrar `docs/demo-client-offline.png` (captura local del HTML a 1440×1600); el guion no depende del navegador.
+- Sin navegador: usar este runbook textual. `docs/demo-client-offline.png` es una **captura histórica anterior a la bandeja FE** y no debe mostrarse como estado actual; el guion no depende de ella.
 - Plan B: usar una grabación previa y decir que es una repetición. Registro:
   anotar commit, hora, comando exacto y resultado (aprobado/fallado/omitido). Si
   algo falla o se omite, decirlo. No fabricar conteos ni éxitos.
@@ -114,8 +116,14 @@ cableados entre sí).
   dedicada (localhost, **no** desechable), build limpio. El Jest completo del
   backend sigue en rojo por fallos previos no relacionados (promociones/env);
   GET/ACK del bot siguen **no** conectados y default-off.
-- **Frontend `88d0c81` — EVIDENCIA SEPARADA:** 11 suites / 219 pruebas de
-  componentes. La ruta es un _shell_: **no** hay lista/detalle/resolver montados.
+- **Frontend `d23cd74` — EVIDENCIA SEPARADA:** bandeja POS **offline,
+  sintética y sin HTTP**, con lista→detalle→resolución en memoria; etiqueta
+  `SIMULACIÓN · datos sintéticos · sin HTTP`. Fixture sin variante: `Alimento
+seco 15 kg`, SKU `ALIM-15KG-DEMO`, cantidad 2 y stock observado 0. El
+  equipo FE reportó 5/5 pruebas responsive y 226 pruebas acumuladas. Su demo
+  se inicia desde su propio worktree con `pnpm demo:human-decisions:offline`
+  **solo si el puerto 4173 está libre**, sin detener servidores ajenos. No
+  confirma una decisión en el backend ni envía un WhatsApp.
 - **Shipping `116ce03` — PROBADO OFFLINE · OTRA RAMA:** **sí** implementa la
   resolución humana `SHIPPING_APPROVAL` (aprobar/rechazar/expirado) en una rama
   aparte, con cotización y aceptación del cliente codificadas; offline, con HTTP
@@ -126,8 +134,9 @@ cableados entre sí).
 
 ## Pendiente (PLANNED)
 
-GET/ACK del bot, entrega al dispositivo, integración con RESTOCK y montaje de
-lista/detalle/resolver en el frontend.
+GET/ACK del bot, entrega al dispositivo, integración RESTOCK entre webhook,
+backend y frontend real. El harness FE visual existe, pero **no** está
+conectado al backend.
 
 Archivos clave: `docs/demo-client-offline.html` ·
 `src/human-decisions/application/restock-intake.service.ts` ·

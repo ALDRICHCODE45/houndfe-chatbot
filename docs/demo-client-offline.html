@@ -169,8 +169,8 @@
         <b class="done">PROBADO OFFLINE · OTRA RAMA:</b> probado, pero fuera de
         esta rama. <b class="sep">EVIDENCIA SEPARADA:</b> reportada por otros
         equipos; se cita, no se ejecuta aquí. <b class="plan">PLANNED:</b>
-        integración ausente (GET/ACK del bot, entrega al dispositivo, montaje
-        del FE).
+        integración ausente (GET/ACK del bot, entrega al dispositivo y
+        FE→backend real).
       </p>
     </header>
 
@@ -273,9 +273,10 @@
       <li>
         <span class="tag sep">EVIDENCIA SEPARADA</span
         ><span
-          ><b>Frontend <code>88d0c81</code>:</b> 11 suites / 219 pruebas de
-          componentes; ruta <em>shell</em>, sin lista/detalle/resolver
-          montados.</span
+          ><b>Frontend <code>d23cd74</code>:</b> bandeja POS sintética
+          lista→detalle→resolución en memoria, <b>sin HTTP</b>, etiquetada
+          «SIMULACIÓN · datos sintéticos · sin HTTP»; 5/5 pruebas responsive y
+          226 pruebas acumuladas. No notifica al cliente.</span
         >
       </li>
     </ul>
@@ -291,14 +292,17 @@
       </li>
       <li>
         <span class="tag plan">PLANNED</span
-        ><span>Montaje de lista/detalle/resolver en el frontend.</span>
+        ><span
+          >Conexión FE→backend real; la bandeja sintética ya existe, pero no
+          realiza HTTP.</span
+        >
       </li>
     </ul>
 
     <footer>
       Demo guiada offline · fuente de verdad: el commit exacto y los comandos
-      del runbook (<code>docs/demo-client-offline.md</code>). Sin capturas
-      fabricadas ni integración en vivo.
+      del runbook (<code>docs/demo-client-offline.md</code>). La captura PNG
+      anterior es histórica, no del estado FE actual. Sin integración en vivo.
     </footer>
   </body>
 </html>

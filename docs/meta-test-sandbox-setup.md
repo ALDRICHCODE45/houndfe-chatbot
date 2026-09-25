@@ -20,14 +20,14 @@
 
    `META_SANDBOX_RECIPIENT` es el WhatsApp ID **solo dígitos, sin `+`**, del teléfono de prueba ya verificado; no es el Phone Number ID del número emisor. `META_GRAPH_API_VERSION` es opcional (valor por defecto `v23.0`); si Meta pide otra versión, usar el formato `vN.N`. No crear `OPS_CHANNEL_PHONE` para esta demo.
 
-5. Si se aprueba después el ensayo de IA real, añadir `OPENAI_API_KEY` y el modelo/los límites que se acuerden. La sola presencia de la clave **no** autoriza llamadas al proveedor.
+5. Si se aprueba después el ensayo de IA real, añadir `OPENAI_API_KEY` y `OPENAI_SANDBOX_MODEL` al mismo archivo. Los únicos modelos admitidos son `gpt-4.1-mini`, `gpt-4.1-nano` y `gpt-4o-mini`; **no elegir uno sin acuerdo**. Límites opcionales: `OPENAI_SANDBOX_MAX_CALLS` (máximo 5 por proceso), `OPENAI_SANDBOX_MAX_OUTPUT_TOKENS` (máximo 256 por llamada), `OPENAI_SANDBOX_MAX_INPUT_CHARS` (máximo 500) y `OPENAI_SANDBOX_TIMEOUT_MS` (máximo 20000). Se validan antes de abrir la app; las llamadas no tienen reintentos automáticos. Estos techos **no garantizan un límite en dólares**. La presencia de la clave **no** autoriza llamadas al proveedor.
 
 ## Límites antes de encender nada
 
 - El perfil de prueba solo debe exponer `GET/POST /webhook`, escuchar en `127.0.0.1` y permanecer en **modo local** con emisor falso hasta las verificaciones independientes.
-- `--outbound` habilitaría el emisor Meta detrás de una barrera de destinatario: **no ejecutarlo** antes de confirmar conmigo el ID emisor y destinatario exactos, el gasto del LLM y obtener autorización nueva para el primer envío.
+- `--outbound` habilitaría el emisor Meta detrás de una barrera de destinatario; `--llm` activaría un máximo de cinco intentos OpenAI por proceso, limitado a **cuatro entradas inocuas canónicas y tres respuestas fijas seguras**. Son opciones separadas y apagadas por defecto. **No ejecutar ninguna** antes de confirmar emisor/destinatario exactos, modelo/límites numéricos, y obtener autorización nueva para el primer envío y la primera llamada al LLM.
 - No iniciar ngrok ni cambiar el callback del panel Meta todavía. Antes de hacerlo, registrar el callback anterior para poder restaurarlo; un túnel efímero puede caducar.
-- Nada de ventas, catálogo de producción, Skydropx, base de datos persistente ni promesas de entrega al dispositivo. La bandeja POS de la junta es una **simulación offline sin HTTP** y no está conectada al canal.
+- El filtro entrante admite **solo texto simple** del destinatario aprobado. Un lote firmado anómalo/mixto o un mensaje con adjunto se detiene sin enviar (puede provocar reintentos Meta); esta demo **no** recibe comprobantes. Nada de ventas, catálogo de producción, Skydropx, base de datos persistente ni promesas de entrega al dispositivo. La bandeja POS de la junta es una **simulación offline sin HTTP** y no está conectada al canal.
 
 ## Comprobación segura
 
