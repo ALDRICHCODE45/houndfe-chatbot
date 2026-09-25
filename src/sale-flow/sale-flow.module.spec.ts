@@ -6,6 +6,9 @@ import { ChatbotApiHttpClient } from '../chatbot-api/infrastructure/chatbot-api-
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { PostgresConversationStore } from '../conversation/infrastructure/postgres-conversation.store';
 import { AppConfigModule } from '../config/config.module';
+import { PG_POOL } from '../database/postgres-pool.provider';
+import { RESTOCK_INTAKE_SERVICE } from '../human-decisions/application/restock-intake.service';
+import { SHARED_ROUTE_MARKERS } from '../human-decisions/domain/shared-route-markers';
 import { HUMAN_HANDOFF_STORE } from '../human-handoff/domain/human-handoff-store.port';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
@@ -39,18 +42,27 @@ describe('SaleFlowModule', () => {
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     OPS_CHANNEL_PHONE: '5215500000000',
   };
+  // WU2B sets HUMAN_DECISIONS_RESTOCK_ENABLED in one test, so the flag is saved
+  // and restored alongside the validated env keys (and unset by default).
+  const ENV_KEYS = [
+    ...Object.keys(VALID_ENV),
+    'HUMAN_DECISIONS_RESTOCK_ENABLED',
+  ];
   let savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     savedEnv = {};
-    for (const key of Object.keys(VALID_ENV)) {
+    for (const key of ENV_KEYS) {
       savedEnv[key] = process.env[key];
+    }
+    for (const key of Object.keys(VALID_ENV)) {
       process.env[key] = VALID_ENV[key];
     }
+    delete process.env.HUMAN_DECISIONS_RESTOCK_ENABLED;
   });
 
   afterEach(() => {
-    for (const key of Object.keys(VALID_ENV)) {
+    for (const key of ENV_KEYS) {
       const saved = savedEnv[key];
       if (saved === undefined) {
         delete process.env[key];
@@ -76,16 +88,26 @@ describe('SaleFlowModule', () => {
     create: jest.fn(),
     update: jest.fn(),
   };
-  const stubConfigService = {
+  const stubConfigService = (restockEnabled?: boolean) => ({
     get: (key: string) => {
       if (key === 'chatbotApi.cashierUserId') {
         return '00000000-4000-9000-0000-000000000001';
       }
+      if (key === 'humanDecisions.restockEnabled') {
+        return restockEnabled;
+      }
       return undefined;
     },
+  });
+
+  /** WU2B: the human-decisions adapters need a pool; init must never use it. */
+  const fakePool = {
+    connect: jest.fn(),
+    query: jest.fn().mockResolvedValue({ rows: [] }),
+    end: jest.fn().mockResolvedValue(undefined),
   };
 
-  async function buildModule() {
+  async function buildModule(restockEnabled?: boolean) {
     const moduleRef = await Test.createTestingModule({
       imports: [
         SaleFlowModule,
@@ -116,8 +138,10 @@ describe('SaleFlowModule', () => {
         resolve: jest.fn(),
       })
 
+      .overrideProvider(PG_POOL)
+      .useValue(fakePool)
       .overrideProvider(ConfigService)
-      .useValue(stubConfigService)
+      .useValue(stubConfigService(restockEnabled))
       .compile();
     return moduleRef;
   }
@@ -159,6 +183,27 @@ describe('SaleFlowModule', () => {
     // single SaleFlowModule export.
     const registry = moduleRef.get(RealToolRegistry);
     expect(Object.keys(registry.getTools())).toHaveLength(12);
+    await moduleRef.close();
+  });
+
+  it('resolves the human-decisions RESTOCK tokens with no connection or SQL', async () => {
+    const moduleRef = await buildModule(false);
+    expect(moduleRef.get(SHARED_ROUTE_MARKERS)).toBeDefined();
+    expect(moduleRef.get(RESTOCK_INTAKE_SERVICE)).toBeDefined();
+    const registry = moduleRef.get(RealToolRegistry);
+    expect(Object.keys(registry.getTools())).toHaveLength(12);
+    expect(fakePool.connect).not.toHaveBeenCalled();
+    expect(fakePool.query).not.toHaveBeenCalled();
+    await moduleRef.close();
+  });
+
+  it('stays inert on the SaleFlow surface even when the gate is exactly true', async () => {
+    process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
+    const moduleRef = await buildModule(true);
+    const registry = moduleRef.get(RealToolRegistry);
+    expect(Object.keys(registry.getTools())).toHaveLength(12);
+    expect(fakePool.connect).not.toHaveBeenCalled();
+    expect(fakePool.query).not.toHaveBeenCalled();
     await moduleRef.close();
   });
 });

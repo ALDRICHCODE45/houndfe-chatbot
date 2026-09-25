@@ -5,6 +5,14 @@ import type { ConversationStore } from '../../conversation/domain/conversation-s
 import { CHATBOT_API_CLIENT as CHATBOT_API_CLIENT_TOKEN } from '../../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE as CONVERSATION_STORE_TOKEN } from '../../conversation/domain/conversation-store';
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
+import {
+  RESTOCK_INTAKE_SERVICE,
+  type RestockIntakeService,
+} from '../../human-decisions/application/restock-intake.service';
+import {
+  SHARED_ROUTE_MARKERS,
+  type SharedRouteMarkersPort,
+} from '../../human-decisions/domain/shared-route-markers';
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import type { ToolDeps } from '../application/tool-deps';
 import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
@@ -55,6 +63,8 @@ export class RealToolRegistry implements ToolRegistry {
     @Inject(CONVERSATION_STORE_TOKEN) store: ConversationStore,
     @Inject(HUMAN_HANDOFF_SERVICE_TOKEN)
     humanHandoffService: HumanHandoffService,
+    @Inject(SHARED_ROUTE_MARKERS) markers: SharedRouteMarkersPort,
+    @Inject(RESTOCK_INTAKE_SERVICE) coordinator: RestockIntakeService,
     configService: ConfigService,
   ) {
     const cashierUserId = configService.get<string>(
@@ -67,6 +77,14 @@ export class RealToolRegistry implements ToolRegistry {
       cashierUserId,
       humanHandoffService,
     };
+
+    // WU2B: the experimental RESTOCK gate is an EXACT boolean read. When it is
+    // not exactly true the `restock` property is omitted ENTIRELY, so the
+    // legacy deps stay byte-identical; nothing here reads the markers or
+    // invokes the coordinator, and no tool branches on the capability.
+    if (configService.get<boolean>('humanDecisions.restockEnabled') === true) {
+      deps.restock = { enabled: true, markers, coordinator };
+    }
 
     this.tools = {
       searchCatalog: makeSearchCatalogTool(deps),

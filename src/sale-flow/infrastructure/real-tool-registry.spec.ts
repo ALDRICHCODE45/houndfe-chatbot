@@ -3,10 +3,25 @@ import { ConfigService } from '@nestjs/config';
 import { TERMINAL_RECEIPT_GUIDANCE } from '../application/tools/attach-receipt.tool';
 import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
+import { RESTOCK_INTAKE_SERVICE } from '../../human-decisions/application/restock-intake.service';
+import { SHARED_ROUTE_MARKERS } from '../../human-decisions/domain/shared-route-markers';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
 } from './real-tool-registry';
+
+/**
+ * Capture the deps object the registry hands to a factory, so the spec can
+ * prove the optional `restock` capability is omitted or populated WITHOUT any
+ * tool branching on it. One factory suffices: all twelve share one `deps`.
+ */
+const mockCapturedDeps: Record<string, unknown>[] = [];
+jest.mock('../application/tools/check-stock.tool', () => ({
+  makeCheckStockTool: (deps: Record<string, unknown>) => {
+    mockCapturedDeps.push(deps);
+    return { description: 'checkStock', inputSchema: {}, execute: () => {} };
+  },
+}));
 
 /**
  * Integration tests for RealToolRegistry wiring.
@@ -48,8 +63,12 @@ describe('RealToolRegistry', () => {
     resolveReply: jest.fn(),
     isOpsSender: jest.fn(),
   };
+  const stubMarkers = { readForSender: jest.fn() };
+  const stubCoordinator = { coordinate: jest.fn() };
 
-  async function buildRegistry(): Promise<RealToolRegistry> {
+  async function buildRegistry(
+    restockEnabled?: boolean,
+  ): Promise<RealToolRegistry> {
     const moduleRef = await Test.createTestingModule({
       providers: [
         RealToolRegistry,
@@ -59,12 +78,17 @@ describe('RealToolRegistry', () => {
           provide: HUMAN_HANDOFF_SERVICE_TOKEN,
           useValue: stubHumanHandoffService,
         },
+        { provide: SHARED_ROUTE_MARKERS, useValue: stubMarkers },
+        { provide: RESTOCK_INTAKE_SERVICE, useValue: stubCoordinator },
         {
           provide: ConfigService,
           useValue: {
             get: (key: string) => {
               if (key === 'chatbotApi.cashierUserId') {
                 return '00000000-4000-9000-0000-000000000001';
+              }
+              if (key === 'humanDecisions.restockEnabled') {
+                return restockEnabled;
               }
               return undefined;
             },
@@ -74,6 +98,8 @@ describe('RealToolRegistry', () => {
     }).compile();
     return moduleRef.get(RealToolRegistry);
   }
+
+  const lastDeps = () => mockCapturedDeps[mockCapturedDeps.length - 1];
 
   it('resolves through Nest DI with CHATBOT_API_CLIENT + CONVERSATION_STORE + HUMAN_HANDOFF_SERVICE_TOKEN + ConfigService', async () => {
     const registry = await buildRegistry();
@@ -121,6 +147,30 @@ describe('RealToolRegistry', () => {
     const a = registry.getTools();
     const b = registry.getTools();
     expect(a).toBe(b);
+  });
+
+  it('omits the restock capability entirely when the gate is absent or false', async () => {
+    for (const flag of [undefined, false]) {
+      mockCapturedDeps.length = 0;
+      const registry = await buildRegistry(flag);
+      expect(Object.keys(registry.getTools())).toHaveLength(12);
+      expect('restock' in lastDeps()).toBe(false);
+    }
+    expect(stubMarkers.readForSender).not.toHaveBeenCalled();
+    expect(stubCoordinator.coordinate).not.toHaveBeenCalled();
+  });
+
+  it('populates the restock capability only when the gate is exactly true, and stays inert', async () => {
+    mockCapturedDeps.length = 0;
+    const registry = await buildRegistry(true);
+    expect(Object.keys(registry.getTools())).toHaveLength(12);
+    expect(lastDeps().restock).toEqual({
+      enabled: true,
+      markers: stubMarkers,
+      coordinator: stubCoordinator,
+    });
+    expect(stubMarkers.readForSender).not.toHaveBeenCalled();
+    expect(stubCoordinator.coordinate).not.toHaveBeenCalled();
   });
 
   describe('attachReceipt compatibility wiring (WU12)', () => {
