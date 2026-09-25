@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Decisiones humanas (RESTOCK) — demo offline guiada</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        max-width: 60rem;
+        margin: 0 auto;
+        padding: 2rem 1.25rem 3rem;
+        background: #f6f2ea;
+        color: #1b1916;
+        font-family: system-ui, sans-serif;
+      }
+      header {
+        padding-bottom: 1rem;
+        border-bottom: 3px solid #1b1916;
+      }
+      h1 {
+        margin: 0 0 0.4rem;
+        font-size: clamp(1.35rem, 2.5vw, 1.95rem);
+      }
+      h2 {
+        margin: 1.8rem 0 0.6rem;
+        font-size: 1.1rem;
+        border-bottom: 1px solid #cfc6b8;
+      }
+      p {
+        margin: 0.35rem 0;
+      }
+      code {
+        padding: 0.05em 0.3em;
+        background: #efeae1;
+        font-family: ui-monospace, Menlo, monospace;
+      }
+      .chips,
+      .rail,
+      .returns {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.6rem;
+        margin: 0.9rem 0 0;
+        padding: 0;
+        list-style: none;
+      }
+      .chip,
+      .tag {
+        display: inline-block;
+        padding: 0.25rem 0.6rem;
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 700;
+      }
+      .done {
+        color: #14503c;
+        background: #e2efe8;
+      }
+      .sim {
+        color: #7a4d00;
+        background: #fbeccb;
+      }
+      .plan {
+        color: #3d3a45;
+        background: #ece9f1;
+      }
+      .sep {
+        color: #1b3a5b;
+        background: #e3ecf6;
+      }
+      .chip.gate {
+        color: #a03a1c;
+        background: #fbe4dc;
+      }
+      .rail {
+        padding-top: 1rem;
+        position: relative;
+      }
+      .rail::before {
+        content: '';
+        position: absolute;
+        top: 0.55rem;
+        left: 3%;
+        right: 3%;
+        height: 3px;
+        background: #cfc6b8;
+      }
+      .rail b {
+        display: block;
+      }
+      .rail li {
+        flex: 1 1 9rem;
+        padding: 0.7rem;
+        border: 1px solid #cfc6b8;
+        border-top: 4px solid #14503c;
+        border-radius: 10px;
+        background: #fffdf9;
+        font-size: 0.82rem;
+      }
+      .rail .sim {
+        border-top-color: #7a4d00;
+      }
+      .card {
+        margin-top: 0.9rem;
+        padding: 0.9rem 1rem;
+        border: 1px solid #cfc6b8;
+        border-left: 6px solid #14503c;
+        border-radius: 10px;
+        background: #fffdf9;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        padding: 0.45rem 0.6rem;
+        border: 1px solid #cfc6b8;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: #efeae1;
+      }
+      footer {
+        margin-top: 2rem;
+        padding-top: 0.9rem;
+        border-top: 1px solid #cfc6b8;
+      }
+      :focus-visible {
+        outline: 3px solid #0b57d0;
+        outline-offset: 2px;
+      }
+      @media (max-width: 720px) {
+        .rail::before {
+          display: none;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          transition: none !important;
+          animation: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Decisiones humanas (RESTOCK): demo offline guiada</h1>
+      <p>
+        Evidencia ya probada de una solicitud de reposición; no es integración
+        en vivo ni pantalla de producto. La demo dispara un
+        <b>evento sintético</b>
+        (llamador de prueba), no un webhook.
+      </p>
+      <ul class="chips">
+        <li class="chip done">IMPLEMENTED OFFLINE</li>
+        <li class="chip sim">SIMULATION</li>
+        <li class="chip plan">PLANNED</li>
+        <li class="chip gate">HUMAN_DECISIONS_RESTOCK_ENABLED = false</li>
+      </ul>
+      <p>
+        <b class="done">IMPLEMENTED OFFLINE:</b> código probado aquí, sin red.
+        <b class="sim">SIMULATION:</b> backend <em>falso</em> y base
+        <em>desechable</em> (Testcontainers).
+        <b class="done">PROBADO OFFLINE · OTRA RAMA:</b> probado, pero fuera de
+        esta rama. <b class="sep">EVIDENCIA SEPARADA:</b> reportada por otros
+        equipos; se cita, no se ejecuta aquí. <b class="plan">PLANNED:</b>
+        integración ausente (GET/ACK del bot, entrega al dispositivo, montaje
+        del FE).
+      </p>
+    </header>
+
+    <h2>Caso 1 · RESTOCK (este repo): reserva → POST única → ledger</h2>
+    <ol class="rail" aria-label="Pasos del caso RESTOCK">
+      <li><b>1 · Evento sintético</b>Llamador de prueba, no webhook</li>
+      <li><b>2 · Reserva local</b><code>reserve()</code> fija el id</li>
+      <li class="sim">
+        <b>3 · Una POST falsa</b><code>submitRestockIntake</code>
+      </li>
+      <li><b>4 · Ledger</b>Registro atómico del recibo</li>
+      <li><b>5 · Resultado</b>Id histórico o espera/bloqueo</li>
+    </ol>
+    <p>
+      El preflight (<code>restock-request-preflight.ts</code>) solo
+      prepara/valida y el coordinador es <b>inerte</b>: <b>no</b> están
+      conectados entre sí ni a un webhook. En la demo <b>no</b> se envía nada a
+      un asesor ni a un cliente; la POST <b>falsa</b> solo simula la admisión
+      (<em>intake</em>). Sin reserva no hay POST y un resultado ambiguo queda en
+      <b>espera</b>, nunca como entrega.
+    </p>
+
+    <h2>Estados, bloqueos y esperas (Caso 1)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Categoría</th>
+          <th scope="col">Valores exactos</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Ledger</td>
+          <td>
+            <code>RESERVED</code> → <code>POST_IN_FLIGHT</code> →
+            <code>RECEIPT_RECORDED</code> | <code>UNKNOWN</code>
+          </td>
+        </tr>
+        <tr>
+          <td><code>blocked</code></td>
+          <td>
+            <code>malformed_input</code>, <code>occupied</code>,
+            <code>collision</code>, <code>reservation_blocked</code>
+          </td>
+        </tr>
+        <tr>
+          <td><code>hold</code></td>
+          <td>
+            <code>post_in_flight</code>, <code>unknown_hold</code>,
+            <code>record_unconfirmed</code>
+          </td>
+        </tr>
+        <tr>
+          <td>Coordinador</td>
+          <td>
+            <code>recorded</code> | <code>existing</code> (id histórico) |
+            <code>hold</code> | <code>blocked</code>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Caso 2 · Envío (shipping) — otra rama</h2>
+    <div class="card">
+      <span class="tag done">PROBADO OFFLINE · OTRA RAMA</span>
+      <p>
+        <b>Shipping <code>116ce03</code>.</b> Resolución humana
+        <code>SHIPPING_APPROVAL</code> (aprobar / rechazar / expirado)
+        implementada y probada offline; cotización y aceptación del cliente
+        codificadas. Todo con HTTP simulado (nunca llama al proveedor).
+      </p>
+      <ul>
+        <li>
+          <b>No integrado:</b> el ruteo de respuestas SÍ/NO <b>no</b> está
+          conectado al webhook.
+        </li>
+        <li>
+          <b>No implementado:</b> resolución de colisión
+          (<code>CANCEL_SHIPPING</code>/<code>CANCEL_RECEIPT</code>).
+        </li>
+        <li>
+          <b>Default-off:</b> <code>SHIPPING_QUOTES_ENABLED=false</code>; no
+          corre desde aquí.
+        </li>
+      </ul>
+    </div>
+
+    <h2>Evidencia separada (reportada, no ejecutada aquí)</h2>
+    <ul class="returns">
+      <li>
+        <span class="tag sep">EVIDENCIA SEPARADA</span
+        ><span
+          ><b>Backend <code>1188206</code>:</b> HD-06 offline congelado por
+          <em>source bytes</em> (solo offline, no despliega). 20 suites DB-free
+          / 1206 y 10 suites / 198 en base RESTOCK local dedicada (no
+          desechable), build limpio. Jest completo en rojo por fallos previos no
+          relacionados; GET/ACK del bot sin conectar, default-off.</span
+        >
+      </li>
+      <li>
+        <span class="tag sep">EVIDENCIA SEPARADA</span
+        ><span
+          ><b>Frontend <code>88d0c81</code>:</b> 11 suites / 219 pruebas de
+          componentes; ruta <em>shell</em>, sin lista/detalle/resolver
+          montados.</span
+        >
+      </li>
+    </ul>
+
+    <h2>Pendiente (PLANNED)</h2>
+    <ul class="returns">
+      <li>
+        <span class="tag plan">PLANNED</span
+        ><span
+          >GET/ACK del bot y entrega al dispositivo; integración con
+          RESTOCK.</span
+        >
+      </li>
+      <li>
+        <span class="tag plan">PLANNED</span
+        ><span>Montaje de lista/detalle/resolver en el frontend.</span>
+      </li>
+    </ul>
+
+    <footer>
+      Demo guiada offline · fuente de verdad: el commit exacto y los comandos
+      del runbook (<code>docs/demo-client-offline.md</code>). Sin capturas
+      fabricadas ni integración en vivo.
+    </footer>
+  </body>
+</html>
