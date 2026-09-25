@@ -245,4 +245,273 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
       });
     });
   });
+
+  // T3c: explicit Postgres-only proofs for the CAS marker primitives and the
+  // stale-`update()` carve-out. They mirror the shared contract's CAS
+  // scenarios but assert against a disposable postgres:16-alpine row, so the
+  // JSONB guards are exercised by the real engine instead of only by
+  // SQL-shape regexes on a fake pool.
+  describe('CAS marker + stale-update DB proof (T3c)', () => {
+    const T = '2026-07-02T08:00:00.000Z';
+    const T2 = '2026-07-02T09:00:00.000Z';
+    const marker = (id: string): PendingHumanRequest => ({
+      requestId: id,
+      ref: `HF-${id}`,
+      createdAt: T,
+      customerNotifiedAt: T,
+    });
+    const pointer: ReceiptAmountPointer = {
+      receiptMediaId: 'receipt-db-1',
+      saleId: 'sale-db-1',
+      receiptVersion: '9007199254740993',
+    };
+
+    beforeEach(async () => {
+      await pool.query('TRUNCATE TABLE conversation_state');
+    });
+
+    it('first-contact set atomically inserts the marker UPSERT row', async () => {
+      const store = new Store(pool);
+      const m = marker('aaaa00001111');
+
+      await expect(
+        store.setPendingHumanRequest('db-first', m, T),
+      ).resolves.toBe(true);
+
+      const fetched = await store.get('db-first');
+      expect(fetched).toEqual({
+        senderId: 'db-first',
+        lastMessageAt: T,
+        data: { pendingHumanRequest: m },
+      });
+    });
+
+    it('set allows an absent marker key and an explicit JSON null key', async () => {
+      const store = new Store(pool);
+      await store.create('db-absent', {
+        lastMessageAt: T,
+        data: { cart: ['sku-1'] },
+      });
+      await store.create('db-null', {
+        lastMessageAt: T,
+        data: { cart: ['sku-2'], pendingHumanRequest: null },
+      });
+
+      const mAbsent = marker('bbbb00001111');
+      const mNull = marker('cccc00001111');
+      await expect(
+        store.setPendingHumanRequest('db-absent', mAbsent, T2),
+      ).resolves.toBe(true);
+      await expect(
+        store.setPendingHumanRequest('db-null', mNull, T2),
+      ).resolves.toBe(true);
+
+      const absent = await store.get('db-absent');
+      expect(absent!.data.pendingHumanRequest).toEqual(mAbsent);
+      expect(absent!.data.cart).toEqual(['sku-1']);
+      expect(absent!.lastMessageAt).toBe(T2);
+
+      const nulled = await store.get('db-null');
+      expect(nulled!.data.pendingHumanRequest).toEqual(mNull);
+      expect(nulled!.data.cart).toEqual(['sku-2']);
+      expect(nulled!.lastMessageAt).toBe(T2);
+    });
+
+    it('set replays the exact marker but refuses different or corrupt-active markers', async () => {
+      const store = new Store(pool);
+      const m1 = marker('dddd00001111');
+      await expect(
+        store.setPendingHumanRequest('db-replay', m1, T),
+      ).resolves.toBe(true);
+
+      await expect(
+        store.setPendingHumanRequest('db-replay', m1, T2),
+      ).resolves.toBe(true);
+      const replayed = await store.get('db-replay');
+      expect(replayed!.data.pendingHumanRequest).toEqual(m1);
+      expect(replayed!.lastMessageAt).toBe(T2);
+
+      const m2 = marker('eeee00001111');
+      await expect(
+        store.setPendingHumanRequest('db-replay', m2, T2),
+      ).resolves.toBe(false);
+      expect((await store.get('db-replay'))!.data.pendingHumanRequest).toEqual(
+        m1,
+      );
+
+      await store.create('db-corrupt', {
+        lastMessageAt: T,
+        data: {
+          pendingHumanRequest: {
+            ...marker('ffff00001111'),
+            x: 1,
+          } as unknown as PendingHumanRequest,
+        },
+      });
+      await expect(
+        store.setPendingHumanRequest('db-corrupt', marker('1111aaaa2222'), T2),
+      ).resolves.toBe(false);
+      const corrupt = await store.get('db-corrupt');
+      expect(
+        (
+          corrupt!.data.pendingHumanRequest as unknown as Record<
+            string,
+            unknown
+          >
+        ).x,
+      ).toBe(1);
+    });
+
+    it('clear nulls the live marker only for an exact requestId', async () => {
+      const store = new Store(pool);
+      const m = marker('2222bbbb3333');
+      await store.setPendingHumanRequest('db-clear', m, T);
+
+      await expect(
+        store.clearPendingHumanRequest('db-clear', 'wrong-request-id', T2),
+      ).resolves.toBe(false);
+      expect((await store.get('db-clear'))!.data.pendingHumanRequest).toEqual(
+        m,
+      );
+
+      await expect(
+        store.clearPendingHumanRequest('db-clear', m.requestId, T2),
+      ).resolves.toBe(true);
+      const cleared = await store.get('db-clear');
+      expect(cleared!.data.pendingHumanRequest).toBeNull();
+      expect(Object.hasOwn(cleared!.data, 'pendingHumanRequest')).toBe(true);
+      expect(cleared!.lastMessageAt).toBe(T2);
+    });
+
+    it('clear fails closed on absent rows, keyless rows, and corrupt markers', async () => {
+      const store = new Store(pool);
+      const m = marker('3333cccc4444');
+
+      await expect(
+        store.clearPendingHumanRequest('db-never', m.requestId, T2),
+      ).resolves.toBe(false);
+
+      await store.create('db-keyless', {
+        lastMessageAt: T,
+        data: { cart: [] },
+      });
+      await expect(
+        store.clearPendingHumanRequest('db-keyless', m.requestId, T2),
+      ).resolves.toBe(false);
+
+      await store.create('db-corrupt-clear', {
+        lastMessageAt: T,
+        data: {
+          pendingHumanRequest: {
+            ...m,
+            x: 1,
+          } as unknown as PendingHumanRequest,
+        },
+      });
+      await expect(
+        store.clearPendingHumanRequest('db-corrupt-clear', m.requestId, T2),
+      ).resolves.toBe(false);
+      expect(
+        (await store.get('db-corrupt-clear'))!.data.pendingHumanRequest,
+      ).not.toBeNull();
+    });
+
+    it('stale full-data update preserves the LIVE marker and cannot resurrect a cleared one', async () => {
+      const store = new Store(pool);
+      const live = marker('4444dddd5555');
+      const stale = marker('5555eeee6666');
+      await store.setPendingHumanRequest('db-stale', live, T);
+
+      await store.update('db-stale', {
+        lastMessageAt: T2,
+        data: { cart: ['sku-1'], pendingHumanRequest: stale },
+      });
+      const afterSet = await store.get('db-stale');
+      expect(afterSet!.data.pendingHumanRequest).toEqual(live);
+      expect(afterSet!.data.cart).toEqual(['sku-1']);
+
+      await expect(
+        store.clearPendingHumanRequest('db-stale', live.requestId, T2),
+      ).resolves.toBe(true);
+      await store.update('db-stale', {
+        lastMessageAt: T,
+        data: { cart: ['sku-2'], pendingHumanRequest: stale },
+      });
+      const afterClear = await store.get('db-stale');
+      expect(afterClear!.data.pendingHumanRequest).toBeNull();
+      expect(Object.hasOwn(afterClear!.data, 'pendingHumanRequest')).toBe(true);
+      expect(afterClear!.data.cart).toEqual(['sku-2']);
+    });
+
+    it('preserves the sibling receipt pointer across marker set, stale update, and clear', async () => {
+      const store = new Store(pool);
+      await store.create('db-siblings', {
+        lastMessageAt: T,
+        data: { cart: ['sku-1'] },
+      });
+      await expect(
+        store.setReceiptAmountPointer('db-siblings', pointer),
+      ).resolves.toBe(true);
+
+      const live = marker('6666ffff7777');
+      await store.setPendingHumanRequest('db-siblings', live, T2);
+
+      await store.update('db-siblings', {
+        lastMessageAt: T,
+        data: { cart: ['sku-2'], pendingHumanRequest: live },
+      });
+      const afterUpdate = await store.get('db-siblings');
+      expect(afterUpdate!.data.receiptAmountPointer).toEqual(pointer);
+      expect(afterUpdate!.data.pendingHumanRequest).toEqual(live);
+
+      await expect(
+        store.clearPendingHumanRequest('db-siblings', live.requestId, T2),
+      ).resolves.toBe(true);
+      const afterClear = await store.get('db-siblings');
+      expect(afterClear!.data.receiptAmountPointer).toEqual(pointer);
+      expect(afterClear!.data.pendingHumanRequest).toBeNull();
+    });
+
+    it('serializes concurrent set/clear against a stale update with distinct Pool clients', async () => {
+      const store = new Store(pool);
+      // A second Pool proves distinct client connections. The CAS writers are
+      // single-statement and the stale read-modify-write `update()` re-applies
+      // the LIVE marker under the row lock, so the outcome below holds for
+      // every interleaving (deterministic, not timing-tolerant).
+      const otherPool = new Pool({
+        connectionString: container.getConnectionUri(),
+      });
+      const other = new Store(otherPool);
+      const live = marker('7777aaaa8888');
+      const stale = marker('8888bbbb9999');
+
+      try {
+        await Promise.all([
+          store.setPendingHumanRequest('db-race-set', live, T),
+          other.update('db-race-set', {
+            lastMessageAt: T2,
+            data: { cart: ['sku-1'], pendingHumanRequest: stale },
+          }),
+        ]);
+        const afterSet = await store.get('db-race-set');
+        expect(afterSet!.data.pendingHumanRequest).toEqual(live);
+
+        await store.setPendingHumanRequest('db-race-clear', live, T);
+        await Promise.all([
+          store.clearPendingHumanRequest('db-race-clear', live.requestId, T2),
+          other.update('db-race-clear', {
+            lastMessageAt: T2,
+            data: { cart: ['sku-2'], pendingHumanRequest: stale },
+          }),
+        ]);
+        const afterClear = await store.get('db-race-clear');
+        expect(afterClear!.data.pendingHumanRequest).toBeNull();
+        expect(Object.hasOwn(afterClear!.data, 'pendingHumanRequest')).toBe(
+          true,
+        );
+      } finally {
+        await otherPool.end();
+      }
+    });
+  });
 });
