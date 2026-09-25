@@ -504,3 +504,163 @@ export function normalizeRestockDecision(
     return null;
   }
 }
+
+/** Terminal bot application-outcome ACK (contract v1 addenda): a pure,
+ * fail-closed request/response shape only. Freshness-window and no-send
+ * semantic validity belongs to the guarded caller, never to this parser. */
+export type RestockApplicationOutcomeCode =
+  | 'PROVIDER_ACCEPTED'
+  | 'PROVIDER_ACCEPTED_LATE'
+  | 'DELIVERY_UNKNOWN'
+  | 'STALE';
+
+export interface RestockApplicationOutcomeAccepted {
+  attemptId: string;
+  expectedResolutionVersion: 2;
+  outcome: 'PROVIDER_ACCEPTED' | 'PROVIDER_ACCEPTED_LATE';
+  attemptedAt: string;
+  providerMessageId: string;
+  providerAcceptedObservedAt: string;
+}
+
+export interface RestockApplicationOutcomeUnknown {
+  attemptId: string;
+  expectedResolutionVersion: 2;
+  outcome: 'DELIVERY_UNKNOWN';
+  attemptedAt: string;
+  providerMessageId?: string;
+}
+
+export interface RestockApplicationOutcomeStale {
+  attemptId: string;
+  expectedResolutionVersion: 2;
+  outcome: 'STALE';
+}
+
+export type RestockApplicationOutcomeRequest =
+  | RestockApplicationOutcomeAccepted
+  | RestockApplicationOutcomeUnknown
+  | RestockApplicationOutcomeStale;
+
+export interface RestockApplicationOutcomeAck {
+  id: string;
+  version: 2;
+  attemptId: string;
+  outcome: RestockApplicationOutcomeCode;
+  ackReceivedAt: string;
+}
+
+const APP_ACCEPTED_KEYS =
+  'attemptId expectedResolutionVersion outcome attemptedAt providerMessageId providerAcceptedObservedAt'.split(
+    ' ',
+  );
+const APP_UNKNOWN_KEYS =
+  'attemptId expectedResolutionVersion outcome attemptedAt providerMessageId'.split(
+    ' ',
+  );
+const APP_UNKNOWN_REQUIRED_KEYS =
+  'attemptId expectedResolutionVersion outcome attemptedAt'.split(' ');
+const APP_STALE_KEYS = 'attemptId expectedResolutionVersion outcome'.split(' ');
+const APP_ACK_KEYS = 'id version attemptId outcome ackReceivedAt'.split(' ');
+
+/** Required exact string: control-free, non-blank, bytes preserved. */
+function asRequiredExactString(value: unknown): string | null {
+  const text = asNullableExactString(value);
+  return typeof text === 'string' && text.trim().length > 0 ? text : null;
+}
+
+/** Normalize the terminal ACK request body into an exact discriminated union:
+ * accepted/late require a non-blank message id and observed acceptance, UNKNOWN
+ * allows only an optional non-blank id, and STALE forbids all send evidence.
+ * Never throws, fails closed on unknown/null/extra fields. */
+export function normalizeRestockApplicationOutcome(
+  value: unknown,
+): RestockApplicationOutcomeRequest | null {
+  try {
+    const record = asPlainRecord(value);
+    if (record === null) return null;
+    const outcome = record.outcome;
+    const attemptId = asUuid(record.attemptId);
+    if (attemptId === null || record.expectedResolutionVersion !== 2) {
+      return null;
+    }
+    if (
+      outcome === 'PROVIDER_ACCEPTED' ||
+      outcome === 'PROVIDER_ACCEPTED_LATE'
+    ) {
+      if (!hasExactKeys(record, APP_ACCEPTED_KEYS)) return null;
+      const attemptedAt = asRequiredInstant(record.attemptedAt);
+      const acceptedAt = asRequiredInstant(record.providerAcceptedObservedAt);
+      const providerMessageId = asRequiredExactString(record.providerMessageId);
+      if (attemptedAt === null || providerMessageId === null) return null;
+      if (acceptedAt === null) return null;
+      return {
+        attemptId,
+        expectedResolutionVersion: 2,
+        outcome,
+        attemptedAt,
+        providerMessageId,
+        providerAcceptedObservedAt: acceptedAt,
+      };
+    }
+    if (outcome === 'DELIVERY_UNKNOWN') {
+      const withId = hasExactKeys(record, APP_UNKNOWN_KEYS);
+      if (!withId && !hasExactKeys(record, APP_UNKNOWN_REQUIRED_KEYS)) {
+        return null;
+      }
+      const attemptedAt = asRequiredInstant(record.attemptedAt);
+      if (attemptedAt === null) return null;
+      const base: RestockApplicationOutcomeUnknown = {
+        attemptId,
+        expectedResolutionVersion: 2,
+        outcome: 'DELIVERY_UNKNOWN',
+        attemptedAt,
+      };
+      if (!withId) return base;
+      const providerMessageId = asRequiredExactString(record.providerMessageId);
+      if (providerMessageId === null) return null;
+      return { ...base, providerMessageId };
+    }
+    if (outcome !== 'STALE' || !hasExactKeys(record, APP_STALE_KEYS)) {
+      return null;
+    }
+    return { attemptId, expectedResolutionVersion: 2, outcome: 'STALE' };
+  } catch {
+    return null;
+  }
+}
+
+/** Normalize the strict five-key ACK response and bind it to the known decision
+ * id, the normalized request's attempt id and its requested outcome. Never
+ * throws, fails closed on any mismatch, and rejects `evidenceCode` even null. */
+export function normalizeRestockApplicationOutcomeAck(
+  value: unknown,
+  decisionId: string,
+  request: RestockApplicationOutcomeRequest,
+): RestockApplicationOutcomeAck | null {
+  try {
+    const record = asPlainRecord(value);
+    if (record === null || !hasExactKeys(record, APP_ACK_KEYS)) return null;
+    if (record.version !== 2 || record.outcome !== request.outcome) {
+      return null;
+    }
+    const id = asUuid(record.id);
+    const attemptId = asUuid(record.attemptId);
+    const ackReceivedAt = asRequiredInstant(record.ackReceivedAt);
+    const expectedAttemptId = asUuid(request.attemptId);
+    if (id === null || attemptId === null) return null;
+    if (ackReceivedAt === null || expectedAttemptId === null) return null;
+    if (!sameUuid(id, decisionId) || !sameUuid(attemptId, expectedAttemptId)) {
+      return null;
+    }
+    return {
+      id,
+      version: 2,
+      attemptId,
+      outcome: request.outcome,
+      ackReceivedAt,
+    };
+  } catch {
+    return null;
+  }
+}

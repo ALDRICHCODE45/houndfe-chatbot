@@ -1,10 +1,15 @@
 import {
   RESTOCK_MAX_PRODUCT_NAME_LENGTH,
+  normalizeRestockApplicationOutcome,
+  normalizeRestockApplicationOutcomeAck,
   normalizeRestockDecision,
   normalizeRestockIntake,
   normalizeRestockIntakeReceipt,
 } from './human-decisions.dto';
-import type { RestockIntakeInput } from './human-decisions.dto';
+import type {
+  RestockApplicationOutcomeRequest,
+  RestockIntakeInput,
+} from './human-decisions.dto';
 
 type Rec = Record<string, unknown>;
 
@@ -651,5 +656,227 @@ describe('normalizeRestockDecision', () => {
     expect(dnorm(spoof)).toBeNull();
     expect(dnorm(throwingProxy({}, 'ownKeys'))).toBeNull();
     expect(dnorm(throwingProxy(pending(), 'get'))).toBeNull();
+  });
+});
+
+const ATTEMPT_ID = '77777777-7777-4777-8777-777777777777';
+const MSG_ID = 'wamid.HBgLMI6';
+const OBS = '2026-06-22T10:40:00.000Z';
+const ACK_AT = '2026-06-22T10:41:00.000Z';
+const DATE_ONLY = '2026-06-22';
+const DECISION_ID = RECEIPT_ID;
+
+const acc = (outcome: string, extra: Rec = {}): Rec => ({
+  attemptId: ATTEMPT_ID,
+  expectedResolutionVersion: 2,
+  outcome,
+  attemptedAt: OBS,
+  providerMessageId: MSG_ID,
+  providerAcceptedObservedAt: OBS,
+  ...extra,
+});
+const unk = (extra: Rec = {}): Rec => ({
+  attemptId: ATTEMPT_ID,
+  expectedResolutionVersion: 2,
+  outcome: 'DELIVERY_UNKNOWN',
+  attemptedAt: OBS,
+  ...extra,
+});
+const stl = (extra: Rec = {}): Rec => ({
+  attemptId: ATTEMPT_ID,
+  expectedResolutionVersion: 2,
+  outcome: 'STALE',
+  ...extra,
+});
+const ack = (outcome: string, extra: Rec = {}): Rec => ({
+  id: DECISION_ID,
+  version: 2,
+  attemptId: ATTEMPT_ID,
+  outcome,
+  ackReceivedAt: ACK_AT,
+  ...extra,
+});
+const A = (extra: Rec = {}): Rec => acc('PROVIDER_ACCEPTED', extra);
+const L = (extra: Rec = {}): Rec => acc('PROVIDER_ACCEPTED_LATE', extra);
+const K = (extra: Rec = {}): Rec => ack('PROVIDER_ACCEPTED', extra);
+const anorm = (value: unknown) => normalizeRestockApplicationOutcome(value);
+const reqOk = (value: Rec): RestockApplicationOutcomeRequest =>
+  anorm(value) as RestockApplicationOutcomeRequest;
+const acknorm = (
+  value: unknown,
+  request: RestockApplicationOutcomeRequest,
+  id: string = DECISION_ID,
+) => normalizeRestockApplicationOutcomeAck(value, id, request);
+
+describe('normalizeRestockApplicationOutcome', () => {
+  it('normalizes all four request outcomes', () => {
+    expect(anorm(A())).toEqual(A());
+    expect(anorm(L())).toEqual(L());
+    expect(anorm(unk())).toEqual(unk());
+    expect(anorm(unk({ providerMessageId: MSG_ID }))).toEqual(
+      unk({ providerMessageId: MSG_ID }),
+    );
+    expect(anorm(stl())).toEqual(stl());
+  });
+
+  it('canonicalizes instants and keeps an absent optional id absent', () => {
+    expect(anorm(A({ attemptedAt: OFFSET_ISO }))).toEqual(
+      A({ attemptedAt: '2026-06-22T10:30:00.000Z' }),
+    );
+    expect(Object.keys(anorm(unk()) ?? {})).toEqual([
+      'attemptId',
+      'expectedResolutionVersion',
+      'outcome',
+      'attemptedAt',
+    ]);
+    expect(anorm(unk({ providerMessageId: '  id  ' }))).toEqual(
+      unk({ providerMessageId: '  id  ' }),
+    );
+  });
+
+  const bad: Array<[string, unknown]> = [
+    ['missing attemptId', omitted(stl(), 'attemptId')],
+    ['non-uuid attemptId', stl({ attemptId: 'x' })],
+    ['missing version', omitted(stl(), 'expectedResolutionVersion')],
+    ['version 1', stl({ expectedResolutionVersion: 1 })],
+    ['version 3', stl({ expectedResolutionVersion: 3 })],
+    ['string version', stl({ expectedResolutionVersion: '2' })],
+    ['unknown outcome', stl({ outcome: 'PENDING_DELIVERY' })],
+    ['missing outcome', omitted(stl(), 'outcome')],
+    ['missing attemptedAt', omitted(A(), 'attemptedAt')],
+    ['date-only attemptedAt', A({ attemptedAt: DATE_ONLY })],
+    ['impossible attemptedAt', A({ attemptedAt: BAD_ISO })],
+    ['numeric attemptedAt', A({ attemptedAt: 1 })],
+    ['null message id', A({ providerMessageId: null })],
+    ['blank message id', A({ providerMessageId: ' \t ' })],
+    ['control message id', A({ providerMessageId: 'a\u0000' })],
+    ['missing observed acceptance', omitted(A(), 'providerAcceptedObservedAt')],
+    ['null observed acceptance', A({ providerAcceptedObservedAt: null })],
+    [
+      'date-only observed acceptance',
+      A({ providerAcceptedObservedAt: DATE_ONLY }),
+    ],
+    ['late missing attemptedAt', omitted(L(), 'attemptedAt')],
+    ['unknown missing attemptedAt', omitted(unk(), 'attemptedAt')],
+    ['unknown null message id', unk({ providerMessageId: null })],
+    ['unknown blank message id', unk({ providerMessageId: ' ' })],
+    ['unknown undefined message id', unk({ providerMessageId: undefined })],
+    ['unknown acceptance null', unk({ providerAcceptedObservedAt: null })],
+    ['unknown acceptance set', unk({ providerAcceptedObservedAt: OBS })],
+    ['stale attemptedAt', stl({ attemptedAt: OBS })],
+    ['stale message id', stl({ providerMessageId: MSG_ID })],
+    ['stale acceptance', stl({ providerAcceptedObservedAt: OBS })],
+    ['evidenceCode', A({ evidenceCode: 'X' })],
+    ['unknown evidenceCode', unk({ evidenceCode: 'X' })],
+    ['stale evidenceCode', stl({ evidenceCode: 'X' })],
+    ['extra tenantId', stl({ tenantId: U.source })],
+    ['symbol key', { ...stl(), [Symbol('tenantId')]: 1 }],
+    ['non-enumerable key', defined(stl(), 'tenantId', 'x')],
+    ['accessor top', accessor(stl(), 'attemptId')],
+    ['accessor outcome', accessor(A(), 'outcome')],
+    ['class instance', new ReceiptClass()],
+    ['inherited object', Object.create(stl())],
+    ['null input', null],
+    ['string input', 'nope'],
+    ['array input', []],
+  ];
+
+  it.each(bad)('rejects a malformed request (%s)', (_label, value) => {
+    expect(anorm(value)).toBeNull();
+  });
+
+  it('fails closed on hostile getters and proxies', () => {
+    const getter = stl();
+    Object.defineProperty(getter, 'outcome', { enumerable: true, get: boom });
+    expect(anorm(getter)).toBeNull();
+    const spoof = new Proxy(stl(), {
+      get: (t, k) => (k === 'attemptId' ? U.variant : t[String(k)]),
+    });
+    expect(anorm(spoof)).toBeNull();
+    expect(anorm(throwingProxy({}, 'ownKeys'))).toBeNull();
+    expect(anorm(throwingProxy(stl(), 'get'))).toBeNull();
+  });
+});
+
+describe('normalizeRestockApplicationOutcomeAck', () => {
+  const reqBytes: Record<string, Rec> = {
+    PROVIDER_ACCEPTED: A(),
+    PROVIDER_ACCEPTED_LATE: L(),
+    DELIVERY_UNKNOWN: unk(),
+    STALE: stl(),
+  };
+  const reqFor = (outcome: string): RestockApplicationOutcomeRequest =>
+    reqOk(reqBytes[outcome]);
+
+  it('normalizes a five-key ACK bound to the request', () => {
+    for (const outcome of Object.keys(reqBytes)) {
+      expect(acknorm(ack(outcome), reqFor(outcome))).toEqual(ack(outcome));
+    }
+  });
+
+  it('binds a case-insensitive UUID and canonicalizes ackReceivedAt', () => {
+    expect(
+      acknorm(
+        K({
+          id: DECISION_ID.toUpperCase(),
+          attemptId: ATTEMPT_ID.toUpperCase(),
+          ackReceivedAt: OFFSET_ISO,
+        }),
+        reqFor('PROVIDER_ACCEPTED'),
+      ),
+    ).toMatchObject({
+      id: DECISION_ID.toUpperCase(),
+      attemptId: ATTEMPT_ID.toUpperCase(),
+      ackReceivedAt: '2026-06-22T10:30:00.000Z',
+    });
+  });
+
+  const badAck: Array<[string, unknown]> = [
+    ['missing id', omitted(K(), 'id')],
+    ['non-uuid id', K({ id: 'x' })],
+    ['mismatched id', K({ id: U.variant })],
+    ['missing version', omitted(K(), 'version')],
+    ['version 1', K({ version: 1 })],
+    ['version 3', K({ version: 3 })],
+    ['missing attemptId', omitted(K(), 'attemptId')],
+    ['non-uuid attemptId', K({ attemptId: 'x' })],
+    ['mismatched attemptId', K({ attemptId: U.variant })],
+    ['missing outcome', omitted(K(), 'outcome')],
+    ['mismatched outcome', ack('DELIVERY_UNKNOWN')],
+    ['missing ackReceivedAt', omitted(K(), 'ackReceivedAt')],
+    ['date-only ackReceivedAt', K({ ackReceivedAt: DATE_ONLY })],
+    ['impossible ackReceivedAt', K({ ackReceivedAt: BAD_ISO })],
+    ['evidenceCode null', K({ evidenceCode: null })],
+    ['extra tenantId', K({ tenantId: U.source })],
+    ['symbol key', { ...K(), [Symbol('x')]: 1 }],
+    ['non-enumerable key', defined(K(), 'tenantId', 'x')],
+    ['accessor', accessor(K(), 'outcome')],
+    ['class instance', new ReceiptClass()],
+    ['inherited object', Object.create(K())],
+    ['null input', null],
+    ['string input', 'nope'],
+    ['array input', []],
+  ];
+
+  it.each(badAck)('rejects a malformed ACK (%s)', (_label, value) => {
+    expect(acknorm(value, reqFor('PROVIDER_ACCEPTED'))).toBeNull();
+  });
+
+  it('fails closed on hostile getters and a non-uuid expected attempt', () => {
+    const request = reqFor('PROVIDER_ACCEPTED');
+    const getter = K();
+    Object.defineProperty(getter, 'outcome', { enumerable: true, get: boom });
+    expect(acknorm(getter, request)).toBeNull();
+    const spoof = new Proxy(K(), {
+      get: (t, k) => (k === 'id' ? U.variant : t[String(k)]),
+    });
+    expect(acknorm(spoof, request)).toBeNull();
+    expect(acknorm(throwingProxy({}, 'ownKeys'), request)).toBeNull();
+    expect(acknorm(throwingProxy(K(), 'get'), request)).toBeNull();
+    const badAttempt = {
+      ...request,
+      attemptId: 'x',
+    } as RestockApplicationOutcomeRequest;
+    expect(acknorm(K(), badAttempt)).toBeNull();
   });
 });
