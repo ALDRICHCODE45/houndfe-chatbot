@@ -123,7 +123,15 @@ describe('makeCheckStockTool', () => {
         productId: uuid1,
         name: 'Café Molido 500g',
         stock: { status: 'out_of_stock', quantity: 0 },
-        variants: [],
+        variants: [
+          {
+            variantId: uuid2,
+            name: '500g',
+            option: null,
+            value: null,
+            stock: { status: 'out_of_stock', quantity: 0 },
+          },
+        ],
       };
       const getStock = jest.fn().mockResolvedValue(stock);
       const deps = {
@@ -146,13 +154,12 @@ describe('makeCheckStockTool', () => {
             productId: uuid1,
             name: 'Café Molido 500g',
             variantId: uuid2,
-            quantity: 0,
           },
         },
       });
     });
 
-    it('prefers the model-supplied input.name over the catalog name', async () => {
+    it('uses the catalog name, never the model-supplied name or available-stock quantity', async () => {
       const stock: StockCheckResponse = {
         productId: uuid1,
         name: 'Nombre del catálogo',
@@ -175,9 +182,44 @@ describe('makeCheckStockTool', () => {
         ...stock,
         humanAssistance: {
           kind: 'out_of_stock',
-          digest: { productId: uuid1, name: 'Nombre del input', quantity: 0 },
+          digest: { productId: uuid1, name: 'Nombre del catálogo' },
         },
       });
+    });
+
+    it('does not signal escalation for a mismatched product or an unverified/available variant', async () => {
+      const base: StockCheckResponse = {
+        productId: uuid1,
+        name: 'Nombre del catálogo',
+        stock: { status: 'out_of_stock', quantity: 0 },
+        variants: [
+          {
+            variantId: uuid2,
+            name: '500g',
+            option: null,
+            value: null,
+            stock: { status: 'available', quantity: 2 },
+          },
+        ],
+      };
+      for (const [stock, variantId] of [
+        [{ ...base, productId: uuid2 }, undefined],
+        [base, '00000000-0000-4000-8000-000000000003'],
+        [base, uuid2],
+      ] as const) {
+        const tool = makeCheckStockTool({
+          ...baseDeps,
+          chatbotApi: {
+            getStock: jest.fn().mockResolvedValue(stock),
+          } as unknown as ChatbotApiClient,
+        });
+        const result = await tool.execute(
+          { productId: uuid1, ...(variantId ? { variantId } : {}) },
+          { toolCallId: 't', messages: [], context: {} },
+        );
+        expect(result).toEqual({ ok: true, ...stock });
+        expect(result).not.toHaveProperty('humanAssistance');
+      }
     });
 
     it('does NOT carry the envelope for available / low_stock / not_managed', async () => {

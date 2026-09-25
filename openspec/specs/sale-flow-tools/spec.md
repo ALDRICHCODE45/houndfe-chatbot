@@ -1013,45 +1013,41 @@ The lifecycle MUST be:
 
 ### Requirement: checkStock returns a humanAssistance envelope on out_of_stock
 
-The `checkStock` tool MUST continue to return the existing `stock` payload when stock is
-available, but when `stock.status === 'out_of_stock'` the tool MUST additionally return a
-`humanAssistance` envelope signalling R7 escalation. The trigger tool MUST NOT call
+The `checkStock` tool MUST continue to return the existing `stock` payload. It MUST
+add a `humanAssistance` envelope signalling R7 escalation only for a backend-
+confirmed product-level shortage with matching product identity, a nonblank catalog
+name, and (when selected) a matching out-of-stock variant. Other responses MUST
+omit the signal. The trigger tool MUST NOT call
 `HumanHandoffService.create(...)` directly (the trigger's role is the signal; the model
 decides when to call `requestHumanAssistance`, which is the sole row-writing entry point
 per ADR-9).
 
-`checkStock`'s return type MUST be the discriminated union:
+`checkStock` preserves the real `StockCheckResponse` shape: `{ productId, name,
+stock:{status,quantity}, variants:[...] }` beneath `{ok:true,...stock}`. The old
+illustrative nested `stock.productId` shape was not the backend DTO. Only a matching
+backend `productId` with product-level `stock.status='out_of_stock'` and a nonblank
+backend `name` may carry `humanAssistance:{kind:'out_of_stock',digest}`. If the
+model supplies a `variantId`, that variant MUST exist in the backend response
+and have `stock.status='out_of_stock'`; otherwise there is no signal.
 
-```text
-{ ok: true, stock: { productId, variantId?, status: 'in_stock' | 'low_stock' | 'unknown' | 'out_of_stock', quantity?, lowStockThreshold?, updatedAt? } }
-  // 'in_stock' / 'low_stock' / 'unknown' branches — no humanAssistance envelope
-
-| { ok: true, stock: { ... 'out_of_stock' branch with quantity: 0 ... },
-    humanAssistance: { kind: 'out_of_stock',
-                        digest: { productId: string; name: string;
-                                  variantId?: string; quantity?: number } } }
-```
-
-`humanAssistance.digest.name` MUST be sourced from the catalog response that
-`searchCatalog` returned earlier in the same session (or, if the model already passed
-the product name into `checkStock`, from that input) — NEVER fabricated. When the model
-does not have a reliable `name` for the product (only `productId`), the tool MUST omit
-`name` from the digest so the model re-asks or falls back to a search before calling
-`requestHumanAssistance`.
+The signal digest contains the backend `productId` and `name`, plus a verified
+`variantId` when selected. A model-supplied `name` is accepted as legacy tool
+input but is not authoritative. The signal MUST NOT copy `stock.quantity` into
+`digest.quantity`: available stock (often zero) is not a customer-requested
+quantity, and zero is invalid in `requestHumanAssistance`'s input schema. No
+human handoff or RESTOCK write is made by `checkStock`; a future RESTOCK intake
+must independently revalidate catalog identity and shortage before its CAS/POST.
 
 #### Scenario: out_of_stock adds the humanAssistance envelope
 
-- GIVEN `checkStock` is invoked with `{ productId: 'p-1', variantId: 'v-1' }`
-- AND the stubbed `chatbotApi.getStock` returns
-  `{ productId: 'p-1', variantId: 'v-1', status: 'out_of_stock', quantity: 0,
-    updatedAt: '2026-09-01T00:00:00.000Z' }`
+- GIVEN `checkStock` is invoked with `{productId:'p-1',variantId:'v-1',name:'model guess'}`
+- AND `chatbotApi.getStock` returns `{productId:'p-1',name:'Catalog name',
+stock:{status:'out_of_stock',quantity:0},variants:[{variantId:'v-1',
+stock:{status:'out_of_stock',quantity:0},...}]}`
 - WHEN the tool's `execute` runs
-- THEN the returned envelope MUST deep-equal
-  `{ ok: true, stock: { productId: 'p-1', variantId: 'v-1', status: 'out_of_stock',
-    quantity: 0, updatedAt: '2026-09-01T00:00:00.000Z' },
-    humanAssistance: { kind: 'out_of_stock',
-      digest: { productId: 'p-1', name: '<name from prior searchCatalog or input>',
-                 variantId: 'v-1', quantity: 0 } } }`.
+- THEN it returns `{ok:true,...stock,humanAssistance:{kind:'out_of_stock',
+digest:{productId:'p-1',name:'Catalog name',variantId:'v-1'}}}` with NO
+  `digest.quantity` and NO model-derived name.
 
 #### Scenario: in_stock / low_stock / unknown do not carry the envelope
 
