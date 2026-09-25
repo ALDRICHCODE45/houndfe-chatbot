@@ -3,6 +3,7 @@ import {
   type HumanHandoffCreateResult,
   type HumanHandoffResolveReplyResult,
 } from '../../../human-handoff/application/human-handoff.service';
+import { deriveRestockSourceRequestId } from '../../../human-decisions/domain/restock-source-identity';
 import { makeRequestHumanAssistanceTool } from './request-human-assistance.tool';
 
 type SafeParseSchema = {
@@ -318,6 +319,280 @@ describe('makeRequestHumanAssistanceTool', () => {
       requestId: 'abc123def456',
       ref: 'HF-abc123def456',
       customerNotified: true,
+    });
+  });
+
+  describe('RESTOCK routing behind the exact default-off gate', () => {
+    const SENDER = '5215550001111';
+    const PRODUCT_ID = '00000000-0000-4000-8000-000000000001';
+    const INBOUND = {
+      receivingPhoneNumberId: '123456789012345',
+      senderId: SENDER,
+      messageId: 'wamid.ABC123',
+    };
+    const outOfStockInput = {
+      kind: 'out_of_stock' as const,
+      digest: { productId: PRODUCT_ID, name: 'Croquetas' },
+    };
+    const failClosed = {
+      ok: false,
+      error: { kind: 'restock_unavailable', retryable: false },
+    };
+
+    const buildStock = () => ({
+      productId: PRODUCT_ID,
+      name: 'Croquetas',
+      stock: { status: 'out_of_stock' as const, quantity: 0 },
+      variants: [],
+    });
+
+    function buildRestockDeps(
+      overrides: {
+        markers?: { readForSender: jest.Mock };
+        coordinator?: { coordinate: jest.Mock };
+        getStock?: jest.Mock;
+        getState?: jest.Mock;
+      } = {},
+    ) {
+      const markers = overrides.markers ?? {
+        readForSender: jest.fn(async () => ({
+          legacyRequestPending: false,
+          restockIntentPresent: false,
+        })),
+      };
+      const coordinator = overrides.coordinator ?? {
+        coordinate: jest.fn(async () => ({
+          decision: 'recorded' as const,
+          historicalPollId: 'BACKEND-POLL-ID-1',
+        })),
+      };
+      const getStock = overrides.getStock ?? jest.fn(async () => buildStock());
+      const getState = overrides.getState ?? jest.fn(async () => null);
+      const create = jest.fn(
+        async (): Promise<HumanHandoffCreateResult> => ({
+          ok: true,
+          requestId: 'abc123def456',
+          ref: 'HF-abc123def456',
+          customerNotified: true,
+        }),
+      );
+      const deps = {
+        cashierUserId: '00000000-0000-4000-8000-000000000001',
+        chatbotApi: { getStock } as never,
+        store: { get: getState } as never,
+        humanHandoffService: { create } as never,
+        restock: {
+          enabled: true as const,
+          markers: markers as never,
+          coordinator: coordinator as never,
+        },
+      };
+      return { deps, markers, coordinator, create, getStock, getState };
+    }
+
+    it('default-off (no restock capability): out_of_stock keeps the exact legacy create call', async () => {
+      const create = jest.fn(
+        async (): Promise<HumanHandoffCreateResult> => ({
+          ok: true,
+          requestId: 'abc123def456',
+          ref: 'HF-abc123def456',
+          customerNotified: true,
+        }),
+      );
+      const tool = makeRequestHumanAssistanceTool({
+        cashierUserId: '00000000-0000-4000-8000-000000000001',
+        chatbotApi: {} as never,
+        store: {} as never,
+        humanHandoffService: { create } as never,
+      });
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(create).toHaveBeenCalledWith({
+        senderId: SENDER,
+        kind: 'out_of_stock',
+        digest: {
+          kind: 'out_of_stock',
+          productId: PRODUCT_ID,
+          name: 'Croquetas',
+        },
+      });
+      expect(result).toEqual({
+        ok: true,
+        requestId: 'abc123def456',
+        ref: 'HF-abc123def456',
+        customerNotified: true,
+      });
+    });
+
+    it('enabled: a non-out_of_stock kind still takes the exact legacy path', async () => {
+      const { deps, markers, coordinator, create, getStock, getState } =
+        buildRestockDeps();
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(
+        {
+          kind: 'needs_human_review',
+          digest: {
+            items: [
+              { productId: PRODUCT_ID, quantity: 1, unitPriceCents: 100 },
+            ],
+          },
+        },
+        { toolCallId: 't', messages: [], context: { senderId: SENDER } },
+      );
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(markers.readForSender).not.toHaveBeenCalled();
+      expect(getStock).not.toHaveBeenCalled();
+      expect(getState).not.toHaveBeenCalled();
+      expect(coordinator.coordinate).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        ok: true,
+        requestId: 'abc123def456',
+        ref: 'HF-abc123def456',
+        customerNotified: true,
+      });
+    });
+
+    it('enabled out_of_stock with no inbound identity fails closed with no legacy fallback or POST', async () => {
+      const { deps, coordinator, create } = buildRestockDeps();
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER },
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(coordinator.coordinate).not.toHaveBeenCalled();
+      expect(result).toEqual(failClosed);
+    });
+
+    it('enabled out_of_stock with conflicting markers fails closed with no fallback or POST', async () => {
+      const { deps, coordinator, create } = buildRestockDeps({
+        markers: {
+          readForSender: jest.fn(async () => ({
+            legacyRequestPending: true,
+            restockIntentPresent: true,
+          })),
+        },
+      });
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(coordinator.coordinate).not.toHaveBeenCalled();
+      expect(result).toEqual(failClosed);
+    });
+
+    it('enabled out_of_stock with a marker read failure fails closed before any catalog read', async () => {
+      const { deps, coordinator, create, getStock } = buildRestockDeps({
+        markers: {
+          readForSender: jest.fn(async () => {
+            throw new Error('db down');
+          }),
+        },
+      });
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(getStock).not.toHaveBeenCalled();
+      expect(coordinator.coordinate).not.toHaveBeenCalled();
+      expect(result).toEqual(failClosed);
+    });
+
+    it('enabled out_of_stock with a catalog read failure fails closed with no POST', async () => {
+      const { deps, coordinator, create } = buildRestockDeps({
+        getStock: jest.fn(async () => {
+          throw new Error('catalog down');
+        }),
+      });
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(coordinator.coordinate).not.toHaveBeenCalled();
+      expect(result).toEqual(failClosed);
+    });
+
+    it('enabled bound out_of_stock routes the derived intake to the coordinator and reports only the historical record', async () => {
+      const { deps, coordinator, create } = buildRestockDeps();
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
+      const expectedArg = expect.objectContaining({
+        senderId: SENDER,
+        intake: expect.objectContaining({
+          type: 'RESTOCK',
+          productId: PRODUCT_ID,
+          sourceRequestId: deriveRestockSourceRequestId(INBOUND),
+        }) as unknown,
+      }) as unknown;
+      expect(coordinator.coordinate).toHaveBeenCalledWith(expectedArg);
+      expect(result).toEqual({
+        ok: true,
+        outcome: 'historical_intake_recorded',
+        customerNotified: false,
+      });
+    });
+
+    it('enabled coordinator existing record reports the same sanitized outcome without leaking the poll id', async () => {
+      const { deps, create } = buildRestockDeps({
+        coordinator: {
+          coordinate: jest.fn(async () => ({
+            decision: 'existing' as const,
+            historicalPollId: 'BACKEND-POLL-ID-1',
+          })),
+        },
+      });
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        ok: true,
+        outcome: 'historical_intake_recorded',
+        customerNotified: false,
+      });
+      expect(JSON.stringify(result)).not.toContain('BACKEND-POLL-ID-1');
+    });
+
+    it('enabled ambiguous coordinator hold fails closed and never fabricates a notice', async () => {
+      const { deps, coordinator, create } = buildRestockDeps({
+        coordinator: {
+          coordinate: jest.fn(async () => ({
+            decision: 'hold' as const,
+            reason: 'unknown_hold' as const,
+          })),
+        },
+      });
+      const tool = makeRequestHumanAssistanceTool(deps);
+      const result = await tool.execute(outOfStockInput, {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER, inboundEvent: INBOUND },
+      });
+      expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
+      expect(create).not.toHaveBeenCalled();
+      expect(result).toEqual(failClosed);
     });
   });
 });

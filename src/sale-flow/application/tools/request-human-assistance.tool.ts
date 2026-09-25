@@ -1,6 +1,27 @@
 import { tool } from 'ai';
 import { z } from 'zod';
-import type { ToolDeps } from '../tool-deps';
+import { preflightRestockRequest } from '../../../human-decisions/application/restock-request-preflight';
+import type { RestockToolCapability, ToolDeps } from '../tool-deps';
+
+/**
+ * Distinct RESTOCK result for `kind:'out_of_stock'` once the experimental gate
+ * is enabled. It reports ONLY a historical intake record: no request ref, no
+ * backend/poll id, no current resolution, and never a notice. `customerNotified:
+ * false` is always true here because nothing was sent to the customer.
+ */
+export type RequestHumanAssistanceRestockResult =
+  | {
+      readonly ok: true;
+      readonly outcome: 'historical_intake_recorded';
+      readonly customerNotified: false;
+    }
+  | {
+      readonly ok: false;
+      readonly error: {
+        readonly kind: 'restock_unavailable';
+        readonly retryable: false;
+      };
+    };
 
 /**
  * requestHumanAssistance — the 12th sale-flow AI-SDK tool.
@@ -27,7 +48,70 @@ import type { ToolDeps } from '../tool-deps';
  * context envelope key matches the tool name, but the inner schema is
  * uniform per the llm-agent spec §"`toolsContext` gains
  * `requestHumanAssistance.senderId`".
+ *
+ * `out_of_stock` + `deps.restock.enabled === true` takes an ENABLED-ONLY
+ * route: `preflightRestockRequest` (current customer event identity,
+ * trusted markers, fresh catalog) then `deps.restock.coordinator`. Every
+ * other outcome fails closed; every other kind and the default-off case
+ * keep the byte-identical legacy `humanHandoffService.create` call.
  */
+
+const failClosedRestock = (): RequestHumanAssistanceRestockResult => ({
+  ok: false,
+  error: { kind: 'restock_unavailable', retryable: false },
+});
+
+/**
+ * Enabled-only RESTOCK branch for `kind:'out_of_stock'`: read-only preflight
+ * (current customer event identity + trusted markers + fresh catalog) then the
+ * already-built coordinator. EVERY non-restock, hold, blocked or throwing
+ * outcome FAILS CLOSED with the same sanitized error — no legacy fallback or
+ * notice. A coordinator hold may follow an ambiguous POST attempt. Only a
+ * durable `recorded`/`existing` coordinator result is
+ * reported, as a distinct non-notifying historical-record outcome. No backend
+ * or poll id is ever exposed.
+ */
+async function runRestockRoute(
+  deps: ToolDeps,
+  restock: RestockToolCapability,
+  digest: unknown,
+  context: { senderId: string; inboundEvent?: unknown },
+): Promise<RequestHumanAssistanceRestockResult> {
+  try {
+    const outcome = await preflightRestockRequest(
+      {
+        senderId: context.senderId,
+        inboundEvent: context.inboundEvent,
+        digest,
+        restockFeatureEnabled: restock.enabled,
+      },
+      {
+        conversation: deps.store,
+        markers: restock.markers,
+        catalog: deps.chatbotApi,
+      },
+    );
+    if (outcome.route !== 'restock') return failClosedRestock();
+    const coordinated = await restock.coordinator.coordinate({
+      senderId: context.senderId,
+      intake: outcome.intake,
+    });
+    if (
+      coordinated.decision === 'recorded' ||
+      coordinated.decision === 'existing'
+    ) {
+      return {
+        ok: true,
+        outcome: 'historical_intake_recorded',
+        customerNotified: false,
+      };
+    }
+    return failClosedRestock();
+  } catch {
+    return failClosedRestock();
+  }
+}
+
 export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
   return tool({
     description:
@@ -71,10 +155,10 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
     ]),
     contextSchema: z.object({
       senderId: z.string(),
-      // R3b3-c4c2: optional inert RESTOCK inbound identity. Accepted (and
-      // strictly shaped) so the SDK validates the per-turn envelope, but NOT
-      // yet read in `execute` — RESTOCK stays default-off/unwired and the
-      // legacy `humanHandoffService.create` behavior is unchanged.
+      // R3b3-c4c2-tool: optional RESTOCK inbound identity, strictly shaped so
+      // the SDK validates the per-turn envelope. It is read ONLY by the
+      // enabled `out_of_stock` route; the default-off and other-kind paths
+      // ignore it and keep the legacy `humanHandoffService.create` behavior.
       inboundEvent: z
         .strictObject({
           receivingPhoneNumberId: z.string().min(1),
@@ -85,6 +169,13 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
     }),
     execute: async (input, options) => {
       const senderId = options.context.senderId;
+      const restock = deps.restock;
+      // The experimental RESTOCK route is reachable ONLY behind the exact
+      // boolean gate and ONLY for `out_of_stock`; every other case keeps the
+      // byte-identical legacy `humanHandoffService.create` call below.
+      if (restock?.enabled === true && input.kind === 'out_of_stock') {
+        return runRestockRoute(deps, restock, input.digest, options.context);
+      }
       // The discriminated union guarantees that `input.kind` aligns with
       // the concrete shape of `input.digest`. The cast widens the digest
       // object back to the application's discriminated-union view so the
