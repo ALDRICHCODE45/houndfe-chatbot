@@ -549,6 +549,117 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   // the verify blocker: the ops path and the short-circuit had ZERO
   // coverage in this file. The hook runs AFTER echo + dedup and BEFORE
   // the runner; the short-circuit runs only for customer-side inbounds.
+  // ─── R3b3-c4c1b: customer inbound identity forwarding (inert) ─────
+  describe('customer inbound identity forwarding', () => {
+    const CUSTOMER = '5215550001111';
+    const OPS_SENDER = '5219999888777';
+    const PHONE_ID = '123456789012345';
+    const EXPECTED = {
+      receivingPhoneNumberId: PHONE_ID,
+      senderId: CUSTOMER,
+      messageId: 'wamid.inbound',
+    };
+
+    const inbound = (
+      messageId: string,
+      body: string,
+      phoneNumberId?: string,
+      from = CUSTOMER,
+    ): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                ...(phoneNumberId === undefined
+                  ? {}
+                  : { metadata: { phone_number_id: phoneNumberId } }),
+                contacts: [{ wa_id: from }],
+                messages: [
+                  {
+                    id: messageId,
+                    from,
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const ready = () => {
+      store.get.mockResolvedValue(null);
+      store.update.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: { messages: [] },
+      });
+      llm.run.mockResolvedValue({
+        reply: 'ok',
+        messages: [{ role: 'assistant', content: 'ok' }],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+    };
+    const input = (index = 0) => llm.run.mock.calls[index][0];
+    const hasEvent = (index = 0) =>
+      Object.prototype.hasOwnProperty.call(input(index), 'inboundEvent');
+
+    it('forwards the normalized customer identity into the agent run', async () => {
+      ready();
+      await service.dispatch(inbound('wamid.inbound', 'hola', PHONE_ID));
+      expect(llm.run).toHaveBeenCalledWith(
+        expect.objectContaining({
+          senderId: CUSTOMER,
+          text: 'hola',
+          inboundEvent: EXPECTED,
+        }),
+      );
+    });
+
+    it('omits the property when the customer inbound has no phone metadata', async () => {
+      ready();
+      await service.dispatch(inbound('wamid.inbound', 'hola'));
+      expect(hasEvent()).toBe(false);
+    });
+
+    it('never forwards the ops identity into the synthetic customer turn', async () => {
+      ready();
+      humanHandoff.isOpsSender.mockImplementation(
+        (sender) => sender === OPS_SENDER,
+      );
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'resolved',
+        customerId: CUSTOMER,
+        ref: 'HF-abc123def456',
+        resolution: { decision: 'YES_RESTOCK_IN_X_DAYS', days: 3 },
+        syntheticUserText: '[Resolución humana] disponible en 3 días.',
+      });
+      await service.dispatch(
+        inbound('wamid.ops', 'HF-abc123def456', PHONE_ID, OPS_SENDER),
+      );
+      expect(humanHandoff.isOpsSender).toHaveBeenCalledWith(OPS_SENDER);
+      expect(input().senderId).toBe(CUSTOMER);
+      expect(hasEvent()).toBe(false);
+    });
+
+    it('preserves the event identity across a redelivery of the same message', async () => {
+      ready();
+      const event = inbound('wamid.inbound', 'hola', PHONE_ID);
+      await service.dispatch(event);
+      await service.dispatch(event);
+      expect(llm.run).toHaveBeenCalledTimes(2);
+      const [first, second] = llm.run.mock.calls.map((c) => c[0].inboundEvent);
+      expect(first).toEqual(EXPECTED);
+      expect(second).toEqual(first);
+      expect(second).not.toBe(first);
+    });
+  });
+
   describe('ops pre-routing hook + pending-marker short-circuit', () => {
     const OPS = '5219999888777';
     const CUSTOMER = '5215550001111';

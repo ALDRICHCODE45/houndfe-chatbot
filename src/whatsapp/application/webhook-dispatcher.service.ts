@@ -241,9 +241,24 @@ export class WebhookDispatcherService {
         }
 
         // ─── (5) Normal agent dispatch ─────────────────────────────────
+        // ─── (5) Normal agent dispatch ─────────────────────────────────
+        // R3b3-c4c1b: a REAL normalized customer inbound carries its
+        // receiving-phone metadata. Forward an inert identity only when it
+        // exists; the runner applies strict validation and drops anything
+        // malformed. Ops synthetic turns never reach this branch, so the ops
+        // identity is never injected.
         const { reply } = await this.agentRunner.handle({
           senderId: message.senderId,
           text: message.text,
+          ...(message.receivingPhoneNumberId === undefined
+            ? {}
+            : {
+                inboundEvent: {
+                  receivingPhoneNumberId: message.receivingPhoneNumberId,
+                  senderId: message.senderId,
+                  messageId: message.messageId,
+                },
+              }),
         });
 
         const { providerMessageId } = await this.whatsappSender.sendText({
