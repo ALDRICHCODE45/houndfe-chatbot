@@ -5,6 +5,11 @@ import {
   CONVERSATION_STORE,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
+import {
+  SHARED_RESERVATION,
+  type ReservationDecision,
+  type SharedReservationPort,
+} from '../../human-decisions/domain/shared-reservation';
 import { normalizeSandboxRecipient } from '../../whatsapp/infrastructure/meta-whatsapp.sender';
 import { WHATSAPP_SENDER } from '../../whatsapp/domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
@@ -60,7 +65,8 @@ export interface HumanHandoffCreateInput {
 
 export type HumanHandoffCreateResult =
   | { ok: true; requestId: string; ref: string; customerNotified: true }
-  | { ok: false; error: { kind: 'disabled'; retryable: false } };
+  | { ok: false; error: { kind: 'disabled'; retryable: false } }
+  | { ok: false; error: { kind: 'unavailable'; retryable: false } };
 
 export type HumanHandoffResolveReplyResult =
   | {
@@ -100,6 +106,8 @@ export class HumanHandoffService {
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore: ConversationStore,
     private readonly configService: ConfigService,
+    @Inject(SHARED_RESERVATION)
+    private readonly reservations: SharedReservationPort,
   ) {}
 
   isOpsSender(senderId: string): boolean {
@@ -113,6 +121,26 @@ export class HumanHandoffService {
       normalizeSandboxRecipient(senderId) ===
       normalizeSandboxRecipient(opsChannelPhone)
     );
+  }
+
+  /** Claim the single ACTIVE legacy slot before any store/send/marker effect.
+   * A non-claim or a thrown reservation fails closed (`unavailable`): the bot
+   * never promises a human that was not actually reserved, and v1 has no
+   * release, so a dead request is left ACTIVE for a later reconciliation cut. */
+  private async reserveLegacy(
+    senderId: string,
+    requestKey: string,
+  ): Promise<ReservationDecision | null> {
+    try {
+      return await this.reservations.reserve({
+        senderId,
+        route: 'LEGACY_OPS',
+        requestKey,
+        intake: null,
+      });
+    } catch {
+      return null;
+    }
   }
 
   async create(
@@ -143,6 +171,11 @@ export class HumanHandoffService {
     const id = randomUUID().replace(/-/g, '').slice(0, 12);
     const ref = `HF-${id}`;
     const nowIso = new Date().toISOString();
+
+    const reservation = await this.reserveLegacy(input.senderId, id);
+    if (reservation?.action !== 'claim') {
+      return { ok: false, error: { kind: 'unavailable', retryable: false } };
+    }
 
     const createInput: CreateHumanHandoffInput = {
       id,
@@ -201,7 +234,15 @@ export class HumanHandoffService {
     }
 
     const resolution = parseResolution(args.text, target.kind);
-    await this.store.resolve(target.id, resolution);
+    const resolved = await this.store.resolve(target.id, resolution);
+    if (
+      resolved === null ||
+      resolved.id !== target.id ||
+      resolved.customerId !== target.customerId ||
+      resolved.status !== 'resolved'
+    ) {
+      throw new Error('human handoff resolve was not persisted');
+    }
 
     const customerState = await this.conversationStore.get(target.customerId);
     await clearPendingHumanRequest(
@@ -209,6 +250,25 @@ export class HumanHandoffService {
       target.customerId,
       customerState,
     );
+
+    // W2: this fresh read narrows the window but does NOT prove CAS against a
+    // concurrent marker re-write landing after the check; a lost update remains
+    // possible. Only a compare-and-set marker store would close that gap.
+    const verifiedState = await this.conversationStore.get(target.customerId);
+    if (
+      verifiedState === null ||
+      verifiedState.data.pendingHumanRequest !== null
+    ) {
+      throw new Error('human handoff marker was not cleared');
+    }
+
+    const closed = await this.reservations.closeLegacyResolved(
+      target.customerId,
+      target.id,
+    );
+    if (!closed) {
+      throw new Error('human handoff reservation was not closed');
+    }
 
     return {
       kind: 'resolved',

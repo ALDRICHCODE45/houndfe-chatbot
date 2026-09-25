@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { DatabaseModule } from '../database/database.module';
 import { ConversationModule } from '../conversation/conversation.module';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
+import { HumanDecisionsModule } from '../human-decisions/human-decisions.module';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
 import { HumanHandoffService } from './application/human-handoff.service';
 import { HUMAN_HANDOFF_STORE } from './domain/human-handoff-store.port';
@@ -26,6 +27,8 @@ import { PostgresHumanHandoffStore } from './infrastructure/postgres-human-hando
  *     under `ConversationState.data.pendingHumanRequest`).
  *   - `WhatsappSenderModule` for `WHATSAPP_SENDER` (digest + customer
  *     notice + ops ask-for-ref).
+ *   - `HumanDecisionsModule` for the REQUIRED `SHARED_RESERVATION` claim
+ *     guard invoked before any store/send/marker effect.
  *   - `ConfigModule` for typed `humanHandoff` config.
  *
  * Module graph (acyclic, ADR-30):
@@ -37,6 +40,7 @@ import { PostgresHumanHandoffStore } from './infrastructure/postgres-human-hando
     DatabaseModule,
     ConversationModule,
     WhatsappSenderModule,
+    HumanDecisionsModule,
   ],
   providers: [
     { provide: HUMAN_HANDOFF_STORE, useClass: PostgresHumanHandoffStore },

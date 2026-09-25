@@ -3,6 +3,10 @@ import type {
   ConversationStore,
   ConversationState,
 } from '../../conversation/domain/conversation-store';
+import type {
+  ReservationDecision,
+  SharedReservationPort,
+} from '../../human-decisions/domain/shared-reservation';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import type {
   CreateHumanHandoffInput,
@@ -40,6 +44,7 @@ describe('HumanHandoffService', () => {
   let whatsappSender: jest.Mocked<WhatsappSenderPort>;
   let conversationStore: jest.Mocked<ConversationStore>;
   let configService: ConfigService;
+  let reservations: jest.Mocked<SharedReservationPort>;
   let service: HumanHandoffService;
 
   const OPS = '5219999888777';
@@ -77,11 +82,20 @@ describe('HumanHandoffService', () => {
       },
     } as unknown as ConfigService;
 
+    reservations = {
+      reserve: jest.fn().mockResolvedValue({
+        action: 'claim',
+        reason: 'single_sender_vacant',
+      }),
+      closeLegacyResolved: jest.fn().mockResolvedValue(true),
+    };
+
     service = new HumanHandoffService(
       store,
       whatsappSender,
       conversationStore,
       configService,
+      reservations,
     );
   });
 
@@ -131,6 +145,7 @@ describe('HumanHandoffService', () => {
           get: (key: string) =>
             key === 'humanHandoff.enabled' ? true : undefined,
         } as unknown as ConfigService,
+        reservations,
       );
       expect(noOps.isOpsSender('5219999888777')).toBe(false);
     });
@@ -247,6 +262,7 @@ describe('HumanHandoffService', () => {
       expect(store.create).not.toHaveBeenCalled();
       expect(whatsappSender.sendText).not.toHaveBeenCalled();
       expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(reservations.reserve).not.toHaveBeenCalled();
       expect(result).toEqual({
         ok: true,
         requestId: REF_ID,
@@ -271,6 +287,7 @@ describe('HumanHandoffService', () => {
         whatsappSender,
         conversationStore,
         disabledConfig,
+        reservations,
       );
 
       const result = await disabled.create({
@@ -290,6 +307,118 @@ describe('HumanHandoffService', () => {
       expect(store.create).not.toHaveBeenCalled();
       expect(whatsappSender.sendText).not.toHaveBeenCalled();
       expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(reservations.reserve).not.toHaveBeenCalled();
+    });
+
+    it('reserves LEGACY_OPS before store.create and proceeds only on claim', async () => {
+      const order: string[] = [];
+      reservations.reserve.mockImplementation(async () => {
+        order.push('reserve');
+        return { action: 'claim', reason: 'single_sender_vacant' };
+      });
+      store.create.mockImplementation(
+        async (input: CreateHumanHandoffInput) => {
+          order.push('create');
+          return {
+            id: input.id,
+            customerId: input.customerId,
+            agentId: input.agentId,
+            kind: input.kind,
+            digest: input.digest,
+            status: 'pending',
+            resolution: null,
+            createdAt: '2026-06-23T12:00:00.000Z',
+            resolvedAt: null,
+          };
+        },
+      );
+      conversationStore.get.mockResolvedValue(null);
+
+      const result = await service.create({
+        senderId: CUSTOMER,
+        kind: 'out_of_stock',
+        digest: {
+          kind: 'out_of_stock',
+          productId: '00000000-0000-4000-8000-000000000001',
+          name: 'Croquetas',
+          quantity: 1,
+        },
+      });
+
+      expect(result.ok).toBe(true);
+      expect(order).toEqual(['reserve', 'create']);
+      const [proposal] = reservations.reserve.mock.calls[0];
+      expect(proposal.senderId).toBe(CUSTOMER);
+      expect(proposal.route).toBe('LEGACY_OPS');
+      expect(proposal.requestKey).toMatch(/^[a-f0-9]{12}$/);
+      expect(proposal.intake).toBeNull();
+    });
+
+    const denied: ReservationDecision[] = [
+      { action: 'replay', reason: 'exact_active_replay' },
+      { action: 'occupied_legacy', reason: 'legacy_marker_present' },
+      {
+        action: 'occupied',
+        reason: 'different_active_key',
+        activeRoute: 'RESTOCK',
+      },
+      { action: 'conflict', reason: 'same_key_different_payload' },
+      { action: 'blocked', reason: 'unknown_existing' },
+    ];
+    it.each(denied)(
+      'fails closed on non-claim reservation %#',
+      async (decision) => {
+        reservations.reserve.mockResolvedValue(decision);
+        conversationStore.get.mockResolvedValue(null);
+
+        const result = await service.create({
+          senderId: CUSTOMER,
+          kind: 'out_of_stock',
+          digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+        });
+
+        expect(result).toEqual({
+          ok: false,
+          error: { kind: 'unavailable', retryable: false },
+        });
+        expect(store.create).not.toHaveBeenCalled();
+        expect(whatsappSender.sendText).not.toHaveBeenCalled();
+        expect(conversationStore.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('fails closed when the reservation throws', async () => {
+      reservations.reserve.mockRejectedValue(new Error('db down'));
+      conversationStore.get.mockResolvedValue(null);
+
+      const result = await service.create({
+        senderId: CUSTOMER,
+        kind: 'out_of_stock',
+        digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: 'unavailable', retryable: false },
+      });
+      expect(store.create).not.toHaveBeenCalled();
+      expect(whatsappSender.sendText).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+    });
+
+    it('keeps the claim and returns no success when store.create fails after claim', async () => {
+      conversationStore.get.mockResolvedValue(null);
+      store.create.mockRejectedValue(new Error('insert failed'));
+
+      await expect(
+        service.create({
+          senderId: CUSTOMER,
+          kind: 'out_of_stock',
+          digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+        }),
+      ).rejects.toThrow('insert failed');
+      // No release API: the claim stays ACTIVE and reserve is attempted once.
+      expect(reservations.reserve).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -300,8 +429,20 @@ describe('HumanHandoffService', () => {
     ): ConversationState => ({
       senderId: customerId,
       lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: marker ? { pendingHumanRequest: marker } : {},
+      data: { pendingHumanRequest: marker },
     });
+
+    // The fresh post-clear re-read must default to a marker-free state.
+    beforeEach(() => {
+      conversationStore.get.mockResolvedValue(customerStateFor(CUSTOMER));
+    });
+
+    const pendingMarker = {
+      requestId: REF_ID,
+      ref: `HF-${REF_ID}`,
+      createdAt: '2026-06-23T12:00:00.000Z',
+      customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+    };
 
     const baseRequest: HumanHandoffRequest = {
       id: REF_ID,
@@ -328,7 +469,7 @@ describe('HumanHandoffService', () => {
         resolution,
         resolvedAt: '2026-06-23T12:05:00.000Z',
       }));
-      conversationStore.get.mockResolvedValue(
+      conversationStore.get.mockResolvedValueOnce(
         customerStateFor(CUSTOMER, {
           requestId: REF_ID,
           ref: `HF-${REF_ID}`,
@@ -380,7 +521,7 @@ describe('HumanHandoffService', () => {
         resolution,
         resolvedAt: '2026-06-23T12:35:00.000Z',
       }));
-      conversationStore.get.mockResolvedValue(
+      conversationStore.get.mockResolvedValueOnce(
         customerStateFor(CUSTOMER, {
           requestId: 'fbabc0000001',
           ref: 'HF-fbabc0000001',
@@ -419,7 +560,7 @@ describe('HumanHandoffService', () => {
         resolution,
         resolvedAt: '2026-06-23T13:05:00.000Z',
       }));
-      conversationStore.get.mockResolvedValue(
+      conversationStore.get.mockResolvedValueOnce(
         customerStateFor(CUSTOMER, {
           requestId: 'newer0000000',
           ref: 'HF-newer0000000',
@@ -453,6 +594,7 @@ describe('HumanHandoffService', () => {
       expect(store.findLatestPendingForAgent).toHaveBeenCalledWith(OPS);
       expect(result).toEqual({ kind: 'no_pending', reply: ASK_FOR_REF });
       expect(store.resolve).not.toHaveBeenCalled();
+      expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
     });
 
     it('no token + no pending: returns { kind: "no_pending", reply: ASK_FOR_REF }', async () => {
@@ -465,6 +607,7 @@ describe('HumanHandoffService', () => {
 
       expect(result).toEqual({ kind: 'no_pending', reply: ASK_FOR_REF });
       expect(store.resolve).not.toHaveBeenCalled();
+      expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
     });
 
     it('bare prose on expiration_date kind: parses EXPIRATION decision', async () => {
@@ -486,7 +629,7 @@ describe('HumanHandoffService', () => {
         resolution,
         resolvedAt: '2026-06-23T12:05:00.000Z',
       }));
-      conversationStore.get.mockResolvedValue(
+      conversationStore.get.mockResolvedValueOnce(
         customerStateFor(CUSTOMER, {
           requestId: REF_ID,
           ref: `HF-${REF_ID}`,
@@ -516,7 +659,7 @@ describe('HumanHandoffService', () => {
         resolution,
         resolvedAt: '2026-06-23T12:05:00.000Z',
       }));
-      conversationStore.get.mockResolvedValue(
+      conversationStore.get.mockResolvedValueOnce(
         customerStateFor(CUSTOMER, {
           requestId: REF_ID,
           ref: `HF-${REF_ID}`,
@@ -536,6 +679,168 @@ describe('HumanHandoffService', () => {
       });
     });
 
+    it('closes the legacy reservation only after resolve + clear + fresh verify', async () => {
+      const order: string[] = [];
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockImplementation(async (id, resolution) => {
+        order.push('resolve');
+        return {
+          ...baseRequest,
+          id,
+          status: 'resolved',
+          resolution,
+          resolvedAt: '2026-06-23T12:05:00.000Z',
+        };
+      });
+      let reads = 0;
+      conversationStore.get.mockImplementation(async () => {
+        order.push('get');
+        reads += 1;
+        return reads === 1
+          ? customerStateFor(CUSTOMER, pendingMarker)
+          : customerStateFor(CUSTOMER);
+      });
+      conversationStore.update.mockImplementation(async () => {
+        order.push('clear');
+        return customerStateFor(CUSTOMER);
+      });
+      reservations.closeLegacyResolved.mockImplementation(async () => {
+        order.push('close');
+        return true;
+      });
+
+      const result = await service.resolveReply({
+        text: `HF-${REF_ID} NO_RESTOCK`,
+        from: OPS,
+      });
+
+      expect(result.kind).toBe('resolved');
+      expect(order).toEqual(['resolve', 'get', 'clear', 'get', 'close']);
+      expect(reservations.closeLegacyResolved).toHaveBeenCalledWith(
+        CUSTOMER,
+        REF_ID,
+      );
+    });
+
+    it('throws and does not close when the durable resolve returns null', async () => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockResolvedValue(null);
+
+      await expect(
+        service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
+      ).rejects.toThrow();
+      expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+    });
+
+    it('throws and does not close when the resolved row mismatches the target', async () => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockResolvedValue({
+        ...baseRequest,
+        customerId: 'other-customer',
+        status: 'resolved',
+        resolution: { decision: 'NO_RESTOCK' },
+        resolvedAt: '2026-06-23T12:05:00.000Z',
+      });
+
+      await expect(
+        service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
+      ).rejects.toThrow();
+      expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
+    });
+
+    it('throws and does not close when the marker write fails', async () => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockImplementation(async (id, resolution) => ({
+        ...baseRequest,
+        id,
+        status: 'resolved',
+        resolution,
+        resolvedAt: '2026-06-23T12:05:00.000Z',
+      }));
+      conversationStore.get.mockResolvedValue(
+        customerStateFor(CUSTOMER, pendingMarker),
+      );
+      conversationStore.update.mockRejectedValue(new Error('update failed'));
+
+      await expect(
+        service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
+      ).rejects.toThrow('update failed');
+      expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, ConversationState | null]>([
+      ['a surviving marker', customerStateFor(CUSTOMER, pendingMarker)],
+      ['a null state', null],
+      ['an absent marker key', { ...customerStateFor(CUSTOMER), data: {} }],
+      [
+        'a malformed marker',
+        customerStateFor(CUSTOMER, { bad: true } as never),
+      ],
+    ])('throws and does not close on %s after clearing', async (_n, bad) => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockImplementation(async (id, resolution) => ({
+        ...baseRequest,
+        id,
+        status: 'resolved',
+        resolution,
+        resolvedAt: '2026-06-23T12:05:00.000Z',
+      }));
+      conversationStore.get
+        .mockResolvedValueOnce(customerStateFor(CUSTOMER, pendingMarker))
+        .mockResolvedValueOnce(bad);
+
+      await expect(
+        service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
+      ).rejects.toThrow();
+      expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
+    });
+
+    it('throws instead of returning resolved when the fenced close is false', async () => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockImplementation(async (id, resolution) => ({
+        ...baseRequest,
+        id,
+        status: 'resolved',
+        resolution,
+        resolvedAt: '2026-06-23T12:05:00.000Z',
+      }));
+      conversationStore.get.mockResolvedValueOnce(
+        customerStateFor(CUSTOMER, pendingMarker),
+      );
+      reservations.closeLegacyResolved.mockResolvedValue(false);
+
+      await expect(
+        service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
+      ).rejects.toThrow();
+      expect(reservations.closeLegacyResolved).toHaveBeenCalledWith(
+        CUSTOMER,
+        REF_ID,
+      );
+    });
+
+    it('rethrows a fenced close failure without retry', async () => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockImplementation(async (id, resolution) => ({
+        ...baseRequest,
+        id,
+        status: 'resolved',
+        resolution,
+        resolvedAt: '2026-06-23T12:05:00.000Z',
+      }));
+      conversationStore.get.mockResolvedValueOnce(
+        customerStateFor(CUSTOMER, pendingMarker),
+      );
+      reservations.closeLegacyResolved.mockRejectedValue(
+        new Error('close failed'),
+      );
+
+      await expect(
+        service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
+      ).rejects.toThrow('close failed');
+      expect(reservations.closeLegacyResolved).toHaveBeenCalledTimes(1);
+    });
+
     it('reads humanHandoff block from ConfigService (not process.env)', async () => {
       const original = process.env.OPS_CHANNEL_PHONE;
       process.env.OPS_CHANNEL_PHONE = 'DIFFERENT_VALUE';
@@ -552,6 +857,7 @@ describe('HumanHandoffService', () => {
           whatsappSender,
           conversationStore,
           procCfg,
+          reservations,
         );
         expect(svc.isOpsSender('5219999888777')).toBe(true);
       } finally {
