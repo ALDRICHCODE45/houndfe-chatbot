@@ -237,14 +237,15 @@ export class PostgresSharedReservationStore implements SharedReservationPort {
       }
       const inserted = await client.query(
         `INSERT INTO human_decision_reservations
-           (sender_id, route, request_key, status, intake)
-         VALUES ($1, $2, $3, 'ACTIVE', $4::jsonb)
+           (sender_id, route, request_key, status, intake, post_state)
+         VALUES ($1, $2, $3, 'ACTIVE', $4::jsonb, $5)
          ON CONFLICT DO NOTHING RETURNING status`,
         [
           canonical.senderId,
           canonical.route,
           canonical.requestKey,
           canonical.intake === null ? null : JSON.stringify(canonical.intake),
+          canonical.route === 'RESTOCK' ? 'RESERVED' : null,
         ],
       );
       if (inserted.rowCount === 1) {

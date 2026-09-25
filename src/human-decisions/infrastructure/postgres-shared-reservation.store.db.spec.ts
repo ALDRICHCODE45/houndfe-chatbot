@@ -32,6 +32,7 @@ const SENDER = 'whatsapp:+5215500000001';
 const OTHER = 'whatsapp:+5215500009999';
 const LEGACY_KEY = 'a1b2c3d4e5f6';
 const NEW_KEY = 'abcdefabcdef';
+const DECISION = '33333333-3333-4333-8333-333333333333';
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 
@@ -180,8 +181,8 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
     const insert = (value: string) =>
       pool.query(
         `INSERT INTO human_decision_reservations
-           (sender_id, route, request_key, status, intake)
-         VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb)`,
+           (sender_id, route, request_key, status, intake, post_state)
+         VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb, 'RESERVED')`,
         [SENDER, A, value],
       );
     await expect(insert('{}')).rejects.toThrow(/intake_check/);
@@ -200,11 +201,58 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
     await expect(
       pool.query(
         `INSERT INTO human_decision_reservations
+           (sender_id, route, request_key, status, intake, post_state)
+         VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb, 'RESERVED')`,
+        [SENDER, A, JSON.stringify(intake())],
+      ),
+    ).rejects.toThrow(/active_sender_idx/);
+  });
+
+  it('rejects a RESTOCK row without a post_state (DB CHECK)', async () => {
+    await expect(
+      pool.query(
+        `INSERT INTO human_decision_reservations
            (sender_id, route, request_key, status, intake)
          VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb)`,
         [SENDER, A, JSON.stringify(intake())],
       ),
-    ).rejects.toThrow(/active_sender_idx/);
+    ).rejects.toThrow(/post_state_route_check/);
+  });
+
+  it('rejects a leaked backend id while RESERVED (DB CHECK)', async () => {
+    await expect(
+      pool.query(
+        `INSERT INTO human_decision_reservations
+           (sender_id, route, request_key, status, intake, post_state,
+            backend_decision_id)
+         VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb, 'RESERVED', $4)`,
+        [SENDER, A, JSON.stringify(intake()), DECISION],
+      ),
+    ).rejects.toThrow(/backend_decision_id_check/);
+  });
+
+  it('rejects a malformed recorded backend id (DB CHECK)', async () => {
+    await expect(
+      pool.query(
+        `INSERT INTO human_decision_reservations
+           (sender_id, route, request_key, status, intake, post_state,
+            backend_decision_id, post_attempted_at, receipt_recorded_at)
+         VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb, 'RECEIPT_RECORDED',
+                 'nope', now(), now())`,
+        [SENDER, A, JSON.stringify(intake())],
+      ),
+    ).rejects.toThrow(/backend_decision_id_check/);
+  });
+
+  it('rejects a LEGACY_OPS row with a post_state (DB CHECK)', async () => {
+    await expect(
+      pool.query(
+        `INSERT INTO human_decision_reservations
+           (sender_id, route, request_key, status, intake, post_state)
+         VALUES ($1, 'LEGACY_OPS', $2, 'ACTIVE', NULL, 'RESERVED')`,
+        [SENDER, LEGACY_KEY],
+      ),
+    ).rejects.toThrow(/post_state_route_check/);
   });
 
   it('does not close while the matching handoff is still pending', async () => {

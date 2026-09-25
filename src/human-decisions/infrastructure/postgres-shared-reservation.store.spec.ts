@@ -71,7 +71,7 @@ const KEY_SQL =
 const PENDING_SQL =
   "SELECT 1 FROM human_handoff_requests WHERE customer_id = $1 AND status = 'pending' LIMIT 1";
 const INSERT_SQL =
-  "INSERT INTO human_decision_reservations (sender_id, route, request_key, status, intake) VALUES ($1, $2, $3, 'ACTIVE', $4::jsonb) ON CONFLICT DO NOTHING RETURNING status";
+  "INSERT INTO human_decision_reservations (sender_id, route, request_key, status, intake, post_state) VALUES ($1, $2, $3, 'ACTIVE', $4::jsonb, $5) ON CONFLICT DO NOTHING RETURNING status";
 
 /** Strict-fake contract faults. `beforeEach` clears them and `afterEach`
  * asserts none, so a mismatched predicate/param fails even a reject-case test
@@ -109,10 +109,16 @@ function strictReply(
       return pick(canned.pending);
     }
     if (sql === INSERT_SQL) {
-      const expectedIntake =
-        target.route === 'RESTOCK' ? JSON.stringify(intake()) : null;
+      const restock = target.route === 'RESTOCK';
+      const expectedIntake = restock ? JSON.stringify(intake()) : null;
       if (
-        !sameParams(params, [SENDER, target.route, target.key, expectedIntake])
+        !sameParams(params, [
+          SENDER,
+          target.route,
+          target.key,
+          expectedIntake,
+          restock ? 'RESERVED' : null,
+        ])
       ) {
         fault('INSERT params');
       }
@@ -207,6 +213,7 @@ describe('PostgresSharedReservationStore.reserve', () => {
       'RESTOCK',
       A,
       JSON.stringify(intake()),
+      'RESERVED',
     ]);
     expect(h.client.releases).toBe(1);
   });
@@ -328,7 +335,13 @@ describe('PostgresSharedReservationStore.reserve — deferred adapter cases', ()
     );
     await expect(h.store.reserve(legacy())).resolves.toEqual(CLAIM);
     const insert = h.client.calls.find((c) => c.sql === INSERT_SQL);
-    expect(insert?.params).toEqual([SENDER, 'LEGACY_OPS', LEGACY_KEY, null]);
+    expect(insert?.params).toEqual([
+      SENDER,
+      'LEGACY_OPS',
+      LEGACY_KEY,
+      null,
+      null,
+    ]);
     expect(h.client.releases).toBe(1);
   });
 
