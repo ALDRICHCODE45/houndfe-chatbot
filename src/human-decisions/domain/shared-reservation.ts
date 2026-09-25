@@ -187,6 +187,15 @@ export function classifyReservation(
  */
 export interface SharedReservationPort {
   reserve(proposal: ReservationProposal): Promise<ReservationDecision>;
+  /**
+   * Fenced terminal close for the LEGACY_OPS route only. Closes the exact ACTIVE
+   * legacy reservation for `(senderId, requestKey)` iff a `human_handoff_requests`
+   * row with the same id/customer_id is `resolved`. Returns true when that
+   * handoff's reservation is (or was already) CLOSED; false on mismatch, missing,
+   * pending, or malformed input. Never closes RESTOCK or a different ACTIVE key.
+   * Idempotent; there is no generic release beyond this exact fenced row.
+   */
+  closeLegacyResolved(senderId: string, requestKey: string): Promise<boolean>;
 }
 
 /** Nest DI token for the `SharedReservationPort` binding. */

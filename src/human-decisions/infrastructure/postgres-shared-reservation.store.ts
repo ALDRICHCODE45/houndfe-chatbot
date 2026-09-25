@@ -32,6 +32,40 @@ const blocked = (reason: ReservationBlockedReason): ReservationDecision => ({
   reason,
 });
 
+const LEGACY_REQUEST_KEY = /^[0-9a-f]{12}$/;
+const closesLegacy = (senderId: unknown, requestKey: unknown): boolean =>
+  typeof senderId === 'string' &&
+  senderId.trim().length > 0 &&
+  typeof requestKey === 'string' &&
+  LEGACY_REQUEST_KEY.test(requestKey);
+
+const CLOSE_LEGACY_SQL = `UPDATE human_decision_reservations AS r
+SET status = 'CLOSED', updated_at = now()
+WHERE r.route = 'LEGACY_OPS'
+  AND r.sender_id = $1
+  AND r.request_key = $2
+  AND r.status = 'ACTIVE'
+  AND EXISTS (
+    SELECT 1 FROM human_handoff_requests AS h
+    WHERE h.id = r.request_key
+      AND h.customer_id = r.sender_id
+      AND h.status = 'resolved'
+  )
+RETURNING r.status`;
+const CLOSE_LEGACY_IDEMPOTENT_SQL = `SELECT 1 AS closed
+FROM human_decision_reservations AS r
+WHERE r.route = 'LEGACY_OPS'
+  AND r.sender_id = $1
+  AND r.request_key = $2
+  AND r.status = 'CLOSED'
+  AND EXISTS (
+    SELECT 1 FROM human_handoff_requests AS h
+    WHERE h.id = r.request_key
+      AND h.customer_id = r.sender_id
+      AND h.status = 'resolved'
+  )
+LIMIT 1`;
+
 const isRow = (row: unknown): boolean =>
   typeof row === 'object' &&
   row !== null &&
@@ -220,6 +254,37 @@ export class PostgresSharedReservationStore implements SharedReservationPort {
       const arbitration = await arbitrate(client, canonical, pending);
       await client.query('ROLLBACK');
       return arbitration;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async closeLegacyResolved(
+    senderId: string,
+    requestKey: string,
+  ): Promise<boolean> {
+    if (!closesLegacy(senderId, requestKey)) return false;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const updated = await client.query(CLOSE_LEGACY_SQL, [
+        senderId,
+        requestKey,
+      ]);
+      if (singleRow(updated).length === 1) {
+        await client.query('COMMIT');
+        return true;
+      }
+      const existing = await client.query(CLOSE_LEGACY_IDEMPOTENT_SQL, [
+        senderId,
+        requestKey,
+      ]);
+      const closed = singleRow(existing).length === 1;
+      await client.query('COMMIT');
+      return closed;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;

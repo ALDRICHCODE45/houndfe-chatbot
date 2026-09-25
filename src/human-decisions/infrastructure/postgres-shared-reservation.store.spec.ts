@@ -53,6 +53,8 @@ type Canned = {
   insert?: Result | Error;
   pending?: Result | Error;
   commit?: Error;
+  close?: Result | Error;
+  closeExisting?: Result | Error;
 };
 const EMPTY: Result = { rows: [], rowCount: 0 };
 const ROWS = (...rows: unknown[]): Result => ({ rows, rowCount: rows.length });
@@ -115,6 +117,12 @@ function strictReply(
         fault('INSERT params');
       }
       return pick(canned.insert);
+    }
+    if (sql.startsWith('UPDATE human_decision_reservations')) {
+      return pick(canned.close);
+    }
+    if (sql.includes('SELECT 1 AS closed')) {
+      return pick(canned.closeExisting);
     }
     return fault(`unrecognized query: ${sql}`);
   };
@@ -378,5 +386,89 @@ describe('PostgresSharedReservationStore.reserve — deferred adapter cases', ()
       expect(h.connects()).toBe(0);
       expect(h.client.calls).toHaveLength(0);
     }
+  });
+});
+
+describe('PostgresSharedReservationStore.closeLegacyResolved', () => {
+  it('closes the exact legacy reservation and commits', async () => {
+    const h = harness({ close: ROWS({ status: 'CLOSED' }) });
+    await expect(h.store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      true,
+    );
+    const sqls = h.sqls();
+    expect(sqls[0]).toBe('BEGIN');
+    expect(sqls.at(-1)).toBe('COMMIT');
+    const update = h.client.calls.find((c) =>
+      c.sql.startsWith('UPDATE human_decision_reservations'),
+    );
+    expect(update?.params).toEqual([SENDER, LEGACY_KEY]);
+    expect(update?.sql).toContain("r.route = 'LEGACY_OPS'");
+    expect(update?.sql).toContain("SET status = 'CLOSED'");
+    expect(update?.sql).toContain('updated_at = now()');
+    expect(update?.sql).toContain("h.status = 'resolved'");
+    expect(h.client.releases).toBe(1);
+  });
+
+  it('returns true idempotently for an already-CLOSED exact reservation', async () => {
+    const h = harness({ close: EMPTY, closeExisting: ROWS({ closed: 1 }) });
+    await expect(h.store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      true,
+    );
+    const sqls = h.sqls();
+    expect(
+      sqls.filter((s) => s.startsWith('UPDATE human_decision_reservations')),
+    ).toHaveLength(1);
+    expect(sqls.some((s) => s.includes('SELECT 1 AS closed'))).toBe(true);
+    expect(sqls.at(-1)).toBe('COMMIT');
+    expect(h.client.releases).toBe(1);
+  });
+
+  it('returns false when no exact resolved legacy reservation exists', async () => {
+    const h = harness({ close: EMPTY, closeExisting: EMPTY });
+    await expect(h.store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      false,
+    );
+    expect(h.sqls()).toContain('COMMIT');
+    expect(h.client.releases).toBe(1);
+  });
+
+  it('fails closed on a malformed sender or non-legacy key before the pool', async () => {
+    const h = harness();
+    await expect(h.store.closeLegacyResolved('', LEGACY_KEY)).resolves.toBe(
+      false,
+    );
+    await expect(h.store.closeLegacyResolved(SENDER, 'XYZ')).resolves.toBe(
+      false,
+    );
+    await expect(h.store.closeLegacyResolved(SENDER, A)).resolves.toBe(false);
+    expect(h.connects()).toBe(0);
+    expect(h.client.calls).toHaveLength(0);
+  });
+
+  it('throws and rolls back on an inconsistent driver result', async () => {
+    const h = harness({ close: { rows: [], rowCount: 1 } });
+    await expect(
+      h.store.closeLegacyResolved(SENDER, LEGACY_KEY),
+    ).rejects.toThrow();
+    expect(h.sqls()).toContain('ROLLBACK');
+    expect(h.client.releases).toBe(1);
+  });
+
+  it('throws and rolls back on a DB or commit error', async () => {
+    const dbError = harness({ close: new Error('boom') });
+    await expect(
+      dbError.store.closeLegacyResolved(SENDER, LEGACY_KEY),
+    ).rejects.toThrow('boom');
+    expect(dbError.sqls()).toContain('ROLLBACK');
+    expect(dbError.client.releases).toBe(1);
+
+    const commitError = harness({
+      close: ROWS({ status: 'CLOSED' }),
+      commit: new Error('commit failed'),
+    });
+    await expect(
+      commitError.store.closeLegacyResolved(SENDER, LEGACY_KEY),
+    ).rejects.toThrow('commit failed');
+    expect(commitError.client.releases).toBe(1);
   });
 });

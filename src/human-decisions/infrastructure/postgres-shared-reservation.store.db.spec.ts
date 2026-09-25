@@ -31,6 +31,7 @@ const REPO_ROOT = join(__dirname, '..', '..', '..');
 const SENDER = 'whatsapp:+5215500000001';
 const OTHER = 'whatsapp:+5215500009999';
 const LEGACY_KEY = 'a1b2c3d4e5f6';
+const NEW_KEY = 'abcdefabcdef';
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 
@@ -102,6 +103,22 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
         [senderId],
       )
     ).rows;
+
+  const addHandoff = (id: string, customerId: string, status: string) =>
+    pool.query(
+      `INSERT INTO human_handoff_requests
+         (id, customer_id, agent_id, kind, digest, status)
+       VALUES ($1, $2, 'OPS', 'out_of_stock', '{}'::jsonb, $3)`,
+      [id, customerId, status],
+    );
+  const statusOf = async (senderId: string, requestKey: string) => {
+    const { rows } = await pool.query<{ status: string }>(
+      `SELECT status FROM human_decision_reservations
+       WHERE route = 'LEGACY_OPS' AND sender_id = $1 AND request_key = $2`,
+      [senderId, requestKey],
+    );
+    return rows[0]?.status;
+  };
 
   it('lets exactly one of two concurrent same-sender routes claim', async () => {
     const decisions = await Promise.all([
@@ -188,5 +205,61 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
         [SENDER, A, JSON.stringify(intake())],
       ),
     ).rejects.toThrow(/active_sender_idx/);
+  });
+
+  it('does not close while the matching handoff is still pending', async () => {
+    await store.reserve(legacy());
+    await addHandoff(LEGACY_KEY, SENDER, 'pending');
+    await expect(store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      false,
+    );
+    expect(await statusOf(SENDER, LEGACY_KEY)).toBe('ACTIVE');
+  });
+
+  it('does not close for a wrong sender or a wrong key', async () => {
+    await store.reserve(legacy());
+    await addHandoff(LEGACY_KEY, SENDER, 'resolved');
+    await expect(store.closeLegacyResolved(OTHER, LEGACY_KEY)).resolves.toBe(
+      false,
+    );
+    await expect(
+      store.closeLegacyResolved(SENDER, 'ffffffffffff'),
+    ).resolves.toBe(false);
+    expect(await statusOf(SENDER, LEGACY_KEY)).toBe('ACTIVE');
+  });
+
+  it('closes the exact resolved handoff and is idempotent', async () => {
+    await store.reserve(legacy());
+    await addHandoff(LEGACY_KEY, SENDER, 'resolved');
+    await expect(store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      true,
+    );
+    expect(await statusOf(SENDER, LEGACY_KEY)).toBe('CLOSED');
+    await expect(store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      true,
+    );
+    expect(await statusOf(SENDER, LEGACY_KEY)).toBe('CLOSED');
+  });
+
+  it('lets a new legacy key claim after close and never touches it', async () => {
+    await store.reserve(legacy());
+    await addHandoff(LEGACY_KEY, SENDER, 'resolved');
+    await expect(store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      true,
+    );
+    await expect(
+      store.reserve({
+        route: 'LEGACY_OPS',
+        senderId: SENDER,
+        requestKey: NEW_KEY,
+        intake: null,
+      }),
+    ).resolves.toEqual({ action: 'claim', reason: 'single_sender_vacant' });
+    expect(await statusOf(SENDER, NEW_KEY)).toBe('ACTIVE');
+    await expect(store.closeLegacyResolved(SENDER, LEGACY_KEY)).resolves.toBe(
+      true,
+    );
+    expect(await statusOf(SENDER, NEW_KEY)).toBe('ACTIVE');
+    expect(await statusOf(SENDER, LEGACY_KEY)).toBe('CLOSED');
   });
 });
