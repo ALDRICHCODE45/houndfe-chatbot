@@ -13,6 +13,7 @@ import {
 } from '../domain/errors';
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
 import { CancelSaleInputSchema } from '../domain/dtos/sales.dto';
+import type { RestockIntakeInput } from '../domain/dtos/human-decisions.dto';
 
 // Complete, type-safe `AxiosResponse` fixture. The client consumes
 // `httpService.request<T>()`, which resolves to `AxiosResponse<T>`, so a bare
@@ -1122,6 +1123,278 @@ describe('ChatbotApiHttpClient', () => {
       }
       expect(httpService.request).toHaveBeenCalledTimes(1);
       expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── submitRestockIntake (POST /chatbot-api/human-decisions) — HD-R2b2
+
+  describe('submitRestockIntake (HD-R2b2)', () => {
+    const intake: RestockIntakeInput = {
+      sourceRequestId: '11111111-1111-4111-8111-111111111111',
+      type: 'RESTOCK',
+      productId: '22222222-2222-4222-8222-222222222222',
+      productName: 'Croquetas Premium',
+      variantId: '33333333-3333-4333-8333-333333333333',
+      sku: 'SKU-1',
+      requestedQuantity: 2,
+      observedStockAtRequest: 0,
+      stockObservedAt: '2026-08-25T12:00:00.000Z',
+      supersedesDecisionId: null,
+    };
+
+    const historicalReceipt = (overrides: Record<string, unknown> = {}) => ({
+      id: '44444444-4444-4444-8444-444444444444',
+      sourceRequestId: intake.sourceRequestId,
+      type: 'RESTOCK',
+      status: 'PENDING',
+      version: 1,
+      createdAt: '2026-08-25T12:00:01.000Z',
+      snapshot: {
+        branchId: '55555555-5555-4555-8555-555555555555',
+        branchName: 'Sucursal Centro',
+        productId: intake.productId,
+        productName: intake.productName,
+        variantId: intake.variantId,
+        sku: intake.sku,
+        requestedQuantity: intake.requestedQuantity,
+        observedStockAtRequest: intake.observedStockAtRequest,
+        stockObservedAt: intake.stockObservedAt,
+      },
+      supersedesDecisionId: null,
+      resolution: null,
+      applyBefore: null,
+      ...overrides,
+    });
+
+    type RequestCfg = {
+      method: string;
+      url: string;
+      data: Record<string, unknown>;
+      headers: Record<string, string>;
+    };
+    const sentConfig = () => httpService.request.mock.calls[0][0] as RequestCfg;
+    const rejectIntake = () =>
+      client.submitRestockIntake(intake).then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (error: ChatbotApiError) => error,
+      );
+
+    it('POSTs the exact 10-key body, idempotency key and auth headers, and replays 200 as historical PENDING', async () => {
+      const receipt = historicalReceipt();
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(receipt, 201)))
+        .mockReturnValueOnce(of(axiosResponse(receipt, 200)));
+
+      await expect(client.submitRestockIntake(intake)).resolves.toEqual(
+        receipt,
+      );
+
+      const cfg = sentConfig();
+      expect(cfg.method).toBe('POST');
+      expect(cfg.url).toBe('/chatbot-api/human-decisions');
+      expect(cfg.data).toEqual(intake);
+      expect(Object.keys(cfg.data).sort()).toEqual(Object.keys(intake).sort());
+      expect(cfg.headers['X-Idempotency-Key']).toBe(intake.sourceRequestId);
+      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+
+      const replayed = await client.submitRestockIntake(intake);
+      expect(replayed).toEqual(receipt);
+      expect(replayed.status).toBe('PENDING');
+      expect(replayed.version).toBe(1);
+      expect(replayed.resolution).toBeNull();
+      expect(replayed.applyBefore).toBeNull();
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('sends omitted optionals as explicit null and no extra authority keys', async () => {
+      httpService.request.mockReturnValue(
+        of(
+          axiosResponse(
+            historicalReceipt({
+              snapshot: {
+                ...historicalReceipt().snapshot,
+                variantId: null,
+                sku: null,
+                requestedQuantity: null,
+                observedStockAtRequest: null,
+                stockObservedAt: null,
+              },
+            }),
+            201,
+          ),
+        ),
+      );
+
+      await client.submitRestockIntake({
+        sourceRequestId: intake.sourceRequestId,
+        type: 'RESTOCK',
+        productId: intake.productId,
+        productName: intake.productName,
+      } as unknown as RestockIntakeInput);
+
+      expect(sentConfig().data).toEqual({
+        ...intake,
+        variantId: null,
+        sku: null,
+        requestedQuantity: null,
+        observedStockAtRequest: null,
+        stockObservedAt: null,
+      });
+    });
+
+    it('rejects a fulfilled 202 and malformed 201 receipts with UpstreamError evidence', async () => {
+      const rejected: Array<[unknown, number]> = [
+        [historicalReceipt(), 202],
+        [historicalReceipt({ status: 'RESOLVED' }), 201],
+        [historicalReceipt({ version: 2 }), 201],
+        [historicalReceipt({ resolution: { action: 'X' } }), 201],
+        [
+          historicalReceipt({
+            snapshot: { ...historicalReceipt().snapshot, productName: 'Otra' },
+          }),
+          201,
+        ],
+      ];
+
+      for (const [body, status] of rejected) {
+        httpService.request.mockReturnValueOnce(
+          of(axiosResponse(body, status)),
+        );
+        const error = await rejectIntake();
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error.statusCode).toBe(status);
+        expect(error.responseBody).toEqual(body);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(rejected.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid local intakes before any HTTP request', async () => {
+      const invalid = [
+        { ...intake, productName: '   ' },
+        { ...intake, source: 'houndfe-chatbot' },
+        { ...intake, sourceRequestId: 'not-a-uuid' },
+      ];
+
+      for (const dto of invalid) {
+        await expect(client.submitRestockIntake(dto)).rejects.toBeInstanceOf(
+          ChatbotApiError,
+        );
+      }
+
+      expect(httpService.request).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [401, 'UNAUTHORIZED', AuthError],
+      [403, 'FORBIDDEN', ForbiddenError],
+      [404, 'NOT_FOUND', NotFoundError],
+    ])(
+      'maps a %i scoped code envelope to %p with errorCode passthrough',
+      async (status, code, ErrorType) => {
+        httpService.request.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status,
+              data: { statusCode: status, code, message: 'nope' },
+            },
+          })),
+        );
+
+        const error = await rejectIntake();
+        expect(error).toBeInstanceOf(ErrorType);
+        expect(error.statusCode).toBe(status);
+        expect(error.errorCode).toBe(code);
+        expect(httpService.request).toHaveBeenCalledTimes(1);
+        expect(sleep).not.toHaveBeenCalled();
+      },
+    );
+
+    it('maps 429 to RateLimitError with Retry-After and the backend code in one request', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 429,
+            headers: { 'retry-after': '9' },
+            data: {
+              statusCode: 429,
+              code: 'RATE_LIMITED',
+              message: 'slow down',
+            },
+          },
+        })),
+      );
+
+      const error = await rejectIntake();
+      expect(error).toBeInstanceOf(RateLimitError);
+      expect((error as RateLimitError).retryAfterSeconds).toBe(9);
+      expect(error.errorCode).toBe('RATE_LIMITED');
+
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('maps a 5xx code envelope and a network failure to UpstreamError with one request and no sleep', async () => {
+      httpService.request
+        .mockReturnValueOnce(
+          throwError(() => ({
+            response: {
+              status: 503,
+              data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+            },
+          })),
+        )
+        .mockReturnValueOnce(
+          throwError(() => ({ code: 'ECONNRESET', message: 'socket down' })),
+        );
+
+      const server = await rejectIntake();
+      expect(server).toBeInstanceOf(UpstreamError);
+      expect(server.statusCode).toBe(503);
+      expect(server.errorCode).toBe('UPSTREAM_DOWN');
+
+      const network = await rejectIntake();
+      expect(network).toBeInstanceOf(UpstreamError);
+      expect(network.statusCode).toBeNull();
+      expect(network.errorCode).toBeNull();
+
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a 409 scoped code envelope and preserves legacy error precedence', async () => {
+      const conflict = {
+        statusCode: 409,
+        code: 'IDEMPOTENCY_CONFLICT',
+        message: 'conflict',
+      };
+      httpService.request.mockReturnValueOnce(
+        throwError(() => ({ response: { status: 409, data: conflict } })),
+      );
+      const error = await rejectIntake();
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect(error.statusCode).toBe(409);
+      expect(error.errorCode).toBe('IDEMPOTENCY_CONFLICT');
+      expect(error.responseBody).toEqual(conflict);
+
+      const legacy: Array<[unknown, string]> = [
+        [{ error: 'SALE_NOT_CANCELLABLE' }, 'SALE_NOT_CANCELLABLE'],
+        [{ error: 'OLD_CODE', code: 'NEW_CODE' }, 'OLD_CODE'],
+        [{ code: 'ONLY_CODE' }, 'ONLY_CODE'],
+      ];
+      for (const [body, expected] of legacy) {
+        httpService.request.mockReturnValueOnce(
+          throwError(() => ({ response: { status: 409, data: body } })),
+        );
+        await expect(rejectIntake()).resolves.toMatchObject({
+          errorCode: expected,
+        });
+      }
     });
   });
 

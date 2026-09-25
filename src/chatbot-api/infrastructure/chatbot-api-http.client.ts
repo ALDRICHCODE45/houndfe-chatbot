@@ -35,8 +35,17 @@ import {
   CreateSaleInputSchema,
 } from '../domain/dtos/sales.dto';
 import {
+  normalizeRestockIntake,
+  normalizeRestockIntakeReceipt,
+} from '../domain/dtos/human-decisions.dto';
+import type {
+  RestockIntakeInput,
+  RestockIntakeReceipt,
+} from '../domain/dtos/human-decisions.dto';
+import {
   AuthError,
   BranchMismatchError,
+  ChatbotApiError,
   ForbiddenError,
   NotFoundError,
   RateLimitError,
@@ -230,6 +239,78 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/cancel`,
       data: { reason: parsed.reason, cashierUserId: parsed.cashierUserId },
     });
+  }
+
+  /**
+   * `POST /chatbot-api/human-decisions` RESTOCK intake (contract v1, scope
+   * `human-decisions:create`).
+   *
+   * The local DTO is normalized first and a malformed intake is rejected
+   * before any request. The wire body is the exact normalized 10-key intake
+   * (optionals present as `null`) and `X-Idempotency-Key` equals the
+   * normalized `sourceRequestId`; no source, tenant, branch or PII authority
+   * is ever sent in the body. Exactly one POST is attempted — no sleep and no
+   * automatic retry even on 5xx or transport ambiguity — and only a `201`
+   * (first intake) or `200` (exact replay) response that passes the strict
+   * immutable-receipt normalizer resolves. That receipt is historical
+   * (`PENDING`/v1) and never represents current decision state.
+   */
+  async submitRestockIntake(
+    dto: RestockIntakeInput,
+  ): Promise<RestockIntakeReceipt> {
+    const sent = normalizeRestockIntake(dto);
+    if (sent === null) {
+      throw new ChatbotApiError(
+        'RESTOCK intake DTO failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    return this.requestRestockIntake(sent);
+  }
+
+  private async requestRestockIntake(
+    sent: RestockIntakeInput,
+  ): Promise<RestockIntakeReceipt> {
+    const requestConfig = this.buildAuthedRequestConfig({
+      method: 'POST',
+      url: '/chatbot-api/human-decisions',
+      data: sent,
+      headers: { 'X-Idempotency-Key': sent.sourceRequestId },
+    });
+
+    let response;
+    try {
+      response = await lastValueFrom(
+        this.httpService.request<unknown>(requestConfig),
+      );
+    } catch (error) {
+      throw this.mapError(error);
+    }
+
+    const body = response.data;
+
+    if (response.status !== 201 && response.status !== 200) {
+      throw new UpstreamError(
+        'Chatbot API RESTOCK intake returned an unexpected status',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    const receipt = normalizeRestockIntakeReceipt(body, sent);
+    if (receipt === null) {
+      throw new UpstreamError(
+        'Chatbot API RESTOCK intake response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return receipt;
   }
 
   /**
@@ -478,8 +559,13 @@ function extractErrorCode(body: unknown): string | null {
   if (typeof body !== 'object' || body === null) {
     return null;
   }
-  const candidate = (body as { error?: unknown }).error;
-  return typeof candidate === 'string' && candidate.length > 0
-    ? candidate
-    : null;
+  const envelope = body as { error?: unknown; code?: unknown };
+  // Older routes keep the `{error}` field and its precedence (ADR-1).
+  const legacy = envelope.error;
+  if (typeof legacy === 'string' && legacy.length > 0) {
+    return legacy;
+  }
+  // Human-decision routes use the scoped `{statusCode,code,message}` envelope.
+  const scoped = envelope.code;
+  return typeof scoped === 'string' && scoped.length > 0 ? scoped : null;
 }

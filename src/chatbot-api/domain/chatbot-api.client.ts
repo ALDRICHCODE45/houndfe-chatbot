@@ -5,6 +5,10 @@ import {
   CustomerUpsertResponse,
 } from './dtos/customers.dto';
 import type { PaymentDetail } from './dtos/payment-details.dto';
+import type {
+  RestockIntakeInput,
+  RestockIntakeReceipt,
+} from './dtos/human-decisions.dto';
 import { CartEvaluationResult, CartItemInput } from './dtos/pricing.dto';
 import {
   AttachReceiptInput,
@@ -58,4 +62,9 @@ export interface ChatbotApiClient {
   ): Promise<AttachReceiptResponse>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
+  /** HD-R2b2: `POST /chatbot-api/human-decisions` RESTOCK intake (scope
+   *  `human-decisions:create`). Single attempt, no retry; resolves only on
+   *  `201`/`200` with a strictly validated immutable historical receipt
+   *  (`PENDING`/v1), never on inferred current decision state. */
+  submitRestockIntake(dto: RestockIntakeInput): Promise<RestockIntakeReceipt>;
 }
