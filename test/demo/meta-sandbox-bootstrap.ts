@@ -3,28 +3,47 @@ import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import type { Server } from 'node:http';
+import { AgentRunner } from '../../src/llm-agent/application/agent-runner.service';
+import {
+  generateTextImpl,
+  type GenerateTextFn,
+} from '../../src/llm-agent/infrastructure/generate-text.provider';
 import {
   WHATSAPP_SENDER,
   type WhatsappSenderPort,
 } from '../../src/whatsapp/domain/whatsapp-sender.port';
-import { MetaWhatsappSender } from '../../src/whatsapp/infrastructure/meta-whatsapp.sender';
+import {
+  MetaWhatsappSender,
+  normalizeSandboxRecipient,
+} from '../../src/whatsapp/infrastructure/meta-whatsapp.sender';
 import {
   createSandboxAllowlistSender,
   parseMetaSandboxConfig,
   type SandboxEnv,
 } from './meta-sandbox-config';
 import { MetaSandboxModule, SandboxSender } from './meta-sandbox.module';
+import {
+  NO_TOOL_SANDBOX_FALLBACK_REPLY,
+  createNoToolSandboxAgentRunner,
+  parseNoToolLlmSandboxConfig,
+  type NoToolSandboxAgentRunner,
+} from './no-tool-llm-sandbox';
 
-// M2a2 test-only bootstrap: reuses the M1 MetaSandboxModule (real guard/
+// M2a2/M2c test-only bootstrap: reuses the M1 MetaSandboxModule (real guard/
 // controller/dispatcher, fake agent/sender/receipt/handoff), swaps in the M2a1
 // parsed config, and fences outbound through the M2a1 allowlist. Real Meta is
 // wired only in explicit `--outbound` mode; local mode is fake-sender only.
-// This boundary never reads process.env itself and never prints secret values.
+// The bounded no-tool LLM runner (M2b) is wired only behind explicit `--llm`
+// with its own parsed config and a sender fence. This boundary never reads
+// process.env itself and never prints secret values.
 
 export type SandboxMode = 'local' | 'outbound';
+export type SandboxLlmMode = 'fake' | 'llm';
 
 /** Explicit CLI opt-in; env values alone can never enable outbound. */
 export const SANDBOX_OUTBOUND_FLAG = '--outbound';
+/** Explicit CLI opt-in; env values alone can never enable the real LLM seam. */
+export const SANDBOX_LLM_FLAG = '--llm';
 export const SANDBOX_BIND_HOST = '127.0.0.1';
 export const SANDBOX_DEFAULT_PORT = 3000;
 
@@ -34,6 +53,11 @@ const CLI_FILE_PATTERN = /meta-sandbox-bootstrap\.[cm]?[jt]s$/;
 
 export function resolveSandboxMode(argv: readonly string[]): SandboxMode {
   return argv.includes(SANDBOX_OUTBOUND_FLAG) ? 'outbound' : 'local';
+}
+
+/** Explicit CLI opt-in; the M1 fake runner stays the default. */
+export function resolveLlmMode(argv: readonly string[]): SandboxLlmMode {
+  return argv.includes(SANDBOX_LLM_FLAG) ? 'llm' : 'fake';
 }
 
 /** Loopback-only bind; any other host is rejected (never 0.0.0.0). */
@@ -58,23 +82,60 @@ export interface MetaSandboxAppOptions {
   readonly env: SandboxEnv;
   /** Defaults to `local`; `outbound` requires the explicit CLI flag. */
   readonly mode?: SandboxMode;
+  /** Defaults to `fake`; `llm` requires the explicit `--llm` opt-in. */
+  readonly llmMode?: SandboxLlmMode;
   /** Test seam: underlying transport behind the outbound allowlist fence. */
   readonly outboundTransport?: WhatsappSenderPort;
+  /**
+   * Test seam: fake AI SDK `generateText`. The real SDK function is used only
+   * when `llmMode === 'llm'` AND this seam is absent.
+   */
+  readonly generateText?: GenerateTextFn;
 }
 
 export interface MetaSandboxApp {
   readonly app: INestApplication<Server>;
   readonly mode: SandboxMode;
+  readonly llmMode: SandboxLlmMode;
   readonly sender: WhatsappSenderPort;
   listen(options?: { readonly port?: number }): Promise<string>;
+}
+
+/**
+ * Sender fence around the bounded no-tool runner: an inbound whose `senderId`
+ * does not normalize to the single approved Meta recipient is refused with the
+ * safe fallback BEFORE the provider seam, so a mismatched webhook can never
+ * burn the shared call budget. The approved recipient comes from the parsed
+ * M2a1 config, never from a caller-supplied value.
+ */
+export function createApprovedSenderFencedRunner(deps: {
+  readonly runner: NoToolSandboxAgentRunner;
+  readonly approvedRecipient: string;
+}): NoToolSandboxAgentRunner {
+  const { runner, approvedRecipient } = deps;
+  return {
+    handle: (input: { readonly senderId: string; readonly text: string }) => {
+      const senderId =
+        typeof input?.senderId === 'string' ? input.senderId : '';
+      if (normalizeSandboxRecipient(senderId) !== approvedRecipient) {
+        return Promise.resolve({ reply: NO_TOOL_SANDBOX_FALLBACK_REPLY });
+      }
+      return runner.handle(input);
+    },
+  };
 }
 
 export async function createMetaSandboxApp(
   options: MetaSandboxAppOptions,
 ): Promise<MetaSandboxApp> {
   const mode = options.mode ?? 'local';
+  const llmMode = options.llmMode ?? 'fake';
   // Parse first: malformed/missing config throws before any app or bind.
   const config = parseMetaSandboxConfig(options.env);
+  // LLM config also fails closed here, still before compile/bind. Parsing the
+  // explicit `options.env` keeps the adapter off the unsafe public config.
+  const llmConfig =
+    llmMode === 'llm' ? parseNoToolLlmSandboxConfig(options.env) : null;
   const values: Record<string, unknown> = {
     'meta.verifyToken': config.verifyToken,
     'meta.appSecret': config.appSecret,
@@ -95,6 +156,21 @@ export async function createMetaSandboxApp(
     imports: [MetaSandboxModule],
   });
   builder.overrideProvider(ConfigService).useValue(configService);
+
+  // One bounded runner per app: its call cap is shared across every webhook
+  // message this process handles. Meta sender modes stay independent below.
+  if (llmConfig !== null) {
+    const generateText = options.generateText ?? generateTextImpl;
+    builder.overrideProvider(AgentRunner).useValue(
+      createApprovedSenderFencedRunner({
+        runner: createNoToolSandboxAgentRunner({
+          config: llmConfig,
+          generateText,
+        }),
+        approvedRecipient: config.approvedRecipient,
+      }),
+    );
+  }
 
   if (mode === 'local') {
     builder.overrideProvider(WHATSAPP_SENDER).useValue(new SandboxSender());
@@ -136,6 +212,7 @@ export async function createMetaSandboxApp(
   return {
     app,
     mode,
+    llmMode,
     sender: app.get<WhatsappSenderPort>(WHATSAPP_SENDER),
     listen: async (listenOptions) => {
       const port =
@@ -157,9 +234,12 @@ export async function main(
   const sandbox = await createMetaSandboxApp({
     env,
     mode: resolveSandboxMode(argv),
+    llmMode: resolveLlmMode(argv),
   });
   const url = await sandbox.listen();
-  console.log(`[meta-sandbox] mode=${sandbox.mode} url=${url} (loopback only)`);
+  console.log(
+    `[meta-sandbox] mode=${sandbox.mode} llm=${sandbox.llmMode} url=${url} (loopback only)`,
+  );
   console.log(
     sandbox.mode === 'outbound'
       ? '[meta-sandbox] outbound enabled: sends are fenced to the approved recipient'
