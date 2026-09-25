@@ -21,7 +21,12 @@ import {
   parseMetaSandboxConfig,
   type SandboxEnv,
 } from './meta-sandbox-config';
-import { MetaSandboxModule, SandboxSender } from './meta-sandbox.module';
+import {
+  MetaSandboxModule,
+  SANDBOX_APPROVED_RECIPIENT_KEY,
+  SANDBOX_OUTBOUND_ENABLED_KEY,
+  SandboxSender,
+} from './meta-sandbox.module';
 import {
   NO_TOOL_SANDBOX_FALLBACK_REPLY,
   createNoToolSandboxAgentRunner,
@@ -142,6 +147,11 @@ export async function createMetaSandboxApp(
     'meta.accessToken': config.accessToken,
     'meta.phoneNumberId': config.phoneNumberId,
     'meta.graphApiBaseUrl': config.graphApiBaseUrl,
+    // M2d: enable the pre-dispatch inbound filter only in explicit outbound
+    // mode. The filter is inert in local mode, where the fake sender has no
+    // recipient fence to trip.
+    [SANDBOX_OUTBOUND_ENABLED_KEY]: mode === 'outbound',
+    [SANDBOX_APPROVED_RECIPIENT_KEY]: config.approvedRecipient,
   };
   const configService = {
     get: (key: string): unknown => values[key],

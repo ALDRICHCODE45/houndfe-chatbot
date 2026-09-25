@@ -2,6 +2,11 @@ import * as crypto from 'crypto';
 import axios from 'axios';
 import request from 'supertest';
 import type { GenerateTextFn } from '../src/llm-agent/infrastructure/generate-text.provider';
+import {
+  type OutboundText,
+  type SendResult,
+  type WhatsappSenderPort,
+} from '../src/whatsapp/domain/whatsapp-sender.port';
 import { SANDBOX_REPLY, SandboxSender } from './demo/meta-sandbox.module';
 import {
   NO_TOOL_SANDBOX_FALLBACK_REPLY,
@@ -37,6 +42,8 @@ const LLM_ENV: Record<string, string | undefined> = {
   OPENAI_SANDBOX_MODEL: 'gpt-4.1-mini',
 };
 const APPROVED_SENDER = '5215550001111';
+// Canonical form of the approved sender after the M2a1 Mexico trunk change.
+const APPROVED_TO = '525550001111';
 const WRONG_SENDER = '5215550009999';
 const SAFE_REPLY = NO_TOOL_SANDBOX_SAFE_REPLIES[0];
 const UNKNOWN_ASKS: readonly string[] = [
@@ -63,6 +70,12 @@ function sign(rawBody: string): string {
 }
 
 function inboundBody(messageId: string, from: string, text: string): string {
+  return inboundBatchBody([{ id: messageId, from, text }]);
+}
+
+function inboundBatchBody(
+  messages: ReadonlyArray<{ id: string; from: string; text: string }>,
+): string {
   return JSON.stringify({
     object: 'whatsapp_business_account',
     entry: [
@@ -71,21 +84,28 @@ function inboundBody(messageId: string, from: string, text: string): string {
           {
             value: {
               metadata: { phone_number_id: '123456789' },
-              messages: [
-                {
-                  id: messageId,
-                  from,
-                  timestamp: '1719000000',
-                  type: 'text',
-                  text: { body: text },
-                },
-              ],
+              messages: messages.map((message) => ({
+                id: message.id,
+                from: message.from,
+                timestamp: '1719000000',
+                type: 'text',
+                text: { body: message.text },
+              })),
             },
           },
         ],
       },
     ],
   });
+}
+
+/** Outbound fake transport: records the fenced send without calling Meta. */
+class FakeTransport implements WhatsappSenderPort {
+  readonly sent: OutboundText[] = [];
+  async sendText(message: OutboundText): Promise<SendResult> {
+    this.sent.push(message);
+    return { providerMessageId: `wamid.fake.${this.sent.length}` };
+  }
 }
 
 describe('meta sandbox LLM wiring (e2e, offline)', () => {
@@ -279,6 +299,121 @@ describe('meta sandbox LLM wiring (e2e, offline)', () => {
     expect((sandbox.sender as SandboxSender).sent).toEqual([
       { to: WRONG_SENDER, text: NO_TOOL_SANDBOX_FALLBACK_REPLY },
     ]);
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  it('acks a signed unapproved-only inbound in outbound mode without a send', async () => {
+    const transport = new FakeTransport();
+    const sandbox = await build({
+      env: LLM_ENV,
+      mode: 'outbound',
+      outboundTransport: transport,
+    });
+
+    await post(
+      sandbox,
+      inboundBody('wamid.m2d.fake.wrong', WRONG_SENDER, 'Hola'),
+    );
+
+    expect(transport.sent).toHaveLength(0);
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  it('acks a signed unapproved-only inbound before the fenced LLM provider call', async () => {
+    const transport = new FakeTransport();
+    const { generateText, mock } = fakeGenerate();
+    const sandbox = await build({
+      env: LLM_ENV,
+      mode: 'outbound',
+      llmMode: 'llm',
+      generateText,
+      outboundTransport: transport,
+    });
+
+    await post(
+      sandbox,
+      inboundBody('wamid.m2d.llm.wrong', WRONG_SENDER, 'Hola'),
+    );
+
+    expect(mock).not.toHaveBeenCalled();
+    expect(transport.sent).toHaveLength(0);
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  it('still answers an approved inbound in outbound mode with the fenced runner', async () => {
+    const transport = new FakeTransport();
+    const { generateText, mock } = fakeGenerate();
+    const sandbox = await build({
+      env: LLM_ENV,
+      mode: 'outbound',
+      llmMode: 'llm',
+      generateText,
+      outboundTransport: transport,
+    });
+
+    await post(
+      sandbox,
+      inboundBody('wamid.m2d.llm.ok', APPROVED_SENDER, 'Hola'),
+    );
+
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(transport.sent).toEqual([{ to: APPROVED_TO, text: SAFE_REPLY }]);
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on a mixed approved/unapproved batch instead of acking it', async () => {
+    const transport = new FakeTransport();
+    const { generateText, mock } = fakeGenerate();
+    const sandbox = await build({
+      env: LLM_ENV,
+      mode: 'outbound',
+      llmMode: 'llm',
+      generateText,
+      outboundTransport: transport,
+    });
+
+    const body = inboundBatchBody([
+      { id: 'wamid.m2d.mixed.ok', from: APPROVED_SENDER, text: 'Hola' },
+      { id: 'wamid.m2d.mixed.wrong', from: WRONG_SENDER, text: 'Hola' },
+    ]);
+
+    await request(sandbox.app.getHttpServer())
+      .post('/webhook')
+      .set('content-type', 'application/json')
+      .set('x-hub-signature-256', sign(body))
+      .send(body)
+      .expect(500);
+
+    expect(mock).not.toHaveBeenCalled();
+    expect(transport.sent).toHaveLength(0);
+    expect(postSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps GET verification and the invalid-signature 401 in outbound mode', async () => {
+    const transport = new FakeTransport();
+    const sandbox = await build({
+      env: LLM_ENV,
+      mode: 'outbound',
+      outboundTransport: transport,
+    });
+    const server = sandbox.app.getHttpServer();
+
+    await request(server)
+      .get(
+        `/webhook?hub.mode=subscribe&hub.verify_token=${BASE_ENV.META_VERIFY_TOKEN}&hub.challenge=challenge-outbound`,
+      )
+      .expect(200)
+      .expect('challenge-outbound');
+
+    const body = inboundBody('wamid.m2d.badsig', APPROVED_SENDER, 'Hola');
+    await request(server)
+      .post('/webhook')
+      .set('content-type', 'application/json')
+      .set('x-hub-signature-256', sign('tampered-body'))
+      .send(body)
+      .expect(401);
+
+    expect(transport.sent).toHaveLength(0);
     expect(postSpy).not.toHaveBeenCalled();
   });
 
