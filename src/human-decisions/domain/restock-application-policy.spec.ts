@@ -157,6 +157,93 @@ describe('classifyRestockApplication', () => {
     );
   });
 
+  it('matches an opaque configured branch by exact bytes up to stale', () => {
+    const opaque = { ...SNAP, branchId: 'branch-123' };
+    expect(
+      classifyRestockApplication(
+        inp({ branchId: 'branch-123', decision: { ...POS, snapshot: opaque } }),
+      ),
+    ).toEqual(ready);
+    expect(
+      classifyRestockApplication(
+        inp({
+          branchId: 'branch-123',
+          decision: { ...PEND, snapshot: opaque },
+        }),
+      ),
+    ).toEqual({ action: 'pending' });
+    expect(
+      classifyRestockApplication(
+        inp({
+          branchId: 'branch-123',
+          now: AB,
+          decision: { ...POS, snapshot: opaque },
+        }),
+      ),
+    ).toEqual(stale);
+  });
+
+  it('matches identical padded opaque branch bytes without normalizing', () => {
+    const padded = '  branch-123  ';
+    const opaque = { ...SNAP, branchId: padded };
+    expect(
+      classifyRestockApplication(
+        inp({ branchId: padded, decision: { ...POS, snapshot: opaque } }),
+      ),
+    ).toEqual(ready);
+    expect(
+      classifyRestockApplication(
+        inp({ branchId: padded, decision: { ...PEND, snapshot: opaque } }),
+      ),
+    ).toEqual({ action: 'pending' });
+    expect(
+      classifyRestockApplication(
+        inp({
+          branchId: padded,
+          now: AB,
+          decision: { ...POS, snapshot: opaque },
+        }),
+      ),
+    ).toEqual(stale);
+  });
+
+  it('holds padded-vs-unpadded branch bytes and never stales one', () => {
+    const padded = '  branch-123  ';
+    const cases = [
+      { branchId: padded, snapshotBranchId: 'branch-123' },
+      { branchId: 'branch-123', snapshotBranchId: padded },
+    ];
+    for (const { branchId, snapshotBranchId } of cases) {
+      expect(
+        classifyRestockApplication(
+          inp({
+            branchId,
+            now: AB,
+            decision: {
+              ...POS,
+              snapshot: { ...SNAP, branchId: snapshotBranchId },
+            },
+          }),
+        ),
+      ).toEqual({ action: 'hold', reason: 'branch_mismatch' });
+    }
+    expect(classifyRestockApplication(inp({ branchId: '   ' }))).toEqual({
+      action: 'hold',
+      reason: 'malformed_input',
+    });
+  });
+
+  it('holds a case-variant or different opaque branch without staling it', () => {
+    const opaque = { ...SNAP, branchId: 'branch-123' };
+    for (const branchId of ['BRANCH-123', 'branch-124']) {
+      expect(
+        classifyRestockApplication(
+          inp({ branchId, now: AB, decision: { ...POS, snapshot: opaque } }),
+        ),
+      ).toEqual({ action: 'hold', reason: 'branch_mismatch' });
+    }
+  });
+
   it('fails closed on malformed or hostile input without throwing', () => {
     const accessor = {} as Record<string, unknown>;
     for (const [k, v] of Object.entries(inp())) {

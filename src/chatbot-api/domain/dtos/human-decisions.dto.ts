@@ -373,7 +373,7 @@ function normalizeDecisionSnapshot(
 ): RestockIntakeReceiptSnapshot | null {
   const snapshot = asPlainRecord(value);
   if (snapshot === null || !hasExactKeys(snapshot, SNAPSHOT_KEYS)) return null;
-  const branchId = asUuid(snapshot.branchId);
+  const branchId = asRequiredExactString(snapshot.branchId);
   const branchName = asNullableExactString(snapshot.branchName);
   const productId = asUuid(snapshot.productId);
   const productName = asNullableExactString(snapshot.productName);

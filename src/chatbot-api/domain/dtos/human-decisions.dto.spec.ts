@@ -541,6 +541,19 @@ describe('normalizeRestockDecision', () => {
     expect(out?.snapshot.productName).toBe(snap.productName);
   });
 
+  it('preserves an exact opaque non-UUID branchId without folding', () => {
+    for (const branchId of [
+      'branch-123',
+      '  branch-123  ',
+      'BRANCH-123',
+      'cafe\u0301',
+    ]) {
+      expect(dnorm(pending({}, { branchId }))?.snapshot.branchId).toBe(
+        branchId,
+      );
+    }
+  });
+
   it('requires every declared top-level and snapshot key', () => {
     const base = pending();
     const snap = base.snapshot as Rec;
@@ -603,7 +616,12 @@ describe('normalizeRestockDecision', () => {
     ['snapshot extra', pending({}, { branchLabel: 'x' })],
     ['non-uuid id', pending({ id: 'x' })],
     ['non-uuid sourceRequestId', pending({ sourceRequestId: 'x' })],
-    ['non-uuid branchId', pending({}, { branchId: 'x' })],
+    ['empty branchId', pending({}, { branchId: '' })],
+    ['blank branchId', pending({}, { branchId: '   ' })],
+    ['null branchId', pending({}, { branchId: null })],
+    ['numeric branchId', pending({}, { branchId: 7 })],
+    ['C0 control branchId', pending({}, { branchId: 'a\u0000' })],
+    ['C1 control branchId', pending({}, { branchId: '\u009fb' })],
     ['non-uuid productId', pending({}, { productId: 'x' })],
     ['wrong type', pending({ type: 'SHIPPING' })],
     ['numeric productName', pending({}, { productName: 7 })],

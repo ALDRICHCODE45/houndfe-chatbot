@@ -156,7 +156,7 @@ export function classifyRestockApplication(
     if (!nonBlank(senderId) || !nonBlank(branchId)) {
       return hold('malformed_input');
     }
-    if (senderId !== senderId.trim() || branchId !== branchId.trim()) {
+    if (senderId !== senderId.trim()) {
       return hold('malformed_input');
     }
     const nowEpoch = asCanonicalUtcInstant(record.now);
@@ -180,7 +180,7 @@ export function classifyRestockApplication(
     ) {
       return hold('identity_mismatch');
     }
-    if (!sameUuid(decision.snapshot.branchId, branchId)) {
+    if (decision.snapshot.branchId !== branchId) {
       return hold('branch_mismatch');
     }
     if (decision.status === 'PENDING') return { action: 'pending' };
