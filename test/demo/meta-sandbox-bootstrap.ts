@@ -1,5 +1,5 @@
 import { ValidationPipe, type INestApplication } from '@nestjs/common';
-import { HttpModule, HttpService } from '@nestjs/axios';
+import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import type { Server } from 'node:http';
@@ -91,13 +91,8 @@ export async function createMetaSandboxApp(
       return values[key];
     },
   };
-  const needsRealSender =
-    mode === 'outbound' && options.outboundTransport === undefined;
-
   const builder = Test.createTestingModule({
-    imports: needsRealSender
-      ? [MetaSandboxModule, HttpModule]
-      : [MetaSandboxModule],
+    imports: [MetaSandboxModule],
   });
   builder.overrideProvider(ConfigService).useValue(configService);
 
@@ -110,17 +105,21 @@ export async function createMetaSandboxApp(
         createSandboxAllowlistSender(options.outboundTransport, config),
       );
   } else {
-    builder.overrideProvider(WHATSAPP_SENDER).useFactory({
-      factory: (http: HttpService) =>
+    // Build the transport directly instead of injecting HttpService: the
+    // override provider lives in MetaSandboxModule, so a sibling root import
+    // of HttpModule cannot satisfy `inject: [HttpService]`. `new HttpService()`
+    // defaults to the shared axios instance and stays fenced by the allowlist.
+    builder
+      .overrideProvider(WHATSAPP_SENDER)
+      .useValue(
         createSandboxAllowlistSender(
           new MetaWhatsappSender(
-            http,
+            new HttpService(),
             configService as unknown as ConfigService,
           ),
           config,
         ),
-      inject: [HttpService],
-    });
+      );
   }
 
   const moduleRef = await builder.compile();
