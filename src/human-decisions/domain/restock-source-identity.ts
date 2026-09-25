@@ -87,7 +87,7 @@ function identity(value: unknown, max: number): string | null {
 }
 
 /** RFC4122 UUIDv5: SHA1(namespace bytes ‖ UTF-8 name), version 5 + variant. */
-function uuidV5(namespace: string, name: string): string {
+export function uuidV5(namespace: string, name: string): string {
   const digest = createHash('sha1')
     .update(Buffer.from(namespace.replace(/-/g, ''), 'hex'))
     .update(Buffer.from(name, 'utf8'))
