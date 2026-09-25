@@ -13,7 +13,10 @@ import {
 } from '../domain/errors';
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
 import { CancelSaleInputSchema } from '../domain/dtos/sales.dto';
-import type { RestockIntakeInput } from '../domain/dtos/human-decisions.dto';
+import type {
+  RestockApplicationOutcomeRequest,
+  RestockIntakeInput,
+} from '../domain/dtos/human-decisions.dto';
 
 // Complete, type-safe `AxiosResponse` fixture. The client consumes
 // `httpService.request<T>()`, which resolves to `AxiosResponse<T>`, so a bare
@@ -1640,6 +1643,293 @@ describe('ChatbotApiHttpClient', () => {
       expect((error as RateLimitError).retryAfterSeconds).toBe(7);
       expect(error.errorCode).toBe('RATE_LIMITED');
       expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── recordRestockApplicationOutcome (POST .../application-outcome) — T4b2
+
+  describe('recordRestockApplicationOutcome (T4b2)', () => {
+    const decisionId = '77777777-7777-4777-8777-777777777777';
+    const attemptId = '88888888-8888-4888-8888-888888888888';
+    const messageId = 'wamid.HBgLMI6';
+    const attemptedAt = '2026-08-25T13:00:00.000Z';
+    const acceptedAt = '2026-08-25T13:00:05.000Z';
+    const ackAt = '2026-08-25T13:00:06.000Z';
+    type Rec = Record<string, unknown>;
+
+    const accepted = (extra: Rec = {}): Rec => ({
+      attemptId,
+      expectedResolutionVersion: 2,
+      outcome: 'PROVIDER_ACCEPTED',
+      attemptedAt,
+      providerMessageId: messageId,
+      providerAcceptedObservedAt: acceptedAt,
+      ...extra,
+    });
+    const late = (extra: Rec = {}): Rec =>
+      accepted({ outcome: 'PROVIDER_ACCEPTED_LATE', ...extra });
+    const unknownVariant = (extra: Rec = {}): Rec => ({
+      attemptId,
+      expectedResolutionVersion: 2,
+      outcome: 'DELIVERY_UNKNOWN',
+      attemptedAt,
+      ...extra,
+    });
+    const stale = (extra: Rec = {}): Rec => ({
+      attemptId,
+      expectedResolutionVersion: 2,
+      outcome: 'STALE',
+      ...extra,
+    });
+    const ack = (outcome: string, extra: Rec = {}): Rec => ({
+      id: decisionId,
+      version: 2,
+      attemptId,
+      outcome,
+      ackReceivedAt: ackAt,
+      ...extra,
+    });
+    const asRequest = (value: Rec): RestockApplicationOutcomeRequest =>
+      value as unknown as RestockApplicationOutcomeRequest;
+    type RequestCfg = {
+      method: string;
+      url: string;
+      data: Record<string, unknown>;
+      headers: Record<string, string>;
+    };
+    const sentConfig = (index = 0) =>
+      httpService.request.mock.calls[index][0] as RequestCfg;
+    const record = (request: Rec = accepted()) =>
+      client
+        .recordRestockApplicationOutcome(decisionId, asRequest(request))
+        .then(
+          () => {
+            throw new Error('expected rejection');
+          },
+          (error: ChatbotApiError) => error,
+        );
+
+    it('POSTs each normalized outcome variant to the encoded path with auth and no idempotency header', async () => {
+      const cases: Array<[Rec, string]> = [
+        [accepted(), 'PROVIDER_ACCEPTED'],
+        [late(), 'PROVIDER_ACCEPTED_LATE'],
+        [unknownVariant(), 'DELIVERY_UNKNOWN'],
+        [stale(), 'STALE'],
+      ];
+      for (const [, outcome] of cases) {
+        httpService.request.mockReturnValueOnce(
+          of(axiosResponse(ack(outcome))),
+        );
+      }
+
+      for (const [request, outcome] of cases) {
+        await expect(
+          client.recordRestockApplicationOutcome(
+            decisionId,
+            asRequest(request),
+          ),
+        ).resolves.toEqual(ack(outcome));
+      }
+
+      cases.forEach(([request], index) => {
+        const cfg = sentConfig(index);
+        expect(cfg.method).toBe('POST');
+        expect(cfg.url).toBe(
+          `/chatbot-api/human-decisions/${decisionId}/application-outcome`,
+        );
+        expect(cfg.data).toEqual(request);
+        expect(Object.keys(cfg.data).sort()).toEqual(
+          Object.keys(request).sort(),
+        );
+        expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+        expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+        expect(cfg.headers['X-Idempotency-Key']).toBeUndefined();
+      });
+      expect(httpService.request).toHaveBeenCalledTimes(cases.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('preserves optional UNKNOWN evidence and keeps an absent id key absent', async () => {
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(ack('DELIVERY_UNKNOWN'))))
+        .mockReturnValueOnce(of(axiosResponse(ack('DELIVERY_UNKNOWN'))));
+
+      await client.recordRestockApplicationOutcome(
+        decisionId,
+        asRequest(unknownVariant()),
+      );
+      const withId = unknownVariant({ providerMessageId: messageId });
+      await client.recordRestockApplicationOutcome(
+        decisionId,
+        asRequest(withId),
+      );
+
+      expect(sentConfig(0).data).toEqual(unknownVariant());
+      expect(Object.keys(sentConfig(0).data)).not.toContain(
+        'providerMessageId',
+      );
+      expect(sentConfig(1).data).toEqual(withId);
+      expect(sentConfig(1).data.providerMessageId).toBe(messageId);
+    });
+
+    it('rejects an invalid decision id or malformed request before any HTTP request', async () => {
+      const invalids: Array<[string, Rec]> = [
+        ['not-a-uuid', accepted()],
+        [decisionId, accepted({ evidenceCode: 'X' })],
+        [decisionId, stale({ attemptedAt })],
+        [decisionId, accepted({ providerMessageId: '   ' })],
+        [decisionId, accepted({ expectedResolutionVersion: 1 })],
+      ];
+
+      for (const [id, request] of invalids) {
+        await expect(
+          client.recordRestockApplicationOutcome(id, asRequest(request)),
+        ).rejects.toBeInstanceOf(ChatbotApiError);
+      }
+
+      expect(httpService.request).not.toHaveBeenCalled();
+    });
+
+    it('rejects wrong, malformed and unexpected-status ACK bodies with UpstreamError evidence', async () => {
+      const bodies: Array<[unknown, number]> = [
+        [ack('PROVIDER_ACCEPTED', { extra: true }), 200],
+        [ack('DELIVERY_UNKNOWN'), 200],
+        [ack('PROVIDER_ACCEPTED', { version: 1 }), 200],
+        [
+          ack('PROVIDER_ACCEPTED', {
+            id: '99999999-9999-4999-8999-999999999999',
+          }),
+          200,
+        ],
+        [
+          ack('PROVIDER_ACCEPTED', {
+            attemptId: '99999999-9999-4999-8999-999999999999',
+          }),
+          200,
+        ],
+        [ack('PROVIDER_ACCEPTED', { evidenceCode: null }), 200],
+        [ack('PROVIDER_ACCEPTED'), 201],
+      ];
+
+      for (const [body, status] of bodies) {
+        httpService.request.mockReturnValueOnce(
+          of(axiosResponse(body, status)),
+        );
+        const error = await record();
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error.statusCode).toBe(status);
+        expect(error.responseBody).toEqual(body);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(bodies.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('preserves the structured errorCode of a fulfilled unexpected-status body', async () => {
+      const body = { statusCode: 202, code: 'ACK_NOT_TERMINAL' };
+      httpService.request.mockReturnValueOnce(of(axiosResponse(body, 202)));
+
+      const error = await record();
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect(error.statusCode).toBe(202);
+      expect(error.errorCode).toBe('ACK_NOT_TERMINAL');
+      expect(error.responseBody).toEqual(body);
+    });
+
+    it.each([
+      [401, 'UNAUTHORIZED', AuthError],
+      [403, 'FORBIDDEN', ForbiddenError],
+      [409, 'VERSION_CONFLICT', UpstreamError],
+    ])(
+      'maps a %i scoped code envelope to %p in one request with no retry',
+      async (status, code, ErrorType) => {
+        httpService.request.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status,
+              data: { statusCode: status, code, message: 'nope' },
+            },
+          })),
+        );
+
+        const error = await record();
+        expect(error).toBeInstanceOf(ErrorType);
+        expect(error.statusCode).toBe(status);
+        expect(error.errorCode).toBe(code);
+        expect(httpService.request).toHaveBeenCalledTimes(1);
+        expect(sleep).not.toHaveBeenCalled();
+      },
+    );
+
+    it('maps 429 to RateLimitError with Retry-After in one request', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 429,
+            headers: { 'retry-after': '5' },
+            data: {
+              statusCode: 429,
+              code: 'RATE_LIMITED',
+              message: 'slow down',
+            },
+          },
+        })),
+      );
+
+      const error = await record();
+      expect(error).toBeInstanceOf(RateLimitError);
+      expect((error as RateLimitError).retryAfterSeconds).toBe(5);
+      expect(error.errorCode).toBe('RATE_LIMITED');
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('maps a persistent 5xx and an ambiguous network failure to UpstreamError with no sleep', async () => {
+      httpService.request
+        .mockReturnValueOnce(
+          throwError(() => ({
+            response: {
+              status: 503,
+              data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+            },
+          })),
+        )
+        .mockReturnValueOnce(
+          throwError(() => ({ code: 'ECONNRESET', message: 'socket down' })),
+        );
+
+      const server = await record();
+      expect(server).toBeInstanceOf(UpstreamError);
+      expect(server.statusCode).toBe(503);
+      expect(server.errorCode).toBe('UPSTREAM_DOWN');
+
+      const network = await record();
+      expect(network).toBeInstanceOf(UpstreamError);
+      expect(network.statusCode).toBeNull();
+      expect(network.errorCode).toBeNull();
+
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('sends a caller-driven exact replay with the same attempt id as a second independent POST', async () => {
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(ack('PROVIDER_ACCEPTED'))))
+        .mockReturnValueOnce(of(axiosResponse(ack('PROVIDER_ACCEPTED'))));
+
+      const first = await client.recordRestockApplicationOutcome(
+        decisionId,
+        asRequest(accepted()),
+      );
+      const second = await client.recordRestockApplicationOutcome(
+        decisionId,
+        asRequest(accepted()),
+      );
+
+      expect(first).toEqual(second);
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sentConfig(1).data.attemptId).toBe(attemptId);
       expect(sleep).not.toHaveBeenCalled();
     });
   });

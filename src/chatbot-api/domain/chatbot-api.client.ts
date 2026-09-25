@@ -6,6 +6,8 @@ import {
 } from './dtos/customers.dto';
 import type { PaymentDetail } from './dtos/payment-details.dto';
 import type {
+  RestockApplicationOutcomeAck,
+  RestockApplicationOutcomeRequest,
   RestockDecision,
   RestockIntakeInput,
   RestockIntakeReceipt,
@@ -76,4 +78,16 @@ export interface ChatbotApiClient {
    *  and binds the parsed current decision to the requested UUID
    *  (case-insensitive). */
   getRestockDecision(decisionId: string): Promise<RestockDecision>;
+  /** T4b2: `POST /chatbot-api/human-decisions/:id/application-outcome`
+   *  terminal bot ACK (scope `human-decisions:ack`). The decision id and the
+   *  request are validated/normalized before any HTTP; the wire body is the
+   *  exact normalized discriminated DTO. Exactly one POST is attempted — no
+   *  retry or sleep even on 5xx/network ambiguity — and only a fulfilled HTTP
+   *  200 whose five-key ACK parses and binds to the requested decision id,
+   *  `attemptId` and outcome resolves. No idempotency header: `attemptId` is
+   *  the backend replay key. */
+  recordRestockApplicationOutcome(
+    decisionId: string,
+    request: RestockApplicationOutcomeRequest,
+  ): Promise<RestockApplicationOutcomeAck>;
 }

@@ -35,11 +35,15 @@ import {
   CreateSaleInputSchema,
 } from '../domain/dtos/sales.dto';
 import {
+  normalizeRestockApplicationOutcome,
+  normalizeRestockApplicationOutcomeAck,
   normalizeRestockDecision,
   normalizeRestockIntake,
   normalizeRestockIntakeReceipt,
 } from '../domain/dtos/human-decisions.dto';
 import type {
+  RestockApplicationOutcomeAck,
+  RestockApplicationOutcomeRequest,
   RestockDecision,
   RestockIntakeInput,
   RestockIntakeReceipt,
@@ -294,6 +298,65 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     }
 
     return decision;
+  }
+
+  /**
+   * `POST /chatbot-api/human-decisions/:id/application-outcome` terminal bot
+   * ACK (contract v1 addenda, scope `human-decisions:ack`).
+   *
+   * The decision id is validated as a UUID and the request normalized before
+   * any request; a malformed request is rejected without HTTP. The wire body is
+   * the exact normalized discriminated DTO. Exactly one POST is attempted — no
+   * sleep and no automatic retry even on 5xx or transport ambiguity, because a
+   * duplicate terminal outcome would be a second attempt; only a fulfilled
+   * HTTP 200 whose five-key body parses as an ACK bound to the requested
+   * decision id, `attemptId` and outcome resolves. Any unexpected status or
+   * malformed/mismatched body throws `UpstreamError` with status, raw body and
+   * `errorCode` evidence; transport failures keep flowing through `mapError`,
+   * so `401`/`403`/`409`/`429`/5xx map to their structured errors. No
+   * `X-Idempotency-Key` is sent: `attemptId` is the backend replay key. */
+  async recordRestockApplicationOutcome(
+    decisionId: string,
+    request: RestockApplicationOutcomeRequest,
+  ): Promise<RestockApplicationOutcomeAck> {
+    if (!DECISION_ID_UUID.test(decisionId)) {
+      throw new ChatbotApiError(
+        'RESTOCK decision id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+
+    const sent = normalizeRestockApplicationOutcome(request);
+    if (sent === null) {
+      throw new ChatbotApiError(
+        'RESTOCK application outcome request failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+
+    const response = await this.requestWithResponse<unknown>({
+      method: 'POST',
+      url: `/chatbot-api/human-decisions/${encodeURIComponent(decisionId)}/application-outcome`,
+      data: sent,
+    });
+
+    const body = response.data;
+    const ack = normalizeRestockApplicationOutcomeAck(body, decisionId, sent);
+
+    if (response.status !== 200 || ack === null) {
+      throw new UpstreamError(
+        'Chatbot API application-outcome ACK response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return ack;
   }
 
   /**
