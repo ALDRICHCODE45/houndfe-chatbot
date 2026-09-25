@@ -1,6 +1,6 @@
-/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeCancelSaleTool } from './cancel-sale.tool';
+import { makeCancelSaleTool as makeCancelSaleToolRaw } from './cancel-sale.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import type { CancelSaleResult } from '../../../chatbot-api/domain/dtos/sales.dto';
 import {
@@ -11,6 +11,49 @@ import type {
   ConversationState,
   ConversationStore,
 } from '../../../conversation/domain/conversation-store';
+import type { HumanHandoffService } from '../../../human-handoff/application/human-handoff.service';
+
+/**
+ * Inert human-handoff dependency for the signal-only `cancelSale` tool.
+ *
+ * `cancelSale` never calls the handoff service (ADR-27: only
+ * `requestHumanAssistance` does), yet `ToolDeps` requires the dependency. The
+ * service is a nominal NestJS provider with private injected fields, so no
+ * structural literal can satisfy it directly. Typing the stub as the exact
+ * `Pick` this suite relies on keeps the single `as unknown as
+ * HumanHandoffService` bridge documented here instead of scattering 14
+ * `as never` / empty casts across every call site.
+ */
+function inertHumanHandoffService(): HumanHandoffService {
+  const stub: Pick<
+    HumanHandoffService,
+    'create' | 'resolveReply' | 'isOpsSender'
+  > = {
+    create: jest.fn<
+      ReturnType<HumanHandoffService['create']>,
+      Parameters<HumanHandoffService['create']>
+    >(),
+    resolveReply: jest.fn<
+      ReturnType<HumanHandoffService['resolveReply']>,
+      Parameters<HumanHandoffService['resolveReply']>
+    >(),
+    isOpsSender: jest.fn<boolean, [string]>(),
+  };
+  return stub as unknown as HumanHandoffService;
+}
+
+/**
+ * Local deps factory: injects the inert handoff stub and exposes the tool
+ * through the verified schema boundary so `description` / `inputSchema` are
+ * the concrete Zod types the assertions exercise.
+ */
+const makeCancelSaleTool = (deps: Omit<ToolDeps, 'humanHandoffService'>) =>
+  asSchemaVerifiedTool(
+    makeCancelSaleToolRaw({
+      ...deps,
+      humanHandoffService: inertHumanHandoffService(),
+    }),
+  );
 
 /**
  * Unit tests for the 11th AI-SDK tool factory `cancelSale` (design.md §e).
@@ -36,15 +79,20 @@ describe('makeCancelSaleTool', () => {
     let current = initial;
     const update = jest
       .fn()
-      .mockImplementation((senderId: string, patch: object) => {
-        const next = {
-          senderId,
-          lastMessageAt: (patch as { lastMessageAt: string }).lastMessageAt,
-          data: (patch as { data: object }).data,
-        };
-        current = next;
-        return next;
-      });
+      .mockImplementation(
+        (
+          senderId: string,
+          patch: Partial<Omit<ConversationState, 'senderId'>>,
+        ) => {
+          const next: ConversationState = {
+            senderId,
+            lastMessageAt: patch.lastMessageAt ?? current?.lastMessageAt ?? '',
+            data: patch.data ?? {},
+          };
+          current = next;
+          return next;
+        },
+      );
     const store = {
       get: jest.fn().mockImplementation(() => Promise.resolve(current)),
       create: jest.fn(),

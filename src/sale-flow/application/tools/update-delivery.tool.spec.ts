@@ -1,9 +1,52 @@
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
-
-import { makeUpdateDeliveryTool } from './update-delivery.tool';
+import { makeUpdateDeliveryTool as makeUpdateDeliveryToolRaw } from './update-delivery.tool';
+import type { ToolDeps } from '../tool-deps';
+import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
 import type { ChatbotApiClient } from '../../../chatbot-api/domain/chatbot-api.client';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
+import type { HumanHandoffService } from '../../../human-handoff/application/human-handoff.service';
+
+/**
+ * Inert human-handoff dependency for the signal-only `updateDelivery` tool.
+ *
+ * `updateDelivery` never calls the handoff service (ADR-27: only
+ * `requestHumanAssistance` does), yet `ToolDeps` requires the dependency. The
+ * service is a nominal NestJS provider with private injected fields, so no
+ * structural literal can satisfy it directly. Typing the stub as the exact
+ * `Pick` this suite relies on keeps the single `as unknown as
+ * HumanHandoffService` bridge documented here instead of an empty `as never`
+ * cast.
+ */
+function inertHumanHandoffService(): HumanHandoffService {
+  const stub: Pick<
+    HumanHandoffService,
+    'create' | 'resolveReply' | 'isOpsSender'
+  > = {
+    create: jest.fn<
+      ReturnType<HumanHandoffService['create']>,
+      Parameters<HumanHandoffService['create']>
+    >(),
+    resolveReply: jest.fn<
+      ReturnType<HumanHandoffService['resolveReply']>,
+      Parameters<HumanHandoffService['resolveReply']>
+    >(),
+    isOpsSender: jest.fn<boolean, [string]>(),
+  };
+  return stub as unknown as HumanHandoffService;
+}
+
+/**
+ * Local deps factory: injects the inert handoff stub and exposes the tool
+ * through the verified schema boundary so `inputSchema` is the concrete Zod
+ * schema the assertions exercise.
+ */
+const makeUpdateDeliveryTool = (deps: Omit<ToolDeps, 'humanHandoffService'>) =>
+  asSchemaVerifiedTool(
+    makeUpdateDeliveryToolRaw({
+      ...deps,
+      humanHandoffService: inertHumanHandoffService(),
+    }),
+  );
 
 /**
  * Unit tests for the updateDelivery tool factory.
@@ -18,7 +61,6 @@ describe('makeUpdateDeliveryTool', () => {
   const baseDeps = {
     store: {} as ConversationStore,
     cashierUserId: '00000000-4000-9000-0000-000000000001',
-    humanHandoffService: {} as never,
   };
 
   it('forwards saleId + optional fields to chatbotApi.updateDelivery', async () => {
@@ -36,7 +78,7 @@ describe('makeUpdateDeliveryTool', () => {
         trackingRef: 'TRACK-1',
         estimatedDeliveryAt: '2026-07-01T12:00:00Z',
       },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(updateDelivery).toHaveBeenCalledWith(
       '00000000-4000-9000-0000-000000000001',
@@ -61,7 +103,7 @@ describe('makeUpdateDeliveryTool', () => {
       {
         saleId: '00000000-4000-9000-0000-000000000001',
       },
-      { toolCallId: 't', messages: [], context: undefined },
+      { toolCallId: 't', messages: [], context: {} },
     );
     expect(updateDelivery).toHaveBeenCalledWith(
       '00000000-4000-9000-0000-000000000001',
@@ -91,7 +133,7 @@ describe('makeUpdateDeliveryTool', () => {
     await expect(
       tool.execute(
         { saleId: '00000000-4000-9000-0000-000000000001' },
-        { toolCallId: 't', messages: [], context: undefined },
+        { toolCallId: 't', messages: [], context: {} },
       ),
     ).resolves.toEqual({
       ok: false,
