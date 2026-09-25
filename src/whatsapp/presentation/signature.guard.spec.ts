@@ -37,17 +37,17 @@ describe('SignatureGuard', () => {
     'utf8',
   );
 
-  let configService: jest.Mocked<Pick<ConfigService, 'getOrThrow'>>;
   let guard: SignatureGuard;
 
   beforeEach(() => {
     jest.clearAllMocks();
 
-    configService = {
-      getOrThrow: jest.fn(() => appSecret),
-    };
+    // In-memory `ConfigService`: `meta.appSecret` resolves through the internal
+    // config via dot-notation, matching the production runtime contract instead
+    // of a partial mock of the overloaded `getOrThrow`.
+    const configService = new ConfigService({ meta: { appSecret } });
 
-    guard = new SignatureGuard(configService as ConfigService);
+    guard = new SignatureGuard(configService);
   });
 
   function sign(body: Buffer) {

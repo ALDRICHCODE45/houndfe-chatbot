@@ -1,5 +1,6 @@
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
+import { AxiosHeaders, type AxiosResponse } from 'axios';
 import { of, throwError } from 'rxjs';
 import { InboundMessage } from '../domain/inbound-message';
 import {
@@ -13,39 +14,52 @@ import {
   WhatsappSendError,
 } from './meta-whatsapp.sender';
 
+// Complete, type-safe `AxiosResponse` fixture: `HttpService.post<T>()` resolves
+// to `AxiosResponse<T>`, so a bare `{ data }` object is not assignable. The full
+// shape (including the required `AxiosHeaders` config) keeps the response
+// stream typed without erasure.
+function axiosResponse<T>(data: T, status = 200): AxiosResponse<T> {
+  return {
+    data,
+    status,
+    statusText: '',
+    headers: {},
+    config: { headers: new AxiosHeaders() },
+  };
+}
+
 describe('MetaWhatsappSender', () => {
-  let httpService: jest.Mocked<Pick<HttpService, 'post'>>;
-  let configService: jest.Mocked<Pick<ConfigService, 'get' | 'getOrThrow'>>;
+  // The sender's constructor requires a full `HttpService`, so a partial Jest
+  // mock cannot be passed without an unsafe cast. Build a real `HttpService`,
+  // install the `post` spy before the sender is constructed so no test can
+  // reach the network, and pass the real service to the sender while keeping a
+  // typed handle to that same spy as `httpService`.
+  let httpService: { post: jest.SpiedFunction<HttpService['post']> };
   let sender: MetaWhatsappSender;
 
   beforeEach(() => {
+    const service = new HttpService();
+
     httpService = {
-      post: jest.fn(),
+      post: jest
+        .spyOn(service, 'post')
+        .mockImplementation(() =>
+          throwError(() => new Error('unexpected network request')),
+        ),
     };
 
-    configService = {
-      get: jest.fn((key: string) => {
-        if (key === 'meta.graphApiBaseUrl') {
-          return 'https://graph.facebook.com/v23.0';
-        }
+    // In-memory `ConfigService`: `meta.*` resolves through the internal config
+    // via dot-notation, matching the production runtime contract instead of a
+    // partial mock of the overloaded `getOrThrow`.
+    const configService = new ConfigService({
+      meta: {
+        accessToken: 'meta-access-token',
+        phoneNumberId: '1234567890',
+        graphApiBaseUrl: 'https://graph.facebook.com/v23.0',
+      },
+    });
 
-        return undefined;
-      }),
-      getOrThrow: jest.fn((key: string) => {
-        const values: Record<string, string> = {
-          'meta.accessToken': 'meta-access-token',
-          'meta.phoneNumberId': '1234567890',
-          'meta.graphApiBaseUrl': 'https://graph.facebook.com/v23.0',
-        };
-
-        return values[key];
-      }),
-    };
-
-    sender = new MetaWhatsappSender(
-      httpService as HttpService,
-      configService as ConfigService,
-    );
+    sender = new MetaWhatsappSender(service, configService);
   });
 
   it('exposes a symbol token and keeps inbound envelopes normalized for downstream phases', () => {
@@ -64,11 +78,7 @@ describe('MetaWhatsappSender', () => {
 
   it('sends one Graph API text request and returns the provider message id', async () => {
     httpService.post.mockReturnValue(
-      of({
-        data: {
-          messages: [{ id: 'wamid.HBgLNDU2' }],
-        },
-      }),
+      of(axiosResponse({ messages: [{ id: 'wamid.HBgLNDU2' }] })),
     );
 
     const outbound: OutboundText = {

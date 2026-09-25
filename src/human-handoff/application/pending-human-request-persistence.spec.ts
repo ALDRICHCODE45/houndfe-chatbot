@@ -166,10 +166,19 @@ describe('pending-human-request-persistence', () => {
     });
 
     it('returns null when the marker is malformed (missing ref)', () => {
+      // Intentionally malformed marker: missing `ref`/`customerNotifiedAt`.
+      // The single explicit cast models a hostile legacy/partial payload that
+      // the pure reader must reject at runtime; the misshapen shape is the
+      // whole point of the case, so it cannot be widened to a valid marker.
       const state: ConversationState = {
         senderId: 'S',
         lastMessageAt: now,
-        data: { pendingHumanRequest: { requestId: 'x', createdAt: now } },
+        data: {
+          pendingHumanRequest: {
+            requestId: 'x',
+            createdAt: now,
+          } as ConversationState['data']['pendingHumanRequest'],
+        },
       };
       expect(readPendingHumanRequest(state)).toBeNull();
     });

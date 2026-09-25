@@ -27,11 +27,13 @@ describe('human-handoff.domain.types', () => {
 
   it('HumanHandoffDigest discriminated union accepts all three active-kind shapes', () => {
     const outOfStock: HumanHandoffDigest = {
+      kind: 'out_of_stock',
       productId: '00000000-0000-4000-8000-000000000001',
       name: 'Croquetas',
       quantity: 2,
     };
     const needsHumanReview: HumanHandoffDigest = {
+      kind: 'needs_human_review',
       items: [
         {
           productId: '00000000-0000-4000-8000-000000000001',
@@ -42,6 +44,7 @@ describe('human-handoff.domain.types', () => {
       originalTotalCents: 100,
     };
     const expirationDate: HumanHandoffDigest = {
+      kind: 'expiration_date',
       productId: '00000000-0000-4000-8000-000000000001',
       name: 'Croquetas',
       question: '¿cuál es la fecha de caducidad?',
@@ -90,6 +93,7 @@ describe('human-handoff.domain.types', () => {
       agentId: 'OPS',
       kind: 'out_of_stock' satisfies HumanHandoffKind,
       digest: {
+        kind: 'out_of_stock',
         productId: '00000000-0000-4000-8000-000000000001',
         name: 'Croquetas',
       },
