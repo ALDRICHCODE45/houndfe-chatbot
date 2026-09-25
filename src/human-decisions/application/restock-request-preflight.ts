@@ -12,8 +12,19 @@
  * pure `restock` builds the ten-key intake. Anything else blocks — there is NO
  * legacy fallback once the feature is on and identity/markers are uncertain.
  *
+ * An enabled path re-reads the catalog (`getStock`) from the trusted client
+ * AFTER the marker reads: the `checkStock` signal that grounded the escalation
+ * is not authority for a later POST. The intake uses BACKEND values only (the
+ * model name and any model-supplied `sourceRequestId` are ignored) and always
+ * sends `requestedQuantity: null`. TIME-OF-CHECK RACE: this fresh GET is NOT
+ * atomic with the later reserve/POST, so a shortage can reappear between them;
+ * the backend must enforce strict shortage-at-POST if that is required.
+ *
  * Reasons are fixed codes only; no PII, digest text, or ids are returned.
  */
+import { z } from 'zod';
+import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
+import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
 import {
   normalizeRestockIntake,
   type RestockIntakeInput,
@@ -45,12 +56,16 @@ export interface RestockPreflightInput {
 export interface RestockPreflightDeps {
   readonly conversation: Pick<ConversationStore, 'get'>;
   readonly markers: SharedRouteMarkersPort;
+  /** Fresh trusted catalog read; the ONLY authority for the RESTOCK intake. */
+  readonly catalog: Pick<ChatbotApiClient, 'getStock'>;
 }
 
 export type RestockPreflightBlockReason =
   | 'identity_unbound'
   | 'marker_read_failed'
   | 'invalid_digest'
+  | 'catalog_read_failed'
+  | 'catalog_unverified'
   | 'existing_legacy'
   | 'existing_restock'
   | 'conflicting_markers'
@@ -101,37 +116,97 @@ function blockReasonFor(
   }
 }
 
+/** Mirrors the tool's `out_of_stock` digest schema; unknown keys are stripped. */
+const DIGEST_SCHEMA = z.object({
+  productId: z.uuid(),
+  name: z.string().min(1),
+  variantId: z.uuid().optional(),
+  quantity: z.number().int().min(1).optional(),
+});
+
+interface RestockCandidate {
+  readonly productId: string;
+  /** Parsed for shape only; the BACKEND name is the one that reaches intake. */
+  readonly name: string;
+  readonly variantId: string | null;
+}
+
 /**
- * Build the EXACT ten-key intake from the model digest plus the server-derived
- * `sourceRequestId`. The digest's own `sourceRequestId` (if any) is never read.
- * `quantity` in the existing checkStock envelope is AVAILABLE STOCK, not a
- * verified customer-requested quantity; never mislabel it as requestedQuantity.
- * Its positive-integer shape is checked if present, but intake sends null.
- * Other absent optionals map to null; malformed digest yields null.
+ * Parse and COPY the model digest, so the (possibly hostile) digest object is
+ * never re-read afterwards. `quantity` is validated for shape only. `null` on a
+ * malformed digest or a throwing getter.
  */
-function buildIntake(
-  digest: unknown,
+function parseCandidate(digest: unknown): RestockCandidate | null {
+  const parsed = DIGEST_SCHEMA.safeParse(digest);
+  if (!parsed.success) return null;
+  return {
+    productId: parsed.data.productId,
+    name: parsed.data.name,
+    variantId: parsed.data.variantId ?? null,
+  };
+}
+
+/**
+ * Verify the FRESH catalog read against the parsed candidate and build the
+ * EXACT ten-key intake from BACKEND values only. `productName` is the backend
+ * name and `requestedQuantity` is ALWAYS null (available stock is not a
+ * requested quantity); a selected variant must be uniquely out of stock. Any
+ * mismatch, malformed shape, or non-out-of-stock reading yields `null`.
+ */
+function verifiedIntake(
+  stock: StockCheckResponse,
+  candidate: RestockCandidate,
   sourceRequestId: string,
 ): RestockIntakeInput | null {
   try {
-    if (typeof digest !== 'object' || digest === null) return null;
-    // SAFETY: `digest` is narrowed to a non-null object; every value below is
-    // handed to `normalizeRestockIntake`, which validates all ten fields.
-    const fields = digest as Record<string, unknown>;
-    if (
-      fields.quantity !== undefined &&
-      (typeof fields.quantity !== 'number' ||
-        !Number.isInteger(fields.quantity) ||
-        fields.quantity < 1)
-    ) {
+    if (stock.productId !== candidate.productId) return null;
+    if (stock.stock.status !== 'out_of_stock' || stock.stock.quantity !== 0) {
       return null;
+    }
+    if (typeof stock.name !== 'string' || stock.name.trim().length === 0) {
+      return null;
+    }
+    if (!Array.isArray(stock.variants)) return null;
+    const variantIds = new Set<string>();
+    for (const variant of stock.variants) {
+      if (
+        typeof variant !== 'object' ||
+        variant === null ||
+        !z.uuid().safeParse(variant.variantId).success ||
+        typeof variant.name !== 'string' ||
+        (variant.option !== null && typeof variant.option !== 'string') ||
+        (variant.value !== null && typeof variant.value !== 'string') ||
+        !variant.stock ||
+        !['available', 'low_stock', 'out_of_stock', 'not_managed'].includes(
+          variant.stock.status,
+        ) ||
+        (variant.stock.quantity !== null &&
+          (!Number.isInteger(variant.stock.quantity) ||
+            variant.stock.quantity < 0)) ||
+        variantIds.has(variant.variantId)
+      ) {
+        return null;
+      }
+      variantIds.add(variant.variantId);
+    }
+    if (candidate.variantId !== null) {
+      const matches = stock.variants.filter(
+        (variant) => variant.variantId === candidate.variantId,
+      );
+      if (matches.length !== 1) return null;
+      if (
+        matches[0].stock.status !== 'out_of_stock' ||
+        matches[0].stock.quantity !== 0
+      ) {
+        return null;
+      }
     }
     return normalizeRestockIntake({
       sourceRequestId,
       type: 'RESTOCK',
-      productId: fields.productId,
-      productName: fields.name,
-      variantId: fields.variantId ?? null,
+      productId: candidate.productId,
+      productName: stock.name,
+      variantId: candidate.variantId,
       sku: null,
       requestedQuantity: null,
       observedStockAtRequest: null,
@@ -184,8 +259,23 @@ export async function preflightRestockRequest(
   });
   if (decision.route !== 'restock') return blocked(blockReasonFor(decision));
 
-  const intake = buildIntake(input.digest, sourceRequestId);
+  let candidate: RestockCandidate | null;
+  try {
+    candidate = parseCandidate(input.digest);
+  } catch {
+    candidate = null;
+  }
+  if (candidate === null) return blocked('invalid_digest');
+
+  let stock: StockCheckResponse;
+  try {
+    stock = await deps.catalog.getStock(candidate.productId);
+  } catch {
+    return blocked('catalog_read_failed');
+  }
+
+  const intake = verifiedIntake(stock, candidate, sourceRequestId);
   return intake === null
-    ? blocked('invalid_digest')
+    ? blocked('catalog_unverified')
     : { route: 'restock', intake };
 }

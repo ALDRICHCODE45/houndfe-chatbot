@@ -2,9 +2,10 @@ import { preflightRestockRequest } from './restock-request-preflight';
 
 /**
  * HD-R3b3 base spec for the inert RESTOCK request preflight: the default-off
- * legacy path and the enabled positive path. It writes nothing and is advisory —
- * the final RestockIntakeService.reserve CAS still decides. Blocking cases live
- * in the adversarial spec.
+ * legacy path and the enabled positive path, which now includes a FRESH trusted
+ * catalog read. It writes nothing and is advisory — the final
+ * RestockIntakeService.reserve CAS still decides. Blocking cases live in the
+ * adversarial spec.
  */
 const SENDER = 'whatsapp:+5215500000001';
 const PRODUCT = '44444444-4444-4444-8444-444444444444';
@@ -17,17 +18,34 @@ const EVENT = {
 const LATER_EVENT = { ...EVENT, messageId: 'wamid.ABC124' };
 const SOURCE = '848d8b89-b323-5a4f-952e-41ebcc00d733';
 const LATER_SOURCE = 'd9d741a0-898a-5f7b-bbd8-934e95e36420';
+/** The MODEL name must never reach the intake; the backend name wins. */
 const DIGEST = {
   productId: PRODUCT,
-  name: 'Croquetas premium',
+  name: 'Nombre del modelo',
   variantId: VARIANT,
   quantity: 2,
+};
+const BACKEND_NAME = 'Croquetas premium (backend)';
+/** A verified out-of-stock product plus the exact selected variant. */
+const STOCK = {
+  productId: PRODUCT,
+  name: BACKEND_NAME,
+  stock: { status: 'out_of_stock', quantity: 0 },
+  variants: [
+    {
+      variantId: VARIANT,
+      name: 'Variante',
+      option: null,
+      value: null,
+      stock: { status: 'out_of_stock', quantity: 0 },
+    },
+  ],
 };
 const INTAKE = {
   sourceRequestId: SOURCE,
   type: 'RESTOCK',
   productId: PRODUCT,
-  productName: 'Croquetas premium',
+  productName: BACKEND_NAME,
   variantId: VARIANT,
   sku: null,
   requestedQuantity: null,
@@ -41,18 +59,23 @@ const deps = (
   over: {
     markers?: unknown;
     state?: unknown;
-    fail?: 'markers' | 'get';
+    catalog?: unknown;
+    fail?: 'markers' | 'get' | 'catalog';
   } = {},
 ) => {
   const readForSender = jest.fn().mockResolvedValue(over.markers ?? CLEAR);
   const get = jest.fn().mockResolvedValue(over.state ?? null);
+  const getStock = jest.fn().mockResolvedValue(over.catalog ?? STOCK);
   if (over.fail === 'markers') readForSender.mockRejectedValue(new Error('db'));
   if (over.fail === 'get') get.mockRejectedValue(new Error('db'));
+  if (over.fail === 'catalog') getStock.mockRejectedValue(new Error('http'));
   return {
     conversation: { get },
     markers: { readForSender },
+    catalog: { getStock },
     readForSender,
     get,
+    getStock,
   };
 };
 const ask = (d: ReturnType<typeof deps>, over: Record<string, unknown> = {}) =>
@@ -83,15 +106,18 @@ describe('preflightRestockRequest', () => {
       expect(outcome).toEqual({ route: 'legacy' });
       expect(d.readForSender).not.toHaveBeenCalled();
       expect(d.get).not.toHaveBeenCalled();
+      expect(d.getStock).not.toHaveBeenCalled();
     }
   });
 
-  it('returns the exact ten-key intake built from the model digest plus the turn id', async () => {
+  it('re-reads the catalog and returns the exact ten-key intake using the backend name', async () => {
     const d = deps();
     const outcome = await ask(d);
     expect(outcome).toEqual({ route: 'restock', intake: INTAKE });
-    if (outcome.route !== 'restock') throw new Error('expected restock');
-    expect(Object.keys(outcome.intake).sort()).toEqual([
+    expect(d.getStock).toHaveBeenCalledWith(PRODUCT);
+    expect(d.readForSender).toHaveBeenCalledWith(SENDER);
+    expect(d.get).toHaveBeenCalledWith(SENDER);
+    expect(Object.keys(INTAKE).sort()).toEqual([
       'observedStockAtRequest',
       'productId',
       'productName',
@@ -103,23 +129,22 @@ describe('preflightRestockRequest', () => {
       'type',
       'variantId',
     ]);
-    expect(d.readForSender).toHaveBeenCalledWith(SENDER);
-    expect(d.get).toHaveBeenCalledWith(SENDER);
   });
 
-  it('maps absent optionals to null and ignores a model-provided sourceRequestId', async () => {
+  it('ignores the model name and sourceRequestId and maps absent optionals to null', async () => {
     const d = deps();
     const outcome = await ask(d, {
       digest: {
         productId: PRODUCT,
-        name: 'Croquetas premium',
+        name: 'Nombre del modelo',
         sourceRequestId: '00000000-0000-4000-8000-000000000000',
       },
     });
     expect(outcome).toEqual({
       route: 'restock',
-      intake: { ...INTAKE, variantId: null },
+      intake: { ...INTAKE, variantId: null, requestedQuantity: null },
     });
+    expect(d.getStock).toHaveBeenCalledWith(PRODUCT);
   });
 
   it('derives a distinct id for a later customer turn with the same digest', async () => {
