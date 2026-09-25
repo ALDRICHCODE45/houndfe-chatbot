@@ -22,6 +22,17 @@ import { createHash } from 'node:crypto';
  */
 export const RESTOCK_SOURCE_NAMESPACE = '4f3f1a2e-9c7b-4d1e-8a2f-6b5c0d9e1f23';
 
+/**
+ * Exact inbound identity that binds a RESTOCK event. All three fields are
+ * required and travel verbatim; this is the only shape a downstream turn may
+ * forward. It carries no derived id — the id stays internal to the deriver.
+ */
+export interface RestockInboundEventIdentity {
+  readonly receivingPhoneNumberId: string;
+  readonly senderId: string;
+  readonly messageId: string;
+}
+
 /** Versioned name tag; a future shape must ship as a NEW tag, not a mutation. */
 const EVENT_NAME_PREFIX = 'RESTOCK/v1';
 const MAX_PHONE_ID = 24;

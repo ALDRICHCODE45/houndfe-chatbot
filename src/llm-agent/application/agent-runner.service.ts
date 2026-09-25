@@ -8,6 +8,10 @@ import {
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import { PENDING_HUMAN_REQUEST_REPLY } from '../../human-handoff/application/human-handoff.service';
+import {
+  deriveRestockSourceRequestId,
+  type RestockInboundEventIdentity,
+} from '../../human-decisions/domain/restock-source-identity';
 import { LLM_AGENT, type LlmAgentPort } from '../domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from '../domain/tool-registry.port';
 import { LLM_AGENT_SYSTEM_PROMPT } from '../domain/system-prompt';
@@ -30,6 +34,12 @@ export { PENDING_HUMAN_REQUEST_REPLY };
 export interface AgentRunnerHandleInput {
   senderId: string;
   text: string;
+  /**
+   * Optional RESTOCK inbound identity. Forwarded to the LLM run ONLY when it
+   * is a strictly valid event whose `senderId` matches this turn; otherwise it
+   * is silently omitted (never thrown, never defaulted).
+   */
+  inboundEvent?: RestockInboundEventIdentity;
 }
 
 /**
@@ -89,9 +99,15 @@ export class AgentRunner {
     costGuard: CostGuardService,
     config: AgentRunnerConfig,
   ): AgentRunner {
+    // SAFETY: `stub` is a deliberate ConfigService double built for tests; the
+    // only method the runner constructor calls is `get('llm')`, implemented
+    // immediately below, so the cast never masks a missing method.
     const stub = {
       get: <T>(path: string): T | undefined => {
         if (path === 'llm')
+          // SAFETY: the 'llm' payload is exactly the shape the constructor
+          // reads (two numbers from `AgentRunnerConfig`), so this cast cannot
+          // diverge from the real `ConfigService.get` contract here.
           return {
             historyTurns: config.historyTurns,
             idleTimeoutMs: config.idleTimeoutMs,
@@ -107,6 +123,37 @@ export class AgentRunner {
       config.systemPrompt,
       stub,
     );
+  }
+
+  /**
+   * Build the frozen, plain inbound-event copy the LLM run may receive, or
+   * `undefined` when the caller supplied no event or the event is not a
+   * strictly valid, sender-matching identity. Never throws: a malformed,
+   * hostile (accessor/Proxy), or mismatched event simply drops out.
+   */
+  private static forwardableEvent(
+    input: AgentRunnerHandleInput,
+  ): RestockInboundEventIdentity | undefined {
+    try {
+      const event = input.inboundEvent;
+      if (event === undefined) return undefined;
+      const boundId = deriveRestockSourceRequestId(event);
+      if (boundId === null) return undefined;
+      const copy = Object.freeze({
+        receivingPhoneNumberId: event.receivingPhoneNumberId,
+        senderId: event.senderId,
+        messageId: event.messageId,
+      });
+      if (
+        copy.senderId !== input.senderId ||
+        deriveRestockSourceRequestId(copy) !== boundId
+      ) {
+        return undefined;
+      }
+      return copy;
+    } catch {
+      return undefined;
+    }
   }
 
   async handle(input: AgentRunnerHandleInput): Promise<{ reply: string }> {
@@ -138,6 +185,14 @@ export class AgentRunner {
       state === null || idleExpired ? [] : readMessages(state);
     const truncated = allTurns.slice(-this.historyTurns);
 
+    // 3a) Optional RESTOCK inbound identity. A strict, fail-closed gate: only a
+    // valid caller event whose sender matches this turn is copied forward,
+    // frozen. An invalid/hostile/mismatched event is dropped rather than
+    // thrown, so ordinary and synthetic-ops turns are unaffected. The derived
+    // id is used ONLY as a validity signal — it is never forwarded, logged,
+    // persisted, or written into text/systemPrompt/history.
+    const forwardedEvent = AgentRunner.forwardableEvent(input);
+
     // 4) Run the agent.
     const result = await this.llm.run({
       senderId: input.senderId,
@@ -145,6 +200,7 @@ export class AgentRunner {
       history: truncated,
       systemPrompt: this.systemPrompt,
       tools: this.tools.getTools(),
+      ...(forwardedEvent === undefined ? {} : { inboundEvent: forwardedEvent }),
     });
 
     // 5) Cost guard.

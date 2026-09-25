@@ -1,4 +1,5 @@
 import type { AgentMessage } from './agent-message';
+import type { RestockInboundEventIdentity } from '../../human-decisions/domain/restock-source-identity';
 
 /**
  * DI injection token for the LLM agent port.
@@ -39,6 +40,13 @@ export interface LlmRunInput {
    * never leaks SDK types past the infrastructure boundary.
    */
   tools: Record<string, unknown>;
+  /**
+   * Optional RESTOCK inbound identity, forwarded verbatim ONLY when a valid
+   * caller-supplied event matched this turn's sender. Absent for ordinary,
+   * synthetic-ops, or invalid inbound turns. Never persisted, never a source
+   * of a model-controlled id.
+   */
+  inboundEvent?: RestockInboundEventIdentity;
 }
 
 /** Port the runner uses to invoke the agent. */

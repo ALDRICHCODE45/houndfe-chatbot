@@ -598,6 +598,132 @@ describe('AgentRunner', () => {
       data: { messages },
     };
   }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Scenario: optional RESTOCK inbound identity propagation (inert)
+  // ────────────────────────────────────────────────────────────────────
+  describe('inbound event propagation', () => {
+    const EVENT = {
+      receivingPhoneNumberId: '123456789012345',
+      senderId: 's',
+      messageId: 'wamid.ABC123',
+    };
+    const lastInput = () =>
+      llm.run.mock.calls[llm.run.mock.calls.length - 1][0];
+
+    beforeEach(() => {
+      store.get.mockResolvedValue(null);
+      store.update.mockResolvedValue({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {},
+      });
+      llm.run.mockResolvedValue({
+        reply: 'ok',
+        messages: [{ role: 'assistant', content: 'ok' }],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+    });
+
+    it('forwards a valid matching event as an exact frozen copy', async () => {
+      await runner.handle({
+        senderId: 's',
+        text: 'hola',
+        inboundEvent: EVENT,
+      });
+      const { inboundEvent } = lastInput();
+      expect(inboundEvent).toEqual(EVENT);
+      expect(inboundEvent).not.toBe(EVENT);
+      expect(Object.isFrozen(inboundEvent)).toBe(true);
+    });
+
+    it('omits inboundEvent entirely for an ordinary turn with no event', async () => {
+      await runner.handle({ senderId: 's', text: 'hola' });
+      expect(
+        Object.prototype.hasOwnProperty.call(lastInput(), 'inboundEvent'),
+      ).toBe(false);
+    });
+
+    it('drops malformed, mismatched, or hostile events without throwing', async () => {
+      const accessor = {} as Record<string, unknown>;
+      for (const [key, value] of Object.entries(EVENT)) {
+        Object.defineProperty(accessor, key, {
+          get: () => value,
+          enumerable: true,
+        });
+      }
+      let rotatingReads = 0;
+      const rotating = new Proxy(
+        { ...EVENT },
+        {
+          get(target, key, receiver) {
+            if (key === 'messageId') {
+              return ++rotatingReads === 1 ? EVENT.messageId : 'wamid.CHANGED';
+            }
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+        },
+      );
+      let throwingReads = 0;
+      const throwing = new Proxy(
+        { ...EVENT },
+        {
+          get(target, key, receiver) {
+            if (key === 'messageId' && ++throwingReads > 1) {
+              throw new Error('changed after validation');
+            }
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+        },
+      );
+      const cases: unknown[] = [
+        { ...EVENT, senderId: 'other' },
+        { receivingPhoneNumberId: '123', senderId: 's' },
+        { ...EVENT, extra: 'x' },
+        { ...EVENT, receivingPhoneNumberId: '12a' },
+        new Proxy({ ...EVENT }, { get: () => 'tampered' }),
+        rotating,
+        throwing,
+        accessor,
+      ];
+      for (const inboundEvent of cases) {
+        await runner.handle({
+          senderId: 's',
+          text: 'hola',
+          inboundEvent: inboundEvent as never,
+        });
+        expect(
+          Object.prototype.hasOwnProperty.call(lastInput(), 'inboundEvent'),
+        ).toBe(false);
+      }
+      expect(llm.run).toHaveBeenCalledTimes(cases.length);
+    });
+
+    it('never persists the event and stays stable across a repeat', async () => {
+      await runner.handle({ senderId: 's', text: 'a', inboundEvent: EVENT });
+      await runner.handle({ senderId: 's', text: 'b', inboundEvent: EVENT });
+      for (const [, patch] of store.update.mock.calls) {
+        const persisted = JSON.stringify(patch);
+        expect(persisted).not.toContain(EVENT.messageId);
+        expect(persisted).not.toContain(EVENT.receivingPhoneNumberId);
+      }
+      const forwarded = llm.run.mock.calls.map((c) => c[0].inboundEvent);
+      expect(forwarded[1]).toEqual(forwarded[0]);
+      expect(forwarded[1]).not.toBe(forwarded[0]);
+      expect(lastInput().text).toBe('b');
+      expect(lastInput().systemPrompt).toBe(SYSTEM_PROMPT);
+    });
+
+    it('leaves the tool registry untouched', async () => {
+      await runner.handle({
+        senderId: 's',
+        text: 'hola',
+        inboundEvent: EVENT,
+      });
+      expect(tools.getTools).toHaveBeenCalledTimes(1);
+      expect(lastInput().tools).toBe(tools.getTools.mock.results[0].value);
+    });
+  });
 });
 
 // Keep type-only imports quiet under strict TS.
