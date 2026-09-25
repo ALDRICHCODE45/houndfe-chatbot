@@ -16,7 +16,7 @@ Deliver a guided, reproducible offline presentation for a client meeting in ~29 
 - [x] **D1 — Map only reproducible evidence.** Route: delegated read-only scout; evidence: bot four-command Testcontainers/unit recommendation, backend/FE peer state; shipping provenance must remain labeled. No implementation commit (investigation only).
 - [x] **D2 — Write a concise offline runbook and meeting script.** Route: bounded delegated writer; 300-second script, three bot-only commands, precise fake/DB labels and fallback. Scoped Prettier and source/path readback passed. Commit `fb12d04` (134 added lines).
 - [x] **D3 — Provide a standalone, client-readable visual walkthrough.** Route: bounded delegated writer; HTML and local Firefox screenshot with explicit simulation/other-branch/planned labels. Scoped Prettier, staged whitespace check and 1440×1600 visual readback passed; no external assets or product UI claims. Commit `9ff5eb7` (304 authored HTML lines; PNG binary).
-- [x] **D4 — Rehearse and collect exact evidence.** Route: independent `gentle-ai-verify`, bot worktree only. Unit coordinator 2 suites/12 tests; pure ledger/reservation/preflight 5 suites/64; disposable Testcontainers PostgreSQL 2 suites/12: **9 suites/88 tests PASS**, three commands exited 0 (Jest 0.499s/0.682s/5.713s). `dist` and two existing buildinfo size/mtime unchanged pre/post. Backend/FE/shipping were not run here, and no integrated runtime, provider, Meta or device delivery was proven. Evidence-update commit pending.
+- [x] **D4 — Rehearse and collect exact evidence.** Route: independent `gentle-ai-verify`, bot worktree only. Unit coordinator 2 suites/12 tests; pure ledger/reservation/preflight 5 suites/64; disposable Testcontainers PostgreSQL 2 suites/12: **9 suites/88 tests PASS**, three commands exited 0 (Jest 0.499s/0.682s/5.713s). `dist` and two existing buildinfo size/mtime unchanged pre/post. Backend/FE/shipping were not run here, and no integrated runtime, provider, Meta or device delivery was proven. Evidence-update commit `8e84482`.
 
 ## Checks and delivery
 
@@ -27,4 +27,4 @@ Deliver a guided, reproducible offline presentation for a client meeting in ~29 
 
 ## Status
 
-D1–D4 verified offline; commits recorded above, evidence-update commit pending. W2 marker CAS was explicitly authorized but is paused for the demo. Backend HD-06 offline source bytes are frozen, but RESTOCK tool runtime, bot GET/ACK, customer delivery, FE route wiring, and cross-branch SHIPPING_APPROVAL integration remain incomplete.
+D1–D4 verified offline; commits recorded above. No live or joined-runtime claim. W2 marker CAS was explicitly authorized but is paused for the demo. Backend HD-06 offline source bytes are frozen, but RESTOCK tool runtime, bot GET/ACK, customer delivery, FE route wiring, and cross-branch SHIPPING_APPROVAL integration remain incomplete.
