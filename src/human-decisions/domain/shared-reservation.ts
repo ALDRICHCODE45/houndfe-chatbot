@@ -188,3 +188,6 @@ export function classifyReservation(
 export interface SharedReservationPort {
   reserve(proposal: ReservationProposal): Promise<ReservationDecision>;
 }
+
+/** Nest DI token for the `SharedReservationPort` binding. */
+export const SHARED_RESERVATION = Symbol('SHARED_RESERVATION');
