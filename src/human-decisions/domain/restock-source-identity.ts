@@ -124,3 +124,42 @@ export function deriveRestockSourceRequestId(input: unknown): string | null {
   const name = JSON.stringify([EVENT_NAME_PREFIX, phone, senderId, messageId]);
   return uuidV5(RESTOCK_SOURCE_NAMESPACE, name);
 }
+
+/**
+ * Validate one inbound identity against a TRUSTED expected sender and return
+ * its FROZEN copy plus the derived `sourceRequestId`, or `null`.
+ *
+ * Safety: the id is derived first (`deriveRestockSourceRequestId(input)`), then
+ * the three ORIGINAL fields are copied and the copy is re-derived and must
+ * equal the first id. That re-derivation is the TOCTOU probe: a rotating or
+ * throwing getter yields a different (or absent) id and the bind fails closed.
+ * Only after the comparison is the already-frozen copy returned — the raw input
+ * is not read again. Every throw becomes `null`; this never throws and never
+ * mutates its input.
+ */
+export function bindRestockInboundEvent(
+  input: unknown,
+  expectedSenderId: string,
+): {
+  readonly event: Readonly<RestockInboundEventIdentity>;
+  readonly sourceRequestId: string;
+} | null {
+  try {
+    const sourceRequestId = deriveRestockSourceRequestId(input);
+    if (sourceRequestId === null) return null;
+    // SAFETY: `deriveRestockSourceRequestId` above already accepted `input` as
+    // exactly the three bounded string fields, and the re-derivation below
+    // re-checks every copied byte before anything is returned.
+    const source = input as RestockInboundEventIdentity;
+    const event = Object.freeze({
+      receivingPhoneNumberId: source.receivingPhoneNumberId,
+      senderId: source.senderId,
+      messageId: source.messageId,
+    });
+    if (event.senderId !== expectedSenderId) return null;
+    if (deriveRestockSourceRequestId(event) !== sourceRequestId) return null;
+    return { event, sourceRequestId };
+  } catch {
+    return null;
+  }
+}

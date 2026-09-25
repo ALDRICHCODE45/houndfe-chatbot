@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { stepCountIs } from 'ai';
 import type { ModelMessage } from 'ai';
 import { openai } from '@ai-sdk/openai';
-import { deriveRestockSourceRequestId } from '../../human-decisions/domain/restock-source-identity';
+import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import type { AgentMessage } from '../domain/agent-message';
 import type {
   LlmAgentPort,
@@ -93,22 +93,11 @@ function forwardableInboundEvent(
   input: LlmRunInput,
 ): LlmRunInput['inboundEvent'] {
   try {
-    const event = input.inboundEvent;
-    if (event === undefined) return undefined;
-    const boundId = deriveRestockSourceRequestId(event);
-    if (boundId === null) return undefined;
-    const copy = Object.freeze({
-      receivingPhoneNumberId: event.receivingPhoneNumberId,
-      senderId: event.senderId,
-      messageId: event.messageId,
-    });
-    if (
-      copy.senderId !== input.senderId ||
-      deriveRestockSourceRequestId(copy) !== boundId
-    ) {
-      return undefined;
-    }
-    return copy;
+    // Accessing `input.inboundEvent` may itself throw (a hostile getter on the
+    // caller's object). The shared binder checks a second raw read against
+    // the original derived id, then forwards only a frozen copy.
+    const bound = bindRestockInboundEvent(input.inboundEvent, input.senderId);
+    return bound === null ? undefined : bound.event;
   } catch {
     return undefined;
   }

@@ -1,4 +1,5 @@
 import {
+  bindRestockInboundEvent,
   deriveRestockSourceRequestId,
   RESTOCK_SOURCE_NAMESPACE,
 } from './restock-source-identity';
@@ -144,5 +145,124 @@ describe('deriveRestockSourceRequestId', () => {
       'senderId',
       'messageId',
     ]);
+  });
+});
+
+describe('bindRestockInboundEvent', () => {
+  const SENDER = GOLDEN_EVENT.senderId;
+
+  it('binds a valid event to its frozen copy and the golden sourceRequestId', () => {
+    const bound = bindRestockInboundEvent(GOLDEN_EVENT, SENDER);
+    expect(bound).not.toBeNull();
+    expect(bound?.event).toEqual(GOLDEN_EVENT);
+    expect(bound?.event).not.toBe(GOLDEN_EVENT);
+    expect(Object.isFrozen(bound?.event)).toBe(true);
+    expect(bound?.sourceRequestId).toBe(GOLDEN);
+    expect(deriveRestockSourceRequestId(bound?.event)).toBe(GOLDEN);
+  });
+
+  it('rejects a sender that does not match the trusted expected sender', () => {
+    expect(
+      bindRestockInboundEvent(GOLDEN_EVENT, 'whatsapp:+5215500000999'),
+    ).toBeNull();
+    expect(bindRestockInboundEvent(GOLDEN_EVENT, '')).toBeNull();
+    expect(bindRestockInboundEvent(GOLDEN_EVENT, 'whatsapp:...')).toBeNull();
+  });
+
+  it('rejects malformed, extra-key, missing-key, and non-object input', () => {
+    const bad: unknown[] = [
+      undefined,
+      null,
+      'RESTOCK/v1',
+      [],
+      withField({ extra: 'x' }),
+      { receivingPhoneNumberId: '123', senderId: SENDER },
+      withField({ messageId: 123 }),
+    ];
+    for (const value of bad) {
+      expect(bindRestockInboundEvent(value, SENDER)).toBeNull();
+    }
+  });
+
+  it('rejects a rotating getter that changes value across reads', () => {
+    let reads = 0;
+    const rotating = new Proxy(
+      { ...GOLDEN_EVENT },
+      {
+        get: (target, property) => {
+          reads += 1;
+          return reads % 2 !== 0
+            ? (Reflect.get(target, property) as unknown)
+            : 'tampered';
+        },
+      },
+    );
+    expect(bindRestockInboundEvent(rotating, SENDER)).toBeNull();
+  });
+
+  it('rejects a throwing getter without throwing', () => {
+    const throwing: Record<string, unknown> = {};
+    for (const key of Object.keys(GOLDEN_EVENT)) {
+      Object.defineProperty(throwing, key, {
+        get: () => {
+          throw new Error('boom');
+        },
+        enumerable: true,
+      });
+    }
+    expect(() => bindRestockInboundEvent(throwing, SENDER)).not.toThrow();
+    expect(bindRestockInboundEvent(throwing, SENDER)).toBeNull();
+  });
+
+  it('rejects a getter that rotates to a different value after the first read', () => {
+    let reads = 0;
+    const rotating = new Proxy(
+      { ...GOLDEN_EVENT },
+      {
+        get: (target, property) => {
+          if (property === 'messageId') {
+            reads += 1;
+            return reads === 1 ? GOLDEN_EVENT.messageId : 'wamid.CHANGED';
+          }
+          return Reflect.get(target, property) as unknown;
+        },
+      },
+    );
+    expect(bindRestockInboundEvent(rotating, SENDER)).toBeNull();
+  });
+
+  it('rejects a getter that throws after the first read, without throwing', () => {
+    let reads = 0;
+    const throwing = new Proxy(
+      { ...GOLDEN_EVENT },
+      {
+        get: (target, property) => {
+          if (property === 'messageId') {
+            reads += 1;
+            if (reads > 1) throw new Error('changed after validation');
+          }
+          return Reflect.get(target, property) as unknown;
+        },
+      },
+    );
+    expect(() => bindRestockInboundEvent(throwing, SENDER)).not.toThrow();
+    expect(bindRestockInboundEvent(throwing, SENDER)).toBeNull();
+  });
+
+  it('derives a different id for a differing event', () => {
+    const other = bindRestockInboundEvent(
+      { ...GOLDEN_EVENT, messageId: 'wamid.ABC124' },
+      SENDER,
+    );
+    expect(other?.sourceRequestId).not.toBe(GOLDEN);
+    expect(other?.event.messageId).toBe('wamid.ABC124');
+  });
+
+  it('returns an immutable copy unaffected by later mutation of the source', () => {
+    const source = { ...GOLDEN_EVENT };
+    const bound = bindRestockInboundEvent(source, SENDER);
+    source.messageId = 'wamid.MUTATED';
+    expect(bound?.event.messageId).toBe(GOLDEN_EVENT.messageId);
+    expect(bound?.sourceRequestId).toBe(GOLDEN);
   });
 });

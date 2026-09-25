@@ -9,7 +9,7 @@ import {
 } from '../../conversation/domain/conversation-store';
 import { PENDING_HUMAN_REQUEST_REPLY } from '../../human-handoff/application/human-handoff.service';
 import {
-  deriveRestockSourceRequestId,
+  bindRestockInboundEvent,
   type RestockInboundEventIdentity,
 } from '../../human-decisions/domain/restock-source-identity';
 import { LLM_AGENT, type LlmAgentPort } from '../domain/llm-agent.port';
@@ -135,22 +135,11 @@ export class AgentRunner {
     input: AgentRunnerHandleInput,
   ): RestockInboundEventIdentity | undefined {
     try {
-      const event = input.inboundEvent;
-      if (event === undefined) return undefined;
-      const boundId = deriveRestockSourceRequestId(event);
-      if (boundId === null) return undefined;
-      const copy = Object.freeze({
-        receivingPhoneNumberId: event.receivingPhoneNumberId,
-        senderId: event.senderId,
-        messageId: event.messageId,
-      });
-      if (
-        copy.senderId !== input.senderId ||
-        deriveRestockSourceRequestId(copy) !== boundId
-      ) {
-        return undefined;
-      }
-      return copy;
+      // Accessing `input.inboundEvent` may itself throw (a hostile getter on
+      // the caller's object). The shared binder checks a second raw read
+      // against the original derived id, then forwards only a frozen copy.
+      const bound = bindRestockInboundEvent(input.inboundEvent, input.senderId);
+      return bound === null ? undefined : bound.event;
     } catch {
       return undefined;
     }
