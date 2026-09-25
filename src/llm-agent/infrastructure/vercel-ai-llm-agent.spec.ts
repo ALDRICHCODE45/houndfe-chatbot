@@ -1,5 +1,6 @@
 import { stepCountIs } from 'ai';
 import { openai } from '@ai-sdk/openai';
+import type { LlmRunInput } from '../domain/llm-agent.port';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
 import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
@@ -241,6 +242,113 @@ describe('VercelAiLlmAgent', () => {
 
       expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 5 });
       expect(result.reply).toBe('Hola');
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // R3b3-c4c2: toolsContext.requestHumanAssistance inbound identity
+  // ────────────────────────────────────────────────────────────────────
+  describe('toolsContext.requestHumanAssistance inbound identity', () => {
+    const EVENT = {
+      receivingPhoneNumberId: '123456789012345',
+      senderId: 's',
+      messageId: 'wamid.ABC123',
+    };
+
+    const run = async (overrides: Partial<LlmRunInput> = {}) => {
+      generateTextFn.mockResolvedValueOnce({
+        text: 'ok',
+        usage: { inputTokens: 1, outputTokens: 1 },
+      } as never);
+      await agent.run({
+        senderId: 's',
+        text: 'hola',
+        history: [],
+        systemPrompt: SYSTEM_PROMPT,
+        tools: {},
+        ...overrides,
+      });
+      const calls = generateTextFn.mock.calls;
+      return calls[calls.length - 1][0] as Record<string, unknown>;
+    };
+    const slot = (args: Record<string, unknown>) =>
+      (args.toolsContext as Record<string, unknown>)
+        .requestHumanAssistance as Record<string, unknown>;
+
+    it('adds a frozen copy to requestHumanAssistance alone for a valid matching event', async () => {
+      const args = await run({ inboundEvent: EVENT });
+      expect(slot(args)).toEqual({ senderId: 's', inboundEvent: EVENT });
+      expect(slot(args).inboundEvent).not.toBe(EVENT);
+      expect(Object.isFrozen(slot(args).inboundEvent)).toBe(true);
+      const ctx = args.toolsContext as Record<string, unknown>;
+      expect(ctx.evaluateCart).toEqual({ senderId: 's' });
+      expect(ctx.createSale).toEqual({ senderId: 's' });
+      expect(ctx.cancelSale).toEqual({ senderId: 's' });
+    });
+
+    it('omits the property for an absent event, preserving the exact envelope', async () => {
+      const args = await run();
+      expect(slot(args)).toEqual({ senderId: 's' });
+      expect(
+        Object.prototype.hasOwnProperty.call(slot(args), 'inboundEvent'),
+      ).toBe(false);
+    });
+
+    it('omits the event for mismatched, malformed, or hostile input', async () => {
+      const accessor = {} as Record<string, unknown>;
+      for (const [key, value] of Object.entries(EVENT)) {
+        Object.defineProperty(accessor, key, {
+          get: () => value,
+          enumerable: true,
+        });
+      }
+      let rotatingReads = 0;
+      const rotating = new Proxy(
+        { ...EVENT },
+        {
+          get(target, key, receiver) {
+            if (key === 'messageId') {
+              return ++rotatingReads === 1 ? EVENT.messageId : 'wamid.CHANGED';
+            }
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+        },
+      );
+      let throwingReads = 0;
+      const throwing = new Proxy(
+        { ...EVENT },
+        {
+          get(target, key, receiver) {
+            if (key === 'messageId' && ++throwingReads > 1) {
+              throw new Error('changed after validation');
+            }
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+        },
+      );
+      const cases: unknown[] = [
+        { ...EVENT, senderId: 'other' },
+        { ...EVENT, receivingPhoneNumberId: '12a' },
+        { ...EVENT, extra: 'x' },
+        new Proxy({ ...EVENT }, { get: () => 'tampered' }),
+        rotating,
+        throwing,
+        accessor,
+      ];
+      for (const inboundEvent of cases) {
+        const args = await run({ inboundEvent: inboundEvent as never });
+        expect(slot(args)).toEqual({ senderId: 's' });
+      }
+    });
+
+    it('never leaks the identity into system, messages, or tools', async () => {
+      const tools = { requestHumanAssistance: { description: 'r' } };
+      const args = await run({ inboundEvent: EVENT, tools });
+      expect(args.system).toBe(SYSTEM_PROMPT);
+      expect(args.tools).toBe(tools);
+      const serialized = JSON.stringify(args.messages);
+      expect(serialized).not.toContain(EVENT.messageId);
+      expect(serialized).not.toContain(EVENT.receivingPhoneNumberId);
     });
   });
 

@@ -20,8 +20,8 @@ import type { ToolDeps } from '../tool-deps';
  * `execute`. The R6 slice will extend the union without breaking this
  * contract.
  *
- * `contextSchema: { senderId }` — the AI-SDK supplies the senderId
- * through `toolsContext.requestHumanAssistance.senderId` (see
+ * `contextSchema: { senderId, inboundEvent? }` — the AI-SDK supplies the
+ * senderId through `toolsContext.requestHumanAssistance.senderId` (see
  * `VercelAiLlmAgent.run`). The tool reads `options.context.senderId`
  * (NOT `options.context.requestHumanAssistance.senderId`) — the
  * context envelope key matches the tool name, but the inner schema is
@@ -69,7 +69,20 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
         }),
       }),
     ]),
-    contextSchema: z.object({ senderId: z.string() }),
+    contextSchema: z.object({
+      senderId: z.string(),
+      // R3b3-c4c2: optional inert RESTOCK inbound identity. Accepted (and
+      // strictly shaped) so the SDK validates the per-turn envelope, but NOT
+      // yet read in `execute` — RESTOCK stays default-off/unwired and the
+      // legacy `humanHandoffService.create` behavior is unchanged.
+      inboundEvent: z
+        .strictObject({
+          receivingPhoneNumberId: z.string().min(1),
+          senderId: z.string().min(1),
+          messageId: z.string().min(1),
+        })
+        .optional(),
+    }),
     execute: async (input, options) => {
       const senderId = options.context.senderId;
       // The discriminated union guarantees that `input.kind` aligns with

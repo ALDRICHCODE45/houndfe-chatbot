@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { stepCountIs } from 'ai';
 import type { ModelMessage } from 'ai';
 import { openai } from '@ai-sdk/openai';
+import { deriveRestockSourceRequestId } from '../../human-decisions/domain/restock-source-identity';
 import type { AgentMessage } from '../domain/agent-message';
 import type {
   LlmAgentPort,
@@ -40,6 +41,7 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     // receive `options.context.senderId` inside `execute`. Stateless
     // tools don't appear here — the SDK only requires an entry for
     // tools that declare a contextSchema.
+    const inboundEvent = forwardableInboundEvent(input);
     const toolsContext = {
       evaluateCart: { senderId: input.senderId },
       createSale: { senderId: input.senderId },
@@ -49,11 +51,16 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       // the SDK scopes the entry into its `options.context` arg.
       cancelSale: { senderId: input.senderId },
       // Human-handoff slice: the 12th tool `requestHumanAssistance`
-      // declares `contextSchema: z.object({ senderId: z.string() })`
-      // and reads `options.context.senderId`. The context envelope key
-      // matches the tool name; the AI-SDK only requires entries for
-      // tools that declare a contextSchema.
-      requestHumanAssistance: { senderId: input.senderId },
+      // declares `contextSchema: z.object({ senderId, inboundEvent? })`
+      // and reads `options.context.senderId`. R3b3-c4c2 adds an inert
+      // RESTOCK `inboundEvent` to THIS entry ONLY, and only for a strictly
+      // valid, sender-matching event, as a frozen copy. The model can never
+      // supply it; every other entry, the system prompt, and the messages
+      // stay byte-identical. No mutable global is touched.
+      requestHumanAssistance: {
+        senderId: input.senderId,
+        ...(inboundEvent === undefined ? {} : { inboundEvent }),
+      },
     };
     const result = await this.generateTextFn({
       model: openai(this.modelId),
@@ -74,6 +81,36 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       messages: assembleAgentMessages(input.history, input.text, result.text),
       usage,
     };
+  }
+}
+
+/**
+ * Return a frozen copy of the caller-supplied RESTOCK inbound identity, or
+ * `undefined` when it is absent or fails the strict, sender-matching gate.
+ * Mirrors the runner's gate so the adapter can never widen what reaches the SDK.
+ */
+function forwardableInboundEvent(
+  input: LlmRunInput,
+): LlmRunInput['inboundEvent'] {
+  try {
+    const event = input.inboundEvent;
+    if (event === undefined) return undefined;
+    const boundId = deriveRestockSourceRequestId(event);
+    if (boundId === null) return undefined;
+    const copy = Object.freeze({
+      receivingPhoneNumberId: event.receivingPhoneNumberId,
+      senderId: event.senderId,
+      messageId: event.messageId,
+    });
+    if (
+      copy.senderId !== input.senderId ||
+      deriveRestockSourceRequestId(copy) !== boundId
+    ) {
+      return undefined;
+    }
+    return copy;
+  } catch {
+    return undefined;
   }
 }
 

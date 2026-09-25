@@ -225,4 +225,99 @@ describe('makeRequestHumanAssistanceTool', () => {
     const r = schemas.contextSchema!.safeParse({ senderId: '5215550001111' });
     expect(r.success).toBe(true);
   });
+
+  it('contextSchema accepts and preserves an optional three-field inboundEvent', () => {
+    const { svc } = buildHandoffServiceMock();
+    const tool = makeRequestHumanAssistanceTool({
+      ...baseDeps,
+      chatbotApi: {} as never,
+      store: {} as never,
+      humanHandoffService: svc,
+    });
+    const schemas = schemaToolView(tool);
+    const event = {
+      receivingPhoneNumberId: '123456789012345',
+      senderId: 'S',
+      messageId: 'wamid.ABC123',
+    };
+    const parsed = schemas.contextSchema!.safeParse({
+      senderId: 'S',
+      inboundEvent: event,
+    }) as { success: boolean; data?: { inboundEvent?: unknown } };
+    expect(parsed.success).toBe(true);
+    expect(parsed.data?.inboundEvent).toEqual(event);
+    const legacy = schemas.contextSchema!.safeParse({ senderId: 'S' });
+    expect(legacy.success).toBe(true);
+  });
+
+  it('contextSchema rejects an extra key or a blank inboundEvent field', () => {
+    const { svc } = buildHandoffServiceMock();
+    const tool = makeRequestHumanAssistanceTool({
+      ...baseDeps,
+      chatbotApi: {} as never,
+      store: {} as never,
+      humanHandoffService: svc,
+    });
+    const schemas = schemaToolView(tool);
+    const base = {
+      receivingPhoneNumberId: '1',
+      senderId: 'S',
+      messageId: 'm',
+    };
+    expect(
+      schemas.contextSchema!.safeParse({
+        senderId: 'S',
+        inboundEvent: { ...base, extra: 'x' },
+      }).success,
+    ).toBe(false);
+    expect(
+      schemas.contextSchema!.safeParse({
+        senderId: 'S',
+        inboundEvent: { ...base, receivingPhoneNumberId: '' },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('execute ignores an inboundEvent in context and keeps the legacy create call', async () => {
+    const { svc, create } = buildHandoffServiceMock();
+    const tool = makeRequestHumanAssistanceTool({
+      ...baseDeps,
+      chatbotApi: {} as never,
+      store: {} as never,
+      humanHandoffService: svc,
+    });
+    const context = {
+      senderId: 'S',
+      inboundEvent: {
+        receivingPhoneNumberId: '1',
+        senderId: 'S',
+        messageId: 'm',
+      },
+    };
+    const result = await tool.execute(
+      {
+        kind: 'out_of_stock',
+        digest: {
+          productId: '00000000-0000-4000-8000-000000000001',
+          name: 'Croquetas',
+        },
+      },
+      { toolCallId: 't', messages: [], context },
+    );
+    expect(create).toHaveBeenCalledWith({
+      senderId: 'S',
+      kind: 'out_of_stock',
+      digest: {
+        kind: 'out_of_stock',
+        productId: '00000000-0000-4000-8000-000000000001',
+        name: 'Croquetas',
+      },
+    });
+    expect(result).toEqual({
+      ok: true,
+      requestId: 'abc123def456',
+      ref: 'HF-abc123def456',
+      customerNotified: true,
+    });
+  });
 });
