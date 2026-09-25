@@ -1,5 +1,6 @@
 import {
   RESTOCK_MAX_PRODUCT_NAME_LENGTH,
+  normalizeRestockDecision,
   normalizeRestockIntake,
   normalizeRestockIntakeReceipt,
 } from './human-decisions.dto';
@@ -443,5 +444,212 @@ describe('normalizeRestockIntakeReceipt', () => {
     expect(norm(throwingProxy({}, 'ownKeys'), sent)).toBeNull();
     expect(norm(throwingProxy(receiptFor(sent), 'get'), sent)).toBeNull();
     expect(norm(receiptFor(sent), null as never)).toBeNull();
+  });
+});
+
+const RESOLVED_AT = '2026-06-22T10:30:00.000Z';
+const APPLY_BEFORE = '2026-06-22T11:30:00.000Z';
+const plus = (ms: number): string =>
+  new Date(Date.parse(RESOLVED_AT) + ms).toISOString();
+
+const snapBase = (): Rec => receiptFor(sentIntake()).snapshot as Rec;
+const positive = (extra: Rec = {}): Rec => ({
+  action: 'PROVIDE_RESTOCK_ESTIMATE',
+  restockDays: 5,
+  resolvedAt: RESOLVED_AT,
+  ...extra,
+});
+const negative = (extra: Rec = {}): Rec => ({
+  action: 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE',
+  resolvedAt: RESOLVED_AT,
+  ...extra,
+});
+const pending = (extra: Rec = {}, snap: Rec = {}): Rec => ({
+  id: RECEIPT_ID,
+  sourceRequestId: U.source,
+  type: 'RESTOCK',
+  status: 'PENDING',
+  version: 1,
+  createdAt: CREATED_AT,
+  snapshot: { ...snapBase(), ...snap },
+  supersedesDecisionId: null,
+  resolution: null,
+  applyBefore: null,
+  ...extra,
+});
+const resolved = (resolution: Rec, extra: Rec = {}): Rec =>
+  pending({
+    status: 'RESOLVED',
+    version: 2,
+    resolution,
+    applyBefore: APPLY_BEFORE,
+    ...extra,
+  });
+const dnorm = (value: unknown) => normalizeRestockDecision(value);
+
+describe('normalizeRestockDecision', () => {
+  it('normalizes PENDING v1 and both RESOLVED v2 variants', () => {
+    expect(dnorm(pending())).toEqual(pending());
+    expect(dnorm(resolved(positive()))).toEqual(resolved(positive()));
+    const negativeOut = dnorm(resolved(negative()));
+    expect(negativeOut).toEqual(resolved(negative()));
+    expect(Object.keys(negativeOut?.resolution ?? {})).toEqual([
+      'action',
+      'resolvedAt',
+    ]);
+  });
+
+  it('accepts bounds, offset canonicalization and the +1h window', () => {
+    expect(dnorm(resolved(positive({ restockDays: 1 })))).not.toBeNull();
+    expect(dnorm(resolved(positive({ restockDays: 365 })))).not.toBeNull();
+    expect(
+      dnorm(
+        resolved(positive({ resolvedAt: '2026-06-22T12:30:00+02:00' }), {
+          createdAt: '2026-06-22T10:30:00Z',
+        }),
+      ),
+    ).toMatchObject({
+      createdAt: RESOLVED_AT,
+      resolution: { resolvedAt: RESOLVED_AT },
+      applyBefore: APPLY_BEFORE,
+    });
+    expect(
+      dnorm(
+        resolved(positive({ resolvedAt: '2026-06-22T10:30:00Z' }), {
+          applyBefore: '2026-06-22T12:30:00+01:00',
+        }),
+      )?.applyBefore,
+    ).toBe(APPLY_BEFORE);
+  });
+
+  it('preserves exact backend product/branch/sku bytes', () => {
+    const snap = {
+      branchName: '  Centro  ',
+      sku: '  SKU-9  ',
+      productName: 'Croquetas  Premium',
+    };
+    const out = dnorm(pending({}, snap));
+    expect([out?.snapshot.branchName, out?.snapshot.sku]).toEqual([
+      snap.branchName,
+      snap.sku,
+    ]);
+    expect(out?.snapshot.productName).toBe(snap.productName);
+  });
+
+  it('requires every declared top-level and snapshot key', () => {
+    const base = pending();
+    const snap = base.snapshot as Rec;
+    for (const key of Object.keys(base)) {
+      expect(dnorm(omitted(base, key))).toBeNull();
+    }
+    for (const key of Object.keys(snap)) {
+      expect(dnorm({ ...base, snapshot: omitted(snap, key) })).toBeNull();
+    }
+  });
+
+  it('requires the exact resolution key set', () => {
+    for (const bad of [
+      omitted(positive(), 'resolvedAt'),
+      positive({ resolvedBy: { id: U.supersedes } }),
+      omitted(positive(), 'restockDays'),
+      omitted(negative(), 'resolvedAt'),
+      negative({ restockDays: 5 }),
+      negative({ evidenceCode: 'X' }),
+    ]) {
+      expect(dnorm(resolved(bad))).toBeNull();
+    }
+  });
+
+  const snapAccessor = {
+    ...pending(),
+    snapshot: accessor(snapBase(), 'productName'),
+  };
+  const days = (n: unknown): Rec => resolved(positive({ restockDays: n }));
+  const at = (instant: unknown): Rec =>
+    resolved(positive(), { applyBefore: instant });
+  const bad: Array<[string, unknown]> = [
+    ['RESOLVED with version 1', resolved(positive(), { version: 1 })],
+    ['PENDING with version 2', pending({ version: 2 })],
+    ['PENDING with resolution', pending({ resolution: positive() })],
+    ['PENDING with applyBefore', pending({ applyBefore: APPLY_BEFORE })],
+    ['RESOLVED with null resolution', resolved(null as never)],
+    ['RESOLVED with null applyBefore', at(null)],
+    ['unknown status', pending({ status: 'EXPIRED' })],
+    ['version 0', pending({ version: 0 })],
+    ['RESOLVED version 3', resolved(positive(), { version: 3 })],
+    ['restockDays zero', days(0)],
+    ['restockDays 366', days(366)],
+    ['restockDays fraction', days(2.5)],
+    ['restockDays string', days('5')],
+    ['restockDays negative', days(-1)],
+    ['restockDays missing', resolved(omitted(positive(), 'restockDays'))],
+    ['restockDays undefined', days(undefined)],
+    ['impossible resolvedAt', resolved(positive({ resolvedAt: BAD_ISO }))],
+    ['date-only resolvedAt', resolved(positive({ resolvedAt: '2026-06-22' }))],
+    ['numeric resolvedAt', resolved(positive({ resolvedAt: 1719000000 }))],
+    ['impossible applyBefore', at(BAD_ISO)],
+    ['date-only applyBefore', at('2026-06-22')],
+    ['zero window', at(RESOLVED_AT)],
+    ['short window', at(plus(3_599_999))],
+    ['long window', at(plus(3_600_001))],
+    ['wrong hour', at(OTHER_ISO)],
+    ['top extra', pending({ tenantId: U.source })],
+    ['top evidenceCode', pending({ evidenceCode: 'X' })],
+    ['snapshot extra', pending({}, { branchLabel: 'x' })],
+    ['non-uuid id', pending({ id: 'x' })],
+    ['non-uuid sourceRequestId', pending({ sourceRequestId: 'x' })],
+    ['non-uuid branchId', pending({}, { branchId: 'x' })],
+    ['non-uuid productId', pending({}, { productId: 'x' })],
+    ['wrong type', pending({ type: 'SHIPPING' })],
+    ['numeric productName', pending({}, { productName: 7 })],
+    ['blank productName', pending({}, { productName: '  ' })],
+    ['overlong productName', pending({}, { productName: 'a'.repeat(201) })],
+    ['string requestedQuantity', pending({}, { requestedQuantity: '3' })],
+    ['zero requestedQuantity', pending({}, { requestedQuantity: 0 })],
+    ['negative observedStock', pending({}, { observedStockAtRequest: -1 })],
+    ['symbol key', { ...pending(), [Symbol('tenantId')]: 1 }],
+    ['non-enumerable key', defined(pending(), 'tenantId', 'x')],
+    ['accessor top', accessor(pending(), 'createdAt')],
+    ['accessor resolution', resolved(accessor(positive(), 'restockDays'))],
+    ['accessor snapshot', snapAccessor],
+    ['class instance', new ReceiptClass()],
+    ['inherited object', Object.create(pending())],
+    ['null input', null],
+    ['string input', 'nope'],
+    ['array input', []],
+  ];
+
+  it.each(bad)('rejects a malformed decision (%s)', (_l, value) => {
+    expect(dnorm(value)).toBeNull();
+  });
+
+  it('rejects a missing nullable key but accepts an explicit null', () => {
+    expect(dnorm(pending({ supersedesDecisionId: null }))).not.toBeNull();
+    expect(dnorm(omitted(pending(), 'supersedesDecisionId'))).toBeNull();
+    expect(dnorm(pending({}, { variantId: null, sku: null }))).not.toBeNull();
+    expect(dnorm(pending({}, { sku: undefined }))).toBeNull();
+    expect(dnorm({ ...pending(), supersedesDecisionId: undefined })).toBeNull();
+  });
+
+  it('requires the stock pair to be both null or both set', () => {
+    const bothNull = pending(
+      {},
+      { observedStockAtRequest: null, stockObservedAt: null },
+    );
+    expect(dnorm(bothNull)).not.toBeNull();
+    expect(dnorm(pending({}, { observedStockAtRequest: null }))).toBeNull();
+    expect(dnorm(pending({}, { stockObservedAt: null }))).toBeNull();
+  });
+
+  it('fails closed on hostile getters and proxies', () => {
+    const getter = pending();
+    Object.defineProperty(getter, 'createdAt', { enumerable: true, get: boom });
+    expect(dnorm(getter)).toBeNull();
+    const spoof = new Proxy(pending(), {
+      get: (t, k) => (k === 'id' ? U.variant : t[String(k)]),
+    });
+    expect(dnorm(spoof)).toBeNull();
+    expect(dnorm(throwingProxy({}, 'ownKeys'))).toBeNull();
+    expect(dnorm(throwingProxy(pending(), 'get'))).toBeNull();
   });
 });

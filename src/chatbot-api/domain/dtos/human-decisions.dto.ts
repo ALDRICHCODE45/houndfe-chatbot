@@ -325,3 +325,182 @@ export function normalizeRestockIntakeReceipt(
     return null;
   }
 }
+
+/** Current GET poll projection (backend 1188206): discriminated `PENDING`
+ * (version 1, null `resolution`/`applyBefore`) or `RESOLVED` (version 2, one
+ * exact typed resolution and `applyBefore = resolvedAt + 1h`). Only the GET
+ * carries current state; the immutable POST receipt never does. */
+export type RestockResolution =
+  | {
+      action: 'PROVIDE_RESTOCK_ESTIMATE';
+      restockDays: number;
+      resolvedAt: string;
+    }
+  | { action: 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE'; resolvedAt: string };
+
+export interface RestockDecisionBase {
+  id: string;
+  sourceRequestId: string;
+  type: 'RESTOCK';
+  createdAt: string;
+  snapshot: RestockIntakeReceiptSnapshot;
+  supersedesDecisionId: string | null;
+}
+
+export type RestockDecisionPending = RestockDecisionBase & {
+  status: 'PENDING';
+  version: 1;
+  resolution: null;
+  applyBefore: null;
+};
+
+export type RestockDecisionResolved = RestockDecisionBase & {
+  status: 'RESOLVED';
+  version: 2;
+  resolution: RestockResolution;
+  applyBefore: string;
+};
+
+export type RestockDecision = RestockDecisionPending | RestockDecisionResolved;
+
+const RESOLUTION_POSITIVE_KEYS = 'action restockDays resolvedAt'.split(' ');
+const RESOLUTION_NEGATIVE_KEYS = 'action resolvedAt'.split(' ');
+
+/** Parse the current GET snapshot: exact nine keys, the same subject fields as
+ * the historical receipt, plus the both-null-or-both-set stock pair. */
+function normalizeDecisionSnapshot(
+  value: unknown,
+): RestockIntakeReceiptSnapshot | null {
+  const snapshot = asPlainRecord(value);
+  if (snapshot === null || !hasExactKeys(snapshot, SNAPSHOT_KEYS)) return null;
+  const branchId = asUuid(snapshot.branchId);
+  const branchName = asNullableExactString(snapshot.branchName);
+  const productId = asUuid(snapshot.productId);
+  const productName = asNullableExactString(snapshot.productName);
+  const variantId = asNullableUuid(snapshot.variantId);
+  const sku = asNullableExactString(snapshot.sku);
+  const requestedQuantity = asNullableInt(snapshot.requestedQuantity, 1);
+  const observedStockAtRequest = asNullableInt(
+    snapshot.observedStockAtRequest,
+    0,
+  );
+  const stockObservedAt = asNullableInstant(snapshot.stockObservedAt);
+  if (typeof productName !== 'string' || productName.trim() === '') return null;
+  if (productName.length > RESTOCK_MAX_PRODUCT_NAME_LENGTH) return null;
+  if (
+    branchId === null ||
+    branchName === undefined ||
+    productId === null ||
+    variantId === undefined ||
+    sku === undefined ||
+    requestedQuantity === undefined ||
+    observedStockAtRequest === undefined ||
+    stockObservedAt === undefined
+  ) {
+    return null;
+  }
+  if ((observedStockAtRequest === null) !== (stockObservedAt === null)) {
+    return null;
+  }
+  return {
+    branchId,
+    branchName,
+    productId,
+    productName,
+    variantId,
+    sku,
+    requestedQuantity,
+    observedStockAtRequest,
+    stockObservedAt,
+  };
+}
+
+/** Exact discriminated resolution: positive adds a bounded integer
+ * `restockDays`, negative forbids it. No `resolvedBy`/`evidenceCode`. */
+function normalizeRestockResolution(value: unknown): RestockResolution | null {
+  const record = asPlainRecord(value);
+  if (record === null) return null;
+  const resolvedAt = asRequiredInstant(record.resolvedAt);
+  if (resolvedAt === null) return null;
+  if (record.action === 'PROVIDE_RESTOCK_ESTIMATE') {
+    if (!hasExactKeys(record, RESOLUTION_POSITIVE_KEYS)) return null;
+    const restockDays = record.restockDays;
+    if (
+      typeof restockDays !== 'number' ||
+      !Number.isSafeInteger(restockDays) ||
+      restockDays < 1 ||
+      restockDays > 365
+    ) {
+      return null;
+    }
+    return { action: 'PROVIDE_RESTOCK_ESTIMATE', restockDays, resolvedAt };
+  }
+  if (record.action !== 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE') return null;
+  if (!hasExactKeys(record, RESOLUTION_NEGATIVE_KEYS)) return null;
+  return { action: 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE', resolvedAt };
+}
+
+/** Normalize the current GET poll projection: exact ten top-level keys, a
+ * `PENDING`/v1 state with null resolution and applyBefore, or a `RESOLVED`/v2
+ * state whose `applyBefore` is exactly `resolvedAt + 1h`. No HTTP/store/send,
+ * never throws, fails closed. */
+export function normalizeRestockDecision(
+  value: unknown,
+): RestockDecision | null {
+  try {
+    const record = asPlainRecord(value);
+    if (record === null || !hasExactKeys(record, RECEIPT_KEYS)) return null;
+    if (record.type !== 'RESTOCK') return null;
+    const id = asUuid(record.id);
+    const sourceRequestId = asUuid(record.sourceRequestId);
+    const createdAt = asRequiredInstant(record.createdAt);
+    const supersedesDecisionId = asNullableUuid(record.supersedesDecisionId);
+    const snapshot = normalizeDecisionSnapshot(record.snapshot);
+    if (
+      id === null ||
+      sourceRequestId === null ||
+      createdAt === null ||
+      supersedesDecisionId === undefined ||
+      snapshot === null
+    ) {
+      return null;
+    }
+    const base = {
+      id,
+      sourceRequestId,
+      type: 'RESTOCK' as const,
+      createdAt,
+      snapshot,
+      supersedesDecisionId,
+    };
+    if (
+      record.status === 'PENDING' &&
+      record.version === 1 &&
+      record.resolution === null &&
+      record.applyBefore === null
+    ) {
+      return {
+        ...base,
+        status: 'PENDING',
+        version: 1,
+        resolution: null,
+        applyBefore: null,
+      };
+    }
+    if (record.status !== 'RESOLVED' || record.version !== 2) return null;
+    const resolution = normalizeRestockResolution(record.resolution);
+    const applyBefore = asRequiredInstant(record.applyBefore);
+    if (resolution === null || applyBefore === null) return null;
+    const window = Date.parse(resolution.resolvedAt) + 3_600_000;
+    if (Date.parse(applyBefore) !== window) return null;
+    return {
+      ...base,
+      status: 'RESOLVED',
+      version: 2,
+      resolution,
+      applyBefore,
+    };
+  } catch {
+    return null;
+  }
+}
