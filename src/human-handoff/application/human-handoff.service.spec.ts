@@ -420,6 +420,51 @@ describe('HumanHandoffService', () => {
       // No release API: the claim stays ACTIVE and reserve is attempted once.
       expect(reservations.reserve).toHaveBeenCalledTimes(1);
     });
+
+    it('keeps ACTIVE and denies the retry when a send fails after claim', async () => {
+      conversationStore.get.mockResolvedValue(null);
+      store.create.mockImplementation(
+        async (created: CreateHumanHandoffInput) => ({
+          id: created.id,
+          customerId: created.customerId,
+          agentId: created.agentId,
+          kind: created.kind,
+          digest: created.digest,
+          status: 'pending',
+          resolution: null,
+          createdAt: '2026-06-23T12:00:00.000Z',
+          resolvedAt: null,
+        }),
+      );
+      whatsappSender.sendText.mockRejectedValueOnce(new Error('meta down'));
+
+      await expect(
+        service.create({
+          senderId: CUSTOMER,
+          kind: 'out_of_stock',
+          digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+        }),
+      ).rejects.toThrow('meta down');
+      expect(reservations.reserve).toHaveBeenCalledTimes(1);
+
+      // The claim stays ACTIVE, so the retry is denied with no second effect.
+      reservations.reserve.mockResolvedValue({
+        action: 'occupied',
+        reason: 'different_active_key',
+        activeRoute: 'LEGACY_OPS',
+      });
+      const retry = await service.create({
+        senderId: CUSTOMER,
+        kind: 'out_of_stock',
+        digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+      });
+      expect(retry).toEqual({
+        ok: false,
+        error: { kind: 'unavailable', retryable: false },
+      });
+      expect(store.create).toHaveBeenCalledTimes(1);
+      expect(whatsappSender.sendText).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('resolveReply', () => {
@@ -839,6 +884,53 @@ describe('HumanHandoffService', () => {
         service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
       ).rejects.toThrow('close failed');
       expect(reservations.closeLegacyResolved).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows a repeated handoff only after the terminal close', async () => {
+      store.findByRef.mockResolvedValue(baseRequest);
+      store.resolve.mockImplementation(async (id, resolution) => ({
+        ...baseRequest,
+        id,
+        status: 'resolved',
+        resolution,
+        resolvedAt: '2026-06-23T12:05:00.000Z',
+      }));
+      conversationStore.get.mockResolvedValueOnce(
+        customerStateFor(CUSTOMER, pendingMarker),
+      );
+
+      await service.resolveReply({
+        text: `HF-${REF_ID} NO_RESTOCK`,
+        from: OPS,
+      });
+      expect(reservations.closeLegacyResolved).toHaveBeenCalledWith(
+        CUSTOMER,
+        REF_ID,
+      );
+
+      conversationStore.get.mockResolvedValue(null);
+      store.create.mockImplementation(
+        async (created: CreateHumanHandoffInput) => ({
+          id: created.id,
+          customerId: created.customerId,
+          agentId: created.agentId,
+          kind: created.kind,
+          digest: created.digest,
+          status: 'pending',
+          resolution: null,
+          createdAt: '2026-06-23T12:10:00.000Z',
+          resolvedAt: null,
+        }),
+      );
+
+      const second = await service.create({
+        senderId: CUSTOMER,
+        kind: 'out_of_stock',
+        digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+      });
+
+      expect(second.ok).toBe(true);
+      expect(reservations.reserve).toHaveBeenCalledTimes(1);
     });
 
     it('reads humanHandoff block from ConfigService (not process.env)', async () => {
