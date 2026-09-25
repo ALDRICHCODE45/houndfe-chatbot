@@ -17,10 +17,47 @@ export interface RestockIntakeInput {
   supersedesDecisionId: string | null;
 }
 
+/** Immutable historical POST receipt projection (contract v1 addenda): the
+ * first `201` and an exact `200` replay, even after a human resolution, always
+ * carry `PENDING`, version 1, `resolution:null` and `applyBefore:null`. Current
+ * state comes only from the GET poll, never from this receipt. */
+export interface RestockIntakeReceiptSnapshot {
+  branchId: string;
+  branchName: string | null;
+  productId: string;
+  productName: string;
+  variantId: string | null;
+  sku: string | null;
+  requestedQuantity: number | null;
+  observedStockAtRequest: number | null;
+  stockObservedAt: string | null;
+}
+
+export interface RestockIntakeReceipt {
+  id: string;
+  sourceRequestId: string;
+  type: 'RESTOCK';
+  status: 'PENDING';
+  version: 1;
+  createdAt: string;
+  snapshot: RestockIntakeReceiptSnapshot;
+  supersedesDecisionId: string | null;
+  resolution: null;
+  applyBefore: null;
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const INSTANT = z.iso.datetime({ offset: true });
 const INTAKE_KEYS =
   'sourceRequestId type productId productName variantId sku requestedQuantity observedStockAtRequest stockObservedAt supersedesDecisionId'.split(
+    ' ',
+  );
+const RECEIPT_KEYS =
+  'id sourceRequestId type status version createdAt snapshot supersedesDecisionId resolution applyBefore'.split(
+    ' ',
+  );
+const SNAPSHOT_KEYS =
+  'branchId branchName productId productName variantId sku requestedQuantity observedStockAtRequest stockObservedAt'.split(
     ' ',
   );
 
@@ -54,6 +91,12 @@ function hasOnlyKeys(
     (key) => typeof key === 'string' && allowed.includes(key),
   );
 }
+/** Exact key set: every declared key present, none `undefined`, no extras. */
+function hasExactKeys(r: Record<string, unknown>, keys: string[]): boolean {
+  const own = Reflect.ownKeys(r);
+  if (own.length !== keys.length) return false;
+  return hasOnlyKeys(r, keys) && keys.every((k) => r[k] !== undefined);
+}
 function asUuid(value: unknown): string | null {
   return typeof value === 'string' && UUID.test(value) ? value : null;
 }
@@ -80,6 +123,21 @@ function asNullableInstant(value: unknown): Tri<string> {
   const epoch = Date.parse(value);
   return Number.isFinite(epoch) ? new Date(epoch).toISOString() : undefined;
 }
+/** Required UTC instant: canonical ISO or `null` when absent/invalid. */
+function asRequiredInstant(value: unknown): string | null {
+  const instant = asNullableInstant(value);
+  return typeof instant === 'string' ? instant : null;
+}
+/** UUID identity compares case-insensitively; echoed bytes stay as received. */
+function sameUuid(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+function sameNullableUuid(left: Tri<string>, right: string | null): boolean {
+  if (left === undefined || left === null || right === null) {
+    return left === right;
+  }
+  return sameUuid(left, right);
+}
 function hasControl(value: string): boolean {
   for (const char of value) {
     const code = char.codePointAt(0) ?? 0;
@@ -94,6 +152,12 @@ function asNullableTrimmed(value: unknown): Tri<string> {
   if (hasControl(normalized)) return undefined;
   const trimmed = normalized.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+/** Preserve an exact backend string or `null`; never NFC/trim/blank-fold. */
+function asNullableExactString(value: unknown): Tri<string> {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || hasControl(value)) return undefined;
+  return value;
 }
 /** NFC first, reject C0/C1, then trim + collapse; `null` when invalid. */
 function sanitizeProductName(value: unknown): string | null {
@@ -157,6 +221,105 @@ export function normalizeRestockIntake(
       observedStockAtRequest,
       stockObservedAt,
       supersedesDecisionId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Normalize the backend-confirmed immutable RESTOCK intake receipt (201/200)
+ * against `sent`; requires exact receipt and snapshot keys, rejects a
+ * non-historical or non-binding shape, returns validated backend fields. */
+export function normalizeRestockIntakeReceipt(
+  value: unknown,
+  sent: RestockIntakeInput,
+): RestockIntakeReceipt | null {
+  try {
+    const record = asPlainRecord(value);
+    if (record === null || !hasExactKeys(record, RECEIPT_KEYS)) return null;
+    const snapshot = asPlainRecord(record.snapshot);
+    if (snapshot === null || !hasExactKeys(snapshot, SNAPSHOT_KEYS)) {
+      return null;
+    }
+
+    if (
+      record.type !== 'RESTOCK' ||
+      record.status !== 'PENDING' ||
+      record.version !== 1 ||
+      record.resolution !== null ||
+      record.applyBefore !== null
+    ) {
+      return null;
+    }
+
+    const id = asUuid(record.id);
+    const sourceRequestId = asUuid(record.sourceRequestId);
+    const createdAt = asRequiredInstant(record.createdAt);
+    const branchId = asUuid(snapshot.branchId);
+    const branchName = asNullableExactString(snapshot.branchName);
+    const productId = asUuid(snapshot.productId);
+    const variantId = asNullableUuid(snapshot.variantId);
+    const sku = asNullableExactString(snapshot.sku);
+    const requestedQuantity = asNullableInt(snapshot.requestedQuantity, 1);
+    const observedStockAtRequest = asNullableInt(
+      snapshot.observedStockAtRequest,
+      0,
+    );
+    const stockObservedAt = asNullableInstant(snapshot.stockObservedAt);
+    const supersedesDecisionId = asNullableUuid(record.supersedesDecisionId);
+    if (
+      id === null ||
+      sourceRequestId === null ||
+      createdAt === null ||
+      branchId === null ||
+      branchName === undefined ||
+      productId === null ||
+      variantId === undefined ||
+      sku === undefined ||
+      requestedQuantity === undefined ||
+      observedStockAtRequest === undefined ||
+      stockObservedAt === undefined ||
+      supersedesDecisionId === undefined
+    ) {
+      return null;
+    }
+
+    // Bind receipt identity and snapshot subject to the normalized intake.
+    if (
+      !sameUuid(sourceRequestId, sent.sourceRequestId) ||
+      !sameUuid(productId, sent.productId) ||
+      snapshot.productName !== sent.productName ||
+      !sameNullableUuid(variantId, sent.variantId) ||
+      sku !== sent.sku ||
+      requestedQuantity !== sent.requestedQuantity ||
+      observedStockAtRequest !== sent.observedStockAtRequest ||
+      stockObservedAt !== sent.stockObservedAt ||
+      !sameNullableUuid(supersedesDecisionId, sent.supersedesDecisionId)
+    ) {
+      return null;
+    }
+
+    return {
+      id,
+      sourceRequestId,
+      type: 'RESTOCK',
+      status: 'PENDING',
+      version: 1,
+      createdAt,
+      snapshot: {
+        branchId,
+        branchName,
+        productId,
+        productName: sent.productName,
+        variantId,
+        sku,
+        requestedQuantity,
+        observedStockAtRequest,
+        stockObservedAt,
+      },
+      supersedesDecisionId,
+      resolution: null,
+      applyBefore: null,
     };
   } catch {
     return null;
