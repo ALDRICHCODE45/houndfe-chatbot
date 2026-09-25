@@ -1,5 +1,4 @@
 import {
-  type ConversationState,
   type ConversationStore,
   type PendingHumanRequest,
   readPendingHumanRequest,
@@ -29,31 +28,23 @@ export { readPendingHumanRequest };
 /**
  * Durable write: SET `data.pendingHumanRequest = marker` while preserving
  * every other `data` key (NOTABLY `cart`, `placedSaleId`, `messages`) via
- * a shallow spread.
+ * the atomic first-contact CAS primitive `ConversationStore.setPendingHumanRequest`.
  *
  * The marker is the customer's "we're already escalated" signal — the
  * runner short-circuits on this and the dispatcher suppresses duplicate
  * agent sends. The helper is the ONLY writer for this field.
  *
  * The marker is set with `pendingHumanRequest: <marker>` (NOT `null`) per
- * spec; `clearPendingHumanRequest` is the explicit null-er.
- *
- * `lastMessageAt` is supplied by the caller so the runner's idle-reset
- * path and the service's `create` flow both have a single source of
- * truth for the timestamp.
+ * spec; `clearPendingHumanRequest` is the explicit null-er. Returns true only
+ * when the CAS set succeeded (a different/corrupt active marker returns false).
  */
-export async function setPendingHumanRequest(
+export function setPendingHumanRequest(
   store: ConversationStore,
   senderId: string,
-  state: ConversationState | null,
   marker: PendingHumanRequest,
   lastMessageAt: string,
-): Promise<ConversationState> {
-  const data = {
-    ...(state?.data ?? {}),
-    pendingHumanRequest: marker,
-  };
-  return store.update(senderId, { lastMessageAt, data });
+): Promise<boolean> {
+  return store.setPendingHumanRequest(senderId, marker, lastMessageAt);
 }
 
 /**
@@ -61,16 +52,15 @@ export async function setPendingHumanRequest(
  * other `data` key. Mirrors `clearPlacedSaleId` style — explicit null
  * so `readPendingHumanRequest` returns `null` deterministically.
  *
- * `lastMessageAt` is preserved from `state` when available; otherwise
- * the helper falls back to a fresh ISO timestamp (mirrors
- * `persistCart` / `clearPlacedSaleId`).
+ * Delegates to the CAS primitive `ConversationStore.clearPendingHumanRequest`:
+ * it clears only when the stored marker's `requestId` matches, so a false
+ * result (missing row, wrong id, or malformed marker) lets the caller fail closed.
  */
-export async function clearPendingHumanRequest(
+export function clearPendingHumanRequest(
   store: ConversationStore,
   senderId: string,
-  state: ConversationState | null,
-): Promise<ConversationState> {
-  const lastMessageAt = state?.lastMessageAt ?? new Date().toISOString();
-  const data = { ...(state?.data ?? {}), pendingHumanRequest: null };
-  return store.update(senderId, { lastMessageAt, data });
+  requestId: string,
+  lastMessageAt: string,
+): Promise<boolean> {
+  return store.clearPendingHumanRequest(senderId, requestId, lastMessageAt);
 }

@@ -12,10 +12,10 @@ import {
  * Contract tests for the pendingHumanRequest persistence helpers.
  *
  * Spec scenarios (human-handoff §"pendingHumanRequest marker semantics"):
- *   - setPendingHumanRequest issues exactly one store.update with
- *     shallow-spread data carrying the marker + lastMessageAt.
- *   - clearPendingHumanRequest issues exactly one store.update with
- *     pendingHumanRequest=null; sibling keys are preserved.
+ *   - setPendingHumanRequest delegates to the CAS primitive
+ *     (ConversationStore.setPendingHumanRequest) and returns its boolean.
+ *   - clearPendingHumanRequest delegates to the CAS primitive with the
+ *     matching requestId and returns its boolean (no legacy update()).
  *   - readPendingHumanRequest is a pure helper; returns the typed object
  *     when structurally valid, null otherwise, and does NOT mutate input.
  */
@@ -56,32 +56,7 @@ describe('pending-human-request-persistence', () => {
   }
 
   describe('setPendingHumanRequest', () => {
-    it('issues exactly one store.update carrying the marker + lastMessageAt', async () => {
-      const { store, existing } = buildStore();
-      const marker = {
-        requestId: 'abc123def456',
-        ref: 'HF-abc123def456',
-        createdAt: now,
-        customerNotifiedAt: now,
-      };
-
-      await setPendingHumanRequest(store, 'S', existing, marker, now);
-
-      expect(store.update).toHaveBeenCalledTimes(1);
-      const [senderId, patch] = store.update.mock.calls[0];
-      expect(senderId).toBe('S');
-      expect(patch).toMatchObject({
-        lastMessageAt: now,
-        data: {
-          messages: existing.data.messages,
-          cart: existing.data.cart,
-          placedSaleId: existing.data.placedSaleId,
-          pendingHumanRequest: marker,
-        },
-      });
-    });
-
-    it('handles a missing prior state by spreading an empty data bag', async () => {
+    it('issues exactly one CAS set carrying the marker + lastMessageAt', async () => {
       const { store } = buildStore();
       const marker = {
         requestId: 'abc123def456',
@@ -90,19 +65,39 @@ describe('pending-human-request-persistence', () => {
         customerNotifiedAt: now,
       };
 
-      await setPendingHumanRequest(store, 'S', null, marker, now);
+      store.setPendingHumanRequest.mockResolvedValue(true);
+      await expect(
+        setPendingHumanRequest(store, 'S', marker, now),
+      ).resolves.toBe(true);
 
-      expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch] = store.update.mock.calls[0];
-      expect(patch).toMatchObject({
-        lastMessageAt: now,
-        data: { pendingHumanRequest: marker },
-      });
+      expect(store.setPendingHumanRequest).toHaveBeenCalledWith(
+        'S',
+        marker,
+        now,
+      );
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    it('propagates a false CAS result without a legacy update()', async () => {
+      const { store } = buildStore();
+      const marker = {
+        requestId: 'abc123def456',
+        ref: 'HF-abc123def456',
+        createdAt: now,
+        customerNotifiedAt: now,
+      };
+
+      store.setPendingHumanRequest.mockResolvedValue(false);
+      await expect(
+        setPendingHumanRequest(store, 'S', marker, now),
+      ).resolves.toBe(false);
+
+      expect(store.update).not.toHaveBeenCalled();
     });
   });
 
   describe('clearPendingHumanRequest', () => {
-    it('issues exactly one store.update with pendingHumanRequest=null and preserves siblings', async () => {
+    it('delegates the matching requestId to the CAS primitive', async () => {
       const { store, existing } = buildStore();
       const withMarker: ConversationState = {
         ...existing,
@@ -115,19 +110,17 @@ describe('pending-human-request-persistence', () => {
         customerNotifiedAt: now,
       };
 
-      await clearPendingHumanRequest(store, 'S', withMarker);
+      store.clearPendingHumanRequest.mockResolvedValue(true);
+      await expect(
+        clearPendingHumanRequest(store, 'S', 'abc123def456', now),
+      ).resolves.toBe(true);
 
-      expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch] = store.update.mock.calls[0];
-      expect(patch).toMatchObject({
-        lastMessageAt: existing.lastMessageAt,
-        data: {
-          messages: existing.data.messages,
-          cart: existing.data.cart,
-          placedSaleId: existing.data.placedSaleId,
-          pendingHumanRequest: null,
-        },
-      });
+      expect(store.clearPendingHumanRequest).toHaveBeenCalledWith(
+        'S',
+        'abc123def456',
+        now,
+      );
+      expect(store.update).not.toHaveBeenCalled();
     });
   });
 

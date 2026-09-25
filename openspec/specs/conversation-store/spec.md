@@ -17,7 +17,7 @@ binding swaps.
 ### Requirement: Manage conversation state by sender id
 
 The system MUST provide a conversation store port that can create, read, and update conversation state by WhatsApp sender id.
-The runtime MUST bind exactly one adapter through the `CONVERSATION_STORE` token that honors the port contract: `update` MUST be UPSERT (when no record exists, the adapter creates one with the supplied patch and returns it; when a record exists, the patch is shallow-merged over it with the `data` field REPLACED as a whole object — no JSONB deep merge at the storage layer), `get` MUST return `null` when no record exists, and the sender id MUST be preserved on every returned record.
+The runtime MUST bind exactly one adapter through the `CONVERSATION_STORE` token that honors the port contract: `update` MUST be UPSERT (when no record exists, the adapter creates one with the supplied patch and returns it; when a record exists, the patch is shallow-merged over it with the `data` field REPLACED as a whole object except the CAS-owned `receiptAmountPointer` and `pendingHumanRequest` keys — no JSONB deep merge at the storage layer), `get` MUST return `null` when no record exists, and the sender id MUST be preserved on every returned record.
 The bound adapter MAY be in-memory (valid for unit tests) or durable (Postgres — the runtime default). Both adapters MUST satisfy the contract byte-identically.
 (Previously: `The slice MUST use an in-memory implementation only.` — the in-memory-only restriction has been relaxed; durable Postgres is now the runtime default while the in-memory adapter remains a valid test-time binding.)
 
@@ -54,9 +54,9 @@ When the field is absent on read or write, the adapter MUST treat it as `[]` (ba
 
 The slice MAY add additional optional typed convenience fields to `ConversationStateData`
 without a migration, so long as (a) the adapter continues to REPLACE `data` as a whole on
-`update`, (b) the new fields live under named keys (no top-level state shape change), and
-(c) every reader that needs the field uses a pure helper that returns `null` when the key
-is missing.
+`update` for ordinary keys, except the CAS-owned `pendingHumanRequest` carve-out, (b) the
+new fields live under named keys (no top-level state shape change), and (c) every reader
+that needs the field uses a pure helper that returns `null` when the key is missing.
 
 (Previously: only `messages`, `cart`, and `placedSaleId` were listed as canonical
 convenience fields; today `pendingHumanRequest` joins them as a fourth named key.)
@@ -80,8 +80,10 @@ convenience fields; today `pendingHumanRequest` joins them as a fourth named key
     ref: 'HF-abc123def456', createdAt: '2026-09-01T00:00:00.000Z',
     customerNotifiedAt: '2026-09-01T00:00:01.000Z' } }`
 - WHEN the runner performs
-  `update(S, { lastMessageAt: T2, data: { messages: [m1, m2, m3], pendingHumanRequest: <preserved> } })`
+  `update(S, { lastMessageAt: T2, data: { messages: [m1, m2, m3] } })` (no marker in the
+  patch, or a stale/different marker value)
 - THEN a subsequent `get(S).data.pendingHumanRequest` MUST deep-equal the prior value
+  (the stale patch value MUST be stripped and the LIVE marker re-applied)
 - AND a subsequent `readPendingHumanRequest(state(S))` MUST return that value (not `null`).
 
 ### Requirement: Conversation state survives process restart
@@ -97,7 +99,7 @@ The durable adapter MUST persist every committed `create` and `update` so that a
 
 ### Requirement: Adapter honors UPSERT semantics on update
 
-Every adapter bound to `CONVERSATION_STORE` MUST satisfy the port's documented UPSERT semantics byte-identically. `get` MUST return `null` when no record exists. `update` MUST create a record from the patch when none exists and MUST shallow-merge the patch over the existing record otherwise; the patch's `data` field REPLACES the prior `data` object as a whole (no JSONB deep merge at the storage layer).
+Every adapter bound to `CONVERSATION_STORE` MUST satisfy the port's documented UPSERT semantics byte-identically. `get` MUST return `null` when no record exists. `update` MUST create a record from the patch when none exists and MUST shallow-merge the patch over the existing record otherwise; the patch's `data` field REPLACES the prior `data` object as a whole except for the CAS-owned `receiptAmountPointer` and `pendingHumanRequest` keys (no JSONB deep merge at the storage layer).
 
 #### Scenario: update() with no prior record creates and returns
 
@@ -211,10 +213,11 @@ PendingHumanRequest = {
 }
 ```
 
-A missing key MUST read as `null`. The field MUST NOT alter the UPSERT semantics: the
-adapter still REPLACES `data` as a whole on `update`. Callers that need to preserve the
-marker through a data-replacing write MUST read the marker first and re-include it in the
-patch.
+A missing key MUST read as `null`. The adapter MUST treat `pendingHumanRequest` as a
+CAS-owned carve-out of the ordinary `data`-REPLACE `update` semantics, exactly like the
+sibling `receiptAmountPointer` carve-out: every patch value for that key is stripped and the
+LIVE stored value (including explicit JSON null) is re-applied under the row lock. Callers
+no longer need to read and re-include the marker through a data-replacing write.
 
 #### Scenario: typed field is present and optional
 
@@ -229,11 +232,13 @@ patch.
 - WHEN `readPendingHumanRequest(state)` is called
 - THEN the result MUST equal `null` (no default fabrication, no validation error).
 
-#### Scenario: explicit null clears the marker
+#### Scenario: CAS clear stores explicit null
 
 - GIVEN a sender S whose `pendingHumanRequest` is currently set
-- WHEN a write carries `data: { ..., pendingHumanRequest: null }`
-- THEN a subsequent `readPendingHumanRequest(state(S))` MUST equal `null`.
+- WHEN `clearPendingHumanRequest(S, requestId, lastMessageAt)` succeeds for that marker
+- THEN the stored key MUST be explicit JSON null
+- AND a subsequent `readPendingHumanRequest(state(S))` MUST equal `null`.
+- A plain `update` patch carrying `pendingHumanRequest: null` MUST NOT clear a live marker.
 
 ### Requirement: readPendingHumanRequest is a pure helper
 
@@ -276,9 +281,8 @@ loaded state (after the existing idle check) so the marker is always current.
 
 The `AgentRunner` idle-reset path (see the `llm-agent` delta) MUST preserve the
 `pendingHumanRequest` marker across the existing `LLM_IDLE_TIMEOUT_MS` reset. The
-reset path's UPSERT MUST carry `pendingHumanRequest` equal to the value freshly read from
-the durable state (which itself carries the marker because `service.create(...)` already
-wrote it on a prior turn), so the marker is preserved byte-identically.
+adapter's UPSERT MUST preserve the live marker under the row lock even if the runner's
+patch contains a stale marker or omits it; the marker is preserved byte-identically.
 
 #### Scenario: idle reset preserves the marker
 

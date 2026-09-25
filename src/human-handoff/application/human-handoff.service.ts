@@ -192,15 +192,13 @@ export class HumanHandoffService {
       text: renderDigest(request),
     });
 
-    await this.whatsappSender.sendText({
-      to: input.senderId,
-      text: UNDER_REVIEW_NOTICE,
-    });
-
-    await setPendingHumanRequest(
+    // CAS the marker BEFORE the customer notice: an ops-send failure must
+    // not strand a marker, and a CAS conflict must not promise the customer
+    // a human we did not reserve. On conflict the ops digest may already be
+    // out (the caller must reconcile); we do not notify or report success.
+    const markerSet = await setPendingHumanRequest(
       this.conversationStore,
       input.senderId,
-      state,
       {
         requestId: id,
         ref,
@@ -209,6 +207,14 @@ export class HumanHandoffService {
       },
       nowIso,
     );
+    if (!markerSet) {
+      return { ok: false, error: { kind: 'unavailable', retryable: false } };
+    }
+
+    await this.whatsappSender.sendText({
+      to: input.senderId,
+      text: UNDER_REVIEW_NOTICE,
+    });
 
     return { ok: true, requestId: id, ref, customerNotified: true };
   }
@@ -245,20 +251,13 @@ export class HumanHandoffService {
     }
 
     const customerState = await this.conversationStore.get(target.customerId);
-    await clearPendingHumanRequest(
+    const cleared = await clearPendingHumanRequest(
       this.conversationStore,
       target.customerId,
-      customerState,
+      target.id,
+      customerState?.lastMessageAt ?? new Date().toISOString(),
     );
-
-    // W2: this fresh read narrows the window but does NOT prove CAS against a
-    // concurrent marker re-write landing after the check; a lost update remains
-    // possible. Only a compare-and-set marker store would close that gap.
-    const verifiedState = await this.conversationStore.get(target.customerId);
-    if (
-      verifiedState === null ||
-      verifiedState.data.pendingHumanRequest !== null
-    ) {
+    if (!cleared) {
       throw new Error('human handoff marker was not cleared');
     }
 

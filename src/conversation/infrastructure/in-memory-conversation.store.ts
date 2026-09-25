@@ -167,6 +167,9 @@ export class InMemoryConversationStore implements ConversationStore {
     const existing = this.map.get(senderId);
     const data = { ...(patch.data ?? {}) };
     delete data.receiptAmountPointer;
+    // The handoff marker is CAS-owned; strip any stale patch value and
+    // reapply the LIVE one (including explicit JSON null) below.
+    delete data.pendingHumanRequest;
     const safePatch = Object.hasOwn(patch, 'data') ? { ...patch, data } : patch;
     const merged = existing
       ? { ...existing, ...safePatch }
@@ -185,6 +188,9 @@ export class InMemoryConversationStore implements ConversationStore {
         ...(merged.data ?? {}),
         ...(existing && Object.hasOwn(existing.data, 'receiptAmountPointer')
           ? { receiptAmountPointer: existing.data.receiptAmountPointer }
+          : {}),
+        ...(existing && Object.hasOwn(existing.data, 'pendingHumanRequest')
+          ? { pendingHumanRequest: existing.data.pendingHumanRequest }
           : {}),
       },
     };

@@ -214,9 +214,13 @@ the following steps in order:
 4. `store.create({ id, customerId: senderId, agentId: opsChannelPhone, kind, digest })`.
 5. `whatsappSender.sendText({ to: opsChannelPhone, text: renderDigest(request) })` — text-only,
    `recipient_type: 'individual'`, no media.
-6. `whatsappSender.sendText({ to: senderId, text: UNDER_REVIEW_NOTICE })` — the literal
-   one-shot customer notice.
-7. `setPendingHumanRequest(store, senderId, state, { requestId: id, ref, createdAt, customerNotifiedAt })`.
+6. **Atomic marker CAS**: `store.setPendingHumanRequest(senderId, { requestId: id, ref,
+   createdAt, customerNotifiedAt }, lastMessageAt)`. If it returns `false` (a
+   different/corrupt active marker), MUST NOT send the customer notice and MUST NOT return
+   success; return `{ ok: false, error: { kind: 'unavailable', retryable: false } }`. The
+   step-5 ops digest may already be sent, so the caller must reconcile.
+7. `whatsappSender.sendText({ to: senderId, text: UNDER_REVIEW_NOTICE })` — the literal
+   one-shot customer notice, sent only AFTER the step-6 CAS succeeds.
 8. Return `{ ok: true, requestId: id, ref, customerNotified: true }`.
 
 The `UNDER_REVIEW_NOTICE` literal MUST equal exactly:
@@ -306,7 +310,9 @@ The system MUST provide `HumanHandoffService.resolveReply({ text, from })` that 
    - `EXPIRATION[: ]?<text>` → `{ decision: 'EXPIRATION', text }`
    - bare prose → `{ decision: 'GENERIC', text }` (the full stripped remainder).
 5. `store.resolve(target.id, resolution)`.
-6. `clearPendingHumanRequest(store, target.customerId)`.
+6. **Atomic marker clear**: `store.clearPendingHumanRequest(target.customerId, target.id,
+   lastMessageAt)` clears only the matching `target.requestId` to explicit JSON null. A
+   `false` result MUST fail closed (throw) and MUST NOT close the reservation.
 7. Return
    `{ kind: 'resolved', customerId: target.customerId, ref: target.ref, resolution,
      syntheticUserText: formatResolutionAsUserTurn(target, resolution) }`.
@@ -465,8 +471,9 @@ directly.
 The `pendingHumanRequest` field on `ConversationStateData` MUST follow this lifecycle:
 
 1. **SET**: `service.create(...)` success persists the marker on the customer's
-   `ConversationState.data` in a durable write (`ConversationStore.update(...)`) carrying
-   `{ requestId, ref, createdAt, customerNotifiedAt }`.
+   `ConversationState.data` via the first-contact-safe CAS
+   `ConversationStore.setPendingHumanRequest(senderId, { requestId, ref, createdAt,
+   customerNotifiedAt }, lastMessageAt)` — NOT `ConversationStore.update(...)`.
 2. **READ (pure helper)**: `readPendingHumanRequest(state)` returns the marker or `null`
    when missing — no validation error, no default fabrication.
 3. **CLEAR**: `service.resolveReply(...)` success clears the marker to `null` on the

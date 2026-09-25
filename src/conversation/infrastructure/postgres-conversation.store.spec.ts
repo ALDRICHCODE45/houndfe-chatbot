@@ -81,11 +81,11 @@ describe('PostgresConversationStore receipt amount pointer SQL', () => {
     },
   );
 
-  it('preserves the live receipt pointer during a stale update', async () => {
+  it('preserves live receipt + marker carve-outs during a stale update', async () => {
     const row = {
       sender_id: 'sender-a',
       last_message_at: new Date(),
-      data: { receiptAmountPointer: pointer },
+      data: { receiptAmountPointer: pointer, pendingHumanRequest: null },
     };
     const pool = new FakePool([{ rows: [row] }, { rows: [row] }]);
     const store = new PostgresConversationStore(pool as unknown as Pool);
@@ -95,7 +95,11 @@ describe('PostgresConversationStore receipt amount pointer SQL', () => {
     const sql = pool.calls[1].sql;
     expect(sql).toMatch(/ON CONFLICT[\s\S]*EXCLUDED\.data/i);
     expect(sql).toMatch(/-\s*'receiptAmountPointer'/);
-    expect(sql).toMatch(/conversation_state\.data/);
+    expect(sql).toMatch(
+      /\|\|\s*CASE\s+WHEN\s+conversation_state\.data\s*\?\s*'pendingHumanRequest'/i,
+    );
+    expect(sql).toMatch(/jsonb_build_object\(\s*'pendingHumanRequest'/i);
+    expect(sql).toMatch(/ELSE\s+'\{\}'::jsonb/i);
     expect(sql).toMatch(/jsonb_set\s*\(/i);
   });
 });

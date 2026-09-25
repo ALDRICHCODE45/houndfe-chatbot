@@ -19,7 +19,6 @@ import {
   ASK_FOR_REF,
   HumanHandoffService,
 } from './human-handoff.service';
-import { setPendingHumanRequest } from './pending-human-request-persistence';
 
 /**
  * Contract tests for HumanHandoffService.
@@ -75,6 +74,9 @@ describe('HumanHandoffService', () => {
       setReceiptAmountPointer: jest.fn(),
       clearReceiptAmountPointer: jest.fn(),
     };
+    // CAS primitives default to success; per-test overrides flip them.
+    conversationStore.setPendingHumanRequest.mockResolvedValue(true);
+    conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
 
     configService = {
       get: (key: string) => {
@@ -209,21 +211,23 @@ describe('HumanHandoffService', () => {
       expect(customerCall).toBeDefined();
       expect(customerCall![0].text).toBe(UNDER_REVIEW_NOTICE);
 
-      expect(conversationStore.update).toHaveBeenCalledTimes(1);
-      const [senderId, patch] = conversationStore.update.mock.calls[0];
-      expect(senderId).toBe(CUSTOMER);
-      expect(patch).toMatchObject({
-        lastMessageAt: now,
-        data: {
-          cart: prior.data.cart,
-          pendingHumanRequest: {
-            requestId: created.id,
-            ref: `HF-${created.id}`,
-            createdAt: now,
-            customerNotifiedAt: now,
-          },
-        },
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(conversationStore.setPendingHumanRequest).toHaveBeenCalledTimes(1);
+      const [markerSender, marker, markerTs] =
+        conversationStore.setPendingHumanRequest.mock.calls[0];
+      expect(markerSender).toBe(CUSTOMER);
+      expect(marker).toEqual({
+        requestId: created.id,
+        ref: `HF-${created.id}`,
+        createdAt: now,
+        customerNotifiedAt: now,
       });
+      expect(markerTs).toBe(now);
+      // The ops digest MUST precede the CAS set, the CAS set the notice.
+      expect(whatsappSender.sendText.mock.calls.map((c) => c[0].to)).toEqual([
+        OPS,
+        CUSTOMER,
+      ]);
 
       expect(result).toEqual({
         ok: true,
@@ -467,6 +471,32 @@ describe('HumanHandoffService', () => {
       expect(store.create).toHaveBeenCalledTimes(1);
       expect(whatsappSender.sendText).toHaveBeenCalledTimes(1);
     });
+
+    it('fails closed without a customer notice when the marker CAS conflicts', async () => {
+      conversationStore.get.mockResolvedValue(null);
+      conversationStore.setPendingHumanRequest.mockResolvedValue(false);
+      store.create.mockResolvedValue({
+        id: 'x',
+        kind: 'out_of_stock',
+        digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+      } as unknown as HumanHandoffRequest);
+
+      const result = await service.create({
+        senderId: CUSTOMER,
+        kind: 'out_of_stock',
+        digest: { kind: 'out_of_stock', productId: 'p', name: 'X' },
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: 'unavailable', retryable: false },
+      });
+      expect(conversationStore.setPendingHumanRequest).toHaveBeenCalledTimes(1);
+      // Ops digest may already be out; the customer was never notified.
+      expect(whatsappSender.sendText.mock.calls.map((c) => c[0].to)).toEqual([
+        OPS,
+      ]);
+    });
   });
 
   describe('resolveReply', () => {
@@ -479,7 +509,7 @@ describe('HumanHandoffService', () => {
       data: { pendingHumanRequest: marker },
     });
 
-    // The fresh post-clear re-read must default to a marker-free state.
+    // Pre-clear read supplies `lastMessageAt` to the CAS clear.
     beforeEach(() => {
       conversationStore.get.mockResolvedValue(customerStateFor(CUSTOMER));
     });
@@ -535,7 +565,11 @@ describe('HumanHandoffService', () => {
         decision: 'YES_RESTOCK_IN_X_DAYS',
         days: 3,
       });
-      expect(conversationStore.update).toHaveBeenCalledTimes(1);
+      expect(conversationStore.clearPendingHumanRequest).toHaveBeenCalledWith(
+        CUSTOMER,
+        REF_ID,
+        '2026-06-23T12:00:00.000Z',
+      );
       expect(result.kind).toBe('resolved');
       if (result.kind === 'resolved') {
         expect(result.customerId).toBe(CUSTOMER);
@@ -726,7 +760,7 @@ describe('HumanHandoffService', () => {
       });
     });
 
-    it('closes the legacy reservation only after resolve + clear + fresh verify', async () => {
+    it('closes the legacy reservation only after resolve + CAS clear', async () => {
       const order: string[] = [];
       store.findByRef.mockResolvedValue(baseRequest);
       store.resolve.mockImplementation(async (id, resolution) => {
@@ -739,18 +773,16 @@ describe('HumanHandoffService', () => {
           resolvedAt: '2026-06-23T12:05:00.000Z',
         };
       });
-      let reads = 0;
       conversationStore.get.mockImplementation(async () => {
         order.push('get');
-        reads += 1;
-        return reads === 1
-          ? customerStateFor(CUSTOMER, pendingMarker)
-          : customerStateFor(CUSTOMER);
+        return customerStateFor(CUSTOMER, pendingMarker);
       });
-      conversationStore.update.mockImplementation(async () => {
-        order.push('clear');
-        return customerStateFor(CUSTOMER);
-      });
+      conversationStore.clearPendingHumanRequest.mockImplementation(
+        async () => {
+          order.push('clear');
+          return true;
+        },
+      );
       reservations.closeLegacyResolved.mockImplementation(async () => {
         order.push('close');
         return true;
@@ -762,7 +794,7 @@ describe('HumanHandoffService', () => {
       });
 
       expect(result.kind).toBe('resolved');
-      expect(order).toEqual(['resolve', 'get', 'clear', 'get', 'close']);
+      expect(order).toEqual(['resolve', 'get', 'clear', 'close']);
       expect(reservations.closeLegacyResolved).toHaveBeenCalledWith(
         CUSTOMER,
         REF_ID,
@@ -777,7 +809,7 @@ describe('HumanHandoffService', () => {
         service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
       ).rejects.toThrow();
       expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
-      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(conversationStore.clearPendingHumanRequest).not.toHaveBeenCalled();
     });
 
     it('throws and does not close when the resolved row mismatches the target', async () => {
@@ -796,7 +828,7 @@ describe('HumanHandoffService', () => {
       expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
     });
 
-    it('throws and does not close when the marker write fails', async () => {
+    it('throws and does not close when the marker clear fails', async () => {
       store.findByRef.mockResolvedValue(baseRequest);
       store.resolve.mockImplementation(async (id, resolution) => ({
         ...baseRequest,
@@ -808,23 +840,17 @@ describe('HumanHandoffService', () => {
       conversationStore.get.mockResolvedValue(
         customerStateFor(CUSTOMER, pendingMarker),
       );
-      conversationStore.update.mockRejectedValue(new Error('update failed'));
+      conversationStore.clearPendingHumanRequest.mockRejectedValue(
+        new Error('clear failed'),
+      );
 
       await expect(
         service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
-      ).rejects.toThrow('update failed');
+      ).rejects.toThrow('clear failed');
       expect(reservations.closeLegacyResolved).not.toHaveBeenCalled();
     });
 
-    it.each<[string, ConversationState | null]>([
-      ['a surviving marker', customerStateFor(CUSTOMER, pendingMarker)],
-      ['a null state', null],
-      ['an absent marker key', { ...customerStateFor(CUSTOMER), data: {} }],
-      [
-        'a malformed marker',
-        customerStateFor(CUSTOMER, { bad: true } as never),
-      ],
-    ])('throws and does not close on %s after clearing', async (_n, bad) => {
+    it('fails closed and does not close when the CAS clear returns false', async () => {
       store.findByRef.mockResolvedValue(baseRequest);
       store.resolve.mockImplementation(async (id, resolution) => ({
         ...baseRequest,
@@ -833,9 +859,7 @@ describe('HumanHandoffService', () => {
         resolution,
         resolvedAt: '2026-06-23T12:05:00.000Z',
       }));
-      conversationStore.get
-        .mockResolvedValueOnce(customerStateFor(CUSTOMER, pendingMarker))
-        .mockResolvedValueOnce(bad);
+      conversationStore.clearPendingHumanRequest.mockResolvedValue(false);
 
       await expect(
         service.resolveReply({ text: `HF-${REF_ID} NO_RESTOCK`, from: OPS }),
@@ -964,5 +988,3 @@ describe('HumanHandoffService', () => {
     });
   });
 });
-
-void setPendingHumanRequest;

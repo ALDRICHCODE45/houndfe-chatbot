@@ -236,7 +236,9 @@ export class PostgresConversationStore implements ConversationStore {
   ): Promise<ConversationState> {
     // Read-modify-write: merge in APP code to mirror InMemory's
     // `{ ...existing, ...patch }` exactly (data REPLACES if patch
-    // carries it, PRESERVES if omitted).
+    // carries it, PRESERVES if omitted). The CAS-owned
+    // `receiptAmountPointer` / `pendingHumanRequest` keys are stripped
+    // from the patch and the LIVE values re-applied under the row lock.
     const existing = await this.get(senderId);
     const merged = existing
       ? { ...existing, ...patch }
@@ -249,6 +251,7 @@ export class PostgresConversationStore implements ConversationStore {
     }
     const data = { ...(merged.data ?? {}) };
     delete data.receiptAmountPointer;
+    delete data.pendingHumanRequest;
 
     const { rows } = await this.pool.query<ConversationRow>(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
@@ -261,6 +264,9 @@ export class PostgresConversationStore implements ConversationStore {
                      '{receiptAmountPointer}', conversation_state.data->'receiptAmountPointer')
                    ELSE EXCLUDED.data - 'receiptAmountPointer'
                  END
+                 || CASE WHEN conversation_state.data ? 'pendingHumanRequest'
+                   THEN jsonb_build_object('pendingHumanRequest', conversation_state.data->'pendingHumanRequest')
+                   ELSE '{}'::jsonb END
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );

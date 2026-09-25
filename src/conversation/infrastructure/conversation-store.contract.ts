@@ -297,5 +297,36 @@ export function runConversationStoreContract(
       await setCas('c5', m);
       await expect(clearCas('c5', 'wrong-id')).resolves.toBe(false);
     });
+
+    // T3b: legacy `update()` is a marker carve-out writer — a stale patch
+    // value is stripped and the LIVE marker (set or explicit null) reapplied.
+    it('update() strips a stale patch marker and keeps the live one', async () => {
+      const m = casMarker('aaaa22223333');
+      await setCas('u1', m);
+      await store.update('u1', {
+        lastMessageAt: T,
+        data: {
+          cart: ['sku-1'],
+          pendingHumanRequest: casMarker('dead22223333'),
+        },
+      });
+      const fetched = await store.get('u1');
+      expect(readPendingHumanRequest(fetched)).toEqual(m);
+      expect(fetched!.data.cart).toEqual(['sku-1']);
+    });
+
+    it('update() cannot resurrect a cleared marker', async () => {
+      const m = casMarker('bbbb22223333');
+      await setCas('u2', m);
+      await expect(clearCas('u2', m.requestId)).resolves.toBe(true);
+      await store.update('u2', {
+        lastMessageAt: T,
+        data: { pendingHumanRequest: casMarker('cccc22223333') },
+      });
+      const fetched = await store.get('u2');
+      expect(readPendingHumanRequest(fetched)).toBeNull();
+      expect(Object.hasOwn(fetched!.data, 'pendingHumanRequest')).toBe(true);
+      expect(fetched!.data.pendingHumanRequest).toBeNull();
+    });
   });
 }
