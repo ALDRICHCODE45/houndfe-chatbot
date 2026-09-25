@@ -255,7 +255,7 @@ export function normalizeRestockIntakeReceipt(
     const id = asUuid(record.id);
     const sourceRequestId = asUuid(record.sourceRequestId);
     const createdAt = asRequiredInstant(record.createdAt);
-    const branchId = asUuid(snapshot.branchId);
+    const branchId = asRequiredExactString(snapshot.branchId);
     const branchName = asNullableExactString(snapshot.branchName);
     const productId = asUuid(snapshot.productId);
     const variantId = asNullableUuid(snapshot.variantId);

@@ -344,6 +344,42 @@ describe('normalizeRestockIntakeReceipt', () => {
     }
   });
 
+  it('accepts and preserves an exact opaque server branchId', () => {
+    const sent = sentMinimal();
+    for (const branchId of [
+      BRANCH_ID,
+      'branch-123',
+      '  branch-123  ',
+      'BRANCH-123',
+      'cafe\u0301',
+    ]) {
+      const out = norm(receiptFor(sent, {}, { branchId }), sent);
+      expect(out?.snapshot.branchId).toBe(branchId);
+    }
+  });
+
+  it('rejects an absent, blank, non-string, or controlled branchId', () => {
+    const sent = sentMinimal();
+    const base = receiptFor(sent);
+    const snapshot = base.snapshot as Rec;
+    for (const branchId of [
+      null,
+      undefined,
+      '',
+      '   ',
+      7,
+      'a\u0000',
+      '\u009fb',
+    ]) {
+      expect(
+        norm({ ...base, snapshot: { ...snapshot, branchId } }, sent),
+      ).toBeNull();
+    }
+    expect(
+      norm({ ...base, snapshot: omitted(snapshot, 'branchId') }, sent),
+    ).toBeNull();
+  });
+
   it('preserves an exact blank or padded branchName', () => {
     const sent = sentMinimal();
     for (const name of ['   ', '  Centro  ']) {
@@ -411,7 +447,6 @@ describe('normalizeRestockIntakeReceipt', () => {
     ['snap branchLabel', (s) => receiptFor(s, {}, { branchLabel: 'x' })],
     ['missing id', (s) => omitted(receiptFor(s), 'id')],
     ['non-uuid id', (s) => receiptFor(s, { id: 'x' })],
-    ['non-uuid branchId', (s) => receiptFor(s, {}, { branchId: 'x' })],
     ['numeric branchName', (s) => receiptFor(s, {}, { branchName: 7 })],
     ['branchName control', (s) => receiptFor(s, {}, { branchName: 'a\u0000' })],
     ['impossible createdAt', (s) => receiptFor(s, { createdAt: BAD_ISO })],
