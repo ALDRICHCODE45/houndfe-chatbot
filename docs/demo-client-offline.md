@@ -101,7 +101,7 @@ cableados entre sí).
 
 - Sin Docker: omitir el **Comando 3** y declararlo "no ejecutado"; los Comandos 1
   y 2 no requieren contenedores.
-- Sin navegador: mostrar el HTML por capturas; el guion no depende del navegador.
+- Sin navegador: mostrar `docs/demo-client-offline.png` (captura local del HTML a 1440×1600); el guion no depende del navegador.
 - Plan B: usar una grabación previa y decir que es una repetición. Registro:
   anotar commit, hora, comando exacto y resultado (aprobado/fallado/omitido). Si
   algo falla o se omite, decirlo. No fabricar conteos ni éxitos.
