@@ -25,6 +25,9 @@ export interface SharedRouteMarkers {
   readonly restockIntentPresent: SharedRouteMarkerState;
 }
 
+/** DI token for the read-only, trusted route-marker reader. */
+export const SHARED_ROUTE_MARKERS = Symbol('SHARED_ROUTE_MARKERS');
+
 export interface SharedRouteMarkersPort {
   /**
    * Snapshot the trusted route markers for one sender. Never throws: an

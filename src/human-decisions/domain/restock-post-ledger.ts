@@ -281,6 +281,9 @@ export interface RestockPostReceiptInput extends RestockPostStartInput {
  * and persist only the returned transition atomically; it must never mint a
  * fresh `sourceRequestId` and never auto-retry an ambiguous POST.
  */
+/** DI token for the durable, route-scoped RESTOCK POST ledger. */
+export const RESTOCK_POST_LEDGER = Symbol('RESTOCK_POST_LEDGER');
+
 export interface RestockPostLedgerPort {
   beginPost(input: RestockPostStartInput): Promise<RestockPostDecision>;
   recordReceipt(input: RestockPostReceiptInput): Promise<RestockPostDecision>;

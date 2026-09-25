@@ -50,6 +50,9 @@ export type RestockIntakeOutcome =
   | { readonly decision: 'hold'; readonly reason: RestockIntakeHoldReason }
   | { readonly decision: 'blocked'; readonly reason: RestockIntakeBlockReason };
 
+/** DI token for the inert, bot-only RESTOCK intake coordinator. */
+export const RESTOCK_INTAKE_SERVICE = Symbol('RESTOCK_INTAKE_SERVICE');
+
 export class RestockIntakeService {
   constructor(
     private readonly reservations: SharedReservationPort,
