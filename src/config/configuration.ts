@@ -48,6 +48,12 @@ const configuration = () => ({
       ? normalizeSandboxRecipient(process.env.OPS_CHANNEL_PHONE)
       : undefined,
   },
+  humanDecisions: {
+    // WU2A experimental gate: ONLY the exact env string 'true' enables it.
+    // Anything else (unset, 'false', a typo, upper-case, '1') stays false, so
+    // there is no ambiguous activation. No consumer reads this yet.
+    restockEnabled: process.env.HUMAN_DECISIONS_RESTOCK_ENABLED === 'true',
+  },
   receiptMedia: {
     enabled: process.env.RECEIPT_MEDIA_ENABLED === 'true',
     maxBytes: parseInt(process.env.RECEIPT_MEDIA_MAX_BYTES ?? '10485760', 10),

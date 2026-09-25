@@ -428,6 +428,46 @@ describe('envValidationSchema', () => {
     });
   });
 
+  // ─── WU2A: experimental human-decisions RESTOCK gate ──────────────────
+  describe('HUMAN_DECISIONS_RESTOCK_ENABLED', () => {
+    const validate = (value: string | undefined) => {
+      const env: Record<string, string | undefined> = { ...validEnv };
+      if (value === undefined) {
+        delete env.HUMAN_DECISIONS_RESTOCK_ENABLED;
+      } else {
+        env.HUMAN_DECISIONS_RESTOCK_ENABLED = value;
+      }
+      return envValidationSchema.validate(env, { abortEarly: false });
+    };
+
+    it('accepts an absent value and defaults it to "false"', () => {
+      const result = validate(undefined);
+      expect(result.error).toBeUndefined();
+      const value = result.value as {
+        HUMAN_DECISIONS_RESTOCK_ENABLED?: unknown;
+      };
+      expect(value.HUMAN_DECISIONS_RESTOCK_ENABLED).toBe('false');
+    });
+
+    it('accepts the exact strings "true" and "false"', () => {
+      expect(validate('true').error).toBeUndefined();
+      expect(validate('false').error).toBeUndefined();
+    });
+
+    it.each(['TRUE', 'True', '1', '0', 'yes', '', 'true '])(
+      'rejects the ambiguous value %p so activation stays unambiguous',
+      (value) => {
+        const { error } = validate(value);
+        expect(error).toBeDefined();
+        expect(
+          error?.details.some((d) =>
+            d.path.includes('HUMAN_DECISIONS_RESTOCK_ENABLED'),
+          ),
+        ).toBe(true);
+      },
+    );
+  });
+
   // ─── WU1C1 + WU1C2A: Receipt media conditional validation foundation ───
   // Disabled (default) MUST be permissive; enabled MUST strictly validate
   // the listed receipt-media fields. WU1C2A extends enabledBase once with

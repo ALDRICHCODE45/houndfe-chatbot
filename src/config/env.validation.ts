@@ -249,6 +249,15 @@ const innerEnvValidationSchema = Joi.object({
     .pattern(/^\+?\d+$/)
     .optional(),
 
+  // ─── Human decisions: experimental RESTOCK gate (WU2A) ──────────────
+  // Explicit opt-in only. The literal string `'true'` enables it and
+  // `'false'` disables it; EVERY other value (a typo, upper-case, `1`) is
+  // REJECTED, so an ambiguous value can never activate the gate. Default:
+  // false. No consumer reads this yet.
+  HUMAN_DECISIONS_RESTOCK_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('false'),
+
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),
   DB_POOL_MAX: Joi.number().integer().min(1).default(5),

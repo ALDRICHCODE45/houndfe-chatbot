@@ -48,6 +48,8 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_POLL_MS',
     'RECEIPT_MEDIA_METRICS_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
+    // WU2A experimental human-decisions gate
+    'HUMAN_DECISIONS_RESTOCK_ENABLED',
   ];
 
   beforeEach(() => {
@@ -190,5 +192,41 @@ describe('configuration()', () => {
         expect(cfg.receiptMedia.capability.activeVersion).toBe(env);
       },
     );
+  });
+
+  // WU2A: explicit experimental RESTOCK gate. The configuration function is
+  // the real activation boundary, so only the exact env string 'true' turns it
+  // on; unset, 'false', and every malformed value stay false. No implicit or
+  // case-insensitive activation is possible here.
+  describe('humanDecisions.restockEnabled', () => {
+    const restockEnabled = () =>
+      (
+        configuration() as {
+          humanDecisions: { restockEnabled: boolean };
+        }
+      ).humanDecisions.restockEnabled;
+
+    it('defaults false when HUMAN_DECISIONS_RESTOCK_ENABLED is absent', () => {
+      delete process.env.HUMAN_DECISIONS_RESTOCK_ENABLED;
+      expect(restockEnabled()).toBe(false);
+    });
+
+    it('is false for the explicit env string "false"', () => {
+      process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'false';
+      expect(restockEnabled()).toBe(false);
+    });
+
+    it.each(['FALSE', 'True', 'TRUE', '1', '0', 'yes', 'on', '', ' true'])(
+      'stays false for the non-exact value %p',
+      (value) => {
+        process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = value;
+        expect(restockEnabled()).toBe(false);
+      },
+    );
+
+    it('is true only for the exact env string "true"', () => {
+      process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
+      expect(restockEnabled()).toBe(true);
+    });
   });
 });
