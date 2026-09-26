@@ -235,6 +235,7 @@ function setup(
     recordOutcomeAck: jest
       .fn()
       .mockResolvedValue({ action: 'recorded', record: outcome.record }),
+    closeAcknowledged: jest.fn().mockResolvedValue({ action: 'closed' }),
   };
   const clock = jest
     .fn()
@@ -258,7 +259,7 @@ function setup(
   };
 }
 
-describe('unwired application orchestration', () => {
+describe('application orchestration', () => {
   it.each(ACTIONS)(
     'sends authoritative %s text then records the actual acceptance and ACK',
     async (action) => {
@@ -296,6 +297,7 @@ describe('unwired application orchestration', () => {
         f.accepted.row,
         outcome.receipt,
       );
+      expect(p.closeAcknowledged).toHaveBeenCalledWith(outcome.record);
       const calls = Object.values(p).map((mock) => {
         expect(mock).toHaveBeenCalledTimes(1);
         return mock.mock.invocationCallOrder[0];
@@ -326,6 +328,8 @@ describe('unwired application orchestration', () => {
     );
     expect(p.recordOutcomeAck).toHaveBeenCalledTimes(1);
     expect(p.recordOutcomeAck).toHaveBeenCalledWith(f.stale, outcome.receipt);
+    expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
+    expect(p.closeAcknowledged).toHaveBeenCalledWith(outcome.record);
   });
 
   it.each(['send rejection', 'post-COMMIT expiry'])(
@@ -343,6 +347,7 @@ describe('unwired application orchestration', () => {
       expect(p.recordAcceptance).not.toHaveBeenCalled();
       expect(p.recordRestockApplicationOutcome).not.toHaveBeenCalled();
       expect(p.recordOutcomeAck).not.toHaveBeenCalled();
+      expect(p.closeAcknowledged).not.toHaveBeenCalled();
     },
   );
 });
@@ -417,7 +422,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
       expect(await result).toEqual({
         action: afterClaim === NOW ? 'ack_recorded' : 'hold',
       });
-      expectThrough(p, afterClaim === NOW ? 6 : 2);
+      expectThrough(p, afterClaim === NOW ? 7 : 2);
       expect(clock).toHaveBeenCalledTimes(afterClaim === NOW ? 2 : 1);
     },
   );
@@ -438,7 +443,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
         record: outcome.record,
       });
       expect(await run()).toEqual({ action: 'ack_recorded' });
-      expectThrough(p, 6);
+      expectThrough(p, 7);
       expect(p.recordAcceptance).toHaveBeenCalledWith({
         row: f.started,
         event: f.late.event,
@@ -452,6 +457,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
         f.late.row,
         outcome.receipt,
       );
+      expect(p.closeAcknowledged).toHaveBeenCalledWith(outcome.record);
     },
   );
 
@@ -477,7 +483,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
       expect(await run()).toEqual({
         action: offset < 1000 ? 'ack_recorded' : 'hold',
       });
-      expectThrough(p, offset < 1000 ? 6 : 2);
+      expectThrough(p, offset < 1000 ? 7 : 2);
       if (offset < 1000)
         expect(p.recordAcceptance).toHaveBeenCalledWith({
           row: f.started,
@@ -651,7 +657,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
       record: outcome.record,
     });
     expect(await run()).toEqual({ action: 'ack_recorded' });
-    expectThrough(p, 6);
+    expectThrough(p, 7);
     expect(p.recordAcceptance).toHaveBeenCalledWith({ row: f.started, event });
     expect(outcome.prepared.request).toHaveProperty(
       'providerMessageId',
@@ -665,6 +671,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
       accepted.next,
       outcome.receipt,
     );
+    expect(p.closeAcknowledged).toHaveBeenCalledWith(outcome.record);
   });
 
   it('does not ACK a valid persisted acceptance that disagrees with the actual observation', async () => {
@@ -689,6 +696,7 @@ describe('application authority and failure boundaries (mocked ports only)', () 
     'recordAcceptance',
     'recordRestockApplicationOutcome',
     'recordOutcomeAck',
+    'closeAcknowledged',
   ] as const)(
     'stops after %s throws, without retry or later calls',
     async (port) => {
@@ -707,12 +715,150 @@ describe('application authority and failure boundaries (mocked ports only)', () 
     'claimPending',
     'recordAcceptance',
     'recordOutcomeAck',
+    'closeAcknowledged',
   ] as const)('stops after a discriminated %s hold', async (port) => {
     const { ports: p, run } = setup();
     p[port].mockResolvedValue({ action: 'hold' });
     expect(await run()).toEqual({ action: 'hold' });
     expectThrough(p, Object.keys(p).indexOf(port));
   });
+});
+
+describe('completion boundary (mocked ports only)', () => {
+  it.each(['closed', 'replay'] as const)(
+    'returns ACK only after %s closes the exact local record',
+    async (action) => {
+      const { outcome, ports: p, run } = setup();
+      p.recordOutcomeAck.mockResolvedValue({
+        action: 'replay',
+        record: outcome.record,
+      });
+      p.closeAcknowledged.mockResolvedValue({ action });
+      expect(await run()).toEqual({ action: 'ack_recorded' });
+      expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
+      expect(p.closeAcknowledged).toHaveBeenCalledWith(outcome.record);
+      const calls = p.closeAcknowledged.mock.calls as unknown[][];
+      const passed = calls[0][0];
+      expect(passed).not.toBe(outcome.record);
+      expect(Object.isFrozen(passed)).toBe(true);
+      expect(p.recordOutcomeAck).toHaveBeenCalledTimes(1);
+      expect(p.recordOutcomeAck.mock.invocationCallOrder[0]).toBeLessThan(
+        p.closeAcknowledged.mock.invocationCallOrder[0],
+      );
+    },
+  );
+
+  it('does not enter closure until local ACK resolves; waits for closure to finish', async () => {
+    const { outcome, ports: p, run } = setup();
+    const ackEntered = deferred<void>();
+    const ack = deferred<{
+      action: 'recorded';
+      record: typeof outcome.record;
+    }>();
+    const closeEntered = deferred<void>();
+    const close = deferred<{ action: 'closed' }>();
+    p.recordOutcomeAck.mockImplementation(() => {
+      ackEntered.resolve();
+      return ack.promise;
+    });
+    p.closeAcknowledged.mockImplementation(() => {
+      closeEntered.resolve();
+      return close.promise;
+    });
+    let settled = false;
+    const result = run();
+    void result.then(() => {
+      settled = true;
+    });
+    await ackEntered.promise;
+    expect(p.closeAcknowledged).not.toHaveBeenCalled();
+    ack.resolve({ action: 'recorded', record: outcome.record });
+    await closeEntered.promise;
+    expect(settled).toBe(false);
+    expectThrough(p, 7);
+    close.resolve({ action: 'closed' });
+    expect(await result).toEqual({ action: 'ack_recorded' });
+    expect(settled).toBe(true);
+  });
+
+  it.each(['senderId', 'sourceRequestId', 'branchId', 'decisionId'] as const)(
+    'holds a foreign %s despite recorded label',
+    async (key) => {
+      const { f, ports: p, run } = setup();
+      const row = {
+        ...f.accepted.row,
+        [key]:
+          key === 'senderId'
+            ? 'other-sender'
+            : key === 'branchId'
+              ? 'other-branch'
+              : TOKEN,
+      };
+      const record = { row, receipt: outcomeFixture(f.accepted.row).receipt };
+      p.recordOutcomeAck.mockResolvedValue({ action: 'recorded', record });
+      expect(await run()).toEqual({ action: 'hold' });
+      expectThrough(p, 6);
+      expect(p.closeAcknowledged).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { label: 'missing', record: undefined },
+    { label: 'malformed', record: {} },
+  ])('holds a $label record despite recorded label', async ({ record }) => {
+    const { ports: p, run } = setup();
+    p.recordOutcomeAck.mockResolvedValue({ action: 'recorded', record });
+    expect(await run()).toEqual({ action: 'hold' });
+    expectThrough(p, 6);
+  });
+
+  it('rejects a local ACK inconsistent with the actual HTTP receipt', async () => {
+    const { f, ports: p, run } = setup();
+    const other = outcomeFixture(f.accepted.row);
+    p.recordRestockApplicationOutcome.mockResolvedValue({
+      ...other.receipt,
+      ackReceivedAt: '2026-06-22T13:00:03.000Z',
+    });
+    expect(await run()).toEqual({ action: 'hold' });
+    expectThrough(p, 6);
+  });
+
+  it('holds a valid but different terminal row without closure', async () => {
+    const { f, ports: p, run } = setup();
+    p.recordOutcomeAck.mockResolvedValue({
+      action: 'recorded',
+      record: outcomeFixture(f.late.row).record,
+    });
+    expect(await run()).toEqual({ action: 'hold' });
+    expectThrough(p, 6);
+  });
+
+  it('holds an uncertain stale closure without sending or rewriting the ACK', async () => {
+    const { ports: p, run } = setup(ACTIONS[0], true);
+    p.closeAcknowledged.mockResolvedValue({ action: 'hold' });
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.recordAcceptance).not.toHaveBeenCalled();
+    expect(p.recordRestockApplicationOutcome).toHaveBeenCalledTimes(1);
+    expect(p.recordOutcomeAck).toHaveBeenCalledTimes(1);
+    expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['hold', 'invalid'] as const)(
+    'stops after uncertain %s closure without replaying send or ACK',
+    async (failure) => {
+      const { ports: p, run } = setup();
+      p.closeAcknowledged.mockResolvedValue(
+        failure === 'hold' ? { action: 'hold' } : { action: 'unexpected' },
+      );
+      expect(await run()).toEqual({ action: 'hold' });
+      expectThrough(p, 7);
+      expect(p.sendText).toHaveBeenCalledTimes(1);
+      expect(p.recordRestockApplicationOutcome).toHaveBeenCalledTimes(1);
+      expect(p.recordOutcomeAck).toHaveBeenCalledTimes(1);
+      expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 describe('coordinator fixture foundation (existing pure contracts only)', () => {

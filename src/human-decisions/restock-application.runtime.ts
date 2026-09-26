@@ -22,8 +22,9 @@ import { PostgresRestockApplicationContextStore } from './infrastructure/postgre
 import { PostgresRestockApplicationPreparationStore } from './infrastructure/postgres-restock-application-preparation.store';
 import { PostgresRestockApplicationClaimStore } from './infrastructure/postgres-restock-application-claim.store';
 import { PostgresRestockApplicationLedgerStore } from './infrastructure/postgres-restock-application-ledger.store';
+import { PostgresRestockApplicationCompletionStore } from './infrastructure/postgres-restock-application-completion.store';
 
-/** Private module runtime. No scans/recovery or reservation closure.
+/** Private module runtime. No scans/recovery; closes only after local ACK.
  * Configuration is latched at bootstrap; shutdown permanently closes admission.
  * Nest awaits the poller drain before closing the shared database pool. */
 @Injectable()
@@ -76,6 +77,10 @@ export class RestockApplicationRuntime
       clock,
     );
     const ledger = new PostgresRestockApplicationLedgerStore(this.pool);
+    const completion = new PostgresRestockApplicationCompletionStore(
+      this.pool,
+      branch,
+    );
     const coordinator = new RestockApplicationCoordinator(
       {
         pollForSender: candidate.pollForSender.bind(candidate),
@@ -83,6 +88,7 @@ export class RestockApplicationRuntime
         claimPending: claim.claimPending.bind(claim),
         recordAcceptance: ledger.recordAcceptance.bind(ledger),
         recordOutcomeAck: ledger.recordOutcomeAck.bind(ledger),
+        closeAcknowledged: completion.closeAcknowledged.bind(completion),
         recordRestockApplicationOutcome:
           this.client.recordRestockApplicationOutcome.bind(this.client),
         sendText: this.sender.sendText.bind(this.sender),

@@ -5,17 +5,20 @@ import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.p
 import type { RestockApplicationCandidateService } from './restock-application-candidate.service';
 import type { PostgresRestockApplicationPreparationStore } from '../infrastructure/postgres-restock-application-preparation.store';
 import type { PostgresRestockApplicationClaimStore } from '../infrastructure/postgres-restock-application-claim.store';
+import type { PostgresRestockApplicationCompletionStore } from '../infrastructure/postgres-restock-application-completion.store';
 import type { RestockApplicationLedgerPort } from '../domain/restock-application-ledger.port';
 import { classifyRestockApplication } from '../domain/restock-application-policy';
 import { normalizeRestockApplicationLedgerRow } from '../domain/restock-application-ledger-row';
 import { classifyRestockApplicationAcceptance } from '../domain/restock-application-ledger-acceptance';
 import { prepareRestockApplicationOutcome } from '../domain/restock-application-ledger-ack-preparation';
+import { classifyRestockApplicationAckRecord } from '../domain/restock-application-ledger-ack-record';
 import type { RestockDecisionResolved } from '../../chatbot-api/domain/dtos/human-decisions.dto';
 
 type Ports = Pick<RestockApplicationCandidateService, 'pollForSender'> &
   Pick<PostgresRestockApplicationPreparationStore, 'preparePending'> &
   Pick<PostgresRestockApplicationClaimStore, 'claimPending'> &
   Pick<RestockApplicationLedgerPort, 'recordAcceptance' | 'recordOutcomeAck'> &
+  Pick<PostgresRestockApplicationCompletionStore, 'closeAcknowledged'> &
   Pick<ChatbotApiClient, 'recordRestockApplicationOutcome'> &
   Pick<WhatsappSenderPort, 'sendText'>;
 const HOLD = Object.freeze({ action: 'hold' as const });
@@ -30,9 +33,9 @@ function format(decision: RestockDecisionResolved): string {
     : `${subject}: el equipo no pudo confirmar un estimado de reposición.`;
 }
 
-/** Unwired trusted-adapter orchestration, not Meta fencing/device delivery.
- * No retries, legacy markers or reservation closure. Ambiguous SEND_STARTED
- * remains started. Durable history/owner guarantees belong to the adapters. */
+/** Trusted-adapter orchestration, not Meta fencing/device delivery.
+ * No retries or legacy markers. Closes only after a matching durable ACK;
+ * ambiguous SEND_STARTED remains started. History/owner guarantees belong to adapters. */
 export class RestockApplicationCoordinator {
   constructor(
     private readonly ports: Ports,
@@ -150,7 +153,27 @@ export class RestockApplicationCoordinator {
         outcome.request,
       );
       const ack = await ports.recordOutcomeAck(terminal, receipt);
-      return ack.action === 'recorded' || ack.action === 'replay' ? ACK : HOLD;
+      if (ack.action !== 'recorded' && ack.action !== 'replay') return HOLD;
+      const verified = classifyRestockApplicationAckRecord(
+        terminal,
+        receipt,
+        ack.record,
+      );
+      if (verified.action !== 'replay') return HOLD;
+      const { record } = verified;
+      const { row } = record;
+      if (
+        row.senderId !== senderId ||
+        row.sourceRequestId !== sourceRequestId ||
+        row.branchId !== branchId ||
+        row.decisionId !== decision.id ||
+        row.decisionId !== context.backendDecisionId
+      )
+        return HOLD;
+      const closed = await ports.closeAcknowledged(record);
+      return closed.action === 'closed' || closed.action === 'replay'
+        ? ACK
+        : HOLD;
     } catch {
       return HOLD;
     }

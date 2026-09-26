@@ -52,7 +52,7 @@ function count(
     : null;
 }
 
-/** Unwired local close after a matching durable terminal ACK; no delivery proof.
+/** Local close after a matching durable terminal ACK; no delivery proof.
  * Snapshot CAS is not a fence against arbitrary raw-SQL writers. An uncertain
  * query outcome is HOLD, never an automatic write retry or reconciliation.
  */

@@ -9,6 +9,7 @@ import { PostgresRestockApplicationContextStore } from './infrastructure/postgre
 import { PostgresRestockApplicationPreparationStore } from './infrastructure/postgres-restock-application-preparation.store';
 import { PostgresRestockApplicationClaimStore } from './infrastructure/postgres-restock-application-claim.store';
 import { PostgresRestockApplicationLedgerStore } from './infrastructure/postgres-restock-application-ledger.store';
+import { PostgresRestockApplicationCompletionStore } from './infrastructure/postgres-restock-application-completion.store';
 
 const source = 'ABCDEF12-1234-4234-8234-123456789ABC';
 const senderId = 'synthetic-sender';
@@ -60,9 +61,14 @@ describe('RestockApplicationRuntime in isolation', () => {
     async (flag) => {
       const f = fixture(flag);
       const start = jest.spyOn(RestockApplicationPoller.prototype, 'start');
+      const close = jest.spyOn(
+        PostgresRestockApplicationCompletionStore.prototype,
+        'closeAcknowledged',
+      );
       f.runtime.onApplicationBootstrap();
       expect(f.runtime.enqueue(senderId, source)).toBe(false);
       expect(start).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
       expect(
         (f.runtime as unknown as { poller?: unknown }).poller,
       ).toBeUndefined();
@@ -176,6 +182,12 @@ describe('RestockApplicationRuntime in isolation', () => {
         'recordOutcomeAck',
       )
       .mockResolvedValue(HOLD);
+    const close = jest
+      .spyOn(
+        PostgresRestockApplicationCompletionStore.prototype,
+        'closeAcknowledged',
+      )
+      .mockResolvedValue(HOLD);
     // Test-only access to private ports; invoke wrappers without real transactions.
     type Internals = {
       ports: Record<string, (...args: unknown[]) => unknown>;
@@ -203,6 +215,7 @@ describe('RestockApplicationRuntime in isolation', () => {
       'claimPending',
       'recordAcceptance',
       'recordOutcomeAck',
+      'closeAcknowledged',
       'recordRestockApplicationOutcome',
       'sendText',
     ])
@@ -225,7 +238,7 @@ describe('RestockApplicationRuntime in isolation', () => {
       });
       expect(spy).toHaveBeenCalledWith(...args);
     }
-    for (const spy of [prepare, claim, acceptance, ack])
+    for (const spy of [prepare, claim, acceptance, ack, close])
       expect((spy.mock.contexts[0] as unknown as { pool: unknown }).pool).toBe(
         f.pool,
       );
@@ -242,6 +255,11 @@ describe('RestockApplicationRuntime in isolation', () => {
       PostgresRestockApplicationLedgerStore,
     );
     expect(acceptance.mock.contexts[0]).toBe(ack.mock.contexts[0]);
+    expect(close.mock.contexts[0]).toBeInstanceOf(
+      PostgresRestockApplicationCompletionStore,
+    );
+    expect(close.mock.contexts[0]).toMatchObject({ branchId: branch });
+    expect(close).toHaveBeenCalledWith(...args);
     expect(f.client.recordRestockApplicationOutcome.mock.contexts[0]).toBe(
       f.client,
     );
