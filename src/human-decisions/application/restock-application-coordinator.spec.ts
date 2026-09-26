@@ -1,3 +1,4 @@
+import { RestockApplicationCoordinator } from './restock-application-coordinator';
 import {
   normalizeRestockDecision,
   normalizeRestockIntake,
@@ -207,6 +208,144 @@ function outcomeFixture(row: RestockApplicationLedgerRow) {
   if (recorded.action !== 'record') throw new Error('not recorded');
   return Object.freeze({ prepared, receipt, record: recorded.next });
 }
+
+function setup(
+  action: RestockResolution['action'] = ACTIONS[0],
+  stale = false,
+) {
+  const f = fixture(action);
+  const outcome = outcomeFixture(stale ? f.stale : f.accepted.row);
+  const ports = {
+    pollForSender: jest.fn().mockResolvedValue(f.candidate),
+    preparePending: jest
+      .fn()
+      .mockResolvedValue({ action: 'prepared', row: f.pending }),
+    claimPending: jest.fn().mockResolvedValue({
+      action: stale ? 'stale' : 'started',
+      row: stale ? f.stale : f.started,
+      evidence: f.evidence,
+    }),
+    sendText: jest.fn().mockResolvedValue(f.providerReceipt),
+    recordAcceptance: jest
+      .fn()
+      .mockResolvedValue({ action: 'updated', row: f.accepted.row }),
+    recordRestockApplicationOutcome: jest
+      .fn()
+      .mockResolvedValue(outcome.receipt),
+    recordOutcomeAck: jest
+      .fn()
+      .mockResolvedValue({ action: 'recorded', record: outcome.record }),
+  };
+  const clock = jest
+    .fn()
+    .mockReturnValueOnce(new Date(NOW))
+    .mockReturnValue(new Date(ACCEPTED_AT));
+  const token = jest.fn(() => TOKEN);
+  const coordinator = new RestockApplicationCoordinator(
+    ports,
+    BRANCH,
+    PHONE,
+    clock,
+    token,
+  );
+  return {
+    f,
+    outcome,
+    ports,
+    clock,
+    token,
+    run: () => coordinator.applyOnce(SENDER, f.evidence.sourceRequestId),
+  };
+}
+
+describe('unwired application orchestration', () => {
+  it.each(ACTIONS)(
+    'sends authoritative %s text then records the actual acceptance and ACK',
+    async (action) => {
+      const { f, outcome, ports: p, token, run } = setup(action);
+      const result = await run();
+      expect(result).toEqual({ action: 'ack_recorded' });
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(p.pollForSender).toHaveBeenCalledWith(
+        SENDER,
+        f.evidence.sourceRequestId,
+      );
+      expect(p.preparePending).toHaveBeenCalledWith(f.candidate);
+      expect(token).toHaveBeenCalledTimes(1);
+      expect(p.claimPending).toHaveBeenCalledWith(
+        f.candidate,
+        f.pending,
+        TOKEN,
+      );
+      expect(p.sendText).toHaveBeenCalledWith({
+        to: SENDER,
+        text:
+          action === 'PROVIDE_RESTOCK_ESTIMATE'
+            ? 'Collar (SKU: COL-01): el equipo confirmó un estimado de reposición de 3 días desde su confirmación. Es un estimado, no una fecha garantizada.'
+            : 'Collar (SKU: COL-01): el equipo no pudo confirmar un estimado de reposición.',
+      });
+      expect(p.recordAcceptance).toHaveBeenCalledWith({
+        row: f.started,
+        event: f.accepted.event,
+      });
+      expect(p.recordRestockApplicationOutcome).toHaveBeenCalledWith(
+        ID,
+        outcome.prepared.request,
+      );
+      expect(p.recordOutcomeAck).toHaveBeenCalledWith(
+        f.accepted.row,
+        outcome.receipt,
+      );
+      const calls = Object.values(p).map((mock) => {
+        expect(mock).toHaveBeenCalledTimes(1);
+        return mock.mock.invocationCallOrder[0];
+      });
+      expect(calls).toEqual([...calls].sort((a, b) => a - b));
+    },
+  );
+
+  it('returns frozen pending without downstream work', async () => {
+    const { ports, run, clock, token } = setup();
+    ports.pollForSender.mockResolvedValue({ action: 'pending' });
+    const result = await run();
+    expect(result).toEqual({ action: 'pending' });
+    expect(Object.isFrozen(result)).toBe(true);
+    for (const mock of [...Object.values(ports).slice(1), clock, token])
+      expect(mock).not.toHaveBeenCalled();
+  });
+
+  it('ACKs confirmed stale without sending or recording acceptance', async () => {
+    const { f, outcome, ports: p, run } = setup(ACTIONS[0], true);
+    expect(await run()).toEqual({ action: 'ack_recorded' });
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.recordAcceptance).not.toHaveBeenCalled();
+    expect(p.recordRestockApplicationOutcome).toHaveBeenCalledTimes(1);
+    expect(p.recordRestockApplicationOutcome).toHaveBeenCalledWith(
+      ID,
+      outcome.prepared.request,
+    );
+    expect(p.recordOutcomeAck).toHaveBeenCalledTimes(1);
+    expect(p.recordOutcomeAck).toHaveBeenCalledWith(f.stale, outcome.receipt);
+  });
+
+  it.each(['send rejection', 'post-COMMIT expiry'])(
+    'holds on %s without acceptance or ACK',
+    async (failure) => {
+      const { ports: p, clock, run } = setup();
+      if (failure === 'send rejection')
+        p.sendText.mockRejectedValue(new Error('uncertain'));
+      else clock.mockReset().mockReturnValue(new Date(END));
+      expect(await run()).toEqual({ action: 'hold' });
+      expect(p.claimPending).toHaveBeenCalledTimes(1);
+      expect(p.sendText).toHaveBeenCalledTimes(
+        failure === 'send rejection' ? 1 : 0,
+      );
+      expect(p.recordAcceptance).not.toHaveBeenCalled();
+      expect(p.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+      expect(p.recordOutcomeAck).not.toHaveBeenCalled();
+    },
+  );
+});
 
 describe('coordinator fixture foundation (existing pure contracts only)', () => {
   it.each(ACTIONS)('binds and freezes a ready %s GET snapshot', (action) => {
