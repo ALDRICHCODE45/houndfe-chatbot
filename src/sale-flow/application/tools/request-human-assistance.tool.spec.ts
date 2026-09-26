@@ -390,6 +390,109 @@ describe('makeRequestHumanAssistanceTool', () => {
       return { deps, markers, coordinator, create, getStock, getState };
     }
 
+    const promotionDigest = {
+      items: [{ productId: PRODUCT_ID, quantity: 1, unitPriceCents: 100 }],
+    };
+    const expirationDigest = {
+      productId: PRODUCT_ID,
+      name: 'Croquetas',
+      question: 'Expiration date?',
+    };
+
+    it.each([
+      outOfStockInput,
+      { kind: 'needs_human_review', digest: promotionDigest },
+      { kind: 'expiration_date', digest: expirationDigest },
+    ])('preserves valid $kind inputs', async (input) => {
+      const { deps, create } = buildRestockDeps();
+      const tool = makeRequestHumanAssistanceTool({
+        ...deps,
+        restock: undefined,
+      });
+      const parsed = schemaToolView(tool).inputSchema.safeParse(input);
+      expect(parsed).toEqual({ success: true, data: input });
+      await tool.execute(input as Parameters<typeof tool.execute>[0], {
+        toolCallId: 't',
+        messages: [],
+        context: { senderId: SENDER },
+      });
+      expect(create).toHaveBeenCalledWith({
+        senderId: SENDER,
+        kind: input.kind,
+        digest: { ...input.digest, kind: input.kind },
+      });
+    });
+
+    it.each([
+      { kind: 'shipping_approval', digest: outOfStockInput.digest },
+      { kind: 'out_of_stock', digest: promotionDigest },
+      { kind: 'needs_human_review', digest: outOfStockInput.digest },
+      { kind: 'expiration_date', digest: outOfStockInput.digest },
+      ...[
+        { productId: 'invalid' },
+        { variantId: 'invalid' },
+        { name: '' },
+        { quantity: 0 },
+        { quantity: 1.5 },
+      ].map((patch) => ({
+        kind: 'out_of_stock',
+        digest: { ...outOfStockInput.digest, ...patch },
+      })),
+      ...[
+        { productId: 'invalid' },
+        { variantId: 'invalid' },
+        { quantity: 0 },
+        { quantity: 1.5 },
+        { unitPriceCents: -1 },
+        { unitPriceCents: 1.5 },
+      ].map((patch) => ({
+        kind: 'needs_human_review',
+        digest: { items: [{ ...promotionDigest.items[0], ...patch }] },
+      })),
+      { kind: 'needs_human_review', digest: { items: [] } },
+      ...[
+        { originalTotalCents: -1 },
+        { originalTotalCents: 1.5 },
+        { recomputedTotalCents: -1 },
+        { recomputedTotalCents: 1.5 },
+      ].map((patch) => ({
+        kind: 'needs_human_review',
+        digest: { ...promotionDigest, ...patch },
+      })),
+      {
+        kind: 'expiration_date',
+        digest: { ...expirationDigest, question: '' },
+      },
+    ])('fences invalid input %# before side effects', async (input) => {
+      for (const enabled of [false, true]) {
+        const { deps, create, markers, coordinator, getState, getStock } =
+          buildRestockDeps();
+        const tool = makeRequestHumanAssistanceTool({
+          ...deps,
+          restock: enabled ? deps.restock : undefined,
+        });
+        expect(schemaToolView(tool).inputSchema.safeParse(input).success).toBe(
+          false,
+        );
+        await expect(
+          tool.execute(input as Parameters<typeof tool.execute>[0], {
+            toolCallId: 't',
+            messages: [],
+            context: { senderId: SENDER, inboundEvent: INBOUND },
+          }),
+        ).rejects.toThrow();
+        for (const effect of [
+          create,
+          markers.readForSender,
+          coordinator.coordinate,
+          getState,
+          getStock,
+        ]) {
+          expect(effect).not.toHaveBeenCalled();
+        }
+      }
+    });
+
     it('default-off (no restock capability): out_of_stock keeps the exact legacy create call', async () => {
       const create = jest.fn(
         async (): Promise<HumanHandoffCreateResult> => ({

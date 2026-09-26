@@ -31,7 +31,7 @@ export type RequestHumanAssistanceRestockResult =
  * (a signal) — the model DECIDES when to call this tool (ADR-27). The
  * trigger tools do NOT call `humanHandoffService` directly.
  *
- * `inputSchema` is a discriminated union on `kind`:
+ * Runtime validation is a discriminated union on `kind`:
  *   - `out_of_stock`       (R7)   — product-level restock query
  *   - `needs_human_review` (promo) — backend flagged promo for review
  *   - `expiration_date`    (R14)  — customer asked about fechas de caducidad
@@ -113,7 +113,7 @@ async function runRestockRoute(
 }
 
 export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
-  return tool({
+  const definition = {
     description:
       "Escala el caso a un agente humano. SOLO llámala cuando `checkStock` / `evaluateCart` / la conversación lo indiquen. NO la uses para derivaciones que no correspondan a un caso explícito. Distingue el resultado EXACTO: `{ ok: true, customerNotified: true }` es la ruta legado y sí notifica al cliente; en `kind: 'out_of_stock'` la ruta RESTOCK devuelve `{ ok: true, outcome: 'historical_intake_recorded', customerNotified: false }`, que SOLO registra un reporte histórico sin resolución actual, ETA, respuesta humana, notificación futura ni entrega del proveedor: NO lo presentes como un escalado ni prometas seguimiento. Si devuelve `{ ok: false, error: { kind: 'restock_unavailable', retryable: false } }`, di que la solicitud no pudo confirmarse: NO reintentes, NO escales por la vía legado y NO impliques que se envió un aviso.",
     inputSchema: z.discriminatedUnion('kind', [
@@ -153,6 +153,25 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
         }),
       }),
     ]),
+  };
+  const [stock, promotion, expiration] = definition.inputSchema.options;
+  return tool({
+    description: definition.description,
+    // Responses requires an object root. Keep optional fields optional via
+    // non-strict mode; the pipe retains authoritative per-kind validation.
+    strict: false,
+    inputSchema: z
+      .object({
+        kind: z.enum(['out_of_stock', 'needs_human_review', 'expiration_date']),
+        digest: z.union([
+          // Preserve branch-specific keys until the discriminator selects
+          // the authoritative schema (stock and expiration overlap).
+          stock.shape.digest.passthrough(),
+          promotion.shape.digest.passthrough(),
+          expiration.shape.digest.passthrough(),
+        ]),
+      })
+      .pipe(definition.inputSchema),
     contextSchema: z.object({
       senderId: z.string(),
       // R3b3-c4c2-tool: optional RESTOCK inbound identity, strictly shaped so
@@ -167,7 +186,9 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
         })
         .optional(),
     }),
-    execute: async (input, options) => {
+    execute: async (rawInput, options) => {
+      // Direct callers bypass SDK validation, so fence both side-effect routes.
+      const input = definition.inputSchema.parse(rawInput);
       const senderId = options.context.senderId;
       const restock = deps.restock;
       // The experimental RESTOCK route is reachable ONLY behind the exact
