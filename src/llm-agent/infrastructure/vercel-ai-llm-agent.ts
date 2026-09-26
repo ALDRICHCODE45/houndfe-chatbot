@@ -135,16 +135,109 @@ function catalogDiagnostic(logger: Logger) {
     }
     return count;
   };
+  // Fixed registry allowlist; never copy a dynamic tool name.
+  const toolNameOf = (name: unknown) => {
+    if (name === 'searchCatalog') return 'searchCatalog';
+    if (name === 'checkStock') return 'checkStock';
+    if (name === 'requestHumanAssistance') return 'requestHumanAssistance';
+    if (name === 'evaluateCart') return 'evaluateCart';
+    if (name === 'getCustomerByPhone') return 'getCustomerByPhone';
+    if (name === 'upsertCustomer') return 'upsertCustomer';
+    if (name === 'createSale') return 'createSale';
+    if (name === 'attachReceipt') return 'attachReceipt';
+    if (name === 'updateDelivery') return 'updateDelivery';
+    if (name === 'getOrderHistory') return 'getOrderHistory';
+    if (name === 'getPaymentDetails') return 'getPaymentDetails';
+    if (name === 'cancelSale') return 'cancelSale';
+    if (name === 'getShippingQuote') return 'getShippingQuote';
+    observationComplete = false;
+    return 'other';
+  };
+  const envelope = (value: unknown): Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const outcomeOf = (name: string, result: unknown): string => {
+    // Only envelope discriminators: not domain validation or proof of delivery.
+    const ok = envelope(result).ok;
+    if (name !== 'checkStock' && name !== 'requestHumanAssistance') {
+      if (ok === true) return 'returned_ok';
+      return ok === false ? 'returned_error' : 'unknown_output';
+    }
+    if (ok === false) {
+      const kind = envelope(envelope(result).error).kind;
+      if (typeof kind !== 'string') return 'unknown_output';
+      if (name === 'requestHumanAssistance') {
+        if (kind === 'disabled') return 'disabled';
+        if (kind === 'restock_unavailable') return 'restock_unavailable';
+      }
+      return 'returned_error';
+    }
+    if (ok !== true) return 'unknown_output';
+    if (name === 'checkStock') {
+      const assistance = envelope(result).humanAssistance;
+      if (assistance !== undefined) {
+        return envelope(assistance).kind === 'out_of_stock'
+          ? 'out_of_stock_signal'
+          : 'unknown_output';
+      }
+      const status = envelope(envelope(result).stock).status;
+      return status === 'available' ||
+        status === 'low_stock' ||
+        status === 'out_of_stock' ||
+        status === 'not_managed'
+        ? 'success'
+        : 'unknown_output';
+    }
+    if (name === 'requestHumanAssistance') {
+      const outcome = envelope(result).outcome;
+      const notified = envelope(result).customerNotified;
+      if (outcome === 'historical_intake_recorded' && notified === false) {
+        return 'historical_intake_recorded';
+      }
+      if (outcome === undefined && notified === true)
+        return 'legacy_customer_notified';
+    }
+    return 'unknown_output';
+  };
   return {
     onStepFinish: (event: { toolCalls: unknown }) =>
       observe(() => {
-        const count = arrayLength(event.toolCalls);
+        const calls = event.toolCalls;
+        const count = arrayLength(calls);
         observedSteps += 1;
         toolCalls += count;
+        const truncated = count > 16;
+        if (truncated) observationComplete = false;
+        for (let index = 0; index < Math.min(count, 16); index += 1) {
+          let toolName = 'other';
+          observe(() => {
+            toolName = toolNameOf(
+              envelope((calls as unknown[])[index]).toolName,
+            );
+          });
+          observe(() => emit({ event: 'tool_requested', toolName, truncated }));
+        }
       }),
     onToolExecutionEnd: (event: ToolExecutionEndEvent) =>
       observe(() => {
-        if (event.toolCall.toolName !== 'searchCatalog') return;
+        let toolName = 'other';
+        observe(() => {
+          toolName = toolNameOf(event.toolCall.toolName);
+        });
+        if (toolName !== 'searchCatalog') {
+          let category = 'unknown_output';
+          observe(() => {
+            if (toolName === 'other') return;
+            const output = event.toolOutput;
+            if (output.type === 'tool-error') category = 'execution_error';
+            if (output.type === 'tool-result')
+              category = outcomeOf(toolName, output.output);
+          });
+          if (category === 'unknown_output') observationComplete = false;
+          emit({ event: 'tool_execution_end', toolName, category });
+          return;
+        }
         const toolOutput = event.toolOutput;
         let category = 'unknown_output';
         let resultCount: number | undefined;

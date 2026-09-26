@@ -35,11 +35,15 @@ describe('temporary catalog diagnostics', () => {
     onToolExecutionEnd: (event: unknown) => void;
   };
   let log: jest.SpyInstance;
+  let otherLogs: jest.SpyInstance[];
   const records = () =>
     log.mock.calls.map(([record]) => record as Record<string, unknown>);
   const step = (hooks: Hooks, count = 0) =>
     hooks.onStepFinish?.({
-      toolCalls: Array(count).fill(secret),
+      toolCalls: Array(count).fill({
+        toolName: 'searchCatalog',
+        input: secret,
+      }),
       text: secret,
       request: { headers: secret, apiKey: secret },
       response: { id: secret, body: secret },
@@ -65,11 +69,17 @@ describe('temporary catalog diagnostics', () => {
   };
   beforeEach(() => {
     log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
+    otherLogs = (['error', 'warn', 'debug', 'verbose', 'fatal'] as const).map(
+      (method) =>
+        jest.spyOn(Logger.prototype, method).mockImplementation(() => {}),
+    );
   });
   afterEach(() => {
     // Inspect every argument, not just the structured message.
-    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
-    log.mockRestore();
+    for (const spy of [log, ...otherLogs]) {
+      expect(JSON.stringify(spy.mock.calls)).not.toContain(secret);
+      spy.mockRestore();
+    }
   });
 
   it('records an observed text-only completion without changing the reply/history', async () => {
@@ -113,19 +123,19 @@ describe('temporary catalog diagnostics', () => {
     });
     expect(records()[0]).toEqual({
       prefix: 'catalog_diagnostic',
-      runId: records()[1].runId,
+      runId: records().at(-1)?.runId,
       event: 'search_catalog_end',
       category,
       ...(resultCount === undefined ? {} : { resultCount }),
     });
-    expect(records()[1]).toMatchObject({
+    expect(records().at(-1)).toMatchObject({
       observedSteps: 2,
       toolCalls: category === 'unknown_output' ? null : 1,
       observationComplete: category !== 'unknown_output',
     });
   });
 
-  it('ignores arbitrary tools and never traverses catalog array items', async () => {
+  it('labels arbitrary tools without inspecting output or catalog array items', async () => {
     const results = new Array(2);
     const getter = jest.fn(() => {
       throw new Error(secret);
@@ -137,12 +147,12 @@ describe('temporary catalog diagnostics', () => {
       step(hooks, 2);
     });
     expect(getter).not.toHaveBeenCalled();
-    expect(records()).toHaveLength(2);
-    expect(records()[0]).toMatchObject({ category: 'success', resultCount: 2 });
-    expect(records()[1]).toMatchObject({
-      toolCalls: 2,
-      observationComplete: true,
+    expect(records()[0]).toMatchObject({
+      toolName: 'other',
+      category: 'unknown_output',
     });
+    expect(records()[1]).toMatchObject({ category: 'success', resultCount: 2 });
+    expect(records().at(-1)).toMatchObject({ observationComplete: false });
   });
 
   it.each(['missing', 'step', 'tool', 'length', 'output'])(
@@ -199,12 +209,229 @@ describe('temporary catalog diagnostics', () => {
     await run((hooks) => step(hooks));
     release();
     await first;
-    const [search, second, completedFirst] = records();
+    const [search, , second, completedFirst] = records();
     expect(search.runId).toBe(completedFirst.runId);
     expect(second.runId).not.toBe(search.runId);
     expect(second).toMatchObject({ observedSteps: 1, toolCalls: 0 });
     expect(completedFirst).toMatchObject({ observedSteps: 2, toolCalls: 1 });
   });
+
+  const stock = { ok: true, stock: { status: 'available' } };
+  const intake = {
+    ok: true,
+    outcome: 'historical_intake_recorded',
+    customerNotified: false,
+  };
+  it.each([
+    ['checkStock', stock, 'success'],
+    [
+      'checkStock',
+      { ...stock, humanAssistance: { kind: 'out_of_stock' } },
+      'out_of_stock_signal',
+    ],
+    ['checkStock', { ok: false, error: { kind: secret } }, 'returned_error'],
+    ['checkStock', { ok: true }, 'unknown_output'],
+    ['checkStock', { ...stock, humanAssistance: {} }, 'unknown_output'],
+    ['requestHumanAssistance', intake, 'historical_intake_recorded'],
+    [
+      'requestHumanAssistance',
+      { ok: true, customerNotified: true },
+      'legacy_customer_notified',
+    ],
+    [
+      'requestHumanAssistance',
+      { ok: false, error: { kind: 'disabled' } },
+      'disabled',
+    ],
+    [
+      'requestHumanAssistance',
+      { ok: false, error: { kind: 'restock_unavailable' } },
+      'restock_unavailable',
+    ],
+    [
+      'requestHumanAssistance',
+      { ok: false, error: { kind: secret } },
+      'returned_error',
+    ],
+    [
+      'requestHumanAssistance',
+      { ...intake, customerNotified: true },
+      'unknown_output',
+    ],
+    ['requestHumanAssistance', { ok: true }, 'unknown_output'],
+    ['requestHumanAssistance', { ok: false }, 'unknown_output'],
+    ['requestHumanAssistance', null, 'unknown_output'],
+  ])('observes %s envelope as %s', async (name, output, category) => {
+    await run((hooks) => {
+      end(hooks, outputOf(output), name);
+      step(hooks);
+    });
+    expect(records()[0]).toEqual({
+      prefix: 'catalog_diagnostic',
+      runId: records().at(-1)?.runId,
+      event: 'tool_execution_end',
+      toolName: name,
+      category,
+    });
+    expect(records()[1].observationComplete).toBe(
+      category !== 'unknown_output',
+    );
+  });
+
+  it.each(['checkStock', 'requestHumanAssistance'])(
+    'records %s execution errors without reading the error',
+    async (name) => {
+      await run((hooks) =>
+        end(hooks, { type: 'tool-error', error: secret }, name),
+      );
+      expect(records()[0]).toMatchObject({
+        toolName: name,
+        category: 'execution_error',
+      });
+    },
+  );
+
+  it('observes requested names without asserting execution, including unknown names', async () => {
+    await run((hooks) =>
+      hooks.onStepFinish({
+        toolCalls: [
+          { toolName: 'checkStock', input: secret },
+          { toolName: 'requestHumanAssistance', input: secret },
+          { toolName: secret, input: secret },
+        ],
+      }),
+    );
+    expect(
+      records()
+        .filter((r) => r.event === 'tool_requested')
+        .map((r) => r.toolName),
+    ).toEqual(['checkStock', 'requestHumanAssistance', 'other']);
+    expect(records().some((r) => r.event === 'tool_execution_end')).toBe(false);
+    expect(records().at(-1)).toMatchObject({ observationComplete: false });
+  });
+
+  const registeredNames = [
+    'searchCatalog',
+    'checkStock',
+    'requestHumanAssistance',
+    'evaluateCart',
+    'getCustomerByPhone',
+    'upsertCustomer',
+    'createSale',
+    'attachReceipt',
+    'updateDelivery',
+    'getOrderHistory',
+    'getPaymentDetails',
+    'cancelSale',
+    'getShippingQuote',
+  ];
+  it.each(registeredNames)('retains requested name %s', async (toolName) => {
+    await run((hooks) => hooks.onStepFinish({ toolCalls: [{ toolName }] }));
+    expect(records()[0]).toMatchObject({ event: 'tool_requested', toolName });
+    expect(records().at(-1)?.observationComplete).toBe(true);
+  });
+
+  it.each(registeredNames.slice(3))(
+    'reads generic flags for %s',
+    async (name) => {
+      const flagOnly = Object.defineProperty({ ok: true }, 'customerNotified', {
+        get() {
+          throw new Error(secret);
+        },
+      });
+      const cases = [
+        [outputOf(flagOnly), 'returned_ok'],
+        [outputOf({ ok: true, customerNotified: true }), 'returned_ok'],
+        [outputOf({ ok: false }), 'returned_error'],
+        [outputOf({ ok: 'true' }), 'unknown_output'],
+        [outputOf(null), 'unknown_output'],
+        [outputOf({}), 'unknown_output'],
+        [{ type: 'tool-error', error: secret }, 'execution_error'],
+      ] as const;
+      for (const [output, category] of cases) {
+        await run((hooks) => {
+          end(hooks, output, name);
+          step(hooks);
+        });
+        expect(records().at(-2)).toMatchObject({
+          event: 'tool_execution_end',
+          toolName: name,
+          category,
+        });
+      }
+    },
+  );
+
+  it('records a known requested call with no execution-end callback', async () => {
+    await run((hooks) =>
+      hooks.onStepFinish({
+        toolCalls: [
+          { toolName: 'requestHumanAssistance', invalid: true, input: secret },
+        ],
+      }),
+    );
+    expect(records().map((r) => r.event)).toEqual([
+      'tool_requested',
+      'run_completed',
+    ]);
+    expect(records()[0]).toMatchObject({
+      toolName: 'requestHumanAssistance',
+      truncated: false,
+    });
+    expect(records()[1]).toMatchObject({ observedSteps: 1, toolCalls: 1 });
+  });
+
+  it('bounds requested metadata reads to sixteen entries', async () => {
+    const calls = Array(17).fill({ toolName: 'checkStock' });
+    const beyondBound = jest.fn(() => {
+      throw new Error(secret);
+    });
+    Object.defineProperty(calls, 16, { get: beyondBound });
+    await run((hooks) => hooks.onStepFinish({ toolCalls: calls }));
+    expect(beyondBound).not.toHaveBeenCalled();
+    expect(records().filter((r) => r.event === 'tool_requested')).toHaveLength(
+      16,
+    );
+    expect(records()[0]).toMatchObject({ truncated: true });
+    expect(records().at(-1)).toMatchObject({
+      observationComplete: false,
+      toolCalls: null,
+    });
+  });
+
+  it.each(['missing', 'name', 'nested', 'unused'])(
+    'guards %s metadata and never serializes nested objects',
+    async (kind) => {
+      const getter = jest.fn(() => {
+        throw new Error(secret);
+      });
+      const hostile = new Proxy({}, { get: getter });
+      await expect(
+        run((hooks) => {
+          if (kind === 'missing') hooks.onStepFinish({ toolCalls: Array(1) });
+          if (kind === 'name') hooks.onStepFinish({ toolCalls: [hostile] });
+          if (kind === 'nested')
+            end(
+              hooks,
+              outputOf({ ok: true, humanAssistance: hostile }),
+              'checkStock',
+            );
+          if (kind === 'unused') {
+            end(
+              hooks,
+              outputOf({ ...intake, debug: hostile, requestId: secret }),
+              'requestHumanAssistance',
+            );
+            hooks.onStepFinish({
+              toolCalls: [{ toolName: 'checkStock', input: hostile }],
+            });
+          }
+        }),
+      ).resolves.toMatchObject({ reply: secret });
+      expect(records().at(-1)?.observationComplete).toBe(kind === 'unused');
+      if (kind === 'unused') expect(getter).not.toHaveBeenCalled();
+    },
+  );
 
   it('contains logger failures on both successful and rejected generation', async () => {
     log.mockImplementationOnce(() => {
@@ -212,7 +439,7 @@ describe('temporary catalog diagnostics', () => {
     });
     await expect(
       run((hooks) => {
-        end(hooks, { type: 'tool-error', error: secret });
+        end(hooks, { type: 'tool-error', error: secret }, 'checkStock');
         step(hooks);
       }),
     ).resolves.toMatchObject({ reply: secret });
@@ -220,7 +447,7 @@ describe('temporary catalog diagnostics', () => {
     log.mockImplementation(() => {
       throw new Error(secret);
     });
-    await expect(run((hooks) => step(hooks))).resolves.toMatchObject({
+    await expect(run((hooks) => step(hooks, 1))).resolves.toMatchObject({
       reply: secret,
     });
     const error = new Error(secret);
