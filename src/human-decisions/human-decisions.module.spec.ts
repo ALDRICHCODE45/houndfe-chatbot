@@ -5,6 +5,9 @@ import {
   type ModuleMetadata,
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
+import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
+import { MetaWhatsappSender } from '../whatsapp/infrastructure/meta-whatsapp.sender';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -82,6 +85,12 @@ const fakeClient = {
 
 const compile = (imports: NonNullable<ModuleMetadata['imports']>) =>
   Test.createTestingModule({ imports })
+    .overrideProvider(ConfigService)
+    .useValue({ get: () => undefined })
+    .overrideProvider(MetaWhatsappSender)
+    .useValue({})
+    .overrideProvider(WHATSAPP_SENDER)
+    .useValue({ sendText: jest.fn() })
     .overrideProvider(PG_POOL)
     .useValue(fakePool)
     .overrideProvider(ChatbotApiHttpClient)

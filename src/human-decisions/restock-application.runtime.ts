@@ -23,9 +23,9 @@ import { PostgresRestockApplicationPreparationStore } from './infrastructure/pos
 import { PostgresRestockApplicationClaimStore } from './infrastructure/postgres-restock-application-claim.store';
 import { PostgresRestockApplicationLedgerStore } from './infrastructure/postgres-restock-application-ledger.store';
 
-/** Unregistered composition seam. No scans/recovery or reservation closure.
+/** Private module runtime. No scans/recovery or reservation closure.
  * Configuration is latched at bootstrap; shutdown permanently closes admission.
- * Nest registration and drain-before-pool-close ordering require separate proof. */
+ * Nest awaits the poller drain before closing the shared database pool. */
 @Injectable()
 export class RestockApplicationRuntime
   implements OnApplicationBootstrap, OnModuleDestroy

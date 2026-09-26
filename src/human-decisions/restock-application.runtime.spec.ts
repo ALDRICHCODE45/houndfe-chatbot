@@ -47,7 +47,7 @@ function fixture(flag: unknown, identity = { branch, phone }) {
 }
 
 // Unit composition/lifecycle proof only: no Nest graph or durable I/O.
-describe('unregistered RestockApplicationRuntime', () => {
+describe('RestockApplicationRuntime in isolation', () => {
   beforeEach(() => jest.useFakeTimers());
   afterEach(() => {
     expect(jest.getTimerCount()).toBe(0);

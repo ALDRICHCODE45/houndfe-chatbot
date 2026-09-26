@@ -1,4 +1,7 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
+import { RestockApplicationRuntime } from './restock-application.runtime';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -33,17 +36,23 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
  *   - `RESTOCK_POST_LEDGER` → `PostgresRestockPostLedgerStore` (the route-scoped
  *     RESTOCK POST state machine).
  *   - `RESTOCK_INTAKE_SERVICE` → `RestockIntakeService`, built by a factory that
- *     injects `[SHARED_RESERVATION, RESTOCK_POST_LEDGER, CHATBOT_API_CLIENT]`.
+ *     forwards fresh receipt hints to the private application runtime.
  *
  * Imports `DatabaseModule` for `PG_POOL` and `ChatbotApiModule` for
- * `CHATBOT_API_CLIENT`. This module is intentionally inert: nothing is
- * reserved, posted, queried, or sent during init. `HumanHandoffModule` imports
- * it for the REQUIRED `SHARED_RESERVATION` guard; the RESTOCK caller and its
- * feature flag are a later cut, so the coordinator is provided but uninvoked.
+ * `CHATBOT_API_CLIENT`; the acyclic sender leaf supplies outbound delivery.
+ * Init stays idle. Only strict `restockEnabled === true` starts the private
+ * runtime; fresh receipt hints schedule bounded application polling.
+ * Shared reservation guards remain available independently of that flag.
  */
 @Module({
-  imports: [DatabaseModule, ChatbotApiModule],
+  imports: [
+    ConfigModule,
+    DatabaseModule,
+    ChatbotApiModule,
+    WhatsappSenderModule,
+  ],
   providers: [
+    RestockApplicationRuntime,
     {
       provide: SHARED_RESERVATION,
       useClass: PostgresSharedReservationStore,
@@ -62,8 +71,22 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
         reservations: SharedReservationPort,
         ledger: RestockPostLedgerPort,
         client: ChatbotApiClient,
-      ) => new RestockIntakeService(reservations, ledger, client),
-      inject: [SHARED_RESERVATION, RESTOCK_POST_LEDGER, CHATBOT_API_CLIENT],
+        runtime: RestockApplicationRuntime,
+      ) =>
+        new RestockIntakeService(
+          reservations,
+          ledger,
+          client,
+          (senderId, sourceRequestId) => {
+            runtime.enqueue(senderId, sourceRequestId);
+          },
+        ),
+      inject: [
+        SHARED_RESERVATION,
+        RESTOCK_POST_LEDGER,
+        CHATBOT_API_CLIENT,
+        RestockApplicationRuntime,
+      ],
     },
   ],
   exports: [
