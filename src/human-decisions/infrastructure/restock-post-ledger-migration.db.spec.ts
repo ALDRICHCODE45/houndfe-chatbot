@@ -10,7 +10,7 @@ import {
  * R3b3-c2b real-PostgreSQL proof for migration 2400 RESTOCK POST ledger columns.
  *
  * Gated by RUN_DOCKER_TESTS=1. It starts a disposable `postgres:16-alpine`,
- * applies ALL migrations to that container URI only via a child process with an
+ * applies migrations through 240 to that container URI only via a child process with an
  * explicit `DATABASE_URL` override (never an ambient value), and exercises the
  * actual CHECK constraints and the `down` data-loss guard. Test-only: it proves
  * the already-committed schema (2def7da); it makes no retroactive
@@ -22,6 +22,20 @@ import {
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 const REPO_ROOT = join(__dirname, '..', '..', '..');
+const MIGRATE_BIN = join(
+  REPO_ROOT,
+  'node_modules',
+  'node-pg-migrate',
+  'bin',
+  'node-pg-migrate.js',
+);
+const CONFIG = [
+  '--config-file',
+  'package.json',
+  '--config-value',
+  'pg-migrate',
+];
+const TARGET = '2400000000000';
 
 const SENDER = 'whatsapp:+5215500000001';
 const LEGACY_KEY = 'a1b2c3d4e5f6';
@@ -54,11 +68,7 @@ ddescribe('restock post ledger migration (real PostgreSQL)', () => {
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
-    execFileSync('pnpm', ['migrate'], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: container.getConnectionUri() },
-      stdio: 'pipe',
-    });
+    runUp();
     pool = new Pool({ connectionString: container.getConnectionUri() });
   });
 
@@ -76,13 +86,14 @@ ddescribe('restock post ledger migration (real PostgreSQL)', () => {
     );
   });
 
-  const migrate = (direction: 'migrate' | 'migrate:down') =>
-    execFileSync('pnpm', [direction], {
+  const run = (direction: 'up' | 'down', ...args: string[]) =>
+    execFileSync('node', [MIGRATE_BIN, ...CONFIG, direction, ...args], {
       cwd: REPO_ROOT,
       env: { ...process.env, DATABASE_URL: container.getConnectionUri() },
       stdio: 'pipe',
     });
-  const migrateDown = () => migrate('migrate:down');
+  const runUp = () => run('up', TARGET, '--timestamp');
+  const migrateDown = () => run('down');
 
   const insert = (
     route: 'RESTOCK' | 'LEGACY_OPS',
@@ -229,7 +240,7 @@ ddescribe('restock post ledger migration (real PostgreSQL)', () => {
       );
       expect(dropped.rows).toHaveLength(0);
     } finally {
-      migrate('migrate');
+      runUp();
     }
     const restored = await pool.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM human_decision_reservations
