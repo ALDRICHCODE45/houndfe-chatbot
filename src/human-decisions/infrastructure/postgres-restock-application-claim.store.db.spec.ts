@@ -340,4 +340,75 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
       await idle(loserPool);
     },
   );
+
+  it('expires cached ready at applyBefore without send authority or replay rewrite', async () => {
+    const { candidate, pending } = await prepared();
+    expect(candidate.classification.action).toBe('ready');
+    expect(Date.parse(evidence.observedAt)).toBeLessThanOrEqual(
+      Date.parse(END),
+    );
+    expect(Date.parse(END)).toBeLessThan(
+      Number(evidence.providerTimestampSeconds) * 1000 + 86_400_000,
+    );
+    const before = await originals();
+    const pendingRows = await ledger();
+    expect(pendingRows).toHaveLength(1);
+    const staleRow = { ...pending, state: 'STALE', staleObservedAt: END };
+    expect(
+      await store(pools[0], END).claimPending(candidate, pending, TOKENS[0]),
+    ).toEqual({ action: 'stale', row: staleRow, evidence });
+    const stale = await ledger();
+    expect(stale).toHaveLength(1);
+    // Exact JSON equality excludes send/provider metadata, not just known tokens.
+    expect(stale[0]).toEqual({
+      ...pendingRows[0],
+      row_data: staleRow,
+      revision: stale[0].revision,
+    });
+    expect(stale[0].revision).toEqual(expect.any(String));
+    expect(stale[0].revision).not.toBe(pendingRows[0].revision);
+    expect(stale[0].ack_receipt).toBeNull();
+    expect(
+      await store(pools[1], END).claimPending(candidate, pending, TOKENS[1]),
+    ).toEqual({ action: 'hold' });
+    expect(await ledger()).toEqual(stale);
+    expect(await originals()).toEqual(before);
+    await idle(pools[0]);
+    await idle(pools[1]);
+  });
+
+  it.each(['receipt pointer presence', 'missing conversation'])(
+    'holds %s without changing pending or surrounding evidence',
+    async (collision) => {
+      const { candidate, pending } = await prepared();
+      if (collision === 'receipt pointer presence') {
+        // Unsupported key presence is conservative even when null; this is not
+        // a claim that the fixture represents a legitimate receipt workflow.
+        await observer.query(
+          'UPDATE conversation_state SET data=$1 WHERE sender_id=$2',
+          [
+            JSON.stringify({ messages: [], receiptAmountPointer: null }),
+            SENDER,
+          ],
+        );
+      } else {
+        // Bounded absent-row HOLD only, not phantom/external-writer exclusion.
+        await observer.query(
+          'DELETE FROM conversation_state WHERE sender_id=$1',
+          [SENDER],
+        );
+      }
+      const before = await originals();
+      const rows = await ledger();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].row_data).toEqual(pending);
+      expect(rows[0].ack_receipt).toBeNull();
+      expect(
+        await store(pools[0]).claimPending(candidate, pending, TOKENS[0]),
+      ).toEqual({ action: 'hold' });
+      expect(await ledger()).toEqual(rows);
+      expect(await originals()).toEqual(before);
+      await idle(pools[0]);
+    },
+  );
 });
