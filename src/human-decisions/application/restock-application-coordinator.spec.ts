@@ -347,6 +347,374 @@ describe('unwired application orchestration', () => {
   );
 });
 
+function expectThrough(ports: ReturnType<typeof setup>['ports'], last: number) {
+  Object.values(ports).forEach((mock, index) =>
+    expect(mock).toHaveBeenCalledTimes(index <= last ? 1 : 0),
+  );
+}
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {
+    throw new Error('not initialized');
+  };
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function evidenceAt(
+  providerOffset: number,
+  observedOffset = 0,
+  senderId = SENDER,
+) {
+  return present(
+    bindRestockInboundEvidence(
+      {
+        event: {
+          senderId,
+          receivingPhoneNumberId: PHONE,
+          messageId: 'wamid.synthetic-inbound',
+        },
+        providerTimestampSeconds: String(
+          (Date.parse(NOW) + providerOffset) / 1000,
+        ),
+        observedAt: new Date(Date.parse(NOW) + observedOffset).toISOString(),
+      },
+      PHONE,
+    ),
+  );
+}
+
+describe('application authority and failure boundaries (mocked ports only)', () => {
+  it.each([NOW, END])(
+    'waits for claim completion before sampling %s',
+    async (afterClaim) => {
+      const { f, ports: p, clock, run } = setup();
+      const entered = deferred<void>();
+      const claim = deferred<{
+        action: 'started';
+        row: typeof f.started;
+        evidence: typeof f.evidence;
+      }>();
+      p.claimPending.mockImplementation(() => {
+        entered.resolve();
+        return claim.promise;
+      });
+      const result = run();
+      await entered.promise;
+      expectThrough(p, 2);
+      expect(clock).not.toHaveBeenCalled();
+      clock
+        .mockReset()
+        .mockReturnValueOnce(new Date(afterClaim))
+        .mockReturnValue(new Date(ACCEPTED_AT));
+      claim.resolve({
+        action: 'started',
+        row: f.started,
+        evidence: f.evidence,
+      });
+      expect(await result).toEqual({
+        action: afterClaim === NOW ? 'ack_recorded' : 'hold',
+      });
+      expectThrough(p, afterClaim === NOW ? 6 : 2);
+      expect(clock).toHaveBeenCalledTimes(afterClaim === NOW ? 2 : 1);
+    },
+  );
+
+  it.each(['updated', 'replay'])(
+    'preserves actual late acceptance with %s persistence',
+    async (action) => {
+      const { f, ports: p, clock, run } = setup();
+      const outcome = outcomeFixture(f.late.row);
+      clock
+        .mockReset()
+        .mockReturnValueOnce(new Date(NOW))
+        .mockReturnValue(new Date(END));
+      p.recordAcceptance.mockResolvedValue({ action, row: f.late.row });
+      p.recordRestockApplicationOutcome.mockResolvedValue(outcome.receipt);
+      p.recordOutcomeAck.mockResolvedValue({
+        action: action === 'replay' ? 'replay' : 'recorded',
+        record: outcome.record,
+      });
+      expect(await run()).toEqual({ action: 'ack_recorded' });
+      expectThrough(p, 6);
+      expect(p.recordAcceptance).toHaveBeenCalledWith({
+        row: f.started,
+        event: f.late.event,
+      });
+      expect(p.recordRestockApplicationOutcome).toHaveBeenCalledWith(
+        ID,
+        outcome.prepared.request,
+      );
+      expect(outcome.prepared.request.outcome).toBe('PROVIDER_ACCEPTED_LATE');
+      expect(p.recordOutcomeAck).toHaveBeenCalledWith(
+        f.late.row,
+        outcome.receipt,
+      );
+    },
+  );
+
+  it.each([999, 1000, 1001])(
+    'checks the original 24h boundary at offset %i ms while policy is ready',
+    async (offset) => {
+      const { f, ports: p, clock, run } = setup();
+      const evidence = evidenceAt(-86_400_000 + 1000);
+      expect(evidence.sourceRequestId).toBe(f.evidence.sourceRequestId);
+      const now = new Date(Date.parse(NOW) + offset).toISOString();
+      expect(classifyRestockApplication({ ...f.policyInput, now }).action).toBe(
+        'ready',
+      );
+      p.claimPending.mockResolvedValue({
+        action: 'started',
+        row: f.started,
+        evidence,
+      });
+      clock
+        .mockReset()
+        .mockReturnValueOnce(new Date(now))
+        .mockReturnValue(new Date(ACCEPTED_AT));
+      expect(await run()).toEqual({
+        action: offset < 1000 ? 'ack_recorded' : 'hold',
+      });
+      expectThrough(p, offset < 1000 ? 6 : 2);
+      if (offset < 1000)
+        expect(p.recordAcceptance).toHaveBeenCalledWith({
+          row: f.started,
+          event: f.accepted.event,
+        });
+    },
+  );
+
+  it('holds clock rollback before attemptedAt even while policy remains ready', async () => {
+    const { f, ports: p, clock, run } = setup();
+    const row = present(
+      normalizeRestockApplicationLedgerRow({
+        ...f.started,
+        attemptedAt: ACCEPTED_AT,
+      }),
+    );
+    expect(row.state).toBe('SEND_STARTED');
+    expect(classifyRestockApplication(f.policyInput).action).toBe('ready');
+    p.claimPending.mockResolvedValue({
+      action: 'started',
+      row,
+      evidence: f.evidence,
+    });
+    clock.mockReset().mockReturnValue(new Date(NOW));
+    expect(await run()).toEqual({ action: 'hold' });
+    expectThrough(p, 2);
+  });
+
+  it.each(['provider', 'observation'])(
+    'rejects future %s evidence while policy remains ready',
+    async (future) => {
+      const { f, ports: p, run } = setup();
+      const evidence = evidenceAt(future === 'provider' ? 1000 : 0, 1000);
+      expect(evidence.sourceRequestId).toBe(f.evidence.sourceRequestId);
+      expect(classifyRestockApplication(f.policyInput).action).toBe('ready');
+      p.claimPending.mockResolvedValue({
+        action: 'started',
+        row: f.started,
+        evidence,
+      });
+      expect(await run()).toEqual({ action: 'hold' });
+      expectThrough(p, 2);
+    },
+  );
+
+  it.each(['throw', 'invalid'])(
+    'holds a %s post-claim clock',
+    async (failure) => {
+      const { ports: p, clock, run } = setup();
+      clock.mockReset().mockImplementation(() => {
+        if (failure === 'throw') throw new Error('clock unavailable');
+        return new Date(NaN);
+      });
+      expect(await run()).toEqual({ action: 'hold' });
+      expectThrough(p, 2);
+    },
+  );
+
+  it.each(['sender', 'source', 'branch'])(
+    'rejects %s binding before preparation',
+    async (mismatch) => {
+      const { f, ports: p, clock, token } = setup();
+      const coordinator = new RestockApplicationCoordinator(
+        p,
+        mismatch === 'branch' ? 'other-branch' : BRANCH,
+        PHONE,
+        clock,
+        token,
+      );
+      expect(
+        await coordinator.applyOnce(
+          mismatch === 'sender' ? 'other-sender' : SENDER,
+          mismatch === 'source' ? ID : f.evidence.sourceRequestId,
+        ),
+      ).toEqual({ action: 'hold' });
+      expectThrough(p, 0);
+      expect(clock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['token', 'sender'])(
+    'rejects a valid but mismatched claimed-row %s',
+    async (mismatch) => {
+      const { f, ports: p, run } = setup();
+      const row = present(
+        normalizeRestockApplicationLedgerRow({
+          ...f.started,
+          ...(mismatch === 'token'
+            ? { sendToken: ID }
+            : { senderId: 'other-sender' }),
+        }),
+      );
+      expect(row.state).toBe('SEND_STARTED');
+      p.claimPending.mockResolvedValue({
+        action: 'started',
+        row,
+        evidence: f.evidence,
+      });
+      expect(await run()).toEqual({ action: 'hold' });
+      expectThrough(p, 2);
+    },
+  );
+
+  it('rejects canonical evidence bound to another source event', async () => {
+    const { f, ports: p, run } = setup();
+    const evidence = evidenceAt(0, 0, 'other-sender');
+    expect(evidence.sourceRequestId).not.toBe(f.evidence.sourceRequestId);
+    p.claimPending.mockResolvedValue({
+      action: 'started',
+      row: f.started,
+      evidence,
+    });
+    expect(await run()).toEqual({ action: 'hold' });
+    expectThrough(p, 2);
+  });
+
+  it('isolates configured phone mismatch with otherwise matching canonical evidence', async () => {
+    const { f, ports: p, clock, token } = setup();
+    expect(f.evidence.senderId).toBe(SENDER);
+    expect(f.evidence.sourceRequestId).toBe(f.started.sourceRequestId);
+    expect(f.evidence.receivingPhoneNumberId).toBe(PHONE);
+    const coordinator = new RestockApplicationCoordinator(
+      p,
+      BRANCH,
+      '987654321',
+      clock,
+      token,
+    );
+    expect(
+      await coordinator.applyOnce(SENDER, f.evidence.sourceRequestId),
+    ).toEqual({ action: 'hold' });
+    expectThrough(p, 2);
+  });
+
+  it.each([
+    null,
+    undefined,
+    {},
+    { providerMessageId: '' },
+    { providerMessageId: 42 },
+  ])(
+    'holds malformed actual receipt %p without inventing acceptance',
+    async (receipt) => {
+      const { ports: p, run } = setup();
+      p.sendText.mockResolvedValue(receipt);
+      expect(await run()).toEqual({ action: 'hold' });
+      expectThrough(p, 3);
+    },
+  );
+
+  it('preserves opaque provider ID bytes through acceptance and ACK', async () => {
+    const { f, ports: p, run } = setup();
+    const providerMessageId = ' provider-e\u0301 ';
+    const event = Object.freeze({ ...f.accepted.event, providerMessageId });
+    const accepted = classifyRestockApplicationAcceptance({
+      row: f.started,
+      event,
+    });
+    expect(accepted.action).toBe('propose_cas');
+    if (accepted.action !== 'propose_cas')
+      throw new Error('invalid acceptance fixture');
+    const outcome = outcomeFixture(accepted.next);
+    p.sendText.mockResolvedValue(Object.freeze({ providerMessageId }));
+    p.recordAcceptance.mockResolvedValue({
+      action: 'updated',
+      row: accepted.next,
+    });
+    p.recordRestockApplicationOutcome.mockResolvedValue(outcome.receipt);
+    p.recordOutcomeAck.mockResolvedValue({
+      action: 'recorded',
+      record: outcome.record,
+    });
+    expect(await run()).toEqual({ action: 'ack_recorded' });
+    expectThrough(p, 6);
+    expect(p.recordAcceptance).toHaveBeenCalledWith({ row: f.started, event });
+    expect(outcome.prepared.request).toHaveProperty(
+      'providerMessageId',
+      providerMessageId,
+    );
+    expect(p.recordRestockApplicationOutcome).toHaveBeenCalledWith(
+      ID,
+      outcome.prepared.request,
+    );
+    expect(p.recordOutcomeAck).toHaveBeenCalledWith(
+      accepted.next,
+      outcome.receipt,
+    );
+  });
+
+  it('does not ACK a valid persisted acceptance that disagrees with the actual observation', async () => {
+    const { f, ports: p, run } = setup();
+    p.recordAcceptance.mockResolvedValue({
+      action: 'updated',
+      row: f.late.row,
+    });
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.recordAcceptance).toHaveBeenCalledWith({
+      row: f.started,
+      event: f.accepted.event,
+    });
+    expectThrough(p, 4);
+  });
+
+  it.each([
+    'pollForSender',
+    'preparePending',
+    'claimPending',
+    'sendText',
+    'recordAcceptance',
+    'recordRestockApplicationOutcome',
+    'recordOutcomeAck',
+  ] as const)(
+    'stops after %s throws, without retry or later calls',
+    async (port) => {
+      const { ports: p, run } = setup();
+      p[port].mockRejectedValue(new Error('uncertain effect'));
+      const result = await run();
+      expect(result).toEqual({ action: 'hold' });
+      expect(Object.isFrozen(result)).toBe(true);
+      expectThrough(p, Object.keys(p).indexOf(port));
+    },
+  );
+
+  it.each([
+    'pollForSender',
+    'preparePending',
+    'claimPending',
+    'recordAcceptance',
+    'recordOutcomeAck',
+  ] as const)('stops after a discriminated %s hold', async (port) => {
+    const { ports: p, run } = setup();
+    p[port].mockResolvedValue({ action: 'hold' });
+    expect(await run()).toEqual({ action: 'hold' });
+    expectThrough(p, Object.keys(p).indexOf(port));
+  });
+});
+
 describe('coordinator fixture foundation (existing pure contracts only)', () => {
   it.each(ACTIONS)('binds and freezes a ready %s GET snapshot', (action) => {
     const f = fixture(action);
