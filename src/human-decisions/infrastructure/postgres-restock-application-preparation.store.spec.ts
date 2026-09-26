@@ -139,6 +139,391 @@ function setup() {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+function stage(sql: string): string {
+  if (sql.includes('FOR UPDATE')) return 'lock';
+  if (sql.includes('FROM human_decision_reservations')) return 'context';
+  if (sql.startsWith('INSERT')) return 'insert';
+  if (sql.includes('FROM restock_application_ledger')) return 'conflict';
+  return sql;
+}
+const PATH = ['BEGIN', 'lock', 'context', 'insert', 'COMMIT'];
+
+describe('extended preparation boundaries', () => {
+  it.each([
+    ['source case', { request_key: SOURCE.toLowerCase() }],
+    ['backend', { backend_decision_id: PRODUCT }],
+    ['sender', { sender_id: 'other' }],
+    ['post timestamp', { post_attempted_at: END }],
+    ['receipt timestamp', { receipt_recorded_at: END }],
+    ['route', { route: 'OTHER' }],
+    ['closed', { status: 'CLOSED' }],
+    ['legacy', { post_state: 'LEGACY' }],
+    ['nonrecorded', { post_state: 'POST_ATTEMPTED' }],
+    ['unknown observation', { unknown_observed_at: NOW }],
+    ['corrupt timestamp', { receipt_recorded_at: 'bad' }],
+  ])('rejects context drift: %s', async (_name, change) => {
+    const f = setup();
+    Object.assign(f.contextRow, change);
+    expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+    expect(f.sql().map(stage)).toEqual([
+      'BEGIN',
+      'lock',
+      'context',
+      'ROLLBACK',
+    ]);
+    expect(f.clock).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['subject', { productName: 'Other' }],
+    ['supersedes', { supersedesDecisionId: PRODUCT }],
+    ['raw uncanonical', { productName: ' Collar ' }],
+    ['source case', { sourceRequestId: SOURCE.toLowerCase() }],
+  ])('rejects detached intake drift: %s', async (_name, change) => {
+    const f = setup();
+    f.contextRow.intake = Object.assign({ ...f.contextRow.intake }, change);
+    expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+    expect(f.sql().map(stage)).toEqual([
+      'BEGIN',
+      'lock',
+      'context',
+      'ROLLBACK',
+    ]);
+    expect(f.release).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['lock', { rows: [], rowCount: 0 }],
+    ['lock', { rows: [{ sender_id: SENDER }], rowCount: NaN }],
+    [
+      'lock',
+      { rows: [{ sender_id: SENDER }, { sender_id: SENDER }], rowCount: 2 },
+    ],
+    ['lock', { rows: [null], rowCount: 1 }],
+    ['lock', { rows: [{ sender_id: 'wrong' }], rowCount: 1 }],
+    ['context', { rows: [], rowCount: 0 }],
+    ['context', { rows: [null], rowCount: 1 }],
+    ['context', { rows: [], rowCount: 1 }],
+  ])('holds malformed %s response %#', async (target, response) => {
+    const f = setup();
+    const original = f.query.getMockImplementation()!;
+    f.query.mockImplementation(async (sql, values) =>
+      stage(sql) === target ? response : original(sql, values),
+    );
+    expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+    expect(f.sql().map(stage)).toEqual([
+      ...PATH.slice(0, target === 'lock' ? 2 : 3),
+      'ROLLBACK',
+    ]);
+    expect(f.release).toHaveBeenCalledTimes(1);
+  });
+  it.each(['byte-exact source', 'raw intake', 'candidate context'])(
+    'does not repair %s before binding',
+    async (kind) => {
+      const f = setup();
+      if (kind === 'byte-exact source') {
+        f.contextRow.request_key = SOURCE.toLowerCase();
+        f.contextRow.intake = {
+          ...f.contextRow.intake,
+          sourceRequestId: SOURCE.toLowerCase(),
+        };
+      } else if (kind === 'raw intake') {
+        // Both copies agree, but normalization must not silently repair either.
+        Object.assign(f.contextRow.intake, { productName: ' Collar ' });
+      } else {
+        Object.assign(f.candidate.context, { backendDecisionId: PRODUCT });
+      }
+      expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+      expect(f.sql().map(stage)).toEqual([...PATH.slice(0, 3), 'ROLLBACK']);
+      expect(f.clock).not.toHaveBeenCalled();
+      expect(f.release).toHaveBeenCalledTimes(1);
+    },
+  );
+  it.each(['', 'bad\u0001branch'])(
+    'holds malformed branch %j before connect',
+    async (branch) => {
+      const f = setup();
+      const store = new PostgresRestockApplicationPreparationStore(
+        { connect: f.connect } as unknown as Pool,
+        branch,
+        f.clock,
+      );
+      expect(await store.preparePending(f.candidate)).toEqual(HOLD);
+      expect(f.connect).not.toHaveBeenCalled();
+      expect(f.query).not.toHaveBeenCalled();
+      expect(f.release).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['action', 'sender', 'decision'])(
+    'holds malformed candidate %s before connect',
+    async (kind) => {
+      const f = setup();
+      if (kind === 'action') Object.assign(f.candidate, { action: 'hold' });
+      if (kind === 'sender')
+        Object.assign(f.candidate.context.reservation, {
+          senderId: ' padded ',
+        });
+      if (kind === 'decision')
+        Object.assign(f.candidate.decision, { id: 'bad' });
+      expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+      expect(f.connect).not.toHaveBeenCalled();
+      expect(f.release).not.toHaveBeenCalled();
+    },
+  );
+  it('accepts reordered context keys without repairing raw intake', async () => {
+    const f = setup();
+    Object.assign(f.candidate, {
+      context: Object.fromEntries(
+        Object.entries(f.candidate.context).reverse(),
+      ),
+    });
+    f.contextRow.intake = Object.fromEntries(
+      Object.entries(f.contextRow.intake).reverse(),
+    ) as typeof f.contextRow.intake;
+    expect(await f.store.preparePending(f.candidate)).toMatchObject({
+      action: 'prepared',
+    });
+    expect(f.sql().map(stage)).toEqual(PATH);
+  });
+  it.each([
+    'subject',
+    'branch',
+    'identity',
+    'invalid clock',
+    'before resolution',
+  ])('ignores cached ready classification for %s', async (kind) => {
+    const f = setup();
+    if (kind === 'subject')
+      Object.assign(f.candidate.decision.snapshot, { productName: 'Other' });
+    if (kind === 'branch')
+      Object.assign(f.candidate.decision.snapshot, { branchId: BRANCH.trim() });
+    if (kind === 'identity')
+      Object.assign(f.candidate.decision, { id: PRODUCT });
+    if (kind === 'invalid clock') f.clock.mockReturnValue(new Date(NaN));
+    if (kind === 'before resolution')
+      f.clock.mockReturnValue(new Date(Date.parse(NOW) - 1));
+    expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+    expect(f.sql().map(stage)).toEqual([
+      'BEGIN',
+      'lock',
+      'context',
+      'ROLLBACK',
+    ]);
+    expect(f.clock).toHaveBeenCalledTimes(1);
+    expect(f.release).toHaveBeenCalledTimes(1);
+  });
+  it.each(['connect', 'lock'])(
+    'detaches nested authority before suspended %s',
+    async (target) => {
+      const f = setup();
+      // Fixture intake aliases the candidate: separate the persisted PG row first.
+      f.contextRow.intake = { ...f.contextRow.intake };
+      const entered = deferred<void>();
+      const resume = deferred<void>();
+      const original = f.query.getMockImplementation()!;
+      if (target === 'connect')
+        f.connect.mockImplementation(async () => {
+          entered.resolve();
+          await resume.promise;
+          return { query: f.query, release: f.release };
+        });
+      else
+        f.query.mockImplementation(async (sql, values) => {
+          if (stage(sql) === 'lock') {
+            entered.resolve();
+            await resume.promise;
+          }
+          return original(sql, values);
+        });
+      const pending = f.store.preparePending(f.candidate);
+      await entered.promise;
+      Object.assign(f.candidate.context.reservation, {
+        senderId: 'changed',
+        requestKey: PRODUCT,
+      });
+      Object.assign(f.candidate.context.reservation.intake, {
+        productName: 'Changed',
+      });
+      Object.assign(f.candidate.decision.snapshot, {
+        productName: 'Changed',
+        branchId: 'changed',
+      });
+      Object.assign(f.candidate.decision.resolution, {
+        resolvedAt: END,
+        restockDays: 9,
+      });
+      Object.assign(f.candidate.decision, { id: PRODUCT, applyBefore: NOW });
+      resume.resolve();
+      expect(await pending).toMatchObject({
+        action: 'prepared',
+        row: {
+          senderId: SENDER,
+          sourceRequestId: SOURCE,
+          decisionId: ID,
+          branchId: BRANCH,
+          resolvedAt: NOW,
+          applyBefore: END,
+        },
+      });
+      expect(f.query.mock.calls[1][1]).toEqual([SENDER]);
+      expect(f.sql().map(stage)).toEqual(PATH);
+      expect(f.release).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('samples freshness only after a suspended locked read crosses expiry', async () => {
+    const f = setup();
+    const entered = deferred<void>();
+    const resume = deferred<void>();
+    const original = f.query.getMockImplementation()!;
+    let current = NOW;
+    const events: string[] = [];
+    f.clock.mockImplementation(() => {
+      events.push('clock');
+      return new Date(current);
+    });
+    f.query.mockImplementation(async (sql, values) => {
+      if (stage(sql) === 'context') {
+        entered.resolve();
+        await resume.promise;
+        events.push('read returned');
+      }
+      return original(sql, values);
+    });
+    const pending = f.store.preparePending(f.candidate);
+    await entered.promise;
+    expect(f.clock).not.toHaveBeenCalled();
+    current = END;
+    Object.assign(f.candidate.classification, { action: 'hold' });
+    resume.resolve();
+    const result = await pending;
+    expect(events).toEqual(['read returned', 'clock']);
+    expect(result).toMatchObject({
+      action: 'prepared',
+      row: { state: 'PENDING_DELIVERY' },
+    });
+    if (result.action === 'prepared')
+      expect(result.row.attemptId).not.toBe(PRODUCT);
+    expect(f.sql().map(stage)).toEqual(PATH);
+  });
+  it.each([false, true])(
+    'awaits delayed COMMIT, rejection=%s',
+    async (fails) => {
+      const f = setup();
+      const entered = deferred<void>();
+      const commit = deferred<{ rows: unknown[]; rowCount: number }>();
+      const original = f.query.getMockImplementation()!;
+      f.query.mockImplementation(async (sql, values) => {
+        if (sql === 'COMMIT') {
+          entered.resolve();
+          return commit.promise;
+        }
+        return original(sql, values);
+      });
+      let settled = false;
+      const pending = f.store.preparePending(f.candidate).then((result) => {
+        settled = true;
+        return result;
+      });
+      await entered.promise;
+      expect(settled).toBe(false);
+      expect(f.release).not.toHaveBeenCalled();
+      if (fails) commit.reject(new Error('private database detail'));
+      else commit.resolve({ rows: [], rowCount: 0 });
+      expect(await pending).toMatchObject({
+        action: fails ? 'hold' : 'prepared',
+      });
+      expect(f.sql().map(stage)).toEqual(fails ? [...PATH, 'ROLLBACK'] : PATH);
+      expect(f.release).toHaveBeenCalledTimes(1);
+    },
+  );
+  it.each([
+    'connect',
+    'BEGIN',
+    'lock',
+    'context',
+    'insert',
+    'conflict',
+    'COMMIT',
+  ])('bounds failure at %s without retry', async (target) => {
+    const f = setup();
+    const original = f.query.getMockImplementation()!;
+    if (target === 'conflict') f.replay();
+    if (target === 'connect')
+      f.connect.mockRejectedValue(new Error('private detail'));
+    f.query.mockImplementation(async (sql, values) => {
+      if (stage(sql) === target) throw new Error('private detail');
+      return original(sql, values);
+    });
+    expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+    const route =
+      target === 'conflict' ? [...PATH.slice(0, 4), 'conflict'] : PATH;
+    expect(f.sql().map(stage)).toEqual(
+      target === 'connect'
+        ? []
+        : [...route.slice(0, route.indexOf(target) + 1), 'ROLLBACK'],
+    );
+    expect(f.connect).toHaveBeenCalledTimes(1);
+    expect(f.release).toHaveBeenCalledTimes(target === 'connect' ? 0 : 1);
+  });
+  it.each(['committed', 'held', 'rollback failed'])(
+    'bounds release failure after %s',
+    async (kind) => {
+      const f = setup();
+      f.release.mockImplementation(() => {
+        throw new Error('SECRET payload');
+      });
+      if (kind !== 'committed') f.mismatch();
+      if (kind === 'rollback failed') f.faults.add('ROLLBACK');
+      await expect(f.store.preparePending(f.candidate)).rejects.toThrow(
+        new Error('restock preparation client release failed'),
+      );
+      expect(f.sql().map(stage)).toEqual(
+        kind === 'committed' ? PATH : ['BEGIN', 'lock', 'ROLLBACK'],
+      );
+      expect(f.release).toHaveBeenCalledTimes(1);
+      if (kind === 'rollback failed')
+        expect(f.release).toHaveBeenCalledWith(
+          new Error('restock preparation rollback failed'),
+        );
+      else expect(f.release).toHaveBeenCalledWith();
+    },
+  );
+  it.each(['binding', 'corrupt'])(
+    'rejects %s conflict ledger without overwrite',
+    async (kind) => {
+      const f = setup();
+      f.replay();
+      const original = f.query.getMockImplementation()!;
+      f.query.mockImplementation(async (sql, values) => {
+        const response = await original(sql, values);
+        if (stage(sql) === 'conflict') {
+          const row = response.rows[0] as Record<string, unknown>;
+          if (kind === 'binding') {
+            row.branch_id = 'other branch';
+            Object.assign(row.row_data as object, { branchId: 'other branch' });
+          } else row.row_data = { state: 'invalid' };
+        }
+        return response;
+      });
+      expect(await f.store.preparePending(f.candidate)).toEqual(HOLD);
+      expect(f.sql().map(stage)).toEqual([
+        ...PATH.slice(0, 4),
+        'conflict',
+        'ROLLBACK',
+      ]);
+      expect(f.release).toHaveBeenCalledTimes(1);
+    },
+  );
+});
+
 describe('unwired transactional pending preparation', () => {
   it.each([NOW, END])(
     'prepares pending at fresh time %s, never starts or expires',
