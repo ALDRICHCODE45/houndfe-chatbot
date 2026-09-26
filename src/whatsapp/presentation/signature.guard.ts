@@ -12,6 +12,19 @@ type RawBodyRequest = Request & {
   rawBody?: Buffer;
 };
 
+export type VerifiedWebhookSnapshot = Readonly<{
+  rawBodyBase64: string;
+  observedAt: string;
+}>;
+
+const verifiedSnapshots = new WeakMap<object, VerifiedWebhookSnapshot>();
+
+export function readVerifiedWebhookSnapshot(
+  request: object,
+): VerifiedWebhookSnapshot | null {
+  return verifiedSnapshots.get(request) ?? null;
+}
+
 const SIGNATURE_HEADER_PREFIX = 'sha256=';
 
 @Injectable()
@@ -20,13 +33,21 @@ export class SignatureGuard implements CanActivate {
 
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest<RawBodyRequest>();
+    verifiedSnapshots.delete(request);
     const signatureHeader = this.readSignatureHeader(request);
     const receivedDigest = Buffer.from(
       signatureHeader.slice(SIGNATURE_HEADER_PREFIX.length),
       'hex',
     );
+    const rawBody = request.rawBody;
+    if (!Buffer.isBuffer(rawBody)) {
+      throw new UnauthorizedException(
+        'Missing raw request body for signature verification',
+      );
+    }
+    const verifiedBytes = Buffer.from(rawBody);
     const expectedDigest = Buffer.from(
-      this.computeDigest(request.rawBody),
+      this.computeDigest(verifiedBytes),
       'hex',
     );
 
@@ -38,16 +59,21 @@ export class SignatureGuard implements CanActivate {
       throw new UnauthorizedException('Invalid X-Hub-Signature-256 header');
     }
 
-    return true;
-  }
-
-  private computeDigest(rawBody: Buffer | undefined): string {
-    if (!Buffer.isBuffer(rawBody)) {
-      throw new UnauthorizedException(
-        'Missing raw request body for signature verification',
+    if (this.configService.get('humanDecisions.restockEnabled') === true) {
+      verifiedSnapshots.set(
+        request,
+        Object.freeze({
+          rawBodyBase64: verifiedBytes.toString('base64'),
+          // Local successful-verification time, not socket or global arrival time.
+          observedAt: new Date().toISOString(),
+        }),
       );
     }
 
+    return true;
+  }
+
+  private computeDigest(rawBody: Buffer): string {
     const appSecret = this.configService.getOrThrow<string>('meta.appSecret');
 
     return crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');

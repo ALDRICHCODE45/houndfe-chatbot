@@ -15,7 +15,7 @@ describe('WebhookController', () => {
 
   let controller: WebhookController;
   let dispatcher: jest.Mocked<Pick<WebhookDispatcherService, 'dispatch'>>;
-  let configService: jest.Mocked<Pick<ConfigService, 'getOrThrow'>>;
+  let configService: jest.Mocked<Pick<ConfigService, 'getOrThrow' | 'get'>>;
 
   beforeEach(() => {
     dispatcher = {
@@ -23,6 +23,7 @@ describe('WebhookController', () => {
     };
 
     configService = {
+      get: jest.fn().mockReturnValue(undefined),
       getOrThrow: jest.fn((key: string) => {
         const values: Record<string, string> = {
           'meta.verifyToken': verifyToken,
@@ -31,7 +32,7 @@ describe('WebhookController', () => {
 
         return values[key];
       }),
-    } as unknown as jest.Mocked<Pick<ConfigService, 'getOrThrow'>>;
+    } as unknown as jest.Mocked<Pick<ConfigService, 'getOrThrow' | 'get'>>;
 
     controller = new WebhookController(
       configService as unknown as ConfigService,

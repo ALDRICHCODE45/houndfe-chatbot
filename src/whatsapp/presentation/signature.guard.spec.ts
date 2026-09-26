@@ -11,11 +11,12 @@ import * as crypto from 'crypto';
 import { UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ExecutionContext } from '@nestjs/common';
-import { SignatureGuard } from './signature.guard';
+import { readVerifiedWebhookSnapshot, SignatureGuard } from './signature.guard';
 
 type MockRequest = {
   rawBody?: Buffer;
   headers: Record<string, string | undefined>;
+  body?: { text: string };
 };
 
 describe('SignatureGuard', () => {
@@ -38,6 +39,7 @@ describe('SignatureGuard', () => {
   );
 
   let guard: SignatureGuard;
+  let configService: ConfigService;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -45,10 +47,19 @@ describe('SignatureGuard', () => {
     // In-memory `ConfigService`: `meta.appSecret` resolves through the internal
     // config via dot-notation, matching the production runtime contract instead
     // of a partial mock of the overloaded `getOrThrow`.
-    const configService = new ConfigService({ meta: { appSecret } });
+    configService = new ConfigService({ meta: { appSecret } });
 
     guard = new SignatureGuard(configService);
   });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  function signedRequest(rawBody = Buffer.from(payload)): MockRequest {
+    return { rawBody, headers: { 'x-hub-signature-256': sign(rawBody) } };
+  }
 
   function sign(body: Buffer) {
     return `sha256=${crypto.createHmac('sha256', appSecret).update(body).digest('hex')}`;
@@ -61,6 +72,131 @@ describe('SignatureGuard', () => {
       }),
     } as ExecutionContext;
   }
+
+  describe('verified raw snapshot', () => {
+    beforeEach(() => {
+      configService.set('humanDecisions.restockEnabled', true);
+    });
+
+    it('publishes frozen exact bytes with local post-verification UTC milliseconds', () => {
+      jest.useFakeTimers().setSystemTime(new Date('2026-07-01T10:00:00.001Z'));
+      const request = Object.assign(signedRequest(Buffer.from('¡Hola 🐶!')), {
+        observedAt: '2000-01-01T00:00:00.000Z',
+      });
+      jest.mocked(crypto.timingSafeEqual).mockImplementationOnce(() => {
+        jest.setSystemTime(new Date('2026-07-01T10:00:00.123Z'));
+        return true;
+      });
+
+      expect(guard.canActivate(executionContextFor(request))).toBe(true);
+      const snapshot = readVerifiedWebhookSnapshot(request);
+      expect(snapshot).toEqual({
+        rawBodyBase64: Buffer.from('¡Hola 🐶!').toString('base64'),
+        observedAt: '2026-07-01T10:00:00.123Z',
+      });
+      expect(Object.isFrozen(snapshot)).toBe(true);
+      jest.advanceTimersByTime(5000);
+      expect(readVerifiedWebhookSnapshot(request)).toBe(snapshot);
+      expect(snapshot?.observedAt).toBe('2026-07-01T10:00:00.123Z');
+    });
+
+    it('isolates bytes from later buffer, rawBody, parsed body and result mutations', () => {
+      const request = signedRequest();
+      request.body = { text: 'original' };
+      guard.canActivate(executionContextFor(request));
+      const snapshot = readVerifiedWebhookSnapshot(request);
+      expect(snapshot).not.toBeNull();
+      request.rawBody!.fill(0);
+      request.rawBody = Buffer.from('replacement');
+      request.body.text = 'changed';
+      request.body = { text: 'replaced' };
+      expect(() =>
+        Object.assign(snapshot!, { rawBodyBase64: 'forged' }),
+      ).toThrow(TypeError);
+      expect(() => Object.assign(snapshot!, { observedAt: 'forged' })).toThrow(
+        TypeError,
+      );
+      expect(readVerifiedWebhookSnapshot(request)).toBe(snapshot);
+      expect(snapshot?.rawBodyBase64).toBe(payload.toString('base64'));
+    });
+
+    it('publishes the detached bytes used by HMAC, not a later request buffer', () => {
+      const request = signedRequest();
+      const original = request.rawBody!;
+      const actualCompare =
+        jest.requireActual<typeof import('crypto')>('crypto').timingSafeEqual;
+      jest.mocked(crypto.timingSafeEqual).mockImplementationOnce((a, b) => {
+        original.fill(0);
+        request.rawBody = Buffer.from('replacement');
+        return actualCompare(a, b);
+      });
+      expect(guard.canActivate(executionContextFor(request))).toBe(true);
+      expect(readVerifiedWebhookSnapshot(request)?.rawBodyBase64).toBe(
+        payload.toString('base64'),
+      );
+    });
+
+    it('preserves authenticated invalid UTF-8 as raw bytes without JSON admission', () => {
+      const bytes = Buffer.from([0xff, 0xc3, 0x28, 0x00]);
+      const request = signedRequest(bytes);
+      expect(guard.canActivate(executionContextFor(request))).toBe(true);
+      expect(readVerifiedWebhookSnapshot(request)?.rawBodyBase64).toBe(
+        bytes.toString('base64'),
+      );
+    });
+
+    it('does not transfer proof to an independent request or accept spoofed properties', () => {
+      const request = signedRequest();
+      guard.canActivate(executionContextFor(request));
+      const snapshot = readVerifiedWebhookSnapshot(request);
+      expect(snapshot).not.toBeNull();
+      const other = Object.assign(signedRequest(), {
+        verifiedWebhookSnapshot: snapshot,
+        verified: true,
+        body: { text: 'forged', verifiedWebhookSnapshot: snapshot },
+      });
+      expect(readVerifiedWebhookSnapshot(other)).toBeNull();
+      expect(readVerifiedWebhookSnapshot(other.body)).toBeNull();
+    });
+
+    it.each(['corrupt MAC', 'missing MAC', 'missing raw body'])(
+      'leaves no proof on %s, including after earlier success',
+      (failure) => {
+        for (const previouslyVerified of [false, true]) {
+          const request = signedRequest();
+          if (previouslyVerified) {
+            guard.canActivate(executionContextFor(request));
+            expect(readVerifiedWebhookSnapshot(request)).not.toBeNull();
+          }
+          if (failure === 'missing raw body') delete request.rawBody;
+          else
+            request.headers['x-hub-signature-256'] =
+              failure === 'missing MAC'
+                ? undefined
+                : `sha256=${'0'.repeat(64)}`;
+          expect(() => guard.canActivate(executionContextFor(request))).toThrow(
+            UnauthorizedException,
+          );
+          expect(readVerifiedWebhookSnapshot(request)).toBeNull();
+        }
+      },
+    );
+
+    it.each([false, undefined, 'true'])(
+      'publishes no snapshot for flag %p and clears earlier proof',
+      (flag) => {
+        const request = signedRequest();
+        guard.canActivate(executionContextFor(request));
+        expect(readVerifiedWebhookSnapshot(request)).not.toBeNull();
+        configService.set('humanDecisions.restockEnabled', flag);
+        expect(guard.canActivate(executionContextFor(request))).toBe(true);
+        expect(readVerifiedWebhookSnapshot(request)).toBeNull();
+        const fresh = signedRequest();
+        expect(guard.canActivate(executionContextFor(fresh))).toBe(true);
+        expect(readVerifiedWebhookSnapshot(fresh)).toBeNull();
+      },
+    );
+  });
 
   it('accepts a valid Meta signature computed from the exact raw body bytes', () => {
     const request: MockRequest = {
