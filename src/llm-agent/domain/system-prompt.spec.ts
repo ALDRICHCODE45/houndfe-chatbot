@@ -14,6 +14,21 @@ describe('SYSTEM_PROMPT', () => {
     expect(SYSTEM_PROMPT).toContain('esa función aún no está disponible');
   });
 
+  it('reserves refusal for unsupported functions, not missing replenishment dates', () => {
+    expect(SYSTEM_PROMPT).toContain('función realmente no cubierta');
+    expect(SYSTEM_PROMPT).toContain('esa función aún no está disponible');
+    expect(SYSTEM_PROMPT).toContain('sin exigir compromiso de compra');
+    expect(SYSTEM_PROMPT).toContain(
+      'La falta de una fecha confirmada es un dato faltante, no una función no disponible',
+    );
+    expect(SYSTEM_PROMPT).toContain(
+      'indica que no tienes una fecha confirmada',
+    );
+    expect(SYSTEM_PROMPT).toContain(
+      'no inventes fechas ni prometas obtenerlas',
+    );
+  });
+
   it('mandates neutral professional Mexican Spanish', () => {
     // The prompt must say "español mexicano" (or close paraphrase) AND
     // require neutral/professional tone.

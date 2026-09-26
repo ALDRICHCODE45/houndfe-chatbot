@@ -1,3 +1,4 @@
+import { SYSTEM_PROMPT } from '../../llm-agent/domain/system-prompt';
 import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import {
   SALE_FLOW_INSTRUCTIONS,
@@ -179,6 +180,79 @@ describe('sale-flow-instructions', () => {
     });
   });
 
+  describe('replenishment ETA guidance (text contract only, not model compliance)', () => {
+    it.each([false, true])(
+      'supports ordinary date inquiries with shipping enabled=%s',
+      (shippingQuoteAvailable) => {
+        const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
+          shippingQuoteAvailable,
+        });
+        expect(prompt).toContain('¿Hay alguna fecha aproximada');
+        expect(prompt).toContain('disponibilidad del producto?');
+        expect(prompt).toContain('sin exigir compromiso de compra');
+        expect(prompt).toContain(
+          'no tienes una fecha de reposición confirmada',
+        );
+        expect(prompt).toContain(
+          '`checkStock` consulta existencias, no proporciona una fecha de reposición',
+        );
+        expect(prompt).toContain('Nunca inventes una fecha de reposición');
+        expect(prompt).not.toContain(
+          'Si la conversación no se trata de una venta',
+        );
+        expect(prompt).toContain(
+          'no para consultas de disponibilidad ni para la falta de una fecha de reposición',
+        );
+        expect(prompt).toContain(
+          'Las preguntas de disponibilidad o fecha de reposición no activan esa frase',
+        );
+      },
+    );
+
+    it('keeps ETA inquiries behind product confirmation, real-ID recovery and validated shortage', () => {
+      const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
+      expect(prompt).toContain(
+        'sigue la confirmación del paso 4 y la consulta del paso 5',
+      );
+      expect(prompt).toContain('confirma la presentación real devuelta');
+      expect(prompt).toContain('(y variante, si aplica)');
+      expect(prompt).toContain('vuelve a buscar con `searchCatalog`');
+      expect(prompt).toContain('Nunca reconstruyas IDs desde nombres');
+      expect(prompt).toContain(
+        "SOLO el sobre de `checkStock` con `humanAssistance` y `kind: 'out_of_stock'` habilita la ruta RESTOCK",
+      );
+      expect(prompt).toContain(
+        'Preguntar por una fecha no confirma el producto ni registra una solicitud',
+      );
+    });
+
+    it('makes quantity optional without fabricating it or bypassing RESTOCK preflight', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        '`quantity` es opcional en el digest: omítela si el cliente no la indicó',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('no supongas una unidad');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Su ausencia no es un requisito técnico pendiente de RESTOCK ni activa una solicitud',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'El preflight de RESTOCK sigue siendo obligatorio',
+      );
+    });
+
+    it('keeps historical intake distinct from contact, notification and follow-up', () => {
+      const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
+      expect(prompt).toContain("outcome: 'historical_intake_recorded'");
+      expect(prompt).toContain(
+        'NO hubo contacto humano ni notificación al cliente',
+      );
+      expect(prompt).toContain(
+        'no hay resolución actual, ETA, respuesta humana',
+      );
+      expect(prompt).toContain('no prometas seguimiento');
+      expect(prompt).toContain('NO reintentes, NO escales por la vía legado');
+    });
+  });
+
   describe('composeSaleFlowSystemPrompt', () => {
     it('returns base + "\\n\\n" + slice (one-arg composer)', () => {
       expect(composeSaleFlowSystemPrompt(base)).toBe(
@@ -223,7 +297,7 @@ describe('sale-flow-instructions', () => {
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain('expiration_date');
       // The refusal phrase stays byte-identical but is explicitly NOT the
-      // R14 reply (it is reserved for features we never plan to tool).
+      // R14 reply (it is reserved for functions not covered by tools).
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'esa función aún no está disponible',
       );
