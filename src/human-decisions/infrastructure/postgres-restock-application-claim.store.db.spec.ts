@@ -1,3 +1,6 @@
+import { PostgresRestockApplicationCompletionStore } from './postgres-restock-application-completion.store';
+import { PostgresRestockApplicationLedgerStore } from './postgres-restock-application-ledger.store';
+import { prepareRestockApplicationOutcome } from '../domain/restock-application-ledger-ack-preparation';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -91,6 +94,10 @@ const settle = <T>(promise: Promise<T>) =>
 
 ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
   jest.setTimeout(180_000);
+  // Forensic-only bounded markers: static labels, generated ID and timing.
+  // No URI, config, or environment values are emitted.
+  const stage = (label: string) =>
+    process.stderr.write(`[claim-db] ${label} t=${Date.now()}\n`);
   let container: StartedPostgreSqlContainer | undefined;
   let pools: Pool[] = [];
   let observer: Pool;
@@ -120,7 +127,10 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
   };
   beforeAll(async () => {
     try {
+      stage('container.start.begin');
       container = await new PostgreSqlContainer('postgres:16-alpine').start();
+      stage(`container.start.end id=${container.getId()}`);
+      stage('migration.begin');
       execFileSync(
         process.execPath,
         [
@@ -140,6 +150,7 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
           timeout: 60_000,
         },
       );
+      stage('migration.end');
       const options = {
         connectionString: container.getConnectionUri(),
         max: 1,
@@ -152,27 +163,37 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
       };
       pools = [new Pool(options), new Pool(options), new Pool(options)];
       observer = pools[2];
+      stage('setup.ready');
     } catch {
       throw new Error('Disposable claim fixture setup/migration to 260 failed');
     }
   });
   afterAll(async () => {
+    stage('cleanup.begin');
     try {
       const ended = await Promise.allSettled(pools.map((pool) => pool.end()));
+      stage('cleanup.pools.end');
       if (ended.some((result) => result.status === 'rejected'))
         throw new Error('Claim fixture pool cleanup failed');
     } finally {
       await container?.stop();
+      stage('cleanup.end');
     }
   });
   beforeEach(async () => {
+    stage(`test.begin ${expect.getState().currentTestName ?? 'unknown'}`);
+    stage('seed.truncate.begin');
     await observer.query(
       'TRUNCATE restock_application_ledger, restock_inbound_evidence, human_decision_reservations, conversation_state',
     );
+    stage('seed.truncate.end');
+    stage('seed.evidence.begin');
     expect(
       await new PostgresRestockInboundEvidenceStore(observer).record(evidence),
     ).toEqual({ action: 'recorded', evidence });
+    stage('seed.evidence.end');
     // Explicitly synthetic POST receipt fixture, not a backend request.
+    stage('seed.reservation.begin');
     await observer.query(
       `INSERT INTO human_decision_reservations
       (sender_id, route, request_key, status, intake, post_state,
@@ -180,12 +201,17 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
       VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3, 'RECEIPT_RECORDED', $4, $5, $5)`,
       [SENDER, evidence.sourceRequestId, JSON.stringify(intake), ID, NOW],
     );
+    stage('seed.reservation.end');
+    stage('seed.conversation.begin');
     await observer.query(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
       VALUES ($1, $2, $3)`,
       [SENDER, NOW, JSON.stringify({ messages: [] })],
     );
+    stage('seed.conversation.end');
+    stage('beforeEach.done');
   });
+  afterEach(() => stage('test.end'));
   async function prepared() {
     const candidate = await new RestockApplicationCandidateService(
       new PostgresRestockApplicationContextStore(observer),
@@ -207,6 +233,195 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
       throw new Error('Expected real pending preparation');
     return { candidate, pending: result.row };
   }
+  describe('unwired completion against durable local terminal ACK', () => {
+    const completion = (pool: Pick<Pool, 'query'> = pools[0]) =>
+      new PostgresRestockApplicationCompletionStore(pool, BRANCH);
+    // Synthetic port only; Pool['query'] overloads are not mockable directly.
+    const fakeQuery = (query: unknown): Pick<Pool, 'query'> =>
+      ({ query }) as unknown as Pick<Pool, 'query'>;
+    async function acknowledged(state = 'PROVIDER_ACCEPTED') {
+      stage('ack.prepared.begin');
+      const { candidate, pending } = await prepared();
+      stage('ack.prepared.end');
+      stage('ack.claim.begin');
+      const claimed = await store(
+        pools[0],
+        state === 'STALE' ? END : NOW,
+      ).claimPending(candidate, pending, TOKENS[0]);
+      stage('ack.claim.end');
+      if (claimed.action !== 'started' && claimed.action !== 'stale')
+        throw new Error('Expected real terminal preparation');
+      let row: unknown = claimed.row;
+      const persistence = new PostgresRestockApplicationLedgerStore(pools[0]);
+      if (claimed.action === 'started') {
+        stage('ack.acceptance.begin');
+        const accepted = await persistence.recordAcceptance({
+          row: claimed.row,
+          event: {
+            kind: 'provider_accepted',
+            attemptId: claimed.row.attemptId,
+            sendToken: TOKENS[0],
+            providerMessageId: 'wamid.synthetic.acceptance',
+            providerAcceptedObservedAt:
+              state === 'PROVIDER_ACCEPTED_LATE' ? END : NOW,
+          },
+        });
+        stage('ack.acceptance.end');
+        if (accepted.action !== 'updated')
+          throw new Error('Expected acceptance');
+        row = accepted.row;
+      }
+      const outcome = prepareRestockApplicationOutcome(row);
+      if (outcome.action !== 'prepared') throw new Error('Expected outcome');
+      // Explicit synthetic backend ACK; no backend or provider call.
+      stage('ack.record.begin');
+      const ack = await persistence.recordOutcomeAck(outcome.expected, {
+        id: outcome.decisionId,
+        version: 2,
+        attemptId: outcome.request.attemptId,
+        outcome: outcome.request.outcome,
+        ackReceivedAt: NOW,
+      });
+      stage('ack.record.end');
+      if (ack.action !== 'recorded') throw new Error('Expected durable ACK');
+      return ack.record;
+    }
+    it.each(['PROVIDER_ACCEPTED', 'PROVIDER_ACCEPTED_LATE', 'STALE'])(
+      'closes %s once; replay changes no reservation bytes or xmin',
+      async (state) => {
+        const record = await acknowledged(state);
+        const before = (await originals()) as Record<string, unknown>[][];
+        const application = await ledger();
+        expect(await completion().closeAcknowledged(record)).toEqual({
+          action: 'closed',
+        });
+        const after = (await originals()) as Record<string, unknown>[][];
+        expect(after[0]).toEqual(before[0]);
+        expect(after[2]).toEqual(before[2]);
+        expect(after[1]).toHaveLength(1);
+        expect(after[1][0]).toEqual({
+          ...before[1][0],
+          status: 'CLOSED',
+          updated_at: after[1][0].updated_at,
+          revision: after[1][0].revision,
+        });
+        expect(after[1][0].revision).not.toBe(before[1][0].revision);
+        expect(await completion().closeAcknowledged(record)).toEqual({
+          action: 'replay',
+        });
+        expect(await originals()).toEqual(after);
+        expect(await ledger()).toEqual(application);
+      },
+    );
+    // Keep every tuple arity 3: jest-each injects `done` into short rows.
+    it.each<[string, string, string | undefined]>([
+      [
+        'missing ACK',
+        'UPDATE restock_application_ledger SET ack_receipt=NULL',
+        undefined,
+      ],
+      [
+        'different ACK',
+        `UPDATE restock_application_ledger SET ack_receipt=jsonb_set(ack_receipt,'{ackReceivedAt}',to_jsonb($1::text))`,
+        END,
+      ],
+      [
+        'different terminal row',
+        `UPDATE restock_application_ledger SET row_data=jsonb_set(row_data,'{providerMessageId}',to_jsonb($1::text))`,
+        'wamid.other',
+      ],
+      [
+        'different branch',
+        `UPDATE restock_application_ledger
+         SET branch_id=$1, row_data=jsonb_set(row_data,'{branchId}',to_jsonb($1::text))`,
+        'other',
+      ],
+      [
+        'different source scalar',
+        `UPDATE restock_application_ledger
+         SET source_request_id=$1::uuid,
+             row_data=jsonb_set(row_data,'{sourceRequestId}',to_jsonb($1::text))`,
+        TOKENS[1],
+      ],
+      [
+        'different receipt identity',
+        'UPDATE human_decision_reservations SET backend_decision_id=$1::uuid',
+        TOKENS[1],
+      ],
+      [
+        'LEGACY_OPS route',
+        `UPDATE human_decision_reservations
+         SET route='LEGACY_OPS', request_key='abcdef123456', intake=NULL,
+             post_state=NULL, backend_decision_id=NULL,
+             post_attempted_at=NULL, receipt_recorded_at=NULL`,
+        undefined,
+      ],
+      [
+        'request key case',
+        `UPDATE human_decision_reservations
+         SET request_key=upper(request_key),
+             intake=jsonb_set(intake,'{sourceRequestId}',to_jsonb(upper(request_key)))`,
+        undefined,
+      ],
+    ])('holds SQL mismatch: %s', async (_label, sql, value) => {
+      const record = await acknowledged();
+      // Deliberate raw-SQL corruption is negative proof, not a supported port.
+      await observer.query(sql, value === undefined ? [] : [value]);
+      const before = await originals();
+      const application = await ledger();
+      expect(await completion().closeAcknowledged(record)).toEqual({
+        action: 'hold',
+      });
+      expect(await originals()).toEqual(before);
+      expect(await ledger()).toEqual(application);
+    });
+    it('old source A replays without closing active successor B', async () => {
+      const record = await acknowledged();
+      expect(await completion().closeAcknowledged(record)).toEqual({
+        action: 'closed',
+      });
+      await observer.query(
+        `INSERT INTO human_decision_reservations
+        (sender_id, route, request_key, status, intake, post_state,
+         backend_decision_id, post_attempted_at, receipt_recorded_at)
+        VALUES ($1,'RESTOCK',$2,'ACTIVE',$3,'RECEIPT_RECORDED',$4,$5,$5)`,
+        [
+          SENDER,
+          TOKENS[1],
+          JSON.stringify({ ...intake, sourceRequestId: TOKENS[1] }),
+          TOKENS[1],
+          NOW,
+        ],
+      );
+      const before = await originals();
+      expect(await completion().closeAcknowledged(record)).toEqual({
+        action: 'replay',
+      });
+      expect(await originals()).toEqual(before);
+    });
+    it('SIMULATED result loss holds without retry/readback although SQL committed', async () => {
+      const record = await acknowledged();
+      const query = jest.fn(async (sql: string, values?: unknown[]) => {
+        await pools[0].query(sql, values);
+        throw new Error('simulated application result loss');
+      });
+      expect(
+        await completion(fakeQuery(query)).closeAcknowledged(record),
+      ).toEqual({ action: 'hold' });
+      expect(query).toHaveBeenCalledTimes(1);
+      // Independent observer, not adapter reconciliation or real connection loss.
+      expect(
+        ((await originals()) as Record<string, unknown>[][])[1][0].status,
+      ).toBe('CLOSED');
+    });
+    it('rejects invalid records before SQL', async () => {
+      const query = jest.fn();
+      expect(
+        await completion(fakeQuery(query)).closeAcknowledged(null),
+      ).toEqual({ action: 'hold' });
+      expect(query).not.toHaveBeenCalled();
+    });
+  });
   async function idle(pool: Pool) {
     const pid = (
       await pool.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
