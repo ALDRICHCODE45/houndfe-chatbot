@@ -29,6 +29,12 @@ import { PostgresReceiptOutboxStore } from '../receipt-media/infrastructure/post
 import { ReceiptMediaIngestionWorker } from '../receipt-media/infrastructure/receipt-media-ingestion.worker';
 import { ReceiptMediaNotificationWorker } from '../receipt-media/infrastructure/receipt-media-notification.worker';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
+import { bindRestockInboundEvidence } from '../human-decisions/domain/restock-inbound-evidence';
+import { RestockInboundCapture } from './application/restock-inbound-capture';
+import {
+  RECENT_OUTBOUND,
+  type RecentOutboundStore,
+} from './domain/recent-outbound.store';
 import { WebhookDispatcherService } from './application/webhook-dispatcher.service';
 import { WHATSAPP_SENDER } from './domain/whatsapp-sender.port';
 import { WhatsappModule } from './whatsapp.module';
@@ -71,6 +77,7 @@ const BASE_ENV: Record<string, string> = {
   LLM_MODEL: 'm',
   DATABASE_URL: 'postgres://u:p@localhost:5432/d',
   OPS_CHANNEL_PHONE: '5215500000000',
+  HUMAN_DECISIONS_RESTOCK_ENABLED: 'false',
 };
 
 /** Enabled receipt environment over the validated WU1C field set. */
@@ -401,6 +408,144 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
       await moduleRef.close().catch(() => undefined);
       await drainMicrotasks();
     }
+  });
+
+  it('resolves an inert disabled restock capture before parsing a snapshot', async () => {
+    const pool = stubPool();
+    await withHostModule(
+      RECEIPT_DISABLED_ENV,
+      async (moduleRef) => {
+        await moduleRef.init();
+        const capture = moduleRef.get(RestockInboundCapture);
+        expect(capture).toBeInstanceOf(RestockInboundCapture);
+        expect(await capture.capture(null)).toEqual({ action: 'disabled' });
+        expect(pool.query).not.toHaveBeenCalled();
+        expect(pool.connect).not.toHaveBeenCalled();
+      },
+      pool,
+    );
+    expect(pool.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('wires enabled capture to the same pool, configured channel, ops and echo filter', async () => {
+    const pool = stubPool();
+    pool.query.mockImplementation((_sql: string, params: unknown[]) =>
+      Promise.resolve({
+        rows: [
+          {
+            sourceRequestId: params[0],
+            receivingPhoneNumberId: params[1],
+            senderId: params[2],
+            messageId: params[3],
+            providerTimestampSeconds: params[4],
+            observedAt: params[5],
+            version: params[6],
+          },
+        ],
+        rowCount: 1,
+      }),
+    );
+    await withHostModule(
+      { ...RECEIPT_DISABLED_ENV, HUMAN_DECISIONS_RESTOCK_ENABLED: 'true' },
+      async (moduleRef) => {
+        await moduleRef.init();
+        const capture = moduleRef.get(RestockInboundCapture);
+        expect(capture).toBeInstanceOf(RestockInboundCapture);
+        expect(pool.query).not.toHaveBeenCalled();
+        expect(pool.connect).not.toHaveBeenCalled();
+        // Synthetic composition input, not proof of HTTP authentication.
+        const observedAt = '2026-06-22T12:00:00.000Z';
+        const message = {
+          id: 'wamid.module-capture',
+          from: '525511111111',
+          timestamp: '1700000000',
+          type: 'text',
+          text: { body: 'Restock please' },
+        };
+        const event = (phone: string, from = message.from) => ({
+          object: 'whatsapp_business_account',
+          entry: [
+            {
+              changes: [
+                {
+                  field: 'messages',
+                  value: {
+                    metadata: {
+                      phone_number_id: phone,
+                      display_phone_number: BASE_ENV.META_PHONE_NUMBER_ID,
+                    },
+                    messages: [{ ...message, from }],
+                  },
+                },
+              ],
+            },
+          ],
+        });
+        const snapshot = (phone: string, from = message.from) => ({
+          rawBodyBase64: Buffer.from(
+            JSON.stringify(event(phone, from)),
+          ).toString('base64'),
+          observedAt,
+        });
+        expect(await capture.capture(snapshot('wrong-channel'))).toEqual({
+          action: 'hold',
+        });
+        expect(
+          await capture.capture(
+            snapshot(BASE_ENV.META_PHONE_NUMBER_ID, BASE_ENV.OPS_CHANNEL_PHONE),
+          ),
+        ).toMatchObject({ action: 'captured', evidence: [] });
+        expect(pool.query).not.toHaveBeenCalled();
+        const result = await capture.capture(
+          snapshot(BASE_ENV.META_PHONE_NUMBER_ID),
+        );
+        const expected = bindRestockInboundEvidence(
+          {
+            event: {
+              receivingPhoneNumberId: BASE_ENV.META_PHONE_NUMBER_ID,
+              senderId: message.from,
+              messageId: message.id,
+            },
+            providerTimestampSeconds: message.timestamp,
+            observedAt,
+          },
+          BASE_ENV.META_PHONE_NUMBER_ID,
+        );
+        expect(expected).not.toBeNull();
+        expect(result).toEqual({
+          action: 'captured',
+          event: event(BASE_ENV.META_PHONE_NUMBER_ID),
+          evidence: [expected],
+        });
+        if (result.action !== 'captured')
+          throw new Error('capture did not record');
+        expect(Object.isFrozen(result.evidence)).toBe(true);
+        expect(Object.isFrozen(result.evidence[0])).toBe(true);
+        expect(pool.query).toHaveBeenCalledTimes(1);
+        expect(pool.query).toHaveBeenCalledWith(
+          expect.stringMatching(/INSERT INTO restock_inbound_evidence/),
+          [
+            expected?.sourceRequestId,
+            BASE_ENV.META_PHONE_NUMBER_ID,
+            message.from,
+            message.id,
+            message.timestamp,
+            observedAt,
+            1,
+          ],
+        );
+        moduleRef
+          .get<RecentOutboundStore>(RECENT_OUTBOUND)
+          .remember(message.id);
+        expect(
+          await capture.capture(snapshot(BASE_ENV.META_PHONE_NUMBER_ID)),
+        ).toMatchObject({ action: 'captured', evidence: [] });
+        expect(pool.query).toHaveBeenCalledTimes(1);
+        expect(pool.connect).not.toHaveBeenCalled();
+      },
+      pool,
+    );
+    expect(pool.end).toHaveBeenCalledTimes(1);
   });
 
   it('declares ReceiptMediaModule among the host imports', () => {
