@@ -1,3 +1,6 @@
+import { Logger } from '@nestjs/common';
+import crypto from 'node:crypto';
+import * as preflight from '../../../human-decisions/application/restock-request-preflight';
 import type { HumanHandoffService } from '../../../human-handoff/application/human-handoff.service';
 import {
   type HumanHandoffCreateResult,
@@ -360,7 +363,7 @@ describe('makeRequestHumanAssistanceTool', () => {
           restockIntentPresent: false,
         })),
       };
-      const coordinator = overrides.coordinator ?? {
+      const coordinator: { coordinate: jest.Mock } = overrides.coordinator ?? {
         coordinate: jest.fn(async () => ({
           decision: 'recorded' as const,
           historicalPollId: 'BACKEND-POLL-ID-1',
@@ -389,6 +392,258 @@ describe('makeRequestHumanAssistanceTool', () => {
       };
       return { deps, markers, coordinator, create, getStock, getState };
     }
+
+    describe('fixed server-only diagnostics', () => {
+      const success = {
+        ok: true,
+        outcome: 'historical_intake_recorded',
+        customerNotified: false,
+      };
+      const attemptId = '10000000-0000-4000-8000-000000000001';
+      let log: jest.SpyInstance;
+      let uuid: jest.SpyInstance;
+      const run = (deps: ReturnType<typeof buildRestockDeps>['deps']) =>
+        makeRequestHumanAssistanceTool(deps).execute(outOfStockInput, {
+          toolCallId: 'PRIVATE-SDK-ID',
+          messages: [],
+          context: { senderId: SENDER, inboundEvent: INBOUND },
+        });
+      const expectLog = (stage: string, outcome: string, reason = 'none') => {
+        expect(log.mock.calls).toEqual([
+          [
+            `restock_diagnostic attemptId=${attemptId} stage=${stage} outcome=${outcome} reason=${reason}`,
+          ],
+        ]);
+      };
+      beforeEach(() => {
+        log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
+        uuid = jest.spyOn(crypto, 'randomUUID').mockReturnValue(attemptId);
+      });
+      afterEach(() => jest.restoreAllMocks());
+
+      it.each([
+        'identity_unbound',
+        'marker_read_failed',
+        'invalid_digest',
+        'catalog_read_failed',
+        'catalog_unverified',
+        'existing_legacy',
+        'existing_restock',
+        'conflicting_markers',
+        'indeterminate_marker_state',
+        'route_not_available',
+      ])('observes preflight blocked %s', async (reason) => {
+        jest.spyOn(preflight, 'preflightRestockRequest').mockResolvedValue({
+          route: 'blocked',
+          reason,
+        } as never);
+        const { deps, coordinator, create } = buildRestockDeps();
+        expect(await run(deps)).toEqual(failClosed);
+        expectLog('preflight', 'blocked', reason);
+        expect(coordinator.coordinate).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['recorded', 'none'],
+        ['existing', 'none'],
+        ['hold', 'post_in_flight'],
+        ['hold', 'unknown_hold'],
+        ['hold', 'record_unconfirmed'],
+        ['blocked', 'malformed_input'],
+        ['blocked', 'occupied'],
+        ['blocked', 'collision'],
+        ['blocked', 'reservation_blocked'],
+      ])('observes %s/%s in order', async (decision, reason) => {
+        const { deps, coordinator, markers, getState, getStock, create } =
+          buildRestockDeps();
+        coordinator.coordinate.mockResolvedValue({ decision, reason });
+        expect(await run(deps)).toEqual(
+          ['recorded', 'existing'].includes(decision) ? success : failClosed,
+        );
+        expectLog('coordinator', decision, reason);
+        const calls = [
+          markers.readForSender,
+          getState,
+          getStock,
+          coordinator.coordinate,
+        ];
+        calls.forEach((call) => expect(call).toHaveBeenCalledTimes(1));
+        const order = calls.map((call) => call.mock.invocationCallOrder[0]);
+        expect(order).toEqual([...order].sort((a, b) => a - b));
+        expect(create).not.toHaveBeenCalled();
+      });
+
+      it.each(['preflight', 'coordinator'])(
+        'sanitizes an unexpected %s exception',
+        async (stage) => {
+          const { deps, coordinator } = buildRestockDeps();
+          const error = new Error('PRIVATE-error-stack-headers');
+          if (stage === 'preflight') {
+            jest
+              .spyOn(preflight, 'preflightRestockRequest')
+              .mockRejectedValue(error);
+          } else {
+            coordinator.coordinate.mockRejectedValue(error);
+          }
+          expect(await run(deps)).toEqual(failClosed);
+          expectLog(stage, 'exception', 'exception');
+          expect(coordinator.coordinate).toHaveBeenCalledTimes(
+            stage === 'preflight' ? 0 : 1,
+          );
+        },
+      );
+
+      it.each(['preflight', 'coordinator'])(
+        'bounds hostile %s metadata without serialization',
+        async (stage) => {
+          const { deps, coordinator } = buildRestockDeps();
+          const poison = jest.fn(() => {
+            throw new Error('PRIVATE-getter');
+          });
+          for (const reason of [
+            'PRIVATE-reason',
+            'occupied',
+            null,
+            { toString: poison },
+            undefined,
+          ]) {
+            log.mockClear();
+            const outcome = Object.defineProperties(
+              { route: 'blocked', decision: 'hold', reason },
+              {
+                historicalPollId: { get: poison },
+                digest: { get: poison },
+                headers: { get: poison },
+                toJSON: { get: poison },
+              },
+            );
+            if (reason === undefined) {
+              Object.defineProperty(outcome, 'reason', { get: poison });
+            }
+            if (stage === 'preflight') {
+              jest
+                .spyOn(preflight, 'preflightRestockRequest')
+                .mockResolvedValue(outcome as never);
+            } else {
+              coordinator.coordinate.mockResolvedValue(outcome);
+            }
+            expect(await run(deps)).toEqual(failClosed);
+            expectLog(
+              stage,
+              stage === 'preflight' ? 'blocked' : 'hold',
+              'unknown',
+            );
+          }
+          expect(poison).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each(['legacy', 'PRIVATE-route'])('bounds route %s', async (route) => {
+        jest
+          .spyOn(preflight, 'preflightRestockRequest')
+          .mockResolvedValue({ route } as never);
+        const { deps, coordinator } = buildRestockDeps();
+        expect(await run(deps)).toEqual(failClosed);
+        expectLog('preflight', route === 'legacy' ? 'legacy' : 'unknown');
+        expect(coordinator.coordinate).not.toHaveBeenCalled();
+      });
+
+      it('never reads historical IDs or rereads a decision for logging', async () => {
+        const { deps, coordinator } = buildRestockDeps();
+        const decision = jest
+          .fn()
+          .mockReturnValueOnce('hold')
+          .mockReturnValueOnce('existing');
+        const poison = jest.fn(() => {
+          throw new Error('PRIVATE-poll');
+        });
+        coordinator.coordinate.mockResolvedValue(
+          Object.defineProperties(
+            {},
+            {
+              decision: { get: decision },
+              historicalPollId: { get: poison },
+            },
+          ),
+        );
+        expect(await run(deps)).toEqual(success);
+        expectLog('coordinator', 'existing');
+        expect(decision).toHaveBeenCalledTimes(2);
+        expect(poison).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['logger', 'recorded'],
+        ['logger', 'hold'],
+        ['logger', 'blocked'],
+        ['uuid', 'recorded'],
+        ['uuid', 'hold'],
+        ['uuid', 'blocked'],
+      ])('%s failure preserves %s', async (failure, decision) => {
+        (failure === 'logger' ? log : uuid).mockImplementation(() => {
+          throw new Error('PRIVATE-observation');
+        });
+        const { deps, coordinator, getStock, create } = buildRestockDeps();
+        coordinator.coordinate.mockResolvedValue({ decision });
+        expect(await run(deps)).toEqual(
+          decision === 'recorded' ? success : failClosed,
+        );
+        expect(getStock).toHaveBeenCalledTimes(1);
+        expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
+        expect(getStock.mock.invocationCallOrder[0]).toBeLessThan(
+          coordinator.coordinate.mock.invocationCallOrder[0],
+        );
+        expect(create).not.toHaveBeenCalled();
+      });
+
+      it('does not initialize diagnostics for default-off or other kinds', async () => {
+        const { deps, create } = buildRestockDeps();
+        await run({ ...deps, restock: undefined } as never);
+        await makeRequestHumanAssistanceTool(deps).execute(
+          { kind: 'expiration_date', digest: expirationDigest },
+          { toolCallId: 't', messages: [], context: { senderId: SENDER } },
+        );
+        expect(create).toHaveBeenCalledTimes(2);
+        expect(uuid).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+      });
+
+      it('keeps concurrent attempt IDs independent and private inputs absent', async () => {
+        const second = '20000000-0000-4000-8000-000000000002';
+        uuid.mockReturnValueOnce(attemptId).mockReturnValueOnce(second);
+        const { deps, coordinator } = buildRestockDeps();
+        coordinator.coordinate.mockResolvedValue({
+          decision: 'PRIVATE-decision',
+          reason: 'PRIVATE-reason',
+        });
+        expect(await Promise.all([run(deps), run(deps)])).toEqual([
+          failClosed,
+          failClosed,
+        ]);
+        expect(
+          log.mock.calls.map(([message]) => message as string).sort(),
+        ).toEqual(
+          [attemptId, second].map(
+            (id) =>
+              `restock_diagnostic attemptId=${id} stage=coordinator outcome=unknown reason=none`,
+          ),
+        );
+        const logged = JSON.stringify(log.mock.calls);
+        for (const secret of [
+          SENDER,
+          PRODUCT_ID,
+          INBOUND.messageId,
+          INBOUND.receivingPhoneNumberId,
+          'Croquetas',
+          'BACKEND-POLL-ID-1',
+          'PRIVATE',
+          deriveRestockSourceRequestId(INBOUND),
+        ]) {
+          expect(logged).not.toContain(secret);
+        }
+      });
+    });
 
     const promotionDigest = {
       items: [{ productId: PRODUCT_ID, quantity: 1, unitPriceCents: 100 }],

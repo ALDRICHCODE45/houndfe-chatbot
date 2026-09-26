@@ -1,3 +1,5 @@
+import { Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { tool } from 'ai';
 import { z } from 'zod';
 import { preflightRestockRequest } from '../../../human-decisions/application/restock-request-preflight';
@@ -61,6 +63,72 @@ const failClosedRestock = (): RequestHumanAssistanceRestockResult => ({
   error: { kind: 'restock_unavailable', retryable: false },
 });
 
+const restockLogger = new Logger('RequestHumanAssistanceTool');
+const preflightReasons = [
+  'identity_unbound',
+  'marker_read_failed',
+  'invalid_digest',
+  'catalog_read_failed',
+  'catalog_unverified',
+  'existing_legacy',
+  'existing_restock',
+  'conflicting_markers',
+  'indeterminate_marker_state',
+  'route_not_available',
+];
+const holdReasons = ['post_in_flight', 'unknown_hold', 'record_unconfirmed'];
+const blockReasons = [
+  'malformed_input',
+  'occupied',
+  'collision',
+  'reservation_blocked',
+];
+
+/** Observe fixed codes only; accessors and observation failures are inert. */
+function restockDiagnostic() {
+  let attemptId: string;
+  try {
+    attemptId = randomUUID();
+  } catch {
+    return () => {};
+  }
+  return (
+    stage: 'preflight' | 'coordinator',
+    code: unknown,
+    value?: Record<string, unknown>,
+  ) => {
+    try {
+      const outcomes =
+        stage === 'preflight'
+          ? ['legacy', 'blocked', 'exception']
+          : ['recorded', 'existing', 'hold', 'blocked', 'exception'];
+      const outcome = outcomes.find((fixed) => fixed === code) ?? 'unknown';
+      let reason = outcome === 'exception' ? 'exception' : 'none';
+      if (outcome === 'blocked' || outcome === 'hold') {
+        let raw: unknown;
+        try {
+          raw =
+            value && Object.getOwnPropertyDescriptor(value, 'reason')?.value;
+        } catch {
+          // Malformed metadata is unknown, never a domain exception.
+        }
+        const reasons =
+          stage === 'preflight'
+            ? preflightReasons
+            : outcome === 'hold'
+              ? holdReasons
+              : blockReasons;
+        reason = reasons.find((fixed) => fixed === raw) ?? 'unknown';
+      }
+      restockLogger.log(
+        `restock_diagnostic attemptId=${attemptId} stage=${stage} outcome=${outcome} reason=${reason}`,
+      );
+    } catch {
+      // Diagnostics must not change the domain result or initiate recovery.
+    }
+  };
+}
+
 /**
  * Enabled-only RESTOCK branch for `kind:'out_of_stock'`: read-only preflight
  * (current customer event identity + trusted markers + fresh catalog) then the
@@ -77,6 +145,8 @@ async function runRestockRoute(
   digest: unknown,
   context: { senderId: string; inboundEvent?: unknown },
 ): Promise<RequestHumanAssistanceRestockResult> {
+  const observe = restockDiagnostic();
+  let stage: 'preflight' | 'coordinator' = 'preflight';
   try {
     const outcome = await preflightRestockRequest(
       {
@@ -91,23 +161,33 @@ async function runRestockRoute(
         catalog: deps.chatbotApi,
       },
     );
-    if (outcome.route !== 'restock') return failClosedRestock();
+    const route = outcome.route;
+    if (route !== 'restock') {
+      observe(stage, route, outcome);
+      return failClosedRestock();
+    }
+    stage = 'coordinator';
     const coordinated = await restock.coordinator.coordinate({
       senderId: context.senderId,
       intake: outcome.intake,
     });
+    // Preserve the original short-circuit reads, without diagnostic re-reads.
+    let decision = coordinated.decision;
     if (
-      coordinated.decision === 'recorded' ||
-      coordinated.decision === 'existing'
+      decision === 'recorded' ||
+      (decision = coordinated.decision) === 'existing'
     ) {
+      observe(stage, decision);
       return {
         ok: true,
         outcome: 'historical_intake_recorded',
         customerNotified: false,
       };
     }
+    observe(stage, decision, coordinated);
     return failClosedRestock();
   } catch {
+    observe(stage, 'exception');
     return failClosedRestock();
   }
 }
