@@ -12,6 +12,7 @@ import {
 } from '../../conversation/domain/conversation-store';
 import { PostgresConversationStore } from '../../conversation/infrastructure/postgres-conversation.store';
 import { PostgresSharedReservationStore } from '../../human-decisions/infrastructure/postgres-shared-reservation.store';
+import { shippingApprovalPolicyAdapter } from '../../shipping/application/shipping-approval-policy.adapter';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import { PostgresHumanHandoffStore } from '../infrastructure/postgres-human-handoff.store';
 import {
@@ -81,6 +82,7 @@ ddescribe('legacy handoff reservation (real DB)', () => {
       conversationStore,
       config,
       new PostgresSharedReservationStore(pool),
+      shippingApprovalPolicyAdapter,
     );
   });
 

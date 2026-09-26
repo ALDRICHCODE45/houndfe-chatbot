@@ -10,6 +10,8 @@ import {
   type ReceiptAmountPointer,
 } from '../../conversation/domain/conversation-store';
 import type {
+  ActiveReceiptStatus,
+  ActiveSenderIdentity,
   AmountBootstrapInput,
   AmountBootstrapOutcome,
   AmountProposalInput,
@@ -28,6 +30,8 @@ import type {
   AttachStartOutcome,
   AttemptStartResult,
   CapabilityAccessRow,
+  CleanupDispositionInput,
+  CleanupDispositionOutcome,
   DownloadCommitInput,
   DownloadCommitOutcome,
   DedupeOutcome,
@@ -42,6 +46,8 @@ import type {
   ReservationOutcome,
   ReserveInput,
   StatusCasInput,
+  StorageFailureDispositionInput,
+  StorageFailureDispositionOutcome,
 } from '../domain/receipt-media-store.port';
 import {
   RECEIPT_MAX_BYTES,
@@ -84,6 +90,31 @@ const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
      AND version = $3::bigint AND lease_expires_at > now()
      AND status = 'DOWNLOADED' AND storage_attempts < 3
      RETURNING storage_attempts AS attempt, version`;
+
+/** ODD-4B: the two receipt-first bootstrap successors. The locked receipt's
+ * durable `declared_amount_cents` exclusively selects the phase: a null
+ * amount keeps the `AWAITING_AMOUNT` prompt successor, while a valid positive
+ * int32 amount is retained and advances to `AWAITING_CONFIRMATION` with
+ * `amount_proposed_at` stamped. Both share the same accepted-object/capability
+ * evidence write and the same live-`clock_timestamp()` lease fence. */
+const BOOTSTRAP_PROMPT_SQL = `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
+     object_etag = $4, object_version_id = $5, capability_token_hash = $6,
+     capability_key_version_text = $7, capability_key_version = $8,
+     capability_issued_at = now(),
+     version = version + 1, updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
+     AND version = $3::bigint AND lease_expires_at > clock_timestamp()
+     RETURNING *`;
+
+const BOOTSTRAP_CONFIRM_SQL = `UPDATE receipt_media SET status = 'AWAITING_CONFIRMATION',
+     amount_proposed_at = now(), stored_at = now(), object_etag = $4,
+     object_version_id = $5, capability_token_hash = $6,
+     capability_key_version_text = $7, capability_key_version = $8,
+     capability_issued_at = now(),
+     version = version + 1, updated_at = now()
+   WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
+     AND version = $3::bigint AND lease_expires_at > clock_timestamp()
+     RETURNING *`;
 
 /** WU6B access projection (RMA2, RMA3): exactly the four access columns —
  * no sender, sale, provider, or raw-token data. Parameter-bound equality
@@ -243,8 +274,156 @@ const META_TERMINAL_SQL = `UPDATE receipt_media
         AND attach_http_status IS NULL AND attach_transport_code IS NULL
         AND attach_outcome_observed_at IS NULL RETURNING *`;
 
-const MAX_INT32 = 2_147_483_647;
+/** ODD-2D1 fresh storage disposition lock: the exact owned, live-leased
+ * DOWNLOADED row at the caller's expected version read under
+ * `clock_timestamp()` and a row lock, so every routing, state, attempt,
+ * status, deadline, cleanup-flag, and intent value comes from the durable
+ * row and a lease that expires while this transaction waits can never
+ * authorize a mutation. */
+const STORAGE_FAILURE_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status = 'DOWNLOADED' FOR UPDATE`;
 
+/** ODD-2D1 storage terminal replay/repair fence: the exact owned,
+ * live-leased terminal successor read under `clock_timestamp()` and a row
+ * lock, so a lease that expires or is released while this transaction waits
+ * on a concurrent writer can never authorize a replay or a legacy
+ * missing-intent repair. */
+const STORAGE_FAILURE_REPLAY_LOOK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2
+        AND lease_expires_at > clock_timestamp() FOR UPDATE`;
+
+/** ODD-2D1 transient retry schedule: retain the DOWNLOADED status and every
+ * required download column, persist only the safe category/code, set the
+ * deadline from DB clock time, clear both lease fields, and bump the
+ * version; no intent is created. */
+const STORAGE_RETRY_SQL = `UPDATE receipt_media
+      SET last_error_category = $5, last_error_code = $6,
+        next_attempt_at = clock_timestamp() + ($7::int * interval '1 millisecond'),
+        lease_owner = NULL, lease_expires_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status = 'DOWNLOADED' AND storage_attempts = $4::int
+      RETURNING *`;
+
+/** ODD-2D1 permanent/exhausted terminal transition: one atomic, parameter-
+ * bound fenced UPDATE to FAILED with the derived failure stage, safe error
+ * evidence, the derived cleanup backlog flag, terminal_at, and every
+ * accepted-object/capability column cleared. Every required download column
+ * is retained — `STORAGE_EXHAUSTED_PRE_ACCEPTANCE` still owns its download
+ * evidence. ODD-2D1 fences with `clock_timestamp()` so a row-lock wait that
+ * outlives the lease cannot commit. */
+const STORAGE_TERMINAL_SQL = `UPDATE receipt_media
+      SET status = 'FAILED', failure_stage = $5, last_error_category = $6,
+        last_error_code = $7, cleanup_pending = $8::boolean,
+        terminal_at = clock_timestamp(), stored_at = NULL,
+        object_etag = NULL, object_version_id = NULL,
+        capability_token_hash = NULL, capability_key_version = NULL,
+        capability_key_version_text = NULL, capability_issued_at = NULL,
+        capability_revoked_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp()
+        AND status = 'DOWNLOADED' AND storage_attempts = $4::int
+        AND backend_receipt_id IS NULL AND backend_receipt_status IS NULL
+        AND attach_http_status IS NULL AND attach_transport_code IS NULL
+        AND attach_outcome_observed_at IS NULL RETURNING *`;
+
+/** ODD-2D2a narrow cleanup claim/start: only `FAILED`
+ * `STORAGE_EXHAUSTED_PRE_ACCEPTANCE` rows with `cleanup_pending = true`, a
+ * due deadline, no live lease, a backlog/retryable delete error code, and
+ * either a remaining logical attempt or an expired reclaimable lease. The
+ * logical attempt is row-derived: an initial backlog or lease-cleared row
+ * starts the next attempt; an expired non-null lease (attempts 1..3)
+ * reclaims the same ambiguous attempt without increment. The exact
+ * `OBJECT_STORAGE` category is required together with the allowlisted
+ * backlog/retryable delete error code, so a safe-looking code under another
+ * category is never claimed. Deterministic `next_attempt_at`/`created_at`
+ * order, `FOR UPDATE SKIP LOCKED`, bounded batch, 60-second lease, and a
+ * version bump. */
+const CLEANUP_CLAIM_SQL = `WITH candidate AS (
+     SELECT id FROM receipt_media
+     WHERE status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true
+       AND next_attempt_at <= now()
+       AND (lease_expires_at IS NULL OR lease_expires_at < now())
+       AND last_error_category = 'OBJECT_STORAGE'
+       AND last_error_code IN ('CLEANUP_PENDING', 'STORAGE_EXHAUSTED',
+         'ABORTED', 'HTTP_RETRYABLE', 'NETWORK_FAILURE')
+       AND (cleanup_attempts < 3
+         OR (cleanup_attempts = 3 AND lease_expires_at IS NOT NULL))
+     ORDER BY next_attempt_at, created_at
+     FOR UPDATE SKIP LOCKED LIMIT $1
+   )
+   UPDATE receipt_media r
+   SET cleanup_attempts = CASE
+         WHEN r.cleanup_attempts = 0 THEN 1
+         WHEN r.lease_expires_at IS NOT NULL THEN r.cleanup_attempts
+         ELSE r.cleanup_attempts + 1
+       END,
+     lease_owner = $2,
+     lease_expires_at = now() + interval '60 seconds',
+     version = version + 1, updated_at = now()
+   FROM candidate c WHERE r.id = c.id
+   RETURNING r.*`;
+
+/** ODD-2D2a fresh cleanup disposition lock: the exact owned, live-leased
+ * claimed cleanup row at the caller's expected version read under
+ * `clock_timestamp()` and a row lock, so the logical attempt and every
+ * derived value come from the durable row and a lease that expires while
+ * this transaction waits can never authorize a mutation. */
+const CLEANUP_DISPOSITION_LOOK_SQL = `SELECT * FROM receipt_media
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true
+       AND cleanup_attempts BETWEEN 1 AND 3 FOR UPDATE`;
+
+/** ODD-2D2a idempotent cleanup success: clear the backlog flag and the
+ * lease and bump the version while retaining the terminal
+ * `FAILED/STORAGE_EXHAUSTED_PRE_ACCEPTANCE` state, download evidence,
+ * object key, failure stage, safe error evidence, and the null
+ * accepted-object/capability boundary; no intent is created. */
+const CLEANUP_SUCCESS_SQL = `UPDATE receipt_media
+     SET cleanup_pending = false, lease_owner = NULL, lease_expires_at = NULL,
+       version = version + 1, updated_at = now()
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true AND cleanup_attempts = $4::int RETURNING *`;
+
+/** ODD-2D2a retryable cleanup failure at attempts 1/2: retain the backlog
+ * and every evidence column, persist only the safe category/code, set the
+ * deadline from a 1s/4s base with bounded positive jitter, clear both
+ * lease fields, and bump the version; no intent is created. */
+const CLEANUP_RETRY_SQL = `UPDATE receipt_media
+     SET last_error_category = $5, last_error_code = $6,
+       next_attempt_at = clock_timestamp() + ($7::int * interval '1 millisecond'),
+       lease_owner = NULL, lease_expires_at = NULL,
+       version = version + 1, updated_at = now()
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true AND cleanup_attempts = $4::int
+       AND cleanup_attempts < 3 RETURNING *`;
+
+/** ODD-2D2a manual hold: a permanent delete failure at any attempt or a
+ * retryable failure at attempt 3 retains the backlog flag, persists only
+ * the safe category/code, clears the lease, and bumps the version without
+ * scheduling any automatic eligibility. */
+const CLEANUP_HOLD_SQL = `UPDATE receipt_media
+     SET last_error_category = $5, last_error_code = $6,
+       lease_owner = NULL, lease_expires_at = NULL,
+       version = version + 1, updated_at = now()
+     WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+       AND lease_expires_at > clock_timestamp() AND status = 'FAILED'
+       AND failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+       AND cleanup_pending = true AND cleanup_attempts = $4::int RETURNING *`;
+
+const MAX_INT32 = 2_147_483_647;
 /** ODD-2C fixed Meta disposition taxonomy. MEDIA_VALIDATION codes are
  * always permanent pre-storage validation failures; HTTP_PERMANENT is a
  * permanent transport failure classified at the same pre-storage stage;
@@ -267,16 +446,15 @@ const META_RETRYABLE_CODES = new Set<string>([
 ]);
 const META_EXHAUSTED = 'META_EXHAUSTED';
 
-/** Documented bounded positive retry jitter for pre-storage Meta failures:
- * attempt 1 waits 1s plus 0..250ms, attempt 2 waits 4s plus 0..1000ms
- * (25% of the base), so a retry deadline is never earlier than its base. */
-const META_RETRY_BASE_MS = [1000, 4000];
-const META_RETRY_JITTER_RATIO = 0.25;
-const metaRetryDelayMs = (attempt: number): number => {
-  const base = META_RETRY_BASE_MS[attempt - 1];
-  return (
-    base + Math.floor(Math.random() * (base * META_RETRY_JITTER_RATIO + 1))
-  );
+/** Documented bounded positive retry jitter for pre-storage Meta and
+ * storage failures: attempt 1 waits 1s plus 0..250ms, attempt 2 waits 4s
+ * plus 0..1000ms (25% of the base), so a retry deadline is never earlier
+ * than its base. */
+const RETRY_BASE_MS = [1000, 4000];
+const RETRY_JITTER_RATIO = 0.25;
+const retryDelayMs = (attempt: number): number => {
+  const base = RETRY_BASE_MS[attempt - 1];
+  return base + Math.floor(Math.random() * (base * RETRY_JITTER_RATIO + 1));
 };
 
 /** The fixed safe command taxonomy; unknown category/code pairs never reach
@@ -312,6 +490,147 @@ const metaFailureDecision = (
       : 'META_EXHAUSTED_PRE_STORAGE'
     : null;
 };
+
+/** ODD-2D1 fixed storage disposition taxonomy. The retryable transport
+ * codes (`ABORTED`, `HTTP_RETRYABLE`, `NETWORK_FAILURE`) schedule attempts
+ * 1/2 and terminalize attempt 3; `CLEANUP_PENDING` is the safe cleanup
+ * backlog and terminalizes at any attempt with `cleanup_pending = true`;
+ * every other allowlisted code is a permanent pre-acceptance failure;
+ * `STORAGE_EXHAUSTED` is the fixed internal code for a reclaimed row
+ * already at `storage_attempts >= 3` and persists the same conservative
+ * `cleanup_pending = true` backlog. */
+const STORAGE_RETRYABLE_CODES = new Set<string>([
+  'ABORTED',
+  'HTTP_RETRYABLE',
+  'NETWORK_FAILURE',
+]);
+const STORAGE_PERMANENT_CODES = new Set<string>([
+  'OBJECT_KEY_INVALID',
+  'REQUEST_INVALID',
+  'RESPONSE_INVALID',
+  'HTTP_PERMANENT',
+  'PERMANENT_FAILURE',
+  'OBJECT_NOT_FOUND',
+]);
+const STORAGE_CLEANUP_PENDING = 'CLEANUP_PENDING';
+const STORAGE_EXHAUSTED = 'STORAGE_EXHAUSTED';
+
+/** The conservative terminal cleanup backlog flag: `CLEANUP_PENDING` is the
+ * observed backlog, and the fixed internal exhaustion code is treated the
+ * same because a reclaimed attempt-3 row may have uploaded before crashing.
+ * Every other terminal code persists no backlog. */
+const storageCleanupPending = (code: string): boolean =>
+  code === STORAGE_CLEANUP_PENDING || code === STORAGE_EXHAUSTED;
+
+/** The fixed safe storage command taxonomy; unknown category/code pairs
+ * never reach the database. */
+const isStorageFailureCommand = (category: unknown, code: unknown): boolean =>
+  category === 'OBJECT_STORAGE' &&
+  typeof code === 'string' &&
+  (STORAGE_RETRYABLE_CODES.has(code) ||
+    STORAGE_PERMANENT_CODES.has(code) ||
+    code === STORAGE_CLEANUP_PENDING ||
+    code === STORAGE_EXHAUSTED);
+
+/** Terminal stage for the locked row's fixed disposition, or `retry` for a
+ * retryable storage code below the attempt limit; null fences. The internal
+ * exhaustion code only terminalizes a genuinely exhausted row. */
+const storageFailureDecision = (
+  category: string,
+  code: string,
+  attempts: number,
+): 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE' | 'retry' | null => {
+  if (category !== 'OBJECT_STORAGE') return null;
+  if (code === STORAGE_EXHAUSTED)
+    return Number.isInteger(attempts) && attempts >= 3
+      ? 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+      : null;
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 3) return null;
+  if (code === STORAGE_CLEANUP_PENDING)
+    return 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+  if (STORAGE_RETRYABLE_CODES.has(code))
+    return attempts < 3 ? 'retry' : 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+  return STORAGE_PERMANENT_CODES.has(code)
+    ? 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'
+    : null;
+};
+
+/** ODD-2D2a fixed cleanup technical-delete disposition taxonomy. The three
+ * retryable delete codes schedule attempts 1/2 and become a manual hold at
+ * attempt 3; the four permanent delete codes are an immediate manual hold
+ * at any attempt; every other category/code pair is malformed and never
+ * reaches the database. */
+const CLEANUP_RETRYABLE_CODES = new Set<string>([
+  'ABORTED',
+  'HTTP_RETRYABLE',
+  'NETWORK_FAILURE',
+]);
+const CLEANUP_PERMANENT_CODES = new Set<string>([
+  'OBJECT_KEY_INVALID',
+  'REQUEST_INVALID',
+  'HTTP_PERMANENT',
+  'PERMANENT_FAILURE',
+]);
+
+/** The fixed safe cleanup failure taxonomy; unknown category/code pairs
+ * fence without mutation. */
+const cleanupFailureCode = (category: unknown, code: unknown): string | null =>
+  category === 'OBJECT_STORAGE' &&
+  typeof code === 'string' &&
+  (CLEANUP_RETRYABLE_CODES.has(code) || CLEANUP_PERMANENT_CODES.has(code))
+    ? code
+    : null;
+
+/** One validated cleanup command, or null for a malformed caller. The
+ * logical attempt, state, and schedule are never caller values. */
+type CleanupCommand =
+  | { outcome: 'deleted' }
+  | { outcome: 'failed'; category: 'OBJECT_STORAGE'; code: string };
+
+const cleanupCommand = (
+  input: CleanupDispositionInput,
+  successor: string | null,
+): CleanupCommand | null => {
+  try {
+    if (
+      successor === null ||
+      typeof input !== 'object' ||
+      input === null ||
+      typeof input.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input.owner !== 'string' ||
+      input.owner.length === 0
+    )
+      return null;
+    const raw = input as {
+      outcome?: unknown;
+      category?: unknown;
+      code?: unknown;
+    };
+    if (raw.outcome === 'deleted') return { outcome: 'deleted' };
+    if (raw.outcome !== 'failed') return null;
+    const code = cleanupFailureCode(raw.category, raw.code);
+    return code === null
+      ? null
+      : { outcome: 'failed', category: 'OBJECT_STORAGE', code };
+  } catch {
+    return null;
+  }
+};
+
+/** ODD-2D2a fail-closed claim boundary, mirroring the established outbox
+ * boundary but robust to forged runtime types: a malformed `limit`/`owner`
+ * returns no rows before any SQL. `limit` must be a positive safe integer so
+ * `LIMIT NULL` can never widen the batch to every due row, and `owner` must
+ * be a bounded 1..100-character string so an empty or non-string owner can
+ * never create a lease that `commitCleanupDisposition` refuses. */
+const cleanupClaimInputOk = (limit: unknown, owner: unknown): boolean =>
+  typeof limit === 'number' &&
+  Number.isSafeInteger(limit) &&
+  limit > 0 &&
+  typeof owner === 'string' &&
+  owner.length >= 1 &&
+  owner.length <= 100;
 
 /** WU11A3A proven non-committing outcomes: the safe allowlisted statuses. */
 const ATTACH_DEFINITE_HTTP_STATUSES = [400, 401, 403, 404, 409, 422, 429];
@@ -460,6 +779,57 @@ const samePointer = (value: unknown, expected: ReceiptAmountPointer) =>
   value.saleId === expected.saleId &&
   value.receiptVersion === expected.receiptVersion;
 
+/** ODD-4B: the two bootstrap phases. The locked receipt's durable
+ *  `declared_amount_cents` exclusively selects the phase — a null amount is
+ *  the prompt phase and a valid positive int32 amount is the confirmation
+ *  phase. Any other out-of-contract value fences (`null`) rather than
+ *  choosing a branch, so a malformed durable amount never mutates state. */
+type BootstrapPhase = 'prompt' | 'confirm';
+const bootstrapPhase = (receipt: Row): BootstrapPhase | null => {
+  const cents = receipt.declared_amount_cents;
+  if (cents === null) return 'prompt';
+  return typeof cents === 'number' &&
+    Number.isInteger(cents) &&
+    cents > 0 &&
+    cents <= MAX_INT32
+    ? 'confirm'
+    : null;
+};
+
+/** ODD-4B: exact structural ownership proof for the one row-derived bootstrap
+ *  intent. The prompt phase owns `RECEIPT_AMOUNT_PROMPT` with exactly `{}`;
+ *  the confirmation phase owns `RECEIPT_AMOUNT_CONFIRM` with exactly
+ *  `{ amountCents }`, matching the wired notification renderer. */
+const bootstrapIntentMatches = (
+  intent: Row | undefined,
+  receipt: Row,
+  successor: string,
+  dedupeKey: string,
+  phase: BootstrapPhase,
+  cents: number | null,
+): intent is Row => {
+  if (
+    !intent ||
+    intent.dedupe_key !== dedupeKey ||
+    intent.receipt_media_id !== receipt.id ||
+    intent.receipt_state_version !== successor ||
+    intent.source_webhook_message_id !== receipt.webhook_message_id ||
+    intent.recipient_id !== receipt.sender_id ||
+    !isRecord(intent.template_args)
+  )
+    return false;
+  if (phase === 'prompt')
+    return (
+      intent.template_key === 'RECEIPT_AMOUNT_PROMPT' &&
+      Object.keys(intent.template_args).length === 0
+    );
+  return (
+    intent.template_key === 'RECEIPT_AMOUNT_CONFIRM' &&
+    Object.keys(intent.template_args).length === 1 &&
+    intent.template_args.amountCents === cents
+  );
+};
+
 const isProposalInput = (
   input: AmountProposalInput,
   successor: string | null,
@@ -498,7 +868,7 @@ const intentMatches = (
   typeof row.template_args === 'object' &&
   row.template_args !== null &&
   Object.keys(row.template_args).length === 1 &&
-  (row.template_args as Row).cents === input.cents;
+  (row.template_args as Row).amountCents === input.cents;
 
 const isRejectionInput = (
   input: AmountRejectionInput,
@@ -718,10 +1088,11 @@ const attachDefiniteFailureIntentMatches = (
   isRecord(row.template_args) &&
   Object.keys(row.template_args).length === 0;
 
-/** Row-derived identity of the single unavailable-later intent: receipt
- * id, FAILED successor version, and stored webhook message only — never a
- * caller value, object key, URL, capability, or free text. */
-const metaFailureIntentKey = (
+/** Row-derived identity of the single unavailable-later intent shared by
+ * every pre-acceptance terminal failure: receipt id, FAILED successor
+ * version, and stored webhook message only — never a caller value, object
+ * key, URL, capability, or free text. */
+const unavailableLaterIntentKey = (
   receiptId: string,
   successor: string,
   webhookMessageId: string,
@@ -731,7 +1102,7 @@ const metaFailureIntentKey = (
 /** Exact structural ownership proof for the `RECEIPT_UNAVAILABLE_LATER`
  * intent: the deterministic key plus every row-derived column, with the
  * single bounded empty-args shape. */
-const metaFailureIntentMatches = (
+const unavailableLaterIntentMatches = (
   row: Row | undefined,
   receiptId: string,
   successor: string,
@@ -783,6 +1154,27 @@ const classify = (hit: Row, input: ReserveInput): ReservationOutcome =>
       : { kind: 'webhook-media-conflict' }
     : { kind: 'provider-media-reused', receipt: camelize<Media>(hit) };
 
+/** UNRELATED active row for the sender; identity overlaps belong to `admit`. */
+const UNRELATED_ACTIVE_SENDER_SQL = `SELECT status FROM receipt_media
+   WHERE sender_id = $1 AND status IN ('RESERVED', 'DOWNLOADED', 'STORED',
+     'AWAITING_AMOUNT', 'AWAITING_CONFIRMATION', 'ATTACHING')
+     AND webhook_message_id <> $2 AND provider_media_id <> $3`;
+
+/** Admission conflict reload: committed active winner, no identity exclusions. */
+const ACTIVE_SENDER_WINNER_SQL = `SELECT status FROM receipt_media
+   WHERE sender_id = $1 AND status IN ('RESERVED', 'DOWNLOADED', 'STORED',
+     'AWAITING_AMOUNT', 'AWAITING_CONFIRMATION', 'ATTACHING')`;
+
+const lookupActiveStatus = async (
+  run: (sql: string, params: unknown[]) => Promise<Array<{ status: string }>>,
+  sql: string,
+  params: unknown[],
+): Promise<ActiveReceiptStatus | null> => {
+  const rows = await run(sql, params);
+  const status = rows[0]?.status;
+  return status === undefined ? null : (status as ActiveReceiptStatus);
+};
+
 /** WU2B2A PostgreSQL primitives (RM1, RM3) over the WU2A1/WU2A2A/WU2A2B
  * schema. Every external value is parameter-bound; no caption, URL, token,
  * response body, raw error, or diagnostic PII is persisted. */
@@ -827,8 +1219,9 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       try {
         const inserted = await c.query<Row>(
           `INSERT INTO receipt_media (id, webhook_message_id, provider_media_id,
-             sender_id, captured_sale_id, object_key, declared_mime_type, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'RESERVED') RETURNING *`,
+             sender_id, captured_sale_id, object_key, declared_mime_type,
+             declared_amount_cents, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'RESERVED') RETURNING *`,
           [
             input.id,
             input.webhookMessageId,
@@ -837,6 +1230,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             input.capturedSaleId,
             input.objectKey,
             input.declaredMimeType ?? null,
+            input.declaredAmountCents ?? null,
           ],
         );
         await markInboundWebhook();
@@ -849,11 +1243,33 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           return classify(winner, input);
         }
         const constraint = (err as { constraint?: string }).constraint;
-        if (constraint === 'receipt_media_active_sender_idx')
-          return { kind: 'sender-active' };
+        if (constraint === 'receipt_media_active_sender_idx') {
+          const status = await lookupActiveStatus(
+            async (sql, params) =>
+              (await c.query<{ status: string }>(sql, params)).rows,
+            ACTIVE_SENDER_WINNER_SQL,
+            [input.senderId],
+          );
+          // A vanished winner is never fabricated: rethrow the original
+          // conflict with zero mutation.
+          if (status === null) throw err;
+          return { kind: 'sender-active', status };
+        }
         throw err;
       }
     });
+  }
+
+  /** Plain status-only read; no lock or transaction. */
+  async findActiveBySender(
+    input: ActiveSenderIdentity,
+  ): Promise<ActiveReceiptStatus | null> {
+    return lookupActiveStatus(
+      async (sql, params) =>
+        (await this.pool.query<{ status: string }>(sql, params)).rows,
+      UNRELATED_ACTIVE_SENDER_SQL,
+      [input.senderId, input.webhookMessageId, input.providerMediaId],
+    );
   }
 
   async insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome> {
@@ -1004,7 +1420,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             successor,
             input.sourceWebhookMessageId,
             input.senderId,
-            JSON.stringify({ cents: input.cents }),
+            JSON.stringify({ amountCents: input.cents }),
           ],
         );
         if (intent.rowCount !== 1) throw FENCED;
@@ -1967,7 +2383,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
    * it or when an existing row is structurally exact; null when a
    * rival/foreign intent already owns the deterministic key so the caller
    * rolls back instead of replacing evidence. */
-  private async ownMetaFailureIntent(
+  private async ownUnavailableLaterIntent(
     c: PoolClient,
     receipt: Row,
   ): Promise<Row | null> {
@@ -1975,7 +2391,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
     const successor = String(receipt.version);
     const webhookMessageId = receipt.webhook_message_id as string;
     const senderId = receipt.sender_id as string;
-    const dedupeKey = metaFailureIntentKey(
+    const dedupeKey = unavailableLaterIntentKey(
       receiptId,
       successor,
       webhookMessageId,
@@ -2004,7 +2420,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           [dedupeKey],
         )
       ).rows[0];
-    return metaFailureIntentMatches(
+    return unavailableLaterIntentMatches(
       owned,
       receiptId,
       successor,
@@ -2055,7 +2471,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
       current.capability_revoked_at !== null
     )
       return { kind: 'fenced' };
-    const intent = await this.ownMetaFailureIntent(c, current);
+    const intent = await this.ownUnavailableLaterIntent(c, current);
     if (!intent) throw FENCED;
     return {
       kind: 'replayed',
@@ -2124,7 +2540,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             attempts,
             input.category,
             input.code,
-            metaRetryDelayMs(attempts),
+            retryDelayMs(attempts),
           ]);
           if (updated.rowCount !== 1) throw FENCED;
           const receipt = updated.rows[0];
@@ -2146,7 +2562,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         ]);
         if (updated.rowCount !== 1) throw FENCED;
         const receipt = updated.rows[0];
-        const intent = await this.ownMetaFailureIntent(c, receipt);
+        const intent = await this.ownUnavailableLaterIntent(c, receipt);
         if (!intent) throw FENCED;
         return {
           kind: 'terminal',
@@ -2154,6 +2570,260 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           version: String(receipt.version),
           receipt: camelize<Media>(receipt),
           intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      if ((err as { code?: string }).code === '22P02')
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** ODD-2D1 storage terminal replay/legacy repair validation; see
+   * STORAGE_FAILURE_REPLAY_LOOK_SQL. The exact owned, live-leased terminal
+   * successor must prove every deterministic field, retained download
+   * evidence (never Meta's cleared-download shape), and cleared
+   * accepted-object/capability evidence; only then is the single row-derived
+   * intent owned (repairing an otherwise exact legacy successor missing
+   * it). */
+  private async replayStorageFailure(
+    c: PoolClient,
+    current: Row,
+    input: StorageFailureDispositionInput,
+    successor: string,
+  ): Promise<StorageFailureDispositionOutcome> {
+    const decision = storageFailureDecision(
+      input.category,
+      input.code,
+      current.storage_attempts as number,
+    );
+    if (decision === null || decision === 'retry') return { kind: 'fenced' };
+    if (
+      current.status !== 'FAILED' ||
+      current.failure_stage !== decision ||
+      String(current.version) !== successor ||
+      current.last_error_category !== input.category ||
+      current.last_error_code !== input.code ||
+      !(current.terminal_at instanceof Date) ||
+      !hasDownloadEvidence(current) ||
+      current.cleanup_pending !== storageCleanupPending(input.code) ||
+      current.stored_at !== null ||
+      current.object_etag !== null ||
+      current.object_version_id !== null ||
+      current.capability_token_hash !== null ||
+      current.capability_key_version !== null ||
+      current.capability_key_version_text !== null ||
+      current.capability_issued_at !== null ||
+      current.capability_revoked_at !== null ||
+      current.backend_receipt_id !== null ||
+      current.backend_receipt_status !== null ||
+      current.attach_http_status !== null ||
+      current.attach_transport_code !== null ||
+      current.attach_outcome_observed_at !== null
+    )
+      return { kind: 'fenced' };
+    const intent = await this.ownUnavailableLaterIntent(c, current);
+    if (!intent) throw FENCED;
+    return {
+      kind: 'replayed',
+      failureStage: decision,
+      version: successor,
+      receipt: camelize<Media>(current),
+      intent: camelize<ReceiptMediaOutboxRow>(intent),
+    };
+  }
+
+  /** ODD-2D1 durable storage failure disposition; see
+   * STORAGE_FAILURE_LOOK_SQL, STORAGE_RETRY_SQL, and STORAGE_TERMINAL_SQL.
+   * The caller supplies only the lease/version fence plus the fixed safe
+   * category/code; the locked DOWNLOADED row owns every routing, state,
+   * attempt, status, deadline, cleanup-flag, and intent value. A row already
+   * at `storage_attempts >= 3` is terminalized through the fixed internal
+   * exhaustion code with no fourth storage call. */
+  async commitStorageFailureDisposition(
+    input: StorageFailureDispositionInput,
+  ): Promise<StorageFailureDispositionOutcome> {
+    let successor: string | null;
+    try {
+      successor = successorVersion(input?.expectedVersion);
+    } catch {
+      return { kind: 'fenced' };
+    }
+    if (
+      successor === null ||
+      typeof input?.id !== 'string' ||
+      !UUID.test(input.id) ||
+      typeof input?.owner !== 'string' ||
+      input.owner.length === 0 ||
+      !isStorageFailureCommand(input?.category, input?.code)
+    )
+      return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const locked = (
+          await c.query<Row>(STORAGE_FAILURE_LOOK_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+          ])
+        ).rows[0];
+        if (!locked) {
+          const current = (
+            await c.query<Row>(STORAGE_FAILURE_REPLAY_LOOK_SQL, [
+              input.id,
+              input.owner,
+            ])
+          ).rows[0];
+          if (!current) return { kind: 'fenced' };
+          return await this.replayStorageFailure(c, current, input, successor);
+        }
+        const attempts = locked.storage_attempts as number;
+        const decision = storageFailureDecision(
+          input.category,
+          input.code,
+          attempts,
+        );
+        if (decision === null) return { kind: 'fenced' };
+        if (decision === 'retry') {
+          const updated = await c.query<Row>(STORAGE_RETRY_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+            attempts,
+            input.category,
+            input.code,
+            retryDelayMs(attempts),
+          ]);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'retry-scheduled',
+            attempt: attempts,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const updated = await c.query<Row>(STORAGE_TERMINAL_SQL, [
+          input.id,
+          input.owner,
+          input.expectedVersion,
+          attempts,
+          decision,
+          input.category,
+          input.code,
+          storageCleanupPending(input.code),
+        ]);
+        if (updated.rowCount !== 1) throw FENCED;
+        const receipt = updated.rows[0];
+        const intent = await this.ownUnavailableLaterIntent(c, receipt);
+        if (!intent) throw FENCED;
+        return {
+          kind: 'terminal',
+          failureStage: decision,
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
+          intent: camelize<ReceiptMediaOutboxRow>(intent),
+        };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      if ((err as { code?: string }).code === '22P02')
+        return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  /** ODD-2D2a narrow cleanup claim/start; see CLEANUP_CLAIM_SQL. Only
+   * durable FAILED/STORAGE_EXHAUSTED_PRE_ACCEPTANCE backlog rows are
+   * eligible; the logical attempt is derived inside the locked transaction
+   * and the returned rows carry their post-claim attempt. Never claims
+   * STORED, generic eligibility, or a fourth logical attempt, and never
+   * performs the external delete. */
+  async claimCleanupBatch(limit: number, owner: string): Promise<Media[]> {
+    if (!cleanupClaimInputOk(limit, owner)) return [];
+    return this.withTx(async (c) => {
+      const { rows } = await c.query<Row>(CLEANUP_CLAIM_SQL, [limit, owner]);
+      return rows
+        .map((r) => camelize<Media>(r))
+        .sort(
+          (a, b) =>
+            +a.nextAttemptAt - +b.nextAttemptAt || +a.createdAt - +b.createdAt,
+        );
+    });
+  }
+
+  /** ODD-2D2a fenced cleanup disposition; see CLEANUP_DISPOSITION_LOOK_SQL,
+   * CLEANUP_SUCCESS_SQL, CLEANUP_RETRY_SQL, and CLEANUP_HOLD_SQL. The caller
+   * supplies only the lease/version fence and, for a failure, the fixed safe
+   * category/code; the locked row owns the logical attempt and every derived
+   * routing, state, deadline, and backlog value. A permanent failure or a
+   * third retryable failure becomes a manual hold with no automatic
+   * eligibility, malformed/unknown commands and mismatched fences return
+   * `fenced` without mutation, and no intent is ever created. */
+  async commitCleanupDisposition(
+    input: CleanupDispositionInput,
+  ): Promise<CleanupDispositionOutcome> {
+    let successor: string | null;
+    try {
+      successor = successorVersion(input?.expectedVersion);
+    } catch {
+      return { kind: 'fenced' };
+    }
+    const command = cleanupCommand(input, successor);
+    if (command === null) return { kind: 'fenced' };
+    try {
+      return await this.withTx(async (c) => {
+        const locked = (
+          await c.query<Row>(CLEANUP_DISPOSITION_LOOK_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+          ])
+        ).rows[0];
+        if (!locked) return { kind: 'fenced' };
+        const attempt = locked.cleanup_attempts as number;
+        const params = [input.id, input.owner, input.expectedVersion, attempt];
+        if (command.outcome === 'deleted') {
+          const updated = await c.query<Row>(CLEANUP_SUCCESS_SQL, params);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'cleaned',
+            attempt,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const retryable = CLEANUP_RETRYABLE_CODES.has(command.code);
+        if (retryable && attempt < 3) {
+          const updated = await c.query<Row>(CLEANUP_RETRY_SQL, [
+            ...params,
+            command.category,
+            command.code,
+            retryDelayMs(attempt),
+          ]);
+          if (updated.rowCount !== 1) throw FENCED;
+          const receipt = updated.rows[0];
+          return {
+            kind: 'retry-scheduled',
+            attempt,
+            version: String(receipt.version),
+            receipt: camelize<Media>(receipt),
+          };
+        }
+        const updated = await c.query<Row>(CLEANUP_HOLD_SQL, [
+          ...params,
+          command.category,
+          command.code,
+        ]);
+        if (updated.rowCount !== 1) throw FENCED;
+        const receipt = updated.rows[0];
+        return {
+          kind: 'manual-hold',
+          attempt,
+          version: String(receipt.version),
+          receipt: camelize<Media>(receipt),
         };
       });
     } catch (err) {
@@ -2184,7 +2854,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
              AND ((status = 'RESERVED'
                  AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'DOWNLOADED'
-                 AND storage_attempts < 3
+                 AND (storage_attempts < 3 OR storage_attempts = 3)
                  AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'ATTACHING'))
            ORDER BY next_attempt_at, created_at
@@ -2281,17 +2951,36 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         const senderId = receipt.sender_id as string;
         const saleId = receipt.captured_sale_id as string;
         const sourceWebhookMessageId = receipt.webhook_message_id as string;
+        const phase = bootstrapPhase(receipt);
+        if (phase === null) throw FENCED;
+        const confirmCents =
+          phase === 'confirm'
+            ? (receipt.declared_amount_cents as number)
+            : null;
+        const expectedStatus =
+          phase === 'prompt' ? 'AWAITING_AMOUNT' : 'AWAITING_CONFIRMATION';
+        const templateKey =
+          phase === 'prompt'
+            ? 'RECEIPT_AMOUNT_PROMPT'
+            : 'RECEIPT_AMOUNT_CONFIRM';
+        const templateArgs =
+          phase === 'prompt' ? {} : { amountCents: confirmCents as number };
+        const proposedAtMatches =
+          phase === 'prompt'
+            ? receipt.amount_proposed_at === null
+            : receipt.amount_proposed_at instanceof Date;
         const pointer = {
           receiptMediaId: receiptId,
           saleId,
           receiptVersion: successor,
         };
-        const dedupeKey = `receipt-amount-prompt:${receiptId}:${input.expectedVersion}:${sourceWebhookMessageId}`;
+        const dedupeKey = `receipt-amount-${phase}:${receiptId}:${input.expectedVersion}:${sourceWebhookMessageId}`;
         if (
-          receipt.status === 'AWAITING_AMOUNT' &&
+          receipt.status === expectedStatus &&
           receipt.version === successor &&
           sameBootstrapEvidence(receipt, input) &&
-          samePointer(conversation.data.receiptAmountPointer, pointer)
+          samePointer(conversation.data.receiptAmountPointer, pointer) &&
+          proposedAtMatches
         ) {
           const intent = (
             await c.query<Row>(
@@ -2300,14 +2989,14 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             )
           ).rows[0];
           if (
-            !intent ||
-            intent.receipt_media_id !== receipt.id ||
-            intent.receipt_state_version !== successor ||
-            intent.source_webhook_message_id !== receipt.webhook_message_id ||
-            intent.recipient_id !== receipt.sender_id ||
-            intent.template_key !== 'RECEIPT_AMOUNT_PROMPT' ||
-            !isRecord(intent.template_args) ||
-            Object.keys(intent.template_args).length !== 0
+            !bootstrapIntentMatches(
+              intent,
+              receipt,
+              successor,
+              dedupeKey,
+              phase,
+              confirmCents,
+            )
           )
             throw FENCED;
           const liveLease = (
@@ -2341,14 +3030,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
         )
           throw FENCED;
         const updated = await c.query<Row>(
-          `UPDATE receipt_media SET status = 'AWAITING_AMOUNT', stored_at = now(),
-             object_etag = $4, object_version_id = $5, capability_token_hash = $6,
-             capability_key_version_text = $7, capability_key_version = $8,
-             capability_issued_at = now(),
-             version = version + 1, updated_at = now()
-           WHERE id = $1 AND lease_owner = $2 AND status = 'DOWNLOADED'
-             AND version = $3::bigint AND lease_expires_at > clock_timestamp()
-             RETURNING *`,
+          phase === 'prompt' ? BOOTSTRAP_PROMPT_SQL : BOOTSTRAP_CONFIRM_SQL,
           [
             input.id,
             input.owner,
@@ -2373,7 +3055,7 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
              receipt_state_version, source_webhook_message_id, recipient_id,
              template_key, template_args)
-           VALUES ($1, $2, $3, $4::bigint, $5, $6, 'RECEIPT_AMOUNT_PROMPT', $7::jsonb)
+           VALUES ($1, $2, $3, $4::bigint, $5, $6, $7, $8::jsonb)
            ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
           [
             randomUUID(),
@@ -2382,7 +3064,8 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
             successor,
             sourceWebhookMessageId,
             senderId,
-            JSON.stringify({}),
+            templateKey,
+            JSON.stringify(templateArgs),
           ],
         );
         if (intent.rowCount !== 1) throw FENCED;

@@ -10,10 +10,10 @@ operation, and during a behaviour rollback.
 
 ## TL;DR
 
-| Knob | Env var | Default | Purpose |
-|---|---|---|---|
-| Channel on/off | `HUMAN_HANDOFF_ENABLED` | `true` | Kill-switch — when `false`, `requestHumanAssistance` returns a `disabled` envelope and the bot never writes a row, never sends a digest, never sets the marker. One env flip, zero code. |
-| Ops phone | `OPS_CHANNEL_PHONE` | required when enabled | WhatsApp senderId (wa_id) of the human agent who receives digests and replies to them. Joi accepts the optional `+` (E.164); the runtime additionally strips the Mexican trunk-1 in dev-mode test numbers via `normalizeSandboxRecipient`. |
+| Knob           | Env var                 | Default               | Purpose                                                                                                                                                                                                                                                                                                                                              |
+| -------------- | ----------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Channel on/off | `HUMAN_HANDOFF_ENABLED` | `true`                | Kill-switch — when `false`, `requestHumanAssistance` returns a `disabled` envelope and the bot never writes a row, never sends a digest, never sets the marker. One env flip, zero code.                                                                                                                                                             |
+| Ops phone      | `OPS_CHANNEL_PHONE`     | required when enabled | Exact digit-only Meta senderId (`wa_id`) of the human agent who receives digests and replies to them, 10-15 digits. A leading `+`, whitespace, or separator is rejected at boot. Comparison is exact by default; the Mexican trunk-1 rewrite runs **only** when `META_SANDBOX_RECIPIENT_NORMALIZATION=true` (Meta test number), never in production. |
 
 ## 1. Shift-start "ops on" pattern
 
@@ -53,13 +53,19 @@ the marker explicitly is helpful for traceability in the human chat.)
 The phone number that the bot will send digests TO must be configured before
 boot. Validate the format end-to-end:
 
-1. **Sandbox (dev/test):** the number looks like `15219999888777` or
-   `5219999888777` (Mexican dev sandbox pattern). The runtime normalizes
-   both forms to `529999888777` (`normalizeSandboxRecipient` strips the
-   trunk-1). Use either form in the env — match works either way.
-2. **Production:** an E.164 number like `+5219999888777`. The `+` prefix is
-   accepted by Joi (per the spec) but the runtime strips it (no effect on
-   the underlying digit string).
+1. **Production (default):** copy and store the **exact digit-only `wa_id`**
+   Meta reports for the human agent, e.g. `5219999888777`; never the E.164
+   form with a `+`. With `META_SANDBOX_RECIPIENT_NORMALIZATION` unset
+   (default `false`) the value is retained verbatim and the sender/ops
+   comparison is an exact string match against the digit-only inbound
+   `wa_id`. Joi fails the boot on a `+`/separator/whitespace form or outside
+   10-15 digits — a `+` would never match, silently losing ops replies.
+2. **Meta test number only:** while building against the Meta test number,
+   you may explicitly set `META_SANDBOX_RECIPIENT_NORMALIZATION=true`. Only
+   then does the runtime rewrite `521` + 10-digit recipients (e.g.
+   `5219999888777`) to `52` + 10 digits and apply the same conversion on
+   both sides of the sender/ops comparison. This compatibility mode is
+   opt-in and must return to `false` at real-number cutover.
 
 ### Env checklist
 
@@ -70,7 +76,8 @@ boot. Validate the format end-to-end:
       bot is allowed to send it outbound messages).
 - [ ] After every change, restart the bot. Joi validation at boot fails
       fast when `HUMAN_HANDOFF_ENABLED=true` and `OPS_CHANNEL_PHONE` is
-      missing/empty/non-string.
+      missing/empty/non-string, or when it is not the exact digit-only
+      `wa_id` (leading `+`, whitespace, separators, or outside 10-15 digits).
 
 ### Test-number allowlist + 24h token cap
 
@@ -128,9 +135,15 @@ If the entire slice needs to be reverted:
 
 ## 5. Open follow-ups (non-blocking)
 
-- **R6 shipping-quote approval gate.** The `shipping_approval` kind is
-  reserved in the union but the tool's inputSchema rejects it today. Lift
-  the gate when the shipping slice lands.
+- **R6 shipping-quote approval gate (updated).** The `shipping_approval`
+  kind is now served by the gated shipping flow: the shipping quote path
+  creates the request server-side and ops resolves it with the structured
+  `APPROVE_SHIPPING`/`REJECT_SHIPPING` grammar documented in
+  `docs/shipping-quotes-operations.md`. The model-facing
+  `requestHumanAssistance` schema still rejects `shipping_approval`, so the
+  model cannot forge it. Shipping quotes remain default-off, and sale
+  continuation for any conversation carrying a shipping marker stays blocked
+  until the backend can persist the approved charge (SQ-5D).
 - **Scheduler-based nudge / expiry.** The current design waits indefinitely
   for the agent reply (no scheduler, no expiry). If operationally noisy,
   add a follow-up slice for an optional `expiresAt` column + a cron nudger.

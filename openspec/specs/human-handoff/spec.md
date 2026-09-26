@@ -40,7 +40,7 @@ inputs as `kind: 'validation'` so the future slice can flip the gate without a s
 #### Scenario: shipping_approval is reserved and rejected by the tool today
 
 - GIVEN the `requestHumanAssistance` tool is invoked with `{ kind: 'shipping_approval',
-  digest: { ... } }`
+digest: { ... } }`
 - WHEN the tool's `execute` runs
 - THEN the tool MUST return
   `{ ok: false, error: { kind: 'validation', retryable: false } }`
@@ -53,17 +53,17 @@ The system MUST create the `human_handoff_requests` table via the
 `migrations/1900000000000_human_handoff_requests.js` `node-pg-migrate` migration with the
 following columns (snake_case in SQL, camelCase on the read model):
 
-| SQL column | Type | Constraints | Maps to (TS) |
-|---|---|---|---|
-| `id` | `text` | PRIMARY KEY | `HumanHandoffRequest.id` (12 lowercase hex chars) |
-| `customer_id` | `text` | NOT NULL | `customerId` (the customer's WhatsApp senderId) |
-| `agent_id` | `text` | NOT NULL | `agentId` (the ops wa_id, set to `OPS_CHANNEL_PHONE` at create) |
-| `kind` | `text` | NOT NULL | `kind: HumanHandoffKind` |
-| `digest` | `jsonb` | NOT NULL | `digest: HumanHandoffDigest` (per-kind payload, Zod-validated) |
-| `status` | `text` | NOT NULL, DEFAULT `'pending'` | `status: 'pending' \| 'resolved'` |
-| `resolution` | `jsonb` | (nullable) | `resolution: HumanHandoffResolution \| null` |
-| `created_at` | `timestamptz` | NOT NULL, DEFAULT `now()` | `createdAt: string` (ISO) |
-| `resolved_at` | `timestamptz` | (nullable) | `resolvedAt: string \| null` (ISO) |
+| SQL column    | Type          | Constraints                   | Maps to (TS)                                                    |
+| ------------- | ------------- | ----------------------------- | --------------------------------------------------------------- |
+| `id`          | `text`        | PRIMARY KEY                   | `HumanHandoffRequest.id` (12 lowercase hex chars)               |
+| `customer_id` | `text`        | NOT NULL                      | `customerId` (the customer's WhatsApp senderId)                 |
+| `agent_id`    | `text`        | NOT NULL                      | `agentId` (the ops wa_id, set to `OPS_CHANNEL_PHONE` at create) |
+| `kind`        | `text`        | NOT NULL                      | `kind: HumanHandoffKind`                                        |
+| `digest`      | `jsonb`       | NOT NULL                      | `digest: HumanHandoffDigest` (per-kind payload, Zod-validated)  |
+| `status`      | `text`        | NOT NULL, DEFAULT `'pending'` | `status: 'pending' \| 'resolved'`                               |
+| `resolution`  | `jsonb`       | (nullable)                    | `resolution: HumanHandoffResolution \| null`                    |
+| `created_at`  | `timestamptz` | NOT NULL, DEFAULT `now()`     | `createdAt: string` (ISO)                                       |
+| `resolved_at` | `timestamptz` | (nullable)                    | `resolvedAt: string \| null` (ISO)                              |
 
 The migration MUST also create the composite index `(status, created_at)` to support
 `findLatestPendingForAgent`'s `WHERE agent_id = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1`
@@ -126,7 +126,7 @@ future slice owns its detailed contract.
 #### Scenario: resolutions round-trip through the jsonb column
 
 - GIVEN a `human_handoff_requests` row with `resolution: { decision: 'APPROVED_PROMO',
-  totalCents: 89000 }` persisted by `store.resolve(...)`
+totalCents: 89000 }` persisted by `store.resolve(...)`
 - WHEN `store.findById(id)` reads the row
 - THEN the returned `resolution` MUST deep-equal
   `{ decision: 'APPROVED_PROMO', totalCents: 89000 }`.
@@ -155,23 +155,25 @@ interface HumanHandoffStore {
   // SELECT ... WHERE agent_id = $1 AND status = 'pending'
   //        ORDER BY created_at DESC LIMIT 1
 
-  resolve(requestId: string, resolution: HumanHandoffResolution): Promise<HumanHandoffRequest>;
+  resolve(requestId: string, resolution: HumanHandoffResolution): Promise<HumanHandoffRequest | null>;
   // UPDATE ... SET status='resolved', resolution=$2, resolved_at=now()
-  //   WHERE id = $1 RETURNING *
+  //   WHERE id = $1 AND status = 'pending' RETURNING *
 }
 ```
 
 The runtime MUST bind exactly one adapter (Postgres raw `pg`) through the
 `HUMAN_HANDOFF_STORE` token. The adapter MUST honor the port contract byte-identically:
 `create` MUST return the row including a generated `createdAt` timestamp;
-`resolve` MUST be a no-op for an unknown `requestId` (returning `null`) and MUST overwrite
-`status` to `'resolved'`, `resolution` to the supplied value, and `resolved_at` to `now()`.
+`resolve` MUST transition only a pending row, setting `status` to `'resolved'`,
+`resolution` to the supplied value, and `resolved_at` to `now()`. For an unknown
+or already-resolved `requestId`, it MUST return `null` without modifying the row;
+concurrent replies MUST NOT overwrite the first recorded decision.
 
 #### Scenario: create inserts and returns the row
 
 - GIVEN a fresh database with the `human_handoff_requests` migration applied
 - WHEN `store.create({ id: 'abc123def456', customerId: '521...', agentId: '521...',
-  kind: 'out_of_stock', digest: { productId: 'p-1', name: 'X' } })` is called
+kind: 'out_of_stock', digest: { productId: 'p-1', name: 'X' } })` is called
 - THEN the returned row MUST include `id: 'abc123def456'`, `status: 'pending'`,
   `resolution: null`, and a `createdAt` ISO timestamp within the last second
 - AND a subsequent `store.findById('abc123def456')` MUST return the same row.
@@ -190,12 +192,15 @@ The runtime MUST bind exactly one adapter (Postgres raw `pg`) through the
 - THEN the returned row MUST have `status: 'resolved'`,
   `resolution: { decision: 'YES_RESTOCK_IN_X_DAYS', days: 3 }`, and a non-null `resolvedAt`.
 
-#### Scenario: resolve on unknown id is a no-op
+#### Scenario: resolve on unknown or already-resolved id is a no-op
 
 - GIVEN no row with `id: 'unknown'`
 - WHEN `store.resolve('unknown', { decision: 'GENERIC', text: 'x' })` runs
 - THEN the method MUST return `null`
 - AND no row MUST be inserted or modified.
+- GIVEN a row already resolved with `{ decision: 'NO_RESTOCK' }`
+- WHEN `store.resolve` is called again with a different decision
+- THEN the method MUST return `null` and preserve the first resolution and `resolvedAt`.
 
 ### Requirement: HumanHandoffService.create writes a row, sends the digest, notifies the customer, and sets the marker
 
@@ -238,7 +243,7 @@ grammar (`YES_RESTOCK_IN_X_DAYS:<n>` / `NO_RESTOCK` for out_of_stock;
   prior `pendingHumanRequest`
 - AND a stubbed `store.create` and `whatsappSender.sendText`
 - WHEN `service.create({ senderId: '521...', kind: 'out_of_stock',
-  digest: { productId: 'p-1', name: 'X', quantity: 1 } })` runs
+digest: { productId: 'p-1', name: 'X', quantity: 1 } })` runs
 - THEN `store.create` MUST be called once with `id` (12 hex chars), `customerId: '521...'`,
   `agentId: '5219999...'`, `kind: 'out_of_stock'`, and the supplied digest
 - AND `whatsappSender.sendText` MUST be called twice: once with `to: '5219999...'` (the
@@ -293,7 +298,8 @@ customer inbound while the marker is still pending MUST be answered with the
 
 ### Requirement: resolveReply parses the HF-<id> token and falls back to newest-pending
 
-The system MUST provide `HumanHandoffService.resolveReply({ text, from })` that performs:
+For non-shipping requests, the system MUST provide
+`HumanHandoffService.resolveReply({ text, from })` that performs:
 
 1. **Ref-token parse**: try to match `/\bHF-([A-Za-z0-9_-]{4,32})\b/i` in `text`. If matched,
    look up via `store.findByRef('HF-<match>')`. If a row is found, that is the target.
@@ -309,11 +315,17 @@ The system MUST provide `HumanHandoffService.resolveReply({ text, from })` that 
    - `APPROVED_PROMO[: ]?<cents>` → `{ decision: 'APPROVED_PROMO', totalCents: cents }`
    - `EXPIRATION[: ]?<text>` → `{ decision: 'EXPIRATION', text }`
    - bare prose → `{ decision: 'GENERIC', text }` (the full stripped remainder).
-5. `store.resolve(target.id, resolution)`.
+5. Call `store.resolve(target.id, resolution)`. If it returns `null` because the
+   row is missing or another reply already resolved it, return
+   `{ kind: 'no_pending', reply: ASK_FOR_REF }` without clearing pending, closing
+   the reservation, or emitting a synthetic turn for the losing decision.
+   A non-null result MUST match the target id/customer and have resolved status;
+   otherwise fail closed.
 6. **Atomic marker clear**: `store.clearPendingHumanRequest(target.customerId, target.id,
    lastMessageAt)` clears only the matching `target.requestId` to explicit JSON null. A
    `false` result MUST fail closed (throw) and MUST NOT close the reservation.
-7. Return
+7. Close the matching legacy reservation; a false result MUST fail closed.
+8. Return
    `{ kind: 'resolved', customerId: target.customerId, ref: target.ref, resolution,
      syntheticUserText: formatResolutionAsUserTurn(target, resolution) }`.
 
@@ -330,10 +342,7 @@ text: syntheticUserText })`.
 - THEN `store.resolve('abc123def456', { decision: 'YES_RESTOCK_IN_X_DAYS', days: 3 })` MUST
   be called
 - AND the customer's `pendingHumanRequest` MUST equal `null` (cleared)
-- AND the returned envelope MUST equal
-  `{ kind: 'resolved', customerId, ref: 'HF-abc123def456',
-    resolution: { decision: 'YES_RESTOCK_IN_X_DAYS', days: 3 },
-    syntheticUserText: '<includes ref + resolution phrasing>' }`.
+- AND the returned envelope MUST equal `{ kind: 'resolved', customerId, ref: 'HF-abc123def456', resolution: { decision: 'YES_RESTOCK_IN_X_DAYS', days: 3 }, syntheticUserText: '<includes ref + resolution phrasing>' }`.
 
 #### Scenario: no token falls back to newest pending for the agent
 
@@ -350,6 +359,13 @@ text: syntheticUserText })`.
 - THEN the returned envelope MUST equal `{ kind: 'no_pending', reply: <ASK_FOR_REF> }`
 - AND no row MUST be modified
 - AND the customer's `pendingHumanRequest` MUST be unchanged.
+
+#### Scenario: losing a concurrent resolve does not emit a losing decision
+
+- GIVEN a pending row selected by `resolveReply` that another reply resolves first
+- WHEN `store.resolve` returns `null`
+- THEN `resolveReply` MUST return `{ kind: 'no_pending', reply: ASK_FOR_REF }`
+- AND it MUST NOT clear the customer's pending marker or emit a synthetic turn.
 
 #### Scenario: bare prose is parsed as a GENERIC resolution
 
@@ -452,9 +468,9 @@ directly.
 - GIVEN a stubbed `service.create` returning
   `{ ok: true, requestId: 'abc123def456', ref: 'HF-abc123def456', customerNotified: true }`
 - WHEN the model invokes `requestHumanAssistance` with `{ kind: 'out_of_stock',
-  digest: { productId: 'p-1', name: 'X' } }` and `context.senderId = '521...'`
+digest: { productId: 'p-1', name: 'X' } }` and `context.senderId = '521...'`
 - THEN the tool MUST call `service.create({ senderId: '521...', kind: 'out_of_stock',
-  digest: { productId: 'p-1', name: 'X' } })` exactly once
+digest: { productId: 'p-1', name: 'X' } })` exactly once
 - AND the returned envelope MUST deep-equal
   `{ ok: true, requestId: 'abc123def456', ref: 'HF-abc123def456', customerNotified: true }`.
 
@@ -493,9 +509,7 @@ delta).
 
 - GIVEN a fresh sender S (no prior `pendingHumanRequest`)
 - WHEN `service.create(...)` succeeds with `id = 'abc123def456'`
-- THEN `readPendingHumanRequest(state(S))` MUST equal
-  `{ requestId: 'abc123def456', ref: 'HF-abc123def456', createdAt: <iso>,
-    customerNotifiedAt: <iso> }`.
+- THEN `readPendingHumanRequest(state(S))` MUST equal `{ requestId: 'abc123def456', ref: 'HF-abc123def456', createdAt: <iso>, customerNotifiedAt: <iso> }`.
 
 #### Scenario: resolveReply clears the marker
 
@@ -531,7 +545,7 @@ response) resumes the original flow with the resolution context.
 #### Scenario: synthetic text carries the ref and kind for the model
 
 - GIVEN a resolution for `kind: 'out_of_stock'` with `decision: 'YES_RESTOCK_IN_X_DAYS',
-  days: 3` and `ref: 'HF-abc123def456'`
+days: 3` and `ref: 'HF-abc123def456'`
 - WHEN `service.resolveReply(...)` builds the synthetic user text
 - THEN the text MUST include the literal `HF-abc123def456` substring (so the model can
   cite the ref if asked)

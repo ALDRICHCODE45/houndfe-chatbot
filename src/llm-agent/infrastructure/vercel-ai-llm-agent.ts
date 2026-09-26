@@ -42,7 +42,10 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     // tools don't appear here — the SDK only requires an entry for
     // tools that declare a contextSchema.
     const inboundEvent = forwardableInboundEvent(input);
-    const toolsContext = {
+    const toolsContext: Record<
+      string,
+      { senderId: string; inboundEvent?: LlmRunInput['inboundEvent'] }
+    > = {
       evaluateCart: { senderId: input.senderId },
       createSale: { senderId: input.senderId },
       // cancelSale declares `contextSchema: z.object({ senderId })` and
@@ -62,6 +65,14 @@ export class VercelAiLlmAgent implements LlmAgentPort {
         ...(inboundEvent === undefined ? {} : { inboundEvent }),
       },
     };
+
+    // SQ-5B2B3: the price-stripped `getShippingQuote` tool also declares
+    // `contextSchema: z.object({ senderId })`. The AI-SDK validates that
+    // every tool with a contextSchema has a matching map entry, so add it
+    // ONLY when the tool is actually present in this run's ToolSet.
+    if (input.tools !== null && 'getShippingQuote' in input.tools) {
+      toolsContext.getShippingQuote = { senderId: input.senderId };
+    }
     const result = await this.generateTextFn({
       model: openai(this.modelId),
       system: input.systemPrompt,

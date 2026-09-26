@@ -160,23 +160,28 @@ describe('pending-human-request-persistence', () => {
       expect(readPendingHumanRequest(state)).toBeNull();
     });
 
-    it('returns null when the marker is malformed (missing ref)', () => {
-      // Intentionally malformed marker: missing `ref`/`customerNotifiedAt`.
-      // The single explicit cast models a hostile legacy/partial payload that
-      // the pure reader must reject at runtime; the misshapen shape is the
-      // whole point of the case, so it cannot be widened to a valid marker.
-      const state: ConversationState = {
-        senderId: 'S',
-        lastMessageAt: now,
-        data: {
-          pendingHumanRequest: {
-            requestId: 'x',
-            createdAt: now,
-          } as ConversationState['data']['pendingHumanRequest'],
-        },
-      };
-      expect(readPendingHumanRequest(state)).toBeNull();
-    });
+    it.each([
+      { requestId: 'x', createdAt: now },
+      { requestId: 'x', createdAt: now, customerNotifiedAt: now },
+    ])(
+      'returns null when the marker is malformed (missing ref): %p',
+      (marker) => {
+        // Persisted conversation rows arrive as untyped JSONB, so a stored
+        // marker can be missing `ref` even though the compile-time contract
+        // requires it. Populate the raw value through Object.assign instead of
+        // asserting completeness with a cast, keeping the malformed shape honest.
+        const data: ConversationState['data'] = { messages: [] };
+        Object.assign(data, {
+          pendingHumanRequest: marker,
+        });
+        const state: ConversationState = {
+          senderId: 'S',
+          lastMessageAt: now,
+          data,
+        };
+        expect(readPendingHumanRequest(state)).toBeNull();
+      },
+    );
 
     it('does NOT mutate the input state', () => {
       const state: ConversationState = {

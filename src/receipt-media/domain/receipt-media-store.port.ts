@@ -7,6 +7,7 @@ import type {
   MetaMediaErrorCategory,
   MetaMediaErrorCode,
 } from './meta-media.port';
+import type { ObjectStorageErrorCode } from './object-storage.port';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -19,7 +20,25 @@ export type ReservationOutcome =
   | { kind: 'webhook-replayed'; receipt: ReceiptMediaRow }
   | { kind: 'provider-media-reused'; receipt: ReceiptMediaRow }
   | { kind: 'webhook-media-conflict' }
-  | { kind: 'sender-active' };
+  | { kind: 'sender-active'; status: ActiveReceiptStatus };
+
+/** The six `receipt_media_active_sender_idx` statuses; a lookup returns one or null. */
+export type ActiveReceiptStatus = Extract<
+  ReceiptMediaStatus,
+  | 'RESERVED'
+  | 'DOWNLOADED'
+  | 'STORED'
+  | 'AWAITING_AMOUNT'
+  | 'AWAITING_CONFIRMATION'
+  | 'ATTACHING'
+>;
+
+/** Overlapping an active row's webhook or provider identity defers to `admit`. */
+export interface ActiveSenderIdentity {
+  senderId: string;
+  webhookMessageId: string;
+  providerMediaId: string;
+}
 
 export interface ReserveInput {
   id: string;
@@ -29,6 +48,10 @@ export interface ReserveInput {
   capturedSaleId: string;
   objectKey: string;
   declaredMimeType?: string;
+  /** ODD-4A: the bounded, caption-derived declared amount in integer cents
+   * (positive, persistable range) or `null`. Raw caption text never crosses
+   * this port. */
+  declaredAmountCents?: number | null;
 }
 
 export interface OutboxIntentInput {
@@ -249,6 +272,44 @@ export type MetaFailureDispositionOutcome =
     }
   | { kind: 'fenced' };
 
+/** ODD-2D1 fixed internal exhaustion code for a reclaimed DOWNLOADED row
+ * already at `storage_attempts >= 3`: it terminalizes without a fourth
+ * storage call. */
+export const STORAGE_EXHAUSTED_CODE = 'STORAGE_EXHAUSTED';
+export type StorageDispositionCode =
+  | ObjectStorageErrorCode
+  | typeof STORAGE_EXHAUSTED_CODE;
+
+/** One immutable pre-acceptance storage failure disposition command: the
+ * existing lease/version fence plus the fixed safe object-storage
+ * category/code only. Every routing, state, attempt, status, deadline,
+ * cleanup flag, and intent value is derived from the locked durable row —
+ * never from the caller. */
+export interface StorageFailureDispositionInput extends LeaseFenceInput {
+  category: 'OBJECT_STORAGE';
+  code: StorageDispositionCode;
+}
+
+/** Transient attempts 1/2 schedule a durable retry with no intent;
+ * permanent, `CLEANUP_PENDING`, attempt-3, and internal exhaustion
+ * outcomes terminalize with exactly one row-derived deterministic intent;
+ * every other caller is fenced. */
+export type StorageFailureDispositionOutcome =
+  | {
+      kind: 'retry-scheduled';
+      attempt: number;
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | {
+      kind: 'terminal' | 'replayed';
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+      version: string;
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow;
+    }
+  | { kind: 'fenced' };
+
 /** Fence for lease mutations: receipt id, matching lease owner, expected
  * version, and a live lease are all required; a loser never mutates. */
 export interface LeaseFenceInput {
@@ -256,6 +317,43 @@ export interface LeaseFenceInput {
   owner: string;
   expectedVersion: string;
 }
+
+/** ODD-2D2a fixed cleanup technical-delete failure taxonomy: the three
+ * retryable delete codes and the four permanent delete codes. Every other
+ * category/code pair is malformed and never reaches the database. */
+export type CleanupDispositionCode =
+  | 'ABORTED'
+  | 'HTTP_RETRYABLE'
+  | 'NETWORK_FAILURE'
+  | 'OBJECT_KEY_INVALID'
+  | 'REQUEST_INVALID'
+  | 'HTTP_PERMANENT'
+  | 'PERMANENT_FAILURE';
+
+/** ODD-2D2a cleanup command: either the idempotent delete succeeded (an
+ * exact 404 is success at the port) or it failed with one safe fixed
+ * category/code. Attempt, state, and scheduling are never caller values. */
+export type CleanupDispositionInput =
+  | (LeaseFenceInput & { outcome: 'deleted' })
+  | (LeaseFenceInput & {
+      outcome: 'failed';
+      category: 'OBJECT_STORAGE';
+      code: CleanupDispositionCode;
+    });
+
+/** ODD-2D2a one terminal outcome derived from the locked cleanup row:
+ * `cleaned` clears the backlog, `retry-scheduled` durably re-queues
+ * attempts 1/2, `manual-hold` parks a permanent failure or a third
+ * retryable failure with no automatic eligibility, and every malformed,
+ * mismatched, or out-of-lifecycle caller is `fenced`. */
+export type CleanupDispositionOutcome =
+  | {
+      kind: 'cleaned' | 'retry-scheduled' | 'manual-hold';
+      attempt: number;
+      version: string;
+      receipt: ReceiptMediaRow;
+    }
+  | { kind: 'fenced' };
 
 /** CAS fence: id + matching owner + expected status/version + live lease. */
 export interface StatusCasInput {
@@ -279,8 +377,13 @@ export type DownloadCommitOutcome = {
   kind: 'committed' | 'replayed' | 'fenced';
 };
 
-/** Fenced DOWNLOADED → AWAITING_AMOUNT bootstrap input. Capability evidence is
- * hash-only; receipt-owned sender, sale, webhook, and pointer are derived. */
+/** Fenced DOWNLOADED → active-amount bootstrap input. The locked receipt's
+ * durable `declared_amount_cents` exclusively selects the successor: a null
+ * amount keeps `AWAITING_AMOUNT` with the empty `RECEIPT_AMOUNT_PROMPT`
+ * intent, while a valid positive int32 amount is retained and advances to
+ * `AWAITING_CONFIRMATION` with the `RECEIPT_AMOUNT_CONFIRM` `{ amountCents }`
+ * intent. Capability evidence is hash-only; receipt-owned sender, sale,
+ * webhook, and pointer are derived. */
 export interface AmountBootstrapInput extends LeaseFenceInput {
   objectEtag: string;
   objectVersionId: string | null;
@@ -319,6 +422,10 @@ export interface CapabilityAccessRow {
 export interface ReceiptMediaStorePort {
   /** Atomically commits a receipt reservation and its inbound webhook marker. */
   admit(input: ReserveInput): Promise<ReservationOutcome>;
+  /** UNRELATED active receipt status for the sender, or null; overlaps excluded. */
+  findActiveBySender(
+    input: ActiveSenderIdentity,
+  ): Promise<ActiveReceiptStatus | null>;
   insertOutboxIntent(input: OutboxIntentInput): Promise<DedupeOutcome>;
   /** Atomically persist one amount proposal, successor pointer, and intent. */
   proposeAmount(input: AmountProposalInput): Promise<AmountProposalOutcome>;
@@ -415,6 +522,61 @@ export interface ReceiptMediaStorePort {
   commitMetaFailureDisposition(
     input: MetaFailureDispositionInput,
   ): Promise<MetaFailureDispositionOutcome>;
+  /** ODD-2D1 durable storage failure disposition (pre-acceptance): under
+   * the caller's exact lease/version fence and a live `clock_timestamp()`
+   * lease, the locked DOWNLOADED row with a started storage attempt decides
+   * its own outcome from its stored `storage_attempts`. Transient retryable
+   * attempts 1/2 retain the DOWNLOADED status and every required download
+   * column, persist only the safe category/code, set `next_attempt_at` from
+   * a documented 1s/4s base with bounded positive jitter, clear both lease
+   * fields, bump the version, and return a retry with no intent. Permanent
+   * codes, the cleanup-backlog code `CLEANUP_PENDING` at any attempt, and
+   * retryable/attempt-3 or internal `STORAGE_EXHAUSTED` exhaustion
+   * atomically set FAILED with `STORAGE_EXHAUSTED_PRE_ACCEPTANCE`, retain
+   * every required download column, keep accepted-object/capability
+   * evidence null, persist the derived `cleanup_pending` backlog flag, and
+   * own exactly one row-derived deterministic `RECEIPT_UNAVAILABLE_LATER`
+   * intent keyed `receipt-unavailable-later:<receiptId>:<successorVersion>:
+   * <storedWebhookMessageId>` with row-derived routing and exactly `{}`
+   * args in the same transaction. Only the exact terminal successor
+   * replaying the exact persisted intent replays — validating retained
+   * download evidence, never Meta's cleared-download shape — an otherwise
+   * exact legacy successor missing only that intent is repaired under the
+   * same live lease — and a mismatched/foreign intent, rival terminal
+   * evidence, or lost/expired lease fences without replacement. */
+  commitStorageFailureDisposition(
+    input: StorageFailureDispositionInput,
+  ): Promise<StorageFailureDispositionOutcome>;
+  /** ODD-2D2a narrow cleanup claim/start: a short `FOR UPDATE SKIP LOCKED`
+   * transaction over only `FAILED/STORAGE_EXHAUSTED_PRE_ACCEPTANCE` rows
+   * with `cleanup_pending = true`, a due `next_attempt_at`, no live lease,
+   * and a backlog/retryable delete error code. Deterministic
+   * `next_attempt_at`/`created_at` order, bounded batch, 60-second lease,
+   * and a version bump. The logical attempt is derived from the locked
+   * row: an initial backlog or lease-cleared row starts the next attempt
+   * (1..3); an expired non-null lease at attempts 1..3 reclaims the same
+   * ambiguous logical attempt without increment; a lease-cleared attempt 3
+   * and any permanent code stay held. Never claims STORED or generic
+   * eligibility, and never calls the external delete. */
+  claimCleanupBatch(limit: number, owner: string): Promise<ReceiptMediaRow[]>;
+  /** ODD-2D2a fenced cleanup disposition: under the caller's exact
+   * lease/version fence and a live `clock_timestamp()` lease, the locked
+   * cleanup row decides its own outcome from its stored
+   * `cleanup_attempts`. Success keeps `FAILED`/`failure_stage`, clears
+   * `cleanup_pending` and the lease, and bumps the version with no intent
+   * and no accepted-object/capability mutation. A retryable delete failure
+   * (`ABORTED`, `HTTP_RETRYABLE`, `NETWORK_FAILURE`) at attempts 1/2 keeps
+   * the backlog and persists only the safe category/code plus a 1s/4s base
+   * with bounded positive jitter; at attempt 3 it becomes a manual hold.
+   * Every permanent delete failure (`OBJECT_KEY_INVALID`,
+   * `REQUEST_INVALID`, `HTTP_PERMANENT`, `PERMANENT_FAILURE`) at any
+   * attempt is a manual hold: backlog retained, safe error persisted, lease
+   * cleared, version bumped, and no automatic eligibility. Malformed
+   * commands, unknown category/code pairs, and mismatched fences return
+   * `fenced` without mutation. */
+  commitCleanupDisposition(
+    input: CleanupDispositionInput,
+  ): Promise<CleanupDispositionOutcome>;
   /** Short SKIP LOCKED claim transaction: bounded batch, deterministic
    * next_attempt_at/created_at order, 60-second lease, version increment;
    * ATTACHING rows (post-crash included) are reclaimable for fix-forward. */
@@ -427,8 +589,14 @@ export interface ReceiptMediaStorePort {
   transitionStatus(input: StatusCasInput): Promise<boolean>;
   /** Atomically persist download evidence while advancing the RESERVED successor. */
   commitDownload(input: DownloadCommitInput): Promise<DownloadCommitOutcome>;
-  /** Atomically store accepted object/capability evidence, create the initial
-   * pointer and deterministic empty amount prompt from the locked receipt. */
+  /** Atomically store accepted object/capability evidence and create the
+   * initial pointer from the locked receipt. The locked receipt's durable
+   * `declared_amount_cents` derives the successor: a null amount keeps the
+   * `AWAITING_AMOUNT` phase with the deterministic empty `RECEIPT_AMOUNT_PROMPT`
+   * intent, while a valid positive int32 amount is retained and advances to
+   * `AWAITING_CONFIRMATION` with `amount_proposed_at` stamped and the
+   * deterministic `RECEIPT_AMOUNT_CONFIRM` `{ amountCents }` intent. An
+   * out-of-contract durable amount fences without mutation. */
   bootstrapAmount(input: AmountBootstrapInput): Promise<AmountBootstrapOutcome>;
   /** Atomic pre-call Meta attempt start (max 3); loser null. */
   startMetaAttempt(input: LeaseFenceInput): Promise<AttemptStartResult | null>;

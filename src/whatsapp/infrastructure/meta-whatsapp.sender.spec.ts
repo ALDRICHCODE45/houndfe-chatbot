@@ -36,10 +36,11 @@ describe('MetaWhatsappSender', () => {
   // typed handle to that same spy as `httpService`.
   let httpService: { post: jest.SpiedFunction<HttpService['post']> };
   let sender: MetaWhatsappSender;
+  let sandboxRecipientNormalizationEnabled: boolean;
 
   beforeEach(() => {
     const service = new HttpService();
-
+    sandboxRecipientNormalizationEnabled = false;
     httpService = {
       post: jest
         .spyOn(service, 'post')
@@ -56,6 +57,9 @@ describe('MetaWhatsappSender', () => {
         accessToken: 'meta-access-token',
         phoneNumberId: '1234567890',
         graphApiBaseUrl: 'https://graph.facebook.com/v23.0',
+        get sandboxRecipientNormalizationEnabled() {
+          return sandboxRecipientNormalizationEnabled;
+        },
       },
     });
 
@@ -76,7 +80,7 @@ describe('MetaWhatsappSender', () => {
     expect(inbound.text).toBe('hola');
   });
 
-  it('sends one Graph API text request and returns the provider message id', async () => {
+  it('sends one Graph API text request preserving the exact wa_id by default and returns the provider message id', async () => {
     httpService.post.mockReturnValue(
       of(axiosResponse({ messages: [{ id: 'wamid.HBgLNDU2' }] })),
     );
@@ -96,7 +100,7 @@ describe('MetaWhatsappSender', () => {
       {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
-        to: '525550001111',
+        to: '5215550001111',
         type: 'text',
         text: {
           body: 'Echo: hola',
@@ -107,6 +111,19 @@ describe('MetaWhatsappSender', () => {
           Authorization: 'Bearer meta-access-token',
         },
       },
+    );
+  });
+
+  it('rewrites the trunk-1 recipient only when normalization is enabled', async () => {
+    sandboxRecipientNormalizationEnabled = true;
+    httpService.post.mockReturnValue(
+      of(axiosResponse({ messages: [{ id: 'w' }] })),
+    );
+    await sender.sendText({ to: '5215550001111', text: 'Echo: hola' });
+    expect(httpService.post).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ to: '525550001111' }),
+      expect.anything(),
     );
   });
 
@@ -159,22 +176,20 @@ describe('MetaWhatsappSender', () => {
   });
 });
 
-describe('normalizeSandboxRecipient (TEMPORARY sandbox workaround)', () => {
-  it('strips the Mexican national trunk 1 from a 521XXXXXXXXXX number', () => {
-    expect(normalizeSandboxRecipient('5215585876245')).toBe('525585876245');
+describe('normalizeSandboxRecipient (explicit opt-in sandbox compatibility mode)', () => {
+  it('preserves 521XXXXXXXXXX when disabled and strips the trunk when enabled', () => {
+    const to = '5215585876245';
+    expect(normalizeSandboxRecipient(to, false)).toBe(to);
+    expect(normalizeSandboxRecipient(to, true)).toBe('525585876245');
   });
 
-  it('leaves non-Mexican numbers unchanged', () => {
-    expect(normalizeSandboxRecipient('15550001111')).toBe('15550001111');
-    expect(normalizeSandboxRecipient('44235550001111')).toBe('44235550001111');
-  });
-
-  it('leaves Mexican numbers without the trunk 1 unchanged', () => {
-    expect(normalizeSandboxRecipient('525585876245')).toBe('525585876245');
-  });
-
-  it('leaves malformed numbers unchanged', () => {
-    expect(normalizeSandboxRecipient('52155858762')).toBe('52155858762');
-    expect(normalizeSandboxRecipient('not-a-number')).toBe('not-a-number');
+  it.each([
+    ['non-Mexican', '15550001111'],
+    ['already stripped', '525585876245'],
+    ['truncated 521', '52155858762'],
+    ['malformed', 'not-a-number'],
+  ])('leaves %s unchanged in both modes', (_label, value) => {
+    expect(normalizeSandboxRecipient(value, false)).toBe(value);
+    expect(normalizeSandboxRecipient(value, true)).toBe(value);
   });
 });

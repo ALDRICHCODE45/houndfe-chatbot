@@ -352,6 +352,59 @@ describe('VercelAiLlmAgent', () => {
     });
   });
 
+  describe('toolsContext gating for getShippingQuote', () => {
+    it('adds getShippingQuote context only when the tool is present', async () => {
+      generateTextFn.mockResolvedValueOnce({ text: 'ok' } as never);
+      await agent.run({
+        senderId: '5215550001111',
+        text: 'hola',
+        history: [],
+        systemPrompt: SYSTEM_PROMPT,
+        tools: {
+          getShippingQuote: {
+            description: 'q',
+            inputSchema: {},
+            execute: () => {},
+          },
+        },
+      });
+      const callArgs = generateTextFn.mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
+      expect(callArgs.toolsContext).toEqual({
+        evaluateCart: { senderId: '5215550001111' },
+        createSale: { senderId: '5215550001111' },
+        cancelSale: { senderId: '5215550001111' },
+        requestHumanAssistance: { senderId: '5215550001111' },
+        getShippingQuote: { senderId: '5215550001111' },
+      });
+    });
+
+    it('omits getShippingQuote context when the tool is absent', async () => {
+      generateTextFn.mockResolvedValueOnce({ text: 'ok' } as never);
+      await agent.run({
+        senderId: '5215550001111',
+        text: 'hola',
+        history: [],
+        systemPrompt: SYSTEM_PROMPT,
+        tools: {},
+      });
+
+      const callArgs = generateTextFn.mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
+      expect(callArgs.toolsContext).toEqual({
+        evaluateCart: { senderId: '5215550001111' },
+        createSale: { senderId: '5215550001111' },
+        cancelSale: { senderId: '5215550001111' },
+        requestHumanAssistance: { senderId: '5215550001111' },
+      });
+      expect(callArgs.toolsContext).not.toHaveProperty('getShippingQuote');
+    });
+  });
+
   // ────────────────────────────────────────────────────────────────────
   // CRITICAL GATE: undefined usage → 0 (prevents NaN aggregate in CostGuard)
   // ────────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { Pool } from 'pg';
 import {
@@ -10,6 +11,7 @@ import type {
   ReceiptAmountPointer,
 } from '../domain/conversation-store';
 import { PostgresConversationStore } from './postgres-conversation.store';
+import { InMemoryConversationStore } from './in-memory-conversation.store';
 import { runConversationStoreContract } from './conversation-store.contract';
 
 /**
@@ -118,6 +120,7 @@ describe('PostgresConversationStore pending human request CAS SQL', () => {
     const store = new PostgresConversationStore(pool as unknown as Pool);
     return { pool, store };
   };
+  const REQUEST_ID = 'abc123def456';
 
   it.each([
     [1, true],
@@ -159,6 +162,7 @@ describe('PostgresConversationStore pending human request CAS SQL', () => {
     );
     expect(sql).not.toMatch(/\bINSERT\b|\bON CONFLICT\b/i);
     expect(params).toEqual(['sender-a', marker.requestId, T]);
+    expect(sql).toContain('last_message_at = $3::timestamptz');
   });
 
   it('rejects malformed markers and invalid args without touching the pool', async () => {
@@ -173,6 +177,124 @@ describe('PostgresConversationStore pending human request CAS SQL', () => {
       false,
     );
     expect(pool.calls).toHaveLength(0);
+  });
+
+  it.each([
+    [1, true],
+    [0, false],
+  ] as const)(
+    'clearPendingHumanRequest maps rowCount %i to %s with one UPDATE',
+    async (count, expected) => {
+      const pool = new FakePool(count);
+      const store = new PostgresConversationStore(pool as unknown as Pool);
+      expect(await store.clearPendingHumanRequest('sender-a', REQUEST_ID)).toBe(
+        expected,
+      );
+      expect(pool.calls).toHaveLength(1);
+      const { sql, params } = pool.calls[0];
+      expect(sql).toMatch(/^\s*UPDATE\s+conversation_state\b/i);
+      expect(sql).toMatch(/\bWHERE\b[\s\S]*\bsender_id\s*=\s*\$\d+/i);
+      expect(sql).not.toMatch(/\bSELECT\b|ON\s+CONFLICT/i);
+      expect(sql).toContain('pendingHumanRequest');
+      expect(sql).toMatch(/jsonb_set\s*\(/i);
+      expect(sql).toMatch(/'null'::jsonb/);
+      expect(sql).toMatch(/jsonb_typeof\s*\(/i);
+      expect(params).toEqual(['sender-a', REQUEST_ID]);
+      expect(sql).not.toContain('last_message_at');
+      expect(sql).toContain("->>'ref' = 'HF-' || $2");
+    },
+  );
+
+  it.each(['', 'ABC123DEF456', 'abc123', 'zzzzzzzzzzzz'])(
+    'clearPendingHumanRequest rejects %p without querying',
+    async (requestId) => {
+      const pool = new FakePool(1);
+      const store = new PostgresConversationStore(pool as unknown as Pool);
+      expect(await store.clearPendingHumanRequest('sender-a', requestId)).toBe(
+        false,
+      );
+      expect(pool.calls).toHaveLength(0);
+    },
+  );
+
+  it('clearPendingHumanRequest rejects an empty sender without querying', async () => {
+    const pool = new FakePool(1);
+    const store = new PostgresConversationStore(pool as unknown as Pool);
+    expect(await store.clearPendingHumanRequest('', REQUEST_ID)).toBe(false);
+    expect(pool.calls).toHaveLength(0);
+  });
+});
+
+describe('combined pending-marker clear overloads (offline)', () => {
+  const before = '2026-07-01T08:00:00.000Z';
+  const after = '2026-07-01T09:00:00.000Z';
+  const marker = {
+    requestId: 'abc123def456',
+    ref: 'HF-abc123def456',
+    createdAt: before,
+    customerNotifiedAt: before,
+  };
+
+  it.each([undefined, null, '', 0, false])(
+    'rejects explicitly supplied invalid timestamp %p in both adapters',
+    async (timestamp) => {
+      const memory = new InMemoryConversationStore();
+      await memory.setPendingHumanRequest('sender', marker, before);
+      const snapshot = structuredClone(await memory.get('sender'));
+      const pool = new FakePool(1);
+      const postgres = new PostgresConversationStore(pool as unknown as Pool);
+      for (const store of [memory, postgres]) {
+        // Reflective call deliberately supplies runtime-invalid input without
+        // pretending it satisfies the public timestamp signature.
+        const result: unknown = await Reflect.apply(
+          store.clearPendingHumanRequest,
+          store,
+          ['sender', marker.requestId, timestamp],
+        );
+        expect(result).toBe(false);
+      }
+      expect(await memory.get('sender')).toEqual(snapshot);
+      expect(pool.calls).toHaveLength(0);
+    },
+  );
+
+  it('preserves structural legacy inputs while canonical clear rejects them', async () => {
+    const store = new InMemoryConversationStore();
+    const legacy = { ...marker, requestId: 'legacy-id', ref: 'legacy-ref' };
+    await expect(
+      store.setPendingHumanRequest('sender', legacy, before),
+    ).resolves.toBe(true);
+    await expect(
+      store.clearPendingHumanRequest('sender', legacy.requestId),
+    ).resolves.toBe(false);
+    await expect(
+      store.clearPendingHumanRequest('sender', legacy.requestId, after),
+    ).resolves.toBe(true);
+    expect(await store.get('sender')).toEqual({
+      senderId: 'sender',
+      lastMessageAt: after,
+      data: { pendingHumanRequest: null },
+    });
+  });
+
+  it('preserves timestamp and sibling state for canonical two-argument clear', async () => {
+    const store = new InMemoryConversationStore();
+    const siblings = {
+      shippingApproval: { decision: 'SHIPPING_APPROVED' },
+      placedSaleId: 'sale',
+    };
+    await store.create('sender', {
+      lastMessageAt: before,
+      data: { ...siblings, pendingHumanRequest: marker },
+    });
+    await expect(
+      store.clearPendingHumanRequest('sender', marker.requestId),
+    ).resolves.toBe(true);
+    expect(await store.get('sender')).toEqual({
+      senderId: 'sender',
+      lastMessageAt: before,
+      data: { ...siblings, pendingHumanRequest: null },
+    });
   });
 });
 
@@ -193,27 +315,45 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
     Store = require('./postgres-conversation.store').PostgresConversationStore;
 
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
-    process.env.DATABASE_URL = container.getConnectionUri();
-    delete process.env.DB_POOL_MAX;
-
-    // Apply the SAME migration the production binary would run —
-    // no hand-rolled DDL, zero schema drift.
-    execSync('pnpm migrate', {
-      env: { ...process.env, DATABASE_URL: container.getConnectionUri() },
-      stdio: 'pipe',
-    });
+    process.stderr.write(
+      `[conversation-db] started owned container ${container.getId()}\n`,
+    );
+    const root = join(__dirname, '..', '..', '..');
+    // Installed CLI only, pinned schema, owned URI, no inherited environment.
+    execFileSync(
+      process.execPath,
+      [
+        join(root, 'node_modules/node-pg-migrate/bin/node-pg-migrate.js'),
+        '--config-file',
+        'package.json',
+        '--config-value',
+        'pg-migrate',
+        'up',
+        '2600000000000',
+        '--timestamp',
+      ],
+      {
+        cwd: root,
+        env: { DATABASE_URL: container.getConnectionUri() },
+        stdio: 'pipe',
+        timeout: 60_000,
+      },
+    );
 
     pool = new Pool({ connectionString: container.getConnectionUri() });
   });
 
   afterAll(async () => {
-    if (pool) {
-      await pool.end();
+    try {
+      if (pool) await pool.end();
+    } finally {
+      if (container) {
+        await container.stop();
+        process.stderr.write(
+          `[conversation-db] stopped owned container ${container.getId()}\n`,
+        );
+      }
     }
-    if (container) {
-      await container.stop();
-    }
-    delete process.env.DATABASE_URL;
   });
 
   runConversationStoreContract('PostgresConversationStore', async () => ({
@@ -381,6 +521,72 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
       expect(cleared!.data.pendingHumanRequest).toBeNull();
       expect(Object.hasOwn(cleared!.data, 'pendingHumanRequest')).toBe(true);
       expect(cleared!.lastMessageAt).toBe(T2);
+    });
+
+    it('structural three-argument clear accepts legacy shape and updates timestamp', async () => {
+      const store = new Store(pool);
+      const legacy = { ...marker('legacy-id'), ref: 'legacy-ref' };
+      await expect(
+        store.setPendingHumanRequest('db-legacy', legacy, T),
+      ).resolves.toBe(true);
+      await expect(
+        store.clearPendingHumanRequest('db-legacy', legacy.requestId, T2),
+      ).resolves.toBe(true);
+      expect(await store.get('db-legacy')).toEqual({
+        senderId: 'db-legacy',
+        lastMessageAt: T2,
+        data: { pendingHumanRequest: null },
+      });
+    });
+
+    it('canonical two-argument clear preserves timestamp and siblings', async () => {
+      const store = new Store(pool);
+      const m = marker('abcd00001111');
+      const siblings = {
+        receiptAmountPointer: pointer,
+        shippingApproval: { decision: 'SHIPPING_APPROVED' },
+        cart: ['sku-1'],
+      };
+      await store.create('db-canonical', {
+        lastMessageAt: T,
+        data: { ...siblings, pendingHumanRequest: m },
+      });
+      await expect(
+        store.clearPendingHumanRequest('db-canonical', m.requestId),
+      ).resolves.toBe(true);
+      expect(await store.get('db-canonical')).toEqual({
+        senderId: 'db-canonical',
+        lastMessageAt: T,
+        data: { ...siblings, pendingHumanRequest: null },
+      });
+    });
+
+    it('rejects a noncanonical ref and an explicitly invalid timestamp without clearing', async () => {
+      const store = new Store(pool);
+      const m = { ...marker('abcd00002222'), ref: 'wrong-ref' };
+      await store.create('db-clear-invalid', {
+        lastMessageAt: T,
+        data: { pendingHumanRequest: m, cart: ['sku-1'] },
+      });
+      const before = await store.get('db-clear-invalid');
+      await expect(
+        store.clearPendingHumanRequest('db-clear-invalid', m.requestId),
+      ).resolves.toBe(false);
+      expect(await store.get('db-clear-invalid')).toEqual(before);
+      const canonical = marker('abcd00003333');
+      await store.create('db-invalid-time', {
+        lastMessageAt: T,
+        data: { pendingHumanRequest: canonical },
+      });
+      const original = await store.get('db-invalid-time');
+      // Explicit runtime undefined is not the omitted two-argument overload.
+      const cleared: unknown = await Reflect.apply(
+        store.clearPendingHumanRequest,
+        store,
+        ['db-invalid-time', canonical.requestId, undefined],
+      );
+      expect(cleared).toBe(false);
+      expect(await store.get('db-invalid-time')).toEqual(original);
     });
 
     it('clear fails closed on absent rows, keyless rows, and corrupt markers', async () => {

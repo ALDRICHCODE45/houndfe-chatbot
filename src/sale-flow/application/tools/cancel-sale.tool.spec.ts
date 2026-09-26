@@ -14,48 +14,6 @@ import type {
 import type { HumanHandoffService } from '../../../human-handoff/application/human-handoff.service';
 
 /**
- * Inert human-handoff dependency for the signal-only `cancelSale` tool.
- *
- * `cancelSale` never calls the handoff service (ADR-27: only
- * `requestHumanAssistance` does), yet `ToolDeps` requires the dependency. The
- * service is a nominal NestJS provider with private injected fields, so no
- * structural literal can satisfy it directly. Typing the stub as the exact
- * `Pick` this suite relies on keeps the single `as unknown as
- * HumanHandoffService` bridge documented here instead of scattering 14
- * `as never` / empty casts across every call site.
- */
-function inertHumanHandoffService(): HumanHandoffService {
-  const stub: Pick<
-    HumanHandoffService,
-    'create' | 'resolveReply' | 'isOpsSender'
-  > = {
-    create: jest.fn<
-      ReturnType<HumanHandoffService['create']>,
-      Parameters<HumanHandoffService['create']>
-    >(),
-    resolveReply: jest.fn<
-      ReturnType<HumanHandoffService['resolveReply']>,
-      Parameters<HumanHandoffService['resolveReply']>
-    >(),
-    isOpsSender: jest.fn<boolean, [string]>(),
-  };
-  return stub as unknown as HumanHandoffService;
-}
-
-/**
- * Local deps factory: injects the inert handoff stub and exposes the tool
- * through the verified schema boundary so `description` / `inputSchema` are
- * the concrete Zod types the assertions exercise.
- */
-const makeCancelSaleTool = (deps: Omit<ToolDeps, 'humanHandoffService'>) =>
-  asSchemaVerifiedTool(
-    makeCancelSaleToolRaw({
-      ...deps,
-      humanHandoffService: inertHumanHandoffService(),
-    }),
-  );
-
-/**
  * Unit tests for the 11th AI-SDK tool factory `cancelSale` (design.md §e).
  *
  * Spec scenarios (sale-flow-tools spec §cancelSale):
@@ -71,6 +29,32 @@ const makeCancelSaleTool = (deps: Omit<ToolDeps, 'humanHandoffService'>) =>
  */
 describe('makeCancelSaleTool', () => {
   const CASHIER = '00000000-4000-9000-0000-000000000001';
+
+  /**
+   * Narrow test-local tool factory.
+   *
+   * `makeCancelSaleTool` never reads `humanHandoffService` (ADR-27: only the
+   * `requestHumanAssistance` tool consumes it), so a minimal inert fake is
+   * injected once here instead of repeating a cast at all 14 call sites; the
+   * fake is asserted untouched in the happy path rather than implemented. The
+   * committed `asSchemaVerifiedTool` boundary narrows only `description` and
+   * `inputSchema`, returning the same tool object so `execute` keeps its
+   * inferred input/output/context types.
+   */
+  const humanHandoffService = {
+    create: jest.fn(),
+    resolveReply: jest.fn(),
+    isOpsSender: jest.fn(),
+  };
+
+  const makeCancelSaleTool = (deps: Omit<ToolDeps, 'humanHandoffService'>) =>
+    asSchemaVerifiedTool(
+      makeCancelSaleToolRaw({
+        ...deps,
+        humanHandoffService:
+          humanHandoffService as unknown as HumanHandoffService,
+      }),
+    );
 
   function stubStore(initial: ConversationState | null): {
     store: jest.Mocked<ConversationStore>;
@@ -178,6 +162,8 @@ describe('makeCancelSaleTool', () => {
       { data: Record<string, unknown> },
     ];
     expect('placedSaleId' in patch.data).toBe(false);
+    // The injected handoff dependency is unused: cancelSale never calls it.
+    expect(humanHandoffService.create).not.toHaveBeenCalled();
   });
 
   it('(b) missing-placedSaleId guard returns {missingPlacedSaleId, false} without any HTTP call', async () => {

@@ -3,6 +3,11 @@ import * as Joi from 'joi';
 export const META_GRAPH_API_BASE_URL_DEFAULT =
   'https://graph.facebook.com/v23.0';
 
+// SQ-2A: Skydropx Pro API host. Domestic quotes need country + postal code +
+// area_level1/2/3 for origin and destination, so a postal code alone is never
+// sufficient; origin address fields are required only when quotes are enabled.
+export const SKYDROPX_BASE_URL_DEFAULT = 'https://api-pro.skydropx.com';
+
 // ─── Receipt-media helpers (WU1C1) ─────────────────────────────────────────
 // Local field-level helpers for the conditional receipt-media foundation.
 // The base schema is `Joi.any()` so the `.when(...)` branch is a complete
@@ -176,6 +181,32 @@ const receiptConditional = (then: Joi.Schema) =>
     otherwise: Joi.any(),
   });
 
+// SQ-2A: same shape as `receiptConditional`; the base stays `Joi.any()` so the
+// when-branch fully replaces it and every provider field is permissive when off.
+const shippingConditional = (then: Joi.Schema) =>
+  Joi.any().when('SHIPPING_QUOTES_ENABLED', {
+    is: true,
+    then,
+    otherwise: Joi.any(),
+  });
+
+// SQ-2A-H: canonical, case-sensitive flag. Joi's boolean rule folds case
+// (accepting 'TRUE'), which would disagree with the factory's exact `=== 'true'`
+// posture; `sensitive(true)` pins the spelling and the original-value guard
+// rejects surrounding whitespace. Output stays boolean with a false default.
+const shippingFlagSchema = Joi.boolean()
+  .sensitive(true)
+  .truthy('true')
+  .falsy('false')
+  .custom((value: boolean, helpers) => {
+    const original: unknown = helpers.original;
+    if (typeof original === 'string' && original !== original.trim()) {
+      return helpers.error('boolean.base');
+    }
+    return value;
+  }, 'canonical boolean')
+  .default(false);
+
 /**
  * Joi validation schema for all required environment variables.
  *
@@ -196,9 +227,11 @@ const receiptConditional = (then: Joi.Schema) =>
  *   HUMAN_HANDOFF_ENABLED  — boolean, default true. Kill-switch for the
  *                             human-handoff channel.
  *   OPS_CHANNEL_PHONE      — REQUIRED when HUMAN_HANDOFF_ENABLED=true.
- *                             Wa_id of the human agent who receives
- *                             digests and replies to them. Joi accepts an
- *                             optional leading `+` (E.164).
+ *                             Exact digit-only Meta sender id (wa_id), same
+ *                             form Meta delivers in an inbound `wa_id`,
+ *                             10-15 digits. `+`/separators/whitespace are
+ *                             rejected at boot: the runtime compares it
+ *                             verbatim, so a `+` would silently drop replies.
  */
 const innerEnvValidationSchema = Joi.object({
   META_VERIFY_TOKEN: Joi.string().required(),
@@ -242,12 +275,21 @@ const innerEnvValidationSchema = Joi.object({
    * WhatsApp senderId (wa_id) of the human agent who receives digests
    * and replies to them. Required when `HUMAN_HANDOFF_ENABLED=true`;
    * optional otherwise (enforced by the `.custom()` block below).
-   * Joi accepts an optional leading `+` (E.164); the runtime normalizer
-   * further strips the Mexican trunk-1 in dev-mode test numbers.
+   * Must be the exact digit-only Meta sender id (same form delivered in an
+   * inbound `wa_id`): 10-15 digits, no leading `+`, whitespace, or
+   * separators. The value is retained verbatim; sender/ops comparison
+   * honors `META_SANDBOX_RECIPIENT_NORMALIZATION`.
    */
   OPS_CHANNEL_PHONE: Joi.string()
-    .pattern(/^\+?\d+$/)
+    .pattern(/^\d{10,15}$/)
     .optional(),
+  /**
+   * Explicit Meta test-number recipient compatibility mode. Default: false.
+   * When true, Mexico `521` + 10-digit recipients are rewritten to `52` + 10
+   * digits and the ops sender/ops-phone comparison applies the same
+   * conversion on both sides. The default keeps the exact inbound `wa_id`.
+   */
+  META_SANDBOX_RECIPIENT_NORMALIZATION: Joi.boolean().default(false),
 
   // ─── Human decisions: experimental RESTOCK gate (WU2A) ──────────────
   // Explicit opt-in only. The literal string `'true'` enables it and
@@ -269,6 +311,10 @@ const innerEnvValidationSchema = Joi.object({
   // when disabled or missing, the field is `Joi.any()`. The base
   // MUST stay `Joi.any()` so the when-branch fully replaces it.
   RECEIPT_MEDIA_ENABLED: Joi.boolean().default(false),
+  // R3-cleanup-rollout-gate: independent, default-false ingestion rollout
+  // gate. It is NOT keyed on RECEIPT_MEDIA_ENABLED; notification and every
+  // other receipt-media feature stay governed by RECEIPT_MEDIA_ENABLED alone.
+  RECEIPT_MEDIA_INGESTION_ENABLED: Joi.boolean().default(false),
   RECEIPT_MEDIA_MAX_BYTES: receiptConditional(
     Joi.number().integer().valid(RECEIPT_MAX_BYTES_VALUE).required(),
   ),
@@ -345,6 +391,38 @@ const innerEnvValidationSchema = Joi.object({
   RECEIPT_CAPABILITY_KEYS: receiptConditional(receiptCapabilityKeysSchema),
   RECEIPT_CAPABILITY_ACTIVE_VERSION: receiptConditional(
     receiptCapabilityActiveVersionSchema,
+  ),
+
+  // ─── Shipping quotes slice (SQ-2A default-off foundation) ────────────────
+  // Kill-switch defaults to false; when enabled the strict Skydropx
+  // requirements validate. Credentials stay plain non-empty strings so no
+  // pattern can echo a secret into a validation message.
+  SHIPPING_QUOTES_ENABLED: shippingFlagSchema,
+  SKYDROPX_BASE_URL: shippingConditional(
+    Joi.string()
+      .trim(true)
+      .uri({ scheme: ['https'] })
+      .default(SKYDROPX_BASE_URL_DEFAULT),
+  ),
+  SKYDROPX_CLIENT_ID: shippingConditional(Joi.string().trim(true).required()),
+  SKYDROPX_CLIENT_SECRET: shippingConditional(
+    Joi.string().trim(true).required(),
+  ),
+  SKYDROPX_ORIGIN_POSTAL_CODE: shippingConditional(
+    Joi.string()
+      .trim(true)
+      .length(5)
+      .pattern(/^[0-9]{5}$/)
+      .required(),
+  ),
+  SKYDROPX_ORIGIN_STATE: shippingConditional(
+    Joi.string().trim(true).max(100).required(),
+  ),
+  SKYDROPX_ORIGIN_MUNICIPALITY: shippingConditional(
+    Joi.string().trim(true).max(100).required(),
+  ),
+  SKYDROPX_ORIGIN_NEIGHBORHOOD: shippingConditional(
+    Joi.string().trim(true).max(100).required(),
   ),
 })
   .custom((value: Record<string, unknown>, helpers) => {

@@ -74,7 +74,10 @@ describe('DatabaseModule unit wiring', () => {
 
   it('provides PG_POOL and PostgresPoolLifecycle through the module', async () => {
     const moduleRef = await Test.createTestingModule({
-      imports: [AppConfigModule.forRoot(), DatabaseModule],
+      imports: [
+        AppConfigModule.forRoot({ ignoreEnvFile: true }),
+        DatabaseModule,
+      ],
     }).compile();
 
     const pool = moduleRef.get<Pool>(PG_POOL);
@@ -123,7 +126,10 @@ ddescribe('DatabaseModule integration (Testcontainers)', () => {
     process.env.DB_POOL_MAX = '4';
 
     moduleRef = await Test.createTestingModule({
-      imports: [AppConfigModule.forRoot(), DatabaseModule],
+      imports: [
+        AppConfigModule.forRoot({ ignoreEnvFile: true }),
+        DatabaseModule,
+      ],
     }).compile();
 
     pool = moduleRef.get<Pool>(PG_POOL);

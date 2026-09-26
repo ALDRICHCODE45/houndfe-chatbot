@@ -9,6 +9,7 @@ import type {
   AttachRequestStartOutcome,
   ReceiptMediaStorePort,
 } from '../domain/receipt-media-store.port';
+import { CapabilityService } from './capability.service';
 import { ReceiptAttachmentService } from './receipt-attachment.service';
 
 const OWNER = 'lease-owner-1';
@@ -22,6 +23,15 @@ const TRANSPORT_UNKNOWN = {
   httpStatus: null,
   transportCode: 'TRANSPORT_FAILURE',
 };
+const CAPABILITY_EVIDENCE_UNAVAILABLE =
+  'Receipt capability evidence is unavailable';
+/** Real deterministic capability over one fixed 32-byte key (version 1). */
+const capability = new CapabilityService(
+  new Map([['1', Buffer.alloc(32, 7)]]),
+  '1',
+);
+const ISSUED = capability.issue(RECEIPT_ID);
+const TOKEN = ISSUED.token;
 
 type AttachableReceipt = ReceiptMediaRow & { declaredAmountCents: number };
 
@@ -93,7 +103,7 @@ const CRASHED_START: AttachRequestStartOutcome = { kind: 'crashed-before-post', 
 function makeReceipt(
   overrides: Partial<Omit<ReceiptMediaRow, 'declaredAmountCents'>> = {},
 ): AttachableReceipt {
-  return { id: RECEIPT_ID, capturedSaleId: SALE_ID, objectKey: OBJECT_KEY, version: '7', declaredAmountCents: 15000, ...overrides } as AttachableReceipt;
+  return { id: RECEIPT_ID, capturedSaleId: SALE_ID, objectKey: OBJECT_KEY, version: '7', declaredAmountCents: 15000, capabilityTokenHash: ISSUED.tokenHash, capabilityKeyVersion: ISSUED.keyVersion, attachRequestStartedAt: null, ...overrides } as AttachableReceipt;
 }
 
 type StoreKeys =
@@ -114,9 +124,12 @@ describe('ReceiptAttachmentService (WU11C)', () => {
     // prettier-ignore
     store = { startAttachRequest: jest.fn(), commitAttachSuccess: jest.fn(), commitAttachDefiniteFailure: jest.fn(), commitAttachUnknownOutcome: jest.fn() };
     client = { attachReceipt: jest.fn() };
-    service = new ReceiptAttachmentService(store, client, {
-      receiptMedia: { publicBaseUrl: BASE_URL },
-    });
+    service = new ReceiptAttachmentService(
+      store,
+      client,
+      { receiptMedia: { publicBaseUrl: BASE_URL } },
+      capability,
+    );
   });
 
   function arrangeStarted(): AttachableReceipt {
@@ -180,11 +193,107 @@ describe('ReceiptAttachmentService (WU11C)', () => {
     const [saleId, body, options] = client.attachReceipt.mock.calls[0];
     expect(saleId).toBe('dur-sale-1');
     // prettier-ignore
-    expect(body).toEqual({ mediaUrl: `${BASE_URL}/receipts/durable-key`, declaredAmountCents: 9900 });
+    expect(body).toEqual({ mediaUrl: `${BASE_URL}/media/receipts/${TOKEN}`, declaredAmountCents: 9900 });
+    expect(body.mediaUrl).not.toContain('durable-key');
+    expect(body.mediaUrl).not.toContain(OBJECT_KEY);
     expect(options).toEqual({ signal: controller.signal });
     expect(store.commitAttachSuccess).toHaveBeenCalledTimes(1);
     // prettier-ignore
     expectCommit(store.commitAttachSuccess, { backendReceiptId: 'backend-r-1' });
+    expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
+    expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before any store or backend call when the persisted capability evidence cannot be reconstructed', async () => {
+    // Existing request-start behaviour that must NOT be reached.
+    store.startAttachRequest.mockResolvedValue(FENCED_START);
+    const receipt = makeReceipt({ capabilityTokenHash: Buffer.alloc(32, 9) });
+    await expect(service.attach({ receipt, owner: OWNER })).rejects.toThrow(
+      CAPABILITY_EVIDENCE_UNAVAILABLE,
+    );
+    expect(store.startAttachRequest).not.toHaveBeenCalled();
+    expect(client.attachReceipt).not.toHaveBeenCalled();
+    expect(store.commitAttachSuccess).not.toHaveBeenCalled();
+    expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
+    expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['null hash', { capabilityTokenHash: null }],
+    ['null version', { capabilityKeyVersion: null }],
+    [
+      'absent evidence',
+      { capabilityTokenHash: null, capabilityKeyVersion: null },
+    ],
+    ['unknown version', { capabilityKeyVersion: '9' }],
+    ['malformed hash length', { capabilityTokenHash: Buffer.alloc(16, 1) }],
+  ] as const)(
+    'fails closed before any store/backend/commit call for %s capability evidence',
+    async (_label, overrides) => {
+      store.startAttachRequest.mockResolvedValue(FENCED_START);
+      await expect(
+        service.attach({ receipt: makeReceipt(overrides), owner: OWNER }),
+      ).rejects.toThrow(CAPABILITY_EVIDENCE_UNAVAILABLE);
+      expect(store.startAttachRequest).not.toHaveBeenCalled();
+      expect(client.attachReceipt).not.toHaveBeenCalled();
+      expect(store.commitAttachSuccess).not.toHaveBeenCalled();
+      expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
+      expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
+    },
+  );
+
+  it('preserves request-evidenced recovery: a crashed-before-post row with unreconstructable capability evidence still fixes forward with one unknown commit and zero POST', async () => {
+    store.startAttachRequest.mockResolvedValue(CRASHED_START);
+    store.commitAttachUnknownOutcome.mockResolvedValue({
+      kind: 'unknown',
+      version: '9',
+      receipt: makeReceipt({ version: '9' }),
+      intent: FAKE_INTENT,
+    });
+    // Realistically request-evidenced: historical key version 9 was removed
+    // from the keyring, so the token cannot be rebuilt, but the durable row
+    // already carries request-start evidence and must still recover.
+    const receipt = makeReceipt({
+      capabilityKeyVersion: '9',
+      attachRequestStartedAt: new Date(1_700_000_000_000),
+    });
+    const report = await service.attach({ receipt, owner: OWNER });
+    expect(report).toEqual({
+      kind: 'outcome-unknown',
+      httpStatus: null,
+      transportCode: 'TRANSPORT_FAILURE',
+    });
+    expect(store.startAttachRequest).toHaveBeenCalledTimes(1);
+    expect(store.commitAttachUnknownOutcome).toHaveBeenCalledTimes(1);
+    expect(store.commitAttachUnknownOutcome).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '8',
+      attachAttemptId: DURABLE_ATTEMPT_ID,
+      httpStatus: null,
+      transportCode: 'TRANSPORT_FAILURE',
+    });
+    expect(client.attachReceipt).not.toHaveBeenCalled();
+    expect(store.commitAttachSuccess).not.toHaveBeenCalled();
+    expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
+  });
+
+  it('fails closed with the fixed error when a request-evidenced row unexpectedly yields a started result and cannot reconstruct a token', async () => {
+    // Inconsistent durable load: the caller claims request-start evidence, yet
+    // the store answers `started`. Recovery never POSTs without a token.
+    // prettier-ignore
+    store.startAttachRequest.mockResolvedValue({ kind: 'started', version: '8', receipt: { ...makeReceipt({ version: '8' }), capturedSaleId: 'dur-sale-1', declaredAmountCents: 9900 } });
+    const receipt = makeReceipt({
+      capabilityTokenHash: null,
+      capabilityKeyVersion: null,
+      attachRequestStartedAt: new Date(1_700_000_000_000),
+    });
+    await expect(service.attach({ receipt, owner: OWNER })).rejects.toThrow(
+      CAPABILITY_EVIDENCE_UNAVAILABLE,
+    );
+    expect(store.startAttachRequest).toHaveBeenCalledTimes(1);
+    expect(client.attachReceipt).not.toHaveBeenCalled();
+    expect(store.commitAttachSuccess).not.toHaveBeenCalled();
     expect(store.commitAttachDefiniteFailure).not.toHaveBeenCalled();
     expect(store.commitAttachUnknownOutcome).not.toHaveBeenCalled();
   });

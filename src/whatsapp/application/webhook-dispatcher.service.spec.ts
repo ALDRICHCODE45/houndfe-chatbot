@@ -6,6 +6,7 @@ import { CostGuardService } from '../../llm-agent/application/cost-guard.service
 import {
   type AgentMessage,
   type ConversationState,
+  type ConversationStateData,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import { type LlmAgentPort } from '../../llm-agent/domain/llm-agent.port';
@@ -22,9 +23,22 @@ import type { InboundMessage } from '../domain/inbound-message';
 import {
   ASK_FOR_REF,
   PENDING_HUMAN_REQUEST_REPLY,
+  SHIPPING_DECISION_GRAMMAR,
+  SHIPPING_REQUOTE_REPLY,
+  SHIPPING_RETRY_REPLY,
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
-import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
+import {
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+} from '../../shipping/application/shipping-customer-acceptance';
+import {
+  shippingAcceptancePair,
+  shippingCustomerAcceptance,
+  shippingCustomerOffer,
+} from '../../../test/fixtures/shipping-customer-acceptance-fixture';
 import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
@@ -247,6 +261,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       to: '5215550001111',
       text: 'Hola, ¿en qué te puedo ayudar?',
     });
+
+    // G-11 whatsapp-webhook/R1/S5: a customer inbound with no pending marker
+    // takes the normal path and never routes to the ops resolveReply hook.
+    expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
   });
 
   it('does NOT send any message outside the inbound-driven path (no proactive sends)', async () => {
@@ -778,6 +796,42 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-nopending');
     });
 
+    // SQ-5C2d: the dispatcher already hands every non-`resolved` ops outcome
+    // the same way (reply to ops, no runner). Characterize the three
+    // data-free shipping outcomes so their exact SHIPPING_* copy is pinned
+    // and can never leak to the customer.
+    it.each([
+      ['needs_decision', SHIPPING_DECISION_GRAMMAR],
+      ['needs_requote', SHIPPING_REQUOTE_REPLY],
+      ['ops_error', SHIPPING_RETRY_REPLY],
+    ] as const)(
+      '%s outcome: the exact data-free SHIPPING_* reply goes to the OPS number with no runner call',
+      async (kind, reply) => {
+        humanHandoff.isOpsSender.mockReturnValue(true);
+        humanHandoff.resolveReply.mockResolvedValue({ kind, reply });
+        const messageId = `wamid.ops-${kind}`;
+
+        await service.dispatch(opsEvent(messageId, 'APPROVE_SHIPPING'));
+
+        expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
+          text: 'APPROVE_SHIPPING',
+          from: OPS,
+        });
+        // Ops-only: the canned shipping reply never reaches the customer.
+        expect(sender.sendText).toHaveBeenCalledTimes(1);
+        expect(sender.sendText).toHaveBeenCalledWith({ to: OPS, text: reply });
+        expect(sender.sendText).not.toHaveBeenCalledWith(
+          expect.objectContaining({ to: CUSTOMER }),
+        );
+        // No customer synthetic turn and no LLM/runner invocation.
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        // The ops path short-circuits BEFORE the pending-marker read.
+        expect(conversationStore.get).not.toHaveBeenCalled();
+        expect(dedup.markSeen).toHaveBeenCalledWith(messageId);
+      },
+    );
+
     it('dedup applies to ops inbounds unchanged: a duplicate ops wamid never reaches resolveReply', async () => {
       dedup.isDuplicate.mockResolvedValue(true);
       humanHandoff.isOpsSender.mockReturnValue(true);
@@ -842,6 +896,378 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(conversationStore.update).not.toHaveBeenCalled();
       expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reply');
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cust-pending');
+    });
+  });
+
+  // ─── SCA-3b2: post-approval deterministic shipping disclosure ─────────────
+  describe('SCA-3b2: SHIPPING_APPROVED deterministic price disclosure', () => {
+    const OPS = '5219999888777';
+    const CUSTOMER = '5215550001111';
+    const PIN = '2026-06-23T12:00:00.000Z';
+    const EXPIRES = '2026-06-23T12:30:00.000Z';
+    const REQUEST = 'abcdef123456';
+    const MERCH = 60_000;
+    const CHARGE = 6_900;
+    const CUSTOMER_UUID = '11111111-1111-1111-1111-111111111111';
+    const ADDR = '22222222-2222-2222-2222-222222222222';
+    const PRODUCT = '33333333-3333-3333-3333-333333333333';
+    // Exact deterministic disclosure bytes (merchandise + freight + total).
+    const TEXT = [
+      'Detalle de tu envío (producto medido):',
+      'Mercancía: $600.00 MXN',
+      'Envío: $69.00 MXN',
+      'Total: $669.00 MXN',
+      '',
+      'Verificaremos el precio antes de registrar tu pedido. Si cambia, te mostraremos el nuevo total para que lo confirmes otra vez.',
+      '',
+      'Responde exactamente "SÍ" para aceptar o "NO" para rechazar.',
+    ].join('\n');
+
+    const line = (unitPriceCents = MERCH) => ({
+      productId: PRODUCT,
+      variantId: null,
+      quantity: 1,
+      unitPriceCents,
+    });
+    const data = (
+      over: Record<string, unknown> = {},
+    ): ConversationStateData => ({
+      shippingQuoteDraft: {
+        schemaVersion: 1,
+        draft: {
+          quoteId: 'quote-1',
+          selectedRate: {
+            rateId: 'rate-1',
+            carrierName: 'Skydropx',
+            serviceName: 'Express',
+            priceCents: CHARGE + 12_000,
+            currency: 'MXN',
+            estimatedDeliveryDays: 3,
+            validUntil: null,
+          },
+          providerExpiresAt: null,
+          bestRateCents: CHARGE + 12_000,
+          totalCreditCents: 12_000,
+          appliedCreditCents: 12_000,
+          unusedCreditCents: 0,
+          qualifyingUnitCount: 1,
+          customerPaysCents: CHARGE,
+        },
+        createdAt: PIN,
+        expiresAt: EXPIRES,
+      },
+      shippingQuoteDraftContext: {
+        schemaVersion: 1,
+        draftCreatedAt: PIN,
+        customerId: CUSTOMER_UUID,
+        shippingAddressId: ADDR,
+        cart: [line()],
+        destination: {
+          zipCode: '06700',
+          state: 'Ciudad de México',
+          municipality: 'Cuauhtémoc',
+          neighborhood: 'Roma Norte',
+        },
+      },
+      shippingApproval: {
+        requestId: REQUEST,
+        draftCreatedAt: PIN,
+        decision: 'SHIPPING_APPROVED',
+        decidedAt: '2026-06-23T12:05:00.000Z',
+      },
+      cart: {
+        items: [line()],
+        idempotencyKey: 'key-1',
+        expectedTotalCents: MERCH,
+      },
+      ...over,
+    });
+    const state = (over: Record<string, unknown> = {}): ConversationState => ({
+      senderId: CUSTOMER,
+      lastMessageAt: '2026-06-23T12:00:00.000Z',
+      data: data(over),
+    });
+    const opsEvent = (): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id: 'wamid.ops-ship-approve',
+                    from: OPS,
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body: 'HF-abcdef123456 APPROVE_SHIPPING' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    beforeEach(() => {
+      jest.setSystemTime(new Date('2026-06-23T12:10:00.000Z'));
+      humanHandoff.isOpsSender.mockReturnValue(true);
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'resolved',
+        customerId: CUSTOMER,
+        ref: 'HF-abcdef123456',
+        resolution: { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN },
+        syntheticUserText: '[Resolución del agente humano]',
+      });
+      conversationStore.update.mockImplementation(
+        (
+          senderId: string,
+          patch: Partial<Omit<ConversationState, 'senderId'>>,
+        ) => Promise.resolve({ senderId, ...patch } as ConversationState),
+      );
+    });
+
+    it('sends the price to the CUSTOMER first, then persists the sent offer with the real provider id', async () => {
+      conversationStore.get.mockResolvedValue(state());
+      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.offer' });
+
+      await service.dispatch(opsEvent());
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: TEXT,
+      });
+      const sendOrder = sender.sendText.mock.invocationCallOrder[0];
+      const persistOrder = conversationStore.update.mock.invocationCallOrder[0];
+      expect(sendOrder).toBeLessThan(persistOrder);
+      const [, patch] = conversationStore.update.mock.calls[0];
+      expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toEqual({
+        schemaVersion: 1,
+        requestId: REQUEST,
+        draftCreatedAt: PIN,
+        offeredAt: '2026-06-23T12:10:00.000Z',
+        expiresAt: EXPIRES,
+        merchandiseCents: MERCH,
+        chargeCents: CHARGE,
+        expectedTotalCents: MERCH + CHARGE,
+        providerMessageId: 'wamid.offer',
+      });
+      expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.offer');
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
+    });
+
+    it('never routes the approval through the LLM runner or the transcript store', async () => {
+      conversationStore.get.mockResolvedValue(state());
+
+      await service.dispatch(opsEvent());
+
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+      expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
+        text: 'HF-abcdef123456 APPROVE_SHIPPING',
+        from: OPS,
+      });
+    });
+
+    it('send failure fails closed: no persist, no remember and no dedup mark', async () => {
+      conversationStore.get.mockResolvedValue(state());
+      sender.sendText.mockRejectedValue(new Error('send-down'));
+
+      await expect(service.dispatch(opsEvent())).rejects.toThrow('send-down');
+
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(recentOutbound.remember).not.toHaveBeenCalled();
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('persist failure fails closed: the send is remembered but never marked seen', async () => {
+      conversationStore.get.mockResolvedValue(state());
+      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.offer' });
+      conversationStore.update.mockResolvedValueOnce(
+        null as unknown as ConversationState,
+      );
+
+      await expect(service.dispatch(opsEvent())).rejects.toThrow();
+
+      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.offer');
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('replay: an active persisted offer on the same request/pin/amounts skips re-send and marks seen', async () => {
+      conversationStore.get.mockResolvedValue(
+        state({ [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer() }),
+      );
+
+      await service.dispatch(opsEvent());
+
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(recentOutbound.remember).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
+    });
+
+    it('stale cart fails closed: no send, no persist and no dedup mark', async () => {
+      conversationStore.get.mockResolvedValue(
+        state({
+          cart: {
+            items: [line(MERCH + 100)],
+            idempotencyKey: 'key-1',
+            expectedTotalCents: MERCH + 100,
+          },
+        }),
+      );
+
+      await expect(service.dispatch(opsEvent())).rejects.toThrow();
+
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(conversationStore.update).not.toHaveBeenCalled();
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('changed price: distrusts the stale offer, re-sends and clears any prior acceptance', async () => {
+      const stale = shippingCustomerOffer({ chargeCents: CHARGE - 100 });
+      const prior = shippingCustomerAcceptance({ chargeCents: CHARGE - 100 });
+      conversationStore.get.mockResolvedValue(
+        state({
+          [SHIPPING_CUSTOMER_OFFER_KEY]: stale,
+          [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: prior,
+        }),
+      );
+      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.reprice' });
+
+      await service.dispatch(opsEvent());
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: TEXT,
+      });
+      const [, patch] = conversationStore.update.mock.calls[0];
+      expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+        chargeCents: CHARGE,
+        expectedTotalCents: MERCH + CHARGE,
+        providerMessageId: 'wamid.reprice',
+      });
+      expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+    });
+
+    // ─── SCA-3b3: replay fencing + post-send clock ─────────────────────────
+    describe('SCA-3b3: replay fence and post-send clock', () => {
+      it('re-discloses when the persisted acceptance is malformed, clearing it', async () => {
+        conversationStore.get.mockResolvedValue(
+          state({
+            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: { schemaVersion: 1 },
+          }),
+        );
+        sender.sendText.mockResolvedValue({
+          providerMessageId: 'wamid.reaccept',
+        });
+
+        await service.dispatch(opsEvent());
+
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        const [, patch] = conversationStore.update.mock.calls[0];
+        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+          chargeCents: CHARGE,
+          providerMessageId: 'wamid.reaccept',
+        });
+        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+        expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reaccept');
+      });
+
+      it('re-discloses when the persisted acceptance is orphaned from the offer', async () => {
+        conversationStore.get.mockResolvedValue(
+          state({
+            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
+              requestId: 'ffffffffffff',
+            }),
+          }),
+        );
+        sender.sendText.mockResolvedValue({
+          providerMessageId: 'wamid.reaccept',
+        });
+
+        await service.dispatch(opsEvent());
+
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        const [, patch] = conversationStore.update.mock.calls[0];
+        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+          providerMessageId: 'wamid.reaccept',
+        });
+        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+      });
+
+      it('re-discloses when the persisted acceptance is dated in the future', async () => {
+        conversationStore.get.mockResolvedValue(
+          state({
+            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
+            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
+              acceptedAt: '2026-06-23T12:20:00.000Z',
+            }),
+          }),
+        );
+        sender.sendText.mockResolvedValue({
+          providerMessageId: 'wamid.reaccept',
+        });
+
+        await service.dispatch(opsEvent());
+
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.update).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        const [, patch] = conversationStore.update.mock.calls[0];
+        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
+          providerMessageId: 'wamid.reaccept',
+        });
+        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
+      });
+
+      it('replay: a fully valid charged acceptance keeps the active offer and skips re-send', async () => {
+        conversationStore.get.mockResolvedValue(
+          state(shippingAcceptancePair()),
+        );
+
+        await service.dispatch(opsEvent());
+
+        expect(sender.sendText).not.toHaveBeenCalled();
+        expect(conversationStore.update).not.toHaveBeenCalled();
+        expect(recentOutbound.remember).not.toHaveBeenCalled();
+        expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
+      });
+
+      it('clock advance during send fails closed: send remembered, no marker write and no markSeen', async () => {
+        conversationStore.get.mockResolvedValue(state());
+        sender.sendText.mockImplementation(async () => {
+          jest.setSystemTime(new Date('2026-06-23T12:31:00.000Z'));
+          return { providerMessageId: 'wamid.late' };
+        });
+
+        await expect(service.dispatch(opsEvent())).rejects.toThrow();
+
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: TEXT,
+        });
+        expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.late');
+        expect(conversationStore.update).not.toHaveBeenCalled();
+        expect(dedup.markSeen).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -1095,6 +1521,138 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
+    // ─── G-2 llm-agent/R2/S1: safe guidance after a terminal receipt ─────
+    it('llm-agent/R2/S1: a definite terminal receipt outcome reaches the normal AgentRunner path with no protected identifiers in the runner input', async () => {
+      // A receipt that already reached a terminal/raced state no longer accepts
+      // the customer's confirmation, so the real router fences it and the
+      // follow-up takes the ordinary LLM path. The canonical pointer's
+      // protected receipt/sale identifiers must reach the real routing
+      // boundary but never cross the llm.run port.
+      const protectedPointer = {
+        receiptMediaId: 'receipt-sentinel-9f2c',
+        saleId: 'sale-sentinel-9f2c',
+        receiptVersion: '7',
+      };
+      conversationStore.get.mockResolvedValue({
+        senderId: CUSTOMER,
+        lastMessageAt: '2026-06-23T11:59:00.000Z',
+        data: { receiptAmountPointer: protectedPointer },
+      });
+      const routerStore = {
+        proposeAmount: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
+        rejectProposedAmount: jest
+          .fn()
+          .mockResolvedValue({ kind: 'fenced' as const }),
+        cancelReceipt: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
+        startAttachment: jest
+          .fn()
+          .mockResolvedValue({ kind: 'fenced' as const }),
+      };
+      const realRouter = new ReceiptAmountRouterService(
+        { get: conversationStore.get },
+        routerStore,
+      );
+      const realService = new WebhookDispatcherService(
+        runner,
+        sender,
+        dedup,
+        recentOutbound,
+        humanHandoff as unknown as HumanHandoffService,
+        conversationStore,
+        realRouter,
+        ingress,
+      );
+
+      await realService.dispatch(textEvent('wamid.terminal-followup', 'sí'));
+
+      // The real router propagated the protected identifiers to its store op,
+      // which fenced because the durable row is already terminal/raced.
+      expect(routerStore.startAttachment).toHaveBeenCalledTimes(1);
+      expect(routerStore.startAttachment).toHaveBeenCalledWith({
+        sourceWebhookMessageId: 'wamid.terminal-followup',
+        senderId: CUSTOMER,
+        receiptMediaId: protectedPointer.receiptMediaId,
+        capturedSaleId: protectedPointer.saleId,
+        expectedReceiptVersion: protectedPointer.receiptVersion,
+        expectedPointer: protectedPointer,
+        expectedReceiptStatus: 'AWAITING_CONFIRMATION',
+      });
+      // The fence fell through to the ordinary LLM path.
+      expect(llm.run).toHaveBeenCalledTimes(1);
+      const [runnerInput] = llm.run.mock.calls[0];
+      expect(runnerInput).toEqual({
+        senderId: CUSTOMER,
+        text: 'sí',
+        history: [],
+        systemPrompt: 'sys',
+        tools: {},
+      });
+      const serialized = JSON.stringify(runnerInput);
+      expect(serialized).not.toContain(protectedPointer.receiptMediaId);
+      expect(serialized).not.toContain(protectedPointer.saleId);
+      expect(runnerInput).not.toHaveProperty('receiptAmountPointer');
+    });
+
+    // ─── ODD-4D: deterministic active-text fallback ────────────────────
+    // An active amount/confirmation flow with malformed or unrecognized
+    // text must never reach the LLM: the dispatcher sends the exact
+    // finish-or-cancel guidance deterministically.
+    const ACTIVE_FLOW_GUIDANCE =
+      'Tienes un proceso abierto: finalízalo o cancélalo.';
+
+    it('ODD-4D unrecognized: exact guidance, one send/remember/markSeen, no LLM', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
+      sender.sendText.mockResolvedValueOnce({
+        providerMessageId: 'wamid.unrecognized-out',
+      });
+      await service.dispatch(textEvent('wamid.unrecognized', 'hola'));
+
+      expect(sender.sendText).toHaveBeenCalledTimes(1);
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: ACTIVE_FLOW_GUIDANCE,
+      });
+      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
+      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
+        'wamid.unrecognized-out',
+      );
+      expect(dedup.markSeen as jest.Mock).toHaveBeenCalledTimes(1);
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.unrecognized');
+      const order = [
+        sender.sendText as jest.Mock,
+        recentOutbound.remember as jest.Mock,
+        dedup.markSeen as jest.Mock,
+      ].map((mock) => mock.mock.invocationCallOrder[0]);
+      expect(order).toEqual([...order].sort((left, right) => left - right));
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    it('ODD-4D unrecognized: send failure propagates with no remember/markSeen/LLM', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
+      sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
+      await expect(
+        service.dispatch(textEvent('wamid.unrecognized-fail', 'hola')),
+      ).rejects.toThrow('Meta 131030');
+      expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
+      expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
+      expect(llm.run).not.toHaveBeenCalled();
+    });
+
+    it('ODD-4D unrecognized: markSeen failure is swallowed after a successful send', async () => {
+      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
+      dedup.markSeen.mockRejectedValueOnce(new Error('dedup write failed'));
+      await expect(
+        service.dispatch(textEvent('wamid.unrecognized-markseen-fail', 'hola')),
+      ).resolves.toBeUndefined();
+      expect(sender.sendText).toHaveBeenCalledTimes(1);
+      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
+      expect(dedup.markSeen).toHaveBeenCalledWith(
+        'wamid.unrecognized-markseen-fail',
+      );
+      expect(llm.run).not.toHaveBeenCalled();
+    });
+
     it('proposed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'proposed',
@@ -1303,9 +1861,19 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ],
       });
 
-      // admit receives exactly 4 fields; caption/filename/sha256 are NOT forwarded.
-      // Also proves captioned media never reaches the LLM.
-      it('admit: 4-field contract + captioned image skips LLM', async () => {
+      // admit receives exactly 5 fields: the normalized optional caption is
+      // the only added field. filename/sha256 and every other payload field
+      // are NOT forwarded, and captioned media never reaches the LLM or the
+      // amount router.
+      const ADMIT_FIELDS = [
+        'caption',
+        'declaredMimeType',
+        'providerMediaId',
+        'senderId',
+        'webhookMessageId',
+      ];
+
+      it('admit: caption-only 5-field contract skips LLM and amount router', async () => {
         let captured:
           | Parameters<jest.Mocked<ReceiptIngressService>['admit']>[0]
           | undefined;
@@ -1328,13 +1896,44 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           providerMediaId: 'media-001',
           senderId: CUSTOMER,
           declaredMimeType: 'image/jpeg',
+          caption: 'komprobante.png',
         });
+        expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
+        expect(amountRouter.route).not.toHaveBeenCalled();
+        expect(llm.run).not.toHaveBeenCalled();
+      });
+
+      it('admit: absent caption still forwards only the 5-field contract', async () => {
+        let captured:
+          | Parameters<jest.Mocked<ReceiptIngressService>['admit']>[0]
+          | undefined;
+        ingress.admit.mockImplementationOnce(async (input) => {
+          captured = input;
+          return {
+            kind: 'reserved',
+            receipt: receiptMediaRowFixture('r-nocaption'),
+          };
+        });
+        await service.dispatch(
+          mediaEvent('wamid.nocaption', 'image', {
+            filename: 'evil.pdf',
+            sha256: 'deadbeef',
+          }),
+        );
+        expect(captured).toEqual({
+          webhookMessageId: 'wamid.nocaption',
+          providerMediaId: 'media-001',
+          senderId: CUSTOMER,
+          declaredMimeType: 'image/jpeg',
+          caption: undefined,
+        });
+        expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
         expect(llm.run).not.toHaveBeenCalled();
       });
 
       // Guidance: customer sees guidance text, no agent, dedup marked
       const guidanceCases: Array<{
-        decision: { kind: string; text: string };
+        decision: { kind: string; text: string; status?: ActiveReceiptStatus };
         expected: string;
       }> = [
         {
@@ -1361,6 +1960,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         {
           decision: {
             kind: 'sender-active',
+            status: 'AWAITING_AMOUNT',
             text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
           },
           expected: 'Tienes un proceso abierto: finalízalo o cancélalo.',
@@ -1383,6 +1983,52 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           });
           expect(llm.run).not.toHaveBeenCalled();
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      // ── ODD-4C: active-image guidance text by durable status ──────────
+      const activeGuidanceCases: Array<{
+        status: ActiveReceiptStatus;
+        text: string;
+      }> = [
+        {
+          status: 'AWAITING_AMOUNT',
+          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+        },
+        {
+          status: 'AWAITING_CONFIRMATION',
+          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+        },
+        { status: 'RESERVED', text: 'Estamos procesando tu comprobante.' },
+        { status: 'DOWNLOADED', text: 'Estamos procesando tu comprobante.' },
+        { status: 'STORED', text: 'Estamos procesando tu comprobante.' },
+        { status: 'ATTACHING', text: 'Estamos procesando tu comprobante.' },
+      ];
+
+      test.each(activeGuidanceCases)(
+        'ODD-4C sender-active $status: exact guidance, one send/remember/markSeen, no router/LLM',
+        async ({ status, text }) => {
+          const wamid = `wamid.active.${status}`;
+          ingress.admit.mockResolvedValueOnce({
+            kind: 'sender-active',
+            status,
+          });
+          sender.sendText.mockResolvedValueOnce({
+            providerMessageId: 'wamid.active-out',
+          });
+
+          await service.dispatch(mediaEvent(wamid, 'image'));
+
+          expect(sender.sendText).toHaveBeenCalledTimes(1);
+          expect(sender.sendText).toHaveBeenCalledWith({ to: CUSTOMER, text });
+          expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
+          expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
+            'wamid.active-out',
+          );
+          expect(dedup.markSeen).toHaveBeenCalledTimes(1);
+          expect(dedup.markSeen).toHaveBeenCalledWith(wamid);
+          expect(amountRouter.route).not.toHaveBeenCalled();
+          expect(llm.run).not.toHaveBeenCalled();
         },
       );
 
@@ -1537,7 +2183,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         { kind: 'disabled' } as const,
         { kind: 'unsupported-media' } as const,
         { kind: 'no-placed-sale' } as const,
-        { kind: 'sender-active' } as const,
+        { kind: 'sender-active', status: 'AWAITING_AMOUNT' } as const,
       ])(
         'guidance marker-write failure after $kind remains terminal',
         async (decision) => {

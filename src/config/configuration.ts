@@ -1,5 +1,7 @@
-import { META_GRAPH_API_BASE_URL_DEFAULT } from './env.validation';
-import { normalizeSandboxRecipient } from '../whatsapp/infrastructure/meta-whatsapp.sender';
+import {
+  META_GRAPH_API_BASE_URL_DEFAULT,
+  SKYDROPX_BASE_URL_DEFAULT,
+} from './env.validation';
 
 const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   if (!v) return def;
@@ -10,6 +12,16 @@ const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   return r.length ? r : def;
 };
 const int = (v: string | undefined) => (v ? parseInt(v, 10) : undefined);
+// SQ-2A-H: normalize accepted surrounding whitespace so ConfigService sees the
+// same trimmed provider values that Joi validates.
+const trimmed = (v: string | undefined) => v?.trim();
+// SQ-5B2A: optional private measured-demo profile JSON. It is a raw, unparsed
+// passthrough so shipping can stay enabled when it is absent or invalid; the
+// shipping resolver fails closed later. Whitespace-only becomes undefined.
+const trimmedOrUndefined = (v: string | undefined) => {
+  const t = v?.trim();
+  return t ? t : undefined;
+};
 
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
@@ -20,6 +32,10 @@ const configuration = () => ({
     phoneNumberId: process.env.META_PHONE_NUMBER_ID as string,
     graphApiBaseUrl:
       process.env.META_GRAPH_API_BASE_URL ?? META_GRAPH_API_BASE_URL_DEFAULT,
+    // Explicit, default-off sandbox compatibility mode. Only the exact
+    // string 'true' enables the historical Mexican trunk-1 rewrite.
+    sandboxRecipientNormalizationEnabled:
+      process.env.META_SANDBOX_RECIPIENT_NORMALIZATION === 'true',
   },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,
@@ -44,9 +60,9 @@ const configuration = () => ({
   },
   humanHandoff: {
     enabled: process.env.HUMAN_HANDOFF_ENABLED !== 'false',
-    opsChannelPhone: process.env.OPS_CHANNEL_PHONE
-      ? normalizeSandboxRecipient(process.env.OPS_CHANNEL_PHONE)
-      : undefined,
+    // Retained exactly as supplied. The recipient normalization decision is
+    // applied explicitly at comparison/send time, never at boot.
+    opsChannelPhone: process.env.OPS_CHANNEL_PHONE,
   },
   humanDecisions: {
     // WU2A experimental gate: ONLY the exact env string 'true' enables it.
@@ -77,6 +93,9 @@ const configuration = () => ({
     },
     attachTimeoutMs: int(process.env.CHATBOT_API_ATTACH_TIMEOUT_MS),
     worker: {
+      // R3-cleanup-rollout-gate: dedicated, default-false ingestion rollout
+      // gate. Only the exact string 'true' enables it; omitted/false stay false.
+      enabled: process.env.RECEIPT_MEDIA_INGESTION_ENABLED === 'true',
       concurrency: parseInt(
         process.env.RECEIPT_MEDIA_WORKER_CONCURRENCY ?? '2',
         10,
@@ -89,6 +108,24 @@ const configuration = () => ({
     },
     metricsEnabled: process.env.RECEIPT_MEDIA_METRICS_ENABLED === 'true',
     metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
+  },
+  // SQ-2A-H: default-off shipping quotes; provider fields are trimmed env passthrough.
+  shippingQuotes: {
+    enabled: process.env.SHIPPING_QUOTES_ENABLED === 'true',
+    // SQ-5B2A: raw private measured-demo profile JSON, trimmed, never parsed at boot.
+    measuredDemoParcelProfileJson: trimmedOrUndefined(
+      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON,
+    ),
+    skydropx: {
+      baseUrl:
+        trimmed(process.env.SKYDROPX_BASE_URL) ?? SKYDROPX_BASE_URL_DEFAULT,
+      clientId: trimmed(process.env.SKYDROPX_CLIENT_ID),
+      clientSecret: trimmed(process.env.SKYDROPX_CLIENT_SECRET),
+      originPostalCode: trimmed(process.env.SKYDROPX_ORIGIN_POSTAL_CODE),
+      originState: trimmed(process.env.SKYDROPX_ORIGIN_STATE),
+      originMunicipality: trimmed(process.env.SKYDROPX_ORIGIN_MUNICIPALITY),
+      originNeighborhood: trimmed(process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD),
+    },
   },
 });
 

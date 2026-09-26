@@ -60,9 +60,13 @@ export interface HumanHandoffStore {
   ): Promise<HumanHandoffRequest | null>;
 
   /**
-   * Mark the request resolved. Sets `status='resolved'`, `resolution`,
-   * `resolved_at=now()`. Returns the updated row, or `null` when no row
-   * with the given id exists (the dispatcher logs and asks for a ref).
+   * Compare-and-set transition of a pending request to resolved. Sets
+   * `status='resolved'`, `resolution`, `resolved_at=now()` only when the
+   * row is still `status='pending'`. Returns the updated row; returns
+   * `null` when no pending row with the given id exists — an unknown id
+   * OR an already-resolved row. A repeated/concurrent resolve therefore
+   * never overwrites a recorded decision (the caller logs and asks for
+   * a ref).
    */
   resolve(
     id: string,

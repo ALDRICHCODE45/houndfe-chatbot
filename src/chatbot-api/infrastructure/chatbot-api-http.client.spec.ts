@@ -13,6 +13,7 @@ import {
 } from '../domain/errors';
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
 import { CancelSaleInputSchema } from '../domain/dtos/sales.dto';
+import type { BotSaleShippingInput } from '../domain/dtos/sales.dto';
 import type {
   RestockApplicationOutcomeRequest,
   RestockIntakeInput,
@@ -658,6 +659,279 @@ describe('ChatbotApiHttpClient', () => {
     expect(rejected).toBe(true);
     expect(httpService.request).not.toHaveBeenCalled();
   });
+
+  // ─── SQ-5E3 — approved shipping request/response contract
+
+  const shippingItem = {
+    productId: 'product-1',
+    productName: 'Croquetas',
+    quantity: 1,
+    unitPriceCents: 10000,
+  };
+
+  function saleBody(
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 12500,
+      paidCents: 0,
+      debtCents: 12500,
+      confirmedAt: null,
+      discountCents: 0,
+      ...extra,
+    };
+  }
+
+  it('forwards the approved shipping object with quoteId and the freight-inclusive expectedTotalCents', async () => {
+    httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
+
+    await client.createSale(
+      {
+        cashierUserId: 'cashier-1',
+        customerId: 'customer-1',
+        shippingAddressId: 'address-1',
+        expectedTotalCents: 12500,
+        shipping: {
+          chargeCents: 2500,
+          approvalId: 'handoff-123',
+          quoteId: 'quote-9',
+        },
+        items: [shippingItem],
+      },
+      'idem-ship-1',
+    );
+
+    const cfg = httpService.request.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(cfg.data.shipping).toEqual({
+      chargeCents: 2500,
+      approvalId: 'handoff-123',
+      quoteId: 'quote-9',
+    });
+    expect(cfg.data.expectedTotalCents).toBe(12500);
+  });
+
+  it.each([null, undefined])(
+    'omits the optional shipping.quoteId when it is %p',
+    async (quoteId) => {
+      httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
+
+      await client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          shippingAddressId: 'address-1',
+          expectedTotalCents: 12500,
+          shipping: { chargeCents: 2500, approvalId: 'handoff-123', quoteId },
+          items: [shippingItem],
+        },
+        'idem-ship-2',
+      );
+
+      const cfg = httpService.request.mock.calls[0]?.[0] as {
+        data: Record<string, unknown>;
+      };
+      expect(cfg.data.shipping).toEqual({
+        chargeCents: 2500,
+        approvalId: 'handoff-123',
+      });
+      expect(JSON.stringify(cfg.data)).not.toContain('quoteId');
+    },
+  );
+
+  it.each([null, undefined])(
+    'omits the shipping key entirely when it is %p',
+    async (shipping) => {
+      httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
+
+      await client.createSale(
+        {
+          cashierUserId: 'cashier-1',
+          customerId: 'customer-1',
+          shipping,
+          items: [shippingItem],
+        },
+        'idem-ship-3',
+      );
+
+      const cfg = httpService.request.mock.calls[0]?.[0] as {
+        data: Record<string, unknown>;
+      };
+      expect(cfg.data).not.toHaveProperty('shipping');
+    },
+  );
+
+  it.each([undefined, null, 0, -1, 2 ** 53])(
+    'rejects shipping with a missing, non-positive, or unsafe expectedTotalCents (%p) before HTTP',
+    async (expectedTotalCents) => {
+      let rejected = false;
+      try {
+        await client.createSale(
+          {
+            cashierUserId: 'cashier-1',
+            customerId: 'customer-1',
+            shippingAddressId: 'address-1',
+            expectedTotalCents,
+            shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
+            items: [shippingItem],
+          },
+          'idem-ship-4',
+        );
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+      expect(httpService.request).not.toHaveBeenCalled();
+    },
+  );
+
+  it('still forwards expectedTotalCents=0 without shipping (legacy path unchanged)', async () => {
+    httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
+
+    await client.createSale(
+      {
+        cashierUserId: 'cashier-1',
+        customerId: 'customer-1',
+        expectedTotalCents: 0,
+        items: [shippingItem],
+      },
+      'idem-ship-5',
+    );
+
+    const cfg = httpService.request.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(cfg.data.expectedTotalCents).toBe(0);
+    expect(cfg.data).not.toHaveProperty('shipping');
+  });
+
+  it.each<[string, BotSaleShippingInput]>([
+    ['chargeCents 0', { chargeCents: 0, approvalId: 'handoff-1' }],
+    [
+      'chargeCents int32 overflow',
+      { chargeCents: 2_147_483_648, approvalId: 'handoff-1' },
+    ],
+    ['empty approvalId', { chargeCents: 1, approvalId: '' }],
+    ['whitespace-only approvalId', { chargeCents: 1, approvalId: '   ' }],
+    [
+      'approvalId over 200 chars',
+      { chargeCents: 1, approvalId: 'a'.repeat(201) },
+    ],
+    [
+      'whitespace-only quoteId',
+      { chargeCents: 1, approvalId: 'handoff-1', quoteId: ' ' },
+    ],
+  ])(
+    'rejects invalid shipping (%s) before any HTTP call',
+    async (_label, shipping) => {
+      let rejected = false;
+      try {
+        await client.createSale(
+          {
+            cashierUserId: 'cashier-1',
+            customerId: 'customer-1',
+            shippingAddressId: 'address-1',
+            expectedTotalCents: 12500,
+            shipping,
+            items: [shippingItem],
+          },
+          'idem-ship-6',
+        );
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+      expect(httpService.request).not.toHaveBeenCalled();
+    },
+  );
+
+  it('forwards optional response subtotalCents and shippingChargeCents verbatim when present', async () => {
+    httpService.request.mockReturnValue(
+      of(
+        axiosResponse(
+          saleBody({ subtotalCents: 10000, shippingChargeCents: 2500 }),
+        ),
+      ),
+    );
+
+    const resolved = await client.createSale(
+      {
+        cashierUserId: 'cashier-1',
+        customerId: 'customer-1',
+        shippingAddressId: 'address-1',
+        expectedTotalCents: 12500,
+        shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
+        items: [shippingItem],
+      },
+      'idem-ship-7',
+    );
+
+    expect(resolved.subtotalCents).toBe(10000);
+    expect(resolved.shippingChargeCents).toBe(2500);
+  });
+
+  it('does not fabricate subtotalCents or shippingChargeCents on an address-only response', async () => {
+    httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
+
+    const resolved = await client.createSale(
+      {
+        cashierUserId: 'cashier-1',
+        customerId: 'customer-1',
+        items: [shippingItem],
+      },
+      'idem-ship-8',
+    );
+
+    expect(resolved).not.toHaveProperty('subtotalCents');
+    expect(resolved).not.toHaveProperty('shippingChargeCents');
+  });
+
+  it.each<[number, string]>([
+    [422, 'SHIPPING_CHARGE_EXCEEDS_MAX'],
+    [422, 'SHIPPING_EXPECTED_TOTAL_REQUIRED'],
+    [409, 'SHIPPING_APPROVAL_ALREADY_USED'],
+  ])(
+    'surfaces backend shipping errorCode %s on HTTP %i',
+    async (status, errorCode) => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status,
+            data: {
+              statusCode: status,
+              error: errorCode,
+              message: 'shipping',
+            },
+          },
+        })),
+      );
+
+      try {
+        await client.createSale(
+          {
+            cashierUserId: 'cashier-1',
+            customerId: 'customer-1',
+            shippingAddressId: 'address-1',
+            expectedTotalCents: 12500,
+            shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
+            items: [shippingItem],
+          },
+          'idem-ship-9',
+        );
+        fail('Expected ChatbotApiError');
+      } catch (error) {
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect((error as ChatbotApiError).statusCode).toBe(status);
+        expect((error as ChatbotApiError).errorCode).toBe(errorCode);
+      }
+    },
+  );
 
   it('resolves BotSaleResponse.discountCents from the body (100) and defaults to 0 when the body omits it', async () => {
     httpService.request.mockReturnValueOnce(

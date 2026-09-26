@@ -1,6 +1,7 @@
 import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import {
   SALE_FLOW_INSTRUCTIONS,
+  SHIPPING_QUOTE_GUIDANCE_FRAGMENT,
   composeSaleFlowSystemPrompt,
 } from './sale-flow-instructions';
 
@@ -330,6 +331,96 @@ describe('sale-flow-instructions', () => {
       expect(
         composed.split('¿Confirmas la cancelación? Sí/No').length - 1,
       ).toBe(1);
+    });
+  });
+
+  describe('opt-in shipping guidance fragment (SQ-5C3d1)', () => {
+    const canonical = base + '\n\n' + SALE_FLOW_INSTRUCTIONS;
+
+    it('keeps the default and explicit-off composed prompt byte-identical to base + "\\n\\n" + slice and never mentions getShippingQuote', () => {
+      expect(composeSaleFlowSystemPrompt(base)).toBe(canonical);
+      expect(
+        composeSaleFlowSystemPrompt(base, { shippingQuoteAvailable: false }),
+      ).toBe(canonical);
+      expect(composeSaleFlowSystemPrompt(base, {})).toBe(canonical);
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('getShippingQuote');
+      expect(composeSaleFlowSystemPrompt(base)).not.toContain(
+        'getShippingQuote',
+      );
+    });
+
+    it('fails closed: hostile or non-boolean availability never enables the fragment', () => {
+      const hostile = {
+        get shippingQuoteAvailable(): boolean {
+          throw new Error('hostile');
+        },
+      };
+      expect(composeSaleFlowSystemPrompt(base, hostile)).toBe(canonical);
+      expect(
+        composeSaleFlowSystemPrompt(base, {
+          shippingQuoteAvailable: 1 as unknown as boolean,
+        }),
+      ).toBe(canonical);
+    });
+
+    it('appends only the shipping fragment when shippingQuoteAvailable is true', () => {
+      const enabled = composeSaleFlowSystemPrompt(base, {
+        shippingQuoteAvailable: true,
+      });
+      expect(enabled).toBe(
+        base +
+          '\n\n' +
+          SALE_FLOW_INSTRUCTIONS +
+          SHIPPING_QUOTE_GUIDANCE_FRAGMENT,
+      );
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT.length).toBeGreaterThan(0);
+      expect(enabled).toContain('getShippingQuote');
+    });
+
+    it('explicitly supersedes the step-15 note and encodes approval-request semantics', () => {
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain(
+        'este slice no cotiza envíos',
+      );
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain('getShippingQuote');
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain('reused');
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain('quoted');
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toMatch(
+        /solicitud de aprobación/i,
+      );
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toMatch(
+        /NO significa que un humano ya la aprobó/i,
+      );
+    });
+
+    it('forbids relaying amount/credit/carrier/ref/digest and shipping_approval forgery, and requires a fresh re-quote on expiry', () => {
+      const fragment = SHIPPING_QUOTE_GUIDANCE_FRAGMENT;
+      for (const marker of [
+        'monto',
+        'crédito',
+        'transportista',
+        'referencia',
+        'digest',
+      ]) {
+        expect(fragment.toLowerCase()).toContain(marker);
+      }
+      expect(fragment).toContain("kind: 'shipping_approval'");
+      expect(fragment).toContain('unavailable');
+      expect(fragment).toContain('handoff_required');
+      expect(fragment).toMatch(/expir/i);
+      expect(fragment).toMatch(/vuelve a llamar a `getShippingQuote`/i);
+      expect(fragment).toMatch(/SQ-5D/);
+    });
+
+    it('blocks createSale for a shipping order until the SQ-5D server gate exists', () => {
+      const createSaleIdx =
+        SHIPPING_QUOTE_GUIDANCE_FRAGMENT.indexOf('createSale');
+      expect(createSaleIdx).toBeGreaterThan(-1);
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT.indexOf('SQ-5D')).toBeGreaterThan(
+        createSaleIdx,
+      );
+      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toMatch(
+        /No llames a `createSale`/,
+      );
     });
   });
 });

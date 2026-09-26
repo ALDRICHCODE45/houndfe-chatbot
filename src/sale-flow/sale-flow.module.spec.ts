@@ -10,6 +10,7 @@ import { PG_POOL } from '../database/postgres-pool.provider';
 import { RESTOCK_INTAKE_SERVICE } from '../human-decisions/application/restock-intake.service';
 import { SHARED_ROUTE_MARKERS } from '../human-decisions/domain/shared-route-markers';
 import { HUMAN_HANDOFF_STORE } from '../human-handoff/domain/human-handoff-store.port';
+import { ShippingModule } from '../shipping/shipping.module';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
@@ -157,6 +158,10 @@ describe('SaleFlowModule', () => {
     const moduleRef = await buildModule();
     const registry = moduleRef.get(RealToolRegistry);
     expect(registry).toBeInstanceOf(RealToolRegistry);
+    expect(
+      (registry as unknown as { shippingQuoteOrchestrator: unknown })
+        .shippingQuoteOrchestrator,
+    ).toBeNull();
     expect(Object.keys(registry.getTools()).sort()).toEqual(
       [
         'searchCatalog',
@@ -174,6 +179,16 @@ describe('SaleFlowModule', () => {
       ].sort(),
     );
     await moduleRef.close();
+  });
+
+  it('imports the dynamic ShippingModule exactly once and nothing else shipping', () => {
+    const imports =
+      (Reflect.getMetadata('imports', SaleFlowModule) as
+        | Array<{ module?: unknown }>
+        | undefined) ?? [];
+    expect(
+      imports.filter((entry) => entry?.module === ShippingModule),
+    ).toHaveLength(1);
   });
 
   it('does not bind the boot-time bank-details seam (only the runtime registry)', async () => {

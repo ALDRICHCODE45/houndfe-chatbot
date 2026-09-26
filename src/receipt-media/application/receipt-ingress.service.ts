@@ -13,8 +13,11 @@
 import { randomUUID } from 'node:crypto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import { readPlacedSaleId } from '../../sale-flow/application/placed-sale-persistence';
+import { parseAmount } from '../domain/amount-parser';
 import { newObjectKey } from '../domain/object-storage.port';
 import type {
+  ActiveReceiptStatus,
+  ActiveSenderIdentity,
   ReservationOutcome,
   ReserveInput,
 } from '../domain/receipt-media-store.port';
@@ -26,6 +29,21 @@ const SUPPORTED_MIME_TYPES: ReadonlySet<string> = new Set([
   'image/png',
 ]);
 
+/** Largest declared amount the durable positive-int32 `declared_amount_cents`
+ * column can hold (mirrors the store's own evidence bound). */
+const MAX_DECLARED_AMOUNT_CENTS = 2_147_483_647;
+
+/** ODD-4A CPU-only caption mapping: the raw caption is consumed here and
+ * never leaves this frame. Only the parsed positive integer cent value within
+ * the persistable range, or `null`, is produced. */
+function declaredAmountCentsOf(caption: string | undefined): number | null {
+  if (caption === undefined) return null;
+  const parsed = parseAmount(caption);
+  return parsed.kind === 'parsed' && parsed.cents <= MAX_DECLARED_AMOUNT_CENTS
+    ? parsed.cents
+    : null;
+}
+
 /** Narrow kill-switch seam over the WU1B `receiptMedia` config subtree. */
 export interface ReceiptMediaKillSwitch {
   readonly enabled: boolean;
@@ -36,17 +54,24 @@ export interface ReceiptIngressConversations {
   getState(senderId: string): Promise<ConversationState | null>;
 }
 
-/** Narrow receipt-admission seam over the store port: one atomic admission. */
+/** Narrow receipt-admission seam over the store port: one atomic admission
+ * plus the ODD-4C identity-aware durable active lookup. */
 export interface ReceiptIngressStore {
   admit(input: ReserveInput): Promise<ReservationOutcome>;
+  findActiveBySender(
+    input: ActiveSenderIdentity,
+  ): Promise<ActiveReceiptStatus | null>;
 }
 
-/** Normalized media envelope; identity pre-checks are store-owned. */
+/** Normalized media envelope; identity pre-checks are store-owned. The
+ * optional caption is transient: it is parsed CPU-only and only its bounded
+ * declared amount ever reaches the store port. */
 export interface ReceiptIngressInput {
   senderId: string;
   webhookMessageId: string;
   providerMediaId: string;
   declaredMimeType: string;
+  caption?: string;
 }
 
 /** Closed admission result: the three pre-admission decisions never create
@@ -60,7 +85,7 @@ export type ReceiptIngressDecision =
   | { kind: 'webhook-replayed'; receipt: ReceiptMediaRow }
   | { kind: 'provider-media-reused'; receipt: ReceiptMediaRow }
   | { kind: 'webhook-media-conflict' }
-  | { kind: 'sender-active' };
+  | { kind: 'sender-active'; status: ActiveReceiptStatus };
 
 export class ReceiptIngressService {
   constructor(
@@ -72,11 +97,18 @@ export class ReceiptIngressService {
   /** TX1 admission: the store atomically persists the reservation and inbound
    * marker. Unsupported media is gated before the state read (media type is
    * intrinsic to the message; sale context is transient); no sale context
-   * reserves nothing. */
+   * reserves nothing. ODD-4C: the active lookup precedes the placed-sale read. */
   async admit(input: ReceiptIngressInput): Promise<ReceiptIngressDecision> {
     if (!this.killSwitch.enabled) return { kind: 'disabled' };
     if (!SUPPORTED_MIME_TYPES.has(input.declaredMimeType))
       return { kind: 'unsupported-media' };
+    const activeStatus = await this.store.findActiveBySender({
+      senderId: input.senderId,
+      webhookMessageId: input.webhookMessageId,
+      providerMediaId: input.providerMediaId,
+    });
+    if (activeStatus !== null)
+      return { kind: 'sender-active', status: activeStatus };
     const placedSaleId = readPlacedSaleId(
       await this.conversations.getState(input.senderId),
     );
@@ -89,6 +121,7 @@ export class ReceiptIngressService {
       capturedSaleId: placedSaleId,
       objectKey: newObjectKey(),
       declaredMimeType: input.declaredMimeType,
+      declaredAmountCents: declaredAmountCentsOf(input.caption),
     });
     switch (reservation.kind) {
       case 'created':
@@ -97,8 +130,9 @@ export class ReceiptIngressService {
       case 'provider-media-reused':
         return { kind: reservation.kind, receipt: reservation.receipt };
       case 'webhook-media-conflict':
-      case 'sender-active':
         return { kind: reservation.kind };
+      case 'sender-active':
+        return { kind: 'sender-active', status: reservation.status };
     }
   }
 }

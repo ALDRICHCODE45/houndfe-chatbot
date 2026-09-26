@@ -10,9 +10,10 @@ import {
   ObjectStorageError,
   type ObjectStoragePort,
 } from '../domain/object-storage.port';
-import type {
-  MetaTerminalFailureStage,
-  ReceiptMediaStorePort,
+import {
+  STORAGE_EXHAUSTED_CODE,
+  type MetaTerminalFailureStage,
+  type ReceiptMediaStorePort,
 } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 import type { CapabilityService } from './capability.service';
@@ -32,7 +33,13 @@ export type ReceiptIngestionOutcome =
       code: string;
     }
   | { kind: 'meta-fenced'; code: string }
-  | { kind: 'storage-failed'; code: string }
+  | { kind: 'storage-retry-scheduled'; attempt: number; code: string }
+  | {
+      kind: 'storage-terminal';
+      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE';
+      code: string;
+    }
+  | { kind: 'storage-fenced'; code: string }
   | { kind: 'unsupported-claimed-status'; status: string };
 
 const PROCESSABLE: ReadonlySet<string> = new Set(['RESERVED', 'DOWNLOADED']);
@@ -57,6 +64,7 @@ export class ReceiptIngestionProcessor {
       | 'commitDownload'
       | 'bootstrapAmount'
       | 'commitMetaFailureDisposition'
+      | 'commitStorageFailureDisposition'
     >,
     private readonly capability: Pick<CapabilityService, 'issue'>,
   ) {}
@@ -71,6 +79,20 @@ export class ReceiptIngestionProcessor {
       return { kind: 'unsupported-claimed-status', status: receipt.status };
     if (abort.aborted) return { kind: 'aborted', stage: 'meta' };
     const fence = { id: receipt.id, owner, expectedVersion: receipt.version };
+    if (receipt.status === 'DOWNLOADED' && receipt.storageAttempts >= 3) {
+      const disposition = await this.store.commitStorageFailureDisposition({
+        ...fence,
+        category: 'OBJECT_STORAGE',
+        code: STORAGE_EXHAUSTED_CODE,
+      });
+      return disposition.kind === 'terminal' || disposition.kind === 'replayed'
+        ? {
+            kind: 'storage-terminal',
+            failureStage: disposition.failureStage,
+            code: STORAGE_EXHAUSTED_CODE,
+          }
+        : { kind: 'storage-fenced', code: STORAGE_EXHAUSTED_CODE };
+    }
     if (receipt.metaAttempts >= 3) {
       const disposition = await this.store.commitMetaFailureDisposition({
         ...fence,
@@ -166,47 +188,65 @@ export class ReceiptIngestionProcessor {
     let done: StoredPassOutcome = { kind: 'blocked', stage: 'storage' };
     let thrown: Error | null = null;
     try {
-      for (;;) {
-        if (signal.aborted) {
-          done = { kind: 'aborted', stage: 'storage' };
-          break;
-        }
+      if (signal.aborted) {
+        done = { kind: 'aborted', stage: 'storage' };
+      } else {
         const start = await this.store.startStorageAttempt({
           id: fence.id,
           owner: fence.owner,
           expectedVersion: fence.expectedVersion,
         });
-        if (start === null) break;
-        fence.expectedVersion = start.version;
-        const stream = createReadStream(file.filePath);
-        const cleanupSignal = new AbortController().signal;
-        try {
-          const object = await this.storage.put({
-            key: objectKey,
-            content: stream,
-            byteCount: file.byteCount,
-            mimeType: file.mimeType,
-            sha256: file.sha256,
-            abortSignal: signal,
-            cleanupSignal,
-          });
-          done = {
-            kind: 'uploaded',
-            version: start.version,
-            objectEtag: object.etag,
-            objectVersionId: object.versionId,
-          };
-          break;
-        } catch (err) {
-          stream.destroy();
-          if (!(err instanceof ObjectStorageError)) throw err;
-          if (err.code === 'ABORTED' && signal.aborted) {
-            done = { kind: 'aborted', stage: 'storage' };
-            break;
-          }
-          if (!err.retryable) {
-            done = { kind: 'storage-failed', code: err.code };
-            break;
+        if (start !== null) {
+          fence.expectedVersion = start.version;
+          const stream = createReadStream(file.filePath);
+          const cleanupSignal = new AbortController().signal;
+          try {
+            const object = await this.storage.put({
+              key: objectKey,
+              content: stream,
+              byteCount: file.byteCount,
+              mimeType: file.mimeType,
+              sha256: file.sha256,
+              abortSignal: signal,
+              cleanupSignal,
+            });
+            done = {
+              kind: 'uploaded',
+              version: start.version,
+              objectEtag: object.etag,
+              objectVersionId: object.versionId,
+            };
+          } catch (err) {
+            stream.destroy();
+            if (!(err instanceof ObjectStorageError)) throw err;
+            const disposition =
+              await this.store.commitStorageFailureDisposition({
+                id: fence.id,
+                owner: fence.owner,
+                expectedVersion: fence.expectedVersion,
+                category: err.category,
+                code: err.code,
+              });
+            if (err.code === 'ABORTED' && signal.aborted) {
+              done = { kind: 'aborted', stage: 'storage' };
+            } else if (
+              disposition.kind === 'terminal' ||
+              disposition.kind === 'replayed'
+            ) {
+              done = {
+                kind: 'storage-terminal',
+                failureStage: disposition.failureStage,
+                code: err.code,
+              };
+            } else if (disposition.kind === 'retry-scheduled') {
+              done = {
+                kind: 'storage-retry-scheduled',
+                attempt: disposition.attempt,
+                code: err.code,
+              };
+            } else {
+              done = { kind: 'storage-fenced', code: err.code };
+            }
           }
         }
       }

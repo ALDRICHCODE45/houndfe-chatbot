@@ -32,6 +32,22 @@ const ROUTES = [
   ['cancelar', 'cancelReceipt'],
 ] as const;
 
+/** ODD-4D: malformed/unrecognized valid-string texts with no routing plan. */
+const MALFORMED_TEXTS = [
+  'hola',
+  '',
+  '   ',
+  'sin monto',
+  '$1,234.50 y 999',
+  '1234,50',
+  '0',
+  '-1234.50',
+  'hola 1234',
+  'no cancelar',
+  'sí no',
+  '1234.5',
+] as const;
+
 const stateOf = (data: unknown) => ({
   senderId: SENDER,
   lastMessageAt: '',
@@ -172,25 +188,30 @@ describe('ReceiptAmountRouterService.route', () => {
     },
   );
 
-  it.each([
-    'hola',
-    '',
-    '   ',
-    'sin monto',
-    '$1,234.50 y 999',
-    '1234,50',
-    '0',
-    '-1234.50',
-    'hola 1234',
-    'no cancelar',
-    'sí no',
-    '1234.5',
-  ])(
-    'never reaches the store for malformed or ambiguous text %j',
+  it.each(MALFORMED_TEXTS)(
+    'ODD-4D: malformed or ambiguous text %j with a valid pointer is unrecognized',
     async (text) => {
       const { router, store, conversations } = routerFixture();
-      expect(await router.route(INPUT(text))).toEqual({ kind: 'fenced' });
-      expect(conversations.get).not.toHaveBeenCalled();
+      expect(await router.route(INPUT(text))).toEqual({ kind: 'unrecognized' });
+      expect(conversations.get).toHaveBeenCalledTimes(1);
+      for (const op of Object.values(store)) expect(op).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['state null', null],
+    ['pointer missing', stateOf({})],
+    ['pointer null', pointerState(null)],
+    ['version zero', pointerState({ ...POINTER, receiptVersion: '0' })],
+    ['empty saleId', pointerState({ ...POINTER, saleId: '' })],
+    ['extra key', pointerState({ ...POINTER, extra: true })],
+    ['missing keys', pointerState({ receiptVersion: '7' })],
+  ])(
+    'ODD-4D: malformed text with a %s stays fenced after one read',
+    async (_label, state) => {
+      const { router, store, conversations } = routerFixture(state);
+      expect(await router.route(INPUT('hola'))).toEqual({ kind: 'fenced' });
+      expect(conversations.get).toHaveBeenCalledTimes(1);
       for (const op of Object.values(store)) expect(op).not.toHaveBeenCalled();
     },
   );

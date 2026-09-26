@@ -42,10 +42,14 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   async sendText(message: OutboundText): Promise<SendResult> {
     this.assertTextMessage(message);
 
-    // TEMPORARY SANDBOX WORKAROUND — REMOVE FOR PRODUCTION (see below)
+    // Explicit, default-off sandbox compatibility mode (see below).
+    const sandboxNormalization =
+      this.configService.get<boolean>(
+        'meta.sandboxRecipientNormalizationEnabled',
+      ) === true;
     const normalizedMessage = {
       ...message,
-      to: normalizeSandboxRecipient(message.to),
+      to: normalizeSandboxRecipient(message.to, sandboxNormalization),
     };
 
     const response = await this.postTextMessage(normalizedMessage);
@@ -125,7 +129,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
 }
 
 /**
- * TEMPORARY SANDBOX WORKAROUND — REMOVE FOR PRODUCTION ⚠️
+ * Explicit opt-in Meta test-number recipient compatibility mode.
  *
  * Context: Meta's TEST phone number (the sandbox number, not a real
  * registered number) only permits replying to phone numbers that appear
@@ -136,21 +140,23 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
  * `525585876245`), so replying to the `from` number as-is fails with
  * Meta error 131030 "Recipient phone number not in allowed list".
  *
- * This function strips the Mexican national trunk `1` (the digit after
- * the `52` country code) so the bot can reply to test recipients.
- *
- * WHEN TO REMOVE:
- * - Once the production WhatsApp Business number is registered (real
- *   numbers do NOT have the allowed-recipient restriction), this
- *   normalization MUST be deleted. The E.164 format WITH the trunk `1`
- *   is the correct format for Mexico in production.
- * - Do NOT ship this to production.
- *
- * This is scoped narrowly: only numbers matching the Mexico pattern
- * `521` + 10 digits are touched. Any other number is passed through
- * unchanged.
+ * This function is gated behind the explicit, default-off
+ * `META_SANDBOX_RECIPIENT_NORMALIZATION` flag. When enabled it strips the
+ * Mexican national trunk `1` from numbers matching the Mexico pattern
+ * `521` + 10 digits so the bot can reply to test recipients; every other
+ * number is passed through unchanged. When disabled (the default) the
+ * recipient is returned exactly as given, so production preserves the
+ * `wa_id` Meta reported. The `enabled` flag is required: there is
+ * deliberately no default that could silently opt in.
  */
-export function normalizeSandboxRecipient(to: string): string {
+export function normalizeSandboxRecipient(
+  to: string,
+  enabled: boolean,
+): string {
+  if (!enabled) {
+    return to;
+  }
+
   const MEXICO_TRUNK_1_PATTERN = /^521\d{10}$/;
 
   if (MEXICO_TRUNK_1_PATTERN.test(to)) {

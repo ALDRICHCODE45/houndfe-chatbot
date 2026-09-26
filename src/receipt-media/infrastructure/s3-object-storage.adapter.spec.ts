@@ -27,8 +27,6 @@ import { S3ObjectStorageAdapter } from './s3-object-storage.adapter';
 import {
   RECEIPT_FAILURE_STAGES,
   RECEIPT_MEDIA_STATUSES,
-  type ReceiptFailureStage,
-  type ReceiptMediaStatus,
 } from '../domain/receipt-media.types';
 
 const BUCKET = 'private-bucket';
@@ -50,15 +48,13 @@ const boom = (props: Record<string, unknown> = {}) =>
   Object.assign(new Error('boom'), props);
 const sourceOf = (b: unknown) => (b as { source?: unknown }).source;
 const listenerCount = (s: AbortSignal) => getEventListeners(s, 'abort').length;
-// Negative gate probe: the production gate is typed on its domain enums, but
-// these cases deliberately feed hostile, non-domain `unknown` values (forged
-// objects, symbols, primitives) to prove the runtime fail-closed behavior. The
-// narrow casts restore the intent without widening the gate's real contract.
-const gate = (s: unknown, f: unknown): boolean =>
-  port.isTechnicalDeleteAllowed(
-    s as ReceiptMediaStatus,
-    f as ReceiptFailureStage | null,
-  );
+// Explicit reflective boundary: the fail-closed tests must feed forged
+// `unknown` values to the real, unmodified production gate. `Reflect.apply`
+// accepts an untyped argument list at runtime, and `=== true` preserves this
+// gate's strict boolean contract.
+const gate = (status: unknown, stage: unknown): boolean =>
+  Reflect.apply(port.isTechnicalDeleteAllowed, undefined, [status, stage]) ===
+  true;
 const putInput = (over: Record<string, unknown> = {}) => ({
   key: KEY,
   content: stream('hello'),

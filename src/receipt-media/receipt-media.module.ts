@@ -1,20 +1,28 @@
-/** WU14C composition root, extended by WU14E: composes the existing
- * adapters (WU2B store, WU4B Meta client, WU5A S3 adapter), the
+/** WU14C composition root, extended by WU14E, ODD-3A, and ODD-3B: composes
+ * the existing adapters (WU2B store, WU4B Meta client, WU5A S3 adapter), the
  * WU7/WU10C/WU11C application services, the WU8A processor, the WU6D1
  * authorizer, and the WU6D2 access controller behind validated
  * receipt-media configuration — and, when enabled, starts the WU9
- * notification drain through a module-local lifecycle coordinator that
- * privately owns the WU14A outbox store and notification worker. No
- * ingestion wiring, no `ReceiptOutboxService`/`ReceiptTx2CommitPort` path,
- * and no outbox intent production — the notification drain consumes
- * already-committed intents only. Enabled mode decodes the configured
+ * notification drain, the ODD-3A ingestion drain, and the ODD-3B cleanup
+ * drain through module-local lifecycle coordinators that privately own their
+ * workers (the WU14A outbox store/notification worker, the WU7/WU10C
+ * dispatcher/WU8B2 ingestion worker, and the ODD-2D2b cleanup
+ * service/worker respectively). No worker or lifecycle service is a DI
+ * token. No
+ * `ReceiptOutboxService`/`ReceiptTx2CommitPort` path, and no outbox intent
+ * production — the notification drain consumes already-committed intents
+ * only, and the ingestion drain claims the existing receipt_media states.
+ * The cleanup drain claims only durable cleanup backlog rows and never
+ * STORED or accepted media. Enabled mode decodes the configured
  * base64 keyring exactly here; absent/malformed keyrings fail closed at
  * boot via CapabilityService validation. Disabled mode
  * (`RECEIPT_MEDIA_ENABLED=false` with no receipt-specific settings) boots
  * inert: module-local fail-closed Meta/S3/lookup seams replace the
  * configured adapters, the authorizer maps every lookup rejection to its
  * existing `unavailable` result without touching storage, and the
- * notification lifecycle performs no claims, polling, sends, or alerts.
+ * notification lifecycle performs no claims, polling, sends, or alerts; the
+ * ingestion and cleanup lifecycles also perform no claims, polling, deletes,
+ * or SQL.
  * Enable/disable takes effect by graceful restart/redeploy, never by live
  * runtime toggling. */
 import { Module } from '@nestjs/common';
@@ -42,6 +50,7 @@ import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { CapabilityService } from './application/capability.service';
 import { ReceiptAmountRouterService } from './application/receipt-amount-router.service';
 import { ReceiptAttachmentService } from './application/receipt-attachment.service';
+import { ReceiptCleanupService } from './application/receipt-cleanup.service';
 import {
   RECEIPT_CAPABILITY_LOOKUP,
   ReceiptCapabilityAuthorizerService,
@@ -49,6 +58,7 @@ import {
 } from './application/receipt-capability-authorizer.service';
 import { ReceiptIngestionProcessor } from './application/receipt-ingestion.processor';
 import { ReceiptIngressService } from './application/receipt-ingress.service';
+import { ReceiptProcessingDispatcher } from './application/receipt-processing-dispatcher.service';
 import {
   META_MEDIA,
   MetaMediaError,
@@ -69,6 +79,8 @@ import {
   type S3ObjectStorageConfig,
 } from './infrastructure/s3-object-storage.adapter';
 import { PostgresReceiptOutboxStore } from './infrastructure/postgres-receipt-outbox.store';
+import { ReceiptCleanupWorker } from './infrastructure/receipt-cleanup.worker';
+import { ReceiptMediaIngestionWorker } from './infrastructure/receipt-media-ingestion.worker';
 import {
   ReceiptMediaNotificationWorker,
   type NotificationAlertSeam,
@@ -101,6 +113,14 @@ const decodeKeyring = (
 /** Narrow enabled/disabled gate over the validated receiptMedia subtree. */
 const isEnabled = (config: ConfigService): boolean =>
   config.get<boolean>('receiptMedia.enabled') === true;
+
+/** R3-cleanup-rollout-gate: the ingestion lifecycle starts only when receipt
+ * media is broadly enabled AND the dedicated, default-false ingestion rollout
+ * gate (`receiptMedia.worker.enabled`) is exactly true. Notification and every
+ * other receipt-media feature stay governed by `isEnabled` alone. */
+const isIngestionEnabled = (config: ConfigService): boolean =>
+  isEnabled(config) &&
+  config.get<boolean>('receiptMedia.worker.enabled') === true;
 
 /** Fixed inert keyring for the disabled capability stand-in: never
  * configured, never persisted, and unusable for real tokens because the
@@ -152,21 +172,23 @@ const WORKER_MIN_POLL_MS = 50;
  * WU14A outbox drain store and the WU9 notification worker (they are never
  * registered as DI tokens) and forwards start/drain exactly once — the
  * start guard makes repeated bootstrap invocations AND a bootstrap after
- * shutdown no-ops, so no second claim loop can be orphaned and no restart
- * can happen after stop. On Nest shutdown its `onModuleDestroy` awaits
- * the worker's in-flight sends and stops the claim loop BEFORE the real
- * PostgresPoolLifecycle (in DatabaseModule, strictly farther from the
- * root) invokes `pool.end`, so no notification transaction can run
- * against a closed pool. In disabled mode both hooks are inert: no
- * worker, no store, no claims, no timers, no sends, no alerts. Enable/
- * disable is configuration + graceful restart/redeploy, never a live
- * runtime toggle. */
+ * shutdown no-ops, and an independent `stopped` latch covers destruction
+ * BEFORE the first bootstrap, when no worker exists yet, so no second claim
+ * loop can be orphaned and no restart can happen after stop. On Nest
+ * shutdown its `onModuleDestroy` awaits the worker's in-flight sends and
+ * stops the claim loop BEFORE the real PostgresPoolLifecycle (in
+ * DatabaseModule, strictly farther from the root) invokes `pool.end`, so no
+ * notification transaction can run against a closed pool. In disabled mode
+ * both hooks are inert: no worker, no store, no claims, no timers, no
+ * sends, no alerts. Enable/disable is configuration + graceful restart/
+ * redeploy, never a live runtime toggle. */
 @Injectable()
 class ReceiptMediaNotificationLifecycle
   implements OnApplicationBootstrap, OnModuleDestroy
 {
   private worker: ReceiptMediaNotificationWorker | undefined;
   private started = false;
+  private stopped = false;
 
   constructor(
     private readonly config: ConfigService,
@@ -177,10 +199,12 @@ class ReceiptMediaNotificationLifecycle
 
   /** Starts the drain exactly once per coordinator instance — repeated
    * and post-shutdown invocations are no-ops (the worker reference alone
-   * cannot protect a NEW instance, so a latched flag guards both).
-   * Disabled mode constructs nothing and performs no I/O. */
+   * cannot protect a NEW instance, so a latched flag guards both; the
+   * `stopped` latch also covers destruction BEFORE the first bootstrap,
+   * when no worker exists yet). Disabled mode constructs nothing and
+   * performs no I/O. */
   onApplicationBootstrap(): void {
-    if (this.started || !isEnabled(this.config)) return;
+    if (this.started || this.stopped || !isEnabled(this.config)) return;
     this.started = true;
     // Validated worker fields only: concurrency supplies batch size and
     // max concurrency; the validated poll interval (normalized up to
@@ -210,8 +234,11 @@ class ReceiptMediaNotificationLifecycle
   }
 
   /** Drains in-flight sends and stops claims exactly once; disabled mode
-   * has nothing to drain. */
+   * has nothing to drain. The `stopped` latch is set even when no worker
+   * was ever constructed, so a later bootstrap cannot restart the lifecycle
+   * after shutdown/pool close. */
   onModuleDestroy(): Promise<void> {
+    this.stopped = true;
     return this.worker?.onModuleDestroy() ?? Promise.resolve();
   }
 
@@ -224,6 +251,157 @@ class ReceiptMediaNotificationLifecycle
         return Promise.resolve();
       },
     };
+  }
+}
+
+/** ODD-3A module-local singleton lifecycle coordinator: when receipt media is
+ * broadly enabled AND the dedicated ingestion rollout gate is true it
+ * privately constructs exactly one
+ * WU7/WU10C dispatcher from the existing processor + attachment service and
+ * exactly one WU8B2 ingestion worker from the existing PostgresReceiptMediaStore
+ * plus validated options — neither the dispatcher nor the worker is ever
+ * registered as a DI token — and forwards start/drain exactly once. The start
+ * guard makes repeated bootstrap invocations AND a bootstrap after shutdown
+ * no-ops, so no second claim loop can be orphaned and no restart can happen
+ * after stop. On Nest shutdown `onModuleDestroy` awaits the worker's graceful
+ * drain (aborting active dispatch signals and waiting for in-flight work)
+ * BEFORE the real PostgresPoolLifecycle (in DatabaseModule, strictly farther
+ * from the root) invokes `pool.end`, so no ingestion transaction can run
+ * against a closed pool. Disabled mode is fully inert: no dispatcher, no
+ * worker, no claims, no timers, no external calls. Enable/disable is
+ * configuration + graceful restart/redeploy, never a live runtime toggle. */
+@Injectable()
+class ReceiptMediaIngestionLifecycle
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
+  private worker: ReceiptMediaIngestionWorker | undefined;
+  private started = false;
+  private stopped = false;
+
+  constructor(
+    private readonly config: ConfigService,
+    private readonly store: PostgresReceiptMediaStore,
+    private readonly processor: ReceiptIngestionProcessor,
+    private readonly attachment: ReceiptAttachmentService,
+  ) {}
+
+  /** Starts exactly once per coordinator instance — repeated and
+   * post-shutdown invocations are no-ops (the worker reference alone cannot
+   * protect a NEW instance, so a latched flag guards both; the `stopped`
+   * latch also covers destruction BEFORE the first bootstrap, when no worker
+   * exists yet). Disabled mode (broad flag off OR the dedicated ingestion
+   * rollout gate off) constructs nothing and performs no I/O. */
+  onApplicationBootstrap(): void {
+    if (this.started || this.stopped || !isIngestionEnabled(this.config))
+      return;
+    this.started = true;
+    // Validated worker fields only: concurrency supplies batch size and
+    // max concurrency; the validated poll interval (normalized up to the
+    // maintainer-approved 50 ms floor) supplies polling; the fixed
+    // 60-second lease lives in the adapter's SQL alone — no second lease
+    // knob exists here.
+    const concurrency =
+      this.config.get<number>('receiptMedia.worker.concurrency') ?? 0;
+    const pollIntervalMs = Math.max(
+      WORKER_MIN_POLL_MS,
+      this.config.get<number>('receiptMedia.worker.pollIntervalMs') ?? 0,
+    );
+    this.worker = new ReceiptMediaIngestionWorker(
+      this.store,
+      new ReceiptProcessingDispatcher(this.processor, this.attachment),
+      {
+        // Stable per process-instance coordinator: one owner for every
+        // claim this instance ever makes.
+        owner: `receipt-media:${randomUUID()}`,
+        pollIntervalMs,
+        batchSize: concurrency,
+        maxConcurrency: concurrency,
+      },
+    );
+    this.worker.onApplicationBootstrap();
+  }
+
+  /** Gracefully drains in-flight ingestion work and stops claims exactly
+   * once; disabled mode has nothing to drain. The `stopped` latch is set even
+   * when no worker was ever constructed, so a later bootstrap cannot restart
+   * the lifecycle after shutdown/pool close. */
+  onModuleDestroy(): Promise<void> {
+    this.stopped = true;
+    return this.worker?.onModuleDestroy() ?? Promise.resolve();
+  }
+}
+
+/** ODD-3B module-local singleton lifecycle coordinator: when receipt media is
+ * broadly enabled AND the dedicated ingestion rollout gate is true, it
+ * co-activates cleanup with ingestion through the exact same
+ * `isIngestionEnabled` predicate. It privately constructs exactly one
+ * `ReceiptCleanupService` (from the existing store + object-storage adapters)
+ * and exactly one `ReceiptCleanupWorker` — neither is ever registered or
+ * exported as a DI token — and forwards start/drain exactly once. The
+ * `started` guard makes repeated bootstrap invocations AND a bootstrap after
+ * shutdown no-ops, and an independent `stopped` latch covers destruction
+ * BEFORE the first bootstrap, when no worker exists yet. On Nest shutdown
+ * `onModuleDestroy` awaits the worker's graceful drain (aborting the active
+ * batch signal and awaiting the complete delete-plus-disposition batch)
+ * BEFORE the real PostgresPoolLifecycle (in DatabaseModule, strictly farther
+ * from the root) invokes `pool.end`, so no cleanup transaction can run
+ * against a closed pool. Cleanup is sequential and owns one active batch at a
+ * time: the configured worker concurrency is the cleanup batch size and no
+ * second pool, dispatcher, or lease knob exists. Disabled mode is fully
+ * inert: no service, no worker, no claims, no timers, no deletes. */
+@Injectable()
+class ReceiptCleanupLifecycle
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
+  private worker: ReceiptCleanupWorker | undefined;
+  private started = false;
+  private stopped = false;
+
+  constructor(
+    private readonly config: ConfigService,
+    private readonly store: PostgresReceiptMediaStore,
+    @Inject(OBJECT_STORAGE_PORT) private readonly storage: ObjectStoragePort,
+  ) {}
+
+  /** Starts exactly once per coordinator instance — repeated and
+   * post-shutdown invocations are no-ops (the `stopped` latch also covers
+   * destruction BEFORE the first bootstrap). Disabled mode (broad flag off OR
+   * the dedicated ingestion rollout gate off) constructs nothing and
+   * performs no I/O. */
+  onApplicationBootstrap(): void {
+    if (this.started || this.stopped || !isIngestionEnabled(this.config))
+      return;
+    this.started = true;
+    // Validated worker fields only: configured concurrency is the cleanup
+    // batch size and the validated poll interval (normalized up to the
+    // maintainer-approved 50 ms floor) supplies polling; the fixed 60-second
+    // cleanup lease lives in the adapter's SQL alone — no second lease knob.
+    const concurrency =
+      this.config.get<number>('receiptMedia.worker.concurrency') ?? 0;
+    const pollIntervalMs = Math.max(
+      WORKER_MIN_POLL_MS,
+      this.config.get<number>('receiptMedia.worker.pollIntervalMs') ?? 0,
+    );
+    this.worker = new ReceiptCleanupWorker(
+      new ReceiptCleanupService(this.store, this.storage),
+      {
+        // Stable per process-instance coordinator: one owner for every
+        // cleanup claim this instance ever makes.
+        owner: `receipt-media:${randomUUID()}`,
+        pollIntervalMs,
+        batchSize: concurrency,
+      },
+    );
+    this.worker.onApplicationBootstrap();
+  }
+
+  /** Gracefully drains the active cleanup batch and stops claims exactly
+   * once; disabled mode has nothing to drain. The `stopped` latch is set even
+   * when no worker was ever constructed, so a later bootstrap cannot restart
+   * the lifecycle after shutdown/pool close. */
+  onModuleDestroy(): Promise<void> {
+    this.stopped = true;
+    return this.worker?.onModuleDestroy() ?? Promise.resolve();
   }
 }
 
@@ -322,14 +500,25 @@ class ReceiptMediaNotificationLifecycle
         store: PostgresReceiptMediaStore,
         client: ChatbotApiClient,
         config: ConfigService,
+        capability: CapabilityService,
       ): ReceiptAttachmentService =>
-        new ReceiptAttachmentService(store, client, {
-          receiptMedia: {
-            publicBaseUrl:
-              config.get<string>('receiptMedia.publicBaseUrl') ?? '',
+        new ReceiptAttachmentService(
+          store,
+          client,
+          {
+            receiptMedia: {
+              publicBaseUrl:
+                config.get<string>('receiptMedia.publicBaseUrl') ?? '',
+            },
           },
-        }),
-      inject: [PostgresReceiptMediaStore, CHATBOT_API_CLIENT, ConfigService],
+          capability,
+        ),
+      inject: [
+        PostgresReceiptMediaStore,
+        CHATBOT_API_CLIENT,
+        ConfigService,
+        CapabilityService,
+      ],
     },
     {
       provide: ReceiptIngestionProcessor,
@@ -364,6 +553,15 @@ class ReceiptMediaNotificationLifecycle
     // notification drain; never exported — worker/store stay unexposed
     // as DI tokens. In disabled mode its hooks are fully inert.
     ReceiptMediaNotificationLifecycle,
+    // ODD-3A module-local lifecycle coordinator: privately owns the
+    // ingestion dispatcher/worker; never exported — the worker stays
+    // unexposed as a DI token. In disabled mode its hooks are fully inert.
+    ReceiptMediaIngestionLifecycle,
+    // ODD-3B module-local lifecycle coordinator: privately owns the cleanup
+    // service/worker and co-activates with ingestion through the exact same
+    // rollout predicate; never exported — neither the service nor the worker
+    // is a DI token. In disabled mode its hooks are fully inert.
+    ReceiptCleanupLifecycle,
     // WU15-2 telemetry: singleton adapter + guard. The telemetry adapter
     // carries its own isolated Registry; two instances with the same Registry
     // resolve to the same object (singleton DI). The adapter's record()

@@ -4,12 +4,16 @@ import {
   readPendingHumanRequest,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import type { AgentMessage } from '../../conversation/domain/conversation-store';
+import type {
+  AgentMessage,
+  ConversationStateData,
+} from '../../conversation/domain/conversation-store';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import {
   ReceiptIngressService,
   type ReceiptIngressDecision,
 } from '../../receipt-media/application/receipt-ingress.service';
+import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
@@ -27,6 +31,15 @@ import {
   WebhookEventDto,
   WebhookMessageDto,
 } from '../presentation/dto/webhook-event.dto';
+import { prepareShippingCustomerDisclosure } from '../../shipping/application/shipping-customer-disclosure';
+import { persistSentShippingCustomerOffer } from '../../shipping/application/shipping-customer-offer-persistence';
+import {
+  normalizeShippingCustomerOffer,
+  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
+  SHIPPING_CUSTOMER_OFFER_KEY,
+  type ShippingCustomerOffer,
+} from '../../shipping/application/shipping-customer-acceptance';
+import { evaluateShippingSaleRevalidation } from '../../sale-flow/application/shipping-sale-revalidation';
 
 /**
  * WebhookDispatcherService (agent + human-handoff router)
@@ -37,7 +50,8 @@ import {
  *   2. WEBHOOK_DEDUP   — skip re-deliveries of already-processed msgs.
  *   3. **Ops pre-routing hook** (new, human-handoff slice) —
  *      when `message.senderId` matches the configured OPS_CHANNEL_PHONE
- *      (sandbox trunk-1 normalized on both sides per ADR-22), the inbound
+ *      (exact by default; both sides apply the same trunk-1 rewrite only
+ *      when `META_SANDBOX_RECIPIENT_NORMALIZATION=true`, per ADR-22), the inbound
  *      is an ops reply to a previous escalation, NOT a customer message:
  *        - `humanHandoff.resolveReply({ text, from })` parses the agent's
  *          decision (or `HF-<id>` token, or newest-pending fallback) and
@@ -124,20 +138,28 @@ export class WebhookDispatcherService {
           });
 
           if (result.kind === 'resolved') {
-            // Synthetic-turn injection through the runner. The marker
-            // was cleared by `resolveReply` so the runner's gate
-            // (ADR-29) does NOT suppress this turn; the customer resumes
-            // normally and the runner's reply is sent to the customer
-            // (NOT the ops phone).
-            const { reply } = await this.agentRunner.handle({
-              senderId: result.customerId,
-              text: result.syntheticUserText,
-            });
-            const { providerMessageId } = await this.whatsappSender.sendText({
-              to: result.customerId,
-              text: reply,
-            });
-            this.recentOutbound.remember(providerMessageId);
+            // SCA-3b2: a structured SHIPPING_APPROVED resolution is NEVER a
+            // synthetic LLM turn. The dispatcher discloses the server-derived
+            // price deterministically and only a successful send can persist
+            // the pending customer-response marker.
+            if (result.resolution.decision === 'SHIPPING_APPROVED') {
+              await this.discloseApprovedShippingPrice(result.customerId);
+            } else {
+              // Synthetic-turn injection through the runner. The marker
+              // was cleared by `resolveReply` so the runner's gate
+              // (ADR-29) does NOT suppress this turn; the customer resumes
+              // normally and the runner's reply is sent to the customer
+              // (NOT the ops phone).
+              const { reply } = await this.agentRunner.handle({
+                senderId: result.customerId,
+                text: result.syntheticUserText,
+              });
+              const { providerMessageId } = await this.whatsappSender.sendText({
+                to: result.customerId,
+                text: reply,
+              });
+              this.recentOutbound.remember(providerMessageId);
+            }
           } else {
             // `no_pending` → reply to the ops phone asking for a ref.
             const { providerMessageId } = await this.whatsappSender.sendText({
@@ -191,6 +213,29 @@ export class WebhookDispatcherService {
             text: message.text,
             sourceWebhookMessageId: message.messageId,
           });
+          // ODD-4D: a valid active receipt pointer with no routing plan is
+          // deterministic — send the active-flow guidance and never call the
+          // LLM. Send failure propagates before remember/markSeen.
+          if (outcome.kind === 'unrecognized') {
+            this.logger.log(
+              `amount router terminal [unrecognized] for ${message.messageId}`,
+            );
+            const { providerMessageId } = await this.whatsappSender.sendText({
+              to: message.senderId,
+              text: ACTIVE_RECEIPT_GUIDANCE,
+            });
+            this.recentOutbound.remember(providerMessageId);
+            try {
+              await this.dedup.markSeen(message.messageId);
+            } catch (error) {
+              this.logger.warn(
+                `markSeen failed for ${message.messageId}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+            continue;
+          }
           if (outcome.kind !== 'fenced') {
             this.logger.log(
               `amount router terminal [${outcome.kind}] for ${message.messageId}`,
@@ -211,13 +256,18 @@ export class WebhookDispatcherService {
 
         // ─── WU13-B2: ReceiptIngressService — customer media only ─────────────
         if (message.media != null) {
-          const { kind } = await this.ingress.admit({
+          // ODD-4A: the normalized optional caption is the only extra field
+          // forwarded. filename/sha256 and every other payload field are
+          // dropped, and the raw caption never reaches the amount router, the
+          // LLM, or any durable type.
+          const decision = await this.ingress.admit({
             webhookMessageId: message.messageId,
             providerMediaId: message.media.providerMediaId,
             senderId: message.senderId,
             declaredMimeType: message.media.declaredMimeType,
+            caption: message.media.caption,
           });
-          const guidance = ingressGuidance(kind);
+          const guidance = ingressGuidance(decision);
 
           if (guidance !== undefined) {
             const { providerMessageId } = await this.whatsappSender.sendText({
@@ -226,7 +276,7 @@ export class WebhookDispatcherService {
             });
             this.recentOutbound.remember(providerMessageId);
           }
-          if (!receiptAdmissionAtomicallyMarksSeen(kind)) {
+          if (!receiptAdmissionAtomicallyMarksSeen(decision.kind)) {
             try {
               await this.dedup.markSeen(message.messageId);
             } catch (error) {
@@ -290,6 +340,101 @@ export class WebhookDispatcherService {
       }
     }
   }
+
+  /**
+   * SCA-3b2: deterministic post-`SHIPPING_APPROVED` price disclosure.
+   *
+   * Reads the current customer state and prepares the server-derived price;
+   * only then does it send the fixed Spanish disclosure to the CUSTOMER and
+   * remember the outbound id. It re-reads fresh state and persists the sent
+   * offer built from the prepared fields plus the real provider message id
+   * (SCA-3b1). A valid active offer on the same approved request/pin/amounts
+   * is treated as a replay: no re-send. Any null/throw fails closed (no
+   * dedup mark), so delivery uncertainty can never enable acceptance.
+   */
+  private async discloseApprovedShippingPrice(
+    customerId: string,
+  ): Promise<void> {
+    const nowMs = Date.now();
+    const state = await this.conversationStore.get(customerId);
+    const prepared = prepareShippingCustomerDisclosure(
+      state?.data ?? null,
+      nowMs,
+    );
+    if (prepared === null) {
+      throw new Error('shipping disclosure unavailable');
+    }
+    const existing = normalizeShippingCustomerOffer(
+      state?.data?.[SHIPPING_CUSTOMER_OFFER_KEY],
+    );
+    if (
+      existing !== null &&
+      isActiveMatchingShippingOffer(existing, prepared.offer, nowMs) &&
+      isAcceptanceAbsentOrCharged(state?.data ?? null, nowMs)
+    ) {
+      this.logger.log(
+        `shipping disclosure replay for ${customerId}: re-send skipped`,
+      );
+      return;
+    }
+    const { providerMessageId } = await this.whatsappSender.sendText({
+      to: customerId,
+      text: prepared.text,
+    });
+    // Remember the confirmed send immediately: even if persistence fails,
+    // the outbound id must be filtered as an echo.
+    this.recentOutbound.remember(providerMessageId);
+    // SCA-3b3: the clock can advance while `sendText` is in flight. Sample it
+    // AFTER the confirmed send and BEFORE persistence so an offer that expires
+    // mid-send fails closed with no marker write and no `markSeen`.
+    const persistNowMs = Date.now();
+    const freshState = await this.conversationStore.get(customerId);
+    const offer = { ...prepared.offer, providerMessageId };
+    const persisted = await persistSentShippingCustomerOffer(
+      this.conversationStore,
+      customerId,
+      freshState,
+      offer,
+      persistNowMs,
+    );
+    if (persisted === null) {
+      throw new Error('shipping disclosure persistence failed');
+    }
+  }
+}
+
+// SCA-3b2: replay predicate — a persisted offer is only trusted when it pins
+// the same approved request, draft and disclosed amounts and is still active.
+function isActiveMatchingShippingOffer(
+  existing: ShippingCustomerOffer,
+  prepared: Omit<ShippingCustomerOffer, 'providerMessageId'>,
+  nowMs: number,
+): boolean {
+  return (
+    existing.requestId === prepared.requestId &&
+    existing.draftCreatedAt === prepared.draftCreatedAt &&
+    existing.expiresAt === prepared.expiresAt &&
+    existing.merchandiseCents === prepared.merchandiseCents &&
+    existing.chargeCents === prepared.chargeCents &&
+    existing.expectedTotalCents === prepared.expectedTotalCents &&
+    Date.parse(existing.offeredAt) <= nowMs &&
+    nowMs < Date.parse(existing.expiresAt)
+  );
+}
+
+// SCA-3b3: an active matching offer is only a replay candidate when no
+// acceptance is stored yet OR the stored acceptance is fully valid for this
+// exact offer at the current clock and cart (the SCA-2 revalidation's
+// `charged` verdict). Malformed, orphan or future acceptances fail closed to
+// re-disclosure, and the persistence then clears the prior acceptance.
+function isAcceptanceAbsentOrCharged(
+  data: ConversationStateData | null,
+  nowMs: number,
+): boolean {
+  if (data === null) return true;
+  const rawAcceptance = data[SHIPPING_CUSTOMER_ACCEPTANCE_KEY];
+  if (rawAcceptance === null || rawAcceptance === undefined) return true;
+  return evaluateShippingSaleRevalidation(data, nowMs).kind === 'charged';
 }
 
 // ── WU13-A2: normalizeInboundMessages media helper ───────────────────────
@@ -415,11 +560,20 @@ function normalizeTimestamp(timestamp: string): string {
 
 // WU13-B2: maps each closed ReceiptIngressDecision kind to customer-facing
 // guidance text. Silent variants return undefined — no reply is sent and
-// media never reaches the amount router or AgentRunner.
-function ingressGuidance(
-  kind: ReceiptIngressDecision['kind'],
-): string | undefined {
-  switch (kind) {
+// media never reaches the amount router or AgentRunner. ODD-4C: a durable
+// sender-active decision carries its exact status, so the guidance reflects
+// whether the open flow still needs the customer's amount/confirmation or is
+// still being processed internally.
+
+/** ODD-4C/4D fixed Spanish guidance for a durable active amount or confirmation
+ * flow that still needs a customer decision. Shared by sender-active image
+ * guidance and the ODD-4D deterministic active-text fallback; defined locally
+ * so the dispatcher never imports notification internals. */
+const ACTIVE_RECEIPT_GUIDANCE =
+  'Tienes un proceso abierto: finalízalo o cancélalo.';
+
+function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
+  switch (decision.kind) {
     case 'disabled':
       return 'El servicio no está disponible. Intenta más tarde.';
     case 'unsupported-media':
@@ -427,12 +581,28 @@ function ingressGuidance(
     case 'no-placed-sale':
       return 'Primero registra la venta en el sistema.';
     case 'sender-active':
-      return 'Tienes un proceso abierto: finalízalo o cancélalo.';
+      return senderActiveGuidance(decision.status);
     case 'reserved':
     case 'webhook-replayed':
     case 'provider-media-reused':
     case 'webhook-media-conflict':
       return undefined;
+  }
+}
+
+/** ODD-4C fixed Spanish guidance for a durable active receipt. An amount or
+ * confirmation flow needs a customer decision; every other active status is
+ * still processing internally. */
+function senderActiveGuidance(status: ActiveReceiptStatus): string {
+  switch (status) {
+    case 'AWAITING_AMOUNT':
+    case 'AWAITING_CONFIRMATION':
+      return ACTIVE_RECEIPT_GUIDANCE;
+    case 'RESERVED':
+    case 'DOWNLOADED':
+    case 'STORED':
+    case 'ATTACHING':
+      return 'Estamos procesando tu comprobante.';
   }
 }
 

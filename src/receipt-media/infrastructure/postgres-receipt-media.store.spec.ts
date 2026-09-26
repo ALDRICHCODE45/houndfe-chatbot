@@ -764,6 +764,68 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       });
     });
 
+    // --- ODD-4A: declared caption amount persisted atomically at admit ---
+    const durableCents = async (id = UUID_A): Promise<number | null> => {
+      const { rows } = await pool.query<{
+        declared_amount_cents: number | null;
+      }>('SELECT declared_amount_cents FROM receipt_media WHERE id = $1', [id]);
+      return rows[0]?.declared_amount_cents ?? null;
+    };
+
+    it('persists the declared caption amount with the reservation and marker', async () => {
+      const admission = reserveInput({ declaredAmountCents: 1250 });
+      const first = await store.admit(admission);
+      if (first.kind !== 'created') throw new Error('expected created');
+      expect(first.receipt.declaredAmountCents).toBe(1250);
+      expect(await durableCents()).toBe(1250);
+      expect(await admissionCounts(admission.webhookMessageId)).toEqual({
+        receipts: 1,
+        markers: 1,
+      });
+    });
+
+    it('persists null when the reservation carries no declared amount', async () => {
+      const first = await store.admit(reserveInput());
+      if (first.kind !== 'created') throw new Error('expected created');
+      expect(first.receipt.declaredAmountCents).toBeNull();
+      expect(await durableCents()).toBeNull();
+    });
+
+    it('retains the first durable amount across webhook replay and provider reuse', async () => {
+      const first = await store.admit(
+        reserveInput({ declaredAmountCents: 1250 }),
+      );
+      if (first.kind !== 'created') throw new Error('expected created');
+      await expect(
+        store.admit(reserveInput({ declaredAmountCents: 999999 })),
+      ).resolves.toMatchObject({ kind: 'webhook-replayed' });
+      await expect(
+        store.admit(
+          reserveInput({
+            id: UUID_B,
+            webhookMessageId: 'wamid.reuse',
+            declaredAmountCents: 7777,
+          }),
+        ),
+      ).resolves.toMatchObject({ kind: 'provider-media-reused' });
+      expect(await durableCents()).toBe(1250);
+    });
+
+    it('concurrent same-message arbitration keeps the winner amount without overwrite', async () => {
+      const [left, right] = await Promise.all([
+        store.admit(reserveInput({ declaredAmountCents: 1250 })),
+        store.admit(reserveInput({ declaredAmountCents: 4200 })),
+      ]);
+      const winner = [left, right].find(
+        (o): o is Extract<ReservationOutcome, { kind: 'created' }> =>
+          o.kind === 'created',
+      );
+      if (!winner) throw new Error('expected one created');
+      const persisted = await durableCents();
+      expect([1250, 4200]).toContain(persisted);
+      expect(persisted).toBe(winner.receipt.declaredAmountCents);
+    });
+
     it('rolls back both artifacts when receipt persistence fails', async () => {
       await pool.query(`CREATE FUNCTION receipt_admission_receipt_failure()
         RETURNS trigger LANGUAGE plpgsql AS $$
@@ -1004,8 +1066,12 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       ['RESERVED', { meta_attempts: 3 }, true],
       ['DOWNLOADED', {}, true],
       ['DOWNLOADED', { meta_attempts: 3 }, true],
-      ['DOWNLOADED', { meta_attempts: 3, storage_attempts: 3 }, false],
-      ['DOWNLOADED', { storage_attempts: 3 }, false],
+      // ODD-2D1: storage-exhausted DOWNLOADED rows are reclaimable only so the
+      // processor can terminalize them; startStorageAttempt still refuses a
+      // fourth call.
+      ['DOWNLOADED', { meta_attempts: 3, storage_attempts: 3 }, true],
+      ['DOWNLOADED', { storage_attempts: 3 }, true],
+      ['DOWNLOADED', { storage_attempts: 3, next_attempt_at: FUTURE }, false],
       // STORED-1: STORED rows are held from automatic claim eligibility;
       // they remain durable and are reserved for separately authorized reconciliation.
       ['STORED', { meta_attempts: 3, storage_attempts: 3 }, false],
@@ -2304,6 +2370,223 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         bootstrap(store as unknown as BootstrapStore, command()),
       ).resolves.toMatchObject({ kind: 'replayed' });
     });
+
+    // --- ODD-4B caption-aware amount bootstrap ---
+
+    describe('ODD-4B caption-aware amount bootstrap', () => {
+      it('retains the null-amount prompt successor with no proposed timestamp', async () => {
+        await seed();
+        const outcome = await bootstrap(
+          store as unknown as BootstrapStore,
+          command(),
+        );
+        expect(outcome).toMatchObject({
+          kind: 'bootstrapped',
+          receipt: {
+            status: 'AWAITING_AMOUNT',
+            declaredAmountCents: null,
+            amountProposedAt: null,
+            version: '3',
+          },
+          intent: {
+            templateKey: 'RECEIPT_AMOUNT_PROMPT',
+            templateArgs: {},
+          },
+        });
+        const durable = await snapshot();
+        expect(durable.receipt).toMatchObject({
+          status: 'AWAITING_AMOUNT',
+          declared_amount_cents: null,
+          amount_proposed_at: null,
+        });
+        expect(durable.outbox).toHaveLength(1);
+      });
+
+      it('retains the durable caption amount and derives the confirmation successor', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const outcome = await bootstrap(
+          store as unknown as BootstrapStore,
+          command(),
+        );
+        expect(outcome.kind).toBe('bootstrapped');
+        if (outcome.kind === 'fenced') throw new Error('expected bootstrap');
+        expect(outcome.receipt).toMatchObject({
+          id: UUID_A,
+          status: 'AWAITING_CONFIRMATION',
+          declaredAmountCents: 1250,
+          version: '3',
+          attachStartedAt: null,
+          attachAttemptId: null,
+        });
+        expect(outcome.receipt.amountProposedAt).toBeInstanceOf(Date);
+        expect(outcome.intent).toMatchObject({
+          dedupeKey: `receipt-amount-confirm:${UUID_A}:2:wamid.amount-bootstrap`,
+          receiptMediaId: UUID_A,
+          receiptStateVersion: '3',
+          sourceWebhookMessageId: 'wamid.amount-bootstrap',
+          recipientId: SENDER,
+          templateKey: 'RECEIPT_AMOUNT_CONFIRM',
+          templateArgs: { amountCents: 1250 },
+        });
+        const durable = await snapshot();
+        expect(durable.receipt).toMatchObject({
+          status: 'AWAITING_CONFIRMATION',
+          declared_amount_cents: 1250,
+          version: '3',
+        });
+        expect(durable.receipt.amount_proposed_at).toBeInstanceOf(Date);
+        expect(durable.conversation).toEqual({
+          sibling: { keep: true },
+          receiptAmountPointer: {
+            receiptMediaId: UUID_A,
+            saleId: UUID_B,
+            receiptVersion: '3',
+          },
+        });
+        expect(durable.outbox).toHaveLength(1);
+        expect(durable.outbox[0].template_args).toEqual({ amountCents: 1250 });
+      });
+
+      it('replays the exact confirmation successor once without a second intent or version bump', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const input = command();
+        const first = await bootstrap(
+          store as unknown as BootstrapStore,
+          input,
+        );
+        expect(first.kind).toBe('bootstrapped');
+        const recreated = new PostgresReceiptMediaStore(
+          pool,
+        ) as unknown as BootstrapStore;
+        const replay = await bootstrap(recreated, input);
+        expect(replay.kind).toBe('replayed');
+        if (first.kind === 'fenced' || replay.kind === 'fenced')
+          throw new Error('expected bootstrap then replay');
+        expect(replay.intent).toEqual(first.intent);
+        expect(replay.receipt).toMatchObject({
+          status: 'AWAITING_CONFIRMATION',
+          declaredAmountCents: 1250,
+          version: '3',
+        });
+        const durable = await snapshot();
+        expect(durable.receipt.version).toBe('3');
+        expect(durable.outbox).toHaveLength(1);
+      });
+
+      type ConfirmationIntentCorruption =
+        | 'extra-argument'
+        | 'rival-amount'
+        | 'foreign-template'
+        | 'foreign-recipient'
+        | 'foreign-source'
+        | 'foreign-version'
+        | 'foreign-receipt-linkage';
+      const corruptConfirmationIntent = async (
+        corruption: ConfirmationIntentCorruption,
+      ): Promise<void> => {
+        switch (corruption) {
+          case 'extra-argument':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET template_args = '{"amountCents":1250,"extra":1}'::jsonb`,
+            );
+            return;
+          case 'rival-amount':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET template_args = '{"amountCents":999}'::jsonb`,
+            );
+            return;
+          case 'foreign-template':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET template_key = 'RECEIPT_AMOUNT_PROMPT'`,
+            );
+            return;
+          case 'foreign-recipient':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'`,
+            );
+            return;
+          case 'foreign-source':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET source_webhook_message_id = 'wamid.rival'`,
+            );
+            return;
+          case 'foreign-version':
+            await pool.query(
+              `UPDATE receipt_media_outbox SET receipt_state_version = 2`,
+            );
+            return;
+          case 'foreign-receipt-linkage':
+            await pool.query(
+              'UPDATE receipt_media_outbox SET receipt_media_id = NULL',
+            );
+            return;
+        }
+      };
+
+      it.each<[string, ConfirmationIntentCorruption]>([
+        ['extra argument', 'extra-argument'],
+        ['rival amount', 'rival-amount'],
+        ['foreign template', 'foreign-template'],
+        ['foreign recipient', 'foreign-recipient'],
+        ['foreign source', 'foreign-source'],
+        ['foreign version', 'foreign-version'],
+        ['foreign receipt linkage', 'foreign-receipt-linkage'],
+      ])(
+        'fences a %s confirmation intent on replay with zero mutation',
+        async (_label, corruption) => {
+          await seed(undefined, { declared_amount_cents: 1250 });
+          const input = command();
+          await bootstrap(store as unknown as BootstrapStore, input);
+          await corruptConfirmationIntent(corruption);
+          await expectFenced(input);
+        },
+      );
+
+      it('rolls back the receipt, pointer, and confirmation intent when the outbox insert fails', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const before = await snapshot();
+        await pool.query(`CREATE FUNCTION odd4b_confirm_outbox_failure()
+          RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN RAISE EXCEPTION 'odd4b confirm outbox failure'; END;
+          $$`);
+        await pool.query(`CREATE TRIGGER odd4b_confirm_outbox_failure
+          BEFORE INSERT ON receipt_media_outbox FOR EACH ROW
+          EXECUTE FUNCTION odd4b_confirm_outbox_failure()`);
+        try {
+          await expect(
+            bootstrap(store as unknown as BootstrapStore, command()),
+          ).rejects.toThrow('odd4b confirm outbox failure');
+          expect(await snapshot()).toEqual(before);
+        } finally {
+          await pool.query(
+            'DROP TRIGGER IF EXISTS odd4b_confirm_outbox_failure ON receipt_media_outbox',
+          );
+          await pool.query(
+            'DROP FUNCTION IF EXISTS odd4b_confirm_outbox_failure()',
+          );
+        }
+      });
+
+      it('converges duplicate concurrent bootstraps on one confirmation intent', async () => {
+        await seed(undefined, { declared_amount_cents: 1250 });
+        const outcomes = await Promise.all([
+          bootstrap(store as unknown as BootstrapStore, command()),
+          bootstrap(store as unknown as BootstrapStore, command()),
+        ]);
+        expect(outcomes.map((outcome) => outcome.kind).sort()).toEqual([
+          'bootstrapped',
+          'replayed',
+        ]);
+        const durable = await snapshot();
+        expect(durable.receipt).toMatchObject({
+          status: 'AWAITING_CONFIRMATION',
+          declared_amount_cents: 1250,
+          version: '3',
+        });
+        expect(durable.outbox).toHaveLength(1);
+        expect(durable.outbox[0].template_args).toEqual({ amountCents: 1250 });
+      });
+    });
   });
 
   // --- WU10C1 atomic receipt amount proposal (PostgreSQL only) ---
@@ -2395,7 +2678,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         sourceWebhookMessageId: 'wamid.amount.1',
         recipientId: SENDER,
         templateKey: 'RECEIPT_AMOUNT_CONFIRM',
-        templateArgs: { cents: 1250 },
+        templateArgs: { amountCents: 1250 },
       });
       expect((await rawReceipt()).amount_proposed_at).toBeInstanceOf(Date);
       expect(await rawConversation()).toEqual({
@@ -2661,6 +2944,35 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       await expect(
         recreated.proposeAmount(command({ cents: 999 })),
       ).resolves.toEqual({
+        kind: 'fenced',
+      });
+      expect(
+        (await pool.query('SELECT * FROM receipt_media_outbox')).rowCount,
+      ).toBe(1);
+    });
+
+    it('persists and exactly replays the canonical amountCents confirmation args', async () => {
+      await seed();
+      const first = command();
+      const outcome = await proposalStore.proposeAmount(first);
+      expect(outcome.kind).toBe('proposed');
+      if (outcome.kind === 'fenced') throw new Error('expected proposal');
+      expect(outcome.intent.templateArgs).toEqual({ amountCents: 1250 });
+      const recreated = new PostgresReceiptMediaStore(pool);
+      const replay = await recreated.proposeAmount(first);
+      expect(replay.kind).toBe('replayed');
+      if (replay.kind === 'fenced') throw new Error('expected replay');
+      expect(replay.intent.templateArgs).toEqual({ amountCents: 1250 });
+      await pool.query(
+        `UPDATE receipt_media_outbox SET template_args = '{"cents":1250}'::jsonb`,
+      );
+      await expect(recreated.proposeAmount(first)).resolves.toEqual({
+        kind: 'fenced',
+      });
+      await pool.query(
+        `UPDATE receipt_media_outbox SET template_args = '{"amountCents":999}'::jsonb`,
+      );
+      await expect(recreated.proposeAmount(first)).resolves.toEqual({
         kind: 'fenced',
       });
       expect(
@@ -3998,7 +4310,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
                     }
                     expect(outbox.id).toBe(competing.intent.id);
                     expect(outbox.template_args).toEqual(
-                  kind === 'amount proposal' ? { cents: 1250 } : {},
+                  kind === 'amount proposal' ? { amountCents: 1250 } : {},
                 );
                 expect(durable.command).toEqual([]);
               }
@@ -6553,7 +6865,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           Object.values(receipt),
         );
       const claimed = await store.claimBatch(5, OWNER);
-      expect(claimed.map((r) => r.id).sort()).toEqual([UUID_A, UUID_B]);
+      expect(claimed.map((r) => r.id).sort()).toEqual([UUID_A, UUID_B, UUID_C]);
       for (const receipt of claimed) {
         expect(receipt.metaAttempts).toBe(3);
         expect(
@@ -6564,6 +6876,1321 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           }),
         ).toBeNull();
       }
+      expect(
+        await store.startStorageAttempt({
+          id: UUID_C,
+          owner: OWNER,
+          expectedVersion: '1',
+        }),
+      ).toBeNull();
+    });
+  });
+
+  describe('ODD-2D1 durable storage retry and finalization', () => {
+    const OWNER = 'worker.storage-failure';
+    const SENDER = 'sender.storage-failure';
+    /** The new primitive is called through a structural seam so this spec
+     * stays runnable before the port surface exists; the durable behavior is
+     * proven against the real PostgreSQL store either way. */
+    const storageStore = () =>
+      store as unknown as {
+        commitStorageFailureDisposition(input: Row): Promise<Row>;
+      };
+    const command = (over: Row = {}): Row => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '2',
+      category: 'OBJECT_STORAGE',
+      code: 'NETWORK_FAILURE',
+      ...over,
+    });
+    const commit = (over: Row = {}) =>
+      storageStore().commitStorageFailureDisposition(command(over));
+    const seedRow = async (receipt: Row) => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      await pool.query(
+        insertSql('receipt_media', receipt),
+        Object.values(receipt),
+      );
+      return receipt;
+    };
+    const seed = (over: Row = {}) =>
+      seedRow(
+        lifeRow('DOWNLOADED', null, {
+          id: UUID_A,
+          sender_id: SENDER,
+          captured_sale_id: UUID_B,
+          object_key: `receipts/${UUID_C}`,
+          version: '2',
+          lease_owner: OWNER,
+          lease_expires_at: new Date(Date.now() + 60_000),
+          ...over,
+        }),
+      );
+    /** A legacy terminal successor written before storage intent ownership:
+     * the exact durable terminal evidence with no `RECEIPT_UNAVAILABLE_LATER`
+     * intent, retaining every required download column. */
+    const legacyTerminal = (over: Row = {}): Row =>
+      lifeRow('FAILED', 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE', {
+        id: UUID_A,
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '3',
+        storage_attempts: 3,
+        last_error_category: 'OBJECT_STORAGE',
+        last_error_code: 'STORAGE_EXHAUSTED',
+        cleanup_pending: true,
+        terminal_at: T0,
+        lease_owner: OWNER,
+        lease_expires_at: new Date(Date.now() + 60_000),
+        ...over,
+      });
+    const row = async () =>
+      (
+        await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [
+          UUID_A,
+        ])
+      ).rows[0];
+    const outboxRows = async () =>
+      (await pool.query<Row>('SELECT * FROM receipt_media_outbox')).rows;
+    const intentKey = (version: string) =>
+      `receipt-unavailable-later:${UUID_A}:${version}:wamid.core`;
+    const remainingMs = async () =>
+      Number(
+        (
+          await pool.query<Row>(
+            `SELECT (extract(epoch from next_attempt_at - clock_timestamp()) * 1000)::int AS ms
+               FROM receipt_media WHERE id = $1`,
+            [UUID_A],
+          )
+        ).rows[0].ms,
+      );
+    const expectFenced = async (input: Row) => {
+      const before = await row();
+      await expect(
+        storageStore().commitStorageFailureDisposition(input),
+      ).resolves.toEqual({ kind: 'fenced' });
+      expect(await row()).toEqual(before);
+    };
+
+    it('schedules attempts 1/2 with retained DOWNLOADED status, download evidence, cleared lease, bounded positive jitter, and no intent', async () => {
+      const cases: Array<[number, number]> = [
+        [1, 1000],
+        [2, 4000],
+      ];
+      for (const [attempt, base] of cases) {
+        await seed({ storage_attempts: attempt });
+        const outcome = await commit();
+        expect(outcome).toMatchObject({
+          kind: 'retry-scheduled',
+          attempt,
+          version: '3',
+          receipt: {
+            status: 'DOWNLOADED',
+            storageAttempts: attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastErrorCategory: 'OBJECT_STORAGE',
+            lastErrorCode: 'NETWORK_FAILURE',
+          },
+        });
+        const stored = await row();
+        expect(stored).toMatchObject({
+          status: 'DOWNLOADED',
+          version: '3',
+          storage_attempts: attempt,
+          lease_owner: null,
+          lease_expires_at: null,
+          last_error_category: 'OBJECT_STORAGE',
+          last_error_code: 'NETWORK_FAILURE',
+          cleanup_pending: false,
+        });
+        expect(stored.downloaded_at).toBeInstanceOf(Date);
+        expect(stored.response_mime_type).toBe('image/jpeg');
+        expect(stored.detected_mime_type).toBe('image/jpeg');
+        expect(stored.byte_count).toBe(1024);
+        expect(Buffer.isBuffer(stored.content_sha256)).toBe(true);
+        expect(await remainingMs()).toBeGreaterThan(base - 500);
+        expect(await remainingMs()).toBeLessThanOrEqual(base * 1.25 + 100);
+        expect(await outboxRows()).toHaveLength(0);
+      }
+    });
+
+    it('retries every retryable storage code below the limit and terminalizes attempt 3 with retained download evidence and one exact intent', async () => {
+      for (const code of ['ABORTED', 'HTTP_RETRYABLE', 'NETWORK_FAILURE']) {
+        await seed({ storage_attempts: 1 });
+        expect((await commit({ code })).kind).toBe('retry-scheduled');
+        expect(await outboxRows()).toHaveLength(0);
+        await seed({ storage_attempts: 3 });
+        const outcome = await commit({ code });
+        expect(outcome).toMatchObject({
+          kind: 'terminal',
+          failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          version: '3',
+          intent: {
+            dedupeKey: intentKey('3'),
+            receiptMediaId: UUID_A,
+            receiptStateVersion: '3',
+            sourceWebhookMessageId: 'wamid.core',
+            recipientId: SENDER,
+            templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+            templateArgs: {},
+          },
+        });
+        const stored = await row();
+        expect(stored).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          last_error_category: 'OBJECT_STORAGE',
+          last_error_code: code,
+          storage_attempts: 3,
+          cleanup_pending: false,
+          stored_at: null,
+          object_etag: null,
+          object_version_id: null,
+          capability_token_hash: null,
+          capability_key_version: null,
+          capability_key_version_text: null,
+          capability_issued_at: null,
+          capability_revoked_at: null,
+        });
+        expect(stored.downloaded_at).toBeInstanceOf(Date);
+        expect(stored.response_mime_type).toBe('image/jpeg');
+        expect(stored.detected_mime_type).toBe('image/jpeg');
+        expect(stored.byte_count).toBe(1024);
+        expect(Buffer.isBuffer(stored.content_sha256)).toBe(true);
+        expect(stored.terminal_at).toBeInstanceOf(Date);
+        expect(await outboxRows()).toHaveLength(1);
+      }
+    });
+
+    it('terminalizes every permanent storage code at any started attempt', async () => {
+      const permanent = [
+        'OBJECT_KEY_INVALID',
+        'REQUEST_INVALID',
+        'RESPONSE_INVALID',
+        'HTTP_PERMANENT',
+        'PERMANENT_FAILURE',
+        'OBJECT_NOT_FOUND',
+      ];
+      for (const code of permanent) {
+        for (const attempt of [1, 3]) {
+          await seed({ storage_attempts: attempt });
+          const outcome = await commit({ code });
+          expect(outcome).toMatchObject({
+            kind: 'terminal',
+            failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+            version: '3',
+            intent: {
+              dedupeKey: intentKey('3'),
+              templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+              templateArgs: {},
+            },
+          });
+          expect(await row()).toMatchObject({
+            status: 'FAILED',
+            failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+            last_error_code: code,
+            cleanup_pending: false,
+          });
+          expect((await row()).downloaded_at).toBeInstanceOf(Date);
+          expect(await outboxRows()).toHaveLength(1);
+        }
+      }
+    });
+
+    it('terminalizes CLEANUP_PENDING immediately at any attempt with the durable cleanup backlog', async () => {
+      for (const attempt of [1, 2, 3]) {
+        await seed({ storage_attempts: attempt });
+        const outcome = await commit({ code: 'CLEANUP_PENDING' });
+        expect(outcome).toMatchObject({
+          kind: 'terminal',
+          failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          version: '3',
+          intent: {
+            dedupeKey: intentKey('3'),
+            templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+            templateArgs: {},
+          },
+        });
+        const stored = await row();
+        expect(stored).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          last_error_category: 'OBJECT_STORAGE',
+          last_error_code: 'CLEANUP_PENDING',
+          cleanup_pending: true,
+          storage_attempts: attempt,
+        });
+        expect(stored.downloaded_at).toBeInstanceOf(Date);
+        expect(await outboxRows()).toHaveLength(1);
+      }
+    });
+
+    it('terminalizes the internal exhaustion code for a reclaimed storage_attempts=3 row and fences it below the limit', async () => {
+      await seed({ storage_attempts: 3, meta_attempts: 3 });
+      const outcome = await commit({ code: 'STORAGE_EXHAUSTED' });
+      expect(outcome).toMatchObject({
+        kind: 'terminal',
+        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+        version: '3',
+        intent: {
+          dedupeKey: intentKey('3'),
+          templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+          templateArgs: {},
+        },
+      });
+      const stored = await row();
+      expect(stored).toMatchObject({
+        status: 'FAILED',
+        failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+        last_error_category: 'OBJECT_STORAGE',
+        last_error_code: 'STORAGE_EXHAUSTED',
+        storage_attempts: 3,
+        cleanup_pending: true,
+      });
+      expect(stored.downloaded_at).toBeInstanceOf(Date);
+      expect(await outboxRows()).toHaveLength(1);
+      // The internal exhaustion code only terminalizes a genuinely
+      // exhausted row.
+      await seed({ storage_attempts: 2 });
+      await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('validates the exact persisted intent on replay, repairs a legacy successor missing only its intent, and fences foreign or rival evidence', async () => {
+      await seed({ storage_attempts: 3 });
+      expect((await commit({ code: 'STORAGE_EXHAUSTED' })).kind).toBe(
+        'terminal',
+      );
+      const successor = await row();
+      const [owned] = await outboxRows();
+      const replayed = await commit({ code: 'STORAGE_EXHAUSTED' });
+      expect(replayed).toMatchObject({
+        kind: 'replayed',
+        version: '3',
+        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+        intent: { id: owned.id },
+      });
+      // Replay validates retained download evidence, never Meta's
+      // cleared-download shape.
+      expect(replayed).toMatchObject({
+        receipt: {
+          downloadedAt: expect.any(Date) as unknown,
+          byteCount: 1024,
+        },
+      });
+      expect(await outboxRows()).toHaveLength(1);
+      expect(await row()).toEqual(successor);
+      // A mismatch in the persisted intent is foreign evidence: fence, never
+      // replace it.
+      await pool.query(
+        "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+      );
+      await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+      expect((await outboxRows())[0].recipient_id).toBe('sender.rival');
+      // Rival terminal evidence fences before any intent repair.
+      await seedRow(
+        lifeRow('FAILED', 'META_EXHAUSTED_PRE_STORAGE', {
+          id: UUID_A,
+          sender_id: SENDER,
+          captured_sale_id: UUID_B,
+          object_key: `receipts/${UUID_C}`,
+          version: '3',
+          meta_attempts: 3,
+          storage_attempts: 3,
+          last_error_category: 'META_TRANSPORT',
+          last_error_code: 'META_EXHAUSTED',
+          terminal_at: T0,
+          lease_owner: OWNER,
+          lease_expires_at: new Date(Date.now() + 60_000),
+        }),
+      );
+      await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(0);
+      // A deterministic key publicly owned by a foreign intent fences.
+      await seedRow(legacyTerminal());
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key,
+           source_webhook_message_id, recipient_id, template_key, template_args)
+         VALUES ($1, $2, 'wamid.core', 'sender.rival',
+           'RECEIPT_AMOUNT_PROMPT', '{}'::jsonb)`,
+        [UUID_C, intentKey('3')],
+      );
+      await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(1);
+      expect((await outboxRows())[0]).toMatchObject({
+        recipient_id: 'sender.rival',
+      });
+      // A legacy FAILED successor missing only its deterministic intent is
+      // repaired under the exact command and live-lease replay fence.
+      await seedRow(legacyTerminal());
+      const repaired = await commit({ code: 'STORAGE_EXHAUSTED' });
+      expect(repaired).toMatchObject({
+        kind: 'replayed',
+        version: '3',
+        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+        intent: {
+          dedupeKey: intentKey('3'),
+          templateKey: 'RECEIPT_UNAVAILABLE_LATER',
+          templateArgs: {},
+        },
+      });
+      const repairedRows = await outboxRows();
+      expect(repairedRows).toHaveLength(1);
+      expect(repairedRows[0]).toMatchObject({
+        dedupe_key: intentKey('3'),
+        receipt_media_id: UUID_A,
+        receipt_state_version: '3',
+        source_webhook_message_id: 'wamid.core',
+        recipient_id: SENDER,
+        template_key: 'RECEIPT_UNAVAILABLE_LATER',
+        template_args: {},
+      });
+      expect(await commit({ code: 'STORAGE_EXHAUSTED' })).toMatchObject({
+        kind: 'replayed',
+        version: '3',
+        intent: { id: repairedRows[0].id },
+      });
+      expect(await outboxRows()).toHaveLength(1);
+      // A dead lease never repairs a legacy terminal successor.
+      await seedRow(legacyTerminal());
+      await pool.query(
+        "UPDATE receipt_media SET lease_expires_at = now() - interval '1s' WHERE id = $1",
+        [UUID_A],
+      );
+      await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('treats every mismatched persisted intent field as foreign evidence and never replaces it', async () => {
+      const commitThenAlter = async (sql: string) => {
+        await seed({ storage_attempts: 3 });
+        expect((await commit({ code: 'STORAGE_EXHAUSTED' })).kind).toBe(
+          'terminal',
+        );
+        await pool.query(sql);
+        await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+        expect(await outboxRows()).toHaveLength(1);
+      };
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival'",
+      );
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET source_webhook_message_id = 'wamid.rival'",
+      );
+      await commitThenAlter(
+        'UPDATE receipt_media_outbox SET receipt_state_version = 2',
+      );
+      await commitThenAlter(
+        'UPDATE receipt_media_outbox SET receipt_media_id = NULL',
+      );
+      await commitThenAlter(
+        "UPDATE receipt_media_outbox SET template_key = 'RECEIPT_AMOUNT_PROMPT'",
+      );
+      await commitThenAlter(
+        `UPDATE receipt_media_outbox SET template_args = '{"extra":1}'::jsonb`,
+      );
+    });
+
+    it('fences a storage terminal transition and a transient retry whose lock wait outlives the lease', async () => {
+      for (const input of [
+        command({ code: 'STORAGE_EXHAUSTED' }),
+        command({ code: 'NETWORK_FAILURE' }),
+      ]) {
+        await seed({
+          storage_attempts: input.code === 'STORAGE_EXHAUSTED' ? 3 : 1,
+          lease_expires_at: new Date(Date.now() + 250),
+        });
+        const before = await row();
+        const locker = await pool.connect();
+        let observedPending: Promise<unknown> | undefined;
+        try {
+          await locker.query('BEGIN');
+          await locker.query(
+            'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+            [UUID_A],
+          );
+          const pending = storageStore().commitStorageFailureDisposition(input);
+          observedPending = pending.catch(() => undefined);
+          while (Date.now() < +(before.lease_expires_at as number) + 20)
+            await new Promise((r) => setTimeout(r, 20));
+          await locker.query('COMMIT');
+          await expect(pending).resolves.toEqual({ kind: 'fenced' });
+          expect(await row()).toEqual(before);
+          expect(await outboxRows()).toHaveLength(0);
+        } finally {
+          await locker.query('ROLLBACK').catch(() => undefined);
+          locker.release();
+          await observedPending;
+        }
+      }
+    });
+
+    it('serializes exact replay intent validation against a concurrent foreign alteration and never replaces it', async () => {
+      await seed({ storage_attempts: 3 });
+      expect((await commit({ code: 'STORAGE_EXHAUSTED' })).kind).toBe(
+        'terminal',
+      );
+      const [owned] = await outboxRows();
+      const locker = await pool.connect();
+      let observedPending: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1 FOR UPDATE',
+          [intentKey('3')],
+        );
+        let settled = false;
+        const pending = (async () => {
+          const outcome = await commit({ code: 'STORAGE_EXHAUSTED' });
+          settled = true;
+          return outcome;
+        })();
+        observedPending = pending.catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 150));
+        expect(settled).toBe(false);
+        await locker.query(
+          "UPDATE receipt_media_outbox SET recipient_id = 'sender.rival' WHERE dedupe_key = $1",
+          [intentKey('3')],
+        );
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await outboxRows()).toHaveLength(1);
+        expect((await outboxRows())[0]).toMatchObject({
+          id: owned.id,
+          recipient_id: 'sender.rival',
+        });
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observedPending;
+      }
+    });
+
+    it('serializes duplicate transient storage retries to one scheduled successor and fences the loser', async () => {
+      await seed({ storage_attempts: 1 });
+      const [a, b] = await Promise.all([commit(), commit()]);
+      expect([a.kind, b.kind].sort()).toEqual(['fenced', 'retry-scheduled']);
+      const stored = await row();
+      expect(stored).toMatchObject({
+        status: 'DOWNLOADED',
+        version: '3',
+        lease_owner: null,
+        lease_expires_at: null,
+      });
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('serializes duplicate terminal storage commits to one state and one intent and fences a rival', async () => {
+      await seed({ storage_attempts: 3 });
+      const [a, b] = await Promise.all([
+        commit({ code: 'STORAGE_EXHAUSTED' }),
+        commit({ code: 'STORAGE_EXHAUSTED' }),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['replayed', 'terminal']);
+      expect(await row()).toMatchObject({
+        status: 'FAILED',
+        version: '3',
+        failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+      });
+      const intents = await outboxRows();
+      expect(intents).toHaveLength(1);
+      expect(intents[0]).toMatchObject({
+        dedupe_key: intentKey('3'),
+        template_key: 'RECEIPT_UNAVAILABLE_LATER',
+        template_args: {},
+      });
+      await seed({ storage_attempts: 3 });
+      const [c, d] = await Promise.all([
+        commit({ code: 'STORAGE_EXHAUSTED' }),
+        commit({ code: 'HTTP_PERMANENT' }),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['fenced', 'terminal']);
+      expect(await row()).toMatchObject({ status: 'FAILED', version: '3' });
+      expect(await outboxRows()).toHaveLength(1);
+    });
+
+    it('rolls back both terminal state and its intent when the outbox insert fails', async () => {
+      await seed({ storage_attempts: 3 });
+      const before = await row();
+      await pool.query(`CREATE FUNCTION receipt_storage_outbox_failure()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'storage outbox failure'; END; $$;
+      CREATE TRIGGER receipt_storage_outbox_failure
+        BEFORE INSERT ON receipt_media_outbox FOR EACH ROW
+        EXECUTE FUNCTION receipt_storage_outbox_failure()`);
+      try {
+        await expect(commit({ code: 'STORAGE_EXHAUSTED' })).rejects.toThrow(
+          'storage outbox failure',
+        );
+        expect(await row()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await pool.query(`DROP TRIGGER IF EXISTS
+          receipt_storage_outbox_failure ON receipt_media_outbox;
+          DROP FUNCTION IF EXISTS receipt_storage_outbox_failure()`);
+      }
+      // A pre-existing foreign intent at the deterministic key also rolls the
+      // fresh FAILED transition back instead of replacing that evidence.
+      await seed({ storage_attempts: 3 });
+      const seeded = await row();
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key,
+           source_webhook_message_id, recipient_id, template_key, template_args)
+         VALUES ($1, $2, 'wamid.core', 'sender.rival',
+           'RECEIPT_AMOUNT_PROMPT', '{}'::jsonb)`,
+        [UUID_C, intentKey('3')],
+      );
+      await expectFenced(command({ code: 'STORAGE_EXHAUSTED' }));
+      expect(await row()).toEqual(seeded);
+      const [foreign] = await outboxRows();
+      expect(foreign).toMatchObject({
+        dedupe_key: intentKey('3'),
+        recipient_id: 'sender.rival',
+        template_key: 'RECEIPT_AMOUNT_PROMPT',
+      });
+    });
+
+    it('fences wrong fences, malformed categories/codes, and non-eligible states without durable mutation', async () => {
+      await seed({ storage_attempts: 1 });
+      for (const over of [
+        { owner: 'worker.rival' },
+        { expectedVersion: '1' },
+        { expectedVersion: '4' },
+        { expectedVersion: '2.5' },
+        { expectedVersion: '0' },
+        { id: UUID_C },
+        { id: 'not-a-uuid' },
+        { owner: '' },
+        { category: 'META_TRANSPORT' },
+        { code: 'MIME_MISMATCH' },
+        { code: 'META_EXHAUSTED' },
+        { code: 'UNKNOWN' },
+        { code: '' },
+        { category: 'OTHER', code: 'NETWORK_FAILURE' },
+      ]) {
+        await expectFenced(command(over));
+      }
+      expect(await outboxRows()).toHaveLength(0);
+      // storage_attempts = 0 has no attempt evidence to dispose.
+      await seed({ storage_attempts: 0 });
+      await expectFenced(command());
+      // RESERVED, STORED, and ATTACHING are never storage-disposition
+      // eligible.
+      await seedRow(lifeRow('RESERVED', null, { storage_attempts: 1 }));
+      await expectFenced(command());
+      await seedRow(lifeRow('STORED', null, { storage_attempts: 1 }));
+      await expectFenced(command());
+      await seedRow(lifeRow('ATTACHING', null, { storage_attempts: 1 }));
+      await expectFenced(command());
+      // A released lease never authorizes a disposition.
+      await seed({ storage_attempts: 1 });
+      await pool.query(
+        'UPDATE receipt_media SET lease_owner = NULL, lease_expires_at = NULL WHERE id = $1',
+        [UUID_A],
+      );
+      await expectFenced(command());
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('reclaims storage-exhausted DOWNLOADED rows for terminalization while refusing a fourth storage attempt and holding STORED', async () => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const exhausted = lifeRow('DOWNLOADED', null, {
+        id: UUID_A,
+        webhook_message_id: 'wamid.rec-sd',
+        provider_media_id: 'media.rec-sd',
+        sender_id: 'sender.rec-sd',
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_A}`,
+        storage_attempts: 3,
+        next_attempt_at: T0,
+      });
+      const stored = lifeRow('STORED', null, {
+        id: '33333333-3333-4333-8333-333333333333',
+        webhook_message_id: 'wamid.rec-st',
+        provider_media_id: 'media.rec-st',
+        sender_id: 'sender.rec-st',
+        captured_sale_id: UUID_B,
+        object_key: 'receipts/stored-sd',
+        storage_attempts: 3,
+        next_attempt_at: T0,
+      });
+      for (const receipt of [exhausted, stored])
+        await pool.query(
+          insertSql('receipt_media', receipt),
+          Object.values(receipt),
+        );
+      const claimed = await store.claimBatch(5, OWNER);
+      expect(claimed.map((r) => r.id)).toEqual([UUID_A]);
+      expect(
+        await store.startStorageAttempt({
+          id: UUID_A,
+          owner: OWNER,
+          expectedVersion: claimed[0].version,
+        }),
+      ).toBeNull();
+    });
+  });
+
+  describe('ODD-2D2a durable cleanup claim and disposition', () => {
+    const OWNER = 'worker.cleanup';
+    const RIVAL = 'worker.cleanup-rival';
+    const SENDER = 'sender.cleanup';
+    const RETRYABLE = ['ABORTED', 'HTTP_RETRYABLE', 'NETWORK_FAILURE'];
+    const PERMANENT = [
+      'OBJECT_KEY_INVALID',
+      'REQUEST_INVALID',
+      'HTTP_PERMANENT',
+      'PERMANENT_FAILURE',
+    ];
+    /** The new primitives are called through a structural seam so this spec
+     * stays runnable before the port surface exists; the durable behavior is
+     * proven against the real PostgreSQL store either way. */
+    const cleanupStore = () =>
+      store as unknown as {
+        claimCleanupBatch(limit: number, owner: string): Promise<Row[]>;
+        commitCleanupDisposition(input: Row): Promise<Row>;
+      };
+    const claim = (limit = 5, owner = OWNER) =>
+      cleanupStore().claimCleanupBatch(limit, owner);
+    /** Bypasses the default parameters so forged runtime inputs reach the
+     * store exactly as a malformed caller would supply them. */
+    const claimRaw = (limit: unknown, owner: unknown) =>
+      cleanupStore().claimCleanupBatch(limit as number, owner as string);
+    /** A post-claim row: live lease, claimed attempt, successor version. */
+    const live = (over: Row = {}): Row => ({
+      lease_owner: OWNER,
+      lease_expires_at: new Date(Date.now() + 60_000),
+      version: '5',
+      ...over,
+    });
+    const cleanupRow = (over: Row = {}): Row =>
+      lifeRow('FAILED', 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE', {
+        id: UUID_A,
+        webhook_message_id: 'wamid.cleanup',
+        provider_media_id: 'media.cleanup',
+        sender_id: SENDER,
+        captured_sale_id: UUID_B,
+        object_key: `receipts/${UUID_C}`,
+        version: '4',
+        storage_attempts: 3,
+        last_error_category: 'OBJECT_STORAGE',
+        last_error_code: 'STORAGE_EXHAUSTED',
+        cleanup_pending: true,
+        cleanup_attempts: 0,
+        next_attempt_at: T0,
+        terminal_at: T0,
+        lease_owner: null,
+        lease_expires_at: null,
+        ...over,
+      });
+    const seed = async (over: Row = {}): Promise<Row> => {
+      const row = cleanupRow(over);
+      await seeds([row]);
+      return row;
+    };
+    const seeds = async (rows: Row[]): Promise<void> => {
+      await pool.query(
+        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      for (const row of rows)
+        await pool.query(insertSql('receipt_media', row), Object.values(row));
+    };
+    const rowOf = async (id = UUID_A): Promise<Row> =>
+      (await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [id]))
+        .rows[0];
+    const outboxRows = async (): Promise<Row[]> =>
+      (await pool.query<Row>('SELECT * FROM receipt_media_outbox')).rows;
+    const remainingMs = async (): Promise<number> =>
+      Number(
+        (
+          await pool.query<Row>(
+            `SELECT (extract(epoch from next_attempt_at - clock_timestamp()) * 1000)::int AS ms
+               FROM receipt_media WHERE id = $1`,
+            [UUID_A],
+          )
+        ).rows[0].ms,
+      );
+    const due = (id = UUID_A): Promise<unknown> =>
+      pool.query(
+        'UPDATE receipt_media SET next_attempt_at = $2 WHERE id = $1',
+        [id, T0],
+      );
+    const deleted = (over: Row = {}): Row => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '5',
+      outcome: 'deleted',
+      ...over,
+    });
+    const deleteFailed = (code: string, over: Row = {}): Row => ({
+      id: UUID_A,
+      owner: OWNER,
+      expectedVersion: '5',
+      outcome: 'failed',
+      category: 'OBJECT_STORAGE',
+      code,
+      ...over,
+    });
+    const dispose = (input: Row) =>
+      cleanupStore().commitCleanupDisposition(input);
+    const expectFenced = async (input: Row): Promise<void> => {
+      const before = await rowOf();
+      await expect(dispose(input)).resolves.toEqual({ kind: 'fenced' });
+      expect(await rowOf()).toEqual(before);
+    };
+    const sleep = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+
+    it('starts attempt 1 from an initial backlog row, including an expired lease retained by ODD-2D1', async () => {
+      const initial: Array<[string, Row]> = [
+        ['a released lease', {}],
+        [
+          'an expired retained lease',
+          {
+            lease_owner: 'worker.storage-failure',
+            lease_expires_at: new Date(Date.now() - 1000),
+          },
+        ],
+      ];
+      for (const [label, over] of initial) {
+        await seed(over);
+        const claimed = await claim();
+        expect([label, claimed]).toHaveLength(2);
+        expect(claimed).toHaveLength(1);
+        expect(claimed[0]).toMatchObject({
+          id: UUID_A,
+          status: 'FAILED',
+          failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          cleanupPending: true,
+          cleanupAttempts: 1,
+          leaseOwner: OWNER,
+          version: '5',
+        });
+        expect(await rowOf()).toMatchObject({
+          cleanup_attempts: 1,
+          lease_owner: OWNER,
+          version: '5',
+        });
+        const expiry = Number((await rowOf()).lease_expires_at);
+        expect(expiry).toBeGreaterThan(Date.now() + 55_000);
+        expect(expiry).toBeLessThanOrEqual(Date.now() + 61_000);
+      }
+    });
+
+    it('claims only due cleanup backlog in deterministic order and honors the limit', async () => {
+      const id = (n: number) => `00000000-0000-4000-8000-00000000000${n}`;
+      const at = (iso: string) => new Date(iso);
+      const mk = (n: number, next: Date, created: Date): Row =>
+        cleanupRow({
+          id: id(n),
+          webhook_message_id: `wamid.o-${n}`,
+          provider_media_id: `media.o-${n}`,
+          object_key: `receipts/o-${n}`,
+          next_attempt_at: next,
+          created_at: created,
+        });
+      await seeds([
+        mk(3, at('2025-01-03T00:00:00Z'), at('2025-01-01T00:00:00Z')),
+        mk(1, at('2025-01-01T00:00:00Z'), at('2025-01-01T00:00:00Z')),
+        mk(2, at('2025-01-01T00:00:00Z'), at('2025-01-02T00:00:00Z')),
+      ]);
+      const claimed = await claim(2);
+      expect(claimed.map((r) => r.id)).toEqual([id(1), id(2)]);
+      expect(claimed.map((r) => r.cleanupAttempts)).toEqual([1, 1]);
+      expect((await rowOf(id(3))).cleanup_attempts).toBe(0);
+    });
+
+    it('excludes every non-eligible cleanup row and never widens generic claimBatch or STORED', async () => {
+      const expectNoCleanupClaim = async (row: Row) => {
+        await seeds([row]);
+        expect(await claim()).toHaveLength(0);
+      };
+      const cases: Array<[string, Row]> = [
+        ['a live lease', cleanupRow(live())],
+        [
+          'a future deadline',
+          cleanupRow({ next_attempt_at: new Date(Date.now() + 3_600_000) }),
+        ],
+        ['cleanup_pending false', cleanupRow({ cleanup_pending: false })],
+        ['a permanent code', cleanupRow({ last_error_code: 'HTTP_PERMANENT' })],
+        ['an unknown code', cleanupRow({ last_error_code: 'MYSTERY' })],
+        [
+          'a lease-cleared retryable attempt 3',
+          cleanupRow({
+            cleanup_attempts: 3,
+            last_error_code: 'NETWORK_FAILURE',
+          }),
+        ],
+        [
+          'a lease-cleared initial backlog attempt 3',
+          cleanupRow({ cleanup_attempts: 3 }),
+        ],
+        [
+          'a non-cleanup failure stage',
+          lifeRow('FAILED', 'META_EXHAUSTED_PRE_STORAGE', {
+            id: UUID_A,
+            webhook_message_id: 'wamid.cleanup',
+            provider_media_id: 'media.cleanup',
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            object_key: `receipts/${UUID_C}`,
+            last_error_category: 'META_TRANSPORT',
+            last_error_code: 'META_EXHAUSTED',
+            cleanup_pending: true,
+            next_attempt_at: T0,
+            terminal_at: T0,
+          }),
+        ],
+        [
+          'a non-cleanup status',
+          lifeRow('DOWNLOADED', null, {
+            id: UUID_A,
+            webhook_message_id: 'wamid.cleanup',
+            provider_media_id: 'media.cleanup',
+            sender_id: SENDER,
+            captured_sale_id: UUID_B,
+            object_key: `receipts/${UUID_C}`,
+            next_attempt_at: T0,
+          }),
+        ],
+      ];
+      for (const [label, row] of cases) {
+        await expectNoCleanupClaim(row);
+        expect([label, await rowOf()]).toHaveLength(2);
+      }
+      // Generic claims stay exactly as before: a FAILED cleanup row and a
+      // STORED row are both absent from automatic batch eligibility.
+      await seeds([
+        cleanupRow({ cleanup_attempts: 1, last_error_code: 'NETWORK_FAILURE' }),
+        lifeRow('STORED', null, {
+          id: '33333333-3333-4333-8333-333333333333',
+          webhook_message_id: 'wamid.cleanup-stored',
+          provider_media_id: 'media.cleanup-stored',
+          sender_id: 'sender.cleanup-stored',
+          captured_sale_id: UUID_B,
+          object_key: 'receipts/cleanup-stored',
+          next_attempt_at: T0,
+        }),
+      ]);
+      expect(await store.claimBatch(5, OWNER)).toHaveLength(0);
+      expect(await rowOf()).toMatchObject({
+        status: 'FAILED',
+        lease_owner: null,
+        cleanup_attempts: 1,
+        version: '4',
+      });
+      expect(await claim()).toHaveLength(1);
+    });
+
+    it('reclaims the same ambiguous logical attempt without increment when a non-null lease expired (attempts 1-3)', async () => {
+      for (const attempt of [1, 2, 3]) {
+        await seed({
+          cleanup_attempts: attempt,
+          last_error_code: 'NETWORK_FAILURE',
+          lease_owner: 'worker.crashed',
+          lease_expires_at: new Date(Date.now() - 1000),
+        });
+        const claimed = await claim();
+        expect(claimed).toHaveLength(1);
+        expect(claimed[0]).toMatchObject({
+          cleanupAttempts: attempt,
+          leaseOwner: OWNER,
+          version: '5',
+        });
+        expect((await rowOf()).cleanup_attempts).toBe(attempt);
+      }
+    });
+
+    it('excludes duplicate concurrent claims and skips a row locked by another transaction', async () => {
+      await seed();
+      const [a, b] = await Promise.all([claim(), claim()]);
+      expect([...a, ...b].map((r) => r.id)).toEqual([UUID_A]);
+      expect(await rowOf()).toMatchObject({
+        cleanup_attempts: 1,
+        version: '5',
+      });
+      await seed();
+      const locker = await pool.connect();
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'SELECT * FROM receipt_media WHERE id = $1 FOR UPDATE',
+          [UUID_A],
+        );
+        expect(await claim()).toHaveLength(0);
+        await locker.query('COMMIT');
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+      }
+      expect(await claim()).toHaveLength(1);
+    });
+
+    it('commits cleanup success by clearing flag and lease while preserving every terminal evidence boundary', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      const intentId = `receipt-unavailable-later:${UUID_A}:5:wamid.cleanup`;
+      await pool.query(
+        `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+           receipt_state_version, source_webhook_message_id, recipient_id,
+           template_key, template_args)
+         VALUES ($1, $2, $3, '5', 'wamid.cleanup', $4,
+           'RECEIPT_UNAVAILABLE_LATER', '{}'::jsonb)`,
+        [UUID_C, intentId, UUID_A, SENDER],
+      );
+      const before = await rowOf();
+      const [intentBefore] = await outboxRows();
+      const outcome = await dispose(deleted());
+      expect(outcome).toMatchObject({
+        kind: 'cleaned',
+        attempt: 1,
+        version: '6',
+        receipt: {
+          status: 'FAILED',
+          failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          cleanupPending: false,
+          cleanupAttempts: 1,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        },
+      });
+      const stored = await rowOf();
+      expect(stored).toMatchObject({
+        cleanup_pending: false,
+        cleanup_attempts: 1,
+        lease_owner: null,
+        lease_expires_at: null,
+        version: '6',
+      });
+      expect(stored.downloaded_at).toEqual(before.downloaded_at);
+      expect(stored.byte_count).toBe(1024);
+      expect(Buffer.isBuffer(stored.content_sha256)).toBe(true);
+      expect(stored.object_key).toBe(`receipts/${UUID_C}`);
+      expect(stored.failure_stage).toBe('STORAGE_EXHAUSTED_PRE_ACCEPTANCE');
+      expect(stored.terminal_at).toEqual(before.terminal_at);
+      expect(stored.last_error_code).toBe('STORAGE_EXHAUSTED');
+      for (const col of [
+        'stored_at',
+        'object_etag',
+        'object_version_id',
+        'capability_token_hash',
+        'capability_key_version',
+        'capability_key_version_text',
+        'capability_issued_at',
+        'capability_revoked_at',
+      ])
+        expect(stored[col]).toBeNull();
+      expect(await outboxRows()).toEqual([intentBefore]);
+      // A cleared row is never re-claimed, and a duplicate command at the
+      // stale version fences without a second bump.
+      expect(await claim()).toHaveLength(0);
+      await expectFenced(deleted());
+      expect((await rowOf()).version).toBe('6');
+    });
+
+    it('schedules retryable attempts 1/2 with a 1s/4s base plus bounded positive jitter and no intent', async () => {
+      for (const [attempt, base] of [
+        [1, 1000],
+        [2, 4000],
+      ] as Array<[number, number]>) {
+        for (const code of RETRYABLE) {
+          await seed(live({ cleanup_attempts: attempt }));
+          const outcome = await dispose(deleteFailed(code));
+          expect(outcome).toMatchObject({
+            kind: 'retry-scheduled',
+            attempt,
+            version: '6',
+            receipt: {
+              cleanupPending: true,
+              cleanupAttempts: attempt,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastErrorCategory: 'OBJECT_STORAGE',
+              lastErrorCode: code,
+            },
+          });
+          expect(await rowOf()).toMatchObject({
+            cleanup_pending: true,
+            cleanup_attempts: attempt,
+            lease_owner: null,
+            lease_expires_at: null,
+            last_error_category: 'OBJECT_STORAGE',
+            last_error_code: code,
+            version: '6',
+          });
+          expect((await rowOf()).downloaded_at).toBeInstanceOf(Date);
+          expect(await remainingMs()).toBeGreaterThan(base - 500);
+          expect(await remainingMs()).toBeLessThanOrEqual(base * 1.25 + 100);
+          expect(await outboxRows()).toHaveLength(0);
+        }
+      }
+    });
+
+    it('manually holds attempt-3 retryable failures and permanent failures at any attempt without automatic eligibility', async () => {
+      const holds: Array<[string, number]> = [
+        ...RETRYABLE.map((code): [string, number] => [code, 3]),
+        ...PERMANENT.map((code): [string, number] => [code, 1]),
+        ...PERMANENT.map((code): [string, number] => [code, 3]),
+      ];
+      for (const [code, attempt] of holds) {
+        await seed(live({ cleanup_attempts: attempt }));
+        const outcome = await dispose(deleteFailed(code));
+        expect(outcome).toMatchObject({
+          kind: 'manual-hold',
+          attempt,
+          version: '6',
+          receipt: {
+            cleanupPending: true,
+            cleanupAttempts: attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastErrorCode: code,
+          },
+        });
+        expect(await rowOf()).toMatchObject({
+          status: 'FAILED',
+          failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
+          cleanup_pending: true,
+          cleanup_attempts: attempt,
+          lease_owner: null,
+          lease_expires_at: null,
+          last_error_category: 'OBJECT_STORAGE',
+          last_error_code: code,
+        });
+        expect(await claim()).toHaveLength(0);
+        expect(await outboxRows()).toHaveLength(0);
+      }
+    });
+
+    it('walks the full lifecycle to a manual hold and never authorizes a fourth logical attempt', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      const first = await dispose(deleteFailed('NETWORK_FAILURE'));
+      expect(first).toMatchObject({ kind: 'retry-scheduled', attempt: 1 });
+      expect(await claim()).toHaveLength(0);
+      await due();
+      const claim2 = (await claim())[0];
+      expect(claim2).toMatchObject({ cleanupAttempts: 2, version: '7' });
+      const second = await dispose(
+        deleteFailed('ABORTED', { expectedVersion: claim2.version }),
+      );
+      expect(second).toMatchObject({ kind: 'retry-scheduled', attempt: 2 });
+      await due();
+      const claim3 = (await claim())[0];
+      expect(claim3).toMatchObject({ cleanupAttempts: 3, version: '9' });
+      const third = await dispose(
+        deleteFailed('HTTP_RETRYABLE', { expectedVersion: claim3.version }),
+      );
+      expect(third).toMatchObject({ kind: 'manual-hold', attempt: 3 });
+      await due();
+      expect(await claim()).toHaveLength(0);
+      expect(await rowOf()).toMatchObject({
+        cleanup_attempts: 3,
+        cleanup_pending: true,
+        last_error_code: 'HTTP_RETRYABLE',
+      });
+    });
+
+    it('reissues a crashed attempt 3, converges on idempotent success, and never starts a fourth attempt', async () => {
+      await seed({
+        cleanup_attempts: 3,
+        last_error_code: 'NETWORK_FAILURE',
+        lease_owner: 'worker.crashed',
+        lease_expires_at: new Date(Date.now() - 1000),
+      });
+      const [claimed] = await claim();
+      expect(claimed).toMatchObject({ cleanupAttempts: 3, version: '5' });
+      const outcome = await dispose(
+        deleted({ expectedVersion: claimed.version }),
+      );
+      expect(outcome).toMatchObject({ kind: 'cleaned', attempt: 3 });
+      expect(await claim()).toHaveLength(0);
+      expect(await rowOf()).toMatchObject({
+        cleanup_pending: false,
+        cleanup_attempts: 3,
+        lease_owner: null,
+        lease_expires_at: null,
+        version: '6',
+      });
+    });
+
+    it('fences malformed commands, mismatched fences, and out-of-lifecycle rows without mutation', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      for (const over of [
+        { owner: RIVAL },
+        { expectedVersion: '4' },
+        { expectedVersion: '6' },
+        { expectedVersion: '0' },
+        { expectedVersion: '2.5' },
+        { expectedVersion: '' },
+        { id: UUID_C },
+        { id: 'not-a-uuid' },
+        { outcome: 'nope' },
+        { outcome: undefined },
+        { outcome: 'failed', code: undefined },
+        { outcome: 'failed', code: 'UNKNOWN' },
+        { outcome: 'failed', code: '' },
+        { outcome: 'failed', category: 'META_TRANSPORT' },
+        { outcome: 'failed', category: 'OTHER' },
+      ])
+        await expectFenced({ ...deleteFailed('NETWORK_FAILURE'), ...over });
+      for (const over of [
+        { cleanup_pending: false },
+        { cleanup_attempts: 0 },
+        { lease_owner: null, lease_expires_at: null },
+        { lease_expires_at: new Date(Date.now() - 1000) },
+      ]) {
+        await seed(live({ cleanup_attempts: 1, ...over }));
+        await expectFenced(deleteFailed('NETWORK_FAILURE'));
+      }
+      await seeds([
+        lifeRow('DOWNLOADED', null, {
+          id: UUID_A,
+          webhook_message_id: 'wamid.cleanup',
+          provider_media_id: 'media.cleanup',
+          sender_id: SENDER,
+          captured_sale_id: UUID_B,
+          object_key: `receipts/${UUID_C}`,
+          next_attempt_at: T0,
+          ...live(),
+        }),
+      ]);
+      await expectFenced(deleteFailed('NETWORK_FAILURE'));
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('fences a disposition whose row-lock wait outlives the lease', async () => {
+      await seed(
+        live({
+          cleanup_attempts: 1,
+          lease_expires_at: new Date(Date.now() + 250),
+        }),
+      );
+      const before = await rowOf();
+      const locker = await pool.connect();
+      let observed: Promise<unknown> | undefined;
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'UPDATE receipt_media SET updated_at = updated_at WHERE id = $1',
+          [UUID_A],
+        );
+        const pending = dispose(deleteFailed('NETWORK_FAILURE'));
+        observed = pending.catch(() => undefined);
+        while (Date.now() < +(before.lease_expires_at as number) + 20)
+          await sleep(20);
+        await locker.query('COMMIT');
+        await expect(pending).resolves.toEqual({ kind: 'fenced' });
+        expect(await rowOf()).toEqual(before);
+        expect(await outboxRows()).toHaveLength(0);
+      } finally {
+        await locker.query('ROLLBACK').catch(() => undefined);
+        locker.release();
+        await observed;
+      }
+    });
+
+    it('converges concurrent rival dispositions on one outcome with exactly one version bump', async () => {
+      await seed(live({ cleanup_attempts: 1 }));
+      const [a, b] = await Promise.all([
+        dispose(deleted()),
+        dispose(deleted()),
+      ]);
+      expect([a.kind, b.kind].sort()).toEqual(['cleaned', 'fenced']);
+      expect(await rowOf()).toMatchObject({
+        cleanup_pending: false,
+        cleanup_attempts: 1,
+        lease_owner: null,
+        version: '6',
+      });
+      // A rival failure racing a success cannot win any second write either.
+      await seed(live({ cleanup_attempts: 1 }));
+      const [c, d] = await Promise.all([
+        dispose(deleted()),
+        dispose(deleteFailed('NETWORK_FAILURE')),
+      ]);
+      expect([c.kind, d.kind].sort()).toEqual(['cleaned', 'fenced']);
+      expect(await rowOf()).toMatchObject({ version: '6' });
+      expect(await outboxRows()).toHaveLength(0);
+    });
+
+    it('fails closed on a malformed runtime limit without claiming or mutating any row', async () => {
+      const malformed: unknown[] = [
+        null,
+        undefined,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        1.5,
+        0,
+        -1,
+        '5',
+        true,
+        2 ** 53,
+      ];
+      for (const limit of malformed) {
+        await seed();
+        const before = await rowOf();
+        await expect(claimRaw(limit, OWNER)).resolves.toEqual([]);
+        expect(await rowOf()).toEqual(before);
+      }
+      // A valid boundary limit still claims the eligible backlog.
+      await seed();
+      expect(await claimRaw(1, OWNER)).toHaveLength(1);
+    });
+
+    it('fails closed on a malformed runtime owner without claiming or mutating any row', async () => {
+      const malformed: unknown[] = [
+        null,
+        undefined,
+        '',
+        123,
+        true,
+        {},
+        'x'.repeat(101),
+      ];
+      for (const owner of malformed) {
+        await seed();
+        const before = await rowOf();
+        await expect(claimRaw(5, owner)).resolves.toEqual([]);
+        expect(await rowOf()).toEqual(before);
+      }
+      // A valid maximum-length owner still claims the eligible backlog.
+      await seed();
+      expect(await claimRaw(5, 'x'.repeat(100))).toHaveLength(1);
+    });
+
+    it('never claims a safe-looking delete code under a non-OBJECT_STORAGE category', async () => {
+      const safeLookingCodes = [
+        'STORAGE_EXHAUSTED',
+        'CLEANUP_PENDING',
+        'ABORTED',
+        'HTTP_RETRYABLE',
+        'NETWORK_FAILURE',
+      ];
+      for (const code of safeLookingCodes) {
+        for (const category of ['META_TRANSPORT', 'OTHER', '', null]) {
+          await seed({
+            last_error_category: category,
+            last_error_code: code,
+          });
+          expect(await claim()).toHaveLength(0);
+          expect(await rowOf()).toMatchObject({
+            cleanup_pending: true,
+            cleanup_attempts: 0,
+            lease_owner: null,
+            version: '4',
+          });
+        }
+      }
+      // Control: the exact OBJECT_STORAGE category with the same code claims.
+      await seed({ last_error_category: 'OBJECT_STORAGE' });
+      expect(await claim()).toHaveLength(1);
     });
   });
 
@@ -7306,6 +8933,166 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         );
       }
       await pool.query('DELETE FROM receipt_media');
+    });
+  });
+
+  // --- ODD-4C identity-aware durable active-image lookup (RM1, RM3) ---
+  describe('ODD-4C identity-aware durable active-image lookup', () => {
+    const SENDER = 'sender.active';
+    const ACTIVE =
+      'RESERVED DOWNLOADED STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING'.split(
+        ' ',
+      );
+    const TERMINAL = 'ATTACHED FAILED CANCELLED ATTACH_OUTCOME_UNKNOWN'.split(
+      ' ',
+    );
+    const unrelated = (sender = SENDER) => ({
+      senderId: sender,
+      webhookMessageId: 'wamid.unrelated',
+      providerMediaId: 'media.unrelated',
+    });
+    type Query = ReturnType<typeof unrelated>;
+    /** Structural seam keeps this spec runnable before the port method
+     * exists; the real PostgreSQL store is exercised either way. */
+    const findActive = (input: Query): Promise<string | null> =>
+      (
+        store as unknown as {
+          findActiveBySender(i: Query): Promise<string | null>;
+        }
+      ).findActiveBySender(input);
+    const admit = (over: Row): Promise<ReservationOutcome> =>
+      store.admit({
+        senderId: SENDER,
+        capturedSaleId: UUID_B,
+        ...over,
+      } as ReserveInput);
+    const count = async (sql: string): Promise<number> =>
+      (await pool.query<{ n: number }>(sql)).rows[0].n;
+    const receiptCount = () =>
+      count('SELECT count(*)::int AS n FROM receipt_media');
+    const markerCount = () =>
+      count('SELECT count(*)::int AS n FROM processed_webhook_messages');
+    const seed = async (status: string, sender = SENDER): Promise<void> => {
+      await pool.query(
+        'TRUNCATE processed_webhook_messages, receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      const row = lifeRow(
+        status,
+        status === 'FAILED' ? 'ATTACH_DEFINITE' : null,
+        {
+          webhook_message_id: 'wamid.active',
+          provider_media_id: 'media.active',
+          sender_id: sender,
+        },
+      );
+      await pool.query(insertSql('receipt_media', row), Object.values(row));
+    };
+    it.each([
+      ...ACTIVE.map((s) => [s, s] as const),
+      ...TERMINAL.map((s) => [s, null] as const),
+    ])('projects %s to %s', async (status, expected) => {
+      await seed(status);
+      await expect(findActive(unrelated())).resolves.toBe(expected);
+    });
+    it('returns null for an absent sender', async () => {
+      await expect(findActive(unrelated('sender.missing'))).resolves.toBeNull();
+    });
+    it('parameter-binds adversarial sender values without altering SQL structure', async () => {
+      const nasty = "sender'); DROP TABLE receipt_media;--";
+      await seed('RESERVED', nasty);
+      await expect(findActive(unrelated(nasty))).resolves.toBe('RESERVED');
+      await expect(
+        findActive(unrelated("sender' OR '1'='1")),
+      ).resolves.toBeNull();
+      expect(await receiptCount()).toBe(1);
+    });
+    it('takes no row lock: an uncommitted writer does not block the lookup', async () => {
+      await seed('RESERVED');
+      const writer = await pool.connect();
+      try {
+        await writer.query('BEGIN');
+        await writer.query(
+          "UPDATE receipt_media SET sender_id = 'sender.locked' WHERE id = $1",
+          [UUID_A],
+        );
+        // The uncommitted writer holds the row lock; a plain read does not block.
+        const outcome = await Promise.race([
+          findActive(unrelated()),
+          new Promise((resolve) => setTimeout(() => resolve('blocked'), 1000)),
+        ]);
+        expect(outcome).toBe('RESERVED');
+      } finally {
+        await writer.query('ROLLBACK');
+        writer.release();
+      }
+    });
+    it.each<[string, string, Record<string, unknown>]>([
+      ['wamid.active', 'media.blank', { kind: 'webhook-media-conflict' }],
+      [
+        'wamid.blank',
+        'media.active',
+        { kind: 'provider-media-reused', receipt: expect.any(Object) },
+      ],
+    ])(
+      'excludes the identity overlap %s/%s from the lookup while admit owns its outcome',
+      async (webhookMessageId, providerMediaId, outcome) => {
+        await seed('RESERVED');
+        await expect(
+          findActive({ senderId: SENDER, webhookMessageId, providerMediaId }),
+        ).resolves.toBeNull();
+        await expect(
+          admit({
+            id: UUID_B,
+            webhookMessageId,
+            providerMediaId,
+            objectKey: `receipts/${UUID_B}`,
+          }),
+        ).resolves.toEqual(outcome);
+        expect(await receiptCount()).toBe(1);
+        expect(await markerCount()).toBe(1);
+      },
+    );
+    it('still projects an unrelated active row', async () => {
+      await seed('RESERVED');
+      await expect(findActive(unrelated())).resolves.toBe('RESERVED');
+    });
+    it('returns the committed winner status for a sender-active admit keeping one receipt', async () => {
+      await seed('DOWNLOADED');
+      await expect(
+        admit({
+          id: UUID_B,
+          webhookMessageId: 'wamid.rival',
+          providerMediaId: 'media.rival',
+          objectKey: `receipts/${UUID_B}`,
+        }),
+      ).resolves.toEqual({ kind: 'sender-active', status: 'DOWNLOADED' });
+      expect(await receiptCount()).toBe(1);
+    });
+    it('rethrows the original conflict when no active row survives', async () => {
+      await pool.query(
+        'TRUNCATE processed_webhook_messages, receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
+      );
+      // Force the active-sender conflict with no durable winner, so the
+      // post-conflict reload finds nothing and admit rethrows.
+      await pool.query(`CREATE FUNCTION forced_active_sender_conflict() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'forced active sender conflict' USING ERRCODE = '23505', CONSTRAINT = 'receipt_media_active_sender_idx'; END; $$;
+        CREATE TRIGGER forced_active_sender_conflict BEFORE INSERT ON receipt_media FOR EACH ROW EXECUTE FUNCTION forced_active_sender_conflict()`);
+      try {
+        await expect(
+          admit({
+            id: UUID_A,
+            webhookMessageId: 'wamid.gone',
+            providerMediaId: 'media.gone',
+            objectKey: `receipts/${UUID_A}`,
+          }),
+        ).rejects.toThrow('forced active sender conflict');
+        expect(await receiptCount()).toBe(0);
+      } finally {
+        await pool.query(
+          'DROP TRIGGER IF EXISTS forced_active_sender_conflict ON receipt_media; DROP FUNCTION IF EXISTS forced_active_sender_conflict()',
+        );
+      }
+      expect(await markerCount()).toBe(0);
     });
   });
 

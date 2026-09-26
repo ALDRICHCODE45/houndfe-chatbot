@@ -4,7 +4,8 @@ import {
   ConversationState,
   ConversationStore,
   isNonEmptyString,
-  isPendingHumanRequest,
+  isStructuralPendingHumanRequest,
+  isPendingHumanRequestId,
   isReceiptAmountPointer,
   PendingHumanRequest,
   ReceiptAmountPointer,
@@ -55,7 +56,7 @@ export class PostgresConversationStore implements ConversationStore {
     if (
       !isNonEmptyString(senderId) ||
       !isNonEmptyString(lastMessageAt) ||
-      !isPendingHumanRequest(marker)
+      !isStructuralPendingHumanRequest(marker)
     ) {
       return false;
     }
@@ -78,11 +79,24 @@ export class PostgresConversationStore implements ConversationStore {
     return (rowCount ?? 0) === 1;
   }
 
-  async clearPendingHumanRequest(
+  clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+  ): Promise<boolean>;
+  clearPendingHumanRequest(
     senderId: string,
     requestId: string,
     lastMessageAt: string,
+  ): Promise<boolean>;
+  async clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+    lastMessageAt?: string,
   ): Promise<boolean> {
+    // An explicitly invalid timestamp must not select the two-argument API.
+    if (arguments.length === 2) {
+      return this.clearCanonicalPendingHumanRequest(senderId, requestId);
+    }
     if (
       !isNonEmptyString(senderId) ||
       !isNonEmptyString(requestId) ||
@@ -197,6 +211,40 @@ export class PostgresConversationStore implements ConversationStore {
         pointer.saleId,
         pointer.receiptVersion,
       ],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  private async clearCanonicalPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+  ): Promise<boolean> {
+    if (
+      typeof senderId !== 'string' ||
+      senderId.length === 0 ||
+      !isPendingHumanRequestId(requestId)
+    ) {
+      return false;
+    }
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = jsonb_set(data, '{pendingHumanRequest}', 'null'::jsonb, true)
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'pendingHumanRequest') = 'object'
+         AND data->'pendingHumanRequest' = jsonb_build_object(
+           'requestId', data->'pendingHumanRequest'->'requestId',
+           'ref', data->'pendingHumanRequest'->'ref',
+           'createdAt', data->'pendingHumanRequest'->'createdAt',
+           'customerNotifiedAt', data->'pendingHumanRequest'->'customerNotifiedAt')
+         AND jsonb_typeof(data->'pendingHumanRequest'->'requestId') = 'string'
+         AND jsonb_typeof(data->'pendingHumanRequest'->'ref') = 'string'
+         AND jsonb_typeof(data->'pendingHumanRequest'->'createdAt') = 'string'
+         AND jsonb_typeof(data->'pendingHumanRequest'->'customerNotifiedAt') = 'string'
+         AND data->'pendingHumanRequest'->>'requestId' = $2
+         AND data->'pendingHumanRequest'->>'ref' = 'HF-' || $2
+         AND length(data->'pendingHumanRequest'->>'createdAt') > 0
+         AND length(data->'pendingHumanRequest'->>'customerNotifiedAt') > 0`,
+      [senderId, requestId],
     );
     return (rowCount ?? 0) === 1;
   }

@@ -179,29 +179,68 @@ describe('AgentRunner', () => {
   // ────────────────────────────────────────────────────────────────────
   describe('history truncation', () => {
     it('passes at most historyTurns most-recent turns to the port', async () => {
+      // G-1 llm-agent/R1/S1: the port owns the SDK tool loop. This port mock
+      // performs exactly ONE tool step (no loop is simulated or reimplemented)
+      // against the tool set it receives, observes the tool's distinct result
+      // sentinel, and derives the final reply from it. The runner must forward
+      // the exact tool set, the expected tool must run with its expected input,
+      // and the runner must return the derived reply byte-for-byte.
+      const toolResultSentinel = 'TOOL_RESULT_SENTINEL_7f3a9c';
+      const toolInput = { query: 'collar' };
+      const searchCatalog = jest.fn((input: { query: string }) => ({
+        echo: `${input.query}:${toolResultSentinel}`,
+      }));
+      tools.getTools.mockReturnValue({ searchCatalog });
+
+      let observedSentinel: string | undefined;
+      llm.run.mockImplementation(async (input) => {
+        const tool = input.tools.searchCatalog as (args: { query: string }) => {
+          echo: string;
+        };
+        // Single tool-derived result construction, owned by the port mock.
+        const result = tool(toolInput);
+        observedSentinel = result.echo;
+        return {
+          reply: `respuesta:${result.echo}`,
+          messages: [
+            { role: 'user', content: 'nueva' },
+            { role: 'assistant', content: `respuesta:${result.echo}` },
+          ],
+          usage: { promptTokens: 1, completionTokens: 1 },
+        };
+      });
+
       const stored = existingState({
         lastMessageAt: new Date(Date.now() - TEN_S_MS).toISOString(),
         turns: 10, // way more than the 4 cap
       });
       store.get.mockResolvedValue(stored);
       store.update.mockResolvedValue(stored);
-      llm.run.mockResolvedValue({
-        reply: 'ok',
-        messages: stored.data.messages!.slice(-4).concat([
-          { role: 'user', content: 'nueva' },
-          { role: 'assistant', content: 'ok' },
-        ]),
-        usage: { promptTokens: 1, completionTokens: 1 },
+
+      const result = await runner.handle({
+        senderId: '5215550001111',
+        text: 'nueva',
       });
 
-      await runner.handle({ senderId: '5215550001111', text: 'nueva' });
-
-      const llmInput = llm.run.mock.calls[0][0] as { history: AgentMessage[] };
+      const llmInput = llm.run.mock.calls[0][0] as {
+        history: AgentMessage[];
+        tools: Record<string, unknown>;
+      };
       // Runner truncated in-memory: only last 4 turns passed.
       expect(llmInput.history).toHaveLength(4);
 
       // Store keeps ALL 10 turns (dumb upsert bag).
       expect(stored.data.messages).toHaveLength(10);
+
+      // The exact tool set reached the port and the expected tool executed.
+      expect(Object.keys(llmInput.tools)).toEqual(['searchCatalog']);
+      expect(llmInput.tools.searchCatalog).toBe(searchCatalog);
+      expect(searchCatalog).toHaveBeenCalledTimes(1);
+      expect(searchCatalog).toHaveBeenCalledWith(toolInput);
+      // The port mock observed the distinct tool-result sentinel.
+      expect(observedSentinel).toBe('collar:TOOL_RESULT_SENTINEL_7f3a9c');
+      // The runner returned the port-derived reply byte-for-byte.
+      expect(result.reply).toBe('respuesta:collar:TOOL_RESULT_SENTINEL_7f3a9c');
     });
 
     it('passes getCurrentTime tools from the registry to the SDK', async () => {

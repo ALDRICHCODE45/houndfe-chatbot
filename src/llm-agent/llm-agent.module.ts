@@ -8,7 +8,7 @@ import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
-import { TOOL_REGISTRY } from './domain/tool-registry.port';
+import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
 import {
   GENERATE_TEXT,
   generateTextImpl,
@@ -16,6 +16,24 @@ import {
 } from './infrastructure/generate-text.provider';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
 import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instructions';
+
+/**
+ * Fail-closed probe for the SQ-5C3d2 boot-time availability binding.
+ *
+ * Returns `true` only when the real registry exposes `getShippingQuote` as
+ * an OWN key of the ToolSet — an inherited key, a non-object `getTools()`
+ * result, a throwing `getTools`, and a hostile proxy that throws on
+ * property inspection all resolve to `false`.
+ */
+function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
+  try {
+    const tools = registry.getTools();
+    if (tools === null || typeof tools !== 'object') return false;
+    return Object.hasOwn(tools, 'getShippingQuote');
+  } catch {
+    return false;
+  }
+}
 
 /**
  * LlmAgentModule
@@ -30,9 +48,15 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
  *
  * Q1 / R11: bank details no longer flow through a boot-time seam. The
  * runtime `getPaymentDetails` AI-SDK tool (registered by RealToolRegistry)
- * is the source of truth. `LLM_AGENT_SYSTEM_PROMPT` collapses to a sync
- * `useFactory: () => composeSaleFlowSystemPrompt(SYSTEM_PROMPT)` with no
- * `await` and no `inject`.
+ * is the source of truth. `LLM_AGENT_SYSTEM_PROMPT` is still a sync
+ * `useFactory`, now injecting the TOOL_REGISTRY seam.
+ *
+ * SQ-5C3d2: the `shippingQuoteAvailable` flag is derived at boot from the
+ * ACTUAL registered tool key, never from env alone. The factory injects
+ * TOOL_REGISTRY (already `useExisting: RealToolRegistry` from SaleFlowModule,
+ * no DI cycle) and appends the opt-in shipping fragment only when the
+ * registry owns `getShippingQuote`. Default-off composes the exact
+ * byte-identical `base + '\n\n' + slice`.
  *
  * SaleFlowModule is imported so RealToolRegistry is reachable.
  * ChatbotApiModule is imported for parity (CHATBOT_API_CLIENT is injected
@@ -70,8 +94,17 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
       // AgentRunner injects the resolved string and never overrides it
       // per turn. The boot-time bank-details seam is gone — the runtime
       // `getPaymentDetails` tool is the source of truth.
+      //
+      // SQ-5C3d2: shipping availability is derived from the registered
+      // tool key (fail-closed on inherited/hostile registries), so the
+      // opt-in fragment is appended only when `getShippingQuote` is
+      // actually wired.
       provide: LLM_AGENT_SYSTEM_PROMPT,
-      useFactory: () => composeSaleFlowSystemPrompt(SYSTEM_PROMPT),
+      inject: [TOOL_REGISTRY],
+      useFactory: (registry: ToolRegistry) =>
+        composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
+          shippingQuoteAvailable: registryOwnsShippingQuote(registry),
+        }),
     },
     {
       provide: CostGuardService,

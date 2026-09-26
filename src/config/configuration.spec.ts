@@ -46,10 +46,24 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_CONCURRENCY',
     'RECEIPT_MEDIA_WORKER_LEASE_MS',
     'RECEIPT_MEDIA_WORKER_POLL_MS',
+    'RECEIPT_MEDIA_INGESTION_ENABLED',
     'RECEIPT_MEDIA_METRICS_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
     // WU2A experimental human-decisions gate
     'HUMAN_DECISIONS_RESTOCK_ENABLED',
+    'META_SANDBOX_RECIPIENT_NORMALIZATION',
+    'OPS_CHANNEL_PHONE',
+    // SQ-2A shipping quotes
+    'SHIPPING_QUOTES_ENABLED',
+    'SKYDROPX_BASE_URL',
+    'SKYDROPX_CLIENT_ID',
+    'SKYDROPX_CLIENT_SECRET',
+    'SKYDROPX_ORIGIN_POSTAL_CODE',
+    'SKYDROPX_ORIGIN_STATE',
+    'SKYDROPX_ORIGIN_MUNICIPALITY',
+    'SKYDROPX_ORIGIN_NEIGHBORHOOD',
+    // SQ-5B2A private measured-demo profile passthrough
+    'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
   ];
 
   beforeEach(() => {
@@ -95,6 +109,32 @@ describe('configuration()', () => {
     expect(cfg.database.poolMax).toBe(12);
   });
 
+  it.each([
+    [undefined, false],
+    ['true', true],
+    ['false', false],
+    ['TRUE', false],
+  ])('maps META_SANDBOX_RECIPIENT_NORMALIZATION=%s', (env, expected) => {
+    if (env === undefined) {
+      delete process.env.META_SANDBOX_RECIPIENT_NORMALIZATION;
+    } else {
+      process.env.META_SANDBOX_RECIPIENT_NORMALIZATION = env;
+    }
+    const cfg = configuration() as unknown as {
+      meta: { sandboxRecipientNormalizationEnabled: boolean };
+    };
+    expect(cfg.meta.sandboxRecipientNormalizationEnabled).toBe(expected);
+  });
+
+  // MVP-1: the ops wa_id is retained verbatim; no boot-time rewrite.
+  it('retains humanHandoff.opsChannelPhone exactly as supplied', () => {
+    process.env.OPS_CHANNEL_PHONE = '5219999888777';
+    const cfg = configuration() as unknown as {
+      humanHandoff: { opsChannelPhone?: string };
+    };
+    expect(cfg.humanHandoff.opsChannelPhone).toBe('5219999888777');
+  });
+
   // Task 1.3/1.4: cashierUserId surfaces on chatbotApi
   it('exposes chatbotApi.cashashierUserId from CHATBOT_API_CASHIER_USER_ID', () => {
     const uuid = '00000000-0000-4000-8000-000000000001';
@@ -137,6 +177,26 @@ describe('configuration()', () => {
       expect(cfg.receiptMedia.worker.concurrency).toBe(2);
       expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
       expect(cfg.receiptMedia.metricsEnabled).toBe(false);
+    });
+
+    // R3-cleanup-rollout-gate: the ingestion rollout gate is surfaced as
+    // `receiptMedia.worker.enabled` and is fail-closed: only the exact string
+    // 'true' enables it; omitted, 'false', and any other casing stay false.
+    it.each([
+      { env: undefined, expected: false, label: 'omitted defaults false' },
+      { env: 'false', expected: false, label: 'explicit false' },
+      { env: 'TRUE', expected: false, label: 'non-exact casing stays false' },
+      { env: 'true', expected: true, label: 'exact true enables' },
+    ])('exposes worker.enabled: $label', ({ env, expected }) => {
+      if (env === undefined) {
+        delete process.env.RECEIPT_MEDIA_INGESTION_ENABLED;
+      } else {
+        process.env.RECEIPT_MEDIA_INGESTION_ENABLED = env;
+      }
+      const cfg = configuration() as unknown as {
+        receiptMedia: { worker: { enabled: boolean } };
+      };
+      expect(cfg.receiptMedia.worker.enabled).toBe(expected);
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia
@@ -227,6 +287,121 @@ describe('configuration()', () => {
     it('is true only for the exact env string "true"', () => {
       process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
       expect(restockEnabled()).toBe(true);
+    });
+  });
+
+  // SQ-2A: default-off shipping quotes; only exact 'true' enables the feature.
+  describe('shippingQuotes', () => {
+    type Shipping = {
+      shippingQuotes: {
+        enabled: boolean;
+        skydropx: Record<string, string | undefined>;
+        measuredDemoParcelProfileJson?: string;
+      };
+    };
+    const shipping = () => (configuration() as Shipping).shippingQuotes;
+
+    it('returns the typed default-off subtree when SHIPPING_QUOTES_ENABLED is absent', () => {
+      delete process.env.SHIPPING_QUOTES_ENABLED;
+      expect(shipping()).toEqual({
+        enabled: false,
+        skydropx: {
+          baseUrl: 'https://api-pro.skydropx.com',
+          clientId: undefined,
+          clientSecret: undefined,
+          originPostalCode: undefined,
+          originState: undefined,
+          originMunicipality: undefined,
+          originNeighborhood: undefined,
+        },
+      });
+    });
+
+    it.each([
+      [undefined, false],
+      ['true', true],
+      ['false', false],
+      ['TRUE', false],
+      ['False', false],
+      ['1', false],
+      [' true ', false],
+    ])('maps SHIPPING_QUOTES_ENABLED=%s', (env, expected) => {
+      if (env === undefined) {
+        delete process.env.SHIPPING_QUOTES_ENABLED;
+      } else {
+        process.env.SHIPPING_QUOTES_ENABLED = env;
+      }
+      expect(shipping().enabled).toBe(expected);
+    });
+
+    it('passes raw Skydropx provider env values through the factory', () => {
+      process.env.SHIPPING_QUOTES_ENABLED = 'true';
+      process.env.SKYDROPX_BASE_URL = 'https://sandbox.skydropx.test';
+      process.env.SKYDROPX_CLIENT_ID = 'client-id-raw';
+      process.env.SKYDROPX_CLIENT_SECRET = 'client-secret-raw';
+      process.env.SKYDROPX_ORIGIN_POSTAL_CODE = '06000';
+      process.env.SKYDROPX_ORIGIN_STATE = 'CDMX';
+      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = 'Cuauhtemoc';
+      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = 'Centro';
+      expect(shipping()).toEqual({
+        enabled: true,
+        skydropx: {
+          baseUrl: 'https://sandbox.skydropx.test',
+          clientId: 'client-id-raw',
+          clientSecret: 'client-secret-raw',
+          originPostalCode: '06000',
+          originState: 'CDMX',
+          originMunicipality: 'Cuauhtemoc',
+          originNeighborhood: 'Centro',
+        },
+      });
+    });
+
+    // SQ-2A-H: accepted surrounding whitespace is normalized in the factory so
+    // ConfigService sees the same trimmed values that Joi validated.
+    it('trims surrounding whitespace on provider values', () => {
+      process.env.SHIPPING_QUOTES_ENABLED = 'true';
+      process.env.SKYDROPX_BASE_URL = '  https://sandbox.skydropx.test  ';
+      process.env.SKYDROPX_CLIENT_ID = '  client-id  ';
+      process.env.SKYDROPX_CLIENT_SECRET = '  client-secret  ';
+      process.env.SKYDROPX_ORIGIN_POSTAL_CODE = ' 06000 ';
+      process.env.SKYDROPX_ORIGIN_STATE = '  CDMX  ';
+      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = '  Cuauhtemoc  ';
+      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = '  Centro  ';
+      expect(shipping()).toEqual({
+        enabled: true,
+        skydropx: {
+          baseUrl: 'https://sandbox.skydropx.test',
+          clientId: 'client-id',
+          clientSecret: 'client-secret',
+          originPostalCode: '06000',
+          originState: 'CDMX',
+          originMunicipality: 'Cuauhtemoc',
+          originNeighborhood: 'Centro',
+        },
+      });
+    });
+
+    // SQ-5B2A: optional private measured-demo profile JSON is a raw string
+    // passthrough; the factory never parses it and blanks become undefined.
+    it.each([undefined, '', '   ', '\n\t '])(
+      'maps absent or blank SHIPPING_DEMO_PARCEL_PROFILE_JSON=%# to undefined',
+      (env) => {
+        if (env === undefined) {
+          delete process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON;
+        } else {
+          process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON = env;
+        }
+        expect(shipping().measuredDemoParcelProfileJson).toBeUndefined();
+      },
+    );
+
+    it('preserves a bounded raw JSON string after outer trim without parsing it', () => {
+      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON =
+        '  {"version":1,"items":[]}  ';
+      expect(shipping().measuredDemoParcelProfileJson).toBe(
+        '{"version":1,"items":[]}',
+      );
     });
   });
 });

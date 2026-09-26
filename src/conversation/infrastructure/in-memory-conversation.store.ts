@@ -5,6 +5,8 @@ import {
   ConversationStore,
   isNonEmptyString,
   isPendingHumanRequest,
+  isStructuralPendingHumanRequest,
+  isPendingHumanRequestId,
   isReceiptAmountPointer,
   PendingHumanRequest,
   ReceiptAmountPointer,
@@ -30,7 +32,7 @@ export class InMemoryConversationStore implements ConversationStore {
     if (
       !isNonEmptyString(senderId) ||
       !isNonEmptyString(lastMessageAt) ||
-      !isPendingHumanRequest(marker)
+      !isStructuralPendingHumanRequest(marker)
     ) {
       return false;
     }
@@ -45,7 +47,7 @@ export class InMemoryConversationStore implements ConversationStore {
     if (state && Object.hasOwn(state.data, 'pendingHumanRequest')) {
       const current = state.data.pendingHumanRequest;
       const same =
-        isPendingHumanRequest(current) &&
+        isStructuralPendingHumanRequest(current) &&
         current.requestId === copy.requestId &&
         current.ref === copy.ref &&
         current.createdAt === copy.createdAt &&
@@ -65,11 +67,25 @@ export class InMemoryConversationStore implements ConversationStore {
     return true;
   }
 
-  async clearPendingHumanRequest(
+  clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+  ): Promise<boolean>;
+  clearPendingHumanRequest(
     senderId: string,
     requestId: string,
     lastMessageAt: string,
+  ): Promise<boolean>;
+  async clearPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+    lastMessageAt?: string,
   ): Promise<boolean> {
+    // Only omission selects canonical timestamp-preserving clear. Explicitly
+    // invalid third arguments must fail the legacy validation below.
+    if (arguments.length === 2) {
+      return this.clearCanonicalPendingHumanRequest(senderId, requestId);
+    }
     if (
       !isNonEmptyString(senderId) ||
       !isNonEmptyString(requestId) ||
@@ -82,7 +98,7 @@ export class InMemoryConversationStore implements ConversationStore {
     if (
       !state ||
       !Object.hasOwn(state.data, 'pendingHumanRequest') ||
-      !isPendingHumanRequest(current) ||
+      !isStructuralPendingHumanRequest(current) ||
       current.requestId !== requestId
     ) {
       return false;
@@ -145,6 +161,27 @@ export class InMemoryConversationStore implements ConversationStore {
 
   async get(senderId: string): Promise<ConversationState | null> {
     return this.map.get(senderId) ?? null;
+  }
+
+  private async clearCanonicalPendingHumanRequest(
+    senderId: string,
+    requestId: string,
+  ): Promise<boolean> {
+    const state = this.map.get(senderId);
+    const current = state?.data.pendingHumanRequest;
+    if (
+      typeof senderId !== 'string' ||
+      senderId.length === 0 ||
+      !isPendingHumanRequestId(requestId) ||
+      !state ||
+      !Object.hasOwn(state.data, 'pendingHumanRequest') ||
+      !isPendingHumanRequest(current) ||
+      current.requestId !== requestId
+    ) {
+      return false;
+    }
+    state.data = { ...state.data, pendingHumanRequest: null };
+    return true;
   }
 
   async create(

@@ -6,7 +6,35 @@ import { mapChatbotError } from '../error-mapping';
 import { persistCart } from '../cart-persistence';
 import { persistConfirmedSale } from '../placed-sale-persistence';
 import { readCart, writeCart, type CartState } from '../../domain/cart-state';
+import type { ConversationState } from '../../../conversation/domain/conversation-store';
 import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
+import { snapshotShippingSaleState } from '../shipping-sale-gate';
+import {
+  evaluateShippingSaleRevalidation,
+  type ShippingSaleChargedVerdict,
+} from '../shipping-sale-revalidation';
+import { resolveShippingSaleDestination } from '../shipping-sale-destination';
+import { bindShippingPromoReQuote } from '../shipping-promo-requote';
+
+/** Finite, price-free fail-closed envelope shared by every guarded branch. */
+const SHIPPING_UNPERSISTABLE = Object.freeze({
+  ok: false as const,
+  error: { kind: 'shippingUnpersistable' as const, retryable: false },
+});
+
+const canonicalUuidEqual = (a: string, b: string): boolean =>
+  a.toLowerCase() === b.toLowerCase();
+
+/** One clock read; invalid/hostile values become `NaN`, so the verdict fails
+ *  closed for any shipping marker (a marker-free snapshot ignores it). */
+const readClock = (now: () => number): number => {
+  try {
+    const value = now();
+    return Number.isSafeInteger(value) && value >= 0 ? value : Number.NaN;
+  } catch {
+    return Number.NaN;
+  }
+};
 
 /**
  * createSale — AI-SDK tool factory.
@@ -24,21 +52,29 @@ import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
  *      - First attempt: mint + persist on cart.
  *      - Retry within the session: reuse the persisted key.
  *      - Success: clear the cart (items + key + expectedTotalCents).
- *      - PROMO_RE_QUOTE: clear the key (payload changed) AND replace
- *        `expectedTotalCents` with the backend's `recomputedTotalCents`
- *        so the next customer-acceptance call (a fresh UUID + the
- *        recomputed total on the wire) cannot loop on the stale total.
- *        Items are preserved. When the PROMO_RE_QUOTE body is malformed
- *        (any of `recomputedTotalCents`, `expectedTotalCents`, or
- *        `discountCents` is missing or not a non-negative integer — the
- *        same shape `mapChatbotError`'s `readPromoPayload` validates)
- *        the cart does NOT adopt a fabricated value — items + prior
- *        `expectedTotalCents` stay intact, only the key is cleared
- *        (R-D2 / ADR-5: never invent totals). The durable replacement
- *        happens ONLY when the SAME mapped result returned to the
- *        caller is `{error.kind:'promoReQuote', ...}` from the canonical
- *        parser — state mutation and returned envelope can never
- *        disagree.
+ *      - PROMO_RE_QUOTE (ordinary, no shipping marker): clear the key
+ *        (payload changed) AND replace `expectedTotalCents` with the
+ *        backend's `recomputedTotalCents` so the next customer-acceptance
+ *        call (a fresh UUID + the recomputed total on the wire) cannot
+ *        loop on the stale total. Items are preserved. When the
+ *        PROMO_RE_QUOTE body is malformed (any of `recomputedTotalCents`,
+ *        `expectedTotalCents`, or `discountCents` is missing or not a
+ *        non-negative integer — the same shape `mapChatbotError`'s
+ *        `readPromoPayload` validates) the cart does NOT adopt a
+ *        fabricated value — items + prior `expectedTotalCents` stay
+ *        intact, only the key is cleared (R-D2 / ADR-5: never invent
+ *        totals). The durable replacement happens ONLY when the SAME
+ *        mapped result returned to the caller is
+ *        `{error.kind:'promoReQuote', ...}` from the canonical parser —
+ *        state mutation and returned envelope can never disagree.
+ *      - PROMO_RE_QUOTE (charged sale): `bindShippingPromoReQuote(result,
+ *        err.responseBody, charged)` must agree (mapped + raw + pinned)
+ *        before persisting. Only a `merchandise_remainder` writes
+ *        `expectedTotalCents = recomputedTotalCents - freight` (freight
+ *        subtracted once), clears the key, and returns the canonical
+ *        `promoReQuote` for fresh customer acceptance; a `blocked` binding
+ *        clears only the key, preserves prior merchandise, and returns
+ *        price-free `shippingUnpersistable`.
  *      - IDEMPOTENCY_KEY_CONFLICT: clear the key (the key is poisoned);
  *        preserve items + the current `expectedTotalCents` (the conflict
  *        is unrelated to the total).
@@ -82,7 +118,10 @@ import { ChatbotApiError } from '../../../chatbot-api/domain/errors';
  * `contextSchema: { senderId }` is the per-tool runtime seam; the
  * sender id never enters the prompt.
  */
-export function makeCreateSaleTool(deps: ToolDeps) {
+export function makeCreateSaleTool(
+  deps: ToolDeps,
+  now: () => number = Date.now,
+) {
   return tool({
     description:
       'Registra la venta. Envía expectedTotalCents desde el carrito (NO desde el modelo). Usa una UUID v4 como X-Idempotency-Key (generada la primera vez, reusada en retries, rotada en promoReQuote/conflict, preservada en in-flight, limpiada en éxito). El cashierUserId se inyecta del servidor.',
@@ -106,8 +145,58 @@ export function makeCreateSaleTool(deps: ToolDeps) {
     execute: async (input, options) => {
       const senderId = options.context.senderId;
 
-      // 1) Load cart from the durable store.
-      const state = await deps.store.get(senderId);
+      // 1) Load the sender state from the durable store.
+      const storedState = await deps.store.get(senderId);
+
+      // E4-2a: ONE validated `state.data` snapshot drives the marker decision,
+      // verdict, cart read, and persistence; a charged verdict is the only
+      // marker-bearing path that may register a sale.
+      const snapshot = snapshotShippingSaleState(storedState);
+      if (snapshot.kind !== 'snapshot') {
+        return SHIPPING_UNPERSISTABLE;
+      }
+      const data = snapshot.data;
+      const state: ConversationState | null =
+        storedState === null || data === null
+          ? null
+          : {
+              senderId: storedState.senderId,
+              lastMessageAt: storedState.lastMessageAt,
+              data,
+            };
+
+      const verdict = evaluateShippingSaleRevalidation(data, readClock(now));
+      if (verdict.kind === 'blocked') {
+        return SHIPPING_UNPERSISTABLE;
+      }
+      const charged: ShippingSaleChargedVerdict | null =
+        verdict.kind === 'charged' ? verdict : null;
+
+      // Charged sales: the model never chooses identity, address, or money;
+      // drift and a stale/absent lookup fail closed before key/store/HTTP.
+      if (charged !== null) {
+        if (!canonicalUuidEqual(input.customerId, charged.customerId)) {
+          return SHIPPING_UNPERSISTABLE;
+        }
+        if (
+          input.shippingAddressId != null &&
+          !canonicalUuidEqual(
+            input.shippingAddressId,
+            charged.shippingAddressId,
+          )
+        ) {
+          return SHIPPING_UNPERSISTABLE;
+        }
+        const destination = await resolveShippingSaleDestination(
+          senderId,
+          charged,
+          deps.chatbotApi,
+        );
+        if (destination.kind !== 'match') {
+          return SHIPPING_UNPERSISTABLE;
+        }
+      }
+
       const cart = readCart(state);
 
       // 2) Empty-cart guard.
@@ -164,17 +253,27 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         });
       }
 
-      // 5) Outgoing DTO — cashierUserId is injected from deps; the
-      //    top-level `expectedTotalCents` is forwarded only when the
-      //    persisted cart carries it (legacy carts omit the key).
+      // 5) Outgoing DTO — a charged sale takes identity, address, freight,
+      //    and the freight-inclusive total solely from the pinned verdict; an
+      //    ordinary sale forwards the cart total only when present.
       const dto: Parameters<typeof deps.chatbotApi.createSale>[0] = {
         cashierUserId: deps.cashierUserId,
-        customerId: input.customerId,
-        shippingAddressId: input.shippingAddressId ?? null,
+        customerId: charged?.customerId ?? input.customerId,
+        shippingAddressId:
+          charged?.shippingAddressId ?? input.shippingAddressId ?? null,
+        ...(charged !== null
+          ? {
+              shipping: {
+                chargeCents: charged.chargeCents,
+                approvalId: charged.approvalId,
+                quoteId: charged.quoteId,
+              },
+              expectedTotalCents: charged.expectedTotalCents,
+            }
+          : cart.expectedTotalCents !== undefined
+            ? { expectedTotalCents: cart.expectedTotalCents }
+            : {}),
         items,
-        ...(cart.expectedTotalCents !== undefined
-          ? { expectedTotalCents: cart.expectedTotalCents }
-          : {}),
       };
 
       try {
@@ -190,12 +289,11 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         // drive BOTH the cart mutation AND the returned envelope from
         // the SAME result. State mutation and envelope MUST agree: a
         // durable `expectedTotalCents` replacement only happens when the
-        // mapper accepted the payload and returned a `promoReQuote`
-        // envelope. For every other error kind (including a malformed
-        // PROMO_RE_QUOTE body the mapper rejects) we never invent a
-        // total — items + prior `expectedTotalCents` stay intact and
-        // only the `idempotencyKey` is cleared when the key is unsafe
-        // to reuse (R-D2 / ADR-5).
+        // canonical payload was accepted (an ordinary `promoReQuote`
+        // envelope, or the charged freight binding below). For every
+        // other error kind we never invent a total — items + prior
+        // `expectedTotalCents` stay intact and only the `idempotencyKey`
+        // is cleared when the key is unsafe to reuse (R-D2 / ADR-5).
         //
         // The mapper rethrows non-ChatbotApiError; assigning its result
         // never completes in that case, so the cart-switch below is
@@ -204,6 +302,31 @@ export function makeCreateSaleTool(deps: ToolDeps) {
         if (err instanceof ChatbotApiError) {
           switch (err.errorCode) {
             case 'PROMO_RE_QUOTE':
+              if (charged !== null) {
+                // E4-2b2: the recomputed total already includes the pinned
+                // freight. Bind the canonical result, raw body, and
+                // server-owned pin; only agreement persists the merchandise
+                // remainder. A blocked binding clears the key but preserves
+                // the prior merchandise total.
+                const binding = bindShippingPromoReQuote(
+                  result,
+                  err.responseBody,
+                  charged,
+                );
+                if (binding.kind === 'merchandise_remainder') {
+                  await persistCart(deps.store, senderId, state, {
+                    ...cart,
+                    idempotencyKey: '',
+                    expectedTotalCents: binding.merchandiseTotalCents,
+                  });
+                  return result;
+                }
+                await persistCart(deps.store, senderId, state, {
+                  ...cart,
+                  idempotencyKey: '',
+                });
+                return SHIPPING_UNPERSISTABLE;
+              }
               if (result.error.kind === 'promoReQuote') {
                 // Backend rejected the stale total and the payload was
                 // well-formed: persist the recomputed total so the

@@ -21,6 +21,7 @@ import {
   type ReceiptIngressStore,
 } from '../../receipt-media/application/receipt-ingress.service';
 import type {
+  ActiveSenderIdentity,
   ReservationOutcome,
   ReserveInput,
 } from '../../receipt-media/domain/receipt-media-store.port';
@@ -88,6 +89,11 @@ class AdmissionProbe implements ReceiptIngressStore {
     gate.admitted.resolve();
     await gate.release.promise;
     return outcome;
+  }
+
+  // ODD-4C transparent delegation: no behavior added to the identity-aware lookup.
+  findActiveBySender(input: ActiveSenderIdentity) {
+    return this.store.findActiveBySender(input);
   }
 }
 

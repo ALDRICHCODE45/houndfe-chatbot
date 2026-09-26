@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
@@ -13,7 +13,17 @@ import {
   SHARED_ROUTE_MARKERS,
   type SharedRouteMarkersPort,
 } from '../../human-decisions/domain/shared-route-markers';
+import {
+  HUMAN_HANDOFF_STORE,
+  type HumanHandoffStore,
+} from '../../human-handoff/domain/human-handoff-store.port';
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
+import { requestShippingApproval } from '../../shipping/application/shipping-approval-request';
+import { ShippingQuoteOrchestrator } from '../../shipping/application/shipping-quote-orchestrator';
+import {
+  MEASURED_DEMO_SHIPPING_CONFIG,
+  type MeasuredDemoShippingConfig,
+} from '../../shipping/application/measured-demo-shipping-config';
 import type { ToolDeps } from '../application/tool-deps';
 import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
 import { makeCancelSaleTool } from '../application/tools/cancel-sale.tool';
@@ -22,6 +32,8 @@ import { makeCreateSaleTool } from '../application/tools/create-sale.tool';
 import { makeEvaluateCartTool } from '../application/tools/evaluate-cart.tool';
 import { makeGetCustomerByPhoneTool } from '../application/tools/get-customer-by-phone.tool';
 import { makeGetOrderHistoryTool } from '../application/tools/get-order-history.tool';
+// prettier-ignore
+import { makeGetShippingQuoteTool } from '../application/tools/get-shipping-quote.tool';
 import { makeGetPaymentDetailsTool } from '../application/tools/get-payment-details.tool';
 import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import { makeSearchCatalogTool } from '../application/tools/search-catalog.tool';
@@ -53,6 +65,23 @@ export const HUMAN_HANDOFF_SERVICE_TOKEN = Symbol('HUMAN_HANDOFF_SERVICE');
  * factory-instantiated with NO deps — it is a terminal compatibility tool
  * (strict `{}` schema, zero backend attachment calls; the server-owned
  * `ReceiptAttachmentService` is the sole §4.4.7 attachment path).
+ *
+ * `ShippingQuoteOrchestrator` is injected as an OPTIONAL dependency (SQ-5A):
+ * the default-off `ShippingModule` only exports it when shipping quotes are
+ * enabled, so the parameter defaults to `null` and the registry keeps its
+ * exact twelve-tool inventory in both states.
+ *
+ * `MEASURED_DEMO_SHIPPING_CONFIG` is likewise injected as an OPTIONAL
+ * dependency (SQ-5B2B3) with a `null` default. The price-stripped
+ * `getShippingQuote` tool is registered as the 13th key ONLY when BOTH the
+ * orchestrator and the measured demo config are present; each alone (or
+ * neither) keeps the exact twelve-tool inventory.
+ *
+ * `HUMAN_HANDOFF_STORE` (SQ-5C3c2) is also OPTIONAL with a `null` default.
+ * In the enabled state it is passed to the quote tool through the committed
+ * `requestShippingApproval` wrapper so the server-owned approval lifecycle
+ * runs; when absent the tool still registers but its approval seam is
+ * undefined, failing closed with a price-free `approval_unavailable`.
  */
 @Injectable()
 export class RealToolRegistry implements ToolRegistry {
@@ -66,6 +95,15 @@ export class RealToolRegistry implements ToolRegistry {
     @Inject(SHARED_ROUTE_MARKERS) markers: SharedRouteMarkersPort,
     @Inject(RESTOCK_INTAKE_SERVICE) coordinator: RestockIntakeService,
     configService: ConfigService,
+    @Optional()
+    @Inject(ShippingQuoteOrchestrator)
+    private readonly shippingQuoteOrchestrator: ShippingQuoteOrchestrator | null = null,
+    @Optional()
+    @Inject(MEASURED_DEMO_SHIPPING_CONFIG)
+    private readonly measuredDemoShippingConfig: MeasuredDemoShippingConfig | null = null,
+    @Optional()
+    @Inject(HUMAN_HANDOFF_STORE)
+    private readonly humanHandoffStore: HumanHandoffStore | null = null,
   ) {
     const cashierUserId = configService.get<string>(
       'chatbotApi.cashierUserId',
@@ -86,7 +124,7 @@ export class RealToolRegistry implements ToolRegistry {
       deps.restock = { enabled: true, markers, coordinator };
     }
 
-    this.tools = {
+    const tools: Record<string, unknown> = {
       searchCatalog: makeSearchCatalogTool(deps),
       checkStock: makeCheckStockTool(deps),
       evaluateCart: makeEvaluateCartTool(deps),
@@ -103,6 +141,41 @@ export class RealToolRegistry implements ToolRegistry {
       cancelSale: makeCancelSaleTool(deps),
       requestHumanAssistance: makeRequestHumanAssistanceTool(deps),
     };
+
+    // SQ-5B2B3: register the price-stripped shipping-quote tool ONLY when
+    // BOTH the shipping orchestrator and the measured demo config are
+    // present. Every other combination keeps the exact twelve-tool set.
+    if (
+      this.shippingQuoteOrchestrator !== null &&
+      this.measuredDemoShippingConfig !== null
+    ) {
+      // SQ-5C3c2: only in the enabled condition does the registry pass the
+      // committed server-owned approval lifecycle. A missing row store leaves
+      // the seam undefined so the tool registers yet fails closed with a
+      // price-free `approval_unavailable`, never a success.
+      const handoffRows = this.humanHandoffStore;
+      tools.getShippingQuote = makeGetShippingQuoteTool({
+        chatbotApi: deps.chatbotApi,
+        store: deps.store,
+        shippingQuoteOrchestrator: this.shippingQuoteOrchestrator,
+        measuredDemoConfig: this.measuredDemoShippingConfig,
+        requestShippingApproval:
+          handoffRows === null
+            ? undefined
+            : (senderId: string) =>
+                requestShippingApproval(
+                  {
+                    conversationStore: store,
+                    handoffCreator: humanHandoffService,
+                    handoffRows,
+                    now: Date.now,
+                  },
+                  senderId,
+                ),
+      });
+    }
+
+    this.tools = tools;
   }
 
   getTools(): Record<string, unknown> {

@@ -30,6 +30,7 @@ describe('ConversationModule binding', () => {
     'CHATBOT_API_BASE_URL',
     'SERVICE_KEY',
     'CHATBOT_API_BRANCH_ID',
+    'CHATBOT_API_CASHIER_USER_ID',
     'OPENAI_API_KEY',
     'LLM_MODEL',
     'DATABASE_URL',
@@ -69,7 +70,11 @@ describe('ConversationModule binding', () => {
 
   it('resolves CONVERSATION_STORE to PostgresConversationStore (not in-memory)', async () => {
     const moduleRef = await Test.createTestingModule({
-      imports: [AppConfigModule.forRoot(), DatabaseModule, ConversationModule],
+      imports: [
+        AppConfigModule.forRoot({ ignoreEnvFile: true }),
+        DatabaseModule,
+        ConversationModule,
+      ],
     })
       .overrideProvider(PG_POOL)
       .useValue({
