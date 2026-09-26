@@ -113,6 +113,72 @@ describe('sale-flow-instructions', () => {
     });
   });
 
+  describe('grounded catalog guidance (contract presence, not model compliance)', () => {
+    const steps = SALE_FLOW_INSTRUCTIONS.slice(
+      SALE_FLOW_INSTRUCTIONS.indexOf('\n2. '),
+      SALE_FLOW_INSTRUCTIONS.indexOf('\n6. '),
+    );
+
+    it('searches a supplied main name before asking generic questions', () => {
+      expect(steps).toContain('nombre principal');
+      expect(steps).toContain('sin volver a preguntar qué producto busca');
+      expect(steps).toContain('dosis y forma');
+      expect(steps).toContain('Nunca sustituyas dosis ni presentaciones');
+    });
+
+    it('presents actual candidates, including unavailable ones, for confirmation', () => {
+      expect(steps).toContain('incluidos los agotados');
+      expect(steps).toContain('nombre, presentación y precio devueltos');
+      expect(steps).toContain('confirma la presentación real');
+    });
+
+    it('bounds empty-result refinement to one distinct broader query', () => {
+      expect(steps).toContain(
+        '`ok: true, results: []` significa sin coincidencias, no agotado',
+      );
+      expect(steps).toContain('como máximo una búsqueda adicional');
+      expect(steps).toContain('consulta distinta con un nombre más general');
+      expect(steps).toContain('solo si la inicial fue demasiado específica');
+      expect(steps).toContain('No repitas consultas idénticas');
+      expect(steps).toContain('pide una aclaración concreta');
+    });
+
+    it('separates errors from misses and shortage without extra model retries', () => {
+      expect(steps).toContain('`ok: false` significa que no se pudo consultar');
+      expect(steps).toContain(
+        'no equivale a cero coincidencias ni a falta de stock',
+      );
+      expect(steps).toContain('No reintentes automáticamente por error');
+      expect(steps).toContain('aunque `retryable: true`');
+    });
+
+    it('recovers missing identities by search, never by reconstructing names', () => {
+      expect(steps).toContain('IDs reales devueltos por herramientas');
+      expect(steps).toContain('Si en un turno posterior no tienes esos IDs');
+      expect(steps).toContain('vuelve a buscar con `searchCatalog`');
+      expect(steps).toContain('Nunca reconstruyas IDs desde nombres');
+    });
+
+    it('requires validated shortage before RESTOCK and keeps supported inquiries in scope', () => {
+      expect(steps).toContain(
+        'SOLO el sobre de `checkStock` con `humanAssistance`',
+      );
+      expect(steps).toContain(
+        "`kind: 'out_of_stock'` habilita la ruta RESTOCK",
+      );
+      expect(steps).toContain(
+        'No la actives por resultados vacíos, errores ni por el estado del catálogo',
+      );
+      expect(steps).toContain(
+        'Las consultas de catálogo, existencias y reposición sí están cubiertas',
+      );
+      expect(steps).toContain(
+        'no uses "esa función aún no está disponible" por una búsqueda sin coincidencias',
+      );
+      expect(steps).toContain('Nunca inventes una fecha de reposición');
+    });
+  });
+
   describe('composeSaleFlowSystemPrompt', () => {
     it('returns base + "\\n\\n" + slice (one-arg composer)', () => {
       expect(composeSaleFlowSystemPrompt(base)).toBe(

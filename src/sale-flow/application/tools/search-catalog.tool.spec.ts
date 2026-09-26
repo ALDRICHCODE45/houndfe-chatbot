@@ -26,6 +26,39 @@ describe('makeSearchCatalogTool', () => {
     humanHandoffService: {} as never,
   };
 
+  it('guides main-name search and preserves real out-of-stock candidates', () => {
+    const tool = makeSearchCatalogTool({
+      ...baseDeps,
+      chatbotApi: {} as ChatbotApiClient,
+    });
+    expect(tool.description).toContain('nombre principal');
+    expect(tool.description).toContain('incluidos los agotados');
+    expect(tool.description).toContain('pasos 2–5');
+    const schema = tool.inputSchema as unknown as {
+      shape: { q: { description?: string } };
+    };
+    expect(schema.shape.q.description).toContain('ibuprofeno');
+    expect(schema.shape.q.description).toContain('dosis y forma');
+    expect(schema.shape.q.description).toContain('no como filtro inicial');
+  });
+
+  it('keeps an empty success distinct from an error without rewriting the query', async () => {
+    const searchCatalog = jest.fn().mockResolvedValue([]);
+    const tool = makeSearchCatalogTool({
+      ...baseDeps,
+      chatbotApi: { searchCatalog } as unknown as ChatbotApiClient,
+    });
+    await expect(
+      tool.execute(tool.inputSchema.parse({ q: 'ibuprofeno de 400 mg' }), {
+        toolCallId: 't',
+        messages: [],
+        context: {},
+      }),
+    ).resolves.toEqual({ ok: true, results: [] });
+    expect(searchCatalog).toHaveBeenCalledWith('ibuprofeno de 400 mg', 10);
+    expect(searchCatalog).toHaveBeenCalledTimes(1);
+  });
+
   it('forwards q + limit (default 10) to chatbotApi.searchCatalog and returns { ok: true, results }', async () => {
     const results: CatalogItemResponse[] = [
       {
