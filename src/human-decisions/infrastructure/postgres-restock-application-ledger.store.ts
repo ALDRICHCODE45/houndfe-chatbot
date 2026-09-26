@@ -94,7 +94,7 @@ function same(
 
 /** Unwired local persistence only; no reservation transaction/authority claim. */
 export class PostgresRestockApplicationLedgerStore implements RestockApplicationLedgerPort {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pick<Pool, 'query'>) {}
 
   async readByDecision(decisionId: string): Promise<RestockApplicationRead> {
     if (typeof decisionId !== 'string' || !UUID.test(decisionId)) return HOLD;
