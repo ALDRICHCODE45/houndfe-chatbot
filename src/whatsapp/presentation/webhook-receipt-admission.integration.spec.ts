@@ -116,6 +116,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     'meta.verifyToken': VERIFY_TOKEN,
   };
   const configService = {
+    get: jest.fn().mockReturnValue(undefined),
     getOrThrow: jest.fn((key: string) => configValues[key]),
   } as unknown as ConfigService;
 
