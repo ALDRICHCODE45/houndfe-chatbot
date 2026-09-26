@@ -33,6 +33,26 @@ export type RestockApplicationTransition =
     }>
   | Readonly<{ action: 'hold' }>;
 
+type Accepted = Extract<
+  RestockApplicationLedgerRow,
+  { state: 'PROVIDER_ACCEPTED' | 'PROVIDER_ACCEPTED_LATE' }
+>;
+export type RestockApplicationAcceptanceInput = Readonly<{
+  row:
+    | Extract<RestockApplicationLedgerRow, { state: 'SEND_STARTED' }>
+    | Accepted;
+  event: Readonly<{
+    kind: 'provider_accepted';
+    attemptId: string;
+    sendToken: string;
+    providerMessageId: string;
+    providerAcceptedObservedAt: string;
+  }>;
+}>;
+export type RestockApplicationAcceptanceResult =
+  | Readonly<{ action: 'updated' | 'replay'; row: Accepted }>
+  | Readonly<{ action: 'hold' }>;
+
 /** Persistence only: local ledger CAS, not send permission or provider proof.
  * Unwired: does NOT satisfy start policy's active-reservation + expected-row
  * atomicity requirement. Before integration, a coordinator must resolve the
@@ -44,6 +64,15 @@ export type RestockApplicationTransition =
  * not external HTTP. Errors may follow a committed write: never infer rollback
  * or retry; recovered SEND_STARTED always holds. */
 export interface RestockApplicationLedgerPort {
+  /** Local acceptance only: caller must correlate the real provider response to
+   * the original send attempt/current owner, establish live authority and
+   * coordinate reservations. Frozen input + CAS prove neither provenance nor
+   * device delivery, and grant no ACK/send permission. Stable attempt identity
+   * and distinct claim token are not HTTP fences. No timeout recovery evidence.
+   * Terminal replay proves a read snapshot, not a lock or historical origin. */
+  recordAcceptance(
+    input: RestockApplicationAcceptanceInput,
+  ): Promise<RestockApplicationAcceptanceResult>;
   readByDecision(decisionId: string): Promise<RestockApplicationRead>;
   insertPending(row: Pending): Promise<RestockApplicationInsert>;
   transitionPending(

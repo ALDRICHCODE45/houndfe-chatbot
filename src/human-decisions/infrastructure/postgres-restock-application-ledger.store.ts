@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { classifyRestockApplicationAcceptance } from '../domain/restock-application-ledger-acceptance';
 import { classifyRestockApplicationStart } from '../domain/restock-application-ledger-start';
 import { normalizeRestockApplicationAckRecord } from '../domain/restock-application-ledger-ack-record';
 import {
@@ -6,6 +7,8 @@ import {
   type RestockApplicationLedgerRow,
 } from '../domain/restock-application-ledger-row';
 import type {
+  RestockApplicationAcceptanceInput,
+  RestockApplicationAcceptanceResult,
   RestockApplicationInsert,
   RestockApplicationLedgerPort,
   RestockApplicationRead,
@@ -102,6 +105,41 @@ export class PostgresRestockApplicationLedgerStore implements RestockApplication
     return raw === null
       ? Object.freeze({ action: 'missing' })
       : decode(raw, decisionId);
+  }
+
+  async recordAcceptance(
+    input: RestockApplicationAcceptanceInput,
+  ): Promise<RestockApplicationAcceptanceResult> {
+    const proposal = classifyRestockApplicationAcceptance(input);
+    if (proposal.action === 'hold') return HOLD;
+    const replay = proposal.action === 'replay';
+    const next = proposal.action === 'replay' ? proposal.row : proposal.next;
+    let found: RestockApplicationRead;
+    if (proposal.action === 'replay') {
+      found = await this.readByDecision(next.decisionId);
+    } else {
+      const { expected } = proposal;
+      const raw = single(
+        await this.pool.query(TRANSITION, [
+          expected.decisionId,
+          expected.sourceRequestId,
+          expected.attemptId,
+          expected.senderId,
+          expected.branchId,
+          JSON.stringify(expected),
+          JSON.stringify(next),
+        ]),
+      );
+      if (raw === null) return HOLD;
+      found = decode(raw, expected.decisionId);
+    }
+    return found.action === 'found' &&
+      (replay || found.ack === null) &&
+      (found.row.state === 'PROVIDER_ACCEPTED' ||
+        found.row.state === 'PROVIDER_ACCEPTED_LATE') &&
+      same(found.row, next)
+      ? Object.freeze({ action: replay ? 'replay' : 'updated', row: found.row })
+      : HOLD;
   }
 
   async transitionPending(
