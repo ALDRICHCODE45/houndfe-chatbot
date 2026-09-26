@@ -1,4 +1,5 @@
 import type { RestockApplicationOutcomeAck } from '../../chatbot-api/domain/dtos/human-decisions.dto';
+import type { RestockApplicationAckRecord } from './restock-application-ledger-ack-record';
 import type { RestockApplicationLedgerRow } from './restock-application-ledger-row';
 
 type Pending = Extract<
@@ -53,6 +54,13 @@ export type RestockApplicationAcceptanceResult =
   | Readonly<{ action: 'updated' | 'replay'; row: Accepted }>
   | Readonly<{ action: 'hold' }>;
 
+export type RestockApplicationAckResult =
+  | Readonly<{
+      action: 'recorded' | 'replay';
+      record: RestockApplicationAckRecord;
+    }>
+  | Readonly<{ action: 'hold' }>;
+
 /** Persistence only: local ledger CAS, not send permission or provider proof.
  * Unwired: does NOT satisfy start policy's active-reservation + expected-row
  * atomicity requirement. Before integration, a coordinator must resolve the
@@ -64,6 +72,15 @@ export type RestockApplicationAcceptanceResult =
  * not external HTTP. Errors may follow a committed write: never infer rollback
  * or retry; recovered SEND_STARTED always holds. */
 export interface RestockApplicationLedgerPort {
+  /** Local CAS only; never calls the backend ACK endpoint or grants authority.
+   * Caller correlates the actual HTTP receipt to the prepared request/current
+   * attempt. Reporting ACK is not provider acceptance or device delivery proof.
+   * Server time is preserved, not ordered against local clocks. No automatic
+   * retry after errors (the write may have committed). E2E proof remains open. */
+  recordOutcomeAck(
+    row: RestockApplicationAckRecord['row'],
+    receipt: RestockApplicationOutcomeAck,
+  ): Promise<RestockApplicationAckResult>;
   /** Local acceptance only: caller must correlate the real provider response to
    * the original send attempt/current owner, establish live authority and
    * coordinate reservations. Frozen input + CAS prove neither provenance nor

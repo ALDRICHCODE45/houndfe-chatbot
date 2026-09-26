@@ -1,12 +1,18 @@
 import type { Pool } from 'pg';
 import { classifyRestockApplicationAcceptance } from '../domain/restock-application-ledger-acceptance';
 import { classifyRestockApplicationStart } from '../domain/restock-application-ledger-start';
-import { normalizeRestockApplicationAckRecord } from '../domain/restock-application-ledger-ack-record';
+import type { RestockApplicationOutcomeAck } from '../../chatbot-api/domain/dtos/human-decisions.dto';
+import {
+  classifyRestockApplicationAckRecord,
+  normalizeRestockApplicationAckRecord,
+  type RestockApplicationAckRecord,
+} from '../domain/restock-application-ledger-ack-record';
 import {
   normalizeRestockApplicationLedgerRow,
   type RestockApplicationLedgerRow,
 } from '../domain/restock-application-ledger-row';
 import type {
+  RestockApplicationAckResult,
   RestockApplicationAcceptanceInput,
   RestockApplicationAcceptanceResult,
   RestockApplicationInsert,
@@ -27,6 +33,10 @@ const INSERT = `INSERT INTO restock_application_ledger (${COLUMNS})
 VALUES ($1, $2, $3, $4, $5, $6::jsonb, NULL)
 ON CONFLICT DO NOTHING RETURNING ${COLUMNS}`;
 const TRANSITION = `UPDATE restock_application_ledger SET row_data = $7::jsonb
+WHERE decision_id = $1::uuid AND source_request_id = $2::uuid
+AND attempt_id = $3::uuid AND sender_id = $4 AND branch_id = $5
+AND row_data = $6::jsonb AND ack_receipt IS NULL RETURNING ${COLUMNS}`;
+const RECORD_ACK = `UPDATE restock_application_ledger SET ack_receipt = $7::jsonb
 WHERE decision_id = $1::uuid AND source_request_id = $2::uuid
 AND attempt_id = $3::uuid AND sender_id = $4 AND branch_id = $5
 AND row_data = $6::jsonb AND ack_receipt IS NULL RETURNING ${COLUMNS}`;
@@ -105,6 +115,42 @@ export class PostgresRestockApplicationLedgerStore implements RestockApplication
     return raw === null
       ? Object.freeze({ action: 'missing' })
       : decode(raw, decisionId);
+  }
+
+  async recordOutcomeAck(
+    row: RestockApplicationAckRecord['row'],
+    receipt: RestockApplicationOutcomeAck,
+  ): Promise<RestockApplicationAckResult> {
+    const proposal = classifyRestockApplicationAckRecord(row, receipt, null);
+    if (proposal.action !== 'record') return HOLD;
+    const { row: expected, receipt: expectedReceipt } = proposal.next;
+    const raw = single(
+      await this.pool.query(RECORD_ACK, [
+        expected.decisionId,
+        expected.sourceRequestId,
+        expected.attemptId,
+        expected.senderId,
+        expected.branchId,
+        JSON.stringify(expected),
+        JSON.stringify(expectedReceipt),
+      ]),
+    );
+    const found =
+      raw === null
+        ? await this.readByDecision(expected.decisionId)
+        : decode(raw, expected.decisionId);
+    if (found.action !== 'found' || found.ack === null) return HOLD;
+    const verified = classifyRestockApplicationAckRecord(
+      expected,
+      expectedReceipt,
+      { row: found.row, receipt: found.ack },
+    );
+    return verified.action === 'replay'
+      ? Object.freeze({
+          action: raw === null ? 'replay' : 'recorded',
+          record: verified.record,
+        })
+      : HOLD;
   }
 
   async recordAcceptance(
