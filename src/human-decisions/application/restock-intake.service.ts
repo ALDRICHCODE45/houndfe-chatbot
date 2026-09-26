@@ -58,6 +58,10 @@ export class RestockIntakeService {
     private readonly reservations: SharedReservationPort,
     private readonly ledger: RestockPostLedgerPort,
     private readonly client: Pick<ChatbotApiClient, 'submitRestockIntake'>,
+    private readonly onReceiptRecorded?: (
+      senderId: string,
+      sourceRequestId: string,
+    ) => void,
   ) {}
 
   async coordinate(
@@ -161,6 +165,12 @@ export class RestockIntakeService {
       recorded.action === 'record_receipt' &&
       recorded.backendDecisionId === backendDecisionId
     ) {
+      // Synchronous enqueue-only hint, never sender authority or delivery proof.
+      try {
+        this.onReceiptRecorded?.(senderId, sourceRequestId);
+      } catch {
+        // Enqueue failure cannot undo the confirmed durable receipt.
+      }
       return { decision: 'recorded', historicalPollId: backendDecisionId };
     }
     if (

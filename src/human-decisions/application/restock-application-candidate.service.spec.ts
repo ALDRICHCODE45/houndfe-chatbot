@@ -72,6 +72,36 @@ function setup(branch = ' opaque branch ') {
   };
 }
 const hold = { action: 'hold' };
+describe('queued source binding', () => {
+  it.each([OTHER, SRC.toUpperCase(), ` ${SRC}`, 'bad', '', null, 42, {}])(
+    'holds supplied source %p before GET and clock',
+    async (source) => {
+      const f = setup();
+      expect(await f.service.pollForSender(S, source as string)).toEqual(hold);
+      expect(f.getRestockDecision).not.toHaveBeenCalled();
+      expect(f.clock).not.toHaveBeenCalled();
+    },
+  );
+  it.each(['PENDING', 'RESOLVED'])(
+    'accepts exact source for %s',
+    async (status) => {
+      const f = setup();
+      if (status === 'PENDING')
+        Object.assign(f.decision, {
+          status,
+          version: 1,
+          resolution: null,
+          applyBefore: null,
+        });
+      expect(await f.service.pollForSender(S, SRC)).toMatchObject({
+        action: status === 'PENDING' ? 'pending' : 'candidate',
+      });
+      expect(f.getRestockDecision).toHaveBeenCalledWith(ID);
+      expect(f.clock).toHaveBeenCalledTimes(1);
+    },
+  );
+});
+
 describe('unwired restock candidate polling', () => {
   it.each(['', ' ', ' padded', 'x\n'])(
     'rejects sender %p before reading',

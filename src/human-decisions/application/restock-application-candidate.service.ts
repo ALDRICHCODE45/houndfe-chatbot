@@ -37,7 +37,10 @@ export class RestockApplicationCandidateService {
     private readonly clock: () => Date,
   ) {}
 
-  async pollForSender(senderId: string): Promise<RestockCandidateResult> {
+  async pollForSender(
+    senderId: string,
+    expectedSourceRequestId?: string,
+  ): Promise<RestockCandidateResult> {
     try {
       if (
         typeof this.branchId !== 'string' ||
@@ -69,6 +72,8 @@ export class RestockApplicationCandidateService {
             !Object.is(reservation.intake[k as keyof typeof intake], v),
         ) ||
         reservation.requestKey !== intake.sourceRequestId ||
+        (expectedSourceRequestId !== undefined &&
+          expectedSourceRequestId !== reservation.requestKey) ||
         typeof context.backendDecisionId !== 'string' ||
         !UUID.test(context.backendDecisionId)
       )

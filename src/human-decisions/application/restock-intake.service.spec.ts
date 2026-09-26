@@ -58,7 +58,9 @@ const receiptFor = (i: RestockIntakeInput): RestockIntakeReceipt => ({
   applyBefore: null,
 });
 
-const build = () => {
+const build = (
+  onReceiptRecorded?: (sender: string, source: string) => void,
+) => {
   const reservations = {
     reserve: jest.fn(),
   } as unknown as jest.Mocked<SharedReservationPort>;
@@ -71,12 +73,154 @@ const build = () => {
     submitRestockIntake: jest.fn(),
   } as unknown as jest.Mocked<Pick<ChatbotApiClient, 'submitRestockIntake'>>;
   return {
-    service: new RestockIntakeService(reservations, ledger, client),
+    service: new RestockIntakeService(
+      reservations,
+      ledger,
+      client,
+      onReceiptRecorded,
+    ),
     reservations,
     ledger,
     client,
   };
 };
+
+describe('receipt-recorded enqueue seam', () => {
+  const ready = (hook: (sender: string, source: string) => void) => {
+    const f = build(hook);
+    f.reservations.reserve.mockResolvedValue({
+      action: 'claim',
+      reason: 'single_sender_vacant',
+    });
+    f.ledger.beginPost.mockResolvedValue({ action: 'authorize_post' });
+    f.client.submitRestockIntake.mockResolvedValue(receiptFor(intake()));
+    f.ledger.recordReceipt.mockResolvedValue({
+      action: 'record_receipt',
+      backendDecisionId: DECISION,
+    });
+    return f;
+  };
+
+  it('enqueues captured primitives once only after durable confirmation', async () => {
+    const hook = jest.fn();
+    const f = ready(hook);
+    let releaseReserve!: () => void;
+    f.reservations.reserve.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        releaseReserve = resolve;
+      });
+      return { action: 'claim', reason: 'single_sender_vacant' };
+    });
+    let confirm!: () => void;
+    let entered!: () => void;
+    const recording = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    f.ledger.recordReceipt.mockImplementationOnce(async () => {
+      entered();
+      await new Promise<void>((resolve) => {
+        confirm = resolve;
+      });
+      return { action: 'record_receipt', backendDecisionId: DECISION };
+    });
+    const request = { senderId: SENDER, intake: intake() };
+    const result = f.service.coordinate(request);
+    request.senderId = 'replacement';
+    request.intake.sourceRequestId = PRODUCT;
+    expect(hook).not.toHaveBeenCalled();
+    releaseReserve();
+    await recording;
+    expect(hook).not.toHaveBeenCalled();
+    confirm();
+    await expect(result).resolves.toEqual({
+      decision: 'recorded',
+      historicalPollId: DECISION,
+    });
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith(SENDER, SOURCE);
+  });
+
+  it('keeps truthful recorded outcome when synchronous enqueue throws', async () => {
+    const hook = jest.fn(() => {
+      throw new Error('enqueue failed');
+    });
+    const f = ready(hook);
+    await expect(
+      f.service.coordinate({ senderId: SENDER, intake: intake() }),
+    ).resolves.toEqual({ decision: 'recorded', historicalPollId: DECISION });
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(f.ledger.markUnknown).not.toHaveBeenCalled();
+    expect(f.ledger.beginPost).toHaveBeenCalledTimes(1);
+    expect(f.ledger.recordReceipt).toHaveBeenCalledTimes(1);
+    expect(f.client.submitRestockIntake).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'historical',
+    'replay',
+    'ambiguous',
+    'wrong-id',
+    'failed-post',
+    'bad-receipt',
+    'hold',
+    'blocked',
+    'record-hold',
+  ])('never enqueues %s outcomes', async (kind) => {
+    const hook = jest.fn();
+    const f = ready(hook);
+    let expected: unknown = { decision: 'hold', reason: 'unknown_hold' };
+    if (kind === 'historical' || kind === 'ambiguous') {
+      expected = { decision: 'existing', historicalPollId: DECISION };
+      f.ledger.beginPost.mockResolvedValue({
+        action: 'historical_receipt',
+        backendDecisionId: DECISION,
+      });
+      if (kind === 'ambiguous') {
+        f.ledger.beginPost.mockResolvedValueOnce({ action: 'authorize_post' });
+        f.ledger.recordReceipt.mockRejectedValue(new Error('ambiguous'));
+      }
+    }
+    if (kind === 'replay') {
+      expected = { decision: 'existing', historicalPollId: DECISION };
+      f.ledger.recordReceipt.mockResolvedValue({
+        action: 'replay_receipt',
+        backendDecisionId: DECISION,
+      });
+    }
+    if (kind === 'wrong-id' || kind === 'record-hold') {
+      expected = { decision: 'hold', reason: 'record_unconfirmed' };
+      f.ledger.recordReceipt.mockResolvedValue(
+        kind === 'wrong-id'
+          ? { action: 'record_receipt', backendDecisionId: PRODUCT }
+          : { action: 'hold', reason: 'post_in_flight' },
+      );
+    }
+    if (kind === 'failed-post')
+      f.client.submitRestockIntake.mockRejectedValue(new Error('POST'));
+    if (kind === 'bad-receipt')
+      f.client.submitRestockIntake.mockResolvedValue(
+        {} as RestockIntakeReceipt,
+      );
+    if (kind === 'hold') {
+      expected = { decision: 'hold', reason: 'post_in_flight' };
+      f.ledger.beginPost.mockResolvedValue({
+        action: 'hold',
+        reason: 'post_in_flight',
+      });
+    }
+    if (kind === 'blocked') {
+      expected = { decision: 'blocked', reason: 'reservation_blocked' };
+      f.ledger.beginPost.mockResolvedValue({
+        action: 'blocked',
+        reason: 'missing_row',
+      });
+    }
+    await expect(
+      f.service.coordinate({ senderId: SENDER, intake: intake() }),
+    ).resolves.toEqual(expected);
+    expect(hook).not.toHaveBeenCalled();
+  });
+});
 
 describe('RestockIntakeService.coordinate', () => {
   it('posts once and records the durable receipt id', async () => {
