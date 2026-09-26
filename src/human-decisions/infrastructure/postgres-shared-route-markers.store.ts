@@ -123,7 +123,7 @@ function mapSnapshot(result: {
 
 @Injectable()
 export class PostgresSharedRouteMarkersStore implements SharedRouteMarkersPort {
-  constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+  constructor(@Inject(PG_POOL) private readonly pool: Pick<Pool, 'query'>) {}
 
   async readForSender(senderId: string): Promise<SharedRouteMarkers> {
     if (!validSenderId(senderId)) return UNKNOWN;
