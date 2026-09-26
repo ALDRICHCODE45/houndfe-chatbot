@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { stepCountIs } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import type { LlmRunInput } from '../domain/llm-agent.port';
@@ -15,6 +16,222 @@ import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
  * 80%/100% threshold scenarios. This file's undefined-usage test
  * is the gate-fix for that failure mode.
  */
+describe('temporary catalog diagnostics', () => {
+  const secret = 'PRIVATE_SENTINEL';
+  const input: LlmRunInput = {
+    senderId: secret,
+    text: secret,
+    systemPrompt: secret,
+    history: [{ role: 'user', content: secret }],
+    tools: {},
+    inboundEvent: {
+      senderId: secret,
+      messageId: secret,
+      receivingPhoneNumberId: secret,
+    },
+  };
+  type Hooks = {
+    onStepFinish: (event: unknown) => void;
+    onToolExecutionEnd: (event: unknown) => void;
+  };
+  let log: jest.SpyInstance;
+  const records = () =>
+    log.mock.calls.map(([record]) => record as Record<string, unknown>);
+  const step = (hooks: Hooks, count = 0) =>
+    hooks.onStepFinish?.({
+      toolCalls: Array(count).fill(secret),
+      text: secret,
+      request: { headers: secret, apiKey: secret },
+      response: { id: secret, body: secret },
+      providerMetadata: { private: secret },
+    });
+  const end = (hooks: Hooks, output: unknown, name = 'searchCatalog') =>
+    hooks.onToolExecutionEnd?.({
+      callId: secret,
+      toolExecutionMs: 1,
+      messages: [secret],
+      toolContext: { headers: secret, cookies: secret },
+      toolCall: { toolName: name, toolCallId: secret, input: secret },
+      toolOutput: output,
+    });
+  const generate = jest.fn();
+  const agent = new VercelAiLlmAgent(generate, 'test', 3);
+  const run = (act: (hooks: Hooks) => void | Promise<void>) => {
+    generate.mockImplementationOnce(async (options: unknown) => {
+      await act(options as Hooks);
+      return { text: secret, usage: { inputTokens: 2, outputTokens: 3 } };
+    });
+    return agent.run(input);
+  };
+  beforeEach(() => {
+    log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    // Inspect every argument, not just the structured message.
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    log.mockRestore();
+  });
+
+  it('records an observed text-only completion without changing the reply/history', async () => {
+    const result = await run((hooks) => step(hooks));
+    expect(result).toEqual({
+      reply: secret,
+      messages: [
+        ...input.history,
+        { role: 'user', content: secret },
+        { role: 'assistant', content: secret },
+      ],
+      usage: { promptTokens: 2, completionTokens: 3 },
+    });
+    expect(records()).toHaveLength(1);
+    expect(records()[0].runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(records()[0]).toEqual({
+      prefix: 'catalog_diagnostic',
+      runId: records()[0].runId,
+      event: 'run_completed',
+      observedSteps: 1,
+      toolCalls: 0,
+      observationComplete: true,
+    });
+  });
+
+  const product = { name: secret, productId: secret, stock: { quantity: 0 } };
+  const outputOf = (output: unknown) => ({ type: 'tool-result', output });
+  it.each([
+    [outputOf({ ok: true, results: [] }), 'success', 0],
+    [outputOf({ ok: true, results: [product] }), 'success', 1],
+    [outputOf({ ok: false, error: secret }), 'mapped_error', undefined],
+    [{ type: 'tool-error', error: secret }, 'execution_error', undefined],
+    [outputOf({ ok: true, results: secret }), 'unknown_output', undefined],
+    [outputOf(null), 'unknown_output', undefined],
+    [{ type: secret }, 'unknown_output', undefined],
+  ])('classifies output %s', async (output, category, resultCount) => {
+    await run((hooks) => {
+      end(hooks, output);
+      step(hooks, 1);
+      step(hooks);
+    });
+    expect(records()[0]).toEqual({
+      prefix: 'catalog_diagnostic',
+      runId: records()[1].runId,
+      event: 'search_catalog_end',
+      category,
+      ...(resultCount === undefined ? {} : { resultCount }),
+    });
+    expect(records()[1]).toMatchObject({
+      observedSteps: 2,
+      toolCalls: category === 'unknown_output' ? null : 1,
+      observationComplete: category !== 'unknown_output',
+    });
+  });
+
+  it('ignores arbitrary tools and never traverses catalog array items', async () => {
+    const results = new Array(2);
+    const getter = jest.fn(() => {
+      throw new Error(secret);
+    });
+    Object.defineProperty(results, 0, { get: getter });
+    await run((hooks) => {
+      end(hooks, new Proxy({}, { get: getter }), secret);
+      end(hooks, { type: 'tool-result', output: { ok: true, results } });
+      step(hooks, 2);
+    });
+    expect(getter).not.toHaveBeenCalled();
+    expect(records()).toHaveLength(2);
+    expect(records()[0]).toMatchObject({ category: 'success', resultCount: 2 });
+    expect(records()[1]).toMatchObject({
+      toolCalls: 2,
+      observationComplete: true,
+    });
+  });
+
+  it.each(['missing', 'step', 'tool', 'length', 'output'])(
+    'marks %s observation incomplete without changing output',
+    async (kind) => {
+      const hostile = new Proxy([], {
+        get() {
+          throw new Error(secret);
+        },
+      });
+      await expect(
+        run((hooks) => {
+          if (kind === 'step') hooks.onStepFinish?.({ toolCalls: null });
+          if (kind === 'tool') hooks.onToolExecutionEnd?.(null);
+          if (kind === 'length') hooks.onStepFinish?.({ toolCalls: hostile });
+          if (kind === 'output') end(hooks, hostile);
+        }),
+      ).resolves.toMatchObject({ reply: secret });
+      expect(records().at(-1)).toMatchObject({
+        event: 'run_completed',
+        toolCalls: null,
+        observationComplete: false,
+      });
+    },
+  );
+
+  it('preserves the identical SDK exception and never asserts zero calls on failure', async () => {
+    const error = new Error(secret);
+    await expect(
+      run((hooks) => {
+        step(hooks);
+        throw error;
+      }),
+    ).rejects.toBe(error);
+    expect(records().at(-1)).toMatchObject({
+      event: 'run_failed',
+      observedSteps: 1,
+      toolCalls: null,
+      observationComplete: false,
+    });
+  });
+
+  it('isolates interleaved runs with distinct random UUIDs and counters', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = run(async (hooks) => {
+      end(hooks, { type: 'tool-result', output: { ok: true, results: [] } });
+      step(hooks, 1);
+      await gate;
+      step(hooks);
+    });
+    await run((hooks) => step(hooks));
+    release();
+    await first;
+    const [search, second, completedFirst] = records();
+    expect(search.runId).toBe(completedFirst.runId);
+    expect(second.runId).not.toBe(search.runId);
+    expect(second).toMatchObject({ observedSteps: 1, toolCalls: 0 });
+    expect(completedFirst).toMatchObject({ observedSteps: 2, toolCalls: 1 });
+  });
+
+  it('contains logger failures on both successful and rejected generation', async () => {
+    log.mockImplementationOnce(() => {
+      throw new Error(secret);
+    });
+    await expect(
+      run((hooks) => {
+        end(hooks, { type: 'tool-error', error: secret });
+        step(hooks);
+      }),
+    ).resolves.toMatchObject({ reply: secret });
+    expect(records().at(-1)).toMatchObject({ observationComplete: false });
+    log.mockImplementation(() => {
+      throw new Error(secret);
+    });
+    await expect(run((hooks) => step(hooks))).resolves.toMatchObject({
+      reply: secret,
+    });
+    const error = new Error(secret);
+    await expect(
+      run(() => {
+        throw error;
+      }),
+    ).rejects.toBe(error);
+  });
+});
+
 describe('VercelAiLlmAgent', () => {
   let generateTextFn: jest.MockedFunction<GenerateTextFn>;
   let agent: VercelAiLlmAgent;

@@ -1,6 +1,7 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { stepCountIs } from 'ai';
-import type { ModelMessage } from 'ai';
+import type { ModelMessage, ToolExecutionEndEvent } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import type { AgentMessage } from '../domain/agent-message';
@@ -27,6 +28,8 @@ import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
  */
 @Injectable()
 export class VercelAiLlmAgent implements LlmAgentPort {
+  private readonly logger = new Logger(VercelAiLlmAgent.name);
+
   constructor(
     @Inject(GENERATE_TEXT) private readonly generateTextFn: GenerateTextFn,
     private readonly modelId: string,
@@ -73,14 +76,24 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     if (input.tools !== null && 'getShippingQuote' in input.tools) {
       toolsContext.getShippingQuote = { senderId: input.senderId };
     }
-    const result = await this.generateTextFn({
-      model: openai(this.modelId),
-      system: input.systemPrompt,
-      messages,
-      tools: input.tools as never,
-      toolsContext,
-      stopWhen: stepCountIs(this.maxSteps),
-    } as never);
+    const diagnostic = catalogDiagnostic(this.logger);
+    let result: Awaited<ReturnType<GenerateTextFn>>;
+    try {
+      result = await this.generateTextFn({
+        model: openai(this.modelId),
+        system: input.systemPrompt,
+        messages,
+        tools: input.tools as never,
+        toolsContext,
+        stopWhen: stepCountIs(this.maxSteps),
+        onStepFinish: diagnostic.onStepFinish,
+        onToolExecutionEnd: diagnostic.onToolExecutionEnd,
+      } as never);
+    } catch (error) {
+      diagnostic.finish('run_failed');
+      throw error;
+    }
+    diagnostic.finish('run_completed');
 
     const usage = {
       promptTokens: result.usage?.inputTokens ?? 0,
@@ -93,6 +106,78 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       usage,
     };
   }
+}
+
+// Temporary, local-only observation. Never serialize SDK objects or array items.
+function catalogDiagnostic(logger: Logger) {
+  let runId: string;
+  let observedSteps = 0;
+  let toolCalls = 0;
+  let observationComplete = true;
+  const observe = (action: () => void) => {
+    try {
+      action();
+    } catch {
+      observationComplete = false;
+    }
+  };
+  observe(() => {
+    runId = randomUUID();
+  });
+  const emit = (fields: Record<string, string | number | boolean | null>) => {
+    if (runId) logger.log({ prefix: 'catalog_diagnostic', runId, ...fields });
+  };
+  const arrayLength = (value: unknown): number => {
+    if (!Array.isArray(value)) throw new Error('invalid observation');
+    const count = value.length;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error('invalid observation');
+    }
+    return count;
+  };
+  return {
+    onStepFinish: (event: { toolCalls: unknown }) =>
+      observe(() => {
+        const count = arrayLength(event.toolCalls);
+        observedSteps += 1;
+        toolCalls += count;
+      }),
+    onToolExecutionEnd: (event: ToolExecutionEndEvent) =>
+      observe(() => {
+        if (event.toolCall.toolName !== 'searchCatalog') return;
+        const toolOutput = event.toolOutput;
+        let category = 'unknown_output';
+        let resultCount: number | undefined;
+        if (toolOutput.type === 'tool-error') category = 'execution_error';
+        if (toolOutput.type === 'tool-result') {
+          const output = toolOutput.output as {
+            ok?: unknown;
+            results?: unknown;
+          } | null;
+          if (output?.ok === false) category = 'mapped_error';
+          else if (output?.ok === true && Array.isArray(output.results)) {
+            resultCount = arrayLength(output.results);
+            category = 'success';
+          }
+        }
+        if (category === 'unknown_output') observationComplete = false;
+        emit({
+          event: 'search_catalog_end',
+          category,
+          ...(resultCount === undefined ? {} : { resultCount }),
+        });
+      }),
+    finish: (event: 'run_completed' | 'run_failed') =>
+      observe(() => {
+        observationComplete &&= observedSteps > 0 && event === 'run_completed';
+        emit({
+          event,
+          observedSteps,
+          toolCalls: observationComplete ? toolCalls : null,
+          observationComplete,
+        });
+      }),
+  };
 }
 
 /**
