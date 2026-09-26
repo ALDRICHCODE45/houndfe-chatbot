@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { classifyRestockApplicationStart } from '../domain/restock-application-ledger-start';
 import { normalizeRestockApplicationAckRecord } from '../domain/restock-application-ledger-ack-record';
 import {
   normalizeRestockApplicationLedgerRow,
@@ -8,6 +9,8 @@ import type {
   RestockApplicationInsert,
   RestockApplicationLedgerPort,
   RestockApplicationRead,
+  RestockApplicationPendingTransition,
+  RestockApplicationTransition,
 } from '../domain/restock-application-ledger.port';
 
 type Pending = Extract<
@@ -20,6 +23,10 @@ const READ = `SELECT ${COLUMNS} FROM restock_application_ledger WHERE decision_i
 const INSERT = `INSERT INTO restock_application_ledger (${COLUMNS})
 VALUES ($1, $2, $3, $4, $5, $6::jsonb, NULL)
 ON CONFLICT DO NOTHING RETURNING ${COLUMNS}`;
+const TRANSITION = `UPDATE restock_application_ledger SET row_data = $7::jsonb
+WHERE decision_id = $1::uuid AND source_request_id = $2::uuid
+AND attempt_id = $3::uuid AND sender_id = $4 AND branch_id = $5
+AND row_data = $6::jsonb AND ack_receipt IS NULL RETURNING ${COLUMNS}`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HOLD = Object.freeze({ action: 'hold' as const });
 
@@ -85,7 +92,7 @@ function same(
   );
 }
 
-/** Offline INSERT/READ only; no DI wiring or transaction/authority claim. */
+/** Unwired local persistence only; no reservation transaction/authority claim. */
 export class PostgresRestockApplicationLedgerStore implements RestockApplicationLedgerPort {
   constructor(private readonly pool: Pool) {}
 
@@ -95,6 +102,33 @@ export class PostgresRestockApplicationLedgerStore implements RestockApplication
     return raw === null
       ? Object.freeze({ action: 'missing' })
       : decode(raw, decisionId);
+  }
+
+  async transitionPending(
+    input: RestockApplicationPendingTransition,
+  ): Promise<RestockApplicationTransition> {
+    const proposal = classifyRestockApplicationStart(input);
+    if (proposal.action === 'hold') return HOLD;
+    const { expected, next } = proposal;
+    const raw = single(
+      await this.pool.query(TRANSITION, [
+        expected.decisionId,
+        expected.sourceRequestId,
+        expected.attemptId,
+        expected.senderId,
+        expected.branchId,
+        JSON.stringify(expected),
+        JSON.stringify(next),
+      ]),
+    );
+    if (raw === null) return HOLD;
+    const found = decode(raw, expected.decisionId);
+    return found.action === 'found' &&
+      found.ack === null &&
+      (found.row.state === 'SEND_STARTED' || found.row.state === 'STALE') &&
+      same(found.row, next)
+      ? Object.freeze({ action: 'updated', row: found.row })
+      : HOLD;
   }
 
   async insertPending(input: Pending): Promise<RestockApplicationInsert> {
