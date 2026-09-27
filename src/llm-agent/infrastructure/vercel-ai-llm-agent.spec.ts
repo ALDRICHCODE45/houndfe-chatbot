@@ -610,6 +610,75 @@ describe('temporary catalog diagnostics', () => {
     ['requestHumanAssistance', intake, 'historical_intake_recorded'],
     [
       'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'pending',
+        customerNotified: false,
+      },
+      'existing_receipt',
+    ],
+    [
+      'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'response_recorded',
+        customerNotified: false,
+      },
+      'existing_receipt',
+    ],
+    [
+      'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'stale',
+        customerNotified: false,
+      },
+      'existing_receipt',
+    ],
+    [
+      'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'current_status_unknown',
+        customerNotified: false,
+      },
+      'existing_receipt',
+    ],
+    [
+      'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'pending',
+      },
+      'unknown_output',
+    ],
+    [
+      'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'pending',
+        customerNotified: true,
+      },
+      'unknown_output',
+    ],
+    [
+      'requestHumanAssistance',
+      {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: 'not_a_status',
+        customerNotified: false,
+      },
+      'unknown_output',
+    ],
+    [
+      'requestHumanAssistance',
       { ok: true, customerNotified: true },
       'legacy_customer_notified',
     ],

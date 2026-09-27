@@ -4,6 +4,7 @@ import type { Provider } from '@nestjs/common';
 import { TERMINAL_RECEIPT_GUIDANCE } from '../application/tools/attach-receipt.tool';
 import { CHATBOT_API_CLIENT } from '../../chatbot-api/domain/chatbot-api.client';
 import { RESTOCK_INTAKE_SERVICE } from '../../human-decisions/application/restock-intake.service';
+import { RESTOCK_EXISTING_REQUEST_STATUS_SERVICE } from '../../human-decisions/application/restock-existing-request-status.service';
 import { SHARED_ROUTE_MARKERS } from '../../human-decisions/domain/shared-route-markers';
 import {
   CONVERSATION_STORE,
@@ -90,6 +91,7 @@ describe('RealToolRegistry', () => {
   };
   const stubMarkers = { readForSender: jest.fn() };
   const stubCoordinator = { coordinate: jest.fn() };
+  const stubRecovery = { recover: jest.fn() };
 
   // DI wiring stub: the shipping tool core has its own tests; here we only
   // assert registration gating, never execution.
@@ -119,6 +121,10 @@ describe('RealToolRegistry', () => {
       RealToolRegistry,
       { provide: SHARED_ROUTE_MARKERS, useValue: stubMarkers },
       { provide: RESTOCK_INTAKE_SERVICE, useValue: stubCoordinator },
+      {
+        provide: RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+        useValue: stubRecovery,
+      },
       { provide: CHATBOT_API_CLIENT, useValue: stubChatbotApi },
       { provide: CONVERSATION_STORE, useValue: extras.store ?? stubStore },
       {
@@ -230,6 +236,7 @@ describe('RealToolRegistry', () => {
     }
     expect(stubMarkers.readForSender).not.toHaveBeenCalled();
     expect(stubCoordinator.coordinate).not.toHaveBeenCalled();
+    expect(stubRecovery.recover).not.toHaveBeenCalled();
   });
 
   it('populates the restock capability only when the gate is exactly true, and stays inert', async () => {
@@ -242,9 +249,11 @@ describe('RealToolRegistry', () => {
       enabled: true,
       markers: stubMarkers,
       coordinator: stubCoordinator,
+      recovery: stubRecovery,
     });
     expect(stubMarkers.readForSender).not.toHaveBeenCalled();
     expect(stubCoordinator.coordinate).not.toHaveBeenCalled();
+    expect(stubRecovery.recover).not.toHaveBeenCalled();
   });
 
   it('stores an omitted shipping orchestrator as null without changing the 12 keys', async () => {

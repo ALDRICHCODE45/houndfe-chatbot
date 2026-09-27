@@ -220,6 +220,18 @@ function catalogDiagnostic(logger: Logger) {
       if (outcome === 'historical_intake_recorded' && notified === false) {
         return 'historical_intake_recorded';
       }
+      if (outcome === 'existing_restock_recorded' && notified === false) {
+        const status = envelope(result).status;
+        if (
+          status === 'pending' ||
+          status === 'response_recorded' ||
+          status === 'stale' ||
+          status === 'current_status_unknown'
+        ) {
+          return 'existing_receipt';
+        }
+        return 'unknown_output';
+      }
       if (outcome === undefined && notified === true)
         return 'legacy_customer_notified';
     }

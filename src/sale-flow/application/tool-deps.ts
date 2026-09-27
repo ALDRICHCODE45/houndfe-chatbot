@@ -1,18 +1,23 @@
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
+import type { RestockExistingRequestStatusService } from '../../human-decisions/application/restock-existing-request-status.service';
 import type { RestockIntakeService } from '../../human-decisions/application/restock-intake.service';
 import type { SharedRouteMarkersPort } from '../../human-decisions/domain/shared-route-markers';
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 
 /**
  * WU2B runtime RESTOCK capability, threaded into the shared deps ONLY while the
- * experimental gate is exactly `true`. It is a carrier: no tool reads it yet,
- * so the flag cannot trigger a marker read, a reserve, or a POST.
+ * experimental gate is exactly `true`.
+ *
+ * `markers` + `coordinator` serve the NEW intake route. `recovery` is the
+ * read-only seam for an ALREADY accepted request whose preflight blocks with
+ * `existing_restock`: it can never POST, reserve, release or fall back to legacy.
  */
 export interface RestockToolCapability {
   readonly enabled: true;
   readonly markers: SharedRouteMarkersPort;
   readonly coordinator: Pick<RestockIntakeService, 'coordinate'>;
+  readonly recovery: Pick<RestockExistingRequestStatusService, 'recover'>;
 }
 
 /**
@@ -33,8 +38,7 @@ export interface ToolDeps {
   humanHandoffService: HumanHandoffService;
   /**
    * ABSENT while the experimental RESTOCK gate is off, so the legacy deps stay
-   * byte-identical; present only when the gate reads exactly `true`. No tool
-   * branches on it yet.
+   * byte-identical; present only when the gate reads exactly `true`.
    */
   restock?: RestockToolCapability;
 }

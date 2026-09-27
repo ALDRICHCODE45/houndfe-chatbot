@@ -639,6 +639,39 @@ describe('sale-flow-instructions', () => {
       expect(tool.description).toContain('customerNotified: true');
       expect(tool.description).toContain('restock_unavailable');
     });
+
+    it('distinguishes an already accepted request with the bounded recovery statuses (text contract)', () => {
+      const tool = makeRequestHumanAssistanceTool({} as never);
+      for (const surface of [SALE_FLOW_INSTRUCTIONS, tool.description]) {
+        expect(surface).toContain('existing_restock_recorded');
+        for (const status of [
+          "'pending'",
+          "'response_recorded'",
+          "'stale'",
+          "'current_status_unknown'",
+        ]) {
+          expect(surface).toContain(status);
+        }
+        // A proven existing request is never reported as a generic failure.
+        expect(surface).toContain('no lo trates como un fallo genérico');
+      }
+      // No offer to re-register what was already accepted.
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'no debes ofrecer registrarla otra vez',
+      );
+    });
+
+    it('never promises notification, delivery or an ETA for a recorded response', () => {
+      const tool = makeRequestHumanAssistanceTool({} as never);
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'sin afirmar que el cliente fue notificado ni prometer entrega',
+      );
+      for (const surface of [SALE_FLOW_INSTRUCTIONS, tool.description]) {
+        expect(surface).toContain('ETA');
+        expect(surface).toContain('notificación');
+        expect(surface).toContain('entrega');
+      }
+    });
   });
 
   describe('step 13 terminal receipt guidance (WU12, server-owned workflow)', () => {

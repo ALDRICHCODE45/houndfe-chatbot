@@ -10,6 +10,10 @@ import {
   type RestockIntakeService,
 } from '../../human-decisions/application/restock-intake.service';
 import {
+  RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+  type RestockExistingRequestStatusService,
+} from '../../human-decisions/application/restock-existing-request-status.service';
+import {
   SHARED_ROUTE_MARKERS,
   type SharedRouteMarkersPort,
 } from '../../human-decisions/domain/shared-route-markers';
@@ -94,6 +98,8 @@ export class RealToolRegistry implements ToolRegistry {
     humanHandoffService: HumanHandoffService,
     @Inject(SHARED_ROUTE_MARKERS) markers: SharedRouteMarkersPort,
     @Inject(RESTOCK_INTAKE_SERVICE) coordinator: RestockIntakeService,
+    @Inject(RESTOCK_EXISTING_REQUEST_STATUS_SERVICE)
+    recovery: RestockExistingRequestStatusService,
     configService: ConfigService,
     @Optional()
     @Inject(ShippingQuoteOrchestrator)
@@ -118,10 +124,10 @@ export class RealToolRegistry implements ToolRegistry {
 
     // WU2B: the experimental RESTOCK gate is an EXACT boolean read. When it is
     // not exactly true the `restock` property is omitted ENTIRELY, so the
-    // legacy deps stay byte-identical; nothing here reads the markers or
-    // invokes the coordinator, and no tool branches on the capability.
+    // legacy deps stay byte-identical; nothing here reads the markers, invokes
+    // the coordinator, or runs the recovery until a tool call does.
     if (configService.get<boolean>('humanDecisions.restockEnabled') === true) {
-      deps.restock = { enabled: true, markers, coordinator };
+      deps.restock = { enabled: true, markers, coordinator, recovery };
     }
 
     const tools: Record<string, unknown> = {

@@ -20,6 +20,10 @@ import {
   RestockIntakeService,
 } from './application/restock-intake.service';
 import {
+  RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+  RestockExistingRequestStatusService,
+} from './application/restock-existing-request-status.service';
+import {
   RESTOCK_POST_LEDGER,
   type RestockPostLedgerPort,
 } from './domain/restock-post-ledger';
@@ -33,6 +37,7 @@ import {
 } from './domain/shared-route-markers';
 import { HumanDecisionsModule } from './human-decisions.module';
 import { PostgresRestockPostLedgerStore } from './infrastructure/postgres-restock-post-ledger.store';
+import { PostgresRestockApplicationContextStore } from './infrastructure/postgres-restock-application-context.store';
 import { PostgresSharedReservationStore } from './infrastructure/postgres-shared-reservation.store';
 import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-shared-route-markers.store';
 
@@ -62,6 +67,8 @@ class HumanDecisionsConsumer {
     @Inject(SHARED_ROUTE_MARKERS) readonly markers: SharedRouteMarkersPort,
     @Inject(RESTOCK_POST_LEDGER) readonly ledger: RestockPostLedgerPort,
     @Inject(RESTOCK_INTAKE_SERVICE) readonly intake: RestockIntakeService,
+    @Inject(RESTOCK_EXISTING_REQUEST_STATUS_SERVICE)
+    readonly recovery: RestockExistingRequestStatusService,
   ) {}
 }
 
@@ -77,10 +84,38 @@ const fakePool = {
   end: jest.fn().mockResolvedValue(undefined),
 };
 
+const CONTEXT_SOURCE = 'abcdefab-1234-5678-9abc-abcdefabcdef';
+const CONTEXT_BACKEND = 'fedcbafe-1234-5678-9abc-abcdefabcdef';
+const CONTEXT_INSTANT = '2026-06-01T10:00:00.000Z';
+const recordedRow = (): Record<string, unknown> => ({
+  sender_id: 'sender',
+  route: 'RESTOCK',
+  request_key: CONTEXT_SOURCE,
+  status: 'ACTIVE',
+  intake: {
+    sourceRequestId: CONTEXT_SOURCE,
+    type: 'RESTOCK',
+    productId: CONTEXT_BACKEND,
+    productName: 'Café',
+    variantId: null,
+    sku: null,
+    requestedQuantity: null,
+    observedStockAtRequest: null,
+    stockObservedAt: null,
+    supersedesDecisionId: null,
+  },
+  post_state: 'RECEIPT_RECORDED',
+  backend_decision_id: CONTEXT_BACKEND,
+  post_attempted_at: new Date(CONTEXT_INSTANT),
+  receipt_recorded_at: new Date(CONTEXT_INSTANT),
+  unknown_observed_at: null,
+});
+
 /** The two ops the coordinator touches; module init must call neither. */
 const fakeClient = {
   getStock: jest.fn(),
   submitRestockIntake: jest.fn(),
+  getRestockDecision: jest.fn(),
 } as unknown as ChatbotApiClient;
 
 const compile = (imports: NonNullable<ModuleMetadata['imports']>) =>
@@ -104,6 +139,7 @@ const inert = () => {
   expect(fakePool.query).not.toHaveBeenCalled();
   expect(fakeClient.getStock).not.toHaveBeenCalled();
   expect(fakeClient.submitRestockIntake).not.toHaveBeenCalled();
+  expect(fakeClient.getRestockDecision).not.toHaveBeenCalled();
 };
 
 describe('HumanDecisionsModule binding', () => {
@@ -132,7 +168,7 @@ describe('HumanDecisionsModule binding', () => {
     await moduleRef.close();
   });
 
-  it('binds the route-marker reader, the ledger, and the coordinator inertly', async () => {
+  it('binds the route-marker reader, the ledger, the coordinator and the recovery inertly', async () => {
     const moduleRef = await compile([DatabaseModule, HumanDecisionsModule]);
     expect(moduleRef.get(SHARED_ROUTE_MARKERS)).toBeInstanceOf(
       PostgresSharedRouteMarkersStore,
@@ -143,8 +179,61 @@ describe('HumanDecisionsModule binding', () => {
     expect(moduleRef.get(RESTOCK_INTAKE_SERVICE)).toBeInstanceOf(
       RestockIntakeService,
     );
+    expect(
+      moduleRef.get(RESTOCK_EXISTING_REQUEST_STATUS_SERVICE),
+    ).toBeInstanceOf(RestockExistingRequestStatusService);
     // Resolving every token still opens nothing and calls no API op.
     inert();
+    await moduleRef.close();
+  });
+
+  it('injects the exact shared context store and client into the recovery service', async () => {
+    const moduleRef = await compile([DatabaseModule, HumanDecisionsModule]);
+    const recovery = moduleRef.get<RestockExistingRequestStatusService>(
+      RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+    );
+    // SAFETY: the recovery service holds its collaborators on private fields,
+    // so test-only introspection is the only way to prove the factory wiring.
+    const internals = recovery as unknown as {
+      reader: unknown;
+      backend: unknown;
+    };
+    expect(internals.reader).toBeInstanceOf(
+      PostgresRestockApplicationContextStore,
+    );
+    expect(internals.reader).toBe(
+      moduleRef.get(PostgresRestockApplicationContextStore),
+    );
+    expect(internals.backend).toBe(fakeClient);
+    inert();
+    await moduleRef.close();
+  });
+
+  it('wires the real context store to the injected pool and reads through it', async () => {
+    const moduleRef = await compile([DatabaseModule, HumanDecisionsModule]);
+    const store = moduleRef.get(PostgresRestockApplicationContextStore);
+
+    // A consistent zero-row read proves the injected pool is genuinely used.
+    fakePool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+    await expect(store.readRecordedForSender('sender')).resolves.toEqual({
+      action: 'missing',
+    });
+    expect(fakePool.query).toHaveBeenCalledTimes(1);
+    expect(fakePool.query).toHaveBeenCalledWith(expect.any(String), ['sender']);
+
+    // A trusted row proves the real SELECT projects a frozen snapshot.
+    fakePool.query.mockResolvedValueOnce({
+      rows: [recordedRow()],
+      rowCount: 1,
+    });
+    const read = await store.readRecordedForSender('sender');
+    expect(read).toMatchObject({
+      action: 'recorded',
+      context: { backendDecisionId: CONTEXT_BACKEND },
+    });
+    if (read.action !== 'recorded') throw new Error('expected recorded');
+    expect(Object.isFrozen(read.context)).toBe(true);
+    expect(fakePool.query).toHaveBeenCalledTimes(2);
     await moduleRef.close();
   });
 
@@ -172,7 +261,7 @@ describe('HumanDecisionsModule binding', () => {
     await moduleRef.close();
   });
 
-  it('exports all four tokens to a consuming module', async () => {
+  it('exports all five tokens to a consuming module', async () => {
     const moduleRef = await compile([TokensConsumerModule]);
     const consumer = moduleRef.get(HumanDecisionsConsumer);
     expect(consumer.reservations).toBeInstanceOf(
@@ -181,6 +270,9 @@ describe('HumanDecisionsModule binding', () => {
     expect(consumer.markers).toBeInstanceOf(PostgresSharedRouteMarkersStore);
     expect(consumer.ledger).toBeInstanceOf(PostgresRestockPostLedgerStore);
     expect(consumer.intake).toBeInstanceOf(RestockIntakeService);
+    expect(consumer.recovery).toBeInstanceOf(
+      RestockExistingRequestStatusService,
+    );
     inert();
     await moduleRef.close();
   });

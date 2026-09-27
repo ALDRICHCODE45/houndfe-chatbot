@@ -6,19 +6,31 @@ import {
   catalogSessionSchema,
   type CatalogSession,
 } from '../../../conversation/domain/catalog-references';
+import type { RestockExistingRequestStatus } from '../../../human-decisions/application/restock-existing-request-status.service';
 import { preflightRestockRequest } from '../../../human-decisions/application/restock-request-preflight';
 import type { RestockToolCapability, ToolDeps } from '../tool-deps';
 
 /**
  * Distinct RESTOCK result for `kind:'out_of_stock'` once the experimental gate
- * is enabled. It reports ONLY a historical intake record: no request ref, no
- * backend/poll id, no current resolution, and never a notice. `customerNotified:
- * false` is always true here because nothing was sent to the customer.
+ * is enabled.
+ *
+ * `historical_intake_recorded` reports ONLY a historical intake record: no
+ * request ref, no backend/poll id, no current resolution, and never a notice.
+ * `existing_restock_recorded` reports the recovery of an ALREADY accepted
+ * request; its `status` is a bare enum — never a resolution payload, ETA or
+ * delivery promise — and `customerNotified: false` always holds because nothing
+ * was sent to the customer.
  */
 export type RequestHumanAssistanceRestockResult =
   | {
       readonly ok: true;
       readonly outcome: 'historical_intake_recorded';
+      readonly customerNotified: false;
+    }
+  | {
+      readonly ok: true;
+      readonly outcome: 'existing_restock_recorded';
+      readonly status: RestockExistingRequestStatus;
       readonly customerNotified: false;
     }
   | {
@@ -88,6 +100,22 @@ const blockReasons = [
   'reservation_blocked',
 ];
 
+/**
+ * Read a preflight `reason` WITHOUT invoking a hostile accessor: the metadata
+ * may be adversarial, so a throwing getter must stay inert and never add a
+ * second diagnostic or divert the result.
+ */
+function blockedReason(value: unknown): string | null {
+  try {
+    if (typeof value !== 'object' || value === null) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'reason');
+    const reason: unknown = descriptor?.value;
+    return typeof reason === 'string' ? reason : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Observe fixed codes only; accessors and observation failures are inert. */
 function restockDiagnostic() {
   let attemptId: string;
@@ -97,7 +125,7 @@ function restockDiagnostic() {
     return () => {};
   }
   return (
-    stage: 'preflight' | 'coordinator',
+    stage: 'preflight' | 'coordinator' | 'recovery',
     code: unknown,
     value?: Record<string, unknown>,
   ) => {
@@ -105,7 +133,9 @@ function restockDiagnostic() {
       const outcomes =
         stage === 'preflight'
           ? ['legacy', 'blocked', 'exception']
-          : ['recorded', 'existing', 'hold', 'blocked', 'exception'];
+          : stage === 'recovery'
+            ? ['recorded', 'unavailable', 'exception']
+            : ['recorded', 'existing', 'hold', 'blocked', 'exception'];
       const outcome = outcomes.find((fixed) => fixed === code) ?? 'unknown';
       let reason = outcome === 'exception' ? 'exception' : 'none';
       if (outcome === 'blocked' || outcome === 'hold') {
@@ -142,6 +172,11 @@ function restockDiagnostic() {
  * durable `recorded`/`existing` coordinator result is
  * reported, as a distinct non-notifying historical-record outcome. No backend
  * or poll id is ever exposed.
+ *
+ * The ONE exception is a preflight `existing_restock` block: an ALREADY accepted
+ * request is not a failure, so it is recovered read-only (no POST, no
+ * coordinator, no legacy fallback) and reported as `existing_restock_recorded`.
+ * Recovery never falls through to the coordinator.
  */
 async function runRestockRoute(
   deps: ToolDeps,
@@ -173,6 +208,12 @@ async function runRestockRoute(
     const route = outcome.route;
     if (route !== 'restock') {
       observe(stage, route, outcome);
+      if (
+        outcome.route === 'blocked' &&
+        blockedReason(outcome) === 'existing_restock'
+      ) {
+        return runExistingRecovery(restock, digest, context, observe);
+      }
       return failClosedRestock();
     }
     stage = 'coordinator';
@@ -201,10 +242,55 @@ async function runRestockRoute(
   }
 }
 
+/**
+ * Read-only recovery for a preflight `existing_restock` block. It reuses the
+ * accepted local receipt, the current-state GET and the shared classifier; it
+ * NEVER calls the coordinator, POSTs an intake or touches the legacy path. Only
+ * a proven same-subject acceptance is reported; everything else (or a throw)
+ * stays the generic `restock_unavailable` with the SAME sanitized shape.
+ */
+async function runExistingRecovery(
+  restock: RestockToolCapability,
+  digest: unknown,
+  context: {
+    senderId: string;
+    inboundEvent?: unknown;
+    catalogSession?: CatalogSession;
+  },
+  observe: (
+    stage: 'preflight' | 'coordinator' | 'recovery',
+    code: unknown,
+    value?: Record<string, unknown>,
+  ) => void,
+): Promise<RequestHumanAssistanceRestockResult> {
+  try {
+    const recovery = await restock.recovery.recover({
+      senderId: context.senderId,
+      catalogSession: context.catalogSession,
+      inboundEvent: context.inboundEvent,
+      digest,
+    });
+    if (recovery.outcome === 'existing_restock_recorded') {
+      observe('recovery', 'recorded');
+      return {
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status: recovery.status,
+        customerNotified: false,
+      };
+    }
+    observe('recovery', 'unavailable');
+    return failClosedRestock();
+  } catch {
+    observe('recovery', 'exception');
+    return failClosedRestock();
+  }
+}
+
 export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
   const definition = {
     description:
-      "Escala el caso a un agente humano. SOLO llámala cuando `checkStock` / `evaluateCart` / la conversación lo indiquen. NO la uses para derivaciones que no correspondan a un caso explícito. Regla INTERNA; no la recites al cliente. Distingue el resultado EXACTO: `{ ok: true, customerNotified: true }` es la ruta legado y sí notifica al cliente; en `kind: 'out_of_stock'` la ruta RESTOCK devuelve `{ ok: true, outcome: 'historical_intake_recorded', customerNotified: false }`, que confirma la aceptación de la consulta, no su estado actual. No acredita revisión humana, resolución actual, ETA, respuesta humana, notificación futura ni entrega del proveedor: no prometas seguimiento ni afirmes que sigue pendiente. Tampoco demuestra que no exista seguimiento: no confundas falta de evidencia con ausencia de un circuito de atención. No afirmes que un agente la leyó ni que el cliente fue notificado. Si devuelve `{ ok: false, error: { kind: 'restock_unavailable', retryable: false } }`, di que la solicitud no pudo confirmarse: NO reintentes, NO escales por la vía legado y NO impliques que se envió un aviso. Respuesta al cliente en RESTOCK: Solo con registro histórico confirmado (nuevo o ya existente), puedes decir: «Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.» Usa la presentación confirmada. En una consulta ya registrada, no afirmes que acabas de enviarla. No pidas permiso para registrar lo ya aceptado ni lo ofrezcas como lista de espera. No implica reserva, revisión humana, contacto, aviso futuro ni fecha de reposición; no los prometas. Si el registro no se pudo confirmar o el resultado es ambiguo: «Por ahora no puedo confirmar que su consulta haya quedado registrada.» No afirmes éxito ni ausencia definitiva de registro. No fuerces una oferta de venta después de ese resultado.",
+      "Escala el caso a un agente humano. SOLO llámala cuando `checkStock` / `evaluateCart` / la conversación lo indiquen. NO la uses para derivaciones que no correspondan a un caso explícito. Regla INTERNA; no la recites al cliente. Distingue el resultado EXACTO: `{ ok: true, customerNotified: true }` es la ruta legado y sí notifica al cliente; en `kind: 'out_of_stock'` la ruta RESTOCK devuelve `{ ok: true, outcome: 'historical_intake_recorded', customerNotified: false }`, que confirma la aceptación de la consulta, no su estado actual. En una consulta RESTOCK ya aceptada, la ruta de recuperación devuelve `{ ok: true, outcome: 'existing_restock_recorded', status, customerNotified: false }`: `status: 'pending'` es una consulta registrada que sigue en espera de respuesta; `status: 'response_recorded'` o `status: 'stale'` significan que ya existe una respuesta registrada (vigente o ya no vigente, respectivamente); `status: 'current_status_unknown'` significa que la consulta registrada existe pero su estado actual no pudo confirmarse. En los cuatro casos reconoce que la consulta ya estaba registrada y NO ofrezcas registrarla de nuevo ni pidas permiso para ello; nunca reveles el contenido de la respuesta, ETA, fecha de reposición, notificación, contacto ni entrega; no lo trates como un fallo genérico. No acredita revisión humana, resolución actual, ETA, respuesta humana, notificación futura ni entrega del proveedor: no prometas seguimiento ni afirmes que sigue pendiente. Tampoco demuestra que no exista seguimiento: no confundas falta de evidencia con ausencia de un circuito de atención. No afirmes que un agente la leyó ni que el cliente fue notificado. Si devuelve `{ ok: false, error: { kind: 'restock_unavailable', retryable: false } }`, di que la solicitud no pudo confirmarse: NO reintentes, NO escales por la vía legado y NO impliques que se envió un aviso. Respuesta al cliente en RESTOCK: Solo con registro histórico confirmado (nuevo o ya existente), puedes decir: «Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.» Usa la presentación confirmada. En una consulta ya registrada, no afirmes que acabas de enviarla. No pidas permiso para registrar lo ya aceptado ni lo ofrezcas como lista de espera. No implica reserva, revisión humana, contacto, aviso futuro ni fecha de reposición; no los prometas. Si el registro no se pudo confirmar o el resultado es ambiguo: «Por ahora no puedo confirmar que su consulta haya quedado registrada.» No afirmes éxito ni ausencia definitiva de registro. No fuerces una oferta de venta después de ese resultado.",
     inputSchema: z.discriminatedUnion('kind', [
       z.object({
         kind: z.literal('out_of_stock'),

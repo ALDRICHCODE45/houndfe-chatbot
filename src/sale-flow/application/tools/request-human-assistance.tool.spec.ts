@@ -362,6 +362,7 @@ describe('makeRequestHumanAssistanceTool', () => {
       overrides: {
         markers?: { readForSender: jest.Mock };
         coordinator?: { coordinate: jest.Mock };
+        recovery?: { recover: jest.Mock };
         getStock?: jest.Mock;
         getState?: jest.Mock;
       } = {},
@@ -377,6 +378,9 @@ describe('makeRequestHumanAssistanceTool', () => {
           decision: 'recorded' as const,
           historicalPollId: 'BACKEND-POLL-ID-1',
         })),
+      };
+      const recovery: { recover: jest.Mock } = overrides.recovery ?? {
+        recover: jest.fn(async () => ({ outcome: 'unavailable' as const })),
       };
       const getStock = overrides.getStock ?? jest.fn(async () => buildStock());
       const getState = overrides.getState ?? jest.fn(async () => null);
@@ -397,9 +401,18 @@ describe('makeRequestHumanAssistanceTool', () => {
           enabled: true as const,
           markers: markers as never,
           coordinator: coordinator as never,
+          recovery: recovery as never,
         },
       };
-      return { deps, markers, coordinator, create, getStock, getState };
+      return {
+        deps,
+        markers,
+        coordinator,
+        recovery,
+        create,
+        getStock,
+        getState,
+      };
     }
 
     describe('fixed server-only diagnostics', () => {
@@ -437,7 +450,6 @@ describe('makeRequestHumanAssistanceTool', () => {
         'catalog_read_failed',
         'catalog_unverified',
         'existing_legacy',
-        'existing_restock',
         'conflicting_markers',
         'indeterminate_marker_state',
         'route_not_available',
@@ -557,6 +569,46 @@ describe('makeRequestHumanAssistanceTool', () => {
         expectLog('preflight', route === 'legacy' ? 'legacy' : 'unknown');
         expect(coordinator.coordinate).not.toHaveBeenCalled();
       });
+
+      it.each(['recorded', 'unavailable'] as const)(
+        'observes recovery %s after the existing_restock block',
+        async (outcome) => {
+          jest.spyOn(preflight, 'preflightRestockRequest').mockResolvedValue({
+            route: 'blocked',
+            reason: 'existing_restock',
+          } as never);
+          const { deps } = buildRestockDeps({
+            recovery: {
+              recover: jest.fn(async () =>
+                outcome === 'recorded'
+                  ? {
+                      outcome: 'existing_restock_recorded' as const,
+                      status: 'pending' as const,
+                    }
+                  : { outcome: 'unavailable' as const },
+              ),
+            },
+          });
+          expect(await run(deps)).toEqual(
+            outcome === 'recorded'
+              ? {
+                  ok: true,
+                  outcome: 'existing_restock_recorded',
+                  status: 'pending',
+                  customerNotified: false,
+                }
+              : failClosed,
+          );
+          expect(log.mock.calls).toEqual([
+            [
+              `restock_diagnostic attemptId=${attemptId} stage=preflight outcome=blocked reason=existing_restock`,
+            ],
+            [
+              `restock_diagnostic attemptId=${attemptId} stage=recovery outcome=${outcome} reason=none`,
+            ],
+          ]);
+        },
+      );
 
       it('never reads historical IDs or rereads a decision for logging', async () => {
         const { deps, coordinator } = buildRestockDeps();
@@ -961,6 +1013,124 @@ describe('makeRequestHumanAssistanceTool', () => {
       expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
       expect(create).not.toHaveBeenCalled();
       expect(result).toEqual(failClosed);
+    });
+
+    describe('existing accepted request recovery (read-only)', () => {
+      const recordedOutcome = (
+        status:
+          | 'pending'
+          | 'response_recorded'
+          | 'stale'
+          | 'current_status_unknown',
+      ) => ({
+        ok: true,
+        outcome: 'existing_restock_recorded',
+        status,
+        customerNotified: false,
+      });
+      const blockExisting = () =>
+        jest.spyOn(preflight, 'preflightRestockRequest').mockResolvedValue({
+          route: 'blocked',
+          reason: 'existing_restock',
+        } as never);
+      afterEach(() => jest.restoreAllMocks());
+
+      it.each([
+        'pending',
+        'response_recorded',
+        'stale',
+        'current_status_unknown',
+      ] as const)(
+        'recovers an accepted request as %s without POST, coordinator or legacy',
+        async (status) => {
+          blockExisting();
+          const {
+            deps,
+            recovery,
+            coordinator,
+            create,
+            getStock,
+            getState,
+            markers,
+          } = buildRestockDeps({
+            recovery: {
+              recover: jest.fn(async () => ({
+                outcome: 'existing_restock_recorded' as const,
+                status,
+              })),
+            },
+          });
+          const result = await makeRequestHumanAssistanceTool(deps).execute(
+            outOfStockInput,
+            { toolCallId: 't', messages: [], context: groundedContext() },
+          );
+          expect(result).toEqual(recordedOutcome(status));
+          expect(recovery.recover).toHaveBeenCalledTimes(1);
+          expect(recovery.recover).toHaveBeenCalledWith({
+            senderId: SENDER,
+            catalogSession: expect.anything() as unknown,
+            inboundEvent: INBOUND,
+            digest: outOfStockInput.digest,
+          });
+          // Strictly read-only: no coordinator, no legacy, no catalog re-read.
+          expect(coordinator.coordinate).not.toHaveBeenCalled();
+          expect(create).not.toHaveBeenCalled();
+          expect(getStock).not.toHaveBeenCalled();
+          expect(getState).not.toHaveBeenCalled();
+          expect(markers.readForSender).not.toHaveBeenCalled();
+        },
+      );
+
+      it('keeps the generic failure when recovery finds no proven acceptance', async () => {
+        blockExisting();
+        const { deps, recovery, coordinator, create } = buildRestockDeps();
+        const result = await makeRequestHumanAssistanceTool(deps).execute(
+          outOfStockInput,
+          { toolCallId: 't', messages: [], context: groundedContext() },
+        );
+        expect(result).toEqual(failClosed);
+        expect(recovery.recover).toHaveBeenCalledTimes(1);
+        expect(coordinator.coordinate).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      });
+
+      it('sanitizes a throwing recovery into the same generic failure', async () => {
+        blockExisting();
+        const { deps, coordinator, create } = buildRestockDeps({
+          recovery: {
+            recover: jest.fn(async () => {
+              throw new Error('PRIVATE-recovery');
+            }),
+          },
+        });
+        const result = await makeRequestHumanAssistanceTool(deps).execute(
+          outOfStockInput,
+          { toolCallId: 't', messages: [], context: groundedContext() },
+        );
+        expect(result).toEqual(failClosed);
+        expect(coordinator.coordinate).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      });
+
+      it('never recovers unless the preflight block is exactly existing_restock', async () => {
+        for (const reason of [
+          'existing_legacy',
+          'conflicting_markers',
+          'indeterminate_marker_state',
+        ] as const) {
+          jest
+            .spyOn(preflight, 'preflightRestockRequest')
+            .mockResolvedValue({ route: 'blocked', reason } as never);
+          const { deps, recovery, coordinator } = buildRestockDeps();
+          const result = await makeRequestHumanAssistanceTool(deps).execute(
+            outOfStockInput,
+            { toolCallId: 't', messages: [], context: groundedContext() },
+          );
+          expect(result).toEqual(failClosed);
+          expect(recovery.recover).not.toHaveBeenCalled();
+          expect(coordinator.coordinate).not.toHaveBeenCalled();
+        }
+      });
     });
   });
 });
