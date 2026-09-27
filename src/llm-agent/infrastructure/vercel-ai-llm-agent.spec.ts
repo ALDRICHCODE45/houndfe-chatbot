@@ -3,6 +3,7 @@ import { generateText, stepCountIs } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { makeCheckStockTool } from '../../sale-flow/application/tools/check-stock.tool';
+import { makeRequestHumanAssistanceTool } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { ToolDeps } from '../../sale-flow/application/tool-deps';
 import { openai } from '@ai-sdk/openai';
 import type { LlmRunInput } from '../domain/llm-agent.port';
@@ -22,8 +23,10 @@ import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
  * is the gate-fix for that failure mode.
  */
 describe('real SDK catalog context isolation', () => {
-  it('preserves the full composed prompt in both SDK branches and isolates catalog evidence', async () => {
-    const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
+  it.each([false, true])('forwards voice (shipping=%s)', async (shipping) => {
+    const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
+      shippingQuoteAvailable: shipping,
+    });
     const senderId = 'PRIVATE_OFFLINE_SENDER';
     const catalogSession = new CatalogSession(senderId, 60000, 0);
     const model = new MockLanguageModelV4({
@@ -52,6 +55,7 @@ describe('real SDK catalog context isolation', () => {
     };
     const agent = new VercelAiLlmAgent(offlineGenerate, 'unused', 2);
     const tools = {
+      requestHumanAssistance: makeRequestHumanAssistanceTool({} as ToolDeps),
       checkStock: makeCheckStockTool({
         chatbotApi: { getStock: jest.fn() },
       } as unknown as ToolDeps),
@@ -131,8 +135,32 @@ describe('real SDK catalog context isolation', () => {
     ]);
     expect(JSON.stringify(result.messages)).not.toContain(catalogEvidence!);
     for (const call of model.doGenerateCalls) {
-      // The boot prompt is checked byte-for-byte above; its originalPriceCents
-      // instruction contains "origin", which is not leaked session metadata.
+      // Scripted replies prove transport only, not generated voice quality.
+      expect(call.prompt[0]).toEqual({ role: 'system', content: systemPrompt });
+      expect(systemPrompt.includes('# Cotización de envío')).toBe(shipping);
+      const assistance = call.tools?.find(
+        (tool) => tool.name === 'requestHumanAssistance',
+      );
+      expect(assistance).toMatchObject({
+        type: 'function',
+        description: tools.requestHumanAssistance.description,
+      });
+      if (assistance?.type !== 'function') {
+        throw new Error('Expected the real assistance function tool');
+      }
+      for (const instructions of [systemPrompt, assistance.description]) {
+        expect(instructions).toContain(
+          'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
+        );
+        expect(instructions).toContain('no afirmes que acabas de enviarla');
+        expect(instructions).toContain(
+          'Por ahora no puedo confirmar que su consulta haya quedado registrada.',
+        );
+        expect(instructions).not.toContain('Registramos su interés');
+        expect(instructions).not.toContain('ni hay seguimiento');
+      }
+      // Match the exact origin token, not legitimate price-schema fields
+      // such as originalTotalCents. The boot prompt is checked above.
       const providerData = JSON.stringify({
         prompt: call.prompt.slice(1),
         tools: call.tools,
@@ -141,7 +169,7 @@ describe('real SDK catalog context isolation', () => {
         senderId,
         'senderId',
         'observedAt',
-        'origin',
+        '"origin"',
         'catalogSession',
         'toolsContext',
       ]) {

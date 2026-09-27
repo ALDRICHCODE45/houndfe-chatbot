@@ -290,10 +290,10 @@ describe('sale-flow-instructions', () => {
       const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
       expect(prompt).toContain("outcome: 'historical_intake_recorded'");
       expect(prompt).toContain(
-        'NO hubo contacto humano ni notificación al cliente',
+        'confirma la aceptación de la consulta, no su estado actual',
       );
       expect(prompt).toContain(
-        'no hay resolución actual, ETA, respuesta humana',
+        'No acredita revisión humana, resolución actual, ETA',
       );
       expect(prompt).toContain('no prometas seguimiento');
       expect(prompt).toContain('NO reintentes, NO escales por la vía legado');
@@ -313,7 +313,7 @@ describe('sale-flow-instructions', () => {
         'Stock desconocido o consulta fallida no significa agotado',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'Ejemplo para disponibilidad, solo con agotamiento confirmado: "Por el momento, [presentación] está agotada."',
+        'Ejemplo para disponibilidad, solo con agotamiento confirmado: "Por ahora no tenemos [presentación]."',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'Si solo pregunta por disponibilidad, no anuncies la falta de fecha',
@@ -322,7 +322,7 @@ describe('sale-flow-instructions', () => {
         'Solo si falta el dato y la fecha es relevante (porque pregunta por reposición o cuándo vuelve, o el contexto lo requiere)',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'No tenemos una fecha de reposición confirmada.',
+        'Aún no tengo una fecha confirmada para que vuelva a estar disponible.',
       );
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain(
         'está agotada. No tenemos una fecha',
@@ -356,16 +356,33 @@ describe('sale-flow-instructions', () => {
             'Solo con registro histórico confirmado (nuevo o ya existente)',
           );
           expect(instructions).toContain(
-            '¡Listo! 😊 Registramos su interés por [producto/presentación].',
+            'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
           );
           expect(instructions).toContain('No implica reserva');
           expect(instructions).toContain(
-            'Por el momento, no puedo confirmar que su interés haya quedado registrado.',
+            'Por ahora no puedo confirmar que su consulta haya quedado registrada.',
           );
           expect(instructions).toContain(
             'No afirmes éxito ni ausencia definitiva de registro',
           );
           expect(instructions).toContain('No fuerces una oferta de venta');
+          expect(instructions).toContain('no afirmes que acabas de enviarla');
+          expect(instructions).toContain(
+            'No pidas permiso para registrar lo ya aceptado',
+          );
+          expect(instructions).toContain(
+            'Tampoco demuestra que no exista seguimiento',
+          );
+          expect(instructions).toContain('pendiente');
+          for (const obsolete of [
+            'Registramos su interés',
+            'registrar su interés',
+            'su interés haya quedado registrado',
+            'ni hay seguimiento',
+            'no hay resolución actual',
+          ]) {
+            expect(instructions).not.toContain(obsolete);
+          }
         }
       },
     );
@@ -492,10 +509,12 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('RESTOCK success proves no resolution, ETA, human response, future notification or provider delivery, and promises no follow-up', () => {
-      expect(SALE_FLOW_INSTRUCTIONS).toMatch(/no hay resolución actual/i);
-      expect(SALE_FLOW_INSTRUCTIONS).toMatch(
-        /respuesta humana, notificación futura ni entrega del proveedor/i,
+    it('RESTOCK acceptance does not establish current state or promise follow-up', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'confirma la aceptación de la consulta, no su estado actual',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'No acredita revisión humana, resolución actual, ETA, respuesta humana, notificación futura ni entrega del proveedor',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toMatch(/no prometas seguimiento/i);
     });

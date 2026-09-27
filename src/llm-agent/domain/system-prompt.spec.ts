@@ -89,6 +89,14 @@ describe('SYSTEM_PROMPT', () => {
       expect(SYSTEM_PROMPT).toContain('no son obligatorios');
     });
 
+    it('uses natural consultation language rather than an interest or waitlist offer', () => {
+      expect(SYSTEM_PROMPT).toContain('consultas de reposición');
+      expect(SYSTEM_PROMPT).toContain(
+        'frases breves y naturales, no lenguaje de trámite',
+      );
+      expect(SYSTEM_PROMPT).not.toContain('registro de interés');
+    });
+
     it('answers the stated request with useful verified details, not boilerplate', () => {
       expect(SYSTEM_PROMPT).toContain(
         'Responde primero a lo que el cliente pidió',
