@@ -253,6 +253,68 @@ describe('sale-flow-instructions', () => {
     });
   });
 
+  describe('customer voice boundaries (text contracts, not generated replies)', () => {
+    it('conditions availability examples on verified stock and preserves unknown ETA', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain('Claro que sí 😊 Contamos con');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'solo con existencias verificadas para esa presentación',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Una coincidencia de catálogo no confirma existencias',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Stock desconocido o consulta fallida no significa agotado',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Por el momento, [presentación] está agotada. No tenemos una fecha de reposición confirmada.',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'solo si el agotamiento está confirmado y no hay fecha verificada',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'No reemplaces una fecha verificada por ese ejemplo',
+      );
+    });
+
+    it('keeps the shortage call immediate without a new voice-driven consent gate', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        "Si `checkStock` devuelve ese sobre, llama a `requestHumanAssistance({ kind: 'out_of_stock'",
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Los ejemplos de voz no agregan una confirmación ni retrasan esa llamada',
+      );
+    });
+
+    it.each([false, true])(
+      'separates internal intake truth from conditional copy with shipping=%s',
+      (shippingQuoteAvailable) => {
+        const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
+          shippingQuoteAvailable,
+        });
+        const description = makeRequestHumanAssistanceTool(
+          {} as never,
+        ).description;
+        for (const instructions of [prompt, description]) {
+          expect(instructions).toContain('Regla INTERNA; no la recites');
+          expect(instructions).toContain(
+            'Solo con registro histórico confirmado (nuevo o ya existente)',
+          );
+          expect(instructions).toContain(
+            '¡Listo! 😊 Registramos su interés por [producto/presentación].',
+          );
+          expect(instructions).toContain('No implica reserva');
+          expect(instructions).toContain(
+            'Por el momento, no puedo confirmar que su interés haya quedado registrado.',
+          );
+          expect(instructions).toContain(
+            'No afirmes éxito ni ausencia definitiva de registro',
+          );
+          expect(instructions).toContain('No fuerces una oferta de venta');
+        }
+      },
+    );
+  });
+
   describe('composeSaleFlowSystemPrompt', () => {
     it('returns base + "\\n\\n" + slice (one-arg composer)', () => {
       expect(composeSaleFlowSystemPrompt(base)).toBe(

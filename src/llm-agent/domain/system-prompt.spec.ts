@@ -53,6 +53,38 @@ describe('SYSTEM_PROMPT', () => {
     expect(SYSTEM_PROMPT).toMatch(/entrega/i);
   });
 
+  describe('customer voice guidance (presence, not model compliance)', () => {
+    it('requires warm usted without impersonating a human or forcing emojis', () => {
+      expect(SYSTEM_PROMPT).toContain('cálido y cercano, siempre de usted');
+      expect(SYSTEM_PROMPT).toContain('No te presentes como asesor humano');
+      expect(SYSTEM_PROMPT).toContain('1–2 emojis discretos');
+      expect(SYSTEM_PROMPT).toContain('no son obligatorios');
+    });
+
+    it('answers the stated request with useful verified details, not boilerplate', () => {
+      expect(SYSTEM_PROMPT).toContain(
+        'Responde primero a lo que el cliente pidió',
+      );
+      expect(SYSTEM_PROMPT).toContain('no preguntes "¿En qué puedo ayudarle?"');
+      expect(SYSTEM_PROMPT).toContain('Omite "Sin Marca" y campos vacíos');
+      expect(SYSTEM_PROMPT).toContain('Evita narrar "He encontrado..."');
+      expect(SYSTEM_PROMPT).toContain('No repitas cierres como "No dude..."');
+      expect(SYSTEM_PROMPT).toContain('un solo siguiente paso útil');
+    });
+
+    it('keeps internal evidence intact and gives required literal replies priority', () => {
+      expect(SYSTEM_PROMPT).toContain(
+        'Traduce IDs, marcadores técnicos y resultados internos',
+      );
+      expect(SYSTEM_PROMPT).toContain(
+        'conserva intacta la evidencia para las herramientas',
+      );
+      expect(SYSTEM_PROMPT).toContain(
+        'Las respuestas literales obligatorias tienen prioridad',
+      );
+    });
+  });
+
   it('is non-empty and reasonably bounded', () => {
     expect(SYSTEM_PROMPT.length).toBeGreaterThan(200);
     expect(SYSTEM_PROMPT.length).toBeLessThan(4000);
