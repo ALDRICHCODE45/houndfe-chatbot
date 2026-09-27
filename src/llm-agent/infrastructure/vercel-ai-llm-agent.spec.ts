@@ -7,6 +7,7 @@ import type { ToolDeps } from '../../sale-flow/application/tool-deps';
 import { openai } from '@ai-sdk/openai';
 import type { LlmRunInput } from '../domain/llm-agent.port';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { composeSaleFlowSystemPrompt } from '../../sale-flow/domain/sale-flow-instructions';
 import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
 import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
 
@@ -21,7 +22,8 @@ import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
  * is the gate-fix for that failure mode.
  */
 describe('real SDK catalog context isolation', () => {
-  it('accepts subsequent-turn catalog evidence through instructions without persisting it', async () => {
+  it('preserves the full composed prompt in both SDK branches and isolates catalog evidence', async () => {
+    const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
     const senderId = 'PRIVATE_OFFLINE_SENDER';
     const catalogSession = new CatalogSession(senderId, 60000, 0);
     const model = new MockLanguageModelV4({
@@ -58,16 +60,19 @@ describe('real SDK catalog context isolation', () => {
       senderId,
       text: 'Busca un producto',
       history: [],
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt,
       tools,
       catalogSession,
     });
-    expect(sdkInputs[0].system).toBe(SYSTEM_PROMPT);
+    expect(sdkInputs[0].system).toBe(systemPrompt);
     expect(sdkInputs[0].instructions).toBeUndefined();
-    expect(model.doGenerateCalls[0].prompt[0]).toEqual({
-      role: 'system',
-      content: SYSTEM_PROMPT,
-    });
+    expect(model.doGenerateCalls[0].prompt).toEqual([
+      { role: 'system', content: systemPrompt },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'Busca un producto' }],
+      },
+    ]);
 
     // Recreate the persisted search evidence available on the next inbound turn.
     catalogSession.installSearch(catalogSession.beginSearch(), [
@@ -86,7 +91,7 @@ describe('real SDK catalog context isolation', () => {
       senderId,
       text,
       history: first.messages,
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt,
       tools,
       catalogSession,
       catalogEvidence: catalogEvidence!,
@@ -102,7 +107,7 @@ describe('real SDK catalog context isolation', () => {
     expect(sdkInputs[1].messages).toEqual(expectedMessages);
     expect(sdkInputs[1].system).toBeUndefined();
     expect(sdkInputs[1].instructions).toEqual([
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'system', content: catalogEvidence },
     ]);
     for (const input of sdkInputs) {
@@ -113,7 +118,7 @@ describe('real SDK catalog context isolation', () => {
     }
     expect(model.doGenerateCalls).toHaveLength(2);
     expect(model.doGenerateCalls[1].prompt).toEqual([
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'system', content: catalogEvidence },
       ...expectedMessages.map((message) => ({
         role: message.role,
@@ -126,8 +131,10 @@ describe('real SDK catalog context isolation', () => {
     ]);
     expect(JSON.stringify(result.messages)).not.toContain(catalogEvidence!);
     for (const call of model.doGenerateCalls) {
+      // The boot prompt is checked byte-for-byte above; its originalPriceCents
+      // instruction contains "origin", which is not leaked session metadata.
       const providerData = JSON.stringify({
-        prompt: call.prompt,
+        prompt: call.prompt.slice(1),
         tools: call.tools,
       });
       for (const privateValue of [

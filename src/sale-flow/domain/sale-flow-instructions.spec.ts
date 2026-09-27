@@ -129,8 +129,35 @@ describe('sale-flow-instructions', () => {
 
     it('presents actual candidates, including unavailable ones, for confirmation', () => {
       expect(steps).toContain('incluidos los agotados');
-      expect(steps).toContain('nombre, presentación y precio devueltos');
+      expect(steps).toContain('conserva nombre, dosis y forma necesarios');
+      expect(steps).toContain('incluso si solo hay un candidato');
       expect(steps).toContain('confirma la presentación real');
+    });
+
+    it('answers first with distinct options and contextual verified prices', () => {
+      for (const rule of [
+        'Responde primero a la consulta concreta con datos verificados',
+        'Un candidato relevante: respuesta breve y natural',
+        'Varios candidatos: opciones breves con diferencias útiles',
+        'una pregunta concreta para elegir cuando haga falta',
+        'sin narrar el proceso de búsqueda',
+        'no uses una ficha anidada',
+        'Precio verificado solo si lo pidió, ayuda a comparar o corresponde a cotización, carrito o pedido',
+        'No cierres por rutina con preguntas genéricas',
+        'Si la disponibilidad es relevante y está verificada, empieza por ella',
+        'agotamiento confirmado, informa con calma, sin celebrar',
+        'Stock no gestionado no confirma disponibilidad ni agotamiento',
+        'No fuerces una oferta de venta después de un error',
+      ]) {
+        expect(steps).toContain(rule);
+      }
+      expect(steps).not.toContain('nombre, presentación y precio devueltos');
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Muestra al cliente el `originalPriceCents` de cada línea y el total',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'productos, cantidades, precios, total',
+      );
     });
 
     it('bounds empty-result refinement to one distinct broader query', () => {

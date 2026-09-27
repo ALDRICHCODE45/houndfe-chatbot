@@ -67,9 +67,27 @@ describe('SYSTEM_PROMPT', () => {
       );
       expect(SYSTEM_PROMPT).toContain('no preguntes "¿En qué puedo ayudarle?"');
       expect(SYSTEM_PROMPT).toContain('Omite "Sin Marca" y campos vacíos');
-      expect(SYSTEM_PROMPT).toContain('Evita narrar "He encontrado..."');
+      expect(SYSTEM_PROMPT).toContain('sin narrar el proceso de búsqueda');
+      expect(SYSTEM_PROMPT).toContain('no uses una ficha anidada');
+      expect(SYSTEM_PROMPT).toContain(
+        'No cierres por rutina con preguntas genéricas',
+      );
       expect(SYSTEM_PROMPT).toContain('No repitas cierres como "No dude..."');
       expect(SYSTEM_PROMPT).toContain('un solo siguiente paso útil');
+    });
+
+    it('adapts identification, availability and price to the current request', () => {
+      for (const rule of [
+        'Un candidato relevante: respuesta breve y natural',
+        'Varios candidatos: opciones breves con diferencias útiles',
+        'conserva nombre, dosis y forma necesarios',
+        'no infieras selección ni omitas la confirmación requerida',
+        'Si la disponibilidad es relevante y está verificada, empieza por ella',
+        'agotamiento confirmado, informa con calma, sin celebrar',
+        'Precio verificado solo si lo pidió, ayuda a comparar o corresponde a cotización, carrito o pedido',
+      ]) {
+        expect(SYSTEM_PROMPT).toContain(rule);
+      }
     });
 
     it('keeps internal evidence intact and gives required literal replies priority', () => {
