@@ -82,11 +82,56 @@ describe('SYSTEM_PROMPT', () => {
   });
 
   describe('customer voice guidance (presence, not model compliance)', () => {
-    it('requires warm usted without impersonating a human or forcing emojis', () => {
+    it('requires warm usted without taking a real staff identity or their private data', () => {
       expect(SYSTEM_PROMPT).toContain('cálido y cercano, siempre de usted');
       expect(SYSTEM_PROMPT).toContain('No te presentes como asesor humano');
-      expect(SYSTEM_PROMPT).toContain('1–2 emojis discretos');
-      expect(SYSTEM_PROMPT).toContain('no son obligatorios');
+      expect(SYSTEM_PROMPT).toContain(
+        'identidad de una persona real del equipo',
+      );
+      expect(SYSTEM_PROMPT).toContain('datos privados');
+    });
+
+    it('reciprocates the initial greeting on the customer own time of day', () => {
+      for (const rule of [
+        'devuélvelo una sola vez',
+        'la misma franja del día que él usó',
+        'saluda neutral',
+        'nunca inventes hora ni zona horaria',
+        'no repitas el saludo en turnos siguientes',
+      ]) {
+        expect(SYSTEM_PROMPT).toContain(rule);
+      }
+    });
+
+    it('treats a light friendly emoji as normal service voice, bounded, never celebratory on failures and never inside literals', () => {
+      for (const rule of [
+        'es parte de esta voz',
+        'no un extra opcional',
+        'no en cada turno',
+        'puedes usarlo aunque algo no esté disponible',
+        'celebrar un faltante confirmado, un error o un rechazo',
+        'ni dentro de mensajes literales',
+      ]) {
+        expect(SYSTEM_PROMPT).toContain(rule);
+      }
+      // The weak "entirely optional" rule is replaced, not kept beside the new one.
+      expect(SYSTEM_PROMPT).not.toContain('1–2 emojis discretos');
+      expect(SYSTEM_PROMPT).not.toContain('no son obligatorios');
+    });
+
+    it('prefers gratitude at a genuine close and patience only after a real wait', () => {
+      expect(SYSTEM_PROMPT).toContain(
+        'ni te despidas ni cierres por preferencia antes de resolver la consulta',
+      );
+      expect(SYSTEM_PROMPT).toContain(
+        'Sí puedes agradecer información o paciencia cuando el contexto lo amerite',
+      );
+      expect(SYSTEM_PROMPT).toContain(
+        'Al cerrar de verdad una gestión resuelta, agradece la preferencia',
+      );
+      expect(SYSTEM_PROMPT).toContain(
+        'agradece la paciencia solo si el contexto muestra una espera real',
+      );
     });
 
     it('uses natural consultation language rather than an interest or waitlist offer', () => {
@@ -140,7 +185,13 @@ describe('SYSTEM_PROMPT', () => {
   });
 
   it('is non-empty and reasonably bounded', () => {
+    // Sanity check only: no production code caps the prompt length or
+    // truncates it before the provider call. The owner-approved voice
+    // guidance (greeting/emoji/thanks) is layered on top of the preserved
+    // safety guards (catalog-vs-stock, importes, UUID suppression, tool-use
+    // and flow pointers), so the prompt legitimately needs headroom above
+    // the previous 4000 bound.
     expect(SYSTEM_PROMPT.length).toBeGreaterThan(200);
-    expect(SYSTEM_PROMPT.length).toBeLessThan(4000);
+    expect(SYSTEM_PROMPT.length).toBeLessThan(5000);
   });
 });

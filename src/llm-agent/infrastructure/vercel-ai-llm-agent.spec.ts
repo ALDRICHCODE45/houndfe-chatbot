@@ -178,6 +178,127 @@ describe('real SDK catalog context isolation', () => {
     }
   });
 
+  it.each([false, true])(
+    'transmits the approved brand voice to the provider (shipping=%s)',
+    async (shipping) => {
+      const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
+        shippingQuoteAvailable: shipping,
+      });
+      const catalogSession = new CatalogSession(
+        'PRIVATE_VOICE_SENDER',
+        60000,
+        0,
+      );
+      const model = new MockLanguageModelV4({
+        doGenerate: {
+          content: [{ type: 'text', text: 'Offline voice reply' }],
+          finishReason: { unified: 'stop', raw: undefined },
+          usage: {
+            inputTokens: {
+              total: 1,
+              noCache: 1,
+              cacheRead: undefined,
+              cacheWrite: undefined,
+            },
+            outputTokens: { total: 1, text: 1, reasoning: undefined },
+          },
+          warnings: [],
+        },
+      });
+      const agent = new VercelAiLlmAgent(
+        ((options: Parameters<GenerateTextFn>[0]) =>
+          generateText({ ...options, model })) as GenerateTextFn,
+        'unused',
+        2,
+      );
+      const tools = {
+        requestHumanAssistance: makeRequestHumanAssistanceTool({} as ToolDeps),
+      };
+      // Turn 1: no catalog evidence. Turn 2: the same voice beside evidence.
+      const firstTurn = await agent.run({
+        senderId: 'PRIVATE_VOICE_SENDER',
+        text: 'Busca ibuprofeno de 400 mg',
+        history: [],
+        systemPrompt,
+        tools,
+        catalogSession,
+      });
+      catalogSession.installSearch(catalogSession.beginSearch(), [
+        {
+          productId: '00000000-0000-4000-8000-000000000001',
+          name: 'Ibuprofeno 400 mg',
+          variants: [],
+        },
+      ]);
+      const catalogEvidence = catalogSession.evidence(0)!;
+      await agent.run({
+        senderId: 'PRIVATE_VOICE_SENDER',
+        text: '¿Tiene existencias?',
+        history: firstTurn.messages,
+        systemPrompt,
+        tools,
+        catalogSession,
+        catalogEvidence,
+      });
+
+      expect(model.doGenerateCalls).toHaveLength(2);
+      for (const call of model.doGenerateCalls) {
+        const transmitted = call.prompt[0];
+        if (
+          transmitted.role !== 'system' ||
+          typeof transmitted.content !== 'string'
+        ) {
+          throw new Error('Expected a string system message first');
+        }
+        // Scripted replies prove transport only: this asserts the instructions
+        // the provider actually received, not the warmth of a real generation.
+        expect(transmitted.content).toBe(systemPrompt);
+        for (const voice of [
+          'devuélvelo una sola vez con la misma cortesía',
+          'la misma franja del día que él usó',
+          'Hola, buenas tardes! 🤗✨',
+          'sin inventar hora ni zona horaria',
+          'no repitas el saludo',
+          'Hola, buenas noches! 😊✨ Sí, tenemos',
+          'no repitas una confirmación del cliente ya establecida en el historial o el contexto',
+          'para entregar un dato verificado puedes escribir "Le comparto…"',
+          '¡Gracias a usted por su preferencia! 🤗✨ Que tenga una excelente noche.',
+          'agradece la paciencia solo si realmente esperó',
+          'mientras la consulta siga abierta no te despidas ni cierres por preferencia',
+          'es parte de esta voz',
+          'no un extra opcional',
+          'celebrar un faltante confirmado, un error o un rechazo',
+          'Al cerrar de verdad una gestión resuelta, agradece la preferencia',
+          'agradece la paciencia solo si el contexto muestra una espera real',
+          'Sí puedes agradecer información o paciencia cuando el contexto lo amerite',
+          'identidad de una persona real del equipo',
+        ]) {
+          expect(transmitted.content).toContain(voice);
+        }
+        for (const obsolete of [
+          'Saludo opcional y contextual',
+          '1–2 emojis discretos',
+          'no son obligatorios',
+        ]) {
+          expect(transmitted.content).not.toContain(obsolete);
+        }
+        expect(transmitted.content.includes('# Cotización de envío')).toBe(
+          shipping,
+        );
+        // Fixed literals and operational gates survive the voice rewrite.
+        for (const fixed of [
+          'esa función aún no está disponible',
+          'en un momento un agente te comparte los datos de pago',
+          '¿Confirmas la cancelación? Sí/No',
+          'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
+          'Aún no tengo una fecha confirmada para que vuelva a estar disponible.',
+        ]) {
+          expect(transmitted.content).toContain(fixed);
+        }
+      }
+    },
+  );
+
   it('keeps server context out of provider requests and ignores model-supplied context', async () => {
     const productId = '00000000-0000-4000-8000-000000000001';
     const wrongId = '00000000-0000-4000-8000-000000000002';

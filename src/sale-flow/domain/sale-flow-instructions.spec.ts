@@ -332,6 +332,79 @@ describe('sale-flow-instructions', () => {
       );
     });
 
+    it('reciprocates the customer greeting only at the first turn', () => {
+      const firstTurn = SALE_FLOW_INSTRUCTIONS.slice(
+        SALE_FLOW_INSTRUCTIONS.indexOf('\n1. '),
+        SALE_FLOW_INSTRUCTIONS.indexOf('\n2. '),
+      );
+      expect(firstTurn).toContain(
+        'devuélvelo una sola vez con la misma cortesía',
+      );
+      expect(firstTurn).toContain('la misma franja del día que él usó');
+      expect(firstTurn).toContain('Hola, buenas tardes! 🤗✨');
+      expect(firstTurn).toContain('un saludo neutral');
+      expect(firstTurn).toContain('sin inventar hora ni zona horaria');
+      expect(firstTurn).toContain('no repitas el saludo');
+      expect(firstTurn).toContain('sin añadir una pregunta genérica');
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain(
+        'Saludo opcional y contextual',
+      );
+    });
+
+    it('keeps the voice separate from fixed literals and flow order', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'La voz define el cómo, nunca el contenido verificado',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'no cambia las frases literales obligatorias',
+      );
+    });
+
+    it('warms the verified-availability answer without re-asking customer selection', () => {
+      const steps = SALE_FLOW_INSTRUCTIONS.slice(
+        SALE_FLOW_INSTRUCTIONS.indexOf('\n2. '),
+        SALE_FLOW_INSTRUCTIONS.indexOf('\n6. '),
+      );
+      expect(steps).toContain('Hola, buenas noches! 😊✨ Sí, tenemos');
+      expect(steps).toContain('ya confirmadas por `checkStock`');
+      expect(steps).toContain(
+        'que el stock esté confirmado no equivale a la selección del paso 4',
+      );
+      expect(steps).toContain(
+        'no repitas una confirmación del cliente ya establecida en el historial o el contexto',
+      );
+      expect(steps).toContain(
+        'solo con existencias verificadas para esa presentación',
+      );
+      expect(steps).toContain('Claro que sí 😊 Contamos con');
+    });
+
+    it('prefers service framing and genuine-close gratitude over boilerplate', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'para entregar un dato verificado puedes escribir "Le comparto…"',
+      );
+      const closing = SALE_FLOW_INSTRUCTIONS.slice(
+        SALE_FLOW_INSTRUCTIONS.indexOf('\n15. '),
+        SALE_FLOW_INSTRUCTIONS.indexOf('\n16. '),
+      );
+      expect(closing).toContain('solo cuando lo pedido esté resuelto');
+      expect(closing).toContain(
+        '¡Gracias a usted por su preferencia! 🤗✨ Que tenga una excelente noche.',
+      );
+      expect(closing).toContain('la misma franja del día que el cliente usó');
+      expect(closing).toContain(
+        'agradece la paciencia solo si realmente esperó',
+      );
+      expect(closing).toContain(
+        'mientras la consulta siga abierta no te despidas ni cierres por preferencia',
+      );
+      expect(closing).toContain(
+        'sí puedes agradecer información o paciencia cuando el contexto lo amerite',
+      );
+      expect(closing).toContain('un saludo neutral si el cliente no la indicó');
+      expect(closing).toContain('este slice no cotiza envíos');
+    });
+
     it('keeps the shortage call immediate without a new voice-driven consent gate', () => {
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         "Si `checkStock` devuelve ese sobre, llama a `requestHumanAssistance({ kind: 'out_of_stock'",
