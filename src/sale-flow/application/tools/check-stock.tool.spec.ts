@@ -1,3 +1,4 @@
+import { CatalogSession } from '../../../conversation/domain/catalog-references';
 import { makeCheckStockTool as makeCheckStockToolRaw } from './check-stock.tool';
 import type { ToolDeps } from '../tool-deps';
 import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
@@ -9,25 +10,117 @@ import {
 import type { ConversationStore } from '../../../conversation/domain/conversation-store';
 import type { StockCheckResponse } from '../../../chatbot-api/domain/dtos/catalog.dto';
 
-/**
- * Unit tests for the checkStock tool factory.
- *
- * Spec scenarios:
- *   - Maps productId (UUID) to chatbotApi.getStock
- *   - Returns { ok: true, ...StockCheckResponse } on success
- *   - 404 -> { ok: false, error: { kind: 'notFound', retryable: false } }
- *   - 5xx -> { ok: false, error: { kind: 'upstream', retryable: true } }
- *   - Rejects non-UUID productId at the schema layer
- */
+const productId = '00000000-0000-4000-8000-000000000001';
+const variantId = '00000000-0000-4000-8000-000000000002';
+const otherId = '00000000-0000-4000-8000-000000000003';
+const stock = (): StockCheckResponse => ({
+  productId,
+  name: 'Café Molido 500g',
+  stock: { status: 'out_of_stock', quantity: 0 },
+  variants: [
+    {
+      variantId,
+      name: '500g',
+      option: null,
+      value: null,
+      stock: { status: 'out_of_stock', quantity: 0 },
+    },
+  ],
+});
+const baseDeps = {
+  store: {} as ConversationStore,
+  cashierUserId: productId,
+  humanHandoffService: {} as never,
+};
 const makeCheckStockTool = (deps: ToolDeps) =>
   asSchemaVerifiedTool(makeCheckStockToolRaw(deps));
+function context() {
+  const catalogSession = new CatalogSession('sender', 60000, 0);
+  catalogSession.installSearch(catalogSession.beginSearch(), [stock()]);
+  return { catalogSession };
+}
+function setup(response = stock()) {
+  const getStock = jest.fn().mockResolvedValue(response);
+  const humanHandoffService = { create: jest.fn() };
+  const tool = makeCheckStockTool({
+    ...baseDeps,
+    chatbotApi: { getStock } as unknown as ChatbotApiClient,
+    humanHandoffService: humanHandoffService as never,
+  });
+  return { tool, getStock, humanHandoffService };
+}
 
 describe('makeCheckStockTool', () => {
-  const baseDeps = {
-    store: {} as ConversationStore,
-    cashierUserId: '00000000-0000-4000-8000-000000000001',
-    humanHandoffService: {} as never,
-  };
+  it('blocks an ungrounded UUID before any backend GET', async () => {
+    const { tool, getStock } = setup();
+    const result = await tool.execute(
+      { productId: '00000000-0000-4000-8000-000000000099' },
+      { toolCallId: 'ungrounded', messages: [], context: {} },
+    );
+    expect(getStock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false });
+  });
+
+  it('rejects a forged session even when a direct caller bypasses SDK validation', async () => {
+    const forged = Object.assign(
+      Object.create(CatalogSession.prototype) as CatalogSession,
+      { matches: () => true },
+    );
+    const { tool, getStock } = setup();
+    await expect(
+      tool.execute(
+        { productId },
+        {
+          toolCallId: 't',
+          messages: [],
+          context: { catalogSession: forged },
+        },
+      ),
+    ).resolves.toMatchObject({ ok: false });
+    expect(getStock).not.toHaveBeenCalled();
+  });
+
+  it('handles a grounded product without variants using the fresh backend name', async () => {
+    const response = { ...stock(), name: 'Updated backend name', variants: [] };
+    const { tool } = setup(response);
+    const catalogSession = new CatalogSession('sender', 60000, 0);
+    catalogSession.installSearch(catalogSession.beginSearch(), [
+      { ...stock(), variants: [] },
+    ]);
+    await expect(
+      tool.execute(
+        { productId, name: stock().name },
+        {
+          toolCallId: 't',
+          messages: [],
+          context: { catalogSession },
+        },
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      ...response,
+      humanAssistance: {
+        kind: 'out_of_stock',
+        digest: { productId, name: response.name },
+      },
+    });
+  });
+
+  it('does not escalate a grounded variant absent from fresh backend stock', async () => {
+    const response = { ...stock(), variants: [] };
+    const { tool, getStock } = setup(response);
+    await expect(
+      tool.execute(
+        { productId, variantId },
+        {
+          toolCallId: 't',
+          messages: [],
+          context: context(),
+        },
+      ),
+    ).resolves.toEqual({ ok: true, ...response });
+    expect(getStock).toHaveBeenCalledTimes(1);
+  });
 
   it('returns the same tool and inputSchema references without reimplementing the schema', () => {
     const rawTool = makeCheckStockToolRaw({
@@ -35,238 +128,95 @@ describe('makeCheckStockTool', () => {
       chatbotApi: {} as ChatbotApiClient,
     });
     const verified = asSchemaVerifiedTool(rawTool);
-
     expect(verified).toBe(rawTool);
     expect(verified.inputSchema).toBe(rawTool.inputSchema);
   });
 
-  it('forwards productId to chatbotApi.getStock and returns { ok: true, ... }', async () => {
-    const stock: StockCheckResponse = {
-      productId: '00000000-0000-4000-8000-000000000001',
-      name: 'Croquetas',
-      stock: { status: 'available', quantity: 10 },
-      variants: [],
-    };
-    const getStock = jest.fn().mockResolvedValue(stock);
-    const deps = {
-      ...baseDeps,
-      chatbotApi: { getStock } as unknown as ChatbotApiClient,
-    };
-    const tool = makeCheckStockTool(deps);
-
-    const result = await tool.execute(
-      { productId: '00000000-0000-4000-8000-000000000001' },
-      { toolCallId: 't', messages: [], context: {} },
-    );
-
-    expect(getStock).toHaveBeenCalledWith(
-      '00000000-0000-4000-8000-000000000001',
-    );
-    expect(result).toEqual({ ok: true, ...stock });
-  });
-
   it('rejects a non-UUID productId at the schema layer', () => {
-    const tool = makeCheckStockTool({
-      ...baseDeps,
-      chatbotApi: {} as ChatbotApiClient,
-    });
-    const r = tool.inputSchema.safeParse({ productId: 'not-a-uuid' });
-    expect(r.success).toBe(false);
+    expect(
+      setup().tool.inputSchema.safeParse({ productId: 'not-a-uuid' }).success,
+    ).toBe(false);
   });
 
-  it('catches NotFoundError into a non-retryable notFound envelope', async () => {
-    const getStock = jest.fn().mockRejectedValue(new NotFoundError('x', 404));
-    const deps = {
-      ...baseDeps,
-      chatbotApi: { getStock } as unknown as ChatbotApiClient,
-    };
-    const tool = makeCheckStockTool(deps);
-
-    await expect(
-      tool.execute(
-        { productId: '00000000-0000-4000-8000-000000000001' },
-        { toolCallId: 't', messages: [], context: {} },
-      ),
-    ).resolves.toEqual({
+  it.each([
+    { productId: otherId },
+    { productId, variantId: otherId },
+    { productId, name: 'Nombre del input' },
+  ])('blocks forged identity %j before GET', async (input) => {
+    const { tool, getStock, humanHandoffService } = setup();
+    const result = await tool.execute(input, {
+      toolCallId: 't',
+      messages: [],
+      context: context(),
+    });
+    expect(result).toMatchObject({
       ok: false,
-      error: { kind: 'notFound', retryable: false },
+      error: { kind: 'catalog_identity_unverified' },
     });
+    expect(getStock).not.toHaveBeenCalled();
+    expect(humanHandoffService.create).not.toHaveBeenCalled();
   });
 
-  it('catches UpstreamError(500) into a retryable upstream envelope', async () => {
-    const getStock = jest.fn().mockRejectedValue(new UpstreamError('x', 500));
-    const deps = {
-      ...baseDeps,
-      chatbotApi: { getStock } as unknown as ChatbotApiClient,
-    };
-    const tool = makeCheckStockTool(deps);
-
-    await expect(
-      tool.execute(
-        { productId: '00000000-0000-4000-8000-000000000001' },
-        { toolCallId: 't', messages: [], context: {} },
-      ),
-    ).resolves.toEqual({
-      ok: false,
-      error: { kind: 'upstream', retryable: true },
+  it('forwards grounded productId and sources the signal from fresh backend stock', async () => {
+    const { tool, getStock, humanHandoffService } = setup();
+    const result = await tool.execute(
+      { productId, variantId, name: stock().name },
+      { toolCallId: 't', messages: [], context: context() },
+    );
+    expect(getStock).toHaveBeenCalledWith(productId);
+    expect(result).toEqual({
+      ok: true,
+      ...stock(),
+      humanAssistance: {
+        kind: 'out_of_stock',
+        digest: { productId, variantId, name: stock().name },
+      },
     });
+    expect(humanHandoffService.create).not.toHaveBeenCalled();
   });
 
-  // ─── sale-flow-tools spec §"checkStock returns a humanAssistance
-  // envelope on out_of_stock" (R7) ─────────────────────────────────────
-  describe('humanAssistance envelope (R7)', () => {
-    const uuid1 = '00000000-0000-4000-8000-000000000001';
-    const uuid2 = '00000000-0000-4000-8000-000000000002';
+  it.each([
+    [new NotFoundError('x', 404), 'notFound', false],
+    [new UpstreamError('x', 500), 'upstream', true],
+  ] as const)(
+    'maps backend error %s after validation',
+    async (error, kind, retryable) => {
+      const { tool, getStock } = setup();
+      getStock.mockRejectedValue(error);
+      await expect(
+        tool.execute(
+          { productId },
+          { toolCallId: 't', messages: [], context: context() },
+        ),
+      ).resolves.toEqual({ ok: false, error: { kind, retryable } });
+    },
+  );
 
-    it('adds the envelope on out_of_stock, sourcing digest.name from the catalog response', async () => {
-      const stock: StockCheckResponse = {
-        productId: uuid1,
-        name: 'Café Molido 500g',
-        stock: { status: 'out_of_stock', quantity: 0 },
-        variants: [
-          {
-            variantId: uuid2,
-            name: '500g',
-            option: null,
-            value: null,
-            stock: { status: 'out_of_stock', quantity: 0 },
-          },
-        ],
-      };
-      const getStock = jest.fn().mockResolvedValue(stock);
-      const deps = {
-        ...baseDeps,
-        chatbotApi: { getStock } as unknown as ChatbotApiClient,
-      };
-      const tool = makeCheckStockTool(deps);
+  it.each(['available', 'low_stock', 'not_managed'] as const)(
+    'does not carry an escalation envelope for fresh %s stock',
+    async (status) => {
+      const response = { ...stock(), stock: { status, quantity: 5 } };
+      const { tool } = setup(response);
+      await expect(
+        tool.execute(
+          { productId },
+          { toolCallId: 't', messages: [], context: context() },
+        ),
+      ).resolves.toEqual({ ok: true, ...response });
+    },
+  );
 
-      const result = await tool.execute(
-        { productId: uuid1, variantId: uuid2 },
-        { toolCallId: 't', messages: [], context: {} },
-      );
-
-      expect(result).toEqual({
-        ok: true,
-        ...stock,
-        humanAssistance: {
-          kind: 'out_of_stock',
-          digest: {
-            productId: uuid1,
-            name: 'Café Molido 500g',
-            variantId: uuid2,
-          },
-        },
-      });
-    });
-
-    it('uses the catalog name, never the model-supplied name or available-stock quantity', async () => {
-      const stock: StockCheckResponse = {
-        productId: uuid1,
-        name: 'Nombre del catálogo',
-        stock: { status: 'out_of_stock', quantity: 0 },
-        variants: [],
-      };
-      const getStock = jest.fn().mockResolvedValue(stock);
-      const tool = makeCheckStockTool({
-        ...baseDeps,
-        chatbotApi: { getStock } as unknown as ChatbotApiClient,
-      });
-
-      const result = await tool.execute(
-        { productId: uuid1, name: 'Nombre del input' },
-        { toolCallId: 't', messages: [], context: {} },
-      );
-
-      expect(result).toEqual({
-        ok: true,
-        ...stock,
-        humanAssistance: {
-          kind: 'out_of_stock',
-          digest: { productId: uuid1, name: 'Nombre del catálogo' },
-        },
-      });
-    });
-
-    it('does not signal escalation for a mismatched product or an unverified/available variant', async () => {
-      const base: StockCheckResponse = {
-        productId: uuid1,
-        name: 'Nombre del catálogo',
-        stock: { status: 'out_of_stock', quantity: 0 },
-        variants: [
-          {
-            variantId: uuid2,
-            name: '500g',
-            option: null,
-            value: null,
-            stock: { status: 'available', quantity: 2 },
-          },
-        ],
-      };
-      for (const [stock, variantId] of [
-        [{ ...base, productId: uuid2 }, undefined],
-        [base, '00000000-0000-4000-8000-000000000003'],
-        [base, uuid2],
-      ] as const) {
-        const tool = makeCheckStockTool({
-          ...baseDeps,
-          chatbotApi: {
-            getStock: jest.fn().mockResolvedValue(stock),
-          } as unknown as ChatbotApiClient,
-        });
-        const result = await tool.execute(
-          { productId: uuid1, ...(variantId ? { variantId } : {}) },
-          { toolCallId: 't', messages: [], context: {} },
-        );
-        expect(result).toEqual({ ok: true, ...stock });
-        expect(result).not.toHaveProperty('humanAssistance');
-      }
-    });
-
-    it('does NOT carry the envelope for available / low_stock / not_managed', async () => {
-      for (const status of ['available', 'low_stock', 'not_managed'] as const) {
-        const stock: StockCheckResponse = {
-          productId: uuid1,
-          name: 'X',
-          stock: { status, quantity: 5 },
-          variants: [],
-        };
-        const getStock = jest.fn().mockResolvedValue(stock);
-        const tool = makeCheckStockTool({
-          ...baseDeps,
-          chatbotApi: { getStock } as unknown as ChatbotApiClient,
-        });
-
-        const result = await tool.execute(
-          { productId: uuid1 },
-          { toolCallId: 't', messages: [], context: {} },
-        );
-
-        expect(result).toEqual({ ok: true, ...stock });
-        expect(result).not.toHaveProperty('humanAssistance');
-      }
-    });
-
-    it('does NOT call HumanHandoffService — the envelope is a signal only', async () => {
-      const stock: StockCheckResponse = {
-        productId: uuid1,
-        name: 'X',
-        stock: { status: 'out_of_stock', quantity: 0 },
-        variants: [],
-      };
-      const getStock = jest.fn().mockResolvedValue(stock);
-      const humanHandoffService = { create: jest.fn() };
-      const tool = makeCheckStockTool({
-        ...baseDeps,
-        humanHandoffService: humanHandoffService as never,
-        chatbotApi: { getStock } as unknown as ChatbotApiClient,
-      });
-
-      await tool.execute(
-        { productId: uuid1 },
-        { toolCallId: 't', messages: [], context: {} },
-      );
-
-      expect(humanHandoffService.create).not.toHaveBeenCalled();
-    });
+  it('does not signal escalation for a mismatched backend product or newly available variant', async () => {
+    const changed = stock();
+    changed.variants[0].stock = { status: 'available', quantity: 2 };
+    for (const response of [{ ...stock(), productId: otherId }, changed]) {
+      const { tool } = setup(response);
+      await expect(
+        tool.execute(
+          { productId, variantId },
+          { toolCallId: 't', messages: [], context: context() },
+        ),
+      ).resolves.toEqual({ ok: true, ...response });
+    }
   });
 });

@@ -1,5 +1,8 @@
 /* eslint-disable @typescript-eslint/require-await */
 import { Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import type { AgentTurnCommit } from '../domain/conversation-store';
 import {
   ConversationState,
   ConversationStore,
@@ -23,6 +26,38 @@ import {
 @Injectable()
 export class InMemoryConversationStore implements ConversationStore {
   private readonly map = new Map<string, ConversationState>();
+
+  async commitAgentTurn(
+    senderId: string,
+    turn: AgentTurnCommit,
+  ): Promise<boolean> {
+    const copy = structuredClone(turn);
+    const live = this.map.get(senderId);
+    if (!live && copy.expected !== null) return false;
+    if (
+      live &&
+      (!isDeepStrictEqual(
+        structuredClone(live.data.messages ?? []),
+        structuredClone(copy.expected?.messages ?? []),
+      ) ||
+        live.data.agentRevision !== copy.expected?.revision)
+    )
+      return false;
+    this.map.set(senderId, {
+      senderId,
+      lastMessageAt:
+        live && Date.parse(live.lastMessageAt) > Date.parse(copy.lastMessageAt)
+          ? live.lastMessageAt
+          : copy.lastMessageAt,
+      data: {
+        ...live?.data,
+        messages: copy.messages,
+        catalogReferences: copy.catalogReferences,
+        agentRevision: randomUUID(),
+      },
+    });
+    return true;
+  }
 
   async setPendingHumanRequest(
     senderId: string,
@@ -207,6 +242,9 @@ export class InMemoryConversationStore implements ConversationStore {
     // The handoff marker is CAS-owned; strip any stale patch value and
     // reapply the LIVE one (including explicit JSON null) below.
     delete data.pendingHumanRequest;
+    delete data.messages;
+    delete data.catalogReferences;
+    delete data.agentRevision;
     const safePatch = Object.hasOwn(patch, 'data') ? { ...patch, data } : patch;
     const merged = existing
       ? { ...existing, ...safePatch }
@@ -223,6 +261,11 @@ export class InMemoryConversationStore implements ConversationStore {
       lastMessageAt: merged.lastMessageAt,
       data: {
         ...(merged.data ?? {}),
+        ...Object.fromEntries(
+          ['messages', 'catalogReferences', 'agentRevision']
+            .filter((key) => existing && Object.hasOwn(existing.data, key))
+            .map((key) => [key, existing!.data[key]]),
+        ),
         ...(existing && Object.hasOwn(existing.data, 'receiptAmountPointer')
           ? { receiptAmountPointer: existing.data.receiptAmountPointer }
           : {}),

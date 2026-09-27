@@ -2,6 +2,10 @@ import { Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { tool } from 'ai';
 import { z } from 'zod';
+import {
+  catalogSessionSchema,
+  type CatalogSession,
+} from '../../../conversation/domain/catalog-references';
 import { preflightRestockRequest } from '../../../human-decisions/application/restock-request-preflight';
 import type { RestockToolCapability, ToolDeps } from '../tool-deps';
 
@@ -143,7 +147,11 @@ async function runRestockRoute(
   deps: ToolDeps,
   restock: RestockToolCapability,
   digest: unknown,
-  context: { senderId: string; inboundEvent?: unknown },
+  context: {
+    senderId: string;
+    inboundEvent?: unknown;
+    catalogSession?: CatalogSession;
+  },
 ): Promise<RequestHumanAssistanceRestockResult> {
   const observe = restockDiagnostic();
   let stage: 'preflight' | 'coordinator' = 'preflight';
@@ -151,6 +159,7 @@ async function runRestockRoute(
     const outcome = await preflightRestockRequest(
       {
         senderId: context.senderId,
+        catalogSession: context.catalogSession,
         inboundEvent: context.inboundEvent,
         digest,
         restockFeatureEnabled: restock.enabled,
@@ -254,6 +263,7 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
       .pipe(definition.inputSchema),
     contextSchema: z.object({
       senderId: z.string(),
+      catalogSession: catalogSessionSchema.optional(),
       // R3b3-c4c2-tool: optional RESTOCK inbound identity, strictly shaped so
       // the SDK validates the per-turn envelope. It is read ONLY by the
       // enabled `out_of_stock` route; the default-off and other-kind paths

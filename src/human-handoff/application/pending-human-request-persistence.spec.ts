@@ -44,6 +44,7 @@ describe('pending-human-request-persistence', () => {
       data: (patch as { data: ConversationState['data'] }).data,
     }));
     const store: jest.Mocked<ConversationStore> = {
+      commitAgentTurn: jest.fn().mockResolvedValue(true),
       get: jest.fn(),
       create: jest.fn(),
       update,

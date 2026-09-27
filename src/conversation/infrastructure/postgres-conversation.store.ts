@@ -1,5 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { Pool } from 'pg';
+import { randomUUID } from 'node:crypto';
+import type { AgentTurnCommit } from '../domain/conversation-store';
 import {
   ConversationState,
   ConversationStore,
@@ -47,6 +49,37 @@ interface ConversationRow {
 @Injectable()
 export class PostgresConversationStore implements ConversationStore {
   constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
+
+  async commitAgentTurn(
+    senderId: string,
+    turn: AgentTurnCommit,
+  ): Promise<boolean> {
+    const copy = structuredClone(turn);
+    const owned = JSON.stringify({
+      messages: copy.messages,
+      catalogReferences: copy.catalogReferences,
+      agentRevision: randomUUID(),
+    });
+    const condition = `COALESCE(conversation_state.data->'messages', '[]'::jsonb) = $4::jsonb
+      AND (($5::text IS NULL AND NOT (conversation_state.data ? 'agentRevision'))
+        OR conversation_state.data->>'agentRevision' = $5::text)`;
+    const merge = `last_message_at = GREATEST(conversation_state.last_message_at, $2::timestamptz),
+      data = conversation_state.data || $3::jsonb`;
+    const sql =
+      copy.expected === null
+        ? `INSERT INTO conversation_state (sender_id, last_message_at, data)
+         VALUES ($1, $2::timestamptz, $3::jsonb)
+         ON CONFLICT (sender_id) DO UPDATE SET ${merge} WHERE ${condition}`
+        : `UPDATE conversation_state SET ${merge} WHERE sender_id = $1 AND ${condition}`;
+    const { rowCount } = await this.pool.query(sql, [
+      senderId,
+      copy.lastMessageAt,
+      owned,
+      JSON.stringify(copy.expected?.messages ?? []),
+      copy.expected?.revision ?? null,
+    ]);
+    return (rowCount ?? 0) === 1;
+  }
 
   async setPendingHumanRequest(
     senderId: string,
@@ -300,6 +333,9 @@ export class PostgresConversationStore implements ConversationStore {
     const data = { ...(merged.data ?? {}) };
     delete data.receiptAmountPointer;
     delete data.pendingHumanRequest;
+    delete data.messages;
+    delete data.catalogReferences;
+    delete data.agentRevision;
 
     const { rows } = await this.pool.query<ConversationRow>(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
@@ -315,6 +351,9 @@ export class PostgresConversationStore implements ConversationStore {
                  || CASE WHEN conversation_state.data ? 'pendingHumanRequest'
                    THEN jsonb_build_object('pendingHumanRequest', conversation_state.data->'pendingHumanRequest')
                    ELSE '{}'::jsonb END
+                 || (SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
+                     FROM jsonb_each(conversation_state.data)
+                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision'))
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { stepCountIs } from 'ai';
 import type { ModelMessage, ToolExecutionEndEvent } from 'ai';
 import { openai } from '@ai-sdk/openai';
+import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import type { AgentMessage } from '../domain/agent-message';
 import type {
@@ -38,6 +39,18 @@ export class VercelAiLlmAgent implements LlmAgentPort {
 
   async run(input: LlmRunInput): Promise<LlmRunResult> {
     const messages = assembleModelMessages(input.history, input.text);
+    if (input.catalogEvidence) {
+      messages.splice(messages.length - 1, 0, {
+        role: 'system',
+        content: input.catalogEvidence,
+      });
+    }
+    const catalogSession =
+      CatalogSession.is(input.catalogSession) &&
+      input.catalogSession.senderId === input.senderId
+        ? input.catalogSession
+        : undefined;
+    const catalogContext = catalogSession ? { catalogSession } : {};
     // toolsContext — per-tool runtime values the LLM must NOT see in
     // the prompt. The cart-touching tools (evaluateCart, createSale)
     // declare `contextSchema: z.object({ senderId: z.string() })` and
@@ -47,7 +60,11 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     const inboundEvent = forwardableInboundEvent(input);
     const toolsContext: Record<
       string,
-      { senderId: string; inboundEvent?: LlmRunInput['inboundEvent'] }
+      {
+        senderId?: string;
+        inboundEvent?: LlmRunInput['inboundEvent'];
+        catalogSession?: CatalogSession;
+      }
     > = {
       evaluateCart: { senderId: input.senderId },
       createSale: { senderId: input.senderId },
@@ -64,10 +81,16 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       // supply it; every other entry, the system prompt, and the messages
       // stay byte-identical. No mutable global is touched.
       requestHumanAssistance: {
+        ...catalogContext,
         senderId: input.senderId,
         ...(inboundEvent === undefined ? {} : { inboundEvent }),
       },
     };
+
+    for (const name of ['searchCatalog', 'checkStock']) {
+      if (input.tools !== null && name in input.tools)
+        toolsContext[name] = catalogContext;
+    }
 
     // SQ-5B2B3: the price-stripped `getShippingQuote` tool also declares
     // `contextSchema: z.object({ senderId })`. The AI-SDK validates that

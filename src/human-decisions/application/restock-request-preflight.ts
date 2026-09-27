@@ -13,9 +13,9 @@
  * legacy fallback once the feature is on and identity/markers are uncertain.
  *
  * An enabled path re-reads the catalog (`getStock`) from the trusted client
- * AFTER the marker reads: the `checkStock` signal that grounded the escalation
- * is not authority for a later POST. The intake uses BACKEND values only (the
- * model name and any model-supplied `sourceRequestId` are ignored) and always
+ * AFTER marker reads and session identity validation: a `checkStock` signal
+ * is not authority for a later POST. The supplied name must match observed
+ * identity; intake uses the fresh backend name and ignores supplied source IDs. It
  * sends `requestedQuantity: null`. TIME-OF-CHECK RACE: this fresh GET is NOT
  * atomic with the later reserve/POST, so a shortage can reappear between them;
  * the backend must enforce strict shortage-at-POST if that is required.
@@ -23,6 +23,7 @@
  * Reasons are fixed codes only; no PII, digest text, or ids are returned.
  */
 import { z } from 'zod';
+import { CatalogSession } from '../../conversation/domain/catalog-references';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
 import {
@@ -46,6 +47,7 @@ import type {
 
 export interface RestockPreflightInput {
   readonly senderId: string;
+  readonly catalogSession?: CatalogSession;
   /** The triggering customer-turn event; the only legal identity source. */
   readonly inboundEvent: unknown;
   /** The model's `out_of_stock` digest (`productId`, `name`, optionals). */
@@ -126,7 +128,7 @@ const DIGEST_SCHEMA = z.object({
 
 interface RestockCandidate {
   readonly productId: string;
-  /** Parsed for shape only; the BACKEND name is the one that reaches intake. */
+  /** Must match observed identity; the fresh BACKEND name reaches intake. */
   readonly name: string;
   readonly variantId: string | null;
 }
@@ -266,6 +268,17 @@ export async function preflightRestockRequest(
     candidate = null;
   }
   if (candidate === null) return blocked('invalid_digest');
+  try {
+    const session = input.catalogSession;
+    if (
+      !CatalogSession.is(session) ||
+      session.senderId !== senderId ||
+      !session.matches(candidate)
+    )
+      return blocked('catalog_unverified');
+  } catch {
+    return blocked('catalog_unverified');
+  }
 
   let stock: StockCheckResponse;
   try {

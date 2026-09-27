@@ -1,3 +1,4 @@
+import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { CostGuardService } from './cost-guard.service';
 import { AgentRunner } from './agent-runner.service';
 import {
@@ -32,7 +33,7 @@ describe('AgentRunner', () => {
   const TEN_S_MS = 10 * 1000;
   // Spec uses a 60-second window for the idle boundary scenario.
   const ONE_MIN_MS = 60 * 1000;
-  type ConversationStoreUpdate = Parameters<ConversationStore['update']>[1];
+  type AgentTurnCommit = Parameters<ConversationStore['commitAgentTurn']>[1];
 
   let store: jest.Mocked<ConversationStore>;
   let llm: jest.Mocked<LlmAgentPort>;
@@ -46,6 +47,7 @@ describe('AgentRunner', () => {
     jest.setSystemTime(new Date('2026-06-23T12:00:00.000Z'));
 
     store = {
+      commitAgentTurn: jest.fn().mockResolvedValue(true),
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
@@ -124,14 +126,14 @@ describe('AgentRunner', () => {
       expect(llmInput.history).toEqual([]);
 
       // Persisted: user + assistant turn appended.
-      expect(store.update).toHaveBeenCalledWith('5215550001111', {
+      expect(store.commitAgentTurn).toHaveBeenCalledWith('5215550001111', {
+        expected: null,
+        catalogReferences: null,
         lastMessageAt: '2026-06-23T12:00:00.000Z',
-        data: {
-          messages: [
-            { role: 'user', content: 'hola' },
-            { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-          ],
-        },
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
+        ],
       });
     });
 
@@ -295,9 +297,10 @@ describe('AgentRunner', () => {
       const llmInput = llm.run.mock.calls[0][0] as { history: AgentMessage[] };
       expect(llmInput.history).toEqual([]);
       // lastMessageAt advanced to now.
-      expect(store.update).toHaveBeenCalledWith(
+      expect(store.commitAgentTurn).toHaveBeenCalledWith(
         '5215550001111',
         expect.objectContaining({
+          expected: { messages: stored.data.messages },
           lastMessageAt: '2026-06-23T12:00:00.000Z',
         }),
       );
@@ -460,7 +463,11 @@ describe('AgentRunner', () => {
       store.get
         .mockResolvedValueOnce(prior)
         .mockResolvedValueOnce(freshPostLlm);
-      store.update.mockResolvedValue(freshPostLlm);
+      const live = new InMemoryConversationStore();
+      await live.create(prior.senderId, freshPostLlm);
+      store.commitAgentTurn.mockImplementation((sender, turn) =>
+        live.commitAgentTurn(sender, turn),
+      );
       llm.run.mockResolvedValue({
         reply: 'Listo.',
         messages: [
@@ -475,10 +482,8 @@ describe('AgentRunner', () => {
         text: 'ok',
       });
 
-      expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch]: [string, ConversationStoreUpdate] =
-        store.update.mock.calls[0];
-      expect(patch).toMatchObject({
+      expect(store.commitAgentTurn).toHaveBeenCalledTimes(1);
+      expect(await live.get(prior.senderId)).toMatchObject({
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: {
           cart: freshPostLlm.data.cart,
@@ -497,7 +502,8 @@ describe('AgentRunner', () => {
         lastMessageAt: '2026-06-23T12:00:00.000Z',
         data: {},
       };
-      store.get.mockResolvedValueOnce(prior).mockResolvedValueOnce(null); // race: state deleted during run
+      store.get.mockResolvedValueOnce(prior);
+      store.commitAgentTurn.mockResolvedValue(false); // Deleted-row CAS loses.
       llm.run.mockResolvedValue({
         reply: 'ok',
         messages: [
@@ -545,7 +551,14 @@ describe('AgentRunner', () => {
       store.get
         .mockResolvedValueOnce(prior)
         .mockResolvedValueOnce(freshPostLlm);
-      store.update.mockResolvedValue(freshPostLlm);
+      const live = new InMemoryConversationStore();
+      await live.create(prior.senderId, {
+        ...freshPostLlm,
+        data: { ...freshPostLlm.data, messages: prior.data.messages },
+      });
+      store.commitAgentTurn.mockImplementation((sender, turn) =>
+        live.commitAgentTurn(sender, turn),
+      );
       llm.run.mockResolvedValue({
         reply: 'Bienvenido de vuelta.',
         messages: [
@@ -560,15 +573,15 @@ describe('AgentRunner', () => {
         text: 'hola',
       });
 
-      expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch]: [string, ConversationStoreUpdate] =
-        store.update.mock.calls[0];
-      // Spread: messages overwrite (from the LLM turn), but the
-      // marker is carried forward from the freshly-written state.
-      expect(patch).toMatchObject({
+      expect(store.commitAgentTurn).toHaveBeenCalledTimes(1);
+      expect(store.commitAgentTurn.mock.calls[0][1].expected).toEqual({
+        messages: prior.data.messages,
+      });
+      const persisted = await live.get(prior.senderId);
+      expect(persisted).toMatchObject({
         data: { pendingHumanRequest: marker },
       });
-      const messages = patch.data?.messages ?? [];
+      const messages = persisted!.data.messages ?? [];
       expect(messages).toEqual(
         expect.arrayContaining([
           { role: 'user', content: 'hola' },
@@ -606,16 +619,15 @@ describe('AgentRunner', () => {
       });
 
       expect(result.reply).toBe('Hola, ¿en qué te puedo ayudar?');
-      expect(store.update).toHaveBeenCalledTimes(1);
-      const [, patch]: [string, ConversationStoreUpdate] =
-        store.update.mock.calls[0];
+      expect(store.commitAgentTurn).toHaveBeenCalledTimes(1);
+      const [, patch]: [string, AgentTurnCommit] =
+        store.commitAgentTurn.mock.calls[0];
       expect(patch).toMatchObject({
-        data: {
-          messages: [
-            { role: 'user', content: 'hola' },
-            { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-          ],
-        },
+        expected: null,
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
+        ],
       });
     });
   });
@@ -743,7 +755,7 @@ describe('AgentRunner', () => {
     it('never persists the event and stays stable across a repeat', async () => {
       await runner.handle({ senderId: 's', text: 'a', inboundEvent: EVENT });
       await runner.handle({ senderId: 's', text: 'b', inboundEvent: EVENT });
-      for (const [, patch] of store.update.mock.calls) {
+      for (const [, patch] of store.commitAgentTurn.mock.calls) {
         const persisted = JSON.stringify(patch);
         expect(persisted).not.toContain(EVENT.messageId);
         expect(persisted).not.toContain(EVENT.receivingPhoneNumberId);

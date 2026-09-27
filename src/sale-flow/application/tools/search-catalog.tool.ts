@@ -2,12 +2,18 @@ import { tool } from 'ai';
 import { z } from 'zod';
 import type { ToolDeps } from '../tool-deps';
 import { mapChatbotError } from '../error-mapping';
+import {
+  CatalogSession,
+  CATALOG_RECOVERY,
+  catalogSessionSchema,
+} from '../../../conversation/domain/catalog-references';
 
 /**
  * searchCatalog — AI-SDK tool factory.
  *
  * AGENTS.md §4.4.1: GET `/chatbot-api/catalog/search` (`catalog:read`).
- * Stateless; no cart or sender context required. The 5xx / network
+ * Shared factory; identity is stored only in the server-supplied run session.
+ * Direct legacy callers without a session may still search. The 5xx / network
  * upstream failures retain the retryable `upstream` envelope, but guidance
  * forbids extra model-driven automatic retries. HTTP retry policy is unchanged.
  */
@@ -24,12 +30,27 @@ export function makeSearchCatalogTool(deps: ToolDeps) {
         ),
       limit: z.number().int().min(1).max(20).default(10),
     }),
-    execute: async (input) => {
+    contextSchema: z.object({
+      catalogSession: catalogSessionSchema.optional(),
+    }),
+    execute: async (input, options) => {
+      let session: CatalogSession | undefined;
+      let ticket: number | undefined;
+      try {
+        session = options.context?.catalogSession;
+        if (session !== undefined && !CatalogSession.is(session))
+          return CATALOG_RECOVERY;
+        ticket = session?.beginSearch();
+      } catch {
+        return CATALOG_RECOVERY;
+      }
       try {
         const results = await deps.chatbotApi.searchCatalog(
           input.q,
           input.limit,
         );
+        if (session && ticket !== undefined)
+          session.installSearch(ticket, results);
         return { ok: true, results };
       } catch (err) {
         return mapChatbotError(err);

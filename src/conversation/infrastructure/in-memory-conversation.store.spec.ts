@@ -29,6 +29,106 @@ describe('InMemoryConversationStore', () => {
   // ──────────────────────────────────────────────────────────────
   // Adapter-specific: AgentMessage round-trip + missing-field default
   // ──────────────────────────────────────────────────────────────
+  describe('atomic agent turns', () => {
+    const timestamp = '2026-06-23T10:00:00.000Z';
+    const later = '2026-06-23T11:00:00.000Z';
+    const turn = () => ({
+      expected: null,
+      messages: [{ role: 'user' as const, content: 'first' }],
+      catalogReferences: null,
+      lastMessageAt: timestamp,
+    });
+
+    it('detaches committed inputs and rejects a stale completion without changing live siblings or timestamps', async () => {
+      const input = turn();
+      expect(await store.commitAgentTurn('sender', input)).toBe(true);
+      input.messages[0].content = 'mutated caller';
+      const original = structuredClone((await store.get('sender'))!);
+      expect(original.data.messages![0].content).toBe('first');
+      const expected = {
+        messages: original.data.messages!,
+        revision: original.data.agentRevision,
+      };
+      await store.update('sender', {
+        lastMessageAt: later,
+        data: { cart: 'live sibling' },
+      });
+      expect(
+        await store.commitAgentTurn('sender', {
+          ...turn(),
+          expected,
+          messages: [{ role: 'assistant', content: 'winner' }],
+        }),
+      ).toBe(true);
+      const winner = structuredClone((await store.get('sender'))!);
+      expect(winner.lastMessageAt).toBe(later);
+      expect(winner.data.cart).toBe('live sibling');
+      expect(winner.data.agentRevision).not.toBe(original.data.agentRevision);
+      expect(
+        await store.commitAgentTurn('sender', { ...turn(), expected }),
+      ).toBe(false);
+      expect(await store.get('sender')).toEqual(winner);
+    });
+
+    it('allows first-contact merge into an empty sibling-created row but not populated history', async () => {
+      await store.create('sender', {
+        lastMessageAt: later,
+        data: { cart: 'sibling' },
+      });
+      expect(await store.commitAgentTurn('sender', turn())).toBe(true);
+      expect((await store.get('sender'))!.data.cart).toBe('sibling');
+      expect(await store.commitAgentTurn('sender', turn())).toBe(false);
+      await store.create('populated', {
+        lastMessageAt: timestamp,
+        data: { messages: [{ role: 'user', content: 'another' }] },
+      });
+      expect(await store.commitAgentTurn('populated', turn())).toBe(false);
+    });
+
+    it('does not recreate a missing row for an existing-row expectation', async () => {
+      expect(
+        await store.commitAgentTurn('deleted', {
+          ...turn(),
+          expected: { messages: [] },
+        }),
+      ).toBe(false);
+      expect(await store.get('deleted')).toBeNull();
+    });
+
+    it('compares full history as well as revision and preserves all owned keys against generic updates', async () => {
+      await store.commitAgentTurn('sender', turn());
+      const original = structuredClone((await store.get('sender'))!);
+      expect(
+        await store.commitAgentTurn('sender', {
+          ...turn(),
+          expected: { messages: [], revision: original.data.agentRevision },
+        }),
+      ).toBe(false);
+      await store.update('sender', {
+        lastMessageAt: timestamp,
+        data: {
+          messages: [],
+          agentRevision: 'forged',
+          catalogReferences: null,
+          arbitrary: 'new',
+        },
+      });
+      expect((await store.get('sender'))!.data).toEqual({
+        ...original.data,
+        arbitrary: 'new',
+      });
+      await store.update('new', {
+        lastMessageAt: timestamp,
+        data: {
+          messages: [],
+          agentRevision: 'forged',
+          catalogReferences: null,
+        },
+      });
+      expect((await store.get('new'))!.data).toEqual({});
+    });
+  });
+
   describe('messages field', () => {
     it('readMessages() defaults to [] when the field is absent', async () => {
       await store.create('wa-empty-msg', {
@@ -40,7 +140,7 @@ describe('InMemoryConversationStore', () => {
       expect(readMessages(state!)).toEqual([]);
     });
 
-    it('round-trips AgentMessage[] through update', async () => {
+    it('round-trips AgentMessage[] through an atomic agent turn', async () => {
       await store.create('wa-msgs', {
         lastMessageAt: '2026-06-23T10:00:00.000Z',
         data: {},
@@ -56,10 +156,14 @@ describe('InMemoryConversationStore', () => {
         },
       ];
 
-      await store.update('wa-msgs', {
-        lastMessageAt: '2026-06-23T11:00:00.000Z',
-        data: { messages: transcript },
-      });
+      expect(
+        await store.commitAgentTurn('wa-msgs', {
+          expected: { messages: [] },
+          lastMessageAt: '2026-06-23T11:00:00.000Z',
+          messages: transcript,
+          catalogReferences: null,
+        }),
+      ).toBe(true);
 
       const state = await store.get('wa-msgs');
       expect((state!.data as { messages: AgentMessage[] }).messages).toEqual(

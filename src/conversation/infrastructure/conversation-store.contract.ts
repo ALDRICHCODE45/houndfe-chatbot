@@ -118,13 +118,13 @@ export function runConversationStoreContract(
     it('update() UPSERTs when no prior record exists', async () => {
       const created = await store.update('wa-ghost', {
         lastMessageAt: '2026-06-23T10:00:00.000Z',
-        data: { messages: [] },
+        data: { step: 'initial' },
       });
 
       expect(created).toEqual({
         senderId: 'wa-ghost',
         lastMessageAt: '2026-06-23T10:00:00.000Z',
-        data: { messages: [] },
+        data: { step: 'initial' },
       });
 
       // A subsequent get must reflect the new record.

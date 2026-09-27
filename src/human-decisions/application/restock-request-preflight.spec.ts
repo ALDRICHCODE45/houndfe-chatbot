@@ -1,3 +1,4 @@
+import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { preflightRestockRequest } from './restock-request-preflight';
 
 /**
@@ -78,12 +79,20 @@ const deps = (
     getStock,
   };
 };
+function grounded() {
+  const session = new CatalogSession(SENDER, 60000, 0);
+  session.installSearch(session.beginSearch(), [
+    { ...STOCK, name: DIGEST.name },
+  ]);
+  return session;
+}
 const ask = (d: ReturnType<typeof deps>, over: Record<string, unknown> = {}) =>
   preflightRestockRequest(
     {
       senderId: SENDER,
       inboundEvent: EVENT,
       digest: DIGEST,
+      catalogSession: grounded(),
       restockFeatureEnabled: true,
       ...over,
     },
@@ -91,6 +100,53 @@ const ask = (d: ReturnType<typeof deps>, over: Record<string, unknown> = {}) =>
   );
 
 describe('preflightRestockRequest', () => {
+  it.each([
+    { ...DIGEST, productId: '00000000-0000-4000-8000-000000000099' },
+    { ...DIGEST, variantId: '00000000-0000-4000-8000-000000000099' },
+    { ...DIGEST, name: 'Unobserved model name' },
+  ])('rejects ungrounded identity before GET %#', async (digest) => {
+    const d = deps();
+    await expect(ask(d, { digest })).resolves.toEqual({
+      route: 'blocked',
+      reason: 'catalog_unverified',
+    });
+    expect(d.getStock).not.toHaveBeenCalled();
+  });
+
+  it('rejects missing, expired and cross-sender sessions before GET', async () => {
+    let now = 1;
+    const expired = new CatalogSession(SENDER, 0, 0, undefined, [], () => now);
+    expired.installSearch(expired.beginSearch(), [
+      { ...STOCK, name: DIGEST.name },
+    ]);
+    const other = new CatalogSession('another', 60000, 0);
+    other.installSearch(other.beginSearch(), [{ ...STOCK, name: DIGEST.name }]);
+    now = 2;
+    for (const catalogSession of [undefined, expired, other]) {
+      const d = deps();
+      await expect(ask(d, { catalogSession })).resolves.toEqual({
+        route: 'blocked',
+        reason: 'catalog_unverified',
+      });
+      expect(d.getStock).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects prototype-forged sessions before GET', async () => {
+    const forged = Object.assign(
+      Object.create(CatalogSession.prototype) as CatalogSession,
+      {
+        senderId: SENDER,
+        matches: () => true,
+      },
+    );
+    const d = deps();
+    await expect(ask(d, { catalogSession: forged })).resolves.toEqual({
+      route: 'blocked',
+      reason: 'catalog_unverified',
+    });
+    expect(d.getStock).not.toHaveBeenCalled();
+  });
   it('recommends legacy with NO reads whenever the feature is not exactly true', async () => {
     for (const flag of [undefined, false, 'true', 1, null, {}]) {
       const d = deps();
@@ -131,7 +187,7 @@ describe('preflightRestockRequest', () => {
     ]);
   });
 
-  it('ignores the model name and sourceRequestId and maps absent optionals to null', async () => {
+  it('uses fresh backend name rather than the previously grounded name and ignores supplied sourceRequestId', async () => {
     const d = deps();
     const outcome = await ask(d, {
       digest: {

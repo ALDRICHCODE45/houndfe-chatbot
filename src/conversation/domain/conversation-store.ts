@@ -1,3 +1,5 @@
+import type { CatalogReferences } from './catalog-references';
+
 /** DI injection token for the ConversationStore port. */
 export const CONVERSATION_STORE = Symbol('CONVERSATION_STORE');
 
@@ -82,6 +84,8 @@ export function isReceiptAmountPointer(
 }
 
 export interface ConversationStateData {
+  catalogReferences?: CatalogReferences | null;
+  agentRevision?: string;
   receiptAmountPointer?: ReceiptAmountPointer;
   messages?: AgentMessage[];
   /** Sale id persisted by createSale success; read/cleared by cancelSale. */
@@ -236,7 +240,17 @@ export function readMessages(state: ConversationState): AgentMessage[] {
  * Adapters (in-memory, Postgres, Redis…) are injected at runtime via
  * the CONVERSATION_STORE Symbol token.
  */
+export interface AgentTurnCommit {
+  /** Detached original state, captured before idle reset or history truncation. */
+  expected: { messages: AgentMessage[]; revision?: string } | null;
+  messages: AgentMessage[];
+  catalogReferences: CatalogReferences | null;
+  lastMessageAt: string;
+}
+
 export interface ConversationStore {
+  /** Atomic history CAS and live sibling merge. False never authorizes a retry. */
+  commitAgentTurn(senderId: string, turn: AgentTurnCommit): Promise<boolean>;
   /**
    * First-contact-safe CAS set of `data.pendingHumanRequest`.
    *

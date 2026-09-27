@@ -1,3 +1,4 @@
+import { CatalogSession } from '../../../conversation/domain/catalog-references';
 import { Logger } from '@nestjs/common';
 import crypto from 'node:crypto';
 import * as preflight from '../../../human-decisions/application/restock-request-preflight';
@@ -349,6 +350,14 @@ describe('makeRequestHumanAssistanceTool', () => {
       variants: [],
     });
 
+    function groundedContext() {
+      const catalogSession = new CatalogSession(SENDER, 60000, 0);
+      catalogSession.installSearch(catalogSession.beginSearch(), [
+        buildStock(),
+      ]);
+      return { senderId: SENDER, inboundEvent: INBOUND, catalogSession };
+    }
+
     function buildRestockDeps(
       overrides: {
         markers?: { readForSender: jest.Mock };
@@ -406,7 +415,7 @@ describe('makeRequestHumanAssistanceTool', () => {
         makeRequestHumanAssistanceTool(deps).execute(outOfStockInput, {
           toolCallId: 'PRIVATE-SDK-ID',
           messages: [],
-          context: { senderId: SENDER, inboundEvent: INBOUND },
+          context: groundedContext(),
         });
       const expectLog = (stage: string, outcome: string, reason = 'none') => {
         expect(log.mock.calls).toEqual([
@@ -867,7 +876,7 @@ describe('makeRequestHumanAssistanceTool', () => {
     });
 
     it('enabled out_of_stock with a catalog read failure fails closed with no POST', async () => {
-      const { deps, coordinator, create } = buildRestockDeps({
+      const { deps, coordinator, create, getStock } = buildRestockDeps({
         getStock: jest.fn(async () => {
           throw new Error('catalog down');
         }),
@@ -876,8 +885,9 @@ describe('makeRequestHumanAssistanceTool', () => {
       const result = await tool.execute(outOfStockInput, {
         toolCallId: 't',
         messages: [],
-        context: { senderId: SENDER, inboundEvent: INBOUND },
+        context: groundedContext(),
       });
+      expect(getStock).toHaveBeenCalledTimes(1);
       expect(create).not.toHaveBeenCalled();
       expect(coordinator.coordinate).not.toHaveBeenCalled();
       expect(result).toEqual(failClosed);
@@ -889,7 +899,7 @@ describe('makeRequestHumanAssistanceTool', () => {
       const result = await tool.execute(outOfStockInput, {
         toolCallId: 't',
         messages: [],
-        context: { senderId: SENDER, inboundEvent: INBOUND },
+        context: groundedContext(),
       });
       expect(create).not.toHaveBeenCalled();
       expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
@@ -922,7 +932,7 @@ describe('makeRequestHumanAssistanceTool', () => {
       const result = await tool.execute(outOfStockInput, {
         toolCallId: 't',
         messages: [],
-        context: { senderId: SENDER, inboundEvent: INBOUND },
+        context: groundedContext(),
       });
       expect(create).not.toHaveBeenCalled();
       expect(result).toEqual({
@@ -946,7 +956,7 @@ describe('makeRequestHumanAssistanceTool', () => {
       const result = await tool.execute(outOfStockInput, {
         toolCallId: 't',
         messages: [],
-        context: { senderId: SENDER, inboundEvent: INBOUND },
+        context: groundedContext(),
       });
       expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
       expect(create).not.toHaveBeenCalled();

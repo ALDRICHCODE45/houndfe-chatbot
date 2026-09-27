@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CatalogSession } from '../../conversation/domain/catalog-references';
 import {
   CONVERSATION_STORE,
   readMessages,
@@ -50,12 +51,13 @@ export interface AgentRunnerHandleInput {
  *   1. Load the sender's conversation state via ConversationStore.get.
  *   2. Apply idle-timeout: if (now - lastMessageAt) > idleTimeoutMs,
  *      treat as a fresh session — history is wiped in memory and the
- *      stored lastMessageAt is overwritten.
- *   3. Truncate the loaded history IN MEMORY to historyTurns. The store
- *      keeps the full transcript (it is a dumb upsert bag).
+ *      original persisted history remains the CAS expectation.
+ *   3. Truncate prompt history to historyTurns, invalidating catalog evidence
+ *      whose originating user turn is no longer retained in that prompt.
  *   4. Invoke LLM_AGENT.run() with the assembled prompt + tools.
  *   5. Record usage on CostGuard.
- *   6. UPSERT-persist user + assistant turns back into the store.
+ *   6. Atomically commit full history and catalog evidence against the original
+ *      snapshot, preserving live siblings and later timestamps. Never retry CAS.
  *
  * No proactive sends anywhere — outbound traffic only flows via the
  * dispatcher after this method returns.
@@ -151,6 +153,15 @@ export class AgentRunner {
 
     // 1) Load state.
     const state = await this.store.get(input.senderId);
+    const expected =
+      state === null
+        ? null
+        : structuredClone({
+            messages: readMessages(state),
+            ...(state.data.agentRevision === undefined
+              ? {}
+              : { revision: state.data.agentRevision }),
+          });
 
     // 1a) Short-circuit on the human-handoff marker (ADR-29).
     // If a `pendingHumanRequest` marker is set on the loaded state we
@@ -173,6 +184,16 @@ export class AgentRunner {
     const allTurns: AgentMessage[] =
       state === null || idleExpired ? [] : readMessages(state);
     const truncated = allTurns.slice(-this.historyTurns);
+    const catalogSession = new CatalogSession(
+      input.senderId,
+      this.idleTimeoutMs,
+      allTurns.length,
+      idleExpired ? undefined : state?.data.catalogReferences,
+      allTurns,
+    );
+    const catalogEvidence = catalogSession.evidence(
+      allTurns.length - truncated.length,
+    );
 
     // 3a) Optional RESTOCK inbound identity. A strict, fail-closed gate: only a
     // valid caller event whose sender matches this turn is copied forward,
@@ -185,6 +206,8 @@ export class AgentRunner {
     // 4) Run the agent.
     const result = await this.llm.run({
       senderId: input.senderId,
+      catalogSession,
+      ...(catalogEvidence === null ? {} : { catalogEvidence }),
       text: input.text,
       history: truncated,
       systemPrompt: this.systemPrompt,
@@ -195,46 +218,20 @@ export class AgentRunner {
     // 5) Cost guard.
     this.costGuard.record(result.usage);
 
-    // 6) Persist user + assistant turns via UPSERT (ADR-28 + ADR-29).
-    // Re-fetch the freshly-written state after `llm.run` so we can
-    // spread its `data` bag over the messages update. Tools that ran
-    // during the LLM turn may have written sibling keys (cart,
-    // placedSaleId, pendingHumanRequest); writing `data: { messages }`
-    // alone would clobber those siblings via the store's data-replace
-    // UPSERT semantics.
-    const freshState = await this.store.get(input.senderId);
-
-    if (freshState === null && state !== null) {
-      // Race: the state record existed at step 1 but was deleted during
-      // the LLM turn. Skip the persist (a null-spread `update` would
-      // fabricate an empty bag); the LLM reply is still returned for the
-      // dispatcher.
-      Logger.error(
-        `[state-deleted-during-run] senderId=${input.senderId}`,
-        'AgentRunner',
-      );
-      return { reply: result.reply };
-    }
-
+    // Final persistence CAS does not roll back tool effects or the reply.
     const nextTurns: AgentMessage[] = [
       ...allTurns,
       { role: 'user', content: input.text },
       { role: 'assistant', content: result.reply },
     ];
 
-    // ADR-28 fresh-state spread: preserve sibling `data` keys (cart,
-    // placedSaleId, pendingHumanRequest) written by tools during the
-    // turn. First contact (both reads null) falls back to a plain
-    // `{ messages }` write — the UPSERT creates the record.
-    const data =
-      freshState === null
-        ? { messages: nextTurns }
-        : { ...freshState.data, messages: nextTurns };
-
-    await this.store.update(input.senderId, {
+    const committed = await this.store.commitAgentTurn(input.senderId, {
+      expected,
+      messages: nextTurns,
+      catalogReferences: catalogSession.snapshot(),
       lastMessageAt: nowIso,
-      data,
     });
+    if (!committed) Logger.warn('[agent-turn-conflict]', 'AgentRunner');
 
     return { reply: result.reply };
   }

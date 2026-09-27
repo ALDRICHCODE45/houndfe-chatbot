@@ -1,5 +1,9 @@
 import { Logger } from '@nestjs/common';
-import { stepCountIs } from 'ai';
+import { generateText, stepCountIs } from 'ai';
+import { MockLanguageModelV4 } from 'ai/test';
+import { CatalogSession } from '../../conversation/domain/catalog-references';
+import { makeCheckStockTool } from '../../sale-flow/application/tools/check-stock.tool';
+import type { ToolDeps } from '../../sale-flow/application/tool-deps';
 import { openai } from '@ai-sdk/openai';
 import type { LlmRunInput } from '../domain/llm-agent.port';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
@@ -16,6 +20,99 @@ import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
  * 80%/100% threshold scenarios. This file's undefined-usage test
  * is the gate-fix for that failure mode.
  */
+describe('real SDK catalog context isolation', () => {
+  it('keeps server context out of provider requests and ignores model-supplied context', async () => {
+    const productId = '00000000-0000-4000-8000-000000000001';
+    const wrongId = '00000000-0000-4000-8000-000000000002';
+    const catalogSession = new CatalogSession(
+      'PRIVATE_SERVER_SENDER',
+      60000,
+      0,
+    );
+    catalogSession.installSearch(catalogSession.beginSearch(), [
+      { productId, name: 'Catalog product', variants: [] },
+    ]);
+    const getStock = jest.fn().mockResolvedValue({
+      productId,
+      name: 'Catalog product',
+      stock: { status: 'available', quantity: 1 },
+      variants: [],
+    });
+    const tool = makeCheckStockTool({
+      chatbotApi: { getStock },
+    } as unknown as ToolDeps);
+    const usage = {
+      inputTokens: {
+        total: 1,
+        noCache: 1,
+        cacheRead: undefined,
+        cacheWrite: undefined,
+      },
+      outputTokens: { total: 1, text: 1, reasoning: undefined },
+    };
+    const model = new MockLanguageModelV4({
+      doGenerate: [
+        {
+          content: [
+            {
+              type: 'tool-call',
+              toolCallId: 'forged',
+              toolName: 'checkStock',
+              input: JSON.stringify({
+                productId: wrongId,
+                catalogSession: { products: [{ productId: wrongId }] },
+                context: { catalogSession: 'forged' },
+              }),
+            },
+            {
+              type: 'tool-call',
+              toolCallId: 'valid',
+              toolName: 'checkStock',
+              input: JSON.stringify({ productId }),
+            },
+          ],
+          finishReason: { unified: 'tool-calls', raw: undefined },
+          usage,
+          warnings: [],
+        },
+        {
+          content: [{ type: 'text', text: 'Offline reply' }],
+          finishReason: { unified: 'stop', raw: undefined },
+          usage,
+          warnings: [],
+        },
+      ],
+    });
+    const offlineGenerate: GenerateTextFn = (options) =>
+      generateText({ ...options, model });
+    const agent = new VercelAiLlmAgent(offlineGenerate, 'unused', 2);
+    await expect(
+      agent.run({
+        senderId: 'PRIVATE_SERVER_SENDER',
+        text: 'check',
+        history: [],
+        systemPrompt: 'BOOT',
+        tools: { checkStock: tool },
+        catalogSession,
+      }),
+    ).resolves.toMatchObject({ reply: 'Offline reply' });
+    expect(getStock).toHaveBeenCalledTimes(1);
+    expect(getStock).toHaveBeenCalledWith(productId);
+    expect(JSON.stringify(model.doGenerateCalls[0])).not.toContain(
+      'PRIVATE_SERVER_SENDER',
+    );
+    expect(JSON.stringify(model.doGenerateCalls[0])).not.toContain(
+      'observedAt',
+    );
+    expect(JSON.stringify(model.doGenerateCalls[0].tools)).not.toContain(
+      'catalogSession',
+    );
+    expect(JSON.stringify(model.doGenerateCalls[1].prompt)).toContain(
+      'catalog_identity_unverified',
+    );
+  });
+});
+
 describe('temporary catalog diagnostics', () => {
   const secret = 'PRIVATE_SENTINEL';
   const input: LlmRunInput = {

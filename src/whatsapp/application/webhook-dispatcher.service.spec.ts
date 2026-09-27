@@ -88,6 +88,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     jest.setSystemTime(new Date('2026-06-23T12:00:00.000Z'));
 
     store = {
+      commitAgentTurn: jest.fn().mockResolvedValue(true),
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
@@ -146,6 +147,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     // `data.pendingHumanRequest` for the customer's pending-marker
     // short-circuit (step 4). Default: returns null (no marker).
     conversationStore = {
+      commitAgentTurn: jest.fn().mockResolvedValue(true),
       get: jest.fn().mockResolvedValue(null),
       create: jest.fn(),
       update: jest.fn(),
@@ -244,16 +246,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }),
     );
 
-    expect(store.update).toHaveBeenCalledWith(
+    expect(store.commitAgentTurn).toHaveBeenCalledWith(
       '5215550001111',
       expect.objectContaining({
         lastMessageAt: '2026-06-23T12:00:00.000Z',
-        data: {
-          messages: [
-            { role: 'user', content: 'hola' },
-            { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-          ],
-        },
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
+        ],
       }),
     );
 
@@ -331,17 +331,16 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     await service.dispatch(event);
 
     // User + assistant both appended to the prior transcript.
-    expect(store.update).toHaveBeenCalledWith(
+    expect(store.commitAgentTurn).toHaveBeenCalledWith(
       '5215550001111',
       expect.objectContaining({
-        data: {
-          messages: [
-            { role: 'user', content: 'hola' },
-            { role: 'assistant', content: 'Hola' },
-            { role: 'user', content: 'precio?' },
-            { role: 'assistant', content: 'precio: $100' },
-          ],
-        },
+        expected: { messages: prior.data.messages },
+        messages: [
+          { role: 'user', content: 'hola' },
+          { role: 'assistant', content: 'Hola' },
+          { role: 'user', content: 'precio?' },
+          { role: 'assistant', content: 'precio: $100' },
+        ],
       }),
     );
     expect(sender.sendText).toHaveBeenCalledWith({
@@ -1581,6 +1580,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(llm.run).toHaveBeenCalledTimes(1);
       const [runnerInput] = llm.run.mock.calls[0];
       expect(runnerInput).toEqual({
+        catalogSession: expect.objectContaining({
+          senderId: CUSTOMER,
+        }) as unknown,
         senderId: CUSTOMER,
         text: 'sí',
         history: [],

@@ -82,6 +82,7 @@ describe('HumanHandoffService', () => {
     };
 
     conversationStore = {
+      commitAgentTurn: jest.fn().mockResolvedValue(true),
       get: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),

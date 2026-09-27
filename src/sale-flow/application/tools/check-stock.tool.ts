@@ -2,13 +2,18 @@ import { tool } from 'ai';
 import { z } from 'zod';
 import type { ToolDeps } from '../tool-deps';
 import { mapChatbotError } from '../error-mapping';
+import {
+  CatalogSession,
+  catalogSessionSchema,
+  CATALOG_RECOVERY,
+} from '../../../conversation/domain/catalog-references';
 
 /**
  * checkStock — AI-SDK tool factory.
  *
  * AGENTS.md §4.4.2: GET `/chatbot-api/catalog/:productId/stock`
- * (`catalog:read`). Stateless; the backend already returns 404 with
- * `NotFoundError` when the product does not exist.
+ * (`catalog:read`). Run-local catalog evidence gates GET; fresh backend
+ * stock remains the authority for the escalation signal.
  */
 export function makeCheckStockTool(deps: ToolDeps) {
   return tool({
@@ -21,7 +26,18 @@ export function makeCheckStockTool(deps: ToolDeps) {
       // product identity in the escalation digest: the backend name wins.
       name: z.string().min(1).optional(),
     }),
-    execute: async (input) => {
+    contextSchema: z.object({
+      catalogSession: catalogSessionSchema.optional(),
+    }),
+    execute: async (input, options) => {
+      try {
+        const session = options.context?.catalogSession;
+        if (!CatalogSession.is(session) || !session.matches(input)) {
+          return CATALOG_RECOVERY;
+        }
+      } catch {
+        return CATALOG_RECOVERY;
+      }
       try {
         const stock = await deps.chatbotApi.getStock(input.productId);
         // Non-trigger branches keep the existing shape byte-identically.

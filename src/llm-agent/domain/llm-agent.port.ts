@@ -1,3 +1,4 @@
+import type { CatalogSession } from '../../conversation/domain/catalog-references';
 import type { AgentMessage } from './agent-message';
 import type { RestockInboundEventIdentity } from '../../human-decisions/domain/restock-source-identity';
 
@@ -31,6 +32,8 @@ export interface LlmRunResult {
 /** Input to a single agent run. */
 export interface LlmRunInput {
   senderId: string;
+  catalogSession?: CatalogSession;
+  catalogEvidence?: string;
   text: string;
   /** Pre-truncated history (truncation is the runner's job, not the port's). */
   history: AgentMessage[];

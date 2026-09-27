@@ -1,3 +1,4 @@
+import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { preflightRestockRequest } from './restock-request-preflight';
 
 /**
@@ -74,12 +75,20 @@ const deps = (
     getStock,
   };
 };
+function grounded() {
+  const session = new CatalogSession(SENDER, 60000, 0);
+  session.installSearch(session.beginSearch(), [
+    { ...STOCK, name: DIGEST.name },
+  ]);
+  return session;
+}
 const ask = (d: ReturnType<typeof deps>, over: Record<string, unknown> = {}) =>
   preflightRestockRequest(
     {
       senderId: SENDER,
       inboundEvent: EVENT,
       digest: DIGEST,
+      catalogSession: grounded(),
       restockFeatureEnabled: true,
       ...over,
     },

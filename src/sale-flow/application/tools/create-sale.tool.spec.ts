@@ -53,6 +53,7 @@ describe('makeCreateSaleTool', () => {
       data: { cart },
     };
     return {
+      commitAgentTurn: jest.fn().mockResolvedValue(true),
       get: jest.fn().mockResolvedValue(state),
       create: jest.fn(),
       setPendingHumanRequest: jest.fn(),
