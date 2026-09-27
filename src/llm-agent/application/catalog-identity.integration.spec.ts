@@ -24,7 +24,8 @@ type Invocation = {
   >;
   toolsContext: Record<string, unknown>;
   messages: unknown[];
-  system: string;
+  system?: string;
+  instructions?: { role: 'system'; content: string }[];
 };
 type Step = (
   call: (name: string, input: unknown) => Promise<unknown>,
@@ -108,9 +109,23 @@ describe('catalog identity through the real runner, adapter and tools', () => {
     await f.runner.handle({ senderId: 'sender', text: 'Medicine' });
     expect(f.getStock).not.toHaveBeenCalled();
     f.steps.push(async (call, invocation) => {
-      expect(invocation.system).toBe('BOOT');
-      expect(JSON.stringify(invocation.messages)).toContain('UNSELECTED');
-      expect(JSON.stringify(invocation.messages)).toContain('stock unknown');
+      expect(invocation.system).toBeUndefined();
+      expect(invocation.instructions).toEqual([
+        { role: 'system', content: 'BOOT' },
+        {
+          role: 'system',
+          content:
+            'UNSELECTED catalog evidence; stock unknown. Ask for explicit customer choice.\n' +
+            JSON.stringify([
+              { productId, name: product.name, variants: [] },
+              { productId: otherId, name: 'Medicine 800 mg', variants: [] },
+            ]),
+        },
+      ]);
+      expect(invocation.messages).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ role: 'system' })]),
+      );
+      expect(JSON.stringify(invocation.messages)).not.toContain('UNSELECTED');
       expect(
         await call('checkStock', {
           productId: '00000000-0000-4000-8000-000000000099',

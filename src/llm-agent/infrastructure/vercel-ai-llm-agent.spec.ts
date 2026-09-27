@@ -21,6 +21,128 @@ import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
  * is the gate-fix for that failure mode.
  */
 describe('real SDK catalog context isolation', () => {
+  it('accepts subsequent-turn catalog evidence through instructions without persisting it', async () => {
+    const senderId = 'PRIVATE_OFFLINE_SENDER';
+    const catalogSession = new CatalogSession(senderId, 60000, 0);
+    const model = new MockLanguageModelV4({
+      doGenerate: {
+        content: [{ type: 'text', text: 'Offline catalog reply' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: {
+          inputTokens: {
+            total: 1,
+            noCache: 1,
+            cacheRead: undefined,
+            cacheWrite: undefined,
+          },
+          outputTokens: { total: 1, text: 1, reasoning: undefined },
+        },
+        warnings: [],
+      },
+    });
+    const sdkInputs: Pick<
+      Parameters<GenerateTextFn>[0],
+      'system' | 'instructions' | 'messages' | 'allowSystemInMessages'
+    >[] = [];
+    const offlineGenerate: GenerateTextFn = (options) => {
+      sdkInputs.push(options);
+      return generateText({ ...options, model });
+    };
+    const agent = new VercelAiLlmAgent(offlineGenerate, 'unused', 2);
+    const tools = {
+      checkStock: makeCheckStockTool({
+        chatbotApi: { getStock: jest.fn() },
+      } as unknown as ToolDeps),
+    };
+    const first = await agent.run({
+      senderId,
+      text: 'Busca un producto',
+      history: [],
+      systemPrompt: SYSTEM_PROMPT,
+      tools,
+      catalogSession,
+    });
+    expect(sdkInputs[0].system).toBe(SYSTEM_PROMPT);
+    expect(sdkInputs[0].instructions).toBeUndefined();
+    expect(model.doGenerateCalls[0].prompt[0]).toEqual({
+      role: 'system',
+      content: SYSTEM_PROMPT,
+    });
+
+    // Recreate the persisted search evidence available on the next inbound turn.
+    catalogSession.installSearch(catalogSession.beginSearch(), [
+      {
+        productId: '00000000-0000-4000-8000-000000000001',
+        name: 'Offline catalog product',
+        variants: [],
+      },
+    ]);
+    const catalogEvidence = catalogSession.evidence(0);
+    expect(catalogEvidence).toContain(
+      'UNSELECTED catalog evidence; stock unknown.',
+    );
+    const text = '¿Tienes existencias de ese producto?';
+    const pending = agent.run({
+      senderId,
+      text,
+      history: first.messages,
+      systemPrompt: SYSTEM_PROMPT,
+      tools,
+      catalogSession,
+      catalogEvidence: catalogEvidence!,
+    });
+    await expect(pending).resolves.toMatchObject({
+      reply: 'Offline catalog reply',
+    });
+    const result = await pending;
+    const expectedMessages = [
+      ...first.messages,
+      { role: 'user', content: text },
+    ];
+    expect(sdkInputs[1].messages).toEqual(expectedMessages);
+    expect(sdkInputs[1].system).toBeUndefined();
+    expect(sdkInputs[1].instructions).toEqual([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: catalogEvidence },
+    ]);
+    for (const input of sdkInputs) {
+      expect(input.messages?.some((message) => message.role === 'system')).toBe(
+        false,
+      );
+      expect(input.allowSystemInMessages).toBeUndefined();
+    }
+    expect(model.doGenerateCalls).toHaveLength(2);
+    expect(model.doGenerateCalls[1].prompt).toEqual([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: catalogEvidence },
+      ...expectedMessages.map((message) => ({
+        role: message.role,
+        content: [{ type: 'text', text: message.content }],
+      })),
+    ]);
+    expect(result.messages).toEqual([
+      ...expectedMessages,
+      { role: 'assistant', content: 'Offline catalog reply' },
+    ]);
+    expect(JSON.stringify(result.messages)).not.toContain(catalogEvidence!);
+    for (const call of model.doGenerateCalls) {
+      const providerData = JSON.stringify({
+        prompt: call.prompt,
+        tools: call.tools,
+      });
+      for (const privateValue of [
+        senderId,
+        'senderId',
+        'observedAt',
+        'origin',
+        'catalogSession',
+        'toolsContext',
+      ]) {
+        expect(providerData).not.toContain(privateValue);
+      }
+    }
+  });
+
   it('keeps server context out of provider requests and ignores model-supplied context', async () => {
     const productId = '00000000-0000-4000-8000-000000000001';
     const wrongId = '00000000-0000-4000-8000-000000000002';

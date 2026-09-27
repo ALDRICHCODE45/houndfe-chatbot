@@ -39,12 +39,6 @@ export class VercelAiLlmAgent implements LlmAgentPort {
 
   async run(input: LlmRunInput): Promise<LlmRunResult> {
     const messages = assembleModelMessages(input.history, input.text);
-    if (input.catalogEvidence) {
-      messages.splice(messages.length - 1, 0, {
-        role: 'system',
-        content: input.catalogEvidence,
-      });
-    }
     const catalogSession =
       CatalogSession.is(input.catalogSession) &&
       input.catalogSession.senderId === input.senderId
@@ -104,7 +98,15 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     try {
       result = await this.generateTextFn({
         model: openai(this.modelId),
-        system: input.systemPrompt,
+        // SDK 7 rejects system roles in messages; keep evidence out of history.
+        ...(input.catalogEvidence
+          ? {
+              instructions: [
+                { role: 'system', content: input.systemPrompt },
+                { role: 'system', content: input.catalogEvidence },
+              ],
+            }
+          : { system: input.systemPrompt }),
         messages,
         tools: input.tools as never,
         toolsContext,
