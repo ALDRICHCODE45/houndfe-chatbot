@@ -727,10 +727,133 @@ describe('temporary catalog diagnostics', () => {
       event: 'tool_execution_end',
       toolName: name,
       category,
+      // Additive, closed-vocabulary diagnostics for the checkStock
+      // returned-error envelope only; a non-allowlisted string kind is
+      // mapped to the fixed `unknown` label, never echoed.
+      ...(name === 'checkStock' && category === 'returned_error'
+        ? { errorKind: 'unknown' }
+        : {}),
     });
     expect(records()[1].observationComplete).toBe(
       category !== 'unknown_output',
     );
+  });
+
+  it.each([
+    'catalog_identity_unverified',
+    'auth',
+    'forbidden',
+    'notFound',
+    'rateLimit',
+    'validation',
+    'upstream',
+  ])(
+    'maps allowlisted checkStock returned error kind %s',
+    async (errorKind) => {
+      await run((hooks) => {
+        end(
+          hooks,
+          outputOf({ ok: false, error: { kind: errorKind } }),
+          'checkStock',
+        );
+        step(hooks);
+      });
+      expect(records()[0]).toEqual({
+        prefix: 'catalog_diagnostic',
+        runId: records().at(-1)?.runId,
+        event: 'tool_execution_end',
+        toolName: 'checkStock',
+        category: 'returned_error',
+        errorKind,
+      });
+    },
+  );
+
+  it('maps a non-allowlisted checkStock kind to fixed unknown without echoing it', async () => {
+    const kind = `${secret}_kind`;
+    await run((hooks) => {
+      end(hooks, outputOf({ ok: false, error: { kind } }), 'checkStock');
+      step(hooks);
+    });
+    expect(records()[0]).toMatchObject({
+      toolName: 'checkStock',
+      category: 'returned_error',
+      errorKind: 'unknown',
+    });
+    expect(JSON.stringify(records())).not.toContain(kind);
+  });
+
+  it.each([
+    ['non-string kind', { ok: false, error: { kind: 7 } }],
+    ['null error', { ok: false, error: null }],
+    ['missing kind', { ok: false, error: {} }],
+    ['missing error', { ok: false }],
+  ])(
+    'keeps a malformed checkStock error envelope as unknown_output (%s)',
+    async (_label, output) => {
+      await run((hooks) => {
+        end(hooks, outputOf(output), 'checkStock');
+        step(hooks);
+      });
+      expect(records()[0]).toMatchObject({
+        toolName: 'checkStock',
+        category: 'unknown_output',
+      });
+      expect(records()[0]).not.toHaveProperty('errorKind');
+    },
+  );
+
+  it('ignores additional sensitive error props while mapping an allowlisted kind', async () => {
+    await run((hooks) => {
+      end(
+        hooks,
+        outputOf({
+          ok: false,
+          error: { kind: 'auth', message: secret, payload: { raw: secret } },
+        }),
+        'checkStock',
+      );
+      step(hooks);
+    });
+    expect(records()[0]).toEqual({
+      prefix: 'catalog_diagnostic',
+      runId: records().at(-1)?.runId,
+      event: 'tool_execution_end',
+      toolName: 'checkStock',
+      category: 'returned_error',
+      errorKind: 'auth',
+    });
+  });
+
+  it('never attaches errorKind to success or non-checkStock envelopes', async () => {
+    await run((hooks) => {
+      end(hooks, outputOf(stock), 'checkStock');
+      end(
+        hooks,
+        outputOf({ ok: false, error: { kind: 'disabled' } }),
+        'requestHumanAssistance',
+      );
+      end(
+        hooks,
+        outputOf({ ok: false, error: { kind: 'auth' } }),
+        'evaluateCart',
+      );
+      step(hooks);
+    });
+    const ends = records().filter((r) => r.event === 'tool_execution_end');
+    expect(ends).toHaveLength(3);
+    for (const record of ends) expect(record).not.toHaveProperty('errorKind');
+  });
+
+  it('does not attach errorKind to the step-completion fallback requests', async () => {
+    await run((hooks) =>
+      hooks.onStepFinish({ toolCalls: [{ toolName: 'checkStock' }] }),
+    );
+    expect(records()[0]).toMatchObject({
+      event: 'tool_requested',
+      toolName: 'checkStock',
+    });
+    expect(records()[0]).not.toHaveProperty('errorKind');
   });
 
   it.each(['checkStock', 'requestHumanAssistance'])(

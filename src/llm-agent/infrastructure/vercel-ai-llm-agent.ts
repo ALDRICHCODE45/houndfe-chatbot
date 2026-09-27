@@ -387,6 +387,24 @@ function catalogDiagnostic(logger: Logger) {
     value !== null && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : {};
+  // Closed allowlist for checkStock returned-error envelopes. Only these
+  // literal kinds reach diagnostics; every other string maps to the fixed
+  // `unknown` label, so arbitrary text, IDs or payloads are never echoed.
+  const checkStockErrorKinds = new Set<string>([
+    'catalog_identity_unverified',
+    'auth',
+    'forbidden',
+    'notFound',
+    'rateLimit',
+    'validation',
+    'upstream',
+  ]);
+  const checkStockErrorKind = (result: unknown): string => {
+    const kind = envelope(envelope(result).error).kind;
+    return typeof kind === 'string' && checkStockErrorKinds.has(kind)
+      ? kind
+      : 'unknown';
+  };
   const outcomeOf = (name: string, result: unknown): string => {
     // Only envelope discriminators: not domain validation or proof of delivery.
     const ok = envelope(result).ok;
@@ -469,15 +487,25 @@ function catalogDiagnostic(logger: Logger) {
         });
         if (toolName !== 'searchCatalog') {
           let category = 'unknown_output';
+          let errorKind: string | undefined;
           observe(() => {
             if (toolName === 'other') return;
             const output = event.toolOutput;
             if (output.type === 'tool-error') category = 'execution_error';
-            if (output.type === 'tool-result')
+            if (output.type === 'tool-result') {
               category = outcomeOf(toolName, output.output);
+              if (toolName === 'checkStock' && category === 'returned_error') {
+                errorKind = checkStockErrorKind(output.output);
+              }
+            }
           });
           if (category === 'unknown_output') observationComplete = false;
-          emit({ event: 'tool_execution_end', toolName, category });
+          emit({
+            event: 'tool_execution_end',
+            toolName,
+            category,
+            ...(errorKind === undefined ? {} : { errorKind }),
+          });
           return;
         }
         const toolOutput = event.toolOutput;
