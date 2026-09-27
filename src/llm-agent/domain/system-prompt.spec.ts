@@ -29,6 +29,34 @@ describe('SYSTEM_PROMPT', () => {
     );
   });
 
+  it('limits missing-date disclosures to relevant replenishment context', () => {
+    expect(SYSTEM_PROMPT).toContain(
+      'Si solo pregunta por disponibilidad, no anuncies la falta de fecha',
+    );
+    expect(SYSTEM_PROMPT).toContain(
+      'Solo si falta el dato y la fecha es relevante (porque pregunta por reposición o el contexto lo requiere), indica que no tienes una fecha confirmada',
+    );
+  });
+
+  it('asks only for pending confirmation of real presentations', () => {
+    expect(SYSTEM_PROMPT).toContain(
+      'Tras presentar candidatos reales, si falta confirmar, pregunta',
+    );
+    expect(SYSTEM_PROMPT).toContain('¿Buscaba esa presentación?');
+    expect(SYSTEM_PROMPT).toContain('solo tras nombrarla');
+    expect(SYSTEM_PROMPT).toContain('opciones reales que los distingan');
+    expect(SYSTEM_PROMPT).toContain(
+      'No repitas confirmación ya establecida en historial o contexto',
+    );
+    expect(SYSTEM_PROMPT).toContain(
+      'conserva las reglas de recuperación de IDs',
+    );
+    expect(SYSTEM_PROMPT).toContain('No inventes opciones');
+    expect(SYSTEM_PROMPT).not.toContain(
+      'ni recomiendes medicamentos alternativos',
+    );
+  });
+
   it('mandates neutral professional Mexican Spanish', () => {
     // The prompt must say "español mexicano" (or close paraphrase) AND
     // require neutral/professional tone.

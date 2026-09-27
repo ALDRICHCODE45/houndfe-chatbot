@@ -160,6 +160,26 @@ describe('sale-flow-instructions', () => {
       );
     });
 
+    it('asks concretely for pending presentation confirmation without repeating it', () => {
+      for (const rule of [
+        'Tras presentar candidatos reales, si falta la confirmación del paso 4',
+        '¿Buscaba esa presentación?',
+        'solo tras nombrar la presentación real',
+        'opciones reales que los distingan',
+        'No repitas confirmación ya establecida en historial o contexto',
+        'conserva las reglas de recuperación de IDs y ambigüedad del paso 5',
+        'No inventes opciones',
+      ]) {
+        expect(steps).toContain(rule);
+      }
+    });
+
+    it('does not introduce a category-wide alternative recommendation ban', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain(
+        'ni recomiendes medicamentos alternativos',
+      );
+    });
+
     it('bounds empty-result refinement to one distinct broader query', () => {
       expect(steps).toContain(
         '`ok: true, results: []` significa sin coincidencias, no agotado',
@@ -281,7 +301,7 @@ describe('sale-flow-instructions', () => {
   });
 
   describe('customer voice boundaries (text contracts, not generated replies)', () => {
-    it('conditions availability examples on verified stock and preserves unknown ETA', () => {
+    it('separates availability-only shortage from relevant missing-ETA guidance', () => {
       expect(SALE_FLOW_INSTRUCTIONS).toContain('Claro que sí 😊 Contamos con');
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'solo con existencias verificadas para esa presentación',
@@ -293,10 +313,19 @@ describe('sale-flow-instructions', () => {
         'Stock desconocido o consulta fallida no significa agotado',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'Por el momento, [presentación] está agotada. No tenemos una fecha de reposición confirmada.',
+        'Ejemplo para disponibilidad, solo con agotamiento confirmado: "Por el momento, [presentación] está agotada."',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'solo si el agotamiento está confirmado y no hay fecha verificada',
+        'Si solo pregunta por disponibilidad, no anuncies la falta de fecha',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Solo si falta el dato y la fecha es relevante (porque pregunta por reposición o cuándo vuelve, o el contexto lo requiere)',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'No tenemos una fecha de reposición confirmada.',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain(
+        'está agotada. No tenemos una fecha',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'No reemplaces una fecha verificada por ese ejemplo',
