@@ -1,7 +1,9 @@
 import { Logger } from '@nestjs/common';
-import { generateText, stepCountIs } from 'ai';
+import { generateText, stepCountIs, tool } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
+import { z } from 'zod';
 import { CatalogSession } from '../../conversation/domain/catalog-references';
+import { UpstreamError } from '../../chatbot-api/domain/errors';
 import { makeCheckStockTool } from '../../sale-flow/application/tools/check-stock.tool';
 import { makeRequestHumanAssistanceTool } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { ToolDeps } from '../../sale-flow/application/tool-deps';
@@ -10,7 +12,12 @@ import type { LlmRunInput } from '../domain/llm-agent.port';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import { composeSaleFlowSystemPrompt } from '../../sale-flow/domain/sale-flow-instructions';
 import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
-import { VercelAiLlmAgent } from './vercel-ai-llm-agent';
+import {
+  createInventorySeparationGate,
+  INVENTORY_UNCONFIRMED_REPLY,
+  STOCK_FIRST_DENIAL_REASON,
+  VercelAiLlmAgent,
+} from './vercel-ai-llm-agent';
 
 /**
  * Unit tests for VercelAiLlmAgent.
@@ -373,7 +380,11 @@ describe('real SDK catalog context isolation', () => {
         tools: { checkStock: tool },
         catalogSession,
       }),
-    ).resolves.toMatchObject({ reply: 'Offline reply' });
+      // R2: the forged checkStock is rejected (catalog_identity_unverified),
+      // so an unresolved stock failure exists with no executed mutation. The
+      // conservative R2 reply override therefore replaces the opaque model
+      // text; the identity/isolation assertions below are unchanged.
+    ).resolves.toMatchObject({ reply: INVENTORY_UNCONFIRMED_REPLY });
     expect(getStock).toHaveBeenCalledTimes(1);
     expect(getStock).toHaveBeenCalledWith(productId);
     expect(JSON.stringify(model.doGenerateCalls[0])).not.toContain(
@@ -1436,6 +1447,469 @@ describe('VercelAiLlmAgent', () => {
       // SDK is loaded and the call typechecks).
       const m = openai('anthropic/claude-sonnet-4.5') as { provider: string };
       expect(m.provider).toBe('openai.responses');
+    });
+  });
+});
+
+describe('inventory evidence separation (R2)', () => {
+  const productId = '00000000-0000-4000-8000-000000000001';
+  const availableStock = {
+    productId,
+    name: 'Medicine 400 mg',
+    stock: { status: 'available', quantity: 5 },
+    variants: [],
+  };
+  const usage = {
+    inputTokens: {
+      total: 1,
+      noCache: 1,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: { total: 1, text: 1, reasoning: undefined },
+  };
+  const toolCall = (toolCallId: string, toolName: string, input: string) => ({
+    type: 'tool-call' as const,
+    toolCallId,
+    toolName,
+    input,
+  });
+
+  function session() {
+    const catalogSession = new CatalogSession('sender', 60000, 0);
+    catalogSession.installSearch(catalogSession.beginSearch(), [
+      { productId, name: 'Medicine 400 mg', variants: [] },
+    ]);
+    return catalogSession;
+  }
+
+  function stub(name: string) {
+    const execute = jest.fn(async () => ({ ok: true }));
+    const definition = tool({
+      description: `${name} stub`,
+      inputSchema: z.object({}),
+      execute,
+    });
+    return { definition, execute };
+  }
+
+  function checkStockTool(getStock: jest.Mock) {
+    return makeCheckStockTool({
+      chatbotApi: { getStock },
+    } as unknown as ToolDeps);
+  }
+
+  async function run(
+    tools: Record<string, unknown>,
+    steps: Array<
+      Array<{ toolCallId: string; toolName: string; input: string }> | string
+    >,
+    catalogSession: CatalogSession,
+  ) {
+    const doGenerate = steps.map((step) =>
+      typeof step === 'string'
+        ? {
+            content: [{ type: 'text', text: step }],
+            finishReason: { unified: 'stop', raw: undefined },
+            usage,
+            warnings: [],
+          }
+        : {
+            content: step,
+            finishReason: { unified: 'tool-calls', raw: undefined },
+            usage,
+            warnings: [],
+          },
+    );
+    const model = new MockLanguageModelV4({ doGenerate } as never);
+    let captured:
+      | { steps: Array<{ content: Array<Record<string, unknown>> }> }
+      | undefined;
+    const generate: GenerateTextFn = async (options) => {
+      const result = await generateText({ ...options, model });
+      captured = result as unknown as typeof captured;
+      return result;
+    };
+    const agent = new VercelAiLlmAgent(generate, 'unused', 6);
+    const result = await agent.run({
+      senderId: 'sender',
+      text: 'check stock',
+      history: [],
+      systemPrompt: 'BOOT',
+      tools,
+      catalogSession,
+    });
+    return { result, model, captured: captured! };
+  }
+
+  const MUTATING = [
+    'evaluateCart',
+    'upsertCustomer',
+    'createSale',
+    'updateDelivery',
+    'cancelSale',
+    'requestHumanAssistance',
+    'getShippingQuote',
+  ];
+  const READ_ONLY = [
+    'searchCatalog',
+    'getCustomerByPhone',
+    'getOrderHistory',
+    'getPaymentDetails',
+    'attachReceipt',
+  ];
+
+  it.each(MUTATING)(
+    'denies the mutating sibling %s without executing it and without an approval UI',
+    async (name) => {
+      const getStock = jest.fn().mockResolvedValue(availableStock);
+      const mutation = stub(name);
+      const tools = {
+        checkStock: checkStockTool(getStock),
+        [name]: mutation.definition,
+      } as Record<string, unknown>;
+      const { captured } = await run(
+        tools,
+        [
+          [
+            toolCall('c1', 'checkStock', JSON.stringify({ productId })),
+            toolCall('m1', name, '{}'),
+          ],
+          'final',
+        ],
+        session(),
+      );
+      expect(mutation.execute).not.toHaveBeenCalled();
+      expect(getStock).toHaveBeenCalledTimes(1);
+      const content = captured.steps[0].content;
+      expect(
+        content.find((part) => part.type === 'tool-approval-response'),
+      ).toMatchObject({ approved: false, reason: STOCK_FIRST_DENIAL_REASON });
+      expect(
+        content.find((part) => part.type === 'tool-approval-request'),
+      ).toMatchObject({ isAutomatic: true });
+      expect(
+        content.some(
+          (part) =>
+            part.type === 'tool-approval-request' && part.isAutomatic !== true,
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it.each(READ_ONLY)(
+    'executes the read-only sibling %s in a checkStock batch',
+    async (name) => {
+      const getStock = jest.fn().mockResolvedValue(availableStock);
+      const readOnly = stub(name);
+      const tools = {
+        checkStock: checkStockTool(getStock),
+        [name]: readOnly.definition,
+      } as Record<string, unknown>;
+      await run(
+        tools,
+        [
+          [
+            toolCall('c1', 'checkStock', JSON.stringify({ productId })),
+            toolCall('r1', name, '{}'),
+          ],
+          'final',
+        ],
+        session(),
+      );
+      expect(readOnly.execute).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('executes the read-only checkStock sibling and no mutation', async () => {
+    const getStock = jest.fn().mockResolvedValue(availableStock);
+    const tools = { checkStock: checkStockTool(getStock) };
+    await run(
+      tools,
+      [[toolCall('c1', 'checkStock', JSON.stringify({ productId }))], 'final'],
+      session(),
+    );
+    expect(getStock).toHaveBeenCalledTimes(1);
+  });
+
+  it('denies a mutation-only batch after a failed stock check even when the model ignores inactive tools', async () => {
+    const getStock = jest
+      .fn()
+      .mockRejectedValue(new UpstreamError('boom', 503));
+    const sale = stub('createSale');
+    const tools = {
+      checkStock: checkStockTool(getStock),
+      createSale: sale.definition,
+    };
+    const { result, model, captured } = await run(
+      tools,
+      [
+        [toolCall('c1', 'checkStock', JSON.stringify({ productId }))],
+        [toolCall('m1', 'createSale', '{}')],
+        'final',
+      ],
+      session(),
+    );
+    expect(sale.execute).not.toHaveBeenCalled();
+    // The mutation is already hidden from the provider presentation...
+    expect(
+      (model.doGenerateCalls[1].tools ?? []).map(
+        (definition) => definition.name,
+      ),
+    ).not.toContain('createSale');
+    // ...and a model that emits it anyway is denied, never queued.
+    const content = captured.steps[1].content;
+    expect(
+      content.find((part) => part.type === 'tool-approval-response'),
+    ).toMatchObject({ approved: false, reason: STOCK_FIRST_DENIAL_REASON });
+    expect(
+      content.some(
+        (part) =>
+          part.type === 'tool-approval-request' && part.isAutomatic !== true,
+      ),
+    ).toBe(false);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('overrides the reply from the first non-authoritative stock result when nothing executed', async () => {
+    const getStock = jest.fn().mockResolvedValue({
+      productId,
+      name: 'Medicine 400 mg',
+      stock: { status: 'not_managed', quantity: null },
+      variants: [],
+    });
+    const tools = { checkStock: checkStockTool(getStock) };
+    const { result } = await run(
+      tools,
+      [[toolCall('c1', 'checkStock', JSON.stringify({ productId }))], 'final'],
+      session(),
+    );
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('denies an unknown executable tool name in a checkStock batch', async () => {
+    const getStock = jest.fn().mockResolvedValue(availableStock);
+    const mystery = stub('mysteryTool');
+    const tools = {
+      checkStock: checkStockTool(getStock),
+      mysteryTool: mystery.definition,
+    };
+    await run(
+      tools,
+      [
+        [
+          toolCall('c1', 'checkStock', JSON.stringify({ productId })),
+          toolCall('x1', 'mysteryTool', '{}'),
+        ],
+        'final',
+      ],
+      session(),
+    );
+    expect(mystery.execute).not.toHaveBeenCalled();
+  });
+
+  it('executes a mutating reissue exactly once after a valid stock result', async () => {
+    const getStock = jest.fn().mockResolvedValue(availableStock);
+    const sale = stub('createSale');
+    const tools = {
+      checkStock: checkStockTool(getStock),
+      createSale: sale.definition,
+    };
+    const { model } = await run(
+      tools,
+      [
+        [
+          toolCall('c1', 'checkStock', JSON.stringify({ productId })),
+          toolCall('m1', 'createSale', '{}'),
+        ],
+        [toolCall('m2', 'createSale', '{}')],
+        'final',
+      ],
+      session(),
+    );
+    expect(sale.execute).toHaveBeenCalledTimes(1);
+    expect(
+      (model.doGenerateCalls[1].tools ?? []).map(
+        (definition) => definition.name,
+      ),
+    ).toContain('createSale');
+  });
+
+  it('does not execute a denied mutation and overrides the reply while unresolved', async () => {
+    const getStock = jest
+      .fn()
+      .mockRejectedValue(new UpstreamError('boom', 503));
+    const sale = stub('createSale');
+    const tools = {
+      checkStock: checkStockTool(getStock),
+      createSale: sale.definition,
+    };
+    const { result, model } = await run(
+      tools,
+      [
+        [
+          toolCall('c1', 'checkStock', JSON.stringify({ productId })),
+          toolCall('m1', 'createSale', '{}'),
+        ],
+        'final',
+      ],
+      session(),
+    );
+    expect(sale.execute).not.toHaveBeenCalled();
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(result.messages.at(-1)).toEqual({
+      role: 'assistant',
+      content: INVENTORY_UNCONFIRMED_REPLY,
+    });
+    const restricted = (model.doGenerateCalls[1].tools ?? []).map(
+      (definition) => definition.name,
+    );
+    expect(restricted).toContain('checkStock');
+    expect(restricted).not.toContain('createSale');
+  });
+
+  it('preserves the reply and history when a prior mutation may have had effects', async () => {
+    const getStock = jest
+      .fn()
+      .mockRejectedValue(new UpstreamError('boom', 503));
+    const sale = stub('createSale');
+    sale.execute.mockRejectedValueOnce(new Error('ambiguous result'));
+    const tools = {
+      checkStock: checkStockTool(getStock),
+      createSale: sale.definition,
+    };
+    const { result } = await run(
+      tools,
+      [
+        [toolCall('m1', 'createSale', '{}')],
+        [toolCall('c1', 'checkStock', JSON.stringify({ productId }))],
+        'final reply',
+      ],
+      session(),
+    );
+    expect(sale.execute).toHaveBeenCalledTimes(1);
+    expect(result.reply).toBe('final reply');
+    expect(result.messages.at(-1)).toEqual({
+      role: 'assistant',
+      content: 'final reply',
+    });
+  });
+
+  it('counts an unknown executed tool as a potential effect and preserves the reply', async () => {
+    const getStock = jest
+      .fn()
+      .mockRejectedValue(new UpstreamError('boom', 503));
+    const mystery = stub('mysteryTool');
+    const tools = {
+      checkStock: checkStockTool(getStock),
+      mysteryTool: mystery.definition,
+    };
+    const { result } = await run(
+      tools,
+      [
+        [toolCall('u1', 'mysteryTool', '{}')],
+        [toolCall('c1', 'checkStock', JSON.stringify({ productId }))],
+        'final reply',
+      ],
+      session(),
+    );
+    expect(mystery.execute).toHaveBeenCalledTimes(1);
+    expect(result.reply).toBe('final reply');
+  });
+
+  describe('createInventorySeparationGate', () => {
+    it('denies mutating and unknown tools when batch metadata is missing or malformed', () => {
+      const gate = createInventorySeparationGate();
+      for (const event of [
+        undefined,
+        null,
+        {},
+        { content: 'not-an-array' },
+        { content: [null] },
+        { content: [{ type: 'tool-call' }] },
+      ]) {
+        gate.capture(event);
+        expect(gate.approve({ toolCallId: 'x', toolName: 'createSale' })).toBe(
+          'denied',
+        );
+        expect(gate.approve({ toolCallId: 'x', toolName: 'mysteryTool' })).toBe(
+          'denied',
+        );
+        expect(
+          gate.approve({ toolCallId: 'x', toolName: 'searchCatalog' }),
+        ).toBe('not-applicable');
+      }
+    });
+
+    it('never lets a stale batch id authorize a mutation', () => {
+      const gate = createInventorySeparationGate();
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'a', toolName: 'checkStock' },
+          { type: 'tool-call', toolCallId: 'b', toolName: 'createSale' },
+        ],
+      });
+      expect(gate.approve({ toolCallId: 'b', toolName: 'createSale' })).toBe(
+        'denied',
+      );
+      expect(gate.approve({ toolCallId: 'a', toolName: 'checkStock' })).toBe(
+        'not-applicable',
+      );
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'c', toolName: 'searchCatalog' },
+        ],
+      });
+      expect(gate.approve({ toolCallId: 'b', toolName: 'createSale' })).toBe(
+        'denied',
+      );
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'd', toolName: 'createSale' },
+        ],
+      });
+      expect(gate.approve({ toolCallId: 'd', toolName: 'createSale' })).toBe(
+        'not-applicable',
+      );
+    });
+
+    it('fails closed on a malformed tool call', () => {
+      const gate = createInventorySeparationGate();
+      expect(gate.approve(null)).toBe('denied');
+      expect(gate.approve({})).toBe('denied');
+      expect(gate.approve({ toolName: 42 })).toBe('denied');
+    });
+
+    it('denies mutating and unknown names while unresolved, even without a checkStock sibling', () => {
+      const gate = createInventorySeparationGate(() => true);
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'm', toolName: 'createSale' },
+        ],
+      });
+      expect(gate.approve({ toolCallId: 'm', toolName: 'createSale' })).toBe(
+        'denied',
+      );
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'u', toolName: 'mysteryTool' },
+        ],
+      });
+      expect(gate.approve({ toolCallId: 'u', toolName: 'mysteryTool' })).toBe(
+        'denied',
+      );
+      // Read-only tools stay available so a recovery check can still run.
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'c', toolName: 'checkStock' },
+        ],
+      });
+      expect(gate.approve({ toolCallId: 'c', toolName: 'checkStock' })).toBe(
+        'not-applicable',
+      );
+      expect(gate.approve({ toolCallId: 's', toolName: 'searchCatalog' })).toBe(
+        'not-applicable',
+      );
     });
   });
 });

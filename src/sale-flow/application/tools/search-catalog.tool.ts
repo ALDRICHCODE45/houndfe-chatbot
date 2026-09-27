@@ -7,6 +7,44 @@ import {
   CATALOG_RECOVERY,
   catalogSessionSchema,
 } from '../../../conversation/domain/catalog-references';
+import type {
+  CatalogItemResponse,
+  CatalogItemVariantResponse,
+} from '../../../chatbot-api/domain/dtos/catalog.dto';
+
+/** Model-facing variant without any stock field. */
+type ProjectedCatalogVariant = Omit<CatalogItemVariantResponse, 'stock'>;
+
+/** Model-facing catalog item: identity + price, never inventory. */
+type ProjectedCatalogItem = Omit<CatalogItemResponse, 'stock' | 'variants'> & {
+  variants: ProjectedCatalogVariant[];
+};
+
+/**
+ * Build a fresh projection that strips product AND variant stock. Every
+ * source object is read-only here: the raw backend DTO (installed into the
+ * CatalogSession for trusted identity) is never mutated.
+ */
+export function projectCatalogResults(
+  results: readonly CatalogItemResponse[],
+): ProjectedCatalogItem[] {
+  return results.map((item) => ({
+    productId: item.productId,
+    name: item.name,
+    brand: item.brand,
+    imageUrl: item.imageUrl,
+    description: item.description,
+    price: { ...item.price },
+    packageInfo: { ...item.packageInfo },
+    variants: item.variants.map((variant) => ({
+      variantId: variant.variantId,
+      name: variant.name,
+      option: variant.option,
+      value: variant.value,
+      priceCents: variant.priceCents,
+    })),
+  }));
+}
 
 /**
  * searchCatalog — AI-SDK tool factory.
@@ -16,11 +54,16 @@ import {
  * Direct legacy callers without a session may still search. The 5xx / network
  * upstream failures retain the retryable `upstream` envelope, but guidance
  * forbids extra model-driven automatic retries. HTTP retry policy is unchanged.
+ *
+ * R2: the raw backend results are installed into the CatalogSession first
+ * (trusted identity), then a stock-free projection is returned to the model
+ * with an explicit `requires_check_stock` marker. Search is never inventory
+ * evidence; only a later `checkStock` can confirm availability.
  */
 export function makeSearchCatalogTool(deps: ToolDeps) {
   return tool({
     description:
-      'Busca por el nombre principal del producto. Devuelve candidatos reales con precios y existencias, incluidos los agotados. Sigue los pasos 2–5 del flujo para confirmar presentación y distinguir coincidencias, errores y falta de stock.',
+      'Busca por el nombre principal del producto. Devuelve candidatos reales con su identidad y precios, incluidos los agotados, pero sin existencias: confirma disponibilidad con checkStock antes de afirmarla. Sigue los pasos 2–5 del flujo para confirmar presentación y distinguir coincidencias, errores y falta de stock.',
     inputSchema: z.object({
       q: z
         .string()
@@ -51,7 +94,11 @@ export function makeSearchCatalogTool(deps: ToolDeps) {
         );
         if (session && ticket !== undefined)
           session.installSearch(ticket, results);
-        return { ok: true, results };
+        return {
+          ok: true as const,
+          requires_check_stock: true as const,
+          results: projectCatalogResults(results),
+        };
       } catch (err) {
         return mapChatbotError(err);
       }

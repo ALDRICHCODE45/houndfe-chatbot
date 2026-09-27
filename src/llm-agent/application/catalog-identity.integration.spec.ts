@@ -142,6 +142,37 @@ describe('catalog identity through the real runner, adapter and tools', () => {
     expect((await f.store.get('sender'))!.data.messages).toHaveLength(4);
   });
 
+  it('returns a stock-free projection while preserving raw catalog identity', async () => {
+    const f = fixture();
+    let observed: unknown;
+    f.steps.push(async (call) => {
+      observed = await call('searchCatalog', { q: 'Medicine', limit: 20 });
+    });
+    await f.runner.handle({ senderId: 'sender', text: 'Medicine' });
+    const envelope = observed as {
+      ok?: unknown;
+      requires_check_stock?: unknown;
+      results?: Array<Record<string, unknown>>;
+    };
+    // The model never receives inventory from a search.
+    expect(envelope.ok).toBe(true);
+    expect(envelope.requires_check_stock).toBe(true);
+    expect(envelope.results).toHaveLength(2);
+    expect(envelope.results?.[0]).not.toHaveProperty('stock');
+    expect(envelope.results?.[0]).toMatchObject({
+      productId,
+      name: product.name,
+    });
+    // Identity survives: the raw id still gates a real stock check next turn.
+    f.steps.push(async (call) => {
+      expect(await call('checkStock', { productId })).toMatchObject({
+        ok: true,
+      });
+    });
+    await f.runner.handle({ senderId: 'sender', text: 'The 400 mg one' });
+    expect(f.getStock).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects hostile search context without crashing or calling the backend', async () => {
     const f = fixture();
     f.steps.push(async (call, invocation) => {
