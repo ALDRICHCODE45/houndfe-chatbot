@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   CONVERSATION_STORE,
   readPendingHumanRequest,
@@ -20,6 +20,7 @@ import {
 } from '../../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
+import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
@@ -99,6 +100,11 @@ export class WebhookDispatcherService {
     private readonly conversationStore: ConversationStore,
     private readonly amountRouter: ReceiptAmountRouterService,
     private readonly ingress: ReceiptIngressService,
+    // Experimental default-off read-only SDK route. Optional so legacy
+    // 8-arg constructions (integration harnesses) keep compiling; when it is
+    // absent the dispatcher keeps the unchanged legacy AgentRunner path.
+    @Optional()
+    private readonly minimalCatalogAgent?: MinimalCatalogAgentService,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -297,6 +303,33 @@ export class WebhookDispatcherService {
         // exists; the runner applies strict validation and drops anything
         // malformed. Ops synthetic turns never reach this branch, so the ops
         // identity is never injected.
+        // Experimental default-off read-only SDK route: when it handles the
+        // turn we reply and finish here; otherwise the byte-identical legacy
+        // AgentRunner path below runs unchanged.
+        const minimal = this.minimalCatalogAgent
+          ? await this.minimalCatalogAgent.tryHandle({
+              senderId: message.senderId,
+              text: message.text,
+            })
+          : null;
+        if (minimal?.kind === 'handled') {
+          const { providerMessageId } = await this.whatsappSender.sendText({
+            to: message.senderId,
+            text: minimal.reply,
+          });
+          this.recentOutbound.remember(providerMessageId);
+          try {
+            await this.dedup.markSeen(message.messageId);
+          } catch (error) {
+            this.logger.warn(
+              `markSeen failed for ${message.messageId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          continue;
+        }
+
         const { reply } = await this.agentRunner.handle({
           senderId: message.senderId,
           text: message.text,

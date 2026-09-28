@@ -262,6 +262,14 @@ const innerEnvValidationSchema = Joi.object({
   LLM_MONTHLY_TOKEN_CEILING: Joi.number().integer().min(1).default(8_000_000),
   LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),
 
+  // ─── Experimental minimal SDK catalog route (default-off) ───────────────
+  // The literal 'true' enables it; every other value stays off. The allowlist
+  // is an optional exact wa_id CSV; an empty/invalid list enables nobody.
+  MINIMAL_CATALOG_AGENT_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('false'),
+  MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: Joi.string().optional(),
+
   // ─── Human-handoff slice (R7 + needs_human_review + R14) ─────────────────
   /**
    * Kill-switch for the human-handoff channel. When `false`,

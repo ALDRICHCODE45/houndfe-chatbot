@@ -6,6 +6,7 @@ import { SaleFlowModule } from '../sale-flow/sale-flow.module';
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
+import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
@@ -116,7 +117,8 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         ),
     },
     AgentRunner,
+    MinimalCatalogAgentService,
   ],
-  exports: [AgentRunner],
+  exports: [AgentRunner, CostGuardService, MinimalCatalogAgentService],
 })
 export class LlmAgentModule {}

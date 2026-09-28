@@ -3,6 +3,7 @@ import {
   type AgentRunnerConfig,
 } from '../../llm-agent/application/agent-runner.service';
 import { CostGuardService } from '../../llm-agent/application/cost-guard.service';
+import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import {
   type AgentMessage,
   type ConversationState,
@@ -82,6 +83,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   let conversationStore: jest.Mocked<ConversationStore>;
   let amountRouter: jest.Mocked<ReceiptAmountRouterService>;
   let ingress: jest.Mocked<ReceiptIngressService>;
+  let minimalAgent: jest.Mocked<MinimalCatalogAgentService>;
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -173,6 +175,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }),
     } as unknown as jest.Mocked<ReceiptIngressService>;
 
+    // Experimental minimal SDK route. Default: not-handled so every existing
+    // scenario continues through the unchanged legacy AgentRunner path.
+    minimalAgent = {
+      tryHandle: jest.fn().mockResolvedValue({ kind: 'not-handled' }),
+    } as unknown as jest.Mocked<MinimalCatalogAgentService>;
+
     service = new WebhookDispatcherService(
       runner,
       sender,
@@ -182,6 +190,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       conversationStore,
       amountRouter,
       ingress,
+      minimalAgent,
     );
   });
 
@@ -1560,6 +1569,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         conversationStore,
         realRouter,
         ingress,
+        minimalAgent,
       );
 
       await realService.dispatch(textEvent('wamid.terminal-followup', 'sí'));
@@ -2213,6 +2223,64 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
         expect(llm.run.mock.calls).toHaveLength(0);
         expect(amountRouter.route.mock.calls).toHaveLength(0);
+      });
+    });
+  });
+
+  // ─── Experimental minimal SDK catalog route (default-off) ────────────────
+  describe('experimental minimal SDK catalog route', () => {
+    const CUSTOMER = '5215550001111';
+    const event = (id: string): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id,
+                    from: CUSTOMER,
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body: 'hola' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    it('routes allowlisted senders to the minimal agent, others to legacy', async () => {
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'SDK reply',
+      });
+      await service.dispatch(event('wamid.min.on'));
+      expect(minimalAgent.tryHandle).toHaveBeenCalledWith({
+        senderId: CUSTOMER,
+        text: 'hola',
+      });
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: 'SDK reply',
+      });
+
+      store.get.mockResolvedValue(null);
+      llm.run.mockResolvedValue({
+        reply: 'legacy reply',
+        messages: [],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+      await service.dispatch(event('wamid.min.off'));
+      expect(llm.run).toHaveBeenCalledTimes(1);
+      expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(2);
+      expect(sender.sendText).toHaveBeenLastCalledWith({
+        to: CUSTOMER,
+        text: 'legacy reply',
       });
     });
   });

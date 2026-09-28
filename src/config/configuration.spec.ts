@@ -64,6 +64,9 @@ describe('configuration()', () => {
     'SKYDROPX_ORIGIN_NEIGHBORHOOD',
     // SQ-5B2A private measured-demo profile passthrough
     'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
+    // Experimental minimal SDK catalog route
+    'MINIMAL_CATALOG_AGENT_ENABLED',
+    'MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS',
   ];
 
   beforeEach(() => {
@@ -417,6 +420,41 @@ describe('configuration()', () => {
       expect(shipping().measuredDemoParcelProfileJson).toBe(
         '{"version":1,"items":[]}',
       );
+    });
+  });
+
+  // Experimental minimal SDK catalog route: default-off; the sender list is
+  // strict and an empty/invalid list enables nobody.
+  describe('minimalCatalogAgent', () => {
+    const minimal = () =>
+      (
+        configuration() as unknown as {
+          minimalCatalogAgent: { enabled: boolean; allowedSenders: string[] };
+        }
+      ).minimalCatalogAgent;
+
+    it('stays disabled unless the flag is exactly "true"', () => {
+      for (const value of [undefined, 'false', 'TRUE', '1', ' true ']) {
+        if (value === undefined)
+          delete process.env.MINIMAL_CATALOG_AGENT_ENABLED;
+        else process.env.MINIMAL_CATALOG_AGENT_ENABLED = value;
+        expect(minimal().enabled).toBe(false);
+      }
+      process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'true';
+      expect(minimal().enabled).toBe(true);
+    });
+
+    it('parses a strict exact wa_id allowlist, else enables nobody', () => {
+      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS =
+        '5215550001111, 5215550002222';
+      expect(minimal().allowedSenders).toEqual([
+        '5215550001111',
+        '5215550002222',
+      ]);
+      for (const value of ['', '   ', 'owner@example.com', '+5215550001111']) {
+        process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = value;
+        expect(minimal().allowedSenders).toEqual([]);
+      }
     });
   });
 });
