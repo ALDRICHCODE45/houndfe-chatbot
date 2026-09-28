@@ -1,4 +1,12 @@
-import { CatalogSession } from '../../../conversation/domain/catalog-references';
+import {
+  CatalogSession,
+  CATALOG_RECOVERY,
+} from '../../../conversation/domain/catalog-references';
+import {
+  StockReadEvidence,
+  type StockReadExecutionObserver,
+  type StockReadReceiptInput,
+} from '../../../llm-agent/domain/stock-read-evidence';
 import { makeCheckStockTool as makeCheckStockToolRaw } from './check-stock.tool';
 import type { ToolDeps } from '../tool-deps';
 import { asSchemaVerifiedTool } from '../../../../test/fixtures/sale-flow-tool-schema';
@@ -38,6 +46,28 @@ function context() {
   const catalogSession = new CatalogSession('sender', 60000, 0);
   catalogSession.installSearch(catalogSession.beginSearch(), [stock()]);
   return { catalogSession };
+}
+function recordingObserver(step = 2, serverTurnId = 'turn-1') {
+  const receipts: StockReadReceiptInput[] = [];
+  const observer: StockReadExecutionObserver = {
+    serverTurnId,
+    step,
+    recordExecution: (receipt) => {
+      receipts.push(receipt);
+    },
+  };
+  return { observer, receipts };
+}
+/** Delay the stock GET until the caller resolves it, returning the resolver. */
+function deferStock(readStock: jest.Mock) {
+  let resolveStock!: (value: StockCheckResponse) => void;
+  readStock.mockImplementation(
+    () =>
+      new Promise<StockCheckResponse>((resolve) => {
+        resolveStock = resolve;
+      }),
+  );
+  return (value: StockCheckResponse) => resolveStock(value);
 }
 function setup(response = stock()) {
   const getStock = jest.fn().mockResolvedValue(response);
@@ -218,5 +248,349 @@ describe('makeCheckStockTool', () => {
         ),
       ).resolves.toEqual({ ok: true, ...response });
     }
+  });
+
+  it('records a genuine receipt through the observer and preserves the envelope', async () => {
+    const { tool, getStock } = setup();
+    const { observer, receipts } = recordingObserver(3, 'turn-9');
+    const result = await tool.execute(
+      { productId, variantId, name: stock().name },
+      {
+        toolCallId: 'call-9',
+        messages: [],
+        context: { ...context(), stockReadObserver: observer },
+      },
+    );
+    const envelope = {
+      ok: true,
+      ...stock(),
+      humanAssistance: {
+        kind: 'out_of_stock',
+        digest: { productId, variantId, name: stock().name },
+      },
+    };
+    expect(getStock).toHaveBeenCalledWith(productId);
+    expect(result).toEqual(envelope);
+    expect(receipts).toEqual([
+      {
+        serverTurnId: 'turn-9',
+        toolCallId: 'call-9',
+        step: 3,
+        subject: {
+          productId,
+          productName: stock().name,
+          variantId,
+          variantName: '500g',
+        },
+        catalogGenerationBefore: 1,
+        catalogGenerationAfter: 1,
+        output: envelope,
+      },
+    ]);
+  });
+
+  it('records subject:null and skips the backend GET for a rejected identity', async () => {
+    const { tool, getStock } = setup();
+    const { observer, receipts } = recordingObserver(1, 'turn-2');
+    const result = await tool.execute(
+      { productId: otherId },
+      {
+        toolCallId: 'call-2',
+        messages: [],
+        context: { ...context(), stockReadObserver: observer },
+      },
+    );
+    expect(getStock).not.toHaveBeenCalled();
+    expect(result).toEqual(CATALOG_RECOVERY);
+    expect(receipts).toEqual([
+      {
+        serverTurnId: 'turn-2',
+        toolCallId: 'call-2',
+        step: 1,
+        subject: null,
+        catalogGenerationBefore: 1,
+        catalogGenerationAfter: 1,
+        output: CATALOG_RECOVERY,
+      },
+    ]);
+  });
+
+  it('uses the invalid generation sentinel when no genuine session exists', async () => {
+    const { tool, getStock } = setup();
+    const { observer, receipts } = recordingObserver(0, 'turn-3');
+    const result = await tool.execute(
+      { productId },
+      {
+        toolCallId: 'call-3',
+        messages: [],
+        context: { stockReadObserver: observer },
+      },
+    );
+    expect(getStock).not.toHaveBeenCalled();
+    expect(result).toEqual(CATALOG_RECOVERY);
+    expect(receipts[0]).toMatchObject({
+      serverTurnId: 'turn-3',
+      toolCallId: 'call-3',
+      subject: null,
+      catalogGenerationBefore: -1,
+      catalogGenerationAfter: -1,
+    });
+  });
+
+  it('marks catalog_changed when a byte-identical search installs during the GET', async () => {
+    const { tool, getStock } = setup();
+    const session = new CatalogSession('sender', 60000, 0);
+    session.installSearch(session.beginSearch(), [stock()]);
+    const { observer, receipts } = recordingObserver(0, 'turn-4');
+    const resolveStock = deferStock(getStock);
+    const pending = tool.execute(
+      { productId, variantId },
+      {
+        toolCallId: 'call-4',
+        messages: [],
+        context: { catalogSession: session, stockReadObserver: observer },
+      },
+    );
+    const ticket = session.beginSearch();
+    session.installSearch(ticket, [stock()]);
+    resolveStock(stock());
+    await expect(pending).resolves.toEqual({
+      ok: true,
+      ...stock(),
+      humanAssistance: {
+        kind: 'out_of_stock',
+        digest: { productId, variantId, name: stock().name },
+      },
+    });
+    expect(receipts[0]).toMatchObject({
+      catalogGenerationBefore: 1,
+      catalogGenerationAfter: 2,
+      subject: {
+        productId,
+        productName: stock().name,
+        variantId,
+        variantName: '500g',
+      },
+    });
+    const evidence = new StockReadEvidence('turn-4');
+    evidence.recordExecution(receipts[0]);
+    evidence.admitCompletedStep(0, [
+      {
+        toolCallId: 'call-4',
+        toolName: 'checkStock',
+        input: { productId, variantId },
+        outcome: 'result',
+      },
+    ]);
+    expect(evidence.getLatestCompleted({ productId, variantId })).toMatchObject(
+      { kind: 'unconfirmed', reason: 'catalog_changed' },
+    );
+  });
+
+  it('records a mapped backend failure that revokes admitted evidence', async () => {
+    const evidence = new StockReadEvidence('turn-5');
+    evidence.recordExecution({
+      serverTurnId: 'turn-5',
+      toolCallId: 'seed',
+      step: 0,
+      subject: {
+        productId,
+        productName: stock().name,
+        variantId: null,
+        variantName: null,
+      },
+      catalogGenerationBefore: 1,
+      catalogGenerationAfter: 1,
+      output: { ok: true, ...stock() },
+    });
+    evidence.admitCompletedStep(0, [
+      {
+        toolCallId: 'seed',
+        toolName: 'checkStock',
+        input: { productId },
+        outcome: 'result',
+      },
+    ]);
+    expect(
+      evidence.getLatestVerifiedShortage({ productId, variantId: null }, 1),
+    ).not.toBeNull();
+
+    const observer: StockReadExecutionObserver = {
+      serverTurnId: 'turn-5',
+      step: 1,
+      recordExecution: (receipt) => evidence.recordExecution(receipt),
+    };
+    const { tool, getStock } = setup();
+    getStock.mockRejectedValue(new NotFoundError('missing', 404));
+    await expect(
+      tool.execute(
+        { productId },
+        {
+          toolCallId: 'fail',
+          messages: [],
+          context: { ...context(), stockReadObserver: observer },
+        },
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: 'notFound', retryable: false },
+    });
+
+    evidence.admitCompletedStep(1, [
+      {
+        toolCallId: 'fail',
+        toolName: 'checkStock',
+        input: { productId },
+        outcome: 'result',
+      },
+    ]);
+    expect(
+      evidence.getLatestVerifiedShortage({ productId, variantId: null }, 2),
+    ).toBeNull();
+    expect(
+      evidence.getLatestCompleted({ productId, variantId: null }),
+    ).toMatchObject({ kind: 'unconfirmed', reason: 'backend_error' });
+  });
+
+  it('sources the canonical variant name from the catalog, not the stock DTO', async () => {
+    const response: StockCheckResponse = {
+      ...stock(),
+      variants: [
+        {
+          variantId,
+          name: 'Presentación actualizada 900 g',
+          option: null,
+          value: null,
+          stock: { status: 'out_of_stock', quantity: 0 },
+        },
+      ],
+    };
+    const { tool } = setup(response);
+    const { observer, receipts } = recordingObserver(2, 'turn-6');
+    await tool.execute(
+      { productId, variantId, name: stock().name },
+      {
+        toolCallId: 'call-6',
+        messages: [],
+        context: { ...context(), stockReadObserver: observer },
+      },
+    );
+    expect(receipts[0].subject).toEqual({
+      productId,
+      productName: stock().name,
+      variantId,
+      variantName: '500g',
+    });
+  });
+
+  it('records subject:null when the catalog reference expires during the GET', async () => {
+    let now = 1000;
+    const session = new CatalogSession(
+      'sender',
+      100,
+      0,
+      undefined,
+      [],
+      () => now,
+    );
+    session.installSearch(session.beginSearch(), [stock()]);
+    const { tool, getStock } = setup();
+    const { observer, receipts } = recordingObserver(0, 'turn-7');
+    const resolveStock = deferStock(getStock);
+    const pending = tool.execute(
+      { productId },
+      {
+        toolCallId: 'call-7',
+        messages: [],
+        context: { catalogSession: session, stockReadObserver: observer },
+      },
+    );
+    now = 2000;
+    resolveStock(stock());
+    await pending;
+    expect(receipts[0]).toMatchObject({
+      catalogGenerationBefore: 1,
+      catalogGenerationAfter: 1,
+      subject: null,
+    });
+  });
+
+  it('preserves the exact envelope when no observer is installed', async () => {
+    const { tool, getStock } = setup();
+    await expect(
+      tool.execute(
+        { productId, variantId, name: stock().name },
+        { toolCallId: 'call-8', messages: [], context: context() },
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      ...stock(),
+      humanAssistance: {
+        kind: 'out_of_stock',
+        digest: { productId, variantId, name: stock().name },
+      },
+    });
+    expect(getStock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never changes the tool output when the observer throws', async () => {
+    const { tool } = setup();
+    const observer: StockReadExecutionObserver = {
+      serverTurnId: 'turn-9b',
+      step: 1,
+      recordExecution: () => {
+        throw new Error('observer failure');
+      },
+    };
+    await expect(
+      tool.execute(
+        { productId, variantId },
+        {
+          toolCallId: 'call-9b',
+          messages: [],
+          context: { ...context(), stockReadObserver: observer },
+        },
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      ...stock(),
+      humanAssistance: {
+        kind: 'out_of_stock',
+        digest: { productId, variantId, name: stock().name },
+      },
+    });
+  });
+
+  it('skips the receipt when the SDK call id is not genuine', async () => {
+    const { tool } = setup();
+    const { observer, receipts } = recordingObserver(1, 'turn-10');
+    await tool.execute(
+      { productId, variantId },
+      {
+        toolCallId: '',
+        messages: [],
+        context: { ...context(), stockReadObserver: observer },
+      },
+    );
+    expect(receipts).toEqual([]);
+  });
+
+  it('does not default a missing observer step to zero', async () => {
+    const { tool } = setup();
+    const receipts: StockReadReceiptInput[] = [];
+    const observer = {
+      serverTurnId: 'turn-12',
+      recordExecution: (receipt: StockReadReceiptInput) =>
+        receipts.push(receipt),
+    } as unknown as StockReadExecutionObserver;
+    await tool.execute(
+      { productId, variantId },
+      {
+        toolCallId: 'call-12',
+        messages: [],
+        context: { ...context(), stockReadObserver: observer },
+      },
+    );
+    expect(receipts).toEqual([]);
   });
 });

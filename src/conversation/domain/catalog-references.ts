@@ -115,21 +115,60 @@ export class CatalogSession {
     }
   }
 
+  /** Read-only run-local search generation (never persisted). */
+  get generation(): number {
+    return this.#search;
+  }
+
+  /**
+   * Detached canonical subject for a validated candidate reference, or `null`
+   * when the candidate is not backed by installed catalog identity. Names come
+   * only from these validated backend references.
+   */
+  resolve(candidate: {
+    productId: string;
+    variantId?: string | null;
+    name?: string;
+  }): {
+    productId: string;
+    productName: string;
+    variantId: string | null;
+    variantName: string | null;
+  } | null {
+    const refs = this.snapshot();
+    if (refs === null) return null;
+    const product = refs.products.find(
+      (p) => p.productId === candidate.productId,
+    );
+    if (product === undefined) return null;
+    if (candidate.name !== undefined && candidate.name !== product.name) {
+      return null;
+    }
+    const variantId = candidate.variantId ?? null;
+    if (variantId === null) {
+      return {
+        productId: product.productId,
+        productName: product.name,
+        variantId: null,
+        variantName: null,
+      };
+    }
+    const variant = product.variants.find((v) => v.variantId === variantId);
+    if (variant === undefined) return null;
+    return {
+      productId: product.productId,
+      productName: product.name,
+      variantId: variant.variantId,
+      variantName: variant.name,
+    };
+  }
+
   matches(candidate: {
     productId: string;
     variantId?: string | null;
     name?: string;
   }): boolean {
-    const refs = this.snapshot();
-    const product = refs?.products.find(
-      (p) => p.productId === candidate.productId,
-    );
-    return (
-      !!product &&
-      (candidate.name === undefined || candidate.name === product.name) &&
-      (candidate.variantId == null ||
-        product.variants.some((v) => v.variantId === candidate.variantId))
-    );
+    return this.resolve(candidate) !== null;
   }
 
   snapshot(): CatalogReferences | null {

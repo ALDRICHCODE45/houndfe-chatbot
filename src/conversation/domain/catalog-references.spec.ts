@@ -2,6 +2,7 @@ import { CatalogSession, catalogSessionSchema } from './catalog-references';
 
 const productId = '00000000-0000-4000-8000-000000000001';
 const variantId = '00000000-0000-4000-8000-000000000002';
+const unknownId = '00000000-0000-4000-8000-0000000000ff';
 const product = () => ({
   productId,
   name: 'Medicine 400 mg',
@@ -217,5 +218,94 @@ describe('CatalogSession', () => {
       },
     ]);
     expect(session.snapshot()).toBeNull();
+  });
+
+  it('exposes a monotonic read-only generation that increments before installation', () => {
+    const session = new CatalogSession(
+      'sender',
+      100,
+      0,
+      undefined,
+      [],
+      () => 1000,
+    );
+    expect(session.generation).toBe(0);
+    const first = session.beginSearch();
+    expect(first).toBe(1);
+    expect(session.generation).toBe(1);
+    session.installSearch(first, [product()]);
+    expect(session.generation).toBe(1);
+    const second = session.beginSearch();
+    expect(second).toBe(2);
+    expect(session.generation).toBe(2);
+    session.installSearch(first, [product()]);
+    expect(session.snapshot()).toBeNull();
+    expect(session.generation).toBe(2);
+  });
+
+  it('resolves a detached canonical product subject from validated references only', () => {
+    const session = seeded();
+    const resolved = session.resolve({ productId });
+    expect(resolved).toEqual({
+      productId,
+      productName: 'Medicine 400 mg',
+      variantId: null,
+      variantName: null,
+    });
+    resolved!.productName = 'Mutated';
+    expect(session.resolve({ productId })!.productName).toBe('Medicine 400 mg');
+    expect(session.resolve({ productId: unknownId })).toBeNull();
+    expect(session.resolve({ productId, name: 'Other' })).toBeNull();
+  });
+
+  it('resolves a canonical variant subject with catalog names', () => {
+    const session = seeded();
+    expect(session.resolve({ productId, variantId })).toEqual({
+      productId,
+      productName: 'Medicine 400 mg',
+      variantId,
+      variantName: '20 tablets',
+    });
+    expect(session.resolve({ productId, variantId: unknownId })).toBeNull();
+  });
+
+  it('keeps matches parity with resolve across candidate shapes', () => {
+    const session = seeded();
+    const cases: Array<{
+      productId: string;
+      variantId?: string | null;
+      name?: string;
+    }> = [
+      { productId },
+      { productId, name: 'Medicine 400 mg' },
+      { productId, name: 'Other' },
+      { productId, variantId },
+      { productId, variantId: unknownId },
+      { productId: unknownId },
+    ];
+    for (const candidate of cases) {
+      expect(session.matches(candidate)).toBe(
+        session.resolve(candidate) !== null,
+      );
+    }
+    expect(session.matches({ productId, variantId })).toBe(true);
+    expect(session.matches({ productId: unknownId })).toBe(false);
+  });
+
+  it('drops the canonical subject once the reference TTL has elapsed', () => {
+    let now = 1000;
+    const session = new CatalogSession(
+      'sender',
+      100,
+      0,
+      undefined,
+      [],
+      () => now,
+    );
+    session.installSearch(session.beginSearch(), [product()]);
+    expect(session.resolve({ productId })).not.toBeNull();
+    now = 1101;
+    expect(session.resolve({ productId })).toBeNull();
+    expect(session.matches({ productId })).toBe(false);
   });
 });
