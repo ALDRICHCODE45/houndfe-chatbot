@@ -452,7 +452,7 @@ export class MinimalCatalogAgentService {
               return { ok: true as const, confirmationRequired: true as const };
             }
             restockRun.outcome = { kind: 'closed' };
-            trace('tool prepareRestock result=closed code=not_available');
+            trace(`tool prepareRestock result=closed code=${prepared.reason}`);
             return toolError('restock_unavailable');
           } catch {
             restockRun.outcome = { kind: 'closed' };

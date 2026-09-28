@@ -48,6 +48,26 @@ export interface MinimalRestockPrepareInput {
   readonly variantId?: string;
 }
 
+/**
+ * Closed categorical cause for a rejected preparation; class-controlled
+ * literals only, never derived from an exception, ID, status or raw input.
+ */
+export type MinimalRestockClosedReason =
+  | 'disabled'
+  | 'identity_unbound'
+  | 'invalid_reference'
+  | 'unknown_product'
+  | 'stock_read_failed'
+  | 'subject_mismatch'
+  | 'parent_not_depleted'
+  | 'unexpected_variant'
+  | 'variant_required'
+  | 'variant_unresolved'
+  | 'variant_not_depleted'
+  | 'catalog_unresolved'
+  | 'display_unsafe_or_ambiguous'
+  | 'preparation_failed';
+
 export type MinimalRestockPrepareResult =
   | {
       readonly kind: 'offer';
@@ -55,7 +75,7 @@ export type MinimalRestockPrepareResult =
       /** Arms the pending ONLY after the transport accepted the question. */
       readonly onSent: () => void;
     }
-  | { readonly kind: 'closed' };
+  | { readonly kind: 'closed'; readonly reason: MinimalRestockClosedReason };
 
 export interface MinimalRestockConsumeInput {
   readonly senderId: string;
@@ -89,24 +109,29 @@ interface PendingRestock {
   armed: boolean;
 }
 
-/** The trusted GET must read the EXACT requested subject as fully depleted. */
-function isShortage(
+/**
+ * The trusted GET must read the EXACT requested subject as fully depleted;
+ * otherwise it returns the closed reason (`null` means a valid shortage).
+ */
+function shortageReason(
   stock: StockCheckResponse,
   productId: string,
   variantId: string | null,
-): boolean {
-  if (stock.productId !== productId) return false;
+): MinimalRestockClosedReason | null {
+  if (stock.productId !== productId) return 'subject_mismatch';
   if (stock.stock.status !== 'out_of_stock' || stock.stock.quantity !== 0) {
-    return false;
+    return 'parent_not_depleted';
   }
-  if (stock.variants.length === 0) return variantId === null;
-  if (variantId === null) return false;
+  if (stock.variants.length === 0) {
+    return variantId === null ? null : 'unexpected_variant';
+  }
+  if (variantId === null) return 'variant_required';
   const hit = stock.variants.filter((v) => v.variantId === variantId);
-  return (
-    hit.length === 1 &&
-    hit[0].stock.status === 'out_of_stock' &&
-    hit[0].stock.quantity === 0
-  );
+  if (hit.length !== 1) return 'variant_unresolved';
+  if (hit[0].stock.status !== 'out_of_stock' || hit[0].stock.quantity !== 0) {
+    return 'variant_not_depleted';
+  }
+  return null;
 }
 
 /**
@@ -181,26 +206,33 @@ export class MinimalRestockRequestService {
   async prepare(
     input: MinimalRestockPrepareInput,
   ): Promise<MinimalRestockPrepareResult> {
+    const closed = (
+      reason: MinimalRestockClosedReason,
+    ): MinimalRestockPrepareResult => ({ kind: 'closed', reason });
     try {
       const restock = this.deps.restock;
       const senderId = input.senderId;
       const variantId = input.variantId ?? null;
       const bound = bindRestockInboundEvent(input.inboundEvent, senderId);
       if (restock === undefined || restock.enabled !== true) {
-        return { kind: 'closed' };
+        return closed('disabled');
       }
-      if (bound === null) return { kind: 'closed' };
-      if (!UUID.test(input.productId)) return { kind: 'closed' };
+      if (bound === null) return closed('identity_unbound');
+      if (!UUID.test(input.productId)) return closed('invalid_reference');
       if (variantId !== null && !UUID.test(variantId)) {
-        return { kind: 'closed' };
+        return closed('invalid_reference');
       }
       if (!input.allowedProductIds.has(input.productId)) {
-        return { kind: 'closed' };
+        return closed('unknown_product');
       }
-      const stock = await this.deps.chatbotApi.getStock(input.productId);
-      if (!isShortage(stock, input.productId, variantId)) {
-        return { kind: 'closed' };
+      let stock: StockCheckResponse;
+      try {
+        stock = await this.deps.chatbotApi.getStock(input.productId);
+      } catch {
+        return closed('stock_read_failed');
       }
+      const depletion = shortageReason(stock, input.productId, variantId);
+      if (depletion !== null) return closed(depletion);
       const session = new CatalogSession(
         senderId,
         MINIMAL_RESTOCK_PENDING_TTL_MS,
@@ -214,9 +246,11 @@ export class MinimalRestockRequestService {
         productId: input.productId,
         variantId,
       });
-      if (resolved === null) return { kind: 'closed' };
+      if (resolved === null) return closed('catalog_unresolved');
       const presentation = presentationLabel(resolved, stock);
-      if (presentation === null) return { kind: 'closed' };
+      if (presentation === null) {
+        return closed('display_unsafe_or_ambiguous');
+      }
       const base = {
         productId: resolved.productId,
         name: resolved.productName,
@@ -245,7 +279,7 @@ export class MinimalRestockRequestService {
         },
       };
     } catch {
-      return { kind: 'closed' };
+      return closed('preparation_failed');
     }
   }
 

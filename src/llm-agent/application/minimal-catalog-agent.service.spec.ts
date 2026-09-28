@@ -752,6 +752,52 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       expect(w.coordinate).not.toHaveBeenCalled();
     });
 
+    it('traces the private closed prepare reason while the model sees only the generic error', async () => {
+      const w = wire();
+      const { service, captured } = build(
+        flow,
+        { restock: w.restock },
+        { item: simpleItem, stock: simpleStock },
+      );
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'busca',
+        inboundEvent: INBOUND,
+      });
+      const logs = captureLogs();
+      await expect(
+        captured[0].tools!.prepareRestock.execute({ productId: PRODUCT }, {}),
+      ).resolves.toEqual({ ok: false, error: 'restock_unavailable' });
+      const joined = logs.join('\n');
+      expect(joined).toContain(
+        'tool prepareRestock result=closed code=parent_not_depleted',
+      );
+      expect(joined).not.toContain('not_available');
+    });
+
+    it('keeps an unexpected prepare failure generic and free of raw values', async () => {
+      const boom = {
+        enabled: true,
+        prepare: jest.fn().mockRejectedValue(new Error('RAW_SENTINEL_9f3')),
+        consume: jest.fn(async () => null),
+      } as unknown as MinimalRestockRequestService;
+      const { service, captured } = build(flow, { restock: () => boom });
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'busca',
+        inboundEvent: INBOUND,
+      });
+      const logs = captureLogs();
+      await expect(
+        captured[0].tools!.prepareRestock.execute({ productId: PRODUCT }, {}),
+      ).resolves.toEqual({ ok: false, error: 'restock_unavailable' });
+      const joined = logs.join('\n');
+      expect(joined).toContain(
+        'tool prepareRestock result=error code=restock_unavailable',
+      );
+      expect(joined).not.toContain('RAW_SENTINEL_9f3');
+    });
+
     it('an unexpected consume failure never falls back to the legacy/SDK path', async () => {
       const boom = {
         enabled: true,

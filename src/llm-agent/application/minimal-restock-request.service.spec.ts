@@ -117,7 +117,10 @@ describe('MinimalRestockRequestService', () => {
   it('default-off: enabled is false, prepare closes and consume is null', async () => {
     const h = hz(parent(), false);
     expect(h.service.enabled).toBe(false);
-    expect(await h.service.prepare(prep())).toEqual({ kind: 'closed' });
+    expect(await h.service.prepare(prep())).toEqual({
+      kind: 'closed',
+      reason: 'disabled',
+    });
     expect(await say(h)).toBeNull();
     expect(h.getStock).not.toHaveBeenCalled();
   });
@@ -338,7 +341,7 @@ describe('MinimalRestockRequestService', () => {
     );
     expect(
       await h.service.prepare(prep({ variantId: vid(1).variantId })),
-    ).toEqual({ kind: 'closed' });
+    ).toEqual({ kind: 'closed', reason: 'display_unsafe_or_ambiguous' });
   });
 
   it.each<
@@ -437,7 +440,7 @@ describe('MinimalRestockRequestService', () => {
         const h = hz(parent({ variants }));
         expect(
           await h.service.prepare(prep({ variantId: ambiguousId })),
-        ).toEqual({ kind: 'closed' });
+        ).toEqual({ kind: 'closed', reason: 'display_unsafe_or_ambiguous' });
         expect(h.coordinate).not.toHaveBeenCalled();
       }
       const h = hz(parent({ variants }));
@@ -458,7 +461,7 @@ describe('MinimalRestockRequestService', () => {
     );
     expect(
       await h.service.prepare(prep({ variantId: vid(1).variantId })),
-    ).toEqual({ kind: 'closed' });
+    ).toEqual({ kind: 'closed', reason: 'display_unsafe_or_ambiguous' });
   });
 
   it('a double SÍ consumes the pending once', async () => {
@@ -485,27 +488,36 @@ describe('MinimalRestockRequestService', () => {
     ).toBeNull();
   });
 
-  it.each<[string, Stock, Record<string, unknown>]>([
+  it.each<[string, Stock, Record<string, unknown>, string]>([
     [
       'parent available',
       parent({ stock: { status: 'available', quantity: 4 } }),
       {},
+      'parent_not_depleted',
     ],
     [
       'parent quantity nonzero',
       parent({ stock: { status: 'out_of_stock', quantity: 3 } }),
       {},
+      'parent_not_depleted',
     ],
     [
       'parent not managed',
       parent({ stock: { status: 'not_managed', quantity: null } }),
       {},
+      'parent_not_depleted',
     ],
-    ['variant required but omitted', parent({ variants: [variant()] }), {}],
+    [
+      'variant required but omitted',
+      parent({ variants: [variant()] }),
+      {},
+      'variant_required',
+    ],
     [
       'unknown variant',
       parent({ variants: [variant()] }),
       { variantId: OTHER },
+      'variant_unresolved',
     ],
     [
       'variant available',
@@ -513,6 +525,7 @@ describe('MinimalRestockRequestService', () => {
         variants: [variant({ stock: { status: 'available', quantity: 2 } })],
       }),
       { variantId: VARIANT },
+      'variant_not_depleted',
     ],
     [
       'variant not managed',
@@ -522,27 +535,65 @@ describe('MinimalRestockRequestService', () => {
         ],
       }),
       { variantId: VARIANT },
+      'variant_not_depleted',
+    ],
+    [
+      'an unexpected variant on a variantless product',
+      parent(),
+      { variantId: VARIANT },
+      'unexpected_variant',
+    ],
+    [
+      'a non-uuid product reference',
+      parent(),
+      { productId: 'not-a-uuid' },
+      'invalid_reference',
+    ],
+    [
+      'a stale subject identity',
+      parent({ productId: OTHER }),
+      {},
+      'subject_mismatch',
+    ],
+    [
+      'an unrepresentable catalog snapshot',
+      parent({ name: 'x'.repeat(257), variants: [variant()] }),
+      { variantId: VARIANT },
+      'catalog_unresolved',
     ],
   ])(
-    'prepare closes on %s without writing',
-    async (_name, stock, inputOver) => {
+    'prepare closes on %s with an exact reason, no pending and no write',
+    async (_name, stock, inputOver, reason) => {
       const h = hz(stock);
       expect(await h.service.prepare(prep(inputOver))).toEqual({
         kind: 'closed',
+        reason,
       });
+      expect(await say(h)).toBeNull();
       expect(h.coordinate).not.toHaveBeenCalled();
     },
   );
+
+  it('maps a stock read failure to stock_read_failed without leaking the error', async () => {
+    const h = hz();
+    h.getStock.mockRejectedValueOnce(new Error('RAW_READ_SENTINEL'));
+    expect(await h.service.prepare(prep())).toEqual({
+      kind: 'closed',
+      reason: 'stock_read_failed',
+    });
+    expect(await say(h)).toBeNull();
+    expect(h.coordinate).not.toHaveBeenCalled();
+  });
 
   it('prepare closes when the product is not allowlisted or the identity is unbound', async () => {
     const a = hz();
     expect(
       await a.service.prepare(prep({ allowedProductIds: new Set<string>() })),
-    ).toEqual({ kind: 'closed' });
+    ).toEqual({ kind: 'closed', reason: 'unknown_product' });
     const b = hz();
     expect(
       await b.service.prepare(prep({ inboundEvent: { senderId: SENDER } })),
-    ).toEqual({ kind: 'closed' });
+    ).toEqual({ kind: 'closed', reason: 'identity_unbound' });
     expect(a.getStock).not.toHaveBeenCalled();
     expect(b.getStock).not.toHaveBeenCalled();
   });
