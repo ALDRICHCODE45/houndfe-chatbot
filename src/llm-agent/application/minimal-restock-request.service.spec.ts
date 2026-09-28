@@ -212,6 +212,71 @@ describe('MinimalRestockRequestService', () => {
     expect(h.coordinate).not.toHaveBeenCalled();
   });
 
+  it.each([
+    'SÍ, por favor',
+    'Si por favor.',
+    'SI POR FAVOR',
+    'sí,  por\tfavor',
+  ])('a bounded polite affirmative (%s) writes exactly once', async (text) => {
+    const spy = restockRoute();
+    const h = hz();
+    const o = await offer(h);
+    o.onSent();
+    expect(await say(h, text)).toEqual(CONFIRMED);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(h.coordinate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    'sí pero no',
+    'no sé',
+    'si por favor no, mejor no',
+    'por favor',
+    'SÍ, por favor, gracias',
+    'NO, por favor',
+  ])(
+    'a mixed or loose intent (%s) is not consent and clears the pending',
+    async (text) => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      expect(await say(h, text)).toBeNull();
+      expect(await say(h)).toBeNull();
+      expect(spy).not.toHaveBeenCalled();
+      expect(h.coordinate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('a polite affirmative with no pending never writes', async () => {
+    const spy = restockRoute();
+    const h = hz();
+    expect(await say(h, 'Sí, por favor')).toBeNull();
+    expect(spy).not.toHaveBeenCalled();
+    expect(h.coordinate).not.toHaveBeenCalled();
+  });
+
+  it('an unarmed polite affirmative stays ambiguous and writes nothing', async () => {
+    const h = hz();
+    await offer(h);
+    expect(await say(h, 'Sí, por favor')).toEqual(AMBIGUOUS);
+    expect(h.coordinate).not.toHaveBeenCalled();
+  });
+
+  it('a polite affirmative on the origin replay never counts as consent', async () => {
+    const spy = restockRoute();
+    const h = hz();
+    const o = await offer(h);
+    o.onSent();
+    expect(await say(h, 'Sí, por favor', PROPOSAL)).toMatchObject({
+      kind: 'handled',
+      reply: o.reply,
+    });
+    expect(h.coordinate).not.toHaveBeenCalled();
+    expect((await say(h, 'sí'))?.kind).toBe('handled');
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
   it('an expired pending never writes', async () => {
     const h = hz();
     const o = await offer(h);

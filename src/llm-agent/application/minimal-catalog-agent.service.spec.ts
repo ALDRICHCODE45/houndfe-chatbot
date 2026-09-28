@@ -582,6 +582,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       'Por ahora no hay existencias de «Ibuprofeno 400 mg». ¿Quiere que consulte si hay una fecha estimada de reposición? Responda SÍ o NO.';
 
     const wire = () => {
+      const instances: MinimalRestockRequestService[] = [];
       const coordinate = jest.fn<
         Promise<{ decision: string }>,
         [
@@ -603,8 +604,9 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
         coordinate,
         recover,
         markers,
-        restock: (api: ChatbotApiClient) =>
-          new MinimalRestockRequestService({
+        instances,
+        restock: (api: ChatbotApiClient) => {
+          const service = new MinimalRestockRequestService({
             chatbotApi: api,
             store: store as never,
             restock: {
@@ -613,7 +615,10 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
               coordinator: { coordinate },
               recovery: { recover },
             } as never,
-          }),
+          });
+          instances.push(service);
+          return service;
+        },
       };
     };
 
@@ -692,6 +697,174 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
         deriveRestockSourceRequestId(THIRD),
       );
       expect(w.recover).not.toHaveBeenCalled();
+    });
+
+    // Shared shape for the proactive-preparation tests: turn 1 presents the
+    // product, turn 2 runs the scripted tail after the trusted checkStock.
+    const proactive = async (
+      stock: unknown,
+      tail: unknown[],
+      item: unknown = simpleItem,
+      arrange?: (ctx: {
+        chatbotApi: jest.Mocked<ChatbotApiClient>;
+        prepare: jest.SpyInstance;
+      }) => void,
+    ) => {
+      const w = wire();
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        ...tail,
+      ];
+      const { service, chatbotApi } = build(
+        steps,
+        { restock: w.restock },
+        { item, stock },
+      );
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'tienen ibuprofeno',
+        inboundEvent: INBOUND,
+      });
+      const prepare = jest.spyOn(w.instances[0], 'prepare');
+      arrange?.({ chatbotApi, prepare });
+      const second = await service.tryHandle({
+        senderId: SENDER,
+        text: 'SÍ',
+        inboundEvent: CONFIRM,
+      });
+      return { w, service, prepare, second };
+    };
+
+    it('prepares the canonical simple-product offer proactively from a trusted checkStock, with no explicit prepare call', async () => {
+      // The model reads stock and only PROMISES a notification — it never calls
+      // prepareRestock, and mentions a 400 mg presentation the read denies.
+      const { w, service, prepare, second } = await proactive(oos, [
+        say('Le aviso cuando llegue el ibuprofeno 400 mg.'),
+      ]);
+      // The SERVER offer replaces the model's unfounded promise.
+      expect(second).toMatchObject({ kind: 'handled', reply: QUESTION });
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(prepare.mock.calls[0][0]).toMatchObject({ productId: PRODUCT });
+      expect(prepare.mock.calls[0][0]).not.toHaveProperty('variantId');
+      expect(w.coordinate).not.toHaveBeenCalled();
+      if (second.kind !== 'handled') throw new Error('expected handled');
+      second.onSent?.();
+      expect(w.coordinate).not.toHaveBeenCalled();
+      // Replaying the selection never runs the SDK nor writes.
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'SÍ',
+          inboundEvent: CONFIRM,
+        }),
+      ).resolves.toMatchObject({ kind: 'handled', reply: QUESTION });
+      expect(w.coordinate).not.toHaveBeenCalled();
+      // A NEW polite affirmative coordinates exactly once under its own id.
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'Sí, por favor',
+          inboundEvent: THIRD,
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply:
+          'Ya quedó registrada su consulta sobre cuándo tendremos «Ibuprofeno 400 mg» de nuevo.',
+      });
+      expect(w.coordinate).toHaveBeenCalledTimes(1);
+      const [coord] = w.coordinate.mock.calls[0];
+      expect(coord.intake.productId).toBe(PRODUCT);
+      expect(coord.intake.sourceRequestId).toBe(
+        deriveRestockSourceRequestId(THIRD),
+      );
+    });
+
+    it('keeps the cautious copy over a model notification claim when the proactive preparation closes', async () => {
+      // The trusted depleted read triggers the proactive attempt, but the
+      // preparation's own read fails, so it closes; the model then claims a
+      // notification. The SERVER cautious reply must win, never the promise.
+      const { w, prepare, second } = await proactive(
+        oos,
+        [say('Le aviso en cuanto llegue.')],
+        simpleItem,
+        ({ chatbotApi }) => {
+          chatbotApi.getStock
+            .mockResolvedValueOnce(oos as never)
+            .mockRejectedValueOnce(new Error('read down'));
+        },
+      );
+      expect(second).toEqual({
+        kind: 'handled',
+        reply: 'Por ahora no puedo preparar esa consulta de reposición.',
+      });
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(w.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('never auto-prepares a variantful product from a depleted parent read', async () => {
+      const { w, prepare, second } = await proactive(
+        { ...oos, variants: [variant] },
+        [say('El producto está agotado.')],
+        variantItem,
+      );
+      expect(second).toEqual({
+        kind: 'handled',
+        reply: 'El producto está agotado.',
+      });
+      expect(prepare).not.toHaveBeenCalled();
+      expect(w.coordinate).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, unknown]>([
+      [
+        'an available parent',
+        { ...simpleStock, stock: { status: 'available', quantity: 4 } },
+      ],
+      [
+        'a not_managed parent',
+        { ...simpleStock, stock: { status: 'not_managed', quantity: null } },
+      ],
+      [
+        'an out_of_stock parent with a nonzero quantity',
+        { ...simpleStock, stock: { status: 'out_of_stock', quantity: 3 } },
+      ],
+      ['a malformed read', { ...simpleStock, variants: undefined }],
+      [
+        'a mismatched product identity',
+        {
+          ...simpleStock,
+          productId: OUTSIDE,
+          stock: { status: 'out_of_stock', quantity: 0 },
+        },
+      ],
+    ])('prepares nothing on %s', async (_name, stock) => {
+      const { w, prepare, second } = await proactive(stock, [
+        say('Texto del modelo verbatim.'),
+      ]);
+      expect(second).toEqual({
+        kind: 'handled',
+        reply: 'Texto del modelo verbatim.',
+      });
+      expect(prepare).not.toHaveBeenCalled();
+      expect(w.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('keeps the valid proactive offer when the model redundantly prepares with an invented variant', async () => {
+      const { w, prepare, second } = await proactive(oos, [
+        call('p1', 'prepareRestock', {
+          productId: PRODUCT,
+          variantId: VARIANT,
+        }),
+        say('listo'),
+      ]);
+      // Only the proactive attempt reached the service; the model's invented
+      // variant was blocked and could not clobber the valid offer.
+      expect(second).toMatchObject({ kind: 'handled', reply: QUESTION });
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(prepare.mock.calls[0][0]).not.toHaveProperty('variantId');
+      expect(w.coordinate).not.toHaveBeenCalled();
     });
 
     it('a NO decline clears the pending, claims nothing and writes nothing', async () => {

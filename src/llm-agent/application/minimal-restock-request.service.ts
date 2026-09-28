@@ -31,6 +31,21 @@ const proposal = (l: string) =>
   `fecha estimada de reposición? Responda SÍ o NO.`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
+// RESTOCK-LOCAL bounded consent: the strict shipping decision first, then
+// exactly one polite affirmative form. No substring, NLP or model inference;
+// every other text (including a polite "NO, por favor") stays `null`.
+const POLITE_AFFIRMATIVE = /^(?:si|sí),?[ \t]+por[ \t]+favor\.?$/i;
+const OUTER_SPACING = /^[ \t]+|[ \t]+$/g;
+const NEWLINES = /[\r\n]/;
+
+function parseRestockDecision(raw: unknown): 'accept' | 'decline' | null {
+  const strict = parseShippingCustomerDecision(raw);
+  if (strict !== null) return strict;
+  if (typeof raw !== 'string' || NEWLINES.test(raw)) return null;
+  return POLITE_AFFIRMATIVE.test(raw.replace(OUTER_SPACING, ''))
+    ? 'accept'
+    : null;
+}
 
 export interface MinimalRestockDeps {
   readonly chatbotApi: ChatbotApiClient;
@@ -292,7 +307,7 @@ export class MinimalRestockRequestService {
       const senderId = input.senderId;
       const pending = this.pending.get(senderId);
       if (pending === undefined) return null;
-      const decision = parseShippingCustomerDecision(input.text);
+      const decision = parseRestockDecision(input.text);
       const bound = bindRestockInboundEvent(input.inboundEvent, senderId);
       const event = bound?.event;
       const trusted =

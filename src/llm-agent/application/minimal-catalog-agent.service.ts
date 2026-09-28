@@ -356,6 +356,67 @@ export class MinimalCatalogAgentService {
     const restock = this.restock;
     const trace = (event: string) =>
       traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
+    // ONE bounded preparation per SDK run, shared by the proactive checkStock
+    // trigger and the model's explicit tool. `attempted` is set before the
+    // await. ANY actual attempt that closes or throws records a `closed`
+    // outcome so the server's cautious reply wins over an unsupported model
+    // claim; a repeated attempt early-returns and never overwrites an existing
+    // offer. The proactive path always omits `variantId`; a `null` helper means
+    // the capability is not exposed.
+    const run = restockRun;
+    const restockService = restock;
+    const prepareOnce:
+      | ((
+          productId: string,
+          variantId?: string,
+        ) => Promise<
+          | { ok: true; confirmationRequired: true }
+          | { ok: false; error: string }
+        >)
+      | null =
+      run === null || restockService === undefined
+        ? null
+        : async (productId, variantId) => {
+            if (run.attempted) {
+              trace('tool prepareRestock result=closed code=repeated_attempt');
+              return toolError('restock_unavailable');
+            }
+            run.attempted = true;
+            try {
+              const prepared = await restockService.prepare({
+                senderId: context.senderId,
+                inboundEvent: context.inboundEvent,
+                allowedProductIds: allowedIds,
+                productId,
+                ...(variantId === undefined ? {} : { variantId }),
+              });
+              if (prepared.kind === 'offer') {
+                run.outcome = {
+                  kind: 'offer',
+                  question: prepared.reply,
+                  onSent: prepared.onSent,
+                };
+                trace('tool prepareRestock result=ok');
+                return {
+                  ok: true as const,
+                  confirmationRequired: true as const,
+                };
+              }
+              // A real closed preparation must never let the model reply
+              // verbatim as if the attempt had succeeded.
+              run.outcome = { kind: 'closed' };
+              trace(
+                `tool prepareRestock result=closed code=${prepared.reason}`,
+              );
+              return toolError('restock_unavailable');
+            } catch {
+              run.outcome = { kind: 'closed' };
+              trace(
+                'tool prepareRestock result=error code=restock_unavailable',
+              );
+              return toolError('restock_unavailable');
+            }
+          };
     const readTools = {
       searchCatalog: tool({
         description:
@@ -399,7 +460,7 @@ export class MinimalCatalogAgentService {
             trace(
               `tool checkStock result=ok parentStockStatus=${status} parentStockQuantity=${quantity}`,
             );
-            return {
+            const result = {
               ok: true as const,
               productId: stock.productId,
               name: stock.name,
@@ -410,6 +471,23 @@ export class MinimalCatalogAgentService {
                 stock: variant.stock,
               })),
             };
+            // Proactive server offer ONLY on a trusted read that proves the
+            // EXACT requested product is a depleted simple product (no
+            // variants). Every other shape — mismatch, available, not_managed,
+            // malformed, variantful — is left to the explicit, validated tool.
+            if (
+              prepareOnce !== null &&
+              run !== null &&
+              !run.attempted &&
+              stock.productId === productId &&
+              stock.stock.status === 'out_of_stock' &&
+              stock.stock.quantity === 0 &&
+              stock.variants.length === 0
+            ) {
+              // Canonical non-variant input: NO `variantId` field is built.
+              await prepareOnce(productId);
+            }
+            return result;
           } catch {
             trace('tool checkStock result=error code=stock_unavailable');
             return toolError('stock_unavailable');
@@ -417,7 +495,7 @@ export class MinimalCatalogAgentService {
         },
       }),
     };
-    if (restockRun === null || restock === undefined) return readTools;
+    if (prepareOnce === null || run === null) return readTools;
     return {
       ...readTools,
       prepareRestock: tool({
@@ -429,36 +507,10 @@ export class MinimalCatalogAgentService {
           variantId: z.uuid().optional(),
         }),
         execute: async ({ productId, variantId }) => {
-          if (restockRun.attempted) {
-            trace('tool prepareRestock result=closed code=repeated_attempt');
-            return toolError('restock_unavailable');
-          }
-          restockRun.attempted = true;
-          try {
-            const prepared = await restock.prepare({
-              senderId: context.senderId,
-              inboundEvent: context.inboundEvent,
-              allowedProductIds: allowedIds,
-              productId,
-              ...(variantId === undefined ? {} : { variantId }),
-            });
-            if (prepared.kind === 'offer') {
-              restockRun.outcome = {
-                kind: 'offer',
-                question: prepared.reply,
-                onSent: prepared.onSent,
-              };
-              trace('tool prepareRestock result=ok');
-              return { ok: true as const, confirmationRequired: true as const };
-            }
-            restockRun.outcome = { kind: 'closed' };
-            trace(`tool prepareRestock result=closed code=${prepared.reason}`);
-            return toolError('restock_unavailable');
-          } catch {
-            restockRun.outcome = { kind: 'closed' };
-            trace('tool prepareRestock result=error code=restock_unavailable');
-            return toolError('restock_unavailable');
-          }
+          // `prepareOnce` already records a `closed` outcome for any real
+          // closed/throw attempt and early-returns a repeated one without
+          // overwriting a valid proactive offer.
+          return prepareOnce(productId, variantId);
         },
       }),
     };
