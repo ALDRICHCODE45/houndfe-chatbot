@@ -18,8 +18,9 @@ import { CostGuardService } from './cost-guard.service';
 
 const INSTRUCTIONS =
   'Ruta experimental de solo lectura: usa searchCatalog para localizar productos por nombre; ' +
-  'la búsqueda NUNCA prueba existencias. Cuando el cliente confirme un producto, vuelve a ' +
-  'buscarlo y luego llama checkStock con su productId EXACTO. En productos con variantes ' +
+  'la búsqueda NUNCA prueba existencias. Cuando el cliente confirme un producto ya ' +
+  'identificado en esta conversación, llama checkStock directo con su productId EXACTO; ' +
+  'si aún no lo está o la identidad expiró, búscalo primero. En productos con variantes ' +
   'informa existencias por variante; no iguales la del producto con la de la variante. ' +
   'No realizas compras, ventas, pagos ni cambios de datos. ' +
   'Saluda cálido de usted con un emoji ligero, según la base. Un hallazgo se anuncia ' +
@@ -82,20 +83,12 @@ function safeQuantity(quantity: unknown): string {
     : 'null';
 }
 
-// At most `maxTurns` whole turns, cut at a user boundary so no tool-call step
-// is ever separated from its tool result.
-function boundWholeTurns(
-  messages: readonly ModelMessage[],
-  maxTurns: number,
-): ModelMessage[] {
-  let seen = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role !== 'user') continue;
-    seen += 1;
-    if (seen >= maxTurns) return messages.slice(index);
-  }
-  return [...messages];
-}
+// One whole turn per sender: the user message, the model/tool response
+// messages, and only the productIds a successful fresh search produced.
+type HistoryTurn = {
+  messages: ModelMessage[];
+  verifiedProductIds: string[];
+};
 
 // Identity + price projection with product and variant stock stripped.
 function projectItem(item: CatalogItemResponse) {
@@ -120,7 +113,7 @@ export class MinimalCatalogAgentService {
   private readonly model: string;
   private readonly maxSteps: number;
   private readonly historyTurns: number;
-  private readonly history = new Map<string, ModelMessage[]>();
+  private readonly history = new Map<string, HistoryTurn[]>();
   private readonly busy = new Set<string>();
   private readonly logger = new Logger(MinimalCatalogAgentService.name);
 
@@ -171,22 +164,32 @@ export class MinimalCatalogAgentService {
   }): Promise<string> {
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
-    const prior = boundWholeTurns(
-      this.history.get(input.senderId) ?? [],
-      this.historyTurns,
-    );
-    const runIds = new Set<string>();
+    const turns = this.history.get(input.senderId) ?? [];
+    const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
+    const allowedIds = new Set<string>();
+    for (const turn of prior) {
+      for (const id of turn.verifiedProductIds) allowedIds.add(id);
+    }
+    const currentIds = new Set<string>();
     const result = await this.generateTextFn({
       model: openai(this.model),
       system: SYSTEM_PROMPT + '\n\n' + INSTRUCTIONS,
-      messages: [...prior, { role: 'user', content: input.text }],
-      tools: this.buildTools(runIds, traceId),
+      messages: [
+        ...prior.flatMap((turn) => turn.messages),
+        { role: 'user', content: input.text },
+      ],
+      tools: this.buildTools(allowedIds, currentIds, traceId),
       stopWhen: stepCountIs(this.maxSteps),
     });
     this.history.set(input.senderId, [
       ...prior,
-      { role: 'user', content: input.text },
-      ...result.responseMessages,
+      {
+        messages: [
+          { role: 'user', content: input.text },
+          ...result.responseMessages,
+        ],
+        verifiedProductIds: [...currentIds],
+      },
     ]);
     this.costGuard.record({
       promptTokens: result.usage?.inputTokens ?? 0,
@@ -195,7 +198,11 @@ export class MinimalCatalogAgentService {
     return result.text;
   }
 
-  private buildTools(runIds: Set<string>, traceId: string) {
+  private buildTools(
+    allowedIds: Set<string>,
+    currentIds: Set<string>,
+    traceId: string,
+  ) {
     const chatbotApi = this.chatbotApi;
     const trace = (event: string) =>
       traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
@@ -207,14 +214,18 @@ export class MinimalCatalogAgentService {
         execute: async ({ q }) => {
           try {
             const items = await chatbotApi.searchCatalog(q);
-            for (const item of items) runIds.add(item.productId);
+            const results = items.map(projectItem);
+            for (const item of items) {
+              allowedIds.add(item.productId);
+              currentIds.add(item.productId);
+            }
             trace(
               `tool searchCatalog result=ok searchResultCount=${items.length}`,
             );
             return {
               ok: true as const,
               stock_verified: false as const,
-              results: items.map(projectItem),
+              results,
             };
           } catch {
             trace('tool searchCatalog result=error code=catalog_unavailable');
@@ -224,10 +235,10 @@ export class MinimalCatalogAgentService {
       }),
       checkStock: tool({
         description:
-          'Consulta existencias por productId de esta misma búsqueda. No acepta variantId.',
+          'Consulta existencias por productId ya identificado en esta conversación. No acepta variantId.',
         inputSchema: z.strictObject({ productId: z.uuid() }),
         execute: async ({ productId }) => {
-          if (!runIds.has(productId)) {
+          if (!allowedIds.has(productId)) {
             trace('tool checkStock result=denied code=unknown_product');
             return toolError('unknown_product');
           }

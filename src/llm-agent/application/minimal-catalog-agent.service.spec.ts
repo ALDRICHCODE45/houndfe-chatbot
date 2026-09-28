@@ -9,6 +9,7 @@ import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 
 const SENDER = '5215550001111';
+const OTHER = '5215550002222';
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
 const VARIANT = '22222222-2222-4222-8222-222222222222';
 const OUTSIDE = '99999999-9999-4999-8999-999999999999';
@@ -77,8 +78,12 @@ type Captured = {
 };
 
 function build(
-  steps: unknown[],
-  over: Partial<{ enabled: boolean; allowedSenders: string[] }> = {},
+  steps: unknown,
+  over: Partial<{
+    enabled: boolean;
+    allowedSenders: string[];
+    historyTurns: number;
+  }> = {},
   fixtures: { item: unknown; stock: unknown } = {
     item: simpleItem,
     stock: simpleStock,
@@ -96,13 +101,16 @@ function build(
             enabled: over.enabled ?? true,
             allowedSenders: over.allowedSenders ?? [SENDER],
           }
-        : { model: 'm', maxSteps: 4, historyTurns: 12 },
+        : { model: 'm', maxSteps: 4, historyTurns: over.historyTurns ?? 12 },
   } as unknown as ConfigService;
   const captured: Captured[] = [];
+  const results: Array<{ responseMessages: ModelMessage[] }> = [];
   const costGuard = new CostGuardService(1_000_000);
   const generate: GenerateTextFn = async (options) => {
     captured.push(options as unknown as Captured);
-    return generateText({ ...options, model });
+    const result = await generateText({ ...options, model });
+    results.push(result);
+    return result;
   };
   return {
     service: new MinimalCatalogAgentService(
@@ -114,6 +122,7 @@ function build(
     chatbotApi,
     costGuard,
     captured,
+    results,
   };
 }
 
@@ -356,5 +365,179 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
     release();
     await expect(first).resolves.toEqual({ kind: 'handled', reply: 'hola' });
     expect(calls).toBe(1);
+  });
+
+  // The cross-turn guarantee: a productId verified by an earlier turn's
+  // search may be checked directly once the customer confirms it; stock reads,
+  // greetings and user text never grant or renew that identity.
+  describe('cross-turn identity (retained verified productIds)', () => {
+    const outOfStock = {
+      ...simpleStock,
+      stock: { status: 'out_of_stock', quantity: 0 },
+    };
+
+    it('reuses a retained verified productId on a later turn without re-search', async () => {
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        say('Sí, está agotado por ahora.'),
+      ];
+      const { service, chatbotApi, results } = build(
+        steps,
+        {},
+        { item: simpleItem, stock: outOfStock },
+      );
+      await service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' });
+      await expect(
+        service.tryHandle({ senderId: SENDER, text: 'sí, esa' }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply: 'Sí, está agotado por ahora.',
+      });
+      expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
+      expect(chatbotApi.getStock).toHaveBeenCalledWith(PRODUCT);
+      const turnB = JSON.stringify(results[1].responseMessages);
+      expect(turnB).toContain('"ok":true');
+      expect(turnB).toContain('"out_of_stock"');
+      expect(turnB).not.toContain('unknown_product');
+    });
+
+    it('isolates retained identity per allowed sender', async () => {
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        say('No puedo revisarlo así.'),
+      ];
+      const { service, chatbotApi, results } = build(steps, {
+        allowedSenders: [SENDER, OTHER],
+      });
+      await service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' });
+      await service.tryHandle({ senderId: OTHER, text: 'esa' });
+      expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
+      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+      expect(JSON.stringify(results[1].responseMessages)).toContain(
+        'unknown_product',
+      );
+    });
+
+    it('expires identity after historyTurns and never renews it on a stock read', async () => {
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        say('Está agotado.'),
+        call('c2', 'checkStock', { productId: PRODUCT }),
+        say('Necesito confirmarlo de nuevo.'),
+      ];
+      const { service, chatbotApi, results, captured } = build(
+        steps,
+        { historyTurns: 1 },
+        { item: simpleItem, stock: outOfStock },
+      );
+      await service.tryHandle({ senderId: SENDER, text: 'bu' });
+      await service.tryHandle({ senderId: SENDER, text: 'sí' });
+      await service.tryHandle({ senderId: SENDER, text: 'y el stock' });
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+      expect(chatbotApi.getStock).toHaveBeenCalledWith(PRODUCT);
+      expect(JSON.stringify(results[1].responseMessages)).toContain(
+        '"out_of_stock"',
+      );
+      expect(JSON.stringify(results[2].responseMessages)).toContain(
+        'unknown_product',
+      );
+      expect(captured[2].messages!.map((m) => m.role)).toEqual([
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        'user',
+      ]);
+    });
+
+    it('never GETs an id mentioned only in user text', async () => {
+      const steps = [
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        say('No puedo confirmarlo.'),
+      ];
+      const { service, chatbotApi, results } = build(steps);
+      await service.tryHandle({
+        senderId: SENDER,
+        text: `mi producto es ${PRODUCT}`,
+      });
+      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+      expect(JSON.stringify(results[0].responseMessages)).toContain(
+        'unknown_product',
+      );
+    });
+
+    it('forgets retained identity when the service restarts', async () => {
+      const first = build([
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+      ]);
+      await first.service.tryHandle({
+        senderId: SENDER,
+        text: 'tienen ibuprofeno',
+      });
+      const restarted = build([
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        say('No puedo confirmarlo.'),
+      ]);
+      await restarted.service.tryHandle({ senderId: SENDER, text: 'sí, esa' });
+      expect(restarted.chatbotApi.getStock).not.toHaveBeenCalled();
+    });
+
+    it('grants no identity when search fails or its projection rejects', async () => {
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        say('No pude consultar.'),
+        call('s2', 'searchCatalog', { q: 'ibuprofeno' }),
+        call('c2', 'checkStock', { productId: PRODUCT }),
+        say('Sigo sin poder.'),
+      ];
+      const { service, chatbotApi, results } = build(steps);
+      chatbotApi.searchCatalog.mockRejectedValueOnce(new Error('http down'));
+      await service.tryHandle({ senderId: SENDER, text: 'bu' });
+      chatbotApi.searchCatalog.mockResolvedValueOnce([
+        { ...simpleItem, variants: undefined } as never,
+      ]);
+      await service.tryHandle({ senderId: SENDER, text: 'sí' });
+      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+      expect(JSON.stringify(results[0].responseMessages)).toContain(
+        'unknown_product',
+      );
+      expect(JSON.stringify(results[1].responseMessages)).toContain(
+        'unknown_product',
+      );
+    });
+
+    it('does not persist identity when generation fails after a search', async () => {
+      let modelCall = 0;
+      const doGenerate = async () => {
+        modelCall += 1;
+        if (modelCall === 1) {
+          return call('s1', 'searchCatalog', { q: 'ibuprofeno' });
+        }
+        if (modelCall === 2) throw new Error('model down');
+        if (modelCall === 3) {
+          return call('c1', 'checkStock', { productId: PRODUCT });
+        }
+        return say('No puedo confirmarlo.');
+      };
+      const { service, chatbotApi } = build(
+        doGenerate,
+        {},
+        { item: simpleItem, stock: outOfStock },
+      );
+      await expect(
+        service.tryHandle({ senderId: SENDER, text: 'a' }),
+      ).rejects.toThrow('model down');
+      await service.tryHandle({ senderId: SENDER, text: 'b' });
+      expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
+      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+    });
   });
 });
