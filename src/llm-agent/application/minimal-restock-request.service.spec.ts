@@ -126,7 +126,7 @@ describe('MinimalRestockRequestService', () => {
     const h = hz();
     const o = await offer(h);
     expect(o.reply).toBe(
-      '¿Quiere que registre una consulta sobre la reposición de «Croquetas»? Responda SÍ o NO.',
+      'Por ahora no hay existencias de «Croquetas». ¿Quiere que consulte si hay una fecha estimada de reposición? Responda SÍ o NO.',
     );
     expect(h.getStock).toHaveBeenCalledTimes(1);
     expect(h.coordinate).not.toHaveBeenCalled();

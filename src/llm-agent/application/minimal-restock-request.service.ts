@@ -27,7 +27,8 @@ const confirmed = (l: string) =>
   `Ya quedó registrada su consulta sobre cuándo tendremos «${l}» de nuevo.`;
 const already = (l: string) => `Su consulta sobre «${l}» ya estaba registrada.`;
 const proposal = (l: string) =>
-  `¿Quiere que registre una consulta sobre la reposición de «${l}»? Responda SÍ o NO.`;
+  `Por ahora no hay existencias de «${l}». ¿Quiere que consulte si hay una ` +
+  `fecha estimada de reposición? Responda SÍ o NO.`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
 

@@ -60,18 +60,31 @@ const toolError = (kind: string) => ({ ok: false as const, error: kind });
 // The read-only prompt denies a registration tool; when `prepareRestock` is
 // present these clauses are reworded and the feature fragment appended.
 const RESTOCK_INSTRUCTIONS_FRAGMENT =
-  '\n\nHerramienta prepareRestock: SOLO cuando el cliente pida registrar o avisar ' +
-  'sobre la reposición de un producto ya verificado en esta conversación, llama a ' +
-  'prepareRestock con su productId EXACTO (y variantId si la presentación importa). ' +
-  'No la uses para una simple búsqueda. Ella no registra: solo PREPARA la confirmación ' +
-  'y la aplicación pregunta SÍ o NO; nunca afirmes que la consulta ya quedó registrada.';
+  '\n\nHerramienta prepareRestock: es SOLO para preparar, no registrar, una ' +
+  'consulta de reposición de un producto ya verificado como agotado en esta ' +
+  'conversación. Si el cliente pregunta por una fecha de reposición ("¿Tiene ' +
+  'alguna fecha de reposición?", "¿cuándo vuelve?", "¿cuándo tendrán de ' +
+  'nuevo?") o pide registrar o avisar sobre la reposición, llama a ' +
+  'prepareRestock con su productId EXACTO (y variantId si la presentación ' +
+  'importa); no esperes a que use palabras técnicas como "crear" o "registrar ' +
+  'solicitud". TAMBIÉN llama a prepareRestock por iniciativa propia en la ' +
+  'MISMA respuesta cuando el cliente confirme el producto seleccionado y ' +
+  'checkStock lo devuelva agotado (out_of_stock con cantidad 0), sin esperar a ' +
+  'que pregunte por una fecha. No la uses para una simple búsqueda inicial ' +
+  'del catálogo, ni cuando el stock sea not_managed o available, ni cuando la ' +
+  'lectura falle; la selección del producto NO autoriza el registro. Incluye ' +
+  'el variantId cuando la presentación importe. Ella no registra: solo ' +
+  'PREPARA la confirmación y la aplicación pregunta SÍ o NO; nunca afirmes ' +
+  'que la consulta ya quedó registrada. No inventes una fecha de reposición ' +
+  'ni prometas aviso o contacto: deja que la aplicación pida permiso con SÍ ' +
+  'o NO en vez de cerrar tú con que no tienes fecha.';
 
 function instructionsFor(restockAvailable: boolean): string {
   if (!restockAvailable) return INSTRUCTIONS;
   return (
     INSTRUCTIONS.replace(
-      'ni prometas registro, contacto o reservación (no existe esa herramienta)',
-      'Para registrar una consulta de reposición existe prepareRestock, que ' +
+      ' ni prometas registro, contacto o reservación (no existe esa herramienta)',
+      '. Para registrar una consulta de reposición existe prepareRestock, que ' +
         'solo prepara la confirmación y no registra nada por sí sola',
     ).replace('solicitud ni promesa de fecha', 'ni promesa de fecha') +
     RESTOCK_INSTRUCTIONS_FRAGMENT
@@ -257,10 +270,22 @@ export class MinimalCatalogAgentService {
     }
     const currentIds = new Set<string>();
     // Offer the tool ONLY with a trusted bound inbound identity.
+    const restockEnabled = this.restock !== undefined && this.restock.enabled;
     const restockAvailable =
-      this.restock !== undefined &&
-      this.restock.enabled &&
+      restockEnabled &&
       bindRestockInboundEvent(input.inboundEvent, input.senderId) !== null;
+    // Closed capability diagnostic: same booleans as tool registration, no raw
+    // identity. `available` only when the tool is actually exposed.
+    let restockCapability: 'disabled' | 'available' | 'unbound' = 'disabled';
+    if (restockAvailable) {
+      restockCapability = 'available';
+    } else if (restockEnabled) {
+      restockCapability = 'unbound';
+    }
+    traceLog(
+      this.logger,
+      `minimal_catalog capability prepareRestock=${restockCapability} trace=${traceId}`,
+    );
     const restockRun: RestockRun | null = restockAvailable
       ? { attempted: false, outcome: null }
       : null;

@@ -573,12 +573,13 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       messageId: 'wamid.A',
     };
     const CONFIRM = { ...INBOUND, messageId: 'wamid.B' };
+    const THIRD = { ...INBOUND, messageId: 'wamid.C' };
     const oos = {
       ...simpleStock,
       stock: { status: 'out_of_stock', quantity: 0 },
     };
     const QUESTION =
-      '¿Quiere que registre una consulta sobre la reposición de «Ibuprofeno 400 mg»? Responda SÍ o NO.';
+      'Por ahora no hay existencias de «Ibuprofeno 400 mg». ¿Quiere que consulte si hay una fecha estimada de reposición? Responda SÍ o NO.';
 
     const wire = () => {
       const coordinate = jest.fn<
@@ -616,10 +617,12 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       };
     };
 
-    it('prepares exactly one server question then one write on SÍ, with no extra SDK run', async () => {
+    it('proposes the offer proactively after selection and writes only on a NEW SÍ, with no extra SDK run', async () => {
       const w = wire();
       const steps = [
         call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
         call('p1', 'prepareRestock', { productId: PRODUCT }),
         call('p2', 'prepareRestock', { productId: PRODUCT }),
         say('listo'),
@@ -629,24 +632,52 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
         { restock: w.restock },
         { item: simpleItem, stock: oos },
       );
+      // Turn 1: a mere search presents the product and offers nothing yet. The
+      // mock scripts tool calls, so this pins the plumbing/gates, NOT that a
+      // real model would pick the tool without pressure.
       const first = await service.tryHandle({
         senderId: SENDER,
-        text: '¿me avisan cuando llegue?',
+        text: 'tienen ibuprofeno',
         inboundEvent: INBOUND,
       });
-      expect(first).toMatchObject({ kind: 'handled', reply: QUESTION });
-      // At most ONE preparation per run: the repeat never replaces the offer,
-      // and the confirmation writes nothing on its own.
-      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+      expect(first).toMatchObject({
+        kind: 'handled',
+        reply: '¿Buscaba esa presentación?',
+      });
       expect(w.coordinate).not.toHaveBeenCalled();
-      expect(String(captured[0].system)).toContain('prepareRestock');
-      if (first.kind !== 'handled') throw new Error('expected handled');
-      first.onSent?.();
+      // Turn 2: the product-selection SÍ. The model checks stock, sees agotado
+      // and prepares the offer in the SAME run without a date question. The
+      // SERVER copy (not the model text) states the shortage and asks SÍ/NO.
+      const second = await service.tryHandle({
+        senderId: SENDER,
+        text: 'SÍ',
+        inboundEvent: CONFIRM,
+      });
+      expect(second).toMatchObject({ kind: 'handled', reply: QUESTION });
+      expect(String(captured[1].system)).toContain('prepareRestock');
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(2);
+      expect(w.coordinate).not.toHaveBeenCalled();
+      if (second.kind !== 'handled') throw new Error('expected handled');
+      second.onSent?.();
+      // Arming the offer never writes: product selection is NOT approval.
+      expect(w.coordinate).not.toHaveBeenCalled();
+      // Replaying the SAME selection message must not run the SDK again nor
+      // write; it only re-exposes the checked question.
       await expect(
         service.tryHandle({
           senderId: SENDER,
           text: 'SÍ',
           inboundEvent: CONFIRM,
+        }),
+      ).resolves.toMatchObject({ kind: 'handled', reply: QUESTION });
+      expect(captured).toHaveLength(2);
+      expect(w.coordinate).not.toHaveBeenCalled();
+      // Only a NEW trusted SÍ after the outbound send writes exactly once.
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'SÍ',
+          inboundEvent: THIRD,
         }),
       ).resolves.toEqual({
         kind: 'handled',
@@ -658,10 +689,9 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       expect(arg.senderId).toBe(SENDER);
       expect(arg.intake.productId).toBe(PRODUCT);
       expect(arg.intake.sourceRequestId).toBe(
-        deriveRestockSourceRequestId(CONFIRM),
+        deriveRestockSourceRequestId(THIRD),
       );
       expect(w.recover).not.toHaveBeenCalled();
-      expect(captured).toHaveLength(1);
     });
 
     it('a NO decline clears the pending, claims nothing and writes nothing', async () => {
@@ -738,6 +768,66 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
         }),
       ).rejects.toThrow('boom');
       expect(captured).toHaveLength(0);
+    });
+
+    it('exposes the restock tool, its natural-date instruction and a closed capability diagnostic only when bound', async () => {
+      // The mock scripts tool calls, so this pins the prompt/gates and the
+      // closed diagnostic; it does not prove a real model chooses the tool.
+      const w = wire();
+      const off = build(flow);
+      const unbound = build(flow, { restock: w.restock });
+      const bound = build(flow, { restock: w.restock });
+      const outsider = build(flow, { allowedSenders: [OTHER] });
+      const logs = captureLogs();
+      await off.service.tryHandle({ senderId: SENDER, text: '¿fecha?' });
+      await unbound.service.tryHandle({ senderId: SENDER, text: '¿fecha?' });
+      await bound.service.tryHandle({
+        senderId: SENDER,
+        text: '¿fecha?',
+        inboundEvent: INBOUND,
+      });
+      await expect(
+        outsider.service.tryHandle({ senderId: SENDER, text: '¿fecha?' }),
+      ).resolves.toEqual({ kind: 'not-handled' });
+
+      // Tool inventory, not just the prompt, must match the capability.
+      expect(Object.keys(off.captured[0].tools!)).not.toContain(
+        'prepareRestock',
+      );
+      expect(Object.keys(unbound.captured[0].tools!)).not.toContain(
+        'prepareRestock',
+      );
+      expect(Object.keys(bound.captured[0].tools!)).toContain('prepareRestock');
+      // The natural-date instruction reaches generateText ONLY when available.
+      expect(String(off.captured[0].system)).not.toContain('¿cuándo vuelve?');
+      expect(String(unbound.captured[0].system)).not.toContain(
+        '¿cuándo vuelve?',
+      );
+      expect(String(bound.captured[0].system)).toContain('¿cuándo vuelve?');
+      // The proactive post-confirmation trigger reaches generateText ONLY when
+      // the tool is actually exposed.
+      expect(String(off.captured[0].system)).not.toContain(
+        'por iniciativa propia',
+      );
+      expect(String(unbound.captured[0].system)).not.toContain(
+        'por iniciativa propia',
+      );
+      expect(String(bound.captured[0].system)).toContain(
+        'por iniciativa propia',
+      );
+
+      const caps = logs.filter((line) =>
+        line.startsWith('minimal_catalog capability prepareRestock='),
+      );
+      const kinds = caps.map(
+        (line) => /prepareRestock=(\w+) trace=\S+$/.exec(line)![1],
+      );
+      expect(caps).toHaveLength(3);
+      expect(kinds).toEqual(['disabled', 'unbound', 'available']);
+      const joined = logs.join('\n');
+      for (const raw of [SENDER, OTHER, PRODUCT, VARIANT, 'ibuprofeno']) {
+        expect(joined).not.toContain(raw);
+      }
     });
   });
 });
