@@ -22,7 +22,7 @@ const snapshotSchema = z.strictObject({
 export type CatalogReferences = z.infer<typeof snapshotSchema>;
 
 // A Cc/Cf/Zl/Zp char in a label can forge extra choices; fail closed.
-const DISPLAY_BREAKING = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+export const DISPLAY_BREAKING = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
 export const CATALOG_RECOVERY = {
   ok: false as const,

@@ -177,9 +177,14 @@ function restockDiagnostic() {
  * request is not a failure, so it is recovered read-only (no POST, no
  * coordinator, no legacy fallback) and reported as `existing_restock_recorded`.
  * Recovery never falls through to the coordinator.
+ *
+ * Exported (WU-A) so the bounded `MinimalRestockRequestService` confirmation
+ * gate can reuse this EXACT route with only the two ports it needs
+ * (`Pick<ToolDeps, 'store' | 'chatbotApi'>`). The body, preflight call,
+ * coordinator ordering, recovery and fail-closed semantics are unchanged.
  */
-async function runRestockRoute(
-  deps: ToolDeps,
+export async function runRestockRoute(
+  deps: Pick<ToolDeps, 'store' | 'chatbotApi'>,
   restock: RestockToolCapability,
   digest: unknown,
   context: {
