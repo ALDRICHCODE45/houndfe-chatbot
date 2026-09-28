@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CatalogSession } from '../../conversation/domain/catalog-references';
@@ -184,12 +185,28 @@ export class AgentRunner {
     const allTurns: AgentMessage[] =
       state === null || idleExpired ? [] : readMessages(state);
     const truncated = allTurns.slice(-this.historyTurns);
+    const correlationId = randomUUID();
+    if (idleExpired) {
+      AgentRunner.logCatalogIdentity(
+        correlationId,
+        'history',
+        'idle_discarded',
+      );
+    }
     const catalogSession = new CatalogSession(
       input.senderId,
       this.idleTimeoutMs,
       allTurns.length,
       idleExpired ? undefined : state?.data.catalogReferences,
       allTurns,
+      undefined,
+      (event) => {
+        AgentRunner.logCatalogIdentity(
+          correlationId,
+          event.phase,
+          event.reason,
+        );
+      },
     );
     const catalogEvidence = catalogSession.evidence(
       allTurns.length - truncated.length,
@@ -231,9 +248,34 @@ export class AgentRunner {
       catalogReferences: catalogSession.snapshot(),
       lastMessageAt: nowIso,
     });
-    if (!committed) Logger.warn('[agent-turn-conflict]', 'AgentRunner');
+    if (!committed) {
+      Logger.warn('[agent-turn-conflict]', 'AgentRunner');
+      AgentRunner.logCatalogIdentity(correlationId, 'commit', 'conflict');
+    } else {
+      AgentRunner.logCatalogIdentity(correlationId, 'commit', 'committed');
+    }
 
     return { reply: result.reply };
+  }
+
+  /**
+   * One structured, privacy-safe diagnostic line. Fields are fixed enums plus
+   * a per-turn server-generated correlation id; nothing caller-supplied is
+   * ever interpolated. Never throws into the turn.
+   */
+  private static logCatalogIdentity(
+    correlationId: string,
+    phase: string,
+    reason: string,
+  ): void {
+    try {
+      Logger.log(
+        `catalog_identity ${correlationId} phase=${phase} reason=${reason}`,
+        'AgentRunner',
+      );
+    } catch {
+      // A logger failure must never affect the conversation turn.
+    }
   }
 }
 

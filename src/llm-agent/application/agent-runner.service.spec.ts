@@ -1,4 +1,5 @@
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
+import { Logger } from '@nestjs/common';
 import { CostGuardService } from './cost-guard.service';
 import { AgentRunner } from './agent-runner.service';
 import {
@@ -775,6 +776,95 @@ describe('AgentRunner', () => {
       });
       expect(tools.getTools).toHaveBeenCalledTimes(1);
       expect(lastInput().tools).toBe(tools.getTools.mock.results[0].value);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Scenario: private catalog identity diagnostics (Unit 2)
+  // ────────────────────────────────────────────────────────────────────
+  describe('catalog identity diagnostics', () => {
+    const loggedLines = (): string[] =>
+      (Logger.log as jest.Mock).mock.calls
+        .map((call: unknown[]) => call[0])
+        .filter(
+          (line): line is string =>
+            typeof line === 'string' && line.startsWith('catalog_identity '),
+        );
+
+    beforeEach(() => {
+      jest.spyOn(Logger, 'log').mockImplementation(() => undefined);
+      store.get.mockResolvedValue(null);
+      store.update.mockResolvedValue({
+        senderId: 's',
+        lastMessageAt: '2026-06-23T12:00:00.000Z',
+        data: {},
+      });
+      llm.run.mockResolvedValue({
+        reply: 'ok',
+        messages: [
+          { role: 'user', content: 'a' },
+          { role: 'assistant', content: 'ok' },
+        ],
+        usage: { promptTokens: 1, completionTokens: 1 },
+      });
+    });
+    afterEach(() => jest.restoreAllMocks());
+
+    it('logs one privacy-keys-only group per turn with isolated ids', async () => {
+      await runner.handle({ senderId: 'sender-secret', text: 'hola-secret' });
+      await runner.handle({ senderId: 'sender-secret', text: 'otra-secret' });
+      const lines = loggedLines();
+      expect(lines).toHaveLength(6);
+      for (const line of lines) {
+        expect(line).toMatch(
+          /^catalog_identity [0-9a-f-]{36} phase=[a-z_]+ reason=[a-z_]+$/,
+        );
+        expect(line).not.toContain('sender-secret');
+        expect(line).not.toContain('hola-secret');
+      }
+      const ids = lines.map((line) => line.split(' ')[1]);
+      expect(ids.slice(0, 3)).toEqual([ids[0], ids[0], ids[0]]);
+      expect(ids.slice(3)).toEqual([ids[3], ids[3], ids[3]]);
+      expect(ids[0]).not.toBe(ids[3]);
+      expect(lines[0]).toContain('phase=restore reason=missing_snapshot');
+      expect(lines[1]).toContain('phase=history reason=missing_snapshot');
+      expect(lines[2]).toContain('phase=commit reason=committed');
+    });
+
+    it('logs a CAS conflict and preserves the reply and warn behavior', async () => {
+      store.commitAgentTurn.mockResolvedValue(false);
+      const warn = jest
+        .spyOn(Logger, 'warn')
+        .mockImplementation(() => undefined);
+      await expect(
+        runner.handle({ senderId: 's', text: 'a' }),
+      ).resolves.toEqual({ reply: 'ok' });
+      expect(warn).toHaveBeenCalledWith('[agent-turn-conflict]', 'AgentRunner');
+      expect(
+        loggedLines().some((line) =>
+          line.includes('phase=commit reason=conflict'),
+        ),
+      ).toBe(true);
+    });
+
+    it('survives a throwing logger without blocking the commit', async () => {
+      (Logger.log as jest.Mock).mockImplementation(() => {
+        throw new Error('logger down');
+      });
+      await expect(
+        runner.handle({ senderId: 's', text: 'a' }),
+      ).resolves.toEqual({ reply: 'ok' });
+      expect(store.commitAgentTurn).toHaveBeenCalledTimes(1);
+    });
+
+    it('never leaks generated diagnostics into model messages or the snapshot', async () => {
+      await runner.handle({ senderId: 'sender-secret', text: 'hola-secret' });
+      expect(JSON.stringify(llm.run.mock.calls[0][0])).not.toContain(
+        'catalog_identity',
+      );
+      expect(
+        JSON.stringify(store.commitAgentTurn.mock.calls[0][1]),
+      ).not.toContain('catalog_identity');
     });
   });
 });

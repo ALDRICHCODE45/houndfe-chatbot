@@ -1,4 +1,9 @@
-import { CatalogSession, catalogSessionSchema } from './catalog-references';
+import {
+  CatalogSession,
+  catalogSessionSchema,
+  type CatalogIdentityEvent,
+} from './catalog-references';
+import type { AgentMessage } from './conversation-store';
 
 const productId = '00000000-0000-4000-8000-000000000001';
 const variantId = '00000000-0000-4000-8000-000000000002';
@@ -458,6 +463,210 @@ describe('CatalogSession', () => {
         },
       ]);
       expect(session.selectionPrompt()).toBeNull();
+    });
+  });
+
+  describe('catalog identity diagnostics', () => {
+    const observed = (now = 1000) => {
+      const events: CatalogIdentityEvent[] = [];
+      const session = new CatalogSession(
+        'sender',
+        100,
+        0,
+        undefined,
+        [],
+        () => now,
+        (event) => events.push(event),
+      );
+      return { session, events };
+    };
+    const latest = (events: CatalogIdentityEvent[]) => events.at(-1);
+    const accept = (session: CatalogSession, results: unknown) =>
+      session.installSearch(session.beginSearch(), results);
+
+    it('reports the direct install rejection and acceptance branch', () => {
+      const { session, events } = observed();
+      const stale = session.beginSearch();
+      session.beginSearch();
+      session.installSearch(stale, [product()]);
+      expect(latest(events)).toEqual({
+        phase: 'install_search',
+        reason: 'stale_ticket',
+      });
+      for (const [results, reason] of [
+        [{}, 'malformed_projection'],
+        [Array.from({ length: 21 }, product), 'oversized'],
+        [[{ ...product(), name: 'x'.repeat(257) }], 'invalid_snapshot'],
+      ] as Array<[unknown, string]>) {
+        session.installSearch(session.generation, results);
+        expect(latest(events)).toEqual({ phase: 'install_search', reason });
+      }
+      accept(session, [product()]);
+      expect(latest(events)).toEqual({
+        phase: 'install_search',
+        reason: 'accepted',
+      });
+    });
+
+    it.each<[string, unknown[], string]>([
+      ['duplicate ids', [product(), product()], 'duplicate_id'],
+      [
+        'the variant limit',
+        [
+          {
+            ...product(),
+            variants: Array.from({ length: 100 }, (_, i) => ({
+              variantId: `00000000-0000-4000-8000-${String(i + 500).padStart(12, '0')}`,
+              name: 'v',
+              option: null,
+              value: null,
+            })),
+          },
+          {
+            productId: unknownId,
+            name: 'Second',
+            variants: [product().variants[0]],
+          },
+        ],
+        'variant_limit',
+      ],
+    ])('reports %s directly', (_label, results, reason) => {
+      const { session, events } = observed();
+      session.installSearch(session.beginSearch(), results);
+      expect(latest(events)).toEqual({ phase: 'install_search', reason });
+    });
+
+    it('reports each restore rejection and acceptance branch directly', () => {
+      const snapshot = seeded().snapshot()!;
+      const events: CatalogIdentityEvent[] = [];
+      const restore = (
+        senderId: string,
+        raw: unknown,
+        retained: readonly AgentMessage[],
+        clock: () => number,
+      ) => {
+        new CatalogSession(senderId, 100, 1, raw, retained, clock, (event) =>
+          events.push(event),
+        );
+        return latest(events);
+      };
+      const cases: Array<
+        [string, unknown, readonly AgentMessage[], () => number]
+      > = [
+        ['missing_snapshot', undefined, history, () => 1000],
+        ['invalid_snapshot', { bad: true }, history, () => 1000],
+        ['sender_mismatch', snapshot, history, () => 1000],
+        ['invalid_clock', snapshot, history, () => NaN],
+        [
+          'future_observation',
+          { ...snapshot, observedAt: 2000 },
+          history,
+          () => 1000,
+        ],
+        ['expired', snapshot, history, () => 1101],
+        ['origin_removed', snapshot, [], () => 1050],
+        ['accepted', snapshot, history, () => 1050],
+      ];
+      for (const [reason, raw, retained, clock] of cases) {
+        const senderId = reason === 'sender_mismatch' ? 'other' : 'sender';
+        expect(restore(senderId, raw, retained, clock)).toEqual({
+          phase: 'restore',
+          reason,
+        });
+      }
+    });
+
+    it('reports resolve, expiry, history and silent reads directly', () => {
+      const { session, events } = observed();
+      accept(session, [product()]);
+      events.length = 0;
+      for (const [candidate, reason] of [
+        [{ productId: unknownId }, 'unknown_product'],
+        [{ productId, name: 'Other' }, 'name_mismatch'],
+        [{ productId, variantId: unknownId }, 'unknown_variant'],
+        [{ productId, variantId }, 'accepted'],
+      ] as Array<[Parameters<CatalogSession['resolve']>[0], string]>) {
+        session.resolve(candidate);
+        expect(latest(events)).toEqual({ phase: 'resolve', reason });
+      }
+
+      const silent = observed();
+      accept(silent.session, [
+        { productId, name: 'Medicine 400 mg', variants: [] },
+      ]);
+      const before = silent.events.length;
+      expect(silent.session.snapshot()).not.toBeNull();
+      expect(silent.session.selectionPrompt()).not.toBeNull();
+      expect(silent.events).toHaveLength(before);
+      expect(silent.session.evidence(1)).toBeNull();
+      expect(latest(silent.events)).toEqual({
+        phase: 'history',
+        reason: 'origin_removed',
+      });
+      const empty = observed();
+      expect(empty.session.evidence(0)).toBeNull();
+      expect(latest(empty.events)).toEqual({
+        phase: 'history',
+        reason: 'missing_snapshot',
+      });
+    });
+
+    it('reports an expired reference when resolve runs after the TTL', () => {
+      let now = 1000;
+      const events: CatalogIdentityEvent[] = [];
+      const session = new CatalogSession(
+        'sender',
+        100,
+        0,
+        undefined,
+        [],
+        () => now,
+        (event) => events.push(event),
+      );
+      accept(session, [product()]);
+      now = 1101;
+      expect(session.resolve({ productId })).toBeNull();
+      expect(latest(events)).toEqual({ phase: 'resolve', reason: 'expired' });
+    });
+
+    it('clears expired references so a rewound clock cannot revive them', () => {
+      let now = 1000;
+      const events: CatalogIdentityEvent[] = [];
+      const session = new CatalogSession(
+        'sender',
+        100,
+        0,
+        undefined,
+        [],
+        () => now,
+        (event) => events.push(event),
+      );
+      session.installSearch(session.beginSearch(), [product()]);
+      now = 1101;
+      expect(session.evidence(0)).toBeNull();
+      expect(latest(events)).toEqual({ phase: 'history', reason: 'expired' });
+      now = 1000;
+      expect(session.snapshot()).toBeNull();
+      expect(session.resolve({ productId })).toBeNull();
+      expect(latest(events)?.reason).toBe('missing_snapshot');
+    });
+
+    it('never lets a throwing observer change validation results', () => {
+      const session = new CatalogSession(
+        'sender',
+        100,
+        0,
+        undefined,
+        [],
+        () => 1000,
+        () => {
+          throw new Error('boom');
+        },
+      );
+      session.installSearch(session.beginSearch(), [product()]);
+      expect(session.snapshot()).not.toBeNull();
+      expect(session.resolve({ productId })).not.toBeNull();
+      expect(session.evidence(0)).toContain('UNSELECTED');
     });
   });
 });
