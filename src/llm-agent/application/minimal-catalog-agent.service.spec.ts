@@ -149,6 +149,26 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
     expect([...off.captured, ...other.captured]).toHaveLength(0);
   });
 
+  it('sends the strengthened voice clauses and examples with the SYSTEM_PROMPT prefix and returns the model reply verbatim', async () => {
+    const arbitrary = 'Eco literal del modelo: **{nombre}** 12345';
+    const { service, captured } = build([say(arbitrary)]);
+    await expect(
+      service.tryHandle({ senderId: SENDER, text: 'hola, busco ibuprofeno' }),
+    ).resolves.toEqual({ kind: 'handled', reply: arbitrary });
+    const system = String(captured[0].system);
+    expect(system.startsWith(SYSTEM_PROMPT)).toBe(true);
+    expect(system).toContain(
+      '¡Hola! 😊 Encontré {nombre} en nuestro catálogo.',
+    );
+    expect(system).toContain('Por ahora, {nombre} está agotado.');
+    expect(system).toContain('sin "¿en qué puedo ayudarle?"');
+    expect(system).toContain('Sin cierre automático');
+    expect(system).toContain('sin emoji al informar agotado');
+    expect(JSON.stringify(captured[0].messages)).toContain(
+      'hola, busco ibuprofeno',
+    );
+  });
+
   it('runs confirm→re-search→checkStock and bounds tools/steps/usage', async () => {
     const { service, chatbotApi, costGuard, captured } = build(flow);
     await expect(
