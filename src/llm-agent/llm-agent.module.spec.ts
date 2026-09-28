@@ -58,7 +58,7 @@ describe('LlmAgentModule integration', () => {
     // default-off prompt byte-identity assertion. MANAGED_KEYS restores it.
     SHIPPING_QUOTES_ENABLED: 'false',
   };
-  const MANAGED_KEYS = Object.keys(VALID_ENV);
+  const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
 
   let savedEnv: Record<string, string | undefined> = {};
 
@@ -67,6 +67,7 @@ describe('LlmAgentModule integration', () => {
       savedEnv[key] = process.env[key];
     }
     Object.assign(process.env, VALID_ENV);
+    delete process.env.LLM_MAX_STEPS;
   });
 
   afterEach(() => {
@@ -183,7 +184,7 @@ describe('LlmAgentModule integration', () => {
     // The config is also wired correctly (used by VercelAiLlmAgent ctor).
     const config = moduleRef.get(ConfigService);
     expect(config.get<string>('llm.model')).toBe('anthropic/claude-sonnet-4.5');
-    expect(config.get<number>('llm.maxSteps')).toBe(3);
+    expect(config.get<number>('llm.maxSteps')).toBe(4);
 
     await moduleRef.close();
   });

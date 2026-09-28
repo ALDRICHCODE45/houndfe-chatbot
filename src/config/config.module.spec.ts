@@ -44,13 +44,14 @@ describe('AppConfigModule integration', () => {
     SKYDROPX_ORIGIN_NEIGHBORHOOD: 'Centro',
   };
 
-  const MANAGED_KEYS = Object.keys(VALID_ENV);
+  const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
   let savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     for (const key of MANAGED_KEYS) {
       savedEnv[key] = process.env[key];
     }
+    delete process.env.LLM_MAX_STEPS;
   });
 
   afterEach(() => {
@@ -96,7 +97,7 @@ describe('AppConfigModule integration', () => {
       expect(config.get<string>('llm.model')).toBe(
         'anthropic/claude-sonnet-4.5',
       );
-      expect(config.get<number>('llm.maxSteps')).toBe(3);
+      expect(config.get<number>('llm.maxSteps')).toBe(4);
       expect(config.get<number>('llm.historyTurns')).toBe(12);
       expect(config.get<number>('llm.monthlyTokenCeiling')).toBe(8_000_000);
       expect(config.get<number>('llm.idleTimeoutMs')).toBe(10_800_000);
@@ -104,6 +105,23 @@ describe('AppConfigModule integration', () => {
       await moduleRef.close();
     });
   });
+
+  it.each(['1', '3', '6'])(
+    'keeps the explicit step cap %s through validation and factory wiring',
+    async (steps) => {
+      Object.assign(process.env, VALID_ENV, { LLM_MAX_STEPS: steps });
+      const moduleRef = await Test.createTestingModule({
+        imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
+      }).compile();
+      try {
+        expect(moduleRef.get(ConfigService).get<number>('llm.maxSteps')).toBe(
+          Number(steps),
+        );
+      } finally {
+        await moduleRef.close();
+      }
+    },
+  );
 
   // ─── Task 1.9 ──────────────────────────────────────────────────────────────
   describe('when a required env var is missing', () => {

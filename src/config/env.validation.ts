@@ -257,7 +257,7 @@ const innerEnvValidationSchema = Joi.object({
   // ─── LLM agent slice ────────────────────────────────────────────────────
   OPENAI_API_KEY: Joi.string().required(),
   LLM_MODEL: Joi.string().required(),
-  LLM_MAX_STEPS: Joi.number().integer().min(1).default(3),
+  LLM_MAX_STEPS: Joi.number().integer().min(1).default(4),
   LLM_HISTORY_TURNS: Joi.number().integer().min(1).default(12),
   LLM_MONTHLY_TOKEN_CEILING: Joi.number().integer().min(1).default(8_000_000),
   LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),

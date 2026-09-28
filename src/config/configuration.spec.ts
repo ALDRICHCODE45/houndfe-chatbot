@@ -83,6 +83,21 @@ describe('configuration()', () => {
     }
   });
 
+  describe('LLM step budget', () => {
+    it('defaults to four steps when LLM_MAX_STEPS is absent', () => {
+      delete process.env.LLM_MAX_STEPS;
+      expect(configuration().llm.maxSteps).toBe(4);
+    });
+
+    it.each(['1', '3', '4', '6'])(
+      'preserves the explicit LLM_MAX_STEPS=%s without raising it',
+      (steps) => {
+        process.env.LLM_MAX_STEPS = steps;
+        expect(configuration().llm.maxSteps).toBe(Number(steps));
+      },
+    );
+  });
+
   it('exposes database.url sourced from DATABASE_URL', () => {
     process.env.DATABASE_URL = 'postgres://u:p@h:5432/d';
     const cfg = configuration() as {

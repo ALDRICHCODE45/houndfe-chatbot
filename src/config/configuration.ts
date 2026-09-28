@@ -46,7 +46,7 @@ const configuration = () => ({
   llm: {
     openaiApiKey: process.env.OPENAI_API_KEY as string,
     model: process.env.LLM_MODEL as string,
-    maxSteps: parseInt(process.env.LLM_MAX_STEPS ?? '3', 10),
+    maxSteps: parseInt(process.env.LLM_MAX_STEPS ?? '4', 10),
     historyTurns: parseInt(process.env.LLM_HISTORY_TURNS ?? '12', 10),
     monthlyTokenCeiling: parseInt(
       process.env.LLM_MONTHLY_TOKEN_CEILING ?? '8000000',

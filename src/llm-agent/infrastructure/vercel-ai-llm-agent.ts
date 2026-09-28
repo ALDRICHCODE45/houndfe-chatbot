@@ -1,25 +1,23 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { ModelMessage, ToolExecutionEndEvent } from 'ai';
+import { stepCountIs } from 'ai';
 import { openai } from '@ai-sdk/openai';
-import {
-  CatalogSession,
-  CATALOG_RECOVERY,
-} from '../../conversation/domain/catalog-references';
+import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import type { AgentMessage } from '../domain/agent-message';
-import {
-  CatalogStockRecoveryRun,
-  catalogStockRecoveryInput,
-  selectCatalogStockRecovery,
-  type CatalogStockRecoveryTarget,
-} from '../domain/catalog-stock-recovery';
 import {
   InventoryEvidenceGuard,
   isNonMutatingToolName,
   type InventoryCallEvidence,
-  type InventoryCallState,
 } from '../domain/inventory-evidence.guard';
+import {
+  StockReadEvidence,
+  type AdmittedToolCall,
+  type StockReadExecutionObserver,
+  type StockReadSubject,
+} from '../domain/stock-read-evidence';
 import type {
   LlmAgentPort,
   LlmRunInput,
@@ -42,51 +40,35 @@ export const STOCK_FIRST_DENIAL_REASON =
   'Complete the stock check first and call this tool again in a later step.';
 
 /**
- * Pre-execution denial reason while the one-shot recovery is in flight. The
- * lock only engages after the recovery arms, but from then on NO tool may run
- * except the single authorized `checkStock`, and nothing at all in the final
- * render step.
+ * Pre-execution denial reason for the final configured step. That step is
+ * reserved for rendering a reply only; even when the provider ignores the
+ * tool-free presentation, an emitted tool call must never execute.
  */
-export const RECOVERY_LOCK_REASON =
-  'Stock recovery in progress: only the single authorized checkStock call may execute.';
+export const FINAL_RENDER_DENIAL_REASON =
+  'The final step is reserved for the reply; no tool may execute.';
 
 /**
- * Truthful clarification for an ambiguous post-failure recovery: the customer
- * asked for availability, a stock check failed on identity, a fresh search
- * produced a valid snapshot, yet no single product/presentation could be
- * selected. It never claims availability or exhaustion and never starts a
- * blind retry loop.
+ * Pre-execution denial reason used when a step's frozen approval frame is
+ * missing or malformed. Without the authentic step the adapter cannot prove
+ * the call is not a final render slot, so it fails closed.
  */
-export const INVENTORY_CLARIFICATION_REPLY =
-  'Para no darle un dato equivocado, necesito confirmar el producto y su ' +
-  'presentación exacta (por ejemplo, la dosis o el tamaño). ¿Me confirma el ' +
-  'nombre completo y la presentación que busca?';
-
-/**
- * Extra steps a forced recovery may use beyond the ordinary cap: the forced
- * `checkStock` step and the forced tool-free final step. Ordinary runs never
- * see this allowance.
- */
-const RECOVERY_EXTRA_STEPS = 2;
-
-/**
- * Read the one executable `checkStock` tool, or `null` when this run has none.
- * The definition is copied, never mutated: the caller's ToolSet is shared.
- */
-function executableCheckStock(tools: Record<string, unknown>): {
-  definition: Record<string, unknown>;
-  execute: (input: unknown, options: unknown) => unknown;
-} | null {
-  const definition = asRecord(tools['checkStock']);
-  const execute = definition?.execute;
-  if (definition === null || typeof execute !== 'function') return null;
-  return {
-    definition,
-    execute: execute as (input: unknown, options: unknown) => unknown,
-  };
-}
+export const STOCK_CONTEXT_DENIAL_REASON =
+  'The stock step context is unavailable; no tool may execute.';
 
 export type SeparationDecision = 'denied' | 'not-applicable';
+
+/** Local shape of `prepareStep` options the adapter reads (SDK-versioned). */
+interface PrepareStepOptions {
+  stepNumber: number;
+  toolsContext?: Record<string, Record<string, unknown>>;
+}
+
+/** Local shape of `toolApproval` options the adapter reads (SDK-versioned). */
+interface ToolApprovalOptions {
+  toolCall?: unknown;
+  toolsContext?: Record<string, Record<string, unknown>>;
+  runtimeContext?: unknown;
+}
 
 /**
  * Run-local gate that separates mutating tool calls from a `checkStock` batch.
@@ -94,8 +76,10 @@ export type SeparationDecision = 'denied' | 'not-applicable';
  * The installed SDK resolves each tool approval in isolation and does not
  * expose the sibling tool calls of the same model call, so the gate keeps a
  * run-local map captured from `onLanguageModelCallEnd` (before any client
- * execution). Approval is then decided against that map. Missing, malformed,
- * or stale metadata fails closed for mutating/unknown names, and the injected
+ * execution). Approval is then decided against that map. A call is authorized
+ * only when its captured identity is UNIQUE and its name and input
+ * structurally equal the approval call; missing, duplicated, malformed, or
+ * stale metadata fails closed for mutating/unknown names, and the injected
  * `isUnresolved` predicate hard-denies them while a stock subject lacks an
  * authoritative answer (even in a batch that has no `checkStock` sibling).
  */
@@ -104,6 +88,19 @@ export interface InventorySeparationGate {
   capture(event: unknown): void;
   /** Decide whether a single tool call may execute. */
   approve(toolCall: unknown): SeparationDecision;
+  /**
+   * True when the captured batch already contains a `checkStock` call for
+   * this tool call. Used to keep the hard same-batch denial even when the
+   * narrow RESTOCK exception would otherwise apply.
+   */
+  hasStockSibling(toolCall: unknown): boolean;
+  /**
+   * True only when the captured batch holds exactly one call for this id whose
+   * tool name matches and whose input structurally equals the approval input.
+   * The narrow RESTOCK exception is validated against this before it can
+   * override the fail-closed unresolved-read denial.
+   */
+  captured(toolCall: unknown): boolean;
   /** Forget all batch metadata (fail closed until the next capture). */
   reset(): void;
 }
@@ -114,57 +111,109 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Parsed captured input, or a failure marker when a string is not JSON. */
+interface ParsedCallInput {
+  ok: boolean;
+  value: unknown;
+}
+
+function parseCallInput(value: unknown): ParsedCallInput {
+  if (typeof value !== 'string') return { ok: true, value };
+  try {
+    return { ok: true, value: JSON.parse(value) as unknown };
+  } catch {
+    return { ok: false, value: undefined };
+  }
+}
+
 /**
- * Read the tool-call names of one completed model call. Returns `null` when
- * the event shape is missing or malformed so the caller defaults to denial.
+ * Structural comparison that tolerates a serialized captured input and a
+ * parsed approval input without string-to-object comparison or property-order
+ * sensitivity. An unparseable string never matches.
  */
-function readBatchMetadata(
-  event: unknown,
-): { byToolCallId: Map<string, string>; hasCheckStock: boolean } | null {
+function callInputsMatch(captured: unknown, approval: unknown): boolean {
+  const left = parseCallInput(captured);
+  const right = parseCallInput(approval);
+  if (!left.ok || !right.ok) return false;
+  return isDeepStrictEqual(left.value, right.value);
+}
+
+interface CapturedBatchCall {
+  toolName: string;
+  input: unknown;
+}
+
+interface CapturedBatch {
+  callsById: Map<string, CapturedBatchCall[]>;
+  hasCheckStock: boolean;
+}
+
+/**
+ * Read every captured tool-call identity of one model call. A call id that is
+ * missing or paired with a non-string name marks the whole batch malformed so
+ * the caller defaults to denial. Duplicate ids are retained, never collapsed,
+ * so a duplicate can never act as a unique authority.
+ */
+function readBatchMetadata(event: unknown): CapturedBatch | null {
   const content = asRecord(event)?.content;
   if (!Array.isArray(content)) return null;
-  const byToolCallId = new Map<string, string>();
+  const callsById = new Map<string, CapturedBatchCall[]>();
   let hasCheckStock = false;
   for (const part of content) {
     const record = asRecord(part);
     if (record === null || record.type !== 'tool-call') continue;
     const toolCallId = record.toolCallId;
     const toolName = record.toolName;
-    if (typeof toolCallId !== 'string' || typeof toolName !== 'string') {
+    if (
+      typeof toolCallId !== 'string' ||
+      toolCallId.length === 0 ||
+      typeof toolName !== 'string' ||
+      toolName.length === 0
+    ) {
       return null;
     }
-    byToolCallId.set(toolCallId, toolName);
+    const call = { toolName, input: record.input };
+    const list = callsById.get(toolCallId);
+    if (list === undefined) callsById.set(toolCallId, [call]);
+    else list.push(call);
     if (toolName === 'checkStock') hasCheckStock = true;
   }
-  if (byToolCallId.size === 0) return null;
-  return { byToolCallId, hasCheckStock };
+  if (callsById.size === 0) return null;
+  return { callsById, hasCheckStock };
+}
+
+/** The single captured call for an id, or `null` when ambiguous/absent. */
+function uniqueCapturedCall(
+  batch: CapturedBatch | null,
+  toolCallId: unknown,
+): CapturedBatchCall | null {
+  if (batch === null || typeof toolCallId !== 'string') return null;
+  const list = batch.callsById.get(toolCallId);
+  if (list === undefined || list.length !== 1) return null;
+  return list[0];
 }
 
 export function createInventorySeparationGate(
   isUnresolved: () => boolean = () => false,
 ): InventorySeparationGate {
-  let batchByToolCallId: Map<string, string> | null = null;
-  let batchHasCheckStock = false;
+  let batch: CapturedBatch | null = null;
   return {
     capture(event: unknown) {
       // Clear first: a throwing or hostile event must not leave stale authority.
-      batchByToolCallId = null;
-      batchHasCheckStock = false;
+      batch = null;
       try {
         const metadata = readBatchMetadata(event);
-        if (metadata !== null) {
-          batchByToolCallId = metadata.byToolCallId;
-          batchHasCheckStock = metadata.hasCheckStock;
-        }
+        if (metadata !== null) batch = metadata;
       } catch {
-        batchByToolCallId = null;
-        batchHasCheckStock = false;
+        batch = null;
       }
     },
     approve(toolCall: unknown) {
       const record = asRecord(toolCall);
       const toolName = record?.toolName;
-      if (typeof toolName !== 'string') return 'denied';
+      if (typeof toolName !== 'string' || toolName.length === 0) {
+        return 'denied';
+      }
       if (isNonMutatingToolName(toolName)) return 'not-applicable';
       // Mutating or unknown name: hard-deny while any stock subject is
       // unresolved, regardless of this batch's siblings, so a later
@@ -172,91 +221,417 @@ export function createInventorySeparationGate(
       // and executes against the full tool set even when `activeTools` hides
       // the tool from the provider presentation.
       if (isUnresolved()) return 'denied';
-      const toolCallId = record?.toolCallId;
-      const batch = batchByToolCallId;
+      const captured = uniqueCapturedCall(batch, record?.toolCallId);
       if (
-        batch === null ||
-        typeof toolCallId !== 'string' ||
-        !batch.has(toolCallId)
+        captured === null ||
+        captured.toolName !== toolName ||
+        !callInputsMatch(captured.input, record?.input)
       ) {
-        // Missing, malformed, or stale batch metadata: fail closed.
+        // Missing, malformed, duplicated, or stale metadata: fail closed.
         return 'denied';
       }
-      return batchHasCheckStock ? 'denied' : 'not-applicable';
+      return batch !== null && batch.hasCheckStock
+        ? 'denied'
+        : 'not-applicable';
+    },
+    hasStockSibling(toolCall: unknown) {
+      const captured = uniqueCapturedCall(
+        batch,
+        asRecord(toolCall)?.toolCallId,
+      );
+      if (captured === null) return true;
+      return batch !== null && batch.hasCheckStock;
+    },
+    captured(toolCall: unknown) {
+      const record = asRecord(toolCall);
+      const toolName = record?.toolName;
+      const captured = uniqueCapturedCall(batch, record?.toolCallId);
+      if (captured === null || typeof toolName !== 'string') return false;
+      if (captured.toolName !== toolName) return false;
+      return callInputsMatch(captured.input, record?.input);
     },
     reset() {
-      batchByToolCallId = null;
-      batchHasCheckStock = false;
+      batch = null;
     },
   };
 }
 
 /**
- * Choose the outgoing reply. A possible effect (any executed non-read-only
- * tool) always preserves the model reply so an effect is never hidden. With
- * nothing executed: a violated choreography or an unresolved stock failure is
- * replaced by the truthful fallback, and an evaluated-but-declined recovery
- * gate gets the specific clarification instead of the retry-oriented text.
+ * Choose the outgoing reply.
+ *
+ * A possible effect (any executed non-read-only tool) ALWAYS preserves the
+ * model reply verbatim, so an effect is never hidden. This includes an empty
+ * `result.text`; masking an executed or ambiguous write with stock copy is a
+ * worse outcome than an empty reply, so the empty-string limitation is
+ * deliberate and documented rather than silently "fixed".
+ *
+ * With nothing executed, the current-turn trusted stock projection wins when
+ * a stock read was attempted at all; otherwise the conservative generic
+ * fallback covers a residual unresolved failure, and a clean read-free run
+ * keeps ordinary model behavior.
  */
-function recoveryReply(
+function selectReply(
   fallback: string,
   guard: InventoryEvidenceGuard,
-  recovery: CatalogStockRecoveryRun,
+  evidence: StockReadEvidence,
 ): string {
   if (guard.hasExecutedMutation()) return fallback;
-  if (recovery.failed) return INVENTORY_UNCONFIRMED_REPLY;
-  if (recovery.requiresClarification) return INVENTORY_CLARIFICATION_REPLY;
+  const projected = evidence.projectStockFacts();
+  if (projected !== null) return projected;
   if (guard.hasUnresolvedStockFailure()) return INVENTORY_UNCONFIRMED_REPLY;
   return fallback;
 }
 
-/** Map one completed SDK step into the guard's SDK-agnostic evidence shape. */
-function extractInventoryCalls(step: unknown): InventoryCallEvidence[] {
-  const content = asRecord(step)?.content;
-  if (!Array.isArray(content)) return [];
-  const outcomes = new Map<
-    string,
-    { state: InventoryCallState; output?: unknown }
-  >();
-  const calls: InventoryCallEvidence[] = [];
+/** Map adapter call evidence into the ledger's completion shape. */
+function admittedCalls(
+  calls: readonly InventoryCallEvidence[],
+): AdmittedToolCall[] {
+  return calls.map((call) => ({
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    input: call.input,
+    outcome:
+      call.state === 'result'
+        ? 'result'
+        : call.state === 'error'
+          ? 'error'
+          : call.state === 'denied'
+            ? 'denied'
+            : 'unaccounted',
+    // The normalized SDK completion terminal travels with the call so the
+    // ledger can cross-check it against the private receipt. The property is
+    // always present on adapter-mapped calls, so a result carrying an
+    // `undefined` terminal is a present-but-unusable value, never a bypass.
+    output: call.output,
+  }));
+}
+
+/**
+ * Downgrade every SDK `result` terminal that private authority cannot
+ * corroborate. A `checkStock` result may clear the conservative guard ONLY
+ * when the ledger already admitted a CURRENT-step verified fact for the exact
+ * requested subject; every other result becomes `unaccounted` (never a
+ * fabricated backend error) while keeping its id/input, so it still revokes
+ * the old subject. Non-stock calls pass through untouched, so a possible
+ * effect is never hidden or downgraded.
+ */
+function guardCallsForStep(
+  calls: readonly InventoryCallEvidence[],
+  evidence: StockReadEvidence,
+  step: number | null,
+): InventoryCallEvidence[] {
+  return calls.map((call) => {
+    if (call.toolName !== 'checkStock' || call.state !== 'result') return call;
+    if (step !== null && evidence.hasCurrentVerifiedSubject(call.input, step)) {
+      return call;
+    }
+    return { ...call, state: 'unaccounted' as const, output: undefined };
+  });
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * The one narrow RESTOCK exception: allow `requestHumanAssistance` with
+ * `kind: 'out_of_stock'` through the unresolved-read denial ONLY when its
+ * parsed digest exactly matches a prior-completed ledger shortage for the
+ * same productId/variantId and the backend product name. It grants no write;
+ * the tool's own fresh preflight, reservation and idempotency stay final.
+ */
+function matchesPriorShortage(
+  toolCall: unknown,
+  evidence: StockReadEvidence,
+  step: number,
+): boolean {
+  const record = asRecord(toolCall);
+  if (record?.toolName !== 'requestHumanAssistance') return false;
+  const input = asRecord(record.input);
+  if (input?.kind !== 'out_of_stock') return false;
+  const digest = asRecord(input.digest);
+  if (digest === null) return false;
+  if (!isNonEmptyString(digest.productId)) return false;
+  let variantId: string | null = null;
+  const rawVariant = digest.variantId;
+  if (rawVariant !== undefined && rawVariant !== null) {
+    if (!isNonEmptyString(rawVariant)) return false;
+    variantId = rawVariant;
+  }
+  if (!isNonEmptyString(digest.name)) return false;
+  const subject: StockReadSubject = { productId: digest.productId, variantId };
+  const shortage = evidence.getLatestVerifiedShortage(subject, step);
+  return shortage !== null && shortage.productName === digest.name;
+}
+
+/**
+ * Frozen per-step frame carried in the SDK `runtimeContext`. It is independent
+ * of any tool registration, so the render-slot protection holds even when
+ * `checkStock` is absent from the run's tool set. The installed SDK replaces
+ * `runtimeContext` with the value `prepareStep` returns before it resolves
+ * this step's approvals (ai 7 `generate-text.ts`).
+ */
+interface StockStepFrame {
+  readonly kind: 'stock-read-step';
+  readonly serverTurnId: string;
+  readonly step: number;
+}
+
+function createStockStepFrame(
+  serverTurnId: string,
+  step: number,
+): StockStepFrame {
+  return Object.freeze({ kind: 'stock-read-step', serverTurnId, step });
+}
+
+/** Read the authentic step from the frozen frame, or `null` when malformed. */
+function stockStepFrom(runtimeContext: unknown): number | null {
+  const frame = asRecord(runtimeContext);
+  if (frame === null || frame.kind !== 'stock-read-step') return null;
+  const step = frame.step;
+  return typeof step === 'number' && Number.isSafeInteger(step) && step >= 0
+    ? step
+    : null;
+}
+
+/**
+ * Clone the per-step toolsContext, preserving every existing entry, and bind
+ * an immutable observer for `checkStock`. The observer's `recordExecution` is
+ * an arrow so the S3b binder cannot steal `this` from the evidence instance.
+ */
+function withStockObserver(
+  toolsContext: unknown,
+  observer: StockReadExecutionObserver,
+  hasCheckStock: boolean,
+): Record<string, unknown> {
+  const base = asRecord(toolsContext);
+  const clone: Record<string, unknown> = base === null ? {} : { ...base };
+  if (hasCheckStock) {
+    const existing = asRecord(clone['checkStock']) ?? {};
+    clone['checkStock'] = { ...existing, stockReadObserver: observer };
+  }
+  return clone;
+}
+
+/** One parsed tool call of a completed step, from the authoritative surface. */
+interface StepCallInstance {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+  invalid: boolean;
+  dynamic: boolean;
+  providerExecuted: boolean;
+}
+
+/** One terminal record: an executed result/error or a refusal. */
+interface StepCallTerminal {
+  state: 'result' | 'error' | 'denied';
+  output?: unknown;
+  toolName: unknown;
+  input: unknown;
+}
+
+/** Observation bound mirrored from the diagnostic observer (16 entries). */
+const MAX_STEP_CALLS = 16;
+
+function readContentCalls(content: unknown[]): {
+  byId: Map<string, Array<{ toolName: string; input: unknown }>>;
+  order: string[];
+} {
+  const byId = new Map<string, Array<{ toolName: string; input: unknown }>>();
+  const order: string[] = [];
   for (const part of content) {
-    const record = asRecord(part);
-    if (record === null) continue;
-    if (record.type === 'tool-call') {
-      const toolCallId = record.toolCallId;
-      const toolName = record.toolName;
-      if (typeof toolCallId === 'string' && typeof toolName === 'string') {
-        calls.push({
-          toolCallId,
-          toolName,
-          input: record.input,
-          state: 'unaccounted',
-        });
-      }
-    } else if (record.type === 'tool-result') {
-      const toolCallId = record.toolCallId;
-      if (typeof toolCallId === 'string') {
-        outcomes.set(toolCallId, { state: 'result', output: record.output });
-      }
-    } else if (record.type === 'tool-error') {
-      const toolCallId = record.toolCallId;
-      if (typeof toolCallId === 'string') {
-        outcomes.set(toolCallId, { state: 'error' });
-      }
-    } else if (
-      record.type === 'tool-approval-response' &&
-      record.approved === false
-    ) {
-      const toolCallId = asRecord(record.toolCall)?.toolCallId;
-      if (typeof toolCallId === 'string') {
-        outcomes.set(toolCallId, { state: 'denied' });
-      }
+    const entry = asRecord(part);
+    if (entry === null || entry.type !== 'tool-call') continue;
+    const toolCallId = entry.toolCallId;
+    if (typeof toolCallId !== 'string' || toolCallId.length === 0) continue;
+    const value = {
+      toolName: typeof entry.toolName === 'string' ? entry.toolName : '',
+      input: entry.input,
+    };
+    const list = byId.get(toolCallId);
+    if (list === undefined) {
+      byId.set(toolCallId, [value]);
+      order.push(toolCallId);
+    } else {
+      list.push(value);
     }
   }
-  return calls.map((call) => {
-    const outcome = outcomes.get(call.toolCallId);
-    return outcome === undefined ? call : { ...call, ...outcome };
-  });
+  return { byId, order };
+}
+
+function readContentTerminals(
+  content: unknown[],
+): Map<string, StepCallTerminal[]> {
+  const terminals = new Map<string, StepCallTerminal[]>();
+  const push = (id: string, terminal: StepCallTerminal) => {
+    const list = terminals.get(id);
+    if (list === undefined) terminals.set(id, [terminal]);
+    else list.push(terminal);
+  };
+  for (const part of content) {
+    const entry = asRecord(part);
+    if (entry === null) continue;
+    if (entry.type === 'tool-result' || entry.type === 'tool-error') {
+      const id = entry.toolCallId;
+      if (typeof id !== 'string' || id.length === 0) continue;
+      push(id, {
+        state: entry.type === 'tool-result' ? 'result' : 'error',
+        output: entry.type === 'tool-result' ? entry.output : undefined,
+        toolName: entry.toolName,
+        input: entry.input,
+      });
+      continue;
+    }
+    if (entry.type === 'tool-approval-response' && entry.approved === false) {
+      const id = asRecord(entry.toolCall)?.toolCallId;
+      if (typeof id !== 'string' || id.length === 0) continue;
+      push(id, { state: 'denied', toolName: undefined, input: undefined });
+    }
+  }
+  return terminals;
+}
+
+/**
+ * Correlate one parsed call with exactly one matching content call and exactly
+ * one matching terminal. Any ambiguity rejects the call as `unaccounted` (never
+ * a fabricated error), so a malformed completion can only revoke, never verify.
+ */
+function correlateInstance(
+  instance: StepCallInstance,
+  contentCalls: Map<string, Array<{ toolName: string; input: unknown }>>,
+  terminals: Map<string, StepCallTerminal[]>,
+): InventoryCallEvidence {
+  const base = {
+    toolCallId: instance.toolCallId,
+    toolName: instance.toolName,
+    input: instance.input,
+  };
+  if (instance.invalid || instance.dynamic || instance.providerExecuted) {
+    return { ...base, state: 'unaccounted' };
+  }
+  const contentList = contentCalls.get(instance.toolCallId);
+  if (contentList === undefined || contentList.length !== 1) {
+    // A call absent from the captured content, or duplicated there, cannot be
+    // reconciled to a single call surface. Count it, but never verify it.
+    return { ...base, state: 'unaccounted' };
+  }
+  const contentCall = contentList[0];
+  if (contentCall.toolName !== instance.toolName) {
+    return { ...base, state: 'unaccounted' };
+  }
+  if (!callInputsMatch(contentCall.input, instance.input)) {
+    return { ...base, state: 'unaccounted' };
+  }
+  const terminalList = terminals.get(instance.toolCallId);
+  if (terminalList === undefined || terminalList.length !== 1) {
+    return { ...base, state: 'unaccounted' };
+  }
+  const terminal = terminalList[0];
+  if (
+    typeof terminal.toolName === 'string' &&
+    terminal.toolName !== instance.toolName
+  ) {
+    return { ...base, state: 'unaccounted' };
+  }
+  if (
+    terminal.input !== undefined &&
+    !callInputsMatch(terminal.input, instance.input)
+  ) {
+    return { ...base, state: 'unaccounted' };
+  }
+  if (terminal.state === 'denied') return { ...base, state: 'denied' };
+  if (terminal.state === 'error') return { ...base, state: 'error' };
+  return { ...base, state: 'result', output: terminal.output };
+}
+
+/**
+ * Strictly correlate one completed SDK step into the guard/ledger call shape.
+ *
+ * The parsed `step.toolCalls` surface is authoritative; content tool-call
+ * parts, and every content-only or terminal-only id, are cross-checked against
+ * it so no call id from ANY surface is silently dropped. The SDK derives
+ * `step.toolCalls` from the same content it hands to this adapter, so a genuine
+ * step reconciles exactly and a crafted one fails closed.
+ */
+function correlateStepCalls(step: unknown): InventoryCallEvidence[] {
+  try {
+    const record = asRecord(step);
+    if (record === null) return [];
+    const instances: StepCallInstance[] = [];
+    const rawToolCalls = record.toolCalls;
+    if (Array.isArray(rawToolCalls)) {
+      // Bound the read exactly like the diagnostic observer: never touch a
+      // metadata index beyond the accepted window. A step that exceeds the
+      // bound is treated conservatively as a possible effect.
+      const limit = Math.min(rawToolCalls.length, MAX_STEP_CALLS);
+      for (let index = 0; index < limit; index += 1) {
+        const call = asRecord(rawToolCalls[index]);
+        if (call === null) continue;
+        const toolCallId = call.toolCallId;
+        const toolName = call.toolName;
+        if (typeof toolCallId !== 'string' || toolCallId.length === 0) continue;
+        if (typeof toolName !== 'string' || toolName.length === 0) continue;
+        instances.push({
+          toolCallId,
+          toolName,
+          input: call.input,
+          invalid: call.invalid === true,
+          dynamic: call.dynamic === true,
+          providerExecuted: call.providerExecuted === true,
+        });
+      }
+      if (rawToolCalls.length > MAX_STEP_CALLS) {
+        instances.push({
+          toolCallId: 'unobserved-overflow',
+          toolName: 'unobserved',
+          input: undefined,
+          invalid: true,
+          dynamic: false,
+          providerExecuted: false,
+        });
+      }
+    }
+
+    const rawContent = record.content;
+    const contentArgs = Array.isArray(rawContent) ? rawContent : [];
+    const contentCalls = readContentCalls(contentArgs);
+    const terminals = readContentTerminals(contentArgs);
+
+    const calls: InventoryCallEvidence[] = [];
+    const accounted = new Set<string>();
+    for (const instance of instances) {
+      accounted.add(instance.toolCallId);
+      calls.push(correlateInstance(instance, contentCalls.byId, terminals));
+    }
+    const foreign = new Set<string>();
+    for (const id of contentCalls.order) {
+      if (accounted.has(id) || foreign.has(id)) continue;
+      foreign.add(id);
+      const first = contentCalls.byId.get(id)?.[0];
+      calls.push({
+        toolCallId: id,
+        toolName: first?.toolName ?? '',
+        input: first?.input,
+        state: 'unaccounted',
+      });
+    }
+    for (const [id, list] of terminals) {
+      if (accounted.has(id) || foreign.has(id)) continue;
+      foreign.add(id);
+      const first = list[0];
+      calls.push({
+        toolCallId: id,
+        toolName: typeof first?.toolName === 'string' ? first.toolName : '',
+        input: first?.input,
+        state: 'unaccounted',
+      });
+    }
+    return calls;
+  } catch {
+    // A hostile or malformed step never throws into the SDK's step callback.
+    return [];
+  }
 }
 
 /**
@@ -341,53 +716,20 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     }
     const diagnostic = catalogDiagnostic(this.logger);
     const guard = new InventoryEvidenceGuard();
+    const serverTurnId = randomUUID();
+    const evidence = new StockReadEvidence(serverTurnId);
     const separation = createInventorySeparationGate(() =>
       guard.hasUnresolvedStockFailure(),
     );
     const nonMutatingActiveTools = Object.keys(sourceTools).filter(
       isNonMutatingToolName,
     );
+    const hasCheckStock = 'checkStock' in sourceTools;
+    // The last configured slot is reserved for a render-only reply. No
+    // dynamic budget extension exists, so this is the only place the caller's
+    // configured cap is interpreted.
+    const finalSlot = Math.max(0, this.maxSteps - 1);
 
-    // Conservative, one-shot read-only stock recovery. The selector reads the
-    // current authentic text, the retained history and the validated snapshot;
-    // it only produces a trusted target for an unambiguous product. The
-    // forced step wraps the real tool so the server-selected input executes
-    // regardless of the model's arguments.
-    const recovery = new CatalogStockRecoveryRun({
-      checkStockAvailable: executableCheckStock(sourceTools) !== null,
-      select: () =>
-        selectCatalogStockRecovery({
-          text: input.text,
-          history: input.history,
-          snapshot: catalogSession?.snapshot() ?? null,
-          // Exact copy of the clarification the bot just sent, used only as a
-          // delimiter so a strict customer answer can authorize the retry.
-          clarificationText: INVENTORY_CLARIFICATION_REPLY,
-        }),
-      snapshotAvailable: () => (catalogSession?.snapshot() ?? null) !== null,
-    });
-    let forcedTarget: CatalogStockRecoveryTarget | null = null;
-    let forcedUsed = false;
-    const checkStock = executableCheckStock(sourceTools);
-    const tools =
-      checkStock === null
-        ? (sourceTools as never)
-        : ({
-            ...sourceTools,
-            checkStock: {
-              ...checkStock.definition,
-              execute: (modelInput: unknown, options: unknown) => {
-                if (forcedTarget === null)
-                  return checkStock.execute(modelInput, options);
-                if (forcedUsed) return Promise.resolve(CATALOG_RECOVERY);
-                forcedUsed = true;
-                return checkStock.execute(
-                  catalogStockRecoveryInput(forcedTarget),
-                  options,
-                );
-              },
-            },
-          } as never);
     let result: Awaited<ReturnType<GenerateTextFn>>;
     try {
       result = await this.generateTextFn({
@@ -402,64 +744,113 @@ export class VercelAiLlmAgent implements LlmAgentPort {
             }
           : { system: input.systemPrompt }),
         messages,
-        tools,
+        // The caller's tool set is forwarded byte-identically. No wrapper
+        // rewrites arguments, so a failed read can never become another
+        // product's read.
+        tools: sourceTools as never,
         toolsContext,
-        stopWhen: (options: { steps?: ReadonlyArray<unknown> }) => {
-          // A violated recovery choreography stops immediately; otherwise the
-          // ordinary cap applies, extended only while forced recovery steps
-          // are outstanding.
-          if (recovery.failed) return true;
-          const completed = Array.isArray(options?.steps)
-            ? options.steps.length
-            : 0;
-          return recovery.extendsBudget
-            ? completed >= this.maxSteps + RECOVERY_EXTRA_STEPS
-            : completed >= this.maxSteps;
-        },
+        // The caller's configured cap is honored exactly.
+        stopWhen: stepCountIs(this.maxSteps),
         // Batch metadata is captured BEFORE any approval/execution and the
         // generic approval runs against it (the SDK never shows siblings).
         onLanguageModelCallEnd: (event: unknown) => separation.capture(event),
-        toolApproval: (options: unknown) => {
-          const toolCall = asRecord(options)?.toolCall;
-          if (recovery.deniesExecution(asRecord(toolCall)?.toolName)) {
-            return { type: 'denied' as const, reason: RECOVERY_LOCK_REASON };
-          }
-          return separation.approve(toolCall) === 'denied'
-            ? { type: 'denied' as const, reason: STOCK_FIRST_DENIAL_REASON }
-            : { type: 'not-applicable' as const };
-        },
-        // While a stock failure is unresolved, hide mutating tools from the
-        // model; a verified same-subject recovery restores the full set.
-        // A forced recovery step instead restricts to `checkStock`, then to no
-        // tools at all for the final render.
-        prepareStep: () => {
-          const directive = recovery.nextDirective();
-          if (directive.kind === 'force-stock') {
-            forcedTarget = directive.target;
-            forcedUsed = false;
+        toolApproval: (options: ToolApprovalOptions) => {
+          const toolCall = options.toolCall;
+          // The authentic step is read from the frozen per-step frame the SDK
+          // carries in `runtimeContext`. There is no mutable counter and no
+          // fallback: a missing or malformed frame fails closed.
+          const step = stockStepFrom(options.runtimeContext);
+          if (step === null) {
             return {
-              activeTools: ['checkStock'],
-              toolChoice: { type: 'tool' as const, toolName: 'checkStock' },
+              type: 'denied' as const,
+              reason: STOCK_CONTEXT_DENIAL_REASON,
             };
           }
-          if (
-            directive.kind === 'force-final' ||
-            directive.kind === 'fail-closed'
-          ) {
-            forcedTarget = null;
-            return { activeTools: [] as string[], toolChoice: 'none' as const };
+          // The final configured slot is render-only: even a provider that
+          // ignores `activeTools`/`toolChoice` cannot execute an emitted call.
+          if (step >= finalSlot) {
+            return {
+              type: 'denied' as const,
+              reason: FINAL_RENDER_DENIAL_REASON,
+            };
           }
-          return guard.hasUnresolvedStockFailure()
-            ? { activeTools: nonMutatingActiveTools }
-            : undefined;
+          if (separation.approve(toolCall) !== 'denied') {
+            return { type: 'not-applicable' as const };
+          }
+          // The same-batch checkStock sibling rule stays absolute. Only the
+          // residual unresolved-read denial is narrowed, and only for an
+          // exactly matching prior shortage.
+          if (
+            separation.captured(toolCall) &&
+            !separation.hasStockSibling(toolCall) &&
+            matchesPriorShortage(toolCall, evidence, step)
+          ) {
+            return { type: 'not-applicable' as const };
+          }
+          return { type: 'denied' as const, reason: STOCK_FIRST_DENIAL_REASON };
+        },
+        prepareStep: (options: PrepareStepOptions) => {
+          const frame = createStockStepFrame(serverTurnId, options.stepNumber);
+          // A fresh immutable observer per step; the arrow keeps the private
+          // evidence `this` even when the S3b tool binder rebinds the function.
+          const observer: StockReadExecutionObserver = {
+            serverTurnId,
+            step: options.stepNumber,
+            recordExecution: (receipt) => evidence.recordExecution(receipt),
+          };
+          Object.freeze(observer);
+          const stepToolsContext = withStockObserver(
+            options.toolsContext,
+            observer,
+            hasCheckStock,
+          );
+          if (options.stepNumber >= finalSlot) {
+            return {
+              runtimeContext: frame,
+              toolsContext: stepToolsContext,
+              activeTools: [] as string[],
+              toolChoice: 'none' as const,
+            };
+          }
+          // While a stock failure is unresolved, keep mutating tools hidden
+          // from the presentation. The single RESTOCK tool becomes visible
+          // only when a prior verified shortage exists, and the approval gate
+          // still denies any non-matching call.
+          if (guard.hasUnresolvedStockFailure()) {
+            const visible = new Set(nonMutatingActiveTools);
+            if (
+              'requestHumanAssistance' in sourceTools &&
+              evidence.hasVerifiedShortage()
+            ) {
+              visible.add('requestHumanAssistance');
+            }
+            return {
+              runtimeContext: frame,
+              toolsContext: stepToolsContext,
+              activeTools: [...visible],
+            };
+          }
+          return { runtimeContext: frame, toolsContext: stepToolsContext };
         },
         onStepFinish: (step: unknown) => {
-          // The recovery controller validates the forced step and substitutes
-          // the effective input the R2 guard must account for.
-          const outcome = recovery.completeStep(extractInventoryCalls(step));
-          forcedTarget = null;
-          forcedUsed = false;
-          guard.recordStep(outcome.calls);
+          // One strict correlation feeds BOTH the conservative guard and the
+          // private ledger, so a malformed completion cannot clear one while
+          // being rejected by the other.
+          const calls = correlateStepCalls(step);
+          const rawStep = asRecord(step)?.stepNumber;
+          const stepNumber =
+            typeof rawStep === 'number' &&
+            Number.isSafeInteger(rawStep) &&
+            rawStep >= 0
+              ? rawStep
+              : null;
+          // Admit the private receipts BEFORE the guard reads them: a stock
+          // result can then clear the unresolved failure only when private
+          // authority corroborates it at THIS step.
+          if (stepNumber !== null) {
+            evidence.admitCompletedStep(stepNumber, admittedCalls(calls));
+          }
+          guard.recordStep(guardCallsForStep(calls, evidence, stepNumber));
           diagnostic.onStepFinish(step as { toolCalls: unknown });
         },
         onToolExecutionEnd: diagnostic.onToolExecutionEnd,
@@ -475,13 +866,11 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       completionTokens: result.usage?.outputTokens ?? 0,
     };
 
-    // Conservative reply override: an unresolved stock failure (or a violated
-    // recovery choreography) with no earlier executed mutation is replaced.
-    // A truthful clarification replaces the retry-oriented message when the
-    // recovery gate was evaluated and declined. Any mutating execution (even
-    // an ambiguous error return) preserves the model reply to avoid hiding
-    // effects.
-    const reply = recoveryReply(result.text, guard, recovery);
+    // Conservative reply override: any executed write preserves the model
+    // reply verbatim (even an empty string); otherwise the current-turn
+    // trusted stock projection wins, with the generic fallback only as a
+    // residual guard.
+    const reply = selectReply(result.text, guard, evidence);
 
     return {
       reply,

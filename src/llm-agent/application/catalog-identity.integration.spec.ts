@@ -1,3 +1,5 @@
+import { generateText } from 'ai';
+import { MockLanguageModelV4 } from 'ai/test';
 import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { AgentRunner } from './agent-runner.service';
 import { CostGuardService } from './cost-guard.service';
@@ -88,6 +90,91 @@ function fixture(historyTurns = 4) {
   );
   return { store, runner, steps, getStock, searchCatalog, intakes, coordinate };
 }
+type ToolStep = Array<{
+  type: 'tool-call';
+  toolCallId: string;
+  toolName: string;
+  input: string;
+}>;
+type SdkStep = ToolStep | string;
+
+const sdkUsage = {
+  inputTokens: {
+    total: 1,
+    noCache: 1,
+    cacheRead: undefined,
+    cacheWrite: undefined,
+  },
+  outputTokens: { total: 1, text: 1, reasoning: undefined },
+};
+
+const sdkToolStep = (
+  toolCallId: string,
+  toolName: string,
+  input: Record<string, unknown>,
+): ToolStep => [
+  {
+    type: 'tool-call',
+    toolCallId,
+    toolName,
+    input: JSON.stringify(input),
+  },
+];
+
+/**
+ * Reuse the real InMemoryConversationStore / AgentRunner / tool factories and
+ * backend client mocks, but inject the ACTUAL AI SDK (`generateText`) plus a
+ * scripted MockLanguageModelV4. This exercises the genuine native tool loop
+ * and the runner's real read/write path instead of manually executing tools
+ * and fabricating assistant history.
+ */
+function sdkFixture(
+  steps: SdkStep[],
+  catalog: readonly unknown[],
+  historyTurns = 10,
+) {
+  const store = new InMemoryConversationStore();
+  const getStock = jest.fn().mockResolvedValue(catalog[0]);
+  const searchCatalog = jest.fn().mockResolvedValue(catalog);
+  const deps = {
+    chatbotApi: { getStock, searchCatalog },
+    cashierUserId: productId,
+    humanHandoffService: { create: jest.fn() },
+    restock: { enabled: false },
+  } as unknown as ToolDeps;
+  const tools = {
+    searchCatalog: makeSearchCatalogTool(deps),
+    checkStock: makeCheckStockTool(deps),
+  };
+  const model = new MockLanguageModelV4({
+    doGenerate: steps.map((step) =>
+      typeof step === 'string'
+        ? {
+            content: [{ type: 'text' as const, text: step }],
+            finishReason: { unified: 'stop', raw: undefined },
+            usage: sdkUsage,
+            warnings: [],
+          }
+        : {
+            content: step,
+            finishReason: { unified: 'tool-calls', raw: undefined },
+            usage: sdkUsage,
+            warnings: [],
+          },
+    ),
+  } as never);
+  const generator: GenerateTextFn = (input) =>
+    generateText({ ...input, model });
+  const runner = AgentRunner.forTest(
+    store,
+    new VercelAiLlmAgent(generator, 'offline', 4),
+    { getTools: () => tools },
+    new CostGuardService(1000000),
+    { systemPrompt: 'BOOT', historyTurns, idleTimeoutMs: 1000 },
+  );
+  return { store, runner, getStock, searchCatalog, model, catalog };
+}
+
 const event = {
   senderId: 'sender',
   receivingPhoneNumberId: '12345',
@@ -300,5 +387,146 @@ describe('catalog identity through the real runner, adapter and tools', () => {
     expect((await f.store.get('sender'))!.data.messages).toEqual([
       { role: 'user', content: 'winning concurrent turn' },
     ]);
+  });
+
+  it('persists one immutable catalog identity across two real runner turns', async () => {
+    const f = fixture();
+    // ONE frozen catalog/search DTO, reused on both turns: no variant-count
+    // trick between turns. This proves runner persistence only; the SDK-level
+    // stock veto itself is covered in the infrastructure spec.
+    const immutableCatalog = Object.freeze([
+      Object.freeze({
+        productId,
+        name: 'Medicine 400 mg',
+        variants: Object.freeze([]),
+        stock: Object.freeze({ status: 'out_of_stock', quantity: 0 }),
+      }),
+    ]);
+    f.searchCatalog.mockResolvedValue(immutableCatalog);
+    f.steps.push(async (call) => {
+      await call('searchCatalog', { q: 'Medicine', limit: 20 });
+      expect(await call('checkStock', { productId })).toMatchObject({
+        ok: true,
+      });
+    });
+    await f.runner.handle({
+      senderId: 'sender',
+      text: '¿Tienen Medicine 400 mg?',
+    });
+    expect(
+      (await f.store.get('sender'))!.data.catalogReferences,
+    ).not.toBeNull();
+    expect(Object.isFrozen(immutableCatalog[0])).toBe(true);
+
+    f.steps.push(async (call, invocation) => {
+      // The second turn receives the text the runner actually persisted.
+      expect(invocation.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: 'user',
+            content: '¿Tienen Medicine 400 mg?',
+          }),
+        ]),
+      );
+      await call('searchCatalog', { q: 'Medicine', limit: 20 });
+      expect(await call('checkStock', { productId })).toMatchObject({
+        ok: true,
+      });
+    });
+    await f.runner.handle({ senderId: 'sender', text: '¿Y el precio?' });
+
+    expect(f.searchCatalog).toHaveBeenCalledTimes(2);
+    expect(await f.searchCatalog.mock.results[0].value).toBe(immutableCatalog);
+    expect(await f.searchCatalog.mock.results[1].value).toBe(immutableCatalog);
+    expect(f.getStock).toHaveBeenCalledTimes(2);
+    expect((await f.store.get('sender'))!.data.messages).toHaveLength(4);
+  });
+
+  // S3c1 genuine native-loop integration. Native bad A -> search B -> the
+  // model's OWN explicit check B, driven by the REAL generateText + a scripted
+  // MockLanguageModelV4 through the real AgentRunner. The frozen DTO is reused
+  // across both runs. Today the unresolved A globally vetoes the verified B
+  // answer, so the persisted assistant turn is the generic fallback.
+  // S3c2 MUST convert this to an ordinary passing test.
+  it('grounds a verified shortage through the real runner and SDK despite a failed subject (S3c1 integration)', async () => {
+    const frozenCatalog = Object.freeze([
+      Object.freeze({
+        productId,
+        name: 'Ibuprofeno de 400 mg',
+        variants: Object.freeze([]),
+        stock: Object.freeze({ status: 'out_of_stock', quantity: 0 }),
+      }),
+    ]);
+    const f = sdkFixture(
+      [
+        // Turn 1: bad A, fresh search B, then the model's OWN check B.
+        sdkToolStep('fail', 'checkStock', { productId: otherId }),
+        sdkToolStep('search', 'searchCatalog', {
+          q: 'Ibuprofeno',
+          limit: 20,
+        }),
+        sdkToolStep('check-b', 'checkStock', { productId }),
+        'Déjame confirmarlo de nuevo.',
+        // Turn 2 re-searches the SAME frozen DTO.
+        sdkToolStep('search-2', 'searchCatalog', {
+          q: 'Ibuprofeno',
+          limit: 20,
+        }),
+        sdkToolStep('check-2', 'checkStock', { productId }),
+        'Sí, sigue agotado.',
+      ],
+      frozenCatalog,
+    );
+
+    const first = await f.runner.handle({
+      senderId: 'sender',
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+    });
+
+    // Real runner write: the persisted assistant turn is exactly the reply
+    // the real SDK produced, never fabricated history.
+    const persisted = (await f.store.get('sender'))!.data.messages;
+    expect(persisted).toEqual([
+      {
+        role: 'user',
+        content: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      },
+      { role: 'assistant', content: first.reply },
+    ]);
+
+    await f.runner.handle({
+      senderId: 'sender',
+      text: '¿Me lo confirmas de nuevo?',
+    });
+
+    // Real runner read into the real SDK: the second-turn prompt received
+    // the actual persisted first-turn assistant message.
+    const secondTurnPrompt = f.model.doGenerateCalls.find((entry) =>
+      JSON.stringify(entry.prompt).includes('¿Me lo confirmas de nuevo?'),
+    )!.prompt;
+    expect(secondTurnPrompt).toEqual(
+      expect.arrayContaining([
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: first.reply }],
+        },
+      ]),
+    );
+    // ONE frozen catalog DTO reused across both runs; never mutated.
+    expect(Object.isFrozen(frozenCatalog)).toBe(true);
+    expect(Object.isFrozen(frozenCatalog[0])).toBe(true);
+    expect(await f.searchCatalog.mock.results[0].value).toBe(frozenCatalog);
+    expect(await f.searchCatalog.mock.results[1].value).toBe(frozenCatalog);
+    // Executed backend arguments: identity validation let only the trusted
+    // B reach the backend, once per run.
+    expect(f.getStock).toHaveBeenCalledTimes(2);
+    expect(f.getStock).toHaveBeenNthCalledWith(1, productId);
+    expect(f.getStock).toHaveBeenNthCalledWith(2, productId);
+
+    // DESIRED (fails today): the verified B shortage is grounded by the
+    // trusted backend name instead of the current global-veto fallback.
+    expect(first.reply).toBe(
+      'Por el momento no tenemos existencias de Ibuprofeno de 400 mg.',
+    );
   });
 });

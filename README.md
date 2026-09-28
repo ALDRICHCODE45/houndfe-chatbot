@@ -25,6 +25,17 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Agent step limit
+
+`LLM_MAX_STEPS` defaults to **4**. The last step is reserved for the reply, so this
+budget can fit a failed stock lookup → catalog search → corrected stock lookup →
+reply. It permits that sequence; it does not force the model to continue.
+
+Explicit values are preserved, never raised automatically. Before deployment,
+the operator must update any explicit value of `3` if this four-step sequence is
+required. Compared with the old default, a turn can use one additional model
+call; the existing cost guard remains in place.
+
 ## Project setup
 
 ```bash

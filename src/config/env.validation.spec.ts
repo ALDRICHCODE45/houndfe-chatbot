@@ -224,6 +224,18 @@ describe('envValidationSchema', () => {
       );
     });
 
+    it.each(['1', '3', '4', '6'])(
+      'preserves an explicit LLM_MAX_STEPS=%s',
+      (steps) => {
+        const { error, value } = envValidationSchema.validate({
+          ...validEnv,
+          LLM_MAX_STEPS: steps,
+        }) as { error?: unknown; value: Record<string, unknown> };
+        expect(error).toBeUndefined();
+        expect(value.LLM_MAX_STEPS).toBe(Number(steps));
+      },
+    );
+
     it('rejects non-integer LLM_HISTORY_TURNS', () => {
       const env = { ...validEnv, LLM_HISTORY_TURNS: '3.5' };
       const { error } = envValidationSchema.validate(env, {
@@ -240,7 +252,7 @@ describe('envValidationSchema', () => {
         abortEarly: false,
       }) as { error?: undefined; value: Record<string, unknown> };
       expect(error).toBeUndefined();
-      expect(value.LLM_MAX_STEPS).toBe(3);
+      expect(value.LLM_MAX_STEPS).toBe(4);
       expect(value.LLM_HISTORY_TURNS).toBe(12);
       expect(value.LLM_MONTHLY_TOKEN_CEILING).toBe(8_000_000);
       expect(value.LLM_IDLE_TIMEOUT_MS).toBe(10_800_000);

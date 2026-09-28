@@ -11,13 +11,12 @@ import type { ToolDeps } from '../../sale-flow/application/tool-deps';
 import { openai } from '@ai-sdk/openai';
 import type { LlmRunInput } from '../domain/llm-agent.port';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { UNBOUND_STOCK_REPLY } from '../domain/stock-read-evidence';
 import { composeSaleFlowSystemPrompt } from '../../sale-flow/domain/sale-flow-instructions';
 import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
 import {
   createInventorySeparationGate,
-  INVENTORY_CLARIFICATION_REPLY,
-  INVENTORY_UNCONFIRMED_REPLY,
-  RECOVERY_LOCK_REASON,
+  FINAL_RENDER_DENIAL_REASON,
   STOCK_FIRST_DENIAL_REASON,
   VercelAiLlmAgent,
 } from './vercel-ai-llm-agent';
@@ -383,11 +382,13 @@ describe('real SDK catalog context isolation', () => {
         tools: { checkStock: tool },
         catalogSession,
       }),
-      // R2: the forged checkStock is rejected (catalog_identity_unverified),
-      // so an unresolved stock failure exists with no executed mutation. The
-      // conservative R2 reply override therefore replaces the opaque model
-      // text; the identity/isolation assertions below are unchanged.
-    ).resolves.toMatchObject({ reply: INVENTORY_UNCONFIRMED_REPLY });
+      // R2/S3c2: the forged checkStock is rejected (catalog_identity_unverified)
+      // and stays unbound, while the valid trusted read is projected. The
+      // forged subject never vetoes the verified one; the identity/isolation
+      // assertions below are unchanged.
+    ).resolves.toMatchObject({
+      reply: 'Con gusto le confirmo que Catalog product sí está disponible.',
+    });
     expect(getStock).toHaveBeenCalledTimes(1);
     expect(getStock).toHaveBeenCalledWith(productId);
     expect(JSON.stringify(model.doGenerateCalls[0])).not.toContain(
@@ -1794,7 +1795,9 @@ describe('inventory evidence separation (R2)', () => {
           part.type === 'tool-approval-request' && part.isAutomatic !== true,
       ),
     ).toBe(false);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(result.reply).toBe(
+      'No pude confirmar las existencias de Medicine 400 mg en esta consulta.',
+    );
   });
 
   it('overrides the reply from the first non-authoritative stock result when nothing executed', async () => {
@@ -1810,7 +1813,9 @@ describe('inventory evidence separation (R2)', () => {
       [[toolCall('c1', 'checkStock', JSON.stringify({ productId }))], 'final'],
       session(),
     );
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(result.reply).toBe(
+      'No pude confirmar las existencias de Medicine 400 mg en esta consulta.',
+    );
   });
 
   it('denies an unknown executable tool name in a checkStock batch', async () => {
@@ -1882,10 +1887,13 @@ describe('inventory evidence separation (R2)', () => {
       session(),
     );
     expect(sale.execute).not.toHaveBeenCalled();
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(result.reply).toBe(
+      'No pude confirmar las existencias de Medicine 400 mg en esta consulta.',
+    );
     expect(result.messages.at(-1)).toEqual({
       role: 'assistant',
-      content: INVENTORY_UNCONFIRMED_REPLY,
+      content:
+        'No pude confirmar las existencias de Medicine 400 mg en esta consulta.',
     });
     const restricted = (model.doGenerateCalls[1].tools ?? []).map(
       (definition) => definition.name,
@@ -2037,12 +2045,112 @@ describe('inventory evidence separation (R2)', () => {
         'not-applicable',
       );
     });
+
+    it('reports captured ids and stock siblings for the narrow RESTOCK check', () => {
+      const gate = createInventorySeparationGate();
+      expect(gate.captured({ toolCallId: 'm', toolName: 'createSale' })).toBe(
+        false,
+      );
+      gate.capture({
+        content: [
+          { type: 'tool-call', toolCallId: 'c', toolName: 'checkStock' },
+          { type: 'tool-call', toolCallId: 'm', toolName: 'createSale' },
+        ],
+      });
+      expect(gate.captured({ toolCallId: 'm', toolName: 'createSale' })).toBe(
+        true,
+      );
+      expect(gate.captured({ toolCallId: 'ghost' })).toBe(false);
+      expect(gate.hasStockSibling({ toolCallId: 'm' })).toBe(true);
+      gate.capture({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'r',
+            toolName: 'requestHumanAssistance',
+          },
+        ],
+      });
+      expect(gate.hasStockSibling({ toolCallId: 'r' })).toBe(false);
+    });
+
+    it('requires a unique, exactly matching captured call for the RESTOCK check', () => {
+      const gate = createInventorySeparationGate();
+      const digest = { productId: '00000000-0000-4000-8000-000000000001' };
+      const approval = {
+        toolCallId: 'r',
+        toolName: 'requestHumanAssistance',
+        input: { kind: 'out_of_stock', digest },
+      };
+      // Positive control: a unique, exactly matching capture is accepted.
+      gate.capture({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'r',
+            toolName: 'requestHumanAssistance',
+            input: JSON.stringify(approval.input),
+          },
+        ],
+      });
+      expect(gate.captured(approval)).toBe(true);
+
+      // Duplicate same-id calls are ambiguous, never authoritative.
+      gate.capture({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'r',
+            toolName: 'requestHumanAssistance',
+            input: JSON.stringify(approval.input),
+          },
+          {
+            type: 'tool-call',
+            toolCallId: 'r',
+            toolName: 'requestHumanAssistance',
+            input: JSON.stringify(approval.input),
+          },
+        ],
+      });
+      expect(gate.captured(approval)).toBe(false);
+      expect(gate.approve(approval)).toBe('denied');
+      expect(gate.hasStockSibling(approval)).toBe(true);
+
+      // A cross-named same-id call never matches.
+      gate.capture({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'r',
+            toolName: 'createSale',
+            input: JSON.stringify(approval.input),
+          },
+        ],
+      });
+      expect(gate.captured(approval)).toBe(false);
+      expect(gate.approve(approval)).toBe('denied');
+
+      // Captured metadata that differs from the approval call never matches.
+      gate.capture({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'r',
+            toolName: 'requestHumanAssistance',
+            input: JSON.stringify({ kind: 'other' }),
+          },
+        ],
+      });
+      expect(gate.captured(approval)).toBe(false);
+      expect(gate.approve(approval)).toBe('denied');
+    });
   });
 });
 
-describe('catalog stock recovery through the real SDK', () => {
+describe('native stock loop through the real SDK', () => {
   const productId = '00000000-0000-4000-8000-000000000001';
-  const adversarialId = '00000000-0000-4000-8000-0000000000aa';
+  const otherId = '00000000-0000-4000-8000-0000000000aa';
+  const variantA = '00000000-0000-4000-8000-0000000000f2';
   const usage = {
     inputTokens: {
       total: 1,
@@ -2058,15 +2166,22 @@ describe('catalog stock recovery through the real SDK', () => {
     toolName,
     input,
   });
+  const productName = 'Ibuprofeno de 400 mg';
   const stockResponse = {
     productId,
-    name: 'Ibuprofeno de 400 mg',
+    name: productName,
     stock: { status: 'available', quantity: 7 },
+    variants: [],
+  };
+  const shortageResponse = {
+    productId,
+    name: productName,
+    stock: { status: 'out_of_stock', quantity: 0 },
     variants: [],
   };
   const catalogItem = {
     productId,
-    name: 'Ibuprofeno de 400 mg',
+    name: productName,
     brand: null,
     imageUrl: null,
     description: null,
@@ -2080,39 +2195,25 @@ describe('catalog stock recovery through the real SDK', () => {
     packageInfo: { weightGrams: null, dimensions: null },
     variants: [],
   };
-  // Production incident: prior user asks about ibuprofeno, the assistant asks
-  // whether it should check availability, and the customer answers "Si por
-  // favor".
+  const availableReply = `Con gusto le confirmo que ${productName} sí está disponible.`;
+  const unconfirmedReply = `No pude confirmar las existencias de ${productName} en esta consulta.`;
   const history = [
     { role: 'user' as const, content: 'Buenas tardes, tienen ibuprofeno?' },
     {
       role: 'assistant' as const,
-      content:
-        'Claro. ¿Quieres que revise la disponibilidad de Ibuprofeno de 400 mg?',
+      content: 'Claro. ¿Quieres que revise la disponibilidad?',
     },
-  ];
-  // Production conversation: the bot already repeated its fixed
-  // clarification after the customer named the exact product and dose, and
-  // the customer now repeats the same answer.
-  const clarificationHistory = [
-    ...history,
-    { role: 'user' as const, content: 'si por favor' },
-    { role: 'assistant' as const, content: INVENTORY_CLARIFICATION_REPLY },
-    { role: 'user' as const, content: 'busco ibuprofeno de 400mg' },
-    { role: 'assistant' as const, content: INVENTORY_CLARIFICATION_REPLY },
   ];
 
   function scenario(options: {
     steps: Array<
       Array<{ toolCallId: string; toolName: string; input: string }> | string
     >;
-    text: string;
     maxSteps: number;
     getStock: jest.Mock;
     catalog?: Array<typeof catalogItem>;
-    extraTools?: Record<string, unknown>;
     seedCatalog?: boolean;
-    history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    text?: string;
   }) {
     const searchCatalog = jest
       .fn()
@@ -2125,6 +2226,16 @@ describe('catalog stock recovery through the real SDK', () => {
         execute: jest.fn(async () => ({ ok: true })),
       }),
     };
+    const assistance = {
+      execute: jest.fn(async () => ({ ok: true })),
+      definition: tool({
+        description: 'requestHumanAssistance stub',
+        // Preserve the RESTOCK discriminator and digest so the adapter can
+        // match the call against prior ledger shortages.
+        inputSchema: z.object({ kind: z.string(), digest: z.unknown() }),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
     const tools = {
       checkStock: makeCheckStockTool({
         chatbotApi: { getStock: options.getStock },
@@ -2133,7 +2244,7 @@ describe('catalog stock recovery through the real SDK', () => {
         chatbotApi: { searchCatalog },
       } as unknown as ToolDeps),
       createSale: sale.definition,
-      ...(options.extraTools ?? {}),
+      requestHumanAssistance: assistance.definition,
     };
     const doGenerate = options.steps.map((step) =>
       typeof step === 'string'
@@ -2167,8 +2278,8 @@ describe('catalog stock recovery through the real SDK', () => {
     const run = () =>
       agent.run({
         senderId: 'sender',
-        text: options.text,
-        history: options.history ?? history,
+        text: options.text ?? 'Si por favor',
+        history,
         systemPrompt: 'BOOT',
         tools,
         catalogSession,
@@ -2179,18 +2290,41 @@ describe('catalog stock recovery through the real SDK', () => {
       getStock: options.getStock,
       searchCatalog,
       sale,
+      assistance,
       captured: () => captured!,
     };
   }
 
-  it('recovers the affirmative continuation with exactly one trusted GET', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
+  it('invalidates an earlier verified shortage once a later read for the same subject fails', async () => {
+    const getStock = jest
+      .fn()
+      .mockResolvedValueOnce(shortageResponse)
+      .mockRejectedValueOnce(new UpstreamError('boom', 503));
     const s = scenario({
-      text: 'Si por favor',
       maxSteps: 3,
       getStock,
+      seedCatalog: true,
       steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [call('first', 'checkStock', JSON.stringify({ productId }))],
+        [call('second', 'checkStock', JSON.stringify({ productId }))],
+        'Déjame revisarlo de nuevo.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(2);
+    expect(s.getStock).toHaveBeenNthCalledWith(1, productId);
+    expect(s.getStock).toHaveBeenNthCalledWith(2, productId);
+    expect(result.reply).toBe(unconfirmedReply);
+  });
+
+  it('reserves the final configured slot for the reply and denies every emitted tool', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      maxSteps: 3,
+      getStock,
+      seedCatalog: true,
+      steps: [
+        [call('stock', 'checkStock', JSON.stringify({ productId }))],
         [
           call(
             'search',
@@ -2198,43 +2332,34 @@ describe('catalog stock recovery through the real SDK', () => {
             JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
           ),
         ],
-        // Adversarial model argument: the server-selected input must win.
-        [
-          call(
-            'recover',
-            'checkStock',
-            JSON.stringify({ productId: adversarialId }),
-          ),
-        ],
-        'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
+        // The provider ignores the render-only presentation and emits a write.
+        [call('sale', 'createSale', '{}')],
+        'Sí, disponible.',
       ],
     });
     const result = await s.run();
     expect(s.getStock).toHaveBeenCalledTimes(1);
     expect(s.getStock).toHaveBeenCalledWith(productId);
-    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
     expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    expect(result.reply).toBe(
-      'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
-    );
-    // Failed check, fresh search, forced stock and final render: no extra step.
-    expect(s.model.doGenerateCalls).toHaveLength(4);
+    const content = s.captured().steps[2].content;
+    expect(
+      content.find((part) => part.type === 'tool-approval-response'),
+    ).toMatchObject({
+      approved: false,
+      reason: FINAL_RENDER_DENIAL_REASON,
+    });
+    // Bounded exit: the final slot ends the run.
+    expect(s.model.doGenerateCalls).toHaveLength(3);
+    expect(result.reply).toBe(availableReply);
   });
 
-  it('keeps a divergent failed identity unresolved instead of clearing it blindly', async () => {
+  it('honors the configured step cap and never extends it for a recovery', async () => {
     const getStock = jest.fn().mockResolvedValue(stockResponse);
     const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
+      maxSteps: 2,
       getStock,
       steps: [
-        [
-          call(
-            'fail',
-            'checkStock',
-            JSON.stringify({ productId: adversarialId }),
-          ),
-        ],
+        [call('fail', 'checkStock', JSON.stringify({ productId: otherId }))],
         [
           call(
             'search',
@@ -2243,98 +2368,120 @@ describe('catalog stock recovery through the real SDK', () => {
           ),
         ],
         [call('recover', 'checkStock', JSON.stringify({ productId }))],
-        'Sí, tenemos disponible.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).toHaveBeenCalledTimes(1);
-    expect(s.getStock).toHaveBeenCalledWith(productId);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
-  });
-
-  it('fails closed when the provider ignores the forced stock step', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
-      getStock,
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        'Sí, claro que sí está disponible.',
+        'Sí, disponible.',
       ],
     });
     const result = await s.run();
     expect(s.getStock).not.toHaveBeenCalled();
-    // The forced step was consumed (fail, search, ignored force) and refused.
-    expect(s.model.doGenerateCalls).toHaveLength(3);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(2);
+    expect(result.reply).toBe(UNBOUND_STOCK_REPLY);
   });
 
-  it('denies a mutation emitted during the forced recovery step', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
+  it('admits a matching RESTOCK after a prior verified shortage without granting a write', async () => {
+    const getStock = jest.fn().mockResolvedValue(shortageResponse);
     const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
+      maxSteps: 4,
       getStock,
+      seedCatalog: true,
       steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [call('fail', 'checkStock', JSON.stringify({ productId: otherId }))],
+        [call('short', 'checkStock', JSON.stringify({ productId }))],
         [
           call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+            'restock',
+            'requestHumanAssistance',
+            JSON.stringify({
+              kind: 'out_of_stock',
+              digest: { productId, name: productName },
+            }),
           ),
         ],
-        [
-          call('recover', 'checkStock', JSON.stringify({ productId })),
-          call('sale', 'createSale', '{}'),
-        ],
-        'Sí, disponible.',
+        'Ya quedó registrada su consulta.',
       ],
     });
     const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(productId);
+    expect(s.assistance.definition.execute).toHaveBeenCalledTimes(1);
     expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    expect(s.getStock).toHaveBeenCalledTimes(1);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(result.reply).toBe('Ya quedó registrada su consulta.');
   });
 
-  it('fails closed when the forced stock lookup itself fails', async () => {
-    const getStock = jest
-      .fn()
-      .mockRejectedValue(new UpstreamError('boom', 503));
+  it.each([
+    ['wrong product', { productId: otherId, name: productName }],
+    ['wrong variant', { productId, variantId: variantA, name: productName }],
+    ['wrong name', { productId, name: 'Otro producto' }],
+  ])(
+    'denies a RESTOCK with a %s digest after a prior shortage',
+    async (_, digest) => {
+      const getStock = jest.fn().mockResolvedValue(shortageResponse);
+      const s = scenario({
+        maxSteps: 4,
+        getStock,
+        seedCatalog: true,
+        steps: [
+          [call('fail', 'checkStock', JSON.stringify({ productId: otherId }))],
+          [call('short', 'checkStock', JSON.stringify({ productId }))],
+          [
+            call(
+              'restock',
+              'requestHumanAssistance',
+              JSON.stringify({ kind: 'out_of_stock', digest }),
+            ),
+          ],
+          'texto',
+        ],
+      });
+      await s.run();
+      expect(s.assistance.definition.execute).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not gate an ordinary accepted-request recovery on a prior shortage', async () => {
+    const getStock = jest.fn();
     const s = scenario({
-      text: 'Si por favor',
       maxSteps: 3,
       getStock,
       steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
         [
           call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+            'restock',
+            'requestHumanAssistance',
+            JSON.stringify({
+              kind: 'out_of_stock',
+              digest: { productId, name: productName },
+            }),
           ),
         ],
-        [call('recover', 'checkStock', JSON.stringify({ productId }))],
-        'Sí, disponible.',
+        'texto',
+      ],
+    });
+    await s.run();
+    expect(s.assistance.definition.execute).toHaveBeenCalledTimes(1);
+    expect(getStock).not.toHaveBeenCalled();
+  });
+
+  it('preserves a possible-effect reply verbatim, including empty text', async () => {
+    const getStock = jest.fn().mockResolvedValue(shortageResponse);
+    const s = scenario({
+      maxSteps: 4,
+      getStock,
+      seedCatalog: true,
+      steps: [
+        [call('sale', 'createSale', '{}')],
+        [call('stock', 'checkStock', JSON.stringify({ productId }))],
+        '',
       ],
     });
     const result = await s.run();
-    expect(s.getStock).toHaveBeenCalledTimes(1);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(s.sale.definition.execute).toHaveBeenCalledTimes(1);
+    // The empty reply is the documented preservation boundary, not a defect.
+    expect(result.reply).toBe('');
   });
 
   it('preserves the reply when a prior mutation may have had effects', async () => {
     const getStock = jest.fn().mockResolvedValue(stockResponse);
     const s = scenario({
-      text: 'Si por favor',
       maxSteps: 5,
       getStock,
       steps: [
@@ -2356,40 +2503,10 @@ describe('catalog stock recovery through the real SDK', () => {
     expect(result.reply).toBe('Sí, disponible.');
   });
 
-  it('keeps the ordinary budget and never forges recovery at a low step cap', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 2,
-      getStock,
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        [call('recover', 'checkStock', JSON.stringify({ productId }))],
-        'Sí, disponible.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).not.toHaveBeenCalled();
-    // The ordinary budget of two steps is kept; no forced recovery is added.
-    expect(s.model.doGenerateCalls).toHaveLength(2);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
-  });
-
   it('does not auto-GET from an assistant-only subject even with a prior valid snapshot', async () => {
-    // Old behavior armed a proactive GET on the first prepareStep from the
-    // assistant's own availability question. There is no this-run identity
-    // failure and no fresh search, so nothing may be forced.
     const getStock = jest.fn().mockResolvedValue(stockResponse);
     const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 2,
+      maxSteps: 3,
       getStock,
       seedCatalog: true,
       steps: [
@@ -2409,320 +2526,9 @@ describe('catalog stock recovery through the real SDK', () => {
     expect(s.model.doGenerateCalls).toHaveLength(2);
   });
 
-  it('denies a mutation emitted in the forced final step before it can execute', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
-      getStock,
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        [call('recover', 'checkStock', JSON.stringify({ productId }))],
-        // The final step is contracted as tool-free, but the model ignores it.
-        [call('sale', 'createSale', '{}')],
-        'Sí, disponible.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).toHaveBeenCalledTimes(1);
-    expect(s.getStock).toHaveBeenCalledWith(productId);
-    expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    // Denied BEFORE execution by the hard recovery lock, not merely detected.
-    const content = s.captured().steps[3].content;
-    expect(
-      content.find((part) => part.type === 'tool-approval-response'),
-    ).toMatchObject({ approved: false, reason: RECOVERY_LOCK_REASON });
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
-    // Bounded exit: the failed choreography stops the run immediately.
-    expect(s.model.doGenerateCalls).toHaveLength(4);
-  });
-
-  it('denies an unknown tool emitted in the forced final step', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const mystery = {
-      execute: jest.fn(async () => ({ ok: true })),
-      definition: tool({
-        description: 'listProducts stub',
-        inputSchema: z.object({}),
-        execute: jest.fn(async () => ({ ok: true })),
-      }),
-    };
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
-      getStock,
-      extraTools: { listProducts: mystery.definition },
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        [call('recover', 'checkStock', JSON.stringify({ productId }))],
-        [call('u', 'listProducts', '{}')],
-        'Sí, disponible.',
-      ],
-    });
-    const result = await s.run();
-    expect(mystery.definition.execute).not.toHaveBeenCalled();
-    const content = s.captured().steps[3].content;
-    expect(
-      content.find((part) => part.type === 'tool-approval-response'),
-    ).toMatchObject({ approved: false, reason: RECOVERY_LOCK_REASON });
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
-    expect(s.model.doGenerateCalls).toHaveLength(4);
-  });
-
-  it('executes only one forced stock lookup when the model emits a duplicate', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
-      getStock,
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        [
-          call('r1', 'checkStock', JSON.stringify({ productId })),
-          call('r2', 'checkStock', JSON.stringify({ productId })),
-        ],
-        'Sí, disponible.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).toHaveBeenCalledTimes(1);
-    expect(s.getStock).toHaveBeenCalledWith(productId);
-    // The duplicate is denied pre-execution by the lock, not only deduped.
-    const denied = s
-      .captured()
-      .steps[2].content.filter(
-        (part) => part.type === 'tool-approval-response',
-      );
-    expect(denied).toEqual([
-      expect.objectContaining({
-        approved: false,
-        reason: RECOVERY_LOCK_REASON,
-      }),
-    ]);
-    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
-    expect(s.model.doGenerateCalls).toHaveLength(3);
-  });
-
-  it('asks a clarification when the assistant proposed an unsupported subject, without a GET', async () => {
-    // The fresh search resolves only ibuprofeno, but the assistant offered to
-    // check paracetamol: the customer never affirmed that subject, so nothing
-    // may be forced and the reply must be a truthful clarification.
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
-      getStock,
-      history: [
-        { role: 'user', content: '¿Tienen ibuprofeno?' },
-        {
-          role: 'assistant',
-          content: '¿Quieres que revise disponibilidad de paracetamol?',
-        },
-      ],
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        'Sí, tenemos disponible.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).not.toHaveBeenCalled();
-    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
-    expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
-    expect(s.model.doGenerateCalls).toHaveLength(3);
-  });
-
-  it('asks a truthful clarification instead of a stock claim when the fresh search is ambiguous', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'Si por favor',
-      maxSteps: 3,
-      getStock,
-      catalog: [
-        catalogItem,
-        {
-          ...catalogItem,
-          productId: '00000000-0000-4000-8000-000000000002',
-          name: 'Ibuprofeno de 800 mg',
-        },
-      ],
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        'Encontré varias presentaciones.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).not.toHaveBeenCalled();
-    expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
-    expect(s.model.doGenerateCalls).toHaveLength(3);
-  });
-
-  it('recovers a strict answer to its own clarification with one trusted GET', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'busco ibuprofeno de 400mg',
-      maxSteps: 3,
-      getStock,
-      history: clarificationHistory,
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        // Adversarial model argument: the server-selected input must win.
-        [
-          call(
-            'recover',
-            'checkStock',
-            JSON.stringify({ productId: adversarialId }),
-          ),
-        ],
-        'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).toHaveBeenCalledTimes(1);
-    expect(s.getStock).toHaveBeenCalledWith(productId);
-    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
-    expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    expect(result.reply).toBe(
-      'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
-    );
-    // Failed check, fresh search, forced stock and final render: no extra step.
-    expect(s.model.doGenerateCalls).toHaveLength(4);
-  });
-
-  it('keeps clarifying a wrong-dose answer without a GET', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'busco ibuprofeno de 200mg',
-      maxSteps: 3,
-      getStock,
-      history: clarificationHistory,
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        'Encontré presentaciones distintas.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).not.toHaveBeenCalled();
-    expect(s.sale.definition.execute).not.toHaveBeenCalled();
-    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
-    expect(s.model.doGenerateCalls).toHaveLength(3);
-  });
-
-  it('never turns an unanchored clarification answer into a GET', async () => {
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const s = scenario({
-      text: 'busco ibuprofeno de 400mg',
-      maxSteps: 3,
-      getStock,
-      history: [
-        { role: 'user', content: 'Hola' },
-        { role: 'assistant', content: INVENTORY_CLARIFICATION_REPLY },
-      ],
-      steps: [
-        [call('fail', 'checkStock', JSON.stringify({ productId }))],
-        [
-          call(
-            'search',
-            'searchCatalog',
-            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-          ),
-        ],
-        'Tenemos varias opciones.',
-      ],
-    });
-    const result = await s.run();
-    expect(s.getStock).not.toHaveBeenCalled();
-    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
-    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
-    expect(s.model.doGenerateCalls).toHaveLength(3);
-  });
-
-  it('hands the answer to a real second run through the messages the first run returned', async () => {
-    const variantId20 = '00000000-0000-4000-8000-0000000000f1';
-    const variantId40 = '00000000-0000-4000-8000-0000000000f2';
-    // Representative, non-production variant payload: the first search finds
-    // one product with an ambiguous variant set, so the first run owes a
-    // clarification. The later search resolves the now-unambiguous 400 mg
-    // product, the shape the recovery must trust.
-    const ambiguousCatalog = [
-      {
-        ...catalogItem,
-        name: 'Ibuprofeno de 400 mg',
-        variants: [
-          {
-            variantId: variantId20,
-            name: '400 mg caja con 20 tabletas',
-            option: null,
-            value: null,
-            priceCents: 100,
-          },
-          {
-            variantId: variantId40,
-            name: '400 mg caja con 40 tabletas',
-            option: null,
-            value: null,
-            priceCents: 150,
-          },
-        ],
-      },
-    ];
-    const getStock = jest.fn().mockResolvedValue(stockResponse);
-    const searchCatalog = jest
-      .fn()
-      .mockResolvedValueOnce(ambiguousCatalog)
-      .mockResolvedValue([catalogItem]);
+  it('protects the render-only final slot even when checkStock is not registered', async () => {
+    const searchCatalog = jest.fn().mockResolvedValue([catalogItem]);
     const sale = {
-      execute: jest.fn(async () => ({ ok: true })),
       definition: tool({
         description: 'createSale stub',
         inputSchema: z.object({}),
@@ -2730,102 +2536,1078 @@ describe('catalog stock recovery through the real SDK', () => {
       }),
     };
     const tools = {
-      checkStock: makeCheckStockTool({
-        chatbotApi: { getStock },
-      } as unknown as ToolDeps),
       searchCatalog: makeSearchCatalogTool({
         chatbotApi: { searchCatalog },
       } as unknown as ToolDeps),
       createSale: sale.definition,
     };
-    const toolStep = (toolCallId: string, toolName: string, input: string) => ({
-      content: [{ type: 'tool-call' as const, toolCallId, toolName, input }],
-      finishReason: { unified: 'tool-calls' as const, raw: undefined },
-      usage,
-      warnings: [],
-    });
-    const textStep = (text: string) => ({
-      content: [{ type: 'text' as const, text }],
-      finishReason: { unified: 'stop' as const, raw: undefined },
-      usage,
-      warnings: [],
-    });
-    const model = new MockLanguageModelV4({
-      doGenerate: [
-        // Run 1: identity failure, fresh ambiguous search, then a reply the
-        // recovery overrides with its fixed clarification.
-        toolStep('fail-1', 'checkStock', JSON.stringify({ productId })),
-        toolStep(
-          'search-1',
-          'searchCatalog',
-          JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-        ),
-        textStep('Encontré varias presentaciones.'),
-        // Run 2: the retained evidence no longer resolves identity, so the
-        // first trusted lookup fails; the fresh search resolves the
-        // unambiguous product; the forced step ignores the adversarial model
-        // argument and the final render stays truthful.
-        toolStep('fail-2', 'checkStock', JSON.stringify({ productId })),
-        toolStep(
-          'search-2',
-          'searchCatalog',
-          JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
-        ),
-        toolStep(
-          'recover-2',
-          'checkStock',
-          JSON.stringify({ productId: adversarialId }),
-        ),
-        textStep('Sí, tenemos Ibuprofeno de 400 mg disponible.'),
-      ],
-    });
+    const doGenerate = [
+      {
+        content: [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        finishReason: { unified: 'tool-calls', raw: undefined },
+        usage,
+        warnings: [],
+      },
+      {
+        content: [call('sale', 'createSale', '{}')],
+        finishReason: { unified: 'tool-calls', raw: undefined },
+        usage,
+        warnings: [],
+      },
+    ];
+    const model = new MockLanguageModelV4({ doGenerate } as never);
+    let captured:
+      | { steps: Array<{ content: Array<Record<string, unknown>> }> }
+      | undefined;
     const generate: GenerateTextFn = async (input) => {
       const result = await generateText({ ...input, model });
+      captured = result as unknown as typeof captured;
+      return result;
+    };
+    const agent = new VercelAiLlmAgent(generate, 'unused', 2);
+    await agent.run({
+      senderId: 'sender',
+      text: 'Si por favor',
+      history,
+      systemPrompt: 'BOOT',
+      tools,
+    });
+    expect(sale.definition.execute).not.toHaveBeenCalled();
+    const content = captured!.steps[1].content;
+    expect(
+      content.find((part) => part.type === 'tool-approval-response'),
+    ).toMatchObject({
+      approved: false,
+      reason: FINAL_RENDER_DENIAL_REASON,
+    });
+  });
+
+  it('denies every duplicate same-id call in one real-SDK batch', async () => {
+    const sale = {
+      definition: tool({
+        description: 'createSale stub',
+        inputSchema: z.object({}),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
+    const doGenerate = [
+      {
+        content: [
+          call('dup', 'createSale', '{}'),
+          call('dup', 'createSale', '{}'),
+        ],
+        finishReason: { unified: 'tool-calls', raw: undefined },
+        usage,
+        warnings: [],
+      },
+      {
+        content: [{ type: 'text' as const, text: 'noop' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage,
+        warnings: [],
+      },
+    ];
+    const model = new MockLanguageModelV4({ doGenerate } as never);
+    let captured:
+      | { steps: Array<{ content: Array<Record<string, unknown>> }> }
+      | undefined;
+    const generate: GenerateTextFn = async (input) => {
+      const result = await generateText({ ...input, model });
+      captured = result as unknown as typeof captured;
       return result;
     };
     const agent = new VercelAiLlmAgent(generate, 'unused', 3);
+    await agent.run({
+      senderId: 'sender',
+      text: 'x',
+      history: [],
+      systemPrompt: 'BOOT',
+      tools: { createSale: sale.definition },
+    });
+    expect(sale.definition.execute).not.toHaveBeenCalled();
+    const denials = captured!.steps[0].content.filter(
+      (part) => part.type === 'tool-approval-response',
+    );
+    expect(denials.length).toBeGreaterThanOrEqual(1);
+    for (const denial of denials) {
+      expect(denial).toMatchObject({ approved: false });
+    }
+  });
+});
 
-    // Availability, then the affirmative the assistant asked for. The first run
-    // only owes the fixed clarification because the catalog is still ambiguous.
-    const conversation = [
-      { role: 'user' as const, content: 'Buenas tardes, tienen ibuprofeno?' },
+/**
+ * S3c2 correction: strict per-step correlation. The adapter must derive its
+ * stock evidence from the PARSED call surface (`step.toolCalls`) reconciled
+ * with the captured content and a single matching terminal, never from a
+ * last-wins map keyed only by call id. A malformed, duplicated, mismatched or
+ * provider-only completion must revoke the subject instead of verifying it.
+ *
+ * These cases CALLBACK-INJECT a step into the observed `onStepFinish`; they
+ * are deliberately not production captures. The genuine server receipt is
+ * still recorded through the real observer before the crafted step lands.
+ */
+describe('strict step correlation (S3c2 correction)', () => {
+  const productId = '00000000-0000-4000-8000-000000000001';
+  const otherId = '00000000-0000-4000-8000-0000000000aa';
+  const productName = 'Medicina 400 mg';
+  const verifiedReply = `Con gusto le confirmo que ${productName} sí está disponible.`;
+  const validOutput = {
+    ok: true,
+    productId,
+    name: productName,
+    stock: { status: 'available', quantity: 5 },
+    variants: [],
+  };
+  const callInput = { productId };
+  const subject = {
+    productId,
+    variantId: null,
+    productName,
+    variantName: null,
+  };
+  const unconfirmedReply = `No pude confirmar las existencias de ${productName} en esta consulta.`;
+  type Options = {
+    prepareStep: (options: unknown) => Record<string, unknown>;
+    onStepFinish: (event: unknown) => void;
+    onLanguageModelCallEnd: (event: unknown) => void;
+    toolApproval: (options: unknown) => unknown;
+  };
+  const generate = jest.fn();
+  const agent = new VercelAiLlmAgent(generate, 'test', 6);
+
+  /**
+   * Drive the adapter's hooks by hand. `receiptOutput` is recorded through
+   * the authentic per-step observer unless `record` is false, which models a
+   * completion that carries no private evidence at all.
+   */
+  async function drive(
+    act: (options: Options, frame: unknown) => void,
+    record: boolean,
+    receiptOutput: unknown = validOutput,
+  ): Promise<string> {
+    generate.mockImplementationOnce(async (options: unknown) => {
+      const hooks = options as Options;
+      const prepared = hooks.prepareStep({ stepNumber: 0, toolsContext: {} });
+      if (record) {
+        const observer = (
+          (prepared.toolsContext as Record<string, unknown>)
+            .checkStock as Record<string, unknown>
+        ).stockReadObserver as {
+          serverTurnId: string;
+          recordExecution: (receipt: unknown) => void;
+        };
+        observer.recordExecution({
+          serverTurnId: observer.serverTurnId,
+          toolCallId: 'b',
+          step: 0,
+          subject,
+          catalogGenerationBefore: 0,
+          catalogGenerationAfter: 0,
+          output: receiptOutput,
+        });
+      }
+      act(hooks, prepared.runtimeContext);
+      return { text: 'MODEL_TEXT', usage: { inputTokens: 1, outputTokens: 1 } };
+    });
+    const result = await agent.run({
+      senderId: 'sender',
+      text: 'hola',
+      history: [],
+      systemPrompt: 'BOOT',
+      tools: { checkStock: { description: 'c', inputSchema: {} } },
+    });
+    return result.reply;
+  }
+
+  const withReceipt = (
+    act: (options: Options, frame: unknown) => void,
+    receiptOutput: unknown = validOutput,
+  ): Promise<string> => drive(act, true, receiptOutput);
+
+  const withNoReceipt = (
+    act: (options: Options, frame: unknown) => void,
+  ): Promise<string> => drive(act, false);
+
+  const callPart = (over: Record<string, unknown> = {}) => ({
+    type: 'tool-call',
+    toolCallId: 'b',
+    toolName: 'checkStock',
+    input: callInput,
+    ...over,
+  });
+  const resultPart = (over: Record<string, unknown> = {}) => ({
+    type: 'tool-result',
+    toolCallId: 'b',
+    toolName: 'checkStock',
+    input: callInput,
+    output: validOutput,
+    ...over,
+  });
+  const step = (over: Record<string, unknown>) => ({
+    stepNumber: 0,
+    ...over,
+  });
+
+  it('still verifies a genuine read whose terminal agrees (positive control)', async () => {
+    const reply = await withReceipt((hooks) =>
+      hooks.onStepFinish(
+        step({ toolCalls: [callPart()], content: [callPart(), resultPart()] }),
+      ),
+    );
+    expect(reply).toBe(verifiedReply);
+  });
+
+  it('rejects a terminal whose input disagrees with the parsed call', async () => {
+    const reply = await withReceipt((hooks) =>
+      hooks.onStepFinish(
+        step({
+          toolCalls: [callPart()],
+          content: [callPart(), resultPart({ input: { productId: otherId } })],
+        }),
+      ),
+    );
+    expect(reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+
+  it('rejects a terminal whose tool name disagrees with the parsed call', async () => {
+    const reply = await withReceipt((hooks) =>
+      hooks.onStepFinish(
+        step({
+          toolCalls: [callPart()],
+          content: [callPart(), resultPart({ toolName: 'searchCatalog' })],
+        }),
+      ),
+    );
+    expect(reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+
+  it.each(['valid-first', 'invalid-first'])(
+    'rejects conflicting terminals regardless of order (%s)',
+    async (order) => {
+      const terminals = [
+        resultPart(),
+        resultPart({ input: { productId: otherId }, output: { ok: false } }),
+      ];
+      if (order === 'invalid-first') terminals.reverse();
+      const reply = await withReceipt((hooks) =>
+        hooks.onStepFinish(
+          step({
+            toolCalls: [callPart()],
+            content: [callPart(), ...terminals],
+          }),
+        ),
+      );
+      expect(reply).toBe(UNBOUND_STOCK_REPLY);
+    },
+  );
+
+  it.each(['invalid', 'dynamic', 'providerExecuted'])(
+    'rejects a %s parsed call even with a matching terminal',
+    async (flag) => {
+      const reply = await withReceipt((hooks) =>
+        hooks.onStepFinish(
+          step({
+            toolCalls: [callPart({ [flag]: true })],
+            content: [callPart({ [flag]: true }), resultPart()],
+          }),
+        ),
+      );
+      expect(reply).toBe(UNBOUND_STOCK_REPLY);
+    },
+  );
+
+  it('rejects a content call whose name disagrees with the parsed call', async () => {
+    const reply = await withReceipt((hooks) =>
+      hooks.onStepFinish(
+        step({
+          toolCalls: [callPart()],
+          content: [callPart({ toolName: 'searchCatalog' }), resultPart()],
+        }),
+      ),
+    );
+    expect(reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+
+  it('rejects a parsed call that is absent from the captured content', async () => {
+    const reply = await withReceipt((hooks) =>
+      hooks.onStepFinish(
+        step({ toolCalls: [callPart()], content: [resultPart()] }),
+      ),
+    );
+    expect(reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+
+  it('rejects a duplicate content call id even when one is non-stock', async () => {
+    const reply = await withReceipt((hooks) =>
+      hooks.onStepFinish(
+        step({
+          toolCalls: [callPart()],
+          content: [
+            callPart(),
+            callPart({ toolName: 'createSale' }),
+            resultPart(),
+          ],
+        }),
+      ),
+    );
+    expect(reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+
+  it('denies a write when a forged stock terminal accompanies a privately failed read (S3c2 correction)', async () => {
+    const forgedTerminal = {
+      ok: true,
+      productId,
+      name: productName,
+      stock: { status: 'out_of_stock', quantity: 0 },
+      variants: [],
+    };
+    const failedRead = { ok: false, error: { kind: 'upstream' } };
+    const restockInput = {
+      kind: 'out_of_stock',
+      digest: { productId, name: productName },
+    };
+    const decisions: unknown[] = [];
+    const act = (hooks: Options, frame: unknown) => {
+      // The genuine private receipt for 'b' is a FAILURE; a forged second
+      // terminal claims a valid OOS answer for the same id/name/input.
+      hooks.onStepFinish(
+        step({
+          toolCalls: [callPart()],
+          content: [callPart(), resultPart({ output: forgedTerminal })],
+        }),
+      );
+      hooks.onLanguageModelCallEnd({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'sale',
+            toolName: 'createSale',
+            input: {},
+          },
+        ],
+      });
+      decisions.push(
+        hooks.toolApproval({
+          toolCall: { toolCallId: 'sale', toolName: 'createSale', input: {} },
+          runtimeContext: frame,
+        }),
+      );
+      hooks.onLanguageModelCallEnd({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'restock',
+            toolName: 'requestHumanAssistance',
+            input: restockInput,
+          },
+        ],
+      });
+      decisions.push(
+        hooks.toolApproval({
+          toolCall: {
+            toolCallId: 'restock',
+            toolName: 'requestHumanAssistance',
+            input: restockInput,
+          },
+          runtimeContext: frame,
+        }),
+      );
+    };
+    const reply = await withReceipt(act, failedRead);
+    // The private failure keeps the write gate closed, for a plain mutation
+    // and for the narrow RESTOCK exception alike.
+    expect(decisions).toHaveLength(2);
+    for (const decision of decisions) {
+      expect(decision).toMatchObject({ type: 'denied' });
+    }
+    // The ledger never upgrades the failed read into a verified fact.
+    expect(reply).toBe(unconfirmedReply);
+  });
+
+  it('does not clear the write gate from an unobserved stock terminal (S3c2 correction)', async () => {
+    // Injected metadata only: a crafted completion claims a stock answer for
+    // a call that never produced a private receipt. No SDK JSON may authorize
+    // a write the private ledger cannot corroborate.
+    const forgedTerminal = {
+      ok: true,
+      productId,
+      name: productName,
+      stock: { status: 'out_of_stock', quantity: 0 },
+      variants: [],
+    };
+    const decisions: unknown[] = [];
+    const act = (hooks: Options, frame: unknown) => {
+      hooks.onStepFinish(
+        step({
+          toolCalls: [callPart()],
+          content: [callPart(), resultPart({ output: forgedTerminal })],
+        }),
+      );
+      hooks.onLanguageModelCallEnd({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'sale',
+            toolName: 'createSale',
+            input: {},
+          },
+        ],
+      });
+      decisions.push(
+        hooks.toolApproval({
+          toolCall: { toolCallId: 'sale', toolName: 'createSale', input: {} },
+          runtimeContext: frame,
+        }),
+      );
+    };
+    const reply = await withNoReceipt(act);
+    expect(decisions[0]).toMatchObject({ type: 'denied' });
+    expect(reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+});
+
+/**
+ * S3c2 correction: the per-step binding must be genuinely immutable and its
+ * absence must fail closed. `prepareStep` returns a frozen observer AND a
+ * frozen `runtimeContext` frame; `toolApproval` reads only that frame and
+ * never a mutable step counter.
+ */
+describe('immutable per-step binding (S3c2 correction)', () => {
+  type Options = {
+    prepareStep: (options: unknown) => Record<string, unknown>;
+    toolApproval: (options: unknown) => unknown;
+    onLanguageModelCallEnd: (event: unknown) => void;
+  };
+  const generate = jest.fn();
+  const agent = new VercelAiLlmAgent(generate, 'test', 6);
+
+  async function capture(act: (options: Options) => void): Promise<void> {
+    generate.mockImplementationOnce(async (options: unknown) => {
+      act(options as Options);
+      return { text: 'MODEL_TEXT', usage: { inputTokens: 1, outputTokens: 1 } };
+    });
+    await agent.run({
+      senderId: 'sender',
+      text: 'hola',
+      history: [],
+      systemPrompt: 'BOOT',
+      tools: { checkStock: { description: 'c', inputSchema: {} } },
+    });
+  }
+
+  it('freezes the observer bound into the step tool context', async () => {
+    await capture((options) => {
+      const prepared = options.prepareStep({ stepNumber: 0, toolsContext: {} });
+      const observer = (
+        (prepared.toolsContext as Record<string, unknown>).checkStock as Record<
+          string,
+          unknown
+        >
+      ).stockReadObserver as { step: number };
+      expect(Object.isFrozen(observer)).toBe(true);
+      expect(observer.step).toBe(0);
+      expect(() => {
+        observer.step = 3;
+      }).toThrow(TypeError);
+    });
+  });
+
+  it('fails closed when the per-step approval frame is absent', async () => {
+    await capture((options) => {
+      const prepared = options.prepareStep({ stepNumber: 0, toolsContext: {} });
+      options.onLanguageModelCallEnd({
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'm',
+            toolName: 'createSale',
+            input: {},
+          },
+        ],
+      });
+      const toolCall = {
+        toolCallId: 'm',
+        toolName: 'createSale',
+        input: {},
+      };
+      // No frame: the call must never be approved by a mutable fallback.
+      expect(options.toolApproval({ toolCall })).toMatchObject({
+        type: 'denied',
+      });
+      // With the frozen frame and a stock-free batch, approval is allowed.
+      expect(
+        options.toolApproval({
+          toolCall,
+          runtimeContext: prepared.runtimeContext,
+        }),
+      ).toMatchObject({ type: 'not-applicable' });
+    });
+  });
+});
+
+/**
+ * S3c2 correction: a genuinely approved RESTOCK must reach the real
+ * `requestHumanAssistance` tool's own fresh preflight. The stub tools of the
+ * loop scenarios prove routing only; this case uses the real tool factory
+ * with faked domain ports.
+ */
+describe('real RESTOCK intake through the governed adapter (S3c2 correction)', () => {
+  const productId = '00000000-0000-4000-8000-000000000001';
+  const otherId = '00000000-0000-4000-8000-0000000000aa';
+  const productName = 'Ibuprofeno de 400 mg';
+  const usage = {
+    inputTokens: {
+      total: 1,
+      noCache: 1,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: { total: 1, text: 1, reasoning: undefined },
+  };
+  const call = (toolCallId: string, toolName: string, input: string) => ({
+    type: 'tool-call' as const,
+    toolCallId,
+    toolName,
+    input,
+  });
+  const shortageResponse = {
+    productId,
+    name: productName,
+    stock: { status: 'out_of_stock', quantity: 0 },
+    variants: [],
+  };
+
+  it('admits a matching RESTOCK and reaches the tool fresh preflight', async () => {
+    const getStock = jest.fn().mockResolvedValue(shortageResponse);
+    const readForSender = jest.fn().mockResolvedValue({
+      legacyRequestPending: false,
+      restockIntentPresent: false,
+    });
+    const coordinate = jest.fn().mockResolvedValue({ decision: 'recorded' });
+    const humanHandoffCreate = jest.fn();
+    const deps = {
+      store: { get: async () => null },
+      chatbotApi: {
+        getStock,
+        searchCatalog: jest.fn().mockResolvedValue([]),
+      },
+      cashierUserId: productId,
+      humanHandoffService: { create: humanHandoffCreate },
+      restock: {
+        enabled: true,
+        markers: { readForSender },
+        coordinator: { coordinate },
+      },
+    } as unknown as ToolDeps;
+    const tools = {
+      checkStock: makeCheckStockTool(deps),
+      requestHumanAssistance: makeRequestHumanAssistanceTool(deps),
+    };
+    const catalogSession = new CatalogSession('sender', 60000, 0);
+    catalogSession.installSearch(catalogSession.beginSearch(), [
+      { productId, name: productName, variants: [] },
+    ]);
+    const doGenerate = [
       {
-        role: 'assistant' as const,
-        content:
-          'Claro. ¿Quieres que revise la disponibilidad de Ibuprofeno de 400 mg?',
+        content: [
+          call('fail', 'checkStock', JSON.stringify({ productId: otherId })),
+        ],
+        finishReason: { unified: 'tool-calls', raw: undefined },
+        usage,
+        warnings: [],
+      },
+      {
+        content: [call('short', 'checkStock', JSON.stringify({ productId }))],
+        finishReason: { unified: 'tool-calls', raw: undefined },
+        usage,
+        warnings: [],
+      },
+      {
+        content: [
+          call(
+            'restock',
+            'requestHumanAssistance',
+            JSON.stringify({
+              kind: 'out_of_stock',
+              digest: { productId, name: productName },
+            }),
+          ),
+        ],
+        finishReason: { unified: 'tool-calls', raw: undefined },
+        usage,
+        warnings: [],
+      },
+      {
+        content: [{ type: 'text' as const, text: 'Ya quedó registrada.' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage,
+        warnings: [],
       },
     ];
-    const first = await agent.run({
+    const model = new MockLanguageModelV4({ doGenerate } as never);
+    const generate: GenerateTextFn = async (input) =>
+      generateText({ ...input, model });
+    const agent = new VercelAiLlmAgent(generate, 'unused', 4);
+    const result = await agent.run({
       senderId: 'sender',
-      text: 'si por favor',
-      history: conversation,
+      text: 'Si por favor',
+      history: [],
       systemPrompt: 'BOOT',
       tools,
-      catalogSession: new CatalogSession('sender', 60000, 0),
+      catalogSession,
+      inboundEvent: {
+        senderId: 'sender',
+        receivingPhoneNumberId: '12345',
+        messageId: 'wamid.test',
+      },
     });
-    expect(first.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
-    expect(first.messages[first.messages.length - 1]).toEqual({
-      role: 'assistant',
-      content: INVENTORY_CLARIFICATION_REPLY,
-    });
-    expect(getStock).not.toHaveBeenCalled();
+    // The approved RESTOCK reached the real tool's fresh preflight (marker
+    // read) and its coordinator, never the legacy notify path.
+    expect(readForSender).toHaveBeenCalledTimes(1);
+    expect(coordinate).toHaveBeenCalledTimes(1);
+    expect(humanHandoffCreate).not.toHaveBeenCalled();
+    expect(result.reply).toBe('Ya quedó registrada.');
+  });
+});
 
-    // A real second turn: the ONLY context handed over is the messages the
-    // first run actually returned, exactly as the runner persists them.
-    const second = await agent.run({
-      senderId: 'sender',
-      text: 'busco ibuprofeno de 400mg',
-      history: first.messages,
-      systemPrompt: 'BOOT',
-      tools,
-      catalogSession: new CatalogSession('sender', 60000, 0),
+/**
+ * S2 (TEST-ONLY) — immutable catalog fixture and the cross-subject stock veto.
+ *
+ * These cases exercise the real SDK execution path (`MockLanguageModelV4` +
+ * real `generateText`), the real `searchCatalog` / `checkStock` tool factories
+ * and a fake domain HTTP client. Nothing here is a production capture: the
+ * catalog is ONE frozen DTO reused on every turn (no first-two-variants then
+ * zero-variants trick) and the stock DTO is stable except for the explicit
+ * matrix variable under test.
+ *
+ * S3c2 replaced the global stock-reply suppression with current-turn,
+ * subject-specific verified evidence. The former expected-failure regressions
+ * are now ordinary passing tests (see the two `(S2 regression)` /
+ * `(A-again regression)` cases below).
+ */
+describe('stock conversation boundary (S2)', () => {
+  const senderId = 'sender';
+  const verifiedId = '00000000-0000-4000-8000-000000000001';
+  const untrustedId = '00000000-0000-4000-8000-0000000000aa';
+  const variant20Id = '00000000-0000-4000-8000-0000000000f1';
+  const variant40Id = '00000000-0000-4000-8000-0000000000f2';
+  const usage = {
+    inputTokens: {
+      total: 1,
+      noCache: 1,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: { total: 1, text: 1, reasoning: undefined },
+  };
+  const call = (toolCallId: string, toolName: string, input: string) => ({
+    type: 'tool-call' as const,
+    toolCallId,
+    toolName,
+    input,
+  });
+
+  // Compact step builders: one real SDK step per call.
+  const searchStep = (id: string) => [
+    call(id, 'searchCatalog', JSON.stringify({ q: 'ibuprofeno', limit: 20 })),
+  ];
+  const stockStep = (id: string, input: Record<string, string>) => [
+    call(id, 'checkStock', JSON.stringify(input)),
+  ];
+
+  const baseProduct = Object.freeze({
+    productId: verifiedId,
+    name: 'Ibuprofeno de 400 mg',
+    brand: null,
+    imageUrl: null,
+    description: null,
+    price: Object.freeze({
+      priceCents: 100,
+      fromPriceCents: null,
+      promoPriceCents: null,
+      promotionEvaluationStatus: 'needs_human_review',
+    }),
+    packageInfo: Object.freeze({ weightGrams: null, dimensions: null }),
+  });
+
+  // ONE immutable catalog/search DTO, returned by every search on every turn.
+  const catalogDto = Object.freeze([
+    Object.freeze({
+      ...baseProduct,
+      stock: Object.freeze({ status: 'available', quantity: 7 }),
+      variants: Object.freeze([]),
+    }),
+  ]);
+
+  // Stable variant catalog: product identity and BOTH presentations are
+  // byte-identical on every turn; only the explicit matrix variable changes.
+  const variantCatalogDto = Object.freeze([
+    Object.freeze({
+      ...baseProduct,
+      stock: Object.freeze({ status: 'available', quantity: 9 }),
+      variants: Object.freeze([
+        Object.freeze({
+          variantId: variant20Id,
+          name: '400 mg caja con 20 tabletas',
+          option: null,
+          value: null,
+          priceCents: 100,
+        }),
+        Object.freeze({
+          variantId: variant40Id,
+          name: '400 mg caja con 40 tabletas',
+          option: null,
+          value: null,
+          priceCents: 150,
+        }),
+      ]),
+    }),
+  ]);
+
+  // The stock DTO is stable except for the explicit matrix variable
+  // (status/quantity). Identity and name never change between cases.
+  const stockDto = (stock: { status: string; quantity: number | null }) => ({
+    ...baseProduct,
+    stock,
+    variants: [] as never[],
+  });
+  const variantStockDto = (
+    v20: { status: string; quantity: number | null },
+    v40: { status: string; quantity: number | null },
+  ) => ({
+    ...baseProduct,
+    stock: { status: 'available', quantity: 9 },
+    variants: [
+      {
+        variantId: variant20Id,
+        name: '400 mg caja con 20 tabletas',
+        option: null,
+        value: null,
+        stock: v20,
+      },
+      {
+        variantId: variant40Id,
+        name: '400 mg caja con 40 tabletas',
+        option: null,
+        value: null,
+        stock: v40,
+      },
+    ],
+  });
+
+  type BoundaryStep =
+    | Array<{
+        type: 'tool-call';
+        toolCallId: string;
+        toolName: string;
+        input: string;
+      }>
+    | string;
+
+  function boundary(options: {
+    text: string;
+    history?: LlmRunInput['history'];
+    maxSteps: number;
+    getStock: jest.Mock;
+    searchCatalog?: jest.Mock;
+    steps: BoundaryStep[];
+  }) {
+    const searchCatalog =
+      options.searchCatalog ?? jest.fn().mockResolvedValue(catalogDto);
+    const sale = {
+      definition: tool({
+        description: 'createSale stub',
+        inputSchema: z.object({}),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
+    const assistance = {
+      definition: tool({
+        description: 'requestHumanAssistance stub',
+        inputSchema: z.object({}),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
+    const tools = {
+      checkStock: makeCheckStockTool({
+        chatbotApi: { getStock: options.getStock },
+      } as unknown as ToolDeps),
+      searchCatalog: makeSearchCatalogTool({
+        chatbotApi: { searchCatalog },
+      } as unknown as ToolDeps),
+      createSale: sale.definition,
+      requestHumanAssistance: assistance.definition,
+    };
+    const model = new MockLanguageModelV4({
+      doGenerate: options.steps.map((step) =>
+        typeof step === 'string'
+          ? {
+              content: [{ type: 'text' as const, text: step }],
+              finishReason: { unified: 'stop', raw: undefined },
+              usage,
+              warnings: [],
+            }
+          : {
+              content: step,
+              finishReason: { unified: 'tool-calls', raw: undefined },
+              usage,
+              warnings: [],
+            },
+      ),
+    } as never);
+    const generate: GenerateTextFn = async (input) =>
+      generateText({ ...input, model });
+    const agent = new VercelAiLlmAgent(generate, 'unused', options.maxSteps);
+    const run = (text = options.text, history = options.history ?? []) =>
+      agent.run({
+        senderId,
+        text,
+        history,
+        systemPrompt: 'BOOT',
+        tools,
+        catalogSession: new CatalogSession(senderId, 60000, 0),
+      });
+    return {
+      run,
+      model,
+      getStock: options.getStock,
+      searchCatalog,
+      sale,
+      assistance,
+    };
+  }
+
+  // S2/S3c1 known regression. The untrusted product A stays unresolved and
+  // globally vetoes the verified B answer, so the final reply is the generic
+  // unconfirmed fallback instead of a name-grounded shortage.
+  //
+  // S3c1 script/copy change (documented BEFORE implementation): the earlier
+  // revision re-requested the SAME failed subject A and only reached the
+  // backend because the old recovery wrapper silently rewrote the model's
+  // arguments into a GET for B. That passed for the wrong reason and hid the
+  // substitution defect. This revision scripts the model's OWN explicit
+  // native `checkStock(B)` after the fresh search, so the same frozen catalog
+  // still produces the verified B GET with no hidden argument rewrite. The
+  // desired copy is likewise the already-designed deterministic shortage
+  // sentence built from the trusted backend name, not the old model prose,
+  // and the global A veto must not suppress that grounded B sentence.
+  // S3c2 MUST convert this to an ordinary passing test.
+  it('grounds a verified shortage even when another product failed globally (S2 regression)', async () => {
+    const getStock = jest
+      .fn()
+      .mockResolvedValue(stockDto({ status: 'out_of_stock', quantity: 0 }));
+    const searchCatalog = jest.fn().mockResolvedValue(catalogDto);
+    const s = boundary({
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      // A, search, B, render: the future native cap needs four slots.
+      maxSteps: 4,
+      getStock,
+      searchCatalog,
+      steps: [
+        stockStep('fail', { productId: untrustedId }),
+        searchStep('search'),
+        // Native, model-authored B check: no wrapper substitution.
+        stockStep('check-b', { productId: verifiedId }),
+        'Déjame confirmarlo de nuevo.',
+        // Turn 2 reuses the SAME immutable DTO through the messages the
+        // first run actually returned.
+        searchStep('search-2'),
+        stockStep('check-2', { productId: verifiedId }),
+        'Sí, sigue agotado el de 400 mg.',
+      ],
     });
+    const first = await s.run();
+    const second = await s.run('¿Me lo confirmas de nuevo?', first.messages);
+
+    // The real SDK executed the model-selected trusted product once per
+    // turn with the model's OWN arguments: exactly two GETs, both for B.
+    expect(s.getStock).toHaveBeenNthCalledWith(1, verifiedId);
+    expect(s.getStock).toHaveBeenNthCalledWith(2, verifiedId);
+    expect(s.getStock).toHaveBeenCalledTimes(2);
+    // ONE immutable catalog DTO across both turns; never mutated.
+    expect(Object.isFrozen(catalogDto)).toBe(true);
+    expect(await searchCatalog.mock.results[0].value).toBe(catalogDto);
+    expect(await searchCatalog.mock.results[1].value).toBe(catalogDto);
+    // The first run's ACTUAL returned messages are what the second run
+    // received back; no fabricated assistant history is passed in.
+    expect(first.messages).toEqual([
+      {
+        role: 'user',
+        content: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      },
+      { role: 'assistant', content: first.reply },
+    ]);
+    expect(second.messages.slice(0, first.messages.length)).toEqual(
+      first.messages,
+    );
+    // No write effect from either turn.
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(s.assistance.definition.execute).not.toHaveBeenCalled();
+
+    // DESIRED (fails today): the verified B shortage is grounded by the
+    // trusted backend name instead of the generic fallback.
+    expect(first.reply).toBe(
+      'Por el momento no tenemos existencias de Ibuprofeno de 400 mg.',
+    );
+  });
+
+  // S3c1 A-again regression. The model re-requests the SAME untrusted subject
+  // A after a fresh B search. The desired adapter must NEVER rewrite that
+  // argument into a GET for the searched B: a failed read of A cannot become
+  // another product's read. The test scripts no forced target and asserts the
+  // executed backend argument, not `activeTools`.
+  // S3c2 MUST convert this to an ordinary passing test.
+  it('never substitutes a recovered product for a re-requested failed subject (A-again regression)', async () => {
+    const getStock = jest
+      .fn()
+      .mockResolvedValue(stockDto({ status: 'out_of_stock', quantity: 0 }));
+    const searchCatalog = jest.fn().mockResolvedValue(catalogDto);
+    const s = boundary({
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      // A, search, A again, render: no dynamic budget extension.
+      maxSteps: 4,
+      getStock,
+      searchCatalog,
+      steps: [
+        stockStep('fail', { productId: untrustedId }),
+        searchStep('search'),
+        // Native, model-authored re-request of the SAME failed subject.
+        stockStep('again', { productId: untrustedId }),
+        'Déjame revisarlo de nuevo.',
+      ],
+    });
+    const result = await s.run();
+
+    // DESIRED: the backend sees NO stock GET at all. A is not a valid
+    // subject, and B must not be fetched on A's behalf.
+    expect(getStock).not.toHaveBeenCalled();
+    expect(getStock).not.toHaveBeenCalledWith(verifiedId);
+    expect(getStock).not.toHaveBeenCalledWith(untrustedId);
+    // The frozen DTO is never mutated and the test forces no target.
+    expect(Object.isFrozen(catalogDto)).toBe(true);
+    expect(await searchCatalog.mock.results[0].value).toBe(catalogDto);
+    // No write effect was manufactured from the failed read.
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(s.assistance.definition.execute).not.toHaveBeenCalled();
+    // The approved evidence projection's unbound reply, not legacy copy.
+    expect(result.reply).toBe(UNBOUND_STOCK_REPLY);
+  });
+
+  it('clears a same-subject identity failure once the trusted product is verified', async () => {
+    const getStock = jest
+      .fn()
+      .mockResolvedValue(stockDto({ status: 'out_of_stock', quantity: 0 }));
+    const searchCatalog = jest.fn().mockResolvedValue(catalogDto);
+    const s = boundary({
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      maxSteps: 4,
+      getStock,
+      searchCatalog,
+      steps: [
+        stockStep('fail', { productId: verifiedId }),
+        searchStep('search'),
+        // The model itself re-requests the now-trusted product: no wrapper
+        // substitution is involved.
+        stockStep('recover', { productId: verifiedId }),
+        'Ibuprofeno de 400 mg está agotado por el momento.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(verifiedId);
+    expect(await searchCatalog.mock.results[0].value).toBe(catalogDto);
+    expect(result.reply).toBe(
+      'Por el momento no tenemos existencias de Ibuprofeno de 400 mg.',
+    );
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(s.assistance.definition.execute).not.toHaveBeenCalled();
+  });
+
+  it('keeps an inconsistent fresh stock answer unconfirmed with no automatic effect', async () => {
+    const getStock = jest
+      .fn()
+      .mockResolvedValue(stockDto({ status: 'available', quantity: null }));
+    const s = boundary({
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      maxSteps: 4,
+      getStock,
+      steps: [
+        stockStep('fail', { productId: verifiedId }),
+        searchStep('search'),
+        stockStep('recover', { productId: verifiedId }),
+        'Sí, tenemos disponible. 😊',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    // A non-integer quantity is not an authoritative fact, so the reply names
+    // the trusted product but never claims availability.
+    expect(result.reply).toBe(
+      'No pude confirmar las existencias de Ibuprofeno de 400 mg en esta consulta.',
+    );
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(s.assistance.definition.execute).not.toHaveBeenCalled();
+  });
+
+  it('names only the verified variant and never another presentation', async () => {
+    const getStock = jest
+      .fn()
+      .mockResolvedValue(
+        variantStockDto(
+          { status: 'out_of_stock', quantity: 0 },
+          { status: 'available', quantity: 5 },
+        ),
+      );
+    const searchCatalog = jest.fn().mockResolvedValue(variantCatalogDto);
+    const s = boundary({
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg caja con 20 tabletas?',
+      maxSteps: 4,
+      getStock,
+      searchCatalog,
+      steps: [
+        stockStep('fail', { productId: verifiedId, variantId: variant20Id }),
+        searchStep('search'),
+        // The model requests the 20-tablet presentation; the exact-key fact
+        // must never answer with the available 40-tablet presentation.
+        stockStep('recover', { productId: verifiedId, variantId: variant20Id }),
+        'Sí, hay de 20 tabletas disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(await searchCatalog.mock.results[0].value).toBe(variantCatalogDto);
+    expect(Object.isFrozen(variantCatalogDto[0])).toBe(true);
     expect(getStock).toHaveBeenCalledTimes(1);
-    expect(getStock).toHaveBeenCalledWith(productId);
-    expect(searchCatalog).toHaveBeenCalledTimes(2);
-    expect(sale.definition.execute).not.toHaveBeenCalled();
-    expect(second.reply).toBe('Sí, tenemos Ibuprofeno de 400 mg disponible.');
-    // Three steps in the first run plus four in the second, all real SDK turns.
-    expect(model.doGenerateCalls).toHaveLength(7);
+    expect(getStock).toHaveBeenCalledWith(verifiedId);
+    expect(result.reply).toContain('20 tabletas');
+    expect(result.reply).not.toContain('40 tabletas');
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+  });
+
+  it('does not guess a product-only GET for an unresolved untrusted subject', async () => {
+    // The model only searches and answers; the adapter must not fabricate a
+    // GET for a subject the model never validated.
+    const getStock = jest.fn();
+    const searchCatalog = jest.fn().mockResolvedValue(variantCatalogDto);
+    const s = boundary({
+      text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      maxSteps: 3,
+      getStock,
+      searchCatalog,
+      steps: [
+        stockStep('fail', { productId: untrustedId }),
+        searchStep('search'),
+        'Encontré una presentación con dos tamaños.',
+      ],
+    });
+    const result = await s.run();
+    expect(getStock).not.toHaveBeenCalled();
+    expect(await searchCatalog.mock.results[0].value).toBe(variantCatalogDto);
+    expect(result.reply).toBe(UNBOUND_STOCK_REPLY);
   });
 });
