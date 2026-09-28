@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import { openai } from '@ai-sdk/openai';
@@ -9,12 +9,14 @@ import {
   type ChatbotApiClient,
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { CatalogItemResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
+import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import {
   GENERATE_TEXT,
   type GenerateTextFn,
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
+import { MinimalRestockRequestService } from './minimal-restock-request.service';
 
 const INSTRUCTIONS =
   'Ruta experimental de solo lectura: usa searchCatalog para localizar productos por nombre; ' +
@@ -43,14 +45,38 @@ const INSTRUCTIONS =
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
 export type MinimalCatalogAgentDecision =
-  | { kind: 'handled'; reply: string }
+  | { kind: 'handled'; reply: string; onSent?: () => void }
   | { kind: 'not-handled' };
 
 // Bounded busy reply returned as `handled` (never legacy) for an in-flight turn.
 const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
 
+const RESTOCK_CAUTIOUS_REPLY =
+  'Por ahora no puedo preparar esa consulta de reposición.';
+
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
+
+// The read-only prompt denies a registration tool; when `prepareRestock` is
+// present these clauses are reworded and the feature fragment appended.
+const RESTOCK_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta prepareRestock: SOLO cuando el cliente pida registrar o avisar ' +
+  'sobre la reposición de un producto ya verificado en esta conversación, llama a ' +
+  'prepareRestock con su productId EXACTO (y variantId si la presentación importa). ' +
+  'No la uses para una simple búsqueda. Ella no registra: solo PREPARA la confirmación ' +
+  'y la aplicación pregunta SÍ o NO; nunca afirmes que la consulta ya quedó registrada.';
+
+function instructionsFor(restockAvailable: boolean): string {
+  if (!restockAvailable) return INSTRUCTIONS;
+  return (
+    INSTRUCTIONS.replace(
+      'ni prometas registro, contacto o reservación (no existe esa herramienta)',
+      'Para registrar una consulta de reposición existe prepareRestock, que ' +
+        'solo prepara la confirmación y no registra nada por sí sola',
+    ).replace('solicitud ni promesa de fecha', 'ni promesa de fecha') +
+    RESTOCK_INSTRUCTIONS_FRAGMENT
+  );
+}
 
 // Opaque per-run correlation for the local trace; never a sender, product or
 // model call id. A missing CSPRNG degrades to a constant marker, not a throw.
@@ -99,6 +125,19 @@ type HistoryTurn = {
   verifiedProductIds: string[];
 };
 
+// One bounded preparation per SDK run; `attempted` is set before the await.
+type RestockPreparation =
+  | {
+      readonly kind: 'offer';
+      readonly question: string;
+      readonly onSent: () => void;
+    }
+  | { readonly kind: 'closed' };
+type RestockRun = {
+  attempted: boolean;
+  outcome: RestockPreparation | null;
+};
+
 // Identity + price projection with product and variant stock stripped.
 function projectItem(item: CatalogItemResponse) {
   const { stock, variants, ...identity } = item;
@@ -131,6 +170,9 @@ export class MinimalCatalogAgentService {
     @Inject(GENERATE_TEXT) private readonly generateTextFn: GenerateTextFn,
     private readonly costGuard: CostGuardService,
     config: ConfigService,
+    // WU-B: optional RESTOCK confirmation gate (absent unless enabled).
+    @Optional()
+    private readonly restock?: MinimalRestockRequestService,
   ) {
     const agent = config.get<{ enabled: boolean; allowedSenders: string[] }>(
       'minimalCatalogAgent',
@@ -152,6 +194,7 @@ export class MinimalCatalogAgentService {
   async tryHandle(input: {
     senderId: string;
     text: string;
+    inboundEvent?: unknown;
   }): Promise<MinimalCatalogAgentDecision> {
     if (!this.enabled || !this.allowedSenders.has(input.senderId)) {
       return { kind: 'not-handled' };
@@ -161,7 +204,39 @@ export class MinimalCatalogAgentService {
     }
     this.busy.add(input.senderId);
     try {
-      return { kind: 'handled', reply: await this.runTurn(input) };
+      // The busy span covers the free consume and the SDK run.
+      if (this.restock !== undefined && this.restock.enabled) {
+        const consumed = await this.restock.consume({
+          senderId: input.senderId,
+          text: input.text,
+          ...(input.inboundEvent === undefined
+            ? {}
+            : { inboundEvent: input.inboundEvent }),
+        });
+        if (consumed !== null) {
+          this.recordTurn(
+            input.senderId,
+            [
+              { role: 'user', content: input.text },
+              { role: 'assistant', content: consumed.reply },
+            ],
+            [],
+          );
+          return {
+            kind: 'handled',
+            reply: consumed.reply,
+            ...(consumed.onSent === undefined
+              ? {}
+              : { onSent: consumed.onSent }),
+          };
+        }
+      }
+      const result = await this.runTurn(input);
+      return {
+        kind: 'handled',
+        reply: result.reply,
+        ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+      };
     } finally {
       this.busy.delete(input.senderId);
     }
@@ -170,7 +245,8 @@ export class MinimalCatalogAgentService {
   private async runTurn(input: {
     senderId: string;
     text: string;
-  }): Promise<string> {
+    inboundEvent?: unknown;
+  }): Promise<{ reply: string; onSent?: () => void }> {
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.history.get(input.senderId) ?? [];
@@ -180,42 +256,82 @@ export class MinimalCatalogAgentService {
       for (const id of turn.verifiedProductIds) allowedIds.add(id);
     }
     const currentIds = new Set<string>();
+    // Offer the tool ONLY with a trusted bound inbound identity.
+    const restockAvailable =
+      this.restock !== undefined &&
+      this.restock.enabled &&
+      bindRestockInboundEvent(input.inboundEvent, input.senderId) !== null;
+    const restockRun: RestockRun | null = restockAvailable
+      ? { attempted: false, outcome: null }
+      : null;
     const result = await this.generateTextFn({
       model: openai(this.model),
-      system: SYSTEM_PROMPT + '\n\n' + INSTRUCTIONS,
+      system: SYSTEM_PROMPT + '\n\n' + instructionsFor(restockAvailable),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
         { role: 'user', content: input.text },
       ],
-      tools: this.buildTools(allowedIds, currentIds, traceId),
+      tools: this.buildTools(
+        allowedIds,
+        currentIds,
+        traceId,
+        restockRun,
+        input,
+      ),
       stopWhen: stepCountIs(this.maxSteps),
     });
-    this.history.set(input.senderId, [
-      ...prior,
-      {
-        messages: [
-          { role: 'user', content: input.text },
-          ...result.responseMessages,
-        ],
-        verifiedProductIds: [...currentIds],
-      },
-    ]);
     this.costGuard.record({
       promptTokens: result.usage?.inputTokens ?? 0,
       completionTokens: result.usage?.outputTokens ?? 0,
     });
-    return result.text;
+    const prepared = restockRun?.outcome ?? null;
+    if (prepared !== null) {
+      // Reply is the SERVER outcome, not the model guess; the tool turn is
+      // discarded, never orphaned.
+      const reply =
+        prepared.kind === 'offer' ? prepared.question : RESTOCK_CAUTIOUS_REPLY;
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+      );
+      return prepared.kind === 'offer'
+        ? { reply, onSent: prepared.onSent }
+        : { reply };
+    }
+    this.recordTurn(
+      input.senderId,
+      [{ role: 'user', content: input.text }, ...result.responseMessages],
+      [...currentIds],
+    );
+    return { reply: result.text };
+  }
+
+  private recordTurn(
+    senderId: string,
+    messages: ModelMessage[],
+    verifiedProductIds: string[],
+  ): void {
+    const turns = this.history.get(senderId) ?? [];
+    const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
+    this.history.set(senderId, [...prior, { messages, verifiedProductIds }]);
   }
 
   private buildTools(
     allowedIds: Set<string>,
     currentIds: Set<string>,
     traceId: string,
+    restockRun: RestockRun | null,
+    context: { senderId: string; inboundEvent?: unknown },
   ) {
     const chatbotApi = this.chatbotApi;
+    const restock = this.restock;
     const trace = (event: string) =>
       traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
-    return {
+    const readTools = {
       searchCatalog: tool({
         description:
           'Busca productos por nombre. Devuelve identidad y precios reales, pero NUNCA existencias.',
@@ -272,6 +388,51 @@ export class MinimalCatalogAgentService {
           } catch {
             trace('tool checkStock result=error code=stock_unavailable');
             return toolError('stock_unavailable');
+          }
+        },
+      }),
+    };
+    if (restockRun === null || restock === undefined) return readTools;
+    return {
+      ...readTools,
+      prepareRestock: tool({
+        description:
+          'Prepara (NO registra) una consulta de reposición para un producto ya ' +
+          'verificado en esta conversación. La aplicación pide la confirmación.',
+        inputSchema: z.strictObject({
+          productId: z.uuid(),
+          variantId: z.uuid().optional(),
+        }),
+        execute: async ({ productId, variantId }) => {
+          if (restockRun.attempted) {
+            trace('tool prepareRestock result=closed code=repeated_attempt');
+            return toolError('restock_unavailable');
+          }
+          restockRun.attempted = true;
+          try {
+            const prepared = await restock.prepare({
+              senderId: context.senderId,
+              inboundEvent: context.inboundEvent,
+              allowedProductIds: allowedIds,
+              productId,
+              ...(variantId === undefined ? {} : { variantId }),
+            });
+            if (prepared.kind === 'offer') {
+              restockRun.outcome = {
+                kind: 'offer',
+                question: prepared.reply,
+                onSent: prepared.onSent,
+              };
+              trace('tool prepareRestock result=ok');
+              return { ok: true as const, confirmationRequired: true as const };
+            }
+            restockRun.outcome = { kind: 'closed' };
+            trace('tool prepareRestock result=closed code=not_available');
+            return toolError('restock_unavailable');
+          } catch {
+            restockRun.outcome = { kind: 'closed' };
+            trace('tool prepareRestock result=error code=restock_unavailable');
+            return toolError('restock_unavailable');
           }
         },
       }),

@@ -25,6 +25,7 @@ import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
 import { GENERATE_TEXT } from './infrastructure/generate-text.provider';
 import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
+import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
 
 /**
@@ -57,6 +58,8 @@ describe('LlmAgentModule integration', () => {
     // SHIPPING_QUOTES_ENABLED=true cannot enable the shipping module or the
     // default-off prompt byte-identity assertion. MANAGED_KEYS restores it.
     SHIPPING_QUOTES_ENABLED: 'false',
+    // WU-B: pin the RESTOCK gate OFF by default; the binding test flips it.
+    HUMAN_DECISIONS_RESTOCK_ENABLED: 'false',
   };
   const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
 
@@ -187,6 +190,37 @@ describe('LlmAgentModule integration', () => {
     expect(config.get<number>('llm.maxSteps')).toBe(4);
 
     await moduleRef.close();
+  });
+
+  it('builds the bounded RESTOCK gate only under the exact restockEnabled flag', async () => {
+    const boot = async () => {
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          AppConfigModule.forRoot({ ignoreEnvFile: true }),
+          HttpModule,
+          ConversationModule,
+          ChatbotApiModule,
+          SaleFlowModule,
+          LlmAgentModule,
+        ],
+      })
+        .overrideProvider(CHATBOT_API_CLIENT)
+        .useValue(stubChatbotApi())
+        .overrideProvider(ChatbotApiHttpClient)
+        .useValue(stubChatbotApi())
+        .overrideProvider(CONVERSATION_STORE)
+        .useValue(stubStore())
+        .overrideProvider(PostgresConversationStore)
+        .useValue(stubStore())
+        .compile();
+      const enabled = moduleRef.get(MinimalRestockRequestService).enabled;
+      await moduleRef.close();
+      return enabled;
+    };
+
+    await expect(boot()).resolves.toBe(false);
+    process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
+    await expect(boot()).resolves.toBe(true);
   });
 
   it('allows tests to override TOOL_REGISTRY with a stub', async () => {

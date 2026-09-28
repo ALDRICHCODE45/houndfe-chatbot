@@ -1,12 +1,34 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
+import {
+  CHATBOT_API_CLIENT,
+  type ChatbotApiClient,
+} from '../chatbot-api/domain/chatbot-api.client';
 import { ConversationModule } from '../conversation/conversation.module';
+import {
+  CONVERSATION_STORE,
+  type ConversationStore,
+} from '../conversation/domain/conversation-store';
+import {
+  RESTOCK_INTAKE_SERVICE,
+  type RestockIntakeService,
+} from '../human-decisions/application/restock-intake.service';
+import {
+  RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+  type RestockExistingRequestStatusService,
+} from '../human-decisions/application/restock-existing-request-status.service';
+import {
+  SHARED_ROUTE_MARKERS,
+  type SharedRouteMarkersPort,
+} from '../human-decisions/domain/shared-route-markers';
+import { HumanDecisionsModule } from '../human-decisions/human-decisions.module';
 import { SaleFlowModule } from '../sale-flow/sale-flow.module';
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
+import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
@@ -66,7 +88,16 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
  *   TOOL_REGISTRY: { useExisting: RealToolRegistry }  -> useClass: InMemoryToolRegistry
  */
 @Module({
-  imports: [ConfigModule, ConversationModule, ChatbotApiModule, SaleFlowModule],
+  imports: [
+    ConfigModule,
+    ConversationModule,
+    ChatbotApiModule,
+    SaleFlowModule,
+    // WU-B: DIRECT import (HumanHandoffModule does not re-export these) so the
+    // RESTOCK markers/coordinator/recovery seams are visible for the bounded
+    // confirmation service factory. Nest de-duplicates the shared instance.
+    HumanDecisionsModule,
+  ],
   providers: [
     {
       provide: GENERATE_TEXT,
@@ -118,7 +149,42 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     },
     AgentRunner,
     MinimalCatalogAgentService,
+    {
+      // WU-B: the RESTOCK confirmation gate. The capability is built ONLY when
+      // `humanDecisions.restockEnabled` is exactly true; otherwise it is
+      // `undefined` and the read-only route stays byte-identical.
+      provide: MinimalRestockRequestService,
+      inject: [
+        CHATBOT_API_CLIENT,
+        CONVERSATION_STORE,
+        ConfigService,
+        SHARED_ROUTE_MARKERS,
+        RESTOCK_INTAKE_SERVICE,
+        RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+      ],
+      useFactory: (
+        chatbotApi: ChatbotApiClient,
+        store: ConversationStore,
+        config: ConfigService,
+        markers: SharedRouteMarkersPort,
+        coordinator: RestockIntakeService,
+        recovery: RestockExistingRequestStatusService,
+      ) =>
+        new MinimalRestockRequestService({
+          chatbotApi,
+          store,
+          restock:
+            config.get<boolean>('humanDecisions.restockEnabled') === true
+              ? { enabled: true, markers, coordinator, recovery }
+              : undefined,
+        }),
+    },
   ],
-  exports: [AgentRunner, CostGuardService, MinimalCatalogAgentService],
+  exports: [
+    AgentRunner,
+    CostGuardService,
+    MinimalCatalogAgentService,
+    MinimalRestockRequestService,
+  ],
 })
 export class LlmAgentModule {}

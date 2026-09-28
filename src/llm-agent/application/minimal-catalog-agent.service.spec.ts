@@ -7,6 +7,8 @@ import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
+import { MinimalRestockRequestService } from './minimal-restock-request.service';
+import { deriveRestockSourceRequestId } from '../../human-decisions/domain/restock-source-identity';
 
 const SENDER = '5215550001111';
 const OTHER = '5215550002222';
@@ -83,6 +85,7 @@ function build(
     enabled: boolean;
     allowedSenders: string[];
     historyTurns: number;
+    restock: (chatbotApi: ChatbotApiClient) => MinimalRestockRequestService;
   }> = {},
   fixtures: { item: unknown; stock: unknown } = {
     item: simpleItem,
@@ -118,6 +121,7 @@ function build(
       generate,
       costGuard,
       config,
+      over.restock?.(chatbotApi),
     ),
     chatbotApi,
     costGuard,
@@ -164,6 +168,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
     expect(system).toContain('sin "¿en qué puedo ayudarle?"');
     expect(system).toContain('Sin cierre automático');
     expect(system).toContain('sin emoji al informar agotado');
+    expect(system).not.toContain('prepareRestock');
     expect(JSON.stringify(captured[0].messages)).toContain(
       'hola, busco ibuprofeno',
     );
@@ -558,6 +563,181 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       await service.tryHandle({ senderId: SENDER, text: 'b' });
       expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
       expect(chatbotApi.getStock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('RESTOCK confirmation wiring (real service, real preflight)', () => {
+    const INBOUND = {
+      receivingPhoneNumberId: '123456789012345',
+      senderId: SENDER,
+      messageId: 'wamid.A',
+    };
+    const CONFIRM = { ...INBOUND, messageId: 'wamid.B' };
+    const oos = {
+      ...simpleStock,
+      stock: { status: 'out_of_stock', quantity: 0 },
+    };
+    const QUESTION =
+      '¿Quiere que registre una consulta sobre la reposición de «Ibuprofeno 400 mg»? Responda SÍ o NO.';
+
+    const wire = () => {
+      const coordinate = jest.fn<
+        Promise<{ decision: string }>,
+        [
+          {
+            senderId: string;
+            intake: { productId: string; sourceRequestId: string };
+          },
+        ]
+      >(async () => ({ decision: 'recorded' }));
+      const recover = jest.fn(async () => ({ outcome: 'unavailable' }));
+      const markers = {
+        readForSender: jest.fn(async () => ({
+          legacyRequestPending: false,
+          restockIntentPresent: false,
+        })),
+      };
+      const store = { get: jest.fn(async () => null) };
+      return {
+        coordinate,
+        recover,
+        markers,
+        restock: (api: ChatbotApiClient) =>
+          new MinimalRestockRequestService({
+            chatbotApi: api,
+            store: store as never,
+            restock: {
+              enabled: true,
+              markers,
+              coordinator: { coordinate },
+              recovery: { recover },
+            } as never,
+          }),
+      };
+    };
+
+    it('prepares exactly one server question then one write on SÍ, with no extra SDK run', async () => {
+      const w = wire();
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        call('p1', 'prepareRestock', { productId: PRODUCT }),
+        call('p2', 'prepareRestock', { productId: PRODUCT }),
+        say('listo'),
+      ];
+      const { service, chatbotApi, captured } = build(
+        steps,
+        { restock: w.restock },
+        { item: simpleItem, stock: oos },
+      );
+      const first = await service.tryHandle({
+        senderId: SENDER,
+        text: '¿me avisan cuando llegue?',
+        inboundEvent: INBOUND,
+      });
+      expect(first).toMatchObject({ kind: 'handled', reply: QUESTION });
+      // At most ONE preparation per run: the repeat never replaces the offer,
+      // and the confirmation writes nothing on its own.
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+      expect(w.coordinate).not.toHaveBeenCalled();
+      expect(String(captured[0].system)).toContain('prepareRestock');
+      if (first.kind !== 'handled') throw new Error('expected handled');
+      first.onSent?.();
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'SÍ',
+          inboundEvent: CONFIRM,
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply:
+          'Ya quedó registrada su consulta sobre cuándo tendremos «Ibuprofeno 400 mg» de nuevo.',
+      });
+      expect(w.coordinate).toHaveBeenCalledTimes(1);
+      const [arg] = w.coordinate.mock.calls[0];
+      expect(arg.senderId).toBe(SENDER);
+      expect(arg.intake.productId).toBe(PRODUCT);
+      expect(arg.intake.sourceRequestId).toBe(
+        deriveRestockSourceRequestId(CONFIRM),
+      );
+      expect(w.recover).not.toHaveBeenCalled();
+      expect(captured).toHaveLength(1);
+    });
+
+    it('a NO decline clears the pending, claims nothing and writes nothing', async () => {
+      const w = wire();
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        call('p1', 'prepareRestock', { productId: PRODUCT }),
+        say('listo'),
+      ];
+      const { service, captured } = build(
+        steps,
+        { restock: w.restock },
+        { item: simpleItem, stock: oos },
+      );
+      const first = await service.tryHandle({
+        senderId: SENDER,
+        text: 'avísenme',
+        inboundEvent: INBOUND,
+      });
+      if (first.kind !== 'handled') throw new Error('expected handled');
+      first.onSent?.();
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'NO',
+          inboundEvent: CONFIRM,
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply: 'Entendido, no registraré la consulta de reposición.',
+      });
+      expect(w.coordinate).not.toHaveBeenCalled();
+      expect(captured).toHaveLength(1);
+    });
+
+    it('a closed preparation yields the cautious copy and never a model claim or write', async () => {
+      const w = wire();
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        call('p1', 'prepareRestock', { productId: PRODUCT }),
+        say('¡Ya la registré!'),
+      ];
+      const { service } = build(
+        steps,
+        { restock: w.restock },
+        { item: simpleItem, stock: simpleStock },
+      );
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'avísenme',
+          inboundEvent: INBOUND,
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply: 'Por ahora no puedo preparar esa consulta de reposición.',
+      });
+      expect(w.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('an unexpected consume failure never falls back to the legacy/SDK path', async () => {
+      const boom = {
+        enabled: true,
+        consume: jest.fn().mockRejectedValue(new Error('boom')),
+      } as unknown as MinimalRestockRequestService;
+      const { service, captured } = build([say('legacy?')], {
+        restock: () => boom,
+      });
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'SÍ',
+          inboundEvent: CONFIRM,
+        }),
+      ).rejects.toThrow('boom');
+      expect(captured).toHaveLength(0);
     });
   });
 });

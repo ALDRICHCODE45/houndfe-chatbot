@@ -310,6 +310,17 @@ export class WebhookDispatcherService {
           ? await this.minimalCatalogAgent.tryHandle({
               senderId: message.senderId,
               text: message.text,
+              // R3b3-c4c1b identity forwarding, same trusted tuple as the
+              // AgentRunner path: EXACT normalized metadata, never config/model.
+              ...(message.receivingPhoneNumberId === undefined
+                ? {}
+                : {
+                    inboundEvent: {
+                      receivingPhoneNumberId: message.receivingPhoneNumberId,
+                      senderId: message.senderId,
+                      messageId: message.messageId,
+                    },
+                  }),
             })
           : null;
         if (minimal?.kind === 'handled') {
@@ -317,6 +328,10 @@ export class WebhookDispatcherService {
             to: message.senderId,
             text: minimal.reply,
           });
+          // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
+          // question, and BEFORE the observational remember/markSeen writes so
+          // an observation failure can never undo the accepted send.
+          minimal.onSent?.();
           this.recentOutbound.remember(providerMessageId);
           try {
             await this.dedup.markSeen(message.messageId);

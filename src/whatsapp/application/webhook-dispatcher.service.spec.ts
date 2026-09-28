@@ -2237,6 +2237,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           changes: [
             {
               value: {
+                metadata: { phone_number_id: '123456789012345' },
                 messages: [
                   {
                     id,
@@ -2262,6 +2263,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(minimalAgent.tryHandle).toHaveBeenCalledWith({
         senderId: CUSTOMER,
         text: 'hola',
+        inboundEvent: {
+          receivingPhoneNumberId: '123456789012345',
+          senderId: CUSTOMER,
+          messageId: 'wamid.min.on',
+        },
       });
       expect(llm.run).not.toHaveBeenCalled();
       expect(sender.sendText).toHaveBeenCalledWith({
@@ -2282,6 +2288,48 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         to: CUSTOMER,
         text: 'legacy reply',
       });
+    });
+
+    it('arms onSent only after a successful send, before remember/dedup', async () => {
+      const onSent = jest.fn();
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'question',
+        onSent,
+      });
+      await service.dispatch(event('wamid.min.arm'));
+      expect(onSent).toHaveBeenCalledTimes(1);
+      expect(sender.sendText.mock.invocationCallOrder[0]).toBeLessThan(
+        onSent.mock.invocationCallOrder[0],
+      );
+      expect(onSent.mock.invocationCallOrder[0]).toBeLessThan(
+        recentOutbound.remember.mock.invocationCallOrder[0],
+      );
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.min.arm');
+    });
+
+    it('never arms onSent when the send fails', async () => {
+      const onSent = jest.fn();
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'question',
+        onSent,
+      });
+      sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
+      await expect(
+        service.dispatch(event('wamid.min.failsend')),
+      ).rejects.toThrow('Meta 131030');
+      expect(onSent).not.toHaveBeenCalled();
+      expect(dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('a minimal-agent failure never falls back to the legacy runner', async () => {
+      minimalAgent.tryHandle.mockRejectedValueOnce(new Error('minimal down'));
+      await expect(service.dispatch(event('wamid.min.err'))).rejects.toThrow(
+        'minimal down',
+      );
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
     });
   });
 });
