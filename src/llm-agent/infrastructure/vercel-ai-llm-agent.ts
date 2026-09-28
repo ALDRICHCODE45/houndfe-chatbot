@@ -13,6 +13,7 @@ import {
   type InventoryCallEvidence,
 } from '../domain/inventory-evidence.guard';
 import {
+  UNBOUND_STOCK_REPLY,
   StockReadEvidence,
   type AdmittedToolCall,
   type StockReadExecutionObserver,
@@ -265,17 +266,23 @@ export function createInventorySeparationGate(
  * worse outcome than an empty reply, so the empty-string limitation is
  * deliberate and documented rather than silently "fixed".
  *
- * With nothing executed, the current-turn trusted stock projection wins when
- * a stock read was attempted at all; otherwise the conservative generic
- * fallback covers a residual unresolved failure, and a clean read-free run
- * keeps ordinary model behavior.
+ * With nothing executed, a stock read that produced ONLY unbound failures asks
+ * for an explicit canonical product/presentation choice (the generic fallback
+ * when no valid catalog snapshot can render one). Otherwise the current-turn
+ * trusted stock projection wins; the conservative generic fallback still
+ * covers a residual unresolved failure, and a clean read-free run keeps
+ * ordinary model behavior.
  */
 function selectReply(
   fallback: string,
   guard: InventoryEvidenceGuard,
   evidence: StockReadEvidence,
+  catalogSession: CatalogSession | undefined,
 ): string {
   if (guard.hasExecutedMutation()) return fallback;
+  if (evidence.hasOnlyUnboundFailures()) {
+    return catalogSession?.selectionPrompt() ?? UNBOUND_STOCK_REPLY;
+  }
   const projected = evidence.projectStockFacts();
   if (projected !== null) return projected;
   if (guard.hasUnresolvedStockFailure()) return INVENTORY_UNCONFIRMED_REPLY;
@@ -870,7 +877,7 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     // reply verbatim (even an empty string); otherwise the current-turn
     // trusted stock projection wins, with the generic fallback only as a
     // residual guard.
-    const reply = selectReply(result.text, guard, evidence);
+    const reply = selectReply(result.text, guard, evidence, catalogSession);
 
     return {
       reply,

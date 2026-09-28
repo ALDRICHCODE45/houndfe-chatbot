@@ -699,6 +699,34 @@ describe('StockReadEvidence', () => {
     });
   });
 
+  describe('hasOnlyUnboundFailures', () => {
+    it('is true only when every attempt lacked a trusted subject', () => {
+      const store = new StockReadEvidence(TURN);
+      expect(store.hasOnlyUnboundFailures()).toBe(false);
+      store.admitCompletedStep(0, [call('unbound', OTHER_ID)]);
+      expect(store.hasOnlyUnboundFailures()).toBe(true);
+      expect(store.getLatestCompleted(productOnly)).toBeNull();
+      store.recordExecution(
+        receipt('trusted', 1, {
+          subject: subject(),
+          output: stockOutput('available', 5),
+        }),
+      );
+      store.admitCompletedStep(1, [call('trusted', PRODUCT_ID)]);
+      expect(store.hasOnlyUnboundFailures()).toBe(false);
+      expect(store.projectStockFacts()).not.toBe(UNBOUND_STOCK_REPLY);
+    });
+
+    it('never grants identity or a write from a failure-only ledger', () => {
+      const store = new StockReadEvidence(TURN);
+      store.recordExecution(receipt('missing', 0));
+      store.admitCompletedStep(0, [call('missing', PRODUCT_ID)]);
+      expect(store.hasOnlyUnboundFailures()).toBe(true);
+      expect(store.hasVerifiedShortage()).toBe(false);
+      expect(store.getLatestCompleted(productOnly)).toBeNull();
+    });
+  });
+
   /**
    * S3c2 correction: the ledger must cross-check the SDK completion terminal
    * the adapter hands it against the private receipt. The private receipt

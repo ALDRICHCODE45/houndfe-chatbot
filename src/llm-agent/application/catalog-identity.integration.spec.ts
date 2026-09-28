@@ -529,4 +529,161 @@ describe('catalog identity through the real runner, adapter and tools', () => {
       'Por el momento no tenemos existencias de Ibuprofeno de 400 mg.',
     );
   });
+
+  // Regression (was characterization): a representative synthetic
+  // name-format difference, NOT asserted to be a production reproducer. The
+  // incident's exact catalog/model argument shapes remain unknown. With one
+  // immutable no-variant product the real SDK completes the model's OWN named
+  // clarification; the adapter must replace that model prose with the
+  // canonical server-rendered selection question, not the generic fallback.
+  it('regression: the server renders a canonical selection question for a harmless name-format mismatch', async () => {
+    const catalogName = 'Ibuprofeno de 400 mg';
+    const mismatchedName = 'Ibuprofeno 400mg';
+    const namedClarification = `¿Se refiere a ${catalogName}?`;
+    const frozenCatalog = Object.freeze([
+      Object.freeze({
+        productId,
+        name: catalogName,
+        variants: Object.freeze([]),
+        stock: Object.freeze({ status: 'out_of_stock', quantity: 0 }),
+      }),
+    ]);
+    const f = sdkFixture(
+      [
+        // Turn 1: one real search, then a plain presentation question. No
+        // checkStock, so nothing is projected and the model text survives.
+        sdkToolStep('search', 'searchCatalog', { q: 'Ibuprofeno', limit: 20 }),
+        'Claro, ¿busca alguna presentación en especial?',
+        // Turn 2: valid productId + a differently formatted optional name ->
+        // identity rejected, then a re-search of the SAME fixture, then the
+        // model's own NAMED clarification.
+        sdkToolStep('check-mismatch', 'checkStock', {
+          productId,
+          name: mismatchedName,
+        }),
+        sdkToolStep('search-2', 'searchCatalog', {
+          q: 'Ibuprofeno',
+          limit: 20,
+        }),
+        namedClarification,
+      ],
+      frozenCatalog,
+    );
+
+    const first = await f.runner.handle({
+      senderId: 'sender',
+      text: 'Buenas tardes, ¿tienen ibuprofeno?',
+    });
+    // First greeting has no stock attempt, so ordinary model behavior wins.
+    expect(first.reply).toBe('Claro, ¿busca alguna presentación en especial?');
+    expect(f.getStock).not.toHaveBeenCalled();
+    expect(f.searchCatalog).toHaveBeenCalledTimes(1);
+    expect(f.model.doGenerateCalls).toHaveLength(2);
+
+    // The next turn restores a still-valid clone of the persisted snapshot
+    // (the runner CAS round-trips it through structuredClone).
+    const persisted = (await f.store.get('sender'))!.data.catalogReferences;
+    expect(persisted).not.toBeNull();
+    const restored = new CatalogSession(
+      'sender',
+      1000,
+      2,
+      structuredClone(persisted),
+      [
+        { role: 'user', content: 'Buenas tardes, ¿tienen ibuprofeno?' },
+        { role: 'assistant', content: first.reply },
+      ],
+    );
+    expect(restored.snapshot()).not.toBeNull();
+    expect(restored.resolve({ productId, name: catalogName })).toMatchObject({
+      productId,
+      productName: catalogName,
+    });
+    // The harmless name-format difference alone makes identity unresolvable.
+    expect(restored.resolve({ productId, name: mismatchedName })).toBeNull();
+
+    const second = await f.runner.handle({
+      senderId: 'sender',
+      text: 'Sí, el de 400',
+    });
+
+    // Context propagation: the restored catalog evidence reached the next
+    // turn's SDK instructions with the canonical identity.
+    const nextTurnPrompt = JSON.stringify(f.model.doGenerateCalls[2]);
+    expect(nextTurnPrompt).toContain('UNSELECTED catalog evidence');
+    expect(nextTurnPrompt).toContain(catalogName);
+
+    // The real SDK handed the identity rejection back to the model, and the
+    // third turn-2 prompt also carries the preceding search tool result.
+    const thirdPrompt = JSON.stringify(f.model.doGenerateCalls[4].prompt);
+    expect(thirdPrompt).toContain('catalog_identity_unverified');
+    expect(thirdPrompt).toContain('requires_check_stock');
+
+    // The SDK stopped naturally on plain text: 3 model calls on turn 2
+    // despite a cap of 4 (5 total across both handles).
+    expect(f.model.doGenerateCalls).toHaveLength(5);
+    // Identity rejection kept the mismatched subject away from the backend.
+    expect(f.getStock).not.toHaveBeenCalled();
+    expect(f.searchCatalog).toHaveBeenCalledTimes(2);
+
+    // The adapter REPLACED the model's prose with the canonical server-
+    // rendered selection question: server rendering, not prose passthrough.
+    const canonicalSelection =
+      'Para consultar existencias, ¿se refiere a «Ibuprofeno de 400 mg»?';
+    expect(namedClarification).not.toBe(canonicalSelection);
+    expect(second.reply).toBe(canonicalSelection);
+    expect((await f.store.get('sender'))!.data.messages!.at(-1)).toEqual({
+      role: 'assistant',
+      content: canonicalSelection,
+    });
+  });
+
+  // Control: the SAME first-turn catalog/history, but the real identity
+  // resolves, so the native SDK toolsContext/CatalogSession boundary grounds a
+  // truthful deterministic answer instead of the unbound fallback.
+  it.each([
+    ['the exact backend name', { productId, name: 'Ibuprofeno de 400 mg' }],
+    ['an omitted optional name', { productId }],
+  ])(
+    'control: identity survives the real SDK boundary with %s and grounds a truthful shortage',
+    async (_label, checkInput) => {
+      const frozenCatalog = Object.freeze([
+        Object.freeze({
+          productId,
+          name: 'Ibuprofeno de 400 mg',
+          variants: Object.freeze([]),
+          stock: Object.freeze({ status: 'out_of_stock', quantity: 0 }),
+        }),
+      ]);
+      const f = sdkFixture(
+        [
+          sdkToolStep('search', 'searchCatalog', {
+            q: 'Ibuprofeno',
+            limit: 20,
+          }),
+          'Claro, déjeme revisarlo.',
+          sdkToolStep('check', 'checkStock', checkInput),
+          'El modelo puede escribir cualquier cosa aquí.',
+        ],
+        frozenCatalog,
+      );
+
+      const first = await f.runner.handle({
+        senderId: 'sender',
+        text: 'Buenas tardes, ¿tienen ibuprofeno de 400 mg?',
+      });
+      expect(first.reply).toBe('Claro, déjeme revisarlo.');
+      await f.runner.handle({ senderId: 'sender', text: '¿Sí hay?' });
+
+      expect(f.getStock).toHaveBeenCalledTimes(1);
+      expect(f.getStock).toHaveBeenCalledWith(productId);
+      // The adapter grounds the reply in the trusted backend identity, not
+      // the model's own text.
+      expect((await f.store.get('sender'))!.data.messages!.at(-1)).toEqual({
+        role: 'assistant',
+        content:
+          'Por el momento no tenemos existencias de Ibuprofeno de 400 mg.',
+      });
+    },
+  );
 });

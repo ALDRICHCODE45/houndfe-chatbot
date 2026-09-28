@@ -308,4 +308,156 @@ describe('CatalogSession', () => {
     expect(session.resolve({ productId })).toBeNull();
     expect(session.matches({ productId })).toBe(false);
   });
+
+  describe('selectionPrompt', () => {
+    const canonical = (label: string) =>
+      'Para consultar existencias, necesito identificar el producto y su presentación. ' +
+      `¿Cuál desea consultar?\n${label}`;
+
+    it('asks a canonical question for a single non-variant candidate', () => {
+      const session = seeded();
+      session.installSearch(session.beginSearch(), [
+        { productId, name: 'Medicine 400 mg', variants: [] },
+      ]);
+      expect(session.selectionPrompt()).toBe(
+        'Para consultar existencias, ¿se refiere a «Medicine 400 mg»?',
+      );
+    });
+
+    it('asks an explicit bounded choice for multiple candidates without selecting', () => {
+      const session = seeded();
+      session.installSearch(session.beginSearch(), [
+        { productId, name: 'Medicine 400 mg', variants: [] },
+        { productId: unknownId, name: 'Medicine 800 mg', variants: [] },
+      ]);
+      expect(session.selectionPrompt()).toBe(
+        canonical('1. Medicine 400 mg\n2. Medicine 800 mg'),
+      );
+    });
+
+    it('lists every variant and splits same-name variants with option/value', () => {
+      const session = seeded();
+      session.installSearch(session.beginSearch(), [
+        {
+          productId,
+          name: 'Medicine 400 mg',
+          variants: [
+            { variantId, name: 'caja', option: 'Tabletas', value: '20' },
+            {
+              variantId: '00000000-0000-4000-8000-000000000003',
+              name: 'caja',
+              option: 'Tabletas',
+              value: '40',
+            },
+          ],
+        },
+      ]);
+      expect(session.selectionPrompt()).toBe(
+        canonical(
+          '1. Medicine 400 mg (caja: Tabletas 20)\n' +
+            '2. Medicine 400 mg (caja: Tabletas 40)',
+        ),
+      );
+    });
+
+    it('returns null without a valid snapshot so the caller can fall back', () => {
+      const historyless = new CatalogSession(
+        'sender',
+        100,
+        0,
+        undefined,
+        [],
+        () => 1000,
+      );
+      expect(historyless.selectionPrompt()).toBeNull();
+      const snapshot = seeded().snapshot();
+      expect(
+        new CatalogSession(
+          'other',
+          100,
+          1,
+          snapshot,
+          history,
+          () => 1000,
+        ).selectionPrompt(),
+      ).toBeNull();
+      expect(
+        new CatalogSession(
+          'sender',
+          100,
+          1,
+          snapshot,
+          history,
+          () => 1101,
+        ).selectionPrompt(),
+      ).toBeNull();
+    });
+
+    it('returns null instead of truncating ambiguous, excessive or oversized sets', () => {
+      const ambiguous = seeded();
+      ambiguous.installSearch(ambiguous.beginSearch(), [
+        { productId, name: 'Same', variants: [] },
+        { productId: unknownId, name: 'Same', variants: [] },
+      ]);
+      expect(ambiguous.selectionPrompt()).toBeNull();
+
+      const excessive = seeded();
+      excessive.installSearch(
+        excessive.beginSearch(),
+        Array.from({ length: 7 }, (_, index) => ({
+          productId: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`,
+          name: `Product ${index}`,
+          variants: [],
+        })),
+      );
+      expect(excessive.selectionPrompt()).toBeNull();
+
+      const oversized = seeded();
+      oversized.installSearch(
+        oversized.beginSearch(),
+        Array.from({ length: 3 }, (_, index) => ({
+          productId: `00000000-0000-4000-8000-${String(index + 200).padStart(12, '0')}`,
+          name: String.fromCharCode(0x4e00 + index) + '界'.repeat(255),
+          variants: [],
+        })),
+      );
+      expect(oversized.selectionPrompt()).toBeNull();
+    });
+
+    it('asks without selecting, inventing ids or claiming stock', () => {
+      const session = seeded();
+      const prompt = session.selectionPrompt()!;
+      expect(prompt).toContain('Medicine 400 mg');
+      expect(prompt).not.toContain(productId);
+      expect(prompt).not.toContain(variantId);
+      expect(prompt).not.toMatch(/disponible|agotado|precio|cantidad/i);
+      // Asking is read-only: it never resolves or consumes the session.
+      expect(session.matches({ productId })).toBe(true);
+      expect(session.evidence(0)).toContain('UNSELECTED');
+    });
+
+    it.each<[string, string, string | null]>([
+      ['a newline', 'Producto A\n7. Producto falso', null],
+      ['a carriage return', 'Producto A\r7. Producto falso', null],
+      ['a C0 control', 'Producto A\u0007', null],
+      ['a C1 control', 'Producto A\u0085', null],
+      ['a line separator', 'Producto A\u2028falso', null],
+      ['a paragraph separator', 'Producto A\u2029falso', null],
+      ['a bidi format control', 'Producto \u202eA', null],
+      ['a variant line break', 'Medicine 400 mg', 'caja\n7. falso'],
+    ])('fails closed on a label containing %s', (_label, name, variantName) => {
+      const session = seeded();
+      session.installSearch(session.beginSearch(), [
+        {
+          productId,
+          name,
+          variants:
+            variantName === null
+              ? []
+              : [{ variantId, name: variantName, option: null, value: null }],
+        },
+      ]);
+      expect(session.selectionPrompt()).toBeNull();
+    });
+  });
 });

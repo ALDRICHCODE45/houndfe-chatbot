@@ -21,6 +21,9 @@ const snapshotSchema = z.strictObject({
 });
 export type CatalogReferences = z.infer<typeof snapshotSchema>;
 
+// A Cc/Cf/Zl/Zp char in a label can forge extra choices; fail closed.
+const DISPLAY_BREAKING = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
 export const CATALOG_RECOVERY = {
   ok: false as const,
   error: { kind: 'catalog_identity_unverified', retryable: false },
@@ -173,6 +176,57 @@ export class CatalogSession {
 
   snapshot(): CatalogReferences | null {
     return this.validate(this.#references);
+  }
+
+  /**
+   * Deterministic customer-facing question that asks for an explicit
+   * product/presentation choice using ONLY the currently validated canonical
+   * identities. It ASKS, never selects, and exposes no id, price or stock.
+   * `null` when no snapshot is valid, or when the candidate set is empty, too
+   * large, byte-heavy or indistinguishable, so the caller can fall back to
+   * the generic reply without ever truncating a dose or name.
+   */
+  selectionPrompt(): string | null {
+    const refs = this.snapshot();
+    if (refs === null) return null;
+    const labels: Array<{ text: string; variantless: boolean }> = [];
+    for (const product of refs.products) {
+      if (product.variants.length === 0) {
+        labels.push({ text: product.name, variantless: true });
+        continue;
+      }
+      const names = product.variants.map((variant) => variant.name);
+      const repeated = new Set(
+        names.filter((value, index) => names.indexOf(value) !== index),
+      );
+      for (const variant of product.variants) {
+        const detail = repeated.has(variant.name)
+          ? [variant.option, variant.value]
+              .filter(
+                (part): part is string => part !== null && part.length > 0,
+              )
+              .join(' ')
+          : '';
+        const suffix =
+          detail.length === 0 ? variant.name : `${variant.name}: ${detail}`;
+        labels.push({
+          text: `${product.name} (${suffix})`,
+          variantless: false,
+        });
+      }
+    }
+    if (labels.length === 0 || labels.length > 6) return null;
+    const texts = labels.map((label) => label.text);
+    if (new Set(texts).size !== texts.length) return null;
+    if (texts.some((text) => DISPLAY_BREAKING.test(text))) return null;
+    if (labels.length === 1 && labels[0].variantless) {
+      return `Para consultar existencias, ¿se refiere a «${texts[0]}»?`;
+    }
+    const list = texts.map((text, index) => `${index + 1}. ${text}`).join('\n');
+    const prompt =
+      'Para consultar existencias, necesito identificar el producto y su presentación. ' +
+      `¿Cuál desea consultar?\n${list}`;
+    return Buffer.byteLength(prompt, 'utf8') <= 2048 ? prompt : null;
   }
 
   /** Only references whose original user turn survives prompt truncation. */

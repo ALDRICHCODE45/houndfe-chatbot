@@ -126,8 +126,8 @@ export type StockSubjectRecord = VerifiedStockFact | UnconfirmedStockFact;
 
 /** Truthful generic reply when only an unbound attempted reference failed. */
 export const UNBOUND_STOCK_REPLY =
-  'Por ahora no puedo confirmar la disponibilidad de lo que consultó. ' +
-  '¿Desea que lo revise de nuevo con usted?';
+  'Para consultar existencias, necesito identificar el producto y su presentación. ' +
+  '¿Qué producto y presentación desea consultar?';
 
 function subjectKey(subject: StockReadSubject): string {
   return JSON.stringify([subject.productId, subject.variantId]);
@@ -439,6 +439,16 @@ export class StockReadEvidence {
     return (
       record !== undefined && record.kind === 'verified' && record.step === step
     );
+  }
+
+  /**
+   * True only when no trusted record exists and at least one unbound failure
+   * does: a read was attempted, but every attempt lacked a trusted subject.
+   * The caller may then ask for an explicit choice; this grants no identity
+   * and no write.
+   */
+  hasOnlyUnboundFailures(): boolean {
+    return this.#latest.size === 0 && this.#unbound.length > 0;
   }
 
   /**

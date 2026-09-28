@@ -3495,8 +3495,11 @@ describe('stock conversation boundary (S2)', () => {
     // No write effect was manufactured from the failed read.
     expect(s.sale.definition.execute).not.toHaveBeenCalled();
     expect(s.assistance.definition.execute).not.toHaveBeenCalled();
-    // The approved evidence projection's unbound reply, not legacy copy.
-    expect(result.reply).toBe(UNBOUND_STOCK_REPLY);
+    // The approved evidence projection asks for an explicit canonical
+    // product choice (never legacy copy, never the model's prose).
+    expect(result.reply).toBe(
+      'Para consultar existencias, ¿se refiere a «Ibuprofeno de 400 mg»?',
+    );
   });
 
   it('clears a same-subject identity failure once the trusted product is verified', async () => {
@@ -3608,6 +3611,12 @@ describe('stock conversation boundary (S2)', () => {
     const result = await s.run();
     expect(getStock).not.toHaveBeenCalled();
     expect(await searchCatalog.mock.results[0].value).toBe(variantCatalogDto);
-    expect(result.reply).toBe(UNBOUND_STOCK_REPLY);
+    // The adapter ASKS for an explicit product/presentation choice from the
+    // validated catalog: it neither guesses a GET nor claims stock.
+    expect(result.reply).toBe(
+      'Para consultar existencias, necesito identificar el producto y su presentación. ¿Cuál desea consultar?\n' +
+        '1. Ibuprofeno de 400 mg (400 mg caja con 20 tabletas)\n' +
+        '2. Ibuprofeno de 400 mg (400 mg caja con 40 tabletas)',
+    );
   });
 });
