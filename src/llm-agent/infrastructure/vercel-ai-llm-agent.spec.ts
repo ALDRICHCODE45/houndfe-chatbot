@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { UpstreamError } from '../../chatbot-api/domain/errors';
 import { makeCheckStockTool } from '../../sale-flow/application/tools/check-stock.tool';
+import { makeSearchCatalogTool } from '../../sale-flow/application/tools/search-catalog.tool';
 import { makeRequestHumanAssistanceTool } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { ToolDeps } from '../../sale-flow/application/tool-deps';
 import { openai } from '@ai-sdk/openai';
@@ -14,7 +15,9 @@ import { composeSaleFlowSystemPrompt } from '../../sale-flow/domain/sale-flow-in
 import { GENERATE_TEXT, type GenerateTextFn } from './generate-text.provider';
 import {
   createInventorySeparationGate,
+  INVENTORY_CLARIFICATION_REPLY,
   INVENTORY_UNCONFIRMED_REPLY,
+  RECOVERY_LOCK_REASON,
   STOCK_FIRST_DENIAL_REASON,
   VercelAiLlmAgent,
 } from './vercel-ai-llm-agent';
@@ -2034,5 +2037,549 @@ describe('inventory evidence separation (R2)', () => {
         'not-applicable',
       );
     });
+  });
+});
+
+describe('catalog stock recovery through the real SDK', () => {
+  const productId = '00000000-0000-4000-8000-000000000001';
+  const adversarialId = '00000000-0000-4000-8000-0000000000aa';
+  const usage = {
+    inputTokens: {
+      total: 1,
+      noCache: 1,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: { total: 1, text: 1, reasoning: undefined },
+  };
+  const call = (toolCallId: string, toolName: string, input: string) => ({
+    type: 'tool-call' as const,
+    toolCallId,
+    toolName,
+    input,
+  });
+  const stockResponse = {
+    productId,
+    name: 'Ibuprofeno de 400 mg',
+    stock: { status: 'available', quantity: 7 },
+    variants: [],
+  };
+  const catalogItem = {
+    productId,
+    name: 'Ibuprofeno de 400 mg',
+    brand: null,
+    imageUrl: null,
+    description: null,
+    price: {
+      priceCents: 100,
+      fromPriceCents: null,
+      promoPriceCents: null,
+      promotionEvaluationStatus: 'needs_human_review' as const,
+    },
+    stock: { status: 'available' as const, quantity: 7 },
+    packageInfo: { weightGrams: null, dimensions: null },
+    variants: [],
+  };
+  // Production incident: prior user asks about ibuprofeno, the assistant asks
+  // whether it should check availability, and the customer answers "Si por
+  // favor".
+  const history = [
+    { role: 'user' as const, content: 'Buenas tardes, tienen ibuprofeno?' },
+    {
+      role: 'assistant' as const,
+      content:
+        'Claro. ¿Quieres que revise la disponibilidad de Ibuprofeno de 400 mg?',
+    },
+  ];
+
+  function scenario(options: {
+    steps: Array<
+      Array<{ toolCallId: string; toolName: string; input: string }> | string
+    >;
+    text: string;
+    maxSteps: number;
+    getStock: jest.Mock;
+    catalog?: Array<typeof catalogItem>;
+    extraTools?: Record<string, unknown>;
+    seedCatalog?: boolean;
+    history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  }) {
+    const searchCatalog = jest
+      .fn()
+      .mockResolvedValue(options.catalog ?? [catalogItem]);
+    const sale = {
+      execute: jest.fn(async () => ({ ok: true })),
+      definition: tool({
+        description: 'createSale stub',
+        inputSchema: z.object({}),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
+    const tools = {
+      checkStock: makeCheckStockTool({
+        chatbotApi: { getStock: options.getStock },
+      } as unknown as ToolDeps),
+      searchCatalog: makeSearchCatalogTool({
+        chatbotApi: { searchCatalog },
+      } as unknown as ToolDeps),
+      createSale: sale.definition,
+      ...(options.extraTools ?? {}),
+    };
+    const doGenerate = options.steps.map((step) =>
+      typeof step === 'string'
+        ? {
+            content: [{ type: 'text' as const, text: step }],
+            finishReason: { unified: 'stop', raw: undefined },
+            usage,
+            warnings: [],
+          }
+        : {
+            content: step,
+            finishReason: { unified: 'tool-calls', raw: undefined },
+            usage,
+            warnings: [],
+          },
+    );
+    const model = new MockLanguageModelV4({ doGenerate } as never);
+    let captured:
+      | { steps: Array<{ content: Array<Record<string, unknown>> }> }
+      | undefined;
+    const generate: GenerateTextFn = async (input) => {
+      const result = await generateText({ ...input, model });
+      captured = result as unknown as typeof captured;
+      return result;
+    };
+    const agent = new VercelAiLlmAgent(generate, 'unused', options.maxSteps);
+    const catalogSession = new CatalogSession('sender', 60000, 0);
+    if (options.seedCatalog) {
+      catalogSession.installSearch(catalogSession.beginSearch(), [catalogItem]);
+    }
+    const run = () =>
+      agent.run({
+        senderId: 'sender',
+        text: options.text,
+        history: options.history ?? history,
+        systemPrompt: 'BOOT',
+        tools,
+        catalogSession,
+      });
+    return {
+      run,
+      model,
+      getStock: options.getStock,
+      searchCatalog,
+      sale,
+      captured: () => captured!,
+    };
+  }
+
+  it('recovers the affirmative continuation with exactly one trusted GET', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        // Adversarial model argument: the server-selected input must win.
+        [
+          call(
+            'recover',
+            'checkStock',
+            JSON.stringify({ productId: adversarialId }),
+          ),
+        ],
+        'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(productId);
+    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(result.reply).toBe(
+      'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
+    );
+    // Failed check, fresh search, forced stock and final render: no extra step.
+    expect(s.model.doGenerateCalls).toHaveLength(4);
+  });
+
+  it('keeps a divergent failed identity unresolved instead of clearing it blindly', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [
+          call(
+            'fail',
+            'checkStock',
+            JSON.stringify({ productId: adversarialId }),
+          ),
+        ],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [call('recover', 'checkStock', JSON.stringify({ productId }))],
+        'Sí, tenemos disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(productId);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('fails closed when the provider ignores the forced stock step', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        'Sí, claro que sí está disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    // The forced step was consumed (fail, search, ignored force) and refused.
+    expect(s.model.doGenerateCalls).toHaveLength(3);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('denies a mutation emitted during the forced recovery step', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [
+          call('recover', 'checkStock', JSON.stringify({ productId })),
+          call('sale', 'createSale', '{}'),
+        ],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('fails closed when the forced stock lookup itself fails', async () => {
+    const getStock = jest
+      .fn()
+      .mockRejectedValue(new UpstreamError('boom', 503));
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [call('recover', 'checkStock', JSON.stringify({ productId }))],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('preserves the reply when a prior mutation may have had effects', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 5,
+      getStock,
+      steps: [
+        [call('sale', 'createSale', '{}')],
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [call('recover', 'checkStock', JSON.stringify({ productId }))],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.sale.definition.execute).toHaveBeenCalledTimes(1);
+    expect(result.reply).toBe('Sí, disponible.');
+  });
+
+  it('keeps the ordinary budget and never forges recovery at a low step cap', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 2,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [call('recover', 'checkStock', JSON.stringify({ productId }))],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    // The ordinary budget of two steps is kept; no forced recovery is added.
+    expect(s.model.doGenerateCalls).toHaveLength(2);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+  });
+
+  it('does not auto-GET from an assistant-only subject even with a prior valid snapshot', async () => {
+    // Old behavior armed a proactive GET on the first prepareStep from the
+    // assistant's own availability question. There is no this-run identity
+    // failure and no fresh search, so nothing may be forced.
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 2,
+      getStock,
+      seedCatalog: true,
+      steps: [
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        'Claro, ¿te gustaría que revise disponibilidad?',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    expect(result.reply).toBe('Claro, ¿te gustaría que revise disponibilidad?');
+    expect(s.model.doGenerateCalls).toHaveLength(2);
+  });
+
+  it('denies a mutation emitted in the forced final step before it can execute', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [call('recover', 'checkStock', JSON.stringify({ productId }))],
+        // The final step is contracted as tool-free, but the model ignores it.
+        [call('sale', 'createSale', '{}')],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(productId);
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    // Denied BEFORE execution by the hard recovery lock, not merely detected.
+    const content = s.captured().steps[3].content;
+    expect(
+      content.find((part) => part.type === 'tool-approval-response'),
+    ).toMatchObject({ approved: false, reason: RECOVERY_LOCK_REASON });
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    // Bounded exit: the failed choreography stops the run immediately.
+    expect(s.model.doGenerateCalls).toHaveLength(4);
+  });
+
+  it('denies an unknown tool emitted in the forced final step', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const mystery = {
+      execute: jest.fn(async () => ({ ok: true })),
+      definition: tool({
+        description: 'listProducts stub',
+        inputSchema: z.object({}),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      extraTools: { listProducts: mystery.definition },
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [call('recover', 'checkStock', JSON.stringify({ productId }))],
+        [call('u', 'listProducts', '{}')],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(mystery.definition.execute).not.toHaveBeenCalled();
+    const content = s.captured().steps[3].content;
+    expect(
+      content.find((part) => part.type === 'tool-approval-response'),
+    ).toMatchObject({ approved: false, reason: RECOVERY_LOCK_REASON });
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(4);
+  });
+
+  it('executes only one forced stock lookup when the model emits a duplicate', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        [
+          call('r1', 'checkStock', JSON.stringify({ productId })),
+          call('r2', 'checkStock', JSON.stringify({ productId })),
+        ],
+        'Sí, disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(productId);
+    // The duplicate is denied pre-execution by the lock, not only deduped.
+    const denied = s
+      .captured()
+      .steps[2].content.filter(
+        (part) => part.type === 'tool-approval-response',
+      );
+    expect(denied).toEqual([
+      expect.objectContaining({
+        approved: false,
+        reason: RECOVERY_LOCK_REASON,
+      }),
+    ]);
+    expect(result.reply).toBe(INVENTORY_UNCONFIRMED_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(3);
+  });
+
+  it('asks a clarification when the assistant proposed an unsupported subject, without a GET', async () => {
+    // The fresh search resolves only ibuprofeno, but the assistant offered to
+    // check paracetamol: the customer never affirmed that subject, so nothing
+    // may be forced and the reply must be a truthful clarification.
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      history: [
+        { role: 'user', content: '¿Tienen ibuprofeno?' },
+        {
+          role: 'assistant',
+          content: '¿Quieres que revise disponibilidad de paracetamol?',
+        },
+      ],
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        'Sí, tenemos disponible.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(3);
+  });
+
+  it('asks a truthful clarification instead of a stock claim when the fresh search is ambiguous', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'Si por favor',
+      maxSteps: 3,
+      getStock,
+      catalog: [
+        catalogItem,
+        {
+          ...catalogItem,
+          productId: '00000000-0000-4000-8000-000000000002',
+          name: 'Ibuprofeno de 800 mg',
+        },
+      ],
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        'Encontré varias presentaciones.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(3);
   });
 });

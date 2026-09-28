@@ -1,11 +1,19 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { stepCountIs } from 'ai';
 import type { ModelMessage, ToolExecutionEndEvent } from 'ai';
 import { openai } from '@ai-sdk/openai';
-import { CatalogSession } from '../../conversation/domain/catalog-references';
+import {
+  CatalogSession,
+  CATALOG_RECOVERY,
+} from '../../conversation/domain/catalog-references';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import type { AgentMessage } from '../domain/agent-message';
+import {
+  CatalogStockRecoveryRun,
+  catalogStockRecoveryInput,
+  selectCatalogStockRecovery,
+  type CatalogStockRecoveryTarget,
+} from '../domain/catalog-stock-recovery';
 import {
   InventoryEvidenceGuard,
   isNonMutatingToolName,
@@ -32,6 +40,51 @@ export const INVENTORY_UNCONFIRMED_REPLY =
 /** Automatic denial reason for a mutating sibling of checkStock in one batch. */
 export const STOCK_FIRST_DENIAL_REASON =
   'Complete the stock check first and call this tool again in a later step.';
+
+/**
+ * Pre-execution denial reason while the one-shot recovery is in flight. The
+ * lock only engages after the recovery arms, but from then on NO tool may run
+ * except the single authorized `checkStock`, and nothing at all in the final
+ * render step.
+ */
+export const RECOVERY_LOCK_REASON =
+  'Stock recovery in progress: only the single authorized checkStock call may execute.';
+
+/**
+ * Truthful clarification for an ambiguous post-failure recovery: the customer
+ * asked for availability, a stock check failed on identity, a fresh search
+ * produced a valid snapshot, yet no single product/presentation could be
+ * selected. It never claims availability or exhaustion and never starts a
+ * blind retry loop.
+ */
+export const INVENTORY_CLARIFICATION_REPLY =
+  'Para no darle un dato equivocado, necesito confirmar el producto y su ' +
+  'presentación exacta (por ejemplo, la dosis o el tamaño). ¿Me confirma el ' +
+  'nombre completo y la presentación que busca?';
+
+/**
+ * Extra steps a forced recovery may use beyond the ordinary cap: the forced
+ * `checkStock` step and the forced tool-free final step. Ordinary runs never
+ * see this allowance.
+ */
+const RECOVERY_EXTRA_STEPS = 2;
+
+/**
+ * Read the one executable `checkStock` tool, or `null` when this run has none.
+ * The definition is copied, never mutated: the caller's ToolSet is shared.
+ */
+function executableCheckStock(tools: Record<string, unknown>): {
+  definition: Record<string, unknown>;
+  execute: (input: unknown, options: unknown) => unknown;
+} | null {
+  const definition = asRecord(tools['checkStock']);
+  const execute = definition?.execute;
+  if (definition === null || typeof execute !== 'function') return null;
+  return {
+    definition,
+    execute: execute as (input: unknown, options: unknown) => unknown,
+  };
+}
 
 export type SeparationDecision = 'denied' | 'not-applicable';
 
@@ -138,6 +191,25 @@ export function createInventorySeparationGate(
   };
 }
 
+/**
+ * Choose the outgoing reply. A possible effect (any executed non-read-only
+ * tool) always preserves the model reply so an effect is never hidden. With
+ * nothing executed: a violated choreography or an unresolved stock failure is
+ * replaced by the truthful fallback, and an evaluated-but-declined recovery
+ * gate gets the specific clarification instead of the retry-oriented text.
+ */
+function recoveryReply(
+  fallback: string,
+  guard: InventoryEvidenceGuard,
+  recovery: CatalogStockRecoveryRun,
+): string {
+  if (guard.hasExecutedMutation()) return fallback;
+  if (recovery.failed) return INVENTORY_UNCONFIRMED_REPLY;
+  if (recovery.requiresClarification) return INVENTORY_CLARIFICATION_REPLY;
+  if (guard.hasUnresolvedStockFailure()) return INVENTORY_UNCONFIRMED_REPLY;
+  return fallback;
+}
+
 /** Map one completed SDK step into the guard's SDK-agnostic evidence shape. */
 function extractInventoryCalls(step: unknown): InventoryCallEvidence[] {
   const content = asRecord(step)?.content;
@@ -226,6 +298,7 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     // tools don't appear here — the SDK only requires an entry for
     // tools that declare a contextSchema.
     const inboundEvent = forwardableInboundEvent(input);
+    const sourceTools = input.tools ?? {};
     const toolsContext: Record<
       string,
       {
@@ -256,15 +329,14 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     };
 
     for (const name of ['searchCatalog', 'checkStock']) {
-      if (input.tools !== null && name in input.tools)
-        toolsContext[name] = catalogContext;
+      if (name in sourceTools) toolsContext[name] = catalogContext;
     }
 
     // SQ-5B2B3: the price-stripped `getShippingQuote` tool also declares
     // `contextSchema: z.object({ senderId })`. The AI-SDK validates that
     // every tool with a contextSchema has a matching map entry, so add it
     // ONLY when the tool is actually present in this run's ToolSet.
-    if (input.tools !== null && 'getShippingQuote' in input.tools) {
+    if ('getShippingQuote' in sourceTools) {
       toolsContext.getShippingQuote = { senderId: input.senderId };
     }
     const diagnostic = catalogDiagnostic(this.logger);
@@ -272,9 +344,47 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     const separation = createInventorySeparationGate(() =>
       guard.hasUnresolvedStockFailure(),
     );
-    const nonMutatingActiveTools = Object.keys(input.tools ?? {}).filter(
+    const nonMutatingActiveTools = Object.keys(sourceTools).filter(
       isNonMutatingToolName,
     );
+
+    // Conservative, one-shot read-only stock recovery. The selector reads the
+    // current authentic text, the retained history and the validated snapshot;
+    // it only produces a trusted target for an unambiguous product. The
+    // forced step wraps the real tool so the server-selected input executes
+    // regardless of the model's arguments.
+    const recovery = new CatalogStockRecoveryRun({
+      checkStockAvailable: executableCheckStock(sourceTools) !== null,
+      select: () =>
+        selectCatalogStockRecovery({
+          text: input.text,
+          history: input.history,
+          snapshot: catalogSession?.snapshot() ?? null,
+        }),
+      snapshotAvailable: () => (catalogSession?.snapshot() ?? null) !== null,
+    });
+    let forcedTarget: CatalogStockRecoveryTarget | null = null;
+    let forcedUsed = false;
+    const checkStock = executableCheckStock(sourceTools);
+    const tools =
+      checkStock === null
+        ? (sourceTools as never)
+        : ({
+            ...sourceTools,
+            checkStock: {
+              ...checkStock.definition,
+              execute: (modelInput: unknown, options: unknown) => {
+                if (forcedTarget === null)
+                  return checkStock.execute(modelInput, options);
+                if (forcedUsed) return Promise.resolve(CATALOG_RECOVERY);
+                forcedUsed = true;
+                return checkStock.execute(
+                  catalogStockRecoveryInput(forcedTarget),
+                  options,
+                );
+              },
+            },
+          } as never);
     let result: Awaited<ReturnType<GenerateTextFn>>;
     try {
       result = await this.generateTextFn({
@@ -289,24 +399,64 @@ export class VercelAiLlmAgent implements LlmAgentPort {
             }
           : { system: input.systemPrompt }),
         messages,
-        tools: input.tools as never,
+        tools,
         toolsContext,
-        stopWhen: stepCountIs(this.maxSteps),
+        stopWhen: (options: { steps?: ReadonlyArray<unknown> }) => {
+          // A violated recovery choreography stops immediately; otherwise the
+          // ordinary cap applies, extended only while forced recovery steps
+          // are outstanding.
+          if (recovery.failed) return true;
+          const completed = Array.isArray(options?.steps)
+            ? options.steps.length
+            : 0;
+          return recovery.extendsBudget
+            ? completed >= this.maxSteps + RECOVERY_EXTRA_STEPS
+            : completed >= this.maxSteps;
+        },
         // Batch metadata is captured BEFORE any approval/execution and the
         // generic approval runs against it (the SDK never shows siblings).
         onLanguageModelCallEnd: (event: unknown) => separation.capture(event),
-        toolApproval: (options: unknown) =>
-          separation.approve(asRecord(options)?.toolCall) === 'denied'
+        toolApproval: (options: unknown) => {
+          const toolCall = asRecord(options)?.toolCall;
+          if (recovery.deniesExecution(asRecord(toolCall)?.toolName)) {
+            return { type: 'denied' as const, reason: RECOVERY_LOCK_REASON };
+          }
+          return separation.approve(toolCall) === 'denied'
             ? { type: 'denied' as const, reason: STOCK_FIRST_DENIAL_REASON }
-            : { type: 'not-applicable' as const },
+            : { type: 'not-applicable' as const };
+        },
         // While a stock failure is unresolved, hide mutating tools from the
         // model; a verified same-subject recovery restores the full set.
-        prepareStep: () =>
-          guard.hasUnresolvedStockFailure()
+        // A forced recovery step instead restricts to `checkStock`, then to no
+        // tools at all for the final render.
+        prepareStep: () => {
+          const directive = recovery.nextDirective();
+          if (directive.kind === 'force-stock') {
+            forcedTarget = directive.target;
+            forcedUsed = false;
+            return {
+              activeTools: ['checkStock'],
+              toolChoice: { type: 'tool' as const, toolName: 'checkStock' },
+            };
+          }
+          if (
+            directive.kind === 'force-final' ||
+            directive.kind === 'fail-closed'
+          ) {
+            forcedTarget = null;
+            return { activeTools: [] as string[], toolChoice: 'none' as const };
+          }
+          return guard.hasUnresolvedStockFailure()
             ? { activeTools: nonMutatingActiveTools }
-            : undefined,
+            : undefined;
+        },
         onStepFinish: (step: unknown) => {
-          guard.recordStep(extractInventoryCalls(step));
+          // The recovery controller validates the forced step and substitutes
+          // the effective input the R2 guard must account for.
+          const outcome = recovery.completeStep(extractInventoryCalls(step));
+          forcedTarget = null;
+          forcedUsed = false;
+          guard.recordStep(outcome.calls);
           diagnostic.onStepFinish(step as { toolCalls: unknown });
         },
         onToolExecutionEnd: diagnostic.onToolExecutionEnd,
@@ -322,13 +472,13 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       completionTokens: result.usage?.outputTokens ?? 0,
     };
 
-    // Conservative reply override: ONLY an unresolved stock failure with no
-    // earlier executed mutation is replaced. Any mutating execution (even an
-    // ambiguous error return) preserves the model reply to avoid hiding effects.
-    const reply =
-      guard.hasUnresolvedStockFailure() && !guard.hasExecutedMutation()
-        ? INVENTORY_UNCONFIRMED_REPLY
-        : result.text;
+    // Conservative reply override: an unresolved stock failure (or a violated
+    // recovery choreography) with no earlier executed mutation is replaced.
+    // A truthful clarification replaces the retry-oriented message when the
+    // recovery gate was evaluated and declined. Any mutating execution (even
+    // an ambiguous error return) preserves the model reply to avoid hiding
+    // effects.
+    const reply = recoveryReply(result.text, guard, recovery);
 
     return {
       reply,
