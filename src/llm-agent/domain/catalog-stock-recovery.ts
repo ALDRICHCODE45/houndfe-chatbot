@@ -10,9 +10,12 @@
  *
  * This module only recognizes the narrow subset of customer text that
  * authorizes an automatic READ-ONLY stock retry: a bounded availability
- * phrase, or a strict affirmative continuation of an availability question
- * asked right after a real customer availability turn (the subject always
- * comes from the customer, never from the assistant). The run controller
+ * phrase, a strict affirmative continuation of an availability question
+ * asked right after a real customer availability turn, or a strict answer to
+ * its own fixed inventory clarification. The clarification path is authorized
+ * only through a bounded, recognized continuation chain that reaches an
+ * authentic customer availability turn for the same identity (the subject
+ * always comes from the customer, never from the assistant). The run controller
  * additionally arms only after this run observed an identity-unverified
  * `checkStock` failure and a later successful fresh search. A target is
  * produced only when the reference matches exactly one product in the
@@ -262,6 +265,44 @@ const AFFIRMATIVES = new Set<string>([
   'vale',
 ]);
 
+/**
+ * Closed whitelist of measurement units eligible for digit/unit adjacency
+ * folding. `400mg` and `400 mg` must tokenize alike while `400g` never
+ * matches `400mg` and `400` never matches `200`.
+ */
+const CLARIFICATION_UNITS = new Set<string>([
+  'g',
+  'kg',
+  'mcg',
+  'mg',
+  'ml',
+  'ui',
+]);
+
+/**
+ * Fold only adjacent number/unit pairs whose unit is in the closed whitelist,
+ * so `400mg` becomes the same evidence as `400 mg`. Every other unit is left
+ * untouched, which is why `400g` can never be mistaken for `400mg`.
+ */
+function normalizeUnitAdjacency(value: string): string {
+  return fold(value).replace(
+    /(\d+)\s*([a-z]+)/g,
+    (match: string, digits: string, unit: string) =>
+      CLARIFICATION_UNITS.has(unit) ? `${digits} ${unit}` : match,
+  );
+}
+
+/**
+ * Tokenize a clarification answer: apply the closed unit folding and drop an
+ * exact leading `busco` (never an arbitrary lead-in). Shortening or padding
+ * the answer therefore changes the tokens and rejects the recovery.
+ */
+function clarificationTokens(value: string): string[] {
+  const tokens = words(normalizeUnitAdjacency(value));
+  const withoutPrefix = tokens[0] === 'busco' ? tokens.slice(1) : tokens;
+  return withoutPrefix.filter((word) => !STOPWORDS.has(word));
+}
+
 function normalizePhrase(value: string): string {
   return fold(value)
     .replace(/[^a-z0-9]+/g, ' ')
@@ -403,6 +444,257 @@ function resolve(
   };
 }
 
+function sameTarget(
+  a: CatalogStockRecoveryTarget,
+  b: CatalogStockRecoveryTarget,
+): boolean {
+  return a.productId === b.productId && a.variantId === b.variantId;
+}
+
+/**
+ * Token set for one candidate identity: the product's significant name tokens
+ * plus, when a variant is selected, that variant's significant name tokens.
+ * Overlapping tokens (a dose restated by the variant) collapse, so a shared
+ * `400 mg` never coexists with an unselected `800 mg`.
+ */
+function candidateTokens(
+  product: CatalogStockRecoveryProduct,
+  variant: CatalogStockRecoveryVariant | null,
+): ReadonlySet<string> {
+  const tokens = new Set<string>(clarificationTokens(product.name));
+  if (variant !== null) {
+    for (const token of clarificationTokens(variant.name)) tokens.add(token);
+  }
+  return tokens;
+}
+
+function sameTokens(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const token of a) if (!b.has(token)) return false;
+  return true;
+}
+
+/**
+ * Strict clarification resolution over candidate IDENTITIES, not products.
+ *
+ * Every product-only identity (a product without variants) and every
+ * `(product, variant)` pair is a candidate; the answer's significant tokens
+ * must equal exactly one candidate's token set — nothing missing and nothing
+ * extra. That single rule rejects a wrong dose, a stray unselected variant
+ * token, an added product, and a partially named product, while still
+ * recovering a full variant answer whose dose tokens also appear in the
+ * product name. A product that has variants can never resolve from its
+ * product name alone, so an omitted presentation stays unselected.
+ */
+function strictResolve(
+  snapshot: CatalogStockRecoverySnapshot | null,
+  reference: ReadonlySet<string>,
+): CatalogStockRecoveryDecision {
+  if (
+    snapshot === null ||
+    snapshot.products.length === 0 ||
+    reference.size === 0
+  ) {
+    return { kind: 'none' };
+  }
+  const candidates: CatalogStockRecoveryTarget[] = [];
+  for (const product of snapshot.products) {
+    if (product.variants.length === 0) {
+      if (sameTokens(candidateTokens(product, null), reference)) {
+        candidates.push({ productId: product.productId, variantId: null });
+      }
+      continue;
+    }
+    for (const variant of product.variants) {
+      if (sameTokens(candidateTokens(product, variant), reference)) {
+        candidates.push({
+          productId: product.productId,
+          variantId: variant.variantId,
+        });
+      }
+    }
+  }
+  if (candidates.length !== 1) return { kind: 'none' };
+  return { kind: 'recover', target: candidates[0] };
+}
+
+/** Bounded retained-history suffix that must carry the continuation chain. */
+const CLARIFICATION_HISTORY_WINDOW = 8;
+
+/** The product a resolved target points at, or null when it vanished. */
+function findProduct(
+  snapshot: CatalogStockRecoverySnapshot | null,
+  productId: string,
+): CatalogStockRecoveryProduct | null {
+  return snapshot?.products.find((p) => p.productId === productId) ?? null;
+}
+
+function targetVariant(
+  product: CatalogStockRecoveryProduct,
+  target: CatalogStockRecoveryTarget,
+): CatalogStockRecoveryVariant | null {
+  if (target.variantId === null) return null;
+  return product.variants.find((v) => v.variantId === target.variantId) ?? null;
+}
+
+/** True when an assistant turn is the exact fixed clarification delimiter. */
+function isDelimiterTurn(content: unknown, delimiter: string): boolean {
+  return typeof content === 'string' && content === delimiter;
+}
+
+function isAffirmativeTurn(content: unknown): boolean {
+  return (
+    typeof content === 'string' && AFFIRMATIVES.has(normalizePhrase(content))
+  );
+}
+
+/**
+ * True when a customer turn is an authentic availability question that may
+ * anchor the retry for the pending identity. Product-level matching tolerates
+ * leaving the variant for the clarification to refine, but every significant
+ * token the customer named (product, dose, variant) must be consistent with
+ * the selected identity. An unsupported product such as paracetamol, or a
+ * dose the target does not carry, therefore cannot anchor the retry.
+ */
+function isAvailabilityAnchorTurn(
+  content: unknown,
+  snapshot: CatalogStockRecoverySnapshot | null,
+  target: CatalogStockRecoveryTarget,
+): boolean {
+  if (!hasAvailabilityCue(content)) return false;
+  const reference = new Set(referenceTokens(String(content)));
+  if (reference.size === 0) return false;
+  const product = findProduct(snapshot, target.productId);
+  if (product === null || !matchesProduct(product, reference)) return false;
+  const identity = candidateTokens(product, targetVariant(product, target));
+  return [...reference].every((token) => identity.has(token));
+}
+
+/**
+ * True when a customer turn is itself a strict answer to an earlier fixed
+ * clarification for the SAME pending identity. A prior answer that selected a
+ * different product or variant breaks the chain instead of being ignored.
+ */
+function isClarificationAnswerTurn(
+  content: unknown,
+  snapshot: CatalogStockRecoverySnapshot | null,
+  target: CatalogStockRecoveryTarget,
+): boolean {
+  if (typeof content !== 'string') return false;
+  const decision = strictResolve(
+    snapshot,
+    new Set(clarificationTokens(content)),
+  );
+  return decision.kind === 'recover' && sameTarget(decision.target, target);
+}
+
+/**
+ * A fixed-clarification answer is authorized only when the immediately
+ * preceding assistant turn is the exact clarification AND the retained suffix
+ * carries a contiguous, recognized continuation chain back to an authentic
+ * customer availability turn for the same pending identity.
+ *
+ * The bounded suffix is read backwards and the chain advances only on
+ * explicitly recognized shapes:
+ *   - assistant: the exact fixed clarification, or an availability question;
+ *   - customer: an availability anchor for the pending identity, a strict
+ *     short affirmative, or a strict clarification answer for that identity.
+ * The chain starts at a customer availability anchor and succeeds only when
+ * one is reached. Every other turn — a cancellation, a new topic, an
+ * unsupported product, a conflicting dose, an answer for another identity, or
+ * an unrecognized assistant message — ends the walk and rejects. This is a
+ * positive recognition rule, never an ad hoc keyword list: a turn that is not
+ * recognized simply cannot continue the chain. The exact clarification copy is
+ * therefore a delimiter, not authority.
+ */
+function hasContinuationChain(
+  history: ReadonlyArray<CatalogStockRecoveryMessage>,
+  snapshot: CatalogStockRecoverySnapshot | null,
+  target: CatalogStockRecoveryTarget,
+  delimiter: string,
+): boolean {
+  const start = Math.max(0, history.length - CLARIFICATION_HISTORY_WINDOW);
+  let index = history.length - 1;
+  const last = history[index];
+  if (
+    last === undefined ||
+    last.role !== 'assistant' ||
+    !isDelimiterTurn(last.content, delimiter)
+  ) {
+    return false;
+  }
+  index -= 1;
+  while (index >= start) {
+    const message = history[index];
+    if (message === undefined) return false;
+    if (message.role === 'assistant') {
+      if (
+        !isDelimiterTurn(message.content, delimiter) &&
+        !isAvailabilityQuestion(message.content)
+      ) {
+        return false;
+      }
+      index -= 1;
+      continue;
+    }
+    if (message.role === 'user') {
+      if (isAvailabilityAnchorTurn(message.content, snapshot, target)) {
+        return true;
+      }
+      if (
+        isAffirmativeTurn(message.content) ||
+        isClarificationAnswerTurn(message.content, snapshot, target)
+      ) {
+        index -= 1;
+        continue;
+      }
+      return false;
+    }
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Resolve a customer answer to the bot's own fixed clarification. Engagement
+ * requires the exact clarification text as the immediately preceding assistant
+ * turn (the adapter passes it; the domain never imports the adapter) plus a
+ * contiguous, recognized customer continuation chain ending in an authentic
+ * availability turn for the same identity. Everything else returns `null` so
+ * the ordinary branches keep their behavior, and an engaged but unresolved
+ * answer returns `none` instead of silently reusing old intent.
+ */
+function clarificationAnswer(
+  input: CatalogStockRecoveryInput,
+): CatalogStockRecoveryDecision | null {
+  const delimiter = input.clarificationText;
+  if (typeof delimiter !== 'string' || delimiter.length === 0) return null;
+  const assistant = input.history[input.history.length - 1];
+  if (
+    assistant === undefined ||
+    assistant.role !== 'assistant' ||
+    !isDelimiterTurn(assistant.content, delimiter)
+  ) {
+    return null;
+  }
+  const decision = strictResolve(
+    input.snapshot,
+    new Set(clarificationTokens(input.text)),
+  );
+  if (decision.kind !== 'recover') return { kind: 'none' };
+  if (
+    !hasContinuationChain(
+      input.history,
+      input.snapshot,
+      decision.target,
+      delimiter,
+    )
+  ) {
+    return { kind: 'none' };
+  }
+  return decision;
+}
+
 /** True when a completed step returned the identity-unverified recovery envelope. */
 function isIdentityFailure(call: InventoryCallEvidence): boolean {
   if (call.toolName !== 'checkStock' || call.state !== 'result') return false;
@@ -420,27 +712,45 @@ function isSearchSuccess(call: InventoryCallEvidence): boolean {
   );
 }
 
+export interface CatalogStockRecoveryInput {
+  readonly text: string;
+  readonly history: ReadonlyArray<CatalogStockRecoveryMessage>;
+  readonly snapshot: CatalogStockRecoverySnapshot | null;
+  /**
+   * Exact fixed clarification text the adapter used for its immediately
+   * preceding question, or `undefined` when the bot did not clarify. It is a
+   * delimiter only: the domain never imports the adapter copy.
+   */
+  readonly clarificationText?: string;
+}
+
 /**
- * Recover a current availability phrase, or a strict affirmative continuation
- * whose subject comes from a real customer turn. Everything else returns
- * `none` so the ordinary model turn keeps its freedom.
+ * Recover a current availability phrase, a strict affirmative continuation
+ * whose subject comes from a real customer turn, or a strict answer to the
+ * bot's own fixed clarification. Everything else returns `none` so the
+ * ordinary model turn keeps its freedom.
  *
  * The customer, never the assistant, supplies the availability intent and the
  * product phrase. The assistant's availability question is only a constraint:
  * it must be the immediately preceding turn, and any subject it names must
  * resolve unambiguously to the customer's exact product and variant. A
  * question that names no subject (generic offer wording) constrains nothing;
- * an unsupported or conflicting proposal rejects the recovery.
+ * an unsupported or conflicting proposal rejects the recovery. The
+ * clarification continuation likewise requires the exact fixed delimiter as
+ * the immediately preceding turn plus a bounded, recognized customer
+ * continuation chain that reaches an authentic availability turn for the same
+ * identity, and resolves its answer strictly over candidate identities (one
+ * product, or one explicit product+variant pair).
  */
-export function selectCatalogStockRecovery(input: {
-  readonly text: string;
-  readonly history: ReadonlyArray<CatalogStockRecoveryMessage>;
-  readonly snapshot: CatalogStockRecoverySnapshot | null;
-}): CatalogStockRecoveryDecision {
+export function selectCatalogStockRecovery(
+  input: CatalogStockRecoveryInput,
+): CatalogStockRecoveryDecision {
   const currentWords = words(input.text);
   if (currentWords.some((word) => AVAILABILITY_CUES.has(word))) {
     return resolve(input.snapshot, new Set(referenceTokens(input.text)));
   }
+  const clarification = clarificationAnswer(input);
+  if (clarification !== null) return clarification;
   if (!AFFIRMATIVES.has(normalizePhrase(input.text))) {
     return { kind: 'none' };
   }

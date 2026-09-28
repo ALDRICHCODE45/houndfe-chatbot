@@ -51,7 +51,8 @@ const select = (
   text: string,
   snapshot: CatalogStockRecoverySnapshot | null = simple,
   history: { role: string; content: unknown }[] = [],
-) => selectCatalogStockRecovery({ text, history, snapshot });
+  clarificationText?: string,
+) => selectCatalogStockRecovery({ text, history, snapshot, clarificationText });
 
 const availabilityQuestion = {
   role: 'assistant',
@@ -241,6 +242,373 @@ describe('selectCatalogStockRecovery', () => {
         { role: 'assistant', content: 'Sí, claro.' },
         availabilityQuestion,
       ]),
+    ).toEqual({ kind: 'none' });
+  });
+});
+
+describe('selectCatalogStockRecovery clarification continuation', () => {
+  // Byte-identical to the adapter's INVENTORY_CLARIFICATION_REPLY. Any drift
+  // only disables the branch (the delimiter never matches), so this local
+  // copy cannot weaken the domain boundary.
+  const clarification =
+    'Para no darle un dato equivocado, necesito confirmar el producto y su ' +
+    'presentación exacta (por ejemplo, la dosis o el tamaño). ¿Me confirma el ' +
+    'nombre completo y la presentación que busca?';
+  const anchor = {
+    role: 'user',
+    content: 'Buenas tardes, tienen ibuprofeno?',
+  };
+  const offer = {
+    role: 'assistant',
+    content:
+      'Claro. ¿Quieres que revise la disponibilidad de Ibuprofeno de 400 mg?',
+  };
+  const affirmative = { role: 'user', content: 'si por favor' };
+  const clarified = { role: 'assistant', content: clarification };
+  const fullConversation = [anchor, offer, affirmative, clarified];
+  // Representative variant payloads. These are NOT known production shapes;
+  // they only exercise the selector's identity rules.
+  const dosedVariants = {
+    products: [
+      product(PRODUCT_ID, 'Ibuprofeno de 400mg', [
+        variant(VARIANT_ID, '400 mg caja con 20 tabletas'),
+        variant(OTHER_VARIANT_ID, '400 mg caja con 40 tabletas'),
+      ]),
+    ],
+  };
+  const genericWithDoses = {
+    products: [
+      product(PRODUCT_ID, 'Ibuprofeno', [
+        variant(VARIANT_ID, '400 mg caja con 20 tabletas'),
+        variant(OTHER_VARIANT_ID, '800 mg caja con 40 tabletas'),
+      ]),
+    ],
+  };
+
+  it('recovers a strict answer with normalized number/unit adjacency', () => {
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        simple,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: null },
+    });
+  });
+
+  it('treats the spaced and unspaced dose as the same evidence', () => {
+    expect(
+      select(
+        'busco ibuprofeno de 400 mg',
+        simple,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: null },
+    });
+  });
+
+  it('uses the strict dose to disambiguate the snapshot', () => {
+    expect(
+      select(
+        'busco ibuprofeno de 800mg',
+        twoDoses,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: OTHER_ID, variantId: null },
+    });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        twoDoses,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: null },
+    });
+  });
+
+  it('rejects a wrong dose, a different unit and a compound answer', () => {
+    expect(
+      select(
+        'busco ibuprofeno de 200mg',
+        simple,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+    expect(
+      select(
+        'busco ibuprofeno de 400g',
+        simple,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg y paracetamol',
+        simple,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it.each(['no gracias', 'cancelar', 'quiero otra cosa'])(
+    'rejects a non-answer instead of forcing a GET: %s',
+    (text) => {
+      expect(select(text, simple, fullConversation, clarification)).toEqual({
+        kind: 'none',
+      });
+    },
+  );
+
+  it('keeps asking while the product presentation is unresolved', () => {
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        withVariants,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg caja con 20 tabletas',
+        withVariants,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: VARIANT_ID },
+    });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg caja con 40 tabletas',
+        withVariants,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: OTHER_VARIANT_ID },
+    });
+  });
+
+  it('requires a real customer availability anchor in the retained suffix', () => {
+    expect(
+      select('busco ibuprofeno de 400mg', simple, [clarified], clarification),
+    ).toEqual({ kind: 'none' });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        simple,
+        [{ role: 'user', content: 'hola' }, clarified],
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('ignores an availability anchor older than the bounded window', () => {
+    const stale = [
+      anchor,
+      offer,
+      affirmative,
+      clarified,
+      { role: 'user', content: 'busco ibuprofeno de 400mg' },
+      clarified,
+      { role: 'user', content: 'me dijiste que confirmara' },
+      { role: 'assistant', content: 'De acuerdo.' },
+      { role: 'user', content: 'gracias' },
+      clarified,
+    ];
+    expect(
+      select('busco ibuprofeno de 400mg', simple, stale, clarification),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('rejects a subject switch between the anchor and the answer', () => {
+    const both = {
+      products: [
+        product(PRODUCT_ID, 'Ibuprofeno de 400 mg'),
+        product(OTHER_ID, 'Paracetamol 500 mg'),
+      ],
+    };
+    const switched = [
+      { role: 'user', content: '¿Tienen paracetamol?' },
+      offer,
+      affirmative,
+      clarified,
+    ];
+    expect(
+      select('busco ibuprofeno de 400mg', both, switched, clarification),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('recovers across repeated exact clarifications', () => {
+    const repeated = [
+      anchor,
+      offer,
+      affirmative,
+      clarified,
+      { role: 'user', content: 'busco ibuprofeno de 400mg' },
+      clarified,
+    ];
+    expect(
+      select('busco ibuprofeno de 400mg', simple, repeated, clarification),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: null },
+    });
+  });
+
+  it('rejects an unsupported anchor product even when the answer names a supported one', () => {
+    const unsupportedAnchor = [
+      { role: 'user', content: '¿Tienen paracetamol?' },
+      clarified,
+    ];
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        simple,
+        unsupportedAnchor,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('rejects when the customer cancels before answering the clarification', () => {
+    const cancelled = [
+      anchor,
+      { role: 'user', content: 'ya no quiero' },
+      clarified,
+    ];
+    expect(
+      select('busco ibuprofeno de 400mg', simple, cancelled, clarification),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('rejects a repeated chain whose prior answer selected another product', () => {
+    const both = {
+      products: [
+        product(PRODUCT_ID, 'Ibuprofeno de 400 mg'),
+        product(OTHER_ID, 'Paracetamol 500 mg'),
+      ],
+    };
+    const switched = [
+      anchor,
+      offer,
+      affirmative,
+      clarified,
+      { role: 'user', content: 'busco paracetamol 500mg' },
+      clarified,
+    ];
+    expect(
+      select('busco ibuprofeno de 400mg', both, switched, clarification),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('rejects a repeated chain whose prior answer selected another variant', () => {
+    const switched = [
+      {
+        role: 'user',
+        content: '¿Tienen ibuprofeno de 400 mg caja con 40 tabletas?',
+      },
+      offer,
+      affirmative,
+      clarified,
+      {
+        role: 'user',
+        content: 'busco ibuprofeno de 400mg caja con 40 tabletas',
+      },
+      clarified,
+    ];
+    expect(
+      select(
+        'busco ibuprofeno de 400mg caja con 20 tabletas',
+        withVariants,
+        switched,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('recovers a full variant answer whose tokens overlap the product name', () => {
+    expect(
+      select(
+        'busco ibuprofeno de 400mg caja con 20 tabletas',
+        dosedVariants,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: VARIANT_ID },
+    });
+  });
+
+  it('rejects an answer carrying an unselected variant dose', () => {
+    expect(
+      select(
+        'ibuprofeno 400mg caja con 20 tabletas 800mg',
+        genericWithDoses,
+        fullConversation,
+        clarification,
+      ),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('refines an ambiguous variant from an authentic product availability turn', () => {
+    const refined = [
+      { role: 'user', content: '¿Tienen ibuprofeno?' },
+      offer,
+      affirmative,
+      clarified,
+    ];
+    expect(
+      select(
+        'busco ibuprofeno de 400mg caja con 20 tabletas',
+        genericWithDoses,
+        refined,
+        clarification,
+      ),
+    ).toEqual({
+      kind: 'recover',
+      target: { productId: PRODUCT_ID, variantId: VARIANT_ID },
+    });
+  });
+
+  it('stays disabled without the exact clarification delimiter', () => {
+    expect(
+      select('busco ibuprofeno de 400mg', simple, fullConversation),
+    ).toEqual({ kind: 'none' });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        simple,
+        fullConversation,
+        'otra pregunta',
+      ),
+    ).toEqual({ kind: 'none' });
+    expect(
+      select(
+        'busco ibuprofeno de 400mg',
+        simple,
+        [anchor, offer, affirmative],
+        clarification,
+      ),
     ).toEqual({ kind: 'none' });
   });
 });
