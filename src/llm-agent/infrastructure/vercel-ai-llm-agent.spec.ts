@@ -2091,6 +2091,16 @@ describe('catalog stock recovery through the real SDK', () => {
         'Claro. ¿Quieres que revise la disponibilidad de Ibuprofeno de 400 mg?',
     },
   ];
+  // Production conversation: the bot already repeated its fixed
+  // clarification after the customer named the exact product and dose, and
+  // the customer now repeats the same answer.
+  const clarificationHistory = [
+    ...history,
+    { role: 'user' as const, content: 'si por favor' },
+    { role: 'assistant' as const, content: INVENTORY_CLARIFICATION_REPLY },
+    { role: 'user' as const, content: 'busco ibuprofeno de 400mg' },
+    { role: 'assistant' as const, content: INVENTORY_CLARIFICATION_REPLY },
+  ];
 
   function scenario(options: {
     steps: Array<
@@ -2581,5 +2591,241 @@ describe('catalog stock recovery through the real SDK', () => {
     expect(s.sale.definition.execute).not.toHaveBeenCalled();
     expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
     expect(s.model.doGenerateCalls).toHaveLength(3);
+  });
+
+  it('recovers a strict answer to its own clarification with one trusted GET', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'busco ibuprofeno de 400mg',
+      maxSteps: 3,
+      getStock,
+      history: clarificationHistory,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        // Adversarial model argument: the server-selected input must win.
+        [
+          call(
+            'recover',
+            'checkStock',
+            JSON.stringify({ productId: adversarialId }),
+          ),
+        ],
+        'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).toHaveBeenCalledTimes(1);
+    expect(s.getStock).toHaveBeenCalledWith(productId);
+    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(result.reply).toBe(
+      'Sí, tenemos Ibuprofeno de 400 mg disponible. 😊',
+    );
+    // Failed check, fresh search, forced stock and final render: no extra step.
+    expect(s.model.doGenerateCalls).toHaveLength(4);
+  });
+
+  it('keeps clarifying a wrong-dose answer without a GET', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'busco ibuprofeno de 200mg',
+      maxSteps: 3,
+      getStock,
+      history: clarificationHistory,
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        'Encontré presentaciones distintas.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    expect(s.sale.definition.execute).not.toHaveBeenCalled();
+    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(3);
+  });
+
+  it('never turns an unanchored clarification answer into a GET', async () => {
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const s = scenario({
+      text: 'busco ibuprofeno de 400mg',
+      maxSteps: 3,
+      getStock,
+      history: [
+        { role: 'user', content: 'Hola' },
+        { role: 'assistant', content: INVENTORY_CLARIFICATION_REPLY },
+      ],
+      steps: [
+        [call('fail', 'checkStock', JSON.stringify({ productId }))],
+        [
+          call(
+            'search',
+            'searchCatalog',
+            JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+          ),
+        ],
+        'Tenemos varias opciones.',
+      ],
+    });
+    const result = await s.run();
+    expect(s.getStock).not.toHaveBeenCalled();
+    expect(s.searchCatalog).toHaveBeenCalledTimes(1);
+    expect(result.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
+    expect(s.model.doGenerateCalls).toHaveLength(3);
+  });
+
+  it('hands the answer to a real second run through the messages the first run returned', async () => {
+    const variantId20 = '00000000-0000-4000-8000-0000000000f1';
+    const variantId40 = '00000000-0000-4000-8000-0000000000f2';
+    // Representative, non-production variant payload: the first search finds
+    // one product with an ambiguous variant set, so the first run owes a
+    // clarification. The later search resolves the now-unambiguous 400 mg
+    // product, the shape the recovery must trust.
+    const ambiguousCatalog = [
+      {
+        ...catalogItem,
+        name: 'Ibuprofeno de 400 mg',
+        variants: [
+          {
+            variantId: variantId20,
+            name: '400 mg caja con 20 tabletas',
+            option: null,
+            value: null,
+            priceCents: 100,
+          },
+          {
+            variantId: variantId40,
+            name: '400 mg caja con 40 tabletas',
+            option: null,
+            value: null,
+            priceCents: 150,
+          },
+        ],
+      },
+    ];
+    const getStock = jest.fn().mockResolvedValue(stockResponse);
+    const searchCatalog = jest
+      .fn()
+      .mockResolvedValueOnce(ambiguousCatalog)
+      .mockResolvedValue([catalogItem]);
+    const sale = {
+      execute: jest.fn(async () => ({ ok: true })),
+      definition: tool({
+        description: 'createSale stub',
+        inputSchema: z.object({}),
+        execute: jest.fn(async () => ({ ok: true })),
+      }),
+    };
+    const tools = {
+      checkStock: makeCheckStockTool({
+        chatbotApi: { getStock },
+      } as unknown as ToolDeps),
+      searchCatalog: makeSearchCatalogTool({
+        chatbotApi: { searchCatalog },
+      } as unknown as ToolDeps),
+      createSale: sale.definition,
+    };
+    const toolStep = (toolCallId: string, toolName: string, input: string) => ({
+      content: [{ type: 'tool-call' as const, toolCallId, toolName, input }],
+      finishReason: { unified: 'tool-calls' as const, raw: undefined },
+      usage,
+      warnings: [],
+    });
+    const textStep = (text: string) => ({
+      content: [{ type: 'text' as const, text }],
+      finishReason: { unified: 'stop' as const, raw: undefined },
+      usage,
+      warnings: [],
+    });
+    const model = new MockLanguageModelV4({
+      doGenerate: [
+        // Run 1: identity failure, fresh ambiguous search, then a reply the
+        // recovery overrides with its fixed clarification.
+        toolStep('fail-1', 'checkStock', JSON.stringify({ productId })),
+        toolStep(
+          'search-1',
+          'searchCatalog',
+          JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+        ),
+        textStep('Encontré varias presentaciones.'),
+        // Run 2: the retained evidence no longer resolves identity, so the
+        // first trusted lookup fails; the fresh search resolves the
+        // unambiguous product; the forced step ignores the adversarial model
+        // argument and the final render stays truthful.
+        toolStep('fail-2', 'checkStock', JSON.stringify({ productId })),
+        toolStep(
+          'search-2',
+          'searchCatalog',
+          JSON.stringify({ q: 'ibuprofeno', limit: 20 }),
+        ),
+        toolStep(
+          'recover-2',
+          'checkStock',
+          JSON.stringify({ productId: adversarialId }),
+        ),
+        textStep('Sí, tenemos Ibuprofeno de 400 mg disponible.'),
+      ],
+    });
+    const generate: GenerateTextFn = async (input) => {
+      const result = await generateText({ ...input, model });
+      return result;
+    };
+    const agent = new VercelAiLlmAgent(generate, 'unused', 3);
+
+    // Availability, then the affirmative the assistant asked for. The first run
+    // only owes the fixed clarification because the catalog is still ambiguous.
+    const conversation = [
+      { role: 'user' as const, content: 'Buenas tardes, tienen ibuprofeno?' },
+      {
+        role: 'assistant' as const,
+        content:
+          'Claro. ¿Quieres que revise la disponibilidad de Ibuprofeno de 400 mg?',
+      },
+    ];
+    const first = await agent.run({
+      senderId: 'sender',
+      text: 'si por favor',
+      history: conversation,
+      systemPrompt: 'BOOT',
+      tools,
+      catalogSession: new CatalogSession('sender', 60000, 0),
+    });
+    expect(first.reply).toBe(INVENTORY_CLARIFICATION_REPLY);
+    expect(first.messages[first.messages.length - 1]).toEqual({
+      role: 'assistant',
+      content: INVENTORY_CLARIFICATION_REPLY,
+    });
+    expect(getStock).not.toHaveBeenCalled();
+
+    // A real second turn: the ONLY context handed over is the messages the
+    // first run actually returned, exactly as the runner persists them.
+    const second = await agent.run({
+      senderId: 'sender',
+      text: 'busco ibuprofeno de 400mg',
+      history: first.messages,
+      systemPrompt: 'BOOT',
+      tools,
+      catalogSession: new CatalogSession('sender', 60000, 0),
+    });
+    expect(getStock).toHaveBeenCalledTimes(1);
+    expect(getStock).toHaveBeenCalledWith(productId);
+    expect(searchCatalog).toHaveBeenCalledTimes(2);
+    expect(sale.definition.execute).not.toHaveBeenCalled();
+    expect(second.reply).toBe('Sí, tenemos Ibuprofeno de 400 mg disponible.');
+    // Three steps in the first run plus four in the second, all real SDK turns.
+    expect(model.doGenerateCalls).toHaveLength(7);
   });
 });

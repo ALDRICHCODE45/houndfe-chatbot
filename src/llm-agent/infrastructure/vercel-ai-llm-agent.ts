@@ -360,6 +360,9 @@ export class VercelAiLlmAgent implements LlmAgentPort {
           text: input.text,
           history: input.history,
           snapshot: catalogSession?.snapshot() ?? null,
+          // Exact copy of the clarification the bot just sent, used only as a
+          // delimiter so a strict customer answer can authorize the retry.
+          clarificationText: INVENTORY_CLARIFICATION_REPLY,
         }),
       snapshotAvailable: () => (catalogSession?.snapshot() ?? null) !== null,
     });
