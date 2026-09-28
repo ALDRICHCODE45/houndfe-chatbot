@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { generateText, stepCountIs, type ModelMessage } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -116,7 +117,17 @@ function build(
   };
 }
 
+function captureLogs(): string[] {
+  const logs: string[] = [];
+  jest.spyOn(Logger.prototype, 'log').mockImplementation((message: unknown) => {
+    logs.push(String(message));
+  });
+  return logs;
+}
+
 describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
   it('handles only an exact enabled allowlisted sender, else not-handled', async () => {
     const off = build([], { enabled: false });
     const other = build([], { allowedSenders: [OUTSIDE] });
@@ -151,6 +162,12 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       'checkStock',
     ]);
     expect(String(captured[0].system).startsWith(SYSTEM_PROMPT)).toBe(true);
+    const system = String(captured[0].system);
+    expect(system).toContain('en catálogo');
+    expect(system).toContain('agotado');
+    expect(system).toContain('needs_human_review');
+    expect(system).toContain('no prueba');
+    expect(system).toContain('reservación');
     expect(captured[1].messages!.map((m) => m.role)).toEqual([
       'user',
       'assistant',
@@ -198,6 +215,106 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
     const failed = await searchCatalog.execute({ q: 'x' }, {});
     expect(failed).toEqual({ ok: false, error: 'catalog_unavailable' });
     expect(JSON.stringify(failed)).not.toContain('leaked');
+  });
+
+  it('traces route entry and tool outcomes with one generated id per run, no raw data', async () => {
+    const { service } = build(flow);
+    const logs = captureLogs();
+    await service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' });
+    await service.tryHandle({ senderId: SENDER, text: 'sí, esa' });
+    const entries = logs.filter((line) =>
+      line.startsWith('minimal_catalog route_enter '),
+    );
+    expect(entries).toHaveLength(2);
+    const idOf = (line: string) => /trace=(\S+)/.exec(line)![1];
+    const [first, second] = entries.map(idOf);
+    expect(first).not.toBe(second);
+    expect(logs).toContain(
+      `minimal_catalog tool searchCatalog result=ok searchResultCount=1 trace=${first}`,
+    );
+    expect(logs).toContain(
+      `minimal_catalog tool searchCatalog result=ok searchResultCount=1 trace=${second}`,
+    );
+    expect(logs).toContain(
+      `minimal_catalog tool checkStock result=ok parentStockStatus=low_stock parentStockQuantity=2 trace=${second}`,
+    );
+    const searchLine = logs.find(
+      (line) => line.includes('tool searchCatalog') && line.includes(second),
+    )!;
+    expect(searchLine).not.toMatch(/Stock|Quantity|status/i);
+    const joined = logs.join('\n');
+    for (const raw of [SENDER, PRODUCT, VARIANT, 'ibuprofeno', 'Ibuprofeno']) {
+      expect(joined).not.toContain(raw);
+    }
+  });
+
+  it('logs closed status values and distinct deny/error codes', async () => {
+    const { service, chatbotApi, captured } = build(flow);
+    const notManaged = {
+      ...simpleStock,
+      stock: { status: 'not_managed' as const, quantity: null },
+    };
+    chatbotApi.getStock.mockResolvedValue(notManaged);
+    await service.tryHandle({ senderId: SENDER, text: 'busca' });
+    const { checkStock } = captured[0].tools!;
+    const logs = captureLogs();
+    await expect(
+      checkStock.execute({ productId: OUTSIDE }, {}),
+    ).resolves.toEqual({ ok: false, error: 'unknown_product' });
+    expect(chatbotApi.getStock).not.toHaveBeenCalled();
+    await expect(
+      checkStock.execute({ productId: PRODUCT }, {}),
+    ).resolves.toMatchObject({
+      stock: { status: 'not_managed', quantity: null },
+    });
+    chatbotApi.getStock.mockResolvedValueOnce({
+      ...notManaged,
+      stock: { status: 'bogus', quantity: 'x' },
+    } as never);
+    await checkStock.execute({ productId: PRODUCT }, {});
+    chatbotApi.getStock.mockRejectedValueOnce(new Error('leaked detail'));
+    await expect(
+      checkStock.execute({ productId: PRODUCT }, {}),
+    ).resolves.toEqual({ ok: false, error: 'stock_unavailable' });
+    const joined = logs.join('\n');
+    expect(joined).toContain(
+      'result=ok parentStockStatus=not_managed parentStockQuantity=null',
+    );
+    expect(joined).toContain(
+      'result=ok parentStockStatus=unknown parentStockQuantity=null',
+    );
+    expect(joined).toContain('result=denied code=unknown_product');
+    expect(joined).toContain('result=error code=stock_unavailable');
+    expect(joined).not.toContain('leaked');
+    expect(joined).not.toContain(PRODUCT);
+  });
+
+  it('keeps replies, history and tool calls intact when logging throws', async () => {
+    const { service, chatbotApi, captured } = build(flow);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {
+      throw new Error('sink down');
+    });
+    await expect(
+      service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' }),
+    ).resolves.toEqual({
+      kind: 'handled',
+      reply: '¿Buscaba esa presentación?',
+    });
+    await expect(
+      service.tryHandle({ senderId: SENDER, text: 'sí, esa' }),
+    ).resolves.toEqual({
+      kind: 'handled',
+      reply: 'Revisé las existencias del producto.',
+    });
+    expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(2);
+    expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+    expect(captured[1].messages!.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'tool',
+      'assistant',
+      'user',
+    ]);
   });
 
   it('answers a bounded busy reply to a concurrent same-sender turn without a second SDK run', async () => {

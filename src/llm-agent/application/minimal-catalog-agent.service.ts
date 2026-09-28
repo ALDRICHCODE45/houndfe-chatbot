@@ -1,5 +1,6 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'node:crypto';
 import { openai } from '@ai-sdk/openai';
 import { stepCountIs, tool, type ModelMessage } from 'ai';
 import { z } from 'zod';
@@ -20,7 +21,16 @@ const INSTRUCTIONS =
   'la búsqueda NUNCA prueba existencias. Cuando el cliente confirme un producto, vuelve a ' +
   'buscarlo y luego llama checkStock con su productId EXACTO. En productos con variantes ' +
   'informa existencias por variante; no iguales la del producto con la de la variante. ' +
-  'No realizas compras, ventas, pagos ni cambios de datos.';
+  'No realizas compras, ventas, pagos ni cambios de datos. ' +
+  'Saluda cálido de usted con un emoji ligero, según la base. Un hallazgo se anuncia ' +
+  '"Encontré ... en catálogo", no "tenemos" ni "disponible": eso solo se afirma tras un ' +
+  'checkStock válido. La selección explícita ya es válida: no la repreguntes. ' +
+  'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
+  'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
+  'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
+  'no una aprobación humana previa a existencias. No inventes fechas de reposición ni ' +
+  'prometas registro, contacto o reservación (no existe esa herramienta). Nunca fijes ' +
+  'producto, precio ni stock: los ejemplos son condicionales, no respuestas forzadas.';
 
 export type MinimalCatalogAgentDecision =
   | { kind: 'handled'; reply: string }
@@ -31,6 +41,46 @@ const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
+
+// Opaque per-run correlation for the local trace; never a sender, product or
+// model call id. A missing CSPRNG degrades to a constant marker, not a throw.
+function newTraceId(): string {
+  try {
+    return randomUUID();
+  } catch {
+    return 'unavailable';
+  }
+}
+
+// Observational only: a logger throw must never change tool results, the model
+// reply or the stored history.
+function traceLog(logger: Logger, message: string): void {
+  try {
+    logger.log(message);
+  } catch {
+    // best-effort tracing; swallow and keep behaviour unchanged
+  }
+}
+
+const STOCK_STATUSES: ReadonlySet<string> = new Set([
+  'available',
+  'low_stock',
+  'out_of_stock',
+  'not_managed',
+]);
+
+// Closed allowlist: an unexpected backend status is reported as `unknown`.
+function safeStatus(status: unknown): string {
+  return typeof status === 'string' && STOCK_STATUSES.has(status)
+    ? status
+    : 'unknown';
+}
+
+function safeQuantity(quantity: unknown): string {
+  return typeof quantity === 'number' && Number.isFinite(quantity)
+    ? String(quantity)
+    : 'null';
+}
 
 // At most `maxTurns` whole turns, cut at a user boundary so no tool-call step
 // is ever separated from its tool result.
@@ -72,6 +122,7 @@ export class MinimalCatalogAgentService {
   private readonly historyTurns: number;
   private readonly history = new Map<string, ModelMessage[]>();
   private readonly busy = new Set<string>();
+  private readonly logger = new Logger(MinimalCatalogAgentService.name);
 
   constructor(
     @Inject(CHATBOT_API_CLIENT) private readonly chatbotApi: ChatbotApiClient,
@@ -118,6 +169,8 @@ export class MinimalCatalogAgentService {
     senderId: string;
     text: string;
   }): Promise<string> {
+    const traceId = newTraceId();
+    traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const prior = boundWholeTurns(
       this.history.get(input.senderId) ?? [],
       this.historyTurns,
@@ -127,7 +180,7 @@ export class MinimalCatalogAgentService {
       model: openai(this.model),
       system: SYSTEM_PROMPT + '\n\n' + INSTRUCTIONS,
       messages: [...prior, { role: 'user', content: input.text }],
-      tools: this.buildTools(runIds),
+      tools: this.buildTools(runIds, traceId),
       stopWhen: stepCountIs(this.maxSteps),
     });
     this.history.set(input.senderId, [
@@ -142,8 +195,10 @@ export class MinimalCatalogAgentService {
     return result.text;
   }
 
-  private buildTools(runIds: Set<string>) {
+  private buildTools(runIds: Set<string>, traceId: string) {
     const chatbotApi = this.chatbotApi;
+    const trace = (event: string) =>
+      traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
     return {
       searchCatalog: tool({
         description:
@@ -153,12 +208,16 @@ export class MinimalCatalogAgentService {
           try {
             const items = await chatbotApi.searchCatalog(q);
             for (const item of items) runIds.add(item.productId);
+            trace(
+              `tool searchCatalog result=ok searchResultCount=${items.length}`,
+            );
             return {
               ok: true as const,
               stock_verified: false as const,
               results: items.map(projectItem),
             };
           } catch {
+            trace('tool searchCatalog result=error code=catalog_unavailable');
             return toolError('catalog_unavailable');
           }
         },
@@ -168,9 +227,17 @@ export class MinimalCatalogAgentService {
           'Consulta existencias por productId de esta misma búsqueda. No acepta variantId.',
         inputSchema: z.strictObject({ productId: z.uuid() }),
         execute: async ({ productId }) => {
-          if (!runIds.has(productId)) return toolError('unknown_product');
+          if (!runIds.has(productId)) {
+            trace('tool checkStock result=denied code=unknown_product');
+            return toolError('unknown_product');
+          }
           try {
             const stock = await chatbotApi.getStock(productId);
+            const status = safeStatus(stock.stock.status);
+            const quantity = safeQuantity(stock.stock.quantity);
+            trace(
+              `tool checkStock result=ok parentStockStatus=${status} parentStockQuantity=${quantity}`,
+            );
             return {
               ok: true as const,
               productId: stock.productId,
@@ -183,6 +250,7 @@ export class MinimalCatalogAgentService {
               })),
             };
           } catch {
+            trace('tool checkStock result=error code=stock_unavailable');
             return toolError('stock_unavailable');
           }
         },
