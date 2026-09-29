@@ -505,6 +505,30 @@ describe('unwired guarded pending claim', () => {
     });
     expect(f.events).toEqual(PATH);
   });
+  it('records STALE instead of HOLD when only normal agent metadata is persisted', async () => {
+    // 48h-old evidence + expired applyBefore: the persisted agent revision and
+    // catalog references are non-authorizing history, not a collision. The
+    // stale path records expire_unsent and never calls Meta.
+    const f = await setup('2026-06-24T12:00:00.000Z');
+    replaceRead(f, 'conversation lock', {
+      sender_id: SENDER,
+      data: {
+        messages: [{ role: 'user', content: 'catalog query' }],
+        agentRevision: 'synthetic-revision',
+        catalogReferences: {
+          senderId: SENDER,
+          observedAt: 1,
+          origin: 0,
+          products: [],
+        },
+      },
+    });
+    expect(await f.claim()).toMatchObject({
+      action: 'stale',
+      row: { state: 'STALE' },
+    });
+    expect(f.events).toEqual(PATH);
+  });
   it('holds a READY decision whose original provider window has closed', async () => {
     // Exactly 48h-old original evidence while the row window is still open.
     const f = await setup(NOW, '', -48 * 3_600_000);

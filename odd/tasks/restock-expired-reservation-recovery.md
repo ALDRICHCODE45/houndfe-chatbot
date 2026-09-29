@@ -82,3 +82,15 @@
   their accompanying specs, and this note. It restores the prior claim-window,
   coordinator, runtime and routing behavior without removing the existing intake.
   Default-off behavior remains inert.
+
+## Metadata false-collision correction (live evidence)
+
+- Parent read-only production inspection now confirms that gap: the ACTIVE
+  RECEIPT_RECORDED request had a backend GET 200 RESOLVEDv2, matching
+  original evidence, past `applyBefore`, and `PENDING_DELIVERY` with no ACK.
+- The HOLD was a false collision: the guard rejected other `data` keys, now
+  also admitting `agentRevision` (string) and `catalogReferences` (null or
+  plain object) as shape-only history; unknown keys still fail closed.
+- This slice only fixes that false collision (no manual state change, no
+  real-DB atomicity/ACK proof; `STALE` records `expire_unsent`). Rollback:
+  revert the collision store and its two specs.

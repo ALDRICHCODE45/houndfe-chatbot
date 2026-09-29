@@ -64,6 +64,34 @@ describe('retained-transaction RESTOCK collision snapshot (not send ownership)',
   );
 
   it.each([
+    [
+      'normal agent metadata',
+      {
+        messages: [{ role: 'user', content: 'catalog query' }],
+        agentRevision: 'synthetic-revision',
+        catalogReferences: {
+          senderId: SENDER,
+          observedAt: 1,
+          origin: 0,
+          products: [],
+        },
+      },
+    ],
+    ['agentRevision only', { agentRevision: 'synthetic-revision' }],
+    ['null catalogReferences', { messages: [], catalogReferences: null }],
+    ['plain object catalogReferences', { catalogReferences: {} }],
+  ])(
+    'clears persisted non-authorizing agent metadata with own RESTOCK: %s',
+    async (_name, data) => {
+      const h = harness(conversation(data));
+      const result = await h.store.readForSender(SENDER);
+      expect(result).toEqual({ action: 'clear' });
+      expect(Object.isFrozen(result)).toBe(true);
+      expectQueries(h.query, 2);
+    },
+  );
+
+  it.each([
     ['missing', { rows: [], rowCount: 0 }],
     ['wrong sender', { rows: [{ sender_id: 'other', data: {} }], rowCount: 1 }],
     ['inconsistent count', { ...conversation(), rowCount: 0 }],
@@ -109,6 +137,30 @@ describe('retained-transaction RESTOCK collision snapshot (not send ownership)',
         receiptMediaId: 'media',
         saleId: 'sale',
         receiptVersion: '1',
+      },
+    },
+    { agentRevision: 42 },
+    { agentRevision: null },
+    { catalogReferences: 'refs' },
+    { catalogReferences: [] },
+    {
+      messages: [],
+      agentRevision: 'synthetic-revision',
+      cart: {},
+    },
+    {
+      agentRevision: 'synthetic-revision',
+      catalogReferences: null,
+      receiptAmountPointer: null,
+    },
+    {
+      agentRevision: 'synthetic-revision',
+      catalogReferences: null,
+      pendingHumanRequest: {
+        requestId: 'request',
+        ref: 'ref',
+        createdAt: 'date',
+        customerNotifiedAt: 'date',
       },
     },
     Object.create({ inherited: true }) as unknown,
