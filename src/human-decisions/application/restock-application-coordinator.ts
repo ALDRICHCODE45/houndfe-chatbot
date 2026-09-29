@@ -12,15 +12,27 @@ import { normalizeRestockApplicationLedgerRow } from '../domain/restock-applicat
 import { classifyRestockApplicationAcceptance } from '../domain/restock-application-ledger-acceptance';
 import { prepareRestockApplicationOutcome } from '../domain/restock-application-ledger-ack-preparation';
 import { classifyRestockApplicationAckRecord } from '../domain/restock-application-ledger-ack-record';
+import type { RestockApplicationLedgerRow } from '../domain/restock-application-ledger-row';
+import type { RestockCandidateResult } from './restock-application-candidate.service';
 import type { RestockDecisionResolved } from '../../chatbot-api/domain/dtos/human-decisions.dto';
 
 type Ports = Pick<RestockApplicationCandidateService, 'pollForSender'> &
   Pick<PostgresRestockApplicationPreparationStore, 'preparePending'> &
   Pick<PostgresRestockApplicationClaimStore, 'claimPending'> &
   Pick<RestockApplicationLedgerPort, 'recordAcceptance' | 'recordOutcomeAck'> &
+  Partial<Pick<RestockApplicationLedgerPort, 'readByDecision'>> &
   Pick<PostgresRestockApplicationCompletionStore, 'closeAcknowledged'> &
   Pick<ChatbotApiClient, 'recordRestockApplicationOutcome'> &
   Pick<WhatsappSenderPort, 'sendText'>;
+type TerminalRow = Extract<
+  RestockApplicationLedgerRow,
+  { state: 'PROVIDER_ACCEPTED' | 'PROVIDER_ACCEPTED_LATE' | 'STALE' }
+>;
+type PendingRow = Extract<
+  RestockApplicationLedgerRow,
+  { state: 'PENDING_DELIVERY' }
+>;
+type Candidate = Extract<RestockCandidateResult, { action: 'candidate' }>;
 const HOLD = Object.freeze({ action: 'hold' as const });
 const PENDING = Object.freeze({ action: 'pending' as const });
 const ACK = Object.freeze({ action: 'ack_recorded' as const });
@@ -146,6 +158,133 @@ export class RestockApplicationCoordinator {
           return HOLD;
         terminal = recorded.row;
       }
+      return this.finish(
+        terminal,
+        senderId,
+        sourceRequestId,
+        decision.id,
+        context.backendDecisionId,
+      );
+    } catch {
+      return HOLD;
+    }
+  }
+
+  /**
+   * Expired-only on-demand reconciliation. It NEVER sends Meta: only an
+   * already-expired (`stale`) candidate is eligible, and every persisted or
+   * freshly claimed terminal is `STALE`. SEND_STARTED / PROVIDER_ACCEPTED / a
+   * claim race therefore hold without resend, expiry fabrication or closure.
+   * The old request identity is taken only from the trusted recorded snapshot
+   * (`pollForSender`), never from the current customer/product/source turn.
+   */
+  async reconcileExpiredOnce(
+    senderId: string,
+    sourceRequestId: string,
+  ): Promise<typeof HOLD | typeof ACK> {
+    const branchId = this.branchId;
+    const ports = this.ports;
+    try {
+      const candidate = await ports.pollForSender(senderId, sourceRequestId);
+      if (candidate.action !== 'candidate') return HOLD;
+      const { decision, context } = candidate;
+      if (
+        context.reservation.senderId !== senderId ||
+        context.reservation.requestKey !== sourceRequestId ||
+        decision.sourceRequestId !== sourceRequestId ||
+        decision.snapshot.branchId !== branchId
+      )
+        return HOLD;
+      if (candidate.classification.action !== 'stale') return HOLD;
+      let pending: PendingRow | undefined;
+      const read = ports.readByDecision;
+      if (typeof read === 'function') {
+        const found = await read(context.backendDecisionId);
+        if (found.action === 'hold') return HOLD;
+        if (found.action === 'found') {
+          if (found.row.state === 'STALE') {
+            if (!this.matchesExpiredSnapshot(found.row, candidate)) return HOLD;
+            return this.finish(
+              found.row,
+              senderId,
+              sourceRequestId,
+              decision.id,
+              context.backendDecisionId,
+            );
+          }
+          if (found.row.state !== 'PENDING_DELIVERY') return HOLD;
+          pending = found.row;
+        }
+      }
+      if (!pending) {
+        const prepared = await ports.preparePending(candidate);
+        if (prepared.action !== 'prepared') return HOLD;
+        pending = prepared.row;
+      }
+      const claimed = await ports.claimPending(
+        candidate,
+        pending,
+        this.tokenFactory(),
+      );
+      if (claimed.action !== 'stale') return HOLD;
+      if (!this.matchesExpiredSnapshot(claimed.row, candidate)) return HOLD;
+      return this.finish(
+        claimed.row,
+        senderId,
+        sourceRequestId,
+        decision.id,
+        context.backendDecisionId,
+      );
+    } catch {
+      return HOLD;
+    }
+  }
+
+  /** A persisted STALE row must equal the derived snapshot in every field; a
+   * `normalize` round-trip also proves a valid stale timestamp, not just a
+   * matching decision id. */
+  private matchesExpiredSnapshot(
+    row: RestockApplicationLedgerRow,
+    candidate: Candidate,
+  ): boolean {
+    if (row.state !== 'STALE') return false;
+    const derived = normalizeRestockApplicationLedgerRow({
+      state: 'STALE',
+      senderId: candidate.context.reservation.senderId,
+      sourceRequestId: candidate.context.reservation.requestKey,
+      branchId: this.branchId,
+      decisionId: candidate.decision.id,
+      resolutionVersion: 2,
+      attemptId: candidate.classification.attemptId,
+      resolvedAt: candidate.decision.resolution.resolvedAt,
+      applyBefore: candidate.decision.applyBefore,
+      staleObservedAt: row.staleObservedAt,
+    });
+    return derived !== null && isDeepStrictEqual(row, derived);
+  }
+
+  /** Shared terminal tail: report the outcome, durably ACK it, then close the
+   * exact local record. Used by `applyOnce` (send or stale) and the expired-only
+   * reconciliation; it never sends and never retries. */
+  private async finish(
+    terminal: TerminalRow,
+    senderId: string,
+    sourceRequestId: string,
+    expectedDecisionId: string,
+    expectedBackendDecisionId: string,
+  ): Promise<typeof HOLD | typeof ACK> {
+    const ports = this.ports;
+    const branchId = this.branchId;
+    try {
+      // Bind the exact terminal to the trusted candidate before any report.
+      if (
+        terminal.senderId !== senderId ||
+        terminal.sourceRequestId !== sourceRequestId ||
+        terminal.branchId !== branchId ||
+        terminal.decisionId !== expectedDecisionId ||
+        terminal.decisionId !== expectedBackendDecisionId
+      )
+        return HOLD;
       const outcome = prepareRestockApplicationOutcome(terminal);
       if (outcome.action !== 'prepared') return HOLD;
       const receipt = await ports.recordRestockApplicationOutcome(
@@ -166,8 +305,8 @@ export class RestockApplicationCoordinator {
         row.senderId !== senderId ||
         row.sourceRequestId !== sourceRequestId ||
         row.branchId !== branchId ||
-        row.decisionId !== decision.id ||
-        row.decisionId !== context.backendDecisionId
+        row.decisionId !== expectedDecisionId ||
+        row.decisionId !== expectedBackendDecisionId
       )
         return HOLD;
       const closed = await ports.closeAcknowledged(record);

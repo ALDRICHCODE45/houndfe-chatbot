@@ -957,3 +957,228 @@ describe('coordinator fixture foundation (existing pure contracts only)', () => 
     }
   });
 });
+
+function expiredCandidate() {
+  const f = fixture();
+  const classification = present(
+    classifyRestockApplication({ ...f.policyInput, now: END }),
+  );
+  if (classification.action !== 'stale')
+    throw new Error('invalid stale classification');
+  return Object.freeze({
+    f,
+    candidate: Object.freeze({
+      ...f.candidate,
+      classification: Object.freeze(classification),
+    }),
+  });
+}
+
+type ExpiredFixture = ReturnType<typeof expiredCandidate>['f'];
+
+function setupExpired(
+  read: (fixture: ExpiredFixture) => unknown = () => ({ action: 'missing' }),
+) {
+  const { f, candidate } = expiredCandidate();
+  const resolved = read(f);
+  const outcome = outcomeFixture(f.stale);
+  const ports = {
+    pollForSender: jest.fn().mockResolvedValue(candidate),
+    preparePending: jest
+      .fn()
+      .mockResolvedValue({ action: 'prepared', row: f.pending }),
+    claimPending: jest.fn().mockResolvedValue({
+      action: 'stale',
+      row: f.stale,
+      evidence: f.evidence,
+    }),
+    sendText: jest.fn(),
+    recordAcceptance: jest.fn(),
+    recordRestockApplicationOutcome: jest
+      .fn()
+      .mockResolvedValue(outcome.receipt),
+    recordOutcomeAck: jest
+      .fn()
+      .mockResolvedValue({ action: 'recorded', record: outcome.record }),
+    closeAcknowledged: jest.fn().mockResolvedValue({ action: 'closed' }),
+    readByDecision: jest.fn().mockResolvedValue(resolved),
+  };
+  const coordinator = new RestockApplicationCoordinator(
+    ports,
+    BRANCH,
+    PHONE,
+    () => new Date(END),
+    () => TOKEN,
+  );
+  return {
+    f,
+    candidate,
+    outcome,
+    ports,
+    run: () =>
+      coordinator.reconcileExpiredOnce(SENDER, f.evidence.sourceRequestId),
+  };
+}
+
+describe('expired-only reconciliation, never a Meta send (mocked ports only)', () => {
+  it('expires a missing-ledger old request, acknowledges and closes it', async () => {
+    const { f, candidate, outcome, ports: p, run } = setupExpired();
+    expect(await run()).toEqual({ action: 'ack_recorded' });
+    expect(p.readByDecision).toHaveBeenCalledWith(ID);
+    expect(p.preparePending).toHaveBeenCalledWith(candidate);
+    expect(p.claimPending).toHaveBeenCalledWith(candidate, f.pending, TOKEN);
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.recordAcceptance).not.toHaveBeenCalled();
+    expect(p.recordRestockApplicationOutcome).toHaveBeenCalledWith(
+      ID,
+      outcome.prepared.request,
+    );
+    expect(p.recordOutcomeAck).toHaveBeenCalledWith(f.stale, outcome.receipt);
+    expect(p.closeAcknowledged).toHaveBeenCalledWith(outcome.record);
+  });
+
+  it('resumes an already persisted matching STALE without re-prepare or send', async () => {
+    const { ports: p, run } = setupExpired((f) => ({
+      action: 'found',
+      row: f.stale,
+      ack: null,
+    }));
+    expect(await run()).toEqual({ action: 'ack_recorded' });
+    expect(p.preparePending).not.toHaveBeenCalled();
+    expect(p.claimPending).not.toHaveBeenCalled();
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds an advanced SEND_STARTED row without send, retry or close', async () => {
+    const { ports: p, run } = setupExpired((f) => ({
+      action: 'found',
+      row: f.started,
+      ack: null,
+    }));
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.recordOutcomeAck).not.toHaveBeenCalled();
+    expect(p.closeAcknowledged).not.toHaveBeenCalled();
+  });
+
+  it('holds a STALE row that disagrees with the derived snapshot', async () => {
+    const { ports: p, run } = setupExpired((f) => ({
+      action: 'found',
+      row: present(
+        normalizeRestockApplicationLedgerRow({
+          ...f.stale,
+          resolvedAt: '2026-06-22T11:00:00.000Z',
+          applyBefore: '2026-06-22T12:00:00.000Z',
+        }),
+      ),
+      ack: null,
+    }));
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.closeAcknowledged).not.toHaveBeenCalled();
+  });
+
+  it.each(['foreign sender', 'backend decision mismatch'] as const)(
+    'holds a persisted STALE with a %s before any outcome, ACK or close',
+    async (mutant) => {
+      const {
+        candidate,
+        ports: p,
+        run,
+      } = setupExpired((f) => ({
+        action: 'found',
+        row: present(
+          normalizeRestockApplicationLedgerRow({
+            ...f.stale,
+            ...(mutant === 'foreign sender'
+              ? { senderId: 'other-sender' }
+              : {}),
+          }),
+        ),
+        ack: null,
+      }));
+      if (mutant === 'backend decision mismatch')
+        p.pollForSender.mockResolvedValue({
+          ...candidate,
+          context: { ...candidate.context, backendDecisionId: TOKEN },
+        });
+      expect(await run()).toEqual({ action: 'hold' });
+      expect(p.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+      expect(p.recordOutcomeAck).not.toHaveBeenCalled();
+      expect(p.closeAcknowledged).not.toHaveBeenCalled();
+    },
+  );
+
+  it('holds a newly claimed STALE that disagrees with the derived snapshot', async () => {
+    const { f, ports: p, run } = setupExpired();
+    p.claimPending.mockResolvedValue({
+      action: 'stale',
+      row: present(
+        normalizeRestockApplicationLedgerRow({
+          ...f.stale,
+          senderId: 'other-sender',
+        }),
+      ),
+      evidence: f.evidence,
+    });
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+    expect(p.recordOutcomeAck).not.toHaveBeenCalled();
+    expect(p.closeAcknowledged).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['pending', { action: 'pending' }],
+    ['hold', { action: 'hold' }],
+  ])('holds a %s poll without any downstream effect', async (_label, poll) => {
+    const { ports: p, run } = setupExpired();
+    p.pollForSender.mockResolvedValue(poll);
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.preparePending).not.toHaveBeenCalled();
+    expect(p.claimPending).not.toHaveBeenCalled();
+    expect(p.sendText).not.toHaveBeenCalled();
+  });
+
+  it('holds a READY candidate instead of sending', async () => {
+    const f = fixture();
+    const { ports: p, run } = setupExpired();
+    p.pollForSender.mockResolvedValue(f.candidate);
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.preparePending).not.toHaveBeenCalled();
+    expect(p.sendText).not.toHaveBeenCalled();
+  });
+
+  it('holds a claim race that would begin a send', async () => {
+    const { f, ports: p, run } = setupExpired();
+    p.claimPending.mockResolvedValue({
+      action: 'started',
+      row: f.started,
+      evidence: f.evidence,
+    });
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.recordAcceptance).not.toHaveBeenCalled();
+    expect(p.closeAcknowledged).not.toHaveBeenCalled();
+  });
+
+  it('leaves an ACK failure unreconciled; a later STALE resume still closes without send', async () => {
+    const { f, ports: p, run } = setupExpired();
+    p.recordOutcomeAck.mockResolvedValueOnce({ action: 'hold' });
+    expect(await run()).toEqual({ action: 'hold' });
+    expect(p.closeAcknowledged).not.toHaveBeenCalled();
+    expect(p.sendText).not.toHaveBeenCalled();
+    const outcome = outcomeFixture(f.stale);
+    p.readByDecision.mockResolvedValue({
+      action: 'found',
+      row: f.stale,
+      ack: null,
+    });
+    p.recordOutcomeAck.mockResolvedValue({
+      action: 'recorded',
+      record: outcome.record,
+    });
+    expect(await run()).toEqual({ action: 'ack_recorded' });
+    expect(p.sendText).not.toHaveBeenCalled();
+    expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
+  });
+});
