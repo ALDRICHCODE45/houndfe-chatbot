@@ -10,6 +10,10 @@ import {
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { CatalogItemResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
+import {
+  MINIMAL_CATALOG_SESSION_STORE,
+  type MinimalCatalogSessionStore,
+} from '../domain/minimal-catalog-session.store';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import {
   GENERATE_TEXT,
@@ -144,13 +148,6 @@ function safeQuantity(quantity: unknown): string {
     : 'null';
 }
 
-// One whole turn per sender: the user message, the model/tool response
-// messages, and only the productIds a successful fresh search produced.
-type HistoryTurn = {
-  messages: ModelMessage[];
-  verifiedProductIds: string[];
-};
-
 // One bounded preparation per SDK run; `attempted` is set before the await.
 type RestockPreparation =
   | {
@@ -187,7 +184,6 @@ export class MinimalCatalogAgentService {
   private readonly model: string;
   private readonly maxSteps: number;
   private readonly historyTurns: number;
-  private readonly history = new Map<string, HistoryTurn[]>();
   private readonly busy = new Set<string>();
   private readonly logger = new Logger(MinimalCatalogAgentService.name);
 
@@ -196,6 +192,8 @@ export class MinimalCatalogAgentService {
     @Inject(GENERATE_TEXT) private readonly generateTextFn: GenerateTextFn,
     private readonly costGuard: CostGuardService,
     config: ConfigService,
+    @Inject(MINIMAL_CATALOG_SESSION_STORE)
+    private readonly sessionStore: MinimalCatalogSessionStore,
     // WU-B: optional RESTOCK confirmation gate (absent unless enabled).
     @Optional()
     private readonly restock?: MinimalRestockRequestService,
@@ -276,7 +274,7 @@ export class MinimalCatalogAgentService {
   }): Promise<{ reply: string; onSent?: () => void }> {
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
-    const turns = this.history.get(input.senderId) ?? [];
+    const turns = this.sessionStore.read(input.senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
     const allowedIds = new Set<string>();
     for (const turn of prior) {
@@ -383,9 +381,12 @@ export class MinimalCatalogAgentService {
     messages: ModelMessage[],
     verifiedProductIds: string[],
   ): void {
-    const turns = this.history.get(senderId) ?? [];
+    const turns = this.sessionStore.read(senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
-    this.history.set(senderId, [...prior, { messages, verifiedProductIds }]);
+    this.sessionStore.write(senderId, [
+      ...prior,
+      { messages, verifiedProductIds },
+    ]);
   }
 
   private buildTools(

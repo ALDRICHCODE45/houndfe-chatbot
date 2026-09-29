@@ -4,6 +4,8 @@ import { generateText, stepCountIs, type ModelMessage } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import type { MinimalCatalogSessionStore } from '../domain/minimal-catalog-session.store';
+import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
@@ -86,6 +88,7 @@ function build(
     enabled: boolean;
     allowedSenders: string[];
     historyTurns: number;
+    sessionStore: MinimalCatalogSessionStore;
     restock: (chatbotApi: ChatbotApiClient) => MinimalRestockRequestService;
   }> = {},
   fixtures: { item: unknown; stock: unknown } = {
@@ -110,6 +113,8 @@ function build(
   const captured: Captured[] = [];
   const results: Array<{ responseMessages: ModelMessage[] }> = [];
   const costGuard = new CostGuardService(1_000_000);
+  const sessionStore =
+    over.sessionStore ?? new InMemoryMinimalCatalogSessionStore();
   const generate: GenerateTextFn = async (options) => {
     captured.push(options as unknown as Captured);
     const result = await generateText({ ...options, model });
@@ -122,12 +127,14 @@ function build(
       generate,
       costGuard,
       config,
+      sessionStore,
       over.restock?.(chatbotApi),
     ),
     chatbotApi,
     costGuard,
     captured,
     results,
+    sessionStore,
   };
 }
 
@@ -380,6 +387,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       generate,
       new CostGuardService(1_000),
       config,
+      new InMemoryMinimalCatalogSessionStore(),
     );
     const first = service.tryHandle({ senderId: SENDER, text: 'a' });
     await expect(
@@ -391,6 +399,13 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
     release();
     await expect(first).resolves.toEqual({ kind: 'handled', reply: 'hola' });
     expect(calls).toBe(1);
+  });
+
+  it('retains each turn through the injected session store, not a private map', async () => {
+    const sessionStore = new InMemoryMinimalCatalogSessionStore();
+    const { service } = build([say('hola')], { sessionStore });
+    await service.tryHandle({ senderId: SENDER, text: 'hola' });
+    expect(sessionStore.read(SENDER)).toHaveLength(1);
   });
 
   // The cross-turn guarantee: a productId verified by an earlier turn's

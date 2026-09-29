@@ -30,6 +30,8 @@ import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
+import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
+import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
@@ -149,6 +151,12 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         ),
     },
     AgentRunner,
+    {
+      // Read-only catalog route per-sender session history (in-memory;
+      // restart loss). Injected so the service owns no hidden fallback map.
+      provide: MINIMAL_CATALOG_SESSION_STORE,
+      useClass: InMemoryMinimalCatalogSessionStore,
+    },
     MinimalCatalogAgentService,
     {
       // WU-B: the RESTOCK confirmation gate. The capability is built ONLY when

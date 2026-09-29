@@ -23,6 +23,8 @@ import { LlmAgentModule } from './llm-agent.module';
 import { LLM_AGENT, type LlmAgentPort } from './domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
 import { GENERATE_TEXT } from './infrastructure/generate-text.provider';
+import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
+import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
@@ -183,6 +185,11 @@ describe('LlmAgentModule integration', () => {
 
     const costGuard = moduleRef.get(CostGuardService);
     expect(costGuard).toBeInstanceOf(CostGuardService);
+
+    // The read-only catalog route's per-sender history resolves to the
+    // in-memory adapter (no hidden fallback constructed inside the service).
+    const sessionStore = moduleRef.get(MINIMAL_CATALOG_SESSION_STORE);
+    expect(sessionStore).toBeInstanceOf(InMemoryMinimalCatalogSessionStore);
 
     // The config is also wired correctly (used by VercelAiLlmAgent ctor).
     const config = moduleRef.get(ConfigService);
