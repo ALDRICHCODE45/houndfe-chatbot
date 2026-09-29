@@ -74,6 +74,7 @@ type Tool = {
 };
 type Captured = {
   system?: unknown;
+  prompt?: unknown;
   messages?: ModelMessage[];
   tools?: Record<string, Tool>;
   stopWhen?: (state: { steps: unknown[] }) => boolean;
@@ -579,7 +580,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       stock: { status: 'out_of_stock', quantity: 0 },
     };
     const QUESTION =
-      'Por ahora no hay existencias de «Ibuprofeno 400 mg». ¿Quiere que consulte si hay una fecha estimada de reposición? Responda SÍ o NO.';
+      'Por ahora no tenemos «Ibuprofeno 400 mg» 😕. ¿Quiere que consulte si hay una fecha estimada de reposición?';
 
     const wire = () => {
       const instances: MinimalRestockRequestService[] = [];
@@ -687,7 +688,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       ).resolves.toEqual({
         kind: 'handled',
         reply:
-          'Ya quedó registrada su consulta sobre cuándo tendremos «Ibuprofeno 400 mg» de nuevo.',
+          '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
       });
       expect(w.coordinate).toHaveBeenCalledTimes(1);
       const [arg] = w.coordinate.mock.calls[0];
@@ -771,7 +772,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       ).resolves.toEqual({
         kind: 'handled',
         reply:
-          'Ya quedó registrada su consulta sobre cuándo tendremos «Ibuprofeno 400 mg» de nuevo.',
+          '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
       });
       expect(w.coordinate).toHaveBeenCalledTimes(1);
       const [coord] = w.coordinate.mock.calls[0];
@@ -894,7 +895,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
         }),
       ).resolves.toEqual({
         kind: 'handled',
-        reply: 'Entendido, no registraré la consulta de reposición.',
+        reply: 'Entendido, no registraré su consulta de reposición. ¡Gracias!',
       });
       expect(w.coordinate).not.toHaveBeenCalled();
       expect(captured).toHaveLength(1);
@@ -1047,6 +1048,104 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       for (const raw of [SENDER, OTHER, PRODUCT, VARIANT, 'ibuprofeno']) {
         expect(joined).not.toContain(raw);
       }
+    });
+
+    it('routes a natural affirmative through the real SDK classifier and writes once (plumbing, not model judgment)', async () => {
+      const w = wire();
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        call('p1', 'prepareRestock', { productId: PRODUCT }),
+        say('listo'),
+        say('{"result":"accept"}'),
+      ];
+      const { service, captured, costGuard } = build(
+        steps,
+        { restock: w.restock },
+        { item: simpleItem, stock: oos },
+      );
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'tienen ibuprofeno',
+        inboundEvent: INBOUND,
+      });
+      const offer = await service.tryHandle({
+        senderId: SENDER,
+        text: 'SÍ',
+        inboundEvent: CONFIRM,
+      });
+      expect(offer).toMatchObject({ kind: 'handled', reply: QUESTION });
+      if (offer.kind !== 'handled') throw new Error('expected handled');
+      offer.onSent?.();
+      const logs = captureLogs();
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'sí, muchas gracias, me ayudaría mucho',
+          inboundEvent: THIRD,
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply:
+          '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
+      });
+      expect(w.coordinate).toHaveBeenCalledTimes(1);
+      // Classifier call is tool-less and history-less, bound to the exact sent
+      // question and the current reply; no classifier JSON reaches the logs.
+      const classify = captured[2];
+      expect(classify.tools).toBeUndefined();
+      expect(classify.messages).toBeUndefined();
+      expect(String(classify.prompt)).toContain(QUESTION);
+      expect(String(classify.prompt)).toContain(
+        'sí, muchas gracias, me ayudaría mucho',
+      );
+      expect(costGuard.currentAggregate).toBeGreaterThan(0);
+      expect(logs.join('\n')).not.toContain('"result"');
+    });
+
+    it('keeps pending without any catalog generation when the classifier says unclear', async () => {
+      const w = wire();
+      const steps = [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+        call('c1', 'checkStock', { productId: PRODUCT }),
+        call('p1', 'prepareRestock', { productId: PRODUCT }),
+        say('listo'),
+        say('{"result":"unclear"}'),
+      ];
+      const { service, chatbotApi, captured } = build(
+        steps,
+        { restock: w.restock },
+        { item: simpleItem, stock: oos },
+      );
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'tienen ibuprofeno',
+        inboundEvent: INBOUND,
+      });
+      const offer = await service.tryHandle({
+        senderId: SENDER,
+        text: 'SÍ',
+        inboundEvent: CONFIRM,
+      });
+      if (offer.kind !== 'handled') throw new Error('expected handled');
+      offer.onSent?.();
+      chatbotApi.searchCatalog.mockClear();
+      await expect(
+        service.tryHandle({
+          senderId: SENDER,
+          text: 'no sé',
+          inboundEvent: THIRD,
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply:
+          'Perdón, no estoy seguro de haberle entendido. ¿Quiere que consulte si hay una fecha estimada de reposición?',
+      });
+      expect(chatbotApi.searchCatalog).not.toHaveBeenCalled();
+      expect(captured).toHaveLength(3);
+      expect(w.coordinate).not.toHaveBeenCalled();
     });
   });
 });

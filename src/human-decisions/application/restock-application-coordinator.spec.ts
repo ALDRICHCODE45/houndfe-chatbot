@@ -36,7 +36,10 @@ function present<T>(value: T | null): T {
 
 // Synthetic contract snapshots: not authentication, durable history, provider
 // acceptance, claim ownership or permission to send/report. No I/O occurs here.
-function fixture(action: RestockResolution['action'] = ACTIONS[0]) {
+function fixture(
+  action: RestockResolution['action'] = ACTIONS[0],
+  restockDays = 3,
+) {
   const evidence = present(
     bindRestockInboundEvidence(
       {
@@ -94,7 +97,7 @@ function fixture(action: RestockResolution['action'] = ACTIONS[0]) {
       version: 2,
       resolution:
         action === 'PROVIDE_RESTOCK_ESTIMATE'
-          ? { action, restockDays: 3, resolvedAt: NOW }
+          ? { action, restockDays, resolvedAt: NOW }
           : { action, resolvedAt: NOW },
       applyBefore: END,
     }),
@@ -212,8 +215,9 @@ function outcomeFixture(row: RestockApplicationLedgerRow) {
 function setup(
   action: RestockResolution['action'] = ACTIONS[0],
   stale = false,
+  restockDays = 3,
 ) {
-  const f = fixture(action);
+  const f = fixture(action, restockDays);
   const outcome = outcomeFixture(stale ? f.stale : f.accepted.row);
   const ports = {
     pollForSender: jest.fn().mockResolvedValue(f.candidate),
@@ -282,8 +286,8 @@ describe('application orchestration', () => {
         to: SENDER,
         text:
           action === 'PROVIDE_RESTOCK_ESTIMATE'
-            ? 'Collar (SKU: COL-01): el equipo confirmó un estimado de reposición de 3 días desde su confirmación. Es un estimado, no una fecha garantizada.'
-            : 'Collar (SKU: COL-01): el equipo no pudo confirmar un estimado de reposición.',
+            ? '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!'
+            : '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar (SKU: COL-01)».',
       });
       expect(p.recordAcceptance).toHaveBeenCalledWith({
         row: f.started,
@@ -305,6 +309,15 @@ describe('application orchestration', () => {
       expect(calls).toEqual([...calls].sort((a, b) => a - b));
     },
   );
+
+  it('uses the singular one-day estimate with the exact SKU subject', async () => {
+    const { ports: p, run } = setup(ACTIONS[0], false, 1);
+    expect(await run()).toEqual({ action: 'ack_recorded' });
+    expect(p.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 1 día para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!',
+    });
+  });
 
   it('returns frozen pending without downstream work', async () => {
     const { ports, run, clock, token } = setup();

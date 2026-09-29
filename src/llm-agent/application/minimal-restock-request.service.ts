@@ -1,11 +1,15 @@
 /**
  * WU-A bounded Spanish RESTOCK confirmation gate: the ONLY customer-consent
  * boundary for a RESTOCK query already grounded by a fresh trusted `getStock`.
- * `prepare` offers one explicit SÍ/NO question after canonical validation and
- * never writes; `consume` turns a strict, sender-bound, armed, unexpired,
- * new-message affirmative into exactly ONE existing `runRestockRoute` attempt
- * whose reservation/ledger/idempotency stays the sole write authority. Pending
- * state is in-memory (one per sender, 5-minute TTL) and is lost on restart.
+ * `prepare` offers one natural question after canonical validation and never
+ * writes; `consume` turns a strict, sender-bound, armed, unexpired, new-message
+ * affirmative into exactly ONE existing `runRestockRoute` attempt whose
+ * reservation/ledger/idempotency stays the sole write authority. Exact SÍ/NO
+ * stay deterministic; any other genuine reply is resolved by an optional
+ * semantic seam (accept|decline|unclear) against the EXACT sent question, while
+ * an unclear, missing or failed classification keeps the pending and asks for a
+ * natural clarification. Pending state is in-memory (one per sender, 5-minute
+ * TTL) and is lost on restart.
  */
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
@@ -14,7 +18,10 @@ import {
   DISPLAY_BREAKING,
 } from '../../conversation/domain/catalog-references';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
-import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
+import {
+  bindRestockInboundEvent,
+  type RestockInboundEventIdentity,
+} from '../../human-decisions/domain/restock-source-identity';
 import { runRestockRoute } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { RestockToolCapability } from '../../sale-flow/application/tool-deps';
 import { parseShippingCustomerDecision } from '../../shipping/application/shipping-customer-decision';
@@ -22,13 +29,26 @@ import { parseShippingCustomerDecision } from '../../shipping/application/shippi
 export const MINIMAL_RESTOCK_PENDING_TTL_MS = 5 * 60 * 1000;
 export const MINIMAL_RESTOCK_AMBIGUOUS_REPLY =
   'Por ahora no puedo confirmar que su consulta haya quedado registrada.';
-const DECLINE_REPLY = 'Entendido, no registraré la consulta de reposición.';
+export const MINIMAL_RESTOCK_CLARIFY_REPLY =
+  'Perdón, no estoy seguro de haberle entendido. ¿Quiere que consulte si hay ' +
+  'una fecha estimada de reposición?';
+/** Bounded per-pending memo of already-classified message ids. */
+export const MINIMAL_RESTOCK_SEEN_MAX = 16;
+export type RestockReplyVerdict = 'accept' | 'decline' | 'unclear';
+/** Task-only classification of the current reply against the sent question. */
+export type RestockReplyClassifier = (
+  question: string,
+  reply: string,
+) => Promise<RestockReplyVerdict>;
+const DECLINE_REPLY =
+  'Entendido, no registraré su consulta de reposición. ¡Gracias!';
 const confirmed = (l: string) =>
-  `Ya quedó registrada su consulta sobre cuándo tendremos «${l}» de nuevo.`;
-const already = (l: string) => `Su consulta sobre «${l}» ya estaba registrada.`;
+  `¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «${l}». ¡Gracias!`;
+const already = (l: string) =>
+  `Su consulta sobre la reposición de «${l}» ya estaba registrada. ¡Gracias!`;
 const proposal = (l: string) =>
-  `Por ahora no hay existencias de «${l}». ¿Quiere que consulte si hay una ` +
-  `fecha estimada de reposición? Responda SÍ o NO.`;
+  `Por ahora no tenemos «${l}» 😕. ¿Quiere que consulte si hay una fecha ` +
+  `estimada de reposición?`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
 // RESTOCK-LOCAL bounded consent: the strict shipping decision first, then
@@ -96,6 +116,8 @@ export interface MinimalRestockConsumeInput {
   readonly senderId: string;
   readonly text: string;
   readonly inboundEvent?: unknown;
+  /** Optional semantic seam; absent means no inference (fail closed). */
+  readonly classify?: RestockReplyClassifier;
 }
 
 export type MinimalRestockConsumeResult = {
@@ -121,6 +143,8 @@ interface PendingRestock {
   };
   readonly presentation: string;
   readonly proposal: string;
+  /** Bounded memo of message ids already sent to the classifier. */
+  readonly seen: Set<string>;
   armed: boolean;
 }
 
@@ -283,6 +307,7 @@ export class MinimalRestockRequestService {
         digest,
         presentation,
         proposal: question,
+        seen: new Set<string>(),
         armed: false,
       };
       this.pending.set(senderId, pending);
@@ -316,53 +341,123 @@ export class MinimalRestockRequestService {
       const expired = this.clock() >= pending.expiresAt;
       // Expiry always clears the slot; it never authorizes a write.
       if (expired) this.pending.delete(senderId);
-      if (decision === null) {
-        // Ordinary text: only a trusted, fresh turn on this pending may clear
-        // stale consent; the ambiguous receipt is reserved for real verdicts.
-        if (trusted && !replay && !expired) this.pending.delete(senderId);
-        return null;
-      }
       const ambiguous: MinimalRestockConsumeResult = {
         kind: 'handled',
         reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY,
       };
-      // A verdict (SÍ or NO) counts only on the trusted, fresh, armed turn.
-      if (expired || !trusted || event === undefined) return ambiguous;
-      if (replay) {
-        return {
-          kind: 'handled',
-          reply: pending.proposal,
-          onSent: () => {
-            if (this.pending.get(senderId) === pending) pending.armed = true;
-          },
-        };
-      }
-      if (!pending.armed) return ambiguous;
-      if (decision === 'decline') {
+      const clarification: MinimalRestockConsumeResult = {
+        kind: 'handled',
+        reply: MINIMAL_RESTOCK_CLARIFY_REPLY,
+      };
+      if (decision !== null) {
+        // A verdict counts only on the trusted, fresh turn.
+        if (expired || !trusted || event === undefined) return ambiguous;
+        // An already-classified message can never be re-read as a verdict.
+        if (pending.seen.has(event.messageId)) return clarification;
+        if (replay) {
+          return {
+            kind: 'handled',
+            reply: pending.proposal,
+            onSent: () => {
+              if (this.pending.get(senderId) === pending) pending.armed = true;
+            },
+          };
+        }
+        if (!pending.armed) return ambiguous;
+        if (decision === 'decline') {
+          this.pending.delete(senderId);
+          return { kind: 'handled', reply: DECLINE_REPLY };
+        }
+        // Consume the slot BEFORE awaiting so a concurrent turn cannot re-enter.
         this.pending.delete(senderId);
-        return { kind: 'handled', reply: DECLINE_REPLY };
+        return await this.write(senderId, pending, event);
       }
-      // Consume the slot BEFORE awaiting so a concurrent turn cannot re-enter.
-      this.pending.delete(senderId);
-      const result = await runRestockRoute(
-        { chatbotApi: this.deps.chatbotApi, store: this.deps.store },
-        restock,
-        pending.digest,
-        {
-          senderId,
-          inboundEvent: event,
-          catalogSession: pending.session,
-        },
-      );
-      if (result.ok && result.outcome === 'historical_intake_recorded') {
-        return { kind: 'handled', reply: confirmed(pending.presentation) };
-      }
-      if (result.ok && result.outcome === 'existing_restock_recorded') {
-        return { kind: 'handled', reply: already(pending.presentation) };
-      }
-      return ambiguous;
+      // Non-exact text: only a trusted, fresh, armed, non-replay turn is
+      // interpretable; every other turn stays unhandled with no stale consent.
+      if (expired || !trusted || event === undefined || replay) return null;
+      if (!pending.armed) return null;
+      return await this.classifyReply(input, senderId, pending, event);
     } catch {
       return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
     }
+  }
+
+  /**
+   * Semantic fallback for ONE genuine reply to the sent question. Fail closed:
+   * a missing seam, exhausted per-pending budget, classifier failure or
+   * malformed output keeps the pending and returns a natural clarification.
+   * The message id is memoized BEFORE the await, so a concurrent or replayed
+   * turn can never change an already-issued verdict; after the await the SAME
+   * pending must still be armed and unexpired or the turn fails closed.
+   */
+  private async classifyReply(
+    input: MinimalRestockConsumeInput,
+    senderId: string,
+    pending: PendingRestock,
+    event: RestockInboundEventIdentity,
+  ): Promise<MinimalRestockConsumeResult> {
+    const clarification: MinimalRestockConsumeResult = {
+      kind: 'handled',
+      reply: MINIMAL_RESTOCK_CLARIFY_REPLY,
+    };
+    if (pending.seen.has(event.messageId)) return clarification;
+    if (pending.seen.size >= MINIMAL_RESTOCK_SEEN_MAX) return clarification;
+    // Memoize BEFORE the seam check: a no-seam clarification must also block a
+    // redelivery of the same event from gaining permission with a new seam.
+    pending.seen.add(event.messageId);
+    const classify = input.classify;
+    if (classify === undefined) return clarification;
+    let verdict: RestockReplyVerdict;
+    try {
+      verdict = await classify(pending.proposal, input.text);
+    } catch {
+      return clarification;
+    }
+    // Revalidate the SAME pending: replacement, expiry or disarm since the
+    // await fails closed and never writes.
+    if (
+      this.pending.get(senderId) !== pending ||
+      !pending.armed ||
+      this.clock() >= pending.expiresAt
+    ) {
+      return clarification;
+    }
+    if (verdict === 'decline') {
+      this.pending.delete(senderId);
+      return { kind: 'handled', reply: DECLINE_REPLY };
+    }
+    if (verdict !== 'accept') return clarification;
+    // Consume BEFORE awaiting so a concurrent accept cannot double-write.
+    this.pending.delete(senderId);
+    return await this.write(senderId, pending, event);
+  }
+
+  /** Runs the ONE existing deterministic RESTOCK route for the consumed turn. */
+  private async write(
+    senderId: string,
+    pending: PendingRestock,
+    event: RestockInboundEventIdentity,
+  ): Promise<MinimalRestockConsumeResult> {
+    const restock = this.deps.restock;
+    if (restock === undefined || restock.enabled !== true) {
+      return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
+    }
+    const result = await runRestockRoute(
+      { chatbotApi: this.deps.chatbotApi, store: this.deps.store },
+      restock,
+      pending.digest,
+      {
+        senderId,
+        inboundEvent: event,
+        catalogSession: pending.session,
+      },
+    );
+    if (result.ok && result.outcome === 'historical_intake_recorded') {
+      return { kind: 'handled', reply: confirmed(pending.presentation) };
+    }
+    if (result.ok && result.outcome === 'existing_restock_recorded') {
+      return { kind: 'handled', reply: already(pending.presentation) };
+    }
+    return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
   }
 }

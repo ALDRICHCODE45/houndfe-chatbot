@@ -40,9 +40,19 @@ const ACK = Object.freeze({ action: 'ack_recorded' as const });
 function format(decision: RestockDecisionResolved): string {
   const { productName, sku } = decision.snapshot;
   const subject = sku ? `${productName} (SKU: ${sku})` : productName;
-  return decision.resolution.action === 'PROVIDE_RESTOCK_ESTIMATE'
-    ? `${subject}: el equipo confirmó un estimado de reposición de ${decision.resolution.restockDays} días desde su confirmación. Es un estimado, no una fecha garantizada.`
-    : `${subject}: el equipo no pudo confirmar un estimado de reposición.`;
+  if (decision.resolution.action !== 'PROVIDE_RESTOCK_ESTIMATE') {
+    return (
+      '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un ' +
+      `estimado de reposición para «${subject}».`
+    );
+  }
+  const days = decision.resolution.restockDays;
+  const label = days === 1 ? '1 día' : `${days} días`;
+  return (
+    `¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de ${label} ` +
+    `para la reposición de «${subject}», contados desde su confirmación. ` +
+    'La fecha puede variar. ¡Que esté muy bien!'
+  );
 }
 
 /** Trusted-adapter orchestration, not Meta fencing/device delivery.

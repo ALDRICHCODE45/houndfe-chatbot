@@ -28,8 +28,12 @@ const AMBIGUOUS = { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
 const CONFIRMED = {
   kind: 'handled',
   reply:
-    'Ya quedó registrada su consulta sobre cuándo tendremos «Croquetas» de nuevo.',
+    '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Croquetas». ¡Gracias!',
 };
+type Classify = (
+  question: string,
+  reply: string,
+) => Promise<'accept' | 'decline' | 'unclear'>;
 const restockRoute = () =>
   jest
     .spyOn(preflight, 'preflightRestockRequest')
@@ -103,8 +107,18 @@ const prep = (o: Record<string, unknown> = {}) => ({
   productId: PRODUCT,
   ...o,
 });
-const say = (h: Hz, text = 'SÍ', inboundEvent: unknown = CONFIRM) =>
-  h.service.consume({ senderId: SENDER, text, inboundEvent });
+const say = (
+  h: Hz,
+  text = 'SÍ',
+  inboundEvent: unknown = CONFIRM,
+  classify?: Classify,
+) =>
+  h.service.consume({
+    senderId: SENDER,
+    text,
+    inboundEvent,
+    ...(classify === undefined ? {} : { classify }),
+  });
 async function offer(h: Hz) {
   const r = await h.service.prepare(prep());
   if (r.kind !== 'offer') throw new Error('expected an offer');
@@ -125,12 +139,14 @@ describe('MinimalRestockRequestService', () => {
     expect(h.getStock).not.toHaveBeenCalled();
   });
 
-  it('prepare offers one clear SÍ/NO question and writes nothing', async () => {
+  it('prepare ends on a natural question and writes nothing', async () => {
     const h = hz();
     const o = await offer(h);
     expect(o.reply).toBe(
-      'Por ahora no hay existencias de «Croquetas». ¿Quiere que consulte si hay una fecha estimada de reposición? Responda SÍ o NO.',
+      'Por ahora no tenemos «Croquetas» 😕. ¿Quiere que consulte si hay una fecha estimada de reposición?',
     );
+    expect(o.reply.endsWith('?')).toBe(true);
+    expect(o.reply).not.toContain('Responda');
     expect(h.getStock).toHaveBeenCalledTimes(1);
     expect(h.coordinate).not.toHaveBeenCalled();
   });
@@ -191,25 +207,35 @@ describe('MinimalRestockRequestService', () => {
     });
   });
 
-  it('NO clears and a later SÍ is left to the ordinary SDK', async () => {
+  it('an exact NO clears and a later SÍ is left to the ordinary SDK', async () => {
     const h = hz();
     const o = await offer(h);
     o.onSent();
     expect(await say(h, 'no')).toEqual({
       kind: 'handled',
-      reply: 'Entendido, no registraré la consulta de reposición.',
+      reply: 'Entendido, no registraré su consulta de reposición. ¡Gracias!',
     });
     expect(await say(h)).toBeNull();
     expect(h.coordinate).not.toHaveBeenCalled();
   });
 
-  it('any other text clears the pending and returns null (no stale consent)', async () => {
+  const CLARIFY = {
+    kind: 'handled',
+    reply:
+      'Perdón, no estoy seguro de haberle entendido. ¿Quiere que consulte si hay una fecha estimada de reposición?',
+  };
+
+  it('unrelated text keeps the pending and asks a natural clarification', async () => {
+    const spy = restockRoute();
     const h = hz();
     const o = await offer(h);
     o.onSent();
-    expect(await say(h, '¿Tienen otra talla?')).toBeNull();
-    expect(await say(h)).toBeNull();
-    expect(h.coordinate).not.toHaveBeenCalled();
+    expect(await say(h, '¿Tienen otra talla?')).toEqual(CLARIFY);
+    expect(await say(h, 'SÍ', { ...CONFIRM, messageId: 'wamid.C2' })).toEqual(
+      CONFIRMED,
+    );
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(h.coordinate).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -235,14 +261,13 @@ describe('MinimalRestockRequestService', () => {
     'SÍ, por favor, gracias',
     'NO, por favor',
   ])(
-    'a mixed or loose intent (%s) is not consent and clears the pending',
+    'a mixed or loose intent (%s) has no fast consent and writes nothing',
     async (text) => {
       const spy = restockRoute();
       const h = hz();
       const o = await offer(h);
       o.onSent();
-      expect(await say(h, text)).toBeNull();
-      expect(await say(h)).toBeNull();
+      expect(await say(h, text)).toEqual(CLARIFY);
       expect(spy).not.toHaveBeenCalled();
       expect(h.coordinate).not.toHaveBeenCalled();
     },
@@ -688,8 +713,276 @@ describe('MinimalRestockRequestService', () => {
     o.onSent();
     expect(await say(h)).toEqual({
       kind: 'handled',
-      reply: 'Su consulta sobre «Croquetas» ya estaba registrada.',
+      reply:
+        'Su consulta sobre la reposición de «Croquetas» ya estaba registrada. ¡Gracias!',
     });
     expect(h.coordinate).not.toHaveBeenCalled();
+  });
+
+  describe('semantic consent seam (mock classifier only)', () => {
+    const NATURAL_QUESTION =
+      'Por ahora no tenemos «Croquetas» 😕. ¿Quiere que consulte si hay una fecha estimada de reposición?';
+    const DECLINED = {
+      kind: 'handled',
+      reply: 'Entendido, no registraré su consulta de reposición. ¡Gracias!',
+    };
+    const newEvent = (id: string) => ({ ...PROPOSAL, messageId: id });
+    const classifier = (verdict: 'accept' | 'decline' | 'unclear'): Classify =>
+      jest.fn(async () => verdict);
+
+    it.each([
+      'sí, muchas gracias, me ayudaría mucho',
+      'por favor',
+      'claro',
+      'adelante',
+    ])(
+      'accepts a natural positive (%s) once through the seam',
+      async (text) => {
+        const spy = restockRoute();
+        const h = hz();
+        const o = await offer(h);
+        o.onSent();
+        const classify = classifier('accept');
+        await expect(say(h, text, CONFIRM, classify)).resolves.toEqual(
+          CONFIRMED,
+        );
+        expect(classify).toHaveBeenCalledWith(NATURAL_QUESTION, text);
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(h.coordinate).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('declines through the seam without writing and clears the pending', async () => {
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      await expect(
+        say(h, 'mejor no', CONFIRM, classifier('decline')),
+      ).resolves.toEqual(DECLINED);
+      expect(await say(h, 'sí')).toBeNull();
+      expect(h.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('keeps the pending and clarifies on unclear, then a fresh clear SÍ writes', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      await expect(
+        say(h, '¿tienen otra talla?', CONFIRM, classifier('unclear')),
+      ).resolves.toEqual(CLARIFY);
+      await expect(say(h, 'SÍ', newEvent('wamid.N1'))).resolves.toEqual(
+        CONFIRMED,
+      );
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(h.coordinate).toHaveBeenCalledTimes(1);
+    });
+
+    it('clarifies without a seam or on a classifier failure, never writing', async () => {
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      await expect(say(h, 'claro')).resolves.toEqual(CLARIFY);
+      const boom: Classify = jest.fn(async () => {
+        throw new Error('RAW_SENTINEL');
+      });
+      await expect(say(h, 'ok', CONFIRM, boom)).resolves.toEqual(CLARIFY);
+      expect(h.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('never upgrades an already-classified message on replay even with new text', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      await expect(
+        say(h, 'no sé', CONFIRM, classifier('unclear')),
+      ).resolves.toEqual(CLARIFY);
+      const replay = classifier('accept');
+      await expect(say(h, 'SÍ', CONFIRM, replay)).resolves.toEqual(CLARIFY);
+      expect(replay).not.toHaveBeenCalled();
+      expect(spy).not.toHaveBeenCalled();
+      expect(h.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('bounds classifier calls and still honors a fresh clear SÍ', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      const classify = classifier('unclear');
+      for (let i = 0; i < 16; i++)
+        await expect(
+          say(h, 'no sé', newEvent(`wamid.${i}`), classify),
+        ).resolves.toEqual(CLARIFY);
+      expect(classify).toHaveBeenCalledTimes(16);
+      await expect(
+        say(h, 'nada', newEvent('wamid.16'), classify),
+      ).resolves.toEqual(CLARIFY);
+      expect(classify).toHaveBeenCalledTimes(16);
+      await expect(say(h, 'SÍ', newEvent('wamid.17'))).resolves.toEqual(
+        CONFIRMED,
+      );
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(h.coordinate).toHaveBeenCalledTimes(1);
+    });
+
+    it('never classifies untrusted, unarmed, origin or expired turns', async () => {
+      const classify = classifier('accept');
+      const untrusted = hz();
+      (await offer(untrusted)).onSent();
+      await expect(
+        say(
+          untrusted,
+          'claro',
+          { ...CONFIRM, receivingPhoneNumberId: '9'.repeat(15) },
+          classify,
+        ),
+      ).resolves.toBeNull();
+      const unarmed = hz();
+      await offer(unarmed);
+      await expect(
+        say(unarmed, 'claro', CONFIRM, classify),
+      ).resolves.toBeNull();
+      const origin = hz();
+      (await offer(origin)).onSent();
+      await expect(
+        say(origin, 'claro', PROPOSAL, classify),
+      ).resolves.toBeNull();
+      const expired = hz();
+      (await offer(expired)).onSent();
+      expired.advance(MINIMAL_RESTOCK_PENDING_TTL_MS);
+      await expect(
+        say(expired, 'claro', newEvent('wamid.E'), classify),
+      ).resolves.toBeNull();
+      expect(classify).not.toHaveBeenCalled();
+    });
+
+    it('cannot write when the pending expires while the classifier is in flight', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      let release!: (verdict: 'accept') => void;
+      const gate = new Promise<'accept'>((resolve) => {
+        release = resolve;
+      });
+      const inFlight: Classify = jest.fn(() => gate);
+      const pending = say(h, 'claro', CONFIRM, inFlight);
+      h.advance(MINIMAL_RESTOCK_PENDING_TTL_MS);
+      release('accept');
+      await expect(pending).resolves.toEqual(CLARIFY);
+      expect(spy).not.toHaveBeenCalled();
+      expect(h.coordinate).not.toHaveBeenCalled();
+    });
+
+    it('writes once when two new messages accept concurrently', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      const classify = classifier('accept');
+      const [a, b] = await Promise.all([
+        say(h, 'claro', newEvent('wamid.A1'), classify),
+        say(h, 'adelante', newEvent('wamid.A2'), classify),
+      ]);
+      expect([a, b].filter((r) => r?.reply === CONFIRMED.reply)).toHaveLength(
+        1,
+      );
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(h.coordinate).toHaveBeenCalledTimes(1);
+    });
+
+    it('memoizes a no-seam ambiguous event so a later seam cannot grant permission on redelivery', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const o = await offer(h);
+      o.onSent();
+      await expect(say(h, 'claro', CONFIRM)).resolves.toEqual(CLARIFY);
+      const classify = classifier('accept');
+      await expect(say(h, 'claro', CONFIRM, classify)).resolves.toEqual(
+        CLARIFY,
+      );
+      expect(classify).not.toHaveBeenCalled();
+      expect(spy).not.toHaveBeenCalled();
+      // A genuinely new message can still be classified later.
+      await expect(
+        say(h, 'adelante', newEvent('wamid.N2'), classifier('accept')),
+      ).resolves.toEqual(CONFIRMED);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(h.coordinate).toHaveBeenCalledTimes(1);
+    });
+
+    it('cannot act on a deferred accept after the pending was replaced', async () => {
+      const spy = restockRoute();
+      const h = hz();
+      const first = await offer(h);
+      first.onSent();
+      let release!: (verdict: 'accept') => void;
+      const gate = new Promise<'accept'>((resolve) => {
+        release = resolve;
+      });
+      const inFlight = say(
+        h,
+        'claro',
+        CONFIRM,
+        jest.fn(() => gate),
+      );
+      const second = await offer(h);
+      release('accept');
+      await expect(inFlight).resolves.toEqual(CLARIFY);
+      expect(spy).not.toHaveBeenCalled();
+      expect(h.coordinate).not.toHaveBeenCalled();
+      // The replacement still needs its own sent question and a new reply.
+      expect(await say(h, 'SÍ', newEvent('wamid.R1'))).toEqual(AMBIGUOUS);
+      second.onSent();
+      await expect(say(h, 'SÍ', newEvent('wamid.R2'))).resolves.toEqual(
+        CONFIRMED,
+      );
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(h.coordinate).toHaveBeenCalledTimes(1);
+    });
+
+    it('contains a deferred classification whose post-await clock throws', async () => {
+      const spy = restockRoute();
+      let failClock = false;
+      const getStock = jest.fn(async () => parent());
+      const coordinate = jest.fn(async () => ({ decision: 'recorded' }));
+      const service = new MinimalRestockRequestService({
+        chatbotApi: { getStock } as never,
+        store: { get: jest.fn(async () => null) } as never,
+        restock: {
+          enabled: true,
+          markers: {},
+          coordinator: { coordinate },
+          recovery: {
+            recover: jest.fn(async () => ({ outcome: 'unavailable' })),
+          },
+        } as never,
+        clock: () => {
+          if (failClock) throw new Error('clock down');
+          return 1_000_000;
+        },
+      });
+      const prepared = await service.prepare(prep());
+      if (prepared.kind !== 'offer') throw new Error('expected an offer');
+      prepared.onSent();
+      let release!: (verdict: 'accept') => void;
+      const gate = new Promise<'accept'>((resolve) => {
+        release = resolve;
+      });
+      const inFlight = service.consume({
+        senderId: SENDER,
+        text: 'claro',
+        inboundEvent: CONFIRM,
+        classify: jest.fn(() => gate),
+      });
+      failClock = true;
+      release('accept');
+      await expect(inFlight).resolves.toEqual(AMBIGUOUS);
+      expect(spy).not.toHaveBeenCalled();
+      expect(coordinate).not.toHaveBeenCalled();
+      expect(getStock).toHaveBeenCalledTimes(1);
+    });
   });
 });

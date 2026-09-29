@@ -38,7 +38,7 @@ const PRODUCT = '44444444-4444-4444-8444-444444444444';
 const DECISION = '33333333-3333-4333-8333-333333333333';
 const PROVIDER = 'wamid.synthetic-outbound';
 const TEXT =
-  'Collar (SKU: COL-01): el equipo confirmó un estimado de reposición de 3 días desde su confirmación. Es un estimado, no una fecha garantizada.';
+  '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
