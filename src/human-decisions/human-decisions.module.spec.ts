@@ -36,6 +36,7 @@ import {
   type SharedRouteMarkersPort,
 } from './domain/shared-route-markers';
 import { HumanDecisionsModule } from './human-decisions.module';
+import { RestockApplicationRuntime } from './restock-application.runtime';
 import { PostgresRestockPostLedgerStore } from './infrastructure/postgres-restock-post-ledger.store';
 import { PostgresRestockApplicationContextStore } from './infrastructure/postgres-restock-application-context.store';
 import { PostgresSharedReservationStore } from './infrastructure/postgres-shared-reservation.store';
@@ -69,6 +70,8 @@ class HumanDecisionsConsumer {
     @Inject(RESTOCK_INTAKE_SERVICE) readonly intake: RestockIntakeService,
     @Inject(RESTOCK_EXISTING_REQUEST_STATUS_SERVICE)
     readonly recovery: RestockExistingRequestStatusService,
+    @Inject(RestockApplicationRuntime)
+    readonly runtime: RestockApplicationRuntime,
   ) {}
 }
 
@@ -261,7 +264,7 @@ describe('HumanDecisionsModule binding', () => {
     await moduleRef.close();
   });
 
-  it('exports all five tokens to a consuming module', async () => {
+  it('exports every decision token to a consuming module', async () => {
     const moduleRef = await compile([TokensConsumerModule]);
     const consumer = moduleRef.get(HumanDecisionsConsumer);
     expect(consumer.reservations).toBeInstanceOf(
@@ -273,6 +276,8 @@ describe('HumanDecisionsModule binding', () => {
     expect(consumer.recovery).toBeInstanceOf(
       RestockExistingRequestStatusService,
     );
+    // The bounded expiry seam is exported for the minimal route factory.
+    expect(consumer.runtime).toBeInstanceOf(RestockApplicationRuntime);
     inert();
     await moduleRef.close();
   });

@@ -16,6 +16,17 @@ const senderId = 'synthetic-sender';
 const branch = ' opaque branch ';
 const phone = ' opaque phone ';
 const HOLD = { action: 'hold' as const };
+const RECORDED = {
+  action: 'recorded' as const,
+  context: { reservation: { requestKey: source } },
+};
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 function fixture(flag: unknown, identity = { branch, phone }) {
   const values: Record<string, unknown> = {
     'humanDecisions.restockEnabled': flag,
@@ -156,6 +167,89 @@ describe('RestockApplicationRuntime in isolation', () => {
     f.inert();
   });
 
+  describe('expired-only on-demand reconciliation', () => {
+    const read = () =>
+      jest
+        .spyOn(
+          PostgresRestockApplicationContextStore.prototype,
+          'readRecordedForSender',
+        )
+        .mockResolvedValue(RECORDED as never);
+    const reconcile = () =>
+      jest
+        .spyOn(RestockApplicationCoordinator.prototype, 'reconcileExpiredOnce')
+        .mockResolvedValue({ action: 'ack_recorded' });
+
+    it.each([undefined, false])(
+      'is inert while disabled (%s)',
+      async (flag) => {
+        const f = fixture(flag);
+        f.runtime.onApplicationBootstrap();
+        await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
+        f.inert();
+        await f.runtime.onModuleDestroy();
+      },
+    );
+
+    it('is inert before bootstrap and after shutdown', async () => {
+      const f = fixture(true);
+      await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
+      f.runtime.onApplicationBootstrap();
+      await f.runtime.onModuleDestroy();
+      await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
+      f.inert();
+    });
+
+    it('passes only the ORIGINAL recorded request key to the coordinator', async () => {
+      const f = fixture(true);
+      const readMock = read();
+      const reconcileMock = reconcile();
+      f.runtime.onApplicationBootstrap();
+      await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(true);
+      expect(readMock).toHaveBeenCalledWith(senderId);
+      expect(reconcileMock).toHaveBeenCalledWith(senderId, source);
+      f.inert();
+      await f.runtime.onModuleDestroy();
+    });
+
+    it.each(['missing', 'hold'])(
+      'does not apply on %s context',
+      async (action) => {
+        const f = fixture(true);
+        read().mockResolvedValue({ action } as never);
+        const reconcileMock = reconcile();
+        f.runtime.onApplicationBootstrap();
+        await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
+        expect(reconcileMock).not.toHaveBeenCalled();
+        f.inert();
+        await f.runtime.onModuleDestroy();
+      },
+    );
+
+    it('awaits an in-flight recovery before shutdown resolves', async () => {
+      const f = fixture(true);
+      read();
+      const gate = deferred<{ action: 'ack_recorded' }>();
+      const reconcileMock = jest
+        .spyOn(RestockApplicationCoordinator.prototype, 'reconcileExpiredOnce')
+        .mockReturnValue(gate.promise);
+      f.runtime.onApplicationBootstrap();
+      const recovered = f.runtime.reconcileExpired(senderId);
+      let drained = false;
+      const stopping = f.runtime.onModuleDestroy().then(() => {
+        drained = true;
+      });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      gate.resolve({ action: 'ack_recorded' });
+      await expect(recovered).resolves.toBe(true);
+      await stopping;
+      expect(drained).toBe(true);
+      expect(reconcileMock).toHaveBeenCalledTimes(1);
+      f.inert();
+    });
+  });
+
   it('composes real adapters on one pool with bound receivers and exact identities', async () => {
     const f = fixture(true);
     const candidate = jest
@@ -215,6 +309,7 @@ describe('RestockApplicationRuntime in isolation', () => {
       'claimPending',
       'recordAcceptance',
       'recordOutcomeAck',
+      'readByDecision',
       'closeAcknowledged',
       'recordRestockApplicationOutcome',
       'sendText',

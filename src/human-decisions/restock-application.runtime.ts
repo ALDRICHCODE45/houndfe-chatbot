@@ -34,6 +34,9 @@ export class RestockApplicationRuntime
   private bootstrapped = false;
   private stopped = false;
   private poller?: RestockApplicationPoller;
+  private coordinator?: RestockApplicationCoordinator;
+  private context?: PostgresRestockApplicationContextStore;
+  private recovery?: Promise<void>;
   private stopping?: Promise<void>;
 
   constructor(
@@ -59,8 +62,9 @@ export class RestockApplicationRuntime
         'RESTOCK application requires branch and phone identities',
       );
     const clock = () => new Date();
+    const context = new PostgresRestockApplicationContextStore(this.pool);
     const candidate = new RestockApplicationCandidateService(
-      new PostgresRestockApplicationContextStore(this.pool),
+      context,
       this.client,
       branch,
       clock,
@@ -88,6 +92,7 @@ export class RestockApplicationRuntime
         claimPending: claim.claimPending.bind(claim),
         recordAcceptance: ledger.recordAcceptance.bind(ledger),
         recordOutcomeAck: ledger.recordOutcomeAck.bind(ledger),
+        readByDecision: ledger.readByDecision.bind(ledger),
         closeAcknowledged: completion.closeAcknowledged.bind(completion),
         recordRestockApplicationOutcome:
           this.client.recordRestockApplicationOutcome.bind(this.client),
@@ -97,6 +102,8 @@ export class RestockApplicationRuntime
       phone,
       clock,
     );
+    this.coordinator = coordinator;
+    this.context = context;
     this.poller = new RestockApplicationPoller(coordinator);
     this.poller.start();
   }
@@ -105,8 +112,55 @@ export class RestockApplicationRuntime
     return this.poller?.enqueue(senderId, sourceRequestId) ?? false;
   }
 
+  /**
+   * Bounded on-demand expired-only reconciliation for ONE sender. It reads
+   * only that sender's trusted recorded context (never a scan) and delegates
+   * the recorded request identity to the expiry coordinator.
+   *
+   * Returns `true` only when the old reservation was durably ACKed and closed.
+   * Inert (no query) while disabled, before bootstrap or after shutdown; a
+   * concurrent recovery is refused fail-closed. It never sends WhatsApp and
+   * never runs a background scan.
+   */
+  async reconcileExpired(senderId: string): Promise<boolean> {
+    if (!this.bootstrapped || this.stopped) return false;
+    const coordinator = this.coordinator;
+    const context = this.context;
+    if (!coordinator || !context || this.recovery) return false;
+    const run = (async (): Promise<boolean> => {
+      try {
+        const read = await context.readRecordedForSender(senderId);
+        if (read.action !== 'recorded') return false;
+        const result = await coordinator.reconcileExpiredOnce(
+          senderId,
+          read.context.reservation.requestKey,
+        );
+        return result.action === 'ack_recorded';
+      } catch {
+        return false;
+      }
+    })();
+    const tracked = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.recovery = tracked;
+    try {
+      return await run;
+    } finally {
+      if (this.recovery === tracked) this.recovery = undefined;
+    }
+  }
+
   onModuleDestroy(): Promise<void> {
     this.stopped = true;
-    return (this.stopping ??= this.poller?.stop() ?? Promise.resolve());
+    return (this.stopping ??= this.drain());
+  }
+
+  /** Drain the poller and any in-flight recovery before the pool closes. */
+  private async drain(): Promise<void> {
+    const recovery = this.recovery;
+    await (this.poller?.stop() ?? Promise.resolve());
+    if (recovery) await recovery;
   }
 }

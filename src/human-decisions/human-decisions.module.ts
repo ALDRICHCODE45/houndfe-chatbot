@@ -131,6 +131,8 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
     RESTOCK_POST_LEDGER,
     RESTOCK_INTAKE_SERVICE,
     RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+    // Bounded on-demand expiry reconciliation seam for the minimal route.
+    RestockApplicationRuntime,
   ],
 })
 export class HumanDecisionsModule {}
