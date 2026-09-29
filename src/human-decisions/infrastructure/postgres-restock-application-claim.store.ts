@@ -126,8 +126,7 @@ export class PostgresRestockApplicationClaimStore {
       if (
         !Number.isFinite(nowMs) ||
         providerMs > nowMs ||
-        Date.parse(evidence.observedAt) > nowMs ||
-        nowMs >= providerMs + 86_400_000
+        Date.parse(evidence.observedAt) > nowMs
       )
         return HOLD;
       const policy = classifyRestockApplication({
@@ -139,6 +138,10 @@ export class PostgresRestockApplicationClaimStore {
         now,
       });
       if (policy.action !== 'ready' && policy.action !== 'stale') return HOLD;
+      // A send still requires the original 24h provider window; an expired
+      // decision only ever records `expire_unsent`, which never calls Meta.
+      if (policy.action === 'ready' && nowMs >= providerMs + 86_400_000)
+        return HOLD;
       const derived = normalizeRestockApplicationLedgerRow({
         state: 'PENDING_DELIVERY',
         senderId: reservation.senderId,

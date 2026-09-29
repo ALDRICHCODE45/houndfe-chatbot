@@ -30,7 +30,7 @@ const PATH = (
   'BEGIN > reservation lock > context > evidence > conversation lock > ' +
   'markers > clock > CAS > COMMIT > release'
 ).split(' > ');
-async function setup(now = NOW, failure = '') {
+async function setup(now = NOW, failure = '', providerOffsetMs = 0) {
   const evidence = bindRestockInboundEvidence(
     {
       event: {
@@ -38,7 +38,9 @@ async function setup(now = NOW, failure = '') {
         senderId: SENDER,
         messageId: 'wamid.core',
       },
-      providerTimestampSeconds: String(Date.parse(NOW) / 1000),
+      providerTimestampSeconds: String(
+        (Date.parse(NOW) + providerOffsetMs) / 1000,
+      ),
       observedAt: NOW,
     },
     PHONE,
@@ -486,10 +488,28 @@ describe('additional claim boundaries (mock SQL, not PostgreSQL proof)', () => {
 });
 
 describe('unwired guarded pending claim', () => {
-  it('holds at the exact original-event 24h boundary before CAS', async () => {
+  it('expires at the exact original-event 24h boundary because applyBefore elapsed', async () => {
     const f = await setup('2026-06-23T12:00:00.000Z');
+    expect(await f.claim()).toMatchObject({
+      action: 'stale',
+      row: { state: 'STALE' },
+    });
+    expect(f.events).toEqual(PATH);
+  });
+  it('expires a long-closed original provider window without any send window', async () => {
+    // Decision and original evidence are both 48h old: STALE, never a send.
+    const f = await setup('2026-06-24T12:00:00.000Z');
+    expect(await f.claim()).toMatchObject({
+      action: 'stale',
+      row: { state: 'STALE' },
+    });
+    expect(f.events).toEqual(PATH);
+  });
+  it('holds a READY decision whose original provider window has closed', async () => {
+    // Exactly 48h-old original evidence while the row window is still open.
+    const f = await setup(NOW, '', -48 * 3_600_000);
     expect(await f.claim()).toEqual({ action: 'hold' });
-    expect(f.events).toEqual([...PATH.slice(0, 7), 'ROLLBACK', 'release']);
+    heldThrough(f, 'clock');
   });
   it.each([
     [NOW, 'started', 'SEND_STARTED'],
