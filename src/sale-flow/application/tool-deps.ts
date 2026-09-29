@@ -18,6 +18,13 @@ export interface RestockToolCapability {
   readonly markers: SharedRouteMarkersPort;
   readonly coordinator: Pick<RestockIntakeService, 'coordinate'>;
   readonly recovery: Pick<RestockExistingRequestStatusService, 'recover'>;
+  /**
+   * Bounded, on-demand expired-only reconciliation of THIS sender's recorded
+   * old RESTOCK request. Optional so the main registry keeps its exact legacy
+   * wiring; the minimal confirmation factory provides it. A `true` result
+   * means the old reservation was durably ACKed and closed, never a send.
+   */
+  readonly reconcileExpired?: (senderId: string) => Promise<boolean>;
 }
 
 /**

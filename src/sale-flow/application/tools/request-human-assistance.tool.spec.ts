@@ -363,6 +363,7 @@ describe('makeRequestHumanAssistanceTool', () => {
         markers?: { readForSender: jest.Mock };
         coordinator?: { coordinate: jest.Mock };
         recovery?: { recover: jest.Mock };
+        reconcileExpired?: jest.Mock;
         getStock?: jest.Mock;
         getState?: jest.Mock;
       } = {},
@@ -402,6 +403,7 @@ describe('makeRequestHumanAssistanceTool', () => {
           markers: markers as never,
           coordinator: coordinator as never,
           recovery: recovery as never,
+          reconcileExpired: overrides.reconcileExpired as never,
         },
       };
       return {
@@ -668,6 +670,30 @@ describe('makeRequestHumanAssistanceTool', () => {
         expect(create).toHaveBeenCalledTimes(2);
         expect(uuid).not.toHaveBeenCalled();
         expect(log).not.toHaveBeenCalled();
+      });
+
+      it('fails closed with no coordinator when the restock.enabled getter throws after the gate', async () => {
+        const { deps, coordinator, create } = buildRestockDeps();
+        // First read is the `execute` gate (returns `true`); the second, inside
+        // the guarded region, throws and must fail closed instead of escaping.
+        let reads = 0;
+        const restock = {
+          markers: deps.restock.markers,
+          coordinator: deps.restock.coordinator,
+          recovery: deps.restock.recovery,
+          get enabled() {
+            reads += 1;
+            if (reads > 1) throw new Error('PRIVATE-enabled-getter');
+            return true;
+          },
+        };
+        expect(await run({ ...deps, restock: restock as never })).toEqual(
+          failClosed,
+        );
+        expect(reads).toBe(2);
+        expect(coordinator.coordinate).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+        expectLog('preflight', 'exception', 'exception');
       });
 
       it('keeps concurrent attempt IDs independent and private inputs absent', async () => {
@@ -1108,6 +1134,77 @@ describe('makeRequestHumanAssistanceTool', () => {
           { toolCallId: 't', messages: [], context: groundedContext() },
         );
         expect(result).toEqual(failClosed);
+        expect(coordinator.coordinate).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      });
+
+      it('expires the old request then records the fresh one exactly once', async () => {
+        const readForSender = jest
+          .fn()
+          .mockResolvedValueOnce({
+            legacyRequestPending: false,
+            restockIntentPresent: true,
+          })
+          .mockResolvedValue({
+            legacyRequestPending: false,
+            restockIntentPresent: false,
+          });
+        const reconcileExpired = jest.fn(async () => true);
+        const { deps, coordinator, recovery, create, getStock } =
+          buildRestockDeps({
+            markers: { readForSender },
+            reconcileExpired,
+          });
+        const result = await makeRequestHumanAssistanceTool(deps).execute(
+          outOfStockInput,
+          { toolCallId: 't', messages: [], context: groundedContext() },
+        );
+        expect(result).toEqual({
+          ok: true,
+          outcome: 'historical_intake_recorded',
+          customerNotified: false,
+        });
+        expect(reconcileExpired).toHaveBeenCalledTimes(1);
+        expect(reconcileExpired).toHaveBeenCalledWith(SENDER);
+        expect(recovery.recover).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+        expect(coordinator.coordinate).toHaveBeenCalledTimes(1);
+        const calls = coordinator.coordinate.mock.calls as unknown as Array<
+          [{ intake: { sourceRequestId: string; productId: string } }]
+        >;
+        const intake = calls[0][0].intake;
+        // The fresh POST binds the CURRENT new turn, never the old receipt.
+        expect(intake.productId).toBe(PRODUCT_ID);
+        expect(intake.sourceRequestId).toBe(
+          deriveRestockSourceRequestId(INBOUND),
+        );
+        expect(getStock).toHaveBeenCalledTimes(1);
+      });
+
+      it('keeps the read-only recovery when the old request is not expired', async () => {
+        const reconcileExpired = jest.fn(async () => false);
+        blockExisting();
+        const { deps, coordinator, recovery, create } = buildRestockDeps({
+          reconcileExpired,
+          recovery: {
+            recover: jest.fn(async () => ({
+              outcome: 'existing_restock_recorded' as const,
+              status: 'pending' as const,
+            })),
+          },
+        });
+        const result = await makeRequestHumanAssistanceTool(deps).execute(
+          outOfStockInput,
+          { toolCallId: 't', messages: [], context: groundedContext() },
+        );
+        expect(result).toEqual({
+          ok: true,
+          outcome: 'existing_restock_recorded',
+          status: 'pending',
+          customerNotified: false,
+        });
+        expect(reconcileExpired).toHaveBeenCalledTimes(1);
+        expect(recovery.recover).toHaveBeenCalledTimes(1);
         expect(coordinator.coordinate).not.toHaveBeenCalled();
         expect(create).not.toHaveBeenCalled();
       });

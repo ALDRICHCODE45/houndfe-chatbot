@@ -23,6 +23,7 @@ import {
   type SharedRouteMarkersPort,
 } from '../human-decisions/domain/shared-route-markers';
 import { HumanDecisionsModule } from '../human-decisions/human-decisions.module';
+import { RestockApplicationRuntime } from '../human-decisions/restock-application.runtime';
 import { SaleFlowModule } from '../sale-flow/sale-flow.module';
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from './application/agent-runner.service';
@@ -161,6 +162,7 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         SHARED_ROUTE_MARKERS,
         RESTOCK_INTAKE_SERVICE,
         RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+        RestockApplicationRuntime,
       ],
       useFactory: (
         chatbotApi: ChatbotApiClient,
@@ -169,13 +171,21 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         markers: SharedRouteMarkersPort,
         coordinator: RestockIntakeService,
         recovery: RestockExistingRequestStatusService,
+        runtime: RestockApplicationRuntime,
       ) =>
         new MinimalRestockRequestService({
           chatbotApi,
           store,
           restock:
             config.get<boolean>('humanDecisions.restockEnabled') === true
-              ? { enabled: true, markers, coordinator, recovery }
+              ? {
+                  enabled: true,
+                  markers,
+                  coordinator,
+                  recovery,
+                  reconcileExpired: (senderId) =>
+                    runtime.reconcileExpired(senderId),
+                }
               : undefined,
         }),
     },

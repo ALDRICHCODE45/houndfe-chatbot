@@ -213,14 +213,37 @@ describe('LlmAgentModule integration', () => {
         .overrideProvider(PostgresConversationStore)
         .useValue(stubStore())
         .compile();
-      const enabled = moduleRef.get(MinimalRestockRequestService).enabled;
+      const service = moduleRef.get(MinimalRestockRequestService);
+      const internals = service as unknown as {
+        deps: { restock?: { reconcileExpired?: unknown } };
+      };
+      const reconcileExpired = internals.deps.restock?.reconcileExpired;
+      // The callback is bound to the runtime; before bootstrap it is inert.
+      const bounded =
+        typeof reconcileExpired === 'function'
+          ? await (reconcileExpired as (senderId: string) => Promise<boolean>)(
+              'sender',
+            )
+          : null;
       await moduleRef.close();
-      return enabled;
+      return {
+        enabled: service.enabled,
+        hasCallback: typeof reconcileExpired === 'function',
+        bounded,
+      };
     };
 
-    await expect(boot()).resolves.toBe(false);
+    await expect(boot()).resolves.toEqual({
+      enabled: false,
+      hasCallback: false,
+      bounded: null,
+    });
     process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
-    await expect(boot()).resolves.toBe(true);
+    await expect(boot()).resolves.toEqual({
+      enabled: true,
+      hasCallback: true,
+      bounded: false,
+    });
   });
 
   it('allows tests to override TOOL_REGISTRY with a stub', async () => {

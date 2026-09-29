@@ -173,15 +173,19 @@ function restockDiagnostic() {
  * reported, as a distinct non-notifying historical-record outcome. No backend
  * or poll id is ever exposed.
  *
- * The ONE exception is a preflight `existing_restock` block: an ALREADY accepted
- * request is not a failure, so it is recovered read-only (no POST, no
- * coordinator, no legacy fallback) and reported as `existing_restock_recorded`.
- * Recovery never falls through to the coordinator.
+ * A preflight `existing_restock` block is not universally read-only: it may run
+ * AT MOST ONE optional expired-only reconciliation (`restock.reconcileExpired`)
+ * that can durably ACK/close the old reservation and, only on a proven close,
+ * unlock a FRESH preflight and (when it routes `restock`) a coordinator POST for
+ * the CURRENT turn. Otherwise the path keeps the UNCHANGED read-only recovery
+ * (`existing_restock_recorded` / sanitized `restock_unavailable`) with no
+ * coordinator and no legacy fallback.
  *
  * Exported (WU-A) so the bounded `MinimalRestockRequestService` confirmation
  * gate can reuse this EXACT route with only the two ports it needs
- * (`Pick<ToolDeps, 'store' | 'chatbotApi'>`). The body, preflight call,
- * coordinator ordering, recovery and fail-closed semantics are unchanged.
+ * (`Pick<ToolDeps, 'store' | 'chatbotApi'>`). Preflight, coordinator ordering,
+ * read-only recovery fallback and fail-closed semantics are unchanged; the only
+ * extension is the bounded expired-only reconciliation on such a block.
  */
 export async function runRestockRoute(
   deps: Pick<ToolDeps, 'store' | 'chatbotApi'>,
@@ -195,36 +199,13 @@ export async function runRestockRoute(
 ): Promise<RequestHumanAssistanceRestockResult> {
   const observe = restockDiagnostic();
   let stage: 'preflight' | 'coordinator' = 'preflight';
-  try {
-    const outcome = await preflightRestockRequest(
-      {
-        senderId: context.senderId,
-        catalogSession: context.catalogSession,
-        inboundEvent: context.inboundEvent,
-        digest,
-        restockFeatureEnabled: restock.enabled,
-      },
-      {
-        conversation: deps.store,
-        markers: restock.markers,
-        catalog: deps.chatbotApi,
-      },
-    );
-    const route = outcome.route;
-    if (route !== 'restock') {
-      observe(stage, route, outcome);
-      if (
-        outcome.route === 'blocked' &&
-        blockedReason(outcome) === 'existing_restock'
-      ) {
-        return runExistingRecovery(restock, digest, context, observe);
-      }
-      return failClosedRestock();
-    }
+  const coordinate = async (
+    intake: unknown,
+  ): Promise<RequestHumanAssistanceRestockResult> => {
     stage = 'coordinator';
     const coordinated = await restock.coordinator.coordinate({
       senderId: context.senderId,
-      intake: outcome.intake,
+      intake,
     });
     // Preserve the original short-circuit reads, without diagnostic re-reads.
     let decision = coordinated.decision;
@@ -241,9 +222,58 @@ export async function runRestockRoute(
     }
     observe(stage, decision, coordinated);
     return failClosedRestock();
+  };
+  try {
+    // Guard construction: a hostile capability/deps getter must fail closed.
+    const input = {
+      senderId: context.senderId,
+      catalogSession: context.catalogSession,
+      inboundEvent: context.inboundEvent,
+      digest,
+      restockFeatureEnabled: restock.enabled,
+    };
+    const preflightDeps = {
+      conversation: deps.store,
+      markers: restock.markers,
+      catalog: deps.chatbotApi,
+    };
+    const outcome = await preflightRestockRequest(input, preflightDeps);
+    if (outcome.route !== 'restock') {
+      observe(stage, outcome.route, outcome);
+      if (
+        outcome.route === 'blocked' &&
+        blockedReason(outcome) === 'existing_restock'
+      ) {
+        // Expired-only reconciliation runs at most once; only a durable close
+        // unlocks a fresh preflight/POST for the CURRENT turn. Anything else
+        // keeps the committed read-only recovery / fail-closed path.
+        if (await reconcileExpiredOnce(restock, context.senderId)) {
+          const fresh = await preflightRestockRequest(input, preflightDeps);
+          if (fresh.route === 'restock') return await coordinate(fresh.intake);
+        }
+        return runExistingRecovery(restock, digest, context, observe);
+      }
+      return failClosedRestock();
+    }
+    return await coordinate(outcome.intake);
   } catch {
     observe(stage, 'exception');
     return failClosedRestock();
+  }
+}
+
+/** Invoke the OPTIONAL bounded reconciliation at most once; any non-`true` or
+ * throwing result fails closed. It never sends or retries. */
+async function reconcileExpiredOnce(
+  restock: RestockToolCapability,
+  senderId: string,
+): Promise<boolean> {
+  const reconcile = restock.reconcileExpired;
+  if (typeof reconcile !== 'function') return false;
+  try {
+    return (await reconcile(senderId)) === true;
+  } catch {
+    return false;
   }
 }
 
