@@ -1,6 +1,6 @@
-# Human decisions v1: EXPIRATION (agreed integration contract; backend source and bot intake + receipt + HTTP transport only)
+# Human decisions v1: EXPIRATION (agreed integration contract; backend source and bot intake + receipt + HTTP transport + GET normalizer only)
 
-**Status:** BUSINESS rules owner-approved; TECHNICAL integration contract agreed by the three repo agents (backend, frontend, bot). Backend source for EXPIRATION intake/receipt is implemented against its own validated source — parent-observed HEAD `cde0f58`; this is source evidence only, **not deployment proof, live routing, or activation**. The frontend is an independent phase and remains pending. The owner authorizes the bot to proceed locally in parallel (no serialization behind a validated backend delivery). Bot-side, the strict intake normalizer (`src/chatbot-api/domain/dtos/human-decisions-expiration.dto.ts`) and its receipt normalizer (`src/chatbot-api/domain/dtos/human-decisions-expiration-receipt.dto.ts`) are implemented locally, and the EXPIRATION HTTP transport method (`submitExpirationIntake` in `src/chatbot-api/infrastructure/chatbot-api-http.client.ts`) is implemented locally but **not wired to runtime**; the GET poll, runtime wiring, E2E compatibility, and activation remain pending. Historical `docs/human-decisions-contract-v1.md` (RESTOCK) is unchanged and authoritative for shared lifecycle shapes; its labels are not proof of current deployment.
+**Status:** BUSINESS rules owner-approved; TECHNICAL integration contract agreed by the three repo agents (backend, frontend, bot). Backend source for EXPIRATION intake/receipt is implemented against its own validated source — parent-observed HEAD `cde0f58`; this is source evidence only, **not deployment proof, live routing, or activation**. The frontend is an independent phase and remains pending. The owner authorizes the bot to proceed locally in parallel (no serialization behind a validated backend delivery). Bot-side, the strict intake normalizer (`src/chatbot-api/domain/dtos/human-decisions-expiration.dto.ts`) and its receipt normalizer (`src/chatbot-api/domain/dtos/human-decisions-expiration-receipt.dto.ts`) are implemented locally, the EXPIRATION HTTP transport method (`submitExpirationIntake` in `src/chatbot-api/infrastructure/chatbot-api-http.client.ts`) is implemented locally but **not wired to runtime**, and the GET current-state projection normalizer (`normalizeExpirationDecision` in `src/chatbot-api/domain/dtos/human-decisions-expiration-decision.dto.ts`) is implemented locally as a pure, fail-closed projection validator; the GET HTTP client/poll, runtime wiring, E2E compatibility, and activation remain pending. Historical `docs/human-decisions-contract-v1.md` (RESTOCK) is unchanged and authoritative for shared lifecycle shapes; its labels are not proof of current deployment.
 
 ## Approved business decisions (owner)
 
@@ -61,6 +61,7 @@ A product-info answer is informational only: it never changes stock, cart, prici
 
 - `POST` → 201; exact replay → 200, both with `{id, sourceRequestId, type, status: 'PENDING', version: 1, createdAt, snapshot, supersedesDecisionId: null, resolution: null, applyBefore: null}`. This is the immutable historical receipt.
 - Only `GET /chatbot-api/human-decisions/:id` returns current state.
+- The bot validates the GET current-state projection with a pure, fail-closed local normalizer (`normalizeExpirationDecision`, committed `dfd636a`): `PENDING`/v1 (null `resolution`/`applyBefore`) or `RESOLVED`/v2 with a typed resolution and `applyBefore = resolvedAt + 24h`; snapshot labels stay historical/verbatim and `branchId` is a non-blank opaque string, not a UUID. Binding the response to the requested id remains the future GET HTTP client's responsibility; there is no live GET wire yet.
 - Resolved v2 poll resolution: `{action, expirationText, resolvedAt}` where `action` is `PROVIDE_EXPIRATION_TEXT` (with `expirationText`) or `REPORT_EXPIRATION_UNAVAILABLE` (no `expirationText`); `applyBefore = resolvedAt + 24h`. No `resolvedBy` in the bot projection.
 
 ### POS
@@ -108,13 +109,13 @@ The local contract is RESTOCK-only: `RestockIntakeInput.type` is `'RESTOCK'`, `R
 - Source/tenant are auth-derived; no customer names, phones, or transcripts in the decision.
 - The bot owns the active reservation collision/closure; the backend does not know the customer/sender. `sourceRequestId` alone does not prevent two fresh parallel IDs — the bot reservation guards the active one.
 - No new async engine, registry, or plugin abstraction is proposed.
-- In scope: this alignment plus the bot's strict intake normalizer, its receipt normalizer, and its HTTP transport method only. Out of scope: runtime writes, cross-repo implementation, activation, and template creation.
+- In scope: this alignment plus the bot's strict intake normalizer, its receipt normalizer, its HTTP transport method, and its GET current-state projection normalizer only. Out of scope: runtime writes, cross-repo implementation, activation, and template creation.
 
 ## Sequence (owner-approved local order)
 
 1. **Backend:** source implemented (parent-observed HEAD `cde0f58`); not deployment proof, delivered, or activated.
 2. **Frontend:** independent phase, still pending; awaits its own validated delivery.
-3. **Bot:** owner-authorized to proceed locally in parallel; strict intake and receipt normalizers plus the HTTP transport method (`submitExpirationIntake`, not wired) implemented, with poll/runtime/E2E/activation pending.
+3. **Bot:** owner-authorized to proceed locally in parallel; strict intake and receipt normalizers, the HTTP transport method (`submitExpirationIntake`, not wired), and the GET current-state projection normalizer (`normalizeExpirationDecision`, committed `dfd636a`) implemented, with the GET HTTP client/poll, runtime wiring, E2E, and activation pending.
 
 No push/deploy/activation/production. These are ordered phases, not a promise of a small (e.g. ≤400-line) full runtime implementation.
 
@@ -137,4 +138,4 @@ No push/deploy/activation/production. These are ordered phases, not a promise of
 
 ## Remaining checkpoint
 
-Backend source is implemented (parent-observed HEAD `cde0f58`, not deployment proof); the frontend remains pending independently. Bot-side, the HTTP transport method is implemented but not wired; the GET poll, runtime wiring, E2E compatibility, and activation verification remain open. The approved rules above are not to be re-litigated.
+Backend source is implemented (parent-observed HEAD `cde0f58`, not deployment proof); the frontend remains pending independently. Bot-side, the HTTP transport method is implemented but not wired, and the GET current-state projection normalizer is implemented (committed `dfd636a`); the GET HTTP client/poll, runtime wiring, E2E compatibility, and activation verification remain open. The approved rules above are not to be re-litigated.
