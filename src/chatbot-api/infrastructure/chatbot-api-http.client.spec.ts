@@ -2209,6 +2209,260 @@ describe('ChatbotApiHttpClient', () => {
     });
   });
 
+  // ─── getExpirationDecision (GET /chatbot-api/human-decisions/:id) — EXPIRATION
+
+  describe('getExpirationDecision (EXPIRATION transport)', () => {
+    const decisionId = '77777777-7777-4777-8777-777777777777';
+
+    const decision = (overrides: Record<string, unknown> = {}) => ({
+      id: decisionId,
+      sourceRequestId: '11111111-1111-4111-8111-111111111111',
+      type: 'EXPIRATION',
+      status: 'PENDING',
+      version: 1,
+      createdAt: '2026-08-25T12:00:01.000Z',
+      snapshot: {
+        branchId: 'sucursal-centro',
+        branchName: 'Sucursal Centro',
+        productId: '22222222-2222-4222-8222-222222222222',
+        productName: 'Croquetas Premium',
+        unit: 'PZA',
+        variantId: null,
+        variantName: null,
+        variantOption: null,
+        variantValue: null,
+      },
+      supersedesDecisionId: null,
+      resolution: null,
+      applyBefore: null,
+      ...overrides,
+    });
+
+    const resolved = (resolution: Record<string, unknown>) => ({
+      ...decision(),
+      status: 'RESOLVED',
+      version: 2,
+      resolution,
+      applyBefore: '2026-08-26T13:00:00.000Z',
+    });
+
+    const provideText = () =>
+      resolved({
+        action: 'PROVIDE_EXPIRATION_TEXT',
+        expirationText: 'Caduca en marzo 2027',
+        resolvedAt: '2026-08-25T13:00:00.000Z',
+      });
+
+    const unavailable = () =>
+      resolved({
+        action: 'REPORT_EXPIRATION_UNAVAILABLE',
+        resolvedAt: '2026-08-25T13:00:00.000Z',
+      });
+
+    const poll = () =>
+      client.getExpirationDecision(decisionId).then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (error: ChatbotApiError) => error,
+      );
+
+    it('GETs the encoded decision URL with auth headers, no idempotency, and parses pending/resolved states', async () => {
+      const expired: Record<string, unknown> = {
+        ...provideText(),
+        resolution: {
+          action: 'PROVIDE_EXPIRATION_TEXT',
+          expirationText: 'Caduca en enero 2020',
+          resolvedAt: '2020-01-01T00:00:00.000Z',
+        },
+        applyBefore: '2020-01-02T00:00:00.000Z',
+      };
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(decision())))
+        .mockReturnValueOnce(of(axiosResponse(provideText())))
+        .mockReturnValueOnce(of(axiosResponse(unavailable())))
+        .mockReturnValueOnce(of(axiosResponse(expired)));
+
+      const pending = await client.getExpirationDecision(decisionId);
+      expect(pending.status).toBe('PENDING');
+      expect(pending.resolution).toBeNull();
+      expect(pending.applyBefore).toBeNull();
+
+      const provide = await client.getExpirationDecision(decisionId);
+      expect(provide.resolution).toEqual({
+        action: 'PROVIDE_EXPIRATION_TEXT',
+        expirationText: 'Caduca en marzo 2027',
+        resolvedAt: '2026-08-25T13:00:00.000Z',
+      });
+
+      const noText = await client.getExpirationDecision(decisionId);
+      expect(noText.resolution).toEqual({
+        action: 'REPORT_EXPIRATION_UNAVAILABLE',
+        resolvedAt: '2026-08-25T13:00:00.000Z',
+      });
+
+      await expect(
+        client.getExpirationDecision(decisionId),
+      ).resolves.toMatchObject({
+        status: 'RESOLVED',
+        applyBefore: '2020-01-02T00:00:00.000Z',
+      });
+
+      const cfg = httpService.request.mock.calls[0][0] as {
+        method: string;
+        url: string;
+        headers: Record<string, string>;
+      };
+      expect(cfg.method).toBe('GET');
+      expect(cfg.url).toBe(`/chatbot-api/human-decisions/${decisionId}`);
+      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+      expect(cfg.headers['X-Idempotency-Key']).toBeUndefined();
+      expect(httpService.request).toHaveBeenCalledTimes(4);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('rejects non-canonical ids (nil, uppercase, whitespace, bad version/variant) before any HTTP', async () => {
+      const invalidIds = [
+        '00000000-0000-0000-0000-000000000000',
+        'ABCDEF01-2345-4678-89AB-CDEF01234567',
+        ` ${decisionId}`,
+        '77777777-7777-0777-8777-777777777777',
+        '77777777-7777-4777-7777-777777777777',
+        'not-a-uuid',
+      ];
+      for (const id of invalidIds) {
+        await expect(client.getExpirationDecision(id)).rejects.toBeInstanceOf(
+          ChatbotApiError,
+        );
+      }
+      expect(httpService.request).not.toHaveBeenCalled();
+    });
+
+    it('rejects fulfilled 202 and malformed/deadline/mismatched bodies as UpstreamError with evidence, no retry', async () => {
+      const cases: Array<[unknown, number, string | null]> = [
+        [provideText(), 202, null],
+        [decision({ extra: true }), 200, null],
+        [
+          { ...provideText(), applyBefore: '2026-08-26T14:00:00.000Z' },
+          200,
+          null,
+        ],
+        [decision({ id: '99999999-9999-4999-8999-999999999999' }), 200, null],
+        [
+          { statusCode: 200, code: 'ODD_ENVELOPE', message: 'x' },
+          200,
+          'ODD_ENVELOPE',
+        ],
+      ];
+
+      for (const [body, status, code] of cases) {
+        httpService.request.mockReturnValueOnce(
+          of(axiosResponse(body, status)),
+        );
+        const error = await poll();
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error.statusCode).toBe(status);
+        expect(error.responseBody).toEqual(body);
+        expect(error.errorCode).toBe(code);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(cases.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('retries network/5xx failures with bounded backoff and returns the later success', async () => {
+      httpService.request
+        .mockReturnValueOnce(
+          throwError(() => ({
+            response: {
+              status: 503,
+              data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+            },
+          })),
+        )
+        .mockReturnValueOnce(
+          throwError(() => ({ code: 'ECONNRESET', message: 'socket down' })),
+        )
+        .mockReturnValueOnce(of(axiosResponse(decision())));
+
+      await expect(
+        client.getExpirationDecision(decisionId),
+      ).resolves.toMatchObject({ status: 'PENDING' });
+
+      expect(httpService.request).toHaveBeenCalledTimes(3);
+      expect(sleep).toHaveBeenNthCalledWith(1, 100);
+      expect(sleep).toHaveBeenNthCalledWith(2, 200);
+    });
+
+    it('exhausts the bounded 3-attempt retry on persistent 5xx and maps the final error', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 503,
+            data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+          },
+        })),
+      );
+
+      const error = await poll();
+      expect(error).toBeInstanceOf(UpstreamError);
+      expect(error.statusCode).toBe(503);
+      expect(error.errorCode).toBe('UPSTREAM_DOWN');
+      expect(httpService.request).toHaveBeenCalledTimes(3);
+      expect(sleep).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      [400, 'VALIDATION_ERROR', UpstreamError],
+      [401, 'UNAUTHORIZED', AuthError],
+      [403, 'FORBIDDEN', ForbiddenError],
+      [404, 'NOT_FOUND', NotFoundError],
+    ])(
+      'maps a %i scoped code envelope to %p without retry',
+      async (status, code, ErrorType) => {
+        httpService.request.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status,
+              data: { statusCode: status, code, message: 'nope' },
+            },
+          })),
+        );
+
+        const error = await poll();
+        expect(error).toBeInstanceOf(ErrorType);
+        expect(error.statusCode).toBe(status);
+        expect(error.errorCode).toBe(code);
+        expect(httpService.request).toHaveBeenCalledTimes(1);
+        expect(sleep).not.toHaveBeenCalled();
+      },
+    );
+
+    it('maps 429 to RateLimitError with Retry-After and no retry', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 429,
+            headers: { 'retry-after': '7' },
+            data: {
+              statusCode: 429,
+              code: 'RATE_LIMITED',
+              message: 'slow down',
+            },
+          },
+        })),
+      );
+
+      const error = await poll();
+      expect(error).toBeInstanceOf(RateLimitError);
+      expect((error as RateLimitError).retryAfterSeconds).toBe(7);
+      expect(error.errorCode).toBe('RATE_LIMITED');
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
   // ─── recordRestockApplicationOutcome (POST .../application-outcome) — T4b2
 
   describe('recordRestockApplicationOutcome (T4b2)', () => {

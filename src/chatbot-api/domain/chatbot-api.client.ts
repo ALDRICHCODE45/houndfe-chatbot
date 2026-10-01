@@ -7,6 +7,7 @@ import {
 import type { PaymentDetail } from './dtos/payment-details.dto';
 import type { ExpirationIntakeInput } from './dtos/human-decisions-expiration.dto';
 import type { ExpirationIntakeReceipt } from './dtos/human-decisions-expiration-receipt.dto';
+import type { ExpirationDecision } from './dtos/human-decisions-expiration-decision.dto';
 import type {
   RestockApplicationOutcomeAck,
   RestockApplicationOutcomeRequest,
@@ -87,6 +88,15 @@ export interface ChatbotApiClient {
    *  and binds the parsed current decision to the requested UUID
    *  (case-insensitive). */
   getRestockDecision(decisionId: string): Promise<RestockDecision>;
+  /** EXPIRATION `GET /chatbot-api/human-decisions/:id` current-state poll
+   *  (scope `human-decisions:read`). Validates the id as a canonical lowercase
+   *  RFC UUID v1–v8 (nil/uppercase/whitespace rejected) before any request,
+   *  uses the safe GET retry policy (network/5xx only, bounded to three
+   *  attempts), and requires HTTP 200 whose normalized body binds exactly to
+   *  the requested id. Binding to source/subject/branch/sender and freshness
+   *  eligibility are future runtime concerns, so a valid `RESOLVED` decision
+   *  past its deadline still parses here. */
+  getExpirationDecision(decisionId: string): Promise<ExpirationDecision>;
   /** T4b2: `POST /chatbot-api/human-decisions/:id/application-outcome`
    *  terminal bot ACK (scope `human-decisions:ack`). The decision id and the
    *  request are validated/normalized before any HTTP; the wire body is the

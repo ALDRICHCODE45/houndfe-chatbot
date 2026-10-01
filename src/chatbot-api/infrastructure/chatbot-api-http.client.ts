@@ -40,6 +40,10 @@ import {
   type ExpirationIntakeInput,
 } from '../domain/dtos/human-decisions-expiration.dto';
 import {
+  normalizeExpirationDecision,
+  type ExpirationDecision,
+} from '../domain/dtos/human-decisions-expiration-decision.dto';
+import {
   normalizeExpirationIntakeReceipt,
   type ExpirationIntakeReceipt,
 } from '../domain/dtos/human-decisions-expiration-receipt.dto';
@@ -78,6 +82,9 @@ const MAX_GET_ATTEMPTS = 3;
 const INITIAL_BACKOFF_MS = 100;
 const DECISION_ID_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Canonical lowercase RFC UUID v1–v8 with variant bits 8/9/a/b (nil uppercase/whitespace rejected). */
+const EXPIRATION_DECISION_ID_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const CHATBOT_API_SLEEP = Symbol('CHATBOT_API_SLEEP');
 
 @Injectable()
@@ -315,6 +322,59 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     ) {
       throw new UpstreamError(
         'Chatbot API current decision poll response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return decision;
+  }
+
+  /**
+   * EXPIRATION `GET /chatbot-api/human-decisions/:id` current-state poll
+   * (contract v1, scope `human-decisions:read`).
+   *
+   * The decision id must be a canonical lowercase RFC UUID v1–v8 with variant
+   * bits 8/9/a/b; a nil, uppercase or whitespace id is rejected before any
+   * request. It reuses the safe GET retry policy (network/5xx only, bounded to
+   * three attempts; 4xx incl. 429 are never retried) and requires an HTTP 200
+   * whose body parses as a current EXPIRATION decision bound EXACTLY to the
+   * requested id; otherwise `UpstreamError` retains the status, raw body and
+   * `errorCode`. A valid `RESOLVED` decision past its deadline still parses
+   * because freshness eligibility belongs to the future runtime. The GET may
+   * observe `PENDING`→`RESOLVED` across retries and each attempt consumes rate
+   * limit and touches `lastUsedAt`; no polling, store, ACK, send or activation
+   * occurs here.
+   */
+  async getExpirationDecision(decisionId: string): Promise<ExpirationDecision> {
+    if (!EXPIRATION_DECISION_ID_UUID.test(decisionId)) {
+      throw new ChatbotApiError(
+        'EXPIRATION decision id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: `/chatbot-api/human-decisions/${encodeURIComponent(decisionId)}`,
+      },
+      { retryable: true },
+    );
+
+    const body = response.data;
+    const decision = normalizeExpirationDecision(body);
+
+    if (
+      response.status !== 200 ||
+      decision === null ||
+      decision.id !== decisionId
+    ) {
+      throw new UpstreamError(
+        'Chatbot API EXPIRATION decision poll response was invalid',
         response.status,
         body,
         extractErrorCode(body),
