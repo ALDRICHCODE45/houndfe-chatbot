@@ -18,6 +18,7 @@ import type {
   RestockApplicationOutcomeRequest,
   RestockIntakeInput,
 } from '../domain/dtos/human-decisions.dto';
+import type { ExpirationIntakeInput } from '../domain/dtos/human-decisions-expiration.dto';
 
 // Complete, type-safe `AxiosResponse` fixture. The client consumes
 // `httpService.request<T>()`, which resolves to `AxiosResponse<T>`, so a bare
@@ -1672,6 +1673,293 @@ describe('ChatbotApiHttpClient', () => {
           errorCode: expected,
         });
       }
+    });
+  });
+
+  // ─── submitExpirationIntake (POST /chatbot-api/human-decisions) — EXPIRATION
+
+  describe('submitExpirationIntake (EXPIRATION transport)', () => {
+    type ErrorCtor = new (...args: never[]) => ChatbotApiError;
+    type Cfg = {
+      method: string;
+      url: string;
+      data: Record<string, unknown>;
+      headers: Record<string, string>;
+    };
+
+    const simple: ExpirationIntakeInput = {
+      sourceRequestId: '11111111-1111-4111-8111-111111111111',
+      type: 'EXPIRATION',
+      productId: '22222222-2222-4222-8222-222222222222',
+      variantId: null,
+    };
+    const variant: ExpirationIntakeInput = {
+      sourceRequestId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA',
+      type: 'EXPIRATION',
+      productId: 'BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB',
+      variantId: 'CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC',
+    };
+    const receipt = (
+      overrides: Record<string, unknown> = {},
+      subject = simple,
+    ) => ({
+      id: '44444444-4444-4444-8444-444444444444',
+      sourceRequestId: subject.sourceRequestId,
+      type: 'EXPIRATION',
+      status: 'PENDING',
+      version: 1,
+      createdAt: '2026-08-25T12:00:01.000Z',
+      snapshot: {
+        branchId: '55555555-5555-4555-8555-555555555555',
+        branchName: 'Sucursal Centro',
+        productId: subject.productId,
+        productName: 'Alimento Premium',
+        unit: 'PZA',
+        variantId: subject.variantId,
+        variantName: subject.variantId === null ? null : 'Sabor',
+        variantOption: subject.variantId === null ? null : 'Sabor',
+        variantValue: subject.variantId === null ? null : 'Pollo',
+      },
+      supersedesDecisionId: null,
+      resolution: null,
+      applyBefore: null,
+      ...overrides,
+    });
+    const sentConfig = (index = 0) =>
+      httpService.request.mock.calls[index][0] as Cfg;
+    const rejectIntake = (dto: ExpirationIntakeInput = simple) =>
+      client.submitExpirationIntake(dto).then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (error: ChatbotApiError) => error,
+      );
+    const failUpstream = (
+      status: number,
+      data?: unknown,
+      headers?: Record<string, string>,
+    ) => throwError(() => ({ response: { status, data, headers } }));
+    const network = (code: string) =>
+      throwError(() => ({ code, message: code }));
+
+    it('POSTs the exact simple four-key body, literal idempotency key and auth headers', async () => {
+      httpService.request.mockReturnValueOnce(
+        of(axiosResponse(receipt(), 201)),
+      );
+
+      await expect(client.submitExpirationIntake(simple)).resolves.toEqual(
+        receipt(),
+      );
+
+      expect(sentConfig()).toMatchObject({
+        method: 'POST',
+        url: '/chatbot-api/human-decisions',
+        data: simple,
+        headers: {
+          'X-Idempotency-Key': simple.sourceRequestId,
+          Authorization: 'Bearer svc_test_key',
+          'X-Branch-Id': 'branch-123',
+        },
+      });
+      expect(Object.keys(sentConfig().data).sort()).toEqual([
+        'productId',
+        'sourceRequestId',
+        'type',
+        'variantId',
+      ]);
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('resolves 201 then a 200 replay as the same immutable historical receipt, preserving the variant body and sent-case header', async () => {
+      const body = receipt(
+        { sourceRequestId: variant.sourceRequestId.toLowerCase() },
+        variant,
+      );
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(body, 201)))
+        .mockReturnValueOnce(of(axiosResponse(body, 200)));
+
+      expect(await client.submitExpirationIntake(variant)).toEqual(body);
+
+      expect(sentConfig(0)).toMatchObject({
+        data: variant,
+        headers: {
+          'X-Idempotency-Key': variant.sourceRequestId,
+          Authorization: 'Bearer svc_test_key',
+          'X-Branch-Id': 'branch-123',
+        },
+      });
+
+      const replayed = await client.submitExpirationIntake(variant);
+      expect(replayed).toEqual(body);
+      expect(replayed.status).toBe('PENDING');
+      expect(replayed.version).toBe(1);
+      expect(replayed.resolution).toBeNull();
+      expect(replayed.applyBefore).toBeNull();
+      expect(replayed.supersedesDecisionId).toBeNull();
+      expect(sentConfig(1).headers['X-Idempotency-Key']).toBe(
+        variant.sourceRequestId,
+      );
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid local intakes before any HTTP request', async () => {
+      const invalid = [
+        { ...simple, type: 'RESTOCK' },
+        { ...simple, variantId: 'not-a-uuid' },
+        { ...simple, extraAuthority: 'branch-9' },
+        {
+          sourceRequestId: simple.sourceRequestId,
+          type: 'EXPIRATION',
+          productId: simple.productId,
+        },
+      ];
+
+      for (const dto of invalid) {
+        await expect(
+          client.submitExpirationIntake(dto as ExpirationIntakeInput),
+        ).rejects.toBeInstanceOf(ChatbotApiError);
+      }
+
+      expect(httpService.request).not.toHaveBeenCalled();
+    });
+
+    it('rejects a fulfilled 202 and malformed/unbound receipts with UpstreamError evidence', async () => {
+      const rejected: Array<[unknown, number]> = [
+        [receipt(), 202],
+        [receipt({ status: 'RESOLVED' }), 201],
+        [receipt({ version: 2 }), 201],
+        [receipt({ resolution: { action: 'X' } }), 201],
+        [
+          receipt({ sourceRequestId: '99999999-9999-4999-8999-999999999999' }),
+          201,
+        ],
+        [
+          receipt({
+            snapshot: {
+              ...receipt().snapshot,
+              productId: '99999999-9999-4999-8999-999999999999',
+            },
+          }),
+          201,
+        ],
+      ];
+
+      for (const [body, status] of rejected) {
+        httpService.request.mockReturnValueOnce(
+          of(axiosResponse(body, status)),
+        );
+        const error = await rejectIntake();
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error.statusCode).toBe(status);
+        expect(error.responseBody).toEqual(body);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(rejected.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('maps 400/404/409/503/429 and network failures with one attempt and no sleep', async () => {
+      const cases: Array<
+        [ReturnType<typeof network>, number | null, string | null, ErrorCtor]
+      > = [
+        [
+          failUpstream(400, {
+            statusCode: 400,
+            code: 'VALIDATION_ERROR',
+            message: 'bad',
+          }),
+          400,
+          'VALIDATION_ERROR',
+          UpstreamError,
+        ],
+        [
+          failUpstream(400, { message: 'pre-controller malformed' }),
+          400,
+          null,
+          UpstreamError,
+        ],
+        [
+          failUpstream(404, {
+            statusCode: 404,
+            code: 'NOT_FOUND',
+            message: 'missing',
+          }),
+          404,
+          'NOT_FOUND',
+          NotFoundError,
+        ],
+        [
+          failUpstream(409, {
+            statusCode: 409,
+            code: 'IDEMPOTENCY_CONFLICT',
+            message: 'conflict',
+          }),
+          409,
+          'IDEMPOTENCY_CONFLICT',
+          UpstreamError,
+        ],
+        [
+          failUpstream(503, {
+            statusCode: 503,
+            code: 'INTERNAL_ERROR',
+            message: 'down',
+          }),
+          503,
+          'INTERNAL_ERROR',
+          UpstreamError,
+        ],
+        [
+          failUpstream(
+            429,
+            { statusCode: 429, code: 'RATE_LIMITED', message: 'slow' },
+            { 'retry-after': '7' },
+          ),
+          429,
+          'RATE_LIMITED',
+          RateLimitError,
+        ],
+        [network('ECONNRESET'), null, null, UpstreamError],
+      ];
+
+      for (const [observable, status, code, ErrorType] of cases) {
+        httpService.request.mockReturnValueOnce(observable);
+        const error = await rejectIntake();
+        expect(error).toBeInstanceOf(ErrorType);
+        expect(error.statusCode).toBe(status);
+        expect(error.errorCode).toBe(code);
+        if (ErrorType === RateLimitError) {
+          expect((error as RateLimitError).retryAfterSeconds).toBe(7);
+        }
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(cases.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('treats a timeout as a lost response: one attempt, then an explicit second invocation with the same header/body resolves 200', async () => {
+      httpService.request
+        .mockReturnValueOnce(network('ETIMEDOUT'))
+        .mockReturnValueOnce(of(axiosResponse(receipt(), 200)));
+
+      const lost = await rejectIntake();
+      expect(lost).toBeInstanceOf(UpstreamError);
+      expect(lost.statusCode).toBeNull();
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+
+      expect(await client.submitExpirationIntake(simple)).toEqual(receipt());
+      expect(sentConfig(0).data).toEqual(sentConfig(1).data);
+      expect(sentConfig(0).headers['X-Idempotency-Key']).toBe(
+        simple.sourceRequestId,
+      );
+      expect(sentConfig(1).headers['X-Idempotency-Key']).toBe(
+        simple.sourceRequestId,
+      );
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
     });
   });
 

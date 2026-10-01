@@ -36,6 +36,14 @@ import {
   CreateSaleInputSchema,
 } from '../domain/dtos/sales.dto';
 import {
+  normalizeExpirationIntake,
+  type ExpirationIntakeInput,
+} from '../domain/dtos/human-decisions-expiration.dto';
+import {
+  normalizeExpirationIntakeReceipt,
+  type ExpirationIntakeReceipt,
+} from '../domain/dtos/human-decisions-expiration-receipt.dto';
+import {
   normalizeRestockApplicationOutcome,
   normalizeRestockApplicationOutcomeAck,
   normalizeRestockDecision,
@@ -438,6 +446,77 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     if (receipt === null) {
       throw new UpstreamError(
         'Chatbot API RESTOCK intake response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return receipt;
+  }
+
+  /**
+   * `POST /chatbot-api/human-decisions` EXPIRATION intake (contract v1, scope
+   * `human-decisions:create`).
+   *
+   * The four-key DTO is normalized first and malformed input is rejected before
+   * any request. The wire body is that exact normalized intake and
+   * `X-Idempotency-Key` is the literal sent `sourceRequestId` (case preserved);
+   * no source, tenant, branch or PII authority is sent. Exactly one POST is
+   * attempted — no sleep, no automatic retry even on 5xx or transport
+   * ambiguity — and only a `201`/`200` immutable historical receipt bound to
+   * the sent identity resolves. That receipt is `PENDING`/v1, never current
+   * state, and nothing here is wired to runtime.
+   */
+  async submitExpirationIntake(
+    dto: ExpirationIntakeInput,
+  ): Promise<ExpirationIntakeReceipt> {
+    const sent = normalizeExpirationIntake(dto);
+    if (sent === null) {
+      throw new ChatbotApiError(
+        'EXPIRATION intake DTO failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    return this.requestExpirationIntake(sent);
+  }
+
+  private async requestExpirationIntake(
+    sent: ExpirationIntakeInput,
+  ): Promise<ExpirationIntakeReceipt> {
+    const requestConfig = this.buildAuthedRequestConfig({
+      method: 'POST',
+      url: '/chatbot-api/human-decisions',
+      data: sent,
+      headers: { 'X-Idempotency-Key': sent.sourceRequestId },
+    });
+
+    let response;
+    try {
+      response = await lastValueFrom(
+        this.httpService.request<unknown>(requestConfig),
+      );
+    } catch (error) {
+      throw this.mapError(error);
+    }
+
+    const body = response.data;
+
+    if (response.status !== 201 && response.status !== 200) {
+      throw new UpstreamError(
+        'Chatbot API EXPIRATION intake returned an unexpected status',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    const receipt = normalizeExpirationIntakeReceipt(body, sent);
+    if (receipt === null) {
+      throw new UpstreamError(
+        'Chatbot API EXPIRATION intake response was invalid',
         response.status,
         body,
         extractErrorCode(body),

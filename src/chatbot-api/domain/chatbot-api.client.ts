@@ -5,6 +5,8 @@ import {
   CustomerUpsertResponse,
 } from './dtos/customers.dto';
 import type { PaymentDetail } from './dtos/payment-details.dto';
+import type { ExpirationIntakeInput } from './dtos/human-decisions-expiration.dto';
+import type { ExpirationIntakeReceipt } from './dtos/human-decisions-expiration-receipt.dto';
 import type {
   RestockApplicationOutcomeAck,
   RestockApplicationOutcomeRequest,
@@ -70,6 +72,13 @@ export interface ChatbotApiClient {
    *  `201`/`200` with a strictly validated immutable historical receipt
    *  (`PENDING`/v1), never on inferred current decision state. */
   submitRestockIntake(dto: RestockIntakeInput): Promise<RestockIntakeReceipt>;
+  /** HD-R2b3: `POST /chatbot-api/human-decisions` EXPIRATION intake (scope
+   *  `human-decisions:create`). Single attempt, no retry; only a `201`/`200`
+   *  immutable historical `PENDING`/v1 receipt bound to the sent identity
+   *  resolves. HTTP transport only — not wired to runtime. */
+  submitExpirationIntake(
+    dto: ExpirationIntakeInput,
+  ): Promise<ExpirationIntakeReceipt>;
   /** T4b1: `GET /chatbot-api/human-decisions/:id` RESTOCK current-state poll
    *  (scope `human-decisions:read`). The only source of current
    *  `PENDING`/`RESOLVED` state; the immutable POST receipt never is. Validates

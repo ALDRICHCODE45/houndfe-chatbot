@@ -1,6 +1,6 @@
 # Task: EXPIRATION human-decision contract alignment (docs + first local bot unit)
 
-**Status:** Backend source for EXPIRATION intake/receipt is implemented (read-only reference, parent-observed HEAD `cde0f58`; parent-verified, **NOT independently verified and NOT deployment proof**). The frontend remains an independent phase, still pending. By owner authorization the bot proceeds locally in parallel instead of serializing behind a validated backend delivery. The bot's strict intake normalizer (committed `939dd10`, native-approved) and its EXPIRATION receipt normalizer are implemented — `partial`: **intake + receipt implemented**; the HTTP call, runtime wiring, GET poll, E2E, and activation remain deliberately deferred. No push/deploy/activation/production.
+**Status:** Backend source for EXPIRATION intake/receipt is implemented (read-only reference, parent-observed HEAD `cde0f58`; parent-verified, **NOT independently verified and NOT deployment proof**). The frontend remains an independent phase, still pending. By owner authorization the bot proceeds locally in parallel instead of serializing behind a validated backend delivery. The bot's strict intake normalizer (committed `939dd10`, native-approved) and its EXPIRATION receipt normalizer are implemented, and the EXPIRATION HTTP transport method (`submitExpirationIntake`) is implemented locally but **not wired to runtime** — `partial`: **intake + receipt + HTTP transport implemented**; runtime wiring, GET poll, E2E, and activation remain deliberately deferred. No push/deploy/activation/production.
 **Deliverable:** the two aligned docs (`docs/human-decisions-expiration-v1.md`, this tracker) plus the bot's local units `src/chatbot-api/domain/dtos/human-decisions-expiration.dto.ts` (+`.spec.ts`, committed `939dd10`, native-approved) and `src/chatbot-api/domain/dtos/human-decisions-expiration-receipt.dto.ts` (+`.spec.ts`). Baseline `939dd10`; earlier baseline `47a0cf3`.
 
 ## Authorized unit (docs + intake normalizer)
@@ -11,7 +11,7 @@
 - [x] Keep historical RESTOCK docs untouched: `docs/human-decisions-contract-v1.md`, `odd/tasks/human-decisions-restock.md`.
 - [x] Implement the strict EXPIRATION intake normalizer only (exactly four keys, RFC v1-v8 UUIDs, explicit `variantId`) — `normalizeExpirationIntake`.
 - [x] Test-first: 23 focused intake cases, RED observed before GREEN.
-- [ ] Deferred: HTTP client call, runtime wiring, GET poll normalizer, E2E compatibility, activation verification (receipt normalizer delivered as a bounded second unit: exact receipt/snapshot keys, historical `PENDING`/v1, case-insensitive identity binding echoing the canonical lowercase backend UUID, raw server labels preserved verbatim; intake files unmodified).
+- [ ] Deferred: runtime wiring, GET poll normalizer, E2E compatibility, activation verification (EXPIRATION HTTP transport method `submitExpirationIntake` implemented locally but not wired; receipt normalizer delivered as a bounded second unit: exact receipt/snapshot keys, historical `PENDING`/v1, case-insensitive identity binding echoing the canonical lowercase backend UUID, raw server labels preserved verbatim; intake files unmodified).
 
 ## Assumptions and constraints
 
@@ -34,4 +34,4 @@
 
 ## Next external checkpoint
 
-- Bot HTTP call, runtime wiring, GET poll normalizer, and E2E remain open (intake `939dd10`, native-approved; receipt focused-verified only). The frontend EXPIRATION phase is independent and awaits its own validated delivery. No approved rule above is reopened.
+- Bot HTTP transport method is implemented but not wired; runtime wiring, GET poll normalizer, and E2E remain open (intake `939dd10`, native-approved; receipt focused-verified only). The frontend EXPIRATION phase is independent and awaits its own validated delivery. No approved rule above is reopened.
