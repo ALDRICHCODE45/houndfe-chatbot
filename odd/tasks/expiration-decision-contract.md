@@ -40,8 +40,8 @@
 
 - `PostgresExpirationPostClaimStore.preparePost` prepares only an exact ACTIVE EXPIRATION reservation (`NULL → RESERVED`); it never authorizes HTTP or initializes unrelated rows. Inbound binding, subject preflight and reservation are caller prerequisites.
 - Source UUID casing is preserved byte-for-byte. Unit tests cover input/projection rejection, exact intake fences and zero-row rereads; uppercase regression: worker observed 1 failed / 24 passed before correction, then 25 passed.
-- Owner-approved split: preparation + unit tests first; real PostgreSQL preparation/concurrency tests second; `RESERVED → POST_IN_FLIGHT` authorization with unique-winner proof third. These last two units remain pending.
-- Runtime verification: N/A, adapter is not registered or invoked. Real PostgreSQL preparation evidence is explicitly deferred, not claimed. Rollback boundary: remove the two new `postgres-expiration-post-claim.store` files and this note; leave schema 280 and other routes untouched.
+- Owner-approved split: preparation + unit tests committed `d02fdc6`; real PostgreSQL preparation/concurrency suite now implemented (17 cases, disposable schema-280 database); `RESERVED → POST_IN_FLIGHT` authorization with unique-winner proof remains pending.
+- Preparation DB proof: two observably blocked UPDATEs yield exactly one `prepared` and one `already_prepared`; includes fresh-adapter/pool replay, exact-case identity, variant/JSONB projection and nonmutation checks. No production/runtime activation or POST authorization. Cleanup paths were reviewed, not fault-injected. Run: `RUN_DOCKER_TESTS=1 pnpm exec jest --runInBand src/human-decisions/infrastructure/postgres-expiration-post-claim.store.db.spec.ts`. Rollback this test unit by removing that spec and reverting these two tracker lines; preserve the adapter and schema.
 
 ## Next external checkpoint
 
