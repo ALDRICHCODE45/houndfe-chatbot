@@ -15,6 +15,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import type { Pool, PoolClient } from 'pg';
 import { normalizeRestockIntake } from '../../chatbot-api/domain/dtos/human-decisions.dto';
+import { normalizeExpirationIntake } from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 import {
   classifyReservation,
@@ -93,7 +94,7 @@ function singleRow(result: {
 }
 
 /** Read one proposal before any connection; null on a throwing getter, an
- * unknown route, a legacy payload, or a RESTOCK intake not bound to its id. */
+ * unknown route, a legacy payload, or an intake not bound to its id. */
 function materialize(
   proposal: ReservationProposal,
 ): ReservationProposal | null {
@@ -107,6 +108,16 @@ function materialize(
       return Object.freeze({
         senderId,
         route: 'RESTOCK' as const,
+        requestKey,
+        intake: Object.freeze(intake),
+      });
+    }
+    if (route === 'EXPIRATION') {
+      const intake = normalizeExpirationIntake(proposal.intake);
+      if (intake === null || intake.sourceRequestId !== requestKey) return null;
+      return Object.freeze({
+        senderId,
+        route: 'EXPIRATION' as const,
         requestKey,
         intake: Object.freeze(intake),
       });

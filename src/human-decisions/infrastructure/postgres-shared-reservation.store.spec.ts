@@ -14,6 +14,17 @@ const SENDER = 'whatsapp:+5215500000001';
 const LEGACY_KEY = 'a1b2c3d4e5f6';
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
+const expiration = (): ReservationProposal => ({
+  senderId: SENDER,
+  route: 'EXPIRATION',
+  requestKey: A,
+  intake: {
+    sourceRequestId: A,
+    type: 'EXPIRATION',
+    productId: B,
+    variantId: null,
+  },
+});
 
 const intake = (o: Partial<RestockIntakeInput> = {}): RestockIntakeInput => ({
   sourceRequestId: A,
@@ -113,7 +124,11 @@ function strictReply(
     }
     if (sql === INSERT_SQL) {
       const restock = target.route === 'RESTOCK';
-      const expectedIntake = restock ? JSON.stringify(intake()) : null;
+      const expectedIntake = restock
+        ? JSON.stringify(intake())
+        : target.route === 'EXPIRATION'
+          ? JSON.stringify(expiration().intake)
+          : null;
       if (
         !sameParams(params, [
           SENDER,
@@ -489,11 +504,26 @@ describe('PostgresSharedReservationStore.closeLegacyResolved', () => {
   });
 });
 
-describe('PostgresSharedReservationStore.reserve — EXPIRATION sentinel', () => {
-  // A VALID pure-EXPIRATION proposal (the classifier claims it) stays outside
-  // the port's supported LEGACY_OPS/RESTOCK adapter subset: an untyped runtime
-  // caller must be rejected before any connect/query, never materialized. The
-  // `as never` cast simulates that untyped runtime caller only.
+describe('PostgresSharedReservationStore.reserve — EXPIRATION persistence', () => {
+  it.each([
+    { sourceRequestId: B },
+    { type: 'RESTOCK' },
+    { variantId: undefined },
+    { productId: 'invalid' },
+    { extra: true },
+  ])('rejects malformed EXPIRATION before connecting: %j', async (patch) => {
+    const proposal = expiration;
+    const h = harness();
+    await expect(
+      h.store.reserve({
+        ...proposal,
+        intake: { ...proposal.intake, ...patch },
+      } as ReservationProposal),
+    ).resolves.toEqual(MALFORMED);
+    expect(h.connects()).toBe(0);
+  });
+
+  // Schema 270 admits reservations only; POST metadata must remain NULL.
   const expiration = {
     senderId: SENDER,
     route: 'EXPIRATION',
@@ -506,7 +536,7 @@ describe('PostgresSharedReservationStore.reserve — EXPIRATION sentinel', () =>
     },
   };
 
-  it('is pure-valid yet rejected before any connection', async () => {
+  it('persists a pure-valid claim without authorizing a POST', async () => {
     expect(
       classifyReservation({
         proposal: expiration as unknown as ReservationProposal,
@@ -515,11 +545,18 @@ describe('PostgresSharedReservationStore.reserve — EXPIRATION sentinel', () =>
       }),
     ).toEqual(CLAIM);
 
-    const h = harness();
-    await expect(h.store.reserve(expiration as never)).resolves.toEqual(
-      MALFORMED,
-    );
-    expect(h.connects()).toBe(0);
-    expect(h.client.calls).toHaveLength(0);
+    const h = harness({ insert: CLAIMED }, { route: 'EXPIRATION', key: A });
+    await expect(
+      h.store.reserve(expiration as ReservationProposal),
+    ).resolves.toEqual(CLAIM);
+    expect(h.connects()).toBe(1);
+    expect(h.client.calls.find((c) => c.sql === INSERT_SQL)?.params).toEqual([
+      SENDER,
+      'EXPIRATION',
+      A,
+      JSON.stringify(expiration.intake),
+      null,
+    ]);
+    expect(h.client.releases).toBe(1);
   });
 });

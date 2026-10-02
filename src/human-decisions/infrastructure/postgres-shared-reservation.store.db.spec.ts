@@ -12,7 +12,7 @@ import { PostgresSharedReservationStore } from './postgres-shared-reservation.st
 /**
  * HD-R3b2b3a real-PostgreSQL contract suite for the shared reservation adapter.
  *
- * It starts a disposable `postgres:16-alpine` container, applies ALL migrations
+ * It starts a disposable `postgres:16-alpine` container, migrates through 270
  * to that container's URI only (never an ambient `DATABASE_URL`), connects a
  * pool exclusively to it, and drives the real adapter against real unique
  * indexes and CHECK constraints. It covers same-sender cross-route concurrency,
@@ -73,11 +73,25 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
-    execFileSync('pnpm', ['migrate'], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: container.getConnectionUri() },
-      stdio: 'pipe',
-    });
+    execFileSync(
+      process.execPath,
+      [
+        join(REPO_ROOT, 'node_modules/node-pg-migrate/bin/node-pg-migrate.js'),
+        '-f',
+        'package.json',
+        '--config-value',
+        'pg-migrate',
+        'up',
+        '2700000000000',
+        '--timestamp',
+      ],
+      {
+        cwd: REPO_ROOT,
+        env: { DATABASE_URL: container.getConnectionUri() },
+        stdio: 'pipe',
+        timeout: 60_000,
+      },
+    );
     pool = new Pool({ connectionString: container.getConnectionUri() });
     store = new PostgresSharedReservationStore(pool);
   });
@@ -120,6 +134,163 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
     );
     return rows[0]?.status;
   };
+
+  const expiration = (
+    variantId: string | null = null,
+  ): ReservationProposal => ({
+    senderId: SENDER,
+    route: 'EXPIRATION',
+    requestKey: A,
+    intake: { sourceRequestId: A, type: 'EXPIRATION', productId: B, variantId },
+  });
+
+  // Both real transactions observe vacancy before either may INSERT.
+  // No rows are fabricated: only delivery of the first SELECT result is gated.
+  const race = async (
+    left: ReservationProposal,
+    right: ReservationProposal,
+  ) => {
+    let arrivals = 0;
+    let open!: () => void;
+    let fail!: (error: Error) => void;
+    const gate = new Promise<void>((resolve, reject) => {
+      open = resolve;
+      fail = reject;
+    });
+    const timer = setTimeout(
+      () => fail(new Error('vacancy barrier timed out')),
+      5_000,
+    );
+    // A connection/query can fail before reaching the barrier.
+    void gate.catch(() => undefined);
+    const racing = new PostgresSharedReservationStore({
+      connect: async () => {
+        const client = await pool.connect();
+        let first = true;
+        return {
+          query: async (text: string, values?: unknown[]) => {
+            const result = await client.query(text, values);
+            if (first && text.includes("status = 'ACTIVE'")) {
+              first = false;
+              expect(result.rows).toEqual([]);
+              if (++arrivals === 2) open();
+              await gate;
+            }
+            return result;
+          },
+          release: () => client.release(),
+        };
+      },
+    } as unknown as Pool);
+    try {
+      const results = await Promise.allSettled([
+        racing.reserve(left),
+        racing.reserve(right),
+      ]);
+      return results.map((result) => {
+        if (result.status === 'rejected') throw result.reason;
+        return result.value;
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  it.each([null, DECISION])(
+    'persists EXPIRATION variant %s without POST metadata',
+    async (variant) => {
+      const proposal = expiration(variant);
+      expect((await store.reserve(proposal)).action).toBe('claim');
+      expect((await store.reserve(proposal)).action).toBe('replay');
+      const { rows } = await pool.query(
+        'SELECT * FROM human_decision_reservations',
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        sender_id: SENDER,
+        route: 'EXPIRATION',
+        request_key: A,
+        intake: proposal.intake,
+        post_state: null,
+        backend_decision_id: null,
+        post_attempted_at: null,
+        receipt_recorded_at: null,
+        unknown_observed_at: null,
+      });
+    },
+  );
+
+  it.each([
+    ['identical', expiration(), 'replay'],
+    ['changed variant', expiration(DECISION), 'conflict'],
+    [
+      'changed product',
+      {
+        ...expiration(),
+        intake: { ...expiration().intake!, productId: DECISION },
+      },
+      'conflict',
+    ],
+    [
+      'different expiration key',
+      {
+        ...expiration(),
+        requestKey: DECISION,
+        intake: { ...expiration().intake!, sourceRequestId: DECISION },
+      },
+      'occupied',
+    ],
+    ['RESTOCK same key', restock(), 'conflict'],
+    [
+      'RESTOCK different key',
+      restock(SENDER, {
+        requestKey: DECISION,
+        intake: intake({ sourceRequestId: DECISION }),
+      }),
+      'occupied',
+    ],
+    ['legacy', legacy(), 'occupied'],
+  ] as const)(
+    'arbitrates concurrent EXPIRATION / %s',
+    async (_name, right, loser) => {
+      const left = expiration();
+      const decisions = await race(left, right as ReservationProposal);
+      expect(decisions.map((d) => d.action).sort()).toEqual(
+        ['claim', loser].sort(),
+      );
+      const winner = decisions[0].action === 'claim' ? left : right;
+      const { rows } = await pool.query(
+        'SELECT route, request_key, intake FROM human_decision_reservations',
+      );
+      expect(rows).toEqual([
+        {
+          route: winner.route,
+          request_key: winner.requestKey,
+          intake: winner.intake,
+        },
+      ]);
+    },
+  );
+
+  it('holds foreign senders, CLOSED keys and pending legacy for EXPIRATION', async () => {
+    const proposal = expiration();
+    await store.reserve(proposal);
+    expect(await store.reserve({ ...proposal, senderId: OTHER })).toEqual({
+      action: 'blocked',
+      reason: 'sender_mismatch',
+    });
+    await pool.query(
+      "UPDATE human_decision_reservations SET status = 'CLOSED'",
+    );
+    expect(await store.reserve(proposal)).toEqual({
+      action: 'blocked',
+      reason: 'unknown_existing',
+    });
+    await pool.query('TRUNCATE human_decision_reservations');
+    await addHandoff(LEGACY_KEY, SENDER, 'pending');
+    expect((await store.reserve(proposal)).action).toBe('occupied_legacy');
+    expect(await activeRows()).toEqual([]);
+  });
 
   it('lets exactly one of two concurrent same-sender routes claim', async () => {
     const decisions = await Promise.all([

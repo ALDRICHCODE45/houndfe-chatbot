@@ -2,9 +2,8 @@
  * HD-R3b1 — shared, route-agnostic ACTIVE reservation policy + port for legacy
  * ops (12-hex), RESTOCK (UUID) and EXPIRATION (UUID) keys. Pure decision over a
  * verified `existing` reading: never SQL/CAS proof, never `ConversationStore.update`,
- * no release, so an ambiguous POST or `DELIVERY_UNKNOWN` keeps ACTIVE. The port's
- * adapter authority stays the LEGACY_OPS/RESTOCK subset only (`SupportedReservationProposal`);
- * EXPIRATION is classified purely but is not yet an adapter capability.
+ * no release, so an ambiguous POST or `DELIVERY_UNKNOWN` keeps ACTIVE.
+ * EXPIRATION persistence requires schema 270; reservation alone authorizes no POST.
  */
 import {
   normalizeRestockIntake,
@@ -44,16 +43,8 @@ export type ReservationProposal = ReservationEnvelope &
     | { readonly route: 'EXPIRATION'; readonly intake: ExpirationIntakeInput }
   );
 
-/**
- * Adapter-authoritative subset of `ReservationProposal`: the pure classifier
- * understands EXPIRATION, but no adapter materializes or SQL-persists it yet,
- * so `SharedReservationPort.reserve` must NOT accept an EXPIRATION proposal.
- */
-export type SupportedReservationProposal = ReservationEnvelope &
-  (
-    | { readonly route: 'LEGACY_OPS'; readonly intake: null }
-    | { readonly route: 'RESTOCK'; readonly intake: RestockIntakeInput }
-  );
+/** Routes supported by reservation persistence, independently of POST authority. */
+export type SupportedReservationProposal = ReservationProposal;
 
 export interface ActiveReservation {
   readonly status: 'ACTIVE';
