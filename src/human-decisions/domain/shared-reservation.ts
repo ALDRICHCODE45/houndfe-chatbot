@@ -1,15 +1,21 @@
 /**
  * HD-R3b1 — shared, route-agnostic ACTIVE reservation policy + port for legacy
- * ops (12-hex) and RESTOCK (UUID) keys. Pure decision over a verified `existing`
- * reading: never SQL/CAS proof, never `ConversationStore.update`, no release, so
- * an ambiguous POST or `DELIVERY_UNKNOWN` keeps ACTIVE.
+ * ops (12-hex), RESTOCK (UUID) and EXPIRATION (UUID) keys. Pure decision over a
+ * verified `existing` reading: never SQL/CAS proof, never `ConversationStore.update`,
+ * no release, so an ambiguous POST or `DELIVERY_UNKNOWN` keeps ACTIVE. The port's
+ * adapter authority stays the LEGACY_OPS/RESTOCK subset only (`SupportedReservationProposal`);
+ * EXPIRATION is classified purely but is not yet an adapter capability.
  */
 import {
   normalizeRestockIntake,
   type RestockIntakeInput,
 } from '../../chatbot-api/domain/dtos/human-decisions.dto';
+import {
+  normalizeExpirationIntake,
+  type ExpirationIntakeInput,
+} from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
 
-export type ReservationRoute = 'LEGACY_OPS' | 'RESTOCK';
+export type ReservationRoute = 'LEGACY_OPS' | 'RESTOCK' | 'EXPIRATION';
 
 const LEGACY_KEY = /^[0-9a-f]{12}$/;
 const UUID_KEY =
@@ -18,21 +24,43 @@ const INTAKE_FIELDS =
   'sourceRequestId type productId productName variantId sku requestedQuantity observedStockAtRequest stockObservedAt supersedesDecisionId'.split(
     ' ',
   ) as ReadonlyArray<keyof RestockIntakeInput>;
+const EXPIRATION_INTAKE_FIELDS =
+  'sourceRequestId type productId variantId'.split(' ') as ReadonlyArray<
+    keyof ExpirationIntakeInput
+  >;
 
-export type ReservationProposal = {
+/** Validated intake payload for one ACTIVE reservation on any route. */
+export type ReservationIntake = RestockIntakeInput | ExpirationIntakeInput;
+
+type ReservationEnvelope = {
   readonly senderId: string;
   readonly requestKey: string;
-} & (
-  | { readonly route: 'LEGACY_OPS'; readonly intake: null }
-  | { readonly route: 'RESTOCK'; readonly intake: RestockIntakeInput }
-);
+};
+
+export type ReservationProposal = ReservationEnvelope &
+  (
+    | { readonly route: 'LEGACY_OPS'; readonly intake: null }
+    | { readonly route: 'RESTOCK'; readonly intake: RestockIntakeInput }
+    | { readonly route: 'EXPIRATION'; readonly intake: ExpirationIntakeInput }
+  );
+
+/**
+ * Adapter-authoritative subset of `ReservationProposal`: the pure classifier
+ * understands EXPIRATION, but no adapter materializes or SQL-persists it yet,
+ * so `SharedReservationPort.reserve` must NOT accept an EXPIRATION proposal.
+ */
+export type SupportedReservationProposal = ReservationEnvelope &
+  (
+    | { readonly route: 'LEGACY_OPS'; readonly intake: null }
+    | { readonly route: 'RESTOCK'; readonly intake: RestockIntakeInput }
+  );
 
 export interface ActiveReservation {
   readonly status: 'ACTIVE';
   readonly route: ReservationRoute;
   readonly senderId: string;
   readonly requestKey: string;
-  readonly intake: RestockIntakeInput | null;
+  readonly intake: ReservationIntake | null;
 }
 
 export interface ReservationClassifyInput {
@@ -76,25 +104,49 @@ const blocked = (reason: ReservationBlockedReason): ReservationDecision => ({
 const nonBlank = (v: unknown): v is string =>
   typeof v === 'string' && v.trim().length > 0;
 const isRoute = (v: unknown): v is ReservationRoute =>
-  v === 'LEGACY_OPS' || v === 'RESTOCK';
-const isRequestKey = (route: ReservationRoute, key: unknown): boolean =>
-  typeof key === 'string' &&
-  (route === 'LEGACY_OPS' ? LEGACY_KEY : UUID_KEY).test(key);
+  v === 'LEGACY_OPS' || v === 'RESTOCK' || v === 'EXPIRATION';
+const isRequestKey = (route: ReservationRoute, key: unknown): boolean => {
+  if (typeof key !== 'string') return false;
+  if (route === 'LEGACY_OPS') return LEGACY_KEY.test(key);
+  if (route === 'RESTOCK' || route === 'EXPIRATION') return UUID_KEY.test(key);
+  return false;
+};
 
+/**
+ * Route-explicit payload validation: exactly one branch per route, never a
+ * non-legacy→RESTOCK fallthrough. Each route's normalizer must return a payload
+ * whose `sourceRequestId` equals `requestKey`, and every raw field must already
+ * equal its normalized value (no silent coercion or field drift).
+ */
 function validatedPayload(
   route: ReservationRoute,
   requestKey: string,
   intake: unknown,
-): RestockIntakeInput | null | undefined {
+): ReservationIntake | null | undefined {
   if (route === 'LEGACY_OPS') return intake === null ? null : undefined;
-  const normalized = normalizeRestockIntake(intake);
-  if (normalized === null || normalized.sourceRequestId !== requestKey) {
-    return undefined;
+  if (route === 'RESTOCK') {
+    const normalized = normalizeRestockIntake(intake);
+    if (normalized === null || normalized.sourceRequestId !== requestKey) {
+      return undefined;
+    }
+    const raw = intake as Record<keyof RestockIntakeInput, unknown>;
+    return INTAKE_FIELDS.some((f) => !Object.is(raw[f], normalized[f]))
+      ? undefined
+      : normalized;
   }
-  const raw = intake as Record<keyof RestockIntakeInput, unknown>;
-  return INTAKE_FIELDS.some((f) => !Object.is(raw[f], normalized[f]))
-    ? undefined
-    : normalized;
+  if (route === 'EXPIRATION') {
+    const normalized = normalizeExpirationIntake(intake);
+    if (normalized === null || normalized.sourceRequestId !== requestKey) {
+      return undefined;
+    }
+    const raw = intake as Record<keyof ExpirationIntakeInput, unknown>;
+    return EXPIRATION_INTAKE_FIELDS.some(
+      (f) => !Object.is(raw[f], normalized[f]),
+    )
+      ? undefined
+      : normalized;
+  }
+  return undefined;
 }
 
 const asMarker = (v: unknown): boolean | 'unknown' | null =>
@@ -161,8 +213,9 @@ export function classifyReservation(
       if (JSON.stringify(payload) !== JSON.stringify(held)) {
         return { action: 'conflict', reason: 'same_key_different_payload' };
       }
-      // A concurrent legacy pending cannot share the replay: hold instead.
-      if (existing.route === 'RESTOCK' && marker !== false) {
+      // A concurrent legacy pending cannot be shared by a non-legacy replay
+      // (RESTOCK or EXPIRATION): hold instead.
+      if (existing.route !== 'LEGACY_OPS' && marker !== false) {
         return blocked('ambiguous_active_hold');
       }
       return { action: 'replay', reason: 'exact_active_replay' };
@@ -186,7 +239,7 @@ export function classifyReservation(
  * never `ConversationStore.update`, and no release in v1.
  */
 export interface SharedReservationPort {
-  reserve(proposal: ReservationProposal): Promise<ReservationDecision>;
+  reserve(proposal: SupportedReservationProposal): Promise<ReservationDecision>;
   /**
    * Fenced terminal close for the LEGACY_OPS route only. Closes the exact ACTIVE
    * legacy reservation for `(senderId, requestKey)` iff a `human_handoff_requests`

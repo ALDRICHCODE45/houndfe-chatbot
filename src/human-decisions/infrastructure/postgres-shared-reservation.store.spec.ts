@@ -4,7 +4,10 @@
  */
 import type { Pool } from 'pg';
 import type { RestockIntakeInput } from '../../chatbot-api/domain/dtos/human-decisions.dto';
-import { type ReservationProposal } from '../domain/shared-reservation';
+import {
+  classifyReservation,
+  type ReservationProposal,
+} from '../domain/shared-reservation';
 import { PostgresSharedReservationStore } from './postgres-shared-reservation.store';
 
 const SENDER = 'whatsapp:+5215500000001';
@@ -483,5 +486,40 @@ describe('PostgresSharedReservationStore.closeLegacyResolved', () => {
       commitError.store.closeLegacyResolved(SENDER, LEGACY_KEY),
     ).rejects.toThrow('commit failed');
     expect(commitError.client.releases).toBe(1);
+  });
+});
+
+describe('PostgresSharedReservationStore.reserve — EXPIRATION sentinel', () => {
+  // A VALID pure-EXPIRATION proposal (the classifier claims it) stays outside
+  // the port's supported LEGACY_OPS/RESTOCK adapter subset: an untyped runtime
+  // caller must be rejected before any connect/query, never materialized. The
+  // `as never` cast simulates that untyped runtime caller only.
+  const expiration = {
+    senderId: SENDER,
+    route: 'EXPIRATION',
+    requestKey: A,
+    intake: {
+      sourceRequestId: A,
+      type: 'EXPIRATION',
+      productId: B,
+      variantId: null,
+    },
+  };
+
+  it('is pure-valid yet rejected before any connection', async () => {
+    expect(
+      classifyReservation({
+        proposal: expiration as unknown as ReservationProposal,
+        existing: 'absent',
+        legacyMarkerPresent: false,
+      }),
+    ).toEqual(CLAIM);
+
+    const h = harness();
+    await expect(h.store.reserve(expiration as never)).resolves.toEqual(
+      MALFORMED,
+    );
+    expect(h.connects()).toBe(0);
+    expect(h.client.calls).toHaveLength(0);
   });
 });
