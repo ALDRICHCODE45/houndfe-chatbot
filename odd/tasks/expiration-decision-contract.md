@@ -36,6 +36,13 @@
 - GET current-state projection normalizer: 109 focused tests; `tsc`/`eslint`/`prettier` and `git diff --check` pass; the unit is 393 ADD lines across two new files (`human-decisions-expiration-decision.dto.ts` + `.spec.ts`), reviewed+approved (`review-0472792d690fb0d1`) and committed `dfd636a`. The EXPIRATION intake HTTP transport is committed separately at `384dd0f` (receipt `8b560fc`), so the GET unit is not the transport.
 - EXPIRATION GET HTTP transport method: `pnpm test -- chatbot-api-http.client` → 122 passed (RED: 9 failed of the 10 new tests against a fail-closed stub; GREEN 122); `pnpm test -- human-decisions-expiration` → 109 passed; `tsc -p tsconfig.spec.json --noEmit`, scoped `eslint`, and `prettier --check` exit 0; whole diff vs `7a05b3a` = 346 ADD+DEL across the five paths. A valid RESOLVED past-deadline body still parses (freshness is runtime's job), and the method is not wired to runtime, so no live GET is claimed.
 
+## Inactive POST preparation unit (after schema `df3316f`)
+
+- `PostgresExpirationPostClaimStore.preparePost` prepares only an exact ACTIVE EXPIRATION reservation (`NULL → RESERVED`); it never authorizes HTTP or initializes unrelated rows. Inbound binding, subject preflight and reservation are caller prerequisites.
+- Source UUID casing is preserved byte-for-byte. Unit tests cover input/projection rejection, exact intake fences and zero-row rereads; uppercase regression: worker observed 1 failed / 24 passed before correction, then 25 passed.
+- Owner-approved split: preparation + unit tests first; real PostgreSQL preparation/concurrency tests second; `RESERVED → POST_IN_FLIGHT` authorization with unique-winner proof third. These last two units remain pending.
+- Runtime verification: N/A, adapter is not registered or invoked. Real PostgreSQL preparation evidence is explicitly deferred, not claimed. Rollback boundary: remove the two new `postgres-expiration-post-claim.store` files and this note; leave schema 280 and other routes untouched.
+
 ## Next external checkpoint
 
 - Bot HTTP transport methods are implemented but not wired, the GET current-state projection normalizer is implemented (committed `dfd636a`, reviewed+approved `review-0472792d690fb0d1`), and the EXPIRATION GET HTTP transport method (`getExpirationDecision`) is implemented but not wired to runtime polling; runtime wiring and E2E remain open (intake `939dd10`, receipt `8b560fc`, transport `384dd0f`, and GET projection `dfd636a` each reviewed/approved locally). The frontend EXPIRATION phase is independent and awaits its own validated delivery. No approved rule above is reopened.
