@@ -73,13 +73,31 @@ RETURNING ${CLAIM_COLUMNS}`;
 const CLAIM_READ_SQL = `SELECT ${CLAIM_COLUMNS} FROM human_decision_reservations
 WHERE route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2
 LIMIT 1`;
+const RECORD_RECEIPT_SQL = `UPDATE human_decision_reservations
+SET post_state = 'RECEIPT_RECORDED', backend_decision_id = $4,
+    receipt_recorded_at = now(), updated_at = now()
+WHERE route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2
+  AND status = 'ACTIVE' AND post_state = 'POST_IN_FLIGHT'
+  AND intake = $3::jsonb AND backend_decision_id IS NULL
+  AND post_attempted_at IS NOT NULL AND receipt_recorded_at IS NULL
+  AND unknown_observed_at IS NULL
+RETURNING ${CLAIM_COLUMNS}`;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INPUT_KEYS = ['senderId', 'sourceRequestId', 'intake'];
 const INTAKE_KEYS = ['sourceRequestId', 'type', 'productId', 'variantId'];
+const RECEIPT_KEYS = INPUT_KEYS.concat('backendDecisionId');
+const canonicalId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  UUID.test(value) &&
+  value === value.toLowerCase();
 const blocked = (
   reason: ExpirationPrepareBlockedReason,
 ): ExpirationPrepareDecision => ({ action: 'blocked', reason });
+const postBlocked = (reason: string): ExpirationPostDecision => ({
+  action: 'blocked',
+  reason,
+});
 
 const isRow = (row: unknown): boolean =>
   typeof row === 'object' &&
@@ -159,6 +177,23 @@ function snapshotInput(input: unknown): ExpirationPostPrepareInput | null {
     return null;
   }
   return { senderId, sourceRequestId, intake };
+}
+
+/** Exact four-key receipt snapshot: identity+intake as `snapshotInput` plus a
+ * canonical lowercase backend UUID. The CALLER MUST already have validated the
+ * normalized receipt against the original request; this store only fences the
+ * persisted identity/intake/state and neither resends nor unreserves. */
+type ExpirationReceiptInput = ExpirationPostPrepareInput & {
+  readonly backendDecisionId: string;
+};
+function snapshotReceiptInput(input: unknown): ExpirationReceiptInput | null {
+  const snap = snapshotOwn(input, RECEIPT_KEYS);
+  if (snap === null || !canonicalId(snap.backendDecisionId)) return null;
+  const { senderId, sourceRequestId, intake } = snap;
+  const base = snapshotInput({ senderId, sourceRequestId, intake });
+  return base === null
+    ? null
+    : { ...base, backendDecisionId: snap.backendDecisionId };
 }
 
 /** The ACTUAL persisted projection must match the fenced target exactly. */
@@ -297,6 +332,73 @@ export class PostgresExpirationPostClaimStore {
       step: { kind: 'begin_post' },
     });
     return decision.action === 'authorize_post'
+      ? { action: 'blocked', reason: 'unknown_state' }
+      : decision;
+  }
+
+  /** Record exactly one POST_IN_FLIGHT receipt as RECEIPT_RECORDED, preserving
+   * the attempt instant. Only the validated RETURNING projection records; a
+   * zero-row update is re-read once and classified (never emitting a record
+   * from a read), and any error/ambiguity throws without retry. */
+  async recordReceipt(input: unknown): Promise<ExpirationPostDecision> {
+    const target = snapshotReceiptInput(input);
+    if (target === null) return postBlocked('malformed_input');
+    const { senderId, sourceRequestId, intake, backendDecisionId } = target;
+
+    const updated = await this.pool.query(RECORD_RECEIPT_SQL, [
+      senderId,
+      sourceRequestId,
+      JSON.stringify(intake),
+      backendDecisionId,
+    ]);
+    const updatedRows = singleRow(updated);
+    if (updatedRows.length === 1) {
+      const row = updatedRows[0];
+      if (
+        !matches(row, senderId, sourceRequestId) ||
+        row.post_state !== 'RECEIPT_RECORDED' ||
+        !isDeepStrictEqual(row.intake, intake) ||
+        row.backend_decision_id !== backendDecisionId ||
+        !isValidDate(row.post_attempted_at) ||
+        !isValidDate(row.receipt_recorded_at) ||
+        row.unknown_observed_at !== null
+      ) {
+        throw new Error(
+          'expiration receipt CAS returned an unexpected projection',
+        );
+      }
+      return { action: 'record_receipt', backendDecisionId };
+    }
+
+    // Zero-row: never record from a read. Re-read the exact row, verify
+    // identity+intake, then classify; a still-POST_IN_FLIGHT row means the CAS
+    // did not visibly apply -> fail closed rather than emit record_receipt.
+    const read = await this.pool.query(CLAIM_READ_SQL, [
+      senderId,
+      sourceRequestId,
+    ]);
+    const readRows = singleRow(read);
+    if (readRows.length === 0) return postBlocked('missing_row');
+    const row = readRows[0];
+    if (!matches(row, senderId, sourceRequestId)) {
+      return postBlocked('unknown_row');
+    }
+    if (!isDeepStrictEqual(row.intake, intake)) {
+      return postBlocked('intake_mismatch');
+    }
+    const decision = classifyExpirationPostTransition({
+      senderId,
+      sourceRequestId,
+      existing: {
+        type: row.route,
+        status: row.post_state,
+        senderId: row.sender_id,
+        sourceRequestId: row.request_key,
+        backendDecisionId: row.backend_decision_id,
+      },
+      step: { kind: 'record_receipt', backendDecisionId },
+    });
+    return decision.action === 'record_receipt'
       ? { action: 'blocked', reason: 'unknown_state' }
       : decision;
   }

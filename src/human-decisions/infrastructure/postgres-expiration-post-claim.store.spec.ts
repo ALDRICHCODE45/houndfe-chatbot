@@ -343,3 +343,149 @@ describe('PostgresExpirationPostClaimStore.beginPost (mock SQL, not PG proof)', 
     },
   );
 });
+
+describe('PostgresExpirationPostClaimStore.recordReceipt (mock SQL, not PG proof)', () => {
+  const receipt = (over: Record<string, unknown> = {}) => ({
+    ...expected,
+    backendDecisionId: DECISION,
+    ...over,
+  });
+  const recordedRow = (over: Record<string, unknown> = {}) =>
+    row({
+      post_state: 'RECEIPT_RECORDED',
+      backend_decision_id: DECISION,
+      post_attempted_at: attempt,
+      receipt_recorded_at: attempt,
+      ...over,
+    });
+  const flight = { post_state: 'POST_IN_FLIGHT', post_attempted_at: attempt };
+  const bad = new Date(Number.NaN);
+  const nil = '00000000-0000-0000-0000-000000000000';
+  const blockedWith = (reason: string) => ({ action: 'blocked', reason });
+  // A getter must fail closed, never read twice into a substituted decision.
+  const hostile = {
+    ...receipt(),
+    get backendDecisionId() {
+      return DECISION;
+    },
+  };
+
+  it.each([
+    ['null', null],
+    ['extra key', { ...receipt(), extra: 1 }],
+    ['missing decision', { ...expected }],
+    ['null decision', receipt({ backendDecisionId: null })],
+    ['blank decision', receipt({ backendDecisionId: '' })],
+    ['non-uuid decision', receipt({ backendDecisionId: 'nope' })],
+    ['nil uuid', receipt({ backendDecisionId: nil })],
+    ['uppercase id', receipt({ backendDecisionId: UPPER })],
+    ['unbound intake', receipt({ intake: intake({ sourceRequestId: OTHER }) })],
+    ['hostile accessor', hostile],
+  ])('fails closed on %s without querying', async (_name, value) => {
+    const query = jest.fn();
+    await expect(store(query).recordReceipt(value)).resolves.toEqual(
+      blockedWith('malformed_input'),
+    );
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['lowercase source', SOURCE],
+    ['uppercase source (case preserved)', UPPER],
+  ])(
+    'records via one fenced CAS with exact %s bytes, never normalized',
+    async (_name, source) => {
+      const exact = intake({ sourceRequestId: source });
+      const query = jest
+        .fn()
+        .mockResolvedValue(
+          one(recordedRow({ request_key: source, intake: exact })),
+        );
+      await expect(
+        store(query).recordReceipt({
+          senderId: SENDER,
+          sourceRequestId: source,
+          intake: exact,
+          backendDecisionId: DECISION,
+        }),
+      ).resolves.toEqual({
+        action: 'record_receipt',
+        backendDecisionId: DECISION,
+      });
+      expect(query).toHaveBeenCalledTimes(1);
+      const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+      const fence =
+        "route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2 AND status = 'ACTIVE' AND post_state = 'POST_IN_FLIGHT' AND intake = $3::jsonb AND backend_decision_id IS NULL AND post_attempted_at IS NOT NULL AND receipt_recorded_at IS NULL AND unknown_observed_at IS NULL";
+      expect(sql.replace(/\s+/g, ' ')).toContain(fence);
+      expect(params).toEqual([SENDER, source, JSON.stringify(exact), DECISION]);
+    },
+  );
+
+  it.each([
+    ['wrong sender', { sender_id: 'whatsapp:+5200000000000' }],
+    ['wrong state', { post_state: 'POST_IN_FLIGHT' }],
+    ['wrong backend id', { backend_decision_id: OTHER }],
+    ['substituted intake', { intake: intake({ productId: OTHER }) }],
+    ['null attempt timestamp', { post_attempted_at: null }],
+    ['invalid attempt timestamp', { post_attempted_at: bad }],
+    ['null receipt timestamp', { receipt_recorded_at: null }],
+    ['invalid receipt timestamp', { receipt_recorded_at: bad }],
+    ['leftover unknown timestamp', { unknown_observed_at: attempt }],
+  ])('throws on an unexpected CAS projection (%s)', async (_name, over) => {
+    const query = jest.fn().mockResolvedValue(one(recordedRow(over)));
+    await expect(store(query).recordReceipt(receipt())).rejects.toThrow(
+      'expiration receipt CAS returned an unexpected projection',
+    );
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws on an ambiguous driver read and never retries a database error', async () => {
+    const anomaly = jest.fn().mockResolvedValue({ rows: [row()], rowCount: 0 });
+    await expect(store(anomaly).recordReceipt(receipt())).rejects.toThrow(
+      'inconsistent expiration prepare read',
+    );
+    expect(anomaly).toHaveBeenCalledTimes(1);
+    const failing = jest.fn().mockRejectedValue(new Error('private database'));
+    await expect(store(failing).recordReceipt(receipt())).rejects.toThrow(
+      'private database',
+    );
+    expect(failing).toHaveBeenCalledTimes(1);
+  });
+
+  const state = (over: Record<string, unknown>) => one(row(over));
+  const fixtures = {
+    closed: state({ ...flight, status: 'CLOSED' }),
+    rerouted: state({ ...flight, route: 'RESTOCK' }),
+    varied: state({ ...flight, intake: intake({ variantId: VARIANT }) }),
+    inFlight: state(flight),
+    reserved: state({ post_state: 'RESERVED' }),
+    unknown: state({ post_state: 'UNKNOWN', unknown_observed_at: attempt }),
+    replay: state(recordedRow()),
+    conflict: state(recordedRow({ backend_decision_id: OTHER })),
+  };
+  const replays = { action: 'replay_receipt', backendDecisionId: DECISION };
+  const conflicts = { action: 'conflict', storedBackendDecisionId: OTHER };
+  it.each([
+    ['missing_row', empty, blockedWith('missing_row')],
+    ['closed', fixtures.closed, blockedWith('unknown_row')],
+    ['wrong route', fixtures.rerouted, blockedWith('unknown_row')],
+    ['intake', fixtures.varied, blockedWith('intake_mismatch')],
+    ['still in flight', fixtures.inFlight, blockedWith('unknown_state')],
+    ['reserved', fixtures.reserved, blockedWith('not_in_flight')],
+    ['unknown', fixtures.unknown, blockedWith('unknown_state')],
+    ['same id replay', fixtures.replay, replays],
+    ['different id conflict', fixtures.conflict, conflicts],
+  ])(
+    'classifies a persisted zero-row re-read as %s without emitting a record',
+    async (_name, result, expectedDecision) => {
+      const query = jest
+        .fn()
+        .mockResolvedValueOnce(empty)
+        .mockResolvedValueOnce(result);
+      await expect(store(query).recordReceipt(receipt())).resolves.toEqual(
+        expectedDecision,
+      );
+      expect(query).toHaveBeenCalledTimes(2);
+    },
+  );
+});

@@ -518,4 +518,149 @@ ddescribe('EXPIRATION preparePost CAS (real PostgreSQL)', () => {
       },
     );
   });
+
+  describe('recordReceipt authorization', () => {
+    const receipt = (
+      decision = DECISION,
+      over: Record<string, unknown> = {},
+    ) => ({ ...input(over), backendDecisionId: decision });
+    const inFlight = { post_state: 'POST_IN_FLIGHT', post_attempted_at: AT };
+
+    it('records one POST_IN_FLIGHT receipt while preserving the attempt instant', async () => {
+      await seed({ meta: inFlight });
+      await expect(store(left).recordReceipt(receipt())).resolves.toEqual({
+        action: 'record_receipt',
+        backendDecisionId: DECISION,
+      });
+      const rows = await snapshot();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        post_state: 'RECEIPT_RECORDED',
+        backend_decision_id: DECISION,
+        unknown_observed_at: null,
+        intake: intake(),
+      });
+      expect((rows[0].post_attempted_at as Date).toISOString()).toBe(AT);
+      expect(rows[0].receipt_recorded_at).toBeInstanceOf(Date);
+    });
+
+    // Holds the row lock so the loser must wait, then re-read the committed
+    // winner instead of racing: two identical ids must not double-record and
+    // two different ids must keep one winner while the loser conflicts.
+    it.each([
+      ['identical', DECISION, DECISION, 'replay_receipt'],
+      ['different', DECISION, OTHER, 'conflict'],
+    ])(
+      'serializes two overlapped %s receipts to one record and one %s',
+      async (_name, first, second, loserAction) => {
+        await seed({ meta: inFlight });
+        const guard = await setup.connect();
+        let open = false;
+        let failure: unknown;
+        let settled: Promise<ClaimSettled[]> | undefined;
+        try {
+          await guard.query('BEGIN');
+          open = true;
+          await guard.query(
+            'SELECT sender_id FROM human_decision_reservations WHERE sender_id = $1 FOR UPDATE',
+            [SENDER],
+          );
+          settled = Promise.allSettled([
+            store(left).recordReceipt(receipt(first)),
+            new PostgresExpirationPostClaimStore(right).recordReceipt(
+              receipt(second),
+            ),
+          ]);
+          await waitForTwoLockedUpdates(guard);
+          await guard.query('COMMIT');
+          open = false;
+        } finally {
+          try {
+            if (open) await guard.query('ROLLBACK');
+          } catch (error) {
+            failure = error;
+          } finally {
+            guard.release(failure instanceof Error ? failure : undefined);
+          }
+          if (settled !== undefined) await settled;
+        }
+        const results = await settled;
+        expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
+        const decisions = results.flatMap((r) =>
+          r.status === 'fulfilled' ? [r.value] : [],
+        );
+        const recorded = decisions.find((r) => r.action === 'record_receipt');
+        expect(recorded).toBeDefined();
+        expect(decisions.filter((r) => r.action === loserAction)).toHaveLength(
+          1,
+        );
+        const winner = (recorded as { backendDecisionId: string })
+          .backendDecisionId;
+        const after = await snapshot();
+        expect(after).toHaveLength(1);
+        expect(after[0].backend_decision_id).toBe(winner);
+        if (loserAction === 'conflict') {
+          expect(decisions.find((r) => r.action === 'conflict')).toMatchObject({
+            storedBackendDecisionId: winner,
+          });
+        }
+      },
+    );
+
+    it('replays the same receipt and conflicts on a different id through a fresh store', async () => {
+      await seed({ meta: inFlight });
+      await store(left).recordReceipt(receipt());
+      const after = await snapshot();
+      const fresh = new PostgresExpirationPostClaimStore(right);
+      await expect(fresh.recordReceipt(receipt())).resolves.toEqual({
+        action: 'replay_receipt',
+        backendDecisionId: DECISION,
+      });
+      await expect(fresh.recordReceipt(receipt(OTHER))).resolves.toEqual({
+        action: 'conflict',
+        storedBackendDecisionId: DECISION,
+      });
+      expect(await snapshot()).toEqual(after);
+    });
+
+    const blocks: Array<[string, Seed, string, unknown?]> = [
+      ['unprepared NULL', { meta: {} }, 'malformed_row'],
+      ['RESERVED', { meta: { post_state: 'RESERVED' } }, 'not_in_flight'],
+      [
+        'UNKNOWN',
+        { meta: { post_state: 'UNKNOWN', unknown_observed_at: AT } },
+        'unknown_state',
+      ],
+      ['CLOSED', { status: 'CLOSED', meta: inFlight }, 'unknown_row'],
+      [
+        'wrong route',
+        { route: 'RESTOCK', intake: restockIntake, meta: inFlight },
+        'missing_row',
+      ],
+      [
+        'wrong sender',
+        { meta: inFlight },
+        'missing_row',
+        receipt(DECISION, { senderId: OTHER_SENDER }),
+      ],
+      [
+        'substituted intake',
+        { meta: inFlight },
+        'intake_mismatch',
+        receipt(DECISION, { intake: intake({ productId: OTHER }) }),
+      ],
+    ];
+    it.each(blocks)(
+      'blocks %s without mutating the persisted row',
+      async (_name, over, reason, call = receipt()) => {
+        await seed(over);
+        const before = await snapshot();
+        await expect(store(left).recordReceipt(call)).resolves.toEqual({
+          action: 'blocked',
+          reason,
+        });
+        expect(await snapshot()).toEqual(before);
+      },
+    );
+  });
 });
