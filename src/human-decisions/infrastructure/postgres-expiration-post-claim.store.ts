@@ -1,8 +1,7 @@
 /**
- * INACTIVE, unwired EXPIRATION POST preparation CAS (no DI/HTTP/send/claim).
- * NULL is NOT RESERVED; `preparePost` is the route/sender/source/intake-fenced
- * CAS that initializes one valid ACTIVE EXPIRATION row NULL -> RESERVED. A later
- * separate RESERVED -> POST_IN_FLIGHT claim owns authorization. Persistence
+ * INACTIVE, unwired EXPIRATION preparation and claim CAS (no DI/HTTP/send).
+ * `preparePost` initializes NULL -> RESERVED; `beginPost` claims RESERVED ->
+ * POST_IN_FLIGHT. Only the successful CAS authorizes a POST. Persistence
  * cannot prove customer intent: the caller MUST first run
  * `bindExpirationInboundEvent` and `preflightExpirationSubject`, then reserve
  * the row. SQL `intake = $3::jsonb` + the exact own-data snapshot forbid
@@ -16,6 +15,10 @@ import {
   normalizeExpirationIntake,
   type ExpirationIntakeInput,
 } from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
+import {
+  classifyExpirationPostTransition,
+  type ExpirationPostDecision,
+} from '../domain/expiration-post-ledger';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 
 export type ExpirationPrepareBlockedReason =
@@ -51,6 +54,23 @@ WHERE route = 'EXPIRATION'
   AND intake = $3::jsonb
 RETURNING ${COLUMNS}`;
 const READ_SQL = `SELECT ${COLUMNS} FROM human_decision_reservations
+WHERE route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2
+LIMIT 1`;
+const CLAIM_COLUMNS = `${COLUMNS}, backend_decision_id, post_attempted_at, receipt_recorded_at, unknown_observed_at`;
+const BEGIN_POST_SQL = `UPDATE human_decision_reservations
+SET post_state = 'POST_IN_FLIGHT', post_attempted_at = now(), updated_at = now()
+WHERE route = 'EXPIRATION'
+  AND sender_id = $1
+  AND request_key = $2
+  AND status = 'ACTIVE'
+  AND post_state = 'RESERVED'
+  AND intake = $3::jsonb
+  AND backend_decision_id IS NULL
+  AND post_attempted_at IS NULL
+  AND receipt_recorded_at IS NULL
+  AND unknown_observed_at IS NULL
+RETURNING ${CLAIM_COLUMNS}`;
+const CLAIM_READ_SQL = `SELECT ${CLAIM_COLUMNS} FROM human_decision_reservations
 WHERE route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2
 LIMIT 1`;
 const UUID =
@@ -151,6 +171,31 @@ function matches(row: Row, senderId: string, sourceRequestId: string): boolean {
   );
 }
 
+/** A driver timestamp is trusted only as a real, non-NaN Date so a corrupted
+ * projection fails closed instead of faking a durable attempt. */
+const isValidDate = (value: unknown): value is Date =>
+  value instanceof Date && !Number.isNaN(value.getTime());
+
+/** The ACTUAL RETURNING row of the successful claim must be the exact fenced
+ * target: same identity/intake, POST_IN_FLIGHT, a valid attempt instant, and
+ * every other metadata column still NULL. Anything else throws, never retries. */
+function authorizes(
+  row: Row,
+  senderId: string,
+  sourceRequestId: string,
+  intake: ExpirationIntakeInput,
+): boolean {
+  return (
+    matches(row, senderId, sourceRequestId) &&
+    row.post_state === 'POST_IN_FLIGHT' &&
+    isDeepStrictEqual(row.intake, intake) &&
+    isValidDate(row.post_attempted_at) &&
+    row.backend_decision_id === null &&
+    row.receipt_recorded_at === null &&
+    row.unknown_observed_at === null
+  );
+}
+
 @Injectable()
 export class PostgresExpirationPostClaimStore {
   constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
@@ -194,5 +239,65 @@ export class PostgresExpirationPostClaimStore {
     return row.post_state === 'RESERVED'
       ? { action: 'already_prepared' }
       : blocked('unknown_row');
+  }
+
+  /** Claim exactly one RESERVED row as POST_IN_FLIGHT. Only the validated
+   * RETURNING projection authorizes; a zero-row update is re-read once and
+   * classified (never authorizing), and any error/ambiguity throws. */
+  async beginPost(input: unknown): Promise<ExpirationPostDecision> {
+    const target = snapshotInput(input);
+    if (target === null) {
+      return { action: 'blocked', reason: 'malformed_input' };
+    }
+    const { senderId, sourceRequestId, intake } = target;
+
+    const updated = await this.pool.query(BEGIN_POST_SQL, [
+      senderId,
+      sourceRequestId,
+      JSON.stringify(intake),
+    ]);
+    const updatedRows = singleRow(updated);
+    if (updatedRows.length === 1) {
+      if (!authorizes(updatedRows[0], senderId, sourceRequestId, intake)) {
+        throw new Error(
+          'expiration begin CAS returned an unexpected projection',
+        );
+      }
+      return { action: 'authorize_post' };
+    }
+
+    // Zero-row: never authorize. Re-read the exact row, verify identity+intake,
+    // then classify with the pure state machine. A still-RESERVED row means the
+    // CAS did not visibly apply -> fail closed rather than authorize a POST.
+    const read = await this.pool.query(CLAIM_READ_SQL, [
+      senderId,
+      sourceRequestId,
+    ]);
+    const readRows = singleRow(read);
+    if (readRows.length === 0) {
+      return { action: 'blocked', reason: 'missing_row' };
+    }
+    const row = readRows[0];
+    if (!matches(row, senderId, sourceRequestId)) {
+      return { action: 'blocked', reason: 'unknown_row' };
+    }
+    if (!isDeepStrictEqual(row.intake, intake)) {
+      return { action: 'blocked', reason: 'intake_mismatch' };
+    }
+    const decision = classifyExpirationPostTransition({
+      senderId,
+      sourceRequestId,
+      existing: {
+        type: row.route,
+        status: row.post_state,
+        senderId: row.sender_id,
+        sourceRequestId: row.request_key,
+        backendDecisionId: row.backend_decision_id,
+      },
+      step: { kind: 'begin_post' },
+    });
+    return decision.action === 'authorize_post'
+      ? { action: 'blocked', reason: 'unknown_state' }
+      : decision;
   }
 }

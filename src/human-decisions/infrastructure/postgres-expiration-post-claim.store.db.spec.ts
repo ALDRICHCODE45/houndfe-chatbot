@@ -12,7 +12,7 @@ import {
   type ExpirationPrepareDecision,
 } from './postgres-expiration-post-claim.store';
 
-// Real-PostgreSQL proof for the INACTIVE preparePost CAS, gated by
+// Real-PostgreSQL proof for INACTIVE preparePost and beginPost CAS, gated by
 // RUN_DOCKER_TESTS=1: actual adapter, schema 280, disposable postgres:16-alpine
 // whose generated URI is the ONLY migration-child env (no ambient DATABASE_URL).
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
@@ -53,6 +53,9 @@ const restockIntake = JSON.stringify({
 
 type Metadata = Partial<Record<string, string | null>>;
 type Settled = PromiseSettledResult<ExpirationPrepareDecision>;
+type ClaimSettled = PromiseSettledResult<
+  Awaited<ReturnType<PostgresExpirationPostClaimStore['beginPost']>>
+>;
 type Seed = Partial<{
   senderId: string;
   route: string;
@@ -390,4 +393,129 @@ ddescribe('EXPIRATION preparePost CAS (real PostgreSQL)', () => {
       expect(await snapshot()).toEqual(before);
     },
   );
+
+  describe('beginPost authorization', () => {
+    it('authorizes one RESERVED -> POST_IN_FLIGHT while other metadata stays NULL', async () => {
+      await seed({ meta: { post_state: 'RESERVED' } });
+      await expect(store(left).beginPost(input())).resolves.toEqual({
+        action: 'authorize_post',
+      });
+      const rows = await snapshot();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        sender_id: SENDER,
+        route: 'EXPIRATION',
+        request_key: SOURCE,
+        status: 'ACTIVE',
+        post_state: 'POST_IN_FLIGHT',
+        backend_decision_id: null,
+        receipt_recorded_at: null,
+        unknown_observed_at: null,
+        intake: intake(),
+      });
+      expect(rows[0].post_attempted_at).toBeInstanceOf(Date);
+      expect(Number.isNaN((rows[0].post_attempted_at as Date).getTime())).toBe(
+        false,
+      );
+    });
+
+    it('serializes two overlapped begins to one authorized and one held without a repeat', async () => {
+      await seed({ meta: { post_state: 'RESERVED' } });
+      const guard = await setup.connect();
+      let open = false;
+      let failure: unknown;
+      let settled: Promise<ClaimSettled[]> | undefined;
+      try {
+        await guard.query('BEGIN');
+        open = true;
+        const locked = await guard.query(
+          'SELECT sender_id FROM human_decision_reservations WHERE sender_id = $1 FOR UPDATE',
+          [SENDER],
+        );
+        expect(locked.rows).toEqual([{ sender_id: SENDER }]);
+        settled = Promise.allSettled([
+          store(left).beginPost(input()),
+          new PostgresExpirationPostClaimStore(right).beginPost(input()),
+        ]);
+        await waitForTwoLockedUpdates(guard);
+        await guard.query('COMMIT');
+        open = false;
+      } finally {
+        try {
+          if (open) await guard.query('ROLLBACK');
+        } catch (error) {
+          failure = error;
+        } finally {
+          guard.release(failure instanceof Error ? failure : undefined);
+        }
+        if (settled !== undefined) await settled;
+      }
+      const results = await settled;
+      const decisions = results.flatMap((result) =>
+        result.status === 'fulfilled' ? [result.value] : [],
+      );
+      expect(results.every((result) => result.status === 'fulfilled')).toBe(
+        true,
+      );
+      expect(
+        decisions.filter((r) => r.action === 'authorize_post'),
+      ).toHaveLength(1);
+      expect(decisions.filter((r) => r.action === 'hold')).toHaveLength(1);
+      const after = await snapshot();
+      expect(after).toHaveLength(1);
+      expect(after[0]).toMatchObject({
+        post_state: 'POST_IN_FLIGHT',
+        backend_decision_id: null,
+        receipt_recorded_at: null,
+        unknown_observed_at: null,
+      });
+      expect(after[0].post_attempted_at).toBeInstanceOf(Date);
+      // A fresh store cannot authorize the same row a second time.
+      await expect(
+        new PostgresExpirationPostClaimStore(right).beginPost(input()),
+      ).resolves.toEqual({ action: 'hold', reason: 'post_in_flight' });
+      expect(await snapshot()).toEqual(after);
+    });
+
+    it.each([
+      [
+        'unprepared NULL',
+        { meta: {} },
+        input(),
+        { action: 'blocked', reason: 'malformed_row' },
+      ],
+      [
+        'CLOSED',
+        { status: 'CLOSED', meta: { post_state: 'RESERVED' } },
+        input(),
+        { action: 'blocked', reason: 'unknown_row' },
+      ],
+      [
+        'wrong sender',
+        { meta: { post_state: 'RESERVED' } },
+        input({ senderId: OTHER_SENDER }),
+        { action: 'blocked', reason: 'missing_row' },
+      ],
+      [
+        'substituted intake',
+        { meta: { post_state: 'RESERVED' } },
+        {
+          senderId: SENDER,
+          sourceRequestId: SOURCE,
+          intake: intake({ productId: OTHER }),
+        },
+        { action: 'blocked', reason: 'intake_mismatch' },
+      ],
+    ])(
+      'fails closed on %s without mutating the persisted row',
+      async (_name, over, call, expectedDecision) => {
+        await seed(over);
+        const before = await snapshot();
+        await expect(store(left).beginPost(call)).resolves.toEqual(
+          expectedDecision,
+        );
+        expect(await snapshot()).toEqual(before);
+      },
+    );
+  });
 });
