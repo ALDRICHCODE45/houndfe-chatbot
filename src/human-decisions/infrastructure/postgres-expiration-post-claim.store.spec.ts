@@ -489,3 +489,179 @@ describe('PostgresExpirationPostClaimStore.recordReceipt (mock SQL, not PG proof
     },
   );
 });
+
+describe('PostgresExpirationPostClaimStore.markUnknown (mock SQL, not PG proof)', () => {
+  const unknownRow = (over: Record<string, unknown> = {}) =>
+    row({
+      post_state: 'UNKNOWN',
+      unknown_observed_at: attempt,
+      ...over,
+    });
+  it.each([
+    ['null', null],
+    ['extra key', { ...expected, extra: 1 }],
+    ['blank sender', { ...expected, senderId: ' ' }],
+    [
+      'unbound intake',
+      { ...expected, intake: intake({ sourceRequestId: OTHER }) },
+    ],
+    [
+      'hostile accessor',
+      {
+        ...expected,
+        get intake() {
+          return intake();
+        },
+      },
+    ],
+  ])('fails closed on %s without querying', async (_name, value) => {
+    const query = jest.fn();
+    await expect(store(query).markUnknown(value)).resolves.toEqual({
+      action: 'blocked',
+      reason: 'malformed_input',
+    });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['lowercase source', SOURCE],
+    ['uppercase source (case preserved)', UPPER],
+  ])(
+    'persists UNKNOWN via one fenced CAS with exact %s bytes, never normalized',
+    async (_name, source) => {
+      const exact = intake({ sourceRequestId: source });
+      const query = jest
+        .fn()
+        .mockResolvedValue(
+          one(unknownRow({ request_key: source, intake: exact })),
+        );
+      await expect(
+        store(query).markUnknown({
+          senderId: SENDER,
+          sourceRequestId: source,
+          intake: exact,
+        }),
+      ).resolves.toEqual({ action: 'mark_unknown', reason: 'pre_post' });
+      expect(query).toHaveBeenCalledTimes(1);
+      const [sql, params] = query.mock.calls[0] as [string, unknown[]];
+      const fence =
+        "route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2 AND status = 'ACTIVE' AND post_state IN ('RESERVED', 'POST_IN_FLIGHT') AND intake = $3::jsonb AND backend_decision_id IS NULL AND receipt_recorded_at IS NULL AND unknown_observed_at IS NULL";
+      expect(sql.replace(/\s+/g, ' ')).toContain(fence);
+      expect(sql).toContain("post_state = 'UNKNOWN'");
+      expect(sql).toContain('unknown_observed_at = now()');
+      expect(sql).toContain('RETURNING');
+      expect(params).toEqual([SENDER, source, JSON.stringify(exact)]);
+    },
+  );
+
+  it('derives pre_post vs ambiguous_post from the RETURNING attempt instant', async () => {
+    const query = jest
+      .fn()
+      .mockResolvedValueOnce(one(unknownRow({ post_attempted_at: null })))
+      .mockResolvedValueOnce(one(unknownRow({ post_attempted_at: attempt })));
+    await expect(store(query).markUnknown(expected)).resolves.toEqual({
+      action: 'mark_unknown',
+      reason: 'pre_post',
+    });
+    await expect(store(query).markUnknown(expected)).resolves.toEqual({
+      action: 'mark_unknown',
+      reason: 'ambiguous_post',
+    });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['wrong sender', { sender_id: 'whatsapp:+5200000000000' }],
+    ['wrong state', { post_state: 'RECEIPT_RECORDED' }],
+    ['substituted intake', { intake: intake({ productId: OTHER }) }],
+    ['leftover backend id', { backend_decision_id: DECISION }],
+    ['leftover receipt timestamp', { receipt_recorded_at: attempt }],
+    ['null observed timestamp', { unknown_observed_at: null }],
+    [
+      'invalid observed timestamp',
+      { unknown_observed_at: new Date(Number.NaN) },
+    ],
+    ['invalid attempt timestamp', { post_attempted_at: new Date(Number.NaN) }],
+  ])('throws on an unexpected CAS projection (%s)', async (_name, over) => {
+    const query = jest.fn().mockResolvedValue(one(unknownRow(over)));
+    await expect(store(query).markUnknown(expected)).rejects.toThrow(
+      'expiration unknown CAS returned an unexpected projection',
+    );
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws on an ambiguous driver read and never retries a database error', async () => {
+    const anomaly = jest.fn().mockResolvedValue({ rows: [row()], rowCount: 0 });
+    await expect(store(anomaly).markUnknown(expected)).rejects.toThrow(
+      'inconsistent expiration prepare read',
+    );
+    expect(anomaly).toHaveBeenCalledTimes(1);
+    const failing = jest.fn().mockRejectedValue(new Error('private database'));
+    await expect(store(failing).markUnknown(expected)).rejects.toThrow(
+      'private database',
+    );
+    expect(failing).toHaveBeenCalledTimes(1);
+  });
+
+  const state = (over: Record<string, unknown>) => one(row(over));
+  it.each([
+    ['missing_row', empty, { action: 'blocked', reason: 'missing_row' }],
+    [
+      'unprepared NULL',
+      state({ post_state: null }),
+      { action: 'blocked', reason: 'malformed_row' },
+    ],
+    [
+      'closed',
+      state({ status: 'CLOSED', post_state: 'RESERVED' }),
+      { action: 'blocked', reason: 'unknown_row' },
+    ],
+    [
+      'wrong route',
+      state({ route: 'RESTOCK', post_state: 'RESERVED' }),
+      { action: 'blocked', reason: 'unknown_row' },
+    ],
+    [
+      'intake',
+      state({ post_state: 'RESERVED', intake: intake({ variantId: VARIANT }) }),
+      { action: 'blocked', reason: 'intake_mismatch' },
+    ],
+    [
+      'still reserved',
+      state({ post_state: 'RESERVED' }),
+      { action: 'blocked', reason: 'unknown_state' },
+    ],
+    [
+      'still in flight',
+      state({ post_state: 'POST_IN_FLIGHT', post_attempted_at: attempt }),
+      { action: 'blocked', reason: 'unknown_state' },
+    ],
+    [
+      'already unknown',
+      state({ post_state: 'UNKNOWN', unknown_observed_at: attempt }),
+      { action: 'hold', reason: 'already_unknown' },
+    ],
+    [
+      'recorded receipt is never overwritten',
+      state({
+        post_state: 'RECEIPT_RECORDED',
+        backend_decision_id: DECISION,
+        post_attempted_at: attempt,
+        receipt_recorded_at: attempt,
+      }),
+      { action: 'blocked', reason: 'receipt_recorded' },
+    ],
+  ])(
+    'classifies a persisted zero-row re-read as %s without emitting a mutation',
+    async (_name, result, expectedDecision) => {
+      const query = jest
+        .fn()
+        .mockResolvedValueOnce(empty)
+        .mockResolvedValueOnce(result);
+      await expect(store(query).markUnknown(expected)).resolves.toEqual(
+        expectedDecision,
+      );
+      expect(query).toHaveBeenCalledTimes(2);
+    },
+  );
+});

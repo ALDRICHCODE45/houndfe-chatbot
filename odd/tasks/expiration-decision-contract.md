@@ -47,6 +47,18 @@
 
 - `recordReceipt` records only the exact ACTIVE EXPIRATION `POST_IN_FLIGHT` reservation; the caller must first validate the receipt against its request. It preserves the attempt timestamp, replays the same backend ID and conflicts on a different one, with no resend/release. Tests cover concurrent identical/different IDs and fresh-adapter replay (not an OS-process restart). Verification: 80 mock and 34 isolated PostgreSQL cases. Rollback: revert recordReceipt additions and their tests; preserve preparation, beginPost and schema 280. HTTP/runtime and UNKNOWN persistence remain pending.
 
+## UNKNOWN persistence unit
+
+### Specs
+- S1: "persistir `UNKNOWN`"; "Mantener la reserva activa y bloquear reenvíos."; "Conservar la fecha del intento, si existe."; "No sobrescribir un recibo ya registrado."; "Probar concurrencia entre registrar el recibo y marcar `UNKNOWN`."
+- S2: "manteniendo el límite de 400 líneas". No HTTP/runtime activation; local commit requires separate owner authorization.
+### Tasks
+- T1 [in progress] S1-S2: inactive markUnknown implementation and all mock checks; independent/native review and explicit commit authorization pending.
+- T2 [pending] S1-S2: isolated PostgreSQL proof including receipt/UNKNOWN concurrency; retain all prepared cases in the separately reviewed next unit.
+### Log
+- L1: Owner authorized the proposed unit: "Si por faavor. Adelante". Baseline receipt persistence committed `9343f60`; existing pure policy permits RESERVED and POST_IN_FLIGHT to UNKNOWN, holds UNKNOWN, and blocks RECEIPT_RECORDED.
+- L2: "Si, autorizada" approves splitting implementation + all mocks from all PostgreSQL/concurrency tests without dropping coverage. T2's patch is preserved locally outside the T1 candidate; the 400 ADD+DEL limit applies to each unit. No runtime activation or commit authorized.
+
 ## Next external checkpoint
 
 - Bot HTTP transport methods are implemented but not wired, the GET current-state projection normalizer is implemented (committed `dfd636a`, reviewed+approved `review-0472792d690fb0d1`), and the EXPIRATION GET HTTP transport method (`getExpirationDecision`) is implemented but not wired to runtime polling; runtime wiring and E2E remain open (intake `939dd10`, receipt `8b560fc`, transport `384dd0f`, and GET projection `dfd636a` each reviewed/approved locally). The frontend EXPIRATION phase is independent and awaits its own validated delivery. No approved rule above is reopened.

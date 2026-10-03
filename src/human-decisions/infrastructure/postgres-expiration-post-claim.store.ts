@@ -73,6 +73,14 @@ RETURNING ${CLAIM_COLUMNS}`;
 const CLAIM_READ_SQL = `SELECT ${CLAIM_COLUMNS} FROM human_decision_reservations
 WHERE route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2
 LIMIT 1`;
+const MARK_UNKNOWN_SQL = `UPDATE human_decision_reservations
+SET post_state = 'UNKNOWN', unknown_observed_at = now(), updated_at = now()
+WHERE route = 'EXPIRATION' AND sender_id = $1 AND request_key = $2
+  AND status = 'ACTIVE'
+  AND post_state IN ('RESERVED', 'POST_IN_FLIGHT')
+  AND intake = $3::jsonb AND backend_decision_id IS NULL
+  AND receipt_recorded_at IS NULL AND unknown_observed_at IS NULL
+RETURNING ${CLAIM_COLUMNS}`;
 const RECORD_RECEIPT_SQL = `UPDATE human_decision_reservations
 SET post_state = 'RECEIPT_RECORDED', backend_decision_id = $4,
     receipt_recorded_at = now(), updated_at = now()
@@ -399,6 +407,79 @@ export class PostgresExpirationPostClaimStore {
       step: { kind: 'record_receipt', backendDecisionId },
     });
     return decision.action === 'record_receipt'
+      ? { action: 'blocked', reason: 'unknown_state' }
+      : decision;
+  }
+
+  /** Mark exactly one ACTIVE EXPIRATION RESERVED or POST_IN_FLIGHT reservation
+   * as UNKNOWN, preserving the attempt instant (NULL before POST, otherwise
+   * untouched). A registered receipt is never overwritten: the CAS fences on
+   * RECEIPT_RECORDED absence, resends and unreservations are caller-side and
+   * never performed here, and UNKNOWN is held (never re-marked). Only the
+   * validated RETURNING projection marks; a zero-row update is re-read once and
+   * classified (never emitting a mutation from a read), and any error/ambiguity
+   * throws without retry. */
+  async markUnknown(input: unknown): Promise<ExpirationPostDecision> {
+    const target = snapshotInput(input);
+    if (target === null) return postBlocked('malformed_input');
+    const { senderId, sourceRequestId, intake } = target;
+
+    const updated = await this.pool.query(MARK_UNKNOWN_SQL, [
+      senderId,
+      sourceRequestId,
+      JSON.stringify(intake),
+    ]);
+    const updatedRows = singleRow(updated);
+    if (updatedRows.length === 1) {
+      const row = updatedRows[0];
+      if (
+        !matches(row, senderId, sourceRequestId) ||
+        row.post_state !== 'UNKNOWN' ||
+        !isDeepStrictEqual(row.intake, intake) ||
+        row.backend_decision_id !== null ||
+        row.receipt_recorded_at !== null ||
+        !isValidDate(row.unknown_observed_at) ||
+        (row.post_attempted_at !== null && !isValidDate(row.post_attempted_at))
+      ) {
+        throw new Error(
+          'expiration unknown CAS returned an unexpected projection',
+        );
+      }
+      return {
+        action: 'mark_unknown',
+        reason: row.post_attempted_at === null ? 'pre_post' : 'ambiguous_post',
+      };
+    }
+
+    // Zero-row: never mutate from a read. Re-read the exact row, verify
+    // identity+intake, then classify; a still-RESERVED/POST_IN_FLIGHT row means
+    // the CAS did not visibly apply -> fail closed rather than emit a mark.
+    const read = await this.pool.query(CLAIM_READ_SQL, [
+      senderId,
+      sourceRequestId,
+    ]);
+    const readRows = singleRow(read);
+    if (readRows.length === 0) return postBlocked('missing_row');
+    const row = readRows[0];
+    if (!matches(row, senderId, sourceRequestId)) {
+      return postBlocked('unknown_row');
+    }
+    if (!isDeepStrictEqual(row.intake, intake)) {
+      return postBlocked('intake_mismatch');
+    }
+    const decision = classifyExpirationPostTransition({
+      senderId,
+      sourceRequestId,
+      existing: {
+        type: row.route,
+        status: row.post_state,
+        senderId: row.sender_id,
+        sourceRequestId: row.request_key,
+        backendDecisionId: row.backend_decision_id,
+      },
+      step: { kind: 'mark_unknown' },
+    });
+    return decision.action === 'mark_unknown'
       ? { action: 'blocked', reason: 'unknown_state' }
       : decision;
   }
