@@ -53,11 +53,13 @@
 - S1: "persistir `UNKNOWN`"; "Mantener la reserva activa y bloquear reenvíos."; "Conservar la fecha del intento, si existe."; "No sobrescribir un recibo ya registrado."; "Probar concurrencia entre registrar el recibo y marcar `UNKNOWN`."
 - S2: "manteniendo el límite de 400 líneas". No HTTP/runtime activation; local commit requires separate owner authorization.
 ### Tasks
-- T1 [in progress] S1-S2: inactive markUnknown implementation and all mock checks; independent/native review and explicit commit authorization pending.
-- T2 [pending] S1-S2: isolated PostgreSQL proof including receipt/UNKNOWN concurrency; retain all prepared cases in the separately reviewed next unit.
+- T1 [done] S1-S2: inactive markUnknown implementation and all mocks committed `983c60a` after explicit authorization; 152 related tests, independent verification and native review approved.
+- T2 [in progress] S1-S2: all 11 preserved PostgreSQL cases restored; independent verification passed 197 related tests (45 PostgreSQL), including guarded overlapping receipt/UNKNOWN and UNKNOWN/UNKNOWN races. Native review and separate commit authorization pending.
 ### Log
 - L1: Owner authorized the proposed unit: "Si por faavor. Adelante". Baseline receipt persistence committed `9343f60`; existing pure policy permits RESERVED and POST_IN_FLIGHT to UNKNOWN, holds UNKNOWN, and blocks RECEIPT_RECORDED.
 - L2: "Si, autorizada" approves splitting implementation + all mocks from all PostgreSQL/concurrency tests without dropping coverage. T2's patch is preserved locally outside the T1 candidate; the 400 ADD+DEL limit applies to each unit. No runtime activation or commit authorized.
+
+- T2 evidence: generated disposable PostgreSQL URI and minimal migration environment; worker typecheck/lint/format passed. Existing-behavior proof, not a new RED cycle; fresh pools are not OS restarts, cleanup failures were not injected, and no HTTP/runtime activation is claimed. Rollback T2 by reverting only its DB test additions and tracker update, retaining implementation `983c60a`.
 
 ## Next external checkpoint
 

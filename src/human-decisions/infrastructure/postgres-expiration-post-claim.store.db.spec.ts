@@ -11,6 +11,7 @@ import {
   PostgresExpirationPostClaimStore,
   type ExpirationPrepareDecision,
 } from './postgres-expiration-post-claim.store';
+import type { ExpirationPostDecision } from '../domain/expiration-post-ledger';
 
 // Real-PostgreSQL proof for INACTIVE preparePost and beginPost CAS, gated by
 // RUN_DOCKER_TESTS=1: actual adapter, schema 280, disposable postgres:16-alpine
@@ -662,5 +663,246 @@ ddescribe('EXPIRATION preparePost CAS (real PostgreSQL)', () => {
         expect(await snapshot()).toEqual(before);
       },
     );
+  });
+
+  describe('markUnknown persistence', () => {
+    const receipt = () => ({ ...input(), backendDecisionId: DECISION });
+    const reserved = { post_state: 'RESERVED' };
+    const inFlightMeta = {
+      post_state: 'POST_IN_FLIGHT',
+      post_attempted_at: AT,
+    };
+    const recorded: Metadata = {
+      post_state: 'RECEIPT_RECORDED',
+      backend_decision_id: DECISION,
+      post_attempted_at: AT,
+      receipt_recorded_at: AT,
+    };
+    const unknownAt: Metadata = {
+      post_state: 'UNKNOWN',
+      unknown_observed_at: AT,
+    };
+
+    it('marks a RESERVED row UNKNOWN while the attempt instant stays NULL', async () => {
+      await seed({ meta: reserved });
+      await expect(store(left).markUnknown(input())).resolves.toEqual({
+        action: 'mark_unknown',
+        reason: 'pre_post',
+      });
+      const rows = await snapshot();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        status: 'ACTIVE',
+        post_state: 'UNKNOWN',
+        backend_decision_id: null,
+        receipt_recorded_at: null,
+        post_attempted_at: null,
+        intake: intake(),
+      });
+      expect(rows[0].unknown_observed_at).toBeInstanceOf(Date);
+    });
+
+    it('marks a POST_IN_FLIGHT row UNKNOWN preserving the attempt instant', async () => {
+      await seed({ meta: inFlightMeta });
+      await expect(store(left).markUnknown(input())).resolves.toEqual({
+        action: 'mark_unknown',
+        reason: 'ambiguous_post',
+      });
+      const rows = await snapshot();
+      expect((rows[0].post_attempted_at as Date).toISOString()).toBe(AT);
+      expect(rows[0]).toMatchObject({
+        post_state: 'UNKNOWN',
+        backend_decision_id: null,
+        receipt_recorded_at: null,
+      });
+    });
+
+    it('holds an already-UNKNOWN row through fresh stores and blocks resends', async () => {
+      await seed({ meta: unknownAt });
+      const before = await snapshot();
+      await expect(
+        new PostgresExpirationPostClaimStore(right).markUnknown(input()),
+      ).resolves.toEqual({ action: 'hold', reason: 'already_unknown' });
+      // UNKNOWN never releases the reservation back to a resend or a receipt.
+      await expect(store(left).recordReceipt(receipt())).resolves.toEqual({
+        action: 'blocked',
+        reason: 'unknown_state',
+      });
+      await expect(store(left).beginPost(input())).resolves.toEqual({
+        action: 'hold',
+        reason: 'unknown_state',
+      });
+      expect(await snapshot()).toEqual(before);
+    });
+
+    it('never overwrites a registered receipt and fails closed on non-applying states', async () => {
+      await seed({ meta: recorded });
+      const before = await snapshot();
+      await expect(store(left).markUnknown(input())).resolves.toEqual({
+        action: 'blocked',
+        reason: 'receipt_recorded',
+      });
+      expect(await snapshot()).toEqual(before);
+      const upperIntake = JSON.stringify({
+        ...intake(),
+        sourceRequestId: UPPER,
+      });
+      await setup.query('DELETE FROM human_decision_reservations');
+      await seed({ key: UPPER, intake: upperIntake, meta: reserved });
+      await expect(
+        store(left).markUnknown({
+          senderId: SENDER,
+          sourceRequestId: UPPER.toLowerCase(),
+          intake: { ...intake(), sourceRequestId: UPPER.toLowerCase() },
+        }),
+      ).resolves.toEqual({ action: 'blocked', reason: 'missing_row' });
+      expect(await snapshot()).toMatchObject([{ request_key: UPPER }]);
+    });
+
+    const blocks: Array<[string, Seed, unknown, unknown]> = [
+      [
+        'unprepared NULL',
+        { meta: {} },
+        input(),
+        { action: 'blocked', reason: 'malformed_row' },
+      ],
+      [
+        'CLOSED',
+        { status: 'CLOSED', meta: reserved },
+        input(),
+        { action: 'blocked', reason: 'unknown_row' },
+      ],
+      [
+        'wrong route',
+        { route: 'RESTOCK', intake: restockIntake, meta: reserved },
+        input(),
+        { action: 'blocked', reason: 'missing_row' },
+      ],
+      [
+        'substituted intake',
+        { meta: reserved },
+        {
+          senderId: SENDER,
+          sourceRequestId: SOURCE,
+          intake: intake({ productId: OTHER }),
+        },
+        { action: 'blocked', reason: 'intake_mismatch' },
+      ],
+      [
+        'malformed caller',
+        { meta: reserved },
+        null,
+        { action: 'blocked', reason: 'malformed_input' },
+      ],
+    ];
+    it.each(blocks)(
+      'blocks %s without mutating the persisted row',
+      async (_name, over, call, expectedDecision) => {
+        await seed(over);
+        const before = await snapshot();
+        await expect(store(left).markUnknown(call)).resolves.toEqual(
+          expectedDecision,
+        );
+        expect(await snapshot()).toEqual(before);
+      },
+    );
+
+    // Same guard-lock harness as the other races, scoped to these two tests:
+    // hold the row FOR UPDATE, launch both operations, and observe that both
+    // UPDATEs observably waited before committing the winner.
+    const overlap = async (
+      run: (
+        s: PostgresExpirationPostClaimStore,
+      ) => Promise<ExpirationPostDecision>[],
+    ): Promise<ExpirationPostDecision[]> => {
+      const guard = await setup.connect();
+      let open = false;
+      let failure: unknown;
+      let settled: Promise<ClaimSettled[]> | undefined;
+      try {
+        await guard.query('BEGIN');
+        open = true;
+        await guard.query(
+          'SELECT sender_id FROM human_decision_reservations WHERE sender_id = $1 FOR UPDATE',
+          [SENDER],
+        );
+        settled = Promise.allSettled(run(store(left)));
+        await waitForTwoLockedUpdates(guard);
+        await guard.query('COMMIT');
+        open = false;
+      } finally {
+        try {
+          if (open) await guard.query('ROLLBACK');
+        } catch (error) {
+          failure = error;
+        } finally {
+          guard.release(failure instanceof Error ? failure : undefined);
+        }
+        if (settled !== undefined) await settled;
+      }
+      const results = await settled;
+      expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
+      return results.flatMap((r) =>
+        r.status === 'fulfilled' ? [r.value] : [],
+      );
+    };
+
+    it('serializes two overlapped marks to one UNKNOWN and one already-unknown hold', async () => {
+      await seed({ meta: inFlightMeta });
+      const fresh = new PostgresExpirationPostClaimStore(right);
+      const decisions = await overlap((s) => [
+        s.markUnknown(input()),
+        fresh.markUnknown(input()),
+      ]);
+      expect(decisions.filter((r) => r.action === 'mark_unknown')).toHaveLength(
+        1,
+      );
+      expect(decisions.filter((r) => r.action === 'hold')).toHaveLength(1);
+      const after = await snapshot();
+      expect(after[0]).toMatchObject({
+        post_state: 'UNKNOWN',
+        backend_decision_id: null,
+        receipt_recorded_at: null,
+      });
+      expect((after[0].post_attempted_at as Date).toISOString()).toBe(AT);
+    });
+
+    it('serializes an overlapped receipt-versus-UNKNOWN race to exactly one winner with no overwrite or resend', async () => {
+      await seed({ meta: inFlightMeta });
+      const fresh = new PostgresExpirationPostClaimStore(right);
+      const decisions = await overlap((s) => [
+        s.recordReceipt(receipt()),
+        fresh.markUnknown(input()),
+      ]);
+      const recorded = decisions.filter((r) => r.action === 'record_receipt');
+      const unknown = decisions.filter((r) => r.action === 'mark_unknown');
+      const blocked = decisions.filter(
+        (r) =>
+          r.action === 'blocked' &&
+          (r.reason === 'unknown_state' || r.reason === 'receipt_recorded'),
+      );
+      expect(recorded.length + unknown.length).toBe(1);
+      expect(blocked).toHaveLength(1);
+      const after = await snapshot();
+      expect(after).toHaveLength(1);
+      if (recorded.length === 1) {
+        // The receipt survived; the UNKNOWN marker lost to RECEIPT_RECORDED.
+        expect(blocked[0]).toMatchObject({ reason: 'receipt_recorded' });
+        expect(after[0]).toMatchObject({
+          post_state: 'RECEIPT_RECORDED',
+          backend_decision_id: DECISION,
+          unknown_observed_at: null,
+        });
+      } else {
+        // UNKNOWN held the row; the receipt was never recorded after it.
+        expect(blocked[0]).toMatchObject({ reason: 'unknown_state' });
+        expect(after[0]).toMatchObject({
+          post_state: 'UNKNOWN',
+          backend_decision_id: null,
+          receipt_recorded_at: null,
+        });
+        expect((after[0].post_attempted_at as Date).toISOString()).toBe(AT);
+      }
+    });
   });
 });
