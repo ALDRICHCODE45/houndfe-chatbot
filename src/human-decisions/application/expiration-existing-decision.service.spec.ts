@@ -1,3 +1,9 @@
+import {
+  AuthError,
+  ForbiddenError,
+  RateLimitError,
+  UpstreamError,
+} from '../../chatbot-api/domain/errors';
 import { ExpirationExistingDecisionService } from './expiration-existing-decision.service';
 
 /**
@@ -137,6 +143,20 @@ describe('ExpirationExistingDecisionService', () => {
     }
   });
 
+  it('still reports resolved past the deadline: no eligibility claim', async () => {
+    const expired = resolved(
+      {
+        action: 'REPORT_EXPIRATION_UNAVAILABLE',
+        resolvedAt: '1999-01-01T00:00:00.000Z',
+      },
+      { applyBefore: '1999-01-02T00:00:00.000Z' },
+    );
+    await expect(ask(setup({ decision: expired }))).resolves.toEqual({
+      outcome: 'resolved',
+      decision: expired,
+    });
+  });
+
   it.each([
     undefined,
     null,
@@ -154,6 +174,84 @@ describe('ExpirationExistingDecisionService', () => {
     const f = setup({ failRead: true });
     await expect(ask(f)).resolves.toEqual(failed);
     expect(f.getExpirationDecision).not.toHaveBeenCalled();
+  });
+
+  it.each(['', ' '])(
+    'held with no I/O for an invalid branch %p',
+    async (branch) => {
+      const f = setup({ branch });
+      await expect(ask(f)).resolves.toEqual(held);
+      expect(f.readRecordedForSender).not.toHaveBeenCalled();
+      expect(f.getExpirationDecision).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['', ' ', ' padded', 'a\u0000b'])(
+    'held with no I/O for an invalid sender %p',
+    async (senderId) => {
+      const f = setup();
+      await expect(ask(f, senderId)).resolves.toEqual(held);
+      expect(f.readRecordedForSender).not.toHaveBeenCalled();
+      expect(f.getExpirationDecision).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['sender', { reservation: { ...context().reservation, senderId: OTHER } }],
+    ['status', { reservation: { ...context().reservation, status: 'CLOSED' } }],
+    ['route', { reservation: { ...context().reservation, route: 'RESTOCK' } }],
+    [
+      'requestKey',
+      { reservation: { ...context().reservation, requestKey: OTHER } },
+    ],
+    [
+      'intake',
+      {
+        reservation: {
+          ...context().reservation,
+          intake: { ...intake(), productId: 'bad' },
+        },
+      },
+    ],
+    ['id', { backendDecisionId: ID.toUpperCase() }],
+    ['id null', { backendDecisionId: null }],
+  ])(
+    'held with no GET for an untrusted context (%s)',
+    async (_label, patch) => {
+      const f = setup({
+        read: { action: 'recorded', context: context(patch) },
+      });
+      await expect(ask(f)).resolves.toEqual(held);
+      expect(f.getExpirationDecision).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    new UpstreamError('socket', null),
+    new UpstreamError('not found', 404),
+    new AuthError('auth', 401),
+    new ForbiddenError('forbidden', 403),
+    new RateLimitError(30),
+    new UpstreamError('down', 500),
+    new UpstreamError('down', 503),
+    new Error('boom'),
+  ])(
+    'query_failed when the GET rejects (%#), never fabricating a decision',
+    async (error) => {
+      const f = setup();
+      f.getExpirationDecision.mockRejectedValue(error);
+      await expect(ask(f)).resolves.toEqual(failed);
+      expect(f.getExpirationDecision).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    null,
+    {},
+    { garbage: true },
+    { ...decision(), id: ID.toUpperCase() },
+  ])('query_failed for a malformed GET projection (%#)', async (wire) => {
+    await expect(ask(setup({ decision: wire }))).resolves.toEqual(failed);
   });
 
   it('query_failed when the returned decision id does not bind to the queried id', async () => {
@@ -221,5 +319,63 @@ describe('ExpirationExistingDecisionService', () => {
     });
     await expect(ask(f)).resolves.toEqual(held);
     expect(f.getExpirationDecision).toHaveBeenCalledWith(ID);
+  });
+
+  it('snapshots the binding before the GET so it cannot rebind across the await', async () => {
+    const ctx = {
+      reservation: {
+        status: 'ACTIVE',
+        route: 'EXPIRATION',
+        senderId: SENDER,
+        requestKey: SRC,
+        intake: intake(),
+      },
+      backendDecisionId: ID,
+    };
+    const readRecordedForSender: jest.Mock = jest
+      .fn()
+      .mockResolvedValue({ action: 'recorded', context: ctx });
+    const getExpirationDecision: jest.Mock = jest.fn(() => {
+      ctx.reservation.intake.productId = OTHER;
+      ctx.reservation.senderId = 'mutated';
+      ctx.backendDecisionId = OTHER;
+      return Promise.resolve(decision());
+    });
+    const service = new ExpirationExistingDecisionService(
+      { readRecordedForSender },
+      { getExpirationDecision },
+      BRANCH,
+    );
+    await expect(service.readExistingDecision(SENDER)).resolves.toEqual({
+      outcome: 'pending',
+      decision: decision(),
+    });
+    expect(getExpirationDecision).toHaveBeenCalledWith(ID);
+  });
+
+  it('never throws: hostile context and decision access fail closed', async () => {
+    const hostileContext = Object.defineProperty({}, 'reservation', {
+      get: () => {
+        throw new Error('boom');
+      },
+    });
+    await expect(
+      ask(setup({ read: { action: 'recorded', context: hostileContext } })),
+    ).resolves.toEqual(held);
+    const hostileDecision = {
+      get id(): string {
+        throw new Error('boom');
+      },
+    };
+    await expect(ask(setup({ decision: hostileDecision }))).resolves.toEqual(
+      failed,
+    );
+  });
+
+  it('returns frozen outcome markers', async () => {
+    expect(
+      Object.isFrozen(await ask(setup({ read: { action: 'hold' } }))),
+    ).toBe(true);
+    expect(Object.isFrozen(await ask(setup({ failRead: true })))).toBe(true);
   });
 });
