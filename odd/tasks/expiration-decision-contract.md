@@ -61,6 +61,19 @@
 
 - T2 evidence: generated disposable PostgreSQL URI and minimal migration environment; worker typecheck/lint/format passed. Existing-behavior proof, not a new RED cycle; fresh pools are not OS restarts, cleanup failures were not injected, and no HTTP/runtime activation is claimed. Rollback T2 by reverting only its DB test additions and tracker update, retaining implementation `983c60a`.
 
+## Inactive POST orchestration unit
+### Specs
+- O1: "unir las piezas en un orquestador de POST de EXPIRATION", "todavía sin conectarlo al flujo real"; "Preparar y reclamar el intento mediante el registro durable."; "Enviar el POST **solo si ganó la autorización atómica**."; "Validar y persistir el recibo."; "Ante un resultado incierto, mantener el bloqueo sin reenviar automáticamente."
+- O2: "HTTP simulado: concurrencia, timeout y fallos al guardar"; "manteniendo el límite de 400 líneas y sin activar producción". Commit requires separate authorization.
+### Tasks
+- O-T1a [in progress] O1-O2: inactive orchestrator + essential tests; independent review passed 197 related tests and scoped typecheck, with no fail-open POST found. Native review and commit pending.
+- O-T1b [pending] O1-O2: remaining adversarial and identity tests, preserving all original coverage; separate review and commit authorization required.
+### Log
+- O-L3: "autorizo" approves two units of at most 400 ADD+DEL each, without dropping tests. Preserve deferred tests outside the first candidate; do not compress behavior or weaken coverage to fit.
+- O-L4: Real preparePost blocks ordinary re-entry into POST_IN_FLIGHT/RECEIPT_RECORDED; downstream hold/historical branches cover races after preparation, not automatic recovery. Mock concurrency verifies composition, not a new PostgreSQL proof.
+- O-L1: Owner authorized proposal with "adelante". Prerequisites remain authentic ingress binding, subject preflight and existing durable reservation; orchestrator owns preparation and claim. UNKNOWN proof committed `f22935c` after review.
+- O-L2: Backend peer confirmed typical lowercase generated receipt IDs, but no unconditional casing guarantee. Preserve source bytes; fail closed on noncanonical backend IDs without converting their identity. Ambiguous persistence remains a conservative hold, even if recording UNKNOWN also fails; never claim durable UNKNOWN without confirmation.
+
 ## Next external checkpoint
 
 - Bot HTTP transport methods are implemented but not wired, the GET current-state projection normalizer is implemented (committed `dfd636a`, reviewed+approved `review-0472792d690fb0d1`), and the EXPIRATION GET HTTP transport method (`getExpirationDecision`) is implemented but not wired to runtime polling; runtime wiring and E2E remain open (intake `939dd10`, receipt `8b560fc`, transport `384dd0f`, and GET projection `dfd636a` each reviewed/approved locally). The frontend EXPIRATION phase is independent and awaits its own validated delivery. No approved rule above is reopened.
