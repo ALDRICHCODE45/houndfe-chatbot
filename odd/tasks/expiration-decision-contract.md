@@ -67,12 +67,21 @@
 - O2: "HTTP simulado: concurrencia, timeout y fallos al guardar"; "manteniendo el límite de 400 líneas y sin activar producción". Commit requires separate authorization.
 ### Tasks
 - O-T1a [done] O1-O2: inactive orchestrator + essential tests committed `b579730`; 197 related tests and scoped typecheck passed, independent/native reviews approved (R3-001 informational).
-- O-T1b [in progress] O1-O2: restore all 23 deferred adversarial/identity cases, preserving exact intake assertions; verify and review separately, commit authorization pending.
+- O-T1b [done] O1-O2: all 28 orchestrator cases preserved; 220 related tests and scoped types passed, independent/native reviews approved; committed `88d7b25`.
 ### Log
 - O-L3: "autorizo" approves two units of at most 400 ADD+DEL each, without dropping tests. Preserve deferred tests outside the first candidate; do not compress behavior or weaken coverage to fit.
 - O-L4: Real preparePost blocks ordinary re-entry into POST_IN_FLIGHT/RECEIPT_RECORDED; downstream hold/historical branches cover races after preparation, not automatic recovery. Mock concurrency verifies composition, not a new PostgreSQL proof.
 - O-L1: Owner authorized proposal with "adelante". Prerequisites remain authentic ingress binding, subject preflight and existing durable reservation; orchestrator owns preparation and claim. UNKNOWN proof committed `f22935c` after review.
 - O-L2: Backend peer confirmed typical lowercase generated receipt IDs, but no unconditional casing guarantee. Preserve source bytes; fail closed on noncanonical backend IDs without converting their identity. Ambiguous persistence remains a conservative hold, even if recording UNKNOWN also fails; never claim durable UNKNOWN without confirmation.
+
+## Inactive orchestrator PostgreSQL integration
+### Specs
+- I1: "Dos ejecuciones concurrentes producen **un solo POST simulado**."; "Un timeout deja el intento bloqueado, sin reenvío."; "El recibo queda persistido y una nueva invocación no vuelve a enviar."
+- I2: "Todo con PostgreSQL descartable, sin backend ni WhatsApp reales, dentro de 400 líneas."
+### Tasks
+- I-T1 [in progress] I1-I2: new isolated PostgreSQL integration spec, test-only claim barrier and mocked HTTP; implementation unchanged, independent/native review and separate commit authorization pending.
+### Log
+- I-L1: Owner authorized proposal with "Adelante.". Observe both claim UPDATEs waiting behind a guard lock after preparation; drain both operations on failure and preserve generated-URI-only migration environment. Seed the existing reservation prerequisite; no ingress, runtime activation, polling or ACK work.
 
 ## Next external checkpoint
 
