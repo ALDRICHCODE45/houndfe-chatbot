@@ -41,6 +41,19 @@ const context = (o: Over = {}) => ({
   backendDecisionId: ID,
   ...o,
 });
+const binding = (o: { inlet?: Over; branch?: string; id?: string } = {}) => ({
+  reservation: {
+    status: 'ACTIVE',
+    route: 'EXPIRATION',
+    senderId: SENDER,
+    requestKey: SRC,
+    intake: intake(o.inlet),
+  },
+  backendDecisionId: o.id ?? ID,
+  branchId: o.branch ?? BRANCH,
+});
+const bindingOf = (result: unknown) =>
+  (result as { binding: ReturnType<typeof binding> }).binding;
 const snapshot = (o: Over = {}) => ({
   branchId: BRANCH,
   branchName: 'Centro',
@@ -121,12 +134,42 @@ const failed = { outcome: 'query_failed' };
 describe('ExpirationExistingDecisionService', () => {
   it('reports pending from a validated GET keyed only by the persisted id', async () => {
     const f = setup();
-    await expect(ask(f)).resolves.toEqual({
+    const result = await ask(f);
+    expect(result).toEqual({
       outcome: 'pending',
       decision: decision(),
+      binding: binding(),
     });
+    const bound = bindingOf(result);
+    expect(bound).toBeDefined();
+    expect(Object.isFrozen(bound)).toBe(true);
+    expect(Object.isFrozen(bound.reservation)).toBe(true);
+    expect(Object.isFrozen(bound.reservation.intake)).toBe(true);
     expect(f.readRecordedForSender).toHaveBeenCalledWith(SENDER);
     expect(f.getExpirationDecision).toHaveBeenCalledWith(ID);
+  });
+
+  it('rejects intake mutation through the public type and at runtime', async () => {
+    const result = await ask(setup());
+    if (result.outcome !== 'pending') throw new Error('unreachable');
+    const intake = result.binding.reservation.intake;
+    expect(() => {
+      // @ts-expect-error Public intake fields must remain readonly.
+      intake.sourceRequestId = OTHER;
+    }).toThrow(TypeError);
+    expect(() => {
+      // @ts-expect-error Public intake fields must remain readonly.
+      intake.type = 'EXPIRATION';
+    }).toThrow(TypeError);
+    expect(() => {
+      // @ts-expect-error Public intake fields must remain readonly.
+      intake.productId = OTHER;
+    }).toThrow(TypeError);
+    expect(() => {
+      // @ts-expect-error Public intake fields must remain readonly.
+      intake.variantId = OTHER;
+    }).toThrow(TypeError);
+    expect(result.binding).toEqual(binding());
   });
 
   it('reports resolved for both typed actions with a detached decision', async () => {
@@ -134,12 +177,18 @@ describe('ExpirationExistingDecisionService', () => {
       const action = resolution.action;
       const wire = resolved(resolution);
       const result = await ask(setup({ decision: wire }));
-      expect(result).toEqual({ outcome: 'resolved', decision: wire });
+      expect(result).toEqual({
+        outcome: 'resolved',
+        decision: wire,
+        binding: binding(),
+      });
       if (result.outcome !== 'resolved') throw new Error('unreachable');
+      expect(Object.isFrozen(bindingOf(result))).toBe(true);
       wire.snapshot.branchId = 'mutated';
       (wire.resolution as unknown as { action: string }).action = 'mutated';
       expect(result.decision.snapshot.branchId).toBe(BRANCH);
       expect(result.decision.resolution.action).toBe(action);
+      expect(bindingOf(result).branchId).toBe(BRANCH);
     }
   });
 
@@ -154,6 +203,7 @@ describe('ExpirationExistingDecisionService', () => {
     await expect(ask(setup({ decision: expired }))).resolves.toEqual({
       outcome: 'resolved',
       decision: expired,
+      binding: binding(),
     });
   });
 
@@ -296,6 +346,7 @@ describe('ExpirationExistingDecisionService', () => {
     ).resolves.toEqual({
       outcome: 'pending',
       decision: decision({ snapshot: blank }),
+      binding: binding({ inlet: { variantId: null } }),
     });
     await expect(ask(setup({ read, decision: decision() }))).resolves.toEqual(
       held,
@@ -346,11 +397,48 @@ describe('ExpirationExistingDecisionService', () => {
       { getExpirationDecision },
       BRANCH,
     );
-    await expect(service.readExistingDecision(SENDER)).resolves.toEqual({
+    const result = await service.readExistingDecision(SENDER);
+    expect(result).toEqual({
       outcome: 'pending',
       decision: decision(),
+      binding: binding(),
     });
+    const bound = bindingOf(result);
+    expect(bound.reservation.intake.productId).toBe(PRODUCT);
+    expect(bound.reservation.senderId).toBe(SENDER);
+    expect(bound.backendDecisionId).toBe(ID);
     expect(getExpirationDecision).toHaveBeenCalledWith(ID);
+  });
+
+  it('returns a detached frozen binding, never the raw read context', async () => {
+    const raw = context();
+    const result = await ask(
+      setup({ read: { action: 'recorded', context: raw } }),
+    );
+    const bound = bindingOf(result);
+    expect(bound).not.toBe(raw);
+    expect(bound.reservation).not.toBe(raw.reservation);
+    expect(bound.reservation.intake).not.toBe(raw.reservation.intake);
+    raw.reservation.intake.productId = OTHER;
+    raw.reservation.senderId = 'mutated';
+    raw.backendDecisionId = OTHER;
+    expect(bound.reservation.intake.productId).toBe(PRODUCT);
+    expect(bound.reservation.senderId).toBe(SENDER);
+    expect(bound.backendDecisionId).toBe(ID);
+    expect(Object.isFrozen(bound.reservation)).toBe(true);
+    expect(Object.isFrozen(bound.reservation.intake)).toBe(true);
+  });
+
+  it('preserves an opaque branch byte-for-byte in the binding', async () => {
+    const opaque = 'sucursal:centro/01 ';
+    const wire = decision({ snapshot: snapshot({ branchId: opaque }) });
+    const result = await ask(setup({ branch: opaque, decision: wire }));
+    expect(result).toEqual({
+      outcome: 'pending',
+      decision: wire,
+      binding: binding({ branch: opaque }),
+    });
+    expect(bindingOf(result).branchId).toBe(opaque);
   });
 
   it('never throws: hostile context and decision access fail closed', async () => {

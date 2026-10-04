@@ -62,6 +62,18 @@ const intake = (
   ...over,
 });
 
+const binding = () => ({
+  reservation: {
+    status: 'ACTIVE',
+    route: 'EXPIRATION',
+    senderId: SENDER,
+    requestKey: SOURCE,
+    intake: intake(),
+  },
+  backendDecisionId: DECISION,
+  branchId: BRANCH,
+});
+
 const snapshot = (over: Record<string, unknown> = {}) => ({
   branchId: BRANCH,
   branchName: 'Sucursal Centro',
@@ -247,7 +259,11 @@ ddescribe(
 
       await expect(
         buildService().readExistingDecision(SENDER),
-      ).resolves.toEqual({ outcome: 'pending', decision: decision() });
+      ).resolves.toEqual({
+        outcome: 'pending',
+        decision: decision(),
+        binding: binding(),
+      });
 
       expect(httpRequest).toHaveBeenCalledTimes(1);
       expectOnlyGets();
@@ -270,7 +286,11 @@ ddescribe(
 
         await expect(
           buildService().readExistingDecision(SENDER),
-        ).resolves.toEqual({ outcome: 'resolved', decision: wire });
+        ).resolves.toEqual({
+          outcome: 'resolved',
+          decision: wire,
+          binding: binding(),
+        });
 
         expect(httpRequest).toHaveBeenCalledTimes(1);
         expectOnlyGets();

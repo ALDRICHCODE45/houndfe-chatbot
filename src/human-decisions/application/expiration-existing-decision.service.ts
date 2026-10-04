@@ -13,7 +13,10 @@ import {
   type ExpirationDecisionPending,
   type ExpirationDecisionResolved,
 } from '../../chatbot-api/domain/dtos/human-decisions-expiration-decision.dto';
-import { normalizeExpirationIntake } from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
+import {
+  normalizeExpirationIntake,
+  type ExpirationIntakeInput,
+} from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
 import type { PostgresExpirationApplicationContextStore } from '../infrastructure/postgres-expiration-application-context.store';
 
 export type ExpirationContextReaderPort = Pick<
@@ -25,7 +28,27 @@ export type ExpirationDecisionClientPort = Pick<
   'getExpirationDecision'
 >;
 
-type OutcomeOf<K, D> = { readonly outcome: K; readonly decision: D };
+/** Immutable, policy-compatible evidence for a resolved success: the caller's
+ * original ACTIVE EXPIRATION reservation (exact five keys), the persisted
+ * backend decision id actually queried, and the trusted configured branch. */
+export interface ExpirationDecisionBindingReservation {
+  readonly status: 'ACTIVE';
+  readonly route: 'EXPIRATION';
+  readonly senderId: string;
+  readonly requestKey: string;
+  readonly intake: Readonly<ExpirationIntakeInput>;
+}
+export interface ExpirationDecisionBinding {
+  readonly reservation: ExpirationDecisionBindingReservation;
+  readonly backendDecisionId: string;
+  readonly branchId: string;
+}
+
+type OutcomeOf<K, D> = {
+  readonly outcome: K;
+  readonly decision: D;
+  readonly binding: ExpirationDecisionBinding;
+};
 export type ExpirationExistingDecisionOutcome =
   | OutcomeOf<'pending', ExpirationDecisionPending>
   | OutcomeOf<'resolved', ExpirationDecisionResolved>
@@ -54,21 +77,17 @@ function validBranch(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-interface TrustedExpirationContext {
-  readonly backendDecisionId: string;
-  readonly sourceRequestId: string;
-  readonly productId: string;
-  readonly variantId: string | null;
-}
-
 /** Defense over the trusted port: the store already validated this snapshot,
  * but a malformed or mutating context must never reach the binding below. Every
  * primitive is copied here, BEFORE the GET await, so the dependency cannot
- * rebind the request across that await. */
+ * rebind the request across that await. The returned reservation and intake are
+ * detached, frozen copies built from the trusted sender, the validated
+ * byte-exact intake primitives and the configured branch. */
 function snapshotTrustedContext(
   context: unknown,
   senderId: string,
-): TrustedExpirationContext | null {
+  branchId: string,
+): ExpirationDecisionBinding | null {
   try {
     if (typeof context !== 'object' || context === null) return null;
     const record = context as Record<string, unknown>;
@@ -100,11 +119,19 @@ function snapshotTrustedContext(
     ) {
       return null;
     }
+    const intake: ExpirationIntakeInput = Object.freeze({ ...normalized });
+    const boundReservation: ExpirationDecisionBindingReservation =
+      Object.freeze({
+        status: 'ACTIVE' as const,
+        route: 'EXPIRATION' as const,
+        senderId,
+        requestKey: normalized.sourceRequestId,
+        intake,
+      });
     return Object.freeze({
+      reservation: boundReservation,
       backendDecisionId,
-      sourceRequestId: normalized.sourceRequestId,
-      productId: normalized.productId,
-      variantId: normalized.variantId,
+      branchId,
     });
   } catch {
     return null;
@@ -132,29 +159,34 @@ export class ExpirationExistingDecisionService {
         return QUERY_FAILED;
       }
       if (read?.action !== 'recorded') return HELD;
-      const context = snapshotTrustedContext(read.context, senderId);
-      if (context === null) return HELD;
+      const binding = snapshotTrustedContext(
+        read.context,
+        senderId,
+        this.branchId,
+      );
+      if (binding === null) return HELD;
       let decision: ReturnType<typeof normalizeExpirationDecision>;
       try {
         decision = normalizeExpirationDecision(
-          await this.backend.getExpirationDecision(context.backendDecisionId),
+          await this.backend.getExpirationDecision(binding.backendDecisionId),
         );
       } catch {
         return QUERY_FAILED;
       }
       if (decision === null) return QUERY_FAILED;
-      if (decision.id !== context.backendDecisionId) return QUERY_FAILED;
+      if (decision.id !== binding.backendDecisionId) return QUERY_FAILED;
       if (
-        decision.sourceRequestId !== context.sourceRequestId ||
-        decision.snapshot.productId !== context.productId ||
-        decision.snapshot.variantId !== context.variantId ||
-        decision.snapshot.branchId !== this.branchId
+        decision.sourceRequestId !==
+          binding.reservation.intake.sourceRequestId ||
+        decision.snapshot.productId !== binding.reservation.intake.productId ||
+        decision.snapshot.variantId !== binding.reservation.intake.variantId ||
+        decision.snapshot.branchId !== binding.branchId
       ) {
         return HELD;
       }
       return decision.status === 'PENDING'
-        ? Object.freeze({ outcome: 'pending' as const, decision })
-        : Object.freeze({ outcome: 'resolved' as const, decision });
+        ? Object.freeze({ outcome: 'pending' as const, decision, binding })
+        : Object.freeze({ outcome: 'resolved' as const, decision, binding });
     } catch {
       return HELD;
     }
