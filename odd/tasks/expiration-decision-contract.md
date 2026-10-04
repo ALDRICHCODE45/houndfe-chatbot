@@ -66,8 +66,8 @@
 - O1: "unir las piezas en un orquestador de POST de EXPIRATION", "todavía sin conectarlo al flujo real"; "Preparar y reclamar el intento mediante el registro durable."; "Enviar el POST **solo si ganó la autorización atómica**."; "Validar y persistir el recibo."; "Ante un resultado incierto, mantener el bloqueo sin reenviar automáticamente."
 - O2: "HTTP simulado: concurrencia, timeout y fallos al guardar"; "manteniendo el límite de 400 líneas y sin activar producción". Commit requires separate authorization.
 ### Tasks
-- O-T1a [in progress] O1-O2: inactive orchestrator + essential tests; independent review passed 197 related tests and scoped typecheck, with no fail-open POST found. Native review and commit pending.
-- O-T1b [pending] O1-O2: remaining adversarial and identity tests, preserving all original coverage; separate review and commit authorization required.
+- O-T1a [done] O1-O2: inactive orchestrator + essential tests committed `b579730`; 197 related tests and scoped typecheck passed, independent/native reviews approved (R3-001 informational).
+- O-T1b [in progress] O1-O2: restore all 23 deferred adversarial/identity cases, preserving exact intake assertions; verify and review separately, commit authorization pending.
 ### Log
 - O-L3: "autorizo" approves two units of at most 400 ADD+DEL each, without dropping tests. Preserve deferred tests outside the first candidate; do not compress behavior or weaken coverage to fit.
 - O-L4: Real preparePost blocks ordinary re-entry into POST_IN_FLIGHT/RECEIPT_RECORDED; downstream hold/historical branches cover races after preparation, not automatic recovery. Mock concurrency verifies composition, not a new PostgreSQL proof.
