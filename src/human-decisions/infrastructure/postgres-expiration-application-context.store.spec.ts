@@ -157,6 +157,49 @@ describe('durable EXPIRATION application context read', () => {
     },
   );
 
+  it.each([
+    { productId: 'invalid' },
+    { variantId: 'invalid' },
+    { sourceRequestId: backend },
+    { sourceRequestId: undefined },
+    { type: 'RESTOCK' },
+    { type: null },
+    { variantId: undefined },
+    { extra: null },
+    { branchId: backend },
+  ])('rejects noncanonical intake %j', async (patch) => {
+    const value = { ...row(), intake: { ...intake(), ...patch } };
+    await expect(setup([value]).read()).resolves.toEqual({ action: 'hold' });
+  });
+
+  it.each(Object.keys(intake()))(
+    'does not repair missing intake key %s',
+    async (key) => {
+      const payload: Record<string, unknown> = intake();
+      delete payload[key];
+      await expect(
+        setup([{ ...row(), intake: payload }]).read(),
+      ).resolves.toEqual({ action: 'hold' });
+    },
+  );
+
+  it('rejects accessors without invoking them, symbols and nonplain intakes', async () => {
+    const getter = jest.fn(() => backend);
+    const accessor = Object.defineProperty(intake(), 'productId', {
+      get: getter,
+    });
+    for (const payload of [
+      accessor,
+      { ...intake(), [Symbol('extra')]: 1 },
+      Object.assign(Object.create({}) as object, intake()),
+    ]) {
+      await expect(
+        setup([{ ...row(), intake: payload }]).read(),
+      ).resolves.toEqual({ action: 'hold' });
+    }
+    expect(getter).not.toHaveBeenCalled();
+  });
+
   it.each(['post_attempted_at', 'receipt_recorded_at'])(
     'validates timestamp %s',
     async (key) => {
