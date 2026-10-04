@@ -92,6 +92,8 @@ const input = (o: Rec = {}) => ({
 const pending = { classification: 'pending' };
 const within = { classification: 'within_window' };
 const expired = { classification: 'expired' };
+const heldInput = { classification: 'held', reason: 'malformed_input' };
+const heldClock = { classification: 'held', reason: 'invalid_clock' };
 const heldContext = { classification: 'held', reason: 'invalid_context' };
 const heldBefore = {
   classification: 'held',
@@ -124,6 +126,23 @@ describe('classifyExpirationApplication', () => {
     expect(
       classifyExpirationApplication(input({ now: '2026-06-23T07:59:59.999Z' })),
     ).toEqual(heldBefore);
+  });
+
+  it('holds a noncanonical or non-string clock fail-closed', () => {
+    for (const now of [
+      '',
+      'x',
+      '2026-06-23',
+      '2026-06-23T08:00:00Z',
+      '2026-06-23T08:00:00.000+00:00',
+      '2026-06-23T08:00:00.000z',
+      1,
+      null,
+      undefined,
+      {},
+    ]) {
+      expect(classifyExpirationApplication(input({ now }))).toEqual(heldClock);
+    }
   });
 
   it('holds every mismatched or foreign binding as invalid context', () => {
@@ -203,6 +222,71 @@ describe('classifyExpirationApplication', () => {
         input({ decision: decision({ snapshot: simpleSnap }) }),
       ),
     ).toEqual(heldContext);
+  });
+
+  it('preserves source casing instead of folding it', () => {
+    const upper = SRC.toUpperCase();
+    const read = reservation({
+      requestKey: upper,
+      intake: intake({ sourceRequestId: upper }),
+    });
+    expect(classifyExpirationApplication(input({ reservation: read }))).toEqual(
+      heldContext,
+    );
+  });
+
+  it('matches an opaque branch by exact bytes, holding padded variants', () => {
+    const opaque = ' branch-9 ';
+    const snap = snapshot({ branchId: opaque });
+    expect(
+      classifyExpirationApplication(
+        input({ branchId: opaque, decision: decision({ snapshot: snap }) }),
+      ),
+    ).toEqual(pending);
+    expect(
+      classifyExpirationApplication(
+        input({ branchId: 'branch-9', decision: decision({ snapshot: snap }) }),
+      ),
+    ).toEqual(heldContext);
+    expect(
+      classifyExpirationApplication(
+        input({
+          branchId: opaque,
+          decision: decision({ snapshot: snapshot({ branchId: 'branch-9' }) }),
+        }),
+      ),
+    ).toEqual(heldContext);
+    expect(classifyExpirationApplication(input({ branchId: '   ' }))).toEqual(
+      heldInput,
+    );
+  });
+
+  it('fails closed on malformed, accessor, proxy and hostile inputs', () => {
+    const accessor = {} as Rec;
+    for (const [k, v] of Object.entries(input())) {
+      Object.defineProperty(accessor, k, { get: () => v, enumerable: true });
+    }
+    const accessorIntake = Object.defineProperty({ ...intake() }, 'productId', {
+      get: () => PRODUCT,
+    });
+    const hostileDecision = new Proxy(decision(), {
+      ownKeys: () => {
+        throw new Error('boom');
+      },
+    });
+    for (const value of [
+      undefined,
+      null,
+      {},
+      { ...input(), extra: 1 },
+      new Proxy(input(), { get: () => 'tampered' }),
+      accessor,
+      input({ reservation: reservation({ intake: accessorIntake }) }),
+      input({ decision: hostileDecision }),
+    ]) {
+      expect(() => classifyExpirationApplication(value)).not.toThrow();
+      expect(classifyExpirationApplication(value).classification).toBe('held');
+    }
   });
 
   it('returns minimal classifications with no authority payload', () => {
