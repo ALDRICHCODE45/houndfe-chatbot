@@ -45,12 +45,41 @@ describe('normalizeExpirationApplicationLedgerRow', () => {
       expect(result).toEqual(row);
       expect(result).not.toBe(row);
       expect(Object.isFrozen(result)).toBe(true);
+      expect(Object.getPrototypeOf(result)).toBeNull();
       const copy = { ...row };
       const detached = normalize(copy);
       copy.branchId = 'changed';
       expect(detached?.branchId).toBe('branch-123');
     },
   );
+  it.each([1, 2, 3])(
+    'preserves a valid mixed-case send token in started/accepted states (%i)',
+    (index) => {
+      const token = 'aAbBcCdD-3333-4333-8333-333333333333';
+      const row = { ...rows[index], sendToken: token };
+      const result = normalize(row);
+      expect(result).toEqual(row);
+      if (result === null || !('sendToken' in result)) {
+        throw new Error('expected a started or accepted row');
+      }
+      expect(result.sendToken).toBe(token);
+    },
+  );
+  it.each([
+    ['nil UUID', '00000000-0000-0000-0000-000000000000'],
+    ['invalid version', decisionId.replace('-4a7b-', '-0a7b-')],
+    ['invalid variant', decisionId.replace('-8c9d-', '-0c9d-')],
+  ])('rejects %s independently of attempt identity matching', (_name, id) => {
+    for (const key of ['sourceRequestId', 'decisionId'] as const) {
+      const row = { ...base, state: 'PENDING_DELIVERY', [key]: id };
+      row.attemptId = deriveExpirationAttemptId(
+        row.sourceRequestId,
+        row.decisionId,
+      );
+      expect(row.attemptId).not.toBeNull();
+      expect(normalize(row)).toBeNull();
+    }
+  });
   it('preserves padded opaque branch and provider identity bytes', () => {
     const row = {
       ...rows[2],
