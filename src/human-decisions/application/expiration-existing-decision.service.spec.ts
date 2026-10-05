@@ -5,6 +5,7 @@ import {
   UpstreamError,
 } from '../../chatbot-api/domain/errors';
 import { ExpirationExistingDecisionService } from './expiration-existing-decision.service';
+import { createExpirationPreparationCandidate } from './expiration-preparation-candidate';
 
 /**
  * INACTIVE EXPIRATION reader->GET composition (mocked ports: no DI/HTTP/DB/
@@ -39,6 +40,8 @@ const context = (o: Over = {}) => ({
     intake: intake(),
   },
   backendDecisionId: ID,
+  postAttemptedAt: '2026-06-23T07:58:00.000Z',
+  receiptRecordedAt: '2026-06-23T07:59:00.000Z',
   ...o,
 });
 const binding = (o: { inlet?: Over; branch?: string; id?: string } = {}) => ({
@@ -50,6 +53,8 @@ const binding = (o: { inlet?: Over; branch?: string; id?: string } = {}) => ({
     intake: intake(o.inlet),
   },
   backendDecisionId: o.id ?? ID,
+  postAttemptedAt: context().postAttemptedAt,
+  receiptRecordedAt: context().receiptRecordedAt,
   branchId: o.branch ?? BRANCH,
 });
 const bindingOf = (result: unknown) =>
@@ -382,6 +387,8 @@ describe('ExpirationExistingDecisionService', () => {
         intake: intake(),
       },
       backendDecisionId: ID,
+      postAttemptedAt: context().postAttemptedAt,
+      receiptRecordedAt: context().receiptRecordedAt,
     };
     const readRecordedForSender: jest.Mock = jest
       .fn()
@@ -459,6 +466,87 @@ describe('ExpirationExistingDecisionService', () => {
       failed,
     );
   });
+
+  it('preserves the original receipt timestamps through GET and candidate creation', async () => {
+    const raw = context();
+    const original = structuredClone(raw);
+    const f = setup({ read: { action: 'recorded', context: raw } });
+    f.getExpirationDecision.mockImplementation(() => {
+      raw.postAttemptedAt = '2026-06-23T08:01:00.000Z';
+      raw.receiptRecordedAt = '2026-06-23T08:02:00.000Z';
+      return Promise.resolve(resolved(provided()));
+    });
+    const outcome = await ask(f);
+    const candidate = createExpirationPreparationCandidate(SENDER, outcome, AT);
+    expect(candidate).toEqual({
+      action: 'candidate',
+      binding: binding(),
+      decision: resolved(provided()),
+      checkedAt: AT,
+    });
+    expect(f.readRecordedForSender).toHaveBeenCalledTimes(1);
+    expect(f.getExpirationDecision).toHaveBeenCalledTimes(1);
+    expect(f.getExpirationDecision).toHaveBeenCalledWith(ID);
+    if (candidate.action !== 'candidate') throw new Error('missing candidate');
+    expect(candidate.binding.postAttemptedAt).toBe(original.postAttemptedAt);
+    expect(candidate.binding.receiptRecordedAt).toBe(
+      original.receiptRecordedAt,
+    );
+    expect(() => {
+      // @ts-expect-error Receipt observations are readonly.
+      candidate.binding.postAttemptedAt = AT;
+    }).toThrow(TypeError);
+    expect(() => {
+      // @ts-expect-error Receipt observations are readonly.
+      candidate.binding.receiptRecordedAt = AT;
+    }).toThrow(TypeError);
+    expect(candidate.binding).toEqual(binding());
+    // Changed valid reader observations remain distinguishable for a future
+    // locked comparison; this helper does not itself compare DB history.
+    const later = await ask(
+      setup({
+        read: { action: 'recorded', context: raw },
+        decision: resolved(provided()),
+      }),
+    );
+    const laterCandidate = createExpirationPreparationCandidate(
+      SENDER,
+      later,
+      AT,
+    );
+    expect(laterCandidate).toEqual({
+      action: 'candidate',
+      binding: {
+        ...binding(),
+        postAttemptedAt: raw.postAttemptedAt,
+        receiptRecordedAt: raw.receiptRecordedAt,
+      },
+      decision: resolved(provided()),
+      checkedAt: AT,
+    });
+    expect(laterCandidate).not.toEqual(candidate);
+  });
+
+  it.each(['postAttemptedAt', 'receiptRecordedAt'] as const)(
+    'holds invalid original %s before GET, without rewriting the reader snapshot',
+    async (key) => {
+      for (const value of [
+        undefined,
+        null,
+        '',
+        'bad',
+        AT.replace('.000Z', 'Z'),
+        new Date(AT),
+      ]) {
+        const raw = context({ [key]: value });
+        const before = structuredClone(raw);
+        const f = setup({ read: { action: 'recorded', context: raw } });
+        expect(await ask(f)).toEqual(held);
+        expect(f.getExpirationDecision).not.toHaveBeenCalled();
+        expect(raw).toEqual(before);
+      }
+    },
+  );
 
   it('returns frozen outcome markers', async () => {
     expect(

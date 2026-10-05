@@ -30,7 +30,9 @@ export type ExpirationDecisionClientPort = Pick<
 
 /** Immutable, policy-compatible evidence for a resolved success: the caller's
  * original ACTIVE EXPIRATION reservation (exact five keys), the persisted
- * backend decision id actually queried, and the trusted configured branch. */
+ * backend decision id actually queried, original canonical receipt timestamps,
+ * and the trusted configured branch. Timestamps are comparison evidence only,
+ * not freshness, ordering or delivery authority. */
 export interface ExpirationDecisionBindingReservation {
   readonly status: 'ACTIVE';
   readonly route: 'EXPIRATION';
@@ -41,6 +43,8 @@ export interface ExpirationDecisionBindingReservation {
 export interface ExpirationDecisionBinding {
   readonly reservation: ExpirationDecisionBindingReservation;
   readonly backendDecisionId: string;
+  readonly postAttemptedAt: string;
+  readonly receiptRecordedAt: string;
   readonly branchId: string;
 }
 
@@ -119,6 +123,23 @@ function snapshotTrustedContext(
     ) {
       return null;
     }
+    // The reader already emits canonical UTC strings. Preserve those exact
+    // observations before GET; never reconstruct missing receipt history.
+    const postAttemptedAt = record.postAttemptedAt;
+    const receiptRecordedAt = record.receiptRecordedAt;
+    for (const instant of [postAttemptedAt, receiptRecordedAt]) {
+      if (
+        typeof instant !== 'string' ||
+        !Number.isFinite(Date.parse(instant)) ||
+        new Date(instant).toISOString() !== instant
+      )
+        return null;
+    }
+    if (
+      typeof postAttemptedAt !== 'string' ||
+      typeof receiptRecordedAt !== 'string'
+    )
+      return null;
     const intake: ExpirationIntakeInput = Object.freeze({ ...normalized });
     const boundReservation: ExpirationDecisionBindingReservation =
       Object.freeze({
@@ -131,6 +152,8 @@ function snapshotTrustedContext(
     return Object.freeze({
       reservation: boundReservation,
       backendDecisionId,
+      postAttemptedAt,
+      receiptRecordedAt,
       branchId,
     });
   } catch {

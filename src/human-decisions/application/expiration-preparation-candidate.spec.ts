@@ -13,6 +13,8 @@ const fixture = () => ({
   binding: {
     branchId,
     backendDecisionId: decisionId,
+    postAttemptedAt: '2026-06-23T07:58:00.000Z',
+    receiptRecordedAt: '2026-06-23T07:59:00.000Z',
     reservation: {
       status: 'ACTIVE' as const,
       route: 'EXPIRATION' as const,
@@ -108,6 +110,8 @@ describe('inactive EXPIRATION preparation candidate', () => {
       expect(candidate.decision).not.toBe(outcome.decision);
       outcome.binding.reservation.intake.productId = decisionId;
       outcome.binding.branchId = 'changed';
+      outcome.binding.postAttemptedAt = at;
+      outcome.binding.receiptRecordedAt = at;
       outcome.decision.snapshot.productName = 'changed';
       expect(candidate).toEqual({
         action: 'candidate',

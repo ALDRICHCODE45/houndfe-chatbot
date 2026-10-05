@@ -75,6 +75,8 @@ const binding = () => ({
     intake: intake(),
   },
   backendDecisionId: DECISION,
+  postAttemptedAt: AT,
+  receiptRecordedAt: AT,
   branchId: BRANCH,
 });
 

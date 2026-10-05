@@ -38,6 +38,8 @@ const reservation = (o: Over = {}) => ({
 const context = (o: Over = {}) => ({
   reservation: reservation(),
   backendDecisionId: ID,
+  postAttemptedAt: '2026-06-23T07:58:00.000Z',
+  receiptRecordedAt: '2026-06-23T07:59:00.000Z',
   ...o,
 });
 const snapshot = (o: Over = {}) => ({
