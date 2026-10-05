@@ -43,8 +43,10 @@ function harness(...replies: unknown[]) {
   return { store: new PostgresExpirationApplicationLedgerStore(pool), calls };
 }
 const hold = { action: 'hold' };
+const inserts = (calls: Array<{ sql: string }>) =>
+  calls.filter((call) => call.sql.startsWith('INSERT'));
 
-describe('offline EXPIRATION application ledger READ adapter', () => {
+describe('offline EXPIRATION application INSERT/READ adapter', () => {
   it('reads a canonical decision as a detached frozen pending snapshot via one SELECT', async () => {
     const raw = pending();
     const h = harness(result(persisted(raw)));
@@ -104,7 +106,113 @@ describe('offline EXPIRATION application ledger READ adapter', () => {
     expect(h.calls).toHaveLength(0);
   });
 
-  it('throws on inconsistent driver results instead of reporting missing', async () => {
+  it('rejects invalid or not-yet-pending input before the first query', async () => {
+    const h = harness();
+    const bad = [
+      null,
+      {},
+      { ...pending(), branchId: '' },
+      { ...pending(), senderId: ' padded' },
+      { ...pending(), decisionId: decisionId.toUpperCase() },
+      { ...pending(), sourceRequestId: 'bad' },
+      { ...pending(), attemptId: sourceRequestId },
+      { ...pending(), resolutionVersion: 1 },
+      { ...pending(), applyBefore: '2026-09-25T11:00:00.000Z' },
+      {
+        ...pending(),
+        state: 'SEND_STARTED',
+        sendToken: '33333333-3333-4333-8333-333333333333',
+        attemptedAt: resolvedAt,
+      },
+      { ...pending(), state: 'STALE', staleObservedAt: applyBefore },
+    ];
+    for (const input of bad) {
+      expect(await h.store.insertPending(input as never)).toEqual(hold);
+    }
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('inserts one PENDING_DELIVERY row with canonical columns and frozen output', async () => {
+    const row = pending();
+    const h = harness(result(persisted(row)));
+    const inserted = await h.store.insertPending(row);
+    expect(inserted).toEqual({ action: 'inserted', row });
+    expect(h.calls).toHaveLength(1);
+    const [call] = h.calls;
+    expect(call.sql).toMatch(
+      /INSERT INTO expiration_application_ledger\s*\(decision_id, source_request_id, attempt_id, sender_id, branch_id, row_data\)/,
+    );
+    expect(call.sql).toMatch(
+      /VALUES\s*\(\$1, \$2, \$3, \$4, \$5, \$6::jsonb\)/,
+    );
+    expect(call.sql).toMatch(/ON CONFLICT DO NOTHING RETURNING/);
+    expect(call.sql).not.toContain('restock');
+    expect(call.values).toEqual([
+      decisionId,
+      sourceRequestId,
+      attemptId,
+      row.senderId,
+      row.branchId,
+      JSON.stringify(row),
+    ]);
+    if (inserted.action !== 'inserted') throw new Error('not inserted');
+    expect(inserted.row).not.toBe(row);
+    expect(Object.isFrozen(inserted)).toBe(true);
+    expect(Object.isFrozen(inserted.row)).toBe(true);
+    expect(inserted).not.toHaveProperty('ack');
+    row.branchId = 'changed';
+    expect(inserted.row.branchId).toBe(' branch ');
+    expect(
+      await harness(
+        result(persisted(row, { sender_id: 'x' })),
+      ).store.insertPending(pending()),
+    ).toEqual(hold);
+    expect(
+      await harness(
+        result(persisted({ ...pending(), branchId: 'other' })),
+      ).store.insertPending(pending()),
+    ).toEqual(hold);
+  });
+
+  it('replays only an exact full pending row after exactly one conflict read', async () => {
+    const row = pending();
+    const h = harness(empty, result(persisted(row)));
+    expect(await h.store.insertPending(row)).toEqual({ action: 'replay', row });
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1].sql).toContain('SELECT');
+    expect(h.calls[1].values).toEqual([decisionId]);
+    expect(inserts(h.calls)).toHaveLength(1);
+    const movedSource = sourceRequestId.replace('848d', '9999');
+    const changed = [
+      { ...row, branchId: 'other' },
+      { ...row, senderId: 'different' },
+      {
+        ...row,
+        sourceRequestId: movedSource,
+        attemptId: deriveExpirationAttemptId(movedSource, decisionId)!,
+      },
+      {
+        ...row,
+        resolvedAt: '2026-09-25T10:01:00.000Z',
+        applyBefore: '2026-09-26T10:01:00.000Z',
+      },
+      { ...row, state: 'STALE', staleObservedAt: row.applyBefore },
+    ];
+    for (const other of changed) {
+      expect(
+        await harness(empty, result(persisted(other))).store.insertPending(row),
+      ).toEqual(hold);
+    }
+    expect(await harness(empty, empty).store.insertPending(row)).toEqual(hold);
+    expect(
+      await harness(
+        empty,
+        result(persisted(row, { sender_id: 'x' })),
+      ).store.insertPending(row),
+    ).toEqual(hold);
+  });
+
+  it('throws on inconsistent driver results instead of reporting missing or retrying', async () => {
     const malformed = [
       { rows: [], rowCount: 1 },
       result(persisted(), persisted()),
@@ -115,14 +223,54 @@ describe('offline EXPIRATION application ledger READ adapter', () => {
       await expect(
         harness(bad).store.readByDecision(decisionId),
       ).rejects.toThrow();
+      await expect(
+        harness(bad).store.insertPending(pending()),
+      ).rejects.toThrow();
+      await expect(
+        harness(empty, bad).store.insertPending(pending()),
+      ).rejects.toThrow();
     }
   });
 
-  it('propagates DB failures without rollback claims or a retry', async () => {
+  it('propagates DB failures without rollback claims, retries or a second write', async () => {
     const read = harness(new Error('read failed'));
     await expect(read.store.readByDecision(decisionId)).rejects.toThrow(
       'read failed',
     );
     expect(read.calls).toHaveLength(1);
+    const write = harness(new Error('write failed'));
+    await expect(write.store.insertPending(pending())).rejects.toThrow(
+      'write failed',
+    );
+    expect(write.calls).toHaveLength(1);
+    const conflict = harness(empty, new Error('read failed'));
+    await expect(conflict.store.insertPending(pending())).rejects.toThrow(
+      'read failed',
+    );
+    expect(conflict.calls).toHaveLength(2);
+    expect(inserts(conflict.calls)).toHaveLength(1);
+  });
+
+  it('serializes the validated snapshot before the first await', async () => {
+    const row = pending();
+    const calls: unknown[][] = [];
+    const store = new PostgresExpirationApplicationLedgerStore({
+      query: async (_sql: string, values: unknown[]) => {
+        calls.push(values);
+        row.branchId = 'mutated during await';
+        row.senderId = 'mutated';
+        return result(persisted(pending()));
+      },
+    } as unknown as Pick<Pool, 'query'>);
+    const inserted = await store.insertPending(row);
+    expect(calls[0]).toEqual([
+      decisionId,
+      sourceRequestId,
+      attemptId,
+      'customer',
+      ' branch ',
+      JSON.stringify(pending()),
+    ]);
+    expect(inserted).toEqual({ action: 'inserted', row: pending() });
   });
 });

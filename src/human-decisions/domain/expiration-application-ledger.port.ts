@@ -16,10 +16,30 @@ export type ExpirationApplicationRead =
   | Readonly<{ action: 'foundPending'; row: ExpirationApplicationPendingRow }>
   | Readonly<{ action: 'hold' }>;
 
+/** Insert/replay observation for one local pending row. It is persistence, not
+ * authority: neither insertion nor replay proves a current reservation, send
+ * eligibility, provenance, provider acceptance, ACK or closure. Replay proves a
+ * read snapshot only, never a lock or history. */
+export type ExpirationApplicationInsert =
+  | Readonly<{
+      action: 'inserted' | 'replay';
+      row: ExpirationApplicationPendingRow;
+    }>
+  | Readonly<{ action: 'hold' }>;
+
 export interface ExpirationApplicationLedgerPort {
   /** One SELECT by decision id. SQL/projection failures propagate unchanged and
    * imply no rollback or retry; a corrupt stored row holds, never a fake
    * missing. No branch/sender authorization, reservation or send/ACK/closure
    * authority is claimed. */
   readByDecision(decisionId: string): Promise<ExpirationApplicationRead>;
+  /** One conflict-safe INSERT ... ON CONFLICT DO NOTHING RETURNING, then at most
+   * one conflict read when RETURNING is empty. SQL/driver failures propagate
+   * unchanged and imply no rollback or retry (the write may have committed); an
+   * existing row is never updated or overwritten. Invalid or non-pending input
+   * holds before any query. No reservation, provenance or send/ACK authority is
+   * claimed. */
+  insertPending(
+    row: ExpirationApplicationPendingRow,
+  ): Promise<ExpirationApplicationInsert>;
 }
