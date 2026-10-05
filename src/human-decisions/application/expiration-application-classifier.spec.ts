@@ -183,6 +183,58 @@ describe('ExpirationApplicationClassifier', () => {
   );
 
   it.each<[string, SetupOptions]>([
+    ['missing receipt', { read: { action: 'missing' } }],
+    ['unknown receipt', { read: { action: 'unknown' } }],
+    ['absent context', { read: { action: 'recorded', context: null } }],
+    [
+      'foreign sender',
+      {
+        read: {
+          action: 'recorded',
+          context: context({ reservation: reservation({ senderId: OTHER }) }),
+        },
+      },
+    ],
+    [
+      'foreign requestKey',
+      {
+        read: {
+          action: 'recorded',
+          context: context({ reservation: reservation({ requestKey: OTHER }) }),
+        },
+      },
+    ],
+    [
+      'malformed intake',
+      {
+        read: {
+          action: 'recorded',
+          context: context({
+            reservation: reservation({ intake: intake({ productId: 'bad' }) }),
+          }),
+        },
+      },
+    ],
+    [
+      'noncanonical persisted id',
+      {
+        read: {
+          action: 'recorded',
+          context: context({ backendDecisionId: ID.toUpperCase() }),
+        },
+      },
+    ],
+  ])(
+    'reports query_held with no GET and no clock for %s',
+    async (_label, o) => {
+      const f = setup(o);
+      await expect(classify(f)).resolves.toEqual(queryHeld);
+      expect(f.getExpirationDecision).not.toHaveBeenCalled();
+      expect(f.clock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each<[string, SetupOptions]>([
     ['foreign source', { decision: decision({ sourceRequestId: OTHER }) }],
     [
       'foreign product',
@@ -295,6 +347,47 @@ describe('ExpirationApplicationClassifier', () => {
     // persisted one. This also exercises the normalized-decision round-trip.
     await expect(classifier.classify(SENDER)).resolves.toEqual(pending);
     expect(getExpirationDecision).toHaveBeenCalledWith(ID);
+  });
+
+  it('classifies a null variant and an opaque configured branch byte-for-byte', async () => {
+    const simple = context({
+      reservation: reservation({ intake: intake({ variantId: null }) }),
+    });
+    const simpleSnap = snapshot({
+      variantId: null,
+      variantName: null,
+      variantOption: null,
+      variantValue: null,
+    });
+    await expect(
+      classify(
+        setup({
+          read: { action: 'recorded', context: simple },
+          decision: decision({ snapshot: simpleSnap }),
+        }),
+      ),
+    ).resolves.toEqual(pending);
+    const opaque = 'sucursal:centro/01 ';
+    await expect(
+      classify(
+        setup({
+          branch: opaque,
+          decision: decision({ snapshot: snapshot({ branchId: opaque }) }),
+        }),
+      ),
+    ).resolves.toEqual(pending);
+    // The service, not the policy, is the single owner of the branch binding:
+    // a byte-for-byte mismatch is a fail-closed query_held with no clock read.
+    await expect(
+      classify(
+        setup({
+          branch: opaque,
+          decision: decision({
+            snapshot: snapshot({ branchId: 'sucursal:centro/01' }),
+          }),
+        }),
+      ),
+    ).resolves.toEqual(queryHeld);
   });
 
   it('returns a minimal, frozen stage union with no authority payload', async () => {
