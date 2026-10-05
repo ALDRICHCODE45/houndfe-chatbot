@@ -9,6 +9,9 @@
  * (sleeps 100/200), and ZERO HTTP for an absent or UNKNOWN reservation, with a
  * per-case before/after `SELECT *` snapshot proving no row mutation and an
  * independent assertion that every observed HTTP method is GET (never POST).
+ * The classifier cases additionally compose the REAL inactive application
+ * classifier with a controlled clock, including a manually released HTTP
+ * response proving expiry at the post-GET instant. They grant no send authority.
  * This does NOT prove communication with a real backend, runtime wiring,
  * process-restart durability, or any send/ACK behavior. */
 import { HttpService } from '@nestjs/axios';
@@ -17,7 +20,7 @@ import { AxiosHeaders, type AxiosResponse } from 'axios';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { Pool } from 'pg';
-import { of, throwError } from 'rxjs';
+import { Observable, of, throwError } from 'rxjs';
 import {
   PostgreSqlContainer,
   type StartedPostgreSqlContainer,
@@ -26,6 +29,7 @@ import type { ExpirationIntakeInput } from '../../chatbot-api/domain/dtos/human-
 import { ChatbotApiHttpClient } from '../../chatbot-api/infrastructure/chatbot-api-http.client';
 import { PostgresExpirationApplicationContextStore } from '../infrastructure/postgres-expiration-application-context.store';
 import { ExpirationExistingDecisionService } from './expiration-existing-decision.service';
+import { ExpirationApplicationClassifier } from './expiration-application-classifier';
 
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
@@ -377,5 +381,208 @@ ddescribe(
         expect(await tableRows()).toEqual(before);
       },
     );
+
+    describe('inactive application classifier over the persisted GET', () => {
+      const expectReadOnly = async (
+        before: Awaited<ReturnType<typeof tableRows>>,
+        getCount = 1,
+      ) => {
+        expect(httpRequest).toHaveBeenCalledTimes(getCount);
+        if (getCount > 0) expectOnlyGets();
+        expect(urls()).toEqual(
+          Array<string>(getCount).fill(
+            `/chatbot-api/human-decisions/${DECISION}`,
+          ),
+        );
+        for (const cfg of calls()) {
+          expect(cfg.headers.Authorization).toBe('Bearer svc_test_key');
+          expect(cfg.headers['X-Branch-Id']).toBe(BRANCH);
+          expect(cfg.headers['X-Idempotency-Key']).toBeUndefined();
+          expect(cfg.data).toBeUndefined();
+        }
+        expect(await tableRows()).toEqual(before);
+      };
+
+      it.each<[string, unknown, string]>([
+        ['PENDING', decision(), 'pending'],
+        ['RESOLVED at applyBefore', resolvedDecision(PROVIDE), 'expired'],
+      ])(
+        'classifies %s using the clock only after the delayed GET completes',
+        async (_label, wire, expected) => {
+          await seedRecorded();
+          const before = await tableRows();
+          let now = new Date(Date.parse(AFTER) - 1);
+          const clock = jest.fn(() => now);
+          let enterGet!: () => void;
+          let releaseGet = () => {};
+          const entered = new Promise<void>((resolve) => {
+            enterGet = resolve;
+          });
+          httpRequest.mockReturnValue(
+            new Observable<AxiosResponse>((subscriber) => {
+              releaseGet = () => {
+                subscriber.next(axiosResponse(wire));
+                subscriber.complete();
+              };
+              enterGet();
+            }),
+          );
+          const inFlight = new ExpirationApplicationClassifier(
+            buildService(),
+            clock,
+          ).classify(SENDER);
+
+          try {
+            await Promise.race([
+              entered,
+              inFlight.then(() => {
+                throw new Error('classification finished before GET release');
+              }),
+            ]);
+            expect(clock).not.toHaveBeenCalled();
+            now = new Date(AFTER);
+            releaseGet();
+            await expect(inFlight).resolves.toEqual({
+              stage: 'classified',
+              classification: { classification: expected },
+            });
+            expect(clock).toHaveBeenCalledTimes(1);
+          } finally {
+            releaseGet();
+            await inFlight;
+          }
+          await expectReadOnly(before);
+        },
+      );
+
+      it.each([PROVIDE, UNAVAILABLE])(
+        'classifies the original persisted inquiry within its window (%#)',
+        async (resolution) => {
+          await seedRecorded();
+          const before = await tableRows();
+          const clock = jest.fn(() => new Date(AT));
+          httpRequest.mockReturnValue(
+            of(axiosResponse(resolvedDecision(resolution))),
+          );
+
+          await expect(
+            new ExpirationApplicationClassifier(buildService(), clock).classify(
+              SENDER,
+            ),
+          ).resolves.toEqual({
+            stage: 'classified',
+            classification: { classification: 'within_window' },
+          });
+
+          expect(clock).toHaveBeenCalledTimes(1);
+          await expectReadOnly(before);
+        },
+      );
+
+      it.each<[string, () => Date, string]>([
+        [
+          'clock before resolution',
+          () => new Date(Date.parse(AT) - 1),
+          'clock_before_resolution',
+        ],
+        ['invalid clock', () => new Date('not-a-date'), 'invalid_clock'],
+        [
+          'throwing clock',
+          () => {
+            throw new Error('clock unavailable');
+          },
+          'invalid_clock',
+        ],
+      ])(
+        'holds a resolved decision with %s after GET',
+        async (_label, readClock, reason) => {
+          await seedRecorded();
+          const before = await tableRows();
+          const clock = jest.fn(readClock);
+          httpRequest.mockReturnValue(
+            of(axiosResponse(resolvedDecision(PROVIDE))),
+          );
+
+          await expect(
+            new ExpirationApplicationClassifier(buildService(), clock).classify(
+              SENDER,
+            ),
+          ).resolves.toEqual({
+            stage: 'classified',
+            classification: { classification: 'held', reason },
+          });
+
+          expect(clock).toHaveBeenCalledTimes(1);
+          await expectReadOnly(before);
+        },
+      );
+
+      it('holds a foreign branch after GET without sampling the clock', async () => {
+        await seedRecorded();
+        const before = await tableRows();
+        const clock = jest.fn(() => new Date(AT));
+        httpRequest.mockReturnValue(
+          of(
+            axiosResponse(
+              decision({ snapshot: snapshot({ branchId: OTHER_BRANCH }) }),
+            ),
+          ),
+        );
+
+        await expect(
+          new ExpirationApplicationClassifier(buildService(), clock).classify(
+            SENDER,
+          ),
+        ).resolves.toEqual({ stage: 'query_held' });
+
+        expect(clock).not.toHaveBeenCalled();
+        await expectReadOnly(before);
+      });
+
+      it('fails a persistent 503 after bounded GET retries without sampling the clock', async () => {
+        await seedRecorded();
+        const before = await tableRows();
+        const clock = jest.fn(() => new Date(AT));
+        httpRequest.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status: 503,
+              data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+            },
+          })),
+        );
+
+        await expect(
+          new ExpirationApplicationClassifier(buildService(), clock).classify(
+            SENDER,
+          ),
+        ).resolves.toEqual({ stage: 'query_failed' });
+
+        expect(clock).not.toHaveBeenCalled();
+        expect(sleep.mock.calls).toEqual([[100], [200]]);
+        await expectReadOnly(before, 3);
+      });
+
+      it.each<[string, boolean]>([
+        ['absent', false],
+        ['UNKNOWN', true],
+      ])(
+        'holds an %s reservation without HTTP or clock access',
+        async (_label, unknown) => {
+          if (unknown) await seedUnknown();
+          const before = await tableRows();
+          const clock = jest.fn(() => new Date(AT));
+
+          await expect(
+            new ExpirationApplicationClassifier(buildService(), clock).classify(
+              SENDER,
+            ),
+          ).resolves.toEqual({ stage: 'query_held' });
+
+          expect(clock).not.toHaveBeenCalled();
+          await expectReadOnly(before, 0);
+        },
+      );
+    });
   },
 );
