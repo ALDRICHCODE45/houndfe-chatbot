@@ -75,6 +75,234 @@ ddescribe('EXPIRATION pending adapter (real PostgreSQL)', () => {
     sendToken,
     attemptedAt: pending().resolvedAt,
   });
+  const started = () => ({
+    ...pending(),
+    state: 'SEND_STARTED' as const,
+    sendToken: begin().sendToken,
+    attemptedAt: begin().attemptedAt,
+  });
+  const acceptance = (observedAt = pending().resolvedAt) => ({
+    kind: 'provider_accepted',
+    attemptId: pending().attemptId,
+    sendToken: begin().sendToken,
+    providerMessageId: ' provider opaque ',
+    providerAcceptedObservedAt: observedAt,
+  });
+  const startRow = async () => {
+    expect(await store.insertPending(pending())).toEqual({
+      action: 'inserted',
+      row: pending(),
+    });
+    expect(
+      await store.transitionPending({ row: pending(), event: begin() }),
+    ).toEqual({
+      action: 'updated',
+      row: started(),
+    });
+  };
+
+  // Acceptance proof uses the public adapters, not direct row-data assertions.
+  // A provisional updated result is not COMMIT; a fresh pool is not an OS
+  // restart. Receipt evidence is synthetic, never a real provider send.
+  it.each([
+    ['on-time identical', pending().resolvedAt, false, 'COMMIT'],
+    ['on-time conflicting', pending().resolvedAt, true, 'COMMIT'],
+    ['late identical', pending().applyBefore, false, 'COMMIT'],
+    ['late conflicting', pending().applyBefore, true, 'COMMIT'],
+    ['rolled-back conflicting', pending().resolvedAt, true, 'ROLLBACK'],
+  ] as const)(
+    'acceptance %s serializes a blocked contender with the expected transaction outcome',
+    async (_, observedAt, conflict, completion) => {
+      await startRow();
+      const row = started();
+      const event = acceptance(observedAt);
+      const next = {
+        ...row,
+        state:
+          observedAt === pending().applyBefore
+            ? 'PROVIDER_ACCEPTED_LATE'
+            : 'PROVIDER_ACCEPTED',
+        providerMessageId: event.providerMessageId,
+        providerAcceptedObservedAt: observedAt,
+      };
+      const contender = {
+        ...event,
+        providerMessageId: conflict
+          ? 'different receipt'
+          : event.providerMessageId,
+      };
+      const first = await pool.connect();
+      let second: PoolClient | undefined;
+      let competing: Promise<unknown> | undefined;
+      try {
+        second = await pool.connect();
+        await first.query("SET statement_timeout = '10s'");
+        await second.query("SET statement_timeout = '10s'");
+        const firstPid = (
+          await first.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+        ).rows[0].pid;
+        const secondPid = (
+          await second.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+        ).rows[0].pid;
+        expect(firstPid).not.toBe(secondPid);
+        await first.query('BEGIN');
+        expect(
+          await new PostgresExpirationApplicationLedgerStore(
+            first,
+          ).recordAcceptance({ row, event }),
+        ).toEqual({ action: 'updated', row: next });
+        let settled = false;
+        competing = new PostgresExpirationApplicationLedgerStore(second)
+          .recordAcceptance({ row, event: contender })
+          .then(
+            (value) => {
+              settled = true;
+              return { value };
+            },
+            () => {
+              settled = true;
+              return { rejected: true };
+            },
+          );
+        let blocked = false;
+        const until = Date.now() + 5_000;
+        while (Date.now() < until) {
+          // Blocking PIDs are live; no cached activity query text is consulted.
+          const { rows } = await first.query<{ blocked: boolean }>(
+            'SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS blocked',
+            [firstPid, secondPid],
+          );
+          if (rows[0].blocked) {
+            blocked = true;
+            break;
+          }
+          await delay(10);
+        }
+        expect(blocked).toBe(true);
+        expect(settled).toBe(false);
+        await first.query(completion);
+        expect(await competing).toEqual({
+          value:
+            completion === 'COMMIT'
+              ? { action: 'hold' }
+              : {
+                  action: 'updated',
+                  row: {
+                    ...next,
+                    providerMessageId: contender.providerMessageId,
+                  },
+                },
+        });
+        const activity = await pool.query(
+          'SELECT state, xact_start FROM pg_stat_activity WHERE pid=$1',
+          [secondPid],
+        );
+        expect(activity.rows).toEqual([{ state: 'idle', xact_start: null }]);
+      } finally {
+        try {
+          await first.query('ROLLBACK');
+        } finally {
+          try {
+            await competing;
+          } finally {
+            first.release();
+            second?.release();
+          }
+        }
+      }
+      const fresh = new Pool({
+        connectionString: container.getConnectionUri(),
+        max: 1,
+        connectionTimeoutMillis: 10_000,
+        statement_timeout: 10_000,
+      });
+      try {
+        const replay = new PostgresExpirationApplicationLedgerStore(fresh);
+        expect(await replay.recordAcceptance({ row, event })).toEqual({
+          action: 'hold',
+        });
+        expect(
+          await replay.recordAcceptance({ row, event: contender }),
+        ).toEqual({ action: 'hold' });
+        expect(await replay.readByDecision(decisionId)).toEqual({
+          action: 'hold',
+        });
+        expect(await replay.insertPending(pending())).toEqual({
+          action: 'hold',
+        });
+        expect(
+          await replay.transitionPending({ row: pending(), event: begin() }),
+        ).toEqual({ action: 'hold' });
+      } finally {
+        await fresh.end();
+      }
+    },
+  );
+  it('rejects absent or divergent expected started rows without losing the exact acceptance CAS', async () => {
+    const row = started();
+    const event = acceptance('2026-09-25T11:00:00.000Z');
+    expect(await store.recordAcceptance({ row, event })).toEqual({
+      action: 'hold',
+    });
+    expect(await store.readByDecision(decisionId)).toEqual({
+      action: 'missing',
+    });
+    await startRow();
+    const otherSource = '99998b89-b323-5a4f-952e-41ebcc00d733';
+    const otherDecision = '22222222-2222-4222-8222-222222222222';
+    for (const changed of [
+      { ...row, senderId: 'other' },
+      { ...row, branchId: 'branch' },
+      { ...row, sendToken: otherDecision },
+      { ...row, attemptedAt: '2026-09-25T10:01:00.000Z' },
+      {
+        ...row,
+        resolvedAt: '2026-09-25T09:00:00.000Z',
+        applyBefore: '2026-09-26T09:00:00.000Z',
+      },
+      {
+        ...row,
+        sourceRequestId: otherSource,
+        attemptId: deriveExpirationAttemptId(otherSource, decisionId)!,
+      },
+      {
+        ...row,
+        decisionId: otherDecision,
+        attemptId: deriveExpirationAttemptId(sourceRequestId, otherDecision)!,
+      },
+    ]) {
+      expect(
+        await store.recordAcceptance({
+          row: changed,
+          event: {
+            ...event,
+            attemptId: changed.attemptId,
+            sendToken: changed.sendToken,
+          },
+        }),
+      ).toEqual({ action: 'hold' });
+    }
+    // The final exact CAS proves rejected candidates left the original started
+    // row intact; JSONB object key order is not identity.
+    expect(
+      await store.recordAcceptance({
+        row: Object.fromEntries(Object.entries(row).reverse()),
+        event,
+      }),
+    ).toEqual({
+      action: 'updated',
+      row: {
+        ...row,
+        state: 'PROVIDER_ACCEPTED',
+        providerMessageId: event.providerMessageId,
+        providerAcceptedObservedAt: event.providerAcceptedObservedAt,
+      },
+    });
+    expect(await store.recordAcceptance({ row, event })).toEqual({
+      action: 'hold',
+    });
+  });
+
   it.each(['identical', 'different'] as const)(
     'one real CAS wins while a blocked %s-token contender holds after commit',
     async (kind) => {
