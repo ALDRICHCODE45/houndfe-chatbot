@@ -35,7 +35,25 @@ export type ExpirationApplicationTransition =
     }>
   | Readonly<{ action: 'hold' }>;
 
+/** Local acceptance CAS observation, not transaction COMMIT, delivery or ACK. */
+export type ExpirationApplicationAcceptance =
+  | Readonly<{
+      action: 'updated';
+      row: Extract<
+        ExpirationApplicationLedgerRow,
+        { state: 'PROVIDER_ACCEPTED' | 'PROVIDER_ACCEPTED_LATE' }
+      >;
+    }>
+  | Readonly<{ action: 'hold' }>;
+
 export interface ExpirationApplicationLedgerPort {
+  /** One exact SEND_STARTED CAS using trusted provider acceptance evidence.
+   * Classification uses the supplied observation time, never the write clock.
+   * Zero rows (including identical replay) hold without reread or retry.
+   * SQL/projection failures propagate; neither failure nor hold proves rollback.
+   * Caller owns evidence provenance and any outer transaction; updated does not
+   * establish COMMIT, reservation ownership, delivery, ACK or closure authority. */
+  recordAcceptance(input: unknown): Promise<ExpirationApplicationAcceptance>;
   /** Begin-send only, via the pure start policy and one exact expected-row CAS.
    * Zero rows (even identical-token replay) hold without reread or retry.
    * SQL/projection failures propagate; neither failure nor hold proves rollback.

@@ -58,6 +58,200 @@ const started = () => ({
   attemptedAt: resolvedAt,
 });
 
+const acceptance = (observedAt = resolvedAt) => ({
+  kind: 'provider_accepted',
+  attemptId,
+  sendToken: begin().sendToken,
+  providerMessageId: ' provider opaque ',
+  providerAcceptedObservedAt: observedAt,
+});
+const accepted = (observedAt = resolvedAt) => ({
+  ...started(),
+  state:
+    observedAt < applyBefore ? 'PROVIDER_ACCEPTED' : 'PROVIDER_ACCEPTED_LATE',
+  providerMessageId: acceptance().providerMessageId,
+  providerAcceptedObservedAt: observedAt,
+});
+
+describe('offline EXPIRATION acceptance CAS', () => {
+  it.each([resolvedAt, applyBefore])(
+    'persists acceptance observed at %s with one full-row fenced UPDATE',
+    async (observedAt) => {
+      const next = accepted(observedAt);
+      const h = harness(result(persisted(next)));
+      const input = { row: started(), event: acceptance(observedAt) };
+      const output = await h.store.recordAcceptance(input);
+      expect(output).toEqual({ action: 'updated', row: next });
+      expect(h.calls).toHaveLength(1);
+      const { sql, values } = h.calls[0];
+      expect(sql).toContain(
+        'UPDATE expiration_application_ledger SET row_data = $7::jsonb',
+      );
+      expect(sql).toContain(
+        'WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3',
+      );
+      expect(sql).toContain(
+        'AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb',
+      );
+      expect(sql).toContain('RETURNING');
+      expect(sql).not.toMatch(/lower\(|ack_receipt|INSERT|DELETE|COMMIT/);
+      expect(values).toEqual([
+        decisionId,
+        sourceRequestId,
+        attemptId,
+        input.row.senderId,
+        input.row.branchId,
+        JSON.stringify(started()),
+        JSON.stringify(next),
+      ]);
+      expect(input).toEqual({ row: started(), event: acceptance(observedAt) });
+      expect(Object.isFrozen(output)).toBe(true);
+      if (output.action !== 'updated') throw new Error('updated required');
+      expect(Object.isFrozen(output.row)).toBe(true);
+      expect(output.row).not.toBe(next);
+    },
+  );
+  it('holds a zero-row result, including identical replay, without reread or retry', async () => {
+    const h = harness(result(persisted(accepted())), empty);
+    const input = { row: started(), event: acceptance() };
+    expect(await h.store.recordAcceptance(input)).toEqual({
+      action: 'updated',
+      row: accepted(),
+    });
+    expect(await h.store.recordAcceptance(input)).toEqual(hold);
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls.every(({ sql }) => sql.startsWith('UPDATE'))).toBe(true);
+    expect(h.calls[0]).toEqual(h.calls[1]);
+    expect(input).toEqual({ row: started(), event: acceptance() });
+  });
+  it.each([
+    null,
+    { row: pending(), event: acceptance() },
+    { row: accepted(), event: acceptance() },
+    { row: accepted(applyBefore), event: acceptance(applyBefore) },
+    { row: started(), event: { ...acceptance(), attemptId: decisionId } },
+    { row: started(), event: { ...acceptance(), sendToken: decisionId } },
+    { row: started(), event: { ...acceptance(), providerMessageId: '' } },
+    {
+      row: started(),
+      event: {
+        ...acceptance(),
+        providerAcceptedObservedAt: '2026-09-25T09:59:59.999Z',
+      },
+    },
+    { row: started(), event: { kind: 'timeout' } },
+  ])(
+    'rejects invalid, ambiguous or nonstarted input without querying %#',
+    async (input) => {
+      const h = harness();
+      const before = structuredClone(input);
+      expect(await h.store.recordAcceptance(input)).toEqual(hold);
+      expect(h.calls).toHaveLength(0);
+      expect(input).toEqual(before);
+    },
+  );
+  it.each([resolvedAt, applyBefore])(
+    'rejects divergent RETURNING at %s',
+    async (observedAt) => {
+      const next = accepted(observedAt);
+      const raw = persisted(next);
+      const wrongColumns = Object.keys(raw)
+        .filter((key) => key !== 'row_data')
+        .map((key) => ({ ...raw, [key]: 'wrong' }));
+      const wrongRows = [
+        pending(),
+        started(),
+        accepted(observedAt === resolvedAt ? applyBefore : resolvedAt),
+        { ...next, providerMessageId: 'other' },
+        {
+          ...next,
+          providerAcceptedObservedAt: observedAt.replace('000Z', '001Z'),
+        },
+        { ...next, sendToken: sourceRequestId },
+        { ...next, branchId: 'other' },
+      ];
+      for (const reply of [
+        ...wrongColumns,
+        ...wrongRows.map((row) => persisted(row)),
+      ]) {
+        const h = harness(result(reply));
+        expect(
+          await h.store.recordAcceptance({
+            row: started(),
+            event: acceptance(observedAt),
+          }),
+        ).toEqual(hold);
+        expect(h.calls).toHaveLength(1);
+      }
+    },
+  );
+  it('propagates malformed RETURNING and SQL failure without claiming rollback or retry', async () => {
+    const failure = new Error('uncertain acceptance write');
+    for (const reply of [
+      undefined,
+      result(null),
+      { rows: [], rowCount: 1 },
+      result(persisted(accepted()), persisted(accepted())),
+    ]) {
+      const h = harness(reply);
+      await expect(
+        h.store.recordAcceptance({ row: started(), event: acceptance() }),
+      ).rejects.toThrow();
+      expect(h.calls).toHaveLength(1);
+    }
+    const h = harness(failure);
+    await expect(
+      h.store.recordAcceptance({ row: started(), event: acceptance() }),
+    ).rejects.toBe(failure);
+    expect(h.calls).toHaveLength(1);
+  });
+  it('detaches before awaiting SQL and accepts JSONB key reordering', async () => {
+    const row = started();
+    const event = acceptance();
+    let valuesAtQuery: unknown[] = [];
+    const query = jest.fn(() => {
+      row.sendToken = decisionId;
+      event.providerMessageId = 'changed';
+      return Promise.resolve(
+        result(
+          persisted(Object.fromEntries(Object.entries(accepted()).reverse())),
+        ),
+      );
+    });
+    const store = new PostgresExpirationApplicationLedgerStore({
+      query: (_sql: string, values: unknown[]) => {
+        valuesAtQuery = values;
+        return query();
+      },
+    } as unknown as Pool);
+    expect(await store.recordAcceptance({ row, event })).toEqual({
+      action: 'updated',
+      row: accepted(),
+    });
+    expect(JSON.parse(valuesAtQuery[5] as string)).toEqual(started());
+    expect(JSON.parse(valuesAtQuery[6] as string)).toEqual(accepted());
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+  it.each([resolvedAt, applyBefore])(
+    'keeps pending reads, inserts and begin-send held on acceptance at %s',
+    async (observedAt) => {
+      const raw = persisted(accepted(observedAt));
+      const h = harness(result(raw), empty, result(raw), empty);
+      expect(await h.store.readByDecision(decisionId)).toEqual(hold);
+      expect(await h.store.insertPending(pending())).toEqual(hold);
+      expect(
+        await h.store.transitionPending({ row: pending(), event: begin() }),
+      ).toEqual(hold);
+      expect(h.calls.map(({ sql }) => sql.split(' ')[0])).toEqual([
+        'SELECT',
+        'INSERT',
+        'SELECT',
+        'UPDATE',
+      ]);
+    },
+  );
+});
+
 describe('offline EXPIRATION begin-send CAS', () => {
   it('updates exactly the full expected pending snapshot with one fenced statement', async () => {
     const h = harness(result(persisted(started())));

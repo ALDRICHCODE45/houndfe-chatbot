@@ -1,8 +1,10 @@
 import { isDeepStrictEqual } from 'node:util';
 import type { Pool } from 'pg';
 import { classifyExpirationApplicationStart } from '../domain/expiration-application-ledger-start';
+import { classifyExpirationApplicationAcceptance } from '../domain/expiration-application-ledger-acceptance';
 import { normalizeExpirationApplicationLedgerRow } from '../domain/expiration-application-ledger-row';
 import type {
+  ExpirationApplicationAcceptance,
   ExpirationApplicationInsert,
   ExpirationApplicationPendingRow,
   ExpirationApplicationRead,
@@ -17,7 +19,7 @@ const READ = `SELECT ${COLUMNS} FROM expiration_application_ledger WHERE decisio
 const INSERT = `INSERT INTO expiration_application_ledger (${COLUMNS})
 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 ON CONFLICT DO NOTHING RETURNING ${COLUMNS}`;
-/** Full JSONB equality includes the pending state; no replay can win twice. */
+/** Full JSONB equality includes the expected state; no replay can win twice. */
 const TRANSITION = `UPDATE expiration_application_ledger SET row_data = $7::jsonb
 WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3
 AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb
@@ -80,7 +82,7 @@ function same(
   );
 }
 
-/** Unwired local pending read/insert and begin-send CAS only. One SELECT,
+/** Unwired local pending read/insert, begin-send and acceptance CAS. One SELECT,
  * conflict-safe INSERT with at most one conflict read, or one exact-row UPDATE.
  * Corrupt stored rows hold while inconsistent driver results throw.
  * CAS does not own an outer transaction or revalidate reservation/current time.
@@ -89,6 +91,42 @@ function same(
  * error implies a rollback or retry (the write may already have committed). */
 export class PostgresExpirationApplicationLedgerStore {
   constructor(private readonly pool: Pick<Pool, 'query'>) {}
+
+  async recordAcceptance(
+    input: unknown,
+  ): Promise<ExpirationApplicationAcceptance> {
+    const proposal = classifyExpirationApplicationAcceptance(input);
+    if (proposal.action !== 'propose_cas') return HOLD;
+    const { expected, next } = proposal;
+    const raw = single(
+      await this.pool.query(TRANSITION, [
+        expected.decisionId,
+        expected.sourceRequestId,
+        expected.attemptId,
+        expected.senderId,
+        expected.branchId,
+        JSON.stringify(expected),
+        JSON.stringify(next),
+      ]),
+    );
+    if (raw === null) return HOLD;
+    // Acceptance is returned only by this successful exact CAS. The existing
+    // pending-only read/insert decoder must never turn it into replay authority.
+    const row = normalizeExpirationApplicationLedgerRow(raw.row_data);
+    if (
+      !row ||
+      (row.state !== 'PROVIDER_ACCEPTED' &&
+        row.state !== 'PROVIDER_ACCEPTED_LATE') ||
+      raw.decision_id !== row.decisionId ||
+      raw.source_request_id !== row.sourceRequestId ||
+      raw.attempt_id !== row.attemptId ||
+      raw.sender_id !== row.senderId ||
+      raw.branch_id !== row.branchId ||
+      !isDeepStrictEqual(row, next)
+    )
+      return HOLD;
+    return Object.freeze({ action: 'updated', row });
+  }
 
   async transitionPending(
     input: unknown,
