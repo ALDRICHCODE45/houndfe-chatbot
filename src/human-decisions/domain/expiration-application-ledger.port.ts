@@ -27,7 +27,21 @@ export type ExpirationApplicationInsert =
     }>
   | Readonly<{ action: 'hold' }>;
 
+/** A successful local CAS observation, not committed transaction or send authority. */
+export type ExpirationApplicationTransition =
+  | Readonly<{
+      action: 'updated';
+      row: Extract<ExpirationApplicationLedgerRow, { state: 'SEND_STARTED' }>;
+    }>
+  | Readonly<{ action: 'hold' }>;
+
 export interface ExpirationApplicationLedgerPort {
+  /** Begin-send only, via the pure start policy and one exact expected-row CAS.
+   * Zero rows (even identical-token replay) hold without reread or retry.
+   * SQL/projection failures propagate; neither failure nor hold proves rollback.
+   * Caller owns reservation/identity/clock revalidation and any outer transaction;
+   * even updated is not committed evidence, WhatsApp eligibility or send authority. */
+  transitionPending(input: unknown): Promise<ExpirationApplicationTransition>;
   /** One SELECT by decision id. SQL/projection failures propagate unchanged and
    * imply no rollback or retry; a corrupt stored row holds, never a fake
    * missing. No branch/sender authorization, reservation or send/ACK/closure

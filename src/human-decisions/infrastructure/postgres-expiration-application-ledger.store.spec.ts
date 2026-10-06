@@ -46,6 +46,161 @@ const hold = { action: 'hold' };
 const inserts = (calls: Array<{ sql: string }>) =>
   calls.filter((call) => call.sql.startsWith('INSERT'));
 
+const begin = () => ({
+  kind: 'begin_send',
+  sendToken: '33333333-3333-4333-8333-333333333333',
+  attemptedAt: resolvedAt,
+});
+const started = () => ({
+  ...pending(),
+  state: 'SEND_STARTED',
+  sendToken: begin().sendToken,
+  attemptedAt: resolvedAt,
+});
+
+describe('offline EXPIRATION begin-send CAS', () => {
+  it('updates exactly the full expected pending snapshot with one fenced statement', async () => {
+    const h = harness(result(persisted(started())));
+    const row = pending();
+    const event = begin();
+    const output = await h.store.transitionPending({ row, event });
+    expect(output).toEqual({ action: 'updated', row: started() });
+    expect(h.calls).toHaveLength(1);
+    const { sql, values } = h.calls[0];
+    expect(sql).toMatch(
+      /UPDATE expiration_application_ledger SET row_data = \$7::jsonb/,
+    );
+    expect(sql).toContain(
+      'WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3',
+    );
+    expect(sql).toContain(
+      'AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb',
+    );
+    expect(sql).toContain('RETURNING');
+    expect(sql).not.toMatch(/lower\(|ack_receipt|INSERT|DELETE|COMMIT/);
+    expect(values).toEqual([
+      decisionId,
+      sourceRequestId,
+      attemptId,
+      row.senderId,
+      row.branchId,
+      JSON.stringify(row),
+      JSON.stringify(started()),
+    ]);
+    expect(row).toEqual(pending());
+    expect(event).toEqual(begin());
+    expect(Object.isFrozen(output)).toBe(true);
+    if (output.action !== 'updated') throw new Error('updated required');
+    expect(Object.isFrozen(output.row)).toBe(true);
+  });
+  it('holds a lost CAS and identical-token retry without a read or second write', async () => {
+    const h = harness(result(persisted(started())), empty);
+    const input = { row: pending(), event: begin() };
+    expect(await h.store.transitionPending(input)).toEqual({
+      action: 'updated',
+      row: started(),
+    });
+    expect(await h.store.transitionPending(input)).toEqual(hold);
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls.every(({ sql }) => sql.startsWith('UPDATE'))).toBe(true);
+    expect(h.calls[0]).toEqual(h.calls[1]);
+    expect(input).toEqual({ row: pending(), event: begin() });
+  });
+  it.each([
+    null,
+    { row: pending(), event: { ...begin(), attemptedAt: applyBefore } },
+    { row: pending(), event: { ...begin(), sendToken: attemptId } },
+    { row: started(), event: begin() },
+    {
+      row: pending(),
+      event: { kind: 'expire_unsent', observedAt: applyBefore },
+    },
+  ])(
+    'rejects invalid, expired, nonpending or unsupported inputs without querying %#',
+    async (input) => {
+      const h = harness();
+      expect(await h.store.transitionPending(input)).toEqual(hold);
+      expect(h.calls).toHaveLength(0);
+    },
+  );
+  it('holds every divergent RETURNING identity or row without replay', async () => {
+    const raw = persisted(started());
+    const wrongColumns = Object.keys(raw)
+      .filter((key) => key !== 'row_data')
+      .map((key) => ({ ...raw, [key]: 'wrong' }));
+    const wrongRows = [
+      pending(),
+      { ...started(), sendToken: sourceRequestId },
+      { ...started(), attemptedAt: '2026-09-25T10:01:00.000Z' },
+      { ...started(), branchId: 'other' },
+    ];
+    for (const reply of [
+      ...wrongColumns,
+      ...wrongRows.map((row) => persisted(row)),
+    ]) {
+      const h = harness(result(reply));
+      expect(
+        await h.store.transitionPending({ row: pending(), event: begin() }),
+      ).toEqual(hold);
+      expect(h.calls).toHaveLength(1);
+    }
+  });
+  it('validates RETURNING cardinality and propagates uncertain failures without retry', async () => {
+    const failure = new Error('uncertain write');
+    for (const reply of [
+      failure,
+      undefined,
+      result(null),
+      { rows: [], rowCount: 1 },
+      result(persisted(started()), persisted(started())),
+    ]) {
+      const h = harness(reply);
+      await expect(
+        h.store.transitionPending({ row: pending(), event: begin() }),
+      ).rejects.toThrow();
+      expect(h.calls).toHaveLength(1);
+    }
+    const h = harness(failure);
+    await expect(
+      h.store.transitionPending({ row: pending(), event: begin() }),
+    ).rejects.toBe(failure);
+  });
+  it('preserves pending-only reads and insert conflict holds after a stored start', async () => {
+    const h = harness(
+      result(persisted(started())),
+      empty,
+      result(persisted(started())),
+    );
+    expect(await h.store.readByDecision(decisionId)).toEqual(hold);
+    expect(await h.store.insertPending(pending())).toEqual(hold);
+    expect(h.calls.map(({ sql }) => sql.split(' ')[0])).toEqual([
+      'SELECT',
+      'INSERT',
+      'SELECT',
+    ]);
+  });
+  it('detaches row and event before awaiting SQL and accepts JSONB key reordering', async () => {
+    const row = pending();
+    const event = begin();
+    const query = jest.fn(async (_sql: string, values: unknown[]) => {
+      row.branchId = 'changed';
+      event.sendToken = decisionId;
+      expect(JSON.parse(values[6] as string)).toEqual(started());
+      return result(
+        persisted(Object.fromEntries(Object.entries(started()).reverse())),
+      );
+    });
+    const store = new PostgresExpirationApplicationLedgerStore({
+      query,
+    } as unknown as Pool);
+    expect(await store.transitionPending({ row, event })).toEqual({
+      action: 'updated',
+      row: started(),
+    });
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('offline EXPIRATION application INSERT/READ adapter', () => {
   it('reads a canonical decision as a detached frozen pending snapshot via one SELECT', async () => {
     const raw = pending();
