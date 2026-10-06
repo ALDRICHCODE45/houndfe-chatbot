@@ -73,6 +73,191 @@ const accepted = (observedAt = resolvedAt) => ({
   providerAcceptedObservedAt: observedAt,
 });
 
+const ackReceipt = (row = accepted()) => ({
+  id: row.decisionId,
+  version: 2,
+  attemptId: row.attemptId,
+  outcome: row.state,
+  ackReceivedAt: '2026-09-26T04:01:00-06:00',
+});
+
+describe('offline EXPIRATION ACK CAS', () => {
+  const stale = { ...pending(), state: 'STALE', staleObservedAt: applyBefore };
+  it.each([accepted(), accepted(applyBefore), stale])(
+    'writes only ACK with exact fences for $state',
+    async (row) => {
+      const receipt = { ...ackReceipt(), outcome: row.state };
+      const h = harness(result(persisted(row, { ack_receipt: receipt })));
+      const before = structuredClone({ row, receipt });
+      const output = await h.store.recordOutcomeAck(row, receipt);
+      expect(output).toEqual({ action: 'updated', row, receipt });
+      expect({ row, receipt }).toEqual(before);
+      expect(h.calls).toHaveLength(1);
+      expect(h.calls[0]).toEqual({
+        sql: `UPDATE expiration_application_ledger SET ack_receipt = $7::jsonb
+WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3
+AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb
+AND ack_receipt IS NULL
+RETURNING decision_id, source_request_id, attempt_id, sender_id, branch_id, row_data, ack_receipt`,
+        values: [
+          decisionId,
+          sourceRequestId,
+          attemptId,
+          row.senderId,
+          row.branchId,
+          JSON.stringify(row),
+          JSON.stringify(receipt),
+        ],
+      });
+      expect(Object.isFrozen(output)).toBe(true);
+      if (output.action !== 'updated') throw new Error('updated required');
+      expect(Object.isFrozen(output.row)).toBe(true);
+      expect(Object.isFrozen(output.receipt)).toBe(true);
+      expect(output.row).not.toBe(row);
+      expect(output.receipt).not.toBe(receipt);
+    },
+  );
+  it('holds zero rows, including identical replay, without reread or retry', async () => {
+    const row = accepted();
+    const receipt = ackReceipt();
+    const h = harness(result(persisted(row, { ack_receipt: receipt })), empty);
+    expect(await h.store.recordOutcomeAck(row, receipt)).toEqual({
+      action: 'updated',
+      row,
+      receipt,
+    });
+    expect(await h.store.recordOutcomeAck(row, receipt)).toEqual(hold);
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[0]).toEqual(h.calls[1]);
+  });
+  it.each([
+    [pending(), ackReceipt()],
+    [started(), ackReceipt()],
+    [null, ackReceipt()],
+    [accepted(), null],
+    [accepted(), { ...ackReceipt(), id: decisionId.toUpperCase() }],
+    [accepted(), { ...ackReceipt(), attemptId: attemptId.toUpperCase() }],
+    [accepted(), { ...ackReceipt(), version: 1 }],
+    [accepted(), { ...ackReceipt(), outcome: 'STALE' }],
+    [accepted(), { ...ackReceipt(), ackReceivedAt: 'invalid' }],
+  ])('holds invalid binding before SQL %#', async (row, receipt) => {
+    const h = harness();
+    const before = structuredClone({ row, receipt });
+    expect(await h.store.recordOutcomeAck(row, receipt)).toEqual(hold);
+    expect({ row, receipt }).toEqual(before);
+    expect(h.calls).toHaveLength(0);
+  });
+  it('holds inconsistent RETURNING columns, row snapshots or ACK evidence', async () => {
+    const row = accepted();
+    const receipt = ackReceipt();
+    const raw = persisted(row, { ack_receipt: receipt });
+    const columns = [
+      'decision_id',
+      'source_request_id',
+      'attempt_id',
+      'sender_id',
+      'branch_id',
+    ];
+    const wrongRows = [
+      pending(),
+      started(),
+      accepted(applyBefore),
+      { ...row, providerMessageId: 'other' },
+      { ...row, sendToken: sourceRequestId },
+      { ...row, branchId: 'other' },
+      { ...row, senderId: 'other' },
+    ];
+    for (const reply of [
+      ...columns.map((key) => ({ ...raw, [key]: 'wrong' })),
+      ...wrongRows.map((candidate) =>
+        persisted(candidate, { ack_receipt: receipt }),
+      ),
+      ...[
+        undefined,
+        null,
+        { ...receipt, id: sourceRequestId },
+        { ...receipt, version: 1 },
+        { ...receipt, outcome: 'STALE' },
+        { ...receipt, ackReceivedAt: 'invalid' },
+        { ...receipt, ackReceivedAt: '2026-09-26T10:01:00.000Z' },
+      ].map((ack) => ({ ...raw, ack_receipt: ack })),
+    ]) {
+      const h = harness(result(reply));
+      expect(await h.store.recordOutcomeAck(row, receipt)).toEqual(hold);
+      expect(h.calls).toHaveLength(1);
+    }
+  });
+  it('propagates SQL and malformed driver results without retry or rollback claims', async () => {
+    for (const reply of [
+      undefined,
+      result(null),
+      { rows: [], rowCount: 1 },
+      result(persisted(), persisted()),
+    ]) {
+      const h = harness(reply);
+      await expect(
+        h.store.recordOutcomeAck(accepted(), ackReceipt()),
+      ).rejects.toThrow();
+      expect(h.calls).toHaveLength(1);
+    }
+    const failure = new Error('uncertain ACK write');
+    const h = harness(failure);
+    await expect(
+      h.store.recordOutcomeAck(accepted(), ackReceipt()),
+    ).rejects.toBe(failure);
+    expect(h.calls).toHaveLength(1);
+  });
+  it('snapshots before SQL awaits and accepts reordered JSONB without timestamp rewriting', async () => {
+    const row = accepted();
+    const receipt = ackReceipt();
+    let valuesAtQuery: unknown[] = [];
+    const query = jest.fn((_sql: string, values: unknown[]) => {
+      valuesAtQuery = values;
+      row.providerMessageId = 'changed';
+      receipt.ackReceivedAt = 'changed';
+      return Promise.resolve(
+        result(
+          persisted(Object.fromEntries(Object.entries(accepted()).reverse()), {
+            ack_receipt: Object.fromEntries(
+              Object.entries(ackReceipt()).reverse(),
+            ),
+          }),
+        ),
+      );
+    });
+    const store = new PostgresExpirationApplicationLedgerStore({
+      query,
+    } as unknown as Pool);
+    expect(await store.recordOutcomeAck(row, receipt)).toEqual({
+      action: 'updated',
+      row: accepted(),
+      receipt: ackReceipt(),
+    });
+    expect(JSON.parse(valuesAtQuery[5] as string)).toEqual(accepted());
+    expect(JSON.parse(valuesAtQuery[6] as string)).toEqual(ackReceipt());
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+  it('keeps pending read/insert/start and acceptance CAS held on an acknowledged row', async () => {
+    const raw = persisted(accepted(), { ack_receipt: ackReceipt() });
+    const h = harness(result(raw), empty, result(raw), empty, empty);
+    expect(await h.store.readByDecision(decisionId)).toEqual(hold);
+    expect(await h.store.insertPending(pending())).toEqual(hold);
+    expect(
+      await h.store.transitionPending({ row: pending(), event: begin() }),
+    ).toEqual(hold);
+    expect(
+      await h.store.recordAcceptance({ row: started(), event: acceptance() }),
+    ).toEqual(hold);
+    expect(h.calls.map(({ sql }) => sql.split(' ')[0])).toEqual([
+      'SELECT',
+      'INSERT',
+      'SELECT',
+      'UPDATE',
+      'UPDATE',
+    ]);
+  });
+});
+
 describe('offline EXPIRATION acceptance CAS', () => {
   it.each([resolvedAt, applyBefore])(
     'persists acceptance observed at %s with one full-row fenced UPDATE',

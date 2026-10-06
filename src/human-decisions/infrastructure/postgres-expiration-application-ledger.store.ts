@@ -3,7 +3,9 @@ import type { Pool } from 'pg';
 import { classifyExpirationApplicationStart } from '../domain/expiration-application-ledger-start';
 import { classifyExpirationApplicationAcceptance } from '../domain/expiration-application-ledger-acceptance';
 import { normalizeExpirationApplicationLedgerRow } from '../domain/expiration-application-ledger-row';
+import { bindExpirationApplicationOutcomeAck } from '../domain/expiration-application-ledger-ack-binding';
 import type {
+  ExpirationApplicationAckWrite,
   ExpirationApplicationAcceptance,
   ExpirationApplicationInsert,
   ExpirationApplicationPendingRow,
@@ -24,6 +26,12 @@ const TRANSITION = `UPDATE expiration_application_ledger SET row_data = $7::json
 WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3
 AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb
 RETURNING ${COLUMNS}`;
+/** ACK-only CAS: never overwrite evidence or change the terminal snapshot. */
+const RECORD_ACK = `UPDATE expiration_application_ledger SET ack_receipt = $7::jsonb
+WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3
+AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb
+AND ack_receipt IS NULL
+RETURNING ${COLUMNS}, ack_receipt`;
 /** Canonical lowercase RFC 4122 v1-v8 UUID; no case-folding, trimming or coercion. */
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -82,7 +90,7 @@ function same(
   );
 }
 
-/** Unwired local pending read/insert, begin-send and acceptance CAS. One SELECT,
+/** Unwired pending read/insert, begin-send, acceptance and ACK CAS. One SELECT,
  * conflict-safe INSERT with at most one conflict read, or one exact-row UPDATE.
  * Corrupt stored rows hold while inconsistent driver results throw.
  * CAS does not own an outer transaction or revalidate reservation/current time.
@@ -91,6 +99,48 @@ function same(
  * error implies a rollback or retry (the write may already have committed). */
 export class PostgresExpirationApplicationLedgerStore {
   constructor(private readonly pool: Pick<Pool, 'query'>) {}
+
+  async recordOutcomeAck(
+    row: unknown,
+    receipt: unknown,
+  ): Promise<ExpirationApplicationAckWrite> {
+    const binding = bindExpirationApplicationOutcomeAck(row, receipt);
+    if (binding.action !== 'bound') return HOLD;
+    const expected = binding.expected;
+    const raw = single(
+      await this.pool.query(RECORD_ACK, [
+        expected.decisionId,
+        expected.sourceRequestId,
+        expected.attemptId,
+        expected.senderId,
+        expected.branchId,
+        JSON.stringify(expected),
+        JSON.stringify(binding.receipt),
+      ]),
+    );
+    if (raw === null) return HOLD;
+    const recorded = bindExpirationApplicationOutcomeAck(
+      raw.row_data,
+      raw.ack_receipt,
+    );
+    if (
+      recorded.action !== 'bound' ||
+      raw.decision_id !== expected.decisionId ||
+      raw.source_request_id !== expected.sourceRequestId ||
+      raw.attempt_id !== expected.attemptId ||
+      raw.sender_id !== expected.senderId ||
+      raw.branch_id !== expected.branchId ||
+      !isDeepStrictEqual(recorded.expected, expected) ||
+      !isDeepStrictEqual(recorded.receipt, binding.receipt)
+    )
+      return HOLD;
+    // A matching RETURNING proves this CAS only, not the caller's COMMIT.
+    return Object.freeze({
+      action: 'updated',
+      row: recorded.expected,
+      receipt: recorded.receipt,
+    });
+  }
 
   async recordAcceptance(
     input: unknown,

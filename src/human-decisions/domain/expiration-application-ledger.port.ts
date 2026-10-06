@@ -1,4 +1,5 @@
 import type { ExpirationApplicationLedgerRow } from './expiration-application-ledger-row';
+import type { ExpirationApplicationAckBinding } from './expiration-application-ledger-ack-binding';
 
 /** The only stored shape this read accepts today: a RESOLVED v2 decision pending
  * delivery. It is a local snapshot, not send authority or history. */
@@ -46,7 +47,26 @@ export type ExpirationApplicationAcceptance =
     }>
   | Readonly<{ action: 'hold' }>;
 
+type BoundAck = Extract<ExpirationApplicationAckBinding, { action: 'bound' }>;
+/** Local ACK CAS observation; not outer COMMIT, delivery or closure authority. */
+export type ExpirationApplicationAckWrite =
+  | Readonly<{
+      action: 'updated';
+      row: BoundAck['expected'];
+      receipt: BoundAck['receipt'];
+    }>
+  | Readonly<{ action: 'hold' }>;
+
 export interface ExpirationApplicationLedgerPort {
+  /** One exact terminal-row CAS into an absent ACK slot, using trusted response
+   * evidence. Invalid input holds before SQL. Zero rows, including identical
+   * replay, hold without reread/retry. SQL/inconsistent-result failures propagate;
+   * neither failure nor hold proves rollback. Caller owns HTTP provenance and
+   * any outer transaction; updated never grants automatic closure or resend. */
+  recordOutcomeAck(
+    row: unknown,
+    receipt: unknown,
+  ): Promise<ExpirationApplicationAckWrite>;
   /** One exact SEND_STARTED CAS using trusted provider acceptance evidence.
    * Classification uses the supplied observation time, never the write clock.
    * Zero rows (including identical replay) hold without reread or retry.
