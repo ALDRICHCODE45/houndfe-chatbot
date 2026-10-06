@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
@@ -66,6 +66,196 @@ ddescribe('EXPIRATION pending adapter (real PostgreSQL)', () => {
   });
   beforeEach(async () => {
     await pool.query('TRUNCATE expiration_application_ledger');
+  });
+
+  // Existing-behavior proof of the low-level CAS, not send authority or a
+  // reservation/fresh-clock claim. No crash or COMMIT-disconnect injection.
+  const begin = (sendToken = '33333333-3333-4333-8333-333333333333') => ({
+    kind: 'begin_send',
+    sendToken,
+    attemptedAt: pending().resolvedAt,
+  });
+  it.each(['identical', 'different'] as const)(
+    'one real CAS wins while a blocked %s-token contender holds after commit',
+    async (kind) => {
+      const row = pending();
+      expect(await store.insertPending(row)).toEqual({
+        action: 'inserted',
+        row,
+      });
+      const first = await pool.connect();
+      let second: PoolClient | undefined;
+      let competing: Promise<unknown> | undefined;
+      try {
+        second = await pool.connect();
+        await first.query("SET statement_timeout = '10s'");
+        await second.query("SET statement_timeout = '10s'");
+        await first.query('BEGIN');
+        const firstPid = (
+          await first.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+        ).rows[0].pid;
+        const secondPid = (
+          await second.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+        ).rows[0].pid;
+        expect(firstPid).not.toBe(secondPid);
+        const winner = {
+          ...row,
+          state: 'SEND_STARTED',
+          sendToken: begin().sendToken,
+          attemptedAt: begin().attemptedAt,
+        };
+        expect(
+          await new PostgresExpirationApplicationLedgerStore(
+            first,
+          ).transitionPending({ row, event: begin() }),
+        ).toEqual({ action: 'updated', row: winner });
+        const event =
+          kind === 'identical'
+            ? begin()
+            : begin('44444444-4444-4444-8444-444444444444');
+        let settled = false;
+        competing = new PostgresExpirationApplicationLedgerStore(second)
+          .transitionPending({ row, event })
+          .then(
+            (value) => {
+              settled = true;
+              return { value };
+            },
+            () => {
+              settled = true;
+              return { rejected: true };
+            },
+          );
+        let blocked = false;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const observation = await first.query<{ blocked: boolean }>(
+            'SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS blocked',
+            [firstPid, secondPid],
+          );
+          if (observation.rows[0].blocked) {
+            blocked = true;
+            break;
+          }
+          await delay(10);
+        }
+        expect(blocked).toBe(true);
+        expect(settled).toBe(false);
+        // Other sessions still see pending until the transaction owner commits.
+        expect(await store.readByDecision(decisionId)).toEqual({
+          action: 'foundPending',
+          row,
+        });
+        await first.query('COMMIT');
+        expect(await competing).toEqual({ value: { action: 'hold' } });
+        expect(await store.readByDecision(decisionId)).toEqual({
+          action: 'hold',
+        });
+        expect(await store.insertPending(row)).toEqual({ action: 'hold' });
+        expect(await store.transitionPending({ row, event: begin() })).toEqual({
+          action: 'hold',
+        });
+        expect(await store.transitionPending({ row, event })).toEqual({
+          action: 'hold',
+        });
+        const activity = await pool.query(
+          'SELECT state, xact_start FROM pg_stat_activity WHERE pid=$1',
+          [secondPid],
+        );
+        expect(activity.rows).toEqual([{ state: 'idle', xact_start: null }]);
+      } finally {
+        try {
+          await first.query('ROLLBACK');
+        } finally {
+          try {
+            await competing;
+          } finally {
+            first.release();
+            second?.release();
+          }
+        }
+      }
+    },
+  );
+  it('keeps updated provisional: caller rollback restores pending and allows a later CAS', async () => {
+    const row = pending();
+    expect(await store.insertPending(row)).toEqual({ action: 'inserted', row });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const next = {
+        ...row,
+        state: 'SEND_STARTED',
+        sendToken: begin().sendToken,
+        attemptedAt: begin().attemptedAt,
+      };
+      expect(
+        await new PostgresExpirationApplicationLedgerStore(
+          client,
+        ).transitionPending({ row, event: begin() }),
+      ).toEqual({ action: 'updated', row: next });
+      expect(await store.readByDecision(decisionId)).toEqual({
+        action: 'foundPending',
+        row,
+      });
+      await client.query('ROLLBACK');
+      expect(await store.readByDecision(decisionId)).toEqual({
+        action: 'foundPending',
+        row,
+      });
+      expect(await store.transitionPending({ row, event: begin() })).toEqual({
+        action: 'updated',
+        row: next,
+      });
+      expect(await store.transitionPending({ row, event: begin() })).toEqual({
+        action: 'hold',
+      });
+    } finally {
+      try {
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+    }
+  });
+  it('holds missing or mismatched full expected snapshots without altering pending', async () => {
+    const row = pending();
+    expect(await store.transitionPending({ row, event: begin() })).toEqual({
+      action: 'hold',
+    });
+    expect(await store.readByDecision(decisionId)).toEqual({
+      action: 'missing',
+    });
+    expect(await store.insertPending(row)).toEqual({ action: 'inserted', row });
+    for (const changed of [
+      { ...row, senderId: 'other' },
+      { ...row, branchId: row.branchId.trim() },
+      {
+        ...row,
+        resolvedAt: '2026-09-25T09:00:00.000Z',
+        applyBefore: '2026-09-26T09:00:00.000Z',
+      },
+    ]) {
+      expect(
+        await store.transitionPending({ row: changed, event: begin() }),
+      ).toEqual({ action: 'hold' });
+      expect(await store.readByDecision(decisionId)).toEqual({
+        action: 'foundPending',
+        row,
+      });
+    }
+    const reordered = Object.fromEntries(Object.entries(row).reverse());
+    expect(
+      await store.transitionPending({ row: reordered, event: begin() }),
+    ).toEqual({
+      action: 'updated',
+      row: {
+        ...row,
+        state: 'SEND_STARTED',
+        sendToken: begin().sendToken,
+        attemptedAt: begin().attemptedAt,
+      },
+    });
   });
 
   it('round-trips an exact pending snapshot and replays reordered JSON keys', async () => {
