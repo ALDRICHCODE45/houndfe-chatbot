@@ -8,6 +8,7 @@ import type {
   ExpirationApplicationAckWrite,
   ExpirationApplicationAcceptance,
   ExpirationApplicationInsert,
+  ExpirationApplicationOutcomeRead,
   ExpirationApplicationPendingRow,
   ExpirationApplicationRead,
   ExpirationApplicationTransition,
@@ -16,6 +17,8 @@ import type {
 const COLUMNS =
   'decision_id, source_request_id, attempt_id, sender_id, branch_id, row_data';
 const READ = `SELECT ${COLUMNS} FROM expiration_application_ledger WHERE decision_id = $1`;
+// The boolean separates SQL NULL (absent) from JSON null (corrupt evidence).
+const READ_OUTCOME = `SELECT ${COLUMNS}, ack_receipt, ack_receipt IS NULL AS ack_absent FROM expiration_application_ledger WHERE decision_id = $1`;
 /** Conflict-safe local insert only: an existing row is never updated or
  * overwritten, and an empty RETURNING triggers at most one conflict read. */
 const INSERT = `INSERT INTO expiration_application_ledger (${COLUMNS})
@@ -90,7 +93,7 @@ function same(
   );
 }
 
-/** Unwired pending read/insert, begin-send, acceptance and ACK CAS. One SELECT,
+/** Unwired pending/outcome reads, insert, begin-send, acceptance and ACK CAS. One SELECT,
  * conflict-safe INSERT with at most one conflict read, or one exact-row UPDATE.
  * Corrupt stored rows hold while inconsistent driver results throw.
  * CAS does not own an outer transaction or revalidate reservation/current time.
@@ -99,6 +102,38 @@ function same(
  * error implies a rollback or retry (the write may already have committed). */
 export class PostgresExpirationApplicationLedgerStore {
   constructor(private readonly pool: Pick<Pool, 'query'>) {}
+
+  async readOutcomeByDecision(
+    decisionId: string,
+  ): Promise<ExpirationApplicationOutcomeRead> {
+    if (typeof decisionId !== 'string' || !UUID.test(decisionId)) return HOLD;
+    const raw = single(await this.pool.query(READ_OUTCOME, [decisionId]));
+    if (raw === null) return Object.freeze({ action: 'missing' });
+    const row = normalizeExpirationApplicationLedgerRow(raw.row_data);
+    if (
+      !row ||
+      (row.state !== 'PROVIDER_ACCEPTED' &&
+        row.state !== 'PROVIDER_ACCEPTED_LATE' &&
+        row.state !== 'STALE') ||
+      row.decisionId !== decisionId ||
+      raw.decision_id !== row.decisionId ||
+      raw.source_request_id !== row.sourceRequestId ||
+      raw.attempt_id !== row.attemptId ||
+      raw.sender_id !== row.senderId ||
+      raw.branch_id !== row.branchId
+    )
+      return HOLD;
+    if (raw.ack_absent === true && raw.ack_receipt === null)
+      return Object.freeze({ action: 'foundOutcome', row, receipt: null });
+    if (raw.ack_absent !== false) return HOLD;
+    const binding = bindExpirationApplicationOutcomeAck(row, raw.ack_receipt);
+    if (binding.action !== 'bound') return HOLD;
+    return Object.freeze({
+      action: 'foundOutcome',
+      row: binding.expected,
+      receipt: binding.receipt,
+    });
+  }
 
   async recordOutcomeAck(
     row: unknown,

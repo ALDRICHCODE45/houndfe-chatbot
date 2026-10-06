@@ -57,7 +57,25 @@ export type ExpirationApplicationAckWrite =
     }>
   | Readonly<{ action: 'hold' }>;
 
+/** One detached terminal observation, not provenance, a lock or permission to
+ * resend/close. receipt=null means SQL NULL, not malformed/missing ACK data. */
+export type ExpirationApplicationOutcomeRead =
+  | Readonly<{ action: 'missing' | 'hold' }>
+  | Readonly<{
+      action: 'foundOutcome';
+      row: BoundAck['expected'];
+      receipt: BoundAck['receipt'] | null;
+    }>;
+
 export interface ExpirationApplicationLedgerPort {
+  /** Dedicated one-SELECT terminal/ACK read, leaving pending-only reads intact.
+   * Exact identity and evidence required; pending/started/corrupt data hold.
+   * Errors propagate without retry. Reads on a supplied transaction client do
+   * not prove its COMMIT. Caller still owns sender/branch/reservation binding,
+   * HTTP provenance and no-send history; LATE never permits automatic closure. */
+  readOutcomeByDecision(
+    decisionId: string,
+  ): Promise<ExpirationApplicationOutcomeRead>;
   /** One exact terminal-row CAS into an absent ACK slot, using trusted response
    * evidence. Invalid input holds before SQL. Zero rows, including identical
    * replay, hold without reread/retry. SQL/inconsistent-result failures propagate;
