@@ -87,6 +87,9 @@ const configuration = () => ({
     // Anything else (unset, 'false', a typo, upper-case, '1') stays false, so
     // there is no ambiguous activation. No consumer reads this yet.
     restockEnabled: process.env.HUMAN_DECISIONS_RESTOCK_ENABLED === 'true',
+    // Independent default-off customer evidence gate; never send permission.
+    customerInboundEnabled:
+      process.env.HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED === 'true',
   },
   receiptMedia: {
     enabled: process.env.RECEIPT_MEDIA_ENABLED === 'true',

@@ -59,7 +59,10 @@ export class SignatureGuard implements CanActivate {
       throw new UnauthorizedException('Invalid X-Hub-Signature-256 header');
     }
 
-    if (this.configService.get('humanDecisions.restockEnabled') === true) {
+    if (
+      this.configService.get('humanDecisions.restockEnabled') === true ||
+      this.configService.get('humanDecisions.customerInboundEnabled') === true
+    ) {
       verifiedSnapshots.set(
         request,
         Object.freeze({

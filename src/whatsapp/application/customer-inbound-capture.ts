@@ -38,7 +38,7 @@ function record(value: unknown): value is Record<string, unknown> {
  * Requires trusted configuration/predicates; never validates message content.
  * Prepared metadata is not a capability, durable evidence, latestness or send
  * permission. A future persister must call this with the actual request itself.
- * The guard currently exposes snapshots only when RESTOCK is enabled.
+ * The guard exposes snapshots when RESTOCK or customer inbound is enabled.
  */
 export function prepareCustomerInboundObservations(
   request: unknown,

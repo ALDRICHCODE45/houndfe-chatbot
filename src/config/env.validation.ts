@@ -308,6 +308,11 @@ const innerEnvValidationSchema = Joi.object({
     .valid('true', 'false')
     .default('false'),
 
+  // Independent opt-in for authenticated customer inbound evidence.
+  HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('false'),
+
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),
   DB_POOL_MAX: Joi.number().integer().min(1).default(5),
