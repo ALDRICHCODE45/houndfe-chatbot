@@ -1,7 +1,9 @@
 import type { PostgresExpirationRecoveryDiscoveryStore } from '../infrastructure/postgres-expiration-recovery-discovery.store';
 import type { PostgresExpirationApplicationPreparationStore } from '../infrastructure/postgres-expiration-application-preparation.store';
+import type { ExpirationApplicationLedgerPort } from '../domain/expiration-application-ledger.port';
 import type { ExpirationExistingDecisionService } from './expiration-existing-decision.service';
 import type { ExpirationDeliveryService } from './expiration-delivery.service';
+import type { ExpirationApplicationOutcomeCoordinator } from './expiration-application-outcome-coordinator';
 import { createExpirationPreparationCandidate } from './expiration-preparation-candidate';
 
 /** One inquiry per five seconds bounds backend GET load. Completed sweeps wrap
@@ -9,7 +11,10 @@ import { createExpirationPreparationCandidate } from './expiration-preparation-c
  * begins a fresh database sweep, not a replay of a volatile job queue.
  * Preparation must report `prepared` before this loop offers the candidate to
  * the delivery boundary; that boundary still owns claim/send/acceptance, and
- * the loop never marks stale or ACKs. `deliver` is optional so a prep-only
+ * the loop never marks stale or ACKs. A durable terminal read happens BEFORE
+ * any prepare/send: an already accepted ledger row is routed to the outcome
+ * coordinator for report/ACK/close without resending, while STALE holds and
+ * nothing is sent. `deliver` and the recovery pair are optional so a prep-only
  * composition stays compatible. */
 export class ExpirationRecoveryPoller {
   private cursor: string | null = null;
@@ -33,6 +38,14 @@ export class ExpirationRecoveryPoller {
     >,
     private readonly clock: () => Date = () => new Date(),
     private readonly delivery?: Pick<ExpirationDeliveryService, 'deliverOnce'>,
+    private readonly outcomes?: Pick<
+      ExpirationApplicationLedgerPort,
+      'readOutcomeByDecision'
+    >,
+    private readonly coordinator?: Pick<
+      ExpirationApplicationOutcomeCoordinator,
+      'finishOnce'
+    >,
   ) {}
 
   start(): void {
@@ -81,6 +94,23 @@ export class ExpirationRecoveryPoller {
           outcome.binding.reservation.requestKey !== hint.requestKey
         )
           continue;
+        if (this.outcomes && this.coordinator) {
+          const terminal = await this.outcomes.readOutcomeByDecision(
+            outcome.binding.backendDecisionId,
+          );
+          if (this.stopped) return;
+          if (terminal.action === 'foundOutcome') {
+            if (terminal.row.state === 'STALE') continue;
+            const recovery = createExpirationPreparationCandidate(
+              hint.senderId,
+              outcome,
+              terminal.row.attemptedAt,
+            );
+            if (recovery.action === 'candidate')
+              await this.coordinator.finishOnce(recovery, terminal.row);
+            continue;
+          }
+        }
         const candidate = createExpirationPreparationCandidate(
           hint.senderId,
           outcome,
@@ -88,8 +118,15 @@ export class ExpirationRecoveryPoller {
         );
         if (candidate.action === 'candidate') {
           const prepared = await this.preparation.preparePending(candidate);
-          if (!this.stopped && prepared.action === 'prepared')
-            await this.delivery?.deliverOnce(candidate);
+          if (!this.stopped && prepared.action === 'prepared') {
+            const delivered = await this.delivery?.deliverOnce(candidate);
+            if (
+              !this.stopped &&
+              delivered?.action === 'accepted' &&
+              this.coordinator
+            )
+              await this.coordinator.finishOnce(candidate, delivered.row);
+          }
         }
       }
     } catch {

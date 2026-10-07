@@ -5,6 +5,7 @@ import type { WhatsappSenderPort } from '../whatsapp/domain/whatsapp-sender.port
 import { ExpirationPreparationRuntime } from './expiration-preparation.runtime';
 import { ExpirationRecoveryPoller } from './application/expiration-recovery-poller';
 import { ExpirationExistingDecisionService } from './application/expiration-existing-decision.service';
+import { ExpirationApplicationOutcomeCoordinator } from './application/expiration-application-outcome-coordinator';
 import {
   normalizeExpirationApplicationLedgerRow,
   type ExpirationApplicationLedgerRow,
@@ -14,6 +15,8 @@ import { PostgresExpirationRecoveryDiscoveryStore } from './infrastructure/postg
 import { PostgresExpirationApplicationPreparationStore } from './infrastructure/postgres-expiration-application-preparation.store';
 import { PostgresExpirationApplicationClaimStore } from './infrastructure/postgres-expiration-application-claim.store';
 import { PostgresExpirationApplicationLedgerStore } from './infrastructure/postgres-expiration-application-ledger.store';
+import { PostgresExpirationApplicationContextStore } from './infrastructure/postgres-expiration-application-context.store';
+import { PostgresExpirationApplicationCompletionStore } from './infrastructure/postgres-expiration-application-completion.store';
 import { PostgresCustomerInboundObservationStore } from './infrastructure/postgres-customer-inbound-observation.store';
 
 const senderId = 'customer';
@@ -152,7 +155,46 @@ function compose() {
         providerAcceptedObservedAt: now,
       }),
     });
-  return { discovery, decisions, preparation, claim, latest, acceptance };
+  const context = jest
+    .spyOn(
+      PostgresExpirationApplicationContextStore.prototype,
+      'readRecordedForSender',
+    )
+    .mockResolvedValue({ action: 'hold' });
+  const terminal = jest
+    .spyOn(
+      PostgresExpirationApplicationLedgerStore.prototype,
+      'readOutcomeByDecision',
+    )
+    .mockResolvedValue({ action: 'missing' });
+  const recordAck = jest
+    .spyOn(
+      PostgresExpirationApplicationLedgerStore.prototype,
+      'recordOutcomeAck',
+    )
+    .mockResolvedValue({ action: 'hold' });
+  const completion = jest
+    .spyOn(
+      PostgresExpirationApplicationCompletionStore.prototype,
+      'closeAcknowledged',
+    )
+    .mockResolvedValue({ action: 'hold' });
+  const finish = jest
+    .spyOn(ExpirationApplicationOutcomeCoordinator.prototype, 'finishOnce')
+    .mockResolvedValue({ action: 'closed' });
+  return {
+    discovery,
+    decisions,
+    preparation,
+    claim,
+    latest,
+    acceptance,
+    context,
+    terminal,
+    recordAck,
+    completion,
+    finish,
+  };
 }
 
 describe('ExpirationPreparationRuntime', () => {
@@ -165,6 +207,9 @@ describe('ExpirationPreparationRuntime', () => {
     branch: unknown = branchId,
     phoneValue: unknown = phone,
     sender: Pick<WhatsappSenderPort, 'sendText'> = { sendText: jest.fn() },
+    client: ChatbotApiClient = {
+      recordRestockApplicationOutcome: jest.fn(),
+    } as unknown as ChatbotApiClient,
   ) {
     const config = {
       get: (key: string) =>
@@ -174,12 +219,7 @@ describe('ExpirationPreparationRuntime', () => {
             ? phoneValue
             : branch,
     } as ConfigService;
-    return new ExpirationPreparationRuntime(
-      config,
-      {} as Pool,
-      {} as ChatbotApiClient,
-      sender,
-    );
+    return new ExpirationPreparationRuntime(config, {} as Pool, client, sender);
   }
   it.each([false, undefined, 'true'])(
     'does not start with gate %s',
@@ -260,6 +300,72 @@ describe('ExpirationPreparationRuntime', () => {
     expect(message.to).toBe(senderId);
     expect(message.text).toContain('Original food');
     expect(spies.acceptance).toHaveBeenCalledTimes(1);
+    await runtime.onModuleDestroy();
+  });
+  it('wires the real outcome coordinator with bound ports and recovers a terminal row without resending', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date(now));
+    const spies = compose();
+    spies.terminal.mockResolvedValue({
+      action: 'foundOutcome',
+      row: fixture('PROVIDER_ACCEPTED', {
+        ...startedExtras,
+        providerMessageId: 'wamid.accepted',
+        providerAcceptedObservedAt: now,
+      }),
+      receipt: null,
+    });
+    type Internals = {
+      ports: Record<string, (...args: unknown[]) => unknown>;
+      branchId: string;
+    };
+    let coordinator!: Internals;
+    spies.finish.mockImplementation(function (
+      this: ExpirationApplicationOutcomeCoordinator,
+    ) {
+      coordinator = this as unknown as Internals;
+      return Promise.resolve({ action: 'closed' });
+    });
+    const record = jest.fn();
+    const client = {
+      recordRestockApplicationOutcome: record,
+    } as unknown as ChatbotApiClient;
+    const sender = { sendText: jest.fn() };
+    const runtime = build(true, branchId, phone, sender, client);
+    runtime.onApplicationBootstrap();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(coordinator.branchId).toBe(branchId);
+    expect(spies.finish).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'candidate' }),
+      expect.objectContaining({ state: 'PROVIDER_ACCEPTED' }),
+    );
+    expect(spies.preparation).not.toHaveBeenCalled();
+    expect(spies.claim).not.toHaveBeenCalled();
+    expect(spies.acceptance).not.toHaveBeenCalled();
+    expect(sender.sendText).not.toHaveBeenCalled();
+    const args = [senderId, sourceRequestId];
+    for (const name of [
+      'readRecordedForSender',
+      'readOutcomeByDecision',
+      'recordOutcomeAck',
+      'recordRestockApplicationOutcome',
+      'closeAcknowledged',
+    ])
+      await coordinator.ports[name](...args);
+    expect(spies.context.mock.contexts[0]).toBeInstanceOf(
+      PostgresExpirationApplicationContextStore,
+    );
+    expect(spies.terminal.mock.contexts[0]).toBeInstanceOf(
+      PostgresExpirationApplicationLedgerStore,
+    );
+    expect(spies.recordAck.mock.contexts[0]).toBe(
+      spies.terminal.mock.contexts[0],
+    );
+    expect(spies.completion.mock.contexts[0]).toBeInstanceOf(
+      PostgresExpirationApplicationCompletionStore,
+    );
+    expect(spies.completion.mock.contexts[0]).toMatchObject({ branchId });
+    expect(record.mock.contexts[0]).toBe(client);
     await runtime.onModuleDestroy();
   });
 });

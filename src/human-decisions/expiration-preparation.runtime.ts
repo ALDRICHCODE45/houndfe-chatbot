@@ -18,14 +18,16 @@ import {
 import { ExpirationExistingDecisionService } from './application/expiration-existing-decision.service';
 import { ExpirationRecoveryPoller } from './application/expiration-recovery-poller';
 import { ExpirationDeliveryService } from './application/expiration-delivery.service';
+import { ExpirationApplicationOutcomeCoordinator } from './application/expiration-application-outcome-coordinator';
 import { PostgresExpirationApplicationContextStore } from './infrastructure/postgres-expiration-application-context.store';
+import { PostgresExpirationApplicationCompletionStore } from './infrastructure/postgres-expiration-application-completion.store';
 import { PostgresExpirationApplicationPreparationStore } from './infrastructure/postgres-expiration-application-preparation.store';
 import { PostgresExpirationApplicationClaimStore } from './infrastructure/postgres-expiration-application-claim.store';
 import { PostgresExpirationApplicationLedgerStore } from './infrastructure/postgres-expiration-application-ledger.store';
 import { PostgresCustomerInboundObservationStore } from './infrastructure/postgres-customer-inbound-observation.store';
 import { PostgresExpirationRecoveryDiscoveryStore } from './infrastructure/postgres-expiration-recovery-discovery.store';
 
-/** Default-off preparation/send runtime; capture and sending share Meta phone identity. */
+/** Default-off preparation/send/outcome runtime; capture and sending share Meta phone identity. */
 @Injectable()
 export class ExpirationPreparationRuntime
   implements OnApplicationBootstrap, OnModuleDestroy
@@ -63,6 +65,22 @@ export class ExpirationPreparationRuntime
       clock,
     );
     const ledger = new PostgresExpirationApplicationLedgerStore(this.pool);
+    const context = new PostgresExpirationApplicationContextStore(this.pool);
+    const completion = new PostgresExpirationApplicationCompletionStore(
+      this.pool,
+      branch,
+    );
+    const coordinator = new ExpirationApplicationOutcomeCoordinator(
+      {
+        readRecordedForSender: context.readRecordedForSender.bind(context),
+        readOutcomeByDecision: ledger.readOutcomeByDecision.bind(ledger),
+        recordOutcomeAck: ledger.recordOutcomeAck.bind(ledger),
+        recordRestockApplicationOutcome:
+          this.client.recordRestockApplicationOutcome.bind(this.client),
+        closeAcknowledged: completion.closeAcknowledged.bind(completion),
+      },
+      branch,
+    );
     const inbound = new PostgresCustomerInboundObservationStore(this.pool);
     const delivery = new ExpirationDeliveryService(
       {
@@ -77,11 +95,7 @@ export class ExpirationPreparationRuntime
     );
     this.poller = new ExpirationRecoveryPoller(
       new PostgresExpirationRecoveryDiscoveryStore(this.pool),
-      new ExpirationExistingDecisionService(
-        new PostgresExpirationApplicationContextStore(this.pool),
-        this.client,
-        branch,
-      ),
+      new ExpirationExistingDecisionService(context, this.client, branch),
       new PostgresExpirationApplicationPreparationStore(
         this.pool,
         branch,
@@ -89,6 +103,8 @@ export class ExpirationPreparationRuntime
       ),
       clock,
       delivery,
+      ledger,
+      coordinator,
     );
     this.poller.start();
   }

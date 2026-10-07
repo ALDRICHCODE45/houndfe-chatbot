@@ -4,7 +4,11 @@ import * as candidates from './expiration-preparation-candidate';
 const hint = { senderId: 'customer', requestKey: 'original' };
 const resolvedOutcome = {
   outcome: 'resolved' as const,
-  binding: { reservation: { requestKey: hint.requestKey } },
+  decision: { resolution: { resolvedAt: '2026-06-23T08:00:00.000Z' } },
+  binding: {
+    backendDecisionId: 'decision',
+    reservation: { requestKey: hint.requestKey },
+  },
 };
 const candidate = {
   action: 'candidate',
@@ -27,7 +31,13 @@ const page = (nextCursor: string | null = null) => ({
   hints: [hint],
   nextCursor,
 });
-function setup(delivery?: { deliverOnce: jest.Mock }) {
+function setup(
+  delivery?: { deliverOnce: jest.Mock },
+  recovery?: {
+    outcomes?: { readOutcomeByDecision: jest.Mock };
+    coordinator?: { finishOnce: jest.Mock };
+  },
+) {
   const discovery = {
     discoverRecordedHints: jest.fn().mockResolvedValue(page()),
   };
@@ -40,14 +50,48 @@ function setup(delivery?: { deliverOnce: jest.Mock }) {
   const preparation = {
     preparePending: jest.fn().mockResolvedValue({ action: 'hold' }),
   };
+  const outcomes = recovery?.outcomes ?? {
+    readOutcomeByDecision: jest.fn().mockResolvedValue({ action: 'missing' }),
+  };
+  const coordinator = recovery?.coordinator ?? { finishOnce: jest.fn() };
   const poller = new ExpirationRecoveryPoller(
     discovery,
     decisions,
     preparation,
     undefined,
     delivery,
+    outcomes,
+    coordinator,
   );
-  return { discovery, decisions, preparation, delivery, poller };
+  return {
+    discovery,
+    decisions,
+    preparation,
+    delivery,
+    outcomes,
+    coordinator,
+    poller,
+  };
+}
+
+const acceptedRow = {
+  state: 'PROVIDER_ACCEPTED' as const,
+  attemptedAt: '2026-06-23T08:30:00.000Z',
+};
+function terminalRecovery(outcome = { action: 'closed' }): {
+  outcomes: { readOutcomeByDecision: jest.Mock };
+  coordinator: { finishOnce: jest.Mock };
+} {
+  return {
+    outcomes: {
+      readOutcomeByDecision: jest.fn().mockResolvedValue({
+        action: 'foundOutcome',
+        row: acceptedRow,
+        receipt: null,
+      }),
+    },
+    coordinator: { finishOnce: jest.fn().mockResolvedValue(outcome) },
+  };
 }
 
 describe('ExpirationRecoveryPoller', () => {
@@ -167,6 +211,127 @@ describe('ExpirationRecoveryPoller', () => {
     await jest.advanceTimersByTimeAsync(5_000);
     expect(delivery.deliverOnce).toHaveBeenCalledTimes(2);
     await h.poller.stop();
+  });
+
+  it('routes a persisted terminal row to the coordinator without preparing or sending', async () => {
+    const recovery = terminalRecovery();
+    const h = setup({ deliverOnce: jest.fn() }, recovery);
+    armResolved(h);
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(recovery.outcomes.readOutcomeByDecision).toHaveBeenCalledWith(
+      resolvedOutcome.binding.backendDecisionId,
+    );
+    expect(recovery.coordinator.finishOnce).toHaveBeenCalledWith(
+      candidate,
+      acceptedRow,
+    );
+    expect(h.preparation.preparePending).not.toHaveBeenCalled();
+    expect(h.delivery?.deliverOnce).not.toHaveBeenCalled();
+    await h.poller.stop();
+  });
+
+  it('holds a persisted STALE row without reporting, preparing or sending', async () => {
+    const recovery = terminalRecovery();
+    recovery.outcomes.readOutcomeByDecision.mockResolvedValue({
+      action: 'foundOutcome',
+      row: { state: 'STALE' },
+      receipt: null,
+    });
+    const h = setup({ deliverOnce: jest.fn() }, recovery);
+    armResolved(h);
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(recovery.coordinator.finishOnce).not.toHaveBeenCalled();
+    expect(h.preparation.preparePending).not.toHaveBeenCalled();
+    expect(h.delivery?.deliverOnce).not.toHaveBeenCalled();
+    await h.poller.stop();
+  });
+
+  it('recovers a terminal row with the historical attempt time, not the current clock', async () => {
+    const recovery = terminalRecovery();
+    const h = setup(undefined, recovery);
+    h.decisions.readExistingDecision.mockResolvedValue(resolvedOutcome);
+    const build = jest
+      .spyOn(candidates, 'createExpirationPreparationCandidate')
+      .mockReturnValue(candidate);
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(build).toHaveBeenCalledWith(
+      hint.senderId,
+      resolvedOutcome,
+      acceptedRow.attemptedAt,
+    );
+    expect(recovery.coordinator.finishOnce).toHaveBeenCalledTimes(1);
+    await h.poller.stop();
+  });
+
+  it('prepares and delivers when no durable terminal row exists', async () => {
+    const h = deliverySetup();
+    const delivery = armResolved(h);
+    h.preparation.preparePending.mockResolvedValue({
+      action: 'prepared',
+      row: {},
+    });
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.outcomes.readOutcomeByDecision).toHaveBeenCalledTimes(1);
+    expect(h.preparation.preparePending).toHaveBeenCalledWith(candidate);
+    expect(delivery.deliverOnce).toHaveBeenCalledWith(candidate);
+    expect(h.coordinator.finishOnce).not.toHaveBeenCalled();
+    await h.poller.stop();
+  });
+
+  it('routes a newly accepted delivery row to the coordinator', async () => {
+    const h = deliverySetup();
+    const delivery = armResolved(h);
+    delivery.deliverOnce.mockResolvedValue({
+      action: 'accepted',
+      row: acceptedRow,
+    });
+    h.preparation.preparePending.mockResolvedValue({
+      action: 'prepared',
+      row: {},
+    });
+    h.coordinator.finishOnce.mockResolvedValue({ action: 'closed' });
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.coordinator.finishOnce).toHaveBeenCalledWith(
+      candidate,
+      acceptedRow,
+    );
+    await h.poller.stop();
+  });
+
+  it('revisits an unreported terminal row next sweep without resending', async () => {
+    const recovery = terminalRecovery({ action: 'hold' });
+    const h = setup({ deliverOnce: jest.fn() }, recovery);
+    armResolved(h);
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(10_000);
+    expect(recovery.coordinator.finishOnce).toHaveBeenCalledTimes(2);
+    expect(h.preparation.preparePending).not.toHaveBeenCalled();
+    expect(h.delivery?.deliverOnce).not.toHaveBeenCalled();
+    await h.poller.stop();
+  });
+
+  it('does not report a terminal row when stopped after the terminal read', async () => {
+    const recovery = terminalRecovery();
+    const h = setup(undefined, recovery);
+    armResolved(h);
+    let release!: (value: unknown) => void;
+    recovery.outcomes.readOutcomeByDecision.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    const stopping = h.poller.stop();
+    release({ action: 'foundOutcome', row: acceptedRow, receipt: null });
+    await stopping;
+    expect(recovery.coordinator.finishOnce).not.toHaveBeenCalled();
   });
 
   it('never delivers when preparation holds or is absent', async () => {

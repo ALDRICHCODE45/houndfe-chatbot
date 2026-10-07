@@ -1,6 +1,6 @@
 # EXPIRATION runtime — default-off intake
 
-Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 pending.** Business/wire rules remain authoritative in
+Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery wired; STALE provenance and deployment rehearsal pending.** Business/wire rules remain authoritative in
 `docs/human-decisions-expiration-v1.md`. E1 is split into two units:
 
 - **E1a (this unit):** the default-off callee — one cohesive service plus the
@@ -80,3 +80,38 @@ runtime reads it at the enabled gate and refuses to start an enabled poller
 without a non-blank identity, while the disabled path performs no new work or
 validation. Acceptance stays local evidence, not device delivery; E4 owns
 backend reporting and ACK.
+
+## E4 terminal outcome/ACK recovery (default-off)
+
+Every sweep performs a **durable terminal read before any preparation or send**.
+An existing `PROVIDER_ACCEPTED`/`PROVIDER_ACCEPTED_LATE` row is routed with the
+trusted original candidate to `ExpirationApplicationOutcomeCoordinator.finishOnce`,
+which revalidates the candidate/row, rereads the recorded context and durable row,
+then reports the outcome, writes the ACK and closes through
+`PostgresExpirationApplicationCompletionStore` under its durable locks. A
+restarted process therefore finishes reporting/ACK/closure without resending.
+`PENDING_DELIVERY` and `SEND_STARTED` are non-terminal and fall through to the
+unchanged prepare/claim/send path; an already-started row is never re-sent.
+`STALE` short-circuits before any candidate or coordinator call.
+
+Recovery uses the accepted row's historical in-window `attemptedAt` instead of
+the current clock, so a restart after the 24h window still reaches the
+coordinator; the send boundary still samples its own fresh clock, so this is not
+send authority. A freshly `accepted` row with no prior terminal is handed to the
+same coordinator. An uncertain report/ACK/closure only returns `hold` and the
+durable row stays, so later sweeps re-invoke `finishOnce` without resending. The
+runtime composes the real coordinator with bound ports sharing the same pool,
+branch and `meta.phoneNumberId`.
+
+### Limits / remaining readiness
+
+- **`STALE` is held, not resolved.** Without no-send history proof an existing
+  `STALE` row is never reported or closed; full no-send handling, `STALE`
+  provenance remain unimplemented. `PROVIDER_ACCEPTED_LATE` never auto-closes.
+- **Conditional replay/closure is not proven end-to-end.** Ledger/report
+  idempotency and the completion store `COMMIT` path were not exercised against
+  a live database; only focused fake-port tests ran.
+- **Owner-run manual rehearsal is still required before activation.** On a
+  disposable branch confirm discovery → preparation → send → acceptance →
+  report/ACK → closure, then restart mid-outcome and confirm the next sweep
+  resumes reporting without resend; deployment/activation/commits stay manual.
