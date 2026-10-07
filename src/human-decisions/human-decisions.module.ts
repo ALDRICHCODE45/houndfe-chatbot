@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { RestockApplicationRuntime } from './restock-application.runtime';
+import { ExpirationPreparationRuntime } from './expiration-preparation.runtime';
 import { ExpirationPostOrchestrator } from './application/expiration-post-orchestrator.service';
 import { PostgresExpirationPostClaimStore } from './infrastructure/postgres-expiration-post-claim.store';
 import {
@@ -53,8 +54,8 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
  *
  * Imports `DatabaseModule` for `PG_POOL` and `ChatbotApiModule` for
  * `CHATBOT_API_CLIENT`; the acyclic sender leaf supplies outbound delivery.
- * Init stays idle. Only strict `restockEnabled === true` starts the private
- * runtime; fresh receipt hints schedule bounded application polling.
+ * Strict route flags gate the private runtimes. RESTOCK uses receipt hints;
+ * EXPIRATION sweeps recorded inquiries for preparation only (no send/ACK).
  * Shared reservation guards remain available independently of that flag.
  */
 @Module({
@@ -66,6 +67,7 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
   ],
   providers: [
     RestockApplicationRuntime,
+    ExpirationPreparationRuntime,
     {
       provide: SHARED_RESERVATION,
       useClass: PostgresSharedReservationStore,
