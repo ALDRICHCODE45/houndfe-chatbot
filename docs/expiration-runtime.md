@@ -1,6 +1,6 @@
 # EXPIRATION runtime — default-off intake
 
-Status: **E1b intake connected, not activated; E2–E4 pending.** Business/wire rules remain authoritative in
+Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary dormant, not wired; E4 pending.** Business/wire rules remain authoritative in
 `docs/human-decisions-expiration-v1.md`. E1 is split into two units:
 
 - **E1a (this unit):** the default-off callee — one cohesive service plus the
@@ -54,3 +54,19 @@ The original request key must still match before validated preparation; the stor
 rechecks locked context. Shutdown drains in-flight work before returning.
 This loop never sends, marks stale, or ACKs; E3/E4 remain required before activation.
 Throughput is bounded per process, not a global credential-rate guarantee.
+
+## E3 send boundary (dormant, not complete)
+
+`ExpirationDeliveryService` is the unwired send boundary. It prepares the
+historical copy **before** claiming (an unusable copy consumes no claim), then
+claims via the existing ledger store: `SEND_STARTED` is a local claim, not send
+authority. At the boundary it re-reads the latest authenticated inbound
+(`readLatest`) and samples a fresh caller clock after every await, and
+`classifyExpirationPreSend` gates the send: a stale WhatsApp or human window,
+missing inbound or mismatch holds without sending. Exactly one send is
+attempted; only a definite provider acceptance is recorded immediately, using
+the started row's exact attempt/token bytes and a fresh observation time
+(`recordAcceptance`). Acceptance is local evidence, not device delivery. A
+thrown or ambiguous send/acceptance holds and is never retried. Backend outcome
+reporting and ACK remain E4. The runtime and poller stay preparation-only and
+default-off, so E3 is **not** complete: wiring and E4 are still required.
