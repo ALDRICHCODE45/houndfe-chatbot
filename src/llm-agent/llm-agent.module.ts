@@ -22,6 +22,11 @@ import {
   SHARED_ROUTE_MARKERS,
   type SharedRouteMarkersPort,
 } from '../human-decisions/domain/shared-route-markers';
+import {
+  SHARED_RESERVATION,
+  type SharedReservationPort,
+} from '../human-decisions/domain/shared-reservation';
+import { ExpirationPostOrchestrator } from '../human-decisions/application/expiration-post-orchestrator.service';
 import { HumanDecisionsModule } from '../human-decisions/human-decisions.module';
 import { RestockApplicationRuntime } from '../human-decisions/restock-application.runtime';
 import { SaleFlowModule } from '../sale-flow/sale-flow.module';
@@ -29,6 +34,7 @@ import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry
 import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
+import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
 import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
@@ -159,6 +165,29 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     },
     MinimalCatalogAgentService,
     {
+      provide: MinimalExpirationRequestService,
+      inject: [
+        CHATBOT_API_CLIENT,
+        SHARED_RESERVATION,
+        ExpirationPostOrchestrator,
+        ConfigService,
+      ],
+      useFactory: (
+        chatbotApi: ChatbotApiClient,
+        reservations: SharedReservationPort,
+        orchestrator: ExpirationPostOrchestrator,
+        config: ConfigService,
+      ) =>
+        new MinimalExpirationRequestService({
+          chatbotApi,
+          reservations,
+          orchestrator,
+          enabled:
+            config.get<{ expirationEnabled: boolean }>('minimalCatalogAgent')
+              ?.expirationEnabled === true,
+        }),
+    },
+    {
       // WU-B: the RESTOCK confirmation gate. The capability is built ONLY when
       // `humanDecisions.restockEnabled` is exactly true; otherwise it is
       // `undefined` and the read-only route stays byte-identical.
@@ -203,6 +232,7 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     CostGuardService,
     MinimalCatalogAgentService,
     MinimalRestockRequestService,
+    MinimalExpirationRequestService,
   ],
 })
 export class LlmAgentModule {}

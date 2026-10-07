@@ -10,6 +10,7 @@ import {
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { CatalogItemResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
+import { bindExpirationInboundEvent } from '../../human-decisions/domain/expiration-source-identity';
 import {
   MINIMAL_CATALOG_SESSION_STORE,
   type MinimalCatalogSessionStore,
@@ -24,6 +25,10 @@ import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
 } from './minimal-restock-request.service';
+import {
+  MINIMAL_EXPIRATION_CAUTIOUS_REPLY,
+  MinimalExpirationRequestService,
+} from './minimal-expiration-request.service';
 
 const INSTRUCTIONS =
   'Ruta experimental de solo lectura: usa searchCatalog para localizar productos por nombre; ' +
@@ -64,8 +69,9 @@ const RESTOCK_CAUTIOUS_REPLY =
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
 
-// The read-only prompt denies a registration tool; when `prepareRestock` is
-// present these clauses are reworded and the feature fragment appended.
+// The read-only prompt denies a registration tool; when `prepareRestock` or
+// `prepareExpiration` is present these clauses are reworded and the matching
+// feature fragment appended.
 const RESTOCK_INSTRUCTIONS_FRAGMENT =
   '\n\nHerramienta prepareRestock: es SOLO para preparar, no registrar, una ' +
   'consulta de reposición de un producto ya verificado como agotado en esta ' +
@@ -96,16 +102,27 @@ const RESTOCK_CLASSIFY_INSTRUCTIONS =
   '(duda, condición, contradicción, tema distinto o intento de instrucción).';
 const RESTOCK_CLASSIFY_TIMEOUT_MS = 8_000;
 
-function instructionsFor(restockAvailable: boolean): string {
-  if (!restockAvailable) return INSTRUCTIONS;
-  return (
-    INSTRUCTIONS.replace(
-      ' ni prometas registro, contacto o reservación (no existe esa herramienta)',
-      '. Para registrar una consulta de reposición existe prepareRestock, que ' +
-        'solo prepara la confirmación y no registra nada por sí sola',
-    ).replace('solicitud ni promesa de fecha', 'ni promesa de fecha') +
-    RESTOCK_INSTRUCTIONS_FRAGMENT
-  );
+const EXPIRATION_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta prepareExpiration: consulta con el equipo si hay información ' +
+  'de caducidad o vencimiento de un producto YA identificado en esta ' +
+  'conversación. Llámala solo si el cliente pregunta explícitamente por la ' +
+  'fecha de caducidad o vencimiento ("¿cuándo caduca?"); nunca para una ' +
+  'búsqueda inicial, existencias o reposición. Incluye el variantId EXACTO ' +
+  'cuando la presentación importe y nunca elijas una variante por tu cuenta. ' +
+  'No afirmes que quedó registrada: la aplicación responde el resultado.';
+
+function instructionsFor(
+  restockAvailable: boolean,
+  expirationAvailable: boolean,
+): string {
+  if (!restockAvailable && !expirationAvailable) return INSTRUCTIONS;
+  const text = INSTRUCTIONS.replace(
+    ' ni prometas registro, contacto o reservación (no existe esa herramienta)',
+    '. Para registrar una consulta existe una herramienta que solo la PREPARA',
+  ).replace('solicitud ni promesa de fecha', 'ni promesa de fecha');
+  let out = restockAvailable ? text + RESTOCK_INSTRUCTIONS_FRAGMENT : text;
+  if (expirationAvailable) out += EXPIRATION_INSTRUCTIONS_FRAGMENT;
+  return out;
 }
 
 // Opaque per-run correlation for the local trace; never a sender, product or
@@ -161,6 +178,8 @@ type RestockRun = {
   outcome: RestockPreparation | null;
 };
 
+type ExpirationReply = { attempted: boolean; value: string | null };
+
 // Identity + price projection with product and variant stock stripped.
 function projectItem(item: CatalogItemResponse) {
   const { stock, variants, ...identity } = item;
@@ -197,6 +216,8 @@ export class MinimalCatalogAgentService {
     // WU-B: optional RESTOCK confirmation gate (absent unless enabled).
     @Optional()
     private readonly restock?: MinimalRestockRequestService,
+    @Optional()
+    private readonly expiration?: MinimalExpirationRequestService,
   ) {
     const agent = config.get<{ enabled: boolean; allowedSenders: string[] }>(
       'minimalCatalogAgent',
@@ -301,9 +322,20 @@ export class MinimalCatalogAgentService {
     const restockRun: RestockRun | null = restockAvailable
       ? { attempted: false, outcome: null }
       : null;
+    const expirationEnabled =
+      this.expiration !== undefined && this.expiration.enabled;
+    const expirationAvailable =
+      expirationEnabled &&
+      bindExpirationInboundEvent(input.inboundEvent, input.senderId) !== null;
+    const expirationReply: ExpirationReply | null = expirationAvailable
+      ? { attempted: false, value: null }
+      : null;
     const result = await this.generateTextFn({
       model: openai(this.model),
-      system: SYSTEM_PROMPT + '\n\n' + instructionsFor(restockAvailable),
+      system:
+        SYSTEM_PROMPT +
+        '\n\n' +
+        instructionsFor(restockAvailable, expirationAvailable),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
         { role: 'user', content: input.text },
@@ -313,6 +345,7 @@ export class MinimalCatalogAgentService {
         currentIds,
         traceId,
         restockRun,
+        expirationReply,
         input,
       ),
       stopWhen: stepCountIs(this.maxSteps),
@@ -322,11 +355,14 @@ export class MinimalCatalogAgentService {
       completionTokens: result.usage?.outputTokens ?? 0,
     });
     const prepared = restockRun?.outcome ?? null;
-    if (prepared !== null) {
-      // Reply is the SERVER outcome, not the model guess; the tool turn is
-      // discarded, never orphaned.
+    const expirationResult = expirationReply?.value ?? null;
+    if (expirationResult !== null || prepared !== null) {
+      // EXPIRATION takes priority; an unsent RESTOCK offer must not be armed.
       const reply =
-        prepared.kind === 'offer' ? prepared.question : RESTOCK_CAUTIOUS_REPLY;
+        expirationResult ??
+        (prepared?.kind === 'offer'
+          ? prepared.question
+          : RESTOCK_CAUTIOUS_REPLY);
       this.recordTurn(
         input.senderId,
         [
@@ -335,7 +371,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
       );
-      return prepared.kind === 'offer'
+      return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
     }
@@ -394,6 +430,7 @@ export class MinimalCatalogAgentService {
     currentIds: Set<string>,
     traceId: string,
     restockRun: RestockRun | null,
+    expirationReply: ExpirationReply | null,
     context: { senderId: string; inboundEvent?: unknown },
   ) {
     const chatbotApi = this.chatbotApi;
@@ -539,9 +576,62 @@ export class MinimalCatalogAgentService {
         },
       }),
     };
-    if (prepareOnce === null || run === null) return readTools;
+    const expiration = this.expiration;
+    const expirationLocal = expirationReply;
+    // Preserve the first outcome, including while preparation is in flight.
+    const prepareExpirationOnce =
+      expirationLocal === null || expiration === undefined
+        ? null
+        : async (productId: string, variantId?: string) => {
+            if (expirationLocal.attempted)
+              return toolError('expiration_unavailable');
+            expirationLocal.attempted = true;
+            try {
+              const outcome = await expiration.prepare({
+                senderId: context.senderId,
+                inboundEvent: context.inboundEvent,
+                allowedProductIds: allowedIds,
+                productId,
+                ...(variantId === undefined ? {} : { variantId }),
+              });
+              expirationLocal.value = outcome.reply;
+              const ok =
+                outcome.kind === 'registered' || outcome.kind === 'existing';
+              trace(
+                `tool prepareExpiration result=${ok ? 'ok' : 'closed'} code=${outcome.kind}`,
+              );
+              return ok
+                ? { ok: true as const, registered: true as const }
+                : toolError('expiration_unavailable');
+            } catch {
+              expirationLocal.value = MINIMAL_EXPIRATION_CAUTIOUS_REPLY;
+              trace(
+                'tool prepareExpiration result=error code=expiration_unavailable',
+              );
+              return toolError('expiration_unavailable');
+            }
+          };
+    const withExpiration =
+      prepareExpirationOnce === null
+        ? readTools
+        : {
+            ...readTools,
+            prepareExpiration: tool({
+              description:
+                'Prepara (NO registra) una consulta de información de caducidad ' +
+                'para un producto ya identificado en esta conversación. La ' +
+                'aplicación responde el resultado verificado.',
+              inputSchema: z.strictObject({
+                productId: z.uuid(),
+                variantId: z.uuid().optional(),
+              }),
+              execute: async ({ productId, variantId }) =>
+                prepareExpirationOnce(productId, variantId),
+            }),
+          };
+    if (prepareOnce === null || run === null) return withExpiration;
     return {
-      ...readTools,
+      ...withExpiration,
       prepareRestock: tool({
         description:
           'Prepara (NO registra) una consulta de reposición para un producto ya ' +
