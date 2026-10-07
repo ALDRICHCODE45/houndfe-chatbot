@@ -1,12 +1,16 @@
 import type { PostgresExpirationRecoveryDiscoveryStore } from '../infrastructure/postgres-expiration-recovery-discovery.store';
 import type { PostgresExpirationApplicationPreparationStore } from '../infrastructure/postgres-expiration-application-preparation.store';
 import type { ExpirationExistingDecisionService } from './expiration-existing-decision.service';
+import type { ExpirationDeliveryService } from './expiration-delivery.service';
 import { createExpirationPreparationCandidate } from './expiration-preparation-candidate';
 
 /** One inquiry per five seconds bounds backend GET load. Completed sweeps wrap
  * so pending decisions and new keys behind the cursor are revisited. Restart
  * begins a fresh database sweep, not a replay of a volatile job queue.
- * This preparation-only loop never claims, sends, expires or ACKs a delivery. */
+ * Preparation must report `prepared` before this loop offers the candidate to
+ * the delivery boundary; that boundary still owns claim/send/acceptance, and
+ * the loop never marks stale or ACKs. `deliver` is optional so a prep-only
+ * composition stays compatible. */
 export class ExpirationRecoveryPoller {
   private cursor: string | null = null;
   private started = false;
@@ -28,6 +32,7 @@ export class ExpirationRecoveryPoller {
       'preparePending'
     >,
     private readonly clock: () => Date = () => new Date(),
+    private readonly delivery?: Pick<ExpirationDeliveryService, 'deliverOnce'>,
   ) {}
 
   start(): void {
@@ -81,8 +86,11 @@ export class ExpirationRecoveryPoller {
           outcome,
           this.clock().toISOString(),
         );
-        if (candidate.action === 'candidate')
-          await this.preparation.preparePending(candidate);
+        if (candidate.action === 'candidate') {
+          const prepared = await this.preparation.preparePending(candidate);
+          if (!this.stopped && prepared.action === 'prepared')
+            await this.delivery?.deliverOnce(candidate);
+        }
       }
     } catch {
       // Retry discovery/GET on a later sweep. Never retry a provider send.

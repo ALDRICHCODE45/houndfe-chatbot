@@ -2,12 +2,32 @@ import { ExpirationRecoveryPoller } from './expiration-recovery-poller';
 import * as candidates from './expiration-preparation-candidate';
 
 const hint = { senderId: 'customer', requestKey: 'original' };
+const resolvedOutcome = {
+  outcome: 'resolved' as const,
+  binding: { reservation: { requestKey: hint.requestKey } },
+};
+const candidate = {
+  action: 'candidate',
+} as candidates.ExpirationPreparationCandidate;
+function armResolved(h: ReturnType<typeof setup>): { deliverOnce: jest.Mock } {
+  h.decisions.readExistingDecision.mockResolvedValue(resolvedOutcome);
+  jest
+    .spyOn(candidates, 'createExpirationPreparationCandidate')
+    .mockReturnValue(candidate);
+  return h.delivery as { deliverOnce: jest.Mock };
+}
+function deliverySetup() {
+  const delivery = {
+    deliverOnce: jest.fn().mockResolvedValue({ action: 'hold' }),
+  };
+  return setup(delivery);
+}
 const page = (nextCursor: string | null = null) => ({
   action: 'page' as const,
   hints: [hint],
   nextCursor,
 });
-function setup() {
+function setup(delivery?: { deliverOnce: jest.Mock }) {
   const discovery = {
     discoverRecordedHints: jest.fn().mockResolvedValue(page()),
   };
@@ -24,8 +44,10 @@ function setup() {
     discovery,
     decisions,
     preparation,
+    undefined,
+    delivery,
   );
-  return { discovery, decisions, preparation, poller };
+  return { discovery, decisions, preparation, delivery, poller };
 }
 
 describe('ExpirationRecoveryPoller', () => {
@@ -128,5 +150,91 @@ describe('ExpirationRecoveryPoller', () => {
       afterRequestKey: null,
     });
     await fresh.stop();
+  });
+
+  it('offers only a prepared candidate to delivery once per tick', async () => {
+    const h = deliverySetup();
+    const delivery = armResolved(h);
+    h.preparation.preparePending.mockResolvedValue({
+      action: 'prepared',
+      row: {},
+    });
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.preparation.preparePending).toHaveBeenCalledWith(candidate);
+    expect(delivery.deliverOnce).toHaveBeenCalledTimes(1);
+    expect(delivery.deliverOnce).toHaveBeenCalledWith(candidate);
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(delivery.deliverOnce).toHaveBeenCalledTimes(2);
+    await h.poller.stop();
+  });
+
+  it('never delivers when preparation holds or is absent', async () => {
+    const h = deliverySetup();
+    const delivery = armResolved(h);
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(h.preparation.preparePending).toHaveBeenCalledTimes(1);
+    expect(delivery.deliverOnce).not.toHaveBeenCalled();
+    await h.poller.stop();
+    const prepOnly = setup();
+    jest
+      .spyOn(candidates, 'createExpirationPreparationCandidate')
+      .mockReturnValue(candidate);
+    prepOnly.decisions.readExistingDecision.mockResolvedValue(resolvedOutcome);
+    prepOnly.preparation.preparePending.mockResolvedValue({
+      action: 'prepared',
+      row: {},
+    });
+    prepOnly.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(prepOnly.preparation.preparePending).toHaveBeenCalledTimes(1);
+    await prepOnly.poller.stop();
+  });
+
+  it('does not deliver when stopped after preparation resolves', async () => {
+    const h = deliverySetup();
+    const delivery = armResolved(h);
+    let release!: (value: unknown) => void;
+    h.preparation.preparePending.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    const stopping = h.poller.stop();
+    release({ action: 'prepared', row: {} });
+    await stopping;
+    expect(delivery.deliverOnce).not.toHaveBeenCalled();
+  });
+
+  it('waits for an in-flight delivery before shutdown drains', async () => {
+    const h = deliverySetup();
+    const delivery = armResolved(h);
+    let release!: (value: unknown) => void;
+    delivery.deliverOnce.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    h.preparation.preparePending.mockResolvedValue({
+      action: 'prepared',
+      row: {},
+    });
+    h.poller.start();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(delivery.deliverOnce).toHaveBeenCalledTimes(1);
+    let drained = false;
+    const stopping = h.poller.stop().then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    release({ action: 'hold' });
+    await stopping;
+    expect(drained).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 # EXPIRATION runtime — default-off intake
 
-Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary dormant, not wired; E4 pending.** Business/wire rules remain authoritative in
+Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 pending.** Business/wire rules remain authoritative in
 `docs/human-decisions-expiration-v1.md`. E1 is split into two units:
 
 - **E1a (this unit):** the default-off callee — one cohesive service plus the
@@ -51,13 +51,15 @@ It processes one recorded inquiry every five seconds, sequentially, and wraps af
 an exhausted page. A restart begins a fresh database sweep; no persisted cursor or
 volatile receipt queue is required. Pending decisions and new keys are revisited.
 The original request key must still match before validated preparation; the store
-rechecks locked context. Shutdown drains in-flight work before returning.
-This loop never sends, marks stale, or ACKs; E3/E4 remain required before activation.
+rechecks locked context. Shutdown drains in-flight work (including an in-flight
+delivery) before returning. Preparation alone never sends; only a `prepared`
+result is offered to the E3 delivery boundary, which owns claim/send/acceptance.
+The loop never marks stale or ACKs.
 Throughput is bounded per process, not a global credential-rate guarantee.
 
-## E3 send boundary (dormant, not complete)
+## E3 send boundary (wired default-off)
 
-`ExpirationDeliveryService` is the unwired send boundary. It prepares the
+`ExpirationDeliveryService` is the send boundary. It prepares the
 historical copy **before** claiming (an unusable copy consumes no claim), then
 claims via the existing ledger store: `SEND_STARTED` is a local claim, not send
 authority. At the boundary it re-reads the latest authenticated inbound
@@ -68,5 +70,13 @@ attempted; only a definite provider acceptance is recorded immediately, using
 the started row's exact attempt/token bytes and a fresh observation time
 (`recordAcceptance`). Acceptance is local evidence, not device delivery. A
 thrown or ambiguous send/acceptance holds and is never retried. Backend outcome
-reporting and ACK remain E4. The runtime and poller stay preparation-only and
-default-off, so E3 is **not** complete: wiring and E4 are still required.
+reporting and ACK remain E4. `ExpirationPreparationRuntime` now builds the
+boundary and hands it to the poller: the loop offers a candidate **only** when
+preparation reports `prepared` and it has not stopped, and `deliverOnce`
+re-claims before any send, so an already-accepted or `SEND_STARTED` row is not
+re-sent. `readLatest` and `classifyExpirationPreSend` use the **exact same Meta
+`phoneNumberId`** that authenticates inbound capture (`meta.phoneNumberId`); the
+runtime reads it at the enabled gate and refuses to start an enabled poller
+without a non-blank identity, while the disabled path performs no new work or
+validation. Acceptance stays local evidence, not device delivery; E4 owns
+backend reporting and ACK.
