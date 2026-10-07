@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { customerInboundCaptureProvider } from './infrastructure/customer-inbound-capture.provider';
 import { ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { PG_POOL } from '../database/postgres-pool.provider';
@@ -53,6 +54,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
   controllers: [WebhookController],
   providers: [
     WebhookDispatcherService,
+    customerInboundCaptureProvider,
     {
       provide: RestockInboundCapture,
       inject: [

@@ -17,7 +17,7 @@ type CaptureResult =
 
 const HOLD = Object.freeze({ action: 'hold' } as const);
 
-/** UNWIRED: authenticates through the actual request's private snapshot before
+/** Default-off runtime capture authenticates the actual request's snapshot before
  * any write. Uses standalone store operations in batch order, without retries
  * or rollback: HOLD/throw may follow a durable prefix or an uncertain write.
  * Returned metadata grants no latestness, service-window or send permission.
