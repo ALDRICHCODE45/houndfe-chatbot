@@ -269,6 +269,11 @@ const innerEnvValidationSchema = Joi.object({
     .valid('true', 'false')
     .default('false'),
   MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: Joi.string().optional(),
+  // E1: independent default-off EXPIRATION inquiry capability. The literal
+  // 'true' enables it; every other value (typo, upper-case, '1') is rejected.
+  HUMAN_DECISIONS_EXPIRATION_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('false'),
 
   // ─── Human-handoff slice (R7 + needs_human_review + R14) ─────────────────
   /**

@@ -3,6 +3,8 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { RestockApplicationRuntime } from './restock-application.runtime';
+import { ExpirationPostOrchestrator } from './application/expiration-post-orchestrator.service';
+import { PostgresExpirationPostClaimStore } from './infrastructure/postgres-expiration-post-claim.store';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -102,6 +104,19 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
       ],
     },
     {
+      provide: PostgresExpirationPostClaimStore,
+      useClass: PostgresExpirationPostClaimStore,
+    },
+    {
+      // E1a: the dormant POST orchestrator, wired inertly for a future caller.
+      provide: ExpirationPostOrchestrator,
+      useFactory: (
+        store: PostgresExpirationPostClaimStore,
+        client: ChatbotApiClient,
+      ) => new ExpirationPostOrchestrator(store, client),
+      inject: [PostgresExpirationPostClaimStore, CHATBOT_API_CLIENT],
+    },
+    {
       provide: RESTOCK_INTAKE_SERVICE,
       useFactory: (
         reservations: SharedReservationPort,
@@ -131,6 +146,7 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
     RESTOCK_POST_LEDGER,
     RESTOCK_INTAKE_SERVICE,
     RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
+    ExpirationPostOrchestrator,
     // Bounded on-demand expiry reconciliation seam for the minimal route.
     RestockApplicationRuntime,
   ],

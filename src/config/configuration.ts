@@ -71,6 +71,10 @@ const configuration = () => ({
     allowedSenders: minimalSenders(
       process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS,
     ),
+    // E1: independent default-off EXPIRATION inquiry capability on the
+    // minimal route. Only the exact env string 'true' enables it.
+    expirationEnabled:
+      process.env.HUMAN_DECISIONS_EXPIRATION_ENABLED === 'true',
   },
   database: {
     url: process.env.DATABASE_URL as string,
