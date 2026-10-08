@@ -22,7 +22,7 @@ const INBOUND = {
 };
 const SOURCE = deriveExpirationSourceRequestId(INBOUND) as string;
 const REGISTERED =
-  '¡Listo! 😊 Su consulta ya quedó registrada con el equipo de HoundFe.';
+  '¡Con gusto! 😊 Voy a consultar la fecha de caducidad con el equipo. En cuanto tenga la respuesta, se la comparto por aquí.';
 const usage = {
   inputTokens: { total: 1 },
   outputTokens: { total: 1 },

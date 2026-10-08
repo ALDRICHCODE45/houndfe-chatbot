@@ -179,7 +179,7 @@ describe('MinimalExpirationRequestService (E1a prerequisite callee)', () => {
     await expect(prepare(h.service)).resolves.toEqual({
       kind: 'registered',
       reply:
-        '¡Listo! 😊 Su consulta ya quedó registrada con el equipo de HoundFe.',
+        '¡Con gusto! 😊 Voy a consultar la fecha de caducidad con el equipo. En cuanto tenga la respuesta, se la comparto por aquí.',
     });
     expect(h.reserve).toHaveBeenCalledWith({
       senderId: SENDER,
@@ -208,7 +208,7 @@ describe('MinimalExpirationRequestService (E1a prerequisite callee)', () => {
           kind: action === 'receipt_recorded' ? 'registered' : 'existing',
           reply:
             action === 'receipt_recorded'
-              ? '¡Listo! 😊 Su consulta ya quedó registrada con el equipo de HoundFe.'
+              ? '¡Con gusto! 😊 Voy a consultar la fecha de caducidad con el equipo. En cuanto tenga la respuesta, se la comparto por aquí.'
               : 'Su consulta ya estaba registrada con el equipo de HoundFe.',
         },
       );
