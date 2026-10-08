@@ -154,6 +154,17 @@ branch and `meta.phoneNumberId`.
   inquiry is seeded. This is not ingress/HTTP, live Meta, OS-restart, hard-crash
   or ambiguous-COMMIT proof.
 
+## Intake diagnostics
+
+A rejected intake emits `expiration_intake stage=<stage> reason=<reason>` from
+`MinimalExpirationRequestService`. Stages are `validation`, `stock`, `grounding`,
+`reservation`, and `post`. Reasons are fixed codes: `disabled`, `invalid_id`,
+`unknown_product`, `invalid_stock`, `subject_blocked`, `reservation_not_claimed`,
+`receipt_not_recorded`, or `exception`. No input, identifiers, adapter error
+messages, credentials, or human text are included. `exception` identifies the
+stage only, not the underlying cause. Customer replies and admission rules are
+unchanged; these warnings do not prove a backend request occurred.
+
 Run the isolated proof (Docker and `postgres:16-alpine` required):
 
 ```sh

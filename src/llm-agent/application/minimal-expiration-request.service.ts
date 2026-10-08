@@ -1,6 +1,7 @@
 /** EXPIRATION intake only; never polls, sends or ACKs. Registration requires a
  * confirmed receipt and durable local association; failures never imply success.
  */
+import { Logger } from '@nestjs/common';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
 import { CatalogSession } from '../../conversation/domain/catalog-references';
@@ -38,6 +39,7 @@ const unavailable = (): MinimalExpirationOutcome => ({
 });
 
 export class MinimalExpirationRequestService {
+  private readonly logger = new Logger(MinimalExpirationRequestService.name);
   private readonly clock: () => number;
   constructor(private readonly deps: MinimalExpirationDeps) {
     this.clock = deps.clock ?? (() => Date.now());
@@ -52,22 +54,43 @@ export class MinimalExpirationRequestService {
     readonly productId: string;
     readonly variantId?: string;
   }): Promise<MinimalExpirationOutcome> {
+    let stage: 'validation' | 'stock' | 'grounding' | 'reservation' | 'post' =
+      'validation';
+    const reject = (
+      reason:
+        | 'disabled'
+        | 'invalid_id'
+        | 'unknown_product'
+        | 'invalid_stock'
+        | 'subject_blocked'
+        | 'reservation_not_claimed'
+        | 'receipt_not_recorded'
+        | 'exception',
+    ) => {
+      // Fixed codes only: never log input, adapter reasons or raw exceptions.
+      this.logger.warn(`expiration_intake stage=${stage} reason=${reason}`);
+      return unavailable();
+    };
     try {
-      if (!this.enabled || !UUID.test(input.productId)) return unavailable();
+      if (!this.enabled) return reject('disabled');
+      if (!UUID.test(input.productId)) return reject('invalid_id');
       if (input.variantId !== undefined && !UUID.test(input.variantId)) {
-        return unavailable();
+        return reject('invalid_id');
       }
-      if (!input.allowedProductIds.has(input.productId)) return unavailable();
+      if (!input.allowedProductIds.has(input.productId))
+        return reject('unknown_product');
+      stage = 'stock';
       let stock: StockCheckResponse;
       try {
         stock = await this.deps.chatbotApi.getStock(input.productId);
       } catch {
-        return unavailable();
+        return reject('exception');
       }
       const variants = stock.variants;
       if (stock.productId !== input.productId || !Array.isArray(variants)) {
-        return unavailable();
+        return reject('invalid_stock');
       }
+      stage = 'grounding';
       const session = new CatalogSession(
         input.senderId,
         MINIMAL_EXPIRATION_SESSION_TTL_MS,
@@ -90,8 +113,9 @@ export class MinimalExpirationRequestService {
       if (grounded.status === 'clarification') {
         return { kind: 'clarify', reply: MINIMAL_EXPIRATION_CLARIFY_REPLY };
       }
-      if (grounded.status !== 'grounded') return unavailable();
+      if (grounded.status !== 'grounded') return reject('subject_blocked');
       const { intake } = grounded;
+      stage = 'reservation';
       const reserved = await this.deps.reservations.reserve({
         senderId: input.senderId,
         route: 'EXPIRATION',
@@ -99,8 +123,9 @@ export class MinimalExpirationRequestService {
         intake,
       });
       if (reserved.action !== 'claim' && reserved.action !== 'replay') {
-        return unavailable();
+        return reject('reservation_not_claimed');
       }
+      stage = 'post';
       const outcome = await this.deps.orchestrator.orchestrateExpirationPost({
         senderId: input.senderId,
         sourceRequestId: intake.sourceRequestId,
@@ -122,9 +147,9 @@ export class MinimalExpirationRequestService {
           reply: 'Su consulta ya estaba registrada con el equipo de HoundFe.',
         };
       }
-      return unavailable();
+      return reject('receipt_not_recorded');
     } catch {
-      return unavailable();
+      return reject('exception');
     }
   }
 }

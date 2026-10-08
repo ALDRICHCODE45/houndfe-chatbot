@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
 import { deriveExpirationSourceRequestId } from '../../human-decisions/domain/expiration-source-identity';
 import {
@@ -78,6 +79,37 @@ const prepare = (
   });
 
 describe('MinimalExpirationRequestService (E1a prerequisite callee)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it.each(['validation', 'stock', 'grounding', 'reservation', 'post'] as const)(
+    'logs only a fixed stage/reason for %s failure and preserves the reply',
+    async (stage) => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      const h = harness();
+      const secret = new Error('private-token customer-phone message-body');
+      const input: Record<string, unknown> = {};
+      if (stage === 'validation') input.allowedProductIds = new Set();
+      if (stage === 'stock') h.getStock.mockRejectedValue(secret);
+      if (stage === 'grounding')
+        input.inboundEvent = { private: 'message-body' };
+      if (stage === 'reservation') h.reserve.mockRejectedValue(secret);
+      if (stage === 'post') h.orchestrate.mockRejectedValue(secret);
+      await expect(prepare(h.service, input)).resolves.toEqual(UNAVAILABLE);
+      const reason =
+        stage === 'validation'
+          ? 'unknown_product'
+          : stage === 'grounding'
+            ? 'subject_blocked'
+            : 'exception';
+      expect(warn.mock.calls).toEqual([
+        [`expiration_intake stage=${stage} reason=${reason}`],
+      ]);
+      if (['validation', 'stock', 'grounding'].includes(stage))
+        expect(h.reserve).not.toHaveBeenCalled();
+      if (stage !== 'post') expect(h.orchestrate).not.toHaveBeenCalled();
+    },
+  );
+
   it('is unavailable when default-off and writes nothing', async () => {
     const h = harness({ enabled: false });
     await expect(prepare(h.service)).resolves.toEqual(UNAVAILABLE);
