@@ -93,6 +93,16 @@ restarted process therefore finishes reporting/ACK/closure without resending.
 `PENDING_DELIVERY` and `SEND_STARTED` are non-terminal and fall through to the
 unchanged prepare/claim/send path; an already-started row is never re-sent.
 `STALE` short-circuits before any candidate or coordinator call.
+`PostgresExpirationApplicationStaleStore` exposes a second explicit entry,
+`expireResolvedOutcome`, beside the unchanged in-window candidate entry
+`expirePending`. It accepts trusted `ExpirationExistingDecisionOutcome` resolved
+evidence (for example a decision first consumed after its window closed) that the
+in-window candidate factory refuses, without fabricating `checkedAt` or dressing
+it as a candidate; both entries share the same reservation/ledger locks, context
+revalidation, exact `PENDING_DELIVERY` CAS and fresh-clock policy, so a row is
+marked `STALE` only when that fresh clock classifies `expired`. Missing,
+non-pending, foreign `STALE` and already-started rows still hold with no CAS.
+No runtime, poller or coordinator wiring uses this entry yet.
 
 Recovery uses the accepted row's historical in-window `attemptedAt` instead of
 the current clock, so a restart after the 24h window still reaches the

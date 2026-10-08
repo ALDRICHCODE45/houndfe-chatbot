@@ -2,6 +2,9 @@ import type { Pool, PoolClient } from 'pg';
 import { PostgresExpirationApplicationContextStore } from './postgres-expiration-application-context.store';
 import { PostgresExpirationApplicationStaleStore } from './postgres-expiration-application-stale.store';
 import { deriveExpirationAttemptId } from '../domain/expiration-attempt-identity';
+import type { ExpirationPreparationCandidate } from '../application/expiration-preparation-candidate';
+import { createExpirationPreparationCandidate } from '../application/expiration-preparation-candidate';
+import type { ExpirationExistingDecisionOutcome } from '../application/expiration-existing-decision.service';
 
 const id = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
 const source = '848d8b89-b323-5a4f-952e-41ebcc00d733';
@@ -307,5 +310,116 @@ describe('inactive transactional EXPIRATION STALE', () => {
     expect(h.release).toHaveBeenCalledTimes(1);
     if (point === 'ROLLBACK')
       expect(h.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+  const evidence = (h: ReturnType<typeof harness>) =>
+    ({
+      outcome: 'resolved' as const,
+      binding: h.candidate.binding,
+      decision: h.candidate.decision,
+    }) satisfies ExpirationExistingDecisionOutcome;
+
+  it('records stale from trusted resolved evidence first consumed after expiry', async () => {
+    const h = harness();
+    // The in-window candidate factory cannot represent evidence consumed after
+    // the window closed, so there is no candidate for this decision.
+    expect(
+      createExpirationPreparationCandidate('customer', evidence(h), end),
+    ).toEqual(hold);
+    expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual({
+      action: 'recordedStale',
+      row: { ...h.expected, state: 'STALE', staleObservedAt: end },
+    });
+    expect(h.events).toEqual([
+      'BEGIN',
+      'reservation-lock',
+      'context',
+      'ledger-lock',
+      'clock',
+      'cas',
+      'COMMIT',
+    ]);
+  });
+
+  it.each([{ outcome: 'held' }, { outcome: 'query_failed' }] as const)(
+    'new entry holds $outcome evidence without side effects',
+    async (unresolved) => {
+      const h = harness();
+      expect(await h.store.expireResolvedOutcome(unresolved)).toEqual(hold);
+      expect(h.connect).not.toHaveBeenCalled();
+      expect(h.events).toEqual([]);
+    },
+  );
+
+  it('new entry holds unresolved and mismatched resolved evidence', async () => {
+    const h = harness();
+    const pending = {
+      ...evidence(h),
+      decision: {
+        ...h.candidate.decision,
+        status: 'PENDING',
+        version: 1,
+        resolution: null,
+        applyBefore: null,
+      } as unknown as ReturnType<typeof evidence>['decision'],
+    };
+    expect(await h.store.expireResolvedOutcome(pending)).toEqual(hold);
+    expect(h.connect).not.toHaveBeenCalled();
+    const mismatched = {
+      ...evidence(h),
+      decision: { ...h.candidate.decision, id: source },
+    };
+    expect(await h.store.expireResolvedOutcome(mismatched)).toEqual(hold);
+    expect(h.events).not.toContain('cas');
+    expect(h.events.at(-1)).toBe('ROLLBACK');
+  });
+
+  it('new entry holds a within-window fresh clock without CAS', async () => {
+    const h = harness();
+    h.clock.mockReturnValue(new Date(start));
+    expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual(hold);
+    expect(h.events).not.toContain('cas');
+    expect(h.events.at(-1)).toBe('ROLLBACK');
+  });
+
+  it.each(['missing', 'started'] as const)(
+    'new entry holds %s ledger without CAS',
+    async (ledger) => {
+      const h = harness();
+      if (ledger === 'started')
+        Object.assign(h.row, {
+          state: 'SEND_STARTED',
+          sendToken: id,
+          attemptedAt: start,
+        });
+      const execute = h.query.getMockImplementation()!;
+      h.query.mockImplementation(async (sql, values) => {
+        if (
+          ledger === 'missing' &&
+          sql.includes('expiration_application_ledger') &&
+          sql.includes('FOR UPDATE')
+        )
+          return { rowCount: 0, rows: [] };
+        return execute(sql, values);
+      });
+      expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual(hold);
+      expect(h.events).not.toContain('cas');
+      expect(h.events.at(-1)).toBe('ROLLBACK');
+    },
+  );
+
+  it('both entries hold malformed arguments without side effects', async () => {
+    const h = harness();
+    expect(
+      await h.store.expireResolvedOutcome(
+        null as unknown as ExpirationExistingDecisionOutcome,
+      ),
+    ).toEqual(hold);
+    expect(
+      await h.store.expirePending(
+        null as unknown as ExpirationPreparationCandidate,
+      ),
+    ).toEqual(hold);
+    expect(h.connect).not.toHaveBeenCalled();
+    expect(h.events).toEqual([]);
   });
 });

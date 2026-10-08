@@ -1,7 +1,14 @@
 import { isDeepStrictEqual } from 'node:util';
 import type { Pool, PoolClient, QueryResult } from 'pg';
-import { normalizeExpirationDecision } from '../../chatbot-api/domain/dtos/human-decisions-expiration-decision.dto';
+import {
+  normalizeExpirationDecision,
+  type ExpirationDecisionResolved,
+} from '../../chatbot-api/domain/dtos/human-decisions-expiration-decision.dto';
 import type { ExpirationPreparationCandidate } from '../application/expiration-preparation-candidate';
+import type {
+  ExpirationDecisionBinding,
+  ExpirationExistingDecisionOutcome,
+} from '../application/expiration-existing-decision.service';
 import {
   normalizeExpirationApplicationLedgerRow as normalize,
   type ExpirationApplicationLedgerRow as Row,
@@ -67,10 +74,41 @@ export class PostgresExpirationApplicationStaleStore {
   async expirePending(
     candidate: ExpirationPreparationCandidate,
   ): Promise<Result> {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      candidate.action !== 'candidate'
+    )
+      return HOLD;
+    return this.expireResolved(candidate.binding, candidate.decision);
+  }
+
+  /** Explicit entry for trusted `ExpirationExistingDecisionOutcome` resolved
+   * evidence (for example a decision first consumed after its window closed)
+   * that the in-window candidate factory refuses. It never fabricates
+   * `checkedAt` and never presents out-of-window evidence as a candidate: the
+   * shared transaction samples its own fresh clock and only records STALE when
+   * that clock classifies `expired`. Non-resolved outcomes fail closed. */
+  async expireResolvedOutcome(
+    outcome: ExpirationExistingDecisionOutcome,
+  ): Promise<Result> {
+    if (
+      typeof outcome !== 'object' ||
+      outcome === null ||
+      outcome.outcome !== 'resolved'
+    )
+      return HOLD;
+    return this.expireResolved(outcome.binding, outcome.decision);
+  }
+
+  private async expireResolved(
+    binding: ExpirationDecisionBinding,
+    decisionInput: ExpirationDecisionResolved,
+  ): Promise<Result> {
     let client: PoolClient | undefined;
     let committed = false;
     try {
-      const { branchId, ...original } = candidate.binding;
+      const { branchId, ...original } = binding;
       const context = {
         ...original,
         reservation: {
@@ -78,12 +116,8 @@ export class PostgresExpirationApplicationStaleStore {
           intake: { ...original.reservation.intake },
         },
       };
-      const decision = normalizeExpirationDecision(candidate.decision);
-      if (
-        candidate.action !== 'candidate' ||
-        branchId !== this.branchId ||
-        decision?.status !== 'RESOLVED'
-      )
+      const decision = normalizeExpirationDecision(decisionInput);
+      if (branchId !== this.branchId || decision?.status !== 'RESOLVED')
         return HOLD;
       const { reservation, backendDecisionId } = context;
       const senderId = reservation.senderId;
