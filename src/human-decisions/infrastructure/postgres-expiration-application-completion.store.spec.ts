@@ -162,11 +162,45 @@ function harness(state: 'STALE' | 'PROVIDER_ACCEPTED' = 'STALE') {
     release,
     connect,
     run,
+    recover: () =>
+      store.closeAcknowledged(
+        {
+          outcome: 'resolved',
+          binding: candidate.binding,
+          decision: candidate.decision,
+        },
+        row,
+        receipt,
+      ),
   };
 }
 afterEach(() => jest.restoreAllMocks());
 
 describe('inactive transactional EXPIRATION completion (mocked PostgreSQL)', () => {
+  it('closes recovered STALE without an in-window candidate after durable row/ACK locks', async () => {
+    const h = harness();
+    expect(await h.recover()).toEqual({ action: 'closed' });
+    expect(h.events).toEqual([
+      'BEGIN',
+      'reservation',
+      'context',
+      'ledger',
+      'outcome',
+      'cas',
+      'COMMIT',
+    ]);
+  });
+  it('holds recovered STALE on durable ACK drift without closing', async () => {
+    const h = harness();
+    h.readOutcome.mockResolvedValue({
+      action: 'foundOutcome',
+      row: h.durable.expected,
+      receipt: { ...h.durable.receipt, ackReceivedAt: start },
+    });
+    expect(await h.recover()).toEqual(hold);
+    expect(h.events).not.toContain('cas');
+    expect(h.events.at(-1)).toBe('ROLLBACK');
+  });
   it.each(['STALE', 'PROVIDER_ACCEPTED'] as const)(
     'closes %s only after locked exact evidence and COMMIT',
     async (state) => {

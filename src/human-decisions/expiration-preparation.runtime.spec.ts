@@ -343,7 +343,7 @@ describe('ExpirationPreparationRuntime', () => {
       await runtime.onModuleDestroy();
     },
   );
-  it('does not expire invalid resolved context or an existing STALE terminal', async () => {
+  it('does not expire invalid context and routes existing STALE only to outcome recovery', async () => {
     jest.useFakeTimers();
     jest.setSystemTime(new Date(applyBefore));
     const spies = compose();
@@ -364,7 +364,10 @@ describe('ExpirationPreparationRuntime', () => {
     expect(spies.stale).not.toHaveBeenCalled();
     expect(spies.preparation).not.toHaveBeenCalled();
     expect(spies.claim).not.toHaveBeenCalled();
-    expect(spies.finish).not.toHaveBeenCalled();
+    expect(spies.finish).toHaveBeenCalledWith(
+      resolvedOutcome,
+      fixture('STALE', { staleObservedAt: applyBefore }),
+    );
     await runtime.onModuleDestroy();
   });
   it('wires the real outcome coordinator with bound ports and recovers a terminal row without resending', async () => {

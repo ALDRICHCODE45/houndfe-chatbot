@@ -116,10 +116,59 @@ function harness(state = 'PROVIDER_ACCEPTED', hasAck = false) {
     ' branch ',
   );
   const run = () => service.finishOnce(candidate, row);
-  return { candidate, context, row, receipt, bound, ports, run };
+  const resolved = {
+    outcome: 'resolved' as const,
+    binding: candidate.binding,
+    decision: candidate.decision,
+  };
+  const recover = () => service.finishOnce(resolved, row);
+  return {
+    candidate,
+    context,
+    row,
+    receipt,
+    bound,
+    ports,
+    run,
+    recover,
+    resolved,
+  };
 }
 
 describe('inactive EXPIRATION terminal outcome coordination', () => {
+  it.each([false, true])(
+    'recovers STALE from resolved evidence without an in-window timestamp (ACK=%s)',
+    async (hasAck) => {
+      const h = harness('STALE', hasAck);
+      expect(await h.recover()).toEqual({ action: 'closed' });
+      expect(h.ports.recordRestockApplicationOutcome).toHaveBeenCalledTimes(
+        hasAck ? 0 : 1,
+      );
+      expect(h.ports.recordOutcomeAck).toHaveBeenCalledTimes(hasAck ? 0 : 1);
+      expect(h.ports.closeAcknowledged).toHaveBeenCalledWith(
+        h.resolved,
+        h.row,
+        h.receipt,
+      );
+      expect(h.resolved).not.toHaveProperty('checkedAt');
+    },
+  );
+  it.each(['PROVIDER_ACCEPTED', 'PROVIDER_ACCEPTED_LATE'])(
+    'rejects %s through the STALE-only resolved evidence entry',
+    async (state) => {
+      const h = harness(state);
+      expect(await h.recover()).toEqual(hold);
+      for (const port of Object.values(h.ports))
+        expect(port).not.toHaveBeenCalled();
+    },
+  );
+  it('holds recovered STALE when durable context changes', async () => {
+    const h = harness('STALE');
+    h.context.receiptRecordedAt = END;
+    expect(await h.recover()).toEqual(hold);
+    expect(h.ports.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+    expect(h.ports.closeAcknowledged).not.toHaveBeenCalled();
+  });
   it.each([
     ['PROVIDER_ACCEPTED', false],
     ['STALE', false],

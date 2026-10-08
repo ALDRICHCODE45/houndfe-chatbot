@@ -231,7 +231,7 @@ describe('ExpirationRecoveryPoller', () => {
     await h.poller.stop();
   });
 
-  it('holds a persisted STALE row without reporting, preparing or sending', async () => {
+  it('offers persisted STALE with resolved evidence for validated recovery, never preparing or sending', async () => {
     const recovery = terminalRecovery();
     recovery.outcomes.readOutcomeByDecision.mockResolvedValue({
       action: 'foundOutcome',
@@ -242,7 +242,10 @@ describe('ExpirationRecoveryPoller', () => {
     armResolved(h);
     h.poller.start();
     await jest.advanceTimersByTimeAsync(5_000);
-    expect(recovery.coordinator.finishOnce).not.toHaveBeenCalled();
+    expect(recovery.coordinator.finishOnce).toHaveBeenCalledWith(
+      resolvedOutcome,
+      { state: 'STALE' },
+    );
     expect(h.preparation.preparePending).not.toHaveBeenCalled();
     expect(h.delivery?.deliverOnce).not.toHaveBeenCalled();
     await h.poller.stop();

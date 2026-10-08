@@ -1,9 +1,9 @@
 import { isDeepStrictEqual } from 'node:util';
 import type { Pool, PoolClient, QueryResult } from 'pg';
 import {
-  createExpirationPreparationCandidate,
-  type ExpirationPreparationCandidate,
-} from '../application/expiration-preparation-candidate';
+  validateExpirationOutcomeContext,
+  type ExpirationOutcomeContext,
+} from '../application/expiration-outcome-context';
 import { prepareExpirationApplicationCompletion } from '../domain/expiration-application-completion-preparation';
 import { PostgresExpirationApplicationContextStore } from './postgres-expiration-application-context.store';
 import { PostgresExpirationApplicationLedgerStore } from './postgres-expiration-application-ledger.store';
@@ -47,25 +47,16 @@ export class PostgresExpirationApplicationCompletionStore {
   ) {}
 
   async closeAcknowledged(
-    candidate: ExpirationPreparationCandidate,
+    candidate: ExpirationOutcomeContext,
     row: unknown,
     receipt: unknown,
   ): Promise<Result> {
     let client: PoolClient | undefined;
     let committed = false;
     try {
-      if (candidate.action !== 'candidate') return HOLD;
-      const original = createExpirationPreparationCandidate(
-        candidate.binding.reservation.senderId,
-        {
-          outcome: 'resolved',
-          binding: candidate.binding,
-          decision: candidate.decision,
-        },
-        candidate.checkedAt,
-      );
+      const original = validateExpirationOutcomeContext(candidate, row);
       const prepared = prepareExpirationApplicationCompletion(row, receipt);
-      if (original.action !== 'candidate' || prepared.action !== 'prepared')
+      if (!('binding' in original) || prepared.action !== 'prepared')
         return HOLD;
       const { branchId, ...context } = original.binding;
       const { reservation } = context;

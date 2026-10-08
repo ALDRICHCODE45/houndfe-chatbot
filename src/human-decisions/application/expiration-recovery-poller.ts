@@ -16,8 +16,8 @@ import type { PostgresExpirationApplicationStaleStore } from '../infrastructure/
  * expired evidence is offered only to the guarded stale store, never to send.
  * A durable terminal read happens BEFORE
  * any prepare/send: an already accepted ledger row is routed to the outcome
- * coordinator for report/ACK/close without resending, while STALE holds and
- * nothing is sent. `deliver` and the recovery pair are optional so a prep-only
+ * coordinator for report/ACK/close without resending. STALE uses resolved
+ * evidence, never a fabricated in-window candidate or send authority. `deliver` and the recovery pair are optional so a prep-only
  * composition stays compatible. */
 export class ExpirationRecoveryPoller {
   private cursor: string | null = null;
@@ -107,7 +107,10 @@ export class ExpirationRecoveryPoller {
           );
           if (this.stopped) return;
           if (terminal.action === 'foundOutcome') {
-            if (terminal.row.state === 'STALE') continue;
+            if (terminal.row.state === 'STALE') {
+              await this.coordinator.finishOnce(outcome, terminal.row);
+              continue;
+            }
             const recovery = createExpirationPreparationCandidate(
               hint.senderId,
               outcome,

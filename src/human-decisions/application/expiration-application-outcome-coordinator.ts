@@ -7,9 +7,9 @@ import { prepareExpirationApplicationOutcome } from '../domain/expiration-applic
 import { bindExpirationApplicationOutcomeAck } from '../domain/expiration-application-ledger-ack-binding';
 import { prepareExpirationApplicationCompletion } from '../domain/expiration-application-completion-preparation';
 import {
-  createExpirationPreparationCandidate,
-  type ExpirationPreparationCandidate,
-} from './expiration-preparation-candidate';
+  validateExpirationOutcomeContext,
+  type ExpirationOutcomeContext,
+} from './expiration-outcome-context';
 
 export type ExpirationApplicationOutcomePorts = Pick<
   PostgresExpirationApplicationContextStore,
@@ -27,7 +27,8 @@ const HOLD: Result = Object.freeze({ action: 'hold' });
 /** Inactive terminal tail, never a sender, scheduler or automatic retry.
  * Requires trusted original candidate/remote provenance and contract-correct
  * ports: ledger observations use committed standalone Pool operations, not an
- * outer transaction client. STALE still needs independent no-send history.
+ * outer transaction client. STALE recovery trusts only controlled application
+ * writers: the guarded PENDING-to-STALE store, not arbitrary ledger imports.
  * Snapshot checks are not remote atomicity; concurrent invocations may report
  * the same attempt. Each invocation reports at most once. Existing ACK skips
  * report/write; LATE may be recorded but never closes. A CAS result alone is not
@@ -39,23 +40,14 @@ export class ExpirationApplicationOutcomeCoordinator {
     private readonly branchId: string,
   ) {}
   async finishOnce(
-    candidate: ExpirationPreparationCandidate,
+    candidate: ExpirationOutcomeContext,
     terminal: unknown,
   ): Promise<Result> {
     const ports = this.ports;
     try {
-      if (candidate.action !== 'candidate') return HOLD;
-      const original = createExpirationPreparationCandidate(
-        candidate.binding.reservation.senderId,
-        {
-          outcome: 'resolved',
-          binding: candidate.binding,
-          decision: candidate.decision,
-        },
-        candidate.checkedAt,
-      );
+      const original = validateExpirationOutcomeContext(candidate, terminal);
       const outcome = prepareExpirationApplicationOutcome(terminal);
-      if (original.action !== 'candidate' || outcome.action !== 'prepared')
+      if (!('binding' in original) || outcome.action !== 'prepared')
         return HOLD;
       const { branchId, ...context } = original.binding;
       const expected = outcome.expected;

@@ -1,6 +1,6 @@
 # EXPIRATION runtime — default-off intake
 
-Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery wired; STALE provenance and deployment rehearsal pending.** Business/wire rules remain authoritative in
+Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery includes controlled-writer STALE recovery; expired/no-ledger handling and deployment rehearsal pending.** Business/wire rules remain authoritative in
 `docs/human-decisions-expiration-v1.md`. E1 is split into two units:
 
 - **E1a (this unit):** the default-off callee — one cohesive service plus the
@@ -93,7 +93,14 @@ then reports the outcome, writes the ACK and closes through
 restarted process therefore finishes reporting/ACK/closure without resending.
 `PENDING_DELIVERY` and `SEND_STARTED` are non-terminal and fall through to the
 unchanged prepare/claim/send path; an already-started row is never re-sent.
-`STALE` short-circuits before any candidate or coordinator call.
+`STALE` routes the trusted resolved decision directly to the outcome coordinator,
+without constructing an in-window candidate. A shared terminal-only validator
+uses the row's actual `staleObservedAt` to validate expiry and detaches the
+original context before awaits; coordinator and closure still recheck exact
+identity, durable context, row and ACK. Recovery trusts the controlled application
+write surface: only the guarded exact PENDING-to-STALE transaction produces
+STALE. Row shape or lock equality alone is not historical no-send proof; manual
+ledger imports and out-of-band sends are not covered by this trust boundary.
 `PostgresExpirationApplicationStaleStore` exposes a second explicit entry,
 `expireResolvedOutcome`, beside the unchanged in-window candidate entry
 `expirePending`. It accepts trusted `ExpirationExistingDecisionOutcome` resolved
@@ -108,7 +115,7 @@ read, an explicitly `expired` policy result routes trusted resolved evidence to
 `expireResolvedOutcome`, never to preparation or delivery. The store rechecks
 expiry with its own fresh clock under locks; the poller's classification is not
 write authority. `recordedStale`, hold and failures never trigger reporting or
-closure here. Existing STALE terminals still short-circuit. This establishes
+closure in the generation tick; the next sweep recovers the terminal row. This establishes
 only controlled local transition history, not proof against out-of-band sends
 or manual database writes.
 
@@ -123,9 +130,10 @@ branch and `meta.phoneNumberId`.
 
 ### Limits / remaining readiness
 
-- **`STALE` is held, not resolved.** Without no-send history proof an existing
-  `STALE` row is never reported or closed; historical recovery/report/ACK remains
-  pending even though guarded PENDING-to-STALE generation is now wired.
+- **STALE recovery is conditional on controlled writer provenance.** Unknown or
+  manually imported history is not certified by snapshot checks. Invalid binding,
+  changed durable context/row/ACK or uncertain I/O holds without a send.
+  Existing valid ACK skips reporting; closure still requires confirmed COMMIT.
   `PROVIDER_ACCEPTED_LATE` never auto-closes.
 - **First observed expired without a ledger row still holds.** No row is created,
   no outcome is reported and the ACTIVE inquiry is revisited on future sweeps.
