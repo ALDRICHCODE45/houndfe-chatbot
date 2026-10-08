@@ -59,23 +59,33 @@ export class MinimalExpirationRequestService {
     const reject = (
       reason:
         | 'disabled'
-        | 'invalid_id'
+        | 'invalid_product_id'
+        | 'invalid_variant_id'
         | 'unknown_product'
         | 'invalid_stock'
         | 'subject_blocked'
         | 'reservation_not_claimed'
         | 'receipt_not_recorded'
         | 'exception',
+      shape?: 'absent' | 'null' | 'wrong_type' | 'invalid_format',
     ) => {
       // Fixed codes only: never log input, adapter reasons or raw exceptions.
-      this.logger.warn(`expiration_intake stage=${stage} reason=${reason}`);
+      this.logger.warn(
+        `expiration_intake stage=${stage} reason=${reason}${shape === undefined ? '' : ` shape=${shape}`}`,
+      );
       return unavailable();
+    };
+    const invalidShape = (value: unknown) => {
+      if (value === undefined) return 'absent';
+      if (value === null) return 'null';
+      return typeof value === 'string' ? 'invalid_format' : 'wrong_type';
     };
     try {
       if (!this.enabled) return reject('disabled');
-      if (!UUID.test(input.productId)) return reject('invalid_id');
+      if (!UUID.test(input.productId))
+        return reject('invalid_product_id', invalidShape(input.productId));
       if (input.variantId !== undefined && !UUID.test(input.variantId)) {
-        return reject('invalid_id');
+        return reject('invalid_variant_id', invalidShape(input.variantId));
       }
       if (!input.allowedProductIds.has(input.productId))
         return reject('unknown_product');

@@ -81,6 +81,50 @@ const prepare = (
 describe('MinimalExpirationRequestService (E1a prerequisite callee)', () => {
   afterEach(() => jest.restoreAllMocks());
 
+  it.each([
+    ['productId', undefined, 'absent'],
+    ['productId', null, 'null'],
+    ['productId', 123, 'wrong_type'],
+    ['productId', 'private-invalid-id', 'invalid_format'],
+    ['variantId', null, 'null'],
+    ['variantId', 123, 'wrong_type'],
+    ['variantId', '', 'invalid_format'],
+    ['variantId', 'private-invalid-id', 'invalid_format'],
+  ])(
+    'identifies rejected %s shape without logging its value (%#)',
+    async (field, value, shape) => {
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      const h = harness();
+      await expect(prepare(h.service, { [field]: value })).resolves.toEqual(
+        UNAVAILABLE,
+      );
+      const reason =
+        field === 'productId' ? 'invalid_product_id' : 'invalid_variant_id';
+      expect(warn.mock.calls).toEqual([
+        [`expiration_intake stage=validation reason=${reason} shape=${shape}`],
+      ]);
+      expect(h.getStock).not.toHaveBeenCalled();
+      expect(h.reserve).not.toHaveBeenCalled();
+      expect(h.orchestrate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('continues accepting an omitted variant without an invalid-ID diagnostic', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    const h = harness();
+    await expect(prepare(h.service)).resolves.toMatchObject({
+      kind: 'registered',
+    });
+    expect(warn).not.toHaveBeenCalled();
+    expect(h.reserve).toHaveBeenCalledWith({
+      senderId: SENDER,
+      route: 'EXPIRATION',
+      requestKey: SOURCE,
+      intake: intake(null),
+    });
+    expect(h.orchestrate).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['validation', 'stock', 'grounding', 'reservation', 'post'] as const)(
     'logs only a fixed stage/reason for %s failure and preserves the reply',
     async (stage) => {

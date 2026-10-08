@@ -158,12 +158,16 @@ branch and `meta.phoneNumberId`.
 
 A rejected intake emits `expiration_intake stage=<stage> reason=<reason>` from
 `MinimalExpirationRequestService`. Stages are `validation`, `stock`, `grounding`,
-`reservation`, and `post`. Reasons are fixed codes: `disabled`, `invalid_id`,
+`reservation`, and `post`. Reasons are fixed codes: `disabled`,
+`invalid_product_id`, `invalid_variant_id`,
 `unknown_product`, `invalid_stock`, `subject_blocked`, `reservation_not_claimed`,
 `receipt_not_recorded`, or `exception`. No input, identifiers, adapter error
 messages, credentials, or human text are included. `exception` identifies the
 stage only, not the underlying cause. Customer replies and admission rules are
 unchanged; these warnings do not prove a backend request occurred.
+Invalid-ID warnings additionally include a fixed `shape` code: `absent`, `null`,
+`wrong_type`, or `invalid_format`. The argument value is never logged. An omitted
+variant remains accepted; this diagnostic does not relax UUID validation.
 
 Run the isolated proof (Docker and `postgres:16-alpine` required):
 
