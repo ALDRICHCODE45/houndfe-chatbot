@@ -54,7 +54,8 @@ The original request key must still match before validated preparation; the stor
 rechecks locked context. Shutdown drains in-flight work (including an in-flight
 delivery) before returning. Preparation alone never sends; only a `prepared`
 result is offered to the E3 delivery boundary, which owns claim/send/acceptance.
-The loop never marks stale or ACKs.
+For expired decisions the loop delegates to the guarded STALE store described
+below; it never directly writes ledger rows or ACKs.
 Throughput is bounded per process, not a global credential-rate guarantee.
 
 ## E3 send boundary (wired default-off)
@@ -102,7 +103,14 @@ it as a candidate; both entries share the same reservation/ledger locks, context
 revalidation, exact `PENDING_DELIVERY` CAS and fresh-clock policy, so a row is
 marked `STALE` only when that fresh clock classifies `expired`. Missing,
 non-pending, foreign `STALE` and already-started rows still hold with no CAS.
-No runtime, poller or coordinator wiring uses this entry yet.
+The enabled runtime now supplies this store to the poller. After the terminal
+read, an explicitly `expired` policy result routes trusted resolved evidence to
+`expireResolvedOutcome`, never to preparation or delivery. The store rechecks
+expiry with its own fresh clock under locks; the poller's classification is not
+write authority. `recordedStale`, hold and failures never trigger reporting or
+closure here. Existing STALE terminals still short-circuit. This establishes
+only controlled local transition history, not proof against out-of-band sends
+or manual database writes.
 
 Recovery uses the accepted row's historical in-window `attemptedAt` instead of
 the current clock, so a restart after the 24h window still reaches the
@@ -116,8 +124,12 @@ branch and `meta.phoneNumberId`.
 ### Limits / remaining readiness
 
 - **`STALE` is held, not resolved.** Without no-send history proof an existing
-  `STALE` row is never reported or closed; full no-send handling, `STALE`
-  provenance remain unimplemented. `PROVIDER_ACCEPTED_LATE` never auto-closes.
+  `STALE` row is never reported or closed; historical recovery/report/ACK remains
+  pending even though guarded PENDING-to-STALE generation is now wired.
+  `PROVIDER_ACCEPTED_LATE` never auto-closes.
+- **First observed expired without a ledger row still holds.** No row is created,
+  no outcome is reported and the ACTIVE inquiry is revisited on future sweeps.
+  This unresolved case and operational visibility remain readiness gaps.
 - **Conditional replay/closure is not proven end-to-end.** Ledger/report
   idempotency and the completion store `COMMIT` path were not exercised against
   a live database; only focused fake-port tests ran.

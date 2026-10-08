@@ -22,6 +22,7 @@ import { ExpirationApplicationOutcomeCoordinator } from './application/expiratio
 import { PostgresExpirationApplicationContextStore } from './infrastructure/postgres-expiration-application-context.store';
 import { PostgresExpirationApplicationCompletionStore } from './infrastructure/postgres-expiration-application-completion.store';
 import { PostgresExpirationApplicationPreparationStore } from './infrastructure/postgres-expiration-application-preparation.store';
+import { PostgresExpirationApplicationStaleStore } from './infrastructure/postgres-expiration-application-stale.store';
 import { PostgresExpirationApplicationClaimStore } from './infrastructure/postgres-expiration-application-claim.store';
 import { PostgresExpirationApplicationLedgerStore } from './infrastructure/postgres-expiration-application-ledger.store';
 import { PostgresCustomerInboundObservationStore } from './infrastructure/postgres-customer-inbound-observation.store';
@@ -105,6 +106,7 @@ export class ExpirationPreparationRuntime
       delivery,
       ledger,
       coordinator,
+      new PostgresExpirationApplicationStaleStore(this.pool, branch, clock),
     );
     this.poller.start();
   }

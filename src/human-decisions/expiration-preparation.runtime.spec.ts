@@ -13,6 +13,7 @@ import {
 import { deriveExpirationAttemptId } from './domain/expiration-attempt-identity';
 import { PostgresExpirationRecoveryDiscoveryStore } from './infrastructure/postgres-expiration-recovery-discovery.store';
 import { PostgresExpirationApplicationPreparationStore } from './infrastructure/postgres-expiration-application-preparation.store';
+import { PostgresExpirationApplicationStaleStore } from './infrastructure/postgres-expiration-application-stale.store';
 import { PostgresExpirationApplicationClaimStore } from './infrastructure/postgres-expiration-application-claim.store';
 import { PostgresExpirationApplicationLedgerStore } from './infrastructure/postgres-expiration-application-ledger.store';
 import { PostgresExpirationApplicationContextStore } from './infrastructure/postgres-expiration-application-context.store';
@@ -182,7 +183,14 @@ function compose() {
   const finish = jest
     .spyOn(ExpirationApplicationOutcomeCoordinator.prototype, 'finishOnce')
     .mockResolvedValue({ action: 'closed' });
+  const stale = jest
+    .spyOn(
+      PostgresExpirationApplicationStaleStore.prototype,
+      'expireResolvedOutcome',
+    )
+    .mockResolvedValue({ action: 'hold' });
   return {
+    stale,
     discovery,
     decisions,
     preparation,
@@ -291,6 +299,7 @@ describe('ExpirationPreparationRuntime', () => {
     runtime.onApplicationBootstrap();
     await jest.advanceTimersByTimeAsync(5_000);
     expect(spies.preparation).toHaveBeenCalledTimes(1);
+    expect(spies.stale).not.toHaveBeenCalled();
     expect(spies.claim).toHaveBeenCalledTimes(1);
     expect(spies.latest).toHaveBeenCalledWith(senderId, phone);
     expect(sender.sendText).toHaveBeenCalledTimes(1);
@@ -300,6 +309,62 @@ describe('ExpirationPreparationRuntime', () => {
     expect(message.to).toBe(senderId);
     expect(message.text).toContain('Original food');
     expect(spies.acceptance).toHaveBeenCalledTimes(1);
+    await runtime.onModuleDestroy();
+  });
+  it.each(['recorded', 'hold', 'error'] as const)(
+    'offers expired resolved evidence to the guarded store (%s), never delivery or closure',
+    async (result) => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date(applyBefore));
+      const spies = compose();
+      if (result === 'recorded')
+        spies.stale.mockResolvedValue({
+          action: 'recordedStale',
+          row: fixture('STALE', { staleObservedAt: applyBefore }),
+        });
+      if (result === 'error')
+        spies.stale.mockRejectedValue(new Error('unavailable'));
+      const sender = { sendText: jest.fn() };
+      const runtime = build(true, branchId, phone, sender);
+      runtime.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(spies.stale).toHaveBeenCalledTimes(1);
+      expect(spies.stale).toHaveBeenCalledWith(resolvedOutcome);
+      expect(spies.stale.mock.contexts[0]).toBeInstanceOf(
+        PostgresExpirationApplicationStaleStore,
+      );
+      expect(spies.stale.mock.contexts[0]).toMatchObject({ branchId });
+      expect(spies.preparation).not.toHaveBeenCalled();
+      expect(spies.claim).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(spies.finish).not.toHaveBeenCalled();
+      expect(spies.recordAck).not.toHaveBeenCalled();
+      expect(spies.completion).not.toHaveBeenCalled();
+      await runtime.onModuleDestroy();
+    },
+  );
+  it('does not expire invalid resolved context or an existing STALE terminal', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date(applyBefore));
+    const spies = compose();
+    spies.decisions.mockResolvedValueOnce({
+      ...resolvedOutcome,
+      binding: { ...resolvedOutcome.binding, branchId: 'wrong-branch' },
+    });
+    const runtime = build(true);
+    runtime.onApplicationBootstrap();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(spies.stale).not.toHaveBeenCalled();
+    spies.terminal.mockResolvedValue({
+      action: 'foundOutcome',
+      row: fixture('STALE', { staleObservedAt: applyBefore }),
+      receipt: null,
+    });
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(spies.stale).not.toHaveBeenCalled();
+    expect(spies.preparation).not.toHaveBeenCalled();
+    expect(spies.claim).not.toHaveBeenCalled();
+    expect(spies.finish).not.toHaveBeenCalled();
     await runtime.onModuleDestroy();
   });
   it('wires the real outcome coordinator with bound ports and recovers a terminal row without resending', async () => {

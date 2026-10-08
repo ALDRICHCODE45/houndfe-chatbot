@@ -5,13 +5,16 @@ import type { ExpirationExistingDecisionService } from './expiration-existing-de
 import type { ExpirationDeliveryService } from './expiration-delivery.service';
 import type { ExpirationApplicationOutcomeCoordinator } from './expiration-application-outcome-coordinator';
 import { createExpirationPreparationCandidate } from './expiration-preparation-candidate';
+import { classifyExpirationApplication } from '../domain/expiration-application-policy';
+import type { PostgresExpirationApplicationStaleStore } from '../infrastructure/postgres-expiration-application-stale.store';
 
 /** One inquiry per five seconds bounds backend GET load. Completed sweeps wrap
  * so pending decisions and new keys behind the cursor are revisited. Restart
  * begins a fresh database sweep, not a replay of a volatile job queue.
  * Preparation must report `prepared` before this loop offers the candidate to
  * the delivery boundary; that boundary still owns claim/send/acceptance, and
- * the loop never marks stale or ACKs. A durable terminal read happens BEFORE
+ * expired evidence is offered only to the guarded stale store, never to send.
+ * A durable terminal read happens BEFORE
  * any prepare/send: an already accepted ledger row is routed to the outcome
  * coordinator for report/ACK/close without resending, while STALE holds and
  * nothing is sent. `deliver` and the recovery pair are optional so a prep-only
@@ -45,6 +48,10 @@ export class ExpirationRecoveryPoller {
     private readonly coordinator?: Pick<
       ExpirationApplicationOutcomeCoordinator,
       'finishOnce'
+    >,
+    private readonly stale?: Pick<
+      PostgresExpirationApplicationStaleStore,
+      'expireResolvedOutcome'
     >,
   ) {}
 
@@ -111,10 +118,27 @@ export class ExpirationRecoveryPoller {
             continue;
           }
         }
+        const checkedAt = this.clock().toISOString();
+        if (this.stale) {
+          const policy = classifyExpirationApplication({
+            senderId: hint.senderId,
+            branchId: outcome.binding.branchId,
+            reservation: outcome.binding.reservation,
+            backendDecisionId: outcome.binding.backendDecisionId,
+            decision: outcome.decision,
+            now: checkedAt,
+          });
+          if (policy.classification === 'expired') {
+            // Only the store's fresh locked PENDING CAS establishes local
+            // no-send evidence. No terminal reporting/closure in this path.
+            await this.stale.expireResolvedOutcome(outcome);
+            continue;
+          }
+        }
         const candidate = createExpirationPreparationCandidate(
           hint.senderId,
           outcome,
-          this.clock().toISOString(),
+          checkedAt,
         );
         if (candidate.action === 'candidate') {
           const prepared = await this.preparation.preparePending(candidate);
