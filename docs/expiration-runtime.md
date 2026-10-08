@@ -144,9 +144,22 @@ branch and `meta.phoneNumberId`.
   The next sweep reports/ACKs/closes through the existing terminal path.
   This assumes controlled writers never delete ledger history; manual deletion
   or out-of-band sends are not certified by absence. Conflicts remain held.
-- **Conditional replay/closure is not proven end-to-end.** Ledger/report
-  idempotency and the completion store `COMMIT` path were not exercised against
-  a live database; only focused fake-port tests ran.
+- **Local composed persistence is covered with disposable PostgreSQL.** The
+  coordinator DB suite runs real discovery, polling, preparation, claim,
+  acceptance, ACK persistence and locked closure. It covers one simulated send,
+  recovery after report failure or a held closure using fresh poller/pool
+  instances without resend, and STALE recovery with/without prior preparation.
+  Closed reservations disappear from discovery. GET, latest inbound observation,
+  provider send and backend report/ACK responses are simulated; the recorded
+  inquiry is seeded. This is not ingress/HTTP, live Meta, OS-restart, hard-crash
+  or ambiguous-COMMIT proof.
+
+Run the isolated proof (Docker and `postgres:16-alpine` required):
+
+```sh
+RUN_DOCKER_TESTS=1 pnpm test --runTestsByPath src/human-decisions/infrastructure/postgres-expiration-application-outcome-coordinator.db.spec.ts --runInBand
+```
+
 - **Owner-run manual rehearsal is still required before activation.** On a
   disposable branch confirm discovery → preparation → send → acceptance →
   report/ACK → closure, then restart mid-outcome and confirm the next sweep

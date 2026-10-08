@@ -10,6 +10,9 @@ import {
   ExpirationApplicationOutcomeCoordinator,
   type ExpirationApplicationOutcomePorts,
 } from '../application/expiration-application-outcome-coordinator';
+import { ExpirationRecoveryPoller } from '../application/expiration-recovery-poller';
+import { ExpirationDeliveryService } from '../application/expiration-delivery.service';
+import { PostgresExpirationRecoveryDiscoveryStore } from './postgres-expiration-recovery-discovery.store';
 import { ExpirationExistingDecisionService } from '../application/expiration-existing-decision.service';
 import {
   createExpirationPreparationCandidate,
@@ -24,9 +27,9 @@ import { PostgresExpirationApplicationContextStore as Context } from './postgres
 import { PostgresExpirationApplicationLedgerStore as Ledger } from './postgres-expiration-application-ledger.store';
 import { PostgresExpirationApplicationCompletionStore as Completion } from './postgres-expiration-application-completion.store';
 
-// Existing-behavior proof, not retroactive RED. Synthetic GET/report/ACK are not
-// remote provenance or HTTP concurrency proof. No sends, no out-of-band no-send
-// proof, OS restart, crash or ambiguous COMMIT injection. Only disposable DBs.
+// Existing-behavior proof, not retroactive RED. GET/inbound/send/report responses
+// are synthetic, not remote provenance or HTTP concurrency proof. No live sends,
+// out-of-band no-send proof, OS restart or ambiguous COMMIT injection. Disposable DBs only.
 const ddescribe =
   process.env.RUN_DOCKER_TESTS === '1' ? describe : describe.skip;
 const ROOT = join(__dirname, '..', '..', '..');
@@ -168,7 +171,7 @@ ddescribe('EXPIRATION outcome coordination with real PostgreSQL', () => {
       if (container) await container.stop();
     }
   });
-  async function seed(state: Terminal['state'], withAck = false) {
+  async function seedRecorded() {
     await observer.query(
       'TRUNCATE expiration_application_ledger, human_decision_reservations',
     );
@@ -178,6 +181,9 @@ ddescribe('EXPIRATION outcome coordination with real PostgreSQL', () => {
       VALUES ($1,'EXPIRATION',$2,'ACTIVE',$3,'RECEIPT_RECORDED',$4,$5,$5)`,
       [SENDER, SOURCE, JSON.stringify(intake), ID, AT],
     );
+  }
+  async function seed(state: Terminal['state'], withAck = false) {
+    await seedRecorded();
     const original = await new ExpirationExistingDecisionService(
       new Context(observer),
       { getExpirationDecision: jest.fn().mockResolvedValue(decision) },
@@ -239,6 +245,227 @@ ddescribe('EXPIRATION outcome coordination with real PostgreSQL', () => {
       });
     report = jest.fn().mockResolvedValue(receipt);
   }
+  // Public poller lifecycle with real stores; only external GET, inbound and
+  // provider/report responses are simulated. New instances are not OS crashes.
+  function composePoller(
+    pool: Pool,
+    at: string,
+    send: jest.Mock,
+    failClose = false,
+  ) {
+    const context = new Context(pool);
+    const ledger = new Ledger(pool);
+    const completion = new Completion(pool, BRANCH);
+    const claim = new PostgresExpirationApplicationClaimStore(
+      pool,
+      BRANCH,
+      () => new Date(at),
+    );
+    const coordinator = new ExpirationApplicationOutcomeCoordinator(
+      {
+        readRecordedForSender: context.readRecordedForSender.bind(context),
+        readOutcomeByDecision: ledger.readOutcomeByDecision.bind(ledger),
+        recordOutcomeAck: ledger.recordOutcomeAck.bind(ledger),
+        recordRestockApplicationOutcome: report,
+        closeAcknowledged: failClose
+          ? async () => ({ action: 'hold' as const })
+          : completion.closeAcknowledged.bind(completion),
+      },
+      BRANCH,
+    );
+    const delivery = new ExpirationDeliveryService(
+      {
+        claimPending: claim.claimPending.bind(claim),
+        recordAcceptance: ledger.recordAcceptance.bind(ledger),
+        readLatest: async () => ({
+          kind: 'found',
+          observation: {
+            senderId: SENDER,
+            receivingPhoneNumberId: '123456',
+            messageId: 'wamid.inbound',
+            providerTimestampSeconds: String(Date.parse(AT) / 1000),
+            observedAt: AT,
+          },
+        }),
+        sendText: send,
+      },
+      BRANCH,
+      '123456',
+      () => new Date(at),
+    );
+    return new ExpirationRecoveryPoller(
+      new PostgresExpirationRecoveryDiscoveryStore(pool),
+      new ExpirationExistingDecisionService(
+        context,
+        { getExpirationDecision: jest.fn().mockResolvedValue(decision) },
+        BRANCH,
+      ),
+      new PostgresExpirationApplicationPreparationStore(
+        pool,
+        BRANCH,
+        () => new Date(at),
+      ),
+      () => new Date(at),
+      delivery,
+      ledger,
+      coordinator,
+      new PostgresExpirationApplicationStaleStore(
+        pool,
+        BRANCH,
+        () => new Date(at),
+      ),
+    );
+  }
+  async function until(check: () => Promise<boolean>) {
+    const deadline = Date.now() + 12_000;
+    while (Date.now() < deadline) {
+      if (await check()) return;
+      await delay(20);
+    }
+    throw new Error('Composed poller did not reach expected durable state');
+  }
+  function acknowledgeReports() {
+    report = jest.fn(async (id, request) => ({
+      id,
+      version: 2 as const,
+      attemptId: request.attemptId,
+      outcome: request.outcome,
+      ackReceivedAt: END,
+    }));
+  }
+  it.each(['none', 'report', 'closure'] as const)(
+    'composes send through durable closure, recovering %s failure without resend',
+    async (failure) => {
+      await seedRecorded();
+      acknowledgeReports();
+      if (failure === 'report')
+        report.mockRejectedValueOnce(
+          new Error('simulated unavailable backend'),
+        );
+      const send = jest
+        .fn()
+        .mockResolvedValue({ providerMessageId: 'wamid.accepted' });
+      const poller = composePoller(first, AT, send, failure === 'closure');
+      poller.start();
+      try {
+        await until(async () => report.mock.calls.length === 1);
+      } finally {
+        await poller.stop();
+      }
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledWith({
+        to: SENDER,
+        text: expect.stringContaining('Food') as unknown,
+      });
+      const before = await snapshot();
+      expect(before.reservations[0].status).toBe(
+        failure === 'none' ? 'CLOSED' : 'ACTIVE',
+      );
+      expect(before.outcome).toMatchObject({
+        action: 'foundOutcome',
+        row: {
+          state: 'PROVIDER_ACCEPTED',
+          providerMessageId: 'wamid.accepted',
+        },
+        receipt: failure === 'report' ? null : { outcome: 'PROVIDER_ACCEPTED' },
+      });
+      if (failure !== 'none') {
+        const fresh = new Pool(config());
+        const recovery = composePoller(fresh, END, send);
+        recovery.start();
+        try {
+          await until(
+            async () => (await snapshot()).reservations[0].status === 'CLOSED',
+          );
+        } finally {
+          await recovery.stop();
+          await fresh.end();
+        }
+      }
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(report).toHaveBeenCalledTimes(failure === 'report' ? 2 : 1);
+      const after = await snapshot();
+      expect(after.reservations[0].status).toBe('CLOSED');
+      expect(after.outcome).toMatchObject({
+        action: 'foundOutcome',
+        receipt: { outcome: 'PROVIDER_ACCEPTED' },
+      });
+      expect(
+        await new PostgresExpirationRecoveryDiscoveryStore(
+          observer,
+        ).discoverRecordedHints({ limit: 1, afterRequestKey: null }),
+      ).toEqual({ action: 'page', hints: [], nextCursor: null });
+    },
+  );
+  it.each([false, true])(
+    'recovers STALE to ACK/closure across fresh pollers without send (prepared=%s)',
+    async (prepared) => {
+      await seedRecorded();
+      if (prepared) {
+        const original = await new ExpirationExistingDecisionService(
+          new Context(first),
+          { getExpirationDecision: jest.fn().mockResolvedValue(decision) },
+          BRANCH,
+        ).readExistingDecision(SENDER);
+        const input = createExpirationPreparationCandidate(
+          SENDER,
+          original,
+          AT,
+        );
+        if (input.action !== 'candidate') throw new Error('Candidate required');
+        expect(
+          (
+            await new PostgresExpirationApplicationPreparationStore(
+              first,
+              BRANCH,
+              () => new Date(AT),
+            ).preparePending(input)
+          ).action,
+        ).toBe('prepared');
+      }
+      acknowledgeReports();
+      const send = jest.fn();
+      const poller = composePoller(first, END, send);
+      poller.start();
+      try {
+        await until(
+          async () =>
+            (await new Ledger(observer).readOutcomeByDecision(ID)).action ===
+            'foundOutcome',
+        );
+      } finally {
+        await poller.stop();
+      }
+      expect(report).not.toHaveBeenCalled();
+      expect((await snapshot()).outcome).toMatchObject({
+        action: 'foundOutcome',
+        row: { state: 'STALE' },
+        receipt: null,
+      });
+      const fresh = new Pool(config());
+      const recovery = composePoller(fresh, END, send);
+      recovery.start();
+      try {
+        await until(
+          async () => (await snapshot()).reservations[0].status === 'CLOSED',
+        );
+      } finally {
+        await recovery.stop();
+        await fresh.end();
+      }
+      expect(send).not.toHaveBeenCalled();
+      expect(report).toHaveBeenCalledTimes(1);
+      expect(report).toHaveBeenCalledWith(ID, {
+        attemptId: expect.any(String) as unknown,
+        expectedResolutionVersion: 2,
+        outcome: 'STALE',
+      });
+      expect((await snapshot()).outcome).toMatchObject({
+        action: 'foundOutcome',
+        receipt: { outcome: 'STALE' },
+      });
+    },
+  );
   async function freshAndStable(expected: unknown) {
     const calls = report.mock.calls.length;
     const fresh = new Pool(config());
