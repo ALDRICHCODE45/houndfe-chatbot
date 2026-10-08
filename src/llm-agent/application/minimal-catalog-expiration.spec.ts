@@ -117,6 +117,64 @@ const invoke = (service: MinimalCatalogAgentService, inboundEvent?: unknown) =>
 describe('MinimalCatalogAgentService EXPIRATION capability (default-off E1)', () => {
   afterEach(() => jest.restoreAllMocks());
 
+  it.each([
+    '00000000-0000-0000-0000-000000000000',
+    'ffffffff-ffff-ffff-ffff-ffffffffffff',
+    '',
+    'null',
+  ])(
+    'rejects placeholder variant %s before executing the tool',
+    async (variantId) => {
+      const h = expiration({ action: 'receipt_recorded' });
+      const prepare = jest.spyOn(h.service, 'prepare');
+      const app = build(
+        [
+          call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+          call('e1', 'prepareExpiration', { productId: PRODUCT, variantId }),
+          say('No se registró la consulta.'),
+        ],
+        h.service,
+      );
+      await invoke(app.service, INBOUND);
+      expect(prepare).not.toHaveBeenCalled();
+      expect(h.reserve).not.toHaveBeenCalled();
+      expect(h.orchestrate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('instructs omission and registers a simple product without a variant through the SDK', async () => {
+    const h = expiration({
+      action: 'receipt_recorded',
+      backendDecisionId: BACKEND,
+    });
+    const app = build(
+      [
+        call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
+        call('e1', 'prepareExpiration', { productId: PRODUCT }),
+        say('respuesta del modelo'),
+      ],
+      h.service,
+    );
+    expect(await invoke(app.service, INBOUND)).toMatchObject({
+      reply: REGISTERED,
+    });
+    expect(String(app.captured[0].system)).toContain(
+      'Si el producto no tiene variantes, omite variantId',
+    );
+    expect(h.reserve).toHaveBeenCalledWith({
+      senderId: SENDER,
+      route: 'EXPIRATION',
+      requestKey: SOURCE,
+      intake: {
+        sourceRequestId: SOURCE,
+        type: 'EXPIRATION',
+        productId: PRODUCT,
+        variantId: null,
+      },
+    });
+    expect(h.orchestrate).toHaveBeenCalledTimes(1);
+  });
+
   it('exposes prepareExpiration only when enabled and the inbound is bound', async () => {
     const off = build([say('hola')], expiration({}, false).service);
     const unbound = build([say('hola')], expiration({}).service);

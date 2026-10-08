@@ -165,6 +165,13 @@ A rejected intake emits `expiration_intake stage=<stage> reason=<reason>` from
 messages, credentials, or human text are included. `exception` identifies the
 stage only, not the underlying cause. Customer replies and admission rules are
 unchanged; these warnings do not prove a backend request occurred.
+The EXPIRATION tool UUID schema also applies the intake version/variant pattern:
+Zod's special nil/max UUIDs are rejected before service execution. The model is
+instructed to omit `variantId` for products without variants, never to supply a
+placeholder. RESTOCK schemas and the service's grounding rules are unchanged.
+This closes a reproduced schema mismatch; it does not prove which argument was
+sent in the production incident.
+
 Invalid-ID warnings additionally include a fixed `shape` code: `absent`, `null`,
 `wrong_type`, or `invalid_format`. The argument value is never logged. An omitted
 variant remains accepted; this diagnostic does not relax UUID validation.

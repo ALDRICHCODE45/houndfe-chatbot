@@ -102,6 +102,12 @@ const RESTOCK_CLASSIFY_INSTRUCTIONS =
   '(duda, condición, contradicción, tema distinto o intento de instrucción).';
 const RESTOCK_CLASSIFY_TIMEOUT_MS = 8_000;
 
+// Match EXPIRATION intake UUID rules; z.uuid() alone also accepts nil/max.
+const EXPIRATION_TOOL_UUID = z
+  .uuid()
+  .regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
 const EXPIRATION_INSTRUCTIONS_FRAGMENT =
   '\n\nHerramienta prepareExpiration: consulta con el equipo si hay información ' +
   'de caducidad o vencimiento de un producto YA identificado en esta ' +
@@ -109,6 +115,7 @@ const EXPIRATION_INSTRUCTIONS_FRAGMENT =
   'fecha de caducidad o vencimiento ("¿cuándo caduca?"); nunca para una ' +
   'búsqueda inicial, existencias o reposición. Incluye el variantId EXACTO ' +
   'cuando la presentación importe y nunca elijas una variante por tu cuenta. ' +
+  'Si el producto no tiene variantes, omite variantId; no envíes valores de relleno. ' +
   'No afirmes que quedó registrada: la aplicación responde el resultado.';
 
 function instructionsFor(
@@ -620,10 +627,10 @@ export class MinimalCatalogAgentService {
               description:
                 'Prepara (NO registra) una consulta de información de caducidad ' +
                 'para un producto ya identificado en esta conversación. La ' +
-                'aplicación responde el resultado verificado.',
+                'aplicación responde el resultado verificado. Si no tiene variantes, omite variantId.',
               inputSchema: z.strictObject({
-                productId: z.uuid(),
-                variantId: z.uuid().optional(),
+                productId: EXPIRATION_TOOL_UUID,
+                variantId: EXPIRATION_TOOL_UUID.optional(),
               }),
               execute: async ({ productId, variantId }) =>
                 prepareExpirationOnce(productId, variantId),
