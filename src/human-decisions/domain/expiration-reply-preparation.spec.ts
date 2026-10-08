@@ -76,7 +76,7 @@ describe('inactive EXPIRATION customer reply preparation', () => {
         : 'Alimento original';
       expect(prepareExpirationReply(input)).toEqual({
         action: 'prepared',
-        text: `Sobre la caducidad de ${subject}:\nEl equipo de HoundFe no pudo confirmar la fecha de caducidad.`,
+        text: `Sobre el ${subject}, el equipo no pudo confirmar la fecha de caducidad. ¿Desea continuar con la compra o prefiere que le ayude con alguna otra consulta?`,
       });
     },
   );

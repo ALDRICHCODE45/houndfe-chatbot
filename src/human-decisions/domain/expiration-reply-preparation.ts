@@ -37,11 +37,10 @@ export function prepareExpirationReply(
     variantId === null
       ? productName
       : `${productName} (presentación: ${variantName})`;
-  const answer =
+  const text =
     decision.resolution.action === 'PROVIDE_EXPIRATION_TEXT'
-      ? `El equipo de HoundFe indicó:\n${decision.resolution.expirationText}`
-      : 'El equipo de HoundFe no pudo confirmar la fecha de caducidad.';
-  const text = `Sobre la caducidad de ${subject}:\n${answer}`;
+      ? `Sobre la caducidad de ${subject}:\nEl equipo de HoundFe indicó:\n${decision.resolution.expirationText}`
+      : `Sobre el ${subject}, el equipo no pudo confirmar la fecha de caducidad. ¿Desea continuar con la compra o prefiere que le ayude con alguna otra consulta?`;
   return text.length <= MAX_TEXT_LENGTH
     ? Object.freeze({ action: 'prepared', text })
     : HOLD;
