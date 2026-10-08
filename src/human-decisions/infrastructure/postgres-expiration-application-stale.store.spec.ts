@@ -381,7 +381,7 @@ describe('inactive transactional EXPIRATION STALE', () => {
     expect(h.events.at(-1)).toBe('ROLLBACK');
   });
 
-  it.each(['missing', 'started'] as const)(
+  it.each(['started'] as const)(
     'new entry holds %s ledger without CAS',
     async (ledger) => {
       const h = harness();
@@ -391,22 +391,99 @@ describe('inactive transactional EXPIRATION STALE', () => {
           sendToken: id,
           attemptedAt: start,
         });
-      const execute = h.query.getMockImplementation()!;
-      h.query.mockImplementation(async (sql, values) => {
-        if (
-          ledger === 'missing' &&
-          sql.includes('expiration_application_ledger') &&
-          sql.includes('FOR UPDATE')
-        )
-          return { rowCount: 0, rows: [] };
-        return execute(sql, values);
-      });
       expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual(hold);
       expect(h.events).not.toContain('cas');
       expect(h.events.at(-1)).toBe('ROLLBACK');
     },
   );
 
+  function absentLedger(mode: 'insert' | 'conflict' | 'uncertain' = 'insert') {
+    const h = harness();
+    const execute = h.query.getMockImplementation()!;
+    h.query.mockImplementation(async (sql, values) => {
+      if (
+        sql.includes('expiration_application_ledger') &&
+        sql.includes('FOR UPDATE')
+      ) {
+        h.events.push('absent');
+        return { rowCount: 0, rows: [] };
+      }
+      if (sql.startsWith('INSERT')) {
+        h.events.push('insert');
+        if (mode === 'conflict') return { rowCount: 0, rows: [] };
+        return {
+          rowCount: 1,
+          rows: [
+            {
+              decision_id: id,
+              source_request_id: source,
+              attempt_id: h.expected.attemptId,
+              sender_id: 'customer',
+              branch_id: ' branch ',
+              row_data: JSON.parse(values![5] as string) as Record<
+                string,
+                unknown
+              >,
+            },
+          ],
+        };
+      }
+      if (sql === 'COMMIT' && mode === 'uncertain')
+        throw new Error('lost connection');
+      return execute(sql, values);
+    });
+    return h;
+  }
+  it('inserts only STALE for expired resolved evidence with an absent ledger', async () => {
+    const h = absentLedger();
+    const row = { ...h.expected, state: 'STALE', staleObservedAt: end };
+    expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual({
+      action: 'recordedStale',
+      row,
+    });
+    expect(h.events).toEqual([
+      'BEGIN',
+      'reservation-lock',
+      'context',
+      'absent',
+      'clock',
+      'insert',
+      'COMMIT',
+    ]);
+    const [sql, values] = h.query.mock.calls.find(([text]) =>
+      text.startsWith('INSERT'),
+    )!;
+    expect(sql).toContain('ON CONFLICT DO NOTHING');
+    expect(sql).not.toContain('DO UPDATE');
+    expect(values).toEqual([
+      id,
+      source,
+      h.expected.attemptId,
+      'customer',
+      ' branch ',
+      JSON.stringify(row),
+    ]);
+    expect(row).not.toHaveProperty('attemptedAt');
+    expect(row).not.toHaveProperty('sendToken');
+  });
+  it.each(['conflict', 'uncertain'] as const)(
+    'holds missing-ledger %s without retry or overwrite',
+    async (mode) => {
+      const h = absentLedger(mode);
+      expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual(hold);
+      expect(h.events.filter((event) => event === 'insert')).toHaveLength(1);
+      expect(h.events).not.toContain('cas');
+      expect(h.events.at(-1)).toBe('ROLLBACK');
+    },
+  );
+  it('keeps the candidate API missing-row behavior and rejects unexpired absent rows', async () => {
+    const h = absentLedger();
+    expect(await h.store.expirePending(h.candidate)).toEqual(hold);
+    h.clock.mockReturnValue(new Date(start));
+    expect(await h.store.expireResolvedOutcome(evidence(h))).toEqual(hold);
+    expect(h.events).not.toContain('insert');
+    expect(h.events).not.toContain('cas');
+  });
   it('both entries hold malformed arguments without side effects', async () => {
     const h = harness();
     expect(

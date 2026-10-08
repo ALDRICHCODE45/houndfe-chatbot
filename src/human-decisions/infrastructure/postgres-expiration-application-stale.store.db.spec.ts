@@ -197,6 +197,77 @@ ddescribe('EXPIRATION STALE versus begin-send in real PostgreSQL', () => {
     clocks.claim.mockClear();
     clocks.stale.mockClear();
   });
+  const resolvedEvidence = () => ({
+    outcome: 'resolved' as const,
+    binding: candidate.binding,
+    decision: candidate.decision,
+  });
+  it('inserts a missing STALE directly and preserves it on a later sweep', async () => {
+    await observer.query('DELETE FROM expiration_application_ledger');
+    now = END;
+    const store = new PostgresExpirationApplicationStaleStore(
+      first,
+      BRANCH,
+      clocks.stale,
+    );
+    const before = await context();
+    expect(await store.expireResolvedOutcome(resolvedEvidence())).toEqual(
+      stale(),
+    );
+    const stored = await observer.query<{ row_data: unknown }>(
+      'SELECT row_data FROM expiration_application_ledger',
+    );
+    expect(stored.rows).toEqual([{ row_data: stale().row }]);
+    expect(stored.rows[0].row_data).not.toHaveProperty('attemptedAt');
+    expect(stored.rows[0].row_data).not.toHaveProperty('sendToken');
+    expect(await store.expireResolvedOutcome(resolvedEvidence())).toEqual(hold);
+    expect(
+      (
+        await observer.query(
+          'SELECT row_data FROM expiration_application_ledger',
+        )
+      ).rows,
+    ).toEqual(stored.rows);
+    expect(await context()).toEqual(before);
+  });
+  it('holds an insert race without overwriting a concurrently inserted pending row', async () => {
+    await observer.query('DELETE FROM expiration_application_ledger');
+    now = END;
+    const client = await first.connect();
+    let raced = false;
+    const competing = new PostgresExpirationApplicationLedgerStore(second);
+    const wrapped = {
+      connect: async () => ({
+        query: async (sql: string, values?: unknown[]) => {
+          const result = await client.query(sql, values);
+          if (
+            sql.includes('expiration_application_ledger') &&
+            sql.includes('FOR UPDATE') &&
+            result.rowCount === 0
+          ) {
+            raced = true;
+            expect((await competing.insertPending(pending)).action).toBe(
+              'inserted',
+            );
+          }
+          return result;
+        },
+        release: () => client.release(),
+      }),
+    } as unknown as Pool;
+    expect(
+      await new PostgresExpirationApplicationStaleStore(
+        wrapped,
+        BRANCH,
+        clocks.stale,
+      ).expireResolvedOutcome(resolvedEvidence()),
+    ).toEqual(hold);
+    expect(raced).toBe(true);
+    expect(await competing.readByDecision(ID)).toEqual({
+      action: 'foundPending',
+      row: pending,
+    });
+  });
   async function blocked(blocker: number, waiter: number, table: string) {
     const until = Date.now() + 5_000;
     while (Date.now() < until) {

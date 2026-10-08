@@ -16,7 +16,8 @@ export type ExpirationOutcomeContext =
   | Resolved;
 
 /** Terminal-only validation, never send authority. Resolved evidence is accepted
- * only for STALE written by the guarded local PENDING-to-STALE transaction.
+ * only for STALE written by the guarded local stale-store transaction (exact
+ * PENDING transition or conflict-safe insertion from explicit absence).
  * This relies on controlled application writers, not shape as historical proof;
  * out-of-band sends/manual ledger writes are outside that trust boundary.
  * staleObservedAt is preserved evidence of expiry, not a reconstructed candidate

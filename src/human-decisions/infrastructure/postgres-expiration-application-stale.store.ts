@@ -19,6 +19,9 @@ import { PostgresExpirationApplicationContextStore } from './postgres-expiration
 
 const COLUMNS =
   'decision_id, source_request_id, attempt_id, sender_id, branch_id, row_data';
+const INSERT = `INSERT INTO expiration_application_ledger (${COLUMNS})
+VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+ON CONFLICT DO NOTHING RETURNING ${COLUMNS}`;
 const CAS = `UPDATE expiration_application_ledger SET row_data = $7::jsonb
 WHERE decision_id = $1 AND source_request_id = $2 AND attempt_id = $3
 AND sender_id = $4 AND branch_id = $5 AND row_data = $6::jsonb
@@ -58,13 +61,17 @@ function release(client: PoolClient, poisoned?: Error): void {
   }
 }
 
-/** Inactive local expiration of an originally prepared, still-unsent row.
+/** Local expiration of an unsent row, or direct STALE insertion for a resolved
+ * decision first observed expired. Missing-row insertion is resolved-entry only.
+ * Controlled application writers never delete ledger rows; absence is not proof
+ * against manual deletion or out-of-band sending. Conflicts hold, never overwrite.
  * Requires trusted original candidate/remote decision provenance and every send
  * path to persist SEND_STARTED first; cannot prove out-of-band provider history.
- * Reservation then ledger locks exclude competing local claims before a fresh
- * clock sample. checkedAt is never reused. Only confirmed COMMIT yields success.
+ * Reservation then existing-ledger locks exclude competing local claims before
+ * a fresh clock sample; absent rows rely on conflict-safe INSERT instead.
+ * checkedAt is never reused. Only confirmed COMMIT yields success.
  * Failure/uncertain COMMIT holds without retry; rollback is cleanup, not proof
- * of undo. No ACK, reservation closure, runtime wiring or WhatsApp permission. */
+ * of undo. No ACK, reservation closure or WhatsApp permission. */
 export class PostgresExpirationApplicationStaleStore {
   constructor(
     private readonly pool: Pool,
@@ -98,12 +105,13 @@ export class PostgresExpirationApplicationStaleStore {
       outcome.outcome !== 'resolved'
     )
       return HOLD;
-    return this.expireResolved(outcome.binding, outcome.decision);
+    return this.expireResolved(outcome.binding, outcome.decision, true);
   }
 
   private async expireResolved(
     binding: ExpirationDecisionBinding,
     decisionInput: ExpirationDecisionResolved,
+    allowMissing = false,
   ): Promise<Result> {
     let client: PoolClient | undefined;
     let committed = false;
@@ -161,7 +169,12 @@ export class PostgresExpirationApplicationStaleStore {
         `SELECT ${COLUMNS} FROM expiration_application_ledger WHERE decision_id=$1 FOR UPDATE`,
         [decision.id],
       );
-      if (!matches(pending, expected)) return HOLD;
+      const missing =
+        allowMissing &&
+        pending.rowCount === 0 &&
+        Array.isArray(pending.rows) &&
+        pending.rows.length === 0;
+      if (!missing && !matches(pending, expected)) return HOLD;
       const now = Date.prototype.toISOString.call(this.clock());
       const policy = classifyExpirationApplication({
         senderId,
@@ -178,15 +191,19 @@ export class PostgresExpirationApplicationStaleStore {
         staleObservedAt: now,
       });
       if (!next || next.state !== 'STALE') return HOLD;
-      const result = await client.query<Record<string, unknown>>(CAS, [
+      const identity = [
         expected.decisionId,
         expected.sourceRequestId,
         expected.attemptId,
         senderId,
         branchId,
-        JSON.stringify(expected),
-        JSON.stringify(next),
-      ]);
+      ];
+      const result = await client.query<Record<string, unknown>>(
+        missing ? INSERT : CAS,
+        missing
+          ? [...identity, JSON.stringify(next)]
+          : [...identity, JSON.stringify(expected), JSON.stringify(next)],
+      );
       if (!matches(result, next)) return HOLD;
       await client.query('COMMIT');
       committed = true;

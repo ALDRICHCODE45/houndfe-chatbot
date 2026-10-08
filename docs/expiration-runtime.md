@@ -1,6 +1,6 @@
 # EXPIRATION runtime — default-off intake
 
-Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery includes controlled-writer STALE recovery; expired/no-ledger handling and deployment rehearsal pending.** Business/wire rules remain authoritative in
+Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery includes controlled-writer STALE recovery; expired/no-ledger handling included; full-flow deployment rehearsal pending.** Business/wire rules remain authoritative in
 `docs/human-decisions-expiration-v1.md`. E1 is split into two units:
 
 - **E1a (this unit):** the default-off callee — one cohesive service plus the
@@ -98,8 +98,8 @@ without constructing an in-window candidate. A shared terminal-only validator
 uses the row's actual `staleObservedAt` to validate expiry and detaches the
 original context before awaits; coordinator and closure still recheck exact
 identity, durable context, row and ACK. Recovery trusts the controlled application
-write surface: only the guarded exact PENDING-to-STALE transaction produces
-STALE. Row shape or lock equality alone is not historical no-send proof; manual
+write surface: only the guarded stale-store transaction produces STALE, from
+exact PENDING or an explicitly absent ledger row for trusted resolved evidence. Row shape or lock equality alone is not historical no-send proof; manual
 ledger imports and out-of-band sends are not covered by this trust boundary.
 `PostgresExpirationApplicationStaleStore` exposes a second explicit entry,
 `expireResolvedOutcome`, beside the unchanged in-window candidate entry
@@ -108,8 +108,12 @@ evidence (for example a decision first consumed after its window closed) that th
 in-window candidate factory refuses, without fabricating `checkedAt` or dressing
 it as a candidate; both entries share the same reservation/ledger locks, context
 revalidation, exact `PENDING_DELIVERY` CAS and fresh-clock policy, so a row is
-marked `STALE` only when that fresh clock classifies `expired`. Missing,
-non-pending, foreign `STALE` and already-started rows still hold with no CAS.
+marked `STALE` only when that fresh clock classifies `expired`. The resolved
+entry can insert STALE directly when the locked read returns explicit absence;
+no PENDING or send history is fabricated. A missing row cannot be row-locked:
+`ON CONFLICT DO NOTHING` protects both decision and attempt identity. Any lost
+insert race holds without reread, overwrite or retry. The older `expirePending`
+entry still holds on absence. Non-pending and already-started rows hold unchanged.
 The enabled runtime now supplies this store to the poller. After the terminal
 read, an explicitly `expired` policy result routes trusted resolved evidence to
 `expireResolvedOutcome`, never to preparation or delivery. The store rechecks
@@ -135,9 +139,11 @@ branch and `meta.phoneNumberId`.
   changed durable context/row/ACK or uncertain I/O holds without a send.
   Existing valid ACK skips reporting; closure still requires confirmed COMMIT.
   `PROVIDER_ACCEPTED_LATE` never auto-closes.
-- **First observed expired without a ledger row still holds.** No row is created,
-  no outcome is reported and the ACTIVE inquiry is revisited on future sweeps.
-  This unresolved case and operational visibility remain readiness gaps.
+- **First observed expired without a ledger row inserts STALE conditionally.**
+  The reservation/context must remain exact and the transaction must commit.
+  The next sweep reports/ACKs/closes through the existing terminal path.
+  This assumes controlled writers never delete ledger history; manual deletion
+  or out-of-band sends are not certified by absence. Conflicts remain held.
 - **Conditional replay/closure is not proven end-to-end.** Ledger/report
   idempotency and the completion store `COMMIT` path were not exercised against
   a live database; only focused fake-port tests ran.

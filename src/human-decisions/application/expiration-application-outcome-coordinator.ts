@@ -28,7 +28,7 @@ const HOLD: Result = Object.freeze({ action: 'hold' });
  * Requires trusted original candidate/remote provenance and contract-correct
  * ports: ledger observations use committed standalone Pool operations, not an
  * outer transaction client. STALE recovery trusts only controlled application
- * writers: the guarded PENDING-to-STALE store, not arbitrary ledger imports.
+ * writers: the guarded stale store, not arbitrary ledger imports or deletions.
  * Snapshot checks are not remote atomicity; concurrent invocations may report
  * the same attempt. Each invocation reports at most once. Existing ACK skips
  * report/write; LATE may be recorded but never closes. A CAS result alone is not
