@@ -112,6 +112,133 @@ function setup() {
 describe('Minimal cart through the public SDK route', () => {
   afterEach(() => jest.restoreAllMocks());
 
+  it.each(['setCartItem', 'adjustCartItem'] as const)(
+    '%s binds variant guidance to the selected product and preserves mixed carts',
+    async (name) => {
+      const f = setup();
+      const otherId = '33333333-3333-4333-8333-333333333333';
+      const otherVariant = '22222222-2222-4222-8222-222222222222';
+      const variant = {
+        variantId: otherVariant,
+        name: '250mg',
+        priceCents: 13000,
+        stock: { status: 'available', quantity: 10 },
+      };
+      f.api.searchCatalog.mockResolvedValue([
+        {
+          productId: ID,
+          name: 'Croquetas Nupec',
+          price: { priceCents: 45000 },
+          variants: [],
+        },
+        {
+          productId: otherId,
+          name: 'Ibuprofeno',
+          price: { priceCents: null },
+          variants: [variant],
+        },
+      ] as never);
+      f.api.getStock.mockImplementation(
+        async (productId) =>
+          ({
+            productId,
+            name: productId === ID ? 'Croquetas Nupec' : 'Ibuprofeno',
+            stock: { status: 'available', quantity: 10 },
+            variants: productId === ID ? [] : [variant],
+          }) as never,
+      );
+      f.api.evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          ...item,
+          variantId: item.variantId ?? null,
+          originalPriceCents: item.quantity * item.unitPriceCents,
+          finalPriceCents: item.quantity * item.unitPriceCents,
+          discountAmountCents: 0,
+          appliedPromotionTitle: null,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      expect(
+        await f.cart.setItem(
+          SENDER,
+          {
+            productId: otherId,
+            variantId: otherVariant,
+            quantity: 2,
+          },
+          new Set([otherId]),
+        ),
+      ).toMatchObject({ ok: true });
+      const before = await f.cart.view(SENDER);
+      const writes = jest.spyOn(f.store, 'commitMinimalCart');
+      const mutation = name === 'setCartItem' ? { quantity: 1 } : { delta: 1 };
+      const agent = f.createAgent();
+      f.steps([
+        call('getCart', {}),
+        call('searchCatalog', { q: 'croquetas' }),
+        call(name, { productId: ID, variantId: otherVariant, ...mutation }),
+        say(),
+      ]);
+      expect(
+        await agent.tryHandle({
+          senderId: SENDER,
+          text: 'Esa opcion me parece perfecta, agrega a mi carrito una unidad por favor.',
+        }),
+      ).toEqual({
+        kind: 'handled',
+        reply:
+          'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+      });
+      expect(writes).not.toHaveBeenCalled();
+      expect(await f.cart.view(SENDER)).toEqual(before);
+      f.steps([
+        call('searchCatalog', { q: 'croquetas' }),
+        call(name, { productId: ID, ...mutation }),
+        say(),
+      ]);
+      expect(
+        await agent.tryHandle({
+          senderId: SENDER,
+          text: 'Agrega una unidad de Croquetas Nupec',
+        }),
+      ).toEqual({
+        kind: 'handled',
+        reply:
+          'Su carrito:\n• Ibuprofeno — 250mg: 2 × $130.00 MXN; importe $260.00 MXN\n• Croquetas Nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $710.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+      });
+      expect(writes).toHaveBeenCalledTimes(1);
+      expect(await f.cart.view(SENDER)).toMatchObject({
+        ok: true,
+        totalCents: 71000,
+        items: [
+          { productId: otherId, variantId: otherVariant, quantity: 2 },
+          { productId: ID, quantity: 1 },
+        ],
+      });
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+      for (const options of f.optionsSeen) {
+        expect(options.system).toContain(
+          'Si el producto no tiene variantes, omita variantId',
+        );
+        expect(options.system).toContain(
+          'Nunca invente un variantId ni copie el de otro producto',
+        );
+        expect(options.system).toContain(
+          'Tras invalid_variant, no repita la llamada con la misma identidad',
+        );
+        const cartTool = options.tools?.[name] as
+          | { description?: unknown }
+          | undefined;
+        expect(cartTool?.description).toEqual(
+          expect.stringContaining(
+            'Si el producto no tiene variantes, omita variantId',
+          ),
+        );
+      }
+    },
+  );
+
   const cartTools = [
     { name: 'getCart', input: {}, quantity: 0 },
     { name: 'setCartItem', input: { productId: ID, quantity: 2 }, quantity: 2 },

@@ -211,6 +211,12 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 
+const CART_VARIANT_GUIDANCE =
+  'Copie productId exactamente de las herramientas. Si el producto no tiene variantes, omita variantId; no envíe valores de relleno. ' +
+  'Si tiene variantes, use solo el variantId de la presentación elegida, devuelto por searchCatalog/checkStock para ese mismo productId o por getCart para ese mismo renglón. ' +
+  'Nunca invente un variantId ni copie el de otro producto, aunque ya esté en el carrito. Si falta la presentación elegida, pregunte; no la deduzca. ' +
+  'Tras invalid_variant, no repita la llamada con la misma identidad ni pruebe IDs al azar; consulte el catálogo o solicite aclaración. Un rechazo no confirma ningún cambio.';
+
 // Identity + price projection with product and variant stock stripped.
 function projectItem(item: CatalogItemResponse) {
   const { stock, variants, ...identity } = item;
@@ -379,6 +385,8 @@ export class MinimalCatalogAgentService {
         '«Quita el producto» elimina el renglón con setCartItem(quantity: 0); «Quita uno» resta una unidad con adjustCartItem(delta: -1). ' +
         'Use adjustCartItem para agregar o quitar unidades; la aplicación calcula el nuevo total. No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
+        CART_VARIANT_GUIDANCE +
+        ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta.'
       : baseInstructions;
@@ -692,7 +700,8 @@ export class MinimalCatalogAgentService {
           }),
           adjustCartItem: tool({
             description:
-              'Suma o resta unidades de un producto/presentación elegido. Delta positivo agrega; negativo quita unidades; cero resultante elimina el renglón. La aplicación calcula el total. No crea pedidos ni reserva existencias.',
+              'Suma o resta unidades de un producto/presentación elegido. Delta positivo agrega; negativo quita unidades; cero resultante elimina el renglón. La aplicación calcula el total. No crea pedidos ni reserva existencias. ' +
+              CART_VARIANT_GUIDANCE,
             inputSchema: minimalCartAdjustmentInput,
             execute: async (input) => {
               const result = await cart.adjustItem(
@@ -708,7 +717,8 @@ export class MinimalCatalogAgentService {
           }),
           setCartItem: tool({
             description:
-              'Fija la cantidad TOTAL de un producto/presentación elegido por el cliente. Cero lo quita. No acepta precios, no reserva existencias ni crea pedidos.',
+              'Fija la cantidad TOTAL de un producto/presentación elegido por el cliente. Cero lo quita. No acepta precios, no reserva existencias ni crea pedidos. ' +
+              CART_VARIANT_GUIDANCE,
             inputSchema: minimalCartInput,
             execute: async (input) => {
               const result = await cart.setItem(
