@@ -50,6 +50,29 @@ interface ConversationRow {
 export class PostgresConversationStore implements ConversationStore {
   constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
 
+  async commitMinimalCart(
+    senderId: string,
+    expected: unknown,
+    next: unknown,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    const absent = expected === undefined;
+    const condition = absent
+      ? "NOT (conversation_state.data ? 'minimalCart')"
+      : "conversation_state.data->'minimalCart' = $4::jsonb";
+    const merge = `data = conversation_state.data || jsonb_build_object('minimalCart', $3::jsonb),
+      last_message_at = GREATEST(conversation_state.last_message_at, $2::timestamptz)`;
+    const sql = absent
+      ? `INSERT INTO conversation_state (sender_id, last_message_at, data)
+         VALUES ($1, $2::timestamptz, jsonb_build_object('minimalCart', $3::jsonb))
+         ON CONFLICT (sender_id) DO UPDATE SET ${merge} WHERE ${condition}`
+      : `UPDATE conversation_state SET ${merge} WHERE sender_id = $1 AND ${condition}`;
+    const params = [senderId, lastMessageAt, JSON.stringify(next)];
+    if (!absent) params.push(JSON.stringify(expected));
+    const { rowCount } = await this.pool.query(sql, params);
+    return (rowCount ?? 0) === 1;
+  }
+
   async commitAgentTurn(
     senderId: string,
     turn: AgentTurnCommit,
@@ -336,6 +359,7 @@ export class PostgresConversationStore implements ConversationStore {
     delete data.messages;
     delete data.catalogReferences;
     delete data.agentRevision;
+    delete data.minimalCart;
 
     const { rows } = await this.pool.query<ConversationRow>(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
@@ -353,7 +377,7 @@ export class PostgresConversationStore implements ConversationStore {
                    ELSE '{}'::jsonb END
                  || (SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
                      FROM jsonb_each(conversation_state.data)
-                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision'))
+                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart'))
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );

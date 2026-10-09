@@ -27,6 +27,25 @@ import {
 export class InMemoryConversationStore implements ConversationStore {
   private readonly map = new Map<string, ConversationState>();
 
+  async commitMinimalCart(
+    senderId: string,
+    expected: unknown,
+    next: unknown,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    const live = this.map.get(senderId);
+    if (!isDeepStrictEqual(live?.data.minimalCart, expected)) return false;
+    this.map.set(senderId, {
+      senderId,
+      lastMessageAt:
+        live && Date.parse(live.lastMessageAt) > Date.parse(lastMessageAt)
+          ? live.lastMessageAt
+          : lastMessageAt,
+      data: { ...live?.data, minimalCart: structuredClone(next) },
+    });
+    return true;
+  }
+
   async commitAgentTurn(
     senderId: string,
     turn: AgentTurnCommit,
@@ -245,6 +264,7 @@ export class InMemoryConversationStore implements ConversationStore {
     delete data.messages;
     delete data.catalogReferences;
     delete data.agentRevision;
+    delete data.minimalCart;
     const safePatch = Object.hasOwn(patch, 'data') ? { ...patch, data } : patch;
     const merged = existing
       ? { ...existing, ...safePatch }
@@ -262,7 +282,7 @@ export class InMemoryConversationStore implements ConversationStore {
       data: {
         ...(merged.data ?? {}),
         ...Object.fromEntries(
-          ['messages', 'catalogReferences', 'agentRevision']
+          ['messages', 'catalogReferences', 'agentRevision', 'minimalCart']
             .filter((key) => existing && Object.hasOwn(existing.data, key))
             .map((key) => [key, existing!.data[key]]),
         ),

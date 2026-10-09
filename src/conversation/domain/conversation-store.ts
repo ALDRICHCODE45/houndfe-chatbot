@@ -249,6 +249,14 @@ export interface AgentTurnCommit {
 }
 
 export interface ConversationStore {
+  /** Optional for older adapters. CAS-owned minimal-route cart; preserves live siblings.
+   * Undefined expected means the key must be absent. False must not be retried blindly. */
+  commitMinimalCart?(
+    senderId: string,
+    expected: unknown,
+    next: unknown,
+    lastMessageAt: string,
+  ): Promise<boolean>;
   /** Atomic history CAS and live sibling merge. False never authorizes a retry. */
   commitAgentTurn(senderId: string, turn: AgentTurnCommit): Promise<boolean>;
   /**
