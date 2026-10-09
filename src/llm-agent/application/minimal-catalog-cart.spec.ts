@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createOpenAI } from '@ai-sdk/openai';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
@@ -25,7 +26,13 @@ const call = (name: string, input: unknown) =>
         type: 'tool-call',
         toolCallId: name,
         toolName: name,
-        input: JSON.stringify(input),
+        input: JSON.stringify(
+          (name === 'setCartItem' || name === 'adjustCartItem') &&
+            typeof input === 'object' &&
+            input !== null
+            ? { variantId: null, ...input }
+            : input,
+        ),
       },
     ],
     'tool-calls',
@@ -86,10 +93,10 @@ function setup() {
       model: new MockLanguageModelV4({ doGenerate: steps } as never),
     });
   };
-  const createAgent = () =>
+  const createAgent = (generateOverride: GenerateTextFn = generate) =>
     new MinimalCatalogAgentService(
       api,
-      generate,
+      generateOverride,
       new CostGuardService(100000),
       config,
       new InMemoryMinimalCatalogSessionStore(),
@@ -111,6 +118,210 @@ function setup() {
 
 describe('Minimal cart through the public SDK route', () => {
   afterEach(() => jest.restoreAllMocks());
+
+  it('sends explicit strict nullable cart schemas through the real OpenAI provider without network access', async () => {
+    const f = setup();
+    const requests: Array<{
+      tools: Array<{
+        name: string;
+        strict?: boolean;
+        parameters: {
+          required: string[];
+          additionalProperties: boolean;
+          properties: Record<string, { anyOf?: Array<{ type: string }> }>;
+        };
+      }>;
+    }> = [];
+    const offline = createOpenAI({
+      apiKey: 'synthetic-offline-key',
+      fetch: (_url, init) => {
+        const body = init?.body;
+        if (typeof body !== 'string') throw new Error('Expected JSON request');
+        requests.push(JSON.parse(body) as (typeof requests)[number]);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'offline',
+              object: 'response',
+              created_at: 0,
+              status: 'completed',
+              model: 'm',
+              output: [
+                {
+                  type: 'message',
+                  id: 'msg',
+                  status: 'completed',
+                  role: 'assistant',
+                  content: [
+                    { type: 'output_text', text: 'offline', annotations: [] },
+                  ],
+                },
+              ],
+              usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        );
+      },
+    });
+    await f
+      .createAgent((options) =>
+        generateText({ ...options, model: offline('m') }),
+      )
+      .tryHandle({ senderId: SENDER, text: 'Muestre mi carrito' });
+    expect(requests).toHaveLength(1);
+    for (const name of ['setCartItem', 'adjustCartItem']) {
+      const wire = requests[0].tools.find(
+        (candidate) => candidate.name === name,
+      );
+      expect(wire).toBeDefined();
+      expect(wire?.strict).toBe(true);
+      expect(wire?.parameters.additionalProperties).toBe(false);
+      expect(wire?.parameters.required.slice().sort()).toEqual(
+        Object.keys(wire?.parameters.properties ?? {}).sort(),
+      );
+      expect(
+        wire?.parameters.properties.variantId.anyOf?.map(
+          (schema) => schema.type,
+        ),
+      ).toContain('null');
+    }
+    expect(await f.cart.view(SENDER)).toMatchObject({
+      ok: true,
+      items: [],
+      totalCents: 0,
+    });
+    expect(f.api.searchCatalog).not.toHaveBeenCalled();
+    expect(f.api.getStock).not.toHaveBeenCalled();
+    expect(f.api.evaluateCart).not.toHaveBeenCalled();
+    expect(f.api.createSale).not.toHaveBeenCalled();
+  });
+
+  it.each(['setCartItem', 'adjustCartItem'] as const)(
+    '%s accepts null at the SDK boundary and omits it before domain validation',
+    async (name) => {
+      const f = setup();
+      const method = name === 'setCartItem' ? 'setItem' : 'adjustItem';
+      const domain = jest.spyOn(f.cart, method);
+      const mutation = name === 'setCartItem' ? { quantity: 2 } : { delta: 2 };
+      f.steps([
+        call('searchCatalog', { q: 'Product' }),
+        call(name, { productId: ID, variantId: null, ...mutation }),
+        say(),
+      ]);
+      expect(
+        await f
+          .createAgent()
+          .tryHandle({ senderId: SENDER, text: 'Agrega dos productos' }),
+      ).toEqual({
+        kind: 'handled',
+        reply:
+          'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+      });
+      expect(domain).toHaveBeenCalledTimes(1);
+      expect(domain.mock.calls[0][1]).toEqual({ productId: ID, ...mutation });
+      const view = await f.cart.view(SENDER);
+      expect(view).toMatchObject({
+        ok: true,
+        items: [{ productId: ID, quantity: 2 }],
+        totalCents: 2400,
+      });
+      if (view.ok) expect(view.items[0]).not.toHaveProperty('variantId');
+      expect(f.api.evaluateCart.mock.calls[0][0]).toEqual([
+        { productId: ID, quantity: 2, unitPriceCents: 1200 },
+      ]);
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { name: 'setCartItem', selected: true },
+    { name: 'adjustCartItem', selected: true },
+    { name: 'setCartItem', selected: false },
+    { name: 'adjustCartItem', selected: false },
+  ] as const)(
+    '$name preserves variant ownership and selection requirements (selected=$selected)',
+    async ({ name, selected }) => {
+      const f = setup();
+      const variantId = '22222222-2222-4222-8222-222222222222';
+      const variant = {
+        variantId,
+        name: '250mg',
+        priceCents: 1200,
+        stock: { status: 'available', quantity: 10 },
+      };
+      f.api.searchCatalog.mockResolvedValue([
+        {
+          productId: ID,
+          name: 'Product',
+          price: { priceCents: null },
+          variants: [variant],
+        },
+      ] as never);
+      f.api.getStock.mockResolvedValue({
+        productId: ID,
+        name: 'Product',
+        stock: { status: 'available', quantity: 10 },
+        variants: [variant],
+      } as never);
+      f.api.evaluateCart.mockResolvedValue({
+        items: [
+          {
+            productId: ID,
+            variantId,
+            quantity: 2,
+            unitPriceCents: 1200,
+            originalPriceCents: 2400,
+            finalPriceCents: 2400,
+            discountAmountCents: 0,
+            appliedPromotionTitle: null,
+          },
+        ],
+        promotionEvaluationStatus: 'fully_evaluated',
+      });
+      const writes = jest.spyOn(f.store, 'commitMinimalCart');
+      f.steps([
+        call('searchCatalog', { q: 'Product' }),
+        call(name, {
+          productId: ID,
+          variantId: selected ? variantId : null,
+          ...(name === 'setCartItem' ? { quantity: 2 } : { delta: 2 }),
+        }),
+        say(),
+      ]);
+      expect(
+        await f
+          .createAgent()
+          .tryHandle({ senderId: SENDER, text: 'Agrega dos' }),
+      ).toEqual({
+        kind: 'handled',
+        reply: selected
+          ? 'Su carrito:\n• Product — 250mg: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
+          : '¿Qué presentación desea agregar al carrito?',
+      });
+      expect(writes).toHaveBeenCalledTimes(selected ? 1 : 0);
+      if (selected) {
+        expect(f.api.evaluateCart.mock.calls[0][0]).toEqual([
+          { productId: ID, variantId, quantity: 2, unitPriceCents: 1200 },
+        ]);
+        expect(await f.cart.view(SENDER)).toMatchObject({
+          ok: true,
+          items: [{ productId: ID, variantId, quantity: 2 }],
+          totalCents: 2400,
+        });
+      } else {
+        expect(f.api.evaluateCart).not.toHaveBeenCalled();
+        expect(await f.cart.view(SENDER)).toMatchObject({
+          ok: true,
+          items: [],
+          totalCents: 0,
+        });
+      }
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(['setCartItem', 'adjustCartItem'] as const)(
     '%s binds variant guidance to the selected product and preserves mixed carts',
@@ -219,7 +430,7 @@ describe('Minimal cart through the public SDK route', () => {
       expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
       for (const options of f.optionsSeen) {
         expect(options.system).toContain(
-          'Si el producto no tiene variantes, omita variantId',
+          'Si el producto no tiene variantes, envíe variantId: null',
         );
         expect(options.system).toContain(
           'Nunca invente un variantId ni copie el de otro producto',
@@ -232,7 +443,7 @@ describe('Minimal cart through the public SDK route', () => {
           | undefined;
         expect(cartTool?.description).toEqual(
           expect.stringContaining(
-            'Si el producto no tiene variantes, omita variantId',
+            'Si el producto no tiene variantes, envíe variantId: null',
           ),
         );
       }

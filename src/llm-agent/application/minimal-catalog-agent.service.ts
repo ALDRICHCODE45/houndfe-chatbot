@@ -211,8 +211,17 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 
+// OpenAI strict function schemas represent absent values as required nulls.
+// Keep this transport shape separate from cart validation and persisted state.
+const cartToolInput = minimalCartInput.extend({
+  variantId: z.uuid().nullable(),
+});
+const cartAdjustmentToolInput = minimalCartAdjustmentInput.extend({
+  variantId: z.uuid().nullable(),
+});
+
 const CART_VARIANT_GUIDANCE =
-  'Copie productId exactamente de las herramientas. Si el producto no tiene variantes, omita variantId; no envíe valores de relleno. ' +
+  'Copie productId exactamente de las herramientas. Si el producto no tiene variantes, envíe variantId: null; no envíe valores de relleno. ' +
   'Si tiene variantes, use solo el variantId de la presentación elegida, devuelto por searchCatalog/checkStock para ese mismo productId o por getCart para ese mismo renglón. ' +
   'Nunca invente un variantId ni copie el de otro producto, aunque ya esté en el carrito. Si falta la presentación elegida, pregunte; no la deduzca. ' +
   'Tras invalid_variant, no repita la llamada con la misma identidad ni pruebe IDs al azar; consulte el catálogo o solicite aclaración. Un rechazo no confirma ningún cambio.';
@@ -702,11 +711,12 @@ export class MinimalCatalogAgentService {
             description:
               'Suma o resta unidades de un producto/presentación elegido. Delta positivo agrega; negativo quita unidades; cero resultante elimina el renglón. La aplicación calcula el total. No crea pedidos ni reserva existencias. ' +
               CART_VARIANT_GUIDANCE,
-            inputSchema: minimalCartAdjustmentInput,
-            execute: async (input) => {
+            inputSchema: cartAdjustmentToolInput,
+            strict: true,
+            execute: async ({ variantId, ...input }) => {
               const result = await cart.adjustItem(
                 context.senderId,
-                input,
+                variantId === null ? input : { ...input, variantId },
                 allowedIds,
                 traceInvalidVariant('adjustCartItem'),
               );
@@ -719,11 +729,12 @@ export class MinimalCatalogAgentService {
             description:
               'Fija la cantidad TOTAL de un producto/presentación elegido por el cliente. Cero lo quita. No acepta precios, no reserva existencias ni crea pedidos. ' +
               CART_VARIANT_GUIDANCE,
-            inputSchema: minimalCartInput,
-            execute: async (input) => {
+            inputSchema: cartToolInput,
+            strict: true,
+            execute: async ({ variantId, ...input }) => {
               const result = await cart.setItem(
                 context.senderId,
-                input,
+                variantId === null ? input : { ...input, variantId },
                 allowedIds,
                 traceInvalidVariant('setCartItem'),
               );
