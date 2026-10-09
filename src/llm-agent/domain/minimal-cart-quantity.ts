@@ -156,12 +156,43 @@ const MEASURE_UNITS: ReadonlySet<string> = new Set([
 const NEGATIVE_NUMBER = /(?:^|[^a-z0-9])(?:-|\u2212)\s*\d/;
 
 /**
+ * Singular Spanish "another unit" idiom: a singular `otra` directly followed by
+ * the singular unit noun `unidad`. Kept deliberately narrow — this is a
+ * grounded everyday phrasing, not a general determiner rule. The plural
+ * `otras unidades` and a non-unit noun such as `otra presentación` must not be
+ * read as a quantity.
+ */
+const SINGULAR_ANOTHER_UNIT = /\botra\s+unidad\b/g;
+
+/** Occurrences of the singular `otra unidad` idiom in a normalized span. */
+function singularAnotherUnitOccurrences(normalized: string): number {
+  return [...normalized.matchAll(SINGULAR_ANOTHER_UNIT)].length;
+}
+
+/**
+ * True when the next token after `index` is exactly the singular noun
+ * `unidad`. Binds a bare `otra` citation to its real surroundings; a plural
+ * `unidades` or another noun does not qualify.
+ */
+function singularUnitFollows(text: string, index: number): boolean {
+  let cursor = index;
+  while (
+    cursor < text.length &&
+    (text[cursor] === ' ' || text[cursor] === '\t')
+  )
+    cursor += 1;
+  const match = /^[a-z]+/.exec(text.slice(cursor));
+  return match !== null && match[0] === 'unidad';
+}
+
+/**
  * Obvious imperative "add" verbs. Used only for the narrow add-vs-set
  * contradiction check below; this is deliberately not intent classification.
  */
 const ADD_VERBS: ReadonlySet<string> = new Set([
   'agrega',
   'agregar',
+  'agregues',
   'agregame',
   'agregale',
   'anade',
@@ -298,6 +329,21 @@ function findWholeToken(haystack: string, needle: string): number {
   }
 }
 
+/** Number of whole-word occurrences of `needle` in `haystack`. */
+function countWholeToken(haystack: string, needle: string): number {
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const index = haystack.indexOf(needle, from);
+    if (index === -1) return count;
+    const before = index === 0 ? '' : haystack[index - 1];
+    const afterIndex = index + needle.length;
+    const after = afterIndex >= haystack.length ? '' : haystack[afterIndex];
+    if (!isWordChar(before) && !isWordChar(after)) count += 1;
+    from = index + 1;
+  }
+}
+
 function tokenize(value: string): string[] {
   return normalize(value)
     .split(/[^a-z0-9]+/)
@@ -316,6 +362,7 @@ function measureUnitFollows(text: string, endIndex: number): boolean {
 /** True when `text` states any generic count (digit run or count word). */
 function hasCountToken(text: string): boolean {
   const haystack = normalize(text);
+  if (singularAnotherUnitOccurrences(haystack) > 0) return true;
   for (const token of tokenize(text)) {
     if (COUNT_WORDS[token] !== undefined) return true;
   }
@@ -392,6 +439,14 @@ function parseCitationCount(citation: string): ParsedCount {
     if (word !== undefined) counts.push(word);
   }
 
+  for (
+    let index = 0;
+    index < singularAnotherUnitOccurrences(citation);
+    index += 1
+  ) {
+    counts.push(1);
+  }
+
   if (invalid) return { status: 'invalid' };
   if (counts.length === 0) return { status: 'none' };
   if (counts.length > 1) return { status: 'invalid' };
@@ -418,7 +473,27 @@ function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
     // measurement unit in the real turn is a dosage, not a quantity.
     if (measureUnitFollows(haystack, matchIndex + citation.length))
       return { status: 'invalid' };
-    const parsed = parseCitationCount(citation);
+    // A bare `otra` is a count only through its real context: the following
+    // token must be the singular noun `unidad`. The whole phrase `otra unidad`
+    // is handled inside `parseCitationCount`. A bare citation is ambiguous
+    // when it repeats, so it fails closed instead of choosing whichever
+    // occurrence happens to imply one unit; repeats of the full idiom fail
+    // closed the same way.
+    let effectiveCitation = citation;
+    if (citation === 'otra') {
+      if (countWholeToken(haystack, citation) !== 1)
+        return { status: 'invalid' };
+      if (singularUnitFollows(haystack, matchIndex + citation.length)) {
+        effectiveCitation = 'otra unidad';
+      }
+    }
+    if (
+      singularAnotherUnitOccurrences(effectiveCitation) > 0 &&
+      singularAnotherUnitOccurrences(haystack) !== 1
+    ) {
+      return { status: 'invalid' };
+    }
+    const parsed = parseCitationCount(effectiveCitation);
     if (parsed.status !== 'ok') return { status: 'invalid' };
     if (quantity !== null) {
       if (!Number.isSafeInteger(quantity) || quantity !== parsed.value)

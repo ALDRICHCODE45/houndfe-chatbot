@@ -1004,3 +1004,125 @@ describe('Minimal cart ambiguity through the public SDK route', () => {
     expect(f.api.createSale).not.toHaveBeenCalled();
   });
 });
+
+describe('Minimal cart singular "otra unidad" add phrasing (S4)', () => {
+  // Both reported live texts, each exercised on its own isolated cart so a
+  // pass cannot come from a compounded increment in another case.
+  const phraseCases: ReadonlyArray<{
+    label: string;
+    text: string;
+    quantityText: string;
+  }> = [
+    {
+      label: 'full phrase',
+      text: 'Agrega otra unidad de Croquetas Nupec',
+      quantityText: 'otra unidad',
+    },
+    {
+      label: 'context-bound short citation',
+      text: 'Quiero que agregues otra unidad de croquetas nupec',
+      quantityText: 'otra',
+    },
+  ];
+
+  const seedReportedCart = async (f: ReturnType<typeof fixture>) => {
+    const allowed = new Set([PRODUCT, FOOD]);
+    expect(
+      (
+        await f.cart.setItem(
+          SENDER,
+          { productId: PRODUCT, variantId: SMALL, quantity: 2 },
+          allowed,
+        )
+      ).ok,
+    ).toBe(true);
+    expect(
+      (await f.cart.setItem(SENDER, { productId: FOOD, quantity: 1 }, allowed))
+        .ok,
+    ).toBe(true);
+  };
+
+  it.each(phraseCases)(
+    'adds exactly one grounded unit for the $label and keeps the other line',
+    async ({ text, quantityText }) => {
+      const f = fixture();
+      await seedReportedCart(f);
+      const before = await f.cart.view(SENDER);
+      expect(before).toMatchObject({
+        ok: true,
+        items: [
+          { productId: PRODUCT, variantId: SMALL, quantity: 2 },
+          { productId: FOOD, quantity: 1 },
+        ],
+        totalCents: 71000,
+      });
+
+      f.steps([call('getCart', {}), say('Su carrito actual.')]);
+      const viewed = await f.agent.tryHandle({
+        senderId: SENDER,
+        text: 'Muéstrame mi carrito',
+      });
+      expect(viewed.kind).toBe('handled');
+
+      const adjust = jest.spyOn(f.cart, 'adjustItem');
+      const set = jest.spyOn(f.cart, 'setItem');
+      f.steps([
+        call('getCart', {}),
+        call('adjustCartItem', {
+          selectionRef: f.refs.food,
+          delta: 1,
+          quantityText,
+          continuation: false,
+        }),
+        say('Agregué otra unidad de croquetas a su carrito.'),
+      ]);
+      const reply = await f.agent.tryHandle({ senderId: SENDER, text });
+      expect(reply.kind).toBe('handled');
+      if (reply.kind !== 'handled') throw new Error('Expected handled reply');
+      expect(reply.reply).not.toContain('Agregué otra unidad');
+      expect(reply.reply).toContain('Croquetas Nupec');
+      expect(adjust).toHaveBeenCalledTimes(1);
+      expect(adjust.mock.calls[0][1]).toEqual({ productId: FOOD, delta: 1 });
+      expect(set).not.toHaveBeenCalled();
+      expect(await f.cart.view(SENDER)).toMatchObject({
+        ok: true,
+        items: [
+          { productId: PRODUCT, variantId: SMALL, quantity: 2 },
+          { productId: FOOD, quantity: 2 },
+        ],
+        totalCents: 116000,
+      });
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(phraseCases)(
+    'rejects a set total of one on the $label without writing',
+    async ({ text, quantityText }) => {
+      const f = fixture();
+      await seedReportedCart(f);
+      const before = await f.cart.view(SENDER);
+      const set = jest.spyOn(f.cart, 'setItem');
+      const adjust = jest.spyOn(f.cart, 'adjustItem');
+      f.steps([
+        call('getCart', {}),
+        call('setCartItem', {
+          selectionRef: f.refs.food,
+          quantity: 1,
+          quantityText,
+          continuation: false,
+        }),
+        say('Fijé una unidad de croquetas.'),
+      ]);
+      const reply = await f.agent.tryHandle({ senderId: SENDER, text });
+      expect(reply.kind).toBe('handled');
+      if (reply.kind !== 'handled') throw new Error('Expected handled reply');
+      expect(reply.reply).toMatch(/No pude confirmar esa operación/);
+      expect(set).not.toHaveBeenCalled();
+      expect(adjust).not.toHaveBeenCalled();
+      expect(await f.cart.view(SENDER)).toEqual(before);
+      expect(f.api.createSale).not.toHaveBeenCalled();
+    },
+  );
+});

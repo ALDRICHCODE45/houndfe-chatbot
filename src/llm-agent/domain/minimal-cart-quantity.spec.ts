@@ -539,6 +539,145 @@ describe('groundCartQuantity S2/S4 citation and removal corrections', () => {
   });
 });
 
+describe('groundCartQuantity singular "otra unidad" evidence (S4)', () => {
+  it('accepts the full phrase "otra unidad" as one grounded unit', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otra unidad de Croquetas Nupec',
+          quantity: 1,
+          quantityText: 'otra unidad',
+        }),
+      ),
+    ).toEqual({
+      kind: 'ready',
+      intent: { productId, operation: 'add', quantity: 1 },
+    });
+  });
+
+  it('accepts a bare "otra" citation only when the real text proves singular unidad', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Quiero que agregues otra unidad de croquetas nupec',
+          quantity: 1,
+          quantityText: 'otra',
+        }),
+      ),
+    ).toEqual({
+      kind: 'ready',
+      intent: { productId, operation: 'add', quantity: 1 },
+    });
+  });
+
+  it('does not read "otra presentación" as one unit', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otra presentación de croquetas',
+          quantity: 1,
+          quantityText: 'otra',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  });
+
+  it('does not guess one from a bare plural "otras unidades"', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otras unidades de croquetas',
+          quantity: 1,
+          quantityText: 'otras',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otras unidades de croquetas',
+          quantity: 1,
+          quantityText: 'otras unidades',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  });
+
+  it('fails closed when the contextual "otra unidad" evidence repeats', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otra unidad de croquetas y otra unidad de ibuprofeno',
+          quantity: 1,
+          quantityText: 'otra',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otra unidad de croquetas y otra presentación de ibuprofeno',
+          quantity: 1,
+          quantityText: 'otra',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  });
+
+  it('does not clear a whole line from a partial "otra unidad" removal', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Quita otra unidad de croquetas nupec',
+          operation: 'remove',
+          quantity: null,
+          quantityText: null,
+          productName: 'Croquetas Nupec',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  });
+
+  it('subtracts one unit from a partial "otra unidad" removal', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Quita otra unidad de croquetas nupec',
+          operation: 'subtract',
+          quantity: 1,
+          quantityText: 'otra unidad',
+        }),
+      ),
+    ).toEqual({
+      kind: 'ready',
+      intent: { productId, operation: 'subtract', quantity: 1 },
+    });
+  });
+
+  it('rejects a set total of one on both reported add phrases', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Agrega otra unidad de Croquetas Nupec',
+          operation: 'set',
+          quantity: 1,
+          quantityText: 'otra unidad',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Quiero que agregues otra unidad de croquetas nupec',
+          operation: 'set',
+          quantity: 1,
+          quantityText: 'otra',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  });
+});
+
 describe('groundCartQuantity named whole-line removal (S4)', () => {
   it('accepts a line clear named by a server-trusted product label', () => {
     expect(

@@ -472,7 +472,7 @@ export class MinimalCatalogAgentService {
         'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total. ' +
         'En ambas, quantityText debe ser el fragmento LITERAL del mensaje actual que respalda el número (por ejemplo "2", "una"); si no lo cita, la aplicación pedirá aclaración. ' +
         'Interprete lenguaje cotidiano: «Agrega 2» suma dos con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
-        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
+        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
         'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
         'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
         'No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
