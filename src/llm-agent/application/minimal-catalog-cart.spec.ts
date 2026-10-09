@@ -6,6 +6,7 @@ import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
+import { MinimalCartSelections } from '../domain/minimal-cart-selections';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import { CostGuardService } from './cost-guard.service';
@@ -19,6 +20,22 @@ const step = (content: unknown[], finish: string) => ({
   usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
   warnings: [],
 });
+// The reference is a deterministic digest of (sender, productId, variantId), so
+// a fixture derives the exact value the server registers from a successful
+// catalog/stock/cart read. No registry state is forged: scripted reads below
+// register every pair a mutation later resolves.
+const selectionRegistry = new MinimalCartSelections(SENDER);
+const cartRef = (productId: string, variantId?: string): string => {
+  const reference = selectionRegistry.register({
+    productId,
+    productName: 'Catalog product',
+    ...(variantId === undefined
+      ? {}
+      : { variantId, variantName: 'Catalog variant' }),
+  });
+  if (reference === null) throw new Error('fixture ref registration failed');
+  return reference;
+};
 const call = (name: string, input: unknown) =>
   step(
     [
@@ -26,13 +43,7 @@ const call = (name: string, input: unknown) =>
         type: 'tool-call',
         toolCallId: name,
         toolName: name,
-        input: JSON.stringify(
-          (name === 'setCartItem' || name === 'adjustCartItem') &&
-            typeof input === 'object' &&
-            input !== null
-            ? { variantId: null, ...input }
-            : input,
-        ),
+        input: JSON.stringify(input),
       },
     ],
     'tool-calls',
@@ -170,22 +181,40 @@ describe('Minimal cart through the public SDK route', () => {
       )
       .tryHandle({ senderId: SENDER, text: 'Muestre mi carrito' });
     expect(requests).toHaveLength(1);
-    for (const name of ['setCartItem', 'adjustCartItem']) {
-      const wire = requests[0].tools.find(
-        (candidate) => candidate.name === name,
-      );
+    const cartWire = (name: string) =>
+      requests[0].tools.find((candidate) => candidate.name === name);
+    for (const name of ['setCartItem', 'adjustCartItem', 'prepareCartItem']) {
+      const wire = cartWire(name);
       expect(wire).toBeDefined();
       expect(wire?.strict).toBe(true);
       expect(wire?.parameters.additionalProperties).toBe(false);
       expect(wire?.parameters.required.slice().sort()).toEqual(
         Object.keys(wire?.parameters.properties ?? {}).sort(),
       );
+      // Identity now travels as a server selection reference, never a raw id.
+      expect(wire?.parameters.properties.selectionRef).toBeDefined();
+      expect(wire?.parameters.properties.continuation).toBeDefined();
       expect(
-        wire?.parameters.properties.variantId.anyOf?.map(
+        wire?.parameters.properties.quantityText.anyOf?.map(
           (schema) => schema.type,
         ),
       ).toContain('null');
+      expect(wire?.parameters.properties.productId).toBeUndefined();
+      expect(wire?.parameters.properties.variantId).toBeUndefined();
     }
+    expect(
+      cartWire('setCartItem')?.parameters.properties.quantity.anyOf?.map(
+        (schema) => schema.type,
+      ),
+    ).toContain('null');
+    expect(
+      cartWire('adjustCartItem')?.parameters.properties.delta.anyOf?.map(
+        (schema) => schema.type,
+      ),
+    ).toContain('null');
+    expect(
+      cartWire('prepareCartItem')?.parameters.properties.operation,
+    ).toBeDefined();
     expect(await f.cart.view(SENDER)).toMatchObject({
       ok: true,
       items: [],
@@ -197,29 +226,43 @@ describe('Minimal cart through the public SDK route', () => {
     expect(f.api.createSale).not.toHaveBeenCalled();
   });
 
-  it.each(['setCartItem', 'adjustCartItem'] as const)(
-    '%s accepts null at the SDK boundary and omits it before domain validation',
-    async (name) => {
+  it.each([
+    {
+      name: 'setCartItem',
+      text: 'Déjame dos productos en total',
+      mutation: { quantity: 2, quantityText: 'dos' },
+      domainInput: { productId: ID, quantity: 2 },
+    },
+    {
+      name: 'adjustCartItem',
+      text: 'Agrega dos productos',
+      mutation: { delta: 2, quantityText: 'dos' },
+      domainInput: { productId: ID, delta: 2 },
+    },
+  ] as const)(
+    '$name grounds the quantity, resolves the selection and omits the variant before domain validation',
+    async ({ name, text, mutation, domainInput }) => {
       const f = setup();
       const method = name === 'setCartItem' ? 'setItem' : 'adjustItem';
       const domain = jest.spyOn(f.cart, method);
-      const mutation = name === 'setCartItem' ? { quantity: 2 } : { delta: 2 };
       f.steps([
         call('searchCatalog', { q: 'Product' }),
-        call(name, { productId: ID, variantId: null, ...mutation }),
+        call(name, {
+          selectionRef: cartRef(ID),
+          ...mutation,
+          continuation: false,
+        }),
         say(),
       ]);
       expect(
-        await f
-          .createAgent()
-          .tryHandle({ senderId: SENDER, text: 'Agrega dos productos' }),
+        await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
         reply:
           'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
       });
       expect(domain).toHaveBeenCalledTimes(1);
-      expect(domain.mock.calls[0][1]).toEqual({ productId: ID, ...mutation });
+      expect(domain.mock.calls[0][1]).toEqual(domainInput);
       const view = await f.cart.view(SENDER);
       expect(view).toMatchObject({
         ok: true,
@@ -236,13 +279,33 @@ describe('Minimal cart through the public SDK route', () => {
   );
 
   it.each([
-    { name: 'setCartItem', selected: true },
-    { name: 'adjustCartItem', selected: true },
-    { name: 'setCartItem', selected: false },
-    { name: 'adjustCartItem', selected: false },
+    {
+      name: 'setCartItem',
+      selected: true,
+      text: 'Déjame dos unidades en total',
+      mutation: { quantity: 2, quantityText: 'dos' },
+    },
+    {
+      name: 'adjustCartItem',
+      selected: true,
+      text: 'Agrega dos unidades',
+      mutation: { delta: 2, quantityText: 'dos' },
+    },
+    {
+      name: 'setCartItem',
+      selected: false,
+      text: 'Déjame dos unidades en total',
+      mutation: { quantity: 2, quantityText: 'dos' },
+    },
+    {
+      name: 'adjustCartItem',
+      selected: false,
+      text: 'Agrega dos unidades',
+      mutation: { delta: 2, quantityText: 'dos' },
+    },
   ] as const)(
     '$name preserves variant ownership and selection requirements (selected=$selected)',
-    async ({ name, selected }) => {
+    async ({ name, selected, text, mutation }) => {
       const f = setup();
       const variantId = '22222222-2222-4222-8222-222222222222';
       const variant = {
@@ -284,16 +347,14 @@ describe('Minimal cart through the public SDK route', () => {
       f.steps([
         call('searchCatalog', { q: 'Product' }),
         call(name, {
-          productId: ID,
-          variantId: selected ? variantId : null,
-          ...(name === 'setCartItem' ? { quantity: 2 } : { delta: 2 }),
+          selectionRef: selected ? cartRef(ID, variantId) : cartRef(ID),
+          ...mutation,
+          continuation: false,
         }),
         say(),
       ]);
       expect(
-        await f
-          .createAgent()
-          .tryHandle({ senderId: SENDER, text: 'Agrega dos' }),
+        await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
         reply: selected
@@ -323,9 +384,20 @@ describe('Minimal cart through the public SDK route', () => {
     },
   );
 
-  it.each(['setCartItem', 'adjustCartItem'] as const)(
-    '%s binds variant guidance to the selected product and preserves mixed carts',
-    async (name) => {
+  it.each([
+    {
+      name: 'setCartItem',
+      addText: 'Déjame una unidad de Croquetas Nupec en total',
+      mutation: { quantity: 1, quantityText: 'una' },
+    },
+    {
+      name: 'adjustCartItem',
+      addText: 'Agrega una unidad de Croquetas Nupec',
+      mutation: { delta: 1, quantityText: 'una' },
+    },
+  ] as const)(
+    '%s binds identity to a server selection and preserves mixed carts',
+    async ({ name, addText, mutation }) => {
       const f = setup();
       const otherId = '33333333-3333-4333-8333-333333333333';
       const otherVariant = '22222222-2222-4222-8222-222222222222';
@@ -382,18 +454,23 @@ describe('Minimal cart through the public SDK route', () => {
       ).toMatchObject({ ok: true });
       const before = await f.cart.view(SENDER);
       const writes = jest.spyOn(f.store, 'commitMinimalCart');
-      const mutation = name === 'setCartItem' ? { quantity: 1 } : { delta: 1 };
       const agent = f.createAgent();
+      // A raw UUID is not a server-owned selection reference: it must be
+      // rejected before any domain validation or write.
       f.steps([
         call('getCart', {}),
         call('searchCatalog', { q: 'croquetas' }),
-        call(name, { productId: ID, variantId: otherVariant, ...mutation }),
+        call(name, {
+          selectionRef: otherVariant,
+          ...mutation,
+          continuation: false,
+        }),
         say(),
       ]);
       expect(
         await agent.tryHandle({
           senderId: SENDER,
-          text: 'Esa opcion me parece perfecta, agrega a mi carrito una unidad por favor.',
+          text: addText,
         }),
       ).toEqual({
         kind: 'handled',
@@ -404,13 +481,17 @@ describe('Minimal cart through the public SDK route', () => {
       expect(await f.cart.view(SENDER)).toEqual(before);
       f.steps([
         call('searchCatalog', { q: 'croquetas' }),
-        call(name, { productId: ID, ...mutation }),
+        call(name, {
+          selectionRef: cartRef(ID),
+          ...mutation,
+          continuation: false,
+        }),
         say(),
       ]);
       expect(
         await agent.tryHandle({
           senderId: SENDER,
-          text: 'Agrega una unidad de Croquetas Nupec',
+          text: addText,
         }),
       ).toEqual({
         kind: 'handled',
@@ -429,31 +510,45 @@ describe('Minimal cart through the public SDK route', () => {
       expect(f.api.createSale).not.toHaveBeenCalled();
       expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
       for (const options of f.optionsSeen) {
-        expect(options.system).toContain(
-          'Si el producto no tiene variantes, envíe variantId: null',
-        );
-        expect(options.system).toContain(
-          'Nunca invente un variantId ni copie el de otro producto',
-        );
-        expect(options.system).toContain(
-          'Tras invalid_variant, no repita la llamada con la misma identidad',
-        );
+        expect(options.system).toMatch(/cartSelectionRef|selectionRef/i);
+        expect(options.system).toContain('prepareCartItem');
         const cartTool = options.tools?.[name] as
           | { description?: unknown }
           | undefined;
-        expect(cartTool?.description).toEqual(
-          expect.stringContaining(
-            'Si el producto no tiene variantes, envíe variantId: null',
-          ),
-        );
+        expect(cartTool?.description).toMatch(/cartSelectionRef|selectionRef/i);
       }
     },
   );
 
   const cartTools = [
-    { name: 'getCart', input: {}, quantity: 0 },
-    { name: 'setCartItem', input: { productId: ID, quantity: 2 }, quantity: 2 },
-    { name: 'adjustCartItem', input: { productId: ID, delta: 2 }, quantity: 2 },
+    {
+      name: 'getCart',
+      input: {},
+      quantity: 0,
+      text: 'Private customer message',
+    },
+    {
+      name: 'setCartItem',
+      input: {
+        selectionRef: cartRef(ID),
+        quantity: 2,
+        quantityText: 'dos',
+        continuation: false,
+      },
+      quantity: 2,
+      text: 'Déjame dos unidades, Private customer message',
+    },
+    {
+      name: 'adjustCartItem',
+      input: {
+        selectionRef: cartRef(ID),
+        delta: 2,
+        quantityText: 'dos',
+        continuation: false,
+      },
+      quantity: 2,
+      text: 'Agrega dos unidades, Private customer message',
+    },
   ];
   const cartLogs = (logs: jest.SpyInstance) =>
     logs.mock.calls
@@ -578,7 +673,14 @@ describe('Minimal cart through the public SDK route', () => {
         })),
         promotionEvaluationStatus: 'fully_evaluated',
       }));
-      f.api.searchCatalog.mockResolvedValue(products(false) as never);
+      const healthy = () =>
+        [ID, secondProduct].map((productId) => ({
+          productId,
+          name: 'Private product',
+          price: { priceCents: 1200 },
+          variants: [variant],
+        }));
+      f.api.searchCatalog.mockImplementation(async () => healthy() as never);
       f.api.getStock.mockImplementation(
         async (id) => inventory(id, false) as never,
       );
@@ -592,10 +694,34 @@ describe('Minimal cart through the public SDK route', () => {
         ).toMatchObject({ ok: true });
       const before = await f.cart.view(SENDER);
       const commit = jest.spyOn(f.store, 'commitMinimalCart');
-      f.api.searchCatalog.mockResolvedValue(products(true) as never);
-      f.api.getStock.mockImplementation(
-        async (id) => inventory(id, true) as never,
+      // A successful read must register the requested pair, then the fresh
+      // domain projection drifts so the SAME reference now fails ownership.
+      // Unknown raw ids can no longer be supplied: they fail before domain
+      // validation and can never pretend to have been registered.
+      const searchQueue: unknown[] = [];
+      const stockQueue: unknown[] = [];
+      if (name === 'getCart') {
+        searchQueue.push(products(true));
+        stockQueue.push(inventory(ID, true));
+      } else {
+        searchQueue.push(healthy()); // scripted read registers the pair
+        stockQueue.push(inventory(target, true)); // domain quote sees drift
+        searchQueue.push(products(true));
+        if (seed && !stale) {
+          searchQueue.splice(1, 0, healthy());
+          stockQueue.unshift(inventory(ID, false));
+        }
+      }
+      f.api.searchCatalog.mockImplementation(
+        async () => searchQueue.shift() as never,
       );
+      f.api.getStock.mockImplementation(
+        async () => stockQueue.shift() as never,
+      );
+      const mutationText =
+        name === 'setCartItem'
+          ? 'Déjame una unidad svc_private-customer-text'
+          : 'Agrega una unidad svc_private-customer-text';
       f.steps([
         ...(name === 'getCart'
           ? []
@@ -605,9 +731,12 @@ describe('Minimal cart through the public SDK route', () => {
           name === 'getCart'
             ? {}
             : {
-                productId: requestedProduct,
-                ...(stale ? {} : { variantId }),
+                selectionRef: stale
+                  ? cartRef(ID)
+                  : cartRef(requestedProduct, variantId),
                 ...(name === 'adjustCartItem' ? { delta: 1 } : { quantity: 1 }),
+                quantityText: 'una',
+                continuation: false,
               },
         ),
         say(),
@@ -615,7 +744,7 @@ describe('Minimal cart through the public SDK route', () => {
       expect(
         await f
           .createAgent()
-          .tryHandle({ senderId: SENDER, text: 'Private customer text' }),
+          .tryHandle({ senderId: SENDER, text: mutationText }),
       ).toEqual({
         kind: 'handled',
         reply:
@@ -643,7 +772,7 @@ describe('Minimal cart through the public SDK route', () => {
         'Private product',
         'Private variant',
         'Private search text',
-        'Private customer text',
+        'svc_private-customer-text',
         'svc_private-logger-secret',
       ])
         expect(messages.join('\n')).not.toContain(secret);
@@ -662,7 +791,7 @@ describe('Minimal cart through the public SDK route', () => {
 
   it.each(cartTools)(
     'traces $name success without changing its result',
-    async ({ name, input, quantity }) => {
+    async ({ name, input, quantity, text }) => {
       const logs = jest
         .spyOn(Logger.prototype, 'log')
         .mockImplementation(() => {});
@@ -676,7 +805,7 @@ describe('Minimal cart through the public SDK route', () => {
       ]);
       const response = await f
         .createAgent()
-        .tryHandle({ senderId: SENDER, text: 'Private customer message' });
+        .tryHandle({ senderId: SENDER, text });
       expect(response).toEqual({
         kind: 'handled',
         reply:
@@ -703,7 +832,7 @@ describe('Minimal cart through the public SDK route', () => {
 
   it.each(cartTools)(
     'traces $name stock rejection without writing or leaking inputs',
-    async ({ name, input }) => {
+    async ({ name, input, text }) => {
       const logs = jest
         .spyOn(Logger.prototype, 'log')
         .mockImplementation(() => {});
@@ -729,9 +858,7 @@ describe('Minimal cart through the public SDK route', () => {
         say(),
       ]);
       expect(
-        await f
-          .createAgent()
-          .tryHandle({ senderId: SENDER, text: 'Private customer message' }),
+        await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
         reply:
@@ -778,11 +905,18 @@ describe('Minimal cart through the public SDK route', () => {
       .mockResolvedValue({ ok: false, error: unsafeError });
     f.steps([
       call('searchCatalog', { q: 'Product' }),
-      call('adjustCartItem', { productId: ID, delta: 2 }),
+      call('adjustCartItem', {
+        selectionRef: cartRef(ID),
+        delta: 2,
+        quantityText: 'dos',
+        continuation: false,
+      }),
       say(),
     ]);
     expect(
-      await f.createAgent().tryHandle({ senderId: SENDER, text: unsafeError }),
+      await f
+        .createAgent()
+        .tryHandle({ senderId: SENDER, text: 'Agrega dos unidades' }),
     ).toEqual({
       kind: 'handled',
       reply:
@@ -803,7 +937,7 @@ describe('Minimal cart through the public SDK route', () => {
 
   it.each(cartTools)(
     'preserves $name behaviour when the logger throws',
-    async ({ name, input, quantity }) => {
+    async ({ name, input, quantity, text }) => {
       jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {
         throw new Error('logging unavailable');
       });
@@ -817,7 +951,7 @@ describe('Minimal cart through the public SDK route', () => {
       ]);
       const response = await f
         .createAgent()
-        .tryHandle({ senderId: SENDER, text: 'Private customer message' });
+        .tryHandle({ senderId: SENDER, text });
       expect(response).toMatchObject({
         kind: 'handled',
         reply:
@@ -841,7 +975,12 @@ describe('Minimal cart through the public SDK route', () => {
     const f = setup();
     f.steps([
       call('searchCatalog', { q: 'Product' }),
-      call('setCartItem', { productId: ID, quantity: 2 }),
+      call('adjustCartItem', {
+        selectionRef: cartRef(ID),
+        delta: 2,
+        quantityText: 'dos',
+        continuation: false,
+      }),
       say(),
     ]);
     const first = await f.createAgent().tryHandle({
@@ -861,7 +1000,7 @@ describe('Minimal cart through the public SDK route', () => {
     ).toEqual(first);
     expect(f.api.createSale).not.toHaveBeenCalled();
     expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
-    expect(f.optionsSeen[0].system).toContain('cantidad TOTAL');
+    expect(f.optionsSeen[0].system).toMatch(/cartSelectionRef|selectionRef/i);
     expect(Object.keys(f.optionsSeen[0].tools ?? {})).not.toContain(
       'createSale',
     );
@@ -872,28 +1011,28 @@ describe('Minimal cart through the public SDK route', () => {
       text: 'Agrega 2 productos a mi carrito por favor',
       initial: 2,
       tool: 'adjustCartItem',
-      input: { productId: ID, delta: 2 },
+      input: { delta: 2, quantityText: '2' },
       expected: 4,
     },
     {
       text: 'Déjame 2 productos en total',
       initial: 3,
       tool: 'setCartItem',
-      input: { productId: ID, quantity: 2 },
+      input: { quantity: 2, quantityText: '2' },
       expected: 2,
     },
     {
       text: 'Quita el producto de mi carrito por favor',
       initial: 2,
       tool: 'setCartItem',
-      input: { productId: ID, quantity: 0 },
+      input: { quantity: 0, quantityText: null },
       expected: 0,
     },
     {
       text: 'Quita uno por favor',
       initial: 2,
       tool: 'adjustCartItem',
-      input: { productId: ID, delta: -1 },
+      input: { delta: -1, quantityText: 'uno' },
       expected: 1,
     },
   ])(
@@ -916,7 +1055,15 @@ describe('Minimal cart through the public SDK route', () => {
         { productId: ID, quantity: initial },
         new Set([ID]),
       );
-      f.steps([call(toolName, input), say()]);
+      f.steps([
+        call('getCart', {}),
+        call(toolName, {
+          selectionRef: cartRef(ID),
+          ...input,
+          continuation: false,
+        }),
+        say(),
+      ]);
       const response = await f
         .createAgent()
         .tryHandle({ senderId: SENDER, text });
@@ -932,14 +1079,15 @@ describe('Minimal cart through the public SDK route', () => {
         items: expected === 0 ? [] : [{ productId: ID, quantity: expected }],
         totalCents: expected * 1200,
       });
-      for (const instruction of [
-        'Agrega 2',
-        'Déjame 2',
-        'Quita el producto',
-        'Quita uno',
-      ]) {
+      for (const instruction of ['Agrega 2', 'Déjame 2', 'Quita uno']) {
         expect(f.optionsSeen[0].system).toContain(instruction);
       }
+      // Whole-line removal is communicated through the mutation tool description
+      // (zero clears the line) rather than an explicit phrase example.
+      const setTool = f.optionsSeen[0].tools?.setCartItem as
+        | { description?: unknown }
+        | undefined;
+      expect(setTool?.description).toMatch(/cero lo quita/i);
       expect(f.api.createSale).not.toHaveBeenCalled();
       expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
     },
@@ -950,7 +1098,12 @@ describe('Minimal cart through the public SDK route', () => {
     jest.spyOn(f.store, 'commitMinimalCart').mockResolvedValue(false);
     f.steps([
       call('searchCatalog', { q: 'Product' }),
-      call('setCartItem', { productId: ID, quantity: 2 }),
+      call('adjustCartItem', {
+        selectionRef: cartRef(ID),
+        delta: 2,
+        quantityText: 'dos',
+        continuation: false,
+      }),
       say(),
     ]);
     expect(

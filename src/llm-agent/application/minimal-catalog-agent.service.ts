@@ -13,8 +13,17 @@ import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-so
 import { bindExpirationInboundEvent } from '../../human-decisions/domain/expiration-source-identity';
 import {
   MINIMAL_CATALOG_SESSION_STORE,
+  type MinimalCartConversationContext,
   type MinimalCatalogSessionStore,
 } from '../domain/minimal-catalog-session.store';
+import {
+  MinimalCartSelections,
+  type MinimalCartSelectionIdentity,
+} from '../domain/minimal-cart-selections';
+import type {
+  CartOperation,
+  MinimalCartQuantityIntent,
+} from '../domain/minimal-cart-quantity';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import {
   GENERATE_TEXT,
@@ -22,9 +31,18 @@ import {
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  CART_OPERATION_CLARIFICATION,
+  CART_QUANTITY_QUESTION,
+  CART_TOOL_NAMES,
+  CART_UNKNOWN_REFERENCE_REPLY,
+  MinimalCartConversation,
+  cartAdjustToolInput,
+  cartPrepareToolInput,
+  cartSetToolInput,
+  type ResolvedCartSelection,
+} from './minimal-cart-conversation';
+import {
   MinimalCartService,
-  minimalCartInput,
-  minimalCartAdjustmentInput,
   minimalCartReply,
   type MinimalCartResult,
   type MinimalCartVariantDiagnostic,
@@ -211,31 +229,46 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 
-// OpenAI strict function schemas represent absent values as required nulls.
-// Keep this transport shape separate from cart validation and persisted state.
-const cartToolInput = minimalCartInput.extend({
-  variantId: z.uuid().nullable(),
-});
-const cartAdjustmentToolInput = minimalCartAdjustmentInput.extend({
-  variantId: z.uuid().nullable(),
-});
-
 const CART_VARIANT_GUIDANCE =
   'Copie productId exactamente de las herramientas. Si el producto no tiene variantes, envíe variantId: null; no envíe valores de relleno. ' +
   'Si tiene variantes, use solo el variantId de la presentación elegida, devuelto por searchCatalog/checkStock para ese mismo productId o por getCart para ese mismo renglón. ' +
   'Nunca invente un variantId ni copie el de otro producto, aunque ya esté en el carrito. Si falta la presentación elegida, pregunte; no la deduzca. ' +
   'Tras invalid_variant, no repita la llamada con la misma identidad ni pruebe IDs al azar; consulte el catálogo o solicite aclaración. Un rechazo no confirma ningún cambio.';
 
-// Identity + price projection with product and variant stock stripped.
-function projectItem(item: CatalogItemResponse) {
+// Identity + price projection with product and variant stock stripped. Each
+// verified identity is registered through `register` (the sender's opaque
+// selection registry) so the model can reference it without ever seeing or
+// inventing a cart UUID.
+type RegisterSelection = (identity: {
+  productId: string;
+  variantId?: string;
+  productName: string;
+  variantName?: string;
+}) => string | null;
+
+function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
   const { stock, variants, ...identity } = item;
   void stock;
+  const productRef = register({
+    productId: item.productId,
+    productName: item.name,
+  });
   return {
     ...identity,
+    ...(productRef === null ? {} : { cartSelectionRef: productRef }),
     variants: variants.map((variant) => {
       const { stock: variantStock, ...label } = variant;
       void variantStock;
-      return label;
+      const variantRef = register({
+        productId: item.productId,
+        variantId: variant.variantId,
+        productName: item.name,
+        ...(variant.name ? { variantName: variant.name } : {}),
+      });
+      return {
+        ...label,
+        ...(variantRef === null ? {} : { cartSelectionRef: variantRef }),
+      };
     }),
   };
 }
@@ -345,6 +378,29 @@ export class MinimalCatalogAgentService {
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
+    // Rebuild this sender's bounded selection registry and pending cart intent
+    // from the last stored turn. Refs are deterministic digests, so a restored
+    // snapshot resolves exactly the identities the previous turn registered.
+    const previousCartContext = turns.at(-1)?.cartContext;
+    const cartConversation = this.cart
+      ? new MinimalCartConversation(
+          new MinimalCartSelections(
+            input.senderId,
+            previousCartContext?.selections,
+          ),
+          input.text,
+          previousCartContext?.pending ?? null,
+        )
+      : null;
+    const persistedCartContext = ():
+      | MinimalCartConversationContext
+      | undefined =>
+      cartConversation === null
+        ? undefined
+        : {
+            selections: cartConversation.snapshot(),
+            pending: cartConversation.pendingIntent,
+          };
     const allowedIds = new Set<string>();
     for (const turn of prior) {
       for (const id of turn.verifiedProductIds) allowedIds.add(id);
@@ -383,21 +439,49 @@ export class MinimalCatalogAgentService {
       restockAvailable,
       expirationAvailable,
     );
+    const pendingIntent = cartConversation?.pendingIntent ?? null;
+    // Bounded pending summary: operation, groundable count and the chosen
+    // server-owned label/reference so a later explicit quantity can target the
+    // same line after the cart-reply branch dropped the SDK tool messages.
+    const pendingContext =
+      pendingIntent === null
+        ? ''
+        : `\nSolicitud pendiente en curso: operación "${pendingIntent.operation}"` +
+          (pendingIntent.quantity === undefined
+            ? ' sin cantidad definida'
+            : ` con ${pendingIntent.quantity} unidad(es)`) +
+          (pendingIntent.productName === undefined
+            ? ''
+            : ` para "${pendingIntent.productName}${
+                pendingIntent.variantName === undefined
+                  ? ''
+                  : ` — ${pendingIntent.variantName}`
+              }"`) +
+          (pendingIntent.reference === undefined
+            ? ''
+            : ` (selectionRef: ${pendingIntent.reference})`) +
+          '. Si el cliente confirma o aclara solo la presentación sin repetir la cantidad, continúe ESA misma solicitud (continuation: true); NO vuelva a preguntar la cantidad, NO herede cantidades del carrito guardado y NO la aplique a otro producto. Si el cliente responde solo con una cantidad a la pregunta de unidades, use esa misma selectionRef con la cantidad explícita citada.';
     const cartInstructions = this.cart
       ? baseInstructions.replace(
           'No realizas compras, ventas, pagos ni cambios de datos.',
           'Puede mantener el carrito; no realiza ventas, pagos ni reservas de inventario.',
         ) +
         '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Use getCart para consultarlo, también después de un reinicio. ' +
-        'Use setCartItem con producto/presentación elegidos y cantidad TOTAL deseada, no un incremento. Cero quita ese renglón. ' +
-        'Interprete lenguaje cotidiano: «Agrega 2» suma dos unidades con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
-        '«Quita el producto» elimina el renglón con setCartItem(quantity: 0); «Quita uno» resta una unidad con adjustCartItem(delta: -1). ' +
-        'Use adjustCartItem para agregar o quitar unidades; la aplicación calcula el nuevo total. No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
+        'Las herramientas de carrito usan selectionRef, NO un productId/variantId: copie el cartSelectionRef EXACTO que devolvió searchCatalog/checkStock/getCart para ese producto o presentación; nunca invente ni reutilice una referencia de otro renglón. ' +
+        'Use setCartItem con la presentación elegida y la cantidad TOTAL deseada (quantity), no un incremento. ' +
+        'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total. ' +
+        'En ambas, quantityText debe ser el fragmento LITERAL del mensaje actual que respalda el número (por ejemplo "2", "una"); si no lo cita, la aplicación pedirá aclaración. ' +
+        'Interprete lenguaje cotidiano: «Agrega 2» suma dos con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
+        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
+        'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
+        'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
+        'No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         CART_VARIANT_GUIDANCE +
         ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
-        'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta.'
+        'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta.' +
+        pendingContext
       : baseInstructions;
     const result = await this.generateTextFn({
       model: openai(this.model),
@@ -414,6 +498,7 @@ export class MinimalCatalogAgentService {
         expirationReply,
         input,
         cartReply,
+        cartConversation,
       ),
       stopWhen: stepCountIs(this.maxSteps),
     });
@@ -437,6 +522,7 @@ export class MinimalCatalogAgentService {
           { role: 'assistant', content: reply },
         ],
         [...currentIds],
+        persistedCartContext(),
       );
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
@@ -450,13 +536,34 @@ export class MinimalCatalogAgentService {
           { role: 'assistant', content: cartReply.value },
         ],
         [...currentIds],
+        persistedCartContext(),
       );
       return { reply: cartReply.value };
+    }
+    if (this.hasInvalidCartToolCall(result)) {
+      // A cart tool whose arguments failed SDK validation never executed; the
+      // model's follow-up text is not an authoritative acknowledgement. Fail
+      // closed with a server-controlled clarification and no write.
+      traceLog(
+        this.logger,
+        `minimal_catalog tool cart argument rejected before execute trace=${traceId}`,
+      );
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: CART_OPERATION_CLARIFICATION },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return { reply: CART_OPERATION_CLARIFICATION };
     }
     this.recordTurn(
       input.senderId,
       [{ role: 'user', content: input.text }, ...result.responseMessages],
       [...currentIds],
+      persistedCartContext(),
     );
     return { reply: result.text };
   }
@@ -494,13 +601,38 @@ export class MinimalCatalogAgentService {
     senderId: string,
     messages: ModelMessage[],
     verifiedProductIds: string[],
+    cartContext?: MinimalCartConversationContext,
   ): void {
     const turns = this.sessionStore.read(senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
+    // Carry the owned cart context forward unless this turn produced a new one,
+    // so a non-cart turn never drops an armed request or the registry snapshot.
+    const inherited = cartContext ?? turns.at(-1)?.cartContext;
     this.sessionStore.write(senderId, [
       ...prior,
-      { messages, verifiedProductIds },
+      {
+        messages,
+        verifiedProductIds,
+        ...(inherited === undefined ? {} : { cartContext: inherited }),
+      },
     ]);
+  }
+
+  /**
+   * True when the SDK rejected a cart tool call's arguments before execute.
+   * The invalid call is surfaced as a dynamic tool call with `invalid: true`;
+   * it is never routed through `execute`, so the caller must fail closed
+   * instead of letting the model author the customer acknowledgement.
+   */
+  private hasInvalidCartToolCall(result: {
+    dynamicToolCalls?: Array<{ toolName?: unknown; invalid?: unknown }>;
+  }): boolean {
+    return (result.dynamicToolCalls ?? []).some(
+      (call) =>
+        call.invalid === true &&
+        typeof call.toolName === 'string' &&
+        CART_TOOL_NAMES.has(call.toolName),
+    );
   }
 
   private buildTools(
@@ -511,9 +643,12 @@ export class MinimalCatalogAgentService {
     expirationReply: ExpirationReply | null,
     context: { senderId: string; inboundEvent?: unknown },
     cartReply: ExpirationReply,
+    cartConversation: MinimalCartConversation | null,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
+    const registerSelection: RegisterSelection = (identity) =>
+      cartConversation === null ? null : cartConversation.register(identity);
     const trace = (event: string) =>
       traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
     const traceCartResult = (
@@ -617,7 +752,9 @@ export class MinimalCatalogAgentService {
         execute: async ({ q }) => {
           try {
             const items = await chatbotApi.searchCatalog(q);
-            const results = items.map(projectItem);
+            const results = items.map((item) =>
+              projectItem(item, registerSelection),
+            );
             for (const item of items) {
               allowedIds.add(item.productId);
               currentIds.add(item.productId);
@@ -657,11 +794,27 @@ export class MinimalCatalogAgentService {
               productId: stock.productId,
               name: stock.name,
               stock: stock.stock,
-              variants: stock.variants.map((variant) => ({
-                variantId: variant.variantId,
-                name: variant.name,
-                stock: variant.stock,
-              })),
+              ...(() => {
+                const ref = registerSelection({
+                  productId: stock.productId,
+                  productName: stock.name,
+                });
+                return ref === null ? {} : { cartSelectionRef: ref };
+              })(),
+              variants: stock.variants.map((variant) => {
+                const ref = registerSelection({
+                  productId: stock.productId,
+                  variantId: variant.variantId,
+                  productName: stock.name,
+                  ...(variant.name ? { variantName: variant.name } : {}),
+                });
+                return {
+                  variantId: variant.variantId,
+                  name: variant.name,
+                  stock: variant.stock,
+                  ...(ref === null ? {} : { cartSelectionRef: ref }),
+                };
+              }),
             };
             // Proactive server offer ONLY on a trusted read that proves the
             // EXACT requested product is a depleted simple product (no
@@ -688,6 +841,91 @@ export class MinimalCatalogAgentService {
       }),
     };
     const cart = this.cart;
+    const conversation = cartConversation;
+    // Per SDK run: once a line (product+variant pair, NOT pair+operation) has a
+    // real mutation attempt, no later cart tool may re-run it or revive it via
+    // a different operation, and its server acknowledgement must survive later
+    // clarifications, unknown references and preparation errors.
+    const attemptedLines = new Set<string>();
+    const lineKey = (identity: MinimalCartSelectionIdentity): string =>
+      `${identity.productId}\u0000${identity.variantId ?? ''}`;
+    let mutationAcknowledged = false;
+    // A server-controlled reply may only fill an EMPTY acknowledgement slot; a
+    // prior real mutation's reply always wins over later no-change messages.
+    const acknowledge = (message: string): void => {
+      if (!mutationAcknowledged) cartReply.value = message;
+    };
+    const applyIntent = async (
+      identity: ResolvedCartSelection,
+      intent: MinimalCartQuantityIntent,
+    ): Promise<MinimalCartResult> => {
+      if (cart === undefined || conversation === null)
+        return { ok: false, error: 'cart_unavailable' };
+      attemptedLines.add(lineKey(identity));
+      // A real mutation attempt disarms the pending request: it must not run again.
+      conversation.clearPending();
+      const base = {
+        productId: identity.productId,
+        ...(identity.variantId === undefined
+          ? {}
+          : { variantId: identity.variantId }),
+      };
+      if (intent.operation === 'add' || intent.operation === 'subtract') {
+        const magnitude = intent.quantity ?? 0;
+        const result = await cart.adjustItem(
+          context.senderId,
+          {
+            ...base,
+            delta: intent.operation === 'add' ? magnitude : -magnitude,
+          },
+          allowedIds,
+          traceInvalidVariant('adjustCartItem'),
+        );
+        traceCartResult('adjustCartItem', result);
+        cartReply.value = minimalCartReply(result);
+        mutationAcknowledged = true;
+        return result;
+      }
+      const result = await cart.setItem(
+        context.senderId,
+        {
+          ...base,
+          quantity: intent.operation === 'set' ? (intent.quantity ?? 0) : 0,
+        },
+        allowedIds,
+        traceInvalidVariant('setCartItem'),
+      );
+      traceCartResult('setCartItem', result);
+      cartReply.value = minimalCartReply(result);
+      mutationAcknowledged = true;
+      return result;
+    };
+    const handleMutation = async (
+      identity: ResolvedCartSelection,
+      proposal: {
+        operation: CartOperation;
+        quantity: number | null;
+        quantityText: string | null;
+        continuation: boolean;
+      },
+    ): Promise<MinimalCartResult> => {
+      if (conversation === null)
+        return { ok: false, error: 'cart_unavailable' };
+      // Line-level bound: a rejected attempt cannot be retried through another
+      // operation in the same run, and it never overwrites the first reply.
+      if (attemptedLines.has(lineKey(identity)))
+        return toolError('cart_line_settled');
+      const grounded = conversation.ground(identity, proposal);
+      if (grounded.kind === 'invalid_evidence') {
+        acknowledge(CART_OPERATION_CLARIFICATION);
+        return toolError('invalid_cart_evidence');
+      }
+      if (grounded.kind === 'quantity_required') {
+        acknowledge(CART_QUANTITY_QUESTION);
+        return toolError('cart_quantity_required');
+      }
+      return applyIntent(identity, grounded.intent);
+    };
     const withCart = cart
       ? {
           ...readTools,
@@ -703,44 +941,151 @@ export class MinimalCatalogAgentService {
               traceCartResult('getCart', result);
               if (result.ok)
                 for (const item of result.items) allowedIds.add(item.productId);
-              cartReply.value = minimalCartReply(result);
-              return result;
+              // Never let a later read replace a real mutation's acknowledgement.
+              acknowledge(minimalCartReply(result));
+              if (!result.ok) return result;
+              const items = result.items.map((item) => {
+                const productRef = conversation?.register({
+                  productId: item.productId,
+                  productName: item.name,
+                });
+                const ref = item.variantId
+                  ? conversation?.register({
+                      productId: item.productId,
+                      variantId: item.variantId,
+                      productName: item.name,
+                      ...(item.variantName
+                        ? { variantName: item.variantName }
+                        : {}),
+                    })
+                  : productRef;
+                return ref === null || ref === undefined
+                  ? item
+                  : { ...item, cartSelectionRef: ref };
+              });
+              return { ...result, items };
             },
           }),
           adjustCartItem: tool({
             description:
-              'Suma o resta unidades de un producto/presentación elegido. Delta positivo agrega; negativo quita unidades; cero resultante elimina el renglón. La aplicación calcula el total. No crea pedidos ni reserva existencias. ' +
+              'Suma o resta unidades de un producto/presentación elegido por su cartSelectionRef. Delta positivo agrega; negativo quita unidades. La aplicación calcula el total y valida la cita de cantidad. No crea pedidos ni reserva existencias. ' +
               CART_VARIANT_GUIDANCE,
-            inputSchema: cartAdjustmentToolInput,
+            inputSchema: cartAdjustToolInput,
             strict: true,
-            execute: async ({ variantId, ...input }) => {
-              const result = await cart.adjustItem(
-                context.senderId,
-                variantId === null ? input : { ...input, variantId },
-                allowedIds,
-                traceInvalidVariant('adjustCartItem'),
-              );
-              traceCartResult('adjustCartItem', result);
-              cartReply.value = minimalCartReply(result);
-              return result;
+            execute: async ({
+              selectionRef,
+              delta,
+              quantityText,
+              continuation,
+            }) => {
+              if (conversation === null) return toolError('cart_unavailable');
+              const identity = conversation.resolve(selectionRef);
+              if (identity === null) {
+                acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
+                return toolError('unknown_cart_selection');
+              }
+              const pending = conversation.pendingIntent;
+              const operation: CartOperation =
+                delta === null
+                  ? pending !== null && pending.productId === identity.productId
+                    ? pending.operation
+                    : 'add'
+                  : delta >= 0
+                    ? 'add'
+                    : 'subtract';
+              return handleMutation(identity, {
+                operation,
+                quantity: delta === null ? null : Math.abs(delta),
+                quantityText,
+                continuation,
+              });
             },
           }),
           setCartItem: tool({
             description:
-              'Fija la cantidad TOTAL de un producto/presentación elegido por el cliente. Cero lo quita. No acepta precios, no reserva existencias ni crea pedidos. ' +
+              'Fija la cantidad TOTAL de un producto/presentación elegido por su cartSelectionRef. Cero lo quita. No acepta precios, no reserva existencias ni crea pedidos. ' +
               CART_VARIANT_GUIDANCE,
-            inputSchema: cartToolInput,
+            inputSchema: cartSetToolInput,
             strict: true,
-            execute: async ({ variantId, ...input }) => {
-              const result = await cart.setItem(
-                context.senderId,
-                variantId === null ? input : { ...input, variantId },
-                allowedIds,
-                traceInvalidVariant('setCartItem'),
-              );
-              traceCartResult('setCartItem', result);
-              cartReply.value = minimalCartReply(result);
-              return result;
+            execute: async ({
+              selectionRef,
+              quantity,
+              quantityText,
+              continuation,
+            }) => {
+              if (conversation === null) return toolError('cart_unavailable');
+              const identity = conversation.resolve(selectionRef);
+              if (identity === null) {
+                acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
+                return toolError('unknown_cart_selection');
+              }
+              if (quantity === 0 && quantityText === null) {
+                // An UNCITED zero may clear only via explicit named whole-line
+                // removal evidence in the CURRENT message ("Quita el
+                // ibuprofeno"). Otherwise the cited set-zero rule still governs.
+                const removal = conversation.ground(identity, {
+                  operation: 'remove',
+                  quantity: null,
+                  quantityText: null,
+                  continuation,
+                });
+                if (removal.kind === 'ready') {
+                  return handleMutation(identity, {
+                    operation: 'remove',
+                    quantity: null,
+                    quantityText: null,
+                    continuation,
+                  });
+                }
+              }
+              return handleMutation(identity, {
+                operation: 'set',
+                quantity,
+                quantityText,
+                continuation,
+              });
+            },
+          }),
+          prepareCartItem: tool({
+            description:
+              'Prepara (NO modifica) una intención de carrito para conservar una cantidad explícita antes de elegir la presentación. Recuerda producto, operación y cantidad citada; no escribe el carrito. ',
+            inputSchema: cartPrepareToolInput,
+            strict: true,
+            execute: ({
+              selectionRef,
+              operation,
+              quantity,
+              quantityText,
+              continuation,
+            }) => {
+              if (conversation === null) return toolError('cart_unavailable');
+              const identity = conversation.resolve(selectionRef);
+              if (identity === null) {
+                acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
+                return toolError('unknown_cart_selection');
+              }
+              if (attemptedLines.has(lineKey(identity)))
+                return toolError('cart_line_settled');
+              const grounded = conversation.prepare(identity, {
+                operation,
+                quantity,
+                quantityText,
+                continuation,
+              });
+              if (grounded.kind === 'ready') {
+                return {
+                  ok: true as const,
+                  prepared: true as const,
+                  operation: grounded.intent.operation,
+                  quantity: grounded.intent.quantity ?? null,
+                };
+              }
+              if (grounded.kind === 'quantity_required') {
+                acknowledge(CART_QUANTITY_QUESTION);
+                return toolError('cart_quantity_required');
+              }
+              acknowledge(CART_OPERATION_CLARIFICATION);
+              return toolError('invalid_cart_evidence');
             },
           }),
         }

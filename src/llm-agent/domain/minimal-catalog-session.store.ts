@@ -1,4 +1,6 @@
 import type { ModelMessage } from 'ai';
+import type { MinimalCartSelectionSnapshot } from './minimal-cart-selections';
+import type { MinimalCartPendingRequest } from './minimal-cart-quantity';
 
 /** DI injection token for the MinimalCatalogSessionStore port. */
 export const MINIMAL_CATALOG_SESSION_STORE = Symbol(
@@ -6,15 +8,32 @@ export const MINIMAL_CATALOG_SESSION_STORE = Symbol(
 );
 
 /**
+ * Server-owned cart state for one sender, retained across turns even when the
+ * cart-reply branch discards the SDK response messages.
+ *
+ * `selections` is the bounded, detached registry snapshot the service rebuilds
+ * its opaque selection references from; `pending` is a single grounded
+ * quantity intent (product + operation + optional count) that may be carried
+ * into the same request. It is never model-authored: the service derives both
+ * from verified tool output.
+ */
+export type MinimalCartConversationContext = {
+  selections: MinimalCartSelectionSnapshot;
+  pending: MinimalCartPendingRequest | null;
+};
+
+/**
  * One whole turn per sender: the user message, the model/tool response
  * messages, and only the productIds a successful fresh search produced.
  *
  * `messages` and `verifiedProductIds` are kept together so a later turn can
- * flatten the retained messages and union the verified identity.
+ * flatten the retained messages and union the verified identity. `cartContext`
+ * carries the owned selection snapshot and pending intent for the cart route.
  */
 export type MinimalCatalogTurn = {
   messages: ModelMessage[];
   verifiedProductIds: string[];
+  cartContext?: MinimalCartConversationContext;
 };
 
 /**
