@@ -22,6 +22,11 @@ import {
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  MinimalCartService,
+  minimalCartInput,
+  minimalCartReply,
+} from './minimal-cart.service';
+import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
 } from './minimal-restock-request.service';
@@ -201,8 +206,8 @@ function projectItem(item: CatalogItemResponse) {
   };
 }
 
-// Experimental default-off read-only catalog route: direct SDK loop, in-memory
-// per-sender history isolated from `ConversationStore`. No writes.
+// Minimal SDK route: in-memory catalog history; optional durable cart and human
+// inquiry capabilities. No checkout, payment or inventory reservations.
 @Injectable()
 export class MinimalCatalogAgentService {
   private readonly enabled: boolean;
@@ -225,6 +230,8 @@ export class MinimalCatalogAgentService {
     private readonly restock?: MinimalRestockRequestService,
     @Optional()
     private readonly expiration?: MinimalExpirationRequestService,
+    @Optional()
+    private readonly cart?: MinimalCartService,
   ) {
     const agent = config.get<{ enabled: boolean; allowedSenders: string[] }>(
       'minimalCatalogAgent',
@@ -337,12 +344,25 @@ export class MinimalCatalogAgentService {
     const expirationReply: ExpirationReply | null = expirationAvailable
       ? { attempted: false, value: null }
       : null;
+    const cartReply: ExpirationReply = { attempted: false, value: null };
+    const baseInstructions = instructionsFor(
+      restockAvailable,
+      expirationAvailable,
+    );
+    const cartInstructions = this.cart
+      ? baseInstructions.replace(
+          'No realizas compras, ventas, pagos ni cambios de datos.',
+          'Puede mantener el carrito; no realiza ventas, pagos ni reservas de inventario.',
+        ) +
+        '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Use getCart para consultarlo, también después de un reinicio. ' +
+        'Use setCartItem con producto/presentación elegidos y cantidad TOTAL deseada, no un incremento. Cero quita ese renglón. ' +
+        'Para agregar unidades a un renglón existente consulte getCart primero. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
+        'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
+        'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta.'
+      : baseInstructions;
     const result = await this.generateTextFn({
       model: openai(this.model),
-      system:
-        SYSTEM_PROMPT +
-        '\n\n' +
-        instructionsFor(restockAvailable, expirationAvailable),
+      system: SYSTEM_PROMPT + '\n\n' + cartInstructions,
       messages: [
         ...prior.flatMap((turn) => turn.messages),
         { role: 'user', content: input.text },
@@ -354,6 +374,7 @@ export class MinimalCatalogAgentService {
         restockRun,
         expirationReply,
         input,
+        cartReply,
       ),
       stopWhen: stepCountIs(this.maxSteps),
     });
@@ -381,6 +402,17 @@ export class MinimalCatalogAgentService {
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
+    }
+    if (cartReply.value !== null) {
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: cartReply.value },
+        ],
+        [...currentIds],
+      );
+      return { reply: cartReply.value };
     }
     this.recordTurn(
       input.senderId,
@@ -439,6 +471,7 @@ export class MinimalCatalogAgentService {
     restockRun: RestockRun | null,
     expirationReply: ExpirationReply | null,
     context: { senderId: string; inboundEvent?: unknown },
+    cartReply: ExpirationReply,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
@@ -583,6 +616,38 @@ export class MinimalCatalogAgentService {
         },
       }),
     };
+    const cart = this.cart;
+    const withCart = cart
+      ? {
+          ...readTools,
+          getCart: tool({
+            description:
+              'Consulta el carrito persistido de este cliente y verifica precios y existencias. No crea pedidos.',
+            inputSchema: z.strictObject({}),
+            execute: async () => {
+              const result = await cart.view(context.senderId);
+              if (result.ok)
+                for (const item of result.items) allowedIds.add(item.productId);
+              cartReply.value = minimalCartReply(result);
+              return result;
+            },
+          }),
+          setCartItem: tool({
+            description:
+              'Fija la cantidad TOTAL de un producto/presentación elegido por el cliente. Cero lo quita. No acepta precios, no reserva existencias ni crea pedidos.',
+            inputSchema: minimalCartInput,
+            execute: async (input) => {
+              const result = await cart.setItem(
+                context.senderId,
+                input,
+                allowedIds,
+              );
+              cartReply.value = minimalCartReply(result);
+              return result;
+            },
+          }),
+        }
+      : readTools;
     const expiration = this.expiration;
     const expirationLocal = expirationReply;
     // Preserve the first outcome, including while preparation is in flight.
@@ -620,9 +685,9 @@ export class MinimalCatalogAgentService {
           };
     const withExpiration =
       prepareExpirationOnce === null
-        ? readTools
+        ? withCart
         : {
-            ...readTools,
+            ...withCart,
             prepareExpiration: tool({
               description:
                 'Prepara (NO registra) una consulta de información de caducidad ' +
