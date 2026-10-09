@@ -26,6 +26,7 @@ import {
   minimalCartInput,
   minimalCartAdjustmentInput,
   minimalCartReply,
+  type MinimalCartResult,
 } from './minimal-cart.service';
 import {
   MinimalRestockRequestService,
@@ -35,6 +36,22 @@ import {
   MINIMAL_EXPIRATION_CAUTIOUS_REPLY,
   MinimalExpirationRequestService,
 } from './minimal-expiration-request.service';
+
+// Closed codes only: cart error strings must never become arbitrary log payloads.
+const CART_TRACE_ERROR_CODES = new Set([
+  'invalid_quantity_or_identity',
+  'invalid_cart',
+  'unknown_product',
+  'item_not_in_cart',
+  'cart_changed',
+  'cart_unavailable',
+  'variant_required',
+  'price_unavailable',
+  'invalid_variant',
+  'stock_unverified',
+  'insufficient_stock',
+  'invalid_evaluation',
+]);
 
 const INSTRUCTIONS =
   'Ruta experimental de solo lectura: usa searchCatalog para localizar productos por nombre; ' +
@@ -481,6 +498,19 @@ export class MinimalCatalogAgentService {
     const restock = this.restock;
     const trace = (event: string) =>
       traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
+    const traceCartResult = (
+      name: 'getCart' | 'setCartItem' | 'adjustCartItem',
+      result: MinimalCartResult,
+    ) => {
+      if (result.ok) {
+        trace(`tool ${name} result=ok`);
+      } else {
+        const code = CART_TRACE_ERROR_CODES.has(result.error)
+          ? result.error
+          : 'unrecognized_cart_error';
+        trace(`tool ${name} result=error code=${code}`);
+      }
+    };
     // ONE bounded preparation per SDK run, shared by the proactive checkStock
     // trigger and the model's explicit tool. `attempted` is set before the
     // await. ANY actual attempt that closes or throws records a `closed`
@@ -630,6 +660,7 @@ export class MinimalCatalogAgentService {
             inputSchema: z.strictObject({}),
             execute: async () => {
               const result = await cart.view(context.senderId);
+              traceCartResult('getCart', result);
               if (result.ok)
                 for (const item of result.items) allowedIds.add(item.productId);
               cartReply.value = minimalCartReply(result);
@@ -646,6 +677,7 @@ export class MinimalCatalogAgentService {
                 input,
                 allowedIds,
               );
+              traceCartResult('adjustCartItem', result);
               cartReply.value = minimalCartReply(result);
               return result;
             },
@@ -660,6 +692,7 @@ export class MinimalCatalogAgentService {
                 input,
                 allowedIds,
               );
+              traceCartResult('setCartItem', result);
               cartReply.value = minimalCartReply(result);
               return result;
             },
