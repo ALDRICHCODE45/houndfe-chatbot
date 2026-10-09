@@ -27,6 +27,7 @@ import {
   minimalCartAdjustmentInput,
   minimalCartReply,
   type MinimalCartResult,
+  type MinimalCartVariantDiagnostic,
 } from './minimal-cart.service';
 import {
   MinimalRestockRequestService,
@@ -511,6 +512,25 @@ export class MinimalCatalogAgentService {
         trace(`tool ${name} result=error code=${code}`);
       }
     };
+    const traceInvalidVariant =
+      (name: 'getCart' | 'setCartItem' | 'adjustCartItem') =>
+      (event: MinimalCartVariantDiagnostic) => {
+        const line =
+          Number.isSafeInteger(event.linePosition) && event.linePosition > 0
+            ? event.linePosition
+            : 'unknown';
+        const origin =
+          event.lineOrigin === 'requested' || event.lineOrigin === 'stored'
+            ? event.lineOrigin
+            : 'unknown';
+        const flag = (value: unknown) =>
+          typeof value === 'boolean' ? String(value) : 'unknown';
+        trace(
+          `cart_variant_check operation=${name} line=${line} origin=${origin} ` +
+            `catalog_match=${flag(event.catalogVariantFound)} stock_match=${flag(event.stockVariantFound)} ` +
+            `variant_is_product=${flag(event.variantIsProductId)}`,
+        );
+      };
     // ONE bounded preparation per SDK run, shared by the proactive checkStock
     // trigger and the model's explicit tool. `attempted` is set before the
     // await. ANY actual attempt that closes or throws records a `closed`
@@ -659,7 +679,10 @@ export class MinimalCatalogAgentService {
               'Consulta el carrito persistido de este cliente y verifica precios y existencias. No crea pedidos.',
             inputSchema: z.strictObject({}),
             execute: async () => {
-              const result = await cart.view(context.senderId);
+              const result = await cart.view(
+                context.senderId,
+                traceInvalidVariant('getCart'),
+              );
               traceCartResult('getCart', result);
               if (result.ok)
                 for (const item of result.items) allowedIds.add(item.productId);
@@ -676,6 +699,7 @@ export class MinimalCatalogAgentService {
                 context.senderId,
                 input,
                 allowedIds,
+                traceInvalidVariant('adjustCartItem'),
               );
               traceCartResult('adjustCartItem', result);
               cartReply.value = minimalCartReply(result);
@@ -691,6 +715,7 @@ export class MinimalCatalogAgentService {
                 context.senderId,
                 input,
                 allowedIds,
+                traceInvalidVariant('setCartItem'),
               );
               traceCartResult('setCartItem', result);
               cartReply.value = minimalCartReply(result);

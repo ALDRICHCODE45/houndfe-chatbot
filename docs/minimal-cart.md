@@ -34,7 +34,20 @@ minimal_catalog tool adjustCartItem result=error code=stock_unverified trace=<tr
 
 Only the fixed tool name, success/error result, allowlisted error code and generated trace ID are recorded. Customer text, phone numbers, product/variant IDs, names, quantities, prices, tool payloads and credentials are not logged by these traces. Unknown error strings become `unrecognized_cart_error`; logger failures do not affect replies or persistence.
 
-For a failed rehearsal, capture all entries for that turn's trace ID. `getCart` alone indicates a completed read, not an attempted addition. `stock_unverified` means stock could not be verified; `insufficient_stock` means verified stock was too low; `invalid_evaluation` means the pricing response failed validation; `cart_changed` means the compare-and-set lost a conflict. `cart_unavailable` can represent a backend or persistence failure and does not identify which one. Codes do not identify the failing line in a multi-item cart. Absence of a cart trace does not prove why a tool failed to execute (for example, SDK input validation can reject it before execution).
+For a failed rehearsal, capture all entries for that turn's trace ID. `getCart` alone indicates a completed read, not an attempted addition. `stock_unverified` means stock could not be verified; `insufficient_stock` means verified stock was too low; `invalid_evaluation` means the pricing response failed validation; `cart_changed` means the compare-and-set lost a conflict. `cart_unavailable` can represent a backend or persistence failure and does not identify which one. The result codes alone do not identify the failing line in a multi-item cart. Absence of a cart trace does not prove why a tool failed to execute (for example, SDK input validation can reject it before execution).
+
+An `invalid_variant` rejection also emits a privacy-preserving comparison immediately before the result trace:
+
+```text
+minimal_catalog cart_variant_check operation=setCartItem line=2 origin=requested catalog_match=false stock_match=false variant_is_product=false trace=<trace-id>
+```
+
+- `line` is the one-based position in the proposed cart being validated, not necessarily the order shown before the operation: a modified line is moved to the end. Only the first rejected line is reported.
+- `origin=requested` identifies the exact product/presentation targeted by the current mutation, including an existing line being adjusted; `stored` identifies another saved line. All lines in `getCart` are `stored`.
+- `catalog_match` and `stock_match` indicate whether the supplied variant was present in the actual catalog and stock responses consumed for that line. Both false does not prove invention: stale identity or changing backend data can also explain it.
+- `variant_is_product=true` indicates that the supplied variant ID equals that line's product ID; it does not log either ID.
+
+These traces contain only a position, fixed operation/origin labels and booleans, besides the generated trace ID. Unexpected diagnostic values become `unknown`. No IDs or response payloads are logged; the comparison is neither returned to the model nor persisted. Diagnostic/logger exceptions do not change the original rejection or permit a write. No additional backend requests are made.
 
 This instrumentation changes neither cart rules nor reply priority. It is diagnostic evidence, not a fix for live intent interpretation. After separately authorized deployment, repeat the failed phrase once and inspect the correlated traces; do not automatically retry quantity adjustments.
 

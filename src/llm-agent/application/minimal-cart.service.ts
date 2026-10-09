@@ -51,6 +51,16 @@ export type MinimalCartResult =
       totalCents: number;
       promotionEvaluationStatus: 'fully_evaluated' | 'needs_human_review';
     };
+/** Synchronous, observational-only callback; never returned to the model or stored. */
+export type MinimalCartVariantDiagnostic = {
+  linePosition: number;
+  lineOrigin: 'requested' | 'stored';
+  catalogVariantFound: boolean;
+  stockVariantFound: boolean;
+  variantIsProductId: boolean;
+};
+type VariantDiagnosticObserver = (event: MinimalCartVariantDiagnostic) => void;
+
 const sameLine = (
   a: Pick<CartItem, 'productId' | 'variantId'>,
   b: Pick<CartItem, 'productId' | 'variantId'>,
@@ -65,12 +75,15 @@ export class MinimalCartService {
     @Inject(CONVERSATION_STORE) private readonly store: ConversationStore,
   ) {}
 
-  async view(senderId: string): Promise<MinimalCartResult> {
+  async view(
+    senderId: string,
+    onInvalidVariant?: VariantDiagnosticObserver,
+  ): Promise<MinimalCartResult> {
     try {
       const raw = (await this.store.get(senderId))?.data.minimalCart;
       const cart = this.read(raw);
       if (!cart) return { ok: false, error: 'invalid_cart' };
-      return await this.quote(cart.items);
+      return await this.quote(cart.items, onInvalidVariant);
     } catch {
       return { ok: false, error: 'cart_unavailable' };
     }
@@ -81,8 +94,15 @@ export class MinimalCartService {
     senderId: string,
     input: MinimalCartInput,
     allowedIds: ReadonlySet<string>,
+    onInvalidVariant?: VariantDiagnosticObserver,
   ): Promise<MinimalCartResult> {
-    return this.changeItem(senderId, input, allowedIds, 'set');
+    return this.changeItem(
+      senderId,
+      input,
+      allowedIds,
+      'set',
+      onInvalidVariant,
+    );
   }
 
   /** Apply a signed unit delta to the same snapshot used by CAS; never retry it. */
@@ -90,8 +110,15 @@ export class MinimalCartService {
     senderId: string,
     input: MinimalCartAdjustmentInput,
     allowedIds: ReadonlySet<string>,
+    onInvalidVariant?: VariantDiagnosticObserver,
   ): Promise<MinimalCartResult> {
-    return this.changeItem(senderId, input, allowedIds, 'adjust');
+    return this.changeItem(
+      senderId,
+      input,
+      allowedIds,
+      'adjust',
+      onInvalidVariant,
+    );
   }
 
   private async changeItem(
@@ -99,6 +126,7 @@ export class MinimalCartService {
     input: MinimalCartInput | MinimalCartAdjustmentInput,
     allowedIds: ReadonlySet<string>,
     operation: 'set' | 'adjust',
+    onInvalidVariant?: VariantDiagnosticObserver,
   ): Promise<MinimalCartResult> {
     try {
       const parsed =
@@ -135,7 +163,7 @@ export class MinimalCartService {
           quantity,
           unitPriceCents: 0,
         });
-      const quote = await this.quote(items);
+      const quote = await this.quote(items, onInvalidVariant, request);
       if (!quote.ok) return quote;
       const next: CartState = {
         items: quote.items.map(
@@ -176,7 +204,11 @@ export class MinimalCartService {
     return parsed.data;
   }
 
-  private async quote(items: CartItem[]): Promise<MinimalCartResult> {
+  private async quote(
+    items: CartItem[],
+    onInvalidVariant?: VariantDiagnosticObserver,
+    requestedLine?: Pick<CartItem, 'productId' | 'variantId'>,
+  ): Promise<MinimalCartResult> {
     if (items.length === 0)
       return {
         ok: true,
@@ -185,7 +217,7 @@ export class MinimalCartService {
         promotionEvaluationStatus: 'fully_evaluated',
       };
     const trusted: Omit<QuotedItem, 'finalPriceCents'>[] = [];
-    for (const line of items) {
+    for (const [index, line] of items.entries()) {
       const stock = await this.api.getStock(line.productId);
       if (stock.productId !== line.productId)
         return { ok: false, error: 'unknown_product' };
@@ -203,8 +235,23 @@ export class MinimalCartService {
       const variantStock = line.variantId
         ? stock.variants.find((v) => v.variantId === line.variantId)
         : undefined;
-      if (line.variantId && (!variant || !variantStock))
+      if (line.variantId && (!variant || !variantStock)) {
+        try {
+          onInvalidVariant?.({
+            linePosition: index + 1,
+            lineOrigin:
+              requestedLine && sameLine(line, requestedLine)
+                ? 'requested'
+                : 'stored',
+            catalogVariantFound: variant !== undefined,
+            stockVariantFound: variantStock !== undefined,
+            variantIsProductId: line.variantId === line.productId,
+          });
+        } catch {
+          // Diagnostics must never replace the original rejection or permit a write.
+        }
         return { ok: false, error: 'invalid_variant' };
+      }
       if (!line.variantId && stock.variants.length > 0)
         return { ok: false, error: 'variant_required' };
       const inventory = variantStock?.stock ?? stock.stock;

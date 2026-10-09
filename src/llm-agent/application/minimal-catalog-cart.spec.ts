@@ -125,6 +125,203 @@ describe('Minimal cart through the public SDK route', () => {
       );
   const traceSuffix = ' trace=[0-9a-f-]{36}$';
 
+  it.each([
+    {
+      tool: 'setCartItem',
+      seed: false,
+      stale: false,
+      catalog: false,
+      stock: false,
+      loggerFails: false,
+    },
+    {
+      tool: 'adjustCartItem',
+      seed: false,
+      stale: false,
+      catalog: true,
+      stock: false,
+      loggerFails: false,
+    },
+    {
+      tool: 'setCartItem',
+      seed: false,
+      stale: false,
+      catalog: false,
+      stock: true,
+      loggerFails: false,
+    },
+    {
+      tool: 'getCart',
+      seed: true,
+      stale: true,
+      catalog: false,
+      stock: false,
+      loggerFails: false,
+    },
+    {
+      tool: 'setCartItem',
+      seed: true,
+      stale: true,
+      catalog: true,
+      stock: false,
+      loggerFails: false,
+    },
+    {
+      tool: 'setCartItem',
+      seed: true,
+      stale: false,
+      catalog: false,
+      stock: false,
+      loggerFails: false,
+    },
+    {
+      tool: 'adjustCartItem',
+      seed: false,
+      stale: false,
+      catalog: true,
+      stock: false,
+      loggerFails: true,
+    },
+  ])(
+    'diagnoses invalid_variant through $tool (seed=$seed stale=$stale catalog=$catalog stock=$stock loggerFails=$loggerFails)',
+    async ({ tool: name, seed, stale, catalog, stock, loggerFails }) => {
+      const logs = jest
+        .spyOn(Logger.prototype, 'log')
+        .mockImplementation((message: unknown) => {
+          if (loggerFails && String(message).includes('cart_variant_check'))
+            throw new Error('svc_private-logger-secret');
+        });
+      const f = setup();
+      const variantId = '22222222-2222-4222-8222-222222222222';
+      const secondProduct = '33333333-3333-4333-8333-333333333333';
+      const requestedProduct = seed ? secondProduct : ID;
+      const target = stale ? ID : requestedProduct;
+      const variant = {
+        variantId,
+        name: 'Private variant',
+        priceCents: 1200,
+        stock: { status: 'available', quantity: 10 },
+      };
+      const products = (broken: boolean) =>
+        [ID, secondProduct].map((productId) => ({
+          productId,
+          name: 'Private product',
+          price: { priceCents: 1200 },
+          variants:
+            broken && productId === target
+              ? catalog
+                ? [variant]
+                : []
+              : seed && productId === ID
+                ? [variant]
+                : [],
+        }));
+      const inventory = (productId: string, broken: boolean) => ({
+        productId,
+        name: 'Private product',
+        stock: { status: 'available', quantity: 10 },
+        variants:
+          broken && productId === target
+            ? stock
+              ? [variant]
+              : []
+            : seed && productId === ID
+              ? [variant]
+              : [],
+      });
+      f.api.evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          ...item,
+          variantId: item.variantId ?? null,
+          originalPriceCents: item.quantity * item.unitPriceCents,
+          finalPriceCents: item.quantity * item.unitPriceCents,
+          discountAmountCents: 0,
+          appliedPromotionTitle: null,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      f.api.searchCatalog.mockResolvedValue(products(false) as never);
+      f.api.getStock.mockImplementation(
+        async (id) => inventory(id, false) as never,
+      );
+      if (seed)
+        expect(
+          await f.cart.setItem(
+            SENDER,
+            { productId: ID, variantId, quantity: 2 },
+            new Set([ID]),
+          ),
+        ).toMatchObject({ ok: true });
+      const before = await f.cart.view(SENDER);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      f.api.searchCatalog.mockResolvedValue(products(true) as never);
+      f.api.getStock.mockImplementation(
+        async (id) => inventory(id, true) as never,
+      );
+      f.steps([
+        ...(name === 'getCart'
+          ? []
+          : [call('searchCatalog', { q: 'Private search text' })]),
+        call(
+          name,
+          name === 'getCart'
+            ? {}
+            : {
+                productId: requestedProduct,
+                ...(stale ? {} : { variantId }),
+                ...(name === 'adjustCartItem' ? { delta: 1 } : { quantity: 1 }),
+              },
+        ),
+        say(),
+      ]);
+      expect(
+        await f
+          .createAgent()
+          .tryHandle({ senderId: SENDER, text: 'Private customer text' }),
+      ).toEqual({
+        kind: 'handled',
+        reply:
+          'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+      });
+      const messages = logs.mock.calls.map(([message]) => String(message));
+      const diagnostics = messages.filter((message) =>
+        message.includes('cart_variant_check'),
+      );
+      const trace = messages
+        .find((message) => message.startsWith('minimal_catalog route_enter '))
+        ?.split('trace=')[1];
+      expect(trace).toMatch(/^[0-9a-f-]{36}$/);
+      expect(diagnostics).toEqual([
+        `minimal_catalog cart_variant_check operation=${name} line=${seed && !stale ? 2 : 1} origin=${stale ? 'stored' : 'requested'} catalog_match=${catalog} stock_match=${stock} variant_is_product=false trace=${trace}`,
+      ]);
+      expect(cartLogs(logs)).toEqual([
+        `minimal_catalog tool ${name} result=error code=invalid_variant trace=${trace}`,
+      ]);
+      for (const secret of [
+        SENDER,
+        ID,
+        variantId,
+        secondProduct,
+        'Private product',
+        'Private variant',
+        'Private search text',
+        'Private customer text',
+        'svc_private-logger-secret',
+      ])
+        expect(messages.join('\n')).not.toContain(secret);
+      expect(commit).not.toHaveBeenCalled();
+      f.api.searchCatalog.mockResolvedValue(products(false) as never);
+      f.api.getStock.mockImplementation(
+        async (id) => inventory(id, false) as never,
+      );
+      expect(await new MinimalCartService(f.api, f.store).view(SENDER)).toEqual(
+        before,
+      );
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(cartTools)(
     'traces $name success without changing its result',
     async ({ name, input, quantity }) => {

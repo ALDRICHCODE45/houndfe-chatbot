@@ -55,6 +55,35 @@ function setup() {
 }
 
 describe('Minimal cart public operations', () => {
+  it('keeps invalid_variant and unchanged cart when a diagnostic observer throws', async () => {
+    const f = setup();
+    const observer = jest.fn(() => {
+      throw new Error('private diagnostic failure');
+    });
+    const invoke: (
+      senderId: string,
+      input: { productId: string; variantId: string; quantity: number },
+      allowedIds: ReadonlySet<string>,
+      diagnostic: () => void,
+    ) => ReturnType<MinimalCartService['setItem']> = f.service.setItem.bind(
+      f.service,
+    );
+    const commit = jest.spyOn(f.store, 'commitMinimalCart');
+    const before = await f.service.view(SENDER);
+    expect(
+      await invoke(
+        SENDER,
+        { productId: PRODUCT, variantId: VARIANT, quantity: 1 },
+        f.allowed,
+        observer,
+      ),
+    ).toEqual({ ok: false, error: 'invalid_variant' });
+    expect(observer).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
+    expect(f.api.evaluateCart).not.toHaveBeenCalled();
+    expect(await f.service.view(SENDER)).toEqual(before);
+  });
+
   it('adds, views after a fresh service, replaces total quantity and removes without creating a sale', async () => {
     const f = setup();
     expect(
