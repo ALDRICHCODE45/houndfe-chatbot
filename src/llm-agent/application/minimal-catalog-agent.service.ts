@@ -24,6 +24,7 @@ import { CostGuardService } from './cost-guard.service';
 import {
   MinimalCartService,
   minimalCartInput,
+  minimalCartAdjustmentInput,
   minimalCartReply,
 } from './minimal-cart.service';
 import {
@@ -356,7 +357,10 @@ export class MinimalCatalogAgentService {
         ) +
         '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Use getCart para consultarlo, también después de un reinicio. ' +
         'Use setCartItem con producto/presentación elegidos y cantidad TOTAL deseada, no un incremento. Cero quita ese renglón. ' +
-        'Para agregar unidades a un renglón existente consulte getCart primero. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
+        'Interprete lenguaje cotidiano: «Agrega 2» suma dos unidades con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
+        '«Quita el producto» elimina el renglón con setCartItem(quantity: 0); «Quita uno» resta una unidad con adjustCartItem(delta: -1). ' +
+        'Use adjustCartItem para agregar o quitar unidades; la aplicación calcula el nuevo total. No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
+        'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta.'
       : baseInstructions;
@@ -628,6 +632,20 @@ export class MinimalCatalogAgentService {
               const result = await cart.view(context.senderId);
               if (result.ok)
                 for (const item of result.items) allowedIds.add(item.productId);
+              cartReply.value = minimalCartReply(result);
+              return result;
+            },
+          }),
+          adjustCartItem: tool({
+            description:
+              'Suma o resta unidades de un producto/presentación elegido. Delta positivo agrega; negativo quita unidades; cero resultante elimina el renglón. La aplicación calcula el total. No crea pedidos ni reserva existencias.',
+            inputSchema: minimalCartAdjustmentInput,
+            execute: async (input) => {
+              const result = await cart.adjustItem(
+                context.senderId,
+                input,
+                allowedIds,
+              );
               cartReply.value = minimalCartReply(result);
               return result;
             },

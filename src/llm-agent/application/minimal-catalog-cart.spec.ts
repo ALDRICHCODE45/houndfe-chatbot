@@ -138,6 +138,84 @@ describe('Minimal cart through the public SDK route', () => {
     );
   });
 
+  it.each([
+    {
+      text: 'Agrega 2 productos a mi carrito por favor',
+      initial: 2,
+      tool: 'adjustCartItem',
+      input: { productId: ID, delta: 2 },
+      expected: 4,
+    },
+    {
+      text: 'Déjame 2 productos en total',
+      initial: 3,
+      tool: 'setCartItem',
+      input: { productId: ID, quantity: 2 },
+      expected: 2,
+    },
+    {
+      text: 'Quita el producto de mi carrito por favor',
+      initial: 2,
+      tool: 'setCartItem',
+      input: { productId: ID, quantity: 0 },
+      expected: 0,
+    },
+    {
+      text: 'Quita uno por favor',
+      initial: 2,
+      tool: 'adjustCartItem',
+      input: { productId: ID, delta: -1 },
+      expected: 1,
+    },
+  ])(
+    'executes the tool interpretation of "$text" without model arithmetic',
+    async ({ text, initial, tool: toolName, input, expected }) => {
+      const f = setup();
+      f.api.evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          ...item,
+          variantId: item.variantId ?? null,
+          originalPriceCents: item.quantity * item.unitPriceCents,
+          finalPriceCents: item.quantity * item.unitPriceCents,
+          discountAmountCents: 0,
+          appliedPromotionTitle: null,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      await new MinimalCartService(f.api, f.store).setItem(
+        SENDER,
+        { productId: ID, quantity: initial },
+        new Set([ID]),
+      );
+      f.steps([call(toolName, input), say()]);
+      const response = await f
+        .createAgent()
+        .tryHandle({ senderId: SENDER, text });
+      const reply =
+        expected === 0
+          ? 'Su carrito está vacío.'
+          : `Su carrito:\n• Product: ${expected} × $12.00 MXN; importe $${(expected * 12).toFixed(2)} MXN\nTotal de productos: $${(expected * 12).toFixed(2)} MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`;
+      expect(response).toEqual({ kind: 'handled', reply });
+      expect(
+        await new MinimalCartService(f.api, f.store).view(SENDER),
+      ).toMatchObject({
+        ok: true,
+        items: expected === 0 ? [] : [{ productId: ID, quantity: expected }],
+        totalCents: expected * 1200,
+      });
+      for (const instruction of [
+        'Agrega 2',
+        'Déjame 2',
+        'Quita el producto',
+        'Quita uno',
+      ]) {
+        expect(f.optionsSeen[0].system).toContain(instruction);
+      }
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    },
+  );
+
   it('overrides a model success claim after failed persistence without reactivating legacy', async () => {
     const f = setup();
     jest.spyOn(f.store, 'commitMinimalCart').mockResolvedValue(false);

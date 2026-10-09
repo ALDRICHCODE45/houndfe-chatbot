@@ -27,6 +27,17 @@ export const minimalCartInput = lineSchema
     quantity: z.number().int().nonnegative(),
   });
 export type MinimalCartInput = z.infer<typeof minimalCartInput>;
+export const minimalCartAdjustmentInput = minimalCartInput
+  .omit({ quantity: true })
+  .extend({
+    delta: z
+      .number()
+      .int()
+      .refine((value) => value !== 0),
+  });
+export type MinimalCartAdjustmentInput = z.infer<
+  typeof minimalCartAdjustmentInput
+>;
 type QuotedItem = CartItem & {
   name: string;
   variantName?: string;
@@ -71,8 +82,29 @@ export class MinimalCartService {
     input: MinimalCartInput,
     allowedIds: ReadonlySet<string>,
   ): Promise<MinimalCartResult> {
+    return this.changeItem(senderId, input, allowedIds, 'set');
+  }
+
+  /** Apply a signed unit delta to the same snapshot used by CAS; never retry it. */
+  async adjustItem(
+    senderId: string,
+    input: MinimalCartAdjustmentInput,
+    allowedIds: ReadonlySet<string>,
+  ): Promise<MinimalCartResult> {
+    return this.changeItem(senderId, input, allowedIds, 'adjust');
+  }
+
+  private async changeItem(
+    senderId: string,
+    input: MinimalCartInput | MinimalCartAdjustmentInput,
+    allowedIds: ReadonlySet<string>,
+    operation: 'set' | 'adjust',
+  ): Promise<MinimalCartResult> {
     try {
-      const parsed = minimalCartInput.safeParse(input);
+      const parsed =
+        operation === 'adjust'
+          ? minimalCartAdjustmentInput.safeParse(input)
+          : minimalCartInput.safeParse(input);
       if (!parsed.success)
         return { ok: false, error: 'invalid_quantity_or_identity' };
       const request = parsed.data;
@@ -81,13 +113,28 @@ export class MinimalCartService {
       );
       const cart = this.read(raw);
       if (!cart) return { ok: false, error: 'invalid_cart' };
-      const exists = cart.items.some((i) => sameLine(i, request));
-      if (!exists && !allowedIds.has(request.productId))
+      const existing = cart.items.find((i) => sameLine(i, request));
+      if (!existing && !allowedIds.has(request.productId))
         return { ok: false, error: 'unknown_product' };
-      if (request.quantity === 0 && !exists)
+      if (
+        !existing &&
+        ('delta' in request ? request.delta < 0 : request.quantity === 0)
+      )
         return { ok: false, error: 'item_not_in_cart' };
+      const quantity =
+        'delta' in request
+          ? (existing?.quantity ?? 0) + request.delta
+          : request.quantity;
+      if (!Number.isSafeInteger(quantity) || quantity < 0)
+        return { ok: false, error: 'invalid_quantity_or_identity' };
       const items = cart.items.filter((i) => !sameLine(i, request));
-      if (request.quantity > 0) items.push({ ...request, unitPriceCents: 0 });
+      if (quantity > 0)
+        items.push({
+          productId: request.productId,
+          ...(request.variantId ? { variantId: request.variantId } : {}),
+          quantity,
+          unitPriceCents: 0,
+        });
       const quote = await this.quote(items);
       if (!quote.ok) return quote;
       const next: CartState = {

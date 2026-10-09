@@ -237,6 +237,88 @@ describe('Minimal cart public operations', () => {
     expect(await f.store.get(SENDER)).toEqual(before);
   });
 
+  it('adds requested units to the stored quantity rather than replacing it', async () => {
+    const f = setup();
+    await f.service.setItem(
+      SENDER,
+      { productId: PRODUCT, quantity: 2 },
+      f.allowed,
+    );
+    expect(
+      await f.service.adjustItem(
+        SENDER,
+        { productId: PRODUCT, delta: 2 },
+        new Set(),
+      ),
+    ).toMatchObject({
+      ok: true,
+      items: [{ productId: PRODUCT, quantity: 4 }],
+      totalCents: 3900,
+    });
+    expect(await f.service.view(SENDER)).toMatchObject({
+      ok: true,
+      items: [{ quantity: 4 }],
+    });
+  });
+
+  it.each([2, 1])(
+    'subtracts one unit from %i, removing the line at zero',
+    async (quantity) => {
+      const f = setup();
+      await f.service.setItem(
+        SENDER,
+        { productId: PRODUCT, quantity },
+        f.allowed,
+      );
+      const result = await f.service.adjustItem(
+        SENDER,
+        { productId: PRODUCT, delta: -1 },
+        new Set(),
+      );
+      const expected =
+        quantity === 1 ? [] : [{ productId: PRODUCT, quantity: 1 }];
+      expect(result).toMatchObject({
+        ok: true,
+        items: expected,
+        totalCents: quantity === 1 ? 0 : 900,
+      });
+      expect(await f.service.view(SENDER)).toMatchObject({
+        ok: true,
+        items: expected,
+      });
+    },
+  );
+
+  it('adds to an empty cart and rejects stock overflow without a write or retry', async () => {
+    const f = setup();
+    const commit = jest.spyOn(f.store, 'commitMinimalCart');
+    expect(
+      await f.service.adjustItem(
+        SENDER,
+        { productId: PRODUCT, delta: 2 },
+        f.allowed,
+      ),
+    ).toMatchObject({
+      ok: true,
+      items: [{ quantity: 2 }],
+      totalCents: 1900,
+    });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(
+      await f.service.adjustItem(
+        SENDER,
+        { productId: PRODUCT, delta: 10 },
+        new Set(),
+      ),
+    ).toEqual({ ok: false, error: 'insufficient_stock' });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(await f.service.view(SENDER)).toMatchObject({
+      ok: true,
+      items: [{ quantity: 2 }],
+      totalCents: 1900,
+    });
+  });
+
   it('holds a lost CAS without retry or claiming success', async () => {
     const f = setup();
     jest.spyOn(f.store, 'commitMinimalCart').mockResolvedValue(false);
