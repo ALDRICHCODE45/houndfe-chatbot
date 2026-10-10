@@ -648,10 +648,22 @@ export class MinimalCatalogAgentService {
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
-    const registerSelection: RegisterSelection = (identity) =>
-      cartConversation === null ? null : cartConversation.register(identity);
     const trace = (event: string) =>
       traceLog(this.logger, `minimal_catalog ${event} trace=${traceId}`);
+    const registerSelection =
+      (name: 'searchCatalog' | 'checkStock' | 'getCart'): RegisterSelection =>
+      (identity) => {
+        const reference =
+          cartConversation === null
+            ? null
+            : cartConversation.register(identity);
+        // No cart capability means no attempted cart binding to diagnose.
+        if (cartConversation !== null && reference === null)
+          trace(
+            `cart_selection stage=register tool=${name} result=rejected code=selection_unavailable`,
+          );
+        return reference;
+      };
     const traceCartResult = (
       name: 'getCart' | 'setCartItem' | 'adjustCartItem',
       result: MinimalCartResult,
@@ -754,7 +766,7 @@ export class MinimalCatalogAgentService {
           try {
             const items = await chatbotApi.searchCatalog(q);
             const results = items.map((item) =>
-              projectItem(item, registerSelection),
+              projectItem(item, registerSelection('searchCatalog')),
             );
             for (const item of items) {
               allowedIds.add(item.productId);
@@ -796,14 +808,14 @@ export class MinimalCatalogAgentService {
               name: stock.name,
               stock: stock.stock,
               ...(() => {
-                const ref = registerSelection({
+                const ref = registerSelection('checkStock')({
                   productId: stock.productId,
                   productName: stock.name,
                 });
                 return ref === null ? {} : { cartSelectionRef: ref };
               })(),
               variants: stock.variants.map((variant) => {
-                const ref = registerSelection({
+                const ref = registerSelection('checkStock')({
                   productId: stock.productId,
                   variantId: variant.variantId,
                   productName: stock.name,
@@ -949,12 +961,12 @@ export class MinimalCatalogAgentService {
               acknowledge(minimalCartReply(result));
               if (!result.ok) return result;
               const items = result.items.map((item) => {
-                const productRef = conversation?.register({
+                const productRef = registerSelection('getCart')({
                   productId: item.productId,
                   productName: item.name,
                 });
                 const ref = item.variantId
-                  ? conversation?.register({
+                  ? registerSelection('getCart')({
                       productId: item.productId,
                       variantId: item.variantId,
                       productName: item.name,
@@ -985,6 +997,9 @@ export class MinimalCatalogAgentService {
               if (conversation === null) return toolError('cart_unavailable');
               const identity = conversation.resolve(selectionRef);
               if (identity === null) {
+                trace(
+                  'cart_selection stage=resolve tool=adjustCartItem result=rejected code=unknown_selection',
+                );
                 acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
                 return toolError('unknown_cart_selection');
               }
@@ -1020,6 +1035,9 @@ export class MinimalCatalogAgentService {
               if (conversation === null) return toolError('cart_unavailable');
               const identity = conversation.resolve(selectionRef);
               if (identity === null) {
+                trace(
+                  'cart_selection stage=resolve tool=setCartItem result=rejected code=unknown_selection',
+                );
                 acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
                 return toolError('unknown_cart_selection');
               }
@@ -1065,6 +1083,9 @@ export class MinimalCatalogAgentService {
               if (conversation === null) return toolError('cart_unavailable');
               const identity = conversation.resolve(selectionRef);
               if (identity === null) {
+                trace(
+                  'cart_selection stage=resolve tool=prepareCartItem result=rejected code=unknown_selection',
+                );
                 acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
                 return toolError('unknown_cart_selection');
               }

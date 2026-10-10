@@ -1417,6 +1417,159 @@ it.each([
   },
 );
 
+describe('private selection-stage rejection diagnostics', () => {
+  it.each(['adjustCartItem', 'setCartItem', 'prepareCartItem'])(
+    'traces an unknown selection before grounding through %s',
+    async (toolName) => {
+      const logs = jest
+        .spyOn(Logger.prototype, 'log')
+        .mockImplementation(() => undefined);
+      try {
+        const f = fixture();
+        const before = await f.cart.view(SENDER);
+        const adjust = jest.spyOn(f.cart, 'adjustItem');
+        const set = jest.spyOn(f.cart, 'setItem');
+        const proposal =
+          toolName === 'adjustCartItem'
+            ? { delta: null }
+            : toolName === 'setCartItem'
+              ? { quantity: null }
+              : { operation: 'add', quantity: null };
+        f.steps([
+          call('searchCatalog', { q: 'ibuprofeno' }),
+          call(toolName, {
+            selectionRef: 'deadbeefdeadbeef',
+            ...proposal,
+            quantityText: null,
+            continuation: true,
+          }),
+          say('Agregado'),
+        ]);
+        const reply = await f.agent.tryHandle({
+          senderId: SENDER,
+          text: 'La de 500mg por favor.',
+        });
+        expect(reply).toMatchObject({ kind: 'handled', reply: REJECTION });
+        expect(adjust).not.toHaveBeenCalled();
+        expect(set).not.toHaveBeenCalled();
+        expect(f.api.getStock).not.toHaveBeenCalled();
+        expect(f.api.evaluateCart).not.toHaveBeenCalled();
+        expect(await f.cart.view(SENDER)).toEqual(before);
+        const lines = logs.mock.calls.map((args) => String(args[0]));
+        expect(lines.filter((line) => line.includes('cart_grounding'))).toEqual(
+          [],
+        );
+        const diagnostics = lines.filter((line) =>
+          line.includes('cart_selection'),
+        );
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0]).toMatch(
+          new RegExp(
+            `^minimal_catalog cart_selection stage=resolve tool=${toolName} result=rejected code=unknown_selection trace=[a-f0-9-]+$`,
+          ),
+        );
+        const fields = diagnostics[0].split(' trace=')[0];
+        for (const secret of [
+          SENDER,
+          PRODUCT,
+          LARGE,
+          f.refs.large,
+          'deadbeefdeadbeef',
+          '500',
+          'ibuprofeno',
+        ])
+          expect(fields).not.toContain(secret);
+        expect(f.api.createSale).not.toHaveBeenCalled();
+        expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+      } finally {
+        logs.mockRestore();
+      }
+    },
+  );
+
+  it('keeps unknown-reference rejection safe when diagnostic logging throws', async () => {
+    const logs = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {
+      throw new Error('logger unavailable');
+    });
+    try {
+      const f = fixture();
+      f.steps([
+        call('searchCatalog', { q: 'ibuprofeno' }),
+        call('adjustCartItem', {
+          selectionRef: 'deadbeefdeadbeef',
+          delta: null,
+          quantityText: null,
+          continuation: true,
+        }),
+        say('Agregado'),
+      ]);
+      const reply = await f.agent.tryHandle({
+        senderId: SENDER,
+        text: 'La de 500mg por favor.',
+      });
+      expect(reply).toMatchObject({ kind: 'handled', reply: REJECTION });
+      expect(await f.cart.view(SENDER)).toMatchObject({ ok: true, items: [] });
+      expect(f.api.getStock).not.toHaveBeenCalled();
+      expect(f.api.evaluateCart).not.toHaveBeenCalled();
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    } finally {
+      logs.mockRestore();
+    }
+  });
+
+  it('traces a refused catalog binding at the registry cap without logging identities', async () => {
+    const logs = jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined);
+    try {
+      const f = fixture();
+      f.api.searchCatalog.mockResolvedValue(
+        Array.from({ length: 51 }, (_, index) => ({
+          ...products[1],
+          productId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`,
+        })) as never,
+      );
+      f.steps([
+        call('searchCatalog', { q: 'croquetas' }),
+        say('Productos encontrados'),
+      ]);
+      const reply = await f.agent.tryHandle({
+        senderId: SENDER,
+        text: 'Busca croquetas',
+      });
+      expect(reply).toMatchObject({
+        kind: 'handled',
+        reply: 'Productos encontrados',
+      });
+      expect(f.api.searchCatalog).toHaveBeenCalledTimes(1);
+      expect(f.api.getStock).not.toHaveBeenCalled();
+      expect(f.api.evaluateCart).not.toHaveBeenCalled();
+      expect(await f.cart.view(SENDER)).toMatchObject({ ok: true, items: [] });
+      const diagnostics = logs.mock.calls
+        .map((args) => String(args[0]))
+        .filter((line) => line.includes('cart_selection'));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toMatch(
+        /^minimal_catalog cart_selection stage=register tool=searchCatalog result=rejected code=selection_unavailable trace=[a-f0-9-]+$/,
+      );
+      const fields = diagnostics[0].split(' trace=')[0];
+      for (const secret of [
+        SENDER,
+        '00000000-',
+        'croquetas',
+        '51',
+        'quantityText',
+      ])
+        expect(fields).not.toContain(secret);
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    } finally {
+      logs.mockRestore();
+    }
+  });
+});
+
 it('rejects wrong SET and emits only closed private grounding diagnostics', async () => {
   const logs = jest
     .spyOn(Logger.prototype, 'log')

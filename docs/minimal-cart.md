@@ -69,6 +69,19 @@ The additional private `detail` field refines evidence failures without changing
 | `invalid_citation`     | The citation is empty, has no single valid count, contains ambiguous/negative/measured evidence, or the proposed number is invalid. |
 | `none`                 | No evidence subcode applies, including success, quantity clarification and other rejection guards.                                  |
 
+Selection failures before quantity grounding have their own private traces:
+
+```text
+minimal_catalog cart_selection stage=register tool=searchCatalog result=rejected code=selection_unavailable trace=<trace-id>
+minimal_catalog cart_selection stage=resolve tool=adjustCartItem result=rejected code=unknown_selection trace=<trace-id>
+```
+
+- `stage=register` means a cart binding was refused during `searchCatalog`, `checkStock` or `getCart`. It does not distinguish invalid catalog identity/labels from the documented 50-binding limit. Disabled cart capability emits no binding diagnostic.
+- `stage=resolve` means `adjustCartItem`, `setCartItem` or `prepareCartItem` could not resolve the supplied reference, so grounding and cart mutation were not reached. It does not prove the model invented the reference or which presentation it intended.
+- Successful registration/resolution emits no new selection trace. Only fixed stage, tool, result and code labels plus the generated trace ID are recorded: no reference, UUID, label, message, argument or count is logged. Logger failures cannot change the rejection, allow a write or cause an automatic retry.
+
+For the failed `La de 500mg por favor.` rehearsal, capture all entries for that turn's trace after separately authorized deployment. A register rejection explains unavailable bindings; a resolve rejection identifies the reference guard. Neither code alone establishes the original live root cause. SDK argument rejection can still happen before execution and is a separate path.
+
 These are closed codes, not payload logging. They never expose the citation, quantity, selection reference or customer message to logs, model results or persisted history. Diagnostic failures remain best-effort and cannot authorize a write or retry.
 
 After separately authorized deployment, select `Sí, la de 500mg por favor.`, then reply `solo 1 por favor.` once. If rejected, capture that turn's `cart_grounding` entries, including `reason`, `detail` and `trace`. The local valid-citation case succeeds; this diagnostic refinement does not claim to fix the unknown live model payload.
