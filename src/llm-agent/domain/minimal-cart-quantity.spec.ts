@@ -31,6 +31,54 @@ function input(
   };
 }
 
+describe('private quantity evidence details', () => {
+  it.each([
+    [null, 1, 'missing_citation'],
+    ['500mg', 1, 'citation_not_literal'],
+    ['1', 2, 'count_mismatch'],
+    ['por favor', 1, 'invalid_citation'],
+  ])(
+    'distinguishes rejected evidence without changing the result (%s)',
+    (quantityText, quantity, detail) => {
+      const onRejection = jest.fn();
+      expect(
+        groundCartQuantity(
+          input({
+            text: 'solo 1 por favor.',
+            quantity,
+            quantityText,
+            pending: { productId, operation: 'add' },
+            continuation: true,
+            onRejection,
+          }),
+        ),
+      ).toEqual({ kind: 'invalid_evidence' });
+      expect(onRejection).toHaveBeenCalledTimes(1);
+      expect(onRejection).toHaveBeenCalledWith('evidence_rejected', detail);
+    },
+  );
+
+  it('keeps literal abbreviated quantity valid and does not emit a rejection', () => {
+    const onRejection = jest.fn();
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'solo 1 por favor.',
+          quantity: 1,
+          quantityText: '1',
+          pending: { productId, operation: 'add' },
+          continuation: true,
+          onRejection,
+        }),
+      ),
+    ).toEqual({
+      kind: 'ready',
+      intent: { productId, operation: 'add', quantity: 1 },
+    });
+    expect(onRejection).not.toHaveBeenCalled();
+  });
+});
+
 describe('groundCartQuantity pending quantity policy (S3)', () => {
   it('keeps the two units stated earlier when the 500mg continuation cites no count', () => {
     const first = groundCartQuantity(

@@ -1307,6 +1307,116 @@ describe('reported presentation-only confirmation after the full cart sequence',
   );
 });
 
+it.each([
+  [null, 1, 'missing_citation'],
+  ['500mg', 1, 'citation_not_literal'],
+  ['1', 2, 'count_mismatch'],
+  ['por favor', 1, 'invalid_citation'],
+])(
+  'traces private follow-up evidence detail %s without changing the cart',
+  async (quantityText, quantity, detail) => {
+    const logs = jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined);
+    try {
+      const f = fixture();
+      await f.cart.setItem(
+        SENDER,
+        { productId: PRODUCT, variantId: SMALL, quantity: 2 },
+        new Set([PRODUCT]),
+      );
+      f.steps([call('searchCatalog', { q: 'ibuprofeno' }), say()]);
+      await f.agent.tryHandle({
+        senderId: SENDER,
+        text: 'Cuantas presentaciones tienes de ibuprofeno?',
+      });
+      f.steps([
+        call('adjustCartItem', {
+          selectionRef: f.refs.large,
+          delta: null,
+          quantityText: null,
+          continuation: true,
+        }),
+        say(),
+      ]);
+      const question = await f.agent.tryHandle({
+        senderId: SENDER,
+        text: 'Si, la de 500mg por favor.',
+      });
+      expect(question).toMatchObject({
+        kind: 'handled',
+        reply: '¿Cuántas unidades desea agregar? Dígame un número, por favor.',
+      });
+      const before = await f.cart.view(SENDER);
+      const adjust = jest.spyOn(f.cart, 'adjustItem');
+      const set = jest.spyOn(f.cart, 'setItem');
+      const stockReads = f.api.getStock.mock.calls.length;
+      const evaluations = f.api.evaluateCart.mock.calls.length;
+      logs.mockClear();
+      f.steps([
+        call('adjustCartItem', {
+          selectionRef: f.refs.large,
+          delta: quantity,
+          quantityText,
+          continuation: true,
+        }),
+        call('prepareCartItem', {
+          selectionRef: f.refs.large,
+          operation: 'add',
+          quantity,
+          quantityText,
+          continuation: true,
+        }),
+        say(),
+      ]);
+      const reply = await f.agent.tryHandle({
+        senderId: SENDER,
+        text: 'solo 1 por favor.',
+      });
+      expect(reply).toMatchObject({
+        kind: 'handled',
+        reply:
+          'No pude confirmar esa operación con la información de su mensaje. No modifiqué el carrito; ¿puede indicarme de nuevo qué desea?',
+      });
+      expect(adjust).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
+      expect(f.api.getStock).toHaveBeenCalledTimes(stockReads);
+      expect(f.api.evaluateCart).toHaveBeenCalledTimes(evaluations);
+      expect(await f.cart.view(SENDER)).toEqual(before);
+      const diagnostics = logs.mock.calls
+        .map((args) => String(args[0]))
+        .filter((line) => line.includes('cart_grounding'));
+      expect(diagnostics).toHaveLength(2);
+      for (const [index, toolName] of [
+        'adjustCartItem',
+        'prepareCartItem',
+      ].entries()) {
+        expect(diagnostics[index]).toMatch(
+          new RegExp(
+            `^minimal_catalog cart_grounding tool=${toolName} mode=add result=invalid_evidence reason=evidence_rejected detail=${detail} trace=[a-f0-9-]+$`,
+          ),
+        );
+        const fields = diagnostics[index].split(' trace=')[0];
+        for (const secret of [
+          SENDER,
+          PRODUCT,
+          LARGE,
+          f.refs.large,
+          'ibuprofeno',
+          '500',
+          'solo 1',
+          'quantityText',
+        ])
+          expect(fields).not.toContain(secret);
+      }
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+    } finally {
+      logs.mockRestore();
+    }
+  },
+);
+
 it('rejects wrong SET and emits only closed private grounding diagnostics', async () => {
   const logs = jest
     .spyOn(Logger.prototype, 'log')
@@ -1338,7 +1448,7 @@ it('rejects wrong SET and emits only closed private grounding diagnostics', asyn
       .filter((line) => line.includes('cart_grounding'));
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]).toMatch(
-      /^minimal_catalog cart_grounding tool=setCartItem mode=set result=invalid_evidence reason=operation_mismatch trace=[a-f0-9-]+$/,
+      /^minimal_catalog cart_grounding tool=setCartItem mode=set result=invalid_evidence reason=operation_mismatch detail=none trace=[a-f0-9-]+$/,
     );
     // A generated UUID may coincidentally contain dose digits; compare only
     // the semantic fields, after validating the trace format above.

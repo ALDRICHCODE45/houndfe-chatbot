@@ -918,7 +918,7 @@ export class MinimalCatalogAgentService {
         return toolError('cart_line_settled');
       const grounded = conversation.ground(identity, proposal);
       trace(
-        `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'}`,
+        `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
       );
       if (grounded.kind === 'invalid_evidence') {
         acknowledge(CART_OPERATION_CLARIFICATION);
@@ -1077,7 +1077,7 @@ export class MinimalCatalogAgentService {
                 continuation,
               });
               trace(
-                `cart_grounding tool=prepareCartItem mode=${operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'}`,
+                `cart_grounding tool=prepareCartItem mode=${operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
               );
               if (grounded.kind === 'ready') {
                 return {

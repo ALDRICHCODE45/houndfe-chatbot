@@ -54,10 +54,24 @@ Only the fixed tool name, success/error result, allowlisted error code and gener
 Grounding also emits a private, closed-code trace before a mutation/preparation outcome:
 
 ```text
-minimal_catalog cart_grounding tool=setCartItem mode=set result=invalid_evidence reason=operation_mismatch trace=<trace-id>
+minimal_catalog cart_grounding tool=setCartItem mode=set result=invalid_evidence reason=operation_mismatch detail=none trace=<trace-id>
 ```
 
 `mode` is one of `add`, `set`, `subtract`, `remove`; `result` is `ready`, `quantity_required` or `invalid_evidence`. `reason` is `none`, `evidence_rejected`, `operation_mismatch`, `quantity_out_of_range` or `removal_unconfirmed`. These codes contain no customer text, count values, labels, references or payloads, and are not returned to the model or stored in conversation history. The trace is best-effort and makes no backend request. `operation_mismatch` identifies a clear ADD offered as SET; it does not permit an automatic retry or operation override.
+
+The additional private `detail` field refines evidence failures without changing `reason` or customer replies:
+
+| `detail`               | Meaning                                                                                                                             |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `missing_citation`     | A valid model-proposed number has no literal citation.                                                                              |
+| `citation_not_literal` | The proposed citation cannot be found as a whole-token span in the current message.                                                 |
+| `count_mismatch`       | The model-proposed number differs from the single count parsed from the citation.                                                   |
+| `invalid_citation`     | The citation is empty, has no single valid count, contains ambiguous/negative/measured evidence, or the proposed number is invalid. |
+| `none`                 | No evidence subcode applies, including success, quantity clarification and other rejection guards.                                  |
+
+These are closed codes, not payload logging. They never expose the citation, quantity, selection reference or customer message to logs, model results or persisted history. Diagnostic failures remain best-effort and cannot authorize a write or retry.
+
+After separately authorized deployment, select `Sí, la de 500mg por favor.`, then reply `solo 1 por favor.` once. If rejected, capture that turn's `cart_grounding` entries, including `reason`, `detail` and `trace`. The local valid-citation case succeeds; this diagnostic refinement does not claim to fix the unknown live model payload.
 
 For a failed rehearsal, capture all entries for that turn's trace ID. `getCart` alone indicates a completed read, not an attempted addition. `stock_unverified` means stock could not be verified; `insufficient_stock` means verified stock was too low; `invalid_evaluation` means the pricing response failed validation; `cart_changed` means the compare-and-set lost a conflict. `cart_unavailable` can represent a backend or persistence failure and does not identify which one. The result codes alone do not identify the failing line in a multi-item cart. Absence of a cart trace does not prove why a tool failed to execute (for example, SDK input validation can reject it before execution).
 

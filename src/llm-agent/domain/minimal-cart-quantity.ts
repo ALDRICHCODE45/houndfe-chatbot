@@ -88,8 +88,19 @@ export interface CartQuantityEvidenceInput {
   /** True only when this turn continues the same pending request. */
   continuation: boolean;
   /** Closed, private diagnostic only; exceptions never affect grounding. */
-  onRejection?: (reason: CartQuantityRejectionReason) => void;
+  onRejection?: (
+    reason: CartQuantityRejectionReason,
+    detail: CartQuantityEvidenceDetail,
+  ) => void;
 }
+
+/** Closed private evidence subcodes; never include citation or count values. */
+export type CartQuantityEvidenceDetail =
+  | 'none'
+  | 'missing_citation'
+  | 'citation_not_literal'
+  | 'count_mismatch'
+  | 'invalid_citation';
 
 export type CartQuantityRejectionReason =
   | 'evidence_rejected'
@@ -308,7 +319,7 @@ type ParsedCount =
 type ResolvedEvidence =
   | { status: 'ok'; value: number }
   | { status: 'none' }
-  | { status: 'invalid' };
+  | { status: 'invalid'; detail: CartQuantityEvidenceDetail };
 
 function normalize(value: string): string {
   return value
@@ -506,18 +517,23 @@ function presentationContext(input: CartQuantityEvidenceInput): {
  */
 function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
   const { text, operation, quantity, quantityText } = input;
+  const invalid: ResolvedEvidence = {
+    status: 'invalid',
+    detail: 'invalid_citation',
+  };
 
   if (quantityText !== null) {
-    if (typeof quantityText !== 'string') return { status: 'invalid' };
+    if (typeof quantityText !== 'string') return invalid;
     const citation = normalize(quantityText).trim();
-    if (citation.length === 0) return { status: 'invalid' };
+    if (citation.length === 0) return invalid;
     const haystack = normalize(text);
     const matchIndex = findWholeToken(haystack, citation);
-    if (matchIndex === -1) return { status: 'invalid' };
+    if (matchIndex === -1)
+      return { status: 'invalid', detail: 'citation_not_literal' };
     // Judge the citation in context: a count immediately followed by a
     // measurement unit in the real turn is a dosage, not a quantity.
     if (measureUnitFollows(haystack, matchIndex + citation.length))
-      return { status: 'invalid' };
+      return invalid;
     // A bare `otra` is a count only through its real context: the following
     // token must be the singular noun `unidad`. The whole phrase `otra unidad`
     // is handled inside `parseCitationCount`. A bare citation is ambiguous
@@ -526,8 +542,7 @@ function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
     // closed the same way.
     let effectiveCitation = citation;
     if (citation === 'otra') {
-      if (countWholeToken(haystack, citation) !== 1)
-        return { status: 'invalid' };
+      if (countWholeToken(haystack, citation) !== 1) return invalid;
       if (singularUnitFollows(haystack, matchIndex + citation.length)) {
         effectiveCitation = 'otra unidad';
       }
@@ -536,7 +551,7 @@ function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
       singularAnotherUnitOccurrences(effectiveCitation) > 0 &&
       singularAnotherUnitOccurrences(haystack) !== 1
     ) {
-      return { status: 'invalid' };
+      return invalid;
     }
     const presentation = presentationContext(input);
     if (presentation.found && effectiveCitation === citation) {
@@ -546,21 +561,22 @@ function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
       );
     }
     const parsed = parseCitationCount(effectiveCitation);
-    if (parsed.status !== 'ok') return { status: 'invalid' };
+    if (parsed.status !== 'ok') return invalid;
     if (quantity !== null) {
-      if (!Number.isSafeInteger(quantity) || quantity !== parsed.value)
-        return { status: 'invalid' };
+      if (!Number.isSafeInteger(quantity)) return invalid;
+      if (quantity !== parsed.value)
+        return { status: 'invalid', detail: 'count_mismatch' };
     }
     return { status: 'ok', value: parsed.value };
   }
 
   if (quantity !== null) {
-    if (!Number.isSafeInteger(quantity)) return { status: 'invalid' };
+    if (!Number.isSafeInteger(quantity)) return invalid;
     // A whole-line `remove` may state zero with no count token to cite; the
     // removal itself is independently grounded by the removal-evidence check.
     if (quantity === 0 && operation === 'remove')
       return { status: 'ok', value: 0 };
-    return { status: 'invalid' };
+    return { status: 'invalid', detail: 'missing_citation' };
   }
 
   return { status: 'none' };
@@ -619,9 +635,10 @@ export function groundCartQuantity(
 
   const reject = (
     reason: CartQuantityRejectionReason,
+    detail: CartQuantityEvidenceDetail = 'none',
   ): CartQuantityGroundingResult => {
     try {
-      input.onRejection?.(reason);
+      input.onRejection?.(reason, detail);
     } catch {
       /* observational only */
     }
@@ -652,7 +669,8 @@ export function groundCartQuantity(
   const evidence = missingPresentationCount
     ? { status: 'none' as const }
     : resolveEvidence(input);
-  if (evidence.status === 'invalid') return reject('evidence_rejected');
+  if (evidence.status === 'invalid')
+    return reject('evidence_rejected', evidence.detail);
 
   // Whole-line removal is authorized only by explicit current-message removal
   // evidence, never by a bare confirmation or a model-chosen operation alone.
