@@ -469,12 +469,13 @@ export class MinimalCatalogAgentService {
         '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Use getCart para consultarlo, también después de un reinicio. ' +
         'Las herramientas de carrito usan selectionRef, NO un productId/variantId: copie el cartSelectionRef EXACTO que devolvió searchCatalog/checkStock/getCart para ese producto o presentación; nunca invente ni reutilice una referencia de otro renglón. ' +
         'Use setCartItem con la presentación elegida y la cantidad TOTAL deseada (quantity), no un incremento. ' +
-        'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total. ' +
+        'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total; un delta positivo también crea un renglón nuevo. ' +
         'En ambas, quantityText debe ser el fragmento LITERAL del mensaje actual que respalda el número (por ejemplo "2", "una"); si no lo cita, la aplicación pedirá aclaración. ' +
         'Interprete lenguaje cotidiano: «Agrega 2» suma dos con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
         '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
         'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
         'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
+        '«Sí, la de 500mg» elige una presentación, NO una cantidad: si no hay cantidad pendiente, use adjustCartItem(delta: null, quantityText: null) para conservar la selección y preguntar cuántas unidades. «Un ibuprofeno de 500» indica una unidad: cite "un", no la dosis. Nunca use setCartItem(quantity: 0) para elegir presentación. ' +
         'No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         CART_VARIANT_GUIDANCE +
@@ -916,6 +917,9 @@ export class MinimalCatalogAgentService {
       if (attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
       const grounded = conversation.ground(identity, proposal);
+      trace(
+        `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'}`,
+      );
       if (grounded.kind === 'invalid_evidence') {
         acknowledge(CART_OPERATION_CLARIFICATION);
         return toolError('invalid_cart_evidence');
@@ -1072,6 +1076,9 @@ export class MinimalCatalogAgentService {
                 quantityText,
                 continuation,
               });
+              trace(
+                `cart_grounding tool=prepareCartItem mode=${operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'}`,
+              );
               if (grounded.kind === 'ready') {
                 return {
                   ok: true as const,

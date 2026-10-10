@@ -751,3 +751,167 @@ describe('groundCartQuantity named whole-line removal (S4)', () => {
     ).toEqual({ kind: 'invalid_evidence' });
   });
 });
+
+describe('trusted presentation role grounding', () => {
+  it.each([
+    [1, '500mg'],
+    [1, null],
+    [500, '500mg'],
+  ])(
+    'asks rather than adopting presentation-only proposal %s/%s',
+    (quantity, quantityText) => {
+      expect(
+        groundCartQuantity(
+          input({
+            text: 'Si, la de 500mg por favor.',
+            variantName: '500mg',
+            productName: 'Ibuprofeno',
+            quantity,
+            quantityText,
+          }),
+        ),
+      ).toEqual({
+        kind: 'quantity_required',
+        intent: { productId, operation: 'add' },
+      });
+    },
+  );
+  it.each(['un', 'un ibuprofeno de 500', 'un ibuprofeno de 500mg'])(
+    'grounds one from broad or precise citation %s',
+    (quantityText) => {
+      const text = quantityText.endsWith('mg')
+        ? 'Quiero agregar un ibuprofeno de 500mg'
+        : 'Quiero agregar un ibuprofeno de 500';
+      expect(
+        groundCartQuantity(
+          input({
+            text,
+            productName: 'Ibuprofeno',
+            variantName: 'Tabletas 500mg',
+            quantity: 1,
+            quantityText,
+          }),
+        ),
+      ).toEqual({
+        kind: 'ready',
+        intent: { productId, operation: 'add', quantity: 1 },
+      });
+    },
+  );
+  it.each([
+    [
+      'Agrega 500 unidades de ibuprofeno de 500mg',
+      '500 unidades',
+      500,
+      'ready',
+    ],
+    [
+      'Agrega 2 o 3 ibuprofenos de 500mg',
+      '2 o 3 ibuprofenos de 500mg',
+      2,
+      'invalid_evidence',
+    ],
+    ['Si, la de 250mg', '250mg', 1, 'invalid_evidence'],
+    ['Agrega un ibuprofeno de 500', 'un ibuprofeno de 500', 1, 'ready'],
+    ['Agrega un ibuprofeno de 500', null, 1, 'invalid_evidence'],
+  ])(
+    'preserves count/evidence control %s',
+    (text, quantityText, quantity, kind) => {
+      expect(
+        groundCartQuantity(
+          input({
+            text,
+            quantityText,
+            quantity,
+            productName: 'Ibuprofeno',
+            variantName: '500mg',
+          }),
+        ).kind,
+      ).toBe(kind);
+    },
+  );
+  it('keeps wrong SET on explicit ADD rejected', () => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Quiero agregar un ibuprofeno de 500',
+          quantity: 1,
+          quantityText: 'un ibuprofeno de 500',
+          operation: 'set',
+          productName: 'Ibuprofeno',
+          variantName: '500mg',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  });
+});
+
+it.each([undefined, 'Presentación 500', '250mg', '500mg / 250mg'])(
+  'keeps unsupported trusted label %s fail-closed for broad citations',
+  (variantName) => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Quiero agregar un ibuprofeno de 500',
+          productName: 'Ibuprofeno',
+          variantName,
+          quantity: 1,
+          quantityText: 'un ibuprofeno de 500',
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  },
+);
+it('retains real 500-unit count inside a broad presentation citation', () => {
+  expect(
+    groundCartQuantity(
+      input({
+        text: 'Agrega 500 unidades de ibuprofeno de 500mg',
+        productName: 'Ibuprofeno',
+        variantName: '500mg',
+        quantity: 500,
+        quantityText: '500 unidades de ibuprofeno de 500mg',
+      }),
+    ),
+  ).toEqual({
+    kind: 'ready',
+    intent: { productId, operation: 'add', quantity: 500 },
+  });
+});
+it('does not let diagnostic exceptions change a rejection', () => {
+  expect(
+    groundCartQuantity(
+      input({
+        text: 'Agrega un ibuprofeno de 500',
+        operation: 'set',
+        productName: 'Ibuprofeno',
+        variantName: '500mg',
+        quantity: 1,
+        quantityText: 'un',
+        onRejection: () => {
+          throw new Error('logger failed');
+        },
+      }),
+    ),
+  ).toEqual({ kind: 'invalid_evidence' });
+});
+
+it.each([undefined, { productId, operation: 'add' as const, quantity: 2 }])(
+  'rejects mixed-dose confirmation before clarification or pending carry (%s)',
+  (pending) => {
+    expect(
+      groundCartQuantity(
+        input({
+          text: 'Si, la de 500mg o 250mg por favor.',
+          productName: 'Ibuprofeno',
+          variantName: '500mg',
+          operation: 'add',
+          quantity: 1,
+          quantityText: '500mg',
+          continuation: true,
+          pending,
+        }),
+      ),
+    ).toEqual({ kind: 'invalid_evidence' });
+  },
+);

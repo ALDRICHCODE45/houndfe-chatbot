@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import { Logger } from '@nestjs/common';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
@@ -751,9 +752,7 @@ describe('Minimal cart ambiguity through the public SDK route', () => {
     });
     expect(reply.kind).toBe('handled');
     if (reply.kind !== 'handled') throw new Error('Expected handled reply');
-    expect(reply.reply).toMatch(
-      /No pude confirmar esa operación|No pude completar esa operación/,
-    );
+    expect(reply.reply).toMatch(QUANTITY_QUESTION);
     expect(set).not.toHaveBeenCalled();
     expect(adjust).not.toHaveBeenCalled();
     expect(await f.cart.view(SENDER)).toEqual(before);
@@ -1125,4 +1124,292 @@ describe('Minimal cart singular "otra unidad" add phrasing (S4)', () => {
       expect(f.api.createSale).not.toHaveBeenCalled();
     },
   );
+});
+
+describe('reported presentation-only confirmation after the full cart sequence', () => {
+  it.each([
+    ['adjustCartItem', { delta: 1, quantityText: '500mg' }],
+    ['adjustCartItem', { delta: 1, quantityText: null }],
+    ['setCartItem', { quantity: 0, quantityText: null }],
+  ])(
+    'retains 500mg without adopting a guessed count through %s',
+    async (toolName, proposal) => {
+      const f = fixture();
+      const allowed = new Set([PRODUCT, FOOD]);
+      await f.cart.setItem(
+        SENDER,
+        { productId: PRODUCT, variantId: SMALL, quantity: 2 },
+        allowed,
+      );
+      await f.cart.setItem(SENDER, { productId: FOOD, quantity: 1 }, allowed);
+      const turn = async (text: string, steps: unknown[]) => {
+        f.steps(steps);
+        const result = await f.agent.tryHandle({ senderId: SENDER, text });
+        if (result.kind !== 'handled')
+          throw new Error('Expected handled reply');
+        return result.reply;
+      };
+      await turn('Muéstrame mi carrito', [call('getCart', {}), say()]);
+      expect(await f.cart.view(SENDER)).toMatchObject({ totalCents: 71000 });
+      await turn('Agrega otra unidad de Croquetas Nupec', [
+        call('adjustCartItem', {
+          selectionRef: f.refs.food,
+          delta: 1,
+          quantityText: 'otra unidad',
+          continuation: false,
+        }),
+        say(),
+      ]);
+      expect(await f.cart.view(SENDER)).toMatchObject({ totalCents: 116000 });
+      const ordinaryStock = f.api.getStock.getMockImplementation()!;
+      f.api.getStock.mockImplementation((id: string) =>
+        id === FOOD
+          ? (Promise.resolve({
+              productId: FOOD,
+              name: 'Croquetas Nupec',
+              stock: { status: 'available', quantity: 3 },
+              variants: [],
+            }) as never)
+          : ordinaryStock(id),
+      );
+      const beforeFailure = await f.cart.view(SENDER);
+      expect(
+        await turn('Agrega 5 croquetas', [
+          call('adjustCartItem', {
+            selectionRef: f.refs.food,
+            delta: 5,
+            quantityText: '5',
+            continuation: false,
+          }),
+          say(),
+        ]),
+      ).toBe(INSUFFICIENT_STOCK);
+      expect(await f.cart.view(SENDER)).toEqual(beforeFailure);
+      await turn('Deja una croqueta', [
+        call('setCartItem', {
+          selectionRef: f.refs.food,
+          quantity: 1,
+          quantityText: 'una',
+          continuation: false,
+        }),
+        say(),
+      ]);
+      expect(await f.cart.view(SENDER)).toMatchObject({ totalCents: 71000 });
+      await turn('Quita una croqueta', [
+        call('adjustCartItem', {
+          selectionRef: f.refs.food,
+          delta: -1,
+          quantityText: 'una',
+          continuation: false,
+        }),
+        say(),
+      ]);
+      expect(await f.cart.view(SENDER)).toMatchObject({ totalCents: 26000 });
+      await turn('Agrega una croqueta', [
+        call('searchCatalog', { q: 'croquetas nupec' }),
+        call('adjustCartItem', {
+          selectionRef: f.refs.food,
+          delta: 1,
+          quantityText: 'una',
+          continuation: false,
+        }),
+        say(),
+      ]);
+      const beforeSelection = await f.cart.view(SENDER);
+      expect(beforeSelection).toMatchObject({ totalCents: 71000 });
+      const adjust = jest.spyOn(f.cart, 'adjustItem');
+      const set = jest.spyOn(f.cart, 'setItem');
+      // The actual introduction is a text-only clarification, not an invented preparation.
+      await turn('Agrega ibuprofeno de otra presentación', [
+        say('¿Cuál presentación desea?'),
+      ]);
+      expect(adjust).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
+      await turn('Cuantas presentaciones tienes de ibuprofeno?', [
+        call('searchCatalog', { q: 'ibuprofeno' }),
+        say('250mg y 500mg'),
+      ]);
+      expect(
+        await turn('Si, la de 500mg por favor.', [
+          call(toolName, {
+            selectionRef: f.refs.large,
+            continuation: true,
+            ...proposal,
+          }),
+          say(),
+        ]),
+      ).toMatch(QUANTITY_QUESTION);
+      expect(adjust).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
+      expect(await f.cart.view(SENDER)).toEqual(beforeSelection);
+      // The next turn sees the server-retained chosen presentation, not a saved 250mg count.
+      const reply = await turn('Quiero agregar un ibuprofeno de 500', [
+        call('adjustCartItem', {
+          selectionRef: f.refs.large,
+          delta: 1,
+          quantityText: 'un ibuprofeno de 500',
+          continuation: false,
+        }),
+        say(),
+      ]);
+      expect(String(f.optionsSeen.at(-1)?.system)).toContain(f.refs.large);
+      expect(reply).toContain('500mg');
+      expect(adjust).toHaveBeenCalledTimes(1);
+      expect(set).not.toHaveBeenCalled();
+      const after = await f.cart.view(SENDER);
+      expect(after).toMatchObject({ totalCents: 86000 });
+      if (!after.ok) throw new Error('Expected verified cart');
+      expect(after.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            productId: PRODUCT,
+            variantId: SMALL,
+            quantity: 2,
+          }),
+          expect.objectContaining({ productId: FOOD, quantity: 1 }),
+          expect.objectContaining({
+            productId: PRODUCT,
+            variantId: LARGE,
+            quantity: 1,
+          }),
+        ]),
+      );
+      expect(f.api.createSale).not.toHaveBeenCalled();
+      expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+      const beforeStockFailure = await f.cart.view(SENDER);
+      f.api.getStock.mockImplementation((id: string) =>
+        id === PRODUCT
+          ? (Promise.resolve({
+              productId: PRODUCT,
+              name: 'Ibuprofeno',
+              stock,
+              variants: products[0].variants.map((v) =>
+                v.variantId === LARGE
+                  ? { ...v, stock: { status: 'available', quantity: 1 } }
+                  : v,
+              ),
+            }) as never)
+          : ordinaryStock(id),
+      );
+      expect(
+        await turn('Agrega un ibuprofeno de 500', [
+          call('adjustCartItem', {
+            selectionRef: f.refs.large,
+            delta: 1,
+            quantityText: 'un',
+            continuation: false,
+          }),
+          say(),
+        ]),
+      ).toBe(INSUFFICIENT_STOCK);
+      expect(await f.cart.view(SENDER)).toEqual(beforeStockFailure);
+    },
+  );
+});
+
+it('rejects wrong SET and emits only closed private grounding diagnostics', async () => {
+  const logs = jest
+    .spyOn(Logger.prototype, 'log')
+    .mockImplementation(() => undefined);
+  try {
+    const f = fixture();
+    f.steps([call('searchCatalog', { q: 'ibuprofeno' }), say()]);
+    await f.agent.tryHandle({ senderId: SENDER, text: 'Busca ibuprofeno' });
+    const before = await f.cart.view(SENDER);
+    f.steps([
+      call('setCartItem', {
+        selectionRef: f.refs.large,
+        quantity: 1,
+        quantityText: 'un ibuprofeno de 500',
+        continuation: false,
+      }),
+      say(),
+    ]);
+    const reply = await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'Quiero agregar un ibuprofeno de 500',
+    });
+    expect(reply.kind).toBe('handled');
+    if (reply.kind !== 'handled') throw new Error('Expected handled reply');
+    expect(reply.reply).toContain('No pude confirmar');
+    expect(await f.cart.view(SENDER)).toEqual(before);
+    const diagnostics = logs.mock.calls
+      .map((args) => String(args[0]))
+      .filter((line) => line.includes('cart_grounding'));
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatch(
+      /^minimal_catalog cart_grounding tool=setCartItem mode=set result=invalid_evidence reason=operation_mismatch trace=[a-f0-9-]+$/,
+    );
+    // A generated UUID may coincidentally contain dose digits; compare only
+    // the semantic fields, after validating the trace format above.
+    const fields = diagnostics[0].split(' trace=')[0];
+    for (const secret of [
+      SENDER,
+      PRODUCT,
+      LARGE,
+      f.refs.large,
+      'ibuprofeno',
+      '500',
+      'quantityText',
+    ])
+      expect(fields).not.toContain(secret);
+    expect(f.api.createSale).not.toHaveBeenCalled();
+    expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+  } finally {
+    logs.mockRestore();
+  }
+});
+
+it('rejects mixed-dose selection without consuming or mutating a prepared quantity', async () => {
+  const f = fixture();
+  f.steps([
+    call('searchCatalog', { q: 'ibuprofeno' }),
+    call('prepareCartItem', {
+      selectionRef: f.refs.parent,
+      operation: 'add',
+      quantity: 2,
+      quantityText: '2',
+      continuation: false,
+    }),
+    say('¿De 250mg o de 500mg?'),
+  ]);
+  await f.agent.tryHandle({ senderId: SENDER, text: 'Agrega 2 ibuprofenos' });
+  const before = await f.cart.view(SENDER);
+  const adjust = jest.spyOn(f.cart, 'adjustItem');
+  f.steps([
+    call('adjustCartItem', {
+      selectionRef: f.refs.large,
+      delta: 1,
+      quantityText: '500mg',
+      continuation: true,
+    }),
+    say(),
+  ]);
+  const reply = await f.agent.tryHandle({
+    senderId: SENDER,
+    text: 'Si, la de 500mg o 250mg por favor.',
+  });
+  expect(reply.kind).toBe('handled');
+  if (reply.kind !== 'handled') throw new Error('Expected handled reply');
+  expect(reply.reply).toContain('No pude confirmar');
+  expect(adjust).not.toHaveBeenCalled();
+  expect(await f.cart.view(SENDER)).toEqual(before);
+  f.steps([
+    call('adjustCartItem', {
+      selectionRef: f.refs.large,
+      delta: null,
+      quantityText: null,
+      continuation: true,
+    }),
+    say(),
+  ]);
+  await f.agent.tryHandle({ senderId: SENDER, text: 'Los de 500mg' });
+  expect(adjust).toHaveBeenCalledTimes(1);
+  expect(await f.cart.view(SENDER)).toMatchObject({
+    ok: true,
+    items: [{ productId: PRODUCT, variantId: LARGE, quantity: 2 }],
+    totalCents: 30000,
+  });
+  expect(f.api.createSale).not.toHaveBeenCalled();
+  expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
 });

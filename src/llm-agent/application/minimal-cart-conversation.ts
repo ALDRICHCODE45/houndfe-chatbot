@@ -28,6 +28,7 @@ import {
 import {
   groundCartQuantity,
   type CartOperation,
+  type CartQuantityRejectionReason,
   type CartQuantityGroundingResult,
   type MinimalCartPendingRequest,
 } from '../domain/minimal-cart-quantity';
@@ -103,6 +104,13 @@ type CartProposal = {
  * `snapshot()` / `pendingIntent` for persistence.
  */
 export class MinimalCartConversation {
+  private rejection: CartQuantityRejectionReason | null = null;
+
+  /** Closed reason for the last grounding attempt; no customer data. */
+  get rejectionReason(): CartQuantityRejectionReason | null {
+    return this.rejection;
+  }
+
   constructor(
     private readonly selections: MinimalCartSelections,
     private readonly text: string,
@@ -137,7 +145,11 @@ export class MinimalCartConversation {
     selection: GroundableSelection,
     proposal: CartProposal,
   ): CartQuantityGroundingResult {
+    this.rejection = null;
     const result = groundCartQuantity({
+      onRejection: (reason) => {
+        this.rejection = reason;
+      },
       text: this.text,
       productId: selection.productId,
       productName: selection.productName,

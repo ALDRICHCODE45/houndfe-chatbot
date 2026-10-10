@@ -9,8 +9,9 @@
  *   - An explicit quantity must be cited with `quantityText`, a literal span of
  *     the current turn. The span is matched on whole words (case- and
  *     diacritic-insensitive) and the count parsed from it must agree with the
- *     model's number. An invented quote, a mismatched number, a dosage such as
- *     `500mg`, a bare substring of a dosage, a negative count, a competing pair
+ *     model's number. Verified presentation-role spans are excluded from a
+ *     broad citation, never used as a unit count. An invented quote, a mismatched
+ *     number, an unverified dosage, a bare substring of a dosage, a negative count, a competing pair
  *     of counts, or a number whose matched span is followed by a measurement
  *     unit in the current text all fail closed.
  *   - When the model states no quantity, a previously validated quantity may be
@@ -86,7 +87,15 @@ export interface CartQuantityEvidenceInput {
   pending?: MinimalCartQuantityIntent;
   /** True only when this turn continues the same pending request. */
   continuation: boolean;
+  /** Closed, private diagnostic only; exceptions never affect grounding. */
+  onRejection?: (reason: CartQuantityRejectionReason) => void;
 }
+
+export type CartQuantityRejectionReason =
+  | 'evidence_rejected'
+  | 'operation_mismatch'
+  | 'quantity_out_of_range'
+  | 'removal_unconfirmed';
 
 export type CartQuantityGroundingResult =
   | { kind: 'ready'; intent: MinimalCartQuantityIntent }
@@ -454,6 +463,42 @@ function parseCitationCount(citation: string): ParsedCount {
 }
 
 /**
+ * Mask only presentation-role spans proven by the server-owned variant label.
+ * Positions are preserved so a literal citation can be evaluated in its actual
+ * surroundings. A number followed by `unidades` is never a presentation.
+ */
+function presentationContext(input: CartQuantityEvidenceInput): {
+  text: string;
+  found: boolean;
+} {
+  const text = normalize(input.text);
+  if (typeof input.variantName !== 'string') return { text, found: false };
+  const doses = [
+    ...normalize(input.variantName).matchAll(/\b(\d+)\s*([a-z]+)\b/g),
+  ].filter((match) => MEASURE_UNITS.has(match[2]));
+  // Multi-dose labels are ambiguous; no leading-digit or equality assumption.
+  if (doses.length !== 1) return { text, found: false };
+  const [dose] = doses;
+  const namedProduct =
+    typeof input.productName === 'string' &&
+    findWholeToken(text, normalize(input.productName).trim()) !== -1;
+  let found = false;
+  const masked = text.replace(/\b\d+/g, (span, offset: number) => {
+    if (span !== dose[1]) return span;
+    const unit = /^\s*([a-z]+)/.exec(text.slice(offset + span.length))?.[1];
+    const prefix = text.slice(0, offset);
+    const barePresentation =
+      (unit === undefined || unit === 'por' || unit === 'para') &&
+      /\bde\s*$/.test(prefix) &&
+      (namedProduct || /\b(?:la|los|las|el)\s+de\s*$/.test(prefix));
+    if (unit !== dose[2] && !barePresentation) return span;
+    found = true;
+    return ' '.repeat(span.length);
+  });
+  return { text: masked, found };
+}
+
+/**
  * Resolve the explicit quantity from the citation, or report none/invalid. A
  * model number without a citation is never trusted, including `set` zero; the
  * only exception is the whole-line `remove` zero, which the removal-evidence
@@ -492,6 +537,13 @@ function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
       singularAnotherUnitOccurrences(haystack) !== 1
     ) {
       return { status: 'invalid' };
+    }
+    const presentation = presentationContext(input);
+    if (presentation.found && effectiveCitation === citation) {
+      effectiveCitation = presentation.text.slice(
+        matchIndex,
+        matchIndex + citation.length,
+      );
     }
     const parsed = parseCitationCount(effectiveCitation);
     if (parsed.status !== 'ok') return { status: 'invalid' };
@@ -565,33 +617,64 @@ export function groundCartQuantity(
     return { kind: 'invalid_evidence' };
   if (!OPERATIONS.has(operation)) return { kind: 'invalid_evidence' };
 
-  const evidence = resolveEvidence(input);
-  if (evidence.status === 'invalid') return { kind: 'invalid_evidence' };
+  const reject = (
+    reason: CartQuantityRejectionReason,
+  ): CartQuantityGroundingResult => {
+    try {
+      input.onRejection?.(reason);
+    } catch {
+      /* observational only */
+    }
+    return { kind: 'invalid_evidence' };
+  };
+  if (contradictsSet(input)) return reject('operation_mismatch');
+  const presentation = presentationContext(input);
+  // Matching dose masking must not hide a competing measured presentation.
+  // Unit-count detection intentionally ignores measurements, so check those
+  // separately before any missing-count fallback or pending quantity carry.
+  if (
+    presentation.found &&
+    [...presentation.text.matchAll(/\d+/g)].some((match) =>
+      measureUnitFollows(presentation.text, match.index + match[0].length),
+    )
+  )
+    return reject('evidence_rejected');
+  // A verified presentation-only selection is not a count, regardless of a
+  // model guess/citation. Never downgrade a real count or arm a removal here.
+  const missingPresentationCount =
+    presentation.found &&
+    !hasCountToken(presentation.text) &&
+    !NEGATIVE_NUMBER.test(normalize(text)) &&
+    (operation === 'add' || operation === 'set') &&
+    (!input.continuation ||
+      input.pending === undefined ||
+      hasMatchingPending(input));
+  const evidence = missingPresentationCount
+    ? { status: 'none' as const }
+    : resolveEvidence(input);
+  if (evidence.status === 'invalid') return reject('evidence_rejected');
 
   // Whole-line removal is authorized only by explicit current-message removal
   // evidence, never by a bare confirmation or a model-chosen operation alone.
   if (operation === 'remove') {
     if (evidence.status === 'ok' && evidence.value !== 0)
-      return { kind: 'invalid_evidence' };
+      return reject('removal_unconfirmed');
     const trustedLabels: string[] = [];
     if (typeof input.productName === 'string')
       trustedLabels.push(input.productName);
     if (typeof input.variantName === 'string')
       trustedLabels.push(input.variantName);
     if (!hasWholeLineRemovalEvidence(text, trustedLabels))
-      return { kind: 'invalid_evidence' };
+      return reject('removal_unconfirmed');
     return {
       kind: 'ready',
       intent: { productId, operation: 'remove', quantity: 0 },
     };
   }
 
-  if (evidence.status === 'ok' && contradictsSet(input))
-    return { kind: 'invalid_evidence' };
-
   if (evidence.status === 'ok') {
     if (!countAllowed(operation, evidence.value))
-      return { kind: 'invalid_evidence' };
+      return reject('quantity_out_of_range');
     return {
       kind: 'ready',
       intent: { productId, operation, quantity: evidence.value },
