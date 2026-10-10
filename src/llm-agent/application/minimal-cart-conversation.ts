@@ -71,6 +71,9 @@ export const CART_TOOL_NAMES: ReadonlySet<string> = new Set([
 export const CART_QUANTITY_QUESTION =
   '¿Cuántas unidades desea agregar? Dígame un número, por favor.';
 
+/** A grounded parent quantity is prepared, but its presentation is not chosen. */
+export const CART_PRESENTATION_QUESTION = '¿Qué presentación desea agregar?';
+
 /** Server-controlled fail-closed reply for a citation/consistency rejection. */
 export const CART_OPERATION_CLARIFICATION =
   'No pude confirmar esa operación con la información de su mensaje. No modifiqué el carrito; ¿puede indicarme de nuevo qué desea?';
@@ -200,7 +203,21 @@ export class MinimalCartConversation {
     proposal: CartProposal,
   ): CartQuantityGroundingResult {
     const result = this.ground(selection, proposal);
-    if (result.kind === 'ready') this.pending = { ...result.intent };
+    if (result.kind === 'ready') {
+      this.pending = {
+        ...result.intent,
+        productName: selection.productName,
+        ...(selection.variantId === undefined
+          ? {}
+          : { variantId: selection.variantId }),
+        ...(selection.variantName === undefined
+          ? {}
+          : { variantName: selection.variantName }),
+        ...(selection.reference === undefined
+          ? {}
+          : { reference: selection.reference }),
+      };
+    }
     return result;
   }
 

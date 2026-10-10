@@ -167,6 +167,159 @@ function fixture() {
   };
 }
 
+describe('reported quantity-before-presentation flow', () => {
+  it('does not instruct opaque-reference cart tools to send raw UUIDs', async () => {
+    const f = fixture();
+    f.steps([say('¿Qué producto desea?')]);
+    await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'Agrega ibuprofeno de otra presentación',
+    });
+    const options = f.optionsSeen.at(-1);
+    expect(String(options?.system)).not.toContain('envíe variantId: null');
+    for (const name of ['adjustCartItem', 'setCartItem', 'prepareCartItem']) {
+      const description = (options?.tools?.[name] as { description: string })
+        .description;
+      expect(description).toContain('selectionRef');
+      expect(description).not.toContain('envíe variantId: null');
+    }
+  });
+
+  it('retains verified references and one prepared unit across the exact customer turns', async () => {
+    const f = fixture();
+    const allowed = new Set([PRODUCT]);
+    await f.cart.setItem(
+      SENDER,
+      { productId: PRODUCT, variantId: SMALL, quantity: 2 },
+      allowed,
+    );
+    await f.cart.setItem(
+      SENDER,
+      { productId: PRODUCT, variantId: LARGE, quantity: 1 },
+      allowed,
+    );
+    const before = await f.cart.view(SENDER);
+    f.steps([call('getCart', {}), say()]);
+    await f.agent.tryHandle({ senderId: SENDER, text: 'Muéstrame mi carrito' });
+    f.steps([say('¿Cuántas unidades de la nueva presentación desea agregar?')]);
+    await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'Agrega ibuprofeno de otra presentación',
+    });
+    const referenceContext = String(f.optionsSeen.at(-1)?.system);
+    expect(referenceContext).toContain(f.refs.parent);
+    expect(referenceContext).toContain(f.refs.small);
+    expect(referenceContext).toContain(f.refs.large);
+    const adjust = jest.spyOn(f.cart, 'adjustItem');
+    f.steps([
+      call('prepareCartItem', {
+        selectionRef: f.refs.parent,
+        operation: 'add',
+        quantity: 1,
+        quantityText: 'una',
+        continuation: true,
+      }),
+      call('getCart', {}),
+      say('Agregado'),
+    ]);
+    const prepared = await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'Solo una',
+    });
+    expect(prepared).toMatchObject({
+      kind: 'handled',
+      reply: '¿Qué presentación desea agregar?',
+    });
+    expect(adjust).not.toHaveBeenCalled();
+    expect(await f.cart.view(SENDER)).toEqual(before);
+    f.steps([
+      call('adjustCartItem', {
+        selectionRef: f.refs.large,
+        delta: null,
+        quantityText: null,
+        continuation: true,
+      }),
+      say(),
+    ]);
+    const reply = await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'la de 500 esta bien, por favor.',
+    });
+    const pendingContext = String(f.optionsSeen.at(-1)?.system);
+    expect(pendingContext).toContain('con 1 unidad(es) para "Ibuprofeno"');
+    expect(pendingContext).toContain(`selectionRef: ${f.refs.parent}`);
+    expect(reply.kind).toBe('handled');
+    if (reply.kind !== 'handled') throw new Error('Expected handled reply');
+    expect(reply.reply).toContain('$560.00 MXN');
+    expect(adjust).toHaveBeenCalledTimes(1);
+    const after = await f.cart.view(SENDER);
+    expect(after).toMatchObject({ ok: true, totalCents: 56000 });
+    if (!after.ok) throw new Error('Expected verified cart');
+    expect(after.items).toHaveLength(2);
+    expect(after.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ variantId: SMALL, quantity: 2 }),
+        expect.objectContaining({ variantId: LARGE, quantity: 2 }),
+      ]),
+    );
+    expect(f.api.createSale).not.toHaveBeenCalled();
+    expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
+  });
+
+  it('does not let a later cart read erase a rejected preparation', async () => {
+    const f = fixture();
+    f.steps([
+      call('prepareCartItem', {
+        selectionRef: 'deadbeefdeadbeef',
+        operation: 'add',
+        quantity: 1,
+        quantityText: 'una',
+        continuation: true,
+      }),
+      call('getCart', {}),
+      say('Agregado'),
+    ]);
+    const reply = await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'Solo una',
+    });
+    expect(reply).toMatchObject({ kind: 'handled', reply: REJECTION });
+    expect(await f.cart.view(SENDER)).toMatchObject({ ok: true, items: [] });
+    expect(f.api.getStock).not.toHaveBeenCalled();
+    expect(f.api.evaluateCart).not.toHaveBeenCalled();
+    expect(f.api.createSale).not.toHaveBeenCalled();
+  });
+
+  it('retains selected presentation metadata after a successful prepare', async () => {
+    const f = fixture();
+    f.steps([
+      call('searchCatalog', { q: 'ibuprofeno' }),
+      call('prepareCartItem', {
+        selectionRef: f.refs.large,
+        operation: 'add',
+        quantity: 1,
+        quantityText: 'una',
+        continuation: false,
+      }),
+      say('Preparado'),
+    ]);
+    await f.agent.tryHandle({
+      senderId: SENDER,
+      text: 'Agrega una unidad de ibuprofeno de 500mg',
+    });
+    f.steps([say('¿Confirma?')]);
+    await f.agent.tryHandle({
+      senderId: SENDER,
+      text: '¿Cuál presentación preparaste?',
+    });
+    expect(String(f.optionsSeen.at(-1)?.system)).toContain(
+      `para "Ibuprofeno — 500mg" (selectionRef: ${f.refs.large})`,
+    );
+    expect(await f.cart.view(SENDER)).toMatchObject({ ok: true, items: [] });
+    expect(f.api.createSale).not.toHaveBeenCalled();
+  });
+});
+
 describe('Minimal cart ambiguity through the public SDK route', () => {
   it('asks for quantity on the reported 500mg confirmation and preserves other lines (S2)', async () => {
     const f = fixture();
