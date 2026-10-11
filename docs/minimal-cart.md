@@ -1,6 +1,27 @@
 # Cart on the minimal WhatsApp route
 
-The enabled, allowlisted minimal agent can maintain a cart without using the legacy sales agent. It cannot create orders, collect payment, quote shipping or reserve stock.
+The enabled, allowlisted minimal agent can maintain a cart and review checkout prerequisites without using the legacy sales agent. It cannot create orders, collect payment, quote shipping or reserve stock.
+
+## Read-only checkout preflight
+
+`reviewCheckout({})` reads the sender's `minimalCart` through `MinimalCartService.view`, including fresh backend catalog prices, stock and promotion evaluation. Saved prices/totals are not checkout authority. Like `getCart`, this may call the backend read/pricing endpoints, but never writes durable conversation/cart state or creates a customer, sale, receipt, reservation or shipping quote. The minimal route still records the turn in its existing in-memory session history.
+
+- Empty cart: `blocked / empty_cart`.
+- Unverified stock/prices, invalid cart or backend failure: `blocked / cart_unverified`; no assumption that the cart is empty.
+- Promotions requiring human review: `blocked / promotion_review`; this does **not** register a human request or approve prices.
+- Verified nonempty cart: `incomplete`, with **productsSubtotalCents**, not a freight-inclusive total. Customer/address confirmation, an approved shipping offer and explicit confirmation of the final total remain pending. This increment does not inspect or adopt legacy customer, shipping or sale markers.
+
+The tool is available only with the existing cart capability, enabled minimal route and exact sender allowlist. It accepts no sender, product, price or customer fields. The prompt directs purchase/review intent to this tool; live model recognition still requires a separately authorized WhatsApp rehearsal. No new flag, dependency or deployment is included.
+
+The customer receives application-owned wording rather than model-authored purchase claims. A later plain `getCart` cannot replace this review; existing cart mutation/clarification acknowledgements and EXPIRATION/RESTOCK priority remain intact. Malformed calls do not execute. Without an earlier authoritative outcome they use the existing cart clarification path; otherwise the prior application-owned acknowledgement is preserved, never replaced by model-authored success.
+
+After separately authorized deployment, say `Quiero revisar mi compra` with a nonempty cart. Expect the fresh product subtotal, pending steps, and an explicit no-order/no-reservation notice. With an empty cart, expect a request to add products instead. Offline tests script SDK calls; they do not prove live intent recognition or delivery.
+
+Focused offline check:
+
+```sh
+pnpm test --runTestsByPath src/llm-agent/application/minimal-checkout-preflight.spec.ts --runInBand
+```
 
 ## Customer rehearsal (after separately authorized deployment)
 

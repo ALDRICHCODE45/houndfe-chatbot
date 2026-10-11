@@ -49,6 +49,10 @@ import {
   type MinimalCartVariantDiagnostic,
 } from './minimal-cart.service';
 import {
+  minimalCheckoutReply,
+  reviewMinimalCheckout,
+} from './minimal-checkout-preflight';
+import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
 } from './minimal-restock-request.service';
@@ -496,7 +500,8 @@ export class MinimalCatalogAgentService {
         CART_VARIANT_GUIDANCE +
         ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
-        'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta.' +
+        'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
+        'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. Es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
         selectionContext +
         pendingContext
       : baseInstructions;
@@ -648,7 +653,8 @@ export class MinimalCatalogAgentService {
       (call) =>
         call.invalid === true &&
         typeof call.toolName === 'string' &&
-        CART_TOOL_NAMES.has(call.toolName),
+        (CART_TOOL_NAMES.has(call.toolName) ||
+          call.toolName === 'reviewCheckout'),
     );
   }
 
@@ -971,6 +977,26 @@ export class MinimalCatalogAgentService {
     const withCart = cart
       ? {
           ...readTools,
+          reviewCheckout: tool({
+            description:
+              'Revisa la compra con precios y existencias frescos del carrito. Solo informa subtotal de productos y requisitos pendientes; no crea pedidos, no modifica el carrito ni cotiza envío. No acepta precios, identidad ni datos del cliente.',
+            inputSchema: z.strictObject({}),
+            strict: true,
+            execute: async () => {
+              const result = await reviewMinimalCheckout(
+                cart,
+                context.senderId,
+              );
+              // Preserve existing mutation and clarification acknowledgements.
+              // A later plain getCart read cannot erase this preflight outcome.
+              if (!mutationAcknowledged && !clarificationAcknowledged)
+                acknowledge(minimalCheckoutReply(result));
+              trace(
+                `tool reviewCheckout result=${result.ok ? 'incomplete' : 'blocked'} code=${result.ok ? 'requirements_pending' : result.reason}`,
+              );
+              return result;
+            },
+          }),
           getCart: tool({
             description:
               'Consulta el carrito persistido de este cliente y verifica precios y existencias. No crea pedidos.',
