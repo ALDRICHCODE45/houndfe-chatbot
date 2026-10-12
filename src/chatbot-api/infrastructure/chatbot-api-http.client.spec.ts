@@ -2750,6 +2750,352 @@ describe('ChatbotApiHttpClient', () => {
     });
   });
 
+  describe('getCustomerCheckoutContext (minimal checkout customer/address)', () => {
+    const CUSTOMER_ID = 'd4ef5012-4444-4444-8444-444444444444';
+    const ADDRESS_ID = 'a1bc2def-1111-4111-8111-111111111111';
+    const ADDRESS_ID_2 = 'b2cd3ef0-2222-4222-8222-222222222222';
+    const VERSION = '2026-06-22T10:30:00.000Z';
+    const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+    const MAX_UUID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+    const BAD_VERSION_UUID = 'a1bc2def-1111-0111-8111-111111111111';
+    const V9_UUID = 'a1bc2def-1111-9111-8111-111111111111';
+
+    const address = (overrides: Record<string, unknown> = {}) => ({
+      id: ADDRESS_ID,
+      version: VERSION,
+      label: 'Casa',
+      street: 'Av. Reforma 123',
+      exteriorNumber: '123',
+      interiorNumber: null,
+      zipCode: '06600',
+      neighborhood: 'Juárez',
+      municipality: 'Cuauhtémoc',
+      city: 'CDMX',
+      state: 'CDMX',
+      visualReferences: null,
+      carrierPhone: null,
+      ...overrides,
+    });
+
+    const customer = (overrides: Record<string, unknown> = {}) => ({
+      customerId: CUSTOMER_ID,
+      firstName: 'Ana',
+      lastName: 'López',
+      ...overrides,
+    });
+
+    const notFoundEnvelope = (overrides: Record<string, unknown> = {}) => ({
+      status: 'not_found',
+      customer: null,
+      addresses: [],
+      nextAfterAddressId: null,
+      ...overrides,
+    });
+
+    const ambiguousEnvelope = (overrides: Record<string, unknown> = {}) => ({
+      status: 'ambiguous',
+      customer: null,
+      addresses: [],
+      nextAfterAddressId: null,
+      ...overrides,
+    });
+
+    const uniqueEnvelope = (overrides: Record<string, unknown> = {}) => ({
+      status: 'unique',
+      customer: customer(),
+      addresses: [address()],
+      nextAfterAddressId: null,
+      ...overrides,
+    });
+
+    type RequestCfg = {
+      method: string;
+      url: string;
+      params: Record<string, unknown>;
+      headers: Record<string, string>;
+    };
+    const sentConfig = (index = 0) =>
+      httpService.request.mock.calls[index][0] as RequestCfg;
+    const lookup = (options?: { limit?: number; afterAddressId?: string }) =>
+      client.getCustomerCheckoutContext('52', '5550001111', options).then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (error: ChatbotApiError) => error,
+      );
+
+    it('GETs the exact route with digit identity, resolved limit, auth headers and no idempotency', async () => {
+      httpService.request.mockReturnValue(of(axiosResponse(uniqueEnvelope())));
+
+      await expect(
+        client.getCustomerCheckoutContext('52', '5550001111'),
+      ).resolves.toEqual(uniqueEnvelope());
+
+      const cfg = sentConfig();
+      expect(cfg.method).toBe('GET');
+      expect(cfg.url).toBe('/chatbot-api/customers/checkout-context');
+      expect(cfg.params).toEqual({
+        phoneCountryCode: '52',
+        phone: '5550001111',
+        limit: 10,
+      });
+      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
+      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
+      expect(cfg.headers['X-Idempotency-Key']).toBeUndefined();
+    });
+
+    it('returns not_found and ambiguous as results, not transport errors', async () => {
+      httpService.request
+        .mockReturnValueOnce(of(axiosResponse(notFoundEnvelope())))
+        .mockReturnValueOnce(of(axiosResponse(ambiguousEnvelope())));
+
+      await expect(
+        client.getCustomerCheckoutContext('52', '5550001111'),
+      ).resolves.toEqual(notFoundEnvelope());
+      await expect(
+        client.getCustomerCheckoutContext('52', '5550001111'),
+      ).resolves.toEqual(ambiguousEnvelope());
+
+      expect(httpService.request).toHaveBeenCalledTimes(2);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('sends the requested limit and afterAddressId only when the cursor is present', async () => {
+      httpService.request.mockReturnValue(
+        of(
+          axiosResponse(
+            uniqueEnvelope({
+              addresses: [address(), address({ id: ADDRESS_ID_2 })],
+              nextAfterAddressId: ADDRESS_ID_2,
+            }),
+          ),
+        ),
+      );
+
+      await expect(
+        client.getCustomerCheckoutContext('52', '5550001111', {
+          limit: 20,
+          afterAddressId: ADDRESS_ID,
+        }),
+      ).resolves.toMatchObject({ status: 'unique' });
+
+      expect(sentConfig().params).toEqual({
+        phoneCountryCode: '52',
+        phone: '5550001111',
+        limit: 20,
+        afterAddressId: ADDRESS_ID,
+      });
+
+      httpService.request.mockReturnValue(of(axiosResponse(uniqueEnvelope())));
+      await client.getCustomerCheckoutContext('52', '5550001111', {
+        afterAddressId: null,
+      });
+      expect(sentConfig(1).params).toEqual({
+        phoneCountryCode: '52',
+        phone: '5550001111',
+        limit: 10,
+      });
+    });
+
+    it('forwards syntactically valid uppercase, nil and max cursors so the backend can reject the cursor', async () => {
+      const cursors = [ADDRESS_ID.toUpperCase(), NIL_UUID, MAX_UUID];
+      cursors.forEach(() => {
+        httpService.request.mockReturnValueOnce(
+          throwError(() => ({
+            response: {
+              status: 400,
+              data: {
+                statusCode: 400,
+                code: 'INVALID_ADDRESS_CURSOR',
+                message: 'invalid cursor',
+              },
+            },
+          })),
+        );
+      });
+
+      for (const cursor of cursors) {
+        const error = await lookup({ afterAddressId: cursor });
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error.statusCode).toBe(400);
+        expect(error.errorCode).toBe('INVALID_ADDRESS_CURSOR');
+      }
+
+      cursors.forEach((cursor, index) => {
+        expect(sentConfig(index).params).toEqual({
+          phoneCountryCode: '52',
+          phone: '5550001111',
+          limit: 10,
+          afterAddressId: cursor,
+        });
+      });
+      expect(httpService.request).toHaveBeenCalledTimes(cursors.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('preserves uppercase, nil and max identifiers returned by the backend', async () => {
+      const bodies = [
+        uniqueEnvelope({
+          customer: customer({ customerId: CUSTOMER_ID.toUpperCase() }),
+          addresses: [address({ id: ADDRESS_ID.toUpperCase() })],
+        }),
+        uniqueEnvelope({
+          customer: customer({ customerId: NIL_UUID }),
+          addresses: [address({ id: NIL_UUID })],
+        }),
+        uniqueEnvelope({
+          customer: customer({ customerId: MAX_UUID }),
+          addresses: [address({ id: MAX_UUID })],
+        }),
+      ];
+      for (const body of bodies) {
+        httpService.request.mockReturnValueOnce(of(axiosResponse(body)));
+      }
+
+      for (const body of bodies) {
+        await expect(
+          client.getCustomerCheckoutContext('52', '5550001111'),
+        ).resolves.toEqual(body);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(bodies.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid identity, limit or cursor before any HTTP request', async () => {
+      const invalids: Array<
+        [string, string, Record<string, unknown> | undefined]
+      > = [
+        ['52', 'not-digits', undefined],
+        ['52x', '5550001111', undefined],
+        ['', '5550001111', undefined],
+        ['12345678901', '5550001111', undefined],
+        ['52', '', undefined],
+        ['52', '123456789012345678901', undefined],
+        ['52', '5550001111', { limit: 0 }],
+        ['52', '5550001111', { limit: 21 }],
+        ['52', '5550001111', { limit: 1.5 }],
+        ['52', '5550001111', { afterAddressId: 'not-a-uuid' }],
+        ['52', '5550001111', { afterAddressId: BAD_VERSION_UUID }],
+        ['52', '5550001111', { afterAddressId: V9_UUID }],
+        [
+          '52',
+          '5550001111',
+          { afterAddressId: 'a1bc2def-1111-4111-0111-111111111111' },
+        ],
+      ];
+
+      for (const [cc, phone, options] of invalids) {
+        await expect(
+          client.getCustomerCheckoutContext(
+            cc,
+            phone,
+            options as { limit?: number; afterAddressId?: string },
+          ),
+        ).rejects.toBeInstanceOf(ChatbotApiError);
+      }
+
+      expect(httpService.request).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed or unfolded bodies as lookup-unavailable UpstreamError with evidence', async () => {
+      const bodies: unknown[] = [
+        notFoundEnvelope({ addresses: [address()] }),
+        ambiguousEnvelope({ nextAfterAddressId: ADDRESS_ID }),
+        uniqueEnvelope({ customer: null }),
+        uniqueEnvelope({ addresses: [address({ version: 'not-a-date' })] }),
+        uniqueEnvelope({ nextAfterAddressId: ADDRESS_ID_2 }),
+        uniqueEnvelope({ status: 'CANCELLED' }),
+        { statusCode: 200, code: 'ODD_ENVELOPE', message: 'x' },
+      ];
+
+      for (const body of bodies) {
+        httpService.request.mockReturnValueOnce(of(axiosResponse(body)));
+        const error = await lookup();
+        expect(error).toBeInstanceOf(UpstreamError);
+        expect(error).not.toBeInstanceOf(NotFoundError);
+        expect(error.statusCode).toBe(200);
+        expect(error.responseBody).toEqual(body);
+      }
+
+      expect(httpService.request).toHaveBeenCalledTimes(bodies.length);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it('retries network/5xx failures with bounded backoff and returns the later success', async () => {
+      httpService.request
+        .mockReturnValueOnce(
+          throwError(() => ({
+            response: {
+              status: 503,
+              data: { statusCode: 503, code: 'UPSTREAM_DOWN', message: 'x' },
+            },
+          })),
+        )
+        .mockReturnValueOnce(
+          throwError(() => ({ code: 'ECONNRESET', message: 'socket down' })),
+        )
+        .mockReturnValueOnce(of(axiosResponse(uniqueEnvelope())));
+
+      await expect(
+        client.getCustomerCheckoutContext('52', '5550001111'),
+      ).resolves.toEqual(uniqueEnvelope());
+
+      expect(httpService.request).toHaveBeenCalledTimes(3);
+      expect(sleep).toHaveBeenNthCalledWith(1, 100);
+      expect(sleep).toHaveBeenNthCalledWith(2, 200);
+    });
+
+    it.each([
+      [400, 'INVALID_ADDRESS_CURSOR', UpstreamError],
+      [401, 'UNAUTHORIZED', AuthError],
+      [403, 'FORBIDDEN', ForbiddenError],
+      [404, 'NOT_FOUND', NotFoundError],
+    ])(
+      'maps a %i scoped code envelope to %p without retry',
+      async (status, code, ErrorType) => {
+        httpService.request.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status,
+              data: { statusCode: status, code, message: 'nope' },
+            },
+          })),
+        );
+
+        const error = await lookup({ afterAddressId: ADDRESS_ID_2 });
+        expect(error).toBeInstanceOf(ErrorType);
+        expect(error.statusCode).toBe(status);
+        expect(error.errorCode).toBe(code);
+        expect(httpService.request).toHaveBeenCalledTimes(1);
+        expect(sleep).not.toHaveBeenCalled();
+      },
+    );
+
+    it('maps 429 to RateLimitError with Retry-After and no retry', async () => {
+      httpService.request.mockReturnValue(
+        throwError(() => ({
+          response: {
+            status: 429,
+            headers: { 'retry-after': '7' },
+            data: {
+              statusCode: 429,
+              code: 'RATE_LIMITED',
+              message: 'slow down',
+            },
+          },
+        })),
+      );
+
+      const error = await lookup();
+      expect(error).toBeInstanceOf(RateLimitError);
+      expect((error as RateLimitError).retryAfterSeconds).toBe(7);
+      expect(error.errorCode).toBe('RATE_LIMITED');
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
   describe('CancelSaleInputSchema', () => {
     it('accepts each of the five reason values', () => {
       for (const reason of [

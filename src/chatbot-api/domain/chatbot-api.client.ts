@@ -26,6 +26,10 @@ import {
   OrderHistoryResponse,
   UpdateDeliveryInput,
 } from './dtos/sales.dto';
+import type {
+  CheckoutContextQuery,
+  CustomerCheckoutContext,
+} from './dtos/checkout-context.dto';
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
@@ -46,6 +50,19 @@ export interface ChatbotApiClient {
     cc: string,
     phone: string,
   ): Promise<CustomerLookupResponse>;
+  /**
+   * S1/S6 minimal checkout customer/address read (scope `customers:read`):
+   * `GET /chatbot-api/customers/checkout-context`. The credential owns the
+   * tenant and the trusted application derives the digit phone. Returns the
+   * `not_found`/`ambiguous`/`unique` envelope as a result; malformed upstream
+   * data rejects as a transport error so an unavailable lookup is never
+   * mistaken for customer absence. Reads only: no upsert, address mutation,
+   * sale, reservation, payment or shipping call. */
+  getCustomerCheckoutContext(
+    cc: string,
+    phone: string,
+    options?: CheckoutContextQuery,
+  ): Promise<CustomerCheckoutContext>;
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse>;
   createSale(
     dto: CreateSaleInput,

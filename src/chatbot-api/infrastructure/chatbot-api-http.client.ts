@@ -15,6 +15,16 @@ import type {
   CustomerUpsertInput,
   CustomerUpsertResponse,
 } from '../domain/dtos/customers.dto';
+import {
+  isDigitCheckoutCountryCode,
+  isDigitCheckoutPhone,
+  normalizeCheckoutContextQuery,
+  normalizeCustomerCheckoutContext,
+} from '../domain/dtos/checkout-context.dto';
+import type {
+  CheckoutContextQuery,
+  CustomerCheckoutContext,
+} from '../domain/dtos/checkout-context.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
 import type {
   CartEvaluationResult,
@@ -144,6 +154,75 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       },
       { retryable: true },
     );
+  }
+
+  /**
+   * `GET /chatbot-api/customers/checkout-context` (S6, scope
+   * `customers:read`).
+   *
+   * The digit country code/phone and the page options are validated before any
+   * request: an invalid limit is rejected, never clamped, and a malformed
+   * cursor is refused locally. The safe GET retry policy (network/5xx only,
+   * bounded to three attempts) and single-branch auth headers are reused. A
+   * fulfilled HTTP 200 is accepted only when the strict envelope normalizer
+   * returns one of `not_found`/`ambiguous`/`unique`; a malformed or truncated
+   * body throws `UpstreamError` with status/body/`errorCode` evidence so the
+   * lookup stays *unavailable* instead of being reported as absence. This is
+   * read-only: no legacy customer lookup fallback or business write occurs.
+   */
+  async getCustomerCheckoutContext(
+    cc: string,
+    phone: string,
+    options: CheckoutContextQuery = {},
+  ): Promise<CustomerCheckoutContext> {
+    if (!isDigitCheckoutCountryCode(cc) || !isDigitCheckoutPhone(phone)) {
+      throw new ChatbotApiError(
+        'Chatbot API checkout-context lookup received an invalid phone identity',
+        null,
+        undefined,
+        null,
+      );
+    }
+
+    const query = normalizeCheckoutContextQuery(options);
+    if (query === null) {
+      throw new ChatbotApiError(
+        'Chatbot API checkout-context lookup received invalid query options',
+        null,
+        undefined,
+        null,
+      );
+    }
+
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: '/chatbot-api/customers/checkout-context',
+        params: {
+          phoneCountryCode: cc,
+          phone,
+          limit: query.limit,
+          ...(query.afterAddressId === null
+            ? {}
+            : { afterAddressId: query.afterAddressId }),
+        },
+      },
+      { retryable: true },
+    );
+
+    const body = response.data;
+    const context = normalizeCustomerCheckoutContext(body);
+
+    if (response.status !== 200 || context === null) {
+      throw new UpstreamError(
+        'Chatbot API checkout-context response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+
+    return context;
   }
 
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse> {
