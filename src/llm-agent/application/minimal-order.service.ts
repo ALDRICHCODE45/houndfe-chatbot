@@ -1,11 +1,14 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
 } from '../../chatbot-api/domain/chatbot-api.client';
-import type { BotSaleResponse } from '../../chatbot-api/domain/dtos/sales.dto';
+import type {
+  BotSaleResponse,
+  CreateSaleInput,
+} from '../../chatbot-api/domain/dtos/sales.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import {
   CONVERSATION_STORE,
@@ -50,14 +53,20 @@ export const MINIMAL_ORDER_CHANGED_REPLY =
   'Su pedido cambió desde el último resumen; no se creó ningún pedido. Revise el resumen actualizado:';
 export const MINIMAL_ORDER_REJECTED_REPLY =
   'No se pudo crear el pedido. Puede revisar su carrito y pedir de nuevo el resumen cuando quiera.';
+export const MINIMAL_ORDER_HELD_REPLY =
+  'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo.';
 export const MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY =
   'No pude confirmar si su pedido quedó registrado. Si vuelve a pedir el resumen y responde SÍ, usaré la misma solicitud para no duplicarlo.';
 const PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos para la transferencia en este momento; su pedido sí quedó registrado.';
 
-/** Definite rejections: the payload changed or the key is poisoned. */
-const ROTATING_ERROR_CODES: ReadonlySet<string> = new Set([
-  'PROMO_RE_QUOTE',
+/**
+ * Definite rejections. `IDEMPOTENCY_KEY_CONFLICT` is NOT one: the backend
+ * already saw this key with another payload, so a sale may exist under it.
+ */
+const ROTATING_ERROR_CODES: ReadonlySet<string> = new Set(['PROMO_RE_QUOTE']);
+const KEEPING_ERROR_CODES: ReadonlySet<string> = new Set([
+  'IDEMPOTENCY_KEY_IN_FLIGHT',
   'IDEMPOTENCY_KEY_CONFLICT',
 ]);
 
@@ -74,7 +83,9 @@ type FreshOrder =
  */
 function classifyFailure(error: unknown): 'rotate' | 'keep' {
   if (!(error instanceof ChatbotApiError)) return 'keep';
-  if (error.errorCode === 'IDEMPOTENCY_KEY_IN_FLIGHT') return 'keep';
+  if (error.errorCode !== null && KEEPING_ERROR_CODES.has(error.errorCode)) {
+    return 'keep';
+  }
   if (error.errorCode !== null && ROTATING_ERROR_CODES.has(error.errorCode)) {
     return 'rotate';
   }
@@ -98,6 +109,11 @@ function isSale(value: unknown): value is BotSaleResponse {
     Number.isSafeInteger(sale.totalCents) &&
     (sale.totalCents ?? -1) >= 0
   );
+}
+
+/** Deterministic digest of the exact payload sent under one key. */
+function fingerprint(payload: CreateSaleInput): string {
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
 function sameCartLines(
@@ -275,6 +291,21 @@ export class MinimalOrderService {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     // `keyed` is the parsed cart; `stored` is the exact value now in the slot,
     // the only valid CAS expectation (parsed objects are not plain data).
+    const payload: CreateSaleInput = {
+      cashierUserId: this.cashierUserId,
+      customerId: snapshot.customerId,
+      shippingAddressId: snapshot.shippingAddressId,
+      expectedTotalCents: snapshot.totalCents,
+      items: snapshot.items.map((item) => ({
+        productId: item.productId,
+        variantId: item.variantId ?? null,
+        productName: item.name,
+        variantName: item.variantName ?? null,
+        quantity: item.quantity,
+        unitPriceCents: item.unitPriceCents,
+      })),
+    };
+    const digest = fingerprint(payload);
     let keyed: MinimalCartState;
     let stored: unknown;
     try {
@@ -282,12 +313,20 @@ export class MinimalOrderService {
       const cart = parseMinimalCart(raw);
       if (cart === null || !sameCartLines(cart, snapshot)) return unverified;
       if (cart.idempotencyKey === '') {
-        keyed = structuredClone({ ...cart, idempotencyKey: randomUUID() });
+        keyed = structuredClone({
+          ...cart,
+          idempotencyKey: randomUUID(),
+          idempotencyFingerprint: digest,
+        });
         if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
         stored = keyed;
-      } else {
+      } else if (cart.idempotencyFingerprint === digest) {
         keyed = cart;
         stored = raw;
+      } else {
+        // An unresolved attempt carried another payload: reusing its key could
+        // be rejected as a conflict, rotating could duplicate it. Hold.
+        return MINIMAL_ORDER_HELD_REPLY;
       }
     } catch {
       return unverified;
@@ -295,32 +334,14 @@ export class MinimalOrderService {
 
     let sale: unknown;
     try {
-      sale = await this.api.createSale(
-        {
-          cashierUserId: this.cashierUserId,
-          customerId: snapshot.customerId,
-          shippingAddressId: snapshot.shippingAddressId,
-          expectedTotalCents: snapshot.totalCents,
-          items: snapshot.items.map((item) => ({
-            productId: item.productId,
-            variantId: item.variantId ?? null,
-            productName: item.name,
-            variantName: item.variantName ?? null,
-            quantity: item.quantity,
-            unitPriceCents: item.unitPriceCents,
-          })),
-        },
-        keyed.idempotencyKey,
-      );
+      sale = await this.api.createSale(payload, keyed.idempotencyKey);
     } catch (error) {
       if (classifyFailure(error) === 'keep') {
         return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
       }
-      await this.commitCart(
-        senderId,
-        stored,
-        structuredClone({ ...keyed, idempotencyKey: '' }),
-      );
+      const unkeyed = structuredClone({ ...keyed, idempotencyKey: '' });
+      delete unkeyed.idempotencyFingerprint;
+      await this.commitCart(senderId, stored, unkeyed);
       return MINIMAL_ORDER_REJECTED_REPLY;
     }
     if (!isSale(sale)) return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;

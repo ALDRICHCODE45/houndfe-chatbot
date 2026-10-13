@@ -14,6 +14,7 @@ import { MinimalCheckoutService } from './minimal-checkout.service';
 import {
   MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
   MINIMAL_ORDER_CHANGED_REPLY,
+  MINIMAL_ORDER_HELD_REPLY,
   MINIMAL_ORDER_INELIGIBLE_REPLIES,
   MINIMAL_ORDER_REJECTED_REPLY,
   MinimalOrderService,
@@ -383,9 +384,61 @@ describe('MinimalOrderService', () => {
     expect((h.api.createSale.mock.calls[1] as unknown[])[1]).toBe(firstKey);
   });
 
+  it('never sends a different payload under an outstanding key', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    h.api.createSale.mockImplementationOnce(() =>
+      Promise.reject(new UpstreamError('timeout', 503)),
+    );
+    await yes(h);
+    const before = await h.minimalCart();
+    // A promotion moves the total while the cart lines stay the same.
+    h.api.evaluateCart.mockImplementation(
+      (items: Array<{ quantity: number }>) =>
+        Promise.resolve({
+          items: items.map((item) => ({
+            productId: PRODUCT,
+            variantId: null,
+            quantity: item.quantity,
+            unitPriceCents: 1500,
+            originalPriceCents: 1500 * item.quantity,
+            finalPriceCents: 1250 * item.quantity,
+            discountAmountCents: 250 * item.quantity,
+            appliedPromotionTitle: null,
+          })),
+          promotionEvaluationStatus: 'fully_evaluated',
+        }),
+    );
+    await offerOrder(h, 'wamid.o3');
+    expect(await yes(h, 'wamid.o4')).toEqual({
+      reply: MINIMAL_ORDER_HELD_REPLY,
+    });
+    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(await h.minimalCart()).toEqual(before);
+  });
+
+  it('keeps the key when the backend saw it with another payload', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    h.api.createSale.mockImplementationOnce(() =>
+      Promise.reject(
+        new ChatbotApiError('conflict', 409, {}, 'IDEMPOTENCY_KEY_CONFLICT'),
+      ),
+    );
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
+    });
+    expect(await h.minimalCart()).toMatchObject({
+      idempotencyKey: (h.api.createSale.mock.calls[0] as unknown[])[1],
+    });
+  });
+
   it.each([
     ['PROMO_RE_QUOTE', 409],
-    ['IDEMPOTENCY_KEY_CONFLICT', 409],
     ['BUSINESS_RULE_VIOLATION', 422],
   ])('rotates the key after a definite %s rejection', async (code, status) => {
     const h = setup();

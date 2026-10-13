@@ -36,15 +36,17 @@ New customers and new addresses get a clear "not yet" reply. This route never ca
 
 ## Duplicate protection
 
-The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`.
+The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`, together with a SHA-256 fingerprint of the exact sale payload (customer, address, expected total, items).
 
-| Backend outcome                                                                | Key                   | Reply                                                                 |
-| ------------------------------------------------------------------------------ | --------------------- | --------------------------------------------------------------------- |
-| Created                                                                        | cleared with the cart | folio + total + payment details                                       |
-| `PROMO_RE_QUOTE`, `IDEMPOTENCY_KEY_CONFLICT`, other definite 4xx (not 408/429) | rotated               | "no se pudo crear el pedido"                                          |
-| `IDEMPOTENCY_KEY_IN_FLIGHT`, 408, 429, 5xx, network error, malformed success   | kept                  | "no pude confirmar si quedó registrado"; a retry replays the same key |
+| Backend outcome                                                                                          | Key                   | Reply                                   |
+| -------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
+| Created                                                                                                  | cleared with the cart | folio + total + payment details         |
+| `PROMO_RE_QUOTE`, other definite 4xx (not 408/429)                                                       | rotated               | "no se pudo crear el pedido"            |
+| `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, 408, 429, 5xx, network error, malformed success | kept                  | "no pude confirmar si quedó registrado" |
 
-Any cart change resets the key. A failed payment-details read or a lost post-sale cart write never hides a created order.
+A retry reuses the kept key only when the new payload has the same fingerprint. If the payload changed while a key is outstanding (another saved address, a promotion that moves the total), the server sends nothing and replies that an earlier order request could not be confirmed, so it never rotates into a possible duplicate. `IDEMPOTENCY_KEY_CONFLICT` keeps the key because the backend already saw it with another payload, so a sale may exist under it.
+
+Any cart change resets the key and its fingerprint. A failed payment-details read or a lost post-sale cart write never hides a created order.
 
 ## Reply priority in one SDK run
 

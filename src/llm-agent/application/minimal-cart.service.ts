@@ -26,6 +26,11 @@ const cartSchema = z.strictObject({
   items: z.array(lineSchema),
   // '' = no order attempt in flight; a UUID = the order's X-Idempotency-Key.
   idempotencyKey: z.union([z.literal(''), z.uuid()]),
+  // SHA-256 of the sale payload first sent under `idempotencyKey`.
+  idempotencyFingerprint: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
   expectedTotalCents: z.number().int().nonnegative().optional(),
   placedSale: placedSaleSchema.optional(),
 });
