@@ -27,7 +27,7 @@ T3 [S1,S2,S3,S4] route=inline; status=done (L9; verify L10 found B1/B2, fixed in
 T5 [S4] route=inline; status=done (L11); B1: order SÍ binds only to the reply right after its summary; any other turn (mixed answer, model turn, RESTOCK or delivery confirmation) drops the pending; commit=d0abbc5.
 T6 [S5] route=inline; status=done, re-verify pending (L12); B2: idempotency key bound to a SHA-256 payload fingerprint; mismatch with an outstanding key holds (no call, no rotation); IDEMPOTENCY_KEY_CONFLICT keeps the key; commit=4f50a64.
 T4 [S2] route=backend agent message; status=handed to backend (owner chose B, L14); next slice; request additive customer/address creation contract from the backend owner; no chatbot code.
-T7 [S4,S5,S7] route=inline; L13 residuals: busy/untrusted/unarmed turns drop the pending order (incl. a run interrupted by a busy turn); persisted attempt counter so a definite rejection rotates only a first attempt; cart mutations refused while a key is outstanding; unresolved reply directs the customer to the store; status=done, re-verify pending (L15); commit=see L15.
+T7 [S4,S5,S7] route=inline; status=done (verified L17); L13 residuals: busy/untrusted/unarmed turns drop the pending order (incl. a run interrupted by a busy turn); persisted attempt counter so a definite rejection rotates only a first attempt; cart mutations refused while a key is outstanding; unresolved reply directs the customer to the store; status=done, re-verify pending (L15); commit=see L15.
 
 ## Log
 
