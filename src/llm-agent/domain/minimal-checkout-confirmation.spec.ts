@@ -617,3 +617,22 @@ describe('MinimalCheckoutConfirmation finalize', () => {
     });
   });
 });
+
+describe('MinimalCheckoutConfirmation confirmedDraft', () => {
+  it('returns the validated draft only while it equals the confirmed content', () => {
+    const svc = make();
+    expect(svc.confirmedDraft(SENDER, newDraft())).toBeNull();
+    const candidate = candidateOf(svc);
+    expect(svc.confirmedDraft(SENDER, newDraft())).toBeNull();
+    svc.finalize({ senderId: SENDER, candidate, committed: true });
+    expect(svc.confirmedDraft(SENDER, newDraft())).toEqual(
+      normalize(newDraft()),
+    );
+    const sameRevisionChange = withFields({ street: 'Otra calle' });
+    expect(svc.confirmedDraft(SENDER, sameRevisionChange)).toBeNull();
+    expect(svc.confirmedDraft(SENDER, { malformed: true })).toBeNull();
+    expect(svc.confirmedDraft('5215550002222', newDraft())).toBeNull();
+    svc.revokeConfirmation(SENDER);
+    expect(svc.confirmedDraft(SENDER, newDraft())).toBeNull();
+  });
+});

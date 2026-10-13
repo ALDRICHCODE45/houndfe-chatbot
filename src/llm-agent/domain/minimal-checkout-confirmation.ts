@@ -156,7 +156,7 @@ const NEWLINES = /[\r\n]/;
  * emoji, amounts, newlines or hostile input are not consent. No model
  * inference.
  */
-function isAffirmative(raw: unknown): boolean {
+export function isAffirmative(raw: unknown): boolean {
   try {
     if (typeof raw !== 'string' || NEWLINES.test(raw)) return false;
     return AFFIRMATIVE.test(raw.replace(OUTER_SPACING, ''));
@@ -330,6 +330,29 @@ export class MinimalCheckoutConfirmation {
    */
   revokeConfirmation(senderId: string): void {
     this.confirmed.delete(senderId);
+  }
+
+  /**
+   * The validated draft only while its exact canonical content equals what the
+   * sender confirmed; any outside change, malformed or foreign draft yields
+   * `null`. Order placement must use this instead of the bare status.
+   */
+  confirmedDraft(
+    senderId: string,
+    rawDraft: unknown,
+  ): MinimalCheckoutDraft | null {
+    try {
+      if (typeof senderId !== 'string') return null;
+      const confirmed = this.confirmed.get(senderId);
+      if (confirmed === undefined) return null;
+      const draft = normalizeMinimalCheckoutDraft(rawDraft, senderId);
+      if (draft === null || canonicalize(draft) !== confirmed.binding) {
+        return null;
+      }
+      return draft;
+    } catch {
+      return null;
+    }
   }
 
   /**
