@@ -90,7 +90,12 @@ async function setup(price = 1500, measured: MeasuredDemoShippingConfig | null =
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
   const provider = { quote: jest.fn((request: ShippingQuoteRequest): Promise<ShippingQuoteProviderResult> => { void request; return Promise.resolve(quoted); }) };
-  const service = new MinimalShippingService(store, cart, checkout, provider, measured);
+  const handoff = { create: jest.fn(async () => {
+    const date = new Date().toISOString();
+    await store.setPendingHumanRequest(SENDER, { requestId: 'abcdef123456', ref: 'HF-abcdef123456', createdAt: date, customerNotifiedAt: date }, date);
+    return { ok: true as const, requestId: 'abcdef123456', ref: 'HF-abcdef123456', customerNotified: true as const };
+  }) };
+  const service = new MinimalShippingService(store, cart, checkout, provider, measured, handoff);
   await store.create(SENDER, { lastMessageAt: new Date().toISOString(), data: {
     minimalCart: { items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: price }], idempotencyKey: '', expectedTotalCents: price * 2 },
     legacy: { untouched: true },
@@ -108,12 +113,20 @@ async function setup(price = 1500, measured: MeasuredDemoShippingConfig | null =
     const ok = await store.commitMinimalCart(SENDER, state.data.minimalCart, { ...(state.data.minimalCart as object), ...patch }, new Date().toISOString());
     if (!ok) throw new Error('fixture CAS failed');
   };
-  return { store, api, cart, checkout, provider, service, confirm, changeCart };
+  return { store, api, cart, checkout, provider, service, handoff, confirm, changeCart };
 }
 
 // prettier-ignore
 describe('MinimalShippingService (T3)', () => {
-  it.each([[1500, 'charged', 20000], [50001, 'free', 0]] as const)('[S1,S2,S5,S6] quotes %s without approval or money disclosure', async (price, classification, customerPaysCents) => {
+  it('[S1,S2,S4] successful quote connects to human approval without returning money', async () => {
+    const h = await setup(50001); await h.confirm();
+    const handoff = { create: jest.fn(async () => ({ ok: true as const, requestId: 'abcdef123456', ref: 'HF-abcdef123456', customerNotified: true as const })) };
+    const service = new MinimalShippingService(h.store, h.cart, h.checkout, h.provider, config, handoff);
+    expect(await service.quote(SENDER)).toEqual({ kind: 'quoted', classification: 'free' });
+    expect(handoff.create).toHaveBeenCalledTimes(1);
+    expect((await h.store.get(SENDER))!.data.minimalCart).toMatchObject({ shipping: { approval: { state: 'pending', requestId: 'abcdef123456' } } });
+  });
+  it.each([[1500, 'charged', 20000], [50001, 'free', 0]] as const)('[S1,S2,S5,S6] quotes %s with pending approval and no money disclosure', async (price, classification, customerPaysCents) => {
     const h = await setup(price); await h.confirm();
     const commit = jest.spyOn(h.store, 'commitMinimalCart');
     expect(await h.service.quote(SENDER)).toEqual({ kind: 'quoted', classification });
@@ -123,11 +136,11 @@ describe('MinimalShippingService (T3)', () => {
       destination: { countryCode: 'MX', postalCode: '06000', state: address.state, municipality: address.city, neighborhood: address.neighborhood },
       parcels: [config.profile.parcel],
     });
-    expect(commit).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(2);
     const data = (await h.store.get(SENDER))!.data;
-    expect(data.minimalCart).toMatchObject({ shipping: { customerPaysCents, approval: { state: 'not_requested' } } });
+    expect(data.minimalCart).toMatchObject({ shipping: { customerPaysCents, approval: { state: 'pending', requestId: 'abcdef123456' } } });
     expect(data.legacy).toEqual({ untouched: true });
-    expect(data).not.toHaveProperty('pendingHumanRequest');
+    expect(data.pendingHumanRequest).toMatchObject({ requestId: 'abcdef123456' });
     expect(data).not.toHaveProperty('shippingApproval');
   });
   it('[S4] supplies the identical raw stored value as CAS expectation', async () => {

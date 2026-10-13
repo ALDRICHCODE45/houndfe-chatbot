@@ -1,4 +1,9 @@
 import {
+  expireApproval,
+  MINIMAL_SHIPPING_UNCONFIRMED,
+} from '../../llm-agent/application/minimal-shipping-approval';
+import { buildMinimalShipping } from '../../llm-agent/domain/minimal-shipping';
+import {
   AgentRunner,
   type AgentRunnerConfig,
 } from '../../llm-agent/application/agent-runner.service';
@@ -78,7 +83,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   let dedup: jest.Mocked<WebhookDedupStore>;
   let recentOutbound: jest.Mocked<RecentOutboundStore>;
   let humanHandoff: jest.Mocked<
-    Pick<HumanHandoffService, 'isOpsSender' | 'create' | 'resolveReply'>
+    Pick<
+      HumanHandoffService,
+      'isOpsSender' | 'create' | 'resolveReply' | 'expireMinimalShipping'
+    >
   >;
   let conversationStore: jest.Mocked<ConversationStore>;
   let amountRouter: jest.Mocked<ReceiptAmountRouterService>;
@@ -142,6 +150,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     humanHandoff = {
       isOpsSender: jest.fn().mockReturnValue(false),
       resolveReply: jest.fn(),
+      expireMinimalShipping: jest.fn(),
       create: jest.fn(),
     };
 
@@ -716,6 +725,119 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         },
       ],
     });
+
+    it('[S1,S6] minimal pending waits without amounts, then expires lazily without model', async () => {
+      const createdAt = '2026-06-23T11:40:00.000Z';
+      const productId = '11111111-1111-4111-8111-111111111111';
+      const shipping = buildMinimalShipping({
+        quote: {
+          kind: 'quoted',
+          quoteId: 'q1',
+          expiresAt: null,
+          rates: [
+            {
+              rateId: 'r1',
+              carrierName: 'Carrier',
+              serviceName: 'Ground',
+              priceCents: 10000,
+              currency: 'MXN',
+              estimatedDeliveryDays: 2,
+              validUntil: null,
+            },
+          ],
+        },
+        cartLines: [
+          {
+            productId,
+            quantity: 1,
+            unitPriceCents: 1000,
+            finalPriceCents: 1000,
+          },
+        ],
+        addressId: '22222222-2222-4222-8222-222222222222',
+        addressVersion: createdAt,
+        createdAt,
+      })!;
+      const state: ConversationState = {
+        senderId: CUSTOMER,
+        lastMessageAt: createdAt,
+        data: {
+          minimalCart: {
+            items: [{ productId, quantity: 1, unitPriceCents: 1000 }],
+            idempotencyKey: '',
+            shipping: {
+              ...shipping,
+              approval: { state: 'pending', requestId: 'abc123def456' },
+            },
+          },
+          pendingHumanRequest: {
+            requestId: 'abc123def456',
+            ref: 'HF-abc123def456',
+            createdAt,
+            customerNotifiedAt: createdAt,
+          },
+        },
+      };
+      conversationStore.get.mockResolvedValue(state);
+      conversationStore.commitMinimalCart = jest.fn().mockResolvedValue(true);
+      conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
+      const event = opsEvent('minimal-wait', 'hola');
+      event.entry![0].changes![0].value!.messages![0].from = CUSTOMER;
+      humanHandoff.expireMinimalShipping.mockImplementation((senderId) =>
+        expireApproval(conversationStore, senderId, Date.now()),
+      );
+      await service.dispatch(event);
+      expect(sender.sendText).toHaveBeenLastCalledWith({
+        to: CUSTOMER,
+        text: PENDING_HUMAN_REQUEST_REPLY,
+      });
+      expect(conversationStore.commitMinimalCart).not.toHaveBeenCalled();
+      jest.setSystemTime(new Date('2026-06-23T12:10:00.000Z'));
+      event.entry![0].changes![0].value!.messages![0].id = 'minimal-expired';
+      await service.dispatch(event);
+      expect(sender.sendText).toHaveBeenLastCalledWith({
+        to: CUSTOMER,
+        text: MINIMAL_SHIPPING_UNCONFIRMED,
+      });
+      expect(conversationStore.commitMinimalCart).toHaveBeenCalledWith(
+        CUSTOMER,
+        state.data.minimalCart,
+        expect.objectContaining({
+          shipping: expect.objectContaining({
+            approval: { state: 'expired' },
+          }) as unknown,
+        }),
+        expect.any(String),
+      );
+      expect(conversationStore.clearPendingHumanRequest).toHaveBeenCalledWith(
+        CUSTOMER,
+        'abc123def456',
+      );
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('minimal-expired');
+    });
+    it.each(['SHIPPING_APPROVED', 'SHIPPING_REJECTED'] as const)(
+      '[S1,S2,S7] minimal %s sends one deterministic customer message, no model',
+      async (decision) => {
+        humanHandoff.isOpsSender.mockReturnValue(true);
+        humanHandoff.resolveReply.mockResolvedValue({
+          kind: 'resolved',
+          customerId: CUSTOMER,
+          ref: 'HF-abc123def456',
+          resolution: { decision, draftCreatedAt: '2026-06-23T12:00:00.000Z' },
+          syntheticUserText: '',
+          minimalCustomerReply: 'envío cubierto por su compra',
+        });
+        await service.dispatch(opsEvent('minimal-ops', 'APPROVE_SHIPPING'));
+        expect(sender.sendText).toHaveBeenCalledTimes(1);
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'envío cubierto por su compra',
+        });
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(dedup.markSeen).toHaveBeenCalledWith('minimal-ops');
+      },
+    );
 
     it('resolved outcome: resolveReply → synthetic customer turn via AgentRunner → reply sent to the CUSTOMER', async () => {
       humanHandoff.isOpsSender.mockReturnValue(true);

@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { isDeepStrictEqual } from 'node:util';
 import {
   CONVERSATION_STORE,
+  readPendingHumanRequest,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import {
@@ -29,7 +30,12 @@ import {
 import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 
+import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
+import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
+import { requestApproval } from './minimal-shipping-approval';
+
 export type MinimalShippingRefusal =
+  | 'approval_unavailable'
   | MinimalOrderIneligibleReason
   | ShippingQuoteOrchestrationUnavailableReason
   | ShippingQuoteOrchestrationHandoffReason
@@ -49,9 +55,10 @@ const refuse = (reason: MinimalShippingRefusal): MinimalShippingResult => ({
   reason,
 });
 
-/** Internal quote only. T4 owns handoff/disclosure; this service returns no money.
+/** Quotes internally, then requests ops approval; never returns money.
  * Not registered or activated here (T7). Uses only the measured legacy profile;
- * arbitrary carts cannot be packed by inference. One provider call, one cart CAS.
+ * arbitrary carts cannot be packed by inference. One provider call, one quote
+ * CAS, then the separate T4 not_requested → pending CAS.
  */
 @Injectable()
 export class MinimalShippingService {
@@ -64,6 +71,8 @@ export class MinimalShippingService {
     @Inject(SHIPPING_QUOTE_PROVIDER) provider: ShippingQuoteProviderPort,
     @Inject(MEASURED_DEMO_SHIPPING_CONFIG)
     private readonly measured: MeasuredDemoShippingConfig | null,
+    @Inject(HUMAN_HANDOFF_SERVICE_TOKEN)
+    private readonly handoff: Pick<HumanHandoffService, 'create'>,
   ) {
     this.orchestrator = new ShippingQuoteOrchestrator(provider);
   }
@@ -72,7 +81,9 @@ export class MinimalShippingService {
     try {
       if (!this.store.commitMinimalCart) return refuse('cart_unverified');
       // Keep the EXACT raw slot for CAS, never the zod-parsed reconstruction.
-      const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
+      const state = await this.store.get(senderId);
+      if (readPendingHumanRequest(state)) return refuse('approval_unavailable');
+      const raw: unknown = state?.data.minimalCart;
       const stored = parseMinimalCart(raw);
       if (stored === null) return refuse('cart_unverified');
       if (stored.idempotencyKey !== '') return refuse('order_unresolved');
@@ -181,9 +192,15 @@ export class MinimalShippingService {
         next,
         new Date().toISOString(),
       );
-      return committed
-        ? { kind: 'quoted', classification: classifyMinimalShipping(shipping) }
-        : refuse('cart_changed');
+      if (!committed) return refuse('cart_changed');
+      if (
+        !(await requestApproval(this.store, this.handoff, senderId, Date.now()))
+      )
+        return refuse('approval_unavailable');
+      return {
+        kind: 'quoted',
+        classification: classifyMinimalShipping(shipping),
+      };
     } catch {
       return refuse('cart_unverified');
     }

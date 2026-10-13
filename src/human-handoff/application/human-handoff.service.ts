@@ -1,4 +1,10 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { parseMinimalCart } from '../../llm-agent/application/minimal-cart.service';
+import {
+  decideApproval,
+  expireApproval,
+  pendingMinimalShipping,
+} from '../../llm-agent/application/minimal-shipping-approval';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import {
@@ -101,6 +107,7 @@ export type HumanHandoffResolveReplyResult =
       ref: string;
       resolution: HumanHandoffResolution;
       syntheticUserText: string;
+      minimalCustomerReply?: string;
     }
   | { kind: 'no_pending'; reply: string }
   | { kind: 'needs_decision'; reply: string }
@@ -261,6 +268,34 @@ export class HumanHandoffService {
     return { ok: true, requestId: id, ref, customerNotified: true };
   }
 
+  /** Minimal-only lazy timeout; close the reservation so a new quote can escalate. */
+  async expireMinimalShipping(senderId: string): Promise<boolean> {
+    const state = await this.conversationStore.get(senderId);
+    const marker = readPendingHumanRequest(state);
+    const shipping = marker && pendingMinimalShipping(state, marker.requestId);
+    if (
+      !marker ||
+      !shipping ||
+      !(await expireApproval(this.conversationStore, senderId, Date.now()))
+    )
+      return false;
+    const row = await this.store.findById(marker.requestId);
+    if (!row || row.customerId !== senderId || row.kind !== 'shipping_approval')
+      throw new Error('minimal expiry handoff unavailable');
+    const resolution: HumanHandoffResolution = {
+      decision: 'SHIPPING_EXPIRED',
+      draftCreatedAt: shipping.createdAt,
+      reason: 'draft_expired',
+    };
+    const resolved = await this.store.resolve(marker.requestId, resolution);
+    if (
+      !resolved ||
+      !(await this.reservations.closeLegacyResolved(senderId, marker.requestId))
+    )
+      throw new Error('minimal expiry reservation close failed');
+    return true;
+  }
+
   async resolveReply(args: {
     text: string;
     from: string;
@@ -398,7 +433,77 @@ export class HumanHandoffService {
     const customerState = await this.conversationStore.get(target.customerId);
     const pendingMarker = readPendingHumanRequest(customerState);
     if (!pendingMarker || pendingMarker.requestId !== target.id) {
+      // Expiry is observational only, never permission to decide or disclose.
+      const shipping = parseMinimalCart(
+        customerState?.data.minimalCart,
+      )?.shipping;
+      if (
+        shipping?.approval.state === 'expired' &&
+        shipping.createdAt === digest.draftCreatedAt &&
+        Date.now() >= Date.parse(shipping.expiresAt)
+      )
+        return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
       return opsError;
+    }
+
+    // Select only by the persisted matching minimal request; never by flags.
+    if (pendingMinimalShipping(customerState, target.id)) {
+      try {
+        const decision = await decideApproval(
+          this.conversationStore,
+          target.customerId,
+          target.id,
+          digest,
+          parsed.decision === 'SHIPPING_APPROVED' ? 'approved' : 'rejected',
+          Date.now(),
+        );
+        if (!decision) return opsError;
+        const resolution: HumanHandoffResolution =
+          decision.state === 'expired'
+            ? {
+                decision: 'SHIPPING_EXPIRED',
+                draftCreatedAt: digest.draftCreatedAt,
+                reason: 'draft_expired',
+              }
+            : {
+                decision: parsed.decision,
+                draftCreatedAt: digest.draftCreatedAt,
+              };
+        const resolved = await this.store.resolve(target.id, resolution);
+        if (
+          !resolved ||
+          resolved.id !== target.id ||
+          resolved.status !== 'resolved' ||
+          resolved.customerId !== target.customerId
+        )
+          return opsError;
+        if (
+          !(await this.conversationStore.clearPendingHumanRequest(
+            target.customerId,
+            target.id,
+          ))
+        )
+          return opsError;
+        if (
+          !(await this.reservations.closeLegacyResolved(
+            target.customerId,
+            target.id,
+          ))
+        )
+          return opsError;
+        if (decision.state === 'expired')
+          return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
+        return {
+          kind: 'resolved',
+          customerId: target.customerId,
+          ref: `HF-${target.id}`,
+          resolution,
+          syntheticUserText: '',
+          minimalCustomerReply: decision.reply,
+        };
+      } catch {
+        return opsError;
+      }
     }
 
     const pin = digest.draftCreatedAt;

@@ -1,5 +1,9 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
+  pendingMinimalShipping,
+  MINIMAL_SHIPPING_UNCONFIRMED,
+} from '../../llm-agent/application/minimal-shipping-approval';
+import {
   CONVERSATION_STORE,
   readPendingHumanRequest,
   type ConversationStore,
@@ -148,7 +152,13 @@ export class WebhookDispatcherService {
             // synthetic LLM turn. The dispatcher discloses the server-derived
             // price deterministically and only a successful send can persist
             // the pending customer-response marker.
-            if (result.resolution.decision === 'SHIPPING_APPROVED') {
+            if (result.minimalCustomerReply !== undefined) {
+              const { providerMessageId } = await this.whatsappSender.sendText({
+                to: result.customerId,
+                text: result.minimalCustomerReply,
+              });
+              this.recentOutbound.remember(providerMessageId);
+            } else if (result.resolution.decision === 'SHIPPING_APPROVED') {
               await this.discloseApprovedShippingPrice(result.customerId);
             } else {
               // Synthetic-turn injection through the runner. The marker
@@ -191,6 +201,20 @@ export class WebhookDispatcherService {
         // The runner has the same gate; this branch keeps the dispatcher
         // consistent even if a caller bypasses the runner.
         const custState = await this.conversationStore.get(message.senderId);
+        const pendingMinimal = readPendingHumanRequest(custState);
+        if (
+          pendingMinimal &&
+          pendingMinimalShipping(custState, pendingMinimal.requestId) &&
+          (await this.humanHandoff.expireMinimalShipping(message.senderId))
+        ) {
+          const { providerMessageId } = await this.whatsappSender.sendText({
+            to: message.senderId,
+            text: MINIMAL_SHIPPING_UNCONFIRMED,
+          });
+          this.recentOutbound.remember(providerMessageId);
+          await this.dedup.markSeen(message.messageId);
+          continue;
+        }
         if (readPendingHumanRequest(custState) !== null) {
           this.logger.log(
             `short-circuit pending-marker for ${message.messageId} from ${message.senderId}`,
