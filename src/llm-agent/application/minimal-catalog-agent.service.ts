@@ -56,6 +56,7 @@ import {
   MinimalCheckoutService,
   type MinimalCheckoutReply,
 } from './minimal-checkout.service';
+import { MinimalOrderService } from './minimal-order.service';
 import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
@@ -246,7 +247,11 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'selectCheckoutAddress',
   'updateCheckoutDetails',
   'confirmCheckoutDetails',
+  'prepareOrder',
 ]);
+
+const ORDER_INSTRUCTIONS_FRAGMENT =
+  ' Pedido: cuando los datos de entrega ya estén confirmados y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
 export const CHECKOUT_TOOL_CLARIFICATION =
   'No pude registrar esos datos de entrega. ¿Me los comparte de nuevo, por favor?';
@@ -355,6 +360,8 @@ export class MinimalCatalogAgentService {
     private readonly cart?: MinimalCartService,
     @Optional()
     private readonly checkout?: MinimalCheckoutService,
+    @Optional()
+    private readonly order?: MinimalOrderService,
   ) {
     const agent = config.get<{ enabled: boolean; allowedSenders: string[] }>(
       'minimalCatalogAgent',
@@ -415,7 +422,9 @@ export class MinimalCatalogAgentService {
         }
       }
       if (this.checkoutAvailable()) {
-        const answered = await this.checkout!.consume(input);
+        const answered =
+          (await this.checkout!.consume(input)) ??
+          (this.orderAvailable() ? await this.order!.consume(input) : null);
         if (answered !== null) {
           this.recordTurn(
             input.senderId,
@@ -578,6 +587,9 @@ export class MinimalCatalogAgentService {
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
         'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. Es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
         (checkoutRun === null ? '' : CHECKOUT_INSTRUCTIONS_FRAGMENT) +
+        (checkoutRun !== null && this.orderAvailable()
+          ? ORDER_INSTRUCTIONS_FRAGMENT
+          : '') +
         selectionContext +
         pendingContext
       : baseInstructions;
@@ -768,6 +780,10 @@ export class MinimalCatalogAgentService {
    */
   private checkoutAvailable(): boolean {
     return this.checkout !== undefined && this.checkout.available;
+  }
+
+  private orderAvailable(): boolean {
+    return this.order !== undefined && this.order.enabled;
   }
 
   private hasInvalidToolCall(
@@ -1322,6 +1338,7 @@ export class MinimalCatalogAgentService {
         }
       : readTools;
     const checkout = this.checkout;
+    const order = this.order;
     const withCheckout =
       checkoutRun === null || checkout === undefined
         ? withCart
@@ -1402,6 +1419,33 @@ export class MinimalCatalogAgentService {
                 };
               },
             }),
+            ...(order === undefined || !order.enabled
+              ? {}
+              : {
+                  prepareOrder: tool({
+                    description:
+                      'Pide a la aplicación mostrar el resumen del pedido (productos, total y dirección confirmada) para que el cliente lo acepte con SÍ. No crea el pedido por sí misma; el envío no está incluido.',
+                    inputSchema: z.strictObject({}),
+                    strict: true,
+                    execute: async () => {
+                      if (checkoutRun.attempted)
+                        return toolError('checkout_presentation_settled');
+                      checkoutRun.attempted = true;
+                      const prepared = await order.prepareOrder(
+                        context.senderId,
+                        context.inboundEvent,
+                      );
+                      checkoutRun.value = prepared;
+                      trace(
+                        `tool prepareOrder result=${prepared.onSent === undefined ? 'blocked' : 'offer'}`,
+                      );
+                      return {
+                        ok: true as const,
+                        presentedByApplication: true as const,
+                      };
+                    },
+                  }),
+                }),
           };
     const expiration = this.expiration;
     const expirationLocal = expirationReply;

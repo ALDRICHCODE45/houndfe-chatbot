@@ -23,6 +23,8 @@ Focused offline check:
 pnpm test --runTestsByPath src/llm-agent/application/minimal-checkout-preflight.spec.ts --runInBand
 ```
 
+Placing the order after this preflight is a separate, default-off capability (`MINIMAL_CATALOG_ORDER_ENABLED`); see `docs/minimal-order-placement.md`. With it enabled, a placed order clears the cart and records `placedSale`, and the cart slot may carry a UUID `idempotencyKey` while an order attempt is pending.
+
 ## Customer rehearsal (after separately authorized deployment)
 
 1. Search for a product and select its presentation explicitly.

@@ -37,7 +37,7 @@ The draft is durable. Address references, the presented summary and the local co
 
 ## Never called by this route
 
-Customer upsert, address mutations, sales, reservations, payments and shipping providers.
+Customer upsert, address mutations, sales, reservations, payments and shipping providers. Creating an order from a confirmed saved address is a separate, default-off capability: see `docs/minimal-order-placement.md`.
 
 ## Check
 

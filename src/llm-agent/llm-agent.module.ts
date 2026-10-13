@@ -36,6 +36,7 @@ import { CostGuardService } from './application/cost-guard.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
+import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
@@ -168,6 +169,7 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     MinimalCatalogAgentService,
     MinimalCartService,
     MinimalCheckoutService,
+    MinimalOrderService,
     {
       provide: MinimalExpirationRequestService,
       inject: [
