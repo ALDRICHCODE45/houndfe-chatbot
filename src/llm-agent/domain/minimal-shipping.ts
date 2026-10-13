@@ -7,7 +7,7 @@
  * line total (`finalPriceCents`); line ordering is not significant.
  * `addressId`/`addressVersion` bind the confirmed saved-address snapshot.
  * `createdAt`/`expiresAt` are zoned ISO timestamps, capped at 30 minutes and
- * provider/rate validity. `approval.state` is pending {requestId}, approved
+ * provider/rate validity. `approval.state` starts not_requested, then pending {requestId}, approved
  * or rejected {requestId, decidedAt}, or expired (no decision metadata).
  * Freshness is NOT approval: a current pending/rejected record cannot authorize
  * disclosure or sale. Callers must separately require approved (S1).
@@ -51,6 +51,7 @@ const cartLinesSchema = z
     ),
   );
 const approvalSchema = z.discriminatedUnion('state', [
+  z.strictObject({ state: z.literal('not_requested') }),
   z.strictObject({ state: z.literal('pending'), requestId: label }),
   z.strictObject({
     state: z.literal('approved'),
@@ -106,14 +107,13 @@ export const minimalShippingSchema = z
 export type MinimalShipping = z.infer<typeof minimalShippingSchema>;
 export type MinimalShippingCartLine = z.infer<typeof cartLineSchema>;
 
-/** Build a detached pending draft; invalid/expired provider or credit => null. */
+/** Build an unstarted draft; invalid/expired provider or credit => null. */
 export function buildMinimalShipping(input: {
   quote: ShippingQuoteQuotedResult;
   cartLines: readonly MinimalShippingCartLine[];
   addressId: string;
   addressVersion: string;
   createdAt: string;
-  requestId: string;
 }): MinimalShipping | null {
   const quote = normalizeShippingQuoteQuotedResult(input.quote);
   if (!quote || !iso.safeParse(input.createdAt).success) return null;
@@ -145,7 +145,7 @@ export function buildMinimalShipping(input: {
     addressVersion: input.addressVersion,
     createdAt: input.createdAt,
     expiresAt: new Date(expiresMs).toISOString(),
-    approval: { state: 'pending', requestId: input.requestId },
+    approval: { state: 'not_requested' },
   });
   return result.success ? result.data : null;
 }
@@ -198,7 +198,29 @@ export function isShippingCurrent(
     : 'stale';
 }
 
-/** Only a matching pending request can transition; late decisions expire. */
+/** T4 starts approval explicitly; no handoff or side effect happens here. */
+export function requestMinimalShippingApproval(
+  record: MinimalShipping,
+  input: { requestId: string; nowMs: number },
+): MinimalShipping | null {
+  if (
+    record.approval.state !== 'not_requested' ||
+    !label.safeParse(input.requestId).success ||
+    !Number.isFinite(input.nowMs) ||
+    input.nowMs < Date.parse(record.createdAt)
+  )
+    return null;
+  const result = minimalShippingSchema.safeParse({
+    ...record,
+    approval:
+      input.nowMs >= Date.parse(record.expiresAt)
+        ? { state: 'expired' }
+        : { state: 'pending', requestId: input.requestId },
+  });
+  return result.success ? result.data : null;
+}
+
+/** Only a matching pending request can decide; an unstarted quote can expire. */
 export function transitionShippingApproval(
   record: MinimalShipping,
   decision: {
@@ -207,6 +229,19 @@ export function transitionShippingApproval(
     nowMs: number;
   },
 ): MinimalShipping | null {
+  if (record.approval.state === 'not_requested') {
+    if (
+      decision.state !== 'expired' ||
+      !Number.isFinite(decision.nowMs) ||
+      decision.nowMs < Date.parse(record.expiresAt)
+    )
+      return null;
+    const result = minimalShippingSchema.safeParse({
+      ...record,
+      approval: { state: 'expired' },
+    });
+    return result.success ? result.data : null;
+  }
   if (
     record.approval.state !== 'pending' ||
     decision.requestId !== record.approval.requestId ||

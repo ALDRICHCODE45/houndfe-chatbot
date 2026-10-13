@@ -4,6 +4,7 @@ import {
   isShippingCurrent,
   minimalShippingSchema,
   transitionShippingApproval,
+  requestMinimalShippingApproval,
 } from './minimal-shipping';
 import type { ShippingQuoteQuotedResult } from '../../shipping/domain/shipping-quote.result';
 
@@ -50,7 +51,6 @@ const input = () => ({
   addressId: ADDRESS,
   addressVersion: CREATED,
   createdAt: CREATED,
-  requestId: 'request-1',
 });
 function record() {
   const result = buildMinimalShipping(input());
@@ -65,7 +65,25 @@ const context = () => ({
 });
 
 describe('Minimal shipping (T2)', () => {
-  it('[S1,S2] selects the cheapest provider rate, calculates summed credit, and starts pending even when free', () => {
+  // prettier-ignore
+  it('[S1,S6] requests pending explicitly; cannot skip pending or restart approval', () => {
+    const fresh = record();
+    expect(transitionShippingApproval(fresh, { state: 'approved', requestId: 'r', nowMs: NOW })).toBeNull();
+    expect(transitionShippingApproval(fresh, { state: 'expired', requestId: 'r', nowMs: NOW })).toBeNull();
+    const pending = requestMinimalShippingApproval(fresh, { requestId: 'r', nowMs: NOW })!;
+    expect(pending.approval).toEqual({ state: 'pending', requestId: 'r' });
+    expect(requestMinimalShippingApproval(pending, { requestId: 'other', nowMs: NOW })).toBeNull();
+    for (const state of ['approved', 'rejected', 'expired'] as const) {
+      const terminal = transitionShippingApproval(pending, { state, requestId: 'r', nowMs: NOW })!;
+      expect(requestMinimalShippingApproval(terminal, { requestId: 'r', nowMs: NOW })).toBeNull();
+    }
+    expect(requestMinimalShippingApproval(fresh, { requestId: '', nowMs: NOW })).toBeNull();
+    expect(requestMinimalShippingApproval(fresh, { requestId: 'r', nowMs: NaN })).toBeNull();
+    expect(requestMinimalShippingApproval(fresh, { requestId: 'r', nowMs: NOW - 1 })).toBeNull();
+    expect(requestMinimalShippingApproval(fresh, { requestId: 'r', nowMs: NOW + 1800000 })?.approval).toEqual({ state: 'expired' });
+    expect(transitionShippingApproval(fresh, { state: 'expired', requestId: '', nowMs: NOW + 1800000 })?.approval).toEqual({ state: 'expired' });
+  });
+  it('[S1,S2] selects the cheapest provider rate, calculates summed credit, and starts not_requested even when free', () => {
     expect(record()).toMatchObject({
       quoteId: 'quote-1',
       rateId: 'best',
@@ -75,7 +93,7 @@ describe('Minimal shipping (T2)', () => {
       bestRateCents: 20000,
       totalCreditCents: 24000,
       customerPaysCents: 0,
-      approval: { state: 'pending', requestId: 'request-1' },
+      approval: { state: 'not_requested' },
     });
     expect(classifyMinimalShipping(record())).toBe('free');
     const charged = buildMinimalShipping({
@@ -177,7 +195,10 @@ describe('Minimal shipping (T2)', () => {
   it.each(['approved', 'rejected', 'expired'] as const)(
     '[S1,S6] permits only pending → %s with exact request binding; terminal states never revive',
     (state) => {
-      const pending = record();
+      const pending = minimalShippingSchema.parse({
+        ...record(),
+        approval: { state: 'pending', requestId: 'request-1' },
+      });
       const decision = { state, requestId: 'request-1', nowMs: NOW + 1000 };
       const next = transitionShippingApproval(pending, decision)!;
       expect(next.approval).toEqual(
@@ -203,11 +224,17 @@ describe('Minimal shipping (T2)', () => {
   );
   it('[S1,S6] late decisions expire rather than approve or reject', () => {
     expect(
-      transitionShippingApproval(record(), {
-        state: 'approved',
-        requestId: 'request-1',
-        nowMs: NOW + 1800000,
-      })?.approval,
+      transitionShippingApproval(
+        minimalShippingSchema.parse({
+          ...record(),
+          approval: { state: 'pending', requestId: 'request-1' },
+        }),
+        {
+          state: 'approved',
+          requestId: 'request-1',
+          nowMs: NOW + 1800000,
+        },
+      )?.approval,
     ).toEqual({ state: 'expired' });
     expect(
       transitionShippingApproval(record(), {
@@ -256,7 +283,7 @@ describe('Minimal shipping (T2)', () => {
     const expired = transitionShippingApproval(record(), {
       state: 'expired',
       requestId: 'request-1',
-      nowMs: NOW,
+      nowMs: NOW + 1800000,
     })!;
     expect(isShippingCurrent(expired, context())).toBe('expired');
     expect(
