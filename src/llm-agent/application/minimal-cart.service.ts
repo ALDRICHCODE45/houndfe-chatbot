@@ -16,11 +16,34 @@ const lineSchema = z.strictObject({
   quantity: z.number().int().positive(),
   unitPriceCents: z.number().int().nonnegative(),
 });
+// Last order created by the minimal route; informational, never a sale input.
+const placedSaleSchema = z.strictObject({
+  saleId: z.string().min(1),
+  folio: z.string().nullable(),
+  totalCents: z.number().int().nonnegative(),
+});
 const cartSchema = z.strictObject({
   items: z.array(lineSchema),
-  idempotencyKey: z.literal(''),
+  // '' = no order attempt in flight; a UUID = the order's X-Idempotency-Key.
+  idempotencyKey: z.union([z.literal(''), z.uuid()]),
   expectedTotalCents: z.number().int().nonnegative().optional(),
+  placedSale: placedSaleSchema.optional(),
 });
+export type MinimalCartState = z.infer<typeof cartSchema>;
+
+/** Validate the owned `minimalCart` slot; absent means an empty cart. */
+export function parseMinimalCart(raw: unknown): MinimalCartState | null {
+  if (raw === undefined) return { items: [], idempotencyKey: '' };
+  const parsed = cartSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  if (
+    parsed.data.items.some((i, index, items) =>
+      items.slice(0, index).some((j) => sameLine(i, j)),
+    )
+  )
+    return null;
+  return parsed.data;
+}
 export const minimalCartInput = lineSchema
   .omit({ unitPriceCents: true })
   .extend({
@@ -192,16 +215,7 @@ export class MinimalCartService {
   }
 
   private read(raw: unknown): CartState | null {
-    if (raw === undefined) return { items: [], idempotencyKey: '' };
-    const parsed = cartSchema.safeParse(raw);
-    if (!parsed.success) return null;
-    if (
-      parsed.data.items.some((i, index, items) =>
-        items.slice(0, index).some((j) => sameLine(i, j)),
-      )
-    )
-      return null;
-    return parsed.data;
+    return parseMinimalCart(raw);
   }
 
   private async quote(

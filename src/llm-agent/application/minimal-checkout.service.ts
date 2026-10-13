@@ -139,7 +139,8 @@ export interface MinimalCheckoutReply {
   onSent?: () => void;
 }
 
-type Revalidation = 'ok' | 'reselect' | 'unavailable';
+export type MinimalCheckoutRevalidation = 'ok' | 'reselect' | 'unavailable';
+type Revalidation = MinimalCheckoutRevalidation;
 
 /** Server-owned incomplete reply listing the missing data in gate order. */
 export function minimalCheckoutIncompleteReply(
@@ -211,6 +212,24 @@ export class MinimalCheckoutService {
   /** Volatile local confirmation state for the sender, or `null`. */
   confirmationStatus(senderId: string): MinimalCheckoutBindingStatus | null {
     return this.confirmation.status(senderId);
+  }
+
+  /**
+   * The durable draft only while it still equals, byte for byte, the content
+   * the sender confirmed; any outside change or an unreadable store is `null`.
+   */
+  async confirmedDraft(senderId: string): Promise<MinimalCheckoutDraft | null> {
+    const current = await this.readDraft(senderId);
+    if (current === null || current.draft === undefined) return null;
+    return this.confirmation.confirmedDraft(senderId, current.raw);
+  }
+
+  /** Fresh saved-address check for order placement; see `revalidate`. */
+  revalidateSelection(
+    senderId: string,
+    draft: MinimalCheckoutDraft,
+  ): Promise<MinimalCheckoutRevalidation> {
+    return this.revalidate(senderId, draft);
   }
 
   async lookup(
