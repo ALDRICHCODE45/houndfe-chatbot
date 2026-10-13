@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import type { AgentTurnCommit } from '../domain/conversation-store';
+import { normalizeMinimalCheckoutDraft } from '../domain/minimal-checkout-draft';
 import {
   ConversationState,
   ConversationStore,
@@ -18,6 +19,184 @@ interface ConversationRow {
   sender_id: string;
   last_message_at: Date;
   data: ConversationState['data'];
+}
+
+/** Sentinel for “this document cannot be reproduced as JSON”. */
+const NON_COMPARABLE = Symbol('non-comparable-expected');
+
+/**
+ * A JSON document reproduced from the caller's value without re-reading it.
+ * `NON_COMPARABLE` marks a refused subtree.
+ */
+type CapturedJson =
+  | string
+  | number
+  | boolean
+  | null
+  | CapturedJson[]
+  | { [key: string]: CapturedJson }
+  | typeof NON_COMPARABLE;
+
+/**
+ * Capture one own value. Anything that would not survive JSON as the SAME
+ * document yields `NON_COMPARABLE`: accessors (never invoked), non-enumerable
+ * own keys (silently dropped by `JSON.stringify`), exotic prototypes, symbols,
+ * functions, `undefined`, bigints and non-finite numbers.
+ */
+function captureComparableValue(
+  node: unknown,
+  stack: Set<object>,
+): CapturedJson {
+  if (node === null) {
+    return null;
+  }
+  if (typeof node === 'string' || typeof node === 'boolean') {
+    return node;
+  }
+  if (typeof node === 'number') {
+    return Number.isFinite(node) ? node : NON_COMPARABLE;
+  }
+  if (typeof node !== 'object') {
+    return NON_COMPARABLE;
+  }
+  // Only a back-edge on the current recursion path is a real cycle; the same
+  // object reachable twice acyclicly still forms one finite JSON document.
+  if (stack.has(node)) {
+    return NON_COMPARABLE;
+  }
+  stack.add(node);
+  try {
+    if (Array.isArray(node)) {
+      // An array subclass (or any non-ordinary array) can carry an inherited
+      // `toJSON` that would rewrite the document, so its own dense indices are
+      // not a lossless projection of what the caller would compare. Reject it
+      // before the index descriptor pass; ordinary arrays keep raw comparison.
+      if (Object.getPrototypeOf(node) !== Array.prototype) {
+        return NON_COMPARABLE;
+      }
+      return captureArray(node as unknown[], stack);
+    }
+    const prototype = Object.getPrototypeOf(node) as object | null;
+    if (prototype !== null && prototype !== Object.prototype) {
+      return NON_COMPARABLE;
+    }
+    return capturePlainObject(node as Record<string, unknown>, stack);
+  } finally {
+    stack.delete(node);
+  }
+}
+
+/**
+ * Dense arrays only: own string keys must be exactly indices `0..length-1`
+ * plus the matching `length`, each an enumerable data property. Holes would
+ * stringify to `null`, and extra or symbol own keys would be dropped, so both
+ * are refused. No indexed read is performed, which keeps array element
+ * accessors uninvoked.
+ */
+function captureArray(node: unknown[], stack: Set<object>): CapturedJson {
+  const keys = Reflect.ownKeys(node);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(node, 'length');
+  if (lengthDescriptor === undefined || !('value' in lengthDescriptor)) {
+    return NON_COMPARABLE;
+  }
+  if (
+    typeof lengthDescriptor.value !== 'number' ||
+    !Number.isSafeInteger(lengthDescriptor.value)
+  ) {
+    return NON_COMPARABLE;
+  }
+  const length = lengthDescriptor.value;
+  if (length < 0 || keys.length !== length + 1) {
+    return NON_COMPARABLE;
+  }
+  for (const key of keys) {
+    if (typeof key !== 'string') {
+      return NON_COMPARABLE;
+    }
+  }
+  const copy: CapturedJson[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const name = String(index);
+    if (!keys.includes(name)) {
+      return NON_COMPARABLE;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(node, name);
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      !descriptor.enumerable
+    ) {
+      return NON_COMPARABLE;
+    }
+    const value = captureComparableValue(descriptor.value, stack);
+    if (value === NON_COMPARABLE) {
+      return NON_COMPARABLE;
+    }
+    copy.push(value);
+  }
+  if (!keys.includes('length')) {
+    return NON_COMPARABLE;
+  }
+  return copy;
+}
+
+/**
+ * Plain (or null-prototype) objects, captured into a null-prototype copy so a
+ * `__proto__` key stays an ordinary data key instead of re-parenting the
+ * clone. Values come from the descriptor pass only; nothing is re-read later
+ * while stringifying, so a transparent or mutating proxy cannot feed a
+ * different document into the CAS binding.
+ */
+function capturePlainObject(
+  node: Record<string, unknown>,
+  stack: Set<object>,
+): CapturedJson {
+  const copy = Object.create(null) as { [key: string]: CapturedJson };
+  for (const key of Reflect.ownKeys(node)) {
+    if (typeof key !== 'string') {
+      return NON_COMPARABLE;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(node, key);
+    if (
+      descriptor === undefined ||
+      !('value' in descriptor) ||
+      !descriptor.enumerable
+    ) {
+      return NON_COMPARABLE;
+    }
+    const value = captureComparableValue(descriptor.value, stack);
+    if (value === NON_COMPARABLE) {
+      return NON_COMPARABLE;
+    }
+    Object.defineProperty(copy, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return copy;
+}
+
+/**
+ * Serialize a RAW expected checkout value for the JSONB equality gate, or
+ * `null` when it is not losslessly comparable. Corrupt data is never
+ * normalized: `{corrupt:true}`, `null`, JSON scalars and dense corrupt arrays
+ * are bound exactly as given, so an absent own key and a present slot holding
+ * a corrupt value stay distinct. Hostile reflection (revoked or lying proxies)
+ * is caught here and refused as `false` rather than propagating.
+ */
+function serializeCheckoutExpected(value: unknown): string | null {
+  try {
+    const captured = captureComparableValue(value, new Set());
+    if (captured === NON_COMPARABLE) {
+      return null;
+    }
+    const json = JSON.stringify(captured);
+    return typeof json === 'string' ? json : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -70,6 +249,63 @@ export class PostgresConversationStore implements ConversationStore {
     const params = [senderId, lastMessageAt, JSON.stringify(next)];
     if (!absent) params.push(JSON.stringify(expected));
     const { rowCount } = await this.pool.query(sql, params);
+    return (rowCount ?? 0) === 1;
+  }
+
+  /**
+   * Durable counterpart of the memory checkout-draft CAS.
+   *
+   * One parameterized guarded statement, never a read-modify-write and never a
+   * retry: `undefined` expected takes the first-contact UPSERT branch that
+   * requires the own key to be ABSENT, while any present raw expectation takes
+   * an UPDATE-only branch gated on JSONB equality with the caller's exact
+   * document. Either branch replaces only the checkout key, merges live
+   * siblings, and keeps the newer inbound timestamp via GREATEST.
+   *
+   * Invalid `next` (sender-bound v1 guard), an invalid timestamp or an
+   * expected value that would not survive JSON round-tripping as the SAME
+   * document all return `false` before any query, so no row is created or
+   * changed and a rejected writer is never authorized to blind-retry.
+   */
+  async commitMinimalCheckoutDraft(
+    senderId: string,
+    expected: unknown,
+    next: unknown,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    const copy = normalizeMinimalCheckoutDraft(next, senderId);
+    if (
+      copy === null ||
+      !isNonEmptyString(lastMessageAt) ||
+      !Number.isFinite(Date.parse(lastMessageAt))
+    ) {
+      return false;
+    }
+    const owned = JSON.stringify(copy);
+    if (expected === undefined) {
+      const { rowCount } = await this.pool.query(
+        `INSERT INTO conversation_state (sender_id, last_message_at, data)
+         VALUES ($1, $2::timestamptz, jsonb_build_object('minimalCheckoutDraft', $3::jsonb))
+         ON CONFLICT (sender_id) DO UPDATE
+           SET data = conversation_state.data || jsonb_build_object('minimalCheckoutDraft', $3::jsonb),
+               last_message_at = GREATEST(conversation_state.last_message_at, $2::timestamptz)
+           WHERE NOT (conversation_state.data ? 'minimalCheckoutDraft')`,
+        [senderId, lastMessageAt, owned],
+      );
+      return (rowCount ?? 0) === 1;
+    }
+    const current = serializeCheckoutExpected(expected);
+    if (current === null) {
+      return false;
+    }
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+         SET data = conversation_state.data || jsonb_build_object('minimalCheckoutDraft', $3::jsonb),
+             last_message_at = GREATEST(conversation_state.last_message_at, $2::timestamptz)
+       WHERE sender_id = $1
+         AND conversation_state.data->'minimalCheckoutDraft' = $4::jsonb`,
+      [senderId, lastMessageAt, owned, current],
+    );
     return (rowCount ?? 0) === 1;
   }
 
@@ -341,8 +577,9 @@ export class PostgresConversationStore implements ConversationStore {
     // Read-modify-write: merge in APP code to mirror InMemory's
     // `{ ...existing, ...patch }` exactly (data REPLACES if patch
     // carries it, PRESERVES if omitted). The CAS-owned
-    // `receiptAmountPointer` / `pendingHumanRequest` keys are stripped
-    // from the patch and the LIVE values re-applied under the row lock.
+    // `receiptAmountPointer` / `pendingHumanRequest` / `minimalCheckoutDraft`
+    // keys are stripped from the patch and the LIVE values re-applied under
+    // the row lock.
     const existing = await this.get(senderId);
     const merged = existing
       ? { ...existing, ...patch }
@@ -360,6 +597,7 @@ export class PostgresConversationStore implements ConversationStore {
     delete data.catalogReferences;
     delete data.agentRevision;
     delete data.minimalCart;
+    delete data.minimalCheckoutDraft;
 
     const { rows } = await this.pool.query<ConversationRow>(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
@@ -377,7 +615,7 @@ export class PostgresConversationStore implements ConversationStore {
                    ELSE '{}'::jsonb END
                  || (SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
                      FROM jsonb_each(conversation_state.data)
-                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart'))
+                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart', 'minimalCheckoutDraft'))
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );
