@@ -31,7 +31,7 @@ New customers and new addresses get a clear "not yet" reply. This route never ca
    - the saved address still has the same `version` upstream;
    - prices and stock come from a new cart evaluation.
 3. The server replies with its own summary: items, product total, delivery address and "shipping not included". It is armed only after the transport sends it.
-4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
+4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
 ## Duplicate protection
@@ -41,12 +41,23 @@ The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its C
 | Backend outcome                                                                                          | Key                   | Reply                                   |
 | -------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
 | Created                                                                                                  | cleared with the cart | folio + total + payment details         |
-| `PROMO_RE_QUOTE`, other definite 4xx (not 408/429)                                                       | rotated               | "no se pudo crear el pedido"            |
+| `PROMO_RE_QUOTE`, other definite 4xx (not 408/429) on the **first** attempt                              | rotated               | "no se pudo crear el pedido"            |
+| Same definite rejection on a **later** attempt (an earlier one was uncertain)                            | kept                  | "comuníquese con la tienda"             |
 | `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, 408, 429, 5xx, network error, malformed success | kept                  | "no pude confirmar si quedó registrado" |
 
 A retry reuses the kept key only when the new payload has the same fingerprint. If the payload changed while a key is outstanding (another saved address, a promotion that moves the total), the server sends nothing and replies that an earlier order request could not be confirmed, so it never rotates into a possible duplicate. `IDEMPOTENCY_KEY_CONFLICT` keeps the key because the backend already saw it with another payload, so a sale may exist under it.
 
-Any cart change resets the key and its fingerprint. A failed payment-details read or a lost post-sale cart write never hides a created order.
+The slot also keeps `idempotencyAttempts`, written through the CAS **before** each call. A definite rejection proves only that this call created nothing, so it rotates the key only on the first attempt.
+
+### Uncertain outcome locks the order (S7)
+
+While a key is outstanding (any uncertain outcome, or a crash mid-call), the order is locked:
+
+- Only the identical order may be retried. The customer asks for the summary again and replies `SÍ`, and the same key is replayed; the backend never duplicates it.
+- Cart changes are refused (`order_unresolved`) and the cart is left untouched.
+- A changed payload is held, and a later definite rejection keeps the key. In both cases the customer is asked to contact the store.
+
+The lock ends only with a confirmed sale, or with a definite rejection of the first attempt. A failed payment-details read or a lost post-sale cart write never hides a created order.
 
 ## Reply priority in one SDK run
 

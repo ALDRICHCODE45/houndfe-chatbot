@@ -142,11 +142,14 @@ function setup(options: { order?: 'on' | 'off' | 'absent' } = {}) {
   } as unknown as ConfigService;
   let steps: unknown[] = [];
   const seen: Array<{ tools?: Record<string, unknown> }> = [];
+  let gate: Promise<void> | null = null;
   const generate: GenerateTextFn = async (input) => {
     seen.push(input);
+    const script = steps;
+    if (gate !== null) await gate;
     return generateText({
       ...input,
-      model: new MockLanguageModelV4({ doGenerate: steps } as never),
+      model: new MockLanguageModelV4({ doGenerate: script } as never),
     });
   };
   const cart = new MinimalCartService(client, store);
@@ -168,6 +171,16 @@ function setup(options: { order?: 'on' | 'off' | 'absent' } = {}) {
     api,
     seen,
     checkout,
+    hold: () => {
+      let release: () => void = () => undefined;
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return () => {
+        gate = null;
+        release();
+      };
+    },
     turn: (text: string, script: unknown[], event?: unknown) => {
       steps = script;
       return agent.tryHandle({
@@ -317,6 +330,25 @@ describe('minimal order placement through the SDK route', () => {
     );
     expect((result as { reply: string }).reply).not.toContain('Pedido creado');
     expect(result).not.toHaveProperty('onSent');
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+
+  it('a busy-rejected turn cancels the summary of the run it interrupted', async () => {
+    const h = setup();
+    await h.ready();
+    const release = h.hold();
+    // Same script for both turns: the busy one returns before the model runs.
+    const script = [call('prepareOrder'), say()];
+    const running = h.turn('Quiero hacer mi pedido', script, EVENT('wamid.o1'));
+    const busy = await h.turn('Mejor espere', script, EVENT('wamid.b1'));
+    expect(busy).toMatchObject({ kind: 'handled' });
+    release();
+    const offer = await running;
+    expect((offer as { reply: string }).reply).toContain(
+      'Resumen de su pedido:',
+    );
+    (offer as { onSent?: () => void }).onSent?.();
+    await h.turn('SÍ', [say('¿En qué le ayudo?')], EVENT('wamid.o2'));
     expect(h.api.createSale).not.toHaveBeenCalled();
   });
 });

@@ -31,6 +31,8 @@ const cartSchema = z.strictObject({
     .string()
     .regex(/^[0-9a-f]{64}$/)
     .optional(),
+  // Sale calls made under `idempotencyKey`, persisted BEFORE each call.
+  idempotencyAttempts: z.number().int().positive().optional(),
   expectedTotalCents: z.number().int().nonnegative().optional(),
   placedSale: placedSaleSchema.optional(),
 });
@@ -169,6 +171,10 @@ export class MinimalCartService {
       );
       const cart = this.read(raw);
       if (!cart) return { ok: false, error: 'invalid_cart' };
+      // An outstanding sale key means an order may exist for these lines;
+      // editing the cart would drop the key and could duplicate it (S7).
+      if (cart.idempotencyKey !== '')
+        return { ok: false, error: 'order_unresolved' };
       const existing = cart.items.find((i) => sameLine(i, request));
       if (!existing && !allowedIds.has(request.productId))
         return { ok: false, error: 'unknown_product' };
@@ -348,6 +354,8 @@ export function minimalCartReply(result: MinimalCartResult): string {
       return '¿Qué presentación desea agregar al carrito?';
     if (result.error === 'insufficient_stock')
       return 'No hay existencias suficientes para esa cantidad. Su carrito no fue modificado.';
+    if (result.error === 'order_unresolved')
+      return 'Tengo un pedido suyo pendiente de confirmar. Para no duplicarlo no puedo cambiar el carrito: pida de nuevo el resumen y responda SÍ para reintentar ese mismo pedido, o comuníquese con la tienda. Su carrito no fue modificado.';
     return 'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.';
   }
   if (result.items.length === 0) return 'Su carrito está vacío.';

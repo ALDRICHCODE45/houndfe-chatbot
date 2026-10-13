@@ -17,6 +17,7 @@ import {
   MINIMAL_ORDER_HELD_REPLY,
   MINIMAL_ORDER_INELIGIBLE_REPLIES,
   MINIMAL_ORDER_REJECTED_REPLY,
+  MINIMAL_ORDER_UNRESOLVED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
@@ -522,5 +523,66 @@ describe('MinimalOrderService', () => {
       idempotencyKey: '',
       expectedTotalCents: 1500,
     });
+  });
+
+  it('never rotates a key whose earlier attempt was uncertain', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    h.api.createSale.mockImplementationOnce(() =>
+      Promise.reject(new UpstreamError('timeout', 503)),
+    );
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
+    });
+    const firstKey = (h.api.createSale.mock.calls[0] as unknown[])[1];
+    await offerOrder(h, 'wamid.o3');
+    h.api.createSale.mockImplementationOnce(() =>
+      Promise.reject(new ChatbotApiError('unauthorized', 401, {}, null)),
+    );
+    expect(await yes(h, 'wamid.o4')).toEqual({
+      reply: MINIMAL_ORDER_UNRESOLVED_REPLY,
+    });
+    expect((h.api.createSale.mock.calls[1] as unknown[])[1]).toBe(firstKey);
+    expect(await h.minimalCart()).toMatchObject({
+      items: [{ productId: PRODUCT, quantity: 2 }],
+      idempotencyKey: firstKey,
+      idempotencyAttempts: 2,
+    });
+  });
+
+  it('refuses cart changes while an attempt is unresolved', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    h.api.createSale.mockImplementationOnce(() =>
+      Promise.reject(new UpstreamError('timeout', 503)),
+    );
+    await yes(h);
+    const before = await h.minimalCart();
+    expect(
+      await h.cart.setItem(
+        SENDER,
+        { productId: PRODUCT, quantity: 2 },
+        new Set([PRODUCT]),
+      ),
+    ).toEqual({ ok: false, error: 'order_unresolved' });
+    expect(await h.minimalCart()).toEqual(before);
+  });
+
+  it('records the first attempt before calling the backend', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    let seen: unknown;
+    h.api.createSale.mockImplementationOnce(async () => {
+      seen = await h.minimalCart();
+      throw new UpstreamError('timeout', 503);
+    });
+    await yes(h);
+    expect(seen).toMatchObject({ idempotencyAttempts: 1 });
   });
 });

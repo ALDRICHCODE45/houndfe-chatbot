@@ -80,6 +80,7 @@ const CART_TRACE_ERROR_CODES = new Set([
   'stock_unverified',
   'insufficient_stock',
   'invalid_evaluation',
+  'order_unresolved',
 ]);
 
 const INSTRUCTIONS =
@@ -342,6 +343,9 @@ export class MinimalCatalogAgentService {
   private readonly maxSteps: number;
   private readonly historyTurns: number;
   private readonly busy = new Set<string>();
+  // Senders whose in-flight run was interrupted by a busy-rejected turn; that
+  // run's order summary must not outlive the interruption.
+  private readonly interrupted = new Set<string>();
   private readonly logger = new Logger(MinimalCatalogAgentService.name);
 
   constructor(
@@ -389,8 +393,12 @@ export class MinimalCatalogAgentService {
       return { kind: 'not-handled' };
     }
     if (this.busy.has(input.senderId)) {
+      // Any turn after a summary spends its consent, even a rejected one.
+      this.interrupted.add(input.senderId);
+      this.order?.dismiss(input.senderId);
       return { kind: 'handled', reply: BUSY_REPLY };
     }
+    this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
     try {
       // The busy span covers the free consume and the SDK run.
@@ -454,6 +462,9 @@ export class MinimalCatalogAgentService {
         ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
       };
     } finally {
+      if (this.interrupted.delete(input.senderId)) {
+        this.order?.dismiss(input.senderId);
+      }
       this.busy.delete(input.senderId);
     }
   }

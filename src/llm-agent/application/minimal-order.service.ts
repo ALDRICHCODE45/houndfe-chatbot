@@ -54,7 +54,9 @@ export const MINIMAL_ORDER_CHANGED_REPLY =
 export const MINIMAL_ORDER_REJECTED_REPLY =
   'No se pudo crear el pedido. Puede revisar su carrito y pedir de nuevo el resumen cuando quiera.';
 export const MINIMAL_ORDER_HELD_REPLY =
-  'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo.';
+  'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo; por favor comuníquese con la tienda para revisarlo.';
+export const MINIMAL_ORDER_UNRESOLVED_REPLY =
+  'No pude confirmar si su pedido anterior quedó registrado y no puedo crear otro sin riesgo de duplicarlo. Por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY =
   'No pude confirmar si su pedido quedó registrado. Si vuelve a pedir el resumen y responde SÍ, usaré la misma solicitud para no duplicarlo.';
 const PAYMENT_UNAVAILABLE_REPLY =
@@ -312,22 +314,28 @@ export class MinimalOrderService {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
       if (cart === null || !sameCartLines(cart, snapshot)) return unverified;
+      // Every call is counted in the slot BEFORE it is made, so a crash or an
+      // uncertain response always leaves evidence of an earlier attempt.
       if (cart.idempotencyKey === '') {
         keyed = structuredClone({
           ...cart,
           idempotencyKey: randomUUID(),
           idempotencyFingerprint: digest,
+          idempotencyAttempts: 1,
         });
-        if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
-        stored = keyed;
       } else if (cart.idempotencyFingerprint === digest) {
-        keyed = cart;
-        stored = raw;
+        keyed = structuredClone({
+          ...cart,
+          // A legacy key without a counter already had one attempt.
+          idempotencyAttempts: (cart.idempotencyAttempts ?? 1) + 1,
+        });
       } else {
         // An unresolved attempt carried another payload: reusing its key could
         // be rejected as a conflict, rotating could duplicate it. Hold.
         return MINIMAL_ORDER_HELD_REPLY;
       }
+      if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
+      stored = keyed;
     } catch {
       return unverified;
     }
@@ -339,8 +347,14 @@ export class MinimalOrderService {
       if (classifyFailure(error) === 'keep') {
         return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
       }
+      // A definite rejection only proves THIS call created nothing; an earlier
+      // uncertain call under the same key may have, so it is never rotated.
+      if ((keyed.idempotencyAttempts ?? 1) > 1) {
+        return MINIMAL_ORDER_UNRESOLVED_REPLY;
+      }
       const unkeyed = structuredClone({ ...keyed, idempotencyKey: '' });
       delete unkeyed.idempotencyFingerprint;
+      delete unkeyed.idempotencyAttempts;
       await this.commitCart(senderId, stored, unkeyed);
       return MINIMAL_ORDER_REJECTED_REPLY;
     }

@@ -249,12 +249,43 @@ describe('MinimalOrderConfirmation', () => {
     expect(
       yes('wamid.2', { receivingPhoneNumberId: '999999999999999' }),
     ).toEqual({ kind: 'handled', reply: MINIMAL_ORDER_AMBIGUOUS_REPLY });
+    offer(confirmation).onSent();
     now += MINIMAL_ORDER_CONFIRMATION_TTL_MS;
     expect(yes('wamid.3')).toEqual({
       kind: 'handled',
       reply: MINIMAL_ORDER_AMBIGUOUS_REPLY,
     });
     expect(confirmation.status(SENDER)).toBeNull();
+  });
+
+  it('drops the offer after a rejected affirmative so a later SÍ cannot sell', () => {
+    const yes = (
+      confirmation: MinimalOrderConfirmation,
+      messageId: string,
+      extra: Record<string, string> = {},
+    ) =>
+      confirmation.consume({
+        senderId: SENDER,
+        text: 'SÍ',
+        inboundEvent: EVENT(messageId, extra),
+      });
+    const unarmed = make();
+    const early = offer(unarmed);
+    expect(yes(unarmed, 'wamid.1')).toEqual({
+      kind: 'handled',
+      reply: MINIMAL_ORDER_AMBIGUOUS_REPLY,
+    });
+    early.onSent();
+    expect(yes(unarmed, 'wamid.2')).toBeNull();
+    expect(unarmed.status(SENDER)).toBeNull();
+
+    const foreign = make();
+    offer(foreign).onSent();
+    expect(
+      yes(foreign, 'wamid.3', { receivingPhoneNumberId: '999999999999999' }),
+    ).toEqual({ kind: 'handled', reply: MINIMAL_ORDER_AMBIGUOUS_REPLY });
+    expect(yes(foreign, 'wamid.4')).toBeNull();
+    expect(foreign.status(SENDER)).toBeNull();
   });
 
   it('leaves mixed or unrelated text to other routes and drops the offer', () => {

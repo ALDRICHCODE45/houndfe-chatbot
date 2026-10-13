@@ -316,8 +316,10 @@ export class MinimalOrderConfirmation {
         this.pending.delete(senderId);
         return null;
       }
-      if (expired || !trusted || !pending.armed) return ambiguous();
+      // A refused affirmative also spends the offer: consent belongs only to
+      // the reply right after the summary, never to a later SÍ.
       this.pending.delete(senderId);
+      if (expired || !trusted || !pending.armed) return ambiguous();
       return {
         kind: 'candidate',
         reference: pending.reference,
