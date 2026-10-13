@@ -25,6 +25,15 @@ import type {
   CheckoutContextQuery,
   CustomerCheckoutContext,
 } from '../domain/dtos/checkout-context.dto';
+import {
+  CheckoutIdempotencyKeySchema,
+  CreateCheckoutInputSchema,
+  normalizeCheckoutResponse,
+  normalizeCheckoutStatus,
+  type CreateCheckoutInput,
+  type CheckoutResponse,
+  type CheckoutStatus,
+} from '../domain/dtos/checkout.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
 import type {
   CartEvaluationResult,
@@ -223,6 +232,77 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     }
 
     return context;
+  }
+
+  /** Atomic checkout seam only; not wired to a live order flow yet. */
+  async createCheckout(
+    dto: CreateCheckoutInput,
+    idempotencyKey: string,
+  ): Promise<CheckoutResponse> {
+    this.validateCheckoutKey(idempotencyKey);
+    const parsed = CreateCheckoutInputSchema.safeParse(dto);
+    if (!parsed.success) {
+      throw new ChatbotApiError(
+        'Invalid atomic checkout input',
+        null,
+        undefined,
+        'INVALID_REQUEST',
+      );
+    }
+    const data = parsed.data;
+    if (data.sale.shipping?.quoteId == null && data.sale.shipping) {
+      delete data.sale.shipping.quoteId;
+    }
+    const response = await this.requestWithResponse<unknown>({
+      method: 'POST',
+      url: '/chatbot-api/checkouts',
+      data,
+      headers: { 'X-Idempotency-Key': idempotencyKey },
+    });
+    const checkout = normalizeCheckoutResponse(response.data);
+    if (response.status !== 201 || checkout === null) {
+      throw new UpstreamError(
+        'Chatbot API checkout response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return checkout;
+  }
+
+  /** not_observed is not rollback evidence and never permits a fresh key. */
+  async getCheckoutStatus(idempotencyKey: string): Promise<CheckoutStatus> {
+    this.validateCheckoutKey(idempotencyKey);
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: '/chatbot-api/checkouts/status',
+        headers: { 'X-Idempotency-Key': idempotencyKey },
+      },
+      { retryable: true },
+    );
+    const status = normalizeCheckoutStatus(response.data);
+    if (response.status !== 200 || status === null) {
+      throw new UpstreamError(
+        'Chatbot API checkout status response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return status;
+  }
+
+  private validateCheckoutKey(key: string): void {
+    if (!CheckoutIdempotencyKeySchema.safeParse(key).success) {
+      throw new ChatbotApiError(
+        'Invalid checkout idempotency key',
+        null,
+        undefined,
+        'INVALID_IDEMPOTENCY_KEY',
+      );
+    }
   }
 
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse> {

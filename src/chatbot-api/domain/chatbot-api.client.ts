@@ -31,6 +31,12 @@ import type {
   CustomerCheckoutContext,
 } from './dtos/checkout-context.dto';
 
+import type {
+  CreateCheckoutInput,
+  CheckoutResponse,
+  CheckoutStatus,
+} from './dtos/checkout.dto';
+
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
 /**
@@ -63,6 +69,11 @@ export interface ChatbotApiClient {
     phone: string,
     options?: CheckoutContextQuery,
   ): Promise<CustomerCheckoutContext>;
+  createCheckout(
+    dto: CreateCheckoutInput,
+    idempotencyKey: string,
+  ): Promise<CheckoutResponse>;
+  getCheckoutStatus(idempotencyKey: string): Promise<CheckoutStatus>;
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse>;
   createSale(
     dto: CreateSaleInput,
