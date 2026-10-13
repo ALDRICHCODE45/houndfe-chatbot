@@ -404,6 +404,8 @@ export class MinimalCatalogAgentService {
             : { inboundEvent: input.inboundEvent }),
         });
         if (consumed !== null) {
+          // An order SÍ binds only to the reply right after its summary.
+          this.order?.dismiss(input.senderId);
           this.recordTurn(
             input.senderId,
             [
@@ -422,8 +424,10 @@ export class MinimalCatalogAgentService {
         }
       }
       if (this.checkoutAvailable()) {
+        const delivery = await this.checkout!.consume(input);
+        if (delivery !== null) this.order?.dismiss(input.senderId);
         const answered =
-          (await this.checkout!.consume(input)) ??
+          delivery ??
           (this.orderAvailable() ? await this.order!.consume(input) : null);
         if (answered !== null) {
           this.recordTurn(

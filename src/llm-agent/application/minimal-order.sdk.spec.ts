@@ -266,6 +266,47 @@ describe('minimal order placement through the SDK route', () => {
     expect(h.api.createSale).not.toHaveBeenCalled();
   });
 
+  it('never sells the earlier summary on a later SÍ meant for the model', async () => {
+    const h = setup();
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say()],
+      EVENT('wamid.o1'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    await h.turn(
+      'Sí, pero quite uno',
+      [say('¿Desea que quite una unidad?')],
+      EVENT('wamid.o2'),
+    );
+    const calls = h.seen.length;
+    expect(
+      await h.turn('Sí', [say('Listo, ¿algo más?')], EVENT('wamid.o3')),
+    ).toEqual({ kind: 'handled', reply: 'Listo, ¿algo más?' });
+    expect(h.seen.length).toBe(calls + 1);
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+
+  it('drops a pending order when a delivery confirmation answers the turn', async () => {
+    const h = setup();
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say()],
+      EVENT('wamid.o1'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    const delivery = await h.checkout.prepareConfirmation(
+      SENDER,
+      EVENT('wamid.d3'),
+    );
+    delivery.onSent?.();
+    await h.turn('SÍ', [say('no debería usarse')], EVENT('wamid.d4'));
+    await h.turn('SÍ', [say('¿En qué más le ayudo?')], EVENT('wamid.o4'));
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+
   it('fails closed when the model sends arguments to prepareOrder', async () => {
     const h = setup();
     await h.ready();

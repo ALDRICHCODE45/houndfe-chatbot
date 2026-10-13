@@ -169,6 +169,11 @@ export class MinimalOrderService {
     return this.offer(senderId, inboundEvent, fresh.snapshot);
   }
 
+  /** Drop the sender's pending summary when another route answers a turn. */
+  dismiss(senderId: string): void {
+    this.confirmation.cancel(senderId);
+  }
+
   /**
    * Consume one inbound turn against a pending order summary. `null` means
    * the turn is not an order answer and other routes keep it.

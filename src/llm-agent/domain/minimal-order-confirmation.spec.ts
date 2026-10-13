@@ -257,10 +257,10 @@ describe('MinimalOrderConfirmation', () => {
     expect(confirmation.status(SENDER)).toBeNull();
   });
 
-  it('leaves mixed or unrelated text to other routes', () => {
-    const confirmation = make();
-    offer(confirmation).onSent();
-    for (const text of ['Sí, pero quite uno', 'no', 'SÍ\nSÍ', 'okay'])
+  it('leaves mixed or unrelated text to other routes and drops the offer', () => {
+    for (const text of ['Sí, pero quite uno', 'no', 'SÍ\nSÍ', 'okay']) {
+      const confirmation = make();
+      offer(confirmation).onSent();
       expect(
         confirmation.consume({
           senderId: SENDER,
@@ -268,7 +268,16 @@ describe('MinimalOrderConfirmation', () => {
           inboundEvent: EVENT('wamid.x'),
         }),
       ).toBeNull();
-    expect(confirmation.status(SENDER)).toMatchObject({ armed: true });
+      expect(confirmation.status(SENDER)).toBeNull();
+      // A later SÍ answers something else, never the dropped summary.
+      expect(
+        confirmation.consume({
+          senderId: SENDER,
+          text: 'SÍ',
+          inboundEvent: EVENT('wamid.later'),
+        }),
+      ).toBeNull();
+    }
   });
 
   it('re-offers on an origin replay without confirming', () => {

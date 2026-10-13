@@ -282,7 +282,10 @@ export class MinimalOrderConfirmation {
   /**
    * Interpret one inbound turn. Only a strict, trusted, armed, unexpired SÍ
    * yields a candidate, and it consumes the pending so a second SÍ cannot
-   * create another order. Everything else is `null` or a handled refusal.
+   * create another order. Any other turn drops the pending: consent binds to
+   * the reply right after the summary, so a later SÍ meant for something else
+   * can never create this order. Everything else is `null` or a handled
+   * refusal.
    */
   consume(input: {
     readonly senderId: string;
@@ -309,7 +312,10 @@ export class MinimalOrderConfirmation {
           onSent: this.armFor(senderId, pending),
         };
       }
-      if (!isAffirmative(input.text)) return null;
+      if (!isAffirmative(input.text)) {
+        this.pending.delete(senderId);
+        return null;
+      }
       if (expired || !trusted || !pending.armed) return ambiguous();
       this.pending.delete(senderId);
       return {
