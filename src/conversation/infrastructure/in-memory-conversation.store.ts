@@ -3,6 +3,7 @@ import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { AgentTurnCommit } from '../domain/conversation-store';
+import { normalizeMinimalCheckoutDraft } from '../domain/minimal-checkout-draft';
 import {
   ConversationState,
   ConversationStore,
@@ -26,6 +27,50 @@ import {
 @Injectable()
 export class InMemoryConversationStore implements ConversationStore {
   private readonly map = new Map<string, ConversationState>();
+
+  async commitMinimalCheckoutDraft(
+    senderId: string,
+    expected: unknown,
+    next: unknown,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    const copy = normalizeMinimalCheckoutDraft(next, senderId);
+    if (
+      copy === null ||
+      !isNonEmptyString(lastMessageAt) ||
+      !Number.isFinite(Date.parse(lastMessageAt))
+    ) {
+      return false;
+    }
+    const live = this.map.get(senderId);
+    const present = !!live && Object.hasOwn(live.data, 'minimalCheckoutDraft');
+    if (expected === undefined ? present : !present) return false;
+    if (expected !== undefined) {
+      if (!live) return false;
+      try {
+        // Compare detached raw values in one clone realm, not caller prototypes.
+        if (
+          !isDeepStrictEqual(
+            structuredClone(live.data.minimalCheckoutDraft),
+            structuredClone(expected),
+          )
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    this.map.set(senderId, {
+      senderId,
+      lastMessageAt:
+        live && Date.parse(live.lastMessageAt) > Date.parse(lastMessageAt)
+          ? live.lastMessageAt
+          : lastMessageAt,
+      data: { ...live?.data, minimalCheckoutDraft: copy },
+    });
+    return true;
+  }
 
   async commitMinimalCart(
     senderId: string,
@@ -214,7 +259,27 @@ export class InMemoryConversationStore implements ConversationStore {
   }
 
   async get(senderId: string): Promise<ConversationState | null> {
-    return this.map.get(senderId) ?? null;
+    const state = this.map.get(senderId);
+    return state ? this.checkoutSnapshot(state) : null;
+  }
+
+  /** Detach containers even on absence; keep legacy sibling descriptors/identity.
+   * Preserve raw null/undefined/corrupt values for CAS, never normalize them away.
+   * Checkout seeds must be cloneable own data, not a mutable accessor closure. */
+  private checkoutSnapshot(state: ConversationState): ConversationState {
+    const descriptors = Object.getOwnPropertyDescriptors(state.data);
+    const draft = descriptors.minimalCheckoutDraft;
+    if (draft) {
+      if (!('value' in draft)) {
+        throw new TypeError('Checkout draft must be an own data property');
+      }
+      descriptors.minimalCheckoutDraft = {
+        ...draft,
+        value: structuredClone(draft.value),
+      };
+    }
+    const data = Object.defineProperties({}, descriptors);
+    return { ...state, data };
   }
 
   private async clearCanonicalPendingHumanRequest(
@@ -242,9 +307,10 @@ export class InMemoryConversationStore implements ConversationStore {
     senderId: string,
     state: Omit<ConversationState, 'senderId'>,
   ): Promise<ConversationState> {
-    const record: ConversationState = { senderId, ...state };
+    const record = this.checkoutSnapshot({ senderId, ...state });
+    const returned = this.checkoutSnapshot(record);
     this.map.set(senderId, record);
-    return record;
+    return returned;
   }
 
   async update(
@@ -265,6 +331,7 @@ export class InMemoryConversationStore implements ConversationStore {
     delete data.catalogReferences;
     delete data.agentRevision;
     delete data.minimalCart;
+    delete data.minimalCheckoutDraft;
     const safePatch = Object.hasOwn(patch, 'data') ? { ...patch, data } : patch;
     const merged = existing
       ? { ...existing, ...safePatch }
@@ -282,7 +349,13 @@ export class InMemoryConversationStore implements ConversationStore {
       data: {
         ...(merged.data ?? {}),
         ...Object.fromEntries(
-          ['messages', 'catalogReferences', 'agentRevision', 'minimalCart']
+          [
+            'messages',
+            'catalogReferences',
+            'agentRevision',
+            'minimalCart',
+            'minimalCheckoutDraft',
+          ]
             .filter((key) => existing && Object.hasOwn(existing.data, key))
             .map((key) => [key, existing!.data[key]]),
         ),
@@ -294,8 +367,9 @@ export class InMemoryConversationStore implements ConversationStore {
           : {}),
       },
     };
+    const returned = this.checkoutSnapshot(finalState);
     this.map.set(senderId, finalState);
-    return finalState;
+    return returned;
   }
 
   private isNewer(incoming: string, current: string): boolean {

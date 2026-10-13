@@ -249,6 +249,16 @@ export interface AgentTurnCommit {
 }
 
 export interface ConversationStore {
+  /** Optional sender-bound checkout draft CAS. Undefined expected requires an
+   * absent own key; null is a present raw value. Next must pass the draft guard.
+   * Preserves siblings and the newer timestamp. False never permits blind retry.
+   * Legacy update cannot insert, overwrite or remove this owned slot. */
+  commitMinimalCheckoutDraft?(
+    senderId: string,
+    expected: unknown,
+    next: unknown,
+    lastMessageAt: string,
+  ): Promise<boolean>;
   /** Optional for older adapters. CAS-owned minimal-route cart; preserves live siblings.
    * Undefined expected means the key must be absent. False must not be retried blindly. */
   commitMinimalCart?(
