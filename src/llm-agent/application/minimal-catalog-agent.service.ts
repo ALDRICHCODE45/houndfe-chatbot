@@ -53,6 +53,10 @@ import {
   reviewMinimalCheckout,
 } from './minimal-checkout-preflight';
 import {
+  MinimalCheckoutService,
+  type MinimalCheckoutReply,
+} from './minimal-checkout.service';
+import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
 } from './minimal-restock-request.service';
@@ -234,6 +238,51 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 
+// One server-owned checkout presentation per SDK run.
+type CheckoutRun = { attempted: boolean; value: MinimalCheckoutReply | null };
+
+const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'lookupCheckoutCustomer',
+  'selectCheckoutAddress',
+  'updateCheckoutDetails',
+  'confirmCheckoutDetails',
+]);
+
+const CHECKOUT_TOOL_CLARIFICATION =
+  'No pude registrar esos datos de entrega. ¿Me los comparte de nuevo, por favor?';
+
+const CHECKOUT_DETAIL_KEYS = [
+  'firstName',
+  'lastName',
+  'label',
+  'street',
+  'exteriorNumber',
+  'interiorNumber',
+  'zipCode',
+  'neighborhood',
+  'municipality',
+  'city',
+  'state',
+  'visualReferences',
+  'carrierPhone',
+] as const;
+const checkoutDetailsToolInput = z.strictObject({
+  ...(Object.fromEntries(
+    CHECKOUT_DETAIL_KEYS.map((key) => [key, z.string().nullable()]),
+  ) as Record<
+    (typeof CHECKOUT_DETAIL_KEYS)[number],
+    z.ZodNullable<z.ZodString>
+  >),
+  useNewAddress: z.boolean(),
+});
+
+const CHECKOUT_INSTRUCTIONS_FRAGMENT =
+  '\n\nDatos de entrega: cuando el cliente quiera comprar o dar sus datos, llame lookupCheckoutCustomer con nextPageRef: null para revisar si ya tiene direcciones guardadas (la aplicación usa su número de WhatsApp; no pida el teléfono). ' +
+  'Si hay direcciones, muéstrelas con su resumen y pregunte cuál usar; para elegir una llame selectCheckoutAddress con su addressRef EXACTO (nunca invente ni elija una por su cuenta). Use nextPageRef solo si el cliente pide ver más. not_found o ambiguous no impiden capturar una dirección nueva; lookup_unavailable no significa que no exista. ' +
+  'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Las direcciones guardadas no se editan aquí. ' +
+  'Se requieren nombre, calle, número exterior o S/N, colonia, código postal, ciudad o municipio y estado; pida lo que falte (missing). ' +
+  'Cuando estén completos, llame confirmCheckoutDetails sin argumentos: la aplicación muestra el resumen y pide al cliente responder SÍ. Usted nunca confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
+
 const CART_VARIANT_GUIDANCE =
   'Para herramientas de carrito copie en selectionRef el cartSelectionRef EXACTO del producto o presentación elegidos, devuelto por searchCatalog/checkStock/getCart o por el contexto verificado. No envíe productId ni variantId a herramientas de carrito. ' +
   'La referencia del producto sin presentación sirve para preparar una cantidad antes de elegir variante; NO sustituye la referencia de la presentación elegida al modificar el carrito. ' +
@@ -304,6 +353,8 @@ export class MinimalCatalogAgentService {
     private readonly expiration?: MinimalExpirationRequestService,
     @Optional()
     private readonly cart?: MinimalCartService,
+    @Optional()
+    private readonly checkout?: MinimalCheckoutService,
   ) {
     const agent = config.get<{ enabled: boolean; allowedSenders: string[] }>(
       'minimalCatalogAgent',
@@ -360,6 +411,26 @@ export class MinimalCatalogAgentService {
             ...(consumed.onSent === undefined
               ? {}
               : { onSent: consumed.onSent }),
+          };
+        }
+      }
+      if (this.checkoutAvailable()) {
+        const answered = await this.checkout!.consume(input);
+        if (answered !== null) {
+          this.recordTurn(
+            input.senderId,
+            [
+              { role: 'user', content: input.text },
+              { role: 'assistant', content: answered.reply },
+            ],
+            [],
+          );
+          return {
+            kind: 'handled',
+            reply: answered.reply,
+            ...(answered.onSent === undefined
+              ? {}
+              : { onSent: answered.onSent }),
           };
         }
       }
@@ -440,6 +511,10 @@ export class MinimalCatalogAgentService {
       ? { attempted: false, value: null }
       : null;
     const cartReply: ExpirationReply = { attempted: false, value: null };
+    const checkoutRun: CheckoutRun | null =
+      this.cart && this.checkoutAvailable()
+        ? { attempted: false, value: null }
+        : null;
     const baseInstructions = instructionsFor(
       restockAvailable,
       expirationAvailable,
@@ -502,6 +577,7 @@ export class MinimalCatalogAgentService {
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
         'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. Es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
+        (checkoutRun === null ? '' : CHECKOUT_INSTRUCTIONS_FRAGMENT) +
         selectionContext +
         pendingContext
       : baseInstructions;
@@ -521,6 +597,7 @@ export class MinimalCatalogAgentService {
         input,
         cartReply,
         cartConversation,
+        checkoutRun,
       ),
       stopWhen: stepCountIs(this.maxSteps),
     });
@@ -549,6 +626,27 @@ export class MinimalCatalogAgentService {
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
+    }
+    const checkoutResult = checkoutRun?.value ?? null;
+    if (checkoutResult !== null) {
+      // The server-owned presentation follows any cart acknowledgement so
+      // neither is lost; the model never authors a checkout outcome.
+      const reply =
+        cartReply.value === null
+          ? checkoutResult.reply
+          : `${cartReply.value}\n\n${checkoutResult.reply}`;
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return checkoutResult.onSent === undefined
+        ? { reply }
+        : { reply, onSent: checkoutResult.onSent };
     }
     if (cartReply.value !== null) {
       this.recordTurn(
@@ -580,6 +678,22 @@ export class MinimalCatalogAgentService {
         persistedCartContext(),
       );
       return { reply: CART_OPERATION_CLARIFICATION };
+    }
+    if (this.hasInvalidToolCall(result, CHECKOUT_TOOL_NAMES)) {
+      traceLog(
+        this.logger,
+        `minimal_catalog tool checkout argument rejected before execute trace=${traceId}`,
+      );
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: CHECKOUT_TOOL_CLARIFICATION },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return { reply: CHECKOUT_TOOL_CLARIFICATION };
     }
     this.recordTurn(
       input.senderId,
@@ -646,6 +760,24 @@ export class MinimalCatalogAgentService {
    * it is never routed through `execute`, so the caller must fail closed
    * instead of letting the model author the customer acknowledgement.
    */
+  private checkoutAvailable(): boolean {
+    return this.checkout !== undefined && this.checkout.available;
+  }
+
+  private hasInvalidToolCall(
+    result: {
+      dynamicToolCalls?: Array<{ toolName?: unknown; invalid?: unknown }>;
+    },
+    names: ReadonlySet<string>,
+  ): boolean {
+    return (result.dynamicToolCalls ?? []).some(
+      (call) =>
+        call.invalid === true &&
+        typeof call.toolName === 'string' &&
+        names.has(call.toolName),
+    );
+  }
+
   private hasInvalidCartToolCall(result: {
     dynamicToolCalls?: Array<{ toolName?: unknown; invalid?: unknown }>;
   }): boolean {
@@ -667,6 +799,7 @@ export class MinimalCatalogAgentService {
     context: { senderId: string; inboundEvent?: unknown },
     cartReply: ExpirationReply,
     cartConversation: MinimalCartConversation | null,
+    checkoutRun: CheckoutRun | null = null,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
@@ -1182,6 +1315,88 @@ export class MinimalCatalogAgentService {
           }),
         }
       : readTools;
+    const checkout = this.checkout;
+    const withCheckout =
+      checkoutRun === null || checkout === undefined
+        ? withCart
+        : {
+            ...withCart,
+            lookupCheckoutCustomer: tool({
+              description:
+                'Busca al cliente por su número de WhatsApp y sus direcciones guardadas (solo lectura). Devuelve referencias opacas addressRef y, si hay más, nextPageRef.',
+              inputSchema: z.strictObject({
+                nextPageRef: z.string().min(1).max(128).nullable(),
+              }),
+              strict: true,
+              execute: async ({ nextPageRef }) => {
+                const result = await checkout.lookup(
+                  context.senderId,
+                  nextPageRef,
+                );
+                trace(
+                  `tool lookupCheckoutCustomer result=${result.ok ? result.status : `error code=${result.error}`}`,
+                );
+                return result;
+              },
+            }),
+            selectCheckoutAddress: tool({
+              description:
+                'Elige para la entrega una dirección guardada por su addressRef EXACTO devuelto por lookupCheckoutCustomer. No edita la dirección.',
+              inputSchema: z.strictObject({
+                addressRef: z.string().min(1).max(128),
+              }),
+              strict: true,
+              execute: async ({ addressRef }) => {
+                const result = await checkout.selectAddress(
+                  context.senderId,
+                  addressRef,
+                );
+                trace(
+                  `tool selectCheckoutAddress result=${result.ok ? 'ok' : `error code=${result.error}`}`,
+                );
+                return result;
+              },
+            }),
+            updateCheckoutDetails: tool({
+              description:
+                'Guarda en el borrador local los datos de entrega que el cliente dijo. null deja el campo sin cambio. useNewAddress: true para una dirección nueva. No registra al cliente ni crea pedidos.',
+              inputSchema: checkoutDetailsToolInput,
+              strict: true,
+              execute: async (patch) => {
+                const result = await checkout.updateDetails(
+                  context.senderId,
+                  patch,
+                );
+                trace(
+                  `tool updateCheckoutDetails result=${result.ok ? 'ok' : `error code=${result.error}`}`,
+                );
+                return result;
+              },
+            }),
+            confirmCheckoutDetails: tool({
+              description:
+                'Pide a la aplicación mostrar el resumen de los datos de entrega para que el cliente lo confirme con SÍ. No confirma por sí misma.',
+              inputSchema: z.strictObject({}),
+              strict: true,
+              execute: async () => {
+                if (checkoutRun.attempted)
+                  return toolError('checkout_presentation_settled');
+                checkoutRun.attempted = true;
+                const prepared = await checkout.prepareConfirmation(
+                  context.senderId,
+                  context.inboundEvent,
+                );
+                checkoutRun.value = prepared;
+                trace(
+                  `tool confirmCheckoutDetails result=${prepared.onSent === undefined ? 'blocked' : 'offer'}`,
+                );
+                return {
+                  ok: true as const,
+                  presentedByApplication: true as const,
+                };
+              },
+            }),
+          };
     const expiration = this.expiration;
     const expirationLocal = expirationReply;
     // Preserve the first outcome, including while preparation is in flight.
@@ -1219,9 +1434,9 @@ export class MinimalCatalogAgentService {
           };
     const withExpiration =
       prepareExpirationOnce === null
-        ? withCart
+        ? withCheckout
         : {
-            ...withCart,
+            ...withCheckout,
             prepareExpiration: tool({
               description:
                 'Prepara (NO registra) una consulta de información de caducidad ' +
