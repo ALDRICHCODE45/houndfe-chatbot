@@ -1,6 +1,6 @@
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
-import { MinimalCartService } from './minimal-cart.service';
+import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
 
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
 const VARIANT = '22222222-2222-4222-8222-222222222222';
@@ -54,7 +54,115 @@ function setup() {
   };
 }
 
+const shipping = {
+  quoteId: 'quote-1',
+  rateId: 'rate-1',
+  carrierName: 'Carrier',
+  serviceName: 'Ground',
+  estimatedDeliveryDays: null,
+  bestRateCents: 10000,
+  totalCreditCents: 0,
+  customerPaysCents: 10000,
+  cartLines: [
+    {
+      productId: PRODUCT,
+      quantity: 2,
+      unitPriceCents: 1000,
+      finalPriceCents: 1900,
+    },
+  ],
+  addressId: OTHER,
+  addressVersion: '2026-06-22T12:00:00.000Z',
+  createdAt: '2026-06-22T12:00:00.000Z',
+  expiresAt: '2026-06-22T12:30:00.000Z',
+  approval: { state: 'pending', requestId: 'request-1' },
+};
 describe('Minimal cart public operations', () => {
+  it('[S1,S4] accepts strict optional shipping and rejects malformed sub-records', () => {
+    const cart = { items: [], idempotencyKey: '', shipping };
+    expect(parseMinimalCart(cart)).toEqual(cart);
+    expect(
+      parseMinimalCart({ ...cart, shipping: { ...shipping, extra: true } }),
+    ).toBeNull();
+    expect(
+      parseMinimalCart({
+        ...cart,
+        shipping: { ...shipping, customerPaysCents: -1 },
+      }),
+    ).toBeNull();
+    expect(parseMinimalCart({ items: [], idempotencyKey: '' })).not.toBeNull();
+  });
+  it.each(['set', 'adjust'] as const)(
+    '[S4] %s item changes drop shipping without touching sibling slots',
+    async (operation) => {
+      const f = setup();
+      await f.store.create(SENDER, {
+        lastMessageAt: shipping.createdAt,
+        data: { shippingApproval: { legacy: true } },
+      });
+      // Seed through the owned CAS, matching the clone realm of cart writes.
+      await f.store.commitMinimalCart(
+        SENDER,
+        undefined,
+        {
+          items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1000 }],
+          idempotencyKey: '',
+          shipping,
+        },
+        shipping.createdAt,
+      );
+      const result =
+        operation === 'set'
+          ? await f.service.setItem(
+              SENDER,
+              { productId: PRODUCT, quantity: 3 },
+              f.allowed,
+            )
+          : await f.service.adjustItem(
+              SENDER,
+              { productId: PRODUCT, delta: 1 },
+              f.allowed,
+            );
+      expect(result).toMatchObject({ ok: true });
+      const data = (await f.store.get(SENDER))!.data;
+      expect(data.minimalCart).not.toHaveProperty('shipping');
+      expect(data.shippingApproval).toEqual({ legacy: true });
+    },
+  );
+  it.each(['set', 'adjust'] as const)(
+    '[S4; inherited order S7] %s preserves shipping and outstanding key under the uncertain-order lock',
+    async (operation) => {
+      const f = setup();
+      await f.store.commitMinimalCart(
+        SENDER,
+        undefined,
+        {
+          items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1000 }],
+          idempotencyKey: OTHER,
+          shipping,
+        },
+        shipping.createdAt,
+      );
+      const before = structuredClone(await f.store.get(SENDER));
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      const result =
+        operation === 'set'
+          ? await f.service.setItem(
+              SENDER,
+              { productId: PRODUCT, quantity: 3 },
+              f.allowed,
+            )
+          : await f.service.adjustItem(
+              SENDER,
+              { productId: PRODUCT, delta: 1 },
+              f.allowed,
+            );
+      expect(result).toEqual({ ok: false, error: 'order_unresolved' });
+      expect(commit).not.toHaveBeenCalled();
+      expect(f.api.getStock).not.toHaveBeenCalled();
+      expect(await f.store.get(SENDER)).toEqual(before);
+    },
+  );
   it('keeps invalid_variant and unchanged cart when a diagnostic observer throws', async () => {
     const f = setup();
     const observer = jest.fn(() => {

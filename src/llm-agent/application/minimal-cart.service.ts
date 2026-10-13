@@ -9,6 +9,7 @@ import {
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
+import { minimalShippingSchema } from '../domain/minimal-shipping';
 
 const lineSchema = z.strictObject({
   productId: z.uuid(),
@@ -35,6 +36,7 @@ const cartSchema = z.strictObject({
   idempotencyAttempts: z.number().int().positive().optional(),
   expectedTotalCents: z.number().int().nonnegative().optional(),
   placedSale: placedSaleSchema.optional(),
+  shipping: minimalShippingSchema.optional(),
 });
 export type MinimalCartState = z.infer<typeof cartSchema>;
 
