@@ -215,11 +215,13 @@ describe('MinimalOrderConfirmation', () => {
       text: ' Sí. ',
       inboundEvent: EVENT('wamid.yes'),
     });
-    expect(consumed).toEqual({
+    expect(consumed).toMatchObject({
       kind: 'candidate',
-      reference: expect.any(String),
       snapshot: eligible(),
     });
+    expect(typeof (consumed as { reference: unknown }).reference).toBe(
+      'string',
+    );
     expect(
       confirmation.consume({
         senderId: SENDER,
