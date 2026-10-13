@@ -16,15 +16,24 @@ import {
   MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
 } from '../domain/minimal-checkout-confirmation';
 import { CostGuardService } from './cost-guard.service';
-import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
+import { CART_OPERATION_CLARIFICATION } from './minimal-cart-conversation';
+import {
+  CHECKOUT_TOOL_CLARIFICATION,
+  MinimalCatalogAgentService,
+} from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import {
   MINIMAL_CHECKOUT_INCOMPLETE_REPLY,
+  MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY,
   MINIMAL_CHECKOUT_RESELECT_REPLY,
   MinimalCheckoutService,
+  type MinimalCheckoutDetailsPatch,
 } from './minimal-checkout.service';
+import type { MinimalExpirationRequestService } from './minimal-expiration-request.service';
+import type { MinimalRestockRequestService } from './minimal-restock-request.service';
 
 const SENDER = '5215550001111';
+const OTHER = '5215550002222';
 const CUSTOMER = '22222222-2222-4222-8222-222222222222';
 const ADDRESS = '33333333-3333-4333-8333-333333333333';
 const ADDRESS_2 = '44444444-4444-4444-8444-444444444444';
@@ -89,10 +98,13 @@ const DETAILS_KEYS = [
 const details = (
   values: Partial<Record<(typeof DETAILS_KEYS)[number], string>>,
   useNewAddress = true,
-) => ({
-  ...Object.fromEntries(DETAILS_KEYS.map((key) => [key, values[key] ?? null])),
-  useNewAddress,
-});
+): MinimalCheckoutDetailsPatch =>
+  ({
+    ...Object.fromEntries(
+      DETAILS_KEYS.map((key) => [key, values[key] ?? null]),
+    ),
+    useNewAddress,
+  }) as MinimalCheckoutDetailsPatch;
 const COMPLETE = {
   firstName: 'Ana',
   street: 'Calle 5',
@@ -121,7 +133,12 @@ const call = (name: string, input: unknown = {}) =>
 const say = (text = 'Listo.') => step([{ type: 'text', text }], 'stop');
 
 function setup(
-  options: { checkout?: boolean; context?: () => Promise<unknown> } = {},
+  options: {
+    checkout?: boolean;
+    context?: () => Promise<unknown>;
+    restock?: MinimalRestockRequestService;
+    expiration?: MinimalExpirationRequestService;
+  } = {},
 ) {
   const store = new InMemoryConversationStore();
   const getCustomerCheckoutContext = jest.fn(
@@ -162,6 +179,7 @@ function setup(
     );
     return result;
   };
+  let checkout = new MinimalCheckoutService(api, store);
   const build = () =>
     new MinimalCatalogAgentService(
       api,
@@ -169,22 +187,22 @@ function setup(
       new CostGuardService(100000),
       config,
       new InMemoryMinimalCatalogSessionStore(),
-      undefined,
-      undefined,
+      options.restock,
+      options.expiration,
       new MinimalCartService(api, store),
-      options.checkout === false
-        ? undefined
-        : new MinimalCheckoutService(api, store),
+      options.checkout === false ? undefined : checkout,
     );
   let agent = build();
   return {
     store,
     api,
+    checkout: () => checkout,
     forbidden,
     getCustomerCheckoutContext,
     seen,
     outputs,
     restart: () => {
+      checkout = new MinimalCheckoutService(api, store);
       agent = build();
     },
     turn: async (text: string, script: unknown[], event?: unknown) => {
@@ -445,7 +463,7 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     });
   });
 
-  it('invalidates a presented summary when the draft changes', async () => {
+  it('invalidates a presented summary when the draft changes and presents the updated one', async () => {
     const h = setup();
     await collectComplete(h);
     const offer = await h.turn(
@@ -458,9 +476,243 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
       call('updateCheckoutDetails', details({ street: 'Calle 6' })),
       say(),
     ]);
-    expect(await h.turn('SÍ', [say()], EVENT('wamid.yes'))).toEqual({
+    const changed = await h.turn('SÍ', [say()], EVENT('wamid.yes'));
+    const reply = (changed as { reply: string }).reply;
+    expect(reply.startsWith(`${MINIMAL_CHECKOUT_CHANGED_REPLY}\n\n`)).toBe(
+      true,
+    );
+    expect(reply).toContain('Calle: Calle 6 S/N');
+    expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+      stage: 'pending',
+      armed: false,
+    });
+    (changed as { onSent: () => void }).onSent();
+    expect(await h.turn('SÍ', [say()], EVENT('wamid.yes2'))).toEqual({
       kind: 'handled',
-      reply: MINIMAL_CHECKOUT_CHANGED_REPLY,
+      reply: MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+    });
+  });
+
+  it('revokes a local confirmation when the draft really changes, not on a no-op update', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const offer = await h.turn(
+      'Listo',
+      [call('confirmCheckoutDetails'), say()],
+      EVENT('wamid.offer'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    await h.turn('SÍ', [say()], EVENT('wamid.yes'));
+    expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+      stage: 'confirmed',
+    });
+
+    await h.turn('Me llamo Ana', [
+      call('updateCheckoutDetails', details({ firstName: 'Ana' })),
+      say(),
+    ]);
+    expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+      stage: 'confirmed',
+    });
+
+    await h.turn('Mejor calle 6', [
+      call('updateCheckoutDetails', details({ street: 'Calle 6' })),
+      say(),
+    ]);
+    expect(h.checkout().confirmationStatus(SENDER)).toBeNull();
+  });
+
+  it('does not confirm, and re-presents the summary, when the acceptance CAS loses', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const offer = await h.turn(
+      'Listo',
+      [call('confirmCheckoutDetails'), say()],
+      EVENT('wamid.offer'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    const before = await h.draft();
+    jest
+      .spyOn(h.store, 'commitMinimalCheckoutDraft')
+      .mockResolvedValueOnce(false);
+    const lost = await h.turn('SÍ', [say()], EVENT('wamid.yes'));
+    const reply = (lost as { reply: string }).reply;
+    expect(
+      reply.startsWith(`${MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY}\n\n`),
+    ).toBe(true);
+    expect(reply).toContain('Calle: Calle 5 S/N');
+    expect(await h.draft()).toEqual(before);
+    expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+      stage: 'pending',
+      armed: false,
+    });
+  });
+
+  it('reports a lost write CAS as draft_changed without retrying or changing the draft', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const before = await h.draft();
+    const cas = jest
+      .spyOn(h.store, 'commitMinimalCheckoutDraft')
+      .mockResolvedValueOnce(false);
+    await h.turn('Mejor calle 6', [
+      call('updateCheckoutDetails', details({ street: 'Calle 6' })),
+      say(),
+    ]);
+    expect(h.outputs[0]).toEqual({ ok: false, error: 'draft_changed' });
+    expect(cas).toHaveBeenCalledTimes(1);
+    expect(await h.draft()).toEqual(before);
+  });
+
+  it('fails closed with a server clarification for a malformed checkout tool call', async () => {
+    const h = setup();
+    const result = await h.turn('La primera', [
+      call('selectCheckoutAddress', {}),
+      say('Listo, elegí su dirección.'),
+    ]);
+    expect(result).toEqual({
+      kind: 'handled',
+      reply: CHECKOUT_TOOL_CLARIFICATION,
+    });
+    expect(await h.draft()).toBeUndefined();
+  });
+
+  it('keeps the invalid-cart clarification ahead of a checkout presentation', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const result = await h.turn(
+      'Agrega y confirma',
+      [call('setCartItem', {}), call('confirmCheckoutDetails'), say('Listo.')],
+      EVENT('wamid.offer'),
+    );
+    const reply = (result as { reply: string }).reply;
+    expect(reply.startsWith(`${CART_OPERATION_CLARIFICATION}\n\n`)).toBe(true);
+    expect(reply).toContain('Calle: Calle 5 S/N');
+    expect(typeof (result as { onSent?: unknown }).onSent).toBe('function');
+  });
+
+  it.each([
+    [
+      'unavailable',
+      () => Promise.reject(new Error('down')),
+      MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY,
+    ],
+    [
+      'changed',
+      () =>
+        Promise.resolve(
+          unique([savedAddress({ version: '2026-10-02T00:00:00.000Z' })]),
+        ),
+      MINIMAL_CHECKOUT_RESELECT_REPLY,
+    ],
+  ] as const)(
+    'blocks the summary when the saved address revalidation is %s',
+    async (_case, fresh, expected) => {
+      const context = jest
+        .fn()
+        .mockResolvedValueOnce(unique())
+        .mockImplementationOnce(fresh);
+      const h = setup({ context });
+      await h.turn('Quiero comprar', [lookup(), say()]);
+      await h.turn('La primera', [
+        call('selectCheckoutAddress', { addressRef: firstRef(h.outputs[0]) }),
+        say(),
+      ]);
+      expect(
+        await h.turn(
+          'Confirmo',
+          [call('confirmCheckoutDetails'), say()],
+          EVENT('wamid.offer'),
+        ),
+      ).toEqual({ kind: 'handled', reply: expected });
+      expect(h.checkout().confirmationStatus(SENDER)).toBeNull();
+    },
+  );
+
+  it('rejects an address reference issued to another sender', async () => {
+    const h = setup();
+    await h.turn('Quiero comprar', [lookup(), say()]);
+    const ref = firstRef(h.outputs[0]);
+    await expect(h.checkout().selectAddress(OTHER, ref)).resolves.toEqual({
+      ok: false,
+      error: 'unknown_reference',
+    });
+    expect(await h.store.get(OTHER)).toBeNull();
+    expect(await h.draft()).toBeUndefined();
+  });
+
+  it('treats a store read failure as unavailable and never writes', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const before = await h.draft();
+    const cas = jest.spyOn(h.store, 'commitMinimalCheckoutDraft');
+    jest.spyOn(h.store, 'get').mockRejectedValueOnce(new Error('db down'));
+    await expect(
+      h.checkout().updateDetails(SENDER, details({ street: 'Calle 6' })),
+    ).resolves.toEqual({ ok: false, error: 'draft_unavailable' });
+    jest.spyOn(h.store, 'get').mockRejectedValueOnce(new Error('db down'));
+    await expect(
+      h.checkout().prepareConfirmation(SENDER, EVENT('wamid.offer')),
+    ).resolves.toEqual({ reply: MINIMAL_CHECKOUT_AMBIGUOUS_REPLY });
+    expect(cas).not.toHaveBeenCalled();
+    expect(await h.draft()).toEqual(before);
+  });
+
+  it('lets a RESTOCK offer win over a checkout presentation and leaves the summary unarmed', async () => {
+    const restockSent = jest.fn();
+    const restock = {
+      enabled: true,
+      prepare: jest.fn(async () => ({
+        kind: 'offer',
+        reply: '¿Consulto la reposición?',
+        onSent: restockSent,
+      })),
+      consume: jest.fn(async () => null),
+    } as unknown as MinimalRestockRequestService;
+    const h = setup({ restock });
+    await collectComplete(h);
+    const result = await h.turn(
+      'Avísenme y confirmo',
+      [
+        call('prepareRestock', { productId: CUSTOMER }),
+        call('confirmCheckoutDetails'),
+        say(),
+      ],
+      EVENT('wamid.offer'),
+    );
+    expect(result).toEqual({
+      kind: 'handled',
+      reply: '¿Consulto la reposición?',
+      onSent: restockSent,
+    });
+    expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+      stage: 'pending',
+      armed: false,
+    });
+  });
+
+  it('lets an EXPIRATION reply win over a checkout presentation', async () => {
+    const expiration = {
+      enabled: true,
+      prepare: jest.fn(async () => ({
+        kind: 'registered',
+        reply: 'Consulté la caducidad con el equipo.',
+      })),
+    } as unknown as MinimalExpirationRequestService;
+    const h = setup({ expiration });
+    await collectComplete(h);
+    const result = await h.turn(
+      '¿Caducidad? y confirmo',
+      [
+        call('prepareExpiration', { productId: CUSTOMER }),
+        call('confirmCheckoutDetails'),
+        say(),
+      ],
+      EVENT('wamid.offer'),
+    );
+    expect(result).toEqual({
+      kind: 'handled',
+      reply: 'Consulté la caducidad con el equipo.',
     });
   });
 
@@ -502,10 +754,13 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     );
     expect((offer as { reply: string }).reply).toContain('Av. Juárez');
     (offer as { onSent: () => void }).onSent();
+    const before = await h.draft();
     expect(await h.turn('SÍ', [say()], EVENT('wamid.yes'))).toEqual({
       kind: 'handled',
-      reply: MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
+      reply: MINIMAL_CHECKOUT_RESELECT_REPLY,
     });
+    expect(h.checkout().confirmationStatus(SENDER)).toBeNull();
+    expect(await h.draft()).toEqual(before);
   });
 
   it('asks to re-select a saved address after a restart instead of trusting cached data', async () => {

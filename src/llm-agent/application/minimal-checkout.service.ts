@@ -22,8 +22,11 @@ import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsa
 import { MinimalCheckoutAddressReferences } from '../domain/minimal-checkout-address-references';
 import {
   MINIMAL_CHECKOUT_AMBIGUOUS_REPLY,
+  MINIMAL_CHECKOUT_CHANGED_REPLY,
+  MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
   MinimalCheckoutConfirmation,
   evaluateMinimalCheckoutReadiness,
+  type MinimalCheckoutBindingStatus,
   type MinimalCheckoutMissingField,
 } from '../domain/minimal-checkout-confirmation';
 
@@ -203,6 +206,11 @@ export class MinimalCheckoutService {
   /** Only adapters with the owned draft CAS can host the checkout tools. */
   get available(): boolean {
     return typeof this.store.commitMinimalCheckoutDraft === 'function';
+  }
+
+  /** Volatile local confirmation state for the sender, or `null`. */
+  confirmationStatus(senderId: string): MinimalCheckoutBindingStatus | null {
+    return this.confirmation.status(senderId);
   }
 
   async lookup(
@@ -387,21 +395,58 @@ export class MinimalCheckoutService {
     if (result.kind === 'reoffer') {
       return { reply: result.reply, onSent: result.onSent };
     }
-    if (result.kind === 'handled') return { reply: result.reply };
-    let committed = false;
-    if (
-      current !== null &&
-      (await this.revalidate(input.senderId, result.draft)) === 'ok'
-    ) {
-      committed = await this.commit(input.senderId, current.raw, result.draft);
+    if (result.kind === 'handled') {
+      return result.reply === MINIMAL_CHECKOUT_CHANGED_REPLY
+        ? this.reoffer(input.senderId, input.inboundEvent, result.reply)
+        : { reply: result.reply };
     }
-    return {
-      reply: this.confirmation.finalize({
+    const revalidation =
+      current === null
+        ? 'unavailable'
+        : await this.revalidate(input.senderId, result.draft);
+    if (current === null || revalidation !== 'ok') {
+      this.confirmation.finalize({
         senderId: input.senderId,
         candidate: result,
-        committed,
-      }).reply,
-    };
+        committed: false,
+      });
+      return revalidationReply(
+        revalidation === 'ok' ? 'unavailable' : revalidation,
+      );
+    }
+    const committed = await this.commit(
+      input.senderId,
+      current.raw,
+      result.draft,
+    );
+    const finalized = this.confirmation.finalize({
+      senderId: input.senderId,
+      candidate: result,
+      committed,
+    });
+    return finalized.kind === 'confirmed'
+      ? { reply: finalized.reply }
+      : this.reoffer(
+          input.senderId,
+          input.inboundEvent,
+          MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
+        );
+  }
+
+  /**
+   * Keeps the promise of `lead` ("le mostraré el resumen actualizado"): the
+   * fresh summary follows it. When no summary can be offered, only the reason
+   * is sent, so the customer is never told a summary is coming.
+   */
+  private async reoffer(
+    senderId: string,
+    inboundEvent: unknown,
+    lead: string,
+  ): Promise<MinimalCheckoutReply> {
+    const prepared = await this.prepareConfirmation(senderId, inboundEvent);
+    return prepared.onSent === undefined
+      ? prepared
+      : { reply: `${lead}\n\n${prepared.reply}`, onSent: prepared.onSent };
   }
 
   private registryFor(senderId: string): MinimalCheckoutAddressReferences {
@@ -466,8 +511,12 @@ export class MinimalCheckoutService {
           revision: previous === undefined ? 0 : previous.revision + 1,
           ...content,
         };
-    if (!unchanged && !(await this.commit(senderId, current.raw, next))) {
-      return { ok: false, error: 'draft_changed' };
+    if (!unchanged) {
+      if (!(await this.commit(senderId, current.raw, next))) {
+        return { ok: false, error: 'draft_changed' };
+      }
+      // S3: a change invalidates the prior local confirmation.
+      this.confirmation.revokeConfirmation(senderId);
     }
     const readiness = evaluateMinimalCheckoutReadiness(next);
     return { ok: true, ready: readiness.ready, missing: readiness.missing };

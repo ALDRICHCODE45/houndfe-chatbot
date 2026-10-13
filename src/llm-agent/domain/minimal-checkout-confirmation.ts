@@ -324,6 +324,15 @@ export class MinimalCheckoutConfirmation {
   }
 
   /**
+   * Drop the local confirmation after the coordinator committed a real draft
+   * change. A live pending is kept: its exact binding already rejects a SÍ for
+   * the changed draft.
+   */
+  revokeConfirmation(senderId: string): void {
+    this.confirmed.delete(senderId);
+  }
+
+  /**
    * Pure readiness for an untrusted draft: `null` when the draft is malformed
    * or bound to another sender, otherwise the observable missing fields.
    */

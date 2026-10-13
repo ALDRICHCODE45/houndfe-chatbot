@@ -248,7 +248,7 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'confirmCheckoutDetails',
 ]);
 
-const CHECKOUT_TOOL_CLARIFICATION =
+export const CHECKOUT_TOOL_CLARIFICATION =
   'No pude registrar esos datos de entrega. ¿Me los comparte de nuevo, por favor?';
 
 const CHECKOUT_DETAIL_KEYS = [
@@ -629,12 +629,18 @@ export class MinimalCatalogAgentService {
     }
     const checkoutResult = checkoutRun?.value ?? null;
     if (checkoutResult !== null) {
-      // The server-owned presentation follows any cart acknowledgement so
-      // neither is lost; the model never authors a checkout outcome.
+      // The server-owned presentation follows any cart acknowledgement or
+      // invalid-cart clarification so neither is lost; the model never
+      // authors a checkout outcome.
+      const cartPart =
+        cartReply.value ??
+        (this.hasInvalidCartToolCall(result)
+          ? CART_OPERATION_CLARIFICATION
+          : null);
       const reply =
-        cartReply.value === null
+        cartPart === null
           ? checkoutResult.reply
-          : `${cartReply.value}\n\n${checkoutResult.reply}`;
+          : `${cartPart}\n\n${checkoutResult.reply}`;
       this.recordTurn(
         input.senderId,
         [
