@@ -6,14 +6,14 @@ This experimental minimal SDK capability is **off by default** and **not product
 
 Enable the minimal route and order capability described in [minimal order placement](minimal-order-placement.md), including the sender allowlist and bot cashier. Then configure:
 
-| Variable | Value / requirement |
-| --- | --- |
-| `MINIMAL_CATALOG_SHIPPING_ENABLED` | Exact `true`; every other value is off. |
-| `SHIPPING_QUOTES_ENABLED` | Exact `true`; makes the provider port available. |
-| `HUMAN_HANDOFF_ENABLED` | `true`; operations approval must be available. |
-| `OPS_CHANNEL_PHONE` | Authorized operations-channel recipient. |
-| Skydropx configuration | Owner-approved sandbox credentials and authoritative branch origin. |
-| `SHIPPING_DEMO_PARCEL_PROFILE_JSON` | Valid measured profile matching the exact cart. |
+| Variable                            | Value / requirement                                                 |
+| ----------------------------------- | ------------------------------------------------------------------- |
+| `MINIMAL_CATALOG_SHIPPING_ENABLED`  | Exact `true`; every other value is off.                             |
+| `SHIPPING_QUOTES_ENABLED`           | Exact `true`; makes the provider port available.                    |
+| `HUMAN_HANDOFF_ENABLED`             | `true`; operations approval must be available.                      |
+| `OPS_CHANNEL_PHONE`                 | Authorized operations-channel recipient.                            |
+| Skydropx configuration              | Owner-approved sandbox credentials and authoritative branch origin. |
+| `SHIPPING_DEMO_PARCEL_PROFILE_JSON` | Valid measured profile matching the exact cart.                     |
 
 Restart after changing gates. There is still one `ShippingModule.forRoot()` composition root. The minimal tool is exposed only when its gate, service and order capability are available. Gate off or service absent adds no shipping tool or instruction fragment. Launch preflight requires both shipping gates explicitly `false`; omission is not a launch-safe posture.
 
