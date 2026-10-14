@@ -40,6 +40,25 @@ describe('runLaunchPreflight', () => {
       });
     },
   );
+  it.each([undefined, '', 'true', 'FALSE', 'false'])(
+    'S2: minimal atomic checkout launch posture must be explicit false (%s)',
+    (value) => {
+      const env = safeEnv();
+      env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = value;
+      const report = run(env);
+      expect(report.posture).toContainEqual({
+        name: 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
+        expected: 'false',
+        status:
+          value === undefined || value === ''
+            ? 'missing'
+            : value === 'false'
+              ? 'safe'
+              : 'unsafe',
+      });
+      expect(report.ok).toBe(value === 'false');
+    },
+  );
   it('passes the happy path with every automatic check satisfied', () => {
     const report = run(safeEnv());
     expect(report.schemaVersion).toBe(1);

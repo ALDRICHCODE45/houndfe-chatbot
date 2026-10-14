@@ -70,6 +70,9 @@ export const POSTURE_EXPECTATIONS: readonly {
   // `unsafe`, so shipping quotes cannot reach production implicitly.
   { name: 'SHIPPING_QUOTES_ENABLED', expected: 'false' },
   { name: 'MINIMAL_CATALOG_SHIPPING_ENABLED', expected: 'false' },
+  // The backend atomic checkout is not deployed yet: launch must keep the
+  // legacy POST /sales path explicitly.
+  { name: 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED', expected: 'false' },
 ];
 
 export const REQUIRED_MIGRATIONS = [

@@ -2,16 +2,17 @@
 
 `MinimalOrderService` lets an allowlisted WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
 
-It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight, but backend checkout wiring and production shipping prerequisites remain unresolved.
+It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight. Placement can go through the backend atomic checkout behind its own default-off switch ([below](#atomic-checkout-switch)); that backend endpoint is not deployed yet, and production shipping prerequisites remain unresolved.
 
 ## Enable it (test environments only)
 
-| Variable                                | Required value        | Why                                                      |
-| --------------------------------------- | --------------------- | -------------------------------------------------------- |
-| `MINIMAL_CATALOG_AGENT_ENABLED`         | `true`                | The minimal SDK route itself.                            |
-| `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS` | test senders          | Only these WhatsApp senders reach the route.             |
-| `MINIMAL_CATALOG_ORDER_ENABLED`         | `true`                | Exposes `prepareOrder`; any other value keeps it hidden. |
-| `CHATBOT_API_CASHIER_USER_ID`           | bot cashier `User.id` | Server-owned `cashierUserId`; empty disables ordering.   |
+| Variable                                  | Required value        | Why                                                                                               |
+| ----------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------- |
+| `MINIMAL_CATALOG_AGENT_ENABLED`           | `true`                | The minimal SDK route itself.                                                                     |
+| `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS`   | test senders          | Only these WhatsApp senders reach the route.                                                      |
+| `MINIMAL_CATALOG_ORDER_ENABLED`           | `true`                | Exposes `prepareOrder`; any other value keeps it hidden.                                          |
+| `CHATBOT_API_CASHIER_USER_ID`             | bot cashier `User.id` | Server-owned `cashierUserId`; empty disables ordering.                                            |
+| `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED` | `true` (optional)     | Places orders via `POST /chatbot-api/checkouts`; any other value keeps `POST /chatbot-api/sales`. |
 
 The store must implement `commitMinimalCart` and `commitMinimalCheckoutDraft`.
 
@@ -59,6 +60,22 @@ While a key is outstanding (any uncertain outcome, or a crash mid-call), the ord
 
 The lock ends only with a confirmed sale, or with a definite rejection of the first attempt. A failed payment-details read or a lost post-sale cart write never hides a created order.
 
+### Atomic checkout switch
+
+With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else is off), `place()` sends one `POST /chatbot-api/checkouts` instead of `POST /chatbot-api/sales`. With it off, the legacy path is unchanged. Launch preflight requires it explicitly `false`: the backend endpoint is committed in `houndfe-backend` but not deployed.
+
+- Same scope as above: customer mode `existing` and deliveryAddress mode `existing` with the confirmed snapshot `version` as `expectedVersion`. Phone comes from the trusted WhatsApp sender. New customers/addresses are still out of scope.
+- The fingerprint covers the exact checkout payload (including any approved shipping charge); key, attempts counter and the S7 lock work as above, with one POST per consent.
+- **Recovery:** before replaying an outstanding key with the same fingerprint, the server reads `GET /chatbot-api/checkouts/status` for that key (a status read is not counted as an attempt):
+
+  | Status                       | Action                                                                            |
+  | ---------------------------- | --------------------------------------------------------------------------------- |
+  | `succeeded` with a sale      | Treated as the created order: cart cleared, `placedSale`, success reply; no POST. |
+  | `not_observed`               | Same payload replayed with the **same** key (never a fresh one).                  |
+  | anything else, or read fails | Lock kept; "no pude confirmar si quedó registrado".                               |
+
+- Errors: `CHECKOUT_RETRY_REQUIRED` keeps the key. `ADDRESS_VERSION_CONFLICT` is a definite rejection that asks the customer to re-select and confirm their delivery data. Other codes follow the table above.
+
 ## Reply priority in one SDK run
 
 EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text.
@@ -76,5 +93,7 @@ Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confi
 ```sh
 node_modules/.bin/jest src/llm-agent/domain/minimal-order-confirmation.spec.ts \
   src/llm-agent/application/minimal-order.service.spec.ts \
-  src/llm-agent/application/minimal-order.sdk.spec.ts
+  src/llm-agent/application/minimal-order.sdk.spec.ts \
+  src/chatbot-api/domain/dtos/checkout.dto.spec.ts \
+  src/chatbot-api/infrastructure/chatbot-api-http.checkout.spec.ts
 ```

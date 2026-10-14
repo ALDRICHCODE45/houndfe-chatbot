@@ -39,7 +39,7 @@ Shipping shares the one-presentation-per-SDK-run slot with delivery confirmation
 ## Not ready for production
 
 - **Arbitrary-cart packing:** current quoting reuses a measured-demo profile and only accepts exactly configured carts. Real product/variant weights and dimensions are missing (`packageInfo` is currently null). Never infer measurements (task log L11).
-- **Backend checkout wiring:** `MinimalOrderService` still calls `POST /chatbot-api/sales`. Shipping persistence on that legacy endpoint is not a deployed contract. The new `POST /chatbot-api/checkouts` and status client exist but are **not wired into this order flow**. Resolve backend charge persistence and atomic-checkout integration before activation.
+- **Backend checkout wiring:** by default `MinimalOrderService` still calls `POST /chatbot-api/sales`, where shipping persistence is not a deployed contract. `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` routes placement, including the approved shipping charge, through `POST /chatbot-api/checkouts` with status-based recovery ([details](minimal-order-placement.md#atomic-checkout-switch)). That backend endpoint is committed but **not deployed**; launch preflight requires the switch explicitly `false`.
 - **Delivery zones:** free-zone/surcharge/carrier-only policy, including CDMX service selection, remains unresolved.
 - Cart CAS, handoff lifecycle/reservation closure and WhatsApp delivery are not one transaction; partial failures may require reconciliation.
 

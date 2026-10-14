@@ -79,6 +79,10 @@ const configuration = () => ({
     // exact env string 'true' enables it.
     orderEnabled: process.env.MINIMAL_CATALOG_ORDER_ENABLED === 'true',
     shippingEnabled: process.env.MINIMAL_CATALOG_SHIPPING_ENABLED === 'true',
+    // Default-off: place orders via POST /chatbot-api/checkouts instead of
+    // POST /chatbot-api/sales. Only the exact env string 'true' enables it.
+    atomicCheckoutEnabled:
+      process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED === 'true',
   },
   database: {
     url: process.env.DATABASE_URL as string,

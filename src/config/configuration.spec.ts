@@ -66,6 +66,7 @@ describe('configuration()', () => {
     'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
     // Experimental minimal SDK catalog route
     'MINIMAL_CATALOG_SHIPPING_ENABLED',
+    'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
     'MINIMAL_CATALOG_AGENT_ENABLED',
     'MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS',
   ];
@@ -95,6 +96,19 @@ describe('configuration()', () => {
       else process.env.MINIMAL_CATALOG_SHIPPING_ENABLED = value;
       expect(configuration().minimalCatalogAgent).toHaveProperty(
         'shippingEnabled',
+        value === 'true',
+      );
+    },
+  );
+
+  it.each([undefined, 'false', 'TRUE', '1', ' true ', 'true'])(
+    'S2: minimal atomic checkout enables only exact true (%s)',
+    (value) => {
+      if (value === undefined)
+        delete process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED;
+      else process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = value;
+      expect(configuration().minimalCatalogAgent).toHaveProperty(
+        'atomicCheckoutEnabled',
         value === 'true',
       );
     },
