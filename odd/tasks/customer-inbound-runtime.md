@@ -1,19 +1,23 @@
 # Default-off customer inbound runtime capture
+
 Branch: `feat/customer-inbound-evidence`; baseline `fd189e7ee6032e85673ddd538148425c3f8aa6f5`.
 Separate <=400-line units with explicit owner commit permission; direct Node Jest, isolated verification.
 
 ## Specs
+
 - **S1 — Scope.** Owner answered "si" to "¿Avanzamos con la integración al runtime, dejándola desactivada por defecto, sin migrar producción, enviar mensajes reales ni hacer push?" Capture only: no latest-read consumer, window renewal or new send authority.
 - **S2 — Failure policy.** Owner: "adelante con tu recomwndacion" after "¿Aplicamos la primera opción, únicamente cuando el nuevo flag esté activado?" Recommended option: "Detener el webhook con HTTP 500 — recomiendo esto: evita procesar sin guardar evidencia. Meta podría reenviarlo; no agregamos reintentos internos." HOLD, missing enabled dependency/snapshot and persistence errors prevent dispatch only when capture is enabled; retain existing HTTP error envelope.
 - **S3 — Authentication and compatibility.** Independent default-off capture flag enables private snapshot creation only after successful HMAC; preserve RESTOCK-only and both-disabled behavior. Reuse actual-request capture, standalone PG pool, operational-sender and outbound-ID filters. Capture before dispatch/dedup; preserve existing RESTOCK admission and dispatch semantics when both flags are enabled. No automatic retries or prefix rollback.
 - **S4 — Delivery and evidence.** Retain owner's prior <=400 authored changed lines/unit, separate commit permission, no push/activation/production operations. Preserve older untracked work. Unit tests before behavior changes; real HTTP composition proof separate. Independent security checks and native review per bounded delivery. Existing nine general TypeScript demo/echo errors are known baseline, not a clean check.
 
 ## Tasks
+
 - **R1 [done]** S1,S3,S4 — Default-off configuration/snapshot gate185 lines;368 focused and7156 regression passed/1078 skipped; independent PASS, native approved/acknowledged; inline; commit `13611facda67cb37fac74c2ee357d258f538945c`.
 - **R2 [done]** S1-S4 — Capture provider/controller318 lines;23 focused/7170 regression passed,1078 skipped; independent PASS and four-lens native approved/acknowledged; inline; commit `49968b4a0134dc5b22461fce94420fa2690ba091`.
 - **R3 [dropped: deferred by owner]** S1-S4 — Automated HTTP proof postponed in favor of a read-only readiness check next session; not claimed as verified.
 
 ## Log
+
 - **L1 — Original request:** "adelanre"; scope clarification quoted in S1, owner "si". Failure-policy recommendation quoted in S2, owner "adelante con tu recomwndacion". Later "si" authorized reading the two named NestJS SKILL.md files only.
 - **L2 — Exploration:** Read-only mapper `muxw8gko-3-zbsg`; parent spot-checked webhook.controller.ts. Snapshot previously RESTOCK-only. No production readLatest consumer. Existing controller RESTOCK admission precedes dispatch and fails500 on missing/noncaptured. PG_POOL singleton lifecycle already exists. Corrected mapper counts: T5b29 + extractor29 =58 combined; T6 customer-inbound-only183 across7 suites, not the broader expiration pattern.
 - **L3 — Route and boundaries:** New multi-delivery feature needs durable tracking; no parallel independent writer units or context-backstop trigger, so inline. R1 adds `HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED`, exact true/false validation/defaultfalse and `humanDecisions.customerInboundEnabled`; snapshot condition is RESTOCK OR customer capture, after unchanged HMAC checks. This prerequisite alone does not persist or wire capture. R2/R3 follow separate owner commit gates. No edits to real .env, migration execution or backend. Rollback R1 flag/gate/tests/docs independently; R2 wiring separately. Skills read: nestjs-best-practices and nestjs-patterns; follow constructor injection, thin controller, explicit provider tokens and request-level security tests.
