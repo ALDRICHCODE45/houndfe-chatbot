@@ -18,7 +18,7 @@ S5 — Recovery: when an outstanding key exists with the same fingerprint, read 
 ## Tasks
 
 T1 [S1,S2,S3,S4,S5] route=worker; status=done (focused 151/151; chatbot slices 129 suites/3968 tests; scoped eslint clean; tsc only the 9 known test/ errors); commit=d0c3031; align the T6 client with the final contract and switch MinimalOrderService.place() to createCheckout behind the switch, with status-based recovery and contract error mapping.
-T2 [S2] route=inline; status=in_progress (RED 11 failures → GREEN config+preflight 373/373; independent verify mv7ip15w-o-qm2x running); commit=cf073bb; config + preflight + docs (docs/minimal-order-placement.md, docs/minimal-shipping.md); independent verification.
+T2 [S2] route=inline; status=done (L3 S5 FAIL → L4 fix, re-verify S1–S5 PASS); commit=cf073bb; config + preflight + docs (docs/minimal-order-placement.md, docs/minimal-shipping.md); independent verification.
 
 ## Log
 

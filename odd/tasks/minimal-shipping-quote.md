@@ -27,7 +27,7 @@ T3 [S1,S2] route=worker mv7bl7mk-d-aaud; status=done (L11); minimal shipping ser
 T4 [S1,S4,S6,S7] route=worker mv7bub9s-e-qch0; status=done (L12); approval wiring: create shipping_approval handoff from the minimal draft, minimal pin verification + CAS decision write through commitMinimalCart, dispatcher branch for minimal senders with a deterministic customer message; legacy path regression-guarded; commit=pending.
 T5 [S1,S2,S4] route=worker mv7cdrj2-g-fjld; status=done (L14); order integration: shipping in MinimalOrderSnapshot/canonical binding/summary (freight + total, or "envío cubierto por su compra"), CreateSaleInput.shipping + freight-inclusive expectedTotalCents in the fingerprinted payload, minimal revalidation before placing; single consent (order SÍ) replaces the legacy offer/acceptance pair; commit=pending.
 T6 [S5] route=worker mv7bbzg5-a-vzi5; status=done (L8); backend client createCheckout() pinned to the agreed /chatbot-api/checkouts shape with mocked contract tests; no live calls until the backend lands; commit=pending.
-T7 [S5] route=worker mv7cnhnl-i-ec5r + independent verify; status=implemented, verify pending; default-off MINIMAL_CATALOG_SHIPPING_ENABLED gate, docs, independent verification; commit=pending.
+T7 [S5] route=worker mv7cnhnl-i-ec5r + independent verify; status=done (L16 FAIL S6 → L17 fix → L18 PASS); default-off MINIMAL_CATALOG_SHIPPING_ENABLED gate, docs, independent verification; commit=on branch (see git log).
 
 ## Log
 
