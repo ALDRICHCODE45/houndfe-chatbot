@@ -88,7 +88,7 @@ Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confi
 ## Not in this slice
 
 - Shipping quotes, charges and approval are a separate default-off capability: [minimal shipping](minimal-shipping.md).
-- Customer and address creation (backend proposal pending owner decision).
+- Customer and address creation without the atomic checkout switch. With the switch on, new customers and new addresses are created by the atomic checkout together with the order; see [atomic checkout switch](#atomic-checkout-switch).
 - Order cancellation from the minimal route.
 
 ## Check
