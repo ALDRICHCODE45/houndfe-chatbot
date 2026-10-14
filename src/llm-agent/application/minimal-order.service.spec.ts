@@ -65,7 +65,12 @@ const unique = (address = savedAddress()): CustomerCheckoutContext => ({
 });
 
 function setup(
-  options: { enabled?: boolean; cashier?: string; shipping?: boolean } = {},
+  options: {
+    enabled?: boolean;
+    cashier?: string;
+    shipping?: boolean;
+    atomic?: unknown;
+  } = {},
 ) {
   const store = new InMemoryConversationStore();
   let unitPrice = 1500;
@@ -118,6 +123,8 @@ function setup(
         discountCents: 0,
       }),
     ),
+    createCheckout: jest.fn(),
+    getCheckoutStatus: jest.fn(),
     getPaymentDetails: jest.fn(() =>
       Promise.resolve({
         id: 'pd',
@@ -134,6 +141,14 @@ function setup(
     cancelSale: jest.fn(),
     updateDelivery: jest.fn(),
   };
+  api.createCheckout.mockImplementation(async () => ({
+    status: 'created',
+    sale: await api.createSale.getMockImplementation()!(),
+  }));
+  api.getCheckoutStatus.mockResolvedValue({
+    status: 'not_observed',
+    checkout: null,
+  });
   const client = api as unknown as ChatbotApiClient;
   const config = {
     get: (key: string) => {
@@ -141,6 +156,7 @@ function setup(
         return {
           orderEnabled: options.enabled !== false,
           shippingEnabled: options.shipping === true,
+          atomicCheckoutEnabled: options.atomic,
         };
       if (key === 'chatbotApi.cashierUserId') return options.cashier ?? CASHIER;
       return undefined;
@@ -238,6 +254,262 @@ async function shippingRecord(
   );
   return shipping;
 }
+
+describe('atomic checkout order S1–S5', () => {
+  async function ready(shipping = false) {
+    const h = setup({ atomic: true, shipping });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    if (shipping) await shippingRecord(h);
+    await offerOrder(h);
+    return h;
+  }
+
+  it('S2/S3/S4 sends trusted identity, saved snapshot and exact fingerprint', async () => {
+    const h = await ready(true);
+    h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
+    expect((await yes(h))?.reply).toBe(MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY);
+    const [payload, key] = h.api.createCheckout.mock.calls[0] as unknown as [
+      Record<string, unknown>,
+      string,
+    ];
+    expect(payload).toEqual({
+      phoneCountryCode: '52',
+      phone: '5550001111',
+      customer: { mode: 'existing', customerId: CUSTOMER },
+      deliveryAddress: {
+        mode: 'existing',
+        addressId: ADDRESS,
+        expectedVersion: savedAddress().version,
+      },
+      sale: {
+        cashierUserId: CASHIER,
+        expectedTotalCents: 8000,
+        shipping: {
+          chargeCents: 5000,
+          approvalId: 'approval-1',
+          quoteId: 'quote-1',
+        },
+        items: [
+          {
+            productId: PRODUCT,
+            variantId: null,
+            productName: 'Ibuprofeno',
+            variantName: null,
+            quantity: 2,
+            unitPriceCents: 1500,
+          },
+        ],
+      },
+    });
+    expect(await h.minimalCart()).toMatchObject({
+      idempotencyKey: key,
+      idempotencyAttempts: 1,
+      idempotencyFingerprint: createHash('sha256')
+        .update(JSON.stringify(payload))
+        .digest('hex'),
+    });
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.getCheckoutStatus).not.toHaveBeenCalled();
+  });
+
+  it('S3/S4 approved free shipping omits freight in checkout', async () => {
+    const h = setup({ atomic: true, shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    const raw = await h.minimalCart();
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 60000 }],
+        idempotencyKey: '',
+        expectedTotalCents: 120000,
+      },
+      new Date().toISOString(),
+    );
+    h.setPrice(60000);
+    await shippingRecord(h, { totalCreditCents: 24000, customerPaysCents: 0 });
+    await offerOrder(h);
+    expect((await yes(h))?.reply).toContain('envío cubierto por su compra');
+    const payload = (
+      h.api.createCheckout.mock.calls[0] as unknown as [
+        { sale: Record<string, unknown> },
+      ]
+    )[0];
+    expect(payload.sale).toMatchObject({ expectedTotalCents: 120000 });
+    expect(payload.sale).not.toHaveProperty('shipping');
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+
+  it.each([null, {}, { sale: { saleId: SALE, totalCents: '3000' } }])(
+    'S4 malformed checkout success %# retains lock',
+    async (body) => {
+      const h = await ready();
+      h.api.createCheckout.mockResolvedValueOnce(body);
+      expect((await yes(h))?.reply).toBe(MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY);
+      expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 1 });
+      expect(
+        await h.cart.setItem(
+          SENDER,
+          { productId: PRODUCT, quantity: 1 },
+          new Set([PRODUCT]),
+        ),
+      ).toEqual({ ok: false, error: 'order_unresolved' });
+    },
+  );
+
+  it('S4 changed checkout fingerprint holds without status or POST', async () => {
+    const h = await ready();
+    h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
+    await yes(h);
+    h.api.getCustomerCheckoutContext.mockResolvedValue(
+      unique(savedAddress({ version: '2026-10-02T00:00:00.000Z' })),
+    );
+    await confirmSavedDelivery(h);
+    await offerOrder(h, 'wamid.changed1');
+    expect((await yes(h, 'wamid.changed2'))?.reply).toBe(
+      MINIMAL_ORDER_HELD_REPLY,
+    );
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(h.api.getCheckoutStatus).not.toHaveBeenCalled();
+    expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 1 });
+  });
+
+  it.each([false, undefined, 'true'])(
+    'S2 gate %s preserves legacy path',
+    async (atomic) => {
+      const h = setup({ atomic });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await offerOrder(h);
+      await yes(h);
+      expect(h.api.createSale).toHaveBeenCalledTimes(1);
+      expect(h.api.createCheckout).not.toHaveBeenCalled();
+      expect(h.api.getCheckoutStatus).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [409, 'IDEMPOTENCY_KEY_IN_FLIGHT'],
+    [409, 'IDEMPOTENCY_KEY_CONFLICT'],
+    [503, 'CHECKOUT_RETRY_REQUIRED'],
+    [500, 'CHECKOUT_CREATE_FAILED'],
+    [408, null],
+    [429, null],
+    [502, null],
+    [500, 'PROMO_RE_QUOTE'],
+    [null, null],
+  ])('S4 uncertain %s %s retains key', async (status, code) => {
+    const h = await ready();
+    h.api.createCheckout.mockRejectedValueOnce(
+      new ChatbotApiError('raw secret', status, undefined, code),
+    );
+    expect((await yes(h))?.reply).toBe(MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY);
+    expect(await h.minimalCart()).toMatchObject({
+      idempotencyAttempts: 1,
+      idempotencyKey: expect.stringMatching(UUID) as unknown,
+    });
+  });
+
+  it.each([
+    'ADDRESS_VERSION_CONFLICT',
+    'PRICE_OUT_OF_DATE',
+    'PROMO_RE_QUOTE',
+    'STOCK_INSUFFICIENT_AT_CONFIRM',
+    'SHIPPING_APPROVAL_ALREADY_USED',
+    'SHIPPING_CHARGE_UNAVAILABLE',
+    'CUSTOMER_PHONE_AMBIGUOUS',
+    'CUSTOMER_NOT_FOUND',
+    'SHIPPING_ADDRESS_NOT_FOUND',
+    'CASHIER_NOT_FOUND',
+    'INVALID_CHECKOUT_REQUEST',
+    'INVALID_IDEMPOTENCY_KEY',
+    'TYPED_RULE',
+  ])('S4 rejection %s rotates first but keeps later', async (code) => {
+    const h = await ready();
+    const status = code.startsWith('INVALID_')
+      ? 400
+      : code.endsWith('_NOT_FOUND')
+        ? 404
+        : code === 'TYPED_RULE'
+          ? 422
+          : 409;
+    const rejection = new ChatbotApiError(
+      'raw secret',
+      status,
+      undefined,
+      code,
+    );
+    h.api.createCheckout.mockRejectedValueOnce(rejection);
+    const reply = (await yes(h))?.reply;
+    expect(reply).not.toContain('raw secret');
+    if (code === 'ADDRESS_VERSION_CONFLICT')
+      expect(reply).toContain('confirme');
+    expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
+    await offerOrder(h, 'wamid.r1');
+    h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
+    await yes(h, 'wamid.r2');
+    const locked = await h.minimalCart();
+    await offerOrder(h, 'wamid.r3');
+    h.api.createCheckout.mockRejectedValueOnce(rejection);
+    expect((await yes(h, 'wamid.r4'))?.reply).toBe(
+      MINIMAL_ORDER_UNRESOLVED_REPLY,
+    );
+    expect(await h.minimalCart()).toMatchObject({
+      idempotencyKey: (locked as { idempotencyKey: string }).idempotencyKey,
+      idempotencyAttempts: 2,
+    });
+  });
+
+  it.each(['succeeded', 'not_observed', 'failure'])(
+    'S5 recovers %s before POST',
+    async (status) => {
+      const h = await ready();
+      h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
+      await yes(h);
+      const before = await h.minimalCart();
+      const [payload, key] = h.api.createCheckout.mock.calls[0] as unknown as [
+        unknown,
+        string,
+      ];
+      if (status === 'failure')
+        h.api.getCheckoutStatus.mockRejectedValueOnce(
+          new Error('status unavailable'),
+        );
+      if (status === 'succeeded')
+        h.api.getCheckoutStatus.mockResolvedValueOnce({
+          status,
+          checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+        });
+      await offerOrder(h, 'wamid.status1');
+      const reply = (await yes(h, 'wamid.status2'))?.reply;
+      expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(key);
+      if (status === 'failure') {
+        expect(reply).toBe(MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY);
+        expect(await h.minimalCart()).toEqual(before);
+        expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+      } else {
+        expect(reply).toContain('B-0042');
+        expect(reply).toContain('CLABE');
+        expect(await h.minimalCart()).toMatchObject({
+          items: [],
+          placedSale: { saleId: SALE },
+        });
+        expect(h.api.createCheckout).toHaveBeenCalledTimes(
+          status === 'succeeded' ? 1 : 2,
+        );
+        if (status === 'not_observed') {
+          expect(h.api.createCheckout.mock.calls[1]).toEqual([payload, key]);
+          expect(
+            h.api.getCheckoutStatus.mock.invocationCallOrder[0],
+          ).toBeLessThan(h.api.createCheckout.mock.invocationCallOrder[1]);
+        }
+      }
+      expect(h.api.createSale).not.toHaveBeenCalled();
+    },
+  );
+});
 
 describe('minimal shipping order safety', () => {
   it('S1/S4: sends approved freight in the exact fingerprinted payload', async () => {

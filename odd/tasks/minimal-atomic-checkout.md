@@ -23,3 +23,4 @@ T2 [S2] route=inline/worker; status=pending; config + preflight + docs (docs/min
 ## Log
 
 L1 — Owner request, verbatim: "Si, adelante" (see S1).
+L2 — Backend update (session 01a135e7, no code/delivery change): a native review over exact target 2ada5dd7 (17 paths, 3663 lines: checkout-context + atomic checkout) was started (review-32c8c59150530d8c, 4 lenses) after host consent; the reviewer group capture was CANCELLED by a 180 s timeout without usable results; one STATUS shows reviewing/collect with 4 slots pending — NOT approved, no ACK. Backend did not retry/reset/recover; HEAD 3e85510 clean, PG fixture stopped. Review blocked on owner disposition in the backend session. C1 earlier review approved/burned; C2 still has no native approval. Does not block this chatbot slice (no live calls).

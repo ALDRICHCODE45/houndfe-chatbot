@@ -40,7 +40,11 @@ const call = (name: string, input: unknown = {}) =>
 const say = (text = 'Listo.') => step([{ type: 'text', text }], 'stop');
 
 function setup(
-  options: { order?: 'on' | 'off' | 'absent'; shipping?: boolean } = {},
+  options: {
+    order?: 'on' | 'off' | 'absent';
+    shipping?: boolean;
+    atomic?: boolean;
+  } = {},
 ) {
   const mode = options.order ?? 'on';
   const store = new InMemoryConversationStore();
@@ -116,6 +120,7 @@ function setup(
         discountCents: 0,
       }),
     ),
+    createCheckout: jest.fn(),
     getPaymentDetails: jest.fn(() =>
       Promise.resolve({
         id: 'pd',
@@ -129,6 +134,10 @@ function setup(
     ),
     upsertCustomer: jest.fn(),
   };
+  api.createCheckout.mockImplementation(async () => ({
+    status: 'created',
+    sale: await api.createSale.getMockImplementation()!(),
+  }));
   const client = api as unknown as ChatbotApiClient;
   const config = {
     get: (key: string) => {
@@ -138,6 +147,7 @@ function setup(
           allowedSenders: [SENDER],
           orderEnabled: mode === 'on',
           shippingEnabled: options.shipping === true,
+          atomicCheckoutEnabled: options.atomic === true,
         };
       if (key === 'chatbotApi.cashierUserId') return CASHIER;
       return { model: 'm', maxSteps: 5, historyTurns: 12 };
@@ -252,6 +262,46 @@ function setup(
 }
 
 describe('minimal order placement through the SDK route', () => {
+  it('atomic S2/S3/S4: armed summary consent creates checkout, not legacy sale', async () => {
+    const h = setup({ atomic: true, shipping: true });
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say('Pedido creado inventado')],
+      EVENT('wamid.atomic1'),
+    );
+    expect((offer as { reply: string }).reply).toContain(
+      'Total a pagar: $80.00 MXN',
+    );
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    (offer as { onSent: () => void }).onSent();
+    const calls = h.seen.length;
+    const placed = await h.turn(
+      'SÍ',
+      [say('inventado')],
+      EVENT('wamid.atomic2'),
+    );
+    expect(h.seen).toHaveLength(calls);
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({
+      phoneCountryCode: '52',
+      phone: '5550001111',
+      customer: { mode: 'existing', customerId: CUSTOMER },
+      deliveryAddress: {
+        mode: 'existing',
+        addressId: ADDRESS,
+        expectedVersion: '2026-10-01T00:00:00.000Z',
+      },
+      sale: { expectedTotalCents: 8000, shipping: { chargeCents: 5000 } },
+    });
+    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('CLABE');
+    await h.turn('SÍ', [say()], EVENT('wamid.atomic3'));
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
   it('S1/S4: prepareOrder plus one SÍ creates the approved charged order', async () => {
     const h = setup({ shipping: true });
     await h.ready();

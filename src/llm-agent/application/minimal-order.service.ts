@@ -9,7 +9,12 @@ import type {
   BotSaleResponse,
   CreateSaleInput,
 } from '../../chatbot-api/domain/dtos/sales.dto';
+import {
+  CreateCheckoutInputSchema,
+  type CreateCheckoutInput,
+} from '../../chatbot-api/domain/dtos/checkout.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
   CONVERSATION_STORE,
   type ConversationStore,
@@ -90,15 +95,20 @@ type FreshOrder =
  * (the key must not be reused for a different payload); `keep` when the outcome
  * is unknown or still in flight, so a retry replays the same key.
  */
-function classifyFailure(error: unknown): 'rotate' | 'keep' {
+function classifyFailure(error: unknown, atomic = false): 'rotate' | 'keep' {
   if (!(error instanceof ChatbotApiError)) return 'keep';
+  if (atomic && error.errorCode === 'CHECKOUT_RETRY_REQUIRED') return 'keep';
   if (error.errorCode !== null && KEEPING_ERROR_CODES.has(error.errorCode)) {
     return 'keep';
   }
-  if (error.errorCode !== null && ROTATING_ERROR_CODES.has(error.errorCode)) {
+  const status = error.statusCode;
+  if (
+    !atomic &&
+    error.errorCode !== null &&
+    ROTATING_ERROR_CODES.has(error.errorCode)
+  ) {
     return 'rotate';
   }
-  const status = error.statusCode;
   return status !== null &&
     status >= 400 &&
     status < 500 &&
@@ -121,7 +131,7 @@ function isSale(value: unknown): value is BotSaleResponse {
 }
 
 /** Deterministic digest of the exact payload sent under one key. */
-function fingerprint(payload: CreateSaleInput): string {
+function fingerprint(payload: CreateSaleInput | CreateCheckoutInput): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
@@ -155,6 +165,7 @@ export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
   private readonly orderEnabled: boolean;
   private readonly shippingEnabled: boolean;
+  private readonly atomicCheckoutEnabled: boolean;
   private readonly cashierUserId: string;
 
   constructor(
@@ -170,6 +181,9 @@ export class MinimalOrderService {
     this.shippingEnabled =
       config.get<{ shippingEnabled?: boolean }>('minimalCatalogAgent')
         ?.shippingEnabled === true;
+    this.atomicCheckoutEnabled =
+      config.get<{ atomicCheckoutEnabled?: boolean }>('minimalCatalogAgent')
+        ?.atomicCheckoutEnabled === true;
     const cashier = config.get<string>('chatbotApi.cashierUserId');
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
   }
@@ -348,7 +362,7 @@ export class MinimalOrderService {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     // `keyed` is the parsed cart; `stored` is the exact value now in the slot,
     // the only valid CAS expectation (parsed objects are not plain data).
-    const payload: CreateSaleInput = {
+    const legacyPayload: CreateSaleInput = {
       cashierUserId: this.cashierUserId,
       customerId: snapshot.customerId,
       shippingAddressId: snapshot.shippingAddressId,
@@ -372,9 +386,35 @@ export class MinimalOrderService {
         unitPriceCents: item.unitPriceCents,
       })),
     };
-    const digest = fingerprint(payload);
+    let checkoutPayload: CreateCheckoutInput | undefined;
+    if (this.atomicCheckoutEnabled) {
+      const phone = parseMexicanWhatsAppPhone(senderId);
+      const address = snapshot.draft.address;
+      if (phone === null || address.kind !== 'saved') return unverified;
+      const parsed = CreateCheckoutInputSchema.safeParse({
+        ...phone,
+        customer: { mode: 'existing', customerId: snapshot.customerId },
+        deliveryAddress: {
+          mode: 'existing',
+          addressId: snapshot.shippingAddressId,
+          expectedVersion: address.snapshot.version,
+        },
+        sale: {
+          cashierUserId: legacyPayload.cashierUserId,
+          items: legacyPayload.items,
+          expectedTotalCents: legacyPayload.expectedTotalCents,
+          ...(legacyPayload.shipping
+            ? { shipping: legacyPayload.shipping }
+            : {}),
+        },
+      });
+      if (!parsed.success) return unverified;
+      checkoutPayload = parsed.data;
+    }
+    const digest = fingerprint(checkoutPayload ?? legacyPayload);
     let keyed: MinimalCartState;
     let stored: unknown;
+    let recoveredSale: BotSaleResponse | undefined;
     try {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
@@ -398,27 +438,58 @@ export class MinimalOrderService {
           idempotencyAttempts: 1,
         });
       } else if (cart.idempotencyFingerprint === digest) {
+        if (checkoutPayload !== undefined) {
+          try {
+            const status = await this.api.getCheckoutStatus(
+              cart.idempotencyKey,
+            );
+            if (
+              status.status === 'succeeded' &&
+              isSale(status.checkout?.sale)
+            ) {
+              recoveredSale = status.checkout.sale;
+            } else if (status.status !== 'not_observed') {
+              return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
+            }
+          } catch {
+            return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
+          }
+        }
         keyed = structuredClone({
           ...cart,
-          // A legacy key without a counter already had one attempt.
-          idempotencyAttempts: (cart.idempotencyAttempts ?? 1) + 1,
+          // Status reads are not POST attempts. A legacy key had one attempt.
+          idempotencyAttempts:
+            (cart.idempotencyAttempts ?? 1) + (recoveredSale ? 0 : 1),
         });
       } else {
         // An unresolved attempt carried another payload: reusing its key could
         // be rejected as a conflict, rotating could duplicate it. Hold.
         return MINIMAL_ORDER_HELD_REPLY;
       }
-      if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
-      stored = keyed;
+      if (recoveredSale === undefined) {
+        if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
+        stored = keyed;
+      } else {
+        stored = raw;
+      }
     } catch {
       return unverified;
     }
 
     let sale: unknown;
     try {
-      sale = await this.api.createSale(payload, keyed.idempotencyKey);
+      sale =
+        recoveredSale ??
+        (checkoutPayload === undefined
+          ? await this.api.createSale(legacyPayload, keyed.idempotencyKey)
+          : (
+              await this.api.createCheckout(
+                checkoutPayload,
+                keyed.idempotencyKey,
+              )
+            )?.sale);
     } catch (error) {
-      if (classifyFailure(error) === 'keep') {
+      if (classifyFailure(error, this.atomicCheckoutEnabled) === 'keep') {
         return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
       }
       // A definite rejection only proves THIS call created nothing; an earlier
@@ -430,6 +501,13 @@ export class MinimalOrderService {
       delete unkeyed.idempotencyFingerprint;
       delete unkeyed.idempotencyAttempts;
       await this.commitCart(senderId, stored, unkeyed);
+      if (
+        this.atomicCheckoutEnabled &&
+        error instanceof ChatbotApiError &&
+        error.errorCode === 'ADDRESS_VERSION_CONFLICT'
+      ) {
+        return 'Su dirección guardada cambió. Seleccione y confirme nuevamente sus datos de entrega. No se creó ningún pedido.';
+      }
       return MINIMAL_ORDER_REJECTED_REPLY;
     }
     if (!isSale(sale)) return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;

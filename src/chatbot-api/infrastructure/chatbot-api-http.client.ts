@@ -234,25 +234,22 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return context;
   }
 
-  /** Atomic checkout seam only; not wired to a live order flow yet. */
+  /** Atomic checkout POST is single-attempt; recovery is a separate GET. */
   async createCheckout(
     dto: CreateCheckoutInput,
     idempotencyKey: string,
   ): Promise<CheckoutResponse> {
-    this.validateCheckoutKey(idempotencyKey);
+    idempotencyKey = this.validateCheckoutKey(idempotencyKey);
     const parsed = CreateCheckoutInputSchema.safeParse(dto);
     if (!parsed.success) {
       throw new ChatbotApiError(
         'Invalid atomic checkout input',
         null,
         undefined,
-        'INVALID_REQUEST',
+        'INVALID_CHECKOUT_REQUEST',
       );
     }
     const data = parsed.data;
-    if (data.sale.shipping?.quoteId == null && data.sale.shipping) {
-      delete data.sale.shipping.quoteId;
-    }
     const response = await this.requestWithResponse<unknown>({
       method: 'POST',
       url: '/chatbot-api/checkouts',
@@ -273,7 +270,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
 
   /** not_observed is not rollback evidence and never permits a fresh key. */
   async getCheckoutStatus(idempotencyKey: string): Promise<CheckoutStatus> {
-    this.validateCheckoutKey(idempotencyKey);
+    idempotencyKey = this.validateCheckoutKey(idempotencyKey);
     const response = await this.requestWithResponse<unknown>(
       {
         method: 'GET',
@@ -294,8 +291,9 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return status;
   }
 
-  private validateCheckoutKey(key: string): void {
-    if (!CheckoutIdempotencyKeySchema.safeParse(key).success) {
+  private validateCheckoutKey(key: string): string {
+    const parsed = CheckoutIdempotencyKeySchema.safeParse(key);
+    if (!parsed.success) {
       throw new ChatbotApiError(
         'Invalid checkout idempotency key',
         null,
@@ -303,6 +301,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
         'INVALID_IDEMPOTENCY_KEY',
       );
     }
+    return parsed.data;
   }
 
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse> {
@@ -872,7 +871,11 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           continue;
         }
 
-        throw this.mapError(error);
+        throw this.mapError(
+          error,
+          config.url === '/chatbot-api/checkouts' ||
+            config.url === '/chatbot-api/checkouts/status',
+        );
       }
     }
 
@@ -911,7 +914,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return INITIAL_BACKOFF_MS * 2 ** (attempt - 1);
   }
 
-  private mapError(error: unknown): Error {
+  private mapError(error: unknown, checkout = false): Error {
     const maybeAxiosError = error as {
       response?: {
         status?: number;
@@ -925,7 +928,14 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     // Q3 errorCode passthrough: populate `errorCode` from `responseBody.error`
     // (verbatim, no transformation). `null` when the body is missing, not
     // JSON, or has no string `error` field (ADR-1 / ADR-2).
-    const errorCode = extractErrorCode(responseBody);
+    const code =
+      typeof responseBody === 'object' && responseBody !== null
+        ? (responseBody as { code?: unknown }).code
+        : null;
+    const errorCode =
+      checkout && typeof code === 'string' && code.length > 0
+        ? code
+        : extractErrorCode(responseBody);
 
     switch (status) {
       case 401:

@@ -1,9 +1,16 @@
 import { z } from 'zod';
 import { isCheckoutUuid } from './checkout-context.dto';
-import { BotSaleShippingInputSchema } from './sales.dto';
 
 const uuid = z.string().refine(isCheckoutUuid, 'Invalid checkout UUID');
-const cents = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const cents = z.number().int().min(0).max(2147483647);
+const identifier = z.string().trim().min(1).max(200);
+const shipping = z
+  .object({
+    chargeCents: z.number().int().min(1).max(2147483647),
+    approvalId: identifier,
+    quoteId: identifier.optional(),
+  })
+  .strict();
 const instant = z.string().refine((value) => {
   try {
     return new Date(value).toISOString() === value;
@@ -72,7 +79,7 @@ export const CreateCheckoutInputSchema = z
           )
           .min(1),
         expectedTotalCents: cents,
-        shipping: BotSaleShippingInputSchema.strict().optional(),
+        shipping: shipping.optional(),
       })
       .strict()
       .refine((sale) => !sale.shipping || sale.expectedTotalCents > 0, {
@@ -87,9 +94,10 @@ export type CreateCheckoutInput = z.infer<typeof CreateCheckoutInputSchema>;
 /** Header-only key; never put it into URLs, messages or query parameters. */
 export const CheckoutIdempotencyKeySchema = z
   .string()
+  .trim()
   .min(1)
   .max(200)
-  .regex(/^[\x21-\x7e]+$/);
+  .regex(/^[\x20-\x7e]+$/);
 
 const saleResponse = z
   .object({
@@ -113,15 +121,18 @@ const checkoutResponse = z
     status: z.literal('created'),
     customer: z
       .object({
-        // L16 leaves resolution vocabulary opaque; do not infer business state.
-        resolution: z.string().min(1),
+        resolution: z.enum(['created', 'existing']),
         customerId: uuid,
         firstName: z.string(),
         lastName: z.string().nullable(),
       })
       .strict(),
     address: z
-      .object({ resolution: z.string().min(1), id: uuid, version: instant })
+      .object({
+        resolution: z.enum(['created', 'existing']),
+        id: uuid,
+        version: instant,
+      })
       .strict(),
     sale: saleResponse,
   })

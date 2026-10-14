@@ -1,4 +1,5 @@
 import {
+  CheckoutIdempotencyKeySchema,
   CreateCheckoutInputSchema,
   normalizeCheckoutResponse,
   normalizeCheckoutStatus,
@@ -53,6 +54,80 @@ export const checkoutResponse = {
 };
 
 describe('atomic checkout DTO', () => {
+  it('S1 trims header and shipping identifiers', () => {
+    expect(CheckoutIdempotencyKeySchema.parse(' key ')).toBe('key');
+    const parsed = CreateCheckoutInputSchema.parse({
+      ...checkoutInput,
+      sale: {
+        ...checkoutInput.sale,
+        shipping: {
+          chargeCents: 1,
+          approvalId: ' approval ',
+          quoteId: ' quote ',
+        },
+      },
+    });
+    expect(parsed.sale.shipping).toEqual({
+      chargeCents: 1,
+      approvalId: 'approval',
+      quoteId: 'quote',
+    });
+  });
+  it.each([0, -1, 1.5, 2147483648])(
+    'S1 rejects shipping charge %s',
+    (chargeCents) => {
+      expect(
+        CreateCheckoutInputSchema.safeParse({
+          ...checkoutInput,
+          sale: {
+            ...checkoutInput.sale,
+            shipping: { chargeCents, approvalId: 'a' },
+          },
+        }).success,
+      ).toBe(false);
+    },
+  );
+  it.each([undefined, -1, 1.5, 2147483648])(
+    'S1 rejects total %s',
+    (expectedTotalCents) => {
+      expect(
+        CreateCheckoutInputSchema.safeParse({
+          ...checkoutInput,
+          sale: { ...checkoutInput.sale, expectedTotalCents },
+        }).success,
+      ).toBe(false);
+    },
+  );
+  it.each(['approvalId', 'quoteId'])(
+    'S1 caps and rejects blank %s',
+    (field) => {
+      for (const value of [' ', 'x'.repeat(201), null]) {
+        expect(
+          CreateCheckoutInputSchema.safeParse({
+            ...checkoutInput,
+            sale: {
+              ...checkoutInput.sale,
+              shipping: { ...checkoutInput.sale.shipping, [field]: value },
+            },
+          }).success,
+        ).toBe(false);
+      }
+    },
+  );
+  it('S1 restricts both resolution vocabularies', () => {
+    expect(
+      normalizeCheckoutResponse({
+        ...checkoutResponse,
+        customer: { ...checkoutResponse.customer, resolution: 'unknown' },
+      }),
+    ).toBeNull();
+    expect(
+      normalizeCheckoutResponse({
+        ...checkoutResponse,
+        address: { ...checkoutResponse.address, resolution: 'unknown' },
+      }),
+    ).toBeNull();
+  });
   it('accepts both strict modes and zero total without shipping', () => {
     expect(CreateCheckoutInputSchema.parse(checkoutInput)).toEqual(
       checkoutInput,
