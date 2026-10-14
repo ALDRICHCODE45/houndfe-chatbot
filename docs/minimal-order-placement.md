@@ -22,14 +22,14 @@ The store must implement `commitMinimalCart` and `commitMinimalCheckoutDraft`.
 - A **saved** address, selected and confirmed through the checkout flow (`docs/minimal-checkout-coordinator.md`).
 - A non-empty cart whose promotions are fully evaluated.
 
-New customers and new addresses get a clear "not yet" reply. This route never calls customer upsert or address mutations.
+With the [atomic checkout switch](#atomic-checkout-switch) on, new customers and confirmed new addresses can also order (see there). With it off, they get a clear "not yet" reply. This route never calls customer upsert or separate address mutations.
 
 ## Flow
 
 1. The model calls `prepareOrder` (no arguments).
 2. The server re-checks everything fresh:
    - the confirmed delivery data still equals the current draft, byte for byte;
-   - the saved address still has the same `version` upstream;
+   - a saved address still has the same `version` upstream (a new address is bound to its exact confirmed fields instead);
    - prices and stock come from a new cart evaluation.
 3. The server replies with its own summary: items, product total, delivery address and "shipping not included" when shipping is off. With [minimal shipping](minimal-shipping.md) enabled, a fresh approved quote is required and the summary includes freight and total, or "envío cubierto por su compra". It is armed only after the transport sends it.
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
@@ -64,7 +64,10 @@ The lock ends only with a confirmed sale, or with a definite rejection of the fi
 
 With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else is off), `place()` sends one `POST /chatbot-api/checkouts` instead of `POST /chatbot-api/sales`. With it off, the legacy path is unchanged. Launch preflight requires it explicitly `false`: the backend endpoint is committed in `houndfe-backend` but not deployed.
 
-- Same scope as above: customer mode `existing` and deliveryAddress mode `existing` with the confirmed snapshot `version` as `expectedVersion`. Phone comes from the trusted WhatsApp sender. New customers/addresses are still out of scope.
+- Saved address: customer mode `existing` and deliveryAddress mode `existing` with the confirmed snapshot `version` as `expectedVersion`. Phone comes from the trusted WhatsApp sender.
+- **New customer or new address:** customer mode `createIfAbsent` (`firstName`, plus `lastName` when known) and deliveryAddress mode `newSaved` with the confirmed fields. Absent optional fields are omitted, never sent as `null`. The backend creates the customer (or reuses the unique one for that phone without changing it) and saves the address **only in the same transaction as the sale**; a rejected or rolled-back checkout saves nothing. The summary adds "Guardaremos esta dirección con su pedido."
+- **State:** the backend accepts only its exact list of 32 state names. The confirmed free text is mapped deterministically (case, accents and spacing ignored, plus fixed aliases such as `CDMX`, `DF`, `Edomex`). Anything else, including a bare `México`, is never guessed: the delivery confirmation is revoked and the customer is asked for a valid state and to confirm again.
+- `CUSTOMER_PHONE_AMBIGUOUS` (several customers share the phone) creates nothing and asks the customer to contact the store.
 - The fingerprint covers the exact checkout payload (including any approved shipping charge); key, attempts counter and the S7 lock work as above, with one POST per consent.
 - **Recovery:** before replaying an outstanding key with the same fingerprint, the server reads `GET /chatbot-api/checkouts/status` for that key (a status read is not counted as an attempt):
 

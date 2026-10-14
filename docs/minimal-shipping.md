@@ -19,8 +19,8 @@ Restart after changing gates. There is still one `ShippingModule.forRoot()` comp
 
 ## Customer flow
 
-1. Build a verified cart, select a saved address, and confirm delivery data through the [checkout coordinator](minimal-checkout-coordinator.md). New customers/addresses are not supported for ordering here.
-2. Ask for home delivery. The model calls `requestShippingQuote({})`; the server uses only the trusted sender and confirmed saved-address snapshot. Arguments containing identity or amounts are rejected.
+1. Build a verified cart, select a saved address or give a new one, and confirm delivery data through the [checkout coordinator](minimal-checkout-coordinator.md). Ordering to a new address requires the [atomic checkout switch](minimal-order-placement.md#atomic-checkout-switch).
+2. Ask for home delivery. The model calls `requestShippingQuote({})`; the server uses only the trusted sender and the confirmed address: the saved-address snapshot, or the exact confirmed fields of a new address (editing any of them makes the quote stale). Arguments containing identity or amounts are rejected.
 3. The server quotes internally and requests operations approval. The immediate reply contains **no amounts**, and no order is created. The operations channel receives the approval digest. Pending requests do not issue duplicate quotes.
 4. An operations decision approves that exact, current quote. Only then does the application disclose the freight. The model never authors amounts, approvals or order claims.
 5. The customer requests the order summary (`prepareOrder`). Its server-owned summary includes freight and the freight-inclusive total, or **“envío cubierto por su compra”** when the credit covers shipping.
