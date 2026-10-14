@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { toMexicanState } from '../domain/mexican-state';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -38,6 +39,7 @@ import {
   type MinimalCartState,
 } from './minimal-cart.service';
 import {
+  MINIMAL_CHECKOUT_INVALID_STATE_REPLY,
   MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY,
   MINIMAL_CHECKOUT_RESELECT_REPLY,
   MinimalCheckoutService,
@@ -56,6 +58,7 @@ export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
     'Las promociones de su carrito requieren revisión del equipo antes de crear el pedido. No se creó ningún pedido.',
   delivery_unconfirmed:
     'Antes de crear el pedido necesito que confirme sus datos de entrega. No se creó ningún pedido.',
+  invalid_state: MINIMAL_CHECKOUT_INVALID_STATE_REPLY,
   new_address_unsupported:
     'Por ahora solo puedo crear pedidos para clientes registrados con una dirección guardada. No se creó ningún pedido.',
 };
@@ -63,6 +66,8 @@ export const MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY =
   'Antes de crear el pedido, solicite y confirme el envío con una cotización vigente aprobada por el equipo. No se creó ningún pedido.';
 export const MINIMAL_ORDER_CHANGED_REPLY =
   'Su pedido cambió desde el último resumen; no se creó ningún pedido. Revise el resumen actualizado:';
+export const MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY =
+  'No puedo identificar un registro único para su teléfono. Por favor comuníquese con la tienda para revisar su pedido.';
 export const MINIMAL_ORDER_REJECTED_REPLY =
   'No se pudo crear el pedido. Puede revisar su carrito y pedir de nuevo el resumen cuando quiera.';
 export const MINIMAL_ORDER_HELD_REPLY =
@@ -155,10 +160,10 @@ function sameCartLines(
 
 /**
  * Minimal-route order placement (minimal-order-placement T2). Creates ONE
- * ONLINE sale for a unique customer with a confirmed saved
- * address, only after a strict armed SÍ for the exact presented summary. It
- * never registers customers, mutates addresses, reserves stock outside the
- * sale, quotes shipping or takes payment. Default off.
+ * ONLINE sale only after a strict armed SÍ for the exact presented summary.
+ * Atomic checkout may create a customer and save a confirmed new address in
+ * that same transaction; legacy placement requires a unique saved address.
+ * No separate customer/address writes, stock reservation or payment. Default off.
  */
 @Injectable()
 export class MinimalOrderService {
@@ -338,7 +343,7 @@ export class MinimalOrderService {
       : { reply: MINIMAL_ORDER_AMBIGUOUS_REPLY };
   }
 
-  /** Fresh quote + exact confirmed draft + saved-address freshness. */
+  /** Fresh quote + exact confirmed draft + destination freshness. */
   private async freshOrder(senderId: string): Promise<FreshOrder> {
     try {
       const quote = await this.cart.view(senderId);
@@ -346,6 +351,7 @@ export class MinimalOrderService {
       const verdict = evaluateMinimalOrder({
         confirmedDraft,
         quote: quote.ok ? quote : null,
+        atomicCheckoutEnabled: this.atomicCheckoutEnabled,
       });
       if (!verdict.ok) {
         return {
@@ -454,15 +460,41 @@ export class MinimalOrderService {
     if (this.atomicCheckoutEnabled) {
       const phone = parseMexicanWhatsAppPhone(senderId);
       const address = snapshot.draft.address;
-      if (phone === null || address.kind !== 'saved') return unverified;
+      if (phone === null) return unverified;
+      const state =
+        address.kind === 'new' ? toMexicanState(address.fields.state) : null;
+      if (address.kind === 'new' && state === null)
+        return MINIMAL_CHECKOUT_INVALID_STATE_REPLY;
       const parsed = CreateCheckoutInputSchema.safeParse({
         ...phone,
-        customer: { mode: 'existing', customerId: snapshot.customerId },
-        deliveryAddress: {
-          mode: 'existing',
-          addressId: snapshot.shippingAddressId,
-          expectedVersion: address.snapshot.version,
-        },
+        customer:
+          address.kind === 'saved'
+            ? { mode: 'existing', customerId: snapshot.customerId }
+            : {
+                mode: 'createIfAbsent',
+                firstName: snapshot.draft.customer.firstName,
+                ...(snapshot.draft.customer.lastName === null
+                  ? {}
+                  : { lastName: snapshot.draft.customer.lastName }),
+              },
+        deliveryAddress:
+          address.kind === 'saved'
+            ? {
+                mode: 'existing',
+                addressId: snapshot.shippingAddressId,
+                expectedVersion: address.snapshot.version,
+              }
+            : {
+                mode: 'newSaved',
+                address: {
+                  ...Object.fromEntries(
+                    Object.entries(address.fields).filter(
+                      ([, value]) => value !== null,
+                    ),
+                  ),
+                  state,
+                },
+              },
         sale: {
           cashierUserId: legacyPayload.cashierUserId,
           items: legacyPayload.items,
@@ -534,13 +566,20 @@ export class MinimalOrderService {
       }
       // A definite rejection only proves THIS call created nothing; an earlier
       // uncertain call under the same key may have, so it is never rotated.
+      const ambiguousPhone =
+        this.atomicCheckoutEnabled &&
+        error instanceof ChatbotApiError &&
+        error.errorCode === 'CUSTOMER_PHONE_AMBIGUOUS';
       if ((keyed.idempotencyAttempts ?? 1) > 1) {
-        return MINIMAL_ORDER_UNRESOLVED_REPLY;
+        return ambiguousPhone
+          ? MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY
+          : MINIMAL_ORDER_UNRESOLVED_REPLY;
       }
       const unkeyed = structuredClone({ ...keyed, idempotencyKey: '' });
       delete unkeyed.idempotencyFingerprint;
       delete unkeyed.idempotencyAttempts;
       await this.commitCart(senderId, stored, unkeyed);
+      if (ambiguousPhone) return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
       if (
         this.atomicCheckoutEnabled &&
         error instanceof ChatbotApiError &&

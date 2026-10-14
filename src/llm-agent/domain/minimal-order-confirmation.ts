@@ -1,6 +1,6 @@
 /**
  * Minimal order confirmation — pure, instance-scoped consent for turning a
- * verified cart plus a locally confirmed saved-address draft into ONE backend
+ * verified cart plus a locally confirmed delivery draft into ONE backend
  * sale (minimal-order-placement T1).
  *
  * Data and consent only: no SDK/Nest/HTTP/store dependency and no sale call.
@@ -10,6 +10,7 @@
  * require `sameMinimalOrder` before creating the sale.
  */
 import { randomUUID } from 'node:crypto';
+import { toMexicanState } from './mexican-state';
 import type { MinimalCheckoutDraft } from '../../conversation/domain/minimal-checkout-draft';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { isAffirmative } from './minimal-checkout-confirmation';
@@ -42,7 +43,8 @@ export type MinimalOrderIneligibleReason =
   | 'empty_cart'
   | 'promotion_review'
   | 'delivery_unconfirmed'
-  | 'new_address_unsupported';
+  | 'new_address_unsupported'
+  | 'invalid_state';
 
 export interface MinimalOrderShipping {
   readonly classification: 'free' | 'charged';
@@ -53,7 +55,9 @@ export interface MinimalOrderShipping {
 
 /** Exact content the customer consents to; detached from every input. */
 export interface MinimalOrderSnapshot {
+  /** Empty for a new customer; new-address checkout resolves identity by phone. */
   readonly customerId: string;
+  /** Empty for new addresses, whose exact fields live in draft. */
   readonly shippingAddressId: string;
   readonly draft: MinimalCheckoutDraft;
   readonly items: readonly MinimalOrderLine[];
@@ -68,12 +72,14 @@ export type MinimalOrderEligibility =
 /**
  * Eligibility for this slice (S1/S2/S4): a verified, non-empty, fully
  * evaluated cart, and a draft that is still exactly the locally confirmed one
- * with a saved address of a unique customer. `confirmedDraft` must come from
+ * with a unique saved address, or a new address when atomic checkout is on.
+ * `confirmedDraft` must come from
  * `MinimalCheckoutConfirmation.confirmedDraft`, never from the bare status.
  */
 export function evaluateMinimalOrder(input: {
   readonly confirmedDraft: MinimalCheckoutDraft | null;
   readonly quote: MinimalOrderQuote | null;
+  readonly atomicCheckoutEnabled?: boolean;
 }): MinimalOrderEligibility {
   const { confirmedDraft, quote } = input;
   if (quote === null) return { ok: false, reason: 'cart_unverified' };
@@ -83,6 +89,24 @@ export function evaluateMinimalOrder(input: {
   }
   if (confirmedDraft === null) {
     return { ok: false, reason: 'delivery_unconfirmed' };
+  }
+  if (
+    confirmedDraft.address.kind === 'new' &&
+    input.atomicCheckoutEnabled === true
+  ) {
+    if (toMexicanState(confirmedDraft.address.fields.state) === null) {
+      return { ok: false, reason: 'invalid_state' };
+    }
+    return {
+      ok: true,
+      snapshot: structuredClone({
+        customerId: confirmedDraft.sourceCustomerId ?? '',
+        shippingAddressId: '',
+        draft: confirmedDraft,
+        items: quote.items.map((item) => ({ ...item })),
+        totalCents: quote.totalCents,
+      }),
+    };
   }
   if (
     confirmedDraft.address.kind !== 'saved' ||
@@ -146,7 +170,9 @@ const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 function deliveryLine(snapshot: MinimalOrderSnapshot): string {
   const draft = snapshot.draft;
   const address =
-    draft.address.kind === 'saved' ? draft.address.snapshot : null;
+    draft.address.kind === 'saved'
+      ? draft.address.snapshot
+      : draft.address.fields;
   const name = [draft.customer.firstName, draft.customer.lastName]
     .filter((part): part is string => typeof part === 'string' && part !== '')
     .join(' ');
@@ -176,6 +202,9 @@ export function renderMinimalOrderSummary(
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
     `Entrega a: ${deliveryLine(snapshot)}`,
+    ...(snapshot.draft.address.kind === 'new'
+      ? ['Guardaremos esta dirección con su pedido.']
+      : []),
     ...(snapshot.shipping === undefined
       ? [
           'El envío no está incluido en este total y se coordinará por separado.',

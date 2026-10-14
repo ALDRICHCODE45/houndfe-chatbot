@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { toMexicanState } from '../domain/mexican-state';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -29,6 +30,9 @@ import {
   type MinimalCheckoutBindingStatus,
   type MinimalCheckoutMissingField,
 } from '../domain/minimal-checkout-confirmation';
+
+export const MINIMAL_CHECKOUT_INVALID_STATE_REPLY =
+  'Indique un estado válido de México para su dirección de entrega; después deberá confirmar nuevamente sus datos de entrega.';
 
 export const MINIMAL_CHECKOUT_INCOMPLETE_REPLY =
   'Para mostrarle el resumen de entrega aún me falta:';
@@ -375,6 +379,13 @@ export class MinimalCheckoutService {
     const readiness = evaluateMinimalCheckoutReadiness(current.draft);
     if (!readiness.ready) {
       return { reply: minimalCheckoutIncompleteReply(readiness.missing) };
+    }
+    if (
+      current.draft.address.kind === 'new' &&
+      toMexicanState(current.draft.address.fields.state) === null
+    ) {
+      this.confirmation.revokeConfirmation(senderId);
+      return { reply: MINIMAL_CHECKOUT_INVALID_STATE_REPLY };
     }
     const revalidation = await this.revalidate(senderId, current.draft);
     if (revalidation !== 'ok') return revalidationReply(revalidation);

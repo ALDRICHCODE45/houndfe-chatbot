@@ -202,7 +202,7 @@ function setup(
         ...(event === undefined ? {} : { inboundEvent: event }),
       });
     },
-    ready: async () => {
+    ready: async (newCustomer = false) => {
       await store.create(SENDER, {
         lastMessageAt: '2026-10-10T00:00:00.000Z',
         data: {
@@ -244,9 +244,28 @@ function setup(
           },
         },
       });
-      const lookup = await checkout.lookup(SENDER, null);
-      if (!lookup.ok || lookup.status !== 'unique') throw new Error('lookup');
-      await checkout.selectAddress(SENDER, lookup.addresses[0].addressRef);
+      if (newCustomer) {
+        await checkout.updateDetails(SENDER, {
+          firstName: 'Ana',
+          lastName: null,
+          useNewAddress: true,
+          label: null,
+          street: 'Calle 5',
+          exteriorNumber: 'S/N',
+          interiorNumber: null,
+          zipCode: '06700',
+          neighborhood: 'Roma',
+          municipality: null,
+          city: 'CDMX',
+          state: 'CDMX',
+          visualReferences: null,
+          carrierPhone: null,
+        });
+      } else {
+        const lookup = await checkout.lookup(SENDER, null);
+        if (!lookup.ok || lookup.status !== 'unique') throw new Error('lookup');
+        await checkout.selectAddress(SENDER, lookup.addresses[0].addressRef);
+      }
       const offer = await checkout.prepareConfirmation(
         SENDER,
         EVENT('wamid.d1'),
@@ -262,6 +281,39 @@ function setup(
 }
 
 describe('minimal order placement through the SDK route', () => {
+  it('S2/S3/S6 new customer order needs armed one-shot summary consent', async () => {
+    const h = setup({ atomic: true });
+    await h.ready(true);
+    const offer = await h.turn(
+      'Hacer pedido',
+      [call('prepareOrder'), say('Inventado')],
+      EVENT('new-order'),
+    );
+    expect((offer as { reply: string }).reply).toContain(
+      'Guardaremos esta dirección con su pedido.',
+    );
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    (offer as { onSent: () => void }).onSent();
+    const calls = h.seen.length;
+    const placed = await h.turn('SÍ', [say('Inventado')], EVENT('new-yes'));
+    expect(h.seen).toHaveLength(calls);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({
+      customer: { mode: 'createIfAbsent', firstName: 'Ana' },
+      deliveryAddress: {
+        mode: 'newSaved',
+        address: { street: 'Calle 5', state: 'Ciudad de México' },
+      },
+    });
+    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('CLABE');
+    expect(h.api.upsertCustomer).not.toHaveBeenCalled();
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    await h.turn('SÍ', [say()], EVENT('duplicate-yes'));
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
   it('atomic S2/S3/S4: armed summary consent creates checkout, not legacy sale', async () => {
     const h = setup({ atomic: true, shipping: true });
     await h.ready();

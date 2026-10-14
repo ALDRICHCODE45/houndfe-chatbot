@@ -160,6 +160,41 @@ describe('shipping summary and exact binding', () => {
   );
 });
 
+describe('new address S2/S3/S4/S6', () => {
+  it.each([null, CUSTOMER])(
+    'atomic enables new address for customer %s',
+    (sourceCustomerId) => {
+      const draft = { ...newDraft(), sourceCustomerId };
+      const verdict = evaluateMinimalOrder({
+        confirmedDraft: draft,
+        quote: quote(),
+        atomicCheckoutEnabled: true,
+      });
+      expect(verdict.ok).toBe(true);
+      if (!verdict.ok) throw new Error('new eligibility');
+      expect(renderMinimalOrderSummary(verdict.snapshot)).toContain(
+        'Guardaremos esta dirección con su pedido.',
+      );
+      expect(renderMinimalOrderSummary(verdict.snapshot)).toContain('Calle 5');
+      const changed = structuredClone(verdict.snapshot);
+      changed.draft.customer.firstName = 'Otro';
+      expect(sameMinimalOrder(verdict.snapshot, changed)).toBe(false);
+    },
+  );
+  it('blocks unmappable confirmed new state', () => {
+    const draft = newDraft();
+    if (draft.address.kind !== 'new') throw new Error('fixture');
+    draft.address.fields.state = 'Texas';
+    expect(
+      evaluateMinimalOrder({
+        confirmedDraft: draft,
+        quote: quote(),
+        atomicCheckoutEnabled: true,
+      }),
+    ).toEqual({ ok: false, reason: 'invalid_state' });
+  });
+});
+
 describe('evaluateMinimalOrder', () => {
   it('builds a snapshot for a unique customer, saved address and evaluated cart', () => {
     expect(

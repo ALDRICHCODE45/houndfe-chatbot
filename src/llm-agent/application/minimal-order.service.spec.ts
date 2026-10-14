@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { CreateCheckoutInputSchema } from '../../chatbot-api/domain/dtos/checkout.dto';
 import {
   minimalShippingDestination,
   type MinimalShipping,
@@ -23,6 +24,7 @@ import {
   MINIMAL_ORDER_HELD_REPLY,
   MINIMAL_ORDER_INELIGIBLE_REPLIES,
   MINIMAL_ORDER_REJECTED_REPLY,
+  MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_UNRESOLVED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
@@ -259,8 +261,312 @@ async function shippingRecord(
   return shipping;
 }
 
+async function confirmNewDelivery(
+  h: Harness,
+  overrides: Record<string, string> = {},
+) {
+  await h.checkout.updateDetails(SENDER, {
+    label: null,
+    firstName: 'Ana',
+    lastName: null,
+    street: 'Calle 5',
+    exteriorNumber: 'S/N',
+    interiorNumber: null,
+    zipCode: '06700',
+    neighborhood: 'Roma',
+    municipality: null,
+    city: 'CDMX',
+    state: 'CDMX',
+    visualReferences: null,
+    carrierPhone: null,
+    useNewAddress: true,
+    ...overrides,
+  });
+  const offer = await h.checkout.prepareConfirmation(SENDER, EVENT('new1'));
+  offer.onSent?.();
+  await h.checkout.consume({
+    senderId: SENDER,
+    text: 'SÍ',
+    inboundEvent: EVENT('new2'),
+  });
+}
+
+async function newShipping(h: Harness, free = false) {
+  const legacy = await shippingRecord(h);
+  if (!('addressId' in legacy)) throw new Error('fixture');
+  const { addressId, addressVersion, ...record } = legacy;
+  void addressId;
+  void addressVersion;
+  const draft = (await h.checkout.confirmedDraft(SENDER))!;
+  const raw = await h.minimalCart();
+  await h.store.commitMinimalCart(
+    SENDER,
+    raw,
+    {
+      ...(raw as object),
+      shipping: {
+        ...record,
+        destination: minimalShippingDestination(draft.address),
+        ...(free ? { totalCreditCents: 24000, customerPaysCents: 0 } : {}),
+      },
+    },
+    new Date().toISOString(),
+  );
+}
+
+describe('new customer checkout S2/S3/S4/S6', () => {
+  it.each(['expired', 'rejected'])(
+    'new shipping %s blocks the summary',
+    async (status) => {
+      const h = setup({ atomic: true, shipping: true });
+      await h.seedCart();
+      await confirmNewDelivery(h);
+      await newShipping(h);
+      const raw = await h.minimalCart();
+      const cart = parseMinimalCart(raw)!;
+      const record = cart.shipping!;
+      await h.store.commitMinimalCart(
+        SENDER,
+        raw,
+        {
+          ...cart,
+          shipping: {
+            ...record,
+            ...(status === 'expired'
+              ? { expiresAt: new Date(Date.now() - 1).toISOString() }
+              : {
+                  approval: {
+                    state: 'rejected',
+                    requestId: 'approval-1',
+                    decidedAt: new Date().toISOString(),
+                  },
+                }),
+          },
+        },
+        new Date().toISOString(),
+      );
+      expect((await offerOrder(h)).onSent).toBeUndefined();
+      expect(h.api.createCheckout).not.toHaveBeenCalled();
+    },
+  );
+  it('not_observed retries the identical new checkout and key under fresh consent', async () => {
+    const h = setup({ atomic: true });
+    await h.seedCart();
+    await confirmNewDelivery(h);
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(new Error('lost'));
+    await yes(h);
+    const first = h.api.createCheckout.mock.calls[0] as unknown as [
+      unknown,
+      string,
+    ];
+    await offerOrder(h, 'retry-new');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect((await yes(h, 'retry-new-yes'))?.reply).toContain('B-0042');
+    expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(first[1]);
+    expect(h.api.createCheckout.mock.calls[1]).toEqual(first);
+  });
+  it.each([false, true])('atomic switch %s', async (atomic) => {
+    const h = setup({ atomic });
+    await h.seedCart();
+    await confirmNewDelivery(h);
+    const offer = await offerOrder(h);
+    if (!atomic)
+      expect(offer.reply).toBe(
+        MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
+      );
+    else
+      expect(offer.reply).toContain(
+        'Guardaremos esta dirección con su pedido.',
+      );
+  });
+  it.each([false, true])(
+    'exact new payload with free shipping %s passes real schema',
+    async (free) => {
+      const h = setup({ atomic: true, shipping: true });
+      await h.seedCart();
+      if (free) {
+        const raw = await h.minimalCart();
+        await h.store.commitMinimalCart(
+          SENDER,
+          raw,
+          {
+            items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 60000 }],
+            idempotencyKey: '',
+            expectedTotalCents: 120000,
+          },
+          new Date().toISOString(),
+        );
+        h.setPrice(60000);
+      }
+      await confirmNewDelivery(h);
+      await newShipping(h, free);
+      await offerOrder(h);
+      await yes(h);
+      const payload = (
+        h.api.createCheckout.mock.calls[0] as unknown as [unknown]
+      )[0];
+      expect(CreateCheckoutInputSchema.safeParse(payload).success).toBe(true);
+      expect(payload).toMatchObject({
+        phoneCountryCode: '52',
+        phone: '5550001111',
+        customer: { mode: 'createIfAbsent', firstName: 'Ana' },
+        deliveryAddress: {
+          mode: 'newSaved',
+          address: {
+            street: 'Calle 5',
+            exteriorNumber: 'S/N',
+            zipCode: '06700',
+            neighborhood: 'Roma',
+            city: 'CDMX',
+            state: 'Ciudad de México',
+          },
+        },
+        sale: { expectedTotalCents: free ? 120000 : 8000 },
+      });
+      const parsed = CreateCheckoutInputSchema.parse(payload);
+      expect(parsed.customer).not.toHaveProperty('lastName');
+      if (parsed.deliveryAddress.mode !== 'newSaved')
+        throw new Error('payload');
+      for (const key of [
+        'label',
+        'interiorNumber',
+        'municipality',
+        'visualReferences',
+        'carrierPhone',
+      ])
+        expect(parsed.deliveryAddress.address).not.toHaveProperty(key);
+      expect(parsed.sale.shipping).toEqual(
+        free
+          ? undefined
+          : { chargeCents: 5000, approvalId: 'approval-1', quoteId: 'quote-1' },
+      );
+      expect(h.api.createSale).not.toHaveBeenCalled();
+      expect(h.api.upsertCustomer).not.toHaveBeenCalled();
+    },
+  );
+  it('unique registered customer with NEW uses createIfAbsent', async () => {
+    const h = setup({ atomic: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await confirmNewDelivery(h);
+    await offerOrder(h);
+    await yes(h);
+    expect(h.api.createCheckout).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customer: { mode: 'createIfAbsent', firstName: 'Ana' },
+        deliveryAddress: expect.objectContaining({
+          mode: 'newSaved',
+        }) as unknown,
+      }),
+      expect.any(String),
+    );
+  });
+  it('invalid state blocks delivery offer and correction requires reconfirmation', async () => {
+    const h = setup({ atomic: true });
+    await h.seedCart();
+    await confirmNewDelivery(h, { state: 'Texas' });
+    const blocked = await h.checkout.prepareConfirmation(SENDER, EVENT('bad'));
+    expect(blocked.onSent).toBeUndefined();
+    expect(blocked.reply).toContain('estado válido de México');
+    expect(await h.checkout.confirmedDraft(SENDER)).toBeNull();
+    await confirmNewDelivery(h, { state: 'Queretaro' });
+    expect((await offerOrder(h)).onSent).toBeDefined();
+  });
+  it.each([1, 2])(
+    'ambiguous phone attempt %s preserves rotation rules',
+    async (attempt) => {
+      const h = setup({ atomic: true });
+      await h.seedCart();
+      await confirmNewDelivery(h);
+      await offerOrder(h);
+      if (attempt === 2) {
+        h.api.createCheckout.mockRejectedValueOnce(new Error('lost'));
+        await yes(h);
+        await offerOrder(h, 'retry');
+      }
+      h.api.createCheckout.mockRejectedValueOnce(
+        new ChatbotApiError(
+          'ambiguous',
+          409,
+          undefined,
+          'CUSTOMER_PHONE_AMBIGUOUS',
+        ),
+      );
+      const reply = await yes(h, 'answer');
+      expect(reply?.reply).toContain('comuníquese con la tienda');
+      expect(reply?.reply).not.toContain('quedó registrado');
+      expect(
+        ((await h.minimalCart()) as { idempotencyKey: string })
+          .idempotencyKey === '',
+      ).toBe(attempt === 1);
+    },
+  );
+  it('new checkout recovers status first after stock exhaustion', async () => {
+    const h = setup({ atomic: true });
+    await h.seedCart();
+    await confirmNewDelivery(h);
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(new Error('lost'));
+    await yes(h);
+    h.api.getStock.mockResolvedValue({
+      productId: PRODUCT,
+      name: 'Ibuprofeno',
+      stock: { status: 'out_of_stock', quantity: 0 },
+      variants: [],
+    });
+    h.api.getStock.mockClear();
+    h.api.getCheckoutStatus.mockResolvedValueOnce({
+      status: 'succeeded',
+      checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+    });
+    expect(
+      (await h.order.prepareOrder(SENDER, EVENT('recover'))).reply,
+    ).toContain('B-0042');
+    expect(h.api.getStock).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    'label',
+    'street',
+    'exteriorNumber',
+    'interiorNumber',
+    'zipCode',
+    'neighborhood',
+    'municipality',
+    'city',
+    'state',
+    'visualReferences',
+    'carrierPhone',
+    'firstName',
+    'lastName',
+  ])('exact payload fingerprint changes with %s', async (field) => {
+    const h = setup({ atomic: true });
+    await h.seedCart();
+    await confirmNewDelivery(h);
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(new Error('lost'));
+    await yes(h);
+    const locked = (await h.minimalCart()) as {
+      idempotencyFingerprint: string;
+    };
+    const first = (
+      h.api.createCheckout.mock.calls[0] as unknown as [unknown]
+    )[0];
+    expect(locked.idempotencyFingerprint).toBe(
+      createHash('sha256').update(JSON.stringify(first)).digest('hex'),
+    );
+    await confirmNewDelivery(h, {
+      [field]: field === 'state' ? 'Jalisco' : 'Otro',
+    });
+    await offerOrder(h, 'edited');
+    expect((await yes(h, 'editedYes'))?.reply).toBe(MINIMAL_ORDER_HELD_REPLY);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('NEW shipping freshness only (T1)', () => {
-  it('accepts approved current NEW shipping, rejects edits, and still refuses NEW orders', async () => {
+  it('accepts approved current NEW shipping, rejects edits, and requires a persisted quote', async () => {
     const h = setup({ atomic: true, shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -335,7 +641,7 @@ describe('NEW shipping freshness only (T1)', () => {
       ),
     ).toBeNull();
     expect((await h.order.prepareOrder(SENDER, EVENT('order-new'))).reply).toBe(
-      MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
+      'Antes de crear el pedido, solicite y confirme el envío con una cotización vigente aprobada por el equipo. No se creó ningún pedido.',
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
@@ -670,7 +976,9 @@ describe('atomic checkout order S1–S5', () => {
     await offerOrder(h, 'wamid.r3');
     h.api.createCheckout.mockRejectedValueOnce(rejection);
     expect((await yes(h, 'wamid.r4'))?.reply).toBe(
-      MINIMAL_ORDER_UNRESOLVED_REPLY,
+      code === 'CUSTOMER_PHONE_AMBIGUOUS'
+        ? MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY
+        : MINIMAL_ORDER_UNRESOLVED_REPLY,
     );
     expect(await h.minimalCart()).toMatchObject({
       idempotencyKey: (locked as { idempotencyKey: string }).idempotencyKey,
