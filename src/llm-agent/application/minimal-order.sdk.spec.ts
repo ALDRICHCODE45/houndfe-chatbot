@@ -39,7 +39,9 @@ const call = (name: string, input: unknown = {}) =>
   ]);
 const say = (text = 'Listo.') => step([{ type: 'text', text }], 'stop');
 
-function setup(options: { order?: 'on' | 'off' | 'absent' } = {}) {
+function setup(
+  options: { order?: 'on' | 'off' | 'absent'; shipping?: boolean } = {},
+) {
   const mode = options.order ?? 'on';
   const store = new InMemoryConversationStore();
   const api = {
@@ -135,6 +137,7 @@ function setup(options: { order?: 'on' | 'off' | 'absent' } = {}) {
           enabled: true,
           allowedSenders: [SENDER],
           orderEnabled: mode === 'on',
+          shippingEnabled: options.shipping === true,
         };
       if (key === 'chatbotApi.cashierUserId') return CASHIER;
       return { model: 'm', maxSteps: 5, historyTurns: 12 };
@@ -197,6 +200,37 @@ function setup(options: { order?: 'on' | 'off' | 'absent' } = {}) {
             items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1500 }],
             idempotencyKey: '',
             expectedTotalCents: 3000,
+            ...(options.shipping
+              ? {
+                  shipping: {
+                    quoteId: 'quote-1',
+                    rateId: 'rate-1',
+                    carrierName: 'Carrier',
+                    serviceName: 'Ground',
+                    estimatedDeliveryDays: 2,
+                    bestRateCents: 5000,
+                    totalCreditCents: 0,
+                    customerPaysCents: 5000,
+                    cartLines: [
+                      {
+                        productId: PRODUCT,
+                        quantity: 2,
+                        unitPriceCents: 1500,
+                        finalPriceCents: 3000,
+                      },
+                    ],
+                    addressId: ADDRESS,
+                    addressVersion: '2026-10-01T00:00:00.000Z',
+                    createdAt: new Date(Date.now() - 1000).toISOString(),
+                    expiresAt: new Date(Date.now() + 60000).toISOString(),
+                    approval: {
+                      state: 'approved',
+                      requestId: 'approval-1',
+                      decidedAt: new Date().toISOString(),
+                    },
+                  },
+                }
+              : {}),
           },
         },
       });
@@ -218,6 +252,37 @@ function setup(options: { order?: 'on' | 'off' | 'absent' } = {}) {
 }
 
 describe('minimal order placement through the SDK route', () => {
+  it('S1/S4: prepareOrder plus one SÍ creates the approved charged order', async () => {
+    const h = setup({ shipping: true });
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say('inventado')],
+      EVENT('wamid.o1'),
+    );
+    expect((offer as { reply: string }).reply).toContain(
+      'Total a pagar: $80.00 MXN',
+    );
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    (offer as { onSent: () => void }).onSent();
+    const seen = h.seen.length;
+    const result = await h.turn('SÍ', [say()], EVENT('wamid.o2'));
+    expect(h.seen).toHaveLength(seen);
+    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createSale.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({
+      expectedTotalCents: 8000,
+      shipping: {
+        chargeCents: 5000,
+        approvalId: 'approval-1',
+        quoteId: 'quote-1',
+      },
+    });
+    expect((result as { reply: string }).reply).not.toContain(
+      'no está incluido',
+    );
+  });
   it.each([
     ['on', true],
     ['off', false],

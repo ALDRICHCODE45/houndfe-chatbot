@@ -95,6 +95,71 @@ const eligible = (): MinimalOrderSnapshot => {
   return verdict.snapshot;
 };
 
+describe('shipping summary and exact binding', () => {
+  const withShipping = (classification: 'charged' | 'free') => ({
+    ...eligible(),
+    shipping: {
+      classification,
+      chargeCents: classification === 'charged' ? 5000 : 0,
+      approvalId: 'approval-1',
+      quoteId: 'quote-1',
+    },
+  });
+  it('S1/S4: presents approved freight and the freight-inclusive total', () => {
+    const summary = renderMinimalOrderSummary(withShipping('charged'));
+    expect(summary).toContain('Total de productos: $27.00 MXN');
+    expect(summary).toContain('Envío: $50.00 MXN');
+    expect(summary).toContain('Total a pagar: $77.00 MXN');
+    expect(summary).not.toContain('no está incluido');
+    expect(summary).toContain(
+      'Responda exactamente "SÍ" para crear el pedido.',
+    );
+  });
+  it('S2/S4: presents covered shipping without a freight line', () => {
+    const summary = renderMinimalOrderSummary(withShipping('free'));
+    expect(summary).toContain('Total de productos: $27.00 MXN');
+    expect(summary).toContain('envío cubierto por su compra');
+    expect(summary).not.toContain('Envío:');
+    expect(summary).not.toContain('no está incluido');
+  });
+  it('S2/S4: covered shipping remains bound to its exact approval and quote', () => {
+    const snapshot = withShipping('free');
+    expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
+    expect(
+      sameMinimalOrder(snapshot, {
+        ...snapshot,
+        shipping: { ...snapshot.shipping, approvalId: 'approval-2' },
+      }),
+    ).toBe(false);
+    expect(
+      sameMinimalOrder(snapshot, {
+        ...snapshot,
+        shipping: { ...snapshot.shipping, quoteId: 'quote-2' },
+      }),
+    ).toBe(false);
+    expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
+  });
+  it.each([
+    { classification: 'free', chargeCents: 0 },
+    { chargeCents: 6000 },
+    { approvalId: 'approval-2' },
+    { quoteId: 'quote-2' },
+  ])(
+    'S4: changed shipping metadata invalidates exact consent (%j)',
+    (change) => {
+      const snapshot = withShipping('charged');
+      expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
+      expect(
+        sameMinimalOrder(snapshot, {
+          ...snapshot,
+          shipping: { ...snapshot.shipping, ...change },
+        } as MinimalOrderSnapshot),
+      ).toBe(false);
+      expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
+    },
+  );
+});
+
 describe('evaluateMinimalOrder', () => {
   it('builds a snapshot for a unique customer, saved address and evaluated cart', () => {
     expect(

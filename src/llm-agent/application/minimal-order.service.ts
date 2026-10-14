@@ -21,7 +21,12 @@ import {
   sameMinimalOrder,
   type MinimalOrderIneligibleReason,
   type MinimalOrderSnapshot,
+  type MinimalOrderShipping,
 } from '../domain/minimal-order-confirmation';
+import {
+  classifyMinimalShipping,
+  isShippingCurrent,
+} from '../domain/minimal-shipping';
 import {
   MinimalCartService,
   parseMinimalCart,
@@ -49,6 +54,8 @@ export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
   new_address_unsupported:
     'Por ahora solo puedo crear pedidos para clientes registrados con una dirección guardada. No se creó ningún pedido.',
 };
+export const MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY =
+  'Antes de crear el pedido, solicite y confirme el envío con una cotización vigente aprobada por el equipo. No se creó ningún pedido.';
 export const MINIMAL_ORDER_CHANGED_REPLY =
   'Su pedido cambió desde el último resumen; no se creó ningún pedido. Revise el resumen actualizado:';
 export const MINIMAL_ORDER_REJECTED_REPLY =
@@ -138,7 +145,7 @@ function sameCartLines(
 
 /**
  * Minimal-route order placement (minimal-order-placement T2). Creates ONE
- * ONLINE sale without shipping for a unique customer with a confirmed saved
+ * ONLINE sale for a unique customer with a confirmed saved
  * address, only after a strict armed SÍ for the exact presented summary. It
  * never registers customers, mutates addresses, reserves stock outside the
  * sale, quotes shipping or takes payment. Default off.
@@ -147,6 +154,7 @@ function sameCartLines(
 export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
   private readonly orderEnabled: boolean;
+  private readonly shippingEnabled: boolean;
   private readonly cashierUserId: string;
 
   constructor(
@@ -159,6 +167,9 @@ export class MinimalOrderService {
     this.orderEnabled =
       config.get<{ orderEnabled?: boolean }>('minimalCatalogAgent')
         ?.orderEnabled === true;
+    this.shippingEnabled =
+      config.get<{ shippingEnabled?: boolean }>('minimalCatalogAgent')
+        ?.shippingEnabled === true;
     const cashier = config.get<string>('chatbotApi.cashierUserId');
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
   }
@@ -272,6 +283,15 @@ export class MinimalOrderService {
       if (revalidation === 'unavailable') {
         return { ok: false, reply: MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY };
       }
+      if (this.shippingEnabled) {
+        const raw = (await this.store.get(senderId))?.data.minimalCart;
+        const cart = parseMinimalCart(raw);
+        const shipping =
+          cart === null ? null : this.currentShipping(cart, verdict.snapshot);
+        if (shipping === null)
+          return { ok: false, reply: MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY };
+        return { ok: true, snapshot: { ...verdict.snapshot, shipping } };
+      }
       return verdict;
     } catch {
       return {
@@ -279,6 +299,41 @@ export class MinimalOrderService {
         reply: MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified,
       };
     }
+  }
+
+  /** Freshness alone never authorizes a sale: require exact human approval. */
+  private currentShipping(
+    cart: MinimalCartState,
+    snapshot: MinimalOrderSnapshot,
+  ): MinimalOrderShipping | null {
+    const record = cart.shipping;
+    const address = snapshot.draft.address;
+    if (
+      record === undefined ||
+      record.approval.state !== 'approved' ||
+      address.kind !== 'saved' ||
+      isShippingCurrent(record, {
+        cartLines: snapshot.items.map((item) => ({
+          productId: item.productId,
+          ...(item.variantId === undefined
+            ? {}
+            : { variantId: item.variantId }),
+          quantity: item.quantity,
+          unitPriceCents: item.unitPriceCents,
+          finalPriceCents: item.finalPriceCents,
+        })),
+        addressId: address.snapshot.id,
+        addressVersion: address.snapshot.version,
+        nowMs: Date.now(),
+      }) !== 'current'
+    )
+      return null;
+    return {
+      classification: classifyMinimalShipping(record),
+      chargeCents: record.customerPaysCents,
+      approvalId: record.approval.requestId,
+      quoteId: record.quoteId,
+    };
   }
 
   /**
@@ -297,7 +352,17 @@ export class MinimalOrderService {
       cashierUserId: this.cashierUserId,
       customerId: snapshot.customerId,
       shippingAddressId: snapshot.shippingAddressId,
-      expectedTotalCents: snapshot.totalCents,
+      expectedTotalCents:
+        snapshot.totalCents + (snapshot.shipping?.chargeCents ?? 0),
+      ...(snapshot.shipping?.classification === 'charged'
+        ? {
+            shipping: {
+              chargeCents: snapshot.shipping.chargeCents,
+              approvalId: snapshot.shipping.approvalId,
+              quoteId: snapshot.shipping.quoteId,
+            },
+          }
+        : {}),
       items: snapshot.items.map((item) => ({
         productId: item.productId,
         variantId: item.variantId ?? null,
@@ -314,6 +379,15 @@ export class MinimalOrderService {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
       if (cart === null || !sameCartLines(cart, snapshot)) return unverified;
+      if (this.shippingEnabled) {
+        const shipping = this.currentShipping(cart, snapshot);
+        if (
+          shipping === null ||
+          !sameMinimalOrder(snapshot, { ...snapshot, shipping })
+        ) {
+          return MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY;
+        }
+      }
       // Every call is counted in the slot BEFORE it is made, so a crash or an
       // uncertain response always leaves evidence of an earlier attempt.
       if (cart.idempotencyKey === '') {
@@ -374,7 +448,11 @@ export class MinimalOrderService {
       (sale.folio === null
         ? 'Su pedido quedó registrado.'
         : `Su pedido quedó registrado con folio ${sale.folio}.`) +
-      ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`;
+      (snapshot.shipping === undefined
+        ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
+        : snapshot.shipping.classification === 'free'
+          ? ` Total de productos: ${mxn(sale.totalCents)}. envío cubierto por su compra.`
+          : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`);
     return `${created}\n\n${await this.paymentInstructions()}`;
   }
 

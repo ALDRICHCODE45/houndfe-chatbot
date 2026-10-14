@@ -44,6 +44,13 @@ export type MinimalOrderIneligibleReason =
   | 'delivery_unconfirmed'
   | 'new_address_unsupported';
 
+export interface MinimalOrderShipping {
+  readonly classification: 'free' | 'charged';
+  readonly chargeCents: number;
+  readonly approvalId: string;
+  readonly quoteId: string;
+}
+
 /** Exact content the customer consents to; detached from every input. */
 export interface MinimalOrderSnapshot {
   readonly customerId: string;
@@ -51,6 +58,7 @@ export interface MinimalOrderSnapshot {
   readonly draft: MinimalCheckoutDraft;
   readonly items: readonly MinimalOrderLine[];
   readonly totalCents: number;
+  readonly shipping?: MinimalOrderShipping;
 }
 
 export type MinimalOrderEligibility =
@@ -110,6 +118,14 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
       item.finalPriceCents,
     ]),
     snapshot.totalCents,
+    snapshot.shipping === undefined
+      ? null
+      : [
+          snapshot.shipping.classification,
+          snapshot.shipping.chargeCents,
+          snapshot.shipping.approvalId,
+          snapshot.shipping.quoteId,
+        ],
   ]);
 }
 
@@ -160,7 +176,16 @@ export function renderMinimalOrderSummary(
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
     `Entrega a: ${deliveryLine(snapshot)}`,
-    'El envío no está incluido en este total y se coordinará por separado.',
+    ...(snapshot.shipping === undefined
+      ? [
+          'El envío no está incluido en este total y se coordinará por separado.',
+        ]
+      : snapshot.shipping.classification === 'free'
+        ? ['envío cubierto por su compra']
+        : [
+            `Envío: ${mxn(snapshot.shipping.chargeCents)}`,
+            `Total a pagar: ${mxn(snapshot.totalCents + snapshot.shipping.chargeCents)}`,
+          ]),
     '',
     'Responda exactamente "SÍ" para crear el pedido.',
   ].join('\n');
