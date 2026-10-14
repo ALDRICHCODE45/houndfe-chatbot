@@ -265,6 +265,135 @@ describe('atomic checkout order S1–S5', () => {
     return h;
   }
 
+  it.each(['stock', 'shipping', 'consume', 'unarmed consume'])(
+    'S5 recovers before fresh %s gates',
+    async (gate) => {
+      const h = await ready(gate === 'shipping');
+      h.api.createCheckout.mockRejectedValueOnce(new Error('lost response'));
+      await yes(h);
+      const locked = await h.minimalCart();
+      if (gate === 'consume') await offerOrder(h, 'wamid.retry');
+      const clock =
+        gate === 'shipping'
+          ? jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 120000)
+          : undefined;
+      if (gate !== 'shipping')
+        h.api.getStock.mockResolvedValue({
+          productId: PRODUCT,
+          name: 'Ibuprofeno',
+          stock: { status: 'out_of_stock', quantity: 0 },
+          variants: [],
+        });
+      h.api.getStock.mockClear();
+      h.api.getCheckoutStatus.mockClear();
+      h.api.getCheckoutStatus.mockResolvedValueOnce({
+        status: 'succeeded',
+        checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+      });
+      const result = gate.includes('consume')
+        ? await yes(h, 'wamid.retryyes')
+        : await h.order.prepareOrder(SENDER, EVENT('wamid.recover'));
+      clock?.mockRestore();
+      expect(result?.reply).toContain('B-0042');
+      expect(result?.reply).toContain('CLABE');
+      expect(result?.onSent).toBeUndefined();
+      expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(
+        (locked as { idempotencyKey: string }).idempotencyKey,
+      );
+      expect(h.api.getStock).not.toHaveBeenCalled();
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+      expect(await h.minimalCart()).toMatchObject({
+        items: [],
+        idempotencyKey: '',
+        placedSale: { saleId: SALE },
+      });
+    },
+  );
+
+  it.each(['not_observed', 'failure', 'invalid'])(
+    'S5 %s with exhausted stock keeps uncertainty and lock',
+    async (status) => {
+      const h = await ready();
+      h.api.createCheckout.mockRejectedValueOnce(new Error('lost response'));
+      await yes(h);
+      const locked = await h.minimalCart();
+      h.api.getStock.mockResolvedValue({
+        productId: PRODUCT,
+        name: 'Ibuprofeno',
+        stock: { status: 'out_of_stock', quantity: 0 },
+        variants: [],
+      });
+      h.api.getStock.mockClear();
+      if (status === 'failure')
+        h.api.getCheckoutStatus.mockRejectedValueOnce(new Error('down'));
+      if (status === 'invalid')
+        h.api.getCheckoutStatus.mockResolvedValueOnce({
+          status: 'succeeded',
+          checkout: null,
+        });
+      const result = await h.order.prepareOrder(SENDER, EVENT('wamid.recover'));
+      expect(result.reply).toBe(
+        status === 'not_observed'
+          ? MINIMAL_ORDER_UNRESOLVED_REPLY
+          : MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
+      );
+      expect(result.reply).not.toContain('No se creó ningún pedido');
+      expect(await h.minimalCart()).toEqual(locked);
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+      if (status !== 'not_observed')
+        expect(h.api.getStock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('S5 not_observed in consume preserves lock when fresh stock fails', async () => {
+    const h = await ready();
+    h.api.createCheckout.mockRejectedValueOnce(new Error('lost response'));
+    await yes(h);
+    await offerOrder(h, 'wamid.retry');
+    const locked = await h.minimalCart();
+    h.api.getCheckoutStatus.mockClear();
+    h.api.getStock.mockImplementation(async () => {
+      expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(
+        (locked as { idempotencyKey: string }).idempotencyKey,
+      );
+      return {
+        productId: PRODUCT,
+        name: 'Ibuprofeno',
+        stock: { status: 'out_of_stock', quantity: 0 },
+        variants: [],
+      };
+    });
+    expect((await yes(h, 'wamid.retryyes'))?.reply).toBe(
+      MINIMAL_ORDER_UNRESOLVED_REPLY,
+    );
+    expect(await h.minimalCart()).toEqual(locked);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  it('S5 recovery discloses success even when its exact raw cart CAS fails', async () => {
+    const h = await ready();
+    h.api.createCheckout.mockRejectedValueOnce(new Error('lost response'));
+    await yes(h);
+    const locked = await h.minimalCart();
+    h.api.getCheckoutStatus.mockResolvedValueOnce({
+      status: 'succeeded',
+      checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+    });
+    const commit = jest
+      .spyOn(h.store, 'commitMinimalCart')
+      .mockResolvedValueOnce(false);
+    const result = await h.order.prepareOrder(SENDER, EVENT('wamid.recover'));
+    expect(commit.mock.calls[0][0]).toBe(SENDER);
+    expect(commit.mock.calls[0][1]).toEqual(locked);
+    expect(commit.mock.calls[0][2]).toMatchObject({
+      placedSale: { saleId: SALE },
+    });
+    expect(result.reply).toContain('B-0042');
+    expect(result.reply).toContain('CLABE');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(await h.minimalCart()).toEqual(locked);
+  });
+
   it('S2/S3/S4 sends trusted identity, saved snapshot and exact fingerprint', async () => {
     const h = await ready(true);
     h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
@@ -359,7 +488,7 @@ describe('atomic checkout order S1–S5', () => {
     },
   );
 
-  it('S4 changed checkout fingerprint holds without status or POST', async () => {
+  it('S4 changed checkout fingerprint checks status but holds without POST', async () => {
     const h = await ready();
     h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
     await yes(h);
@@ -372,7 +501,7 @@ describe('atomic checkout order S1–S5', () => {
       MINIMAL_ORDER_HELD_REPLY,
     );
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
-    expect(h.api.getCheckoutStatus).not.toHaveBeenCalled();
+    expect(h.api.getCheckoutStatus).toHaveBeenCalled();
     expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 1 });
   });
 
@@ -482,8 +611,11 @@ describe('atomic checkout order S1–S5', () => {
           status,
           checkout: { sale: await h.api.createSale.getMockImplementation()!() },
         });
-      await offerOrder(h, 'wamid.status1');
-      const reply = (await yes(h, 'wamid.status2'))?.reply;
+      const offered = await offerOrder(h, 'wamid.status1');
+      const reply =
+        status === 'not_observed'
+          ? (await yes(h, 'wamid.status2'))?.reply
+          : offered.reply;
       expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(key);
       if (status === 'failure') {
         expect(reply).toBe(MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY);

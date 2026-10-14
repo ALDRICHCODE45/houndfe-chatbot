@@ -204,10 +204,19 @@ export class MinimalOrderService {
     inboundEvent: unknown,
   ): Promise<MinimalCheckoutReply> {
     if (!this.enabled) return { reply: MINIMAL_ORDER_AMBIGUOUS_REPLY };
+    const recovery = await this.recoverOutstanding(senderId);
+    if (recovery.reply !== undefined) {
+      this.confirmation.cancel(senderId);
+      return { reply: recovery.reply };
+    }
     const fresh = await this.freshOrder(senderId);
     if (!fresh.ok) {
       this.confirmation.cancel(senderId);
-      return { reply: fresh.reply };
+      return {
+        reply: recovery.outstanding
+          ? MINIMAL_ORDER_UNRESOLVED_REPLY
+          : fresh.reply,
+      };
     }
     return this.offer(senderId, inboundEvent, fresh.snapshot);
   }
@@ -226,9 +235,13 @@ export class MinimalOrderService {
     text: string;
     inboundEvent?: unknown;
   }): Promise<MinimalCheckoutReply | null> {
-    if (!this.enabled || this.confirmation.status(input.senderId) === null) {
-      return null;
+    if (!this.enabled) return null;
+    const recovery = await this.recoverOutstanding(input.senderId);
+    if (recovery.reply !== undefined) {
+      this.confirmation.cancel(input.senderId);
+      return { reply: recovery.reply };
     }
+    if (this.confirmation.status(input.senderId) === null) return null;
     const result = this.confirmation.consume({
       senderId: input.senderId,
       text: input.text,
@@ -240,21 +253,74 @@ export class MinimalOrderService {
     }
     if (result.kind === 'handled') return { reply: result.reply };
     const fresh = await this.freshOrder(input.senderId);
-    if (!fresh.ok) return { reply: fresh.reply };
+    if (!fresh.ok)
+      return {
+        reply: recovery.outstanding
+          ? MINIMAL_ORDER_UNRESOLVED_REPLY
+          : fresh.reply,
+      };
     if (!sameMinimalOrder(fresh.snapshot, result.snapshot)) {
       const offer = this.offer(
         input.senderId,
         input.inboundEvent,
         fresh.snapshot,
       );
+      const changedReply = recovery.outstanding
+        ? MINIMAL_ORDER_UNRESOLVED_REPLY
+        : MINIMAL_ORDER_CHANGED_REPLY;
       return offer.onSent === undefined
-        ? { reply: MINIMAL_ORDER_CHANGED_REPLY }
+        ? { reply: changedReply }
         : {
-            reply: `${MINIMAL_ORDER_CHANGED_REPLY}\n\n${offer.reply}`,
+            reply: `${changedReply}\n\n${offer.reply}`,
             onSent: offer.onSent,
           };
     }
-    return { reply: await this.place(input.senderId, fresh.snapshot) };
+    const reply = await this.place(input.senderId, fresh.snapshot);
+    return {
+      reply:
+        recovery.outstanding &&
+        (reply === MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified ||
+          reply === MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY)
+          ? MINIMAL_ORDER_UNRESOLVED_REPLY
+          : reply,
+    };
+  }
+
+  /** Resolve an earlier POST before consulting mutable stock/address/shipping. */
+  private async recoverOutstanding(
+    senderId: string,
+  ): Promise<{ outstanding: boolean; reply?: string }> {
+    if (!this.atomicCheckoutEnabled) return { outstanding: false };
+    try {
+      const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
+      const cart = parseMinimalCart(raw);
+      const key =
+        typeof raw === 'object' &&
+        raw !== null &&
+        'idempotencyKey' in raw &&
+        typeof raw.idempotencyKey === 'string'
+          ? raw.idempotencyKey
+          : '';
+      if (key === '') return { outstanding: false };
+      const status = await this.api.getCheckoutStatus(key);
+      if (status.status === 'not_observed') return { outstanding: true };
+      if (status.status === 'succeeded' && isSale(status.checkout?.sale)) {
+        return {
+          outstanding: true,
+          reply: await this.completeSale(
+            senderId,
+            raw,
+            status.checkout.sale,
+            this.shippingEnabled && cart !== null && cart.shipping !== undefined
+              ? { classification: classifyMinimalShipping(cart.shipping) }
+              : undefined,
+          ),
+        };
+      }
+    } catch {
+      // A failed status read is not evidence that an earlier order is absent.
+    }
+    return { outstanding: true, reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY };
   }
 
   private offer(
@@ -414,7 +480,6 @@ export class MinimalOrderService {
     const digest = fingerprint(checkoutPayload ?? legacyPayload);
     let keyed: MinimalCartState;
     let stored: unknown;
-    let recoveredSale: BotSaleResponse | undefined;
     try {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
@@ -438,40 +503,18 @@ export class MinimalOrderService {
           idempotencyAttempts: 1,
         });
       } else if (cart.idempotencyFingerprint === digest) {
-        if (checkoutPayload !== undefined) {
-          try {
-            const status = await this.api.getCheckoutStatus(
-              cart.idempotencyKey,
-            );
-            if (
-              status.status === 'succeeded' &&
-              isSale(status.checkout?.sale)
-            ) {
-              recoveredSale = status.checkout.sale;
-            } else if (status.status !== 'not_observed') {
-              return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
-            }
-          } catch {
-            return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
-          }
-        }
         keyed = structuredClone({
           ...cart,
           // Status reads are not POST attempts. A legacy key had one attempt.
-          idempotencyAttempts:
-            (cart.idempotencyAttempts ?? 1) + (recoveredSale ? 0 : 1),
+          idempotencyAttempts: (cart.idempotencyAttempts ?? 1) + 1,
         });
       } else {
         // An unresolved attempt carried another payload: reusing its key could
         // be rejected as a conflict, rotating could duplicate it. Hold.
         return MINIMAL_ORDER_HELD_REPLY;
       }
-      if (recoveredSale === undefined) {
-        if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
-        stored = keyed;
-      } else {
-        stored = raw;
-      }
+      if (!(await this.commitCart(senderId, raw, keyed))) return unverified;
+      stored = keyed;
     } catch {
       return unverified;
     }
@@ -479,15 +522,14 @@ export class MinimalOrderService {
     let sale: unknown;
     try {
       sale =
-        recoveredSale ??
-        (checkoutPayload === undefined
+        checkoutPayload === undefined
           ? await this.api.createSale(legacyPayload, keyed.idempotencyKey)
           : (
               await this.api.createCheckout(
                 checkoutPayload,
                 keyed.idempotencyKey,
               )
-            )?.sale);
+            )?.sale;
     } catch (error) {
       if (classifyFailure(error, this.atomicCheckoutEnabled) === 'keep') {
         return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
@@ -512,6 +554,15 @@ export class MinimalOrderService {
     }
     if (!isSale(sale)) return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
 
+    return this.completeSale(senderId, stored, sale, snapshot.shipping);
+  }
+
+  private async completeSale(
+    senderId: string,
+    stored: unknown,
+    sale: BotSaleResponse,
+    shipping?: Pick<MinimalOrderShipping, 'classification'>,
+  ): Promise<string> {
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
       items: [],
@@ -526,9 +577,9 @@ export class MinimalOrderService {
       (sale.folio === null
         ? 'Su pedido quedó registrado.'
         : `Su pedido quedó registrado con folio ${sale.folio}.`) +
-      (snapshot.shipping === undefined
+      (shipping === undefined
         ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
-        : snapshot.shipping.classification === 'free'
+        : shipping.classification === 'free'
           ? ` Total de productos: ${mxn(sale.totalCents)}. envío cubierto por su compra.`
           : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`);
     return `${created}\n\n${await this.paymentInstructions()}`;
