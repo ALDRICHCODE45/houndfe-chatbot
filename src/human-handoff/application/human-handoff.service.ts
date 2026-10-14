@@ -111,7 +111,11 @@ export type HumanHandoffResolveReplyResult =
     }
   | { kind: 'no_pending'; reply: string }
   | { kind: 'needs_decision'; reply: string }
-  | { kind: 'needs_requote'; reply: string }
+  | {
+      kind: 'needs_requote';
+      reply: string;
+      minimalCustomerNotice?: { customerId: string; reply: string };
+    }
   | { kind: 'ops_error'; reply: string };
 
 /**
@@ -492,7 +496,16 @@ export class HumanHandoffService {
         )
           return opsError;
         if (decision.state === 'expired')
-          return { kind: 'needs_requote', reply: SHIPPING_REQUOTE_REPLY };
+          return {
+            kind: 'needs_requote',
+            reply: SHIPPING_REQUOTE_REPLY,
+            // Only the winning pending→expired CAS owns the customer notice.
+            // An already-expired request (including lazy expiry) stays ops-only.
+            minimalCustomerNotice: {
+              customerId: target.customerId,
+              reply: decision.reply,
+            },
+          };
         return {
           kind: 'resolved',
           customerId: target.customerId,

@@ -177,6 +177,16 @@ export class WebhookDispatcherService {
               this.recentOutbound.remember(providerMessageId);
             }
           } else {
+            if (
+              result.kind === 'needs_requote' &&
+              result.minimalCustomerNotice !== undefined
+            ) {
+              const { providerMessageId } = await this.whatsappSender.sendText({
+                to: result.minimalCustomerNotice.customerId,
+                text: result.minimalCustomerNotice.reply,
+              });
+              this.recentOutbound.remember(providerMessageId);
+            }
             // `no_pending` → reply to the ops phone asking for a ref.
             const { providerMessageId } = await this.whatsappSender.sendText({
               to: message.senderId,

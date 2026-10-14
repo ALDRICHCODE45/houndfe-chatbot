@@ -3,6 +3,10 @@ import {
   MINIMAL_SHIPPING_UNCONFIRMED,
 } from '../../llm-agent/application/minimal-shipping-approval';
 import { buildMinimalShipping } from '../../llm-agent/domain/minimal-shipping';
+import { ConfigService } from '@nestjs/config';
+import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
+import { shippingApprovalPolicyAdapter } from '../../shipping/application/shipping-approval-policy.adapter';
+import { shippingDigest } from '../../llm-agent/application/minimal-shipping-approval';
 import {
   AgentRunner,
   type AgentRunnerConfig,
@@ -32,7 +36,7 @@ import {
   SHIPPING_DECISION_GRAMMAR,
   SHIPPING_REQUOTE_REPLY,
   SHIPPING_RETRY_REPLY,
-  type HumanHandoffService,
+  HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
@@ -725,6 +729,158 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         },
       ],
     });
+
+    it.each(['APPROVE_SHIPPING', 'REJECT_SHIPPING'])(
+      '[S6] late minimal %s notifies customer once and still answers ops',
+      async (decision) => {
+        const { dispatcher, stateStore } = await expiredMinimalDispatcher();
+        await dispatcher.dispatch(opsEvent('late-ops', decision));
+        expect(sender.sendText.mock.calls.map(([message]) => message)).toEqual([
+          { to: CUSTOMER, text: MINIMAL_SHIPPING_UNCONFIRMED },
+          { to: OPS, text: SHIPPING_REQUOTE_REPLY },
+        ]);
+        expect((await stateStore.get(CUSTOMER))!.data).toMatchObject({
+          pendingHumanRequest: null,
+          minimalCart: { shipping: { approval: { state: 'expired' } } },
+        });
+        await dispatcher.dispatch(opsEvent('later-ops', decision));
+        expect(
+          sender.sendText.mock.calls.filter(([m]) => m.to === CUSTOMER),
+        ).toHaveLength(1);
+        expect(llm.run).not.toHaveBeenCalled();
+      },
+    );
+
+    it('[S6] lazy expiry then late ops does not notify customer twice', async () => {
+      const { dispatcher } = await expiredMinimalDispatcher();
+      const customerEvent = opsEvent('lazy-expiry', 'hola');
+      customerEvent.entry![0].changes![0].value!.messages![0].from = CUSTOMER;
+      await dispatcher.dispatch(customerEvent);
+      await dispatcher.dispatch(
+        opsEvent('late-after-lazy', 'APPROVE_SHIPPING'),
+      );
+      expect(sender.sendText.mock.calls.map(([message]) => message)).toEqual([
+        { to: CUSTOMER, text: MINIMAL_SHIPPING_UNCONFIRMED },
+        { to: OPS, text: SHIPPING_REQUOTE_REPLY },
+      ]);
+      expect(llm.run).not.toHaveBeenCalled();
+    });
+
+    async function expiredMinimalDispatcher() {
+      const stateStore = new InMemoryConversationStore();
+      const createdAt = '2026-06-23T11:30:00.000Z';
+      const requestId = 'abc123def456';
+      const shipping = buildMinimalShipping({
+        quote: {
+          kind: 'quoted',
+          quoteId: 'q1',
+          expiresAt: null,
+          rates: [
+            {
+              rateId: 'r1',
+              carrierName: 'Carrier',
+              serviceName: 'Ground',
+              priceCents: 10000,
+              currency: 'MXN',
+              estimatedDeliveryDays: 2,
+              validUntil: null,
+            },
+          ],
+        },
+        cartLines: [
+          {
+            productId: '11111111-1111-4111-8111-111111111111',
+            quantity: 1,
+            unitPriceCents: 1000,
+            finalPriceCents: 1000,
+          },
+        ],
+        addressId: '22222222-2222-4222-8222-222222222222',
+        addressVersion: createdAt,
+        createdAt,
+      })!;
+      await stateStore.create(CUSTOMER, {
+        lastMessageAt: createdAt,
+        data: {
+          minimalCart: {
+            items: shipping.cartLines.map(
+              ({ productId, quantity, unitPriceCents }) => ({
+                productId,
+                quantity,
+                unitPriceCents,
+              }),
+            ),
+            idempotencyKey: '',
+            shipping: {
+              ...shipping,
+              approval: { state: 'pending', requestId },
+            },
+          },
+          pendingHumanRequest: {
+            requestId,
+            ref: `HF-${requestId}`,
+            createdAt,
+            customerNotifiedAt: createdAt,
+          },
+        },
+      });
+      const target = {
+        id: requestId,
+        customerId: CUSTOMER,
+        agentId: OPS,
+        kind: 'shipping_approval' as const,
+        digest: shippingDigest(shipping),
+        status: 'pending' as const,
+        resolution: null,
+        createdAt,
+        resolvedAt: null,
+      };
+      const rows = {
+        create: jest.fn(),
+        findById: jest.fn().mockResolvedValue(target),
+        findByRef: jest.fn().mockResolvedValue(target),
+        findLatestPendingForAgent: jest.fn().mockResolvedValue(target),
+        resolve: jest.fn(
+          (
+            _id: string,
+            resolution: import('../../human-handoff/domain/human-handoff.types').HumanHandoffResolution,
+          ) =>
+            Promise.resolve({
+              ...target,
+              status: 'resolved' as const,
+              resolution,
+            }),
+        ),
+      };
+      const resolver = new HumanHandoffService(
+        rows,
+        sender,
+        stateStore,
+        {
+          get: (key: string) =>
+            key === 'humanHandoff.opsChannelPhone' ? OPS : true,
+        } as unknown as ConfigService,
+        {
+          reserve: jest.fn(),
+          closeLegacyResolved: jest.fn().mockResolvedValue(true),
+        },
+        shippingApprovalPolicyAdapter,
+      );
+      return {
+        stateStore,
+        dispatcher: new WebhookDispatcherService(
+          runner,
+          sender,
+          dedup,
+          recentOutbound,
+          resolver,
+          stateStore,
+          amountRouter,
+          ingress,
+          minimalAgent,
+        ),
+      };
+    }
 
     it('[S1,S6] minimal pending waits without amounts, then expires lazily without model', async () => {
       const createdAt = '2026-06-23T11:40:00.000Z';
