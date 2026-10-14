@@ -19,9 +19,9 @@ S6 — Inherited safety unchanged: exact-snapshot one-shot SÍ, payload fingerpr
 
 ## Tasks
 
-T1 [S5] route=worker mv7kih1h-r-q3jo; status=done (L3); shipping quote/approval/freshness for a confirmed new address; commit=pending.
-T2 [S2,S3,S4,S6] route=worker mv7kuch0-t-b9i6; status=done (L5); order eligibility + checkout payload createIfAbsent/newSaved + state mapping + replies; commit=pending.
-T3 [S2] route=inline; status=done (26df8a2 + doc fixes, verified L6); docs + independent verification; commit=pending.
+T1 [S5] route=worker mv7kih1h-r-q3jo; status=done (L3); shipping quote/approval/freshness for a confirmed new address; commit=ce0870e.
+T2 [S2,S3,S4,S6] route=worker mv7kuch0-t-b9i6; status=done (L5); order eligibility + checkout payload createIfAbsent/newSaved + state mapping + replies; commit=ee94d28.
+T3 [S2] route=inline; status=done (26df8a2 + doc fixes, verified L6); docs + independent verification; commit=26df8a2, 8810bd8.
 
 ## Log
 
