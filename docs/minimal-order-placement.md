@@ -2,7 +2,7 @@
 
 `MinimalOrderService` lets an allowlisted WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
 
-It is **off by default**. It is not ready for production: shipping is not quoted or charged yet.
+It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight, but backend checkout wiring and production shipping prerequisites remain unresolved.
 
 ## Enable it (test environments only)
 
@@ -30,13 +30,13 @@ New customers and new addresses get a clear "not yet" reply. This route never ca
    - the confirmed delivery data still equals the current draft, byte for byte;
    - the saved address still has the same `version` upstream;
    - prices and stock come from a new cart evaluation.
-3. The server replies with its own summary: items, product total, delivery address and "shipping not included". It is armed only after the transport sends it.
+3. The server replies with its own summary: items, product total, delivery address and "shipping not included" when shipping is off. With [minimal shipping](minimal-shipping.md) enabled, a fresh approved quote is required and the summary includes freight and total, or "envío cubierto por su compra". It is armed only after the transport sends it.
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
 ## Duplicate protection
 
-The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`, together with a SHA-256 fingerprint of the exact sale payload (customer, address, expected total, items).
+The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`, together with a SHA-256 fingerprint of the exact sale payload (customer, address, expected total, items and any approved shipping charge).
 
 | Backend outcome                                                                                          | Key                   | Reply                                   |
 | -------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
@@ -61,13 +61,13 @@ The lock ends only with a confirmed sale, or with a definite rejection of the fi
 
 ## Reply priority in one SDK run
 
-EXPIRATION > RESTOCK > checkout or order presentation (after any cart acknowledgement) > cart reply > model text.
+EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text.
 
 Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confirmation, then the order summary.
 
 ## Not in this slice
 
-- Shipping quotes, charges and approval.
+- Shipping quotes, charges and approval are a separate default-off capability: [minimal shipping](minimal-shipping.md).
 - Customer and address creation (backend proposal pending owner decision).
 - Order cancellation from the minimal route.
 

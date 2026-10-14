@@ -57,6 +57,7 @@ import {
   type MinimalCheckoutReply,
 } from './minimal-checkout.service';
 import { MinimalOrderService } from './minimal-order.service';
+import { MinimalShippingService } from './minimal-shipping.service';
 import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
@@ -249,7 +250,11 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'updateCheckoutDetails',
   'confirmCheckoutDetails',
   'prepareOrder',
+  'requestShippingQuote',
 ]);
+
+const SHIPPING_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta requestShippingQuote: sin argumentos, solo después de confirmar los datos de entrega y si el cliente quiere envío a domicilio. Solicita cotización y aprobación humana. Nunca indique montos, aprobaciones ni que existe un pedido. Tras la aprobación, la aplicación informa el flete; luego el cliente pide el resumen con prepareOrder. No ofrece recoger en tienda.';
 
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
@@ -338,6 +343,7 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
 @Injectable()
 export class MinimalCatalogAgentService {
   private readonly enabled: boolean;
+  private readonly shippingEnabled: boolean;
   private readonly allowedSenders: ReadonlySet<string>;
   private readonly model: string;
   private readonly maxSteps: number;
@@ -366,16 +372,21 @@ export class MinimalCatalogAgentService {
     private readonly checkout?: MinimalCheckoutService,
     @Optional()
     private readonly order?: MinimalOrderService,
+    @Optional()
+    private readonly shipping?: MinimalShippingService,
   ) {
-    const agent = config.get<{ enabled: boolean; allowedSenders: string[] }>(
-      'minimalCatalogAgent',
-    )!;
+    const agent = config.get<{
+      enabled: boolean;
+      allowedSenders: string[];
+      shippingEnabled?: boolean;
+    }>('minimalCatalogAgent')!;
     const llm = config.get<{
       model: string;
       maxSteps: number;
       historyTurns: number;
     }>('llm')!;
     this.enabled = agent.enabled === true;
+    this.shippingEnabled = agent.shippingEnabled === true;
     this.allowedSenders = new Set(agent.allowedSenders ?? []);
     this.model = llm.model;
     this.maxSteps = llm.maxSteps;
@@ -603,7 +614,15 @@ export class MinimalCatalogAgentService {
         'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. Es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
         (checkoutRun === null ? '' : CHECKOUT_INSTRUCTIONS_FRAGMENT) +
         (checkoutRun !== null && this.orderAvailable()
-          ? ORDER_INSTRUCTIONS_FRAGMENT
+          ? this.shippingAvailable()
+            ? ORDER_INSTRUCTIONS_FRAGMENT.replace(
+                '; el envío no está incluido.',
+                '.',
+              )
+            : ORDER_INSTRUCTIONS_FRAGMENT
+          : '') +
+        (checkoutRun !== null && this.shippingAvailable()
+          ? SHIPPING_INSTRUCTIONS_FRAGMENT
           : '') +
         selectionContext +
         pendingContext
@@ -795,6 +814,14 @@ export class MinimalCatalogAgentService {
    */
   private checkoutAvailable(): boolean {
     return this.checkout !== undefined && this.checkout.available;
+  }
+
+  private shippingAvailable(): boolean {
+    return (
+      this.shippingEnabled &&
+      this.shipping !== undefined &&
+      this.orderAvailable()
+    );
   }
 
   private orderAvailable(): boolean {
@@ -1434,12 +1461,53 @@ export class MinimalCatalogAgentService {
                 };
               },
             }),
+            ...(this.shippingAvailable()
+              ? {
+                  requestShippingQuote: tool({
+                    description:
+                      'Solicita cotización de envío a domicilio y aprobación del equipo para los datos de entrega confirmados. No acepta argumentos ni informa montos.',
+                    inputSchema: z.strictObject({}),
+                    strict: true,
+                    execute: async () => {
+                      if (checkoutRun.attempted)
+                        return toolError('checkout_presentation_settled');
+                      checkoutRun.attempted = true;
+                      try {
+                        const result = await this.shipping!.quote(
+                          context.senderId,
+                        );
+                        checkoutRun.value = {
+                          reply:
+                            result.kind === 'quoted'
+                              ? 'Solicité la aprobación del envío al equipo. No se creó ningún pedido.'
+                              : result.reason === 'approval_unavailable'
+                                ? 'La aprobación del envío está pendiente o no está disponible. No se creó ningún pedido.'
+                                : `No pude cotizar el envío (${result.reason}). No se creó ningún pedido. Puede solicitar otra cotización.`,
+                        };
+                        return {
+                          ok: result.kind === 'quoted',
+                          presentedByApplication: true,
+                        };
+                      } catch {
+                        checkoutRun.value = {
+                          reply:
+                            'No pude cotizar el envío. No se creó ningún pedido. Puede solicitar otra cotización.',
+                        };
+                        return toolError('shipping_unavailable');
+                      }
+                    },
+                  }),
+                }
+              : {}),
             ...(order === undefined || !order.enabled
               ? {}
               : {
                   prepareOrder: tool({
                     description:
-                      'Pide a la aplicación mostrar el resumen del pedido (productos, total y dirección confirmada) para que el cliente lo acepte con SÍ. No crea el pedido por sí misma; el envío no está incluido.',
+                      'Pide a la aplicación mostrar el resumen del pedido (productos, total y dirección confirmada) para que el cliente lo acepte con SÍ. No crea el pedido por sí misma' +
+                      (this.shippingAvailable()
+                        ? '.'
+                        : '; el envío no está incluido.'),
                     inputSchema: z.strictObject({}),
                     strict: true,
                     execute: async () => {

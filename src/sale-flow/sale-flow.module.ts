@@ -44,6 +44,6 @@ import { RealToolRegistry } from './infrastructure/real-tool-registry';
     ShippingModule.forRoot(),
   ],
   providers: [RealToolRegistry],
-  exports: [RealToolRegistry],
+  exports: [RealToolRegistry, ShippingModule],
 })
 export class SaleFlowModule {}

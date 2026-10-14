@@ -37,6 +37,18 @@ import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.
 import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
 import { MinimalOrderService } from './application/minimal-order.service';
+import { MinimalShippingService } from './application/minimal-shipping.service';
+import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
+import type { HumanHandoffService } from '../human-handoff/application/human-handoff.service';
+import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
+import {
+  SHIPPING_QUOTE_PROVIDER,
+  type ShippingQuoteProviderPort,
+} from '../shipping/domain/shipping-quote.port';
+import {
+  MEASURED_DEMO_SHIPPING_CONFIG,
+  type MeasuredDemoShippingConfig,
+} from '../shipping/application/measured-demo-shipping-config';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
@@ -105,6 +117,7 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     ConversationModule,
     ChatbotApiModule,
     SaleFlowModule,
+    HumanHandoffModule,
     // WU-B: DIRECT import (HumanHandoffModule does not re-export these) so the
     // RESTOCK markers/coordinator/recovery seams are visible for the bounded
     // confirmation service factory. Nest de-duplicates the shared instance.
@@ -170,6 +183,38 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     MinimalCartService,
     MinimalCheckoutService,
     MinimalOrderService,
+    {
+      provide: MinimalShippingService,
+      inject: [
+        CONVERSATION_STORE,
+        MinimalCartService,
+        MinimalCheckoutService,
+        ConfigService,
+        { token: SHIPPING_QUOTE_PROVIDER, optional: true },
+        { token: MEASURED_DEMO_SHIPPING_CONFIG, optional: true },
+        HUMAN_HANDOFF_SERVICE_TOKEN,
+      ],
+      useFactory: (
+        store: ConversationStore,
+        cart: MinimalCartService,
+        checkout: MinimalCheckoutService,
+        config: ConfigService,
+        provider: ShippingQuoteProviderPort | undefined,
+        measured: MeasuredDemoShippingConfig | null | undefined,
+        handoff: Pick<HumanHandoffService, 'create'>,
+      ) =>
+        config.get<boolean>('minimalCatalogAgent.shippingEnabled') === true &&
+        provider !== undefined
+          ? new MinimalShippingService(
+              store,
+              cart,
+              checkout,
+              provider,
+              measured ?? null,
+              handoff,
+            )
+          : undefined,
+    },
     {
       provide: MinimalExpirationRequestService,
       inject: [

@@ -76,8 +76,9 @@ const configuration = () => ({
     expirationEnabled:
       process.env.HUMAN_DECISIONS_EXPIRATION_ENABLED === 'true',
     // Default-off order placement (creates real backend sales). Only the
-    // exact env string 'true' enables it; shipping is not part of it yet.
+    // exact env string 'true' enables it.
     orderEnabled: process.env.MINIMAL_CATALOG_ORDER_ENABLED === 'true',
+    shippingEnabled: process.env.MINIMAL_CATALOG_SHIPPING_ENABLED === 'true',
   },
   database: {
     url: process.env.DATABASE_URL as string,

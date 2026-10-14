@@ -1,4 +1,7 @@
 import { Test } from '@nestjs/testing';
+import { Module, type DynamicModule } from '@nestjs/common';
+import { SHIPPING_QUOTE_PROVIDER } from '../shipping/domain/shipping-quote.port';
+import { MEASURED_DEMO_SHIPPING_CONFIG } from '../shipping/application/measured-demo-shipping-config';
 import { ConfigService } from '@nestjs/config';
 import { HttpModule } from '@nestjs/axios';
 import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
@@ -26,6 +29,25 @@ import { SaleFlowModule } from './sale-flow.module';
  *   - ChatbotApiModule + ConversationModule are transitively imported
  *     (CHATBOT_API_CLIENT + CONVERSATION_STORE resolve through the module).
  */
+const SHIPPING_PROBE = Symbol('SHIPPING_PROBE');
+@Module({
+  imports: [SaleFlowModule],
+  providers: [
+    {
+      provide: SHIPPING_PROBE,
+      inject: [
+        { token: SHIPPING_QUOTE_PROVIDER, optional: true },
+        { token: MEASURED_DEMO_SHIPPING_CONFIG, optional: true },
+      ],
+      useFactory: (provider: unknown, measured: unknown) => ({
+        provider,
+        measured,
+      }),
+    },
+  ],
+})
+class ShippingImporter {}
+
 describe('SaleFlowModule', () => {
   // Set up the env so AppConfigModule.forRoot() can validate (with
   // ignoreEnvFile: true, only process.env matters).
@@ -108,10 +130,11 @@ describe('SaleFlowModule', () => {
     end: jest.fn().mockResolvedValue(undefined),
   };
 
-  async function buildModule(restockEnabled?: boolean) {
-    const moduleRef = await Test.createTestingModule({
+  async function buildModule(restockEnabled?: boolean, shipping = false) {
+    const builder = Test.createTestingModule({
       imports: [
         SaleFlowModule,
+        ShippingImporter,
         HttpModule,
         AppConfigModule.forRoot({ ignoreEnvFile: true }),
       ],
@@ -142,9 +165,25 @@ describe('SaleFlowModule', () => {
       .overrideProvider(PG_POOL)
       .useValue(fakePool)
       .overrideProvider(ConfigService)
-      .useValue(stubConfigService(restockEnabled))
-      .compile();
-    return moduleRef;
+      .useValue(stubConfigService(restockEnabled));
+    if (shipping) {
+      const imports = Reflect.getMetadata(
+        'imports',
+        SaleFlowModule,
+      ) as DynamicModule[];
+      const existing = imports.find(
+        (entry) => entry.module === ShippingModule,
+      )!;
+      builder.overrideModule(existing).useModule({
+        module: ShippingModule,
+        providers: [
+          { provide: SHIPPING_QUOTE_PROVIDER, useValue: { quote: jest.fn() } },
+          { provide: MEASURED_DEMO_SHIPPING_CONFIG, useValue: null },
+        ],
+        exports: [SHIPPING_QUOTE_PROVIDER, MEASURED_DEMO_SHIPPING_CONFIG],
+      });
+    }
+    return builder.compile();
   }
 
   // AppConfigModule is imported above to make ConfigService available to
@@ -179,6 +218,27 @@ describe('SaleFlowModule', () => {
       ].sort(),
     );
     await moduleRef.close();
+  });
+
+  it.each([false, true])(
+    'S5: downstream importer sees shipping tokens only when provided (%s)',
+    async (enabled) => {
+      const ref = await buildModule(undefined, enabled);
+      const probe = ref.get<{ provider: unknown; measured: unknown }>(
+        SHIPPING_PROBE,
+      );
+      expect(probe.provider !== undefined).toBe(enabled);
+      expect(probe.measured).toBe(enabled ? null : undefined);
+      await ref.close();
+    },
+  );
+
+  it('S5: re-exports the single ShippingModule for downstream optional injection', () => {
+    const exports: unknown[] = Reflect.getMetadata(
+      'exports',
+      SaleFlowModule,
+    ) as unknown[];
+    expect(exports).toContain(ShippingModule);
   });
 
   it('imports the dynamic ShippingModule exactly once and nothing else shipping', () => {

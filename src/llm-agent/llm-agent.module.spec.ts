@@ -1,6 +1,9 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 
 import { readFileSync } from 'node:fs';
+import type { FactoryProvider } from '@nestjs/common';
+import { MinimalShippingService } from './application/minimal-shipping.service';
+import { SHIPPING_QUOTE_PROVIDER } from '../shipping/domain/shipping-quote.port';
 import { join } from 'node:path';
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
@@ -108,6 +111,40 @@ describe('LlmAgentModule integration', () => {
       update: jest.fn(),
     };
   }
+
+  it.each([
+    [false, undefined, false],
+    [true, undefined, false],
+    [false, { quote: jest.fn() }, false],
+    [true, { quote: jest.fn() }, true],
+  ] as const)(
+    'S5: minimal shipping factory requires gate and provider (%s, %j)',
+    (enabled, provider, available) => {
+      const providers = Reflect.getMetadata(
+        'providers',
+        LlmAgentModule,
+      ) as FactoryProvider[];
+      const factory = providers.find(
+        (entry) => entry.provide === MinimalShippingService,
+      )!;
+      expect(factory.inject).toContainEqual({
+        token: SHIPPING_QUOTE_PROVIDER,
+        optional: true,
+      });
+      const create = factory.useFactory as (...args: unknown[]) => unknown;
+      const service = create(
+        {},
+        {},
+        {},
+        { get: () => enabled },
+        provider,
+        null,
+        { create: jest.fn() },
+      );
+      if (available) expect(service).toBeInstanceOf(MinimalShippingService);
+      else expect(service).toBeUndefined();
+    },
+  );
 
   it('resolves every symbol binding and exports AgentRunner', async () => {
     const moduleRef = await Test.createTestingModule({

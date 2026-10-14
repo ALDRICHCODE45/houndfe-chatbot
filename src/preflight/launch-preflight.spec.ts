@@ -23,6 +23,23 @@ const run = (
 ) => runLaunchPreflight({ env, migrationFilenames });
 
 describe('runLaunchPreflight', () => {
+  it.each([undefined, '', 'true', 'FALSE', 'false'])(
+    'S5: minimal shipping launch posture must be explicit false (%s)',
+    (value) => {
+      const env = safeEnv();
+      env.MINIMAL_CATALOG_SHIPPING_ENABLED = value;
+      expect(run(env).posture).toContainEqual({
+        name: 'MINIMAL_CATALOG_SHIPPING_ENABLED',
+        expected: 'false',
+        status:
+          value === undefined || value === ''
+            ? 'missing'
+            : value === 'false'
+              ? 'safe'
+              : 'unsafe',
+      });
+    },
+  );
   it('passes the happy path with every automatic check satisfied', () => {
     const report = run(safeEnv());
     expect(report.schemaVersion).toBe(1);
