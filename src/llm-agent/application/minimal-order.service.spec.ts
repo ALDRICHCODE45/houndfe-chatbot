@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import type { MinimalShipping } from '../domain/minimal-shipping';
+import {
+  minimalShippingDestination,
+  type MinimalShipping,
+} from '../domain/minimal-shipping';
+import { parseMinimalCart } from './minimal-cart.service';
 import type { ConfigService } from '@nestjs/config';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type {
@@ -254,6 +258,89 @@ async function shippingRecord(
   );
   return shipping;
 }
+
+describe('NEW shipping freshness only (T1)', () => {
+  it('accepts approved current NEW shipping, rejects edits, and still refuses NEW orders', async () => {
+    const h = setup({ atomic: true, shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await h.checkout.updateDetails(SENDER, {
+      ...savedAddress(),
+      firstName: null,
+      lastName: null,
+      useNewAddress: true,
+    });
+    const offer = await h.checkout.prepareConfirmation(SENDER, EVENT('new1'));
+    offer.onSent?.();
+    await h.checkout.consume({
+      senderId: SENDER,
+      text: 'SÍ',
+      inboundEvent: EVENT('new2'),
+    });
+    const draft = (await h.checkout.confirmedDraft(SENDER))!;
+    expect(draft.address.kind).toBe('new');
+    const legacy = await shippingRecord(h);
+    if (!('addressId' in legacy)) throw new Error('legacy fixture');
+    const { addressId, addressVersion, ...rest } = legacy;
+    void addressId;
+    void addressVersion;
+    const shipping = {
+      ...rest,
+      destination: minimalShippingDestination(draft.address),
+    };
+    const cart = parseMinimalCart(await h.minimalCart())!;
+    const quote = await h.cart.view(SENDER);
+    if (!quote.ok) throw new Error('cart fixture');
+    const snapshot = {
+      customerId: CUSTOMER,
+      shippingAddressId: '',
+      draft,
+      items: quote.items,
+      totalCents: quote.totalCents,
+    };
+    expect(h.order['currentShipping']({ ...cart, shipping }, snapshot)).toEqual(
+      {
+        classification: 'charged',
+        chargeCents: 5000,
+        approvalId: 'approval-1',
+        quoteId: 'quote-1',
+      },
+    );
+    if (draft.address.kind !== 'new') throw new Error('new fixture');
+    expect(
+      h.order['currentShipping'](
+        { ...cart, shipping },
+        {
+          ...snapshot,
+          draft: {
+            ...draft,
+            address: {
+              kind: 'new',
+              fields: { ...draft.address.fields, street: 'Edited' },
+            },
+          },
+        },
+      ),
+    ).toBeNull();
+    expect(
+      h.order['currentShipping'](
+        {
+          ...cart,
+          shipping: {
+            ...shipping,
+            approval: { state: 'pending', requestId: 'approval-1' },
+          },
+        },
+        snapshot,
+      ),
+    ).toBeNull();
+    expect((await h.order.prepareOrder(SENDER, EVENT('order-new'))).reply).toBe(
+      MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
+    );
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+});
 
 describe('atomic checkout order S1–S5', () => {
   async function ready(shipping = false) {
@@ -742,7 +829,9 @@ describe('minimal shipping order safety', () => {
         );
       } else {
         const record = await shippingRecord(h);
-        const changes: Partial<MinimalShipping> = {};
+        const changes: Partial<
+          Extract<MinimalShipping, { addressId: string }>
+        > = {};
         if (state === 'not_requested' || state === 'expired')
           changes.approval = { state };
         if (state === 'pending')

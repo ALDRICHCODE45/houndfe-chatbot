@@ -26,6 +26,7 @@ import {
 import {
   buildMinimalShipping,
   classifyMinimalShipping,
+  minimalShippingDestination,
 } from '../domain/minimal-shipping';
 import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
@@ -93,9 +94,11 @@ export class MinimalShippingService {
         quote: quote.ok ? quote : null,
         confirmedDraft: draft,
       });
-      if (!eligibility.ok) return refuse(eligibility.reason);
-      if (!quote.ok || draft === null || draft.address.kind !== 'saved')
-        return refuse('cart_unverified');
+      // Shipping accepts either confirmed destination; new-address ORDER eligibility
+      // remains separately gated by the order service.
+      if (!eligibility.ok && eligibility.reason !== 'new_address_unsupported')
+        return refuse(eligibility.reason);
+      if (!quote.ok || draft === null) return refuse('cart_unverified');
       // Fresh prices must still describe these exact stored lines and total.
       if (
         stored.items.length !== quote.items.length ||
@@ -131,7 +134,10 @@ export class MinimalShippingService {
         quote.items,
       );
       if (prepared === null) return refuse('measurements_unavailable');
-      const address = draft.address.snapshot;
+      const address =
+        draft.address.kind === 'saved'
+          ? draft.address.snapshot
+          : draft.address.fields;
       const createdAt = new Date().toISOString();
       const outcome = await this.orchestrator.quote({
         requestInput: {
@@ -174,8 +180,7 @@ export class MinimalShippingService {
             finalPriceCents,
           }),
         ),
-        addressId: address.id,
-        addressVersion: address.version,
+        destination: minimalShippingDestination(draft.address),
         createdAt,
       });
       if (shipping === null || Date.now() >= Date.parse(shipping.expiresAt))

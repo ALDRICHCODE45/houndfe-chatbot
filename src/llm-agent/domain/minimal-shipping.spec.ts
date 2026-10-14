@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   buildMinimalShipping,
   classifyMinimalShipping,
@@ -64,7 +65,113 @@ const context = () => ({
   nowMs: NOW,
 });
 
+const newFields = {
+  label: null,
+  street: 'Juárez',
+  exteriorNumber: '10',
+  interiorNumber: null,
+  zipCode: '06000',
+  neighborhood: 'Centro',
+  municipality: null,
+  city: 'Cuauhtémoc',
+  state: 'Ciudad de México',
+  visualReferences: null,
+  carrierPhone: null,
+};
+const fingerprint = createHash('sha256')
+  .update(
+    JSON.stringify([
+      newFields.street,
+      newFields.exteriorNumber,
+      newFields.interiorNumber,
+      newFields.zipCode,
+      newFields.neighborhood,
+      newFields.municipality,
+      newFields.city,
+      newFields.state,
+    ]),
+  )
+  .digest('hex');
+
 describe('Minimal shipping (T2)', () => {
+  it('[S5] binds NEW quotes to canonical confirmed fields, not object-key order or phone', () => {
+    const built = buildMinimalShipping({
+      quote,
+      cartLines: lines,
+      createdAt: CREATED,
+      destination: { kind: 'new', fingerprint },
+    });
+    expect(built).not.toBeNull();
+    if (!built) throw new Error('new fixture rejected');
+    const current = {
+      cartLines: lines,
+      address: { kind: 'new' as const, fields: newFields },
+      nowMs: NOW,
+    };
+    expect(isShippingCurrent(built, current)).toBe('current');
+    expect(
+      isShippingCurrent(built, {
+        ...current,
+        address: {
+          kind: 'new',
+          fields: {
+            ...newFields,
+            carrierPhone: '5550000000',
+            label: 'Other',
+            visualReferences: 'Door',
+          },
+        },
+      }),
+    ).toBe('current');
+    for (const field of [
+      'street',
+      'exteriorNumber',
+      'interiorNumber',
+      'zipCode',
+      'neighborhood',
+      'municipality',
+      'city',
+      'state',
+    ] as const) {
+      expect(
+        isShippingCurrent(built, {
+          ...current,
+          address: { kind: 'new', fields: { ...newFields, [field]: 'edited' } },
+        }),
+      ).toBe('stale');
+    }
+    expect(isShippingCurrent(built, context())).toBe('stale');
+    expect(isShippingCurrent(record(), current)).toBe('stale');
+    expect(isShippingCurrent(built, { ...current, nowMs: NOW + 1800000 })).toBe(
+      'expired',
+    );
+  });
+  it('[S5] preserves old saved records and parses discriminated destinations strictly', () => {
+    const legacy = record();
+    expect(minimalShippingSchema.parse(legacy)).toEqual(legacy);
+    if (!('addressId' in legacy)) throw new Error('legacy fixture');
+    const { addressId, addressVersion, ...rest } = legacy;
+    const saved = minimalShippingSchema.parse({
+      ...rest,
+      destination: { kind: 'saved', addressId, version: addressVersion },
+    });
+    expect(isShippingCurrent(saved, context())).toBe('current');
+    expect(
+      minimalShippingSchema.safeParse({
+        ...legacy,
+        destination: { kind: 'new', fingerprint },
+      }).success,
+    ).toBe(false);
+    for (const destination of [
+      { kind: 'new', fingerprint: 'bad' },
+      { kind: 'new', fingerprint, addressId: ADDRESS },
+      { kind: 'saved', addressId: ADDRESS },
+    ]) {
+      expect(
+        minimalShippingSchema.safeParse({ ...rest, destination }).success,
+      ).toBe(false);
+    }
+  });
   // prettier-ignore
   it('[S1,S6] requests pending explicitly; cannot skip pending or restart approval', () => {
     const fresh = record();

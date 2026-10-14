@@ -7,6 +7,8 @@ import type { ShippingQuoteRequest } from '../../shipping/domain/shipping-quote.
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 import { MinimalShippingService } from './minimal-shipping.service';
+import { decideApproval, shippingDigest } from './minimal-shipping-approval';
+import { parseMinimalCart } from './minimal-cart.service';
 
 const SENDER = '5215550001111';
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
@@ -183,14 +185,24 @@ describe('MinimalShippingService (T3)', () => {
     expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'delivery_unconfirmed' });
     expect(h.provider.quote).not.toHaveBeenCalled();
   });
-  it('[S1] refuses a confirmed new address', async () => {
-    const h = await setup(); await h.confirm();
+  it.each([[1500, 'charged', 20000], [50001, 'free', 0]] as const)('[S5] quotes a confirmed NEW address with unchanged approval (%s)', async (price, classification, customerPaysCents) => {
+    const h = await setup(price); await h.confirm();
     await h.checkout.updateDetails(SENDER, { ...address, firstName: null, lastName: null, useNewAddress: true });
     const offer = await h.checkout.prepareConfirmation(SENDER, event('n1')); offer.onSent?.();
     await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('n2') });
     expect((await h.checkout.confirmedDraft(SENDER))?.address.kind).toBe('new');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'new_address_unsupported' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'quoted', classification });
+    expect(h.provider.quote).toHaveBeenCalledTimes(1);
+    expect(h.provider.quote.mock.calls[0][0].destination).toEqual({ countryCode: 'MX', postalCode: address.zipCode, state: address.state, municipality: address.city, neighborhood: address.neighborhood });
+    const shipping = parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!;
+    expect(shipping).toMatchObject({ destination: { kind: 'new' }, customerPaysCents, approval: { state: 'pending', requestId: 'abcdef123456' } });
+    expect(shipping).toHaveProperty('destination.fingerprint', expect.stringMatching(/^[a-f0-9]{64}$/));
+    expect(h.handoff.create.mock.calls[0]).toEqual([{ senderId: SENDER, kind: 'shipping_approval', digest: shippingDigest(shipping) }]);
+    expect(JSON.stringify(shippingDigest(shipping))).not.toMatch(/Juárez|06000|521555|fingerprint/);
+    const decision = await decideApproval(h.store, SENDER, 'abcdef123456', shippingDigest(shipping), 'approved', Date.now());
+    expect(decision?.state).toBe('approved');
+    expect(decision?.reply).toContain(classification === 'free' ? 'envío cubierto' : '$200.00');
+    expect(parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!.approval.state).toBe('approved');
   });
   it('[S4] refuses outstanding uncertain-order lock', async () => {
     const h = await setup(); await h.confirm();

@@ -19,10 +19,12 @@ S6 — Inherited safety unchanged: exact-snapshot one-shot SÍ, payload fingerpr
 
 ## Tasks
 
-T1 [S5] route=worker; status=pending; shipping quote/approval/freshness for a confirmed new address; commit=pending.
+T1 [S5] route=worker mv7kih1h-r-q3jo; status=done (L3); shipping quote/approval/freshness for a confirmed new address; commit=pending.
 T2 [S2,S3,S4,S6] route=worker; status=pending (needs MEXICAN_STATES list); order eligibility + checkout payload createIfAbsent/newSaved + state mapping + replies; commit=pending.
 T3 [S2] route=inline; status=pending; docs + independent verification; commit=pending.
 
 ## Log
 
 L1 — Owner request, verbatim: "Adelante." (see S1). Parent spot check: the MEXICAN_STATES list exists only in the backend (src/sale-flow/application/tools/upsert-customer.tool.ts:17-20 documents that the chatbot never duplicated it); requested from the backend session.
+L2 — Backend reply (session 01a135e7, read-only): MEXICAN_STATES defined at houndfe-backend src/customers/domain/constants.ts:2 (lines 2–35), exactly 32 values: 'Aguascalientes', 'Baja California', 'Baja California Sur', 'Campeche', 'Chiapas', 'Chihuahua', 'Ciudad de México', 'Coahuila', 'Colima', 'Durango', 'Estado de México', 'Guanajuato', 'Guerrero', 'Hidalgo', 'Jalisco', 'Michoacán', 'Morelos', 'Nayarit', 'Nuevo León', 'Oaxaca', 'Puebla', 'Querétaro', 'Quintana Roo', 'San Luis Potosí', 'Sinaloa', 'Sonora', 'Tabasco', 'Tamaulipas', 'Tlaxcala', 'Veracruz', 'Yucatán', 'Zacatecas'. Validation is class-validator @IsIn with strict === (case- and accent-sensitive, no trim, no Unicode normalization): 'Ciudad de México' accepted; 'CDMX', 'Ciudad de Mexico', 'ciudad de méxico' and padded values rejected. newSaved inherits it (checkout.request.ts:55; customer-upsert.request.ts:62). No backend alias mapping exists (CDMX/Edomex/Distrito Federal would be chatbot-side aliases). state is optional at the API but required by our S7 readiness gate. T2 unblocked; it starts after T1 because both edit minimal-order.service.ts.
+L3 — T1 by worker mv7kih1h-r-q3jo: RED service 2 / domain 2 / order-helper 1 intended failures; GREEN focused 139 passed; src/llm-agent+human-handoff+whatsapp+shipping 92 suites/2686 passed (6 skipped); ESLint exit0; tsc only the 9 known test/ errors; diff --check exit0. Shipping record destination is now a strict union saved{addressId, version} | new{fingerprint = SHA-256 of canonical street, exteriorNumber, interiorNumber, zipCode, neighborhood, municipality, city, state}; legacy saved records still parse; any of the eight fields edited makes the quote stale; approval digest stays redacted. NEW-address orders are still refused (eligibility is T2). Parent re-ran the focused specs.

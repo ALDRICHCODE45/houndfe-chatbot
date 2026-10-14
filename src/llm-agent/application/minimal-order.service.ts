@@ -391,7 +391,6 @@ export class MinimalOrderService {
     if (
       record === undefined ||
       record.approval.state !== 'approved' ||
-      address.kind !== 'saved' ||
       isShippingCurrent(record, {
         cartLines: snapshot.items.map((item) => ({
           productId: item.productId,
@@ -402,8 +401,7 @@ export class MinimalOrderService {
           unitPriceCents: item.unitPriceCents,
           finalPriceCents: item.finalPriceCents,
         })),
-        addressId: address.snapshot.id,
-        addressVersion: address.snapshot.version,
+        address,
         nowMs: Date.now(),
       }) !== 'current'
     )

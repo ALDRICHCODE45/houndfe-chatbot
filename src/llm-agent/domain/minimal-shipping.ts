@@ -5,7 +5,8 @@
  * are provider labels/ETA. All amounts are integer MXN cents.
  * `cartLines` bind identity, quantity, unit price and evaluated merchandise
  * line total (`finalPriceCents`); line ordering is not significant.
- * `addressId`/`addressVersion` bind the confirmed saved-address snapshot.
+ * `destination` binds saved id/version or a SHA-256 of confirmed new-address
+ * fields. Legacy top-level `addressId`/`addressVersion` records still parse.
  * `createdAt`/`expiresAt` are zoned ISO timestamps, capped at 30 minutes and
  * provider/rate validity. `approval.state` starts not_requested, then pending {requestId}, approved
  * or rejected {requestId, decidedAt}, or expired (no decision metadata).
@@ -13,7 +14,9 @@
  * disclosure or sale. Callers must separately require approved (S1).
  * No clock, store, transport, framework or SDK dependency.
  */
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import type { MinimalCheckoutDraftAddress } from '../../conversation/domain/minimal-checkout-draft';
 import { calculateShippingCredit } from '../../shipping/domain/shipping-credit';
 import {
   normalizeShippingQuoteQuotedResult,
@@ -66,24 +69,70 @@ const approvalSchema = z.discriminatedUnion('state', [
   z.strictObject({ state: z.literal('expired') }),
 ]);
 
-/** Strict persisted sub-record; arithmetic and chronology fail closed. */
-export const minimalShippingSchema = z
-  .strictObject({
-    quoteId: label,
-    rateId: label,
-    carrierName: label,
-    serviceName: label,
-    estimatedDeliveryDays: money.nullable(),
-    bestRateCents: money,
-    totalCreditCents: money,
-    customerPaysCents: money,
-    cartLines: cartLinesSchema,
+const destinationSchema = z.discriminatedUnion('kind', [
+  z.strictObject({
+    kind: z.literal('saved'),
     addressId: z.uuid(),
-    addressVersion: iso,
-    createdAt: iso,
-    expiresAt: iso,
-    approval: approvalSchema,
-  })
+    version: iso,
+  }),
+  z.strictObject({
+    kind: z.literal('new'),
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  }),
+]);
+export type MinimalShippingDestination = z.infer<typeof destinationSchema>;
+
+/** Fixed-order, lossless canonical content; never normalize away an address edit. */
+export function minimalShippingDestination(
+  address: MinimalCheckoutDraftAddress,
+): MinimalShippingDestination {
+  if (address.kind === 'saved') {
+    return {
+      kind: 'saved',
+      addressId: address.snapshot.id,
+      version: address.snapshot.version,
+    };
+  }
+  const f = address.fields;
+  return {
+    kind: 'new',
+    fingerprint: createHash('sha256')
+      .update(
+        JSON.stringify([
+          f.street,
+          f.exteriorNumber,
+          f.interiorNumber,
+          f.zipCode,
+          f.neighborhood,
+          f.municipality,
+          f.city,
+          f.state,
+        ]),
+      )
+      .digest('hex'),
+  };
+}
+
+const shippingFields = z.strictObject({
+  quoteId: label,
+  rateId: label,
+  carrierName: label,
+  serviceName: label,
+  estimatedDeliveryDays: money.nullable(),
+  bestRateCents: money,
+  totalCreditCents: money,
+  customerPaysCents: money,
+  cartLines: cartLinesSchema,
+  createdAt: iso,
+  expiresAt: iso,
+  approval: approvalSchema,
+});
+/** Strict persisted record; legacy saved records remain parseable without rewriting. */
+export const minimalShippingSchema = z
+  .union([
+    shippingFields.extend({ addressId: z.uuid(), addressVersion: iso }),
+    shippingFields.extend({ destination: destinationSchema }),
+  ])
   .refine((record) => {
     const credit = calculateShippingCredit({
       bestRateCents: record.bestRateCents,
@@ -108,13 +157,16 @@ export type MinimalShipping = z.infer<typeof minimalShippingSchema>;
 export type MinimalShippingCartLine = z.infer<typeof cartLineSchema>;
 
 /** Build an unstarted draft; invalid/expired provider or credit => null. */
-export function buildMinimalShipping(input: {
-  quote: ShippingQuoteQuotedResult;
-  cartLines: readonly MinimalShippingCartLine[];
-  addressId: string;
-  addressVersion: string;
-  createdAt: string;
-}): MinimalShipping | null {
+export function buildMinimalShipping(
+  input: {
+    quote: ShippingQuoteQuotedResult;
+    cartLines: readonly MinimalShippingCartLine[];
+    createdAt: string;
+  } & (
+    | { addressId: string; addressVersion: string }
+    | { destination: MinimalShippingDestination }
+  ),
+): MinimalShipping | null {
   const quote = normalizeShippingQuoteQuotedResult(input.quote);
   if (!quote || !iso.safeParse(input.createdAt).success) return null;
   const best = quote.rates.reduce((a, b) =>
@@ -141,8 +193,9 @@ export function buildMinimalShipping(input: {
     totalCreditCents: credit.totalCreditCents,
     customerPaysCents: credit.customerPaysCents,
     cartLines: input.cartLines,
-    addressId: input.addressId,
-    addressVersion: input.addressVersion,
+    ...('destination' in input
+      ? { destination: input.destination }
+      : { addressId: input.addressId, addressVersion: input.addressVersion }),
     createdAt: input.createdAt,
     expiresAt: new Date(expiresMs).toISOString(),
     approval: { state: 'not_requested' },
@@ -161,10 +214,11 @@ export function isShippingCurrent(
   record: MinimalShipping,
   context: {
     cartLines: readonly MinimalShippingCartLine[];
-    addressId: string;
-    addressVersion: string;
     nowMs: number;
-  },
+  } & (
+    | { addressId: string; addressVersion: string }
+    | { address: MinimalCheckoutDraftAddress }
+  ),
 ): 'stale' | 'expired' | 'current' {
   if (
     record.approval.state === 'expired' ||
@@ -177,10 +231,31 @@ export function isShippingCurrent(
   )
     return 'stale';
   const lines = cartLinesSchema.safeParse(context.cartLines);
+  const expected =
+    'destination' in record
+      ? record.destination
+      : {
+          kind: 'saved' as const,
+          addressId: record.addressId,
+          version: record.addressVersion,
+        };
+  const current =
+    'address' in context
+      ? minimalShippingDestination(context.address)
+      : {
+          kind: 'saved' as const,
+          addressId: context.addressId,
+          version: context.addressVersion,
+        };
+  const sameDestination =
+    expected.kind === 'new'
+      ? current.kind === 'new' && current.fingerprint === expected.fingerprint
+      : current.kind === 'saved' &&
+        current.addressId === expected.addressId &&
+        current.version === expected.version;
   if (
     !lines.success ||
-    context.addressId !== record.addressId ||
-    context.addressVersion !== record.addressVersion ||
+    !sameDestination ||
     lines.data.length !== record.cartLines.length
   )
     return 'stale';
