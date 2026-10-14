@@ -1,6 +1,6 @@
 # EXPIRATION runtime — default-off intake
 
-Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery includes controlled-writer STALE recovery; expired/no-ledger handling included; full-flow deployment rehearsal pending.** Business/wire rules remain authoritative in
+Status: **E1b intake connected; E2 polling/preparation delivered; E3 send boundary wired default-off; E4 terminal outcome/ACK recovery includes controlled-writer STALE recovery; expired/no-ledger handling included; E4 closed locally, full-flow checks run on the deployed bot.** Business/wire rules remain authoritative in
 `docs/human-decisions-expiration-v1.md`. E1 is split into two units:
 
 - **E1a (this unit):** the default-off callee — one cohesive service plus the
@@ -182,7 +182,8 @@ Run the isolated proof (Docker and `postgres:16-alpine` required):
 RUN_DOCKER_TESTS=1 pnpm test --runTestsByPath src/human-decisions/infrastructure/postgres-expiration-application-outcome-coordinator.db.spec.ts --runInBand
 ```
 
-- **Owner-run manual rehearsal is still required before activation.** On a
-  disposable branch confirm discovery → preparation → send → acceptance →
-  report/ACK → closure, then restart mid-outcome and confirm the next sweep
-  resumes reporting without resend; deployment/activation/commits stay manual.
+- **Post-deploy test plan (features are tested deployed).** With
+  `HUMAN_DECISIONS_EXPIRATION_ENABLED=true` on the deployed bot, confirm
+  discovery → preparation → send → acceptance → report/ACK → closure on a real
+  inquiry, then restart the service mid-outcome and confirm the next sweep
+  resumes reporting without resend. Activation stays an owner decision.
