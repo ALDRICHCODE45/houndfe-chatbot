@@ -1029,6 +1029,13 @@ describe('Minimal cart through the public SDK route', () => {
       expected: 0,
     },
     {
+      text: 'Solo deja las croquetas en mi carrito por favor, quita todo lo demas',
+      initial: 2,
+      tool: 'setCartItem',
+      input: { quantity: 0, quantityText: null },
+      expected: 0,
+    },
+    {
       text: 'Quita uno por favor',
       initial: 2,
       tool: 'adjustCartItem',
@@ -1088,6 +1095,12 @@ describe('Minimal cart through the public SDK route', () => {
         | { description?: unknown }
         | undefined;
       expect(setTool?.description).toMatch(/cero lo quita/i);
+      // Whole-line removal has no number to cite: the model must send
+      // quantity 0 with quantityText null, never an invented "0" citation.
+      expect(f.optionsSeen[0].system).toContain('«Quita el ibuprofeno»');
+      expect(f.optionsSeen[0].system).toContain(
+        'setCartItem(quantity: 0, quantityText: null)',
+      );
       expect(f.api.createSale).not.toHaveBeenCalled();
       expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
     },
