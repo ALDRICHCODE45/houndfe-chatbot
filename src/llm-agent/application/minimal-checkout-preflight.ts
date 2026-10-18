@@ -56,7 +56,15 @@ const blocked = (
 });
 
 /** Only application-owned wording reaches the customer after a preflight call. */
-export function minimalCheckoutReply(result: MinimalCheckoutPreflight): string {
+export function minimalCheckoutReply(
+  result: MinimalCheckoutPreflight,
+  flow: { checkout: boolean; shipping: boolean } = {
+    checkout: false,
+    shipping: false,
+  },
+): string {
+  if (result.ok && flow.checkout)
+    return `Revisión de compra: subtotal de productos $${(result.productsSubtotalCents / 100).toFixed(2)} MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega${flow.shipping ? ', obtener un envío aprobado' : ''} y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.`;
   if (result.ok)
     return `Revisión de compra: subtotal de productos $${(result.productsSubtotalCents / 100).toFixed(2)} MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.`;
   switch (result.reason) {

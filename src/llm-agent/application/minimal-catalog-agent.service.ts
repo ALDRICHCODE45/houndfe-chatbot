@@ -614,7 +614,10 @@ export class MinimalCatalogAgentService {
         ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
-        'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. Es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
+        (checkoutRun === null
+          ? 'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. '
+          : 'Si el cliente quiere comprar o continuar con la compra, NO llame reviewCheckout: llame lookupCheckoutCustomer (ver Datos de entrega). Llame reviewCheckout sin argumentos solo si pide revisar su compra o cuánto lleva. ') +
+        'reviewCheckout es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
         (checkoutRun === null ? '' : CHECKOUT_INSTRUCTIONS_FRAGMENT) +
         (checkoutRun !== null && this.orderAvailable()
           ? this.shippingAvailable()
@@ -1192,7 +1195,12 @@ export class MinimalCatalogAgentService {
               // Preserve existing mutation and clarification acknowledgements.
               // A later plain getCart read cannot erase this preflight outcome.
               if (!mutationAcknowledged && !clarificationAcknowledged)
-                acknowledge(minimalCheckoutReply(result));
+                acknowledge(
+                  minimalCheckoutReply(result, {
+                    checkout: checkoutRun !== null,
+                    shipping: checkoutRun !== null && this.shippingAvailable(),
+                  }),
+                );
               trace(
                 `tool reviewCheckout result=${result.ok ? 'incomplete' : 'blocked'} code=${result.ok ? 'requirements_pending' : result.reason}`,
               );

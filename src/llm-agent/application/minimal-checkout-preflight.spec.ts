@@ -8,6 +8,7 @@ import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
+import { minimalCheckoutReply } from './minimal-checkout-preflight';
 import { MinimalCartSelections } from '../domain/minimal-cart-selections';
 import type { MinimalRestockRequestService } from './minimal-restock-request.service';
 import type { MinimalExpirationRequestService } from './minimal-expiration-request.service';
@@ -467,5 +468,41 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     ).toEqual({ kind: 'not-handled' });
     expect(f.seen).toHaveLength(0);
     expect(active.seen).toHaveLength(0);
+  });
+});
+
+describe('Checkout preflight reply when the checkout flow is available', () => {
+  const incomplete = {
+    ok: true as const,
+    status: 'incomplete' as const,
+    productsSubtotalCents: 4500,
+    missing: [
+      'customer_and_address',
+      'approved_shipping',
+      'explicit_confirmation',
+    ] as const,
+    orderCreated: false as const,
+  };
+
+  it('points to the next step and omits shipping approval when shipping is off', () => {
+    expect(
+      minimalCheckoutReply(incomplete, { checkout: true, shipping: false }),
+    ).toBe(
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
+    );
+  });
+
+  it('keeps shipping approval as a step when shipping is on', () => {
+    expect(
+      minimalCheckoutReply(incomplete, { checkout: true, shipping: true }),
+    ).toBe(
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, obtener un envío aprobado y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
+    );
+  });
+
+  it('keeps the previous wording without the checkout flow', () => {
+    expect(minimalCheckoutReply(incomplete)).toBe(
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+    );
   });
 });

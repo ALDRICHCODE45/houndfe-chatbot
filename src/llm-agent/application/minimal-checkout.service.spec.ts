@@ -822,6 +822,26 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
       expect(fn).not.toHaveBeenCalled();
   });
 
+  it('routes a purchase request to the address lookup, not the cart review', async () => {
+    const h = setup();
+    await h.turn('Quiero comprarlo', [say()]);
+    const system = String(h.seen[0].system);
+    expect(system).toContain(
+      'Si el cliente quiere comprar o continuar con la compra, NO llame reviewCheckout: llame lookupCheckoutCustomer',
+    );
+    expect(system).not.toContain(
+      'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout',
+    );
+  });
+
+  it('keeps routing purchases to the cart review without the checkout capability', async () => {
+    const h = setup({ checkout: false });
+    await h.turn('Quiero comprarlo', [say()]);
+    expect(String(h.seen[0].system)).toContain(
+      'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout',
+    );
+  });
+
   it('exposes no checkout tools without the checkout capability', async () => {
     const h = setup({ checkout: false });
     await h.turn('Hola', [say()]);
