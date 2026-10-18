@@ -24,6 +24,7 @@ import type {
   CartOperation,
   MinimalCartQuantityIntent,
 } from '../domain/minimal-cart-quantity';
+import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import {
   GENERATE_TEXT,
@@ -38,6 +39,7 @@ import {
   CART_UNKNOWN_REFERENCE_REPLY,
   MinimalCartConversation,
   cartAdjustToolInput,
+  cartKeepOnlyToolInput,
   cartPrepareToolInput,
   cartSetToolInput,
   type ResolvedCartSelection,
@@ -72,6 +74,7 @@ const CART_TRACE_ERROR_CODES = new Set([
   'invalid_quantity_or_identity',
   'invalid_cart',
   'unknown_product',
+  'unknown_cart_line',
   'item_not_in_cart',
   'cart_changed',
   'cart_unavailable',
@@ -601,7 +604,7 @@ export class MinimalCatalogAgentService {
         'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total; un delta positivo también crea un renglón nuevo. ' +
         'En ambas, quantityText debe ser el fragmento LITERAL del mensaje actual que respalda el número (por ejemplo "2", "una"); si no lo cita, la aplicación pedirá aclaración. ' +
         'Interprete lenguaje cotidiano: «Agrega 2» suma dos con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
-        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Quita el ibuprofeno» o «quita todo lo demás» elimina renglones completos: llame setCartItem(quantity: 0, quantityText: null) una vez por cada renglón que el cliente pidió quitar; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
+        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Solo deja las croquetas», «quita todo lo demás» o «que solo contenga las croquetas»: llame getCart si hace falta, luego keepOnlyCartItems con keepSelectionRefs: los cartSelectionRef de cada renglón que se queda, obtenidos de getCart en este turno; nunca elimine renglones uno por uno para esa solicitud. «Quita el ibuprofeno» elimina un renglón completo: llame setCartItem(quantity: 0, quantityText: null) para ese renglón; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
         'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
         'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
         '«Sí, la de 500mg» elige una presentación, NO una cantidad: si no hay cantidad pendiente, use adjustCartItem(delta: null, quantityText: null) para conservar la selección y preguntar cuántas unidades. «Un ibuprofeno de 500» indica una unidad: cite "un", no la dosis. Nunca use setCartItem(quantity: 0) para elegir presentación. ' +
@@ -860,7 +863,7 @@ export class MinimalCatalogAgentService {
     traceId: string,
     restockRun: RestockRun | null,
     expirationReply: ExpirationReply | null,
-    context: { senderId: string; inboundEvent?: unknown },
+    context: { senderId: string; text: string; inboundEvent?: unknown },
     cartReply: ExpirationReply,
     cartConversation: MinimalCartConversation | null,
     checkoutRun: CheckoutRun | null = null,
@@ -1079,6 +1082,8 @@ export class MinimalCatalogAgentService {
     // a different operation, and its server acknowledgement must survive later
     // clarifications, unknown references and preparation errors.
     const attemptedLines = new Set<string>();
+    let keepOnlyAttempted = false;
+    let keepOnlySettled = false;
     const lineKey = (identity: MinimalCartSelectionIdentity): string =>
       `${identity.productId}\u0000${identity.variantId ?? ''}`;
     let mutationAcknowledged = false;
@@ -1155,7 +1160,7 @@ export class MinimalCatalogAgentService {
         return { ok: false, error: 'cart_unavailable' };
       // Line-level bound: a rejected attempt cannot be retried through another
       // operation in the same run, and it never overwrites the first reply.
-      if (attemptedLines.has(lineKey(identity)))
+      if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
       const grounded = conversation.ground(identity, proposal);
       trace(
@@ -1229,6 +1234,51 @@ export class MinimalCatalogAgentService {
                   : { ...item, cartSelectionRef: ref };
               });
               return { ...result, items };
+            },
+          }),
+          keepOnlyCartItems: tool({
+            description:
+              'Conserva SOLO los renglones elegidos por sus cartSelectionRef de getCart y quita todos los demás en una sola escritura, sin cambiar cantidades. Solo para una solicitud explícita de conservar únicamente esos productos, sin cantidades. No vacía el carrito ni crea pedidos.',
+            inputSchema: cartKeepOnlyToolInput,
+            strict: true,
+            execute: async ({ keepSelectionRefs }) => {
+              if (conversation === null) return toolError('cart_unavailable');
+              if (keepOnlyAttempted) {
+                trace('cart_keep_only result=error code=cart_line_settled');
+                return toolError('cart_line_settled');
+              }
+              keepOnlyAttempted = true;
+              if (!hasKeepOnlyCartEvidence(context.text)) {
+                trace(
+                  'cart_keep_only result=invalid_evidence code=invalid_cart_evidence',
+                );
+                acknowledge(CART_OPERATION_CLARIFICATION);
+                return toolError('invalid_cart_evidence');
+              }
+              const keep: ResolvedCartSelection[] = [];
+              for (const ref of keepSelectionRefs) {
+                const identity = conversation.resolve(ref);
+                if (identity === null) {
+                  trace(
+                    'cart_keep_only result=unknown_selection code=unknown_cart_selection',
+                  );
+                  acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
+                  return toolError('unknown_cart_selection');
+                }
+                keep.push(identity);
+              }
+              trace('cart_keep_only result=ready code=none');
+              keepOnlySettled = true;
+              for (const line of conversation.snapshot().selections)
+                attemptedLines.add(lineKey(line));
+              conversation.clearPending();
+              const result = await cart.keepOnly(context.senderId, keep);
+              trace(
+                `cart_keep_only result=${result.ok ? 'ok' : 'error'} code=${result.ok ? 'none' : CART_TRACE_ERROR_CODES.has(result.error) ? result.error : 'unrecognized_cart_error'}`,
+              );
+              cartReply.value = minimalCartReply(result);
+              mutationAcknowledged = true;
+              return result;
             },
           }),
           adjustCartItem: tool({
@@ -1339,7 +1389,7 @@ export class MinimalCatalogAgentService {
                 acknowledge(CART_UNKNOWN_REFERENCE_REPLY);
                 return toolError('unknown_cart_selection');
               }
-              if (attemptedLines.has(lineKey(identity)))
+              if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
               const grounded = conversation.prepare(identity, {
                 operation,

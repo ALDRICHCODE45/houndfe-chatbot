@@ -153,6 +153,57 @@ export class MinimalCartService {
     );
   }
 
+  /** Retain exact existing pairs with unchanged quantities, in one CAS; never retry. */
+  async keepOnly(
+    senderId: string,
+    keep: Array<Pick<CartItem, 'productId' | 'variantId'>>,
+  ): Promise<MinimalCartResult> {
+    try {
+      const raw = structuredClone(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      const cart = this.read(raw);
+      if (!cart) return { ok: false, error: 'invalid_cart' };
+      if (cart.idempotencyKey !== '')
+        return { ok: false, error: 'order_unresolved' };
+      if (
+        keep.length === 0 ||
+        keep.some(
+          (identity) => !cart.items.some((line) => sameLine(line, identity)),
+        )
+      )
+        return { ok: false, error: 'unknown_cart_line' };
+      const items = cart.items.filter((line) =>
+        keep.some((identity) => sameLine(line, identity)),
+      );
+      const quote = await this.quote(items);
+      if (!quote.ok || items.length === cart.items.length) return quote;
+      const next: CartState = {
+        items: quote.items.map(
+          ({ productId, variantId, quantity, unitPriceCents }) => ({
+            productId,
+            ...(variantId ? { variantId } : {}),
+            quantity,
+            unitPriceCents,
+          }),
+        ),
+        idempotencyKey: '',
+        expectedTotalCents: quote.totalCents,
+      };
+      if (!this.store.commitMinimalCart)
+        return { ok: false, error: 'cart_unavailable' };
+      const saved = await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+      return saved ? quote : { ok: false, error: 'cart_changed' };
+    } catch {
+      return { ok: false, error: 'cart_unavailable' };
+    }
+  }
+
   private async changeItem(
     senderId: string,
     input: MinimalCartInput | MinimalCartAdjustmentInput,

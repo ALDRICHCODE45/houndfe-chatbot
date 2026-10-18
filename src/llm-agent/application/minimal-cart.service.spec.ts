@@ -78,6 +78,83 @@ const shipping = {
   approval: { state: 'pending', requestId: 'request-1' },
 };
 describe('Minimal cart public operations', () => {
+  it.each([
+    'remove',
+    'unknown',
+    'variant',
+    'locked',
+    'noop',
+    'conflict',
+    'pricing',
+    'empty',
+  ] as const)(
+    '[S3] keep-only %s validates all identities before one CAS, never retries',
+    async (mode) => {
+      const f = setup();
+      const items = [
+        { productId: PRODUCT, quantity: 2, unitPriceCents: 1000 },
+        {
+          productId: OTHER,
+          variantId: VARIANT,
+          quantity: 4,
+          unitPriceCents: 900,
+        },
+      ];
+      await f.store.commitMinimalCart(
+        SENDER,
+        undefined,
+        {
+          items: mode === 'noop' ? [items[0]] : items,
+          idempotencyKey: mode === 'locked' ? OTHER : '',
+        },
+        shipping.createdAt,
+      );
+      const before = await f.store.get(SENDER);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      if (mode === 'conflict') commit.mockResolvedValue(false);
+      if (mode === 'pricing')
+        f.api.evaluateCart.mockResolvedValue({
+          items: [],
+          promotionEvaluationStatus: 'fully_evaluated',
+        });
+      const keep =
+        mode === 'empty'
+          ? []
+          : mode === 'unknown'
+            ? [{ productId: PRODUCT }, { productId: VARIANT }]
+            : mode === 'variant'
+              ? [{ productId: OTHER }]
+              : [{ productId: PRODUCT }, { productId: PRODUCT }];
+      const result = await f.service.keepOnly(SENDER, keep);
+      if (mode === 'remove' || mode === 'noop')
+        expect(result).toMatchObject({
+          ok: true,
+          items: [{ productId: PRODUCT, quantity: 2 }],
+        });
+      else
+        expect(result).toEqual({
+          ok: false,
+          error:
+            mode === 'locked'
+              ? 'order_unresolved'
+              : mode === 'conflict'
+                ? 'cart_changed'
+                : mode === 'pricing'
+                  ? 'invalid_evaluation'
+                  : 'unknown_cart_line',
+        });
+      expect(commit).toHaveBeenCalledTimes(
+        mode === 'remove' || mode === 'conflict' ? 1 : 0,
+      );
+      if (mode === 'remove')
+        expect((await f.store.get(SENDER))?.data.minimalCart).toEqual({
+          items: [items[0]],
+          idempotencyKey: '',
+          expectedTotalCents: 1900,
+        });
+      else expect(await f.store.get(SENDER)).toEqual(before);
+    },
+  );
   it('[S1,S4] accepts strict optional shipping and rejects malformed sub-records', () => {
     const cart = { items: [], idempotencyKey: '', shipping };
     expect(parseMinimalCart(cart)).toEqual(cart);

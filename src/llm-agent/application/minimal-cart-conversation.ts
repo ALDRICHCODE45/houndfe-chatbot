@@ -34,6 +34,11 @@ import {
   type MinimalCartPendingRequest,
 } from '../domain/minimal-cart-quantity';
 
+/** Only existing cart lines to retain; an empty-cart command is not supported. */
+export const cartKeepOnlyToolInput = z.strictObject({
+  keepSelectionRefs: z.array(z.string().min(1)).min(1).max(20),
+});
+
 /** Required-nullable transport shape for `setCartItem` (total quantity). */
 export const cartSetToolInput = z.strictObject({
   selectionRef: z.string().min(1),
@@ -62,6 +67,7 @@ export const cartPrepareToolInput = z.strictObject({
 /** Cart tool names whose malformed input must fail closed, never echo the model. */
 export const CART_TOOL_NAMES: ReadonlySet<string> = new Set([
   'getCart',
+  'keepOnlyCartItems',
   'setCartItem',
   'adjustCartItem',
   'prepareCartItem',

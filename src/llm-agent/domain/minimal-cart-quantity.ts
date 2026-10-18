@@ -254,7 +254,7 @@ const SET_MARKERS: ReadonlySet<string> = new Set([
 ]);
 
 /** Whole-line removal verbs; paired with an object below to prove a line clear. */
-const REMOVAL_VERBS: ReadonlySet<string> = new Set([
+export const REMOVAL_VERBS: ReadonlySet<string> = new Set([
   'quita',
   'quitar',
   'quitas',
@@ -302,7 +302,7 @@ const WHOLE_LINE_OBJECTS: ReadonlySet<string> = new Set([
  * authorize a clear. This is deliberately a small closed list, not intent
  * classification; an unlisted phrasing simply fails closed to clarification.
  */
-const NEGATION_TOKENS: ReadonlySet<string> = new Set([
+export const NEGATION_TOKENS: ReadonlySet<string> = new Set([
   'no',
   'nunca',
   'jamas',
@@ -364,7 +364,7 @@ function countWholeToken(haystack: string, needle: string): number {
   }
 }
 
-function tokenize(value: string): string[] {
+export function tokenize(value: string): string[] {
   return normalize(value)
     .split(/[^a-z0-9]+/)
     .filter((token) => token.length > 0);

@@ -7,6 +7,11 @@ import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.clie
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import { MinimalCartSelections } from '../domain/minimal-cart-selections';
+import {
+  CART_OPERATION_CLARIFICATION,
+  CART_UNKNOWN_REFERENCE_REPLY,
+  cartKeepOnlyToolInput,
+} from './minimal-cart-conversation';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import { CostGuardService } from './cost-guard.service';
@@ -129,6 +134,152 @@ function setup() {
 
 describe('Minimal cart through the public SDK route', () => {
   afterEach(() => jest.restoreAllMocks());
+
+  it.each([
+    {},
+    { keepSelectionRefs: [] },
+    { keepSelectionRefs: [''] },
+    { keepSelectionRefs: Array(21).fill('ref') },
+    { keepSelectionRefs: ['ref'], quantity: 0 },
+  ])('[S1] rejects malformed keep-only input %j', (input) => {
+    expect(cartKeepOnlyToolInput.safeParse(input).success).toBe(false);
+  });
+
+  it.each(['keep', 'repeat', 'evidence', 'unknown'] as const)(
+    '[S1,S4,S5,S6] keep-only %s on the three-line cart',
+    async (mode) => {
+      const logs = jest
+        .spyOn(Logger.prototype, 'log')
+        .mockImplementation(() => {});
+      const f = setup();
+      const other = '33333333-3333-4333-8333-333333333333';
+      const variants = [
+        '22222222-2222-4222-8222-222222222222',
+        '44444444-4444-4444-8444-444444444444',
+      ].map((variantId, index) => ({
+        variantId,
+        name: index === 0 ? '250mg' : '500mg',
+        priceCents: 13000,
+        stock: { status: 'available', quantity: 10 },
+      }));
+      f.api.searchCatalog.mockResolvedValue([
+        {
+          productId: ID,
+          name: 'Croquetas nupec',
+          price: { priceCents: 45000 },
+          variants: [],
+        },
+        {
+          productId: other,
+          name: 'Ibuprofeno',
+          price: { priceCents: null },
+          variants,
+        },
+      ] as never);
+      f.api.getStock.mockImplementation(
+        async (productId) =>
+          ({
+            productId,
+            name: productId === ID ? 'Croquetas nupec' : 'Ibuprofeno',
+            stock: { status: 'available', quantity: 10 },
+            variants: productId === ID ? [] : variants,
+          }) as never,
+      );
+      f.api.evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          ...item,
+          variantId: item.variantId ?? null,
+          originalPriceCents: item.quantity * item.unitPriceCents,
+          finalPriceCents: item.quantity * item.unitPriceCents,
+          discountAmountCents: 0,
+          appliedPromotionTitle: null,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      for (const [index, variant] of variants.entries())
+        await f.cart.setItem(
+          SENDER,
+          {
+            productId: other,
+            variantId: variant.variantId,
+            quantity: index === 0 ? 2 : 4,
+          },
+          new Set([other]),
+        );
+      await f.cart.setItem(
+        SENDER,
+        { productId: ID, quantity: 1 },
+        new Set([ID]),
+      );
+      const before = await f.store.get(SENDER);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      const set = jest.spyOn(f.cart, 'setItem');
+      const keep = {
+        keepSelectionRefs: [
+          cartRef(ID),
+          ...(mode === 'unknown' ? ['unknown'] : []),
+        ],
+      };
+      f.steps([
+        call('getCart', {}),
+        call('keepOnlyCartItems', keep),
+        ...(mode === 'keep'
+          ? [
+              call('setCartItem', {
+                selectionRef: cartRef(other, variants[0].variantId),
+                quantity: 0,
+                quantityText: null,
+                continuation: false,
+              }),
+            ]
+          : mode === 'repeat'
+            ? [call('keepOnlyCartItems', keep)]
+            : []),
+        say(),
+      ]);
+      const success = mode === 'keep' || mode === 'repeat';
+      expect(
+        await f.createAgent().tryHandle({
+          senderId: SENDER,
+          text:
+            mode === 'evidence'
+              ? 'agrega croquetas'
+              : 'Solo deja las croquetas en mi carrito por favor, quita todo lo demas',
+        }),
+      ).toEqual({
+        kind: 'handled',
+        reply: success
+          ? 'Su carrito:\n• Croquetas nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $450.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
+          : mode === 'evidence'
+            ? CART_OPERATION_CLARIFICATION
+            : CART_UNKNOWN_REFERENCE_REPLY,
+      });
+      expect(commit).toHaveBeenCalledTimes(success ? 1 : 0);
+      expect(set).not.toHaveBeenCalled();
+      const traces = logs.mock.calls
+        .flat()
+        .map(String)
+        .filter((line) => line.includes('cart_keep_only'));
+      expect(traces).toHaveLength(success ? (mode === 'repeat' ? 3 : 2) : 1);
+      for (const line of traces)
+        expect(line).toMatch(
+          /^minimal_catalog cart_keep_only result=(ready|invalid_evidence|unknown_selection|ok|error) code=[a-z_]+ trace=[0-9a-f-]{36}$/,
+        );
+      if (success)
+        expect(await f.cart.view(SENDER)).toMatchObject({
+          ok: true,
+          items: [{ productId: ID, quantity: 1 }],
+        });
+      else expect(await f.store.get(SENDER)).toEqual(before);
+      expect(f.optionsSeen[0].tools?.keepOnlyCartItems).toMatchObject({
+        strict: true,
+      });
+      expect(f.optionsSeen[0].system).toContain('keepOnlyCartItems');
+      expect(f.optionsSeen[0].system).toContain(
+        'nunca elimine renglones uno por uno',
+      );
+    },
+  );
 
   it('sends explicit strict nullable cart schemas through the real OpenAI provider without network access', async () => {
     const f = setup();
