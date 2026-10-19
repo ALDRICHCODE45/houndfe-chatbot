@@ -1225,6 +1225,91 @@ describe('minimal shipping order safety', () => {
 });
 
 describe('MinimalOrderService', () => {
+  it.each([false, true])(
+    '[S5] discounted display leaves the exact payload, fingerprint and retry key unchanged (atomic %s)',
+    async (atomic) => {
+      const h = setup({ atomic });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      let title = 'Oferta';
+      const evaluateCart = h.api.evaluateCart as unknown as jest.MockedFunction<
+        ChatbotApiClient['evaluateCart']
+      >;
+      evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          productId: PRODUCT,
+          variantId: null,
+          quantity: item.quantity,
+          unitPriceCents: 1500,
+          originalPriceCents: 1500 * item.quantity,
+          finalPriceCents: 1350 * item.quantity,
+          discountAmountCents: 150 * item.quantity,
+          appliedPromotionTitle: title,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      const sale = {
+        cashierUserId: CASHIER,
+        customerId: CUSTOMER,
+        shippingAddressId: ADDRESS,
+        expectedTotalCents: 2700,
+        items: [
+          {
+            productId: PRODUCT,
+            variantId: null,
+            productName: 'Ibuprofeno',
+            variantName: null,
+            quantity: 2,
+            unitPriceCents: 1500,
+          },
+        ],
+      };
+      const expectedPayload = atomic
+        ? CreateCheckoutInputSchema.parse({
+            phoneCountryCode: '52',
+            phone: '5550001111',
+            customer: { mode: 'existing', customerId: CUSTOMER },
+            deliveryAddress: {
+              mode: 'existing',
+              addressId: ADDRESS,
+              expectedVersion: savedAddress().version,
+            },
+            sale: {
+              cashierUserId: sale.cashierUserId,
+              expectedTotalCents: sale.expectedTotalCents,
+              items: sale.items,
+            },
+          })
+        : sale;
+      const fingerprint = createHash('sha256')
+        .update(JSON.stringify(expectedPayload))
+        .digest('hex');
+      for (const attempt of [1, 2]) {
+        const offer = await offerOrder(h, `promo-offer-${attempt}`);
+        expect(offer.reply).toContain(
+          `• Ibuprofeno: 2 × $15.00 MXN; importe $27.00 MXN (promoción: ${title}, ahorro $3.00 MXN)`,
+        );
+        if (atomic)
+          h.api.createCheckout.mockRejectedValueOnce(
+            new Error('lost response'),
+          );
+        else h.api.createSale.mockRejectedValueOnce(new Error('lost response'));
+        await yes(h, `promo-yes-${attempt}`);
+        expect(await h.minimalCart()).toMatchObject({
+          idempotencyFingerprint: fingerprint,
+          idempotencyAttempts: attempt,
+        });
+        title = 'Renamed offer';
+      }
+      const calls = atomic
+        ? h.api.createCheckout.mock.calls
+        : h.api.createSale.mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[0]).toEqual([expectedPayload, expect.stringMatching(UUID)]);
+      expect(calls[1]).toEqual(calls[0]);
+    },
+  );
+
   it('is disabled unless the gate and a cashier are configured', () => {
     expect(setup({ enabled: false }).order.enabled).toBe(false);
     expect(setup({ cashier: '' }).order.enabled).toBe(false);

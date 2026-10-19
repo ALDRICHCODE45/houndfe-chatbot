@@ -35,6 +35,8 @@ With the [atomic checkout switch](#atomic-checkout-switch) on, new customers and
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
+Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from the validated backend evaluation, or `(descuento: ahorro $X.XX MXN)` for a null/blank title. Zero-discount lines are unchanged. This is server-owned text, never model-authored. Promotion metadata is carried in the consent snapshot (changes require a fresh summary), but is display-only: neither sale/checkout payloads nor their idempotency fingerprints include these fields.
+
 ## Duplicate protection
 
 The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`, together with a SHA-256 fingerprint of the exact sale payload (customer, address, expected total, items and any approved shipping charge).

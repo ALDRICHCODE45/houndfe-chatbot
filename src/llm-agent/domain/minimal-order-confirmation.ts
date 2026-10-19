@@ -29,6 +29,9 @@ export interface MinimalOrderLine {
   readonly quantity: number;
   readonly unitPriceCents: number;
   readonly finalPriceCents: number;
+  /** Display-only evaluation metadata; absent in older snapshots. */
+  readonly appliedPromotionTitle?: string | null;
+  readonly discountAmountCents?: number;
 }
 
 /** A fresh, server-derived cart quote (shape of a successful cart view). */
@@ -140,6 +143,8 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
       item.quantity,
       item.unitPriceCents,
       item.finalPriceCents,
+      item.appliedPromotionTitle ?? null,
+      item.discountAmountCents ?? 0,
     ]),
     snapshot.totalCents,
     snapshot.shipping === undefined
@@ -166,6 +171,18 @@ export function sameMinimalOrder(
 }
 
 const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
+
+/** Server-owned display of validated backend savings, never a price calculation. */
+export function minimalPromotionSuffix(
+  item: Pick<MinimalOrderLine, 'appliedPromotionTitle' | 'discountAmountCents'>,
+): string {
+  const discount = item.discountAmountCents ?? 0;
+  if (discount <= 0) return '';
+  const label = item.appliedPromotionTitle?.trim()
+    ? `promoción: ${item.appliedPromotionTitle}, ahorro`
+    : 'descuento: ahorro';
+  return ` (${label} ${mxn(discount)})`;
+}
 
 function deliveryLine(snapshot: MinimalOrderSnapshot): string {
   const draft = snapshot.draft;
@@ -198,7 +215,7 @@ export function renderMinimalOrderSummary(
     'Resumen de su pedido:',
     ...snapshot.items.map(
       (item) =>
-        `• ${item.name}${item.variantName ? ` — ${item.variantName}` : ''}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}`,
+        `• ${item.name}${item.variantName ? ` — ${item.variantName}` : ''}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
     `Entrega a: ${deliveryLine(snapshot)}`,

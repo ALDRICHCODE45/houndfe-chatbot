@@ -10,6 +10,7 @@ import {
 } from '../../conversation/domain/conversation-store';
 import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
 import { minimalShippingSchema } from '../domain/minimal-shipping';
+import { minimalPromotionSuffix } from '../domain/minimal-order-confirmation';
 
 const lineSchema = z.strictObject({
   productId: z.uuid(),
@@ -74,6 +75,8 @@ type QuotedItem = CartItem & {
   name: string;
   variantName?: string;
   finalPriceCents: number;
+  appliedPromotionTitle: string | null;
+  discountAmountCents: number;
 };
 export type MinimalCartResult =
   | { ok: false; error: string }
@@ -294,7 +297,10 @@ export class MinimalCartService {
         totalCents: 0,
         promotionEvaluationStatus: 'fully_evaluated',
       };
-    const trusted: Omit<QuotedItem, 'finalPriceCents'>[] = [];
+    const trusted: Omit<
+      QuotedItem,
+      'finalPriceCents' | 'appliedPromotionTitle' | 'discountAmountCents'
+    >[] = [];
     for (const [index, line] of items.entries()) {
       const stock = await this.api.getStock(line.productId);
       if (stock.productId !== line.productId)
@@ -383,13 +389,20 @@ export class MinimalCartService {
           expected.unitPriceCents * expected.quantity ||
         !money(actual.finalPriceCents) ||
         !money(actual.discountAmountCents) ||
+        (actual.appliedPromotionTitle !== null &&
+          typeof actual.appliedPromotionTitle !== 'string') ||
         actual.finalPriceCents + actual.discountAmountCents !==
           actual.originalPriceCents
       )
         return { ok: false, error: 'invalid_evaluation' };
       totalCents += actual.finalPriceCents;
       if (!money(totalCents)) return { ok: false, error: 'invalid_evaluation' };
-      quoted.push({ ...expected, finalPriceCents: actual.finalPriceCents });
+      quoted.push({
+        ...expected,
+        finalPriceCents: actual.finalPriceCents,
+        appliedPromotionTitle: actual.appliedPromotionTitle,
+        discountAmountCents: actual.discountAmountCents,
+      });
     }
     return {
       ok: true,
@@ -415,7 +428,7 @@ export function minimalCartReply(result: MinimalCartResult): string {
   const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
   const lines = result.items.map(
     (i) =>
-      `• ${i.name}${i.variantName ? ` — ${i.variantName}` : ''}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}`,
+      `• ${i.name}${i.variantName ? ` — ${i.variantName}` : ''}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}`,
   );
   return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`;
 }

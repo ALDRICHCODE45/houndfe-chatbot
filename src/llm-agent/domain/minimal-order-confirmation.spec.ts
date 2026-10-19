@@ -253,6 +253,45 @@ describe('evaluateMinimalOrder', () => {
 });
 
 describe('renderMinimalOrderSummary', () => {
+  it.each([
+    ['Oferta', 'promoción: Oferta, ahorro'],
+    [null, 'descuento: ahorro'],
+    ['', 'descuento: ahorro'],
+    ['   ', 'descuento: ahorro'],
+  ])('[S5] renders the exact discounted summary (title %j)', (title, label) => {
+    const snapshot = eligible();
+    const items = snapshot.items.map((item) => ({
+      ...item,
+      appliedPromotionTitle: title,
+      discountAmountCents: 300,
+    }));
+    expect(renderMinimalOrderSummary({ ...snapshot, items })).toBe(
+      [
+        'Resumen de su pedido:',
+        `• Ibuprofeno — 500 mg: 2 × $15.00 MXN; importe $27.00 MXN (${label} $3.00 MXN)`,
+        'Total de productos: $27.00 MXN',
+        'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
+        'El envío no está incluido en este total y se coordinará por separado.',
+        '',
+        'Responda exactamente "SÍ" para crear el pedido.',
+      ].join('\n'),
+    );
+  });
+
+  it('[S5] keeps a zero-discount summary byte-identical even with a title', () => {
+    const snapshot = eligible();
+    expect(
+      renderMinimalOrderSummary({
+        ...snapshot,
+        items: snapshot.items.map((item) => ({
+          ...item,
+          appliedPromotionTitle: 'Not applied',
+          discountAmountCents: 0,
+        })),
+      }),
+    ).toBe(renderMinimalOrderSummary(snapshot));
+  });
+
   it('lists items, total, delivery address and the no-shipping notice', () => {
     expect(renderMinimalOrderSummary(eligible())).toBe(
       [
@@ -269,6 +308,30 @@ describe('renderMinimalOrderSummary', () => {
 });
 
 describe('sameMinimalOrder', () => {
+  it.each([
+    { appliedPromotionTitle: 'Renamed offer', discountAmountCents: 300 },
+    { appliedPromotionTitle: 'Oferta', discountAmountCents: 400 },
+  ])('[S5] binds displayed promotion metadata to consent (%j)', (change) => {
+    const snapshot = eligible();
+    const discounted = {
+      ...snapshot,
+      items: snapshot.items.map((item) => ({
+        ...item,
+        appliedPromotionTitle: 'Oferta',
+        discountAmountCents: 300,
+      })),
+    };
+    expect(sameMinimalOrder(discounted, structuredClone(discounted))).toBe(
+      true,
+    );
+    expect(
+      sameMinimalOrder(discounted, {
+        ...discounted,
+        items: discounted.items.map((item) => ({ ...item, ...change })),
+      }),
+    ).toBe(false);
+  });
+
   it('matches only identical content', () => {
     const changed = eligible();
     (changed as { totalCents: number }).totalCents = 2800;

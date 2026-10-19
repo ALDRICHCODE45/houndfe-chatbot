@@ -1,6 +1,10 @@
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
-import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
+import {
+  MinimalCartService,
+  minimalCartReply,
+  parseMinimalCart,
+} from './minimal-cart.service';
 
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
 const VARIANT = '22222222-2222-4222-8222-222222222222';
@@ -78,6 +82,105 @@ const shipping = {
   approval: { state: 'pending', requestId: 'request-1' },
 };
 describe('Minimal cart public operations', () => {
+  it.each([
+    ['Discount', 'promoción: Discount, ahorro'],
+    [null, 'descuento: ahorro'],
+    ['', 'descuento: ahorro'],
+    ['   ', 'descuento: ahorro'],
+  ])(
+    '[S5] renders a discounted and a normal cart line (title %j)',
+    async (title, label) => {
+      const f = setup();
+      await f.store.commitMinimalCart(
+        SENDER,
+        undefined,
+        {
+          items: [
+            { productId: PRODUCT, quantity: 2, unitPriceCents: 1000 },
+            { productId: OTHER, quantity: 1, unitPriceCents: 1000 },
+          ],
+          idempotencyKey: '',
+        },
+        shipping.createdAt,
+      );
+      f.api.getStock.mockImplementation(
+        async (productId) =>
+          ({
+            ...f.stock,
+            productId,
+          }) as never,
+      );
+      f.api.searchCatalog.mockResolvedValue([
+        f.item,
+        { ...f.item, productId: OTHER, name: 'Normal' },
+      ] as never);
+      f.api.evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          ...item,
+          variantId: null,
+          originalPriceCents: item.quantity * item.unitPriceCents,
+          finalPriceCents:
+            item.quantity * item.unitPriceCents -
+            (item.productId === PRODUCT ? 100 : 0),
+          appliedPromotionTitle:
+            item.productId === PRODUCT ? title : 'No discount',
+          discountAmountCents: item.productId === PRODUCT ? 100 : 0,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      const result = await f.service.view(SENDER);
+      expect(minimalCartReply(result)).toBe(
+        [
+          'Su carrito:',
+          `• Product: 2 × $10.00 MXN; importe $19.00 MXN (${label} $1.00 MXN)`,
+          '• Normal: 1 × $10.00 MXN; importe $10.00 MXN',
+          'Total de productos: $29.00 MXN.',
+          'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        ].join('\n'),
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        items: [
+          { appliedPromotionTitle: title, discountAmountCents: 100 },
+          { appliedPromotionTitle: 'No discount', discountAmountCents: 0 },
+        ],
+      });
+    },
+  );
+
+  it.each([42, false, {}, [], undefined])(
+    '[S5] rejects malformed promotion title %j without a cart write',
+    async (title) => {
+      const f = setup();
+      f.api.evaluateCart.mockResolvedValue({
+        items: [
+          {
+            productId: PRODUCT,
+            variantId: null,
+            quantity: 2,
+            unitPriceCents: 1000,
+            originalPriceCents: 2000,
+            finalPriceCents: 1900,
+            discountAmountCents: 100,
+            appliedPromotionTitle: title,
+          },
+        ],
+        promotionEvaluationStatus: 'fully_evaluated',
+      } as never);
+      const before = await f.store.get(SENDER);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      expect(
+        await f.service.setItem(
+          SENDER,
+          { productId: PRODUCT, quantity: 2 },
+          f.allowed,
+        ),
+      ).toEqual({ ok: false, error: 'invalid_evaluation' });
+      expect(commit).not.toHaveBeenCalled();
+      expect(await f.store.get(SENDER)).toEqual(before);
+    },
+  );
+
   it.each([
     'remove',
     'unknown',
