@@ -74,6 +74,35 @@ describe('ChatbotApiHttpClient', () => {
     client = new ChatbotApiHttpClient(service, configService, sleep);
   });
 
+  it.each([false, true])(
+    '[T1c] sends pricing phone fields only when the caller supplies a customer (%s)',
+    async (withCustomer) => {
+      const items = [
+        { productId: 'product-1', quantity: 2, unitPriceCents: 1000 },
+      ];
+      const customer = { phoneCountryCode: '52', phone: '5585876245' };
+      const response = {
+        items: [],
+        promotionEvaluationStatus: 'fully_evaluated',
+        customerResolution: withCustomer ? 'unique' : 'not_provided',
+      };
+      httpService.request.mockReturnValue(of(axiosResponse(response)));
+      await expect(
+        withCustomer
+          ? client.evaluateCart(items, customer)
+          : client.evaluateCart(items),
+      ).resolves.toEqual(response);
+      expect(httpService.request).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: 'POST',
+          url: '/chatbot-api/pricing/evaluate-cart',
+          data: withCustomer ? { items, ...customer } : { items },
+        }),
+      );
+      expect(httpService.request).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('sends Bearer and X-Branch-Id headers on read requests', async () => {
     httpService.request.mockReturnValue(of(axiosResponse([])));
 

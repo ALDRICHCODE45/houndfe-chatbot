@@ -1,5 +1,6 @@
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
+import { NotFoundError, UpstreamError } from '../../chatbot-api/domain/errors';
 import {
   MinimalCartService,
   minimalCartReply,
@@ -82,6 +83,271 @@ const shipping = {
   approval: { state: 'pending', requestId: 'request-1' },
 };
 describe('Minimal cart public operations', () => {
+  const customerEvaluation = (overrides: Record<string, unknown> = {}) => ({
+    items: [
+      {
+        productId: PRODUCT,
+        variantId: null,
+        quantity: 2,
+        unitPriceCents: 800,
+        originalPriceCents: 1600,
+        finalPriceCents: 1500,
+        discountAmountCents: 100,
+        appliedPromotionTitle: 'Discount',
+        ...overrides,
+      },
+    ],
+    promotionEvaluationStatus: 'fully_evaluated' as const,
+  });
+
+  it.each(['5215585876245', '525585876245', '15555555555', 'sender-a'])(
+    '[T1c] derives pricing identity only from trusted sender %s on mutation and view',
+    async (sender) => {
+      const f = setup();
+      await f.service.setItem(
+        sender,
+        { productId: PRODUCT, quantity: 2 },
+        f.allowed,
+      );
+      await f.service.view(sender);
+      expect(f.api.evaluateCart).toHaveBeenCalledTimes(2);
+      for (const args of f.api.evaluateCart.mock.calls) {
+        expect(args[0]).toEqual([
+          { productId: PRODUCT, quantity: 2, unitPriceCents: 1000 },
+        ]);
+        expect(args.slice(1)).toEqual(
+          sender.startsWith('52')
+            ? [{ phoneCountryCode: '52', phone: '5585876245' }]
+            : [],
+        );
+      }
+    },
+  );
+
+  it('[T1c] displays and persists the backend unit price, not the catalog price', async () => {
+    const f = setup();
+    f.api.evaluateCart.mockResolvedValue({
+      ...customerEvaluation(),
+      customerResolution: 'unique',
+    });
+    const result = await f.service.setItem(
+      '5215585876245',
+      { productId: PRODUCT, quantity: 2 },
+      f.allowed,
+    );
+    expect(minimalCartReply(result)).toBe(
+      [
+        'Su carrito:',
+        '• Product: 2 × $8.00 MXN; importe $15.00 MXN (promoción: Discount, ahorro $1.00 MXN)',
+        'Total de productos: $15.00 MXN.',
+        'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+      ].join('\n'),
+    );
+    expect((await f.store.get('5215585876245'))?.data.minimalCart).toEqual({
+      items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 800 }],
+      idempotencyKey: '',
+      expectedTotalCents: 1500,
+    });
+  });
+
+  it('[T1c] keep-only persists repriced retained lines and passes trusted identity', async () => {
+    const f = setup();
+    const sender = '5215585876245';
+    await f.store.commitMinimalCart(
+      sender,
+      undefined,
+      {
+        items: [
+          { productId: PRODUCT, quantity: 2, unitPriceCents: 1000 },
+          { productId: OTHER, quantity: 1, unitPriceCents: 1000 },
+        ],
+        idempotencyKey: '',
+      },
+      shipping.createdAt,
+    );
+    f.api.evaluateCart.mockResolvedValue(customerEvaluation());
+    expect(
+      await f.service.keepOnly(sender, [{ productId: PRODUCT }]),
+    ).toMatchObject({
+      ok: true,
+      items: [{ unitPriceCents: 800 }],
+      totalCents: 1500,
+    });
+    expect(f.api.evaluateCart).toHaveBeenCalledWith(
+      [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1000 }],
+      { phoneCountryCode: '52', phone: '5585876245' },
+    );
+    expect((await f.store.get(sender))?.data.minimalCart).toEqual({
+      items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 800 }],
+      idempotencyKey: '',
+      expectedTotalCents: 1500,
+    });
+  });
+
+  it.each([
+    'unique',
+    'not_found',
+    'ambiguous',
+    'not_provided',
+    undefined,
+  ] as const)(
+    '[T1c] accepts customerResolution %s, including older backend omission',
+    async (resolution) => {
+      const f = setup();
+      f.api.evaluateCart.mockResolvedValue({
+        ...customerEvaluation(),
+        ...(resolution === undefined ? {} : { customerResolution: resolution }),
+      });
+      expect(
+        await f.service.setItem(
+          SENDER,
+          { productId: PRODUCT, quantity: 2 },
+          f.allowed,
+        ),
+      ).toMatchObject({ ok: true, totalCents: 1500 });
+    },
+  );
+
+  it.each(['unknown', null, 42, {}, []])(
+    '[T1c] rejects malformed customerResolution %j without writing',
+    async (resolution) => {
+      const f = setup();
+      f.api.evaluateCart.mockResolvedValue({
+        ...customerEvaluation({
+          unitPriceCents: 1000,
+          originalPriceCents: 2000,
+          finalPriceCents: 1900,
+        }),
+        customerResolution: resolution,
+      } as never);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      expect(
+        await f.service.setItem(
+          SENDER,
+          { productId: PRODUCT, quantity: 2 },
+          f.allowed,
+        ),
+      ).toEqual({ ok: false, error: 'invalid_evaluation' });
+      expect(commit).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { originalPriceCents: 2000 },
+    { unitPriceCents: -1 },
+    { unitPriceCents: 800.5 },
+    { unitPriceCents: NaN },
+    { unitPriceCents: Number.MAX_SAFE_INTEGER + 1 },
+    {
+      unitPriceCents: Number.MAX_SAFE_INTEGER,
+      originalPriceCents: Number.MAX_SAFE_INTEGER * 2,
+      finalPriceCents: Number.MAX_SAFE_INTEGER,
+      discountAmountCents: Number.MAX_SAFE_INTEGER,
+    },
+  ])(
+    '[T1c] rejects invalid backend price arithmetic %j without writing',
+    async (overrides) => {
+      const f = setup();
+      f.api.evaluateCart.mockResolvedValue(customerEvaluation(overrides));
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      expect(
+        await f.service.setItem(
+          SENDER,
+          { productId: PRODUCT, quantity: 2 },
+          f.allowed,
+        ),
+      ).toEqual({ ok: false, error: 'invalid_evaluation' });
+      expect(commit).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      new UpstreamError('unavailable', 409, undefined, 'PRICE_OUT_OF_DATE'),
+      'price_unavailable',
+    ],
+    [
+      new NotFoundError('deleted', 404, undefined, 'CUSTOMER_NOT_FOUND'),
+      'cart_unavailable',
+    ],
+    [
+      new UpstreamError('deleted', 404, undefined, 'CUSTOMER_NOT_FOUND'),
+      'cart_unavailable',
+    ],
+    [
+      new UpstreamError('other conflict', 409, undefined, 'OTHER'),
+      'cart_unavailable',
+    ],
+    [
+      new UpstreamError('upstream', 503, undefined, 'PRICE_OUT_OF_DATE'),
+      'cart_unavailable',
+    ],
+  ] as const)(
+    '[T1c] maps evaluate-cart failure %s to %s without a cart write',
+    async (error, code) => {
+      const f = setup();
+      await f.service.setItem(
+        SENDER,
+        { productId: PRODUCT, quantity: 2 },
+        f.allowed,
+      );
+      const before = await f.store.get(SENDER);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      f.api.evaluateCart.mockRejectedValue(error);
+      const result = await f.service.adjustItem(
+        SENDER,
+        { productId: PRODUCT, delta: 1 },
+        f.allowed,
+      );
+      expect(result).toEqual({ ok: false, error: code });
+      expect(minimalCartReply(result)).toBe(
+        'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+      );
+      expect(commit).not.toHaveBeenCalled();
+      expect(await f.store.get(SENDER)).toEqual(before);
+    },
+  );
+
+  it.each([undefined, VARIANT])(
+    '[T1c] sends one line per product/variant after repeated sets and adjustments (%s)',
+    async (variantId) => {
+      const f = setup();
+      if (variantId) {
+        f.api.searchCatalog.mockResolvedValue([
+          {
+            ...f.item,
+            variants: [{ variantId, name: 'Small', priceCents: 1000 }],
+          },
+        ] as never);
+        f.api.getStock.mockResolvedValue({
+          ...f.stock,
+          variants: [{ variantId, name: 'Small', stock: f.stock.stock }],
+        } as never);
+      }
+      const identity = {
+        productId: PRODUCT,
+        ...(variantId ? { variantId } : {}),
+      };
+      await f.service.setItem(SENDER, { ...identity, quantity: 2 }, f.allowed);
+      await f.service.setItem(SENDER, { ...identity, quantity: 3 }, f.allowed);
+      await f.service.adjustItem(SENDER, { ...identity, delta: 1 }, f.allowed);
+      expect(f.api.evaluateCart.mock.calls.map(([items]) => items)).toEqual(
+        [2, 3, 4].map((quantity) => [
+          { ...identity, quantity, unitPriceCents: 1000 },
+        ]),
+      );
+      expect(
+        parseMinimalCart({
+          items: [
+            { ...identity, quantity: 1, unitPriceCents: 1000 },
+            { ...identity, quantity: 2, unitPriceCents: 1000 },
+          ],
+          idempotencyKey: '',
+        }),
+      ).toBeNull();
+    },
+  );
+
   it.each([
     ['Discount', 'promoción: Discount, ahorro'],
     [null, 'descuento: ahorro'],

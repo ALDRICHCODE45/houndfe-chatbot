@@ -9,6 +9,9 @@ import {
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
+import type { CartEvaluationResult } from '../../chatbot-api/domain/dtos/pricing.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import { minimalShippingSchema } from '../domain/minimal-shipping';
 import { minimalPromotionSuffix } from '../domain/minimal-order-confirmation';
 
@@ -118,7 +121,7 @@ export class MinimalCartService {
       const raw = (await this.store.get(senderId))?.data.minimalCart;
       const cart = this.read(raw);
       if (!cart) return { ok: false, error: 'invalid_cart' };
-      return await this.quote(cart.items, onInvalidVariant);
+      return await this.quote(senderId, cart.items, onInvalidVariant);
     } catch {
       return { ok: false, error: 'cart_unavailable' };
     }
@@ -179,7 +182,7 @@ export class MinimalCartService {
       const items = cart.items.filter((line) =>
         keep.some((identity) => sameLine(line, identity)),
       );
-      const quote = await this.quote(items);
+      const quote = await this.quote(senderId, items);
       if (!quote.ok || items.length === cart.items.length) return quote;
       const next: CartState = {
         items: quote.items.map(
@@ -253,7 +256,12 @@ export class MinimalCartService {
           quantity,
           unitPriceCents: 0,
         });
-      const quote = await this.quote(items, onInvalidVariant, request);
+      const quote = await this.quote(
+        senderId,
+        items,
+        onInvalidVariant,
+        request,
+      );
       if (!quote.ok) return quote;
       const next: CartState = {
         items: quote.items.map(
@@ -286,6 +294,7 @@ export class MinimalCartService {
   }
 
   private async quote(
+    senderId: string,
     items: CartItem[],
     onInvalidVariant?: VariantDiagnosticObserver,
     requestedLine?: Pick<CartItem, 'productId' | 'variantId'>,
@@ -361,18 +370,38 @@ export class MinimalCartService {
         ...(variant ? { variantName: variant.name } : {}),
       });
     }
-    const evaluation = await this.api.evaluateCart(
-      trusted.map(({ productId, variantId, quantity, unitPriceCents }) => ({
+    const evaluationItems = trusted.map(
+      ({ productId, variantId, quantity, unitPriceCents }) => ({
         productId,
         ...(variantId ? { variantId } : {}),
         quantity,
         unitPriceCents,
-      })),
+      }),
     );
+    const customer = parseMexicanWhatsAppPhone(senderId);
+    let evaluation: CartEvaluationResult;
+    try {
+      evaluation = customer
+        ? await this.api.evaluateCart(evaluationItems, customer)
+        : await this.api.evaluateCart(evaluationItems);
+    } catch (error) {
+      if (
+        error instanceof ChatbotApiError &&
+        error.statusCode === 409 &&
+        error.errorCode === 'PRICE_OUT_OF_DATE'
+      )
+        return { ok: false, error: 'price_unavailable' };
+      // Includes CUSTOMER_NOT_FOUND: keep the generic retryable failure and no write.
+      throw error;
+    }
     if (
       !['fully_evaluated', 'needs_human_review'].includes(
         evaluation.promotionEvaluationStatus,
       ) ||
+      (evaluation.customerResolution !== undefined &&
+        !['unique', 'not_found', 'ambiguous', 'not_provided'].includes(
+          evaluation.customerResolution,
+        )) ||
       evaluation.items.length !== trusted.length
     )
       return { ok: false, error: 'invalid_evaluation' };
@@ -384,9 +413,10 @@ export class MinimalCartService {
         actual.productId !== expected.productId ||
         (actual.variantId ?? undefined) !== expected.variantId ||
         actual.quantity !== expected.quantity ||
-        actual.unitPriceCents !== expected.unitPriceCents ||
+        !money(actual.unitPriceCents) ||
+        !money(actual.originalPriceCents) ||
         actual.originalPriceCents !==
-          expected.unitPriceCents * expected.quantity ||
+          actual.unitPriceCents * expected.quantity ||
         !money(actual.finalPriceCents) ||
         !money(actual.discountAmountCents) ||
         (actual.appliedPromotionTitle !== null &&
@@ -399,6 +429,7 @@ export class MinimalCartService {
       if (!money(totalCents)) return { ok: false, error: 'invalid_evaluation' };
       quoted.push({
         ...expected,
+        unitPriceCents: actual.unitPriceCents,
         finalPriceCents: actual.finalPriceCents,
         appliedPromotionTitle: actual.appliedPromotionTitle,
         discountAmountCents: actual.discountAmountCents,

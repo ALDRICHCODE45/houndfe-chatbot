@@ -140,11 +140,22 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     );
   }
 
-  evaluateCart(items: CartItemInput[]): Promise<CartEvaluationResult> {
+  evaluateCart(
+    items: CartItemInput[],
+    customer?: { phoneCountryCode: string; phone: string },
+  ): Promise<CartEvaluationResult> {
     return this.request<CartEvaluationResult>({
       method: 'POST',
       url: '/chatbot-api/pricing/evaluate-cart',
-      data: { items },
+      data: {
+        items,
+        ...(customer
+          ? {
+              phoneCountryCode: customer.phoneCountryCode,
+              phone: customer.phone,
+            }
+          : {}),
+      },
     });
   }
 

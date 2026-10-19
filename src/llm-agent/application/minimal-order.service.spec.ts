@@ -1226,6 +1226,85 @@ describe('minimal shipping order safety', () => {
 
 describe('MinimalOrderService', () => {
   it.each([false, true])(
+    '[T1c] places the customer-priced cart using backend unit prices and final totals (atomic %s)',
+    async (atomic) => {
+      const h = setup({ atomic });
+      h.setPrice(1000);
+      h.api.evaluateCart.mockImplementation(async (items) => ({
+        items: items.map((item) => ({
+          productId: PRODUCT,
+          variantId: null,
+          quantity: item.quantity,
+          unitPriceCents: 800,
+          originalPriceCents: 800 * item.quantity,
+          finalPriceCents: 800 * item.quantity - 100,
+          discountAmountCents: 100,
+          appliedPromotionTitle: null,
+        })),
+        promotionEvaluationStatus: 'fully_evaluated',
+      }));
+      expect(
+        await h.cart.setItem(
+          SENDER,
+          { productId: PRODUCT, quantity: 2 },
+          new Set([PRODUCT]),
+        ),
+      ).toMatchObject({ ok: true, totalCents: 1500 });
+      expect(await h.minimalCart()).toMatchObject({
+        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 800 }],
+        expectedTotalCents: 1500,
+      });
+      await confirmSavedDelivery(h);
+      const offer = await offerOrder(h);
+      expect(offer.reply).toContain('2 × $8.00 MXN');
+      expect(offer.reply).toContain('Total de productos: $15.00 MXN');
+      const sale = {
+        ...(await h.api.createSale.getMockImplementation()!()),
+        totalCents: 1500,
+        debtCents: 1500,
+        discountCents: 100,
+      };
+      h.api.createSale.mockResolvedValue(sale);
+      h.api.createCheckout.mockResolvedValue({ status: 'created', sale });
+      expect((await yes(h))?.reply).toContain('B-0042');
+      const expectedSale = {
+        cashierUserId: CASHIER,
+        expectedTotalCents: 1500,
+        items: [
+          {
+            productId: PRODUCT,
+            variantId: null,
+            productName: 'Ibuprofeno',
+            variantName: null,
+            quantity: 2,
+            unitPriceCents: 800,
+          },
+        ],
+      };
+      if (atomic) {
+        expect(h.api.createCheckout).toHaveBeenCalledWith(
+          expect.objectContaining({ sale: expectedSale }),
+          expect.stringMatching(UUID),
+        );
+        expect(h.api.createSale).not.toHaveBeenCalled();
+      } else {
+        expect(h.api.createSale).toHaveBeenCalledWith(
+          { ...expectedSale, customerId: CUSTOMER, shippingAddressId: ADDRESS },
+          expect.stringMatching(UUID),
+        );
+        expect(h.api.createCheckout).not.toHaveBeenCalled();
+      }
+      for (const args of h.api.evaluateCart.mock
+        .calls as unknown as unknown[][]) {
+        expect(args[1]).toEqual({
+          phoneCountryCode: '52',
+          phone: '5550001111',
+        });
+      }
+    },
+  );
+
+  it.each([false, true])(
     '[S5] discounted display leaves the exact payload, fingerprint and retry key unchanged (atomic %s)',
     async (atomic) => {
       const h = setup({ atomic });

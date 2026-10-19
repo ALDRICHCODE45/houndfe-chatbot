@@ -51,7 +51,10 @@ export interface AttachReceiptTransportOptions {
 export interface ChatbotApiClient {
   searchCatalog(q: string, limit?: number): Promise<CatalogItemResponse[]>;
   getStock(productId: string): Promise<StockCheckResponse>;
-  evaluateCart(items: CartItemInput[]): Promise<CartEvaluationResult>;
+  evaluateCart(
+    items: CartItemInput[],
+    customer?: { phoneCountryCode: string; phone: string },
+  ): Promise<CartEvaluationResult>;
   getCustomerByPhone(
     cc: string,
     phone: string,

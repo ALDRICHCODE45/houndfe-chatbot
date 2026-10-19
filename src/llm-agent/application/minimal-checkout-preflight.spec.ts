@@ -178,9 +178,11 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     const result = await review(f);
     expect(f.api.getStock).toHaveBeenCalledWith(ID);
     expect(f.api.searchCatalog).toHaveBeenCalledWith('Product', 20);
-    expect(f.api.evaluateCart).toHaveBeenCalledWith([
-      { productId: ID, quantity: 2, unitPriceCents: 1500 },
-    ]);
+    // The trusted WhatsApp sender prices the cart with its customer list.
+    expect(f.api.evaluateCart).toHaveBeenCalledWith(
+      [{ productId: ID, quantity: 2, unitPriceCents: 1500 }],
+      { phoneCountryCode: '52', phone: '5550001111' },
+    );
     expect(f.outputs).toContainEqual({
       ok: true,
       status: 'incomplete',
