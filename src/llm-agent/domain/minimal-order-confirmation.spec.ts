@@ -112,7 +112,7 @@ describe('shipping summary and exact binding', () => {
     expect(summary).toContain('Total a pagar: $77.00 MXN');
     expect(summary).not.toContain('no está incluido');
     expect(summary).toContain(
-      'Responda exactamente "SÍ" para crear el pedido.',
+      'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
     );
   });
   it('S2/S4: presents covered shipping without a freight line', () => {
@@ -273,7 +273,7 @@ describe('renderMinimalOrderSummary', () => {
         'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
         'El envío no está incluido en este total y se coordinará por separado.',
         '',
-        'Responda exactamente "SÍ" para crear el pedido.',
+        'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
       ].join('\n'),
     );
   });
@@ -301,7 +301,7 @@ describe('renderMinimalOrderSummary', () => {
         'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
         'El envío no está incluido en este total y se coordinará por separado.',
         '',
-        'Responda exactamente "SÍ" para crear el pedido.',
+        'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
       ].join('\n'),
     );
   });

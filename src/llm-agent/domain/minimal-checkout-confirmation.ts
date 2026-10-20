@@ -43,11 +43,11 @@ import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-so
 export const MINIMAL_CHECKOUT_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 
 export const MINIMAL_CHECKOUT_AMBIGUOUS_REPLY =
-  'Por ahora no puedo confirmar sus datos de entrega en este chat.';
+  'Por ahora no puedo confirmar sus datos de entrega. Dígame «quiero comprar» para revisar su dirección y mostrarle los datos de nuevo.';
 export const MINIMAL_CHECKOUT_CHANGED_REPLY =
   'Sus datos de entrega cambiaron. Le mostraré el resumen actualizado para que lo confirme de nuevo.';
 export const MINIMAL_CHECKOUT_CONFIRMED_REPLY =
-  'Gracias. Confirmé sus datos de entrega para este chat. Esta confirmación no crea un pedido, no registra al cliente ni activa el envío.';
+  'Gracias. Confirmé sus datos de entrega para este chat. Esta confirmación no crea un pedido, no registra al cliente ni activa el envío. Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.';
 export const MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY =
   'No pude confirmar sus datos de entrega. Le mostraré el resumen actualizado para que lo confirme de nuevo.';
 
@@ -78,6 +78,7 @@ function isFilled(value: string | null): boolean {
 function addressFields(draft: MinimalCheckoutDraft): {
   street: string | null;
   exteriorNumber: string | null;
+  interiorNumber: string | null;
   neighborhood: string | null;
   zipCode: string | null;
   state: string | null;
@@ -91,6 +92,7 @@ function addressFields(draft: MinimalCheckoutDraft): {
   return {
     street: source.street,
     exteriorNumber: source.exteriorNumber,
+    interiorNumber: source.interiorNumber,
     neighborhood: source.neighborhood,
     zipCode: source.zipCode,
     state: source.state,
@@ -136,13 +138,14 @@ export function renderMinimalCheckoutConfirmation(
   return [
     'Confirme sus datos de entrega:',
     `Nombre: ${name}`,
-    `Calle: ${fields.street ?? ''} ${fields.exteriorNumber ?? ''}`.trim(),
+    `Calle: ${fields.street ?? ''} ${fields.exteriorNumber ?? ''}${isFilled(fields.interiorNumber) ? `, int. ${fields.interiorNumber}` : ''}`.trim(),
     `Colonia: ${fields.neighborhood ?? ''}`,
     `Código postal: ${fields.zipCode ?? ''}`,
     `Ciudad o municipio: ${location ?? ''}`,
     `Estado: ${fields.state ?? ''}`,
     '',
-    'Responda exactamente "SÍ" para confirmar. Esta confirmación es solo en este chat: no crea un pedido, no registra al cliente ni activa el envío.',
+    'Esta confirmación es solo en este chat: no crea un pedido, no registra al cliente ni activa el envío.',
+    'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',
   ].join('\n');
 }
 

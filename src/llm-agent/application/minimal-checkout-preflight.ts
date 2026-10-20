@@ -71,8 +71,8 @@ export function minimalCheckoutReply(
     case 'empty_cart':
       return 'Su carrito está vacío. Agregue productos antes de revisar la compra. No se creó ningún pedido.';
     case 'promotion_review':
-      return 'Las promociones o precios de su carrito requieren revisión del equipo antes de continuar con la compra. Esta revisión no registró una solicitud ni creó un pedido.';
+      return 'Las promociones o precios de su carrito requieren revisión del equipo. Comuníquese con la tienda para revisarlos; esta revisión no registró una solicitud ni creó un pedido.';
     case 'cart_unverified':
-      return 'No pude verificar los precios y existencias del carrito para revisar la compra. No se creó ningún pedido ni se modificó su carrito.';
+      return 'No pude verificar los precios y existencias del carrito. Dígame «revisar mi compra» para intentarlo de nuevo; no se creó ningún pedido ni se modificó su carrito.';
   }
 }

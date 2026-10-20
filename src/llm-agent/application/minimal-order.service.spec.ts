@@ -641,7 +641,7 @@ describe('NEW shipping freshness only (T1)', () => {
       ),
     ).toBeNull();
     expect((await h.order.prepareOrder(SENDER, EVENT('order-new'))).reply).toBe(
-      'Antes de crear el pedido, solicite y confirme el envío con una cotización vigente aprobada por el equipo. No se creó ningún pedido.',
+      'Dígame «cotizar envío» y espere la aprobación del equipo antes de volver a pedir el resumen; no se creó ningún pedido.',
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
@@ -1170,9 +1170,9 @@ describe('minimal shipping order safety', () => {
         await shippingRecord(h, { ...record, ...changes });
       }
       const refusal = await yes(h);
-      expect(refusal?.reply).toMatch(/solicite.*confirme.*envío/);
+      expect(refusal?.reply).toContain('Dígame «cotizar envío»');
       const offer = await offerOrder(h, 'wamid.recheck');
-      expect(offer.reply).toMatch(/solicite.*confirme.*envío/);
+      expect(offer.reply).toContain('Dígame «cotizar envío»');
       expect(offer.onSent).toBeUndefined();
       await yes(h);
       expect(h.api.createSale).not.toHaveBeenCalled();
@@ -1518,7 +1518,7 @@ describe('MinimalOrderService', () => {
     expect(h.api.createSale).not.toHaveBeenCalled();
   });
 
-  it('refuses when the delivery draft changed after the summary', async () => {
+  it('reoffers delivery confirmation without selling when the delivery draft changed after the summary', async () => {
     const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -1539,9 +1539,10 @@ describe('MinimalOrderService', () => {
       carrierPhone: null,
       useNewAddress: false,
     });
-    expect(await yes(h)).toEqual({
-      reply: MINIMAL_ORDER_INELIGIBLE_REPLIES.delivery_unconfirmed,
-    });
+    const result = await yes(h);
+    expect(result?.reply).toMatch(/^Confirme sus datos de entrega:/);
+    expect(result?.reply).toContain('Nombre: Ana María');
+    expect(result?.onSent).toEqual(expect.any(Function));
     expect(h.api.createSale).not.toHaveBeenCalled();
   });
 

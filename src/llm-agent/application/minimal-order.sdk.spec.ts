@@ -93,7 +93,7 @@ function setup(
             label: 'Casa',
             street: 'Av. Juárez',
             exteriorNumber: '10',
-            interiorNumber: null,
+            interiorNumber: null as string | null,
             zipCode: '06000',
             neighborhood: 'Centro',
             municipality: 'Cuauhtémoc',
@@ -154,15 +154,23 @@ function setup(
     },
   } as unknown as ConfigService;
   let steps: unknown[] = [];
-  const seen: Array<{ tools?: Record<string, unknown> }> = [];
+  const seen: Array<{ system?: unknown; tools?: Record<string, unknown> }> = [];
   let gate: Promise<void> | null = null;
   const generate: GenerateTextFn = async (input) => {
     seen.push(input);
     const script = steps;
     if (gate !== null) await gate;
+    let index = 0;
     return generateText({
       ...input,
-      model: new MockLanguageModelV4({ doGenerate: script } as never),
+      model: new MockLanguageModelV4({
+        doGenerate: async () => {
+          const next = script[index++];
+          return (
+            typeof next === 'function' ? (next as () => unknown)() : next
+          ) as Awaited<ReturnType<MockLanguageModelV4['doGenerate']>>;
+        },
+      }),
     });
   };
   const cart = new MinimalCartService(client, store);
@@ -182,8 +190,20 @@ function setup(
   );
   return {
     api,
+    store,
     seen,
     checkout,
+    seedCart: () =>
+      store.create(SENDER, {
+        lastMessageAt: new Date().toISOString(),
+        data: {
+          minimalCart: {
+            items: [{ productId: PRODUCT, quantity: 1, unitPriceCents: 1500 }],
+            idempotencyKey: '',
+            expectedTotalCents: 1500,
+          },
+        },
+      }),
     hold: () => {
       let release: () => void = () => undefined;
       gate = new Promise<void>((resolve) => {
@@ -279,6 +299,204 @@ function setup(
     },
   };
 }
+
+describe('checkout next-step guidance through the SDK route', () => {
+  const deliveryEnding =
+    'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.';
+  const orderEnding =
+    'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+
+  it('lookup → select → prepareOrder presents delivery in the same turn, then needs two separate sent-summary consents for one sale', async () => {
+    const h = setup();
+    await h.seedCart();
+    const context = await h.api.getCustomerCheckoutContext();
+    context.addresses[0].interiorNumber = '130';
+    h.api.getCustomerCheckoutContext.mockResolvedValue(context);
+    h.api.createSale.mockResolvedValue({
+      ...(await h.api.createSale.getMockImplementation()!()),
+      totalCents: 1500,
+      debtCents: 1500,
+    });
+    let addressRef = '';
+    const lookup = h.checkout.lookup.bind(h.checkout);
+    jest.spyOn(h.checkout, 'lookup').mockImplementation(async (...args) => {
+      const result = await lookup(...args);
+      if (result.ok && result.status === 'unique')
+        addressRef = result.addresses[0].addressRef;
+      return result;
+    });
+    const delivery = await h.turn(
+      'quiero realizar el pedido por favor.',
+      [
+        call('lookupCheckoutCustomer', { nextPageRef: null }),
+        () => call('selectCheckoutAddress', { addressRef }),
+        call('prepareOrder'),
+        call('confirmCheckoutDetails'),
+        say('Datos inventados'),
+      ],
+      EVENT('delivery-offer'),
+    );
+    const reply = (delivery as { reply: string }).reply;
+    expect(reply).toMatch(/^Confirme sus datos de entrega:/);
+    expect(reply).toContain('Calle: Av. Juárez 10, int. 130');
+    expect(reply.endsWith(deliveryEnding)).toBe(true);
+    expect(reply).toContain('no crea un pedido');
+    expect(reply).not.toContain('Antes de crear el pedido necesito');
+    expect(reply).not.toContain('Datos inventados');
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.checkout.confirmationStatus(SENDER)).toMatchObject({
+      armed: false,
+    });
+    (delivery as { onSent: () => void }).onSent();
+    const calls = h.seen.length;
+    const confirmed = await h.turn('SÍ', [say()], EVENT('delivery-yes'));
+    expect(h.seen).toHaveLength(calls);
+    expect((confirmed as { reply: string }).reply).toContain(
+      'Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.',
+    );
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    const order = await h.turn(
+      'hacer pedido',
+      [call('prepareOrder'), say()],
+      EVENT('order-offer'),
+    );
+    expect((order as { reply: string }).reply.endsWith(orderEnding)).toBe(true);
+    (order as { onSent: () => void }).onSent();
+    await h.turn('SÍ', [say()], EVENT('order-yes'));
+    await h.turn('SÍ', [say()], EVENT('repeat-yes'));
+    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])(
+    'fallback delivery still requires sent-summary strict consent (sent: %s)',
+    async (sent) => {
+      const h = setup();
+      await h.ready();
+      const draft = await h.checkout.confirmedDraft(SENDER);
+      if (draft === null) throw new Error('expected confirmed fixture');
+      await h.store.commitMinimalCheckoutDraft(
+        SENDER,
+        draft,
+        {
+          ...draft,
+          revision: draft.revision + 1,
+          customer: { ...draft.customer, firstName: 'Ana María' },
+        },
+        new Date().toISOString(),
+      );
+      const offer = await h.turn(
+        'hacer pedido',
+        [call('prepareOrder'), say()],
+        EVENT('fallback-offer'),
+      );
+      expect((offer as { reply: string }).reply).toMatch(
+        /^Confirme sus datos de entrega:/,
+      );
+      if (sent) (offer as { onSent: () => void }).onSent();
+      await h.turn(
+        sent ? 'Sí, pero cambie la calle' : 'SÍ',
+        [say('¿Qué calle desea usar?')],
+        EVENT('fallback-answer'),
+      );
+      expect(await h.checkout.confirmedDraft(SENDER)).toBeNull();
+      expect(h.api.createSale).not.toHaveBeenCalled();
+    },
+  );
+
+  it('prepareOrder with an incomplete draft lists the missing fields', async () => {
+    const h = setup();
+    await h.seedCart();
+    await h.checkout.updateDetails(SENDER, {
+      firstName: 'Ana',
+      lastName: null,
+      useNewAddress: true,
+      label: null,
+      street: 'Calle 5',
+      exteriorNumber: null,
+      interiorNumber: null,
+      zipCode: null,
+      neighborhood: null,
+      municipality: null,
+      city: null,
+      state: null,
+      visualReferences: null,
+      carrierPhone: null,
+    });
+    const result = await h.turn(
+      'hacer pedido',
+      [call('prepareOrder'), say()],
+      EVENT('partial'),
+    );
+    expect(result).toEqual({
+      kind: 'handled',
+      reply:
+        'Para mostrarle el resumen de entrega aún me falta: número exterior o S/N, colonia, código postal, estado, ciudad o municipio.',
+    });
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+
+  it('prepareOrder without an address gives a concrete starting instruction', async () => {
+    const h = setup();
+    await h.seedCart();
+    const result = await h.turn(
+      'hacer pedido',
+      [call('prepareOrder'), say()],
+      EVENT('absent'),
+    );
+    expect(result).toEqual({
+      kind: 'handled',
+      reply:
+        'Para crear su pedido primero necesito su dirección de entrega. Dígame «quiero comprar» para ver sus direcciones guardadas o escríbame una dirección nueva.',
+    });
+    expect(result).not.toHaveProperty('onSent');
+  });
+
+  it.each([false, true])(
+    'drops reviewCheckout when a delivery presentation is produced (review last: %s)',
+    async (reviewLast) => {
+      const h = setup();
+      await h.ready();
+      const confirm = call('confirmCheckoutDetails');
+      const review = call('reviewCheckout');
+      const result = await h.turn(
+        'confirmar datos',
+        reviewLast ? [confirm, review, say()] : [review, confirm, say()],
+        EVENT('review-delivery'),
+      );
+      expect((result as { reply: string }).reply).toMatch(
+        /^Confirme sus datos de entrega:/,
+      );
+      expect((result as { reply: string }).reply).not.toContain(
+        'Revisión de compra',
+      );
+      expect(result).toHaveProperty('onSent');
+    },
+  );
+
+  it('drops reviewCheckout when an order summary is produced', async () => {
+    const h = setup();
+    await h.ready();
+    const result = await h.turn(
+      'hacer pedido',
+      [call('reviewCheckout'), call('prepareOrder'), say()],
+      EVENT('review-order'),
+    );
+    expect((result as { reply: string }).reply).toMatch(
+      /^Resumen de su pedido:/,
+    );
+    expect((result as { reply: string }).reply).not.toContain(
+      'Revisión de compra',
+    );
+  });
+
+  it('guides same-response delivery confirmation and prohibits review during checkout', async () => {
+    const h = setup();
+    await h.turn('Hola', [say()]);
+    expect(h.seen[0].system).toContain('Después de selectCheckoutAddress ok');
+    expect(h.seen[0].system).toContain('en la MISMA respuesta');
+    expect(h.seen[0].system).toContain('Nunca llame reviewCheckout mientras');
+  });
+});
 
 describe('minimal order placement through the SDK route', () => {
   it('S2/S3/S6 new customer order needs armed one-shot summary consent', async () => {

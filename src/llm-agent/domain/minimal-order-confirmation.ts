@@ -19,7 +19,7 @@ import { isAffirmative } from './minimal-checkout-confirmation';
 export const MINIMAL_ORDER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 
 export const MINIMAL_ORDER_AMBIGUOUS_REPLY =
-  'Por ahora no puedo confirmar su pedido en este chat. No se creó ningún pedido.';
+  'Por ahora no puedo confirmar su pedido en este chat. Dígame «hacer pedido» para volver a mostrarle el resumen; no se creó ningún pedido.';
 
 export interface MinimalOrderLine {
   readonly productId: string;
@@ -233,7 +233,7 @@ export function renderMinimalOrderSummary(
             `Total a pagar: ${mxn(snapshot.totalCents + snapshot.shipping.chargeCents)}`,
           ]),
     '',
-    'Responda exactamente "SÍ" para crear el pedido.',
+    'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
   ].join('\n');
 }
 

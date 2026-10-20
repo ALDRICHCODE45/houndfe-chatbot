@@ -39,6 +39,7 @@ import {
   type MinimalCartState,
 } from './minimal-cart.service';
 import {
+  MINIMAL_CHECKOUT_ADDRESS_REQUIRED_REPLY,
   MINIMAL_CHECKOUT_INVALID_STATE_REPLY,
   MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY,
   MINIMAL_CHECKOUT_RESELECT_REPLY,
@@ -51,19 +52,18 @@ export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
   string
 > = {
   cart_unverified:
-    'No pude verificar los precios y existencias de su carrito. No se creó ningún pedido.',
+    'No pude verificar los precios y existencias de su carrito. Dígame «hacer pedido» para intentar verificarlos de nuevo; no se creó ningún pedido.',
   empty_cart:
     'Su carrito está vacío. Agregue productos antes de hacer su pedido. No se creó ningún pedido.',
   promotion_review:
-    'Las promociones de su carrito requieren revisión del equipo antes de crear el pedido. No se creó ningún pedido.',
-  delivery_unconfirmed:
-    'Antes de crear el pedido necesito que confirme sus datos de entrega. No se creó ningún pedido.',
+    'Las promociones de su carrito requieren revisión del equipo. Comuníquese con la tienda para revisarlas antes de hacer el pedido; no se creó ningún pedido.',
+  delivery_unconfirmed: MINIMAL_CHECKOUT_ADDRESS_REQUIRED_REPLY,
   invalid_state: MINIMAL_CHECKOUT_INVALID_STATE_REPLY,
   new_address_unsupported:
-    'Por ahora solo puedo crear pedidos para clientes registrados con una dirección guardada. No se creó ningún pedido.',
+    'Por ahora solo puedo crear pedidos para clientes registrados con una dirección guardada. Comuníquese con la tienda para registrar sus datos; no se creó ningún pedido.',
 };
 export const MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY =
-  'Antes de crear el pedido, solicite y confirme el envío con una cotización vigente aprobada por el equipo. No se creó ningún pedido.';
+  'Dígame «cotizar envío» y espere la aprobación del equipo antes de volver a pedir el resumen; no se creó ningún pedido.';
 export const MINIMAL_ORDER_CHANGED_REPLY =
   'Su pedido cambió desde el último resumen; no se creó ningún pedido. Revise el resumen actualizado:';
 export const MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY =
@@ -93,7 +93,7 @@ const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 
 type FreshOrder =
   | { ok: true; snapshot: MinimalOrderSnapshot }
-  | { ok: false; reply: string };
+  | { ok: false; reply: string; reason?: MinimalOrderIneligibleReason };
 
 /**
  * After a sale attempt: `rotate` when the backend definitely did not create it
@@ -217,6 +217,8 @@ export class MinimalOrderService {
     const fresh = await this.freshOrder(senderId);
     if (!fresh.ok) {
       this.confirmation.cancel(senderId);
+      if (!recovery.outstanding && fresh.reason === 'delivery_unconfirmed')
+        return this.checkout.prepareConfirmation(senderId, inboundEvent);
       return {
         reply: recovery.outstanding
           ? MINIMAL_ORDER_UNRESOLVED_REPLY
@@ -258,12 +260,18 @@ export class MinimalOrderService {
     }
     if (result.kind === 'handled') return { reply: result.reply };
     const fresh = await this.freshOrder(input.senderId);
-    if (!fresh.ok)
+    if (!fresh.ok) {
+      if (!recovery.outstanding && fresh.reason === 'delivery_unconfirmed')
+        return this.checkout.prepareConfirmation(
+          input.senderId,
+          input.inboundEvent,
+        );
       return {
         reply: recovery.outstanding
           ? MINIMAL_ORDER_UNRESOLVED_REPLY
           : fresh.reply,
       };
+    }
     if (!sameMinimalOrder(fresh.snapshot, result.snapshot)) {
       const offer = this.offer(
         input.senderId,
@@ -357,6 +365,7 @@ export class MinimalOrderService {
         return {
           ok: false,
           reply: MINIMAL_ORDER_INELIGIBLE_REPLIES[verdict.reason],
+          reason: verdict.reason,
         };
       }
       const revalidation = await this.checkout.revalidateSelection(

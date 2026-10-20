@@ -34,10 +34,13 @@ import {
 export const MINIMAL_CHECKOUT_INVALID_STATE_REPLY =
   'Indique un estado válido de México para su dirección de entrega; después deberá confirmar nuevamente sus datos de entrega.';
 
+export const MINIMAL_CHECKOUT_ADDRESS_REQUIRED_REPLY =
+  'Para crear su pedido primero necesito su dirección de entrega. Dígame «quiero comprar» para ver sus direcciones guardadas o escríbame una dirección nueva.';
+
 export const MINIMAL_CHECKOUT_INCOMPLETE_REPLY =
   'Para mostrarle el resumen de entrega aún me falta:';
 export const MINIMAL_CHECKOUT_RESELECT_REPLY =
-  'Necesito que vuelva a elegir su dirección guardada antes de confirmar sus datos de entrega.';
+  'Dígame «quiero comprar» para ver sus direcciones guardadas y elija cuál usar para la entrega.';
 export const MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY =
   'Por ahora no puedo verificar su dirección guardada. Intente de nuevo en un momento.';
 
@@ -56,15 +59,6 @@ const MISSING_LABELS: Record<MinimalCheckoutMissingField, string> = {
   state: 'estado',
   cityOrMunicipality: 'ciudad o municipio',
 };
-const ALL_MISSING: readonly MinimalCheckoutMissingField[] = [
-  'firstName',
-  'street',
-  'exteriorNumber',
-  'neighborhood',
-  'zipCode',
-  'state',
-  'cityOrMunicipality',
-];
 
 const ADDRESS_FIELDS = [
   'label',
@@ -374,7 +368,7 @@ export class MinimalCheckoutService {
     const current = await this.readDraft(senderId);
     if (current === null) return { reply: MINIMAL_CHECKOUT_AMBIGUOUS_REPLY };
     if (current.draft === undefined) {
-      return { reply: minimalCheckoutIncompleteReply(ALL_MISSING) };
+      return { reply: MINIMAL_CHECKOUT_ADDRESS_REQUIRED_REPLY };
     }
     const readiness = evaluateMinimalCheckoutReadiness(current.draft);
     if (!readiness.ready) {

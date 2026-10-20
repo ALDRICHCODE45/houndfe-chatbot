@@ -253,7 +253,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
       expect(result).toEqual({
         kind: 'handled',
         reply:
-          'No pude verificar los precios y existencias del carrito para revisar la compra. No se creó ningún pedido ni se modificó su carrito.',
+          'No pude verificar los precios y existencias del carrito. Dígame «revisar mi compra» para intentarlo de nuevo; no se creó ningún pedido ni se modificó su carrito.',
       });
     },
   );
@@ -281,7 +281,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(result).toEqual({
       kind: 'handled',
       reply:
-        'Las promociones o precios de su carrito requieren revisión del equipo antes de continuar con la compra. Esta revisión no registró una solicitud ni creó un pedido.',
+        'Las promociones o precios de su carrito requieren revisión del equipo. Comuníquese con la tienda para revisarlos; esta revisión no registró una solicitud ni creó un pedido.',
     });
   });
 

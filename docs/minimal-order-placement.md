@@ -31,7 +31,7 @@ With the [atomic checkout switch](#atomic-checkout-switch) on, new customers and
    - the confirmed delivery data still equals the current draft, byte for byte;
    - a saved address still has the same `version` upstream (a new address is bound to its exact confirmed fields instead);
    - prices and stock come from a new cart evaluation.
-3. The server replies with its own summary: items, product total, delivery address and "shipping not included" when shipping is off. With [minimal shipping](minimal-shipping.md) enabled, a fresh approved quote is required and the summary includes freight and total, or "envío cubierto por su compra". It is armed only after the transport sends it.
+3. If delivery is unconfirmed, the server reuses the delivery-confirmation service in this same turn: it shows the delivery data (including any interior number), lists missing fields, or explains how to select/enter an address. A strict `SÍ` after that **sent delivery summary** confirms delivery only; the customer is then told to say «hacer pedido» for the order summary. Otherwise, the server replies with its own order summary: items, product total, delivery address and "shipping not included" when shipping is off. With [minimal shipping](minimal-shipping.md) enabled, a fresh approved quote is required and the summary includes freight and total, or "envío cubierto por su compra". The order summary ends with `Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.` It is armed only after the transport sends it.
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
@@ -85,7 +85,9 @@ With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else
 
 ## Reply priority in one SDK run
 
-EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text.
+EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.
+
+Blocked replies name the next action: retry the order/cart review, add products, select a saved address, supply missing fields, request a shipping quote and wait for team approval, or contact the store where human review/registration is required. These wording changes do not alter eligibility, shipping freshness, consent, or idempotency gates.
 
 Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confirmation, then the order summary.
 

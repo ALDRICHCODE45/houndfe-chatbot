@@ -259,6 +259,32 @@ describe('checkout readiness gate (S7)', () => {
   });
 });
 
+describe('delivery confirmation next-step presentation', () => {
+  it.each(['new', 'saved'] as const)(
+    'shows the interior number for a %s address and ends with the answer and alternative',
+    (kind) => {
+      const fields = fullFields({ interiorNumber: '130' });
+      const raw = kind === 'new' ? withFields(fields) : savedWithFields(fields);
+      const summary = renderMinimalCheckoutConfirmation(normalize(raw));
+      expect(summary).toContain('Calle: Av. Reforma 123, int. 130');
+      expect(summary).toContain(
+        'no crea un pedido, no registra al cliente ni activa el envío.',
+      );
+      expect(
+        summary.endsWith(
+          'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it('omits the interior suffix when there is no interior number', () => {
+    expect(
+      renderMinimalCheckoutConfirmation(normalize(newDraft())),
+    ).not.toContain('int.');
+  });
+});
+
 describe('MinimalCheckoutConfirmation prepare', () => {
   it('offers a server-owned summary only for a trusted, complete draft', () => {
     const svc = make();

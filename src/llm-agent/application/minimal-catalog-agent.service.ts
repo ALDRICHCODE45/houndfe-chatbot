@@ -243,6 +243,7 @@ type RestockRun = {
 };
 
 type ExpirationReply = { attempted: boolean; value: string | null };
+type CartReply = ExpirationReply & { source?: 'cart' | 'reviewCheckout' };
 
 // One server-owned checkout presentation per SDK run.
 type CheckoutRun = { attempted: boolean; value: MinimalCheckoutReply | null };
@@ -295,7 +296,7 @@ const CHECKOUT_INSTRUCTIONS_FRAGMENT =
   'Si hay direcciones, muéstrelas con su resumen y pregunte cuál usar; para elegir una llame selectCheckoutAddress con su addressRef EXACTO (nunca invente ni elija una por su cuenta). Use nextPageRef solo si el cliente pide ver más. not_found o ambiguous no impiden capturar una dirección nueva; lookup_unavailable no significa que no exista. ' +
   'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Las direcciones guardadas no se editan aquí. ' +
   'Se requieren nombre, calle, número exterior o S/N, colonia, código postal, ciudad o municipio y estado; pida lo que falte (missing). ' +
-  'Cuando estén completos, llame confirmCheckoutDetails sin argumentos: la aplicación muestra el resumen y pide al cliente responder SÍ. Usted nunca confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
+  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
 
 const CART_VARIANT_GUIDANCE =
   'Para herramientas de carrito copie en selectionRef el cartSelectionRef EXACTO del producto o presentación elegidos, devuelto por searchCatalog/checkStock/getCart o por el contexto verificado. No envíe productId ni variantId a herramientas de carrito. ' +
@@ -548,7 +549,7 @@ export class MinimalCatalogAgentService {
     const expirationReply: ExpirationReply | null = expirationAvailable
       ? { attempted: false, value: null }
       : null;
-    const cartReply: ExpirationReply = { attempted: false, value: null };
+    const cartReply: CartReply = { attempted: false, value: null };
     const checkoutRun: CheckoutRun | null =
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
@@ -685,7 +686,7 @@ export class MinimalCatalogAgentService {
       // invalid-cart clarification so neither is lost; the model never
       // authors a checkout outcome.
       const cartPart =
-        cartReply.value ??
+        (cartReply.source === 'reviewCheckout' ? null : cartReply.value) ??
         (this.hasInvalidCartToolCall(result)
           ? CART_OPERATION_CLARIFICATION
           : null);
@@ -867,7 +868,7 @@ export class MinimalCatalogAgentService {
     restockRun: RestockRun | null,
     expirationReply: ExpirationReply | null,
     context: { senderId: string; text: string; inboundEvent?: unknown },
-    cartReply: ExpirationReply,
+    cartReply: CartReply,
     cartConversation: MinimalCartConversation | null,
     checkoutRun: CheckoutRun | null = null,
   ) {
@@ -1095,7 +1096,7 @@ export class MinimalCatalogAgentService {
     let clarificationAcknowledged = false;
     const acknowledge = (
       message: string,
-      kind: 'read' | 'clarification' = 'clarification',
+      kind: 'read' | 'clarification' | 'reviewCheckout' = 'clarification',
     ): void => {
       if (
         mutationAcknowledged ||
@@ -1103,7 +1104,8 @@ export class MinimalCatalogAgentService {
       )
         return;
       cartReply.value = message;
-      if (kind === 'clarification') clarificationAcknowledged = true;
+      cartReply.source = kind === 'reviewCheckout' ? 'reviewCheckout' : 'cart';
+      if (kind !== 'read') clarificationAcknowledged = true;
     };
     const applyIntent = async (
       identity: ResolvedCartSelection,
@@ -1133,6 +1135,7 @@ export class MinimalCatalogAgentService {
         );
         traceCartResult('adjustCartItem', result);
         cartReply.value = minimalCartReply(result);
+        cartReply.source = 'cart';
         mutationAcknowledged = true;
         return result;
       }
@@ -1147,6 +1150,7 @@ export class MinimalCatalogAgentService {
       );
       traceCartResult('setCartItem', result);
       cartReply.value = minimalCartReply(result);
+      cartReply.source = 'cart';
       mutationAcknowledged = true;
       return result;
     };
@@ -1200,6 +1204,7 @@ export class MinimalCatalogAgentService {
                     checkout: checkoutRun !== null,
                     shipping: checkoutRun !== null && this.shippingAvailable(),
                   }),
+                  'reviewCheckout',
                 );
               trace(
                 `tool reviewCheckout result=${result.ok ? 'incomplete' : 'blocked'} code=${result.ok ? 'requirements_pending' : result.reason}`,
@@ -1285,6 +1290,7 @@ export class MinimalCatalogAgentService {
                 `cart_keep_only result=${result.ok ? 'ok' : 'error'} code=${result.ok ? 'none' : CART_TRACE_ERROR_CODES.has(result.error) ? result.error : 'unrecognized_cart_error'}`,
               );
               cartReply.value = minimalCartReply(result);
+              cartReply.source = 'cart';
               mutationAcknowledged = true;
               return result;
             },
@@ -1537,9 +1543,9 @@ export class MinimalCatalogAgentService {
                         checkoutRun.value = {
                           reply:
                             result.kind === 'quoted'
-                              ? 'Solicité la aprobación del envío al equipo. No se creó ningún pedido.'
+                              ? 'Solicité la aprobación del envío al equipo. Espere la respuesta del equipo antes de pedir el resumen; no se creó ningún pedido.'
                               : result.reason === 'approval_unavailable'
-                                ? 'La aprobación del envío está pendiente o no está disponible. No se creó ningún pedido.'
+                                ? 'La aprobación del envío está pendiente o no está disponible. Comuníquese con la tienda para revisarla; no se creó ningún pedido.'
                                 : `No pude cotizar el envío (${result.reason}). No se creó ningún pedido. Puede solicitar otra cotización.`,
                         };
                         return {
