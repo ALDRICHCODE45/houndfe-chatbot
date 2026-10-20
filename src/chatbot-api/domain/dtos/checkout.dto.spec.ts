@@ -54,6 +54,42 @@ export const checkoutResponse = {
 };
 
 describe('atomic checkout DTO', () => {
+  it('accepts existingUpdated with exact version and the updated receipt', () => {
+    const deliveryAddress = {
+      mode: 'existingUpdated',
+      addressId: id,
+      expectedVersion: checkoutResponse.address.version,
+      address: { street: 'Centro', zipCode: '55635' },
+    };
+    expect(
+      CreateCheckoutInputSchema.safeParse({ ...checkoutInput, deliveryAddress })
+        .success,
+    ).toBe(true);
+    const response = {
+      ...checkoutResponse,
+      address: { ...checkoutResponse.address, resolution: 'updated' },
+    };
+    expect(normalizeCheckoutResponse(response)?.address.resolution).toBe(
+      'updated',
+    );
+    expect(
+      normalizeCheckoutStatus({ status: 'succeeded', checkout: response })
+        ?.status,
+    ).toBe('succeeded');
+    for (const patch of [
+      { expectedVersion: 'bad' },
+      { addressId: 'bad' },
+      { address: { zipCode: '55635' } },
+      { address: { street: 'Centro', latitude: 19 } },
+    ]) {
+      expect(
+        CreateCheckoutInputSchema.safeParse({
+          ...checkoutInput,
+          deliveryAddress: { ...deliveryAddress, ...patch },
+        }).success,
+      ).toBe(false);
+    }
+  });
   it('S1 trims header and shipping identifiers', () => {
     expect(CheckoutIdempotencyKeySchema.parse(' key ')).toBe('key');
     const parsed = CreateCheckoutInputSchema.parse({

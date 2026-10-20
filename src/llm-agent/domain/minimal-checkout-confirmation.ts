@@ -86,9 +86,9 @@ function addressFields(draft: MinimalCheckoutDraft): {
   municipality: string | null;
 } {
   const source =
-    draft.address.kind === 'new'
-      ? draft.address.fields
-      : draft.address.snapshot;
+    draft.address.kind === 'saved'
+      ? draft.address.snapshot
+      : draft.address.fields;
   return {
     street: source.street,
     exteriorNumber: source.exteriorNumber,

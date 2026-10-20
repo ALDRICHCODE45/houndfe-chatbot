@@ -374,23 +374,148 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     expect(await h.draft()).toEqual(before);
   });
 
-  it('does not edit a saved address unless a new address is explicitly requested', async () => {
+  it('accumulates corrections, preserves names, and returns to saved when restored', async () => {
     const h = setup();
+    const service = h.checkout();
+    const result = await service.lookup(SENDER, null);
+    if (!result.ok || result.status !== 'unique') throw new Error('fixture');
+    await service.selectAddress(SENDER, result.addresses[0].addressRef);
+    await service.updateDetails(SENDER, details({ zipCode: '55635' }, false));
+    const offer = await service.prepareConfirmation(SENDER, EVENT('first'));
+    offer.onSent?.();
+    await service.consume({
+      senderId: SENDER,
+      text: 'SÍ',
+      inboundEvent: EVENT('first-yes'),
+    });
+    expect(await service.confirmedDraft(SENDER)).not.toBeNull();
+    await service.updateDetails(
+      SENDER,
+      details({ interiorNumber: '130', firstName: 'Ana María' }, false),
+    );
+    expect(await service.confirmedDraft(SENDER)).toBeNull();
+    expect(await h.draft()).toMatchObject({
+      customer: { firstName: 'Ana María' },
+      address: {
+        kind: 'savedCorrected',
+        fields: { zipCode: '55635', interiorNumber: '130' },
+        snapshot: savedAddress(),
+      },
+    });
+    await service.updateDetails(
+      SENDER,
+      details({ zipCode: '06000', interiorNumber: '130' }, false),
+    );
+    expect(await h.draft()).toMatchObject({
+      address: { kind: 'savedCorrected' },
+    });
+    // Restore to the base with a non-null field; null patches intentionally mean no change.
+    const base = savedAddress({ interiorNumber: '130' });
+    const other = setup({ context: () => Promise.resolve(unique([base])) });
+    const lookupResult = await other.checkout().lookup(SENDER, null);
+    if (!lookupResult.ok || lookupResult.status !== 'unique')
+      throw new Error('fixture');
+    await other
+      .checkout()
+      .selectAddress(SENDER, lookupResult.addresses[0].addressRef);
+    await other
+      .checkout()
+      .updateDetails(SENDER, details({ zipCode: '55635' }, false));
+    await other
+      .checkout()
+      .updateDetails(SENDER, details({ zipCode: '06000' }, false));
+    expect(await other.draft()).toMatchObject({
+      address: { kind: 'saved', snapshot: base },
+    });
+  });
+
+  it.each(['version', 'id', 'restart'] as const)(
+    'reselects corrected saved addresses after base %s changes',
+    async (change) => {
+      const h = setup();
+      const service = h.checkout();
+      const result = await service.lookup(SENDER, null);
+      if (!result.ok || result.status !== 'unique') throw new Error('fixture');
+      await service.selectAddress(SENDER, result.addresses[0].addressRef);
+      await service.updateDetails(SENDER, details({ zipCode: '55635' }, false));
+      if (change === 'restart') h.restart();
+      else
+        h.getCustomerCheckoutContext.mockResolvedValue(
+          unique([
+            savedAddress(
+              change === 'id'
+                ? { id: ADDRESS_2 }
+                : { version: '2026-10-02T00:00:00.000Z' },
+            ),
+          ]),
+        );
+      expect(
+        await h.checkout().prepareConfirmation(SENDER, EVENT('stale')),
+      ).toEqual({ reply: MINIMAL_CHECKOUT_RESELECT_REPLY });
+      expect(await h.checkout().confirmedDraft(SENDER)).toBeNull();
+    },
+  );
+
+  it('corrects the production saved ZIP case and confirms only the corrected server summary', async () => {
+    const snapshot = savedAddress({ zipCode: '05635' });
+    const h = setup({ context: () => Promise.resolve(unique([snapshot])) });
     await h.turn('Quiero comprar', [lookup(), say()]);
     await h.turn('La primera', [
       call('selectCheckoutAddress', { addressRef: firstRef(h.outputs[0]) }),
       say(),
     ]);
-    const before = await h.draft();
-    await h.turn('Cambie la calle', [
-      call('updateCheckoutDetails', details({ street: 'Otra' }, false)),
-      say(),
-    ]);
-    expect(h.outputs[0]).toEqual({
-      ok: false,
-      error: 'saved_address_not_editable',
+    const oldOffer = await h
+      .checkout()
+      .prepareConfirmation(SENDER, EVENT('old'));
+    oldOffer.onSent?.();
+    const corrected = await h.turn(
+      'el codigo postal esta mal, el correcto es: 55635',
+      [
+        call('updateCheckoutDetails', details({ zipCode: '55635' }, false)),
+        call('confirmCheckoutDetails'),
+        say('Confirme los datos anteriores'),
+      ],
+      EVENT('correction'),
+    );
+    expect(h.outputs[0]).toEqual({ ok: true, ready: true, missing: [] });
+    expect((corrected as { reply: string }).reply).toContain(
+      'Código postal: 55635',
+    );
+    expect((corrected as { reply: string }).reply).toMatch(
+      /^Confirme sus datos de entrega:/,
+    );
+    expect((corrected as { reply: string }).reply).toContain(
+      'Calle: Av. Juárez 10',
+    );
+    expect((corrected as { reply: string }).reply).not.toContain('05635');
+    const { id: _id, version: _version, ...fields } = snapshot;
+    void _id;
+    void _version;
+    expect(await h.draft()).toMatchObject({
+      address: {
+        kind: 'savedCorrected',
+        snapshot,
+        fields: { ...fields, zipCode: '55635' },
+      },
     });
-    expect(await h.draft()).toEqual(before);
+    expect(await h.checkout().confirmedDraft(SENDER)).toBeNull();
+    (corrected as { onSent: () => void }).onSent();
+    expect(await h.turn('SÍ', [say()], EVENT('corrected-yes'))).toEqual({
+      kind: 'handled',
+      reply: MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+    });
+    expect((await h.checkout().confirmedDraft(SENDER))?.address.kind).toBe(
+      'savedCorrected',
+    );
+    for (const fn of Object.values(h.forbidden))
+      expect(fn).not.toHaveBeenCalled();
+    expect(h.seen[0].system).not.toContain(
+      'Las direcciones guardadas no se editan aquí',
+    );
+    expect(h.seen[0].system).toContain('useNewAddress: false');
+    expect(h.seen[0].system).toContain(
+      'Nunca pida confirmar datos que el cliente dijo que están mal',
+    );
   });
 
   it('blocks confirmation with the missing-data reply while the draft is incomplete', async () => {

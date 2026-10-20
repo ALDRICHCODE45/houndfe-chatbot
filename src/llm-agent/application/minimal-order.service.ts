@@ -471,13 +471,13 @@ export class MinimalOrderService {
       const address = snapshot.draft.address;
       if (phone === null) return unverified;
       const state =
-        address.kind === 'new' ? toMexicanState(address.fields.state) : null;
-      if (address.kind === 'new' && state === null)
+        address.kind !== 'saved' ? toMexicanState(address.fields.state) : null;
+      if (address.kind !== 'saved' && state === null)
         return MINIMAL_CHECKOUT_INVALID_STATE_REPLY;
       const parsed = CreateCheckoutInputSchema.safeParse({
         ...phone,
         customer:
-          address.kind === 'saved'
+          address.kind !== 'new'
             ? { mode: 'existing', customerId: snapshot.customerId }
             : {
                 mode: 'createIfAbsent',
@@ -494,7 +494,13 @@ export class MinimalOrderService {
                 expectedVersion: address.snapshot.version,
               }
             : {
-                mode: 'newSaved',
+                ...(address.kind === 'savedCorrected'
+                  ? {
+                      mode: 'existingUpdated',
+                      addressId: address.snapshot.id,
+                      expectedVersion: address.snapshot.version,
+                    }
+                  : { mode: 'newSaved' }),
                 address: {
                   ...Object.fromEntries(
                     Object.entries(address.fields).filter(
@@ -570,6 +576,12 @@ export class MinimalOrderService {
               )
             )?.sale;
     } catch (error) {
+      const addressRejected =
+        this.atomicCheckoutEnabled &&
+        error instanceof ChatbotApiError &&
+        (error.errorCode === 'ADDRESS_VERSION_CONFLICT' ||
+          error.errorCode === 'SHIPPING_ADDRESS_NOT_FOUND');
+      if (addressRejected) this.checkout.clearSelection(senderId);
       if (classifyFailure(error, this.atomicCheckoutEnabled) === 'keep') {
         return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
       }
@@ -589,13 +601,7 @@ export class MinimalOrderService {
       delete unkeyed.idempotencyAttempts;
       await this.commitCart(senderId, stored, unkeyed);
       if (ambiguousPhone) return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
-      if (
-        this.atomicCheckoutEnabled &&
-        error instanceof ChatbotApiError &&
-        error.errorCode === 'ADDRESS_VERSION_CONFLICT'
-      ) {
-        return 'Su dirección guardada cambió. Seleccione y confirme nuevamente sus datos de entrega. No se creó ningún pedido.';
-      }
+      if (addressRejected) return MINIMAL_CHECKOUT_RESELECT_REPLY;
       return MINIMAL_ORDER_REJECTED_REPLY;
     }
     if (!isSale(sale)) return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;

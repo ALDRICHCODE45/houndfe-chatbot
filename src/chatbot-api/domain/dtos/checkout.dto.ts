@@ -55,6 +55,14 @@ export const CreateCheckoutInputSchema = z
       z.object({ mode: z.literal('newSaved'), address }).strict(),
       z
         .object({
+          mode: z.literal('existingUpdated'),
+          addressId: uuid,
+          expectedVersion: instant,
+          address,
+        })
+        .strict(),
+      z
+        .object({
           mode: z.literal('existing'),
           addressId: uuid,
           expectedVersion: instant,
@@ -129,7 +137,7 @@ const checkoutResponse = z
       .strict(),
     address: z
       .object({
-        resolution: z.enum(['created', 'existing']),
+        resolution: z.enum(['created', 'existing', 'updated']),
         id: uuid,
         version: instant,
       })

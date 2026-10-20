@@ -103,8 +103,7 @@ export type MinimalCheckoutError =
   | 'unknown_reference'
   | 'draft_unavailable'
   | 'draft_changed'
-  | 'invalid_details'
-  | 'saved_address_not_editable';
+  | 'invalid_details';
 
 export interface MinimalCheckoutAddressChoice {
   addressRef: string;
@@ -222,6 +221,12 @@ export class MinimalCheckoutService {
     return this.confirmation.confirmedDraft(senderId, current.raw);
   }
 
+  /** Backend rejected the selected base; a fresh lookup/selection is required. */
+  clearSelection(senderId: string): void {
+    this.selected.delete(senderId);
+    this.confirmation.revokeConfirmation(senderId);
+  }
+
   /** Fresh saved-address check for order placement; see `revalidate`. */
   revalidateSelection(
     senderId: string,
@@ -327,19 +332,24 @@ export class MinimalCheckoutService {
     const current = await this.readDraft(senderId);
     if (current === null) return { ok: false, error: 'draft_unavailable' };
     const draft = current.draft;
-    const touchesAddress = ADDRESS_FIELDS.some((key) => values.has(key));
-    const savedSelected = draft?.address.kind === 'saved';
-    if (savedSelected && touchesAddress && patch.useNewAddress !== true) {
-      return { ok: false, error: 'saved_address_not_editable' };
-    }
+    const savedSelected = draft !== undefined && draft.address.kind !== 'new';
     const keepSaved = savedSelected && patch.useNewAddress !== true;
     const customer = {
       firstName: values.get('firstName') ?? draft?.customer.firstName ?? null,
       lastName: values.get('lastName') ?? draft?.customer.lastName ?? null,
     };
     let address: MinimalCheckoutDraft['address'];
-    if (keepSaved && draft !== undefined) {
-      address = draft.address;
+    if (keepSaved && draft !== undefined && draft.address.kind !== 'new') {
+      const snapshot = draft.address.snapshot;
+      const fields: MinimalCheckoutDraftNewAddressFields = EMPTY_FIELDS();
+      const source =
+        draft.address.kind === 'saved' ? snapshot : draft.address.fields;
+      for (const key of ADDRESS_FIELDS) {
+        fields[key] = values.get(key) ?? source[key];
+      }
+      address = ADDRESS_FIELDS.every((key) => fields[key] === snapshot[key])
+        ? { kind: 'saved', snapshot }
+        : { kind: 'savedCorrected', snapshot, fields };
     } else {
       const fields =
         draft?.address.kind === 'new'
@@ -375,7 +385,7 @@ export class MinimalCheckoutService {
       return { reply: minimalCheckoutIncompleteReply(readiness.missing) };
     }
     if (
-      current.draft.address.kind === 'new' &&
+      current.draft.address.kind !== 'saved' &&
       toMexicanState(current.draft.address.fields.state) === null
     ) {
       this.confirmation.revokeConfirmation(senderId);
@@ -576,7 +586,7 @@ export class MinimalCheckoutService {
     senderId: string,
     draft: MinimalCheckoutDraft,
   ): Promise<Revalidation> {
-    if (draft.address.kind !== 'saved') return 'ok';
+    if (draft.address.kind === 'new') return 'ok';
     const reference = this.selected.get(senderId);
     const registry = this.references.get(senderId);
     const phone = parseMexicanWhatsAppPhone(senderId);

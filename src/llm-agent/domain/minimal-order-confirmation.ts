@@ -94,7 +94,7 @@ export function evaluateMinimalOrder(input: {
     return { ok: false, reason: 'delivery_unconfirmed' };
   }
   if (
-    confirmedDraft.address.kind === 'new' &&
+    confirmedDraft.address.kind !== 'saved' &&
     input.atomicCheckoutEnabled === true
   ) {
     if (toMexicanState(confirmedDraft.address.fields.state) === null) {
@@ -104,7 +104,10 @@ export function evaluateMinimalOrder(input: {
       ok: true,
       snapshot: structuredClone({
         customerId: confirmedDraft.sourceCustomerId ?? '',
-        shippingAddressId: '',
+        shippingAddressId:
+          confirmedDraft.address.kind === 'savedCorrected'
+            ? confirmedDraft.address.snapshot.id
+            : '',
         draft: confirmedDraft,
         items: quote.items.map((item) => ({ ...item })),
         totalCents: quote.totalCents,
@@ -221,6 +224,9 @@ export function renderMinimalOrderSummary(
     `Entrega a: ${deliveryLine(snapshot)}`,
     ...(snapshot.draft.address.kind === 'new'
       ? ['Guardaremos esta dirección con su pedido.']
+      : []),
+    ...(snapshot.draft.address.kind === 'savedCorrected'
+      ? ['Actualizaremos su dirección guardada con estos datos.']
       : []),
     ...(snapshot.shipping === undefined
       ? [

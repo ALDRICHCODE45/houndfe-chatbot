@@ -37,6 +37,7 @@ const DRAFT_KEYS = [
 const CUSTOMER_KEYS = ['firstName', 'lastName'] as const;
 const NEW_ADDRESS_KEYS = ['kind', 'fields'] as const;
 const SAVED_ADDRESS_KEYS = ['kind', 'snapshot'] as const;
+const CORRECTED_ADDRESS_KEYS = ['kind', 'snapshot', 'fields'] as const;
 /** All T1 delivery fields except `id`/`version`; all nullable for local collection. */
 const NEW_FIELD_KEYS = [
   'label',
@@ -87,14 +88,18 @@ export interface MinimalCheckoutDraftSavedAddressChoice {
   snapshot: CheckoutContextAddress;
 }
 
-/**
- * Tagged union: `new` carries local fields; `saved` carries an exact backend
- * snapshot and requires a non-null `sourceCustomerId`. The two never mix, and
- * `saved` snapshots are never narrowed relative to the T1 shape.
- */
+/** Full prospective replacement plus the unchanged freshness/identity base. */
+export interface MinimalCheckoutDraftCorrectedAddressChoice {
+  kind: 'savedCorrected';
+  snapshot: CheckoutContextAddress;
+  fields: MinimalCheckoutDraftNewAddressFields;
+}
+
+/** Saved variants require a customer and retain the exact backend snapshot. */
 export type MinimalCheckoutDraftAddress =
   | MinimalCheckoutDraftNewAddressChoice
-  | MinimalCheckoutDraftSavedAddressChoice;
+  | MinimalCheckoutDraftSavedAddressChoice
+  | MinimalCheckoutDraftCorrectedAddressChoice;
 
 export interface MinimalCheckoutDraft {
   schemaVersion: 1;
@@ -247,6 +252,18 @@ function normalizeDraftAddress(
   if (kind === 'new') {
     if (!hasExactKeys(captured, NEW_ADDRESS_KEYS)) return null;
     return normalizeNewAddress(captured.get('fields'));
+  }
+  if (kind === 'savedCorrected') {
+    if (
+      sourceCustomerId === null ||
+      !hasExactKeys(captured, CORRECTED_ADDRESS_KEYS)
+    )
+      return null;
+    const base = normalizeSavedAddress(captured.get('snapshot'));
+    const corrected = normalizeNewAddress(captured.get('fields'));
+    return base === null || corrected === null
+      ? null
+      : { kind, snapshot: base.snapshot, fields: corrected.fields };
   }
   if (kind === 'saved') {
     if (!hasExactKeys(captured, SAVED_ADDRESS_KEYS)) return null;

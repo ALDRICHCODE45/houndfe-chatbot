@@ -19,6 +19,7 @@ import type {
   RestockIntakeInput,
 } from '../domain/dtos/human-decisions.dto';
 import type { ExpirationIntakeInput } from '../domain/dtos/human-decisions-expiration.dto';
+import type { CreateCheckoutInput } from '../domain/dtos/checkout.dto';
 
 // Complete, type-safe `AxiosResponse` fixture. The client consumes
 // `httpService.request<T>()`, which resolves to `AxiosResponse<T>`, so a bare
@@ -72,6 +73,76 @@ describe('ChatbotApiHttpClient', () => {
     sleep = jest.fn<Promise<void>, [number]>().mockResolvedValue(undefined);
 
     client = new ChatbotApiHttpClient(service, configService, sleep);
+  });
+
+  it('posts a corrected saved address once and accepts updated resolution', async () => {
+    const id = '11111111-1111-4111-8111-111111111111';
+    const input: CreateCheckoutInput = {
+      phoneCountryCode: '52',
+      phone: '5512345678',
+      customer: { mode: 'existing', customerId: id },
+      deliveryAddress: {
+        mode: 'existingUpdated',
+        addressId: id,
+        expectedVersion: '2026-10-01T00:00:00.000Z',
+        address: { street: 'Centro', zipCode: '55635' },
+      },
+      sale: {
+        cashierUserId: id,
+        items: [
+          {
+            productId: id,
+            productName: 'Food',
+            quantity: 1,
+            unitPriceCents: 1500,
+          },
+        ],
+        expectedTotalCents: 1500,
+      },
+    };
+    const receipt = {
+      status: 'created',
+      customer: {
+        resolution: 'existing',
+        customerId: id,
+        firstName: 'Ana',
+        lastName: null,
+      },
+      address: {
+        resolution: 'updated',
+        id,
+        version: '2026-10-19T00:00:00.000Z',
+      },
+      sale: {
+        saleId: id,
+        folio: 'B-1',
+        paymentStatus: 'CREDIT',
+        channel: 'ONLINE',
+        deliveryStatus: 'PENDING',
+        totalCents: 1500,
+        paidCents: 0,
+        debtCents: 1500,
+        confirmedAt: null,
+      },
+    };
+    httpService.request.mockReturnValue(of(axiosResponse(receipt, 201)));
+    await expect(
+      client.createCheckout(input, 'correction-key'),
+    ).resolves.toMatchObject({
+      address: receipt.address,
+      sale: { saleId: receipt.sale.saleId },
+    });
+    expect(httpService.request).toHaveBeenCalledTimes(1);
+    expect(httpService.request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: 'POST',
+        url: '/chatbot-api/checkouts',
+        data: input,
+        headers: expect.objectContaining({
+          'X-Idempotency-Key': 'correction-key',
+        }) as unknown,
+      }),
+    );
   });
 
   it.each([false, true])(

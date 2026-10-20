@@ -10,11 +10,27 @@ A local confirmation is not an order, not a customer registration and not a ship
 | -------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Find saved data      | `lookupCheckoutCustomer({ nextPageRef })`             | Reads `GET /chatbot-api/customers/checkout-context` for the trusted sender phone. Returns `unique` (opaque `addressRef`s + summaries), `not_found`, `ambiguous`, or `lookup_unavailable`. One bounded page per call. |
 | Pick a saved address | `selectCheckoutAddress({ addressRef })`               | Only a live server-issued reference works. Stores an exact snapshot in the durable draft.                                                                                                                            |
-| Dictate new data     | `updateCheckoutDetails({ ...fields, useNewAddress })` | `null` keeps a field. Saved addresses are never edited: address fields on a saved selection need `useNewAddress: true`. Values are trimmed and bounded like the backend customer DTO.                                |
+| Dictate new data     | `updateCheckoutDetails({ ...fields, useNewAddress })` | `null` keeps a field. With a saved selection, `useNewAddress: false` corrects only supplied fields; `true` starts a new address. Values are trimmed and bounded like the backend customer DTO.                       |
 | Ask to confirm       | `confirmCheckoutDetails({})`                          | Server-owned reply: the summary (armed by `onSent`), the missing-data list, or a re-select request.                                                                                                                  |
 | Confirm              | customer replies `SÍ`                                 | Consumed in `tryHandle` before the SDK run.                                                                                                                                                                          |
 
 The tools exist only when the minimal cart is enabled and the store implements `commitMinimalCheckoutDraft`. Without `MinimalCheckoutService` the route is unchanged.
+
+## Correct a selected saved address
+
+For “el codigo postal esta mal, el correcto es: 55635”, the model calls
+`updateCheckoutDetails` with `zipCode: '55635'`, `useNewAddress: false` and
+`null` for every other field, then `confirmCheckoutDetails` in the same turn.
+The server keeps the other snapshot fields and presents the corrected delivery
+summary for a new **SÍ**. If the customer says a value is wrong but supplies no
+replacement, ask for the correct value; never ask them to confirm the wrong data.
+
+The durable `savedCorrected` choice holds the exact base snapshot (`id` and
+`version` included) and the full corrected fields. Later corrections accumulate;
+restoring all original values returns to plain `saved`. Name corrections keep
+the existing behavior. Base freshness is revalidated just like `saved`, including
+after restart. Nothing is written upstream until the atomic order transaction;
+see [order placement](minimal-order-placement.md#atomic-checkout-switch).
 
 ## Confirmation rules
 

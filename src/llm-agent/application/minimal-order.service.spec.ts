@@ -314,6 +314,140 @@ async function newShipping(h: Harness, free = false) {
   );
 }
 
+async function correctSavedDelivery(h: Harness, zipCode = '55635') {
+  const fields = Object.fromEntries(
+    Object.keys(savedAddress())
+      .filter((key) => key !== 'id' && key !== 'version')
+      .map((key) => [key, null]),
+  );
+  await h.checkout.updateDetails(SENDER, {
+    ...fields,
+    firstName: null,
+    lastName: null,
+    zipCode,
+    useNewAddress: false,
+  } as Parameters<MinimalCheckoutService['updateDetails']>[1]);
+  const offer = await h.checkout.prepareConfirmation(
+    SENDER,
+    EVENT('correction'),
+  );
+  offer.onSent?.();
+  await h.checkout.consume({
+    senderId: SENDER,
+    text: 'SÍ',
+    inboundEvent: EVENT('correction-yes'),
+  });
+}
+
+describe('corrected saved address checkout', () => {
+  it.each([
+    ['55635', 'existingUpdated'],
+    ['06000', 'existing'],
+  ])(
+    'places %s using %s without changing unspecified snapshot fields',
+    async (zipCode, mode) => {
+      const h = setup({ atomic: true });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await correctSavedDelivery(h, zipCode);
+      const offered = await offerOrder(h);
+      expect(offered.reply).toContain(`C.P. ${zipCode}`);
+      if (mode === 'existingUpdated')
+        expect(offered.reply).toContain(
+          'Actualizaremos su dirección guardada con estos datos.',
+        );
+      await yes(h);
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+      const [payload] = h.api.createCheckout.mock.calls[0] as unknown as [
+        { deliveryAddress: unknown },
+      ];
+      const { id, version, ...address } = savedAddress();
+      expect(payload.deliveryAddress).toEqual({
+        mode,
+        addressId: id,
+        expectedVersion: version,
+        ...(mode === 'existingUpdated'
+          ? {
+              address: Object.fromEntries(
+                Object.entries({ ...address, zipCode }).filter(
+                  ([, value]) => value !== null,
+                ),
+              ),
+            }
+          : {}),
+      });
+      expect(h.api.createSale).not.toHaveBeenCalled();
+      expect(await h.minimalCart()).toMatchObject({
+        placedSale: { saleId: SALE },
+      });
+      await yes(h, 'duplicate');
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('refuses corrected saved addresses when atomic checkout is off', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await correctSavedDelivery(h);
+    expect((await offerOrder(h)).reply).toBe(
+      MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
+    );
+    await yes(h);
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [409, 'ADDRESS_VERSION_CONFLICT'],
+    [404, 'SHIPPING_ADDRESS_NOT_FOUND'],
+  ] as const)(
+    'clears the selection after %s %s and never retries',
+    async (status, code) => {
+      const h = setup({ atomic: true });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await correctSavedDelivery(h);
+      await offerOrder(h);
+      const draft = (await h.checkout.confirmedDraft(SENDER))!;
+      h.api.createCheckout.mockRejectedValueOnce(
+        new ChatbotApiError('private', status, undefined, code),
+      );
+      expect((await yes(h))?.reply).toBe(MINIMAL_CHECKOUT_RESELECT_REPLY);
+      expect(await h.checkout.revalidateSelection(SENDER, draft)).toBe(
+        'reselect',
+      );
+      expect(await h.checkout.confirmedDraft(SENDER)).toBeNull();
+      await offerOrder(h, 'retry');
+      await yes(h, 'retry-yes');
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+      expect(h.api.createSale).not.toHaveBeenCalled();
+    },
+  );
+
+  it('fingerprints the corrected payload and holds a changed correction after uncertainty', async () => {
+    const h = setup({ atomic: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await correctSavedDelivery(h);
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
+    await yes(h);
+    const [payload] = h.api.createCheckout.mock.calls[0] as unknown as [
+      unknown,
+    ];
+    expect(await h.minimalCart()).toMatchObject({
+      idempotencyFingerprint: createHash('sha256')
+        .update(JSON.stringify(payload))
+        .digest('hex'),
+    });
+    await correctSavedDelivery(h, '55636');
+    await offerOrder(h, 'changed');
+    expect((await yes(h, 'changed-yes'))?.reply).toBe(MINIMAL_ORDER_HELD_REPLY);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('new customer checkout S2/S3/S4/S6', () => {
   it.each(['expired', 'rejected'])(
     'new shipping %s blocks the summary',
@@ -966,8 +1100,13 @@ describe('atomic checkout order S1–S5', () => {
     h.api.createCheckout.mockRejectedValueOnce(rejection);
     const reply = (await yes(h))?.reply;
     expect(reply).not.toContain('raw secret');
-    if (code === 'ADDRESS_VERSION_CONFLICT')
-      expect(reply).toContain('confirme');
+    if (
+      code === 'ADDRESS_VERSION_CONFLICT' ||
+      code === 'SHIPPING_ADDRESS_NOT_FOUND'
+    ) {
+      expect(reply).toBe(MINIMAL_CHECKOUT_RESELECT_REPLY);
+      await confirmSavedDelivery(h);
+    }
     expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
     await offerOrder(h, 'wamid.r1');
     h.api.createCheckout.mockRejectedValueOnce(new Error('network'));

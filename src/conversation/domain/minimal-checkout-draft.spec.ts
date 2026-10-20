@@ -63,6 +63,46 @@ const snapshotOf = (draft: MinimalCheckoutDraft | null) =>
   (draft?.address as { snapshot?: CheckoutContextAddress })?.snapshot;
 describe('normalizeMinimalCheckoutDraft', () => {
   describe('accepted records', () => {
+    it('detaches corrected fields and the exact base snapshot independently', () => {
+      const raw = savedDraft({
+        address: {
+          kind: 'savedCorrected',
+          snapshot: savedSnapshot(),
+          fields: { ...newFields(), street: 'Centro', zipCode: '55635' },
+        },
+      });
+      const parsed = normalize(raw);
+      expect(parsed).toEqual(raw);
+      expect(parsed).not.toBe(raw);
+      const corrected = parsed?.address as unknown as {
+        snapshot: CheckoutContextAddress;
+        fields: MinimalCheckoutDraftNewAddressFields;
+      };
+      corrected.fields.zipCode = 'other';
+      corrected.snapshot.street = 'other';
+      expect(normalize(raw)).toEqual(raw);
+      expect(normalize({ ...raw, sourceCustomerId: null })).toBeNull();
+      for (const address of [
+        { ...corrected, kind: 'savedCorrected', extra: true },
+        {
+          ...corrected,
+          kind: 'savedCorrected',
+          fields: { ...corrected.fields, id: UPPER_ID },
+        },
+        {
+          ...corrected,
+          kind: 'savedCorrected',
+          snapshot: { ...savedSnapshot(), version: NON_CANONICAL },
+        },
+        {
+          ...corrected,
+          kind: 'savedCorrected',
+          fields: { ...corrected.fields, zipCode: undefined },
+        },
+      ]) {
+        expect(normalize({ ...raw, address })).toBeNull();
+      }
+    });
     it('accepts an incomplete new draft preserving null partial data', () => {
       expect(normalize(newDraft())).toEqual<MinimalCheckoutDraft>({
         schemaVersion: 1,

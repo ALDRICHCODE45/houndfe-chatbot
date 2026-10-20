@@ -22,7 +22,7 @@ The store must implement `commitMinimalCart` and `commitMinimalCheckoutDraft`.
 - A **saved** address, selected and confirmed through the checkout flow (`docs/minimal-checkout-coordinator.md`).
 - A non-empty cart whose promotions are fully evaluated.
 
-With the [atomic checkout switch](#atomic-checkout-switch) on, new customers and confirmed new addresses can also order (see there). With it off, they get a clear "not yet" reply. This route never calls customer upsert or separate address mutations.
+With the [atomic checkout switch](#atomic-checkout-switch) on, new customers, confirmed new addresses and corrected saved addresses can also order (see there). With it off, they get a clear "not yet" reply. This route never calls customer upsert or separate address mutations.
 
 ## Flow
 
@@ -69,6 +69,7 @@ The lock ends only with a confirmed sale, or with a definite rejection of the fi
 With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else is off), `place()` sends one `POST /chatbot-api/checkouts` instead of `POST /chatbot-api/sales`. With it off, the legacy path is unchanged. Launch preflight requires it explicitly `false`: the backend endpoint is committed in `houndfe-backend` but not deployed.
 
 - Saved address: customer mode `existing` and deliveryAddress mode `existing` with the confirmed snapshot `version` as `expectedVersion`. Phone comes from the trusted WhatsApp sender.
+- **Corrected saved address:** customer mode `existing`, deliveryAddress mode `existingUpdated`, the base `addressId` and exact base `version` as `expectedVersion`, plus the full snapshot-derived corrected address (no coordinates). This is a full replacement: null optional fields are omitted so the backend stores null, while unchanged non-null fields are preserved. The server's “Entrega a:” uses the corrected address and adds “Actualizaremos su dirección guardada con estos datos.” The backend updates that same address atomically with the sale; failure saves nothing. An identical correction stays plain `saved` and uses mode `existing`. The receipt accepts address resolution `updated` (or `existing` for a no-op).
 - **New customer or new address:** customer mode `createIfAbsent` (`firstName`, plus `lastName` when known) and deliveryAddress mode `newSaved` with the confirmed fields. Absent optional fields are omitted, never sent as `null`. The backend creates the customer (or reuses the unique one for that phone without changing it) and saves the address **only in the same transaction as the sale**; a rejected or rolled-back checkout saves nothing. The summary adds "Guardaremos esta dirección con su pedido."
 - **State:** the backend accepts only its exact list of 32 state names. The confirmed free text is mapped deterministically (case, accents and spacing ignored, plus fixed aliases such as `CDMX`, `DF`, `Edomex`). Anything else, including a bare `México`, is never guessed: the delivery confirmation is revoked and the customer is asked for a valid state and to confirm again.
 - `CUSTOMER_PHONE_AMBIGUOUS` (several customers share the phone) creates nothing and asks the customer to contact the store.
@@ -81,7 +82,7 @@ With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else
   | `not_observed`               | Same payload replayed with the **same** key (never a fresh one).                  |
   | anything else, or read fails | Lock kept; "no pude confirmar si quedó registrado".                               |
 
-- Errors: `CHECKOUT_RETRY_REQUIRED` keeps the key. `ADDRESS_VERSION_CONFLICT` is a definite rejection that asks the customer to re-select and confirm their delivery data. Other codes follow the table above.
+- Errors: `CHECKOUT_RETRY_REQUIRED` keeps the key. `ADDRESS_VERSION_CONFLICT` and `SHIPPING_ADDRESS_NOT_FOUND` clear the volatile selection and local confirmation; on a first attempt the customer must re-read saved addresses, select and confirm again. A later rejection still keeps any uncertain earlier order locked. Other codes follow the table above. The corrected full address, mode, address id and expected version are part of the fingerprint; an uncertain request cannot be retried with different corrections.
 
 ## Reply priority in one SDK run
 

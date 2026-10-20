@@ -96,28 +96,40 @@ export function runMinimalCheckoutDraftStoreContract(
       },
     );
 
-    it('accepts a detached read expectation and preserves an exact saved snapshot', async () => {
-      const saved: MinimalCheckoutDraft = {
-        ...checkoutDraft(),
-        sourceCustomerId: '00000000-0000-0000-0000-000000000000',
-        address: {
-          kind: 'saved',
-          snapshot: {
-            ...checkoutDraft().address.fields,
-            id: 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF',
-            version: CHECKOUT_TIME,
-            street: '',
-          },
-        },
-      };
-      expect(await commit(undefined, saved)).toBe(true);
-      const read = (await store.get(CHECKOUT_SENDER))!;
-      const next = { ...saved, revision: 1 };
-      expect(await commit(read.data.minimalCheckoutDraft, next)).toBe(true);
-      expect(
-        (await store.get(CHECKOUT_SENDER))?.data.minimalCheckoutDraft,
-      ).toEqual(next);
-    });
+    it.each(['saved', 'savedCorrected'] as const)(
+      'accepts a detached read expectation and preserves an exact %s base',
+      async (kind) => {
+        const snapshot = {
+          ...checkoutDraft().address.fields,
+          id: 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF',
+          version: CHECKOUT_TIME,
+          street: '',
+        };
+        const saved: MinimalCheckoutDraft = {
+          ...checkoutDraft(),
+          sourceCustomerId: '00000000-0000-0000-0000-000000000000',
+          address:
+            kind === 'saved'
+              ? { kind, snapshot }
+              : {
+                  kind,
+                  snapshot,
+                  fields: {
+                    ...checkoutDraft().address.fields,
+                    street: 'Centro',
+                    zipCode: '55635',
+                  },
+                },
+        };
+        expect(await commit(undefined, saved)).toBe(true);
+        const read = (await store.get(CHECKOUT_SENDER))!;
+        const next = { ...saved, revision: 1 };
+        expect(await commit(read.data.minimalCheckoutDraft, next)).toBe(true);
+        expect(
+          (await store.get(CHECKOUT_SENDER))?.data.minimalCheckoutDraft,
+        ).toEqual(next);
+      },
+    );
 
     it('permits exactly one competing CAS and never retries a stale writer', async () => {
       await commit(undefined, checkoutDraft());

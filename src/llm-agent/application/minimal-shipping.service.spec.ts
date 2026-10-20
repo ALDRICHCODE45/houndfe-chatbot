@@ -9,6 +9,7 @@ import { MinimalCheckoutService } from './minimal-checkout.service';
 import { MinimalShippingService } from './minimal-shipping.service';
 import { decideApproval, shippingDigest } from './minimal-shipping-approval';
 import { parseMinimalCart } from './minimal-cart.service';
+import { minimalShippingDestination } from '../domain/minimal-shipping';
 
 const SENDER = '5215550001111';
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
@@ -203,6 +204,25 @@ describe('MinimalShippingService (T3)', () => {
     expect(decision?.state).toBe('approved');
     expect(decision?.reply).toContain(classification === 'free' ? 'envío cubierto' : '$200.00');
     expect(parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!.approval.state).toBe('approved');
+  });
+  it('quotes and fingerprints the corrected saved ZIP, not the base snapshot', async () => {
+    const h = await setup(); await h.confirm();
+    await h.checkout.updateDetails(SENDER, {
+      label: null, street: null, exteriorNumber: null, interiorNumber: null,
+      zipCode: '55635', neighborhood: null, municipality: null, city: null,
+      state: null, visualReferences: null, carrierPhone: null,
+      firstName: null, lastName: null, useNewAddress: false,
+    });
+    const offer = await h.checkout.prepareConfirmation(SENDER, event('c1')); offer.onSent?.();
+    await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('c2') });
+    expect((await h.checkout.confirmedDraft(SENDER))?.address.kind).toBe('savedCorrected');
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'quoted', classification: 'charged' });
+    expect(h.provider.quote.mock.calls[0][0].destination.postalCode).toBe('55635');
+    const record = parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!;
+    expect(record).toMatchObject({ destination: { kind: 'new' } });
+    const { id: _id, version: _version, ...fields } = address; void _id; void _version;
+    expect('destination' in record && record.destination).toEqual(minimalShippingDestination({ kind: 'new', fields: { ...fields, zipCode: '55635' } }));
+    expect('destination' in record && record.destination).not.toEqual(minimalShippingDestination({ kind: 'new', fields }));
   });
   it('[S4] refuses outstanding uncertain-order lock', async () => {
     const h = await setup(); await h.confirm();

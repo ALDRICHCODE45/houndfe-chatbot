@@ -294,7 +294,7 @@ const checkoutDetailsToolInput = z.strictObject({
 const CHECKOUT_INSTRUCTIONS_FRAGMENT =
   '\n\nDatos de entrega: cuando el cliente quiera comprar o dar sus datos, llame lookupCheckoutCustomer con nextPageRef: null para revisar si ya tiene direcciones guardadas (la aplicación usa su número de WhatsApp; no pida el teléfono). ' +
   'Si hay direcciones, muéstrelas con su resumen y pregunte cuál usar; para elegir una llame selectCheckoutAddress con su addressRef EXACTO (nunca invente ni elija una por su cuenta). Use nextPageRef solo si el cliente pide ver más. not_found o ambiguous no impiden capturar una dirección nueva; lookup_unavailable no significa que no exista. ' +
-  'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Las direcciones guardadas no se editan aquí. ' +
+  'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Si el cliente corrige una dirección guardada seleccionada, llame updateCheckoutDetails con SOLO los campos corregidos, null en los demás y useNewAddress: false; conservamos los otros datos y actualizaremos esa dirección al crear el pedido. Si dice que un dato está mal sin dar el valor correcto, pregunte cuál es el correcto. Nunca pida confirmar datos que el cliente dijo que están mal. ' +
   'Se requieren nombre, calle, número exterior o S/N, colonia, código postal, ciudad o municipio y estado; pida lo que falte (missing). ' +
   'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
 
@@ -1488,7 +1488,7 @@ export class MinimalCatalogAgentService {
             }),
             updateCheckoutDetails: tool({
               description:
-                'Guarda en el borrador local los datos de entrega que el cliente dijo. null deja el campo sin cambio. useNewAddress: true para una dirección nueva. No registra al cliente ni crea pedidos.',
+                'Guarda en el borrador local los datos de entrega que el cliente dijo. null deja el campo sin cambio. useNewAddress: false corrige la dirección guardada seleccionada; true inicia una dirección nueva. El cambio guardado ocurre solo junto con el pedido. No registra al cliente ni crea pedidos.',
               inputSchema: checkoutDetailsToolInput,
               strict: true,
               execute: async (patch) => {
