@@ -13,10 +13,10 @@ Branch: `feat/always-on-features`. Production has no real users (owner, 2026-11-
 ## Tasks
 
 - T1 [S1-S4] Human decisions always on: HUMAN_HANDOFF_ENABLED, HUMAN_DECISIONS_RESTOCK_ENABLED, HUMAN_DECISIONS_EXPIRATION_ENABLED, HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED. Route: gentle-ai-worker. Commit: 6ef762f (slice 1; mostly deletions, 350+/858-).
-- T2 [S1-S4] Atomic checkout always on (MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED); delete the legacy POST /sales order path. Route: inline. Commit: —
-- T3 [S1-S4] Minimal route always on: MINIMAL_CATALOG_AGENT_ENABLED, MINIMAL_CATALOG_ORDER_ENABLED, MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS (blocked: owner decision on real number). Route: inline. Commit: —
+- T2 [S1-S4] Atomic checkout always on (MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED); delete the legacy POST /sales order path. Route: gentle-ai-worker. Commit: d75b7ea (slice 2).
+- T3 [S1-S4] Minimal route always on: MINIMAL_CATALOG_AGENT_ENABLED, MINIMAL_CATALOG_ORDER_ENABLED, MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS (owner: new dedicated number, serve every sender). Route: gentle-ai-worker. Commit: —
 - T4 [S1-S3] Receipt metrics: drop RECEIPT_MEDIA_METRICS_ENABLED. Route: inline. Commit: —
-- T5 [S1-S3] Shipping flags (blocked: owner decision on moving carriers to backend). Commit: —
+- T5 [S1-S3] Shipping flags (blocked: owner moved carriers to backend; replace chatbot Skydropx once the backend quote endpoint exists). Commit: —
 - T6 [S1-S3] Receipt media flags (blocked: receipt image storage decision). Commit: —
 - T7 [S2] Preflight posture and docs cleanup. Route: inline. Commit: —
 
@@ -26,3 +26,5 @@ Branch: `feat/always-on-features`. Production has no real users (owner, 2026-11-
 - L2 (2026-11-05): Backend inventory (main 6b8f99c) confirms /chatbot-api/checkouts and /checkouts/status exist; the preflight note "atomic checkout is not deployed yet" is stale.
 - L3 (2026-11-05): Flag map from explorer: shipping ON requires Skydropx credentials and makes every order require a human-approved quote; receipt media ON requires Spaces/S3 storage, public base URL and capability keys; legacy AgentRunner still serves the ops synthetic turn.
 - L4 (2026-11-05): T1 done in 6ef762f. Leftovers for T7: dead service-level `enabled` fields (MinimalRestockRequestService, MinimalExpirationRequestService deps, tool-deps restock.enabled, request-human-assistance.tool); docs/meta-test-sandbox-setup.md still says not to create OPS_CHANNEL_PHONE. Webhook now returns 500 when RESTOCK or customer-inbound capture fails (DB dependency on every message).
+- L5 (2026-11-05, owner, verbatim): "1. Numero nuevo real para el chatbot, no el numero de prueba de meta. 2. Envios perros y skydropx son las dos opciones que hoy se ocupan como envios con externos, se usa la que sea mas barata, punto y no, no tengo conexion a su api. 3. Si lo recomiendas si."
+- L6 (2026-11-05): T2 done in d75b7ea. Leftovers for T7: new_address_unsupported reply wording now only for saved address without customer id; GET /customers/checkout-context missing from CLIENT_ROUTES.
