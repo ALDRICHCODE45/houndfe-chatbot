@@ -17,12 +17,12 @@ Branch: `feat/always-on-features` (continues there until split). Backend contrac
 
 ## Tasks
 
-- U1 [S1,S3] `createShippingQuote` port, zod request/response DTOs (destination XOR, zoneStatus enum, eta), HTTP adapter, in-memory fake. Route: worker. Commit: —
+- U1 [S1,S3] `createShippingQuote` port, zod request/response DTOs (destination XOR, zoneStatus enum, eta), HTTP adapter, in-memory fake. Route: gentle-ai-worker. Commit: 3a4c7a3.
 - U2 [S2,S6] Checkout DTO `shipping: {quoteId} | {mode:'pickup'}`; new quote error codes mapped in client and minimal-order.service. Commit: —
 - U3 [S2,S3] `minimalCart.shipping` schema with address/cart pin; MinimalShippingService over U1; currentShipping requires a live quoteId. Commit: —
 - U4 [S4,S5,S6,S7] Conversation: tool/prompt without approval, pickup branch, PENDING/DENIED replies, summary with carrier and ETA, new shipping-required reply. Commit: —
 - U5 [S2] Delete per-quote approval (minimal-shipping-approval, human-handoff shipping_approval branches, dispatcher ops commands). Commit: —
-- U6 [S1,S9] Delete Skydropx provider, measured demo profile, local credit rule, legacy getShippingQuote tool and sale-flow shipping; drop SHIPPING_QUOTES_ENABLED, SHIPPING_DEMO_PARCEL_PROFILE_JSON, SKYDROPX_*, MINIMAL_CATALOG_SHIPPING_ENABLED; preflight and docs. Commit: —
+- U6 [S1,S9] Delete Skydropx provider, measured demo profile, local credit rule, legacy getShippingQuote tool and sale-flow shipping; drop SHIPPING*QUOTES_ENABLED, SHIPPING_DEMO_PARCEL_PROFILE_JSON, SKYDROPX*\*, MINIMAL_CATALOG_SHIPPING_ENABLED; preflight and docs. Commit: —
 - U7 [S5] DELIVERY_ZONE route: reservation CHECK migration, ledgers, decision DTO, coordinator/poller cloned from EXPIRATION, customer texts (blocked: backend T1 exact names; key model agreed in L4). Commit: —
 - U8 [S8] `sendTemplate` on WhatsappSenderPort and Meta adapter; late-zone template use (activation blocked: owner creates and Meta approves the template). Commit: —
 - U9 [S1-S8] E2E against the live backend and runbook (blocked: backend endpoints in main). Commit: —
@@ -33,3 +33,4 @@ Branch: `feat/always-on-features` (continues there until split). Backend contrac
 - L2 (2026-11-05): Backend relayed owner decisions: zone approval decides deliverable+type+cost; one package per order with smallest standard box; per-quote approval removed (signed quoteId); credit per unit >$500 after discounts; always cheapest carrier. Credit on SURCHARGE provisional and configurable.
 - L3 (2026-11-05): Explorer map: RESTOCK/EXPIRATION use per-route ledgers and a reservation keyed by sender turn; backend dedupes DELIVERY_ZONE per ZIP — key model open. WhatsApp sender supports text only (no Meta templates).
 - L4 (2026-11-05): Backend accepted the DELIVERY_ZONE key model: one open decision per ZIP with many requesters; intake idempotent per chatbot sourceRequestId (sender+turn) and attached as requester; poll and ACK per sourceRequestId; an intake for an already resolved ZIP is accepted and resolved immediately. Exact names arrive with backend docs/delivery-zones.md after its T1.
+- L5 (2026-11-05): U1 done in 3a4c7a3 (additive). Leftover: add POST /chatbot-api/shipping/quotes to preflight CLIENT_ROUTES. Worker-chosen strictness beyond the brief (digits-only phone, non-empty neighborhood/municipality/state, canonical ISO expiresAt, non-negative ETA) to re-check against backend docs.
