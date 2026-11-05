@@ -439,7 +439,9 @@ export class HumanHandoffService {
         customerState?.data.minimalCart,
       )?.shipping;
       if (
-        shipping?.approval.state === 'expired' &&
+        shipping !== undefined &&
+        'approval' in shipping &&
+        shipping.approval.state === 'expired' &&
         shipping.createdAt === digest.draftCreatedAt &&
         Date.now() >= Date.parse(shipping.expiresAt)
       )

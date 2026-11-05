@@ -229,14 +229,24 @@ function setup(
               ? {
                   shipping: {
                     quoteId: 'quote-1',
-                    rateId: 'rate-1',
-                    carrierName: 'Carrier',
-                    serviceName: 'Ground',
-                    estimatedDeliveryDays: 2,
-                    bestRateCents: 5000,
-                    totalCreditCents: 0,
-                    customerPaysCents: 5000,
-                    cartLines: [
+                    expiresAt: new Date(Date.now() + 60000).toISOString(),
+                    zoneStatus: 'CARRIER_ONLY',
+                    option: {
+                      carrier: 'Carrier',
+                      service: 'Ground',
+                      etaDays: 2,
+                    },
+                    costCents: 5000,
+                    creditCents: 0,
+                    customerChargeCents: 5000,
+                    currency: 'MXN',
+                    eta: null,
+                    destinationPin: {
+                      kind: 'saved',
+                      addressId: ADDRESS,
+                      version: '2026-10-01T00:00:00.000Z',
+                    },
+                    cartPin: [
                       {
                         productId: PRODUCT,
                         quantity: 2,
@@ -244,15 +254,6 @@ function setup(
                         finalPriceCents: 3000,
                       },
                     ],
-                    addressId: ADDRESS,
-                    addressVersion: '2026-10-01T00:00:00.000Z',
-                    createdAt: new Date(Date.now() - 1000).toISOString(),
-                    expiresAt: new Date(Date.now() + 60000).toISOString(),
-                    approval: {
-                      state: 'approved',
-                      requestId: 'approval-1',
-                      decidedAt: new Date().toISOString(),
-                    },
                   },
                 }
               : {}),
@@ -526,7 +527,7 @@ describe('minimal order placement through the SDK route', () => {
     await h.turn('SÍ', [say()], EVENT('duplicate-yes'));
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });
-  it('S1/S2/S3/S4: armed summary consent creates the approved charged checkout', async () => {
+  it('S1/S2/S3/S4: armed summary consent creates the backend-quoted charged checkout', async () => {
     const h = setup({ shipping: true });
     await h.ready();
     const offer = await h.turn(

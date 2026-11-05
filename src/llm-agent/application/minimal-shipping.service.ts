@@ -1,90 +1,105 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  CHATBOT_API_CLIENT,
+  type ChatbotApiClient,
+} from '../../chatbot-api/domain/chatbot-api.client';
+import {
+  CreateShippingQuoteInputSchema,
+  PACKAGING_DATA_MISSING,
+  type CreateShippingQuoteInput,
+  type ShippingQuoteResponse,
+} from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import {
   CONVERSATION_STORE,
-  readPendingHumanRequest,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import {
-  MEASURED_DEMO_SHIPPING_CONFIG,
-  type MeasuredDemoShippingConfig,
-} from '../../shipping/application/measured-demo-shipping-config';
-import { matchMeasuredDemoParcelProfile } from '../../shipping/application/measured-demo-parcel-profile';
-import {
-  ShippingQuoteOrchestrator,
-  type ShippingQuoteOrchestrationUnavailableReason,
-  type ShippingQuoteOrchestrationHandoffReason,
-} from '../../shipping/application/shipping-quote-orchestrator';
-import {
-  SHIPPING_QUOTE_PROVIDER,
-  type ShippingQuoteProviderPort,
-} from '../../shipping/domain/shipping-quote.port';
+import type { MinimalCheckoutDraftAddress } from '../../conversation/domain/minimal-checkout-draft';
+import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
+import { toMexicanState } from '../domain/mexican-state';
 import {
   evaluateMinimalOrder,
   type MinimalOrderIneligibleReason,
 } from '../domain/minimal-order-confirmation';
 import {
-  buildMinimalShipping,
-  classifyMinimalShipping,
+  buildMinimalShippingQuote,
   minimalShippingDestination,
 } from '../domain/minimal-shipping';
 import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 
-import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
-import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
-import { requestApproval } from './minimal-shipping-approval';
-
 export type MinimalShippingRefusal =
-  | 'approval_unavailable'
   | MinimalOrderIneligibleReason
-  | ShippingQuoteOrchestrationUnavailableReason
-  | ShippingQuoteOrchestrationHandoffReason
   | 'order_unresolved'
   | 'cart_changed'
   | 'address_changed'
   | 'address_unverified'
-  | 'unsupported_destination'
-  | 'measurements_unavailable'
-  | 'manual_packing_required'
-  | 'quote_expired';
+  | 'unsupported_destination';
 export type MinimalShippingResult =
-  | { kind: 'quoted'; classification: 'free' | 'charged' }
+  | {
+      kind: 'quoted';
+      zoneStatus: 'FREE' | 'SURCHARGE' | 'CARRIER_ONLY';
+      costCents: number;
+      creditCents: number;
+      customerChargeCents: number;
+      option: ShippingQuoteResponse['option'];
+      eta: NonNullable<ShippingQuoteResponse['eta']> | null;
+    }
+  | { kind: 'zone_pending' }
+  | { kind: 'zone_denied' }
+  | { kind: 'packaging_missing' }
+  | { kind: 'unavailable' }
   | { kind: 'refused'; reason: MinimalShippingRefusal };
 const refuse = (reason: MinimalShippingRefusal): MinimalShippingResult => ({
   kind: 'refused',
   reason,
 });
 
-/** Quotes internally, then requests ops approval; never returns money.
- * Not registered or activated here (T7). Uses only the measured legacy profile;
- * arbitrary carts cannot be packed by inference. One provider call, one quote
- * CAS, then the separate T4 not_requested → pending CAS.
+/** Saved address by id; new or corrected content as loose fields. */
+function quoteDestination(
+  address: MinimalCheckoutDraftAddress,
+): CreateShippingQuoteInput['destination'] {
+  if (address.kind === 'saved')
+    return { shippingAddressId: address.snapshot.id };
+  const f = address.fields;
+  const fields = {
+    street: f.street,
+    exteriorNumber: f.exteriorNumber,
+    interiorNumber: f.interiorNumber,
+    zipCode: f.zipCode,
+    neighborhood: f.neighborhood,
+    municipality: f.municipality ?? f.city,
+    city: f.city,
+    state: f.state === null ? null : (toMexicanState(f.state) ?? f.state),
+  };
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== null),
+  ) as CreateShippingQuoteInput['destination'];
+}
+
+/**
+ * One `createShippingQuote` call for the verified cart and confirmed
+ * destination. The backend picks the carrier, computes the credit and signs
+ * the quote (S1-S3); the answer is stored verbatim in `minimalCart.shipping`
+ * under one cart CAS. No human approval gates it (S2).
  */
 @Injectable()
 export class MinimalShippingService {
-  private readonly orchestrator: ShippingQuoteOrchestrator;
-
   constructor(
     @Inject(CONVERSATION_STORE) private readonly store: ConversationStore,
     private readonly cart: MinimalCartService,
     private readonly checkout: MinimalCheckoutService,
-    @Inject(SHIPPING_QUOTE_PROVIDER) provider: ShippingQuoteProviderPort,
-    @Inject(MEASURED_DEMO_SHIPPING_CONFIG)
-    private readonly measured: MeasuredDemoShippingConfig | null,
-    @Inject(HUMAN_HANDOFF_SERVICE_TOKEN)
-    private readonly handoff: Pick<HumanHandoffService, 'create'>,
-  ) {
-    this.orchestrator = new ShippingQuoteOrchestrator(provider);
-  }
+    @Inject(CHATBOT_API_CLIENT)
+    private readonly api: Pick<ChatbotApiClient, 'createShippingQuote'>,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
 
   async quote(senderId: string): Promise<MinimalShippingResult> {
     try {
       if (!this.store.commitMinimalCart) return refuse('cart_unverified');
       // Keep the EXACT raw slot for CAS, never the zod-parsed reconstruction.
-      const state = await this.store.get(senderId);
-      if (readPendingHumanRequest(state)) return refuse('approval_unavailable');
-      const raw: unknown = state?.data.minimalCart;
+      const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const stored = parseMinimalCart(raw);
       if (stored === null) return refuse('cart_unverified');
       if (stored.idempotencyKey !== '') return refuse('order_unresolved');
@@ -128,43 +143,30 @@ export class MinimalShippingService {
         )
       )
         return refuse('cart_changed');
-      if (this.measured === null) return refuse('measurements_unavailable');
-      const prepared = matchMeasuredDemoParcelProfile(
-        this.measured.profile,
-        quote.items,
-      );
-      if (prepared === null) return refuse('measurements_unavailable');
-      const address =
-        draft.address.kind === 'saved'
-          ? draft.address.snapshot
-          : draft.address.fields;
-      const createdAt = new Date().toISOString();
-      const outcome = await this.orchestrator.quote({
-        requestInput: {
-          origin: this.measured.origin,
-          destination: {
-            zipCode: address.zipCode,
-            state: address.state,
-            municipality: address.municipality ?? address.city,
-            neighborhood: address.neighborhood,
-          },
-          items: prepared.items,
-          parcels: prepared.parcels,
-        },
+      const phone = parseMexicanWhatsAppPhone(senderId);
+      if (phone === null) return refuse('cart_unverified');
+      const request = CreateShippingQuoteInputSchema.safeParse({
+        items: quote.items.map(({ productId, variantId, quantity }) => ({
+          productId,
+          ...(variantId ? { variantId } : {}),
+          quantity,
+        })),
+        phoneCountryCode: phone.phoneCountryCode,
+        phone: phone.phone,
+        destination: quoteDestination(draft.address),
       });
-      if (outcome.kind !== 'draft')
-        return refuse(
-          outcome.reason === 'invalid_destination'
-            ? 'unsupported_destination'
-            : outcome.reason,
-        );
-      const shipping = buildMinimalShipping({
-        quote: {
-          kind: 'quoted',
-          quoteId: outcome.draft.quoteId,
-          rates: [outcome.draft.selectedRate],
-          expiresAt: outcome.draft.providerExpiresAt,
-        },
+      if (!request.success) return refuse('unsupported_destination');
+      let response: ShippingQuoteResponse;
+      try {
+        response = await this.api.createShippingQuote(request.data);
+      } catch (error) {
+        return error instanceof ChatbotApiError &&
+          error.errorCode === PACKAGING_DATA_MISSING
+          ? { kind: 'packaging_missing' }
+          : { kind: 'unavailable' };
+      }
+      const shipping = buildMinimalShippingQuote({
+        response,
         cartLines: quote.items.map(
           ({
             productId,
@@ -181,30 +183,31 @@ export class MinimalShippingService {
           }),
         ),
         destination: minimalShippingDestination(draft.address),
-        createdAt,
       });
-      if (shipping === null || Date.now() >= Date.parse(shipping.expiresAt))
-        return refuse('quote_expired');
-      // Delivery is a separate slot: reject changes during provider latency.
+      if (shipping === null || this.now() >= Date.parse(shipping.expiresAt))
+        return { kind: 'unavailable' };
+      // Delivery is a separate slot: reject changes during backend latency.
       if (
         !isDeepStrictEqual(draft, await this.checkout.confirmedDraft(senderId))
       )
         return refuse('address_changed');
-      const next = structuredClone({ ...stored, shipping });
       const committed = await this.store.commitMinimalCart(
         senderId,
         raw,
-        next,
-        new Date().toISOString(),
+        structuredClone({ ...stored, shipping }),
+        new Date(this.now()).toISOString(),
       );
       if (!committed) return refuse('cart_changed');
-      if (
-        !(await requestApproval(this.store, this.handoff, senderId, Date.now()))
-      )
-        return refuse('approval_unavailable');
+      if (shipping.zoneStatus === 'PENDING') return { kind: 'zone_pending' };
+      if (shipping.zoneStatus === 'DENIED') return { kind: 'zone_denied' };
       return {
         kind: 'quoted',
-        classification: classifyMinimalShipping(shipping),
+        zoneStatus: shipping.zoneStatus,
+        costCents: shipping.costCents,
+        creditCents: shipping.creditCents,
+        customerChargeCents: shipping.customerChargeCents,
+        option: shipping.option,
+        eta: shipping.eta,
       };
     } catch {
       return refuse('cart_unverified');

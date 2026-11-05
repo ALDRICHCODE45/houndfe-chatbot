@@ -89,13 +89,13 @@ The lock ends only with a confirmed sale, or with a definite rejection of the fi
 
 EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.
 
-Blocked replies name the next action: retry the order/cart review, add products, select a saved address, supply missing fields, request a shipping quote and wait for team approval, or contact the store where human review/registration is required. These wording changes do not alter eligibility, shipping freshness, consent, or idempotency gates.
+Blocked replies name the next action: retry the order/cart review, add products, select a saved address, supply missing fields, request a shipping quote, or contact the store where human review/registration is required. These wording changes do not alter eligibility, shipping freshness, consent, or idempotency gates.
 
 Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confirmation, then the order summary.
 
 ## Not in this slice
 
-- Shipping quotes, charges and approval are a separate default-off capability: [minimal shipping](minimal-shipping.md).
+- Backend shipping quotes and charges are a separate default-off capability: [minimal shipping](minimal-shipping.md).
 - Customer and address creation outside an order. New customers and new addresses are created only by the atomic checkout together with the order; see [atomic checkout](#atomic-checkout).
 - Order cancellation from the minimal route.
 

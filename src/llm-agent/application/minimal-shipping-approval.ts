@@ -7,11 +7,23 @@ import {
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import type { ShippingApprovalDigest } from '../../human-handoff/domain/human-handoff.types';
 import {
+  isMinimalShippingQuote,
   requestMinimalShippingApproval,
   transitionShippingApproval,
-  type MinimalShipping,
+  type LegacyMinimalShipping as MinimalShipping,
 } from '../domain/minimal-shipping';
-import { parseMinimalCart } from './minimal-cart.service';
+import {
+  parseMinimalCart,
+  type MinimalCartState,
+} from './minimal-cart.service';
+
+/** LEGACY (U5 deletes): backend-signed quotes have no per-quote approval. */
+function legacyShipping(
+  cart: MinimalCartState | null | undefined,
+): MinimalShipping | undefined {
+  const s = cart?.shipping;
+  return s === undefined || isMinimalShippingQuote(s) ? undefined : s;
+}
 
 export const MINIMAL_SHIPPING_UNCONFIRMED =
   'No pudimos confirmar el envío. No se creó ningún pedido. Puedes solicitar otra cotización, por ejemplo con otra dirección guardada.';
@@ -34,7 +46,7 @@ export function pendingMinimalShipping(
   state: ConversationState | null,
   requestId: string,
 ): MinimalShipping | null {
-  const s = parseMinimalCart(state?.data.minimalCart)?.shipping;
+  const s = legacyShipping(parseMinimalCart(state?.data.minimalCart));
   return s?.approval.state === 'pending' && s.approval.requestId === requestId
     ? s
     : null;
@@ -50,7 +62,7 @@ export async function requestApproval(
   const state = await store.get(senderId);
   const raw = state?.data.minimalCart;
   const cart = parseMinimalCart(raw);
-  const s = cart?.shipping;
+  const s = legacyShipping(cart);
   if (
     !store.commitMinimalCart ||
     !cart ||
@@ -149,7 +161,7 @@ export async function expireApproval(
   const state = await store.get(senderId);
   const raw = state?.data.minimalCart;
   const cart = parseMinimalCart(raw);
-  const s = cart?.shipping;
+  const s = legacyShipping(cart);
   const pending = readPendingHumanRequest(state);
   if (
     !store.commitMinimalCart ||

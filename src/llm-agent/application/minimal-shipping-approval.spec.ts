@@ -125,7 +125,7 @@ describe('minimal approval T4', () => {
       };
       const service = new HumanHandoffService(
         rows,
-        { sendText: jest.fn() },
+        { sendText: jest.fn(), sendTemplate: jest.fn() },
         h.store,
         {
           get: (key: string) =>

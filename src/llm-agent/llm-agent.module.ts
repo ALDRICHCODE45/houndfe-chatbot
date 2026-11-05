@@ -39,16 +39,6 @@ import { MinimalCheckoutService } from './application/minimal-checkout.service';
 import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
-import type { HumanHandoffService } from '../human-handoff/application/human-handoff.service';
-import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
-import {
-  SHIPPING_QUOTE_PROVIDER,
-  type ShippingQuoteProviderPort,
-} from '../shipping/domain/shipping-quote.port';
-import {
-  MEASURED_DEMO_SHIPPING_CONFIG,
-  type MeasuredDemoShippingConfig,
-} from '../shipping/application/measured-demo-shipping-config';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
@@ -190,29 +180,17 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         MinimalCartService,
         MinimalCheckoutService,
         ConfigService,
-        { token: SHIPPING_QUOTE_PROVIDER, optional: true },
-        { token: MEASURED_DEMO_SHIPPING_CONFIG, optional: true },
-        HUMAN_HANDOFF_SERVICE_TOKEN,
+        CHATBOT_API_CLIENT,
       ],
       useFactory: (
         store: ConversationStore,
         cart: MinimalCartService,
         checkout: MinimalCheckoutService,
         config: ConfigService,
-        provider: ShippingQuoteProviderPort | undefined,
-        measured: MeasuredDemoShippingConfig | null | undefined,
-        handoff: Pick<HumanHandoffService, 'create'>,
+        api: ChatbotApiClient,
       ) =>
-        config.get<boolean>('minimalCatalogAgent.shippingEnabled') === true &&
-        provider !== undefined
-          ? new MinimalShippingService(
-              store,
-              cart,
-              checkout,
-              provider,
-              measured ?? null,
-              handoff,
-            )
+        config.get<boolean>('minimalCatalogAgent.shippingEnabled') === true
+          ? new MinimalShippingService(store, cart, checkout, api)
           : undefined,
     },
     {

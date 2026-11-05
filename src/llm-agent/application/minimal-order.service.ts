@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomUUID } from 'node:crypto';
@@ -32,7 +32,7 @@ import {
   type MinimalOrderShipping,
 } from '../domain/minimal-order-confirmation';
 import {
-  classifyMinimalShipping,
+  isMinimalShippingQuote,
   isShippingCurrent,
 } from '../domain/minimal-shipping';
 import {
@@ -65,7 +65,9 @@ export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
     'Por ahora solo puedo crear pedidos para clientes registrados con una dirección guardada. Comuníquese con la tienda para registrar sus datos; no se creó ningún pedido.',
 };
 export const MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY =
-  'Dígame «cotizar envío» y espere la aprobación del equipo antes de volver a pedir el resumen; no se creó ningún pedido.';
+  'Dígame «cotizar envío» para calcular el envío a su dirección antes de volver a pedir el resumen; no se creó ningún pedido.';
+/** Test seam for quote expiry; production uses `Date.now`. */
+export const MINIMAL_ORDER_CLOCK = Symbol('MINIMAL_ORDER_CLOCK');
 export const MINIMAL_ORDER_CHANGED_REPLY =
   'Su pedido cambió desde el último resumen; no se creó ningún pedido. Revise el resumen actualizado:';
 export const MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY =
@@ -182,6 +184,7 @@ export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
   private readonly shippingEnabled: boolean;
   private readonly cashierUserId: string;
+  private readonly now: () => number;
 
   constructor(
     @Inject(CHATBOT_API_CLIENT) private readonly api: ChatbotApiClient,
@@ -189,7 +192,9 @@ export class MinimalOrderService {
     private readonly cart: MinimalCartService,
     private readonly checkout: MinimalCheckoutService,
     config: ConfigService,
+    @Optional() @Inject(MINIMAL_ORDER_CLOCK) now?: () => number,
   ) {
+    this.now = now ?? (() => Date.now());
     this.shippingEnabled =
       config.get<{ shippingEnabled?: boolean }>('minimalCatalogAgent')
         ?.shippingEnabled === true;
@@ -326,8 +331,12 @@ export class MinimalOrderService {
             senderId,
             raw,
             status.checkout.sale,
-            this.shippingEnabled && cart !== null && cart.shipping !== undefined
-              ? { classification: classifyMinimalShipping(cart.shipping) }
+            this.shippingEnabled && cart?.shipping !== undefined
+              ? {
+                  customerChargeCents: isMinimalShippingQuote(cart.shipping)
+                    ? cart.shipping.customerChargeCents
+                    : cart.shipping.customerPaysCents,
+                }
               : undefined,
           ),
         };
@@ -397,16 +406,19 @@ export class MinimalOrderService {
     }
   }
 
-  /** Freshness alone never authorizes a sale: require exact human approval. */
+  /**
+   * A delivery order needs a stored backend quote for a deliverable zone with
+   * a quoteId, not yet expired, whose cart and address pins still match.
+   */
   private currentShipping(
     cart: MinimalCartState,
     snapshot: MinimalOrderSnapshot,
   ): MinimalOrderShipping | null {
     const record = cart.shipping;
-    const address = snapshot.draft.address;
     if (
       record === undefined ||
-      record.approval.state !== 'approved' ||
+      !isMinimalShippingQuote(record) ||
+      record.quoteId === null ||
       isShippingCurrent(record, {
         cartLines: snapshot.items.map((item) => ({
           productId: item.productId,
@@ -417,16 +429,14 @@ export class MinimalOrderService {
           unitPriceCents: item.unitPriceCents,
           finalPriceCents: item.finalPriceCents,
         })),
-        address,
-        nowMs: Date.now(),
+        address: snapshot.draft.address,
+        nowMs: this.now(),
       }) !== 'current'
     )
       return null;
     return {
-      classification: classifyMinimalShipping(record),
-      chargeCents: record.customerPaysCents,
-      approvalId: record.approval.requestId,
       quoteId: record.quoteId,
+      customerChargeCents: record.customerChargeCents,
     };
   }
 
@@ -494,7 +504,7 @@ export class MinimalOrderService {
           unitPriceCents: item.unitPriceCents,
         })),
         expectedTotalCents:
-          snapshot.totalCents + (snapshot.shipping?.chargeCents ?? 0),
+          snapshot.totalCents + (snapshot.shipping?.customerChargeCents ?? 0),
         ...(snapshot.shipping === undefined
           ? {}
           : { shipping: { quoteId: snapshot.shipping.quoteId } }),
@@ -607,7 +617,7 @@ export class MinimalOrderService {
     senderId: string,
     stored: unknown,
     sale: BotSaleResponse,
-    shipping?: Pick<MinimalOrderShipping, 'classification'>,
+    shipping?: Pick<MinimalOrderShipping, 'customerChargeCents'>,
   ): Promise<string> {
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
@@ -625,7 +635,7 @@ export class MinimalOrderService {
         : `Su pedido quedó registrado con folio ${sale.folio}.`) +
       (shipping === undefined
         ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
-        : shipping.classification === 'free'
+        : shipping.customerChargeCents === 0
           ? ` Total de productos: ${mxn(sale.totalCents)}. envío cubierto por su compra.`
           : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`);
     return `${created}\n\n${await this.paymentInstructions()}`;

@@ -3,23 +3,23 @@ import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
-import type { ShippingQuoteProviderResult } from '../../shipping/domain/shipping-quote.port';
-import type { MeasuredDemoShippingConfig } from '../../shipping/application/measured-demo-shipping-config';
+import {
+  PACKAGING_DATA_MISSING,
+  SHIPPING_QUOTE_UNAVAILABLE,
+  type ShippingQuoteResponse,
+} from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import {
   MinimalCatalogAgentService,
   CHECKOUT_TOOL_CLARIFICATION,
 } from './minimal-catalog-agent.service';
-import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
+import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 import { MinimalOrderService } from './minimal-order.service';
 import { MinimalShippingService } from './minimal-shipping.service';
-import {
-  decideApproval,
-  expireApproval,
-  shippingDigest,
-} from './minimal-shipping-approval';
 import { CostGuardService } from './cost-guard.service';
 
 const SENDER = '5215550001111';
@@ -46,6 +46,19 @@ const call = (toolName: string, input: unknown = {}) =>
       input: JSON.stringify(input),
     },
   ]);
+const backendQuote = (
+  overrides: Partial<ShippingQuoteResponse> = {},
+): ShippingQuoteResponse => ({
+  quoteId: 'q1',
+  expiresAt: new Date(Date.now() + 30 * 60000).toISOString(),
+  zoneStatus: 'CARRIER_ONLY',
+  option: { carrier: 'Carrier', service: 'Ground', etaDays: 3 },
+  costCents: 20000,
+  creditCents: 0,
+  customerChargeCents: 20000,
+  currency: 'MXN',
+  ...overrides,
+});
 const say = () =>
   step([{ type: 'text', text: 'Inventado $999. Pedido creado.' }], 'stop');
 
@@ -67,17 +80,12 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
   const order = new MinimalOrderService(client, store, cart, checkout, config);
-  const measured: MeasuredDemoShippingConfig = { origin: { postalCode: '06000', state: 'Ciudad de México', municipality: 'Cuauhtémoc', neighborhood: 'Centro' }, profile: { version: 1, items: [{ productId: PRODUCT, variantId: null, quantity: 2, measurement: { weightGrams: 100, lengthCm: 10, widthCm: 10, heightCm: 10 } }], parcel: { weightGrams: 200, lengthCm: 20, widthCm: 20, heightCm: 20 } } };
-  const provider = { quote: jest.fn(async (): Promise<ShippingQuoteProviderResult> => ({ kind: 'quoted' as const, quoteId: 'q1', expiresAt: null, rates: [{ rateId: 'r1', carrierName: 'Carrier', serviceName: 'Ground', priceCents: 20000, currency: 'MXN' as const, estimatedDeliveryDays: 3, validUntil: null }] })) };
-  const handoff = { create: jest.fn(async () => {
-    const date = new Date().toISOString();
-    await store.setPendingHumanRequest(SENDER, { requestId: 'abcdef123456', ref: 'HF-abcdef123456', createdAt: date, customerNotifiedAt: date }, date);
-    return { ok: true as const, requestId: 'abcdef123456', ref: 'HF-abcdef123456', customerNotified: true as const };
-  }) };
-  const shipping = new MinimalShippingService(store, cart, checkout, provider, measured, handoff);
+  const quotes = new FakeShippingQuoteClient();
+  const shipping = new MinimalShippingService(store, cart, checkout, quotes);
   let script: unknown[] = [];
   const seen: Array<{ tools?: Record<string, unknown>; system?: unknown }> = [];
-  const generate: GenerateTextFn = async input => { seen.push(input); return generateText({ ...input, model: new MockLanguageModelV4({ doGenerate: script } as never) }); };
+  const models: MockLanguageModelV4[] = [];
+  const generate: GenerateTextFn = async input => { seen.push(input); const model = new MockLanguageModelV4({ doGenerate: script } as never); models.push(model); return generateText({ ...input, model }); };
   const agent = new MinimalCatalogAgentService(client, generate, new CostGuardService(100000), config, new InMemoryMinimalCatalogSessionStore(), undefined, undefined, cart, checkout, order, options.absent ? undefined : shipping);
   await store.create(SENDER, { lastMessageAt: new Date().toISOString(), data: { minimalCart: { items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: price }], idempotencyKey: '', expectedTotalCents: price * 2 } } });
   const lookup = await checkout.lookup(SENDER, null);
@@ -86,14 +94,7 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
   const offer = await checkout.prepareConfirmation(SENDER, event('d1')); offer.onSent?.();
   if (!options.unconfirmed) await checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('d2') });
   const turn = (text: string, steps: unknown[]) => { script = steps; return agent.tryHandle({ senderId: SENDER, text, inboundEvent: event(`wamid.${Math.random()}`) }); };
-  const decide = async (decision: 'approved' | 'rejected', now = Date.now()) => {
-    const s = parseMinimalCart((await store.get(SENDER))?.data.minimalCart)?.shipping;
-    if (!s) throw new Error('shipping');
-    const result = await decideApproval(store, SENDER, 'abcdef123456', shippingDigest(s), decision, now);
-    await store.clearPendingHumanRequest(SENDER, 'abcdef123456');
-    return result;
-  };
-  return { api, store, provider, handoff, seen, turn, decide };
+  return { api, store, quotes, seen, models, turn };
 }
 
 // prettier-ignore
@@ -109,18 +110,16 @@ describe('minimal shipping SDK public seam', () => {
     expect(Object.keys(off.seen[0].tools!)).toEqual(Object.keys(absent.seen[0].tools!));
     expect(off.seen[0].system).toBe(absent.seen[0].system);
   });
-  it.each([false, true])('S1/S2/S3/S4: approval then single order SÍ, free=%s', async free => {
+  it.each([false, true])('[S1,S2,S3] backend quote then single order SÍ with its quoteId, free=%s', async free => {
     const h = await setup({ free });
-    const pending = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
-    expect(pending.kind).toBe('handled');
-    if (pending.kind !== 'handled') throw new Error('reply');
-    expect(pending.reply).toContain('aprobación');
-    expect(pending.reply).not.toMatch(/\$|200|999/);
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-    expect(h.handoff.create).toHaveBeenCalledTimes(1);
+    h.quotes.enqueue(backendQuote(free ? { zoneStatus: 'FREE', creditCents: 20000, customerChargeCents: 0 } : {}));
+    const quoted = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
+    if (quoted.kind !== 'handled') throw new Error('reply');
+    expect(quoted.reply).toContain(free ? 'cubierto por su compra' : 'a pagar $200.00 MXN');
+    expect(quoted.reply).not.toMatch(/aprobaci|999/);
+    expect(h.quotes.calls).toHaveLength(1);
     expect(h.seen[0].tools).not.toHaveProperty('requestStorePickup');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
-    expect(await h.decide('approved')).toMatchObject({ state: 'approved' });
     const offer = await h.turn('Prepare mi pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
     expect(offer.reply).toContain(free ? 'envío cubierto por su compra' : 'Envío: $200.00 MXN');
@@ -128,40 +127,48 @@ describe('minimal shipping SDK public seam', () => {
     await h.turn('SÍ', []);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     const payload: unknown = (h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale;
-    expect(payload).toMatchObject({ shipping: { quoteId: 'q1' } });
+    expect(payload).toMatchObject({ shipping: { quoteId: 'q1' }, expectedTotalCents: free ? 100002 : 23000 });
     expect(payload).not.toHaveProperty('shipping.chargeCents');
     expect(payload).not.toHaveProperty('shipping.approvalId');
-    if (!free) expect(payload).toMatchObject({ expectedTotalCents: 23000 });
   });
-  it('S7: rejected quote offers requote, no order', async () => {
-    const h = await setup(); await h.turn('Envío', [call('requestShippingQuote'), say()]);
-    const decision = await h.decide('rejected');
-    expect(decision?.state).toBe('rejected');
-    expect(decision?.reply).toContain('otra cotización');
+  it.each([
+    [backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }), 'zone_pending', 'validación'],
+    [backendQuote({ zoneStatus: 'DENIED', quoteId: null, option: null }), 'zone_denied', 'no tenemos envío'],
+    [new ChatbotApiError('quote', 422, {}, PACKAGING_DATA_MISSING), 'packaging_missing', 'empaque'],
+    [new ChatbotApiError('quote', 503, {}, SHIPPING_QUOTE_UNAVAILABLE), 'unavailable', 'en este momento'],
+  ] as const)('tool result reflects %#: %s and no order is possible', async (answer, kind, text) => {
+    const h = await setup();
+    h.quotes.enqueue(answer);
+    const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
+    if (result.kind !== 'handled') throw new Error('reply');
+    expect(result.reply).toContain(text);
+    expect(result.reply).not.toContain('$');
+    // The model's next step sees the tool result carrying the new kind.
+    const prompts = JSON.stringify(h.models.at(-1)!.doGenerateCalls.map(c => c.prompt));
+    expect(prompts).toContain(`"shipping":"${kind}"`);
+    expect(prompts).toContain('"ok":false');
     await h.turn('Pedido', [call('prepareOrder'), say()]);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
-  it('S6: pending approval expires after 30 minutes through public expiry path', async () => {
-    const h = await setup(); await h.turn('Envío', [call('requestShippingQuote'), say()]);
-    expect(await expireApproval(h.store, SENDER, Date.now() + 31 * 60000)).toBe(true);
-    expect(await h.store.get(SENDER)).toHaveProperty('data.pendingHumanRequest', null);
-    await h.turn('Pedido', [call('prepareOrder'), say()]);
-    expect(h.api.createCheckout).not.toHaveBeenCalled();
+  it('[S7] a STOCK_PENDING eta says the delivery date depends on restock', async () => {
+    const h = await setup();
+    h.quotes.enqueue(backendQuote({ eta: { days: null, reason: 'STOCK_PENDING' } }));
+    const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
+    if (result.kind !== 'handled') throw new Error('reply');
+    expect(result.reply).toContain('depende de la reposición');
   });
   it('S1/S4: strict arguments fail closed before provider execution', async () => {
     const h = await setup();
     expect(await h.turn('Envío', [call('requestShippingQuote', { senderId: 'attacker' }), say()])).toMatchObject({ reply: CHECKOUT_TOOL_CLARIFICATION });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
   });
-  it('S1/S4: shipping shares the first presentation slot and pending reply contains no amounts', async () => {
+  it('S1/S4: shipping shares the first presentation slot', async () => {
     const h = await setup();
+    h.quotes.enqueue(backendQuote()).enqueue(backendQuote({ quoteId: 'q2' }));
     await h.turn('Envío', [call('requestShippingQuote'), call('prepareOrder'), call('requestShippingQuote'), say()]);
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-    const pending = await h.turn('Envío de nuevo', [call('requestShippingQuote'), say()]);
-    if (pending.kind !== 'handled') throw new Error('pending');
-    expect(pending.reply).toContain('pendiente');
-    expect(pending.reply).not.toContain('$');
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
+    expect(h.quotes.calls).toHaveLength(1);
+    await h.turn('Envío de nuevo', [call('requestShippingQuote'), say()]);
+    expect(h.quotes.calls).toHaveLength(2);
   });
   it('S1/S4: unconfirmed delivery is refused without amounts or provider calls', async () => {
     const h = await setup({ unconfirmed: true });
@@ -169,14 +176,13 @@ describe('minimal shipping SDK public seam', () => {
     if (result.kind !== 'handled') throw new Error('reply');
     expect(result.reply).toContain('delivery_unconfirmed');
     expect(result.reply).not.toContain('$');
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
   it('S4: earlier delivery presentation prevents quoting in the same run', async () => {
     const h = await setup();
     await h.turn('Datos y envío', [call('confirmCheckoutDetails'), call('requestShippingQuote'), say()]);
-    expect(h.provider.quote).not.toHaveBeenCalled();
-    expect(h.handoff.create).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
   });
   it('S5: gate off keeps existing order flow without shipping', async () => {
     const h = await setup({ gate: false });

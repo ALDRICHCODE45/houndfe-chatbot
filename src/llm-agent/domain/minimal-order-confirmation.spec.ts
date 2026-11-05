@@ -96,17 +96,12 @@ const eligible = (): MinimalOrderSnapshot => {
 };
 
 describe('shipping summary and exact binding', () => {
-  const withShipping = (classification: 'charged' | 'free') => ({
+  const withShipping = (customerChargeCents: number) => ({
     ...eligible(),
-    shipping: {
-      classification,
-      chargeCents: classification === 'charged' ? 5000 : 0,
-      approvalId: 'approval-1',
-      quoteId: 'quote-1',
-    },
+    shipping: { quoteId: 'quote-1', customerChargeCents },
   });
-  it('S1/S4: presents approved freight and the freight-inclusive total', () => {
-    const summary = renderMinimalOrderSummary(withShipping('charged'));
+  it('[S2,S3] presents the backend charge and the charge-inclusive total', () => {
+    const summary = renderMinimalOrderSummary(withShipping(5000));
     expect(summary).toContain('Total de productos: $27.00 MXN');
     expect(summary).toContain('Envío: $50.00 MXN');
     expect(summary).toContain('Total a pagar: $77.00 MXN');
@@ -115,45 +110,23 @@ describe('shipping summary and exact binding', () => {
       'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
     );
   });
-  it('S2/S4: presents covered shipping without a freight line', () => {
-    const summary = renderMinimalOrderSummary(withShipping('free'));
+  it('[S3] presents a zero charge as covered shipping without a freight line', () => {
+    const summary = renderMinimalOrderSummary(withShipping(0));
     expect(summary).toContain('Total de productos: $27.00 MXN');
     expect(summary).toContain('envío cubierto por su compra');
     expect(summary).not.toContain('Envío:');
     expect(summary).not.toContain('no está incluido');
   });
-  it('S2/S4: covered shipping remains bound to its exact approval and quote', () => {
-    const snapshot = withShipping('free');
-    expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
-    expect(
-      sameMinimalOrder(snapshot, {
-        ...snapshot,
-        shipping: { ...snapshot.shipping, approvalId: 'approval-2' },
-      }),
-    ).toBe(false);
-    expect(
-      sameMinimalOrder(snapshot, {
-        ...snapshot,
-        shipping: { ...snapshot.shipping, quoteId: 'quote-2' },
-      }),
-    ).toBe(false);
-    expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
-  });
-  it.each([
-    { classification: 'free', chargeCents: 0 },
-    { chargeCents: 6000 },
-    { approvalId: 'approval-2' },
-    { quoteId: 'quote-2' },
-  ])(
-    'S4: changed shipping metadata invalidates exact consent (%j)',
+  it.each([{ customerChargeCents: 6000 }, { quoteId: 'quote-2' }])(
+    '[S2] changed quote content invalidates exact consent (%j)',
     (change) => {
-      const snapshot = withShipping('charged');
+      const snapshot = withShipping(5000);
       expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
       expect(
         sameMinimalOrder(snapshot, {
           ...snapshot,
           shipping: { ...snapshot.shipping, ...change },
-        } as MinimalOrderSnapshot),
+        }),
       ).toBe(false);
       expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
     },

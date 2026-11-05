@@ -6,8 +6,9 @@ import {
   SHIPPING_QUOTE_NOT_FOUND,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
 import {
+  buildMinimalShipping,
   minimalShippingDestination,
-  type MinimalShipping,
+  type MinimalShippingQuote,
 } from '../domain/minimal-shipping';
 import { parseMinimalCart } from './minimal-cart.service';
 import type { ConfigService } from '@nestjs/config';
@@ -33,6 +34,7 @@ import {
   MINIMAL_ORDER_UNRESOLVED_REPLY,
   MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
   MINIMAL_ORDER_STOCK_CHANGED_REPLY,
+  MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
   MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
@@ -95,6 +97,7 @@ function setup(
   options: {
     cashier?: string;
     shipping?: boolean;
+    now?: () => number;
   } = {},
 ) {
   const store = new InMemoryConversationStore();
@@ -174,7 +177,14 @@ function setup(
   } as unknown as ConfigService;
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
-  const order = new MinimalOrderService(client, store, cart, checkout, config);
+  const order = new MinimalOrderService(
+    client,
+    store,
+    cart,
+    checkout,
+    config,
+    options.now,
+  );
   return {
     store,
     api,
@@ -225,35 +235,32 @@ async function offerOrder(h: Harness, id = 'wamid.o1') {
 const yes = (h: Harness, id = 'wamid.o2') =>
   h.order.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: EVENT(id) });
 
+/** Stores a backend-signed quote pinned to the current cart and saved address. */
 async function shippingRecord(
   h: Harness,
-  overrides: Partial<MinimalShipping> = {},
+  overrides: Partial<MinimalShippingQuote> = {},
 ) {
   const raw = await h.minimalCart();
-  const cart = raw as { items: MinimalShipping['cartLines'] };
-  const now = Date.now();
-  const shipping: MinimalShipping = {
+  const cart = raw as { items: MinimalShippingQuote['cartPin'] };
+  const shipping: MinimalShippingQuote = {
     quoteId: 'quote-1',
-    rateId: 'rate-1',
-    carrierName: 'Carrier',
-    serviceName: 'Ground',
-    estimatedDeliveryDays: 2,
-    bestRateCents: 5000,
-    totalCreditCents: 0,
-    customerPaysCents: 5000,
-    cartLines: cart.items.map((line) => ({
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    zoneStatus: 'CARRIER_ONLY',
+    option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
+    costCents: 5000,
+    creditCents: 0,
+    customerChargeCents: 5000,
+    currency: 'MXN',
+    eta: null,
+    destinationPin: {
+      kind: 'saved',
+      addressId: ADDRESS,
+      version: savedAddress().version,
+    },
+    cartPin: cart.items.map((line) => ({
       ...line,
       finalPriceCents: line.unitPriceCents * line.quantity,
     })),
-    addressId: ADDRESS,
-    addressVersion: savedAddress().version,
-    createdAt: new Date(now - 1000).toISOString(),
-    expiresAt: new Date(now + 60000).toISOString(),
-    approval: {
-      state: 'approved',
-      requestId: 'approval-1',
-      decidedAt: new Date(now).toISOString(),
-    },
     ...overrides,
   };
   await h.store.commitMinimalCart(
@@ -296,26 +303,11 @@ async function confirmNewDelivery(
 }
 
 async function newShipping(h: Harness, free = false) {
-  const legacy = await shippingRecord(h);
-  if (!('addressId' in legacy)) throw new Error('fixture');
-  const { addressId, addressVersion, ...record } = legacy;
-  void addressId;
-  void addressVersion;
   const draft = (await h.checkout.confirmedDraft(SENDER))!;
-  const raw = await h.minimalCart();
-  await h.store.commitMinimalCart(
-    SENDER,
-    raw,
-    {
-      ...(raw as object),
-      shipping: {
-        ...record,
-        destination: minimalShippingDestination(draft.address),
-        ...(free ? { totalCreditCents: 24000, customerPaysCents: 0 } : {}),
-      },
-    },
-    new Date().toISOString(),
-  );
+  await shippingRecord(h, {
+    destinationPin: minimalShippingDestination(draft.address),
+    ...(free ? { creditCents: 5000, customerChargeCents: 0 } : {}),
+  });
 }
 
 async function correctSavedDelivery(h: Harness, zipCode = '55635') {
@@ -440,7 +432,7 @@ describe('corrected saved address checkout', () => {
 });
 
 describe('new customer checkout S2/S3/S4/S6', () => {
-  it.each(['expired', 'rejected'])(
+  it.each(['expired', 'PENDING', 'DENIED'] as const)(
     'new shipping %s blocks the summary',
     async (status) => {
       const h = setup({ shipping: true });
@@ -459,13 +451,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
             ...record,
             ...(status === 'expired'
               ? { expiresAt: new Date(Date.now() - 1).toISOString() }
-              : {
-                  approval: {
-                    state: 'rejected',
-                    requestId: 'approval-1',
-                    decidedAt: new Date().toISOString(),
-                  },
-                }),
+              : { zoneStatus: status, quoteId: null, option: null }),
           },
         },
         new Date().toISOString(),
@@ -680,7 +666,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
 });
 
 describe('NEW shipping freshness only (T1)', () => {
-  it('accepts approved current NEW shipping, rejects edits, and requires a persisted quote', async () => {
+  it('accepts a current NEW-address quote, rejects edits and PENDING zones, and requires a persisted quote', async () => {
     const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -699,15 +685,9 @@ describe('NEW shipping freshness only (T1)', () => {
     });
     const draft = (await h.checkout.confirmedDraft(SENDER))!;
     expect(draft.address.kind).toBe('new');
-    const legacy = await shippingRecord(h);
-    if (!('addressId' in legacy)) throw new Error('legacy fixture');
-    const { addressId, addressVersion, ...rest } = legacy;
-    void addressId;
-    void addressVersion;
-    const shipping = {
-      ...rest,
-      destination: minimalShippingDestination(draft.address),
-    };
+    const shipping = await shippingRecord(h, {
+      destinationPin: minimalShippingDestination(draft.address),
+    });
     const cart = parseMinimalCart(await h.minimalCart())!;
     const quote = await h.cart.view(SENDER);
     if (!quote.ok) throw new Error('cart fixture');
@@ -719,12 +699,7 @@ describe('NEW shipping freshness only (T1)', () => {
       totalCents: quote.totalCents,
     };
     expect(h.order['currentShipping']({ ...cart, shipping }, snapshot)).toEqual(
-      {
-        classification: 'charged',
-        chargeCents: 5000,
-        approvalId: 'approval-1',
-        quoteId: 'quote-1',
-      },
+      { quoteId: 'quote-1', customerChargeCents: 5000 },
     );
     if (draft.address.kind !== 'new') throw new Error('new fixture');
     expect(
@@ -748,14 +723,21 @@ describe('NEW shipping freshness only (T1)', () => {
           ...cart,
           shipping: {
             ...shipping,
-            approval: { state: 'pending', requestId: 'approval-1' },
+            zoneStatus: 'PENDING',
+            quoteId: null,
           },
         },
         snapshot,
       ),
     ).toBeNull();
+    await h.store.commitMinimalCart(
+      SENDER,
+      await h.minimalCart(),
+      { ...cart, shipping: undefined },
+      new Date().toISOString(),
+    );
     expect((await h.order.prepareOrder(SENDER, EVENT('order-new'))).reply).toBe(
-      'Dígame «cotizar envío» y espere la aprobación del equipo antes de volver a pedir el resumen; no se creó ningún pedido.',
+      MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
@@ -961,7 +943,7 @@ describe('atomic checkout order S1–S5', () => {
       new Date().toISOString(),
     );
     h.setPrice(60000);
-    await shippingRecord(h, { totalCreditCents: 24000, customerPaysCents: 0 });
+    await shippingRecord(h, { creditCents: 5000, customerChargeCents: 0 });
     await offerOrder(h);
     expect((await yes(h))?.reply).toContain('envío cubierto por su compra');
     const payload = (
@@ -1140,7 +1122,7 @@ describe('atomic checkout order S1–S5', () => {
 });
 
 describe('minimal shipping order safety', () => {
-  it('S1/S4: sends approved freight in the exact fingerprinted payload', async () => {
+  it('[S2] sends the stored quoteId and products+customerChargeCents in the exact fingerprinted payload', async () => {
     const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -1177,7 +1159,7 @@ describe('minimal shipping order safety', () => {
     expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 2 });
   });
 
-  it('S2: approved covered shipping sends only its quoteId and omits the disclaimer', async () => {
+  it('[S2,S3] covered shipping sends only its quoteId and omits the disclaimer', async () => {
     const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -1193,7 +1175,7 @@ describe('minimal shipping order safety', () => {
       new Date().toISOString(),
     );
     h.setPrice(60000);
-    await shippingRecord(h, { totalCreditCents: 24000, customerPaysCents: 0 });
+    await shippingRecord(h, { creditCents: 5000, customerChargeCents: 0 });
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('envío cubierto por su compra');
     expect(offer.reply).not.toContain('Envío:');
@@ -1213,70 +1195,100 @@ describe('minimal shipping order safety', () => {
 
   it.each([
     'missing',
-    'not_requested',
-    'pending',
-    'rejected',
+    'PENDING',
+    'DENIED',
     'expired',
-    'ttl',
+    'clock',
     'cart',
     'address',
     'version',
+    'legacy',
   ] as const)(
-    'S1/S6: refuses %s shipping before summary and sale',
+    '[S2] refuses %s shipping before summary and sale',
     async (state) => {
-      const h = setup({ shipping: true });
+      const clock = { now: Date.now() };
+      const h = setup({ shipping: true, now: () => clock.now });
       await h.seedCart();
       await confirmSavedDelivery(h);
-      await shippingRecord(h);
+      const record = await shippingRecord(h);
       await offerOrder(h);
-      if (state === 'missing') {
-        const raw = await h.minimalCart();
-        const next = { ...(raw as Record<string, unknown>) };
-        delete next.shipping;
-        await h.store.commitMinimalCart(
-          SENDER,
-          raw,
-          next,
-          new Date().toISOString(),
-        );
-      } else {
-        const record = await shippingRecord(h);
-        const changes: Partial<
-          Extract<MinimalShipping, { addressId: string }>
-        > = {};
-        if (state === 'not_requested' || state === 'expired')
-          changes.approval = { state };
-        if (state === 'pending')
-          changes.approval = { state, requestId: 'approval-1' };
-        if (state === 'rejected')
-          changes.approval = {
-            state,
-            requestId: 'approval-1',
-            decidedAt: record.createdAt,
-          };
-        if (state === 'ttl') {
-          changes.createdAt = new Date(Date.now() - 120000).toISOString();
-          changes.expiresAt = new Date(Date.now() - 60000).toISOString();
-          changes.approval = {
-            state: 'approved',
-            requestId: 'approval-1',
-            decidedAt: changes.createdAt,
-          };
-        }
-        if (state === 'cart')
-          changes.cartLines = record.cartLines.map((line) => ({
+      const raw = await h.minimalCart();
+      const next = { ...(raw as Record<string, unknown>) };
+      if (state === 'missing') delete next.shipping;
+      if (state === 'PENDING' || state === 'DENIED')
+        next.shipping = { ...record, zoneStatus: state, quoteId: null };
+      if (state === 'expired')
+        next.shipping = {
+          ...record,
+          expiresAt: new Date(clock.now - 1).toISOString(),
+        };
+      // The stored quote is untouched; only the injected clock passes expiresAt.
+      if (state === 'clock') clock.now = Date.parse(record.expiresAt);
+      if (state === 'cart')
+        next.shipping = {
+          ...record,
+          cartPin: record.cartPin.map((line) => ({
             ...line,
             finalPriceCents: 2900,
-          }));
-        if (state === 'address') changes.addressId = CUSTOMER;
-        if (state === 'version')
-          changes.addressVersion = '2026-10-02T00:00:00.000Z';
-        await shippingRecord(h, { ...record, ...changes });
+          })),
+        };
+      if (state === 'address')
+        next.shipping = {
+          ...record,
+          destinationPin: { ...record.destinationPin, addressId: CUSTOMER },
+        };
+      if (state === 'version')
+        next.shipping = {
+          ...record,
+          destinationPin: {
+            ...record.destinationPin,
+            version: '2026-10-02T00:00:00.000Z',
+          },
+        };
+      if (state === 'legacy') {
+        const createdAt = new Date().toISOString();
+        const legacy = buildMinimalShipping({
+          quote: {
+            kind: 'quoted',
+            quoteId: 'quote-1',
+            expiresAt: null,
+            rates: [
+              {
+                rateId: 'rate-1',
+                carrierName: 'Carrier',
+                serviceName: 'Ground',
+                priceCents: 5000,
+                currency: 'MXN',
+                estimatedDeliveryDays: 2,
+                validUntil: null,
+              },
+            ],
+          },
+          cartLines: record.cartPin,
+          addressId: ADDRESS,
+          addressVersion: savedAddress().version,
+          createdAt,
+        })!;
+        next.shipping = {
+          ...legacy,
+          approval: {
+            state: 'approved',
+            requestId: 'approval-1',
+            decidedAt: createdAt,
+          },
+        };
       }
+      await h.store.commitMinimalCart(
+        SENDER,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+      expect(parseMinimalCart(await h.minimalCart())).not.toBeNull();
       const refusal = await yes(h);
-      expect(refusal?.reply).toContain('Dígame «cotizar envío»');
+      expect(refusal?.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
       const offer = await offerOrder(h, 'wamid.recheck');
-      expect(offer.reply).toContain('Dígame «cotizar envío»');
+      expect(offer.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
       expect(offer.onSent).toBeUndefined();
       await yes(h);
       expect(h.api.createCheckout).not.toHaveBeenCalled();
@@ -1290,7 +1302,11 @@ describe('minimal shipping order safety', () => {
     await confirmSavedDelivery(h);
     await shippingRecord(h);
     await offerOrder(h);
-    await shippingRecord(h, { bestRateCents: 6000, customerPaysCents: 6000 });
+    await shippingRecord(h, {
+      quoteId: 'quote-2',
+      costCents: 6000,
+      customerChargeCents: 6000,
+    });
     const result = await yes(h);
     expect(result?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
     expect(result?.reply).toContain('Total a pagar: $90.00 MXN');
@@ -1316,7 +1332,11 @@ describe('minimal shipping order safety', () => {
     await offerOrder(h);
     await yes(h);
     const before = await h.minimalCart();
-    await shippingRecord(h, { bestRateCents: 6000, customerPaysCents: 6000 });
+    await shippingRecord(h, {
+      quoteId: 'quote-2',
+      costCents: 6000,
+      customerChargeCents: 6000,
+    });
     await offerOrder(h, 'wamid.retry1');
     expect(await yes(h, 'wamid.retry2')).toEqual({
       reply: MINIMAL_ORDER_HELD_REPLY,

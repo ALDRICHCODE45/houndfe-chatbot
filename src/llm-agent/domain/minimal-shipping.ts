@@ -1,22 +1,21 @@
 /**
  * Pure minimal-route shipping, owned exclusively by `minimalCart.shipping`.
- * `quoteId`/`rateId` identify the cheapest provider rate (first wins ties);
- * `carrierName`, `serviceName`, `estimatedDeliveryDays` (null = unavailable)
- * are provider labels/ETA. All amounts are integer MXN cents.
- * `cartLines` bind identity, quantity, unit price and evaluated merchandise
- * line total (`finalPriceCents`); line ordering is not significant.
- * `destination` binds saved id/version or a SHA-256 of confirmed new-address
- * fields. Legacy top-level `addressId`/`addressVersion` records still parse.
- * `createdAt`/`expiresAt` are zoned ISO timestamps, capped at 30 minutes and
- * provider/rate validity. `approval.state` starts not_requested, then pending {requestId}, approved
- * or rejected {requestId, decidedAt}, or expired (no decision metadata).
- * Freshness is NOT approval: a current pending/rejected record cannot authorize
- * disclosure or sale. Callers must separately require approved (S1).
+ * The backend chooses the carrier, computes the credit and signs `quoteId`
+ * with `expiresAt` (S1-S3); this record stores that answer verbatim and pins
+ * it to the cart lines (`cartPin`: identity, quantity, unit price and
+ * evaluated line total) and the confirmed destination (`destinationPin`:
+ * saved id/version or a SHA-256 of confirmed new-address fields). Only a
+ * deliverable, unexpired quote whose pins still match may back an order.
  * No clock, store, transport, framework or SDK dependency.
+ *
+ * LEGACY: records with an `approval` sub-object came from the per-quote human
+ * approval flow. They still parse so old slots and the approval code keep
+ * working until U5 deletes them; they never back an order.
  */
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { MinimalCheckoutDraftAddress } from '../../conversation/domain/minimal-checkout-draft';
+import type { ShippingQuoteResponse } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
 import { calculateShippingCredit } from '../../shipping/domain/shipping-credit';
 import {
   normalizeShippingQuoteQuotedResult,
@@ -113,6 +112,130 @@ export function minimalShippingDestination(
   };
 }
 
+const deliverableZones: ReadonlySet<string> = new Set([
+  'FREE',
+  'SURCHARGE',
+  'CARRIER_ONLY',
+]);
+/** Mirrors the backend DTO so every accepted response re-parses from the slot. */
+export const minimalShippingQuoteSchema = z
+  .strictObject({
+    quoteId: z.string().min(1).nullable(),
+    expiresAt: iso,
+    zoneStatus: z.enum([
+      'FREE',
+      'SURCHARGE',
+      'CARRIER_ONLY',
+      'PENDING',
+      'DENIED',
+    ]),
+    option: z
+      .strictObject({
+        carrier: z.string().min(1),
+        service: z.string().min(1),
+        etaDays: money.nullable(),
+      })
+      .nullable(),
+    costCents: money,
+    creditCents: money,
+    customerChargeCents: money,
+    currency: z.literal('MXN'),
+    eta: z
+      .strictObject({
+        days: money.nullable(),
+        reason: z.literal('STOCK_PENDING').optional(),
+      })
+      .nullable(),
+    destinationPin: destinationSchema,
+    cartPin: cartLinesSchema,
+  })
+  .refine(
+    (record) =>
+      !deliverableZones.has(record.zoneStatus) || record.quoteId !== null,
+  );
+export type MinimalShippingQuote = z.infer<typeof minimalShippingQuoteSchema>;
+export type MinimalShippingCartLine = z.infer<typeof cartLineSchema>;
+
+/** Store the backend answer as returned; anything off-schema => null. */
+export function buildMinimalShippingQuote(input: {
+  response: ShippingQuoteResponse;
+  cartLines: readonly MinimalShippingCartLine[];
+  destination: MinimalShippingDestination;
+}): MinimalShippingQuote | null {
+  const r = input.response;
+  const result = minimalShippingQuoteSchema.safeParse({
+    quoteId: r.quoteId,
+    expiresAt: r.expiresAt,
+    zoneStatus: r.zoneStatus,
+    option: r.option,
+    costCents: r.costCents,
+    creditCents: r.creditCents,
+    customerChargeCents: r.customerChargeCents,
+    currency: r.currency,
+    eta: r.eta ?? null,
+    destinationPin: input.destination,
+    cartPin: input.cartLines,
+  });
+  return result.success ? structuredClone(result.data) : null;
+}
+
+/** New backend quote vs. a legacy approval record. */
+export function isMinimalShippingQuote(
+  record: MinimalShippingQuote | LegacyMinimalShipping,
+): record is MinimalShippingQuote {
+  return 'zoneStatus' in record;
+}
+
+/**
+ * `current` only for a deliverable zone with a quoteId, strictly before the
+ * backend `expiresAt`, whose cart and destination pins match exactly.
+ */
+export function isShippingCurrent(
+  record: MinimalShippingQuote,
+  context: {
+    cartLines: readonly MinimalShippingCartLine[];
+    address: MinimalCheckoutDraftAddress;
+    nowMs: number;
+  },
+): 'current' | 'expired' | 'stale' | 'undeliverable' {
+  if (!deliverableZones.has(record.zoneStatus) || record.quoteId === null)
+    return 'undeliverable';
+  if (
+    !Number.isFinite(context.nowMs) ||
+    context.nowMs >= Date.parse(record.expiresAt)
+  )
+    return 'expired';
+  const current = minimalShippingDestination(context.address);
+  const pin = record.destinationPin;
+  const sameDestination =
+    pin.kind === 'new'
+      ? current.kind === 'new' && current.fingerprint === pin.fingerprint
+      : current.kind === 'saved' &&
+        current.addressId === pin.addressId &&
+        current.version === pin.version;
+  const lines = cartLinesSchema.safeParse(context.cartLines);
+  if (
+    !sameDestination ||
+    !lines.success ||
+    lines.data.length !== record.cartPin.length
+  )
+    return 'stale';
+  return record.cartPin.every((line) =>
+    lines.data.some(
+      (other) =>
+        line.productId === other.productId &&
+        line.variantId === other.variantId &&
+        line.quantity === other.quantity &&
+        line.unitPriceCents === other.unitPriceCents &&
+        line.finalPriceCents === other.finalPriceCents,
+    ),
+  )
+    ? 'current'
+    : 'stale';
+}
+
+// ---- LEGACY per-quote approval records (U5/U6 delete) ----
+
 const shippingFields = z.strictObject({
   quoteId: label,
   rateId: label,
@@ -127,8 +250,8 @@ const shippingFields = z.strictObject({
   expiresAt: iso,
   approval: approvalSchema,
 });
-/** Strict persisted record; legacy saved records remain parseable without rewriting. */
-export const minimalShippingSchema = z
+/** Legacy approval record; never created by the minimal route any more. */
+export const legacyMinimalShippingSchema = z
   .union([
     shippingFields.extend({ addressId: z.uuid(), addressVersion: iso }),
     shippingFields.extend({ destination: destinationSchema }),
@@ -153,8 +276,7 @@ export const minimalShippingSchema = z
       (decision === null || (decision >= created && decision < expires))
     );
   });
-export type MinimalShipping = z.infer<typeof minimalShippingSchema>;
-export type MinimalShippingCartLine = z.infer<typeof cartLineSchema>;
+export type LegacyMinimalShipping = z.infer<typeof legacyMinimalShippingSchema>;
 
 /** Build an unstarted draft; invalid/expired provider or credit => null. */
 export function buildMinimalShipping(
@@ -166,7 +288,7 @@ export function buildMinimalShipping(
     | { addressId: string; addressVersion: string }
     | { destination: MinimalShippingDestination }
   ),
-): MinimalShipping | null {
+): LegacyMinimalShipping | null {
   const quote = normalizeShippingQuoteQuotedResult(input.quote);
   if (!quote || !iso.safeParse(input.createdAt).success) return null;
   const best = quote.rates.reduce((a, b) =>
@@ -183,7 +305,7 @@ export function buildMinimalShipping(
     best.validUntil === null ? Infinity : Date.parse(best.validUntil),
   );
   if (!Number.isFinite(expiresMs)) return null;
-  const result = minimalShippingSchema.safeParse({
+  const result = legacyMinimalShippingSchema.safeParse({
     quoteId: quote.quoteId,
     rateId: best.rateId,
     carrierName: best.carrierName,
@@ -203,81 +325,11 @@ export function buildMinimalShipping(
   return result.success ? result.data : null;
 }
 
-/** Classification only; free shipping still requires human approval. */
-export function classifyMinimalShipping(
-  record: MinimalShipping,
-): 'free' | 'charged' {
-  return record.customerPaysCents === 0 ? 'free' : 'charged';
-}
-
-export function isShippingCurrent(
-  record: MinimalShipping,
-  context: {
-    cartLines: readonly MinimalShippingCartLine[];
-    nowMs: number;
-  } & (
-    | { addressId: string; addressVersion: string }
-    | { address: MinimalCheckoutDraftAddress }
-  ),
-): 'stale' | 'expired' | 'current' {
-  if (
-    record.approval.state === 'expired' ||
-    context.nowMs >= Date.parse(record.expiresAt)
-  )
-    return 'expired';
-  if (
-    !Number.isFinite(context.nowMs) ||
-    context.nowMs < Date.parse(record.createdAt)
-  )
-    return 'stale';
-  const lines = cartLinesSchema.safeParse(context.cartLines);
-  const expected =
-    'destination' in record
-      ? record.destination
-      : {
-          kind: 'saved' as const,
-          addressId: record.addressId,
-          version: record.addressVersion,
-        };
-  const current =
-    'address' in context
-      ? minimalShippingDestination(context.address)
-      : {
-          kind: 'saved' as const,
-          addressId: context.addressId,
-          version: context.addressVersion,
-        };
-  const sameDestination =
-    expected.kind === 'new'
-      ? current.kind === 'new' && current.fingerprint === expected.fingerprint
-      : current.kind === 'saved' &&
-        current.addressId === expected.addressId &&
-        current.version === expected.version;
-  if (
-    !lines.success ||
-    !sameDestination ||
-    lines.data.length !== record.cartLines.length
-  )
-    return 'stale';
-  return record.cartLines.every((line) =>
-    lines.data.some(
-      (other) =>
-        line.productId === other.productId &&
-        line.variantId === other.variantId &&
-        line.quantity === other.quantity &&
-        line.unitPriceCents === other.unitPriceCents &&
-        line.finalPriceCents === other.finalPriceCents,
-    ),
-  )
-    ? 'current'
-    : 'stale';
-}
-
 /** T4 starts approval explicitly; no handoff or side effect happens here. */
 export function requestMinimalShippingApproval(
-  record: MinimalShipping,
+  record: LegacyMinimalShipping,
   input: { requestId: string; nowMs: number },
-): MinimalShipping | null {
+): LegacyMinimalShipping | null {
   if (
     record.approval.state !== 'not_requested' ||
     !label.safeParse(input.requestId).success ||
@@ -285,7 +337,7 @@ export function requestMinimalShippingApproval(
     input.nowMs < Date.parse(record.createdAt)
   )
     return null;
-  const result = minimalShippingSchema.safeParse({
+  const result = legacyMinimalShippingSchema.safeParse({
     ...record,
     approval:
       input.nowMs >= Date.parse(record.expiresAt)
@@ -297,13 +349,13 @@ export function requestMinimalShippingApproval(
 
 /** Only a matching pending request can decide; an unstarted quote can expire. */
 export function transitionShippingApproval(
-  record: MinimalShipping,
+  record: LegacyMinimalShipping,
   decision: {
     state: 'approved' | 'rejected' | 'expired';
     requestId: string;
     nowMs: number;
   },
-): MinimalShipping | null {
+): LegacyMinimalShipping | null {
   if (record.approval.state === 'not_requested') {
     if (
       decision.state !== 'expired' ||
@@ -311,7 +363,7 @@ export function transitionShippingApproval(
       decision.nowMs < Date.parse(record.expiresAt)
     )
       return null;
-    const result = minimalShippingSchema.safeParse({
+    const result = legacyMinimalShippingSchema.safeParse({
       ...record,
       approval: { state: 'expired' },
     });
@@ -326,7 +378,7 @@ export function transitionShippingApproval(
     return null;
   const state =
     decision.nowMs >= Date.parse(record.expiresAt) ? 'expired' : decision.state;
-  const result = minimalShippingSchema.safeParse({
+  const result = legacyMinimalShippingSchema.safeParse({
     ...record,
     approval:
       state === 'expired'

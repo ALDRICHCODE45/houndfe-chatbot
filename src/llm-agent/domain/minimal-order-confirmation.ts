@@ -49,11 +49,10 @@ export type MinimalOrderIneligibleReason =
   | 'new_address_unsupported'
   | 'invalid_state';
 
+/** Backend-signed delivery quote; the backend computed the charge (S2/S3). */
 export interface MinimalOrderShipping {
-  readonly classification: 'free' | 'charged';
-  readonly chargeCents: number;
-  readonly approvalId: string;
   readonly quoteId: string;
+  readonly customerChargeCents: number;
 }
 
 /** Exact content the customer consents to; detached from every input. */
@@ -145,12 +144,7 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
     snapshot.totalCents,
     snapshot.shipping === undefined
       ? null
-      : [
-          snapshot.shipping.classification,
-          snapshot.shipping.chargeCents,
-          snapshot.shipping.approvalId,
-          snapshot.shipping.quoteId,
-        ],
+      : [snapshot.shipping.quoteId, snapshot.shipping.customerChargeCents],
   ]);
 }
 
@@ -225,11 +219,11 @@ export function renderMinimalOrderSummary(
       ? [
           'El envío no está incluido en este total y se coordinará por separado.',
         ]
-      : snapshot.shipping.classification === 'free'
+      : snapshot.shipping.customerChargeCents === 0
         ? ['envío cubierto por su compra']
         : [
-            `Envío: ${mxn(snapshot.shipping.chargeCents)}`,
-            `Total a pagar: ${mxn(snapshot.totalCents + snapshot.shipping.chargeCents)}`,
+            `Envío: ${mxn(snapshot.shipping.customerChargeCents)}`,
+            `Total a pagar: ${mxn(snapshot.totalCents + snapshot.shipping.customerChargeCents)}`,
           ]),
     '',
     'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',

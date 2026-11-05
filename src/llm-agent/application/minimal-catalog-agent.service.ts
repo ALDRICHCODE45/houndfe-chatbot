@@ -59,7 +59,10 @@ import {
   type MinimalCheckoutReply,
 } from './minimal-checkout.service';
 import { MinimalOrderService } from './minimal-order.service';
-import { MinimalShippingService } from './minimal-shipping.service';
+import {
+  MinimalShippingService,
+  type MinimalShippingResult,
+} from './minimal-shipping.service';
 import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
@@ -260,10 +263,38 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 const SHIPPING_INSTRUCTIONS_FRAGMENT =
-  '\n\nHerramienta requestShippingQuote: sin argumentos, solo después de confirmar los datos de entrega y si el cliente quiere envío a domicilio. Solicita cotización y aprobación humana. Nunca indique montos, aprobaciones ni que existe un pedido. Tras la aprobación, la aplicación informa el flete; luego el cliente pide el resumen con prepareOrder. No ofrece recoger en tienda.';
+  '\n\nHerramienta requestShippingQuote: sin argumentos, solo después de confirmar los datos de entrega y si el cliente quiere envío a domicilio. Solicita la cotización de envío; la aplicación informa al cliente el resultado. Nunca indique montos ni que existe un pedido. Luego el cliente pide el resumen con prepareOrder. No ofrece recoger en tienda.';
 
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
+
+const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
+
+/** Server-owned reply for one quote attempt; amounts come only from the backend. */
+function minimalShippingReply(result: MinimalShippingResult): string {
+  switch (result.kind) {
+    case 'quoted':
+      return [
+        result.customerChargeCents === 0
+          ? 'El envío a domicilio queda cubierto por su compra.'
+          : `Envío a domicilio: costo ${shippingMxn(result.costCents)}, crédito por su compra ${shippingMxn(result.creditCents)}, a pagar ${shippingMxn(result.customerChargeCents)}.`,
+        ...(result.eta?.reason === 'STOCK_PENDING'
+          ? ['La fecha de entrega depende de la reposición de existencias.']
+          : []),
+        'Pida el resumen para hacer su pedido; no se creó ningún pedido.',
+      ].join(' ');
+    case 'zone_pending':
+      return 'Su código postal necesita validación de la tienda antes de cotizar el envío; no se creó ningún pedido.';
+    case 'zone_denied':
+      return 'Por ahora no tenemos envío a domicilio para su código postal; no se creó ningún pedido.';
+    case 'packaging_missing':
+      return 'No pude cotizar el envío porque falta información de empaque de un producto. Comuníquese con la tienda; no se creó ningún pedido.';
+    case 'unavailable':
+      return 'No pude cotizar el envío en este momento. No se creó ningún pedido. Puede solicitar otra cotización.';
+    case 'refused':
+      return `No pude cotizar el envío (${result.reason}). No se creó ningún pedido. Puede solicitar otra cotización.`;
+  }
+}
 
 export const CHECKOUT_TOOL_CLARIFICATION =
   'No pude registrar esos datos de entrega. ¿Me los comparte de nuevo, por favor?';
@@ -1522,7 +1553,7 @@ export class MinimalCatalogAgentService {
               ? {
                   requestShippingQuote: tool({
                     description:
-                      'Solicita cotización de envío a domicilio y aprobación del equipo para los datos de entrega confirmados. No acepta argumentos ni informa montos.',
+                      'Solicita la cotización de envío a domicilio para los datos de entrega confirmados. No acepta argumentos ni informa montos.',
                     inputSchema: z.strictObject({}),
                     strict: true,
                     execute: async () => {
@@ -1534,16 +1565,15 @@ export class MinimalCatalogAgentService {
                           context.senderId,
                         );
                         checkoutRun.value = {
-                          reply:
-                            result.kind === 'quoted'
-                              ? 'Solicité la aprobación del envío al equipo. Espere la respuesta del equipo antes de pedir el resumen; no se creó ningún pedido.'
-                              : result.reason === 'approval_unavailable'
-                                ? 'La aprobación del envío está pendiente o no está disponible. Comuníquese con la tienda para revisarla; no se creó ningún pedido.'
-                                : `No pude cotizar el envío (${result.reason}). No se creó ningún pedido. Puede solicitar otra cotización.`,
+                          reply: minimalShippingReply(result),
                         };
                         return {
                           ok: result.kind === 'quoted',
                           presentedByApplication: true,
+                          shipping:
+                            result.kind === 'refused'
+                              ? result.reason
+                              : result.kind,
                         };
                       } catch {
                         checkoutRun.value = {
