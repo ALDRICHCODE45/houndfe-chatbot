@@ -24,7 +24,7 @@ Branch: `feat/always-on-features` (continues there until split). Backend contrac
 - U5 [S2] Delete per-quote approval (minimal-shipping-approval, human-handoff shipping_approval branches, dispatcher ops commands). Commit: —
 - U6 [S1,S9] Delete Skydropx provider, measured demo profile, local credit rule, legacy getShippingQuote tool and sale-flow shipping; drop SHIPPING*QUOTES_ENABLED, SHIPPING_DEMO_PARCEL_PROFILE_JSON, SKYDROPX*\*, MINIMAL_CATALOG_SHIPPING_ENABLED; preflight and docs. Commit: —
 - U7 [S5] DELIVERY_ZONE route: reservation CHECK migration, ledgers, decision DTO, coordinator/poller cloned from EXPIRATION, customer texts (blocked: backend T1 exact names; key model agreed in L4). Commit: —
-- U8 [S8] `sendTemplate` on WhatsappSenderPort and Meta adapter; late-zone template use (activation blocked: owner creates and Meta approves the template). Commit: —
+- U8 [S8] `sendTemplate` on WhatsappSenderPort and Meta adapter; late-zone template use (activation blocked: owner creates and Meta approves the template). Commit: bec2b84 (port and adapter, no caller).
 - U9 [S1-S8] E2E against the live backend and runbook (blocked: backend endpoints in main). Commit: —
 
 ## Log
@@ -35,3 +35,4 @@ Branch: `feat/always-on-features` (continues there until split). Backend contrac
 - L4 (2026-11-05): Backend accepted the DELIVERY_ZONE key model: one open decision per ZIP with many requesters; intake idempotent per chatbot sourceRequestId (sender+turn) and attached as requester; poll and ACK per sourceRequestId; an intake for an already resolved ZIP is accepted and resolved immediately. Exact names arrive with backend docs/delivery-zones.md after its T1.
 - L5 (2026-11-05): U1 done in 3a4c7a3 (additive). Leftover: add POST /chatbot-api/shipping/quotes to preflight CLIENT_ROUTES. Worker-chosen strictness beyond the brief (digits-only phone, non-empty neighborhood/municipality/state, canonical ISO expiresAt, non-negative ETA) to re-check against backend docs.
 - L6 (2026-11-05): U2 done in 72b68ce. Leftovers: legacy POST /sales wireShipping + create-sale.tool still send chargeCents/approvalId (U6 deletes); currentShipping still requires approval.state==='approved' and snapshot carries chargeCents/approvalId, used by summary, fingerprint and sameMinimalOrder (U3/U5); MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY wording (U4); pickup not wired (U4); free shipping now also sends its quoteId.
+- L7 (2026-11-05): U8 port and Meta adapter in bec2b84. Proposed template for the owner: utility `zona_entrega_revisada`, es_MX, body "Hola, ya revisamos la entrega a su código postal {{1}}. Responda a este mensaje para continuar con su pedido."
