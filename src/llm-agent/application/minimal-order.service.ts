@@ -11,6 +11,11 @@ import {
   CreateCheckoutInputSchema,
   type CreateCheckoutInput,
 } from '../../chatbot-api/domain/dtos/checkout.dto';
+import {
+  SHIPPING_QUOTE_EXPIRED,
+  SHIPPING_QUOTE_MISMATCH,
+  SHIPPING_QUOTE_NOT_FOUND,
+} from '../../chatbot-api/domain/dtos/shipping-quote.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
@@ -71,6 +76,8 @@ export const MINIMAL_ORDER_VARIANT_CHANGED_REPLY =
   'Las presentaciones de un producto de su carrito cambiaron y no pude crear el pedido así; no se creó ningún pedido. Revise su carrito, elija de nuevo la presentación de ese producto o quítelo, y pida otra vez el resumen.';
 export const MINIMAL_ORDER_STOCK_CHANGED_REPLY =
   'Mientras confirmaba su pedido ya no alcanzó la existencia de un producto de su carrito; no se creó ningún pedido. Revise su carrito, ajuste la cantidad o quite ese producto, y pida otra vez el resumen.';
+export const MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY =
+  'La cotización de envío ya no es válida porque venció o cambió su pedido; no se creó ningún pedido. Pídame de nuevo el envío para su dirección y le muestro el total actualizado.';
 export const MINIMAL_ORDER_HELD_REPLY =
   'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo; por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_UNRESOLVED_REPLY =
@@ -85,6 +92,12 @@ const VARIANT_REJECTION_CODES: ReadonlySet<string> = new Set([
   'BOT_ITEM_VARIANT_REQUIRED',
   'BOT_ITEM_VARIANT_NOT_ALLOWED',
   'BOT_ITEM_VARIANT_MISMATCH',
+]);
+/** The signed shipping quote is gone, expired or no longer matches the cart. */
+const SHIPPING_QUOTE_REJECTION_CODES: ReadonlySet<string> = new Set([
+  SHIPPING_QUOTE_NOT_FOUND,
+  SHIPPING_QUOTE_EXPIRED,
+  SHIPPING_QUOTE_MISMATCH,
 ]);
 /**
  * Unknown outcomes. `IDEMPOTENCY_KEY_CONFLICT` is one: the backend already saw
@@ -482,15 +495,9 @@ export class MinimalOrderService {
         })),
         expectedTotalCents:
           snapshot.totalCents + (snapshot.shipping?.chargeCents ?? 0),
-        ...(snapshot.shipping?.classification === 'charged'
-          ? {
-              shipping: {
-                chargeCents: snapshot.shipping.chargeCents,
-                approvalId: snapshot.shipping.approvalId,
-                quoteId: snapshot.shipping.quoteId,
-              },
-            }
-          : {}),
+        ...(snapshot.shipping === undefined
+          ? {}
+          : { shipping: { quoteId: snapshot.shipping.quoteId } }),
       },
     });
     if (!parsed.success) return unverified;
@@ -581,6 +588,13 @@ export class MinimalOrderService {
         error.errorCode === 'STOCK_INSUFFICIENT_AT_CONFIRM'
       ) {
         return MINIMAL_ORDER_STOCK_CHANGED_REPLY;
+      }
+      if (
+        error instanceof ChatbotApiError &&
+        error.errorCode !== null &&
+        SHIPPING_QUOTE_REJECTION_CODES.has(error.errorCode)
+      ) {
+        return MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY;
       }
       return MINIMAL_ORDER_REJECTED_REPLY;
     }

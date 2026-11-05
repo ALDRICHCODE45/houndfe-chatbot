@@ -22,11 +22,7 @@ export const checkoutInput = {
       },
     ],
     expectedTotalCents: 61000,
-    shipping: {
-      chargeCents: 1000,
-      approvalId: 'approval-1',
-      quoteId: 'quote-1',
-    },
+    shipping: { quoteId: 'quote-1' },
   },
 };
 export const checkoutResponse = {
@@ -96,33 +92,33 @@ describe('atomic checkout DTO', () => {
       ...checkoutInput,
       sale: {
         ...checkoutInput.sale,
-        shipping: {
-          chargeCents: 1,
-          approvalId: ' approval ',
-          quoteId: ' quote ',
-        },
+        shipping: { quoteId: ' quote ' },
       },
     });
-    expect(parsed.sale.shipping).toEqual({
-      chargeCents: 1,
-      approvalId: 'approval',
-      quoteId: 'quote',
-    });
+    expect(parsed.sale.shipping).toEqual({ quoteId: 'quote' });
   });
-  it.each([0, -1, 1.5, 2147483648])(
-    'S1 rejects shipping charge %s',
-    (chargeCents) => {
-      expect(
-        CreateCheckoutInputSchema.safeParse({
-          ...checkoutInput,
-          sale: {
-            ...checkoutInput.sale,
-            shipping: { chargeCents, approvalId: 'a' },
-          },
-        }).success,
-      ).toBe(false);
-    },
-  );
+  it.each([
+    { quoteId: 'q', chargeCents: 1000 },
+    { quoteId: 'q', approvalId: 'a' },
+    { chargeCents: 1000, approvalId: 'a' },
+    { mode: 'pickup', quoteId: 'q' },
+    { mode: 'delivery' },
+    {},
+  ])('S2 rejects shipping %j', (shipping) => {
+    expect(
+      CreateCheckoutInputSchema.safeParse({
+        ...checkoutInput,
+        sale: { ...checkoutInput.sale, shipping },
+      }).success,
+    ).toBe(false);
+  });
+  it('S4 accepts store pickup', () => {
+    const pickup = {
+      ...checkoutInput,
+      sale: { ...checkoutInput.sale, shipping: { mode: 'pickup' } },
+    };
+    expect(CreateCheckoutInputSchema.parse(pickup)).toEqual(pickup);
+  });
   it.each([undefined, -1, 1.5, 2147483648])(
     'S1 rejects total %s',
     (expectedTotalCents) => {
@@ -134,22 +130,16 @@ describe('atomic checkout DTO', () => {
       ).toBe(false);
     },
   );
-  it.each(['approvalId', 'quoteId'])(
-    'S1 caps and rejects blank %s',
-    (field) => {
-      for (const value of [' ', 'x'.repeat(201), null]) {
-        expect(
-          CreateCheckoutInputSchema.safeParse({
-            ...checkoutInput,
-            sale: {
-              ...checkoutInput.sale,
-              shipping: { ...checkoutInput.sale.shipping, [field]: value },
-            },
-          }).success,
-        ).toBe(false);
-      }
-    },
-  );
+  it('S1 caps and rejects blank quoteId', () => {
+    for (const quoteId of [' ', 'x'.repeat(201), null]) {
+      expect(
+        CreateCheckoutInputSchema.safeParse({
+          ...checkoutInput,
+          sale: { ...checkoutInput.sale, shipping: { quoteId } },
+        }).success,
+      ).toBe(false);
+    }
+  });
   it('S1 restricts both resolution vocabularies', () => {
     expect(
       normalizeCheckoutResponse({
@@ -194,10 +184,6 @@ describe('atomic checkout DTO', () => {
     {
       ...checkoutInput,
       deliveryAddress: { ...checkoutInput.deliveryAddress, addressId: id },
-    },
-    {
-      ...checkoutInput,
-      sale: { ...checkoutInput.sale, expectedTotalCents: 0 },
     },
     {
       ...checkoutInput,

@@ -26,7 +26,7 @@ const input = {
       },
     ],
     expectedTotalCents: 61000,
-    shipping: { chargeCents: 1000, approvalId: 'approval-1' },
+    shipping: { quoteId: 'quote-1' },
   },
 };
 const receipt = {
@@ -87,7 +87,7 @@ describe('atomic checkout mocked HTTP contract', () => {
       sleep,
     );
   });
-  it('posts the exact freight-inclusive payload once with authenticated headers', async () => {
+  it('posts the exact quoted payload once with authenticated headers', async () => {
     request.mockReturnValue(of(response(receipt)));
     await expect(client.createCheckout(input, key)).resolves.toEqual({
       ...receipt,
@@ -107,7 +107,7 @@ describe('atomic checkout mocked HTTP contract', () => {
       }),
     );
   });
-  it('sends createIfAbsent/newSaved without freight for a covered delivery', async () => {
+  it('sends createIfAbsent/newSaved without a shipping member', async () => {
     const sale = { ...input.sale, shipping: undefined };
     const freeInput = {
       ...input,
@@ -122,12 +122,25 @@ describe('atomic checkout mocked HTTP contract', () => {
     await client.createCheckout(freeInput, key);
     expect(request.mock.calls[0][0].data).toEqual(freeInput);
   });
+  it('sends pickup as the only shipping member', async () => {
+    const pickup = {
+      ...input,
+      sale: {
+        ...input.sale,
+        expectedTotalCents: 60000,
+        shipping: { mode: 'pickup' as const },
+      },
+    };
+    request.mockReturnValue(of(response(receipt)));
+    await client.createCheckout(pickup, key);
+    expect(request.mock.calls[0][0].data).toEqual(pickup);
+  });
   it('S1 rejects null quoteId without mutating the caller', async () => {
     const dto = {
       ...input,
       sale: {
         ...input.sale,
-        shipping: { ...input.sale.shipping, quoteId: null },
+        shipping: { quoteId: null },
       },
     };
     request.mockReturnValue(of(response(receipt)));
@@ -160,22 +173,13 @@ describe('atomic checkout mocked HTTP contract', () => {
     { ...input.sale, expectedTotalCents: 2147483648 },
     { ...input.sale, expectedTotalCents: -1 },
     { ...input.sale, expectedTotalCents: undefined },
-    { ...input.sale, shipping: { chargeCents: 2147483648, approvalId: 'a' } },
-    { ...input.sale, shipping: { chargeCents: 0, approvalId: 'a' } },
-    { ...input.sale, shipping: { chargeCents: 1.5, approvalId: 'a' } },
-    { ...input.sale, shipping: { chargeCents: 1, approvalId: ' ' } },
-    {
-      ...input.sale,
-      shipping: { chargeCents: 1, approvalId: 'a'.repeat(201) },
-    },
-    {
-      ...input.sale,
-      shipping: { chargeCents: 1, approvalId: 'a', quoteId: ' ' },
-    },
-    {
-      ...input.sale,
-      shipping: { chargeCents: 1, approvalId: 'a', quoteId: 'q'.repeat(201) },
-    },
+    { ...input.sale, shipping: {} },
+    { ...input.sale, shipping: { quoteId: ' ' } },
+    { ...input.sale, shipping: { quoteId: 'q'.repeat(201) } },
+    { ...input.sale, shipping: { quoteId: 'q', chargeCents: 1000 } },
+    { ...input.sale, shipping: { quoteId: 'q', approvalId: 'a' } },
+    { ...input.sale, shipping: { mode: 'delivery' } },
+    { ...input.sale, shipping: { mode: 'pickup', quoteId: 'q' } },
   ])('S1 refuses invalid caps before HTTP %#', async (sale) => {
     await expect(
       client.createCheckout({ ...input, sale } as typeof input, key),
@@ -190,11 +194,7 @@ describe('atomic checkout mocked HTTP contract', () => {
         sale: {
           ...input.sale,
           expectedTotalCents: 2147483647,
-          shipping: {
-            chargeCents: 2147483647,
-            approvalId: 'a'.repeat(200),
-            quoteId: 'q'.repeat(200),
-          },
+          shipping: { quoteId: 'q'.repeat(200) },
         },
       },
       'k'.repeat(200),
@@ -234,7 +234,7 @@ describe('atomic checkout mocked HTTP contract', () => {
         ...input,
         sale: {
           ...input.sale,
-          shipping: { chargeCents: 1, approvalId: ' a ', quoteId: ' q ' },
+          shipping: { quoteId: ' q ' },
         },
       },
       ` ${key} `,
@@ -242,7 +242,7 @@ describe('atomic checkout mocked HTTP contract', () => {
     expect(request.mock.calls[0][0].headers?.['X-Idempotency-Key']).toBe(key);
     expect(
       (request.mock.calls[0][0].data as typeof input).sale.shipping,
-    ).toEqual({ chargeCents: 1, approvalId: 'a', quoteId: 'q' });
+    ).toEqual({ quoteId: 'q' });
   });
   it.each(['', ' ', 'x'.repeat(201), 'bad\r\nkey'])(
     'rejects invalid keys locally',
@@ -306,8 +306,9 @@ describe('atomic checkout mocked HTTP contract', () => {
     [404, 'SHIPPING_ADDRESS_NOT_FOUND'],
     [409, 'PRICE_OUT_OF_DATE'],
     [409, 'STOCK_INSUFFICIENT_AT_CONFIRM'],
-    [409, 'SHIPPING_APPROVAL_ALREADY_USED'],
-    [409, 'SHIPPING_CHARGE_UNAVAILABLE'],
+    [404, 'SHIPPING_QUOTE_NOT_FOUND'],
+    [409, 'SHIPPING_QUOTE_EXPIRED'],
+    [409, 'SHIPPING_QUOTE_MISMATCH'],
     [422, 'TYPED_RULE'],
     [500, 'CHECKOUT_CREATE_FAILED'],
     [409, 'CUSTOMER_PHONE_AMBIGUOUS'],

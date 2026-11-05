@@ -561,11 +561,7 @@ describe('minimal order placement through the SDK route', () => {
       },
       sale: {
         expectedTotalCents: 8000,
-        shipping: {
-          chargeCents: 5000,
-          approvalId: 'approval-1',
-          quoteId: 'quote-1',
-        },
+        shipping: { quoteId: 'quote-1' },
       },
     });
     expect((placed as { reply: string }).reply).toContain('folio B-0042');

@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import { CreateCheckoutInputSchema } from '../../chatbot-api/domain/dtos/checkout.dto';
 import {
+  SHIPPING_QUOTE_EXPIRED,
+  SHIPPING_QUOTE_MISMATCH,
+  SHIPPING_QUOTE_NOT_FOUND,
+} from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import {
   minimalShippingDestination,
   type MinimalShipping,
 } from '../domain/minimal-shipping';
@@ -28,6 +33,7 @@ import {
   MINIMAL_ORDER_UNRESOLVED_REPLY,
   MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
   MINIMAL_ORDER_STOCK_CHANGED_REPLY,
+  MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
@@ -548,11 +554,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
         'carrierPhone',
       ])
         expect(parsed.deliveryAddress.address).not.toHaveProperty(key);
-      expect(parsed.sale.shipping).toEqual(
-        free
-          ? undefined
-          : { chargeCents: 5000, approvalId: 'approval-1', quoteId: 'quote-1' },
-      );
+      expect(parsed.sale.shipping).toEqual({ quoteId: 'quote-1' });
       expect(h.api.createSale).not.toHaveBeenCalled();
       expect(h.api.upsertCustomer).not.toHaveBeenCalled();
     },
@@ -919,11 +921,7 @@ describe('atomic checkout order S1–S5', () => {
       sale: {
         cashierUserId: CASHIER,
         expectedTotalCents: 8000,
-        shipping: {
-          chargeCents: 5000,
-          approvalId: 'approval-1',
-          quoteId: 'quote-1',
-        },
+        shipping: { quoteId: 'quote-1' },
         items: [
           {
             productId: PRODUCT,
@@ -947,7 +945,7 @@ describe('atomic checkout order S1–S5', () => {
     expect(h.api.getCheckoutStatus).not.toHaveBeenCalled();
   });
 
-  it('S3/S4 approved free shipping omits freight in checkout', async () => {
+  it('S2 free shipping still sends its quoteId with a product-only total', async () => {
     const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -971,8 +969,10 @@ describe('atomic checkout order S1–S5', () => {
         { sale: Record<string, unknown> },
       ]
     )[0];
-    expect(payload.sale).toMatchObject({ expectedTotalCents: 120000 });
-    expect(payload.sale).not.toHaveProperty('shipping');
+    expect(payload.sale).toMatchObject({
+      expectedTotalCents: 120000,
+      shipping: { quoteId: 'quote-1' },
+    });
     expect(h.api.createSale).not.toHaveBeenCalled();
   });
 
@@ -1037,8 +1037,6 @@ describe('atomic checkout order S1–S5', () => {
     'PRICE_OUT_OF_DATE',
     'PROMO_RE_QUOTE',
     'STOCK_INSUFFICIENT_AT_CONFIRM',
-    'SHIPPING_APPROVAL_ALREADY_USED',
-    'SHIPPING_CHARGE_UNAVAILABLE',
     'CUSTOMER_PHONE_AMBIGUOUS',
     'CUSTOMER_NOT_FOUND',
     'SHIPPING_ADDRESS_NOT_FOUND',
@@ -1158,11 +1156,7 @@ describe('minimal shipping order safety', () => {
     expect(payload).toMatchObject({
       sale: {
         expectedTotalCents: 8000,
-        shipping: {
-          chargeCents: 5000,
-          approvalId: 'approval-1',
-          quoteId: 'quote-1',
-        },
+        shipping: { quoteId: 'quote-1' },
       },
     });
     expect(await h.minimalCart()).toMatchObject({
@@ -1183,7 +1177,7 @@ describe('minimal shipping order safety', () => {
     expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 2 });
   });
 
-  it('S2: approved covered shipping omits the shipping payload and disclaimer', async () => {
+  it('S2: approved covered shipping sends only its quoteId and omits the disclaimer', async () => {
     const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -1210,8 +1204,10 @@ describe('minimal shipping order safety', () => {
         { sale: Record<string, unknown> },
       ]
     )[0];
-    expect(payload.sale).toMatchObject({ expectedTotalCents: 120000 });
-    expect(payload.sale).not.toHaveProperty('shipping');
+    expect(payload.sale).toMatchObject({
+      expectedTotalCents: 120000,
+      shipping: { quoteId: 'quote-1' },
+    });
     expect(result?.reply).not.toContain('no está incluido');
   });
 
@@ -1743,6 +1739,36 @@ describe('MinimalOrderService', () => {
       idempotencyKey: '',
     });
   });
+
+  it.each([
+    [SHIPPING_QUOTE_EXPIRED, 409],
+    [SHIPPING_QUOTE_MISMATCH, 409],
+    [SHIPPING_QUOTE_NOT_FOUND, 404],
+  ])(
+    '%s asks for a fresh shipping quote and rotates the key',
+    async (code, status) => {
+      const h = setup({ shipping: true });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await shippingRecord(h);
+      await offerOrder(h);
+      const rejection = new ChatbotApiError(
+        code,
+        status,
+        { error: code },
+        code,
+      );
+      h.api.createCheckout.mockRejectedValueOnce(rejection);
+      expect(await yes(h)).toEqual({
+        reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+      });
+      expect(await h.minimalCart()).toMatchObject({
+        items: [{ productId: PRODUCT, quantity: 2 }],
+        idempotencyKey: '',
+      });
+      expect(h.api.createSale).not.toHaveBeenCalled();
+    },
+  );
 
   it('preserves the key while the backend reports the sale in flight', async () => {
     const h = setup();

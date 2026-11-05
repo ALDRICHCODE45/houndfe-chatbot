@@ -9,6 +9,10 @@ import { isCheckoutUuid } from './checkout-context.dto';
  */
 export const PACKAGING_DATA_MISSING = 'PACKAGING_DATA_MISSING';
 export const SHIPPING_QUOTE_UNAVAILABLE = 'SHIPPING_QUOTE_UNAVAILABLE';
+/** Checkout rejections of `shipping: {quoteId}`: nothing was created. */
+export const SHIPPING_QUOTE_NOT_FOUND = 'SHIPPING_QUOTE_NOT_FOUND';
+export const SHIPPING_QUOTE_EXPIRED = 'SHIPPING_QUOTE_EXPIRED';
+export const SHIPPING_QUOTE_MISMATCH = 'SHIPPING_QUOTE_MISMATCH';
 
 const uuid = z.string().refine(isCheckoutUuid, 'Invalid UUID');
 const cents = z.number().int().min(0).max(2147483647);

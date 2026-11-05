@@ -4,13 +4,11 @@ import { isCheckoutUuid } from './checkout-context.dto';
 const uuid = z.string().refine(isCheckoutUuid, 'Invalid checkout UUID');
 const cents = z.number().int().min(0).max(2147483647);
 const identifier = z.string().trim().min(1).max(200);
-const shipping = z
-  .object({
-    chargeCents: z.number().int().min(1).max(2147483647),
-    approvalId: identifier,
-    quoteId: identifier.optional(),
-  })
-  .strict();
+/** A backend-signed quote, or store pickup; the backend computes the charge. */
+const shipping = z.union([
+  z.object({ quoteId: identifier }).strict(),
+  z.object({ mode: z.literal('pickup') }).strict(),
+]);
 const instant = z.string().refine((value) => {
   try {
     return new Date(value).toISOString() === value;
@@ -89,11 +87,7 @@ export const CreateCheckoutInputSchema = z
         expectedTotalCents: cents,
         shipping: shipping.optional(),
       })
-      .strict()
-      .refine((sale) => !sale.shipping || sale.expectedTotalCents > 0, {
-        path: ['expectedTotalCents'],
-        message: 'expectedTotalCents must be positive when shipping is charged',
-      }),
+      .strict(),
   })
   .strict();
 

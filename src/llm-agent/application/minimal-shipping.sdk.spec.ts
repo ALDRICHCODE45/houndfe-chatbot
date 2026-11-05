@@ -128,8 +128,10 @@ describe('minimal shipping SDK public seam', () => {
     await h.turn('SÍ', []);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     const payload: unknown = (h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale;
-    if (free) expect(payload).not.toHaveProperty('shipping');
-    else expect(payload).toMatchObject({ shipping: { chargeCents: 20000, approvalId: 'abcdef123456', quoteId: 'q1' }, expectedTotalCents: 23000 });
+    expect(payload).toMatchObject({ shipping: { quoteId: 'q1' } });
+    expect(payload).not.toHaveProperty('shipping.chargeCents');
+    expect(payload).not.toHaveProperty('shipping.approvalId');
+    if (!free) expect(payload).toMatchObject({ expectedTotalCents: 23000 });
   });
   it('S7: rejected quote offers requote, no order', async () => {
     const h = await setup(); await h.turn('Envío', [call('requestShippingQuote'), say()]);

@@ -41,12 +41,13 @@ Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from t
 
 ## Duplicate protection
 
-The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/checkouts`, together with a SHA-256 fingerprint of the exact checkout payload (phone, customer, delivery address, expected total, items and any approved shipping charge).
+The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/checkouts`, together with a SHA-256 fingerprint of the exact checkout payload (phone, customer, delivery address, expected total, items and the shipping member: `{quoteId}` for a backend-signed quote, `{mode: "pickup"}` for store pickup, or absent). The backend computes the freight from the quote; the expected total is the product total plus the quoted customer charge.
 
 | Backend outcome                                                                                                                     | Key                   | Reply                                   |
 | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
 | Created                                                                                                                             | cleared with the cart | folio + total + payment details         |
 | Definite 4xx (not 408/429), such as `PROMO_RE_QUOTE`, on the **first** attempt                                                      | rotated               | "no se pudo crear el pedido"            |
+| `SHIPPING_QUOTE_EXPIRED`, `SHIPPING_QUOTE_MISMATCH`, `SHIPPING_QUOTE_NOT_FOUND` on the **first** attempt (cart kept)                | rotated               | "pídame de nuevo el envío" (re-quote)   |
 | Same definite rejection on a **later** attempt (an earlier one was uncertain)                                                       | kept                  | "comuníquese con la tienda"             |
 | `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, `CHECKOUT_RETRY_REQUIRED`, 408, 429, 5xx, network error, malformed success | kept                  | "no pude confirmar si quedó registrado" |
 
