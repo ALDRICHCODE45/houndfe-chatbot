@@ -8,7 +8,6 @@ import {
   Post,
   Query,
   Req,
-  Optional,
   InternalServerErrorException,
   UseGuards,
 } from '@nestjs/common';
@@ -29,11 +28,9 @@ export class WebhookController {
   constructor(
     private readonly configService: ConfigService,
     private readonly webhookDispatcher: WebhookDispatcherService,
-    // Optional only for default-off composition; enabled requires a future factory.
-    @Optional() private readonly restockCapture?: RestockInboundCapture,
-    @Optional()
+    private readonly restockCapture: RestockInboundCapture,
     @Inject(CUSTOMER_INBOUND_CAPTURE)
-    private readonly customerCapture?: CustomerInboundCapture,
+    private readonly customerCapture: CustomerInboundCapture,
   ) {}
 
   @Get('webhook')
@@ -58,30 +55,22 @@ export class WebhookController {
     @Body() event: WebhookEventDto,
     @Req() request?: Request,
   ): Promise<{ received: true }> {
-    let dispatchEvent = event;
-    if (this.configService.get('humanDecisions.restockEnabled') === true) {
-      const snapshot = request ? readVerifiedWebhookSnapshot(request) : null;
-      if (!snapshot || !this.restockCapture) {
-        throw new InternalServerErrorException();
-      }
-      const result = await this.restockCapture.capture(snapshot);
-      if (result.action !== 'captured') {
-        throw new InternalServerErrorException();
-      }
-      dispatchEvent = result.event;
+    const snapshot = request ? readVerifiedWebhookSnapshot(request) : null;
+    if (!snapshot) {
+      throw new InternalServerErrorException();
     }
-    if (
-      this.configService.get('humanDecisions.customerInboundEnabled') === true
-    ) {
-      try {
-        if (!this.customerCapture) throw new InternalServerErrorException();
-        const result = await this.customerCapture(request);
-        if (result.action !== 'captured')
-          throw new InternalServerErrorException();
-      } catch {
-        // Do not expose storage details, retry, or dispatch after uncertain writes.
+    const restock = await this.restockCapture.capture(snapshot);
+    if (restock.action !== 'captured') {
+      throw new InternalServerErrorException();
+    }
+    const dispatchEvent = restock.event;
+    try {
+      const result = await this.customerCapture(request);
+      if (result.action !== 'captured')
         throw new InternalServerErrorException();
-      }
+    } catch {
+      // Do not expose storage details, retry, or dispatch after uncertain writes.
+      throw new InternalServerErrorException();
     }
     // Capture is not send authorization; retain the original dispatcher boundary.
     await this.webhookDispatcher.dispatch(dispatchEvent);

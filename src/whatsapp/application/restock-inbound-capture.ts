@@ -8,7 +8,7 @@ import type { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 import type { VerifiedWebhookSnapshot } from '../presentation/signature.guard';
 
 type Result =
-  | { action: 'disabled' | 'hold' }
+  | { action: 'hold' }
   | {
       action: 'captured';
       event: WebhookEventDto;
@@ -27,14 +27,12 @@ function object(value: unknown): value is Record<string, unknown> {
  */
 export class RestockInboundCapture {
   constructor(
-    private readonly enabled: unknown,
     private readonly phone: string,
     private readonly store: Pick<RestockInboundEvidencePort, 'record'>,
     private readonly isOpsSender: (senderId: string) => boolean,
     private readonly isKnownOutbound: (messageId: string) => boolean,
   ) {}
   async capture(snapshot: VerifiedWebhookSnapshot | null): Promise<Result> {
-    if (this.enabled !== true) return { action: 'disabled' };
     if (!snapshot) return HOLD;
     const { rawBodyBase64, observedAt } = snapshot;
     let event: unknown;

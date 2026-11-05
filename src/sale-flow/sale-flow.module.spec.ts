@@ -65,12 +65,7 @@ describe('SaleFlowModule', () => {
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     OPS_CHANNEL_PHONE: '5215500000000',
   };
-  // WU2B sets HUMAN_DECISIONS_RESTOCK_ENABLED in one test, so the flag is saved
-  // and restored alongside the validated env keys (and unset by default).
-  const ENV_KEYS = [
-    ...Object.keys(VALID_ENV),
-    'HUMAN_DECISIONS_RESTOCK_ENABLED',
-  ];
+  const ENV_KEYS = Object.keys(VALID_ENV);
   let savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
@@ -81,7 +76,6 @@ describe('SaleFlowModule', () => {
     for (const key of Object.keys(VALID_ENV)) {
       process.env[key] = VALID_ENV[key];
     }
-    delete process.env.HUMAN_DECISIONS_RESTOCK_ENABLED;
   });
 
   afterEach(() => {
@@ -111,13 +105,10 @@ describe('SaleFlowModule', () => {
     create: jest.fn(),
     update: jest.fn(),
   };
-  const stubConfigService = (restockEnabled?: boolean) => ({
+  const stubConfigService = () => ({
     get: (key: string) => {
       if (key === 'chatbotApi.cashierUserId') {
         return '00000000-4000-9000-0000-000000000001';
-      }
-      if (key === 'humanDecisions.restockEnabled') {
-        return restockEnabled;
       }
       return undefined;
     },
@@ -130,7 +121,7 @@ describe('SaleFlowModule', () => {
     end: jest.fn().mockResolvedValue(undefined),
   };
 
-  async function buildModule(restockEnabled?: boolean, shipping = false) {
+  async function buildModule(shipping = false) {
     const builder = Test.createTestingModule({
       imports: [
         SaleFlowModule,
@@ -165,7 +156,7 @@ describe('SaleFlowModule', () => {
       .overrideProvider(PG_POOL)
       .useValue(fakePool)
       .overrideProvider(ConfigService)
-      .useValue(stubConfigService(restockEnabled));
+      .useValue(stubConfigService());
     if (shipping) {
       const imports = Reflect.getMetadata(
         'imports',
@@ -223,7 +214,7 @@ describe('SaleFlowModule', () => {
   it.each([false, true])(
     'S5: downstream importer sees shipping tokens only when provided (%s)',
     async (enabled) => {
-      const ref = await buildModule(undefined, enabled);
+      const ref = await buildModule(enabled);
       const probe = ref.get<{ provider: unknown; measured: unknown }>(
         SHIPPING_PROBE,
       );
@@ -262,19 +253,9 @@ describe('SaleFlowModule', () => {
   });
 
   it('resolves the human-decisions RESTOCK tokens with no connection or SQL', async () => {
-    const moduleRef = await buildModule(false);
+    const moduleRef = await buildModule();
     expect(moduleRef.get(SHARED_ROUTE_MARKERS)).toBeDefined();
     expect(moduleRef.get(RESTOCK_INTAKE_SERVICE)).toBeDefined();
-    const registry = moduleRef.get(RealToolRegistry);
-    expect(Object.keys(registry.getTools())).toHaveLength(12);
-    expect(fakePool.connect).not.toHaveBeenCalled();
-    expect(fakePool.query).not.toHaveBeenCalled();
-    await moduleRef.close();
-  });
-
-  it('stays inert on the SaleFlow surface even when the gate is exactly true', async () => {
-    process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
-    const moduleRef = await buildModule(true);
     const registry = moduleRef.get(RealToolRegistry);
     expect(Object.keys(registry.getTools())).toHaveLength(12);
     expect(fakePool.connect).not.toHaveBeenCalled();

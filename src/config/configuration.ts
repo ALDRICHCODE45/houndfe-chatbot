@@ -71,10 +71,6 @@ const configuration = () => ({
     allowedSenders: minimalSenders(
       process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS,
     ),
-    // E1: independent default-off EXPIRATION inquiry capability on the
-    // minimal route. Only the exact env string 'true' enables it.
-    expirationEnabled:
-      process.env.HUMAN_DECISIONS_EXPIRATION_ENABLED === 'true',
     // Default-off order placement (creates real backend sales). Only the
     // exact env string 'true' enables it.
     orderEnabled: process.env.MINIMAL_CATALOG_ORDER_ENABLED === 'true',
@@ -89,19 +85,9 @@ const configuration = () => ({
     poolMax: parseInt(process.env.DB_POOL_MAX ?? '5', 10),
   },
   humanHandoff: {
-    enabled: process.env.HUMAN_HANDOFF_ENABLED !== 'false',
     // Retained exactly as supplied. The recipient normalization decision is
     // applied explicitly at comparison/send time, never at boot.
     opsChannelPhone: process.env.OPS_CHANNEL_PHONE,
-  },
-  humanDecisions: {
-    // WU2A experimental gate: ONLY the exact env string 'true' enables it.
-    // Anything else (unset, 'false', a typo, upper-case, '1') stays false, so
-    // there is no ambiguous activation. No consumer reads this yet.
-    restockEnabled: process.env.HUMAN_DECISIONS_RESTOCK_ENABLED === 'true',
-    // Independent default-off customer evidence gate; never send permission.
-    customerInboundEnabled:
-      process.env.HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED === 'true',
   },
   receiptMedia: {
     enabled: process.env.RECEIPT_MEDIA_ENABLED === 'true',

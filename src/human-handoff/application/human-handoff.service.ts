@@ -199,13 +199,10 @@ export class HumanHandoffService {
   async create(
     input: HumanHandoffCreateInput,
   ): Promise<HumanHandoffCreateResult> {
-    const enabled = this.configService.get<boolean>('humanHandoff.enabled');
     const opsChannelPhone = this.configService.get<string>(
       'humanHandoff.opsChannelPhone',
     );
-    if (!enabled) {
-      return { ok: false, error: { kind: 'disabled', retryable: false } };
-    }
+    // Boot validation requires OPS_CHANNEL_PHONE; this is defense in depth.
     if (!opsChannelPhone) {
       return { ok: false, error: { kind: 'disabled', retryable: false } };
     }

@@ -31,8 +31,8 @@ import { RealToolRegistry } from './infrastructure/real-tool-registry';
  *
  * Bank data flows through the runtime `getPaymentDetails` AI-SDK tool
  * (Q1 / R11); human-handoff flows through `requestHumanAssistance`
- * (human-handoff slice). The RESTOCK capability is threaded into the tool deps
- * only while `humanDecisions.restockEnabled` is exactly true. Shipping stays
+ * (human-handoff slice). The RESTOCK capability is always threaded into the tool
+ * deps. Shipping stays
  * inert unless `SHIPPING_QUOTES_ENABLED === 'true'`.
  */
 @Module({

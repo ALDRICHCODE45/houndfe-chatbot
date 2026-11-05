@@ -63,7 +63,8 @@ describe('LlmAgentModule integration', () => {
     // SHIPPING_QUOTES_ENABLED=true cannot enable the shipping module or the
     // default-off prompt byte-identity assertion. MANAGED_KEYS restores it.
     SHIPPING_QUOTES_ENABLED: 'false',
-    // WU-B: pin the RESTOCK gate OFF by default; the binding test flips it.
+    // Removed flag: RESTOCK is always on, so this stale value must have no
+    // effect (the binding test below proves the gate is still built).
     HUMAN_DECISIONS_RESTOCK_ENABLED: 'false',
   };
   const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
@@ -236,7 +237,7 @@ describe('LlmAgentModule integration', () => {
     await moduleRef.close();
   });
 
-  it('builds the bounded RESTOCK gate only under the exact restockEnabled flag', async () => {
+  it('always builds the bounded RESTOCK gate, even with the removed flag set to false', async () => {
     const boot = async () => {
       const moduleRef = await Test.createTestingModule({
         imports: [
@@ -277,12 +278,7 @@ describe('LlmAgentModule integration', () => {
       };
     };
 
-    await expect(boot()).resolves.toEqual({
-      enabled: false,
-      hasCallback: false,
-      bounded: null,
-    });
-    process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
+    expect(process.env.HUMAN_DECISIONS_RESTOCK_ENABLED).toBe('false');
     await expect(boot()).resolves.toEqual({
       enabled: true,
       hasCallback: true,

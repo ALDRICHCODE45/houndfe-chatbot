@@ -1,8 +1,6 @@
 import configuration from './configuration';
 import { envValidationSchema } from './env.validation';
 
-const FLAG = 'HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED';
-const RESTOCK = 'HUMAN_DECISIONS_RESTOCK_ENABLED';
 const validEnv = {
   META_VERIFY_TOKEN: 'test-token',
   META_APP_SECRET: 'test-secret',
@@ -18,50 +16,40 @@ const validEnv = {
   OPS_CHANNEL_PHONE: '5219999888777',
 };
 
-// Read the public projection without requiring the new field at compile time.
-const flags = () => configuration().humanDecisions as Record<string, unknown>;
-const original = { [FLAG]: process.env[FLAG], [RESTOCK]: process.env[RESTOCK] };
+// Human decisions are always on: the former opt-in flags are unknown env vars
+// that neither validation nor configuration reads.
+const REMOVED = [
+  'HUMAN_HANDOFF_ENABLED',
+  'HUMAN_DECISIONS_RESTOCK_ENABLED',
+  'HUMAN_DECISIONS_EXPIRATION_ENABLED',
+  'HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED',
+] as const;
+const original = Object.fromEntries(REMOVED.map((k) => [k, process.env[k]]));
 afterEach(() => {
-  for (const key of [FLAG, RESTOCK] as const) {
+  for (const key of REMOVED) {
     if (original[key] === undefined) delete process.env[key];
     else process.env[key] = original[key];
   }
 });
 
-it.each([undefined, 'false', 'true'])(
-  'validates and projects canonical customer flag %p independently of RESTOCK',
-  (input) => {
-    if (input === undefined) delete process.env[FLAG];
-    else process.env[FLAG] = input;
+it.each(['false', 'true', 'garbage'])(
+  'ignores removed human-decision flags set to %p',
+  (value) => {
+    const env = Object.fromEntries(REMOVED.map((k) => [k, value]));
     const result = envValidationSchema.validate(
-      { ...validEnv, ...(input === undefined ? {} : { [FLAG]: input }) },
+      { ...validEnv, ...env },
       { abortEarly: false },
     );
     expect(result.error).toBeUndefined();
-    expect((result.value as Record<string, unknown>)[FLAG]).toBe(
-      input ?? 'false',
-    );
-    for (const restock of ['true', 'false']) {
-      process.env[RESTOCK] = restock;
-      expect(flags()).toEqual({
-        restockEnabled: restock === 'true',
-        customerInboundEnabled: input === 'true',
-      });
+    const validated = result.value as Record<string, unknown>;
+    for (const key of REMOVED) {
+      expect(validated[key]).toBe(value);
+      process.env[key] = value;
     }
-  },
-);
-it.each(['TRUE', 'True', '1', '0', 'yes', '', 'true ', ' true'])(
-  'rejects ambiguous flag %p at boot and never activates it in the factory',
-  (input) => {
-    process.env[FLAG] = input;
-    const { error } = envValidationSchema.validate(
-      { ...validEnv, [FLAG]: input },
-      { abortEarly: false },
-    );
-    expect(error).toBeDefined();
-    expect(error?.details.some((detail) => detail.path.includes(FLAG))).toBe(
-      true,
-    );
-    expect(flags().customerInboundEnabled).toBe(false);
+    const cfg = configuration() as unknown as Record<string, unknown>;
+    expect(cfg.humanDecisions).toBeUndefined();
+    expect(cfg.humanHandoff).toEqual({
+      opsChannelPhone: process.env.OPS_CHANNEL_PHONE,
+    });
   },
 );

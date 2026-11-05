@@ -69,11 +69,7 @@ ddescribe('legacy handoff reservation (real DB)', () => {
     };
     const config = {
       get: (key: string) =>
-        key === 'humanHandoff.enabled'
-          ? true
-          : key === 'humanHandoff.opsChannelPhone'
-            ? OPS
-            : undefined,
+        key === 'humanHandoff.opsChannelPhone' ? OPS : undefined,
     } as unknown as ConfigService;
     conversationStore = new PostgresConversationStore(pool);
     service = new HumanHandoffService(

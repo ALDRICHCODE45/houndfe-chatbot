@@ -272,7 +272,6 @@ ddescribe(
         expect(await reservationRows()).toHaveLength(0);
         expect(await ledgerRows()).toHaveLength(0);
         const config: Record<string, unknown> = {
-          'humanDecisions.restockEnabled': true,
           'chatbotApi.branchId': BRANCH,
           'meta.phoneNumberId': PHONE,
         };

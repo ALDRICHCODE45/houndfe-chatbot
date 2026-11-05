@@ -5,13 +5,12 @@ import {
 import { readVerifiedWebhookSnapshot } from '../presentation/signature.guard';
 
 export type CustomerInboundCaptureOptions = Readonly<{
-  enabled: unknown;
   phone: string;
   isOpsSender: (senderId: string) => boolean;
   isKnownOutbound: (messageId: string) => boolean;
 }>;
 type Preparation =
-  | Readonly<{ action: 'disabled' | 'hold' }>
+  | Readonly<{ action: 'hold' }>
   | Readonly<{
       action: 'prepared';
       observations: readonly CustomerInboundObservation[];
@@ -38,13 +37,12 @@ function record(value: unknown): value is Record<string, unknown> {
  * Requires trusted configuration/predicates; never validates message content.
  * Prepared metadata is not a capability, durable evidence, latestness or send
  * permission. The runtime persister calls this with the actual request itself.
- * The guard exposes snapshots when RESTOCK or customer inbound is enabled.
+ * The guard always exposes the verified snapshot.
  */
 export function prepareCustomerInboundObservations(
   request: unknown,
   options: CustomerInboundCaptureOptions,
 ): Preparation {
-  if (options.enabled !== true) return Object.freeze({ action: 'disabled' });
   if (request === null || typeof request !== 'object') return HOLD;
   const snapshot = readVerifiedWebhookSnapshot(request);
   if (!snapshot) return HOLD;

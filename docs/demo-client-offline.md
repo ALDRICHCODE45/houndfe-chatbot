@@ -19,7 +19,7 @@ además, de un **harness visual sintético separado** que no realiza HTTP.
 | **EVIDENCIA SEPARADA**          | Suites/ramas reportadas por otros equipos; se citan, **no** se ejecutan aquí.   |
 | **PLANNED**                     | Integración ausente: GET/ACK del bot, entrega al dispositivo y FE→backend real. |
 
-`HUMAN_DECISIONS_RESTOCK_ENABLED` **por defecto es `false`**. Reserva, ledger y
+RESTOCK está **siempre activo** (sin variable de entorno). Reserva, ledger y
 coordinador existen y están probados; el coordinador **sí** compone reserva y
 ledger, pero el preflight **no** está cableado al coordinador ni al webhook. La
 demo usa un **evento sintético** (llamador de prueba).

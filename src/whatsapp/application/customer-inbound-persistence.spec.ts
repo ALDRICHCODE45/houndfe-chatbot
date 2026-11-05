@@ -23,7 +23,7 @@ const observation = (id = 'first') => ({
   providerTimestampSeconds: message().timestamp,
   observedAt,
 });
-function signed(messages: unknown[] = [message()], enabled = true) {
+function signed(messages: unknown[] = [message()]) {
   const rawBody = Buffer.from(
     JSON.stringify({
       object: 'whatsapp_business_account',
@@ -51,7 +51,6 @@ function signed(messages: unknown[] = [message()], enabled = true) {
   const guard = new SignatureGuard(
     new ConfigService({
       meta: { appSecret: secret },
-      humanDecisions: { restockEnabled: enabled },
     }),
   );
   guard.canActivate({
@@ -59,7 +58,7 @@ function signed(messages: unknown[] = [message()], enabled = true) {
   } as ExecutionContext);
   return req;
 }
-function setup(enabled: unknown = true) {
+function setup() {
   const record = jest
     .fn<ReturnType<CustomerInboundObservationStore['record']>, [unknown]>()
     .mockImplementation((input) =>
@@ -70,7 +69,6 @@ function setup(enabled: unknown = true) {
     );
   const readLatest = jest.fn();
   const options = {
-    enabled,
     phone,
     isOpsSender: (id: string) => id === 'ops',
     isKnownOutbound: (id: string) => id === 'outbound',
@@ -84,23 +82,11 @@ beforeEach(() => jest.useFakeTimers({ now: new Date(observedAt) }));
 afterEach(() => jest.useRealTimers());
 
 describe('unwired authenticated inbound persistence', () => {
-  it.each([false, null, 'true', 1])(
-    'disabled %p performs no persistence',
-    async (enabled) => {
-      const s = setup(enabled);
-      const result = await s.capture(signed());
-      expect(result).toEqual({ action: 'disabled' });
-      expect(Object.isFrozen(result)).toBe(true);
-      expect(s.record).not.toHaveBeenCalled();
-      expect(s.readLatest).not.toHaveBeenCalled();
-    },
-  );
   it('rejects forged prepared data, cloned requests and missing snapshots before I/O', async () => {
     const s = setup();
     for (const req of [
       { action: 'prepared', observations: [observation()] },
       { ...signed() },
-      signed([message()], false),
       null,
     ])
       expect(await s.capture(req)).toEqual({ action: 'hold' });

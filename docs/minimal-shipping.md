@@ -10,7 +10,6 @@ Enable the minimal route and order capability described in [minimal order placem
 | ----------------------------------- | ------------------------------------------------------------------- |
 | `MINIMAL_CATALOG_SHIPPING_ENABLED`  | Exact `true`; every other value is off.                             |
 | `SHIPPING_QUOTES_ENABLED`           | Exact `true`; makes the provider port available.                    |
-| `HUMAN_HANDOFF_ENABLED`             | `true`; operations approval must be available.                      |
 | `OPS_CHANNEL_PHONE`                 | Authorized operations-channel recipient.                            |
 | Skydropx configuration              | Owner-approved sandbox credentials and authoritative branch origin. |
 | `SHIPPING_DEMO_PARCEL_PROFILE_JSON` | Valid measured profile matching the exact cart.                     |

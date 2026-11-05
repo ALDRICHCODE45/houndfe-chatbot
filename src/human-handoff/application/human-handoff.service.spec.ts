@@ -43,8 +43,6 @@ import {
  *       customer notice + sets the marker; returns the success envelope.
  *   - (b) idempotent re-call: a second create for the same sender with
  *       pendingHumanRequest set returns the existing envelope.
- *   - (c) disabled kill-switch: enabled=false returns the disabled envelope
- *       and does NOT call store.create or whatsappSender.sendText.
  *   - (d) resolveReply with explicit ref token parses + resolves + clears.
  *   - (e) no-token fallback to newest pending request for the agent.
  *   - (f) no-token + no pending returns { kind: 'no_pending', reply }.
@@ -97,7 +95,6 @@ describe('HumanHandoffService', () => {
 
     configService = {
       get: (key: string) => {
-        if (key === 'humanHandoff.enabled') return true;
         if (key === 'humanHandoff.opsChannelPhone') return OPS;
         return undefined;
       },
@@ -153,8 +150,7 @@ describe('HumanHandoffService', () => {
         whatsappSender,
         conversationStore,
         {
-          get: (key: string) =>
-            key === 'humanHandoff.enabled' ? true : undefined,
+          get: () => undefined,
         } as unknown as ConfigService,
         reservations,
         shippingApprovalPolicyAdapter,
@@ -304,44 +300,6 @@ describe('HumanHandoffService', () => {
       });
 
       jest.useRealTimers();
-    });
-
-    it('disabled kill-switch: returns disabled envelope without writes/sends', async () => {
-      const disabledConfig = {
-        get: (key: string) =>
-          key === 'humanHandoff.enabled'
-            ? false
-            : key === 'humanHandoff.opsChannelPhone'
-              ? OPS
-              : undefined,
-      } as unknown as ConfigService;
-      const disabled = new HumanHandoffService(
-        store,
-        whatsappSender,
-        conversationStore,
-        disabledConfig,
-        reservations,
-        shippingApprovalPolicyAdapter,
-      );
-
-      const result = await disabled.create({
-        senderId: CUSTOMER,
-        kind: 'out_of_stock',
-        digest: {
-          kind: 'out_of_stock',
-          productId: 'p',
-          name: 'X',
-        },
-      });
-
-      expect(result).toEqual({
-        ok: false,
-        error: { kind: 'disabled', retryable: false },
-      });
-      expect(store.create).not.toHaveBeenCalled();
-      expect(whatsappSender.sendText).not.toHaveBeenCalled();
-      expect(conversationStore.update).not.toHaveBeenCalled();
-      expect(reservations.reserve).not.toHaveBeenCalled();
     });
 
     it('reserves LEGACY_OPS before store.create and proceeds only on claim', async () => {
@@ -1214,7 +1172,6 @@ describe('HumanHandoffService', () => {
       try {
         const procCfg = {
           get: (key: string) => {
-            if (key === 'humanHandoff.enabled') return true;
             if (key === 'humanHandoff.opsChannelPhone') return OPS;
             return undefined;
           },

@@ -147,7 +147,6 @@ this number before cutover; do not assume inherited access or scope.
     (copy the value Meta delivers in an inbound `wa_id`; never the E.164 form
     with a leading `+`). Boot fails fast on a `+`/separator/whitespace form, so
     ops handoff replies cannot be silently dropped.
-  - `HUMAN_HANDOFF_ENABLED` — keep `true` for the pilot.
   - Receipt flags stay **false**: `RECEIPT_MEDIA_ENABLED=false`,
     `RECEIPT_MEDIA_INGESTION_ENABLED=false`,
     `RECEIPT_MEDIA_METRICS_ENABLED=false` (ODD-8 gates).
@@ -160,7 +159,7 @@ this number before cutover; do not assume inherited access or scope.
 1. Set the Dokploy env names in §8 (owner enters values) and restart.
 2. Run chatbot migrations against the target database.
 3. Deploy the current commit; Joi validates env at boot and fails fast when
-   `HUMAN_HANDOFF_ENABLED=true` and `OPS_CHANNEL_PHONE` is missing.
+   `OPS_CHANNEL_PHONE` is missing (human handoff is always on).
 4. Confirm the webhook GET verification returns the challenge and `messages`
    is subscribed.
 5. Run **one controlled synthetic text-sales journey** from the owner or a
@@ -217,12 +216,12 @@ tokens por chat: los ingresas tú directo en Meta y en el panel.
 Run `pnpm preflight:launch` before cutover and after every config change. It
 prints one deterministic JSON report and exits `0` (pass), `1` (check
 failures), or `2` (usage/runtime error). It reads only environment variable
-names/presence, five posture flags, and `migrations/` filenames: no network,
+names/presence, the posture flags, and `migrations/` filenames: no network,
 no `.env`, no Nest boot, and never a value, token, length, or hash.
 
 Report: `coreConfig` (`present|missing`); `posture` (`safe|unsafe|missing`
 against exact `META_SANDBOX_RECIPIENT_NORMALIZATION=false`,
-`HUMAN_HANDOFF_ENABLED=true`, and the three receipt flags `false`; missing or
+and the three receipt flags `false`; missing or
 non-exact fails closed); `migrations` (`present_on_disk|missing_on_disk`);
 `clientRoutes`/`manualChecks` (always `manual_external`, never flipping `ok`).
 `ok` is false only for missing core names, unsafe/missing posture, or a missing

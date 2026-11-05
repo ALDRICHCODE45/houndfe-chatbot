@@ -2,21 +2,16 @@
 
 ## Current boundary
 
-`HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED` defaults to `false`. Only the exact
-strings `true` and `false` pass environment validation; ambiguous spellings fail
-startup. The configuration factory enables the flag only for the exact `true`.
+Customer inbound capture is **always on**; there is no env flag.
 
-A successful Meta HMAC verification retains a private, immutable copy of the raw
-request and its verification time when either this flag or
-`HUMAN_DECISIONS_RESTOCK_ENABLED` is enabled. Both flags off retain no snapshot.
-Invalid signatures never publish evidence and revoke any previous snapshot for
-that request. RESTOCK does not require the new flag.
+A successful Meta HMAC verification always retains a private, immutable copy of
+the raw request and its verification time. Invalid signatures never publish
+evidence and revoke any previous snapshot for that request.
 
-When enabled, the controller persists authenticated customer metadata through
-the existing standalone PostgreSQL pool after RESTOCK admission (if enabled)
-and before dispatch/dedup. Operational senders and known outbound message IDs
-use the existing handoff and recent-outbound filters. With the flag off, customer
-capture performs no writes and the original dispatch path remains unchanged.
+The controller persists authenticated customer metadata through the existing
+standalone PostgreSQL pool after RESTOCK admission and before dispatch/dedup.
+Operational senders and known outbound message IDs use the existing handoff and
+recent-outbound filters. A capture hold or failure returns 500 without dispatch.
 No latest-read consumer, service-window renewal or send authority is added.
 
 ## Controller failure policy

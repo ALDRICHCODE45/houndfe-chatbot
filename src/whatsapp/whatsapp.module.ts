@@ -70,7 +70,6 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
         recent: Pick<RecentOutboundStore, 'isKnown'>,
       ): RestockInboundCapture =>
         new RestockInboundCapture(
-          config.get('humanDecisions.restockEnabled'),
           config.get<string>('meta.phoneNumberId') ?? '',
           new PostgresRestockInboundEvidenceStore(pool),
           (sender) => handoff.isOpsSender(sender),

@@ -6,6 +6,7 @@ import request from 'supertest';
 import type { RestockInboundEvidencePort } from '../../human-decisions/infrastructure/postgres-restock-inbound-evidence.store';
 import { RestockInboundCapture } from '../application/restock-inbound-capture';
 import { WebhookDispatcherService } from '../application/webhook-dispatcher.service';
+import { CUSTOMER_INBOUND_CAPTURE } from '../infrastructure/customer-inbound-capture.provider';
 import * as signatures from './signature.guard';
 import { WebhookController } from './webhook.controller';
 
@@ -53,20 +54,14 @@ describe('Webhook restock capture connection', () => {
 
   async function setup(
     options: {
-      flag?: unknown;
-      missingProvider?: boolean;
       fakeGuard?: boolean;
       mutate?: boolean;
-      captureEnabled?: boolean;
     } = {},
   ) {
-    const flag = 'flag' in options ? options.flag : true;
     const config = new ConfigService({
       meta: { appSecret: secret },
-      humanDecisions: { restockEnabled: flag },
     });
     capture = new RestockInboundCapture(
-      options.captureEnabled ?? true,
       '123456789',
       { record },
       () => false,
@@ -79,9 +74,12 @@ describe('Webhook restock capture connection', () => {
         signatures.SignatureGuard,
         { provide: ConfigService, useValue: config },
         { provide: WebhookDispatcherService, useValue: { dispatch } },
-        ...(options.missingProvider
-          ? []
-          : [{ provide: RestockInboundCapture, useValue: capture }]),
+        { provide: RestockInboundCapture, useValue: capture },
+        {
+          provide: CUSTOMER_INBOUND_CAPTURE,
+          useValue: () =>
+            Promise.resolve({ action: 'captured', observations: [] }),
+        },
       ],
     });
     if (options.fakeGuard)
@@ -213,12 +211,8 @@ describe('Webhook restock capture connection', () => {
     expect(dispatch).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { missingProvider: true },
-    { fakeGuard: true },
-    { captureEnabled: false },
-  ])('fails closed for unavailable authority/capture: %p', async (options) => {
-    await setup(options);
+  it('fails closed without the private guard snapshot', async () => {
+    await setup({ fakeGuard: true });
     await fails();
     expect(record).not.toHaveBeenCalled();
   });
@@ -249,19 +243,4 @@ describe('Webhook restock capture connection', () => {
     );
     expect(record).not.toHaveBeenCalled();
   });
-
-  it.each([false, undefined, 'true'])(
-    'bypasses capture for non-strict flag %p',
-    async (flag) => {
-      await setup({ flag, mutate: true });
-      const getter = jest.spyOn(signatures, 'readVerifiedWebhookSnapshot');
-      await post({ invalidForCapture: true })
-        .expect(200)
-        .expect({ received: true });
-      expect(captureSpy).not.toHaveBeenCalled();
-      expect(getter).not.toHaveBeenCalled();
-      expect(record).not.toHaveBeenCalled();
-      expect(dispatch).toHaveBeenCalledWith({ forged: true });
-    },
-  );
 });

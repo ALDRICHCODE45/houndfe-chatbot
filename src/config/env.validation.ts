@@ -222,11 +222,7 @@ const shippingFlagSchema = Joi.boolean()
  *   CHATBOT_API_BASE_URL   — base URL of the houndfe-backend chatbot-api
  *   SERVICE_KEY            — ServiceCredential raw key; MUST start with "svc_"
  *   CHATBOT_API_BRANCH_ID  — tenant branch id sent as X-Branch-Id header
- *
- * Conditional vars (human-handoff slice):
- *   HUMAN_HANDOFF_ENABLED  — boolean, default true. Kill-switch for the
- *                             human-handoff channel.
- *   OPS_CHANNEL_PHONE      — REQUIRED when HUMAN_HANDOFF_ENABLED=true.
+ *   OPS_CHANNEL_PHONE      — human-handoff ops recipient (always on).
  *                             Exact digit-only Meta sender id (wa_id), same
  *                             form Meta delivers in an inbound `wa_id`,
  *                             10-15 digits. `+`/separators/whitespace are
@@ -269,25 +265,12 @@ const innerEnvValidationSchema = Joi.object({
     .valid('true', 'false')
     .default('false'),
   MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: Joi.string().optional(),
-  // E1: independent default-off EXPIRATION inquiry capability. The literal
-  // 'true' enables it; every other value (typo, upper-case, '1') is rejected.
-  HUMAN_DECISIONS_EXPIRATION_ENABLED: Joi.string()
-    .valid('true', 'false')
-    .default('false'),
 
   // ─── Human-handoff slice (R7 + needs_human_review + R14) ─────────────────
   /**
-   * Kill-switch for the human-handoff channel. When `false`,
-   * `HumanHandoffService.create` short-circuits with a `disabled`
-   * envelope before any write/send; the 12th tool
-   * `requestHumanAssistance` returns the same disabled envelope.
-   * Default: true.
-   */
-  HUMAN_HANDOFF_ENABLED: Joi.boolean().default(true),
-  /**
    * WhatsApp senderId (wa_id) of the human agent who receives digests
-   * and replies to them. Required when `HUMAN_HANDOFF_ENABLED=true`;
-   * optional otherwise (enforced by the `.custom()` block below).
+   * and replies to them. Always required: human handoff and human
+   * decisions are always on.
    * Must be the exact digit-only Meta sender id (same form delivered in an
    * inbound `wa_id`): 10-15 digits, no leading `+`, whitespace, or
    * separators. The value is retained verbatim; sender/ops comparison
@@ -295,7 +278,7 @@ const innerEnvValidationSchema = Joi.object({
    */
   OPS_CHANNEL_PHONE: Joi.string()
     .pattern(/^\d{10,15}$/)
-    .optional(),
+    .required(),
   /**
    * Explicit Meta test-number recipient compatibility mode. Default: false.
    * When true, Mexico `521` + 10-digit recipients are rewritten to `52` + 10
@@ -303,20 +286,6 @@ const innerEnvValidationSchema = Joi.object({
    * conversion on both sides. The default keeps the exact inbound `wa_id`.
    */
   META_SANDBOX_RECIPIENT_NORMALIZATION: Joi.boolean().default(false),
-
-  // ─── Human decisions: experimental RESTOCK gate (WU2A) ──────────────
-  // Explicit opt-in only. The literal string `'true'` enables it and
-  // `'false'` disables it; EVERY other value (a typo, upper-case, `1`) is
-  // REJECTED, so an ambiguous value can never activate the gate. Default:
-  // false. No consumer reads this yet.
-  HUMAN_DECISIONS_RESTOCK_ENABLED: Joi.string()
-    .valid('true', 'false')
-    .default('false'),
-
-  // Independent opt-in for authenticated customer inbound evidence.
-  HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED: Joi.string()
-    .valid('true', 'false')
-    .default('false'),
 
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),
@@ -444,17 +413,6 @@ const innerEnvValidationSchema = Joi.object({
   ),
 })
   .custom((value: Record<string, unknown>, helpers) => {
-    const enabled = value.HUMAN_HANDOFF_ENABLED !== false;
-    const ops = value.OPS_CHANNEL_PHONE;
-    if (enabled && (typeof ops !== 'string' || ops.length === 0)) {
-      // Joi's `helpers.error` doesn't apply the supplied `message`
-      // context directly to the error message; we throw with the
-      // explicit message appended so the boot log carries the
-      // actionable text.
-      const err = helpers.error('any.custom');
-      err.message = `"OPS_CHANNEL_PHONE" is required when "HUMAN_HANDOFF_ENABLED" is true`;
-      throw err;
-    }
     // WU1C2A cross-field rule: download timeout must be at least as large as metadata timeout; only enforced when receipt-media is enabled.
     if (value.RECEIPT_MEDIA_ENABLED === true) {
       const meta = Number(value.META_MEDIA_METADATA_TIMEOUT_MS);

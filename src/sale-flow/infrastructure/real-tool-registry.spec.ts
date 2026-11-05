@@ -109,7 +109,6 @@ describe('RealToolRegistry', () => {
     store?: StoreStub;
     humanHandoffService?: ServiceStub;
     humanHandoffStore?: HumanHandoffStore;
-    restockEnabled?: boolean;
   }
 
   async function buildRegistry(
@@ -137,9 +136,6 @@ describe('RealToolRegistry', () => {
           get: (key: string) => {
             if (key === 'chatbotApi.cashierUserId') {
               return '00000000-4000-9000-0000-000000000001';
-            }
-            if (key === 'humanDecisions.restockEnabled') {
-              return extras.restockEnabled;
             }
             return undefined;
           },
@@ -225,25 +221,9 @@ describe('RealToolRegistry', () => {
     expect(a).toBe(b);
   });
 
-  it('omits the restock capability entirely when the gate is absent or false', async () => {
-    for (const flag of [undefined, false]) {
-      mockCapturedDeps.length = 0;
-      const registry = await buildRegistry(undefined, undefined, {
-        restockEnabled: flag,
-      });
-      expect(Object.keys(registry.getTools())).toHaveLength(12);
-      expect('restock' in lastDeps()).toBe(false);
-    }
-    expect(stubMarkers.readForSender).not.toHaveBeenCalled();
-    expect(stubCoordinator.coordinate).not.toHaveBeenCalled();
-    expect(stubRecovery.recover).not.toHaveBeenCalled();
-  });
-
-  it('populates the restock capability only when the gate is exactly true, and stays inert', async () => {
+  it('always populates the restock capability, and stays inert', async () => {
     mockCapturedDeps.length = 0;
-    const registry = await buildRegistry(undefined, undefined, {
-      restockEnabled: true,
-    });
+    const registry = await buildRegistry();
     expect(Object.keys(registry.getTools())).toHaveLength(12);
     expect(lastDeps().restock).toEqual({
       enabled: true,

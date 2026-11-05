@@ -122,13 +122,10 @@ export class RealToolRegistry implements ToolRegistry {
       humanHandoffService,
     };
 
-    // WU2B: the experimental RESTOCK gate is an EXACT boolean read. When it is
-    // not exactly true the `restock` property is omitted ENTIRELY, so the
-    // legacy deps stay byte-identical; nothing here reads the markers, invokes
-    // the coordinator, or runs the recovery until a tool call does.
-    if (configService.get<boolean>('humanDecisions.restockEnabled') === true) {
-      deps.restock = { enabled: true, markers, coordinator, recovery };
-    }
+    // WU2B: RESTOCK is always on (human decisions are not flag-gated).
+    // Nothing here reads the markers, invokes the coordinator, or runs the
+    // recovery until a tool call does.
+    deps.restock = { enabled: true, markers, coordinator, recovery };
 
     const tools: Record<string, unknown> = {
       searchCatalog: makeSearchCatalogTool(deps),

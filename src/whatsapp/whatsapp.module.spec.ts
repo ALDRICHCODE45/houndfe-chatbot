@@ -87,7 +87,6 @@ const BASE_ENV: Record<string, string> = {
   LLM_MODEL: 'm',
   DATABASE_URL: 'postgres://u:p@localhost:5432/d',
   OPS_CHANNEL_PHONE: '5215500000000',
-  HUMAN_DECISIONS_RESTOCK_ENABLED: 'false',
 };
 
 /** Enabled receipt environment over the validated WU1C field set. */
@@ -505,7 +504,11 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         clearReceiptAmountPointer: jest.fn(),
       })
       .overrideProvider(CHATBOT_API_CLIENT)
-      .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+      .useValue({
+        attachReceipt: jest.fn().mockResolvedValue(undefined),
+        // Human decisions are always on; their runtimes bind these edges.
+        recordRestockApplicationOutcome: jest.fn(),
+      })
       .overrideProvider(WHATSAPP_SENDER)
       .useValue({ sendText })
       .overrideProvider(ReceiptIngestionProcessor)
@@ -611,7 +614,11 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         clearReceiptAmountPointer: jest.fn(),
       })
       .overrideProvider(CHATBOT_API_CLIENT)
-      .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+      .useValue({
+        attachReceipt: jest.fn().mockResolvedValue(undefined),
+        // Human decisions are always on; their runtimes bind these edges.
+        recordRestockApplicationOutcome: jest.fn(),
+      })
       .overrideProvider(WHATSAPP_SENDER)
       .useValue({
         sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
@@ -677,7 +684,11 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         clearReceiptAmountPointer: jest.fn(),
       })
       .overrideProvider(CHATBOT_API_CLIENT)
-      .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+      .useValue({
+        attachReceipt: jest.fn().mockResolvedValue(undefined),
+        // Human decisions are always on; their runtimes bind these edges.
+        recordRestockApplicationOutcome: jest.fn(),
+      })
       .overrideProvider(WHATSAPP_SENDER)
       .useValue({ sendText })
       .compile();
@@ -715,24 +726,7 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
     }
   });
 
-  it('resolves an inert disabled restock capture before parsing a snapshot', async () => {
-    const pool = stubPool();
-    await withHostModule(
-      RECEIPT_DISABLED_ENV,
-      async (moduleRef) => {
-        await moduleRef.init();
-        const capture = moduleRef.get(RestockInboundCapture);
-        expect(capture).toBeInstanceOf(RestockInboundCapture);
-        expect(await capture.capture(null)).toEqual({ action: 'disabled' });
-        expect(pool.query).not.toHaveBeenCalled();
-        expect(pool.connect).not.toHaveBeenCalled();
-      },
-      pool,
-    );
-    expect(pool.end).toHaveBeenCalledTimes(1);
-  });
-
-  it('wires enabled capture to the same pool, configured channel, ops and echo filter', async () => {
+  it('wires capture to the same pool, configured channel, ops and echo filter', async () => {
     const pool = stubPool();
     pool.query.mockImplementation((_sql: string, params: unknown[]) =>
       Promise.resolve({
@@ -751,7 +745,7 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
       }),
     );
     await withHostModule(
-      { ...RECEIPT_DISABLED_ENV, HUMAN_DECISIONS_RESTOCK_ENABLED: 'true' },
+      RECEIPT_DISABLED_ENV,
       async (moduleRef) => {
         await moduleRef.init();
         const capture = moduleRef.get(RestockInboundCapture);

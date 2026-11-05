@@ -369,12 +369,9 @@ describe('envValidationSchema', () => {
   });
 
   // ─── Task T3.1 / T3.2: human-handoff env vars ─────────────────────────
-  describe('OPS_CHANNEL_PHONE / HUMAN_HANDOFF_ENABLED', () => {
-    it('rejects when HUMAN_HANDOFF_ENABLED=true and OPS_CHANNEL_PHONE is missing', () => {
-      const env: Record<string, string> = {
-        ...validEnv,
-        HUMAN_HANDOFF_ENABLED: 'true',
-      };
+  describe('OPS_CHANNEL_PHONE (always required)', () => {
+    it('rejects when OPS_CHANNEL_PHONE is missing', () => {
+      const env: Record<string, string> = { ...validEnv };
       delete env.OPS_CHANNEL_PHONE;
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
@@ -385,7 +382,7 @@ describe('envValidationSchema', () => {
       ).toBe(true);
     });
 
-    it('rejects when OPS_CHANNEL_PHONE is an empty string (HUMAN_HANDOFF_ENABLED=true)', () => {
+    it('rejects when OPS_CHANNEL_PHONE is an empty string', () => {
       const env = { ...validEnv, OPS_CHANNEL_PHONE: '' };
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
@@ -446,7 +443,7 @@ describe('envValidationSchema', () => {
       },
     );
 
-    it('accepts a valid OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is true (default)', () => {
+    it('accepts a valid OPS_CHANNEL_PHONE', () => {
       const env = { ...validEnv, OPS_CHANNEL_PHONE: '5219999888777' };
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
@@ -454,7 +451,7 @@ describe('envValidationSchema', () => {
       expect(error).toBeUndefined();
     });
 
-    it('accepts missing OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is false', () => {
+    it('still requires OPS_CHANNEL_PHONE when the removed HUMAN_HANDOFF_ENABLED=false is set', () => {
       const env: Record<string, string> = {
         ...validEnv,
         HUMAN_HANDOFF_ENABLED: 'false',
@@ -463,58 +460,11 @@ describe('envValidationSchema', () => {
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
       });
-      expect(error).toBeUndefined();
-    });
-
-    it('applies HUMAN_HANDOFF_ENABLED default true when absent', () => {
-      const env: Record<string, string> = { ...validEnv };
-      delete env.OPS_CHANNEL_PHONE;
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      // Default is true so missing OPS_CHANNEL_PHONE is rejected.
       expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('OPS_CHANNEL_PHONE')),
+      ).toBe(true);
     });
-  });
-
-  // ─── WU2A: experimental human-decisions RESTOCK gate ──────────────────
-  describe('HUMAN_DECISIONS_RESTOCK_ENABLED', () => {
-    const validate = (value: string | undefined) => {
-      const env: Record<string, string | undefined> = { ...validEnv };
-      if (value === undefined) {
-        delete env.HUMAN_DECISIONS_RESTOCK_ENABLED;
-      } else {
-        env.HUMAN_DECISIONS_RESTOCK_ENABLED = value;
-      }
-      return envValidationSchema.validate(env, { abortEarly: false });
-    };
-
-    it('accepts an absent value and defaults it to "false"', () => {
-      const result = validate(undefined);
-      expect(result.error).toBeUndefined();
-      const value = result.value as {
-        HUMAN_DECISIONS_RESTOCK_ENABLED?: unknown;
-      };
-      expect(value.HUMAN_DECISIONS_RESTOCK_ENABLED).toBe('false');
-    });
-
-    it('accepts the exact strings "true" and "false"', () => {
-      expect(validate('true').error).toBeUndefined();
-      expect(validate('false').error).toBeUndefined();
-    });
-
-    it.each(['TRUE', 'True', '1', '0', 'yes', '', 'true '])(
-      'rejects the ambiguous value %p so activation stays unambiguous',
-      (value) => {
-        const { error } = validate(value);
-        expect(error).toBeDefined();
-        expect(
-          error?.details.some((d) =>
-            d.path.includes('HUMAN_DECISIONS_RESTOCK_ENABLED'),
-          ),
-        ).toBe(true);
-      },
-    );
   });
 
   describe('META_SANDBOX_RECIPIENT_NORMALIZATION', () => {

@@ -109,7 +109,7 @@ describe('runLaunchPreflight', () => {
     const missing = safeEnv();
     delete missing.RECEIPT_MEDIA_INGESTION_ENABLED;
     const nonExact = safeEnv();
-    nonExact.HUMAN_HANDOFF_ENABLED = 'TRUE';
+    nonExact.META_SANDBOX_RECIPIENT_NORMALIZATION = 'FALSE';
     const wrong = safeEnv();
     wrong.RECEIPT_MEDIA_ENABLED = 'true';
 
@@ -123,7 +123,8 @@ describe('runLaunchPreflight', () => {
     ).toBe('missing');
     expect(
       run(nonExact).posture.find(
-        (c: { name: string }) => c.name === 'HUMAN_HANDOFF_ENABLED',
+        (c: { name: string }) =>
+          c.name === 'META_SANDBOX_RECIPIENT_NORMALIZATION',
       )?.status,
     ).toBe('unsafe');
     expect(
@@ -146,6 +147,32 @@ describe('runLaunchPreflight', () => {
     expect(report.failures).toContainEqual({
       area: 'migration',
       name: '2000000000000_receipt_media.js',
+      status: 'missing_on_disk',
+    });
+  });
+
+  it('does not check the removed HUMAN_HANDOFF_ENABLED posture', () => {
+    const env = safeEnv();
+    delete env.HUMAN_HANDOFF_ENABLED;
+    const report = run(env);
+    expect(report.ok).toBe(true);
+    expect(
+      report.posture.some(
+        (c: { name: string }) => c.name === 'HUMAN_HANDOFF_ENABLED',
+      ),
+    ).toBe(false);
+  });
+
+  it('fails when a human-decision migration is absent from disk', () => {
+    const name = '3100000000000_customer_inbound_observations.js';
+    const report = run(
+      safeEnv(),
+      REQUIRED_MIGRATIONS.filter((m: string) => m !== name),
+    );
+    expect(report.ok).toBe(false);
+    expect(report.failures).toContainEqual({
+      area: 'migration',
+      name,
       status: 'missing_on_disk',
     });
   });

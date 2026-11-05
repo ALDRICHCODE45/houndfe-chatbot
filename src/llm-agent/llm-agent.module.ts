@@ -221,32 +221,27 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         CHATBOT_API_CLIENT,
         SHARED_RESERVATION,
         ExpirationPostOrchestrator,
-        ConfigService,
       ],
       useFactory: (
         chatbotApi: ChatbotApiClient,
         reservations: SharedReservationPort,
         orchestrator: ExpirationPostOrchestrator,
-        config: ConfigService,
       ) =>
         new MinimalExpirationRequestService({
           chatbotApi,
           reservations,
           orchestrator,
-          enabled:
-            config.get<{ expirationEnabled: boolean }>('minimalCatalogAgent')
-              ?.expirationEnabled === true,
+          // Human decisions are always on.
+          enabled: true,
         }),
     },
     {
-      // WU-B: the RESTOCK confirmation gate. The capability is built ONLY when
-      // `humanDecisions.restockEnabled` is exactly true; otherwise it is
-      // `undefined` and the read-only route stays byte-identical.
+      // WU-B: the RESTOCK confirmation gate. Human decisions are always on,
+      // so the capability is always built.
       provide: MinimalRestockRequestService,
       inject: [
         CHATBOT_API_CLIENT,
         CONVERSATION_STORE,
-        ConfigService,
         SHARED_ROUTE_MARKERS,
         RESTOCK_INTAKE_SERVICE,
         RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
@@ -255,7 +250,6 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
       useFactory: (
         chatbotApi: ChatbotApiClient,
         store: ConversationStore,
-        config: ConfigService,
         markers: SharedRouteMarkersPort,
         coordinator: RestockIntakeService,
         recovery: RestockExistingRequestStatusService,
@@ -264,17 +258,13 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         new MinimalRestockRequestService({
           chatbotApi,
           store,
-          restock:
-            config.get<boolean>('humanDecisions.restockEnabled') === true
-              ? {
-                  enabled: true,
-                  markers,
-                  coordinator,
-                  recovery,
-                  reconcileExpired: (senderId) =>
-                    runtime.reconcileExpired(senderId),
-                }
-              : undefined,
+          restock: {
+            enabled: true,
+            markers,
+            coordinator,
+            recovery,
+            reconcileExpired: (senderId) => runtime.reconcileExpired(senderId),
+          },
         }),
     },
   ],

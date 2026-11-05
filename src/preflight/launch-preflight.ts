@@ -61,7 +61,6 @@ export const POSTURE_EXPECTATIONS: readonly {
   expected: PostureValue;
 }[] = [
   { name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' },
-  { name: 'HUMAN_HANDOFF_ENABLED', expected: 'true' },
   { name: 'RECEIPT_MEDIA_ENABLED', expected: 'false' },
   { name: 'RECEIPT_MEDIA_INGESTION_ENABLED', expected: 'false' },
   { name: 'RECEIPT_MEDIA_METRICS_ENABLED', expected: 'false' },
@@ -82,6 +81,16 @@ export const REQUIRED_MIGRATIONS = [
   '2000000000000_receipt_media.js',
   '2100000000000_receipt_media_cancellation_commands.js',
   '2200000000000_receipt_media_capability_string_versions.js',
+  // Human decisions are always on, so their ledgers are required.
+  '2300000000000_human_decision_reservations.js',
+  '2400000000000_restock_intake_post_ledger.js',
+  '2500000000000_restock_application_ledger.js',
+  '2600000000000_restock_inbound_evidence.js',
+  '2700000000000_expiration_reservations.js',
+  '2800000000000_expiration_post_ledger.js',
+  '2900000000000_expiration_application_ledger.js',
+  '3000000000000_expiration_application_ack.js',
+  '3100000000000_customer_inbound_observations.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
