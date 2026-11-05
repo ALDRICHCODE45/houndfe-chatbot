@@ -11,13 +11,13 @@ and reacts to the backend's payment outcome.
 
 ## Options researched (2026-11-05, web research, not contract-verified)
 
-| Option | API to create a link per order | Payment confirmation | Difficulty |
-|---|---|---|---|
+| Option                                                 | API to create a link per order                                                                                     | Payment confirmation                                                                           | Difficulty                                                                                               |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | EVO Payments México ("EVO Click" is the manual portal) | Yes, through the EVO payment engine on Mastercard Gateway: `INITIATE_CHECKOUT` with `checkoutMode: "PAYMENT_LINK"` | Webhooks with `X-Notification-Secret`, documented as not guaranteed: poll Retrieve Transaction | Medium-high: needs an EVO affiliation contract plus the e-commerce annex, no Node SDK, fees not verified |
-| Mercado Pago Checkout Pro | Yes: `POST /checkout/preferences` returns the payment URL | Webhooks, sandbox available | Easy |
-| Stripe Payment Links (Mexico) | Yes | Webhooks | Easy |
-| Conekta | Yes: `POST /checkouts` | Webhooks | Easy-medium |
-| Clip, Openpay | Yes (redirect checkout / payment button) | Webhooks | Medium |
+| Mercado Pago Checkout Pro                              | Yes: `POST /checkout/preferences` returns the payment URL                                                          | Webhooks, sandbox available                                                                    | Easy                                                                                                     |
+| Stripe Payment Links (Mexico)                          | Yes                                                                                                                | Webhooks                                                                                       | Easy                                                                                                     |
+| Conekta                                                | Yes: `POST /checkouts`                                                                                             | Webhooks                                                                                       | Easy-medium                                                                                              |
+| Clip, Openpay                                          | Yes (redirect checkout / payment button)                                                                           | Webhooks                                                                                       | Medium                                                                                                   |
 
 Recommendation: unless EVO is required by the business's bank or fees, Mercado
 Pago is the fastest path.
