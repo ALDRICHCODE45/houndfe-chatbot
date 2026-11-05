@@ -70,6 +70,8 @@ export const MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY =
   'No puedo identificar un registro único para su teléfono. Por favor comuníquese con la tienda para revisar su pedido.';
 export const MINIMAL_ORDER_REJECTED_REPLY =
   'No se pudo crear el pedido. Puede revisar su carrito y pedir de nuevo el resumen cuando quiera.';
+export const MINIMAL_ORDER_VARIANT_CHANGED_REPLY =
+  'Las presentaciones de un producto de su carrito cambiaron y no pude crear el pedido así; no se creó ningún pedido. Revise su carrito, elija de nuevo la presentación de ese producto o quítelo, y pida otra vez el resumen.';
 export const MINIMAL_ORDER_HELD_REPLY =
   'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo; por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_UNRESOLVED_REPLY =
@@ -84,6 +86,12 @@ const PAYMENT_UNAVAILABLE_REPLY =
  * already saw this key with another payload, so a sale may exist under it.
  */
 const ROTATING_ERROR_CODES: ReadonlySet<string> = new Set(['PROMO_RE_QUOTE']);
+/** The item no longer matches the product's current variants; nothing was written. */
+const VARIANT_REJECTION_CODES: ReadonlySet<string> = new Set([
+  'BOT_ITEM_VARIANT_REQUIRED',
+  'BOT_ITEM_VARIANT_NOT_ALLOWED',
+  'BOT_ITEM_VARIANT_MISMATCH',
+]);
 const KEEPING_ERROR_CODES: ReadonlySet<string> = new Set([
   'IDEMPOTENCY_KEY_IN_FLIGHT',
   'IDEMPOTENCY_KEY_CONFLICT',
@@ -602,6 +610,13 @@ export class MinimalOrderService {
       await this.commitCart(senderId, stored, unkeyed);
       if (ambiguousPhone) return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
       if (addressRejected) return MINIMAL_CHECKOUT_RESELECT_REPLY;
+      if (
+        error instanceof ChatbotApiError &&
+        error.errorCode !== null &&
+        VARIANT_REJECTION_CODES.has(error.errorCode)
+      ) {
+        return MINIMAL_ORDER_VARIANT_CHANGED_REPLY;
+      }
       return MINIMAL_ORDER_REJECTED_REPLY;
     }
     if (!isSale(sale)) return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;

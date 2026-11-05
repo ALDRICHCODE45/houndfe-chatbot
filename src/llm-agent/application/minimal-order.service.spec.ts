@@ -26,6 +26,7 @@ import {
   MINIMAL_ORDER_REJECTED_REPLY,
   MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_UNRESOLVED_REPLY,
+  MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
@@ -1791,6 +1792,33 @@ describe('MinimalOrderService', () => {
       idempotencyKey: '',
     });
   });
+
+  it.each([
+    ['legacy', 'BOT_ITEM_VARIANT_REQUIRED'],
+    ['legacy', 'BOT_ITEM_VARIANT_NOT_ALLOWED'],
+    ['legacy', 'BOT_ITEM_VARIANT_MISMATCH'],
+    ['atomic', 'BOT_ITEM_VARIANT_REQUIRED'],
+    ['atomic', 'BOT_ITEM_VARIANT_NOT_ALLOWED'],
+    ['atomic', 'BOT_ITEM_VARIANT_MISMATCH'],
+  ])(
+    '%s %s asks to choose the presentation again and rotates the key',
+    async (mode, code) => {
+      const h = setup({ atomic: mode === 'atomic' });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await offerOrder(h);
+      const rejection = new ChatbotApiError(code, 422, { error: code }, code);
+      const call = mode === 'atomic' ? h.api.createCheckout : h.api.createSale;
+      call.mockRejectedValueOnce(rejection);
+      expect(await yes(h)).toEqual({
+        reply: MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
+      });
+      expect(await h.minimalCart()).toMatchObject({
+        items: [{ productId: PRODUCT, quantity: 2 }],
+        idempotencyKey: '',
+      });
+    },
+  );
 
   it('preserves the key while the backend reports the sale in flight', async () => {
     const h = setup();
