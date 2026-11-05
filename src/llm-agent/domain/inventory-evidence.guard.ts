@@ -27,7 +27,6 @@ export const MUTATING_TOOL_NAMES = [
   'updateDelivery',
   'cancelSale',
   'requestHumanAssistance',
-  'getShippingQuote',
 ] as const;
 
 /** Tools that never change persisted business state. */

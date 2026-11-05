@@ -54,10 +54,8 @@ export type RequestHumanAssistanceRestockResult =
  *   - `needs_human_review` (promo) — backend flagged promo for review
  *   - `expiration_date`    (R14)  — customer asked about fechas de caducidad
  *
- * `shipping_approval` is RESERVED for the future R6 slice; the union
- * does NOT include it today, so the schema layer rejects it before
- * `execute`. The R6 slice will extend the union without breaking this
- * contract.
+ * Any other kind (including the removed `shipping_approval`) is rejected
+ * by the schema layer before `execute`.
  *
  * `contextSchema: { senderId, inboundEvent? }` — the AI-SDK supplies the
  * senderId through `toolsContext.requestHumanAssistance.senderId` (see

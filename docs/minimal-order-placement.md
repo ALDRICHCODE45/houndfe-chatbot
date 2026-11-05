@@ -2,7 +2,7 @@
 
 `MinimalOrderService` lets any WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
 
-It is **always on**: the minimal route serves every sender and always exposes `prepareOrder`. Optional [minimal shipping](minimal-shipping.md) binds a backend-signed shipping quote or a store pickup choice. Placement always goes through the backend [atomic checkout](#atomic-checkout) (`POST /chatbot-api/checkouts`); production shipping prerequisites remain unresolved.
+It is **always on**: the minimal route serves every sender and always exposes `prepareOrder`. Every order needs [minimal shipping](minimal-shipping.md) (always on): a backend-signed shipping quote or a store pickup choice. Placement always goes through the backend [atomic checkout](#atomic-checkout) (`POST /chatbot-api/checkouts`).
 
 ## Requirements
 
@@ -31,7 +31,7 @@ This route never calls customer upsert or separate address mutations.
    - the confirmed delivery data still equals the current draft, byte for byte;
    - a saved address still has the same `version` upstream (a new address is bound to its exact confirmed fields instead);
    - prices and stock come from a new cart evaluation.
-3. If delivery is unconfirmed, the server reuses the delivery-confirmation service in this same turn: it shows the delivery data (including any interior number), lists missing fields, or explains how to select/enter an address. A strict `SÍ` after that **sent delivery summary** confirms delivery only; the customer is then told to say «hacer pedido» for the order summary. Otherwise, the server replies with its own order summary: items, product total, delivery address and "shipping not included" when shipping is off. With [minimal shipping](minimal-shipping.md) enabled, a current quote or a store pickup choice is required: the summary shows carrier, customer charge, credit and ETA plus the total, or "Recoge en tienda (sin costo de envío)" for pickup. Without either, the reply asks the customer to quote shipping for the confirmed address or choose store pickup. The order summary ends with `Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.` It is armed only after the transport sends it.
+3. If delivery is unconfirmed, the server reuses the delivery-confirmation service in this same turn: it shows the delivery data (including any interior number), lists missing fields, or explains how to select/enter an address. A strict `SÍ` after that **sent delivery summary** confirms delivery only; the customer is then told to say «hacer pedido» for the order summary. Otherwise, the server replies with its own order summary: items, product total and delivery address. A current quote or a store pickup choice is always required ([minimal shipping](minimal-shipping.md)): the summary shows carrier, customer charge, credit and ETA plus the total, or "Recoge en tienda (sin costo de envío)" for pickup. Without either, the reply asks the customer to quote shipping for the confirmed address or choose store pickup. The order summary ends with `Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.` It is armed only after the transport sends it.
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
@@ -41,7 +41,7 @@ Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from t
 
 ## Duplicate protection
 
-The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/checkouts`, together with a SHA-256 fingerprint of the exact checkout payload (phone, customer, delivery address, expected total, items and the shipping member: `{quoteId}` for a backend-signed quote, `{mode: "pickup"}` for store pickup, or absent). The backend computes the freight from the quote; the expected total is the product total plus the quoted customer charge.
+The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/checkouts`, together with a SHA-256 fingerprint of the exact checkout payload (phone, customer, delivery address, expected total, items and the shipping member: `{quoteId}` for a backend-signed quote, `{mode: "pickup"}` for store pickup). The backend computes the freight from the quote; the expected total is the product total plus the quoted customer charge.
 
 | Backend outcome                                                                                                                     | Key                   | Reply                                                                                       |
 | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------- |
@@ -88,7 +88,7 @@ The lock ends only with a confirmed sale, or with a definite rejection of the fi
 
 ## Reply priority in one SDK run
 
-EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.
+EXPIRATION > RESTOCK > checkout, order or shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.
 
 Blocked replies name the next action: retry the order/cart review, add products, select a saved address, supply missing fields, request a shipping quote or choose store pickup, or contact the store where human review/registration is required. These wording changes do not alter eligibility, shipping freshness, consent, or idempotency gates.
 
@@ -96,7 +96,7 @@ Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confi
 
 ## Not in this slice
 
-- Backend shipping quotes and charges are a separate default-off capability: [minimal shipping](minimal-shipping.md).
+- Backend shipping quotes and store pickup: [minimal shipping](minimal-shipping.md).
 - Customer and address creation outside an order. New customers and new addresses are created only by the atomic checkout together with the order; see [atomic checkout](#atomic-checkout).
 - Order cancellation from the minimal route.
 

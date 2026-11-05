@@ -1,20 +1,16 @@
 # Minimal home-delivery shipping
 
-This minimal SDK capability is **off by default**. The backend quotes shipping
+This minimal SDK capability is **always on** (no feature flag). The backend quotes shipping
 (`POST /chatbot-api/shipping/quotes`): it picks the cheapest carrier, applies
 the shipping credit and signs a `quoteId` that expires. The chatbot shows the
 backend's amounts verbatim and sends that `quoteId` on checkout. There is no
 per-quote human approval. The customer can also choose store pickup.
 
-## Enable only in controlled test environments
+## Configuration
 
-The minimal route and order capability are always on (see [minimal order placement](minimal-order-placement.md)); they need the bot cashier. Then configure:
+Nothing to enable. The minimal route and order capability are always on (see [minimal order placement](minimal-order-placement.md)) and need the bot cashier; the minimal tools (`requestShippingQuote`, `chooseStorePickup`) are exposed whenever the order capability is available. The chatbot holds no carrier credentials: `SHIPPING_QUOTES_ENABLED`, `MINIMAL_CATALOG_SHIPPING_ENABLED`, `SHIPPING_DEMO_PARCEL_PROFILE_JSON` and every `SKYDROPX_*` variable were removed and have no effect if still set.
 
-| Variable                           | Value / requirement                     |
-| ---------------------------------- | --------------------------------------- |
-| `MINIMAL_CATALOG_SHIPPING_ENABLED` | Exact `true`; every other value is off. |
-
-Restart after changing the gate. The minimal tools (`requestShippingQuote`, `chooseStorePickup`) are exposed only when its gate, service and order capability are available. Gate off adds no shipping tool or instruction fragment. The Skydropx provider, measured parcel profile and `SHIPPING_QUOTES_ENABLED` are no longer used by the minimal route (task U6 removes them and their preflight checks).
+The service credential needs access to `POST /chatbot-api/shipping/quotes`; its scope is still to be published by the backend (preflight lists it as `TBD by backend`).
 
 ## Customer flow
 
@@ -30,6 +26,7 @@ Restart after changing the gate. The minimal tools (`requestShippingQuote`, `cho
    | `PENDING` (S5)                             | “Estamos validando la entrega a su código postal {CP}. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.”                           |
    | `DENIED` (S4)                              | “Por ahora no tenemos entrega a su código postal {CP}. Puede recoger su pedido en tienda sin costo de envío. ¿Le parece?”                                                                     |
    | packaging data missing / quote unavailable | honest explanation without any amount; try again later or pick up in store                                                                                                                    |
+   | refused (cart, address or order state)     | one customer sentence per reason (for example “Antes de cotizar el envío necesito que confirme sus datos de entrega.”); internal reason codes never reach the customer                        |
 
    ETA line: “Llega en aproximadamente N días hábiles” from the backend `eta.days` (or `option.etaDays`); with `eta.reason = STOCK_PENDING` (S7): “La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.” No line when the backend gives no ETA.
 
@@ -58,7 +55,6 @@ Shipping shares the one-presentation-per-SDK-run slot with delivery confirmation
 - The checkout sends `sale.shipping = {quoteId}` and `expectedTotalCents = products + customerChargeCents`; the quote id and charge are part of the order fingerprint, so a requote spends consent and re-presents the summary.
 - Checkout rejections (S6) create nothing and rotate the key on a first attempt. `SHIPPING_QUOTE_EXPIRED` and `SHIPPING_QUOTE_MISMATCH` trigger one automatic re-quote and present the updated summary for a fresh `SÍ` (if the re-quote is not deliverable, the customer is asked to quote shipping again). `SHIPPING_QUOTE_NOT_FOUND`, `PACKAGING_DATA_MISSING` and a 4xx `SHIPPING_QUOTE_UNAVAILABLE` get their own replies; a 5xx stays an uncertain outcome that keeps the key.
 - A delivery order without a current quote or pickup choice gets: “Antes del resumen necesito saber cómo recibirá su pedido: dígame «cotizar envío» … o «recoger en tienda» …”.
-- Legacy records with an `approval` sub-object still parse but never back an order (task U5 deletes the approval flow).
 
 ## Not ready for production
 

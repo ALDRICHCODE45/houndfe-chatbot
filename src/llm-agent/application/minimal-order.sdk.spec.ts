@@ -1,3 +1,5 @@
+import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
+import { MinimalShippingService } from './minimal-shipping.service';
 import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -140,10 +142,6 @@ function setup(
   const client = api as unknown as ChatbotApiClient;
   const config = {
     get: (key: string) => {
-      if (key === 'minimalCatalogAgent')
-        return {
-          shippingEnabled: options.shipping === true,
-        };
       if (key === 'chatbotApi.cashierUserId') return CASHIER;
       return { model: 'm', maxSteps: 5, historyTurns: 12 };
     },
@@ -170,7 +168,20 @@ function setup(
   };
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
-  const order = new MinimalOrderService(client, store, cart, checkout, config);
+  const shipping = new MinimalShippingService(
+    store,
+    cart,
+    checkout,
+    new FakeShippingQuoteClient(),
+  );
+  const order = new MinimalOrderService(
+    client,
+    store,
+    cart,
+    checkout,
+    config,
+    shipping,
+  );
   const agent = new MinimalCatalogAgentService(
     client,
     generate,
@@ -196,6 +207,17 @@ function setup(
             items: [{ productId: PRODUCT, quantity: 1, unitPriceCents: 1500 }],
             idempotencyKey: '',
             expectedTotalCents: 1500,
+            shipping: {
+              mode: 'pickup',
+              cartPin: [
+                {
+                  productId: PRODUCT,
+                  quantity: 1,
+                  unitPriceCents: 1500,
+                  finalPriceCents: 1500,
+                },
+              ],
+            },
           },
         },
       }),
@@ -256,7 +278,21 @@ function setup(
                     ],
                   },
                 }
-              : {}),
+              : {
+                  // Shipping is always on: without a delivery quote the
+                  // order uses store pickup.
+                  shipping: {
+                    mode: 'pickup',
+                    cartPin: [
+                      {
+                        productId: PRODUCT,
+                        quantity: 2,
+                        unitPriceCents: 1500,
+                        finalPriceCents: 3000,
+                      },
+                    ],
+                  },
+                }),
           },
         },
       });

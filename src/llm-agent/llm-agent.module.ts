@@ -45,7 +45,7 @@ import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.
 import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
-import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
+import { TOOL_REGISTRY } from './domain/tool-registry.port';
 import {
   GENERATE_TEXT,
   generateTextImpl,
@@ -53,24 +53,6 @@ import {
 } from './infrastructure/generate-text.provider';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
 import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instructions';
-
-/**
- * Fail-closed probe for the SQ-5C3d2 boot-time availability binding.
- *
- * Returns `true` only when the real registry exposes `getShippingQuote` as
- * an OWN key of the ToolSet — an inherited key, a non-object `getTools()`
- * result, a throwing `getTools`, and a hostile proxy that throws on
- * property inspection all resolve to `false`.
- */
-function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
-  try {
-    const tools = registry.getTools();
-    if (tools === null || typeof tools !== 'object') return false;
-    return Object.hasOwn(tools, 'getShippingQuote');
-  } catch {
-    return false;
-  }
-}
 
 /**
  * LlmAgentModule
@@ -87,13 +69,6 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
  * runtime `getPaymentDetails` AI-SDK tool (registered by RealToolRegistry)
  * is the source of truth. `LLM_AGENT_SYSTEM_PROMPT` is still a sync
  * `useFactory`, now injecting the TOOL_REGISTRY seam.
- *
- * SQ-5C3d2: the `shippingQuoteAvailable` flag is derived at boot from the
- * ACTUAL registered tool key, never from env alone. The factory injects
- * TOOL_REGISTRY (already `useExisting: RealToolRegistry` from SaleFlowModule,
- * no DI cycle) and appends the opt-in shipping fragment only when the
- * registry owns `getShippingQuote`. Default-off composes the exact
- * byte-identical `base + '\n\n' + slice`.
  *
  * SaleFlowModule is imported so RealToolRegistry is reachable.
  * ChatbotApiModule is imported for parity (CHATBOT_API_CLIENT is injected
@@ -141,17 +116,8 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
       // AgentRunner injects the resolved string and never overrides it
       // per turn. The boot-time bank-details seam is gone — the runtime
       // `getPaymentDetails` tool is the source of truth.
-      //
-      // SQ-5C3d2: shipping availability is derived from the registered
-      // tool key (fail-closed on inherited/hostile registries), so the
-      // opt-in fragment is appended only when `getShippingQuote` is
-      // actually wired.
       provide: LLM_AGENT_SYSTEM_PROMPT,
-      inject: [TOOL_REGISTRY],
-      useFactory: (registry: ToolRegistry) =>
-        composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
-          shippingQuoteAvailable: registryOwnsShippingQuote(registry),
-        }),
+      useFactory: () => composeSaleFlowSystemPrompt(SYSTEM_PROMPT),
     },
     {
       provide: CostGuardService,
@@ -174,24 +140,20 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     MinimalCheckoutService,
     MinimalOrderService,
     {
+      // Always on: backend-signed quotes back every delivery order (S9).
       provide: MinimalShippingService,
       inject: [
         CONVERSATION_STORE,
         MinimalCartService,
         MinimalCheckoutService,
-        ConfigService,
         CHATBOT_API_CLIENT,
       ],
       useFactory: (
         store: ConversationStore,
         cart: MinimalCartService,
         checkout: MinimalCheckoutService,
-        config: ConfigService,
         api: ChatbotApiClient,
-      ) =>
-        config.get<boolean>('minimalCatalogAgent.shippingEnabled') === true
-          ? new MinimalShippingService(store, cart, checkout, api)
-          : undefined,
+      ) => new MinimalShippingService(store, cart, checkout, api),
     },
     {
       provide: MinimalExpirationRequestService,

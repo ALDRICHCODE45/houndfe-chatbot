@@ -41,8 +41,8 @@ RECEIPT_RECORDED | UNKNOWN`. Un resultado ambiguo queda en **espera**, nunca
 5. **(50 s) Simulación honesta.** "El POST al backend es **falso**; la base es
    PostgreSQL **desechable** con Testcontainers (`postgres:16-alpine`). Prueba la
    ruta durable, no un backend real."
-6. **(30 s) Segundo caso y evidencia.** Envío (otra rama): `SHIPPING_APPROVAL`
-   (aprobar/rechazar/expirado), offline. Backend: evidencia separada. Frontend:
+6. **(30 s) Segundo caso y evidencia.** Envío: hoy lo cotiza el backend (quoteId
+   firmado, sin aprobación humana por cotización). Backend: evidencia separada. Frontend:
    bandeja POS sintética lista→detalle→resolución, **sin HTTP**.
 7. **(30 s) Cierre.** "El preflight y el coordinador no están conectados entre sí
    ni al webhook; la resolución del POS simulado tampoco notifica al cliente.
@@ -124,13 +124,11 @@ seco 15 kg`, SKU `ALIM-15KG-DEMO`, cantidad 2 y stock observado 0. El
   se inicia desde su propio worktree con `pnpm demo:human-decisions:offline`
   **solo si el puerto 4173 está libre**, sin detener servidores ajenos. No
   confirma una decisión en el backend ni envía un WhatsApp.
-- **Shipping `116ce03` — PROBADO OFFLINE · OTRA RAMA:** **sí** implementa la
-  resolución humana `SHIPPING_APPROVAL` (aprobar/rechazar/expirado) en una rama
-  aparte, con cotización y aceptación del cliente codificadas; offline, con HTTP
-  simulado (nunca llama al proveedor). Límites: `SHIPPING_QUOTES_ENABLED=false`,
-  el ruteo SÍ/NO **no** está conectado al webhook y la resolución de colisión
-  (`CANCEL_SHIPPING`/`CANCEL_RECEIPT`) **no** está implementada. Rama separada,
-  **no** integrada con RESTOCK.
+- **Shipping — REEMPLAZADO:** la rama `116ce03` (aprobación humana
+  `SHIPPING_APPROVAL`, cotización Skydropx en el chatbot) fue retirada. Hoy el
+  backend elige la paquetería más barata, calcula el crédito y firma un
+  `quoteId` con vencimiento; el chatbot solo lo muestra y lo envía en el
+  checkout (ver `docs/minimal-shipping.md`).
 
 ## Pendiente (PLANNED)
 

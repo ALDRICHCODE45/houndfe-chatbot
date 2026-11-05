@@ -233,29 +233,17 @@
       </tbody>
     </table>
 
-    <h2>Caso 2 · Envío (shipping) — otra rama</h2>
+    <h2>Caso 2 · Envío (shipping)</h2>
     <div class="card">
-      <span class="tag done">PROBADO OFFLINE · OTRA RAMA</span>
+      <span class="tag done">REEMPLAZADO</span>
       <p>
-        <b>Shipping <code>116ce03</code>.</b> Resolución humana
-        <code>SHIPPING_APPROVAL</code> (aprobar / rechazar / expirado)
-        implementada y probada offline; cotización y aceptación del cliente
-        codificadas. Todo con HTTP simulado (nunca llama al proveedor).
+        <b>Shipping <code>116ce03</code> retirado.</b> La aprobación humana
+        por cotización y la cotización Skydropx en el chatbot ya no existen.
+        El backend elige la paquetería más barata, calcula el crédito y firma
+        un <code>quoteId</code> con vencimiento; el chatbot lo muestra tal
+        cual y lo envía en el checkout. El cliente también puede recoger en
+        tienda.
       </p>
-      <ul>
-        <li>
-          <b>No integrado:</b> el ruteo de respuestas SÍ/NO <b>no</b> está
-          conectado al webhook.
-        </li>
-        <li>
-          <b>No implementado:</b> resolución de colisión
-          (<code>CANCEL_SHIPPING</code>/<code>CANCEL_RECEIPT</code>).
-        </li>
-        <li>
-          <b>Default-off:</b> <code>SHIPPING_QUOTES_ENABLED=false</code>; no
-          corre desde aquí.
-        </li>
-      </ul>
     </div>
 
     <h2>Evidencia separada (reportada, no ejecutada aquí)</h2>

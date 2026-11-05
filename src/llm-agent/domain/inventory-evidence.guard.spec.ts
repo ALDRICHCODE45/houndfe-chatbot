@@ -69,7 +69,7 @@ const search: InventoryCallEvidence = {
 };
 
 describe('inventory tool classification', () => {
-  it('freezes the seven mutating and six non-mutating names', () => {
+  it('freezes the six mutating and six non-mutating names', () => {
     expect([...MUTATING_TOOL_NAMES]).toEqual([
       'evaluateCart',
       'upsertCustomer',
@@ -77,7 +77,6 @@ describe('inventory tool classification', () => {
       'updateDelivery',
       'cancelSale',
       'requestHumanAssistance',
-      'getShippingQuote',
     ]);
     expect([...NON_MUTATING_TOOL_NAMES]).toEqual([
       'searchCatalog',

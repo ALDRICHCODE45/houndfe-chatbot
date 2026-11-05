@@ -10,7 +10,6 @@ import {
 import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { MinimalShippingService } from './minimal-shipping.service';
 import {
-  buildMinimalShipping,
   minimalShippingDestination,
   type MinimalShippingQuote,
 } from '../domain/minimal-shipping';
@@ -104,6 +103,7 @@ const placedSale = () => ({
 function setup(
   options: {
     cashier?: string;
+    /** Delivery-quote tests; every other test seeds store pickup (S9). */
     shipping?: boolean;
     now?: () => number;
   } = {},
@@ -175,10 +175,6 @@ function setup(
   const client = api as unknown as ChatbotApiClient;
   const config = {
     get: (key: string) => {
-      if (key === 'minimalCatalogAgent')
-        return {
-          shippingEnabled: options.shipping === true,
-        };
       if (key === 'chatbotApi.cashierUserId') return options.cashier ?? CASHIER;
       return undefined;
     },
@@ -193,8 +189,8 @@ function setup(
     cart,
     checkout,
     config,
+    shipping,
     options.now,
-    options.shipping === true ? shipping : undefined,
   );
   return {
     store,
@@ -215,6 +211,21 @@ function setup(
             items: [{ productId: PRODUCT, quantity, unitPriceCents: 1500 }],
             idempotencyKey: '',
             expectedTotalCents: 1500 * quantity,
+            ...(options.shipping === true
+              ? {}
+              : {
+                  shipping: {
+                    mode: 'pickup',
+                    cartPin: [
+                      {
+                        productId: PRODUCT,
+                        quantity,
+                        unitPriceCents: 1500,
+                        finalPriceCents: 1500 * quantity,
+                      },
+                    ],
+                  },
+                }),
           },
           cart: { legacy: 'preserved' },
         },
@@ -1222,7 +1233,6 @@ describe('minimal shipping order safety', () => {
     'cart',
     'address',
     'version',
-    'legacy',
   ] as const)(
     '[S2] refuses %s shipping before summary and sale',
     async (state) => {
@@ -1265,39 +1275,6 @@ describe('minimal shipping order safety', () => {
             version: '2026-10-02T00:00:00.000Z',
           },
         };
-      if (state === 'legacy') {
-        const createdAt = new Date().toISOString();
-        const legacy = buildMinimalShipping({
-          quote: {
-            kind: 'quoted',
-            quoteId: 'quote-1',
-            expiresAt: null,
-            rates: [
-              {
-                rateId: 'rate-1',
-                carrierName: 'Carrier',
-                serviceName: 'Ground',
-                priceCents: 5000,
-                currency: 'MXN',
-                estimatedDeliveryDays: 2,
-                validUntil: null,
-              },
-            ],
-          },
-          cartLines: record.cartPin,
-          addressId: ADDRESS,
-          addressVersion: savedAddress().version,
-          createdAt,
-        })!;
-        next.shipping = {
-          ...legacy,
-          approval: {
-            state: 'approved',
-            requestId: 'approval-1',
-            decidedAt: createdAt,
-          },
-        };
-      }
       await h.store.commitMinimalCart(
         SENDER,
         raw,
@@ -1398,6 +1375,8 @@ describe('MinimalOrderService', () => {
       expectedTotalCents: 1500,
     });
     await confirmSavedDelivery(h);
+    // The customer price changed the lines, so store pickup is re-chosen.
+    await h.shipping.chooseStorePickup(SENDER);
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('2 × $8.00 MXN');
     expect(offer.reply).toContain('Total de productos: $15.00 MXN');
@@ -1422,6 +1401,7 @@ describe('MinimalOrderService', () => {
           unitPriceCents: 800,
         },
       ],
+      shipping: { mode: 'pickup' },
     };
     expect(h.api.createCheckout).toHaveBeenCalledWith(
       expect.objectContaining({ sale: expectedSale }),
@@ -1471,6 +1451,7 @@ describe('MinimalOrderService', () => {
           unitPriceCents: 1500,
         },
       ],
+      shipping: { mode: 'pickup' as const },
     };
     const expectedPayload = CreateCheckoutInputSchema.parse({
       phoneCountryCode: '52',
@@ -1486,6 +1467,28 @@ describe('MinimalOrderService', () => {
     const fingerprint = createHash('sha256')
       .update(JSON.stringify(expectedPayload))
       .digest('hex');
+    // The promotion changed the line totals, so the store pickup choice is
+    // pinned to the discounted lines.
+    const raw = await h.minimalCart();
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...(raw as object),
+        shipping: {
+          mode: 'pickup',
+          cartPin: [
+            {
+              productId: PRODUCT,
+              quantity: 2,
+              unitPriceCents: 1500,
+              finalPriceCents: 2700,
+            },
+          ],
+        },
+      },
+      new Date().toISOString(),
+    );
     for (const attempt of [1, 2]) {
       const offer = await offerOrder(h, `promo-offer-${attempt}`);
       expect(offer.reply).toContain(
@@ -1547,6 +1550,7 @@ describe('MinimalOrderService', () => {
             unitPriceCents: 1500,
           },
         ],
+        shipping: { mode: 'pickup' },
       },
     });
     expect(key).toMatch(UUID);
@@ -1598,10 +1602,10 @@ describe('MinimalOrderService', () => {
     await confirmSavedDelivery(h);
     await offerOrder(h);
     h.setPrice(1600);
-    const result = await yes(h);
-    expect(result?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
-    expect(result?.reply).toContain('Total de productos: $32.00 MXN');
-    expect(result?.onSent).toEqual(expect.any(Function));
+    // A price change invalidates the pinned pickup choice like a quote, so
+    // the customer must choose how to receive the order again (freight
+    // changes re-present via MINIMAL_ORDER_CHANGED_REPLY, see S4 above).
+    expect((await yes(h))?.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
@@ -1696,10 +1700,12 @@ describe('MinimalOrderService', () => {
           promotionEvaluationStatus: 'fully_evaluated',
         }),
     );
-    await offerOrder(h, 'wamid.o3');
-    expect(await yes(h, 'wamid.o4')).toEqual({
-      reply: MINIMAL_ORDER_HELD_REPLY,
-    });
+    // The new totals also invalidate the pinned pickup, so no new summary is
+    // armed and nothing is sent under the outstanding key.
+    expect((await offerOrder(h, 'wamid.o3')).reply).toBe(
+      MINIMAL_ORDER_UNRESOLVED_REPLY,
+    );
+    expect(await yes(h, 'wamid.o4')).toBeNull();
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(await h.minimalCart()).toEqual(before);
   });

@@ -20,7 +20,10 @@ import {
 } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
-import { MinimalOrderService } from './minimal-order.service';
+import {
+  MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
+  MinimalOrderService,
+} from './minimal-order.service';
 import { MinimalShippingService } from './minimal-shipping.service';
 import { CostGuardService } from './cost-guard.service';
 
@@ -65,7 +68,7 @@ const say = () =>
   step([{ type: 'text', text: 'Inventado $999. Pedido creado.' }], 'stop');
 
 // prettier-ignore
-async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean; unconfirmed?: boolean } = {}) {
+async function setup(options: { absent?: boolean; free?: boolean; unconfirmed?: boolean } = {}) {
   const price = options.free ? 50001 : 1500;
   const store = new InMemoryConversationStore();
   const api = {
@@ -74,16 +77,16 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
     evaluateCart: jest.fn(async (items: Array<{ quantity: number }>) => ({ items: items.map(item => ({ productId: PRODUCT, variantId: null, quantity: item.quantity, unitPriceCents: price, originalPriceCents: price * item.quantity, finalPriceCents: price * item.quantity, discountAmountCents: 0, appliedPromotionTitle: null })), promotionEvaluationStatus: 'fully_evaluated' })),
     getCustomerCheckoutContext: jest.fn(async () => ({ status: 'unique', customer: { customerId: CUSTOMER, firstName: 'Ana', lastName: null }, addresses: [{ id: ADDRESS, version: '2026-10-01T00:00:00.000Z', label: 'Casa', street: 'Juárez', exteriorNumber: '10', interiorNumber: null, zipCode: '06000', neighborhood: 'Centro', municipality: 'Cuauhtémoc', city: null, state: 'Ciudad de México', visualReferences: null, carrierPhone: null }], nextAfterAddressId: null })),
     createSale: jest.fn(),
-    createCheckout: jest.fn(async (...args: unknown[]) => { void args; return ({ status: 'created', sale: { saleId: '55555555-5555-4555-8555-555555555555', folio: 'B-42', paymentStatus: 'CREDIT', channel: 'ONLINE', deliveryStatus: 'PENDING', totalCents: price * 2 + (options.free || options.gate === false ? 0 : 20000), paidCents: 0, debtCents: price * 2, confirmedAt: null, discountCents: 0 } }); }),
+    createCheckout: jest.fn(async (...args: unknown[]) => { void args; return ({ status: 'created', sale: { saleId: '55555555-5555-4555-8555-555555555555', folio: 'B-42', paymentStatus: 'CREDIT', channel: 'ONLINE', deliveryStatus: 'PENDING', totalCents: price * 2 + (options.free ? 0 : 20000), paidCents: 0, debtCents: price * 2, confirmedAt: null, discountCents: 0 } }); }),
     getPaymentDetails: jest.fn(async () => ({ id: 'pd', bankName: 'BBVA', beneficiary: 'HoundFe', clabe: '012180001234567891', accountNumber: null, isActive: true, updatedAt: '2026-10-01T00:00:00.000Z' })),
   };
   const client = api as unknown as ChatbotApiClient;
-  const config = { get: (key: string) => key === 'minimalCatalogAgent' ? { shippingEnabled: options.gate !== false } : key === 'chatbotApi.cashierUserId' ? '99999999-9999-4999-8999-999999999999' : { model: 'm', maxSteps: 6, historyTurns: 12 } } as unknown as ConfigService;
+  const config = { get: (key: string) => key === 'chatbotApi.cashierUserId' ? '99999999-9999-4999-8999-999999999999' : { model: 'm', maxSteps: 6, historyTurns: 12 } } as unknown as ConfigService;
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
-  const order = new MinimalOrderService(client, store, cart, checkout, config);
   const quotes = new FakeShippingQuoteClient();
   const shipping = new MinimalShippingService(store, cart, checkout, quotes);
+  const order = new MinimalOrderService(client, store, cart, checkout, config, shipping);
   let script: unknown[] = [];
   const seen: Array<{ tools?: Record<string, unknown>; system?: unknown }> = [];
   const models: MockLanguageModelV4[] = [];
@@ -101,16 +104,15 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
 
 // prettier-ignore
 describe('minimal shipping SDK public seam', () => {
-  it.each([{ gate: false }, { absent: true }])('S5: hidden without both capabilities (%j)', async options => {
-    const h = await setup(options); await h.turn('Hola', [say()]);
+  it('S9: shipping tools are always offered when the service is wired (no flag)', async () => {
+    const h = await setup(); await h.turn('Hola', [say()]);
+    expect(h.seen[0].tools).toHaveProperty('requestShippingQuote');
+    expect(h.seen[0].tools).toHaveProperty('chooseStorePickup');
+  });
+  it('S5: hidden only when the service itself is absent (test seam)', async () => {
+    const h = await setup({ absent: true }); await h.turn('Hola', [say()]);
     expect(h.seen[0].tools).not.toHaveProperty('requestShippingQuote');
     expect(h.seen[0].system).not.toContain('Herramienta requestShippingQuote');
-  });
-  it('S5: gate-off and service-absent preserve identical tools and prompt', async () => {
-    const off = await setup({ gate: false }); const absent = await setup({ absent: true });
-    await off.turn('Hola', [say()]); await absent.turn('Hola', [say()]);
-    expect(Object.keys(off.seen[0].tools!)).toEqual(Object.keys(absent.seen[0].tools!));
-    expect(off.seen[0].system).toBe(absent.seen[0].system);
   });
   it.each([false, true])('[S1,S2,S3] backend quote then single order SÍ with its quoteId, free=%s', async free => {
     const h = await setup({ free });
@@ -177,7 +179,9 @@ describe('minimal shipping SDK public seam', () => {
     const h = await setup({ unconfirmed: true });
     const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
     if (result.kind !== 'handled') throw new Error('reply');
-    expect(result.reply).toContain('delivery_unconfirmed');
+    // L10: the customer sees a sentence, never the internal reason code.
+    expect(result.reply).toContain('confirme sus datos de entrega');
+    expect(result.reply).not.toContain('delivery_unconfirmed');
     expect(result.reply).not.toContain('$');
     expect(h.quotes.calls).toHaveLength(0);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
@@ -187,13 +191,13 @@ describe('minimal shipping SDK public seam', () => {
     await h.turn('Datos y envío', [call('confirmCheckoutDetails'), call('requestShippingQuote'), say()]);
     expect(h.quotes.calls).toHaveLength(0);
   });
-  it('S5: gate off keeps existing order flow without shipping', async () => {
-    const h = await setup({ gate: false });
+  it('S9: no order without a backend quote or store pickup', async () => {
+    const h = await setup();
     const offer = await h.turn('Pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
-    offer.onSent?.(); await h.turn('SÍ', []);
-    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
-    expect((h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale).not.toHaveProperty('shipping');
+    expect(offer.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
+    offer.onSent?.(); await h.turn('SÍ', [say()]);
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
   });
 });
@@ -203,6 +207,12 @@ describe('U4 customer shipping conversation', () => {
   const quoted = (overrides: Partial<Extract<Parameters<typeof minimalShippingReply>[0], { kind: 'quoted' }>> = {}) =>
     minimalShippingReply({ kind: 'quoted', zoneStatus: 'SURCHARGE', costCents: 30000, creditCents: 24000, customerChargeCents: 6000,
       option: { carrier: 'Envíos Perros', service: 'Estándar', etaDays: 4 }, eta: null, zipCode: '06000', ...overrides });
+  it.each(['cart_unverified', 'empty_cart', 'promotion_review', 'delivery_unconfirmed', 'new_address_unsupported', 'invalid_state', 'order_unresolved', 'cart_changed', 'address_changed', 'address_unverified', 'unsupported_destination'] as const)('[L10] refusal %s maps to a customer sentence without the reason code', reason => {
+    const reply = minimalShippingReply({ kind: 'refused', reason });
+    expect(reply).not.toContain(reason);
+    expect(reply).not.toMatch(/[a-z]+_[a-z]+/);
+    expect(reply.length).toBeGreaterThan(20);
+  });
   it('[S3] SURCHARGE shows carrier, cost, credit, customer charge, ETA and the next step', () => {
     expect(quoted()).toBe(
       'Envío a domicilio con Envíos Perros (Estándar): $300.00 MXN. Usted tiene un crédito de $240.00 MXN por sus productos. Usted paga $60.00 MXN. ' +

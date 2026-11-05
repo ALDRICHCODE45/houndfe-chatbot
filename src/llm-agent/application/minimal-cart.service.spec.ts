@@ -59,16 +59,23 @@ function setup() {
   };
 }
 
+const SHIPPING_AT = '2026-06-22T12:00:00.000Z';
 const shipping = {
   quoteId: 'quote-1',
-  rateId: 'rate-1',
-  carrierName: 'Carrier',
-  serviceName: 'Ground',
-  estimatedDeliveryDays: null,
-  bestRateCents: 10000,
-  totalCreditCents: 0,
-  customerPaysCents: 10000,
-  cartLines: [
+  expiresAt: '2026-06-22T12:30:00.000Z',
+  zoneStatus: 'CARRIER_ONLY',
+  option: { carrier: 'Carrier', service: 'Ground', etaDays: null },
+  costCents: 10000,
+  creditCents: 0,
+  customerChargeCents: 10000,
+  currency: 'MXN',
+  eta: null,
+  destinationPin: {
+    kind: 'saved',
+    addressId: OTHER,
+    version: SHIPPING_AT,
+  },
+  cartPin: [
     {
       productId: PRODUCT,
       quantity: 2,
@@ -76,11 +83,6 @@ const shipping = {
       finalPriceCents: 1900,
     },
   ],
-  addressId: OTHER,
-  addressVersion: '2026-06-22T12:00:00.000Z',
-  createdAt: '2026-06-22T12:00:00.000Z',
-  expiresAt: '2026-06-22T12:30:00.000Z',
-  approval: { state: 'pending', requestId: 'request-1' },
 };
 describe('Minimal cart public operations', () => {
   const customerEvaluation = (overrides: Record<string, unknown> = {}) => ({
@@ -163,7 +165,7 @@ describe('Minimal cart public operations', () => {
         ],
         idempotencyKey: '',
       },
-      shipping.createdAt,
+      SHIPPING_AT,
     );
     f.api.evaluateCart.mockResolvedValue(customerEvaluation());
     expect(
@@ -367,7 +369,7 @@ describe('Minimal cart public operations', () => {
           ],
           idempotencyKey: '',
         },
-        shipping.createdAt,
+        SHIPPING_AT,
       );
       f.api.getStock.mockImplementation(
         async (productId) =>
@@ -476,7 +478,7 @@ describe('Minimal cart public operations', () => {
           items: mode === 'noop' ? [items[0]] : items,
           idempotencyKey: mode === 'locked' ? OTHER : '',
         },
-        shipping.createdAt,
+        SHIPPING_AT,
       );
       const before = await f.store.get(SENDER);
       const commit = jest.spyOn(f.store, 'commitMinimalCart');
@@ -533,7 +535,7 @@ describe('Minimal cart public operations', () => {
     expect(
       parseMinimalCart({
         ...cart,
-        shipping: { ...shipping, customerPaysCents: -1 },
+        shipping: { ...shipping, customerChargeCents: -1 },
       }),
     ).toBeNull();
     expect(parseMinimalCart({ items: [], idempotencyKey: '' })).not.toBeNull();
@@ -543,7 +545,7 @@ describe('Minimal cart public operations', () => {
     async (operation) => {
       const f = setup();
       await f.store.create(SENDER, {
-        lastMessageAt: shipping.createdAt,
+        lastMessageAt: SHIPPING_AT,
         data: { shippingApproval: { legacy: true } },
       });
       // Seed through the owned CAS, matching the clone realm of cart writes.
@@ -555,7 +557,7 @@ describe('Minimal cart public operations', () => {
           idempotencyKey: '',
           shipping,
         },
-        shipping.createdAt,
+        SHIPPING_AT,
       );
       const result =
         operation === 'set'
@@ -587,7 +589,7 @@ describe('Minimal cart public operations', () => {
           idempotencyKey: OTHER,
           shipping,
         },
-        shipping.createdAt,
+        SHIPPING_AT,
       );
       const before = structuredClone(await f.store.get(SENDER));
       const commit = jest.spyOn(f.store, 'commitMinimalCart');

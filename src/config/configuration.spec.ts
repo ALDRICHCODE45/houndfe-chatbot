@@ -50,7 +50,7 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_METRICS_TOKEN',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
     'OPS_CHANNEL_PHONE',
-    // SQ-2A shipping quotes
+    // Removed shipping vars (U6): kept here so the test restores them.
     'SHIPPING_QUOTES_ENABLED',
     'SKYDROPX_BASE_URL',
     'SKYDROPX_CLIENT_ID',
@@ -59,9 +59,7 @@ describe('configuration()', () => {
     'SKYDROPX_ORIGIN_STATE',
     'SKYDROPX_ORIGIN_MUNICIPALITY',
     'SKYDROPX_ORIGIN_NEIGHBORHOOD',
-    // SQ-5B2A private measured-demo profile passthrough
     'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
-    // Experimental minimal SDK catalog route
     'MINIMAL_CATALOG_SHIPPING_ENABLED',
     // Removed always-on flags: kept here so the test restores them.
     'MINIMAL_CATALOG_AGENT_ENABLED',
@@ -86,24 +84,9 @@ describe('configuration()', () => {
     }
   });
 
-  it.each([undefined, 'false', 'TRUE', '1', ' true ', 'true'])(
-    'S5: minimal shipping enables only exact true (%s)',
-    (value) => {
-      if (value === undefined)
-        delete process.env.MINIMAL_CATALOG_SHIPPING_ENABLED;
-      else process.env.MINIMAL_CATALOG_SHIPPING_ENABLED = value;
-      expect(configuration().minimalCatalogAgent).toHaveProperty(
-        'shippingEnabled',
-        value === 'true',
-      );
-    },
-  );
-
   it('S2: the removed atomic checkout flag no longer configures anything', () => {
     process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = 'true';
-    expect(configuration().minimalCatalogAgent).not.toHaveProperty(
-      'atomicCheckoutEnabled',
-    );
+    expect(configuration()).not.toHaveProperty('minimalCatalogAgent');
     delete process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED;
   });
 
@@ -291,142 +274,30 @@ describe('configuration()', () => {
     );
   });
 
-  // SQ-2A: default-off shipping quotes; only exact 'true' enables the feature.
-  describe('shippingQuotes', () => {
-    type Shipping = {
-      shippingQuotes: {
-        enabled: boolean;
-        skydropx: Record<string, string | undefined>;
-        measuredDemoParcelProfileJson?: string;
-      };
-    };
-    const shipping = () => (configuration() as Shipping).shippingQuotes;
-
-    it('returns the typed default-off subtree when SHIPPING_QUOTES_ENABLED is absent', () => {
-      delete process.env.SHIPPING_QUOTES_ENABLED;
-      expect(shipping()).toEqual({
-        enabled: false,
-        skydropx: {
-          baseUrl: 'https://api-pro.skydropx.com',
-          clientId: undefined,
-          clientSecret: undefined,
-          originPostalCode: undefined,
-          originState: undefined,
-          originMunicipality: undefined,
-          originNeighborhood: undefined,
-        },
-      });
-    });
-
-    it.each([
-      [undefined, false],
-      ['true', true],
-      ['false', false],
-      ['TRUE', false],
-      ['False', false],
-      ['1', false],
-      [' true ', false],
-    ])('maps SHIPPING_QUOTES_ENABLED=%s', (env, expected) => {
-      if (env === undefined) {
-        delete process.env.SHIPPING_QUOTES_ENABLED;
-      } else {
-        process.env.SHIPPING_QUOTES_ENABLED = env;
-      }
-      expect(shipping().enabled).toBe(expected);
-    });
-
-    it('passes raw Skydropx provider env values through the factory', () => {
-      process.env.SHIPPING_QUOTES_ENABLED = 'true';
+  // U6: the backend quotes carriers; the removed chatbot-side shipping vars
+  // (Skydropx, demo parcel profile, both shipping flags) configure nothing.
+  describe('removed shipping vars', () => {
+    it.each(['true', 'false'])('have no effect when set (flags=%s)', (flag) => {
+      process.env.SHIPPING_QUOTES_ENABLED = flag;
+      process.env.MINIMAL_CATALOG_SHIPPING_ENABLED = flag;
+      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON = '{"x":1}';
       process.env.SKYDROPX_BASE_URL = 'https://sandbox.skydropx.test';
-      process.env.SKYDROPX_CLIENT_ID = 'client-id-raw';
-      process.env.SKYDROPX_CLIENT_SECRET = 'client-secret-raw';
+      process.env.SKYDROPX_CLIENT_ID = 'id';
+      process.env.SKYDROPX_CLIENT_SECRET = 'secret';
       process.env.SKYDROPX_ORIGIN_POSTAL_CODE = '06000';
-      process.env.SKYDROPX_ORIGIN_STATE = 'CDMX';
-      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = 'Cuauhtemoc';
-      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = 'Centro';
-      expect(shipping()).toEqual({
-        enabled: true,
-        skydropx: {
-          baseUrl: 'https://sandbox.skydropx.test',
-          clientId: 'client-id-raw',
-          clientSecret: 'client-secret-raw',
-          originPostalCode: '06000',
-          originState: 'CDMX',
-          originMunicipality: 'Cuauhtemoc',
-          originNeighborhood: 'Centro',
-        },
-      });
-    });
-
-    // SQ-2A-H: accepted surrounding whitespace is normalized in the factory so
-    // ConfigService sees the same trimmed values that Joi validated.
-    it('trims surrounding whitespace on provider values', () => {
-      process.env.SHIPPING_QUOTES_ENABLED = 'true';
-      process.env.SKYDROPX_BASE_URL = '  https://sandbox.skydropx.test  ';
-      process.env.SKYDROPX_CLIENT_ID = '  client-id  ';
-      process.env.SKYDROPX_CLIENT_SECRET = '  client-secret  ';
-      process.env.SKYDROPX_ORIGIN_POSTAL_CODE = ' 06000 ';
-      process.env.SKYDROPX_ORIGIN_STATE = '  CDMX  ';
-      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = '  Cuauhtemoc  ';
-      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = '  Centro  ';
-      expect(shipping()).toEqual({
-        enabled: true,
-        skydropx: {
-          baseUrl: 'https://sandbox.skydropx.test',
-          clientId: 'client-id',
-          clientSecret: 'client-secret',
-          originPostalCode: '06000',
-          originState: 'CDMX',
-          originMunicipality: 'Cuauhtemoc',
-          originNeighborhood: 'Centro',
-        },
-      });
-    });
-
-    // SQ-5B2A: optional private measured-demo profile JSON is a raw string
-    // passthrough; the factory never parses it and blanks become undefined.
-    it.each([undefined, '', '   ', '\n\t '])(
-      'maps absent or blank SHIPPING_DEMO_PARCEL_PROFILE_JSON=%# to undefined',
-      (env) => {
-        if (env === undefined) {
-          delete process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON;
-        } else {
-          process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON = env;
-        }
-        expect(shipping().measuredDemoParcelProfileJson).toBeUndefined();
-      },
-    );
-
-    it('preserves a bounded raw JSON string after outer trim without parsing it', () => {
-      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON =
-        '  {"version":1,"items":[]}  ';
-      expect(shipping().measuredDemoParcelProfileJson).toBe(
-        '{"version":1,"items":[]}',
-      );
+      const cfg = configuration() as unknown as Record<string, unknown>;
+      expect(cfg).not.toHaveProperty('shippingQuotes');
+      expect(cfg).not.toHaveProperty('minimalCatalogAgent');
+      expect(JSON.stringify(cfg)).not.toMatch(/skydropx|sandbox\.skydropx/i);
     });
   });
 
   // The minimal SDK catalog route is always on for every sender; its former
-  // enable/allowlist/order env vars are removed and have no effect.
-  describe('minimalCatalogAgent', () => {
-    const minimal = () =>
-      (
-        configuration() as unknown as {
-          minimalCatalogAgent: Record<string, unknown>;
-        }
-      ).minimalCatalogAgent;
-
-    it('ignores the removed enable, allowlist and order env vars', () => {
-      delete process.env.MINIMAL_CATALOG_SHIPPING_ENABLED;
-      delete process.env.MINIMAL_CATALOG_AGENT_ENABLED;
-      delete process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS;
-      delete process.env.MINIMAL_CATALOG_ORDER_ENABLED;
-      const baseline = minimal();
-      process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'false';
-      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = '5215550001111';
-      process.env.MINIMAL_CATALOG_ORDER_ENABLED = 'false';
-      expect(minimal()).toEqual(baseline);
-      expect(Object.keys(minimal())).toEqual(['shippingEnabled']);
-    });
+  // enable/allowlist/order/shipping env vars are removed and have no effect.
+  it('ignores the removed minimal-route enable, allowlist and order env vars', () => {
+    process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'false';
+    process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = '5215550001111';
+    process.env.MINIMAL_CATALOG_ORDER_ENABLED = 'false';
+    expect(configuration()).not.toHaveProperty('minimalCatalogAgent');
   });
 });

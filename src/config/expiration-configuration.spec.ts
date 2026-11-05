@@ -11,10 +11,5 @@ afterEach(() => {
 
 it('does not project an EXPIRATION switch even when the old flag is false', () => {
   process.env[FLAG] = 'false';
-  const agent = (
-    configuration() as unknown as {
-      minimalCatalogAgent: Record<string, unknown>;
-    }
-  ).minimalCatalogAgent;
-  expect(agent).not.toHaveProperty('expirationEnabled');
+  expect(JSON.stringify(configuration())).not.toContain('expirationEnabled');
 });

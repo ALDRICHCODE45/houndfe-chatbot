@@ -62,6 +62,7 @@ import { MinimalOrderService } from './minimal-order.service';
 import {
   MinimalShippingService,
   type MinimalPickupResult,
+  type MinimalShippingRefusal,
   type MinimalShippingResult,
 } from './minimal-shipping.service';
 import { minimalShippingEtaLine } from '../domain/minimal-shipping';
@@ -320,7 +321,36 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
     case 'unavailable':
       return 'No pude calcular el envío en este momento. Puede pedírmelo de nuevo en unos minutos o, si prefiere, recoger su pedido en tienda sin costo de envío.';
     case 'refused':
-      return `No pude cotizar el envío (${result.reason}). No se creó ningún pedido. Puede solicitar otra cotización.`;
+      return shippingRefusalReply(result.reason);
+  }
+}
+
+const SHIPPING_RETRY =
+  'No se creó ningún pedido. Puede solicitar otra cotización.';
+
+/** Customer sentence per refusal; internal reason codes never reach the text. */
+function shippingRefusalReply(reason: MinimalShippingRefusal): string {
+  switch (reason) {
+    case 'empty_cart':
+      return 'Su carrito está vacío. Agregue productos y después le cotizo el envío.';
+    case 'delivery_unconfirmed':
+      return `Antes de cotizar el envío necesito que confirme sus datos de entrega. ${SHIPPING_RETRY}`;
+    case 'promotion_review':
+      return `Un precio de su carrito está en revisión, así que todavía no puedo cotizar el envío. ${SHIPPING_RETRY}`;
+    case 'order_unresolved':
+      return 'Tengo un pedido suyo pendiente de confirmar, así que por ahora no puedo cotizar otro envío. Pida de nuevo el resumen y responda SÍ para reintentar ese mismo pedido, o comuníquese con la tienda.';
+    case 'cart_changed':
+      return `Su carrito cambió mientras cotizaba el envío. Revise su carrito y vuelva a pedírmelo. ${SHIPPING_RETRY}`;
+    case 'address_changed':
+      return `Su dirección de entrega cambió. Confírmela de nuevo y le cotizo el envío. ${SHIPPING_RETRY}`;
+    case 'address_unverified':
+      return `No pude verificar su dirección de entrega en este momento. ${SHIPPING_RETRY}`;
+    case 'unsupported_destination':
+      return `No pude usar esa dirección para cotizar el envío; revise el código postal, la colonia, el municipio y el estado. ${SHIPPING_RETRY}`;
+    case 'new_address_unsupported':
+    case 'cart_unverified':
+    case 'invalid_state':
+      return `No pude cotizar el envío. ${SHIPPING_RETRY}`;
   }
 }
 
@@ -418,7 +448,6 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
 // inquiry capabilities. No checkout, payment or inventory reservations.
 @Injectable()
 export class MinimalCatalogAgentService {
-  private readonly shippingEnabled: boolean;
   private readonly model: string;
   private readonly maxSteps: number;
   private readonly historyTurns: number;
@@ -449,15 +478,11 @@ export class MinimalCatalogAgentService {
     @Optional()
     private readonly shipping?: MinimalShippingService,
   ) {
-    const agent = config.get<{ shippingEnabled?: boolean }>(
-      'minimalCatalogAgent',
-    );
     const llm = config.get<{
       model: string;
       maxSteps: number;
       historyTurns: number;
     }>('llm')!;
-    this.shippingEnabled = agent?.shippingEnabled === true;
     this.model = llm.model;
     this.maxSteps = llm.maxSteps;
     this.historyTurns = llm.historyTurns;
@@ -886,12 +911,10 @@ export class MinimalCatalogAgentService {
     return this.checkout !== undefined && this.checkout.available;
   }
 
+  // Always on in production wiring (no flag); optional only as a test seam
+  // like the cart/checkout/order capabilities.
   private shippingAvailable(): boolean {
-    return (
-      this.shippingEnabled &&
-      this.shipping !== undefined &&
-      this.orderAvailable()
-    );
+    return this.shipping !== undefined && this.orderAvailable();
   }
 
   private orderAvailable(): boolean {

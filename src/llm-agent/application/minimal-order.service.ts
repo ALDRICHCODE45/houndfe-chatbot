@@ -35,7 +35,6 @@ import {
 } from '../domain/minimal-order-confirmation';
 import {
   isMinimalPickup,
-  isMinimalShippingQuote,
   isPickupCurrent,
   isShippingCurrent,
   minimalShippingEta,
@@ -198,7 +197,6 @@ function sameCartLines(
 @Injectable()
 export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
-  private readonly shippingEnabled: boolean;
   private readonly cashierUserId: string;
   private readonly now: () => number;
 
@@ -208,13 +206,10 @@ export class MinimalOrderService {
     private readonly cart: MinimalCartService,
     private readonly checkout: MinimalCheckoutService,
     config: ConfigService,
+    private readonly shipping: MinimalShippingService,
     @Optional() @Inject(MINIMAL_ORDER_CLOCK) now?: () => number,
-    @Optional() private readonly shipping?: MinimalShippingService,
   ) {
     this.now = now ?? (() => Date.now());
-    this.shippingEnabled =
-      config.get<{ shippingEnabled?: boolean }>('minimalCatalogAgent')
-        ?.shippingEnabled === true;
     const cashier = config.get<string>('chatbotApi.cashierUserId');
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
   }
@@ -336,7 +331,6 @@ export class MinimalOrderService {
     inboundEvent: unknown,
   ): Promise<MinimalCheckoutReply> {
     const fallback = { reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY };
-    if (this.shipping === undefined) return fallback;
     try {
       if ((await this.shipping.quote(senderId)).kind !== 'quoted')
         return fallback;
@@ -378,14 +372,10 @@ export class MinimalOrderService {
             senderId,
             raw,
             status.checkout.sale,
-            this.shippingEnabled && cart?.shipping !== undefined
+            cart?.shipping !== undefined
               ? isMinimalPickup(cart.shipping)
                 ? { mode: 'pickup' }
-                : {
-                    customerChargeCents: isMinimalShippingQuote(cart.shipping)
-                      ? cart.shipping.customerChargeCents
-                      : cart.shipping.customerPaysCents,
-                  }
+                : { customerChargeCents: cart.shipping.customerChargeCents }
               : undefined,
           ),
         };
@@ -437,16 +427,13 @@ export class MinimalOrderService {
       if (revalidation === 'unavailable') {
         return { ok: false, reply: MINIMAL_CHECKOUT_LOOKUP_UNAVAILABLE_REPLY };
       }
-      if (this.shippingEnabled) {
-        const raw = (await this.store.get(senderId))?.data.minimalCart;
-        const cart = parseMinimalCart(raw);
-        const shipping =
-          cart === null ? null : this.currentShipping(cart, verdict.snapshot);
-        if (shipping === null)
-          return { ok: false, reply: MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY };
-        return { ok: true, snapshot: { ...verdict.snapshot, shipping } };
-      }
-      return verdict;
+      const raw = (await this.store.get(senderId))?.data.minimalCart;
+      const cart = parseMinimalCart(raw);
+      const shipping =
+        cart === null ? null : this.currentShipping(cart, verdict.snapshot);
+      if (shipping === null)
+        return { ok: false, reply: MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY };
+      return { ok: true, snapshot: { ...verdict.snapshot, shipping } };
     } catch {
       return {
         ok: false,
@@ -476,7 +463,6 @@ export class MinimalOrderService {
     if (isMinimalPickup(record))
       return isPickupCurrent(record, cartLines) ? { mode: 'pickup' } : null;
     if (
-      !isMinimalShippingQuote(record) ||
       record.quoteId === null ||
       isShippingCurrent(record, {
         cartLines,
@@ -586,14 +572,12 @@ export class MinimalOrderService {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
       if (cart === null || !sameCartLines(cart, snapshot)) return unverified;
-      if (this.shippingEnabled) {
-        const shipping = this.currentShipping(cart, snapshot);
-        if (
-          shipping === null ||
-          !sameMinimalOrder(snapshot, { ...snapshot, shipping })
-        ) {
-          return MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY;
-        }
+      const shipping = this.currentShipping(cart, snapshot);
+      if (
+        shipping === null ||
+        !sameMinimalOrder(snapshot, { ...snapshot, shipping })
+      ) {
+        return MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY;
       }
       // Every call is counted in the slot BEFORE it is made, so a crash or an
       // uncertain response always leaves evidence of an earlier attempt.

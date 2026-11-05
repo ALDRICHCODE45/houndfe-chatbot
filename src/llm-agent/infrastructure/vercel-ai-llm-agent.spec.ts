@@ -32,10 +32,8 @@ import {
  * is the gate-fix for that failure mode.
  */
 describe('real SDK catalog context isolation', () => {
-  it.each([false, true])('forwards voice (shipping=%s)', async (shipping) => {
-    const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
-      shippingQuoteAvailable: shipping,
-    });
+  it('forwards voice', async () => {
+    const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
     const senderId = 'PRIVATE_OFFLINE_SENDER';
     const catalogSession = new CatalogSession(senderId, 60000, 0);
     const model = new MockLanguageModelV4({
@@ -146,7 +144,7 @@ describe('real SDK catalog context isolation', () => {
     for (const call of model.doGenerateCalls) {
       // Scripted replies prove transport only, not generated voice quality.
       expect(call.prompt[0]).toEqual({ role: 'system', content: systemPrompt });
-      expect(systemPrompt.includes('# Cotización de envío')).toBe(shipping);
+      expect(systemPrompt.includes('# Cotización de envío')).toBe(false);
       const assistance = call.tools?.find(
         (tool) => tool.name === 'requestHumanAssistance',
       );
@@ -187,126 +185,115 @@ describe('real SDK catalog context isolation', () => {
     }
   });
 
-  it.each([false, true])(
-    'transmits the approved brand voice to the provider (shipping=%s)',
-    async (shipping) => {
-      const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
-        shippingQuoteAvailable: shipping,
-      });
-      const catalogSession = new CatalogSession(
-        'PRIVATE_VOICE_SENDER',
-        60000,
-        0,
-      );
-      const model = new MockLanguageModelV4({
-        doGenerate: {
-          content: [{ type: 'text', text: 'Offline voice reply' }],
-          finishReason: { unified: 'stop', raw: undefined },
-          usage: {
-            inputTokens: {
-              total: 1,
-              noCache: 1,
-              cacheRead: undefined,
-              cacheWrite: undefined,
-            },
-            outputTokens: { total: 1, text: 1, reasoning: undefined },
+  it('transmits the approved brand voice to the provider', async () => {
+    const systemPrompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
+    const catalogSession = new CatalogSession('PRIVATE_VOICE_SENDER', 60000, 0);
+    const model = new MockLanguageModelV4({
+      doGenerate: {
+        content: [{ type: 'text', text: 'Offline voice reply' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: {
+          inputTokens: {
+            total: 1,
+            noCache: 1,
+            cacheRead: undefined,
+            cacheWrite: undefined,
           },
-          warnings: [],
+          outputTokens: { total: 1, text: 1, reasoning: undefined },
         },
-      });
-      const agent = new VercelAiLlmAgent(
-        ((options: Parameters<GenerateTextFn>[0]) =>
-          generateText({ ...options, model })) as GenerateTextFn,
-        'unused',
-        2,
-      );
-      const tools = {
-        requestHumanAssistance: makeRequestHumanAssistanceTool({} as ToolDeps),
-      };
-      // Turn 1: no catalog evidence. Turn 2: the same voice beside evidence.
-      const firstTurn = await agent.run({
-        senderId: 'PRIVATE_VOICE_SENDER',
-        text: 'Busca ibuprofeno de 400 mg',
-        history: [],
-        systemPrompt,
-        tools,
-        catalogSession,
-      });
-      catalogSession.installSearch(catalogSession.beginSearch(), [
-        {
-          productId: '00000000-0000-4000-8000-000000000001',
-          name: 'Ibuprofeno 400 mg',
-          variants: [],
-        },
-      ]);
-      const catalogEvidence = catalogSession.evidence(0)!;
-      await agent.run({
-        senderId: 'PRIVATE_VOICE_SENDER',
-        text: '¿Tiene existencias?',
-        history: firstTurn.messages,
-        systemPrompt,
-        tools,
-        catalogSession,
-        catalogEvidence,
-      });
+        warnings: [],
+      },
+    });
+    const agent = new VercelAiLlmAgent(
+      ((options: Parameters<GenerateTextFn>[0]) =>
+        generateText({ ...options, model })) as GenerateTextFn,
+      'unused',
+      2,
+    );
+    const tools = {
+      requestHumanAssistance: makeRequestHumanAssistanceTool({} as ToolDeps),
+    };
+    // Turn 1: no catalog evidence. Turn 2: the same voice beside evidence.
+    const firstTurn = await agent.run({
+      senderId: 'PRIVATE_VOICE_SENDER',
+      text: 'Busca ibuprofeno de 400 mg',
+      history: [],
+      systemPrompt,
+      tools,
+      catalogSession,
+    });
+    catalogSession.installSearch(catalogSession.beginSearch(), [
+      {
+        productId: '00000000-0000-4000-8000-000000000001',
+        name: 'Ibuprofeno 400 mg',
+        variants: [],
+      },
+    ]);
+    const catalogEvidence = catalogSession.evidence(0)!;
+    await agent.run({
+      senderId: 'PRIVATE_VOICE_SENDER',
+      text: '¿Tiene existencias?',
+      history: firstTurn.messages,
+      systemPrompt,
+      tools,
+      catalogSession,
+      catalogEvidence,
+    });
 
-      expect(model.doGenerateCalls).toHaveLength(2);
-      for (const call of model.doGenerateCalls) {
-        const transmitted = call.prompt[0];
-        if (
-          transmitted.role !== 'system' ||
-          typeof transmitted.content !== 'string'
-        ) {
-          throw new Error('Expected a string system message first');
-        }
-        // Scripted replies prove transport only: this asserts the instructions
-        // the provider actually received, not the warmth of a real generation.
-        expect(transmitted.content).toBe(systemPrompt);
-        for (const voice of [
-          'devuélvelo una sola vez con la misma cortesía',
-          'la misma franja del día que él usó',
-          'Hola, buenas tardes! 🤗✨',
-          'sin inventar hora ni zona horaria',
-          'no repitas el saludo',
-          'Hola, buenas noches! 😊✨ Sí, tenemos',
-          'no repitas una confirmación del cliente ya establecida en el historial o el contexto',
-          'para entregar un dato verificado puedes escribir "Le comparto…"',
-          '¡Gracias a usted por su preferencia! 🤗✨ Que tenga una excelente noche.',
-          'agradece la paciencia solo si realmente esperó',
-          'mientras la consulta siga abierta no te despidas ni cierres por preferencia',
-          'es parte de esta voz',
-          'no un extra opcional',
-          'celebrar un faltante confirmado, un error o un rechazo',
-          'Al cerrar de verdad una gestión resuelta, agradece la preferencia',
-          'agradece la paciencia solo si el contexto muestra una espera real',
-          'Sí puedes agradecer información o paciencia cuando el contexto lo amerite',
-          'identidad de una persona real del equipo',
-        ]) {
-          expect(transmitted.content).toContain(voice);
-        }
-        for (const obsolete of [
-          'Saludo opcional y contextual',
-          '1–2 emojis discretos',
-          'no son obligatorios',
-        ]) {
-          expect(transmitted.content).not.toContain(obsolete);
-        }
-        expect(transmitted.content.includes('# Cotización de envío')).toBe(
-          shipping,
-        );
-        // Fixed literals and operational gates survive the voice rewrite.
-        for (const fixed of [
-          'esa función aún no está disponible',
-          'en un momento un agente te comparte los datos de pago',
-          '¿Confirmas la cancelación? Sí/No',
-          'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
-          'Aún no tengo una fecha confirmada para que vuelva a estar disponible.',
-        ]) {
-          expect(transmitted.content).toContain(fixed);
-        }
+    expect(model.doGenerateCalls).toHaveLength(2);
+    for (const call of model.doGenerateCalls) {
+      const transmitted = call.prompt[0];
+      if (
+        transmitted.role !== 'system' ||
+        typeof transmitted.content !== 'string'
+      ) {
+        throw new Error('Expected a string system message first');
       }
-    },
-  );
+      // Scripted replies prove transport only: this asserts the instructions
+      // the provider actually received, not the warmth of a real generation.
+      expect(transmitted.content).toBe(systemPrompt);
+      for (const voice of [
+        'devuélvelo una sola vez con la misma cortesía',
+        'la misma franja del día que él usó',
+        'Hola, buenas tardes! 🤗✨',
+        'sin inventar hora ni zona horaria',
+        'no repitas el saludo',
+        'Hola, buenas noches! 😊✨ Sí, tenemos',
+        'no repitas una confirmación del cliente ya establecida en el historial o el contexto',
+        'para entregar un dato verificado puedes escribir "Le comparto…"',
+        '¡Gracias a usted por su preferencia! 🤗✨ Que tenga una excelente noche.',
+        'agradece la paciencia solo si realmente esperó',
+        'mientras la consulta siga abierta no te despidas ni cierres por preferencia',
+        'es parte de esta voz',
+        'no un extra opcional',
+        'celebrar un faltante confirmado, un error o un rechazo',
+        'Al cerrar de verdad una gestión resuelta, agradece la preferencia',
+        'agradece la paciencia solo si el contexto muestra una espera real',
+        'Sí puedes agradecer información o paciencia cuando el contexto lo amerite',
+        'identidad de una persona real del equipo',
+      ]) {
+        expect(transmitted.content).toContain(voice);
+      }
+      for (const obsolete of [
+        'Saludo opcional y contextual',
+        '1–2 emojis discretos',
+        'no son obligatorios',
+      ]) {
+        expect(transmitted.content).not.toContain(obsolete);
+      }
+      expect(transmitted.content).not.toContain('# Cotización de envío');
+      // Fixed literals and operational gates survive the voice rewrite.
+      for (const fixed of [
+        'esa función aún no está disponible',
+        'en un momento un agente te comparte los datos de pago',
+        '¿Confirmas la cancelación? Sí/No',
+        'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
+        'Aún no tengo una fecha confirmada para que vuelva a estar disponible.',
+      ]) {
+        expect(transmitted.content).toContain(fixed);
+      }
+    }
+  });
 
   it('keeps server context out of provider requests and ignores model-supplied context', async () => {
     const productId = '00000000-0000-4000-8000-000000000001';
@@ -905,7 +892,6 @@ describe('temporary catalog diagnostics', () => {
     'getOrderHistory',
     'getPaymentDetails',
     'cancelSale',
-    'getShippingQuote',
   ];
   it.each(registeredNames)('retains requested name %s', async (toolName) => {
     await run((hooks) => hooks.onStepFinish({ toolCalls: [{ toolName }] }));
@@ -1378,57 +1364,23 @@ describe('VercelAiLlmAgent', () => {
     });
   });
 
-  describe('toolsContext gating for getShippingQuote', () => {
-    it('adds getShippingQuote context only when the tool is present', async () => {
-      generateTextFn.mockResolvedValueOnce({ text: 'ok' } as never);
-      await agent.run({
-        senderId: '5215550001111',
-        text: 'hola',
-        history: [],
-        systemPrompt: SYSTEM_PROMPT,
-        tools: {
-          getShippingQuote: {
-            description: 'q',
-            inputSchema: {},
-            execute: () => {},
-          },
+  it('passes no getShippingQuote context even if a stray tool of that name is present', async () => {
+    generateTextFn.mockResolvedValueOnce({ text: 'ok' } as never);
+    await agent.run({
+      senderId: '5215550001111',
+      text: 'hola',
+      history: [],
+      systemPrompt: SYSTEM_PROMPT,
+      tools: {
+        getShippingQuote: {
+          description: 'q',
+          inputSchema: {},
+          execute: () => {},
         },
-      });
-      const callArgs = generateTextFn.mock.calls[0][0] as Record<
-        string,
-        unknown
-      >;
-      expect(callArgs.toolsContext).toEqual({
-        evaluateCart: { senderId: '5215550001111' },
-        createSale: { senderId: '5215550001111' },
-        cancelSale: { senderId: '5215550001111' },
-        requestHumanAssistance: { senderId: '5215550001111' },
-        getShippingQuote: { senderId: '5215550001111' },
-      });
+      },
     });
-
-    it('omits getShippingQuote context when the tool is absent', async () => {
-      generateTextFn.mockResolvedValueOnce({ text: 'ok' } as never);
-      await agent.run({
-        senderId: '5215550001111',
-        text: 'hola',
-        history: [],
-        systemPrompt: SYSTEM_PROMPT,
-        tools: {},
-      });
-
-      const callArgs = generateTextFn.mock.calls[0][0] as Record<
-        string,
-        unknown
-      >;
-      expect(callArgs.toolsContext).toEqual({
-        evaluateCart: { senderId: '5215550001111' },
-        createSale: { senderId: '5215550001111' },
-        cancelSale: { senderId: '5215550001111' },
-        requestHumanAssistance: { senderId: '5215550001111' },
-      });
-      expect(callArgs.toolsContext).not.toHaveProperty('getShippingQuote');
-    });
+    const callArgs = generateTextFn.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.toolsContext).not.toHaveProperty('getShippingQuote');
   });
 
   // ────────────────────────────────────────────────────────────────────
@@ -1676,7 +1628,6 @@ describe('inventory evidence separation (R2)', () => {
     'updateDelivery',
     'cancelSale',
     'requestHumanAssistance',
-    'getShippingQuote',
   ];
   const READ_ONLY = [
     'searchCatalog',

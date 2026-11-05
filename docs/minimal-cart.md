@@ -19,7 +19,7 @@ Private traces use `cart_keep_only result=<ready|invalid_evidence|unknown_select
 - Empty cart: `blocked / empty_cart`.
 - Unverified stock/prices, invalid cart or backend failure: `blocked / cart_unverified`; no assumption that the cart is empty.
 - Promotions requiring human review: `blocked / promotion_review`; this does **not** register a human request or approve prices.
-- Verified nonempty cart: `incomplete`, with **productsSubtotalCents**, not a freight-inclusive total. Customer/address confirmation, an approved shipping offer and explicit confirmation of the final total remain pending. This increment does not inspect or adopt legacy customer, shipping or sale markers.
+- Verified nonempty cart: `incomplete`, with **productsSubtotalCents**, not a freight-inclusive total. Customer/address confirmation, a backend shipping quote or store pickup and explicit confirmation of the final total remain pending. This increment does not inspect or adopt legacy customer, shipping or sale markers.
 
 The tool is available whenever the cart capability is bound. It accepts no sender, product, price or customer fields. The prompt directs purchase/review intent to this tool; live model recognition still requires a separately authorized WhatsApp rehearsal. No new flag, dependency or deployment is included.
 

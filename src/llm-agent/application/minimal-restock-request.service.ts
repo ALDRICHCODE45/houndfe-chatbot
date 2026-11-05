@@ -24,7 +24,6 @@ import {
 } from '../../human-decisions/domain/restock-source-identity';
 import { runRestockRoute } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { RestockToolCapability } from '../../sale-flow/application/tool-deps';
-import { parseShippingCustomerDecision } from '../../shipping/application/shipping-customer-decision';
 
 export const MINIMAL_RESTOCK_PENDING_TTL_MS = 5 * 60 * 1000;
 export const MINIMAL_RESTOCK_AMBIGUOUS_REPLY =
@@ -51,20 +50,21 @@ const proposal = (l: string) =>
   `estimada de reposición?`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
-// RESTOCK-LOCAL bounded consent: the strict shipping decision first, then
-// exactly one polite affirmative form. No substring, NLP or model inference;
-// every other text (including a polite "NO, por favor") stays `null`.
+// RESTOCK-LOCAL bounded consent: a whole `SI`/`SÍ`/`NO` (case, outer
+// spaces/tabs and one trailing period tolerated), then exactly one polite
+// affirmative form. No substring, NLP or model inference; every other text
+// (including a polite "NO, por favor") stays `null`.
+const STRICT_DECISION = /^(?:si|sí|no)\.?$/i;
 const POLITE_AFFIRMATIVE = /^(?:si|sí),?[ \t]+por[ \t]+favor\.?$/i;
 const OUTER_SPACING = /^[ \t]+|[ \t]+$/g;
 const NEWLINES = /[\r\n]/;
 
 function parseRestockDecision(raw: unknown): 'accept' | 'decline' | null {
-  const strict = parseShippingCustomerDecision(raw);
-  if (strict !== null) return strict;
   if (typeof raw !== 'string' || NEWLINES.test(raw)) return null;
-  return POLITE_AFFIRMATIVE.test(raw.replace(OUTER_SPACING, ''))
-    ? 'accept'
-    : null;
+  const candidate = raw.replace(OUTER_SPACING, '');
+  if (STRICT_DECISION.test(candidate))
+    return candidate.charAt(0).toLowerCase() === 'n' ? 'decline' : 'accept';
+  return POLITE_AFFIRMATIVE.test(candidate) ? 'accept' : null;
 }
 
 export interface MinimalRestockDeps {

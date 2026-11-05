@@ -151,6 +151,10 @@ this number before cutover; do not assume inherited access or scope.
     `RECEIPT_MEDIA_INGESTION_ENABLED=false` (ODD-8 gates). Leave
     `RECEIPT_MEDIA_METRICS_TOKEN` unset unless metrics are scraped; the
     metrics endpoint answers 404 without it.
+  - No shipping variables: the backend quotes carriers, so
+    `SHIPPING_QUOTES_ENABLED`, `MINIMAL_CATALOG_SHIPPING_ENABLED`,
+    `SHIPPING_DEMO_PARCEL_PROFILE_JSON` and `SKYDROPX_*` are not used (delete
+    them from Dokploy if present; a leftover value has no effect).
 
 - Preserve `META_APP_SECRET` and `META_VERIFY_TOKEN` unless Meta actually
   changes them; do not rotate them for convenience at cutover.
@@ -222,14 +226,17 @@ no `.env`, no Nest boot, and never a value, token, length, or hash.
 
 Report: `coreConfig` (`present|missing`); `posture` (`safe|unsafe|missing`
 against exact `META_SANDBOX_RECIPIENT_NORMALIZATION=false`,
-and the three receipt flags `false`; missing or
-non-exact fails closed); `migrations` (`present_on_disk|missing_on_disk`);
+and the two receipt flags `false`; missing or
+non-exact fails closed; there is no shipping posture: shipping is always on
+and quoted by the backend); `migrations` (`present_on_disk|missing_on_disk`);
 `clientRoutes`/`manualChecks` (always `manual_external`, never flipping `ok`).
 `ok` is false only for missing core names, unsafe/missing posture, or a missing
 migration file.
 
 Limitations: presence is not validity; a migration file on disk is not an
-applied migration; all reachability and data checks (backend, the 13 routes,
+applied migration; all reachability and data checks (backend, the 14 routes
+including `POST /chatbot-api/shipping/quotes` whose scope is still TBD by the
+backend,
 cashier user, `ServiceCredential` with seven scopes including
 `payment-details:read`, active `PaymentDetail`, populated catalog) stay manual.
 

@@ -1,7 +1,4 @@
-import {
-  META_GRAPH_API_BASE_URL_DEFAULT,
-  SKYDROPX_BASE_URL_DEFAULT,
-} from './env.validation';
+import { META_GRAPH_API_BASE_URL_DEFAULT } from './env.validation';
 
 const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   if (!v) return def;
@@ -12,17 +9,6 @@ const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   return r.length ? r : def;
 };
 const int = (v: string | undefined) => (v ? parseInt(v, 10) : undefined);
-// SQ-2A-H: normalize accepted surrounding whitespace so ConfigService sees the
-// same trimmed provider values that Joi validates.
-const trimmed = (v: string | undefined) => v?.trim();
-// SQ-5B2A: optional private measured-demo profile JSON. It is a raw, unparsed
-// passthrough so shipping can stay enabled when it is absent or invalid; the
-// shipping resolver fails closed later. Whitespace-only becomes undefined.
-const trimmedOrUndefined = (v: string | undefined) => {
-  const t = v?.trim();
-  return t ? t : undefined;
-};
-
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
   meta: {
@@ -53,11 +39,6 @@ const configuration = () => ({
       10,
     ),
     idleTimeoutMs: parseInt(process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000', 10),
-  },
-  // Minimal SDK catalog route: always on for every sender, including order
-  // placement. Only the shipping capability keeps its own switch.
-  minimalCatalogAgent: {
-    shippingEnabled: process.env.MINIMAL_CATALOG_SHIPPING_ENABLED === 'true',
   },
   database: {
     url: process.env.DATABASE_URL as string,
@@ -105,24 +86,6 @@ const configuration = () => ({
       pollIntervalMs: int(process.env.RECEIPT_MEDIA_WORKER_POLL_MS),
     },
     metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
-  },
-  // SQ-2A-H: default-off shipping quotes; provider fields are trimmed env passthrough.
-  shippingQuotes: {
-    enabled: process.env.SHIPPING_QUOTES_ENABLED === 'true',
-    // SQ-5B2A: raw private measured-demo profile JSON, trimmed, never parsed at boot.
-    measuredDemoParcelProfileJson: trimmedOrUndefined(
-      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON,
-    ),
-    skydropx: {
-      baseUrl:
-        trimmed(process.env.SKYDROPX_BASE_URL) ?? SKYDROPX_BASE_URL_DEFAULT,
-      clientId: trimmed(process.env.SKYDROPX_CLIENT_ID),
-      clientSecret: trimmed(process.env.SKYDROPX_CLIENT_SECRET),
-      originPostalCode: trimmed(process.env.SKYDROPX_ORIGIN_POSTAL_CODE),
-      originState: trimmed(process.env.SKYDROPX_ORIGIN_STATE),
-      originMunicipality: trimmed(process.env.SKYDROPX_ORIGIN_MUNICIPALITY),
-      originNeighborhood: trimmed(process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD),
-    },
   },
 });
 

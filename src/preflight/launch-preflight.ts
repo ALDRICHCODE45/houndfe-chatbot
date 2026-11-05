@@ -63,11 +63,6 @@ export const POSTURE_EXPECTATIONS: readonly {
   { name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' },
   { name: 'RECEIPT_MEDIA_ENABLED', expected: 'false' },
   { name: 'RECEIPT_MEDIA_INGESTION_ENABLED', expected: 'false' },
-  // Launch preflight requires explicit `false` even though the runtime default
-  // is off: an absent value is `missing` and any enabled/non-canonical value is
-  // `unsafe`, so shipping quotes cannot reach production implicitly.
-  { name: 'SHIPPING_QUOTES_ENABLED', expected: 'false' },
-  { name: 'MINIMAL_CATALOG_SHIPPING_ENABLED', expected: 'false' },
 ];
 
 export const REQUIRED_MIGRATIONS = [
@@ -93,6 +88,9 @@ export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
   ['GET', '/chatbot-api/catalog/search', 'catalog:read'],
   ['GET', '/chatbot-api/catalog/:productId/stock', 'catalog:read'],
   ['POST', '/chatbot-api/pricing/evaluate-cart', 'pricing:evaluate'],
+  // Scope TBD by backend: its shipping proposal (§9-11) names the route but
+  // not the scope yet; replace this placeholder once the backend commits it.
+  ['POST', '/chatbot-api/shipping/quotes', 'TBD by backend'],
   ['GET', '/chatbot-api/customers/by-phone', 'customers:read'],
   ['PUT', '/chatbot-api/customers/by-phone', 'customers:write'],
   ['POST', '/chatbot-api/sales', 'sales:create'],
@@ -111,35 +109,11 @@ const MANUAL_PREREQUISITES: readonly (readonly [string, string])[] = [
   ['service_credential', 'Seven scopes including payment-details:read.'],
   ['active_payment_detail', 'An active PaymentDetail exists (no 404).'],
   ['populated_catalog', 'Catalog has products for search/stock/cart flows.'],
-  // Shipping activation prerequisites (SQ-6B): listed for humans only and never
-  // counted as automatic failures. No credential value is read or reported.
+  // Carrier, credit and zone rules are backend-owned (signed quoteId); only
+  // the backend side needs a human check before delivery orders.
   [
-    'shipping_origin_authoritative',
-    'Branch origin postal/address data is authoritative.',
-  ],
-  [
-    'shipping_backend_measurements',
-    'Backend exposes product/variant weights and dimensions, not null.',
-  ],
-  [
-    'shipping_sandbox_host_credentials',
-    'Owner-approved Skydropx sandbox host and credentials provisioned.',
-  ],
-  [
-    'shipping_backend_charge_persistence',
-    'Backend can persist the approved shipping charge with the sale.',
-  ],
-  [
-    'shipping_cdmx_zone_service_policy',
-    'CDMX free-zone rules and service-selection policy are approved.',
-  ],
-  [
-    'shipping_approval_workflow_e2e',
-    'The human shipping-approval workflow is proven end to end.',
-  ],
-  [
-    'shipping_synthetic_journey',
-    'A controlled synthetic shipping journey passes before any quote.',
+    'backend_shipping_quotes',
+    'Backend serves POST /chatbot-api/shipping/quotes with packaging data.',
   ],
 ];
 

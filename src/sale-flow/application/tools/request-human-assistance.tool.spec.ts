@@ -30,8 +30,8 @@ const schemaToolView = (tool: object): SchemaToolView =>
  *     senderId from context + the input kind + digest.
  *   - idempotent re-call returns the existing envelope (service owns this).
  *   - inputSchema rejects malformed digests.
- *   - inputSchema rejects the reserved `shipping_approval` kind (no
- *     discriminator match — R6 slice lifts the gate).
+ *   - inputSchema rejects the removed `shipping_approval` kind (no
+ *     discriminator match).
  */
 describe('makeRequestHumanAssistanceTool', () => {
   const baseDeps = {
@@ -124,7 +124,7 @@ describe('makeRequestHumanAssistanceTool', () => {
     expect(r.success).toBe(false);
   });
 
-  it('inputSchema rejects the reserved shipping_approval kind', () => {
+  it('inputSchema rejects the removed shipping_approval kind', () => {
     const { svc } = buildHandoffServiceMock();
     const deps = {
       ...baseDeps,

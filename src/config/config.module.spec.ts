@@ -32,18 +32,27 @@ describe('AppConfigModule integration', () => {
     RECEIPT_STORAGE_FORCE_PATH_STYLE: 'false',
     RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
     RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
-    // SQ-2A shipping keys (managed; provider values cleared for default-off)
-    SHIPPING_QUOTES_ENABLED: 'false',
-    SKYDROPX_BASE_URL: 'https://api-pro.skydropx.com',
-    SKYDROPX_CLIENT_ID: 'test-client-id',
-    SKYDROPX_CLIENT_SECRET: 'test-client-secret',
-    SKYDROPX_ORIGIN_POSTAL_CODE: '06000',
-    SKYDROPX_ORIGIN_STATE: 'Ciudad de Mexico',
-    SKYDROPX_ORIGIN_MUNICIPALITY: 'Cuauhtemoc',
-    SKYDROPX_ORIGIN_NEIGHBORHOOD: 'Centro',
   };
 
-  const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
+  // Removed shipping vars (U6): managed so a leaked value never escapes a test.
+  const REMOVED_SHIPPING_ENV: Record<string, string> = {
+    SHIPPING_QUOTES_ENABLED: 'true',
+    SHIPPING_DEMO_PARCEL_PROFILE_JSON: '{"x":1}',
+    SKYDROPX_BASE_URL: 'not-a-url',
+    SKYDROPX_CLIENT_ID: 'id',
+    SKYDROPX_CLIENT_SECRET: 'secret',
+    SKYDROPX_ORIGIN_POSTAL_CODE: 'bad',
+    SKYDROPX_ORIGIN_STATE: 'x',
+    SKYDROPX_ORIGIN_MUNICIPALITY: 'x',
+    SKYDROPX_ORIGIN_NEIGHBORHOOD: 'x',
+    MINIMAL_CATALOG_SHIPPING_ENABLED: 'false',
+  };
+
+  const MANAGED_KEYS = [
+    ...Object.keys(VALID_ENV),
+    ...Object.keys(REMOVED_SHIPPING_ENV),
+    'LLM_MAX_STEPS',
+  ];
   let savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
@@ -228,27 +237,15 @@ describe('AppConfigModule integration', () => {
     );
   });
 
-  // SQ-2A: shippingQuotes disabled-default boot with the Skydropx base URL default.
-  describe('shippingQuotes disabled-default', () => {
-    it.each([undefined, 'false'])(
-      'boots with disabled-default shippingQuotes for %s',
-      async (enabled) => {
-        Object.assign(process.env, VALID_ENV);
-        // Clear ambient provider values so disabled-default stays undefined.
-        for (const key of Object.keys(VALID_ENV))
-          if (key.startsWith('SKYDROPX_')) delete process.env[key];
-        delete process.env.SHIPPING_QUOTES_ENABLED;
-        if (enabled !== undefined)
-          process.env.SHIPPING_QUOTES_ENABLED = enabled;
-        const moduleRef = await Test.createTestingModule({
-          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
-        }).compile();
-        expect(moduleRef.get(ConfigService).get('shippingQuotes')).toEqual({
-          enabled: false,
-          skydropx: { baseUrl: 'https://api-pro.skydropx.com' },
-        });
-        await moduleRef.close();
-      },
-    );
+  // U6: chatbot-side carrier quoting is gone; its env vars have no effect.
+  it('boots and exposes no shipping config when the removed shipping vars are set', async () => {
+    Object.assign(process.env, VALID_ENV, REMOVED_SHIPPING_ENV);
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
+    }).compile();
+    const config = moduleRef.get(ConfigService);
+    expect(config.get('shippingQuotes')).toBeUndefined();
+    expect(config.get('minimalCatalogAgent')).toBeUndefined();
+    await moduleRef.close();
   });
 });

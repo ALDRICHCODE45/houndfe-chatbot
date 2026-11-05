@@ -1,7 +1,4 @@
 import { Test } from '@nestjs/testing';
-import { Module, type DynamicModule } from '@nestjs/common';
-import { SHIPPING_QUOTE_PROVIDER } from '../shipping/domain/shipping-quote.port';
-import { MEASURED_DEMO_SHIPPING_CONFIG } from '../shipping/application/measured-demo-shipping-config';
 import { ConfigService } from '@nestjs/config';
 import { HttpModule } from '@nestjs/axios';
 import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
@@ -13,7 +10,6 @@ import { PG_POOL } from '../database/postgres-pool.provider';
 import { RESTOCK_INTAKE_SERVICE } from '../human-decisions/application/restock-intake.service';
 import { SHARED_ROUTE_MARKERS } from '../human-decisions/domain/shared-route-markers';
 import { HUMAN_HANDOFF_STORE } from '../human-handoff/domain/human-handoff-store.port';
-import { ShippingModule } from '../shipping/shipping.module';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
@@ -29,25 +25,6 @@ import { SaleFlowModule } from './sale-flow.module';
  *   - ChatbotApiModule + ConversationModule are transitively imported
  *     (CHATBOT_API_CLIENT + CONVERSATION_STORE resolve through the module).
  */
-const SHIPPING_PROBE = Symbol('SHIPPING_PROBE');
-@Module({
-  imports: [SaleFlowModule],
-  providers: [
-    {
-      provide: SHIPPING_PROBE,
-      inject: [
-        { token: SHIPPING_QUOTE_PROVIDER, optional: true },
-        { token: MEASURED_DEMO_SHIPPING_CONFIG, optional: true },
-      ],
-      useFactory: (provider: unknown, measured: unknown) => ({
-        provider,
-        measured,
-      }),
-    },
-  ],
-})
-class ShippingImporter {}
-
 describe('SaleFlowModule', () => {
   // Set up the env so AppConfigModule.forRoot() can validate (with
   // ignoreEnvFile: true, only process.env matters).
@@ -121,11 +98,10 @@ describe('SaleFlowModule', () => {
     end: jest.fn().mockResolvedValue(undefined),
   };
 
-  async function buildModule(shipping = false) {
+  async function buildModule() {
     const builder = Test.createTestingModule({
       imports: [
         SaleFlowModule,
-        ShippingImporter,
         HttpModule,
         AppConfigModule.forRoot({ ignoreEnvFile: true }),
       ],
@@ -157,23 +133,6 @@ describe('SaleFlowModule', () => {
       .useValue(fakePool)
       .overrideProvider(ConfigService)
       .useValue(stubConfigService());
-    if (shipping) {
-      const imports = Reflect.getMetadata(
-        'imports',
-        SaleFlowModule,
-      ) as DynamicModule[];
-      const existing = imports.find(
-        (entry) => entry.module === ShippingModule,
-      )!;
-      builder.overrideModule(existing).useModule({
-        module: ShippingModule,
-        providers: [
-          { provide: SHIPPING_QUOTE_PROVIDER, useValue: { quote: jest.fn() } },
-          { provide: MEASURED_DEMO_SHIPPING_CONFIG, useValue: null },
-        ],
-        exports: [SHIPPING_QUOTE_PROVIDER, MEASURED_DEMO_SHIPPING_CONFIG],
-      });
-    }
     return builder.compile();
   }
 
@@ -188,10 +147,6 @@ describe('SaleFlowModule', () => {
     const moduleRef = await buildModule();
     const registry = moduleRef.get(RealToolRegistry);
     expect(registry).toBeInstanceOf(RealToolRegistry);
-    expect(
-      (registry as unknown as { shippingQuoteOrchestrator: unknown })
-        .shippingQuoteOrchestrator,
-    ).toBeNull();
     expect(Object.keys(registry.getTools()).sort()).toEqual(
       [
         'searchCatalog',
@@ -211,35 +166,16 @@ describe('SaleFlowModule', () => {
     await moduleRef.close();
   });
 
-  it.each([false, true])(
-    'S5: downstream importer sees shipping tokens only when provided (%s)',
-    async (enabled) => {
-      const ref = await buildModule(enabled);
-      const probe = ref.get<{ provider: unknown; measured: unknown }>(
-        SHIPPING_PROBE,
-      );
-      expect(probe.provider !== undefined).toBe(enabled);
-      expect(probe.measured).toBe(enabled ? null : undefined);
-      await ref.close();
-    },
-  );
-
-  it('S5: re-exports the single ShippingModule for downstream optional injection', () => {
-    const exports: unknown[] = Reflect.getMetadata(
-      'exports',
-      SaleFlowModule,
-    ) as unknown[];
-    expect(exports).toContain(ShippingModule);
-  });
-
-  it('imports the dynamic ShippingModule exactly once and nothing else shipping', () => {
-    const imports =
-      (Reflect.getMetadata('imports', SaleFlowModule) as
-        | Array<{ module?: unknown }>
-        | undefined) ?? [];
-    expect(
-      imports.filter((entry) => entry?.module === ShippingModule),
-    ).toHaveLength(1);
+  it('imports and exports no shipping module (carrier quoting is backend-owned)', () => {
+    const names = [
+      ...((Reflect.getMetadata('imports', SaleFlowModule) as unknown[]) ?? []),
+      ...((Reflect.getMetadata('exports', SaleFlowModule) as unknown[]) ?? []),
+    ].map((entry) =>
+      typeof entry === 'function'
+        ? entry.name
+        : (entry as { module?: { name?: string } })?.module?.name,
+    );
+    expect(names).not.toContain('ShippingModule');
   });
 
   it('does not bind the boot-time bank-details seam (only the runtime registry)', async () => {
