@@ -36,6 +36,10 @@ import type {
   CheckoutResponse,
   CheckoutStatus,
 } from './dtos/checkout.dto';
+import type {
+  CreateShippingQuoteInput,
+  ShippingQuoteResponse,
+} from './dtos/shipping-quote.dto';
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
@@ -77,6 +81,13 @@ export interface ChatbotApiClient {
     idempotencyKey: string,
   ): Promise<CheckoutResponse>;
   getCheckoutStatus(idempotencyKey: string): Promise<CheckoutStatus>;
+  /** `POST /chatbot-api/shipping/quotes`: the backend picks the cheapest
+   *  carrier and computes the credit; single attempt, no retry. Rejects with
+   *  `ChatbotApiError` carrying `errorCode` (e.g. `PACKAGING_DATA_MISSING`,
+   *  `SHIPPING_QUOTE_UNAVAILABLE`); a malformed body is an `UpstreamError`. */
+  createShippingQuote(
+    input: CreateShippingQuoteInput,
+  ): Promise<ShippingQuoteResponse>;
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse>;
   createSale(
     dto: CreateSaleInput,

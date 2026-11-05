@@ -35,6 +35,12 @@ import {
   type CheckoutStatus,
 } from '../domain/dtos/checkout.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
+import {
+  CreateShippingQuoteInputSchema,
+  normalizeShippingQuoteResponse,
+  type CreateShippingQuoteInput,
+  type ShippingQuoteResponse,
+} from '../domain/dtos/shipping-quote.dto';
 import type {
   CartEvaluationResult,
   CartItemInput,
@@ -300,6 +306,43 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       );
     }
     return status;
+  }
+
+  /**
+   * `POST /chatbot-api/shipping/quotes` is single-attempt (non-GET). The input
+   * is validated before any request; only a 200/201 whose body passes the
+   * strict normalizer resolves, otherwise `UpstreamError` keeps the evidence.
+   */
+  async createShippingQuote(
+    input: CreateShippingQuoteInput,
+  ): Promise<ShippingQuoteResponse> {
+    const parsed = CreateShippingQuoteInputSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new ChatbotApiError(
+        'Invalid shipping quote input',
+        null,
+        undefined,
+        'INVALID_SHIPPING_QUOTE_REQUEST',
+      );
+    }
+    const response = await this.requestWithResponse<unknown>({
+      method: 'POST',
+      url: '/chatbot-api/shipping/quotes',
+      data: parsed.data,
+    });
+    const quote = normalizeShippingQuoteResponse(response.data);
+    if (
+      (response.status !== 200 && response.status !== 201) ||
+      quote === null
+    ) {
+      throw new UpstreamError(
+        'Chatbot API shipping quote response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return quote;
   }
 
   private validateCheckoutKey(key: string): string {
