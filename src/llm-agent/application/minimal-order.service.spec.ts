@@ -27,6 +27,7 @@ import {
   MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_UNRESOLVED_REPLY,
   MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
+  MINIMAL_ORDER_STOCK_CHANGED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
@@ -1812,6 +1813,27 @@ describe('MinimalOrderService', () => {
       call.mockRejectedValueOnce(rejection);
       expect(await yes(h)).toEqual({
         reply: MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
+      });
+      expect(await h.minimalCart()).toMatchObject({
+        items: [{ productId: PRODUCT, quantity: 2 }],
+        idempotencyKey: '',
+      });
+    },
+  );
+
+  it.each(['legacy', 'atomic'])(
+    '%s STOCK_INSUFFICIENT_AT_CONFIRM says stock ran out and rotates the key',
+    async (mode) => {
+      const h = setup({ atomic: mode === 'atomic' });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await offerOrder(h);
+      const code = 'STOCK_INSUFFICIENT_AT_CONFIRM';
+      const rejection = new ChatbotApiError(code, 409, { error: code }, code);
+      const call = mode === 'atomic' ? h.api.createCheckout : h.api.createSale;
+      call.mockRejectedValueOnce(rejection);
+      expect(await yes(h)).toEqual({
+        reply: MINIMAL_ORDER_STOCK_CHANGED_REPLY,
       });
       expect(await h.minimalCart()).toMatchObject({
         items: [{ productId: PRODUCT, quantity: 2 }],

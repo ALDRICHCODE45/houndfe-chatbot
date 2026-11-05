@@ -72,6 +72,8 @@ export const MINIMAL_ORDER_REJECTED_REPLY =
   'No se pudo crear el pedido. Puede revisar su carrito y pedir de nuevo el resumen cuando quiera.';
 export const MINIMAL_ORDER_VARIANT_CHANGED_REPLY =
   'Las presentaciones de un producto de su carrito cambiaron y no pude crear el pedido así; no se creó ningún pedido. Revise su carrito, elija de nuevo la presentación de ese producto o quítelo, y pida otra vez el resumen.';
+export const MINIMAL_ORDER_STOCK_CHANGED_REPLY =
+  'Mientras confirmaba su pedido ya no alcanzó la existencia de un producto de su carrito; no se creó ningún pedido. Revise su carrito, ajuste la cantidad o quite ese producto, y pida otra vez el resumen.';
 export const MINIMAL_ORDER_HELD_REPLY =
   'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo; por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_UNRESOLVED_REPLY =
@@ -616,6 +618,12 @@ export class MinimalOrderService {
         VARIANT_REJECTION_CODES.has(error.errorCode)
       ) {
         return MINIMAL_ORDER_VARIANT_CHANGED_REPLY;
+      }
+      if (
+        error instanceof ChatbotApiError &&
+        error.errorCode === 'STOCK_INSUFFICIENT_AT_CONFIRM'
+      ) {
+        return MINIMAL_ORDER_STOCK_CHANGED_REPLY;
       }
       return MINIMAL_ORDER_REJECTED_REPLY;
     }
