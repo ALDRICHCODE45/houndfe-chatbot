@@ -12,7 +12,7 @@ Branch: `feat/always-on-features`. Production has no real users (owner, 2026-11-
 
 ## Tasks
 
-- T1 [S1-S4] Human decisions always on: HUMAN_HANDOFF_ENABLED, HUMAN_DECISIONS_RESTOCK_ENABLED, HUMAN_DECISIONS_EXPIRATION_ENABLED, HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED. Route: inline. Commit: —
+- T1 [S1-S4] Human decisions always on: HUMAN_HANDOFF_ENABLED, HUMAN_DECISIONS_RESTOCK_ENABLED, HUMAN_DECISIONS_EXPIRATION_ENABLED, HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED. Route: gentle-ai-worker. Commit: 6ef762f (slice 1; mostly deletions, 350+/858-).
 - T2 [S1-S4] Atomic checkout always on (MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED); delete the legacy POST /sales order path. Route: inline. Commit: —
 - T3 [S1-S4] Minimal route always on: MINIMAL_CATALOG_AGENT_ENABLED, MINIMAL_CATALOG_ORDER_ENABLED, MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS (blocked: owner decision on real number). Route: inline. Commit: —
 - T4 [S1-S3] Receipt metrics: drop RECEIPT_MEDIA_METRICS_ENABLED. Route: inline. Commit: —
@@ -25,3 +25,4 @@ Branch: `feat/always-on-features`. Production has no real users (owner, 2026-11-
 - L1 (2026-11-05, owner, verbatim excerpt): "en primera quiero YA configurar el numero real, en segunda, por favor, ya no quiero estar teniendo miles de variables de entorno para prender/apagar funcionalidades en produccion, ahora en producion no hay nadie usando el chatbot real, por lo que no importa del todo esto, quiero tener todo prendido, ya se que hay cosas que no estan probadas o no estan terminadas, estoy consiente de ello, y es por eso que no importa si esta prendido o apagado, solo agrega muchas friccion para probar funcionalidades y ademas no es nada comodo para mi"
 - L2 (2026-11-05): Backend inventory (main 6b8f99c) confirms /chatbot-api/checkouts and /checkouts/status exist; the preflight note "atomic checkout is not deployed yet" is stale.
 - L3 (2026-11-05): Flag map from explorer: shipping ON requires Skydropx credentials and makes every order require a human-approved quote; receipt media ON requires Spaces/S3 storage, public base URL and capability keys; legacy AgentRunner still serves the ops synthetic turn.
+- L4 (2026-11-05): T1 done in 6ef762f. Leftovers for T7: dead service-level `enabled` fields (MinimalRestockRequestService, MinimalExpirationRequestService deps, tool-deps restock.enabled, request-human-assistance.tool); docs/meta-test-sandbox-setup.md still says not to create OPS_CHANNEL_PHONE. Webhook now returns 500 when RESTOCK or customer-inbound capture fails (DB dependency on every message).
