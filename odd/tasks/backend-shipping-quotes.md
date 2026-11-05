@@ -18,7 +18,7 @@ Branch: `feat/always-on-features` (continues there until split). Backend contrac
 ## Tasks
 
 - U1 [S1,S3] `createShippingQuote` port, zod request/response DTOs (destination XOR, zoneStatus enum, eta), HTTP adapter, in-memory fake. Route: gentle-ai-worker. Commit: 3a4c7a3.
-- U2 [S2,S6] Checkout DTO `shipping: {quoteId} | {mode:'pickup'}`; new quote error codes mapped in client and minimal-order.service. Commit: —
+- U2 [S2,S6] Checkout DTO `shipping: {quoteId} | {mode:'pickup'}`; new quote error codes mapped in client and minimal-order.service. Route: gentle-ai-worker. Commit: 72b68ce.
 - U3 [S2,S3] `minimalCart.shipping` schema with address/cart pin; MinimalShippingService over U1; currentShipping requires a live quoteId. Commit: —
 - U4 [S4,S5,S6,S7] Conversation: tool/prompt without approval, pickup branch, PENDING/DENIED replies, summary with carrier and ETA, new shipping-required reply. Commit: —
 - U5 [S2] Delete per-quote approval (minimal-shipping-approval, human-handoff shipping_approval branches, dispatcher ops commands). Commit: —
@@ -34,3 +34,4 @@ Branch: `feat/always-on-features` (continues there until split). Backend contrac
 - L3 (2026-11-05): Explorer map: RESTOCK/EXPIRATION use per-route ledgers and a reservation keyed by sender turn; backend dedupes DELIVERY_ZONE per ZIP — key model open. WhatsApp sender supports text only (no Meta templates).
 - L4 (2026-11-05): Backend accepted the DELIVERY_ZONE key model: one open decision per ZIP with many requesters; intake idempotent per chatbot sourceRequestId (sender+turn) and attached as requester; poll and ACK per sourceRequestId; an intake for an already resolved ZIP is accepted and resolved immediately. Exact names arrive with backend docs/delivery-zones.md after its T1.
 - L5 (2026-11-05): U1 done in 3a4c7a3 (additive). Leftover: add POST /chatbot-api/shipping/quotes to preflight CLIENT_ROUTES. Worker-chosen strictness beyond the brief (digits-only phone, non-empty neighborhood/municipality/state, canonical ISO expiresAt, non-negative ETA) to re-check against backend docs.
+- L6 (2026-11-05): U2 done in 72b68ce. Leftovers: legacy POST /sales wireShipping + create-sale.tool still send chargeCents/approvalId (U6 deletes); currentShipping still requires approval.state==='approved' and snapshot carries chargeCents/approvalId, used by summary, fingerprint and sameMinimalOrder (U3/U5); MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY wording (U4); pickup not wired (U4); free shipping now also sends its quoteId.
