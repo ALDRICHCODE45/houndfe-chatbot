@@ -322,7 +322,17 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
   ): Promise<void> => {
     await h.conversations.update(senderId, {
       lastMessageAt: new Date().toISOString(),
-      data: { placedSaleId: PLACED_SALE_ID },
+      data: {
+        minimalCart: {
+          items: [],
+          idempotencyKey: '',
+          placedSale: {
+            saleId: PLACED_SALE_ID,
+            folio: null,
+            totalCents: 150_000,
+          },
+        },
+      },
     });
   };
 
@@ -631,7 +641,18 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
     // setting the pending marker in the real `conversation_state`.
     await h.conversations.update(CUSTOMER, {
       lastMessageAt: new Date().toISOString(),
-      data: { placedSaleId: PLACED_SALE_ID, pendingHumanRequest: pending },
+      data: {
+        minimalCart: {
+          items: [],
+          idempotencyKey: '',
+          placedSale: {
+            saleId: PLACED_SALE_ID,
+            folio: null,
+            totalCents: 150_000,
+          },
+        },
+        pendingHumanRequest: pending,
+      },
     });
     expect(await readPointer(h.conversations, CUSTOMER)).not.toBeNull();
 

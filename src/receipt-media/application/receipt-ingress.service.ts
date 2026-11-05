@@ -2,7 +2,7 @@
  * atomic receipt admission to the durable store. Deterministic closed
  * decisions (kill-switch disabled, unsupported media, no
  * placed sale) return without touching the store; a supported JPEG/PNG with a
- * captured `placedSaleId` builds an immutable reservation identity, reserves
+ * minimal-route `minimalCart.placedSale` (S3) builds an immutable reservation identity, reserves
  * exactly once, and maps the store's resolved outcome exhaustively (the
  * concrete WU2B store resolves only after its own transaction commits; this
  * unit layer makes no database-durability claim). There are
@@ -12,9 +12,9 @@
  * intent exists before storage (WA2); worker wiring and DI tokens are WU14. */
 import { randomUUID } from 'node:crypto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
-import { readPlacedSaleId } from '../../sale-flow/application/placed-sale-persistence';
 import { parseAmount } from '../domain/amount-parser';
 import { newObjectKey } from '../domain/object-storage.port';
+import { readPlacedOrder } from '../domain/placed-order';
 import type {
   ActiveReceiptStatus,
   ActiveSenderIdentity,
@@ -109,16 +109,16 @@ export class ReceiptIngressService {
     });
     if (activeStatus !== null)
       return { kind: 'sender-active', status: activeStatus };
-    const placedSaleId = readPlacedSaleId(
+    const placedOrder = readPlacedOrder(
       await this.conversations.getState(input.senderId),
     );
-    if (placedSaleId === null) return { kind: 'no-placed-sale' };
+    if (placedOrder === null) return { kind: 'no-placed-sale' };
     const reservation = await this.store.admit({
       id: randomUUID(),
       webhookMessageId: input.webhookMessageId,
       providerMediaId: input.providerMediaId,
       senderId: input.senderId,
-      capturedSaleId: placedSaleId,
+      capturedSaleId: placedOrder.saleId,
       objectKey: newObjectKey(),
       declaredMimeType: input.declaredMimeType,
       declaredAmountCents: declaredAmountCentsOf(input.caption),

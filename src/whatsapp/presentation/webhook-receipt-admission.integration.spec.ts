@@ -180,8 +180,18 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     const probe = new AdmissionProbe(new PostgresReceiptMediaStore(pool));
     const dedup = new PostgresWebhookDedupStore(pool);
     const state = {
-      data: { placedSaleId: PLACED_SALE_ID },
-    } as ConversationState;
+      data: {
+        minimalCart: {
+          items: [],
+          idempotencyKey: '',
+          placedSale: {
+            saleId: PLACED_SALE_ID,
+            folio: null,
+            totalCents: 150_000,
+          },
+        },
+      },
+    } as unknown as ConversationState;
     const conversations = {
       get: jest.fn<Promise<ConversationState | null>, [string]>(() =>
         Promise.resolve(state),

@@ -15,7 +15,7 @@ import {
 const SENDER = 'sender-1';
 const WAMID = 'wamid.ABC';
 const MEDIA = 'media-1';
-const SALE = 'sale-A';
+const SALE = '6b1f0c2e-8d4a-4c3b-9e2f-1a2b3c4d5e6f';
 const IDENTITY: ActiveSenderIdentity = {
   senderId: SENDER,
   webhookMessageId: WAMID,
@@ -24,6 +24,17 @@ const IDENTITY: ActiveSenderIdentity = {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SEND = /send|notify|deliver|llm|agent|schedule|outbox|worker|prompt/i;
+
+// Conversation state after a minimal-route order (`minimalCart.placedSale`).
+const placedOrderState = (placedSale: unknown): ConversationState =>
+  ({
+    data: { minimalCart: { items: [], idempotencyKey: '', placedSale } },
+  }) as unknown as ConversationState;
+const placedSale = (saleId: string) => ({
+  saleId,
+  folio: 'F-1',
+  totalCents: 12_345,
+});
 
 const receipt = (id = 'r-1') => ({ id }) as ReceiptMediaRow;
 const created = (): { kind: 'created'; receipt: ReceiptMediaRow } => ({
@@ -45,7 +56,7 @@ const deferred = <T>() => {
 };
 type Reserve = (input: ReserveInput) => Promise<ReservationOutcome>;
 const fixture = (
-  placedSaleId: string | null = SALE,
+  saleId: string | null = SALE,
   reserveImpl: Reserve = () => Promise.resolve(created()),
   enabled = true,
   activeStatus: ActiveReceiptStatus | null = null,
@@ -55,10 +66,7 @@ const fixture = (
     Promise<ActiveReceiptStatus | null>,
     [ActiveSenderIdentity]
   >(() => Promise.resolve(activeStatus));
-  const state =
-    placedSaleId === null
-      ? null
-      : ({ data: { placedSaleId } } as ConversationState);
+  const state = saleId === null ? null : placedOrderState(placedSale(saleId));
   const conversations = { getState: jest.fn(() => Promise.resolve(state)) };
   const service = new ReceiptIngressService({ enabled }, conversations, {
     admit: reserve,
@@ -99,6 +107,39 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     expect(reserve).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['an empty state', { data: {} }],
+    ['an empty minimal cart', { data: { minimalCart: { items: [] } } }],
+    ['only the legacy placedSaleId', { data: { placedSaleId: SALE } }],
+    ['an empty saleId', placedOrderState(placedSale(''))],
+    ['a non-UUID saleId', placedOrderState(placedSale('sale-A'))],
+    [
+      'a non-canonical saleId',
+      placedOrderState(placedSale(SALE.toUpperCase())),
+    ],
+    ['a numeric saleId', placedOrderState({ saleId: 42, totalCents: 1 })],
+    ['a non-object placedSale', placedOrderState('sale')],
+    ['a non-object minimalCart', { data: { minimalCart: SALE } }],
+  ])('treats %s as no placed sale', async (_label, data) => {
+    const { service, conversations, reserve } = fixture();
+    conversations.getState.mockResolvedValue(data as ConversationState);
+    await expect(service.admit(input())).resolves.toEqual({
+      kind: 'no-placed-sale',
+    });
+    expect(reserve).not.toHaveBeenCalled();
+  });
+
+  it('binds the receipt to minimalCart.placedSale.saleId (S3)', async () => {
+    const { service, conversations, reserve } = fixture();
+    conversations.getState.mockResolvedValue(
+      placedOrderState({ saleId: SALE, folio: null, totalCents: 0 }),
+    );
+    await expect(service.admit(input())).resolves.toMatchObject({
+      kind: 'reserved',
+    });
+    expect(reserve.mock.calls[0][0].capturedSaleId).toBe(SALE);
+  });
+
   it('waits for the atomic receipt admission operation rather than the legacy reservation path', async () => {
     const admission = jest.fn<Promise<ReservationOutcome>, [ReserveInput]>(() =>
       Promise.resolve(created()),
@@ -106,7 +147,7 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     const reserve = jest.fn<Promise<ReservationOutcome>, [ReserveInput]>(() =>
       Promise.reject(new Error('legacy reservation path used')),
     );
-    const state = { data: { placedSaleId: SALE } } as ConversationState;
+    const state = placedOrderState(placedSale(SALE));
     const ingressStore = {
       admit: admission,
       reserve,
@@ -429,9 +470,8 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     ['no-placed-sale', null],
   ] as const)(
     'continues to admit as %s when no unrelated active row exists',
-    async (kind, placedSaleId) => {
-      const { service, conversations, reserve, findActive } =
-        fixture(placedSaleId);
+    async (kind, saleId) => {
+      const { service, conversations, reserve, findActive } = fixture(saleId);
       expect((await service.admit(input())).kind).toBe(kind);
       expect(findActive).toHaveBeenCalledWith(IDENTITY);
       expect(conversations.getState).toHaveBeenCalledWith(SENDER);
