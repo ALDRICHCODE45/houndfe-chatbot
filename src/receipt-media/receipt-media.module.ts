@@ -86,7 +86,10 @@ import {
   type NotificationAlertSeam,
 } from './infrastructure/receipt-media-notification.worker';
 import { ReceiptMediaAccessController } from './presentation/receipt-media-access.controller';
-import { ReceiptMetricsAuthGuard } from './presentation/receipt-metrics-auth.guard';
+import {
+  isConfiguredMetricsToken,
+  ReceiptMetricsAuthGuard,
+} from './presentation/receipt-metrics-auth.guard';
 import { ReceiptMetricsController } from './presentation/receipt-metrics.controller';
 import {
   PrometheusReceiptTelemetry,
@@ -565,14 +568,17 @@ class ReceiptCleanupLifecycle
     // WU15-2 telemetry: singleton adapter + guard. The telemetry adapter
     // carries its own isolated Registry; two instances with the same Registry
     // resolve to the same object (singleton DI). The adapter's record()
-    // method is a no-op when metricsFlag is false and never escapes failures.
+    // method is a no-op when no metrics token is configured and never escapes
+    // failures.
     // No Prometheus scrape causes storage/provider I/O.
     ReceiptMetricsAuthGuard,
     {
       provide: RECEIPT_TELEMETRY,
       useFactory: (config: ConfigService): PrometheusReceiptTelemetry =>
         new PrometheusReceiptTelemetry(
-          config.get<boolean>('receiptMedia.metricsEnabled') === true,
+          isConfiguredMetricsToken(
+            config.get<string>('receiptMedia.metricsToken'),
+          ),
         ),
       inject: [ConfigService],
     },

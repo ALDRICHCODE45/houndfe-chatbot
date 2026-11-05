@@ -836,7 +836,6 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       const pool = stubPool();
       applyEnv({
         ...RECEIPT_ENABLED_ENV,
-        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
         RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(64),
       });
       const builder = Test.createTestingModule({

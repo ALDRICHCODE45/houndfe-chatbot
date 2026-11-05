@@ -148,8 +148,9 @@ this number before cutover; do not assume inherited access or scope.
     with a leading `+`). Boot fails fast on a `+`/separator/whitespace form, so
     ops handoff replies cannot be silently dropped.
   - Receipt flags stay **false**: `RECEIPT_MEDIA_ENABLED=false`,
-    `RECEIPT_MEDIA_INGESTION_ENABLED=false`,
-    `RECEIPT_MEDIA_METRICS_ENABLED=false` (ODD-8 gates).
+    `RECEIPT_MEDIA_INGESTION_ENABLED=false` (ODD-8 gates). Leave
+    `RECEIPT_MEDIA_METRICS_TOKEN` unset unless metrics are scraped; the
+    metrics endpoint answers 404 without it.
 
 - Preserve `META_APP_SECRET` and `META_VERIFY_TOKEN` unless Meta actually
   changes them; do not rotate them for convenience at cutover.

@@ -8,9 +8,9 @@
  * to the controller task (WU15-2).
  *
  * Guard contract:
- *  - metrics disabled → 404 regardless of Authorization
- *  - metrics enabled + missing/invalid/malformed Authorization → 401
- *  - metrics enabled + correct dedicated Bearer token → true
+ *  - no valid configured token → 404 regardless of Authorization
+ *  - token configured + missing/invalid/malformed Authorization → 401
+ *  - token configured + correct dedicated Bearer token → true
  *  - Token only through Authorization header; never query/cookies
  *  - Case-insensitive HTTP auth scheme; strict token bytes
  *  - request and request.headers must be plain objects
@@ -42,51 +42,22 @@ function makeMockConfig(getImpl: (key: string) => unknown): ConfigService {
   return { get: getImpl } as ConfigService;
 }
 
+function makeTokenMock(token: unknown): ConfigService {
+  return makeMockConfig((key) =>
+    key === 'receiptMedia.metricsToken' ? token : undefined,
+  );
+}
+
 function makeDefaultMock(): ConfigService {
-  return makeMockConfig((key) =>
-    key === 'receiptMedia.metricsEnabled'
-      ? true
-      : key === 'receiptMedia.metricsToken'
-        ? FIXED_FAKE_TOKEN
-        : undefined,
-  );
+  return makeTokenMock(FIXED_FAKE_TOKEN);
 }
 
-function makeDisabledMock(): ConfigService {
-  return makeMockConfig((key) =>
-    key === 'receiptMedia.metricsEnabled'
-      ? false
-      : key === 'receiptMedia.metricsToken'
-        ? FIXED_FAKE_TOKEN
-        : undefined,
-  );
-}
-
-function makeUndefinedEnabledMock(): ConfigService {
+function makeNoTokenMock(): ConfigService {
   return makeMockConfig(() => undefined);
 }
 
 function makeWrongTokenMock(): ConfigService {
-  return makeMockConfig((key) =>
-    key === 'receiptMedia.metricsEnabled'
-      ? true
-      : key === 'receiptMedia.metricsToken'
-        ? WRONG_TOKEN
-        : undefined,
-  );
-}
-
-function makeCustomMock(opts: {
-  metricsEnabled?: boolean;
-  metricsToken?: string;
-}): ConfigService {
-  return makeMockConfig((key) =>
-    key === 'receiptMedia.metricsEnabled'
-      ? opts.metricsEnabled
-      : key === 'receiptMedia.metricsToken'
-        ? opts.metricsToken
-        : undefined,
-  );
+  return makeTokenMock(WRONG_TOKEN);
 }
 
 type ParsedRequest = { headers: Record<string, unknown> };
@@ -400,8 +371,8 @@ describe('ReceiptMetricsAuthGuard', () => {
       ).toThrow(UnauthorizedException);
     });
 
-    it('throws 404 when malformed request is provided but metrics are disabled', () => {
-      const guard = new ReceiptMetricsAuthGuard(makeDisabledMock());
+    it('throws 404 when malformed request is provided but no token is configured', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeNoTokenMock());
       expect(() =>
         guard.canActivate({
           switchToHttp: () => ({ getRequest: () => null }),
@@ -409,7 +380,7 @@ describe('ReceiptMetricsAuthGuard', () => {
       ).toThrow(NotFoundException);
     });
 
-    it('throws 401 when request headers container is null (enabled)', () => {
+    it('throws 401 when request headers container is null (token configured)', () => {
       const guard = new ReceiptMetricsAuthGuard(makeDefaultMock());
       expect(() =>
         guard.canActivate({
@@ -421,10 +392,10 @@ describe('ReceiptMetricsAuthGuard', () => {
     });
   });
 
-  // ─── 404 when metrics are disabled ──────────────────────────────────
-  describe('metrics disabled → 404', () => {
-    it('throws 404 when metricsEnabled is false', () => {
-      const guard = new ReceiptMetricsAuthGuard(makeDisabledMock());
+  // ─── 404 when no metrics token is configured ───────────────────────
+  describe('no configured token → 404', () => {
+    it('throws 404 when no token is configured', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeNoTokenMock());
       expect(() =>
         guard.canActivate(
           makeFullCtx(
@@ -435,8 +406,13 @@ describe('ReceiptMetricsAuthGuard', () => {
       ).toThrow(NotFoundException);
     });
 
-    it('throws 404 when metricsEnabled is undefined', () => {
-      const guard = new ReceiptMetricsAuthGuard(makeUndefinedEnabledMock());
+    // T4: the removed metricsEnabled key has no effect on serving.
+    it('throws 404 without a token even when a stale metricsEnabled=true is present', () => {
+      const guard = new ReceiptMetricsAuthGuard(
+        makeMockConfig((key) =>
+          key === 'receiptMedia.metricsEnabled' ? true : undefined,
+        ),
+      );
       expect(() =>
         guard.canActivate(
           makeFullCtx(
@@ -447,23 +423,23 @@ describe('ReceiptMetricsAuthGuard', () => {
       ).toThrow(NotFoundException);
     });
 
-    it('throws 404 regardless of Authorization header when disabled', () => {
-      const guard = new ReceiptMetricsAuthGuard(makeDisabledMock());
+    it('throws 404 regardless of Authorization header when no token is configured', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeNoTokenMock());
       expect(() =>
         guard.canActivate(makeParsedCtx({ authorization: 'Bearer WRONG' })),
       ).toThrow(NotFoundException);
     });
 
-    it('throws 404 when no Authorization header is present and disabled', () => {
-      const guard = new ReceiptMetricsAuthGuard(makeDisabledMock());
+    it('throws 404 when no Authorization header is present and no token is configured', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeNoTokenMock());
       expect(() => guard.canActivate(makeParsedCtx({}))).toThrow(
         NotFoundException,
       );
     });
   });
 
-  // ─── 401 when metrics are enabled but Authorization is missing/malformed ─────
-  describe('metrics enabled → 401 on auth failures', () => {
+  // ─── 401 when a token is configured but Authorization is missing/malformed ───
+  describe('token configured → 401 on auth failures', () => {
     // Intentionally missing raw: tests that verify missing rawHeaders behavior
     it('throws 401 when Authorization header is absent', () => {
       const guard = new ReceiptMetricsAuthGuard(makeDefaultMock());
@@ -908,13 +884,7 @@ describe('ReceiptMetricsAuthGuard', () => {
     });
 
     it('throws 401 when configured uppercase token receives lowercase request token', () => {
-      const upperConfig = makeMockConfig((key) =>
-        key === 'receiptMedia.metricsEnabled'
-          ? true
-          : key === 'receiptMedia.metricsToken'
-            ? UPPER_HEX_TOKEN
-            : undefined,
-      );
+      const upperConfig = makeTokenMock(UPPER_HEX_TOKEN);
       const guard = new ReceiptMetricsAuthGuard(upperConfig);
       const val = `Bearer ${FIXED_FAKE_TOKEN}`;
       expect(() =>
@@ -930,13 +900,7 @@ describe('ReceiptMetricsAuthGuard', () => {
     });
 
     it('returns true when token is exactly 64 hex chars (uppercase) and configured token is identical uppercase', () => {
-      const upperConfig = makeMockConfig((key) =>
-        key === 'receiptMedia.metricsEnabled'
-          ? true
-          : key === 'receiptMedia.metricsToken'
-            ? UPPER_HEX_TOKEN
-            : undefined,
-      );
+      const upperConfig = makeTokenMock(UPPER_HEX_TOKEN);
       const guard = new ReceiptMetricsAuthGuard(upperConfig);
       const upperRaw = [
         'Authorization',
@@ -979,12 +943,10 @@ describe('ReceiptMetricsAuthGuard', () => {
     });
   });
 
-  // ─── Defense-in-depth: missing configured token → deny ──────────────
-  describe('defense-in-depth: missing configured token → deny', () => {
-    it('throws 401 when configured token is undefined', () => {
-      const guard = new ReceiptMetricsAuthGuard(
-        makeCustomMock({ metricsEnabled: true, metricsToken: undefined }),
-      );
+  // ─── Missing or unusable configured token → endpoint not served ────
+  describe('missing or unusable configured token → 404', () => {
+    it('throws 404 when configured token is undefined', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeTokenMock(undefined));
       expect(() =>
         guard.canActivate(
           makeFullCtx(
@@ -992,13 +954,11 @@ describe('ReceiptMetricsAuthGuard', () => {
             VALID_RAW,
           ),
         ),
-      ).toThrow(UnauthorizedException);
+      ).toThrow(NotFoundException);
     });
 
-    it('throws 401 when configured token is empty string', () => {
-      const guard = new ReceiptMetricsAuthGuard(
-        makeCustomMock({ metricsEnabled: true, metricsToken: '' }),
-      );
+    it('throws 404 when configured token is empty string', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeTokenMock(''));
       expect(() =>
         guard.canActivate(
           makeFullCtx(
@@ -1006,13 +966,11 @@ describe('ReceiptMetricsAuthGuard', () => {
             VALID_RAW,
           ),
         ),
-      ).toThrow(UnauthorizedException);
+      ).toThrow(NotFoundException);
     });
 
-    it('throws 401 when configured token is whitespace-only string', () => {
-      const guard = new ReceiptMetricsAuthGuard(
-        makeCustomMock({ metricsEnabled: true, metricsToken: '   ' }),
-      );
+    it('throws 404 when configured token is whitespace-only string', () => {
+      const guard = new ReceiptMetricsAuthGuard(makeTokenMock('   '));
       expect(() =>
         guard.canActivate(
           makeFullCtx(
@@ -1020,7 +978,7 @@ describe('ReceiptMetricsAuthGuard', () => {
             VALID_RAW,
           ),
         ),
-      ).toThrow(UnauthorizedException);
+      ).toThrow(NotFoundException);
     });
   });
 
@@ -1047,9 +1005,7 @@ describe('ReceiptMetricsAuthGuard', () => {
       expect.assertions(2);
       const DIFFERENT_TOKEN =
         'b2c3d4e5f67890123456789012345678901bcdef01234567890bcdef01234567';
-      const guard = new ReceiptMetricsAuthGuard(
-        makeCustomMock({ metricsEnabled: true, metricsToken: DIFFERENT_TOKEN }),
-      );
+      const guard = new ReceiptMetricsAuthGuard(makeTokenMock(DIFFERENT_TOKEN));
       try {
         guard.canActivate(
           makeFullCtx(

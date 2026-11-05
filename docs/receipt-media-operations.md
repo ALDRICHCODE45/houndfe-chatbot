@@ -4,14 +4,15 @@ This slice exposes an authenticated, in-memory telemetry foundation. It does
 **not** activate ingestion, TX2, receipt attachment, or additional business
 emitters. Local tests are not evidence of production deployment readiness.
 
-## Before enabling metrics
+## Before serving metrics
 
 1. Provision a dedicated `RECEIPT_MEDIA_METRICS_TOKEN` through your secret manager.
    Generate it from 32 cryptographically random bytes encoded as 64 ASCII hex
    characters. Never reuse Meta, service-API, or receipt-capability secrets.
-2. Set `RECEIPT_MEDIA_METRICS_ENABLED=true` and inject the token at boot. Coordinate
-   this with the scraper secret. Changes require a graceful restart; no live
-   toggle or dual-token overlap is implemented.
+2. Inject the token at boot; the endpoint is served exactly when
+   `RECEIPT_MEDIA_METRICS_TOKEN` is configured (there is no separate enable
+   flag). Coordinate this with the scraper secret. Changes require a graceful
+   restart; no live toggle or dual-token overlap is implemented.
 3. Require HTTPS with certificate verification and restrict the endpoint to the
    scraper using firewall, VPN, or proxy policy. `/internal` is only a path name,
    not a private-network boundary. Prevent direct public access to the app port.
@@ -25,14 +26,13 @@ emitters. Local tests are not evidence of production deployment readiness.
 
 Route: `GET /internal/receipt-media/metrics`.
 
-| Condition                                                           | Result                                                                                                  |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Metrics flag missing or false                                       | HTTP 404; guard stops before serialization                                                              |
-| Metrics enabled, configured token missing or malformed              | Boot validation rejects configuration; no running endpoint is established                               |
-| Any malformed configured token supplied, even with metrics disabled | Boot validation rejects configuration                                                                   |
-| Running endpoint, missing/wrong request credentials                 | HTTP 401; no serialization                                                                              |
-| Running endpoint, valid dedicated Bearer token                      | HTTP 200, Prometheus content type, `Cache-Control: no-store`                                            |
-| Authenticated scrape whose registry serialization fails             | HTTP 503, fixed `metrics unavailable` body, `Cache-Control: no-store`; not a successful metrics payload |
+| Condition                                               | Result                                                                                                  |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `RECEIPT_MEDIA_METRICS_TOKEN` absent                    | HTTP 404; guard stops before serialization                                                              |
+| Malformed `RECEIPT_MEDIA_METRICS_TOKEN` supplied        | Boot validation rejects configuration; no running endpoint is established                               |
+| Running endpoint, missing/wrong request credentials     | HTTP 401; no serialization                                                                              |
+| Running endpoint, valid dedicated Bearer token          | HTTP 200, Prometheus content type, `Cache-Control: no-store`                                            |
+| Authenticated scrape whose registry serialization fails | HTTP 503, fixed `metrics unavailable` body, `Cache-Control: no-store`; not a successful metrics payload |
 
 Token format permits upper- and lowercase hexadecimal characters, but
 **authentication compares the exact, case-sensitive secret bytes**. Do not
@@ -41,8 +41,8 @@ normalize token case. The Bearer scheme is case-insensitive. Send exactly one
 authenticate; duplicate, malformed, or inconsistent Authorization metadata is
 denied.
 
-The metrics flag is independent of `RECEIPT_MEDIA_ENABLED` (receipt admission).
-Metrics can be enabled while admission is disabled, or disabled while admission
+The metrics token is independent of `RECEIPT_MEDIA_ENABLED` (receipt admission).
+Metrics can be served while admission is disabled, or not served while admission
 is enabled. Disabling admission also fail-closes **existing receipt capability
 lookup** and leaves the notification drain inert. A mounted download route does
 not mean existing downloads remain usable.
@@ -54,12 +54,12 @@ It has no global/default process collectors. Scraping serializes in-memory state
 it does not query storage, the database, Meta, or the backend. The existing
 notification drain may perform its own work independently of a scrape.
 
-| Metric                                     | Meaning                                                                                                                           |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `receipt_media_metrics_enabled`            | Configuration gauge: metrics flag (1 or 0), **not** receipt admission or pipeline health. An enabled endpoint normally exposes 1. |
-| `receipt_outbox_tx2_committed_total`       | Counter initialized only after recording a committed TX2 event                                                                    |
-| `receipt_outbox_tx2_transition_lost_total` | Counter initialized only after recording a lost TX2 transition                                                                    |
-| `receipt_outbox_tx2_failed_total`          | Counter initialized only after recording a failed TX2 event                                                                       |
+| Metric                                     | Meaning                                                                                                                            |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `receipt_media_metrics_enabled`            | Configuration gauge: metrics token configured (1 or 0), **not** receipt admission or pipeline health. A served endpoint exposes 1. |
+| `receipt_outbox_tx2_committed_total`       | Counter initialized only after recording a committed TX2 event                                                                     |
+| `receipt_outbox_tx2_transition_lost_total` | Counter initialized only after recording a lost TX2 transition                                                                     |
+| `receipt_outbox_tx2_failed_total`          | Counter initialized only after recording a failed TX2 event                                                                        |
 
 The three TX2 emitters remain unwired in the current production composition.
 Their counters are therefore **absent**, not preinitialized healthy zeros. A

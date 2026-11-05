@@ -63,7 +63,6 @@ export const POSTURE_EXPECTATIONS: readonly {
   { name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' },
   { name: 'RECEIPT_MEDIA_ENABLED', expected: 'false' },
   { name: 'RECEIPT_MEDIA_INGESTION_ENABLED', expected: 'false' },
-  { name: 'RECEIPT_MEDIA_METRICS_ENABLED', expected: 'false' },
   // Launch preflight requires explicit `false` even though the runtime default
   // is off: an absent value is `missing` and any enabled/non-canonical value is
   // `unsafe`, so shipping quotes cannot reach production implicitly.

@@ -4,9 +4,9 @@
  * Auth:  ReceiptMetricsAuthGuard (dedicated Bearer token, REAL guard).
  *
  * Behavior:
- *   - Metrics disabled → 404 (no auth inspection)
- *   - Metrics enabled + invalid/missing token → 401
- *   - Metrics enabled + valid token → 200, Prometheus text, no-store
+ *   - No RECEIPT_MEDIA_METRICS_TOKEN configured → 404 (no auth inspection)
+ *   - Token configured + invalid/missing request token → 401
+ *   - Token configured + valid request token → 200, Prometheus text, no-store
  *   - Serialization failure → 503 with fixed safe body (no raw details)
  *   - Token only through Authorization header; query/cookies denied
  *

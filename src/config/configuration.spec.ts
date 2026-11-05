@@ -47,7 +47,6 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_LEASE_MS',
     'RECEIPT_MEDIA_WORKER_POLL_MS',
     'RECEIPT_MEDIA_INGESTION_ENABLED',
-    'RECEIPT_MEDIA_METRICS_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
     'OPS_CHANNEL_PHONE',
@@ -207,7 +206,6 @@ describe('configuration()', () => {
           meta: { allowedHosts: string[] };
           storage: { forcePathStyle: boolean };
           worker: { concurrency: number; leaseMs: number };
-          metricsEnabled: boolean;
         };
       };
       expect(cfg.receiptMedia.enabled).toBe(expected);
@@ -216,7 +214,6 @@ describe('configuration()', () => {
       expect(cfg.receiptMedia.storage.forcePathStyle).toBe(false);
       expect(cfg.receiptMedia.worker.concurrency).toBe(2);
       expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
-      expect(cfg.receiptMedia.metricsEnabled).toBe(false);
     });
 
     // R3-cleanup-rollout-gate: the ingestion rollout gate is surfaced as

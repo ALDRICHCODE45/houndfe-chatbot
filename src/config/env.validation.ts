@@ -307,19 +307,16 @@ const innerEnvValidationSchema = Joi.object({
   ),
   RECEIPT_STORAGE_FORCE_PATH_STYLE: receiptConditional(Joi.boolean()),
   RECEIPT_MEDIA_PUBLIC_BASE_URL: receiptConditional(httpsUrlSchema),
-  // WU15-1: RECEIPT_MEDIA_METRICS_ENABLED is independently validated (not keyed on
-  // RECEIPT_MEDIA_ENABLED); defaults false. When true, a dedicated Bearer-safe
-  // opaque token is required: exactly 64 ASCII hex characters (32 random bytes).
-  RECEIPT_MEDIA_METRICS_ENABLED: Joi.boolean().default(false),
-  // WU15-1: Any supplied token is validated as exactly 64 ASCII hex.
-  // .when only controls requiredness: required when enabled, optional when disabled.
-  // Custom validation always rejects non-empty malformed values regardless of flag.
+  // WU15-1: optional dedicated Bearer-safe metrics token, independent of
+  // RECEIPT_MEDIA_ENABLED. The metrics endpoint is served exactly when it is
+  // configured; any supplied value must be exactly 64 ASCII hex characters
+  // (32 random bytes).
   RECEIPT_MEDIA_METRICS_TOKEN: Joi.string()
     .length(64)
     .pattern(/^[0-9a-fA-F]{64}$/)
     .custom((value: unknown, helpers) => {
-      // Allow undefined/absent (optionality handled by .when) but reject
-      // any supplied non-empty value that is not exactly 64 ASCII hex.
+      // Allow undefined/absent but reject any supplied non-empty value that
+      // is not exactly 64 ASCII hex.
       if (typeof value === 'string' && value.length > 0) {
         if (value.length !== 64 || !METRICS_TOKEN_HEX_RE.test(value)) {
           return helpers.error('string.custom');
@@ -327,26 +324,14 @@ const innerEnvValidationSchema = Joi.object({
       }
       return value;
     }, 'metrics token format')
-    .when('RECEIPT_MEDIA_METRICS_ENABLED', {
-      is: true,
-      then: Joi.string().required().messages({
-        'any.required':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" is required when "RECEIPT_MEDIA_METRICS_ENABLED" is true',
-        'string.length':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 characters',
-        'string.pattern.base':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 hexadecimal characters',
-        'string.custom':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 hexadecimal characters',
-      }),
-      otherwise: Joi.string().optional().messages({
-        'string.length':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 characters',
-        'string.pattern.base':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 hexadecimal characters',
-        'string.custom':
-          '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 hexadecimal characters',
-      }),
+    .optional()
+    .messages({
+      'string.length':
+        '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 characters',
+      'string.pattern.base':
+        '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 hexadecimal characters',
+      'string.custom':
+        '"RECEIPT_MEDIA_METRICS_TOKEN" must be exactly 64 hexadecimal characters',
     }),
   // WU1C2A numeric relations: same `receiptConditional` shape; all fields bounded by the 60s lease window, attach adds a 30s cap.
   META_MEDIA_METADATA_TIMEOUT_MS: receiptConditional(receiptLessThanLease),

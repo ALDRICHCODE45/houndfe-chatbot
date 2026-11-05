@@ -32,7 +32,6 @@ describe('AppConfigModule integration', () => {
     RECEIPT_STORAGE_FORCE_PATH_STYLE: 'false',
     RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
     RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
-    RECEIPT_MEDIA_METRICS_ENABLED: 'false',
     // SQ-2A shipping keys (managed; provider values cleared for default-off)
     SHIPPING_QUOTES_ENABLED: 'false',
     SKYDROPX_BASE_URL: 'https://api-pro.skydropx.com',
@@ -219,7 +218,6 @@ describe('AppConfigModule integration', () => {
             leaseMs: 60_000,
             pollIntervalMs: undefined,
           },
-          metricsEnabled: false,
           metricsToken: undefined,
         };
 
