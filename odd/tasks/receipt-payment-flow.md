@@ -17,7 +17,7 @@ Branch: `feat/always-on-features` (until split). Payments v1: bank transfer only
 
 ## Tasks
 
-- R1 [S3] Ingestion reads `minimalCart.placedSale` (saleId, totalCents) for the receipt's sale. Route: worker. Commit: —
+- R1 [S3] Ingestion reads `minimalCart.placedSale` (saleId, totalCents) for the receipt's sale. Route: gentle-ai-worker. Commit: db4cd90.
 - R2 [S2] Backend upload adapter replacing storage + capability in the ingestion processor and attachment service (blocked: backend upload contract). Commit: —
 - R3 [S2,S7] Delete chatbot-owned storage: S3 adapter, cleanup worker, capability service and access controller, RECEIPT*STORAGE*_, RECEIPT*CAPABILITY*_, RECEIPT_MEDIA_PUBLIC_BASE_URL, store states/columns and migrations; drop RECEIPT_MEDIA_ENABLED / RECEIPT_MEDIA_INGESTION_ENABLED. After R2. Commit: —
 - R4 [S1,S4,S8,S9] Vision (images and PDF first pages, receipt yes/no classification) pre-fill port and LLM adapter with timeout and budget; mismatch flag; never decides. Commit: —
