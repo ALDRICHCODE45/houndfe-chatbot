@@ -4,6 +4,8 @@ import { AxiosHeaders, type AxiosResponse } from 'axios';
 import { of, throwError } from 'rxjs';
 import { InboundMessage } from '../domain/inbound-message';
 import {
+  InvalidOutboundTemplateError,
+  OutboundTemplate,
   OutboundText,
   UnsupportedOutboundError,
   WHATSAPP_SENDER,
@@ -173,6 +175,201 @@ describe('MetaWhatsappSender', () => {
     expect((thrown as WhatsappSendError).status).toBe(400);
     expect(JSON.stringify(thrown)).not.toContain(token);
     expect(JSON.stringify(thrown)).not.toContain('Authorization');
+  });
+
+  describe('sendTemplate', () => {
+    const template: OutboundTemplate = {
+      to: '5215550001111',
+      templateName: 'delivery_zone_resolved',
+      languageCode: 'es_MX',
+      bodyParameters: ['Ana'],
+    };
+
+    it('sends one Graph API template request with one body parameter and returns the provider message id', async () => {
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'wamid.TPL1' }] })),
+      );
+
+      await expect(sender.sendTemplate(template)).resolves.toEqual({
+        providerMessageId: 'wamid.TPL1',
+      });
+
+      expect(httpService.post).toHaveBeenCalledTimes(1);
+      expect(httpService.post).toHaveBeenCalledWith(
+        'https://graph.facebook.com/v23.0/1234567890/messages',
+        {
+          messaging_product: 'whatsapp',
+          to: '5215550001111',
+          type: 'template',
+          template: {
+            name: 'delivery_zone_resolved',
+            language: { code: 'es_MX' },
+            components: [
+              {
+                type: 'body',
+                parameters: [{ type: 'text', text: 'Ana' }],
+              },
+            ],
+          },
+        },
+        {
+          headers: {
+            Authorization: 'Bearer meta-access-token',
+          },
+        },
+      );
+    });
+
+    it('keeps two body parameters in order and passes the language code through', async () => {
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'wamid.TPL2' }] })),
+      );
+
+      await sender.sendTemplate({
+        ...template,
+        languageCode: 'en_US',
+        bodyParameters: ['Ana', '06700'],
+      });
+
+      expect(httpService.post).toHaveBeenCalledWith(
+        expect.anything(),
+        {
+          messaging_product: 'whatsapp',
+          to: '5215550001111',
+          type: 'template',
+          template: {
+            name: 'delivery_zone_resolved',
+            language: { code: 'en_US' },
+            components: [
+              {
+                type: 'body',
+                parameters: [
+                  { type: 'text', text: 'Ana' },
+                  { type: 'text', text: '06700' },
+                ],
+              },
+            ],
+          },
+        },
+        expect.anything(),
+      );
+    });
+
+    it('omits the body component for a template without variables', async () => {
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'w' }] })),
+      );
+
+      await sender.sendTemplate({ ...template, bodyParameters: [] });
+
+      expect(httpService.post).toHaveBeenCalledWith(
+        expect.anything(),
+        {
+          messaging_product: 'whatsapp',
+          to: '5215550001111',
+          type: 'template',
+          template: {
+            name: 'delivery_zone_resolved',
+            language: { code: 'es_MX' },
+          },
+        },
+        expect.anything(),
+      );
+    });
+
+    it('rewrites the trunk-1 recipient only when normalization is enabled', async () => {
+      sandboxRecipientNormalizationEnabled = true;
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'w' }] })),
+      );
+
+      await sender.sendTemplate(template);
+
+      expect(httpService.post).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({ to: '525550001111' }),
+        expect.anything(),
+      );
+    });
+
+    it.each<[string, Partial<OutboundTemplate>]>([
+      ['uppercase name', { templateName: 'Delivery_Zone' }],
+      ['name with a dash', { templateName: 'delivery-zone' }],
+      ['empty name', { templateName: '' }],
+      ['name over 512 chars', { templateName: 'a'.repeat(513) }],
+      ['empty language code', { languageCode: '' }],
+      ['empty recipient', { to: '' }],
+      ['empty parameter', { bodyParameters: [''] }],
+      ['whitespace-only parameter', { bodyParameters: ['   '] }],
+      ['untrimmed parameter', { bodyParameters: [' Ana'] }],
+      ['newline in parameter', { bodyParameters: ['Ana\nLópez'] }],
+      ['tab in parameter', { bodyParameters: ['Ana\tLópez'] }],
+      ['five consecutive spaces', { bodyParameters: ['Ana     López'] }],
+      ['parameter over 1024 chars', { bodyParameters: ['a'.repeat(1025)] }],
+      [
+        'non-array parameters',
+        { bodyParameters: 'Ana' as unknown as string[] },
+      ],
+    ])('rejects %s before any request', async (_label, override) => {
+      await expect(
+        sender.sendTemplate({ ...template, ...override }),
+      ).rejects.toThrow(InvalidOutboundTemplateError);
+      expect(httpService.post).not.toHaveBeenCalled();
+    });
+
+    it('accepts boundary values: 512-char name, 1024-char parameter, four consecutive spaces', async () => {
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'w' }] })),
+      );
+
+      await expect(
+        sender.sendTemplate({
+          ...template,
+          templateName: 'a'.repeat(512),
+          bodyParameters: ['a'.repeat(1024), 'Ana    López'],
+        }),
+      ).resolves.toEqual({ providerMessageId: 'w' });
+    });
+
+    it('maps a Graph API rejection to the same sanitized typed error as sendText', async () => {
+      const token = 'meta-access-token';
+      httpService.post.mockReturnValue(
+        throwError(() => ({
+          isAxiosError: true,
+          config: { headers: { Authorization: `Bearer ${token}` } },
+          response: {
+            status: 400,
+            data: {
+              error: { code: 132001, message: 'Template does not exist' },
+            },
+          },
+        })),
+      );
+
+      let thrown: unknown;
+      try {
+        await sender.sendTemplate(template);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(WhatsappSendError);
+      expect((thrown as WhatsappSendError).status).toBe(400);
+      expect((thrown as WhatsappSendError).graphErrorCode).toBe(132001);
+      expect((thrown as WhatsappSendError).graphErrorMessage).toBe(
+        'Template does not exist',
+      );
+      expect(JSON.stringify(thrown)).not.toContain(token);
+      expect(httpService.post).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails when Meta omits the provider message id', async () => {
+      httpService.post.mockReturnValue(of(axiosResponse({ messages: [] })));
+
+      await expect(sender.sendTemplate(template)).rejects.toThrow(
+        'Meta response did not include a provider message id',
+      );
+    });
   });
 });
 

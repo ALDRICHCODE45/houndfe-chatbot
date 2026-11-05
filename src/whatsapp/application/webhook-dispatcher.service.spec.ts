@@ -117,6 +117,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           [Parameters<WhatsappSenderPort['sendText']>[0]]
         >()
         .mockResolvedValue({ providerMessageId: 'wamid.reply' }),
+      sendTemplate: jest.fn(),
     };
 
     llm = {

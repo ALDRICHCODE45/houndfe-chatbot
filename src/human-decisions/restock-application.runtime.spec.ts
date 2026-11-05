@@ -38,7 +38,7 @@ function fixture(identity = { branch, phone }) {
     getRestockDecision: jest.fn(),
     recordRestockApplicationOutcome: jest.fn(),
   };
-  const sender = { sendText: jest.fn() };
+  const sender = { sendText: jest.fn(), sendTemplate: jest.fn() };
   const runtime = new RestockApplicationRuntime(
     config as unknown as ConfigService,
     pool as unknown as Pool,

@@ -200,7 +200,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
         Promise.resolve(state),
       ),
     };
-    const sender = { sendText: jest.fn() };
+    const sender = { sendText: jest.fn(), sendTemplate: jest.fn() };
     const agentRunner = { handle: jest.fn() };
     const minimalAgent = { tryHandle: jest.fn() };
     const amountRouter = { route: jest.fn() };

@@ -3,6 +3,7 @@ import axios from 'axios';
 import request from 'supertest';
 import type { GenerateTextFn } from '../src/llm-agent/infrastructure/generate-text.provider';
 import {
+  type OutboundTemplate,
   type OutboundText,
   type SendResult,
   type WhatsappSenderPort,
@@ -102,9 +103,14 @@ function inboundBatchBody(
 /** Outbound fake transport: records the fenced send without calling Meta. */
 class FakeTransport implements WhatsappSenderPort {
   readonly sent: OutboundText[] = [];
+  readonly sentTemplates: OutboundTemplate[] = [];
   async sendText(message: OutboundText): Promise<SendResult> {
     this.sent.push(message);
     return { providerMessageId: `wamid.fake.${this.sent.length}` };
+  }
+  async sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    this.sentTemplates.push(message);
+    return { providerMessageId: `wamid.fake.tpl.${this.sentTemplates.length}` };
   }
 }
 

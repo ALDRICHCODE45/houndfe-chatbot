@@ -66,6 +66,7 @@ ddescribe('legacy handoff reservation (real DB)', () => {
       sendText: jest
         .fn()
         .mockResolvedValue({ providerMessageId: 'wamid.outbound' }),
+      sendTemplate: jest.fn(),
     };
     const config = {
       get: (key: string) =>

@@ -1,4 +1,5 @@
 import {
+  type OutboundTemplate,
   type OutboundText,
   type SendResult,
   type WhatsappSenderPort,
@@ -151,6 +152,17 @@ export class SandboxAllowlistSender implements WhatsappSenderPort {
       return Promise.reject(new SandboxOutboundError('recipient_not_allowed'));
     }
     return this.inner.sendText({ ...message, to: normalized });
+  }
+
+  /** Same recipient fence as sendText; template content is Meta-validated. */
+  sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    const to: unknown = (message as { to?: unknown } | undefined)?.to;
+    const normalized =
+      typeof to === 'string' ? normalizeSandboxRecipient(to, true) : '';
+    if (normalized !== this.approvedRecipient) {
+      return Promise.reject(new SandboxOutboundError('recipient_not_allowed'));
+    }
+    return this.inner.sendTemplate({ ...message, to: normalized });
   }
 }
 

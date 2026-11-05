@@ -8,6 +8,7 @@ import {
   type SandboxEnv,
 } from './meta-sandbox-config';
 import {
+  type OutboundTemplate,
   type OutboundText,
   type SendResult,
   type WhatsappSenderPort,
@@ -25,10 +26,18 @@ const APPROVED_RECIPIENT = '525550001111';
 
 class FakeInnerSender implements WhatsappSenderPort {
   readonly sent: OutboundText[] = [];
+  readonly sentTemplates: OutboundTemplate[] = [];
 
   async sendText(message: OutboundText): Promise<SendResult> {
     this.sent.push(message);
     return { providerMessageId: `wamid.sandbox.${this.sent.length}` };
+  }
+
+  async sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    this.sentTemplates.push(message);
+    return {
+      providerMessageId: `wamid.sandbox.tpl.${this.sentTemplates.length}`,
+    };
   }
 }
 

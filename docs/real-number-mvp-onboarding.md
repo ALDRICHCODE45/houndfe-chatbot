@@ -232,3 +232,20 @@ Limitations: presence is not validity; a migration file on disk is not an
 applied migration; all reachability and data checks (backend, the 13 routes,
 cashier user, `ServiceCredential` with seven scopes including
 `payment-details:read`, active `PaymentDetail`, populated catalog) stay manual.
+
+## 13. Template messages
+
+`WhatsappSenderPort.sendTemplate` sends a pre-approved Meta template (name,
+language code such as `es_MX`, and ordered body parameters `{{1}}..{{n}}`).
+
+- Create each template in Meta WhatsApp Manager and wait for Meta to approve
+  it **before** any code uses its name; an unapproved or unknown template is
+  rejected by Meta (surfaced as `WhatsappSendError`).
+- Use templates only **outside** the 24h customer service window (e.g. a late
+  delivery-zone decision). Inside the window the bot keeps replying with
+  free-form text via `sendText`.
+- Body parameters must be non-empty and trimmed, at most 1024 characters,
+  without newlines or tabs and with no more than 4 consecutive spaces; the
+  adapter rejects violations before calling Meta.
+- Template names must match the approved name exactly (lowercase `a-z`,
+  `0-9`, `_`, at most 512 characters).

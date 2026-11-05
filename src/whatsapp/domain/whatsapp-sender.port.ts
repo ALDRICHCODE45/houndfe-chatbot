@@ -7,6 +7,23 @@ export interface OutboundText {
   text: string;
 }
 
+/**
+ * Pre-approved template message (Meta WhatsApp Manager). Only for sends
+ * outside the 24h customer service window, where free-form text is refused.
+ */
+export interface OutboundTemplate {
+  to: string;
+  /** Lowercase `[a-z0-9_]+`, at most 512 chars. */
+  templateName: string;
+  /** Approved template language, e.g. `es_MX`. */
+  languageCode: string;
+  /**
+   * Ordered `{{1}}..{{n}}` body values: each non-empty, trimmed, at most 1024
+   * chars, no newlines/tabs and no more than 4 consecutive spaces.
+   */
+  bodyParameters: string[];
+}
+
 /** Minimal send acknowledgement returned by the provider adapter. */
 export interface SendResult {
   providerMessageId: string;
@@ -22,7 +39,16 @@ export class UnsupportedOutboundError extends Error {
   }
 }
 
-/** Port abstraction for outbound WhatsApp text delivery. */
+/** Error raised when a template message would be rejected by Meta. */
+export class InvalidOutboundTemplateError extends Error {
+  constructor(public readonly reason: string) {
+    super(`Invalid outbound template message: ${reason}`);
+    this.name = 'InvalidOutboundTemplateError';
+  }
+}
+
+/** Port abstraction for outbound WhatsApp text and template delivery. */
 export interface WhatsappSenderPort {
   sendText(message: OutboundText): Promise<SendResult>;
+  sendTemplate(message: OutboundTemplate): Promise<SendResult>;
 }

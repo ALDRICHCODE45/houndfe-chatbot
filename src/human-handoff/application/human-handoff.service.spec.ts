@@ -77,6 +77,7 @@ describe('HumanHandoffService', () => {
       sendText: jest
         .fn()
         .mockResolvedValue({ providerMessageId: 'wamid.outbound' }),
+      sendTemplate: jest.fn(),
     };
 
     conversationStore = {

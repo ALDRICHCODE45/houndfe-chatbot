@@ -21,6 +21,7 @@ import { RECENT_OUTBOUND } from '../../src/whatsapp/domain/recent-outbound.store
 import { WEBHOOK_DEDUP } from '../../src/whatsapp/domain/webhook-dedup.store';
 import {
   WHATSAPP_SENDER,
+  type OutboundTemplate,
   type OutboundText,
   type SendResult,
   type WhatsappSenderPort,
@@ -76,10 +77,19 @@ export const SANDBOX_CONFIG = {
 /** In-memory sender double; records every outbound instead of calling Meta. */
 export class SandboxSender implements WhatsappSenderPort {
   readonly sent: OutboundText[] = [];
+  readonly sentTemplates: OutboundTemplate[] = [];
   private sequence = 0;
 
   sendText(message: OutboundText): Promise<SendResult> {
     this.sent.push(message);
+    this.sequence += 1;
+    return Promise.resolve({
+      providerMessageId: `wamid.sandbox.${this.sequence}`,
+    });
+  }
+
+  sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    this.sentTemplates.push(message);
     this.sequence += 1;
     return Promise.resolve({
       providerMessageId: `wamid.sandbox.${this.sequence}`,

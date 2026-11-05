@@ -222,7 +222,10 @@ describe('ExpirationPreparationRuntime', () => {
       get: (key: string) =>
         key === 'meta.phoneNumberId' ? phoneValue : branch,
     } as ConfigService;
-    return new ExpirationPreparationRuntime(config, {} as Pool, client, sender);
+    return new ExpirationPreparationRuntime(config, {} as Pool, client, {
+      ...sender,
+      sendTemplate: jest.fn(),
+    });
   }
   it('starts once with a valid branch and drains the poller on shutdown', async () => {
     const start = jest

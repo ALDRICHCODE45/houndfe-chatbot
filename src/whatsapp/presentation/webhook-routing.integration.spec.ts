@@ -404,6 +404,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
         sent.push({ to: message.to, text: message.text, providerMessageId });
         return Promise.resolve({ providerMessageId });
       }),
+      sendTemplate: jest.fn(),
     };
     const agentRunner = {
       handle: jest.fn<
