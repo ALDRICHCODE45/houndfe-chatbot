@@ -228,6 +228,6 @@ non-exact fails closed); `migrations` (`present_on_disk|missing_on_disk`);
 migration file.
 
 Limitations: presence is not validity; a migration file on disk is not an
-applied migration; all reachability and data checks (backend, the 11 routes,
+applied migration; all reachability and data checks (backend, the 13 routes,
 cashier user, `ServiceCredential` with seven scopes including
 `payment-details:read`, active `PaymentDetail`, populated catalog) stay manual.

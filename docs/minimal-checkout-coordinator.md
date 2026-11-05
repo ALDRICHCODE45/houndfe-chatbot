@@ -30,7 +30,7 @@ The durable `savedCorrected` choice holds the exact base snapshot (`id` and
 restoring all original values returns to plain `saved`. Name corrections keep
 the existing behavior. Base freshness is revalidated just like `saved`, including
 after restart. Nothing is written upstream until the atomic order transaction;
-see [order placement](minimal-order-placement.md#atomic-checkout-switch).
+see [order placement](minimal-order-placement.md#atomic-checkout).
 
 ## Confirmation rules
 

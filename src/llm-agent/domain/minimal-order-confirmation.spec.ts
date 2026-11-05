@@ -162,13 +162,12 @@ describe('shipping summary and exact binding', () => {
 
 describe('new address S2/S3/S4/S6', () => {
   it.each([null, CUSTOMER])(
-    'atomic enables new address for customer %s',
+    'enables new address for customer %s',
     (sourceCustomerId) => {
       const draft = { ...newDraft(), sourceCustomerId };
       const verdict = evaluateMinimalOrder({
         confirmedDraft: draft,
         quote: quote(),
-        atomicCheckoutEnabled: true,
       });
       expect(verdict.ok).toBe(true);
       if (!verdict.ok) throw new Error('new eligibility');
@@ -189,7 +188,6 @@ describe('new address S2/S3/S4/S6', () => {
       evaluateMinimalOrder({
         confirmedDraft: draft,
         quote: quote(),
-        atomicCheckoutEnabled: true,
       }),
     ).toEqual({ ok: false, reason: 'invalid_state' });
   });
@@ -228,7 +226,13 @@ describe('evaluateMinimalOrder', () => {
       },
     ],
     ['delivery_unconfirmed', { confirmedDraft: null, quote: quote() }],
-    ['new_address_unsupported', { confirmedDraft: newDraft(), quote: quote() }],
+    [
+      'new_address_unsupported',
+      {
+        confirmedDraft: { ...savedDraft(), sourceCustomerId: null },
+        quote: quote(),
+      },
+    ],
   ] as const)('rejects %s', (reason, input) => {
     expect(evaluateMinimalOrder(input)).toEqual({ ok: false, reason });
   });

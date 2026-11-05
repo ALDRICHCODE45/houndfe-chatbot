@@ -72,12 +72,24 @@ const unique = (address = savedAddress()): CustomerCheckoutContext => ({
   nextAfterAddressId: null,
 });
 
+const placedSale = () => ({
+  saleId: SALE,
+  folio: 'B-0042',
+  paymentStatus: 'CREDIT',
+  channel: 'ONLINE',
+  deliveryStatus: 'PENDING',
+  totalCents: 3000,
+  paidCents: 0,
+  debtCents: 3000,
+  confirmedAt: '2026-10-13T00:00:00.000Z',
+  discountCents: 0,
+});
+
 function setup(
   options: {
     enabled?: boolean;
     cashier?: string;
     shipping?: boolean;
-    atomic?: unknown;
   } = {},
 ) {
   const store = new InMemoryConversationStore();
@@ -117,20 +129,8 @@ function setup(
       }),
     ),
     getCustomerCheckoutContext: jest.fn(() => Promise.resolve(unique())),
-    createSale: jest.fn(() =>
-      Promise.resolve({
-        saleId: SALE,
-        folio: 'B-0042',
-        paymentStatus: 'CREDIT',
-        channel: 'ONLINE',
-        deliveryStatus: 'PENDING',
-        totalCents: 3000,
-        paidCents: 0,
-        debtCents: 3000,
-        confirmedAt: '2026-10-13T00:00:00.000Z',
-        discountCents: 0,
-      }),
-    ),
+    // The legacy POST /sales path is gone; it must never be called.
+    createSale: jest.fn(),
     createCheckout: jest.fn(),
     getCheckoutStatus: jest.fn(),
     getPaymentDetails: jest.fn(() =>
@@ -149,10 +149,9 @@ function setup(
     cancelSale: jest.fn(),
     updateDelivery: jest.fn(),
   };
-  api.createCheckout.mockImplementation(async () => ({
-    status: 'created',
-    sale: await api.createSale.getMockImplementation()!(),
-  }));
+  api.createCheckout.mockImplementation(() =>
+    Promise.resolve({ status: 'created', sale: placedSale() }),
+  );
   api.getCheckoutStatus.mockResolvedValue({
     status: 'not_observed',
     checkout: null,
@@ -164,7 +163,6 @@ function setup(
         return {
           orderEnabled: options.enabled !== false,
           shippingEnabled: options.shipping === true,
-          atomicCheckoutEnabled: options.atomic,
         };
       if (key === 'chatbotApi.cashierUserId') return options.cashier ?? CASHIER;
       return undefined;
@@ -348,7 +346,7 @@ describe('corrected saved address checkout', () => {
   ])(
     'places %s using %s without changing unspecified snapshot fields',
     async (zipCode, mode) => {
-      const h = setup({ atomic: true });
+      const h = setup();
       await h.seedCart();
       await confirmSavedDelivery(h);
       await correctSavedDelivery(h, zipCode);
@@ -387,26 +385,13 @@ describe('corrected saved address checkout', () => {
     },
   );
 
-  it('refuses corrected saved addresses when atomic checkout is off', async () => {
-    const h = setup();
-    await h.seedCart();
-    await confirmSavedDelivery(h);
-    await correctSavedDelivery(h);
-    expect((await offerOrder(h)).reply).toBe(
-      MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
-    );
-    await yes(h);
-    expect(h.api.createSale).not.toHaveBeenCalled();
-    expect(h.api.createCheckout).not.toHaveBeenCalled();
-  });
-
   it.each([
     [409, 'ADDRESS_VERSION_CONFLICT'],
     [404, 'SHIPPING_ADDRESS_NOT_FOUND'],
   ] as const)(
     'clears the selection after %s %s and never retries',
     async (status, code) => {
-      const h = setup({ atomic: true });
+      const h = setup();
       await h.seedCart();
       await confirmSavedDelivery(h);
       await correctSavedDelivery(h);
@@ -428,7 +413,7 @@ describe('corrected saved address checkout', () => {
   );
 
   it('fingerprints the corrected payload and holds a changed correction after uncertainty', async () => {
-    const h = setup({ atomic: true });
+    const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
     await correctSavedDelivery(h);
@@ -454,7 +439,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
   it.each(['expired', 'rejected'])(
     'new shipping %s blocks the summary',
     async (status) => {
-      const h = setup({ atomic: true, shipping: true });
+      const h = setup({ shipping: true });
       await h.seedCart();
       await confirmNewDelivery(h);
       await newShipping(h);
@@ -486,7 +471,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     },
   );
   it('not_observed retries the identical new checkout and key under fresh consent', async () => {
-    const h = setup({ atomic: true });
+    const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h);
     await offerOrder(h);
@@ -502,24 +487,17 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(first[1]);
     expect(h.api.createCheckout.mock.calls[1]).toEqual(first);
   });
-  it.each([false, true])('atomic switch %s', async (atomic) => {
-    const h = setup({ atomic });
+  it('offers a new address for saving with the order', async () => {
+    const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h);
     const offer = await offerOrder(h);
-    if (!atomic)
-      expect(offer.reply).toBe(
-        MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
-      );
-    else
-      expect(offer.reply).toContain(
-        'Guardaremos esta dirección con su pedido.',
-      );
+    expect(offer.reply).toContain('Guardaremos esta dirección con su pedido.');
   });
   it.each([false, true])(
     'exact new payload with free shipping %s passes real schema',
     async (free) => {
-      const h = setup({ atomic: true, shipping: true });
+      const h = setup({ shipping: true });
       await h.seedCart();
       if (free) {
         const raw = await h.minimalCart();
@@ -582,7 +560,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     },
   );
   it('unique registered customer with NEW uses createIfAbsent', async () => {
-    const h = setup({ atomic: true });
+    const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
     await confirmNewDelivery(h);
@@ -599,7 +577,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     );
   });
   it('invalid state blocks delivery offer and correction requires reconfirmation', async () => {
-    const h = setup({ atomic: true });
+    const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h, { state: 'Texas' });
     const blocked = await h.checkout.prepareConfirmation(SENDER, EVENT('bad'));
@@ -612,7 +590,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
   it.each([1, 2])(
     'ambiguous phone attempt %s preserves rotation rules',
     async (attempt) => {
-      const h = setup({ atomic: true });
+      const h = setup();
       await h.seedCart();
       await confirmNewDelivery(h);
       await offerOrder(h);
@@ -639,7 +617,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     },
   );
   it('new checkout recovers status first after stock exhaustion', async () => {
-    const h = setup({ atomic: true });
+    const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h);
     await offerOrder(h);
@@ -654,7 +632,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     h.api.getStock.mockClear();
     h.api.getCheckoutStatus.mockResolvedValueOnce({
       status: 'succeeded',
-      checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+      checkout: { sale: placedSale() },
     });
     expect(
       (await h.order.prepareOrder(SENDER, EVENT('recover'))).reply,
@@ -677,7 +655,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     'firstName',
     'lastName',
   ])('exact payload fingerprint changes with %s', async (field) => {
-    const h = setup({ atomic: true });
+    const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h);
     await offerOrder(h);
@@ -703,7 +681,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
 
 describe('NEW shipping freshness only (T1)', () => {
   it('accepts approved current NEW shipping, rejects edits, and requires a persisted quote', async () => {
-    const h = setup({ atomic: true, shipping: true });
+    const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
     await h.checkout.updateDetails(SENDER, {
@@ -786,7 +764,7 @@ describe('NEW shipping freshness only (T1)', () => {
 
 describe('atomic checkout order S1–S5', () => {
   async function ready(shipping = false) {
-    const h = setup({ atomic: true, shipping });
+    const h = setup({ shipping });
     await h.seedCart();
     await confirmSavedDelivery(h);
     if (shipping) await shippingRecord(h);
@@ -817,7 +795,7 @@ describe('atomic checkout order S1–S5', () => {
       h.api.getCheckoutStatus.mockClear();
       h.api.getCheckoutStatus.mockResolvedValueOnce({
         status: 'succeeded',
-        checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+        checkout: { sale: placedSale() },
       });
       const result = gate.includes('consume')
         ? await yes(h, 'wamid.retryyes')
@@ -906,7 +884,7 @@ describe('atomic checkout order S1–S5', () => {
     const locked = await h.minimalCart();
     h.api.getCheckoutStatus.mockResolvedValueOnce({
       status: 'succeeded',
-      checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+      checkout: { sale: placedSale() },
     });
     const commit = jest
       .spyOn(h.store, 'commitMinimalCart')
@@ -972,7 +950,7 @@ describe('atomic checkout order S1–S5', () => {
   });
 
   it('S3/S4 approved free shipping omits freight in checkout', async () => {
-    const h = setup({ atomic: true, shipping: true });
+    const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
     const raw = await h.minimalCart();
@@ -1033,20 +1011,6 @@ describe('atomic checkout order S1–S5', () => {
     expect(h.api.getCheckoutStatus).toHaveBeenCalled();
     expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 1 });
   });
-
-  it.each([false, undefined, 'true'])(
-    'S2 gate %s preserves legacy path',
-    async (atomic) => {
-      const h = setup({ atomic });
-      await h.seedCart();
-      await confirmSavedDelivery(h);
-      await offerOrder(h);
-      await yes(h);
-      expect(h.api.createSale).toHaveBeenCalledTimes(1);
-      expect(h.api.createCheckout).not.toHaveBeenCalled();
-      expect(h.api.getCheckoutStatus).not.toHaveBeenCalled();
-    },
-  );
 
   it.each([
     [409, 'IDEMPOTENCY_KEY_IN_FLIGHT'],
@@ -1145,7 +1109,7 @@ describe('atomic checkout order S1–S5', () => {
       if (status === 'succeeded')
         h.api.getCheckoutStatus.mockResolvedValueOnce({
           status,
-          checkout: { sale: await h.api.createSale.getMockImplementation()!() },
+          checkout: { sale: placedSale() },
         });
       const offered = await offerOrder(h, 'wamid.status1');
       const reply =
@@ -1185,18 +1149,22 @@ describe('minimal shipping order safety', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await shippingRecord(h);
-    h.api.createSale.mockRejectedValueOnce(new Error('uncertain'));
+    h.api.createCheckout.mockRejectedValueOnce(new Error('uncertain'));
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('Envío: $50.00 MXN');
     expect(offer.reply).toContain('Total a pagar: $80.00 MXN');
     await yes(h);
-    const payload = (h.api.createSale.mock.calls[0] as unknown as [unknown])[0];
+    const payload = (
+      h.api.createCheckout.mock.calls[0] as unknown as [unknown]
+    )[0];
     expect(payload).toMatchObject({
-      expectedTotalCents: 8000,
-      shipping: {
-        chargeCents: 5000,
-        approvalId: 'approval-1',
-        quoteId: 'quote-1',
+      sale: {
+        expectedTotalCents: 8000,
+        shipping: {
+          chargeCents: 5000,
+          approvalId: 'approval-1',
+          quoteId: 'quote-1',
+        },
       },
     });
     expect(await h.minimalCart()).toMatchObject({
@@ -1206,13 +1174,13 @@ describe('minimal shipping order safety', () => {
         .digest('hex'),
     });
     const firstKey = (
-      h.api.createSale.mock.calls[0] as unknown as [unknown, string]
+      h.api.createCheckout.mock.calls[0] as unknown as [unknown, string]
     )[1];
-    h.api.createSale.mockRejectedValueOnce(new Error('still uncertain'));
+    h.api.createCheckout.mockRejectedValueOnce(new Error('still uncertain'));
     await offerOrder(h, 'wamid.retry1');
     await yes(h, 'wamid.retry2');
     expect(
-      h.api.createSale.mock.calls[1] as unknown as [unknown, string],
+      h.api.createCheckout.mock.calls[1] as unknown as [unknown, string],
     ).toEqual([payload, firstKey]);
     expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 2 });
   });
@@ -1239,12 +1207,13 @@ describe('minimal shipping order safety', () => {
     expect(offer.reply).not.toContain('Envío:');
     expect(offer.reply).not.toContain('no está incluido');
     const result = await yes(h);
-    expect(
-      (h.api.createSale.mock.calls[0] as unknown as [unknown])[0],
-    ).toMatchObject({ expectedTotalCents: 120000 });
-    expect(
-      (h.api.createSale.mock.calls[0] as unknown as [unknown])[0],
-    ).not.toHaveProperty('shipping');
+    const payload = (
+      h.api.createCheckout.mock.calls[0] as unknown as [
+        { sale: Record<string, unknown> },
+      ]
+    )[0];
+    expect(payload.sale).toMatchObject({ expectedTotalCents: 120000 });
+    expect(payload.sale).not.toHaveProperty('shipping');
     expect(result?.reply).not.toContain('no está incluido');
   });
 
@@ -1316,6 +1285,7 @@ describe('minimal shipping order safety', () => {
       expect(offer.reply).toContain('Dígame «cotizar envío»');
       expect(offer.onSent).toBeUndefined();
       await yes(h);
+      expect(h.api.createCheckout).not.toHaveBeenCalled();
       expect(h.api.createSale).not.toHaveBeenCalled();
     },
   );
@@ -1330,10 +1300,10 @@ describe('minimal shipping order safety', () => {
     const result = await yes(h);
     expect(result?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
     expect(result?.reply).toContain('Total a pagar: $90.00 MXN');
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
     result?.onSent?.();
     await yes(h, 'wamid.o3');
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(
       await h.order.consume({
         senderId: SENDER,
@@ -1348,7 +1318,7 @@ describe('minimal shipping order safety', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await shippingRecord(h);
-    h.api.createSale.mockRejectedValueOnce(new Error('uncertain'));
+    h.api.createCheckout.mockRejectedValueOnce(new Error('uncertain'));
     await offerOrder(h);
     await yes(h);
     const before = await h.minimalCart();
@@ -1357,7 +1327,7 @@ describe('minimal shipping order safety', () => {
     expect(await yes(h, 'wamid.retry2')).toEqual({
       reply: MINIMAL_ORDER_HELD_REPLY,
     });
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(await h.minimalCart()).toMatchObject({
       idempotencyKey: (before as { idempotencyKey: string }).idempotencyKey,
       idempotencyAttempts: 1,
@@ -1366,169 +1336,140 @@ describe('minimal shipping order safety', () => {
 });
 
 describe('MinimalOrderService', () => {
-  it.each([false, true])(
-    '[T1c] places the customer-priced cart using backend unit prices and final totals (atomic %s)',
-    async (atomic) => {
-      const h = setup({ atomic });
-      h.setPrice(1000);
-      h.api.evaluateCart.mockImplementation(async (items) => ({
-        items: items.map((item) => ({
+  it('[T1c] places the customer-priced cart using backend unit prices and final totals', async () => {
+    const h = setup();
+    h.setPrice(1000);
+    h.api.evaluateCart.mockImplementation(async (items) => ({
+      items: items.map((item) => ({
+        productId: PRODUCT,
+        variantId: null,
+        quantity: item.quantity,
+        unitPriceCents: 800,
+        originalPriceCents: 800 * item.quantity,
+        finalPriceCents: 800 * item.quantity - 100,
+        discountAmountCents: 100,
+        appliedPromotionTitle: null,
+      })),
+      promotionEvaluationStatus: 'fully_evaluated',
+    }));
+    expect(
+      await h.cart.setItem(
+        SENDER,
+        { productId: PRODUCT, quantity: 2 },
+        new Set([PRODUCT]),
+      ),
+    ).toMatchObject({ ok: true, totalCents: 1500 });
+    expect(await h.minimalCart()).toMatchObject({
+      items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 800 }],
+      expectedTotalCents: 1500,
+    });
+    await confirmSavedDelivery(h);
+    const offer = await offerOrder(h);
+    expect(offer.reply).toContain('2 × $8.00 MXN');
+    expect(offer.reply).toContain('Total de productos: $15.00 MXN');
+    const sale = {
+      ...placedSale(),
+      totalCents: 1500,
+      debtCents: 1500,
+      discountCents: 100,
+    };
+    h.api.createCheckout.mockResolvedValue({ status: 'created', sale });
+    expect((await yes(h))?.reply).toContain('B-0042');
+    const expectedSale = {
+      cashierUserId: CASHIER,
+      expectedTotalCents: 1500,
+      items: [
+        {
           productId: PRODUCT,
           variantId: null,
-          quantity: item.quantity,
+          productName: 'Ibuprofeno',
+          variantName: null,
+          quantity: 2,
           unitPriceCents: 800,
-          originalPriceCents: 800 * item.quantity,
-          finalPriceCents: 800 * item.quantity - 100,
-          discountAmountCents: 100,
-          appliedPromotionTitle: null,
-        })),
-        promotionEvaluationStatus: 'fully_evaluated',
-      }));
-      expect(
-        await h.cart.setItem(
-          SENDER,
-          { productId: PRODUCT, quantity: 2 },
-          new Set([PRODUCT]),
-        ),
-      ).toMatchObject({ ok: true, totalCents: 1500 });
-      expect(await h.minimalCart()).toMatchObject({
-        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 800 }],
-        expectedTotalCents: 1500,
+        },
+      ],
+    };
+    expect(h.api.createCheckout).toHaveBeenCalledWith(
+      expect.objectContaining({ sale: expectedSale }),
+      expect.stringMatching(UUID),
+    );
+    expect(h.api.createSale).not.toHaveBeenCalled();
+    for (const args of h.api.evaluateCart.mock
+      .calls as unknown as unknown[][]) {
+      expect(args[1]).toEqual({
+        phoneCountryCode: '52',
+        phone: '5550001111',
       });
-      await confirmSavedDelivery(h);
-      const offer = await offerOrder(h);
-      expect(offer.reply).toContain('2 × $8.00 MXN');
-      expect(offer.reply).toContain('Total de productos: $15.00 MXN');
-      const sale = {
-        ...(await h.api.createSale.getMockImplementation()!()),
-        totalCents: 1500,
-        debtCents: 1500,
-        discountCents: 100,
-      };
-      h.api.createSale.mockResolvedValue(sale);
-      h.api.createCheckout.mockResolvedValue({ status: 'created', sale });
-      expect((await yes(h))?.reply).toContain('B-0042');
-      const expectedSale = {
-        cashierUserId: CASHIER,
-        expectedTotalCents: 1500,
-        items: [
-          {
-            productId: PRODUCT,
-            variantId: null,
-            productName: 'Ibuprofeno',
-            variantName: null,
-            quantity: 2,
-            unitPriceCents: 800,
-          },
-        ],
-      };
-      if (atomic) {
-        expect(h.api.createCheckout).toHaveBeenCalledWith(
-          expect.objectContaining({ sale: expectedSale }),
-          expect.stringMatching(UUID),
-        );
-        expect(h.api.createSale).not.toHaveBeenCalled();
-      } else {
-        expect(h.api.createSale).toHaveBeenCalledWith(
-          { ...expectedSale, customerId: CUSTOMER, shippingAddressId: ADDRESS },
-          expect.stringMatching(UUID),
-        );
-        expect(h.api.createCheckout).not.toHaveBeenCalled();
-      }
-      for (const args of h.api.evaluateCart.mock
-        .calls as unknown as unknown[][]) {
-        expect(args[1]).toEqual({
-          phoneCountryCode: '52',
-          phone: '5550001111',
-        });
-      }
-    },
-  );
+    }
+  });
 
-  it.each([false, true])(
-    '[S5] discounted display leaves the exact payload, fingerprint and retry key unchanged (atomic %s)',
-    async (atomic) => {
-      const h = setup({ atomic });
-      await h.seedCart();
-      await confirmSavedDelivery(h);
-      let title = 'Oferta';
-      const evaluateCart = h.api.evaluateCart as unknown as jest.MockedFunction<
-        ChatbotApiClient['evaluateCart']
-      >;
-      evaluateCart.mockImplementation(async (items) => ({
-        items: items.map((item) => ({
+  it('[S5] discounted display leaves the exact payload, fingerprint and retry key unchanged', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    let title = 'Oferta';
+    const evaluateCart = h.api.evaluateCart as unknown as jest.MockedFunction<
+      ChatbotApiClient['evaluateCart']
+    >;
+    evaluateCart.mockImplementation(async (items) => ({
+      items: items.map((item) => ({
+        productId: PRODUCT,
+        variantId: null,
+        quantity: item.quantity,
+        unitPriceCents: 1500,
+        originalPriceCents: 1500 * item.quantity,
+        finalPriceCents: 1350 * item.quantity,
+        discountAmountCents: 150 * item.quantity,
+        appliedPromotionTitle: title,
+      })),
+      promotionEvaluationStatus: 'fully_evaluated',
+    }));
+    const sale = {
+      cashierUserId: CASHIER,
+      expectedTotalCents: 2700,
+      items: [
+        {
           productId: PRODUCT,
           variantId: null,
-          quantity: item.quantity,
+          productName: 'Ibuprofeno',
+          variantName: null,
+          quantity: 2,
           unitPriceCents: 1500,
-          originalPriceCents: 1500 * item.quantity,
-          finalPriceCents: 1350 * item.quantity,
-          discountAmountCents: 150 * item.quantity,
-          appliedPromotionTitle: title,
-        })),
-        promotionEvaluationStatus: 'fully_evaluated',
-      }));
-      const sale = {
-        cashierUserId: CASHIER,
-        customerId: CUSTOMER,
-        shippingAddressId: ADDRESS,
-        expectedTotalCents: 2700,
-        items: [
-          {
-            productId: PRODUCT,
-            variantId: null,
-            productName: 'Ibuprofeno',
-            variantName: null,
-            quantity: 2,
-            unitPriceCents: 1500,
-          },
-        ],
-      };
-      const expectedPayload = atomic
-        ? CreateCheckoutInputSchema.parse({
-            phoneCountryCode: '52',
-            phone: '5550001111',
-            customer: { mode: 'existing', customerId: CUSTOMER },
-            deliveryAddress: {
-              mode: 'existing',
-              addressId: ADDRESS,
-              expectedVersion: savedAddress().version,
-            },
-            sale: {
-              cashierUserId: sale.cashierUserId,
-              expectedTotalCents: sale.expectedTotalCents,
-              items: sale.items,
-            },
-          })
-        : sale;
-      const fingerprint = createHash('sha256')
-        .update(JSON.stringify(expectedPayload))
-        .digest('hex');
-      for (const attempt of [1, 2]) {
-        const offer = await offerOrder(h, `promo-offer-${attempt}`);
-        expect(offer.reply).toContain(
-          `• Ibuprofeno: 2 × $15.00 MXN; importe $27.00 MXN (promoción: ${title}, ahorro $3.00 MXN)`,
-        );
-        if (atomic)
-          h.api.createCheckout.mockRejectedValueOnce(
-            new Error('lost response'),
-          );
-        else h.api.createSale.mockRejectedValueOnce(new Error('lost response'));
-        await yes(h, `promo-yes-${attempt}`);
-        expect(await h.minimalCart()).toMatchObject({
-          idempotencyFingerprint: fingerprint,
-          idempotencyAttempts: attempt,
-        });
-        title = 'Renamed offer';
-      }
-      const calls = atomic
-        ? h.api.createCheckout.mock.calls
-        : h.api.createSale.mock.calls;
-      expect(calls).toHaveLength(2);
-      expect(calls[0]).toEqual([expectedPayload, expect.stringMatching(UUID)]);
-      expect(calls[1]).toEqual(calls[0]);
-    },
-  );
+        },
+      ],
+    };
+    const expectedPayload = CreateCheckoutInputSchema.parse({
+      phoneCountryCode: '52',
+      phone: '5550001111',
+      customer: { mode: 'existing', customerId: CUSTOMER },
+      deliveryAddress: {
+        mode: 'existing',
+        addressId: ADDRESS,
+        expectedVersion: savedAddress().version,
+      },
+      sale,
+    });
+    const fingerprint = createHash('sha256')
+      .update(JSON.stringify(expectedPayload))
+      .digest('hex');
+    for (const attempt of [1, 2]) {
+      const offer = await offerOrder(h, `promo-offer-${attempt}`);
+      expect(offer.reply).toContain(
+        `• Ibuprofeno: 2 × $15.00 MXN; importe $27.00 MXN (promoción: ${title}, ahorro $3.00 MXN)`,
+      );
+      h.api.createCheckout.mockRejectedValueOnce(new Error('lost response'));
+      await yes(h, `promo-yes-${attempt}`);
+      expect(await h.minimalCart()).toMatchObject({
+        idempotencyFingerprint: fingerprint,
+        idempotencyAttempts: attempt,
+      });
+      title = 'Renamed offer';
+    }
+    const calls = h.api.createCheckout.mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual([expectedPayload, expect.stringMatching(UUID)]);
+    expect(calls[1]).toEqual(calls[0]);
+  });
 
   it('is disabled unless the gate and a cashier are configured', () => {
     expect(setup({ enabled: false }).order.enabled).toBe(false);
@@ -1543,29 +1484,37 @@ describe('MinimalOrderService', () => {
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('Resumen de su pedido:');
     expect(offer.reply).toContain('Total de productos: $30.00 MXN');
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
 
     const placed = await yes(h);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
-    const [payload, key] = h.api.createSale.mock.calls[0] as unknown as [
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    const [payload, key] = h.api.createCheckout.mock.calls[0] as unknown as [
       unknown,
       string,
     ];
     expect(payload).toEqual({
-      cashierUserId: CASHIER,
-      customerId: CUSTOMER,
-      shippingAddressId: ADDRESS,
-      expectedTotalCents: 3000,
-      items: [
-        {
-          productId: PRODUCT,
-          variantId: null,
-          productName: 'Ibuprofeno',
-          variantName: null,
-          quantity: 2,
-          unitPriceCents: 1500,
-        },
-      ],
+      phoneCountryCode: '52',
+      phone: '5550001111',
+      customer: { mode: 'existing', customerId: CUSTOMER },
+      deliveryAddress: {
+        mode: 'existing',
+        addressId: ADDRESS,
+        expectedVersion: savedAddress().version,
+      },
+      sale: {
+        cashierUserId: CASHIER,
+        expectedTotalCents: 3000,
+        items: [
+          {
+            productId: PRODUCT,
+            variantId: null,
+            productName: 'Ibuprofeno',
+            variantName: null,
+            quantity: 2,
+            unitPriceCents: 1500,
+          },
+        ],
+      },
     });
     expect(key).toMatch(UUID);
     expect(placed?.reply).toContain('folio B-0042');
@@ -1581,7 +1530,7 @@ describe('MinimalOrderService', () => {
       legacy: 'preserved',
     });
     expect(await yes(h, 'wamid.o3')).toBeNull();
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
   });
 
@@ -1591,7 +1540,7 @@ describe('MinimalOrderService', () => {
     await confirmSavedDelivery(h);
     await h.order.prepareOrder(SENDER, EVENT('wamid.o1'));
     expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_AMBIGUOUS_REPLY });
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1606,45 +1555,9 @@ describe('MinimalOrderService', () => {
       expect(await h.order.prepareOrder(SENDER, EVENT('wamid.o1'))).toEqual({
         reply: MINIMAL_ORDER_INELIGIBLE_REPLIES[reason],
       });
-      expect(h.api.createSale).not.toHaveBeenCalled();
+      expect(h.api.createCheckout).not.toHaveBeenCalled();
     },
   );
-
-  it('refuses a new (unsaved) delivery address in this slice', async () => {
-    const h = setup();
-    await h.seedCart();
-    await h.checkout.updateDetails(SENDER, {
-      firstName: 'Ana',
-      lastName: null,
-      label: null,
-      street: 'Calle 5',
-      exteriorNumber: 'S/N',
-      interiorNumber: null,
-      zipCode: '06700',
-      neighborhood: 'Roma',
-      municipality: null,
-      city: 'CDMX',
-      state: 'Ciudad de México',
-      visualReferences: null,
-      carrierPhone: null,
-      useNewAddress: true,
-    });
-    const offer = await h.checkout.prepareConfirmation(
-      SENDER,
-      EVENT('wamid.d1'),
-    );
-    offer.onSent?.();
-    await h.checkout.consume({
-      senderId: SENDER,
-      text: 'SÍ',
-      inboundEvent: EVENT('wamid.d2'),
-    });
-    expect(await h.order.prepareOrder(SENDER, EVENT('wamid.o1'))).toEqual({
-      reply: MINIMAL_ORDER_INELIGIBLE_REPLIES.new_address_unsupported,
-    });
-    expect(h.api.createSale).not.toHaveBeenCalled();
-    expect(h.api.upsertCustomer).not.toHaveBeenCalled();
-  });
 
   it('re-presents instead of selling when prices changed after the summary', async () => {
     const h = setup();
@@ -1656,7 +1569,7 @@ describe('MinimalOrderService', () => {
     expect(result?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
     expect(result?.reply).toContain('Total de productos: $32.00 MXN');
     expect(result?.onSent).toEqual(expect.any(Function));
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('reoffers delivery confirmation without selling when the delivery draft changed after the summary', async () => {
@@ -1684,7 +1597,7 @@ describe('MinimalOrderService', () => {
     expect(result?.reply).toMatch(/^Confirme sus datos de entrega:/);
     expect(result?.reply).toContain('Nombre: Ana María');
     expect(result?.onSent).toEqual(expect.any(Function));
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('asks to re-select when the saved address changed upstream', async () => {
@@ -1698,7 +1611,7 @@ describe('MinimalOrderService', () => {
       ),
     );
     expect(await yes(h)).toEqual({ reply: MINIMAL_CHECKOUT_RESELECT_REPLY });
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('keeps the idempotency key after an ambiguous failure and reuses it', async () => {
@@ -1706,21 +1619,21 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(new UpstreamError('timeout', 503)),
     );
     expect(await yes(h)).toEqual({
       reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
     });
-    const firstKey = (h.api.createSale.mock.calls[0] as unknown[])[1];
+    const firstKey = (h.api.createCheckout.mock.calls[0] as unknown[])[1];
     expect(await h.minimalCart()).toMatchObject({
       items: [{ productId: PRODUCT, quantity: 2 }],
       idempotencyKey: firstKey,
     });
     await offerOrder(h, 'wamid.o3');
     await yes(h, 'wamid.o4');
-    expect(h.api.createSale).toHaveBeenCalledTimes(2);
-    expect((h.api.createSale.mock.calls[1] as unknown[])[1]).toBe(firstKey);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(2);
+    expect((h.api.createCheckout.mock.calls[1] as unknown[])[1]).toBe(firstKey);
   });
 
   it('never sends a different payload under an outstanding key', async () => {
@@ -1728,7 +1641,7 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(new UpstreamError('timeout', 503)),
     );
     await yes(h);
@@ -1754,7 +1667,7 @@ describe('MinimalOrderService', () => {
     expect(await yes(h, 'wamid.o4')).toEqual({
       reply: MINIMAL_ORDER_HELD_REPLY,
     });
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(await h.minimalCart()).toEqual(before);
   });
 
@@ -1763,7 +1676,7 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(
         new ChatbotApiError('conflict', 409, {}, 'IDEMPOTENCY_KEY_CONFLICT'),
       ),
@@ -1772,7 +1685,7 @@ describe('MinimalOrderService', () => {
       reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
     });
     expect(await h.minimalCart()).toMatchObject({
-      idempotencyKey: (h.api.createSale.mock.calls[0] as unknown[])[1],
+      idempotencyKey: (h.api.createCheckout.mock.calls[0] as unknown[])[1],
     });
   });
 
@@ -1784,7 +1697,7 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(new ChatbotApiError('rejected', status, {}, code)),
     );
     expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_REJECTED_REPLY });
@@ -1795,22 +1708,18 @@ describe('MinimalOrderService', () => {
   });
 
   it.each([
-    ['legacy', 'BOT_ITEM_VARIANT_REQUIRED'],
-    ['legacy', 'BOT_ITEM_VARIANT_NOT_ALLOWED'],
-    ['legacy', 'BOT_ITEM_VARIANT_MISMATCH'],
-    ['atomic', 'BOT_ITEM_VARIANT_REQUIRED'],
-    ['atomic', 'BOT_ITEM_VARIANT_NOT_ALLOWED'],
-    ['atomic', 'BOT_ITEM_VARIANT_MISMATCH'],
+    'BOT_ITEM_VARIANT_REQUIRED',
+    'BOT_ITEM_VARIANT_NOT_ALLOWED',
+    'BOT_ITEM_VARIANT_MISMATCH',
   ])(
-    '%s %s asks to choose the presentation again and rotates the key',
-    async (mode, code) => {
-      const h = setup({ atomic: mode === 'atomic' });
+    '%s asks to choose the presentation again and rotates the key',
+    async (code) => {
+      const h = setup();
       await h.seedCart();
       await confirmSavedDelivery(h);
       await offerOrder(h);
       const rejection = new ChatbotApiError(code, 422, { error: code }, code);
-      const call = mode === 'atomic' ? h.api.createCheckout : h.api.createSale;
-      call.mockRejectedValueOnce(rejection);
+      h.api.createCheckout.mockRejectedValueOnce(rejection);
       expect(await yes(h)).toEqual({
         reply: MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
       });
@@ -1821,33 +1730,29 @@ describe('MinimalOrderService', () => {
     },
   );
 
-  it.each(['legacy', 'atomic'])(
-    '%s STOCK_INSUFFICIENT_AT_CONFIRM says stock ran out and rotates the key',
-    async (mode) => {
-      const h = setup({ atomic: mode === 'atomic' });
-      await h.seedCart();
-      await confirmSavedDelivery(h);
-      await offerOrder(h);
-      const code = 'STOCK_INSUFFICIENT_AT_CONFIRM';
-      const rejection = new ChatbotApiError(code, 409, { error: code }, code);
-      const call = mode === 'atomic' ? h.api.createCheckout : h.api.createSale;
-      call.mockRejectedValueOnce(rejection);
-      expect(await yes(h)).toEqual({
-        reply: MINIMAL_ORDER_STOCK_CHANGED_REPLY,
-      });
-      expect(await h.minimalCart()).toMatchObject({
-        items: [{ productId: PRODUCT, quantity: 2 }],
-        idempotencyKey: '',
-      });
-    },
-  );
+  it('STOCK_INSUFFICIENT_AT_CONFIRM says stock ran out and rotates the key', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    const code = 'STOCK_INSUFFICIENT_AT_CONFIRM';
+    const rejection = new ChatbotApiError(code, 409, { error: code }, code);
+    h.api.createCheckout.mockRejectedValueOnce(rejection);
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_STOCK_CHANGED_REPLY,
+    });
+    expect(await h.minimalCart()).toMatchObject({
+      items: [{ productId: PRODUCT, quantity: 2 }],
+      idempotencyKey: '',
+    });
+  });
 
   it('preserves the key while the backend reports the sale in flight', async () => {
     const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(
         new ChatbotApiError('busy', 409, {}, 'IDEMPOTENCY_KEY_IN_FLIGHT'),
       ),
@@ -1856,7 +1761,7 @@ describe('MinimalOrderService', () => {
       reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
     });
     expect(await h.minimalCart()).toMatchObject({
-      idempotencyKey: (h.api.createSale.mock.calls[0] as unknown[])[1],
+      idempotencyKey: (h.api.createCheckout.mock.calls[0] as unknown[])[1],
     });
   });
 
@@ -1889,7 +1794,7 @@ describe('MinimalOrderService', () => {
     expect(await yes(h)).toEqual({
       reply: MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified,
     });
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('keeps the cart usable after an order was placed', async () => {
@@ -1916,21 +1821,21 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(new UpstreamError('timeout', 503)),
     );
     expect(await yes(h)).toEqual({
       reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
     });
-    const firstKey = (h.api.createSale.mock.calls[0] as unknown[])[1];
+    const firstKey = (h.api.createCheckout.mock.calls[0] as unknown[])[1];
     await offerOrder(h, 'wamid.o3');
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(new ChatbotApiError('unauthorized', 401, {}, null)),
     );
     expect(await yes(h, 'wamid.o4')).toEqual({
       reply: MINIMAL_ORDER_UNRESOLVED_REPLY,
     });
-    expect((h.api.createSale.mock.calls[1] as unknown[])[1]).toBe(firstKey);
+    expect((h.api.createCheckout.mock.calls[1] as unknown[])[1]).toBe(firstKey);
     expect(await h.minimalCart()).toMatchObject({
       items: [{ productId: PRODUCT, quantity: 2 }],
       idempotencyKey: firstKey,
@@ -1943,7 +1848,7 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await offerOrder(h);
-    h.api.createSale.mockImplementationOnce(() =>
+    h.api.createCheckout.mockImplementationOnce(() =>
       Promise.reject(new UpstreamError('timeout', 503)),
     );
     await yes(h);
@@ -1964,7 +1869,7 @@ describe('MinimalOrderService', () => {
     await confirmSavedDelivery(h);
     await offerOrder(h);
     let seen: unknown;
-    h.api.createSale.mockImplementationOnce(async () => {
+    h.api.createCheckout.mockImplementationOnce(async () => {
       seen = await h.minimalCart();
       throw new UpstreamError('timeout', 503);
     });

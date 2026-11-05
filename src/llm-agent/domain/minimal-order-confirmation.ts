@@ -75,14 +75,13 @@ export type MinimalOrderEligibility =
 /**
  * Eligibility for this slice (S1/S2/S4): a verified, non-empty, fully
  * evaluated cart, and a draft that is still exactly the locally confirmed one
- * with a unique saved address, or a new address when atomic checkout is on.
+ * with a unique saved address, a corrected saved address or a new address.
  * `confirmedDraft` must come from
  * `MinimalCheckoutConfirmation.confirmedDraft`, never from the bare status.
  */
 export function evaluateMinimalOrder(input: {
   readonly confirmedDraft: MinimalCheckoutDraft | null;
   readonly quote: MinimalOrderQuote | null;
-  readonly atomicCheckoutEnabled?: boolean;
 }): MinimalOrderEligibility {
   const { confirmedDraft, quote } = input;
   if (quote === null) return { ok: false, reason: 'cart_unverified' };
@@ -93,10 +92,7 @@ export function evaluateMinimalOrder(input: {
   if (confirmedDraft === null) {
     return { ok: false, reason: 'delivery_unconfirmed' };
   }
-  if (
-    confirmedDraft.address.kind !== 'saved' &&
-    input.atomicCheckoutEnabled === true
-  ) {
+  if (confirmedDraft.address.kind !== 'saved') {
     if (toMexicanState(confirmedDraft.address.fields.state) === null) {
       return { ok: false, reason: 'invalid_state' };
     }
@@ -114,10 +110,7 @@ export function evaluateMinimalOrder(input: {
       }),
     };
   }
-  if (
-    confirmedDraft.address.kind !== 'saved' ||
-    confirmedDraft.sourceCustomerId === null
-  ) {
+  if (confirmedDraft.sourceCustomerId === null) {
     return { ok: false, reason: 'new_address_unsupported' };
   }
   return {

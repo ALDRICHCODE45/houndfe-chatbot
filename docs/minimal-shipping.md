@@ -18,7 +18,7 @@ Restart after changing gates. There is still one `ShippingModule.forRoot()` comp
 
 ## Customer flow
 
-1. Build a verified cart, select a saved address or give a new one, and confirm delivery data through the [checkout coordinator](minimal-checkout-coordinator.md). Ordering to a new address requires the [atomic checkout switch](minimal-order-placement.md#atomic-checkout-switch).
+1. Build a verified cart, select a saved address or give a new one, and confirm delivery data through the [checkout coordinator](minimal-checkout-coordinator.md). Orders to a new address go through the [atomic checkout](minimal-order-placement.md#atomic-checkout).
 2. Ask for home delivery. The model calls `requestShippingQuote({})`; the server uses only the trusted sender and the confirmed address: the saved-address snapshot, or the exact confirmed destination of a new or corrected saved address (editing street, exterior or interior number, ZIP code, neighborhood, municipality, city or state makes the quote stale; label, visual references and carrier phone do not). Arguments containing identity or amounts are rejected.
 3. The server quotes internally and requests operations approval. The immediate reply contains **no amounts**, and no order is created. The operations channel receives the approval digest. Pending requests do not issue duplicate quotes.
 4. An operations decision approves that exact, current quote. Only then does the application disclose the freight. The model never authors amounts, approvals or order claims.
@@ -29,7 +29,7 @@ A `savedCorrected` draft quotes the corrected ZIP and other location fields,
 never its stale base snapshot. Its quote destination is a location fingerprint
 (`kind: 'new'`), just like a confirmed new address. Changes require delivery
 reconfirmation and, when location fields change, a new quote and approval.
-Ordering with corrections requires the atomic checkout switch; the original
+Orders with corrections go through the atomic checkout; the original
 saved id/version is still revalidated before quoting and ordering.
 
 Shipping shares the one-presentation-per-SDK-run slot with delivery confirmation and order summaries: the first attempt wins, including a refusal. Reply priority remains EXPIRATION > RESTOCK > checkout/order/shipping presentation (after any cart acknowledgement) > cart reply > model text. An unsent summary remains unarmed.
@@ -40,12 +40,11 @@ Shipping shares the one-presentation-per-SDK-run slot with delivery confirmation
 - Free shipping still requires approval; the order payload omits a shipping charge.
 - Approval expires at the earliest of 30 minutes from quote creation and provider/rate validity. Expiry is **lazy on the next customer inbound**, not a scheduled proactive notification. The matching pending request is cleared; the customer is told shipping could not be confirmed and may ask again. Late operations decisions fail closed.
 - Rejection offers another quote, for example using another saved address. It creates no order.
-- Cart, address, quote or approval changes invalidate the summary. Before placement the application revalidates the approved charge, includes charged freight in the fingerprinted idempotency payload, and preserves the existing uncertain-outcome lock.
+- Cart, address, quote or approval changes invalidate the summary. Before placement the application revalidates the approved charge, includes charged freight in the fingerprinted `POST /chatbot-api/checkouts` payload, and preserves the existing uncertain-outcome lock.
 
 ## Not ready for production
 
 - **Arbitrary-cart packing:** current quoting reuses a measured-demo profile and only accepts exactly configured carts. Real product/variant weights and dimensions are missing (`packageInfo` is currently null). Never infer measurements (task log L11).
-- **Backend checkout wiring:** by default `MinimalOrderService` still calls `POST /chatbot-api/sales`, where shipping persistence is not a deployed contract. `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` routes placement, including the approved shipping charge, through `POST /chatbot-api/checkouts` with status-based recovery ([details](minimal-order-placement.md#atomic-checkout-switch)). That backend endpoint is committed but **not deployed**; launch preflight requires the switch explicitly `false`.
 - **Delivery zones:** free-zone/surcharge/carrier-only policy, including CDMX service selection, remains unresolved.
 - Cart CAS, handoff lifecycle/reservation closure and WhatsApp delivery are not one transaction; partial failures may require reconciliation.
 

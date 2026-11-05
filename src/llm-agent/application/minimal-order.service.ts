@@ -6,10 +6,7 @@ import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
 } from '../../chatbot-api/domain/chatbot-api.client';
-import type {
-  BotSaleResponse,
-  CreateSaleInput,
-} from '../../chatbot-api/domain/dtos/sales.dto';
+import type { BotSaleResponse } from '../../chatbot-api/domain/dtos/sales.dto';
 import {
   CreateCheckoutInputSchema,
   type CreateCheckoutInput,
@@ -83,20 +80,20 @@ export const MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY =
 const PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos para la transferencia en este momento; su pedido sí quedó registrado.';
 
-/**
- * Definite rejections. `IDEMPOTENCY_KEY_CONFLICT` is NOT one: the backend
- * already saw this key with another payload, so a sale may exist under it.
- */
-const ROTATING_ERROR_CODES: ReadonlySet<string> = new Set(['PROMO_RE_QUOTE']);
 /** The item no longer matches the product's current variants; nothing was written. */
 const VARIANT_REJECTION_CODES: ReadonlySet<string> = new Set([
   'BOT_ITEM_VARIANT_REQUIRED',
   'BOT_ITEM_VARIANT_NOT_ALLOWED',
   'BOT_ITEM_VARIANT_MISMATCH',
 ]);
+/**
+ * Unknown outcomes. `IDEMPOTENCY_KEY_CONFLICT` is one: the backend already saw
+ * this key with another payload, so a sale may exist under it.
+ */
 const KEEPING_ERROR_CODES: ReadonlySet<string> = new Set([
   'IDEMPOTENCY_KEY_IN_FLIGHT',
   'IDEMPOTENCY_KEY_CONFLICT',
+  'CHECKOUT_RETRY_REQUIRED',
 ]);
 
 const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
@@ -110,20 +107,12 @@ type FreshOrder =
  * (the key must not be reused for a different payload); `keep` when the outcome
  * is unknown or still in flight, so a retry replays the same key.
  */
-function classifyFailure(error: unknown, atomic = false): 'rotate' | 'keep' {
+function classifyFailure(error: unknown): 'rotate' | 'keep' {
   if (!(error instanceof ChatbotApiError)) return 'keep';
-  if (atomic && error.errorCode === 'CHECKOUT_RETRY_REQUIRED') return 'keep';
   if (error.errorCode !== null && KEEPING_ERROR_CODES.has(error.errorCode)) {
     return 'keep';
   }
   const status = error.statusCode;
-  if (
-    !atomic &&
-    error.errorCode !== null &&
-    ROTATING_ERROR_CODES.has(error.errorCode)
-  ) {
-    return 'rotate';
-  }
   return status !== null &&
     status >= 400 &&
     status < 500 &&
@@ -146,7 +135,7 @@ function isSale(value: unknown): value is BotSaleResponse {
 }
 
 /** Deterministic digest of the exact payload sent under one key. */
-function fingerprint(payload: CreateSaleInput | CreateCheckoutInput): string {
+function fingerprint(payload: CreateCheckoutInput): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
@@ -170,9 +159,9 @@ function sameCartLines(
 
 /**
  * Minimal-route order placement (minimal-order-placement T2). Creates ONE
- * ONLINE sale only after a strict armed SÍ for the exact presented summary.
- * Atomic checkout may create a customer and save a confirmed new address in
- * that same transaction; legacy placement requires a unique saved address.
+ * ONLINE sale only after a strict armed SÍ for the exact presented summary,
+ * through one atomic `POST /chatbot-api/checkouts` that may also create the
+ * customer and save a confirmed new or corrected address in that transaction.
  * No separate customer/address writes, stock reservation or payment. Default off.
  */
 @Injectable()
@@ -180,7 +169,6 @@ export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
   private readonly orderEnabled: boolean;
   private readonly shippingEnabled: boolean;
-  private readonly atomicCheckoutEnabled: boolean;
   private readonly cashierUserId: string;
 
   constructor(
@@ -196,9 +184,6 @@ export class MinimalOrderService {
     this.shippingEnabled =
       config.get<{ shippingEnabled?: boolean }>('minimalCatalogAgent')
         ?.shippingEnabled === true;
-    this.atomicCheckoutEnabled =
-      config.get<{ atomicCheckoutEnabled?: boolean }>('minimalCatalogAgent')
-        ?.atomicCheckoutEnabled === true;
     const cashier = config.get<string>('chatbotApi.cashierUserId');
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
   }
@@ -313,7 +298,6 @@ export class MinimalOrderService {
   private async recoverOutstanding(
     senderId: string,
   ): Promise<{ outstanding: boolean; reply?: string }> {
-    if (!this.atomicCheckoutEnabled) return { outstanding: false };
     try {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
@@ -369,7 +353,6 @@ export class MinimalOrderService {
       const verdict = evaluateMinimalOrder({
         confirmedDraft,
         quote: quote.ok ? quote : null,
-        atomicCheckoutEnabled: this.atomicCheckoutEnabled,
       });
       if (!verdict.ok) {
         return {
@@ -449,90 +432,77 @@ export class MinimalOrderService {
     snapshot: MinimalOrderSnapshot,
   ): Promise<string> {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
+    const phone = parseMexicanWhatsAppPhone(senderId);
+    const address = snapshot.draft.address;
+    if (phone === null) return unverified;
+    const state =
+      address.kind !== 'saved' ? toMexicanState(address.fields.state) : null;
+    if (address.kind !== 'saved' && state === null)
+      return MINIMAL_CHECKOUT_INVALID_STATE_REPLY;
+    const parsed = CreateCheckoutInputSchema.safeParse({
+      ...phone,
+      customer:
+        address.kind !== 'new'
+          ? { mode: 'existing', customerId: snapshot.customerId }
+          : {
+              mode: 'createIfAbsent',
+              firstName: snapshot.draft.customer.firstName,
+              ...(snapshot.draft.customer.lastName === null
+                ? {}
+                : { lastName: snapshot.draft.customer.lastName }),
+            },
+      deliveryAddress:
+        address.kind === 'saved'
+          ? {
+              mode: 'existing',
+              addressId: snapshot.shippingAddressId,
+              expectedVersion: address.snapshot.version,
+            }
+          : {
+              ...(address.kind === 'savedCorrected'
+                ? {
+                    mode: 'existingUpdated',
+                    addressId: address.snapshot.id,
+                    expectedVersion: address.snapshot.version,
+                  }
+                : { mode: 'newSaved' }),
+              address: {
+                ...Object.fromEntries(
+                  Object.entries(address.fields).filter(
+                    ([, value]) => value !== null,
+                  ),
+                ),
+                state,
+              },
+            },
+      sale: {
+        cashierUserId: this.cashierUserId,
+        items: snapshot.items.map((item) => ({
+          productId: item.productId,
+          variantId: item.variantId ?? null,
+          productName: item.name,
+          variantName: item.variantName ?? null,
+          quantity: item.quantity,
+          unitPriceCents: item.unitPriceCents,
+        })),
+        expectedTotalCents:
+          snapshot.totalCents + (snapshot.shipping?.chargeCents ?? 0),
+        ...(snapshot.shipping?.classification === 'charged'
+          ? {
+              shipping: {
+                chargeCents: snapshot.shipping.chargeCents,
+                approvalId: snapshot.shipping.approvalId,
+                quoteId: snapshot.shipping.quoteId,
+              },
+            }
+          : {}),
+      },
+    });
+    if (!parsed.success) return unverified;
+    const checkoutPayload = parsed.data;
+    const digest = fingerprint(checkoutPayload);
     // `keyed` is the parsed cart; `stored` is the exact value now in the slot,
     // the only valid CAS expectation (parsed objects are not plain data).
-    const legacyPayload: CreateSaleInput = {
-      cashierUserId: this.cashierUserId,
-      customerId: snapshot.customerId,
-      shippingAddressId: snapshot.shippingAddressId,
-      expectedTotalCents:
-        snapshot.totalCents + (snapshot.shipping?.chargeCents ?? 0),
-      ...(snapshot.shipping?.classification === 'charged'
-        ? {
-            shipping: {
-              chargeCents: snapshot.shipping.chargeCents,
-              approvalId: snapshot.shipping.approvalId,
-              quoteId: snapshot.shipping.quoteId,
-            },
-          }
-        : {}),
-      items: snapshot.items.map((item) => ({
-        productId: item.productId,
-        variantId: item.variantId ?? null,
-        productName: item.name,
-        variantName: item.variantName ?? null,
-        quantity: item.quantity,
-        unitPriceCents: item.unitPriceCents,
-      })),
-    };
-    let checkoutPayload: CreateCheckoutInput | undefined;
-    if (this.atomicCheckoutEnabled) {
-      const phone = parseMexicanWhatsAppPhone(senderId);
-      const address = snapshot.draft.address;
-      if (phone === null) return unverified;
-      const state =
-        address.kind !== 'saved' ? toMexicanState(address.fields.state) : null;
-      if (address.kind !== 'saved' && state === null)
-        return MINIMAL_CHECKOUT_INVALID_STATE_REPLY;
-      const parsed = CreateCheckoutInputSchema.safeParse({
-        ...phone,
-        customer:
-          address.kind !== 'new'
-            ? { mode: 'existing', customerId: snapshot.customerId }
-            : {
-                mode: 'createIfAbsent',
-                firstName: snapshot.draft.customer.firstName,
-                ...(snapshot.draft.customer.lastName === null
-                  ? {}
-                  : { lastName: snapshot.draft.customer.lastName }),
-              },
-        deliveryAddress:
-          address.kind === 'saved'
-            ? {
-                mode: 'existing',
-                addressId: snapshot.shippingAddressId,
-                expectedVersion: address.snapshot.version,
-              }
-            : {
-                ...(address.kind === 'savedCorrected'
-                  ? {
-                      mode: 'existingUpdated',
-                      addressId: address.snapshot.id,
-                      expectedVersion: address.snapshot.version,
-                    }
-                  : { mode: 'newSaved' }),
-                address: {
-                  ...Object.fromEntries(
-                    Object.entries(address.fields).filter(
-                      ([, value]) => value !== null,
-                    ),
-                  ),
-                  state,
-                },
-              },
-        sale: {
-          cashierUserId: legacyPayload.cashierUserId,
-          items: legacyPayload.items,
-          expectedTotalCents: legacyPayload.expectedTotalCents,
-          ...(legacyPayload.shipping
-            ? { shipping: legacyPayload.shipping }
-            : {}),
-        },
-      });
-      if (!parsed.success) return unverified;
-      checkoutPayload = parsed.data;
-    }
-    const digest = fingerprint(checkoutPayload ?? legacyPayload);
     let keyed: MinimalCartState;
     let stored: unknown;
     try {
@@ -576,29 +546,21 @@ export class MinimalOrderService {
 
     let sale: unknown;
     try {
-      sale =
-        checkoutPayload === undefined
-          ? await this.api.createSale(legacyPayload, keyed.idempotencyKey)
-          : (
-              await this.api.createCheckout(
-                checkoutPayload,
-                keyed.idempotencyKey,
-              )
-            )?.sale;
+      sale = (
+        await this.api.createCheckout(checkoutPayload, keyed.idempotencyKey)
+      )?.sale;
     } catch (error) {
       const addressRejected =
-        this.atomicCheckoutEnabled &&
         error instanceof ChatbotApiError &&
         (error.errorCode === 'ADDRESS_VERSION_CONFLICT' ||
           error.errorCode === 'SHIPPING_ADDRESS_NOT_FOUND');
       if (addressRejected) this.checkout.clearSelection(senderId);
-      if (classifyFailure(error, this.atomicCheckoutEnabled) === 'keep') {
+      if (classifyFailure(error) === 'keep') {
         return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
       }
       // A definite rejection only proves THIS call created nothing; an earlier
       // uncertain call under the same key may have, so it is never rotated.
       const ambiguousPhone =
-        this.atomicCheckoutEnabled &&
         error instanceof ChatbotApiError &&
         error.errorCode === 'CUSTOMER_PHONE_AMBIGUOUS';
       if ((keyed.idempotencyAttempts ?? 1) > 1) {

@@ -40,25 +40,36 @@ describe('runLaunchPreflight', () => {
       });
     },
   );
-  it.each([undefined, '', 'true', 'FALSE', 'false'])(
-    'S2: minimal atomic checkout launch posture must be explicit false (%s)',
-    (value) => {
-      const env = safeEnv();
-      env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = value;
-      const report = run(env);
-      expect(report.posture).toContainEqual({
-        name: 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
-        expected: 'false',
-        status:
-          value === undefined || value === ''
-            ? 'missing'
-            : value === 'false'
-              ? 'safe'
-              : 'unsafe',
-      });
-      expect(report.ok).toBe(value === 'false');
-    },
-  );
+  it('S2: does not check the removed atomic checkout posture', () => {
+    const env = safeEnv();
+    delete env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED;
+    const report = run(env);
+    expect(report.ok).toBe(true);
+    expect(
+      report.posture.some(
+        (c: { name: string }) =>
+          c.name === 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
+      ),
+    ).toBe(false);
+  });
+  it('S2: lists the atomic checkout routes the order flow calls', () => {
+    expect(run(safeEnv()).clientRoutes).toEqual(
+      expect.arrayContaining([
+        {
+          method: 'POST',
+          path: '/chatbot-api/checkouts',
+          scope: 'customers:write sales:create',
+          status: 'manual_external',
+        },
+        {
+          method: 'GET',
+          path: '/chatbot-api/checkouts/status',
+          scope: 'customers:write sales:create',
+          status: 'manual_external',
+        },
+      ]),
+    );
+  });
   it('passes the happy path with every automatic check satisfied', () => {
     const report = run(safeEnv());
     expect(report.schemaVersion).toBe(1);
@@ -190,7 +201,7 @@ describe('runLaunchPreflight', () => {
         }),
       ),
     );
-    expect(first.clientRoutes).toHaveLength(11);
+    expect(first.clientRoutes).toHaveLength(13);
     expect(first.manualChecks.map((c: { id: string }) => c.id)).toEqual([
       'backend_reachable',
       'bot_cashier_user',

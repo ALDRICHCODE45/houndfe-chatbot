@@ -15,7 +15,8 @@ live on the backend. The bot's only contract here is the
 
 ## What the bot needs
 
-The bot issues `POST /chatbot-api/sales`, `GET /chatbot-api/payment-details`,
+The bot issues `POST /chatbot-api/checkouts` (minimal order placement),
+`POST /chatbot-api/sales` (legacy sale-flow tools), `GET /chatbot-api/payment-details`,
 and the other nine endpoints under a service credential. The
 `ServiceCredential` issued to the bot cashier must carry **7 scopes**:
 
@@ -24,8 +25,8 @@ and the other nine endpoints under a service credential. The
 | 1 | `catalog:read` | `searchCatalog`, `checkStock` |
 | 2 | `pricing:evaluate` | `evaluateCart` |
 | 3 | `customers:read` | `getCustomerByPhone`, `getOrderHistory` |
-| 4 | `customers:write` | `upsertCustomer` |
-| 5 | `sales:create` | `createSale` |
+| 4 | `customers:write` | `upsertCustomer`, `createCheckout`, `getCheckoutStatus` |
+| 5 | `sales:create` | `createSale`, `createCheckout`, `getCheckoutStatus` |
 | 6 | `sales:write` | `attachReceipt`, `updateDelivery` |
 | 7 | `payment-details:read` | `getPaymentDetails` (new in this slice) |
 

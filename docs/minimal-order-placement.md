@@ -2,27 +2,28 @@
 
 `MinimalOrderService` lets an allowlisted WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
 
-It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight. Placement can go through the backend atomic checkout behind its own default-off switch ([below](#atomic-checkout-switch)); that backend endpoint is not deployed yet, and production shipping prerequisites remain unresolved.
+It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight. Placement always goes through the backend [atomic checkout](#atomic-checkout) (`POST /chatbot-api/checkouts`); production shipping prerequisites remain unresolved.
 
 ## Enable it (test environments only)
 
-| Variable                                  | Required value        | Why                                                                                               |
-| ----------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------- |
-| `MINIMAL_CATALOG_AGENT_ENABLED`           | `true`                | The minimal SDK route itself.                                                                     |
-| `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS`   | test senders          | Only these WhatsApp senders reach the route.                                                      |
-| `MINIMAL_CATALOG_ORDER_ENABLED`           | `true`                | Exposes `prepareOrder`; any other value keeps it hidden.                                          |
-| `CHATBOT_API_CASHIER_USER_ID`             | bot cashier `User.id` | Server-owned `cashierUserId`; empty disables ordering.                                            |
-| `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED` | `true` (optional)     | Places orders via `POST /chatbot-api/checkouts`; any other value keeps `POST /chatbot-api/sales`. |
+| Variable                                | Required value        | Why                                                      |
+| --------------------------------------- | --------------------- | -------------------------------------------------------- |
+| `MINIMAL_CATALOG_AGENT_ENABLED`         | `true`                | The minimal SDK route itself.                            |
+| `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS` | test senders          | Only these WhatsApp senders reach the route.             |
+| `MINIMAL_CATALOG_ORDER_ENABLED`         | `true`                | Exposes `prepareOrder`; any other value keeps it hidden. |
+| `CHATBOT_API_CASHIER_USER_ID`           | bot cashier `User.id` | Server-owned `cashierUserId`; empty disables ordering.   |
+
+The service credential needs `customers:write` and `sales:create` for `POST /chatbot-api/checkouts` and `GET /chatbot-api/checkouts/status`.
 
 The store must implement `commitMinimalCart` and `commitMinimalCheckoutDraft`.
 
-## Who can order in this slice
+## Who can order
 
-- A **unique** registered customer, found by the trusted WhatsApp number.
-- A **saved** address, selected and confirmed through the checkout flow (`docs/minimal-checkout-coordinator.md`).
+- A **unique** registered customer with a **saved** address, selected and confirmed through the checkout flow (`docs/minimal-checkout-coordinator.md`), or with a confirmed correction of that saved address.
+- A new customer, or a registered one, with a confirmed **new** address (see [atomic checkout](#atomic-checkout)).
 - A non-empty cart whose promotions are fully evaluated.
 
-With the [atomic checkout switch](#atomic-checkout-switch) on, new customers, confirmed new addresses and corrected saved addresses can also order (see there). With it off, they get a clear "not yet" reply. This route never calls customer upsert or separate address mutations.
+This route never calls customer upsert or separate address mutations.
 
 ## Flow
 
@@ -35,20 +36,20 @@ With the [atomic checkout switch](#atomic-checkout-switch) on, new customers, co
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
-Fresh cart evaluation uses only the trusted sender's normalized phone to obtain customer pricing from the backend. Both legacy `/sales` and atomic `/checkouts` send the evaluation's backend-chosen **unit price before discount**, not the catalog price. `expectedTotalCents` is the sum of `finalPriceCents` plus any approved shipping charge. A changed customer price/promotion requires fresh consent; `PROMO_RE_QUOTE` can still occur if backend state changes between quote and placement.
+Fresh cart evaluation uses only the trusted sender's normalized phone to obtain customer pricing from the backend. The checkout sends the evaluation's backend-chosen **unit price before discount**, not the catalog price. `expectedTotalCents` is the sum of `finalPriceCents` plus any approved shipping charge. A changed customer price/promotion requires fresh consent; `PROMO_RE_QUOTE` can still occur if backend state changes between quote and placement.
 
-Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from the validated backend evaluation, or `(descuento: ahorro $X.XX MXN)` for a null/blank title. Zero-discount lines are unchanged. This is server-owned text, never model-authored. Promotion metadata is carried in the consent snapshot (changes require a fresh summary), but is display-only: neither sale/checkout payloads nor their idempotency fingerprints include these fields.
+Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from the validated backend evaluation, or `(descuento: ahorro $X.XX MXN)` for a null/blank title. Zero-discount lines are unchanged. This is server-owned text, never model-authored. Promotion metadata is carried in the consent snapshot (changes require a fresh summary), but is display-only: neither checkout payloads nor their idempotency fingerprints include these fields.
 
 ## Duplicate protection
 
-The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`, together with a SHA-256 fingerprint of the exact sale payload (customer, address, expected total, items and any approved shipping charge).
+The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/checkouts`, together with a SHA-256 fingerprint of the exact checkout payload (phone, customer, delivery address, expected total, items and any approved shipping charge).
 
-| Backend outcome                                                                                          | Key                   | Reply                                   |
-| -------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
-| Created                                                                                                  | cleared with the cart | folio + total + payment details         |
-| `PROMO_RE_QUOTE`, other definite 4xx (not 408/429) on the **first** attempt                              | rotated               | "no se pudo crear el pedido"            |
-| Same definite rejection on a **later** attempt (an earlier one was uncertain)                            | kept                  | "comuníquese con la tienda"             |
-| `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, 408, 429, 5xx, network error, malformed success | kept                  | "no pude confirmar si quedó registrado" |
+| Backend outcome                                                                                                                     | Key                   | Reply                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
+| Created                                                                                                                             | cleared with the cart | folio + total + payment details         |
+| Definite 4xx (not 408/429), such as `PROMO_RE_QUOTE`, on the **first** attempt                                                      | rotated               | "no se pudo crear el pedido"            |
+| Same definite rejection on a **later** attempt (an earlier one was uncertain)                                                       | kept                  | "comuníquese con la tienda"             |
+| `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, `CHECKOUT_RETRY_REQUIRED`, 408, 429, 5xx, network error, malformed success | kept                  | "no pude confirmar si quedó registrado" |
 
 A retry reuses the kept key only when the new payload has the same fingerprint. If the payload changed while a key is outstanding (another saved address, a promotion that moves the total), the server sends nothing and replies that an earlier order request could not be confirmed, so it never rotates into a possible duplicate. `IDEMPOTENCY_KEY_CONFLICT` keeps the key because the backend already saw it with another payload, so a sale may exist under it.
 
@@ -64,9 +65,9 @@ While a key is outstanding (any uncertain outcome, or a crash mid-call), the ord
 
 The lock ends only with a confirmed sale, or with a definite rejection of the first attempt. A failed payment-details read or a lost post-sale cart write never hides a created order.
 
-### Atomic checkout switch
+### Atomic checkout
 
-With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else is off), `place()` sends one `POST /chatbot-api/checkouts` instead of `POST /chatbot-api/sales`. With it off, the legacy path is unchanged. Launch preflight requires it explicitly `false`: the backend endpoint is committed in `houndfe-backend` but not deployed.
+`place()` sends one `POST /chatbot-api/checkouts` per consent. There is no switch and no `POST /chatbot-api/sales` fallback in this route (the legacy sale-flow tools still use `/sales`).
 
 - Saved address: customer mode `existing` and deliveryAddress mode `existing` with the confirmed snapshot `version` as `expectedVersion`. Phone comes from the trusted WhatsApp sender.
 - **Corrected saved address:** customer mode `existing`, deliveryAddress mode `existingUpdated`, the base `addressId` and exact base `version` as `expectedVersion`, plus the full snapshot-derived corrected address (no coordinates). This is a full replacement: null optional fields are omitted so the backend stores null, while unchanged non-null fields are preserved. The server's “Entrega a:” uses the corrected address and adds “Actualizaremos su dirección guardada con estos datos.” The backend updates that same address atomically with the sale; failure saves nothing. An identical correction stays plain `saved` and uses mode `existing`. The receipt accepts address resolution `updated` (or `existing` for a no-op).
@@ -95,7 +96,7 @@ Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confi
 ## Not in this slice
 
 - Shipping quotes, charges and approval are a separate default-off capability: [minimal shipping](minimal-shipping.md).
-- Customer and address creation without the atomic checkout switch. With the switch on, new customers and new addresses are created by the atomic checkout together with the order; see [atomic checkout switch](#atomic-checkout-switch).
+- Customer and address creation outside an order. New customers and new addresses are created only by the atomic checkout together with the order; see [atomic checkout](#atomic-checkout).
 - Order cancellation from the minimal route.
 
 ## Check

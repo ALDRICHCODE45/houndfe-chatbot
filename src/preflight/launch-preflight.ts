@@ -69,9 +69,6 @@ export const POSTURE_EXPECTATIONS: readonly {
   // `unsafe`, so shipping quotes cannot reach production implicitly.
   { name: 'SHIPPING_QUOTES_ENABLED', expected: 'false' },
   { name: 'MINIMAL_CATALOG_SHIPPING_ENABLED', expected: 'false' },
-  // The backend atomic checkout is not deployed yet: launch must keep the
-  // legacy POST /sales path explicitly.
-  { name: 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED', expected: 'false' },
 ];
 
 export const REQUIRED_MIGRATIONS = [
@@ -100,6 +97,8 @@ export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
   ['GET', '/chatbot-api/customers/by-phone', 'customers:read'],
   ['PUT', '/chatbot-api/customers/by-phone', 'customers:write'],
   ['POST', '/chatbot-api/sales', 'sales:create'],
+  ['POST', '/chatbot-api/checkouts', 'customers:write sales:create'],
+  ['GET', '/chatbot-api/checkouts/status', 'customers:write sales:create'],
   ['GET', '/chatbot-api/payment-details', 'payment-details:read'],
   ['POST', '/chatbot-api/sales/:saleId/cancel', 'sales:write'],
   ['POST', '/chatbot-api/sales/:saleId/receipts', 'sales:write'],

@@ -64,7 +64,7 @@ const response = (data: unknown, status = 201) => ({
   config: { headers: new AxiosHeaders() },
 });
 
-describe('atomic checkout mocked HTTP contract (endpoint not live)', () => {
+describe('atomic checkout mocked HTTP contract', () => {
   const key = 'checkout-secret-key';
   let request: jest.SpiedFunction<HttpService['request']>;
   let client: ChatbotApiHttpClient;

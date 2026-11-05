@@ -58,7 +58,8 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
     getStock: jest.fn(async () => ({ productId: PRODUCT, name: 'Producto', stock: { status: 'available', quantity: 10 }, variants: [] })),
     evaluateCart: jest.fn(async (items: Array<{ quantity: number }>) => ({ items: items.map(item => ({ productId: PRODUCT, variantId: null, quantity: item.quantity, unitPriceCents: price, originalPriceCents: price * item.quantity, finalPriceCents: price * item.quantity, discountAmountCents: 0, appliedPromotionTitle: null })), promotionEvaluationStatus: 'fully_evaluated' })),
     getCustomerCheckoutContext: jest.fn(async () => ({ status: 'unique', customer: { customerId: CUSTOMER, firstName: 'Ana', lastName: null }, addresses: [{ id: ADDRESS, version: '2026-10-01T00:00:00.000Z', label: 'Casa', street: 'Juárez', exteriorNumber: '10', interiorNumber: null, zipCode: '06000', neighborhood: 'Centro', municipality: 'Cuauhtémoc', city: null, state: 'Ciudad de México', visualReferences: null, carrierPhone: null }], nextAfterAddressId: null })),
-    createSale: jest.fn(async (...args: unknown[]) => { void args; return ({ saleId: '55555555-5555-4555-8555-555555555555', folio: 'B-42', paymentStatus: 'CREDIT', channel: 'ONLINE', deliveryStatus: 'PENDING', totalCents: price * 2 + (options.free || options.gate === false ? 0 : 20000), paidCents: 0, debtCents: price * 2, confirmedAt: null, discountCents: 0 }); }),
+    createSale: jest.fn(),
+    createCheckout: jest.fn(async (...args: unknown[]) => { void args; return ({ status: 'created', sale: { saleId: '55555555-5555-4555-8555-555555555555', folio: 'B-42', paymentStatus: 'CREDIT', channel: 'ONLINE', deliveryStatus: 'PENDING', totalCents: price * 2 + (options.free || options.gate === false ? 0 : 20000), paidCents: 0, debtCents: price * 2, confirmedAt: null, discountCents: 0 } }); }),
     getPaymentDetails: jest.fn(async () => ({ id: 'pd', bankName: 'BBVA', beneficiary: 'HoundFe', clabe: '012180001234567891', accountNumber: null, isActive: true, updatedAt: '2026-10-01T00:00:00.000Z' })),
   };
   const client = api as unknown as ChatbotApiClient;
@@ -118,15 +119,15 @@ describe('minimal shipping SDK public seam', () => {
     expect(h.provider.quote).toHaveBeenCalledTimes(1);
     expect(h.handoff.create).toHaveBeenCalledTimes(1);
     expect(h.seen[0].tools).not.toHaveProperty('requestStorePickup');
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(await h.decide('approved')).toMatchObject({ state: 'approved' });
     const offer = await h.turn('Prepare mi pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
     expect(offer.reply).toContain(free ? 'envío cubierto por su compra' : 'Envío: $200.00 MXN');
     offer.onSent?.();
     await h.turn('SÍ', []);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
-    const payload: unknown = h.api.createSale.mock.calls[0]?.[0];
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    const payload: unknown = (h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale;
     if (free) expect(payload).not.toHaveProperty('shipping');
     else expect(payload).toMatchObject({ shipping: { chargeCents: 20000, approvalId: 'abcdef123456', quoteId: 'q1' }, expectedTotalCents: 23000 });
   });
@@ -136,14 +137,14 @@ describe('minimal shipping SDK public seam', () => {
     expect(decision?.state).toBe('rejected');
     expect(decision?.reply).toContain('otra cotización');
     await h.turn('Pedido', [call('prepareOrder'), say()]);
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
   it('S6: pending approval expires after 30 minutes through public expiry path', async () => {
     const h = await setup(); await h.turn('Envío', [call('requestShippingQuote'), say()]);
     expect(await expireApproval(h.store, SENDER, Date.now() + 31 * 60000)).toBe(true);
     expect(await h.store.get(SENDER)).toHaveProperty('data.pendingHumanRequest', null);
     await h.turn('Pedido', [call('prepareOrder'), say()]);
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
   it('S1/S4: strict arguments fail closed before provider execution', async () => {
     const h = await setup();
@@ -167,7 +168,7 @@ describe('minimal shipping SDK public seam', () => {
     expect(result.reply).toContain('delivery_unconfirmed');
     expect(result.reply).not.toContain('$');
     expect(h.provider.quote).not.toHaveBeenCalled();
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
   it('S4: earlier delivery presentation prevents quoting in the same run', async () => {
     const h = await setup();
@@ -180,7 +181,8 @@ describe('minimal shipping SDK public seam', () => {
     const offer = await h.turn('Pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
     offer.onSent?.(); await h.turn('SÍ', []);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
-    expect(h.api.createSale.mock.calls[0]?.[0]).not.toHaveProperty('shipping');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect((h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale).not.toHaveProperty('shipping');
+    expect(h.api.createSale).not.toHaveBeenCalled();
   });
 });
