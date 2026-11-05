@@ -14,6 +14,7 @@ import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
   legacyMinimalShippingSchema,
+  minimalPickupSchema,
   minimalShippingQuoteSchema,
 } from '../domain/minimal-shipping';
 import { minimalPromotionSuffix } from '../domain/minimal-order-confirmation';
@@ -43,9 +44,13 @@ const cartSchema = z.strictObject({
   idempotencyAttempts: z.number().int().positive().optional(),
   expectedTotalCents: z.number().int().nonnegative().optional(),
   placedSale: placedSaleSchema.optional(),
-  // Backend-signed quote; legacy approval records only parse (U5 deletes).
+  // Backend-signed quote or store pickup; legacy approval records only parse (U5 deletes).
   shipping: z
-    .union([minimalShippingQuoteSchema, legacyMinimalShippingSchema])
+    .union([
+      minimalShippingQuoteSchema,
+      minimalPickupSchema,
+      legacyMinimalShippingSchema,
+    ])
     .optional(),
 });
 export type MinimalCartState = z.infer<typeof cartSchema>;

@@ -14,6 +14,7 @@ import { toMexicanState } from './mexican-state';
 import type { MinimalCheckoutDraft } from '../../conversation/domain/minimal-checkout-draft';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { isAffirmative } from './minimal-checkout-confirmation';
+import { minimalShippingEtaLine } from './minimal-shipping';
 
 /** Pending-offer TTL; mirrors the checkout and RESTOCK volatile lifecycles. */
 export const MINIMAL_ORDER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
@@ -49,11 +50,29 @@ export type MinimalOrderIneligibleReason =
   | 'new_address_unsupported'
   | 'invalid_state';
 
-/** Backend-signed delivery quote; the backend computed the charge (S2/S3). */
-export interface MinimalOrderShipping {
-  readonly quoteId: string;
-  readonly customerChargeCents: number;
+/** Backend ETA: business days, or unknown while stock is pending (S7). */
+export interface MinimalShippingEta {
+  readonly days: number | null;
+  readonly reason?: 'STOCK_PENDING';
 }
+
+/**
+ * Backend-signed delivery quote (the backend computed charge and credit,
+ * S2/S3) or store pickup (S4). Display fields are optional only for older
+ * snapshots; a fresh order fills them from the stored quote.
+ */
+export type MinimalOrderShipping =
+  | {
+      readonly quoteId: string;
+      readonly customerChargeCents: number;
+      readonly creditCents?: number;
+      readonly option?: {
+        readonly carrier: string;
+        readonly service: string;
+      } | null;
+      readonly eta?: MinimalShippingEta | null;
+    }
+  | { readonly mode: 'pickup' };
 
 /** Exact content the customer consents to; detached from every input. */
 export interface MinimalOrderSnapshot {
@@ -144,7 +163,17 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
     snapshot.totalCents,
     snapshot.shipping === undefined
       ? null
-      : [snapshot.shipping.quoteId, snapshot.shipping.customerChargeCents],
+      : 'quoteId' in snapshot.shipping
+        ? [
+            snapshot.shipping.quoteId,
+            snapshot.shipping.customerChargeCents,
+            snapshot.shipping.creditCents ?? 0,
+            snapshot.shipping.option?.carrier ?? null,
+            snapshot.shipping.option?.service ?? null,
+            snapshot.shipping.eta?.days ?? null,
+            snapshot.shipping.eta?.reason ?? null,
+          ]
+        : [snapshot.shipping.mode],
   ]);
 }
 
@@ -197,10 +226,43 @@ function deliveryLine(snapshot: MinimalOrderSnapshot): string {
     .join(', ');
 }
 
+/** Shipping block of the summary: carrier, charge, credit and ETA (S3/S7). */
+function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
+  const shipping = snapshot.shipping;
+  if (shipping === undefined)
+    return [
+      'El envío no está incluido en este total y se coordinará por separado.',
+    ];
+  if (!('quoteId' in shipping))
+    return ['Recoge en tienda (sin costo de envío)'];
+  const carrier = shipping.option
+    ? ` con ${shipping.option.carrier} (${shipping.option.service})`
+    : '';
+  const eta = minimalShippingEtaLine(shipping.eta);
+  return [
+    shipping.customerChargeCents === 0
+      ? `Envío${carrier}: sin costo para usted`
+      : `Envío${carrier}: ${mxn(shipping.customerChargeCents)}`,
+    ...((shipping.creditCents ?? 0) > 0
+      ? [
+          `Usted tiene un crédito de ${mxn(shipping.creditCents ?? 0)} por sus productos (ya descontado del envío)`,
+        ]
+      : []),
+    ...(eta === null ? [] : [eta]),
+    ...(shipping.customerChargeCents === 0
+      ? []
+      : [
+          `Total a pagar: ${mxn(snapshot.totalCents + shipping.customerChargeCents)}`,
+        ]),
+  ];
+}
+
 /** Server-owned order summary; the model never authors it. */
 export function renderMinimalOrderSummary(
   snapshot: MinimalOrderSnapshot,
 ): string {
+  const pickup =
+    snapshot.shipping !== undefined && !('quoteId' in snapshot.shipping);
   return [
     'Resumen de su pedido:',
     ...snapshot.items.map(
@@ -208,23 +270,16 @@ export function renderMinimalOrderSummary(
         `• ${item.name}${item.variantName ? ` — ${item.variantName}` : ''}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
-    `Entrega a: ${deliveryLine(snapshot)}`,
+    pickup
+      ? `Datos del cliente: ${deliveryLine(snapshot)}`
+      : `Entrega a: ${deliveryLine(snapshot)}`,
     ...(snapshot.draft.address.kind === 'new'
       ? ['Guardaremos esta dirección con su pedido.']
       : []),
     ...(snapshot.draft.address.kind === 'savedCorrected'
       ? ['Actualizaremos su dirección guardada con estos datos.']
       : []),
-    ...(snapshot.shipping === undefined
-      ? [
-          'El envío no está incluido en este total y se coordinará por separado.',
-        ]
-      : snapshot.shipping.customerChargeCents === 0
-        ? ['envío cubierto por su compra']
-        : [
-            `Envío: ${mxn(snapshot.shipping.customerChargeCents)}`,
-            `Total a pagar: ${mxn(snapshot.totalCents + snapshot.shipping.customerChargeCents)}`,
-          ]),
+    ...shippingLines(snapshot),
     '',
     'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
   ].join('\n');

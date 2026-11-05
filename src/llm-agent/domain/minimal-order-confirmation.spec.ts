@@ -110,27 +110,82 @@ describe('shipping summary and exact binding', () => {
       'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
     );
   });
-  it('[S3] presents a zero charge as covered shipping without a freight line', () => {
+  it('[S3] presents a zero charge as shipping without cost and no extra total', () => {
     const summary = renderMinimalOrderSummary(withShipping(0));
     expect(summary).toContain('Total de productos: $27.00 MXN');
-    expect(summary).toContain('envío cubierto por su compra');
-    expect(summary).not.toContain('Envío:');
+    expect(summary).toContain('Envío: sin costo para usted');
+    expect(summary).not.toContain('Total a pagar');
     expect(summary).not.toContain('no está incluido');
   });
-  it.each([{ customerChargeCents: 6000 }, { quoteId: 'quote-2' }])(
-    '[S2] changed quote content invalidates exact consent (%j)',
-    (change) => {
-      const snapshot = withShipping(5000);
-      expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
-      expect(
-        sameMinimalOrder(snapshot, {
-          ...snapshot,
-          shipping: { ...snapshot.shipping, ...change },
-        }),
-      ).toBe(false);
-      expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
-    },
-  );
+  it('[S3,S7] shows carrier, charge, credit and the ETA line', () => {
+    const summary = renderMinimalOrderSummary({
+      ...eligible(),
+      shipping: {
+        quoteId: 'quote-1',
+        customerChargeCents: 3000,
+        creditCents: 12000,
+        option: { carrier: 'Envíos Perros', service: 'Estándar' },
+        eta: { days: 3 },
+      },
+    });
+    expect(summary).toContain('Envío con Envíos Perros (Estándar): $30.00 MXN');
+    expect(summary).toContain(
+      'Usted tiene un crédito de $120.00 MXN por sus productos',
+    );
+    expect(summary).toContain('Llega en aproximadamente 3 días hábiles');
+    expect(summary).toContain('Total a pagar: $57.00 MXN');
+    expect(summary).toContain('Entrega a: Ana Pérez, Av. Juárez 10');
+  });
+  it('[S7] a STOCK_PENDING eta says delivery depends on restock; no credit line at zero', () => {
+    const summary = renderMinimalOrderSummary({
+      ...eligible(),
+      shipping: {
+        quoteId: 'quote-1',
+        customerChargeCents: 3000,
+        creditCents: 0,
+        option: null,
+        eta: { days: null, reason: 'STOCK_PENDING' },
+      },
+    });
+    expect(summary).toContain('Envío: $30.00 MXN');
+    expect(summary).not.toContain('crédito');
+    expect(summary).toContain(
+      'La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.',
+    );
+    expect(summary).not.toContain('Llega en');
+  });
+  it('[S4] pickup says the customer picks it up in store with no shipping cost', () => {
+    const snapshot: MinimalOrderSnapshot = {
+      ...eligible(),
+      shipping: { mode: 'pickup' },
+    };
+    const summary = renderMinimalOrderSummary(snapshot);
+    expect(summary).toContain('Recoge en tienda (sin costo de envío)');
+    expect(summary).toContain('Total de productos: $27.00 MXN');
+    expect(summary).not.toContain('Entrega a:');
+    expect(summary).not.toContain('Total a pagar');
+    expect(summary).not.toContain('no está incluido');
+    expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
+    expect(sameMinimalOrder(snapshot, withShipping(0))).toBe(false);
+    expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
+  });
+  it.each([
+    { customerChargeCents: 6000 },
+    { quoteId: 'quote-2' },
+    { creditCents: 100 },
+    { option: { carrier: 'Otro', service: 'Ground' } },
+    { eta: { days: 5 } },
+  ])('[S2] changed quote content invalidates exact consent (%j)', (change) => {
+    const snapshot = withShipping(5000);
+    expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
+    expect(
+      sameMinimalOrder(snapshot, {
+        ...snapshot,
+        shipping: { ...snapshot.shipping, ...change },
+      }),
+    ).toBe(false);
+    expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
+  });
 });
 
 describe('new address S2/S3/S4/S6', () => {

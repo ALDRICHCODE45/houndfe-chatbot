@@ -7,6 +7,7 @@ import {
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import type { ShippingApprovalDigest } from '../../human-handoff/domain/human-handoff.types';
 import {
+  isMinimalPickup,
   isMinimalShippingQuote,
   requestMinimalShippingApproval,
   transitionShippingApproval,
@@ -22,7 +23,9 @@ function legacyShipping(
   cart: MinimalCartState | null | undefined,
 ): MinimalShipping | undefined {
   const s = cart?.shipping;
-  return s === undefined || isMinimalShippingQuote(s) ? undefined : s;
+  return s === undefined || isMinimalShippingQuote(s) || isMinimalPickup(s)
+    ? undefined
+    : s;
 }
 
 export const MINIMAL_SHIPPING_UNCONFIRMED =

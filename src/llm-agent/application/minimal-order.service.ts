@@ -12,9 +12,11 @@ import {
   type CreateCheckoutInput,
 } from '../../chatbot-api/domain/dtos/checkout.dto';
 import {
+  PACKAGING_DATA_MISSING,
   SHIPPING_QUOTE_EXPIRED,
   SHIPPING_QUOTE_MISMATCH,
   SHIPPING_QUOTE_NOT_FOUND,
+  SHIPPING_QUOTE_UNAVAILABLE,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
@@ -32,8 +34,11 @@ import {
   type MinimalOrderShipping,
 } from '../domain/minimal-order-confirmation';
 import {
+  isMinimalPickup,
   isMinimalShippingQuote,
+  isPickupCurrent,
   isShippingCurrent,
+  minimalShippingEta,
 } from '../domain/minimal-shipping';
 import {
   MinimalCartService,
@@ -48,6 +53,7 @@ import {
   MinimalCheckoutService,
   type MinimalCheckoutReply,
 } from './minimal-checkout.service';
+import { MinimalShippingService } from './minimal-shipping.service';
 
 export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
   MinimalOrderIneligibleReason,
@@ -65,7 +71,7 @@ export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
     'Por ahora solo puedo crear pedidos para clientes registrados con una dirección guardada. Comuníquese con la tienda para registrar sus datos; no se creó ningún pedido.',
 };
 export const MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY =
-  'Dígame «cotizar envío» para calcular el envío a su dirección antes de volver a pedir el resumen; no se creó ningún pedido.';
+  'Antes del resumen necesito saber cómo recibirá su pedido: dígame «cotizar envío» para calcular el envío a su dirección confirmada, o «recoger en tienda» si prefiere recogerlo sin costo de envío. Por ahora no se creó ningún pedido.';
 /** Test seam for quote expiry; production uses `Date.now`. */
 export const MINIMAL_ORDER_CLOCK = Symbol('MINIMAL_ORDER_CLOCK');
 export const MINIMAL_ORDER_CHANGED_REPLY =
@@ -80,6 +86,14 @@ export const MINIMAL_ORDER_STOCK_CHANGED_REPLY =
   'Mientras confirmaba su pedido ya no alcanzó la existencia de un producto de su carrito; no se creó ningún pedido. Revise su carrito, ajuste la cantidad o quite ese producto, y pida otra vez el resumen.';
 export const MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY =
   'La cotización de envío ya no es válida porque venció o cambió su pedido; no se creó ningún pedido. Pídame de nuevo el envío para su dirección y le muestro el total actualizado.';
+export const MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY =
+  'La cotización de envío venció o cambió, así que la actualicé; no se creó ningún pedido. Revise el nuevo total:';
+export const MINIMAL_ORDER_SHIPPING_QUOTE_NOT_FOUND_REPLY =
+  'No encontré su cotización de envío; no se creó ningún pedido. Dígame «cotizar envío» para calcularlo de nuevo, o «recoger en tienda» si prefiere recogerlo sin costo de envío.';
+export const MINIMAL_ORDER_PACKAGING_MISSING_REPLY =
+  'No pude confirmar el envío porque nos falta información de empaque de un producto; no se creó ningún pedido. Puede intentarlo más tarde o, si prefiere, recoger su pedido en tienda sin costo de envío.';
+export const MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY =
+  'No pude confirmar el envío en este momento; no se creó ningún pedido. Puede pedirme de nuevo el envío en unos minutos o, si prefiere, recoger su pedido en tienda sin costo de envío.';
 export const MINIMAL_ORDER_HELD_REPLY =
   'Tengo una solicitud de pedido anterior que no pude confirmar y sus datos ya no coinciden con este resumen. Para no duplicar su pedido no creé uno nuevo; por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_UNRESOLVED_REPLY =
@@ -95,12 +109,14 @@ const VARIANT_REJECTION_CODES: ReadonlySet<string> = new Set([
   'BOT_ITEM_VARIANT_NOT_ALLOWED',
   'BOT_ITEM_VARIANT_MISMATCH',
 ]);
-/** The signed shipping quote is gone, expired or no longer matches the cart. */
-const SHIPPING_QUOTE_REJECTION_CODES: ReadonlySet<string> = new Set([
-  SHIPPING_QUOTE_NOT_FOUND,
-  SHIPPING_QUOTE_EXPIRED,
-  SHIPPING_QUOTE_MISMATCH,
-]);
+/** Definite checkout rejections about the shipping quote (S6). */
+const SHIPPING_REJECTION_REPLIES: Readonly<Record<string, string>> = {
+  [SHIPPING_QUOTE_EXPIRED]: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+  [SHIPPING_QUOTE_MISMATCH]: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+  [SHIPPING_QUOTE_NOT_FOUND]: MINIMAL_ORDER_SHIPPING_QUOTE_NOT_FOUND_REPLY,
+  [PACKAGING_DATA_MISSING]: MINIMAL_ORDER_PACKAGING_MISSING_REPLY,
+  [SHIPPING_QUOTE_UNAVAILABLE]: MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY,
+};
 /**
  * Unknown outcomes. `IDEMPOTENCY_KEY_CONFLICT` is one: the backend already saw
  * this key with another payload, so a sale may exist under it.
@@ -193,6 +209,7 @@ export class MinimalOrderService {
     private readonly checkout: MinimalCheckoutService,
     config: ConfigService,
     @Optional() @Inject(MINIMAL_ORDER_CLOCK) now?: () => number,
+    @Optional() private readonly shipping?: MinimalShippingService,
   ) {
     this.now = now ?? (() => Date.now());
     this.shippingEnabled =
@@ -297,6 +314,8 @@ export class MinimalOrderService {
           };
     }
     const reply = await this.place(input.senderId, fresh.snapshot);
+    if (reply === MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY && !recovery.outstanding)
+      return this.requote(input.senderId, input.inboundEvent);
     return {
       reply:
         recovery.outstanding &&
@@ -305,6 +324,34 @@ export class MinimalOrderService {
           ? MINIMAL_ORDER_UNRESOLVED_REPLY
           : reply,
     };
+  }
+
+  /**
+   * S6: the backend refused an expired or mismatched quote and created
+   * nothing. Ask for one fresh quote and present the new summary for a new
+   * SÍ; any other outcome asks the customer to request shipping again.
+   */
+  private async requote(
+    senderId: string,
+    inboundEvent: unknown,
+  ): Promise<MinimalCheckoutReply> {
+    const fallback = { reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY };
+    if (this.shipping === undefined) return fallback;
+    try {
+      if ((await this.shipping.quote(senderId)).kind !== 'quoted')
+        return fallback;
+      const fresh = await this.freshOrder(senderId);
+      if (!fresh.ok) return fallback;
+      const offer = this.offer(senderId, inboundEvent, fresh.snapshot);
+      return offer.onSent === undefined
+        ? fallback
+        : {
+            reply: `${MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY}\n\n${offer.reply}`,
+            onSent: offer.onSent,
+          };
+    } catch {
+      return fallback;
+    }
   }
 
   /** Resolve an earlier POST before consulting mutable stock/address/shipping. */
@@ -332,11 +379,13 @@ export class MinimalOrderService {
             raw,
             status.checkout.sale,
             this.shippingEnabled && cart?.shipping !== undefined
-              ? {
-                  customerChargeCents: isMinimalShippingQuote(cart.shipping)
-                    ? cart.shipping.customerChargeCents
-                    : cart.shipping.customerPaysCents,
-                }
+              ? isMinimalPickup(cart.shipping)
+                ? { mode: 'pickup' }
+                : {
+                    customerChargeCents: isMinimalShippingQuote(cart.shipping)
+                      ? cart.shipping.customerChargeCents
+                      : cart.shipping.customerPaysCents,
+                  }
               : undefined,
           ),
         };
@@ -408,27 +457,29 @@ export class MinimalOrderService {
 
   /**
    * A delivery order needs a stored backend quote for a deliverable zone with
-   * a quoteId, not yet expired, whose cart and address pins still match.
+   * a quoteId, not yet expired, whose cart and address pins still match. A
+   * pickup order needs a pickup choice whose cart pin still matches (S4).
    */
   private currentShipping(
     cart: MinimalCartState,
     snapshot: MinimalOrderSnapshot,
   ): MinimalOrderShipping | null {
     const record = cart.shipping;
+    if (record === undefined) return null;
+    const cartLines = snapshot.items.map((item) => ({
+      productId: item.productId,
+      ...(item.variantId === undefined ? {} : { variantId: item.variantId }),
+      quantity: item.quantity,
+      unitPriceCents: item.unitPriceCents,
+      finalPriceCents: item.finalPriceCents,
+    }));
+    if (isMinimalPickup(record))
+      return isPickupCurrent(record, cartLines) ? { mode: 'pickup' } : null;
     if (
-      record === undefined ||
       !isMinimalShippingQuote(record) ||
       record.quoteId === null ||
       isShippingCurrent(record, {
-        cartLines: snapshot.items.map((item) => ({
-          productId: item.productId,
-          ...(item.variantId === undefined
-            ? {}
-            : { variantId: item.variantId }),
-          quantity: item.quantity,
-          unitPriceCents: item.unitPriceCents,
-          finalPriceCents: item.finalPriceCents,
-        })),
+        cartLines,
         address: snapshot.draft.address,
         nowMs: this.now(),
       }) !== 'current'
@@ -437,6 +488,12 @@ export class MinimalOrderService {
     return {
       quoteId: record.quoteId,
       customerChargeCents: record.customerChargeCents,
+      creditCents: record.creditCents,
+      option:
+        record.option === null
+          ? null
+          : { carrier: record.option.carrier, service: record.option.service },
+      eta: minimalShippingEta(record),
     };
   }
 
@@ -504,10 +561,18 @@ export class MinimalOrderService {
           unitPriceCents: item.unitPriceCents,
         })),
         expectedTotalCents:
-          snapshot.totalCents + (snapshot.shipping?.customerChargeCents ?? 0),
+          snapshot.totalCents +
+          (snapshot.shipping !== undefined && 'quoteId' in snapshot.shipping
+            ? snapshot.shipping.customerChargeCents
+            : 0),
         ...(snapshot.shipping === undefined
           ? {}
-          : { shipping: { quoteId: snapshot.shipping.quoteId } }),
+          : {
+              shipping:
+                'quoteId' in snapshot.shipping
+                  ? { quoteId: snapshot.shipping.quoteId }
+                  : { mode: 'pickup' },
+            }),
       },
     });
     if (!parsed.success) return unverified;
@@ -602,9 +667,9 @@ export class MinimalOrderService {
       if (
         error instanceof ChatbotApiError &&
         error.errorCode !== null &&
-        SHIPPING_QUOTE_REJECTION_CODES.has(error.errorCode)
+        Object.hasOwn(SHIPPING_REJECTION_REPLIES, error.errorCode)
       ) {
-        return MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY;
+        return SHIPPING_REJECTION_REPLIES[error.errorCode];
       }
       return MINIMAL_ORDER_REJECTED_REPLY;
     }
@@ -617,7 +682,7 @@ export class MinimalOrderService {
     senderId: string,
     stored: unknown,
     sale: BotSaleResponse,
-    shipping?: Pick<MinimalOrderShipping, 'customerChargeCents'>,
+    shipping?: { mode: 'pickup' } | { customerChargeCents: number },
   ): Promise<string> {
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
@@ -635,9 +700,11 @@ export class MinimalOrderService {
         : `Su pedido quedó registrado con folio ${sale.folio}.`) +
       (shipping === undefined
         ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
-        : shipping.customerChargeCents === 0
-          ? ` Total de productos: ${mxn(sale.totalCents)}. envío cubierto por su compra.`
-          : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`);
+        : !('customerChargeCents' in shipping)
+          ? ` Total a pagar: ${mxn(sale.totalCents)}. Recoge en tienda (sin costo de envío).`
+          : shipping.customerChargeCents === 0
+            ? ` Total de productos: ${mxn(sale.totalCents)}. Envío sin costo para usted.`
+            : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`);
     return `${created}\n\n${await this.paymentInstructions()}`;
   }
 

@@ -15,6 +15,8 @@ import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import {
   MinimalCatalogAgentService,
   CHECKOUT_TOOL_CLARIFICATION,
+  minimalPickupReply,
+  minimalShippingReply,
 } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
@@ -115,14 +117,14 @@ describe('minimal shipping SDK public seam', () => {
     h.quotes.enqueue(backendQuote(free ? { zoneStatus: 'FREE', creditCents: 20000, customerChargeCents: 0 } : {}));
     const quoted = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
     if (quoted.kind !== 'handled') throw new Error('reply');
-    expect(quoted.reply).toContain(free ? 'cubierto por su compra' : 'a pagar $200.00 MXN');
+    expect(quoted.reply).toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
     expect(quoted.reply).not.toMatch(/aprobaci|999/);
     expect(h.quotes.calls).toHaveLength(1);
-    expect(h.seen[0].tools).not.toHaveProperty('requestStorePickup');
+    expect(h.seen[0].tools).toHaveProperty('chooseStorePickup');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     const offer = await h.turn('Prepare mi pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
-    expect(offer.reply).toContain(free ? 'envío cubierto por su compra' : 'Envío: $200.00 MXN');
+    expect(offer.reply).toContain(free ? 'sin costo para usted' : 'Envío con Carrier (Ground): $200.00 MXN');
     offer.onSent?.();
     await h.turn('SÍ', []);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
@@ -132,8 +134,8 @@ describe('minimal shipping SDK public seam', () => {
     expect(payload).not.toHaveProperty('shipping.approvalId');
   });
   it.each([
-    [backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }), 'zone_pending', 'validación'],
-    [backendQuote({ zoneStatus: 'DENIED', quoteId: null, option: null }), 'zone_denied', 'no tenemos envío'],
+    [backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }), 'zone_pending', 'Estamos validando la entrega a su código postal 06000'],
+    [backendQuote({ zoneStatus: 'DENIED', quoteId: null, option: null }), 'zone_denied', 'Por ahora no tenemos entrega a su código postal 06000'],
     [new ChatbotApiError('quote', 422, {}, PACKAGING_DATA_MISSING), 'packaging_missing', 'empaque'],
     [new ChatbotApiError('quote', 503, {}, SHIPPING_QUOTE_UNAVAILABLE), 'unavailable', 'en este momento'],
   ] as const)('tool result reflects %#: %s and no order is possible', async (answer, kind, text) => {
@@ -155,7 +157,8 @@ describe('minimal shipping SDK public seam', () => {
     h.quotes.enqueue(backendQuote({ eta: { days: null, reason: 'STOCK_PENDING' } }));
     const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
     if (result.kind !== 'handled') throw new Error('reply');
-    expect(result.reply).toContain('depende de la reposición');
+    expect(result.reply).toContain('La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.');
+    expect(result.reply).not.toContain('Llega en');
   });
   it('S1/S4: strict arguments fail closed before provider execution', async () => {
     const h = await setup();
@@ -192,5 +195,75 @@ describe('minimal shipping SDK public seam', () => {
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect((h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale).not.toHaveProperty('shipping');
     expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+});
+
+// prettier-ignore
+describe('U4 customer shipping conversation', () => {
+  const quoted = (overrides: Partial<Extract<Parameters<typeof minimalShippingReply>[0], { kind: 'quoted' }>> = {}) =>
+    minimalShippingReply({ kind: 'quoted', zoneStatus: 'SURCHARGE', costCents: 30000, creditCents: 24000, customerChargeCents: 6000,
+      option: { carrier: 'Envíos Perros', service: 'Estándar', etaDays: 4 }, eta: null, zipCode: '06000', ...overrides });
+  it('[S3] SURCHARGE shows carrier, cost, credit, customer charge, ETA and the next step', () => {
+    expect(quoted()).toBe(
+      'Envío a domicilio con Envíos Perros (Estándar): $300.00 MXN. Usted tiene un crédito de $240.00 MXN por sus productos. Usted paga $60.00 MXN. ' +
+      'Llega en aproximadamente 4 días hábiles. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+  });
+  it('[S3] CARRIER_ONLY without credit or carrier omits those parts', () => {
+    const reply = quoted({ zoneStatus: 'CARRIER_ONLY', creditCents: 0, customerChargeCents: 30000, option: null });
+    expect(reply).toContain('Envío a domicilio: $300.00 MXN. Usted paga $300.00 MXN.');
+    expect(reply).not.toContain('crédito');
+    expect(reply).not.toContain('Llega en');
+  });
+  it('[S3] FREE says there is no cost for that ZIP, with the ETA line', () => {
+    expect(quoted({ zoneStatus: 'FREE', costCents: 0, creditCents: 0, customerChargeCents: 0, option: null, eta: { days: 1 } })).toBe(
+      'Su envío al código postal 06000 no tiene costo. Llega en aproximadamente 1 día hábil. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+  });
+  it('[S7] STOCK_PENDING replaces the day count', () => {
+    expect(quoted({ eta: { days: null, reason: 'STOCK_PENDING' } })).toContain(
+      'La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.');
+  });
+  it('[S5] PENDING zone', () => {
+    expect(minimalShippingReply({ kind: 'zone_pending', zipCode: '06000' })).toBe(
+      'Estamos validando la entrega a su código postal 06000. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.');
+  });
+  it('[S4] DENIED zone', () => {
+    expect(minimalShippingReply({ kind: 'zone_denied', zipCode: '06000' })).toBe(
+      'Por ahora no tenemos entrega a su código postal 06000. Puede recoger su pedido en tienda sin costo de envío. ¿Le parece?');
+  });
+  it.each(['packaging_missing', 'unavailable'] as const)('[S6] %s is honest, has no amount and offers pickup or a retry', kind => {
+    const reply = minimalShippingReply({ kind });
+    expect(reply).not.toContain('$');
+    expect(reply).toContain('recoger su pedido en tienda');
+    expect(reply).toMatch(/más tarde|en unos minutos/);
+  });
+  it('[S4] pickup replies', () => {
+    expect(minimalPickupReply({ kind: 'pickup' })).toBe(
+      'Listo, usted recoge su pedido en tienda, sin costo de envío. Dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+    expect(minimalPickupReply({ kind: 'refused', reason: 'cart_changed' })).not.toContain('Listo');
+  });
+  it('[S4] prompt: quote after confirmation, never invent costs, pickup on DENIED/PENDING, no approval', async () => {
+    const h = await setup(); await h.turn('Hola', [say()]);
+    const system = String(h.seen[0].system);
+    expect(system).toContain('chooseStorePickup');
+    expect(system).toContain('Nunca invente');
+    expect(system).not.toContain('No ofrece recoger en tienda');
+    expect(system).not.toMatch(/(env[ií]o|cotizaci[oó]n)[^.]{0,80}aprob|aprob[^.]{0,80}(env[ií]o|cotizaci[oó]n)/i);
+  });
+  it('[S4] chooseStorePickup then SÍ creates a pickup order with a products-only total', async () => {
+    const h = await setup();
+    const chosen = await h.turn('Mejor paso a recogerlo', [call('chooseStorePickup'), say()]);
+    if (chosen.kind !== 'handled') throw new Error('reply');
+    expect(chosen.reply).toContain('recoge su pedido en tienda');
+    expect(h.quotes.calls).toHaveLength(0);
+    const offer = await h.turn('Pedido', [call('prepareOrder'), say()]);
+    if (offer.kind !== 'handled') throw new Error('offer');
+    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
+    offer.onSent?.(); await h.turn('SÍ', []);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect((h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale).toMatchObject({ shipping: { mode: 'pickup' }, expectedTotalCents: 3000 });
+  });
+  it('[S4] strict arguments fail closed for chooseStorePickup', async () => {
+    const h = await setup();
+    expect(await h.turn('Recoger', [call('chooseStorePickup', { senderId: 'attacker' }), say()])).toMatchObject({ reply: CHECKOUT_TOOL_CLARIFICATION });
   });
 });

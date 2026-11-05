@@ -61,8 +61,10 @@ import {
 import { MinimalOrderService } from './minimal-order.service';
 import {
   MinimalShippingService,
+  type MinimalPickupResult,
   type MinimalShippingResult,
 } from './minimal-shipping.service';
+import { minimalShippingEtaLine } from '../domain/minimal-shipping';
 import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
@@ -260,40 +262,77 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'confirmCheckoutDetails',
   'prepareOrder',
   'requestShippingQuote',
+  'chooseStorePickup',
 ]);
 
 const SHIPPING_INSTRUCTIONS_FRAGMENT =
-  '\n\nHerramienta requestShippingQuote: sin argumentos, solo después de confirmar los datos de entrega y si el cliente quiere envío a domicilio. Solicita la cotización de envío; la aplicación informa al cliente el resultado. Nunca indique montos ni que existe un pedido. Luego el cliente pide el resumen con prepareOrder. No ofrece recoger en tienda.';
+  '\n\nEnvío: llame requestShippingQuote sin argumentos solo después de que el cliente confirmó sus datos de entrega y quiere envío a domicilio; la aplicación le informa el costo, el crédito y la fecha estimada. Nunca invente ni calcule costos, créditos, transportistas ni fechas de entrega; no repita montos. ' +
+  'Si la entrega a su código postal está en validación o no está disponible, ofrezca recoger el pedido en tienda. Cuando el cliente elija recoger en tienda (puede pedirlo en cualquier momento), llame chooseStorePickup sin argumentos; no tiene costo de envío. ' +
+  'Después el cliente pide el resumen con prepareOrder. Nunca diga que existe un pedido.';
 
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
 const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
+const NEXT_STEP =
+  'Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.';
+const zipPhrase = (zipCode: string | null) =>
+  zipCode === null ? 'su código postal' : `su código postal ${zipCode}`;
 
 /** Server-owned reply for one quote attempt; amounts come only from the backend. */
-function minimalShippingReply(result: MinimalShippingResult): string {
+export function minimalShippingReply(result: MinimalShippingResult): string {
   switch (result.kind) {
-    case 'quoted':
+    case 'quoted': {
+      const eta = minimalShippingEtaLine(
+        result.eta?.reason === 'STOCK_PENDING'
+          ? { days: null, reason: 'STOCK_PENDING' }
+          : { days: result.eta?.days ?? result.option?.etaDays ?? null },
+      );
+      const carrier = result.option
+        ? ` con ${result.option.carrier} (${result.option.service})`
+        : '';
       return [
-        result.customerChargeCents === 0
-          ? 'El envío a domicilio queda cubierto por su compra.'
-          : `Envío a domicilio: costo ${shippingMxn(result.costCents)}, crédito por su compra ${shippingMxn(result.creditCents)}, a pagar ${shippingMxn(result.customerChargeCents)}.`,
-        ...(result.eta?.reason === 'STOCK_PENDING'
-          ? ['La fecha de entrega depende de la reposición de existencias.']
-          : []),
-        'Pida el resumen para hacer su pedido; no se creó ningún pedido.',
+        ...(result.zoneStatus === 'FREE'
+          ? [
+              result.zipCode === null
+                ? 'Su envío no tiene costo.'
+                : `Su envío al código postal ${result.zipCode} no tiene costo.`,
+            ]
+          : [
+              `Envío a domicilio${carrier}: ${shippingMxn(result.costCents)}.`,
+              ...(result.creditCents > 0
+                ? [
+                    `Usted tiene un crédito de ${shippingMxn(result.creditCents)} por sus productos.`,
+                  ]
+                : []),
+              `Usted paga ${shippingMxn(result.customerChargeCents)}.`,
+            ]),
+        ...(eta === null ? [] : [eta]),
+        NEXT_STEP,
       ].join(' ');
+    }
     case 'zone_pending':
-      return 'Su código postal necesita validación de la tienda antes de cotizar el envío; no se creó ningún pedido.';
+      return `Estamos validando la entrega a ${zipPhrase(result.zipCode)}. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.`;
     case 'zone_denied':
-      return 'Por ahora no tenemos envío a domicilio para su código postal; no se creó ningún pedido.';
+      return `Por ahora no tenemos entrega a ${zipPhrase(result.zipCode)}. Puede recoger su pedido en tienda sin costo de envío. ¿Le parece?`;
     case 'packaging_missing':
-      return 'No pude cotizar el envío porque falta información de empaque de un producto. Comuníquese con la tienda; no se creó ningún pedido.';
+      return 'Por ahora no puedo calcular el envío porque nos falta información de empaque de un producto, y no quiero darle un monto sin tenerla. Puede intentarlo más tarde o, si prefiere, recoger su pedido en tienda sin costo de envío.';
     case 'unavailable':
-      return 'No pude cotizar el envío en este momento. No se creó ningún pedido. Puede solicitar otra cotización.';
+      return 'No pude calcular el envío en este momento. Puede pedírmelo de nuevo en unos minutos o, si prefiere, recoger su pedido en tienda sin costo de envío.';
     case 'refused':
       return `No pude cotizar el envío (${result.reason}). No se creó ningún pedido. Puede solicitar otra cotización.`;
   }
+}
+
+/** Server-owned reply for a store pickup choice (S4). */
+export function minimalPickupReply(result: MinimalPickupResult): string {
+  if (result.kind === 'pickup')
+    return `Listo, usted recoge su pedido en tienda, sin costo de envío. Dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.`;
+  if (result.reason === 'order_unresolved')
+    return 'Tengo un pedido suyo pendiente de confirmar, así que por ahora no puedo cambiar cómo lo recibe. Pida de nuevo el resumen y responda SÍ para reintentar ese mismo pedido, o comuníquese con la tienda.';
+  if (result.reason === 'empty_cart')
+    return 'Su carrito está vacío. Agregue productos y después dígame si prefiere recoger en tienda.';
+  return 'No pude registrar que recoge su pedido en tienda. Revise su carrito y vuelva a pedírmelo; no se creó ningún pedido.';
 }
 
 export const CHECKOUT_TOOL_CLARIFICATION =
@@ -1553,7 +1592,7 @@ export class MinimalCatalogAgentService {
               ? {
                   requestShippingQuote: tool({
                     description:
-                      'Solicita la cotización de envío a domicilio para los datos de entrega confirmados. No acepta argumentos ni informa montos.',
+                      'Solicita al sistema la cotización de envío a domicilio para los datos de entrega confirmados. La aplicación informa costo, crédito y fecha al cliente; usted nunca los inventa. No acepta argumentos.',
                     inputSchema: z.strictObject({}),
                     strict: true,
                     execute: async () => {
@@ -1581,6 +1620,41 @@ export class MinimalCatalogAgentService {
                             'No pude cotizar el envío. No se creó ningún pedido. Puede solicitar otra cotización.',
                         };
                         return toolError('shipping_unavailable');
+                      }
+                    },
+                  }),
+                  chooseStorePickup: tool({
+                    description:
+                      'Registra que el cliente recogerá su pedido en tienda, sin costo de envío. Úsela cuando el cliente lo elija, por ejemplo si la entrega a su código postal está en validación o no está disponible. No acepta argumentos.',
+                    inputSchema: z.strictObject({}),
+                    strict: true,
+                    execute: async () => {
+                      if (checkoutRun.attempted)
+                        return toolError('checkout_presentation_settled');
+                      checkoutRun.attempted = true;
+                      try {
+                        const result = await this.shipping!.chooseStorePickup(
+                          context.senderId,
+                        );
+                        checkoutRun.value = {
+                          reply: minimalPickupReply(result),
+                        };
+                        return {
+                          ok: result.kind === 'pickup',
+                          presentedByApplication: true,
+                          pickup:
+                            result.kind === 'refused'
+                              ? result.reason
+                              : result.kind,
+                        };
+                      } catch {
+                        checkoutRun.value = {
+                          reply: minimalPickupReply({
+                            kind: 'refused',
+                            reason: 'cart_unverified',
+                          }),
+                        };
+                        return toolError('pickup_unavailable');
                       }
                     },
                   }),

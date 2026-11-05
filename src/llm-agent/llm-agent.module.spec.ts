@@ -2,6 +2,7 @@
 
 import { readFileSync } from 'node:fs';
 import type { FactoryProvider } from '@nestjs/common';
+import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
 import { join } from 'node:path';
 import { Test } from '@nestjs/testing';
@@ -140,6 +141,14 @@ describe('LlmAgentModule integration', () => {
       else expect(service).toBeUndefined();
     },
   );
+
+  it('[S6] MinimalOrderService receives the optional shipping service for re-quotes', () => {
+    const params = Reflect.getMetadata(
+      'design:paramtypes',
+      MinimalOrderService,
+    ) as unknown[];
+    expect(params.at(-1)).toBe(MinimalShippingService);
+  });
 
   it('resolves every symbol binding and exports AgentRunner', async () => {
     const moduleRef = await Test.createTestingModule({

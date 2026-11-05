@@ -196,7 +196,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(result).toEqual({
       kind: 'handled',
       reply:
-        'Revisión de compra: subtotal de productos $30.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+        'Revisión de compra: subtotal de productos $30.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
     });
     expect(String(f.seen[0].system)).toContain('reviewCheckout');
     expect(Object.keys(f.seen[0].tools ?? {})).not.toContain('createSale');
@@ -481,13 +481,13 @@ describe('Checkout preflight reply when the checkout flow is available', () => {
     expect(
       minimalCheckoutReply(incomplete, { checkout: true, shipping: true }),
     ).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, obtener un envío aprobado y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, cotizar el envío o elegir recoger en tienda y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 
   it('keeps the previous wording without the checkout flow', () => {
     expect(minimalCheckoutReply(incomplete)).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 });

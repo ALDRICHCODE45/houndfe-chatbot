@@ -6,6 +6,7 @@
  * evaluated line total) and the confirmed destination (`destinationPin`:
  * saved id/version or a SHA-256 of confirmed new-address fields). Only a
  * deliverable, unexpired quote whose pins still match may back an order.
+ * Store pickup (S4) is the other record kind: `{mode: 'pickup', cartPin}`.
  * No clock, store, transport, framework or SDK dependency.
  *
  * LEGACY: records with an `approval` sub-object came from the per-quote human
@@ -179,11 +180,95 @@ export function buildMinimalShippingQuote(input: {
   return result.success ? structuredClone(result.data) : null;
 }
 
-/** New backend quote vs. a legacy approval record. */
+/**
+ * Store pickup (S4): no carrier and no shipping charge. Pinned to the cart
+ * lines only, so any cart change invalidates it like a quote.
+ */
+export const minimalPickupSchema = z.strictObject({
+  mode: z.literal('pickup'),
+  cartPin: cartLinesSchema,
+});
+export type MinimalPickup = z.infer<typeof minimalPickupSchema>;
+
+/** Pickup record for exactly these verified lines; invalid lines => null. */
+export function buildMinimalPickup(
+  cartLines: readonly MinimalShippingCartLine[],
+): MinimalPickup | null {
+  const result = minimalPickupSchema.safeParse({
+    mode: 'pickup',
+    cartPin: cartLines,
+  });
+  return result.success ? structuredClone(result.data) : null;
+}
+
+type MinimalShippingRecord =
+  | MinimalShippingQuote
+  | MinimalPickup
+  | LegacyMinimalShipping;
+
+/** New backend quote vs. pickup or a legacy approval record. */
 export function isMinimalShippingQuote(
-  record: MinimalShippingQuote | LegacyMinimalShipping,
+  record: MinimalShippingRecord,
 ): record is MinimalShippingQuote {
   return 'zoneStatus' in record;
+}
+
+export function isMinimalPickup(
+  record: MinimalShippingRecord,
+): record is MinimalPickup {
+  return 'mode' in record && record.mode === 'pickup';
+}
+
+/** Same lines, quantities and prices as the pin, in any order. */
+function sameCartPin(
+  pin: readonly MinimalShippingCartLine[],
+  cartLines: readonly MinimalShippingCartLine[],
+): boolean {
+  const lines = cartLinesSchema.safeParse(cartLines);
+  return (
+    lines.success &&
+    lines.data.length === pin.length &&
+    pin.every((line) =>
+      lines.data.some(
+        (other) =>
+          line.productId === other.productId &&
+          line.variantId === other.variantId &&
+          line.quantity === other.quantity &&
+          line.unitPriceCents === other.unitPriceCents &&
+          line.finalPriceCents === other.finalPriceCents,
+      ),
+    )
+  );
+}
+
+/** A pickup choice backs an order only while its cart pin still matches. */
+export function isPickupCurrent(
+  record: MinimalPickup,
+  cartLines: readonly MinimalShippingCartLine[],
+): boolean {
+  return sameCartPin(record.cartPin, cartLines);
+}
+
+/** Business days from the backend, or the STOCK_PENDING reason (S7). */
+export function minimalShippingEta(
+  record: Pick<MinimalShippingQuote, 'eta' | 'option'>,
+): { days: number | null; reason?: 'STOCK_PENDING' } | null {
+  if (record.eta?.reason === 'STOCK_PENDING')
+    return { days: null, reason: 'STOCK_PENDING' };
+  const days = record.eta?.days ?? record.option?.etaDays ?? null;
+  return days === null ? null : { days };
+}
+
+/** Customer ETA sentence, or null when the backend gave none. */
+export function minimalShippingEtaLine(
+  eta: { days: number | null; reason?: 'STOCK_PENDING' } | null | undefined,
+): string | null {
+  if (eta?.reason === 'STOCK_PENDING')
+    return 'La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.';
+  if (eta === null || eta === undefined || eta.days === null) return null;
+  return eta.days === 1
+    ? 'Llega en aproximadamente 1 día hábil.'
+    : `Llega en aproximadamente ${eta.days} días hábiles.`;
 }
 
 /**
@@ -213,23 +298,7 @@ export function isShippingCurrent(
       : current.kind === 'saved' &&
         current.addressId === pin.addressId &&
         current.version === pin.version;
-  const lines = cartLinesSchema.safeParse(context.cartLines);
-  if (
-    !sameDestination ||
-    !lines.success ||
-    lines.data.length !== record.cartPin.length
-  )
-    return 'stale';
-  return record.cartPin.every((line) =>
-    lines.data.some(
-      (other) =>
-        line.productId === other.productId &&
-        line.variantId === other.variantId &&
-        line.quantity === other.quantity &&
-        line.unitPriceCents === other.unitPriceCents &&
-        line.finalPriceCents === other.finalPriceCents,
-    ),
-  )
+  return sameDestination && sameCartPin(record.cartPin, context.cartLines)
     ? 'current'
     : 'stale';
 }

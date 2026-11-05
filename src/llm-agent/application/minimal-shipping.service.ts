@@ -23,10 +23,17 @@ import {
   type MinimalOrderIneligibleReason,
 } from '../domain/minimal-order-confirmation';
 import {
+  buildMinimalPickup,
   buildMinimalShippingQuote,
   minimalShippingDestination,
+  type MinimalShippingCartLine,
 } from '../domain/minimal-shipping';
-import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
+import {
+  MinimalCartService,
+  parseMinimalCart,
+  type MinimalCartResult,
+  type MinimalCartState,
+} from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 
 export type MinimalShippingRefusal =
@@ -45,16 +52,71 @@ export type MinimalShippingResult =
       customerChargeCents: number;
       option: ShippingQuoteResponse['option'];
       eta: NonNullable<ShippingQuoteResponse['eta']> | null;
+      zipCode: string | null;
     }
-  | { kind: 'zone_pending' }
-  | { kind: 'zone_denied' }
+  | { kind: 'zone_pending'; zipCode: string | null }
+  | { kind: 'zone_denied'; zipCode: string | null }
   | { kind: 'packaging_missing' }
   | { kind: 'unavailable' }
   | { kind: 'refused'; reason: MinimalShippingRefusal };
+export type MinimalPickupResult =
+  | { kind: 'pickup' }
+  | {
+      kind: 'refused';
+      reason: Extract<
+        MinimalShippingRefusal,
+        | 'cart_unverified'
+        | 'empty_cart'
+        | 'promotion_review'
+        | 'order_unresolved'
+        | 'cart_changed'
+      >;
+    };
 const refuse = (reason: MinimalShippingRefusal): MinimalShippingResult => ({
   kind: 'refused',
   reason,
 });
+
+/** Fresh prices must still describe these exact stored lines and total. */
+function sameStoredLines(
+  stored: MinimalCartState,
+  quote: Extract<MinimalCartResult, { ok: true }>,
+): boolean {
+  return (
+    stored.items.length === quote.items.length &&
+    stored.items.every((line, index) => {
+      const fresh = quote.items[index];
+      return (
+        line.productId === fresh.productId &&
+        line.variantId === fresh.variantId &&
+        line.quantity === fresh.quantity &&
+        line.unitPriceCents === fresh.unitPriceCents
+      );
+    }) &&
+    (stored.expectedTotalCents === undefined ||
+      stored.expectedTotalCents === quote.totalCents)
+  );
+}
+
+function pinLines(
+  quote: Extract<MinimalCartResult, { ok: true }>,
+): MinimalShippingCartLine[] {
+  return quote.items.map(
+    ({ productId, variantId, quantity, unitPriceCents, finalPriceCents }) => ({
+      productId,
+      ...(variantId ? { variantId } : {}),
+      quantity,
+      unitPriceCents,
+      finalPriceCents,
+    }),
+  );
+}
+
+function zipOf(address: MinimalCheckoutDraftAddress): string | null {
+  return address.kind === 'saved'
+    ? address.snapshot.zipCode
+    : address.fields.zipCode;
+}
 
 /** Saved address by id; new or corrected content as loose fields. */
 function quoteDestination(
@@ -114,22 +176,7 @@ export class MinimalShippingService {
       if (!eligibility.ok && eligibility.reason !== 'new_address_unsupported')
         return refuse(eligibility.reason);
       if (!quote.ok || draft === null) return refuse('cart_unverified');
-      // Fresh prices must still describe these exact stored lines and total.
-      if (
-        stored.items.length !== quote.items.length ||
-        !stored.items.every((line, index) => {
-          const fresh = quote.items[index];
-          return (
-            line.productId === fresh.productId &&
-            line.variantId === fresh.variantId &&
-            line.quantity === fresh.quantity &&
-            line.unitPriceCents === fresh.unitPriceCents
-          );
-        }) ||
-        (stored.expectedTotalCents !== undefined &&
-          stored.expectedTotalCents !== quote.totalCents)
-      )
-        return refuse('cart_changed');
+      if (!sameStoredLines(stored, quote)) return refuse('cart_changed');
       const revalidation = await this.checkout.revalidateSelection(
         senderId,
         draft,
@@ -167,21 +214,7 @@ export class MinimalShippingService {
       }
       const shipping = buildMinimalShippingQuote({
         response,
-        cartLines: quote.items.map(
-          ({
-            productId,
-            variantId,
-            quantity,
-            unitPriceCents,
-            finalPriceCents,
-          }) => ({
-            productId,
-            ...(variantId ? { variantId } : {}),
-            quantity,
-            unitPriceCents,
-            finalPriceCents,
-          }),
-        ),
+        cartLines: pinLines(quote),
         destination: minimalShippingDestination(draft.address),
       });
       if (shipping === null || this.now() >= Date.parse(shipping.expiresAt))
@@ -198,8 +231,11 @@ export class MinimalShippingService {
         new Date(this.now()).toISOString(),
       );
       if (!committed) return refuse('cart_changed');
-      if (shipping.zoneStatus === 'PENDING') return { kind: 'zone_pending' };
-      if (shipping.zoneStatus === 'DENIED') return { kind: 'zone_denied' };
+      const zipCode = zipOf(draft.address);
+      if (shipping.zoneStatus === 'PENDING')
+        return { kind: 'zone_pending', zipCode };
+      if (shipping.zoneStatus === 'DENIED')
+        return { kind: 'zone_denied', zipCode };
       return {
         kind: 'quoted',
         zoneStatus: shipping.zoneStatus,
@@ -208,9 +244,46 @@ export class MinimalShippingService {
         customerChargeCents: shipping.customerChargeCents,
         option: shipping.option,
         eta: shipping.eta,
+        zipCode,
       };
     } catch {
       return refuse('cart_unverified');
+    }
+  }
+
+  /**
+   * Record store pickup (S4) for the verified cart under one cart CAS. Needs
+   * no delivery data or backend quote and replaces any stored quote; a cart
+   * change drops it like a quote.
+   */
+  async chooseStorePickup(senderId: string): Promise<MinimalPickupResult> {
+    const refused = (
+      reason: Extract<MinimalPickupResult, { kind: 'refused' }>['reason'],
+    ): MinimalPickupResult => ({ kind: 'refused', reason });
+    try {
+      if (!this.store.commitMinimalCart) return refused('cart_unverified');
+      // Keep the EXACT raw slot for CAS, never the zod-parsed reconstruction.
+      const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
+      const stored = parseMinimalCart(raw);
+      if (stored === null) return refused('cart_unverified');
+      if (stored.idempotencyKey !== '') return refused('order_unresolved');
+      const quote = await this.cart.view(senderId);
+      if (!quote.ok) return refused('cart_unverified');
+      if (quote.items.length === 0) return refused('empty_cart');
+      if (quote.promotionEvaluationStatus !== 'fully_evaluated')
+        return refused('promotion_review');
+      if (!sameStoredLines(stored, quote)) return refused('cart_changed');
+      const pickup = buildMinimalPickup(pinLines(quote));
+      if (pickup === null) return refused('cart_unverified');
+      const committed = await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        structuredClone({ ...stored, shipping: pickup }),
+        new Date(this.now()).toISOString(),
+      );
+      return committed ? { kind: 'pickup' } : refused('cart_changed');
+    } catch {
+      return refused('cart_unverified');
     }
   }
 }

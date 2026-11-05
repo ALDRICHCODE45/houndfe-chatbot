@@ -99,7 +99,7 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     h.quotes.enqueue(backendQuote({ costCents: 30000, creditCents: 24000, customerChargeCents: 6000 }));
     expect(await h.service.quote(SENDER)).toEqual({
       kind: 'quoted', zoneStatus: 'CARRIER_ONLY', costCents: 30000, creditCents: 24000, customerChargeCents: 6000,
-      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 }, eta: null,
+      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 }, eta: null, zipCode: '06000',
     });
     expect(h.quotes.calls).toEqual([{
       items: [{ productId: PRODUCT, quantity: 2 }],
@@ -122,8 +122,8 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     ['FREE', { kind: 'quoted' }],
     ['SURCHARGE', { kind: 'quoted' }],
     ['CARRIER_ONLY', { kind: 'quoted' }],
-    ['PENDING', { kind: 'zone_pending' }],
-    ['DENIED', { kind: 'zone_denied' }],
+    ['PENDING', { kind: 'zone_pending', zipCode: '06000' }],
+    ['DENIED', { kind: 'zone_denied', zipCode: '06000' }],
   ] as const)('stores the %s quote and returns its kind', async (zoneStatus, expected) => {
     const h = await setup(); await h.confirm();
     const deliverable = zoneStatus !== 'PENDING' && zoneStatus !== 'DENIED';
@@ -259,5 +259,53 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     if (reason === 'cart_unverified') h.api.getStock.mockRejectedValueOnce(new Error('offline'));
     expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason });
     expect(h.quotes.calls).toHaveLength(0);
+  });
+});
+
+// prettier-ignore
+describe('MinimalShippingService.chooseStorePickup (U4, S4)', () => {
+  const pin = [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1500, finalPriceCents: 3000 }];
+  it('[S4] stores a pickup choice pinned to the verified cart without calling the quote backend', async () => {
+    const h = await setup();
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'pickup' });
+    expect(await h.stored()).toEqual({ mode: 'pickup', cartPin: pin });
+    expect(h.quotes.calls).toHaveLength(0);
+    expect((await h.store.get(SENDER))!.data.legacy).toEqual({ untouched: true });
+  });
+  it('[S4,S5] replaces a DENIED or PENDING zone answer', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote({ zoneStatus: 'DENIED', quoteId: null, option: null }));
+    await h.service.quote(SENDER);
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'pickup' });
+    expect(await h.stored()).toEqual({ mode: 'pickup', cartPin: pin });
+  });
+  it('[S4] a cart change drops the pickup choice', async () => {
+    const h = await setup();
+    await h.service.chooseStorePickup(SENDER);
+    const changed = await h.cart.setItem(SENDER, { productId: PRODUCT, quantity: 3 }, new Set([PRODUCT]));
+    expect(changed.ok).toBe(true);
+    expect(await h.stored()).toBeUndefined();
+  });
+  it('refuses an outstanding uncertain-order lock', async () => {
+    const h = await setup();
+    await h.changeCart({ idempotencyKey: CUSTOMER });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'order_unresolved' });
+  });
+  it('refuses fresh price drift and an empty cart', async () => {
+    const h = await setup();
+    await h.changeCart({ items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1499 }] });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
+    await h.changeCart({ items: [], expectedTotalCents: 0 });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'empty_cart' });
+    expect(await h.stored()).toBeUndefined();
+  });
+  it('CAS rejects a concurrent cart edit while verifying prices', async () => {
+    const h = await setup();
+    h.api.evaluateCart.mockImplementationOnce(async (items: Array<{ quantity: number }>) => {
+      await h.changeCart({ expectedTotalCents: 1 });
+      return { items: items.map(item => ({ productId: PRODUCT, variantId: null, quantity: item.quantity, unitPriceCents: 1500, originalPriceCents: 1500 * item.quantity, finalPriceCents: 1500 * item.quantity, discountAmountCents: 0, appliedPromotionTitle: null })), promotionEvaluationStatus: 'fully_evaluated' };
+    });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
+    expect(await h.stored()).toBeUndefined();
   });
 });

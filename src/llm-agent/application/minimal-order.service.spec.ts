@@ -1,10 +1,14 @@
 import { createHash } from 'node:crypto';
 import { CreateCheckoutInputSchema } from '../../chatbot-api/domain/dtos/checkout.dto';
 import {
+  PACKAGING_DATA_MISSING,
   SHIPPING_QUOTE_EXPIRED,
   SHIPPING_QUOTE_MISMATCH,
   SHIPPING_QUOTE_NOT_FOUND,
+  SHIPPING_QUOTE_UNAVAILABLE,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
+import { MinimalShippingService } from './minimal-shipping.service';
 import {
   buildMinimalShipping,
   minimalShippingDestination,
@@ -36,6 +40,10 @@ import {
   MINIMAL_ORDER_STOCK_CHANGED_REPLY,
   MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
   MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+  MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY,
+  MINIMAL_ORDER_SHIPPING_QUOTE_NOT_FOUND_REPLY,
+  MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY,
+  MINIMAL_ORDER_PACKAGING_MISSING_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
@@ -177,6 +185,8 @@ function setup(
   } as unknown as ConfigService;
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
+  const quotes = new FakeShippingQuoteClient();
+  const shipping = new MinimalShippingService(store, cart, checkout, quotes);
   const order = new MinimalOrderService(
     client,
     store,
@@ -184,6 +194,7 @@ function setup(
     checkout,
     config,
     options.now,
+    options.shipping === true ? shipping : undefined,
   );
   return {
     store,
@@ -191,6 +202,8 @@ function setup(
     cart,
     checkout,
     order,
+    quotes,
+    shipping,
     setPrice: (cents: number) => {
       unitPrice = cents;
     },
@@ -699,7 +712,13 @@ describe('NEW shipping freshness only (T1)', () => {
       totalCents: quote.totalCents,
     };
     expect(h.order['currentShipping']({ ...cart, shipping }, snapshot)).toEqual(
-      { quoteId: 'quote-1', customerChargeCents: 5000 },
+      {
+        quoteId: 'quote-1',
+        customerChargeCents: 5000,
+        creditCents: 0,
+        option: { carrier: 'Skydropx', service: 'Ground' },
+        eta: { days: 2 },
+      },
     );
     if (draft.address.kind !== 'new') throw new Error('new fixture');
     expect(
@@ -945,7 +964,7 @@ describe('atomic checkout order S1–S5', () => {
     h.setPrice(60000);
     await shippingRecord(h, { creditCents: 5000, customerChargeCents: 0 });
     await offerOrder(h);
-    expect((await yes(h))?.reply).toContain('envío cubierto por su compra');
+    expect((await yes(h))?.reply).toContain('Envío sin costo para usted');
     const payload = (
       h.api.createCheckout.mock.calls[0] as unknown as [
         { sale: Record<string, unknown> },
@@ -1129,7 +1148,8 @@ describe('minimal shipping order safety', () => {
     await shippingRecord(h);
     h.api.createCheckout.mockRejectedValueOnce(new Error('uncertain'));
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Envío: $50.00 MXN');
+    expect(offer.reply).toContain('Envío con Skydropx (Ground): $50.00 MXN');
+    expect(offer.reply).toContain('Llega en aproximadamente 2 días hábiles.');
     expect(offer.reply).toContain('Total a pagar: $80.00 MXN');
     await yes(h);
     const payload = (
@@ -1177,8 +1197,8 @@ describe('minimal shipping order safety', () => {
     h.setPrice(60000);
     await shippingRecord(h, { creditCents: 5000, customerChargeCents: 0 });
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('envío cubierto por su compra');
-    expect(offer.reply).not.toContain('Envío:');
+    expect(offer.reply).toContain('sin costo para usted');
+    expect(offer.reply).not.toContain('Total a pagar');
     expect(offer.reply).not.toContain('no está incluido');
     const result = await yes(h);
     const payload = (
@@ -1761,34 +1781,86 @@ describe('MinimalOrderService', () => {
   });
 
   it.each([
-    [SHIPPING_QUOTE_EXPIRED, 409],
-    [SHIPPING_QUOTE_MISMATCH, 409],
-    [SHIPPING_QUOTE_NOT_FOUND, 404],
+    [
+      SHIPPING_QUOTE_NOT_FOUND,
+      404,
+      MINIMAL_ORDER_SHIPPING_QUOTE_NOT_FOUND_REPLY,
+    ],
+    [PACKAGING_DATA_MISSING, 422, MINIMAL_ORDER_PACKAGING_MISSING_REPLY],
+    [SHIPPING_QUOTE_UNAVAILABLE, 422, MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY],
   ])(
-    '%s asks for a fresh shipping quote and rotates the key',
-    async (code, status) => {
+    '[S6] %s gives its specific reply, creates nothing and rotates the key',
+    async (code, status, reply) => {
       const h = setup({ shipping: true });
       await h.seedCart();
       await confirmSavedDelivery(h);
       await shippingRecord(h);
       await offerOrder(h);
-      const rejection = new ChatbotApiError(
-        code,
-        status,
-        { error: code },
-        code,
+      h.api.createCheckout.mockRejectedValueOnce(
+        new ChatbotApiError(code, status, { error: code }, code),
       );
-      h.api.createCheckout.mockRejectedValueOnce(rejection);
-      expect(await yes(h)).toEqual({
-        reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
-      });
+      expect(await yes(h)).toEqual({ reply });
       expect(await h.minimalCart()).toMatchObject({
         items: [{ productId: PRODUCT, quantity: 2 }],
         idempotencyKey: '',
       });
+      expect(h.quotes.calls).toHaveLength(0);
       expect(h.api.createSale).not.toHaveBeenCalled();
     },
   );
+
+  it.each([SHIPPING_QUOTE_EXPIRED, SHIPPING_QUOTE_MISMATCH])(
+    '[S6] %s re-quotes and shows the new total for a fresh SÍ',
+    async (code) => {
+      const h = setup({ shipping: true });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await shippingRecord(h);
+      await offerOrder(h);
+      h.api.createCheckout.mockRejectedValueOnce(
+        new ChatbotApiError(code, 409, { error: code }, code),
+      );
+      h.quotes.enqueue({
+        quoteId: 'quote-2',
+        expiresAt: new Date(Date.now() + 60000).toISOString(),
+        zoneStatus: 'SURCHARGE',
+        option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
+        costCents: 7000,
+        creditCents: 0,
+        customerChargeCents: 7000,
+        currency: 'MXN',
+      });
+      const requoted = await yes(h);
+      expect(requoted?.reply).toContain(MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY);
+      expect(requoted?.reply).toContain('Total a pagar: $100.00 MXN');
+      expect(h.quotes.calls).toHaveLength(1);
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+      requoted?.onSent?.();
+      await yes(h, 'wamid.fresh');
+      expect(h.api.createCheckout).toHaveBeenCalledTimes(2);
+      expect(
+        (h.api.createCheckout.mock.calls[1] as unknown as [unknown])[0],
+      ).toMatchObject({
+        sale: { expectedTotalCents: 10000, shipping: { quoteId: 'quote-2' } },
+      });
+    },
+  );
+
+  it('[S6] a failed re-quote falls back to asking for a new quote', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await shippingRecord(h);
+    await offerOrder(h);
+    const code = SHIPPING_QUOTE_EXPIRED;
+    h.api.createCheckout.mockRejectedValueOnce(
+      new ChatbotApiError(code, 409, { error: code }, code),
+    );
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+    });
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
 
   it('preserves the key while the backend reports the sale in flight', async () => {
     const h = setup();
@@ -1918,5 +1990,92 @@ describe('MinimalOrderService', () => {
     });
     await yes(h);
     expect(seen).toMatchObject({ idempotencyAttempts: 1 });
+  });
+});
+
+describe('minimal store pickup order (U4, S4)', () => {
+  it('[S4] pickup sends shipping {mode: pickup} with a products-only total', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    expect(await h.shipping.chooseStorePickup(SENDER)).toEqual({
+      kind: 'pickup',
+    });
+    const offer = await offerOrder(h);
+    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(offer.reply).toContain('Total de productos: $30.00 MXN');
+    expect(offer.reply).not.toContain('Total a pagar');
+    const result = await yes(h);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    const payload = (
+      h.api.createCheckout.mock.calls[0] as unknown as [
+        { sale: Record<string, unknown> },
+      ]
+    )[0];
+    expect(payload.sale).toMatchObject({
+      expectedTotalCents: 3000,
+      shipping: { mode: 'pickup' },
+    });
+    expect(CreateCheckoutInputSchema.safeParse(payload).success).toBe(true);
+    expect(result?.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(result?.reply).not.toContain('no está incluido');
+  });
+
+  it('[S4] a cart change invalidates the pickup choice', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await h.shipping.chooseStorePickup(SENDER);
+    const changed = await h.cart.setItem(
+      SENDER,
+      { productId: PRODUCT, quantity: 3 },
+      new Set([PRODUCT]),
+    );
+    expect(changed.ok).toBe(true);
+    const offer = await offerOrder(h);
+    expect(offer.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
+    await yes(h);
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+  });
+
+  it('[S4] a pickup pinned to other prices does not back an order', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    const raw = await h.minimalCart();
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...(raw as object),
+        shipping: {
+          mode: 'pickup',
+          cartPin: [
+            {
+              productId: PRODUCT,
+              quantity: 2,
+              unitPriceCents: 1400,
+              finalPriceCents: 2800,
+            },
+          ],
+        },
+      },
+      new Date().toISOString(),
+    );
+    expect((await offerOrder(h)).reply).toBe(
+      MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
+    );
+  });
+
+  it('[S4] the shipping-required reply offers a quote for the confirmed address or store pickup', () => {
+    expect(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY).toContain(
+      'dirección confirmada',
+    );
+    expect(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY).toContain(
+      'recoger en tienda',
+    );
+    expect(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY).toContain(
+      'no se creó ningún pedido',
+    );
   });
 });
