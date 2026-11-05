@@ -62,7 +62,7 @@ No activar red, no fusionar ramas y no escribir fuera de este repositorio.
 ## Comando 1 — Coordinador RESTOCK (unit, sin Docker)
 
 ```bash
-pnpm exec jest --runInBand --no-cache --runTestsByPath \
+pnpm test --runInBand --no-cache --runTestsByPath \
   src/human-decisions/application/restock-intake.service.spec.ts \
   src/human-decisions/application/restock-intake.service.adversarial.spec.ts
 ```
@@ -70,7 +70,7 @@ pnpm exec jest --runInBand --no-cache --runTestsByPath \
 ## Comando 2 — Especificaciones puras (ledger, reserva, preflight)
 
 ```bash
-pnpm exec jest --runInBand --no-cache --runTestsByPath \
+pnpm test --runInBand --no-cache --runTestsByPath \
   src/human-decisions/domain/restock-post-ledger.spec.ts \
   src/human-decisions/domain/restock-post-ledger.adversarial.spec.ts \
   src/human-decisions/domain/shared-reservation.spec.ts \
@@ -83,7 +83,7 @@ pnpm exec jest --runInBand --no-cache --runTestsByPath \
 Solo con Docker. Usa un **cliente falso** (`submitRestockIntake`):
 
 ```bash
-RUN_DOCKER_TESTS=1 pnpm exec jest --runInBand --no-cache --runTestsByPath \
+RUN_DOCKER_TESTS=1 pnpm test --runInBand --no-cache --runTestsByPath \
   src/human-decisions/application/restock-intake.service.db.spec.ts \
   src/human-decisions/infrastructure/postgres-restock-post-ledger.store.transitions.db.spec.ts
 ```

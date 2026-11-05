@@ -750,3 +750,19 @@ The client was informed in simple terms: **contacts are guaranteed, conversation
 ### 12.4 Separate Workstream (NOT part of this chatbot repo)
 
 - A parallel effort is remodeling the POS **product creation form** (in `houndfe-backend` + `frontend-houndfe`). A full form spec was produced at `frontend-houndfe/docs/product-creation-form-spec.md` (Engram topic `products/create-form-spec`). This is unrelated to the chatbot program and does not affect `houndfe-chatbot`.
+
+---
+
+## 13. Running Tests
+
+> Always run tests through the project's test scripts (`pnpm test`, `make test`,
+> etc.), never by invoking the runner binary directly (`npx vitest`, `go test`,
+> `pytest`), so the machine-wide `run-tests` queue applies. Subagents run only
+> the tests related to the files they changed (for example `vitest related`,
+> `jest --findRelatedTests`, `go test ./changed/pkg/...`, `pytest path/to/test`),
+> passing them through the project script. Only the main agent runs the full
+> suite, once, before finishing. If you see `[run-tests] waiting`, the suite is
+> queued, not hung: wait for it and do not kill or retry it.
+
+In this repository: `pnpm test -- --findRelatedTests <changed files>` or
+`pnpm test -- --runTestsByPath <spec files>`; full suite `pnpm test`; e2e `pnpm test:e2e`.
