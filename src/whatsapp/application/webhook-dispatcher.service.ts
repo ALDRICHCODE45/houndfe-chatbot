@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import {
   pendingMinimalShipping,
   MINIMAL_SHIPPING_UNCONFIRMED,
@@ -74,17 +74,16 @@ import { evaluateShippingSaleRevalidation } from '../../sale-flow/application/sh
  *      when the customer's `data.pendingHumanRequest` is set, send the
  *      canned byte-identical "seguimos esperando respuesta del agente,
  *      te avisamos en cuanto tengamos" reply and `continue`. No LLM call.
- *   5. `AgentRunner.handle({ senderId, text })` — runner owns idle-check,
- *      history truncation, cost-guard, fresh-state spread (ADR-28), and
- *      UPSERT-persistence of user + assistant turns (with the pending-marker
- *      short-circuit gate inside).
+ *   5. `MinimalCatalogAgentService.tryHandle({ senderId, text })` — every
+ *      customer turn runs through the minimal SDK route (no sender
+ *      allowlist, no legacy fallback). `AgentRunner` is used only for the
+ *      ops synthetic "resolved" turn in step 3.
  *   6. WhatsappSenderPort.sendText — send the reply.
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
  *      successful send, so a failed send lets Meta re-deliver and retry.
  *
  * Spec: `openspec/changes/human-handoff/specs/whatsapp-webhook/delta.md`.
- * Test: `webhook-dispatcher.service.spec.ts` (15 it() blocks: 8 agent-path
- * + 3 metadata + 4 ops-path/pending-marker short-circuit).
+ * Test: `webhook-dispatcher.service.spec.ts`.
  */
 @Injectable()
 export class WebhookDispatcherService {
@@ -104,11 +103,9 @@ export class WebhookDispatcherService {
     private readonly conversationStore: ConversationStore,
     private readonly amountRouter: ReceiptAmountRouterService,
     private readonly ingress: ReceiptIngressService,
-    // Experimental default-off read-only SDK route. Optional so legacy
-    // 8-arg constructions (integration harnesses) keep compiling; when it is
-    // absent the dispatcher keeps the unchanged legacy AgentRunner path.
-    @Optional()
-    private readonly minimalCatalogAgent?: MinimalCatalogAgentService,
+    // Handles every customer turn; AgentRunner only serves the ops synthetic
+    // "resolved" turn above.
+    private readonly minimalCatalogAgent: MinimalCatalogAgentService,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -330,56 +327,12 @@ export class WebhookDispatcherService {
           continue;
         }
 
-        // ─── (5) Normal agent dispatch ─────────────────────────────────
-        // ─── (5) Normal agent dispatch ─────────────────────────────────
-        // R3b3-c4c1b: a REAL normalized customer inbound carries its
-        // receiving-phone metadata. Forward an inert identity only when it
-        // exists; the runner applies strict validation and drops anything
-        // malformed. Ops synthetic turns never reach this branch, so the ops
-        // identity is never injected.
-        // Experimental default-off read-only SDK route: when it handles the
-        // turn we reply and finish here; otherwise the byte-identical legacy
-        // AgentRunner path below runs unchanged.
-        const minimal = this.minimalCatalogAgent
-          ? await this.minimalCatalogAgent.tryHandle({
-              senderId: message.senderId,
-              text: message.text,
-              // R3b3-c4c1b identity forwarding, same trusted tuple as the
-              // AgentRunner path: EXACT normalized metadata, never config/model.
-              ...(message.receivingPhoneNumberId === undefined
-                ? {}
-                : {
-                    inboundEvent: {
-                      receivingPhoneNumberId: message.receivingPhoneNumberId,
-                      senderId: message.senderId,
-                      messageId: message.messageId,
-                    },
-                  }),
-            })
-          : null;
-        if (minimal?.kind === 'handled') {
-          const { providerMessageId } = await this.whatsappSender.sendText({
-            to: message.senderId,
-            text: minimal.reply,
-          });
-          // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
-          // question, and BEFORE the observational remember/markSeen writes so
-          // an observation failure can never undo the accepted send.
-          minimal.onSent?.();
-          this.recentOutbound.remember(providerMessageId);
-          try {
-            await this.dedup.markSeen(message.messageId);
-          } catch (error) {
-            this.logger.warn(
-              `markSeen failed for ${message.messageId}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-          }
-          continue;
-        }
-
-        const { reply } = await this.agentRunner.handle({
+        // ─── (5) Minimal catalog agent dispatch ────────────────────────
+        // Every customer turn goes to the minimal SDK route. R3b3-c4c1b: a
+        // REAL normalized customer inbound carries its receiving-phone
+        // metadata; forward that inert identity only when it exists. Ops
+        // synthetic turns never reach this branch.
+        const minimal = await this.minimalCatalogAgent.tryHandle({
           senderId: message.senderId,
           text: message.text,
           ...(message.receivingPhoneNumberId === undefined
@@ -392,12 +345,14 @@ export class WebhookDispatcherService {
                 },
               }),
         });
-
         const { providerMessageId } = await this.whatsappSender.sendText({
           to: message.senderId,
-          text: reply,
+          text: minimal.reply,
         });
-
+        // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
+        // question, and BEFORE the observational remember/markSeen writes so
+        // an observation failure can never undo the accepted send.
+        minimal.onSent?.();
         this.recentOutbound.remember(providerMessageId);
 
         // A dedup-write failure must NOT turn a successful send into a

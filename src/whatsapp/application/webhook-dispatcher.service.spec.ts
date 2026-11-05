@@ -14,7 +14,6 @@ import {
 import { CostGuardService } from '../../llm-agent/application/cost-guard.service';
 import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import {
-  type AgentMessage,
   type ConversationState,
   type ConversationStateData,
   type ConversationStore,
@@ -62,11 +61,10 @@ const receiptMediaOutboxRowFixture = (id: string): ReceiptMediaOutboxRow =>
   ({ id }) as unknown as ReceiptMediaOutboxRow;
 
 /**
- * Spec rewrite: the dispatcher MUST replace the echo path with
- * AgentRunner.handle(). After each run, both the user and the
- * assistant turns MUST be persisted via ConversationStore.update
- * (UPSERT), and the assistant reply MUST be sent via
- * WhatsappSenderPort.sendText. No proactive sends.
+ * Every customer turn is handled by the minimal SDK route
+ * (MinimalCatalogAgentService.tryHandle) and its reply is sent via
+ * WhatsappSenderPort.sendText. AgentRunner only serves the ops synthetic
+ * "resolved" turn. No proactive sends.
  *
  * Post-incident additions (unsolicited greetings bug):
  *   - A re-delivered (duplicate) message id is skipped before any agent
@@ -188,10 +186,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }),
     } as unknown as jest.Mocked<ReceiptIngressService>;
 
-    // Experimental minimal SDK route. Default: not-handled so every existing
-    // scenario continues through the unchanged legacy AgentRunner path.
+    // Minimal SDK route: handles every customer turn. Tests override the
+    // reply per scenario.
     minimalAgent = {
-      tryHandle: jest.fn().mockResolvedValue({ kind: 'not-handled' }),
+      tryHandle: jest
+        .fn()
+        .mockResolvedValue({ kind: 'handled', reply: 'Hola' }),
     } as unknown as jest.Mocked<MinimalCatalogAgentService>;
 
     service = new WebhookDispatcherService(
@@ -211,28 +211,17 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     jest.useRealTimers();
   });
 
+  // Neither the minimal customer route nor the ops AgentRunner ran a model.
+  const expectNoAgentRun = () => {
+    expect(llm.run).not.toHaveBeenCalled();
+    expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+  };
+
   // ─── Scenario: Signed inbound text reaches agent dispatch ───────────
-  it('invokes the agent, persists the assistant turn, and sends the reply', async () => {
-    // ADR-28: after `llm.run` the runner re-fetches state. First
-    // call returns null (first contact); second returns the
-    // just-written state with empty messages.
-    store.get.mockResolvedValueOnce(null).mockResolvedValueOnce({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
+  it('routes the customer turn to the minimal agent and sends its reply', async () => {
+    minimalAgent.tryHandle.mockResolvedValueOnce({
+      kind: 'handled',
       reply: 'Hola, ¿en qué te puedo ayudar?',
-      messages: [
-        { role: 'user', content: 'hola' },
-        { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-      ],
-      usage: { promptTokens: 1, completionTokens: 1 },
     });
 
     const event: WebhookEventDto = {
@@ -261,23 +250,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).toHaveBeenCalledWith(
-      expect.objectContaining({
-        senderId: '5215550001111',
-        text: 'hola',
-      }),
-    );
-
-    expect(store.commitAgentTurn).toHaveBeenCalledWith(
-      '5215550001111',
-      expect.objectContaining({
-        lastMessageAt: '2026-06-23T12:00:00.000Z',
-        messages: [
-          { role: 'user', content: 'hola' },
-          { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-        ],
-      }),
-    );
+    expect(minimalAgent.tryHandle).toHaveBeenCalledWith({
+      senderId: '5215550001111',
+      text: 'hola',
+    });
+    // The legacy AgentRunner never serves a customer turn.
+    expect(llm.run).not.toHaveBeenCalled();
+    expect(store.commitAgentTurn).not.toHaveBeenCalled();
 
     expect(sender.sendText).toHaveBeenCalledWith({
       to: '5215550001111',
@@ -298,77 +277,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await expect(service.dispatch(event)).resolves.toBeUndefined();
     expect(sender.sendText).not.toHaveBeenCalled();
-    expect(llm.run).not.toHaveBeenCalled();
-  });
-
-  it('preserves prior history turns when UPSERTing after a successful run', async () => {
-    const prior: ConversationState = {
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T11:59:30.000Z', // within idle window
-      data: {
-        messages: [
-          { role: 'user', content: 'hola' },
-          { role: 'assistant', content: 'Hola' },
-        ] as AgentMessage[],
-      },
-    };
-    store.get.mockResolvedValue(prior);
-    store.update.mockResolvedValue({
-      ...prior,
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-    });
-    llm.run.mockResolvedValue({
-      reply: 'precio: $100',
-      messages: [
-        ...prior.data.messages!,
-        { role: 'user', content: 'precio?' },
-        { role: 'assistant', content: 'precio: $100' },
-      ],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
-
-    const event: WebhookEventDto = {
-      object: 'whatsapp_business_account',
-      entry: [
-        {
-          changes: [
-            {
-              value: {
-                messages: [
-                  {
-                    id: 'wamid.inbound-2',
-                    from: '5215550001111',
-                    timestamp: '1719000000',
-                    type: 'text',
-                    text: { body: 'precio?' },
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      ],
-    };
-
-    await service.dispatch(event);
-
-    // User + assistant both appended to the prior transcript.
-    expect(store.commitAgentTurn).toHaveBeenCalledWith(
-      '5215550001111',
-      expect.objectContaining({
-        expected: { messages: prior.data.messages },
-        messages: [
-          { role: 'user', content: 'hola' },
-          { role: 'assistant', content: 'Hola' },
-          { role: 'user', content: 'precio?' },
-          { role: 'assistant', content: 'precio: $100' },
-        ],
-      }),
-    );
-    expect(sender.sendText).toHaveBeenCalledWith({
-      to: '5215550001111',
-      text: 'precio: $100',
-    });
+    expectNoAgentRun();
   });
 
   // ─── Scenario: Meta re-delivers a SUCCESSFULLY processed message ──────
@@ -403,7 +312,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).not.toHaveBeenCalled();
+    expectNoAgentRun();
     expect(sender.sendText).not.toHaveBeenCalled();
     expect(store.update).not.toHaveBeenCalled();
   });
@@ -438,27 +347,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).not.toHaveBeenCalled();
+    expectNoAgentRun();
     expect(sender.sendText).not.toHaveBeenCalled();
   });
 
   // ─── Scenario: successful processing records dedup + outbound echo ───
   it('marks the message seen and remembers the outbound wamid after success', async () => {
-    store.get.mockResolvedValue(null);
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
-      reply: 'Hola',
-      messages: [
-        { role: 'user', content: 'hola' },
-        { role: 'assistant', content: 'Hola' },
-      ],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
-
     const event: WebhookEventDto = {
       object: 'whatsapp_business_account',
       entry: [
@@ -490,17 +384,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
   // ─── Scenario: failed SEND → NOT marked seen (retry must reprocess) ──
   it('does NOT mark the message seen when the send fails, so a retry can reprocess', async () => {
-    store.get.mockResolvedValue(null);
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
-      reply: 'Hola',
-      messages: [],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
     sender.sendText.mockRejectedValue(new Error('Meta 131030'));
 
     const event: WebhookEventDto = {
@@ -532,17 +415,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
   // ─── Scenario: one event carries several messages, one already seen ──
   it('processes each new message and skips only the duplicate within one event', async () => {
-    store.get.mockResolvedValue(null);
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
-      reply: 'Hola',
-      messages: [],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
     dedup.isDuplicate.mockImplementation(
       async (id: string) => id === 'wamid.dup',
     );
@@ -579,8 +451,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).toHaveBeenCalledTimes(1);
-    expect(llm.run).toHaveBeenCalledWith(
+    expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+    expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'nuevo' }),
     );
     expect(sender.sendText).toHaveBeenCalledTimes(1);
@@ -651,11 +523,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     const input = (index = 0) => llm.run.mock.calls[index][0];
     const hasEvent = (index = 0) =>
       Object.prototype.hasOwnProperty.call(input(index), 'inboundEvent');
+    const customerInput = (index = 0) =>
+      minimalAgent.tryHandle.mock.calls[index][0];
 
     it('forwards the normalized customer identity into the agent run', async () => {
       ready();
       await service.dispatch(inbound('wamid.inbound', 'hola', PHONE_ID));
-      expect(llm.run).toHaveBeenCalledWith(
+      expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
         expect.objectContaining({
           senderId: CUSTOMER,
           text: 'hola',
@@ -667,7 +541,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('omits the property when the customer inbound has no phone metadata', async () => {
       ready();
       await service.dispatch(inbound('wamid.inbound', 'hola'));
-      expect(hasEvent()).toBe(false);
+      expect(customerInput()).not.toHaveProperty('inboundEvent');
     });
 
     it('never forwards the ops identity into the synthetic customer turn', async () => {
@@ -688,6 +562,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(humanHandoff.isOpsSender).toHaveBeenCalledWith(OPS_SENDER);
       expect(input().senderId).toBe(CUSTOMER);
       expect(hasEvent()).toBe(false);
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
     });
 
     it('preserves the event identity across a redelivery of the same message', async () => {
@@ -695,8 +570,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       const event = inbound('wamid.inbound', 'hola', PHONE_ID);
       await service.dispatch(event);
       await service.dispatch(event);
-      expect(llm.run).toHaveBeenCalledTimes(2);
-      const [first, second] = llm.run.mock.calls.map((c) => c[0].inboundEvent);
+      expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(2);
+      const [first, second] = minimalAgent.tryHandle.mock.calls.map(
+        (c) => c[0].inboundEvent,
+      );
       expect(first).toEqual(EXPECTED);
       expect(second).toEqual(first);
       expect(second).not.toBe(first);
@@ -747,7 +624,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expect(
           sender.sendText.mock.calls.filter(([m]) => m.to === CUSTOMER),
         ).toHaveLength(1);
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
       },
     );
 
@@ -763,7 +640,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         { to: CUSTOMER, text: MINIMAL_SHIPPING_UNCONFIRMED },
         { to: OPS, text: SHIPPING_REQUOTE_REPLY },
       ]);
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
     });
 
     async function expiredMinimalDispatcher() {
@@ -969,7 +846,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         CUSTOMER,
         'abc123def456',
       );
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(dedup.markSeen).toHaveBeenCalledWith('minimal-expired');
     });
     it.each(['SHIPPING_APPROVED', 'SHIPPING_REJECTED'] as const)(
@@ -990,7 +867,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           to: CUSTOMER,
           text: 'envío cubierto por su compra',
         });
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(dedup.markSeen).toHaveBeenCalledWith('minimal-ops');
       },
     );
@@ -1076,7 +953,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         to: OPS,
         text: ASK_FOR_REF,
       });
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       // The ops path short-circuits BEFORE the pending-marker read.
       expect(conversationStore.get).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-nopending');
@@ -1110,7 +987,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           expect.objectContaining({ to: CUSTOMER }),
         );
         // No customer synthetic turn and no LLM/runner invocation.
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(store.update).not.toHaveBeenCalled();
         // The ops path short-circuits BEFORE the pending-marker read.
         expect(conversationStore.get).not.toHaveBeenCalled();
@@ -1132,7 +1009,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(dedup.markSeen).not.toHaveBeenCalled();
     });
 
-    it('customer inbound with pending marker: canned reply, NO AgentRunner call, no transcript write', async () => {
+    it('customer inbound with pending marker: canned reply, NO agent call, no transcript write', async () => {
       // Default humanHandoff.isOpsSender → false: customer-side inbound.
       conversationStore.get.mockResolvedValue({
         senderId: CUSTOMER,
@@ -1177,7 +1054,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         to: CUSTOMER,
         text: PENDING_HUMAN_REQUEST_REPLY,
       });
-      expect(llm.run).not.toHaveBeenCalled(); // runner never invoked
+      expectNoAgentRun(); // no agent invoked
       expect(store.update).not.toHaveBeenCalled(); // no transcript write
       expect(conversationStore.update).not.toHaveBeenCalled();
       expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reply');
@@ -1349,7 +1226,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
       await service.dispatch(opsEvent());
 
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(store.update).not.toHaveBeenCalled();
       expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
         text: 'HF-abcdef123456 APPROVE_SHIPPING',
@@ -1453,7 +1330,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
         await service.dispatch(opsEvent());
 
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(store.update).not.toHaveBeenCalled();
         expect(sender.sendText).toHaveBeenCalledWith({
           to: CUSTOMER,
@@ -1483,7 +1360,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
         await service.dispatch(opsEvent());
 
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(store.update).not.toHaveBeenCalled();
         expect(sender.sendText).toHaveBeenCalledWith({
           to: CUSTOMER,
@@ -1511,7 +1388,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
         await service.dispatch(opsEvent());
 
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(store.update).not.toHaveBeenCalled();
         expect(sender.sendText).toHaveBeenCalledWith({
           to: CUSTOMER,
@@ -1789,18 +1666,26 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
-    it('calls amountRouter for customer text before agentRunner', async () => {
+    it('calls amountRouter for customer text before the minimal agent', async () => {
       await service.dispatch(textEvent('wamid.route-order', '500 pesos'));
       expect(amountRouter.route).toHaveBeenCalled();
-      expect(llm.run).toHaveBeenCalled();
+      expect(minimalAgent.tryHandle).toHaveBeenCalled();
+      expect(amountRouter.route.mock.invocationCallOrder[0]).toBeLessThan(
+        minimalAgent.tryHandle.mock.invocationCallOrder[0],
+      );
     });
 
-    it('fenced: calls AgentRunner and sends reply normally', async () => {
+    it('fenced: calls the minimal agent and sends reply normally', async () => {
       amountRouter.route.mockResolvedValue({ kind: 'fenced' });
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'Hola!',
+      });
       await service.dispatch(textEvent('wamid.fenced', 'hola'));
-      expect(llm.run).toHaveBeenCalledWith(
+      expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
         expect.objectContaining({ senderId: CUSTOMER, text: 'hola' }),
       );
+      expect(llm.run).not.toHaveBeenCalled();
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
         text: 'Hola!',
@@ -1808,7 +1693,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
 
     // ─── G-2 llm-agent/R2/S1: safe guidance after a terminal receipt ─────
-    it('llm-agent/R2/S1: a definite terminal receipt outcome reaches the normal AgentRunner path with no protected identifiers in the runner input', async () => {
+    it('llm-agent/R2/S1: a definite terminal receipt outcome reaches the minimal agent with no protected identifiers in its input', async () => {
       // A receipt that already reached a terminal/raced state no longer accepts
       // the customer's confirmation, so the real router fences it and the
       // follow-up takes the ordinary LLM path. The canonical pointer's
@@ -1864,19 +1749,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expectedPointer: protectedPointer,
         expectedReceiptStatus: 'AWAITING_CONFIRMATION',
       });
-      // The fence fell through to the ordinary LLM path.
-      expect(llm.run).toHaveBeenCalledTimes(1);
-      const [runnerInput] = llm.run.mock.calls[0];
-      expect(runnerInput).toEqual({
-        catalogSession: expect.objectContaining({
-          senderId: CUSTOMER,
-        }) as unknown,
-        senderId: CUSTOMER,
-        text: 'sí',
-        history: [],
-        systemPrompt: 'sys',
-        tools: {},
-      });
+      // The fence fell through to the ordinary minimal agent path.
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+      const [runnerInput] = minimalAgent.tryHandle.mock.calls[0];
+      expect(runnerInput).toEqual({ senderId: CUSTOMER, text: 'sí' });
       const serialized = JSON.stringify(runnerInput);
       expect(serialized).not.toContain(protectedPointer.receiptMediaId);
       expect(serialized).not.toContain(protectedPointer.saleId);
@@ -1914,7 +1791,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         dedup.markSeen as jest.Mock,
       ].map((mock) => mock.mock.invocationCallOrder[0]);
       expect(order).toEqual([...order].sort((left, right) => left - right));
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(store.update).not.toHaveBeenCalled();
     });
 
@@ -1926,7 +1803,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       ).rejects.toThrow('Meta 131030');
       expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
       expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
     });
 
     it('ODD-4D unrecognized: markSeen failure is swallowed after a successful send', async () => {
@@ -1940,65 +1817,65 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(dedup.markSeen).toHaveBeenCalledWith(
         'wamid.unrecognized-markseen-fail',
       );
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
     });
 
-    it('proposed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+    it('proposed: skips the agent and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'proposed',
         receipt: receiptMediaRowFixture('r1'),
         intent: receiptMediaOutboxRowFixture('i1'),
       });
       await service.dispatch(textEvent('wamid.proposed', '500 pesos'));
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.proposed');
     });
 
-    it('started: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+    it('started: skips the agent and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'started',
         receipt: receiptMediaRowFixture('r2'),
         intent: receiptMediaOutboxRowFixture('i2'),
       });
       await service.dispatch(textEvent('wamid.started', 'si'));
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.started');
     });
 
-    it('rejected: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+    it('rejected: skips the agent and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'rejected',
         receipt: receiptMediaRowFixture('r3'),
         intent: receiptMediaOutboxRowFixture('i3'),
       });
       await service.dispatch(textEvent('wamid.rejected', 'no'));
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.rejected');
     });
 
-    it('cancelled: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+    it('cancelled: skips the agent and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'cancelled',
         receipt: receiptMediaRowFixture('r4'),
         intent: receiptMediaOutboxRowFixture('i4'),
       });
       await service.dispatch(textEvent('wamid.cancelled', 'cancelar'));
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cancelled');
     });
 
-    it('replayed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
+    it('replayed: skips the agent and sender, marks dedup seen, continues', async () => {
       amountRouter.route.mockResolvedValue({
         kind: 'replayed',
         receipt: receiptMediaRowFixture('r5'),
         intent: receiptMediaOutboxRowFixture('i5'),
       });
       await service.dispatch(textEvent('wamid.replayed', '500 pesos'));
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.replayed');
     });
@@ -2015,7 +1892,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           textEvent('wamid.terminal-markseen-fail', '500 pesos'),
         ),
       ).resolves.toBeUndefined();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith(
         'wamid.terminal-markseen-fail',
@@ -2051,7 +1928,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ],
       });
       expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).toHaveBeenCalled();
     });
 
@@ -2070,7 +1947,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
       await service.dispatch(textEvent('wamid.pending-bypass', '¿siguen?'));
       expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
         text: PENDING_HUMAN_REQUEST_REPLY,
@@ -2105,7 +1982,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ],
       });
       expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
     });
 
     // ─── WU13-B2: ReceiptIngressService customer media routing ─────────────────
@@ -2190,7 +2067,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         });
         expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
         expect(amountRouter.route).not.toHaveBeenCalled();
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
       });
 
       it('admit: absent caption still forwards only the 5-field contract', async () => {
@@ -2218,7 +2095,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           caption: undefined,
         });
         expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
       });
 
       // Guidance: customer sees guidance text, no agent, dedup marked
@@ -2271,7 +2148,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
             to: CUSTOMER,
             text: c.expected,
           });
-          expect(llm.run).not.toHaveBeenCalled();
+          expectNoAgentRun();
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
         },
       );
@@ -2318,7 +2195,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
           expect(dedup.markSeen).toHaveBeenCalledWith(wamid);
           expect(amountRouter.route).not.toHaveBeenCalled();
-          expect(llm.run).not.toHaveBeenCalled();
+          expectNoAgentRun();
         },
       );
 
@@ -2355,7 +2232,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           (ingress.admit as jest.Mock).mockResolvedValueOnce(decision);
           await service.dispatch(mediaEvent(c.wamid, 'image'));
           expect(sender.sendText).not.toHaveBeenCalled();
-          expect(llm.run).not.toHaveBeenCalled();
+          expectNoAgentRun();
           expect(dedup.markSeen).not.toHaveBeenCalled();
         },
       );
@@ -2442,7 +2319,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expect(ingress.admit).not.toHaveBeenCalled();
         expect(sender.sendText).not.toHaveBeenCalled();
         expect(amountRouter.route).not.toHaveBeenCalled();
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(dedup.markSeen).not.toHaveBeenCalled();
       });
 
@@ -2485,7 +2362,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           ).resolves.toBeUndefined();
           expect(sender.sendText as jest.Mock).toHaveBeenCalledTimes(1);
           expect(dedup.markSeen).toHaveBeenCalledWith('wamid.markseen-fail');
-          expect(llm.run.mock.calls).toHaveLength(0);
+          expectNoAgentRun();
           expect(amountRouter.route.mock.calls).toHaveLength(0);
         },
       );
@@ -2499,14 +2376,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ).rejects.toThrow('Meta 131030');
         expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
         expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
-        expect(llm.run.mock.calls).toHaveLength(0);
+        expectNoAgentRun();
         expect(amountRouter.route.mock.calls).toHaveLength(0);
       });
     });
   });
 
-  // ─── Experimental minimal SDK catalog route (default-off) ────────────────
-  describe('experimental minimal SDK catalog route', () => {
+  // ─── Minimal SDK catalog route (every customer turn) ────────────────────
+  describe('minimal SDK catalog route', () => {
     const CUSTOMER = '5215550001111';
     const event = (id: string): WebhookEventDto => ({
       object: 'whatsapp_business_account',
@@ -2532,7 +2409,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       ],
     });
 
-    it('routes allowlisted senders to the minimal agent, others to legacy', async () => {
+    it('routes every customer to the minimal agent, never the legacy runner', async () => {
       minimalAgent.tryHandle.mockResolvedValueOnce({
         kind: 'handled',
         reply: 'SDK reply',
@@ -2547,25 +2424,28 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           messageId: 'wamid.min.on',
         },
       });
-      expect(llm.run).not.toHaveBeenCalled();
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
         text: 'SDK reply',
       });
 
-      store.get.mockResolvedValue(null);
-      llm.run.mockResolvedValue({
-        reply: 'legacy reply',
-        messages: [],
-        usage: { promptTokens: 1, completionTokens: 1 },
+      // A sender that was never on any allowlist takes the same route.
+      const stranger = event('wamid.min.stranger');
+      stranger.entry![0].changes![0].value!.messages![0].from = '5215559998888';
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'SDK reply 2',
       });
-      await service.dispatch(event('wamid.min.off'));
-      expect(llm.run).toHaveBeenCalledTimes(1);
+      await service.dispatch(stranger);
       expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(2);
+      expect(minimalAgent.tryHandle).toHaveBeenLastCalledWith(
+        expect.objectContaining({ senderId: '5215559998888' }),
+      );
       expect(sender.sendText).toHaveBeenLastCalledWith({
-        to: CUSTOMER,
-        text: 'legacy reply',
+        to: '5215559998888',
+        text: 'SDK reply 2',
       });
+      expect(llm.run).not.toHaveBeenCalled();
     });
 
     it('arms onSent only after a successful send, before remember/dedup', async () => {

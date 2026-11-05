@@ -113,11 +113,13 @@ const INSTRUCTIONS =
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
-export type MinimalCatalogAgentDecision =
-  | { kind: 'handled'; reply: string; onSent?: () => void }
-  | { kind: 'not-handled' };
+export type MinimalCatalogAgentDecision = {
+  kind: 'handled';
+  reply: string;
+  onSent?: () => void;
+};
 
-// Bounded busy reply returned as `handled` (never legacy) for an in-flight turn.
+// Bounded busy reply returned as `handled` for an in-flight turn.
 const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
 
@@ -346,9 +348,7 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
 // inquiry capabilities. No checkout, payment or inventory reservations.
 @Injectable()
 export class MinimalCatalogAgentService {
-  private readonly enabled: boolean;
   private readonly shippingEnabled: boolean;
-  private readonly allowedSenders: ReadonlySet<string>;
   private readonly model: string;
   private readonly maxSteps: number;
   private readonly historyTurns: number;
@@ -379,34 +379,27 @@ export class MinimalCatalogAgentService {
     @Optional()
     private readonly shipping?: MinimalShippingService,
   ) {
-    const agent = config.get<{
-      enabled: boolean;
-      allowedSenders: string[];
-      shippingEnabled?: boolean;
-    }>('minimalCatalogAgent')!;
+    const agent = config.get<{ shippingEnabled?: boolean }>(
+      'minimalCatalogAgent',
+    );
     const llm = config.get<{
       model: string;
       maxSteps: number;
       historyTurns: number;
     }>('llm')!;
-    this.enabled = agent.enabled === true;
-    this.shippingEnabled = agent.shippingEnabled === true;
-    this.allowedSenders = new Set(agent.allowedSenders ?? []);
+    this.shippingEnabled = agent?.shippingEnabled === true;
     this.model = llm.model;
     this.maxSteps = llm.maxSteps;
     this.historyTurns = llm.historyTurns;
   }
 
-  // An exact allowlisted turn while enabled, else `not-handled` so the caller
-  // keeps the legacy path. A same-sender run already in flight is rejected.
+  // Handles every customer turn; a same-sender run already in flight is
+  // rejected.
   async tryHandle(input: {
     senderId: string;
     text: string;
     inboundEvent?: unknown;
   }): Promise<MinimalCatalogAgentDecision> {
-    if (!this.enabled || !this.allowedSenders.has(input.senderId)) {
-      return { kind: 'not-handled' };
-    }
     if (this.busy.has(input.senderId)) {
       // Any turn after a summary spends its consent, even a rejected one.
       this.interrupted.add(input.senderId);

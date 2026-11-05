@@ -64,8 +64,10 @@ describe('configuration()', () => {
     'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
     // Experimental minimal SDK catalog route
     'MINIMAL_CATALOG_SHIPPING_ENABLED',
+    // Removed always-on flags: kept here so the test restores them.
     'MINIMAL_CATALOG_AGENT_ENABLED',
     'MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS',
+    'MINIMAL_CATALOG_ORDER_ENABLED',
   ];
 
   beforeEach(() => {
@@ -407,38 +409,27 @@ describe('configuration()', () => {
     });
   });
 
-  // Experimental minimal SDK catalog route: default-off; the sender list is
-  // strict and an empty/invalid list enables nobody.
+  // The minimal SDK catalog route is always on for every sender; its former
+  // enable/allowlist/order env vars are removed and have no effect.
   describe('minimalCatalogAgent', () => {
     const minimal = () =>
       (
         configuration() as unknown as {
-          minimalCatalogAgent: { enabled: boolean; allowedSenders: string[] };
+          minimalCatalogAgent: Record<string, unknown>;
         }
       ).minimalCatalogAgent;
 
-    it('stays disabled unless the flag is exactly "true"', () => {
-      for (const value of [undefined, 'false', 'TRUE', '1', ' true ']) {
-        if (value === undefined)
-          delete process.env.MINIMAL_CATALOG_AGENT_ENABLED;
-        else process.env.MINIMAL_CATALOG_AGENT_ENABLED = value;
-        expect(minimal().enabled).toBe(false);
-      }
-      process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'true';
-      expect(minimal().enabled).toBe(true);
-    });
-
-    it('parses a strict exact wa_id allowlist, else enables nobody', () => {
-      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS =
-        '5215550001111, 5215550002222';
-      expect(minimal().allowedSenders).toEqual([
-        '5215550001111',
-        '5215550002222',
-      ]);
-      for (const value of ['', '   ', 'owner@example.com', '+5215550001111']) {
-        process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = value;
-        expect(minimal().allowedSenders).toEqual([]);
-      }
+    it('ignores the removed enable, allowlist and order env vars', () => {
+      delete process.env.MINIMAL_CATALOG_SHIPPING_ENABLED;
+      delete process.env.MINIMAL_CATALOG_AGENT_ENABLED;
+      delete process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS;
+      delete process.env.MINIMAL_CATALOG_ORDER_ENABLED;
+      const baseline = minimal();
+      process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'false';
+      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = '5215550001111';
+      process.env.MINIMAL_CATALOG_ORDER_ENABLED = 'false';
+      expect(minimal()).toEqual(baseline);
+      expect(Object.keys(minimal())).toEqual(['shippingEnabled']);
     });
   });
 });

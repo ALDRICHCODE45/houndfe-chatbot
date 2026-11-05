@@ -50,7 +50,7 @@ const say = () =>
   step([{ type: 'text', text: 'Inventado $999. Pedido creado.' }], 'stop');
 
 // prettier-ignore
-async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean; order?: boolean; unconfirmed?: boolean } = {}) {
+async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean; unconfirmed?: boolean } = {}) {
   const price = options.free ? 50001 : 1500;
   const store = new InMemoryConversationStore();
   const api = {
@@ -63,7 +63,7 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
     getPaymentDetails: jest.fn(async () => ({ id: 'pd', bankName: 'BBVA', beneficiary: 'HoundFe', clabe: '012180001234567891', accountNumber: null, isActive: true, updatedAt: '2026-10-01T00:00:00.000Z' })),
   };
   const client = api as unknown as ChatbotApiClient;
-  const config = { get: (key: string) => key === 'minimalCatalogAgent' ? { enabled: true, allowedSenders: [SENDER], orderEnabled: options.order !== false, shippingEnabled: options.gate !== false } : key === 'chatbotApi.cashierUserId' ? '99999999-9999-4999-8999-999999999999' : { model: 'm', maxSteps: 6, historyTurns: 12 } } as unknown as ConfigService;
+  const config = { get: (key: string) => key === 'minimalCatalogAgent' ? { shippingEnabled: options.gate !== false } : key === 'chatbotApi.cashierUserId' ? '99999999-9999-4999-8999-999999999999' : { model: 'm', maxSteps: 6, historyTurns: 12 } } as unknown as ConfigService;
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
   const order = new MinimalOrderService(client, store, cart, checkout, config);
@@ -98,7 +98,7 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
 
 // prettier-ignore
 describe('minimal shipping SDK public seam', () => {
-  it.each([{ gate: false }, { absent: true }, { order: false }])('S5: hidden without both capabilities (%j)', async options => {
+  it.each([{ gate: false }, { absent: true }])('S5: hidden without both capabilities (%j)', async options => {
     const h = await setup(options); await h.turn('Hola', [say()]);
     expect(h.seen[0].tools).not.toHaveProperty('requestShippingQuote');
     expect(h.seen[0].system).not.toContain('Herramienta requestShippingQuote');

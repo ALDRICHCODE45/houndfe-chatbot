@@ -185,6 +185,30 @@ describe('envValidationSchema', () => {
       expect(error).toBeUndefined();
       expect(value.PORT).toBe(3000);
     });
+
+    it('ignores the removed minimal-route enable, allowlist and order vars', () => {
+      const env = {
+        ...validEnv,
+        MINIMAL_CATALOG_AGENT_ENABLED: 'not-a-boolean',
+        MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: 'owner@example.com',
+        MINIMAL_CATALOG_ORDER_ENABLED: 'nope',
+      };
+      const { error, value } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value).toEqual(
+        expect.objectContaining({
+          MINIMAL_CATALOG_AGENT_ENABLED: 'not-a-boolean',
+          MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: 'owner@example.com',
+          MINIMAL_CATALOG_ORDER_ENABLED: 'nope',
+        }),
+      );
+      const { value: baseline } = envValidationSchema.validate(validEnv) as {
+        value: Record<string, unknown>;
+      };
+      expect(baseline).not.toHaveProperty('MINIMAL_CATALOG_AGENT_ENABLED');
+    });
   });
 
   // ─── LLM agent env vars ───────────────────────────────────────────────────

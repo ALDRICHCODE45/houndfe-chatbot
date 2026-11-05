@@ -1,6 +1,6 @@
 # Minimal checkout coordinator (T3B/T3C)
 
-`MinimalCheckoutService` wires the T3A domains (`MinimalCheckoutConfirmation`, `MinimalCheckoutAddressReferences`) into the minimal SDK route. It lets an allowlisted WhatsApp sender pick a saved address or dictate a new one, then confirm the delivery data **locally**.
+`MinimalCheckoutService` wires the T3A domains (`MinimalCheckoutConfirmation`, `MinimalCheckoutAddressReferences`) into the minimal SDK route. It lets any WhatsApp sender pick a saved address or dictate a new one, then confirm the delivery data **locally**.
 
 A local confirmation is not an order, not a customer registration and not a shipping activation.
 
@@ -58,7 +58,7 @@ The draft is durable. Address references, the presented summary and the local co
 
 ## Never called by this route
 
-Customer upsert, address mutations, sales, reservations, payments and shipping providers. Creating an order from a confirmed saved address is a separate, default-off capability: see `docs/minimal-order-placement.md`.
+Customer upsert, address mutations, sales, reservations, payments and shipping providers. Creating an order from a confirmed saved address is a separate, always-on capability: see `docs/minimal-order-placement.md`.
 
 ## Check
 

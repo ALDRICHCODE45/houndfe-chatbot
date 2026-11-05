@@ -4,7 +4,7 @@ Adds an additive, read-only chatbot client for the backend checkout-context rout
 
 ## Quick path
 
-1. Call `ChatbotApiClient.getCustomerCheckoutContext(cc, phone, { limit?, afterAddressId? })` from an allowlisted minimal-route service (integration is a later unit).
+1. Call `ChatbotApiClient.getCustomerCheckoutContext(cc, phone, { limit?, afterAddressId? })` from a minimal-route service (integration is a later unit).
 2. Read `status`: `not_found` and `ambiguous` are results, not exceptions; only `unique` carries `customer` and `addresses`.
 3. Treat a rejected promise as _lookup unavailable_, never as customer absence.
 

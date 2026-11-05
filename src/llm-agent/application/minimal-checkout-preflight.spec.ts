@@ -43,7 +43,6 @@ function setup(
   options: {
     empty?: boolean;
     cartAvailable?: boolean;
-    enabled?: boolean;
     restock?: MinimalRestockRequestService;
     expiration?: MinimalExpirationRequestService;
   } = {},
@@ -87,7 +86,7 @@ function setup(
   const config = {
     get: (key: string) =>
       key === 'minimalCatalogAgent'
-        ? { enabled: options.enabled !== false, allowedSenders: [SENDER] }
+        ? {}
         : { model: 'm', maxSteps: 5, historyTurns: 12 },
   } as unknown as ConfigService;
   let steps: unknown[] = [call(), say];
@@ -454,22 +453,6 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     await review(f);
     expect(f.seen[0].tools).not.toHaveProperty('reviewCheckout');
     expect(String(f.seen[0].system)).not.toContain('reviewCheckout');
-  });
-
-  it('preserves enabled and sender allowlist gates', async () => {
-    const f = setup({ enabled: false });
-    expect(
-      await f.agent.tryHandle({ senderId: SENDER, text: 'Quiero comprar' }),
-    ).toEqual({ kind: 'not-handled' });
-    const active = setup();
-    expect(
-      await active.agent.tryHandle({
-        senderId: 'unlisted',
-        text: 'Quiero comprar',
-      }),
-    ).toEqual({ kind: 'not-handled' });
-    expect(f.seen).toHaveLength(0);
-    expect(active.seen).toHaveLength(0);
   });
 });
 

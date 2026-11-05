@@ -12,6 +12,7 @@ import { Observable, of } from 'rxjs';
 import { CONVERSATION_STORE } from '../../src/conversation/domain/conversation-store';
 import { InMemoryConversationStore } from '../../src/conversation/infrastructure/in-memory-conversation.store';
 import { AgentRunner } from '../../src/llm-agent/application/agent-runner.service';
+import { MinimalCatalogAgentService } from '../../src/llm-agent/application/minimal-catalog-agent.service';
 import { ReceiptAmountRouterService } from '../../src/receipt-media/application/receipt-amount-router.service';
 import { ReceiptIngressService } from '../../src/receipt-media/application/receipt-ingress.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../src/sale-flow/infrastructure/real-tool-registry';
@@ -35,7 +36,8 @@ import { WebhookController } from '../../src/whatsapp/presentation/webhook.contr
  *
  * Exposes ONLY the real `GET/POST /webhook` surface (WebhookController +
  * SignatureGuard + WebhookDispatcherService) and fakes every outbound edge:
- * the LLM/agent runner returns a canned reply, the sender records instead of
+ * the LLM/agent runner returns a canned reply (customer turns reach it through
+ * the sandbox minimal route), the sender records instead of
  * calling Meta, and the receipt and human-handoff dependencies are inert.
  *
  * It deliberately does NOT import the production `AppModule`, `WhatsappModule`,
@@ -90,6 +92,24 @@ export const SANDBOX_AGENT_RUNNER = {
   handle: (input: { senderId: string; text: string }) =>
     Promise.resolve({ reply: SANDBOX_REPLY, input }),
 };
+
+/**
+ * Sandbox minimal route: the dispatcher sends every customer turn to the
+ * minimal SDK route, so this delegates to whatever `AgentRunner` the sandbox
+ * bound (canned reply or the no-tool LLM override).
+ */
+export function sandboxMinimalCatalogAgent(runner: {
+  handle: (input: { senderId: string; text: string }) => Promise<{
+    reply: string;
+  }>;
+}) {
+  return {
+    tryHandle: async (input: { senderId: string; text: string }) => ({
+      kind: 'handled' as const,
+      reply: (await runner.handle(input)).reply,
+    }),
+  };
+}
 
 /** Inert receipt amount router: always fences (no store/backend access). */
 export const SANDBOX_AMOUNT_ROUTER = {
@@ -309,6 +329,11 @@ function scanRawSenders(
     { provide: RECENT_OUTBOUND, useClass: InMemoryRecentOutboundStore },
     { provide: CONVERSATION_STORE, useClass: InMemoryConversationStore },
     { provide: AgentRunner, useValue: SANDBOX_AGENT_RUNNER },
+    {
+      provide: MinimalCatalogAgentService,
+      useFactory: sandboxMinimalCatalogAgent,
+      inject: [AgentRunner],
+    },
     { provide: ReceiptAmountRouterService, useValue: SANDBOX_AMOUNT_ROUTER },
     { provide: ReceiptIngressService, useValue: SANDBOX_RECEIPT_INGRESS },
     { provide: HUMAN_HANDOFF_SERVICE_TOKEN, useValue: SANDBOX_HUMAN_HANDOFF },

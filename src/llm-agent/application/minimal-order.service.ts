@@ -162,12 +162,11 @@ function sameCartLines(
  * ONLINE sale only after a strict armed SÍ for the exact presented summary,
  * through one atomic `POST /chatbot-api/checkouts` that may also create the
  * customer and save a confirmed new or corrected address in that transaction.
- * No separate customer/address writes, stock reservation or payment. Default off.
+ * No separate customer/address writes, stock reservation or payment. Always on.
  */
 @Injectable()
 export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
-  private readonly orderEnabled: boolean;
   private readonly shippingEnabled: boolean;
   private readonly cashierUserId: string;
 
@@ -178,9 +177,6 @@ export class MinimalOrderService {
     private readonly checkout: MinimalCheckoutService,
     config: ConfigService,
   ) {
-    this.orderEnabled =
-      config.get<{ orderEnabled?: boolean }>('minimalCatalogAgent')
-        ?.orderEnabled === true;
     this.shippingEnabled =
       config.get<{ shippingEnabled?: boolean }>('minimalCatalogAgent')
         ?.shippingEnabled === true;
@@ -188,10 +184,9 @@ export class MinimalOrderService {
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
   }
 
-  /** Gate, server-owned cashier and the owned CAS capabilities. */
+  /** Server-owned cashier and the owned CAS capabilities. */
   get enabled(): boolean {
     return (
-      this.orderEnabled &&
       this.cashierUserId !== '' &&
       typeof this.store.commitMinimalCart === 'function' &&
       this.checkout.available

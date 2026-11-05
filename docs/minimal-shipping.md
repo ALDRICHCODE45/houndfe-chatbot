@@ -4,7 +4,7 @@ This experimental minimal SDK capability is **off by default** and **not product
 
 ## Enable only in controlled test environments
 
-Enable the minimal route and order capability described in [minimal order placement](minimal-order-placement.md), including the sender allowlist and bot cashier. Then configure:
+The minimal route and order capability are always on (see [minimal order placement](minimal-order-placement.md)); they need the bot cashier. Then configure:
 
 | Variable                            | Value / requirement                                                 |
 | ----------------------------------- | ------------------------------------------------------------------- |

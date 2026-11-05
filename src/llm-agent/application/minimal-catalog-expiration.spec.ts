@@ -83,7 +83,7 @@ function build(
   const config = {
     get: (path: string) =>
       path === 'minimalCatalogAgent'
-        ? { enabled: true, allowedSenders: [SENDER] }
+        ? {}
         : { model: 'm', maxSteps: 4, historyTurns: 12 },
   } as unknown as ConfigService;
   const captured: Array<{ system?: unknown; tools?: Record<string, unknown> }> =

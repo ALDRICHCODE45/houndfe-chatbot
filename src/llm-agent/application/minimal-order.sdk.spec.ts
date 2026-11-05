@@ -54,7 +54,7 @@ const placedSale = () => ({
 
 function setup(
   options: {
-    order?: 'on' | 'off' | 'absent';
+    order?: 'on' | 'absent';
     shipping?: boolean;
   } = {},
 ) {
@@ -142,9 +142,6 @@ function setup(
     get: (key: string) => {
       if (key === 'minimalCatalogAgent')
         return {
-          enabled: true,
-          allowedSenders: [SENDER],
-          orderEnabled: mode === 'on',
           shippingEnabled: options.shipping === true,
         };
       if (key === 'chatbotApi.cashierUserId') return CASHIER;
@@ -581,10 +578,9 @@ describe('minimal order placement through the SDK route', () => {
   });
   it.each([
     ['on', true],
-    ['off', false],
     ['absent', false],
   ] as const)(
-    'exposes prepareOrder only when the order gate is %s',
+    'exposes prepareOrder only when the order service is %s',
     async (order, exposed) => {
       const h = setup({ order });
       await h.turn('Hola', [say()]);

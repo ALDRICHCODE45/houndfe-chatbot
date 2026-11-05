@@ -22,17 +22,6 @@ const trimmedOrUndefined = (v: string | undefined) => {
   const t = v?.trim();
   return t ? t : undefined;
 };
-// Experimental minimal SDK catalog route: exact Meta wa_id allowlist. Any
-// empty or malformed list resolves to [] so the route enables NOBODY.
-const minimalSenders = (v: string | undefined): string[] => {
-  const list = (v ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return list.length > 0 && list.every((s) => /^\d{10,15}$/.test(s))
-    ? list
-    : [];
-};
 
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
@@ -65,15 +54,9 @@ const configuration = () => ({
     ),
     idleTimeoutMs: parseInt(process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000', 10),
   },
-  // Experimental, default-off minimal SDK catalog route (manual test only).
+  // Minimal SDK catalog route: always on for every sender, including order
+  // placement. Only the shipping capability keeps its own switch.
   minimalCatalogAgent: {
-    enabled: process.env.MINIMAL_CATALOG_AGENT_ENABLED === 'true',
-    allowedSenders: minimalSenders(
-      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS,
-    ),
-    // Default-off order placement (creates real backend sales). Only the
-    // exact env string 'true' enables it.
-    orderEnabled: process.env.MINIMAL_CATALOG_ORDER_ENABLED === 'true',
     shippingEnabled: process.env.MINIMAL_CATALOG_SHIPPING_ENABLED === 'true',
   },
   database: {

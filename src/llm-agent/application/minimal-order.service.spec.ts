@@ -87,7 +87,6 @@ const placedSale = () => ({
 
 function setup(
   options: {
-    enabled?: boolean;
     cashier?: string;
     shipping?: boolean;
   } = {},
@@ -161,7 +160,6 @@ function setup(
     get: (key: string) => {
       if (key === 'minimalCatalogAgent')
         return {
-          orderEnabled: options.enabled !== false,
           shippingEnabled: options.shipping === true,
         };
       if (key === 'chatbotApi.cashierUserId') return options.cashier ?? CASHIER;
@@ -1471,8 +1469,7 @@ describe('MinimalOrderService', () => {
     expect(calls[1]).toEqual(calls[0]);
   });
 
-  it('is disabled unless the gate and a cashier are configured', () => {
-    expect(setup({ enabled: false }).order.enabled).toBe(false);
+  it('is enabled whenever a cashier is configured', () => {
     expect(setup({ cashier: '' }).order.enabled).toBe(false);
     expect(setup().order.enabled).toBe(true);
   });

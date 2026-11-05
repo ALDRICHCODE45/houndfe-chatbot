@@ -20,6 +20,7 @@ import {
   type HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
+import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import type {
   ReceiptAmountRouteInput,
@@ -200,6 +201,12 @@ interface Harness {
   agentRunner: {
     handle: jest.Mock<
       Promise<{ reply: string }>,
+      [{ senderId: string; text: string }]
+    >;
+  };
+  minimalAgent: {
+    tryHandle: jest.Mock<
+      Promise<{ kind: 'handled'; reply: string }>,
       [{ senderId: string; text: string }]
     >;
   };
@@ -394,6 +401,13 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
         [{ senderId: string; text: string }]
       >(() => Promise.resolve({ reply: 'AGENT-REPLY' })),
     };
+    // Every customer turn goes to the minimal route.
+    const minimalAgent = {
+      tryHandle: jest.fn<
+        Promise<{ kind: 'handled'; reply: string }>,
+        [{ senderId: string; text: string }]
+      >(() => Promise.resolve({ kind: 'handled', reply: 'AGENT-REPLY' })),
+    };
     const handoff = {
       isOpsSender: jest.fn<boolean, [string]>(() => false),
       resolveReply: jest.fn<
@@ -419,6 +433,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
       conversations,
       amountRouter,
       ingress,
+      minimalAgent as unknown as MinimalCatalogAgentService,
     );
 
     // Transparent spies: the real router/ingress/store methods still execute;
@@ -457,6 +472,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
       storeAdmitSpy,
       sender,
       agentRunner,
+      minimalAgent,
       handoff,
       close,
     };
@@ -502,7 +518,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
       h.app,
       textBody('wamid.echo.source.1', CUSTOMER, 'hola'),
     ).expect(200);
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
     const rememberedId = lastSent(h).providerMessageId;
 
     // The remembered outbound id re-delivered as an inbound is skipped by the
@@ -510,7 +526,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
     await postSigned(h.app, textBody(rememberedId, CUSTOMER, 'hola')).expect(
       200,
     );
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
     expect(await markerRows()).not.toContain(rememberedId);
 
     // The real durable marker short-circuits BEFORE the ops hook: an ops-sender
@@ -522,7 +538,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
       textBody('wamid.pre.dedup.1', OPS_PHONE, 'sí'),
     ).expect(200);
     expect(h.handoff.resolveReply).not.toHaveBeenCalled();
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
   });
 
   it('runs an ops reply through the real handoff hook and bypasses router and ingress', async () => {
@@ -628,7 +644,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
       to: CUSTOMER,
       text: PENDING_HUMAN_REQUEST_REPLY,
     });
-    expect(h.agentRunner.handle).not.toHaveBeenCalled();
+    expect(h.minimalAgent.tryHandle).not.toHaveBeenCalled();
     const after = await receiptRow(receiptId);
     expect(after.status).toBe(before.status);
     expect(after.version).toBe(before.version);
@@ -646,7 +662,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
       h.app,
       textBody('wamid.llm.only.1', CUSTOMER, 'quiero comprar'),
     ).expect(200);
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
     expect(await receiptCount()).toBe(0);
     expect(await outboxRows()).toHaveLength(0);
 
@@ -681,7 +697,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
     expect(after.version).toBe(before.version);
     expect(after.declared_amount_cents).toBe(before.declared_amount_cents);
     expect(await receiptCount()).toBe(1);
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
   });
 
   it('bootstraps a captioned receipt to confirmation and starts attachment on `sí` without duplicate replay', async () => {
@@ -739,7 +755,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
     expect(replayed.status).toBe('ATTACHING');
     expect(replayed.version).toBe(attaching.version);
     expect(await outboxRows()).toHaveLength(2);
-    expect(h.agentRunner.handle).not.toHaveBeenCalled();
+    expect(h.minimalAgent.tryHandle).not.toHaveBeenCalled();
   });
 
   it('bootstraps an uncaptioned receipt to the amount prompt and proposes `$500` through the real router', async () => {
@@ -838,12 +854,12 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
 
     // With the pointer gone, a later `sí` fences through to the LLM instead of
     // transitioning the cancelled receipt.
-    const callsBefore = h.agentRunner.handle.mock.calls.length;
+    const callsBefore = h.minimalAgent.tryHandle.mock.calls.length;
     await postSigned(
       h.app,
       textBody('wamid.term.si.after-cancel', CUSTOMER, 'sí'),
     ).expect(200);
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(callsBefore + 1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(callsBefore + 1);
     const afterCancel = await receiptRow(receiptId);
     expect(afterCancel.status).toBe('CANCELLED');
     expect(afterCancel.version).toBe(cancelled.version);
@@ -869,12 +885,12 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
     expect(attaching.status).toBe('ATTACHING');
     expect(await readPointer(h.conversations, CUSTOMER)).toBeNull();
 
-    const callsBefore = h.agentRunner.handle.mock.calls.length;
+    const callsBefore = h.minimalAgent.tryHandle.mock.calls.length;
     await postSigned(
       h.app,
       textBody('wamid.startclear.si.2', CUSTOMER, 'sí'),
     ).expect(200);
-    expect(h.agentRunner.handle).toHaveBeenCalledTimes(callsBefore + 1);
+    expect(h.minimalAgent.tryHandle).toHaveBeenCalledTimes(callsBefore + 1);
     const afterSecond = await receiptRow(receiptId);
     expect(afterSecond.status).toBe('ATTACHING');
     expect(afterSecond.version).toBe(attaching.version);
@@ -919,7 +935,7 @@ ddescribe('Webhook receipt routing integration (Testcontainers)', () => {
     const sendsAfterText = h.sent.length;
     await postSigned(h.app, textBody(textWamid, CUSTOMER, 'hola')).expect(200);
     expect(h.sent.length).toBe(sendsAfterText);
-    expect(h.agentRunner.handle).not.toHaveBeenCalled();
+    expect(h.minimalAgent.tryHandle).not.toHaveBeenCalled();
 
     // (c) Provider-media reuse retains the first durable amount. Direct
     // observation excludes ODD-4C sender-active interception: the media route

@@ -15,6 +15,7 @@ import type {
 } from '../../conversation/domain/conversation-store';
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
+import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import {
   ReceiptIngressService,
@@ -104,6 +105,7 @@ interface Harness {
   sender: { sendText: jest.Mock };
   conversations: { get: jest.Mock; getState: jest.Mock };
   agentRunner: { handle: jest.Mock };
+  minimalAgent: { tryHandle: jest.Mock };
   amountRouter: { route: jest.Mock };
   handoff: { isOpsSender: jest.Mock; resolveReply: jest.Mock };
   close: () => Promise<void>;
@@ -190,6 +192,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     };
     const sender = { sendText: jest.fn() };
     const agentRunner = { handle: jest.fn() };
+    const minimalAgent = { tryHandle: jest.fn() };
     const amountRouter = { route: jest.fn() };
     const handoff = {
       isOpsSender: jest.fn(() => false),
@@ -213,6 +216,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
         { getState: conversations.getState },
         probe,
       ),
+      minimalAgent as unknown as MinimalCatalogAgentService,
     );
 
     const moduleRef = await Test.createTestingModule({
@@ -240,6 +244,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
       sender,
       conversations,
       agentRunner,
+      minimalAgent,
       amountRouter,
       handoff,
       close,
@@ -395,6 +400,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     expect(replayed.conversations.getState).not.toHaveBeenCalled();
     expect(replayed.sender.sendText).not.toHaveBeenCalled();
     expect(replayed.agentRunner.handle).not.toHaveBeenCalled();
+    expect(replayed.minimalAgent.tryHandle).not.toHaveBeenCalled();
     expect(replayed.amountRouter.route).not.toHaveBeenCalled();
     expect(replayed.handoff.resolveReply).not.toHaveBeenCalled();
   });

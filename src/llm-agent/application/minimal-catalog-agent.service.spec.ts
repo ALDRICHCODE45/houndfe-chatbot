@@ -85,8 +85,6 @@ type Captured = {
 function build(
   steps: unknown,
   over: Partial<{
-    enabled: boolean;
-    allowedSenders: string[];
     historyTurns: number;
     sessionStore: MinimalCatalogSessionStore;
     restock: (chatbotApi: ChatbotApiClient) => MinimalRestockRequestService;
@@ -104,10 +102,7 @@ function build(
   const config = {
     get: (path: string) =>
       path === 'minimalCatalogAgent'
-        ? {
-            enabled: over.enabled ?? true,
-            allowedSenders: over.allowedSenders ?? [SENDER],
-          }
+        ? {}
         : { model: 'm', maxSteps: 4, historyTurns: over.historyTurns ?? 12 },
   } as unknown as ConfigService;
   const captured: Captured[] = [];
@@ -146,19 +141,20 @@ function captureLogs(): string[] {
   return logs;
 }
 
-describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => {
+describe('MinimalCatalogAgentService (minimal SDK route)', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it('handles only an exact enabled allowlisted sender, else not-handled', async () => {
-    const off = build([], { enabled: false });
-    const other = build([], { allowedSenders: [OUTSIDE] });
+  it('handles every sender with no allowlist or enable flag', async () => {
+    // A sender that was never configured anywhere still runs the SDK turn.
+    const stranger = '5215559998888';
+    const { service, captured } = build([say('Hola'), say('Hola')]);
     await expect(
-      off.service.tryHandle({ senderId: SENDER, text: 'x' }),
-    ).resolves.toEqual({ kind: 'not-handled' });
+      service.tryHandle({ senderId: stranger, text: 'hola' }),
+    ).resolves.toEqual({ kind: 'handled', reply: 'Hola' });
     await expect(
-      other.service.tryHandle({ senderId: SENDER, text: 'x' }),
-    ).resolves.toEqual({ kind: 'not-handled' });
-    expect([...off.captured, ...other.captured]).toHaveLength(0);
+      service.tryHandle({ senderId: SENDER, text: 'hola' }),
+    ).resolves.toEqual({ kind: 'handled', reply: 'Hola' });
+    expect(captured).toHaveLength(2);
   });
 
   it('sends the strengthened voice clauses and examples with the SYSTEM_PROMPT prefix and returns the model reply verbatim', async () => {
@@ -376,7 +372,7 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
     const config = {
       get: (path: string) =>
         path === 'minimalCatalogAgent'
-          ? { enabled: true, allowedSenders: [SENDER] }
+          ? {}
           : { model: 'm', maxSteps: 4, historyTurns: 12 },
     } as unknown as ConfigService;
     const service = new MinimalCatalogAgentService(
@@ -444,16 +440,14 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       expect(turnB).not.toContain('unknown_product');
     });
 
-    it('isolates retained identity per allowed sender', async () => {
+    it('isolates retained identity per sender', async () => {
       const steps = [
         call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
         say('¿Buscaba esa presentación?'),
         call('c1', 'checkStock', { productId: PRODUCT }),
         say('No puedo revisarlo así.'),
       ];
-      const { service, chatbotApi, results } = build(steps, {
-        allowedSenders: [SENDER, OTHER],
-      });
+      const { service, chatbotApi, results } = build(steps);
       await service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' });
       await service.tryHandle({ senderId: OTHER, text: 'esa' });
       expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
@@ -1012,7 +1006,6 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
       const off = build(flow);
       const unbound = build(flow, { restock: w.restock });
       const bound = build(flow, { restock: w.restock });
-      const outsider = build(flow, { allowedSenders: [OTHER] });
       const logs = captureLogs();
       await off.service.tryHandle({ senderId: SENDER, text: '¿fecha?' });
       await unbound.service.tryHandle({ senderId: SENDER, text: '¿fecha?' });
@@ -1021,9 +1014,6 @@ describe('MinimalCatalogAgentService (experimental read-only SDK route)', () => 
         text: '¿fecha?',
         inboundEvent: INBOUND,
       });
-      await expect(
-        outsider.service.tryHandle({ senderId: SENDER, text: '¿fecha?' }),
-      ).resolves.toEqual({ kind: 'not-handled' });
 
       // Tool inventory, not just the prompt, must match the capability.
       expect(Object.keys(off.captured[0].tools!)).not.toContain(

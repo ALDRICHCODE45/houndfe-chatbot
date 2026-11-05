@@ -162,7 +162,7 @@ function setup(
   const config = {
     get: (key: string) =>
       key === 'minimalCatalogAgent'
-        ? { enabled: true, allowedSenders: [SENDER] }
+        ? {}
         : { model: 'm', maxSteps: 5, historyTurns: 12 },
   } as unknown as ConfigService;
   let steps: unknown[] = [];

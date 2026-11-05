@@ -1,6 +1,6 @@
 # Cart on the minimal WhatsApp route
 
-The enabled, allowlisted minimal agent can maintain a cart and review checkout prerequisites without using the legacy sales agent. It cannot create orders, collect payment, quote shipping or reserve stock.
+The minimal agent, which serves every sender, can maintain a cart and review checkout prerequisites without using the legacy sales agent. It cannot create orders, collect payment, quote shipping or reserve stock.
 
 ## Keep only selected cart lines
 
@@ -21,7 +21,7 @@ Private traces use `cart_keep_only result=<ready|invalid_evidence|unknown_select
 - Promotions requiring human review: `blocked / promotion_review`; this does **not** register a human request or approve prices.
 - Verified nonempty cart: `incomplete`, with **productsSubtotalCents**, not a freight-inclusive total. Customer/address confirmation, an approved shipping offer and explicit confirmation of the final total remain pending. This increment does not inspect or adopt legacy customer, shipping or sale markers.
 
-The tool is available only with the existing cart capability, enabled minimal route and exact sender allowlist. It accepts no sender, product, price or customer fields. The prompt directs purchase/review intent to this tool; live model recognition still requires a separately authorized WhatsApp rehearsal. No new flag, dependency or deployment is included.
+The tool is available whenever the cart capability is bound. It accepts no sender, product, price or customer fields. The prompt directs purchase/review intent to this tool; live model recognition still requires a separately authorized WhatsApp rehearsal. No new flag, dependency or deployment is included.
 
 The customer receives application-owned wording rather than model-authored purchase claims. A later plain `getCart` cannot replace this review; existing cart mutation/clarification acknowledgements and EXPIRATION/RESTOCK priority remain intact. Malformed calls do not execute. Without an earlier authoritative outcome they use the existing cart clarification path; otherwise the prior application-owned acknowledgement is preserved, never replaced by model-authored success.
 
@@ -33,7 +33,7 @@ Focused offline check:
 pnpm test --runTestsByPath src/llm-agent/application/minimal-checkout-preflight.spec.ts --runInBand
 ```
 
-Placing the order after this preflight is a separate, default-off capability (`MINIMAL_CATALOG_ORDER_ENABLED`); see `docs/minimal-order-placement.md`. With it enabled, a placed order clears the cart and records `placedSale`, and the cart slot may carry a UUID `idempotencyKey` while an order attempt is pending.
+Placing the order after this preflight is always available; see `docs/minimal-order-placement.md`. A placed order clears the cart and records `placedSale`, and the cart slot may carry a UUID `idempotencyKey` while an order attempt is pending.
 
 ## Customer rehearsal (after separately authorized deployment)
 
@@ -155,7 +155,7 @@ The existing `CartState` format is reused under `conversation_state.data.minimal
 
 An exact-prior-value compare-and-set writes only `minimalCart`, preserving live siblings. A conflict returns a cautious failure without automatic retry. Generic conversation updates cannot overwrite this CAS-owned key. PostgreSQL persists it across adapter/service restarts; the in-memory adapter is only a test substitute. No migration, dependency or new environment variable is required. The selection/pending context is not part of this durable cart format and is lost on restart.
 
-Availability follows the existing `MINIMAL_CATALOG_AGENT_ENABLED` and exact `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS` gate. A deployment/configuration change still requires separate authorization. Catalog chat history remains in-memory; cart persistence does not make that history durable. After restart, view the cart to recover its product identities, or search again for a new product.
+The minimal route serves every sender; there is no enable flag or sender allowlist. Catalog chat history remains in-memory; cart persistence does not make that history durable. After restart, view the cart to recover its product identities, or search again for a new product.
 
 ## Checks
 

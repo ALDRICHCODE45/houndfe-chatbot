@@ -105,4 +105,4 @@ renderMinimalCheckoutConfirmation(validatedDraft); // server-owned summary
 
 ## Next step
 
-Wire this unit behind the existing minimal-route coordinator with the trusted WhatsApp phone parser and optional DI, preserving the sender allowlist and the EXPIRATION/RESTOCK/cart acknowledgement priorities.
+Wire this unit behind the existing minimal-route coordinator with the trusted WhatsApp phone parser and optional DI, preserving the EXPIRATION/RESTOCK/cart acknowledgement priorities. The minimal route serves every sender.

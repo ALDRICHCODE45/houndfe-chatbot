@@ -120,7 +120,7 @@ function fixture() {
   const config = {
     get: (key: string) =>
       key === 'minimalCatalogAgent'
-        ? { enabled: true, allowedSenders: [SENDER] }
+        ? {}
         : { model: 'm', maxSteps: 6, historyTurns: 12 },
   } as unknown as ConfigService;
   const agent = new MinimalCatalogAgentService(

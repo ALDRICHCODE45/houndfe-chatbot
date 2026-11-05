@@ -1,17 +1,16 @@
 # Minimal order placement
 
-`MinimalOrderService` lets an allowlisted WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
+`MinimalOrderService` lets any WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
 
-It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight. Placement always goes through the backend [atomic checkout](#atomic-checkout) (`POST /chatbot-api/checkouts`); production shipping prerequisites remain unresolved.
+It is **always on**: the minimal route serves every sender and always exposes `prepareOrder`. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight. Placement always goes through the backend [atomic checkout](#atomic-checkout) (`POST /chatbot-api/checkouts`); production shipping prerequisites remain unresolved.
 
-## Enable it (test environments only)
+## Requirements
 
-| Variable                                | Required value        | Why                                                      |
-| --------------------------------------- | --------------------- | -------------------------------------------------------- |
-| `MINIMAL_CATALOG_AGENT_ENABLED`         | `true`                | The minimal SDK route itself.                            |
-| `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS` | test senders          | Only these WhatsApp senders reach the route.             |
-| `MINIMAL_CATALOG_ORDER_ENABLED`         | `true`                | Exposes `prepareOrder`; any other value keeps it hidden. |
-| `CHATBOT_API_CASHIER_USER_ID`           | bot cashier `User.id` | Server-owned `cashierUserId`; empty disables ordering.   |
+| Variable                      | Required value        | Why                                  |
+| ----------------------------- | --------------------- | ------------------------------------ |
+| `CHATBOT_API_CASHIER_USER_ID` | bot cashier `User.id` | Server-owned `cashierUserId` (UUID). |
+
+There is no enable flag or sender allowlist.
 
 The service credential needs `customers:write` and `sales:create` for `POST /chatbot-api/checkouts` and `GET /chatbot-api/checkouts/status`.
 
