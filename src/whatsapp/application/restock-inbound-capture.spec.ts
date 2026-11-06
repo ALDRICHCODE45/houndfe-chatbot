@@ -64,6 +64,10 @@ describe('unwired text-only restock capture', () => {
     { type: 'image', image: { id: 'media' } },
     { type: 'document', document: { id: 'pdf', mime_type: 'application/pdf' } },
     { type: 'audio', audio: { id: 'voice' } },
+    { type: 'unsupported', errors: [{ code: 131051 }] },
+    { type: 'order', order: { catalog_id: 'c' } },
+    { type: 'system', system: { body: 'changed number' } },
+    { type: 'future_type' },
   ])(
     'skips a well-formed non-text message and captures the rest: %p',
     async (payload) => {
@@ -107,6 +111,11 @@ describe('unwired text-only restock capture', () => {
     value([{ ...message(), from: undefined }]),
     value([{ ...message(), image: { id: 'ambiguous' } }]),
     value([{ ...message(), audio: { id: 'ambiguous' } }]),
+    value([{ ...message(), text: undefined }]),
+    value([{ ...message(), text: { body: 1 } }]),
+    value([{ ...message(), type: undefined }]),
+    value([{ ...message(), type: 7 }]),
+    value([{ ...message(), type: 'unsupported' }]),
     { ...value(), metadata: undefined },
     { ...value(), metadata: { phone_number_id: 'other' } },
     value(null),

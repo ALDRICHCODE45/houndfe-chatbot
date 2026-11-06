@@ -15,9 +15,10 @@ type Result =
       evidence: readonly RestockInboundEvidence[];
     };
 const HOLD = { action: 'hold' } as const;
-// Well-formed non-text customer messages (receipts, voice notes, ...) carry no
-// RESTOCK reply evidence: skip them instead of holding the whole webhook.
-const NON_TEXT_TYPES = new Set([
+// Well-formed non-text customer messages (receipts, voice notes, and types
+// Meta adds later such as `unsupported`, `order`, `system`) carry no RESTOCK
+// reply evidence: skip them instead of holding (500 → endless Meta retries).
+const MEDIA_KEYS = [
   'image',
   'document',
   'audio',
@@ -28,7 +29,7 @@ const NON_TEXT_TYPES = new Set([
   'interactive',
   'button',
   'reaction',
-]);
+];
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -92,7 +93,7 @@ export class RestockInboundCapture {
             continue;
           if (
             typeof message.type === 'string' &&
-            NON_TEXT_TYPES.has(message.type) &&
+            message.type !== 'text' &&
             !('text' in message)
           )
             continue;
@@ -101,18 +102,7 @@ export class RestockInboundCapture {
             !object(message.text) ||
             typeof message.text.body !== 'string' ||
             typeof message.from !== 'string' ||
-            [
-              'image',
-              'document',
-              'audio',
-              'video',
-              'sticker',
-              'location',
-              'contacts',
-              'interactive',
-              'button',
-              'reaction',
-            ].some((key) => key in message)
+            MEDIA_KEYS.some((key) => key in message)
           )
             return HOLD;
           const candidate = bindRestockInboundEvidence(

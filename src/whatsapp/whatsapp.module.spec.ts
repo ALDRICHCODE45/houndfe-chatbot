@@ -142,6 +142,28 @@ type OutboxPool = {
  * this pool and is recorded separately (never in `sequence`) so the host
  * notification observations stay unconflated while the host ingestion drain
  * can still be observed. */
+/** G2: the customer wrote within the 24 h window, so outcome intents send. */
+const openWindowQuery = (text: unknown, params?: unknown[]) =>
+  Promise.resolve(
+    typeof text === 'string' &&
+      text.includes('FROM customer_inbound_observations')
+      ? {
+          rows: [
+            {
+              receivingPhoneNumberId: params?.[1],
+              senderId: params?.[0],
+              messageId: 'wamid.inbound',
+              providerTimestampSeconds: String(
+                Math.floor(Date.now() / 1000) - 60,
+              ),
+              observedAt: new Date(Date.now() - 60_000).toISOString(),
+            },
+          ],
+          rowCount: 1,
+        }
+      : { rows: [], rowCount: 0 },
+  );
+
 const makeOutboxPool = (
   batches: Array<Record<string, unknown>[]> = [],
   opts: {
@@ -212,7 +234,7 @@ const makeOutboxPool = (
   };
   const client = { query: jest.fn(clientQuery), release: jest.fn() };
   const pool = {
-    query: jest.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+    query: jest.fn(openWindowQuery),
     connect: jest.fn(() => Promise.resolve(client)),
     end: jest.fn(() => {
       sequence.push('end');
