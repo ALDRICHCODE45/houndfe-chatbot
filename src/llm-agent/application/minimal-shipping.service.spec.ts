@@ -70,7 +70,8 @@ async function setup(price = 1500) {
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
   const quotes = new FakeShippingQuoteClient();
-  const service = new MinimalShippingService(store, cart, checkout, quotes, () => NOW);
+  const zones = { register: jest.fn<Promise<void>, [unknown]>(async () => undefined) };
+  const service = new MinimalShippingService(store, cart, checkout, quotes, zones, () => NOW);
   await store.create(SENDER, { lastMessageAt: new Date().toISOString(), data: {
     minimalCart: { items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: price }], idempotencyKey: '', expectedTotalCents: price * 2 },
     legacy: { untouched: true },
@@ -89,7 +90,7 @@ async function setup(price = 1500) {
     if (!ok) throw new Error('fixture CAS failed');
   };
   const stored = async () => parseMinimalCart((await store.get(SENDER))?.data.minimalCart)!.shipping;
-  return { store, api, cart, checkout, quotes, service, confirm, changeCart, stored };
+  return { store, api, cart, checkout, quotes, zones, service, confirm, changeCart, stored };
 }
 
 // prettier-ignore
@@ -130,6 +131,31 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     h.quotes.enqueue(backendQuote({ zoneStatus, ...(deliverable ? {} : { quoteId: null, option: null }) }));
     expect(await h.service.quote(SENDER)).toMatchObject(expected);
     expect(await h.stored()).toMatchObject({ zoneStatus, quoteId: deliverable ? 'quote-1' : null });
+  });
+
+  it('[S5] a PENDING zone registers the sender with the saved address fields', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }));
+    expect(await h.service.quote(SENDER)).toMatchObject({ kind: 'zone_pending' });
+    expect(h.zones.register).toHaveBeenCalledTimes(1);
+    expect(h.zones.register).toHaveBeenCalledWith({
+      senderId: SENDER, zipCode: '06000', state: 'Ciudad de México',
+      municipality: 'Cuauhtémoc', neighborhood: 'Centro',
+    });
+  });
+
+  it('[S5] a failing zone intake still returns the PENDING answer', async () => {
+    const h = await setup(); await h.confirm();
+    h.zones.register.mockRejectedValueOnce(new Error('down'));
+    h.quotes.enqueue(backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }));
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'zone_pending', zipCode: '06000' });
+  });
+
+  it.each(['FREE', 'DENIED'] as const)('[S5] a %s zone registers nothing', async (zoneStatus) => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote({ zoneStatus, ...(zoneStatus === 'DENIED' ? { quoteId: null, option: null } : {}) }));
+    await h.service.quote(SENDER);
+    expect(h.zones.register).not.toHaveBeenCalled();
   });
 
   it('[S7] keeps the STOCK_PENDING eta in the stored quote and the result', async () => {
@@ -180,6 +206,19 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
       municipality: 'Cuauhtémoc', city: 'Cuauhtémoc', state: 'Ciudad de México',
     });
     expect(await h.stored()).toMatchObject({ destinationPin: { kind: 'new' } });
+  });
+
+  it('[S5] a PENDING zone for a NEW address registers the quoted loose fields', async () => {
+    const h = await setup(); await h.confirm();
+    await h.checkout.updateDetails(SENDER, { ...address, zipCode: '55635', firstName: null, lastName: null, useNewAddress: true });
+    const offer = await h.checkout.prepareConfirmation(SENDER, event('z1')); offer.onSent?.();
+    await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('z2') });
+    h.quotes.enqueue(backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }));
+    await h.service.quote(SENDER);
+    expect(h.zones.register).toHaveBeenCalledWith({
+      senderId: SENDER, zipCode: '55635', state: 'Ciudad de México',
+      municipality: 'Cuauhtémoc', neighborhood: 'Centro',
+    });
   });
 
   it('sends the corrected saved ZIP as loose fields and pins the corrected content', async () => {

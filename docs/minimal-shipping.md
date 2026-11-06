@@ -56,9 +56,37 @@ Shipping shares the one-presentation-per-SDK-run slot with delivery confirmation
 - Checkout rejections (S6) create nothing and rotate the key on a first attempt. `SHIPPING_QUOTE_EXPIRED` and `SHIPPING_QUOTE_MISMATCH` trigger one automatic re-quote and present the updated summary for a fresh `SÍ` (if the re-quote is not deliverable, the customer is asked to quote shipping again). `SHIPPING_QUOTE_NOT_FOUND`, `PACKAGING_DATA_MISSING` and a 4xx `SHIPPING_QUOTE_UNAVAILABLE` get their own replies; a 5xx stays an uncertain outcome that keeps the key.
 - A delivery order without a current quote or pickup choice gets: “Antes del resumen necesito saber cómo recibirá su pedido: dígame «cotizar envío» … o «recoger en tienda» …”.
 
+## Zone validation (S5, S8)
+
+When a quote comes back `zoneStatus: PENDING`, the customer gets the PENDING reply above and the bot registers them for the backend DELIVERY_ZONE decision (contract: `docs/contracts/delivery-zone-bot-cycle.md`). A staff user validates or denies the ZIP in the backend; the bot learns the outcome and tells the customer.
+
+**Flow**
+
+1. **Intake.** `MinimalShippingService` calls the zone intake with the same destination it quoted: the saved address fields, or the confirmed new/corrected fields (`municipality` falls back to `city`). The request is `POST /chatbot-api/human-decisions` with `type: "DELIVERY_ZONE"`, `X-Idempotency-Key` = `sourceRequestId`, the sender phone, `conversationRef = "wa:" + sender`, and `lastCustomerMessageAt` (provider time of the latest verified inbound, or now).
+   - One open requester per sender + ZIP. A repeated PENDING quote for that ZIP reuses the open requester and re-sends the stored body byte for byte, so the backend replays it instead of creating a new requester.
+   - An intake failure never changes the customer reply. A transient failure (network, 5xx, 429) is retried by the poller with the same `sourceRequestId`. A 400/404/409/422 closes the requester as `FAILED`.
+   - If the ZIP already has an active zone, the backend resolves the intake at once (`EXISTING_ZONE`). The bot stores it as resolved and the poller delivers it on its next tick, like any poll result.
+2. **Poll.** The poller runs on boot and every 60 s (`DeliveryZonePoller` option `intervalMs`). Each tick reads a batch of up to 20 due requesters from the database and calls `GET /chatbot-api/human-decisions/:id` with the requester id. A requester is polled at most once per minute during its first hour, then every 5 minutes. There is no time horizon: a validation can stay pending for days.
+3. **Notify.** On `RESOLVED` the bot sends exactly one message:
+   - **Inside the customer's 24 h WhatsApp window** (latest verified inbound less than 24 h old), it sends a text:
+     - `FREE`, `SURCHARGE` or `CARRIER_ONLY`: “¡Listo! Ya tenemos entrega a su código postal {CP}. Pídame de nuevo el envío y le muestro el costo actualizado.” The surcharge is not quoted, because the backend quote applies the product credit; only the new quote shows what the customer pays.
+     - `DENIED`: “Revisamos su código postal {CP} y por ahora no tenemos entrega ahí. Puede recoger su pedido en tienda sin costo de envío.”
+   - **Outside that window, or with no inbound evidence,** it sends the utility template `zona_entrega_revisada` (`es_MX`) with one body parameter, the ZIP.
+   - A stored PENDING-zone quote for that sender is then removed, so the next shipping request re-quotes.
+4. **ACK.** `POST /chatbot-api/human-decisions/:id/application-outcome`, with the same body as the RESTOCK ACK (the same client call):
+   - `PROVIDER_ACCEPTED` when Meta accepted the text or template before `applyBefore` (`resolvedAt + 24 h`).
+   - `DELIVERY_UNKNOWN` when the send failed (for example, the template is not approved yet) or the bot crashed mid-send.
+   - Acceptance after `applyBefore` is recorded locally as `PROVIDER_ACCEPTED_LATE` with no ACK, because the backend rejects ACKs outside the window.
+   - A transient ACK failure is retried on the next tick with the same `attemptId` and evidence. A 4xx closes the requester locally.
+
+**Durability.** Each requester is a row in `delivery_zone_requesters` (migration `3200000000000_delivery_zone_requesters.js`, required by preflight). The row holds the stored intake body, the requester id, the status, the last poll time, the resolution, and the delivery and ACK evidence. Status moves `INTAKE_PENDING → PENDING → RESOLVED → SEND_STARTED → NOTIFIED → CLOSED`, and every step is a status compare-and-set. `SEND_STARTED` is written before the provider call, so a restart never sends twice: a row found in `SEND_STARTED` is recorded as `DELIVERY_UNKNOWN`. A restart resumes from the table.
+
+**Template dependency.** The owner must create the utility template `zona_entrega_revisada` (`es_MX`, body “Hola, ya revisamos la entrega a su código postal {{1}}. Responda a este mensaje para continuar con su pedido.”) and Meta must approve it. Until then, late notices fail and are recorded once as `DELIVERY_UNKNOWN`. In-window texts are unaffected.
+
 ## Not ready for production
 
-- **Zone follow-up:** the bot says a `PENDING` zone is being validated, but learning the decision (DELIVERY_ZONE cycle) and re-quoting is task U7.
+- **Zone template:** late zone notices need the `zona_entrega_revisada` template approved by Meta (see Zone validation).
+- **Zone backend:** the DELIVERY_ZONE routes live on backend branch `feat/shipping-zones`, not yet in `main`.
 - Cart CAS and WhatsApp delivery are not one transaction; partial failures may require reconciliation.
 
 No live backend/WhatsApp calls are needed for validation:

@@ -35,6 +35,11 @@ import {
   type MinimalCartState,
 } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
+import {
+  DELIVERY_ZONE_INTAKE,
+  type DeliveryZoneIntakePort,
+  type DeliveryZoneIntakeRequest,
+} from '../../delivery-zones/application/delivery-zone-intake.service';
 
 export type MinimalShippingRefusal =
   | MinimalOrderIneligibleReason
@@ -140,6 +145,21 @@ function quoteDestination(
   ) as CreateShippingQuoteInput['destination'];
 }
 
+/** Zone validation destination: the same address the quote used (S5). */
+function zoneDestination(
+  senderId: string,
+  address: MinimalCheckoutDraftAddress,
+): DeliveryZoneIntakeRequest {
+  const f = address.kind === 'saved' ? address.snapshot : address.fields;
+  return {
+    senderId,
+    zipCode: f.zipCode,
+    state: f.state === null ? null : (toMexicanState(f.state) ?? f.state),
+    municipality: f.municipality ?? f.city,
+    neighborhood: f.neighborhood,
+  };
+}
+
 /**
  * One `createShippingQuote` call for the verified cart and confirmed
  * destination. The backend picks the carrier, computes the credit and signs
@@ -154,6 +174,8 @@ export class MinimalShippingService {
     private readonly checkout: MinimalCheckoutService,
     @Inject(CHATBOT_API_CLIENT)
     private readonly api: Pick<ChatbotApiClient, 'createShippingQuote'>,
+    @Inject(DELIVERY_ZONE_INTAKE)
+    private readonly zones: DeliveryZoneIntakePort,
     private readonly now: () => number = () => Date.now(),
   ) {}
 
@@ -232,8 +254,13 @@ export class MinimalShippingService {
       );
       if (!committed) return refuse('cart_changed');
       const zipCode = zipOf(draft.address);
-      if (shipping.zoneStatus === 'PENDING')
+      if (shipping.zoneStatus === 'PENDING') {
+        // Register for the DELIVERY_ZONE decision; never blocks the reply.
+        await this.zones
+          .register(zoneDestination(senderId, draft.address))
+          .catch(() => undefined);
         return { kind: 'zone_pending', zipCode };
+      }
       if (shipping.zoneStatus === 'DENIED')
         return { kind: 'zone_denied', zipCode };
       return {

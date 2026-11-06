@@ -82,6 +82,8 @@ export const REQUIRED_MIGRATIONS = [
   '2900000000000_expiration_application_ledger.js',
   '3000000000000_expiration_application_ack.js',
   '3100000000000_customer_inbound_observations.js',
+  // Durable DELIVERY_ZONE requesters (zone validation polling and notice).
+  '3200000000000_delivery_zone_requesters.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
@@ -101,6 +103,14 @@ export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
   ['POST', '/chatbot-api/sales/:saleId/receipts', 'sales:write'],
   ['PATCH', '/chatbot-api/sales/:saleId/delivery', 'sales:write'],
   ['GET', '/chatbot-api/customers/by-phone/:phone/orders', 'customers:read'],
+  // Human-decision bot cycle (RESTOCK, EXPIRATION and DELIVERY_ZONE).
+  ['POST', '/chatbot-api/human-decisions', 'human-decisions:create'],
+  ['GET', '/chatbot-api/human-decisions/:id', 'human-decisions:read'],
+  [
+    'POST',
+    '/chatbot-api/human-decisions/:id/application-outcome',
+    'human-decisions:ack',
+  ],
 ];
 
 const MANUAL_PREREQUISITES: readonly (readonly [string, string])[] = [

@@ -173,6 +173,7 @@ function setup(
     cart,
     checkout,
     new FakeShippingQuoteClient(),
+    { register: async () => undefined },
   );
   const order = new MinimalOrderService(
     client,

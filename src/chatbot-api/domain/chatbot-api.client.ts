@@ -9,6 +9,10 @@ import type { ExpirationIntakeInput } from './dtos/human-decisions-expiration.dt
 import type { ExpirationIntakeReceipt } from './dtos/human-decisions-expiration-receipt.dto';
 import type { ExpirationDecision } from './dtos/human-decisions-expiration-decision.dto';
 import type {
+  DeliveryZoneIntakeInput,
+  DeliveryZoneRequester,
+} from './dtos/human-decisions-delivery-zone.dto';
+import type {
   RestockApplicationOutcomeAck,
   RestockApplicationOutcomeRequest,
   RestockDecision,
@@ -151,4 +155,16 @@ export interface ChatbotApiClient {
     decisionId: string,
     request: RestockApplicationOutcomeRequest,
   ): Promise<RestockApplicationOutcomeAck>;
+  /** DELIVERY_ZONE intake: `POST /chatbot-api/human-decisions` with `type:
+   *  "DELIVERY_ZONE"` (scope `human-decisions:create`) and `X-Idempotency-Key`
+   *  = `sourceRequestId`. Single attempt; resolves on `201`/`200` with the
+   *  current requester state (PENDING, or RESOLVED for EXISTING_ZONE). The ACK
+   *  is identical to RESTOCK: use `recordRestockApplicationOutcome` with the
+   *  requester id. */
+  submitDeliveryZoneIntake(
+    dto: DeliveryZoneIntakeInput,
+  ): Promise<DeliveryZoneRequester>;
+  /** DELIVERY_ZONE poll: `GET /chatbot-api/human-decisions/:id` by requester id
+   *  (scope `human-decisions:read`), safe GET retry policy. */
+  getDeliveryZoneRequester(requesterId: string): Promise<DeliveryZoneRequester>;
 }

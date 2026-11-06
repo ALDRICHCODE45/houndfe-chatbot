@@ -85,7 +85,7 @@ async function setup(options: { absent?: boolean; free?: boolean; unconfirmed?: 
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
   const quotes = new FakeShippingQuoteClient();
-  const shipping = new MinimalShippingService(store, cart, checkout, quotes);
+  const shipping = new MinimalShippingService(store, cart, checkout, quotes, { register: async () => undefined });
   const order = new MinimalOrderService(client, store, cart, checkout, config, shipping);
   let script: unknown[] = [];
   const seen: Array<{ tools?: Record<string, unknown>; system?: unknown }> = [];

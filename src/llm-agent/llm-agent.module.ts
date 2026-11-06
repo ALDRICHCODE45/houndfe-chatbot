@@ -38,6 +38,11 @@ import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
 import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
+import { DeliveryZonesModule } from '../delivery-zones/delivery-zones.module';
+import {
+  DELIVERY_ZONE_INTAKE,
+  type DeliveryZoneIntakePort,
+} from '../delivery-zones/application/delivery-zone-intake.service';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
@@ -87,6 +92,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     // RESTOCK markers/coordinator/recovery seams are visible for the bounded
     // confirmation service factory. Nest de-duplicates the shared instance.
     HumanDecisionsModule,
+    // S5: PENDING zones register a DELIVERY_ZONE requester (always on).
+    DeliveryZonesModule,
   ],
   providers: [
     {
@@ -147,13 +154,15 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         MinimalCartService,
         MinimalCheckoutService,
         CHATBOT_API_CLIENT,
+        DELIVERY_ZONE_INTAKE,
       ],
       useFactory: (
         store: ConversationStore,
         cart: MinimalCartService,
         checkout: MinimalCheckoutService,
         api: ChatbotApiClient,
-      ) => new MinimalShippingService(store, cart, checkout, api),
+        zones: DeliveryZoneIntakePort,
+      ) => new MinimalShippingService(store, cart, checkout, api, zones),
     },
     {
       provide: MinimalExpirationRequestService,

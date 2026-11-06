@@ -170,6 +170,12 @@ describe('runLaunchPreflight', () => {
     ).toBe(false);
   });
 
+  it('requires the DELIVERY_ZONE requester migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain(
+      '3200000000000_delivery_zone_requesters.js',
+    );
+  });
+
   it('fails when a human-decision migration is absent from disk', () => {
     const name = '3100000000000_customer_inbound_observations.js';
     const report = run(
@@ -197,7 +203,18 @@ describe('runLaunchPreflight', () => {
         }),
       ),
     );
-    expect(first.clientRoutes).toHaveLength(14);
+    expect(first.clientRoutes).toHaveLength(17);
+    expect(CLIENT_ROUTES).toEqual(
+      expect.arrayContaining([
+        ['POST', '/chatbot-api/human-decisions', 'human-decisions:create'],
+        ['GET', '/chatbot-api/human-decisions/:id', 'human-decisions:read'],
+        [
+          'POST',
+          '/chatbot-api/human-decisions/:id/application-outcome',
+          'human-decisions:ack',
+        ],
+      ]),
+    );
     expect(first.manualChecks.map((c: { id: string }) => c.id)).toEqual([
       'backend_reachable',
       'bot_cashier_user',

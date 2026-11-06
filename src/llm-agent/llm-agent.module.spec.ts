@@ -19,6 +19,7 @@ import { PostgresConversationStore } from '../conversation/infrastructure/postgr
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { LLM_AGENT_SYSTEM_PROMPT, SYSTEM_PROMPT } from './domain/system-prompt';
 import { SALE_FLOW_INSTRUCTIONS } from '../sale-flow/domain/sale-flow-instructions';
+import { DELIVERY_ZONE_INTAKE } from '../delivery-zones/application/delivery-zone-intake.service';
 import { LlmAgentModule } from './llm-agent.module';
 import { LLM_AGENT, type LlmAgentPort } from './domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
@@ -119,9 +120,16 @@ describe('LlmAgentModule integration', () => {
     )!;
     expect(factory.inject).toContain(CHATBOT_API_CLIENT);
     expect(factory.inject).not.toContain(ConfigService);
+    expect(factory.inject).toContain(DELIVERY_ZONE_INTAKE);
     const create = factory.useFactory as (...args: unknown[]) => unknown;
     expect(
-      create({}, {}, {}, { createShippingQuote: jest.fn() }),
+      create(
+        {},
+        {},
+        {},
+        { createShippingQuote: jest.fn() },
+        { register: jest.fn() },
+      ),
     ).toBeInstanceOf(MinimalShippingService);
   });
 

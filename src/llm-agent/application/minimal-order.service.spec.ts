@@ -182,7 +182,9 @@ function setup(
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
   const quotes = new FakeShippingQuoteClient();
-  const shipping = new MinimalShippingService(store, cart, checkout, quotes);
+  const shipping = new MinimalShippingService(store, cart, checkout, quotes, {
+    register: async () => undefined,
+  });
   const order = new MinimalOrderService(
     client,
     store,

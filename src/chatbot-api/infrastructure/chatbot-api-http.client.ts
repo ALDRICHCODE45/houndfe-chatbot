@@ -72,6 +72,12 @@ import {
   type ExpirationIntakeReceipt,
 } from '../domain/dtos/human-decisions-expiration-receipt.dto';
 import {
+  normalizeDeliveryZoneIntake,
+  normalizeDeliveryZoneRequester,
+  type DeliveryZoneIntakeInput,
+  type DeliveryZoneRequester,
+} from '../domain/dtos/human-decisions-delivery-zone.dto';
+import {
   normalizeRestockApplicationOutcome,
   normalizeRestockApplicationOutcomeAck,
   normalizeRestockDecision,
@@ -637,6 +643,86 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     }
 
     return ack;
+  }
+
+  /**
+   * DELIVERY_ZONE intake (docs/contracts/delivery-zone-bot-cycle.md §4.1).
+   * The exact ten-key body is normalized before any request and
+   * `X-Idempotency-Key` equals `sourceRequestId`. Exactly one POST (no retry:
+   * a replay is the caller's choice under the same key); only a `201`/`200`
+   * requester bound to the sent `sourceRequestId` resolves.
+   */
+  async submitDeliveryZoneIntake(
+    dto: DeliveryZoneIntakeInput,
+  ): Promise<DeliveryZoneRequester> {
+    const sent = normalizeDeliveryZoneIntake(dto);
+    if (sent === null) {
+      throw new ChatbotApiError(
+        'DELIVERY_ZONE intake DTO failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>({
+      method: 'POST',
+      url: '/chatbot-api/human-decisions',
+      data: sent,
+      headers: { 'X-Idempotency-Key': sent.sourceRequestId },
+    });
+    const body = response.data;
+    const requester = normalizeDeliveryZoneRequester(body);
+    if (
+      (response.status !== 201 && response.status !== 200) ||
+      requester === null ||
+      requester.sourceRequestId.toLowerCase() !==
+        sent.sourceRequestId.toLowerCase()
+    ) {
+      throw new UpstreamError(
+        'Chatbot API DELIVERY_ZONE intake response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return requester;
+  }
+
+  /** DELIVERY_ZONE poll by requester id (§4.2): UUID-validated before any
+   * request, safe GET retry policy, HTTP 200 bound to the requested id. */
+  async getDeliveryZoneRequester(
+    requesterId: string,
+  ): Promise<DeliveryZoneRequester> {
+    if (!DECISION_ID_UUID.test(requesterId)) {
+      throw new ChatbotApiError(
+        'DELIVERY_ZONE requester id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: `/chatbot-api/human-decisions/${encodeURIComponent(requesterId)}`,
+      },
+      { retryable: true },
+    );
+    const body = response.data;
+    const requester = normalizeDeliveryZoneRequester(body);
+    if (
+      response.status !== 200 ||
+      requester === null ||
+      requester.id.toLowerCase() !== requesterId.toLowerCase()
+    ) {
+      throw new UpstreamError(
+        'Chatbot API DELIVERY_ZONE poll response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return requester;
   }
 
   /**
