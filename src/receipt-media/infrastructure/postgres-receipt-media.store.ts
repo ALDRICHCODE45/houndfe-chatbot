@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Logger } from '@nestjs/common';
 import type { Pool, PoolClient } from 'pg';
 import type {
   ReceiptMediaOutboxRow,
@@ -18,6 +19,7 @@ import type {
   ReservationOutcome,
   ReserveInput,
   RejectedMediaInput,
+  StorageAttemptInput,
   UploadCommitOutcome,
   UploadDefiniteFailureInput,
   UploadSuccessInput,
@@ -57,6 +59,7 @@ const META_ATTEMPT_SQL = `UPDATE receipt_media
 
 const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
    SET storage_attempts = storage_attempts + 1, version = version + 1,
+     upload_fields = COALESCE(upload_fields, $4::jsonb),
      updated_at = now() WHERE id = $1 AND lease_owner = $2
      AND version = $3::bigint AND lease_expires_at > now()
      AND status = 'DOWNLOADED' AND storage_attempts < ${MAX_UPLOAD_ATTEMPTS}
@@ -387,9 +390,8 @@ const uploadRetryDelayMs = (attempt: number): number => {
   return base + Math.floor(Math.random() * (base * 0.1 + 1));
 };
 
-const UPLOAD_DEFINITE_STATUSES = new Set([
-  400, 401, 403, 404, 409, 413, 415, 422, 429,
-]);
+/** 401/403/429 are retryable unknown outcomes (migration 3600). */
+const UPLOAD_DEFINITE_STATUSES = new Set([400, 404, 409, 413, 415, 422]);
 const UPLOAD_DEFINITE_TEMPLATES = new Set<string>([
   'RECEIPT_SALE_ALREADY_PAID',
   'RECEIPT_SALE_NOT_PAYABLE',
@@ -403,6 +405,8 @@ const REJECTED_MEDIA_TEMPLATES = {
 /** Safe, bounded evidence code: an allowlisted shape, never a body. */
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const MAX_FOLIO_LENGTH = 40;
+/** Transport code of an accepted upload whose receipt id fails validation. */
+const RECEIPT_ID_INVALID = 'RECEIPT_ID_INVALID';
 
 const isUploadFence = (input: LeaseFenceInput): boolean =>
   typeof input?.id === 'string' &&
@@ -493,6 +497,8 @@ const isOutcomeCommit = (input: ReceiptOutcomeCommitInput): boolean => {
 export class PostgresReceiptMediaStore
   implements ReceiptMediaStorePort, ReceiptOutcomeStore
 {
+  private readonly logger = new Logger(PostgresReceiptMediaStore.name);
+
   constructor(private readonly pool: Pool) {}
 
   private async withTx<T>(fn: (c: PoolClient) => Promise<T>): Promise<T> {
@@ -880,12 +886,14 @@ export class PostgresReceiptMediaStore
   private async startAttempt(
     sql: string,
     input: LeaseFenceInput,
+    extra: unknown[] = [],
   ): Promise<AttemptStartResult | null> {
     return this.withTx(async (c) => {
       const { rows, rowCount } = await c.query<Row>(sql, [
         input.id,
         input.owner,
         input.expectedVersion,
+        ...extra,
       ]);
       return rowCount === 1
         ? {
@@ -896,17 +904,21 @@ export class PostgresReceiptMediaStore
     });
   }
 
-  /** R2: DOWNLOADED → ATTACHED plus the received/in-review intent. */
+  /** R2: DOWNLOADED → ATTACHED plus the received/in-review intent. The
+   * backend accepted the file, so a receipt id we cannot validate is never
+   * fenced (the row would sit DOWNLOADED): it is recorded as a terminal
+   * ATTACH_OUTCOME_UNKNOWN (`RECEIPT_ID_INVALID`) with the once-only
+   * "registering" intent, for reconciliation against the backend. */
   async commitUploadSuccess(
     input: UploadSuccessInput,
   ): Promise<UploadCommitOutcome> {
-    if (
-      !isUploadFence(input) ||
-      typeof input.backendReceiptId !== 'string' ||
-      !UUID.test(input.backendReceiptId.toLowerCase()) ||
-      !isUploadTemplateArgs(input.templateArgs)
-    )
+    if (!isUploadFence(input) || !isUploadTemplateArgs(input.templateArgs))
       return { kind: 'fenced' };
+    if (
+      typeof input.backendReceiptId !== 'string' ||
+      !UUID.test(input.backendReceiptId.toLowerCase())
+    )
+      return this.commitInvalidReceiptId(input);
     return this.uploadTx(input, async (c, locked) => {
       const receipt = await this.uploadUpdate(c, UPLOAD_SUCCESS_SQL, input, [
         input.backendReceiptId.toLowerCase(),
@@ -922,6 +934,37 @@ export class PostgresReceiptMediaStore
           `receipt-upload-received:${input.id}`,
           'RECEIPT_ATTACHED_PENDING',
           input.templateArgs,
+        ),
+      };
+    });
+  }
+
+  private async commitInvalidReceiptId(
+    input: UploadSuccessInput,
+  ): Promise<UploadCommitOutcome> {
+    const id: unknown = input.backendReceiptId;
+    // Only the shape: the value itself is never logged.
+    this.logger.warn(
+      `receipt ${input.id}: backend accepted the upload with an invalid receiptId (type=${typeof id}, length=${typeof id === 'string' ? id.length : 'n/a'}); recorded as ATTACH_OUTCOME_UNKNOWN`,
+    );
+    return this.uploadTx(input, async (c, locked) => {
+      const receipt = await this.uploadUpdate(
+        c,
+        UPLOAD_UNKNOWN_TERMINAL_SQL,
+        input,
+        [null, RECEIPT_ID_INVALID, RECEIPT_ID_INVALID],
+      );
+      return {
+        kind: 'committed',
+        attempt: locked.storage_attempts as number,
+        receipt: camelize<Media>(receipt),
+        intent: await this.uploadIntent(
+          c,
+          receipt,
+          `receipt-upload-unknown:${input.id}`,
+          'RECEIPT_ATTACH_UNKNOWN',
+          {},
+          true,
         ),
       };
     });
@@ -1129,10 +1172,16 @@ export class PostgresReceiptMediaStore
     return this.startAttempt(META_ATTEMPT_SQL, input);
   }
 
+  /** The first attempt's upload fields win: later starts never replace
+   * them. */
   async startStorageAttempt(
-    input: LeaseFenceInput,
+    input: StorageAttemptInput,
   ): Promise<AttemptStartResult | null> {
-    return this.startAttempt(STORAGE_ATTEMPT_SQL, input);
+    const fields = input.uploadFields;
+    if (fields !== undefined && !isRecord(fields)) return null;
+    return this.startAttempt(STORAGE_ATTEMPT_SQL, input, [
+      fields === undefined ? null : JSON.stringify(fields),
+    ]);
   }
 
   /** R5: due ATTACHED receipts awaiting their human outcome. */

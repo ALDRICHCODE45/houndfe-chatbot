@@ -7,9 +7,12 @@
  * DOWNLOADED pass: a same-key retry of an unknown upload outcome; the file is
  * downloaded again under the upload attempt fence (`storage_attempts`), so a
  * failed re-download is one more unknown attempt, never a Meta exhaustion.
+ * The retry sends the upload fields persisted by the first attempt and never
+ * runs the extraction again (no drift under one idempotency key).
  * The lease (60 s) is renewed while the extraction and the upload (up to
  * 90 s for a PDF) run. The bot never confirms or rejects a payment (S1). */
 import { promises as fs } from 'node:fs';
+import type { ReceiptUploadFields } from '../../chatbot-api/domain/dtos/receipt-upload.dto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import {
   MetaMediaError,
@@ -30,9 +33,10 @@ import {
 } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 import { isEncryptedPdf } from '../infrastructure/media-structure.validator';
-import type {
-  ReceiptAttachmentService,
-  UploadReport,
+import {
+  toUploadFields,
+  type ReceiptAttachmentService,
+  type UploadReport,
 } from './receipt-attachment.service';
 
 export type ReceiptIngestionOutcome =
@@ -153,18 +157,14 @@ export class ReceiptIngestionProcessor {
         const extraction = await this.extract(bytes, file, order);
         if (extraction.kind === 'not_receipt')
           return this.reject(fence, 'NOT_A_RECEIPT');
-        const attempt = await this.store.startStorageAttempt({ ...fence });
+        const fields = toUploadFields(receipt, extraction);
+        const attempt = await this.store.startStorageAttempt({
+          ...fence,
+          uploadFields: fields,
+        });
         if (attempt === null) return { kind: 'blocked', stage: 'upload' };
         fence.expectedVersion = attempt.version;
-        return this.upload(
-          receipt,
-          fence,
-          file,
-          bytes,
-          extraction,
-          order,
-          signal,
-        );
+        return this.upload(receipt, fence, file, bytes, fields, order, signal);
       });
     });
   }
@@ -206,21 +206,12 @@ export class ReceiptIngestionProcessor {
       return this.withFile(file, async () => {
         const bytes = await this.readFile(file.filePath);
         const order = await this.orderOf(receipt);
-        const extraction = await this.extract(bytes, file, order);
-        // The first pass already decided to submit this file.
-        const submitted: ReceiptExtraction =
-          extraction.kind === 'not_receipt'
-            ? { kind: 'unavailable', reason: 'error' }
-            : extraction;
-        return this.upload(
-          receipt,
-          fence,
-          file,
-          bytes,
-          submitted,
-          order,
-          signal,
-        );
+        // The first attempt's exact fields; never a second extraction. A
+        // row started before migration 3600 sends its declared data only.
+        const fields =
+          receipt.uploadFields ??
+          toUploadFields(receipt, { kind: 'unavailable', reason: 'error' });
+        return this.upload(receipt, fence, file, bytes, fields, order, signal);
       });
     });
   }
@@ -241,7 +232,7 @@ export class ReceiptIngestionProcessor {
     fence: LeaseFenceInput,
     file: ValidatedMediaFile,
     bytes: Buffer,
-    extraction: ReceiptExtraction,
+    fields: ReceiptUploadFields,
     order: PlacedOrder | null,
     signal: AbortSignal,
   ): Promise<ReceiptIngestionOutcome> {
@@ -249,7 +240,7 @@ export class ReceiptIngestionProcessor {
       receipt,
       fence: { ...fence },
       file: { bytes, mimeType: file.mimeType },
-      extraction,
+      fields,
       order,
       signal,
     });

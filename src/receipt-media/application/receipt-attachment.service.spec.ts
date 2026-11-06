@@ -15,6 +15,7 @@ import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   ReceiptAttachmentService,
+  toUploadFields,
   type UploadInvocation,
 } from './receipt-attachment.service';
 
@@ -94,13 +95,17 @@ const extracted = (
   ...overrides,
 });
 
-const invocation = (
-  overrides: Partial<UploadInvocation> = {},
-): UploadInvocation => ({
-  receipt,
+/** Fields as the first attempt computes them from an extraction. */
+const invocation = ({
+  extraction = extracted(),
+  ...overrides
+}: Partial<UploadInvocation> & {
+  extraction?: ReceiptExtraction;
+} = {}): UploadInvocation => ({
+  receipt: overrides.receipt ?? receipt,
   fence: FENCE,
   file: { bytes: BYTES, mimeType: 'image/jpeg' },
-  extraction: extracted(),
+  fields: toUploadFields(overrides.receipt ?? receipt, extraction),
   order: { saleId: SALE_ID, totalCents: 150000, folio: 'F-0042' },
   ...overrides,
 });
@@ -193,6 +198,18 @@ describe('ReceiptAttachmentService.upload (R2)', () => {
     });
   });
 
+  it('sends persisted retry fields unchanged and derives the mismatch from them', async () => {
+    const { service, client, store } = fixture();
+    const fields = { extracted: { amountCents: 140000, confidence: 0.6 } };
+    await service.upload(invocation({ fields }));
+    expect(client.uploadReceipt.mock.calls[0][2]).toBe(fields);
+    expect(store.commitUploadSuccess.mock.calls[0][0].templateArgs).toEqual({
+      folio: 'F-0042',
+      extractedAmountCents: 140000,
+      totalCents: 150000,
+    });
+  });
+
   it('omits the folio when the order does not carry one', async () => {
     const { service, store } = fixture();
     await service.upload(
@@ -240,7 +257,7 @@ describe('ReceiptAttachmentService.upload (R2)', () => {
       RECEIPT_UPLOAD_ERROR.INVALID_IDEMPOTENCY_KEY,
       'RECEIPT_ATTACH_DEFINITE_FAILURE',
     ],
-    [403, null, 'RECEIPT_ATTACH_DEFINITE_FAILURE'],
+    [422, null, 'RECEIPT_ATTACH_DEFINITE_FAILURE'],
   ] as const)(
     'commits HTTP %i %s as a definite refusal with %s',
     async (httpStatus, errorCode, templateKey) => {
@@ -283,6 +300,22 @@ describe('ReceiptAttachmentService.upload (R2)', () => {
       'an invalid 201 body',
       new UpstreamError('invalid', 201, {}, null),
       { httpStatus: null, transportCode: 'RESPONSE_INVALID' },
+    ],
+    // Rate limiting and credential/config problems are fixable: retried.
+    [
+      'a 429 rate limit',
+      new ChatbotApiError('rate limited', 429, {}, null),
+      { httpStatus: 429, transportCode: null },
+    ],
+    [
+      'a 401',
+      new ChatbotApiError('unauthorized', 401, {}, null),
+      { httpStatus: 401, transportCode: null },
+    ],
+    [
+      'a 403',
+      new ChatbotApiError('forbidden', 403, {}, null),
+      { httpStatus: 403, transportCode: null },
     ],
     [
       'an unexpected error',

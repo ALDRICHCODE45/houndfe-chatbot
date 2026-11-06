@@ -156,17 +156,23 @@ as multipart to `POST /chatbot-api/sales/:saleId/receipts` with
 `docs/contracts/transfer-receipts.md`). The upload has a 90 s HTTP timeout and
 the worker renews its 60 s lease while it runs.
 
-| Backend answer                                                          | Durable result               | Customer message                                                        |
-| ----------------------------------------------------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
-| 201                                                                     | `ATTACHED`                   | received + in review, with the folio (and the amount mismatch sentence) |
-| 409 `SALE_ALREADY_PAID`                                                 | `FAILED` / `ATTACH_DEFINITE` | the order is already paid                                               |
-| 409 `SALE_NOT_PAYABLE`                                                  | `FAILED` / `ATTACH_DEFINITE` | the order no longer accepts payments                                    |
-| 413 / 415                                                               | `FAILED` / `ATTACH_DEFINITE` | send a JPEG, PNG or PDF under 10 MB                                     |
-| other 400/401/403/404/409/422/429                                       | `FAILED` / `ATTACH_DEFINITE` | generic "write to us"                                                   |
-| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201 | stays `DOWNLOADED`, retried  | "registering" message, once                                             |
+| Backend answer                                                                                                                                   | Durable result                                                                  | Customer message                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| 201                                                                                                                                              | `ATTACHED`                                                                      | received + in review, with the folio (and the amount mismatch sentence) |
+| 409 `SALE_ALREADY_PAID`                                                                                                                          | `FAILED` / `ATTACH_DEFINITE`                                                    | the order is already paid                                               |
+| 409 `SALE_NOT_PAYABLE`                                                                                                                           | `FAILED` / `ATTACH_DEFINITE`                                                    | the order no longer accepts payments                                    |
+| 413 / 415                                                                                                                                        | `FAILED` / `ATTACH_DEFINITE`                                                    | send a JPEG, PNG or PDF under 10 MB                                     |
+| other 400/404/409/422                                                                                                                            | `FAILED` / `ATTACH_DEFINITE`                                                    | generic "write to us"                                                   |
+| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201, 429 (rate limit), 401/403 (credential or scope, fixable by an operator) | stays `DOWNLOADED`, retried                                                     | "registering" message, once                                             |
+| 201 whose `receiptId` is not a UUID                                                                                                              | `ATTACH_OUTCOME_UNKNOWN` (`RECEIPT_ID_INVALID`), terminal, logged by shape only | "registering" message, once                                             |
 
 An unknown outcome is safe to retry because the key is the media id: the
-backend returns the same receipt for the same key and file. The store schedules
+backend returns the same receipt for the same key and file. The first attempt
+stores its exact declared/extracted fields (`upload_fields`, migration 3600)
+and every retry sends them again without running the vision extraction, so one
+key never carries different fields. A persistent 401/403 exhausts the attempts
+like any unknown outcome: fix the credential, then reconcile the
+`ATTACH_OUTCOME_UNKNOWN` rows. The store schedules
 up to 6 attempts (backoff 30 s, 2, 5, 10, 15 min, about 32 min in total) and
 then sets `ATTACH_OUTCOME_UNKNOWN`. Such a row may still exist in the backend;
 reconcile it against the backend before any manual action.

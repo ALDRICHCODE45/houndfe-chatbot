@@ -1,6 +1,7 @@
 /** WU2B2A store port (RM1, RM3): reservation, claim/lease and bounded
  * attempt primitives; R2 adds the backend upload commits. Conflicts/lost
  * fences return as values (false/null), never thrown. */
+import type { ReceiptUploadFields } from '../../chatbot-api/domain/dtos/receipt-upload.dto';
 import type {
   MetaMediaErrorCategory,
   MetaMediaErrorCode,
@@ -111,6 +112,13 @@ export type DownloadCommitOutcome = {
 export interface AttemptStartResult {
   attempt: number;
   version: string;
+}
+
+/** Upload attempt start; the first attempt persists the exact upload fields
+ * (kept as-is by later starts) so a retry never re-extracts (no drift under
+ * one idempotency key). */
+export interface StorageAttemptInput extends LeaseFenceInput {
+  uploadFields?: ReceiptUploadFields;
 }
 
 /** R2 backend upload attempts per receipt (`storage_attempts`), all under
@@ -226,6 +234,6 @@ export interface ReceiptMediaStorePort {
   /** Atomic pre-call backend upload attempt start (max
    * `MAX_UPLOAD_ATTEMPTS`); loser null. */
   startStorageAttempt(
-    input: LeaseFenceInput,
+    input: StorageAttemptInput,
   ): Promise<AttemptStartResult | null>;
 }

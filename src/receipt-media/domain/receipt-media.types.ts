@@ -7,6 +7,8 @@
  * category/code pairs.
  */
 
+import type { ReceiptUploadFields } from '../../chatbot-api/domain/dtos/receipt-upload.dto';
+
 export const RECEIPT_MAX_BYTES = 10_485_760;
 export const RECEIPT_SHA256_BYTES = 32;
 
@@ -117,6 +119,9 @@ export interface ReceiptMediaRow {
   outcomePolledAt: Date | null;
   outcomeNotifiedAt: Date | null;
   outcomeDelivery: 'QUEUED' | 'OUTSIDE_WINDOW' | null;
+  /** The exact upload fields of the first backend upload attempt, reused
+   * by every same-key retry (migration 3600); null before it starts. */
+  uploadFields: ReceiptUploadFields | null;
 }
 
 /** Durable `receipt_media_outbox` row: committed deterministic intents only. */

@@ -102,6 +102,24 @@ export function toReceiptUploadForm(
   if (declared?.reference !== undefined)
     form.append('declaredReference', declared.reference);
   if (extracted !== undefined && Object.keys(extracted).length > 0)
-    form.append('extracted', JSON.stringify(extracted));
+    form.append('extracted', serializeExtracted(extracted));
   return form;
+}
+
+const EXTRACTED_KEYS = [
+  'amountCents',
+  'date',
+  'reference',
+  'bank',
+  'confidence',
+] as const satisfies readonly (keyof ReceiptUploadExtracted)[];
+
+/** Fixed key order: a retry re-sends fields read back from jsonb (which
+ * reorders keys) byte-identical to the first attempt. */
+function serializeExtracted(extracted: ReceiptUploadExtracted): string {
+  const ordered: ReceiptUploadExtracted = {};
+  for (const key of EXTRACTED_KEYS)
+    if (extracted[key] !== undefined)
+      (ordered as Record<string, unknown>)[key] = extracted[key];
+  return JSON.stringify(ordered);
 }

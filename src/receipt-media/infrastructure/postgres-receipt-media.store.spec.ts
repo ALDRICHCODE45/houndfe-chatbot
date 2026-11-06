@@ -122,6 +122,7 @@ reconciled_by text YES sale_folio text YES outcome_status text YES
 outcome_reason text YES outcome_debt_cents bigint YES
 outcome_observed_at timestamptz YES outcome_polled_at timestamptz YES
 outcome_notified_at timestamptz YES outcome_delivery text YES
+upload_fields jsonb YES
 `;
 
 const RECEIPT_MEDIA_OUTBOX_COLUMNS = `
@@ -600,8 +601,8 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     for (const fragment of not) expect(def).not.toContain(fragment);
   });
 
-  // R3: the chain ends at the irreversible 3500 (receipt media backend
-  // only, `exports.down = false`, like 3300 and 3400), so the first
+  // The chain ends at the irreversible 3600 (receipt media upload fields,
+  // `exports.down = false`, like 3300 through 3500), so the first
   // single-step down already refuses and the tables stay in place.
   const tryMigrateDown = (): string => {
     try {
@@ -621,7 +622,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
     await pool.query(insertSql(table, row), Object.values(row));
     expect(tryMigrateDown()).toMatch(
-      /disabled down migration on file: 3500000000000_receipt_media_backend_only/,
+      /disabled down migration on file: 3600000000000_receipt_media_upload_fields/,
     );
     const { rows } = await pool.query<{ a: boolean; b: boolean }>(
       "SELECT to_regclass('receipt_media') IS NOT NULL AS a, " +

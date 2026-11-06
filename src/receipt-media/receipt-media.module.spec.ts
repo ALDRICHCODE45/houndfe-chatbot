@@ -25,7 +25,10 @@ import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
-import { ReceiptAttachmentService } from './application/receipt-attachment.service';
+import {
+  ReceiptAttachmentService,
+  toUploadFields,
+} from './application/receipt-attachment.service';
 import { CostGuardService } from '../llm-agent/application/cost-guard.service';
 import { GENERATE_TEXT } from '../llm-agent/infrastructure/generate-text.provider';
 import { LlmCoreModule } from '../llm-agent/infrastructure/llm-core.module';
@@ -637,7 +640,10 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
             expectedVersion: '7',
           },
           file: { bytes: Buffer.from('img'), mimeType: 'image/jpeg' },
-          extraction,
+          fields: toUploadFields(
+            { declaredAmountCents: null } as ReceiptMediaRow,
+            extraction,
+          ),
           order: null,
         });
         expect(report.kind).toBe('uploaded');

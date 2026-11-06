@@ -189,12 +189,13 @@ describe('ReceiptIngestionProcessor (R2: download → extract → backend upload
       id: RECEIPT_ID,
       owner: OWNER,
       expectedVersion: '5',
+      uploadFields: { extracted: { amountCents: 150000, confidence: 0.9 } },
     });
     expect(f.upload).toHaveBeenCalledWith(
       expect.objectContaining({
         fence: { id: RECEIPT_ID, owner: OWNER, expectedVersion: '6' },
         file: { bytes: JPEG, mimeType: 'image/jpeg' },
-        extraction: receiptExtraction,
+        fields: { extracted: { amountCents: 150000, confidence: 0.9 } },
         order: { saleId: SALE_ID, folio: 'F-7', totalCents: 150000 },
       }),
     );
@@ -246,7 +247,7 @@ describe('ReceiptIngestionProcessor (R2: download → extract → backend upload
     };
     const f = fixture({ extraction: unavailable });
     await f.processor.process(row(), OWNER);
-    expect(f.upload.mock.calls[0][0].extraction).toEqual(unavailable);
+    expect(f.upload.mock.calls[0][0].fields).toEqual({});
   });
 
   it('extracts without an expected amount when the placed order is another sale', async () => {
@@ -292,6 +293,65 @@ describe('ReceiptIngestionProcessor (R2: download → extract → backend upload
     });
     expect(f.resolveAndDownload).toHaveBeenCalledTimes(1);
     expect(f.upload.mock.calls[0][0].fence.expectedVersion).toBe('10');
+  });
+
+  it('persists the first-attempt upload fields with the attempt start', async () => {
+    const f = fixture();
+    await f.processor.process(row({ declaredAmountCents: 99900 }), OWNER);
+    const fields = {
+      declared: { amountCents: 99900 },
+      extracted: { amountCents: 150000, confidence: 0.9 },
+    };
+    expect(f.store.startStorageAttempt).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '5',
+      uploadFields: fields,
+    });
+    expect(f.upload.mock.calls[0][0].fields).toEqual(fields);
+  });
+
+  it('reuses the persisted upload fields on a retry without extracting again', async () => {
+    const persisted = {
+      declared: { amountCents: 99900 },
+      extracted: { amountCents: 140000, bank: 'BBVA', confidence: 0.6 },
+    };
+    const f = fixture({ extraction: { kind: 'not_receipt' } });
+    await f.processor.process(
+      row({
+        status: 'DOWNLOADED',
+        version: '9',
+        storageAttempts: 1,
+        declaredAmountCents: 99900,
+        uploadFields: persisted,
+      }),
+      OWNER,
+    );
+    expect(f.extract).not.toHaveBeenCalled();
+    expect(f.store.startStorageAttempt).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '9',
+    });
+    expect(f.upload.mock.calls[0][0].fields).toBe(persisted);
+  });
+
+  it('retries a row without persisted fields with the declared data only', async () => {
+    const f = fixture();
+    await f.processor.process(
+      row({
+        status: 'DOWNLOADED',
+        version: '9',
+        storageAttempts: 1,
+        declaredAmountCents: 99900,
+        uploadFields: null,
+      }),
+      OWNER,
+    );
+    expect(f.extract).not.toHaveBeenCalled();
+    expect(f.upload.mock.calls[0][0].fields).toEqual({
+      declared: { amountCents: 99900 },
+    });
   });
 
   it('treats a failed re-download as one more unknown upload attempt', async () => {

@@ -211,6 +211,109 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
     ]);
   });
 
+  it.each([429, 401, 403])(
+    'retries HTTP %i as an unknown outcome and terminalizes it at the cap',
+    async (httpStatus) => {
+      const { id, fence } = await downloaded();
+      await expect(
+        store.commitUploadDefiniteFailure({
+          ...fence,
+          httpStatus,
+          errorCode: null,
+          templateKey: 'RECEIPT_ATTACH_DEFINITE_FAILURE',
+          templateArgs: {},
+        }),
+      ).resolves.toEqual({ kind: 'fenced' });
+      await expect(
+        store.commitUploadUnknown({
+          ...fence,
+          httpStatus,
+          transportCode: null,
+        }),
+      ).resolves.toMatchObject({
+        kind: 'retry-scheduled',
+        receipt: { status: 'DOWNLOADED', lastErrorCode: `HTTP_${httpStatus}` },
+        intent: { templateKey: 'RECEIPT_ATTACH_UNKNOWN' },
+      });
+      // The schema admits the status as unknown evidence at the cap.
+      await pool.query(
+        `UPDATE receipt_media SET next_attempt_at = now(),
+           storage_attempts = $2 - 1 WHERE id = $1`,
+        [id, MAX_UPLOAD_ATTEMPTS],
+      );
+      const [claimed] = await store.claimBatch(1, OWNER);
+      const start = await store.startStorageAttempt({
+        id,
+        owner: OWNER,
+        expectedVersion: claimed.version,
+      });
+      await expect(
+        store.commitUploadUnknown({
+          id,
+          owner: OWNER,
+          expectedVersion: start!.version,
+          httpStatus,
+          transportCode: null,
+        }),
+      ).resolves.toMatchObject({
+        kind: 'committed',
+        receipt: {
+          status: 'ATTACH_OUTCOME_UNKNOWN',
+          attachHttpStatus: httpStatus,
+        },
+        intent: null,
+      });
+    },
+  );
+
+  it('keeps the first attempt upload fields across later attempt starts', async () => {
+    const { id, fence } = await downloaded();
+    const first = {
+      declared: { amountCents: 99900 },
+      extracted: { amountCents: 140000, bank: 'BBVA', confidence: 0.6 },
+    };
+    // `downloaded()` started attempt 1 without fields; record them on a
+    // fresh row through the real first-pass start instead.
+    await pool.query(
+      'UPDATE receipt_media SET storage_attempts = 0, version = version + 1 WHERE id = $1',
+      [id],
+    );
+    const v = String(BigInt(fence.expectedVersion) + 1n);
+    const start = await store.startStorageAttempt({
+      id,
+      owner: OWNER,
+      expectedVersion: v,
+      uploadFields: first,
+    });
+    expect(start?.attempt).toBe(1);
+    await store.commitUploadUnknown({
+      id,
+      owner: OWNER,
+      expectedVersion: start!.version,
+      httpStatus: 503,
+      transportCode: null,
+    });
+    await pool.query(
+      'UPDATE receipt_media SET next_attempt_at = now() WHERE id = $1',
+      [id],
+    );
+    const [claimed] = await store.claimBatch(1, OWNER);
+    expect(claimed.uploadFields).toEqual(first);
+    // A later start (even with other fields) never replaces them.
+    const retry = await store.startStorageAttempt({
+      id,
+      owner: OWNER,
+      expectedVersion: claimed.version,
+      uploadFields: { extracted: { amountCents: 1, confidence: 0.3 } },
+    });
+    expect(retry?.attempt).toBe(2);
+    const { rows } = await pool.query<{ upload_fields: unknown }>(
+      'SELECT upload_fields FROM receipt_media WHERE id = $1',
+      [id],
+    );
+    expect(rows[0].upload_fields).toEqual(first);
+  });
+
   it('commits a success after unknown retries', async () => {
     const { id, fence } = await downloaded();
     await store.commitUploadUnknown({
@@ -272,12 +375,85 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
     },
   );
 
+  it('records an accepted upload with an invalid receipt id as an unknown outcome', async () => {
+    const { id, fence } = await downloaded();
+    const out = await store.commitUploadSuccess({
+      ...fence,
+      backendReceiptId: 'not-a-uuid',
+      templateArgs: { folio: 'F-12' },
+    });
+    expect(out).toMatchObject({
+      kind: 'committed',
+      receipt: {
+        status: 'ATTACH_OUTCOME_UNKNOWN',
+        backendReceiptId: null,
+        attachHttpStatus: null,
+        attachTransportCode: 'RECEIPT_ID_INVALID',
+        leaseOwner: OWNER,
+      },
+      intent: { templateKey: 'RECEIPT_ATTACH_UNKNOWN', templateArgs: {} },
+    });
+    // Terminal: never reclaimed, and the stale fence cannot commit again.
+    await pool.query(
+      'UPDATE receipt_media SET next_attempt_at = now() WHERE id = $1',
+      [id],
+    );
+    await expect(store.claimBatch(1, OWNER)).resolves.toEqual([]);
+    await expect(
+      store.commitUploadSuccess({
+        ...fence,
+        backendReceiptId: 'not-a-uuid',
+        templateArgs: {},
+      }),
+    ).resolves.toEqual({ kind: 'fenced' });
+    expect((await intents(id)).map((r) => r.template_key)).toEqual([
+      'RECEIPT_ATTACH_UNKNOWN',
+    ]);
+  });
+
+  it('sends the registering message once when an earlier unknown outcome sent it', async () => {
+    const { id, fence } = await downloaded();
+    const retry = await store.commitUploadUnknown({
+      ...fence,
+      httpStatus: 503,
+      transportCode: null,
+    });
+    expect(retry.kind).toBe('retry-scheduled');
+    await pool.query(
+      'UPDATE receipt_media SET next_attempt_at = now() WHERE id = $1',
+      [id],
+    );
+    const [claimed] = await store.claimBatch(1, OWNER);
+    const start = await store.startStorageAttempt({
+      id,
+      owner: OWNER,
+      expectedVersion: claimed.version,
+    });
+    await expect(
+      store.commitUploadSuccess({
+        id,
+        owner: OWNER,
+        expectedVersion: start!.version,
+        backendReceiptId: 42 as unknown as string,
+        templateArgs: {},
+      }),
+    ).resolves.toMatchObject({
+      kind: 'committed',
+      receipt: { status: 'ATTACH_OUTCOME_UNKNOWN' },
+      intent: null,
+    });
+    expect((await intents(id)).map((r) => r.template_key)).toEqual([
+      'RECEIPT_ATTACH_UNKNOWN',
+    ]);
+  });
+
   it('fences a malformed command without touching the row', async () => {
     const { fence } = await downloaded();
     await expect(
       store.commitUploadSuccess({
         ...fence,
-        backendReceiptId: 'not-a-uuid',
+        expectedVersion: 'x',
+        backendReceiptId: BACKEND_RECEIPT,
         templateArgs: {},
       }),
     ).resolves.toEqual({ kind: 'fenced' });

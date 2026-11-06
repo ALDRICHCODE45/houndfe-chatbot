@@ -1,9 +1,10 @@
 /** R2 backend upload (S2): the downloaded receipt file goes to the backend
  * as multipart with `X-Idempotency-Key` = the WhatsApp media id, and exactly
  * one durable outcome is committed per call. A definite refusal (4xx) is
- * terminal; any unknown outcome (timeout, network, 5xx, invalid 201) is
- * retried later by the store with the same key. The bot never confirms or
- * rejects the payment (S1): the backend keeps the receipt PENDING. */
+ * terminal; any unknown outcome (timeout, network, 5xx, 401/403/429,
+ * invalid 201) is retried later by the store with the same key. The bot
+ * never confirms or rejects the payment (S1): the backend keeps the receipt
+ * PENDING. */
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   RECEIPT_UPLOAD_ERROR,
@@ -19,16 +20,17 @@ import type {
   UploadDefiniteTemplateKey,
   UploadTemplateArgs,
 } from '../domain/receipt-media-store.port';
-import type {
-  ReceiptExtraction,
-  ReceiptExtractionConfidence,
+import {
+  computeAmountMismatch,
+  type ReceiptExtraction,
+  type ReceiptExtractionConfidence,
 } from '../domain/receipt-extraction.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 
-/** Backend statuses that prove the receipt was refused (no retry helps). */
-const DEFINITE_STATUSES = new Set([
-  400, 401, 403, 404, 409, 413, 415, 422, 429,
-]);
+/** Backend statuses that prove the receipt was refused (no retry helps).
+ * 429 (rate limit) and 401/403 (credential/config, fixable by an operator)
+ * are unknown outcomes retried with the same key. */
+const DEFINITE_STATUSES = new Set([400, 404, 409, 413, 415, 422]);
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 /** The backend `extracted.confidence` is 0..1. */
@@ -56,7 +58,9 @@ export interface UploadInvocation {
   /** Fence of the already-started upload attempt. */
   fence: LeaseFenceInput;
   file: { bytes: Buffer; mimeType: ReceiptUploadMimeType };
-  extraction: ReceiptExtraction;
+  /** The exact fields of the first attempt (`toUploadFields`), reused
+   * byte-for-byte by every retry under the same idempotency key. */
+  fields: ReceiptUploadFields;
   /** The placed order bound to the receipt's sale, when still known. */
   order: PlacedOrder | null;
   signal?: AbortSignal;
@@ -79,7 +83,7 @@ export class ReceiptAttachmentService {
   ) {}
 
   async upload(invocation: UploadInvocation): Promise<UploadReport> {
-    const { receipt, fence, file, extraction, order, signal } = invocation;
+    const { receipt, fence, file, fields, order, signal } = invocation;
     const folioArgs: UploadTemplateArgs =
       order?.folio == null ? {} : { folio: order.folio };
     let backendReceiptId: string;
@@ -91,7 +95,7 @@ export class ReceiptAttachmentService {
           mimeType: file.mimeType,
           filename: FILENAME[file.mimeType],
         },
-        uploadFields(receipt, extraction),
+        fields,
         receipt.providerMediaId,
         { signal },
       ));
@@ -121,15 +125,13 @@ export class ReceiptAttachmentService {
         }),
       };
     }
+    const extractedAmountCents = fields.extracted?.amountCents ?? null;
+    const totalCents = order?.totalCents ?? null;
     const mismatch =
-      extraction.kind === 'receipt' &&
-      extraction.amountMismatch &&
-      extraction.amountCents !== null &&
-      order?.totalCents != null
-        ? {
-            extractedAmountCents: extraction.amountCents,
-            totalCents: order.totalCents,
-          }
+      extractedAmountCents !== null &&
+      totalCents !== null &&
+      computeAmountMismatch(extractedAmountCents, totalCents)
+        ? { extractedAmountCents, totalCents }
         : {};
     return {
       kind: 'uploaded',
@@ -144,7 +146,7 @@ export class ReceiptAttachmentService {
 }
 
 /** Declared (caption) and extracted (vision) data travel apart (S4). */
-function uploadFields(
+export function toUploadFields(
   receipt: ReceiptMediaRow,
   extraction: ReceiptExtraction,
 ): ReceiptUploadFields {
