@@ -22,7 +22,10 @@ import {
   SHIPPING_QUOTE_NOT_FOUND,
   SHIPPING_QUOTE_UNAVAILABLE,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
-import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import {
+  ChatbotApiError,
+  UpstreamError,
+} from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
   CONVERSATION_STORE,
@@ -82,6 +85,11 @@ export const MINIMAL_ORDER_PICKUP_CUSTOMER_UNAVAILABLE_REPLY =
   'Por ahora no puedo verificar sus datos de cliente. Intente de nuevo en un momento; no se creó ningún pedido.';
 export const MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY =
   'Sus datos de cliente ya no coinciden con la cotización de envío; no se creó ningún pedido. Dígame «quiero comprar» para revisar sus datos y después le cotizo el envío de nuevo.';
+/** Backend code: `expectedTotalCents` no longer matches merchandise plus
+ * shipping (a promotion started or ended); nothing was written. */
+const PROMO_RE_QUOTE = 'PROMO_RE_QUOTE';
+/** Internal `send` → `consume` marker for PROMO_RE_QUOTE; never sent. */
+const PROMO_REPRICE_MARKER = Symbol('minimal-order.promo-reprice').toString();
 /** Test seam for quote expiry; production uses `Date.now`. */
 export const MINIMAL_ORDER_CLOCK = Symbol('MINIMAL_ORDER_CLOCK');
 export const MINIMAL_ORDER_CHANGED_REPLY =
@@ -179,7 +187,13 @@ function classifyFailure(error: unknown): 'rotate' | 'keep' {
     : 'keep';
 }
 
-function isSale(value: unknown): value is BotSaleResponse {
+/** The sale fields the order-created reply and `placedSale` need. */
+type PlacedSaleIdentity = Pick<
+  BotSaleResponse,
+  'saleId' | 'folio' | 'totalCents'
+>;
+
+function isSale(value: unknown): value is PlacedSaleIdentity {
   if (typeof value !== 'object' || value === null) return false;
   const sale = value as Partial<BotSaleResponse>;
   return (
@@ -355,6 +369,8 @@ export class MinimalOrderService {
     // whose earlier attempt the status read resolved), so re-quoting is safe.
     if (reply === MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY)
       return this.requote(input.senderId, input.inboundEvent);
+    if (reply === PROMO_REPRICE_MARKER)
+      return this.represent(input.senderId, input.inboundEvent);
     return {
       reply:
         recovery.outstanding &&
@@ -392,6 +408,26 @@ export class MinimalOrderService {
     }
   }
 
+  /**
+   * F5: PROMO_RE_QUOTE wrote nothing and the key is already cleared. The
+   * fresh order re-prices the cart (and re-quotes a delivery quote pinned to
+   * the old prices); the new summary is shown for a fresh SÍ.
+   */
+  private async represent(
+    senderId: string,
+    inboundEvent: unknown,
+  ): Promise<MinimalCheckoutReply> {
+    const fresh = await this.freshOrder(senderId);
+    if (!fresh.ok) return { reply: fresh.reply };
+    const offer = this.offer(senderId, inboundEvent, fresh.snapshot);
+    return offer.onSent === undefined
+      ? { reply: MINIMAL_ORDER_CHANGED_REPLY }
+      : {
+          reply: `${MINIMAL_ORDER_CHANGED_REPLY}\n\n${offer.reply}`,
+          onSent: offer.onSent,
+        };
+  }
+
   /** Resolve an earlier POST before consulting mutable stock/address/shipping. */
   private async recoverOutstanding(
     senderId: string,
@@ -409,7 +445,7 @@ export class MinimalOrderService {
       if (key === '') return { outstanding: false };
       const status = await this.api.getCheckoutStatus(key);
       if (status.status === 'not_observed') return { outstanding: true };
-      if (status.status === 'succeeded' && isSale(status.checkout?.sale)) {
+      if (isSale(status.checkout?.sale)) {
         return {
           outstanding: true,
           reply: await this.completeSale(
@@ -805,6 +841,21 @@ export class MinimalOrderService {
           ? response.pickupLocation
           : undefined;
     } catch (error) {
+      // A 201 whose body fails the strict contract parse: the sale may exist
+      // under our key. Read it back at once (a GET, never a second POST); a
+      // failed read keeps the key for the next turn's recovery.
+      if (error instanceof UpstreamError && error.statusCode === 201) {
+        const own = await this.ownCheckout(keyed.idempotencyKey);
+        return own.kind === 'sale'
+          ? this.completeSale(
+              senderId,
+              stored,
+              own.sale,
+              snapshot.shipping,
+              own.pickupLocation,
+            )
+          : MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
+      }
       const code = error instanceof ChatbotApiError ? error.errorCode : null;
       // A SHIPPING_QUOTE_* error proves THIS call wrote nothing. After an
       // earlier uncertain attempt (or for ALREADY_USED, where the quote may
@@ -857,10 +908,14 @@ export class MinimalOrderService {
       const unkeyed = structuredClone({ ...keyed, idempotencyKey: '' });
       delete unkeyed.idempotencyFingerprint;
       delete unkeyed.idempotencyAttempts;
+      // A quote is pinned to lines and address, never to the customer: kept,
+      // it would be resent after the re-check and fail the same way.
+      if (customerMismatch) delete unkeyed.shipping;
       await this.commitCart(senderId, stored, unkeyed);
       if (ambiguousPhone) return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
       if (addressRejected) return MINIMAL_CHECKOUT_RESELECT_REPLY;
       if (customerMismatch) return MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY;
+      if (code === PROMO_RE_QUOTE) return PROMO_REPRICE_MARKER;
       if (
         error instanceof ChatbotApiError &&
         error.errorCode !== null &&
@@ -899,7 +954,7 @@ export class MinimalOrderService {
   private async ownCheckout(key: string): Promise<
     | {
         kind: 'sale';
-        sale: BotSaleResponse;
+        sale: PlacedSaleIdentity;
         pickupLocation?: CheckoutPickupLocation | null;
       }
     | { kind: 'absent' | 'unknown' }
@@ -924,7 +979,7 @@ export class MinimalOrderService {
   private async completeSale(
     senderId: string,
     stored: unknown,
-    sale: BotSaleResponse,
+    sale: PlacedSaleIdentity,
     shipping?: { mode: 'pickup' } | { customerChargeCents: number },
     pickupLocation?: CheckoutPickupLocation | null,
   ): Promise<string> {

@@ -233,8 +233,32 @@ const checkoutStatus = z.discriminatedUnion('status', [
     .strict(),
   z.object({ status: z.literal('not_observed'), checkout: z.null() }).strict(),
 ]);
-/** not_observed is NOT proof of rollback; callers must retain the same key. */
-export type CheckoutStatus = z.infer<typeof checkoutStatus>;
+/** Our sale under our own key whose body has keys outside the contract: only
+ * the identity and total are read (still validated), so an uncertain strict
+ * 201 can still be completed instead of stranding the customer. */
+const recoveredCheckoutStatus = z.object({
+  status: z.literal('succeeded'),
+  checkout: z.object({
+    sale: z.object({
+      saleId: uuid,
+      folio: z.string().nullable(),
+      totalCents: cents,
+    }),
+  }),
+});
+export interface CheckoutRecoveredSale {
+  saleId: string;
+  folio: string | null;
+  totalCents: number;
+}
+/** not_observed is NOT proof of rollback; callers must retain the same key.
+ * `succeeded_unverified` carries only the recovered sale identity. */
+export type CheckoutStatus =
+  | z.infer<typeof checkoutStatus>
+  | {
+      status: 'succeeded_unverified';
+      checkout: { sale: CheckoutRecoveredSale };
+    };
 
 export function normalizeCheckoutResponse(
   body: unknown,
@@ -244,7 +268,14 @@ export function normalizeCheckoutResponse(
 }
 export function normalizeCheckoutStatus(body: unknown): CheckoutStatus | null {
   const parsed = checkoutStatus.safeParse(body);
-  return parsed.success ? parsed.data : null;
+  if (parsed.success) return parsed.data;
+  const recovered = recoveredCheckoutStatus.safeParse(body);
+  if (!recovered.success) return null;
+  const { saleId, folio, totalCents } = recovered.data.checkout.sale;
+  return {
+    status: 'succeeded_unverified',
+    checkout: { sale: { saleId, folio, totalCents } },
+  };
 }
 
 /** `mismatches[]` of a SHIPPING_QUOTE_MISMATCH error body; `[]` when absent. */

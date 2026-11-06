@@ -492,3 +492,62 @@ describe('checkout shipping contract (C1)', () => {
     expect(checkoutErrorMismatches(null)).toEqual([]);
   });
 });
+
+describe('checkout status recovery (R3-strict-receipt)', () => {
+  // A 201 with an unexpected key is an uncertain outcome; the status read
+  // embeds the same strict body, so recovery must still find our sale.
+  it('recovers our sale from a succeeded status with an unexpected key', () => {
+    const body = {
+      status: 'succeeded',
+      checkout: {
+        ...contractPickup201,
+        sale: { ...contractPickup201.sale, extra: 1 },
+        newField: true,
+      },
+    };
+    expect(normalizeCheckoutStatus(body)).toEqual({
+      status: 'succeeded_unverified',
+      checkout: {
+        sale: {
+          saleId: contractPickup201.sale.saleId,
+          folio: contractPickup201.sale.folio,
+          totalCents: contractPickup201.sale.totalCents,
+        },
+      },
+    });
+  });
+
+  it('keeps the exact contract body as succeeded', () => {
+    expect(
+      normalizeCheckoutStatus({
+        status: 'succeeded',
+        checkout: contractDelivery201,
+      })?.status,
+    ).toBe('succeeded');
+  });
+
+  it.each([
+    ['no sale', { status: 'succeeded', checkout: { status: 'created' } }],
+    [
+      'an invalid sale id',
+      {
+        status: 'succeeded',
+        checkout: {
+          sale: { ...contractPickup201.sale, saleId: 'x', extra: 1 },
+        },
+      },
+    ],
+    [
+      'an invalid total',
+      {
+        status: 'succeeded',
+        checkout: {
+          sale: { ...contractPickup201.sale, totalCents: -1, extra: 1 },
+        },
+      },
+    ],
+    ['not_observed with a key', { status: 'not_observed', checkout: {} }],
+  ])('still fails closed with %s', (_name, body) => {
+    expect(normalizeCheckoutStatus(body)).toBeNull();
+  });
+});

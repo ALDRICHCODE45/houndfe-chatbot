@@ -322,6 +322,10 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
         extractErrorCode(response.data),
       );
     }
+    if (status.status === 'succeeded_unverified')
+      new Logger(ChatbotApiHttpClient.name).warn(
+        'chatbot-api /checkouts/status body has keys outside the contract; recovered the sale identity only',
+      );
     return status;
   }
 

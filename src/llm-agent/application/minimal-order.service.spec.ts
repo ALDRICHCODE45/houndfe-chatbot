@@ -1896,23 +1896,23 @@ describe('MinimalOrderService', () => {
     });
   });
 
-  it.each([
-    ['PROMO_RE_QUOTE', 409],
-    ['BUSINESS_RULE_VIOLATION', 422],
-  ])('rotates the key after a definite %s rejection', async (code, status) => {
-    const h = setup();
-    await h.seedCart();
-    await confirmSavedDelivery(h);
-    await offerOrder(h);
-    h.api.createCheckout.mockImplementationOnce(() =>
-      Promise.reject(new ChatbotApiError('rejected', status, {}, code)),
-    );
-    expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_REJECTED_REPLY });
-    expect(await h.minimalCart()).toMatchObject({
-      items: [{ productId: PRODUCT, quantity: 2 }],
-      idempotencyKey: '',
-    });
-  });
+  it.each([['BUSINESS_RULE_VIOLATION', 422]])(
+    'rotates the key after a definite %s rejection',
+    async (code, status) => {
+      const h = setup();
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await offerOrder(h);
+      h.api.createCheckout.mockImplementationOnce(() =>
+        Promise.reject(new ChatbotApiError('rejected', status, {}, code)),
+      );
+      expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_REJECTED_REPLY });
+      expect(await h.minimalCart()).toMatchObject({
+        items: [{ productId: PRODUCT, quantity: 2 }],
+        idempotencyKey: '',
+      });
+    },
+  );
 
   it.each([
     'BOT_ITEM_VARIANT_REQUIRED',
@@ -2634,6 +2634,157 @@ describe('checkout quote errors (C1)', () => {
     });
     expect(h.quotes.calls).toHaveLength(0);
     expect(h.checkout.confirmationStatus(SENDER)).toBeNull();
+    // The quote has no customer pin: kept, it would be resent after the
+    // customer re-selects the same address and fail the same way.
+    const cart = await h.minimalCart();
+    expect(cart).toMatchObject({ idempotencyKey: '' });
+    expect(cart).not.toHaveProperty('shipping');
+  });
+
+  it('an invalid 201 recovers our sale through /checkouts/status at once (R3-strict-receipt)', async () => {
+    const h = setup();
+    await h.seedCart();
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(
+      new UpstreamError('invalid', 201, {}, null),
+    );
+    h.api.getCheckoutStatus.mockResolvedValueOnce({
+      status: 'succeeded_unverified',
+      checkout: {
+        sale: { saleId: SALE, folio: 'B-0042', totalCents: 3000 },
+      },
+    });
+    const reply = await yes(h);
+    expect(reply?.reply).toContain('folio B-0042');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(await h.minimalCart()).toMatchObject({
+      items: [],
+      placedSale: { saleId: SALE, folio: 'B-0042', totalCents: 3000 },
+    });
+  });
+
+  it('an invalid 201 with a failed status read recovers on the next turn, without a second POST', async () => {
+    const h = setup();
+    await h.seedCart();
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(
+      new UpstreamError('invalid', 201, {}, null),
+    );
+    h.api.getCheckoutStatus.mockRejectedValueOnce(new Error('down'));
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
+    });
+    h.api.getCheckoutStatus.mockResolvedValueOnce({
+      status: 'succeeded_unverified',
+      checkout: {
+        sale: { saleId: SALE, folio: 'B-0042', totalCents: 3000 },
+      },
+    });
+    const next = await h.order.consume({ senderId: SENDER, text: 'hola' });
+    expect(next?.reply).toContain('folio B-0042');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  describe('PROMO_RE_QUOTE (F5): a promotion changed between the summary and the SÍ', () => {
+    const promoReQuote = () =>
+      new ChatbotApiError(
+        'PROMO_RE_QUOTE',
+        409,
+        { statusCode: 409, error: 'PROMO_RE_QUOTE' },
+        'PROMO_RE_QUOTE',
+      );
+    /** The promotion now prices each unit at $12.50 instead of $15.00. */
+    const promotionChanges = (h: Harness) =>
+      h.api.evaluateCart.mockImplementation(
+        (items: Array<{ quantity: number }>) =>
+          Promise.resolve({
+            items: items.map((item) => ({
+              productId: PRODUCT,
+              variantId: null,
+              quantity: item.quantity,
+              unitPriceCents: 1500,
+              originalPriceCents: 1500 * item.quantity,
+              finalPriceCents: 1250 * item.quantity,
+              discountAmountCents: 250 * item.quantity,
+              appliedPromotionTitle: null,
+            })),
+            promotionEvaluationStatus: 'fully_evaluated',
+          }),
+      );
+
+    it('pickup: re-prices and re-presents the summary for a fresh SÍ under a new key', async () => {
+      const h = setup();
+      await h.seedCart();
+      await offerOrder(h);
+      h.api.createCheckout.mockImplementationOnce(() => {
+        // The promotion ends while the POST is verified.
+        promotionChanges(h);
+        return Promise.reject(promoReQuote());
+      });
+      const reply = await yes(h);
+      expect(reply?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
+      expect(reply?.reply).toContain('$25.00');
+      expect(reply?.onSent).toBeDefined();
+      const firstKey = (h.api.createCheckout.mock.calls[0] as unknown[])[1];
+      expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
+      reply?.onSent?.();
+      h.api.createCheckout.mockResolvedValueOnce({
+        status: 'created',
+        customer: {
+          resolution: 'existing',
+          customerId: CUSTOMER,
+          firstName: 'Ana',
+          lastName: null,
+        },
+        address: null,
+        sale: { ...placedSale(), fulfillmentMode: 'PICKUP' },
+        pickupLocation: null,
+      });
+      expect((await yes(h, 'wamid.o9'))?.reply).toContain('folio B-0042');
+      const [payload, key] = h.api.createCheckout.mock.calls[1] as unknown as [
+        { sale: { expectedTotalCents: number } },
+        string,
+      ];
+      expect(payload.sale.expectedTotalCents).toBe(2500);
+      expect(key).not.toBe(firstKey);
+    });
+
+    it('delivery: re-prices, re-quotes the shipping once and re-presents the summary', async () => {
+      const h = await deliveryOffer();
+      h.api.createCheckout.mockImplementationOnce(() => {
+        // The promotion ends while the POST is verified.
+        promotionChanges(h);
+        return Promise.reject(promoReQuote());
+      });
+      h.quotes.enqueue(newQuote);
+      const reply = await yes(h);
+      expect(reply?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
+      expect(reply?.reply).toContain('Total a pagar: $95.00 MXN');
+      expect(reply?.onSent).toBeDefined();
+      expect(h.quotes.calls).toHaveLength(1);
+      expect(await h.minimalCart()).toMatchObject({
+        idempotencyKey: '',
+        shipping: { quoteId: 'quote-2' },
+      });
+    });
+
+    it('after an earlier uncertain attempt the key is held, nothing re-presented', async () => {
+      const h = setup();
+      await h.seedCart();
+      await offerOrder(h);
+      h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
+      await yes(h);
+      h.api.getCheckoutStatus.mockResolvedValue({
+        status: 'not_observed',
+        checkout: null,
+      });
+      await offerOrder(h, 'wamid.p1');
+      h.api.createCheckout.mockRejectedValueOnce(promoReQuote());
+      expect(await yes(h, 'wamid.p2')).toEqual({
+        reply: MINIMAL_ORDER_UNRESOLVED_REPLY,
+      });
+      expect(await h.minimalCart()).toMatchObject({ idempotencyAttempts: 2 });
+    });
   });
 
   it('MISMATCH on LINES re-quotes', async () => {
