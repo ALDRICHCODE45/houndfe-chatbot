@@ -4,6 +4,11 @@ import { RestockInboundCapture } from './restock-inbound-capture';
 
 const observedAt = '2026-06-22T13:00:00.000Z';
 const phone = '123456789';
+const media = (id: string) => ({
+  id,
+  from: '5215555555555',
+  timestamp: '1782129600',
+});
 const message = (id = 'wamid.first') => ({
   id,
   from: '5215555555555',
@@ -55,6 +60,35 @@ function setup() {
 }
 
 describe('unwired text-only restock capture', () => {
+  it.each([
+    { type: 'image', image: { id: 'media' } },
+    { type: 'document', document: { id: 'pdf', mime_type: 'application/pdf' } },
+    { type: 'audio', audio: { id: 'voice' } },
+  ])(
+    'skips a well-formed non-text message and captures the rest: %p',
+    async (payload) => {
+      const s = setup();
+      const result = await s.run([
+        value([message(), { ...media('wamid.media'), ...payload }]),
+      ]);
+      expect(result.action).toBe('captured');
+      if (result.action !== 'captured') throw new Error('not captured');
+      expect(result.evidence).toEqual([fixture()]);
+      expect(s.record).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('captures a batch with only a non-text message without recording evidence', async () => {
+    const s = setup();
+    const result = await s.run([
+      value([
+        { ...media('wamid.only-media'), type: 'image', image: { id: 'm' } },
+      ]),
+    ]);
+    expect(result.action).toBe('captured');
+    if (result.action !== 'captured') throw new Error('not captured');
+    expect(result.evidence).toEqual([]);
+    expect(s.record).not.toHaveBeenCalled();
+  });
   it('preserves UTF8 and provider seconds in detached event and frozen evidence', async () => {
     const s = setup();
     const input = event();
@@ -71,7 +105,6 @@ describe('unwired text-only restock capture', () => {
     value([{ ...message(), timestamp: '01' }]),
     value([{ ...message(), timestamp: '9999999999' }]),
     value([{ ...message(), from: undefined }]),
-    value([{ ...message(), type: 'image', image: { id: 'media' } }]),
     value([{ ...message(), image: { id: 'ambiguous' } }]),
     value([{ ...message(), audio: { id: 'ambiguous' } }]),
     { ...value(), metadata: undefined },

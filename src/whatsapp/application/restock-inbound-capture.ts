@@ -15,6 +15,20 @@ type Result =
       evidence: readonly RestockInboundEvidence[];
     };
 const HOLD = { action: 'hold' } as const;
+// Well-formed non-text customer messages (receipts, voice notes, ...) carry no
+// RESTOCK reply evidence: skip them instead of holding the whole webhook.
+const NON_TEXT_TYPES = new Set([
+  'image',
+  'document',
+  'audio',
+  'video',
+  'sticker',
+  'location',
+  'contacts',
+  'interactive',
+  'button',
+  'reaction',
+]);
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -74,6 +88,12 @@ export class RestockInboundCapture {
           if (
             typeof message.from === 'string' &&
             this.isOpsSender(message.from)
+          )
+            continue;
+          if (
+            typeof message.type === 'string' &&
+            NON_TEXT_TYPES.has(message.type) &&
+            !('text' in message)
           )
             continue;
           if (
