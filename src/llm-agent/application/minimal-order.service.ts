@@ -1,4 +1,4 @@
-import { Inject, Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomUUID } from 'node:crypto';
@@ -9,6 +9,10 @@ import {
 import type { BotSaleResponse } from '../../chatbot-api/domain/dtos/sales.dto';
 import {
   CreateCheckoutInputSchema,
+  INVALID_CHECKOUT_REQUEST,
+  SHIPPING_QUOTE_ALREADY_USED,
+  checkoutErrorMismatches,
+  type CheckoutPickupLocation,
   type CreateCheckoutInput,
 } from '../../chatbot-api/domain/dtos/checkout.dto';
 import {
@@ -28,6 +32,7 @@ import {
   MINIMAL_ORDER_AMBIGUOUS_REPLY,
   MinimalOrderConfirmation,
   evaluateMinimalOrder,
+  evaluateMinimalPickupOrder,
   sameMinimalOrder,
   type MinimalOrderIneligibleReason,
   type MinimalOrderSnapshot,
@@ -71,6 +76,12 @@ export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
 };
 export const MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY =
   'Antes del resumen necesito saber cómo recibirá su pedido: dígame «cotizar envío» para calcular el envío a su dirección confirmada, o «recoger en tienda» si prefiere recogerlo sin costo de envío. Por ahora no se creó ningún pedido.';
+export const MINIMAL_ORDER_PICKUP_NAME_REQUIRED_REPLY =
+  'Para registrar su pedido para recoger en tienda solo necesito su nombre. ¿Me lo comparte? Por ahora no se creó ningún pedido.';
+export const MINIMAL_ORDER_PICKUP_CUSTOMER_UNAVAILABLE_REPLY =
+  'Por ahora no puedo verificar sus datos de cliente. Intente de nuevo en un momento; no se creó ningún pedido.';
+export const MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY =
+  'Sus datos de cliente ya no coinciden con la cotización de envío; no se creó ningún pedido. Dígame «quiero comprar» para revisar sus datos y después le cotizo el envío de nuevo.';
 /** Test seam for quote expiry; production uses `Date.now`. */
 export const MINIMAL_ORDER_CLOCK = Symbol('MINIMAL_ORDER_CLOCK');
 export const MINIMAL_ORDER_CHANGED_REPLY =
@@ -112,6 +123,7 @@ const VARIANT_REJECTION_CODES: ReadonlySet<string> = new Set([
 const SHIPPING_REJECTION_REPLIES: Readonly<Record<string, string>> = {
   [SHIPPING_QUOTE_EXPIRED]: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
   [SHIPPING_QUOTE_MISMATCH]: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+  [SHIPPING_QUOTE_ALREADY_USED]: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
   [SHIPPING_QUOTE_NOT_FOUND]: MINIMAL_ORDER_SHIPPING_QUOTE_NOT_FOUND_REPLY,
   [PACKAGING_DATA_MISSING]: MINIMAL_ORDER_PACKAGING_MISSING_REPLY,
   [SHIPPING_QUOTE_UNAVAILABLE]: MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY,
@@ -164,6 +176,20 @@ function isSale(value: unknown): value is BotSaleResponse {
   );
 }
 
+/** Backend pickup location (C1); null parts are omitted, never invented. */
+function pickupLocationText(
+  location: CheckoutPickupLocation | null | undefined,
+): string {
+  if (location === null || location === undefined) return '';
+  const place =
+    location.address === null
+      ? ` Recójalo en ${location.name}.`
+      : ` Recójalo en ${location.name}: ${location.address.formatted.replace(/\.$/, '')}.`;
+  return location.hours === null
+    ? place
+    : `${place} Horario: ${location.hours.summary}`;
+}
+
 /** Deterministic digest of the exact payload sent under one key. */
 function fingerprint(payload: CreateCheckoutInput): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
@@ -197,6 +223,7 @@ function sameCartLines(
 @Injectable()
 export class MinimalOrderService {
   private readonly confirmation = new MinimalOrderConfirmation();
+  private readonly logger = new Logger(MinimalOrderService.name);
   private readonly cashierUserId: string;
   private readonly now: () => number;
 
@@ -377,6 +404,9 @@ export class MinimalOrderService {
                 ? { mode: 'pickup' }
                 : { customerChargeCents: cart.shipping.customerChargeCents }
               : undefined,
+            'pickupLocation' in status.checkout
+              ? status.checkout.pickupLocation
+              : undefined,
           ),
         };
       }
@@ -408,6 +438,11 @@ export class MinimalOrderService {
   private async freshOrder(senderId: string): Promise<FreshOrder> {
     try {
       const { quote, repriced } = await this.cart.refreshPrices(senderId);
+      const pickup = await this.freshPickupOrder(
+        senderId,
+        quote.ok ? quote : null,
+      );
+      if (pickup !== null) return pickup;
       const confirmedDraft = await this.checkout.confirmedDraft(senderId);
       const verdict = evaluateMinimalOrder({
         confirmedDraft,
@@ -420,9 +455,16 @@ export class MinimalOrderService {
           reason: verdict.reason,
         };
       }
+      const draft = verdict.snapshot.draft;
+      if (draft === null)
+        return {
+          ok: false,
+          reply: MINIMAL_ORDER_INELIGIBLE_REPLIES.delivery_unconfirmed,
+          reason: 'delivery_unconfirmed',
+        };
       const revalidation = await this.checkout.revalidateSelection(
         senderId,
-        verdict.snapshot.draft,
+        draft,
       );
       if (revalidation === 'reselect') {
         return { ok: false, reply: MINIMAL_CHECKOUT_RESELECT_REPLY };
@@ -467,6 +509,54 @@ export class MinimalOrderService {
   }
 
   /**
+   * Store pickup (C1): a current pickup choice needs only the customer
+   * identity, never confirmed delivery data. `null` when the cart holds no
+   * current pickup choice, so the delivery path decides.
+   */
+  private async freshPickupOrder(
+    senderId: string,
+    quote: Parameters<typeof evaluateMinimalPickupOrder>[0]['quote'],
+  ): Promise<FreshOrder | null> {
+    const cart = parseMinimalCart(
+      (await this.store.get(senderId))?.data.minimalCart,
+    );
+    const record = cart?.shipping;
+    if (record === undefined || !isMinimalPickup(record)) return null;
+    if (quote !== null && quote.items.length > 0) {
+      const lines = quote.items.map((item) => ({
+        productId: item.productId,
+        ...(item.variantId === undefined ? {} : { variantId: item.variantId }),
+        quantity: item.quantity,
+        unitPriceCents: item.unitPriceCents,
+        finalPriceCents: item.finalPriceCents,
+      }));
+      if (!isPickupCurrent(record, lines)) return null;
+    }
+    const identity = await this.checkout.pickupIdentity(senderId);
+    if (identity.kind === 'ambiguous')
+      return { ok: false, reply: MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY };
+    if (identity.kind === 'unavailable')
+      return {
+        ok: false,
+        reply: MINIMAL_ORDER_PICKUP_CUSTOMER_UNAVAILABLE_REPLY,
+      };
+    if (identity.kind === 'name_required')
+      return { ok: false, reply: MINIMAL_ORDER_PICKUP_NAME_REQUIRED_REPLY };
+    const verdict = evaluateMinimalPickupOrder({
+      quote,
+      customerId: identity.kind === 'existing' ? identity.customerId : '',
+      customer: { firstName: identity.firstName, lastName: identity.lastName },
+    });
+    return verdict.ok
+      ? { ok: true, snapshot: verdict.snapshot }
+      : {
+          ok: false,
+          reply: MINIMAL_ORDER_INELIGIBLE_REPLIES[verdict.reason],
+          reason: verdict.reason,
+        };
+  }
+
+  /**
    * A delivery order needs a stored backend quote for a deliverable zone with
    * a quoteId, not yet expired, whose cart and address pins still match. A
    * pickup order needs a pickup choice whose cart pin still matches (S4).
@@ -487,6 +577,7 @@ export class MinimalOrderService {
     if (isMinimalPickup(record))
       return isPickupCurrent(record, cartLines) ? { mode: 'pickup' } : null;
     if (
+      snapshot.draft === null ||
       record.quoteId === null ||
       isShippingCurrent(record, {
         cartLines,
@@ -518,23 +609,76 @@ export class MinimalOrderService {
   ): Promise<string> {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     const phone = parseMexicanWhatsAppPhone(senderId);
-    const address = snapshot.draft.address;
     if (phone === null) return unverified;
+    const parsed =
+      snapshot.draft === null
+        ? this.pickupPayload(phone, snapshot)
+        : this.deliveryPayload(phone, snapshot, snapshot.draft);
+    if (parsed === 'invalid_state') return MINIMAL_CHECKOUT_INVALID_STATE_REPLY;
+    if (!parsed.success) return unverified;
+    return this.send(senderId, snapshot, parsed.data);
+  }
+
+  /** Store pickup (C1): identity only, no deliveryAddress, merchandise total. */
+  private pickupPayload(
+    phone: { phoneCountryCode: string; phone: string },
+    snapshot: MinimalOrderSnapshot,
+  ) {
+    const customer = snapshot.customer;
+    return CreateCheckoutInputSchema.safeParse({
+      ...phone,
+      customer:
+        snapshot.customerId !== ''
+          ? { mode: 'existing', customerId: snapshot.customerId }
+          : {
+              mode: 'createIfAbsent',
+              firstName: customer?.firstName,
+              ...(customer?.lastName == null
+                ? {}
+                : { lastName: customer.lastName }),
+            },
+      sale: {
+        ...this.saleLines(snapshot),
+        expectedTotalCents: snapshot.totalCents,
+        shipping: { mode: 'pickup' },
+      },
+    });
+  }
+
+  private saleLines(snapshot: MinimalOrderSnapshot) {
+    return {
+      cashierUserId: this.cashierUserId,
+      items: snapshot.items.map((item) => ({
+        productId: item.productId,
+        variantId: item.variantId ?? null,
+        productName: item.name,
+        variantName: item.variantName ?? null,
+        quantity: item.quantity,
+        unitPriceCents: item.unitPriceCents,
+      })),
+    };
+  }
+
+  private deliveryPayload(
+    phone: { phoneCountryCode: string; phone: string },
+    snapshot: MinimalOrderSnapshot,
+    draft: NonNullable<MinimalOrderSnapshot['draft']>,
+  ) {
+    const address = draft.address;
     const state =
       address.kind !== 'saved' ? toMexicanState(address.fields.state) : null;
-    if (address.kind !== 'saved' && state === null)
-      return MINIMAL_CHECKOUT_INVALID_STATE_REPLY;
-    const parsed = CreateCheckoutInputSchema.safeParse({
+    if (address.kind !== 'saved' && state === null) return 'invalid_state';
+    return CreateCheckoutInputSchema.safeParse({
       ...phone,
       customer:
         address.kind !== 'new'
           ? { mode: 'existing', customerId: snapshot.customerId }
           : {
               mode: 'createIfAbsent',
-              firstName: snapshot.draft.customer.firstName,
-              ...(snapshot.draft.customer.lastName === null
+              firstName: draft.customer.firstName,
+              ...(draft.customer.lastName === null
                 ? {}
-                : { lastName: snapshot.draft.customer.lastName }),
+                : { lastName: draft.customer.lastName }),
             },
       deliveryAddress:
         address.kind === 'saved'
@@ -561,15 +705,7 @@ export class MinimalOrderService {
               },
             },
       sale: {
-        cashierUserId: this.cashierUserId,
-        items: snapshot.items.map((item) => ({
-          productId: item.productId,
-          variantId: item.variantId ?? null,
-          productName: item.name,
-          variantName: item.variantName ?? null,
-          quantity: item.quantity,
-          unitPriceCents: item.unitPriceCents,
-        })),
+        ...this.saleLines(snapshot),
         expectedTotalCents:
           snapshot.totalCents +
           (snapshot.shipping !== undefined && 'quoteId' in snapshot.shipping
@@ -585,8 +721,18 @@ export class MinimalOrderService {
             }),
       },
     });
-    if (!parsed.success) return unverified;
-    const checkoutPayload = parsed.data;
+  }
+
+  /**
+   * Persist the key, POST once and map the outcome; see `place`. A
+   * definite quote rejection returns a recovery marker for `consume`.
+   */
+  private async send(
+    senderId: string,
+    snapshot: MinimalOrderSnapshot,
+    checkoutPayload: CreateCheckoutInput,
+  ): Promise<string> {
+    const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     const digest = fingerprint(checkoutPayload);
     // `keyed` is the parsed cart; `stored` is the exact value now in the slot,
     // the only valid CAS expectation (parsed objects are not plain data).
@@ -630,11 +776,41 @@ export class MinimalOrderService {
     }
 
     let sale: unknown;
+    let pickupLocation: CheckoutPickupLocation | null | undefined;
     try {
-      sale = (
-        await this.api.createCheckout(checkoutPayload, keyed.idempotencyKey)
-      )?.sale;
+      const response = await this.api.createCheckout(
+        checkoutPayload,
+        keyed.idempotencyKey,
+      );
+      sale = response?.sale;
+      pickupLocation =
+        response !== undefined && 'pickupLocation' in response
+          ? response.pickupLocation
+          : undefined;
     } catch (error) {
+      const code = error instanceof ChatbotApiError ? error.errorCode : null;
+      if (code === SHIPPING_QUOTE_ALREADY_USED) {
+        // The quote backs another sale (no saleId): it may be our own earlier
+        // attempt, so the stored key is checked before anything else.
+        const own = await this.ownSale(keyed.idempotencyKey);
+        if (own !== null)
+          return this.completeSale(
+            senderId,
+            stored,
+            own.sale,
+            snapshot.shipping,
+            own.pickupLocation,
+          );
+      }
+      if (code === INVALID_CHECKOUT_REQUEST)
+        this.logger.warn(
+          `checkout rejected ${INVALID_CHECKOUT_REQUEST}: ${error instanceof Error ? error.message : ''}`,
+        );
+      const customerMismatch =
+        code === SHIPPING_QUOTE_MISMATCH &&
+        error instanceof ChatbotApiError &&
+        checkoutErrorMismatches(error.responseBody).includes('CUSTOMER');
+      if (customerMismatch) this.checkout.clearSelection(senderId);
       const addressRejected =
         error instanceof ChatbotApiError &&
         (error.errorCode === 'ADDRESS_VERSION_CONFLICT' ||
@@ -659,6 +835,7 @@ export class MinimalOrderService {
       await this.commitCart(senderId, stored, unkeyed);
       if (ambiguousPhone) return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
       if (addressRejected) return MINIMAL_CHECKOUT_RESELECT_REPLY;
+      if (customerMismatch) return MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY;
       if (
         error instanceof ChatbotApiError &&
         error.errorCode !== null &&
@@ -683,7 +860,34 @@ export class MinimalOrderService {
     }
     if (!isSale(sale)) return MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
 
-    return this.completeSale(senderId, stored, sale, snapshot.shipping);
+    return this.completeSale(
+      senderId,
+      stored,
+      sale,
+      snapshot.shipping,
+      pickupLocation,
+    );
+  }
+
+  /** The sale recorded under this key, if `/checkouts/status` shows one. */
+  private async ownSale(key: string): Promise<{
+    sale: BotSaleResponse;
+    pickupLocation?: CheckoutPickupLocation | null;
+  } | null> {
+    try {
+      const status = await this.api.getCheckoutStatus(key);
+      if (status.status !== 'succeeded' || !isSale(status.checkout?.sale))
+        return null;
+      return {
+        sale: status.checkout.sale,
+        pickupLocation:
+          'pickupLocation' in status.checkout
+            ? status.checkout.pickupLocation
+            : undefined,
+      };
+    } catch {
+      return null;
+    }
   }
 
   private async completeSale(
@@ -691,6 +895,7 @@ export class MinimalOrderService {
     stored: unknown,
     sale: BotSaleResponse,
     shipping?: { mode: 'pickup' } | { customerChargeCents: number },
+    pickupLocation?: CheckoutPickupLocation | null,
   ): Promise<string> {
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
@@ -712,7 +917,8 @@ export class MinimalOrderService {
           ? ` Total a pagar: ${mxn(sale.totalCents)}. Recoge en tienda (sin costo de envío).`
           : shipping.customerChargeCents === 0
             ? ` Total de productos: ${mxn(sale.totalCents)}. Envío sin costo para usted.`
-            : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`);
+            : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`) +
+      pickupLocationText(pickupLocation);
     return `${created}\n\n${await this.paymentInstructions()}`;
   }
 

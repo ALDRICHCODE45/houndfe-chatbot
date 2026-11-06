@@ -1,5 +1,6 @@
 import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { MinimalShippingService } from './minimal-shipping.service';
+import { minimalShippingDestination } from '../domain/minimal-shipping';
 import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -207,18 +208,9 @@ function setup(
           minimalCart: {
             items: [{ productId: PRODUCT, quantity: 1, unitPriceCents: 1500 }],
             idempotencyKey: '',
+            // No pickup choice: these guidance turns walk the delivery path
+            // (store pickup needs no delivery data, C1).
             expectedTotalCents: 1500,
-            shipping: {
-              mode: 'pickup',
-              cartPin: [
-                {
-                  productId: PRODUCT,
-                  quantity: 1,
-                  unitPriceCents: 1500,
-                  finalPriceCents: 1500,
-                },
-              ],
-            },
           },
         },
       }),
@@ -387,6 +379,27 @@ describe('checkout next-step guidance through the SDK route', () => {
       'Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.',
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
+    // The customer then chooses store pickup.
+    const raw = (await h.store.get(SENDER))?.data.minimalCart;
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...(raw as object),
+        shipping: {
+          mode: 'pickup',
+          cartPin: [
+            {
+              productId: PRODUCT,
+              quantity: 1,
+              unitPriceCents: 1500,
+              finalPriceCents: 1500,
+            },
+          ],
+        },
+      },
+      new Date().toISOString(),
+    );
     const order = await h.turn(
       'hacer pedido',
       [call('prepareOrder'), say()],
@@ -402,7 +415,7 @@ describe('checkout next-step guidance through the SDK route', () => {
   it.each([false, true])(
     'fallback delivery still requires sent-summary strict consent (sent: %s)',
     async (sent) => {
-      const h = setup();
+      const h = setup({ shipping: true });
       await h.ready();
       const draft = await h.checkout.confirmedDraft(SENDER);
       if (draft === null) throw new Error('expected confirmed fixture');
@@ -532,8 +545,25 @@ describe('checkout next-step guidance through the SDK route', () => {
 
 describe('minimal order placement through the SDK route', () => {
   it('S2/S3/S6 new customer order needs armed one-shot summary consent', async () => {
-    const h = setup();
+    const h = setup({ shipping: true });
     await h.ready(true);
+    // Pin the delivery quote to the confirmed new address.
+    const draft = (await h.checkout.confirmedDraft(SENDER))!;
+    const raw = (await h.store.get(SENDER))?.data.minimalCart as {
+      shipping: object;
+    };
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...raw,
+        shipping: {
+          ...raw.shipping,
+          destinationPin: minimalShippingDestination(draft.address),
+        },
+      },
+      new Date().toISOString(),
+    );
     const offer = await h.turn(
       'Hacer pedido',
       [call('prepareOrder'), say('Inventado')],

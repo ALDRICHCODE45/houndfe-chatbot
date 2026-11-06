@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
-import { CreateCheckoutInputSchema } from '../../chatbot-api/domain/dtos/checkout.dto';
+import { Logger } from '@nestjs/common';
+import {
+  CreateCheckoutInputSchema,
+  INVALID_CHECKOUT_REQUEST,
+  SHIPPING_QUOTE_ALREADY_USED,
+} from '../../chatbot-api/domain/dtos/checkout.dto';
 import {
   PACKAGING_DATA_MISSING,
   SHIPPING_QUOTE_EXPIRED,
@@ -43,6 +48,9 @@ import {
   MINIMAL_ORDER_SHIPPING_QUOTE_NOT_FOUND_REPLY,
   MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY,
   MINIMAL_ORDER_PACKAGING_MISSING_REPLY,
+  MINIMAL_ORDER_PICKUP_NAME_REQUIRED_REPLY,
+  MINIMAL_ORDER_PICKUP_CUSTOMER_UNAVAILABLE_REPLY,
+  MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
@@ -372,6 +380,7 @@ describe('corrected saved address checkout', () => {
       await h.seedCart();
       await confirmSavedDelivery(h);
       await correctSavedDelivery(h, zipCode);
+      await newShipping(h);
       const offered = await offerOrder(h);
       expect(offered.reply).toContain(`C.P. ${zipCode}`);
       if (mode === 'existingUpdated')
@@ -417,6 +426,7 @@ describe('corrected saved address checkout', () => {
       await h.seedCart();
       await confirmSavedDelivery(h);
       await correctSavedDelivery(h);
+      await newShipping(h);
       await offerOrder(h);
       const draft = (await h.checkout.confirmedDraft(SENDER))!;
       h.api.createCheckout.mockRejectedValueOnce(
@@ -439,6 +449,7 @@ describe('corrected saved address checkout', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await correctSavedDelivery(h);
+    await newShipping(h);
     await offerOrder(h);
     h.api.createCheckout.mockRejectedValueOnce(new Error('network'));
     await yes(h);
@@ -451,6 +462,7 @@ describe('corrected saved address checkout', () => {
         .digest('hex'),
     });
     await correctSavedDelivery(h, '55636');
+    await newShipping(h);
     await offerOrder(h, 'changed');
     expect((await yes(h, 'changed-yes'))?.reply).toBe(MINIMAL_ORDER_HELD_REPLY);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
@@ -507,6 +519,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h);
+    await newShipping(h);
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('Guardaremos esta dirección con su pedido.');
   });
@@ -556,7 +569,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
       });
       const parsed = CreateCheckoutInputSchema.parse(payload);
       expect(parsed.customer).not.toHaveProperty('lastName');
-      if (parsed.deliveryAddress.mode !== 'newSaved')
+      if (parsed.deliveryAddress?.mode !== 'newSaved')
         throw new Error('payload');
       for (const key of [
         'label',
@@ -576,6 +589,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     await confirmNewDelivery(h);
+    await newShipping(h);
     await offerOrder(h);
     await yes(h);
     expect(h.api.createCheckout).toHaveBeenCalledWith(
@@ -670,6 +684,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     const h = setup();
     await h.seedCart();
     await confirmNewDelivery(h);
+    await newShipping(h);
     await offerOrder(h);
     h.api.createCheckout.mockRejectedValueOnce(new Error('lost'));
     await yes(h);
@@ -685,6 +700,7 @@ describe('new customer checkout S2/S3/S4/S6', () => {
     await confirmNewDelivery(h, {
       [field]: field === 'state' ? 'Jalisco' : 'Otro',
     });
+    await newShipping(h);
     await offerOrder(h, 'edited');
     expect((await yes(h, 'editedYes'))?.reply).toBe(MINIMAL_ORDER_HELD_REPLY);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
@@ -1015,6 +1031,7 @@ describe('atomic checkout order S1–S5', () => {
       unique(savedAddress({ version: '2026-10-02T00:00:00.000Z' })),
     );
     await confirmSavedDelivery(h);
+    await newShipping(h);
     await offerOrder(h, 'wamid.changed1');
     expect((await yes(h, 'wamid.changed2'))?.reply).toBe(
       MINIMAL_ORDER_HELD_REPLY,
@@ -1467,11 +1484,6 @@ describe('MinimalOrderService', () => {
       phoneCountryCode: '52',
       phone: '5550001111',
       customer: { mode: 'existing', customerId: CUSTOMER },
-      deliveryAddress: {
-        mode: 'existing',
-        addressId: ADDRESS,
-        expectedVersion: savedAddress().version,
-      },
       sale,
     });
     const fingerprint = createHash('sha256')
@@ -1542,11 +1554,6 @@ describe('MinimalOrderService', () => {
       phoneCountryCode: '52',
       phone: '5550001111',
       customer: { mode: 'existing', customerId: CUSTOMER },
-      deliveryAddress: {
-        mode: 'existing',
-        addressId: ADDRESS,
-        expectedVersion: savedAddress().version,
-      },
       sale: {
         cashierUserId: CASHIER,
         expectedTotalCents: 3000,
@@ -1596,7 +1603,8 @@ describe('MinimalOrderService', () => {
   ] as const)(
     'explains %s without creating a sale',
     async (reason, confirm, seed) => {
-      const h = setup();
+      // A delivery cart: store pickup needs no delivery data (C1).
+      const h = setup({ shipping: true });
       if (seed) await h.seedCart();
       if (confirm) await confirmSavedDelivery(h);
       expect(await h.order.prepareOrder(SENDER, EVENT('wamid.o1'))).toEqual({
@@ -1772,6 +1780,7 @@ describe('MinimalOrderService', () => {
     const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
+    await newShipping(h);
     await offerOrder(h);
     await h.checkout.updateDetails(SENDER, {
       firstName: 'Ana María',
@@ -1800,6 +1809,7 @@ describe('MinimalOrderService', () => {
     const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
+    await newShipping(h);
     await offerOrder(h);
     h.api.getCustomerCheckoutContext.mockImplementation(() =>
       Promise.resolve(
@@ -2272,5 +2282,300 @@ describe('minimal store pickup order (U4, S4)', () => {
     expect(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY).toContain(
       'no se creó ningún pedido',
     );
+  });
+});
+
+describe('store pickup without delivery data (C1)', () => {
+  const nameOnly = (firstName: string, lastName: string | null = null) => ({
+    label: null,
+    firstName,
+    lastName,
+    street: null,
+    exteriorNumber: null,
+    interiorNumber: null,
+    zipCode: null,
+    neighborhood: null,
+    municipality: null,
+    city: null,
+    state: null,
+    visualReferences: null,
+    carrierPhone: null,
+    useNewAddress: false,
+  });
+  const location = {
+    name: 'Sucursal Centro',
+    address: {
+      addressLine1: 'Av. Juárez 123',
+      addressLine2: null,
+      neighborhood: 'Centro',
+      municipality: 'Cuauhtémoc',
+      state: 'Ciudad de México',
+      postalCode: '06000',
+      formatted:
+        'Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000',
+    },
+    hours: {
+      timeZone: 'America/Mexico_City',
+      days: [],
+      summary: 'Lunes a sábado: 09:00–18:00. Domingo: cerrado.',
+    },
+  };
+  const pickupCreated = (pickupLocation: unknown = location) => ({
+    status: 'created',
+    customer: {
+      resolution: 'existing',
+      customerId: CUSTOMER,
+      firstName: 'Ana',
+      lastName: null,
+    },
+    address: null,
+    sale: { ...placedSale(), fulfillmentMode: 'PICKUP' },
+    pickupLocation,
+  });
+  const payloadOf = (h: Harness, call = 0) =>
+    (
+      h.api.createCheckout.mock.calls[call] as unknown as [
+        Record<string, unknown>,
+      ]
+    )[0];
+
+  it('an existing customer orders pickup with no delivery confirmation and no deliveryAddress', async () => {
+    const h = setup();
+    await h.seedCart();
+    const offer = await offerOrder(h);
+    expect(offer.reply).toContain('Datos del cliente: Ana');
+    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
+    h.api.createCheckout.mockResolvedValueOnce(pickupCreated());
+    await yes(h);
+    const payload = payloadOf(h);
+    expect(payload).not.toHaveProperty('deliveryAddress');
+    expect(payload).toMatchObject({
+      phoneCountryCode: '52',
+      customer: { mode: 'existing', customerId: CUSTOMER },
+      sale: { expectedTotalCents: 3000, shipping: { mode: 'pickup' } },
+    });
+    expect(CreateCheckoutInputSchema.safeParse(payload).success).toBe(true);
+  });
+
+  it('a new customer needs only a name and is sent as createIfAbsent', async () => {
+    const h = setup();
+    h.api.getCustomerCheckoutContext.mockResolvedValue({
+      status: 'not_found',
+      customer: null,
+      addresses: [],
+      nextAfterAddressId: null,
+    } as unknown as CustomerCheckoutContext);
+    await h.seedCart();
+    expect((await offerOrder(h)).reply).toBe(
+      MINIMAL_ORDER_PICKUP_NAME_REQUIRED_REPLY,
+    );
+    await h.checkout.updateDetails(SENDER, nameOnly('Luis', 'Pérez'));
+    const offer = await offerOrder(h, 'wamid.o3');
+    expect(offer.reply).toContain('Datos del cliente: Luis Pérez');
+    await yes(h, 'wamid.o4');
+    const payload = payloadOf(h);
+    expect(payload).not.toHaveProperty('deliveryAddress');
+    expect(payload).toMatchObject({
+      phoneCountryCode: '52',
+      customer: {
+        mode: 'createIfAbsent',
+        firstName: 'Luis',
+        lastName: 'Pérez',
+      },
+      sale: { expectedTotalCents: 3000, shipping: { mode: 'pickup' } },
+    });
+    expect(CreateCheckoutInputSchema.safeParse(payload).success).toBe(true);
+  });
+
+  it('an ambiguous phone or a failed lookup offers no pickup summary', async () => {
+    const h = setup();
+    await h.seedCart();
+    h.api.getCustomerCheckoutContext.mockResolvedValueOnce({
+      status: 'ambiguous',
+      customer: null,
+      addresses: [],
+      nextAfterAddressId: null,
+    } as unknown as CustomerCheckoutContext);
+    expect((await offerOrder(h)).reply).toBe(
+      MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
+    );
+    h.api.getCustomerCheckoutContext.mockRejectedValueOnce(new Error('down'));
+    expect((await offerOrder(h, 'wamid.o5')).reply).toBe(
+      MINIMAL_ORDER_PICKUP_CUSTOMER_UNAVAILABLE_REPLY,
+    );
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'address and hours',
+      location,
+      'Recójalo en Sucursal Centro: Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000.',
+      'Horario: Lunes a sábado: 09:00–18:00. Domingo: cerrado.',
+    ],
+    [
+      'no hours',
+      { ...location, hours: null },
+      'Recójalo en Sucursal Centro: Av. Juárez 123',
+      null,
+    ],
+    [
+      'no address',
+      { ...location, address: null },
+      'Recójalo en Sucursal Centro.',
+      'Horario:',
+    ],
+  ])(
+    'the order-created reply shows the pickup location (%s)',
+    async (_name, pickupLocation, place, hours) => {
+      const h = setup();
+      await h.seedCart();
+      await offerOrder(h);
+      h.api.createCheckout.mockResolvedValueOnce(pickupCreated(pickupLocation));
+      const reply = (await yes(h))?.reply ?? '';
+      expect(reply).toContain('folio B-0042');
+      expect(reply).toContain(place);
+      if (hours === null) expect(reply).not.toContain('Horario');
+      else expect(reply).toContain(hours);
+    },
+  );
+
+  it('omits the location when the response has none', async () => {
+    const h = setup();
+    await h.seedCart();
+    await offerOrder(h);
+    const reply = (await yes(h))?.reply ?? '';
+    expect(reply).toContain('folio B-0042');
+    expect(reply).not.toContain('Recójalo');
+  });
+});
+
+describe('checkout quote errors (C1)', () => {
+  const alreadyUsed = () =>
+    new ChatbotApiError(
+      'used',
+      409,
+      {
+        statusCode: 409,
+        error: SHIPPING_QUOTE_ALREADY_USED,
+        message: SHIPPING_QUOTE_ALREADY_USED,
+      },
+      SHIPPING_QUOTE_ALREADY_USED,
+    );
+  async function deliveryOffer() {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await shippingRecord(h);
+    await offerOrder(h);
+    return h;
+  }
+  const newQuote = {
+    quoteId: 'quote-2',
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    zoneStatus: 'CARRIER_ONLY' as const,
+    option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
+    costCents: 7000,
+    creditCents: 0,
+    customerChargeCents: 7000,
+    currency: 'MXN' as const,
+    eta: { days: 2, reason: null },
+  };
+
+  it('ALREADY_USED recovers our own sale through /checkouts/status', async () => {
+    const h = await deliveryOffer();
+    h.api.createCheckout.mockRejectedValueOnce(alreadyUsed());
+    h.api.getCheckoutStatus.mockResolvedValueOnce({
+      status: 'succeeded',
+      checkout: { status: 'created', sale: placedSale() },
+    });
+    const reply = await yes(h);
+    const key = (h.api.createCheckout.mock.calls[0] as unknown[])[1];
+    expect(h.api.getCheckoutStatus).toHaveBeenLastCalledWith(key);
+    expect(reply?.reply).toContain('folio B-0042');
+    expect(h.quotes.calls).toHaveLength(0);
+    expect(await h.minimalCart()).toMatchObject({
+      items: [],
+      placedSale: { saleId: SALE },
+    });
+  });
+
+  it('ALREADY_USED without our sale re-quotes once and shows the new summary', async () => {
+    const h = await deliveryOffer();
+    h.api.createCheckout.mockRejectedValueOnce(alreadyUsed());
+    h.quotes.enqueue(newQuote);
+    const requoted = await yes(h);
+    expect(requoted?.reply).toContain(MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY);
+    expect(requoted?.reply).toContain('Total a pagar: $100.00 MXN');
+    expect(h.quotes.calls).toHaveLength(1);
+    expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
+  });
+
+  it('MISMATCH on CUSTOMER re-checks the customer instead of re-quoting', async () => {
+    const h = await deliveryOffer();
+    const code = SHIPPING_QUOTE_MISMATCH;
+    h.api.createCheckout.mockRejectedValueOnce(
+      new ChatbotApiError(
+        code,
+        409,
+        {
+          statusCode: 409,
+          error: code,
+          message: code,
+          mismatches: ['CUSTOMER', 'LINES'],
+        },
+        code,
+      ),
+    );
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY,
+    });
+    expect(h.quotes.calls).toHaveLength(0);
+    expect(h.checkout.confirmationStatus(SENDER)).toBeNull();
+  });
+
+  it('MISMATCH on LINES re-quotes', async () => {
+    const h = await deliveryOffer();
+    const code = SHIPPING_QUOTE_MISMATCH;
+    h.api.createCheckout.mockRejectedValueOnce(
+      new ChatbotApiError(
+        code,
+        409,
+        { statusCode: 409, error: code, message: code, mismatches: ['LINES'] },
+        code,
+      ),
+    );
+    h.quotes.enqueue(newQuote);
+    expect((await yes(h))?.reply).toContain(
+      MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY,
+    );
+    expect(h.quotes.calls).toHaveLength(1);
+  });
+
+  it('INVALID_CHECKOUT_REQUEST is a logged, generic, definite rejection', async () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const h = setup();
+    await h.seedCart();
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(
+      new ChatbotApiError(
+        'bad',
+        400,
+        {
+          statusCode: 400,
+          error: INVALID_CHECKOUT_REQUEST,
+          message: 'no deliveryAddress',
+        },
+        INVALID_CHECKOUT_REQUEST,
+      ),
+    );
+    expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_REJECTED_REPLY });
+    expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(INVALID_CHECKOUT_REQUEST),
+    );
+    warn.mockRestore();
   });
 });

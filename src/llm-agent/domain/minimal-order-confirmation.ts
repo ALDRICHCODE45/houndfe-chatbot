@@ -74,13 +74,22 @@ export type MinimalOrderShipping =
     }
   | { readonly mode: 'pickup' };
 
+/** Customer identity of a store-pickup order (C1): no delivery data. */
+export interface MinimalOrderCustomer {
+  readonly firstName: string;
+  readonly lastName: string | null;
+}
+
 /** Exact content the customer consents to; detached from every input. */
 export interface MinimalOrderSnapshot {
   /** Empty for a new customer; new-address checkout resolves identity by phone. */
   readonly customerId: string;
   /** Empty for new addresses, whose exact fields live in draft. */
   readonly shippingAddressId: string;
-  readonly draft: MinimalCheckoutDraft;
+  /** `null` only for store pickup, which needs no delivery data (C1). */
+  readonly draft: MinimalCheckoutDraft | null;
+  /** Pickup identity; set exactly when `draft` is `null`. */
+  readonly customer?: MinimalOrderCustomer;
   readonly items: readonly MinimalOrderLine[];
   readonly totalCents: number;
   readonly shipping?: MinimalOrderShipping;
@@ -102,11 +111,9 @@ export function evaluateMinimalOrder(input: {
   readonly quote: MinimalOrderQuote | null;
 }): MinimalOrderEligibility {
   const { confirmedDraft, quote } = input;
-  if (quote === null) return { ok: false, reason: 'cart_unverified' };
-  if (quote.items.length === 0) return { ok: false, reason: 'empty_cart' };
-  if (quote.promotionEvaluationStatus !== 'fully_evaluated') {
-    return { ok: false, reason: 'promotion_review' };
-  }
+  const cartReason = minimalQuoteIneligibility(quote);
+  if (cartReason !== null || quote === null)
+    return { ok: false, reason: cartReason ?? 'cart_unverified' };
   if (confirmedDraft === null) {
     return { ok: false, reason: 'delivery_unconfirmed' };
   }
@@ -143,12 +150,55 @@ export function evaluateMinimalOrder(input: {
   };
 }
 
+/** Why a fresh cart quote cannot back an order, or `null` when it can. */
+export function minimalQuoteIneligibility(
+  quote: MinimalOrderQuote | null,
+): 'cart_unverified' | 'empty_cart' | 'promotion_review' | null {
+  if (quote === null) return 'cart_unverified';
+  if (quote.items.length === 0) return 'empty_cart';
+  return quote.promotionEvaluationStatus === 'fully_evaluated'
+    ? null
+    : 'promotion_review';
+}
+
+/**
+ * Store pickup (C1): a verified cart plus the customer identity only, an
+ * existing customer (`customerId`) or a new one by name (`customerId` empty).
+ * No delivery draft, address or freight is involved.
+ */
+export function evaluateMinimalPickupOrder(input: {
+  readonly quote: MinimalOrderQuote | null;
+  readonly customerId: string;
+  readonly customer: MinimalOrderCustomer;
+}): MinimalOrderEligibility {
+  const { quote } = input;
+  const cartReason = minimalQuoteIneligibility(quote);
+  if (cartReason !== null || quote === null)
+    return { ok: false, reason: cartReason ?? 'cart_unverified' };
+  return {
+    ok: true,
+    snapshot: structuredClone({
+      customerId: input.customerId,
+      shippingAddressId: '',
+      draft: null,
+      customer: {
+        firstName: input.customer.firstName,
+        lastName: input.customer.lastName,
+      },
+      items: quote.items.map((item) => ({ ...item })),
+      totalCents: quote.totalCents,
+      shipping: { mode: 'pickup' as const },
+    }),
+  };
+}
+
 /** Deterministic canonical content for exact snapshot binding. */
 function canonicalize(snapshot: MinimalOrderSnapshot): string {
   return JSON.stringify([
     snapshot.customerId,
     snapshot.shippingAddressId,
     snapshot.draft,
+    snapshot.customer ?? null,
     snapshot.items.map((item) => [
       item.productId,
       item.variantId ?? null,
@@ -205,6 +255,10 @@ export function minimalPromotionSuffix(
 
 function deliveryLine(snapshot: MinimalOrderSnapshot): string {
   const draft = snapshot.draft;
+  if (draft === null)
+    return [snapshot.customer?.firstName, snapshot.customer?.lastName]
+      .filter((part): part is string => typeof part === 'string' && part !== '')
+      .join(' ');
   const address =
     draft.address.kind === 'saved'
       ? draft.address.snapshot
@@ -273,10 +327,10 @@ export function renderMinimalOrderSummary(
     pickup
       ? `Datos del cliente: ${deliveryLine(snapshot)}`
       : `Entrega a: ${deliveryLine(snapshot)}`,
-    ...(snapshot.draft.address.kind === 'new'
+    ...(snapshot.draft?.address.kind === 'new'
       ? ['Guardaremos esta dirección con su pedido.']
       : []),
-    ...(snapshot.draft.address.kind === 'savedCorrected'
+    ...(snapshot.draft?.address.kind === 'savedCorrected'
       ? ['Actualizaremos su dirección guardada con estos datos.']
       : []),
     ...shippingLines(snapshot),

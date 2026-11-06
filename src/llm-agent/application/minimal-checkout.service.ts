@@ -137,6 +137,19 @@ export interface MinimalCheckoutReply {
 }
 
 export type MinimalCheckoutRevalidation = 'ok' | 'reselect' | 'unavailable';
+
+/** Store-pickup identity (C1): no delivery data is involved. */
+export type MinimalPickupIdentity =
+  | {
+      kind: 'existing';
+      customerId: string;
+      firstName: string;
+      lastName: string | null;
+    }
+  | { kind: 'new'; firstName: string; lastName: string | null }
+  | { kind: 'name_required' }
+  | { kind: 'ambiguous' }
+  | { kind: 'unavailable' };
 type Revalidation = MinimalCheckoutRevalidation;
 
 /** Server-owned incomplete reply listing the missing data in gate order. */
@@ -233,6 +246,40 @@ export class MinimalCheckoutService {
     draft: MinimalCheckoutDraft,
   ): Promise<MinimalCheckoutRevalidation> {
     return this.revalidate(senderId, draft);
+  }
+
+  /**
+   * Pickup identity from a fresh sender-bound lookup: the unique registered
+   * customer, or a new customer by the name in the local draft (confirmed or
+   * not). Never needs an address or a delivery confirmation.
+   */
+  async pickupIdentity(senderId: string): Promise<MinimalPickupIdentity> {
+    const phone = parseMexicanWhatsAppPhone(senderId);
+    if (phone === null) return { kind: 'unavailable' };
+    let context;
+    try {
+      context = normalizeCustomerCheckoutContext(
+        await this.api.getCustomerCheckoutContext(
+          phone.phoneCountryCode,
+          phone.phone,
+          { ...FIRST_PAGE },
+        ),
+      );
+    } catch {
+      return { kind: 'unavailable' };
+    }
+    if (context === null) return { kind: 'unavailable' };
+    if (context.status === 'ambiguous') return { kind: 'ambiguous' };
+    if (context.status === 'unique') {
+      const { customerId, firstName, lastName } = context.customer;
+      return { kind: 'existing', customerId, firstName, lastName };
+    }
+    const current = await this.readDraft(senderId);
+    if (current === null) return { kind: 'unavailable' };
+    const name = current.draft?.customer;
+    return name?.firstName === null || name === undefined
+      ? { kind: 'name_required' }
+      : { kind: 'new', firstName: name.firstName, lastName: name.lastName };
   }
 
   async lookup(

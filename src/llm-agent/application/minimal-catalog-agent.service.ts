@@ -271,11 +271,11 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 const SHIPPING_INSTRUCTIONS_FRAGMENT =
   '\n\nEnvío: llame requestShippingQuote sin argumentos solo después de que el cliente confirmó sus datos de entrega y quiere envío a domicilio; la aplicación le informa el costo, el crédito y la fecha estimada. Nunca invente ni calcule costos, créditos, transportistas ni fechas de entrega; no repita montos. ' +
-  'Si la entrega a su código postal está en validación o no está disponible, ofrezca recoger el pedido en tienda. Cuando el cliente elija recoger en tienda (puede pedirlo en cualquier momento), llame chooseStorePickup sin argumentos; no tiene costo de envío. ' +
+  'Si la entrega a su código postal está en validación o no está disponible, ofrezca recoger el pedido en tienda. Cuando el cliente elija recoger en tienda (puede pedirlo en cualquier momento), llame chooseStorePickup sin argumentos; no tiene costo de envío y no necesita dirección de entrega. Para recoger en tienda solo hace falta el nombre del cliente: si la aplicación lo pide, guárdelo con updateCheckoutDetails (solo firstName y lastName, null en los demás, useNewAddress: false) y llame prepareOrder de nuevo; no pida dirección ni la confirmación de datos de entrega. ' +
   'Después el cliente pide el resumen con prepareOrder. Nunca diga que existe un pedido.';
 
 const ORDER_INSTRUCTIONS_FRAGMENT =
-  ' Pedido: cuando los datos de entrega ya estén confirmados y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
+  ' Pedido: cuando los datos de entrega ya estén confirmados (o el cliente eligió recoger en tienda) y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
 const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 const NEXT_STEP =
@@ -1699,7 +1699,7 @@ export class MinimalCatalogAgentService {
               : {
                   prepareOrder: tool({
                     description:
-                      'Pide a la aplicación mostrar el resumen del pedido (productos, total y dirección confirmada) para que el cliente lo acepte con SÍ. No crea el pedido por sí misma' +
+                      'Pide a la aplicación mostrar el resumen del pedido (productos, total y la dirección confirmada o la recolección en tienda) para que el cliente lo acepte con SÍ. No crea el pedido por sí misma' +
                       (this.shippingAvailable()
                         ? '.'
                         : '; el envío no está incluido.'),

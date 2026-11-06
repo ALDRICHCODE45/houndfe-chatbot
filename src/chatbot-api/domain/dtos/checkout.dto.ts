@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { isCheckoutUuid } from './checkout-context.dto';
 
+/** The quote already backs another sale; nothing was written (no saleId). */
+export const SHIPPING_QUOTE_ALREADY_USED = 'SHIPPING_QUOTE_ALREADY_USED';
+/** Bad or mixed shipping shape; nothing was written. */
+export const INVALID_CHECKOUT_REQUEST = 'INVALID_CHECKOUT_REQUEST';
+
 const uuid = z.string().refine(isCheckoutUuid, 'Invalid checkout UUID');
 const cents = z.number().int().min(0).max(2147483647);
 const identifier = z.string().trim().min(1).max(200);
@@ -34,7 +39,10 @@ const address = z
   })
   .strict();
 
-/** Atomic intent: no legacy upsert or sale-only fields are accepted. */
+/**
+ * Atomic intent: no legacy upsert or sale-only fields are accepted. Store
+ * pickup sends no deliveryAddress; every other checkout requires one.
+ */
 export const CreateCheckoutInputSchema = z
   .object({
     phoneCountryCode: z.string().regex(/^[0-9]{1,10}$/),
@@ -49,24 +57,26 @@ export const CreateCheckoutInputSchema = z
         .strict(),
       z.object({ mode: z.literal('existing'), customerId: uuid }).strict(),
     ]),
-    deliveryAddress: z.discriminatedUnion('mode', [
-      z.object({ mode: z.literal('newSaved'), address }).strict(),
-      z
-        .object({
-          mode: z.literal('existingUpdated'),
-          addressId: uuid,
-          expectedVersion: instant,
-          address,
-        })
-        .strict(),
-      z
-        .object({
-          mode: z.literal('existing'),
-          addressId: uuid,
-          expectedVersion: instant,
-        })
-        .strict(),
-    ]),
+    deliveryAddress: z
+      .discriminatedUnion('mode', [
+        z.object({ mode: z.literal('newSaved'), address }).strict(),
+        z
+          .object({
+            mode: z.literal('existingUpdated'),
+            addressId: uuid,
+            expectedVersion: instant,
+            address,
+          })
+          .strict(),
+        z
+          .object({
+            mode: z.literal('existing'),
+            addressId: uuid,
+            expectedVersion: instant,
+          })
+          .strict(),
+      ])
+      .optional(),
     sale: z
       .object({
         cashierUserId: uuid,
@@ -89,7 +99,13 @@ export const CreateCheckoutInputSchema = z
       })
       .strict(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (input) =>
+      (input.sale.shipping !== undefined && 'mode' in input.sale.shipping) ===
+      (input.deliveryAddress === undefined),
+    'Pickup sends no deliveryAddress; delivery requires one',
+  );
 
 export type CreateCheckoutInput = z.infer<typeof CreateCheckoutInputSchema>;
 
@@ -101,44 +117,114 @@ export const CheckoutIdempotencyKeySchema = z
   .max(200)
   .regex(/^[\x20-\x7e]+$/);
 
-const saleResponse = z
+const saleBase = {
+  saleId: uuid,
+  folio: z.string().nullable(),
+  paymentStatus: z.enum(['CREDIT', 'PARTIAL', 'PAID']),
+  channel: z.string().min(1),
+  deliveryStatus: z.string().min(1),
+  totalCents: cents,
+  discountCents: cents,
+  paidCents: cents,
+  debtCents: cents,
+  confirmedAt: instant.nullable(),
+};
+/** Quote-backed delivery: merchandise subtotal plus the shipping charge. */
+const deliverySale = z
   .object({
-    saleId: uuid,
-    folio: z.string().nullable(),
-    paymentStatus: z.enum(['CREDIT', 'PARTIAL', 'PAID']),
-    channel: z.string().min(1),
-    deliveryStatus: z.string().min(1),
-    totalCents: cents,
-    subtotalCents: cents.optional(),
-    shippingChargeCents: cents.optional(),
-    paidCents: cents,
-    debtCents: cents,
-    confirmedAt: instant.nullable(),
-    discountCents: cents.default(0),
+    ...saleBase,
+    subtotalCents: cents,
+    shippingChargeCents: cents,
+    fulfillmentMode: z.literal('DELIVERY'),
+  })
+  .strict();
+const pickupSale = z
+  .object({ ...saleBase, fulfillmentMode: z.literal('PICKUP') })
+  .strict();
+
+const text = z.string().min(1);
+/** Branch shipping origin, or the free-text sucursal address (`formatted` only). */
+const pickupAddress = z
+  .object({
+    addressLine1: text.nullable(),
+    addressLine2: text.nullable(),
+    neighborhood: text.nullable(),
+    municipality: text.nullable(),
+    state: text.nullable(),
+    postalCode: text.nullable(),
+    formatted: text,
+  })
+  .strict();
+const clock = z.string().regex(/^[0-9]{2}:[0-9]{2}$/);
+const pickupHours = z
+  .object({
+    timeZone: text,
+    days: z.array(
+      z
+        .object({
+          day: z.enum([
+            'MONDAY',
+            'TUESDAY',
+            'WEDNESDAY',
+            'THURSDAY',
+            'FRIDAY',
+            'SATURDAY',
+            'SUNDAY',
+          ]),
+          label: text,
+          closed: z.boolean(),
+          ranges: z.array(z.object({ open: clock, close: clock }).strict()),
+        })
+        .strict(),
+    ),
+    summary: text,
+  })
+  .strict();
+const pickupLocation = z
+  .object({
+    name: text,
+    address: pickupAddress.nullable(),
+    hours: pickupHours.nullable(),
+  })
+  .strict();
+export type CheckoutPickupLocation = z.infer<typeof pickupLocation>;
+
+const customerResponse = z
+  .object({
+    resolution: z.enum(['created', 'existing']),
+    customerId: uuid,
+    firstName: z.string(),
+    lastName: z.string().nullable(),
+  })
+  .strict();
+const addressResponse = z
+  .object({
+    resolution: z.enum(['created', 'existing', 'updated']),
+    id: uuid,
+    version: instant,
   })
   .strict();
 
-const checkoutResponse = z
-  .object({
-    status: z.literal('created'),
-    customer: z
-      .object({
-        resolution: z.enum(['created', 'existing']),
-        customerId: uuid,
-        firstName: z.string(),
-        lastName: z.string().nullable(),
-      })
-      .strict(),
-    address: z
-      .object({
-        resolution: z.enum(['created', 'existing', 'updated']),
-        id: uuid,
-        version: instant,
-      })
-      .strict(),
-    sale: saleResponse,
-  })
-  .strict();
+/** Exactly the documented keys per fulfillment mode (checkout-shipping.md). */
+const checkoutResponse = z.union([
+  z
+    .object({
+      status: z.literal('created'),
+      customer: customerResponse,
+      address: addressResponse,
+      sale: deliverySale,
+    })
+    .strict(),
+  z
+    .object({
+      status: z.literal('created'),
+      customer: customerResponse,
+      address: z.null(),
+      sale: pickupSale,
+      pickupLocation,
+    })
+    .strict(),
+]);
 export type CheckoutResponse = z.infer<typeof checkoutResponse>;
 
 const checkoutStatus = z.discriminatedUnion('status', [
@@ -159,4 +245,14 @@ export function normalizeCheckoutResponse(
 export function normalizeCheckoutStatus(body: unknown): CheckoutStatus | null {
   const parsed = checkoutStatus.safeParse(body);
   return parsed.success ? parsed.data : null;
+}
+
+/** `mismatches[]` of a SHIPPING_QUOTE_MISMATCH error body; `[]` when absent. */
+export function checkoutErrorMismatches(body: unknown): string[] {
+  if (typeof body !== 'object' || body === null || !('mismatches' in body))
+    return [];
+  const { mismatches } = body;
+  return Array.isArray(mismatches)
+    ? mismatches.filter((part): part is string => typeof part === 'string')
+    : [];
 }

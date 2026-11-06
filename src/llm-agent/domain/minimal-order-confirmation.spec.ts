@@ -204,6 +204,7 @@ describe('new address S2/S3/S4/S6', () => {
       );
       expect(renderMinimalOrderSummary(verdict.snapshot)).toContain('Calle 5');
       const changed = structuredClone(verdict.snapshot);
+      if (changed.draft === null) throw new Error('draft');
       changed.draft.customer.firstName = 'Otro';
       expect(sameMinimalOrder(verdict.snapshot, changed)).toBe(false);
     },

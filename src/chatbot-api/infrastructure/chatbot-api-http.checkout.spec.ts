@@ -49,8 +49,10 @@ const receipt = {
     channel: 'ONLINE',
     deliveryStatus: 'PENDING',
     totalCents: 61000,
+    discountCents: 0,
     subtotalCents: 60000,
     shippingChargeCents: 1000,
+    fulfillmentMode: 'DELIVERY',
     paidCents: 0,
     debtCents: 61000,
     confirmedAt: null,
@@ -89,10 +91,7 @@ describe('atomic checkout mocked HTTP contract', () => {
   });
   it('posts the exact quoted payload once with authenticated headers', async () => {
     request.mockReturnValue(of(response(receipt)));
-    await expect(client.createCheckout(input, key)).resolves.toEqual({
-      ...receipt,
-      sale: { ...receipt.sale, discountCents: 0 },
-    });
+    await expect(client.createCheckout(input, key)).resolves.toEqual(receipt);
     expect(request).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -124,15 +123,28 @@ describe('atomic checkout mocked HTTP contract', () => {
   });
   it('sends pickup as the only shipping member', async () => {
     const pickup = {
-      ...input,
+      phoneCountryCode: input.phoneCountryCode,
+      phone: input.phone,
+      customer: input.customer,
       sale: {
         ...input.sale,
         expectedTotalCents: 60000,
         shipping: { mode: 'pickup' as const },
       },
     };
-    request.mockReturnValue(of(response(receipt)));
-    await client.createCheckout(pickup, key);
+    const sale: Partial<typeof receipt.sale> = { ...receipt.sale };
+    delete sale.subtotalCents;
+    delete sale.shippingChargeCents;
+    const pickupReceipt = {
+      ...receipt,
+      address: null,
+      sale: { ...sale, totalCents: 60000, fulfillmentMode: 'PICKUP' },
+      pickupLocation: { name: 'Sucursal Centro', address: null, hours: null },
+    };
+    request.mockReturnValue(of(response(pickupReceipt)));
+    await expect(client.createCheckout(pickup, key)).resolves.toEqual(
+      pickupReceipt,
+    );
     expect(request.mock.calls[0][0].data).toEqual(pickup);
   });
   it('S1 rejects null quoteId without mutating the caller', async () => {
