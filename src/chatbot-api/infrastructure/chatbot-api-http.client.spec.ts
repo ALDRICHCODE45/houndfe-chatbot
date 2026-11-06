@@ -450,7 +450,7 @@ describe('ChatbotApiHttpClient', () => {
   it('percent-encodes productId, saleId, receiptId and order-history phone segments', async () => {
     httpService.request.mockReturnValue(of(axiosResponse({})));
 
-    await client.getStock('prod+with/slash');
+    await client.getStock('prod+with/slash').catch(() => undefined);
     await client
       .uploadReceipt(
         'sale+id/1',

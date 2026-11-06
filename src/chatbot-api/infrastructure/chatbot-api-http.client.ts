@@ -6,10 +6,15 @@ import { lastValueFrom } from 'rxjs';
 import type { AppConfig } from '../../config/configuration';
 import { ChatbotApiClient } from '../domain/chatbot-api.client';
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
+import {
+  parseCatalogSearchResponse,
+  parseStockCheckResponse,
+} from '../domain/dtos/catalog.dto';
 import type {
   CatalogItemResponse,
   StockCheckResponse,
 } from '../domain/dtos/catalog.dto';
+import type { TolerantRead } from '../domain/dtos/tolerant-read';
 import type {
   CustomerLookupResponse,
   CustomerUpsertInput,
@@ -55,6 +60,7 @@ import {
   type CreateShippingQuoteInput,
   type ShippingQuoteResponse,
 } from '../domain/dtos/shipping-quote.dto';
+import { parseCartEvaluationResult } from '../domain/dtos/pricing.dto';
 import type {
   CartEvaluationResult,
   CartItemInput,
@@ -139,8 +145,11 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     private readonly sleep: SleepFn = defaultSleep,
   ) {}
 
-  searchCatalog(q: string, limit?: number): Promise<CatalogItemResponse[]> {
-    return this.request<CatalogItemResponse[]>(
+  async searchCatalog(
+    q: string,
+    limit?: number,
+  ): Promise<CatalogItemResponse[]> {
+    const response = await this.requestWithResponse<unknown>(
       {
         method: 'GET',
         url: '/chatbot-api/catalog/search',
@@ -151,23 +160,35 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       },
       { retryable: true },
     );
+    return this.acceptTolerantRead(
+      'catalog search',
+      response,
+      [200],
+      parseCatalogSearchResponse(response.data),
+    );
   }
 
-  getStock(productId: string): Promise<StockCheckResponse> {
-    return this.request<StockCheckResponse>(
+  async getStock(productId: string): Promise<StockCheckResponse> {
+    const response = await this.requestWithResponse<unknown>(
       {
         method: 'GET',
         url: `/chatbot-api/catalog/${encodeURIComponent(productId)}/stock`,
       },
       { retryable: true },
     );
+    return this.acceptTolerantRead(
+      'stock check',
+      response,
+      [200],
+      parseStockCheckResponse(response.data),
+    );
   }
 
-  evaluateCart(
+  async evaluateCart(
     items: CartItemInput[],
     customer?: { phoneCountryCode: string; phone: string },
   ): Promise<CartEvaluationResult> {
-    return this.request<CartEvaluationResult>({
+    const response = await this.requestWithResponse<unknown>({
       method: 'POST',
       url: '/chatbot-api/pricing/evaluate-cart',
       data: {
@@ -180,6 +201,43 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           : {}),
       },
     });
+    return this.acceptTolerantRead(
+      'evaluate-cart',
+      response,
+      [200, 201],
+      parseCartEvaluationResult(response.data),
+    );
+  }
+
+  /** Unknown-key names already warned about, so each is logged only once. */
+  private readonly loggedUnknownKeys = new Set<string>();
+
+  /** Shared by the three tolerant reads: an unexpected status or a body that
+   *  breaks the contract is an UpstreamError; unknown keys were stripped and
+   *  are warned once per name, never with values. */
+  private acceptTolerantRead<T>(
+    endpoint: string,
+    response: AxiosResponse<unknown>,
+    statuses: number[],
+    parsed: TolerantRead<T> | null,
+  ): T {
+    if (!statuses.includes(response.status) || parsed === null) {
+      throw new UpstreamError(
+        `Chatbot API ${endpoint} response was invalid`,
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    for (const key of parsed.unknownKeys) {
+      const name = `${endpoint}: ${key}`;
+      if (this.loggedUnknownKeys.has(name)) continue;
+      this.loggedUnknownKeys.add(name);
+      new Logger(ChatbotApiHttpClient.name).warn(
+        `Chatbot API ${endpoint} response carried an unknown key (stripped): ${key}`,
+      );
+    }
+    return parsed.value;
   }
 
   getCustomerByPhone(
