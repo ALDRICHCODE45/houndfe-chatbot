@@ -21,11 +21,12 @@ const quote: ShippingQuoteResponse = {
   quoteId: 'quote-1',
   expiresAt: '2026-11-05T12:00:00.000Z',
   zoneStatus: 'FREE',
-  option: { carrier: 'Skydropx', service: 'Express', etaDays: null },
+  option: null,
   costCents: 0,
   creditCents: 0,
   customerChargeCents: 0,
   currency: 'MXN',
+  eta: { days: 2, reason: null },
 };
 const response = (data: unknown, status = 201) => ({
   data,

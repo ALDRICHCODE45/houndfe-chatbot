@@ -2,12 +2,24 @@ import { z } from 'zod';
 import { isCheckoutUuid } from './checkout-context.dto';
 
 /**
- * `POST /chatbot-api/shipping/quotes` contract (backend
- * `docs/shipping-and-delivery-zones-proposal.md` §9-11). The backend picks the
- * cheapest carrier and computes the credit; the bot only shows the result.
- * Field names live only in this file so a backend rename touches nothing else.
+ * `POST /chatbot-api/shipping/quotes` contract (docs/contracts/shipping-quotes.md,
+ * scope `shipping:quote`). The backend picks the cheapest carrier and computes
+ * the credit; the bot only shows the result. Field names live only in this
+ * file so a backend rename touches nothing else.
  */
+/** Quote rejections (`body.error`); nothing is stored by the backend. */
+export const INVALID_SHIPPING_DESTINATION = 'INVALID_SHIPPING_DESTINATION';
+export const DUPLICATE_CART_LINE = 'DUPLICATE_CART_LINE';
+export const PRODUCT_NOT_FOUND = 'PRODUCT_NOT_FOUND';
+export const VARIANT_NOT_FOUND = 'VARIANT_NOT_FOUND';
+export const SHIPPING_ADDRESS_NOT_FOUND = 'SHIPPING_ADDRESS_NOT_FOUND';
+export const CUSTOMER_PHONE_AMBIGUOUS = 'CUSTOMER_PHONE_AMBIGUOUS';
+export const PRICE_OUT_OF_DATE = 'PRICE_OUT_OF_DATE';
+export const SHIPPING_ADDRESS_INCOMPLETE = 'SHIPPING_ADDRESS_INCOMPLETE';
 export const PACKAGING_DATA_MISSING = 'PACKAGING_DATA_MISSING';
+export const NO_SHIPPING_BOX_FITS = 'NO_SHIPPING_BOX_FITS';
+export const SHIPPING_ORIGIN_NOT_CONFIGURED = 'SHIPPING_ORIGIN_NOT_CONFIGURED';
+/** 503, also while CARRIER_ONLY has no carrier adapter. */
 export const SHIPPING_QUOTE_UNAVAILABLE = 'SHIPPING_QUOTE_UNAVAILABLE';
 /** Checkout rejections of `shipping: {quoteId}`: nothing was created. */
 export const SHIPPING_QUOTE_NOT_FOUND = 'SHIPPING_QUOTE_NOT_FOUND';
@@ -25,16 +37,13 @@ const instant = z.string().refine((value) => {
 }, 'Invalid canonical instant');
 
 const savedDestination = z.object({ shippingAddressId: uuid }).strict();
+/** Exactly the four zone fields; street and numbers never leave the bot. */
 const rawDestination = z
   .object({
-    street: z.string().min(1).max(200).optional(),
-    exteriorNumber: z.string().max(20).optional(),
-    interiorNumber: z.string().max(20).optional(),
     zipCode: z.string().min(1).max(10),
-    neighborhood: z.string().min(1).max(100),
-    municipality: z.string().min(1).max(100),
     state: z.string().min(1).max(100),
-    city: z.string().max(100).optional(),
+    municipality: z.string().min(1).max(100),
+    neighborhood: z.string().min(1).max(100),
   })
   .strict();
 
@@ -61,48 +70,66 @@ export type CreateShippingQuoteInput = z.infer<
   typeof CreateShippingQuoteInputSchema
 >;
 
-const zoneStatus = z.enum([
-  'FREE',
-  'SURCHARGE',
-  'CARRIER_ONLY',
-  'PENDING',
-  'DENIED',
-]);
-export type ShippingZoneStatus = z.infer<typeof zoneStatus>;
+export type ShippingZoneStatus =
+  | 'FREE'
+  | 'SURCHARGE'
+  | 'CARRIER_ONLY'
+  | 'PENDING'
+  | 'DENIED';
 
-const shippingQuoteResponse = z
+const option = z
   .object({
-    quoteId: z.string().min(1).nullable(),
-    expiresAt: instant,
-    zoneStatus,
-    option: z
-      .object({
-        carrier: z.string().min(1),
-        service: z.string().min(1),
-        etaDays: z.number().int().min(0).nullable(),
-      })
-      .strict()
-      .nullable(),
-    costCents: cents,
-    creditCents: cents,
-    customerChargeCents: cents,
-    currency: z.literal('MXN'),
-    eta: z
-      .object({
-        days: z.number().int().min(0).nullable(),
-        reason: z.literal('STOCK_PENDING').optional(),
-      })
-      .strict()
-      .optional(),
+    carrier: z.string().min(1),
+    service: z.string().min(1),
+    etaDays: z.number().int().min(0).nullable(),
   })
-  .strict()
-  .refine(
-    (quote) =>
-      quote.zoneStatus === 'PENDING' ||
-      quote.zoneStatus === 'DENIED' ||
-      quote.quoteId !== null,
-    { path: ['quoteId'], message: 'Deliverable zones require a quoteId' },
-  );
+  .strict();
+const eta = z
+  .object({
+    days: z.number().int().min(0).nullable(),
+    reason: z.literal('STOCK_PENDING').nullable(),
+  })
+  .strict();
+const amounts = {
+  costCents: cents,
+  creditCents: cents,
+  customerChargeCents: cents,
+  currency: z.literal('MXN'),
+  eta,
+};
+const deliverable = z
+  .object({
+    quoteId: z.string().min(1),
+    expiresAt: instant,
+    ...amounts,
+  })
+  .strict();
+const zero = z.literal(0);
+
+/**
+ * FREE and SURCHARGE carry no carrier option; CARRIER_ONLY does. DENIED and
+ * PENDING are not stored by the backend: null quoteId and expiresAt, zero
+ * amounts.
+ */
+const shippingQuoteResponse = z.discriminatedUnion('zoneStatus', [
+  deliverable.extend({
+    zoneStatus: z.enum(['FREE', 'SURCHARGE']),
+    option: z.null(),
+  }),
+  deliverable.extend({ zoneStatus: z.literal('CARRIER_ONLY'), option }),
+  z
+    .object({
+      quoteId: z.null(),
+      expiresAt: z.null(),
+      zoneStatus: z.enum(['PENDING', 'DENIED']),
+      option: option.nullable(),
+      ...amounts,
+      costCents: zero,
+      creditCents: zero,
+      customerChargeCents: zero,
+    })
+    .strict(),
+]);
 export type ShippingQuoteResponse = z.infer<typeof shippingQuoteResponse>;
 
 /** Strict parse; any unknown value or key yields `null` (fail closed). */

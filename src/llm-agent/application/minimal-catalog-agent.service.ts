@@ -58,7 +58,10 @@ import {
   MinimalCheckoutService,
   type MinimalCheckoutReply,
 } from './minimal-checkout.service';
-import { MinimalOrderService } from './minimal-order.service';
+import {
+  MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
+  MinimalOrderService,
+} from './minimal-order.service';
 import {
   MinimalShippingService,
   type MinimalPickupResult,
@@ -320,6 +323,14 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
       return 'Por ahora no puedo calcular el envío porque nos falta información de empaque de un producto, y no quiero darle un monto sin tenerla. Puede intentarlo más tarde o, si prefiere, recoger su pedido en tienda sin costo de envío.';
     case 'unavailable':
       return 'No pude calcular el envío en este momento. Puede pedírmelo de nuevo en unos minutos o, si prefiere, recoger su pedido en tienda sin costo de envío.';
+    case 'prices_changed':
+      return 'Los precios de su carrito cambiaron. Pídame ver su carrito para revisar los precios actualizados y después le cotizo el envío; no se creó ningún pedido.';
+    case 'cart_invalid':
+      return 'Un producto de su carrito ya no está disponible así. Revise su carrito, elija de nuevo el producto o su presentación, o quítelo, y vuelva a pedirme el envío; no se creó ningún pedido.';
+    case 'address_invalid':
+      return 'No pude cotizar el envío con esa dirección. ¿Me confirma o corrige su dirección de entrega (calle, número, colonia, código postal, municipio y estado)? No se creó ningún pedido.';
+    case 'phone_ambiguous':
+      return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
     case 'refused':
       return shippingRefusalReply(result.reason);
   }

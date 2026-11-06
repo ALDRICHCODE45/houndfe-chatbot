@@ -6,7 +6,15 @@ import {
 } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   CreateShippingQuoteInputSchema,
+  CUSTOMER_PHONE_AMBIGUOUS,
+  DUPLICATE_CART_LINE,
+  INVALID_SHIPPING_DESTINATION,
   PACKAGING_DATA_MISSING,
+  PRICE_OUT_OF_DATE,
+  PRODUCT_NOT_FOUND,
+  SHIPPING_ADDRESS_INCOMPLETE,
+  SHIPPING_ADDRESS_NOT_FOUND,
+  VARIANT_NOT_FOUND,
   type CreateShippingQuoteInput,
   type ShippingQuoteResponse,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
@@ -27,6 +35,7 @@ import {
   buildMinimalShippingQuote,
   minimalShippingDestination,
   type MinimalShippingCartLine,
+  type MinimalShippingQuote,
 } from '../domain/minimal-shipping';
 import {
   MinimalCartService,
@@ -56,13 +65,12 @@ export type MinimalShippingResult =
       creditCents: number;
       customerChargeCents: number;
       option: ShippingQuoteResponse['option'];
-      eta: NonNullable<ShippingQuoteResponse['eta']> | null;
+      eta: MinimalShippingQuote['eta'];
       zipCode: string | null;
     }
   | { kind: 'zone_pending'; zipCode: string | null }
   | { kind: 'zone_denied'; zipCode: string | null }
-  | { kind: 'packaging_missing' }
-  | { kind: 'unavailable' }
+  | MinimalShippingRejection
   | { kind: 'refused'; reason: MinimalShippingRefusal };
 export type MinimalPickupResult =
   | { kind: 'pickup' }
@@ -77,6 +85,41 @@ export type MinimalPickupResult =
         | 'cart_changed'
       >;
     };
+/** Backend quote rejections; nothing was stored on either side. */
+type MinimalShippingRejection = {
+  kind:
+    | 'prices_changed'
+    | 'cart_invalid'
+    | 'address_invalid'
+    | 'phone_ambiguous'
+    | 'packaging_missing'
+    | 'unavailable';
+};
+const REJECTION_KINDS: Readonly<
+  Record<string, MinimalShippingRejection['kind']>
+> = {
+  [PRICE_OUT_OF_DATE]: 'prices_changed',
+  [PRODUCT_NOT_FOUND]: 'cart_invalid',
+  [VARIANT_NOT_FOUND]: 'cart_invalid',
+  [DUPLICATE_CART_LINE]: 'cart_invalid',
+  [SHIPPING_ADDRESS_NOT_FOUND]: 'address_invalid',
+  [SHIPPING_ADDRESS_INCOMPLETE]: 'address_invalid',
+  [INVALID_SHIPPING_DESTINATION]: 'address_invalid',
+  [CUSTOMER_PHONE_AMBIGUOUS]: 'phone_ambiguous',
+  [PACKAGING_DATA_MISSING]: 'packaging_missing',
+};
+
+/** Known codes map to a reply; NO_SHIPPING_BOX_FITS, missing origin, 503 and the rest are `unavailable`. */
+function rejectionOf(error: unknown): MinimalShippingRejection {
+  const code = error instanceof ChatbotApiError ? error.errorCode : null;
+  return {
+    kind:
+      code !== null && Object.hasOwn(REJECTION_KINDS, code)
+        ? REJECTION_KINDS[code]
+        : 'unavailable',
+  };
+}
+
 const refuse = (reason: MinimalShippingRefusal): MinimalShippingResult => ({
   kind: 'refused',
   reason,
@@ -123,7 +166,10 @@ function zipOf(address: MinimalCheckoutDraftAddress): string | null {
     : address.fields.zipCode;
 }
 
-/** Saved address by id; new or corrected content as loose fields. */
+/**
+ * Saved address by id; new or corrected content as exactly the four zone
+ * fields the backend accepts (street and numbers are not sent).
+ */
 function quoteDestination(
   address: MinimalCheckoutDraftAddress,
 ): CreateShippingQuoteInput['destination'] {
@@ -131,14 +177,10 @@ function quoteDestination(
     return { shippingAddressId: address.snapshot.id };
   const f = address.fields;
   const fields = {
-    street: f.street,
-    exteriorNumber: f.exteriorNumber,
-    interiorNumber: f.interiorNumber,
     zipCode: f.zipCode,
-    neighborhood: f.neighborhood,
-    municipality: f.municipality ?? f.city,
-    city: f.city,
     state: f.state === null ? null : (toMexicanState(f.state) ?? f.state),
+    municipality: f.municipality ?? f.city,
+    neighborhood: f.neighborhood,
   };
   return Object.fromEntries(
     Object.entries(fields).filter(([, value]) => value !== null),
@@ -229,17 +271,19 @@ export class MinimalShippingService {
       try {
         response = await this.api.createShippingQuote(request.data);
       } catch (error) {
-        return error instanceof ChatbotApiError &&
-          error.errorCode === PACKAGING_DATA_MISSING
-          ? { kind: 'packaging_missing' }
-          : { kind: 'unavailable' };
+        return rejectionOf(error);
       }
       const shipping = buildMinimalShippingQuote({
         response,
         cartLines: pinLines(quote),
         destination: minimalShippingDestination(draft.address),
       });
-      if (shipping === null || this.now() >= Date.parse(shipping.expiresAt))
+      // PENDING/DENIED carry no expiresAt: nothing to expire.
+      if (
+        shipping === null ||
+        (shipping.expiresAt !== null &&
+          this.now() >= Date.parse(shipping.expiresAt))
+      )
         return { kind: 'unavailable' };
       // Delivery is a separate slot: reject changes during backend latency.
       if (

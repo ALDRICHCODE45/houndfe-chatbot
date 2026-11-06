@@ -86,11 +86,15 @@ const deliverableZones: ReadonlySet<string> = new Set([
   'SURCHARGE',
   'CARRIER_ONLY',
 ]);
-/** Mirrors the backend DTO so every accepted response re-parses from the slot. */
+/**
+ * Mirrors the backend DTO so every accepted response re-parses from the slot.
+ * PENDING/DENIED carry null quoteId and expiresAt; older slots may lack
+ * `eta.reason` or store `eta: null`.
+ */
 export const minimalShippingQuoteSchema = z
   .strictObject({
     quoteId: z.string().min(1).nullable(),
-    expiresAt: iso,
+    expiresAt: iso.nullable(),
     zoneStatus: z.enum([
       'FREE',
       'SURCHARGE',
@@ -112,7 +116,7 @@ export const minimalShippingQuoteSchema = z
     eta: z
       .strictObject({
         days: money.nullable(),
-        reason: z.literal('STOCK_PENDING').optional(),
+        reason: z.literal('STOCK_PENDING').nullable().optional(),
       })
       .nullable(),
     destinationPin: destinationSchema,
@@ -120,7 +124,8 @@ export const minimalShippingQuoteSchema = z
   })
   .refine(
     (record) =>
-      !deliverableZones.has(record.zoneStatus) || record.quoteId !== null,
+      !deliverableZones.has(record.zoneStatus) ||
+      (record.quoteId !== null && record.expiresAt !== null),
   );
 export type MinimalShippingQuote = z.infer<typeof minimalShippingQuoteSchema>;
 export type MinimalShippingCartLine = z.infer<typeof cartLineSchema>;
@@ -176,10 +181,11 @@ export function isMinimalPickup(
   return 'mode' in record && record.mode === 'pickup';
 }
 
-/** Same lines, quantities and prices as the pin, in any order. */
+/** Same lines and quantities as the pin, in any order; prices too unless `ignorePrices`. */
 function sameCartPin(
   pin: readonly MinimalShippingCartLine[],
   cartLines: readonly MinimalShippingCartLine[],
+  ignorePrices = false,
 ): boolean {
   const lines = cartLinesSchema.safeParse(cartLines);
   return (
@@ -191,19 +197,24 @@ function sameCartPin(
           line.productId === other.productId &&
           line.variantId === other.variantId &&
           line.quantity === other.quantity &&
-          line.unitPriceCents === other.unitPriceCents &&
-          line.finalPriceCents === other.finalPriceCents,
+          (ignorePrices ||
+            (line.unitPriceCents === other.unitPriceCents &&
+              line.finalPriceCents === other.finalPriceCents)),
       ),
     )
   );
 }
 
-/** A pickup choice backs an order only while its cart pin still matches. */
+/**
+ * A pickup choice backs an order while the same products and quantities
+ * remain. Pickup has no price-dependent charge, so a price or promotion
+ * change keeps it and the order re-presents the updated summary (L13).
+ */
 export function isPickupCurrent(
   record: MinimalPickup,
   cartLines: readonly MinimalShippingCartLine[],
 ): boolean {
-  return sameCartPin(record.cartPin, cartLines);
+  return sameCartPin(record.cartPin, cartLines, true);
 }
 
 /** Business days from the backend, or the STOCK_PENDING reason (S7). */
@@ -240,7 +251,11 @@ export function isShippingCurrent(
     nowMs: number;
   },
 ): 'current' | 'expired' | 'stale' | 'undeliverable' {
-  if (!deliverableZones.has(record.zoneStatus) || record.quoteId === null)
+  if (
+    !deliverableZones.has(record.zoneStatus) ||
+    record.quoteId === null ||
+    record.expiresAt === null
+  )
     return 'undeliverable';
   if (
     !Number.isFinite(context.nowMs) ||

@@ -268,11 +268,11 @@ describe('runLaunchPreflight', () => {
 });
 
 describe('shipping launch preflight', () => {
-  it('lists the backend shipping quote route with a scope still TBD by backend', () => {
+  it('lists the backend shipping quote route with the shipping:quote scope', () => {
     expect(run(safeEnv()).clientRoutes).toContainEqual({
       method: 'POST',
       path: '/chatbot-api/shipping/quotes',
-      scope: 'TBD by backend',
+      scope: 'shipping:quote',
       status: 'manual_external',
     });
   });

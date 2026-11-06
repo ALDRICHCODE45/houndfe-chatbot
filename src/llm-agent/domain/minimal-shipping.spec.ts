@@ -22,7 +22,7 @@ const lines = [
   },
 ];
 const response = (
-  overrides: Partial<ShippingQuoteResponse> = {},
+  overrides: Record<string, unknown> = {},
 ): ShippingQuoteResponse => ({
   quoteId: 'quote-1',
   expiresAt: EXPIRES,
@@ -32,6 +32,7 @@ const response = (
   creditCents: 24000,
   customerChargeCents: 6000,
   currency: 'MXN',
+  eta: { days: 3, reason: null },
   ...overrides,
 });
 const savedAddress = {
@@ -65,7 +66,7 @@ const newFields = {
   visualReferences: null,
   carrierPhone: null,
 };
-function record(overrides: Partial<ShippingQuoteResponse> = {}) {
+function record(overrides: Record<string, unknown> = {}) {
   const built = buildMinimalShippingQuote({
     response: response(overrides),
     cartLines: lines,
@@ -95,7 +96,7 @@ describe('Minimal shipping backend quote record (U3)', () => {
       destinationPin: { kind: 'saved', addressId: ADDRESS, version: VERSION },
       cartPin: lines,
     });
-    expect(record()).toHaveProperty('eta', null);
+    expect(record()).toHaveProperty('eta', { days: 3, reason: null });
     expect(record()).not.toHaveProperty('approval');
   });
 
@@ -105,7 +106,16 @@ describe('Minimal shipping backend quote record (U3)', () => {
       const undeliverable = zoneStatus === 'PENDING' || zoneStatus === 'DENIED';
       const built = record({
         zoneStatus,
-        ...(undeliverable ? { quoteId: null, option: null } : {}),
+        ...(undeliverable
+          ? {
+              quoteId: null,
+              expiresAt: null,
+              option: null,
+              costCents: 0,
+              creditCents: 0,
+              customerChargeCents: 0,
+            }
+          : {}),
       });
       expect(built.zoneStatus).toBe(zoneStatus);
       expect(isShippingCurrent(built, context())).toBe(
@@ -117,7 +127,7 @@ describe('Minimal shipping backend quote record (U3)', () => {
   it('rejects a deliverable zone without quoteId and records that fail the strict schema', () => {
     expect(
       buildMinimalShippingQuote({
-        response: { ...response(), quoteId: null },
+        response: response({ quoteId: null }),
         cartLines: lines,
         destination: minimalShippingDestination(savedAddress),
       }),
@@ -135,6 +145,23 @@ describe('Minimal shipping backend quote record (U3)', () => {
         approval: { state: 'approved' },
       }).success,
     ).toBe(false);
+  });
+
+  it('[U1b] rejects a stored deliverable quote without expiresAt', () => {
+    expect(
+      minimalShippingQuoteSchema.safeParse({ ...record(), expiresAt: null })
+        .success,
+    ).toBe(false);
+  });
+
+  it('[U1b] still reads a stored quote from before eta.reason was always present', () => {
+    expect(
+      minimalShippingQuoteSchema.safeParse({ ...record(), eta: { days: 3 } })
+        .success,
+    ).toBe(true);
+    expect(
+      minimalShippingQuoteSchema.safeParse({ ...record(), eta: null }).success,
+    ).toBe(true);
   });
 
   it('[S2] uses the backend expiresAt; at or after it the quote is expired', () => {

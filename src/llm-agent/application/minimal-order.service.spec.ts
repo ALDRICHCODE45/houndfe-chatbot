@@ -1248,14 +1248,22 @@ describe('minimal shipping order safety', () => {
       const next = { ...(raw as Record<string, unknown>) };
       if (state === 'missing') delete next.shipping;
       if (state === 'PENDING' || state === 'DENIED')
-        next.shipping = { ...record, zoneStatus: state, quoteId: null };
+        next.shipping = {
+          ...record,
+          zoneStatus: state,
+          quoteId: null,
+          expiresAt: null,
+          costCents: 0,
+          creditCents: 0,
+          customerChargeCents: 0,
+        };
       if (state === 'expired')
         next.shipping = {
           ...record,
           expiresAt: new Date(clock.now - 1).toISOString(),
         };
       // The stored quote is untouched; only the injected clock passes expiresAt.
-      if (state === 'clock') clock.now = Date.parse(record.expiresAt);
+      if (state === 'clock') clock.now = Date.parse(record.expiresAt!);
       if (state === 'cart')
         next.shipping = {
           ...record,
@@ -1604,10 +1612,13 @@ describe('MinimalOrderService', () => {
     await confirmSavedDelivery(h);
     await offerOrder(h);
     h.setPrice(1600);
-    // A price change invalidates the pinned pickup choice like a quote, so
-    // the customer must choose how to receive the order again (freight
-    // changes re-present via MINIMAL_ORDER_CHANGED_REPLY, see S4 above).
-    expect((await yes(h))?.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
+    // L13: same products and quantities keep the pickup choice; only the
+    // prices changed, so the customer sees the updated summary, not the
+    // shipping-required question.
+    const result = await yes(h);
+    expect(result?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
+    expect(result?.reply).toContain('Total de productos: $32.00 MXN');
+    expect(result?.onSent).toEqual(expect.any(Function));
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
@@ -1702,12 +1713,12 @@ describe('MinimalOrderService', () => {
           promotionEvaluationStatus: 'fully_evaluated',
         }),
     );
-    // The new totals also invalidate the pinned pickup, so no new summary is
-    // armed and nothing is sent under the outstanding key.
-    expect((await offerOrder(h, 'wamid.o3')).reply).toBe(
-      MINIMAL_ORDER_UNRESOLVED_REPLY,
-    );
-    expect(await yes(h, 'wamid.o4')).toBeNull();
+    // The pickup choice survives a price change (L13), so the new summary is
+    // shown, but its SÍ is held: nothing is sent under the outstanding key.
+    await offerOrder(h, 'wamid.o3');
+    expect(await yes(h, 'wamid.o4')).toEqual({
+      reply: MINIMAL_ORDER_HELD_REPLY,
+    });
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(await h.minimalCart()).toEqual(before);
   });
@@ -1831,12 +1842,13 @@ describe('MinimalOrderService', () => {
       h.quotes.enqueue({
         quoteId: 'quote-2',
         expiresAt: new Date(Date.now() + 60000).toISOString(),
-        zoneStatus: 'SURCHARGE',
+        zoneStatus: 'CARRIER_ONLY',
         option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
         costCents: 7000,
         creditCents: 0,
         customerChargeCents: 7000,
         currency: 'MXN',
+        eta: { days: 2, reason: null },
       });
       const requoted = await yes(h);
       expect(requoted?.reply).toContain(MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY);
@@ -2046,7 +2058,7 @@ describe('minimal store pickup order (U4, S4)', () => {
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
-  it('[S4] a pickup pinned to other prices does not back an order', async () => {
+  it('[S4] a pickup pinned to older prices of the same lines backs the current summary', async () => {
     const h = setup({ shipping: true });
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -2064,6 +2076,35 @@ describe('minimal store pickup order (U4, S4)', () => {
               quantity: 2,
               unitPriceCents: 1400,
               finalPriceCents: 2800,
+            },
+          ],
+        },
+      },
+      new Date().toISOString(),
+    );
+    const offer = await offerOrder(h);
+    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(offer.reply).toContain('Total de productos: $30.00 MXN');
+  });
+
+  it('[S4] a pickup pinned to other quantities does not back an order', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    const raw = await h.minimalCart();
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...(raw as object),
+        shipping: {
+          mode: 'pickup',
+          cartPin: [
+            {
+              productId: PRODUCT,
+              quantity: 3,
+              unitPriceCents: 1500,
+              finalPriceCents: 4500,
             },
           ],
         },

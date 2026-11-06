@@ -4,8 +4,13 @@ import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import {
+  CUSTOMER_PHONE_AMBIGUOUS,
+  NO_SHIPPING_BOX_FITS,
   PACKAGING_DATA_MISSING,
+  PRICE_OUT_OF_DATE,
+  SHIPPING_ADDRESS_INCOMPLETE,
   SHIPPING_QUOTE_UNAVAILABLE,
+  VARIANT_NOT_FOUND,
   type ShippingQuoteResponse,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
@@ -21,6 +26,7 @@ import {
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 import {
+  MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
@@ -52,7 +58,7 @@ const call = (toolName: string, input: unknown = {}) =>
     },
   ]);
 const backendQuote = (
-  overrides: Partial<ShippingQuoteResponse> = {},
+  overrides: Record<string, unknown> = {},
 ): ShippingQuoteResponse => ({
   quoteId: 'q1',
   expiresAt: new Date(Date.now() + 30 * 60000).toISOString(),
@@ -62,8 +68,20 @@ const backendQuote = (
   creditCents: 0,
   customerChargeCents: 20000,
   currency: 'MXN',
+  eta: { days: 3, reason: null },
   ...overrides,
 });
+const undeliverable = (zoneStatus: 'PENDING' | 'DENIED') =>
+  backendQuote({
+    zoneStatus,
+    quoteId: null,
+    expiresAt: null,
+    option: null,
+    eta: { days: null, reason: null },
+    costCents: 0,
+    creditCents: 0,
+    customerChargeCents: 0,
+  });
 const say = () =>
   step([{ type: 'text', text: 'Inventado $999. Pedido creado.' }], 'stop');
 
@@ -116,7 +134,7 @@ describe('minimal shipping SDK public seam', () => {
   });
   it.each([false, true])('[S1,S2,S3] backend quote then single order SÍ with its quoteId, free=%s', async free => {
     const h = await setup({ free });
-    h.quotes.enqueue(backendQuote(free ? { zoneStatus: 'FREE', creditCents: 20000, customerChargeCents: 0 } : {}));
+    h.quotes.enqueue(backendQuote(free ? { zoneStatus: 'FREE', option: null, creditCents: 20000, customerChargeCents: 0 } : {}));
     const quoted = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
     if (quoted.kind !== 'handled') throw new Error('reply');
     expect(quoted.reply).toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
@@ -136,8 +154,13 @@ describe('minimal shipping SDK public seam', () => {
     expect(payload).not.toHaveProperty('shipping.approvalId');
   });
   it.each([
-    [backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }), 'zone_pending', 'Estamos validando la entrega a su código postal 06000'],
-    [backendQuote({ zoneStatus: 'DENIED', quoteId: null, option: null }), 'zone_denied', 'Por ahora no tenemos entrega a su código postal 06000'],
+    [undeliverable('PENDING'), 'zone_pending', 'Estamos validando la entrega a su código postal 06000'],
+    [undeliverable('DENIED'), 'zone_denied', 'Por ahora no tenemos entrega a su código postal 06000'],
+    [new ChatbotApiError('quote', 409, {}, PRICE_OUT_OF_DATE), 'prices_changed', 'precios'],
+    [new ChatbotApiError('quote', 404, {}, VARIANT_NOT_FOUND), 'cart_invalid', 'carrito'],
+    [new ChatbotApiError('quote', 422, {}, SHIPPING_ADDRESS_INCOMPLETE), 'address_invalid', 'dirección'],
+    [new ChatbotApiError('quote', 409, {}, CUSTOMER_PHONE_AMBIGUOUS), 'phone_ambiguous', 'registro único'],
+    [new ChatbotApiError('quote', 422, {}, NO_SHIPPING_BOX_FITS), 'unavailable', 'en este momento'],
     [new ChatbotApiError('quote', 422, {}, PACKAGING_DATA_MISSING), 'packaging_missing', 'empaque'],
     [new ChatbotApiError('quote', 503, {}, SHIPPING_QUOTE_UNAVAILABLE), 'unavailable', 'en este momento'],
   ] as const)('tool result reflects %#: %s and no order is possible', async (answer, kind, text) => {
@@ -225,7 +248,7 @@ describe('U4 customer shipping conversation', () => {
     expect(reply).not.toContain('Llega en');
   });
   it('[S3] FREE says there is no cost for that ZIP, with the ETA line', () => {
-    expect(quoted({ zoneStatus: 'FREE', costCents: 0, creditCents: 0, customerChargeCents: 0, option: null, eta: { days: 1 } })).toBe(
+    expect(quoted({ zoneStatus: 'FREE', costCents: 0, creditCents: 0, customerChargeCents: 0, option: null, eta: { days: 1, reason: null } })).toBe(
       'Su envío al código postal 06000 no tiene costo. Llega en aproximadamente 1 día hábil. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
   });
   it('[S7] STOCK_PENDING replaces the day count', () => {
@@ -239,6 +262,26 @@ describe('U4 customer shipping conversation', () => {
   it('[S4] DENIED zone', () => {
     expect(minimalShippingReply({ kind: 'zone_denied', zipCode: '06000' })).toBe(
       'Por ahora no tenemos entrega a su código postal 06000. Puede recoger su pedido en tienda sin costo de envío. ¿Le parece?');
+  });
+  it('[U1b] a price change asks to review the cart prices before quoting again', () => {
+    const reply = minimalShippingReply({ kind: 'prices_changed' });
+    expect(reply).toBe('Los precios de su carrito cambiaron. Pídame ver su carrito para revisar los precios actualizados y después le cotizo el envío; no se creó ningún pedido.');
+  });
+  it('[U1b] a cart the backend cannot quote asks to fix the cart', () => {
+    expect(minimalShippingReply({ kind: 'cart_invalid' })).toBe(
+      'Un producto de su carrito ya no está disponible así. Revise su carrito, elija de nuevo el producto o su presentación, o quítelo, y vuelva a pedirme el envío; no se creó ningún pedido.');
+  });
+  it('[U1b] an address the backend cannot quote asks to confirm or correct it', () => {
+    expect(minimalShippingReply({ kind: 'address_invalid' })).toBe(
+      'No pude cotizar el envío con esa dirección. ¿Me confirma o corrige su dirección de entrega (calle, número, colonia, código postal, municipio y estado)? No se creó ningún pedido.');
+  });
+  it('[U1b] an ambiguous phone uses the order phone-ambiguous reply', () => {
+    expect(minimalShippingReply({ kind: 'phone_ambiguous' })).toBe(MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY);
+  });
+  it.each(['prices_changed', 'cart_invalid', 'address_invalid', 'phone_ambiguous', 'packaging_missing', 'unavailable'] as const)('[U1b] %s never shows an internal code or amount', kind => {
+    const reply = minimalShippingReply({ kind });
+    expect(reply).not.toMatch(/[A-Z]{3,}_[A-Z]+|[a-z]+_[a-z]+/);
+    expect(reply).not.toContain('$');
   });
   it.each(['packaging_missing', 'unavailable'] as const)('[S6] %s is honest, has no amount and offers pickup or a retry', kind => {
     const reply = minimalShippingReply({ kind });

@@ -10,13 +10,13 @@ per-quote human approval. The customer can also choose store pickup.
 
 Nothing to enable. The minimal route and order capability are always on (see [minimal order placement](minimal-order-placement.md)) and need the bot cashier; the minimal tools (`requestShippingQuote`, `chooseStorePickup`) are exposed whenever the order capability is available. The chatbot holds no carrier credentials: `SHIPPING_QUOTES_ENABLED`, `MINIMAL_CATALOG_SHIPPING_ENABLED`, `SHIPPING_DEMO_PARCEL_PROFILE_JSON` and every `SKYDROPX_*` variable were removed and have no effect if still set.
 
-The service credential needs access to `POST /chatbot-api/shipping/quotes`; its scope is still to be published by the backend (preflight lists it as `TBD by backend`).
+The service credential needs the `shipping:quote` scope for `POST /chatbot-api/shipping/quotes` (contract: [docs/contracts/shipping-quotes.md](contracts/shipping-quotes.md)); preflight lists the route with that scope.
 
 ## Customer flow
 
 1. Build a verified cart, select a saved address or give a new one, and confirm delivery data through the [checkout coordinator](minimal-checkout-coordinator.md). Orders to a new address go through the [atomic checkout](minimal-order-placement.md#atomic-checkout).
 2. Ask for home delivery. The model calls `requestShippingQuote({})`; the server uses only the trusted sender and the confirmed address: the saved-address snapshot, or the exact confirmed destination of a new or corrected saved address (editing street, exterior or interior number, ZIP code, neighborhood, municipality, city or state makes the quote stale; label, visual references and carrier phone do not). Arguments containing identity or amounts are rejected.
-3. The server makes one backend quote call with the cart lines (product, variant, quantity), the customer phone and the destination: `{shippingAddressId}` for a saved address, loose address fields for a new or corrected one. The answer is stored verbatim in `minimalCart.shipping` under one cart CAS, pinned to the cart lines and the confirmed destination. No order is created.
+3. The server makes one backend quote call with the cart lines (product, variant, quantity), the customer phone and the destination: `{shippingAddressId}` for a saved address, or exactly `{zipCode, state, municipality, neighborhood}` for a new or corrected one (`municipality` falls back to `city`; street and numbers are not sent). A loose destination missing any of the four fields is refused before the call. The answer is stored verbatim in `minimalCart.shipping` under one cart CAS, pinned to the cart lines and the confirmed destination. No order is created.
 4. The application tells the customer the result in server-owned Spanish (the model never authors amounts, carriers, dates or order claims):
 
    | Result                                     | Customer reply                                                                                                                                                                                |
@@ -25,8 +25,14 @@ The service credential needs access to `POST /chatbot-api/shipping/quotes`; its 
    | `SURCHARGE` / `CARRIER_ONLY`               | carrier and service when present, cost, “Usted tiene un crédito de $X por sus productos” when the credit is above zero, “Usted paga $Y”, the ETA line, then «hacer pedido» to see the summary |
    | `PENDING` (S5)                             | “Estamos validando la entrega a su código postal {CP}. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.”                           |
    | `DENIED` (S4)                              | “Por ahora no tenemos entrega a su código postal {CP}. Puede recoger su pedido en tienda sin costo de envío. ¿Le parece?”                                                                     |
-   | packaging data missing / quote unavailable | honest explanation without any amount; try again later or pick up in store                                                                                                                    |
+   | `PRICE_OUT_OF_DATE`                        | the cart prices changed: ask to see the cart for the updated prices, then quote again                                                                                                         |
+   | `PRODUCT_NOT_FOUND` / `VARIANT_NOT_FOUND` / `DUPLICATE_CART_LINE` | a cart product is no longer available that way: fix the cart (choose the product or presentation again, or remove it) and ask for shipping again                         |
+   | `SHIPPING_ADDRESS_NOT_FOUND` / `SHIPPING_ADDRESS_INCOMPLETE` / `INVALID_SHIPPING_DESTINATION` | ask the customer to confirm or correct the delivery address                                                                                       |
+   | `CUSTOMER_PHONE_AMBIGUOUS`                 | the order phone-ambiguous reply (contact the store)                                                                                                                                           |
+   | `PACKAGING_DATA_MISSING` / `NO_SHIPPING_BOX_FITS` / `SHIPPING_ORIGIN_NOT_CONFIGURED` / `SHIPPING_QUOTE_UNAVAILABLE` (503, also CARRIER_ONLY until the backend has the Skydropx adapter) / anything else | honest explanation without any amount; try again later or pick up in store |
    | refused (cart, address or order state)     | one customer sentence per reason (for example “Antes de cotizar el envío necesito que confirme sus datos de entrega.”); internal reason codes never reach the customer                        |
+
+   The backend always sends `eta: {days, reason}` with `reason` null or `STOCK_PENDING`. `FREE` and `SURCHARGE` have `option: null`; `CARRIER_ONLY` has a carrier option. `PENDING` and `DENIED` carry `quoteId: null`, `expiresAt: null` and zero amounts (the backend stores nothing); any other shape fails closed. Internal codes never reach the customer.
 
    ETA line: “Llega en aproximadamente N días hábiles” from the backend `eta.days` (or `option.etaDays`); with `eta.reason = STOCK_PENDING` (S7): “La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.” No line when the backend gives no ETA.
 
@@ -35,7 +41,7 @@ The service credential needs access to `POST /chatbot-api/shipping/quotes`; its 
 
 ## Store pickup (S4)
 
-The customer can choose store pickup at any time, and the bot offers it when the zone is `PENDING` or `DENIED`. The model calls `chooseStorePickup({})`; the server verifies the cart with fresh prices and stores `minimalCart.shipping = {mode: "pickup", cartPin}` under one cart CAS (no backend call, replaces any stored quote). It refuses an unresolved earlier order, an empty cart, promotions under review, drifted prices or a concurrent cart edit. Any cart change drops the choice, like a quote.
+The customer can choose store pickup at any time, and the bot offers it when the zone is `PENDING` or `DENIED`. The model calls `chooseStorePickup({})`; the server verifies the cart with fresh prices and stores `minimalCart.shipping = {mode: "pickup", cartPin}` under one cart CAS (no backend call, replaces any stored quote). It refuses an unresolved earlier order, an empty cart, promotions under review, drifted prices or a concurrent cart edit. A change of products or quantities drops the choice. A price or promotion change keeps it (pickup has no price-dependent charge): the order re-presents the updated summary with “Su pedido cambió desde el último resumen …” for a fresh `SÍ`.
 
 A pickup order sends `sale.shipping = {mode: "pickup"}` with `expectedTotalCents` = products only, and the summary says “Recoge en tienda (sin costo de envío)” and lists the customer data as “Datos del cliente” instead of “Entrega a”. The checkout contract still requires `deliveryAddress`, so a pickup order still needs confirmed delivery data (the order summary asks for it as usual); the address is saved with the order but nothing is shipped.
 
@@ -51,7 +57,7 @@ Shipping shares the one-presentation-per-SDK-run slot with delivery confirmation
 ## Quote validity
 
 - The backend computes the credit ($120 MXN per unit whose discounted price is above $500; credits sum) and `customerChargeCents = max(0, cost − credit)`. The chatbot never recomputes it.
-- A delivery order needs a stored quote with zone `FREE`, `SURCHARGE` or `CARRIER_ONLY`, a non-null `quoteId`, `expiresAt` still in the future, and cart and destination pins matching the current cart and confirmed address. Otherwise the customer is asked to quote shipping again.
+- A delivery order needs a stored quote with zone `FREE`, `SURCHARGE` or `CARRIER_ONLY`, a non-null `quoteId`, `expiresAt` still in the future, and cart and destination pins matching the current cart (including prices, since the credit depends on them) and confirmed address. Otherwise the customer is asked to quote shipping again.
 - The checkout sends `sale.shipping = {quoteId}` and `expectedTotalCents = products + customerChargeCents`; the quote id and charge are part of the order fingerprint, so a requote spends consent and re-presents the summary.
 - Checkout rejections (S6) create nothing and rotate the key on a first attempt. `SHIPPING_QUOTE_EXPIRED` and `SHIPPING_QUOTE_MISMATCH` trigger one automatic re-quote and present the updated summary for a fresh `SÍ` (if the re-quote is not deliverable, the customer is asked to quote shipping again). `SHIPPING_QUOTE_NOT_FOUND`, `PACKAGING_DATA_MISSING` and a 4xx `SHIPPING_QUOTE_UNAVAILABLE` get their own replies; a 5xx stays an uncertain outcome that keeps the key.
 - A delivery order without a current quote or pickup choice gets: “Antes del resumen necesito saber cómo recibirá su pedido: dígame «cotizar envío» … o «recoger en tienda» …”.

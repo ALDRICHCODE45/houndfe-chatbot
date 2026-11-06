@@ -1,8 +1,18 @@
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { CheckoutContextAddress } from '../../chatbot-api/domain/dtos/checkout-context.dto';
 import {
+  CUSTOMER_PHONE_AMBIGUOUS,
+  DUPLICATE_CART_LINE,
+  INVALID_SHIPPING_DESTINATION,
+  NO_SHIPPING_BOX_FITS,
   PACKAGING_DATA_MISSING,
+  PRICE_OUT_OF_DATE,
+  PRODUCT_NOT_FOUND,
+  SHIPPING_ADDRESS_INCOMPLETE,
+  SHIPPING_ADDRESS_NOT_FOUND,
+  SHIPPING_ORIGIN_NOT_CONFIGURED,
   SHIPPING_QUOTE_UNAVAILABLE,
+  VARIANT_NOT_FOUND,
   type ShippingQuoteResponse,
 } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
@@ -40,7 +50,7 @@ const address: CheckoutContextAddress = {
   carrierPhone: null,
 };
 const backendQuote = (
-  overrides: Partial<ShippingQuoteResponse> = {},
+  overrides: Record<string, unknown> = {},
 ): ShippingQuoteResponse => ({
   quoteId: 'quote-1',
   expiresAt: EXPIRES,
@@ -50,8 +60,21 @@ const backendQuote = (
   creditCents: 0,
   customerChargeCents: 20000,
   currency: 'MXN',
+  eta: { days: 3, reason: null },
   ...overrides,
 });
+/** Backend PENDING/DENIED: nothing stored, so no quoteId, expiry or amounts. */
+const undeliverable = (zoneStatus: 'PENDING' | 'DENIED') =>
+  backendQuote({
+    zoneStatus,
+    quoteId: null,
+    expiresAt: null,
+    option: null,
+    eta: { days: null, reason: null },
+    costCents: 0,
+    creditCents: 0,
+    customerChargeCents: 0,
+  });
 
 // prettier-ignore
 async function setup(price = 1500) {
@@ -100,7 +123,7 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     h.quotes.enqueue(backendQuote({ costCents: 30000, creditCents: 24000, customerChargeCents: 6000 }));
     expect(await h.service.quote(SENDER)).toEqual({
       kind: 'quoted', zoneStatus: 'CARRIER_ONLY', costCents: 30000, creditCents: 24000, customerChargeCents: 6000,
-      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 }, eta: null, zipCode: '06000',
+      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 }, eta: { days: 3, reason: null }, zipCode: '06000',
     });
     expect(h.quotes.calls).toEqual([{
       items: [{ productId: PRODUCT, quantity: 2 }],
@@ -113,7 +136,7 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     expect(await h.stored()).toEqual({
       quoteId: 'quote-1', expiresAt: EXPIRES, zoneStatus: 'CARRIER_ONLY',
       option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 },
-      costCents: 30000, creditCents: 24000, customerChargeCents: 6000, currency: 'MXN', eta: null,
+      costCents: 30000, creditCents: 24000, customerChargeCents: 6000, currency: 'MXN', eta: { days: 3, reason: null },
       destinationPin: { kind: 'saved', addressId: ADDRESS, version: address.version },
       cartPin: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1500, finalPriceCents: 3000 }],
     });
@@ -128,14 +151,14 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
   ] as const)('stores the %s quote and returns its kind', async (zoneStatus, expected) => {
     const h = await setup(); await h.confirm();
     const deliverable = zoneStatus !== 'PENDING' && zoneStatus !== 'DENIED';
-    h.quotes.enqueue(backendQuote({ zoneStatus, ...(deliverable ? {} : { quoteId: null, option: null }) }));
+    h.quotes.enqueue(deliverable ? backendQuote({ zoneStatus, ...(zoneStatus === 'CARRIER_ONLY' ? {} : { option: null }) }) : undeliverable(zoneStatus));
     expect(await h.service.quote(SENDER)).toMatchObject(expected);
-    expect(await h.stored()).toMatchObject({ zoneStatus, quoteId: deliverable ? 'quote-1' : null });
+    expect(await h.stored()).toMatchObject({ zoneStatus, quoteId: deliverable ? 'quote-1' : null, expiresAt: deliverable ? EXPIRES : null });
   });
 
   it('[S5] a PENDING zone registers the sender with the saved address fields', async () => {
     const h = await setup(); await h.confirm();
-    h.quotes.enqueue(backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }));
+    h.quotes.enqueue(undeliverable('PENDING'));
     expect(await h.service.quote(SENDER)).toMatchObject({ kind: 'zone_pending' });
     expect(h.zones.register).toHaveBeenCalledTimes(1);
     expect(h.zones.register).toHaveBeenCalledWith({
@@ -147,13 +170,13 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
   it('[S5] a failing zone intake still returns the PENDING answer', async () => {
     const h = await setup(); await h.confirm();
     h.zones.register.mockRejectedValueOnce(new Error('down'));
-    h.quotes.enqueue(backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }));
+    h.quotes.enqueue(undeliverable('PENDING'));
     expect(await h.service.quote(SENDER)).toEqual({ kind: 'zone_pending', zipCode: '06000' });
   });
 
   it.each(['FREE', 'DENIED'] as const)('[S5] a %s zone registers nothing', async (zoneStatus) => {
     const h = await setup(); await h.confirm();
-    h.quotes.enqueue(backendQuote({ zoneStatus, ...(zoneStatus === 'DENIED' ? { quoteId: null, option: null } : {}) }));
+    h.quotes.enqueue(zoneStatus === 'DENIED' ? undeliverable('DENIED') : backendQuote({ zoneStatus, option: null }));
     await h.service.quote(SENDER);
     expect(h.zones.register).not.toHaveBeenCalled();
   });
@@ -166,7 +189,17 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
   });
 
   it.each([
+    [PRICE_OUT_OF_DATE, 'prices_changed'],
+    [PRODUCT_NOT_FOUND, 'cart_invalid'],
+    [VARIANT_NOT_FOUND, 'cart_invalid'],
+    [DUPLICATE_CART_LINE, 'cart_invalid'],
+    [SHIPPING_ADDRESS_NOT_FOUND, 'address_invalid'],
+    [SHIPPING_ADDRESS_INCOMPLETE, 'address_invalid'],
+    [INVALID_SHIPPING_DESTINATION, 'address_invalid'],
+    [CUSTOMER_PHONE_AMBIGUOUS, 'phone_ambiguous'],
     [PACKAGING_DATA_MISSING, 'packaging_missing'],
+    [NO_SHIPPING_BOX_FITS, 'unavailable'],
+    [SHIPPING_ORIGIN_NOT_CONFIGURED, 'unavailable'],
     [SHIPPING_QUOTE_UNAVAILABLE, 'unavailable'],
     ['SOMETHING_ELSE', 'unavailable'],
   ] as const)('%s → %s without persistence', async (code, kind) => {
@@ -193,7 +226,14 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     expect(await h.stored()).toMatchObject({ quoteId: 'quote-2', customerChargeCents: 1000 });
   });
 
-  it('sends the confirmed NEW address as loose fields', async () => {
+  it('[U1b] a PENDING answer with null expiresAt is stored, not treated as expired', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(undeliverable('PENDING'));
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'zone_pending', zipCode: '06000' });
+    expect(await h.stored()).toMatchObject({ zoneStatus: 'PENDING', quoteId: null, expiresAt: null });
+  });
+
+  it('sends the confirmed NEW address as exactly the four loose fields', async () => {
     const h = await setup(); await h.confirm();
     await h.checkout.updateDetails(SENDER, { ...address, firstName: null, lastName: null, useNewAddress: true });
     const offer = await h.checkout.prepareConfirmation(SENDER, event('n1')); offer.onSent?.();
@@ -202,8 +242,7 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     h.quotes.enqueue(backendQuote());
     expect(await h.service.quote(SENDER)).toMatchObject({ kind: 'quoted' });
     expect(h.quotes.calls[0].destination).toEqual({
-      street: 'Juárez', exteriorNumber: '10', zipCode: '06000', neighborhood: 'Centro',
-      municipality: 'Cuauhtémoc', city: 'Cuauhtémoc', state: 'Ciudad de México',
+      zipCode: '06000', state: 'Ciudad de México', municipality: 'Cuauhtémoc', neighborhood: 'Centro',
     });
     expect(await h.stored()).toMatchObject({ destinationPin: { kind: 'new' } });
   });
@@ -213,7 +252,7 @@ describe('MinimalShippingService (U3: backend-signed quote)', () => {
     await h.checkout.updateDetails(SENDER, { ...address, zipCode: '55635', firstName: null, lastName: null, useNewAddress: true });
     const offer = await h.checkout.prepareConfirmation(SENDER, event('z1')); offer.onSent?.();
     await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('z2') });
-    h.quotes.enqueue(backendQuote({ zoneStatus: 'PENDING', quoteId: null, option: null }));
+    h.quotes.enqueue(undeliverable('PENDING'));
     await h.service.quote(SENDER);
     expect(h.zones.register).toHaveBeenCalledWith({
       senderId: SENDER, zipCode: '55635', state: 'Ciudad de México',
@@ -313,7 +352,7 @@ describe('MinimalShippingService.chooseStorePickup (U4, S4)', () => {
   });
   it('[S4,S5] replaces a DENIED or PENDING zone answer', async () => {
     const h = await setup(); await h.confirm();
-    h.quotes.enqueue(backendQuote({ zoneStatus: 'DENIED', quoteId: null, option: null }));
+    h.quotes.enqueue(undeliverable('DENIED'));
     await h.service.quote(SENDER);
     expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'pickup' });
     expect(await h.stored()).toEqual({ mode: 'pickup', cartPin: pin });

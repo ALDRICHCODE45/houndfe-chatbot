@@ -90,9 +90,7 @@ export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
   ['GET', '/chatbot-api/catalog/search', 'catalog:read'],
   ['GET', '/chatbot-api/catalog/:productId/stock', 'catalog:read'],
   ['POST', '/chatbot-api/pricing/evaluate-cart', 'pricing:evaluate'],
-  // Scope TBD by backend: its shipping proposal (§9-11) names the route but
-  // not the scope yet; replace this placeholder once the backend commits it.
-  ['POST', '/chatbot-api/shipping/quotes', 'TBD by backend'],
+  ['POST', '/chatbot-api/shipping/quotes', 'shipping:quote'],
   ['GET', '/chatbot-api/customers/by-phone', 'customers:read'],
   ['PUT', '/chatbot-api/customers/by-phone', 'customers:write'],
   ['POST', '/chatbot-api/sales', 'sales:create'],
@@ -116,7 +114,10 @@ export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
 const MANUAL_PREREQUISITES: readonly (readonly [string, string])[] = [
   ['backend_reachable', 'Backend reachable from the chatbot host (manual).'],
   ['bot_cashier_user', 'Bot cashier User matches CHATBOT_API_CASHIER_USER_ID.'],
-  ['service_credential', 'Seven scopes including payment-details:read.'],
+  [
+    'service_credential',
+    'Eleven scopes including payment-details:read, shipping:quote and human-decisions:create/read/ack.',
+  ],
   ['active_payment_detail', 'An active PaymentDetail exists (no 404).'],
   ['populated_catalog', 'Catalog has products for search/stock/cart flows.'],
   // Carrier, credit and zone rules are backend-owned (signed quoteId); only
