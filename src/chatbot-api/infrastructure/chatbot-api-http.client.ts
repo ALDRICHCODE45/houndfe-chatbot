@@ -128,6 +128,19 @@ type RequestOptions = {
 
 const MAX_GET_ATTEMPTS = 3;
 const INITIAL_BACKOFF_MS = 100;
+/**
+ * Per-request axios timeouts, so a hung backend never freezes a WhatsApp turn
+ * or a poller. Each applies per attempt (a timed-out GET is retried under the
+ * safe GET policy; a timed-out POST is single-attempt and an unknown outcome).
+ * The slow routes sit above the backend's own deadlines: checkout/sales ≈30 s,
+ * Skydropx quotes 30–35 s (≈16 s observed), receipt upload ≈60 s observed.
+ */
+export const CHATBOT_API_TIMEOUTS_MS = {
+  default: 10_000,
+  checkout: 30_000,
+  shippingQuote: 45_000,
+  receiptUpload: RECEIPT_UPLOAD_TIMEOUT_MS,
+} as const;
 const DECISION_ID_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Canonical lowercase RFC UUID v1–v8 with variant bits 8/9/a/b (nil uppercase/whitespace rejected). */
@@ -347,6 +360,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       url: '/chatbot-api/checkouts',
       data,
       headers: { 'X-Idempotency-Key': idempotencyKey },
+      timeout: CHATBOT_API_TIMEOUTS_MS.checkout,
     });
     const checkout = normalizeCheckoutResponse(response.data);
     if (response.status !== 201 || checkout === null) {
@@ -408,6 +422,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       method: 'POST',
       url: '/chatbot-api/shipping/quotes',
       data: parsed.data,
+      timeout: CHATBOT_API_TIMEOUTS_MS.shippingQuote,
     });
     const quote = normalizeShippingQuoteResponse(response.data);
     if (
@@ -469,6 +484,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       headers: {
         'X-Idempotency-Key': idempotencyKey,
       },
+      timeout: CHATBOT_API_TIMEOUTS_MS.checkout,
     }).then((sale) => this.normalizeSaleResponse(sale));
   }
 
@@ -513,7 +529,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
       data: toReceiptUploadForm(file, fields),
       headers: { 'X-Idempotency-Key': idempotencyKey },
-      timeout: RECEIPT_UPLOAD_TIMEOUT_MS,
+      timeout: CHATBOT_API_TIMEOUTS_MS.receiptUpload,
       signal: options.signal,
     });
 
@@ -1010,13 +1026,15 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   /**
    * Shared single-branch auth envelope: base URL + `Authorization` and
    * `X-Branch-Id` headers (ADR-16), applied identically to every
-   * chatbot-api request including the attachment-only transport.
+   * chatbot-api request including the attachment-only transport. A request
+   * without its own `timeout` gets the bounded default.
    */
   private buildAuthedRequestConfig(
     config: AxiosRequestConfig,
   ): AxiosRequestConfig {
     return {
       ...config,
+      timeout: config.timeout ?? CHATBOT_API_TIMEOUTS_MS.default,
       baseURL:
         this.configService.getOrThrow<AppConfig['chatbotApi']['baseUrl']>(
           'chatbotApi.baseUrl',
