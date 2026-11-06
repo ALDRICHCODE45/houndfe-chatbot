@@ -475,7 +475,7 @@ export class MinimalCatalogAgentService {
     config: ConfigService,
     @Inject(MINIMAL_CATALOG_SESSION_STORE)
     private readonly sessionStore: MinimalCatalogSessionStore,
-    // WU-B: optional RESTOCK confirmation gate (absent unless enabled).
+    // WU-B: RESTOCK confirmation gate; optional only as a test seam.
     @Optional()
     private readonly restock?: MinimalRestockRequestService,
     @Optional()
@@ -516,7 +516,7 @@ export class MinimalCatalogAgentService {
     this.busy.add(input.senderId);
     try {
       // The busy span covers the free consume and the SDK run.
-      if (this.restock !== undefined && this.restock.enabled) {
+      if (this.restock !== undefined) {
         const consumed = await this.restock.consume({
           senderId: input.senderId,
           text: input.text,
@@ -621,7 +621,7 @@ export class MinimalCatalogAgentService {
     }
     const currentIds = new Set<string>();
     // Offer the tool ONLY with a trusted bound inbound identity.
-    const restockEnabled = this.restock !== undefined && this.restock.enabled;
+    const restockEnabled = this.restock !== undefined;
     const restockAvailable =
       restockEnabled &&
       bindRestockInboundEvent(input.inboundEvent, input.senderId) !== null;
@@ -640,10 +640,8 @@ export class MinimalCatalogAgentService {
     const restockRun: RestockRun | null = restockAvailable
       ? { attempted: false, outcome: null }
       : null;
-    const expirationEnabled =
-      this.expiration !== undefined && this.expiration.enabled;
     const expirationAvailable =
-      expirationEnabled &&
+      this.expiration !== undefined &&
       bindExpirationInboundEvent(input.inboundEvent, input.senderId) !== null;
     const expirationReply: ExpirationReply | null = expirationAvailable
       ? { attempted: false, value: null }

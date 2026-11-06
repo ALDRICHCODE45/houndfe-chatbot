@@ -8,7 +8,7 @@ import { RealToolRegistry } from './infrastructure/real-tool-registry';
 /**
  * SaleFlowModule
  *
- * Composition root for the twelve sale-flow tools + the cart state.
+ * Composition root for the eleven sale-flow tools + the cart state.
  * `LlmAgentModule` imports this module and binds `TOOL_REGISTRY` to
  * `RealToolRegistry` (`useExisting` so rollback to `InMemoryToolRegistry`
  * stays a one-line revert).

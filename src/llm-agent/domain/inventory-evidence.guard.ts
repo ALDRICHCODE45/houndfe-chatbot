@@ -36,7 +36,6 @@ export const NON_MUTATING_TOOL_NAMES = [
   'getCustomerByPhone',
   'getOrderHistory',
   'getPaymentDetails',
-  'attachReceipt',
 ] as const;
 
 const MUTATING = new Set<string>(MUTATING_TOOL_NAMES);

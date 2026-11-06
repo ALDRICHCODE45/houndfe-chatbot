@@ -83,10 +83,7 @@ function setup(
     getPaymentDetails: jest.fn(),
   } as unknown as jest.Mocked<ChatbotApiClient>;
   const config = {
-    get: (key: string) =>
-      key === 'minimalCatalogAgent'
-        ? {}
-        : { model: 'm', maxSteps: 5, historyTurns: 12 },
+    get: () => ({ model: 'm', maxSteps: 5, historyTurns: 12 }),
   } as unknown as ConfigService;
   let steps: unknown[] = [call(), say];
   const seen: Array<{ system?: unknown; tools?: Record<string, unknown> }> = [];
@@ -396,14 +393,12 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
         kind === 'restock'
           ? {
               restock: {
-                enabled: true,
                 consume: jest.fn().mockResolvedValue(null),
                 prepare,
               } as unknown as MinimalRestockRequestService,
             }
           : {
               expiration: {
-                enabled: true,
                 prepare,
               } as unknown as MinimalExpirationRequestService,
             },

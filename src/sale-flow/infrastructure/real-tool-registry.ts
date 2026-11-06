@@ -19,7 +19,6 @@ import {
 } from '../../human-decisions/domain/shared-route-markers';
 import type { ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import type { ToolDeps } from '../application/tool-deps';
-import { makeAttachReceiptTool } from '../application/tools/attach-receipt.tool';
 import { makeCancelSaleTool } from '../application/tools/cancel-sale.tool';
 import { makeCheckStockTool } from '../application/tools/check-stock.tool';
 import { makeCreateSaleTool } from '../application/tools/create-sale.tool';
@@ -35,28 +34,23 @@ import { makeUpsertCustomerTool } from '../application/tools/upsert-customer.too
 export const HUMAN_HANDOFF_SERVICE_TOKEN = Symbol('HUMAN_HANDOFF_SERVICE');
 
 /**
- * Production `ToolRegistry` for the twelve sale-flow tools.
+ * Production `ToolRegistry` for the eleven sale-flow tools.
  *
  * Replaces the historical `InMemoryToolRegistry` placeholder in the
  * production wiring of `LlmAgentModule`. The ToolSet is built ONCE in the
  * constructor — every `getTools()` call returns the SAME frozen
  * reference, so the AI-SDK never observes tool-definition churn.
  *
- * Inventory (12):
+ * Inventory (11):
  *   - searchCatalog, checkStock, evaluateCart
  *   - getCustomerByPhone, upsertCustomer
- *   - createSale, attachReceipt, updateDelivery, getOrderHistory
+ *   - createSale, updateDelivery, getOrderHistory
  *   - getPaymentDetails  (Q1 / R11)
  *   - cancelSale         (Q8)
- *   - requestHumanAssistance (12th, human-handoff slice — R7 + needs_human_review + R14)
+ *   - requestHumanAssistance (human-handoff slice — R7 + needs_human_review + R14)
  *
  * `cashierUserId` is sourced from typed `AppConfig.chatbotApi.cashierUserId`
  * and injected into the tool deps so the model can never pick it.
- *
- * `attachReceipt` is the one exception: it stays a registry key but is
- * factory-instantiated with NO deps — it is a terminal compatibility tool
- * (strict `{}` schema, zero backend attachment calls; the server-owned
- * `ReceiptAttachmentService` is the sole §4.4.7 attachment path).
  */
 @Injectable()
 export class RealToolRegistry implements ToolRegistry {
@@ -87,7 +81,7 @@ export class RealToolRegistry implements ToolRegistry {
     // WU2B: RESTOCK is always on (human decisions are not flag-gated).
     // Nothing here reads the markers, invokes the coordinator, or runs the
     // recovery until a tool call does.
-    deps.restock = { enabled: true, markers, coordinator, recovery };
+    deps.restock = { markers, coordinator, recovery };
 
     const tools: Record<string, unknown> = {
       searchCatalog: makeSearchCatalogTool(deps),
@@ -96,10 +90,6 @@ export class RealToolRegistry implements ToolRegistry {
       getCustomerByPhone: makeGetCustomerByPhoneTool(deps),
       upsertCustomer: makeUpsertCustomerTool(deps),
       createSale: makeCreateSaleTool(deps),
-      // attachReceipt is a compatibility key wired WITHOUT any
-      // model-controlled or backend-attachment dependency (WU12):
-      // zero-arg factory, terminal guidance only.
-      attachReceipt: makeAttachReceiptTool(),
       updateDelivery: makeUpdateDeliveryTool(deps),
       getOrderHistory: makeGetOrderHistoryTool(deps),
       getPaymentDetails: makeGetPaymentDetailsTool(deps),

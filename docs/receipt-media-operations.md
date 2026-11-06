@@ -134,15 +134,15 @@ base URL or capability-signed URL. The removed variables `RECEIPT_MEDIA_ENABLED`
 `RECEIPT_MEDIA_PUBLIC_BASE_URL` and `CHATBOT_API_ATTACH_TIMEOUT_MS` have no
 effect. The remaining knobs all have defaults:
 
-| Variable | Default |
-| --- | --- |
-| `META_MEDIA_ALLOWED_HOSTS` | `lookaside.fbsbx.com` |
-| `META_MEDIA_METADATA_TIMEOUT_MS` | 10000 (< 60000) |
-| `META_MEDIA_DOWNLOAD_TIMEOUT_MS` | 30000 (< 60000, ≥ metadata) |
-| `RECEIPT_MEDIA_WORKER_CONCURRENCY` | 2 (1–8) |
-| `RECEIPT_MEDIA_WORKER_LEASE_MS` | 60000 (fixed) |
-| `RECEIPT_MEDIA_WORKER_POLL_MS` | 5000 (< 60000) |
-| `RECEIPT_MEDIA_MAX_BYTES` | 10485760 (fixed) |
+| Variable                           | Default                     |
+| ---------------------------------- | --------------------------- |
+| `META_MEDIA_ALLOWED_HOSTS`         | `lookaside.fbsbx.com`       |
+| `META_MEDIA_METADATA_TIMEOUT_MS`   | 10000 (< 60000)             |
+| `META_MEDIA_DOWNLOAD_TIMEOUT_MS`   | 30000 (< 60000, ≥ metadata) |
+| `RECEIPT_MEDIA_WORKER_CONCURRENCY` | 2 (1–8)                     |
+| `RECEIPT_MEDIA_WORKER_LEASE_MS`    | 60000 (fixed)               |
+| `RECEIPT_MEDIA_WORKER_POLL_MS`     | 5000 (< 60000)              |
+| `RECEIPT_MEDIA_MAX_BYTES`          | 10485760 (fixed)            |
 
 The service credential needs `sales:write` (upload) and `sales:read`
 (outcome); `sales:write` alone answers 403 on the outcome read.
@@ -183,12 +183,12 @@ tick; a receipt attached more than 1 h ago is read every 15 min) reads
 `GET /chatbot-api/receipts/:receiptId` for every `ATTACHED` row without a
 recorded outcome. There is no time horizon and a restart resumes from the table.
 
-| Backend outcome | Customer message (Spanish, usted) |
-| --- | --- |
-| `PENDING` (or a failed read) | none; read again later |
-| `CONFIRMED`, `debtCents = 0` | "¡Listo! Confirmamos su pago del pedido {folio}. Gracias por su compra." |
-| `CONFIRMED`, `debtCents > 0` | "Confirmamos un pago de su pedido {folio}. Queda un saldo pendiente de $1,500.00 MXN; …" |
-| `REJECTED` | "No pudimos confirmar su comprobante del pedido {folio}: {reason}. ¿Me puede enviar otro comprobante?" |
+| Backend outcome              | Customer message (Spanish, usted)                                                                      |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `PENDING` (or a failed read) | none; read again later                                                                                 |
+| `CONFIRMED`, `debtCents = 0` | "¡Listo! Confirmamos su pago del pedido {folio}. Gracias por su compra."                               |
+| `CONFIRMED`, `debtCents > 0` | "Confirmamos un pago de su pedido {folio}. Queda un saldo pendiente de $1,500.00 MXN; …"               |
+| `REJECTED`                   | "No pudimos confirmar su comprobante del pedido {folio}: {reason}. ¿Me puede enviar otro comprobante?" |
 
 The outcome, reason, remaining debt and notification are recorded once, in the
 same transaction that queues the message on the receipt outbox (sent by the
@@ -198,11 +198,11 @@ is sent and nothing loops (a Meta template for this case is a leftover).
 
 ### Claim eligibility
 
-| Status | claimBatch eligible | Notes |
-| --- | --- | --- |
-| RESERVED | ✅ | Download, extraction and backend upload |
-| DOWNLOADED | ✅ | Same-key backend upload retry |
-| ATTACHED, FAILED, ATTACH_OUTCOME_UNKNOWN | ❌ | Terminal; ATTACHED is read by the outcome poller only |
+| Status                                   | claimBatch eligible | Notes                                                 |
+| ---------------------------------------- | ------------------- | ----------------------------------------------------- |
+| RESERVED                                 | ✅                  | Download, extraction and backend upload               |
+| DOWNLOADED                               | ✅                  | Same-key backend upload retry                         |
+| ATTACHED, FAILED, ATTACH_OUTCOME_UNKNOWN | ❌                  | Terminal; ATTACHED is read by the outcome poller only |
 
 ## Evidence boundary and references
 

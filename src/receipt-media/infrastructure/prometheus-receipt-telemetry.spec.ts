@@ -5,7 +5,7 @@
  *
  * Scope: isolated per-instance Registry, three fixed TX2 events, finite
  * runtime-validated event/template allowlists, safe label spreading,
- * flag-gated no-op, no business flow escape, no arbitrary PII/URL/token/
+ * token-gated no-op, no business flow escape, no arbitrary PII/URL/token/
  * filename/caption/error in labels, time series created only after record()
  * call, truly independent registries (no shared state), and global
  * registry unchanged.
@@ -42,7 +42,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
       expect(regA).not.toBe(regB);
     });
 
-    it('records no TX2 metric until record() is called even when enabled', async () => {
+    it('records no TX2 metric until record() is called even when a token is configured', async () => {
       const instance = new PrometheusReceiptTelemetry(true);
       const registry = (instance as unknown as { registry: Registry }).registry;
       const metricsBefore = await registry.metrics();
@@ -85,8 +85,8 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
     });
   });
 
-  describe('record() — flag gating', () => {
-    it('record() is a no-op when metricsFlag is false', async () => {
+  describe('record() — token gating', () => {
+    it('record() is a no-op when no metrics token is configured', async () => {
       const instance = new PrometheusReceiptTelemetry(false);
       instance.record('receipt_outbox_tx2_committed');
       const metrics = await (
@@ -95,7 +95,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
       expect(metrics).not.toContain('receipt_outbox_tx2');
     });
 
-    it('record() produces a metric when metricsFlag is true', async () => {
+    it('record() produces a metric when a metrics token is configured', async () => {
       const instance = new PrometheusReceiptTelemetry(true);
       instance.record('receipt_outbox_tx2_committed');
       const metrics = await (
@@ -127,7 +127,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
   });
 
   describe('record() — event allowlist', () => {
-    it('records all three TX2 events when flag is true', async () => {
+    it('records all three TX2 events when a token is configured', async () => {
       const instance = new PrometheusReceiptTelemetry(true);
       const events = [
         'receipt_outbox_tx2_committed',
@@ -139,7 +139,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
       for (const event of events) expect(lines).toContain(`${event}_total 1`);
     });
 
-    it('rejects an unknown event name silently when flag is true', async () => {
+    it('rejects an unknown event name silently when a token is configured', async () => {
       const instance = new PrometheusReceiptTelemetry(true);
 
       (instance as unknown as { record: (event: string) => void }).record(
@@ -151,7 +151,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
       expect(metrics).not.toContain('unknown_event_total');
     });
 
-    it('ignores unknown event silently when flag is false', () => {
+    it('ignores unknown event silently when no token is configured', () => {
       const instance = new PrometheusReceiptTelemetry(false);
       expect(() =>
         (instance as unknown as { record: (event: string) => void }).record(
@@ -307,7 +307,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
       expect(metrics).not.toContain('receipt_media_admission_enabled');
     });
 
-    it('the gauge reflects the constructor flag value', async () => {
+    it('the gauge reflects whether a metrics token is configured', async () => {
       const enabled = new PrometheusReceiptTelemetry(true);
       const disabled = new PrometheusReceiptTelemetry(false);
       const metricsOn = await (

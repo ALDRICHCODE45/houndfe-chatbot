@@ -1035,7 +1035,11 @@ export class PostgresReceiptMediaStore
           receipt,
           `receipt-media-rejected:${input.id}`,
           REJECTED_MEDIA_TEMPLATES[input.reason],
-          {},
+          // The not-a-receipt reply names the file kind (image vs PDF).
+          input.reason === 'NOT_A_RECEIPT' &&
+            locked.detected_mime_type === 'application/pdf'
+            ? { mediaKind: 'pdf' }
+            : {},
         ),
       };
     });
@@ -1087,7 +1091,7 @@ export class PostgresReceiptMediaStore
     receipt: Row,
     dedupeKey: string,
     templateKey: string,
-    templateArgs: UploadTemplateArgs,
+    templateArgs: UploadTemplateArgs | { mediaKind: 'pdf' },
     onceOnly = false,
   ): Promise<ReceiptMediaOutboxRow | null> {
     const inserted = await c.query<Row>(

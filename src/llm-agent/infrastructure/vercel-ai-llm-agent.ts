@@ -916,7 +916,6 @@ function catalogDiagnostic(logger: Logger) {
     if (name === 'getCustomerByPhone') return 'getCustomerByPhone';
     if (name === 'upsertCustomer') return 'upsertCustomer';
     if (name === 'createSale') return 'createSale';
-    if (name === 'attachReceipt') return 'attachReceipt';
     if (name === 'updateDelivery') return 'updateDelivery';
     if (name === 'getOrderHistory') return 'getOrderHistory';
     if (name === 'getPaymentDetails') return 'getPaymentDetails';

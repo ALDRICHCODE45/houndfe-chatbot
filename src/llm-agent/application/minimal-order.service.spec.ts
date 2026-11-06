@@ -169,7 +169,6 @@ function setup(
       }),
     ),
     upsertCustomer: jest.fn(),
-    attachReceipt: jest.fn(),
     cancelSale: jest.fn(),
     updateDelivery: jest.fn(),
   };

@@ -3,15 +3,11 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
-import type { AppModule as AppModuleStatic } from '../src/app.module';
 import type { ConversationStore } from '../src/conversation/domain/conversation-store';
-import type { CONVERSATION_STORE as CONVERSATION_STORE_MODULE } from '../src/conversation/domain/conversation-store';
-import type { WHATSAPP_SENDER as WHATSAPP_SENDER_MODULE } from '../src/whatsapp/domain/whatsapp-sender.port';
 import { InMemoryConversationStore } from '../src/conversation/infrastructure/in-memory-conversation.store';
 import { InMemoryWebhookDedupStore } from '../src/whatsapp/infrastructure/in-memory-webhook-dedup.store';
-import type { WEBHOOK_DEDUP as WEBHOOK_DEDUP_MODULE } from '../src/whatsapp/domain/webhook-dedup.store';
-import type { LLM_AGENT as LLM_AGENT_MODULE } from '../src/llm-agent/domain/llm-agent.port';
 import type { LlmAgentPort } from '../src/llm-agent/domain/llm-agent.port';
+import type { VerifiedWebhookSnapshot } from '../src/whatsapp/presentation/signature.guard';
 
 describe('Webhook agent flow (e2e)', () => {
   const verifyToken = 'verify-token';
@@ -29,6 +25,8 @@ describe('Webhook agent flow (e2e)', () => {
   let whatsappSenderToken: symbol;
   let webhookDedupToken: symbol;
   let llmAgentToken: symbol;
+  let RestockInboundCapture: unknown;
+  let customerInboundCaptureToken: symbol;
   let llmAgent: LlmAgentPort;
 
   beforeEach(async () => {
@@ -54,19 +52,25 @@ describe('Webhook agent flow (e2e)', () => {
 
     const { AppModule } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../src/app.module') as typeof AppModuleStatic;
+      require('../src/app.module') as typeof import('../src/app.module');
     ({ CONVERSATION_STORE: conversationStoreToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../src/conversation/domain/conversation-store') as typeof CONVERSATION_STORE_MODULE);
+      require('../src/conversation/domain/conversation-store') as typeof import('../src/conversation/domain/conversation-store'));
     ({ WHATSAPP_SENDER: whatsappSenderToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../src/whatsapp/domain/whatsapp-sender.port') as typeof WHATSAPP_SENDER_MODULE);
+      require('../src/whatsapp/domain/whatsapp-sender.port') as typeof import('../src/whatsapp/domain/whatsapp-sender.port'));
     ({ WEBHOOK_DEDUP: webhookDedupToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../src/whatsapp/domain/webhook-dedup.store') as typeof WEBHOOK_DEDUP_MODULE);
+      require('../src/whatsapp/domain/webhook-dedup.store') as typeof import('../src/whatsapp/domain/webhook-dedup.store'));
+    ({ RestockInboundCapture } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/whatsapp/application/restock-inbound-capture') as typeof import('../src/whatsapp/application/restock-inbound-capture'));
+    ({ CUSTOMER_INBOUND_CAPTURE: customerInboundCaptureToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/whatsapp/infrastructure/customer-inbound-capture.provider') as typeof import('../src/whatsapp/infrastructure/customer-inbound-capture.provider'));
     ({ LLM_AGENT: llmAgentToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../src/llm-agent/domain/llm-agent.port') as typeof LLM_AGENT_MODULE);
+      require('../src/llm-agent/domain/llm-agent.port') as typeof import('../src/llm-agent/domain/llm-agent.port'));
 
     const mockedSendText = jest
       .fn<
@@ -101,6 +105,27 @@ describe('Webhook agent flow (e2e)', () => {
       .useValue(new InMemoryWebhookDedupStore())
       .overrideProvider(llmAgentToken)
       .useValue(llmAgent)
+      // No database here: the always-on captures pass the verified body
+      // through and record nothing.
+      .overrideProvider(RestockInboundCapture)
+      .useValue({
+        capture: (snapshot: VerifiedWebhookSnapshot | null) =>
+          Promise.resolve(
+            snapshot
+              ? {
+                  action: 'captured',
+                  event: JSON.parse(
+                    Buffer.from(snapshot.rawBodyBase64, 'base64').toString(
+                      'utf8',
+                    ),
+                  ) as unknown,
+                  evidence: [],
+                }
+              : { action: 'hold' },
+          ),
+      })
+      .overrideProvider(customerInboundCaptureToken)
+      .useValue(() => Promise.resolve({ action: 'captured', observations: [] }))
       .compile();
 
     app = moduleFixture.createNestApplication({ rawBody: true });

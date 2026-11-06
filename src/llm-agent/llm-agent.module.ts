@@ -168,8 +168,6 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
           chatbotApi,
           reservations,
           orchestrator,
-          // Human decisions are always on.
-          enabled: true,
         }),
     },
     {
@@ -196,7 +194,6 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
           chatbotApi,
           store,
           restock: {
-            enabled: true,
             markers,
             coordinator,
             recovery,

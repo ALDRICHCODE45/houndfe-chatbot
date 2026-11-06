@@ -246,22 +246,31 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
   });
 
   it.each([
-    ['NOT_A_RECEIPT', 'RECEIPT_NOT_A_RECEIPT'],
-    ['PDF_ENCRYPTED', 'RECEIPT_PDF_ENCRYPTED'],
-  ] as const)('refuses %s media without an upload', async (reason, key) => {
-    const { id, fence } = await downloaded('application/pdf');
-    const out = await store.commitRejectedMedia({ ...fence, reason });
-    expect(out).toMatchObject({
-      kind: 'committed',
-      receipt: {
-        status: 'FAILED',
-        failureStage: reason,
-        backendReceiptId: null,
-      },
-      intent: { templateKey: key, templateArgs: {} },
-    });
-    expect(await intents(id)).toHaveLength(1);
-  });
+    [
+      'NOT_A_RECEIPT',
+      'application/pdf',
+      'RECEIPT_NOT_A_RECEIPT',
+      { mediaKind: 'pdf' },
+    ],
+    ['NOT_A_RECEIPT', 'image/jpeg', 'RECEIPT_NOT_A_RECEIPT', {}],
+    ['PDF_ENCRYPTED', 'application/pdf', 'RECEIPT_PDF_ENCRYPTED', {}],
+  ] as const)(
+    'refuses %s %s media without an upload',
+    async (reason, mime, key, args) => {
+      const { id, fence } = await downloaded(mime);
+      const out = await store.commitRejectedMedia({ ...fence, reason });
+      expect(out).toMatchObject({
+        kind: 'committed',
+        receipt: {
+          status: 'FAILED',
+          failureStage: reason,
+          backendReceiptId: null,
+        },
+        intent: { templateKey: key, templateArgs: args },
+      });
+      expect(await intents(id)).toHaveLength(1);
+    },
+  );
 
   it('fences a malformed command without touching the row', async () => {
     const { fence } = await downloaded();

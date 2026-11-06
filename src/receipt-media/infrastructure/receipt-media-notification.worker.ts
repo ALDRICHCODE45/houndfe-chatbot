@@ -128,6 +128,10 @@ export const renderNotificationText = (
           : '';
       return `No pudimos confirmar su comprobante ${ofOrder(folio)}${reason.length > 0 ? `: ${reason}` : ''}. ¿Me puede enviar otro comprobante?`;
     }
+    case 'RECEIPT_NOT_A_RECEIPT':
+      return args.mediaKind === 'pdf'
+        ? 'Este archivo no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.'
+        : TEXT.RECEIPT_NOT_A_RECEIPT;
     case 'RECEIPT_SALE_ALREADY_PAID':
       return folio === null
         ? TEXT.RECEIPT_SALE_ALREADY_PAID

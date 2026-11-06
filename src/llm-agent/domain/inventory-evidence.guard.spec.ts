@@ -84,7 +84,6 @@ describe('inventory tool classification', () => {
       'getCustomerByPhone',
       'getOrderHistory',
       'getPaymentDetails',
-      'attachReceipt',
     ]);
   });
 

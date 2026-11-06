@@ -1,4 +1,3 @@
-import { makeAttachReceiptTool } from './attach-receipt.tool';
 import { makeCancelSaleTool } from './cancel-sale.tool';
 import { makeCheckStockTool } from './check-stock.tool';
 import { makeCreateSaleTool } from './create-sale.tool';
@@ -56,7 +55,6 @@ const factories: Array<[string, Factory]> = [
   ['getCustomerByPhone', makeGetCustomerByPhoneTool as unknown as Factory],
   ['upsertCustomer', makeUpsertCustomerTool as unknown as Factory],
   ['createSale', makeCreateSaleTool as unknown as Factory],
-  ['attachReceipt', makeAttachReceiptTool as unknown as Factory],
   ['updateDelivery', makeUpdateDeliveryTool as unknown as Factory],
   ['getOrderHistory', makeGetOrderHistoryTool as unknown as Factory],
   ['getPaymentDetails', makeGetPaymentDetailsTool as unknown as Factory],
@@ -90,19 +88,4 @@ describe('sale-flow tool contract (T4.1 / T4.12)', () => {
       expect(result.success).toBe(false);
     },
   );
-
-  it('attachReceipt is the strict empty-object compatibility tool ({} parses, saleId payload is rejected)', () => {
-    const tool = makeAttachReceiptTool();
-    const schema = tool.inputSchema as unknown as {
-      safeParse: (data: unknown) => { success: boolean };
-    };
-    const r = schema.safeParse({});
-    expect(r.success).toBe(true);
-    const result = schema.safeParse({
-      saleId: '00000000-0000-4000-8000-000000000001',
-      mediaUrl: 'https://example.com/receipt.jpg',
-      declaredAmountCents: 50000,
-    });
-    expect(result.success).toBe(false);
-  });
 });

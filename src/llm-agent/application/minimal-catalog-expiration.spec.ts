@@ -53,7 +53,7 @@ const STOCK = {
   variants: [],
 };
 
-function expiration(outcome: unknown, enabled = true) {
+function expiration(outcome: unknown) {
   const reserve = jest
     .fn()
     .mockResolvedValue({ action: 'claim', reason: 'single_sender_vacant' });
@@ -65,7 +65,6 @@ function expiration(outcome: unknown, enabled = true) {
       chatbotApi: { getStock: jest.fn().mockResolvedValue(STOCK) },
       reservations: { reserve },
       orchestrator: { orchestrateExpirationPost: orchestrate },
-      enabled,
     }),
   };
 }
@@ -81,10 +80,7 @@ function build(
     getStock: jest.fn().mockResolvedValue(STOCK),
   } as unknown as jest.Mocked<ChatbotApiClient>;
   const config = {
-    get: (path: string) =>
-      path === 'minimalCatalogAgent'
-        ? {}
-        : { model: 'm', maxSteps: 4, historyTurns: 12 },
+    get: () => ({ model: 'm', maxSteps: 4, historyTurns: 12 }),
   } as unknown as ConfigService;
   const captured: Array<{ system?: unknown; tools?: Record<string, unknown> }> =
     [];
@@ -175,8 +171,8 @@ describe('MinimalCatalogAgentService EXPIRATION capability (default-off E1)', ()
     expect(h.orchestrate).toHaveBeenCalledTimes(1);
   });
 
-  it('exposes prepareExpiration only when enabled and the inbound is bound', async () => {
-    const off = build([say('hola')], expiration({}, false).service);
+  it('exposes prepareExpiration only when wired and the inbound is bound', async () => {
+    const off = build([say('hola')]);
     const unbound = build([say('hola')], expiration({}).service);
     const bound = build([say('hola')], expiration({}).service);
     await invoke(off.service);
@@ -234,7 +230,6 @@ describe('MinimalCatalogAgentService EXPIRATION capability (default-off E1)', ()
       const prepare = jest.spyOn(h.service, 'prepare');
       const onSent = jest.fn();
       const restock = {
-        enabled: true,
         consume: jest.fn().mockResolvedValue(null),
         prepare: jest
           .fn()

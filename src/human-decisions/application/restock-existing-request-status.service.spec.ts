@@ -532,7 +532,6 @@ describe('RestockExistingRequestStatusService against the real HTTP client shape
         serviceKey: 'svc_test_key',
         branchId: BRANCH,
       },
-      receiptMedia: { attachTimeoutMs: 15000 },
     });
     const client = new ChatbotApiHttpClient(
       httpService,

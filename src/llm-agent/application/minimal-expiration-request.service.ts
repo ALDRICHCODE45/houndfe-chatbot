@@ -27,7 +27,6 @@ export interface MinimalExpirationDeps {
     ExpirationPostOrchestrator,
     'orchestrateExpirationPost'
   >;
-  readonly enabled: boolean;
   readonly clock?: () => number;
 }
 
@@ -44,9 +43,6 @@ export class MinimalExpirationRequestService {
   constructor(private readonly deps: MinimalExpirationDeps) {
     this.clock = deps.clock ?? (() => Date.now());
   }
-  get enabled(): boolean {
-    return this.deps.enabled === true;
-  }
   async prepare(input: {
     readonly senderId: string;
     readonly inboundEvent: unknown;
@@ -58,7 +54,6 @@ export class MinimalExpirationRequestService {
       'validation';
     const reject = (
       reason:
-        | 'disabled'
         | 'invalid_product_id'
         | 'invalid_variant_id'
         | 'unknown_product'
@@ -81,7 +76,6 @@ export class MinimalExpirationRequestService {
       return typeof value === 'string' ? 'invalid_format' : 'wrong_type';
     };
     try {
-      if (!this.enabled) return reject('disabled');
       if (!UUID.test(input.productId))
         return reject('invalid_product_id', invalidShape(input.productId));
       if (input.variantId !== undefined && !UUID.test(input.variantId)) {

@@ -6,7 +6,6 @@ const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
 };
 
 const approved = [
-  ['@aws-sdk/client-s3', '3.1121.0'],
   ['ipaddr.js', '2.5.0'],
   ['prom-client', '15.1.3'],
 ] as const;
@@ -14,19 +13,6 @@ const approved = [
 describe('Receipt media approved dependencies', () => {
   it.each(approved)('declares only approved %s', (name, version) => {
     expect(packageJson.dependencies[name]).toBe(version);
-  });
-
-  it('imports the required S3 command surface', async () => {
-    const s3 = await import('@aws-sdk/client-s3');
-    for (const name of [
-      'S3Client',
-      'PutObjectCommand',
-      'GetObjectCommand',
-      'HeadObjectCommand',
-      'DeleteObjectCommand',
-    ] as const) {
-      expect(typeof s3[name]).toBe('function');
-    }
   });
 
   it('imports the ipaddr.js parse, kind, and range surface', async () => {
@@ -44,12 +30,12 @@ describe('Receipt media approved dependencies', () => {
     expect(typeof Counter).toBe('function');
   });
 
-  it('declares no extra AWS or ipaddr type package', () => {
+  it('declares no AWS SDK or ipaddr type package', () => {
     expect(
       Object.keys(packageJson.dependencies).filter((name) =>
         name.startsWith('@aws-sdk/'),
       ),
-    ).toEqual(['@aws-sdk/client-s3']);
+    ).toEqual([]);
     expect(packageJson.devDependencies['@types/ipaddr.js']).toBeUndefined();
   });
 });

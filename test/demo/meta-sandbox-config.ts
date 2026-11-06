@@ -111,7 +111,7 @@ export function parseMetaSandboxConfig(env: SandboxEnv): MetaSandboxConfig {
     appSecret,
     accessToken,
     phoneNumberId,
-    approvedRecipient: normalizeSandboxRecipient(rawRecipient),
+    approvedRecipient: normalizeSandboxRecipient(rawRecipient, true),
     graphApiBaseUrl: resolveGraphApiBaseUrl(env),
   };
 }
@@ -147,7 +147,7 @@ export class SandboxAllowlistSender implements WhatsappSenderPort {
     }
     const to: unknown = (message as { to?: unknown } | undefined)?.to;
     const normalized =
-      typeof to === 'string' ? normalizeSandboxRecipient(to) : '';
+      typeof to === 'string' ? normalizeSandboxRecipient(to, true) : '';
     if (normalized !== this.approvedRecipient) {
       return Promise.reject(new SandboxOutboundError('recipient_not_allowed'));
     }

@@ -261,6 +261,11 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
         'Esta imagen no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
       ],
       [
+        'RECEIPT_NOT_A_RECEIPT',
+        { mediaKind: 'pdf' },
+        'Este archivo no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+      ],
+      [
         'RECEIPT_PDF_ENCRYPTED',
         {},
         'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',

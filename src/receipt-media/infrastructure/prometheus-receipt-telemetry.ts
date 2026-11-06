@@ -12,7 +12,7 @@
  *   the only metric that may exist before any record() call.
  * - No IDs, PII, URLs, tokens, filenames, captions, or arbitrary error
  *   text ever appears in metric labels.
- * - record() is a no-op when metricsFlag is false.
+ * - record() is a no-op when no metrics token is configured.
  * - Serialization failures propagate to the caller for HTTP-level handling.
  */
 import { Injectable } from '@nestjs/common';
@@ -33,7 +33,7 @@ const ALLOWED_EVENTS = new Set<ReceiptTelemetryEvent>([
 /** Set of allowed templateKey values. */
 const ALLOWED_TEMPLATE_KEYS = new Set(RECEIPT_TEMPLATE_KEYS);
 
-/** Configuration-state gauge name: reflects the metrics flag, not receipt admission. */
+/** Configuration-state gauge name: reflects whether a metrics token is configured, not receipt admission. */
 const METRICS_GAUGE_NAME = 'receipt_media_metrics_enabled';
 
 /** Guards a string label value against unsafe characters allowed by Prometheus.
@@ -73,30 +73,30 @@ export class PrometheusReceiptTelemetry {
   private readonly registry: Registry;
   private readonly counters: CounterMap = new Map();
   private readonly configGauge: Gauge<string>;
-  private readonly metricsFlag: boolean;
+  private readonly tokenConfigured: boolean;
 
   /** Constructor: creates an isolated per-instance Registry and the config gauge.
    * Each adapter instance owns its own Registry — no shared state between instances.
-   * @param metricsFlag   Controls whether record() emits counters. Independent
-   *                      of receipt-media admission/enabled flag.
+   * @param tokenConfigured  Whether a metrics token is configured; controls
+   *                         whether record() emits counters.
    */
-  constructor(metricsFlag: boolean) {
-    this.metricsFlag = metricsFlag;
+  constructor(tokenConfigured: boolean) {
+    this.tokenConfigured = tokenConfigured;
     this.registry = new Registry();
 
     this.configGauge = new Gauge({
       name: METRICS_GAUGE_NAME,
-      help: 'Whether receipt-media metrics collection is enabled (1) or disabled (0). This reflects the metrics flag only, not ingestion or TX2 health.',
+      help: 'Whether a receipt-media metrics token is configured (1) or not (0). This reflects the metrics token only, not ingestion or TX2 health.',
       registers: [this.registry],
     });
-    this.configGauge.set(metricsFlag ? 1 : 0);
+    this.configGauge.set(tokenConfigured ? 1 : 0);
   }
 
   /**
    * Records a TX2 event as a Prometheus counter increment.
    *
    * Behavior:
-   * - If metricsFlag is false: no-op, no counter is created.
+   * - If no metrics token is configured: no-op, no counter is created.
    * - Unknown event names: safely ignored, no metric emitted.
    * - Unknown templateKey labels: safely dropped.
    * - record() failures (e.g. closed registry) are swallowed silently.
@@ -108,7 +108,7 @@ export class PrometheusReceiptTelemetry {
     event: ReceiptTelemetryEvent,
     labels?: { templateKey?: string },
   ): void {
-    if (!this.metricsFlag) return;
+    if (!this.tokenConfigured) return;
     if (!ALLOWED_EVENTS.has(event)) return;
 
     // All counter work (including label extraction) is inside the best-effort

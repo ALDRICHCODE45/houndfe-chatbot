@@ -100,10 +100,11 @@ function build(
     getStock: jest.fn().mockResolvedValue(fixtures.stock),
   } as unknown as jest.Mocked<ChatbotApiClient>;
   const config = {
-    get: (path: string) =>
-      path === 'minimalCatalogAgent'
-        ? {}
-        : { model: 'm', maxSteps: 4, historyTurns: over.historyTurns ?? 12 },
+    get: () => ({
+      model: 'm',
+      maxSteps: 4,
+      historyTurns: over.historyTurns ?? 12,
+    }),
   } as unknown as ConfigService;
   const captured: Captured[] = [];
   const results: Array<{ responseMessages: ModelMessage[] }> = [];
@@ -370,10 +371,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       return generateText({ ...options, model });
     };
     const config = {
-      get: (path: string) =>
-        path === 'minimalCatalogAgent'
-          ? {}
-          : { model: 'm', maxSteps: 4, historyTurns: 12 },
+      get: () => ({ model: 'm', maxSteps: 4, historyTurns: 12 }),
     } as unknown as ConfigService;
     const service = new MinimalCatalogAgentService(
       {
@@ -620,7 +618,6 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
             chatbotApi: api,
             store: store as never,
             restock: {
-              enabled: true,
               markers,
               coordinator: { coordinate },
               recovery: { recover },
@@ -960,7 +957,6 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
 
     it('keeps an unexpected prepare failure generic and free of raw values', async () => {
       const boom = {
-        enabled: true,
         prepare: jest.fn().mockRejectedValue(new Error('RAW_SENTINEL_9f3')),
         consume: jest.fn(async () => null),
       } as unknown as MinimalRestockRequestService;
@@ -983,7 +979,6 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
 
     it('an unexpected consume failure never falls back to the legacy/SDK path', async () => {
       const boom = {
-        enabled: true,
         consume: jest.fn().mockRejectedValue(new Error('boom')),
       } as unknown as MinimalRestockRequestService;
       const { service, captured } = build([say('legacy?')], {

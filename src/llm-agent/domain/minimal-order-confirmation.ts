@@ -283,10 +283,8 @@ function deliveryLine(snapshot: MinimalOrderSnapshot): string {
 /** Shipping block of the summary: carrier, charge, credit and ETA (S3/S7). */
 function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   const shipping = snapshot.shipping;
-  if (shipping === undefined)
-    return [
-      'El envío no está incluido en este total y se coordinará por separado.',
-    ];
+  // Every presented snapshot carries a quote or pickup (`freshOrder`).
+  if (shipping === undefined) return [];
   if (!('quoteId' in shipping))
     return ['Recoge en tienda (sin costo de envío)'];
   const carrier = shipping.option

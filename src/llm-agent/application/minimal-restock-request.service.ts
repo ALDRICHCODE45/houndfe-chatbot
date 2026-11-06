@@ -238,10 +238,6 @@ export class MinimalRestockRequestService {
     this.clock = deps.clock ?? (() => Date.now());
   }
 
-  get enabled(): boolean {
-    return this.deps.restock?.enabled === true;
-  }
-
   async prepare(
     input: MinimalRestockPrepareInput,
   ): Promise<MinimalRestockPrepareResult> {
@@ -253,7 +249,7 @@ export class MinimalRestockRequestService {
       const senderId = input.senderId;
       const variantId = input.variantId ?? null;
       const bound = bindRestockInboundEvent(input.inboundEvent, senderId);
-      if (restock === undefined || restock.enabled !== true) {
+      if (restock === undefined) {
         return closed('disabled');
       }
       if (bound === null) return closed('identity_unbound');
@@ -328,7 +324,7 @@ export class MinimalRestockRequestService {
   ): Promise<MinimalRestockConsumeResult> {
     try {
       const restock = this.deps.restock;
-      if (restock === undefined || restock.enabled !== true) return null;
+      if (restock === undefined) return null;
       const senderId = input.senderId;
       const pending = this.pending.get(senderId);
       if (pending === undefined) return null;
@@ -439,7 +435,7 @@ export class MinimalRestockRequestService {
     event: RestockInboundEventIdentity,
   ): Promise<MinimalRestockConsumeResult> {
     const restock = this.deps.restock;
-    if (restock === undefined || restock.enabled !== true) {
+    if (restock === undefined) {
       return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
     }
     const result = await runRestockRoute(

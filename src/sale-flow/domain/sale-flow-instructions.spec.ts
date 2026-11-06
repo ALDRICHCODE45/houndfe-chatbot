@@ -16,8 +16,8 @@ import {
  *   - the human-handoff phrase is byte-identical, wrapped in a
  *     `noActivePaymentDetail` branch
  *   - step 11 carries the `promoReQuote` re-confirmation + fresh-UUID rule
- *   - marker order covers the 10-tool registry (getPaymentDetails between
- *     createSale and attachReceipt)
+ *   - marker order covers the tool registry (getPaymentDetails between
+ *     createSale and cancelSale)
  */
 describe('sale-flow-instructions', () => {
   const base = 'BASE_PROMPT_PLACEHOLDER';
@@ -40,7 +40,7 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('encodes the 15-step escrow flow markers in order (with getPaymentDetails between createSale and attachReceipt, cancelSale after attachReceipt)', () => {
+    it('encodes the 15-step escrow flow markers in order (with getPaymentDetails between createSale and cancelSale)', () => {
       const stepOrder = [
         'searchCatalog',
         'checkStock',
@@ -49,7 +49,6 @@ describe('sale-flow-instructions', () => {
         'upsertCustomer',
         'createSale',
         'getPaymentDetails',
-        'attachReceipt',
         'cancelSale',
       ];
       let lastIndex = -1;
@@ -394,7 +393,7 @@ describe('sale-flow-instructions', () => {
         'sí puedes agradecer información o paciencia cuando el contexto lo amerite',
       );
       expect(closing).toContain('un saludo neutral si el cliente no la indicó');
-      expect(closing).toContain('este slice no cotiza envíos');
+      expect(closing).toContain('el envío lo cotiza el backend');
     });
 
     it('keeps the shortage call immediate without a new voice-driven consent gate', () => {
@@ -528,7 +527,7 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('marks the 12-tool order with requestHumanAssistance after cancelSale (step 16)', () => {
+    it('marks the 11-tool order with requestHumanAssistance after cancelSale (step 16)', () => {
       const stepOrder = [
         'searchCatalog',
         'checkStock',
@@ -537,7 +536,6 @@ describe('sale-flow-instructions', () => {
         'upsertCustomer',
         'createSale',
         'getPaymentDetails',
-        'attachReceipt',
         'cancelSale',
         'requestHumanAssistance',
       ];
@@ -670,12 +668,12 @@ describe('sale-flow-instructions', () => {
       return line as string;
     }
 
-    it('replaces step 13 with the exact canonical terminal-guidance literal (WU12: server-owned evidence gates acknowledgement; without evidence, state could-not-be-associated + offer assistance; valid empty attachReceipt returns terminal guidance)', () => {
+    it('replaces step 13 with the exact canonical literal (server-owned evidence gates acknowledgement; without evidence, state could-not-be-associated + offer assistance)', () => {
       // Canonical spec step 13: server-owned evidence gates "acknowledge pending review";
-      // without evidence: state "could not be associated" + offer assistance; valid
-      // empty attachReceipt result = terminal guidance, never retry, never ask protected ids.
+      // without evidence: state "could not be associated" + offer assistance;
+      // never ask protected ids.
       expect(step13()).toBe(
-        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT call `attachReceipt` and do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference. Only explicit server-owned evidence that the image was correlated to an active confirmed sale permits acknowledging that it is pending human review. Without that evidence, state that the receipt could not be associated and offer human assistance — do not claim attachment or pending review. If `attachReceipt` ever returns a result from a valid empty invocation, treat it as terminal guidance — never retry it and never ask the customer for any protected identifier.',
+        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference, and never ask the customer for any protected identifier. Only explicit server-owned evidence that the image was correlated to an active confirmed sale permits acknowledging that it is pending human review. Without that evidence, state that the receipt could not be associated and offer human assistance — do not claim attachment or pending review.',
       );
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredAmountCents');
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredReference');

@@ -122,7 +122,7 @@ export function createApprovedSenderFencedRunner(deps: {
     handle: (input: { readonly senderId: string; readonly text: string }) => {
       const senderId =
         typeof input?.senderId === 'string' ? input.senderId : '';
-      if (normalizeSandboxRecipient(senderId) !== approvedRecipient) {
+      if (normalizeSandboxRecipient(senderId, true) !== approvedRecipient) {
         return Promise.resolve({ reply: NO_TOOL_SANDBOX_FALLBACK_REPLY });
       }
       return runner.handle(input);

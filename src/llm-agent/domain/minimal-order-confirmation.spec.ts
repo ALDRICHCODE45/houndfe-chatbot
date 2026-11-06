@@ -304,7 +304,6 @@ describe('renderMinimalOrderSummary', () => {
         `• Ibuprofeno — 500 mg: 2 × $15.00 MXN; importe $27.00 MXN (${label} $3.00 MXN)`,
         'Total de productos: $27.00 MXN',
         'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
-        'El envío no está incluido en este total y se coordinará por separado.',
         '',
         'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
       ].join('\n'),
@@ -325,14 +324,13 @@ describe('renderMinimalOrderSummary', () => {
     ).toBe(renderMinimalOrderSummary(snapshot));
   });
 
-  it('lists items, total, delivery address and the no-shipping notice', () => {
+  it('lists items, total and delivery address without a shipping block', () => {
     expect(renderMinimalOrderSummary(eligible())).toBe(
       [
         'Resumen de su pedido:',
         '• Ibuprofeno — 500 mg: 2 × $15.00 MXN; importe $27.00 MXN',
         'Total de productos: $27.00 MXN',
         'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
-        'El envío no está incluido en este total y se coordinará por separado.',
         '',
         'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
       ].join('\n'),

@@ -887,7 +887,6 @@ describe('temporary catalog diagnostics', () => {
     'getCustomerByPhone',
     'upsertCustomer',
     'createSale',
-    'attachReceipt',
     'updateDelivery',
     'getOrderHistory',
     'getPaymentDetails',
@@ -1634,7 +1633,6 @@ describe('inventory evidence separation (R2)', () => {
     'getCustomerByPhone',
     'getOrderHistory',
     'getPaymentDetails',
-    'attachReceipt',
   ];
 
   it.each(MUTATING)(
@@ -3051,7 +3049,6 @@ describe('real RESTOCK intake through the governed adapter (S3c2 correction)', (
       cashierUserId: productId,
       humanHandoffService: { create: humanHandoffCreate },
       restock: {
-        enabled: true,
         markers: { readForSender },
         coordinator: { coordinate },
       },

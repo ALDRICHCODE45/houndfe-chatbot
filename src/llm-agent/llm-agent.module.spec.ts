@@ -96,7 +96,6 @@ describe('LlmAgentModule integration', () => {
       getCustomerByPhone: jest.fn(),
       upsertCustomer: jest.fn(),
       createSale: jest.fn(),
-      attachReceipt: jest.fn(),
       updateDelivery: jest.fn(),
       getOrderHistory: jest.fn(),
     };
@@ -171,7 +170,7 @@ describe('LlmAgentModule integration', () => {
     const llm = moduleRef.get<LlmAgentPort>(LLM_AGENT);
     expect(llm).toBeInstanceOf(VercelAiLlmAgent);
 
-    // TOOL_REGISTRY resolves to RealToolRegistry with the 12 sale-flow tools.
+    // TOOL_REGISTRY resolves to RealToolRegistry with the 11 sale-flow tools.
     const tools = moduleRef.get<ToolRegistry>(TOOL_REGISTRY);
     expect(tools).toBeInstanceOf(RealToolRegistry);
     const toolKeys = Object.keys(tools.getTools()).sort();
@@ -183,7 +182,6 @@ describe('LlmAgentModule integration', () => {
         'getCustomerByPhone',
         'upsertCustomer',
         'createSale',
-        'attachReceipt',
         'updateDelivery',
         'getOrderHistory',
         'getPaymentDetails',
@@ -267,7 +265,6 @@ describe('LlmAgentModule integration', () => {
           : null;
       await moduleRef.close();
       return {
-        enabled: service.enabled,
         hasCallback: typeof reconcileExpired === 'function',
         bounded,
       };
@@ -275,7 +272,6 @@ describe('LlmAgentModule integration', () => {
 
     expect(process.env.HUMAN_DECISIONS_RESTOCK_ENABLED).toBe('false');
     await expect(boot()).resolves.toEqual({
-      enabled: true,
       hasCallback: true,
       bounded: false,
     });

@@ -75,7 +75,6 @@ function hz(stock: Stock = parent(), enabled = true) {
   const chatbotApi = { getStock };
   const store = { get: jest.fn(async () => null) };
   const restock = {
-    enabled: true as const,
     markers: {},
     coordinator: { coordinate },
     recovery: { recover },
@@ -128,9 +127,8 @@ async function offer(h: Hz) {
 describe('MinimalRestockRequestService', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it('default-off: enabled is false, prepare closes and consume is null', async () => {
+  it('unwired capability: prepare closes and consume is null', async () => {
     const h = hz(parent(), false);
-    expect(h.service.enabled).toBe(false);
     expect(await h.service.prepare(prep())).toEqual({
       kind: 'closed',
       reason: 'disabled',
@@ -952,7 +950,6 @@ describe('MinimalRestockRequestService', () => {
         chatbotApi: { getStock } as never,
         store: { get: jest.fn(async () => null) } as never,
         restock: {
-          enabled: true,
           markers: {},
           coordinator: { coordinate },
           recovery: {

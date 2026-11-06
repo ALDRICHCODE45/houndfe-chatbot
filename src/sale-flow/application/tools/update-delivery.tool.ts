@@ -14,7 +14,7 @@ import { mapChatbotError } from '../error-mapping';
 export function makeUpdateDeliveryTool(deps: ToolDeps) {
   return tool({
     description:
-      'Actualiza los datos de envío de una venta (carrier, tracking, fecha estimada). Reservado para una futura integración con Skydropx.',
+      'Actualiza los datos de envío de una venta (carrier, tracking, fecha estimada). El envío lo cotiza el backend.',
     inputSchema: z.object({
       saleId: z.uuid(),
       carrierName: z.string().min(1).nullish(),
