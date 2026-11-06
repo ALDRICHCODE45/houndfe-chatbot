@@ -54,3 +54,13 @@ Errors (`body.error`):
 ## Checkout (in progress on the backend, T7)
 
 `POST /chatbot-api/checkouts` and `/sales` accept `shipping: { "quoteId": "..." } | { "mode": "pickup" }`; the response adds `pickupLocation { name, address, hours }`. The old `chargeCents`/`approvalId` format still works, deprecated.
+
+## Checkout update (2026-11-05, backend local main merge e89cf14)
+
+- `POST /chatbot-api/checkouts` and `/sales` accept `shipping: { "quoteId": "..." } | { "mode": "pickup" }`.
+- Errors: 404 `SHIPPING_QUOTE_NOT_FOUND`; 409 `SHIPPING_QUOTE_EXPIRED`; 409 `SHIPPING_QUOTE_MISMATCH` with `"mismatches": ["CUSTOMER" | "LINES" | "DESTINATION"]`; 409 `SHIPPING_QUOTE_ALREADY_USED`.
+- With pickup the response has `address: null` and `pickupLocation { name, address { …, formatted } | null, hours { timeZone, days, summary } | null }`.
+- The old `{ chargeCents, approvalId }` shape still works, deprecated.
+- Credential scopes needed: `shipping:quote` and `sales:read`.
+- Without Skydropx credentials in the backend, CARRIER_ONLY answers 503 `SHIPPING_QUOTE_UNAVAILABLE`.
+- Exact request/response JSON examples requested from the backend.
