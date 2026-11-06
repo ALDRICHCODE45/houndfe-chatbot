@@ -1,6 +1,6 @@
 /** WU7 receipt ingress admission service (RM1, WA2): TX1 delegates one
- * atomic receipt admission to the durable store. Deterministic closed
- * decisions (kill-switch disabled, unsupported media, no
+ * atomic receipt admission to the durable store. Receipt ingestion is always
+ * on (R3/S7). Deterministic closed decisions (unsupported media, no
  * placed sale) return without touching the store; a supported JPEG/PNG/PDF with a
  * minimal-route `minimalCart.placedSale` (S3) builds an immutable reservation identity, reserves
  * exactly once, and maps the store's resolved outcome exhaustively (the
@@ -13,7 +13,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import { parseAmount } from '../domain/amount-parser';
-import { newObjectKey } from '../domain/object-storage.port';
 import { readPlacedOrder } from '../domain/placed-order';
 import type {
   ActiveReceiptStatus,
@@ -46,11 +45,6 @@ function declaredAmountCentsOf(caption: string | undefined): number | null {
     : null;
 }
 
-/** Narrow kill-switch seam over the WU1B `receiptMedia` config subtree. */
-export interface ReceiptMediaKillSwitch {
-  readonly enabled: boolean;
-}
-
 /** Narrow conversation seam: admission needs only the durable state read. */
 export interface ReceiptIngressConversations {
   getState(senderId: string): Promise<ConversationState | null>;
@@ -76,11 +70,10 @@ export interface ReceiptIngressInput {
   caption?: string;
 }
 
-/** Closed admission result: the three pre-admission decisions never create
+/** Closed admission result: the two pre-admission decisions never create
  * a row; every `ReceiptMediaStorePort.admit()` outcome maps 1:1, carrying
  * the persisted receipt exactly when the store returned one. */
 export type ReceiptIngressDecision =
-  | { kind: 'disabled' }
   | { kind: 'unsupported-media' }
   | { kind: 'no-placed-sale' }
   | { kind: 'reserved'; receipt: ReceiptMediaRow }
@@ -91,7 +84,6 @@ export type ReceiptIngressDecision =
 
 export class ReceiptIngressService {
   constructor(
-    private readonly killSwitch: ReceiptMediaKillSwitch,
     private readonly conversations: ReceiptIngressConversations,
     private readonly store: ReceiptIngressStore,
   ) {}
@@ -101,7 +93,6 @@ export class ReceiptIngressService {
    * intrinsic to the message; sale context is transient); no sale context
    * reserves nothing. ODD-4C: the active lookup precedes the placed-sale read. */
   async admit(input: ReceiptIngressInput): Promise<ReceiptIngressDecision> {
-    if (!this.killSwitch.enabled) return { kind: 'disabled' };
     if (!SUPPORTED_MIME_TYPES.has(input.declaredMimeType))
       return { kind: 'unsupported-media' };
     const activeStatus = await this.store.findActiveBySender({
@@ -121,7 +112,6 @@ export class ReceiptIngressService {
       providerMediaId: input.providerMediaId,
       senderId: input.senderId,
       capturedSaleId: placedOrder.saleId,
-      objectKey: newObjectKey(),
       declaredMimeType: input.declaredMimeType,
       declaredAmountCents: declaredAmountCentsOf(input.caption),
     });

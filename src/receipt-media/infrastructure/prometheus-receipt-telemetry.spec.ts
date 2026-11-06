@@ -165,12 +165,12 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
     it('accepts a valid templateKey label', async () => {
       const instance = new PrometheusReceiptTelemetry(true);
       instance.record('receipt_outbox_tx2_committed', {
-        templateKey: 'RECEIPT_AMOUNT_CONFIRM',
+        templateKey: 'RECEIPT_PAYMENT_CONFIRMED',
       });
       const metrics = await (
         instance as unknown as { registry: Registry }
       ).registry.metrics();
-      expect(metrics).toContain('templateKey="RECEIPT_AMOUNT_CONFIRM"');
+      expect(metrics).toContain('templateKey="RECEIPT_PAYMENT_CONFIRMED"');
     });
 
     it('rejects an unknown templateKey label silently', async () => {
@@ -197,7 +197,7 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
           record: (event: string, labels?: unknown) => void;
         }
       ).record('receipt_outbox_tx2_committed', {
-        templateKey: 'RECEIPT_AMOUNT_CONFIRM',
+        templateKey: 'RECEIPT_PAYMENT_CONFIRMED',
         __proto__: { admin: true },
         constructor: { prototype: { evil: 'injected' } },
       });
@@ -223,13 +223,13 @@ describe('PrometheusReceiptTelemetry (behavior spec)', () => {
         caption: 'synthetic-private-caption',
         error: 'synthetic-private-error',
       };
-      const labels = { templateKey: 'RECEIPT_AMOUNT_CONFIRM', ...sensitive };
+      const labels = { templateKey: 'RECEIPT_PAYMENT_CONFIRMED', ...sensitive };
       instance.record('receipt_outbox_tx2_committed', labels);
       instance.record('receipt_outbox_tx2_committed', {
         templateKey: sensitive.token,
       });
       const metrics = await instance.metrics();
-      expect(metrics).toContain('templateKey="RECEIPT_AMOUNT_CONFIRM"');
+      expect(metrics).toContain('templateKey="RECEIPT_PAYMENT_CONFIRMED"');
       for (const value of Object.values(sensitive))
         expect(metrics).not.toContain(value);
     });

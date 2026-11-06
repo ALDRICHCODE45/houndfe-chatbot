@@ -232,11 +232,7 @@ describe('InMemoryConversationStore', () => {
       const seeded = await seed({
         messages: [{ role: 'user', content: 'hola' }],
         pendingHumanRequest: canonical,
-        receiptAmountPointer: {
-          receiptMediaId: 'rm-1',
-          saleId: 'sale-1',
-          receiptVersion: '7',
-        },
+        cart: ['sku-1'],
         shippingApproval: { decision: 'approve' },
       });
 
@@ -247,11 +243,7 @@ describe('InMemoryConversationStore', () => {
       const state = await seeded.get('wa-hf');
       expect(Object.hasOwn(state!.data, 'pendingHumanRequest')).toBe(true);
       expect(state!.data.pendingHumanRequest).toBeNull();
-      expect(state!.data.receiptAmountPointer).toEqual({
-        receiptMediaId: 'rm-1',
-        saleId: 'sale-1',
-        receiptVersion: '7',
-      });
+      expect(state!.data.cart).toEqual(['sku-1']);
       expect(state!.data.shippingApproval).toEqual({ decision: 'approve' });
       expect(state!.data.messages).toEqual([{ role: 'user', content: 'hola' }]);
       expect(state!.lastMessageAt).toBe(at);

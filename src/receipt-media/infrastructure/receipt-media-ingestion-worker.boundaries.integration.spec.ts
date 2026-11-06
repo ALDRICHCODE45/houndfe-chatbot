@@ -32,7 +32,6 @@ const media = (n: number, label: string) => ({
   wamid: `wamid.odd6a2.${label}`,
   mediaId: `media.odd6a2.${label}`,
   sender: `sender.odd6a2.${label}`,
-  objectKey: `receipts/aaaaaaaa-000${n}-4000-8000-00000000000${n}`,
 });
 type Media = ReturnType<typeof media>;
 const UPLOAD_ABORT = media(1, 'uploadabort');
@@ -41,10 +40,9 @@ const PEER = media(3, 'peer');
 const HELD = media(4, 'held');
 const COLS = (
   'id webhook_message_id provider_media_id sender_id captured_sale_id' +
-  ' object_key status version declared_mime_type declared_amount_cents' +
+  ' status version declared_mime_type declared_amount_cents' +
   ' lease_owner lease_expires_at downloaded_at response_mime_type' +
-  ' detected_mime_type byte_count content_sha256 stored_at object_etag' +
-  ' capability_token_hash capability_key_version capability_issued_at'
+  ' detected_mime_type byte_count content_sha256 failure_stage'
 ).split(' ');
 const INSERT = `INSERT INTO receipt_media (${COLS.join(
   ', ',
@@ -143,7 +141,6 @@ ddescribe('receipt-media ingestion worker boundaries (ODD-6A2)', () => {
       provider_media_id: target.mediaId,
       sender_id: target.sender,
       captured_sale_id: SALE,
-      object_key: target.objectKey,
     };
     await pool.query(
       INSERT,
@@ -210,8 +207,7 @@ ddescribe('receipt-media ingestion worker boundaries (ODD-6A2)', () => {
     jest.restoreAllMocks();
     extract.mockClear();
     await pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
-        ' receipt_media, conversation_state',
+      'TRUNCATE receipt_media_outbox,' + ' receipt_media, conversation_state',
     );
   });
 
@@ -287,20 +283,11 @@ ddescribe('receipt-media ingestion worker boundaries (ODD-6A2)', () => {
     expect(claims()).toBe(before);
   });
 
-  it('holds a legacy STORED row unclaimed and untouched while a RESERVED peer is uploaded', async () => {
+  it('holds a terminal row unclaimed and untouched while a RESERVED peer is uploaded', async () => {
     const meta = fakeMeta(async () => fakeFile());
     await seed(HELD, {
-      status: 'STORED',
-      downloaded_at: new Date(),
-      response_mime_type: 'image/png',
-      detected_mime_type: 'image/png',
-      byte_count: 2048,
-      content_sha256: Buffer.alloc(32, 9),
-      stored_at: new Date(),
-      object_etag: 'etag.held',
-      capability_token_hash: Buffer.alloc(32, 9),
-      capability_key_version: 1,
-      capability_issued_at: new Date(),
+      status: 'FAILED',
+      failure_stage: 'META_EXHAUSTED_PRE_STORAGE',
     });
     await seed(PEER);
     const before = await readRow(HELD.id);
@@ -308,7 +295,7 @@ ddescribe('receipt-media ingestion worker boundaries (ODD-6A2)', () => {
     await waitRow(PEER, 'ATTACHED');
     const held = await readRow(HELD.id);
     expect(held).toMatchObject({
-      status: 'STORED',
+      status: 'FAILED',
       version: '0',
       lease_owner: null,
       meta_attempts: 0,

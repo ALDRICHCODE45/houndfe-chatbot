@@ -52,28 +52,21 @@ export const RETRY_DELAY_MS = 60_000;
 const isCents = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-const money = (value: number | string | undefined): string =>
-  isCents(value)
-    ? `${Math.floor(value / 100)}.${String(value % 100).padStart(2, '0')}`
-    : '';
-
-/** `$1,500.00` customer-facing pesos. */
+/** `$1,500.00 MXN`: the one customer-facing money format of receipt texts. */
 const pesos = (cents: number): string =>
-  `$${Math.floor(cents / 100).toLocaleString('en-US')}.${String(cents % 100).padStart(2, '0')}`;
+  `$${Math.floor(cents / 100).toLocaleString('en-US')}.${String(cents % 100).padStart(2, '0')} MXN`;
+
+/** "del pedido F-12", or "de su pedido" when the folio is unknown. */
+const ofOrder = (folio: string | null): string =>
+  folio === null ? 'de su pedido' : `del pedido ${folio}`;
 
 const RECEIVED_SUFFIX =
   'Lo estamos revisando y le avisamos en cuanto se confirme.';
 
 /** Deterministic canonical Spanish texts keyed by the tracked template keys;
- * the bounded args are the only substitutions. Never free text. The amount
- * dialog texts (RECEIPT_AMOUNT_*, CANCELLED, FINISH_OR_CANCEL) are no longer
- * produced (R6) and go away with the store states in R3. */
+ * the bounded args are the only substitutions. The only backend-supplied
+ * text is the customer-safe rejection reason (R5). */
 const TEXT: Record<ReceiptTemplateKey, string> = {
-  RECEIPT_AMOUNT_PROMPT: '¿Cuál fue el monto de tu transferencia?',
-  RECEIPT_AMOUNT_CONFIRM:
-    'Detectamos {amountCents} MXN. Responde CONFIRMAR o CANCELAR.',
-  RECEIPT_AMOUNT_REASK: 'No pudimos leer el monto. Envíalo como número.',
-  RECEIPT_CANCELLED: 'Cancelamos el comprobante. Puedes enviarlo de nuevo.',
   RECEIPT_ATTACHED_PENDING: `Recibimos su comprobante. ${RECEIVED_SUFFIX}`,
   RECEIPT_ATTACH_DEFINITE_FAILURE:
     'No pudimos registrar su comprobante. Escríbanos y le ayudamos.',
@@ -81,13 +74,8 @@ const TEXT: Record<ReceiptTemplateKey, string> = {
     'Estamos registrando su comprobante; le avisamos en cuanto quede.',
   RECEIPT_UNAVAILABLE_LATER:
     'No pudimos recibir su comprobante. Por favor envíelo de nuevo más tarde.',
-  RECEIPT_IN_PROGRESS: 'Estamos procesando su comprobante.',
-  RECEIPT_FINISH_OR_CANCEL:
-    'Tienes un proceso abierto: finalízalo o cancélalo.',
-  RECEIPT_PLACE_SALE_FIRST: 'Primero registra la venta en el sistema.',
   RECEIPT_UNSUPPORTED_FORMAT:
     'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
-  RECEIPT_RECEIPTS_ONLY: 'Solo podemos procesar comprobantes de pago.',
   RECEIPT_SALE_ALREADY_PAID: 'Su pedido ya está pagado.',
   RECEIPT_SALE_NOT_PAYABLE:
     'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
@@ -95,6 +83,12 @@ const TEXT: Record<ReceiptTemplateKey, string> = {
     'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',
   RECEIPT_NOT_A_RECEIPT:
     'Esta imagen no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+  RECEIPT_PAYMENT_CONFIRMED:
+    '¡Listo! Confirmamos su pago de su pedido. Gracias por su compra.',
+  RECEIPT_PAYMENT_PARTIAL:
+    'Confirmamos un pago de su pedido. Puede enviarnos el comprobante del resto cuando lo tenga.',
+  RECEIPT_PAYMENT_REJECTED:
+    'No pudimos confirmar su comprobante de su pedido. ¿Me puede enviar otro comprobante?',
 };
 
 const folioOf = (args: ReceiptMediaOutboxRow['templateArgs']): string | null =>
@@ -118,15 +112,28 @@ export const renderNotificationText = (
         ? `${received} Vemos un monto de ${pesos(seen)} y su pedido es de ${pesos(owed)}; lo revisamos igual.`
         : received;
     }
+    // R5/S5: the human outcome; the bot never decides it (S1).
+    case 'RECEIPT_PAYMENT_CONFIRMED':
+      return `¡Listo! Confirmamos su pago ${ofOrder(folio)}. Gracias por su compra.`;
+    case 'RECEIPT_PAYMENT_PARTIAL': {
+      const order = folio === null ? 'su pedido' : `su pedido ${folio}`;
+      return isCents(args.debtCents)
+        ? `Confirmamos un pago de ${order}. Queda un saldo pendiente de ${pesos(args.debtCents)}; puede enviarnos el comprobante del resto cuando lo tenga.`
+        : `Confirmamos un pago de ${order}. Puede enviarnos el comprobante del resto cuando lo tenga.`;
+    }
+    case 'RECEIPT_PAYMENT_REJECTED': {
+      const reason =
+        typeof args.reason === 'string'
+          ? args.reason.trim().replace(/\.+$/, '')
+          : '';
+      return `No pudimos confirmar su comprobante ${ofOrder(folio)}${reason.length > 0 ? `: ${reason}` : ''}. ¿Me puede enviar otro comprobante?`;
+    }
     case 'RECEIPT_SALE_ALREADY_PAID':
       return folio === null
         ? TEXT.RECEIPT_SALE_ALREADY_PAID
         : `Su pedido ${folio} ya está pagado.`;
     default:
-      return TEXT[row.templateKey].replace(
-        '{amountCents}',
-        money(args.amountCents),
-      );
+      return TEXT[row.templateKey];
   }
 };
 

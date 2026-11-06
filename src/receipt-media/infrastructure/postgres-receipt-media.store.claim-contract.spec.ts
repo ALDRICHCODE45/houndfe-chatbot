@@ -85,7 +85,8 @@ describe('claimBatch SQL contract — STORED-1', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Eligibility retention: RESERVED, DOWNLOADED, ATTACHING must be present
+  // Eligibility retention: RESERVED and DOWNLOADED must be present; the
+  // removed ATTACHING state (R3) is never claimable.
   // -------------------------------------------------------------------------
 
   it('retains RESERVED as a claimable status', async () => {
@@ -100,10 +101,10 @@ describe('claimBatch SQL contract — STORED-1', () => {
     expect(allSql).toMatch(/status\s*=\s*'DOWNLOADED'/i);
   });
 
-  it('retains ATTACHING as a claimable status', async () => {
+  it('never claims the removed ATTACHING status (R3)', async () => {
     await store.claimBatch(5, 'test-owner');
     const allSql = pool.client.calls.map((c) => c.sql).join('\n');
-    expect(allSql).toMatch(/status\s*=\s*'ATTACHING'/i);
+    expect(allSql).not.toMatch(/'ATTACHING'/i);
   });
 
   // -------------------------------------------------------------------------

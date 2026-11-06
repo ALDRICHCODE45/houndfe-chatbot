@@ -365,10 +365,10 @@ describe('ReceiptIngestionProcessor (R2: download → extract → backend upload
   it('declines any other claimed status', async () => {
     const f = fixture();
     await expect(
-      f.processor.process(row({ status: 'ATTACHING' }), OWNER),
+      f.processor.process(row({ status: 'ATTACHED' }), OWNER),
     ).resolves.toEqual({
       kind: 'unsupported-claimed-status',
-      status: 'ATTACHING',
+      status: 'ATTACHED',
     });
     expect(f.resolveAndDownload).not.toHaveBeenCalled();
   });

@@ -129,18 +129,6 @@ export interface BotSaleResponse {
   discountCents: number;
 }
 
-export interface AttachReceiptInput {
-  mediaUrl: string;
-  declaredAmountCents: number;
-  declaredDate?: string | null;
-  declaredReference?: string | null;
-}
-
-export interface AttachReceiptResponse {
-  receiptId: string;
-  status: 'PENDING';
-}
-
 export interface UpdateDeliveryInput {
   carrierName?: string | null;
   trackingRef?: string | null;

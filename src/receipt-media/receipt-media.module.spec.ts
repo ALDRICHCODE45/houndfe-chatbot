@@ -1,34 +1,12 @@
-/** WU14C composition spec, transitioned to WU14E lifecycle behavior: the
- * ReceiptMediaModule NestJS graph booted through the real testing module
- * with stubbed external edges only (no live PostgreSQL, Meta, S3, or
- * outbound HTTP). Proven: the graph boots with the full composition, the
- * RECEIPT_CAPABILITY_LOOKUP store singleton identity, and the base64
- * keyring decode at the composition boundary; enabled/disabled config
- * reaches the ingress kill switch; declared imports/dispatcher exports
- * match the contract; no ingestion worker or outbox provider is registered
- * and no ingestion/outbox-intent production runs in either mode; the graph
- * fails without ConfigService; a valid disabled environment with every
- * receipt-specific setting deleted boots inert and fails closed; enabled
- * mode still fails without the capability keyring; and the WU14E lifecycle
- * coordinator privately runs the notification drain only when enabled,
- * with validated options/owner, drain-before-pool.end shutdown, no rearm,
- * duplicate-import singularity, and a constant non-PII exhaustion alert.
- * ODD-3A transitions the stale "no ingestion worker exists" assumption to
- * the exact intended contract: the ingestion worker still has no DI token
- * (the module-local lifecycle coordinator privately owns it and the
- * dispatcher), while enabled/disabled ingestion runtime behavior — claim
- * timing, the 50 ms poll floor, concurrency mapping, one stable owner,
- * abort propagation, graceful drain before pool.end, contained claim/
- * dispatch failures, and the distinct ingestion claim (no outbox/STORED
- * work) — is proven through that coordinator. ODD-3B adds the co-active
- * cleanup lifecycle: a second module-local coordinator privately owns the
- * ODD-2D2b `ReceiptCleanupService` and `ReceiptCleanupWorker` (no DI token),
- * starts only under the same `receiptMedia.enabled` + rollout-gate
- * predicate, maps concurrency to the cleanup batch size, reuses the poll
- * floor, re-drains immediately on a non-empty batch, contains claim/store
- * failures, latches destroy-before-bootstrap, and drains the active batch
- * before pool.end. Its claim is observed on a separate channel and proven
- * to target only cleanup backlog rows — never STORED or accepted media. */
+/** ReceiptMediaModule composition and lifecycle spec: the NestJS graph is
+ * booted through the real testing module with stubbed external edges only
+ * (no live PostgreSQL, Meta, backend, or outbound HTTP). Receipt media is
+ * always on (receipt payment flow R3/S7): the graph composes the ingress,
+ * the Meta client, the backend upload and the vision pre-fill; the
+ * module-local coordinators privately own the notification drain (WU14E),
+ * the ingestion drain (ODD-3A) and the outcome poller (R5), with validated
+ * options/owner, drain-before-pool.end shutdown, no rearm, duplicate-import
+ * singularity, and a constant non-PII exhaustion alert. */
 import { Test } from '@nestjs/testing';
 import { ConfigModule } from '@nestjs/config';
 import {
@@ -47,7 +25,6 @@ import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
-import { CapabilityService } from './application/capability.service';
 import { ReceiptAttachmentService } from './application/receipt-attachment.service';
 import { CostGuardService } from '../llm-agent/application/cost-guard.service';
 import { GENERATE_TEXT } from '../llm-agent/infrastructure/generate-text.provider';
@@ -56,25 +33,15 @@ import {
   RECEIPT_EXTRACTION,
   type ReceiptExtractionPort,
 } from './domain/receipt-extraction.port';
-import {
-  RECEIPT_CAPABILITY_LOOKUP,
-  ReceiptCapabilityAuthorizerService as CapabilityAuthorizer,
-} from './application/receipt-capability-authorizer.service';
-import { ReceiptCleanupService } from './application/receipt-cleanup.service';
 import { ReceiptIngestionProcessor } from './application/receipt-ingestion.processor';
 import { ReceiptIngressService } from './application/receipt-ingress.service';
-import { ReceiptOutboxService } from './application/receipt-outbox.service';
 import { META_MEDIA } from './domain/meta-media.port';
-import { OBJECT_STORAGE_PORT } from './domain/object-storage.port';
 import type { ReceiptMediaRow } from './domain/receipt-media.types';
 import { MetaMediaClient } from './infrastructure/meta-media.client';
 import { PostgresReceiptMediaStore } from './infrastructure/postgres-receipt-media.store';
 import { PostgresReceiptOutboxStore } from './infrastructure/postgres-receipt-outbox.store';
-import { ReceiptCleanupWorker } from './infrastructure/receipt-cleanup.worker';
 import { ReceiptMediaIngestionWorker } from './infrastructure/receipt-media-ingestion.worker';
 import { ReceiptMediaNotificationWorker } from './infrastructure/receipt-media-notification.worker';
-import { S3ObjectStorageAdapter } from './infrastructure/s3-object-storage.adapter';
-import { ReceiptMediaAccessController } from './presentation/receipt-media-access.controller';
 import { ReceiptMetricsController } from './presentation/receipt-metrics.controller';
 import {
   PrometheusReceiptTelemetry,
@@ -97,27 +64,10 @@ class TelemetryConsumer {
 @Module({ imports: [ReceiptMediaModule], providers: [TelemetryConsumer] })
 class ReceiptMediaHostWrapper {}
 
-/** Tokens the module must never register, in either mode: the ingestion
- * worker, the outbox service, and the outbox store stay unregistered (the
- * notification worker has no DI token either — WU14E owns it privately —
- * but token absence alone does not prove the private worker did not run,
- * so lifecycle behavior is proven separately below). */
-const FORBIDDEN_NONWORKER_TOKENS = [
-  ReceiptMediaIngestionWorker,
-  ReceiptMediaNotificationWorker,
-  ReceiptCleanupWorker,
-  ReceiptCleanupService,
-  ReceiptOutboxService,
-  PostgresReceiptOutboxStore,
-] as const;
-
-/** Tokens forbidden as DI registrations; the notification drain itself is
- * exercised through behavior in the WU14E lifecycle describe block. */
+/** Tokens forbidden as DI registrations; the drains themselves are
+ * exercised through behavior in the lifecycle describe blocks. */
 const FORBIDDEN_TOKENS = [
   ReceiptMediaIngestionWorker,
-  ReceiptCleanupWorker,
-  ReceiptCleanupService,
-  ReceiptOutboxService,
   PostgresReceiptOutboxStore,
 ] as const;
 
@@ -137,8 +87,8 @@ const outboxRow = (
 ): Record<string, unknown> => ({
   id: '00000000-0000-4000-8000-0000000000aa',
   recipient_id: '+525500000000',
-  template_key: 'RECEIPT_AMOUNT_CONFIRM',
-  template_args: { amountCents: 123456 },
+  template_key: 'RECEIPT_PAYMENT_PARTIAL',
+  template_args: { folio: 'F-1', debtCents: 123456 },
   status: 'PENDING',
   attempts: 0,
   lease_expires_at: new Date(1_700_000_000_000),
@@ -265,7 +215,7 @@ const buildModule = (
     .overrideProvider(CONVERSATION_STORE)
     .useValue({ get: jest.fn().mockResolvedValue(null) })
     .overrideProvider(CHATBOT_API_CLIENT)
-    .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) });
+    .useValue(backendClient());
   if (sendText)
     builder.overrideProvider(WHATSAPP_SENDER).useValue({ sendText });
   return { builder };
@@ -286,36 +236,24 @@ const BASE_ENV: Record<string, string> = {
   OPS_CHANNEL_PHONE: '5215500000000',
 };
 
-/** WU1C validated receipt-media field set; keyring v1/v2 = "A"/"B" keys. */
+/** Validated receipt-media field set (always on). */
 const RECEIPT_ENABLED_ENV: Record<string, string> = {
   ...BASE_ENV,
-  RECEIPT_MEDIA_ENABLED: 'true',
   RECEIPT_MEDIA_MAX_BYTES: '10485760',
   META_MEDIA_ALLOWED_HOSTS: 'graph.facebook.com,.meta.com',
   META_MEDIA_METADATA_TIMEOUT_MS: '5000',
   META_MEDIA_DOWNLOAD_TIMEOUT_MS: '30000',
-  RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
-  RECEIPT_STORAGE_REGION: 'us-east-1',
-  RECEIPT_STORAGE_BUCKET: 'houndfe-receipts',
-  RECEIPT_STORAGE_ACCESS_KEY_ID: 'AKIAEXAMPLE',
-  RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'redacted-secret-value',
-  RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
   RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
   RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
   RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
-  RECEIPT_MEDIA_INGESTION_ENABLED: 'true',
-  CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
-  RECEIPT_CAPABILITY_KEYS:
-    '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=,2:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=',
-  RECEIPT_CAPABILITY_ACTIVE_VERSION: '2',
 };
 
-/** WU14C-R1: valid disabled environment — only the kill switch over the
- * pristine base environment; every receipt-specific setting is deleted. */
-const RECEIPT_DISABLED_ENV: Record<string, string> = {
-  ...BASE_ENV,
-  RECEIPT_MEDIA_ENABLED: 'false',
-};
+/** Backend client stub: the outcome poller reads nothing (no ATTACHED
+ * rows), the upload is never reached. */
+const backendClient = () => ({
+  uploadReceipt: jest.fn(),
+  getReceiptOutcome: jest.fn(),
+});
 
 /** Snapshot of the pristine worker environment, restored after each test. */
 const baseEnv: Record<string, string | undefined> = { ...process.env };
@@ -347,7 +285,7 @@ const withModule = async (
     .overrideProvider(CONVERSATION_STORE)
     .useValue({ get: jest.fn().mockResolvedValue(null) })
     .overrideProvider(CHATBOT_API_CLIENT)
-    .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) });
+    .useValue(backendClient());
   const moduleRef = await builder.compile();
   try {
     await run(moduleRef);
@@ -357,15 +295,13 @@ const withModule = async (
 };
 
 /** Instrumented fake pool for the REAL PostgresReceiptMediaStore claim
- * path: ingestion claims are recorded (limit/owner/SQL), cleanup claims are
- * recorded on their own channel, `end` records closure, and any query after
+ * path: ingestion claims are recorded (limit/owner/SQL), `end` records closure, and any query after
  * closure is counted and rejected. The notification outbox drain shares this
  * pool and is deliberately neutralized (empty) so every coordinator can boot
  * together with unconflated observations. */
 type IngestionPool = {
   pool: { query: jest.Mock; connect: jest.Mock; end: jest.Mock };
   claims: Array<{ limit: unknown; owner: unknown; sql: string }>;
-  cleanupClaims: Array<{ limit: unknown; owner: unknown; sql: string }>;
   sequence: string[];
   queriesAfterEnd: () => number;
 };
@@ -375,32 +311,14 @@ const makeIngestionPool = (
   opts: {
     claimGate?: Promise<void>;
     failFirstClaim?: boolean;
-    failFirstCleanupClaim?: boolean;
-    cleanupBatches?: Array<Array<Record<string, unknown>>>;
   } = {},
 ): IngestionPool => {
   const pending = [...batches];
-  const cleanupPending = [...(opts.cleanupBatches ?? [])];
-  const cleanupRows = new Map<string, Record<string, unknown>>();
   const claims: Array<{ limit: unknown; owner: unknown; sql: string }> = [];
-  const cleanupClaims: Array<{
-    limit: unknown;
-    owner: unknown;
-    sql: string;
-  }> = [];
   const sequence: string[] = [];
   let queriesAfterEnd = 0;
   let ended = false;
   let failClaim = opts.failFirstClaim === true;
-  let failCleanupClaim = opts.failFirstCleanupClaim === true;
-  const cleanupUpdated = (
-    row: Record<string, unknown>,
-    over: Record<string, unknown>,
-  ): Record<string, unknown> => ({
-    ...row,
-    ...over,
-    version: Number(row.version) + 1,
-  });
   const clientQuery = async (
     text: unknown,
     params?: unknown[],
@@ -418,22 +336,6 @@ const makeIngestionPool = (
       // The notification drain shares this pool; its outbox claim is
       // neutralized so it never enters the ingestion observations.
       if (/receipt_media_outbox/.test(sql)) return { rows: [], rowCount: 0 };
-      // ODD-3B: the cleanup claim shares this pool too. It is recorded on
-      // its own channel and never in `sequence`, so ingestion observations
-      // stay unconflated while the cleanup drain stays observable.
-      if (/cleanup_pending = true/.test(sql)) {
-        cleanupClaims.push({ limit: params?.[0], owner: params?.[1], sql });
-        if (failCleanupClaim) {
-          failCleanupClaim = false;
-          throw new Error('receipt-media test: injected cleanup claim failure');
-        }
-        const rows =
-          cleanupPending.length > 0
-            ? (cleanupPending.shift() as Array<Record<string, unknown>>)
-            : [];
-        for (const row of rows) cleanupRows.set(String(row.id), row);
-        return { rows, rowCount: rows.length };
-      }
       // Recorded BEFORE the optional gate so an in-flight claim is
       // observable while it is still unresolved.
       sequence.push('claim');
@@ -445,36 +347,6 @@ const makeIngestionPool = (
       claims.push({ limit: params?.[0], owner: params?.[1], sql });
       const rows = pending.length > 0 ? (pending.shift() as unknown[]) : [];
       return { rows, rowCount: rows.length };
-    }
-    // ODD-3B cleanup disposition SQL, only reached for a claimed cleanup
-    // row; it is neutralized onto its own channel and never pushes
-    // `sequence` entries, so the no-other-work evidence stays intact.
-    if (/cleanup_attempts BETWEEN 1 AND 3 FOR UPDATE/.test(sql)) {
-      const row = cleanupRows.get(String(params?.[0]));
-      return row ? { rows: [row], rowCount: 1 } : { rows: [], rowCount: 0 };
-    }
-    if (/SET cleanup_pending = false/.test(sql)) {
-      const row = cleanupRows.get(String(params?.[0]));
-      if (!row) return { rows: [], rowCount: 0 };
-      const updated = cleanupUpdated(row, {
-        cleanup_pending: false,
-        lease_owner: null,
-        lease_expires_at: null,
-      });
-      cleanupRows.set(String(row.id), updated);
-      return { rows: [updated], rowCount: 1 };
-    }
-    if (/SET last_error_category = \$5/.test(sql)) {
-      const row = cleanupRows.get(String(params?.[0]));
-      if (!row) return { rows: [], rowCount: 0 };
-      const updated = cleanupUpdated(row, {
-        last_error_category: params?.[4],
-        last_error_code: params?.[5],
-        lease_owner: null,
-        lease_expires_at: null,
-      });
-      cleanupRows.set(String(row.id), updated);
-      return { rows: [updated], rowCount: 1 };
     }
     if (/INSERT\s+INTO\s+receipt_media_outbox/i.test(sql)) {
       sequence.push('insert');
@@ -496,14 +368,13 @@ const makeIngestionPool = (
   return {
     pool,
     claims,
-    cleanupClaims,
     sequence,
     queriesAfterEnd: () => queriesAfterEnd,
   };
 };
 
 /** Builds (not compiles) the receipt graph with stubbed edges plus optional
- * instrumented ingestion/cleanup collaborators. The dispatcher must be
+ * instrumented ingestion collaborators. The dispatcher must be
  * constructed from the REAL injected processor/attachment, so the fakes are
  * injected at their DI tokens and never at the dispatcher. */
 const buildIngestionModule = (
@@ -512,7 +383,6 @@ const buildIngestionModule = (
   overrides: {
     processor?: unknown;
     attachment?: unknown;
-    storage?: unknown;
   } = {},
 ): ReturnType<typeof Test.createTestingModule> => {
   applyEnv(env);
@@ -527,7 +397,7 @@ const buildIngestionModule = (
     .overrideProvider(CONVERSATION_STORE)
     .useValue({ get: jest.fn().mockResolvedValue(null) })
     .overrideProvider(CHATBOT_API_CLIENT)
-    .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+    .useValue(backendClient())
     .overrideProvider(WHATSAPP_SENDER)
     .useValue({
       sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
@@ -540,8 +410,6 @@ const buildIngestionModule = (
     builder
       .overrideProvider(ReceiptAttachmentService)
       .useValue(overrides.attachment);
-  if (overrides.storage)
-    builder.overrideProvider(OBJECT_STORAGE_PORT).useValue(overrides.storage);
   return builder;
 };
 
@@ -552,7 +420,6 @@ const runIngestion = async (
   overrides: {
     processor?: unknown;
     attachment?: unknown;
-    storage?: unknown;
   },
   run: (moduleRef: INestApplicationContext) => Promise<void> | void,
 ): Promise<void> => {
@@ -585,106 +452,38 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         [ReceiptIngressService, ReceiptIngressService],
         [ReceiptAttachmentService, ReceiptAttachmentService],
         [ReceiptIngestionProcessor, ReceiptIngestionProcessor],
-        [CapabilityAuthorizer, CapabilityAuthorizer],
-        [ReceiptMediaAccessController, ReceiptMediaAccessController],
         [META_MEDIA, MetaMediaClient],
-        [OBJECT_STORAGE_PORT, S3ObjectStorageAdapter],
-        [CapabilityService, CapabilityService],
         [PostgresReceiptMediaStore, PostgresReceiptMediaStore],
       ];
       for (const [token, ctor] of members)
         expect(moduleRef.get(token as never)).toBeInstanceOf(ctor);
-      expect(moduleRef.get(RECEIPT_CAPABILITY_LOOKUP)).toBe(
-        moduleRef.get(PostgresReceiptMediaStore),
-      );
-      const capability = moduleRef.get(CapabilityService);
-      const first = capability.issue('00000000-0000-4000-8000-0000000000ab');
-      const second = capability.issue('00000000-0000-4000-8000-0000000000ab');
-      expect(first.token).toBe(second.token);
-      expect(first.keyVersion).toBe('2');
-      expect(capability.parseToken(first.token)).toBe(first.token);
     });
   });
 
+  // R3/S7: no kill switch; even the removed flag set to false changes nothing.
   it.each([
-    ['enabled', RECEIPT_ENABLED_ENV, 'unsupported-media'],
+    ['always-on', RECEIPT_ENABLED_ENV],
     [
-      'disabled',
+      'removed flag',
       { ...RECEIPT_ENABLED_ENV, RECEIPT_MEDIA_ENABLED: 'false' },
-      'disabled',
     ],
-  ] as const)(
-    'threads the %s kill switch into the ingress service',
-    async (_label, env, kind) => {
-      await withModule(env, async (moduleRef) => {
-        expect(
-          await moduleRef.get(ReceiptIngressService).admit({
-            senderId: 's1',
-            webhookMessageId: 'w1',
-            providerMediaId: 'm1',
-            declaredMimeType: 'image/webp',
-          }),
-        ).toEqual({ kind });
-      });
-    },
-  );
-
-  it('boots the valid disabled environment without receipt-specific settings', async () => {
-    const pool = stubPool();
-    await withModule(
-      RECEIPT_DISABLED_ENV,
-      async (moduleRef) => {
-        // Store singleton + alias stay available for dispatcher DI.
-        const store = moduleRef.get(PostgresReceiptMediaStore);
-        expect(moduleRef.get(RECEIPT_CAPABILITY_LOOKUP)).toBe(store);
-        // The mounted access controller stays registered.
-        expect(moduleRef.get(ReceiptMediaAccessController)).toBeInstanceOf(
-          ReceiptMediaAccessController,
-        );
-        // Ingress remains disabled.
-        expect(
-          await moduleRef.get(ReceiptIngressService).admit({
-            senderId: 's1',
-            webhookMessageId: 'w1',
-            providerMediaId: 'm1',
-            declaredMimeType: 'image/jpeg',
-          }),
-        ).toEqual({ kind: 'disabled' });
-        // No real configured Meta/S3 adapter is constructed.
-        expect(moduleRef.get(META_MEDIA)).not.toBeInstanceOf(MetaMediaClient);
-        expect(moduleRef.get(OBJECT_STORAGE_PORT)).not.toBeInstanceOf(
-          S3ObjectStorageAdapter,
-        );
-        // Authorization fails closed to the existing unavailable result.
-        const authorizer = moduleRef.get(CapabilityAuthorizer);
-        const token = moduleRef
-          .get(CapabilityService)
-          .issue('00000000-0000-4000-8000-0000000000ab').token;
-        expect(await authorizer.authorize(token)).toEqual({
-          kind: 'unavailable',
-        });
-        expect(await authorizer.authorize('malformed')).toEqual({
-          kind: 'denied',
-        });
-        // Neither worker nor outbox path registers in disabled mode either.
-        for (const absent of FORBIDDEN_NONWORKER_TOKENS)
-          expect(() => {
-            void moduleRef.get(absent, { strict: true });
-          }).toThrow();
-      },
-      pool,
-    );
-    // Boot performed no database work.
-    expect(pool.query).not.toHaveBeenCalled();
-    expect(pool.connect).not.toHaveBeenCalled();
+  ] as const)('admits through the %s ingress service', async (_label, env) => {
+    await withModule(env, async (moduleRef) => {
+      expect(
+        await moduleRef.get(ReceiptIngressService).admit({
+          senderId: 's1',
+          webhookMessageId: 'w1',
+          providerMediaId: 'm1',
+          declaredMimeType: 'image/webp',
+        }),
+      ).toEqual({ kind: 'unsupported-media' });
+    });
   });
 
-  it('still fails closed at boot when enabled mode lacks the keyring', async () => {
-    const env = { ...RECEIPT_ENABLED_ENV };
-    delete env.RECEIPT_CAPABILITY_KEYS;
-    await expect(withModule(env, () => undefined)).rejects.toThrow(
-      /RECEIPT_CAPABILITY_KEYS/,
-    );
+  it('boots with the receipt knobs from defaults (no receipt-specific settings)', async () => {
+    await withModule(BASE_ENV, (moduleRef) => {
+      expect(moduleRef.get(META_MEDIA)).toBeInstanceOf(MetaMediaClient);
+    });
   });
 
   it('declares the required imports and dispatcher exports', () => {
@@ -704,9 +503,8 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
 
   it('registers neither receipt worker nor the receipt outbox composition', async () => {
     await withModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
-      // The ingestion worker, outbox service, and outbox store stay
-      // unregistered in enabled mode; only the notification drain claims
-      // anything, and its behavior is proven below (WU14E).
+      // The ingestion worker and the outbox store stay unregistered; the
+      // drains are proven through behavior below.
       for (const absent of FORBIDDEN_TOKENS)
         expect(() => {
           void moduleRef.get(absent, { strict: true });
@@ -755,10 +553,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         },
         usage: { inputTokens: 10, outputTokens: 5 },
       });
-      // Ingestion rollout gate off, so no worker claims run.
-      const env = { ...RECEIPT_ENABLED_ENV };
-      delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
-      applyEnv(env);
+      applyEnv(RECEIPT_ENABLED_ENV);
       const moduleRef = await Test.createTestingModule({
         imports: [
           AppConfigModule.forRoot({ ignoreEnvFile: true }),
@@ -772,7 +567,11 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(CHATBOT_API_CLIENT)
         .useValue({ uploadReceipt })
         .overrideProvider(PostgresReceiptMediaStore)
-        .useValue({ commitUploadSuccess })
+        .useValue({
+          commitUploadSuccess,
+          claimBatch: jest.fn().mockResolvedValue([]),
+          listOutcomeDue: jest.fn().mockResolvedValue([]),
+        })
         .overrideProvider(GENERATE_TEXT)
         .useValue(generateText)
         .overrideProvider(WHATSAPP_SENDER)
@@ -881,7 +680,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(CONVERSATION_STORE)
         .useValue({ get: jest.fn().mockResolvedValue(null) })
         .overrideProvider(CHATBOT_API_CLIENT)
-        .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) });
+        .useValue(backendClient());
       const moduleRef = await builder.compile();
       try {
         const direct = moduleRef.get<TelemetryConsumer>(
@@ -1110,7 +909,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         expect(sendText).toHaveBeenCalledTimes(1);
         expect(sendText).toHaveBeenCalledWith({
           to: '+525500000000',
-          text: 'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
+          text: 'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
         });
         // The fenced CAS marks the provider wamid exactly once.
         expect(outbox.marks).toEqual(['wamid.OK']);
@@ -1320,7 +1119,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(CONVERSATION_STORE)
         .useValue({ get: jest.fn().mockResolvedValue(null) })
         .overrideProvider(CHATBOT_API_CLIENT)
-        .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+        .useValue(backendClient())
         .overrideProvider(WHATSAPP_SENDER)
         .useValue({ sendText });
       const moduleRef = await builder.compile();
@@ -1358,12 +1157,12 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
           .map((call) => JSON.stringify(call))
           .join('');
         expect(logged).not.toContain('+525500000000');
-        expect(logged).not.toContain('RECEIPT_AMOUNT_CONFIRM');
+        expect(logged).not.toContain('RECEIPT_PAYMENT_PARTIAL');
         expect(outbox.queriesAfterEnd()).toBe(0);
       });
     });
 
-    it('runs no ingestion storage work and produces no outbox intents in either mode', async () => {
+    it('runs no ingestion storage work and produces no outbox intents', async () => {
       const sendText = jest.fn(() =>
         Promise.resolve({ providerMessageId: 'wamid.OK' }),
       );
@@ -1380,18 +1179,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
           (entry) => entry !== 'claim' && entry !== 'mark' && entry !== 'end',
         ),
       ).toEqual([]);
-      expect(enabled.pool.query).not.toHaveBeenCalled();
-      // Disabled: the lifecycle stays fully inert — no claims, timers,
-      // sends, alerts, or SQL; only the real pool lifecycle closes the pool.
-      const disabled = makeOutboxPool();
-      await runLifecycle(RECEIPT_DISABLED_ENV, disabled, sendText, async () => {
-        await jest.advanceTimersByTimeAsync(3_600_000);
-        expect(disabled.claims).toHaveLength(0);
-      });
-      expect(disabled.sequence).toEqual(['end']);
-      expect(disabled.pool.query).not.toHaveBeenCalled();
-      expect(disabled.pool.connect).not.toHaveBeenCalled();
-      expect(sendText).toHaveBeenCalledTimes(1); // only the enabled-mode send
+      expect(sendText).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1461,53 +1249,6 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       }
     });
 
-    it('is fully inert when disabled: no claim, no timer, no external call, only pool.end', async () => {
-      const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
-      const moduleRef = await buildIngestionModule(
-        RECEIPT_DISABLED_ENV,
-        pool.pool,
-      ).compile();
-      try {
-        await moduleRef.init();
-        await jest.advanceTimersByTimeAsync(3_600_000);
-        await drainMicrotasks();
-        expect(pool.claims).toHaveLength(0);
-        expect(pool.sequence).toEqual([]);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-      expect(pool.sequence).toEqual(['end']);
-      expect(pool.queriesAfterEnd()).toBe(0);
-    });
-
-    it.each(['omitted', 'false'] as const)(
-      'stays fully inert while receipt media is enabled but the ingestion gate is %s',
-      async (gate) => {
-        const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
-        const processor = makeProcessor();
-        // Broad receipt media stays enabled (notification still runs); only
-        // the dedicated ingestion rollout gate is absent/false.
-        const env = { ...RECEIPT_ENABLED_ENV };
-        if (gate === 'omitted') delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
-        else env.RECEIPT_MEDIA_INGESTION_ENABLED = 'false';
-        const moduleRef = await buildIngestionModule(env, pool.pool, {
-          processor,
-        }).compile();
-        try {
-          await moduleRef.init();
-          await jest.advanceTimersByTimeAsync(3_600_000);
-          await drainMicrotasks();
-          expect(pool.claims).toHaveLength(0);
-          expect(pool.sequence).toEqual([]);
-          expect(processor.process).not.toHaveBeenCalled();
-        } finally {
-          await moduleRef.close().catch(() => undefined);
-          await drainMicrotasks();
-        }
-      },
-    );
-
     it('keeps the worker unexposed as a DI token and latches one worker/owner on repeated bootstrap', async () => {
       const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
       const processor = makeProcessor();
@@ -1557,7 +1298,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(CONVERSATION_STORE)
         .useValue({ get: jest.fn().mockResolvedValue(null) })
         .overrideProvider(CHATBOT_API_CLIENT)
-        .useValue({ attachReceipt: jest.fn().mockResolvedValue(undefined) })
+        .useValue(backendClient())
         .overrideProvider(WHATSAPP_SENDER)
         .useValue({
           sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
@@ -1767,8 +1508,8 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       }
     });
 
-    it('never dispatches a legacy ATTACHING row (the amount dialog is gone)', async () => {
-      const pool = makeIngestionPool([[{ id: 'a1', status: 'ATTACHING' }]]);
+    it('never dispatches a non-ingestion (ATTACHED) row', async () => {
+      const pool = makeIngestionPool([[{ id: 'a1', status: 'ATTACHED' }]]);
       const processor = { process: jest.fn() };
       const moduleRef = await buildIngestionModule(
         RECEIPT_ENABLED_ENV,
@@ -1910,31 +1651,16 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       });
     });
 
-    it('runs only the existing ingestion and cleanup claims: no STORED, outbox intent, or generic work', async () => {
+    it('runs only the ingestion claim: no outbox intent or generic work', async () => {
       const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
       const processor = makeProcessor();
       await runIngestion(RECEIPT_ENABLED_ENV, pool, { processor }, async () => {
         await untilMicrotask(() => pool.claims.length >= 1);
-        await untilMicrotask(() => pool.cleanupClaims.length >= 1);
         await drainMicrotasks();
         const sql = String(pool.claims[0]?.sql);
         expect(sql).toMatch(/status = 'RESERVED'/);
-        expect(sql).not.toMatch(/STORED/);
-        expect(sql).not.toMatch(/cleanup/i);
         expect(sql).not.toMatch(/delete/i);
         expect(sql).not.toMatch(/receipt_media_outbox/);
-        // The co-active ODD-3B cleanup claim is a distinct bounded claim over
-        // ONLY durable cleanup backlog rows: never STORED, never accepted
-        // media, and never a generic delete.
-        const cleanupSql = String(pool.cleanupClaims[0]?.sql);
-        expect(cleanupSql).toMatch(/status = 'FAILED'/);
-        expect(cleanupSql).toMatch(
-          /failure_stage = 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE'/,
-        );
-        expect(cleanupSql).toMatch(/cleanup_pending = true/);
-        expect(cleanupSql).not.toMatch(/STORED/);
-        expect(cleanupSql).not.toMatch(/delete/i);
-        expect(cleanupSql).not.toMatch(/receipt_media_outbox/);
         // No generic outbox intent production and no unaccounted SQL.
         expect(
           pool.sequence.filter(
@@ -1942,279 +1668,6 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
           ),
         ).toEqual([]);
       });
-    });
-  });
-
-  describe('ReceiptMediaModule cleanup lifecycle (ODD-3B)', () => {
-    beforeEach(() => {
-      jest.useFakeTimers();
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-    });
-
-    const OWNER_RE =
-      /^receipt-media:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-    type CleanupLifecycleHooks = {
-      onApplicationBootstrap(): void;
-      onModuleDestroy(): Promise<void>;
-    };
-
-    /** Resolves the module-local cleanup coordinator WITHOUT exporting the
-     * internal class: it is read from the module's DECLARED provider metadata
-     * (a public contract of ReceiptMediaModule) and resolved through real
-     * Nest DI, so tests can drive its hooks directly. */
-    const resolveCleanupLifecycle = (
-      moduleRef: INestApplicationContext,
-    ): CleanupLifecycleHooks => {
-      const providers = (Reflect.getMetadata('providers', ReceiptMediaModule) ??
-        []) as unknown[];
-      const ctor = providers.find(
-        (provider) =>
-          typeof provider === 'function' &&
-          (provider as { name?: string }).name === 'ReceiptCleanupLifecycle',
-      ) as abstract new (...args: never[]) => CleanupLifecycleHooks;
-      expect(ctor).toBeDefined();
-      return moduleRef.get(ctor);
-    };
-
-    /** Snake_case FAILED cleanup backlog row exactly as pg would deliver it. */
-    const cleanupRow = (
-      over: Record<string, unknown> = {},
-    ): Record<string, unknown> => ({
-      id: '00000000-0000-4000-8000-0000000000c1',
-      object_key: 'receipts/00000000-0000-4000-8000-0000000000c1',
-      status: 'FAILED',
-      failure_stage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      version: '4',
-      cleanup_attempts: 1,
-      cleanup_pending: true,
-      ...over,
-    });
-
-    it('keeps the cleanup worker and service unexposed and claims with one stable owner', async () => {
-      const pool = makeIngestionPool();
-      const moduleRef = await buildIngestionModule(
-        RECEIPT_ENABLED_ENV,
-        pool.pool,
-      ).compile();
-      try {
-        // Neither the cleanup worker nor the cleanup service is a DI token:
-        // the private module-local lifecycle owns both.
-        expect(() => {
-          void moduleRef.get(ReceiptCleanupWorker, { strict: true });
-        }).toThrow();
-        expect(() => {
-          void moduleRef.get(ReceiptCleanupService, { strict: true });
-        }).toThrow();
-        const coordinator = resolveCleanupLifecycle(moduleRef);
-        coordinator.onApplicationBootstrap();
-        // A second bootstrap on the SAME coordinator is a no-op: no second
-        // loop and no second owner.
-        coordinator.onApplicationBootstrap();
-        await untilMicrotask(() => pool.cleanupClaims.length >= 1);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(1);
-        expect(pool.cleanupClaims[0]?.limit).toBe(2); // default concurrency
-        expect(String(pool.cleanupClaims[0]?.owner)).toMatch(OWNER_RE);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-    });
-
-    it('maps configured concurrency to the cleanup batch size', async () => {
-      const pool = makeIngestionPool();
-      const env = {
-        ...RECEIPT_ENABLED_ENV,
-        RECEIPT_MEDIA_WORKER_CONCURRENCY: '3',
-      };
-      const moduleRef = await buildIngestionModule(env, pool.pool).compile();
-      try {
-        resolveCleanupLifecycle(moduleRef).onApplicationBootstrap();
-        await untilMicrotask(() => pool.cleanupClaims.length >= 1);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims[0]?.limit).toBe(3);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-    });
-
-    it.each(['omitted', 'false'] as const)(
-      'stays fully inert while the ingestion rollout gate is %s',
-      async (gate) => {
-        const pool = makeIngestionPool([[{ id: 'r1', status: 'RESERVED' }]]);
-        const env = { ...RECEIPT_ENABLED_ENV };
-        if (gate === 'omitted') delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
-        else env.RECEIPT_MEDIA_INGESTION_ENABLED = 'false';
-        const moduleRef = await buildIngestionModule(env, pool.pool).compile();
-        try {
-          resolveCleanupLifecycle(moduleRef).onApplicationBootstrap();
-          await jest.advanceTimersByTimeAsync(3_600_000);
-          await drainMicrotasks();
-          expect(pool.cleanupClaims).toHaveLength(0);
-          expect(pool.claims).toHaveLength(0); // ingestion stays inert too
-        } finally {
-          await moduleRef.close().catch(() => undefined);
-          await drainMicrotasks();
-        }
-      },
-    );
-
-    it('stays fully inert when receipt media is broadly disabled', async () => {
-      const pool = makeIngestionPool();
-      const moduleRef = await buildIngestionModule(
-        RECEIPT_DISABLED_ENV,
-        pool.pool,
-      ).compile();
-      try {
-        resolveCleanupLifecycle(moduleRef).onApplicationBootstrap();
-        await jest.advanceTimersByTimeAsync(3_600_000);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(0);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-    });
-
-    it.each([
-      [1, 50],
-      [49, 50],
-      [50, 50],
-      [2000, 2000],
-    ] as const)(
-      'polls cleanup at its effective interval: configured %i ms -> effective %i ms',
-      async (configured, effective) => {
-        const pool = makeIngestionPool();
-        const env = {
-          ...RECEIPT_ENABLED_ENV,
-          RECEIPT_MEDIA_WORKER_POLL_MS: String(configured),
-        };
-        const moduleRef = await buildIngestionModule(env, pool.pool).compile();
-        try {
-          resolveCleanupLifecycle(moduleRef).onApplicationBootstrap();
-          await drainMicrotasks();
-          expect(pool.cleanupClaims).toHaveLength(1);
-          await jest.advanceTimersByTimeAsync(effective - 1);
-          await drainMicrotasks();
-          expect(pool.cleanupClaims).toHaveLength(1);
-          await jest.advanceTimersByTimeAsync(1);
-          await untilMicrotask(() => pool.cleanupClaims.length >= 2);
-          await drainMicrotasks();
-          expect(pool.cleanupClaims).toHaveLength(2);
-        } finally {
-          await moduleRef.close().catch(() => undefined);
-          await drainMicrotasks();
-        }
-      },
-    );
-
-    it('re-drains immediately after a non-empty cleanup batch with no poll wait', async () => {
-      const pool = makeIngestionPool([], { cleanupBatches: [[cleanupRow()]] });
-      const storage = {
-        deleteTechnicalObject: jest
-          .fn<Promise<void>, [{ key: string; abortSignal: AbortSignal }]>()
-          .mockResolvedValue(undefined),
-      };
-      const moduleRef = await buildIngestionModule(
-        RECEIPT_ENABLED_ENV,
-        pool.pool,
-        { storage },
-      ).compile();
-      try {
-        resolveCleanupLifecycle(moduleRef).onApplicationBootstrap();
-        // The non-empty batch drains back-to-back with no timer advance.
-        await untilMicrotask(() => pool.cleanupClaims.length >= 2);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(2);
-        expect(storage.deleteTechnicalObject).toHaveBeenCalledTimes(1);
-        const request = storage.deleteTechnicalObject.mock.calls[0]?.[0];
-        expect(request?.key).toBe(
-          'receipts/00000000-0000-4000-8000-0000000000c1',
-        );
-        expect(request?.abortSignal).toBeInstanceOf(AbortSignal);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-    });
-
-    it('contains a cleanup claim failure and keeps polling on the next interval', async () => {
-      const pool = makeIngestionPool([], { failFirstCleanupClaim: true });
-      const env = {
-        ...RECEIPT_ENABLED_ENV,
-        RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
-      };
-      const moduleRef = await buildIngestionModule(env, pool.pool).compile();
-      try {
-        resolveCleanupLifecycle(moduleRef).onApplicationBootstrap();
-        await drainMicrotasks();
-        // The first cleanup claim threw; the loop contained it and is now
-        // waiting rather than terminating.
-        expect(pool.cleanupClaims).toHaveLength(1);
-        await jest.advanceTimersByTimeAsync(1000);
-        await untilMicrotask(() => pool.cleanupClaims.length >= 2);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(2);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-    });
-
-    it('is idempotent on shutdown and never rearms on a post-shutdown bootstrap', async () => {
-      const pool = makeIngestionPool();
-      const moduleRef = await buildIngestionModule(
-        RECEIPT_ENABLED_ENV,
-        pool.pool,
-      ).compile();
-      try {
-        const coordinator = resolveCleanupLifecycle(moduleRef);
-        coordinator.onApplicationBootstrap();
-        await untilMicrotask(() => pool.cleanupClaims.length >= 1);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(1);
-        await coordinator.onModuleDestroy();
-        await drainMicrotasks();
-        const stopped = pool.cleanupClaims.length;
-        coordinator.onApplicationBootstrap();
-        await jest.advanceTimersByTimeAsync(3_600_000);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(stopped);
-        await coordinator.onModuleDestroy();
-        await jest.advanceTimersByTimeAsync(3_600_000);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(stopped);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
-    });
-
-    it('latches shutdown before any bootstrap so a later bootstrap cannot start cleanup', async () => {
-      const pool = makeIngestionPool([], {
-        cleanupBatches: [[cleanupRow()]],
-      });
-      const moduleRef = await buildIngestionModule(
-        RECEIPT_ENABLED_ENV,
-        pool.pool,
-      ).compile();
-      try {
-        const coordinator = resolveCleanupLifecycle(moduleRef);
-        await coordinator.onModuleDestroy();
-        await coordinator.onModuleDestroy(); // safe repeated destroy
-        coordinator.onApplicationBootstrap();
-        await jest.advanceTimersByTimeAsync(3_600_000);
-        await drainMicrotasks();
-        expect(pool.cleanupClaims).toHaveLength(0);
-      } finally {
-        await moduleRef.close().catch(() => undefined);
-        await drainMicrotasks();
-      }
     });
   });
 });

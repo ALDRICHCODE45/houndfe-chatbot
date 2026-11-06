@@ -53,7 +53,6 @@ const media = (n: number, label: string) => ({
   wamid: `wamid.odd7b2a.${label}`,
   mediaId: `media.odd7b2a.${label}`,
   sender: `sender.odd7b2a.${label}`,
-  objectKey: `receipts/aaaaaaaa-000${n}-4000-8000-00000000000${n}`,
 });
 type Media = ReturnType<typeof media>;
 const REBIND = media(1, 'rebind');
@@ -62,7 +61,7 @@ const BAD_REDIRECT = media(3, 'redirect');
 const EXHAUST = media(4, 'exhaust');
 const COLS = (
   'id webhook_message_id provider_media_id sender_id captured_sale_id' +
-  ' object_key status version declared_mime_type declared_amount_cents' +
+  ' status version declared_mime_type declared_amount_cents' +
   ' lease_owner lease_expires_at'
 ).split(' ');
 const INSERT = `INSERT INTO receipt_media (${COLS.join(
@@ -147,7 +146,6 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
       provider_media_id: target.mediaId,
       sender_id: target.sender,
       captured_sale_id: SALE,
-      object_key: target.objectKey,
     };
     await pool.query(
       INSERT,
@@ -183,9 +181,7 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
   const assertNoAcceptedEvidence = (row: Row) => {
     const fields = (
       'downloaded_at response_mime_type detected_mime_type byte_count ' +
-      'content_sha256 stored_at object_etag object_version_id ' +
-      'capability_token_hash capability_key_version ' +
-      'capability_key_version_text capability_issued_at capability_revoked_at'
+      'content_sha256'
     ).split(' ');
     for (const field of fields) expect(row[field]).toBeNull();
   };
@@ -262,10 +258,7 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
       workers.clear();
       extract.mockClear();
       upload.mockClear();
-      await pool.query(
-        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
-          ' receipt_media',
-      );
+      await pool.query('TRUNCATE receipt_media_outbox,' + ' receipt_media');
     }
   });
 

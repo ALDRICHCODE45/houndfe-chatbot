@@ -39,11 +39,7 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
     if (container) await container.stop();
   });
 
-  beforeEach(() =>
-    pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
-    ),
-  );
+  beforeEach(() => pool.query('TRUNCATE receipt_media_outbox, receipt_media'));
 
   /** Admits, claims and downloads one receipt; returns its upload fence. */
   const downloaded = async (
@@ -58,7 +54,6 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
       providerMediaId: `media-${id}`,
       senderId: sender,
       capturedSaleId: SALE,
-      objectKey: `receipts/${randomUUID()}`,
       declaredMimeType: mime,
       declaredAmountCents,
     });

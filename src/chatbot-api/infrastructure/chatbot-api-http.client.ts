@@ -46,6 +46,10 @@ import {
   type ReceiptUploadResponse,
 } from '../domain/dtos/receipt-upload.dto';
 import {
+  parseReceiptOutcome,
+  type ReceiptOutcome,
+} from '../domain/dtos/receipt-outcome.dto';
+import {
   CreateShippingQuoteInputSchema,
   normalizeShippingQuoteResponse,
   type CreateShippingQuoteInput,
@@ -56,8 +60,6 @@ import type {
   CartItemInput,
 } from '../domain/dtos/pricing.dto';
 import type {
-  AttachReceiptInput,
-  AttachReceiptResponse,
   BotSaleResponse,
   CancelSaleInput,
   CancelSaleResult,
@@ -426,21 +428,6 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return sale;
   }
 
-  attachReceipt(
-    saleId: string,
-    dto: AttachReceiptInput,
-    options: AttachReceiptTransportOptions = {},
-  ): Promise<AttachReceiptResponse> {
-    return this.requestAttachReceipt(
-      {
-        method: 'POST',
-        url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
-        data: dto,
-      },
-      options,
-    );
-  }
-
   async uploadReceipt(
     saleId: string,
     file: ReceiptUploadFile,
@@ -488,6 +475,37 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       );
     }
     return body;
+  }
+
+  /** Receipt outcome read: UUID-validated before any request, safe GET
+   * retry policy, HTTP 200 with a strictly parsed body. */
+  async getReceiptOutcome(receiptId: string): Promise<ReceiptOutcome> {
+    if (!DECISION_ID_UUID.test(receiptId)) {
+      throw new ChatbotApiError(
+        'Receipt id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: `/chatbot-api/receipts/${encodeURIComponent(receiptId)}`,
+      },
+      { retryable: true },
+    );
+    const body = response.data;
+    const outcome = parseReceiptOutcome(body);
+    if (response.status !== 200 || outcome === null) {
+      throw new UpstreamError(
+        'Chatbot API receipt outcome response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return outcome;
   }
 
   async updateDelivery(
@@ -925,61 +943,6 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     }
 
     return receipt;
-  }
-
-  /**
-   * Attachment-only (WU11B) transport: exactly one POST, no retries, no
-   * sleeps. The timeout is owned by this client
-   * (`receiptMedia.attachTimeoutMs`, forwarded as the Axios `timeout`) and
-   * a caller-supplied `AbortSignal` is forwarded verbatim as the Axios
-   * `signal`. Axios rejections keep flowing through `mapError()` with
-   * status/body/errorCode evidence; only *fulfilled* responses with an
-   * unexpected status or body are converted here to an `UpstreamError`
-   * that keeps the same evidence — this error is thrown out of this
-   * private seam and never re-mapped, so no evidence is lost.
-   */
-  private async requestAttachReceipt(
-    config: AxiosRequestConfig,
-    options: AttachReceiptTransportOptions,
-  ): Promise<AttachReceiptResponse> {
-    const timeoutMs = this.configService.getOrThrow<
-      NonNullable<AppConfig['receiptMedia']['attachTimeoutMs']>
-    >('receiptMedia.attachTimeoutMs');
-
-    const requestConfig = this.buildAuthedRequestConfig({
-      ...config,
-      timeout: timeoutMs,
-      signal: options.signal,
-    });
-
-    let response;
-    try {
-      response = await lastValueFrom(
-        this.httpService.request<AttachReceiptResponse>(requestConfig),
-      );
-    } catch (error) {
-      throw this.mapError(error);
-    }
-
-    const body = response.data;
-    const isValid =
-      response.status === 201 &&
-      typeof body === 'object' &&
-      body !== null &&
-      !Array.isArray(body) &&
-      typeof (body as { receiptId?: unknown }).receiptId === 'string' &&
-      (body as { status?: unknown }).status === 'PENDING';
-
-    if (!isValid) {
-      throw new UpstreamError(
-        'Chatbot API attach-receipt response was invalid',
-        response.status,
-        body,
-        extractErrorCode(body),
-      );
-    }
-
-    return body;
   }
 
   /**

@@ -50,8 +50,6 @@ describe('pending-human-request-persistence', () => {
       update,
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
     return { store, existing };
   }

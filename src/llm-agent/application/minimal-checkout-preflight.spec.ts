@@ -80,7 +80,6 @@ function setup(
     }),
     createSale: jest.fn(),
     upsertCustomer: jest.fn(),
-    attachReceipt: jest.fn(),
     getPaymentDetails: jest.fn(),
   } as unknown as jest.Mocked<ChatbotApiClient>;
   const config = {
@@ -164,7 +163,6 @@ async function review(f: ReturnType<typeof setup>, inboundEvent?: unknown) {
   expect(cartWrite).not.toHaveBeenCalled();
   expect(f.api.createSale).not.toHaveBeenCalled();
   expect(f.api.upsertCustomer).not.toHaveBeenCalled();
-  expect(f.api.attachReceipt).not.toHaveBeenCalled();
   expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
   return result;
 }

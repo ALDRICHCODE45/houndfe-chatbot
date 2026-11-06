@@ -72,8 +72,6 @@ describe('HumanHandoffService', () => {
       update: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
     // CAS primitives default to success; per-test overrides flip them.
     conversationStore.setPendingHumanRequest.mockResolvedValue(true);

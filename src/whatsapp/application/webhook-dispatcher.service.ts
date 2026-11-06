@@ -406,8 +406,6 @@ const UNSUPPORTED_RECEIPT_FORMAT =
 
 function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
   switch (decision.kind) {
-    case 'disabled':
-      return 'El servicio no está disponible. Intenta más tarde.';
     case 'unsupported-media':
       return UNSUPPORTED_RECEIPT_FORMAT;
     case 'no-placed-sale':

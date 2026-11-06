@@ -27,9 +27,7 @@ describe('AppConfigModule integration', () => {
     CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
     OPS_CHANNEL_PHONE: '5215500000000',
     // WU1B receipt media
-    RECEIPT_MEDIA_ENABLED: 'false',
     RECEIPT_MEDIA_MAX_BYTES: '10485760',
-    RECEIPT_STORAGE_FORCE_PATH_STYLE: 'false',
     RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
     RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
   };
@@ -178,20 +176,18 @@ describe('AppConfigModule integration', () => {
     });
   });
 
-  // WU1B RED: receiptMedia subtree absent → test fails until GREEN
-  describe('receiptMedia disabled-default', () => {
+  // R3/S7: receipt media is always on; its knobs boot from defaults and the
+  // removed flag vars have no effect.
+  describe('receiptMedia always-on defaults', () => {
     it.each([
-      { enabled: undefined, label: 'omitted RECEIPT_MEDIA_ENABLED' },
-      { enabled: 'false', label: 'explicit false' },
+      { flag: undefined, label: 'no removed flag' },
+      { flag: 'false', label: 'removed RECEIPT_MEDIA_ENABLED=false' },
     ])(
-      '$label boots and ConfigService returns disabled-default receiptMedia',
-      async ({ enabled }) => {
+      '$label boots and ConfigService returns the default receiptMedia',
+      async ({ flag }) => {
         Object.assign(process.env, VALID_ENV);
-        if (enabled === undefined) {
-          delete process.env.RECEIPT_MEDIA_ENABLED;
-        } else {
-          process.env.RECEIPT_MEDIA_ENABLED = enabled;
-        }
+        if (flag === undefined) delete process.env.RECEIPT_MEDIA_ENABLED;
+        else process.env.RECEIPT_MEDIA_ENABLED = flag;
 
         const moduleRef = await Test.createTestingModule({
           imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
@@ -199,38 +195,20 @@ describe('AppConfigModule integration', () => {
 
         const config = moduleRef.get(ConfigService);
 
-        const disabledDefault = {
-          enabled: false,
+        expect(config.get('receiptMedia')).toEqual({
           maxBytes: 10_485_760,
           meta: {
-            allowedHosts: [] as string[],
-            metadataTimeoutMs: undefined,
-            downloadTimeoutMs: undefined,
+            allowedHosts: ['lookaside.fbsbx.com'],
+            metadataTimeoutMs: 10_000,
+            downloadTimeoutMs: 30_000,
           },
-          storage: {
-            endpoint: undefined,
-            region: undefined,
-            bucket: undefined,
-            accessKeyId: undefined,
-            secretAccessKey: undefined,
-            forcePathStyle: false,
-          },
-          publicBaseUrl: undefined,
-          capability: {
-            keys: undefined,
-            activeVersion: undefined,
-          },
-          attachTimeoutMs: undefined,
           worker: {
-            enabled: false,
             concurrency: 2,
             leaseMs: 60_000,
-            pollIntervalMs: undefined,
+            pollIntervalMs: 5_000,
           },
           metricsToken: undefined,
-        };
-
-        expect(config.get('receiptMedia')).toEqual(disabledDefault);
+        });
 
         await moduleRef.close();
       },

@@ -43,11 +43,10 @@ const media = (n: number, label: string) => ({
   wamid: `wamid.r2.${label}`,
   mediaId: `media.r2.${label}`,
   sender: `sender.r2.${label}`,
-  objectKey: `receipts/aaaaaaaa-000${n}-4000-8000-00000000000${n}`,
 });
 type Media = ReturnType<typeof media>;
 const COLS =
-  'id webhook_message_id provider_media_id sender_id captured_sale_id object_key status version declared_mime_type declared_amount_cents'.split(
+  'id webhook_message_id provider_media_id sender_id captured_sale_id status version declared_mime_type declared_amount_cents'.split(
     ' ',
   );
 const INSERT = `INSERT INTO receipt_media (${COLS.join(
@@ -163,7 +162,6 @@ ddescribe('receipt-media R2 pipeline (worker → backend upload)', () => {
       provider_media_id: target.mediaId,
       sender_id: target.sender,
       captured_sale_id: SALE,
-      object_key: target.objectKey,
       status: 'RESERVED',
       version: '0',
       declared_mime_type: mime,
@@ -237,8 +235,7 @@ ddescribe('receipt-media R2 pipeline (worker → backend upload)', () => {
     for (const worker of workers) await worker.onModuleDestroy();
     workers.clear();
     await pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
-        ' receipt_media, conversation_state',
+      'TRUNCATE receipt_media_outbox,' + ' receipt_media, conversation_state',
     );
   });
 

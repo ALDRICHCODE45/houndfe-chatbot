@@ -13,7 +13,6 @@ import { CONVERSATION_STORE } from '../../src/conversation/domain/conversation-s
 import { InMemoryConversationStore } from '../../src/conversation/infrastructure/in-memory-conversation.store';
 import { AgentRunner } from '../../src/llm-agent/application/agent-runner.service';
 import { MinimalCatalogAgentService } from '../../src/llm-agent/application/minimal-catalog-agent.service';
-import { ReceiptAmountRouterService } from '../../src/receipt-media/application/receipt-amount-router.service';
 import { ReceiptIngressService } from '../../src/receipt-media/application/receipt-ingress.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../src/sale-flow/infrastructure/real-tool-registry';
 import { WebhookDispatcherService } from '../../src/whatsapp/application/webhook-dispatcher.service';
@@ -121,14 +120,9 @@ export function sandboxMinimalCatalogAgent(runner: {
   };
 }
 
-/** Inert receipt amount router: always fences (no store/backend access). */
-export const SANDBOX_AMOUNT_ROUTER = {
-  route: () => Promise.resolve({ kind: 'fenced' as const }),
-};
-
-/** Inert receipt ingress: never admits media. */
+/** Inert receipt ingress: never admits media (no store/backend access). */
 export const SANDBOX_RECEIPT_INGRESS = {
-  admit: () => Promise.resolve({ kind: 'disabled' as const }),
+  admit: () => Promise.resolve({ kind: 'no-placed-sale' as const }),
 };
 
 /** Inert human-handoff: no ops phone, no pending/ops routing. */
@@ -344,7 +338,6 @@ function scanRawSenders(
       useFactory: sandboxMinimalCatalogAgent,
       inject: [AgentRunner],
     },
-    { provide: ReceiptAmountRouterService, useValue: SANDBOX_AMOUNT_ROUTER },
     { provide: ReceiptIngressService, useValue: SANDBOX_RECEIPT_INGRESS },
     { provide: HUMAN_HANDOFF_SERVICE_TOKEN, useValue: SANDBOX_HUMAN_HANDOFF },
     SandboxInboundSenderFilterInterceptor,

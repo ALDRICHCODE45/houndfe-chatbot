@@ -6,7 +6,7 @@
  * TestingModule — no guard mocking, no external services, loopback listener
  * per test, closed in finally/afterEach.
  *
- * Coverage: metrics/admission flag matrix, authenticated 200/401/404,
+ * Coverage: metrics token matrix, authenticated 200/401/404,
  * query/cookie-only 401, case-sensitive token/mixedcase Bearer,
  * content-type/no-store, serialization rejection (503), no unauthorized
  * serialization, and singleton duplicate-imports.
@@ -18,7 +18,6 @@ import type { AddressInfo } from 'node:net';
 import { Registry } from 'prom-client';
 import { WHATSAPP_SENDER } from '../../whatsapp/domain/whatsapp-sender.port';
 import { META_MEDIA } from '../domain/meta-media.port';
-import { OBJECT_STORAGE_PORT } from '../domain/object-storage.port';
 import { AppConfigModule } from '../../config/config.module';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
@@ -86,10 +85,7 @@ function httpGet(
 }
 
 /** Applies synthetic env only; AppConfigModule never reads an env file. */
-function applyReceiptEnv(
-  metricsToken: string | undefined,
-  admissionEnabled: boolean,
-): void {
+function applyReceiptEnv(metricsToken: string | undefined): void {
   // Clear everything except npm_/NODE_ preservation list.
   for (const key of Object.keys(process.env)) {
     if (!key.startsWith('npm_') && !key.startsWith('NODE_')) {
@@ -109,52 +105,28 @@ function applyReceiptEnv(
   process.env.LLM_MODEL = 'm';
   process.env.DATABASE_URL = 'postgres://u:p@localhost:5432/d';
   process.env.OPS_CHANNEL_PHONE = '5215500000000';
-  process.env.RECEIPT_MEDIA_ENABLED = String(admissionEnabled);
-  if (admissionEnabled) {
-    Object.assign(process.env, {
-      RECEIPT_MEDIA_MAX_BYTES: '10485760',
-      META_MEDIA_ALLOWED_HOSTS: 'graph.facebook.com,.meta.com',
-      META_MEDIA_METADATA_TIMEOUT_MS: '5000',
-      META_MEDIA_DOWNLOAD_TIMEOUT_MS: '30000',
-      RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
-      RECEIPT_STORAGE_REGION: 'us-east-1',
-      RECEIPT_STORAGE_BUCKET: 'test-receipts',
-      RECEIPT_STORAGE_ACCESS_KEY_ID: 'test-key',
-      RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'test-secret',
-      RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
-      RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
-      RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
-      RECEIPT_MEDIA_WORKER_POLL_MS: '59000',
-      CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
-      RECEIPT_CAPABILITY_KEYS: '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=',
-      RECEIPT_CAPABILITY_ACTIVE_VERSION: '1',
-    });
-  }
+  // Receipt media is always on: keep the background drains' next poll far
+  // from the request window.
+  process.env.RECEIPT_MEDIA_WORKER_POLL_MS = '59000';
   if (metricsToken !== undefined) {
     process.env.RECEIPT_MEDIA_METRICS_TOKEN = metricsToken;
   }
 }
 
 /** Builds the receipt module graph, binds an ephemeral loopback listener. */
-async function buildApp(
-  metricsToken: string | undefined,
-  admissionEnabled = false,
-): Promise<{
+async function buildApp(metricsToken: string | undefined): Promise<{
   app: INestApplication;
   port: number;
   boundaryCalls: jest.Mock[];
 }> {
-  applyReceiptEnv(metricsToken, admissionEnabled);
+  applyReceiptEnv(metricsToken);
   const pool = stubPool();
-  const backend = { attachReceipt: jest.fn() };
+  const backend = {
+    uploadReceipt: jest.fn(),
+    getReceiptOutcome: jest.fn(),
+  };
   const sender = { sendText: jest.fn() };
   const media = { resolveAndDownload: jest.fn() };
-  const storage = {
-    put: jest.fn(),
-    getStream: jest.fn(),
-    head: jest.fn(),
-    deleteTechnicalObject: jest.fn(),
-  };
 
   const builder = Test.createTestingModule({
     imports: [
@@ -171,14 +143,14 @@ async function buildApp(
     .overrideProvider(WHATSAPP_SENDER)
     .useValue(sender)
     .overrideProvider(META_MEDIA)
-    .useValue(media)
-    .overrideProvider(OBJECT_STORAGE_PORT)
-    .useValue(storage);
+    .useValue(media);
 
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
   try {
     await app.listen(0, '127.0.0.1');
+    // Let the always-on drains finish their boot pass before any snapshot.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     const { port } = (
       app.getHttpServer() as http.Server
     ).address() as AddressInfo;
@@ -189,10 +161,10 @@ async function buildApp(
         pool.query,
         pool.connect,
         pool.client.query,
-        backend.attachReceipt,
+        backend.uploadReceipt,
+        backend.getReceiptOutcome,
         sender.sendText,
         media.resolveAndDownload,
-        ...Object.values(storage),
       ],
     };
   } catch (error) {
@@ -209,18 +181,15 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     Object.assign(process.env, baseEnv);
   });
 
-  describe('metrics token + admission flag matrix', () => {
+  describe('metrics token matrix', () => {
     it.each([
-      [false, false, 404],
-      [false, true, 404],
-      [true, false, 200],
-      [true, true, 200],
+      [false, 404],
+      [true, 200],
     ] as const)(
-      'token=%s admission=%s returns %i without scrape-caused I/O',
-      async (metrics, admission, expectedStatus) => {
+      'token=%s returns %i without scrape-caused I/O',
+      async (metrics, expectedStatus) => {
         const { app, port, boundaryCalls } = await buildApp(
           metrics ? FIXED_TOKEN : undefined,
-          admission,
         );
         try {
           const before = boundaryCalls.map((spy) => spy.mock.calls.length);

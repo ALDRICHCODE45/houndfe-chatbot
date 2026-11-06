@@ -231,11 +231,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
       recentOutbound,
       handoff as unknown as HumanHandoffService,
       conversations as unknown as ConversationStore,
-      new ReceiptIngressService(
-        { enabled: true },
-        { getState: conversations.getState },
-        probe,
-      ),
+      new ReceiptIngressService({ getState: conversations.getState }, probe),
       minimalAgent as unknown as MinimalCatalogAgentService,
     );
 
@@ -303,7 +299,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     await Promise.all(harnesses.splice(0).map((h) => h.close()));
     await dropForcedFailureTrigger();
     await pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
+      'TRUNCATE receipt_media_outbox,' +
         ' receipt_media, processed_webhook_messages',
     );
   });

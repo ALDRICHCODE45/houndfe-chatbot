@@ -70,8 +70,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       update: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
 
     sender = {
@@ -130,8 +128,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       update: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
 
     // WU13-B2: ReceiptIngressService mock. Default reserved with a minimal
@@ -1170,13 +1166,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }> = [
         {
           decision: {
-            kind: 'disabled',
-            text: 'El servicio no está disponible. Intenta más tarde.',
-          },
-          expected: 'El servicio no está disponible. Intenta más tarde.',
-        },
-        {
-          decision: {
             kind: 'unsupported-media',
             text: 'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
           },
@@ -1193,7 +1182,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         {
           decision: {
             kind: 'sender-active',
-            status: 'AWAITING_AMOUNT',
+            status: 'DOWNLOADED',
             text: 'Estamos procesando su comprobante.',
           },
           expected: 'Estamos procesando su comprobante.',
@@ -1224,18 +1213,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         status: ActiveReceiptStatus;
         text: string;
       }> = [
-        {
-          status: 'AWAITING_AMOUNT',
-          text: 'Estamos procesando su comprobante.',
-        },
-        {
-          status: 'AWAITING_CONFIRMATION',
-          text: 'Estamos procesando su comprobante.',
-        },
         { status: 'RESERVED', text: 'Estamos procesando su comprobante.' },
         { status: 'DOWNLOADED', text: 'Estamos procesando su comprobante.' },
-        { status: 'STORED', text: 'Estamos procesando su comprobante.' },
-        { status: 'ATTACHING', text: 'Estamos procesando su comprobante.' },
       ];
 
       test.each(activeGuidanceCases)(
@@ -1388,7 +1367,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
 
       it('orders guidance collaborators and remembers the outbound id', async () => {
-        ingress.admit.mockResolvedValueOnce({ kind: 'disabled' });
+        ingress.admit.mockResolvedValueOnce({ kind: 'unsupported-media' });
         sender.sendText.mockResolvedValueOnce({
           providerMessageId: 'wamid.out',
         });
@@ -1411,10 +1390,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
 
       test.each([
-        { kind: 'disabled' } as const,
         { kind: 'unsupported-media' } as const,
         { kind: 'no-placed-sale' } as const,
-        { kind: 'sender-active', status: 'AWAITING_AMOUNT' } as const,
+        { kind: 'sender-active', status: 'DOWNLOADED' } as const,
       ])(
         'guidance marker-write failure after $kind remains terminal',
         async (decision) => {
@@ -1431,7 +1409,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       );
 
       it('does not remember or mark seen when guidance delivery fails', async () => {
-        ingress.admit.mockResolvedValueOnce({ kind: 'disabled' });
+        ingress.admit.mockResolvedValueOnce({ kind: 'unsupported-media' });
         sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
 
         await expect(

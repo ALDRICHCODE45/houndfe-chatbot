@@ -27,8 +27,6 @@ export type DispatchOutcome = DispatchedOutcome | NonDispatchedOutcome;
 /**
  * Construction is inert. Errors from the processor propagate unchanged.
  * Signal is forwarded unchanged; the dispatcher has no cancellation policy.
- * The legacy ATTACHING state (amount dialog) is no longer produced and is
- * never dispatched.
  */
 export class ReceiptProcessingDispatcher {
   constructor(private readonly ingestion: Ingestion) {}

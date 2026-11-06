@@ -21,8 +21,6 @@ import type {
 } from './dtos/human-decisions.dto';
 import { CartEvaluationResult, CartItemInput } from './dtos/pricing.dto';
 import {
-  AttachReceiptInput,
-  AttachReceiptResponse,
   BotSaleResponse,
   CancelSaleInput,
   CancelSaleResult,
@@ -49,13 +47,14 @@ import type {
   ReceiptUploadFile,
   ReceiptUploadResponse,
 } from './dtos/receipt-upload.dto';
+import type { ReceiptOutcome } from './dtos/receipt-outcome.dto';
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
 /**
- * Transport-level options for attachment-only receipt upload (WU11B).
- * `signal` is caller-owned and forwarded verbatim to the HTTP layer as the
- * Axios `signal`; the request timeout is owned by the HTTP client config.
+ * Transport-level options for the multipart receipt upload. `signal` is
+ * caller-owned and forwarded verbatim to the HTTP layer as the Axios
+ * `signal`; the request timeout is owned by the HTTP client.
  */
 export interface AttachReceiptTransportOptions {
   signal?: AbortSignal;
@@ -112,11 +111,6 @@ export interface ChatbotApiClient {
    *  The `cancelSale` tool layer always sends `reason: 'CUSTOMER_REQUEST'`
    *  and the injected `cashierUserId`. */
   cancelSale(saleId: string, dto: CancelSaleInput): Promise<CancelSaleResult>;
-  attachReceipt(
-    saleId: string,
-    dto: AttachReceiptInput,
-    options?: AttachReceiptTransportOptions,
-  ): Promise<AttachReceiptResponse>;
   /** Multipart `POST /chatbot-api/sales/:saleId/receipts` (scope
    *  `sales:write`). `idempotencyKey` is the WhatsApp media id: a retry with
    *  the same key and file returns the same receipt. Exactly one POST per
@@ -130,6 +124,10 @@ export interface ChatbotApiClient {
     idempotencyKey: string,
     options?: AttachReceiptTransportOptions,
   ): Promise<ReceiptUploadResponse>;
+  /** `GET /chatbot-api/receipts/:receiptId` (scope `sales:read`): the
+   *  human outcome of an uploaded receipt. UUID-validated before any request,
+   *  safe GET retry policy, strict body parse; errors carry `body.error`. */
+  getReceiptOutcome(receiptId: string): Promise<ReceiptOutcome>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
   /** HD-R2b2: `POST /chatbot-api/human-decisions` RESTOCK intake (scope

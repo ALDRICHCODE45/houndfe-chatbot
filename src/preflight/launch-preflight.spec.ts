@@ -114,18 +114,19 @@ describe('runLaunchPreflight', () => {
 
   it('fails closed on missing posture and rejects non-exact values', () => {
     const missing = safeEnv();
-    delete missing.RECEIPT_MEDIA_INGESTION_ENABLED;
+    delete missing.META_SANDBOX_RECIPIENT_NORMALIZATION;
     const nonExact = safeEnv();
     nonExact.META_SANDBOX_RECIPIENT_NORMALIZATION = 'FALSE';
     const wrong = safeEnv();
-    wrong.RECEIPT_MEDIA_ENABLED = 'true';
+    wrong.META_SANDBOX_RECIPIENT_NORMALIZATION = 'true';
 
     expect(run(missing).ok).toBe(false);
     expect(run(nonExact).ok).toBe(false);
     expect(run(wrong).ok).toBe(false);
     expect(
       run(missing).posture.find(
-        (c: { name: string }) => c.name === 'RECEIPT_MEDIA_INGESTION_ENABLED',
+        (c: { name: string }) =>
+          c.name === 'META_SANDBOX_RECIPIENT_NORMALIZATION',
       )?.status,
     ).toBe('missing');
     expect(
@@ -137,6 +138,49 @@ describe('runLaunchPreflight', () => {
     expect(
       run(missing).failures.some((f: { area: string }) => f.area === 'posture'),
     ).toBe(true);
+  });
+
+  // R3/S7: receipt media is always on; its removed flags are not checked.
+  it.each(['RECEIPT_MEDIA_ENABLED', 'RECEIPT_MEDIA_INGESTION_ENABLED'])(
+    'does not check the removed %s posture',
+    (name) => {
+      const env = safeEnv();
+      env[name] = 'true';
+      const report = run(env);
+      expect(report.ok).toBe(true);
+      expect(
+        report.posture.some((c: { name: string }) => c.name === name),
+      ).toBe(false);
+    },
+  );
+
+  it('lists the receipt upload and outcome routes with their scopes', () => {
+    expect(run(safeEnv()).clientRoutes).toEqual(
+      expect.arrayContaining([
+        {
+          method: 'POST',
+          path: '/chatbot-api/sales/:saleId/receipts',
+          scope: 'sales:write',
+          status: 'manual_external',
+        },
+        {
+          method: 'GET',
+          path: '/chatbot-api/receipts/:receiptId',
+          scope: 'sales:read',
+          status: 'manual_external',
+        },
+      ]),
+    );
+  });
+
+  it('requires the receipt payment flow migrations', () => {
+    expect(REQUIRED_MIGRATIONS).toEqual(
+      expect.arrayContaining([
+        '3300000000000_receipt_media_backend_upload.js',
+        '3400000000000_receipt_media_outcome.js',
+        '3500000000000_receipt_media_backend_only.js',
+      ]),
+    );
   });
 
   it('fails when a required migration filename is absent from disk', () => {
@@ -203,7 +247,7 @@ describe('runLaunchPreflight', () => {
         }),
       ),
     );
-    expect(first.clientRoutes).toHaveLength(17);
+    expect(first.clientRoutes).toHaveLength(18);
     expect(CLIENT_ROUTES).toEqual(
       expect.arrayContaining([
         ['POST', '/chatbot-api/human-decisions', 'human-decisions:create'],

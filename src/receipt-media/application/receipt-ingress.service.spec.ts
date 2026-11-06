@@ -1,5 +1,4 @@
 import type { ConversationState } from '../../conversation/domain/conversation-store';
-import { isCanonicalObjectKey } from '../domain/object-storage.port';
 import type {
   ActiveReceiptStatus,
   ActiveSenderIdentity,
@@ -58,7 +57,6 @@ type Reserve = (input: ReserveInput) => Promise<ReservationOutcome>;
 const fixture = (
   saleId: string | null = SALE,
   reserveImpl: Reserve = () => Promise.resolve(created()),
-  enabled = true,
   activeStatus: ActiveReceiptStatus | null = null,
 ) => {
   const reserve = jest.fn(reserveImpl);
@@ -68,7 +66,7 @@ const fixture = (
   >(() => Promise.resolve(activeStatus));
   const state = saleId === null ? null : placedOrderState(placedSale(saleId));
   const conversations = { getState: jest.fn(() => Promise.resolve(state)) };
-  const service = new ReceiptIngressService({ enabled }, conversations, {
+  const service = new ReceiptIngressService(conversations, {
     admit: reserve,
     findActiveBySender: findActive,
   });
@@ -77,15 +75,6 @@ const fixture = (
 const flush = () => new Promise<void>((r) => setImmediate(r));
 
 describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
-  it('gates the kill-switch with no state read and no reservation', async () => {
-    const { service, conversations, reserve } = fixture(SALE, undefined, false);
-    await expect(service.admit(input())).resolves.toEqual({
-      kind: 'disabled',
-    });
-    expect(conversations.getState).not.toHaveBeenCalled();
-    expect(reserve).not.toHaveBeenCalled();
-  });
-
   it('admits a PDF document receipt like an image (S8)', async () => {
     const { service, reserve } = fixture();
     const decision = await service.admit(
@@ -165,7 +154,6 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
       findActiveBySender: jest.fn(() => Promise.resolve(null)),
     };
     const service = new ReceiptIngressService(
-      { enabled: true },
       { getState: jest.fn(() => Promise.resolve(state)) },
       ingressStore,
     );
@@ -194,7 +182,6 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
       declaredMimeType: 'image/png',
     });
     expect(reserved.id).toMatch(UUID);
-    expect(isCanonicalObjectKey(reserved.objectKey)).toBe(true);
     expect(decision).toEqual({ kind: 'reserved', receipt: { id: 'r-1' } });
     expect((decision as { receipt: ReceiptMediaRow }).receipt).toBe(
       outcome.receipt,
@@ -246,12 +233,12 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     const { service } = fixture(SALE, () =>
       Promise.resolve({
         kind: 'sender-active',
-        status: 'ATTACHING',
+        status: 'DOWNLOADED',
       } as ReservationOutcome),
     );
     await expect(service.admit(input())).resolves.toEqual({
       kind: 'sender-active',
-      status: 'ATTACHING',
+      status: 'DOWNLOADED',
     });
   });
 
@@ -307,10 +294,7 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     expect(second).toEqual({ kind: 'reserved', receipt: { id: 'r-1' } });
     expect(reserve).toHaveBeenCalledTimes(2);
     const [firstId, secondId] = reserve.mock.calls.map(([r]) => r.id);
-    const [firstKey, secondKey] = reserve.mock.calls.map(([r]) => r.objectKey);
     expect(firstId).not.toBe(secondId);
-    expect(firstKey).not.toBe(secondKey);
-    expect(isCanonicalObjectKey(secondKey)).toBe(true);
   });
 
   it('propagates reservation rejection with no downstream action', async () => {
@@ -399,13 +383,11 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
       declaredAmountCents: 150000,
     });
     expect(reserved.id).toMatch(UUID);
-    expect(isCanonicalObjectKey(reserved.objectKey)).toBe(true);
     expect(Object.keys(reserved).sort()).toEqual([
       'capturedSaleId',
       'declaredAmountCents',
       'declaredMimeType',
       'id',
-      'objectKey',
       'providerMediaId',
       'senderId',
       'webhookMessageId',
@@ -416,17 +398,13 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
   });
 
   // ── ODD-4C: identity-aware active-image lookup (status-only projection) ─
-  const ACTIVE_STATUSES =
-    'RESERVED DOWNLOADED STORED AWAITING_AMOUNT AWAITING_CONFIRMATION ATTACHING'.split(
-      ' ',
-    );
+  const ACTIVE_STATUSES = 'RESERVED DOWNLOADED'.split(' ');
   it.each(ACTIVE_STATUSES)(
     'returns status-bearing sender-active for an active %s before any conversation read or admit',
     async (status) => {
       const { service, conversations, reserve, findActive } = fixture(
         SALE,
         undefined,
-        true,
         status as ActiveReceiptStatus,
       );
       await expect(service.admit(input())).resolves.toEqual({
@@ -465,12 +443,11 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     const { service, conversations, reserve } = fixture(
       null,
       undefined,
-      true,
-      'AWAITING_CONFIRMATION',
+      'DOWNLOADED',
     );
     await expect(service.admit(input())).resolves.toEqual({
       kind: 'sender-active',
-      status: 'AWAITING_CONFIRMATION',
+      status: 'DOWNLOADED',
     });
     expect(conversations.getState).not.toHaveBeenCalled();
     expect(reserve).not.toHaveBeenCalled();
@@ -491,16 +468,14 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
   );
 
   it.each([
-    ['disabled', false, 'image/jpeg'],
-    ['unsupported-media', true, 'application/msword'],
-    ['unsupported-media', true, 'image/gif'],
+    ['unsupported-media', 'application/msword'],
+    ['unsupported-media', 'image/gif'],
   ] as const)(
     'gates %s before the active lookup for %s',
-    async (kind, enabled, declaredMimeType) => {
+    async (kind, declaredMimeType) => {
       const { service, findActive, conversations, reserve } = fixture(
         SALE,
         undefined,
-        enabled,
         'RESERVED',
       );
       await expect(service.admit(input({ declaredMimeType }))).resolves.toEqual(

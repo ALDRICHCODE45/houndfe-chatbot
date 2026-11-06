@@ -115,17 +115,10 @@ ddescribe('receipt-media backend upload over the real HTTP client (R2)', () => {
   const seed = (target: Media) =>
     pool.query(
       `INSERT INTO receipt_media (id, webhook_message_id, provider_media_id,
-         sender_id, captured_sale_id, object_key, status, version,
+         sender_id, captured_sale_id, status, version,
          declared_mime_type)
-       VALUES ($1, $2, $3, $4, $5, $6, 'RESERVED', 0, 'image/jpeg')`,
-      [
-        target.id,
-        target.wamid,
-        target.mediaId,
-        target.sender,
-        SALE,
-        `receipts/${target.id}`,
-      ],
+       VALUES ($1, $2, $3, $4, $5, 'RESERVED', 0, 'image/jpeg')`,
+      [target.id, target.wamid, target.mediaId, target.sender, SALE],
     );
   const readRow = async (id: string): Promise<Row> =>
     (await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [id]))
@@ -167,9 +160,7 @@ ddescribe('receipt-media backend upload over the real HTTP client (R2)', () => {
     for (const worker of workers) await worker.onModuleDestroy();
     workers.clear();
     jest.restoreAllMocks();
-    await pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
-    );
+    await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
   });
 
   it('sends one multipart POST keyed by the media id and commits ATTACHED', async () => {

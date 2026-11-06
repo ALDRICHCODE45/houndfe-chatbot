@@ -73,7 +73,6 @@ describe('SaleFlowModule', () => {
     getCustomerByPhone: jest.fn(),
     upsertCustomer: jest.fn(),
     createSale: jest.fn(),
-    attachReceipt: jest.fn(),
     updateDelivery: jest.fn(),
     getOrderHistory: jest.fn(),
   };

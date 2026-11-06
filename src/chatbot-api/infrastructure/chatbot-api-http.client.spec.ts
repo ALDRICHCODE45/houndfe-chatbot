@@ -56,9 +56,8 @@ describe('ChatbotApiHttpClient', () => {
         ),
     };
 
-    // In-memory `ConfigService`: `chatbotApi.*` and
-    // `receiptMedia.attachTimeoutMs` resolve through the internal config via
-    // dot-notation, matching the production runtime contract instead of a
+    // In-memory `ConfigService`: `chatbotApi.*` resolves through the
+    // internal config via dot-notation, matching the production runtime contract instead of a
     // partial mock of the overloaded `getOrThrow`.
     configService = new ConfigService({
       chatbotApi: {
@@ -66,7 +65,6 @@ describe('ChatbotApiHttpClient', () => {
         serviceKey: 'svc_test_key',
         branchId: 'branch-123',
       },
-      receiptMedia: { attachTimeoutMs: 15000 },
     });
 
     sleep = jest.fn<Promise<void>, [number]>().mockResolvedValue(undefined);
@@ -445,15 +443,21 @@ describe('ChatbotApiHttpClient', () => {
     expect(url).not.toContain('/555/0001111');
   });
 
-  it('percent-encodes productId, saleId, and order-history phone segments', async () => {
+  it('percent-encodes productId, saleId, receiptId and order-history phone segments', async () => {
     httpService.request.mockReturnValue(of(axiosResponse({})));
 
     await client.getStock('prod+with/slash');
     await client
-      .attachReceipt('sale+id/1', {
-        mediaUrl: 'https://example.com/r.jpg',
-        declaredAmountCents: 1000,
-      })
+      .uploadReceipt(
+        'sale+id/1',
+        {
+          bytes: Buffer.from('img'),
+          mimeType: 'image/jpeg',
+          filename: 'receipt.jpg',
+        },
+        {},
+        'wa-media-1',
+      )
       .catch(() => undefined);
     await client
       .updateDelivery('sale+id/2', {
@@ -1127,155 +1131,6 @@ describe('ChatbotApiHttpClient', () => {
       cashierUserId: 'cashier-1',
     });
     expect(resolved).toEqual(replay);
-  });
-
-  // ─── attachReceipt abortable attachment-only HTTP transport (WU11B)
-
-  describe('attachReceipt (WU11B)', () => {
-    const attachDto = {
-      mediaUrl: 'https://example.com/r.jpg',
-      declaredAmountCents: 1000,
-    };
-    const validBody = { receiptId: 'receipt-1', status: 'PENDING' };
-
-    function mockFulfilled(status: number, data: unknown): void {
-      httpService.request.mockReturnValue(of(axiosResponse(data, status)));
-    }
-
-    it('resolves a valid 201 PENDING body', async () => {
-      mockFulfilled(201, validBody);
-
-      await expect(client.attachReceipt('sale-1', attachDto)).resolves.toEqual(
-        validBody,
-      );
-    });
-
-    it('sends exactly one POST with the configured timeout, the same caller AbortSignal, and auth/branch headers', async () => {
-      mockFulfilled(201, validBody);
-      const controller = new AbortController();
-
-      await client.attachReceipt('sale-1', attachDto, {
-        signal: controller.signal,
-      });
-
-      expect(httpService.request).toHaveBeenCalledTimes(1);
-      const cfg = httpService.request.mock.calls[0][0] as {
-        method: string;
-        url: string;
-        data: unknown;
-        timeout: number;
-        signal: AbortSignal;
-        headers: Record<string, string>;
-      };
-      expect(cfg.method).toBe('POST');
-      expect(cfg.url).toBe('/chatbot-api/sales/sale-1/receipts');
-      expect(cfg.data).toEqual(attachDto);
-      expect(cfg.timeout).toBe(15000);
-      expect(cfg.signal).toBe(controller.signal);
-      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
-      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
-    });
-
-    it('stays compatible when called without options: no signal is forwarded and the request still succeeds', async () => {
-      mockFulfilled(201, validBody);
-
-      await expect(client.attachReceipt('sale-1', attachDto)).resolves.toEqual(
-        validBody,
-      );
-
-      const cfg = httpService.request.mock.calls[0][0] as {
-        timeout: number;
-        signal?: AbortSignal;
-      };
-      expect(cfg.signal).toBeUndefined();
-      expect(cfg.timeout).toBe(15000);
-    });
-
-    it.each([200, 202])(
-      'rejects a fulfilled HTTP %i response with UpstreamError carrying the observed status and body',
-      async (status) => {
-        mockFulfilled(status, validBody);
-
-        try {
-          await client.attachReceipt('sale-1', attachDto);
-          fail('Expected UpstreamError');
-        } catch (error) {
-          expect(error).toBeInstanceOf(UpstreamError);
-          expect((error as ChatbotApiError).statusCode).toBe(status);
-          expect((error as ChatbotApiError).responseBody).toEqual(validBody);
-        }
-      },
-    );
-
-    it.each([
-      ['missing receiptId', { status: 'PENDING' }],
-      ['non-string receiptId', { receiptId: 123, status: 'PENDING' }],
-      ['non-PENDING status', { receiptId: 'r-1', status: 'CONFIRMED' }],
-      ['null body', null],
-      ['array body', [validBody]],
-    ])(
-      'rejects malformed 201 body (%s) with UpstreamError evidence',
-      async (_label, body) => {
-        mockFulfilled(201, body);
-
-        try {
-          await client.attachReceipt('sale-1', attachDto);
-          fail('Expected UpstreamError');
-        } catch (error) {
-          expect(error).toBeInstanceOf(UpstreamError);
-          expect((error as ChatbotApiError).statusCode).toBe(201);
-          expect((error as ChatbotApiError).responseBody).toEqual(body);
-        }
-      },
-    );
-
-    it('preserves the errorCode evidence from the body on a fulfilled invalid response', async () => {
-      const body = { error: 'ATTACH_REJECTED', receiptId: 5 };
-      mockFulfilled(201, body);
-
-      try {
-        await client.attachReceipt('sale-1', attachDto);
-        fail('Expected UpstreamError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).errorCode).toBe('ATTACH_REJECTED');
-      }
-    });
-
-    it('maps a 5xx rejection through the existing error mapping with exactly one request and no sleep', async () => {
-      httpService.request.mockReturnValue(
-        throwError(() => ({
-          response: { status: 503, data: { error: 'BOOM' } },
-        })),
-      );
-
-      try {
-        await client.attachReceipt('sale-1', attachDto);
-        fail('Expected UpstreamError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).statusCode).toBe(503);
-        expect((error as ChatbotApiError).errorCode).toBe('BOOM');
-      }
-      expect(httpService.request).toHaveBeenCalledTimes(1);
-      expect(sleep).not.toHaveBeenCalled();
-    });
-
-    it('maps an abort/transport rejection through the existing error mapping with exactly one request and no sleep', async () => {
-      httpService.request.mockReturnValue(
-        throwError(() => ({ code: 'ERR_CANCELED', message: 'canceled' })),
-      );
-
-      try {
-        await client.attachReceipt('sale-1', attachDto);
-        fail('Expected UpstreamError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).statusCode).toBeNull();
-      }
-      expect(httpService.request).toHaveBeenCalledTimes(1);
-      expect(sleep).not.toHaveBeenCalled();
-    });
   });
 
   // ─── submitRestockIntake (POST /chatbot-api/human-decisions) — HD-R2b2

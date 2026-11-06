@@ -59,11 +59,7 @@ export const CORE_CONFIG_NAMES = [
 export const POSTURE_EXPECTATIONS: readonly {
   name: string;
   expected: PostureValue;
-}[] = [
-  { name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' },
-  { name: 'RECEIPT_MEDIA_ENABLED', expected: 'false' },
-  { name: 'RECEIPT_MEDIA_INGESTION_ENABLED', expected: 'false' },
-];
+}[] = [{ name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' }];
 
 export const REQUIRED_MIGRATIONS = [
   '1700000000000_create-conversation-state.js',
@@ -84,6 +80,11 @@ export const REQUIRED_MIGRATIONS = [
   '3100000000000_customer_inbound_observations.js',
   // Durable DELIVERY_ZONE requesters (zone validation polling and notice).
   '3200000000000_delivery_zone_requesters.js',
+  // Receipt payment flow (always on): backend upload, human outcome, and the
+  // removal of the chatbot-owned storage schema.
+  '3300000000000_receipt_media_backend_upload.js',
+  '3400000000000_receipt_media_outcome.js',
+  '3500000000000_receipt_media_backend_only.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
@@ -98,7 +99,10 @@ export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
   ['GET', '/chatbot-api/checkouts/status', 'customers:write sales:create'],
   ['GET', '/chatbot-api/payment-details', 'payment-details:read'],
   ['POST', '/chatbot-api/sales/:saleId/cancel', 'sales:write'],
+  // Multipart receipt upload (X-Idempotency-Key = WhatsApp media id).
   ['POST', '/chatbot-api/sales/:saleId/receipts', 'sales:write'],
+  // Human receipt outcome (CONFIRMED / REJECTED) relayed to the customer.
+  ['GET', '/chatbot-api/receipts/:receiptId', 'sales:read'],
   ['PATCH', '/chatbot-api/sales/:saleId/delivery', 'sales:write'],
   ['GET', '/chatbot-api/customers/by-phone/:phone/orders', 'customers:read'],
   // Human-decision bot cycle (RESTOCK, EXPIRATION and DELIVERY_ZONE).
@@ -116,7 +120,7 @@ const MANUAL_PREREQUISITES: readonly (readonly [string, string])[] = [
   ['bot_cashier_user', 'Bot cashier User matches CHATBOT_API_CASHIER_USER_ID.'],
   [
     'service_credential',
-    'Eleven scopes including payment-details:read, shipping:quote and human-decisions:create/read/ack.',
+    'Twelve scopes including payment-details:read, shipping:quote, sales:read and human-decisions:create/read/ack.',
   ],
   ['active_payment_detail', 'An active PaymentDetail exists (no 404).'],
   ['populated_catalog', 'Catalog has products for search/stock/cart flows.'],

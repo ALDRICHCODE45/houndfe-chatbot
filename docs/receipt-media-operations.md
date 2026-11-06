@@ -1,14 +1,16 @@
 # Receipt Media Operations Runbook — WU15-2
 
-This slice exposes an authenticated, in-memory telemetry foundation. It does
-**not** activate ingestion, TX2, receipt attachment, or additional business
-emitters. Local tests are not evidence of production deployment readiness.
+Receipt ingestion is always on (receipt payment flow R3/S7): the backend stores
+the files, a human validates each receipt, and the bot relays the outcome. The
+metrics endpoint is an authenticated, in-memory telemetry foundation; it does
+not activate TX2 or additional business emitters. Local tests are not evidence
+of production deployment readiness.
 
 ## Before serving metrics
 
 1. Provision a dedicated `RECEIPT_MEDIA_METRICS_TOKEN` through your secret manager.
    Generate it from 32 cryptographically random bytes encoded as 64 ASCII hex
-   characters. Never reuse Meta, service-API, or receipt-capability secrets.
+   characters. Never reuse Meta or service-API secrets.
 2. Inject the token at boot; the endpoint is served exactly when
    `RECEIPT_MEDIA_METRICS_TOKEN` is configured (there is no separate enable
    flag). Coordinate this with the scraper secret. Changes require a graceful
@@ -41,11 +43,8 @@ normalize token case. The Bearer scheme is case-insensitive. Send exactly one
 authenticate; duplicate, malformed, or inconsistent Authorization metadata is
 denied.
 
-The metrics token is independent of `RECEIPT_MEDIA_ENABLED` (receipt admission).
-Metrics can be served while admission is disabled, or not served while admission
-is enabled. Disabling admission also fail-closes **existing receipt capability
-lookup** and leaves the notification drain inert. A mounted download route does
-not mean existing downloads remain usable.
+Receipt ingestion is always on (receipt payment flow R3/S7); the metrics token
+only decides whether the metrics endpoint is served.
 
 ## Metric meanings: absence is not zero
 
@@ -111,9 +110,7 @@ are separate requirements, not properties of this YAML.
    works and the old token no longer authenticates without exposing either value.
 4. Retire the old scraper secret only after the coordinated switch is verified.
 
-This procedure does **not** rotate receipt capability keys. Capability rotation
-is a separate operational change described below; neither rotation drill was
-executed in this slice.
+This rotation drill was not executed in this slice.
 
 ## Alerts and deferred operational drills
 
@@ -128,29 +125,27 @@ It contains no row IDs, PII, or provider details. Exhaustion is not exposed as a
 new business metric here. Do not infer TX2 health from scrape success or configure
 healthy-zero alerts for the absent counters.
 
-### Private bucket and capability-key rotation
+### Configuration (always on)
 
-- Verify private bucket access, public-access restrictions, and least-privilege
-  permissions for the paths being deployed. Live storage access and policy drills
-  remain unexercised; this document grants no new infrastructure permissions.
-- When rotating `RECEIPT_CAPABILITY_KEYS` and `RECEIPT_CAPABILITY_ACTIVE_VERSION`,
-  retain previous key versions and their original bytes for as long as existing
-  receipts need reconstruction. Missing or changed keys make reconstruction fail
-  closed. Changing the active version is **not** automatic revocation of old
-  capabilities. Key removal requires a separately approved lifecycle/retention
-  decision and validation of existing receipts.
+Receipt ingestion has no feature flag: the backend stores receipt files in
+DigitalOcean (receipt-payment-flow S2), so the chatbot owns no bucket, public
+base URL or capability-signed URL. The removed variables `RECEIPT_MEDIA_ENABLED`,
+`RECEIPT_MEDIA_INGESTION_ENABLED`, `RECEIPT_STORAGE_*`, `RECEIPT_CAPABILITY_*`,
+`RECEIPT_MEDIA_PUBLIC_BASE_URL` and `CHATBOT_API_ATTACH_TIMEOUT_MS` have no
+effect. The remaining knobs all have defaults:
 
-### Storage growth and incomplete multipart uploads
+| Variable | Default |
+| --- | --- |
+| `META_MEDIA_ALLOWED_HOSTS` | `lookaside.fbsbx.com` |
+| `META_MEDIA_METADATA_TIMEOUT_MS` | 10000 (< 60000) |
+| `META_MEDIA_DOWNLOAD_TIMEOUT_MS` | 30000 (< 60000, ≥ metadata) |
+| `RECEIPT_MEDIA_WORKER_CONCURRENCY` | 2 (1–8) |
+| `RECEIPT_MEDIA_WORKER_LEASE_MS` | 60000 (fixed) |
+| `RECEIPT_MEDIA_WORKER_POLL_MS` | 5000 (< 60000) |
+| `RECEIPT_MEDIA_MAX_BYTES` | 10485760 (fixed) |
 
-Observe storage growth using separately approved infrastructure monitoring. No
-new receipt/object expiry or deletion policy is introduced here. Do not interpret
-`ATTACHED`, `CANCELLED`, `FAILED`, or an unknown attachment outcome as blanket
-permission to delete evidence. Existing technical-delete guards are not a general
-retention policy.
-
-An incomplete-multipart abort rule is a **future, unexercised storage-policy
-drill**: verify a safe window and that it affects only incomplete uploads, not
-completed receipt objects. No lifecycle rule or cleanup command is applied here.
+The service credential needs `sales:write` (upload) and `sales:read`
+(outcome); `sales:write` alone answers 403 on the outcome read.
 
 ### Backend upload and unknown outcome (R2)
 
@@ -161,70 +156,53 @@ as multipart to `POST /chatbot-api/sales/:saleId/receipts` with
 `docs/contracts/transfer-receipts.md`). The upload has a 90 s HTTP timeout and
 the worker renews its 60 s lease while it runs.
 
-| Backend answer | Durable result | Customer message |
-| --- | --- | --- |
-| 201 | `ATTACHED` | received + in review, with the folio (and the amount mismatch sentence) |
-| 409 `SALE_ALREADY_PAID` | `FAILED` / `ATTACH_DEFINITE` | the order is already paid |
-| 409 `SALE_NOT_PAYABLE` | `FAILED` / `ATTACH_DEFINITE` | the order no longer accepts payments |
-| 413 / 415 | `FAILED` / `ATTACH_DEFINITE` | send a JPEG, PNG or PDF under 10 MB |
-| other 400/401/403/404/409/422/429 | `FAILED` / `ATTACH_DEFINITE` | generic "write to us" |
-| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201 | stays `DOWNLOADED`, retried | "registering" message, once |
+| Backend answer                                                          | Durable result               | Customer message                                                        |
+| ----------------------------------------------------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
+| 201                                                                     | `ATTACHED`                   | received + in review, with the folio (and the amount mismatch sentence) |
+| 409 `SALE_ALREADY_PAID`                                                 | `FAILED` / `ATTACH_DEFINITE` | the order is already paid                                               |
+| 409 `SALE_NOT_PAYABLE`                                                  | `FAILED` / `ATTACH_DEFINITE` | the order no longer accepts payments                                    |
+| 413 / 415                                                               | `FAILED` / `ATTACH_DEFINITE` | send a JPEG, PNG or PDF under 10 MB                                     |
+| other 400/401/403/404/409/422/429                                       | `FAILED` / `ATTACH_DEFINITE` | generic "write to us"                                                   |
+| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201 | stays `DOWNLOADED`, retried  | "registering" message, once                                             |
 
 An unknown outcome is safe to retry because the key is the media id: the
 backend returns the same receipt for the same key and file. The store schedules
 up to 6 attempts (backoff 30 s, 2, 5, 10, 15 min, about 32 min in total) and
 then sets `ATTACH_OUTCOME_UNKNOWN`. Such a row may still exist in the backend;
-reconcile it against the backend before any manual action. Outcome polling is
-R5.
+reconcile it against the backend before any manual action.
 
 A file that must not be uploaded ends `FAILED` without any backend call:
 `NOT_A_RECEIPT` (the vision says it is not a payment receipt) or
 `PDF_ENCRYPTED` (asks for a screenshot).
 
-The bucket, capability and storage-cleanup sections above describe the
-chatbot-owned storage that R2 no longer writes to; R3 removes it.
+### Human outcome (R5)
 
-## STORED-1: excluded from automatic claim eligibility
+A human always confirms or rejects the receipt in the backend (S1); the bot
+only relays the result. The outcome poller (boot + every 60 s, 20 receipts per
+tick; a receipt attached more than 1 h ago is read every 15 min) reads
+`GET /chatbot-api/receipts/:receiptId` for every `ATTACHED` row without a
+recorded outcome. There is no time horizon and a restart resumes from the table.
 
-**STORED rows are held out of automatic worker dispatch.** The `claimBatch` SQL
-does not include `status = 'STORED'` in its candidate predicate. This means the
-background worker never automatically claims STORED rows for processing.
+| Backend outcome | Customer message (Spanish, usted) |
+| --- | --- |
+| `PENDING` (or a failed read) | none; read again later |
+| `CONFIRMED`, `debtCents = 0` | "¡Listo! Confirmamos su pago del pedido {folio}. Gracias por su compra." |
+| `CONFIRMED`, `debtCents > 0` | "Confirmamos un pago de su pedido {folio}. Queda un saldo pendiente de $1,500.00 MXN; …" |
+| `REJECTED` | "No pudimos confirmar su comprobante del pedido {folio}: {reason}. ¿Me puede enviar otro comprobante?" |
 
-| Status     | claimBatch eligible | Worker dispatched | Notes                                          |
-| ---------- | ------------------- | ----------------- | ---------------------------------------------- |
-| RESERVED   | ✅                  | ✅                | Download, extraction and backend upload        |
-| DOWNLOADED | ✅                  | ✅                | Same-key backend upload retry                  |
-| ATTACHING  | ✅                  | ❌                | Legacy amount-dialog state; no longer produced |
-| STORED     | ❌                  | ❌                | Held; requires separate reconciliation process |
+The outcome, reason, remaining debt and notification are recorded once, in the
+same transaction that queues the message on the receipt outbox (sent by the
+notification drain). Outside the 24 h WhatsApp customer window a free-text
+message cannot be sent: the outcome is recorded as `OUTSIDE_WINDOW`, nothing
+is sent and nothing loops (a Meta template for this case is a leftover).
 
-**Why STORED is excluded:** Once a receipt is marked STORED, it has already been
-successfully processed through the ingestion pipeline. Re-processing a STORED row
-through the standard dispatch path is unnecessary and could cause duplicate
-processing or state corruption.
+### Claim eligibility
 
-**If a STORED row needs re-processing:** A separate, explicitly-authorized process
-must handle STORED rows. Do not attempt to reset a STORED row's status manually
-and re-enter the automatic claim path without a clear reconciliation protocol.
-
-**Dispatcher behavior:** The `ReceiptProcessingDispatcher` receives all claimed rows
-from the worker. For STORED rows, it returns `{ kind: 'non-dispatched', status: 'STORED' }`
-without calling any downstream collaborator (processor, attachment service, etc.).
-
-**Verification:** The claim-contract spec (`postgres-receipt-media.store.claim-contract.spec.ts`)
-exercises `claimBatch` with a Pool/PoolClient double and asserts that the issued SQL
-does not include the STORED status. This is a unit-level contract test; it does not
-exercise a real PostgreSQL connection and does not validate SQL runtime behavior,
-concurrency, or predicate selectivity. The existing database test suite
-(`postgres-receipt-media.store.spec.ts`) additionally asserts STORED exclusion against
-a real Testcontainers instance when `RUN_DOCKER_TESTS=1`.
-
-```
-# Claim-contract unit test (no DB required)
-node ./node_modules/jest/bin/jest.js --config ./jest.isolated.config.cjs \
-  --runInBand --runTestsByPath \
-  ./src/receipt-media/infrastructure/postgres-receipt-media.store.claim-contract.spec.ts \
-  --no-cache
-```
+| Status | claimBatch eligible | Notes |
+| --- | --- | --- |
+| RESERVED | ✅ | Download, extraction and backend upload |
+| DOWNLOADED | ✅ | Same-key backend upload retry |
+| ATTACHED, FAILED, ATTACH_OUTCOME_UNKNOWN | ❌ | Terminal; ATTACHED is read by the outcome poller only |
 
 ## Evidence boundary and references
 
@@ -239,6 +217,5 @@ Relevant implementation references:
 - `src/receipt-media/infrastructure/prometheus-receipt-telemetry.ts`
 - `src/receipt-media/presentation/receipt-metrics-auth.guard.ts`
 - `src/receipt-media/presentation/receipt-metrics.controller.ts`
-- `src/receipt-media/application/capability.service.ts` (`reconstruct`)
 - `src/receipt-media/application/receipt-attachment.service.ts` (`upload`)
-- `src/receipt-media/domain/object-storage.port.ts` (technical-delete boundary)
+- `src/receipt-media/application/receipt-outcome.poller.ts` (R5 outcome)

@@ -172,51 +172,68 @@ describe('configuration()', () => {
 
   // WU1B
   describe('receiptMedia', () => {
-    it.each([
-      { env: undefined, expected: false, label: 'omitted defaults' },
-      { env: 'false', expected: false, label: 'explicit false' },
-      { env: 'true', expected: true, label: 'exact true' },
-    ])('$label', ({ env, expected }) => {
-      if (env === undefined) {
-        delete process.env.RECEIPT_MEDIA_ENABLED;
-      } else {
-        process.env.RECEIPT_MEDIA_ENABLED = env;
-      }
-      const cfg = configuration() as unknown as {
-        receiptMedia: {
-          enabled: boolean;
-          maxBytes: number;
-          meta: { allowedHosts: string[] };
-          storage: { forcePathStyle: boolean };
-          worker: { concurrency: number; leaseMs: number };
-        };
-      };
-      expect(cfg.receiptMedia.enabled).toBe(expected);
+    it('derives the always-on receipt knobs from defaults', () => {
+      for (const key of [
+        'META_MEDIA_ALLOWED_HOSTS',
+        'META_MEDIA_METADATA_TIMEOUT_MS',
+        'META_MEDIA_DOWNLOAD_TIMEOUT_MS',
+        'RECEIPT_MEDIA_WORKER_POLL_MS',
+      ])
+        delete process.env[key];
+      const cfg = configuration();
       expect(cfg.receiptMedia.maxBytes).toBe(10_485_760);
-      expect(cfg.receiptMedia.meta.allowedHosts).toEqual([]);
-      expect(cfg.receiptMedia.storage.forcePathStyle).toBe(false);
-      expect(cfg.receiptMedia.worker.concurrency).toBe(2);
-      expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
+      expect(cfg.receiptMedia.meta).toEqual({
+        allowedHosts: ['lookaside.fbsbx.com'],
+        metadataTimeoutMs: 10_000,
+        downloadTimeoutMs: 30_000,
+      });
+      expect(cfg.receiptMedia.worker).toEqual({
+        concurrency: 2,
+        leaseMs: 60_000,
+        pollIntervalMs: 5_000,
+      });
     });
 
-    // R3-cleanup-rollout-gate: the ingestion rollout gate is surfaced as
-    // `receiptMedia.worker.enabled` and is fail-closed: only the exact string
-    // 'true' enables it; omitted, 'false', and any other casing stay false.
-    it.each([
-      { env: undefined, expected: false, label: 'omitted defaults false' },
-      { env: 'false', expected: false, label: 'explicit false' },
-      { env: 'TRUE', expected: false, label: 'non-exact casing stays false' },
-      { env: 'true', expected: true, label: 'exact true enables' },
-    ])('exposes worker.enabled: $label', ({ env, expected }) => {
-      if (env === undefined) {
-        delete process.env.RECEIPT_MEDIA_INGESTION_ENABLED;
-      } else {
-        process.env.RECEIPT_MEDIA_INGESTION_ENABLED = env;
-      }
-      const cfg = configuration() as unknown as {
-        receiptMedia: { worker: { enabled: boolean } };
-      };
-      expect(cfg.receiptMedia.worker.enabled).toBe(expected);
+    it('reads explicit receipt knobs', () => {
+      process.env.META_MEDIA_ALLOWED_HOSTS = 'a.example.com, .b.example';
+      process.env.META_MEDIA_METADATA_TIMEOUT_MS = '5000';
+      process.env.META_MEDIA_DOWNLOAD_TIMEOUT_MS = '20000';
+      process.env.RECEIPT_MEDIA_WORKER_POLL_MS = '1000';
+      const { meta, worker } = configuration().receiptMedia;
+      expect(meta).toEqual({
+        allowedHosts: ['a.example.com', '.b.example'],
+        metadataTimeoutMs: 5000,
+        downloadTimeoutMs: 20000,
+      });
+      expect(worker.pollIntervalMs).toBe(1000);
+    });
+
+    // R3/S4: the removed flag, storage and capability vars configure nothing.
+    it('ignores the removed receipt flag, storage and capability vars', () => {
+      Object.assign(process.env, {
+        RECEIPT_MEDIA_ENABLED: 'true',
+        RECEIPT_MEDIA_INGESTION_ENABLED: 'true',
+        RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
+        RECEIPT_STORAGE_BUCKET: 'bucket',
+        RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
+        RECEIPT_CAPABILITY_KEYS: '1:key',
+        RECEIPT_CAPABILITY_ACTIVE_VERSION: '1',
+        CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
+      });
+      const receiptMedia = configuration().receiptMedia as Record<
+        string,
+        unknown
+      >;
+      for (const removed of [
+        'enabled',
+        'storage',
+        'publicBaseUrl',
+        'capability',
+        'attachTimeoutMs',
+      ])
+        expect(receiptMedia).not.toHaveProperty(removed);
+      expect(receiptMedia.worker).not.toHaveProperty('enabled');
+      expect(JSON.stringify(receiptMedia)).not.toMatch(/s3\.example|bucket/);
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia
@@ -235,43 +252,6 @@ describe('configuration()', () => {
       };
       expect(cfg.receiptMedia.metricsToken).toBeUndefined();
     });
-
-    // WU15-1: metricsToken is independent of receiptMedia.enabled
-    it('exposes metricsToken when receiptMedia is disabled', () => {
-      process.env.RECEIPT_MEDIA_ENABLED = 'false';
-      process.env.RECEIPT_MEDIA_METRICS_TOKEN = 'independent-token';
-      const cfg = configuration() as unknown as {
-        receiptMedia: {
-          enabled: boolean;
-          metricsToken: string | undefined;
-        };
-      };
-      expect(cfg.receiptMedia.enabled).toBe(false);
-      expect(cfg.receiptMedia.metricsToken).toBe('independent-token');
-    });
-
-    // WU14B: capability versions are canonical decimal strings of arbitrary
-    // magnitude; configuration passes the raw env string through verbatim
-    // (never numeric, never bounded by Number.MAX_SAFE_INTEGER).
-    it.each([
-      '1',
-      '2147483647',
-      '2147483648',
-      '9007199254740991',
-      '9007199254740992',
-      '9223372036854775808',
-    ])(
-      'passes RECEIPT_CAPABILITY_ACTIVE_VERSION %s through verbatim',
-      (env) => {
-        process.env.RECEIPT_CAPABILITY_ACTIVE_VERSION = env;
-        const cfg = configuration() as {
-          receiptMedia: {
-            capability: { activeVersion: string; keys?: string[] };
-          };
-        };
-        expect(cfg.receiptMedia.capability.activeVersion).toBe(env);
-      },
-    );
   });
 
   // U6: the backend quotes carriers; the removed chatbot-side shipping vars

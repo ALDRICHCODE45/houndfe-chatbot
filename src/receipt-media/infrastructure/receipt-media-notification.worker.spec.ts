@@ -23,8 +23,8 @@ const intent = (over: Partial<ReceiptMediaOutboxRow> = {}) =>
   ({
     id: 'i1',
     recipientId: '+525500000000',
-    templateKey: 'RECEIPT_AMOUNT_CONFIRM',
-    templateArgs: { amountCents: 123456 },
+    templateKey: 'RECEIPT_PAYMENT_PARTIAL',
+    templateArgs: { folio: 'F-1', debtCents: 123456 },
     status: 'PENDING',
     attempts: 0,
     leaseExpiresAt: LEASE,
@@ -83,7 +83,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(h.sendText).toHaveBeenCalledTimes(1);
     expect(h.sendText).toHaveBeenCalledWith({
       to: '+525500000000',
-      text: 'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
+      text: 'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
     });
   });
 
@@ -117,7 +117,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
   it('requeues attempts 1-2 and exhausts with exactly one alert on the third', async () => {
     const row = intent({
       id: 'i2',
-      templateKey: 'RECEIPT_CANCELLED',
+      templateKey: 'RECEIPT_ATTACH_UNKNOWN',
       templateArgs: {},
     });
     const h = harness([[row], [row], [row]]);
@@ -188,10 +188,10 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     const argsFor = (
       key: ReceiptMediaOutboxRow['templateKey'],
     ): Record<string, number | string> =>
-      key === 'RECEIPT_AMOUNT_CONFIRM'
-        ? { amountCents: 123456 }
-        : key === 'RECEIPT_ATTACHED_PENDING'
-          ? { folio: 'F-1' }
+      key === 'RECEIPT_ATTACHED_PENDING'
+        ? { folio: 'F-1' }
+        : key === 'RECEIPT_PAYMENT_PARTIAL'
+          ? { folio: 'F-1', debtCents: 150000 }
           : {};
     for (const key of RECEIPT_TEMPLATE_KEYS) {
       const row = intent({ templateKey: key, templateArgs: argsFor(key) });
@@ -202,7 +202,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       expect(text).toBe(text.trim());
     }
     expect(renderNotificationText(intent())).toBe(
-      'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
+      'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
     );
   });
 
@@ -229,7 +229,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
           totalCents: 150000,
         }),
       ).toBe(
-        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme. Vemos un monto de $1,400.50 y su pedido es de $1,500.00; lo revisamos igual.',
+        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme. Vemos un monto de $1,400.50 MXN y su pedido es de $1,500.00 MXN; lo revisamos igual.',
       );
     });
 
@@ -264,6 +264,53 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
         'RECEIPT_PDF_ENCRYPTED',
         {},
         'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',
+      ],
+    ] as const)('renders %s %j', (key, args, text) => {
+      expect(render(key, args)).toBe(text);
+    });
+  });
+
+  describe('R5/S5 human outcome messages', () => {
+    const render = (
+      templateKey: ReceiptMediaOutboxRow['templateKey'],
+      templateArgs: Record<string, number | string> = {},
+    ) => renderNotificationText({ templateKey, templateArgs });
+
+    it.each([
+      [
+        'RECEIPT_PAYMENT_CONFIRMED',
+        { folio: 'F-0042' },
+        '¡Listo! Confirmamos su pago del pedido F-0042. Gracias por su compra.',
+      ],
+      [
+        'RECEIPT_PAYMENT_CONFIRMED',
+        {},
+        '¡Listo! Confirmamos su pago de su pedido. Gracias por su compra.',
+      ],
+      [
+        'RECEIPT_PAYMENT_PARTIAL',
+        { folio: 'F-0042', debtCents: 150000 },
+        'Confirmamos un pago de su pedido F-0042. Queda un saldo pendiente de $1,500.00 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+      ],
+      [
+        'RECEIPT_PAYMENT_PARTIAL',
+        { debtCents: 5 },
+        'Confirmamos un pago de su pedido. Queda un saldo pendiente de $0.05 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+      ],
+      [
+        'RECEIPT_PAYMENT_REJECTED',
+        { folio: 'F-0042', reason: 'El monto no coincide' },
+        'No pudimos confirmar su comprobante del pedido F-0042: El monto no coincide. ¿Me puede enviar otro comprobante?',
+      ],
+      [
+        'RECEIPT_PAYMENT_REJECTED',
+        { folio: 'F-0042' },
+        'No pudimos confirmar su comprobante del pedido F-0042. ¿Me puede enviar otro comprobante?',
+      ],
+      [
+        'RECEIPT_PAYMENT_REJECTED',
+        { reason: 'Comprobante ilegible.' },
+        'No pudimos confirmar su comprobante de su pedido: Comprobante ilegible. ¿Me puede enviar otro comprobante?',
       ],
     ] as const)('renders %s %j', (key, args, text) => {
       expect(render(key, args)).toBe(text);

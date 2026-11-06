@@ -172,7 +172,6 @@ ddescribe('Webhook receipt routing integration (R2/R6, Testcontainers)', () => {
       } as unknown as HumanHandoffService,
       conversations,
       new ReceiptIngressService(
-        { enabled: true },
         { getState: (senderId: string) => conversations.get(senderId) },
         store,
       ),
@@ -221,8 +220,8 @@ ddescribe('Webhook receipt routing integration (R2/R6, Testcontainers)', () => {
   afterEach(async () => {
     await app.close();
     await pool.query(
-      'TRUNCATE conversation_state, receipt_media_cancellation_commands,' +
-        ' receipt_media_outbox, receipt_media, processed_webhook_messages',
+      'TRUNCATE conversation_state, receipt_media_outbox, receipt_media,' +
+        ' processed_webhook_messages',
     );
   });
 
