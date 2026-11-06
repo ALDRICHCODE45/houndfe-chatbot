@@ -21,19 +21,12 @@ import {
   PENDING_HUMAN_REQUEST_REPLY,
   HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
-import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
-import type {
-  ReceiptMediaOutboxRow,
-  ReceiptMediaRow,
-} from '../../receipt-media/domain/receipt-media.types';
+import type { ReceiptMediaRow } from '../../receipt-media/domain/receipt-media.types';
 import { type ReceiptIngressService } from '../../receipt-media/application/receipt-ingress.service';
 
 const receiptMediaRowFixture = (id: string): ReceiptMediaRow =>
   ({ id }) as unknown as ReceiptMediaRow;
-
-const receiptMediaOutboxRowFixture = (id: string): ReceiptMediaOutboxRow =>
-  ({ id }) as unknown as ReceiptMediaOutboxRow;
 
 /**
  * Every customer turn is handled by the minimal SDK route
@@ -63,7 +56,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     Pick<HumanHandoffService, 'isOpsSender' | 'create' | 'resolveReply'>
   >;
   let conversationStore: jest.Mocked<ConversationStore>;
-  let amountRouter: jest.Mocked<ReceiptAmountRouterService>;
   let ingress: jest.Mocked<ReceiptIngressService>;
   let minimalAgent: jest.Mocked<MinimalCatalogAgentService>;
 
@@ -142,12 +134,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       clearReceiptAmountPointer: jest.fn(),
     };
 
-    // WU13-B1: ReceiptAmountRouter mock. Default fenced so the ordinary
-    // agent path runs. Tests override per scenario.
-    amountRouter = {
-      route: jest.fn().mockResolvedValue({ kind: 'fenced' }),
-    } as unknown as jest.Mocked<ReceiptAmountRouterService>;
-
     // WU13-B2: ReceiptIngressService mock. Default reserved with a minimal
     // receipt fixture — the only valid closed terminal decision that carries
     // a receipt; guidance and other silent outcomes carry no receipt field.
@@ -173,7 +159,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       recentOutbound,
       humanHandoff as unknown as HumanHandoffService,
       conversationStore,
-      amountRouter,
       ingress,
       minimalAgent,
     );
@@ -919,8 +904,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
   });
 
-  // ─── WU13-B1: ReceiptAmountRouter integration ──────────────────────────────
-  describe('WU13-B1: ReceiptAmountRouter customer-text routing', () => {
+  // ─── R6: the receipt amount dialog is gone ─────────────────────────────────
+  describe('R6: customer text always reaches the agent', () => {
     const CUSTOMER = '5215550001111';
 
     const textEvent = (messageId: string, body: string): WebhookEventDto => ({
@@ -947,7 +932,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
 
     beforeEach(() => {
-      amountRouter.route.mockResolvedValue({ kind: 'fenced' });
       store.get.mockResolvedValue(null);
       store.update.mockResolvedValue({
         senderId: CUSTOMER,
@@ -964,240 +948,27 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
-    it('calls amountRouter for customer text before the minimal agent', async () => {
-      await service.dispatch(textEvent('wamid.route-order', '500 pesos'));
-      expect(amountRouter.route).toHaveBeenCalled();
-      expect(minimalAgent.tryHandle).toHaveBeenCalled();
-      expect(amountRouter.route.mock.invocationCallOrder[0]).toBeLessThan(
-        minimalAgent.tryHandle.mock.invocationCallOrder[0],
-      );
-    });
+    it.each(['500 pesos', 'CONFIRMAR', 'cancelar', 'sí'])(
+      'R6: %s goes straight to the minimal agent (no amount dialog)',
+      async (body) => {
+        minimalAgent.tryHandle.mockResolvedValueOnce({
+          kind: 'handled',
+          reply: 'Hola!',
+        });
+        await service.dispatch(textEvent(`wamid.r6.${body}`, body));
+        expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+          expect.objectContaining({ senderId: CUSTOMER, text: body }),
+        );
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledTimes(1);
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Hola!',
+        });
+      },
+    );
 
-    it('fenced: calls the minimal agent and sends reply normally', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'fenced' });
-      minimalAgent.tryHandle.mockResolvedValueOnce({
-        kind: 'handled',
-        reply: 'Hola!',
-      });
-      await service.dispatch(textEvent('wamid.fenced', 'hola'));
-      expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
-        expect.objectContaining({ senderId: CUSTOMER, text: 'hola' }),
-      );
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).toHaveBeenCalledWith({
-        to: CUSTOMER,
-        text: 'Hola!',
-      });
-    });
-
-    // ─── G-2 llm-agent/R2/S1: safe guidance after a terminal receipt ─────
-    it('llm-agent/R2/S1: a definite terminal receipt outcome reaches the minimal agent with no protected identifiers in its input', async () => {
-      // A receipt that already reached a terminal/raced state no longer accepts
-      // the customer's confirmation, so the real router fences it and the
-      // follow-up takes the ordinary LLM path. The canonical pointer's
-      // protected receipt/sale identifiers must reach the real routing
-      // boundary but never cross the llm.run port.
-      const protectedPointer = {
-        receiptMediaId: 'receipt-sentinel-9f2c',
-        saleId: 'sale-sentinel-9f2c',
-        receiptVersion: '7',
-      };
-      conversationStore.get.mockResolvedValue({
-        senderId: CUSTOMER,
-        lastMessageAt: '2026-06-23T11:59:00.000Z',
-        data: { receiptAmountPointer: protectedPointer },
-      });
-      const routerStore = {
-        proposeAmount: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
-        rejectProposedAmount: jest
-          .fn()
-          .mockResolvedValue({ kind: 'fenced' as const }),
-        cancelReceipt: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
-        startAttachment: jest
-          .fn()
-          .mockResolvedValue({ kind: 'fenced' as const }),
-      };
-      const realRouter = new ReceiptAmountRouterService(
-        { get: conversationStore.get },
-        routerStore,
-      );
-      const realService = new WebhookDispatcherService(
-        runner,
-        sender,
-        dedup,
-        recentOutbound,
-        humanHandoff as unknown as HumanHandoffService,
-        conversationStore,
-        realRouter,
-        ingress,
-        minimalAgent,
-      );
-
-      await realService.dispatch(textEvent('wamid.terminal-followup', 'sí'));
-
-      // The real router propagated the protected identifiers to its store op,
-      // which fenced because the durable row is already terminal/raced.
-      expect(routerStore.startAttachment).toHaveBeenCalledTimes(1);
-      expect(routerStore.startAttachment).toHaveBeenCalledWith({
-        sourceWebhookMessageId: 'wamid.terminal-followup',
-        senderId: CUSTOMER,
-        receiptMediaId: protectedPointer.receiptMediaId,
-        capturedSaleId: protectedPointer.saleId,
-        expectedReceiptVersion: protectedPointer.receiptVersion,
-        expectedPointer: protectedPointer,
-        expectedReceiptStatus: 'AWAITING_CONFIRMATION',
-      });
-      // The fence fell through to the ordinary minimal agent path.
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
-      const [runnerInput] = minimalAgent.tryHandle.mock.calls[0];
-      expect(runnerInput).toEqual({ senderId: CUSTOMER, text: 'sí' });
-      const serialized = JSON.stringify(runnerInput);
-      expect(serialized).not.toContain(protectedPointer.receiptMediaId);
-      expect(serialized).not.toContain(protectedPointer.saleId);
-      expect(runnerInput).not.toHaveProperty('receiptAmountPointer');
-    });
-
-    // ─── ODD-4D: deterministic active-text fallback ────────────────────
-    // An active amount/confirmation flow with malformed or unrecognized
-    // text must never reach the LLM: the dispatcher sends the exact
-    // finish-or-cancel guidance deterministically.
-    const ACTIVE_FLOW_GUIDANCE =
-      'Tienes un proceso abierto: finalízalo o cancélalo.';
-
-    it('ODD-4D unrecognized: exact guidance, one send/remember/markSeen, no LLM', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
-      sender.sendText.mockResolvedValueOnce({
-        providerMessageId: 'wamid.unrecognized-out',
-      });
-      await service.dispatch(textEvent('wamid.unrecognized', 'hola'));
-
-      expect(sender.sendText).toHaveBeenCalledTimes(1);
-      expect(sender.sendText).toHaveBeenCalledWith({
-        to: CUSTOMER,
-        text: ACTIVE_FLOW_GUIDANCE,
-      });
-      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
-      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
-        'wamid.unrecognized-out',
-      );
-      expect(dedup.markSeen as jest.Mock).toHaveBeenCalledTimes(1);
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.unrecognized');
-      const order = [
-        sender.sendText as jest.Mock,
-        recentOutbound.remember as jest.Mock,
-        dedup.markSeen as jest.Mock,
-      ].map((mock) => mock.mock.invocationCallOrder[0]);
-      expect(order).toEqual([...order].sort((left, right) => left - right));
-      expectNoAgentRun();
-      expect(store.update).not.toHaveBeenCalled();
-    });
-
-    it('ODD-4D unrecognized: send failure propagates with no remember/markSeen/LLM', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
-      sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
-      await expect(
-        service.dispatch(textEvent('wamid.unrecognized-fail', 'hola')),
-      ).rejects.toThrow('Meta 131030');
-      expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
-      expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
-      expectNoAgentRun();
-    });
-
-    it('ODD-4D unrecognized: markSeen failure is swallowed after a successful send', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
-      dedup.markSeen.mockRejectedValueOnce(new Error('dedup write failed'));
-      await expect(
-        service.dispatch(textEvent('wamid.unrecognized-markseen-fail', 'hola')),
-      ).resolves.toBeUndefined();
-      expect(sender.sendText).toHaveBeenCalledTimes(1);
-      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
-      expect(dedup.markSeen).toHaveBeenCalledWith(
-        'wamid.unrecognized-markseen-fail',
-      );
-      expectNoAgentRun();
-    });
-
-    it('proposed: skips the agent and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'proposed',
-        receipt: receiptMediaRowFixture('r1'),
-        intent: receiptMediaOutboxRowFixture('i1'),
-      });
-      await service.dispatch(textEvent('wamid.proposed', '500 pesos'));
-      expectNoAgentRun();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.proposed');
-    });
-
-    it('started: skips the agent and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'started',
-        receipt: receiptMediaRowFixture('r2'),
-        intent: receiptMediaOutboxRowFixture('i2'),
-      });
-      await service.dispatch(textEvent('wamid.started', 'si'));
-      expectNoAgentRun();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.started');
-    });
-
-    it('rejected: skips the agent and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'rejected',
-        receipt: receiptMediaRowFixture('r3'),
-        intent: receiptMediaOutboxRowFixture('i3'),
-      });
-      await service.dispatch(textEvent('wamid.rejected', 'no'));
-      expectNoAgentRun();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.rejected');
-    });
-
-    it('cancelled: skips the agent and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'cancelled',
-        receipt: receiptMediaRowFixture('r4'),
-        intent: receiptMediaOutboxRowFixture('i4'),
-      });
-      await service.dispatch(textEvent('wamid.cancelled', 'cancelar'));
-      expectNoAgentRun();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cancelled');
-    });
-
-    it('replayed: skips the agent and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'replayed',
-        receipt: receiptMediaRowFixture('r5'),
-        intent: receiptMediaOutboxRowFixture('i5'),
-      });
-      await service.dispatch(textEvent('wamid.replayed', '500 pesos'));
-      expectNoAgentRun();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.replayed');
-    });
-
-    it('terminal outcome with markSeen failure does not throw', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'proposed',
-        receipt: receiptMediaRowFixture('r6'),
-        intent: receiptMediaOutboxRowFixture('i6'),
-      });
-      dedup.markSeen.mockRejectedValue(new Error('dedup write failed'));
-      await expect(
-        service.dispatch(
-          textEvent('wamid.terminal-markseen-fail', '500 pesos'),
-        ),
-      ).resolves.toBeUndefined();
-      expectNoAgentRun();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith(
-        'wamid.terminal-markseen-fail',
-      );
-    });
-
-    it('ops inbound: amountRouter is NEVER called', async () => {
+    it('ops inbound: handled before any customer routing', async () => {
       humanHandoff.isOpsSender.mockReturnValue(true);
       humanHandoff.resolveReply.mockResolvedValue({
         kind: 'no_pending',
@@ -1225,12 +996,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           },
         ],
       });
-      expect(amountRouter.route).not.toHaveBeenCalled();
       expectNoAgentRun();
       expect(sender.sendText).toHaveBeenCalled();
     });
 
-    it('pending-human short-circuit: amountRouter is NEVER called', async () => {
+    it('pending-human short-circuit: no agent run', async () => {
       conversationStore.get.mockResolvedValue({
         senderId: CUSTOMER,
         lastMessageAt: '2026-06-23T12:00:00.000Z',
@@ -1244,7 +1014,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         },
       });
       await service.dispatch(textEvent('wamid.pending-bypass', '¿siguen?'));
-      expect(amountRouter.route).not.toHaveBeenCalled();
       expectNoAgentRun();
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
@@ -1252,7 +1021,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
-    it('media message: amountRouter is NEVER called (media ingress is WU13-B2)', async () => {
+    it('media message: never reaches the agent (media ingress is WU13-B2)', async () => {
       await service.dispatch({
         object: 'whatsapp_business_account',
         entry: [
@@ -1279,7 +1048,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           },
         ],
       });
-      expect(amountRouter.route).not.toHaveBeenCalled();
       expectNoAgentRun();
     });
 
@@ -1364,7 +1132,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           caption: 'komprobante.png',
         });
         expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
-        expect(amountRouter.route).not.toHaveBeenCalled();
         expectNoAgentRun();
       });
 
@@ -1411,9 +1178,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         {
           decision: {
             kind: 'unsupported-media',
-            text: 'Formato no soportado. Envía JPEG o PNG.',
+            text: 'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
           },
-          expected: 'Formato no soportado. Envía JPEG o PNG.',
+          expected:
+            'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
         },
         {
           decision: {
@@ -1426,9 +1194,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           decision: {
             kind: 'sender-active',
             status: 'AWAITING_AMOUNT',
-            text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+            text: 'Estamos procesando su comprobante.',
           },
-          expected: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+          expected: 'Estamos procesando su comprobante.',
         },
       ];
 
@@ -1458,16 +1226,16 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }> = [
         {
           status: 'AWAITING_AMOUNT',
-          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+          text: 'Estamos procesando su comprobante.',
         },
         {
           status: 'AWAITING_CONFIRMATION',
-          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+          text: 'Estamos procesando su comprobante.',
         },
-        { status: 'RESERVED', text: 'Estamos procesando tu comprobante.' },
-        { status: 'DOWNLOADED', text: 'Estamos procesando tu comprobante.' },
-        { status: 'STORED', text: 'Estamos procesando tu comprobante.' },
-        { status: 'ATTACHING', text: 'Estamos procesando tu comprobante.' },
+        { status: 'RESERVED', text: 'Estamos procesando su comprobante.' },
+        { status: 'DOWNLOADED', text: 'Estamos procesando su comprobante.' },
+        { status: 'STORED', text: 'Estamos procesando su comprobante.' },
+        { status: 'ATTACHING', text: 'Estamos procesando su comprobante.' },
       ];
 
       test.each(activeGuidanceCases)(
@@ -1492,7 +1260,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           );
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
           expect(dedup.markSeen).toHaveBeenCalledWith(wamid);
-          expect(amountRouter.route).not.toHaveBeenCalled();
           expectNoAgentRun();
         },
       );
@@ -1616,7 +1383,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
         expect(ingress.admit).not.toHaveBeenCalled();
         expect(sender.sendText).not.toHaveBeenCalled();
-        expect(amountRouter.route).not.toHaveBeenCalled();
         expectNoAgentRun();
         expect(dedup.markSeen).not.toHaveBeenCalled();
       });
@@ -1661,7 +1427,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           expect(sender.sendText as jest.Mock).toHaveBeenCalledTimes(1);
           expect(dedup.markSeen).toHaveBeenCalledWith('wamid.markseen-fail');
           expectNoAgentRun();
-          expect(amountRouter.route.mock.calls).toHaveLength(0);
         },
       );
 
@@ -1675,7 +1440,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
         expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
         expectNoAgentRun();
-        expect(amountRouter.route.mock.calls).toHaveLength(0);
       });
     });
   });

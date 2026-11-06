@@ -25,7 +25,7 @@ const row = (
   status: ReceiptMediaRow['status'] = 'RESERVED',
 ): ReceiptMediaRow => ({ id, status }) as ReceiptMediaRow;
 
-const downloaded: ReceiptIngestionOutcome = { kind: 'downloaded' };
+const downloaded: ReceiptIngestionOutcome = { kind: 'cleanup-failed' };
 
 const settleOnAbort = (
   signal?: AbortSignal,

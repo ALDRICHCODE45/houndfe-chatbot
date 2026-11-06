@@ -8,14 +8,8 @@ import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
-import { CapabilityService } from '../application/capability.service';
 import { ReceiptIngestionProcessor } from '../application/receipt-ingestion.processor';
 import { ReceiptProcessingDispatcher } from '../application/receipt-processing-dispatcher.service';
-import type { ReceiptAttachmentService } from '../application/receipt-attachment.service';
-import type {
-  ObjectStoragePort,
-  PutObjectInput,
-} from '../domain/object-storage.port';
 import {
   MetaMediaClient,
   type MetaHttp,
@@ -82,19 +76,10 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
   let store: PostgresReceiptMediaStore;
   let priorDatabaseUrl: string | undefined;
   const workers = new Set<ReceiptMediaIngestionWorker>();
-  const attach = jest.fn();
-  const attachment = { attach } as unknown as Pick<
-    ReceiptAttachmentService,
-    'attach'
-  >;
-  const putCalls: PutObjectInput[] = [];
-  const storage: Pick<ObjectStoragePort, 'put'> = {
-    put: (input) => {
-      putCalls.push(input);
-      input.content.resume();
-      return Promise.resolve({ etag: 'etag.ssrf', versionId: null });
-    },
-  };
+  // Never reached: every case fails at the Meta boundary before any
+  // extraction or backend upload.
+  const extract = jest.fn();
+  const upload = jest.fn();
 
   const harness = (options: {
     graph?: LookupAddress[];
@@ -133,13 +118,14 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
     return { client, requests, resolve, createTempFile };
   };
   const boot = (owner: string, client: MetaMediaClient) => {
-    const capability = new CapabilityService(
-      new Map([['1', Buffer.alloc(32, 3)]]),
-      '1',
-    );
     const dispatcher = new ReceiptProcessingDispatcher(
-      new ReceiptIngestionProcessor(client, storage, store, capability),
-      attachment,
+      new ReceiptIngestionProcessor(
+        client,
+        store,
+        { extract },
+        { upload },
+        { get: () => Promise.resolve(null) },
+      ),
     );
     const worker = new ReceiptMediaIngestionWorker(store, dispatcher, {
       owner,
@@ -215,8 +201,8 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
       expectedResolveHosts,
     );
     expect(h.createTempFile).not.toHaveBeenCalled();
-    expect(putCalls).toHaveLength(0);
-    expect(attach).not.toHaveBeenCalled();
+    expect(extract).not.toHaveBeenCalled();
+    expect(upload).not.toHaveBeenCalled();
   };
   const assertAttemptOne = (row: Row, startedAt: number) => {
     expect(row).toMatchObject({
@@ -271,11 +257,11 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
   afterEach(async () => {
     try {
       await Promise.all([...workers].map((worker) => worker.onModuleDestroy()));
-      expect(attach).not.toHaveBeenCalled();
+      expect(upload).not.toHaveBeenCalled();
     } finally {
       workers.clear();
-      attach.mockClear();
-      putCalls.length = 0;
+      extract.mockClear();
+      upload.mockClear();
       await pool.query(
         'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
           ' receipt_media',

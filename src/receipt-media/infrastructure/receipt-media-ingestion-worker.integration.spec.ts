@@ -4,151 +4,170 @@ import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
-import { CapabilityService } from '../application/capability.service';
+import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
+import {
+  ChatbotApiError,
+  UpstreamError,
+} from '../../chatbot-api/domain/errors';
+import { ReceiptAttachmentService } from '../application/receipt-attachment.service';
 import { ReceiptIngestionProcessor } from '../application/receipt-ingestion.processor';
 import { ReceiptProcessingDispatcher } from '../application/receipt-processing-dispatcher.service';
-import type { ReceiptAttachmentService } from '../application/receipt-attachment.service';
 import {
   MetaMediaError,
   type MetaMediaPort,
-  type MetaMediaRequest,
   type ValidatedMediaFile,
 } from '../domain/meta-media.port';
-import {
-  type ObjectStoragePort,
-  type PutObjectInput,
-} from '../domain/object-storage.port';
-import type { ReceiptMediaRow } from '../domain/receipt-media.types';
+import type {
+  ReceiptExtraction,
+  ReceiptExtractionPort,
+} from '../domain/receipt-extraction.port';
+import type { ReceiptMimeType } from '../domain/receipt-media.types';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import { ReceiptMediaIngestionWorker } from './receipt-media-ingestion.worker';
 
-/** ODD-6A1 tests-only composition: the real worker → dispatcher → processor →
- * PostgreSQL store chain over Testcontainers with the production migrations
- * and deterministic fake Meta/object-storage boundaries; ATTACHING is an
- * inert stub. No production change; gated by RUN_DOCKER_TESTS=1. */
+/** R2 end-to-end over Testcontainers with the production migrations: the
+ * real worker → dispatcher → processor → attachment service → PostgreSQL
+ * store chain, with deterministic fakes for Meta, the vision extraction and
+ * the backend upload client. Gated by RUN_DOCKER_TESTS=1. */
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 type Row = Record<string, unknown>;
 const SALE = 'cccccccc-0001-4000-8000-000000000001';
-/** Distinct receipt/webhook/provider/sender/object identity per case. */
+const BACKEND_RECEIPT = 'dddddddd-0001-4000-8000-000000000001';
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+const ENCRYPTED_PDF = Buffer.from(
+  '%PDF-1.7\ntrailer << /Root 1 0 R /Encrypt 4 0 R >>\n%%EOF\n',
+);
 const media = (n: number, label: string) => ({
   id: `aaaaaaaa-000${n}-4000-8000-00000000000${n}`,
-  wamid: `wamid.odd6a.${label}`,
-  mediaId: `media.odd6a.${label}`,
-  sender: `sender.odd6a.${label}`,
+  wamid: `wamid.r2.${label}`,
+  mediaId: `media.r2.${label}`,
+  sender: `sender.r2.${label}`,
   objectKey: `receipts/aaaaaaaa-000${n}-4000-8000-00000000000${n}`,
 });
 type Media = ReturnType<typeof media>;
-const PROMPT = media(1, 'prompt');
-const CONFIRM = media(2, 'confirm');
-const RETRY = media(3, 'retry');
-const EXHAUST = media(4, 'exhaust');
-const RECLAIM = media(5, 'reclaim');
 const COLS =
-  'id webhook_message_id provider_media_id sender_id captured_sale_id object_key status version declared_mime_type declared_amount_cents lease_owner lease_expires_at'.split(
+  'id webhook_message_id provider_media_id sender_id captured_sale_id object_key status version declared_mime_type declared_amount_cents'.split(
     ' ',
   );
 const INSERT = `INSERT INTO receipt_media (${COLS.join(
   ', ',
 )}) VALUES (${COLS.map((_, i) => `$${i + 1}`).join(', ')})`;
-/** Independently derived from the production two-pass claim sequence: claim,
- * meta attempt, download commit, reclaim, meta attempt, storage attempt, and
- * accepted-object bootstrap each bump `version` once. */
-const ACCEPTED_VERSION = '7';
-/** The bootstrap dedupe key binds the pre-bootstrap (storage-attempt)
- * expected version, exactly one below the accepted successor. */
-const PRE_BOOTSTRAP_VERSION = '6';
-type StorageHandler = (
-  input: PutObjectInput,
-  call: number,
-) => Promise<{ etag: string; versionId: string | null }>;
 
-ddescribe('receipt-media ingestion worker integration (ODD-6A1)', () => {
+const receipt = (
+  overrides: Partial<Extract<ReceiptExtraction, { kind: 'receipt' }>> = {},
+): ReceiptExtraction => ({
+  kind: 'receipt',
+  amountCents: 150_000,
+  date: '2026-11-05',
+  reference: 'REF123',
+  bank: 'BBVA',
+  confidence: 'medium',
+  amountMismatch: false,
+  ...overrides,
+});
+
+const uploaded = {
+  receiptId: BACKEND_RECEIPT,
+  status: 'PENDING' as const,
+  mimeType: 'image/jpeg',
+  sizeBytes: 4,
+  sha256: 'ab'.repeat(32),
+  previewStatus: 'READY' as const,
+};
+
+ddescribe('receipt-media R2 pipeline (worker → backend upload)', () => {
   jest.setTimeout(120_000);
   let container: StartedPostgreSqlContainer;
   let pool: Pool;
   let store: PostgresReceiptMediaStore;
-  let priorDatabaseUrl: string | undefined;
   const workers = new Set<ReceiptMediaIngestionWorker>();
-  const attachment = { attach: jest.fn() } as unknown as Pick<
-    ReceiptAttachmentService,
-    'attach'
-  >;
-  /** The readable path is the spec's own bytes; the fake cleanup never deletes. */
-  const fakeFile = (): ValidatedMediaFile => ({
-    filePath: __filename,
-    mimeType: 'image/jpeg',
-    byteCount: 4096,
-    providerDeclaredBytes: 4096,
+
+  const fakeFile = (mimeType: ReceiptMimeType): ValidatedMediaFile => ({
+    filePath: '/not-read',
+    mimeType,
+    byteCount: 4,
+    providerDeclaredBytes: 4,
     sha256: Buffer.alloc(32, 7),
     cleanup: async () => undefined,
   });
-  const fakeMeta = (
-    handler: (
-      input: MetaMediaRequest,
-      call: number,
-    ) => Promise<ValidatedMediaFile>,
-  ) => {
-    const calls: MetaMediaRequest[] = [];
-    const port: MetaMediaPort = {
-      resolveAndDownload: (input) => {
-        calls.push(input);
-        return handler(input, calls.length);
-      },
-    };
-    return { port, calls };
-  };
-  const fakeStorage = (
-    handler: StorageHandler = async () => ({
-      etag: 'etag.test',
-      versionId: null,
-    }),
-  ) => {
-    const calls: PutObjectInput[] = [];
-    const port: Pick<ObjectStoragePort, 'put'> = {
-      put: (input) => {
-        calls.push(input);
-        input.content.resume();
-        return handler(input, calls.length);
-      },
-    };
-    return { port, calls };
-  };
-  const boot = (
-    owner: string,
-    meta: MetaMediaPort,
-    storage: Pick<ObjectStoragePort, 'put'>,
-  ) => {
-    const capability = new CapabilityService(
-      new Map([['1', Buffer.alloc(32, 3)]]),
-      '1',
+
+  const boot = (options: {
+    owner: string;
+    meta?: MetaMediaPort['resolveAndDownload'];
+    extraction?: ReceiptExtraction;
+    upload?: ChatbotApiClient['uploadReceipt'];
+    bytes?: Buffer;
+    mime?: ReceiptMimeType;
+  }) => {
+    const meta = jest.fn(
+      options.meta ??
+        (() => Promise.resolve(fakeFile(options.mime ?? 'image/jpeg'))),
     );
-    const dispatcher = new ReceiptProcessingDispatcher(
-      new ReceiptIngestionProcessor(meta, storage, store, capability),
-      attachment,
+    const extract = jest.fn<
+      ReturnType<ReceiptExtractionPort['extract']>,
+      Parameters<ReceiptExtractionPort['extract']>
+    >(() => Promise.resolve(options.extraction ?? receipt()));
+    const uploadReceipt = jest.fn<
+      ReturnType<ChatbotApiClient['uploadReceipt']>,
+      Parameters<ChatbotApiClient['uploadReceipt']>
+    >(options.upload ?? (() => Promise.resolve(uploaded)));
+    const processor = new ReceiptIngestionProcessor(
+      { resolveAndDownload: meta },
+      store,
+      { extract },
+      new ReceiptAttachmentService(store, { uploadReceipt }),
+      {
+        get: (senderId: string) =>
+          pool
+            .query<{
+              data: Record<string, unknown>;
+            }>('SELECT data FROM conversation_state WHERE sender_id = $1', [
+              senderId,
+            ])
+            .then((r) =>
+              r.rows[0]
+                ? {
+                    senderId,
+                    lastMessageAt: new Date().toISOString(),
+                    data: r.rows[0].data,
+                  }
+                : null,
+            ),
+      },
+      { readFile: () => Promise.resolve(options.bytes ?? JPEG) },
     );
-    const worker = new ReceiptMediaIngestionWorker(store, dispatcher, {
-      owner,
-      pollIntervalMs: 50,
-      batchSize: 4,
-      maxConcurrency: 4,
-    });
+    const worker = new ReceiptMediaIngestionWorker(
+      store,
+      new ReceiptProcessingDispatcher(processor),
+      {
+        owner: options.owner,
+        pollIntervalMs: 50,
+        batchSize: 4,
+        maxConcurrency: 4,
+      },
+    );
     workers.add(worker);
     worker.onApplicationBootstrap();
-    return { worker, dispatcher };
+    return { worker, meta, extract, uploadReceipt };
   };
-  const seed = async (target: Media, over: Row = {}): Promise<void> => {
+
+  const seed = async (
+    target: Media,
+    mime: ReceiptMimeType = 'image/jpeg',
+    declaredAmountCents: number | null = null,
+  ): Promise<void> => {
     const row: Row = {
-      status: 'RESERVED',
-      version: '0',
-      declared_mime_type: 'image/jpeg',
-      ...over,
       id: target.id,
       webhook_message_id: target.wamid,
       provider_media_id: target.mediaId,
       sender_id: target.sender,
       captured_sale_id: SALE,
       object_key: target.objectKey,
+      status: 'RESERVED',
+      version: '0',
+      declared_mime_type: mime,
+      declared_amount_cents: declaredAmountCents,
     };
     await pool.query(
       INSERT,
@@ -156,17 +175,27 @@ ddescribe('receipt-media ingestion worker integration (ODD-6A1)', () => {
     );
     await pool.query(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
-       VALUES ($1, now(), '{}'::jsonb) ON CONFLICT (sender_id) DO NOTHING`,
-      [target.sender],
+       VALUES ($1, now(), $2::jsonb)`,
+      [
+        target.sender,
+        JSON.stringify({
+          minimalCart: {
+            items: [],
+            idempotencyKey: '',
+            placedSale: { saleId: SALE, folio: 'F-0042', totalCents: 150_000 },
+          },
+        }),
+      ],
     );
   };
   const readRow = async (id: string): Promise<Row> =>
     (await pool.query<Row>('SELECT * FROM receipt_media WHERE id = $1', [id]))
       .rows[0];
-  const readOutbox = async (): Promise<Row[]> =>
+  const readOutbox = async (id: string): Promise<Row[]> =>
     (
       await pool.query<Row>(
-        'SELECT * FROM receipt_media_outbox ORDER BY created_at, template_key',
+        'SELECT * FROM receipt_media_outbox WHERE receipt_media_id = $1 ORDER BY created_at',
+        [id],
       )
     ).rows;
   const waitFor = async <T>(
@@ -177,39 +206,22 @@ ddescribe('receipt-media ingestion worker integration (ODD-6A1)', () => {
     for (;;) {
       const value = await probe();
       if (value !== null) return value;
-      if (Date.now() > deadline) throw new Error('ODD-6A1: waitFor timed out');
+      if (Date.now() > deadline) throw new Error('R2: waitFor timed out');
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   };
-  const waitRow = (target: Media, status: string): Promise<Row> =>
-    waitFor(async () => {
-      const row = await readRow(target.id);
-      return row.status === status ? row : null;
-    });
-  /** Deterministic reclaim seam: wait for the real worker's first pass to
-   * commit DOWNLOADED, then expire that row's live lease so the next poll can
-   * reclaim the storage/bootstrap stage without the 60-second production
-   * lease. Test-controlled database evidence only; no production change. */
-  const expireLeaseAfterDownload = async (target: Media): Promise<void> => {
-    await waitRow(target, 'DOWNLOADED');
-    await pool.query(
-      `UPDATE receipt_media SET lease_expires_at = now() - interval '1 second'
-        WHERE id = $1 AND status = 'DOWNLOADED'`,
-      [target.id],
-    );
-  };
-  const acceptAfterReclaim = async (
+  const waitStatus = (
     target: Media,
     status: string,
-  ): Promise<Row> => {
-    await expireLeaseAfterDownload(target);
-    return waitRow(target, status);
-  };
+    extra: (row: Row) => boolean = () => true,
+  ) =>
+    waitFor(async () => {
+      const row = await readRow(target.id);
+      return row.status === status && extra(row) ? row : null;
+    });
 
   beforeAll(async () => {
-    priorDatabaseUrl = process.env.DATABASE_URL;
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
-    process.env.DATABASE_URL = container.getConnectionUri();
     execSync('pnpm migrate', {
       env: { ...process.env, DATABASE_URL: container.getConnectionUri() },
       stdio: 'pipe',
@@ -218,16 +230,8 @@ ddescribe('receipt-media ingestion worker integration (ODD-6A1)', () => {
     store = new PostgresReceiptMediaStore(pool);
   });
   afterAll(async () => {
-    try {
-      if (pool) await pool.end();
-    } finally {
-      try {
-        if (container) await container.stop();
-      } finally {
-        if (priorDatabaseUrl === undefined) delete process.env.DATABASE_URL;
-        else process.env.DATABASE_URL = priorDatabaseUrl;
-      }
-    }
+    if (pool) await pool.end();
+    if (container) await container.stop();
   });
   afterEach(async () => {
     for (const worker of workers) await worker.onModuleDestroy();
@@ -238,139 +242,185 @@ ddescribe('receipt-media ingestion worker integration (ODD-6A1)', () => {
     );
   });
 
-  it('drives RESERVED rows to their accepted-object amount state with the exact prompt/confirm intent', async () => {
-    const meta = fakeMeta(async () => fakeFile());
-    const storage = fakeStorage();
-    await seed(PROMPT);
-    await seed(CONFIRM, { declared_amount_cents: 1250 });
-    boot('worker.flow', meta.port, storage.port);
-    const [prompt, confirm] = await Promise.all([
-      acceptAfterReclaim(PROMPT, 'AWAITING_AMOUNT'),
-      acceptAfterReclaim(CONFIRM, 'AWAITING_CONFIRMATION'),
-    ]);
-    expect(prompt).toMatchObject({
-      object_etag: 'etag.test',
-      declared_amount_cents: null,
-      byte_count: 4096,
+  it('downloads, extracts and uploads in one pass, then says received with the folio and the mismatch', async () => {
+    const target = media(1, 'success');
+    await seed(target, 'image/jpeg', 149_000);
+    const h = boot({
+      owner: 'r2.success',
+      extraction: receipt({ amountCents: 140_000, amountMismatch: true }),
     });
-    expect(prompt.version).toBe(ACCEPTED_VERSION);
-    expect(prompt.stored_at).toBeInstanceOf(Date);
-    expect(confirm).toMatchObject({
-      object_etag: 'etag.test',
-      declared_amount_cents: 1250,
+    const row = await waitStatus(target, 'ATTACHED');
+    expect(row).toMatchObject({
+      backend_receipt_id: BACKEND_RECEIPT,
+      backend_receipt_status: 'PENDING',
+      storage_attempts: 1,
+      meta_attempts: 1,
     });
-    expect(confirm.version).toBe(ACCEPTED_VERSION);
-    expect(confirm.stored_at).toBeInstanceOf(Date);
-    expect(confirm.amount_proposed_at).toBeInstanceOf(Date);
-    const intents = await readOutbox();
-    expect(intents).toHaveLength(2);
-    const promptIntent = intents.find((i) => i.receipt_media_id === PROMPT.id);
-    const confirmIntent = intents.find(
-      (i) => i.receipt_media_id === CONFIRM.id,
+    expect(h.meta).toHaveBeenCalledTimes(1);
+    expect(h.extract).toHaveBeenCalledWith({
+      bytes: JPEG,
+      mimeType: 'image/jpeg',
+      expectedAmountCents: 150_000,
+    });
+    expect(h.uploadReceipt).toHaveBeenCalledWith(
+      SALE,
+      { bytes: JPEG, mimeType: 'image/jpeg', filename: 'receipt.jpg' },
+      {
+        declared: { amountCents: 149_000 },
+        extracted: {
+          amountCents: 140_000,
+          date: '2026-11-05',
+          reference: 'REF123',
+          bank: 'BBVA',
+          confidence: 0.6,
+        },
+      },
+      target.mediaId,
+      expect.objectContaining({ signal: expect.any(AbortSignal) as unknown }),
     );
-    expect(promptIntent).toMatchObject({
-      template_key: 'RECEIPT_AMOUNT_PROMPT',
-      recipient_id: PROMPT.sender,
-      source_webhook_message_id: PROMPT.wamid,
-      receipt_state_version: ACCEPTED_VERSION,
-    });
-    expect(promptIntent?.template_args).toEqual({});
-    expect(promptIntent?.dedupe_key).toBe(
-      `receipt-amount-prompt:${PROMPT.id}:${PRE_BOOTSTRAP_VERSION}:${PROMPT.wamid}`,
-    );
-    expect(confirmIntent).toMatchObject({
-      template_key: 'RECEIPT_AMOUNT_CONFIRM',
-      recipient_id: CONFIRM.sender,
-      source_webhook_message_id: CONFIRM.wamid,
-      receipt_state_version: ACCEPTED_VERSION,
-    });
-    expect(confirmIntent?.template_args).toEqual({ amountCents: 1250 });
-    expect(confirmIntent?.dedupe_key).toBe(
-      `receipt-amount-confirm:${CONFIRM.id}:${PRE_BOOTSTRAP_VERSION}:${CONFIRM.wamid}`,
-    );
-    expect(meta.calls).toHaveLength(4);
-    expect(storage.calls).toHaveLength(2);
-  });
-
-  it('schedules a durable retry on a transient Meta failure and reaches the accepted state after the re-claim', async () => {
-    const meta = fakeMeta(async (_input, call) => {
-      if (call === 1)
-        throw new MetaMediaError('META_TRANSPORT', 'HTTP_RETRYABLE');
-      return fakeFile();
-    });
-    const storage = fakeStorage();
-    await seed(RETRY);
-    boot('worker.retry', meta.port, storage.port);
-    const reclaim = acceptAfterReclaim(RETRY, 'AWAITING_AMOUNT');
-    const retried = await waitFor(async () => {
-      const row = await readRow(RETRY.id);
-      return row.meta_attempts === 1 && row.status === 'RESERVED' ? row : null;
-    });
-    expect(retried).toMatchObject({
-      last_error_category: 'META_TRANSPORT',
-      last_error_code: 'HTTP_RETRYABLE',
-      lease_owner: null,
-      lease_expires_at: null,
-    });
-    expect((retried.next_attempt_at as Date).getTime()).toBeGreaterThan(
-      (retried.updated_at as Date).getTime(),
-    );
-    expect(await readOutbox()).toEqual([]);
-    const done = await reclaim;
-    expect(done).toMatchObject({
-      meta_attempts: 3,
-      last_error_code: 'HTTP_RETRYABLE',
-    });
-    expect(meta.calls).toHaveLength(3);
-  });
-
-  it('exhausts Meta at exactly three attempts and never issues a fourth call', async () => {
-    const meta = fakeMeta(async () => {
-      throw new MetaMediaError('META_TRANSPORT', 'HTTP_RETRYABLE');
-    });
-    const storage = fakeStorage();
-    await seed(EXHAUST);
-    const { dispatcher } = boot('worker.exhaust', meta.port, storage.port);
-    const failed = await waitRow(EXHAUST, 'FAILED');
-    expect(failed).toMatchObject({
-      failure_stage: 'META_EXHAUSTED_PRE_STORAGE',
-      meta_attempts: 3,
-      last_error_category: 'META_TRANSPORT',
-      last_error_code: 'HTTP_RETRYABLE',
-    });
-    expect(meta.calls).toHaveLength(3);
-    const intents = await readOutbox();
+    const intents = await readOutbox(target.id);
     expect(intents).toHaveLength(1);
     expect(intents[0]).toMatchObject({
-      template_key: 'RECEIPT_UNAVAILABLE_LATER',
-      receipt_media_id: EXHAUST.id,
+      template_key: 'RECEIPT_ATTACHED_PENDING',
+      recipient_id: target.sender,
+      template_args: {
+        folio: 'F-0042',
+        extractedAmountCents: 140_000,
+        totalCents: 150_000,
+      },
     });
-    // No fourth call: the terminal row is neither claimable nor dispatched.
-    expect(await store.claimBatch(10, 'worker.exhaust.probe')).toEqual([]);
-    expect(
-      await dispatcher.dispatch(
-        failed as unknown as ReceiptMediaRow,
-        'worker.exhaust.probe',
-      ),
-    ).toEqual({ kind: 'non-dispatched', status: 'FAILED' });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(meta.calls).toHaveLength(3);
   });
 
-  it('reclaims an expired lease with a replacement worker', async () => {
-    const meta = fakeMeta(async () => fakeFile());
-    const storage = fakeStorage();
-    await seed(RECLAIM, {
-      version: '1',
-      lease_owner: 'worker.stale',
-      lease_expires_at: new Date(Date.now() - 60_000),
+  it('retries an unknown outcome later with the SAME media id and tells the customer once', async () => {
+    const target = media(2, 'retry');
+    await seed(target);
+    let call = 0;
+    const h = boot({
+      owner: 'r2.retry',
+      upload: () =>
+        ++call === 1
+          ? Promise.reject(
+              new UpstreamError('x', 502, {}, 'RECEIPT_STORAGE_FAILED'),
+            )
+          : Promise.resolve(uploaded),
     });
-    boot('worker.replacement', meta.port, storage.port);
-    const done = await acceptAfterReclaim(RECLAIM, 'AWAITING_AMOUNT');
-    expect(done).toMatchObject({
-      lease_owner: 'worker.replacement',
-      meta_attempts: 2,
+    const scheduled = await waitStatus(
+      target,
+      'DOWNLOADED',
+      (row) => row.storage_attempts === 1 && row.lease_owner === null,
+    );
+    expect(scheduled).toMatchObject({
+      last_error_category: 'BACKEND_UPLOAD',
+      last_error_code: 'HTTP_502',
     });
-    expect(meta.calls).toHaveLength(2);
+    expect((scheduled.next_attempt_at as Date).getTime()).toBeGreaterThan(
+      Date.now() + 20_000,
+    );
+    expect((await readOutbox(target.id)).map((r) => r.template_key)).toEqual([
+      'RECEIPT_ATTACH_UNKNOWN',
+    ]);
+    // Make the retry due instead of waiting the 30 s backoff.
+    await pool.query(
+      'UPDATE receipt_media SET next_attempt_at = now() WHERE id = $1',
+      [target.id],
+    );
+    await waitStatus(target, 'ATTACHED');
+    expect(h.uploadReceipt).toHaveBeenCalledTimes(2);
+    expect(h.uploadReceipt.mock.calls.map((c) => c[3])).toEqual([
+      target.mediaId,
+      target.mediaId,
+    ]);
+    expect(h.meta).toHaveBeenCalledTimes(2);
+    expect((await readOutbox(target.id)).map((r) => r.template_key)).toEqual([
+      'RECEIPT_ATTACH_UNKNOWN',
+      'RECEIPT_ATTACHED_PENDING',
+    ]);
+  });
+
+  it('commits SALE_ALREADY_PAID as a definite refusal with its message', async () => {
+    const target = media(3, 'paid');
+    await seed(target);
+    boot({
+      owner: 'r2.paid',
+      upload: () =>
+        Promise.reject(
+          new ChatbotApiError('paid', 409, {}, 'SALE_ALREADY_PAID'),
+        ),
+    });
+    const row = await waitStatus(target, 'FAILED');
+    expect(row).toMatchObject({
+      failure_stage: 'ATTACH_DEFINITE',
+      attach_http_status: 409,
+      last_error_code: 'SALE_ALREADY_PAID',
+    });
+    const intents = await readOutbox(target.id);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({
+      template_key: 'RECEIPT_SALE_ALREADY_PAID',
+      template_args: { folio: 'F-0042' },
+    });
+  });
+
+  it('never uploads an image that is not a receipt', async () => {
+    const target = media(4, 'notreceipt');
+    await seed(target);
+    const h = boot({
+      owner: 'r2.notreceipt',
+      extraction: { kind: 'not_receipt' },
+    });
+    const row = await waitStatus(target, 'FAILED');
+    expect(row.failure_stage).toBe('NOT_A_RECEIPT');
+    expect(h.uploadReceipt).not.toHaveBeenCalled();
+    expect((await readOutbox(target.id)).map((r) => r.template_key)).toEqual([
+      'RECEIPT_NOT_A_RECEIPT',
+    ]);
+  });
+
+  it('refuses an encrypted PDF and asks for a screenshot', async () => {
+    const target = media(5, 'encrypted');
+    await seed(target, 'application/pdf');
+    const h = boot({
+      owner: 'r2.encrypted',
+      mime: 'application/pdf',
+      bytes: ENCRYPTED_PDF,
+    });
+    const row = await waitStatus(target, 'FAILED');
+    expect(row.failure_stage).toBe('PDF_ENCRYPTED');
+    expect(h.extract).not.toHaveBeenCalled();
+    expect(h.uploadReceipt).not.toHaveBeenCalled();
+    expect((await readOutbox(target.id)).map((r) => r.template_key)).toEqual([
+      'RECEIPT_PDF_ENCRYPTED',
+    ]);
+  });
+
+  it('uploads without extracted data when the extraction is unavailable', async () => {
+    const target = media(6, 'unavailable');
+    await seed(target);
+    const h = boot({
+      owner: 'r2.unavailable',
+      extraction: { kind: 'unavailable', reason: 'timeout' },
+    });
+    await waitStatus(target, 'ATTACHED');
+    expect(h.uploadReceipt.mock.calls[0][2]).toEqual({});
+    expect((await readOutbox(target.id))[0]).toMatchObject({
+      template_key: 'RECEIPT_ATTACHED_PENDING',
+      template_args: { folio: 'F-0042' },
+    });
+  });
+
+  it('keeps the transient Meta retry on the first download', async () => {
+    const target = media(7, 'meta');
+    await seed(target);
+    let call = 0;
+    const h = boot({
+      owner: 'r2.meta',
+      meta: () =>
+        ++call === 1
+          ? Promise.reject(new MetaMediaError('META_TRANSPORT', 'TIMEOUT'))
+          : Promise.resolve(fakeFile('image/jpeg')),
+    });
+    await waitStatus(target, 'ATTACHED');
+    expect(h.meta).toHaveBeenCalledTimes(2);
+    expect((await readRow(target.id)).meta_attempts).toBe(2);
   });
 });

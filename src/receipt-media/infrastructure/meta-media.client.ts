@@ -122,6 +122,8 @@ function detectMagic(bytes: Buffer): ReceiptMimeType | undefined {
     return 'image/png';
   if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8)
     return 'image/jpeg';
+  if (bytes.length >= 5 && bytes.toString('latin1', 0, 5) === '%PDF-')
+    return 'application/pdf';
   return undefined;
 }
 
@@ -193,6 +195,7 @@ function responseLengthOf(headers: unknown): number | undefined {
 const CANONICAL_MIME_TYPES: ReadonlySet<string> = new Set([
   'image/jpeg',
   'image/png',
+  'application/pdf',
 ]);
 
 /** Design byte bound: provider-declared size must be 1..10_485_760. */

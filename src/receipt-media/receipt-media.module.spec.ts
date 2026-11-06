@@ -48,8 +48,14 @@ import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { CapabilityService } from './application/capability.service';
-import { ReceiptAmountRouterService } from './application/receipt-amount-router.service';
 import { ReceiptAttachmentService } from './application/receipt-attachment.service';
+import { CostGuardService } from '../llm-agent/application/cost-guard.service';
+import { GENERATE_TEXT } from '../llm-agent/infrastructure/generate-text.provider';
+import { LlmCoreModule } from '../llm-agent/infrastructure/llm-core.module';
+import {
+  RECEIPT_EXTRACTION,
+  type ReceiptExtractionPort,
+} from './domain/receipt-extraction.port';
 import {
   RECEIPT_CAPABILITY_LOOKUP,
   ReceiptCapabilityAuthorizerService as CapabilityAuthorizer,
@@ -577,7 +583,6 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         [unknown, abstract new (...args: never[]) => unknown]
       > = [
         [ReceiptIngressService, ReceiptIngressService],
-        [ReceiptAmountRouterService, ReceiptAmountRouterService],
         [ReceiptAttachmentService, ReceiptAttachmentService],
         [ReceiptIngestionProcessor, ReceiptIngestionProcessor],
         [CapabilityAuthorizer, CapabilityAuthorizer],
@@ -691,10 +696,10 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       ConversationModule,
       ChatbotApiModule,
       WhatsappSenderModule,
+      LlmCoreModule,
     ])
       expect(meta('imports')).toContain(required);
-    expect(meta('exports')).toContain(ReceiptIngressService);
-    expect(meta('exports')).toContain(ReceiptAmountRouterService);
+    expect(meta('exports')).toEqual([ReceiptIngressService, RECEIPT_TELEMETRY]);
   });
 
   it('registers neither receipt worker nor the receipt outbox composition', async () => {
@@ -726,27 +731,31 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
     await expect(builder.compile()).rejects.toThrow(/ConfigService/);
   });
 
-  describe('ReceiptMediaModule attachment capability composition (ODD-5A)', () => {
-    it('injects the module capability so the composed attachment service posts the reconstructed token URL without the private object key', async () => {
-      const receiptId = '11111111-1111-4111-8111-111111111111';
-      const privateObjectKey = 'receipts/private-object-key';
-      const attachReceipt = jest.fn<
-        Promise<{ receiptId: string; status: string }>,
-        [string, { mediaUrl: string; declaredAmountCents: number }]
-      >(() => Promise.resolve({ receiptId: 'backend-1', status: 'PENDING' }));
-      const startAttachRequest = jest.fn().mockResolvedValue({
-        kind: 'started',
-        version: '8',
-        receipt: {
-          id: receiptId,
-          capturedSaleId: 'sale-1',
-          objectKey: privateObjectKey,
-          version: '8',
-          declaredAmountCents: 15000,
-        },
+  describe('ReceiptMediaModule backend upload composition (R2)', () => {
+    it('wires the backend upload client and the vision pre-fill over the shared LLM seams', async () => {
+      const uploadReceipt = jest.fn().mockResolvedValue({
+        receiptId: '33333333-3333-4333-8333-333333333333',
+        status: 'PENDING',
+        mimeType: 'image/jpeg',
+        sizeBytes: 3,
+        sha256: 'ab',
+        previewStatus: 'READY',
       });
-      // Broad enablement keeps the real CapabilityService alive while the
-      // dedicated ingestion rollout gate stays off, so no worker claims run.
+      const commitUploadSuccess = jest
+        .fn()
+        .mockResolvedValue({ kind: 'committed' });
+      const generateText = jest.fn().mockResolvedValue({
+        output: {
+          isReceipt: true,
+          amountCents: 15000,
+          date: null,
+          reference: null,
+          bank: null,
+          confidence: 'high',
+        },
+        usage: { inputTokens: 10, outputTokens: 5 },
+      });
+      // Ingestion rollout gate off, so no worker claims run.
       const env = { ...RECEIPT_ENABLED_ENV };
       delete env.RECEIPT_MEDIA_INGESTION_ENABLED;
       applyEnv(env);
@@ -761,45 +770,64 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(CONVERSATION_STORE)
         .useValue({ get: jest.fn().mockResolvedValue(null) })
         .overrideProvider(CHATBOT_API_CLIENT)
-        .useValue({ attachReceipt })
+        .useValue({ uploadReceipt })
         .overrideProvider(PostgresReceiptMediaStore)
-        .useValue({
-          startAttachRequest,
-          commitAttachSuccess: jest.fn().mockResolvedValue({
-            kind: 'committed',
-          }),
-          commitAttachDefiniteFailure: jest.fn(),
-          commitAttachUnknownOutcome: jest.fn(),
-        })
+        .useValue({ commitUploadSuccess })
+        .overrideProvider(GENERATE_TEXT)
+        .useValue(generateText)
         .overrideProvider(WHATSAPP_SENDER)
         .useValue({
           sendText: jest.fn().mockResolvedValue({ providerMessageId: 'wamid' }),
         })
         .compile();
       try {
-        const issued = moduleRef.get(CapabilityService).issue(receiptId);
-        const report = await moduleRef.get(ReceiptAttachmentService).attach({
-          receipt: {
-            id: receiptId,
-            capturedSaleId: 'sale-1',
-            objectKey: privateObjectKey,
-            version: '7',
-            declaredAmountCents: 15000,
-            capabilityTokenHash: issued.tokenHash,
-            capabilityKeyVersion: issued.keyVersion,
-          } as unknown as ReceiptMediaRow,
-          owner: 'owner-1',
+        const costGuard = moduleRef.get(CostGuardService);
+        const record = jest.spyOn(costGuard, 'record');
+        const extraction = await moduleRef
+          .get<ReceiptExtractionPort>(RECEIPT_EXTRACTION)
+          .extract({
+            bytes: Buffer.from('img'),
+            mimeType: 'image/jpeg',
+            expectedAmountCents: 15000,
+          });
+        expect(extraction).toMatchObject({
+          kind: 'receipt',
+          amountCents: 15000,
         });
-        expect(report).toEqual({
-          kind: 'attached',
-          backendReceiptId: 'backend-1',
-        });
-        const [saleId, body] = attachReceipt.mock.calls[0];
-        expect(saleId).toBe('sale-1');
-        expect(body.mediaUrl).toBe(
-          `https://media.example.com/media/receipts/${issued.token}`,
+        expect(generateText).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: expect.objectContaining({ modelId: 'm' }) as unknown,
+          }),
         );
-        expect(body.mediaUrl).not.toContain(privateObjectKey);
+        expect(record).toHaveBeenCalledWith({
+          promptTokens: 10,
+          completionTokens: 5,
+        });
+        const report = await moduleRef.get(ReceiptAttachmentService).upload({
+          receipt: {
+            id: '11111111-1111-4111-8111-111111111111',
+            capturedSaleId: 'sale-1',
+            providerMediaId: 'wa-media-1',
+            declaredAmountCents: null,
+          } as unknown as ReceiptMediaRow,
+          fence: {
+            id: '11111111-1111-4111-8111-111111111111',
+            owner: 'o',
+            expectedVersion: '7',
+          },
+          file: { bytes: Buffer.from('img'), mimeType: 'image/jpeg' },
+          extraction,
+          order: null,
+        });
+        expect(report.kind).toBe('uploaded');
+        expect(uploadReceipt).toHaveBeenCalledWith(
+          'sale-1',
+          expect.anything(),
+          expect.anything(),
+          'wa-media-1',
+          expect.anything(),
+        );
+        expect(commitUploadSuccess).toHaveBeenCalledTimes(1);
       } finally {
         await moduleRef.close().catch(() => undefined);
         await drainMicrotasks();
@@ -1739,39 +1767,19 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       }
     });
 
-    it('aborts the same signal handed to an active attachment collaborator on shutdown', async () => {
+    it('never dispatches a legacy ATTACHING row (the amount dialog is gone)', async () => {
       const pool = makeIngestionPool([[{ id: 'a1', status: 'ATTACHING' }]]);
-      const signals: AbortSignal[] = [];
-      const attachment = {
-        attach: jest.fn<
-          Promise<unknown>,
-          [{ receipt: unknown; owner: string; signal?: AbortSignal }]
-        >(
-          (input) =>
-            new Promise((resolve) => {
-              if (input.signal) signals.push(input.signal);
-              input.signal?.addEventListener(
-                'abort',
-                () => resolve({ kind: 'skipped', reason: 'fenced' }),
-                { once: true },
-              );
-            }),
-        ),
-      };
+      const processor = { process: jest.fn() };
       const moduleRef = await buildIngestionModule(
         RECEIPT_ENABLED_ENV,
         pool.pool,
-        { attachment },
+        { processor },
       ).compile();
       try {
         await moduleRef.init();
-        await untilMicrotask(() => signals.length >= 1);
-        const closing = moduleRef.close();
+        await untilMicrotask(() => pool.claims.length >= 1);
         await drainMicrotasks();
-        expect(signals[0]?.aborted).toBe(true);
-        await closing;
-        await drainMicrotasks();
-        expect(pool.queriesAfterEnd()).toBe(0);
+        expect(processor.process).not.toHaveBeenCalled();
       } finally {
         await moduleRef.close().catch(() => undefined);
         await drainMicrotasks();

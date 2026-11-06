@@ -112,12 +112,35 @@ function validateJpeg(bytes: Buffer): void {
   bad();
 }
 
+const PDF_HEADER = /^%PDF-[12]\.\d/;
+/** The end-of-file marker must sit in the last KiB (trailing whitespace or
+ *  junk some generators append is tolerated). */
+const PDF_TAIL_BYTES = 1024;
+
+/** S8 envelope check only: the chatbot never renders or interprets a PDF. */
+function validatePdf(bytes: Buffer): void {
+  const head = bytes.toString('latin1', 0, 16);
+  const tail = bytes.toString(
+    'latin1',
+    Math.max(0, bytes.length - PDF_TAIL_BYTES),
+  );
+  if (!PDF_HEADER.test(head) || !tail.includes('%%EOF'))
+    throw new MetaMediaError('MEDIA_VALIDATION', 'PDF_STRUCTURE_INVALID');
+}
+
+/** S8: a password-protected PDF carries an `/Encrypt` entry in its trailer
+ *  (or xref stream) dictionary; such a file is never uploaded. */
+export function isEncryptedPdf(bytes: Buffer): boolean {
+  return /\/Encrypt(?![A-Za-z0-9])/.test(bytes.toString('latin1'));
+}
+
 export function validateMediaStructure(
   bytes: Buffer,
   mimeType: string,
 ): ReceiptMimeType {
   if (mimeType === 'image/png') validatePng(bytes);
   else if (mimeType === 'image/jpeg') validateJpeg(bytes);
+  else if (mimeType === 'application/pdf') validatePdf(bytes);
   else throw new MetaMediaError('MEDIA_VALIDATION', 'UNSUPPORTED_MIME');
   return mimeType;
 }

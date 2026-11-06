@@ -2,9 +2,9 @@
  * behavior: proves the real WhatsappModule graph boots through the Nest
  * testing module once ReceiptMediaModule is imported, so the
  * WebhookDispatcherService's mandatory receipt dependencies (ReceiptIngress
- * Service, ReceiptAmountRouterService) resolve. External edges are stubbed
+ * Service) resolve. External edges are stubbed
  * only (no live PostgreSQL, backend, Meta, S3, or LLM requests). Proven: the
- * host graph composes in enabled mode with dispatcher/ingress/router all
+ * host graph composes in enabled mode with dispatcher/ingress all
  * resolvable and the WHATSAPP_SENDER alias intact; the same graph composes in
  * a genuinely receipt-setting-free disabled environment where the ingress
  * outcome remains `disabled`; the host registers none of the private receipt
@@ -24,7 +24,6 @@ import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { AppConfigModule } from '../config/config.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
-import { ReceiptAmountRouterService } from '../receipt-media/application/receipt-amount-router.service';
 import { ReceiptCleanupService } from '../receipt-media/application/receipt-cleanup.service';
 import { ReceiptIngestionProcessor } from '../receipt-media/application/receipt-ingestion.processor';
 import { ReceiptIngressService } from '../receipt-media/application/receipt-ingress.service';
@@ -393,16 +392,13 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
     Object.assign(process.env, baseEnv);
   });
 
-  it('composes the host graph so dispatcher, ingress, and router resolve', async () => {
+  it('composes the host graph so dispatcher and ingress resolve', async () => {
     await withHostModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
       expect(moduleRef.get(WebhookDispatcherService)).toBeInstanceOf(
         WebhookDispatcherService,
       );
       expect(moduleRef.get(ReceiptIngressService)).toBeInstanceOf(
         ReceiptIngressService,
-      );
-      expect(moduleRef.get(ReceiptAmountRouterService)).toBeInstanceOf(
-        ReceiptAmountRouterService,
       );
       // The outbound sender alias keeps resolving through the sender module.
       expect(moduleRef.get(WHATSAPP_SENDER)).toBeDefined();
@@ -421,9 +417,6 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         );
         expect(moduleRef.get(ReceiptIngressService)).toBeInstanceOf(
           ReceiptIngressService,
-        );
-        expect(moduleRef.get(ReceiptAmountRouterService)).toBeInstanceOf(
-          ReceiptAmountRouterService,
         );
         // The ingress kill switch stays disabled with no receipt settings.
         expect(

@@ -187,11 +187,11 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
   it('renders every tracked template key deterministically, no free-form path', () => {
     const argsFor = (
       key: ReceiptMediaOutboxRow['templateKey'],
-    ): Record<string, number | 'PENDING'> =>
+    ): Record<string, number | string> =>
       key === 'RECEIPT_AMOUNT_CONFIRM'
         ? { amountCents: 123456 }
         : key === 'RECEIPT_ATTACHED_PENDING'
-          ? { backendStatus: 'PENDING' }
+          ? { folio: 'F-1' }
           : {};
     for (const key of RECEIPT_TEMPLATE_KEYS) {
       const row = intent({ templateKey: key, templateArgs: argsFor(key) });
@@ -204,12 +204,70 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(renderNotificationText(intent())).toBe(
       'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
     );
-    expect(
-      renderNotificationText({
-        templateKey: 'RECEIPT_ATTACHED_PENDING',
-        templateArgs: { backendStatus: 'PENDING' },
-      }),
-    ).toBe('Comprobante recibido, queda PENDIENTE (PENDING).');
+  });
+
+  describe('R2/S9 receipt outcome messages', () => {
+    const render = (
+      templateKey: ReceiptMediaOutboxRow['templateKey'],
+      templateArgs: Record<string, number | string> = {},
+    ) => renderNotificationText({ templateKey, templateArgs });
+
+    it('says received and in review with the folio, without any amount prompt', () => {
+      expect(render('RECEIPT_ATTACHED_PENDING', { folio: 'F-0042' })).toBe(
+        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme.',
+      );
+      expect(render('RECEIPT_ATTACHED_PENDING')).toBe(
+        'Recibimos su comprobante. Lo estamos revisando y le avisamos en cuanto se confirme.',
+      );
+    });
+
+    it('adds one sentence when the extracted amount differs from the order total', () => {
+      expect(
+        render('RECEIPT_ATTACHED_PENDING', {
+          folio: 'F-0042',
+          extractedAmountCents: 140050,
+          totalCents: 150000,
+        }),
+      ).toBe(
+        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme. Vemos un monto de $1,400.50 y su pedido es de $1,500.00; lo revisamos igual.',
+      );
+    });
+
+    it.each([
+      [
+        'RECEIPT_SALE_ALREADY_PAID',
+        { folio: 'F-0042' },
+        'Su pedido F-0042 ya está pagado.',
+      ],
+      ['RECEIPT_SALE_ALREADY_PAID', {}, 'Su pedido ya está pagado.'],
+      [
+        'RECEIPT_SALE_NOT_PAYABLE',
+        {},
+        'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
+      ],
+      [
+        'RECEIPT_UNSUPPORTED_FORMAT',
+        {},
+        'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
+      ],
+      [
+        'RECEIPT_ATTACH_UNKNOWN',
+        {},
+        'Estamos registrando su comprobante; le avisamos en cuanto quede.',
+      ],
+      [
+        'RECEIPT_NOT_A_RECEIPT',
+        {},
+        'Esta imagen no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+      ],
+      [
+        'RECEIPT_PDF_ENCRYPTED',
+        {},
+        'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',
+      ],
+    ] as const)('renders %s %j', (key, args, text) => {
+      expect(render(key, args)).toBe(text);
+    });
   });
 
   it('shutdown stops claims, wakes polling, drains the active send, idempotent', async () => {

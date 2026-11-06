@@ -1,7 +1,7 @@
 /** WU7 receipt ingress admission service (RM1, WA2): TX1 delegates one
  * atomic receipt admission to the durable store. Deterministic closed
  * decisions (kill-switch disabled, unsupported media, no
- * placed sale) return without touching the store; a supported JPEG/PNG with a
+ * placed sale) return without touching the store; a supported JPEG/PNG/PDF with a
  * minimal-route `minimalCart.placedSale` (S3) builds an immutable reservation identity, reserves
  * exactly once, and maps the store's resolved outcome exhaustively (the
  * concrete WU2B store resolves only after its own transaction commits; this
@@ -23,10 +23,12 @@ import type {
 } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 
-/** Exact canonical receipt MIME values; no non-canonical alias is admitted. */
+/** Exact canonical receipt MIME values; no non-canonical alias is admitted.
+ * S8: a WhatsApp `document` with a PDF mime is admitted like an image. */
 const SUPPORTED_MIME_TYPES: ReadonlySet<string> = new Set([
   'image/jpeg',
   'image/png',
+  'application/pdf',
 ]);
 
 /** Largest declared amount the durable positive-int32 `declared_amount_cents`

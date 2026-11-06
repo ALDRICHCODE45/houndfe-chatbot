@@ -4,7 +4,10 @@ import {
   type ValidatedMediaFile,
   META_MEDIA,
 } from '../domain/meta-media.port';
-import { validateMediaStructure } from './media-structure.validator';
+import {
+  isEncryptedPdf,
+  validateMediaStructure,
+} from './media-structure.validator';
 import { deflateSync, inflateSync } from 'zlib';
 
 const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex');
@@ -61,7 +64,7 @@ const positive = (entropy: number[]) => jpeg(...tables, SOF, SOS, entropy);
 
 const expectInvalid = (
   bytes: Buffer,
-  mimeType: 'image/png' | 'image/jpeg' | 'image/gif',
+  mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'application/pdf',
   code: string,
 ) =>
   expect(() => validateMediaStructure(bytes, mimeType)).toThrow(
@@ -253,5 +256,36 @@ describe('JPEG structural validation', () => {
 
   it('rejects unsupported MIME with a fixed safe error', () => {
     expectInvalid(Buffer.from('unsafe'), 'image/gif', 'UNSUPPORTED_MIME');
+  });
+
+  const pdf = (body = '1 0 obj << /Type /Catalog >> endobj\n') =>
+    Buffer.from(`%PDF-1.7\n${body}trailer << /Root 1 0 R >>\n%%EOF\n`);
+
+  it('accepts a PDF with a header and an end-of-file marker (S8)', () => {
+    expect(validateMediaStructure(pdf(), 'application/pdf')).toBe(
+      'application/pdf',
+    );
+  });
+
+  it.each([
+    ['no header', Buffer.from('1 0 obj endobj\n%%EOF\n')],
+    ['no end-of-file marker', Buffer.from('%PDF-1.7\n1 0 obj endobj\n')],
+    ['a bad version', Buffer.from('%PDF-x\n%%EOF\n')],
+  ])('rejects a PDF with %s', (_name, bytes) => {
+    expectInvalid(bytes, 'application/pdf', 'PDF_STRUCTURE_INVALID');
+  });
+
+  it('detects an encrypted PDF without interpreting it', () => {
+    expect(isEncryptedPdf(pdf())).toBe(false);
+    expect(
+      isEncryptedPdf(
+        Buffer.from(
+          '%PDF-1.7\ntrailer << /Root 1 0 R /Encrypt 5 0 R >>\n%%EOF\n',
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isEncryptedPdf(Buffer.from('%PDF-1.7\n/EncryptMetadata\n%%EOF')),
+    ).toBe(false);
   });
 });

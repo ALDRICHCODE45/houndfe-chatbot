@@ -13,6 +13,8 @@ export interface PlacedOrder {
   saleId: string;
   /** Order total in cents; `null` when the persisted value is malformed. */
   totalCents: number | null;
+  /** Backend order folio shown to the customer; `null` when absent. */
+  folio: string | null;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -23,13 +25,17 @@ export function readPlacedOrder(
 ): PlacedOrder | null {
   const cart = state?.data?.minimalCart;
   if (!isRecord(cart) || !isRecord(cart.placedSale)) return null;
-  const { saleId, totalCents } = cart.placedSale;
+  const { saleId, totalCents, folio } = cart.placedSale;
   if (typeof saleId !== 'string' || !UUID.test(saleId)) return null;
   return {
     saleId,
     totalCents:
       Number.isSafeInteger(totalCents) && (totalCents as number) >= 0
         ? (totalCents as number)
+        : null,
+    folio:
+      typeof folio === 'string' && folio.length > 0 && folio.length <= 40
+        ? folio
         : null,
   };
 }

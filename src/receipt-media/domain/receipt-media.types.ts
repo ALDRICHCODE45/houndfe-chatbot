@@ -29,6 +29,10 @@ export const RECEIPT_FAILURE_STAGES = [
   'META_EXHAUSTED_PRE_STORAGE',
   'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
   'ATTACH_DEFINITE',
+  /** R2: the extraction says the image is not a payment receipt. */
+  'NOT_A_RECEIPT',
+  /** R2/S8: a password-protected PDF is never uploaded. */
+  'PDF_ENCRYPTED',
 ] as const;
 export type ReceiptFailureStage = (typeof RECEIPT_FAILURE_STAGES)[number];
 
@@ -63,10 +67,14 @@ export const RECEIPT_TEMPLATE_KEYS = [
   'RECEIPT_PLACE_SALE_FIRST',
   'RECEIPT_UNSUPPORTED_FORMAT',
   'RECEIPT_RECEIPTS_ONLY',
+  'RECEIPT_SALE_ALREADY_PAID',
+  'RECEIPT_SALE_NOT_PAYABLE',
+  'RECEIPT_PDF_ENCRYPTED',
+  'RECEIPT_NOT_A_RECEIPT',
 ] as const;
 export type ReceiptTemplateKey = (typeof RECEIPT_TEMPLATE_KEYS)[number];
 
-export type ReceiptMimeType = 'image/jpeg' | 'image/png';
+export type ReceiptMimeType = 'image/jpeg' | 'image/png' | 'application/pdf';
 export type ReceiptBackendReceiptStatus = 'PENDING';
 
 /** Durable `receipt_media` row (snake_case columns projected to camelCase). */
@@ -138,8 +146,8 @@ export interface ReceiptMediaOutboxRow {
   sourceWebhookMessageId: string;
   recipientId: string;
   templateKey: ReceiptTemplateKey;
-  /** Bounded arguments: integer cents and backend status only. */
-  templateArgs: Record<string, number | ReceiptBackendReceiptStatus>;
+  /** Bounded arguments: integer cents, the order folio, backend status. */
+  templateArgs: Record<string, number | string>;
   status: ReceiptOutboxStatus;
   attempts: number;
   nextAttemptAt: Date;

@@ -32,7 +32,6 @@ import { RestockApplicationRuntime } from '../human-decisions/restock-applicatio
 import { SaleFlowModule } from '../sale-flow/sale-flow.module';
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from './application/agent-runner.service';
-import { CostGuardService } from './application/cost-guard.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
@@ -53,9 +52,9 @@ import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
 import { TOOL_REGISTRY } from './domain/tool-registry.port';
 import {
   GENERATE_TEXT,
-  generateTextImpl,
   type GenerateTextFn,
 } from './infrastructure/generate-text.provider';
+import { LlmCoreModule } from './infrastructure/llm-core.module';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
 import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instructions';
 
@@ -84,6 +83,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
 @Module({
   imports: [
     ConfigModule,
+    // GENERATE_TEXT + the shared CostGuardService (also used by receipts).
+    LlmCoreModule,
     ConversationModule,
     ChatbotApiModule,
     SaleFlowModule,
@@ -96,10 +97,6 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     DeliveryZonesModule,
   ],
   providers: [
-    {
-      provide: GENERATE_TEXT,
-      useValue: generateTextImpl,
-    },
     {
       provide: LLM_AGENT,
       inject: [GENERATE_TEXT, ConfigService],
@@ -125,15 +122,6 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
       // `getPaymentDetails` tool is the source of truth.
       provide: LLM_AGENT_SYSTEM_PROMPT,
       useFactory: () => composeSaleFlowSystemPrompt(SYSTEM_PROMPT),
-    },
-    {
-      provide: CostGuardService,
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) =>
-        new CostGuardService(
-          config.get<{ monthlyTokenCeiling: number }>('llm')!
-            .monthlyTokenCeiling,
-        ),
     },
     AgentRunner,
     {
@@ -219,7 +207,7 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
   ],
   exports: [
     AgentRunner,
-    CostGuardService,
+    LlmCoreModule,
     MinimalCatalogAgentService,
     MinimalRestockRequestService,
     MinimalExpirationRequestService,

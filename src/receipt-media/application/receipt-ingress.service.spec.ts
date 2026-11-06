@@ -86,7 +86,18 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
     expect(reserve).not.toHaveBeenCalled();
   });
 
-  it.each(['application/pdf', 'image/gif', 'IMAGE/JPEG', ''])(
+  it('admits a PDF document receipt like an image (S8)', async () => {
+    const { service, reserve } = fixture();
+    const decision = await service.admit(
+      input({ declaredMimeType: 'application/pdf' }),
+    );
+    expect(decision.kind).toBe('reserved');
+    expect(reserve).toHaveBeenCalledWith(
+      expect.objectContaining({ declaredMimeType: 'application/pdf' }),
+    );
+  });
+
+  it.each(['application/msword', 'image/gif', 'IMAGE/JPEG', ''])(
     'returns unsupported-media for %s without a state read or reservation',
     async (declaredMimeType) => {
       const { service, conversations, reserve } = fixture();
@@ -481,7 +492,7 @@ describe('ReceiptIngressService TX1 admission (RM1, WA2)', () => {
 
   it.each([
     ['disabled', false, 'image/jpeg'],
-    ['unsupported-media', true, 'application/pdf'],
+    ['unsupported-media', true, 'application/msword'],
     ['unsupported-media', true, 'image/gif'],
   ] as const)(
     'gates %s before the active lookup for %s',

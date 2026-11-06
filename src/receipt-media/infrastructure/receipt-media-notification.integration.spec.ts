@@ -31,7 +31,8 @@ const ddescribe = DOCKER ? describe : describe.skip;
 type Row = Record<string, unknown>;
 const OWNER = 'odd6c.worker';
 const AMOUNT_CONFIRM = 'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.';
-const ATTACHED_PENDING = 'Comprobante recibido, queda PENDIENTE (PENDING).';
+const ATTACHED_PENDING =
+  'Recibimos su comprobante del pedido F-1. Lo estamos revisando y le avisamos en cuanto se confirme.';
 
 type SendHandler = (message: OutboundText) => Promise<SendResult>;
 const fakeSender = (handler: SendHandler) => {
@@ -212,7 +213,7 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
     const attached = await insert({
       recipient_id: '+525500000002',
       template_key: 'RECEIPT_ATTACHED_PENDING',
-      template_args: JSON.stringify({ backendStatus: 'PENDING' }),
+      template_args: JSON.stringify({ folio: 'F-1' }),
     });
     const { sender, calls } = fakeSender(async (message) => ({
       providerMessageId: `wamid.det.${message.to}`,
@@ -226,7 +227,7 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
     });
     const [a, b] = rows;
     expect(a.template_args).toEqual({ amountCents: 123456 });
-    expect(b.template_args).toEqual({ backendStatus: 'PENDING' });
+    expect(b.template_args).toEqual({ folio: 'F-1' });
     for (const [row, text] of [
       [a, AMOUNT_CONFIRM],
       [b, ATTACHED_PENDING],
@@ -320,7 +321,7 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
     const id = await insert({
       recipient_id: '+525500000004',
       template_key: 'RECEIPT_ATTACHED_PENDING',
-      template_args: JSON.stringify({ backendStatus: 'PENDING' }),
+      template_args: JSON.stringify({ folio: 'F-1' }),
       status: 'SENDING',
       attempts: 1,
       lease_owner: 'crashed-worker',

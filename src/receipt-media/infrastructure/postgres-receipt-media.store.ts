@@ -48,7 +48,14 @@ import type {
   StatusCasInput,
   StorageFailureDispositionInput,
   StorageFailureDispositionOutcome,
+  RejectedMediaInput,
+  UploadCommitOutcome,
+  UploadDefiniteFailureInput,
+  UploadSuccessInput,
+  UploadTemplateArgs,
+  UploadUnknownInput,
 } from '../domain/receipt-media-store.port';
+import { MAX_UPLOAD_ATTEMPTS } from '../domain/receipt-media-store.port';
 import {
   RECEIPT_MAX_BYTES,
   RECEIPT_SHA256_BYTES,
@@ -88,7 +95,7 @@ const STORAGE_ATTEMPT_SQL = `UPDATE receipt_media
    SET storage_attempts = storage_attempts + 1, version = version + 1,
      updated_at = now() WHERE id = $1 AND lease_owner = $2
      AND version = $3::bigint AND lease_expires_at > now()
-     AND status = 'DOWNLOADED' AND storage_attempts < 3
+     AND status = 'DOWNLOADED' AND storage_attempts < ${MAX_UPLOAD_ATTEMPTS}
      RETURNING storage_attempts AS attempt, version`;
 
 /** ODD-4B: the two receipt-first bootstrap successors. The locked receipt's
@@ -436,6 +443,7 @@ const META_VALIDATION_CODES = new Set<string>([
   'MIME_MISMATCH',
   'PNG_STRUCTURE_INVALID',
   'JPEG_STRUCTURE_INVALID',
+  'PDF_STRUCTURE_INVALID',
 ]);
 const META_RETRYABLE_CODES = new Set<string>([
   'FILE_IO_FAILURE',
@@ -664,6 +672,14 @@ const isRecord = (value: unknown): value is Row =>
 class ProposalFencedError extends Error {}
 const FENCED = new ProposalFencedError();
 
+const RECEIPT_MIME_TYPES: ReadonlySet<unknown> = new Set([
+  'image/jpeg',
+  'image/png',
+  'application/pdf',
+]);
+const isReceiptMime = (value: unknown): boolean =>
+  RECEIPT_MIME_TYPES.has(value);
+
 const successorVersion = (value: string): string | null => {
   if (!/^[1-9]\d*(?![\s\S])/.test(value)) return null;
   const parsed = BigInt(value);
@@ -681,10 +697,8 @@ const isDownloadInput = (
       input.id.length > 0 &&
       typeof input.owner === 'string' &&
       input.owner.length > 0 &&
-      (input.responseMimeType === 'image/jpeg' ||
-        input.responseMimeType === 'image/png') &&
-      (input.detectedMimeType === 'image/jpeg' ||
-        input.detectedMimeType === 'image/png') &&
+      isReceiptMime(input.responseMimeType) &&
+      isReceiptMime(input.detectedMimeType) &&
       Number.isInteger(input.byteCount) &&
       input.byteCount > 0 &&
       input.byteCount <= MAX_INT32 &&
@@ -732,10 +746,8 @@ const isBootstrapInput = (
 
 const hasDownloadEvidence = (row: Row) =>
   row.downloaded_at instanceof Date &&
-  (row.response_mime_type === 'image/jpeg' ||
-    row.response_mime_type === 'image/png') &&
-  (row.detected_mime_type === 'image/jpeg' ||
-    row.detected_mime_type === 'image/png') &&
+  isReceiptMime(row.response_mime_type) &&
+  isReceiptMime(row.detected_mime_type) &&
   Number.isInteger(row.byte_count) &&
   typeof row.byte_count === 'number' &&
   row.byte_count > 0 &&
@@ -1178,6 +1190,115 @@ const lookupActiveStatus = async (
 /** WU2B2A PostgreSQL primitives (RM1, RM3) over the WU2A1/WU2A2A/WU2A2B
  * schema. Every external value is parameter-bound; no caption, URL, token,
  * response body, raw error, or diagnostic PII is persisted. */
+
+/** R2 backend upload commits: every one locks the exact owned, live-leased
+ * DOWNLOADED row at the caller's version (`clock_timestamp()` fence). */
+const UPLOAD_LOCK_SQL = `SELECT * FROM receipt_media
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+        AND lease_expires_at > clock_timestamp() AND status = 'DOWNLOADED'
+      FOR UPDATE`;
+
+/** Request evidence stamped at the terminal commit (the schema requires it
+ * for every attach-terminal row). */
+const UPLOAD_ATTACH_EVIDENCE = `attach_started_at = now(),
+        attach_attempt_id = $4, attach_request_started_at = now(),
+        attach_attempts = 1, terminal_at = now(), version = version + 1,
+        updated_at = now()`;
+
+const UPLOAD_SUCCESS_SQL = `UPDATE receipt_media
+      SET status = 'ATTACHED', backend_receipt_id = $5,
+        backend_receipt_status = 'PENDING', attached_at = now(),
+        last_error_category = NULL, last_error_code = NULL,
+        ${UPLOAD_ATTACH_EVIDENCE}
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+      RETURNING *`;
+
+const UPLOAD_DEFINITE_SQL = `UPDATE receipt_media
+      SET status = 'FAILED', failure_stage = 'ATTACH_DEFINITE',
+        attach_http_status = $5, last_error_category = 'BACKEND_UPLOAD',
+        last_error_code = $6, ${UPLOAD_ATTACH_EVIDENCE}
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+      RETURNING *`;
+
+const UPLOAD_UNKNOWN_TERMINAL_SQL = `UPDATE receipt_media
+      SET status = 'ATTACH_OUTCOME_UNKNOWN', attach_http_status = $5,
+        attach_transport_code = $6, attach_outcome_observed_at = now(),
+        last_error_category = 'BACKEND_UPLOAD', last_error_code = $7,
+        ${UPLOAD_ATTACH_EVIDENCE}
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+      RETURNING *`;
+
+/** Same-key retry: keep DOWNLOADED, persist the safe code, schedule, and
+ * release the lease so any worker reclaims it when due. */
+const UPLOAD_RETRY_SQL = `UPDATE receipt_media
+      SET last_error_category = 'BACKEND_UPLOAD', last_error_code = $4,
+        next_attempt_at = clock_timestamp() + ($5::int * interval '1 millisecond'),
+        lease_owner = NULL, lease_expires_at = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+      RETURNING *`;
+
+/** Refused media: FAILED with the reason stage; the download evidence is
+ * cleared as the schema requires for a never-uploaded file. */
+const UPLOAD_REJECTED_SQL = `UPDATE receipt_media
+      SET status = 'FAILED', failure_stage = $4, terminal_at = now(),
+        downloaded_at = NULL, response_mime_type = NULL,
+        detected_mime_type = NULL, byte_count = NULL, content_sha256 = NULL,
+        version = version + 1, updated_at = now()
+      WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
+      RETURNING *`;
+
+/** Backoff after unknown attempt n (1..5): 30 s, 2, 5, 10, 15 min (~32 min
+ * before the sixth and last attempt), plus up to 10% positive jitter. */
+const UPLOAD_RETRY_BASE_MS = [30_000, 120_000, 300_000, 600_000, 900_000];
+const uploadRetryDelayMs = (attempt: number): number => {
+  const base =
+    UPLOAD_RETRY_BASE_MS[Math.min(attempt, UPLOAD_RETRY_BASE_MS.length) - 1];
+  return base + Math.floor(Math.random() * (base * 0.1 + 1));
+};
+
+const UPLOAD_DEFINITE_STATUSES = new Set([
+  400, 401, 403, 404, 409, 413, 415, 422, 429,
+]);
+const UPLOAD_DEFINITE_TEMPLATES = new Set<string>([
+  'RECEIPT_SALE_ALREADY_PAID',
+  'RECEIPT_SALE_NOT_PAYABLE',
+  'RECEIPT_UNSUPPORTED_FORMAT',
+  'RECEIPT_ATTACH_DEFINITE_FAILURE',
+]);
+const REJECTED_MEDIA_TEMPLATES = {
+  NOT_A_RECEIPT: 'RECEIPT_NOT_A_RECEIPT',
+  PDF_ENCRYPTED: 'RECEIPT_PDF_ENCRYPTED',
+} as const;
+/** Safe, bounded evidence code: an allowlisted shape, never a body. */
+const SAFE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const MAX_FOLIO_LENGTH = 40;
+
+const isUploadFence = (input: LeaseFenceInput): boolean =>
+  typeof input?.id === 'string' &&
+  UUID.test(input.id) &&
+  typeof input?.owner === 'string' &&
+  input.owner.length > 0 &&
+  typeof input?.expectedVersion === 'string' &&
+  successorVersion(input.expectedVersion) !== null;
+
+const isCents = (value: unknown): boolean =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
+
+/** Exactly the three optional keys, each bounded. */
+const isUploadTemplateArgs = (args: UploadTemplateArgs): boolean =>
+  isRecord(args) &&
+  Object.keys(args).every((k) =>
+    ['folio', 'extractedAmountCents', 'totalCents'].includes(k),
+  ) &&
+  (args.folio === undefined ||
+    (typeof args.folio === 'string' &&
+      args.folio.length > 0 &&
+      args.folio.length <= MAX_FOLIO_LENGTH)) &&
+  (args.extractedAmountCents === undefined ||
+    isCents(args.extractedAmountCents)) &&
+  (args.totalCents === undefined || isCents(args.totalCents));
+
 export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
   constructor(private readonly pool: Pool) {}
 
@@ -2854,8 +2975,8 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
              AND ((status = 'RESERVED'
                  AND (meta_attempts < 3 OR meta_attempts = 3))
                OR (status = 'DOWNLOADED'
-                 AND (storage_attempts < 3 OR storage_attempts = 3)
-                 AND (meta_attempts < 3 OR meta_attempts = 3))
+                 AND storage_attempts <= ${MAX_UPLOAD_ATTEMPTS}
+                 AND meta_attempts <= 3)
                OR (status = 'ATTACHING'))
            ORDER BY next_attempt_at, created_at
            FOR UPDATE SKIP LOCKED LIMIT $1
@@ -3135,6 +3256,231 @@ export class PostgresReceiptMediaStore implements ReceiptMediaStorePort {
           }
         : null;
     });
+  }
+
+  /** R2: DOWNLOADED → ATTACHED plus the received/in-review intent. */
+  async commitUploadSuccess(
+    input: UploadSuccessInput,
+  ): Promise<UploadCommitOutcome> {
+    if (
+      !isUploadFence(input) ||
+      typeof input.backendReceiptId !== 'string' ||
+      !UUID.test(input.backendReceiptId.toLowerCase()) ||
+      !isUploadTemplateArgs(input.templateArgs)
+    )
+      return { kind: 'fenced' };
+    return this.uploadTx(input, async (c, locked) => {
+      const receipt = await this.uploadUpdate(c, UPLOAD_SUCCESS_SQL, input, [
+        randomUUID(),
+        input.backendReceiptId.toLowerCase(),
+      ]);
+      return {
+        kind: 'committed',
+        attempt: locked.storage_attempts as number,
+        receipt: camelize<Media>(receipt),
+        intent: await this.uploadIntent(
+          c,
+          receipt,
+          `receipt-upload-received:${input.id}`,
+          'RECEIPT_ATTACHED_PENDING',
+          input.templateArgs,
+        ),
+      };
+    });
+  }
+
+  /** R2: DOWNLOADED → FAILED/ATTACH_DEFINITE plus the refusal intent. */
+  async commitUploadDefiniteFailure(
+    input: UploadDefiniteFailureInput,
+  ): Promise<UploadCommitOutcome> {
+    if (
+      !isUploadFence(input) ||
+      !UPLOAD_DEFINITE_STATUSES.has(input.httpStatus) ||
+      !(input.errorCode === null || SAFE_CODE.test(input.errorCode)) ||
+      !UPLOAD_DEFINITE_TEMPLATES.has(input.templateKey) ||
+      !isUploadTemplateArgs(input.templateArgs)
+    )
+      return { kind: 'fenced' };
+    return this.uploadTx(input, async (c, locked) => {
+      const receipt = await this.uploadUpdate(c, UPLOAD_DEFINITE_SQL, input, [
+        randomUUID(),
+        input.httpStatus,
+        input.errorCode,
+      ]);
+      return {
+        kind: 'committed',
+        attempt: locked.storage_attempts as number,
+        receipt: camelize<Media>(receipt),
+        intent: await this.uploadIntent(
+          c,
+          receipt,
+          `receipt-upload-refused:${input.id}`,
+          input.templateKey,
+          input.templateArgs,
+        ),
+      };
+    });
+  }
+
+  /** R2: an unknown outcome retries under the same key until the locked
+   * row's `storage_attempts` reaches `MAX_UPLOAD_ATTEMPTS`, then becomes
+   * ATTACH_OUTCOME_UNKNOWN. The "registering" intent is keyed by receipt
+   * only, so the customer hears it once across every retry. */
+  async commitUploadUnknown(
+    input: UploadUnknownInput,
+  ): Promise<UploadCommitOutcome> {
+    const status = input.httpStatus;
+    const statusOk =
+      status === null ||
+      (Number.isInteger(status) &&
+        status >= 100 &&
+        status <= 599 &&
+        (status < 200 || status > 299) &&
+        !UPLOAD_DEFINITE_STATUSES.has(status));
+    const transportOk =
+      input.transportCode === null || SAFE_CODE.test(input.transportCode);
+    if (
+      !isUploadFence(input) ||
+      !statusOk ||
+      !transportOk ||
+      (status === null) === (input.transportCode === null)
+    )
+      return { kind: 'fenced' };
+    const code = status === null ? input.transportCode! : `HTTP_${status}`;
+    return this.uploadTx(input, async (c, locked) => {
+      const attempt = locked.storage_attempts as number;
+      const terminal = attempt >= MAX_UPLOAD_ATTEMPTS;
+      const receipt = terminal
+        ? await this.uploadUpdate(c, UPLOAD_UNKNOWN_TERMINAL_SQL, input, [
+            randomUUID(),
+            status,
+            input.transportCode,
+            code,
+          ])
+        : await this.uploadUpdate(c, UPLOAD_RETRY_SQL, input, [
+            code,
+            uploadRetryDelayMs(Math.max(attempt, 1)),
+          ]);
+      return {
+        kind: terminal ? 'committed' : 'retry-scheduled',
+        attempt,
+        receipt: camelize<Media>(receipt),
+        intent: await this.uploadIntent(
+          c,
+          receipt,
+          `receipt-upload-unknown:${input.id}`,
+          'RECEIPT_ATTACH_UNKNOWN',
+          {},
+          true,
+        ),
+      };
+    });
+  }
+
+  /** R2: DOWNLOADED → FAILED (NOT_A_RECEIPT / PDF_ENCRYPTED), no upload. */
+  async commitRejectedMedia(
+    input: RejectedMediaInput,
+  ): Promise<UploadCommitOutcome> {
+    if (
+      !isUploadFence(input) ||
+      !Object.hasOwn(REJECTED_MEDIA_TEMPLATES, input.reason)
+    )
+      return { kind: 'fenced' };
+    return this.uploadTx(input, async (c, locked) => {
+      const receipt = await this.uploadUpdate(c, UPLOAD_REJECTED_SQL, input, [
+        input.reason,
+      ]);
+      return {
+        kind: 'committed',
+        attempt: locked.storage_attempts as number,
+        receipt: camelize<Media>(receipt),
+        intent: await this.uploadIntent(
+          c,
+          receipt,
+          `receipt-media-rejected:${input.id}`,
+          REJECTED_MEDIA_TEMPLATES[input.reason],
+          {},
+        ),
+      };
+    });
+  }
+
+  /** One transaction over the locked upload row; a missing row fences. */
+  private async uploadTx(
+    input: LeaseFenceInput,
+    fn: (c: PoolClient, locked: Row) => Promise<UploadCommitOutcome>,
+  ): Promise<UploadCommitOutcome> {
+    try {
+      return await this.withTx(async (c) => {
+        const locked = (
+          await c.query<Row>(UPLOAD_LOCK_SQL, [
+            input.id,
+            input.owner,
+            input.expectedVersion,
+          ])
+        ).rows[0];
+        return locked ? fn(c, locked) : { kind: 'fenced' };
+      });
+    } catch (err) {
+      if (err === FENCED) return { kind: 'fenced' };
+      throw err;
+    }
+  }
+
+  private async uploadUpdate(
+    c: PoolClient,
+    sql: string,
+    input: LeaseFenceInput,
+    params: unknown[],
+  ): Promise<Row> {
+    const updated = await c.query<Row>(sql, [
+      input.id,
+      input.owner,
+      input.expectedVersion,
+      ...params,
+    ]);
+    if (updated.rowCount !== 1) throw FENCED;
+    return updated.rows[0];
+  }
+
+  /** Inserts the row-routed intent once per dedupe key. Returns the created
+   * intent; an existing one is returned too unless `onceOnly`, in which
+   * case a repeat yields null (the customer already heard it). */
+  private async uploadIntent(
+    c: PoolClient,
+    receipt: Row,
+    dedupeKey: string,
+    templateKey: string,
+    templateArgs: UploadTemplateArgs,
+    onceOnly = false,
+  ): Promise<ReceiptMediaOutboxRow | null> {
+    const inserted = await c.query<Row>(
+      `INSERT INTO receipt_media_outbox (id, dedupe_key, receipt_media_id,
+         receipt_state_version, source_webhook_message_id, recipient_id,
+         template_key, template_args)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (dedupe_key) DO NOTHING RETURNING *`,
+      [
+        randomUUID(),
+        dedupeKey,
+        receipt.id,
+        receipt.version,
+        receipt.webhook_message_id,
+        receipt.sender_id,
+        templateKey,
+        JSON.stringify(templateArgs),
+      ],
+    );
+    const row = inserted.rows[0];
+    if (row) return camelize<ReceiptMediaOutboxRow>(row);
+    if (onceOnly) return null;
+    const existing = (
+      await c.query<Row>(
+        'SELECT * FROM receipt_media_outbox WHERE dedupe_key = $1',
+        [dedupeKey],
+      )
+    ).rows[0];
+    return existing ? camelize<ReceiptMediaOutboxRow>(existing) : null;
   }
 
   async startMetaAttempt(

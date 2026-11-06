@@ -44,6 +44,11 @@ import type {
   CreateShippingQuoteInput,
   ShippingQuoteResponse,
 } from './dtos/shipping-quote.dto';
+import type {
+  ReceiptUploadFields,
+  ReceiptUploadFile,
+  ReceiptUploadResponse,
+} from './dtos/receipt-upload.dto';
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
@@ -112,6 +117,19 @@ export interface ChatbotApiClient {
     dto: AttachReceiptInput,
     options?: AttachReceiptTransportOptions,
   ): Promise<AttachReceiptResponse>;
+  /** Multipart `POST /chatbot-api/sales/:saleId/receipts` (scope
+   *  `sales:write`). `idempotencyKey` is the WhatsApp media id: a retry with
+   *  the same key and file returns the same receipt. Exactly one POST per
+   *  call; only a strictly valid 201 resolves. Rejects with `ChatbotApiError`
+   *  carrying `statusCode` and `errorCode` (`body.error`); a timeout or
+   *  network failure has `statusCode: null` (unknown outcome). */
+  uploadReceipt(
+    saleId: string,
+    file: ReceiptUploadFile,
+    fields: ReceiptUploadFields,
+    idempotencyKey: string,
+    options?: AttachReceiptTransportOptions,
+  ): Promise<ReceiptUploadResponse>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
   /** HD-R2b2: `POST /chatbot-api/human-decisions` RESTOCK intake (scope

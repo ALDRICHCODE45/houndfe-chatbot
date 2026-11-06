@@ -1,6 +1,7 @@
 import { execSync } from 'node:child_process';
 import type { PoolClient, QueryResultRow } from 'pg';
 import { Pool } from 'pg';
+import { MAX_UPLOAD_ATTEMPTS } from '../domain/receipt-media-store.port';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 import type {
   AmountBootstrapInput,
@@ -378,8 +379,10 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     ['byte_count', 10_485_761, false],
     ['provider_declared_bytes', 0, false],
     ['provider_declared_bytes', 10_485_761, false],
-    ['capability_key_version', '01', false],
-    ['capability_key_version', '1', false],
+    // R2 (migration 3300) dropped the accepted-object composite: capability
+    // evidence is no longer tied to a lifecycle state (R3 drops the columns).
+    ['capability_key_version', '01', true],
+    ['capability_key_version', '1', true],
     ['declared_amount_cents', 0, false],
     ['declared_amount_cents', 1, true],
     ['attach_attempts', 2, false],
@@ -387,7 +390,10 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     ['meta_attempts', -1, false],
     ['meta_attempts', 4, false],
     ['meta_attempts', 3, true],
-    ['storage_attempts', 4, false],
+    // R2: up to MAX_UPLOAD_ATTEMPTS (6) same-key backend upload attempts.
+    ['storage_attempts', 6, true],
+    ['storage_attempts', 7, false],
+    ['declared_mime_type', 'application/pdf', true],
     ['cleanup_attempts', -1, false],
   ])('receipt_media.%s accepts/rejects %j', async (col, value, ok) => {
     await expectInserts([['receipt_media', receiptRow({ [col]: value }), ok]]);
@@ -396,7 +402,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   it.each([
     ['content_sha256', 32, false],
     ['content_sha256', 31, false],
-    ['capability_token_hash', 32, false],
+    ['capability_token_hash', 32, true],
     ['capability_token_hash', 31, false],
   ])('%s enforces its 32-byte length (%d)', async (col, len, ok) => {
     await expectInserts([
@@ -436,8 +442,6 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
     ),
   ];
   const invalidReceipts: Array<[string, string, string | null, Row]> = [
-    ['no object pre-store', 'RESERVED', null, acceptedEvidence],
-    ['object required', 'STORED', null, { object_etag: null }],
     ['bytes required', 'DOWNLOADED', null, { byte_count: null }],
     ['no download early', 'RESERVED', null, { downloaded_at: T0 }],
     ['amount blocked', 'AWAITING_AMOUNT', null, { declared_amount_cents: 100 }],
@@ -1315,23 +1319,25 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         ['meta', 'RESERVED'],
         ['storage', 'DOWNLOADED'],
       ])(
-        'starts three %s attempts and refuses a fourth',
+        'starts every allowed %s attempt and refuses one more',
         async (counter, status) => {
+          // Meta keeps 3; R2 storage = backend upload attempts (6).
+          const cap = counter === 'meta' ? 3 : MAX_UPLOAD_ATTEMPTS;
           await insert(claimRow(status));
           const claimed = await claim();
           const f = fence(claimed);
-          for (let i = 1, v = claimed.version; i <= 3; i++, v = String(i)) {
+          for (let i = 1, v = claimed.version; i <= cap; i++, v = String(i)) {
             expect(await start(counter, { ...f, expectedVersion: v })).toEqual({
               attempt: i,
               version: String(i + 1),
             });
           }
           expect(
-            await start(counter, { ...f, expectedVersion: '4' }),
+            await start(counter, { ...f, expectedVersion: String(cap + 1) }),
           ).toBeNull();
           expect(await state(claimed.id)).toMatchObject({
-            [COL[counter]]: 3,
-            version: '4',
+            [COL[counter]]: cap,
+            version: String(cap + 1),
           });
         },
       );
@@ -6876,13 +6882,15 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           }),
         ).toBeNull();
       }
+      // R2: storage_attempts counts backend upload attempts, capped at
+      // MAX_UPLOAD_ATTEMPTS (6), so a row at 3 may still start an upload.
       expect(
         await store.startStorageAttempt({
           id: UUID_C,
           owner: OWNER,
           expectedVersion: '1',
         }),
-      ).toBeNull();
+      ).toMatchObject({ attempt: 4 });
     });
   });
 
@@ -7497,7 +7505,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       expect(await outboxRows()).toHaveLength(0);
     });
 
-    it('reclaims storage-exhausted DOWNLOADED rows for terminalization while refusing a fourth storage attempt and holding STORED', async () => {
+    it('reclaims upload-exhausted DOWNLOADED rows for terminalization while refusing another upload attempt and holding STORED', async () => {
       await pool.query(
         'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox, receipt_media',
       );
@@ -7508,7 +7516,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
         sender_id: 'sender.rec-sd',
         captured_sale_id: UUID_B,
         object_key: `receipts/${UUID_A}`,
-        storage_attempts: 3,
+        storage_attempts: MAX_UPLOAD_ATTEMPTS,
         next_attempt_at: T0,
       });
       const stored = lifeRow('STORED', null, {
@@ -8815,14 +8823,14 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
           }),
           true,
         ],
-        // neither channel: rejected.
+        // neither channel: accepted since R2 dropped the composite.
         [
           'receipt_media',
           versionedRow('1', {
             capability_key_version_text: null,
             capability_key_version: null,
           }),
-          false,
+          true,
         ],
       ]);
     });

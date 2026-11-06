@@ -36,6 +36,16 @@ import {
 } from '../domain/dtos/checkout.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
 import {
+  isReceiptUploadResponse,
+  RECEIPT_UPLOAD_ERROR,
+  RECEIPT_UPLOAD_KEY_MAX_LENGTH,
+  RECEIPT_UPLOAD_TIMEOUT_MS,
+  toReceiptUploadForm,
+  type ReceiptUploadFields,
+  type ReceiptUploadFile,
+  type ReceiptUploadResponse,
+} from '../domain/dtos/receipt-upload.dto';
+import {
   CreateShippingQuoteInputSchema,
   normalizeShippingQuoteResponse,
   type CreateShippingQuoteInput,
@@ -429,6 +439,55 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       },
       options,
     );
+  }
+
+  async uploadReceipt(
+    saleId: string,
+    file: ReceiptUploadFile,
+    fields: ReceiptUploadFields,
+    idempotencyKey: string,
+    options: AttachReceiptTransportOptions = {},
+  ): Promise<ReceiptUploadResponse> {
+    if (
+      idempotencyKey.length < 1 ||
+      idempotencyKey.length > RECEIPT_UPLOAD_KEY_MAX_LENGTH
+    ) {
+      throw new ChatbotApiError(
+        'Receipt upload idempotency key is out of contract',
+        400,
+        undefined,
+        RECEIPT_UPLOAD_ERROR.INVALID_IDEMPOTENCY_KEY,
+      );
+    }
+    const requestConfig = this.buildAuthedRequestConfig({
+      method: 'POST',
+      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
+      data: toReceiptUploadForm(file, fields),
+      headers: { 'X-Idempotency-Key': idempotencyKey },
+      timeout: RECEIPT_UPLOAD_TIMEOUT_MS,
+      signal: options.signal,
+    });
+
+    let response;
+    try {
+      // Single attempt: a retry is the caller's, later, with the same key.
+      response = await lastValueFrom(
+        this.httpService.request<unknown>(requestConfig),
+      );
+    } catch (error) {
+      throw this.mapError(error);
+    }
+
+    const body = response.data;
+    if (response.status !== 201 || !isReceiptUploadResponse(body)) {
+      throw new UpstreamError(
+        'Chatbot API receipt upload response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return body;
   }
 
   async updateDelivery(

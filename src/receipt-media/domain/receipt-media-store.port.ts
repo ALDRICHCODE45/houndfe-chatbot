@@ -12,6 +12,7 @@ import type {
   ReceiptMediaOutboxRow,
   ReceiptMediaRow,
   ReceiptMediaStatus,
+  ReceiptMimeType,
   ReceiptTemplateKey,
 } from './receipt-media.types';
 
@@ -61,7 +62,7 @@ export interface OutboxIntentInput {
   sourceWebhookMessageId: string;
   recipientId: string;
   templateKey: ReceiptTemplateKey;
-  templateArgs?: Record<string, number | 'PENDING'>;
+  templateArgs?: Record<string, number | string>;
 }
 
 export type DedupeOutcome = { created: boolean; intent: ReceiptMediaOutboxRow };
@@ -366,8 +367,8 @@ export interface StatusCasInput {
 
 /** Fenced, evidence-complete RESERVED → DOWNLOADED commit. */
 export interface DownloadCommitInput extends LeaseFenceInput {
-  responseMimeType: 'image/jpeg' | 'image/png';
-  detectedMimeType: 'image/jpeg' | 'image/png';
+  responseMimeType: ReceiptMimeType;
+  detectedMimeType: ReceiptMimeType;
   byteCount: number;
   contentSha256: Buffer;
 }
@@ -418,6 +419,67 @@ export interface CapabilityAccessRow {
   capabilityTokenHash: Buffer;
   capabilityRevokedAt: Date | null;
 }
+
+/** R2 backend upload attempts per receipt (`storage_attempts`), all under
+ * the same `X-Idempotency-Key` (the WhatsApp media id). */
+export const MAX_UPLOAD_ATTEMPTS = 6;
+
+/** Bounded customer-message arguments for the upload outcome intents. */
+export interface UploadTemplateArgs {
+  folio?: string;
+  /** Present with `totalCents` only when the extracted amount differs. */
+  extractedAmountCents?: number;
+  totalCents?: number;
+}
+
+/** The customer messages a definite (4xx) upload failure can produce. */
+export type UploadDefiniteTemplateKey = Extract<
+  ReceiptTemplateKey,
+  | 'RECEIPT_SALE_ALREADY_PAID'
+  | 'RECEIPT_SALE_NOT_PAYABLE'
+  | 'RECEIPT_UNSUPPORTED_FORMAT'
+  | 'RECEIPT_ATTACH_DEFINITE_FAILURE'
+>;
+
+/** DOWNLOADED → ATTACHED with the received/in-review intent (S9). */
+export interface UploadSuccessInput extends LeaseFenceInput {
+  backendReceiptId: string;
+  templateArgs: UploadTemplateArgs;
+}
+
+/** DOWNLOADED → FAILED/ATTACH_DEFINITE: the backend refused (4xx). */
+export interface UploadDefiniteFailureInput extends LeaseFenceInput {
+  httpStatus: number;
+  /** Backend `body.error`, persisted as safe evidence; null when absent. */
+  errorCode: string | null;
+  templateKey: UploadDefiniteTemplateKey;
+  templateArgs: UploadTemplateArgs;
+}
+
+/** Unknown outcome (timeout, network, 5xx, invalid 201): the store retries
+ * below `MAX_UPLOAD_ATTEMPTS` and terminalizes ATTACH_OUTCOME_UNKNOWN at it.
+ * The first unknown outcome owns the single "registering" intent. Exactly
+ * one evidence channel: a non-2xx HTTP status or a transport code. */
+export interface UploadUnknownInput extends LeaseFenceInput {
+  httpStatus: number | null;
+  transportCode: string | null;
+}
+
+/** DOWNLOADED → FAILED without any upload (S8/S9). */
+export interface RejectedMediaInput extends LeaseFenceInput {
+  reason: 'NOT_A_RECEIPT' | 'PDF_ENCRYPTED';
+}
+
+/** `intent` is the customer intent this commit created, or null when the
+ * once-only intent already existed (or none applies). */
+export type UploadCommitOutcome =
+  | {
+      kind: 'committed' | 'retry-scheduled';
+      attempt: number;
+      receipt: ReceiptMediaRow;
+      intent: ReceiptMediaOutboxRow | null;
+    }
+  | { kind: 'fenced' };
 
 export interface ReceiptMediaStorePort {
   /** Atomically commits a receipt reservation and its inbound webhook marker. */
@@ -600,7 +662,18 @@ export interface ReceiptMediaStorePort {
   bootstrapAmount(input: AmountBootstrapInput): Promise<AmountBootstrapOutcome>;
   /** Atomic pre-call Meta attempt start (max 3); loser null. */
   startMetaAttempt(input: LeaseFenceInput): Promise<AttemptStartResult | null>;
-  /** Atomic pre-call storage attempt start (max 3); loser null. */
+  /** R2: commit a successful backend upload. */
+  commitUploadSuccess(input: UploadSuccessInput): Promise<UploadCommitOutcome>;
+  /** R2: commit a definite (4xx) backend refusal. */
+  commitUploadDefiniteFailure(
+    input: UploadDefiniteFailureInput,
+  ): Promise<UploadCommitOutcome>;
+  /** R2: schedule a same-key retry, or terminalize the unknown outcome. */
+  commitUploadUnknown(input: UploadUnknownInput): Promise<UploadCommitOutcome>;
+  /** R2: refuse a downloaded file that must not be uploaded. */
+  commitRejectedMedia(input: RejectedMediaInput): Promise<UploadCommitOutcome>;
+  /** Atomic pre-call backend upload attempt start (max
+   * `MAX_UPLOAD_ATTEMPTS`); loser null. */
   startStorageAttempt(
     input: LeaseFenceInput,
   ): Promise<AttemptStartResult | null>;

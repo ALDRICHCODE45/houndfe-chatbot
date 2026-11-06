@@ -16,6 +16,7 @@
  * UNPROVEN and user explicitly accepted preserve-and-verify. This spec
  * is a future regression test only; its passing does not retroactively
  * establish prior RED. */
+import { MAX_UPLOAD_ATTEMPTS } from '../domain/receipt-media-store.port';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
 
 // ---------------------------------------------------------------------------
@@ -115,11 +116,13 @@ describe('claimBatch SQL contract — STORED-1', () => {
     expect(allSql).toMatch(/meta_attempts\s*<\s*3/i);
   });
 
-  it('retains storage_attempts < 3 and meta_attempts < 3 for DOWNLOADED', async () => {
+  it('bounds DOWNLOADED upload retries by the upload attempt cap (R2)', async () => {
     await store.claimBatch(5, 'test-owner');
     const allSql = pool.client.calls.map((c) => c.sql).join('\n');
-    expect(allSql).toMatch(/storage_attempts\s*<\s*3/i);
-    expect(allSql).toMatch(/meta_attempts\s*<\s*3/i);
+    expect(allSql).toMatch(
+      new RegExp(`storage_attempts\\s*<=\\s*${MAX_UPLOAD_ATTEMPTS}`, 'i'),
+    );
+    expect(allSql).toMatch(/meta_attempts\s*<=\s*3/i);
   });
 
   // -------------------------------------------------------------------------

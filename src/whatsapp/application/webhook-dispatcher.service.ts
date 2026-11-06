@@ -5,12 +5,10 @@ import {
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import type { AgentMessage } from '../../conversation/domain/conversation-store';
-import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import {
   ReceiptIngressService,
   type ReceiptIngressDecision,
 } from '../../receipt-media/application/receipt-ingress.service';
-import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
@@ -85,7 +83,6 @@ export class WebhookDispatcherService {
     private readonly humanHandoff: HumanHandoffService,
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore: ConversationStore,
-    private readonly amountRouter: ReceiptAmountRouterService,
     private readonly ingress: ReceiptIngressService,
     // Handles every customer turn; AgentRunner only serves the ops synthetic
     // "resolved" turn above.
@@ -189,60 +186,12 @@ export class WebhookDispatcherService {
           continue;
         }
 
-        // ─── WU13-B1: ReceiptAmountRouter — customer text only ─────────────
-        if (message.media == null) {
-          const outcome = await this.amountRouter.route({
-            senderId: message.senderId,
-            text: message.text,
-            sourceWebhookMessageId: message.messageId,
-          });
-          // ODD-4D: a valid active receipt pointer with no routing plan is
-          // deterministic — send the active-flow guidance and never call the
-          // LLM. Send failure propagates before remember/markSeen.
-          if (outcome.kind === 'unrecognized') {
-            this.logger.log(
-              `amount router terminal [unrecognized] for ${message.messageId}`,
-            );
-            const { providerMessageId } = await this.whatsappSender.sendText({
-              to: message.senderId,
-              text: ACTIVE_RECEIPT_GUIDANCE,
-            });
-            this.recentOutbound.remember(providerMessageId);
-            try {
-              await this.dedup.markSeen(message.messageId);
-            } catch (error) {
-              this.logger.warn(
-                `markSeen failed for ${message.messageId}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            }
-            continue;
-          }
-          if (outcome.kind !== 'fenced') {
-            this.logger.log(
-              `amount router terminal [${outcome.kind}] for ${message.messageId}`,
-            );
-            try {
-              await this.dedup.markSeen(message.messageId);
-            } catch (error) {
-              this.logger.warn(
-                `markSeen failed for ${message.messageId}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            }
-            continue;
-          }
-          // Fenced → fall through to the ordinary agent path below.
-        }
-
         // ─── WU13-B2: ReceiptIngressService — customer media only ─────────────
         if (message.media != null) {
           // ODD-4A: the normalized optional caption is the only extra field
           // forwarded. filename/sha256 and every other payload field are
-          // dropped, and the raw caption never reaches the amount router, the
-          // LLM, or any durable type.
+          // dropped, and the raw caption never reaches the LLM or any
+          // durable type.
           const decision = await this.ingress.admit({
             webhookMessageId: message.messageId,
             providerMediaId: message.media.providerMediaId,
@@ -448,49 +397,30 @@ function normalizeTimestamp(timestamp: string): string {
 
 // WU13-B2: maps each closed ReceiptIngressDecision kind to customer-facing
 // guidance text. Silent variants return undefined — no reply is sent and
-// media never reaches the amount router or AgentRunner. ODD-4C: a durable
-// sender-active decision carries its exact status, so the guidance reflects
-// whether the open flow still needs the customer's amount/confirmation or is
-// still being processed internally.
+// media never reaches AgentRunner. Customer text always goes to the agent:
+// the receipt amount dialog (CONFIRMAR/CANCELAR) is gone (R6/S9).
 
-/** ODD-4C/4D fixed Spanish guidance for a durable active amount or confirmation
- * flow that still needs a customer decision. Shared by sender-active image
- * guidance and the ODD-4D deterministic active-text fallback; defined locally
- * so the dispatcher never imports notification internals. */
-const ACTIVE_RECEIPT_GUIDANCE =
-  'Tienes un proceso abierto: finalízalo o cancélalo.';
+/** S8: the formats the backend accepts (same text as the outbox template). */
+const UNSUPPORTED_RECEIPT_FORMAT =
+  'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.';
 
 function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
   switch (decision.kind) {
     case 'disabled':
       return 'El servicio no está disponible. Intenta más tarde.';
     case 'unsupported-media':
-      return 'Formato no soportado. Envía JPEG o PNG.';
+      return UNSUPPORTED_RECEIPT_FORMAT;
     case 'no-placed-sale':
       return 'Primero registra la venta en el sistema.';
     case 'sender-active':
-      return senderActiveGuidance(decision.status);
+      // R6: no amount dialog any more, so an active receipt is always still
+      // being processed (downloaded, read and uploaded to the backend).
+      return 'Estamos procesando su comprobante.';
     case 'reserved':
     case 'webhook-replayed':
     case 'provider-media-reused':
     case 'webhook-media-conflict':
       return undefined;
-  }
-}
-
-/** ODD-4C fixed Spanish guidance for a durable active receipt. An amount or
- * confirmation flow needs a customer decision; every other active status is
- * still processing internally. */
-function senderActiveGuidance(status: ActiveReceiptStatus): string {
-  switch (status) {
-    case 'AWAITING_AMOUNT':
-    case 'AWAITING_CONFIRMATION':
-      return ACTIVE_RECEIPT_GUIDANCE;
-    case 'RESERVED':
-    case 'DOWNLOADED':
-    case 'STORED':
-    case 'ATTACHING':
-      return 'Estamos procesando tu comprobante.';
   }
 }
 

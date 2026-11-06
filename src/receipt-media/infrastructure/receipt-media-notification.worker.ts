@@ -49,40 +49,86 @@ export interface NotificationAlertSeam {
 
 export const RETRY_DELAY_MS = 60_000;
 
-const money = (value: number | 'PENDING' | undefined): string =>
-  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+const isCents = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+const money = (value: number | string | undefined): string =>
+  isCents(value)
     ? `${Math.floor(value / 100)}.${String(value % 100).padStart(2, '0')}`
     : '';
 
-/** Deterministic canonical Spanish texts keyed by the tracked WU3 template
- * keys; the bounded WU3 args are the only substitutions. Never free text. */
+/** `$1,500.00` customer-facing pesos. */
+const pesos = (cents: number): string =>
+  `$${Math.floor(cents / 100).toLocaleString('en-US')}.${String(cents % 100).padStart(2, '0')}`;
+
+const RECEIVED_SUFFIX =
+  'Lo estamos revisando y le avisamos en cuanto se confirme.';
+
+/** Deterministic canonical Spanish texts keyed by the tracked template keys;
+ * the bounded args are the only substitutions. Never free text. The amount
+ * dialog texts (RECEIPT_AMOUNT_*, CANCELLED, FINISH_OR_CANCEL) are no longer
+ * produced (R6) and go away with the store states in R3. */
 const TEXT: Record<ReceiptTemplateKey, string> = {
   RECEIPT_AMOUNT_PROMPT: '¿Cuál fue el monto de tu transferencia?',
   RECEIPT_AMOUNT_CONFIRM:
     'Detectamos {amountCents} MXN. Responde CONFIRMAR o CANCELAR.',
   RECEIPT_AMOUNT_REASK: 'No pudimos leer el monto. Envíalo como número.',
   RECEIPT_CANCELLED: 'Cancelamos el comprobante. Puedes enviarlo de nuevo.',
-  RECEIPT_ATTACHED_PENDING:
-    'Comprobante recibido, queda PENDIENTE ({backendStatus}).',
+  RECEIPT_ATTACHED_PENDING: `Recibimos su comprobante. ${RECEIVED_SUFFIX}`,
   RECEIPT_ATTACH_DEFINITE_FAILURE:
-    'No pudimos adjuntar el comprobante. Contacta a soporte.',
-  RECEIPT_ATTACH_UNKNOWN: 'Estamos verificando el adjunto del comprobante.',
+    'No pudimos registrar su comprobante. Escríbanos y le ayudamos.',
+  RECEIPT_ATTACH_UNKNOWN:
+    'Estamos registrando su comprobante; le avisamos en cuanto quede.',
   RECEIPT_UNAVAILABLE_LATER:
-    'El servicio no está disponible. Intenta más tarde.',
-  RECEIPT_IN_PROGRESS: 'Estamos procesando tu comprobante.',
+    'No pudimos recibir su comprobante. Por favor envíelo de nuevo más tarde.',
+  RECEIPT_IN_PROGRESS: 'Estamos procesando su comprobante.',
   RECEIPT_FINISH_OR_CANCEL:
     'Tienes un proceso abierto: finalízalo o cancélalo.',
   RECEIPT_PLACE_SALE_FIRST: 'Primero registra la venta en el sistema.',
-  RECEIPT_UNSUPPORTED_FORMAT: 'Formato no soportado. Envía JPEG o PNG.',
+  RECEIPT_UNSUPPORTED_FORMAT:
+    'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
   RECEIPT_RECEIPTS_ONLY: 'Solo podemos procesar comprobantes de pago.',
+  RECEIPT_SALE_ALREADY_PAID: 'Su pedido ya está pagado.',
+  RECEIPT_SALE_NOT_PAYABLE:
+    'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
+  RECEIPT_PDF_ENCRYPTED:
+    'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',
+  RECEIPT_NOT_A_RECEIPT:
+    'Esta imagen no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
 };
+
+const folioOf = (args: ReceiptMediaOutboxRow['templateArgs']): string | null =>
+  typeof args.folio === 'string' && args.folio.length > 0 ? args.folio : null;
 
 export const renderNotificationText = (
   row: Pick<ReceiptMediaOutboxRow, 'templateKey' | 'templateArgs'>,
-): string =>
-  TEXT[row.templateKey]
-    .replace('{amountCents}', money(row.templateArgs.amountCents))
-    .replace('{backendStatus}', String(row.templateArgs.backendStatus ?? ''));
+): string => {
+  const args = row.templateArgs;
+  const folio = folioOf(args);
+  switch (row.templateKey) {
+    case 'RECEIPT_ATTACHED_PENDING': {
+      // S9: received + in review; a differing extracted amount is mentioned
+      // without blocking.
+      const received =
+        folio === null
+          ? TEXT.RECEIPT_ATTACHED_PENDING
+          : `Recibimos su comprobante del pedido ${folio}. ${RECEIVED_SUFFIX}`;
+      const { extractedAmountCents: seen, totalCents: owed } = args;
+      return isCents(seen) && isCents(owed) && seen !== owed
+        ? `${received} Vemos un monto de ${pesos(seen)} y su pedido es de ${pesos(owed)}; lo revisamos igual.`
+        : received;
+    }
+    case 'RECEIPT_SALE_ALREADY_PAID':
+      return folio === null
+        ? TEXT.RECEIPT_SALE_ALREADY_PAID
+        : `Su pedido ${folio} ya está pagado.`;
+    default:
+      return TEXT[row.templateKey].replace(
+        '{amountCents}',
+        money(args.amountCents),
+      );
+  }
+};
 
 export interface NotificationWorkerOptions {
   owner: string;

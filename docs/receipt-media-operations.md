@@ -152,19 +152,37 @@ An incomplete-multipart abort rule is a **future, unexercised storage-policy
 drill**: verify a safe window and that it affects only incomplete uploads, not
 completed receipt objects. No lifecycle rule or cleanup command is applied here.
 
-### Unknown attachment outcome: no repeat POST
+### Backend upload and unknown outcome (R2)
 
-`ATTACH_OUTCOME_UNKNOWN` concerns an **ambiguous backend receipt-attachment
-outcome**, not an unknown WhatsApp media type. `ReceiptAttachmentService` makes
-at most one POST for the durable attach attempt. A timeout or lost response can
-leave the backend receipt created even though success was not recorded locally.
+The backend stores receipt files (receipt-payment-flow S2). The worker
+downloads the WhatsApp media, reads it with the vision pre-fill, and uploads it
+as multipart to `POST /chatbot-api/sales/:saleId/receipts` with
+`X-Idempotency-Key` = the WhatsApp media id (contract:
+`docs/contracts/transfer-receipts.md`). The upload has a 90 s HTTP timeout and
+the worker renews its 60 s lease while it runs.
 
-Do not automatically repeat the POST, reset the attempt to retryable, or delete
-its evidence. After lease/fencing uncertainty, do not assume the backend did
-nothing. Preserve the attempt and obtain human reconciliation against backend
-receipt/audit evidence through approved access. Reconciliation tooling and the
-production drill are deferred; this runbook authorizes no state repair or second
-POST.
+| Backend answer | Durable result | Customer message |
+| --- | --- | --- |
+| 201 | `ATTACHED` | received + in review, with the folio (and the amount mismatch sentence) |
+| 409 `SALE_ALREADY_PAID` | `FAILED` / `ATTACH_DEFINITE` | the order is already paid |
+| 409 `SALE_NOT_PAYABLE` | `FAILED` / `ATTACH_DEFINITE` | the order no longer accepts payments |
+| 413 / 415 | `FAILED` / `ATTACH_DEFINITE` | send a JPEG, PNG or PDF under 10 MB |
+| other 400/401/403/404/409/422/429 | `FAILED` / `ATTACH_DEFINITE` | generic "write to us" |
+| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201 | stays `DOWNLOADED`, retried | "registering" message, once |
+
+An unknown outcome is safe to retry because the key is the media id: the
+backend returns the same receipt for the same key and file. The store schedules
+up to 6 attempts (backoff 30 s, 2, 5, 10, 15 min, about 32 min in total) and
+then sets `ATTACH_OUTCOME_UNKNOWN`. Such a row may still exist in the backend;
+reconcile it against the backend before any manual action. Outcome polling is
+R5.
+
+A file that must not be uploaded ends `FAILED` without any backend call:
+`NOT_A_RECEIPT` (the vision says it is not a payment receipt) or
+`PDF_ENCRYPTED` (asks for a screenshot).
+
+The bucket, capability and storage-cleanup sections above describe the
+chatbot-owned storage that R2 no longer writes to; R3 removes it.
 
 ## STORED-1: excluded from automatic claim eligibility
 
@@ -174,9 +192,9 @@ background worker never automatically claims STORED rows for processing.
 
 | Status     | claimBatch eligible | Worker dispatched | Notes                                          |
 | ---------- | ------------------- | ----------------- | ---------------------------------------------- |
-| RESERVED   | ✅                  | ✅                | Processed through ingestion pipeline           |
-| DOWNLOADED | ✅                  | ✅                | Processed through ingestion pipeline           |
-| ATTACHING  | ✅                  | ✅                | Processed through receipt attachment pipeline  |
+| RESERVED   | ✅                  | ✅                | Download, extraction and backend upload        |
+| DOWNLOADED | ✅                  | ✅                | Same-key backend upload retry                  |
+| ATTACHING  | ✅                  | ❌                | Legacy amount-dialog state; no longer produced |
 | STORED     | ❌                  | ❌                | Held; requires separate reconciliation process |
 
 **Why STORED is excluded:** Once a receipt is marked STORED, it has already been
@@ -222,5 +240,5 @@ Relevant implementation references:
 - `src/receipt-media/presentation/receipt-metrics-auth.guard.ts`
 - `src/receipt-media/presentation/receipt-metrics.controller.ts`
 - `src/receipt-media/application/capability.service.ts` (`reconstruct`)
-- `src/receipt-media/application/receipt-attachment.service.ts` (`attach`)
+- `src/receipt-media/application/receipt-attachment.service.ts` (`upload`)
 - `src/receipt-media/domain/object-storage.port.ts` (technical-delete boundary)

@@ -1,4 +1,10 @@
-/** WU14C composition root, extended by WU14E, ODD-3A, and ODD-3B: composes
+/** R2: the ingestion processor downloads the WhatsApp media, reads it with
+ * the vision pre-fill (RECEIPT_EXTRACTION over the shared LlmCoreModule
+ * seams) and uploads it to the backend through ReceiptAttachmentService; the
+ * S3 adapter, capability service and access controller below only serve the
+ * legacy chatbot-owned storage that R3 removes.
+ *
+ * WU14C composition root, extended by WU14E, ODD-3A, and ODD-3B: composes
  * the existing adapters (WU2B store, WU4B Meta client, WU5A S3 adapter), the
  * WU7/WU10C/WU11C application services, the WU8A processor, the WU6D1
  * authorizer, and the WU6D2 access controller behind validated
@@ -43,12 +49,17 @@ import { ConversationModule } from '../conversation/conversation.module';
 import type { ConversationStore } from '../conversation/domain/conversation-store';
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { DatabaseModule } from '../database/database.module';
+import { CostGuardService } from '../llm-agent/application/cost-guard.service';
+import {
+  GENERATE_TEXT,
+  type GenerateTextFn,
+} from '../llm-agent/infrastructure/generate-text.provider';
+import { LlmCoreModule } from '../llm-agent/infrastructure/llm-core.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../whatsapp/domain/whatsapp-sender.port';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
 import { CapabilityService } from './application/capability.service';
-import { ReceiptAmountRouterService } from './application/receipt-amount-router.service';
 import { ReceiptAttachmentService } from './application/receipt-attachment.service';
 import { ReceiptCleanupService } from './application/receipt-cleanup.service';
 import {
@@ -74,6 +85,11 @@ import {
   type MetaMediaClientConfig,
 } from './infrastructure/meta-media.client';
 import { PostgresReceiptMediaStore } from './infrastructure/postgres-receipt-media.store';
+import {
+  RECEIPT_EXTRACTION,
+  type ReceiptExtractionPort,
+} from './domain/receipt-extraction.port';
+import { LlmReceiptExtractionAdapter } from './infrastructure/llm-receipt-extraction.adapter';
 import {
   S3ObjectStorageAdapter,
   type S3ObjectStorageConfig,
@@ -285,7 +301,6 @@ class ReceiptMediaIngestionLifecycle
     private readonly config: ConfigService,
     private readonly store: PostgresReceiptMediaStore,
     private readonly processor: ReceiptIngestionProcessor,
-    private readonly attachment: ReceiptAttachmentService,
   ) {}
 
   /** Starts exactly once per coordinator instance — repeated and
@@ -311,7 +326,7 @@ class ReceiptMediaIngestionLifecycle
     );
     this.worker = new ReceiptMediaIngestionWorker(
       this.store,
-      new ReceiptProcessingDispatcher(this.processor, this.attachment),
+      new ReceiptProcessingDispatcher(this.processor),
       {
         // Stable per process-instance coordinator: one owner for every
         // claim this instance ever makes.
@@ -415,6 +430,7 @@ class ReceiptCleanupLifecycle
     ConversationModule,
     ChatbotApiModule,
     WhatsappSenderModule,
+    LlmCoreModule,
   ],
   controllers: [ReceiptMediaAccessController, ReceiptMetricsController],
   providers: [
@@ -489,54 +505,54 @@ class ReceiptCleanupLifecycle
       inject: [ConfigService, CONVERSATION_STORE, PostgresReceiptMediaStore],
     },
     {
-      provide: ReceiptAmountRouterService,
+      // R4 vision pre-fill: same GENERATE_TEXT seam, model and cost guard as
+      // the agent; it never confirms or rejects a payment (S1).
+      provide: RECEIPT_EXTRACTION,
       useFactory: (
-        conversations: ConversationStore,
-        store: PostgresReceiptMediaStore,
-      ): ReceiptAmountRouterService =>
-        new ReceiptAmountRouterService(conversations, store),
-      inject: [CONVERSATION_STORE, PostgresReceiptMediaStore],
+        generateTextFn: GenerateTextFn,
+        config: ConfigService,
+        costGuard: CostGuardService,
+      ): ReceiptExtractionPort =>
+        new LlmReceiptExtractionAdapter(
+          generateTextFn,
+          config.get<string>('llm.model') ?? '',
+          { costGuard },
+        ),
+      inject: [GENERATE_TEXT, ConfigService, CostGuardService],
     },
     {
+      // R2: the backend stores the receipt (S2); multipart upload keyed by
+      // the WhatsApp media id.
       provide: ReceiptAttachmentService,
       useFactory: (
         store: PostgresReceiptMediaStore,
         client: ChatbotApiClient,
-        config: ConfigService,
-        capability: CapabilityService,
       ): ReceiptAttachmentService =>
-        new ReceiptAttachmentService(
-          store,
-          client,
-          {
-            receiptMedia: {
-              publicBaseUrl:
-                config.get<string>('receiptMedia.publicBaseUrl') ?? '',
-            },
-          },
-          capability,
-        ),
-      inject: [
-        PostgresReceiptMediaStore,
-        CHATBOT_API_CLIENT,
-        ConfigService,
-        CapabilityService,
-      ],
+        new ReceiptAttachmentService(store, client),
+      inject: [PostgresReceiptMediaStore, CHATBOT_API_CLIENT],
     },
     {
       provide: ReceiptIngestionProcessor,
       useFactory: (
         meta: MetaMediaPort,
-        storage: ObjectStoragePort,
         store: PostgresReceiptMediaStore,
-        capability: CapabilityService,
+        extraction: ReceiptExtractionPort,
+        attachment: ReceiptAttachmentService,
+        conversations: ConversationStore,
       ): ReceiptIngestionProcessor =>
-        new ReceiptIngestionProcessor(meta, storage, store, capability),
+        new ReceiptIngestionProcessor(
+          meta,
+          store,
+          extraction,
+          attachment,
+          conversations,
+        ),
       inject: [
         META_MEDIA,
-        OBJECT_STORAGE_PORT,
         PostgresReceiptMediaStore,
-        CapabilityService,
+        RECEIPT_EXTRACTION,
+        ReceiptAttachmentService,
+        CONVERSATION_STORE,
       ],
     },
     {
@@ -583,10 +599,6 @@ class ReceiptCleanupLifecycle
       inject: [ConfigService],
     },
   ],
-  exports: [
-    ReceiptIngressService,
-    ReceiptAmountRouterService,
-    RECEIPT_TELEMETRY,
-  ],
+  exports: [ReceiptIngressService, RECEIPT_TELEMETRY],
 })
 export class ReceiptMediaModule {}
