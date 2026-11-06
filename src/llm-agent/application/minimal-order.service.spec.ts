@@ -1622,6 +1622,152 @@ describe('MinimalOrderService', () => {
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
+  it('a SÍ on the re-presented prices-changed summary places the order at the new prices', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    h.setPrice(1600);
+    const changed = await yes(h);
+    expect(changed?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
+    // The stored cart now carries the prices the customer was shown; the
+    // pickup choice survives because it ignores prices.
+    expect(await h.minimalCart()).toMatchObject({
+      items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1600 }],
+      expectedTotalCents: 3200,
+      shipping: { mode: 'pickup' },
+    });
+    changed?.onSent?.();
+    const placed = await yes(h, 'wamid.o3');
+    expect(placed?.reply).toContain('folio B-0042');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({
+      sale: {
+        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1600 }],
+        expectedTotalCents: 3200,
+        shipping: { mode: 'pickup' },
+      },
+    });
+  });
+
+  it('a price change before the first summary is stored so its SÍ places the order', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    h.setPrice(1600);
+    const offer = await offerOrder(h);
+    expect(offer.reply).toContain('Total de productos: $32.00 MXN');
+    await yes(h);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({ sale: { expectedTotalCents: 3200 } });
+  });
+
+  it('a cart edit racing the re-price loses the CAS like any cart write and creates nothing', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    h.setPrice(1600);
+    const before = await h.minimalCart();
+    const commit = h.store.commitMinimalCart.bind(h.store);
+    jest
+      .spyOn(h.store, 'commitMinimalCart')
+      .mockImplementationOnce(() => Promise.resolve(false))
+      .mockImplementation(commit);
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified,
+    });
+    expect(h.store.commitMinimalCart).toHaveBeenCalledTimes(1);
+    expect(await h.minimalCart()).toEqual(before);
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    // Not a dead end: asking again re-prices and the next SÍ places it.
+    const offer = await offerOrder(h, 'wamid.again');
+    expect(offer.reply).toContain('Total de productos: $32.00 MXN');
+    await yes(h, 'wamid.again-yes');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({ sale: { expectedTotalCents: 3200 } });
+  });
+
+  it('a delivery quote pinned to the old prices is re-quoted in the same turn', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await shippingRecord(h);
+    await offerOrder(h);
+    h.setPrice(1600);
+    h.quotes.enqueue({
+      quoteId: 'quote-2',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      zoneStatus: 'CARRIER_ONLY',
+      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
+      costCents: 5000,
+      creditCents: 0,
+      customerChargeCents: 5000,
+      currency: 'MXN',
+      eta: { days: 2, reason: null },
+    });
+    const changed = await yes(h);
+    expect(changed?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
+    expect(changed?.reply).toContain('Total a pagar: $82.00 MXN');
+    expect(h.quotes.calls).toHaveLength(1);
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    changed?.onSent?.();
+    await yes(h, 'wamid.o3');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({
+      sale: {
+        items: [{ unitPriceCents: 1600 }],
+        expectedTotalCents: 8200,
+        shipping: { quoteId: 'quote-2' },
+      },
+    });
+  });
+
+  it('a failed re-quote after a price change asks for shipping again and a new quote then works', async () => {
+    const h = setup({ shipping: true });
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await shippingRecord(h);
+    await offerOrder(h);
+    h.setPrice(1600);
+    // Nothing queued: the fake shipping client rejects the re-quote.
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY,
+    });
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    expect(await h.minimalCart()).toMatchObject({
+      items: [{ unitPriceCents: 1600 }],
+      expectedTotalCents: 3200,
+    });
+    h.quotes.enqueue({
+      quoteId: 'quote-3',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      zoneStatus: 'CARRIER_ONLY',
+      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
+      costCents: 5000,
+      creditCents: 0,
+      customerChargeCents: 5000,
+      currency: 'MXN',
+      eta: { days: 2, reason: null },
+    });
+    expect(await h.shipping.quote(SENDER)).toMatchObject({ kind: 'quoted' });
+    await offerOrder(h, 'wamid.quoted');
+    await yes(h, 'wamid.quoted-yes');
+    expect(
+      (h.api.createCheckout.mock.calls[0] as unknown as [unknown])[0],
+    ).toMatchObject({
+      sale: { expectedTotalCents: 8200, shipping: { quoteId: 'quote-3' } },
+    });
+  });
+
   it('reoffers delivery confirmation without selling when the delivery draft changed after the summary', async () => {
     const h = setup();
     await h.seedCart();

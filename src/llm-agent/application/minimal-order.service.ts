@@ -401,10 +401,13 @@ export class MinimalOrderService {
       : { reply: MINIMAL_ORDER_AMBIGUOUS_REPLY };
   }
 
-  /** Fresh quote + exact confirmed draft + destination freshness. */
+  /**
+   * Fresh quote + exact confirmed draft + destination freshness. Fresh prices
+   * are stored first so the summary they produce can be placed (L16).
+   */
   private async freshOrder(senderId: string): Promise<FreshOrder> {
     try {
-      const quote = await this.cart.view(senderId);
+      const { quote, repriced } = await this.cart.refreshPrices(senderId);
       const confirmedDraft = await this.checkout.confirmedDraft(senderId);
       const verdict = evaluateMinimalOrder({
         confirmedDraft,
@@ -429,8 +432,29 @@ export class MinimalOrderService {
       }
       const raw = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
-      const shipping =
+      let shipping =
         cart === null ? null : this.currentShipping(cart, verdict.snapshot);
+      if (
+        shipping === null &&
+        repriced &&
+        cart?.shipping !== undefined &&
+        !isMinimalPickup(cart.shipping) &&
+        cart.shipping.quoteId !== null
+      ) {
+        // The delivery quote was pinned to the old prices and its credit may
+        // change: re-quote once, like the EXPIRED/MISMATCH checkout path.
+        if ((await this.shipping.quote(senderId)).kind !== 'quoted')
+          return { ok: false, reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY };
+        const requoted = parseMinimalCart(
+          (await this.store.get(senderId))?.data.minimalCart,
+        );
+        shipping =
+          requoted === null
+            ? null
+            : this.currentShipping(requoted, verdict.snapshot);
+        if (shipping === null)
+          return { ok: false, reply: MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY };
+      }
       if (shipping === null)
         return { ok: false, reply: MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY };
       return { ok: true, snapshot: { ...verdict.snapshot, shipping } };

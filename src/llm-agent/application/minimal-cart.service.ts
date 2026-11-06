@@ -133,6 +133,67 @@ export class MinimalCartService {
     }
   }
 
+  /**
+   * Quote the stored lines and, when only their prices or total changed,
+   * store the fresh unit prices and total in one CAS, keeping shipping and
+   * every other field; never retry. A cart with an outstanding order key is
+   * never rewritten. `repriced` means this call committed a rewrite.
+   */
+  async refreshPrices(
+    senderId: string,
+  ): Promise<{ quote: MinimalCartResult; repriced: boolean }> {
+    try {
+      // Keep the EXACT raw slot for CAS, never the zod-parsed reconstruction.
+      const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
+      const cart = parseMinimalCart(raw);
+      if (!cart)
+        return { quote: { ok: false, error: 'invalid_cart' }, repriced: false };
+      const quote = await this.quote(senderId, cart.items);
+      if (
+        !quote.ok ||
+        cart.idempotencyKey !== '' ||
+        (cart.items.every(
+          (line, index) =>
+            line.unitPriceCents === quote.items[index].unitPriceCents,
+        ) &&
+          (cart.expectedTotalCents === undefined ||
+            cart.expectedTotalCents === quote.totalCents))
+      )
+        return { quote, repriced: false };
+      const next: MinimalCartState = structuredClone({
+        ...cart,
+        items: quote.items.map(
+          ({ productId, variantId, quantity, unitPriceCents }) => ({
+            productId,
+            ...(variantId ? { variantId } : {}),
+            quantity,
+            unitPriceCents,
+          }),
+        ),
+        expectedTotalCents: quote.totalCents,
+      });
+      if (!this.store.commitMinimalCart)
+        return {
+          quote: { ok: false, error: 'cart_unavailable' },
+          repriced: false,
+        };
+      const saved = await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+      return saved
+        ? { quote, repriced: true }
+        : { quote: { ok: false, error: 'cart_changed' }, repriced: false };
+    } catch {
+      return {
+        quote: { ok: false, error: 'cart_unavailable' },
+        repriced: false,
+      };
+    }
+  }
+
   /** Quantity is the desired TOTAL for this line, not an increment; zero removes. */
   async setItem(
     senderId: string,

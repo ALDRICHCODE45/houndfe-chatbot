@@ -917,4 +917,86 @@ describe('Minimal cart public operations', () => {
     expect(f.store.commitMinimalCart).toHaveBeenCalledTimes(1);
     expect(await f.store.get(SENDER)).toBeNull();
   });
+
+  describe('refreshPrices', () => {
+    const seed = async (
+      f: ReturnType<typeof setup>,
+      overrides: Record<string, unknown> = {},
+    ) => {
+      await f.store.commitMinimalCart(
+        SENDER,
+        undefined,
+        {
+          items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 900 }],
+          idempotencyKey: '',
+          expectedTotalCents: 1700,
+          shipping,
+          ...overrides,
+        },
+        SHIPPING_AT,
+      );
+      return (await f.store.get(SENDER))?.data.minimalCart;
+    };
+
+    it('stores fresh prices of the same lines in one CAS and keeps shipping', async () => {
+      const f = setup();
+      await seed(f);
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      expect(await f.service.refreshPrices(SENDER)).toMatchObject({
+        repriced: true,
+        quote: { ok: true, totalCents: 1900 },
+      });
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect((await f.store.get(SENDER))?.data.minimalCart).toEqual({
+        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1000 }],
+        idempotencyKey: '',
+        expectedTotalCents: 1900,
+        shipping,
+      });
+      expect(await f.service.refreshPrices(SENDER)).toMatchObject({
+        repriced: false,
+        quote: { ok: true, totalCents: 1900 },
+      });
+      expect(commit).toHaveBeenCalledTimes(1);
+    });
+
+    it('rewrites a promotion-only total change', async () => {
+      const f = setup();
+      await seed(f, {
+        items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1000 }],
+      });
+      expect(await f.service.refreshPrices(SENDER)).toMatchObject({
+        repriced: true,
+      });
+      expect((await f.store.get(SENDER))?.data.minimalCart).toMatchObject({
+        expectedTotalCents: 1900,
+      });
+    });
+
+    it('holds a lost CAS without retry and reports cart_changed', async () => {
+      const f = setup();
+      const before = await seed(f);
+      jest.spyOn(f.store, 'commitMinimalCart').mockResolvedValue(false);
+      expect(await f.service.refreshPrices(SENDER)).toEqual({
+        repriced: false,
+        quote: { ok: false, error: 'cart_changed' },
+      });
+      expect(f.store.commitMinimalCart).toHaveBeenCalledTimes(1);
+      expect((await f.store.get(SENDER))?.data.minimalCart).toEqual(before);
+    });
+
+    it('never rewrites a cart with an outstanding order key', async () => {
+      const f = setup();
+      const before = await seed(f, {
+        idempotencyKey: '44444444-4444-4444-8444-444444444444',
+      });
+      const commit = jest.spyOn(f.store, 'commitMinimalCart');
+      expect(await f.service.refreshPrices(SENDER)).toMatchObject({
+        repriced: false,
+        quote: { ok: true, totalCents: 1900 },
+      });
+      expect(commit).not.toHaveBeenCalled();
+      expect((await f.store.get(SENDER))?.data.minimalCart).toEqual(before);
+    });
+  });
 });
