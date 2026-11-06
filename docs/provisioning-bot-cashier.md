@@ -20,19 +20,19 @@ The bot issues `POST /chatbot-api/checkouts` (minimal order placement),
 and the other nine endpoints under a service credential. The
 `ServiceCredential` issued to the bot cashier must carry **11 scopes**:
 
-| # | Scope | Used by |
-|---|-------|---------|
-| 1 | `catalog:read` | `searchCatalog`, `checkStock` |
-| 2 | `pricing:evaluate` | `evaluateCart` |
-| 3 | `customers:read` | `getCustomerByPhone`, `getOrderHistory` |
-| 4 | `customers:write` | `upsertCustomer`, `createCheckout`, `getCheckoutStatus` |
-| 5 | `sales:create` | `createSale`, `createCheckout`, `getCheckoutStatus` |
-| 6 | `sales:write` | `attachReceipt`, `updateDelivery` |
-| 7 | `payment-details:read` | `getPaymentDetails` (new in this slice) |
-| 8 | `shipping:quote` | `createShippingQuote` (`POST /chatbot-api/shipping/quotes`) |
-| 9 | `human-decisions:create` | RESTOCK, EXPIRATION and DELIVERY_ZONE intake (`POST /chatbot-api/human-decisions`) |
-| 10 | `human-decisions:read` | decision poll (`GET /chatbot-api/human-decisions/:id`) |
-| 11 | `human-decisions:ack` | decision ACK (`POST /chatbot-api/human-decisions/:id/application-outcome`) |
+| #   | Scope                    | Used by                                                                            |
+| --- | ------------------------ | ---------------------------------------------------------------------------------- |
+| 1   | `catalog:read`           | `searchCatalog`, `checkStock`                                                      |
+| 2   | `pricing:evaluate`       | `evaluateCart`                                                                     |
+| 3   | `customers:read`         | `getCustomerByPhone`, `getOrderHistory`                                            |
+| 4   | `customers:write`        | `upsertCustomer`, `createCheckout`, `getCheckoutStatus`                            |
+| 5   | `sales:create`           | `createSale`, `createCheckout`, `getCheckoutStatus`                                |
+| 6   | `sales:write`            | `attachReceipt`, `updateDelivery`                                                  |
+| 7   | `payment-details:read`   | `getPaymentDetails` (new in this slice)                                            |
+| 8   | `shipping:quote`         | `createShippingQuote` (`POST /chatbot-api/shipping/quotes`)                        |
+| 9   | `human-decisions:create` | RESTOCK, EXPIRATION and DELIVERY_ZONE intake (`POST /chatbot-api/human-decisions`) |
+| 10  | `human-decisions:read`   | decision poll (`GET /chatbot-api/human-decisions/:id`)                             |
+| 11  | `human-decisions:ack`    | decision ACK (`POST /chatbot-api/human-decisions/:id/application-outcome`)         |
 
 Scopes 8–11 came after this slice: `shipping:quote` with the backend shipping
 quotes (docs/contracts/shipping-quotes.md) and the `human-decisions:*` scopes
