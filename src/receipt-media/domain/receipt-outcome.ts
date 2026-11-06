@@ -6,6 +6,7 @@
  * the 24 h WhatsApp window is open, or `OUTSIDE_WINDOW` (not delivered, no
  * retry loop) when it closed. No time horizon: a review may take days. */
 import type { ReceiptOutcome } from '../../chatbot-api/domain/dtos/receipt-outcome.dto';
+import type { CustomerInboundObservationStore } from '../../human-decisions/domain/customer-inbound-observation-store.port';
 import type { ReceiptMediaOutboxRow } from './receipt-media.types';
 
 export interface ReceiptOutcomePollPolicy {
@@ -103,4 +104,46 @@ export function outcomeTemplate(
             : { ...folioArgs, reason: outcome.customerReason },
       };
   }
+}
+
+/** WhatsApp customer service window. */
+const CUSTOMER_WINDOW_MS = 86_400_000;
+
+/** The 24 h window rule shared by the outcome poller (commit time) and the
+ * notification worker (send time): open only when the latest recorded
+ * inbound message is at most 24 h old. Rejects when the read fails, so the
+ * send-time caller can retry instead of treating it as closed. */
+export async function readCustomerWindowOpen(
+  observations: Pick<CustomerInboundObservationStore, 'readLatest'>,
+  senderId: string,
+  receivingPhoneNumberId: string,
+  now: Date,
+): Promise<boolean> {
+  const nowMs = now.getTime();
+  const latest = await observations.readLatest(
+    senderId,
+    receivingPhoneNumberId,
+  );
+  if (latest.kind !== 'found') return false;
+  const providerMs = Number(latest.observation.providerTimestampSeconds) * 1000;
+  return (
+    Number.isSafeInteger(providerMs) &&
+    providerMs <= nowMs &&
+    nowMs < providerMs + CUSTOMER_WINDOW_MS
+  );
+}
+
+/** Commit-time variant: a failed read counts as closed. */
+export function isCustomerWindowOpen(
+  observations: Pick<CustomerInboundObservationStore, 'readLatest'>,
+  senderId: string,
+  receivingPhoneNumberId: string,
+  now: Date,
+): Promise<boolean> {
+  return readCustomerWindowOpen(
+    observations,
+    senderId,
+    receivingPhoneNumberId,
+    now,
+  ).catch(() => false);
 }

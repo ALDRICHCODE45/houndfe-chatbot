@@ -10,7 +10,10 @@
  * expiry (at-least-once). Retryable failures reschedule; the third failed
  * attempt becomes `FAILED` and emits the local exhaustion alert seam.
  * Shutdown stops claims, wakes polling, and drains active sends — the port
- * has no AbortSignal, so no send cancellation is pretended. */
+ * has no AbortSignal, so no send cancellation is pretended.
+ * Human-outcome intents (R5) may wait in the queue: the 24 h window is
+ * re-checked right before sending; closed means not delivered, no retry,
+ * while a failed window read is retried like a failed send. */
 import {
   Injectable,
   OnApplicationBootstrap,
@@ -42,6 +45,25 @@ export interface NotificationStoreSeam {
     leaseExpiresAt: Date,
   ): Promise<'rescheduled' | 'exhausted' | 'lost'>;
 }
+
+/** R5 send-time window gate for the human-outcome intents. */
+export interface OutcomeWindowSeam {
+  /** Same inbound-observation evidence as the outcome poller. Rejects when
+   * the read fails: that is transient, not a closed window. */
+  isOpen(recipientId: string): Promise<boolean>;
+  /** Fenced terminal mark: the intent is not delivered and never retried. */
+  markNotDelivered(
+    id: string,
+    owner: string,
+    leaseExpiresAt: Date,
+  ): Promise<boolean>;
+}
+
+const OUTCOME_TEMPLATE_KEYS: ReadonlySet<ReceiptTemplateKey> = new Set([
+  'RECEIPT_PAYMENT_CONFIRMED',
+  'RECEIPT_PAYMENT_PARTIAL',
+  'RECEIPT_PAYMENT_REJECTED',
+]);
 
 export interface NotificationAlertSeam {
   onExhausted(intent: ReceiptMediaOutboxRow): Promise<void>;
@@ -171,6 +193,7 @@ export class ReceiptMediaNotificationWorker
     private readonly sender: Pick<WhatsappSenderPort, 'sendText'>,
     private readonly alert: NotificationAlertSeam,
     options: NotificationWorkerOptions,
+    private readonly outcomeWindow?: OutcomeWindowSeam,
   ) {
     const { owner, pollIntervalMs, batchSize, maxConcurrency } = options;
     if (
@@ -270,9 +293,40 @@ export class ReceiptMediaNotificationWorker
       : null;
   }
 
+  /** Fenced requeue; the third failed attempt alerts exhaustion. */
+  private async retry(
+    intent: ReceiptMediaOutboxRow,
+    lease: Date,
+  ): Promise<void> {
+    const outcome = await this.store
+      .reschedule(intent.id, this.owner, RETRY_DELAY_MS, lease)
+      .catch(() => 'lost' as const);
+    if (outcome === 'exhausted')
+      await this.alert.onExhausted(intent).catch(() => undefined);
+  }
+
   private async deliver(intent: ReceiptMediaOutboxRow): Promise<void> {
     const lease = this.leaseToken(intent);
     if (lease === null) return;
+    if (
+      this.outcomeWindow !== undefined &&
+      OUTCOME_TEMPLATE_KEYS.has(intent.templateKey)
+    ) {
+      let open: boolean;
+      try {
+        open = await this.outcomeWindow.isOpen(intent.recipientId);
+      } catch {
+        // A failed read proves nothing about the window: retry like a
+        // transient send failure, within the same attempt cap.
+        return this.retry(intent, lease);
+      }
+      if (!open) {
+        await this.outcomeWindow
+          .markNotDelivered(intent.id, this.owner, lease)
+          .catch(() => false);
+        return;
+      }
+    }
     let wamid: string;
     try {
       ({ providerMessageId: wamid } = await this.sender.sendText({
@@ -280,12 +334,7 @@ export class ReceiptMediaNotificationWorker
         text: renderNotificationText(intent),
       }));
     } catch {
-      const outcome = await this.store
-        .reschedule(intent.id, this.owner, RETRY_DELAY_MS, lease)
-        .catch(() => 'lost' as const);
-      if (outcome === 'exhausted')
-        await this.alert.onExhausted(intent).catch(() => undefined);
-      return;
+      return this.retry(intent, lease);
     }
     // Fenced CAS after provider success only; a loser (false) mutates
     // nothing further — at-least-once replay covers the unmarked send.

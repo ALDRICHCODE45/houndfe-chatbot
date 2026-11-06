@@ -1962,6 +1962,8 @@ describe('MinimalOrderService', () => {
     ],
     [PACKAGING_DATA_MISSING, 422, MINIMAL_ORDER_PACKAGING_MISSING_REPLY],
     [SHIPPING_QUOTE_UNAVAILABLE, 422, MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY],
+    // G3: a 503 with this code is still a definite "nothing written".
+    [SHIPPING_QUOTE_UNAVAILABLE, 503, MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY],
   ])(
     '[S6] %s gives its specific reply, creates nothing and rotates the key',
     async (code, status, reply) => {
@@ -2020,6 +2022,107 @@ describe('MinimalOrderService', () => {
       });
     },
   );
+
+  describe('G3: SHIPPING_QUOTE_* after an earlier uncertain attempt', () => {
+    const quoteRejection = (code: string, status: number) =>
+      new ChatbotApiError(code, status, { error: code }, code);
+    /** Attempt 1 times out (key kept), then the same summary is offered again. */
+    const uncertainThenReoffer = async () => {
+      const h = setup({ shipping: true });
+      await h.seedCart();
+      await confirmSavedDelivery(h);
+      await shippingRecord(h);
+      await offerOrder(h);
+      h.api.createCheckout.mockImplementationOnce(() =>
+        Promise.reject(new UpstreamError('timeout', 503)),
+      );
+      expect(await yes(h)).toEqual({
+        reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
+      });
+      const key = (h.api.createCheckout.mock.calls[0] as unknown[])[1];
+      await offerOrder(h, 'wamid.o3');
+      return { h, key };
+    };
+
+    it('status shows no sale: clears the key and re-quotes for a fresh SÍ', async () => {
+      const { h, key } = await uncertainThenReoffer();
+      h.api.createCheckout.mockRejectedValueOnce(
+        quoteRejection(SHIPPING_QUOTE_EXPIRED, 409),
+      );
+      h.quotes.enqueue({
+        quoteId: 'quote-2',
+        expiresAt: new Date(Date.now() + 60000).toISOString(),
+        zoneStatus: 'CARRIER_ONLY',
+        option: { carrier: 'Skydropx', service: 'Ground', etaDays: 2 },
+        costCents: 7000,
+        creditCents: 0,
+        customerChargeCents: 7000,
+        currency: 'MXN',
+        eta: { days: 2, reason: null },
+      });
+      const requoted = await yes(h, 'wamid.o4');
+      expect((h.api.createCheckout.mock.calls[1] as unknown[])[1]).toBe(key);
+      expect(h.api.getCheckoutStatus).toHaveBeenLastCalledWith(key);
+      expect(requoted?.reply).toContain(MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY);
+      expect(h.quotes.calls).toHaveLength(1);
+      expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
+      // The re-quoted summary places under a NEW key, never held.
+      requoted?.onSent?.();
+      const placed = await yes(h, 'wamid.o5');
+      expect(placed?.reply).toContain('folio B-0042');
+      const third = (h.api.createCheckout.mock.calls[2] as unknown[])[1];
+      expect(third).not.toBe(key);
+    });
+
+    it('status shows no sale: UNAVAILABLE clears the key with its specific reply', async () => {
+      const { h } = await uncertainThenReoffer();
+      h.api.createCheckout.mockRejectedValueOnce(
+        quoteRejection(SHIPPING_QUOTE_UNAVAILABLE, 503),
+      );
+      expect(await yes(h, 'wamid.o4')).toEqual({
+        reply: MINIMAL_ORDER_SHIPPING_UNAVAILABLE_REPLY,
+      });
+      expect(await h.minimalCart()).toMatchObject({
+        items: [{ productId: PRODUCT, quantity: 2 }],
+        idempotencyKey: '',
+      });
+    });
+
+    it('status shows a sale under the key: completes it instead', async () => {
+      const { h, key } = await uncertainThenReoffer();
+      h.api.createCheckout.mockImplementationOnce(() => {
+        h.api.getCheckoutStatus.mockResolvedValueOnce({
+          status: 'succeeded',
+          checkout: { status: 'created', sale: placedSale() },
+        });
+        return Promise.reject(quoteRejection(SHIPPING_QUOTE_UNAVAILABLE, 503));
+      });
+      const reply = await yes(h, 'wamid.o4');
+      expect(h.api.getCheckoutStatus).toHaveBeenLastCalledWith(key);
+      expect(reply?.reply).toContain('folio B-0042');
+      expect(h.quotes.calls).toHaveLength(0);
+      expect(await h.minimalCart()).toMatchObject({
+        items: [],
+        placedSale: { saleId: SALE },
+      });
+    });
+
+    it('a failed status read keeps the key and stays unresolved', async () => {
+      const { h, key } = await uncertainThenReoffer();
+      h.api.createCheckout.mockImplementationOnce(() => {
+        h.api.getCheckoutStatus.mockRejectedValueOnce(new Error('down'));
+        return Promise.reject(quoteRejection(SHIPPING_QUOTE_EXPIRED, 409));
+      });
+      expect(await yes(h, 'wamid.o4')).toEqual({
+        reply: MINIMAL_ORDER_UNRESOLVED_REPLY,
+      });
+      expect(h.quotes.calls).toHaveLength(0);
+      expect(await h.minimalCart()).toMatchObject({
+        idempotencyKey: key,
+        idempotencyAttempts: 2,
+      });
+    });
+  });
 
   it('[S6] a failed re-quote falls back to asking for a new quote', async () => {
     const h = setup({ shipping: true });

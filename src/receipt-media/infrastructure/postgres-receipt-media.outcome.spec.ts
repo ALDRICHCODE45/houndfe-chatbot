@@ -11,6 +11,7 @@ import {
 import { Pool } from 'pg';
 import type { ReceiptOutcomeCommitInput } from '../domain/receipt-outcome';
 import { PostgresReceiptMediaStore } from './postgres-receipt-media.store';
+import { PostgresReceiptOutboxStore } from './postgres-receipt-outbox.store';
 
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
@@ -248,6 +249,56 @@ ddescribe('R5 receipt outcome store (Testcontainers)', () => {
     );
     expect(rows[0].outcome_delivery).toBe('OUTSIDE_WINDOW');
     await expect(store.listOutcomeDue(10, POLICY)).resolves.toEqual([]);
+  });
+
+  it('G2: marks a queued outcome intent not delivered once the window closed before send', async () => {
+    const { id } = await attached();
+    await store.commitOutcome(commit(id));
+    const outbox = new PostgresReceiptOutboxStore(pool);
+    const claimed = await outbox.claimBatch(10, 'notifier');
+    const outcome = claimed.find(
+      (row) => row.templateKey === 'RECEIPT_PAYMENT_CONFIRMED',
+    )!;
+    const pending = claimed.find(
+      (row) => row.templateKey === 'RECEIPT_ATTACHED_PENDING',
+    )!;
+    // Only outcome intents can be closed this way, and only by the lease holder.
+    await expect(
+      outbox.markNotDelivered(pending.id, 'notifier', pending.leaseExpiresAt!),
+    ).resolves.toBe(false);
+    await expect(
+      outbox.markNotDelivered(outcome.id, 'other', outcome.leaseExpiresAt!),
+    ).resolves.toBe(false);
+    await expect(
+      outbox.markNotDelivered(outcome.id, 'notifier', outcome.leaseExpiresAt!),
+    ).resolves.toBe(true);
+    const intent = (
+      await pool.query<Record<string, unknown>>(
+        'SELECT status, lease_owner, provider_message_id FROM receipt_media_outbox WHERE id = $1',
+        [outcome.id],
+      )
+    ).rows[0];
+    expect(intent).toEqual({
+      status: 'FAILED',
+      lease_owner: null,
+      provider_message_id: null,
+    });
+    const receipt = (
+      await pool.query<{ outcome_delivery: string }>(
+        'SELECT outcome_delivery FROM receipt_media WHERE id = $1',
+        [id],
+      )
+    ).rows[0];
+    expect(receipt.outcome_delivery).toBe('OUTSIDE_WINDOW');
+    // Terminal: never claimed again, a replayed mark is fenced.
+    await pool.query(
+      "UPDATE receipt_media_outbox SET next_attempt_at = now() - interval '1h'",
+    );
+    const again = await outbox.claimBatch(10, 'notifier');
+    expect(again.map((row) => row.id)).not.toContain(outcome.id);
+    await expect(
+      outbox.markNotDelivered(outcome.id, 'notifier', outcome.leaseExpiresAt!),
+    ).resolves.toBe(false);
   });
 
   it('fences malformed commits without mutation', async () => {

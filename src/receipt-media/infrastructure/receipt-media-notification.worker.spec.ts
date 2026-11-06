@@ -352,6 +352,96 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(h.onExhausted).not.toHaveBeenCalled();
   });
 
+  describe('G2: outcome intents re-check the 24 h window at send time', () => {
+    const gated = (open: boolean | Error, row = intent()) => {
+      const h = harness([[row]]);
+      const isOpen = jest.fn((recipientId: string) => {
+        void recipientId;
+        return open instanceof Error
+          ? Promise.reject(open)
+          : Promise.resolve(open);
+      });
+      const markNotDelivered = jest.fn<
+        Promise<boolean>,
+        [string, string, Date]
+      >(() => Promise.resolve(true));
+      const worker = new ReceiptMediaNotificationWorker(
+        {
+          claimBatch: h.claimBatch,
+          markSent: h.markSent,
+          reschedule: h.reschedule,
+        },
+        { sendText: h.sendText },
+        { onExhausted: h.onExhausted },
+        { owner: 'wn', pollIntervalMs: 1_000, batchSize: 5, maxConcurrency: 2 },
+        { isOpen, markNotDelivered },
+      );
+      live.add(worker);
+      return { ...h, worker, isOpen, markNotDelivered };
+    };
+
+    it.each([
+      'RECEIPT_PAYMENT_CONFIRMED',
+      'RECEIPT_PAYMENT_PARTIAL',
+      'RECEIPT_PAYMENT_REJECTED',
+    ] as const)('sends %s when the window is still open', async (key) => {
+      const h = gated(true, intent({ templateKey: key }));
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.isOpen).toHaveBeenCalledWith('+525500000000');
+      expect(h.sendText).toHaveBeenCalledTimes(1);
+      expect(h.markSent).toHaveBeenCalledWith('i1', 'wn', 'wamid.OK', LEASE);
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+    });
+
+    it('marks the intent not delivered (terminal) when the window is confirmed closed', async () => {
+      const h = gated(false);
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.sendText).not.toHaveBeenCalled();
+      expect(h.markNotDelivered).toHaveBeenCalledWith('i1', 'wn', LEASE);
+      expect(h.markSent).not.toHaveBeenCalled();
+      expect(h.reschedule).not.toHaveBeenCalled();
+      expect(h.onExhausted).not.toHaveBeenCalled();
+    });
+
+    it('reschedules like a transient send failure when the window read fails', async () => {
+      const h = gated(new Error('db'));
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.sendText).not.toHaveBeenCalled();
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+      expect(h.reschedule).toHaveBeenCalledWith(
+        'i1',
+        'wn',
+        RETRY_DELAY_MS,
+        LEASE,
+      );
+      expect(h.onExhausted).not.toHaveBeenCalled();
+    });
+
+    it('alerts exhaustion when a failing window read hits the attempt cap', async () => {
+      const h = gated(new Error('db'));
+      h.reschedule.mockResolvedValueOnce('exhausted');
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+      expect(h.onExhausted).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not consult the window for inbound-reply intents', async () => {
+      const h = gated(
+        false,
+        intent({ templateKey: 'RECEIPT_ATTACHED_PENDING', templateArgs: {} }),
+      );
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.isOpen).not.toHaveBeenCalled();
+      expect(h.sendText).toHaveBeenCalledTimes(1);
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+    });
+  });
+
   it('carries no LLM or AgentRunner authority', () => {
     const source = readFileSync(
       join(__dirname, 'receipt-media-notification.worker.ts'),

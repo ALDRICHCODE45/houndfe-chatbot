@@ -398,6 +398,7 @@ ddescribe('PostgresReceiptOutboxStore (WU14A, Testcontainers)', () => {
     ).toEqual([
       'claimBatch',
       'constructor',
+      'markNotDelivered',
       'markSent',
       'reschedule',
       'withTx',

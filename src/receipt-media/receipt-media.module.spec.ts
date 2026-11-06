@@ -112,6 +112,28 @@ type OutboxPool = {
   queriesAfterEnd: () => number;
 };
 
+/** G2: the customer wrote within the 24 h window, so outcome intents send. */
+const openWindowQuery = (text: unknown, params?: unknown[]) =>
+  Promise.resolve(
+    typeof text === 'string' &&
+      text.includes('FROM customer_inbound_observations')
+      ? {
+          rows: [
+            {
+              receivingPhoneNumberId: params?.[1],
+              senderId: params?.[0],
+              messageId: 'wamid.inbound',
+              providerTimestampSeconds: String(
+                Math.floor(Date.now() / 1000) - 60,
+              ),
+              observedAt: new Date(Date.now() - 60_000).toISOString(),
+            },
+          ],
+          rowCount: 1,
+        }
+      : { rows: [], rowCount: 0 },
+  );
+
 const makeOutboxPool = (
   batches: Array<Record<string, unknown>[]> = [],
   opts: { claimGate?: Promise<void> } = {},
@@ -170,7 +192,7 @@ const makeOutboxPool = (
   };
   const client = { query: jest.fn(clientQuery), release: jest.fn() };
   const pool = {
-    query: jest.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+    query: jest.fn(openWindowQuery),
     connect: jest.fn(() => Promise.resolve(client)),
     end: jest.fn(() => {
       sequence.push('end');
@@ -915,7 +937,12 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         expect(outbox.marks).toEqual(['wamid.OK']);
         // Only notification-drain SQL ran: no ingestion storage writes and
         // no outbox intent production (no INSERT into the outbox table).
-        expect(outbox.pool.query).not.toHaveBeenCalled();
+        // The one pool read is the G2 send-time 24 h window check.
+        expect(outbox.pool.query).toHaveBeenCalledTimes(1);
+        expect(outbox.pool.query).toHaveBeenCalledWith(
+          expect.stringContaining('FROM customer_inbound_observations'),
+          ['+525500000000', '1'],
+        );
         expect(
           outbox.sequence.filter(
             (entry) => entry === 'insert' || entry === 'other',

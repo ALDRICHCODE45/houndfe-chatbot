@@ -138,6 +138,19 @@ const KEEPING_ERROR_CODES: ReadonlySet<string> = new Set([
   'CHECKOUT_RETRY_REQUIRED',
 ]);
 
+/** Checkout errors after which the backend wrote nothing (contract). */
+const QUOTE_REJECTION_CODES: ReadonlySet<string> = new Set([
+  SHIPPING_QUOTE_EXPIRED,
+  SHIPPING_QUOTE_MISMATCH,
+  SHIPPING_QUOTE_ALREADY_USED,
+  SHIPPING_QUOTE_NOT_FOUND,
+  SHIPPING_QUOTE_UNAVAILABLE,
+]);
+const isQuoteRejection = (error: unknown): boolean =>
+  error instanceof ChatbotApiError &&
+  error.errorCode !== null &&
+  QUOTE_REJECTION_CODES.has(error.errorCode);
+
 const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 
 type FreshOrder =
@@ -151,6 +164,8 @@ type FreshOrder =
  */
 function classifyFailure(error: unknown): 'rotate' | 'keep' {
   if (!(error instanceof ChatbotApiError)) return 'keep';
+  // The backend writes nothing after any SHIPPING_QUOTE_* error, even a 503.
+  if (isQuoteRejection(error)) return 'rotate';
   if (error.errorCode !== null && KEEPING_ERROR_CODES.has(error.errorCode)) {
     return 'keep';
   }
@@ -336,7 +351,9 @@ export class MinimalOrderService {
           };
     }
     const reply = await this.place(input.senderId, fresh.snapshot);
-    if (reply === MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY && !recovery.outstanding)
+    // This reply only follows a cleared key (first attempt, or a later one
+    // whose earlier attempt the status read resolved), so re-quoting is safe.
+    if (reply === MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY)
       return this.requote(input.senderId, input.inboundEvent);
     return {
       reply:
@@ -789,11 +806,18 @@ export class MinimalOrderService {
           : undefined;
     } catch (error) {
       const code = error instanceof ChatbotApiError ? error.errorCode : null;
-      if (code === SHIPPING_QUOTE_ALREADY_USED) {
-        // The quote backs another sale (no saleId): it may be our own earlier
-        // attempt, so the stored key is checked before anything else.
-        const own = await this.ownSale(keyed.idempotencyKey);
-        if (own !== null)
+      // A SHIPPING_QUOTE_* error proves THIS call wrote nothing. After an
+      // earlier uncertain attempt (or for ALREADY_USED, where the quote may
+      // back our own sale) the key is read first: a sale under it is ours to
+      // complete; a confirmed absence lets the key be cleared below.
+      let earlierResolved = false;
+      if (
+        isQuoteRejection(error) &&
+        (code === SHIPPING_QUOTE_ALREADY_USED ||
+          (keyed.idempotencyAttempts ?? 1) > 1)
+      ) {
+        const own = await this.ownCheckout(keyed.idempotencyKey);
+        if (own.kind === 'sale')
           return this.completeSale(
             senderId,
             stored,
@@ -801,6 +825,7 @@ export class MinimalOrderService {
             snapshot.shipping,
             own.pickupLocation,
           );
+        earlierResolved = own.kind === 'absent';
       }
       if (code === INVALID_CHECKOUT_REQUEST)
         this.logger.warn(
@@ -824,7 +849,7 @@ export class MinimalOrderService {
       const ambiguousPhone =
         error instanceof ChatbotApiError &&
         error.errorCode === 'CUSTOMER_PHONE_AMBIGUOUS';
-      if ((keyed.idempotencyAttempts ?? 1) > 1) {
+      if ((keyed.idempotencyAttempts ?? 1) > 1 && !earlierResolved) {
         return ambiguousPhone
           ? MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY
           : MINIMAL_ORDER_UNRESOLVED_REPLY;
@@ -869,16 +894,22 @@ export class MinimalOrderService {
     );
   }
 
-  /** The sale recorded under this key, if `/checkouts/status` shows one. */
-  private async ownSale(key: string): Promise<{
-    sale: BotSaleResponse;
-    pickupLocation?: CheckoutPickupLocation | null;
-  } | null> {
+  /** What `/checkouts/status` shows under this key: our sale, a confirmed
+   * `not_observed`, or `unknown` when the read failed. */
+  private async ownCheckout(key: string): Promise<
+    | {
+        kind: 'sale';
+        sale: BotSaleResponse;
+        pickupLocation?: CheckoutPickupLocation | null;
+      }
+    | { kind: 'absent' | 'unknown' }
+  > {
     try {
       const status = await this.api.getCheckoutStatus(key);
-      if (status.status !== 'succeeded' || !isSale(status.checkout?.sale))
-        return null;
+      if (status.status === 'not_observed') return { kind: 'absent' };
+      if (!isSale(status.checkout?.sale)) return { kind: 'unknown' };
       return {
+        kind: 'sale',
         sale: status.checkout.sale,
         pickupLocation:
           'pickupLocation' in status.checkout
@@ -886,7 +917,7 @@ export class MinimalOrderService {
             : undefined,
       };
     } catch {
-      return null;
+      return { kind: 'unknown' };
     }
   }
 

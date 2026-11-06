@@ -196,6 +196,14 @@ notification drain). Outside the 24 h WhatsApp customer window a free-text
 message cannot be sent: the outcome is recorded as `OUTSIDE_WINDOW`, nothing
 is sent and nothing loops (a Meta template for this case is a leftover).
 
+A queued outcome message can wait in the outbox (retries, a busy drain), so
+the notification drain checks the window again right before sending, using the
+same inbound-observation evidence. If the window is confirmed closed, nothing
+is sent: the outbox row becomes `FAILED` (terminal, no retry, no exhaustion
+alert) and the receipt's `outcome_delivery` flips from `QUEUED` to
+`OUTSIDE_WINDOW`, in one transaction. If the window read itself fails, the
+intent is rescheduled like a failed send, within the same three-attempt cap.
+
 ### Claim eligibility
 
 | Status                                   | claimBatch eligible | Notes                                                 |

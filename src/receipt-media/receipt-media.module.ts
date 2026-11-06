@@ -46,6 +46,7 @@ import { ReceiptIngressService } from './application/receipt-ingress.service';
 import { ReceiptOutcomePoller } from './application/receipt-outcome.poller';
 import { ReceiptProcessingDispatcher } from './application/receipt-processing-dispatcher.service';
 import { META_MEDIA, type MetaMediaPort } from './domain/meta-media.port';
+import { readCustomerWindowOpen } from './domain/receipt-outcome';
 import {
   RECEIPT_EXTRACTION,
   type ReceiptExtractionPort,
@@ -99,8 +100,8 @@ const workerOptions = (config: ConfigService) => {
   };
 };
 
-/** The Meta receiving phone: the outcome poller reads the customer window
- * for this exact phone (same rule as DELIVERY_ZONE). */
+/** The Meta receiving phone: the outcome poller and the notification drain
+ * read the customer window for this exact phone (same rule as DELIVERY_ZONE). */
 const receivingPhone = (config: ConfigService): string => {
   const phone = config.get<string>('meta.phoneNumberId');
   if (typeof phone !== 'string' || !phone.trim())
@@ -130,11 +131,21 @@ class ReceiptMediaNotificationLifecycle
   onApplicationBootstrap(): void {
     if (this.started || this.stopped) return;
     this.started = true;
+    const outbox = new PostgresReceiptOutboxStore(this.pool);
+    const inbound = new PostgresCustomerInboundObservationStore(this.pool);
+    const phone = receivingPhone(this.config);
     this.worker = new ReceiptMediaNotificationWorker(
-      new PostgresReceiptOutboxStore(this.pool),
+      outbox,
       this.sender,
       this.exhaustionAlert(),
       workerOptions(this.config),
+      // R5: a queued outcome text is sent only while the 24 h window is open.
+      {
+        isOpen: (recipientId) =>
+          readCustomerWindowOpen(inbound, recipientId, phone, new Date()),
+        markNotDelivered: (id, owner, lease) =>
+          outbox.markNotDelivered(id, owner, lease),
+      },
     );
     this.worker.onApplicationBootstrap();
   }

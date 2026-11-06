@@ -3,14 +3,12 @@ import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.clie
 import type { CustomerInboundObservationStore } from '../../human-decisions/domain/customer-inbound-observation-store.port';
 import {
   DEFAULT_RECEIPT_OUTCOME_POLL_POLICY,
+  isCustomerWindowOpen,
   outcomeTemplate,
   type ReceiptOutcomeCandidate,
   type ReceiptOutcomePollPolicy,
   type ReceiptOutcomeStore,
 } from '../domain/receipt-outcome';
-
-/** WhatsApp customer service window. */
-const CUSTOMER_WINDOW_MS = 86_400_000;
 
 export type ReceiptOutcomePollerPorts = Pick<
   ChatbotApiClient,
@@ -37,7 +35,8 @@ export interface ReceiptOutcomePollerOptions {
  *
  * A decided outcome is recorded once, with its notification, in one store
  * transaction: the customer text is queued on the receipt outbox (sent by the
- * notification worker) when the 24 h window is open; outside it the free-text
+ * notification worker, which re-checks the window right before sending) when
+ * the 24 h window is open; outside it the free-text
  * message cannot be sent, so it is recorded as `OUTSIDE_WINDOW` and never
  * retried. The bot never decides the outcome (S1).
  */
@@ -146,24 +145,13 @@ export class ReceiptOutcomePoller {
     });
   }
 
-  private async insideCustomerWindow(senderId: string): Promise<boolean> {
-    const nowMs = this.clock().getTime();
-    try {
-      const latest = await this.ports.readLatest(
-        senderId,
-        this.receivingPhoneNumberId,
-      );
-      if (latest.kind !== 'found') return false;
-      const providerMs =
-        Number(latest.observation.providerTimestampSeconds) * 1000;
-      return (
-        Number.isSafeInteger(providerMs) &&
-        providerMs <= nowMs &&
-        nowMs < providerMs + CUSTOMER_WINDOW_MS
-      );
-    } catch {
-      return false;
-    }
+  private insideCustomerWindow(senderId: string): Promise<boolean> {
+    return isCustomerWindowOpen(
+      this.ports,
+      senderId,
+      this.receivingPhoneNumberId,
+      this.clock(),
+    );
   }
 
   private schedule(delayMs: number): void {
