@@ -13,6 +13,8 @@ import type {
   StockCheckResponse,
 } from '../../src/chatbot-api/domain/dtos/catalog.dto';
 import type { CartEvaluationResult } from '../../src/chatbot-api/domain/dtos/pricing.dto';
+import type { ShippingQuoteResponse } from '../../src/chatbot-api/domain/dtos/shipping-quote.dto';
+import { toMexicanState } from '../../src/llm-agent/domain/mexican-state';
 
 const REQUIRED_ENV = [
   'CHATBOT_API_BASE_URL',
@@ -217,12 +219,431 @@ function assertShape(step: string, value: unknown, spec: Spec): void {
   }
 }
 
+/* ---- Diagnosis shapes for bodies the client's strict parsers rejected ---- */
+
+const quoteShape: Spec = {
+  object: {
+    quoteId: n('string'),
+    expiresAt: n('string'),
+    zoneStatus: {
+      enum: ['FREE', 'SURCHARGE', 'CARRIER_ONLY', 'DENIED', 'PENDING'],
+    },
+    option: n({
+      object: { carrier: 'string', service: 'string', etaDays: n('int') },
+    }),
+    eta: {
+      object: { days: n('int'), reason: n({ enum: ['STOCK_PENDING'] }) },
+    },
+    costCents: 'int',
+    creditCents: 'int',
+    customerChargeCents: 'int',
+    currency: { enum: ['MXN'] },
+  },
+};
+const deliveryCheckoutShape: Spec = {
+  object: {
+    status: { enum: ['created'] },
+    customer: {
+      object: {
+        resolution: { enum: ['created', 'existing'] },
+        customerId: 'string',
+        firstName: 'string',
+        lastName: n('string'),
+      },
+    },
+    address: {
+      object: {
+        resolution: { enum: ['created', 'existing', 'updated'] },
+        id: 'string',
+        version: 'string',
+      },
+    },
+    sale: {
+      object: {
+        saleId: 'string',
+        folio: n('string'),
+        paymentStatus: { enum: ['CREDIT', 'PARTIAL', 'PAID'] },
+        channel: 'string',
+        deliveryStatus: 'string',
+        totalCents: 'int',
+        discountCents: 'int',
+        subtotalCents: 'int',
+        shippingChargeCents: 'int',
+        fulfillmentMode: { enum: ['DELIVERY'] },
+        paidCents: 'int',
+        debtCents: 'int',
+        confirmedAt: n('string'),
+      },
+    },
+  },
+};
+
+const isParseFailure = (error: unknown): boolean =>
+  error instanceof ChatbotApiError &&
+  /response was invalid/.test(error.message);
+
+/** On a strict-parser rejection, also prints the failing paths (key names). */
+function failDiagnosed(step: string, error: unknown, spec: Spec): never {
+  if (error instanceof ChatbotApiError && isParseFailure(error))
+    line(step, 'PARSER_PATHS', { paths: check(error.responseBody, spec) });
+  fail(step, error);
+}
+
 function sellable(s: { status: string; quantity: number | null }): boolean {
   return (
     ['available', 'low_stock'].includes(s.status) &&
     Number.isSafeInteger(s.quantity) &&
     (s.quantity as number) >= 1
   );
+}
+
+/** Dev zones configured by the backend for the delivery scenario. */
+const DELIVERY_PRODUCT_ID = '45935cb9-7370-4148-8d6a-1a63b625c2b8';
+const ZONES = [
+  {
+    expected: 'FREE',
+    destination: {
+      zipCode: '03100',
+      state: 'Ciudad de México',
+      municipality: 'Benito Juárez',
+      neighborhood: 'Del Valle Centro',
+    },
+  },
+  {
+    expected: 'SURCHARGE',
+    destination: {
+      zipCode: '04000',
+      state: 'Ciudad de México',
+      municipality: 'Coyoacán',
+      neighborhood: 'Villa Coyoacán',
+    },
+  },
+  {
+    expected: 'CARRIER_ONLY',
+    destination: {
+      zipCode: '14000',
+      state: 'Ciudad de México',
+      municipality: 'Tlalpan',
+      neighborhood: 'Tlalpan Centro',
+    },
+  },
+  {
+    expected: 'DENIED',
+    destination: {
+      zipCode: '12000',
+      state: 'Ciudad de México',
+      municipality: 'Milpa Alta',
+      neighborhood: 'Villa Milpa Alta',
+    },
+  },
+] as const;
+const SURCHARGE_COST_CENTS = 6900;
+/** $120 MXN per unit whose unit price is above $500 MXN. */
+const CREDIT_PER_UNIT_CENTS = 12000;
+const CREDIT_THRESHOLD_CENTS = 50000;
+
+/**
+ * Delivery scenario: quotes for the four dev zones, a SURCHARGE delivery
+ * checkout + status replay, then the same quote under a new key (expects 409
+ * SHIPPING_QUOTE_ALREADY_USED). WRITES: one customer, one saved address and
+ * one delivery sale (stock -1). The CARRIER_ONLY quote is never consumed.
+ */
+async function runDelivery(
+  client: ChatbotApiHttpClient,
+  cashierUserId: string,
+): Promise<void> {
+  const runId = Date.now();
+  const phoneCountryCode = '52';
+  const suffix = String(Math.floor(runId / 60_000) % 10_000).padStart(4, '0');
+  // 5510… so it never collides with the default scenario's 5500… phones.
+  const phone = `551000${suffix}`;
+  line('setup', 'ok', {
+    scenario: 'delivery',
+    runId,
+    phone: `${phoneCountryCode} 55 1000 ${suffix}`,
+  });
+
+  // 1. Product (catalog price) + evaluation with the fresh phone.
+  let product: CatalogItemResponse | undefined;
+  for (const q of ['croquetas 18', 'croquetas', 'croqueta']) {
+    let items: CatalogItemResponse[];
+    try {
+      items = await client.searchCatalog(q, 20);
+    } catch (error) {
+      fail('1.searchCatalog', error);
+    }
+    items.forEach((item, i) =>
+      assertShape(`1.searchCatalog[${i}]`, item, catalogItem),
+    );
+    product = items.find((item) => item.productId === DELIVERY_PRODUCT_ID);
+    line('1.searchCatalog', 'ok', {
+      q,
+      results: items.length,
+      found: product !== undefined,
+    });
+    if (product) break;
+  }
+  if (!product)
+    fail(
+      '1.searchCatalog',
+      new StepFailure(`BACKEND_DATA: ${DELIVERY_PRODUCT_ID} not in search`),
+    );
+  if (product.variants.length > 0 || product.price.priceCents === null)
+    fail(
+      '1.searchCatalog',
+      new StepFailure('expected a simple product with a price'),
+    );
+  const catalogPrice = product.price.priceCents;
+  line('1.pick', 'ok', {
+    productId: product.productId,
+    name: product.name,
+    priceCents: catalogPrice,
+    stock: product.stock,
+  });
+  if (!sellable(product.stock))
+    fail('1.pick', new StepFailure('BACKEND_DATA: product has no stock'));
+
+  let evaluation: CartEvaluationResult;
+  try {
+    evaluation = await client.evaluateCart(
+      [
+        {
+          productId: DELIVERY_PRODUCT_ID,
+          quantity: 1,
+          unitPriceCents: catalogPrice,
+        },
+      ],
+      { phoneCountryCode, phone },
+    );
+  } catch (error) {
+    fail('1.evaluateCart', error);
+  }
+  assertShape('1.evaluateCart', evaluation, cartEvaluation);
+  const evaluated = evaluation.items[0];
+  const merchandiseTotal = evaluation.items.reduce(
+    (sum, i) => sum + i.finalPriceCents,
+    0,
+  );
+  line('1.evaluateCart', 'ok', {
+    unitPriceCents: evaluated.unitPriceCents,
+    finalPriceCents: evaluated.finalPriceCents,
+    discountAmountCents: evaluated.discountAmountCents,
+    promotionEvaluationStatus: evaluation.promotionEvaluationStatus,
+    customerResolution: evaluation.customerResolution ?? '(omitted)',
+    merchandiseTotal,
+  });
+  const expectedCredit =
+    evaluation.items
+      .filter((i) => i.unitPriceCents > CREDIT_THRESHOLD_CENTS)
+      .reduce((sum, i) => sum + i.quantity, 0) * CREDIT_PER_UNIT_CENTS;
+
+  // 2. One quote per dev zone; deviations are collected, not fatal.
+  const deviations: string[] = [];
+  const quotes = new Map<string, ShippingQuoteResponse>();
+  for (const zone of ZONES) {
+    const step = `2.quote(${zone.destination.zipCode} ${zone.expected})`;
+    let quote: ShippingQuoteResponse;
+    try {
+      quote = await client.createShippingQuote({
+        items: [{ productId: DELIVERY_PRODUCT_ID, quantity: 1 }],
+        phoneCountryCode,
+        phone,
+        destination: zone.destination,
+      });
+    } catch (error) {
+      if (zone.expected === 'CARRIER_ONLY' && !isParseFailure(error)) {
+        const body =
+          error instanceof ChatbotApiError ? error.responseBody : undefined;
+        line(step, 'error (continuing)', {
+          status: error instanceof ChatbotApiError ? error.statusCode : null,
+          errorCode:
+            error instanceof ChatbotApiError ? error.errorCode : undefined,
+          bodyKeys: body === undefined ? null : keyTree(body),
+        });
+        deviations.push(`${zone.expected}: request failed`);
+        continue;
+      }
+      failDiagnosed(step, error, quoteShape);
+    }
+    quotes.set(zone.expected, quote);
+    line(step, 'ok', {
+      zoneStatus: quote.zoneStatus,
+      quoteId: quote.quoteId,
+      expiresAt: quote.expiresAt,
+      costCents: quote.costCents,
+      creditCents: quote.creditCents,
+      customerChargeCents: quote.customerChargeCents,
+      option: quote.option,
+      eta: quote.eta,
+    });
+    const problems: string[] = [];
+    if (quote.zoneStatus !== zone.expected)
+      problems.push(`zoneStatus=${quote.zoneStatus}`);
+    const chargeRule = Math.max(0, quote.costCents - quote.creditCents);
+    if (quote.quoteId !== null && quote.customerChargeCents !== chargeRule)
+      problems.push(
+        `customerChargeCents ${quote.customerChargeCents} != max(0, cost - credit) ${chargeRule}`,
+      );
+    if (zone.expected === 'FREE') {
+      if (quote.option !== null) problems.push('option not null');
+      if (quote.customerChargeCents !== 0)
+        problems.push(`customerChargeCents ${quote.customerChargeCents} != 0`);
+    }
+    if (zone.expected === 'SURCHARGE') {
+      if (quote.option !== null) problems.push('option not null');
+      if (quote.costCents !== SURCHARGE_COST_CENTS)
+        problems.push(
+          `costCents ${quote.costCents} != ${SURCHARGE_COST_CENTS}`,
+        );
+      const capped = Math.min(expectedCredit, quote.costCents);
+      if (![expectedCredit, capped].includes(quote.creditCents))
+        problems.push(
+          `creditCents ${quote.creditCents} not in {${expectedCredit} (rule), ${capped} (capped at cost)}`,
+        );
+      const expectedCharge = Math.max(0, quote.costCents - expectedCredit);
+      if (quote.customerChargeCents !== expectedCharge)
+        problems.push(
+          `customerChargeCents ${quote.customerChargeCents} != ${expectedCharge}`,
+        );
+    }
+    if (zone.expected === 'CARRIER_ONLY' && quote.option === null)
+      problems.push('option missing');
+    if (zone.expected === 'DENIED' && quote.quoteId !== null)
+      problems.push('quoteId not null');
+    if (problems.length > 0) {
+      line(step, 'DEVIATION', { problems });
+      deviations.push(...problems.map((p) => `${zone.expected}: ${p}`));
+    }
+  }
+
+  // 3. Delivery checkout to the SURCHARGE zone, as minimal-order builds it.
+  const surcharge = quotes.get('SURCHARGE');
+  if (!surcharge?.quoteId)
+    fail('3.createCheckout', new StepFailure('no SURCHARGE quoteId'));
+  const surchargeZone = ZONES[1].destination;
+  const checkoutInput = (quoteId: string) => ({
+    phoneCountryCode,
+    phone,
+    customer: { mode: 'createIfAbsent' as const, firstName: 'E2E Envio' },
+    deliveryAddress: {
+      mode: 'newSaved' as const,
+      address: {
+        street: 'Calle Prueba 1',
+        zipCode: surchargeZone.zipCode,
+        state: toMexicanState(surchargeZone.state) ?? surchargeZone.state,
+        municipality: surchargeZone.municipality,
+        neighborhood: surchargeZone.neighborhood,
+      },
+    },
+    sale: {
+      cashierUserId,
+      items: [
+        {
+          productId: DELIVERY_PRODUCT_ID,
+          variantId: null,
+          productName: product.name,
+          variantName: null,
+          quantity: 1,
+          unitPriceCents: evaluated.unitPriceCents,
+        },
+      ],
+      expectedTotalCents: merchandiseTotal + surcharge.customerChargeCents,
+      shipping: { quoteId },
+    },
+  });
+  const checkoutKey = `e2e-delivery-${runId}`;
+  let saleId: string;
+  try {
+    const checkout = await client.createCheckout(
+      checkoutInput(surcharge.quoteId),
+      checkoutKey,
+    );
+    saleId = checkout.sale.saleId;
+    const sale = checkout.sale;
+    line('3.createCheckout', 'ok', {
+      saleId,
+      folio: sale.folio,
+      totalCents: sale.totalCents,
+      subtotalCents: 'subtotalCents' in sale ? sale.subtotalCents : null,
+      shippingChargeCents:
+        'shippingChargeCents' in sale ? sale.shippingChargeCents : null,
+      fulfillmentMode: sale.fulfillmentMode,
+      debtCents: sale.debtCents,
+      paymentStatus: sale.paymentStatus,
+      customerResolution: checkout.customer.resolution,
+      addressResolution: checkout.address?.resolution ?? null,
+    });
+    if (sale.fulfillmentMode !== 'DELIVERY')
+      throw new StepFailure('expected fulfillmentMode DELIVERY');
+    if (sale.totalCents !== merchandiseTotal + surcharge.customerChargeCents)
+      deviations.push(
+        `checkout totalCents ${sale.totalCents} != ${merchandiseTotal + surcharge.customerChargeCents}`,
+      );
+  } catch (error) {
+    failDiagnosed('3.createCheckout', error, deliveryCheckoutShape);
+  }
+  try {
+    const status = await client.getCheckoutStatus(checkoutKey);
+    const replayedId = status.checkout?.sale.saleId ?? null;
+    line('3.getCheckoutStatus', replayedId === saleId ? 'ok' : 'UNEXPECTED', {
+      status: status.status,
+      saleId: replayedId,
+      sameSale: replayedId === saleId,
+    });
+    if (status.status !== 'succeeded' || replayedId !== saleId)
+      throw new StepFailure(
+        'status must replay the same sale with a strict body',
+      );
+  } catch (error) {
+    fail('3.getCheckoutStatus', error);
+  }
+
+  // 4. Same quote, new key: 409 SHIPPING_QUOTE_ALREADY_USED, nothing written.
+  const reuseKey = `e2e-delivery-reuse-${runId}`;
+  try {
+    const second = await client.createCheckout(
+      checkoutInput(surcharge.quoteId),
+      reuseKey,
+    );
+    line('4.reuseQuote', 'UNEXPECTED', { saleId: second.sale.saleId });
+    throw new StepFailure('a second sale was created with a used quote');
+  } catch (error) {
+    if (!(error instanceof ChatbotApiError) || isParseFailure(error))
+      fail('4.reuseQuote', error);
+    const expected =
+      error.statusCode === 409 &&
+      error.errorCode === 'SHIPPING_QUOTE_ALREADY_USED';
+    line('4.reuseQuote', expected ? 'ok' : 'UNEXPECTED', {
+      status: error.statusCode,
+      errorCode: error.errorCode,
+    });
+    if (!expected) throw new StepFailure('4.reuseQuote');
+  }
+  try {
+    const status = await client.getCheckoutStatus(reuseKey);
+    line(
+      '4.getCheckoutStatus(reuse)',
+      status.status === 'not_observed' ? 'ok' : 'UNEXPECTED',
+      { status: status.status },
+    );
+    if (status.status !== 'not_observed')
+      throw new StepFailure('the rejected key must not hold a sale');
+  } catch (error) {
+    fail('4.getCheckoutStatus(reuse)', error);
+  }
+
+  // 5. CARRIER_ONLY quote: printed only, never consumed (keeps dev stock).
+  const carrier = quotes.get('CARRIER_ONLY');
+  line('5.carrierOnly', carrier ? 'ok (not consumed)' : 'no quote', {
+    quoteId: carrier?.quoteId ?? null,
+    option: carrier?.option ?? null,
+    customerChargeCents: carrier?.customerChargeCents ?? null,
+  });
+
+  line(deviations.length === 0 ? 'done' : 'done (with deviations)', 'ok', {
+    saleId,
+    deviations,
+  });
 }
 
 async function main(): Promise<void> {
@@ -244,6 +665,14 @@ async function main(): Promise<void> {
   });
   // HttpModule's default provider is the global axios instance.
   const client = new ChatbotApiHttpClient(new HttpService(axios), config);
+
+  const scenario = process.argv[2] ?? process.env.SCENARIO ?? 'default';
+  if (scenario === 'delivery') return runDelivery(client, cashierUserId);
+  if (scenario !== 'default') {
+    process.stderr.write(`unknown scenario: ${scenario}\n`);
+    process.exitCode = 2;
+    return;
+  }
 
   const runId = Date.now();
   const phoneCountryCode = '52';
