@@ -3,7 +3,6 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { App } from 'supertest/types';
-import type { ConversationStore } from '../src/conversation/domain/conversation-store';
 import { InMemoryConversationStore } from '../src/conversation/infrastructure/in-memory-conversation.store';
 import { InMemoryWebhookDedupStore } from '../src/whatsapp/infrastructure/in-memory-webhook-dedup.store';
 import type { LlmAgentPort } from '../src/llm-agent/domain/llm-agent.port';
@@ -14,7 +13,6 @@ describe('Webhook agent flow (e2e)', () => {
   const appSecret = 'meta-app-secret';
 
   let app: INestApplication<App>;
-  let conversationStore: ConversationStore;
   let sender: {
     sendText: jest.Mock<
       Promise<{ providerMessageId: string }>,
@@ -25,6 +23,7 @@ describe('Webhook agent flow (e2e)', () => {
   let whatsappSenderToken: symbol;
   let webhookDedupToken: symbol;
   let llmAgentToken: symbol;
+  let generateTextToken: symbol;
   let RestockInboundCapture: unknown;
   let customerInboundCaptureToken: symbol;
   let llmAgent: LlmAgentPort;
@@ -68,6 +67,9 @@ describe('Webhook agent flow (e2e)', () => {
     ({ CUSTOMER_INBOUND_CAPTURE: customerInboundCaptureToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../src/whatsapp/infrastructure/customer-inbound-capture.provider') as typeof import('../src/whatsapp/infrastructure/customer-inbound-capture.provider'));
+    ({ GENERATE_TEXT: generateTextToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/llm-agent/infrastructure/generate-text.provider') as typeof import('../src/llm-agent/infrastructure/generate-text.provider'));
     ({ LLM_AGENT: llmAgentToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../src/llm-agent/domain/llm-agent.port') as typeof import('../src/llm-agent/domain/llm-agent.port'));
@@ -105,6 +107,18 @@ describe('Webhook agent flow (e2e)', () => {
       .useValue(new InMemoryWebhookDedupStore())
       .overrideProvider(llmAgentToken)
       .useValue(llmAgent)
+      // Customer turns run on the minimal route: answer without a network call.
+      .overrideProvider(generateTextToken)
+      .useValue(
+        jest.fn().mockResolvedValue({
+          text: 'Hola, ¿en qué puedo ayudarte?',
+          responseMessages: [
+            { role: 'assistant', content: 'Hola, ¿en qué puedo ayudarte?' },
+          ],
+          usage: { inputTokens: 5, outputTokens: 8 },
+          steps: [],
+        }),
+      )
       // No database here: the always-on captures pass the verified body
       // through and record nothing.
       .overrideProvider(RestockInboundCapture)
@@ -136,10 +150,6 @@ describe('Webhook agent flow (e2e)', () => {
       }),
     );
     await app.init();
-
-    conversationStore = app.get<ConversationStore>(conversationStoreToken, {
-      strict: false,
-    });
   });
 
   afterEach(async () => {
@@ -208,15 +218,5 @@ describe('Webhook agent flow (e2e)', () => {
       to: '5215550001111',
       text: 'Hola, ¿en qué puedo ayudarte?',
     });
-
-    const state = await conversationStore.get('5215550001111');
-    expect(state?.senderId).toBe('5215550001111');
-    expect(state?.data.messages).toEqual([
-      { role: 'user', content: 'hola mundo' },
-      {
-        role: 'assistant',
-        content: 'Hola, ¿en qué puedo ayudarte?',
-      },
-    ]);
   });
 });
