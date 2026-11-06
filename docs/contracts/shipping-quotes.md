@@ -12,8 +12,15 @@ Request:
 {
   "phoneCountryCode": "52",
   "phone": "5512345678",
-  "items": [{ "productId": "<uuid>", "variantId": "<uuid, optional>", "quantity": 1 }],
-  "destination": { "zipCode": "06700", "state": "...", "municipality": "...", "neighborhood": "..." }
+  "items": [
+    { "productId": "<uuid>", "variantId": "<uuid, optional>", "quantity": 1 }
+  ],
+  "destination": {
+    "zipCode": "06700",
+    "state": "...",
+    "municipality": "...",
+    "neighborhood": "..."
+  }
 }
 ```
 
@@ -43,13 +50,13 @@ Request:
 
 Errors (`body.error`):
 
-| Status | Codes |
-| --- | --- |
-| 400 | validation, `INVALID_SHIPPING_DESTINATION`, `DUPLICATE_CART_LINE` |
-| 404 | `PRODUCT_NOT_FOUND`, `VARIANT_NOT_FOUND`, `SHIPPING_ADDRESS_NOT_FOUND` |
-| 409 | `CUSTOMER_PHONE_AMBIGUOUS`, `PRICE_OUT_OF_DATE` |
-| 422 | `SHIPPING_ADDRESS_INCOMPLETE`, `PACKAGING_DATA_MISSING`, `NO_SHIPPING_BOX_FITS`, `SHIPPING_ORIGIN_NOT_CONFIGURED` |
-| 503 | `SHIPPING_QUOTE_UNAVAILABLE` |
+| Status | Codes                                                                                                             |
+| ------ | ----------------------------------------------------------------------------------------------------------------- |
+| 400    | validation, `INVALID_SHIPPING_DESTINATION`, `DUPLICATE_CART_LINE`                                                 |
+| 404    | `PRODUCT_NOT_FOUND`, `VARIANT_NOT_FOUND`, `SHIPPING_ADDRESS_NOT_FOUND`                                            |
+| 409    | `CUSTOMER_PHONE_AMBIGUOUS`, `PRICE_OUT_OF_DATE`                                                                   |
+| 422    | `SHIPPING_ADDRESS_INCOMPLETE`, `PACKAGING_DATA_MISSING`, `NO_SHIPPING_BOX_FITS`, `SHIPPING_ORIGIN_NOT_CONFIGURED` |
+| 503    | `SHIPPING_QUOTE_UNAVAILABLE`                                                                                      |
 
 ## Checkout (in progress on the backend, T7)
 
