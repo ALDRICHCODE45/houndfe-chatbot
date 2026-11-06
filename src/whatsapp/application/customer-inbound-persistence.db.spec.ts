@@ -51,12 +51,7 @@ const found = (value: ReturnType<typeof observation>) => ({
   kind: 'found',
   observation: value,
 });
-function signed(
-  messages: unknown[],
-  phone = PHONE,
-  time = EARLY,
-  enabled = true,
-) {
+function signed(messages: unknown[], phone = PHONE, time = EARLY) {
   const rawBody = Buffer.from(
     JSON.stringify({
       object: 'whatsapp_business_account',
@@ -84,7 +79,6 @@ function signed(
   const guard = new SignatureGuard(
     new ConfigService({
       meta: { appSecret: SECRET },
-      humanDecisions: { restockEnabled: enabled },
     }),
   );
   const verify = () => {
@@ -156,11 +150,10 @@ ddescribe('authenticated capture to latest inbound (real PostgreSQL)', () => {
         'SELECT *, xmin::text AS xmin FROM customer_inbound_observations ORDER BY receiving_phone_number_id, message_id',
       )
     ).rows as unknown[];
-  const capture = (req: unknown, phone = PHONE, enabled: unknown = true) =>
+  const capture = (req: unknown, phone = PHONE) =>
     captureCustomerInboundObservations(
       req,
       {
-        enabled,
         phone,
         isOpsSender: (sender) => sender === 'ops',
         isKnownOutbound: (id) => id === 'outbound',
@@ -285,7 +278,7 @@ ddescribe('authenticated capture to latest inbound (real PostgreSQL)', () => {
     expect(await snapshot()).toEqual(before);
     expect(await latest()).toEqual(found(observation()));
   });
-  it('rejects forgeries, revoked signatures and disabled snapshots with no writes', async () => {
+  it('rejects forgeries and revoked signatures with no writes', async () => {
     expect(await capture(signed([message()]).req)).toEqual(
       captured(observation()),
     );
@@ -298,16 +291,11 @@ ddescribe('authenticated capture to latest inbound (real PostgreSQL)', () => {
       req,
       cloned,
       { action: 'prepared', observations: [observation('untrusted', '200')] },
-      signed([message('untrusted', '200')], PHONE, EARLY, false).req,
     ]) {
       expect(await capture(untrusted)).toEqual({ action: 'hold' });
       expect(await snapshot()).toEqual(before);
       expect(await latest()).toEqual(found(observation()));
     }
-    expect(
-      await capture(signed([message('disabled', '300')]).req, PHONE, false),
-    ).toEqual({ action: 'disabled' });
-    expect(await snapshot()).toEqual(before);
   });
   it('filters excluded messages while preserving reaction outer identity and valid media', async () => {
     const messages = [

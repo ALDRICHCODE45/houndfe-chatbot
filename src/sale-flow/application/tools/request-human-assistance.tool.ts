@@ -11,8 +11,8 @@ import { preflightRestockRequest } from '../../../human-decisions/application/re
 import type { RestockToolCapability, ToolDeps } from '../tool-deps';
 
 /**
- * Distinct RESTOCK result for `kind:'out_of_stock'` once the experimental gate
- * is enabled.
+ * Distinct RESTOCK result for `kind:'out_of_stock'` when the RESTOCK capability
+ * is wired.
  *
  * `historical_intake_recorded` reports ONLY a historical intake record: no
  * request ref, no backend/poll id, no current resolution, and never a notice.
@@ -54,10 +54,8 @@ export type RequestHumanAssistanceRestockResult =
  *   - `needs_human_review` (promo) — backend flagged promo for review
  *   - `expiration_date`    (R14)  — customer asked about fechas de caducidad
  *
- * `shipping_approval` is RESERVED for the future R6 slice; the union
- * does NOT include it today, so the schema layer rejects it before
- * `execute`. The R6 slice will extend the union without breaking this
- * contract.
+ * Any other kind (including the removed `shipping_approval`) is rejected
+ * by the schema layer before `execute`.
  *
  * `contextSchema: { senderId, inboundEvent? }` — the AI-SDK supplies the
  * senderId through `toolsContext.requestHumanAssistance.senderId` (see
@@ -67,11 +65,11 @@ export type RequestHumanAssistanceRestockResult =
  * uniform per the llm-agent spec §"`toolsContext` gains
  * `requestHumanAssistance.senderId`".
  *
- * `out_of_stock` + `deps.restock.enabled === true` takes an ENABLED-ONLY
- * route: `preflightRestockRequest` (current customer event identity,
- * trusted markers, fresh catalog) then `deps.restock.coordinator`. Every
- * other outcome fails closed; every other kind and the default-off case
- * keep the byte-identical legacy `humanHandoffService.create` call.
+ * `out_of_stock` with `deps.restock` wired takes the RESTOCK route:
+ * `preflightRestockRequest` (current customer event identity, trusted
+ * markers, fresh catalog) then `deps.restock.coordinator`. Every other
+ * outcome fails closed; every other kind and an unwired capability keep the
+ * byte-identical legacy `humanHandoffService.create` call.
  */
 
 const failClosedRestock = (): RequestHumanAssistanceRestockResult => ({
@@ -230,7 +228,7 @@ export async function runRestockRoute(
       catalogSession: context.catalogSession,
       inboundEvent: context.inboundEvent,
       digest,
-      restockFeatureEnabled: restock.enabled,
+      restockFeatureEnabled: true,
     };
     const preflightDeps = {
       conversation: deps.store,
@@ -387,8 +385,7 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
       catalogSession: catalogSessionSchema.optional(),
       // R3b3-c4c2-tool: optional RESTOCK inbound identity, strictly shaped so
       // the SDK validates the per-turn envelope. It is read ONLY by the
-      // enabled `out_of_stock` route; the default-off and other-kind paths
-      // ignore it and keep the legacy `humanHandoffService.create` behavior.
+      // `out_of_stock` RESTOCK route; the other-kind paths ignore it and keep the legacy `humanHandoffService.create` behavior.
       inboundEvent: z
         .strictObject({
           receivingPhoneNumberId: z.string().min(1),
@@ -402,10 +399,10 @@ export function makeRequestHumanAssistanceTool(deps: ToolDeps) {
       const input = definition.inputSchema.parse(rawInput);
       const senderId = options.context.senderId;
       const restock = deps.restock;
-      // The experimental RESTOCK route is reachable ONLY behind the exact
-      // boolean gate and ONLY for `out_of_stock`; every other case keeps the
-      // byte-identical legacy `humanHandoffService.create` call below.
-      if (restock?.enabled === true && input.kind === 'out_of_stock') {
+      // The RESTOCK route is reachable ONLY with the capability wired and ONLY
+      // for `out_of_stock`; every other case keeps the byte-identical legacy
+      // `humanHandoffService.create` call below.
+      if (restock !== undefined && input.kind === 'out_of_stock') {
         return runRestockRoute(deps, restock, input.digest, options.context);
       }
       // The discriminated union guarantees that `input.kind` aligns with

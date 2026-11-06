@@ -3,23 +3,34 @@ import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
-import type { ShippingQuoteProviderResult } from '../../shipping/domain/shipping-quote.port';
-import type { MeasuredDemoShippingConfig } from '../../shipping/application/measured-demo-shipping-config';
+import {
+  CUSTOMER_PHONE_AMBIGUOUS,
+  NO_SHIPPING_BOX_FITS,
+  PACKAGING_DATA_MISSING,
+  PRICE_OUT_OF_DATE,
+  SHIPPING_ADDRESS_INCOMPLETE,
+  SHIPPING_QUOTE_UNAVAILABLE,
+  VARIANT_NOT_FOUND,
+  type ShippingQuoteResponse,
+} from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import {
   MinimalCatalogAgentService,
   CHECKOUT_TOOL_CLARIFICATION,
+  minimalPickupReply,
+  minimalShippingReply,
 } from './minimal-catalog-agent.service';
-import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
+import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
-import { MinimalOrderService } from './minimal-order.service';
-import { MinimalShippingService } from './minimal-shipping.service';
 import {
-  decideApproval,
-  expireApproval,
-  shippingDigest,
-} from './minimal-shipping-approval';
+  MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
+  MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
+  MinimalOrderService,
+} from './minimal-order.service';
+import { MinimalShippingService } from './minimal-shipping.service';
 import { CostGuardService } from './cost-guard.service';
 
 const SENDER = '5215550001111';
@@ -46,11 +57,36 @@ const call = (toolName: string, input: unknown = {}) =>
       input: JSON.stringify(input),
     },
   ]);
+const backendQuote = (
+  overrides: Record<string, unknown> = {},
+): ShippingQuoteResponse => ({
+  quoteId: 'q1',
+  expiresAt: new Date(Date.now() + 30 * 60000).toISOString(),
+  zoneStatus: 'CARRIER_ONLY',
+  option: { carrier: 'Carrier', service: 'Ground', etaDays: 3 },
+  costCents: 20000,
+  creditCents: 0,
+  customerChargeCents: 20000,
+  currency: 'MXN',
+  eta: { days: 3, reason: null },
+  ...overrides,
+});
+const undeliverable = (zoneStatus: 'PENDING' | 'DENIED') =>
+  backendQuote({
+    zoneStatus,
+    quoteId: null,
+    expiresAt: null,
+    option: null,
+    eta: { days: null, reason: null },
+    costCents: 0,
+    creditCents: 0,
+    customerChargeCents: 0,
+  });
 const say = () =>
   step([{ type: 'text', text: 'Inventado $999. Pedido creado.' }], 'stop');
 
 // prettier-ignore
-async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean; order?: boolean; unconfirmed?: boolean } = {}) {
+async function setup(options: { absent?: boolean; free?: boolean; unconfirmed?: boolean } = {}) {
   const price = options.free ? 50001 : 1500;
   const store = new InMemoryConversationStore();
   const api = {
@@ -58,25 +94,21 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
     getStock: jest.fn(async () => ({ productId: PRODUCT, name: 'Producto', stock: { status: 'available', quantity: 10 }, variants: [] })),
     evaluateCart: jest.fn(async (items: Array<{ quantity: number }>) => ({ items: items.map(item => ({ productId: PRODUCT, variantId: null, quantity: item.quantity, unitPriceCents: price, originalPriceCents: price * item.quantity, finalPriceCents: price * item.quantity, discountAmountCents: 0, appliedPromotionTitle: null })), promotionEvaluationStatus: 'fully_evaluated' })),
     getCustomerCheckoutContext: jest.fn(async () => ({ status: 'unique', customer: { customerId: CUSTOMER, firstName: 'Ana', lastName: null }, addresses: [{ id: ADDRESS, version: '2026-10-01T00:00:00.000Z', label: 'Casa', street: 'Juárez', exteriorNumber: '10', interiorNumber: null, zipCode: '06000', neighborhood: 'Centro', municipality: 'Cuauhtémoc', city: null, state: 'Ciudad de México', visualReferences: null, carrierPhone: null }], nextAfterAddressId: null })),
-    createSale: jest.fn(async (...args: unknown[]) => { void args; return ({ saleId: '55555555-5555-4555-8555-555555555555', folio: 'B-42', paymentStatus: 'CREDIT', channel: 'ONLINE', deliveryStatus: 'PENDING', totalCents: price * 2 + (options.free || options.gate === false ? 0 : 20000), paidCents: 0, debtCents: price * 2, confirmedAt: null, discountCents: 0 }); }),
+    createSale: jest.fn(),
+    createCheckout: jest.fn(async (...args: unknown[]) => { void args; return ({ status: 'created', sale: { saleId: '55555555-5555-4555-8555-555555555555', folio: 'B-42', paymentStatus: 'CREDIT', channel: 'ONLINE', deliveryStatus: 'PENDING', totalCents: price * 2 + (options.free ? 0 : 20000), paidCents: 0, debtCents: price * 2, confirmedAt: null, discountCents: 0 } }); }),
     getPaymentDetails: jest.fn(async () => ({ id: 'pd', bankName: 'BBVA', beneficiary: 'HoundFe', clabe: '012180001234567891', accountNumber: null, isActive: true, updatedAt: '2026-10-01T00:00:00.000Z' })),
   };
   const client = api as unknown as ChatbotApiClient;
-  const config = { get: (key: string) => key === 'minimalCatalogAgent' ? { enabled: true, allowedSenders: [SENDER], orderEnabled: options.order !== false, shippingEnabled: options.gate !== false } : key === 'chatbotApi.cashierUserId' ? '99999999-9999-4999-8999-999999999999' : { model: 'm', maxSteps: 6, historyTurns: 12 } } as unknown as ConfigService;
+  const config = { get: (key: string) => key === 'chatbotApi.cashierUserId' ? '99999999-9999-4999-8999-999999999999' : { model: 'm', maxSteps: 6, historyTurns: 12 } } as unknown as ConfigService;
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
-  const order = new MinimalOrderService(client, store, cart, checkout, config);
-  const measured: MeasuredDemoShippingConfig = { origin: { postalCode: '06000', state: 'Ciudad de México', municipality: 'Cuauhtémoc', neighborhood: 'Centro' }, profile: { version: 1, items: [{ productId: PRODUCT, variantId: null, quantity: 2, measurement: { weightGrams: 100, lengthCm: 10, widthCm: 10, heightCm: 10 } }], parcel: { weightGrams: 200, lengthCm: 20, widthCm: 20, heightCm: 20 } } };
-  const provider = { quote: jest.fn(async (): Promise<ShippingQuoteProviderResult> => ({ kind: 'quoted' as const, quoteId: 'q1', expiresAt: null, rates: [{ rateId: 'r1', carrierName: 'Carrier', serviceName: 'Ground', priceCents: 20000, currency: 'MXN' as const, estimatedDeliveryDays: 3, validUntil: null }] })) };
-  const handoff = { create: jest.fn(async () => {
-    const date = new Date().toISOString();
-    await store.setPendingHumanRequest(SENDER, { requestId: 'abcdef123456', ref: 'HF-abcdef123456', createdAt: date, customerNotifiedAt: date }, date);
-    return { ok: true as const, requestId: 'abcdef123456', ref: 'HF-abcdef123456', customerNotified: true as const };
-  }) };
-  const shipping = new MinimalShippingService(store, cart, checkout, provider, measured, handoff);
+  const quotes = new FakeShippingQuoteClient();
+  const shipping = new MinimalShippingService(store, cart, checkout, quotes, { register: async () => undefined });
+  const order = new MinimalOrderService(client, store, cart, checkout, config, shipping);
   let script: unknown[] = [];
   const seen: Array<{ tools?: Record<string, unknown>; system?: unknown }> = [];
-  const generate: GenerateTextFn = async input => { seen.push(input); return generateText({ ...input, model: new MockLanguageModelV4({ doGenerate: script } as never) }); };
+  const models: MockLanguageModelV4[] = [];
+  const generate: GenerateTextFn = async input => { seen.push(input); const model = new MockLanguageModelV4({ doGenerate: script } as never); models.push(model); return generateText({ ...input, model }); };
   const agent = new MinimalCatalogAgentService(client, generate, new CostGuardService(100000), config, new InMemoryMinimalCatalogSessionStore(), undefined, undefined, cart, checkout, order, options.absent ? undefined : shipping);
   await store.create(SENDER, { lastMessageAt: new Date().toISOString(), data: { minimalCart: { items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: price }], idempotencyKey: '', expectedTotalCents: price * 2 } } });
   const lookup = await checkout.lookup(SENDER, null);
@@ -85,102 +117,206 @@ async function setup(options: { gate?: boolean; absent?: boolean; free?: boolean
   const offer = await checkout.prepareConfirmation(SENDER, event('d1')); offer.onSent?.();
   if (!options.unconfirmed) await checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('d2') });
   const turn = (text: string, steps: unknown[]) => { script = steps; return agent.tryHandle({ senderId: SENDER, text, inboundEvent: event(`wamid.${Math.random()}`) }); };
-  const decide = async (decision: 'approved' | 'rejected', now = Date.now()) => {
-    const s = parseMinimalCart((await store.get(SENDER))?.data.minimalCart)?.shipping;
-    if (!s) throw new Error('shipping');
-    const result = await decideApproval(store, SENDER, 'abcdef123456', shippingDigest(s), decision, now);
-    await store.clearPendingHumanRequest(SENDER, 'abcdef123456');
-    return result;
-  };
-  return { api, store, provider, handoff, seen, turn, decide };
+  return { api, store, quotes, seen, models, turn };
 }
 
 // prettier-ignore
 describe('minimal shipping SDK public seam', () => {
-  it.each([{ gate: false }, { absent: true }, { order: false }])('S5: hidden without both capabilities (%j)', async options => {
-    const h = await setup(options); await h.turn('Hola', [say()]);
+  it('S9: shipping tools are always offered when the service is wired (no flag)', async () => {
+    const h = await setup(); await h.turn('Hola', [say()]);
+    expect(h.seen[0].tools).toHaveProperty('requestShippingQuote');
+    expect(h.seen[0].tools).toHaveProperty('chooseStorePickup');
+  });
+  it('S5: hidden only when the service itself is absent (test seam)', async () => {
+    const h = await setup({ absent: true }); await h.turn('Hola', [say()]);
     expect(h.seen[0].tools).not.toHaveProperty('requestShippingQuote');
     expect(h.seen[0].system).not.toContain('Herramienta requestShippingQuote');
   });
-  it('S5: gate-off and service-absent preserve identical tools and prompt', async () => {
-    const off = await setup({ gate: false }); const absent = await setup({ absent: true });
-    await off.turn('Hola', [say()]); await absent.turn('Hola', [say()]);
-    expect(Object.keys(off.seen[0].tools!)).toEqual(Object.keys(absent.seen[0].tools!));
-    expect(off.seen[0].system).toBe(absent.seen[0].system);
-  });
-  it.each([false, true])('S1/S2/S3/S4: approval then single order SÍ, free=%s', async free => {
+  it.each([false, true])('[S1,S2,S3] backend quote then single order SÍ with its quoteId, free=%s', async free => {
     const h = await setup({ free });
-    const pending = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
-    expect(pending.kind).toBe('handled');
-    if (pending.kind !== 'handled') throw new Error('reply');
-    expect(pending.reply).toContain('aprobación');
-    expect(pending.reply).not.toMatch(/\$|200|999/);
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-    expect(h.handoff.create).toHaveBeenCalledTimes(1);
-    expect(h.seen[0].tools).not.toHaveProperty('requestStorePickup');
-    expect(h.api.createSale).not.toHaveBeenCalled();
-    expect(await h.decide('approved')).toMatchObject({ state: 'approved' });
+    h.quotes.enqueue(backendQuote(free ? { zoneStatus: 'FREE', option: null, creditCents: 20000, customerChargeCents: 0 } : {}));
+    const quoted = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
+    if (quoted.kind !== 'handled') throw new Error('reply');
+    expect(quoted.reply).toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
+    expect(quoted.reply).not.toMatch(/aprobaci|999/);
+    expect(h.quotes.calls).toHaveLength(1);
+    expect(h.seen[0].tools).toHaveProperty('chooseStorePickup');
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
     const offer = await h.turn('Prepare mi pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
-    expect(offer.reply).toContain(free ? 'envío cubierto por su compra' : 'Envío: $200.00 MXN');
+    expect(offer.reply).toContain(free ? 'sin costo para usted' : 'Envío con Carrier (Ground): $200.00 MXN');
     offer.onSent?.();
     await h.turn('SÍ', []);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
-    const payload: unknown = h.api.createSale.mock.calls[0]?.[0];
-    if (free) expect(payload).not.toHaveProperty('shipping');
-    else expect(payload).toMatchObject({ shipping: { chargeCents: 20000, approvalId: 'abcdef123456', quoteId: 'q1' }, expectedTotalCents: 23000 });
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    const payload: unknown = (h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale;
+    expect(payload).toMatchObject({ shipping: { quoteId: 'q1' }, expectedTotalCents: free ? 100002 : 23000 });
+    expect(payload).not.toHaveProperty('shipping.chargeCents');
+    expect(payload).not.toHaveProperty('shipping.approvalId');
   });
-  it('S7: rejected quote offers requote, no order', async () => {
-    const h = await setup(); await h.turn('Envío', [call('requestShippingQuote'), say()]);
-    const decision = await h.decide('rejected');
-    expect(decision?.state).toBe('rejected');
-    expect(decision?.reply).toContain('otra cotización');
+  it.each([
+    [undeliverable('PENDING'), 'zone_pending', 'Estamos validando la entrega a su código postal 06000'],
+    [undeliverable('DENIED'), 'zone_denied', 'Por ahora no tenemos entrega a su código postal 06000'],
+    [new ChatbotApiError('quote', 409, {}, PRICE_OUT_OF_DATE), 'prices_changed', 'precios'],
+    [new ChatbotApiError('quote', 404, {}, VARIANT_NOT_FOUND), 'cart_invalid', 'carrito'],
+    [new ChatbotApiError('quote', 422, {}, SHIPPING_ADDRESS_INCOMPLETE), 'address_invalid', 'dirección'],
+    [new ChatbotApiError('quote', 409, {}, CUSTOMER_PHONE_AMBIGUOUS), 'phone_ambiguous', 'registro único'],
+    [new ChatbotApiError('quote', 422, {}, NO_SHIPPING_BOX_FITS), 'unavailable', 'en este momento'],
+    [new ChatbotApiError('quote', 422, {}, PACKAGING_DATA_MISSING), 'packaging_missing', 'empaque'],
+    [new ChatbotApiError('quote', 503, {}, SHIPPING_QUOTE_UNAVAILABLE), 'unavailable', 'en este momento'],
+  ] as const)('tool result reflects %#: %s and no order is possible', async (answer, kind, text) => {
+    const h = await setup();
+    h.quotes.enqueue(answer);
+    const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
+    if (result.kind !== 'handled') throw new Error('reply');
+    expect(result.reply).toContain(text);
+    expect(result.reply).not.toContain('$');
+    // The model's next step sees the tool result carrying the new kind.
+    const prompts = JSON.stringify(h.models.at(-1)!.doGenerateCalls.map(c => c.prompt));
+    expect(prompts).toContain(`"shipping":"${kind}"`);
+    expect(prompts).toContain('"ok":false');
     await h.turn('Pedido', [call('prepareOrder'), say()]);
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
-  it('S6: pending approval expires after 30 minutes through public expiry path', async () => {
-    const h = await setup(); await h.turn('Envío', [call('requestShippingQuote'), say()]);
-    expect(await expireApproval(h.store, SENDER, Date.now() + 31 * 60000)).toBe(true);
-    expect(await h.store.get(SENDER)).toHaveProperty('data.pendingHumanRequest', null);
-    await h.turn('Pedido', [call('prepareOrder'), say()]);
-    expect(h.api.createSale).not.toHaveBeenCalled();
+  it('[S7] a STOCK_PENDING eta says the delivery date depends on restock', async () => {
+    const h = await setup();
+    h.quotes.enqueue(backendQuote({ eta: { days: null, reason: 'STOCK_PENDING' } }));
+    const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
+    if (result.kind !== 'handled') throw new Error('reply');
+    expect(result.reply).toContain('La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.');
+    expect(result.reply).not.toContain('Llega en');
   });
   it('S1/S4: strict arguments fail closed before provider execution', async () => {
     const h = await setup();
     expect(await h.turn('Envío', [call('requestShippingQuote', { senderId: 'attacker' }), say()])).toMatchObject({ reply: CHECKOUT_TOOL_CLARIFICATION });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
   });
-  it('S1/S4: shipping shares the first presentation slot and pending reply contains no amounts', async () => {
+  it('S1/S4: shipping shares the first presentation slot', async () => {
     const h = await setup();
+    h.quotes.enqueue(backendQuote()).enqueue(backendQuote({ quoteId: 'q2' }));
     await h.turn('Envío', [call('requestShippingQuote'), call('prepareOrder'), call('requestShippingQuote'), say()]);
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-    const pending = await h.turn('Envío de nuevo', [call('requestShippingQuote'), say()]);
-    if (pending.kind !== 'handled') throw new Error('pending');
-    expect(pending.reply).toContain('pendiente');
-    expect(pending.reply).not.toContain('$');
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
+    expect(h.quotes.calls).toHaveLength(1);
+    await h.turn('Envío de nuevo', [call('requestShippingQuote'), say()]);
+    expect(h.quotes.calls).toHaveLength(2);
   });
   it('S1/S4: unconfirmed delivery is refused without amounts or provider calls', async () => {
     const h = await setup({ unconfirmed: true });
     const result = await h.turn('Envío', [call('requestShippingQuote'), say()]);
     if (result.kind !== 'handled') throw new Error('reply');
-    expect(result.reply).toContain('delivery_unconfirmed');
+    // L10: the customer sees a sentence, never the internal reason code.
+    expect(result.reply).toContain('confirme sus datos de entrega');
+    expect(result.reply).not.toContain('delivery_unconfirmed');
     expect(result.reply).not.toContain('$');
-    expect(h.provider.quote).not.toHaveBeenCalled();
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
   it('S4: earlier delivery presentation prevents quoting in the same run', async () => {
     const h = await setup();
     await h.turn('Datos y envío', [call('confirmCheckoutDetails'), call('requestShippingQuote'), say()]);
-    expect(h.provider.quote).not.toHaveBeenCalled();
-    expect(h.handoff.create).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
   });
-  it('S5: gate off keeps existing order flow without shipping', async () => {
-    const h = await setup({ gate: false });
+  it('S9: no order without a backend quote or store pickup', async () => {
+    const h = await setup();
     const offer = await h.turn('Pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
+    expect(offer.reply).toBe(MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY);
+    offer.onSent?.(); await h.turn('SÍ', [say()]);
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    expect(h.api.createSale).not.toHaveBeenCalled();
+  });
+});
+
+// prettier-ignore
+describe('U4 customer shipping conversation', () => {
+  const quoted = (overrides: Partial<Extract<Parameters<typeof minimalShippingReply>[0], { kind: 'quoted' }>> = {}) =>
+    minimalShippingReply({ kind: 'quoted', zoneStatus: 'SURCHARGE', costCents: 30000, creditCents: 24000, customerChargeCents: 6000,
+      option: { carrier: 'Envíos Perros', service: 'Estándar', etaDays: 4 }, eta: null, zipCode: '06000', ...overrides });
+  it.each(['cart_unverified', 'empty_cart', 'promotion_review', 'delivery_unconfirmed', 'new_address_unsupported', 'invalid_state', 'order_unresolved', 'cart_changed', 'address_changed', 'address_unverified', 'unsupported_destination'] as const)('[L10] refusal %s maps to a customer sentence without the reason code', reason => {
+    const reply = minimalShippingReply({ kind: 'refused', reason });
+    expect(reply).not.toContain(reason);
+    expect(reply).not.toMatch(/[a-z]+_[a-z]+/);
+    expect(reply.length).toBeGreaterThan(20);
+  });
+  it('[S3] SURCHARGE shows carrier, cost, credit, customer charge, ETA and the next step', () => {
+    expect(quoted()).toBe(
+      'Envío a domicilio con Envíos Perros (Estándar): $300.00 MXN. Usted tiene un crédito de $240.00 MXN por sus productos. Usted paga $60.00 MXN. ' +
+      'Llega en aproximadamente 4 días hábiles. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+  });
+  it('[S3] CARRIER_ONLY without credit or carrier omits those parts', () => {
+    const reply = quoted({ zoneStatus: 'CARRIER_ONLY', creditCents: 0, customerChargeCents: 30000, option: null });
+    expect(reply).toContain('Envío a domicilio: $300.00 MXN. Usted paga $300.00 MXN.');
+    expect(reply).not.toContain('crédito');
+    expect(reply).not.toContain('Llega en');
+  });
+  it('[S3] FREE says there is no cost for that ZIP, with the ETA line', () => {
+    expect(quoted({ zoneStatus: 'FREE', costCents: 0, creditCents: 0, customerChargeCents: 0, option: null, eta: { days: 1, reason: null } })).toBe(
+      'Su envío al código postal 06000 no tiene costo. Llega en aproximadamente 1 día hábil. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+  });
+  it('[S7] STOCK_PENDING replaces the day count', () => {
+    expect(quoted({ eta: { days: null, reason: 'STOCK_PENDING' } })).toContain(
+      'La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.');
+  });
+  it('[S5] PENDING zone', () => {
+    expect(minimalShippingReply({ kind: 'zone_pending', zipCode: '06000' })).toBe(
+      'Estamos validando la entrega a su código postal 06000. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.');
+  });
+  it('[S4] DENIED zone', () => {
+    expect(minimalShippingReply({ kind: 'zone_denied', zipCode: '06000' })).toBe(
+      'Por ahora no tenemos entrega a su código postal 06000. Puede recoger su pedido en tienda sin costo de envío. ¿Le parece?');
+  });
+  it('[U1b] a price change asks to review the cart prices before quoting again', () => {
+    const reply = minimalShippingReply({ kind: 'prices_changed' });
+    expect(reply).toBe('Los precios de su carrito cambiaron. Pídame ver su carrito para revisar los precios actualizados y después le cotizo el envío; no se creó ningún pedido.');
+  });
+  it('[U1b] a cart the backend cannot quote asks to fix the cart', () => {
+    expect(minimalShippingReply({ kind: 'cart_invalid' })).toBe(
+      'Un producto de su carrito ya no está disponible así. Revise su carrito, elija de nuevo el producto o su presentación, o quítelo, y vuelva a pedirme el envío; no se creó ningún pedido.');
+  });
+  it('[U1b] an address the backend cannot quote asks to confirm or correct it', () => {
+    expect(minimalShippingReply({ kind: 'address_invalid' })).toBe(
+      'No pude cotizar el envío con esa dirección. ¿Me confirma o corrige su dirección de entrega (calle, número, colonia, código postal, municipio y estado)? No se creó ningún pedido.');
+  });
+  it('[U1b] an ambiguous phone uses the order phone-ambiguous reply', () => {
+    expect(minimalShippingReply({ kind: 'phone_ambiguous' })).toBe(MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY);
+  });
+  it.each(['prices_changed', 'cart_invalid', 'address_invalid', 'phone_ambiguous', 'packaging_missing', 'unavailable'] as const)('[U1b] %s never shows an internal code or amount', kind => {
+    const reply = minimalShippingReply({ kind });
+    expect(reply).not.toMatch(/[A-Z]{3,}_[A-Z]+|[a-z]+_[a-z]+/);
+    expect(reply).not.toContain('$');
+  });
+  it.each(['packaging_missing', 'unavailable'] as const)('[S6] %s is honest, has no amount and offers pickup or a retry', kind => {
+    const reply = minimalShippingReply({ kind });
+    expect(reply).not.toContain('$');
+    expect(reply).toContain('recoger su pedido en tienda');
+    expect(reply).toMatch(/más tarde|en unos minutos/);
+  });
+  it('[S4] pickup replies', () => {
+    expect(minimalPickupReply({ kind: 'pickup' })).toBe(
+      'Listo, usted recoge su pedido en tienda, sin costo de envío. Dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+    expect(minimalPickupReply({ kind: 'refused', reason: 'cart_changed' })).not.toContain('Listo');
+  });
+  it('[S4] prompt: quote after confirmation, never invent costs, pickup on DENIED/PENDING, no approval', async () => {
+    const h = await setup(); await h.turn('Hola', [say()]);
+    const system = String(h.seen[0].system);
+    expect(system).toContain('chooseStorePickup');
+    expect(system).toContain('Nunca invente');
+    expect(system).not.toContain('No ofrece recoger en tienda');
+    expect(system).not.toMatch(/(env[ií]o|cotizaci[oó]n)[^.]{0,80}aprob|aprob[^.]{0,80}(env[ií]o|cotizaci[oó]n)/i);
+  });
+  it('[S4] chooseStorePickup then SÍ creates a pickup order with a products-only total', async () => {
+    const h = await setup();
+    const chosen = await h.turn('Mejor paso a recogerlo', [call('chooseStorePickup'), say()]);
+    if (chosen.kind !== 'handled') throw new Error('reply');
+    expect(chosen.reply).toContain('recoge su pedido en tienda');
+    expect(h.quotes.calls).toHaveLength(0);
+    const offer = await h.turn('Pedido', [call('prepareOrder'), say()]);
+    if (offer.kind !== 'handled') throw new Error('offer');
+    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
     offer.onSent?.(); await h.turn('SÍ', []);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
-    expect(h.api.createSale.mock.calls[0]?.[0]).not.toHaveProperty('shipping');
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect((h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale).toMatchObject({ shipping: { mode: 'pickup' }, expectedTotalCents: 3000 });
+  });
+  it('[S4] strict arguments fail closed for chooseStorePickup', async () => {
+    const h = await setup();
+    expect(await h.turn('Recoger', [call('chooseStorePickup', { senderId: 'attacker' }), say()])).toMatchObject({ reply: CHECKOUT_TOOL_CLARIFICATION });
   });
 });

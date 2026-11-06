@@ -29,7 +29,7 @@ const observation = (id = 'inbound') => ({
   providerTimestampSeconds: message().timestamp,
   observedAt,
 });
-function request(input: unknown = event(), enabled = true) {
+function request(input: unknown = event()) {
   const rawBody = Buffer.isBuffer(input)
     ? input
     : Buffer.from(JSON.stringify(input));
@@ -42,7 +42,6 @@ function request(input: unknown = event(), enabled = true) {
   const guard = new SignatureGuard(
     new ConfigService({
       meta: { appSecret: secret },
-      humanDecisions: { restockEnabled: enabled },
     }),
   );
   const verify = () =>
@@ -52,12 +51,11 @@ function request(input: unknown = event(), enabled = true) {
   verify();
   return { req, verify };
 }
-function setup(enabled: unknown = true) {
+function setup() {
   const ops = jest.fn((sender: string) => sender === 'ops');
   const echo = jest.fn((id: string) => id === 'outbound');
   const capture = (req: unknown) =>
     prepareCustomerInboundObservations(req, {
-      enabled,
       phone,
       isOpsSender: ops,
       isKnownOutbound: echo,
@@ -70,26 +68,7 @@ beforeEach(() => jest.useFakeTimers({ now: new Date(observedAt) }));
 afterEach(() => jest.useRealTimers());
 
 describe('unwired authenticated customer inbound capture', () => {
-  it.each([false, null, 'true', 1])(
-    'strict opt-in rejects %p without effects',
-    (enabled) => {
-      const s = setup(enabled);
-      const unreadable = new Proxy(
-        {},
-        {
-          get: () => {
-            throw Error('read');
-          },
-        },
-      );
-      expect(s.capture(unreadable)).toEqual({
-        action: 'disabled',
-      });
-      expect(s.ops).not.toHaveBeenCalled();
-      expect(s.echo).not.toHaveBeenCalled();
-    },
-  );
-  it('rejects body/snapshot forgeries, clones, proxies and flag-disabled snapshots', () => {
+  it('rejects body/snapshot forgeries, clones and proxies', () => {
     const s = setup();
     const { req } = request();
     for (const untrusted of [
@@ -100,7 +79,6 @@ describe('unwired authenticated customer inbound capture', () => {
       { rawBodyBase64: req.rawBody.toString('base64'), observedAt },
       { ...req },
       new Proxy(req, {}),
-      request(event(), false).req,
     ])
       expect(s.capture(untrusted)).toEqual({ action: 'hold' });
     expect(s.ops).not.toHaveBeenCalled();

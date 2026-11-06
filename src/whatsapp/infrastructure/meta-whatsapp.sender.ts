@@ -4,6 +4,8 @@ import { ConfigService } from '@nestjs/config';
 import { lastValueFrom } from 'rxjs';
 import { AppConfig } from '../../config/configuration';
 import {
+  InvalidOutboundTemplateError,
+  OutboundTemplate,
   OutboundText,
   SendResult,
   UnsupportedOutboundError,
@@ -13,6 +15,14 @@ import {
 type MetaSendResponse = {
   messages?: Array<{ id: string }>;
 };
+
+type MetaMessagePayload = Record<string, unknown> & { to: string };
+
+const TEMPLATE_NAME_PATTERN = /^[a-z0-9_]+$/;
+const TEMPLATE_NAME_MAX_LENGTH = 512;
+const TEMPLATE_PARAMETER_MAX_LENGTH = 1024;
+// Meta rejects body parameters with newlines, tabs or more than 4 spaces.
+const TEMPLATE_PARAMETER_FORBIDDEN = /[\n\r\t]| {5,}/;
 
 type GraphErrorResponse = {
   error?: {
@@ -42,17 +52,54 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   async sendText(message: OutboundText): Promise<SendResult> {
     this.assertTextMessage(message);
 
+    return this.send({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: message.to,
+      type: 'text',
+      text: {
+        body: message.text,
+      },
+    });
+  }
+
+  async sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    this.assertTemplateMessage(message);
+
+    return this.send({
+      messaging_product: 'whatsapp',
+      to: message.to,
+      type: 'template',
+      template: {
+        name: message.templateName,
+        language: { code: message.languageCode },
+        // A template without variables carries no body component.
+        ...(message.bodyParameters.length > 0 && {
+          components: [
+            {
+              type: 'body',
+              parameters: message.bodyParameters.map((text) => ({
+                type: 'text',
+                text,
+              })),
+            },
+          ],
+        }),
+      },
+    });
+  }
+
+  private async send(payload: MetaMessagePayload): Promise<SendResult> {
     // Explicit, default-off sandbox compatibility mode (see below).
     const sandboxNormalization =
       this.configService.get<boolean>(
         'meta.sandboxRecipientNormalizationEnabled',
       ) === true;
-    const normalizedMessage = {
-      ...message,
-      to: normalizeSandboxRecipient(message.to, sandboxNormalization),
-    };
 
-    const response = await this.postTextMessage(normalizedMessage);
+    const response = await this.postMessage({
+      ...payload,
+      to: normalizeSandboxRecipient(payload.to, sandboxNormalization),
+    });
 
     const providerMessageId = response.messages?.[0]?.id;
 
@@ -63,22 +110,14 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     return { providerMessageId };
   }
 
-  private async postTextMessage(
-    message: OutboundText,
+  private async postMessage(
+    payload: MetaMessagePayload,
   ): Promise<MetaSendResponse> {
     try {
       const response = await lastValueFrom(
         this.httpService.post<MetaSendResponse>(
           this.buildMessagesUrl(),
-          {
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: message.to,
-            type: 'text',
-            text: {
-              body: message.text,
-            },
-          },
+          payload,
           {
             headers: {
               Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['meta']['accessToken']>('meta.accessToken')}`,
@@ -124,6 +163,39 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   private assertTextMessage(message: OutboundText): void {
     if (typeof message?.to !== 'string' || typeof message?.text !== 'string') {
       throw new UnsupportedOutboundError();
+    }
+  }
+
+  private assertTemplateMessage(message: OutboundTemplate): void {
+    if (typeof message?.to !== 'string' || message.to === '') {
+      throw new InvalidOutboundTemplateError('recipient');
+    }
+    const name: unknown = message.templateName;
+    if (
+      typeof name !== 'string' ||
+      name.length > TEMPLATE_NAME_MAX_LENGTH ||
+      !TEMPLATE_NAME_PATTERN.test(name)
+    ) {
+      throw new InvalidOutboundTemplateError('template_name');
+    }
+    const languageCode: unknown = message.languageCode;
+    if (typeof languageCode !== 'string' || languageCode.trim() === '') {
+      throw new InvalidOutboundTemplateError('language_code');
+    }
+    const parameters: unknown = message.bodyParameters;
+    if (!Array.isArray(parameters)) {
+      throw new InvalidOutboundTemplateError('body_parameters');
+    }
+    for (const parameter of parameters as unknown[]) {
+      if (
+        typeof parameter !== 'string' ||
+        parameter === '' ||
+        parameter !== parameter.trim() ||
+        parameter.length > TEMPLATE_PARAMETER_MAX_LENGTH ||
+        TEMPLATE_PARAMETER_FORBIDDEN.test(parameter)
+      ) {
+        throw new InvalidOutboundTemplateError('body_parameter');
+      }
     }
   }
 }

@@ -8,13 +8,28 @@ import type { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 import type { VerifiedWebhookSnapshot } from '../presentation/signature.guard';
 
 type Result =
-  | { action: 'disabled' | 'hold' }
+  | { action: 'hold' }
   | {
       action: 'captured';
       event: WebhookEventDto;
       evidence: readonly RestockInboundEvidence[];
     };
 const HOLD = { action: 'hold' } as const;
+// Well-formed non-text customer messages (receipts, voice notes, and types
+// Meta adds later such as `unsupported`, `order`, `system`) carry no RESTOCK
+// reply evidence: skip them instead of holding (500 → endless Meta retries).
+const MEDIA_KEYS = [
+  'image',
+  'document',
+  'audio',
+  'video',
+  'sticker',
+  'location',
+  'contacts',
+  'interactive',
+  'button',
+  'reaction',
+];
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -27,14 +42,12 @@ function object(value: unknown): value is Record<string, unknown> {
  */
 export class RestockInboundCapture {
   constructor(
-    private readonly enabled: unknown,
     private readonly phone: string,
     private readonly store: Pick<RestockInboundEvidencePort, 'record'>,
     private readonly isOpsSender: (senderId: string) => boolean,
     private readonly isKnownOutbound: (messageId: string) => boolean,
   ) {}
   async capture(snapshot: VerifiedWebhookSnapshot | null): Promise<Result> {
-    if (this.enabled !== true) return { action: 'disabled' };
     if (!snapshot) return HOLD;
     const { rawBodyBase64, observedAt } = snapshot;
     let event: unknown;
@@ -79,22 +92,17 @@ export class RestockInboundCapture {
           )
             continue;
           if (
+            typeof message.type === 'string' &&
+            message.type !== 'text' &&
+            !('text' in message)
+          )
+            continue;
+          if (
             message.type !== 'text' ||
             !object(message.text) ||
             typeof message.text.body !== 'string' ||
             typeof message.from !== 'string' ||
-            [
-              'image',
-              'document',
-              'audio',
-              'video',
-              'sticker',
-              'location',
-              'contacts',
-              'interactive',
-              'button',
-              'reaction',
-            ].some((key) => key in message)
+            MEDIA_KEYS.some((key) => key in message)
           )
             return HOLD;
           const candidate = bindRestockInboundEvidence(

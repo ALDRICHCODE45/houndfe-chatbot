@@ -11,9 +11,7 @@ import {
   isPendingHumanRequest,
   isStructuralPendingHumanRequest,
   isPendingHumanRequestId,
-  isReceiptAmountPointer,
   PendingHumanRequest,
-  ReceiptAmountPointer,
 } from '../domain/conversation-store';
 
 /**
@@ -207,57 +205,6 @@ export class InMemoryConversationStore implements ConversationStore {
     return true;
   }
 
-  async setReceiptAmountPointer(
-    senderId: string,
-    pointer: ReceiptAmountPointer,
-  ): Promise<boolean> {
-    const state = this.map.get(senderId);
-    if (
-      typeof senderId !== 'string' ||
-      senderId.length === 0 ||
-      !isReceiptAmountPointer(pointer) ||
-      !state
-    )
-      return false;
-    const current = state.data.receiptAmountPointer;
-    if (
-      Object.hasOwn(state.data, 'receiptAmountPointer') &&
-      (!isReceiptAmountPointer(current) ||
-        current.receiptMediaId !== pointer.receiptMediaId ||
-        current.saleId !== pointer.saleId ||
-        !this.isNewer(pointer.receiptVersion, current.receiptVersion))
-    ) {
-      return false;
-    }
-    state.data = { ...state.data, receiptAmountPointer: pointer };
-    return true;
-  }
-
-  async clearReceiptAmountPointer(
-    senderId: string,
-    pointer: ReceiptAmountPointer,
-  ): Promise<boolean> {
-    const state = this.map.get(senderId);
-    const current = state?.data.receiptAmountPointer;
-    if (
-      typeof senderId !== 'string' ||
-      senderId.length === 0 ||
-      !isReceiptAmountPointer(pointer) ||
-      !state ||
-      !Object.hasOwn(state.data, 'receiptAmountPointer') ||
-      !isReceiptAmountPointer(current) ||
-      current.receiptMediaId !== pointer.receiptMediaId ||
-      current.saleId !== pointer.saleId ||
-      current.receiptVersion !== pointer.receiptVersion
-    ) {
-      return false;
-    }
-    const data = { ...state.data };
-    delete data.receiptAmountPointer;
-    state.data = data;
-    return true;
-  }
-
   async get(senderId: string): Promise<ConversationState | null> {
     const state = this.map.get(senderId);
     return state ? this.checkoutSnapshot(state) : null;
@@ -323,7 +270,6 @@ export class InMemoryConversationStore implements ConversationStore {
     // write path handles both first contact and follow-ups.
     const existing = this.map.get(senderId);
     const data = { ...(patch.data ?? {}) };
-    delete data.receiptAmountPointer;
     // The handoff marker is CAS-owned; strip any stale patch value and
     // reapply the LIVE one (including explicit JSON null) below.
     delete data.pendingHumanRequest;
@@ -359,9 +305,6 @@ export class InMemoryConversationStore implements ConversationStore {
             .filter((key) => existing && Object.hasOwn(existing.data, key))
             .map((key) => [key, existing!.data[key]]),
         ),
-        ...(existing && Object.hasOwn(existing.data, 'receiptAmountPointer')
-          ? { receiptAmountPointer: existing.data.receiptAmountPointer }
-          : {}),
         ...(existing && Object.hasOwn(existing.data, 'pendingHumanRequest')
           ? { pendingHumanRequest: existing.data.pendingHumanRequest }
           : {}),

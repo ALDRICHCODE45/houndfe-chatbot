@@ -30,8 +30,8 @@ const schemaToolView = (tool: object): SchemaToolView =>
  *     senderId from context + the input kind + digest.
  *   - idempotent re-call returns the existing envelope (service owns this).
  *   - inputSchema rejects malformed digests.
- *   - inputSchema rejects the reserved `shipping_approval` kind (no
- *     discriminator match — R6 slice lifts the gate).
+ *   - inputSchema rejects the removed `shipping_approval` kind (no
+ *     discriminator match).
  */
 describe('makeRequestHumanAssistanceTool', () => {
   const baseDeps = {
@@ -124,7 +124,7 @@ describe('makeRequestHumanAssistanceTool', () => {
     expect(r.success).toBe(false);
   });
 
-  it('inputSchema rejects the reserved shipping_approval kind', () => {
+  it('inputSchema rejects the removed shipping_approval kind', () => {
     const { svc } = buildHandoffServiceMock();
     const deps = {
       ...baseDeps,
@@ -399,7 +399,6 @@ describe('makeRequestHumanAssistanceTool', () => {
         store: { get: getState } as never,
         humanHandoffService: { create } as never,
         restock: {
-          enabled: true as const,
           markers: markers as never,
           coordinator: coordinator as never,
           recovery: recovery as never,
@@ -672,25 +671,23 @@ describe('makeRequestHumanAssistanceTool', () => {
         expect(log).not.toHaveBeenCalled();
       });
 
-      it('fails closed with no coordinator when the restock.enabled getter throws after the gate', async () => {
+      it('fails closed with no coordinator when a restock capability getter throws in the guarded region', async () => {
         const { deps, coordinator, create } = buildRestockDeps();
-        // First read is the `execute` gate (returns `true`); the second, inside
-        // the guarded region, throws and must fail closed instead of escaping.
+        // The guarded region reads `markers`; a throwing getter must fail
+        // closed instead of escaping.
         let reads = 0;
         const restock = {
-          markers: deps.restock.markers,
           coordinator: deps.restock.coordinator,
           recovery: deps.restock.recovery,
-          get enabled() {
+          get markers() {
             reads += 1;
-            if (reads > 1) throw new Error('PRIVATE-enabled-getter');
-            return true;
+            throw new Error('PRIVATE-markers-getter');
           },
         };
         expect(await run({ ...deps, restock: restock as never })).toEqual(
           failClosed,
         );
-        expect(reads).toBe(2);
+        expect(reads).toBe(1);
         expect(coordinator.coordinate).not.toHaveBeenCalled();
         expect(create).not.toHaveBeenCalled();
         expectLog('preflight', 'exception', 'exception');

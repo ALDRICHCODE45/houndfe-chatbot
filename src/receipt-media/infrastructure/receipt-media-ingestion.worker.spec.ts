@@ -4,11 +4,10 @@
  * WU2B claim/reclaim and the processor's fenced CAS; this worker never
  * renews leases and cannot detect mid-call loss (documented, not faked).
  *
- * STORED-1 change: the second constructor argument is the state-aware
- * dispatcher (ReceiptProcessingDispatcher), not the raw processor. The
- * dispatcher routes RESERVED/DOWNLOADED to ingestion, ATTACHING to
- * attachment, and all other statuses (including STORED) to a no-op
- * non-dispatch result. STORED rows are held from automatic eligibility. */
+ * The second constructor argument is the state-aware dispatcher
+ * (ReceiptProcessingDispatcher), not the raw processor: it routes
+ * RESERVED/DOWNLOADED to ingestion and every other status to a no-op
+ * non-dispatch result. */
 import {
   ReceiptMediaIngestionWorker,
   waitWithSignal,
@@ -25,7 +24,7 @@ const row = (
   status: ReceiptMediaRow['status'] = 'RESERVED',
 ): ReceiptMediaRow => ({ id, status }) as ReceiptMediaRow;
 
-const downloaded: ReceiptIngestionOutcome = { kind: 'downloaded' };
+const downloaded: ReceiptIngestionOutcome = { kind: 'cleanup-failed' };
 
 const settleOnAbort = (
   signal?: AbortSignal,
@@ -375,7 +374,7 @@ describe('STORED-1: dispatch seam — worker calls dispatcher, not processor', (
     await worker.onModuleDestroy();
   });
 
-  it('passes ATTACHING receipt identity, owner, and AbortSignal to dispatcher', async () => {
+  it('passes DOWNLOADED receipt identity, owner, and AbortSignal to dispatcher', async () => {
     const called = defer<void>();
     const result = defer<DispatchOutcome>();
     const dispatch = jest.fn<
@@ -385,7 +384,7 @@ describe('STORED-1: dispatch seam — worker calls dispatcher, not processor', (
       called.resolve();
       return result.promise;
     });
-    const receipt = row('r-attaching', 'ATTACHING');
+    const receipt = row('r-downloaded', 'DOWNLOADED');
     const claimBatch = jest
       .fn<Promise<ReceiptMediaRow[]>, [number, string]>()
       .mockResolvedValueOnce([receipt])

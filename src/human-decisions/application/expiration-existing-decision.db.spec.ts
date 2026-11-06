@@ -248,7 +248,6 @@ ddescribe(
           serviceKey: 'svc_test_key',
           branchId: BRANCH,
         },
-        receiptMedia: { attachTimeoutMs: 15000 },
       });
       sleep = jest.fn<Promise<void>, [number]>().mockResolvedValue(undefined);
       httpRequest = jest

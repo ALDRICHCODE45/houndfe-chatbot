@@ -27,24 +27,30 @@ describe('AppConfigModule integration', () => {
     CHATBOT_API_CASHIER_USER_ID: '00000000-0000-4000-8000-000000000001',
     OPS_CHANNEL_PHONE: '5215500000000',
     // WU1B receipt media
-    RECEIPT_MEDIA_ENABLED: 'false',
     RECEIPT_MEDIA_MAX_BYTES: '10485760',
-    RECEIPT_STORAGE_FORCE_PATH_STYLE: 'false',
     RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
     RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
-    RECEIPT_MEDIA_METRICS_ENABLED: 'false',
-    // SQ-2A shipping keys (managed; provider values cleared for default-off)
-    SHIPPING_QUOTES_ENABLED: 'false',
-    SKYDROPX_BASE_URL: 'https://api-pro.skydropx.com',
-    SKYDROPX_CLIENT_ID: 'test-client-id',
-    SKYDROPX_CLIENT_SECRET: 'test-client-secret',
-    SKYDROPX_ORIGIN_POSTAL_CODE: '06000',
-    SKYDROPX_ORIGIN_STATE: 'Ciudad de Mexico',
-    SKYDROPX_ORIGIN_MUNICIPALITY: 'Cuauhtemoc',
-    SKYDROPX_ORIGIN_NEIGHBORHOOD: 'Centro',
   };
 
-  const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
+  // Removed shipping vars (U6): managed so a leaked value never escapes a test.
+  const REMOVED_SHIPPING_ENV: Record<string, string> = {
+    SHIPPING_QUOTES_ENABLED: 'true',
+    SHIPPING_DEMO_PARCEL_PROFILE_JSON: '{"x":1}',
+    SKYDROPX_BASE_URL: 'not-a-url',
+    SKYDROPX_CLIENT_ID: 'id',
+    SKYDROPX_CLIENT_SECRET: 'secret',
+    SKYDROPX_ORIGIN_POSTAL_CODE: 'bad',
+    SKYDROPX_ORIGIN_STATE: 'x',
+    SKYDROPX_ORIGIN_MUNICIPALITY: 'x',
+    SKYDROPX_ORIGIN_NEIGHBORHOOD: 'x',
+    MINIMAL_CATALOG_SHIPPING_ENABLED: 'false',
+  };
+
+  const MANAGED_KEYS = [
+    ...Object.keys(VALID_ENV),
+    ...Object.keys(REMOVED_SHIPPING_ENV),
+    'LLM_MAX_STEPS',
+  ];
   let savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
@@ -170,20 +176,18 @@ describe('AppConfigModule integration', () => {
     });
   });
 
-  // WU1B RED: receiptMedia subtree absent → test fails until GREEN
-  describe('receiptMedia disabled-default', () => {
+  // R3/S7: receipt media is always on; its knobs boot from defaults and the
+  // removed flag vars have no effect.
+  describe('receiptMedia always-on defaults', () => {
     it.each([
-      { enabled: undefined, label: 'omitted RECEIPT_MEDIA_ENABLED' },
-      { enabled: 'false', label: 'explicit false' },
+      { flag: undefined, label: 'no removed flag' },
+      { flag: 'false', label: 'removed RECEIPT_MEDIA_ENABLED=false' },
     ])(
-      '$label boots and ConfigService returns disabled-default receiptMedia',
-      async ({ enabled }) => {
+      '$label boots and ConfigService returns the default receiptMedia',
+      async ({ flag }) => {
         Object.assign(process.env, VALID_ENV);
-        if (enabled === undefined) {
-          delete process.env.RECEIPT_MEDIA_ENABLED;
-        } else {
-          process.env.RECEIPT_MEDIA_ENABLED = enabled;
-        }
+        if (flag === undefined) delete process.env.RECEIPT_MEDIA_ENABLED;
+        else process.env.RECEIPT_MEDIA_ENABLED = flag;
 
         const moduleRef = await Test.createTestingModule({
           imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
@@ -191,66 +195,35 @@ describe('AppConfigModule integration', () => {
 
         const config = moduleRef.get(ConfigService);
 
-        const disabledDefault = {
-          enabled: false,
+        expect(config.get('receiptMedia')).toEqual({
           maxBytes: 10_485_760,
           meta: {
-            allowedHosts: [] as string[],
-            metadataTimeoutMs: undefined,
-            downloadTimeoutMs: undefined,
+            allowedHosts: ['lookaside.fbsbx.com'],
+            metadataTimeoutMs: 10_000,
+            downloadTimeoutMs: 30_000,
           },
-          storage: {
-            endpoint: undefined,
-            region: undefined,
-            bucket: undefined,
-            accessKeyId: undefined,
-            secretAccessKey: undefined,
-            forcePathStyle: false,
-          },
-          publicBaseUrl: undefined,
-          capability: {
-            keys: undefined,
-            activeVersion: undefined,
-          },
-          attachTimeoutMs: undefined,
           worker: {
-            enabled: false,
             concurrency: 2,
             leaseMs: 60_000,
-            pollIntervalMs: undefined,
+            pollIntervalMs: 5_000,
           },
-          metricsEnabled: false,
           metricsToken: undefined,
-        };
-
-        expect(config.get('receiptMedia')).toEqual(disabledDefault);
+        });
 
         await moduleRef.close();
       },
     );
   });
 
-  // SQ-2A: shippingQuotes disabled-default boot with the Skydropx base URL default.
-  describe('shippingQuotes disabled-default', () => {
-    it.each([undefined, 'false'])(
-      'boots with disabled-default shippingQuotes for %s',
-      async (enabled) => {
-        Object.assign(process.env, VALID_ENV);
-        // Clear ambient provider values so disabled-default stays undefined.
-        for (const key of Object.keys(VALID_ENV))
-          if (key.startsWith('SKYDROPX_')) delete process.env[key];
-        delete process.env.SHIPPING_QUOTES_ENABLED;
-        if (enabled !== undefined)
-          process.env.SHIPPING_QUOTES_ENABLED = enabled;
-        const moduleRef = await Test.createTestingModule({
-          imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
-        }).compile();
-        expect(moduleRef.get(ConfigService).get('shippingQuotes')).toEqual({
-          enabled: false,
-          skydropx: { baseUrl: 'https://api-pro.skydropx.com' },
-        });
-        await moduleRef.close();
-      },
-    );
+  // U6: chatbot-side carrier quoting is gone; its env vars have no effect.
+  it('boots and exposes no shipping config when the removed shipping vars are set', async () => {
+    Object.assign(process.env, VALID_ENV, REMOVED_SHIPPING_ENV);
+    const moduleRef = await Test.createTestingModule({
+      imports: [AppConfigModule.forRoot({ ignoreEnvFile: true })],
+    }).compile();
+    const config = moduleRef.get(ConfigService);
+    expect(config.get('shippingQuotes')).toBeUndefined();
+    expect(config.get('minimalCatalogAgent')).toBeUndefined();
+    await moduleRef.close();
   });
 });

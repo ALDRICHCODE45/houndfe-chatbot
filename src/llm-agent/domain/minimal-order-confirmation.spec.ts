@@ -96,17 +96,12 @@ const eligible = (): MinimalOrderSnapshot => {
 };
 
 describe('shipping summary and exact binding', () => {
-  const withShipping = (classification: 'charged' | 'free') => ({
+  const withShipping = (customerChargeCents: number) => ({
     ...eligible(),
-    shipping: {
-      classification,
-      chargeCents: classification === 'charged' ? 5000 : 0,
-      approvalId: 'approval-1',
-      quoteId: 'quote-1',
-    },
+    shipping: { quoteId: 'quote-1', customerChargeCents },
   });
-  it('S1/S4: presents approved freight and the freight-inclusive total', () => {
-    const summary = renderMinimalOrderSummary(withShipping('charged'));
+  it('[S2,S3] presents the backend charge and the charge-inclusive total', () => {
+    const summary = renderMinimalOrderSummary(withShipping(5000));
     expect(summary).toContain('Total de productos: $27.00 MXN');
     expect(summary).toContain('Envío: $50.00 MXN');
     expect(summary).toContain('Total a pagar: $77.00 MXN');
@@ -115,60 +110,92 @@ describe('shipping summary and exact binding', () => {
       'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
     );
   });
-  it('S2/S4: presents covered shipping without a freight line', () => {
-    const summary = renderMinimalOrderSummary(withShipping('free'));
+  it('[S3] presents a zero charge as shipping without cost and no extra total', () => {
+    const summary = renderMinimalOrderSummary(withShipping(0));
     expect(summary).toContain('Total de productos: $27.00 MXN');
-    expect(summary).toContain('envío cubierto por su compra');
-    expect(summary).not.toContain('Envío:');
+    expect(summary).toContain('Envío: sin costo para usted');
+    expect(summary).not.toContain('Total a pagar');
     expect(summary).not.toContain('no está incluido');
   });
-  it('S2/S4: covered shipping remains bound to its exact approval and quote', () => {
-    const snapshot = withShipping('free');
+  it('[S3,S7] shows carrier, charge, credit and the ETA line', () => {
+    const summary = renderMinimalOrderSummary({
+      ...eligible(),
+      shipping: {
+        quoteId: 'quote-1',
+        customerChargeCents: 3000,
+        creditCents: 12000,
+        option: { carrier: 'Envíos Perros', service: 'Estándar' },
+        eta: { days: 3 },
+      },
+    });
+    expect(summary).toContain('Envío con Envíos Perros (Estándar): $30.00 MXN');
+    expect(summary).toContain(
+      'Usted tiene un crédito de $120.00 MXN por sus productos',
+    );
+    expect(summary).toContain('Llega en aproximadamente 3 días hábiles');
+    expect(summary).toContain('Total a pagar: $57.00 MXN');
+    expect(summary).toContain('Entrega a: Ana Pérez, Av. Juárez 10');
+  });
+  it('[S7] a STOCK_PENDING eta says delivery depends on restock; no credit line at zero', () => {
+    const summary = renderMinimalOrderSummary({
+      ...eligible(),
+      shipping: {
+        quoteId: 'quote-1',
+        customerChargeCents: 3000,
+        creditCents: 0,
+        option: null,
+        eta: { days: null, reason: 'STOCK_PENDING' },
+      },
+    });
+    expect(summary).toContain('Envío: $30.00 MXN');
+    expect(summary).not.toContain('crédito');
+    expect(summary).toContain(
+      'La fecha de entrega depende de la reposición de existencias; se la confirmamos en cuanto la tengamos.',
+    );
+    expect(summary).not.toContain('Llega en');
+  });
+  it('[S4] pickup says the customer picks it up in store with no shipping cost', () => {
+    const snapshot: MinimalOrderSnapshot = {
+      ...eligible(),
+      shipping: { mode: 'pickup' },
+    };
+    const summary = renderMinimalOrderSummary(snapshot);
+    expect(summary).toContain('Recoge en tienda (sin costo de envío)');
+    expect(summary).toContain('Total de productos: $27.00 MXN');
+    expect(summary).not.toContain('Entrega a:');
+    expect(summary).not.toContain('Total a pagar');
+    expect(summary).not.toContain('no está incluido');
+    expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
+    expect(sameMinimalOrder(snapshot, withShipping(0))).toBe(false);
+    expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
+  });
+  it.each([
+    { customerChargeCents: 6000 },
+    { quoteId: 'quote-2' },
+    { creditCents: 100 },
+    { option: { carrier: 'Otro', service: 'Ground' } },
+    { eta: { days: 5 } },
+  ])('[S2] changed quote content invalidates exact consent (%j)', (change) => {
+    const snapshot = withShipping(5000);
     expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
     expect(
       sameMinimalOrder(snapshot, {
         ...snapshot,
-        shipping: { ...snapshot.shipping, approvalId: 'approval-2' },
-      }),
-    ).toBe(false);
-    expect(
-      sameMinimalOrder(snapshot, {
-        ...snapshot,
-        shipping: { ...snapshot.shipping, quoteId: 'quote-2' },
+        shipping: { ...snapshot.shipping, ...change },
       }),
     ).toBe(false);
     expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
   });
-  it.each([
-    { classification: 'free', chargeCents: 0 },
-    { chargeCents: 6000 },
-    { approvalId: 'approval-2' },
-    { quoteId: 'quote-2' },
-  ])(
-    'S4: changed shipping metadata invalidates exact consent (%j)',
-    (change) => {
-      const snapshot = withShipping('charged');
-      expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
-      expect(
-        sameMinimalOrder(snapshot, {
-          ...snapshot,
-          shipping: { ...snapshot.shipping, ...change },
-        } as MinimalOrderSnapshot),
-      ).toBe(false);
-      expect(sameMinimalOrder(snapshot, eligible())).toBe(false);
-    },
-  );
 });
 
 describe('new address S2/S3/S4/S6', () => {
   it.each([null, CUSTOMER])(
-    'atomic enables new address for customer %s',
+    'enables new address for customer %s',
     (sourceCustomerId) => {
       const draft = { ...newDraft(), sourceCustomerId };
       const verdict = evaluateMinimalOrder({
         confirmedDraft: draft,
         quote: quote(),
-        atomicCheckoutEnabled: true,
       });
       expect(verdict.ok).toBe(true);
       if (!verdict.ok) throw new Error('new eligibility');
@@ -177,6 +204,7 @@ describe('new address S2/S3/S4/S6', () => {
       );
       expect(renderMinimalOrderSummary(verdict.snapshot)).toContain('Calle 5');
       const changed = structuredClone(verdict.snapshot);
+      if (changed.draft === null) throw new Error('draft');
       changed.draft.customer.firstName = 'Otro';
       expect(sameMinimalOrder(verdict.snapshot, changed)).toBe(false);
     },
@@ -189,7 +217,6 @@ describe('new address S2/S3/S4/S6', () => {
       evaluateMinimalOrder({
         confirmedDraft: draft,
         quote: quote(),
-        atomicCheckoutEnabled: true,
       }),
     ).toEqual({ ok: false, reason: 'invalid_state' });
   });
@@ -228,7 +255,13 @@ describe('evaluateMinimalOrder', () => {
       },
     ],
     ['delivery_unconfirmed', { confirmedDraft: null, quote: quote() }],
-    ['new_address_unsupported', { confirmedDraft: newDraft(), quote: quote() }],
+    [
+      'new_address_unsupported',
+      {
+        confirmedDraft: { ...savedDraft(), sourceCustomerId: null },
+        quote: quote(),
+      },
+    ],
   ] as const)('rejects %s', (reason, input) => {
     expect(evaluateMinimalOrder(input)).toEqual({ ok: false, reason });
   });
@@ -271,7 +304,6 @@ describe('renderMinimalOrderSummary', () => {
         `• Ibuprofeno — 500 mg: 2 × $15.00 MXN; importe $27.00 MXN (${label} $3.00 MXN)`,
         'Total de productos: $27.00 MXN',
         'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
-        'El envío no está incluido en este total y se coordinará por separado.',
         '',
         'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
       ].join('\n'),
@@ -292,14 +324,13 @@ describe('renderMinimalOrderSummary', () => {
     ).toBe(renderMinimalOrderSummary(snapshot));
   });
 
-  it('lists items, total, delivery address and the no-shipping notice', () => {
+  it('lists items, total and delivery address without a shipping block', () => {
     expect(renderMinimalOrderSummary(eligible())).toBe(
       [
         'Resumen de su pedido:',
         '• Ibuprofeno — 500 mg: 2 × $15.00 MXN; importe $27.00 MXN',
         'Total de productos: $27.00 MXN',
         'Entrega a: Ana Pérez, Av. Juárez 10, Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
-        'El envío no está incluido en este total y se coordinará por separado.',
         '',
         'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
       ].join('\n'),

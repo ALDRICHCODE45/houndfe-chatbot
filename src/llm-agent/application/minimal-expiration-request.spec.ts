@@ -43,7 +43,6 @@ const UNAVAILABLE = {
 
 function harness(
   over: {
-    enabled?: boolean;
     catalog?: StockCheckResponse;
     outcome?: unknown;
   } = {},
@@ -62,7 +61,6 @@ function harness(
     chatbotApi: { getStock },
     reservations: { reserve },
     orchestrator: { orchestrateExpirationPost: orchestrate },
-    enabled: over.enabled ?? true,
   });
   return { service, getStock, reserve, orchestrate };
 }
@@ -153,13 +151,6 @@ describe('MinimalExpirationRequestService (E1a prerequisite callee)', () => {
       if (stage !== 'post') expect(h.orchestrate).not.toHaveBeenCalled();
     },
   );
-
-  it('is unavailable when default-off and writes nothing', async () => {
-    const h = harness({ enabled: false });
-    await expect(prepare(h.service)).resolves.toEqual(UNAVAILABLE);
-    expect(h.getStock).not.toHaveBeenCalled();
-    expect(h.reserve).not.toHaveBeenCalled();
-  });
 
   it('fences the allowlist before any read and never reserves an unbound identity', async () => {
     const fence = harness();

@@ -6,8 +6,29 @@ import request from 'supertest';
 import { WebhookDispatcherService } from '../application/webhook-dispatcher.service';
 import { WebhookEventDto } from './dto/webhook-event.dto';
 import { WebhookVerifyDto } from './dto/webhook-verify.dto';
+import { RestockInboundCapture } from '../application/restock-inbound-capture';
+import { CUSTOMER_INBOUND_CAPTURE } from '../infrastructure/customer-inbound-capture.provider';
+import * as signatures from './signature.guard';
 import { SignatureGuard } from './signature.guard';
 import { WebhookController } from './webhook.controller';
+
+// Human decisions are always on: every webhook goes through the RESTOCK and
+// customer-inbound captures. These stubs parse the verified snapshot like the
+// real capture and always succeed.
+const restockCapture = {
+  capture: jest.fn((snapshot: signatures.VerifiedWebhookSnapshot) =>
+    Promise.resolve({
+      action: 'captured' as const,
+      event: JSON.parse(
+        Buffer.from(snapshot.rawBodyBase64, 'base64').toString('utf8'),
+      ) as WebhookEventDto,
+      evidence: [],
+    }),
+  ),
+} as unknown as RestockInboundCapture;
+const customerCapture = jest.fn(() =>
+  Promise.resolve({ action: 'captured' as const, observations: [] }),
+);
 
 describe('WebhookController', () => {
   const verifyToken = 'verify-token';
@@ -37,8 +58,21 @@ describe('WebhookController', () => {
     controller = new WebhookController(
       configService as unknown as ConfigService,
       dispatcher as unknown as WebhookDispatcherService,
+      restockCapture,
+      customerCapture,
     );
   });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  // Unit calls bypass the guard, so seed the private verified snapshot.
+  const handle = (payload: WebhookEventDto) => {
+    jest.spyOn(signatures, 'readVerifiedWebhookSnapshot').mockReturnValue({
+      rawBodyBase64: Buffer.from(JSON.stringify(payload)).toString('base64'),
+      observedAt: new Date().toISOString(),
+    });
+    return controller.handleEvent(payload, {} as never);
+  };
 
   it('returns the hub challenge when verify token and mode are valid', () => {
     const query: WebhookVerifyDto = {
@@ -68,7 +102,7 @@ describe('WebhookController', () => {
       entry: [],
     };
 
-    await expect(controller.handleEvent(payload)).resolves.toEqual({
+    await expect(handle(payload)).resolves.toEqual({
       received: true,
     });
     expect(dispatcher.dispatch).toHaveBeenCalledWith(payload);
@@ -82,9 +116,7 @@ describe('WebhookController', () => {
 
     dispatcher.dispatch.mockRejectedValueOnce(new Error('admission failed'));
 
-    await expect(controller.handleEvent(payload)).rejects.toThrow(
-      'admission failed',
-    );
+    await expect(handle(payload)).rejects.toThrow('admission failed');
     expect(dispatcher.dispatch).toHaveBeenCalledWith(payload);
   });
 
@@ -112,6 +144,8 @@ describe('WebhookController', () => {
               dispatch: dispatchSpy,
             },
           },
+          { provide: RestockInboundCapture, useValue: restockCapture },
+          { provide: CUSTOMER_INBOUND_CAPTURE, useValue: customerCapture },
         ],
       }).compile();
 

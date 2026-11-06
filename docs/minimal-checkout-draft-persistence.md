@@ -59,7 +59,7 @@ The gated runner contract, in the same spec file:
 ```sh
 # PORT must come from the parent's exclusively owned disposable container.
 RUN_DOCKER_TESTS=0 RUN_CHECKOUT_DRAFT_DB_TESTS=1 CHECKOUT_TEST_PG_PORT="$PORT" \
-  node node_modules/jest/bin/jest.js --runTestsByPath \
+  pnpm test --runTestsByPath \
   src/conversation/infrastructure/minimal-checkout-draft-postgres.spec.ts --runInBand
 ```
 
@@ -68,8 +68,8 @@ RUN_DOCKER_TESTS=0 RUN_CHECKOUT_DRAFT_DB_TESTS=1 CHECKOUT_TEST_PG_PORT="$PORT" \
 No backend, Meta, database connection or production environment is needed:
 
 ```sh
-RUN_DOCKER_TESTS=0 RUN_CHECKOUT_DRAFT_DB_TESTS=0 node node_modules/jest/bin/jest.js --runTestsByPath src/conversation/infrastructure/minimal-checkout-draft-postgres.spec.ts --runInBand
-node node_modules/jest/bin/jest.js --runTestsByPath src/conversation/infrastructure/minimal-checkout-draft-persistence.spec.ts --runInBand
+RUN_DOCKER_TESTS=0 RUN_CHECKOUT_DRAFT_DB_TESTS=0 pnpm test --runTestsByPath src/conversation/infrastructure/minimal-checkout-draft-postgres.spec.ts --runInBand
+pnpm test --runTestsByPath src/conversation/infrastructure/minimal-checkout-draft-persistence.spec.ts --runInBand
 ```
 
 The reusable public contract covers first creation, raw legacy slots, detached reads and exact saved snapshots, competing writers, unchanged rejected writes, sibling/timestamp preservation, stale/omitted legacy patches, and cart/agent-turn compatibility. Memory-only cases check own `undefined`, sibling identity, and unrelated getters. The same runner is reused unchanged for the gated PostgreSQL suite.

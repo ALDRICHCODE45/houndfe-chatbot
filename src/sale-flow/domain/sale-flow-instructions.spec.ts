@@ -2,7 +2,6 @@ import { SYSTEM_PROMPT } from '../../llm-agent/domain/system-prompt';
 import { makeRequestHumanAssistanceTool } from '../application/tools/request-human-assistance.tool';
 import {
   SALE_FLOW_INSTRUCTIONS,
-  SHIPPING_QUOTE_GUIDANCE_FRAGMENT,
   composeSaleFlowSystemPrompt,
 } from './sale-flow-instructions';
 
@@ -17,8 +16,8 @@ import {
  *   - the human-handoff phrase is byte-identical, wrapped in a
  *     `noActivePaymentDetail` branch
  *   - step 11 carries the `promoReQuote` re-confirmation + fresh-UUID rule
- *   - marker order covers the 10-tool registry (getPaymentDetails between
- *     createSale and attachReceipt)
+ *   - marker order covers the tool registry (getPaymentDetails between
+ *     createSale and cancelSale)
  */
 describe('sale-flow-instructions', () => {
   const base = 'BASE_PROMPT_PLACEHOLDER';
@@ -41,7 +40,7 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('encodes the 15-step escrow flow markers in order (with getPaymentDetails between createSale and attachReceipt, cancelSale after attachReceipt)', () => {
+    it('encodes the 15-step escrow flow markers in order (with getPaymentDetails between createSale and cancelSale)', () => {
       const stepOrder = [
         'searchCatalog',
         'checkStock',
@@ -50,7 +49,6 @@ describe('sale-flow-instructions', () => {
         'upsertCustomer',
         'createSale',
         'getPaymentDetails',
-        'attachReceipt',
         'cancelSale',
       ];
       let lastIndex = -1;
@@ -228,33 +226,26 @@ describe('sale-flow-instructions', () => {
   });
 
   describe('replenishment ETA guidance (text contract only, not model compliance)', () => {
-    it.each([false, true])(
-      'supports ordinary date inquiries with shipping enabled=%s',
-      (shippingQuoteAvailable) => {
-        const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
-          shippingQuoteAvailable,
-        });
-        expect(prompt).toContain('¿Hay alguna fecha aproximada');
-        expect(prompt).toContain('disponibilidad del producto?');
-        expect(prompt).toContain('sin exigir compromiso de compra');
-        expect(prompt).toContain(
-          'no tienes una fecha de reposición confirmada',
-        );
-        expect(prompt).toContain(
-          '`checkStock` consulta existencias, no proporciona una fecha de reposición',
-        );
-        expect(prompt).toContain('Nunca inventes una fecha de reposición');
-        expect(prompt).not.toContain(
-          'Si la conversación no se trata de una venta',
-        );
-        expect(prompt).toContain(
-          'no para consultas de disponibilidad ni para la falta de una fecha de reposición',
-        );
-        expect(prompt).toContain(
-          'Las preguntas de disponibilidad o fecha de reposición no activan esa frase',
-        );
-      },
-    );
+    it('supports ordinary date inquiries', () => {
+      const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
+      expect(prompt).toContain('¿Hay alguna fecha aproximada');
+      expect(prompt).toContain('disponibilidad del producto?');
+      expect(prompt).toContain('sin exigir compromiso de compra');
+      expect(prompt).toContain('no tienes una fecha de reposición confirmada');
+      expect(prompt).toContain(
+        '`checkStock` consulta existencias, no proporciona una fecha de reposición',
+      );
+      expect(prompt).toContain('Nunca inventes una fecha de reposición');
+      expect(prompt).not.toContain(
+        'Si la conversación no se trata de una venta',
+      );
+      expect(prompt).toContain(
+        'no para consultas de disponibilidad ni para la falta de una fecha de reposición',
+      );
+      expect(prompt).toContain(
+        'Las preguntas de disponibilidad o fecha de reposición no activan esa frase',
+      );
+    });
 
     it('keeps ETA inquiries behind product confirmation, real-ID recovery and validated shortage', () => {
       const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
@@ -402,7 +393,7 @@ describe('sale-flow-instructions', () => {
         'sí puedes agradecer información o paciencia cuando el contexto lo amerite',
       );
       expect(closing).toContain('un saludo neutral si el cliente no la indicó');
-      expect(closing).toContain('este slice no cotiza envíos');
+      expect(closing).toContain('el envío lo cotiza el backend');
     });
 
     it('keeps the shortage call immediate without a new voice-driven consent gate', () => {
@@ -414,51 +405,46 @@ describe('sale-flow-instructions', () => {
       );
     });
 
-    it.each([false, true])(
-      'separates internal intake truth from conditional copy with shipping=%s',
-      (shippingQuoteAvailable) => {
-        const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
-          shippingQuoteAvailable,
-        });
-        const description = makeRequestHumanAssistanceTool(
-          {} as never,
-        ).description;
-        for (const instructions of [prompt, description]) {
-          expect(instructions).toContain('Regla INTERNA; no la recites');
-          expect(instructions).toContain(
-            'Solo con registro histórico confirmado (nuevo o ya existente)',
-          );
-          expect(instructions).toContain(
-            'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
-          );
-          expect(instructions).toContain('No implica reserva');
-          expect(instructions).toContain(
-            'Por ahora no puedo confirmar que su consulta haya quedado registrada.',
-          );
-          expect(instructions).toContain(
-            'No afirmes éxito ni ausencia definitiva de registro',
-          );
-          expect(instructions).toContain('No fuerces una oferta de venta');
-          expect(instructions).toContain('no afirmes que acabas de enviarla');
-          expect(instructions).toContain(
-            'No pidas permiso para registrar lo ya aceptado',
-          );
-          expect(instructions).toContain(
-            'Tampoco demuestra que no exista seguimiento',
-          );
-          expect(instructions).toContain('pendiente');
-          for (const obsolete of [
-            'Registramos su interés',
-            'registrar su interés',
-            'su interés haya quedado registrado',
-            'ni hay seguimiento',
-            'no hay resolución actual',
-          ]) {
-            expect(instructions).not.toContain(obsolete);
-          }
+    it('separates internal intake truth from conditional copy', () => {
+      const prompt = composeSaleFlowSystemPrompt(SYSTEM_PROMPT);
+      const description = makeRequestHumanAssistanceTool(
+        {} as never,
+      ).description;
+      for (const instructions of [prompt, description]) {
+        expect(instructions).toContain('Regla INTERNA; no la recites');
+        expect(instructions).toContain(
+          'Solo con registro histórico confirmado (nuevo o ya existente)',
+        );
+        expect(instructions).toContain(
+          'Ya quedó registrada su consulta sobre cuándo tendremos [presentación] de nuevo.',
+        );
+        expect(instructions).toContain('No implica reserva');
+        expect(instructions).toContain(
+          'Por ahora no puedo confirmar que su consulta haya quedado registrada.',
+        );
+        expect(instructions).toContain(
+          'No afirmes éxito ni ausencia definitiva de registro',
+        );
+        expect(instructions).toContain('No fuerces una oferta de venta');
+        expect(instructions).toContain('no afirmes que acabas de enviarla');
+        expect(instructions).toContain(
+          'No pidas permiso para registrar lo ya aceptado',
+        );
+        expect(instructions).toContain(
+          'Tampoco demuestra que no exista seguimiento',
+        );
+        expect(instructions).toContain('pendiente');
+        for (const obsolete of [
+          'Registramos su interés',
+          'registrar su interés',
+          'su interés haya quedado registrado',
+          'ni hay seguimiento',
+          'no hay resolución actual',
+        ]) {
+          expect(instructions).not.toContain(obsolete);
         }
-      },
-    );
+      }
+    });
   });
 
   describe('composeSaleFlowSystemPrompt', () => {
@@ -541,7 +527,7 @@ describe('sale-flow-instructions', () => {
       }
     });
 
-    it('marks the 12-tool order with requestHumanAssistance after cancelSale (step 16)', () => {
+    it('marks the 11-tool order with requestHumanAssistance after cancelSale (step 16)', () => {
       const stepOrder = [
         'searchCatalog',
         'checkStock',
@@ -550,7 +536,6 @@ describe('sale-flow-instructions', () => {
         'upsertCustomer',
         'createSale',
         'getPaymentDetails',
-        'attachReceipt',
         'cancelSale',
         'requestHumanAssistance',
       ];
@@ -683,12 +668,12 @@ describe('sale-flow-instructions', () => {
       return line as string;
     }
 
-    it('replaces step 13 with the exact canonical terminal-guidance literal (WU12: server-owned evidence gates acknowledgement; without evidence, state could-not-be-associated + offer assistance; valid empty attachReceipt returns terminal guidance)', () => {
+    it('replaces step 13 with the exact canonical literal (server-owned evidence gates acknowledgement; without evidence, state could-not-be-associated + offer assistance)', () => {
       // Canonical spec step 13: server-owned evidence gates "acknowledge pending review";
-      // without evidence: state "could not be associated" + offer assistance; valid
-      // empty attachReceipt result = terminal guidance, never retry, never ask protected ids.
+      // without evidence: state "could not be associated" + offer assistance;
+      // never ask protected ids.
       expect(step13()).toBe(
-        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT call `attachReceipt` and do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference. Only explicit server-owned evidence that the image was correlated to an active confirmed sale permits acknowledging that it is pending human review. Without that evidence, state that the receipt could not be associated and offer human assistance — do not claim attachment or pending review. If `attachReceipt` ever returns a result from a valid empty invocation, treat it as terminal guidance — never retry it and never ask the customer for any protected identifier.',
+        '13. When the customer sends a receipt image, receipt images are handled by the server-owned durable receipt workflow: do NOT collect or derive a sale ID, media URL, object key, token, capability, pending media, amount, date, or reference, and never ask the customer for any protected identifier. Only explicit server-owned evidence that the image was correlated to an active confirmed sale permits acknowledging that it is pending human review. Without that evidence, state that the receipt could not be associated and offer human assistance — do not claim attachment or pending review.',
       );
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredAmountCents');
       expect(SALE_FLOW_INSTRUCTIONS).not.toContain('declaredReference');
@@ -717,93 +702,15 @@ describe('sale-flow-instructions', () => {
     });
   });
 
-  describe('opt-in shipping guidance fragment (SQ-5C3d1)', () => {
-    const canonical = base + '\n\n' + SALE_FLOW_INSTRUCTIONS;
-
-    it('keeps the default and explicit-off composed prompt byte-identical to base + "\\n\\n" + slice and never mentions getShippingQuote', () => {
-      expect(composeSaleFlowSystemPrompt(base)).toBe(canonical);
-      expect(
-        composeSaleFlowSystemPrompt(base, { shippingQuoteAvailable: false }),
-      ).toBe(canonical);
-      expect(composeSaleFlowSystemPrompt(base, {})).toBe(canonical);
-      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('getShippingQuote');
+  describe('shipping (U6: backend-owned quotes)', () => {
+    it('composes exactly base + "\\n\\n" + slice with no chatbot-side quote tool', () => {
+      expect(composeSaleFlowSystemPrompt(base)).toBe(
+        base + '\n\n' + SALE_FLOW_INSTRUCTIONS,
+      );
       expect(composeSaleFlowSystemPrompt(base)).not.toContain(
         'getShippingQuote',
       );
-    });
-
-    it('fails closed: hostile or non-boolean availability never enables the fragment', () => {
-      const hostile = {
-        get shippingQuoteAvailable(): boolean {
-          throw new Error('hostile');
-        },
-      };
-      expect(composeSaleFlowSystemPrompt(base, hostile)).toBe(canonical);
-      expect(
-        composeSaleFlowSystemPrompt(base, {
-          shippingQuoteAvailable: 1 as unknown as boolean,
-        }),
-      ).toBe(canonical);
-    });
-
-    it('appends only the shipping fragment when shippingQuoteAvailable is true', () => {
-      const enabled = composeSaleFlowSystemPrompt(base, {
-        shippingQuoteAvailable: true,
-      });
-      expect(enabled).toBe(
-        base +
-          '\n\n' +
-          SALE_FLOW_INSTRUCTIONS +
-          SHIPPING_QUOTE_GUIDANCE_FRAGMENT,
-      );
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT.length).toBeGreaterThan(0);
-      expect(enabled).toContain('getShippingQuote');
-    });
-
-    it('explicitly supersedes the step-15 note and encodes approval-request semantics', () => {
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain(
-        'este slice no cotiza envíos',
-      );
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain('getShippingQuote');
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain('reused');
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toContain('quoted');
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toMatch(
-        /solicitud de aprobación/i,
-      );
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toMatch(
-        /NO significa que un humano ya la aprobó/i,
-      );
-    });
-
-    it('forbids relaying amount/credit/carrier/ref/digest and shipping_approval forgery, and requires a fresh re-quote on expiry', () => {
-      const fragment = SHIPPING_QUOTE_GUIDANCE_FRAGMENT;
-      for (const marker of [
-        'monto',
-        'crédito',
-        'transportista',
-        'referencia',
-        'digest',
-      ]) {
-        expect(fragment.toLowerCase()).toContain(marker);
-      }
-      expect(fragment).toContain("kind: 'shipping_approval'");
-      expect(fragment).toContain('unavailable');
-      expect(fragment).toContain('handoff_required');
-      expect(fragment).toMatch(/expir/i);
-      expect(fragment).toMatch(/vuelve a llamar a `getShippingQuote`/i);
-      expect(fragment).toMatch(/SQ-5D/);
-    });
-
-    it('blocks createSale for a shipping order until the SQ-5D server gate exists', () => {
-      const createSaleIdx =
-        SHIPPING_QUOTE_GUIDANCE_FRAGMENT.indexOf('createSale');
-      expect(createSaleIdx).toBeGreaterThan(-1);
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT.indexOf('SQ-5D')).toBeGreaterThan(
-        createSaleIdx,
-      );
-      expect(SHIPPING_QUOTE_GUIDANCE_FRAGMENT).toMatch(
-        /No llames a `createSale`/,
-      );
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain("kind: 'shipping_approval'");
     });
   });
 });

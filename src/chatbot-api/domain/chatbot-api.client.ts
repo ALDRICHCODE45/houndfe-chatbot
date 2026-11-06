@@ -9,6 +9,10 @@ import type { ExpirationIntakeInput } from './dtos/human-decisions-expiration.dt
 import type { ExpirationIntakeReceipt } from './dtos/human-decisions-expiration-receipt.dto';
 import type { ExpirationDecision } from './dtos/human-decisions-expiration-decision.dto';
 import type {
+  DeliveryZoneIntakeInput,
+  DeliveryZoneRequester,
+} from './dtos/human-decisions-delivery-zone.dto';
+import type {
   RestockApplicationOutcomeAck,
   RestockApplicationOutcomeRequest,
   RestockDecision,
@@ -17,8 +21,6 @@ import type {
 } from './dtos/human-decisions.dto';
 import { CartEvaluationResult, CartItemInput } from './dtos/pricing.dto';
 import {
-  AttachReceiptInput,
-  AttachReceiptResponse,
   BotSaleResponse,
   CancelSaleInput,
   CancelSaleResult,
@@ -36,13 +38,23 @@ import type {
   CheckoutResponse,
   CheckoutStatus,
 } from './dtos/checkout.dto';
+import type {
+  CreateShippingQuoteInput,
+  ShippingQuoteResponse,
+} from './dtos/shipping-quote.dto';
+import type {
+  ReceiptUploadFields,
+  ReceiptUploadFile,
+  ReceiptUploadResponse,
+} from './dtos/receipt-upload.dto';
+import type { ReceiptOutcome } from './dtos/receipt-outcome.dto';
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
 /**
- * Transport-level options for attachment-only receipt upload (WU11B).
- * `signal` is caller-owned and forwarded verbatim to the HTTP layer as the
- * Axios `signal`; the request timeout is owned by the HTTP client config.
+ * Transport-level options for the multipart receipt upload. `signal` is
+ * caller-owned and forwarded verbatim to the HTTP layer as the Axios
+ * `signal`; the request timeout is owned by the HTTP client.
  */
 export interface AttachReceiptTransportOptions {
   signal?: AbortSignal;
@@ -77,6 +89,13 @@ export interface ChatbotApiClient {
     idempotencyKey: string,
   ): Promise<CheckoutResponse>;
   getCheckoutStatus(idempotencyKey: string): Promise<CheckoutStatus>;
+  /** `POST /chatbot-api/shipping/quotes`: the backend picks the cheapest
+   *  carrier and computes the credit; single attempt, no retry. Rejects with
+   *  `ChatbotApiError` carrying `errorCode` (e.g. `PACKAGING_DATA_MISSING`,
+   *  `SHIPPING_QUOTE_UNAVAILABLE`); a malformed body is an `UpstreamError`. */
+  createShippingQuote(
+    input: CreateShippingQuoteInput,
+  ): Promise<ShippingQuoteResponse>;
   upsertCustomer(dto: CustomerUpsertInput): Promise<CustomerUpsertResponse>;
   createSale(
     dto: CreateSaleInput,
@@ -92,11 +111,23 @@ export interface ChatbotApiClient {
    *  The `cancelSale` tool layer always sends `reason: 'CUSTOMER_REQUEST'`
    *  and the injected `cashierUserId`. */
   cancelSale(saleId: string, dto: CancelSaleInput): Promise<CancelSaleResult>;
-  attachReceipt(
+  /** Multipart `POST /chatbot-api/sales/:saleId/receipts` (scope
+   *  `sales:write`). `idempotencyKey` is the WhatsApp media id: a retry with
+   *  the same key and file returns the same receipt. Exactly one POST per
+   *  call; only a strictly valid 201 resolves. Rejects with `ChatbotApiError`
+   *  carrying `statusCode` and `errorCode` (`body.error`); a timeout or
+   *  network failure has `statusCode: null` (unknown outcome). */
+  uploadReceipt(
     saleId: string,
-    dto: AttachReceiptInput,
+    file: ReceiptUploadFile,
+    fields: ReceiptUploadFields,
+    idempotencyKey: string,
     options?: AttachReceiptTransportOptions,
-  ): Promise<AttachReceiptResponse>;
+  ): Promise<ReceiptUploadResponse>;
+  /** `GET /chatbot-api/receipts/:receiptId` (scope `sales:read`): the
+   *  human outcome of an uploaded receipt. UUID-validated before any request,
+   *  safe GET retry policy, strict body parse; errors carry `body.error`. */
+  getReceiptOutcome(receiptId: string): Promise<ReceiptOutcome>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
   /** HD-R2b2: `POST /chatbot-api/human-decisions` RESTOCK intake (scope
@@ -140,4 +171,16 @@ export interface ChatbotApiClient {
     decisionId: string,
     request: RestockApplicationOutcomeRequest,
   ): Promise<RestockApplicationOutcomeAck>;
+  /** DELIVERY_ZONE intake: `POST /chatbot-api/human-decisions` with `type:
+   *  "DELIVERY_ZONE"` (scope `human-decisions:create`) and `X-Idempotency-Key`
+   *  = `sourceRequestId`. Single attempt; resolves on `201`/`200` with the
+   *  current requester state (PENDING, or RESOLVED for EXISTING_ZONE). The ACK
+   *  is identical to RESTOCK: use `recordRestockApplicationOutcome` with the
+   *  requester id. */
+  submitDeliveryZoneIntake(
+    dto: DeliveryZoneIntakeInput,
+  ): Promise<DeliveryZoneRequester>;
+  /** DELIVERY_ZONE poll: `GET /chatbot-api/human-decisions/:id` by requester id
+   *  (scope `human-decisions:read`), safe GET retry policy. */
+  getDeliveryZoneRequester(requesterId: string): Promise<DeliveryZoneRequester>;
 }

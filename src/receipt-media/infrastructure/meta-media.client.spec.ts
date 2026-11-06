@@ -962,6 +962,42 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
     'hex',
   );
 
+  it('downloads a PDF document receipt validated by magic bytes (S8)', async () => {
+    const PDF = Buffer.from('%PDF-1.7\n1 0 obj << >> endobj\n%%EOF\n');
+    const { client } = makePipeline({
+      metadata: { ...META_OK, mime_type: 'application/pdf' },
+      hops: [
+        {
+          data: streamOf([PDF]),
+          headers: { 'content-type': 'application/pdf' },
+        },
+      ],
+    });
+    const result = await resolveAndDownload(client)(
+      req('media-123', 'application/pdf'),
+    );
+    try {
+      expect(result.mimeType).toBe('application/pdf');
+      expect(result.byteCount).toBe(PDF.length);
+      expect(sha256Matches(result, PDF)).toBe(true);
+    } finally {
+      await result.cleanup();
+    }
+  });
+
+  it('rejects a PDF-declared body without the PDF magic as MIME_MISMATCH', async () => {
+    const { client, created } = makePipeline({
+      metadata: { ...META_OK, mime_type: 'application/pdf' },
+      hops: [{ headers: { 'content-type': 'application/pdf' } }],
+    });
+    await safeError(
+      resolveAndDownload(client)(req('media-123', 'application/pdf')),
+      'MIME_MISMATCH',
+      'MEDIA_VALIDATION',
+    );
+    for (const filePath of created) await expectUnlinked(filePath);
+  });
+
   it('rejects a malformed JPEG body with JPEG_STRUCTURE_INVALID', () =>
     expectRejectedFile(
       { hops: [{ data: streamOf([MALFORMED_JPEG]) }] },

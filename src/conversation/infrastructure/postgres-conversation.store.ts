@@ -9,9 +9,7 @@ import {
   isNonEmptyString,
   isStructuralPendingHumanRequest,
   isPendingHumanRequestId,
-  isReceiptAmountPointer,
   PendingHumanRequest,
-  ReceiptAmountPointer,
 } from '../domain/conversation-store';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 
@@ -421,92 +419,6 @@ export class PostgresConversationStore implements ConversationStore {
     return (rowCount ?? 0) === 1;
   }
 
-  async setReceiptAmountPointer(
-    senderId: string,
-    pointer: ReceiptAmountPointer,
-  ): Promise<boolean> {
-    if (
-      typeof senderId !== 'string' ||
-      senderId.length === 0 ||
-      !isReceiptAmountPointer(pointer)
-    ) {
-      return false;
-    }
-    const { rowCount } = await this.pool.query(
-      `UPDATE conversation_state
-       SET data = jsonb_set(data, '{receiptAmountPointer}',
-         jsonb_build_object('receiptMediaId', $2::text,
-           'saleId', $3::text, 'receiptVersion', $4::text), true)
-       WHERE sender_id = $1 AND (
-         NOT (data ? 'receiptAmountPointer') OR (
-           jsonb_typeof(data->'receiptAmountPointer') = 'object'
-           AND data->'receiptAmountPointer' = jsonb_build_object(
-             'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
-             'saleId', data->'receiptAmountPointer'->'saleId',
-             'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
-           AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
-           AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
-           AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
-           AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
-           AND data->'receiptAmountPointer'->>'saleId' = $3
-           AND data->'receiptAmountPointer'->>'receiptVersion' ~ '^[1-9][0-9]*$'
-           AND (
-             length($4::text) > length(data->'receiptAmountPointer'->>'receiptVersion')
-             OR (
-               length($4::text) = length(data->'receiptAmountPointer'->>'receiptVersion')
-               AND $4::text COLLATE "C" >
-                 (data->'receiptAmountPointer'->>'receiptVersion') COLLATE "C"
-             )
-           )
-         )
-       )`,
-      [
-        senderId,
-        pointer.receiptMediaId,
-        pointer.saleId,
-        pointer.receiptVersion,
-      ],
-    );
-    return (rowCount ?? 0) === 1;
-  }
-
-  async clearReceiptAmountPointer(
-    senderId: string,
-    pointer: ReceiptAmountPointer,
-  ): Promise<boolean> {
-    if (
-      typeof senderId !== 'string' ||
-      senderId.length === 0 ||
-      !isReceiptAmountPointer(pointer)
-    ) {
-      return false;
-    }
-    const { rowCount } = await this.pool.query(
-      `UPDATE conversation_state
-       SET data = data - 'receiptAmountPointer'
-       WHERE sender_id = $1
-         AND jsonb_typeof(data->'receiptAmountPointer') = 'object'
-         AND data->'receiptAmountPointer' = jsonb_build_object(
-           'receiptMediaId', data->'receiptAmountPointer'->'receiptMediaId',
-           'saleId', data->'receiptAmountPointer'->'saleId',
-           'receiptVersion', data->'receiptAmountPointer'->'receiptVersion')
-         AND jsonb_typeof(data->'receiptAmountPointer'->'receiptMediaId') = 'string'
-         AND jsonb_typeof(data->'receiptAmountPointer'->'saleId') = 'string'
-         AND jsonb_typeof(data->'receiptAmountPointer'->'receiptVersion') = 'string'
-         AND data->'receiptAmountPointer'->>'receiptMediaId' = $2
-         AND data->'receiptAmountPointer'->>'saleId' = $3
-         AND data->'receiptAmountPointer'->>'receiptVersion' ~ '^[1-9][0-9]*$'
-         AND data->'receiptAmountPointer'->>'receiptVersion' = $4`,
-      [
-        senderId,
-        pointer.receiptMediaId,
-        pointer.saleId,
-        pointer.receiptVersion,
-      ],
-    );
-    return (rowCount ?? 0) === 1;
-  }
-
   private async clearCanonicalPendingHumanRequest(
     senderId: string,
     requestId: string,
@@ -577,7 +489,7 @@ export class PostgresConversationStore implements ConversationStore {
     // Read-modify-write: merge in APP code to mirror InMemory's
     // `{ ...existing, ...patch }` exactly (data REPLACES if patch
     // carries it, PRESERVES if omitted). The CAS-owned
-    // `receiptAmountPointer` / `pendingHumanRequest` / `minimalCheckoutDraft`
+    // `pendingHumanRequest` / `minimalCheckoutDraft`
     // keys are stripped from the patch and the LIVE values re-applied under
     // the row lock.
     const existing = await this.get(senderId);
@@ -591,7 +503,6 @@ export class PostgresConversationStore implements ConversationStore {
       );
     }
     const data = { ...(merged.data ?? {}) };
-    delete data.receiptAmountPointer;
     delete data.pendingHumanRequest;
     delete data.messages;
     delete data.catalogReferences;
@@ -604,12 +515,7 @@ export class PostgresConversationStore implements ConversationStore {
        VALUES ($1, $2::timestamptz, $3::jsonb)
        ON CONFLICT (sender_id) DO UPDATE
          SET last_message_at = EXCLUDED.last_message_at,
-                 data = CASE
-                   WHEN conversation_state.data ? 'receiptAmountPointer'
-                   THEN jsonb_set(EXCLUDED.data - 'receiptAmountPointer',
-                     '{receiptAmountPointer}', conversation_state.data->'receiptAmountPointer')
-                   ELSE EXCLUDED.data - 'receiptAmountPointer'
-                 END
+                 data = EXCLUDED.data
                  || CASE WHEN conversation_state.data ? 'pendingHumanRequest'
                    THEN jsonb_build_object('pendingHumanRequest', conversation_state.data->'pendingHumanRequest')
                    ELSE '{}'::jsonb END

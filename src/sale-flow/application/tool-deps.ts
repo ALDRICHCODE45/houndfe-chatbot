@@ -6,15 +6,14 @@ import type { SharedRouteMarkersPort } from '../../human-decisions/domain/shared
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 
 /**
- * WU2B runtime RESTOCK capability, threaded into the shared deps ONLY while the
- * experimental gate is exactly `true`.
+ * WU2B runtime RESTOCK capability, threaded into the shared deps (always wired
+ * in production; optional only as a test seam).
  *
  * `markers` + `coordinator` serve the NEW intake route. `recovery` is the
  * read-only seam for an ALREADY accepted request whose preflight blocks with
  * `existing_restock`: it can never POST, reserve, release or fall back to legacy.
  */
 export interface RestockToolCapability {
-  readonly enabled: true;
   readonly markers: SharedRouteMarkersPort;
   readonly coordinator: Pick<RestockIntakeService, 'coordinate'>;
   readonly recovery: Pick<RestockExistingRequestStatusService, 'recover'>;
@@ -30,12 +29,11 @@ export interface RestockToolCapability {
 /**
  * Shared dependencies injected into every sale-flow tool factory.
  *
- * Every factory except the zero-dep `attachReceipt` compatibility tool
- * exposes the SAME deps shape so `RealToolRegistry` can wire them
- * uniformly. `cashierUserId` is only consumed by `createSale`; bank data
+ * Every factory exposes the SAME deps shape so `RealToolRegistry` can wire
+ * them uniformly. `cashierUserId` is only consumed by `createSale`; bank data
  * flows through the runtime `getPaymentDetails` tool (Q1 / R11);
- * `humanHandoffService` is consumed only by `requestHumanAssistance`
- * (the 12th tool) — the other 11 are signal-only and never call the
+ * `humanHandoffService` is consumed only by `requestHumanAssistance` — the
+ * other 10 are signal-only and never call the
  * handoff service directly (ADR-27).
  */
 export interface ToolDeps {

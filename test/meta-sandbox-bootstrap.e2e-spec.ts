@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import { HttpService } from '@nestjs/axios';
 import request from 'supertest';
 import {
+  type OutboundTemplate,
   type OutboundText,
   type SendResult,
   type WhatsappSenderPort,
@@ -35,9 +36,14 @@ const APPROVED_TO = '525550001111';
 
 class FakeTransport implements WhatsappSenderPort {
   readonly sent: OutboundText[] = [];
+  readonly sentTemplates: OutboundTemplate[] = [];
   async sendText(message: OutboundText): Promise<SendResult> {
     this.sent.push(message);
     return { providerMessageId: `wamid.fake.${this.sent.length}` };
+  }
+  async sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    this.sentTemplates.push(message);
+    return { providerMessageId: `wamid.fake.tpl.${this.sentTemplates.length}` };
   }
 }
 

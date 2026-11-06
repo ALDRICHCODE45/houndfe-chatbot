@@ -35,17 +35,9 @@ let moduleRef: TestingModule | undefined;
 afterEach(async () => {
   await moduleRef?.close();
 });
-async function setup(
-  enabled: unknown = true,
-  restock = false,
-  provider = true,
-) {
+async function setup() {
   const config = new ConfigService({
     meta: { appSecret: secret, phoneNumberId: phone },
-    humanDecisions: {
-      customerInboundEnabled: enabled,
-      restockEnabled: restock,
-    },
   });
   const order: string[] = [];
   const query = jest
@@ -92,7 +84,7 @@ async function setup(
       { provide: RECENT_OUTBOUND, useValue: { isKnown } },
       { provide: WebhookDispatcherService, useValue: { dispatch } },
       { provide: RestockInboundCapture, useValue: { capture } },
-      ...(provider ? [customerInboundCaptureProvider] : []),
+      customerInboundCaptureProvider,
     ],
   }).compile();
   const request = (input: unknown = event()) => {
@@ -122,17 +114,6 @@ async function setup(
   };
 }
 
-it.each([false, undefined, 'true'])(
-  'disabled %p retains legacy dispatch without capture I/O',
-  async (flag) => {
-    const s = await setup(flag === undefined ? null : flag);
-    expect(await s.handle()).toEqual({ received: true });
-    expect(s.dispatch.mock.calls).toEqual([[dto]]);
-    expect(s.query).not.toHaveBeenCalled();
-    expect(s.isOpsSender).not.toHaveBeenCalled();
-    expect(s.isKnown).not.toHaveBeenCalled();
-  },
-);
 it('persists actual-request metadata before dispatch using the existing pool', async () => {
   const s = await setup();
   expect(await s.handle(s.request())).toEqual({ received: true });
@@ -144,7 +125,7 @@ it('persists actual-request metadata before dispatch using the existing pool', a
     '100',
     expect.any(String),
   ]);
-  expect(s.order).toEqual(['record', 'dispatch']);
+  expect(s.order).toEqual(['restock', 'record', 'dispatch']);
   expect(s.dispatch.mock.calls).toEqual([[dto]]);
   expect(s.isOpsSender).toHaveBeenCalledWith('customer');
   expect(s.isKnown).toHaveBeenCalledWith('inbound');
@@ -162,45 +143,37 @@ it.each(['ops', 'outbound'])(
     expect(s.dispatch).toHaveBeenCalledTimes(1);
   },
 );
-it.each([
-  'missing provider',
-  'missing request',
-  'forgery',
-  'hold',
-  'SQL failure',
-])('fails closed on %s without dispatch or retry', async (failure) => {
-  const s = await setup(true, false, failure !== 'missing provider');
-  let req: Request | undefined = s.request();
-  if (failure === 'missing request') req = undefined;
-  if (failure === 'forgery') req = { ...req } as Request;
-  if (failure === 'hold')
-    s.query.mockResolvedValue({ rowCount: 1, rows: [{}] });
-  if (failure === 'SQL failure')
-    s.query.mockRejectedValue(Error('private SQL failure'));
-  await expect(s.handle(req)).rejects.toMatchObject({
-    status: 500,
-    message: 'Internal Server Error',
-  });
-  expect(s.dispatch).not.toHaveBeenCalled();
-  expect(s.query).toHaveBeenCalledTimes(
-    ['hold', 'SQL failure'].includes(failure) ? 1 : 0,
-  );
-});
-it.each([false, true])(
-  'preserves RESTOCK admission ordering with capture=%p',
-  async (enabled) => {
-    const s = await setup(enabled, true);
-    expect(await s.handle(s.request())).toEqual({ received: true });
-    expect(s.order).toEqual(
-      enabled ? ['restock', 'record', 'dispatch'] : ['restock', 'dispatch'],
+it.each(['missing request', 'forgery', 'hold', 'SQL failure'])(
+  'fails closed on %s without dispatch or retry',
+  async (failure) => {
+    const s = await setup();
+    let req: Request | undefined = s.request();
+    if (failure === 'missing request') req = undefined;
+    if (failure === 'forgery') req = { ...req } as Request;
+    if (failure === 'hold')
+      s.query.mockResolvedValue({ rowCount: 1, rows: [{}] });
+    if (failure === 'SQL failure')
+      s.query.mockRejectedValue(Error('private SQL failure'));
+    await expect(s.handle(req)).rejects.toMatchObject({
+      status: 500,
+      message: 'Internal Server Error',
+    });
+    expect(s.dispatch).not.toHaveBeenCalled();
+    expect(s.query).toHaveBeenCalledTimes(
+      ['hold', 'SQL failure'].includes(failure) ? 1 : 0,
     );
-    expect(s.capture).toHaveBeenCalledTimes(1);
-    expect(s.dispatch.mock.calls).toEqual([[dto]]);
-    expect(s.query).toHaveBeenCalledTimes(enabled ? 1 : 0);
   },
 );
+it('runs RESTOCK admission before customer capture and dispatch', async () => {
+  const s = await setup();
+  expect(await s.handle(s.request())).toEqual({ received: true });
+  expect(s.order).toEqual(['restock', 'record', 'dispatch']);
+  expect(s.capture).toHaveBeenCalledTimes(1);
+  expect(s.dispatch.mock.calls).toEqual([[dto]]);
+  expect(s.query).toHaveBeenCalledTimes(1);
+});
 it('does not capture or dispatch after rejected RESTOCK admission', async () => {
-  const s = await setup(true, true);
+  const s = await setup();
   s.capture.mockResolvedValue({ action: 'hold' });
   await expect(s.handle(s.request())).rejects.toMatchObject({ status: 500 });
   expect(s.capture).toHaveBeenCalledTimes(1);

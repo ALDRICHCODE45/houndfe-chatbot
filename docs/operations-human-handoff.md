@@ -10,10 +10,11 @@ operation, and during a behaviour rollback.
 
 ## TL;DR
 
-| Knob           | Env var                 | Default               | Purpose                                                                                                                                                                                                                                                                                                                                              |
-| -------------- | ----------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Channel on/off | `HUMAN_HANDOFF_ENABLED` | `true`                | Kill-switch — when `false`, `requestHumanAssistance` returns a `disabled` envelope and the bot never writes a row, never sends a digest, never sets the marker. One env flip, zero code.                                                                                                                                                             |
-| Ops phone      | `OPS_CHANNEL_PHONE`     | required when enabled | Exact digit-only Meta senderId (`wa_id`) of the human agent who receives digests and replies to them, 10-15 digits. A leading `+`, whitespace, or separator is rejected at boot. Comparison is exact by default; the Mexican trunk-1 rewrite runs **only** when `META_SANDBOX_RECIPIENT_NORMALIZATION=true` (Meta test number), never in production. |
+Human handoff is **always on**; there is no kill-switch env var.
+
+| Knob      | Env var             | Default  | Purpose                                                                                                                                                                                                                                                                                                                                              |
+| --------- | ------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ops phone | `OPS_CHANNEL_PHONE` | required | Exact digit-only Meta senderId (`wa_id`) of the human agent who receives digests and replies to them, 10-15 digits. A leading `+`, whitespace, or separator is rejected at boot. Comparison is exact by default; the Mexican trunk-1 rewrite runs **only** when `META_SANDBOX_RECIPIENT_NORMALIZATION=true` (Meta test number), never in production. |
 
 ## 1. Shift-start "ops on" pattern
 
@@ -70,13 +71,10 @@ boot. Validate the format end-to-end:
 ### Env checklist
 
 - [ ] `OPS_CHANNEL_PHONE` set in the deployment env (or `.env`).
-- [ ] `HUMAN_HANDOFF_ENABLED` left at the default `true` (omit it) OR
-      explicitly set to `false` if you want the channel disabled.
 - [ ] The associated phone is registered as a Meta WhatsApp sender (so the
       bot is allowed to send it outbound messages).
 - [ ] After every change, restart the bot. Joi validation at boot fails
-      fast when `HUMAN_HANDOFF_ENABLED=true` and `OPS_CHANNEL_PHONE` is
-      missing/empty/non-string, or when it is not the exact digit-only
+      fast when `OPS_CHANNEL_PHONE` is missing/empty/non-string, or when it is not the exact digit-only
       `wa_id` (leading `+`, whitespace, separators, or outside 10-15 digits).
 
 ### Test-number allowlist + 24h token cap
@@ -88,35 +86,10 @@ does not implement its own cap. If you see `Meta 131030` in the logs, the
 have no approved template loaded. Solution: open the chat from the customer
 phone ("ops on" pattern) before expecting digests to deliver.
 
-## 3. Behaviour rollback — one env flip
+## 3. Behaviour rollback
 
-If the channel misbehaves (the bot is over-escalating; ops can't keep up;
-digests are noisy), the kill-switch is one env flip:
-
-```bash
-export HUMAN_HANDOFF_ENABLED=false
-# restart
-```
-
-After the restart:
-
-- `HumanHandoffService.create(...)` short-circuits with
-  `{ ok: false, error: { kind: 'disabled', retryable: false } }` before any
-  write or any send. No row is inserted; no digest is dispatched.
-- The 12th AI-SDK tool `requestHumanAssistance` returns the same envelope.
-- `check-stock` and `evaluate-cart` still return their new `humanAssistance`
-  envelope shape to the model (the signal is held in the registry), but the
-  model has no live escalation tool — the LLM falls back to the prompt's
-  natural-language phrasing.
-- The dispatcher's ops pre-routing hook is still wired but is inert —
-  `resolveReply` with no rows returns the `ASK_FOR_REF` boilerplate (the
-  agent sees a "no pending" reply).
-- `pendingHumanRequest` markers already set in `conversation_state.data`
-  remain until they are cleared or until the next idle-reset UPSERT — both
-  of which run unchanged. The runner's pending-marker short-circuit still
-  sends the canned "seguimos esperando" reply for any pre-existing pending
-  request, so flipping the kill-switch does not strand any in-flight
-  handoff.
+There is no env kill-switch: human handoff is always on. If the channel
+misbehaves, roll back the code (section 4).
 
 ## 4. Code rollback
 
@@ -135,15 +108,10 @@ If the entire slice needs to be reverted:
 
 ## 5. Open follow-ups (non-blocking)
 
-- **R6 shipping-quote approval gate (updated).** The `shipping_approval`
-  kind is now served by the gated shipping flow: the shipping quote path
-  creates the request server-side and ops resolves it with the structured
-  `APPROVE_SHIPPING`/`REJECT_SHIPPING` grammar documented in
-  `docs/shipping-quotes-operations.md`. The model-facing
-  `requestHumanAssistance` schema still rejects `shipping_approval`, so the
-  model cannot forge it. Shipping quotes remain default-off, and sale
-  continuation for any conversation carrying a shipping marker stays blocked
-  until the backend can persist the approved charge (SQ-5D).
+- **No shipping approval kind.** Per-quote human approval was removed: the
+  backend signs each shipping quote (`quoteId` with expiry), so there is no
+  `shipping_approval` request, digest or `APPROVE_SHIPPING`/`REJECT_SHIPPING`
+  ops command. See [minimal shipping](minimal-shipping.md).
 - **Scheduler-based nudge / expiry.** The current design waits indefinitely
   for the agent reply (no scheduler, no expiry). If operationally noisy,
   add a follow-up slice for an optional `expiresAt` column + a cron nudger.

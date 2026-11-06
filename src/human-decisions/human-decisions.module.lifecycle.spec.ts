@@ -7,6 +7,7 @@ import { ChatbotApiHttpClient } from '../chatbot-api/infrastructure/chatbot-api-
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import { MetaWhatsappSender } from '../whatsapp/infrastructure/meta-whatsapp.sender';
 import { HumanDecisionsModule } from './human-decisions.module';
+import { ExpirationPreparationRuntime } from './expiration-preparation.runtime';
 import { RestockApplicationRuntime } from './restock-application.runtime';
 import { RESTOCK_INTAKE_SERVICE } from './application/restock-intake.service';
 import { RestockApplicationCoordinator } from './application/restock-application-coordinator';
@@ -21,7 +22,7 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-async function compile(flag: unknown, reverse = false) {
+async function compile(reverse = false) {
   const pool = {
     query: jest.fn(),
     connect: jest.fn(),
@@ -33,7 +34,6 @@ async function compile(flag: unknown, reverse = false) {
   };
   const sender = { sendText: jest.fn() };
   const values: Record<string, unknown> = {
-    'humanDecisions.restockEnabled': flag,
     'chatbotApi.branchId': 'synthetic-branch',
     'meta.phoneNumberId': 'synthetic-phone',
   };
@@ -75,26 +75,6 @@ describe('HumanDecisionsModule application lifecycle', () => {
     jest.useRealTimers();
   });
 
-  it.each([undefined, false, 'true'])(
-    'keeps strict-OFF %s inert through real Nest hooks',
-    async (flag) => {
-      const start = jest.spyOn(RestockApplicationPoller.prototype, 'start');
-      const f = await compile(flag);
-      f.inert();
-      await f.moduleRef.init();
-      const runtime = f.moduleRef.get(RestockApplicationRuntime);
-      expect(runtime.enqueue(senderId, source)).toBe(false);
-      expect(
-        (runtime as unknown as { poller?: unknown }).poller,
-      ).toBeUndefined();
-      expect(start).not.toHaveBeenCalled();
-      f.inert();
-      await f.moduleRef.close();
-      expect(f.pool.end).toHaveBeenCalledTimes(1);
-      f.inert();
-    },
-  );
-
   it.each([false, true])(
     'wires the intake hook and drains before pool close (reverse=%s)',
     async (reverse) => {
@@ -116,7 +96,11 @@ describe('HumanDecisionsModule application lifecycle', () => {
         .spyOn(RestockApplicationCoordinator.prototype, 'applyOnce')
         .mockReturnValue(operation.promise);
       const start = jest.spyOn(RestockApplicationPoller.prototype, 'start');
-      const f = await compile(true, reverse);
+      // EXPIRATION is always on too; keep this proof scoped to RESTOCK.
+      jest
+        .spyOn(ExpirationPreparationRuntime.prototype, 'onApplicationBootstrap')
+        .mockImplementation();
+      const f = await compile(reverse);
       f.pool.end.mockImplementation(async () => {
         events.push('pool.end');
       });

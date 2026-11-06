@@ -12,22 +12,31 @@ import { Observable, of } from 'rxjs';
 import { CONVERSATION_STORE } from '../../src/conversation/domain/conversation-store';
 import { InMemoryConversationStore } from '../../src/conversation/infrastructure/in-memory-conversation.store';
 import { AgentRunner } from '../../src/llm-agent/application/agent-runner.service';
-import { ReceiptAmountRouterService } from '../../src/receipt-media/application/receipt-amount-router.service';
+import { MinimalCatalogAgentService } from '../../src/llm-agent/application/minimal-catalog-agent.service';
 import { ReceiptIngressService } from '../../src/receipt-media/application/receipt-ingress.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../src/sale-flow/infrastructure/real-tool-registry';
+import { RestockInboundCapture } from '../../src/whatsapp/application/restock-inbound-capture';
 import { WebhookDispatcherService } from '../../src/whatsapp/application/webhook-dispatcher.service';
 import { RECENT_OUTBOUND } from '../../src/whatsapp/domain/recent-outbound.store';
 import { WEBHOOK_DEDUP } from '../../src/whatsapp/domain/webhook-dedup.store';
 import {
   WHATSAPP_SENDER,
+  type OutboundTemplate,
   type OutboundText,
   type SendResult,
   type WhatsappSenderPort,
 } from '../../src/whatsapp/domain/whatsapp-sender.port';
+import {
+  CUSTOMER_INBOUND_CAPTURE,
+  type CustomerInboundCapture,
+} from '../../src/whatsapp/infrastructure/customer-inbound-capture.provider';
 import { InMemoryRecentOutboundStore } from '../../src/whatsapp/infrastructure/in-memory-recent-outbound.store';
 import { InMemoryWebhookDedupStore } from '../../src/whatsapp/infrastructure/in-memory-webhook-dedup.store';
 import { normalizeSandboxRecipient } from '../../src/whatsapp/infrastructure/meta-whatsapp.sender';
-import { SignatureGuard } from '../../src/whatsapp/presentation/signature.guard';
+import {
+  SignatureGuard,
+  type VerifiedWebhookSnapshot,
+} from '../../src/whatsapp/presentation/signature.guard';
 import { WebhookController } from '../../src/whatsapp/presentation/webhook.controller';
 
 /**
@@ -35,7 +44,8 @@ import { WebhookController } from '../../src/whatsapp/presentation/webhook.contr
  *
  * Exposes ONLY the real `GET/POST /webhook` surface (WebhookController +
  * SignatureGuard + WebhookDispatcherService) and fakes every outbound edge:
- * the LLM/agent runner returns a canned reply, the sender records instead of
+ * the LLM/agent runner returns a canned reply (customer turns reach it through
+ * the sandbox minimal route), the sender records instead of
  * calling Meta, and the receipt and human-handoff dependencies are inert.
  *
  * It deliberately does NOT import the production `AppModule`, `WhatsappModule`,
@@ -71,13 +81,43 @@ export const SANDBOX_CONFIG = {
   get: (): undefined => undefined,
 };
 
+/**
+ * Pass-through capture doubles: the sandbox records no human-decision
+ * evidence and dispatches the verified body unchanged.
+ */
+const SANDBOX_RESTOCK_CAPTURE = {
+  capture: (snapshot: VerifiedWebhookSnapshot | null) =>
+    Promise.resolve(
+      snapshot
+        ? {
+            action: 'captured' as const,
+            event: JSON.parse(
+              Buffer.from(snapshot.rawBodyBase64, 'base64').toString('utf8'),
+            ) as unknown,
+            evidence: [],
+          }
+        : { action: 'hold' as const },
+    ),
+};
+const SANDBOX_CUSTOMER_CAPTURE: CustomerInboundCapture = () =>
+  Promise.resolve({ action: 'captured', observations: [] });
+
 /** In-memory sender double; records every outbound instead of calling Meta. */
 export class SandboxSender implements WhatsappSenderPort {
   readonly sent: OutboundText[] = [];
+  readonly sentTemplates: OutboundTemplate[] = [];
   private sequence = 0;
 
   sendText(message: OutboundText): Promise<SendResult> {
     this.sent.push(message);
+    this.sequence += 1;
+    return Promise.resolve({
+      providerMessageId: `wamid.sandbox.${this.sequence}`,
+    });
+  }
+
+  sendTemplate(message: OutboundTemplate): Promise<SendResult> {
+    this.sentTemplates.push(message);
     this.sequence += 1;
     return Promise.resolve({
       providerMessageId: `wamid.sandbox.${this.sequence}`,
@@ -91,14 +131,27 @@ export const SANDBOX_AGENT_RUNNER = {
     Promise.resolve({ reply: SANDBOX_REPLY, input }),
 };
 
-/** Inert receipt amount router: always fences (no store/backend access). */
-export const SANDBOX_AMOUNT_ROUTER = {
-  route: () => Promise.resolve({ kind: 'fenced' as const }),
-};
+/**
+ * Sandbox minimal route: the dispatcher sends every customer turn to the
+ * minimal SDK route, so this delegates to whatever `AgentRunner` the sandbox
+ * bound (canned reply or the no-tool LLM override).
+ */
+export function sandboxMinimalCatalogAgent(runner: {
+  handle: (input: { senderId: string; text: string }) => Promise<{
+    reply: string;
+  }>;
+}) {
+  return {
+    tryHandle: async (input: { senderId: string; text: string }) => ({
+      kind: 'handled' as const,
+      reply: (await runner.handle(input)).reply,
+    }),
+  };
+}
 
-/** Inert receipt ingress: never admits media. */
+/** Inert receipt ingress: never admits media (no store/backend access). */
 export const SANDBOX_RECEIPT_INGRESS = {
-  admit: () => Promise.resolve({ kind: 'disabled' as const }),
+  admit: () => Promise.resolve({ kind: 'no-placed-sale' as const }),
 };
 
 /** Inert human-handoff: no ops phone, no pending/ops routing. */
@@ -232,7 +285,7 @@ function classifyRawSender(
     return 'invalid';
   }
   if (!hasOnlyKeys(raw.text, ALLOWED_TEXT_KEYS)) return 'invalid';
-  return normalizeSandboxRecipient(raw.from) === approvedRecipient
+  return normalizeSandboxRecipient(raw.from, true) === approvedRecipient
     ? 'approved'
     : 'unapproved';
 }
@@ -307,9 +360,15 @@ function scanRawSenders(
     { provide: WHATSAPP_SENDER, useClass: SandboxSender },
     { provide: WEBHOOK_DEDUP, useClass: InMemoryWebhookDedupStore },
     { provide: RECENT_OUTBOUND, useClass: InMemoryRecentOutboundStore },
+    { provide: RestockInboundCapture, useValue: SANDBOX_RESTOCK_CAPTURE },
+    { provide: CUSTOMER_INBOUND_CAPTURE, useValue: SANDBOX_CUSTOMER_CAPTURE },
     { provide: CONVERSATION_STORE, useClass: InMemoryConversationStore },
     { provide: AgentRunner, useValue: SANDBOX_AGENT_RUNNER },
-    { provide: ReceiptAmountRouterService, useValue: SANDBOX_AMOUNT_ROUTER },
+    {
+      provide: MinimalCatalogAgentService,
+      useFactory: sandboxMinimalCatalogAgent,
+      inject: [AgentRunner],
+    },
     { provide: ReceiptIngressService, useValue: SANDBOX_RECEIPT_INGRESS },
     { provide: HUMAN_HANDOFF_SERVICE_TOKEN, useValue: SANDBOX_HUMAN_HANDOFF },
     SandboxInboundSenderFilterInterceptor,

@@ -59,19 +59,14 @@ export class SignatureGuard implements CanActivate {
       throw new UnauthorizedException('Invalid X-Hub-Signature-256 header');
     }
 
-    if (
-      this.configService.get('humanDecisions.restockEnabled') === true ||
-      this.configService.get('humanDecisions.customerInboundEnabled') === true
-    ) {
-      verifiedSnapshots.set(
-        request,
-        Object.freeze({
-          rawBodyBase64: verifiedBytes.toString('base64'),
-          // Local successful-verification time, not socket or global arrival time.
-          observedAt: new Date().toISOString(),
-        }),
-      );
-    }
+    verifiedSnapshots.set(
+      request,
+      Object.freeze({
+        rawBodyBase64: verifiedBytes.toString('base64'),
+        // Local successful-verification time, not socket or global arrival time.
+        observedAt: new Date().toISOString(),
+      }),
+    );
 
     return true;
   }

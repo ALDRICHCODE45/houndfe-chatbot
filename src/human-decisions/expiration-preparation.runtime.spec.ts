@@ -211,7 +211,6 @@ describe('ExpirationPreparationRuntime', () => {
     jest.restoreAllMocks();
   });
   function build(
-    enabled: unknown,
     branch: unknown = branchId,
     phoneValue: unknown = phone,
     sender: Pick<WhatsappSenderPort, 'sendText'> = { sendText: jest.fn() },
@@ -221,26 +220,13 @@ describe('ExpirationPreparationRuntime', () => {
   ) {
     const config = {
       get: (key: string) =>
-        key === 'minimalCatalogAgent.expirationEnabled'
-          ? enabled
-          : key === 'meta.phoneNumberId'
-            ? phoneValue
-            : branch,
+        key === 'meta.phoneNumberId' ? phoneValue : branch,
     } as ConfigService;
-    return new ExpirationPreparationRuntime(config, {} as Pool, client, sender);
+    return new ExpirationPreparationRuntime(config, {} as Pool, client, {
+      ...sender,
+      sendTemplate: jest.fn(),
+    });
   }
-  it.each([false, undefined, 'true'])(
-    'does not start with gate %s',
-    async (enabled) => {
-      const start = jest
-        .spyOn(ExpirationRecoveryPoller.prototype, 'start')
-        .mockImplementation();
-      const runtime = build(enabled);
-      runtime.onApplicationBootstrap();
-      expect(start).not.toHaveBeenCalled();
-      await runtime.onModuleDestroy();
-    },
-  );
   it('starts once with a valid branch and drains the poller on shutdown', async () => {
     const start = jest
       .spyOn(ExpirationRecoveryPoller.prototype, 'start')
@@ -248,7 +234,7 @@ describe('ExpirationPreparationRuntime', () => {
     const stop = jest
       .spyOn(ExpirationRecoveryPoller.prototype, 'stop')
       .mockResolvedValue();
-    const runtime = build(true);
+    const runtime = build();
     runtime.onApplicationBootstrap();
     runtime.onApplicationBootstrap();
     expect(start).toHaveBeenCalledTimes(1);
@@ -261,30 +247,19 @@ describe('ExpirationPreparationRuntime', () => {
     const start = jest
       .spyOn(ExpirationRecoveryPoller.prototype, 'start')
       .mockImplementation();
-    expect(() => build(true, '').onApplicationBootstrap()).toThrow(
+    expect(() => build('').onApplicationBootstrap()).toThrow(
       'EXPIRATION preparation requires branch identity',
     );
     expect(start).not.toHaveBeenCalled();
   });
-  it('requires the receiving phone identity before starting the enabled runtime', () => {
+  it('requires the receiving phone identity before starting the runtime', () => {
     const start = jest
       .spyOn(ExpirationRecoveryPoller.prototype, 'start')
       .mockImplementation();
-    expect(() => build(true, branchId, '   ').onApplicationBootstrap()).toThrow(
+    expect(() => build(branchId, '   ').onApplicationBootstrap()).toThrow(
       'EXPIRATION runtime requires the Meta receiving phone identity',
     );
     expect(start).not.toHaveBeenCalled();
-  });
-  it('stays inert when disabled even without a phone identity', async () => {
-    const start = jest
-      .spyOn(ExpirationRecoveryPoller.prototype, 'start')
-      .mockImplementation();
-    const sender = { sendText: jest.fn() };
-    const runtime = build(false, branchId, '', sender);
-    runtime.onApplicationBootstrap();
-    expect(start).not.toHaveBeenCalled();
-    expect(sender.sendText).not.toHaveBeenCalled();
-    await runtime.onModuleDestroy();
   });
   it('sends the historical reply with the configured receiving phone and records acceptance', async () => {
     jest.useFakeTimers();
@@ -295,7 +270,7 @@ describe('ExpirationPreparationRuntime', () => {
         .fn()
         .mockResolvedValue({ providerMessageId: 'wamid.accepted' }),
     };
-    const runtime = build(true, branchId, phone, sender);
+    const runtime = build(branchId, phone, sender);
     runtime.onApplicationBootstrap();
     await jest.advanceTimersByTimeAsync(5_000);
     expect(spies.preparation).toHaveBeenCalledTimes(1);
@@ -325,7 +300,7 @@ describe('ExpirationPreparationRuntime', () => {
       if (result === 'error')
         spies.stale.mockRejectedValue(new Error('unavailable'));
       const sender = { sendText: jest.fn() };
-      const runtime = build(true, branchId, phone, sender);
+      const runtime = build(branchId, phone, sender);
       runtime.onApplicationBootstrap();
       await jest.advanceTimersByTimeAsync(5_000);
       expect(spies.stale).toHaveBeenCalledTimes(1);
@@ -351,7 +326,7 @@ describe('ExpirationPreparationRuntime', () => {
       ...resolvedOutcome,
       binding: { ...resolvedOutcome.binding, branchId: 'wrong-branch' },
     });
-    const runtime = build(true);
+    const runtime = build();
     runtime.onApplicationBootstrap();
     await jest.advanceTimersByTimeAsync(5_000);
     expect(spies.stale).not.toHaveBeenCalled();
@@ -399,7 +374,7 @@ describe('ExpirationPreparationRuntime', () => {
       recordRestockApplicationOutcome: record,
     } as unknown as ChatbotApiClient;
     const sender = { sendText: jest.fn() };
-    const runtime = build(true, branchId, phone, sender, client);
+    const runtime = build(branchId, phone, sender, client);
     runtime.onApplicationBootstrap();
     await jest.advanceTimersByTimeAsync(5_000);
     expect(coordinator.branchId).toBe(branchId);

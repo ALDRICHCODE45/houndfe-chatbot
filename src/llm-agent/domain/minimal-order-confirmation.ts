@@ -14,6 +14,7 @@ import { toMexicanState } from './mexican-state';
 import type { MinimalCheckoutDraft } from '../../conversation/domain/minimal-checkout-draft';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { isAffirmative } from './minimal-checkout-confirmation';
+import { minimalShippingEtaLine } from './minimal-shipping';
 
 /** Pending-offer TTL; mirrors the checkout and RESTOCK volatile lifecycles. */
 export const MINIMAL_ORDER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
@@ -49,11 +50,34 @@ export type MinimalOrderIneligibleReason =
   | 'new_address_unsupported'
   | 'invalid_state';
 
-export interface MinimalOrderShipping {
-  readonly classification: 'free' | 'charged';
-  readonly chargeCents: number;
-  readonly approvalId: string;
-  readonly quoteId: string;
+/** Backend ETA: business days, or unknown while stock is pending (S7). */
+export interface MinimalShippingEta {
+  readonly days: number | null;
+  readonly reason?: 'STOCK_PENDING';
+}
+
+/**
+ * Backend-signed delivery quote (the backend computed charge and credit,
+ * S2/S3) or store pickup (S4). Display fields are optional only for older
+ * snapshots; a fresh order fills them from the stored quote.
+ */
+export type MinimalOrderShipping =
+  | {
+      readonly quoteId: string;
+      readonly customerChargeCents: number;
+      readonly creditCents?: number;
+      readonly option?: {
+        readonly carrier: string;
+        readonly service: string;
+      } | null;
+      readonly eta?: MinimalShippingEta | null;
+    }
+  | { readonly mode: 'pickup' };
+
+/** Customer identity of a store-pickup order (C1): no delivery data. */
+export interface MinimalOrderCustomer {
+  readonly firstName: string;
+  readonly lastName: string | null;
 }
 
 /** Exact content the customer consents to; detached from every input. */
@@ -62,7 +86,10 @@ export interface MinimalOrderSnapshot {
   readonly customerId: string;
   /** Empty for new addresses, whose exact fields live in draft. */
   readonly shippingAddressId: string;
-  readonly draft: MinimalCheckoutDraft;
+  /** `null` only for store pickup, which needs no delivery data (C1). */
+  readonly draft: MinimalCheckoutDraft | null;
+  /** Pickup identity; set exactly when `draft` is `null`. */
+  readonly customer?: MinimalOrderCustomer;
   readonly items: readonly MinimalOrderLine[];
   readonly totalCents: number;
   readonly shipping?: MinimalOrderShipping;
@@ -75,28 +102,22 @@ export type MinimalOrderEligibility =
 /**
  * Eligibility for this slice (S1/S2/S4): a verified, non-empty, fully
  * evaluated cart, and a draft that is still exactly the locally confirmed one
- * with a unique saved address, or a new address when atomic checkout is on.
+ * with a unique saved address, a corrected saved address or a new address.
  * `confirmedDraft` must come from
  * `MinimalCheckoutConfirmation.confirmedDraft`, never from the bare status.
  */
 export function evaluateMinimalOrder(input: {
   readonly confirmedDraft: MinimalCheckoutDraft | null;
   readonly quote: MinimalOrderQuote | null;
-  readonly atomicCheckoutEnabled?: boolean;
 }): MinimalOrderEligibility {
   const { confirmedDraft, quote } = input;
-  if (quote === null) return { ok: false, reason: 'cart_unverified' };
-  if (quote.items.length === 0) return { ok: false, reason: 'empty_cart' };
-  if (quote.promotionEvaluationStatus !== 'fully_evaluated') {
-    return { ok: false, reason: 'promotion_review' };
-  }
+  const cartReason = minimalQuoteIneligibility(quote);
+  if (cartReason !== null || quote === null)
+    return { ok: false, reason: cartReason ?? 'cart_unverified' };
   if (confirmedDraft === null) {
     return { ok: false, reason: 'delivery_unconfirmed' };
   }
-  if (
-    confirmedDraft.address.kind !== 'saved' &&
-    input.atomicCheckoutEnabled === true
-  ) {
+  if (confirmedDraft.address.kind !== 'saved') {
     if (toMexicanState(confirmedDraft.address.fields.state) === null) {
       return { ok: false, reason: 'invalid_state' };
     }
@@ -114,10 +135,7 @@ export function evaluateMinimalOrder(input: {
       }),
     };
   }
-  if (
-    confirmedDraft.address.kind !== 'saved' ||
-    confirmedDraft.sourceCustomerId === null
-  ) {
+  if (confirmedDraft.sourceCustomerId === null) {
     return { ok: false, reason: 'new_address_unsupported' };
   }
   return {
@@ -132,12 +150,55 @@ export function evaluateMinimalOrder(input: {
   };
 }
 
+/** Why a fresh cart quote cannot back an order, or `null` when it can. */
+export function minimalQuoteIneligibility(
+  quote: MinimalOrderQuote | null,
+): 'cart_unverified' | 'empty_cart' | 'promotion_review' | null {
+  if (quote === null) return 'cart_unverified';
+  if (quote.items.length === 0) return 'empty_cart';
+  return quote.promotionEvaluationStatus === 'fully_evaluated'
+    ? null
+    : 'promotion_review';
+}
+
+/**
+ * Store pickup (C1): a verified cart plus the customer identity only, an
+ * existing customer (`customerId`) or a new one by name (`customerId` empty).
+ * No delivery draft, address or freight is involved.
+ */
+export function evaluateMinimalPickupOrder(input: {
+  readonly quote: MinimalOrderQuote | null;
+  readonly customerId: string;
+  readonly customer: MinimalOrderCustomer;
+}): MinimalOrderEligibility {
+  const { quote } = input;
+  const cartReason = minimalQuoteIneligibility(quote);
+  if (cartReason !== null || quote === null)
+    return { ok: false, reason: cartReason ?? 'cart_unverified' };
+  return {
+    ok: true,
+    snapshot: structuredClone({
+      customerId: input.customerId,
+      shippingAddressId: '',
+      draft: null,
+      customer: {
+        firstName: input.customer.firstName,
+        lastName: input.customer.lastName,
+      },
+      items: quote.items.map((item) => ({ ...item })),
+      totalCents: quote.totalCents,
+      shipping: { mode: 'pickup' as const },
+    }),
+  };
+}
+
 /** Deterministic canonical content for exact snapshot binding. */
 function canonicalize(snapshot: MinimalOrderSnapshot): string {
   return JSON.stringify([
     snapshot.customerId,
     snapshot.shippingAddressId,
     snapshot.draft,
+    snapshot.customer ?? null,
     snapshot.items.map((item) => [
       item.productId,
       item.variantId ?? null,
@@ -152,12 +213,17 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
     snapshot.totalCents,
     snapshot.shipping === undefined
       ? null
-      : [
-          snapshot.shipping.classification,
-          snapshot.shipping.chargeCents,
-          snapshot.shipping.approvalId,
-          snapshot.shipping.quoteId,
-        ],
+      : 'quoteId' in snapshot.shipping
+        ? [
+            snapshot.shipping.quoteId,
+            snapshot.shipping.customerChargeCents,
+            snapshot.shipping.creditCents ?? 0,
+            snapshot.shipping.option?.carrier ?? null,
+            snapshot.shipping.option?.service ?? null,
+            snapshot.shipping.eta?.days ?? null,
+            snapshot.shipping.eta?.reason ?? null,
+          ]
+        : [snapshot.shipping.mode],
   ]);
 }
 
@@ -189,6 +255,10 @@ export function minimalPromotionSuffix(
 
 function deliveryLine(snapshot: MinimalOrderSnapshot): string {
   const draft = snapshot.draft;
+  if (draft === null)
+    return [snapshot.customer?.firstName, snapshot.customer?.lastName]
+      .filter((part): part is string => typeof part === 'string' && part !== '')
+      .join(' ');
   const address =
     draft.address.kind === 'saved'
       ? draft.address.snapshot
@@ -210,10 +280,41 @@ function deliveryLine(snapshot: MinimalOrderSnapshot): string {
     .join(', ');
 }
 
+/** Shipping block of the summary: carrier, charge, credit and ETA (S3/S7). */
+function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
+  const shipping = snapshot.shipping;
+  // Every presented snapshot carries a quote or pickup (`freshOrder`).
+  if (shipping === undefined) return [];
+  if (!('quoteId' in shipping))
+    return ['Recoge en tienda (sin costo de envío)'];
+  const carrier = shipping.option
+    ? ` con ${shipping.option.carrier} (${shipping.option.service})`
+    : '';
+  const eta = minimalShippingEtaLine(shipping.eta);
+  return [
+    shipping.customerChargeCents === 0
+      ? `Envío${carrier}: sin costo para usted`
+      : `Envío${carrier}: ${mxn(shipping.customerChargeCents)}`,
+    ...((shipping.creditCents ?? 0) > 0
+      ? [
+          `Usted tiene un crédito de ${mxn(shipping.creditCents ?? 0)} por sus productos (ya descontado del envío)`,
+        ]
+      : []),
+    ...(eta === null ? [] : [eta]),
+    ...(shipping.customerChargeCents === 0
+      ? []
+      : [
+          `Total a pagar: ${mxn(snapshot.totalCents + shipping.customerChargeCents)}`,
+        ]),
+  ];
+}
+
 /** Server-owned order summary; the model never authors it. */
 export function renderMinimalOrderSummary(
   snapshot: MinimalOrderSnapshot,
 ): string {
+  const pickup =
+    snapshot.shipping !== undefined && !('quoteId' in snapshot.shipping);
   return [
     'Resumen de su pedido:',
     ...snapshot.items.map(
@@ -221,23 +322,16 @@ export function renderMinimalOrderSummary(
         `• ${item.name}${item.variantName ? ` — ${item.variantName}` : ''}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
-    `Entrega a: ${deliveryLine(snapshot)}`,
-    ...(snapshot.draft.address.kind === 'new'
+    pickup
+      ? `Datos del cliente: ${deliveryLine(snapshot)}`
+      : `Entrega a: ${deliveryLine(snapshot)}`,
+    ...(snapshot.draft?.address.kind === 'new'
       ? ['Guardaremos esta dirección con su pedido.']
       : []),
-    ...(snapshot.draft.address.kind === 'savedCorrected'
+    ...(snapshot.draft?.address.kind === 'savedCorrected'
       ? ['Actualizaremos su dirección guardada con estos datos.']
       : []),
-    ...(snapshot.shipping === undefined
-      ? [
-          'El envío no está incluido en este total y se coordinará por separado.',
-        ]
-      : snapshot.shipping.classification === 'free'
-        ? ['envío cubierto por su compra']
-        : [
-            `Envío: ${mxn(snapshot.shipping.chargeCents)}`,
-            `Total a pagar: ${mxn(snapshot.totalCents + snapshot.shipping.chargeCents)}`,
-          ]),
+    ...shippingLines(snapshot),
     '',
     'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
   ].join('\n');

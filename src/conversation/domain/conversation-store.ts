@@ -42,51 +42,9 @@ export interface PendingHumanRequest {
   customerNotifiedAt: string;
 }
 
-/**
- * Typed `data` payload carried by ConversationState.
- *
- * `messages` is optional at the storage level so legacy records that
- * predate the LLM slice still round-trip cleanly; callers should always
- * go through `readMessages(state)` to receive `[]` when missing.
- *
- * `pendingHumanRequest?` is the human-handoff slice's bookmark. Sibling
- * of `placedSaleId`; the agent runner reads it before each LLM turn to
- * short-circuit the canned "we are still waiting" reply when present
- * (ADR-29). Idempotency on `HumanHandoffService.create` relies on this
- * field too — a second call for a sender with a marker set returns the
- * existing ref without writing a new row.
- */
-export type ReceiptAmountPointer = Readonly<{
-  receiptMediaId: string;
-  saleId: string;
-  receiptVersion: string;
-}>;
-
-export function isReceiptAmountPointer(
-  value: unknown,
-): value is ReceiptAmountPointer {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const pointer = value as Record<string, unknown>;
-  return (
-    Object.keys(pointer).length === 3 &&
-    Object.hasOwn(pointer, 'receiptMediaId') &&
-    Object.hasOwn(pointer, 'saleId') &&
-    Object.hasOwn(pointer, 'receiptVersion') &&
-    typeof pointer.receiptMediaId === 'string' &&
-    pointer.receiptMediaId.length > 0 &&
-    typeof pointer.saleId === 'string' &&
-    pointer.saleId.length > 0 &&
-    typeof pointer.receiptVersion === 'string' &&
-    /^[1-9]\d*$/.test(pointer.receiptVersion)
-  );
-}
-
 export interface ConversationStateData {
   catalogReferences?: CatalogReferences | null;
   agentRevision?: string;
-  receiptAmountPointer?: ReceiptAmountPointer;
   messages?: AgentMessage[];
   /** Sale id persisted by createSale success; read/cleared by cancelSale. */
   placedSaleId?: string;
@@ -301,22 +259,12 @@ export interface ConversationStore {
     lastMessageAt: string,
   ): Promise<boolean>;
 
-  setReceiptAmountPointer(
-    senderId: string,
-    pointer: ReceiptAmountPointer,
-  ): Promise<boolean>;
-
-  clearReceiptAmountPointer(
-    senderId: string,
-    pointer: ReceiptAmountPointer,
-  ): Promise<boolean>;
-
   /**
    * Atomically clears `data.pendingHumanRequest` (SET to JSON `null`,
    * retaining the key) iff the stored marker is canonical AND its
    * `requestId` equals the supplied id. Returns true iff exactly one row
    * transitioned; false with no writes otherwise. Sibling `data` keys
-   * (incl. `receiptAmountPointer`, `shippingApproval`) and `lastMessageAt`
+   * (incl. `shippingApproval`) and `lastMessageAt`
    * are preserved.
    */
   clearPendingHumanRequest(

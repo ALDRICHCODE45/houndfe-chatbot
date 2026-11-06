@@ -43,7 +43,6 @@ function setup(
   options: {
     empty?: boolean;
     cartAvailable?: boolean;
-    enabled?: boolean;
     restock?: MinimalRestockRequestService;
     expiration?: MinimalExpirationRequestService;
   } = {},
@@ -81,14 +80,10 @@ function setup(
     }),
     createSale: jest.fn(),
     upsertCustomer: jest.fn(),
-    attachReceipt: jest.fn(),
     getPaymentDetails: jest.fn(),
   } as unknown as jest.Mocked<ChatbotApiClient>;
   const config = {
-    get: (key: string) =>
-      key === 'minimalCatalogAgent'
-        ? { enabled: options.enabled !== false, allowedSenders: [SENDER] }
-        : { model: 'm', maxSteps: 5, historyTurns: 12 },
+    get: () => ({ model: 'm', maxSteps: 5, historyTurns: 12 }),
   } as unknown as ConfigService;
   let steps: unknown[] = [call(), say];
   const seen: Array<{ system?: unknown; tools?: Record<string, unknown> }> = [];
@@ -165,7 +160,6 @@ async function review(f: ReturnType<typeof setup>, inboundEvent?: unknown) {
   expect(cartWrite).not.toHaveBeenCalled();
   expect(f.api.createSale).not.toHaveBeenCalled();
   expect(f.api.upsertCustomer).not.toHaveBeenCalled();
-  expect(f.api.attachReceipt).not.toHaveBeenCalled();
   expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
   return result;
 }
@@ -197,7 +191,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(result).toEqual({
       kind: 'handled',
       reply:
-        'Revisión de compra: subtotal de productos $30.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+        'Revisión de compra: subtotal de productos $30.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
     });
     expect(String(f.seen[0].system)).toContain('reviewCheckout');
     expect(Object.keys(f.seen[0].tools ?? {})).not.toContain('createSale');
@@ -399,14 +393,12 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
         kind === 'restock'
           ? {
               restock: {
-                enabled: true,
                 consume: jest.fn().mockResolvedValue(null),
                 prepare,
               } as unknown as MinimalRestockRequestService,
             }
           : {
               expiration: {
-                enabled: true,
                 prepare,
               } as unknown as MinimalExpirationRequestService,
             },
@@ -455,22 +447,6 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(f.seen[0].tools).not.toHaveProperty('reviewCheckout');
     expect(String(f.seen[0].system)).not.toContain('reviewCheckout');
   });
-
-  it('preserves enabled and sender allowlist gates', async () => {
-    const f = setup({ enabled: false });
-    expect(
-      await f.agent.tryHandle({ senderId: SENDER, text: 'Quiero comprar' }),
-    ).toEqual({ kind: 'not-handled' });
-    const active = setup();
-    expect(
-      await active.agent.tryHandle({
-        senderId: 'unlisted',
-        text: 'Quiero comprar',
-      }),
-    ).toEqual({ kind: 'not-handled' });
-    expect(f.seen).toHaveLength(0);
-    expect(active.seen).toHaveLength(0);
-  });
 });
 
 describe('Checkout preflight reply when the checkout flow is available', () => {
@@ -498,13 +474,13 @@ describe('Checkout preflight reply when the checkout flow is available', () => {
     expect(
       minimalCheckoutReply(incomplete, { checkout: true, shipping: true }),
     ).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, obtener un envío aprobado y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, cotizar el envío o elegir recoger en tienda y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 
   it('keeps the previous wording without the checkout flow', () => {
     expect(minimalCheckoutReply(incomplete)).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 });

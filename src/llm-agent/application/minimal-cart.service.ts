@@ -12,7 +12,10 @@ import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
 import type { CartEvaluationResult } from '../../chatbot-api/domain/dtos/pricing.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
-import { minimalShippingSchema } from '../domain/minimal-shipping';
+import {
+  minimalPickupSchema,
+  minimalShippingQuoteSchema,
+} from '../domain/minimal-shipping';
 import { minimalPromotionSuffix } from '../domain/minimal-order-confirmation';
 
 const lineSchema = z.strictObject({
@@ -40,7 +43,10 @@ const cartSchema = z.strictObject({
   idempotencyAttempts: z.number().int().positive().optional(),
   expectedTotalCents: z.number().int().nonnegative().optional(),
   placedSale: placedSaleSchema.optional(),
-  shipping: minimalShippingSchema.optional(),
+  // Backend-signed quote or store pickup.
+  shipping: z
+    .union([minimalShippingQuoteSchema, minimalPickupSchema])
+    .optional(),
 });
 export type MinimalCartState = z.infer<typeof cartSchema>;
 
@@ -124,6 +130,67 @@ export class MinimalCartService {
       return await this.quote(senderId, cart.items, onInvalidVariant);
     } catch {
       return { ok: false, error: 'cart_unavailable' };
+    }
+  }
+
+  /**
+   * Quote the stored lines and, when only their prices or total changed,
+   * store the fresh unit prices and total in one CAS, keeping shipping and
+   * every other field; never retry. A cart with an outstanding order key is
+   * never rewritten. `repriced` means this call committed a rewrite.
+   */
+  async refreshPrices(
+    senderId: string,
+  ): Promise<{ quote: MinimalCartResult; repriced: boolean }> {
+    try {
+      // Keep the EXACT raw slot for CAS, never the zod-parsed reconstruction.
+      const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
+      const cart = parseMinimalCart(raw);
+      if (!cart)
+        return { quote: { ok: false, error: 'invalid_cart' }, repriced: false };
+      const quote = await this.quote(senderId, cart.items);
+      if (
+        !quote.ok ||
+        cart.idempotencyKey !== '' ||
+        (cart.items.every(
+          (line, index) =>
+            line.unitPriceCents === quote.items[index].unitPriceCents,
+        ) &&
+          (cart.expectedTotalCents === undefined ||
+            cart.expectedTotalCents === quote.totalCents))
+      )
+        return { quote, repriced: false };
+      const next: MinimalCartState = structuredClone({
+        ...cart,
+        items: quote.items.map(
+          ({ productId, variantId, quantity, unitPriceCents }) => ({
+            productId,
+            ...(variantId ? { variantId } : {}),
+            quantity,
+            unitPriceCents,
+          }),
+        ),
+        expectedTotalCents: quote.totalCents,
+      });
+      if (!this.store.commitMinimalCart)
+        return {
+          quote: { ok: false, error: 'cart_unavailable' },
+          repriced: false,
+        };
+      const saved = await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+      return saved
+        ? { quote, repriced: true }
+        : { quote: { ok: false, error: 'cart_changed' }, repriced: false };
+    } catch {
+      return {
+        quote: { ok: false, error: 'cart_unavailable' },
+        repriced: false,
+      };
     }
   }
 

@@ -1,6 +1,6 @@
 import {
   META_GRAPH_API_BASE_URL_DEFAULT,
-  SKYDROPX_BASE_URL_DEFAULT,
+  META_MEDIA_ALLOWED_HOSTS_DEFAULT,
 } from './env.validation';
 
 const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
@@ -11,29 +11,8 @@ const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
     .filter(Boolean);
   return r.length ? r : def;
 };
-const int = (v: string | undefined) => (v ? parseInt(v, 10) : undefined);
-// SQ-2A-H: normalize accepted surrounding whitespace so ConfigService sees the
-// same trimmed provider values that Joi validates.
-const trimmed = (v: string | undefined) => v?.trim();
-// SQ-5B2A: optional private measured-demo profile JSON. It is a raw, unparsed
-// passthrough so shipping can stay enabled when it is absent or invalid; the
-// shipping resolver fails closed later. Whitespace-only becomes undefined.
-const trimmedOrUndefined = (v: string | undefined) => {
-  const t = v?.trim();
-  return t ? t : undefined;
-};
-// Experimental minimal SDK catalog route: exact Meta wa_id allowlist. Any
-// empty or malformed list resolves to [] so the route enables NOBODY.
-const minimalSenders = (v: string | undefined): string[] => {
-  const list = (v ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return list.length > 0 && list.every((s) => /^\d{10,15}$/.test(s))
-    ? list
-    : [];
-};
-
+const int = (v: string | undefined, def?: number) =>
+  v ? parseInt(v, 10) : def;
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
   meta: {
@@ -65,70 +44,33 @@ const configuration = () => ({
     ),
     idleTimeoutMs: parseInt(process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000', 10),
   },
-  // Experimental, default-off minimal SDK catalog route (manual test only).
-  minimalCatalogAgent: {
-    enabled: process.env.MINIMAL_CATALOG_AGENT_ENABLED === 'true',
-    allowedSenders: minimalSenders(
-      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS,
-    ),
-    // E1: independent default-off EXPIRATION inquiry capability on the
-    // minimal route. Only the exact env string 'true' enables it.
-    expirationEnabled:
-      process.env.HUMAN_DECISIONS_EXPIRATION_ENABLED === 'true',
-    // Default-off order placement (creates real backend sales). Only the
-    // exact env string 'true' enables it.
-    orderEnabled: process.env.MINIMAL_CATALOG_ORDER_ENABLED === 'true',
-    shippingEnabled: process.env.MINIMAL_CATALOG_SHIPPING_ENABLED === 'true',
-    // Default-off: place orders via POST /chatbot-api/checkouts instead of
-    // POST /chatbot-api/sales. Only the exact env string 'true' enables it.
-    atomicCheckoutEnabled:
-      process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED === 'true',
-  },
   database: {
     url: process.env.DATABASE_URL as string,
     poolMax: parseInt(process.env.DB_POOL_MAX ?? '5', 10),
   },
   humanHandoff: {
-    enabled: process.env.HUMAN_HANDOFF_ENABLED !== 'false',
     // Retained exactly as supplied. The recipient normalization decision is
     // applied explicitly at comparison/send time, never at boot.
     opsChannelPhone: process.env.OPS_CHANNEL_PHONE,
   },
-  humanDecisions: {
-    // WU2A experimental gate: ONLY the exact env string 'true' enables it.
-    // Anything else (unset, 'false', a typo, upper-case, '1') stays false, so
-    // there is no ambiguous activation. No consumer reads this yet.
-    restockEnabled: process.env.HUMAN_DECISIONS_RESTOCK_ENABLED === 'true',
-    // Independent default-off customer evidence gate; never send permission.
-    customerInboundEnabled:
-      process.env.HUMAN_DECISIONS_CUSTOMER_INBOUND_ENABLED === 'true',
-  },
   receiptMedia: {
-    enabled: process.env.RECEIPT_MEDIA_ENABLED === 'true',
+    // Always on (receipt payment flow R3/S7); defaults mirror env.validation.
     maxBytes: parseInt(process.env.RECEIPT_MEDIA_MAX_BYTES ?? '10485760', 10),
     meta: {
-      allowedHosts: csv(process.env.META_MEDIA_ALLOWED_HOSTS, []),
-      metadataTimeoutMs: int(process.env.META_MEDIA_METADATA_TIMEOUT_MS),
-      downloadTimeoutMs: int(process.env.META_MEDIA_DOWNLOAD_TIMEOUT_MS),
+      allowedHosts: csv(
+        process.env.META_MEDIA_ALLOWED_HOSTS,
+        csv(META_MEDIA_ALLOWED_HOSTS_DEFAULT),
+      ),
+      metadataTimeoutMs: int(
+        process.env.META_MEDIA_METADATA_TIMEOUT_MS,
+        10_000,
+      ),
+      downloadTimeoutMs: int(
+        process.env.META_MEDIA_DOWNLOAD_TIMEOUT_MS,
+        30_000,
+      ),
     },
-    storage: {
-      endpoint: process.env.RECEIPT_STORAGE_ENDPOINT,
-      region: process.env.RECEIPT_STORAGE_REGION,
-      bucket: process.env.RECEIPT_STORAGE_BUCKET,
-      accessKeyId: process.env.RECEIPT_STORAGE_ACCESS_KEY_ID,
-      secretAccessKey: process.env.RECEIPT_STORAGE_SECRET_ACCESS_KEY,
-      forcePathStyle: process.env.RECEIPT_STORAGE_FORCE_PATH_STYLE === 'true',
-    },
-    publicBaseUrl: process.env.RECEIPT_MEDIA_PUBLIC_BASE_URL,
-    capability: {
-      keys: csv(process.env.RECEIPT_CAPABILITY_KEYS),
-      activeVersion: process.env.RECEIPT_CAPABILITY_ACTIVE_VERSION,
-    },
-    attachTimeoutMs: int(process.env.CHATBOT_API_ATTACH_TIMEOUT_MS),
     worker: {
-      // R3-cleanup-rollout-gate: dedicated, default-false ingestion rollout
-      // gate. Only the exact string 'true' enables it; omitted/false stay false.
-      enabled: process.env.RECEIPT_MEDIA_INGESTION_ENABLED === 'true',
       concurrency: parseInt(
         process.env.RECEIPT_MEDIA_WORKER_CONCURRENCY ?? '2',
         10,
@@ -137,28 +79,9 @@ const configuration = () => ({
         process.env.RECEIPT_MEDIA_WORKER_LEASE_MS ?? '60000',
         10,
       ),
-      pollIntervalMs: int(process.env.RECEIPT_MEDIA_WORKER_POLL_MS),
+      pollIntervalMs: int(process.env.RECEIPT_MEDIA_WORKER_POLL_MS, 5_000),
     },
-    metricsEnabled: process.env.RECEIPT_MEDIA_METRICS_ENABLED === 'true',
     metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
-  },
-  // SQ-2A-H: default-off shipping quotes; provider fields are trimmed env passthrough.
-  shippingQuotes: {
-    enabled: process.env.SHIPPING_QUOTES_ENABLED === 'true',
-    // SQ-5B2A: raw private measured-demo profile JSON, trimmed, never parsed at boot.
-    measuredDemoParcelProfileJson: trimmedOrUndefined(
-      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON,
-    ),
-    skydropx: {
-      baseUrl:
-        trimmed(process.env.SKYDROPX_BASE_URL) ?? SKYDROPX_BASE_URL_DEFAULT,
-      clientId: trimmed(process.env.SKYDROPX_CLIENT_ID),
-      clientSecret: trimmed(process.env.SKYDROPX_CLIENT_SECRET),
-      originPostalCode: trimmed(process.env.SKYDROPX_ORIGIN_POSTAL_CODE),
-      originState: trimmed(process.env.SKYDROPX_ORIGIN_STATE),
-      originMunicipality: trimmed(process.env.SKYDROPX_ORIGIN_MUNICIPALITY),
-      originNeighborhood: trimmed(process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD),
-    },
   },
 });
 

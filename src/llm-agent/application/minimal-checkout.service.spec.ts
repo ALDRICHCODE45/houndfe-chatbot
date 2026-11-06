@@ -147,7 +147,6 @@ function setup(
   const forbidden = {
     upsertCustomer: jest.fn(),
     createSale: jest.fn(),
-    attachReceipt: jest.fn(),
     getPaymentDetails: jest.fn(),
     cancelSale: jest.fn(),
     updateDelivery: jest.fn(),
@@ -160,10 +159,7 @@ function setup(
     ...forbidden,
   } as unknown as jest.Mocked<ChatbotApiClient>;
   const config = {
-    get: (key: string) =>
-      key === 'minimalCatalogAgent'
-        ? { enabled: true, allowedSenders: [SENDER] }
-        : { model: 'm', maxSteps: 5, historyTurns: 12 },
+    get: () => ({ model: 'm', maxSteps: 5, historyTurns: 12 }),
   } as unknown as ConfigService;
   let steps: unknown[] = [];
   const seen: Array<{ system?: unknown; tools?: Record<string, unknown> }> = [];
@@ -786,7 +782,6 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
   it('lets a RESTOCK offer win over a checkout presentation and leaves the summary unarmed', async () => {
     const restockSent = jest.fn();
     const restock = {
-      enabled: true,
       prepare: jest.fn(async () => ({
         kind: 'offer',
         reply: '¿Consulto la reposición?',
@@ -818,7 +813,6 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
 
   it('lets an EXPIRATION reply win over a checkout presentation', async () => {
     const expiration = {
-      enabled: true,
       prepare: jest.fn(async () => ({
         kind: 'registered',
         reply: 'Consulté la caducidad con el equipo.',

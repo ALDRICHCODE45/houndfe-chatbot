@@ -1,4 +1,5 @@
 import {
+  checkoutErrorMismatches,
   CheckoutIdempotencyKeySchema,
   CreateCheckoutInputSchema,
   normalizeCheckoutResponse,
@@ -22,11 +23,7 @@ export const checkoutInput = {
       },
     ],
     expectedTotalCents: 61000,
-    shipping: {
-      chargeCents: 1000,
-      approvalId: 'approval-1',
-      quoteId: 'quote-1',
-    },
+    shipping: { quoteId: 'quote-1' },
   },
 };
 export const checkoutResponse = {
@@ -45,8 +42,10 @@ export const checkoutResponse = {
     channel: 'ONLINE',
     deliveryStatus: 'PENDING',
     totalCents: 61000,
+    discountCents: 0,
     subtotalCents: 60000,
     shippingChargeCents: 1000,
+    fulfillmentMode: 'DELIVERY',
     paidCents: 0,
     debtCents: 61000,
     confirmedAt: '2026-06-22T00:00:00.000Z',
@@ -69,7 +68,7 @@ describe('atomic checkout DTO', () => {
       ...checkoutResponse,
       address: { ...checkoutResponse.address, resolution: 'updated' },
     };
-    expect(normalizeCheckoutResponse(response)?.address.resolution).toBe(
+    expect(normalizeCheckoutResponse(response)?.address?.resolution).toBe(
       'updated',
     );
     expect(
@@ -96,33 +95,39 @@ describe('atomic checkout DTO', () => {
       ...checkoutInput,
       sale: {
         ...checkoutInput.sale,
-        shipping: {
-          chargeCents: 1,
-          approvalId: ' approval ',
-          quoteId: ' quote ',
-        },
+        shipping: { quoteId: ' quote ' },
       },
     });
-    expect(parsed.sale.shipping).toEqual({
-      chargeCents: 1,
-      approvalId: 'approval',
-      quoteId: 'quote',
-    });
+    expect(parsed.sale.shipping).toEqual({ quoteId: 'quote' });
   });
-  it.each([0, -1, 1.5, 2147483648])(
-    'S1 rejects shipping charge %s',
-    (chargeCents) => {
-      expect(
-        CreateCheckoutInputSchema.safeParse({
-          ...checkoutInput,
-          sale: {
-            ...checkoutInput.sale,
-            shipping: { chargeCents, approvalId: 'a' },
-          },
-        }).success,
-      ).toBe(false);
-    },
-  );
+  it.each([
+    { quoteId: 'q', chargeCents: 1000 },
+    { quoteId: 'q', approvalId: 'a' },
+    { chargeCents: 1000, approvalId: 'a' },
+    { mode: 'pickup', quoteId: 'q' },
+    { mode: 'delivery' },
+    {},
+  ])('S2 rejects shipping %j', (shipping) => {
+    expect(
+      CreateCheckoutInputSchema.safeParse({
+        ...checkoutInput,
+        sale: { ...checkoutInput.sale, shipping },
+      }).success,
+    ).toBe(false);
+  });
+  it('S4 accepts store pickup', () => {
+    const { deliveryAddress, ...rest } = checkoutInput;
+    const pickup = {
+      ...rest,
+      sale: { ...checkoutInput.sale, shipping: { mode: 'pickup' } },
+    };
+    expect(CreateCheckoutInputSchema.parse(pickup)).toEqual(pickup);
+    // Pickup with an address is a mixed shape (400 INVALID_CHECKOUT_REQUEST).
+    expect(
+      CreateCheckoutInputSchema.safeParse({ ...pickup, deliveryAddress })
+        .success,
+    ).toBe(false);
+  });
   it.each([undefined, -1, 1.5, 2147483648])(
     'S1 rejects total %s',
     (expectedTotalCents) => {
@@ -134,22 +139,16 @@ describe('atomic checkout DTO', () => {
       ).toBe(false);
     },
   );
-  it.each(['approvalId', 'quoteId'])(
-    'S1 caps and rejects blank %s',
-    (field) => {
-      for (const value of [' ', 'x'.repeat(201), null]) {
-        expect(
-          CreateCheckoutInputSchema.safeParse({
-            ...checkoutInput,
-            sale: {
-              ...checkoutInput.sale,
-              shipping: { ...checkoutInput.sale.shipping, [field]: value },
-            },
-          }).success,
-        ).toBe(false);
-      }
-    },
-  );
+  it('S1 caps and rejects blank quoteId', () => {
+    for (const quoteId of [' ', 'x'.repeat(201), null]) {
+      expect(
+        CreateCheckoutInputSchema.safeParse({
+          ...checkoutInput,
+          sale: { ...checkoutInput.sale, shipping: { quoteId } },
+        }).success,
+      ).toBe(false);
+    }
+  });
   it('S1 restricts both resolution vocabularies', () => {
     expect(
       normalizeCheckoutResponse({
@@ -197,10 +196,6 @@ describe('atomic checkout DTO', () => {
     },
     {
       ...checkoutInput,
-      sale: { ...checkoutInput.sale, expectedTotalCents: 0 },
-    },
-    {
-      ...checkoutInput,
       sale: {
         ...checkoutInput.sale,
         shipping: { ...checkoutInput.sale.shipping, extra: true },
@@ -217,16 +212,14 @@ describe('atomic checkout DTO', () => {
   ])('rejects invalid or mixed fields %#', (input) => {
     expect(CreateCheckoutInputSchema.safeParse(input).success).toBe(false);
   });
-  it('normalizes the receipt without inventing optional freight fields', () => {
-    expect(
-      normalizeCheckoutResponse(checkoutResponse)?.sale.discountCents,
-    ).toBe(0);
-    const sale = { ...checkoutResponse.sale };
-    Reflect.deleteProperty(sale, 'subtotalCents');
-    Reflect.deleteProperty(sale, 'shippingChargeCents');
-    expect(
-      normalizeCheckoutResponse({ ...checkoutResponse, sale })?.sale,
-    ).not.toHaveProperty('subtotalCents');
+  it('requires the delivery freight and discount fields', () => {
+    for (const key of ['discountCents', 'shippingChargeCents']) {
+      const sale = { ...checkoutResponse.sale };
+      Reflect.deleteProperty(sale, key);
+      expect(
+        normalizeCheckoutResponse({ ...checkoutResponse, sale }),
+      ).toBeNull();
+    }
   });
   it.each([
     null,
@@ -262,5 +255,299 @@ describe('atomic checkout DTO', () => {
         checkout: checkoutResponse,
       }),
     ).toBeNull();
+  });
+});
+
+/** docs/contracts/checkout-shipping.md examples; "…" ids replaced by UUIDs. */
+export const contractDelivery201 = {
+  status: 'created',
+  customer: {
+    resolution: 'existing',
+    customerId: 'c0a1c0a1-0000-4000-8000-000000000001',
+    firstName: 'Ana',
+    lastName: null,
+  },
+  address: {
+    resolution: 'created',
+    id: 'd4e5d4e5-0000-4000-8000-000000000002',
+    version: '2026-11-06T18:01:02.345Z',
+  },
+  sale: {
+    saleId: '1e061e06-0000-4000-8000-000000000003',
+    folio: 'A-202611-000001',
+    paymentStatus: 'CREDIT',
+    channel: 'ONLINE',
+    deliveryStatus: 'PENDING',
+    totalCents: 78000,
+    discountCents: 0,
+    subtotalCents: 60000,
+    shippingChargeCents: 18000,
+    fulfillmentMode: 'DELIVERY',
+    paidCents: 0,
+    debtCents: 78000,
+    confirmedAt: '2026-11-06T18:01:02.400Z',
+  },
+};
+export const contractPickup201 = {
+  status: 'created',
+  customer: {
+    resolution: 'created',
+    customerId: '77b077b0-0000-4000-8000-000000000004',
+    firstName: 'Luis',
+    lastName: null,
+  },
+  address: null,
+  sale: {
+    saleId: '9c219c21-0000-4000-8000-000000000005',
+    folio: 'A-202611-000002',
+    paymentStatus: 'CREDIT',
+    channel: 'ONLINE',
+    deliveryStatus: 'PENDING',
+    totalCents: 60000,
+    discountCents: 0,
+    fulfillmentMode: 'PICKUP',
+    paidCents: 0,
+    debtCents: 60000,
+    confirmedAt: '2026-11-06T18:05:00.000Z',
+  },
+  pickupLocation: {
+    name: 'Sucursal Centro',
+    address: {
+      addressLine1: 'Av. Juárez 123',
+      addressLine2: null,
+      neighborhood: 'Centro',
+      municipality: 'Cuauhtémoc',
+      state: 'Ciudad de México',
+      postalCode: '06000',
+      formatted:
+        'Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000',
+    },
+    hours: {
+      timeZone: 'America/Mexico_City',
+      days: [
+        ['MONDAY', 'Lunes'],
+        ['TUESDAY', 'Martes'],
+        ['WEDNESDAY', 'Miércoles'],
+        ['THURSDAY', 'Jueves'],
+        ['FRIDAY', 'Viernes'],
+        ['SATURDAY', 'Sábado'],
+      ]
+        .map(([day, label]) => ({
+          day,
+          label,
+          closed: false,
+          ranges: [{ open: '09:00', close: '18:00' }],
+        }))
+        .concat([
+          { day: 'SUNDAY', label: 'Domingo', closed: true, ranges: [] },
+        ]),
+      summary: 'Lunes a sábado: 09:00–18:00. Domingo: cerrado.',
+    },
+  },
+};
+
+describe('checkout shipping contract (C1)', () => {
+  it('parses the delivery 201 exactly', () => {
+    expect(normalizeCheckoutResponse(contractDelivery201)).toEqual(
+      contractDelivery201,
+    );
+  });
+  it('parses the pickup 201 exactly, also through /checkouts/status', () => {
+    expect(normalizeCheckoutResponse(contractPickup201)).toEqual(
+      contractPickup201,
+    );
+    expect(
+      normalizeCheckoutStatus({
+        status: 'succeeded',
+        checkout: contractPickup201,
+      }),
+    ).toEqual({ status: 'succeeded', checkout: contractPickup201 });
+  });
+  it('accepts a formatted-only pickup address and null address/hours', () => {
+    const formattedOnly = {
+      ...contractPickup201,
+      pickupLocation: {
+        name: 'Sucursal Centro',
+        address: {
+          addressLine1: null,
+          addressLine2: null,
+          neighborhood: null,
+          municipality: null,
+          state: null,
+          postalCode: null,
+          formatted: 'Av. Juárez 123, Centro',
+        },
+        hours: null,
+      },
+    };
+    expect(normalizeCheckoutResponse(formattedOnly)).toEqual(formattedOnly);
+    const bare = {
+      ...contractPickup201,
+      pickupLocation: { name: 'Sucursal Centro', address: null, hours: null },
+    };
+    expect(normalizeCheckoutResponse(bare)).toEqual(bare);
+  });
+  it('pickup request: existing and new customer without deliveryAddress', () => {
+    const items = [
+      {
+        productId: id,
+        productName: 'Croquetas',
+        quantity: 1,
+        unitPriceCents: 60000,
+      },
+    ];
+    const sale = {
+      cashierUserId: id,
+      items,
+      expectedTotalCents: 60000,
+      shipping: { mode: 'pickup' },
+    };
+    const created = {
+      phoneCountryCode: '52',
+      phone: '5511112222',
+      customer: { mode: 'createIfAbsent', firstName: 'Luis' },
+      sale,
+    };
+    expect(CreateCheckoutInputSchema.parse(created)).toEqual(created);
+    const existing = {
+      ...created,
+      customer: { mode: 'existing', customerId: id },
+    };
+    expect(CreateCheckoutInputSchema.parse(existing)).toEqual(existing);
+    // Delivery still needs an address.
+    expect(
+      CreateCheckoutInputSchema.safeParse({
+        ...created,
+        sale: { ...sale, shipping: { quoteId: 'q' } },
+      }).success,
+    ).toBe(false);
+  });
+  it.each([
+    [
+      'delivery without subtotal',
+      {
+        ...contractDelivery201,
+        sale: { ...contractDelivery201.sale, subtotalCents: undefined },
+      },
+    ],
+    [
+      'delivery with pickup mode',
+      {
+        ...contractDelivery201,
+        sale: { ...contractDelivery201.sale, fulfillmentMode: 'PICKUP' },
+      },
+    ],
+    [
+      'delivery with pickupLocation',
+      {
+        ...contractDelivery201,
+        pickupLocation: contractPickup201.pickupLocation,
+      },
+    ],
+    ['delivery without address', { ...contractDelivery201, address: null }],
+    [
+      'pickup with shipping charge',
+      {
+        ...contractPickup201,
+        sale: { ...contractPickup201.sale, shippingChargeCents: 0 },
+      },
+    ],
+    [
+      'pickup with an address',
+      { ...contractPickup201, address: contractDelivery201.address },
+    ],
+    [
+      'pickup sale extra key',
+      { ...contractPickup201, sale: { ...contractPickup201.sale, extra: 1 } },
+    ],
+    [
+      'pickupLocation extra key',
+      {
+        ...contractPickup201,
+        pickupLocation: { ...contractPickup201.pickupLocation, phone: 'x' },
+      },
+    ],
+    [
+      'no fulfillmentMode',
+      {
+        ...contractDelivery201,
+        sale: { ...contractDelivery201.sale, fulfillmentMode: undefined },
+      },
+    ],
+  ])('fails closed: %s', (_name, body) => {
+    expect(
+      normalizeCheckoutResponse(JSON.parse(JSON.stringify(body))),
+    ).toBeNull();
+  });
+  it('reads mismatches from an error body', () => {
+    expect(
+      checkoutErrorMismatches({
+        statusCode: 409,
+        error: 'SHIPPING_QUOTE_MISMATCH',
+        message: 'SHIPPING_QUOTE_MISMATCH',
+        mismatches: ['LINES', 'DESTINATION'],
+      }),
+    ).toEqual(['LINES', 'DESTINATION']);
+    expect(checkoutErrorMismatches({ statusCode: 409 })).toEqual([]);
+    expect(checkoutErrorMismatches(null)).toEqual([]);
+  });
+});
+
+describe('checkout status recovery (R3-strict-receipt)', () => {
+  // A 201 with an unexpected key is an uncertain outcome; the status read
+  // embeds the same strict body, so recovery must still find our sale.
+  it('recovers our sale from a succeeded status with an unexpected key', () => {
+    const body = {
+      status: 'succeeded',
+      checkout: {
+        ...contractPickup201,
+        sale: { ...contractPickup201.sale, extra: 1 },
+        newField: true,
+      },
+    };
+    expect(normalizeCheckoutStatus(body)).toEqual({
+      status: 'succeeded_unverified',
+      checkout: {
+        sale: {
+          saleId: contractPickup201.sale.saleId,
+          folio: contractPickup201.sale.folio,
+          totalCents: contractPickup201.sale.totalCents,
+        },
+      },
+    });
+  });
+
+  it('keeps the exact contract body as succeeded', () => {
+    expect(
+      normalizeCheckoutStatus({
+        status: 'succeeded',
+        checkout: contractDelivery201,
+      })?.status,
+    ).toBe('succeeded');
+  });
+
+  it.each([
+    ['no sale', { status: 'succeeded', checkout: { status: 'created' } }],
+    [
+      'an invalid sale id',
+      {
+        status: 'succeeded',
+        checkout: {
+          sale: { ...contractPickup201.sale, saleId: 'x', extra: 1 },
+        },
+      },
+    ],
+    [
+      'an invalid total',
+      {
+        status: 'succeeded',
+        checkout: {
+          sale: { ...contractPickup201.sale, totalCents: -1, extra: 1 },
+        },
+      },
+    ],
+    ['not_observed with a key', { status: 'not_observed', checkout: {} }],
+  ])('still fails closed with %s', (_name, body) => {
+    expect(normalizeCheckoutStatus(body)).toBeNull();
   });
 });

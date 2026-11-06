@@ -53,7 +53,6 @@ function fixture(historyTurns = 4) {
     cashierUserId: productId,
     humanHandoffService: { create: jest.fn() },
     restock: {
-      enabled: true,
       markers: {
         readForSender: jest.fn().mockResolvedValue({
           legacyRequestPending: false,
@@ -140,7 +139,6 @@ function sdkFixture(
     chatbotApi: { getStock, searchCatalog },
     cashierUserId: productId,
     humanHandoffService: { create: jest.fn() },
-    restock: { enabled: false },
   } as unknown as ToolDeps;
   const tools = {
     searchCatalog: makeSearchCatalogTool(deps),

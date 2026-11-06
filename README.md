@@ -36,6 +36,12 @@ the operator must update any explicit value of `3` if this four-step sequence is
 required. Compared with the old default, a turn can use one additional model
 call; the existing cost guard remains in place.
 
+## Customer route
+
+Every customer WhatsApp message is handled by the minimal catalog agent,
+including order placement. There is no enable flag or sender allowlist; the
+legacy agent runner only answers the ops-resolved human-handoff turn.
+
 ## Project setup
 
 ```bash

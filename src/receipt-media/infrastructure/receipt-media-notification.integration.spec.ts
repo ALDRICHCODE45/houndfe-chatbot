@@ -30,8 +30,10 @@ const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 type Row = Record<string, unknown>;
 const OWNER = 'odd6c.worker';
-const AMOUNT_CONFIRM = 'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.';
-const ATTACHED_PENDING = 'Comprobante recibido, queda PENDIENTE (PENDING).';
+const AMOUNT_CONFIRM =
+  'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.';
+const ATTACHED_PENDING =
+  'Recibimos su comprobante del pedido F-1. Lo estamos revisando y le avisamos en cuanto se confirme.';
 
 type SendHandler = (message: OutboundText) => Promise<SendResult>;
 const fakeSender = (handler: SendHandler) => {
@@ -93,8 +95,8 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
       dedupe_key: `odd6c.${++seq}`,
       source_webhook_message_id: `wamid.odd6c.${seq}`,
       recipient_id: '+525500000000',
-      template_key: 'RECEIPT_AMOUNT_CONFIRM',
-      template_args: JSON.stringify({ amountCents: 123456 }),
+      template_key: 'RECEIPT_PAYMENT_PARTIAL',
+      template_args: JSON.stringify({ folio: 'F-1', debtCents: 123456 }),
       status: 'PENDING',
       attempts: 0,
       ...over,
@@ -196,9 +198,7 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
     } finally {
       workers.clear();
     }
-    await pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox',
-    );
+    await pool.query('TRUNCATE receipt_media_outbox');
     if (failure)
       throw failure instanceof Error ? failure : new Error('ODD-6C teardown');
   });
@@ -206,13 +206,13 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
   it('renders committed PENDING intents through the JSONB round trip and marks each durably SENT once', async () => {
     const confirm = await insert({
       recipient_id: '+525500000001',
-      template_key: 'RECEIPT_AMOUNT_CONFIRM',
-      template_args: JSON.stringify({ amountCents: 123456 }),
+      template_key: 'RECEIPT_PAYMENT_PARTIAL',
+      template_args: JSON.stringify({ folio: 'F-1', debtCents: 123456 }),
     });
     const attached = await insert({
       recipient_id: '+525500000002',
       template_key: 'RECEIPT_ATTACHED_PENDING',
-      template_args: JSON.stringify({ backendStatus: 'PENDING' }),
+      template_args: JSON.stringify({ folio: 'F-1' }),
     });
     const { sender, calls } = fakeSender(async (message) => ({
       providerMessageId: `wamid.det.${message.to}`,
@@ -225,8 +225,8 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
       return current.every((row) => row.status === 'SENT') ? current : null;
     });
     const [a, b] = rows;
-    expect(a.template_args).toEqual({ amountCents: 123456 });
-    expect(b.template_args).toEqual({ backendStatus: 'PENDING' });
+    expect(a.template_args).toEqual({ folio: 'F-1', debtCents: 123456 });
+    expect(b.template_args).toEqual({ folio: 'F-1' });
     for (const [row, text] of [
       [a, AMOUNT_CONFIRM],
       [b, ATTACHED_PENDING],
@@ -305,8 +305,8 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
       status: 'SENDING',
       attempts: 2,
       recipientId: '+525500000003',
-      templateKey: 'RECEIPT_AMOUNT_CONFIRM',
-      templateArgs: { amountCents: 123456 },
+      templateKey: 'RECEIPT_PAYMENT_PARTIAL',
+      templateArgs: { folio: 'F-1', debtCents: 123456 },
     });
 
     // No automatic fourth send and no re-arm: the terminal row stays put.
@@ -320,7 +320,7 @@ ddescribe('receipt-media notification cross-boundary (ODD-6C)', () => {
     const id = await insert({
       recipient_id: '+525500000004',
       template_key: 'RECEIPT_ATTACHED_PENDING',
-      template_args: JSON.stringify({ backendStatus: 'PENDING' }),
+      template_args: JSON.stringify({ folio: 'F-1' }),
       status: 'SENDING',
       attempts: 1,
       lease_owner: 'crashed-worker',

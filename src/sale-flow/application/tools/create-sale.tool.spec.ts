@@ -8,22 +8,6 @@ import type {
 } from '../../../conversation/domain/conversation-store';
 import { UpstreamError } from '../../../chatbot-api/domain/errors';
 import type { BotSaleResponse } from '../../../chatbot-api/domain/dtos/sales.dto';
-import { SHIPPING_APPROVAL_KEY } from '../../../human-handoff/application/shipping-approval-persistence';
-import { SHIPPING_QUOTE_DRAFT_KEY } from '../../../shipping/application/shipping-quote-draft-record';
-import {
-  DENIED,
-  MODEL_INPUT,
-  SALE,
-  blockedCases,
-  cleanCart,
-  dataWithAccessor,
-  divergentDataProxyState,
-  executeGateTool,
-  executeGateWithData,
-  statefulAccessorState,
-  statefulDataProxyState,
-  stateWithDataAccessor,
-} from '../../../../test/fixtures/shipping-sale-gate-fixture';
 
 /**
  * Unit tests for the createSale tool factory.
@@ -58,8 +42,6 @@ describe('makeCreateSaleTool', () => {
       create: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
       update: jest
         .fn()
         .mockImplementation(
@@ -1372,132 +1354,55 @@ describe('makeCreateSaleTool', () => {
     );
   });
 
-  // ── SQ-5D2: shipping marker gate ─────────────────────────────────────
-  // The backend `CreateSaleInput` has no shipping-charge field, so any
-  // server-written shipping marker must deny before the idempotency-key
-  // mint / backend call; an address-only sale still passes.
-  describe('shipping marker gate (SQ-5D2)', () => {
-    it.each(blockedCases)(
-      'denies before minting a key / calling the backend when the state carries $label',
-      async ({ data }) => {
-        const { result, createSale, update } = executeGateWithData(
-          baseDeps,
-          data(),
-        );
-        // Empty key would force a mint write; the gate returns first.
-        expect(await result).toEqual(DENIED);
-        expect(createSale).not.toHaveBeenCalled();
-        expect(update).not.toHaveBeenCalled();
+  it('forwards shippingAddressId and never sends a shipping charge', async () => {
+    const address = '00000000-4000-9000-0000-0000000000aa';
+    const sale: BotSaleResponse = {
+      saleId: 'sale-1',
+      folio: null,
+      paymentStatus: 'CREDIT',
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      totalCents: 1000,
+      paidCents: 0,
+      debtCents: 1000,
+      confirmedAt: null,
+      discountCents: 0,
+    };
+    const createSale = jest.fn().mockResolvedValue(sale);
+    const store = stubStoreWithCart({
+      items: [
+        {
+          productId: '00000000-4000-9000-0000-000000000001',
+          quantity: 1,
+          unitPriceCents: 1000,
+        },
+      ],
+      idempotencyKey: '',
+    });
+    const tool = makeCreateSaleTool({
+      ...baseDeps,
+      chatbotApi: { createSale } as unknown as ChatbotApiClient,
+      store,
+    });
+
+    const result = await tool.execute(
+      {
+        customerId: '00000000-4000-9000-0000-000000000099',
+        shippingAddressId: address,
+        items: [
+          {
+            productId: '00000000-4000-9000-0000-000000000001',
+            productName: 'Croquetas',
+            quantity: 1,
+            unitPriceCents: 1000,
+          },
+        ],
       },
+      { toolCallId: 't', messages: [], context: { senderId: 's' } },
     );
 
-    it('fails closed (malformed_state → same deny) when a marker getter throws', async () => {
-      const data = dataWithAccessor(SHIPPING_APPROVAL_KEY, () => {
-        throw new Error('hostile marker getter');
-      });
-      const { result, createSale, update } = executeGateWithData(
-        baseDeps,
-        data,
-      );
-      expect(await result).toEqual(DENIED);
-      expect(createSale).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-    });
-
-    it('fails closed BEFORE the cart read when reading state.data throws', async () => {
-      const state = stateWithDataAccessor(() => {
-        throw new Error('hostile data getter');
-      });
-      const { result, createSale, update } = executeGateTool(baseDeps, state);
-      expect(await result).toEqual(DENIED);
-      expect(createSale).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-    });
-
-    it('fails closed on non-plain state.data before attempting any cart read', async () => {
-      const { result, createSale, update } = executeGateWithData(baseDeps, [
-        'not',
-        'a',
-        'bag',
-      ] as unknown as ConversationState['data']);
-      expect(await result).toEqual(DENIED);
-      expect(createSale).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-    });
-
-    it('rejects a stateful state.data accessor (clean then marked) without invoking it', async () => {
-      const { state, dataReads } = statefulAccessorState();
-      const { result, createSale, update } = executeGateTool(baseDeps, state);
-      expect(await result).toEqual(DENIED);
-      expect(createSale).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-      // Descriptor rejection never executes the accessor.
-      expect(dataReads()).toBe(0);
-    });
-
-    // ── D2 correction: descriptor / get divergence ─────────────────────
-    // A plain-prototype Proxy can report a clean `data` DESCRIPTOR while its
-    // `get('data')` supplies a shipping-marked bag. Pre-correction the gate
-    // trusted the descriptor, so the marked bag reached readCart /
-    // persistence. Reject the divergence before any key mint / backend call.
-    it('denies a Proxy whose data descriptor is clean while get("data") is shipping-marked', async () => {
-      const { result, createSale, update } = executeGateTool(
-        baseDeps,
-        divergentDataProxyState(),
-      );
-      expect(await result).toEqual(DENIED);
-      expect(createSale).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-    });
-
-    it('pins one snapshot: a stateful get("data") (clean then marked) cannot bypass the gate', async () => {
-      const { state, dataReads } = statefulDataProxyState();
-      const { result, createSale, update } = executeGateTool(baseDeps, state);
-      expect(await result).toEqual({ ok: true, ...SALE });
-      expect(createSale).toHaveBeenCalledTimes(1);
-      // The clean FIRST snapshot is the only `data` read; the later marked bag
-      // reaches neither readCart nor the durable write.
-      expect(dataReads()).toBe(1);
-      expect(update).toHaveBeenCalledTimes(1);
-      expect(update.mock.calls[0]![1].data).not.toHaveProperty(
-        SHIPPING_QUOTE_DRAFT_KEY,
-      );
-    });
-
-    it('keeps readCart defensive: a malformed cart snapshot still yields validation with no backend call', async () => {
-      const { result, createSale, update } = executeGateWithData(baseDeps, {
-        cart: 'not-a-cart',
-      });
-      expect(await result).toEqual({
-        ok: false,
-        error: { kind: 'validation', retryable: false },
-      });
-      expect(createSale).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-    });
-
-    it('does not claim nested-Proxy detection: a pass-through data Proxy behaves like plain data', async () => {
-      const data = new Proxy(cleanCart(), {});
-      const { result } = executeGateWithData(baseDeps, data);
-      expect(await result).toEqual({ ok: true, ...SALE });
-    });
-
-    it('leaves an ordinary sale with a shippingAddressId but no markers unchanged', async () => {
-      const address = '00000000-4000-9000-0000-0000000000aa';
-      const { result, createSale, update } = executeGateWithData(
-        baseDeps,
-        cleanCart(),
-        {
-          ...MODEL_INPUT,
-          shippingAddressId: address,
-        },
-      );
-
-      expect(await result).toEqual({ ok: true, ...SALE });
-      expect(createSale).toHaveBeenCalledTimes(1);
-      expect(createSale.mock.calls[0]![0].shippingAddressId).toBe(address);
-      // Only the success-path atomic write happens; the gate writes nothing.
-      expect(update).toHaveBeenCalledTimes(1);
-    });
+    expect(result).toEqual({ ok: true, ...sale });
+    expect(createSale.mock.calls[0]![0].shippingAddressId).toBe(address);
+    expect(createSale.mock.calls[0]![0]).not.toHaveProperty('shipping');
   });
 });

@@ -1,7 +1,4 @@
 import { Test } from '@nestjs/testing';
-import { Module, type DynamicModule } from '@nestjs/common';
-import { SHIPPING_QUOTE_PROVIDER } from '../shipping/domain/shipping-quote.port';
-import { MEASURED_DEMO_SHIPPING_CONFIG } from '../shipping/application/measured-demo-shipping-config';
 import { ConfigService } from '@nestjs/config';
 import { HttpModule } from '@nestjs/axios';
 import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
@@ -13,7 +10,6 @@ import { PG_POOL } from '../database/postgres-pool.provider';
 import { RESTOCK_INTAKE_SERVICE } from '../human-decisions/application/restock-intake.service';
 import { SHARED_ROUTE_MARKERS } from '../human-decisions/domain/shared-route-markers';
 import { HUMAN_HANDOFF_STORE } from '../human-handoff/domain/human-handoff-store.port';
-import { ShippingModule } from '../shipping/shipping.module';
 import {
   HUMAN_HANDOFF_SERVICE_TOKEN,
   RealToolRegistry,
@@ -29,25 +25,6 @@ import { SaleFlowModule } from './sale-flow.module';
  *   - ChatbotApiModule + ConversationModule are transitively imported
  *     (CHATBOT_API_CLIENT + CONVERSATION_STORE resolve through the module).
  */
-const SHIPPING_PROBE = Symbol('SHIPPING_PROBE');
-@Module({
-  imports: [SaleFlowModule],
-  providers: [
-    {
-      provide: SHIPPING_PROBE,
-      inject: [
-        { token: SHIPPING_QUOTE_PROVIDER, optional: true },
-        { token: MEASURED_DEMO_SHIPPING_CONFIG, optional: true },
-      ],
-      useFactory: (provider: unknown, measured: unknown) => ({
-        provider,
-        measured,
-      }),
-    },
-  ],
-})
-class ShippingImporter {}
-
 describe('SaleFlowModule', () => {
   // Set up the env so AppConfigModule.forRoot() can validate (with
   // ignoreEnvFile: true, only process.env matters).
@@ -65,12 +42,7 @@ describe('SaleFlowModule', () => {
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     OPS_CHANNEL_PHONE: '5215500000000',
   };
-  // WU2B sets HUMAN_DECISIONS_RESTOCK_ENABLED in one test, so the flag is saved
-  // and restored alongside the validated env keys (and unset by default).
-  const ENV_KEYS = [
-    ...Object.keys(VALID_ENV),
-    'HUMAN_DECISIONS_RESTOCK_ENABLED',
-  ];
+  const ENV_KEYS = Object.keys(VALID_ENV);
   let savedEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
@@ -81,7 +53,6 @@ describe('SaleFlowModule', () => {
     for (const key of Object.keys(VALID_ENV)) {
       process.env[key] = VALID_ENV[key];
     }
-    delete process.env.HUMAN_DECISIONS_RESTOCK_ENABLED;
   });
 
   afterEach(() => {
@@ -102,7 +73,6 @@ describe('SaleFlowModule', () => {
     getCustomerByPhone: jest.fn(),
     upsertCustomer: jest.fn(),
     createSale: jest.fn(),
-    attachReceipt: jest.fn(),
     updateDelivery: jest.fn(),
     getOrderHistory: jest.fn(),
   };
@@ -111,13 +81,10 @@ describe('SaleFlowModule', () => {
     create: jest.fn(),
     update: jest.fn(),
   };
-  const stubConfigService = (restockEnabled?: boolean) => ({
+  const stubConfigService = () => ({
     get: (key: string) => {
       if (key === 'chatbotApi.cashierUserId') {
         return '00000000-4000-9000-0000-000000000001';
-      }
-      if (key === 'humanDecisions.restockEnabled') {
-        return restockEnabled;
       }
       return undefined;
     },
@@ -130,11 +97,10 @@ describe('SaleFlowModule', () => {
     end: jest.fn().mockResolvedValue(undefined),
   };
 
-  async function buildModule(restockEnabled?: boolean, shipping = false) {
+  async function buildModule() {
     const builder = Test.createTestingModule({
       imports: [
         SaleFlowModule,
-        ShippingImporter,
         HttpModule,
         AppConfigModule.forRoot({ ignoreEnvFile: true }),
       ],
@@ -165,24 +131,7 @@ describe('SaleFlowModule', () => {
       .overrideProvider(PG_POOL)
       .useValue(fakePool)
       .overrideProvider(ConfigService)
-      .useValue(stubConfigService(restockEnabled));
-    if (shipping) {
-      const imports = Reflect.getMetadata(
-        'imports',
-        SaleFlowModule,
-      ) as DynamicModule[];
-      const existing = imports.find(
-        (entry) => entry.module === ShippingModule,
-      )!;
-      builder.overrideModule(existing).useModule({
-        module: ShippingModule,
-        providers: [
-          { provide: SHIPPING_QUOTE_PROVIDER, useValue: { quote: jest.fn() } },
-          { provide: MEASURED_DEMO_SHIPPING_CONFIG, useValue: null },
-        ],
-        exports: [SHIPPING_QUOTE_PROVIDER, MEASURED_DEMO_SHIPPING_CONFIG],
-      });
-    }
+      .useValue(stubConfigService());
     return builder.compile();
   }
 
@@ -193,14 +142,10 @@ describe('SaleFlowModule', () => {
   // AppConfigModule.forRoot({ ignoreEnvFile: true }) keeps the test
   // hermetic — it does NOT read the repo's .env file.
 
-  it('resolves RealToolRegistry through the module with exactly 12 tools', async () => {
+  it('resolves RealToolRegistry through the module with exactly 11 tools', async () => {
     const moduleRef = await buildModule();
     const registry = moduleRef.get(RealToolRegistry);
     expect(registry).toBeInstanceOf(RealToolRegistry);
-    expect(
-      (registry as unknown as { shippingQuoteOrchestrator: unknown })
-        .shippingQuoteOrchestrator,
-    ).toBeNull();
     expect(Object.keys(registry.getTools()).sort()).toEqual(
       [
         'searchCatalog',
@@ -209,7 +154,6 @@ describe('SaleFlowModule', () => {
         'getCustomerByPhone',
         'upsertCustomer',
         'createSale',
-        'attachReceipt',
         'updateDelivery',
         'getOrderHistory',
         'getPaymentDetails',
@@ -220,63 +164,34 @@ describe('SaleFlowModule', () => {
     await moduleRef.close();
   });
 
-  it.each([false, true])(
-    'S5: downstream importer sees shipping tokens only when provided (%s)',
-    async (enabled) => {
-      const ref = await buildModule(undefined, enabled);
-      const probe = ref.get<{ provider: unknown; measured: unknown }>(
-        SHIPPING_PROBE,
-      );
-      expect(probe.provider !== undefined).toBe(enabled);
-      expect(probe.measured).toBe(enabled ? null : undefined);
-      await ref.close();
-    },
-  );
-
-  it('S5: re-exports the single ShippingModule for downstream optional injection', () => {
-    const exports: unknown[] = Reflect.getMetadata(
-      'exports',
-      SaleFlowModule,
-    ) as unknown[];
-    expect(exports).toContain(ShippingModule);
-  });
-
-  it('imports the dynamic ShippingModule exactly once and nothing else shipping', () => {
-    const imports =
-      (Reflect.getMetadata('imports', SaleFlowModule) as
-        | Array<{ module?: unknown }>
-        | undefined) ?? [];
-    expect(
-      imports.filter((entry) => entry?.module === ShippingModule),
-    ).toHaveLength(1);
+  it('imports and exports no shipping module (carrier quoting is backend-owned)', () => {
+    const names = [
+      ...((Reflect.getMetadata('imports', SaleFlowModule) as unknown[]) ?? []),
+      ...((Reflect.getMetadata('exports', SaleFlowModule) as unknown[]) ?? []),
+    ].map((entry) =>
+      typeof entry === 'function'
+        ? entry.name
+        : (entry as { module?: { name?: string } })?.module?.name,
+    );
+    expect(names).not.toContain('ShippingModule');
   });
 
   it('does not bind the boot-time bank-details seam (only the runtime registry)', async () => {
     const moduleRef = await buildModule();
     // Probe the registry only — the boot-time bank-details symbol +
-    // provider file no longer exist. The 12-tool registry is the
+    // provider file no longer exist. The 11-tool registry is the
     // single SaleFlowModule export.
     const registry = moduleRef.get(RealToolRegistry);
-    expect(Object.keys(registry.getTools())).toHaveLength(12);
+    expect(Object.keys(registry.getTools())).toHaveLength(11);
     await moduleRef.close();
   });
 
   it('resolves the human-decisions RESTOCK tokens with no connection or SQL', async () => {
-    const moduleRef = await buildModule(false);
+    const moduleRef = await buildModule();
     expect(moduleRef.get(SHARED_ROUTE_MARKERS)).toBeDefined();
     expect(moduleRef.get(RESTOCK_INTAKE_SERVICE)).toBeDefined();
     const registry = moduleRef.get(RealToolRegistry);
-    expect(Object.keys(registry.getTools())).toHaveLength(12);
-    expect(fakePool.connect).not.toHaveBeenCalled();
-    expect(fakePool.query).not.toHaveBeenCalled();
-    await moduleRef.close();
-  });
-
-  it('stays inert on the SaleFlow surface even when the gate is exactly true', async () => {
-    process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
-    const moduleRef = await buildModule(true);
-    const registry = moduleRef.get(RealToolRegistry);
-    expect(Object.keys(registry.getTools())).toHaveLength(12);
+    expect(Object.keys(registry.getTools())).toHaveLength(11);
     expect(fakePool.connect).not.toHaveBeenCalled();
     expect(fakePool.query).not.toHaveBeenCalled();
     await moduleRef.close();

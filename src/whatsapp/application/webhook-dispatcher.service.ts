@@ -1,23 +1,14 @@
-import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
-import {
-  pendingMinimalShipping,
-  MINIMAL_SHIPPING_UNCONFIRMED,
-} from '../../llm-agent/application/minimal-shipping-approval';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import {
   CONVERSATION_STORE,
   readPendingHumanRequest,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import type {
-  AgentMessage,
-  ConversationStateData,
-} from '../../conversation/domain/conversation-store';
-import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import type { AgentMessage } from '../../conversation/domain/conversation-store';
 import {
   ReceiptIngressService,
   type ReceiptIngressDecision,
 } from '../../receipt-media/application/receipt-ingress.service';
-import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
@@ -36,15 +27,6 @@ import {
   WebhookEventDto,
   WebhookMessageDto,
 } from '../presentation/dto/webhook-event.dto';
-import { prepareShippingCustomerDisclosure } from '../../shipping/application/shipping-customer-disclosure';
-import { persistSentShippingCustomerOffer } from '../../shipping/application/shipping-customer-offer-persistence';
-import {
-  normalizeShippingCustomerOffer,
-  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
-  SHIPPING_CUSTOMER_OFFER_KEY,
-  type ShippingCustomerOffer,
-} from '../../shipping/application/shipping-customer-acceptance';
-import { evaluateShippingSaleRevalidation } from '../../sale-flow/application/shipping-sale-revalidation';
 
 /**
  * WebhookDispatcherService (agent + human-handoff router)
@@ -74,17 +56,16 @@ import { evaluateShippingSaleRevalidation } from '../../sale-flow/application/sh
  *      when the customer's `data.pendingHumanRequest` is set, send the
  *      canned byte-identical "seguimos esperando respuesta del agente,
  *      te avisamos en cuanto tengamos" reply and `continue`. No LLM call.
- *   5. `AgentRunner.handle({ senderId, text })` — runner owns idle-check,
- *      history truncation, cost-guard, fresh-state spread (ADR-28), and
- *      UPSERT-persistence of user + assistant turns (with the pending-marker
- *      short-circuit gate inside).
+ *   5. `MinimalCatalogAgentService.tryHandle({ senderId, text })` — every
+ *      customer turn runs through the minimal SDK route (no sender
+ *      allowlist, no legacy fallback). `AgentRunner` is used only for the
+ *      ops synthetic "resolved" turn in step 3.
  *   6. WhatsappSenderPort.sendText — send the reply.
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
  *      successful send, so a failed send lets Meta re-deliver and retry.
  *
  * Spec: `openspec/changes/human-handoff/specs/whatsapp-webhook/delta.md`.
- * Test: `webhook-dispatcher.service.spec.ts` (15 it() blocks: 8 agent-path
- * + 3 metadata + 4 ops-path/pending-marker short-circuit).
+ * Test: `webhook-dispatcher.service.spec.ts`.
  */
 @Injectable()
 export class WebhookDispatcherService {
@@ -102,13 +83,10 @@ export class WebhookDispatcherService {
     private readonly humanHandoff: HumanHandoffService,
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore: ConversationStore,
-    private readonly amountRouter: ReceiptAmountRouterService,
     private readonly ingress: ReceiptIngressService,
-    // Experimental default-off read-only SDK route. Optional so legacy
-    // 8-arg constructions (integration harnesses) keep compiling; when it is
-    // absent the dispatcher keeps the unchanged legacy AgentRunner path.
-    @Optional()
-    private readonly minimalCatalogAgent?: MinimalCatalogAgentService,
+    // Handles every customer turn; AgentRunner only serves the ops synthetic
+    // "resolved" turn above.
+    private readonly minimalCatalogAgent: MinimalCatalogAgentService,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -148,45 +126,21 @@ export class WebhookDispatcherService {
           });
 
           if (result.kind === 'resolved') {
-            // SCA-3b2: a structured SHIPPING_APPROVED resolution is NEVER a
-            // synthetic LLM turn. The dispatcher discloses the server-derived
-            // price deterministically and only a successful send can persist
-            // the pending customer-response marker.
-            if (result.minimalCustomerReply !== undefined) {
-              const { providerMessageId } = await this.whatsappSender.sendText({
-                to: result.customerId,
-                text: result.minimalCustomerReply,
-              });
-              this.recentOutbound.remember(providerMessageId);
-            } else if (result.resolution.decision === 'SHIPPING_APPROVED') {
-              await this.discloseApprovedShippingPrice(result.customerId);
-            } else {
-              // Synthetic-turn injection through the runner. The marker
-              // was cleared by `resolveReply` so the runner's gate
-              // (ADR-29) does NOT suppress this turn; the customer resumes
-              // normally and the runner's reply is sent to the customer
-              // (NOT the ops phone).
-              const { reply } = await this.agentRunner.handle({
-                senderId: result.customerId,
-                text: result.syntheticUserText,
-              });
-              const { providerMessageId } = await this.whatsappSender.sendText({
-                to: result.customerId,
-                text: reply,
-              });
-              this.recentOutbound.remember(providerMessageId);
-            }
+            // Synthetic-turn injection through the runner. The marker
+            // was cleared by `resolveReply` so the runner's gate
+            // (ADR-29) does NOT suppress this turn; the customer resumes
+            // normally and the runner's reply is sent to the customer
+            // (NOT the ops phone).
+            const { reply } = await this.agentRunner.handle({
+              senderId: result.customerId,
+              text: result.syntheticUserText,
+            });
+            const { providerMessageId } = await this.whatsappSender.sendText({
+              to: result.customerId,
+              text: reply,
+            });
+            this.recentOutbound.remember(providerMessageId);
           } else {
-            if (
-              result.kind === 'needs_requote' &&
-              result.minimalCustomerNotice !== undefined
-            ) {
-              const { providerMessageId } = await this.whatsappSender.sendText({
-                to: result.minimalCustomerNotice.customerId,
-                text: result.minimalCustomerNotice.reply,
-              });
-              this.recentOutbound.remember(providerMessageId);
-            }
             // `no_pending` → reply to the ops phone asking for a ref.
             const { providerMessageId } = await this.whatsappSender.sendText({
               to: message.senderId,
@@ -211,20 +165,6 @@ export class WebhookDispatcherService {
         // The runner has the same gate; this branch keeps the dispatcher
         // consistent even if a caller bypasses the runner.
         const custState = await this.conversationStore.get(message.senderId);
-        const pendingMinimal = readPendingHumanRequest(custState);
-        if (
-          pendingMinimal &&
-          pendingMinimalShipping(custState, pendingMinimal.requestId) &&
-          (await this.humanHandoff.expireMinimalShipping(message.senderId))
-        ) {
-          const { providerMessageId } = await this.whatsappSender.sendText({
-            to: message.senderId,
-            text: MINIMAL_SHIPPING_UNCONFIRMED,
-          });
-          this.recentOutbound.remember(providerMessageId);
-          await this.dedup.markSeen(message.messageId);
-          continue;
-        }
         if (readPendingHumanRequest(custState) !== null) {
           this.logger.log(
             `short-circuit pending-marker for ${message.messageId} from ${message.senderId}`,
@@ -246,60 +186,12 @@ export class WebhookDispatcherService {
           continue;
         }
 
-        // ─── WU13-B1: ReceiptAmountRouter — customer text only ─────────────
-        if (message.media == null) {
-          const outcome = await this.amountRouter.route({
-            senderId: message.senderId,
-            text: message.text,
-            sourceWebhookMessageId: message.messageId,
-          });
-          // ODD-4D: a valid active receipt pointer with no routing plan is
-          // deterministic — send the active-flow guidance and never call the
-          // LLM. Send failure propagates before remember/markSeen.
-          if (outcome.kind === 'unrecognized') {
-            this.logger.log(
-              `amount router terminal [unrecognized] for ${message.messageId}`,
-            );
-            const { providerMessageId } = await this.whatsappSender.sendText({
-              to: message.senderId,
-              text: ACTIVE_RECEIPT_GUIDANCE,
-            });
-            this.recentOutbound.remember(providerMessageId);
-            try {
-              await this.dedup.markSeen(message.messageId);
-            } catch (error) {
-              this.logger.warn(
-                `markSeen failed for ${message.messageId}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            }
-            continue;
-          }
-          if (outcome.kind !== 'fenced') {
-            this.logger.log(
-              `amount router terminal [${outcome.kind}] for ${message.messageId}`,
-            );
-            try {
-              await this.dedup.markSeen(message.messageId);
-            } catch (error) {
-              this.logger.warn(
-                `markSeen failed for ${message.messageId}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            }
-            continue;
-          }
-          // Fenced → fall through to the ordinary agent path below.
-        }
-
         // ─── WU13-B2: ReceiptIngressService — customer media only ─────────────
         if (message.media != null) {
           // ODD-4A: the normalized optional caption is the only extra field
           // forwarded. filename/sha256 and every other payload field are
-          // dropped, and the raw caption never reaches the amount router, the
-          // LLM, or any durable type.
+          // dropped, and the raw caption never reaches the LLM or any
+          // durable type.
           const decision = await this.ingress.admit({
             webhookMessageId: message.messageId,
             providerMediaId: message.media.providerMediaId,
@@ -330,56 +222,12 @@ export class WebhookDispatcherService {
           continue;
         }
 
-        // ─── (5) Normal agent dispatch ─────────────────────────────────
-        // ─── (5) Normal agent dispatch ─────────────────────────────────
-        // R3b3-c4c1b: a REAL normalized customer inbound carries its
-        // receiving-phone metadata. Forward an inert identity only when it
-        // exists; the runner applies strict validation and drops anything
-        // malformed. Ops synthetic turns never reach this branch, so the ops
-        // identity is never injected.
-        // Experimental default-off read-only SDK route: when it handles the
-        // turn we reply and finish here; otherwise the byte-identical legacy
-        // AgentRunner path below runs unchanged.
-        const minimal = this.minimalCatalogAgent
-          ? await this.minimalCatalogAgent.tryHandle({
-              senderId: message.senderId,
-              text: message.text,
-              // R3b3-c4c1b identity forwarding, same trusted tuple as the
-              // AgentRunner path: EXACT normalized metadata, never config/model.
-              ...(message.receivingPhoneNumberId === undefined
-                ? {}
-                : {
-                    inboundEvent: {
-                      receivingPhoneNumberId: message.receivingPhoneNumberId,
-                      senderId: message.senderId,
-                      messageId: message.messageId,
-                    },
-                  }),
-            })
-          : null;
-        if (minimal?.kind === 'handled') {
-          const { providerMessageId } = await this.whatsappSender.sendText({
-            to: message.senderId,
-            text: minimal.reply,
-          });
-          // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
-          // question, and BEFORE the observational remember/markSeen writes so
-          // an observation failure can never undo the accepted send.
-          minimal.onSent?.();
-          this.recentOutbound.remember(providerMessageId);
-          try {
-            await this.dedup.markSeen(message.messageId);
-          } catch (error) {
-            this.logger.warn(
-              `markSeen failed for ${message.messageId}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-          }
-          continue;
-        }
-
-        const { reply } = await this.agentRunner.handle({
+        // ─── (5) Minimal catalog agent dispatch ────────────────────────
+        // Every customer turn goes to the minimal SDK route. R3b3-c4c1b: a
+        // REAL normalized customer inbound carries its receiving-phone
+        // metadata; forward that inert identity only when it exists. Ops
+        // synthetic turns never reach this branch.
+        const minimal = await this.minimalCatalogAgent.tryHandle({
           senderId: message.senderId,
           text: message.text,
           ...(message.receivingPhoneNumberId === undefined
@@ -392,12 +240,14 @@ export class WebhookDispatcherService {
                 },
               }),
         });
-
         const { providerMessageId } = await this.whatsappSender.sendText({
           to: message.senderId,
-          text: reply,
+          text: minimal.reply,
         });
-
+        // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
+        // question, and BEFORE the observational remember/markSeen writes so
+        // an observation failure can never undo the accepted send.
+        minimal.onSent?.();
         this.recentOutbound.remember(providerMessageId);
 
         // A dedup-write failure must NOT turn a successful send into a
@@ -422,101 +272,6 @@ export class WebhookDispatcherService {
       }
     }
   }
-
-  /**
-   * SCA-3b2: deterministic post-`SHIPPING_APPROVED` price disclosure.
-   *
-   * Reads the current customer state and prepares the server-derived price;
-   * only then does it send the fixed Spanish disclosure to the CUSTOMER and
-   * remember the outbound id. It re-reads fresh state and persists the sent
-   * offer built from the prepared fields plus the real provider message id
-   * (SCA-3b1). A valid active offer on the same approved request/pin/amounts
-   * is treated as a replay: no re-send. Any null/throw fails closed (no
-   * dedup mark), so delivery uncertainty can never enable acceptance.
-   */
-  private async discloseApprovedShippingPrice(
-    customerId: string,
-  ): Promise<void> {
-    const nowMs = Date.now();
-    const state = await this.conversationStore.get(customerId);
-    const prepared = prepareShippingCustomerDisclosure(
-      state?.data ?? null,
-      nowMs,
-    );
-    if (prepared === null) {
-      throw new Error('shipping disclosure unavailable');
-    }
-    const existing = normalizeShippingCustomerOffer(
-      state?.data?.[SHIPPING_CUSTOMER_OFFER_KEY],
-    );
-    if (
-      existing !== null &&
-      isActiveMatchingShippingOffer(existing, prepared.offer, nowMs) &&
-      isAcceptanceAbsentOrCharged(state?.data ?? null, nowMs)
-    ) {
-      this.logger.log(
-        `shipping disclosure replay for ${customerId}: re-send skipped`,
-      );
-      return;
-    }
-    const { providerMessageId } = await this.whatsappSender.sendText({
-      to: customerId,
-      text: prepared.text,
-    });
-    // Remember the confirmed send immediately: even if persistence fails,
-    // the outbound id must be filtered as an echo.
-    this.recentOutbound.remember(providerMessageId);
-    // SCA-3b3: the clock can advance while `sendText` is in flight. Sample it
-    // AFTER the confirmed send and BEFORE persistence so an offer that expires
-    // mid-send fails closed with no marker write and no `markSeen`.
-    const persistNowMs = Date.now();
-    const freshState = await this.conversationStore.get(customerId);
-    const offer = { ...prepared.offer, providerMessageId };
-    const persisted = await persistSentShippingCustomerOffer(
-      this.conversationStore,
-      customerId,
-      freshState,
-      offer,
-      persistNowMs,
-    );
-    if (persisted === null) {
-      throw new Error('shipping disclosure persistence failed');
-    }
-  }
-}
-
-// SCA-3b2: replay predicate — a persisted offer is only trusted when it pins
-// the same approved request, draft and disclosed amounts and is still active.
-function isActiveMatchingShippingOffer(
-  existing: ShippingCustomerOffer,
-  prepared: Omit<ShippingCustomerOffer, 'providerMessageId'>,
-  nowMs: number,
-): boolean {
-  return (
-    existing.requestId === prepared.requestId &&
-    existing.draftCreatedAt === prepared.draftCreatedAt &&
-    existing.expiresAt === prepared.expiresAt &&
-    existing.merchandiseCents === prepared.merchandiseCents &&
-    existing.chargeCents === prepared.chargeCents &&
-    existing.expectedTotalCents === prepared.expectedTotalCents &&
-    Date.parse(existing.offeredAt) <= nowMs &&
-    nowMs < Date.parse(existing.expiresAt)
-  );
-}
-
-// SCA-3b3: an active matching offer is only a replay candidate when no
-// acceptance is stored yet OR the stored acceptance is fully valid for this
-// exact offer at the current clock and cart (the SCA-2 revalidation's
-// `charged` verdict). Malformed, orphan or future acceptances fail closed to
-// re-disclosure, and the persistence then clears the prior acceptance.
-function isAcceptanceAbsentOrCharged(
-  data: ConversationStateData | null,
-  nowMs: number,
-): boolean {
-  if (data === null) return true;
-  const rawAcceptance = data[SHIPPING_CUSTOMER_ACCEPTANCE_KEY];
-  if (rawAcceptance === null || rawAcceptance === undefined) return true;
-  return evaluateShippingSaleRevalidation(data, nowMs).kind === 'charged';
 }
 
 // ── WU13-A2: normalizeInboundMessages media helper ───────────────────────
@@ -642,49 +397,28 @@ function normalizeTimestamp(timestamp: string): string {
 
 // WU13-B2: maps each closed ReceiptIngressDecision kind to customer-facing
 // guidance text. Silent variants return undefined — no reply is sent and
-// media never reaches the amount router or AgentRunner. ODD-4C: a durable
-// sender-active decision carries its exact status, so the guidance reflects
-// whether the open flow still needs the customer's amount/confirmation or is
-// still being processed internally.
+// media never reaches AgentRunner. Customer text always goes to the agent:
+// the receipt amount dialog (CONFIRMAR/CANCELAR) is gone (R6/S9).
 
-/** ODD-4C/4D fixed Spanish guidance for a durable active amount or confirmation
- * flow that still needs a customer decision. Shared by sender-active image
- * guidance and the ODD-4D deterministic active-text fallback; defined locally
- * so the dispatcher never imports notification internals. */
-const ACTIVE_RECEIPT_GUIDANCE =
-  'Tienes un proceso abierto: finalízalo o cancélalo.';
+/** S8: the formats the backend accepts (same text as the outbox template). */
+const UNSUPPORTED_RECEIPT_FORMAT =
+  'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.';
 
 function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
   switch (decision.kind) {
-    case 'disabled':
-      return 'El servicio no está disponible. Intenta más tarde.';
     case 'unsupported-media':
-      return 'Formato no soportado. Envía JPEG o PNG.';
+      return UNSUPPORTED_RECEIPT_FORMAT;
     case 'no-placed-sale':
       return 'Primero registra la venta en el sistema.';
     case 'sender-active':
-      return senderActiveGuidance(decision.status);
+      // R6: no amount dialog any more, so an active receipt is always still
+      // being processed (downloaded, read and uploaded to the backend).
+      return 'Estamos procesando su comprobante.';
     case 'reserved':
     case 'webhook-replayed':
     case 'provider-media-reused':
     case 'webhook-media-conflict':
       return undefined;
-  }
-}
-
-/** ODD-4C fixed Spanish guidance for a durable active receipt. An amount or
- * confirmation flow needs a customer decision; every other active status is
- * still processing internally. */
-function senderActiveGuidance(status: ActiveReceiptStatus): string {
-  switch (status) {
-    case 'AWAITING_AMOUNT':
-    case 'AWAITING_CONFIRMATION':
-      return ACTIVE_RECEIPT_GUIDANCE;
-    case 'RESERVED':
-    case 'DOWNLOADED':
-    case 'STORED':
-    case 'ATTACHING':
-      return 'Estamos procesando tu comprobante.';
   }
 }
 

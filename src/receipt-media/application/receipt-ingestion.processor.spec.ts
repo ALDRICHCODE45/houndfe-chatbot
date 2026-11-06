@@ -1,983 +1,435 @@
+import type { ConversationState } from '../../conversation/domain/conversation-store';
 import {
   MetaMediaError,
-  type MetaMediaRequest,
+  type MetaMediaPort,
   type ValidatedMediaFile,
 } from '../domain/meta-media.port';
-import {
-  ObjectStorageError,
-  type ObjectStorageErrorCode,
-  type PutObjectInput,
-} from '../domain/object-storage.port';
 import type {
-  AmountBootstrapInput,
-  AmountBootstrapOutcome,
-  AttemptStartResult,
-  DownloadCommitInput,
-  DownloadCommitOutcome,
-  LeaseFenceInput,
+  ReceiptExtraction,
+  ReceiptExtractionPort,
+} from '../domain/receipt-extraction.port';
+import {
+  MAX_UPLOAD_ATTEMPTS,
+  type ReceiptMediaStorePort,
+  type UploadCommitOutcome,
 } from '../domain/receipt-media-store.port';
 import type {
-  ReceiptMediaOutboxRow,
   ReceiptMediaRow,
+  ReceiptMimeType,
 } from '../domain/receipt-media.types';
-import {
-  CapabilityService,
-  type CapabilityTokenResult,
-} from './capability.service';
+import type {
+  ReceiptAttachmentService,
+  UploadInvocation,
+} from './receipt-attachment.service';
 import { ReceiptIngestionProcessor } from './receipt-ingestion.processor';
 
-const flush = () => new Promise<void>((r) => setImmediate(r));
+const RECEIPT_ID = '11111111-1111-4111-8111-111111111111';
+const SALE_ID = '22222222-2222-4222-8222-222222222222';
+const OWNER = 'owner-1';
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+const PDF = Buffer.from('%PDF-1.7\ntrailer << /Root 1 0 R >>\n%%EOF\n');
+const ENCRYPTED_PDF = Buffer.from(
+  '%PDF-1.7\ntrailer << /Root 1 0 R /Encrypt 4 0 R >>\n%%EOF\n',
+);
+const committed = { kind: 'committed' } as unknown as UploadCommitOutcome;
 
-const row = (over: Partial<ReceiptMediaRow> = {}): ReceiptMediaRow =>
+const row = (overrides: Partial<ReceiptMediaRow> = {}): ReceiptMediaRow =>
   ({
-    id: 'r1',
-    webhookMessageId: 'wamid',
-    providerMediaId: 'm1',
-    senderId: 's1',
-    objectKey: 'receipts/1c0fac1e-5f0e-4a1e-9c1d-2b3c4d5e6f70',
+    id: RECEIPT_ID,
     status: 'RESERVED',
-    version: '1',
+    version: '3',
+    senderId: '5215550000000',
+    capturedSaleId: SALE_ID,
+    providerMediaId: 'wa-media-1',
     declaredMimeType: 'image/jpeg',
-    ...over,
+    declaredAmountCents: null,
+    metaAttempts: 0,
+    storageAttempts: 0,
+    ...overrides,
   }) as ReceiptMediaRow;
 
-const fixture = (
-  over: Partial<ReceiptMediaRow> = {},
-  capability: Pick<CapabilityService, 'issue'> = {
-    issue: jest.fn<CapabilityTokenResult, [string]>(() => ({
-      token: 'raw-capability-token',
-      tokenHash: Buffer.alloc(32, 8),
-      keyVersion: '2',
-    })),
-  },
-) => {
-  const receipt = row(over);
-  const cleanup = jest.fn(() => Promise.resolve());
-  const file = {
-    filePath: 'package.json',
-    mimeType: 'image/jpeg',
-    byteCount: 5,
-    providerDeclaredBytes: 5,
-    sha256: Buffer.alloc(32, 7),
-    cleanup,
-  } as ValidatedMediaFile;
-  const meta = {
-    resolveAndDownload: jest.fn<
-      Promise<ValidatedMediaFile>,
-      [MetaMediaRequest]
-    >(() => Promise.resolve(file)),
-  };
-  const storage = {
-    put: jest.fn<
-      Promise<{ etag: string; versionId: string | null }>,
-      [PutObjectInput]
-    >((input) => {
-      input.content.destroy();
-      return Promise.resolve({ etag: 'e', versionId: null });
-    }),
-  };
-  const store = {
-    startMetaAttempt: jest.fn<
-      Promise<AttemptStartResult | null>,
-      [LeaseFenceInput]
-    >(() => Promise.resolve({ attempt: 1, version: '2' })),
-    startStorageAttempt: jest.fn<
-      Promise<AttemptStartResult | null>,
-      [LeaseFenceInput]
-    >(() => Promise.resolve({ attempt: 1, version: '3' })),
-    commitDownload: jest.fn<
-      Promise<DownloadCommitOutcome>,
-      [DownloadCommitInput]
-    >(() => Promise.resolve({ kind: 'committed' })),
-    bootstrapAmount: jest.fn<
-      Promise<AmountBootstrapOutcome>,
-      [AmountBootstrapInput]
-    >(() =>
-      Promise.resolve({
-        kind: 'bootstrapped',
-        receipt,
-        intent: {} as ReceiptMediaOutboxRow,
-      }),
-    ),
-    // ODD-2C: durable Meta failure disposition. Tests that read the outcome
-    // install an explicit resolution; the ABORTED path never reads it.
-    commitMetaFailureDisposition: jest.fn(),
-    // ODD-2D1: durable storage failure disposition. Tests that read the
-    // outcome install an explicit resolution.
-    commitStorageFailureDisposition: jest.fn(),
-  };
+const state = (placedSale: unknown): ConversationState =>
+  ({
+    data: { minimalCart: { items: [], placedSale } },
+  }) as unknown as ConversationState;
 
-  const processor = new ReceiptIngestionProcessor(
-    meta,
-    storage,
-    store,
-    capability,
-  );
-  return {
-    receipt,
-    cleanup,
-    file,
-    processor,
-    meta,
-    storage,
-    store,
-    capability,
-  };
+const receiptExtraction: ReceiptExtraction = {
+  kind: 'receipt',
+  amountCents: 150000,
+  date: null,
+  reference: null,
+  bank: null,
+  confidence: 'high',
+  amountMismatch: false,
 };
 
-describe('ReceiptIngestionProcessor RESERVED pass (WU8A1)', () => {
-  it('processes only a claimed RESERVED row', async () => {
-    const f = fixture({ status: 'STORED' });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'unsupported-claimed-status',
-      status: 'STORED',
-    });
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.cleanup).not.toHaveBeenCalled();
-  });
+type Store = Pick<
+  ReceiptMediaStorePort,
+  | 'startMetaAttempt'
+  | 'startStorageAttempt'
+  | 'commitDownload'
+  | 'commitMetaFailureDisposition'
+  | 'commitUploadUnknown'
+  | 'commitRejectedMedia'
+  | 'renewLease'
+>;
 
-  // Seam proof: Meta and cleanup run between store transactions; cleanup precedes the fence.
-  it('calls no Meta while the CAS seam is pending and awaits temp cleanup', async () => {
+const fixture = (
+  options: {
+    bytes?: Buffer;
+    mime?: ReceiptMimeType;
+    extraction?: ReceiptExtraction;
+    download?: () => Promise<ValidatedMediaFile>;
+    placedSale?: unknown;
+  } = {},
+) => {
+  const bytes = options.bytes ?? JPEG;
+  const cleanup = jest.fn().mockResolvedValue(undefined);
+  const file: ValidatedMediaFile = {
+    filePath: '/tmp/receipt',
+    mimeType: options.mime ?? 'image/jpeg',
+    byteCount: bytes.length,
+    providerDeclaredBytes: bytes.length,
+    sha256: Buffer.alloc(32, 1),
+    cleanup,
+  };
+  const resolveAndDownload = jest.fn<
+    ReturnType<MetaMediaPort['resolveAndDownload']>,
+    Parameters<MetaMediaPort['resolveAndDownload']>
+  >(options.download ?? (() => Promise.resolve(file)));
+  const store = {
+    startMetaAttempt: jest.fn<
+      ReturnType<Store['startMetaAttempt']>,
+      Parameters<Store['startMetaAttempt']>
+    >(() => Promise.resolve({ attempt: 1, version: '4' })),
+    commitDownload: jest.fn<
+      ReturnType<Store['commitDownload']>,
+      Parameters<Store['commitDownload']>
+    >(() => Promise.resolve({ kind: 'committed' })),
+    startStorageAttempt: jest.fn<
+      ReturnType<Store['startStorageAttempt']>,
+      Parameters<Store['startStorageAttempt']>
+    >((fence) =>
+      Promise.resolve({
+        attempt: 1,
+        version: String(Number(fence.expectedVersion) + 1),
+      }),
+    ),
+    commitMetaFailureDisposition: jest.fn<
+      ReturnType<Store['commitMetaFailureDisposition']>,
+      Parameters<Store['commitMetaFailureDisposition']>
+    >(() => Promise.resolve({ kind: 'fenced' })),
+    commitUploadUnknown: jest.fn<
+      ReturnType<Store['commitUploadUnknown']>,
+      Parameters<Store['commitUploadUnknown']>
+    >(() => Promise.resolve(committed)),
+    commitRejectedMedia: jest.fn<
+      ReturnType<Store['commitRejectedMedia']>,
+      Parameters<Store['commitRejectedMedia']>
+    >(() => Promise.resolve(committed)),
+    renewLease: jest.fn<
+      ReturnType<Store['renewLease']>,
+      Parameters<Store['renewLease']>
+    >(() => Promise.resolve(true)),
+  };
+  const extract = jest.fn<
+    ReturnType<ReceiptExtractionPort['extract']>,
+    Parameters<ReceiptExtractionPort['extract']>
+  >(() => Promise.resolve(options.extraction ?? receiptExtraction));
+  const upload = jest.fn<
+    ReturnType<ReceiptAttachmentService['upload']>,
+    [UploadInvocation]
+  >(() =>
+    Promise.resolve({
+      kind: 'uploaded',
+      backendReceiptId: 'b',
+      outcome: committed,
+    }),
+  );
+  const conversations = {
+    get: jest.fn(() =>
+      Promise.resolve(
+        state(
+          'placedSale' in options
+            ? options.placedSale
+            : { saleId: SALE_ID, folio: 'F-7', totalCents: 150000 },
+        ),
+      ),
+    ),
+  };
+  const processor = new ReceiptIngestionProcessor(
+    { resolveAndDownload },
+    store,
+    { extract },
+    { upload },
+    conversations,
+    { readFile: () => Promise.resolve(bytes) },
+  );
+  return { processor, store, extract, upload, resolveAndDownload, cleanup };
+};
+
+describe('ReceiptIngestionProcessor (R2: download → extract → backend upload)', () => {
+  it('downloads, extracts against the order total and uploads in one pass', async () => {
     const f = fixture();
-    let release!: (value: AttemptStartResult | null) => void;
-    const gate = new Promise<AttemptStartResult | null>((r) => (release = r));
-    f.store.startMetaAttempt.mockImplementationOnce(() => gate);
-    let releaseCleanup!: () => void;
-    const cleanupGate = new Promise<void>((r) => (releaseCleanup = r));
-    f.cleanup.mockImplementation(() => cleanupGate);
-    let settled = false;
-    const run = f.processor.process(f.receipt, 'w1');
-    void run.then(() => (settled = true));
-    await flush();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(settled).toBe(false);
-    release({ attempt: 1, version: '2' });
-    await flush();
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(f.store.commitDownload).not.toHaveBeenCalled();
-    expect(settled).toBe(false);
-    releaseCleanup();
-    const seq = [
-      f.store.startMetaAttempt.mock.invocationCallOrder[0],
-      f.meta.resolveAndDownload.mock.invocationCallOrder[0],
-    ];
-    seq.push(
-      f.cleanup.mock.invocationCallOrder[0],
-      f.store.commitDownload.mock.invocationCallOrder[0],
+    await expect(f.processor.process(row(), OWNER)).resolves.toMatchObject({
+      kind: 'upload',
+      report: { kind: 'uploaded' },
+    });
+    expect(f.resolveAndDownload).toHaveBeenCalledTimes(1);
+    expect(f.store.commitDownload).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedVersion: '4' }),
     );
-    expect([...seq].sort((a, b) => a - b)).toEqual(seq);
-    await expect(run).resolves.toEqual({ kind: 'downloaded' });
-  });
-
-  it('commits only validated download evidence after cleanup with no R2 behavior', async () => {
-    const f = fixture();
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'downloaded',
+    expect(f.extract).toHaveBeenCalledWith({
+      bytes: JPEG,
+      mimeType: 'image/jpeg',
+      expectedAmountCents: 150000,
     });
-    expect(f.store.commitDownload).toHaveBeenCalledWith({
-      id: 'r1',
-      owner: 'w1',
-      expectedVersion: '2',
-      responseMimeType: 'image/jpeg',
-      detectedMimeType: 'image/jpeg',
-      byteCount: 5,
-      contentSha256: Buffer.alloc(32, 7),
+    // Upload attempt fenced on the post-download version (4 → 5 → 6).
+    expect(f.store.startStorageAttempt).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '5',
+      uploadFields: { extracted: { amountCents: 150000, confidence: 0.9 } },
     });
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('propagates a store error only after required cleanup', async () => {
-    const f = fixture();
-    f.store.commitDownload.mockRejectedValue(new Error('db-down'));
-    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
-      'db-down',
+    expect(f.upload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fence: { id: RECEIPT_ID, owner: OWNER, expectedVersion: '6' },
+        file: { bytes: JPEG, mimeType: 'image/jpeg' },
+        fields: { extracted: { amountCents: 150000, confidence: 0.9 } },
+        order: { saleId: SALE_ID, folio: 'F-7', totalCents: 150000 },
+      }),
     );
     expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(f.storage.put).not.toHaveBeenCalled();
   });
 
-  it('treats a proven store replay as a closed download success', async () => {
-    const f = fixture();
-    f.store.commitDownload.mockResolvedValue({ kind: 'replayed' });
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'downloaded',
-    });
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('runs Meta on attempts 1/2/3 and a null CAS blocks the fourth', async () => {
-    const f = fixture();
-    f.store.startMetaAttempt
-      .mockResolvedValueOnce({ attempt: 1, version: '2' })
-      .mockResolvedValueOnce({ attempt: 2, version: '3' })
-      .mockResolvedValueOnce({ attempt: 3, version: '4' })
-      .mockResolvedValue(null);
-    for (let i = 0; i < 3; i += 1) await f.processor.process(f.receipt, 'w1');
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'blocked',
-      stage: 'meta',
-    });
-    expect(f.store.startMetaAttempt).toHaveBeenCalledTimes(4);
-    expect(f.meta.resolveAndDownload).toHaveBeenCalledTimes(3);
-    expect(f.store.commitDownload).toHaveBeenCalledTimes(3);
-  });
-
-  it('fails safe with no transition when temp cleanup rejects', async () => {
-    const f = fixture();
-    f.cleanup.mockRejectedValue(new Error('raw-unlink-diagnostics'));
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'cleanup-failed',
-    });
-    expect(f.store.commitDownload).not.toHaveBeenCalled();
-  });
-
-  it('cleans up and stops without stale mutation when the fence is lost', async () => {
-    const f = fixture();
-    f.store.commitDownload.mockResolvedValue({ kind: 'fenced' });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'fence-lost',
-      stage: 'download',
-    });
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(f.store.startMetaAttempt).toHaveBeenCalledTimes(1);
-    expect(f.store.commitDownload).toHaveBeenCalledTimes(1);
-  });
-
-  it('durably commits a permanent Meta validation failure and reports its terminal stage', async () => {
-    const f = fixture();
-    f.meta.resolveAndDownload.mockRejectedValue(
-      new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH'),
+  it('admits a PDF and uploads it', async () => {
+    const f = fixture({ bytes: PDF, mime: 'application/pdf' });
+    await f.processor.process(
+      row({ declaredMimeType: 'application/pdf' }),
+      OWNER,
     );
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'MEDIA_VALIDATION_PRE_STORAGE',
-      version: '3',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
+    expect(f.upload.mock.calls[0][0].file).toEqual({
+      bytes: PDF,
+      mimeType: 'application/pdf',
     });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-terminal',
-      failureStage: 'MEDIA_VALIDATION_PRE_STORAGE',
-      code: 'MIME_MISMATCH',
+  });
+
+  it('refuses an encrypted PDF without extraction or upload', async () => {
+    const f = fixture({ bytes: ENCRYPTED_PDF, mime: 'application/pdf' });
+    await expect(
+      f.processor.process(row({ declaredMimeType: 'application/pdf' }), OWNER),
+    ).resolves.toMatchObject({ kind: 'rejected', reason: 'PDF_ENCRYPTED' });
+    expect(f.store.commitRejectedMedia).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '5',
+      reason: 'PDF_ENCRYPTED',
     });
+    expect(f.extract).not.toHaveBeenCalled();
+    expect(f.upload).not.toHaveBeenCalled();
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it('never uploads an image that is not a receipt', async () => {
+    const f = fixture({ extraction: { kind: 'not_receipt' } });
+    await expect(f.processor.process(row(), OWNER)).resolves.toMatchObject({
+      kind: 'rejected',
+      reason: 'NOT_A_RECEIPT',
+    });
+    expect(f.store.startStorageAttempt).not.toHaveBeenCalled();
+    expect(f.upload).not.toHaveBeenCalled();
+  });
+
+  it('uploads when the extraction is unavailable', async () => {
+    const unavailable: ReceiptExtraction = {
+      kind: 'unavailable',
+      reason: 'timeout',
+    };
+    const f = fixture({ extraction: unavailable });
+    await f.processor.process(row(), OWNER);
+    expect(f.upload.mock.calls[0][0].fields).toEqual({});
+  });
+
+  it('extracts without an expected amount when the placed order is another sale', async () => {
+    const f = fixture({
+      placedSale: {
+        saleId: '44444444-4444-4444-8444-444444444444',
+        folio: 'F-9',
+        totalCents: 1,
+      },
+    });
+    await f.processor.process(row(), OWNER);
+    expect(f.extract.mock.calls[0][0].expectedAmountCents).toBeNull();
+    expect(f.upload.mock.calls[0][0].order).toBeNull();
+  });
+
+  it('keeps the Meta failure disposition for the first download', async () => {
+    const f = fixture({
+      download: () =>
+        Promise.reject(new MetaMediaError('META_TRANSPORT', 'TIMEOUT')),
+    });
+    await f.processor.process(row(), OWNER);
     expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith({
-      id: 'r1',
-      owner: 'w1',
-      expectedVersion: '2',
-      category: 'MEDIA_VALIDATION',
-      code: 'MIME_MISMATCH',
-    });
-    expect(f.cleanup).not.toHaveBeenCalled();
-    expect(f.store.commitDownload).not.toHaveBeenCalled();
-  });
-});
-
-describe('ReceiptIngestionProcessor DOWNLOADED pass (WU8A2a)', () => {
-  it('bootstraps hash-only capability evidence after cleanup', async () => {
-    const id = '1c0fac1e-5f0e-4a1e-9c1d-2b3c4d5e6f70';
-    const capability = new CapabilityService(
-      new Map([['1', Buffer.alloc(32, 1)]]),
-      '1',
-    );
-    const issue = jest.spyOn(capability, 'issue');
-    const f = fixture({ id, status: 'DOWNLOADED' }, capability);
-    f.storage.put.mockResolvedValue({ etag: 'first-etag', versionId: 'v1' });
-
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'stored',
-    });
-
-    const issued = issue.mock.results[0]?.value as CapabilityTokenResult;
-    const input = f.store.bootstrapAmount.mock.calls[0][0];
-    expect(input).toEqual({
-      id,
-      owner: 'w1',
-      expectedVersion: '3',
-      objectEtag: 'first-etag',
-      objectVersionId: 'v1',
-      capabilityTokenHash: issued.tokenHash,
-      capabilityKeyVersion: '1',
-    });
-    expect(input).not.toHaveProperty('token');
-    const reconstructed = capability.reconstruct(
-      id,
-      input.capabilityKeyVersion,
-      input.capabilityTokenHash,
-    );
-    expect(reconstructed?.token).toBe(issued.token);
-    expect(f.cleanup.mock.invocationCallOrder[0]).toBeLessThan(
-      issue.mock.invocationCallOrder[0],
-    );
-    expect(issue.mock.invocationCallOrder[0]).toBeLessThan(
-      f.store.bootstrapAmount.mock.invocationCallOrder[0],
-    );
-  });
-
-  it('performs exactly one PutObject attempt per claim, durably schedules a retry, and destroys the failed stream', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    const issue = jest.spyOn(f.capability, 'issue');
-    let stream!: PutObjectInput['content'];
-    f.storage.put.mockImplementationOnce((input) => {
-      stream = input.content;
-      return Promise.reject(
-        new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
-      );
-    });
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 1,
-      version: '3',
-    });
-    f.store.startStorageAttempt.mockResolvedValue(null);
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'retry-scheduled',
-      attempt: 1,
-      version: '4',
-      receipt: f.receipt,
-    });
-
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'storage-retry-scheduled',
-      attempt: 1,
-      code: 'HTTP_RETRYABLE',
-    });
-    expect(f.storage.put).toHaveBeenCalledTimes(1);
-    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
-    expect(stream.destroyed).toBe(true);
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(issue).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('uploads once on a later claim with a fresh stream and bootstraps', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    const issue = jest.spyOn(f.capability, 'issue');
-    f.storage.put.mockImplementation((input) => {
-      input.content.destroy();
-      return Promise.resolve({ etag: 'retry-etag', versionId: null });
-    });
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 2,
-      version: '4',
-    });
-
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'stored',
-    });
-
-    const streams = f.storage.put.mock.calls.map(([input]) => input.content);
-    expect(streams).toHaveLength(1);
-    expect(f.store.bootstrapAmount).toHaveBeenCalledWith({
-      id: 'r1',
-      owner: 'w1',
+      id: RECEIPT_ID,
+      owner: OWNER,
       expectedVersion: '4',
-      objectEtag: 'retry-etag',
-      objectVersionId: null,
-      capabilityTokenHash: Buffer.alloc(32, 8),
-      capabilityKeyVersion: '2',
-    });
-    expect(f.cleanup.mock.invocationCallOrder[0]).toBeLessThan(
-      issue.mock.invocationCallOrder[0],
-    );
-  });
-
-  it('maps bootstrap replay to stored and a fenced bootstrap to fence-lost/tx2', async () => {
-    const replayed = fixture({ status: 'DOWNLOADED' });
-    replayed.store.bootstrapAmount.mockResolvedValue({
-      kind: 'replayed',
-      receipt: replayed.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    await expect(
-      replayed.processor.process(replayed.receipt, 'w1'),
-    ).resolves.toEqual({ kind: 'stored' });
-
-    const fenced = fixture({ status: 'DOWNLOADED' });
-    fenced.store.bootstrapAmount.mockResolvedValue({ kind: 'fenced' });
-    await expect(
-      fenced.processor.process(fenced.receipt, 'w1'),
-    ).resolves.toEqual({
-      kind: 'fence-lost',
-      stage: 'tx2',
-    });
-  });
-
-  it('stops after cleanup failure without issuing or bootstrapping', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    const issue = jest.spyOn(f.capability, 'issue');
-    f.cleanup.mockRejectedValue(new Error('raw-unlink-diagnostics'));
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'cleanup-failed',
-    });
-    expect(issue).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('propagates capability and bootstrap failures only after cleanup', async () => {
-    const capabilityFailure = fixture({ status: 'DOWNLOADED' });
-    const issue = jest
-      .spyOn(capabilityFailure.capability, 'issue')
-      .mockImplementation(() => {
-        throw new Error('capability-down');
-      });
-    await expect(
-      capabilityFailure.processor.process(capabilityFailure.receipt, 'w1'),
-    ).rejects.toThrow('capability-down');
-    expect(capabilityFailure.cleanup).toHaveBeenCalledTimes(1);
-    expect(capabilityFailure.store.bootstrapAmount).not.toHaveBeenCalled();
-    expect(issue.mock.invocationCallOrder[0]).toBeGreaterThan(
-      capabilityFailure.cleanup.mock.invocationCallOrder[0],
-    );
-
-    const bootstrapFailure = fixture({ status: 'DOWNLOADED' });
-    bootstrapFailure.store.bootstrapAmount.mockRejectedValue(
-      new Error('bootstrap-down'),
-    );
-    await expect(
-      bootstrapFailure.processor.process(bootstrapFailure.receipt, 'w1'),
-    ).rejects.toThrow('bootstrap-down');
-    expect(bootstrapFailure.cleanup).toHaveBeenCalledTimes(1);
-  });
-
-  it('preserves null-meta and storage fence gates before bootstrap', async () => {
-    const meta = fixture({ status: 'DOWNLOADED' });
-    meta.store.startMetaAttempt.mockResolvedValue(null);
-    await expect(meta.processor.process(meta.receipt, 'w1')).resolves.toEqual({
-      kind: 'blocked',
-      stage: 'meta',
-    });
-    expect(meta.cleanup).not.toHaveBeenCalled();
-
-    const storage = fixture({ status: 'DOWNLOADED' });
-    storage.store.startStorageAttempt.mockResolvedValueOnce(null);
-    await expect(
-      storage.processor.process(storage.receipt, 'w1'),
-    ).resolves.toEqual({ kind: 'blocked', stage: 'storage' });
-    expect(storage.storage.put).not.toHaveBeenCalled();
-    expect(
-      storage.store.commitStorageFailureDisposition,
-    ).not.toHaveBeenCalled();
-    expect(storage.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-});
-
-// WU8B1: narrow signal-aware seam so a lifecycle worker can stop this
-// processor safely; the default signal keeps existing callers unchanged.
-describe('ReceiptIngestionProcessor cancellation seam (WU8B1)', () => {
-  it('returns aborted/meta with no CAS attempt on a pre-aborted signal', async () => {
-    const f = fixture();
-    const controller = new AbortController();
-    controller.abort();
-    expect(
-      await f.processor.process(f.receipt, 'w1', controller.signal),
-    ).toEqual({ kind: 'aborted', stage: 'meta' });
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.cleanup).not.toHaveBeenCalled();
-  });
-
-  it('passes the parent signal to Meta, commits the disposition, and maps ABORTED to aborted/meta', async () => {
-    const f = fixture();
-    const controller = new AbortController();
-    let seen!: AbortSignal;
-    f.meta.resolveAndDownload.mockImplementationOnce((input) => {
-      seen = input.signal;
-      return Promise.reject(new MetaMediaError('META_TRANSPORT', 'ABORTED'));
-    });
-    expect(
-      await f.processor.process(f.receipt, 'w1', controller.signal),
-    ).toEqual({ kind: 'aborted', stage: 'meta' });
-    expect(seen).toBe(controller.signal);
-    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith({
-      id: 'r1',
-      owner: 'w1',
-      expectedVersion: '2',
       category: 'META_TRANSPORT',
-      code: 'ABORTED',
-    });
-    expect(f.store.commitDownload).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-  });
-
-  it('aborts a caller-cancelled upload after one attempt without consuming further attempts', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    const controller = new AbortController();
-    let put!: PutObjectInput;
-    f.storage.put.mockImplementation((input: PutObjectInput) => {
-      put = input;
-      input.content.destroy();
-      controller.abort();
-      return Promise.reject(
-        new ObjectStorageError('OBJECT_STORAGE', 'ABORTED'),
-      );
-    });
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'retry-scheduled',
-      attempt: 1,
-      version: '4',
-      receipt: f.receipt,
-    });
-    expect(
-      await f.processor.process(f.receipt, 'w1', controller.signal),
-    ).toEqual({ kind: 'aborted', stage: 'storage' });
-    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
-    expect(f.storage.put).toHaveBeenCalledTimes(1);
-    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith({
-      id: 'r1',
-      owner: 'w1',
-      expectedVersion: '3',
-      category: 'OBJECT_STORAGE',
-      code: 'ABORTED',
-    });
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(put.abortSignal).toBe(controller.signal);
-    expect(put.cleanupSignal).not.toBe(controller.signal);
-    expect(put.cleanupSignal.aborted).toBe(false);
-  });
-});
-
-// ODD-2C: every caught Meta failure is durably committed through the narrow
-// disposition seam; the processor never performs a storage or capability
-// action on a Meta failure, and a claimed meta_attempts=3 row is
-// terminalized before any fourth Meta call.
-describe('ReceiptIngestionProcessor durable Meta failure disposition (ODD-2C)', () => {
-  const disposition = (over: Record<string, unknown> = {}) => ({
-    id: 'r1',
-    owner: 'w1',
-    expectedVersion: '2',
-    category: 'META_TRANSPORT',
-    code: 'NETWORK_FAILURE',
-    ...over,
-  });
-
-  it('schedules a durable retry without downstream action for a transient attempt 1/2 failure', async () => {
-    const f = fixture();
-    f.store.startMetaAttempt.mockResolvedValue({ attempt: 2, version: '3' });
-    f.meta.resolveAndDownload.mockRejectedValue(
-      new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE'),
-    );
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'retry-scheduled',
-      attempt: 2,
-      version: '4',
-      receipt: f.receipt,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-retry-scheduled',
-      attempt: 2,
-      code: 'NETWORK_FAILURE',
-    });
-    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith(
-      disposition({ expectedVersion: '3' }),
-    );
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.capability.issue).not.toHaveBeenCalled();
-    expect(f.store.commitDownload).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-    expect(f.cleanup).not.toHaveBeenCalled();
-  });
-
-  it('terminalizes attempt 3 as META_EXHAUSTED_PRE_STORAGE with the fixed identity', async () => {
-    const f = fixture();
-    f.store.startMetaAttempt.mockResolvedValue({ attempt: 3, version: '4' });
-    f.meta.resolveAndDownload.mockRejectedValue(
-      new MetaMediaError('META_TRANSPORT', 'TIMEOUT'),
-    );
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
-      version: '5',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-terminal',
-      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
       code: 'TIMEOUT',
     });
-    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith(
-      disposition({ expectedVersion: '4', code: 'TIMEOUT' }),
-    );
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.capability.issue).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+    expect(f.upload).not.toHaveBeenCalled();
   });
 
-  it('reports a stable fence outcome with no downstream action when the disposition fences', async () => {
+  it('retries a DOWNLOADED row: fenced upload attempt, fresh download, same media', async () => {
     const f = fixture();
-    f.meta.resolveAndDownload.mockRejectedValue(
-      new MetaMediaError('META_TRANSPORT', 'HTTP_RETRYABLE'),
+    await f.processor.process(
+      row({ status: 'DOWNLOADED', version: '9', storageAttempts: 2 }),
+      OWNER,
     );
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'fenced',
+    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
+    expect(f.store.startStorageAttempt).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '9',
     });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-fenced',
-      code: 'HTTP_RETRYABLE',
-    });
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.store.commitDownload).not.toHaveBeenCalled();
+    expect(f.resolveAndDownload).toHaveBeenCalledTimes(1);
+    expect(f.upload.mock.calls[0][0].fence.expectedVersion).toBe('10');
   });
 
-  it('terminalizes a reclaimed meta_attempts=3 row before any Meta call', async () => {
-    const f = fixture({ status: 'RESERVED', metaAttempts: 3 });
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
-      version: '2',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
+  it('persists the first-attempt upload fields with the attempt start', async () => {
+    const f = fixture();
+    await f.processor.process(row({ declaredAmountCents: 99900 }), OWNER);
+    const fields = {
+      declared: { amountCents: 99900 },
+      extracted: { amountCents: 150000, confidence: 0.9 },
+    };
+    expect(f.store.startStorageAttempt).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '5',
+      uploadFields: fields,
     });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-terminal',
-      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
-      code: 'META_EXHAUSTED',
-    });
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.store.commitMetaFailureDisposition).toHaveBeenCalledWith(
-      disposition({ expectedVersion: '1', code: 'META_EXHAUSTED' }),
+    expect(f.upload.mock.calls[0][0].fields).toEqual(fields);
+  });
+
+  it('reuses the persisted upload fields on a retry without extracting again', async () => {
+    const persisted = {
+      declared: { amountCents: 99900 },
+      extracted: { amountCents: 140000, bank: 'BBVA', confidence: 0.6 },
+    };
+    const f = fixture({ extraction: { kind: 'not_receipt' } });
+    await f.processor.process(
+      row({
+        status: 'DOWNLOADED',
+        version: '9',
+        storageAttempts: 1,
+        declaredAmountCents: 99900,
+        uploadFields: persisted,
+      }),
+      OWNER,
     );
+    expect(f.extract).not.toHaveBeenCalled();
+    expect(f.store.startStorageAttempt).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '9',
+    });
+    expect(f.upload.mock.calls[0][0].fields).toBe(persisted);
   });
 
-  it('fences a reclaimed count-3 recovery without a fourth Meta call', async () => {
-    const f = fixture({ status: 'RESERVED', metaAttempts: 3 });
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'fenced',
+  it('retries a row without persisted fields with the declared data only', async () => {
+    const f = fixture();
+    await f.processor.process(
+      row({
+        status: 'DOWNLOADED',
+        version: '9',
+        storageAttempts: 1,
+        declaredAmountCents: 99900,
+        uploadFields: null,
+      }),
+      OWNER,
+    );
+    expect(f.extract).not.toHaveBeenCalled();
+    expect(f.upload.mock.calls[0][0].fields).toEqual({
+      declared: { amountCents: 99900 },
     });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-fenced',
-      code: 'META_EXHAUSTED',
-    });
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
   });
 
-  it('processes a claimed DOWNLOADED row with metaAttempts=3 and storageAttempts<3 through the Meta exhaustion disposition', async () => {
+  it('treats a failed re-download as one more unknown upload attempt', async () => {
     const f = fixture({
-      status: 'DOWNLOADED',
-      metaAttempts: 3,
-      storageAttempts: 2,
+      download: () =>
+        Promise.reject(new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE')),
     });
-    f.store.commitMetaFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
-      version: '2',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'meta-terminal',
-      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
-      code: 'META_EXHAUSTED',
-    });
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.store.startStorageAttempt).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.store.commitStorageFailureDisposition).not.toHaveBeenCalled();
-  });
-
-  it('still rethrows a non-Meta error without any disposition', async () => {
-    const f = fixture();
-    f.meta.resolveAndDownload.mockRejectedValue(new Error('raw-transport'));
-    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
-      'raw-transport',
+    await f.processor.process(
+      row({ status: 'DOWNLOADED', version: '9', storageAttempts: 1 }),
+      OWNER,
     );
+    expect(f.store.commitUploadUnknown).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '10',
+      httpStatus: null,
+      transportCode: 'META_NETWORK_FAILURE',
+    });
     expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-  });
-});
-
-// ODD-2D1: the storage retry loop is replaced by exactly one PutObject
-// attempt per claim; every caught ObjectStorageError is durably committed
-// through the narrow storage disposition seam, and a claimed
-// storage_attempts>=3 DOWNLOADED row is terminalized before any Meta or
-// storage call.
-describe('ReceiptIngestionProcessor durable storage failure disposition (ODD-2D1)', () => {
-  const command = (over: Record<string, unknown> = {}) => ({
-    id: 'r1',
-    owner: 'w1',
-    expectedVersion: '3',
-    category: 'OBJECT_STORAGE',
-    code: 'HTTP_RETRYABLE',
-    ...over,
   });
 
-  it('durably schedules a retry after exactly one PutObject for a transient attempt 1/2 failure', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'HTTP_RETRYABLE'),
+  it('terminalizes a reclaimed last attempt as unknown without another upload', async () => {
+    const f = fixture();
+    await f.processor.process(
+      row({
+        status: 'DOWNLOADED',
+        version: '9',
+        storageAttempts: MAX_UPLOAD_ATTEMPTS,
+      }),
+      OWNER,
     );
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 2,
-      version: '4',
+    expect(f.store.commitUploadUnknown).toHaveBeenCalledWith({
+      id: RECEIPT_ID,
+      owner: OWNER,
+      expectedVersion: '9',
+      httpStatus: null,
+      transportCode: 'TRANSPORT_FAILURE',
     });
-    f.store.startStorageAttempt.mockResolvedValue(null);
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'retry-scheduled',
-      attempt: 2,
-      version: '5',
-      receipt: f.receipt,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-retry-scheduled',
-      attempt: 2,
-      code: 'HTTP_RETRYABLE',
-    });
-    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
-      command({ expectedVersion: '4' }),
-    );
-    expect(f.storage.put).toHaveBeenCalledTimes(1);
-    expect(f.store.startStorageAttempt).toHaveBeenCalledTimes(1);
-    expect(f.capability.issue).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+    expect(f.resolveAndDownload).not.toHaveBeenCalled();
+    expect(f.upload).not.toHaveBeenCalled();
   });
 
-  it('terminalizes permanent and retryable attempt-3 storage failures with the fixed identity', async () => {
-    const cases: Array<[number, ObjectStorageErrorCode]> = [
-      [1, 'HTTP_PERMANENT'],
-      [1, 'PERMANENT_FAILURE'],
-      [2, 'OBJECT_NOT_FOUND'],
-      [3, 'HTTP_RETRYABLE'],
-      [3, 'NETWORK_FAILURE'],
-    ];
-    for (const [attempt, code] of cases) {
-      const f = fixture({ status: 'DOWNLOADED' });
-      f.storage.put.mockRejectedValue(
-        new ObjectStorageError('OBJECT_STORAGE', code),
+  it('renews the lease while the extraction and upload run', async () => {
+    jest.useFakeTimers();
+    try {
+      let release!: () => void;
+      const f = fixture();
+      f.upload.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve({ kind: 'unknown', outcome: committed });
+          }),
       );
-      f.store.startStorageAttempt.mockResolvedValueOnce({
-        attempt,
-        version: '4',
+      const run = f.processor.process(row(), OWNER);
+      await jest.advanceTimersByTimeAsync(45_000);
+      expect(f.store.renewLease).toHaveBeenCalledWith({
+        id: RECEIPT_ID,
+        owner: OWNER,
+        expectedVersion: '6',
       });
-      f.store.startStorageAttempt.mockResolvedValue(null);
-      f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-        kind: 'terminal',
-        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-        version: '5',
-        receipt: f.receipt,
-        intent: {} as ReceiptMediaOutboxRow,
-      });
-      expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-        kind: 'storage-terminal',
-        failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-        code,
-      });
-      expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
-        command({ expectedVersion: '4', code }),
-      );
-      expect(f.storage.put).toHaveBeenCalledTimes(1);
-      expect(f.capability.issue).not.toHaveBeenCalled();
-      expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
+      release();
+      await run;
+      const calls = f.store.renewLease.mock.calls.length;
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(f.store.renewLease.mock.calls.length).toBe(calls);
+    } finally {
+      jest.useRealTimers();
     }
   });
 
-  it('terminalizes CLEANUP_PENDING at attempt 1 with the safe cleanup backlog', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'CLEANUP_PENDING'),
-    );
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 1,
-      version: '3',
+  it('declines any other claimed status', async () => {
+    const f = fixture();
+    await expect(
+      f.processor.process(row({ status: 'ATTACHED' }), OWNER),
+    ).resolves.toEqual({
+      kind: 'unsupported-claimed-status',
+      status: 'ATTACHED',
     });
-    f.store.startStorageAttempt.mockResolvedValue(null);
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      version: '4',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      code: 'CLEANUP_PENDING',
-    });
-    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
-      command({ code: 'CLEANUP_PENDING' }),
-    );
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('reports a stable storage fence outcome with no capability or bootstrap action', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'NETWORK_FAILURE'),
-    );
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 1,
-      version: '3',
-    });
-    f.store.startStorageAttempt.mockResolvedValue(null);
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'fenced',
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-fenced',
-      code: 'NETWORK_FAILURE',
-    });
-    expect(f.capability.issue).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('terminalizes a claimed DOWNLOADED storageAttempts>=3 row before any Meta or storage call', async () => {
-    const f = fixture({ status: 'DOWNLOADED', storageAttempts: 3 });
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      version: '2',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      code: 'STORAGE_EXHAUSTED',
-    });
-    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledWith(
-      command({ expectedVersion: '1', code: 'STORAGE_EXHAUSTED' }),
-    );
-    expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.store.startStorageAttempt).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-    expect(f.cleanup).not.toHaveBeenCalled();
-    expect(f.capability.issue).not.toHaveBeenCalled();
-  });
-
-  it('prefers storage exhaustion over Meta exhaustion when both counters are 3', async () => {
-    const f = fixture({
-      status: 'DOWNLOADED',
-      metaAttempts: 3,
-      storageAttempts: 3,
-    });
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      version: '2',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      code: 'STORAGE_EXHAUSTED',
-    });
-    expect(f.store.commitMetaFailureDisposition).not.toHaveBeenCalled();
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-  });
-
-  it('fences a reclaimed storage-exhausted recovery without a Meta or storage call', async () => {
-    const f = fixture({ status: 'DOWNLOADED', storageAttempts: 3 });
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'fenced',
-    });
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'storage-fenced',
-      code: 'STORAGE_EXHAUSTED',
-    });
-    expect(f.store.startMetaAttempt).not.toHaveBeenCalled();
-    expect(f.meta.resolveAndDownload).not.toHaveBeenCalled();
-    expect(f.storage.put).not.toHaveBeenCalled();
-  });
-
-  it('leaves RESERVED behavior unchanged even when storageAttempts is at the cap', async () => {
-    const f = fixture({ status: 'RESERVED', storageAttempts: 3 });
-    await expect(f.processor.process(f.receipt, 'w1')).resolves.toEqual({
-      kind: 'downloaded',
-    });
-    expect(f.store.commitStorageFailureDisposition).not.toHaveBeenCalled();
-    expect(f.store.startMetaAttempt).toHaveBeenCalledTimes(1);
-  });
-
-  it('destroys the stream and rethrows an unknown error only after cleanup', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    let stream!: PutObjectInput['content'];
-    f.storage.put.mockImplementation((input) => {
-      stream = input.content;
-      return Promise.reject(new Error('raw-storage-diagnostics'));
-    });
-    f.store.startStorageAttempt.mockResolvedValue({ attempt: 1, version: '3' });
-    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
-      'raw-storage-diagnostics',
-    );
-    expect(stream.destroyed).toBe(true);
-    expect(f.store.commitStorageFailureDisposition).not.toHaveBeenCalled();
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps the durable disposition and reports cleanup-failed when temp cleanup fails', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'HTTP_PERMANENT'),
-    );
-    f.store.startStorageAttempt.mockResolvedValue({ attempt: 1, version: '3' });
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      version: '4',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    f.cleanup.mockRejectedValue(new Error('raw-unlink-diagnostics'));
-    expect(await f.processor.process(f.receipt, 'w1')).toEqual({
-      kind: 'cleanup-failed',
-    });
-    expect(f.store.commitStorageFailureDisposition).toHaveBeenCalledTimes(1);
-    expect(f.capability.issue).not.toHaveBeenCalled();
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-  });
-
-  it('cleans up once and rethrows when the disposition itself throws', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'NETWORK_FAILURE'),
-    );
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 1,
-      version: '3',
-    });
-    f.store.startStorageAttempt.mockResolvedValue(null);
-    f.store.commitStorageFailureDisposition.mockRejectedValue(
-      new Error('disposition-down'),
-    );
-    await expect(f.processor.process(f.receipt, 'w1')).rejects.toThrow(
-      'disposition-down',
-    );
-    expect(f.cleanup).toHaveBeenCalledTimes(1);
-    expect(f.store.bootstrapAmount).not.toHaveBeenCalled();
-    expect(f.capability.issue).not.toHaveBeenCalled();
-  });
-
-  it('never calls the technical delete while persisting the cleanup backlog', async () => {
-    const f = fixture({ status: 'DOWNLOADED' });
-    const deleteTechnicalObject = jest.fn();
-    (f.storage as unknown as Record<string, unknown>).deleteTechnicalObject =
-      deleteTechnicalObject;
-    f.storage.put.mockRejectedValue(
-      new ObjectStorageError('OBJECT_STORAGE', 'CLEANUP_PENDING'),
-    );
-    f.store.startStorageAttempt.mockResolvedValueOnce({
-      attempt: 1,
-      version: '3',
-    });
-    f.store.startStorageAttempt.mockResolvedValue(null);
-    f.store.commitStorageFailureDisposition.mockResolvedValueOnce({
-      kind: 'terminal',
-      failureStage: 'STORAGE_EXHAUSTED_PRE_ACCEPTANCE',
-      version: '4',
-      receipt: f.receipt,
-      intent: {} as ReceiptMediaOutboxRow,
-    });
-    await f.processor.process(f.receipt, 'w1');
-    expect(deleteTechnicalObject).not.toHaveBeenCalled();
+    expect(f.resolveAndDownload).not.toHaveBeenCalled();
   });
 });

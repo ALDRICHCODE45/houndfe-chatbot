@@ -30,6 +30,7 @@ You are in repo **`houndfe-chatbot`**. This document is your bootstrap artifact 
 **Goal**: Build a 24/7 WhatsApp AI sales chatbot for HoundFe, a Mexican retail/POS business. The chatbot handles customer inquiries, product search, cart building, order placement, payment receipt collection, and delivery tracking — all via WhatsApp.
 
 **Success criteria**:
+
 - Customers can browse products, build a cart, and place orders entirely through WhatsApp
 - Transfer payment receipts are collected by the bot and routed to human confirmation
 - Shipping quotes are calculated (Skydropx) with credit rules applied
@@ -73,6 +74,7 @@ You are in repo **`houndfe-chatbot`**. This document is your bootstrap artifact 
 ```
 
 **Key architectural decisions:**
+
 - **Backend is the source of truth** for all transactional data (sales, customers, products, payments, receipts). The chatbot NEVER writes directly to the backend database.
 - **Chatbot is a separate service** on a separate VPS. It communicates with the backend exclusively through the `chatbot-api` HTTP endpoints.
 - **Payment v1**: Bot collects transfer receipt images → backend stores as `PENDING` → human confirms/rejects via backend's receipt-review workflow → payment recorded.
@@ -85,20 +87,21 @@ You are in repo **`houndfe-chatbot`**. This document is your bootstrap artifact 
 
 ### 4.1 Authentication
 
-| Aspect | Detail |
-|--------|--------|
-| **Header** | `Authorization: Bearer svc_<raw-api-key>` |
-| **Key format** | Must start with `svc_` prefix |
-| **Hash scheme** | SHA-256 of the raw key, stored as hex in `ServiceCredential.hashedKey` (unique index) |
-| **Hash comparison** | `crypto.timingSafeEqual` on the Buffer-decoded hex hashes |
-| **Branch context** | Optional `X-Branch-Id` header; if present, must match `credential.tenantId` or → `403 Forbidden` |
-| **CLS context set** | `tenantId` = credential's tenant, `userId` = `service:<credentialId>`, `isSuperAdmin` = false |
-| **Scope enforcement** | `@RequiredScopes(...)` decorator; method-level scopes **replace** (not merge) class-level scopes via `getAllAndOverride` |
-| **Rate limiting** | In-memory sliding window per credential; `credential.rateLimit` requests per 60s window (default: 60). Returns `429 Too Many Requests` with `Retry-After` header (seconds) |
-| **Credential lifecycle** | `isActive` must be true AND `revokedAt` must be null; `lastUsedAt` is touched on every successful auth |
-| **Audit** | `BotAuditInterceptor` logs every request (success + error) to `BotAuditLog` with action, resource type/id, HTTP method, status code, outcome |
+| Aspect                   | Detail                                                                                                                                                                     |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Header**               | `Authorization: Bearer svc_<raw-api-key>`                                                                                                                                  |
+| **Key format**           | Must start with `svc_` prefix                                                                                                                                              |
+| **Hash scheme**          | SHA-256 of the raw key, stored as hex in `ServiceCredential.hashedKey` (unique index)                                                                                      |
+| **Hash comparison**      | `crypto.timingSafeEqual` on the Buffer-decoded hex hashes                                                                                                                  |
+| **Branch context**       | Optional `X-Branch-Id` header; if present, must match `credential.tenantId` or → `403 Forbidden`                                                                           |
+| **CLS context set**      | `tenantId` = credential's tenant, `userId` = `service:<credentialId>`, `isSuperAdmin` = false                                                                              |
+| **Scope enforcement**    | `@RequiredScopes(...)` decorator; method-level scopes **replace** (not merge) class-level scopes via `getAllAndOverride`                                                   |
+| **Rate limiting**        | In-memory sliding window per credential; `credential.rateLimit` requests per 60s window (default: 60). Returns `429 Too Many Requests` with `Retry-After` header (seconds) |
+| **Credential lifecycle** | `isActive` must be true AND `revokedAt` must be null; `lastUsedAt` is touched on every successful auth                                                                     |
+| **Audit**                | `BotAuditInterceptor` logs every request (success + error) to `BotAuditLog` with action, resource type/id, HTTP method, status code, outcome                               |
 
 **Error responses:**
+
 - `401 Unauthorized` — missing/invalid Bearer token, inactive credential, revoked credential
 - `403 Forbidden` — insufficient scopes, branch mismatch
 - `429 Too Many Requests` — rate limit exceeded (includes `Retry-After` header)
@@ -121,6 +124,7 @@ ServiceCredential {
 ```
 
 **Known scopes** (from code):
+
 - `catalog:read` — catalog search, stock check (class-level default)
 - `pricing:evaluate` — cart pricing evaluation
 - `customers:read` — customer lookup, order history
@@ -131,6 +135,7 @@ ServiceCredential {
 ### 4.3 Idempotency
 
 Bot sale registration uses a dedicated `SaleIdempotency` table:
+
 - **Header**: `X-Idempotency-Key` (sent with `POST /chatbot-api/sales`)
 - **Scope**: Per-tenant, operation `bot_sale_register`, keyed by the idempotency key value
 - **Behavior**: If key already exists with `status: SUCCEEDED`, returns cached `responseJson` without re-creating the sale
@@ -154,6 +159,7 @@ All routes are prefixed with `/chatbot-api/`. All require `ServiceAuthGuard` (Be
 | `limit` | number | `@IsOptional()`, `@IsInt()`, `@Min(1)`, `@Max(20)` | `10` |
 
 **Response** `200`: `CatalogItemResponse[]`
+
 ```typescript
 interface CatalogItemResponse {
   productId: string;
@@ -163,17 +169,17 @@ interface CatalogItemResponse {
   description: string | null;
   price: {
     priceCents: number | null;
-    fromPriceCents: number | null;       // min variant price if has variants
-    promoPriceCents: number | null;      // always null in search (use evaluate-cart)
-    promotionEvaluationStatus: "needs_human_review";  // hardcoded in search
+    fromPriceCents: number | null; // min variant price if has variants
+    promoPriceCents: number | null; // always null in search (use evaluate-cart)
+    promotionEvaluationStatus: 'needs_human_review'; // hardcoded in search
   };
   stock: {
-    status: "available" | "low_stock" | "out_of_stock" | "not_managed";
+    status: 'available' | 'low_stock' | 'out_of_stock' | 'not_managed';
     quantity: number | null;
   };
   packageInfo: {
-    weightGrams: null;       // not yet implemented
-    dimensions: null;        // not yet implemented
+    weightGrams: null; // not yet implemented
+    dimensions: null; // not yet implemented
   };
   variants: Array<{
     variantId: string;
@@ -182,7 +188,7 @@ interface CatalogItemResponse {
     value: string | null;
     priceCents: number | null;
     stock: {
-      status: "available" | "low_stock" | "out_of_stock" | "not_managed";
+      status: 'available' | 'low_stock' | 'out_of_stock' | 'not_managed';
       quantity: number | null;
     };
   }>;
@@ -203,12 +209,13 @@ interface CatalogItemResponse {
 | `productId` | string | `ParseUUIDPipe` |
 
 **Response** `200`: `StockCheckResponse`
+
 ```typescript
 interface StockCheckResponse {
   productId: string;
   name: string;
   stock: {
-    status: "available" | "low_stock" | "out_of_stock" | "not_managed";
+    status: 'available' | 'low_stock' | 'out_of_stock' | 'not_managed';
     quantity: number | null;
   };
   variants: Array<{
@@ -217,7 +224,7 @@ interface StockCheckResponse {
     option: string | null;
     value: string | null;
     stock: {
-      status: "available" | "low_stock" | "out_of_stock" | "not_managed";
+      status: 'available' | 'low_stock' | 'out_of_stock' | 'not_managed';
       quantity: number | null;
     };
   }>;
@@ -233,18 +240,21 @@ interface StockCheckResponse {
 **Scopes**: `pricing:evaluate`
 
 **Request body:**
+
 ```typescript
 {
-  items: Array<{                        // @ArrayMinSize(1)
-    productId: string;                  // @IsUUID()
-    variantId?: string;                 // @IsOptional(), @IsUUID()
-    quantity: number;                   // @IsInt(), @Min(1)
-    unitPriceCents: number;             // @IsInt(), @Min(0)
+  items: Array<{
+    // @ArrayMinSize(1)
+    productId: string; // @IsUUID()
+    variantId?: string; // @IsOptional(), @IsUUID()
+    quantity: number; // @IsInt(), @Min(1)
+    unitPriceCents: number; // @IsInt(), @Min(0)
   }>;
 }
 ```
 
 **Response** `201`: `CartEvaluationResult`
+
 ```typescript
 interface CartEvaluationResult {
   items: Array<{
@@ -257,7 +267,7 @@ interface CartEvaluationResult {
     appliedPromotionTitle: string | null;
     discountAmountCents: number;
   }>;
-  promotionEvaluationStatus: "fully_evaluated" | "needs_human_review";
+  promotionEvaluationStatus: 'fully_evaluated' | 'needs_human_review';
 }
 ```
 
@@ -276,6 +286,7 @@ interface CartEvaluationResult {
 | `phone` | string | `@IsString()`, `@MaxLength(20)`, required |
 
 **Response** `200`: `CustomerLookupResponse`
+
 ```typescript
 interface CustomerLookupResponse {
   found: boolean;
@@ -317,6 +328,7 @@ interface CustomerDeliveryAddressResponse {
 **Scopes**: `customers:write`
 
 **Request body:**
+
 ```typescript
 {
   firstName: string;                   // @IsString(), @MaxLength(100), required
@@ -341,10 +353,11 @@ interface CustomerDeliveryAddressResponse {
 ```
 
 **Response** `200`: `CustomerUpsertResponse`
+
 ```typescript
 interface CustomerUpsertResponse {
-  status: "created" | "updated";
-  customer: CustomerProfileResponse;    // same shape as lookup response
+  status: 'created' | 'updated';
+  customer: CustomerProfileResponse; // same shape as lookup response
 }
 ```
 
@@ -359,6 +372,7 @@ interface CustomerUpsertResponse {
 **Required header**: `X-Idempotency-Key: <string>` (see Section 4.3)
 
 **Request body:**
+
 ```typescript
 {
   cashierUserId: string;               // @IsUUID(), required — must be a valid User.id
@@ -376,21 +390,23 @@ interface CustomerUpsertResponse {
 ```
 
 **Response** `201`: `BotSaleResponse`
+
 ```typescript
 interface BotSaleResponse {
   saleId: string;
   folio: string | null;
-  paymentStatus: "CREDIT" | "PARTIAL" | "PAID";
-  channel: string;                     // always "ONLINE" for bot sales
-  deliveryStatus: string;              // initial: "PENDING"
+  paymentStatus: 'CREDIT' | 'PARTIAL' | 'PAID';
+  channel: string; // always "ONLINE" for bot sales
+  deliveryStatus: string; // initial: "PENDING"
   totalCents: number;
   paidCents: number;
   debtCents: number;
-  confirmedAt: string | null;          // ISO 8601
+  confirmedAt: string | null; // ISO 8601
 }
 ```
 
 **Notes**:
+
 - Creates a CONFIRMED ONLINE sale with `paymentStatus: CREDIT` (pending transfer payment).
 - `cashierUserId` must be a seeded bot-dedicated User record (FK constraint on `Sale.userId`). The bot's identity is attributed via `BotAuditLog`, not the sale's userId.
 - Routes through `SalesService.confirmBotSale()` which enforces all domain invariants: folio allocation, stock decrement, price validation, dueDate, domain event emission (`sale.confirmed` outbox event).
@@ -408,6 +424,7 @@ interface BotSaleResponse {
 | `saleId` | string | `ParseUUIDPipe` |
 
 **Request body:**
+
 ```typescript
 {
   mediaUrl: string;                    // @IsUrl(), required
@@ -418,10 +435,11 @@ interface BotSaleResponse {
 ```
 
 **Response** `201`: `AttachReceiptResponse`
+
 ```typescript
 interface AttachReceiptResponse {
   receiptId: string;
-  status: "PENDING";                   // always PENDING; human confirms later
+  status: 'PENDING'; // always PENDING; human confirms later
 }
 ```
 
@@ -439,6 +457,7 @@ interface AttachReceiptResponse {
 | `saleId` | string | `ParseUUIDPipe` |
 
 **Request body:**
+
 ```typescript
 {
   carrierName?: string | null;         // @IsOptional(), @IsString(), @IsNotEmpty()
@@ -450,6 +469,7 @@ interface AttachReceiptResponse {
 **Response** `200`: `{}` (empty object)
 
 **Preconditions** (enforced in service; throws `BusinessRuleViolationError` if violated):
+
 - Sale must exist
 - `sale.status === 'CONFIRMED'`
 - `sale.paymentStatus === 'PAID'`
@@ -475,11 +495,12 @@ interface AttachReceiptResponse {
 | `phoneCountryCode` | string | Required (no validation decorator — **ambiguity**: controller extracts via `@Query('phoneCountryCode')` with no DTO, defaults to `''` if missing) |
 
 **Response** `200`: `OrderHistoryResponse[]`
+
 ```typescript
 interface OrderHistoryResponse {
   saleId: string;
   folio: string | null;
-  confirmedAt: string | null;          // ISO 8601
+  confirmedAt: string | null; // ISO 8601
   channel: string;
   deliveryStatus: string;
   paymentStatus: string | null;
@@ -512,17 +533,17 @@ interface OrderHistoryResponse {
 
 ### 4.5 Endpoint Summary Table
 
-| # | Method | Path | Scopes | Idempotent | Status |
-|---|--------|------|--------|-----------|--------|
-| 1 | GET | `/chatbot-api/catalog/search` | `catalog:read` | N/A (read) | 200 |
-| 2 | GET | `/chatbot-api/catalog/:productId/stock` | `catalog:read` | N/A (read) | 200 / 404 |
-| 3 | POST | `/chatbot-api/pricing/evaluate-cart` | `pricing:evaluate` | No | 201 |
-| 4 | GET | `/chatbot-api/customers/by-phone` | `customers:read` | N/A (read) | 200 |
-| 5 | PUT | `/chatbot-api/customers/by-phone` | `customers:write` | No (upsert) | 200 |
-| 6 | POST | `/chatbot-api/sales` | `sales:create` | Yes (`X-Idempotency-Key`) | 201 |
-| 7 | POST | `/chatbot-api/sales/:saleId/receipts` | `sales:write` | No | 201 |
-| 8 | PATCH | `/chatbot-api/sales/:saleId/delivery` | `sales:write` | No | 200 |
-| 9 | GET | `/chatbot-api/customers/by-phone/:phone/orders` | `customers:read` | N/A (read) | 200 |
+| #   | Method | Path                                            | Scopes             | Idempotent                | Status    |
+| --- | ------ | ----------------------------------------------- | ------------------ | ------------------------- | --------- |
+| 1   | GET    | `/chatbot-api/catalog/search`                   | `catalog:read`     | N/A (read)                | 200       |
+| 2   | GET    | `/chatbot-api/catalog/:productId/stock`         | `catalog:read`     | N/A (read)                | 200 / 404 |
+| 3   | POST   | `/chatbot-api/pricing/evaluate-cart`            | `pricing:evaluate` | No                        | 201       |
+| 4   | GET    | `/chatbot-api/customers/by-phone`               | `customers:read`   | N/A (read)                | 200       |
+| 5   | PUT    | `/chatbot-api/customers/by-phone`               | `customers:write`  | No (upsert)               | 200       |
+| 6   | POST   | `/chatbot-api/sales`                            | `sales:create`     | Yes (`X-Idempotency-Key`) | 201       |
+| 7   | POST   | `/chatbot-api/sales/:saleId/receipts`           | `sales:write`      | No                        | 201       |
+| 8   | PATCH  | `/chatbot-api/sales/:saleId/delivery`           | `sales:write`      | No                        | 200       |
+| 9   | GET    | `/chatbot-api/customers/by-phone/:phone/orders` | `customers:read`   | N/A (read)                | 200       |
 
 **Total: 9 endpoints** (4 GET, 3 POST, 1 PUT, 1 PATCH)
 
@@ -532,18 +553,18 @@ interface OrderHistoryResponse {
 
 ### 5.1 Models the Chatbot Relies On
 
-| Model | Role for Chatbot |
-|-------|-----------------|
-| `ServiceCredential` | API-key auth; scopes, rate limit, tenant binding |
-| `BotAuditLog` | Audit trail for all chatbot-api calls |
-| `SaleIdempotency` | Prevents duplicate bot sale creation |
-| `Sale` | Bot-created sales (channel=ONLINE, status=CONFIRMED) |
-| `SaleItem` | Line items on bot sales |
-| `SalePayment` | Payments (created by receipt-review, not by bot directly) |
-| `ReceiptEvidence` | Transfer receipt images (bot creates as PENDING) |
-| `Customer` | Customer profiles (phone-indexed for WhatsApp lookup) |
-| `CustomerAddress` | Delivery addresses |
-| `OutboxEvent` | Domain events emitted on `sale.confirmed` |
+| Model               | Role for Chatbot                                          |
+| ------------------- | --------------------------------------------------------- |
+| `ServiceCredential` | API-key auth; scopes, rate limit, tenant binding          |
+| `BotAuditLog`       | Audit trail for all chatbot-api calls                     |
+| `SaleIdempotency`   | Prevents duplicate bot sale creation                      |
+| `Sale`              | Bot-created sales (channel=ONLINE, status=CONFIRMED)      |
+| `SaleItem`          | Line items on bot sales                                   |
+| `SalePayment`       | Payments (created by receipt-review, not by bot directly) |
+| `ReceiptEvidence`   | Transfer receipt images (bot creates as PENDING)          |
+| `Customer`          | Customer profiles (phone-indexed for WhatsApp lookup)     |
+| `CustomerAddress`   | Delivery addresses                                        |
+| `OutboxEvent`       | Domain events emitted on `sale.confirmed`                 |
 
 ### 5.2 Key Enums
 
@@ -599,6 +620,7 @@ SaleIdempotencyStatus: IN_FLIGHT | SUCCEEDED | FAILED
 **Scope**: Stand up the `houndfe-chatbot` repo on its own VPS and wire the WhatsApp webhook channel to consume the backend chatbot-api.
 
 **Deliverables**:
+
 1. New repo scaffolding (`houndfe-chatbot`)
 2. Meta WhatsApp webhook receiver (signature verification with `X-Hub-Signature-256`)
 3. Send/receive messages against the Meta Cloud API test number
@@ -609,14 +631,14 @@ SaleIdempotencyStatus: IN_FLIGHT | SUCCEEDED | FAILED
 
 **Prerequisites / Blockers**:
 
-| Prerequisite | Status | Notes |
-|-------------|--------|-------|
-| Meta WhatsApp test number | **BLOCKED** | Owner started verification paperwork (SAT Constancia + address proof). Test numbers work without business verification, but need owner to complete phone number registration on Meta dashboard. Verification takes 2–14 days. **Confirm current status with owner before starting.** |
-| Dedicated bot cashier User record | NOT SEEDED | Must create in production DB before live sales |
-| ServiceCredential provisioned | NOT PROVISIONED | Create with scopes: `catalog:read`, `pricing:evaluate`, `customers:read`, `customers:write`, `sales:create`, `sales:write` |
-| VPS 2 provisioned | UNKNOWN | Separate VPS for chatbot service |
-| LLM provider account | UNKNOWN | $200/mo cap; not needed for echo-bot slice but needed soon after |
-| Skydropx sandbox account | UNKNOWN | Needed for shipping slice, not this one |
+| Prerequisite                      | Status          | Notes                                                                                                                                                                                                                                                                                |
+| --------------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Meta WhatsApp test number         | **BLOCKED**     | Owner started verification paperwork (SAT Constancia + address proof). Test numbers work without business verification, but need owner to complete phone number registration on Meta dashboard. Verification takes 2–14 days. **Confirm current status with owner before starting.** |
+| Dedicated bot cashier User record | NOT SEEDED      | Must create in production DB before live sales                                                                                                                                                                                                                                       |
+| ServiceCredential provisioned     | NOT PROVISIONED | Create with scopes: `catalog:read`, `pricing:evaluate`, `customers:read`, `customers:write`, `sales:create`, `sales:write`                                                                                                                                                           |
+| VPS 2 provisioned                 | UNKNOWN         | Separate VPS for chatbot service                                                                                                                                                                                                                                                     |
+| LLM provider account              | UNKNOWN         | $200/mo cap; not needed for echo-bot slice but needed soon after                                                                                                                                                                                                                     |
+| Skydropx sandbox account          | UNKNOWN         | Needed for shipping slice, not this one                                                                                                                                                                                                                                              |
 
 ---
 
@@ -632,6 +654,7 @@ In priority order (from conversation-analysis R1–R16):
 6. **Delivery zones** — 4-state postal-code zones: FREE, SURCHARGE, CARRIER_ONLY, UNKNOWN (discovered during receipt-payment-confirmation)
 
 **Remaining backend hardening** (minor, in houndfe-backend repo):
+
 - W-001: Delivery metadata precondition guard clarification
 - W-002: `timingSafeEqual` defense-in-depth (already implemented as of bot-sale-domain-events)
 - W-003: Multi-bot credential namespace documentation
@@ -644,25 +667,26 @@ In priority order (from conversation-analysis R1–R16):
 
 ### Backend (`houndfe-backend`)
 
-| Aspect | Detail |
-|--------|--------|
-| Runtime | Node.js + TypeScript 5.7 |
-| Framework | NestJS 11 |
-| ORM | Prisma 6.19 (PostgreSQL) |
-| Auth (human) | Passport + JWT + CASL |
-| Auth (service) | Custom `ServiceAuthGuard` (API key → SHA-256) |
-| Multi-tenancy | `nestjs-cls` (CLS-based tenant context) |
-| Package manager | **pnpm** |
-| Test runner | **Jest 30** + ts-jest |
-| Build | `pnpm build` (NestJS CLI → tsc) |
-| Lint | `pnpm lint` — **CAUTION**: repo-wide lint is broken (pre-existing). Use `pnpm exec eslint src/chatbot-api` for scoped linting |
-| Architecture | Screaming/feature-module: `src/<module>/{domain,application,infrastructure,presentation}` |
-| Commits | Conventional commits (no AI co-author attribution) |
-| Domain events | `@nestjs/event-emitter` + OutboxEvent table for durable delivery |
+| Aspect          | Detail                                                                                                                        |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Runtime         | Node.js + TypeScript 5.7                                                                                                      |
+| Framework       | NestJS 11                                                                                                                     |
+| ORM             | Prisma 6.19 (PostgreSQL)                                                                                                      |
+| Auth (human)    | Passport + JWT + CASL                                                                                                         |
+| Auth (service)  | Custom `ServiceAuthGuard` (API key → SHA-256)                                                                                 |
+| Multi-tenancy   | `nestjs-cls` (CLS-based tenant context)                                                                                       |
+| Package manager | **pnpm**                                                                                                                      |
+| Test runner     | **Jest 30** + ts-jest                                                                                                         |
+| Build           | `pnpm build` (NestJS CLI → tsc)                                                                                               |
+| Lint            | `pnpm lint` — **CAUTION**: repo-wide lint is broken (pre-existing). Use `pnpm exec eslint src/chatbot-api` for scoped linting |
+| Architecture    | Screaming/feature-module: `src/<module>/{domain,application,infrastructure,presentation}`                                     |
+| Commits         | Conventional commits (no AI co-author attribution)                                                                            |
+| Domain events   | `@nestjs/event-emitter` + OutboxEvent table for durable delivery                                                              |
 
 ### Chatbot (`houndfe-chatbot`) — To Be Decided
 
 Stack for the new repo is not yet locked. Consider:
+
 - Runtime: Node.js (consistent with backend team knowledge)
 - Framework: Lightweight (Fastify, Hono, or plain Express) — no need for NestJS complexity
 - LLM: Provider TBD ($200/mo cap)
@@ -675,46 +699,46 @@ Stack for the new repo is not yet locked. Consider:
 
 ### Engram Queries (project: `houndfe-backend`)
 
-| Topic Key / Query | What You Get |
-|-------------------|-------------|
-| `sdd/whatsapp-ai-chatbot/archive-report` | Full archive report for chatbot-api-foundation (#2308) |
-| `sdd/receipt-payment-confirmation/archive-report` | Receipt-review workflow archive (#2351) |
-| Session summary #2373 | bot-sale-domain-events session (confirmBotSale, domain invariants) |
-| Session summary #2309 | Original chatbot-api-foundation session (full program context) |
-| `receipt-payment-confirmation audit attribution` | D7 decision on audit attribution (#2312) |
-| `delivery zones payment precondition` | HoundFe delivery + payment rules (#2330) |
+| Topic Key / Query                                 | What You Get                                                       |
+| ------------------------------------------------- | ------------------------------------------------------------------ |
+| `sdd/whatsapp-ai-chatbot/archive-report`          | Full archive report for chatbot-api-foundation (#2308)             |
+| `sdd/receipt-payment-confirmation/archive-report` | Receipt-review workflow archive (#2351)                            |
+| Session summary #2373                             | bot-sale-domain-events session (confirmBotSale, domain invariants) |
+| Session summary #2309                             | Original chatbot-api-foundation session (full program context)     |
+| `receipt-payment-confirmation audit attribution`  | D7 decision on audit attribution (#2312)                           |
+| `delivery zones payment precondition`             | HoundFe delivery + payment rules (#2330)                           |
 
 ### File References (in `houndfe-backend` repo)
 
-| File | Content |
-|------|---------|
+| File                                                                               | Content                                                                                                                            |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `openspec/changes/archive/2026-06-11-whatsapp-ai-chatbot/conversation-analysis.md` | **LIVING DOCUMENT**: R1–R16 requirement-to-flow mappings, conversation state machine sketches, LLM prompt notes, known ambiguities |
-| `openspec/changes/archive/2026-06-11-whatsapp-ai-chatbot/proposal.md` | Program scope, intent, success criteria |
-| `openspec/changes/archive/2026-06-11-whatsapp-ai-chatbot/design.md` | Technical architecture decisions, data flow |
-| `openspec/specs/chatbot-api-foundation/spec.md` | Canonical API spec |
-| `openspec/specs/receipt-review/spec.md` | Receipt review workflow spec |
-| `openspec/specs/sales/spec.md` | Sales capability (formalized with bot-sale-domain-events) |
-| `openspec/specs/sale-payments/spec.md` | Sale payments spec |
-| `docs/whatsapp-business-api-registro-meta.md` | Meta registration guide for the owner (Spanish) |
+| `openspec/changes/archive/2026-06-11-whatsapp-ai-chatbot/proposal.md`              | Program scope, intent, success criteria                                                                                            |
+| `openspec/changes/archive/2026-06-11-whatsapp-ai-chatbot/design.md`                | Technical architecture decisions, data flow                                                                                        |
+| `openspec/specs/chatbot-api-foundation/spec.md`                                    | Canonical API spec                                                                                                                 |
+| `openspec/specs/receipt-review/spec.md`                                            | Receipt review workflow spec                                                                                                       |
+| `openspec/specs/sales/spec.md`                                                     | Sales capability (formalized with bot-sale-domain-events)                                                                          |
+| `openspec/specs/sale-payments/spec.md`                                             | Sale payments spec                                                                                                                 |
+| `docs/whatsapp-business-api-registro-meta.md`                                      | Meta registration guide for the owner (Spanish)                                                                                    |
 
 ---
 
 ## 11. Open Questions / Risks for the New Repo
 
-| # | Question / Risk | Impact | Notes |
-|---|----------------|--------|-------|
-| 1 | **Meta WhatsApp number verification status** | BLOCKING | Owner started paperwork. Test numbers work without verification, but confirm where the process stands. |
-| 2 | **VPS 2 provisioning** | BLOCKING for deployment | Need server details, OS, domain/subdomain for webhook URL |
-| 3 | **Webhook URL requirements** | Medium | Meta requires HTTPS webhook endpoint. Need SSL cert (Let's Encrypt) and public domain/subdomain |
-| 4 | **Bot cashier User seeding** | BLOCKING for live sales | Must exist before `POST /chatbot-api/sales` can succeed (FK constraint) |
-| 5 | **ServiceCredential provisioning** | BLOCKING for API access | No admin endpoint exists to create credentials — must be seeded directly in DB or via a seed script |
-| 6 | **`phoneCountryCode` on order history endpoint** | Minor ambiguity | The `GET /chatbot-api/customers/by-phone/:phone/orders` endpoint takes `phoneCountryCode` as a raw `@Query()` param with no DTO validation — it defaults to `''` if missing. The chatbot should always send it. |
-| 7 | **Rate limit adequacy** | Low | Default 60 req/min per credential. Adequate for v1 single-bot, but monitor. In-memory limiter resets on backend restart. |
-| 8 | **LLM provider selection** | Medium | $200/mo hard cap. Need to select provider and model. Affects agent architecture. |
-| 9 | **Conversation persistence strategy** | Medium | No design locked yet. Affects state management, context window, and handoff. |
-| 10 | **`promotionEvaluationStatus: needs_human_review`** | Design choice | Catalog search always returns `needs_human_review` for promo pricing. The bot should use `evaluate-cart` for accurate pricing and still handle `needs_human_review` gracefully. |
-| 11 | **WhatsApp message cost** | Low risk | Service conversations (user-initiated) are free within 24h window. Marketing templates ~$0.04 USD/msg MX. Keep bot reactive, not proactive, to control costs. |
-| 12 | **Receipt image hosting** | Design decision | `attachReceipt` expects a `mediaUrl`. The chatbot needs to either: (a) host the WhatsApp-received image and provide a URL, or (b) use the Meta media download URL directly. Consider URL expiration. |
+| #   | Question / Risk                                     | Impact                  | Notes                                                                                                                                                                                                           |
+| --- | --------------------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Meta WhatsApp number verification status**        | BLOCKING                | Owner started paperwork. Test numbers work without verification, but confirm where the process stands.                                                                                                          |
+| 2   | **VPS 2 provisioning**                              | BLOCKING for deployment | Need server details, OS, domain/subdomain for webhook URL                                                                                                                                                       |
+| 3   | **Webhook URL requirements**                        | Medium                  | Meta requires HTTPS webhook endpoint. Need SSL cert (Let's Encrypt) and public domain/subdomain                                                                                                                 |
+| 4   | **Bot cashier User seeding**                        | BLOCKING for live sales | Must exist before `POST /chatbot-api/sales` can succeed (FK constraint)                                                                                                                                         |
+| 5   | **ServiceCredential provisioning**                  | BLOCKING for API access | No admin endpoint exists to create credentials — must be seeded directly in DB or via a seed script                                                                                                             |
+| 6   | **`phoneCountryCode` on order history endpoint**    | Minor ambiguity         | The `GET /chatbot-api/customers/by-phone/:phone/orders` endpoint takes `phoneCountryCode` as a raw `@Query()` param with no DTO validation — it defaults to `''` if missing. The chatbot should always send it. |
+| 7   | **Rate limit adequacy**                             | Low                     | Default 60 req/min per credential. Adequate for v1 single-bot, but monitor. In-memory limiter resets on backend restart.                                                                                        |
+| 8   | **LLM provider selection**                          | Medium                  | $200/mo hard cap. Need to select provider and model. Affects agent architecture.                                                                                                                                |
+| 9   | **Conversation persistence strategy**               | Medium                  | No design locked yet. Affects state management, context window, and handoff.                                                                                                                                    |
+| 10  | **`promotionEvaluationStatus: needs_human_review`** | Design choice           | Catalog search always returns `needs_human_review` for promo pricing. The bot should use `evaluate-cart` for accurate pricing and still handle `needs_human_review` gracefully.                                 |
+| 11  | **WhatsApp message cost**                           | Low risk                | Service conversations (user-initiated) are free within 24h window. Marketing templates ~$0.04 USD/msg MX. Keep bot reactive, not proactive, to control costs.                                                   |
+| 12  | **Receipt image hosting**                           | Design decision         | `attachReceipt` expects a `mediaUrl`. The chatbot needs to either: (a) host the WhatsApp-received image and provide a URL, or (b) use the Meta media download URL directly. Consider URL expiration.            |
 
 ---
 
@@ -737,6 +761,7 @@ Earlier it was assumed a brand-new number from scratch was MANDATORY. **That is 
 - **Contacts ARE preservable**: they live in the device address book, not in WhatsApp. Export to CSV/vCard (Google Contacts / iCloud) and load later (maps to the `Customer` model).
 
 **DECISION — phased approach:**
+
 1. Build/validate the entire bot on the **test number**; do NOT touch the client's live number yet.
 2. Defer the real-number choice (migrate existing number vs. use a new dedicated number) until the bot **and** human-handoff are production-ready, then do a planned cutover with a full backup beforehand.
 3. Meanwhile, the client should **export contacts** (CSV/vCard) and **back up conversations** now, so they are covered for either path.
@@ -750,3 +775,19 @@ The client was informed in simple terms: **contacts are guaranteed, conversation
 ### 12.4 Separate Workstream (NOT part of this chatbot repo)
 
 - A parallel effort is remodeling the POS **product creation form** (in `houndfe-backend` + `frontend-houndfe`). A full form spec was produced at `frontend-houndfe/docs/product-creation-form-spec.md` (Engram topic `products/create-form-spec`). This is unrelated to the chatbot program and does not affect `houndfe-chatbot`.
+
+---
+
+## 13. Running Tests
+
+> Always run tests through the project's test scripts (`pnpm test`, `make test`,
+> etc.), never by invoking the runner binary directly (`npx vitest`, `go test`,
+> `pytest`), so the machine-wide `run-tests` queue applies. Subagents run only
+> the tests related to the files they changed (for example `vitest related`,
+> `jest --findRelatedTests`, `go test ./changed/pkg/...`, `pytest path/to/test`),
+> passing them through the project script. Only the main agent runs the full
+> suite, once, before finishing. If you see `[run-tests] waiting`, the suite is
+> queued, not hung: wait for it and do not kill or retry it.
+
+In this repository: `pnpm test --findRelatedTests <changed files>` (no `--`: jest would read the files as a path pattern) or
+`pnpm test --runTestsByPath <spec files>`; full suite `pnpm test`; e2e `pnpm test:e2e`.

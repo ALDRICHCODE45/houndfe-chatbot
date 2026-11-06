@@ -6,10 +6,7 @@ import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
-import type {
-  PendingHumanRequest,
-  ReceiptAmountPointer,
-} from '../domain/conversation-store';
+import type { PendingHumanRequest } from '../domain/conversation-store';
 import { PostgresConversationStore } from './postgres-conversation.store';
 import { InMemoryConversationStore } from './in-memory-conversation.store';
 import { runConversationStoreContract } from './conversation-store.contract';
@@ -46,48 +43,12 @@ class FakePool {
   }
 }
 
-describe('PostgresConversationStore receipt amount pointer SQL', () => {
-  const pointer: ReceiptAmountPointer = {
-    receiptMediaId: 'receipt-a',
-    saleId: 'sale-a',
-    receiptVersion: '9007199254740993',
-  };
-  it.each([
-    ['setReceiptAmountPointer', 1, true],
-    ['setReceiptAmountPointer', 0, false],
-    ['clearReceiptAmountPointer', 1, true],
-    ['clearReceiptAmountPointer', 0, false],
-  ] as const)(
-    '%s maps rowCount %i to %s with one UPDATE',
-    async (method, count, expected) => {
-      const pool = new FakePool(count);
-      const store = new PostgresConversationStore(pool as unknown as Pool);
-      expect(await store[method]('sender-a', pointer)).toBe(expected);
-      expect(pool.calls).toHaveLength(1);
-      const { sql, params } = pool.calls[0];
-      expect(sql).toMatch(/^\s*UPDATE\s+conversation_state\b/i);
-      expect(sql).toMatch(/\bWHERE\b[\s\S]*\bsender_id\s*=\s*\$\d+/i);
-      expect(sql).not.toMatch(/\bSELECT\b|::numeric/i);
-      expect(sql).toContain('receiptAmountPointer');
-      expect(params).toEqual(
-        expect.arrayContaining(['sender-a', ...Object.values(pointer)]),
-      );
-      if (method === 'setReceiptAmountPointer') {
-        expect(sql).toMatch(/jsonb_set\s*\(|\|\|/i);
-        expect(sql).toMatch(/\?\s*'receiptAmountPointer'/);
-        expect(sql).toMatch(/(?:char_)?length\s*\(/i);
-        expect(sql).toMatch(/COLLATE\s+"C"/i);
-      } else {
-        expect(sql).toMatch(/-\s*'receiptAmountPointer'/);
-      }
-    },
-  );
-
-  it('preserves live receipt + marker carve-outs during a stale update', async () => {
+describe('PostgresConversationStore update carve-out SQL', () => {
+  it('preserves the live marker carve-out during a stale update', async () => {
     const row = {
       sender_id: 'sender-a',
       last_message_at: new Date(),
-      data: { receiptAmountPointer: pointer, pendingHumanRequest: null },
+      data: { pendingHumanRequest: null },
     };
     const pool = new FakePool([{ rows: [row] }, { rows: [row] }]);
     const store = new PostgresConversationStore(pool as unknown as Pool);
@@ -96,13 +57,11 @@ describe('PostgresConversationStore receipt amount pointer SQL', () => {
     });
     const sql = pool.calls[1].sql;
     expect(sql).toMatch(/ON CONFLICT[\s\S]*EXCLUDED\.data/i);
-    expect(sql).toMatch(/-\s*'receiptAmountPointer'/);
     expect(sql).toMatch(
       /\|\|\s*CASE\s+WHEN\s+conversation_state\.data\s*\?\s*'pendingHumanRequest'/i,
     );
     expect(sql).toMatch(/jsonb_build_object\(\s*'pendingHumanRequest'/i);
     expect(sql).toMatch(/ELSE\s+'\{\}'::jsonb/i);
-    expect(sql).toMatch(/jsonb_set\s*\(/i);
   });
 });
 
@@ -400,11 +359,6 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
       createdAt: T,
       customerNotifiedAt: T,
     });
-    const pointer: ReceiptAmountPointer = {
-      receiptMediaId: 'receipt-db-1',
-      saleId: 'sale-db-1',
-      receiptVersion: '9007199254740993',
-    };
 
     beforeEach(async () => {
       await pool.query('TRUNCATE TABLE conversation_state');
@@ -543,7 +497,6 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
       const store = new Store(pool);
       const m = marker('abcd00001111');
       const siblings = {
-        receiptAmountPointer: pointer,
         shippingApproval: { decision: 'SHIPPING_APPROVED' },
         cart: ['sku-1'],
       };
@@ -647,35 +600,6 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
       expect(afterClear!.data.pendingHumanRequest).toBeNull();
       expect(Object.hasOwn(afterClear!.data, 'pendingHumanRequest')).toBe(true);
       expect(afterClear!.data.cart).toEqual(['sku-2']);
-    });
-
-    it('preserves the sibling receipt pointer across marker set, stale update, and clear', async () => {
-      const store = new Store(pool);
-      await store.create('db-siblings', {
-        lastMessageAt: T,
-        data: { cart: ['sku-1'] },
-      });
-      await expect(
-        store.setReceiptAmountPointer('db-siblings', pointer),
-      ).resolves.toBe(true);
-
-      const live = marker('6666ffff7777');
-      await store.setPendingHumanRequest('db-siblings', live, T2);
-
-      await store.update('db-siblings', {
-        lastMessageAt: T,
-        data: { cart: ['sku-2'], pendingHumanRequest: live },
-      });
-      const afterUpdate = await store.get('db-siblings');
-      expect(afterUpdate!.data.receiptAmountPointer).toEqual(pointer);
-      expect(afterUpdate!.data.pendingHumanRequest).toEqual(live);
-
-      await expect(
-        store.clearPendingHumanRequest('db-siblings', live.requestId, T2),
-      ).resolves.toBe(true);
-      const afterClear = await store.get('db-siblings');
-      expect(afterClear!.data.receiptAmountPointer).toEqual(pointer);
-      expect(afterClear!.data.pendingHumanRequest).toBeNull();
     });
 
     it('serializes concurrent set/clear against a stale update with distinct Pool clients', async () => {

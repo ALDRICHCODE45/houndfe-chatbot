@@ -6,7 +6,7 @@
  * TestingModule — no guard mocking, no external services, loopback listener
  * per test, closed in finally/afterEach.
  *
- * Coverage: metrics/admission flag matrix, authenticated 200/401/404,
+ * Coverage: metrics token matrix, authenticated 200/401/404,
  * query/cookie-only 401, case-sensitive token/mixedcase Bearer,
  * content-type/no-store, serialization rejection (503), no unauthorized
  * serialization, and singleton duplicate-imports.
@@ -18,7 +18,6 @@ import type { AddressInfo } from 'node:net';
 import { Registry } from 'prom-client';
 import { WHATSAPP_SENDER } from '../../whatsapp/domain/whatsapp-sender.port';
 import { META_MEDIA } from '../domain/meta-media.port';
-import { OBJECT_STORAGE_PORT } from '../domain/object-storage.port';
 import { AppConfigModule } from '../../config/config.module';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 import { CONVERSATION_STORE } from '../../conversation/domain/conversation-store';
@@ -86,11 +85,7 @@ function httpGet(
 }
 
 /** Applies synthetic env only; AppConfigModule never reads an env file. */
-function applyReceiptEnv(
-  metricsEnabled: boolean,
-  metricsToken: string | undefined,
-  admissionEnabled: boolean,
-): void {
+function applyReceiptEnv(metricsToken: string | undefined): void {
   // Clear everything except npm_/NODE_ preservation list.
   for (const key of Object.keys(process.env)) {
     if (!key.startsWith('npm_') && !key.startsWith('NODE_')) {
@@ -110,56 +105,28 @@ function applyReceiptEnv(
   process.env.LLM_MODEL = 'm';
   process.env.DATABASE_URL = 'postgres://u:p@localhost:5432/d';
   process.env.OPS_CHANNEL_PHONE = '5215500000000';
-  process.env.RECEIPT_MEDIA_ENABLED = String(admissionEnabled);
-  if (admissionEnabled) {
-    Object.assign(process.env, {
-      RECEIPT_MEDIA_MAX_BYTES: '10485760',
-      META_MEDIA_ALLOWED_HOSTS: 'graph.facebook.com,.meta.com',
-      META_MEDIA_METADATA_TIMEOUT_MS: '5000',
-      META_MEDIA_DOWNLOAD_TIMEOUT_MS: '30000',
-      RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
-      RECEIPT_STORAGE_REGION: 'us-east-1',
-      RECEIPT_STORAGE_BUCKET: 'test-receipts',
-      RECEIPT_STORAGE_ACCESS_KEY_ID: 'test-key',
-      RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'test-secret',
-      RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
-      RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
-      RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
-      RECEIPT_MEDIA_WORKER_POLL_MS: '59000',
-      CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
-      RECEIPT_CAPABILITY_KEYS: '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=',
-      RECEIPT_CAPABILITY_ACTIVE_VERSION: '1',
-    });
-  }
-  if (metricsEnabled) {
-    process.env.RECEIPT_MEDIA_METRICS_ENABLED = 'true';
-    if (metricsToken !== undefined) {
-      process.env.RECEIPT_MEDIA_METRICS_TOKEN = metricsToken;
-    }
+  // Receipt media is always on: keep the background drains' next poll far
+  // from the request window.
+  process.env.RECEIPT_MEDIA_WORKER_POLL_MS = '59000';
+  if (metricsToken !== undefined) {
+    process.env.RECEIPT_MEDIA_METRICS_TOKEN = metricsToken;
   }
 }
 
 /** Builds the receipt module graph, binds an ephemeral loopback listener. */
-async function buildApp(
-  metricsEnabled: boolean,
-  metricsToken: string | undefined,
-  admissionEnabled = false,
-): Promise<{
+async function buildApp(metricsToken: string | undefined): Promise<{
   app: INestApplication;
   port: number;
   boundaryCalls: jest.Mock[];
 }> {
-  applyReceiptEnv(metricsEnabled, metricsToken, admissionEnabled);
+  applyReceiptEnv(metricsToken);
   const pool = stubPool();
-  const backend = { attachReceipt: jest.fn() };
+  const backend = {
+    uploadReceipt: jest.fn(),
+    getReceiptOutcome: jest.fn(),
+  };
   const sender = { sendText: jest.fn() };
   const media = { resolveAndDownload: jest.fn() };
-  const storage = {
-    put: jest.fn(),
-    getStream: jest.fn(),
-    head: jest.fn(),
-    deleteTechnicalObject: jest.fn(),
-  };
 
   const builder = Test.createTestingModule({
     imports: [
@@ -176,14 +143,14 @@ async function buildApp(
     .overrideProvider(WHATSAPP_SENDER)
     .useValue(sender)
     .overrideProvider(META_MEDIA)
-    .useValue(media)
-    .overrideProvider(OBJECT_STORAGE_PORT)
-    .useValue(storage);
+    .useValue(media);
 
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
   try {
     await app.listen(0, '127.0.0.1');
+    // Let the always-on drains finish their boot pass before any snapshot.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     const { port } = (
       app.getHttpServer() as http.Server
     ).address() as AddressInfo;
@@ -194,10 +161,10 @@ async function buildApp(
         pool.query,
         pool.connect,
         pool.client.query,
-        backend.attachReceipt,
+        backend.uploadReceipt,
+        backend.getReceiptOutcome,
         sender.sendText,
         media.resolveAndDownload,
-        ...Object.values(storage),
       ],
     };
   } catch (error) {
@@ -214,19 +181,15 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     Object.assign(process.env, baseEnv);
   });
 
-  describe('metrics + admission flag matrix', () => {
+  describe('metrics token matrix', () => {
     it.each([
-      [false, false, 404],
-      [false, true, 404],
-      [true, false, 200],
-      [true, true, 200],
+      [false, 404],
+      [true, 200],
     ] as const)(
-      'metrics=%s admission=%s returns %i without scrape-caused I/O',
-      async (metrics, admission, expectedStatus) => {
+      'token=%s returns %i without scrape-caused I/O',
+      async (metrics, expectedStatus) => {
         const { app, port, boundaryCalls } = await buildApp(
-          metrics,
-          FIXED_TOKEN,
-          admission,
+          metrics ? FIXED_TOKEN : undefined,
         );
         try {
           const before = boundaryCalls.map((spy) => spy.mock.calls.length);
@@ -253,14 +216,14 @@ describe('ReceiptMetricsController (behavior spec)', () => {
       },
     );
 
-    it('rejects boot when metrics are enabled without a configured token', async () => {
-      await expect(buildApp(true, undefined)).rejects.toThrow(
+    it('rejects boot when a malformed token is configured', async () => {
+      await expect(buildApp('not-a-hex-token')).rejects.toThrow(
         /RECEIPT_MEDIA_METRICS_TOKEN/,
       );
     });
 
-    it('returns 404 when metrics are disabled', async () => {
-      const { app, port } = await buildApp(false, undefined);
+    it('returns 404 when no token is configured', async () => {
+      const { app, port } = await buildApp(undefined);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -274,7 +237,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     });
 
     it('returns 401 when token is missing', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -288,7 +251,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     });
 
     it('returns 401 when token is wrong', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -303,7 +266,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     });
 
     it('returns 200 when token is correct', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -321,7 +284,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
 
   describe('authentication — token only via Authorization header', () => {
     it('returns 401 when token is sent only as query parameter', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -335,7 +298,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     });
 
     it('returns 401 when token is sent only as a cookie', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -355,7 +318,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
       // FIXED_UPPER_TOKEN uses uppercase A-F digits. Configure with it, then
       // send the lowercased version. The guard must reject because the token
       // bytes differ after SHA-256 hashing.
-      const { app, port } = await buildApp(true, FIXED_UPPER_TOKEN);
+      const { app, port } = await buildApp(FIXED_UPPER_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -371,7 +334,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     });
 
     it('accepts uppercase hex when configured token is uppercase', async () => {
-      const { app, port } = await buildApp(true, FIXED_UPPER_TOKEN);
+      const { app, port } = await buildApp(FIXED_UPPER_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -388,7 +351,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
 
   describe('response headers', () => {
     it('sets Content-Type and Cache-Control: no-store on 200', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',
@@ -416,7 +379,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
     });
 
     it('does NOT serialize metrics when guard denies with wrong token', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       const serialize = jest.spyOn(Registry.prototype, 'metrics');
       try {
         const res = await httpGet(
@@ -434,8 +397,8 @@ describe('ReceiptMetricsController (behavior spec)', () => {
       }
     });
 
-    it('does NOT serialize metrics when metrics are disabled', async () => {
-      const { app, port } = await buildApp(false, undefined);
+    it('does NOT serialize metrics when no token is configured', async () => {
+      const { app, port } = await buildApp(undefined);
       const serialize = jest.spyOn(Registry.prototype, 'metrics');
       try {
         const res = await httpGet(
@@ -444,7 +407,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
           '/internal/receipt-media/metrics',
         );
         expect(res.statusCode).toBe(HttpStatus.NOT_FOUND);
-        // The disabled guard rejects before reaching the controller.
+        // Without a token the guard rejects before reaching the controller.
         expect(serialize).not.toHaveBeenCalled();
         expect(res.body).not.toContain('receipt_media_metrics_enabled');
         expect(res.body).not.toContain('receipt_outbox_tx2');
@@ -456,7 +419,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
 
   describe('serialization error → 503', () => {
     it('returns 503 with safe body when the real adapter Registry rejects', async () => {
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       expect(app.get(RECEIPT_TELEMETRY)).toBeInstanceOf(
         PrometheusReceiptTelemetry,
       );
@@ -487,7 +450,7 @@ describe('ReceiptMetricsController (behavior spec)', () => {
   describe('controller composition', () => {
     it('controller resolves and serves metrics with one module import', async () => {
       // Duplicate-import identity is exercised in receipt-media.module.spec.ts.
-      const { app, port } = await buildApp(true, FIXED_TOKEN);
+      const { app, port } = await buildApp(FIXED_TOKEN);
       try {
         const res = await httpGet(
           '127.0.0.1',

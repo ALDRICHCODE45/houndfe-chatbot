@@ -1,20 +1,34 @@
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { CheckoutContextAddress } from '../../chatbot-api/domain/dtos/checkout-context.dto';
+import {
+  CUSTOMER_PHONE_AMBIGUOUS,
+  DUPLICATE_CART_LINE,
+  INVALID_SHIPPING_DESTINATION,
+  NO_SHIPPING_BOX_FITS,
+  PACKAGING_DATA_MISSING,
+  PRICE_OUT_OF_DATE,
+  PRODUCT_NOT_FOUND,
+  SHIPPING_ADDRESS_INCOMPLETE,
+  SHIPPING_ADDRESS_NOT_FOUND,
+  SHIPPING_ORIGIN_NOT_CONFIGURED,
+  SHIPPING_QUOTE_UNAVAILABLE,
+  VARIANT_NOT_FOUND,
+  type ShippingQuoteResponse,
+} from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
-import type { MeasuredDemoShippingConfig } from '../../shipping/application/measured-demo-shipping-config';
-import type { ShippingQuoteProviderResult } from '../../shipping/domain/shipping-quote.port';
-import type { ShippingQuoteRequest } from '../../shipping/domain/shipping-quote.request';
-import { MinimalCartService } from './minimal-cart.service';
+import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 import { MinimalShippingService } from './minimal-shipping.service';
-import { decideApproval, shippingDigest } from './minimal-shipping-approval';
-import { parseMinimalCart } from './minimal-cart.service';
 import { minimalShippingDestination } from '../domain/minimal-shipping';
 
 const SENDER = '5215550001111';
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
 const CUSTOMER = '22222222-2222-4222-8222-222222222222';
 const ADDRESS = '33333333-3333-4333-8333-333333333333';
+const NOW = Date.parse('2026-11-05T12:00:00.000Z');
+const EXPIRES = '2026-11-05T12:30:00.000Z';
 const event = (messageId: string) => ({
   receivingPhoneNumberId: '123456789012345',
   senderId: SENDER,
@@ -35,49 +49,35 @@ const address: CheckoutContextAddress = {
   visualReferences: null,
   carrierPhone: null,
 };
-const config: MeasuredDemoShippingConfig = {
-  origin: {
-    postalCode: '06000',
-    state: 'Ciudad de México',
-    municipality: 'Cuauhtémoc',
-    neighborhood: 'Centro',
-  },
-  profile: {
-    version: 1,
-    items: [
-      {
-        productId: PRODUCT,
-        variantId: null,
-        quantity: 2,
-        measurement: {
-          weightGrams: 100,
-          lengthCm: 10,
-          widthCm: 10,
-          heightCm: 10,
-        },
-      },
-    ],
-    parcel: { weightGrams: 200, lengthCm: 20, widthCm: 20, heightCm: 20 },
-  },
-};
-const quoted: ShippingQuoteProviderResult = {
-  kind: 'quoted',
-  quoteId: 'q1',
-  expiresAt: null,
-  rates: [
-    {
-      rateId: 'r1',
-      carrierName: 'Carrier',
-      serviceName: 'Ground',
-      priceCents: 20000,
-      currency: 'MXN',
-      estimatedDeliveryDays: 3,
-      validUntil: null,
-    },
-  ],
-};
+const backendQuote = (
+  overrides: Record<string, unknown> = {},
+): ShippingQuoteResponse => ({
+  quoteId: 'quote-1',
+  expiresAt: EXPIRES,
+  zoneStatus: 'CARRIER_ONLY',
+  option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 },
+  costCents: 20000,
+  creditCents: 0,
+  customerChargeCents: 20000,
+  currency: 'MXN',
+  eta: { days: 3, reason: null },
+  ...overrides,
+});
+/** Backend PENDING/DENIED: nothing stored, so no quoteId, expiry or amounts. */
+const undeliverable = (zoneStatus: 'PENDING' | 'DENIED') =>
+  backendQuote({
+    zoneStatus,
+    quoteId: null,
+    expiresAt: null,
+    option: null,
+    eta: { days: null, reason: null },
+    costCents: 0,
+    creditCents: 0,
+    customerChargeCents: 0,
+  });
+
 // prettier-ignore
-async function setup(price = 1500, measured: MeasuredDemoShippingConfig | null = config) {
+async function setup(price = 1500) {
   const store = new InMemoryConversationStore();
   const api = {
     searchCatalog: jest.fn(async () => [{ productId: PRODUCT, name: 'Producto', price: { priceCents: price }, variants: [] }]),
@@ -92,13 +92,9 @@ async function setup(price = 1500, measured: MeasuredDemoShippingConfig | null =
   const client = api as unknown as ChatbotApiClient;
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
-  const provider = { quote: jest.fn((request: ShippingQuoteRequest): Promise<ShippingQuoteProviderResult> => { void request; return Promise.resolve(quoted); }) };
-  const handoff = { create: jest.fn(async () => {
-    const date = new Date().toISOString();
-    await store.setPendingHumanRequest(SENDER, { requestId: 'abcdef123456', ref: 'HF-abcdef123456', createdAt: date, customerNotifiedAt: date }, date);
-    return { ok: true as const, requestId: 'abcdef123456', ref: 'HF-abcdef123456', customerNotified: true as const };
-  }) };
-  const service = new MinimalShippingService(store, cart, checkout, provider, measured, handoff);
+  const quotes = new FakeShippingQuoteClient();
+  const zones = { register: jest.fn<Promise<void>, [unknown]>(async () => undefined) };
+  const service = new MinimalShippingService(store, cart, checkout, quotes, zones, () => NOW);
   await store.create(SENDER, { lastMessageAt: new Date().toISOString(), data: {
     minimalCart: { items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: price }], idempotencyKey: '', expectedTotalCents: price * 2 },
     legacy: { untouched: true },
@@ -116,96 +112,155 @@ async function setup(price = 1500, measured: MeasuredDemoShippingConfig | null =
     const ok = await store.commitMinimalCart(SENDER, state.data.minimalCart, { ...(state.data.minimalCart as object), ...patch }, new Date().toISOString());
     if (!ok) throw new Error('fixture CAS failed');
   };
-  return { store, api, cart, checkout, provider, service, handoff, confirm, changeCart };
+  const stored = async () => parseMinimalCart((await store.get(SENDER))?.data.minimalCart)!.shipping;
+  return { store, api, cart, checkout, quotes, zones, service, confirm, changeCart, stored };
 }
 
 // prettier-ignore
-describe('MinimalShippingService (T3)', () => {
-  it('[S1,S2,S4] successful quote connects to human approval without returning money', async () => {
-    const h = await setup(50001); await h.confirm();
-    const handoff = { create: jest.fn(async () => ({ ok: true as const, requestId: 'abcdef123456', ref: 'HF-abcdef123456', customerNotified: true as const })) };
-    const service = new MinimalShippingService(h.store, h.cart, h.checkout, h.provider, config, handoff);
-    expect(await service.quote(SENDER)).toEqual({ kind: 'quoted', classification: 'free' });
-    expect(handoff.create).toHaveBeenCalledTimes(1);
-    expect((await h.store.get(SENDER))!.data.minimalCart).toMatchObject({ shipping: { approval: { state: 'pending', requestId: 'abcdef123456' } } });
-  });
-  it.each([[1500, 'charged', 20000], [50001, 'free', 0]] as const)('[S1,S2,S5,S6] quotes %s with pending approval and no money disclosure', async (price, classification, customerPaysCents) => {
-    const h = await setup(price); await h.confirm();
-    const commit = jest.spyOn(h.store, 'commitMinimalCart');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'quoted', classification });
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-    expect(h.provider.quote.mock.calls[0]?.[0]).toEqual({
-      origin: { countryCode: 'MX', ...config.origin },
-      destination: { countryCode: 'MX', postalCode: '06000', state: address.state, municipality: address.city, neighborhood: address.neighborhood },
-      parcels: [config.profile.parcel],
+describe('MinimalShippingService (U3: backend-signed quote)', () => {
+  it('[S1,S3] one createShippingQuote call for a saved address; stores and returns the backend amounts', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote({ costCents: 30000, creditCents: 24000, customerChargeCents: 6000 }));
+    expect(await h.service.quote(SENDER)).toEqual({
+      kind: 'quoted', zoneStatus: 'CARRIER_ONLY', costCents: 30000, creditCents: 24000, customerChargeCents: 6000,
+      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 }, eta: { days: 3, reason: null }, zipCode: '06000',
     });
-    expect(commit).toHaveBeenCalledTimes(2);
+    expect(h.quotes.calls).toEqual([{
+      items: [{ productId: PRODUCT, quantity: 2 }],
+      phoneCountryCode: '52', phone: '5550001111',
+      destination: { shippingAddressId: ADDRESS },
+    }]);
     const data = (await h.store.get(SENDER))!.data;
-    expect(data.minimalCart).toMatchObject({ shipping: { customerPaysCents, approval: { state: 'pending', requestId: 'abcdef123456' } } });
     expect(data.legacy).toEqual({ untouched: true });
-    expect(data.pendingHumanRequest).toMatchObject({ requestId: 'abcdef123456' });
-    expect(data).not.toHaveProperty('shippingApproval');
-  });
-  it('[S4] supplies the identical raw stored value as CAS expectation', async () => {
-    const h = await setup(); await h.confirm();
-    const get = jest.spyOn(h.store, 'get'); const commit = jest.spyOn(h.store, 'commitMinimalCart');
-    await h.service.quote(SENDER);
-    const first = await get.mock.results[0].value as Awaited<ReturnType<typeof h.store.get>>;
-    expect(commit.mock.calls[0][1]).toBe(first!.data.minimalCart);
-  });
-  it('[S4] refuses fresh price drift', async () => {
-    const h = await setup(); await h.confirm(); await h.changeCart({ items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1499 }] });
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
-  });
-  it('[S1,S6] refuses expired provider quote without persistence', async () => {
-    const h = await setup(); await h.confirm();
-    if (quoted.kind !== 'quoted') throw new Error('fixture');
-    h.provider.quote.mockResolvedValueOnce({ ...quoted, expiresAt: '2020-01-01T00:00:00.000Z' });
-    const commit = jest.spyOn(h.store, 'commitMinimalCart');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'quote_expired' });
-    expect(commit).not.toHaveBeenCalled();
-  });
-  it('[S4] rejects delivery drift during provider latency', async () => {
-    const h = await setup(); await h.confirm();
-    h.provider.quote.mockImplementationOnce(async () => {
-      await h.checkout.updateDetails(SENDER, { ...address, firstName: 'Changed', lastName: null, useNewAddress: true });
-      return quoted;
+    expect(data).not.toHaveProperty('pendingHumanRequest');
+    expect(await h.stored()).toEqual({
+      quoteId: 'quote-1', expiresAt: EXPIRES, zoneStatus: 'CARRIER_ONLY',
+      option: { carrier: 'Skydropx', service: 'Ground', etaDays: 3 },
+      costCents: 30000, creditCents: 24000, customerChargeCents: 6000, currency: 'MXN', eta: { days: 3, reason: null },
+      destinationPin: { kind: 'saved', addressId: ADDRESS, version: address.version },
+      cartPin: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1500, finalPriceCents: 3000 }],
     });
+  });
+
+  it.each([
+    ['FREE', { kind: 'quoted' }],
+    ['SURCHARGE', { kind: 'quoted' }],
+    ['CARRIER_ONLY', { kind: 'quoted' }],
+    ['PENDING', { kind: 'zone_pending', zipCode: '06000' }],
+    ['DENIED', { kind: 'zone_denied', zipCode: '06000' }],
+  ] as const)('stores the %s quote and returns its kind', async (zoneStatus, expected) => {
+    const h = await setup(); await h.confirm();
+    const deliverable = zoneStatus !== 'PENDING' && zoneStatus !== 'DENIED';
+    h.quotes.enqueue(deliverable ? backendQuote({ zoneStatus, ...(zoneStatus === 'CARRIER_ONLY' ? {} : { option: null }) }) : undeliverable(zoneStatus));
+    expect(await h.service.quote(SENDER)).toMatchObject(expected);
+    expect(await h.stored()).toMatchObject({ zoneStatus, quoteId: deliverable ? 'quote-1' : null, expiresAt: deliverable ? EXPIRES : null });
+  });
+
+  it('[S5] a PENDING zone registers the sender with the saved address fields', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(undeliverable('PENDING'));
+    expect(await h.service.quote(SENDER)).toMatchObject({ kind: 'zone_pending' });
+    expect(h.zones.register).toHaveBeenCalledTimes(1);
+    expect(h.zones.register).toHaveBeenCalledWith({
+      senderId: SENDER, zipCode: '06000', state: 'Ciudad de México',
+      municipality: 'Cuauhtémoc', neighborhood: 'Centro',
+    });
+  });
+
+  it('[S5] a failing zone intake still returns the PENDING answer', async () => {
+    const h = await setup(); await h.confirm();
+    h.zones.register.mockRejectedValueOnce(new Error('down'));
+    h.quotes.enqueue(undeliverable('PENDING'));
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'zone_pending', zipCode: '06000' });
+  });
+
+  it.each(['FREE', 'DENIED'] as const)('[S5] a %s zone registers nothing', async (zoneStatus) => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(zoneStatus === 'DENIED' ? undeliverable('DENIED') : backendQuote({ zoneStatus, option: null }));
+    await h.service.quote(SENDER);
+    expect(h.zones.register).not.toHaveBeenCalled();
+  });
+
+  it('[S7] keeps the STOCK_PENDING eta in the stored quote and the result', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote({ eta: { days: null, reason: 'STOCK_PENDING' } }));
+    expect(await h.service.quote(SENDER)).toMatchObject({ kind: 'quoted', eta: { days: null, reason: 'STOCK_PENDING' } });
+    expect(await h.stored()).toMatchObject({ eta: { days: null, reason: 'STOCK_PENDING' } });
+  });
+
+  it.each([
+    [PRICE_OUT_OF_DATE, 'prices_changed'],
+    [PRODUCT_NOT_FOUND, 'cart_invalid'],
+    [VARIANT_NOT_FOUND, 'cart_invalid'],
+    [DUPLICATE_CART_LINE, 'cart_invalid'],
+    [SHIPPING_ADDRESS_NOT_FOUND, 'address_invalid'],
+    [SHIPPING_ADDRESS_INCOMPLETE, 'address_invalid'],
+    [INVALID_SHIPPING_DESTINATION, 'address_invalid'],
+    [CUSTOMER_PHONE_AMBIGUOUS, 'phone_ambiguous'],
+    [PACKAGING_DATA_MISSING, 'packaging_missing'],
+    [NO_SHIPPING_BOX_FITS, 'unavailable'],
+    [SHIPPING_ORIGIN_NOT_CONFIGURED, 'unavailable'],
+    [SHIPPING_QUOTE_UNAVAILABLE, 'unavailable'],
+    ['SOMETHING_ELSE', 'unavailable'],
+  ] as const)('%s → %s without persistence', async (code, kind) => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(new ChatbotApiError('quote', 422, {}, code));
     const commit = jest.spyOn(h.store, 'commitMinimalCart');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'address_changed' });
+    expect(await h.service.quote(SENDER)).toEqual({ kind });
     expect(commit).not.toHaveBeenCalled();
   });
-  it('[S1,S5] refuses a mismatched measured profile', async () => {
-    const h = await setup(1500, { ...config, profile: { ...config.profile, items: [{ ...config.profile.items[0], productId: CUSTOMER }] } }); await h.confirm();
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'measurements_unavailable' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+
+  it('an already expired backend quote is unavailable and not stored', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote({ expiresAt: new Date(NOW).toISOString() }));
+    const commit = jest.spyOn(h.store, 'commitMinimalCart');
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'unavailable' });
+    expect(commit).not.toHaveBeenCalled();
   });
-  it('[S1] refuses unconfirmed delivery', async () => {
-    const h = await setup();
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'delivery_unconfirmed' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+
+  it('[S2] a requote replaces the stored quote', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(backendQuote()).enqueue(backendQuote({ quoteId: 'quote-2', customerChargeCents: 1000 }));
+    await h.service.quote(SENDER);
+    await h.service.quote(SENDER);
+    expect(await h.stored()).toMatchObject({ quoteId: 'quote-2', customerChargeCents: 1000 });
   });
-  it.each([[1500, 'charged', 20000], [50001, 'free', 0]] as const)('[S5] quotes a confirmed NEW address with unchanged approval (%s)', async (price, classification, customerPaysCents) => {
-    const h = await setup(price); await h.confirm();
+
+  it('[U1b] a PENDING answer with null expiresAt is stored, not treated as expired', async () => {
+    const h = await setup(); await h.confirm();
+    h.quotes.enqueue(undeliverable('PENDING'));
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'zone_pending', zipCode: '06000' });
+    expect(await h.stored()).toMatchObject({ zoneStatus: 'PENDING', quoteId: null, expiresAt: null });
+  });
+
+  it('sends the confirmed NEW address as exactly the four loose fields', async () => {
+    const h = await setup(); await h.confirm();
     await h.checkout.updateDetails(SENDER, { ...address, firstName: null, lastName: null, useNewAddress: true });
     const offer = await h.checkout.prepareConfirmation(SENDER, event('n1')); offer.onSent?.();
     await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('n2') });
     expect((await h.checkout.confirmedDraft(SENDER))?.address.kind).toBe('new');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'quoted', classification });
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-    expect(h.provider.quote.mock.calls[0][0].destination).toEqual({ countryCode: 'MX', postalCode: address.zipCode, state: address.state, municipality: address.city, neighborhood: address.neighborhood });
-    const shipping = parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!;
-    expect(shipping).toMatchObject({ destination: { kind: 'new' }, customerPaysCents, approval: { state: 'pending', requestId: 'abcdef123456' } });
-    expect(shipping).toHaveProperty('destination.fingerprint', expect.stringMatching(/^[a-f0-9]{64}$/));
-    expect(h.handoff.create.mock.calls[0]).toEqual([{ senderId: SENDER, kind: 'shipping_approval', digest: shippingDigest(shipping) }]);
-    expect(JSON.stringify(shippingDigest(shipping))).not.toMatch(/Juárez|06000|521555|fingerprint/);
-    const decision = await decideApproval(h.store, SENDER, 'abcdef123456', shippingDigest(shipping), 'approved', Date.now());
-    expect(decision?.state).toBe('approved');
-    expect(decision?.reply).toContain(classification === 'free' ? 'envío cubierto' : '$200.00');
-    expect(parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!.approval.state).toBe('approved');
+    h.quotes.enqueue(backendQuote());
+    expect(await h.service.quote(SENDER)).toMatchObject({ kind: 'quoted' });
+    expect(h.quotes.calls[0].destination).toEqual({
+      zipCode: '06000', state: 'Ciudad de México', municipality: 'Cuauhtémoc', neighborhood: 'Centro',
+    });
+    expect(await h.stored()).toMatchObject({ destinationPin: { kind: 'new' } });
   });
-  it('quotes and fingerprints the corrected saved ZIP, not the base snapshot', async () => {
+
+  it('[S5] a PENDING zone for a NEW address registers the quoted loose fields', async () => {
+    const h = await setup(); await h.confirm();
+    await h.checkout.updateDetails(SENDER, { ...address, zipCode: '55635', firstName: null, lastName: null, useNewAddress: true });
+    const offer = await h.checkout.prepareConfirmation(SENDER, event('z1')); offer.onSent?.();
+    await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('z2') });
+    h.quotes.enqueue(undeliverable('PENDING'));
+    await h.service.quote(SENDER);
+    expect(h.zones.register).toHaveBeenCalledWith({
+      senderId: SENDER, zipCode: '55635', state: 'Ciudad de México',
+      municipality: 'Cuauhtémoc', neighborhood: 'Centro',
+    });
+  });
+
+  it('sends the corrected saved ZIP as loose fields and pins the corrected content', async () => {
     const h = await setup(); await h.confirm();
     await h.checkout.updateDetails(SENDER, {
       label: null, street: null, exteriorNumber: null, interiorNumber: null,
@@ -216,74 +271,119 @@ describe('MinimalShippingService (T3)', () => {
     const offer = await h.checkout.prepareConfirmation(SENDER, event('c1')); offer.onSent?.();
     await h.checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('c2') });
     expect((await h.checkout.confirmedDraft(SENDER))?.address.kind).toBe('savedCorrected');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'quoted', classification: 'charged' });
-    expect(h.provider.quote.mock.calls[0][0].destination.postalCode).toBe('55635');
-    const record = parseMinimalCart((await h.store.get(SENDER))?.data.minimalCart)!.shipping!;
-    expect(record).toMatchObject({ destination: { kind: 'new' } });
+    h.quotes.enqueue(backendQuote());
+    await h.service.quote(SENDER);
+    expect(h.quotes.calls[0].destination).toMatchObject({ zipCode: '55635' });
+    expect(h.quotes.calls[0].destination).not.toHaveProperty('shippingAddressId');
     const { id: _id, version: _version, ...fields } = address; void _id; void _version;
-    expect('destination' in record && record.destination).toEqual(minimalShippingDestination({ kind: 'new', fields: { ...fields, zipCode: '55635' } }));
-    expect('destination' in record && record.destination).not.toEqual(minimalShippingDestination({ kind: 'new', fields }));
+    expect(await h.stored()).toMatchObject({ destinationPin: minimalShippingDestination({ kind: 'new', fields: { ...fields, zipCode: '55635' } }) });
   });
-  it('[S4] refuses outstanding uncertain-order lock', async () => {
+
+  it('refuses unconfirmed delivery without calling the backend', async () => {
+    const h = await setup();
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'delivery_unconfirmed' });
+    expect(h.quotes.calls).toHaveLength(0);
+  });
+
+  it('refuses an incomplete destination without calling the backend', async () => {
+    const h = await setup(); await h.confirm();
+    const draft = (await h.checkout.confirmedDraft(SENDER))!;
+    jest.spyOn(h.checkout, 'confirmedDraft').mockResolvedValue({ ...draft, address: { kind: 'new', fields: { ...address, label: null, zipCode: null } } });
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'unsupported_destination' });
+    expect(h.quotes.calls).toHaveLength(0);
+  });
+
+  it('refuses an outstanding uncertain-order lock', async () => {
     const h = await setup(); await h.confirm();
     await h.changeCart({ idempotencyKey: CUSTOMER });
     expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'order_unresolved' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
   });
-  it.each(['provider_failure', 'no_rates'] as const)('[S1,S5] fails closed on %s', async reason => {
+
+  it('refuses fresh price drift before quoting', async () => {
+    const h = await setup(); await h.confirm(); await h.changeCart({ items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1499 }] });
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
+    expect(h.quotes.calls).toHaveLength(0);
+  });
+
+  it('CAS rejects a concurrent cart edit during the backend call', async () => {
     const h = await setup(); await h.confirm();
-    if (reason === 'provider_failure') h.provider.quote.mockRejectedValueOnce(new Error('secret'));
-    else h.provider.quote.mockResolvedValueOnce({ kind: 'error', error: { kind: 'no_rates' } });
+    jest.spyOn(h.quotes, 'createShippingQuote').mockImplementationOnce(async () => { await h.changeCart({ expectedTotalCents: 1 }); return backendQuote(); });
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
+  });
+
+  it('rejects a delivery change during the backend call', async () => {
+    const h = await setup(); await h.confirm();
+    jest.spyOn(h.quotes, 'createShippingQuote').mockImplementationOnce(async () => {
+      await h.checkout.updateDetails(SENDER, { ...address, firstName: 'Changed', lastName: null, useNewAddress: true });
+      return backendQuote();
+    });
     const commit = jest.spyOn(h.store, 'commitMinimalCart');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason });
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'address_changed' });
     expect(commit).not.toHaveBeenCalled();
   });
-  it('[S4] CAS false never retries or requotes', async () => {
+
+  it.each(['reselect', 'unavailable'] as const)('refuses saved address revalidation %s', async result => {
     const h = await setup(); await h.confirm();
-    const commit = jest.spyOn(h.store, 'commitMinimalCart').mockResolvedValue(false);
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
-    expect(commit).toHaveBeenCalledTimes(1); expect(h.provider.quote).toHaveBeenCalledTimes(1);
+    jest.spyOn(h.checkout, 'revalidateSelection').mockResolvedValue(result);
+    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: result === 'reselect' ? 'address_changed' : 'address_unverified' });
+    expect(h.quotes.calls).toHaveLength(0);
   });
-  it('[S4] rejects cart drift before provider call', async () => {
-    const h = await setup(); await h.confirm();
-    const view = h.cart.view.bind(h.cart);
-    jest.spyOn(h.cart, 'view').mockImplementationOnce(async sender => {
-      const quote = await view(sender); await h.changeCart({ items: [{ productId: PRODUCT, quantity: 1, unitPriceCents: 1500 }] }); return quote;
-    });
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
-  });
-  it('[S4] CAS rejects a concurrent edit during provider call', async () => {
-    const h = await setup(); await h.confirm();
-    h.provider.quote.mockImplementationOnce(async () => { await h.changeCart({ expectedTotalCents: 1 }); return quoted; });
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
-    expect(h.provider.quote).toHaveBeenCalledTimes(1);
-  });
-  it.each(['empty_cart', 'promotion_review', 'cart_unverified'] as const)('[S1,S4] refuses %s', async reason => {
+
+  it.each(['empty_cart', 'promotion_review', 'cart_unverified'] as const)('refuses %s', async reason => {
     const h = await setup(); await h.confirm();
     if (reason === 'empty_cart') await h.changeCart({ items: [] });
     if (reason === 'promotion_review') h.api.evaluateCart.mockResolvedValueOnce({ items: [{ productId: PRODUCT, variantId: null, quantity: 2, unitPriceCents: 1500, originalPriceCents: 3000, finalPriceCents: 3000, discountAmountCents: 0, appliedPromotionTitle: null }], promotionEvaluationStatus: 'needs_human_review' });
     if (reason === 'cart_unverified') h.api.getStock.mockRejectedValueOnce(new Error('offline'));
     expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    expect(h.quotes.calls).toHaveLength(0);
   });
-  it('[S1] refuses unsupported destination without provider call', async () => {
+});
+
+// prettier-ignore
+describe('MinimalShippingService.chooseStorePickup (U4, S4)', () => {
+  const pin = [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1500, finalPriceCents: 3000 }];
+  it('[S4] stores a pickup choice pinned to the verified cart without calling the quote backend', async () => {
+    const h = await setup();
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'pickup' });
+    expect(await h.stored()).toEqual({ mode: 'pickup', cartPin: pin });
+    expect(h.quotes.calls).toHaveLength(0);
+    expect((await h.store.get(SENDER))!.data.legacy).toEqual({ untouched: true });
+  });
+  it('[S4,S5] replaces a DENIED or PENDING zone answer', async () => {
     const h = await setup(); await h.confirm();
-    const draft = (await h.checkout.confirmedDraft(SENDER))!;
-    jest.spyOn(h.checkout, 'confirmedDraft').mockResolvedValue({ ...draft, address: { kind: 'saved', snapshot: { ...address, zipCode: null } } });
-    jest.spyOn(h.checkout, 'revalidateSelection').mockResolvedValue('ok');
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'unsupported_destination' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+    h.quotes.enqueue(undeliverable('DENIED'));
+    await h.service.quote(SENDER);
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'pickup' });
+    expect(await h.stored()).toEqual({ mode: 'pickup', cartPin: pin });
   });
-  it('[S1,S5] requires the exact measured profile', async () => {
-    const h = await setup(1500, null); await h.confirm();
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: 'measurements_unavailable' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+  it('[S4] a cart change drops the pickup choice', async () => {
+    const h = await setup();
+    await h.service.chooseStorePickup(SENDER);
+    const changed = await h.cart.setItem(SENDER, { productId: PRODUCT, quantity: 3 }, new Set([PRODUCT]));
+    expect(changed.ok).toBe(true);
+    expect(await h.stored()).toBeUndefined();
   });
-  it.each(['reselect', 'unavailable'] as const)('[S4] refuses saved address revalidation %s', async result => {
-    const h = await setup(); await h.confirm();
-    jest.spyOn(h.checkout, 'revalidateSelection').mockResolvedValue(result);
-    expect(await h.service.quote(SENDER)).toEqual({ kind: 'refused', reason: result === 'reselect' ? 'address_changed' : 'address_unverified' });
-    expect(h.provider.quote).not.toHaveBeenCalled();
+  it('refuses an outstanding uncertain-order lock', async () => {
+    const h = await setup();
+    await h.changeCart({ idempotencyKey: CUSTOMER });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'order_unresolved' });
+  });
+  it('refuses fresh price drift and an empty cart', async () => {
+    const h = await setup();
+    await h.changeCart({ items: [{ productId: PRODUCT, quantity: 2, unitPriceCents: 1499 }] });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
+    await h.changeCart({ items: [], expectedTotalCents: 0 });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'empty_cart' });
+    expect(await h.stored()).toBeUndefined();
+  });
+  it('CAS rejects a concurrent cart edit while verifying prices', async () => {
+    const h = await setup();
+    h.api.evaluateCart.mockImplementationOnce(async (items: Array<{ quantity: number }>) => {
+      await h.changeCart({ expectedTotalCents: 1 });
+      return { items: items.map(item => ({ productId: PRODUCT, variantId: null, quantity: item.quantity, unitPriceCents: 1500, originalPriceCents: 1500 * item.quantity, finalPriceCents: 1500 * item.quantity, discountAmountCents: 0, appliedPromotionTitle: null })), promotionEvaluationStatus: 'fully_evaluated' };
+    });
+    expect(await h.service.chooseStorePickup(SENDER)).toEqual({ kind: 'refused', reason: 'cart_changed' });
+    expect(await h.stored()).toBeUndefined();
   });
 });

@@ -1,28 +1,28 @@
 # Minimal order placement
 
-`MinimalOrderService` lets an allowlisted WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
+`MinimalOrderService` lets any WhatsApp customer turn the minimal cart into a **real backend ONLINE sale** after explicit consent, then sends the transfer payment details.
 
-It is **off by default** and not ready for production. Optional [minimal shipping](minimal-shipping.md) now quotes and binds approved freight. Placement can go through the backend atomic checkout behind its own default-off switch ([below](#atomic-checkout-switch)); that backend endpoint is not deployed yet, and production shipping prerequisites remain unresolved.
+It is **always on**: the minimal route serves every sender and always exposes `prepareOrder`. Every order needs [minimal shipping](minimal-shipping.md) (always on): a backend-signed shipping quote or a store pickup choice. Placement always goes through the backend [atomic checkout](#atomic-checkout) (`POST /chatbot-api/checkouts`).
 
-## Enable it (test environments only)
+## Requirements
 
-| Variable                                  | Required value        | Why                                                                                               |
-| ----------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------- |
-| `MINIMAL_CATALOG_AGENT_ENABLED`           | `true`                | The minimal SDK route itself.                                                                     |
-| `MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS`   | test senders          | Only these WhatsApp senders reach the route.                                                      |
-| `MINIMAL_CATALOG_ORDER_ENABLED`           | `true`                | Exposes `prepareOrder`; any other value keeps it hidden.                                          |
-| `CHATBOT_API_CASHIER_USER_ID`             | bot cashier `User.id` | Server-owned `cashierUserId`; empty disables ordering.                                            |
-| `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED` | `true` (optional)     | Places orders via `POST /chatbot-api/checkouts`; any other value keeps `POST /chatbot-api/sales`. |
+| Variable                      | Required value        | Why                                  |
+| ----------------------------- | --------------------- | ------------------------------------ |
+| `CHATBOT_API_CASHIER_USER_ID` | bot cashier `User.id` | Server-owned `cashierUserId` (UUID). |
+
+There is no enable flag or sender allowlist.
+
+The service credential needs `customers:write` and `sales:create` for `POST /chatbot-api/checkouts` and `GET /chatbot-api/checkouts/status`.
 
 The store must implement `commitMinimalCart` and `commitMinimalCheckoutDraft`.
 
-## Who can order in this slice
+## Who can order
 
-- A **unique** registered customer, found by the trusted WhatsApp number.
-- A **saved** address, selected and confirmed through the checkout flow (`docs/minimal-checkout-coordinator.md`).
+- A **unique** registered customer with a **saved** address, selected and confirmed through the checkout flow (`docs/minimal-checkout-coordinator.md`), or with a confirmed correction of that saved address.
+- A new customer, or a registered one, with a confirmed **new** address (see [atomic checkout](#atomic-checkout)).
 - A non-empty cart whose promotions are fully evaluated.
 
-With the [atomic checkout switch](#atomic-checkout-switch) on, new customers, confirmed new addresses and corrected saved addresses can also order (see there). With it off, they get a clear "not yet" reply. This route never calls customer upsert or separate address mutations.
+This route never calls customer upsert or separate address mutations.
 
 ## Flow
 
@@ -31,28 +31,35 @@ With the [atomic checkout switch](#atomic-checkout-switch) on, new customers, co
    - the confirmed delivery data still equals the current draft, byte for byte;
    - a saved address still has the same `version` upstream (a new address is bound to its exact confirmed fields instead);
    - prices and stock come from a new cart evaluation.
-3. If delivery is unconfirmed, the server reuses the delivery-confirmation service in this same turn: it shows the delivery data (including any interior number), lists missing fields, or explains how to select/enter an address. A strict `SÍ` after that **sent delivery summary** confirms delivery only; the customer is then told to say «hacer pedido» for the order summary. Otherwise, the server replies with its own order summary: items, product total, delivery address and "shipping not included" when shipping is off. With [minimal shipping](minimal-shipping.md) enabled, a fresh approved quote is required and the summary includes freight and total, or "envío cubierto por su compra". The order summary ends with `Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.` It is armed only after the transport sends it.
+3. A store pickup choice skips the delivery steps: the summary needs only the customer identity (see [minimal shipping](minimal-shipping.md#store-pickup-s4)). Otherwise, if delivery is unconfirmed, the server reuses the delivery-confirmation service in this same turn: it shows the delivery data (including any interior number), lists missing fields, or explains how to select/enter an address. A strict `SÍ` after that **sent delivery summary** confirms delivery only; the customer is then told to say «hacer pedido» for the order summary. Otherwise, the server replies with its own order summary: items, product total and delivery address. A current quote or a store pickup choice is always required ([minimal shipping](minimal-shipping.md)): the summary shows carrier, customer charge, credit and ETA plus the total, or "Recoge en tienda (sin costo de envío)" for pickup. Without either, the reply asks the customer to quote shipping for the confirmed address or choose store pickup. The order summary ends with `Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.` It is armed only after the transport sends it.
 4. Only a strict `SÍ` from the same sender and receiving phone creates the sale, and only as the very next reply to the summary (within 5 minutes). Any other turn — a mixed answer, a question, a RESTOCK or delivery confirmation — drops the summary, and so does a `SÍ` that is refused (from another phone, or before the summary was sent) or a message rejected because a reply is still in progress; a later `SÍ` never creates it. The order is re-checked again; if anything changed, the customer gets a new summary instead of a sale.
 5. On success: the reply has the folio, the backend total and the transfer details. The cart is cleared and the sale is recorded as `placedSale`.
 
-Fresh cart evaluation uses only the trusted sender's normalized phone to obtain customer pricing from the backend. Both legacy `/sales` and atomic `/checkouts` send the evaluation's backend-chosen **unit price before discount**, not the catalog price. `expectedTotalCents` is the sum of `finalPriceCents` plus any approved shipping charge. A changed customer price/promotion requires fresh consent; `PROMO_RE_QUOTE` can still occur if backend state changes between quote and placement.
+Fresh cart evaluation uses only the trusted sender's normalized phone to obtain customer pricing from the backend. The checkout sends the evaluation's backend-chosen **unit price before discount**, not the catalog price. `expectedTotalCents` is the sum of `finalPriceCents` plus the quoted customer shipping charge (nothing for pickup). A changed customer price/promotion requires fresh consent; `PROMO_RE_QUOTE` can still occur if backend state changes between quote and placement. Every fresh evaluation that finds new prices for the same lines stores them (unit prices and `expectedTotalCents`) in one cart CAS before the summary, so a `SÍ` on that summary places the order at the shown prices. A lost CAS (a concurrent cart edit) writes nothing and asks the customer to say «hacer pedido» again; a cart with an outstanding order key is never rewritten. A store pickup choice survives the price change. A delivery quote pinned to the old prices is stale (the credit may change): the server re-quotes once in the same turn and shows the new total, or asks the customer to request shipping again if the re-quote fails.
 
-Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from the validated backend evaluation, or `(descuento: ahorro $X.XX MXN)` for a null/blank title. Zero-discount lines are unchanged. This is server-owned text, never model-authored. Promotion metadata is carried in the consent snapshot (changes require a fresh summary), but is display-only: neither sale/checkout payloads nor their idempotency fingerprints include these fields.
+Discounted summary lines append `(promoción: <title>, ahorro $X.XX MXN)` from the validated backend evaluation, or `(descuento: ahorro $X.XX MXN)` for a null/blank title. Zero-discount lines are unchanged. This is server-owned text, never model-authored. Promotion metadata is carried in the consent snapshot (changes require a fresh summary), but is display-only: neither checkout payloads nor their idempotency fingerprints include these fields.
 
 ## Duplicate protection
 
-The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/sales`, together with a SHA-256 fingerprint of the exact sale payload (customer, address, expected total, items and any approved shipping charge).
+The `X-Idempotency-Key` is a UUID stored in the `minimalCart` slot through its CAS **before** `POST /chatbot-api/checkouts`, together with a SHA-256 fingerprint of the exact checkout payload (phone, customer, delivery address — absent for pickup —, expected total, items and the shipping member: `{quoteId}` for a backend-signed quote, `{mode: "pickup"}` for store pickup). The backend computes the freight from the quote; the expected total is the product total plus the quoted customer charge.
 
-| Backend outcome                                                                                          | Key                   | Reply                                   |
-| -------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------- |
-| Created                                                                                                  | cleared with the cart | folio + total + payment details         |
-| `PROMO_RE_QUOTE`, other definite 4xx (not 408/429) on the **first** attempt                              | rotated               | "no se pudo crear el pedido"            |
-| Same definite rejection on a **later** attempt (an earlier one was uncertain)                            | kept                  | "comuníquese con la tienda"             |
-| `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, 408, 429, 5xx, network error, malformed success | kept                  | "no pude confirmar si quedó registrado" |
+| Backend outcome                                                                                                                                    | Key                        | Reply                                                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Created                                                                                                                                            | cleared with the cart      | folio + total + payment details                                                                                                                                                                                  |
+| Definite 4xx (not 408/429) on the **first** attempt                                                                                                | rotated                    | "no se pudo crear el pedido"                                                                                                                                                                                     |
+| `SHIPPING_QUOTE_EXPIRED`, `SHIPPING_QUOTE_MISMATCH` (`LINES`/`DESTINATION`), `SHIPPING_QUOTE_ALREADY_USED` on the **first** attempt (cart kept)    | rotated                    | automatic re-quote and new summary for a fresh "SÍ"; "pídame de nuevo el envío" if it fails. `ALREADY_USED` first checks `GET /checkouts/status` with the stored key and completes our own sale if it exists     |
+| 409 `PROMO_RE_QUOTE` on the **first** attempt (a promotion started or ended after the summary; nothing written)                                    | rotated                    | cart re-priced (a delivery quote pinned to the old prices is re-quoted once) and the new summary shown after "Su pedido cambió…" for a fresh "SÍ"                                                                |
+| `SHIPPING_QUOTE_MISMATCH` with `CUSTOMER` in `mismatches[]`                                                                                        | rotated                    | selection and the stored quote cleared (a quote has no customer pin); asks the customer to review their data («quiero comprar») and quote again                                                                  |
+| `INVALID_CHECKOUT_REQUEST` (400)                                                                                                                   | rotated                    | logged; generic "No se pudo crear el pedido"                                                                                                                                                                     |
+| `SHIPPING_QUOTE_NOT_FOUND`, `PACKAGING_DATA_MISSING`, `SHIPPING_QUOTE_UNAVAILABLE` (any status, 503 included) on the **first** attempt (cart kept) | rotated                    | specific reply; offers to quote again or pick up in store                                                                                                                                                        |
+| Other definite rejection on a **later** attempt (an earlier one was uncertain)                                                                     | kept                       | "comuníquese con la tienda"                                                                                                                                                                                      |
+| Any `SHIPPING_QUOTE_*` on a **later** attempt: the server reads `GET /checkouts/status` with the stored key first                                  | completed / rotated / kept | a sale under the key is completed; `not_observed` clears the key and gives the first-attempt reply (re-quote for `EXPIRED`/`MISMATCH`/`ALREADY_USED`); a failed read keeps the key ("comuníquese con la tienda") |
+| 201 whose body fails the strict contract parse                                                                                                     | kept                       | `GET /checkouts/status` is read at once: our sale under the key is completed (no second POST); otherwise "no pude confirmar si quedó registrado" and the next turn recovers                                      |
+| `IDEMPOTENCY_KEY_IN_FLIGHT`, `IDEMPOTENCY_KEY_CONFLICT`, `CHECKOUT_RETRY_REQUIRED`, 408, 429, 5xx, network error, malformed success                | kept                       | "no pude confirmar si quedó registrado"                                                                                                                                                                          |
 
 A retry reuses the kept key only when the new payload has the same fingerprint. If the payload changed while a key is outstanding (another saved address, a promotion that moves the total), the server sends nothing and replies that an earlier order request could not be confirmed, so it never rotates into a possible duplicate. `IDEMPOTENCY_KEY_CONFLICT` keeps the key because the backend already saw it with another payload, so a sale may exist under it.
 
-The slot also keeps `idempotencyAttempts`, written through the CAS **before** each call. A definite rejection proves only that this call created nothing, so it rotates the key only on the first attempt.
+The slot also keeps `idempotencyAttempts`, written through the CAS **before** each call. A definite rejection proves only that this call created nothing, so it rotates the key only on the first attempt. The exception is `SHIPPING_QUOTE_*`: the backend writes nothing after these errors (any status), and a fresh status read with the same key settles any earlier uncertain attempt before the key is cleared.
 
 ### Uncertain outcome locks the order (S7)
 
@@ -64,38 +71,40 @@ While a key is outstanding (any uncertain outcome, or a crash mid-call), the ord
 
 The lock ends only with a confirmed sale, or with a definite rejection of the first attempt. A failed payment-details read or a lost post-sale cart write never hides a created order.
 
-### Atomic checkout switch
+### Atomic checkout
 
-With `MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED=true` (exact string; anything else is off), `place()` sends one `POST /chatbot-api/checkouts` instead of `POST /chatbot-api/sales`. With it off, the legacy path is unchanged. Launch preflight requires it explicitly `false`: the backend endpoint is committed in `houndfe-backend` but not deployed.
+`place()` sends one `POST /chatbot-api/checkouts` per consent. There is no switch and no `POST /chatbot-api/sales` fallback in this route (the legacy sale-flow tools still use `/sales`).
 
+- **Store pickup:** no `deliveryAddress`; customer mode `existing` with the `customerId` of the unique registered customer, or `createIfAbsent` with the name (plus top-level phone); `expectedTotalCents` = products only. The order-created reply adds the backend pickup location and hours when present.
 - Saved address: customer mode `existing` and deliveryAddress mode `existing` with the confirmed snapshot `version` as `expectedVersion`. Phone comes from the trusted WhatsApp sender.
 - **Corrected saved address:** customer mode `existing`, deliveryAddress mode `existingUpdated`, the base `addressId` and exact base `version` as `expectedVersion`, plus the full snapshot-derived corrected address (no coordinates). This is a full replacement: null optional fields are omitted so the backend stores null, while unchanged non-null fields are preserved. The server's “Entrega a:” uses the corrected address and adds “Actualizaremos su dirección guardada con estos datos.” The backend updates that same address atomically with the sale; failure saves nothing. An identical correction stays plain `saved` and uses mode `existing`. The receipt accepts address resolution `updated` (or `existing` for a no-op).
 - **New customer or new address:** customer mode `createIfAbsent` (`firstName`, plus `lastName` when known) and deliveryAddress mode `newSaved` with the confirmed fields. Absent optional fields are omitted, never sent as `null`. The backend creates the customer (or reuses the unique one for that phone without changing it) and saves the address **only in the same transaction as the sale**; a rejected or rolled-back checkout saves nothing. The summary adds "Guardaremos esta dirección con su pedido."
 - **State:** the backend accepts only its exact list of 32 state names. The confirmed free text is mapped deterministically (case, accents and spacing ignored, plus fixed aliases such as `CDMX`, `DF`, `Edomex`). Anything else, including a bare `México`, is never guessed: the delivery confirmation is revoked and the customer is asked for a valid state and to confirm again.
 - `CUSTOMER_PHONE_AMBIGUOUS` (several customers share the phone) creates nothing and asks the customer to contact the store.
-- The fingerprint covers the exact checkout payload (including any approved shipping charge); key, attempts counter and the S7 lock work as above, with one POST per consent.
+- The fingerprint covers the exact checkout payload (including the shipping member and quoted charge); key, attempts counter and the S7 lock work as above, with one POST per consent.
 - **Recovery:** before replaying an outstanding key with the same fingerprint, the server reads `GET /chatbot-api/checkouts/status` for that key (a status read is not counted as an attempt):
 
-  | Status                       | Action                                                                            |
-  | ---------------------------- | --------------------------------------------------------------------------------- |
-  | `succeeded` with a sale      | Treated as the created order: cart cleared, `placedSale`, success reply; no POST. |
-  | `not_observed`               | Same payload replayed with the **same** key (never a fresh one).                  |
-  | anything else, or read fails | Lock kept; "no pude confirmar si quedó registrado".                               |
+  | Status                                 | Action                                                                                                                      |
+  | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+  | `succeeded` with a sale                | Treated as the created order: cart cleared, `placedSale`, success reply; no POST.                                           |
+  | `succeeded`, keys outside the contract | Only the sale id, folio and total are read (still validated), a warning is logged, and the order is completed the same way. |
+  | `not_observed`                         | Same payload replayed with the **same** key (never a fresh one).                                                            |
+  | anything else, or read fails           | Lock kept; "no pude confirmar si quedó registrado".                                                                         |
 
 - Errors: `CHECKOUT_RETRY_REQUIRED` keeps the key. `ADDRESS_VERSION_CONFLICT` and `SHIPPING_ADDRESS_NOT_FOUND` clear the volatile selection and local confirmation; on a first attempt the customer must re-read saved addresses, select and confirm again. A later rejection still keeps any uncertain earlier order locked. Other codes follow the table above. The corrected full address, mode, address id and expected version are part of the fingerprint; an uncertain request cannot be retried with different corrections.
 
 ## Reply priority in one SDK run
 
-EXPIRATION > RESTOCK > checkout, order or optional shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.
+EXPIRATION > RESTOCK > checkout, order or shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.
 
-Blocked replies name the next action: retry the order/cart review, add products, select a saved address, supply missing fields, request a shipping quote and wait for team approval, or contact the store where human review/registration is required. These wording changes do not alter eligibility, shipping freshness, consent, or idempotency gates.
+Blocked replies name the next action: retry the order/cart review, add products, select a saved address, supply missing fields, request a shipping quote or choose store pickup, or contact the store where human review/registration is required. These wording changes do not alter eligibility, shipping freshness, consent, or idempotency gates.
 
 Before the SDK runs, a `SÍ` is checked against RESTOCK, then the delivery confirmation, then the order summary.
 
 ## Not in this slice
 
-- Shipping quotes, charges and approval are a separate default-off capability: [minimal shipping](minimal-shipping.md).
-- Customer and address creation without the atomic checkout switch. With the switch on, new customers and new addresses are created by the atomic checkout together with the order; see [atomic checkout switch](#atomic-checkout-switch).
+- Backend shipping quotes and store pickup: [minimal shipping](minimal-shipping.md).
+- Customer and address creation outside an order. New customers and new addresses are created only by the atomic checkout together with the order; see [atomic checkout](#atomic-checkout).
 - Order cancellation from the minimal route.
 
 ## Check

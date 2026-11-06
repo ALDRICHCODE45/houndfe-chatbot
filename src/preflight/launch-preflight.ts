@@ -59,21 +59,7 @@ export const CORE_CONFIG_NAMES = [
 export const POSTURE_EXPECTATIONS: readonly {
   name: string;
   expected: PostureValue;
-}[] = [
-  { name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' },
-  { name: 'HUMAN_HANDOFF_ENABLED', expected: 'true' },
-  { name: 'RECEIPT_MEDIA_ENABLED', expected: 'false' },
-  { name: 'RECEIPT_MEDIA_INGESTION_ENABLED', expected: 'false' },
-  { name: 'RECEIPT_MEDIA_METRICS_ENABLED', expected: 'false' },
-  // Launch preflight requires explicit `false` even though the runtime default
-  // is off: an absent value is `missing` and any enabled/non-canonical value is
-  // `unsafe`, so shipping quotes cannot reach production implicitly.
-  { name: 'SHIPPING_QUOTES_ENABLED', expected: 'false' },
-  { name: 'MINIMAL_CATALOG_SHIPPING_ENABLED', expected: 'false' },
-  // The backend atomic checkout is not deployed yet: launch must keep the
-  // legacy POST /sales path explicitly.
-  { name: 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED', expected: 'false' },
-];
+}[] = [{ name: 'META_SANDBOX_RECIPIENT_NORMALIZATION', expected: 'false' }];
 
 export const REQUIRED_MIGRATIONS = [
   '1700000000000_create-conversation-state.js',
@@ -82,57 +68,68 @@ export const REQUIRED_MIGRATIONS = [
   '2000000000000_receipt_media.js',
   '2100000000000_receipt_media_cancellation_commands.js',
   '2200000000000_receipt_media_capability_string_versions.js',
+  // Human decisions are always on, so their ledgers are required.
+  '2300000000000_human_decision_reservations.js',
+  '2400000000000_restock_intake_post_ledger.js',
+  '2500000000000_restock_application_ledger.js',
+  '2600000000000_restock_inbound_evidence.js',
+  '2700000000000_expiration_reservations.js',
+  '2800000000000_expiration_post_ledger.js',
+  '2900000000000_expiration_application_ledger.js',
+  '3000000000000_expiration_application_ack.js',
+  '3100000000000_customer_inbound_observations.js',
+  // Durable DELIVERY_ZONE requesters (zone validation polling and notice).
+  '3200000000000_delivery_zone_requesters.js',
+  // Receipt payment flow (always on): backend upload, human outcome, and the
+  // removal of the chatbot-owned storage schema.
+  '3300000000000_receipt_media_backend_upload.js',
+  '3400000000000_receipt_media_outcome.js',
+  '3500000000000_receipt_media_backend_only.js',
+  '3600000000000_receipt_media_upload_fields.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [
   ['GET', '/chatbot-api/catalog/search', 'catalog:read'],
   ['GET', '/chatbot-api/catalog/:productId/stock', 'catalog:read'],
   ['POST', '/chatbot-api/pricing/evaluate-cart', 'pricing:evaluate'],
+  ['POST', '/chatbot-api/shipping/quotes', 'shipping:quote'],
   ['GET', '/chatbot-api/customers/by-phone', 'customers:read'],
   ['PUT', '/chatbot-api/customers/by-phone', 'customers:write'],
   ['POST', '/chatbot-api/sales', 'sales:create'],
+  ['POST', '/chatbot-api/checkouts', 'customers:write sales:create'],
+  ['GET', '/chatbot-api/checkouts/status', 'customers:write sales:create'],
   ['GET', '/chatbot-api/payment-details', 'payment-details:read'],
   ['POST', '/chatbot-api/sales/:saleId/cancel', 'sales:write'],
+  // Multipart receipt upload (X-Idempotency-Key = WhatsApp media id).
   ['POST', '/chatbot-api/sales/:saleId/receipts', 'sales:write'],
+  // Human receipt outcome (CONFIRMED / REJECTED) relayed to the customer.
+  ['GET', '/chatbot-api/receipts/:receiptId', 'sales:read'],
   ['PATCH', '/chatbot-api/sales/:saleId/delivery', 'sales:write'],
   ['GET', '/chatbot-api/customers/by-phone/:phone/orders', 'customers:read'],
+  // Human-decision bot cycle (RESTOCK, EXPIRATION and DELIVERY_ZONE).
+  ['POST', '/chatbot-api/human-decisions', 'human-decisions:create'],
+  ['GET', '/chatbot-api/human-decisions/:id', 'human-decisions:read'],
+  [
+    'POST',
+    '/chatbot-api/human-decisions/:id/application-outcome',
+    'human-decisions:ack',
+  ],
 ];
 
 const MANUAL_PREREQUISITES: readonly (readonly [string, string])[] = [
   ['backend_reachable', 'Backend reachable from the chatbot host (manual).'],
   ['bot_cashier_user', 'Bot cashier User matches CHATBOT_API_CASHIER_USER_ID.'],
-  ['service_credential', 'Seven scopes including payment-details:read.'],
+  [
+    'service_credential',
+    'Twelve scopes including payment-details:read, shipping:quote, sales:read and human-decisions:create/read/ack.',
+  ],
   ['active_payment_detail', 'An active PaymentDetail exists (no 404).'],
   ['populated_catalog', 'Catalog has products for search/stock/cart flows.'],
-  // Shipping activation prerequisites (SQ-6B): listed for humans only and never
-  // counted as automatic failures. No credential value is read or reported.
+  // Carrier, credit and zone rules are backend-owned (signed quoteId); only
+  // the backend side needs a human check before delivery orders.
   [
-    'shipping_origin_authoritative',
-    'Branch origin postal/address data is authoritative.',
-  ],
-  [
-    'shipping_backend_measurements',
-    'Backend exposes product/variant weights and dimensions, not null.',
-  ],
-  [
-    'shipping_sandbox_host_credentials',
-    'Owner-approved Skydropx sandbox host and credentials provisioned.',
-  ],
-  [
-    'shipping_backend_charge_persistence',
-    'Backend can persist the approved shipping charge with the sale.',
-  ],
-  [
-    'shipping_cdmx_zone_service_policy',
-    'CDMX free-zone rules and service-selection policy are approved.',
-  ],
-  [
-    'shipping_approval_workflow_e2e',
-    'The human shipping-approval workflow is proven end to end.',
-  ],
-  [
-    'shipping_synthetic_journey',
-    'A controlled synthetic shipping journey passes before any quote.',
+    'backend_shipping_quotes',
+    'Backend serves POST /chatbot-api/shipping/quotes with packaging data.',
   ],
 ];
 

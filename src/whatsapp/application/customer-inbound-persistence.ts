@@ -9,7 +9,7 @@ import {
 } from './customer-inbound-capture';
 
 type CaptureResult =
-  | Readonly<{ action: 'disabled' | 'hold' }>
+  | Readonly<{ action: 'hold' }>
   | Readonly<{
       action: 'captured';
       observations: readonly CustomerInboundObservation[];
@@ -17,7 +17,7 @@ type CaptureResult =
 
 const HOLD = Object.freeze({ action: 'hold' } as const);
 
-/** Default-off runtime capture authenticates the actual request's snapshot before
+/** Always-on runtime capture authenticates the actual request's snapshot before
  * any write. Uses standalone store operations in batch order, without retries
  * or rollback: HOLD/throw may follow a durable prefix or an uncertain write.
  * Returned metadata grants no latestness, service-window or send permission.

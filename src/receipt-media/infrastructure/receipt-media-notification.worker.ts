@@ -10,7 +10,10 @@
  * expiry (at-least-once). Retryable failures reschedule; the third failed
  * attempt becomes `FAILED` and emits the local exhaustion alert seam.
  * Shutdown stops claims, wakes polling, and drains active sends — the port
- * has no AbortSignal, so no send cancellation is pretended. */
+ * has no AbortSignal, so no send cancellation is pretended.
+ * Human-outcome intents (R5) may wait in the queue: the 24 h window is
+ * re-checked right before sending; closed means not delivered, no retry,
+ * while a failed window read is retried like a failed send. */
 import {
   Injectable,
   OnApplicationBootstrap,
@@ -43,46 +46,122 @@ export interface NotificationStoreSeam {
   ): Promise<'rescheduled' | 'exhausted' | 'lost'>;
 }
 
+/** R5 send-time window gate for the human-outcome intents. */
+export interface OutcomeWindowSeam {
+  /** Same inbound-observation evidence as the outcome poller. Rejects when
+   * the read fails: that is transient, not a closed window. */
+  isOpen(recipientId: string): Promise<boolean>;
+  /** Fenced terminal mark: the intent is not delivered and never retried. */
+  markNotDelivered(
+    id: string,
+    owner: string,
+    leaseExpiresAt: Date,
+  ): Promise<boolean>;
+}
+
+const OUTCOME_TEMPLATE_KEYS: ReadonlySet<ReceiptTemplateKey> = new Set([
+  'RECEIPT_PAYMENT_CONFIRMED',
+  'RECEIPT_PAYMENT_PARTIAL',
+  'RECEIPT_PAYMENT_REJECTED',
+]);
+
 export interface NotificationAlertSeam {
   onExhausted(intent: ReceiptMediaOutboxRow): Promise<void>;
 }
 
 export const RETRY_DELAY_MS = 60_000;
 
-const money = (value: number | 'PENDING' | undefined): string =>
-  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-    ? `${Math.floor(value / 100)}.${String(value % 100).padStart(2, '0')}`
-    : '';
+const isCents = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-/** Deterministic canonical Spanish texts keyed by the tracked WU3 template
- * keys; the bounded WU3 args are the only substitutions. Never free text. */
+/** `$1,500.00 MXN`: the one customer-facing money format of receipt texts. */
+const pesos = (cents: number): string =>
+  `$${Math.floor(cents / 100).toLocaleString('en-US')}.${String(cents % 100).padStart(2, '0')} MXN`;
+
+/** "del pedido F-12", or "de su pedido" when the folio is unknown. */
+const ofOrder = (folio: string | null): string =>
+  folio === null ? 'de su pedido' : `del pedido ${folio}`;
+
+const RECEIVED_SUFFIX =
+  'Lo estamos revisando y le avisamos en cuanto se confirme.';
+
+/** Deterministic canonical Spanish texts keyed by the tracked template keys;
+ * the bounded args are the only substitutions. The only backend-supplied
+ * text is the customer-safe rejection reason (R5). */
 const TEXT: Record<ReceiptTemplateKey, string> = {
-  RECEIPT_AMOUNT_PROMPT: '¿Cuál fue el monto de tu transferencia?',
-  RECEIPT_AMOUNT_CONFIRM:
-    'Detectamos {amountCents} MXN. Responde CONFIRMAR o CANCELAR.',
-  RECEIPT_AMOUNT_REASK: 'No pudimos leer el monto. Envíalo como número.',
-  RECEIPT_CANCELLED: 'Cancelamos el comprobante. Puedes enviarlo de nuevo.',
-  RECEIPT_ATTACHED_PENDING:
-    'Comprobante recibido, queda PENDIENTE ({backendStatus}).',
+  RECEIPT_ATTACHED_PENDING: `Recibimos su comprobante. ${RECEIVED_SUFFIX}`,
   RECEIPT_ATTACH_DEFINITE_FAILURE:
-    'No pudimos adjuntar el comprobante. Contacta a soporte.',
-  RECEIPT_ATTACH_UNKNOWN: 'Estamos verificando el adjunto del comprobante.',
+    'No pudimos registrar su comprobante. Escríbanos y le ayudamos.',
+  RECEIPT_ATTACH_UNKNOWN:
+    'Estamos registrando su comprobante; le avisamos en cuanto quede.',
   RECEIPT_UNAVAILABLE_LATER:
-    'El servicio no está disponible. Intenta más tarde.',
-  RECEIPT_IN_PROGRESS: 'Estamos procesando tu comprobante.',
-  RECEIPT_FINISH_OR_CANCEL:
-    'Tienes un proceso abierto: finalízalo o cancélalo.',
-  RECEIPT_PLACE_SALE_FIRST: 'Primero registra la venta en el sistema.',
-  RECEIPT_UNSUPPORTED_FORMAT: 'Formato no soportado. Envía JPEG o PNG.',
-  RECEIPT_RECEIPTS_ONLY: 'Solo podemos procesar comprobantes de pago.',
+    'No pudimos recibir su comprobante. Por favor envíelo de nuevo más tarde.',
+  RECEIPT_UNSUPPORTED_FORMAT:
+    'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
+  RECEIPT_SALE_ALREADY_PAID: 'Su pedido ya está pagado.',
+  RECEIPT_SALE_NOT_PAYABLE:
+    'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
+  RECEIPT_PDF_ENCRYPTED:
+    'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',
+  RECEIPT_NOT_A_RECEIPT:
+    'Esta imagen no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+  RECEIPT_PAYMENT_CONFIRMED:
+    '¡Listo! Confirmamos su pago de su pedido. Gracias por su compra.',
+  RECEIPT_PAYMENT_PARTIAL:
+    'Confirmamos un pago de su pedido. Puede enviarnos el comprobante del resto cuando lo tenga.',
+  RECEIPT_PAYMENT_REJECTED:
+    'No pudimos confirmar su comprobante de su pedido. ¿Me puede enviar otro comprobante?',
 };
+
+const folioOf = (args: ReceiptMediaOutboxRow['templateArgs']): string | null =>
+  typeof args.folio === 'string' && args.folio.length > 0 ? args.folio : null;
 
 export const renderNotificationText = (
   row: Pick<ReceiptMediaOutboxRow, 'templateKey' | 'templateArgs'>,
-): string =>
-  TEXT[row.templateKey]
-    .replace('{amountCents}', money(row.templateArgs.amountCents))
-    .replace('{backendStatus}', String(row.templateArgs.backendStatus ?? ''));
+): string => {
+  const args = row.templateArgs;
+  const folio = folioOf(args);
+  switch (row.templateKey) {
+    case 'RECEIPT_ATTACHED_PENDING': {
+      // S9: received + in review; a differing extracted amount is mentioned
+      // without blocking.
+      const received =
+        folio === null
+          ? TEXT.RECEIPT_ATTACHED_PENDING
+          : `Recibimos su comprobante del pedido ${folio}. ${RECEIVED_SUFFIX}`;
+      const { extractedAmountCents: seen, totalCents: owed } = args;
+      return isCents(seen) && isCents(owed) && seen !== owed
+        ? `${received} Vemos un monto de ${pesos(seen)} y su pedido es de ${pesos(owed)}; lo revisamos igual.`
+        : received;
+    }
+    // R5/S5: the human outcome; the bot never decides it (S1).
+    case 'RECEIPT_PAYMENT_CONFIRMED':
+      return `¡Listo! Confirmamos su pago ${ofOrder(folio)}. Gracias por su compra.`;
+    case 'RECEIPT_PAYMENT_PARTIAL': {
+      const order = folio === null ? 'su pedido' : `su pedido ${folio}`;
+      return isCents(args.debtCents)
+        ? `Confirmamos un pago de ${order}. Queda un saldo pendiente de ${pesos(args.debtCents)}; puede enviarnos el comprobante del resto cuando lo tenga.`
+        : `Confirmamos un pago de ${order}. Puede enviarnos el comprobante del resto cuando lo tenga.`;
+    }
+    case 'RECEIPT_PAYMENT_REJECTED': {
+      const reason =
+        typeof args.reason === 'string'
+          ? args.reason.trim().replace(/\.+$/, '')
+          : '';
+      return `No pudimos confirmar su comprobante ${ofOrder(folio)}${reason.length > 0 ? `: ${reason}` : ''}. ¿Me puede enviar otro comprobante?`;
+    }
+    case 'RECEIPT_NOT_A_RECEIPT':
+      return args.mediaKind === 'pdf'
+        ? 'Este archivo no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.'
+        : TEXT.RECEIPT_NOT_A_RECEIPT;
+    case 'RECEIPT_SALE_ALREADY_PAID':
+      return folio === null
+        ? TEXT.RECEIPT_SALE_ALREADY_PAID
+        : `Su pedido ${folio} ya está pagado.`;
+    default:
+      return TEXT[row.templateKey];
+  }
+};
 
 export interface NotificationWorkerOptions {
   owner: string;
@@ -114,6 +193,7 @@ export class ReceiptMediaNotificationWorker
     private readonly sender: Pick<WhatsappSenderPort, 'sendText'>,
     private readonly alert: NotificationAlertSeam,
     options: NotificationWorkerOptions,
+    private readonly outcomeWindow?: OutcomeWindowSeam,
   ) {
     const { owner, pollIntervalMs, batchSize, maxConcurrency } = options;
     if (
@@ -213,9 +293,40 @@ export class ReceiptMediaNotificationWorker
       : null;
   }
 
+  /** Fenced requeue; the third failed attempt alerts exhaustion. */
+  private async retry(
+    intent: ReceiptMediaOutboxRow,
+    lease: Date,
+  ): Promise<void> {
+    const outcome = await this.store
+      .reschedule(intent.id, this.owner, RETRY_DELAY_MS, lease)
+      .catch(() => 'lost' as const);
+    if (outcome === 'exhausted')
+      await this.alert.onExhausted(intent).catch(() => undefined);
+  }
+
   private async deliver(intent: ReceiptMediaOutboxRow): Promise<void> {
     const lease = this.leaseToken(intent);
     if (lease === null) return;
+    if (
+      this.outcomeWindow !== undefined &&
+      OUTCOME_TEMPLATE_KEYS.has(intent.templateKey)
+    ) {
+      let open: boolean;
+      try {
+        open = await this.outcomeWindow.isOpen(intent.recipientId);
+      } catch {
+        // A failed read proves nothing about the window: retry like a
+        // transient send failure, within the same attempt cap.
+        return this.retry(intent, lease);
+      }
+      if (!open) {
+        await this.outcomeWindow
+          .markNotDelivered(intent.id, this.owner, lease)
+          .catch(() => false);
+        return;
+      }
+    }
     let wamid: string;
     try {
       ({ providerMessageId: wamid } = await this.sender.sendText({
@@ -223,12 +334,7 @@ export class ReceiptMediaNotificationWorker
         text: renderNotificationText(intent),
       }));
     } catch {
-      const outcome = await this.store
-        .reschedule(intent.id, this.owner, RETRY_DELAY_MS, lease)
-        .catch(() => 'lost' as const);
-      if (outcome === 'exhausted')
-        await this.alert.onExhausted(intent).catch(() => undefined);
-      return;
+      return this.retry(intent, lease);
     }
     // Fenced CAS after provider success only; a loser (false) mutates
     // nothing further — at-least-once replay covers the unmarked send.

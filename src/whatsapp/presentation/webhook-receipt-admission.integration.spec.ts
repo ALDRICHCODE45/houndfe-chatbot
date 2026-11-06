@@ -15,7 +15,7 @@ import type {
 } from '../../conversation/domain/conversation-store';
 import type { HumanHandoffService } from '../../human-handoff/application/human-handoff.service';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
-import type { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
+import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import {
   ReceiptIngressService,
   type ReceiptIngressStore,
@@ -28,6 +28,9 @@ import type {
 import { PostgresReceiptMediaStore } from '../../receipt-media/infrastructure/postgres-receipt-media.store';
 import { WebhookDispatcherService } from '../application/webhook-dispatcher.service';
 import { PostgresWebhookDedupStore } from '../infrastructure/postgres-webhook-dedup.store';
+import { RestockInboundCapture } from '../application/restock-inbound-capture';
+import { CUSTOMER_INBOUND_CAPTURE } from '../infrastructure/customer-inbound-capture.provider';
+import type { WebhookEventDto } from './dto/webhook-event.dto';
 import { SignatureGuard } from './signature.guard';
 import { WebhookController } from './webhook.controller';
 
@@ -45,6 +48,17 @@ import { WebhookController } from './webhook.controller';
  * No production source, worker composition, STORED claim, or external call is
  * exercised: admission leaves the row in RESERVED with no lease.
  */
+
+const passThroughRestockCapture = {
+  capture: (snapshot: { rawBodyBase64: string }) =>
+    Promise.resolve({
+      action: 'captured' as const,
+      event: JSON.parse(
+        Buffer.from(snapshot.rawBodyBase64, 'base64').toString('utf8'),
+      ) as WebhookEventDto,
+      evidence: [],
+    }),
+} as unknown as RestockInboundCapture;
 
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
@@ -104,7 +118,7 @@ interface Harness {
   sender: { sendText: jest.Mock };
   conversations: { get: jest.Mock; getState: jest.Mock };
   agentRunner: { handle: jest.Mock };
-  amountRouter: { route: jest.Mock };
+  minimalAgent: { tryHandle: jest.Mock };
   handoff: { isOpsSender: jest.Mock; resolveReply: jest.Mock };
   close: () => Promise<void>;
 }
@@ -178,8 +192,18 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     const probe = new AdmissionProbe(new PostgresReceiptMediaStore(pool));
     const dedup = new PostgresWebhookDedupStore(pool);
     const state = {
-      data: { placedSaleId: PLACED_SALE_ID },
-    } as ConversationState;
+      data: {
+        minimalCart: {
+          items: [],
+          idempotencyKey: '',
+          placedSale: {
+            saleId: PLACED_SALE_ID,
+            folio: null,
+            totalCents: 150_000,
+          },
+        },
+      },
+    } as unknown as ConversationState;
     const conversations = {
       get: jest.fn<Promise<ConversationState | null>, [string]>(() =>
         Promise.resolve(state),
@@ -188,9 +212,9 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
         Promise.resolve(state),
       ),
     };
-    const sender = { sendText: jest.fn() };
+    const sender = { sendText: jest.fn(), sendTemplate: jest.fn() };
     const agentRunner = { handle: jest.fn() };
-    const amountRouter = { route: jest.fn() };
+    const minimalAgent = { tryHandle: jest.fn() };
     const handoff = {
       isOpsSender: jest.fn(() => false),
       resolveReply: jest.fn(),
@@ -207,12 +231,8 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
       recentOutbound,
       handoff as unknown as HumanHandoffService,
       conversations as unknown as ConversationStore,
-      amountRouter as unknown as ReceiptAmountRouterService,
-      new ReceiptIngressService(
-        { enabled: true },
-        { getState: conversations.getState },
-        probe,
-      ),
+      new ReceiptIngressService({ getState: conversations.getState }, probe),
+      minimalAgent as unknown as MinimalCatalogAgentService,
     );
 
     const moduleRef = await Test.createTestingModule({
@@ -221,6 +241,13 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
         SignatureGuard,
         { provide: ConfigService, useValue: configService },
         { provide: WebhookDispatcherService, useValue: dispatcher },
+        // Pass-through inbound captures (their behavior has its own specs).
+        { provide: RestockInboundCapture, useValue: passThroughRestockCapture },
+        {
+          provide: CUSTOMER_INBOUND_CAPTURE,
+          useValue: () =>
+            Promise.resolve({ action: 'captured', observations: [] }),
+        },
       ],
     }).compile();
 
@@ -240,7 +267,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
       sender,
       conversations,
       agentRunner,
-      amountRouter,
+      minimalAgent,
       handoff,
       close,
     };
@@ -272,7 +299,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     await Promise.all(harnesses.splice(0).map((h) => h.close()));
     await dropForcedFailureTrigger();
     await pool.query(
-      'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
+      'TRUNCATE receipt_media_outbox,' +
         ' receipt_media, processed_webhook_messages',
     );
   });
@@ -395,7 +422,7 @@ ddescribe('Webhook receipt admission integration (Testcontainers)', () => {
     expect(replayed.conversations.getState).not.toHaveBeenCalled();
     expect(replayed.sender.sendText).not.toHaveBeenCalled();
     expect(replayed.agentRunner.handle).not.toHaveBeenCalled();
-    expect(replayed.amountRouter.route).not.toHaveBeenCalled();
+    expect(replayed.minimalAgent.tryHandle).not.toHaveBeenCalled();
     expect(replayed.handoff.resolveReply).not.toHaveBeenCalled();
   });
 });

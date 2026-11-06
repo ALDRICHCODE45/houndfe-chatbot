@@ -23,42 +23,49 @@ const run = (
 ) => runLaunchPreflight({ env, migrationFilenames });
 
 describe('runLaunchPreflight', () => {
-  it.each([undefined, '', 'true', 'FALSE', 'false'])(
-    'S5: minimal shipping launch posture must be explicit false (%s)',
+  it.each(['true', 'false', undefined])(
+    'U6: does not check the removed shipping postures (%s)',
     (value) => {
       const env = safeEnv();
+      env.SHIPPING_QUOTES_ENABLED = value;
       env.MINIMAL_CATALOG_SHIPPING_ENABLED = value;
-      expect(run(env).posture).toContainEqual({
-        name: 'MINIMAL_CATALOG_SHIPPING_ENABLED',
-        expected: 'false',
-        status:
-          value === undefined || value === ''
-            ? 'missing'
-            : value === 'false'
-              ? 'safe'
-              : 'unsafe',
-      });
-    },
-  );
-  it.each([undefined, '', 'true', 'FALSE', 'false'])(
-    'S2: minimal atomic checkout launch posture must be explicit false (%s)',
-    (value) => {
-      const env = safeEnv();
-      env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = value;
       const report = run(env);
-      expect(report.posture).toContainEqual({
-        name: 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
-        expected: 'false',
-        status:
-          value === undefined || value === ''
-            ? 'missing'
-            : value === 'false'
-              ? 'safe'
-              : 'unsafe',
-      });
-      expect(report.ok).toBe(value === 'false');
+      expect(report.ok).toBe(true);
+      expect(
+        report.posture.filter((c: { name: string }) => /SHIPPING/.test(c.name)),
+      ).toEqual([]);
     },
   );
+  it('S2: does not check the removed atomic checkout posture', () => {
+    const env = safeEnv();
+    delete env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED;
+    const report = run(env);
+    expect(report.ok).toBe(true);
+    expect(
+      report.posture.some(
+        (c: { name: string }) =>
+          c.name === 'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
+      ),
+    ).toBe(false);
+  });
+  it('S2: lists the atomic checkout routes the order flow calls', () => {
+    expect(run(safeEnv()).clientRoutes).toEqual(
+      expect.arrayContaining([
+        {
+          method: 'POST',
+          path: '/chatbot-api/checkouts',
+          scope: 'customers:write sales:create',
+          status: 'manual_external',
+        },
+        {
+          method: 'GET',
+          path: '/chatbot-api/checkouts/status',
+          scope: 'customers:write sales:create',
+          status: 'manual_external',
+        },
+      ]),
+    );
+  });
   it('passes the happy path with every automatic check satisfied', () => {
     const report = run(safeEnv());
     expect(report.schemaVersion).toBe(1);
@@ -107,28 +114,74 @@ describe('runLaunchPreflight', () => {
 
   it('fails closed on missing posture and rejects non-exact values', () => {
     const missing = safeEnv();
-    delete missing.RECEIPT_MEDIA_INGESTION_ENABLED;
+    delete missing.META_SANDBOX_RECIPIENT_NORMALIZATION;
     const nonExact = safeEnv();
-    nonExact.HUMAN_HANDOFF_ENABLED = 'TRUE';
+    nonExact.META_SANDBOX_RECIPIENT_NORMALIZATION = 'FALSE';
     const wrong = safeEnv();
-    wrong.RECEIPT_MEDIA_ENABLED = 'true';
+    wrong.META_SANDBOX_RECIPIENT_NORMALIZATION = 'true';
 
     expect(run(missing).ok).toBe(false);
     expect(run(nonExact).ok).toBe(false);
     expect(run(wrong).ok).toBe(false);
     expect(
       run(missing).posture.find(
-        (c: { name: string }) => c.name === 'RECEIPT_MEDIA_INGESTION_ENABLED',
+        (c: { name: string }) =>
+          c.name === 'META_SANDBOX_RECIPIENT_NORMALIZATION',
       )?.status,
     ).toBe('missing');
     expect(
       run(nonExact).posture.find(
-        (c: { name: string }) => c.name === 'HUMAN_HANDOFF_ENABLED',
+        (c: { name: string }) =>
+          c.name === 'META_SANDBOX_RECIPIENT_NORMALIZATION',
       )?.status,
     ).toBe('unsafe');
     expect(
       run(missing).failures.some((f: { area: string }) => f.area === 'posture'),
     ).toBe(true);
+  });
+
+  // R3/S7: receipt media is always on; its removed flags are not checked.
+  it.each(['RECEIPT_MEDIA_ENABLED', 'RECEIPT_MEDIA_INGESTION_ENABLED'])(
+    'does not check the removed %s posture',
+    (name) => {
+      const env = safeEnv();
+      env[name] = 'true';
+      const report = run(env);
+      expect(report.ok).toBe(true);
+      expect(
+        report.posture.some((c: { name: string }) => c.name === name),
+      ).toBe(false);
+    },
+  );
+
+  it('lists the receipt upload and outcome routes with their scopes', () => {
+    expect(run(safeEnv()).clientRoutes).toEqual(
+      expect.arrayContaining([
+        {
+          method: 'POST',
+          path: '/chatbot-api/sales/:saleId/receipts',
+          scope: 'sales:write',
+          status: 'manual_external',
+        },
+        {
+          method: 'GET',
+          path: '/chatbot-api/receipts/:receiptId',
+          scope: 'sales:read',
+          status: 'manual_external',
+        },
+      ]),
+    );
+  });
+
+  it('requires the receipt payment flow migrations', () => {
+    expect(REQUIRED_MIGRATIONS).toEqual(
+      expect.arrayContaining([
+        '3300000000000_receipt_media_backend_upload.js',
+        '3400000000000_receipt_media_outcome.js',
+        '3500000000000_receipt_media_backend_only.js',
+        '3600000000000_receipt_media_upload_fields.js',
+      ]),
+    );
   });
 
   it('fails when a required migration filename is absent from disk', () => {
@@ -150,6 +203,38 @@ describe('runLaunchPreflight', () => {
     });
   });
 
+  it('does not check the removed HUMAN_HANDOFF_ENABLED posture', () => {
+    const env = safeEnv();
+    delete env.HUMAN_HANDOFF_ENABLED;
+    const report = run(env);
+    expect(report.ok).toBe(true);
+    expect(
+      report.posture.some(
+        (c: { name: string }) => c.name === 'HUMAN_HANDOFF_ENABLED',
+      ),
+    ).toBe(false);
+  });
+
+  it('requires the DELIVERY_ZONE requester migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain(
+      '3200000000000_delivery_zone_requesters.js',
+    );
+  });
+
+  it('fails when a human-decision migration is absent from disk', () => {
+    const name = '3100000000000_customer_inbound_observations.js';
+    const report = run(
+      safeEnv(),
+      REQUIRED_MIGRATIONS.filter((m: string) => m !== name),
+    );
+    expect(report.ok).toBe(false);
+    expect(report.failures).toContainEqual({
+      area: 'migration',
+      name,
+      status: 'missing_on_disk',
+    });
+  });
+
   it('is deterministic and lists manual checks without verifying them', () => {
     const first = run(safeEnv());
     expect(run(safeEnv())).toEqual(first);
@@ -163,20 +248,25 @@ describe('runLaunchPreflight', () => {
         }),
       ),
     );
-    expect(first.clientRoutes).toHaveLength(11);
+    expect(first.clientRoutes).toHaveLength(18);
+    expect(CLIENT_ROUTES).toEqual(
+      expect.arrayContaining([
+        ['POST', '/chatbot-api/human-decisions', 'human-decisions:create'],
+        ['GET', '/chatbot-api/human-decisions/:id', 'human-decisions:read'],
+        [
+          'POST',
+          '/chatbot-api/human-decisions/:id/application-outcome',
+          'human-decisions:ack',
+        ],
+      ]),
+    );
     expect(first.manualChecks.map((c: { id: string }) => c.id)).toEqual([
       'backend_reachable',
       'bot_cashier_user',
       'service_credential',
       'active_payment_detail',
       'populated_catalog',
-      'shipping_origin_authoritative',
-      'shipping_backend_measurements',
-      'shipping_sandbox_host_credentials',
-      'shipping_backend_charge_persistence',
-      'shipping_cdmx_zone_service_policy',
-      'shipping_approval_workflow_e2e',
-      'shipping_synthetic_journey',
+      'backend_shipping_quotes',
     ]);
     expect(
       first.manualChecks.every(
@@ -223,83 +313,23 @@ describe('runLaunchPreflight', () => {
 });
 
 describe('shipping launch preflight', () => {
-  const shippingPosture = (env: Env) =>
-    run(env).posture.find((c) => c.name === 'SHIPPING_QUOTES_ENABLED');
-
-  const SHIPPING_MANUAL_IDS = [
-    'shipping_origin_authoritative',
-    'shipping_backend_measurements',
-    'shipping_sandbox_host_credentials',
-    'shipping_backend_charge_persistence',
-    'shipping_cdmx_zone_service_policy',
-    'shipping_approval_workflow_e2e',
-    'shipping_synthetic_journey',
-  ] as const;
-
-  it('requires an explicit false shipping posture at launch', () => {
-    const env = safeEnv();
-    env.SHIPPING_QUOTES_ENABLED = 'false';
-    const report = run(env);
-    expect(shippingPosture(env)).toEqual({
-      name: 'SHIPPING_QUOTES_ENABLED',
-      expected: 'false',
-      status: 'safe',
+  it('lists the backend shipping quote route with the shipping:quote scope', () => {
+    expect(run(safeEnv()).clientRoutes).toContainEqual({
+      method: 'POST',
+      path: '/chatbot-api/shipping/quotes',
+      scope: 'shipping:quote',
+      status: 'manual_external',
     });
-    expect(report.ok).toBe(true);
   });
 
-  it('fails closed when the shipping flag is absent', () => {
+  it('never leaks removed Skydropx values into the report', () => {
     const env = safeEnv();
-    delete env.SHIPPING_QUOTES_ENABLED;
-    const report = run(env);
-    expect(report.ok).toBe(false);
-    expect(shippingPosture(env)?.status).toBe('missing');
-    expect(report.failures).toContainEqual({
-      area: 'posture',
-      name: 'SHIPPING_QUOTES_ENABLED',
-      status: 'missing',
-    });
-
-    const blank = safeEnv();
-    blank.SHIPPING_QUOTES_ENABLED = '';
-    expect(run(blank).ok).toBe(false);
-    expect(shippingPosture(blank)?.status).toBe('missing');
-  });
-
-  it('rejects an enabled or non-canonical shipping flag', () => {
-    for (const raw of ['true', 'TRUE', 'False', ' false ', '1', 'yes']) {
-      const env = safeEnv();
-      env.SHIPPING_QUOTES_ENABLED = raw;
-      const report = run(env);
-      expect(report.ok).toBe(false);
-      expect(shippingPosture(env)?.status).toBe('unsafe');
-      expect(report.failures).toContainEqual({
-        area: 'posture',
-        name: 'SHIPPING_QUOTES_ENABLED',
-        status: 'unsafe',
-      });
-    }
-  });
-
-  it('lists the seven shipping manual prerequisites without verifying them', () => {
-    const report = run(safeEnv());
-    const ids = report.manualChecks.map((c) => c.id);
-    for (const id of SHIPPING_MANUAL_IDS) expect(ids).toContain(id);
-    expect(report.ok).toBe(true);
-    for (const check of report.manualChecks) {
-      expect(check.status).toBe('manual_external');
-      expect(report.failures.some((f) => f.name === check.id)).toBe(false);
-    }
-  });
-
-  it('never leaks shipping credential values into the report', () => {
-    const env = safeEnv();
-    env.SHIPPING_QUOTES_ENABLED = 'false';
     env.SKYDROPX_CLIENT_SECRET = `sk_${CANARY}`;
     env.SKYDROPX_BASE_URL = `https://sandbox.example/${CANARY}`;
     const serialized = JSON.stringify(run(env));
     expect(serialized).not.toContain(CANARY);
     expect(serialized).not.toContain('sk_');
     expect(serialized).not.toContain('sandbox.example');
+    expect(serialized).not.toMatch(/skydropx/i);
   });
 });

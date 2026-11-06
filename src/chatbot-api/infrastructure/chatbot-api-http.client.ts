@@ -6,10 +6,15 @@ import { lastValueFrom } from 'rxjs';
 import type { AppConfig } from '../../config/configuration';
 import { ChatbotApiClient } from '../domain/chatbot-api.client';
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
+import {
+  parseCatalogSearchResponse,
+  parseStockCheckResponse,
+} from '../domain/dtos/catalog.dto';
 import type {
   CatalogItemResponse,
   StockCheckResponse,
 } from '../domain/dtos/catalog.dto';
+import type { TolerantRead } from '../domain/dtos/tolerant-read';
 import type {
   CustomerLookupResponse,
   CustomerUpsertInput,
@@ -35,15 +40,33 @@ import {
   type CheckoutStatus,
 } from '../domain/dtos/checkout.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
+import {
+  isReceiptUploadResponse,
+  RECEIPT_UPLOAD_ERROR,
+  RECEIPT_UPLOAD_KEY_MAX_LENGTH,
+  RECEIPT_UPLOAD_TIMEOUT_MS,
+  toReceiptUploadForm,
+  type ReceiptUploadFields,
+  type ReceiptUploadFile,
+  type ReceiptUploadResponse,
+} from '../domain/dtos/receipt-upload.dto';
+import {
+  parseReceiptOutcome,
+  type ReceiptOutcome,
+} from '../domain/dtos/receipt-outcome.dto';
+import {
+  CreateShippingQuoteInputSchema,
+  normalizeShippingQuoteResponse,
+  type CreateShippingQuoteInput,
+  type ShippingQuoteResponse,
+} from '../domain/dtos/shipping-quote.dto';
+import { parseCartEvaluationResult } from '../domain/dtos/pricing.dto';
 import type {
   CartEvaluationResult,
   CartItemInput,
 } from '../domain/dtos/pricing.dto';
 import type {
-  AttachReceiptInput,
-  AttachReceiptResponse,
   BotSaleResponse,
-  BotSaleShippingInput,
   CancelSaleInput,
   CancelSaleResult,
   CreateSaleInput,
@@ -66,6 +89,12 @@ import {
   normalizeExpirationIntakeReceipt,
   type ExpirationIntakeReceipt,
 } from '../domain/dtos/human-decisions-expiration-receipt.dto';
+import {
+  normalizeDeliveryZoneIntake,
+  normalizeDeliveryZoneRequester,
+  type DeliveryZoneIntakeInput,
+  type DeliveryZoneRequester,
+} from '../domain/dtos/human-decisions-delivery-zone.dto';
 import {
   normalizeRestockApplicationOutcome,
   normalizeRestockApplicationOutcomeAck,
@@ -99,6 +128,19 @@ type RequestOptions = {
 
 const MAX_GET_ATTEMPTS = 3;
 const INITIAL_BACKOFF_MS = 100;
+/**
+ * Per-request axios timeouts, so a hung backend never freezes a WhatsApp turn
+ * or a poller. Each applies per attempt (a timed-out GET is retried under the
+ * safe GET policy; a timed-out POST is single-attempt and an unknown outcome).
+ * The slow routes sit above the backend's own deadlines: checkout/sales ≈30 s,
+ * Skydropx quotes 30–35 s (≈16 s observed), receipt upload ≈60 s observed.
+ */
+export const CHATBOT_API_TIMEOUTS_MS = {
+  default: 10_000,
+  checkout: 30_000,
+  shippingQuote: 45_000,
+  receiptUpload: RECEIPT_UPLOAD_TIMEOUT_MS,
+} as const;
 const DECISION_ID_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Canonical lowercase RFC UUID v1–v8 with variant bits 8/9/a/b (nil uppercase/whitespace rejected). */
@@ -116,8 +158,11 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     private readonly sleep: SleepFn = defaultSleep,
   ) {}
 
-  searchCatalog(q: string, limit?: number): Promise<CatalogItemResponse[]> {
-    return this.request<CatalogItemResponse[]>(
+  async searchCatalog(
+    q: string,
+    limit?: number,
+  ): Promise<CatalogItemResponse[]> {
+    const response = await this.requestWithResponse<unknown>(
       {
         method: 'GET',
         url: '/chatbot-api/catalog/search',
@@ -128,23 +173,35 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       },
       { retryable: true },
     );
+    return this.acceptTolerantRead(
+      'catalog search',
+      response,
+      [200],
+      parseCatalogSearchResponse(response.data),
+    );
   }
 
-  getStock(productId: string): Promise<StockCheckResponse> {
-    return this.request<StockCheckResponse>(
+  async getStock(productId: string): Promise<StockCheckResponse> {
+    const response = await this.requestWithResponse<unknown>(
       {
         method: 'GET',
         url: `/chatbot-api/catalog/${encodeURIComponent(productId)}/stock`,
       },
       { retryable: true },
     );
+    return this.acceptTolerantRead(
+      'stock check',
+      response,
+      [200],
+      parseStockCheckResponse(response.data),
+    );
   }
 
-  evaluateCart(
+  async evaluateCart(
     items: CartItemInput[],
     customer?: { phoneCountryCode: string; phone: string },
   ): Promise<CartEvaluationResult> {
-    return this.request<CartEvaluationResult>({
+    const response = await this.requestWithResponse<unknown>({
       method: 'POST',
       url: '/chatbot-api/pricing/evaluate-cart',
       data: {
@@ -157,6 +214,43 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
           : {}),
       },
     });
+    return this.acceptTolerantRead(
+      'evaluate-cart',
+      response,
+      [200, 201],
+      parseCartEvaluationResult(response.data),
+    );
+  }
+
+  /** Unknown-key names already warned about, so each is logged only once. */
+  private readonly loggedUnknownKeys = new Set<string>();
+
+  /** Shared by the three tolerant reads: an unexpected status or a body that
+   *  breaks the contract is an UpstreamError; unknown keys were stripped and
+   *  are warned once per name, never with values. */
+  private acceptTolerantRead<T>(
+    endpoint: string,
+    response: AxiosResponse<unknown>,
+    statuses: number[],
+    parsed: TolerantRead<T> | null,
+  ): T {
+    if (!statuses.includes(response.status) || parsed === null) {
+      throw new UpstreamError(
+        `Chatbot API ${endpoint} response was invalid`,
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    for (const key of parsed.unknownKeys) {
+      const name = `${endpoint}: ${key}`;
+      if (this.loggedUnknownKeys.has(name)) continue;
+      this.loggedUnknownKeys.add(name);
+      new Logger(ChatbotApiHttpClient.name).warn(
+        `Chatbot API ${endpoint} response carried an unknown key (stripped): ${key}`,
+      );
+    }
+    return parsed.value;
   }
 
   getCustomerByPhone(
@@ -266,6 +360,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       url: '/chatbot-api/checkouts',
       data,
       headers: { 'X-Idempotency-Key': idempotencyKey },
+      timeout: CHATBOT_API_TIMEOUTS_MS.checkout,
     });
     const checkout = normalizeCheckoutResponse(response.data);
     if (response.status !== 201 || checkout === null) {
@@ -299,7 +394,49 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
         extractErrorCode(response.data),
       );
     }
+    if (status.status === 'succeeded_unverified')
+      new Logger(ChatbotApiHttpClient.name).warn(
+        'chatbot-api /checkouts/status body has keys outside the contract; recovered the sale identity only',
+      );
     return status;
+  }
+
+  /**
+   * `POST /chatbot-api/shipping/quotes` is single-attempt (non-GET). The input
+   * is validated before any request; only a 200/201 whose body passes the
+   * strict normalizer resolves, otherwise `UpstreamError` keeps the evidence.
+   */
+  async createShippingQuote(
+    input: CreateShippingQuoteInput,
+  ): Promise<ShippingQuoteResponse> {
+    const parsed = CreateShippingQuoteInputSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new ChatbotApiError(
+        'Invalid shipping quote input',
+        null,
+        undefined,
+        'INVALID_SHIPPING_QUOTE_REQUEST',
+      );
+    }
+    const response = await this.requestWithResponse<unknown>({
+      method: 'POST',
+      url: '/chatbot-api/shipping/quotes',
+      data: parsed.data,
+      timeout: CHATBOT_API_TIMEOUTS_MS.shippingQuote,
+    });
+    const quote = normalizeShippingQuoteResponse(response.data);
+    if (
+      (response.status !== 200 && response.status !== 201) ||
+      quote === null
+    ) {
+      throw new UpstreamError(
+        'Chatbot API shipping quote response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return quote;
   }
 
   private validateCheckoutKey(key: string): string {
@@ -333,27 +470,12 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     // no `null` to mean "absent").
     const parsed = CreateSaleInputSchema.parse(dto);
     const expectedTotalCents = parsed.expectedTotalCents;
-    const shipping = parsed.shipping;
-    // SQ-5E3: `shipping` is omitted entirely when absent/null, and its own
-    // optional `quoteId` is omitted when absent/null (the backend rejects a
-    // literal `null` on the wire). The conditional positive-`expectedTotalCents`
-    // rule is already enforced by `CreateSaleInputSchema`.
-    const wireShipping: BotSaleShippingInput | null = shipping
-      ? {
-          chargeCents: shipping.chargeCents,
-          approvalId: shipping.approvalId,
-          ...(typeof shipping.quoteId === 'string'
-            ? { quoteId: shipping.quoteId }
-            : {}),
-        }
-      : null;
     const wireDto: CreateSaleInput = {
       cashierUserId: parsed.cashierUserId,
       customerId: parsed.customerId,
       shippingAddressId: parsed.shippingAddressId ?? null,
       items: parsed.items,
       ...(typeof expectedTotalCents === 'number' ? { expectedTotalCents } : {}),
-      ...(wireShipping ? { shipping: wireShipping } : {}),
     };
     return this.request<BotSaleResponse>({
       method: 'POST',
@@ -362,6 +484,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
       headers: {
         'X-Idempotency-Key': idempotencyKey,
       },
+      timeout: CHATBOT_API_TIMEOUTS_MS.checkout,
     }).then((sale) => this.normalizeSaleResponse(sale));
   }
 
@@ -383,19 +506,84 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     return sale;
   }
 
-  attachReceipt(
+  async uploadReceipt(
     saleId: string,
-    dto: AttachReceiptInput,
+    file: ReceiptUploadFile,
+    fields: ReceiptUploadFields,
+    idempotencyKey: string,
     options: AttachReceiptTransportOptions = {},
-  ): Promise<AttachReceiptResponse> {
-    return this.requestAttachReceipt(
+  ): Promise<ReceiptUploadResponse> {
+    if (
+      idempotencyKey.length < 1 ||
+      idempotencyKey.length > RECEIPT_UPLOAD_KEY_MAX_LENGTH
+    ) {
+      throw new ChatbotApiError(
+        'Receipt upload idempotency key is out of contract',
+        400,
+        undefined,
+        RECEIPT_UPLOAD_ERROR.INVALID_IDEMPOTENCY_KEY,
+      );
+    }
+    const requestConfig = this.buildAuthedRequestConfig({
+      method: 'POST',
+      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
+      data: toReceiptUploadForm(file, fields),
+      headers: { 'X-Idempotency-Key': idempotencyKey },
+      timeout: CHATBOT_API_TIMEOUTS_MS.receiptUpload,
+      signal: options.signal,
+    });
+
+    let response;
+    try {
+      // Single attempt: a retry is the caller's, later, with the same key.
+      response = await lastValueFrom(
+        this.httpService.request<unknown>(requestConfig),
+      );
+    } catch (error) {
+      throw this.mapError(error);
+    }
+
+    const body = response.data;
+    if (response.status !== 201 || !isReceiptUploadResponse(body)) {
+      throw new UpstreamError(
+        'Chatbot API receipt upload response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return body;
+  }
+
+  /** Receipt outcome read: UUID-validated before any request, safe GET
+   * retry policy, HTTP 200 with a strictly parsed body. */
+  async getReceiptOutcome(receiptId: string): Promise<ReceiptOutcome> {
+    if (!DECISION_ID_UUID.test(receiptId)) {
+      throw new ChatbotApiError(
+        'Receipt id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>(
       {
-        method: 'POST',
-        url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/receipts`,
-        data: dto,
+        method: 'GET',
+        url: `/chatbot-api/receipts/${encodeURIComponent(receiptId)}`,
       },
-      options,
+      { retryable: true },
     );
+    const body = response.data;
+    const outcome = parseReceiptOutcome(body);
+    if (response.status !== 200 || outcome === null) {
+      throw new UpstreamError(
+        'Chatbot API receipt outcome response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return outcome;
   }
 
   async updateDelivery(
@@ -613,6 +801,86 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   }
 
   /**
+   * DELIVERY_ZONE intake (docs/contracts/delivery-zone-bot-cycle.md §4.1).
+   * The exact ten-key body is normalized before any request and
+   * `X-Idempotency-Key` equals `sourceRequestId`. Exactly one POST (no retry:
+   * a replay is the caller's choice under the same key); only a `201`/`200`
+   * requester bound to the sent `sourceRequestId` resolves.
+   */
+  async submitDeliveryZoneIntake(
+    dto: DeliveryZoneIntakeInput,
+  ): Promise<DeliveryZoneRequester> {
+    const sent = normalizeDeliveryZoneIntake(dto);
+    if (sent === null) {
+      throw new ChatbotApiError(
+        'DELIVERY_ZONE intake DTO failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>({
+      method: 'POST',
+      url: '/chatbot-api/human-decisions',
+      data: sent,
+      headers: { 'X-Idempotency-Key': sent.sourceRequestId },
+    });
+    const body = response.data;
+    const requester = normalizeDeliveryZoneRequester(body);
+    if (
+      (response.status !== 201 && response.status !== 200) ||
+      requester === null ||
+      requester.sourceRequestId.toLowerCase() !==
+        sent.sourceRequestId.toLowerCase()
+    ) {
+      throw new UpstreamError(
+        'Chatbot API DELIVERY_ZONE intake response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return requester;
+  }
+
+  /** DELIVERY_ZONE poll by requester id (§4.2): UUID-validated before any
+   * request, safe GET retry policy, HTTP 200 bound to the requested id. */
+  async getDeliveryZoneRequester(
+    requesterId: string,
+  ): Promise<DeliveryZoneRequester> {
+    if (!DECISION_ID_UUID.test(requesterId)) {
+      throw new ChatbotApiError(
+        'DELIVERY_ZONE requester id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>(
+      {
+        method: 'GET',
+        url: `/chatbot-api/human-decisions/${encodeURIComponent(requesterId)}`,
+      },
+      { retryable: true },
+    );
+    const body = response.data;
+    const requester = normalizeDeliveryZoneRequester(body);
+    if (
+      response.status !== 200 ||
+      requester === null ||
+      requester.id.toLowerCase() !== requesterId.toLowerCase()
+    ) {
+      throw new UpstreamError(
+        'Chatbot API DELIVERY_ZONE poll response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    return requester;
+  }
+
+  /**
    * `POST /chatbot-api/human-decisions` RESTOCK intake (contract v1, scope
    * `human-decisions:create`).
    *
@@ -756,70 +1024,17 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   }
 
   /**
-   * Attachment-only (WU11B) transport: exactly one POST, no retries, no
-   * sleeps. The timeout is owned by this client
-   * (`receiptMedia.attachTimeoutMs`, forwarded as the Axios `timeout`) and
-   * a caller-supplied `AbortSignal` is forwarded verbatim as the Axios
-   * `signal`. Axios rejections keep flowing through `mapError()` with
-   * status/body/errorCode evidence; only *fulfilled* responses with an
-   * unexpected status or body are converted here to an `UpstreamError`
-   * that keeps the same evidence — this error is thrown out of this
-   * private seam and never re-mapped, so no evidence is lost.
-   */
-  private async requestAttachReceipt(
-    config: AxiosRequestConfig,
-    options: AttachReceiptTransportOptions,
-  ): Promise<AttachReceiptResponse> {
-    const timeoutMs = this.configService.getOrThrow<
-      NonNullable<AppConfig['receiptMedia']['attachTimeoutMs']>
-    >('receiptMedia.attachTimeoutMs');
-
-    const requestConfig = this.buildAuthedRequestConfig({
-      ...config,
-      timeout: timeoutMs,
-      signal: options.signal,
-    });
-
-    let response;
-    try {
-      response = await lastValueFrom(
-        this.httpService.request<AttachReceiptResponse>(requestConfig),
-      );
-    } catch (error) {
-      throw this.mapError(error);
-    }
-
-    const body = response.data;
-    const isValid =
-      response.status === 201 &&
-      typeof body === 'object' &&
-      body !== null &&
-      !Array.isArray(body) &&
-      typeof (body as { receiptId?: unknown }).receiptId === 'string' &&
-      (body as { status?: unknown }).status === 'PENDING';
-
-    if (!isValid) {
-      throw new UpstreamError(
-        'Chatbot API attach-receipt response was invalid',
-        response.status,
-        body,
-        extractErrorCode(body),
-      );
-    }
-
-    return body;
-  }
-
-  /**
    * Shared single-branch auth envelope: base URL + `Authorization` and
    * `X-Branch-Id` headers (ADR-16), applied identically to every
-   * chatbot-api request including the attachment-only transport.
+   * chatbot-api request including the attachment-only transport. A request
+   * without its own `timeout` gets the bounded default.
    */
   private buildAuthedRequestConfig(
     config: AxiosRequestConfig,
   ): AxiosRequestConfig {
     return {
       ...config,
+      timeout: config.timeout ?? CHATBOT_API_TIMEOUTS_MS.default,
       baseURL:
         this.configService.getOrThrow<AppConfig['chatbotApi']['baseUrl']>(
           'chatbotApi.baseUrl',

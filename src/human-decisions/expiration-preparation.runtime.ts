@@ -47,8 +47,6 @@ export class ExpirationPreparationRuntime
   onApplicationBootstrap(): void {
     if (this.bootstrapped || this.stopped) return;
     this.bootstrapped = true;
-    if (this.config.get('minimalCatalogAgent.expirationEnabled') !== true)
-      return;
     const branch = this.config.get<string>('chatbotApi.branchId');
     const phone = this.config.get<string>('meta.phoneNumberId');
     if (typeof branch !== 'string' || !branch.trim()) {

@@ -54,8 +54,6 @@ describe('AgentRunner', () => {
       update: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
     // Cast to the typed shape for ease.
     store.get = jest.fn();

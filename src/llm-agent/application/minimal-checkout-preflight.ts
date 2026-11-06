@@ -64,9 +64,9 @@ export function minimalCheckoutReply(
   },
 ): string {
   if (result.ok && flow.checkout)
-    return `Revisión de compra: subtotal de productos $${(result.productsSubtotalCents / 100).toFixed(2)} MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega${flow.shipping ? ', obtener un envío aprobado' : ''} y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.`;
+    return `Revisión de compra: subtotal de productos $${(result.productsSubtotalCents / 100).toFixed(2)} MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega${flow.shipping ? ', cotizar el envío o elegir recoger en tienda' : ''} y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.`;
   if (result.ok)
-    return `Revisión de compra: subtotal de productos $${(result.productsSubtotalCents / 100).toFixed(2)} MXN. No incluye envío. Falta confirmar sus datos y dirección, obtener un envío aprobado y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.`;
+    return `Revisión de compra: subtotal de productos $${(result.productsSubtotalCents / 100).toFixed(2)} MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.`;
   switch (result.reason) {
     case 'empty_cart':
       return 'Su carrito está vacío. Agregue productos antes de revisar la compra. No se creó ningún pedido.';

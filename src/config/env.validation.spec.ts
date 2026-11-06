@@ -185,6 +185,30 @@ describe('envValidationSchema', () => {
       expect(error).toBeUndefined();
       expect(value.PORT).toBe(3000);
     });
+
+    it('ignores the removed minimal-route enable, allowlist and order vars', () => {
+      const env = {
+        ...validEnv,
+        MINIMAL_CATALOG_AGENT_ENABLED: 'not-a-boolean',
+        MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: 'owner@example.com',
+        MINIMAL_CATALOG_ORDER_ENABLED: 'nope',
+      };
+      const { error, value } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value).toEqual(
+        expect.objectContaining({
+          MINIMAL_CATALOG_AGENT_ENABLED: 'not-a-boolean',
+          MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS: 'owner@example.com',
+          MINIMAL_CATALOG_ORDER_ENABLED: 'nope',
+        }),
+      );
+      const { value: baseline } = envValidationSchema.validate(validEnv) as {
+        value: Record<string, unknown>;
+      };
+      expect(baseline).not.toHaveProperty('MINIMAL_CATALOG_AGENT_ENABLED');
+    });
   });
 
   // ─── LLM agent env vars ───────────────────────────────────────────────────
@@ -369,12 +393,9 @@ describe('envValidationSchema', () => {
   });
 
   // ─── Task T3.1 / T3.2: human-handoff env vars ─────────────────────────
-  describe('OPS_CHANNEL_PHONE / HUMAN_HANDOFF_ENABLED', () => {
-    it('rejects when HUMAN_HANDOFF_ENABLED=true and OPS_CHANNEL_PHONE is missing', () => {
-      const env: Record<string, string> = {
-        ...validEnv,
-        HUMAN_HANDOFF_ENABLED: 'true',
-      };
+  describe('OPS_CHANNEL_PHONE (always required)', () => {
+    it('rejects when OPS_CHANNEL_PHONE is missing', () => {
+      const env: Record<string, string> = { ...validEnv };
       delete env.OPS_CHANNEL_PHONE;
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
@@ -385,7 +406,7 @@ describe('envValidationSchema', () => {
       ).toBe(true);
     });
 
-    it('rejects when OPS_CHANNEL_PHONE is an empty string (HUMAN_HANDOFF_ENABLED=true)', () => {
+    it('rejects when OPS_CHANNEL_PHONE is an empty string', () => {
       const env = { ...validEnv, OPS_CHANNEL_PHONE: '' };
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
@@ -446,7 +467,7 @@ describe('envValidationSchema', () => {
       },
     );
 
-    it('accepts a valid OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is true (default)', () => {
+    it('accepts a valid OPS_CHANNEL_PHONE', () => {
       const env = { ...validEnv, OPS_CHANNEL_PHONE: '5219999888777' };
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
@@ -454,7 +475,7 @@ describe('envValidationSchema', () => {
       expect(error).toBeUndefined();
     });
 
-    it('accepts missing OPS_CHANNEL_PHONE when HUMAN_HANDOFF_ENABLED is false', () => {
+    it('still requires OPS_CHANNEL_PHONE when the removed HUMAN_HANDOFF_ENABLED=false is set', () => {
       const env: Record<string, string> = {
         ...validEnv,
         HUMAN_HANDOFF_ENABLED: 'false',
@@ -463,58 +484,11 @@ describe('envValidationSchema', () => {
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
       });
-      expect(error).toBeUndefined();
-    });
-
-    it('applies HUMAN_HANDOFF_ENABLED default true when absent', () => {
-      const env: Record<string, string> = { ...validEnv };
-      delete env.OPS_CHANNEL_PHONE;
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      // Default is true so missing OPS_CHANNEL_PHONE is rejected.
       expect(error).toBeDefined();
+      expect(
+        error!.details.some((d) => d.path.includes('OPS_CHANNEL_PHONE')),
+      ).toBe(true);
     });
-  });
-
-  // ─── WU2A: experimental human-decisions RESTOCK gate ──────────────────
-  describe('HUMAN_DECISIONS_RESTOCK_ENABLED', () => {
-    const validate = (value: string | undefined) => {
-      const env: Record<string, string | undefined> = { ...validEnv };
-      if (value === undefined) {
-        delete env.HUMAN_DECISIONS_RESTOCK_ENABLED;
-      } else {
-        env.HUMAN_DECISIONS_RESTOCK_ENABLED = value;
-      }
-      return envValidationSchema.validate(env, { abortEarly: false });
-    };
-
-    it('accepts an absent value and defaults it to "false"', () => {
-      const result = validate(undefined);
-      expect(result.error).toBeUndefined();
-      const value = result.value as {
-        HUMAN_DECISIONS_RESTOCK_ENABLED?: unknown;
-      };
-      expect(value.HUMAN_DECISIONS_RESTOCK_ENABLED).toBe('false');
-    });
-
-    it('accepts the exact strings "true" and "false"', () => {
-      expect(validate('true').error).toBeUndefined();
-      expect(validate('false').error).toBeUndefined();
-    });
-
-    it.each(['TRUE', 'True', '1', '0', 'yes', '', 'true '])(
-      'rejects the ambiguous value %p so activation stays unambiguous',
-      (value) => {
-        const { error } = validate(value);
-        expect(error).toBeDefined();
-        expect(
-          error?.details.some((d) =>
-            d.path.includes('HUMAN_DECISIONS_RESTOCK_ENABLED'),
-          ),
-        ).toBe(true);
-      },
-    );
   });
 
   describe('META_SANDBOX_RECIPIENT_NORMALIZATION', () => {
@@ -545,112 +519,81 @@ describe('envValidationSchema', () => {
   // the listed receipt-media fields. WU1C2A extends enabledBase once with
   // numeric timeout/concurrency/lease/poll/attach values and proves the
   // relational bounds at the same compactness budget.
-  describe('RECEIPT_MEDIA_* conditional foundation (WU1C1+WU1C2A)', () => {
+  describe('RECEIPT_MEDIA_* (always on, receipt payment flow R3)', () => {
     const enabledBase = {
       ...validEnv,
-      RECEIPT_MEDIA_ENABLED: 'true',
       RECEIPT_MEDIA_MAX_BYTES: '10485760',
       META_MEDIA_ALLOWED_HOSTS: 'graph.facebook.com,.meta.com',
-      RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
-      RECEIPT_STORAGE_REGION: 'us-east-1',
-      RECEIPT_STORAGE_BUCKET: 'houndfe-receipts',
-      RECEIPT_STORAGE_ACCESS_KEY_ID: 'AKIAEXAMPLE',
-      RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'redacted-secret-value',
-      RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
-      RECEIPT_MEDIA_METRICS_ENABLED: 'true',
       // WU15-1: dedicated metrics Bearer token — 64 hex chars from 32 random bytes.
       RECEIPT_MEDIA_METRICS_TOKEN:
         'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
       // WU1C2A numeric relations: metadata=5s, download=30s,
-      // concurrency=2, lease=exactly 60s, poll=1s, attach=30s.
+      // concurrency=2, lease=exactly 60s, poll=1s.
       META_MEDIA_METADATA_TIMEOUT_MS: '5000',
       META_MEDIA_DOWNLOAD_TIMEOUT_MS: '30000',
       RECEIPT_MEDIA_WORKER_CONCURRENCY: '2',
       RECEIPT_MEDIA_WORKER_LEASE_MS: '60000',
       RECEIPT_MEDIA_WORKER_POLL_MS: '1000',
-      CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
-      // WU1C2B1: versioned keyring v1=32-byte "A" key, v2=32-byte "B" key; active=v2.
-      RECEIPT_CAPABILITY_KEYS:
-        '1:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=,2:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=',
-      RECEIPT_CAPABILITY_ACTIVE_VERSION: '2',
     };
 
-    // ─── Disabled permissiveness ───────────────────────────────────────
-    const disabledCases: Array<[string, Record<string, unknown>]> = [
-      ['no receipt fields at all', { ...validEnv }],
-      [
-        'enabled=false with malformed max bytes',
-        {
-          ...validEnv,
-          RECEIPT_MEDIA_ENABLED: 'false',
-          RECEIPT_MEDIA_MAX_BYTES: 'not-an-int',
-        },
-      ],
-      [
-        'enabled=false with malformed allowed hosts',
-        {
-          ...validEnv,
-          RECEIPT_MEDIA_ENABLED: 'false',
-          META_MEDIA_ALLOWED_HOSTS: 'http://example.com:443/path',
-        },
-      ],
-      [
-        'enabled=false with malformed capability keyring + active version',
-        {
-          ...validEnv,
-          RECEIPT_MEDIA_ENABLED: 'false',
-          RECEIPT_CAPABILITY_KEYS: 'not-a-keyring',
-          RECEIPT_CAPABILITY_ACTIVE_VERSION: 'not-an-int',
-        },
-      ],
-    ];
-    it.each(disabledCases)('disabled accepts: %s', (_label, env) => {
-      const { error } = envValidationSchema.validate(env, {
+    it('derives every receipt knob from defaults when none is set', () => {
+      const { error, value } = envValidationSchema.validate(validEnv, {
         abortEarly: false,
-      });
+      }) as { error?: undefined; value: Record<string, unknown> };
       expect(error).toBeUndefined();
+      expect(value).toMatchObject({
+        RECEIPT_MEDIA_MAX_BYTES: 10485760,
+        META_MEDIA_ALLOWED_HOSTS: 'lookaside.fbsbx.com',
+        META_MEDIA_METADATA_TIMEOUT_MS: 10000,
+        META_MEDIA_DOWNLOAD_TIMEOUT_MS: 30000,
+        RECEIPT_MEDIA_WORKER_CONCURRENCY: 2,
+        RECEIPT_MEDIA_WORKER_LEASE_MS: 60000,
+        RECEIPT_MEDIA_WORKER_POLL_MS: 5000,
+      });
     });
 
-    // ─── Valid enabled fixture ─────────────────────────────────────────
-    it('accepts a complete valid enabled environment', () => {
-      const { error } = envValidationSchema.validate(enabledBase, {
-        abortEarly: false,
-      });
-      expect(error).toBeUndefined();
-    });
-
-    // ─── Missing required enabled fields ──────────────────────────────
-    const enabledRequiredFields = [
-      'RECEIPT_MEDIA_MAX_BYTES',
-      'META_MEDIA_ALLOWED_HOSTS',
+    // R3/S4: removed storage, capability and flag vars are not validated, so
+    // any value (even a malformed one) has no effect.
+    const REMOVED_RECEIPT_VARS = [
+      'RECEIPT_MEDIA_ENABLED',
+      'RECEIPT_MEDIA_INGESTION_ENABLED',
       'RECEIPT_STORAGE_ENDPOINT',
       'RECEIPT_STORAGE_REGION',
       'RECEIPT_STORAGE_BUCKET',
       'RECEIPT_STORAGE_ACCESS_KEY_ID',
       'RECEIPT_STORAGE_SECRET_ACCESS_KEY',
+      'RECEIPT_STORAGE_FORCE_PATH_STYLE',
       'RECEIPT_MEDIA_PUBLIC_BASE_URL',
       'RECEIPT_CAPABILITY_KEYS',
       'RECEIPT_CAPABILITY_ACTIVE_VERSION',
+      'CHATBOT_API_ATTACH_TIMEOUT_MS',
     ];
-    it.each(enabledRequiredFields)(
-      'rejects enabled with missing %s',
-      (field) => {
-        const env: Record<string, unknown> = { ...enabledBase };
-        delete env[field];
-        const { error } = envValidationSchema.validate(env, {
+    it.each(['true', 'false', 'not-a-url', ''])(
+      'boots unchanged with the removed receipt vars set to %j',
+      (value) => {
+        const env: Record<string, unknown> = { ...validEnv };
+        for (const key of REMOVED_RECEIPT_VARS) env[key] = value;
+        const removed = envValidationSchema.validate(env, {
           abortEarly: false,
         });
-        expect(error).toBeDefined();
-        expect(error!.details.some((d) => d.path.includes(field))).toBe(true);
+        const plain = envValidationSchema.validate(validEnv, {
+          abortEarly: false,
+        });
+        expect(removed.error).toBeUndefined();
+        const validated = removed.value as Record<string, unknown>;
+        for (const key of Object.keys(plain.value as object))
+          expect(validated[key]).toEqual(
+            (plain.value as Record<string, unknown>)[key],
+          );
       },
     );
-    it.each(enabledRequiredFields)('rejects enabled with empty %s', (field) => {
-      const env = { ...enabledBase, [field]: '' };
-      const { error } = envValidationSchema.validate(env, {
+
+    // ─── Valid enabled fixture ─────────────────────────────────────────
+    it('accepts a complete valid environment', () => {
+      const { error } = envValidationSchema.validate(enabledBase, {
         abortEarly: false,
       });
-      expect(error).toBeDefined();
-      expect(error!.details.some((d) => d.path.includes(field))).toBe(true);
+      expect(error).toBeUndefined();
     });
 
     // ─── Exact max bytes ──────────────────────────────────────────────
@@ -670,26 +613,6 @@ describe('envValidationSchema', () => {
         abortEarly: false,
       });
       expect(error).toBeUndefined();
-    });
-
-    // ─── HTTPS-only URLs ──────────────────────────────────────────────
-    const urlFields = [
-      'RECEIPT_STORAGE_ENDPOINT',
-      'RECEIPT_MEDIA_PUBLIC_BASE_URL',
-    ];
-    it.each(urlFields)('rejects http:// scheme for %s', (field) => {
-      const env = { ...enabledBase, [field]: 'http://example.com' };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-    });
-    it.each(urlFields)('rejects malformed %s', (field) => {
-      const env = { ...enabledBase, [field]: 'not-a-url' };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
     });
 
     // ─── Host labels: exact vs leading-dot suffix vs malformed ────────
@@ -728,85 +651,12 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
-    // ─── Booleans: canonical vs arbitrary vs empty ─────────────────────
-    const booleanFields = [
-      'RECEIPT_STORAGE_FORCE_PATH_STYLE',
-      'RECEIPT_MEDIA_METRICS_ENABLED',
-    ];
-    it.each(['true', 'false'] as const)(
-      'accepts %s canonical booleans',
-      (value) => {
-        for (const field of booleanFields) {
-          const env = { ...enabledBase, [field]: value };
-          const { error } = envValidationSchema.validate(env, {
-            abortEarly: false,
-          });
-          expect(error).toBeUndefined();
-        }
-      },
-    );
-    it.each(booleanFields)('rejects empty %s', (field) => {
-      const env = { ...enabledBase, [field]: '' };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-    });
-    it.each(booleanFields)('rejects arbitrary value for %s', (field) => {
-      const env = { ...enabledBase, [field]: 'yes' };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-    });
-
-    // ─── R3-cleanup-rollout-gate: independent default-false ingestion gate ─
-    // The gate is NOT keyed on RECEIPT_MEDIA_ENABLED (the accepts case below
-    // uses `validEnv`, which has no RECEIPT_MEDIA_ENABLED), so it can never be
-    // silently implied by the broad flag and always defaults fail-closed.
-    it('defaults RECEIPT_MEDIA_INGESTION_ENABLED to false when absent', () => {
-      const { error, value } = envValidationSchema.validate(validEnv, {
-        abortEarly: false,
-      }) as { error?: undefined; value: Record<string, unknown> };
-      expect(error).toBeUndefined();
-      expect(value.RECEIPT_MEDIA_INGESTION_ENABLED).toBe(false);
-    });
-
-    it.each(['true', 'false'] as const)(
-      'accepts canonical RECEIPT_MEDIA_INGESTION_ENABLED=%s without RECEIPT_MEDIA_ENABLED',
-      (flag) => {
-        const { error } = envValidationSchema.validate(
-          { ...validEnv, RECEIPT_MEDIA_INGESTION_ENABLED: flag },
-          { abortEarly: false },
-        );
-        expect(error).toBeUndefined();
-      },
-    );
-
-    it('rejects a non-boolean RECEIPT_MEDIA_INGESTION_ENABLED', () => {
-      const { error } = envValidationSchema.validate(
-        { ...validEnv, RECEIPT_MEDIA_INGESTION_ENABLED: 'yes' },
-        { abortEarly: false },
-      );
-      expect(error).toBeDefined();
-      expect(
-        error!.details.some((d) =>
-          d.path.includes('RECEIPT_MEDIA_INGESTION_ENABLED'),
-        ),
-      ).toBe(true);
-    });
-
-    // ─── WU15-1: Independent metrics flag + dedicated token validation ─────
-    // RECEIPT_MEDIA_METRICS_ENABLED is independently validated (not keyed on
-    // RECEIPT_MEDIA_ENABLED); token is required ONLY when metrics is enabled.
-
-    // Metrics disabled: any supplied token must still be valid 64hex.
-    // RED: current schema accepts malformed tokens when disabled.
-    it('rejects disabled metrics with supplied invalid-token (too short)', () => {
+    // ─── WU15-1: Optional dedicated metrics token validation ──────────────
+    // RECEIPT_MEDIA_METRICS_TOKEN is optional; the metrics endpoint is served
+    // exactly when it is configured. Any supplied token must be valid 64hex.
+    it('rejects supplied invalid token (too short)', () => {
       const env = {
         ...validEnv,
-        RECEIPT_MEDIA_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
         RECEIPT_MEDIA_METRICS_TOKEN: 'too-short',
       };
       const { error } = envValidationSchema.validate(env, {
@@ -815,11 +665,9 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
-    it('rejects disabled metrics with supplied invalid-token (non-hex chars)', () => {
+    it('rejects supplied invalid token (non-hex chars)', () => {
       const env = {
         ...validEnv,
-        RECEIPT_MEDIA_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
         RECEIPT_MEDIA_METRICS_TOKEN:
           'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ',
       };
@@ -829,90 +677,28 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
-    it('rejects disabled metrics with supplied 65-char token', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_TOKEN: 'a'.repeat(65),
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-    });
-
-    it('accepts disabled metrics with absent RECEIPT_MEDIA_METRICS_TOKEN', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeUndefined();
-    });
-
-    it('accepts disabled metrics with valid 64hex RECEIPT_MEDIA_METRICS_TOKEN', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_TOKEN:
-          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeUndefined();
-    });
-
-    // Metrics disabled + enabled flag independently: valid token supplied with metrics=false → OK
-    it('accepts disabled metrics with valid token even when metricsEnabled absent', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_METRICS_TOKEN:
-          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeUndefined();
-    });
-
-    it('accepts enabled metrics with valid token when RECEIPT_MEDIA_ENABLED=false', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_ENABLED: 'false',
-        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
-        RECEIPT_MEDIA_METRICS_TOKEN:
-          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeUndefined();
-    });
-
-    // Metrics enabled: token is required
-    it('rejects enabled metrics with missing RECEIPT_MEDIA_METRICS_TOKEN', () => {
-      const env = {
-        ...enabledBase,
-      };
+    it('accepts absent RECEIPT_MEDIA_METRICS_TOKEN', () => {
+      const env = { ...enabledBase };
       delete (env as Record<string, unknown>).RECEIPT_MEDIA_METRICS_TOKEN;
       const { error } = envValidationSchema.validate(env, {
         abortEarly: false,
       });
-      expect(error).toBeDefined();
-      expect(
-        error!.details.some((d) =>
-          d.path.includes('RECEIPT_MEDIA_METRICS_TOKEN'),
-        ),
-      ).toBe(true);
+      expect(error).toBeUndefined();
     });
 
-    it('rejects enabled metrics with empty RECEIPT_MEDIA_METRICS_TOKEN', () => {
+    it('accepts a valid token without any other receipt var', () => {
+      const env = {
+        ...validEnv,
+        RECEIPT_MEDIA_METRICS_TOKEN:
+          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+      };
+      const { error } = envValidationSchema.validate(env, {
+        abortEarly: false,
+      });
+      expect(error).toBeUndefined();
+    });
+
+    it('rejects empty RECEIPT_MEDIA_METRICS_TOKEN', () => {
       const env = {
         ...enabledBase,
         RECEIPT_MEDIA_METRICS_TOKEN: '',
@@ -923,7 +709,7 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
-    it('rejects enabled metrics with whitespace-only RECEIPT_MEDIA_METRICS_TOKEN', () => {
+    it('rejects whitespace-only RECEIPT_MEDIA_METRICS_TOKEN', () => {
       const env = {
         ...enabledBase,
         RECEIPT_MEDIA_METRICS_TOKEN: '   ',
@@ -934,7 +720,7 @@ describe('envValidationSchema', () => {
       expect(error).toBeDefined();
     });
 
-    it('accepts enabled metrics with valid RECEIPT_MEDIA_METRICS_TOKEN', () => {
+    it('accepts valid RECEIPT_MEDIA_METRICS_TOKEN', () => {
       const env = {
         ...enabledBase,
         RECEIPT_MEDIA_METRICS_TOKEN:
@@ -1019,39 +805,24 @@ describe('envValidationSchema', () => {
       expect(String(original)).not.toContain(TOKEN_SENTINEL);
     });
 
-    // Metrics flag is independently validated (not keyed on RECEIPT_MEDIA_ENABLED)
-    it('accepts RECEIPT_MEDIA_METRICS_ENABLED=true without RECEIPT_MEDIA_ENABLED=true', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
-        RECEIPT_MEDIA_METRICS_TOKEN:
-          'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeUndefined();
-    });
-
-    it('rejects RECEIPT_MEDIA_METRICS_ENABLED=true without RECEIPT_MEDIA_METRICS_TOKEN', () => {
-      const env = {
-        ...validEnv,
-        RECEIPT_MEDIA_METRICS_ENABLED: 'true',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-      expect(
-        error!.details.some((d) =>
-          d.path.includes('RECEIPT_MEDIA_METRICS_TOKEN'),
-        ),
-      ).toBe(true);
-    });
+    // T4: the removed RECEIPT_MEDIA_METRICS_ENABLED flag has no effect; an
+    // unknown key is tolerated and never makes the token required.
+    it.each(['true', 'false', 'not-a-boolean'])(
+      'ignores removed RECEIPT_MEDIA_METRICS_ENABLED=%s',
+      (value) => {
+        const env = { ...validEnv, RECEIPT_MEDIA_METRICS_ENABLED: value };
+        const result = envValidationSchema.validate(env, {
+          abortEarly: false,
+        });
+        const validated = result.value as Record<string, unknown>;
+        expect(result.error).toBeUndefined();
+        expect(validated.RECEIPT_MEDIA_METRICS_TOKEN).toBeUndefined();
+      },
+    );
 
     // ─── WU1C2A: Numeric relational bounds (compact table-driven) ────────
     // Every numeric env var is mutated in isolation against enabledBase.
-    // The relational case (download smaller than metadata) and lease/attach
+    // The relational case (download smaller than metadata) and lease
     // boundary cases are tested via the same path-targeted it.each plus a
     // tiny message-targeted assertion for the cross-field rule.
     const invalidNumericCases: Array<[string, string, string]> = [
@@ -1075,10 +846,6 @@ describe('envValidationSchema', () => {
       // RECEIPT_MEDIA_WORKER_POLL_MS: positive integer, < lease.
       ['poll=0', 'RECEIPT_MEDIA_WORKER_POLL_MS', '0'],
       ['poll=60000 (=lease)', 'RECEIPT_MEDIA_WORKER_POLL_MS', '60000'],
-      // CHATBOT_API_ATTACH_TIMEOUT_MS: positive integer, <=30000, < lease.
-      ['attach=0', 'CHATBOT_API_ATTACH_TIMEOUT_MS', '0'],
-      ['attach=30001 (max+1)', 'CHATBOT_API_ATTACH_TIMEOUT_MS', '30001'],
-      ['attach=60000 (=lease)', 'CHATBOT_API_ATTACH_TIMEOUT_MS', '60000'],
     ];
     it.each(invalidNumericCases)('rejects %s', (_label, field, value) => {
       const env = { ...enabledBase, [field]: value };
@@ -1108,7 +875,7 @@ describe('envValidationSchema', () => {
       expect(allText).toMatch(/META_MEDIA_METADATA_TIMEOUT_MS/);
     });
 
-    // Valid boundary table: min, max, equality, and exact attach cap.
+    // Valid boundary table: min, max and equality.
     const validNumericBoundaryCases: Array<[string, Record<string, string>]> = [
       [
         'min boundaries',
@@ -1117,7 +884,6 @@ describe('envValidationSchema', () => {
           META_MEDIA_DOWNLOAD_TIMEOUT_MS: '2',
           RECEIPT_MEDIA_WORKER_CONCURRENCY: '1',
           RECEIPT_MEDIA_WORKER_POLL_MS: '1',
-          CHATBOT_API_ATTACH_TIMEOUT_MS: '1',
         },
       ],
       [
@@ -1127,7 +893,6 @@ describe('envValidationSchema', () => {
           META_MEDIA_DOWNLOAD_TIMEOUT_MS: '59999',
           RECEIPT_MEDIA_WORKER_CONCURRENCY: '8',
           RECEIPT_MEDIA_WORKER_POLL_MS: '59999',
-          CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
         },
       ],
       [
@@ -1149,95 +914,6 @@ describe('envValidationSchema', () => {
       },
     );
 
-    // WU1C2B1: comma-separated version:base64 with unique positive versions; canonical base64 keys (RFC 4648 §4) >=32 bytes; active must be a member.
-    const INVALID_KEYRING_32A = 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=';
-    const INVALID_KEYRING_32B = 'QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=';
-    const KEYRING_TOO_SHORT_31 = 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==';
-    const KEY_WITH_INTERNAL_WS = `1:QUFB QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=`;
-    const KEY_DUP_VERSIONS = `1:${INVALID_KEYRING_32A},1:${INVALID_KEYRING_32B}`;
-    const hasFieldError = (err: unknown, field: string): boolean => {
-      const d = (err as { details?: Array<{ path: Array<string | number> }> })
-        ?.details;
-      return !!d?.some((p) => p.path.includes(field));
-    };
-
-    const invalidKeyringCases: Array<[string, string]> = [
-      ['only colon', ':'],
-      ['missing colon', `1${INVALID_KEYRING_32A}`],
-      ['empty version', `:${INVALID_KEYRING_32A}`],
-      ['non-integer version', `abc:${INVALID_KEYRING_32A}`],
-      ['zero version', `0:${INVALID_KEYRING_32A}`],
-      ['negative version', `-1:${INVALID_KEYRING_32A}`],
-      ['decimal version', `1.5:${INVALID_KEYRING_32A}`],
-      ['leading zero version', `01:${INVALID_KEYRING_32A}`],
-      ['empty base64', '1:'],
-      ['non-base64 alphabet', `1:${'@'.repeat(44)}`],
-      ['whitespace around entry', ` 1:${INVALID_KEYRING_32A}`],
-      ['internal whitespace in key', KEY_WITH_INTERNAL_WS],
-      ['length not multiple of 4', '1:QUFB'],
-      ['31-byte key (too short)', `1:${KEYRING_TOO_SHORT_31}`],
-      ['duplicate version', KEY_DUP_VERSIONS],
-      ['trailing comma', `1:${INVALID_KEYRING_32A},`],
-      ['leading comma', `,1:${INVALID_KEYRING_32A}`],
-      ['double comma', `1:${INVALID_KEYRING_32A},,2:${INVALID_KEYRING_32B}`],
-    ];
-    it.each(invalidKeyringCases)(
-      'rejects enabled with malformed RECEIPT_CAPABILITY_KEYS: %s',
-      (_label, keys) => {
-        const env = { ...enabledBase, RECEIPT_CAPABILITY_KEYS: keys };
-        const { error } = envValidationSchema.validate(env, {
-          abortEarly: false,
-        });
-        expect(hasFieldError(error, 'RECEIPT_CAPABILITY_KEYS')).toBe(true);
-      },
-    );
-
-    const invalidActiveVersionCases: Array<[string, string, string]> = [
-      ['zero active version', '0', `1:${INVALID_KEYRING_32A}`],
-      ['negative active version', '-1', `1:${INVALID_KEYRING_32A}`],
-      ['non-integer active version', 'abc', `1:${INVALID_KEYRING_32A}`],
-      ['non-member active version', '99', `1:${INVALID_KEYRING_32A}`],
-    ];
-    it.each(invalidActiveVersionCases)(
-      'rejects enabled with %s',
-      (_label, active, keys) => {
-        const env = {
-          ...enabledBase,
-          RECEIPT_CAPABILITY_KEYS: keys,
-          RECEIPT_CAPABILITY_ACTIVE_VERSION: active,
-        };
-        const { error } = envValidationSchema.validate(env, {
-          abortEarly: false,
-        });
-        expect(hasFieldError(error, 'RECEIPT_CAPABILITY_ACTIVE_VERSION')).toBe(
-          true,
-        );
-      },
-    );
-
-    const KEY_V1_V2 = `1:${INVALID_KEYRING_32A},2:${INVALID_KEYRING_32B}`;
-    const HUGE_KEYRING = `1:${INVALID_KEYRING_32A},9007199254740992:${INVALID_KEYRING_32B},9007199254740993:${INVALID_KEYRING_32A}`;
-    const validKeyringCases: Array<[string, string, string]> = [
-      ['single 32-byte key, active=v1', `1:${INVALID_KEYRING_32A}`, '1'],
-      ['two 32-byte keys, active=v2', KEY_V1_V2, '2'],
-      ['huge versions, active=lower', HUGE_KEYRING, '9007199254740992'],
-      ['huge versions, active=higher', HUGE_KEYRING, '9007199254740993'],
-    ];
-    it.each(validKeyringCases)(
-      'accepts enabled keyring: %s',
-      (_label, keys, active) => {
-        const env = {
-          ...enabledBase,
-          RECEIPT_CAPABILITY_KEYS: keys,
-          RECEIPT_CAPABILITY_ACTIVE_VERSION: active,
-        };
-        const { error } = envValidationSchema.validate(env, {
-          abortEarly: false,
-        });
-        expect(error).toBeUndefined();
-      },
-    );
-
     // ─── Existing & multi-field regression ────────────────────────────
     it('preserves existing validEnv compatibility', () => {
       const { error } = envValidationSchema.validate(validEnv, {
@@ -1245,351 +921,46 @@ describe('envValidationSchema', () => {
       });
       expect(error).toBeUndefined();
     });
-    it('does not interpolate the storage secret in validation errors', () => {
-      const env = {
-        ...enabledBase,
-        RECEIPT_STORAGE_ENDPOINT: 'not-a-url',
-        RECEIPT_STORAGE_SECRET_ACCESS_KEY: 'super-secret-sentinel',
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-      const allText = error!.details.map((d) => d.message).join(' | ');
-      expect(allText).not.toContain('super-secret-sentinel');
-    });
-
-    // ─── WU1C2B2: validation error redaction ───────────────────────────
-    // Two distinct sentinels are placed in credential-bearing and keyring-
-    // bearing fields and intentionally force a Joi failure on the same
-    // surface (URI for the endpoint, custom keyring parse). Every
-    // observable error projection — top-level message, detail/context
-    // serialization, and String(error) — MUST scrub both values before
-    // the error leaves the validation wrapper.
-    const STORAGE_CREDENTIAL_SENTINEL =
-      'wu1c2b2-storage-credential-sentinel-9af3';
-    const KEYRING_SENTINEL = 'wu1c2b2-keyring-sentinel-DEF456==';
-    const assertValidationErrorRedacted = (
-      error: Joi.ValidationError,
-    ): void => {
-      const detailsJson = JSON.stringify(error.details);
-      const stringified = String(error);
-      for (const sentinel of [STORAGE_CREDENTIAL_SENTINEL, KEYRING_SENTINEL]) {
-        expect(error.message).not.toContain(sentinel);
-        expect(detailsJson).not.toContain(sentinel);
-        expect(stringified).not.toContain(sentinel);
-      }
-    };
-
-    // Credential-only invalid: malformed URI carries the sentinel as its
-    // `context.value` (and the value sits inside `_original`). The
-    // keyring fields stay valid so the only failure path is the URI rule.
-    it('redacts credential value from invalid RECEIPT_STORAGE_ENDPOINT', () => {
-      const env = {
-        ...enabledBase,
-        RECEIPT_STORAGE_ENDPOINT: STORAGE_CREDENTIAL_SENTINEL,
-        RECEIPT_STORAGE_ACCESS_KEY_ID: STORAGE_CREDENTIAL_SENTINEL,
-        RECEIPT_STORAGE_SECRET_ACCESS_KEY: STORAGE_CREDENTIAL_SENTINEL,
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-      assertValidationErrorRedacted(error!);
-      // Field category is preserved for diagnostics.
-      expect(
-        error!.details.some((d) => d.path.includes('RECEIPT_STORAGE_ENDPOINT')),
-      ).toBe(true);
-    });
-
-    // Keyring-only invalid: forcing the keyring to be malformed surfaces
-    // the raw keyring sentinel through the custom throw and `_original`.
-    // The redaction must scrub both surfaces.
-    it('redacts keyring value from invalid RECEIPT_CAPABILITY_KEYS', () => {
-      const env = {
-        ...enabledBase,
-        RECEIPT_CAPABILITY_KEYS: KEYRING_SENTINEL,
-        RECEIPT_CAPABILITY_ACTIVE_VERSION: KEYRING_SENTINEL,
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-      assertValidationErrorRedacted(error!);
-    });
-
-    // Both invalid simultaneously: multi-error aggregation must scrub
-    // every detail independently — a single shared scrubber pass that
-    // only inspects the first detail would miss this case.
-    it('redacts both sentinels when credential and keyring fail together', () => {
-      const env = {
-        ...enabledBase,
-        RECEIPT_STORAGE_ENDPOINT: STORAGE_CREDENTIAL_SENTINEL,
-        RECEIPT_STORAGE_SECRET_ACCESS_KEY: STORAGE_CREDENTIAL_SENTINEL,
-        RECEIPT_CAPABILITY_KEYS: KEYRING_SENTINEL,
-        RECEIPT_CAPABILITY_ACTIVE_VERSION: KEYRING_SENTINEL,
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-      // Multi-error aggregation: at least one detail per failing field.
-      expect(
-        error!.details.some((d) => d.path.includes('RECEIPT_STORAGE_ENDPOINT')),
-      ).toBe(true);
-      expect(
-        error!.details.some((d) => d.path.includes('RECEIPT_CAPABILITY_KEYS')),
-      ).toBe(true);
-      assertValidationErrorRedacted(error!);
-    });
-
-    // Active-version-only invalid: the keyring parses fine but the
-    // active version is not a member, exercising a different throw site
-    // inside the same custom helper. The sentinel must still be scrubbed.
-    it('redacts sentinel passed as RECEIPT_CAPABILITY_ACTIVE_VERSION', () => {
-      const env = {
-        ...enabledBase,
-        RECEIPT_CAPABILITY_KEYS: `1:${INVALID_KEYRING_32A}`,
-        RECEIPT_CAPABILITY_ACTIVE_VERSION: KEYRING_SENTINEL,
-      };
-      const { error } = envValidationSchema.validate(env, {
-        abortEarly: false,
-      });
-      expect(error).toBeDefined();
-      assertValidationErrorRedacted(error!);
-    });
   });
 
-  // ── SQ-2A: default-off shipping-quote configuration ────────────────────
-  // `SHIPPING_QUOTES_ENABLED` gates every provider field through
-  // `shippingConditional`; when disabled the branch is fully permissive.
-  describe('SHIPPING_QUOTES_* conditional configuration (SQ-2A)', () => {
-    const enabledBase = {
-      ...validEnv,
-      SHIPPING_QUOTES_ENABLED: 'true',
-      SKYDROPX_BASE_URL: 'https://api-pro.skydropx.com',
-      SKYDROPX_CLIENT_ID: 'skydropx-client-id',
-      SKYDROPX_CLIENT_SECRET: 'skydropx-client-secret',
-      SKYDROPX_ORIGIN_POSTAL_CODE: '06000',
-      SKYDROPX_ORIGIN_STATE: 'Ciudad de Mexico',
-      SKYDROPX_ORIGIN_MUNICIPALITY: 'Cuauhtemoc',
-      SKYDROPX_ORIGIN_NEIGHBORHOOD: 'Centro',
-    };
-
-    const validate = (env: Record<string, unknown>) =>
-      envValidationSchema.validate(env, { abortEarly: false });
-    const expectValid = (env: Record<string, unknown>): void => {
-      expect(validate(env).error).toBeUndefined();
-    };
-    const expectFieldError = (
-      env: Record<string, unknown>,
-      field: string,
-    ): void => {
-      expect(
-        validate(env).error?.details.some((d) => d.path.includes(field)),
-      ).toBe(true);
-    };
-
-    // Disabled permissiveness: malformed/oversized provider values are fine.
-    it.each([
-      ['no shipping fields', { ...validEnv }],
-      ['explicit false', { ...validEnv, SHIPPING_QUOTES_ENABLED: 'false' }],
-      [
-        'malformed provider values',
-        {
+  // U6: the backend quotes carriers; the removed chatbot-side shipping vars
+  // are no longer validated, so any value (even a malformed one) has no effect.
+  describe('removed shipping vars', () => {
+    it.each(['true', 'false', 'TRUE', 'nope'])(
+      'boots unchanged with the removed shipping vars set (flags=%s)',
+      (flag) => {
+        const env = {
           ...validEnv,
-          SHIPPING_QUOTES_ENABLED: 'false',
+          SHIPPING_QUOTES_ENABLED: flag,
+          MINIMAL_CATALOG_SHIPPING_ENABLED: flag,
+          SHIPPING_DEMO_PARCEL_PROFILE_JSON: '{not json',
           SKYDROPX_BASE_URL: 'not-a-url',
           SKYDROPX_CLIENT_ID: '',
           SKYDROPX_CLIENT_SECRET: '',
           SKYDROPX_ORIGIN_POSTAL_CODE: 'abc',
-          SKYDROPX_ORIGIN_STATE: '',
+          SKYDROPX_ORIGIN_STATE: 'x'.repeat(101),
           SKYDROPX_ORIGIN_MUNICIPALITY: '',
           SKYDROPX_ORIGIN_NEIGHBORHOOD: '',
-        },
-      ],
-      [
-        'oversized provider value',
-        {
-          ...validEnv,
-          SHIPPING_QUOTES_ENABLED: 'false',
-          SKYDROPX_ORIGIN_STATE: 'x'.repeat(101),
-        },
-      ],
-    ] as Array<[string, Record<string, unknown>]>)(
-      'disabled accepts: %s',
-      (_label, env) => {
-        expectValid(env);
-      },
-    );
-
-    it('defaults SHIPPING_QUOTES_ENABLED to false when absent', () => {
-      const { error, value } = validate({ ...validEnv }) as {
-        error?: undefined;
-        value: Record<string, unknown>;
-      };
-      expect(error).toBeUndefined();
-      expect(value.SHIPPING_QUOTES_ENABLED).toBe(false);
-    });
-
-    it.each([
-      { flag: 'true', base: enabledBase, expected: true },
-      { flag: 'false', base: { ...validEnv }, expected: false },
-    ])(
-      'accepts canonical SHIPPING_QUOTES_ENABLED=$flag',
-      ({ flag, base, expected }) => {
-        // Enabling requires the full provider config; disabling is permissive.
-        const { error, value } = validate({
-          ...base,
-          SHIPPING_QUOTES_ENABLED: flag,
+        };
+        const { error, value } = envValidationSchema.validate(env, {
+          abortEarly: false,
         }) as { error?: undefined; value: Record<string, unknown> };
         expect(error).toBeUndefined();
-        expect(value.SHIPPING_QUOTES_ENABLED).toBe(expected);
+        // Passed through untouched (allowUnknown), never coerced or defaulted.
+        expect(value.SHIPPING_QUOTES_ENABLED).toBe(flag);
+        expect(value.SKYDROPX_BASE_URL).toBe('not-a-url');
       },
     );
 
-    it.each(['yes', 'maybe', '', 'TRUE', 'False', '1', '0', ' true '])(
-      'rejects noncanonical SHIPPING_QUOTES_ENABLED=%s',
-      (flag) => {
-        expectFieldError(
-          { ...validEnv, SHIPPING_QUOTES_ENABLED: flag },
-          'SHIPPING_QUOTES_ENABLED',
-        );
-      },
-    );
-
-    it('accepts a complete valid enabled environment', () => {
-      expectValid(enabledBase);
-    });
-
-    it('applies the Skydropx base URL default when enabled and absent', () => {
-      const env: Record<string, unknown> = { ...enabledBase };
-      delete env.SKYDROPX_BASE_URL;
-      const { error, value } = validate(env) as {
-        error?: undefined;
+    it('adds no shipping defaults when the removed vars are absent', () => {
+      const { value } = envValidationSchema.validate(validEnv) as {
         value: Record<string, unknown>;
       };
-      expect(error).toBeUndefined();
-      expect(value.SKYDROPX_BASE_URL).toBe('https://api-pro.skydropx.com');
-    });
-
-    const requiredFields = [
-      'SKYDROPX_CLIENT_ID',
-      'SKYDROPX_CLIENT_SECRET',
-      'SKYDROPX_ORIGIN_POSTAL_CODE',
-      'SKYDROPX_ORIGIN_STATE',
-      'SKYDROPX_ORIGIN_MUNICIPALITY',
-      'SKYDROPX_ORIGIN_NEIGHBORHOOD',
-    ];
-    it.each(requiredFields)('rejects enabled missing %s', (field) => {
-      const env: Record<string, unknown> = { ...enabledBase };
-      delete env[field];
-      expectFieldError(env, field);
-    });
-    it.each(requiredFields)('rejects enabled empty %s', (field) => {
-      expectFieldError({ ...enabledBase, [field]: '' }, field);
-    });
-    it.each(requiredFields)('rejects enabled whitespace-only %s', (field) => {
-      expectFieldError({ ...enabledBase, [field]: '   ' }, field);
-    });
-
-    // SQ-2A-H: accepted surrounding whitespace is trimmed consistently so the
-    // validated output matches what the configuration factory exposes.
-    it('trims accepted surrounding whitespace in enabled values', () => {
-      const { error, value } = validate({
-        ...enabledBase,
-        SKYDROPX_BASE_URL: '  https://api-pro.skydropx.com  ',
-        SKYDROPX_CLIENT_ID: '  client-id  ',
-        SKYDROPX_CLIENT_SECRET: '  client-secret  ',
-        SKYDROPX_ORIGIN_POSTAL_CODE: ' 06000 ',
-        SKYDROPX_ORIGIN_STATE: '  Ciudad de Mexico  ',
-        SKYDROPX_ORIGIN_MUNICIPALITY: '  Cuauhtemoc  ',
-        SKYDROPX_ORIGIN_NEIGHBORHOOD: '  Centro  ',
-      }) as { error?: undefined; value: Record<string, unknown> };
-      expect(error).toBeUndefined();
-      expect(value.SKYDROPX_BASE_URL).toBe('https://api-pro.skydropx.com');
-      expect(value.SKYDROPX_CLIENT_ID).toBe('client-id');
-      expect(value.SKYDROPX_CLIENT_SECRET).toBe('client-secret');
-      expect(value.SKYDROPX_ORIGIN_POSTAL_CODE).toBe('06000');
-      expect(value.SKYDROPX_ORIGIN_STATE).toBe('Ciudad de Mexico');
-      expect(value.SKYDROPX_ORIGIN_MUNICIPALITY).toBe('Cuauhtemoc');
-      expect(value.SKYDROPX_ORIGIN_NEIGHBORHOOD).toBe('Centro');
-    });
-
-    it.each(['http://api-pro.skydropx.com', 'not-a-url', ''])(
-      'rejects SKYDROPX_BASE_URL=%s',
-      (value) => {
-        expectFieldError(
-          { ...enabledBase, SKYDROPX_BASE_URL: value },
-          'SKYDROPX_BASE_URL',
-        );
-      },
-    );
-
-    it.each(['0600', '060000', 'O6000', '0600 '])(
-      'rejects non-5-digit SKYDROPX_ORIGIN_POSTAL_CODE=%s',
-      (value) => {
-        expectFieldError(
-          { ...enabledBase, SKYDROPX_ORIGIN_POSTAL_CODE: value },
-          'SKYDROPX_ORIGIN_POSTAL_CODE',
-        );
-      },
-    );
-    it('accepts a five-digit SKYDROPX_ORIGIN_POSTAL_CODE', () => {
-      expectValid({ ...enabledBase, SKYDROPX_ORIGIN_POSTAL_CODE: '06000' });
-    });
-
-    const originTextFields = [
-      'SKYDROPX_ORIGIN_STATE',
-      'SKYDROPX_ORIGIN_MUNICIPALITY',
-      'SKYDROPX_ORIGIN_NEIGHBORHOOD',
-    ];
-    it.each(originTextFields)('rejects empty %s', (field) => {
-      expectFieldError({ ...enabledBase, [field]: '' }, field);
-    });
-    it.each(originTextFields)('rejects oversized %s', (field) => {
-      expectFieldError({ ...enabledBase, [field]: 'x'.repeat(101) }, field);
-    });
-    it.each(originTextFields)('accepts 100-char %s boundary', (field) => {
-      expectValid({ ...enabledBase, [field]: 'x'.repeat(100) });
-    });
-
-    // Client credentials must never survive into any validation-error surface.
-    const CLIENT_SENTINEL = 'sq2a-client-credential-sentinel-7c1f';
-    const assertRedacted = (error: Joi.ValidationError): void => {
-      for (const surface of [
-        error.message,
-        JSON.stringify(error.details),
-        String(error),
-      ]) {
-        expect(surface).not.toContain(CLIENT_SENTINEL);
-      }
-    };
-
-    it('redacts client credentials from a malformed-URL error surface', () => {
-      const { error } = validate({
-        ...enabledBase,
-        SKYDROPX_BASE_URL: 'not-a-url',
-        SKYDROPX_CLIENT_ID: CLIENT_SENTINEL,
-        SKYDROPX_CLIENT_SECRET: CLIENT_SENTINEL,
-      });
-      expect(error).toBeDefined();
       expect(
-        error!.details.some((d) => d.path.includes('SKYDROPX_BASE_URL')),
-      ).toBe(true);
-      assertRedacted(error!);
-    });
-
-    it('redacts a sentinel carried inside a malformed credential value', () => {
-      const { error } = validate({
-        ...enabledBase,
-        SKYDROPX_CLIENT_SECRET: [CLIENT_SENTINEL],
-      });
-      expect(error).toBeDefined();
-      expect(
-        error!.details.some((d) => d.path.includes('SKYDROPX_CLIENT_SECRET')),
-      ).toBe(true);
-      assertRedacted(error!);
+        Object.keys(value).filter((key) =>
+          /^(SHIPPING_|SKYDROPX_|MINIMAL_CATALOG_SHIPPING)/.test(key),
+        ),
+      ).toEqual([]);
     });
   });
 });

@@ -23,8 +23,8 @@ const intent = (over: Partial<ReceiptMediaOutboxRow> = {}) =>
   ({
     id: 'i1',
     recipientId: '+525500000000',
-    templateKey: 'RECEIPT_AMOUNT_CONFIRM',
-    templateArgs: { amountCents: 123456 },
+    templateKey: 'RECEIPT_PAYMENT_PARTIAL',
+    templateArgs: { folio: 'F-1', debtCents: 123456 },
     status: 'PENDING',
     attempts: 0,
     leaseExpiresAt: LEASE,
@@ -83,7 +83,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(h.sendText).toHaveBeenCalledTimes(1);
     expect(h.sendText).toHaveBeenCalledWith({
       to: '+525500000000',
-      text: 'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
+      text: 'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
     });
   });
 
@@ -117,7 +117,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
   it('requeues attempts 1-2 and exhausts with exactly one alert on the third', async () => {
     const row = intent({
       id: 'i2',
-      templateKey: 'RECEIPT_CANCELLED',
+      templateKey: 'RECEIPT_ATTACH_UNKNOWN',
       templateArgs: {},
     });
     const h = harness([[row], [row], [row]]);
@@ -187,11 +187,11 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
   it('renders every tracked template key deterministically, no free-form path', () => {
     const argsFor = (
       key: ReceiptMediaOutboxRow['templateKey'],
-    ): Record<string, number | 'PENDING'> =>
-      key === 'RECEIPT_AMOUNT_CONFIRM'
-        ? { amountCents: 123456 }
-        : key === 'RECEIPT_ATTACHED_PENDING'
-          ? { backendStatus: 'PENDING' }
+    ): Record<string, number | string> =>
+      key === 'RECEIPT_ATTACHED_PENDING'
+        ? { folio: 'F-1' }
+        : key === 'RECEIPT_PAYMENT_PARTIAL'
+          ? { folio: 'F-1', debtCents: 150000 }
           : {};
     for (const key of RECEIPT_TEMPLATE_KEYS) {
       const row = intent({ templateKey: key, templateArgs: argsFor(key) });
@@ -202,14 +202,124 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       expect(text).toBe(text.trim());
     }
     expect(renderNotificationText(intent())).toBe(
-      'Detectamos 1234.56 MXN. Responde CONFIRMAR o CANCELAR.',
+      'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
     );
-    expect(
-      renderNotificationText({
-        templateKey: 'RECEIPT_ATTACHED_PENDING',
-        templateArgs: { backendStatus: 'PENDING' },
-      }),
-    ).toBe('Comprobante recibido, queda PENDIENTE (PENDING).');
+  });
+
+  describe('R2/S9 receipt outcome messages', () => {
+    const render = (
+      templateKey: ReceiptMediaOutboxRow['templateKey'],
+      templateArgs: Record<string, number | string> = {},
+    ) => renderNotificationText({ templateKey, templateArgs });
+
+    it('says received and in review with the folio, without any amount prompt', () => {
+      expect(render('RECEIPT_ATTACHED_PENDING', { folio: 'F-0042' })).toBe(
+        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme.',
+      );
+      expect(render('RECEIPT_ATTACHED_PENDING')).toBe(
+        'Recibimos su comprobante. Lo estamos revisando y le avisamos en cuanto se confirme.',
+      );
+    });
+
+    it('adds one sentence when the extracted amount differs from the order total', () => {
+      expect(
+        render('RECEIPT_ATTACHED_PENDING', {
+          folio: 'F-0042',
+          extractedAmountCents: 140050,
+          totalCents: 150000,
+        }),
+      ).toBe(
+        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme. Vemos un monto de $1,400.50 MXN y su pedido es de $1,500.00 MXN; lo revisamos igual.',
+      );
+    });
+
+    it.each([
+      [
+        'RECEIPT_SALE_ALREADY_PAID',
+        { folio: 'F-0042' },
+        'Su pedido F-0042 ya está pagado.',
+      ],
+      ['RECEIPT_SALE_ALREADY_PAID', {}, 'Su pedido ya está pagado.'],
+      [
+        'RECEIPT_SALE_NOT_PAYABLE',
+        {},
+        'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
+      ],
+      [
+        'RECEIPT_UNSUPPORTED_FORMAT',
+        {},
+        'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
+      ],
+      [
+        'RECEIPT_ATTACH_UNKNOWN',
+        {},
+        'Estamos registrando su comprobante; le avisamos en cuanto quede.',
+      ],
+      [
+        'RECEIPT_NOT_A_RECEIPT',
+        {},
+        'Esta imagen no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+      ],
+      [
+        'RECEIPT_NOT_A_RECEIPT',
+        { mediaKind: 'pdf' },
+        'Este archivo no parece un comprobante de pago. Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+      ],
+      [
+        'RECEIPT_PDF_ENCRYPTED',
+        {},
+        'Su PDF está protegido con contraseña y no podemos abrirlo. ¿Nos envía una captura de pantalla del comprobante?',
+      ],
+    ] as const)('renders %s %j', (key, args, text) => {
+      expect(render(key, args)).toBe(text);
+    });
+  });
+
+  describe('R5/S5 human outcome messages', () => {
+    const render = (
+      templateKey: ReceiptMediaOutboxRow['templateKey'],
+      templateArgs: Record<string, number | string> = {},
+    ) => renderNotificationText({ templateKey, templateArgs });
+
+    it.each([
+      [
+        'RECEIPT_PAYMENT_CONFIRMED',
+        { folio: 'F-0042' },
+        '¡Listo! Confirmamos su pago del pedido F-0042. Gracias por su compra.',
+      ],
+      [
+        'RECEIPT_PAYMENT_CONFIRMED',
+        {},
+        '¡Listo! Confirmamos su pago de su pedido. Gracias por su compra.',
+      ],
+      [
+        'RECEIPT_PAYMENT_PARTIAL',
+        { folio: 'F-0042', debtCents: 150000 },
+        'Confirmamos un pago de su pedido F-0042. Queda un saldo pendiente de $1,500.00 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+      ],
+      [
+        'RECEIPT_PAYMENT_PARTIAL',
+        { debtCents: 5 },
+        'Confirmamos un pago de su pedido. Queda un saldo pendiente de $0.05 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+      ],
+      [
+        'RECEIPT_PAYMENT_REJECTED',
+        { folio: 'F-0042', reason: 'El monto no coincide' },
+        'No pudimos confirmar su comprobante del pedido F-0042: El monto no coincide. ¿Me puede enviar otro comprobante?',
+      ],
+      [
+        'RECEIPT_PAYMENT_REJECTED',
+        { folio: 'F-0042' },
+        'No pudimos confirmar su comprobante del pedido F-0042. ¿Me puede enviar otro comprobante?',
+      ],
+      [
+        'RECEIPT_PAYMENT_REJECTED',
+        { reason: 'Comprobante ilegible.' },
+        'No pudimos confirmar su comprobante de su pedido: Comprobante ilegible. ¿Me puede enviar otro comprobante?',
+      ],
+    ] as const)('renders %s %j', (key, args, text) => {
+      expect(render(key, args)).toBe(text);
+    });
   });
 
   it('shutdown stops claims, wakes polling, drains the active send, idempotent', async () => {
@@ -240,6 +350,96 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(h.markSent).not.toHaveBeenCalled();
     expect(h.reschedule).not.toHaveBeenCalled();
     expect(h.onExhausted).not.toHaveBeenCalled();
+  });
+
+  describe('G2: outcome intents re-check the 24 h window at send time', () => {
+    const gated = (open: boolean | Error, row = intent()) => {
+      const h = harness([[row]]);
+      const isOpen = jest.fn((recipientId: string) => {
+        void recipientId;
+        return open instanceof Error
+          ? Promise.reject(open)
+          : Promise.resolve(open);
+      });
+      const markNotDelivered = jest.fn<
+        Promise<boolean>,
+        [string, string, Date]
+      >(() => Promise.resolve(true));
+      const worker = new ReceiptMediaNotificationWorker(
+        {
+          claimBatch: h.claimBatch,
+          markSent: h.markSent,
+          reschedule: h.reschedule,
+        },
+        { sendText: h.sendText },
+        { onExhausted: h.onExhausted },
+        { owner: 'wn', pollIntervalMs: 1_000, batchSize: 5, maxConcurrency: 2 },
+        { isOpen, markNotDelivered },
+      );
+      live.add(worker);
+      return { ...h, worker, isOpen, markNotDelivered };
+    };
+
+    it.each([
+      'RECEIPT_PAYMENT_CONFIRMED',
+      'RECEIPT_PAYMENT_PARTIAL',
+      'RECEIPT_PAYMENT_REJECTED',
+    ] as const)('sends %s when the window is still open', async (key) => {
+      const h = gated(true, intent({ templateKey: key }));
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.isOpen).toHaveBeenCalledWith('+525500000000');
+      expect(h.sendText).toHaveBeenCalledTimes(1);
+      expect(h.markSent).toHaveBeenCalledWith('i1', 'wn', 'wamid.OK', LEASE);
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+    });
+
+    it('marks the intent not delivered (terminal) when the window is confirmed closed', async () => {
+      const h = gated(false);
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.sendText).not.toHaveBeenCalled();
+      expect(h.markNotDelivered).toHaveBeenCalledWith('i1', 'wn', LEASE);
+      expect(h.markSent).not.toHaveBeenCalled();
+      expect(h.reschedule).not.toHaveBeenCalled();
+      expect(h.onExhausted).not.toHaveBeenCalled();
+    });
+
+    it('reschedules like a transient send failure when the window read fails', async () => {
+      const h = gated(new Error('db'));
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.sendText).not.toHaveBeenCalled();
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+      expect(h.reschedule).toHaveBeenCalledWith(
+        'i1',
+        'wn',
+        RETRY_DELAY_MS,
+        LEASE,
+      );
+      expect(h.onExhausted).not.toHaveBeenCalled();
+    });
+
+    it('alerts exhaustion when a failing window read hits the attempt cap', async () => {
+      const h = gated(new Error('db'));
+      h.reschedule.mockResolvedValueOnce('exhausted');
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+      expect(h.onExhausted).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not consult the window for inbound-reply intents', async () => {
+      const h = gated(
+        false,
+        intent({ templateKey: 'RECEIPT_ATTACHED_PENDING', templateArgs: {} }),
+      );
+      h.worker.onApplicationBootstrap();
+      await flush();
+      expect(h.isOpen).not.toHaveBeenCalled();
+      expect(h.sendText).toHaveBeenCalledTimes(1);
+      expect(h.markNotDelivered).not.toHaveBeenCalled();
+    });
   });
 
   it('carries no LLM or AgentRunner authority', () => {

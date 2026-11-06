@@ -45,6 +45,23 @@ WHERE id = $1 AND status = 'SENDING' AND lease_owner = $2
   AND lease_expires_at = $4::timestamptz AND lease_expires_at > now()
 RETURNING attempts`;
 
+/** R5 send-time window closure: the claimed human-outcome intent becomes a
+ * terminal FAILED row (never claimed again, no send) and its receipt's
+ * notification evidence flips QUEUED → OUTSIDE_WINDOW, in one transaction. */
+const MARK_NOT_DELIVERED_SQL = `UPDATE receipt_media_outbox
+SET status = 'FAILED', lease_owner = NULL, lease_expires_at = NULL,
+  updated_at = now()
+WHERE id = $1 AND status = 'SENDING' AND lease_owner = $2
+  AND lease_expires_at = $3::timestamptz AND lease_expires_at > now()
+  AND template_key IN ('RECEIPT_PAYMENT_CONFIRMED', 'RECEIPT_PAYMENT_PARTIAL',
+    'RECEIPT_PAYMENT_REJECTED')
+RETURNING receipt_media_id`;
+
+const OUTCOME_OUTSIDE_WINDOW_SQL = `UPDATE receipt_media
+SET outcome_delivery = 'OUTSIDE_WINDOW', version = version + 1,
+  updated_at = now()
+WHERE id = $1 AND outcome_delivery = 'QUEUED'`;
+
 const camelize = <T extends object>(row: Row): T =>
   Object.fromEntries(
     Object.entries(row).map(([k, v]) => [
@@ -144,6 +161,23 @@ export class PostgresReceiptOutboxStore {
       );
       if (rowCount !== 1) return 'lost';
       return rows[0].attempts >= 3 ? 'exhausted' : 'rescheduled';
+    });
+  }
+
+  async markNotDelivered(
+    id: string,
+    owner: string,
+    leaseExpiresAt: Date,
+  ): Promise<boolean> {
+    if (!casInputOk(id, owner) || !leaseTokenOk(leaseExpiresAt)) return false;
+    return this.withTx(async (c) => {
+      const { rows, rowCount } = await c.query<{
+        receipt_media_id: string | null;
+      }>(MARK_NOT_DELIVERED_SQL, [id, owner, leaseExpiresAt]);
+      if (rowCount !== 1) return false;
+      if (rows[0].receipt_media_id !== null)
+        await c.query(OUTCOME_OUTSIDE_WINDOW_SQL, [rows[0].receipt_media_id]);
+      return true;
     });
   }
 }

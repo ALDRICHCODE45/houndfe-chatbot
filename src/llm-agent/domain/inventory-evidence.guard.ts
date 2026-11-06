@@ -27,7 +27,6 @@ export const MUTATING_TOOL_NAMES = [
   'updateDelivery',
   'cancelSale',
   'requestHumanAssistance',
-  'getShippingQuote',
 ] as const;
 
 /** Tools that never change persisted business state. */
@@ -37,7 +36,6 @@ export const NON_MUTATING_TOOL_NAMES = [
   'getCustomerByPhone',
   'getOrderHistory',
   'getPaymentDetails',
-  'attachReceipt',
 ] as const;
 
 const MUTATING = new Set<string>(MUTATING_TOOL_NAMES);

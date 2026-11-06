@@ -24,11 +24,6 @@ import {
 
 const LATER = '2026-10-13T11:00:00.000Z';
 const CART = { items: [], idempotencyKey: '', expectedTotalCents: 0 };
-const POINTER = {
-  receiptMediaId: 'receipt-a',
-  saleId: 'sale-a',
-  receiptVersion: '9007199254740993',
-};
 
 /** The port with the optional checkout capability narrowed to required. */
 type CheckoutCapable = ConversationStore &
@@ -544,7 +539,7 @@ describe('PostgresConversationStore checkout draft SQL seam (offline)', () => {
     );
     for (const call of seam.calls) {
       expect(call.sql).not.toMatch(
-        /minimalCart|receiptAmountPointer|pendingHumanRequest|agentRevision|shippingApproval/,
+        /minimalCart|pendingHumanRequest|agentRevision|shippingApproval/,
       );
     }
   });
@@ -554,7 +549,6 @@ describe('PostgresConversationStore checkout draft SQL seam (offline)', () => {
       sibling: 'live',
       minimalCheckoutDraft: checkoutDraft(),
       minimalCart: CART,
-      receiptAmountPointer: POINTER,
       pendingHumanRequest: null,
     });
     const seam = new QuerySeam([
@@ -576,11 +570,9 @@ describe('PostgresConversationStore checkout draft SQL seam (offline)', () => {
     expect(sent.sibling).toBe('patched');
     // Pre-existing carve-outs stay carved out.
     expect(Object.hasOwn(sent, 'minimalCart')).toBe(false);
-    expect(Object.hasOwn(sent, 'receiptAmountPointer')).toBe(false);
     expect(Object.hasOwn(sent, 'pendingHumanRequest')).toBe(false);
     expect(sql).toMatch(/WHERE key IN \([^)]*'minimalCheckoutDraft'[^)]*\)/);
     expect(sql).toMatch(/WHERE key IN \([^)]*'minimalCart'[^)]*\)/);
-    expect(sql).toMatch(/-\s*'receiptAmountPointer'/);
     expect(sql).toMatch(/jsonb_build_object\(\s*'pendingHumanRequest'/);
   });
 

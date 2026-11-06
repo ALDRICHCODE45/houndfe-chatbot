@@ -9,13 +9,11 @@
  * The exact safe contract is WU2B claim/reclaim: an expired lease simply
  * becomes reclaimable by any worker, and the stale caller loses its
  * post-call fenced CAS (`startStorageAttempt`/`transitionStatus`/TX2),
- * receiving safe value outcomes — no heartbeat exists or is faked here.
+ * receiving safe value outcomes.
  *
- * STORED-1: the second constructor argument is the state-aware dispatcher,
- * not the raw processor. The dispatcher routes RESERVED/DOWNLOADED to ingestion,
- * ATTACHING to attachment, and all other statuses to a no-op non-dispatch
- * result. STORED rows are held from automatic claim eligibility and are
- * never dispatched by this worker.
+ * The second constructor argument is the state-aware dispatcher, not the
+ * raw processor: it routes RESERVED/DOWNLOADED to ingestion and every other
+ * status to a no-op non-dispatch result.
  */
 import {
   Injectable,

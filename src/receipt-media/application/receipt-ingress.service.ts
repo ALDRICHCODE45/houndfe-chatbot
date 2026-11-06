@@ -1,8 +1,8 @@
 /** WU7 receipt ingress admission service (RM1, WA2): TX1 delegates one
- * atomic receipt admission to the durable store. Deterministic closed
- * decisions (kill-switch disabled, unsupported media, no
- * placed sale) return without touching the store; a supported JPEG/PNG with a
- * captured `placedSaleId` builds an immutable reservation identity, reserves
+ * atomic receipt admission to the durable store. Receipt ingestion is always
+ * on (R3/S7). Deterministic closed decisions (unsupported media, no
+ * placed sale) return without touching the store; a supported JPEG/PNG/PDF with a
+ * minimal-route `minimalCart.placedSale` (S3) builds an immutable reservation identity, reserves
  * exactly once, and maps the store's resolved outcome exhaustively (the
  * concrete WU2B store resolves only after its own transaction commits; this
  * unit layer makes no database-durability claim). There are
@@ -12,9 +12,8 @@
  * intent exists before storage (WA2); worker wiring and DI tokens are WU14. */
 import { randomUUID } from 'node:crypto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
-import { readPlacedSaleId } from '../../sale-flow/application/placed-sale-persistence';
 import { parseAmount } from '../domain/amount-parser';
-import { newObjectKey } from '../domain/object-storage.port';
+import { readPlacedOrder } from '../domain/placed-order';
 import type {
   ActiveReceiptStatus,
   ActiveSenderIdentity,
@@ -23,10 +22,12 @@ import type {
 } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 
-/** Exact canonical receipt MIME values; no non-canonical alias is admitted. */
+/** Exact canonical receipt MIME values; no non-canonical alias is admitted.
+ * S8: a WhatsApp `document` with a PDF mime is admitted like an image. */
 const SUPPORTED_MIME_TYPES: ReadonlySet<string> = new Set([
   'image/jpeg',
   'image/png',
+  'application/pdf',
 ]);
 
 /** Largest declared amount the durable positive-int32 `declared_amount_cents`
@@ -42,11 +43,6 @@ function declaredAmountCentsOf(caption: string | undefined): number | null {
   return parsed.kind === 'parsed' && parsed.cents <= MAX_DECLARED_AMOUNT_CENTS
     ? parsed.cents
     : null;
-}
-
-/** Narrow kill-switch seam over the WU1B `receiptMedia` config subtree. */
-export interface ReceiptMediaKillSwitch {
-  readonly enabled: boolean;
 }
 
 /** Narrow conversation seam: admission needs only the durable state read. */
@@ -74,11 +70,10 @@ export interface ReceiptIngressInput {
   caption?: string;
 }
 
-/** Closed admission result: the three pre-admission decisions never create
+/** Closed admission result: the two pre-admission decisions never create
  * a row; every `ReceiptMediaStorePort.admit()` outcome maps 1:1, carrying
  * the persisted receipt exactly when the store returned one. */
 export type ReceiptIngressDecision =
-  | { kind: 'disabled' }
   | { kind: 'unsupported-media' }
   | { kind: 'no-placed-sale' }
   | { kind: 'reserved'; receipt: ReceiptMediaRow }
@@ -89,7 +84,6 @@ export type ReceiptIngressDecision =
 
 export class ReceiptIngressService {
   constructor(
-    private readonly killSwitch: ReceiptMediaKillSwitch,
     private readonly conversations: ReceiptIngressConversations,
     private readonly store: ReceiptIngressStore,
   ) {}
@@ -99,7 +93,6 @@ export class ReceiptIngressService {
    * intrinsic to the message; sale context is transient); no sale context
    * reserves nothing. ODD-4C: the active lookup precedes the placed-sale read. */
   async admit(input: ReceiptIngressInput): Promise<ReceiptIngressDecision> {
-    if (!this.killSwitch.enabled) return { kind: 'disabled' };
     if (!SUPPORTED_MIME_TYPES.has(input.declaredMimeType))
       return { kind: 'unsupported-media' };
     const activeStatus = await this.store.findActiveBySender({
@@ -109,17 +102,16 @@ export class ReceiptIngressService {
     });
     if (activeStatus !== null)
       return { kind: 'sender-active', status: activeStatus };
-    const placedSaleId = readPlacedSaleId(
+    const placedOrder = readPlacedOrder(
       await this.conversations.getState(input.senderId),
     );
-    if (placedSaleId === null) return { kind: 'no-placed-sale' };
+    if (placedOrder === null) return { kind: 'no-placed-sale' };
     const reservation = await this.store.admit({
       id: randomUUID(),
       webhookMessageId: input.webhookMessageId,
       providerMediaId: input.providerMediaId,
       senderId: input.senderId,
-      capturedSaleId: placedSaleId,
-      objectKey: newObjectKey(),
+      capturedSaleId: placedOrder.saleId,
       declaredMimeType: input.declaredMimeType,
       declaredAmountCents: declaredAmountCentsOf(input.caption),
     });

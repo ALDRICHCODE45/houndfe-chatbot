@@ -15,19 +15,29 @@ live on the backend. The bot's only contract here is the
 
 ## What the bot needs
 
-The bot issues `POST /chatbot-api/sales`, `GET /chatbot-api/payment-details`,
+The bot issues `POST /chatbot-api/checkouts` (minimal order placement),
+`POST /chatbot-api/sales` (legacy sale-flow tools), `GET /chatbot-api/payment-details`,
 and the other nine endpoints under a service credential. The
-`ServiceCredential` issued to the bot cashier must carry **7 scopes**:
+`ServiceCredential` issued to the bot cashier must carry **11 scopes**:
 
-| # | Scope | Used by |
-|---|-------|---------|
-| 1 | `catalog:read` | `searchCatalog`, `checkStock` |
-| 2 | `pricing:evaluate` | `evaluateCart` |
-| 3 | `customers:read` | `getCustomerByPhone`, `getOrderHistory` |
-| 4 | `customers:write` | `upsertCustomer` |
-| 5 | `sales:create` | `createSale` |
-| 6 | `sales:write` | `attachReceipt`, `updateDelivery` |
-| 7 | `payment-details:read` | `getPaymentDetails` (new in this slice) |
+| #   | Scope                    | Used by                                                                            |
+| --- | ------------------------ | ---------------------------------------------------------------------------------- |
+| 1   | `catalog:read`           | `searchCatalog`, `checkStock`                                                      |
+| 2   | `pricing:evaluate`       | `evaluateCart`                                                                     |
+| 3   | `customers:read`         | `getCustomerByPhone`, `getOrderHistory`                                            |
+| 4   | `customers:write`        | `upsertCustomer`, `createCheckout`, `getCheckoutStatus`                            |
+| 5   | `sales:create`           | `createSale`, `createCheckout`, `getCheckoutStatus`                                |
+| 6   | `sales:write`            | `attachReceipt`, `updateDelivery`                                                  |
+| 7   | `payment-details:read`   | `getPaymentDetails` (new in this slice)                                            |
+| 8   | `shipping:quote`         | `createShippingQuote` (`POST /chatbot-api/shipping/quotes`)                        |
+| 9   | `human-decisions:create` | RESTOCK, EXPIRATION and DELIVERY_ZONE intake (`POST /chatbot-api/human-decisions`) |
+| 10  | `human-decisions:read`   | decision poll (`GET /chatbot-api/human-decisions/:id`)                             |
+| 11  | `human-decisions:ack`    | decision ACK (`POST /chatbot-api/human-decisions/:id/application-outcome`)         |
+
+Scopes 8–11 came after this slice: `shipping:quote` with the backend shipping
+quotes (docs/contracts/shipping-quotes.md) and the `human-decisions:*` scopes
+with the human-decision bot cycle. Without `shipping:quote` every quote returns
+`403` and the customer gets the “cannot quote right now, pick up in store” reply.
 
 The seventh scope (`payment-details:read`) is the **delta** vs. the
 archived `sale-flow` slice, which carried only six scopes. Without it,
@@ -42,7 +52,7 @@ Per branch:
    by branch via `CHATBOT_API_BRANCH_ID`); the bot reads `cashierUserId`
    from `CHATBOT_API_CASHIER_USER_ID` and forwards it on every write
    request as `cashierUserId` in the request DTO.
-2. **`ServiceCredential`** tied to that `User`, carrying the 7 scopes
+2. **`ServiceCredential`** tied to that `User`, carrying the 11 scopes
    above. **One credential per branch** — the bot is single-branch.
    Secret exposed to the bot as `SERVICE_KEY` (env var, unchanged).
 3. **At least one active `PaymentDetail`** per branch/tenant. This is

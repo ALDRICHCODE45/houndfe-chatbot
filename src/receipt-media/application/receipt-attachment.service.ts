@@ -1,212 +1,193 @@
-import { randomUUID } from 'node:crypto';
+/** R2 backend upload (S2): the downloaded receipt file goes to the backend
+ * as multipart with `X-Idempotency-Key` = the WhatsApp media id, and exactly
+ * one durable outcome is committed per call. A definite refusal (4xx) is
+ * terminal; any unknown outcome (timeout, network, 5xx, 401/403/429,
+ * invalid 201) is retried later by the store with the same key. The bot
+ * never confirms or rejects the payment (S1): the backend keeps the receipt
+ * PENDING. */
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
-import type { ReceiptMediaStorePort } from '../domain/receipt-media-store.port';
+import {
+  RECEIPT_UPLOAD_ERROR,
+  type ReceiptUploadExtracted,
+  type ReceiptUploadFields,
+  type ReceiptUploadMimeType,
+} from '../../chatbot-api/domain/dtos/receipt-upload.dto';
+import type { PlacedOrder } from '../domain/placed-order';
+import type {
+  LeaseFenceInput,
+  ReceiptMediaStorePort,
+  UploadCommitOutcome,
+  UploadDefiniteTemplateKey,
+  UploadTemplateArgs,
+} from '../domain/receipt-media-store.port';
+import {
+  computeAmountMismatch,
+  type ReceiptExtraction,
+  type ReceiptExtractionConfidence,
+} from '../domain/receipt-extraction.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
-import type { CapabilityService } from './capability.service';
 
-const DEFINITE_FAILURE_STATUSES = new Set([400, 401, 403, 404, 409, 422, 429]);
-const TRANSPORT_UNKNOWN = {
-  httpStatus: null,
-  transportCode: 'TRANSPORT_FAILURE',
-} as const;
+/** Backend statuses that prove the receipt was refused (no retry helps).
+ * 429 (rate limit) and 401/403 (credential/config, fixable by an operator)
+ * are unknown outcomes retried with the same key. */
+const DEFINITE_STATUSES = new Set([400, 404, 409, 413, 415, 422]);
+const SAFE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
-/** Fixed, secret-free failure for persisted capability evidence that cannot
- *  be reconstructed: it carries no token, hash, version, or object key. */
-const CAPABILITY_EVIDENCE_UNAVAILABLE =
-  'Receipt capability evidence is unavailable';
+/** The backend `extracted.confidence` is 0..1. */
+const CONFIDENCE: Record<ReceiptExtractionConfidence, number> = {
+  high: 0.9,
+  medium: 0.6,
+  low: 0.3,
+};
 
-export type AttachReport =
-  | { kind: 'skipped'; reason: 'fenced' }
-  | { kind: 'attached'; backendReceiptId: string }
-  | { kind: 'definite-failure'; httpStatus: number }
-  | {
-      kind: 'outcome-unknown';
-      httpStatus: number | null;
-      transportCode: string | null;
-    }
-  | { kind: 'terminal-fenced' };
+const FILENAME: Record<ReceiptUploadMimeType, string> = {
+  'image/jpeg': 'receipt.jpg',
+  'image/png': 'receipt.png',
+  'application/pdf': 'receipt.pdf',
+};
 
-export interface ReceiptAttachmentConfig {
-  receiptMedia: { publicBaseUrl: string };
-}
+const DEFINITE_TEMPLATE: Partial<Record<string, UploadDefiniteTemplateKey>> = {
+  [RECEIPT_UPLOAD_ERROR.SALE_ALREADY_PAID]: 'RECEIPT_SALE_ALREADY_PAID',
+  [RECEIPT_UPLOAD_ERROR.SALE_NOT_PAYABLE]: 'RECEIPT_SALE_NOT_PAYABLE',
+  [RECEIPT_UPLOAD_ERROR.FILE_TOO_LARGE]: 'RECEIPT_UNSUPPORTED_FORMAT',
+  [RECEIPT_UPLOAD_ERROR.FILE_TYPE_NOT_ALLOWED]: 'RECEIPT_UNSUPPORTED_FORMAT',
+};
 
-export interface AttachInvocation {
+export interface UploadInvocation {
   receipt: ReceiptMediaRow;
-  owner: string;
+  /** Fence of the already-started upload attempt. */
+  fence: LeaseFenceInput;
+  file: { bytes: Buffer; mimeType: ReceiptUploadMimeType };
+  /** The exact fields of the first attempt (`toUploadFields`), reused
+   * byte-for-byte by every retry under the same idempotency key. */
+  fields: ReceiptUploadFields;
+  /** The placed order bound to the receipt's sale, when still known. */
+  order: PlacedOrder | null;
   signal?: AbortSignal;
 }
 
-interface AttachFence {
-  id: string;
-  owner: string;
-  expectedVersion: string;
-  attachAttemptId: string;
-}
+export type UploadReport =
+  | { kind: 'uploaded'; backendReceiptId: string; outcome: UploadCommitOutcome }
+  | { kind: 'refused'; httpStatus: number; outcome: UploadCommitOutcome }
+  | { kind: 'unknown'; outcome: UploadCommitOutcome };
 
-interface UnknownEvidence {
-  httpStatus: number | null;
-  transportCode: string | null;
-}
+type UploadStore = Pick<
+  ReceiptMediaStorePort,
+  'commitUploadSuccess' | 'commitUploadDefiniteFailure' | 'commitUploadUnknown'
+>;
 
-type StoreKeys =
-  | 'startAttachRequest'
-  | 'commitAttachSuccess'
-  | 'commitAttachDefiniteFailure'
-  | 'commitAttachUnknownOutcome';
-
-/**
- * WU11C orchestration over the WU11A fenced store primitives and the WU11B
- * transport: one fresh attempt identity, at most one POST, exactly one
- * persisted terminal result, never an automatic retry or cleanup.
- */
 export class ReceiptAttachmentService {
   constructor(
-    private readonly store: Pick<ReceiptMediaStorePort, StoreKeys>,
-    private readonly client: Pick<ChatbotApiClient, 'attachReceipt'>,
-    private readonly config: ReceiptAttachmentConfig,
-    private readonly capability: Pick<CapabilityService, 'reconstruct'>,
+    private readonly store: UploadStore,
+    private readonly client: Pick<ChatbotApiClient, 'uploadReceipt'>,
   ) {}
 
-  async attach({
-    receipt,
-    owner,
-    signal,
-  }: AttachInvocation): Promise<AttachReport> {
-    // ODD-5A: a FRESH row (no request-start evidence) must prove its immutable
-    // persisted capability evidence BEFORE the request-start fence; a null
-    // result fails closed before any durable mutation or POST, so no false
-    // request-start evidence can appear. An already request-evidenced row is
-    // owned by the store's recovery path: the historical capability key may
-    // have rotated or the evidence may be malformed, and such a row must still
-    // reach `startAttachRequest` so a reclaimed ATTACHING attempt can fix
-    // forward. The token is only required to actually POST; the private object
-    // key is never exposed.
-    const requestEvidenced = receipt.attachRequestStartedAt !== null;
-    let capability = requestEvidenced ? null : this.reconstructToken(receipt);
-    if (capability === null && !requestEvidenced) {
-      throw new Error(CAPABILITY_EVIDENCE_UNAVAILABLE);
-    }
-    const attempt = { id: receipt.id, owner, attachAttemptId: randomUUID() };
-    const started = await this.store.startAttachRequest({
-      ...attempt,
-      expectedVersion: receipt.version,
-    });
-    if (started.kind === 'fenced') {
-      return { kind: 'skipped', reason: 'fenced' };
-    }
-    if (started.kind === 'crashed-before-post') {
-      // Request-start evidence already exists, so a POST would be a second
-      // request. Fix the reclaimed ATTACHING row forward through its single
-      // unknown terminal outcome using the durable attempt identity and
-      // version, never the fresh caller values.
-      const outcome = await this.store.commitAttachUnknownOutcome({
-        id: receipt.id,
-        owner,
-        expectedVersion: started.version,
-        attachAttemptId: started.attachAttemptId,
-        ...TRANSPORT_UNKNOWN,
-      });
-      return outcome.kind === 'fenced'
-        ? { kind: 'terminal-fenced' }
-        : { kind: 'outcome-unknown', ...TRANSPORT_UNKNOWN };
-    }
-    // A request-evidenced caller should only ever reach recovery through the
-    // crashed-before-post branch above; a `started` successor here is an
-    // inconsistent durable load (the real store/version contract should
-    // prevent it), so never POST without a reconstructed token.
-    capability ??= this.reconstructToken(receipt);
-    if (capability === null) {
-      throw new Error(CAPABILITY_EVIDENCE_UNAVAILABLE);
-    }
-    // The durable locked successor is the only POST source after start.
-    if (started.receipt.declaredAmountCents === null) {
-      throw new Error('Receipt has no persisted declared amount');
-    }
-    const fence: AttachFence = { ...attempt, expectedVersion: started.version };
-    let committing = false;
+  async upload(invocation: UploadInvocation): Promise<UploadReport> {
+    const { receipt, fence, file, fields, order, signal } = invocation;
+    const folioArgs: UploadTemplateArgs =
+      order?.folio == null ? {} : { folio: order.folio };
+    let backendReceiptId: string;
     try {
-      const response = await this.client.attachReceipt(
-        started.receipt.capturedSaleId,
+      ({ receiptId: backendReceiptId } = await this.client.uploadReceipt(
+        receipt.capturedSaleId,
         {
-          mediaUrl: `${this.config.receiptMedia.publicBaseUrl}/media/receipts/${capability}`,
-          declaredAmountCents: started.receipt.declaredAmountCents,
+          bytes: file.bytes,
+          mimeType: file.mimeType,
+          filename: FILENAME[file.mimeType],
         },
+        fields,
+        receipt.providerMediaId,
         { signal },
-      );
-      if (
-        typeof response?.receiptId === 'string' &&
-        response.receiptId.length > 0 &&
-        response?.status === 'PENDING'
-      ) {
-        committing = true;
-        const outcome = await this.store.commitAttachSuccess({
-          ...fence,
-          backendReceiptId: response.receiptId,
-        });
-        return outcome.kind === 'fenced'
-          ? { kind: 'terminal-fenced' }
-          : { kind: 'attached', backendReceiptId: response.receiptId };
-      }
-      committing = true;
-      return this.commitUnknown(fence, TRANSPORT_UNKNOWN);
+      ));
     } catch (error) {
-      if (committing) {
-        throw error;
+      const status = statusOf(error);
+      if (status !== null && DEFINITE_STATUSES.has(status)) {
+        const errorCode = codeOf(error);
+        return {
+          kind: 'refused',
+          httpStatus: status,
+          outcome: await this.store.commitUploadDefiniteFailure({
+            ...fence,
+            httpStatus: status,
+            errorCode,
+            templateKey:
+              (errorCode === null ? undefined : DEFINITE_TEMPLATE[errorCode]) ??
+              'RECEIPT_ATTACH_DEFINITE_FAILURE',
+            templateArgs: folioArgs,
+          }),
+        };
       }
-      const status =
-        (error as { statusCode?: number | null } | null)?.statusCode ?? null;
-      if (signal?.aborted === true || (error as Error)?.name === 'AbortError') {
-        committing = true;
-        await this.commitUnknown(fence, TRANSPORT_UNKNOWN);
-        throw error;
-      }
-      if (status !== null && DEFINITE_FAILURE_STATUSES.has(status)) {
-        const outcome = await this.store.commitAttachDefiniteFailure({
+      return {
+        kind: 'unknown',
+        outcome: await this.store.commitUploadUnknown({
           ...fence,
-          httpStatus: status,
-        });
-        return outcome.kind === 'fenced'
-          ? { kind: 'terminal-fenced' }
-          : { kind: 'definite-failure', httpStatus: status };
-      }
-      committing = true;
-      if (
-        status !== null &&
-        status >= 100 &&
-        status <= 599 &&
-        (status < 200 || status > 299)
-      ) {
-        return this.commitUnknown(fence, {
-          httpStatus: status,
-          transportCode: null,
-        });
-      }
-      return this.commitUnknown(fence, TRANSPORT_UNKNOWN);
+          ...unknownEvidence(status, signal),
+        }),
+      };
     }
+    const extractedAmountCents = fields.extracted?.amountCents ?? null;
+    const totalCents = order?.totalCents ?? null;
+    const mismatch =
+      extractedAmountCents !== null &&
+      totalCents !== null &&
+      computeAmountMismatch(extractedAmountCents, totalCents)
+        ? { extractedAmountCents, totalCents }
+        : {};
+    return {
+      kind: 'uploaded',
+      backendReceiptId,
+      outcome: await this.store.commitUploadSuccess({
+        ...fence,
+        backendReceiptId,
+        templateArgs: { ...folioArgs, ...mismatch },
+      }),
+    };
   }
+}
 
-  /** Rebuilds the public URL token from the loaded durable caller receipt;
-   *  null when the persisted evidence cannot be reconstructed. */
-  private reconstructToken(receipt: ReceiptMediaRow): string | null {
-    return (
-      this.capability.reconstruct(
-        receipt.id,
-        receipt.capabilityKeyVersion ?? '',
-        receipt.capabilityTokenHash,
-      )?.token ?? null
-    );
+/** Declared (caption) and extracted (vision) data travel apart (S4). */
+export function toUploadFields(
+  receipt: ReceiptMediaRow,
+  extraction: ReceiptExtraction,
+): ReceiptUploadFields {
+  const fields: ReceiptUploadFields = {};
+  if (receipt.declaredAmountCents !== null)
+    fields.declared = { amountCents: receipt.declaredAmountCents };
+  if (extraction.kind === 'receipt') {
+    const extracted: ReceiptUploadExtracted = {
+      confidence: CONFIDENCE[extraction.confidence],
+    };
+    if (extraction.amountCents !== null)
+      extracted.amountCents = extraction.amountCents;
+    if (extraction.date !== null) extracted.date = extraction.date;
+    if (extraction.reference !== null)
+      extracted.reference = extraction.reference;
+    if (extraction.bank !== null) extracted.bank = extraction.bank;
+    fields.extracted = extracted;
   }
+  return fields;
+}
 
-  private async commitUnknown(
-    fence: AttachFence,
-    evidence: UnknownEvidence,
-  ): Promise<AttachReport> {
-    const outcome = await this.store.commitAttachUnknownOutcome({
-      ...fence,
-      ...evidence,
-    });
-    return outcome.kind === 'fenced'
-      ? { kind: 'terminal-fenced' }
-      : { kind: 'outcome-unknown', ...evidence };
-  }
+const statusOf = (error: unknown): number | null => {
+  const status = (error as { statusCode?: unknown } | null)?.statusCode;
+  return typeof status === 'number' && Number.isInteger(status) ? status : null;
+};
+
+const codeOf = (error: unknown): string | null => {
+  const code = (error as { errorCode?: unknown } | null)?.errorCode;
+  return typeof code === 'string' && SAFE_CODE.test(code) ? code : null;
+};
+
+/** Exactly one safe evidence channel for an unknown outcome. */
+function unknownEvidence(
+  status: number | null,
+  signal: AbortSignal | undefined,
+): { httpStatus: number | null; transportCode: string | null } {
+  if (signal?.aborted === true)
+    return { httpStatus: null, transportCode: 'ABORTED' };
+  if (status !== null && status >= 200 && status <= 299)
+    return { httpStatus: null, transportCode: 'RESPONSE_INVALID' };
+  if (status !== null && status >= 100 && status <= 599)
+    return { httpStatus: status, transportCode: null };
+  return { httpStatus: null, transportCode: 'TRANSPORT_FAILURE' };
 }

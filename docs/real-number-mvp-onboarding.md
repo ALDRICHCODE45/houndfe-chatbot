@@ -28,16 +28,16 @@ Keep this order even when other features are explored in parallel:
    approval when required, register the phone-number ID, create the permanent
    System User token, and subscribe the WABA/app webhook `messages` field.
 4. **Configure Dokploy** — the owner enters secrets directly; use the exact
-   digit-only ops `wa_id`, keep sandbox normalization off, and keep every
-   receipt-media flag off.
+   digit-only ops `wa_id` and keep sandbox normalization off. Receipt media
+   is always on (no flag); the backend stores the receipt files.
 5. **Migrate and deploy** — apply target-database migrations, deploy the
    reviewed commit, run `pnpm preflight:launch`, and confirm webhook health.
 6. **Run one synthetic journey** — use controlled test data for the complete
    text-sales path before admitting any customer.
 7. **Open a limited pilot** — admit a small monitored client group with the
    rollback path ready.
-8. **Resume ODD-8 after stability** — only then provision receipt-media
-   infrastructure and enable its flags gradually.
+8. **Watch transfer receipts** — the bot uploads each receipt to the backend,
+   a human confirms or rejects it there, and the bot relays the outcome.
 
 Exploring another capability does not reorder or implicitly authorize any of
 these gates. New capabilities require their own disabled-by-default rollout
@@ -147,10 +147,20 @@ this number before cutover; do not assume inherited access or scope.
     (copy the value Meta delivers in an inbound `wa_id`; never the E.164 form
     with a leading `+`). Boot fails fast on a `+`/separator/whitespace form, so
     ops handoff replies cannot be silently dropped.
-  - `HUMAN_HANDOFF_ENABLED` — keep `true` for the pilot.
-  - Receipt flags stay **false**: `RECEIPT_MEDIA_ENABLED=false`,
-    `RECEIPT_MEDIA_INGESTION_ENABLED=false`,
-    `RECEIPT_MEDIA_METRICS_ENABLED=false` (ODD-8 gates).
+  - No receipt flags or storage variables: receipt media is always on and the
+    backend stores the files, so `RECEIPT_MEDIA_ENABLED`,
+    `RECEIPT_MEDIA_INGESTION_ENABLED`, `RECEIPT_STORAGE_*`,
+    `RECEIPT_CAPABILITY_*`, `RECEIPT_MEDIA_PUBLIC_BASE_URL` and
+    `CHATBOT_API_ATTACH_TIMEOUT_MS` are not used (delete them from Dokploy if
+    present; a leftover value has no effect). `META_MEDIA_*` and
+    `RECEIPT_MEDIA_WORKER_*` have working defaults (see
+    `docs/receipt-media-operations.md`). Leave `RECEIPT_MEDIA_METRICS_TOKEN`
+    unset unless metrics are scraped; the metrics endpoint answers 404 without
+    it.
+  - No shipping variables: the backend quotes carriers, so
+    `SHIPPING_QUOTES_ENABLED`, `MINIMAL_CATALOG_SHIPPING_ENABLED`,
+    `SHIPPING_DEMO_PARCEL_PROFILE_JSON` and `SKYDROPX_*` are not used (delete
+    them from Dokploy if present; a leftover value has no effect).
 
 - Preserve `META_APP_SECRET` and `META_VERIFY_TOKEN` unless Meta actually
   changes them; do not rotate them for convenience at cutover.
@@ -160,7 +170,7 @@ this number before cutover; do not assume inherited access or scope.
 1. Set the Dokploy env names in §8 (owner enters values) and restart.
 2. Run chatbot migrations against the target database.
 3. Deploy the current commit; Joi validates env at boot and fails fast when
-   `HUMAN_HANDOFF_ENABLED=true` and `OPS_CHANNEL_PHONE` is missing.
+   `OPS_CHANNEL_PHONE` is missing (human handoff is always on).
 4. Confirm the webhook GET verification returns the challenge and `messages`
    is subscribed.
 5. Run **one controlled synthetic text-sales journey** from the owner or a
@@ -183,9 +193,10 @@ Stop and roll back on: webhook verification failure, signature failure,
 duplicate/looping deliveries, handoff digests not reaching ops, or any
 unexpected outbound to a real customer number.
 
-**ODD-8 deferral:** receipt-media rollout stays deferred. All receipt flags
-remain `false`; Spaces, capability keys, redaction proof, alerting, and
-reconciliation drills are out of scope for this pilot.
+**Receipts:** the credential needs `sales:write` (upload) and `sales:read`
+(outcome). Outside the 24 h WhatsApp window the outcome message is not sent
+(recorded as `OUTSIDE_WINDOW`); alerting and reconciliation drills remain out
+of scope for this pilot.
 
 ## 11. Client message (neutral Mexican Spanish, copy-paste)
 
@@ -217,18 +228,37 @@ tokens por chat: los ingresas tú directo en Meta y en el panel.
 Run `pnpm preflight:launch` before cutover and after every config change. It
 prints one deterministic JSON report and exits `0` (pass), `1` (check
 failures), or `2` (usage/runtime error). It reads only environment variable
-names/presence, five posture flags, and `migrations/` filenames: no network,
+names/presence, the posture flags, and `migrations/` filenames: no network,
 no `.env`, no Nest boot, and never a value, token, length, or hash.
 
 Report: `coreConfig` (`present|missing`); `posture` (`safe|unsafe|missing`
-against exact `META_SANDBOX_RECIPIENT_NORMALIZATION=false`,
-`HUMAN_HANDOFF_ENABLED=true`, and the three receipt flags `false`; missing or
-non-exact fails closed); `migrations` (`present_on_disk|missing_on_disk`);
+against exact `META_SANDBOX_RECIPIENT_NORMALIZATION=false`; missing or
+non-exact fails closed; there is no shipping or receipt posture: both are
+always on); `migrations` (`present_on_disk|missing_on_disk`);
 `clientRoutes`/`manualChecks` (always `manual_external`, never flipping `ok`).
 `ok` is false only for missing core names, unsafe/missing posture, or a missing
 migration file.
 
 Limitations: presence is not validity; a migration file on disk is not an
-applied migration; all reachability and data checks (backend, the 11 routes,
-cashier user, `ServiceCredential` with seven scopes including
-`payment-details:read`, active `PaymentDetail`, populated catalog) stay manual.
+applied migration; all reachability and data checks (backend, the 18 client routes
+including `POST /chatbot-api/shipping/quotes` whose scope is still TBD by the
+backend,
+cashier user, `ServiceCredential` with twelve scopes including
+`payment-details:read` and `sales:read`, active `PaymentDetail`, populated catalog) stay manual.
+
+## 13. Template messages
+
+`WhatsappSenderPort.sendTemplate` sends a pre-approved Meta template (name,
+language code such as `es_MX`, and ordered body parameters `{{1}}..{{n}}`).
+
+- Create each template in Meta WhatsApp Manager and wait for Meta to approve
+  it **before** any code uses its name; an unapproved or unknown template is
+  rejected by Meta (surfaced as `WhatsappSendError`).
+- Use templates only **outside** the 24h customer service window (e.g. a late
+  delivery-zone decision). Inside the window the bot keeps replying with
+  free-form text via `sendText`.
+- Body parameters must be non-empty and trimmed, at most 1024 characters,
+  without newlines or tabs and with no more than 4 consecutive spaces; the
+  adapter rejects violations before calling Meta.
+- Template names must match the approved name exactly (lowercase `a-z`,
+  `0-9`, `_`, at most 512 characters).

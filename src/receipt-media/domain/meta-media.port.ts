@@ -1,6 +1,6 @@
 /** Provider-neutral boundary: provider URLs and credentials stay in infrastructure. */
 export const META_MEDIA = Symbol('META_MEDIA');
-export type ReceiptMimeType = 'image/jpeg' | 'image/png';
+export type ReceiptMimeType = 'image/jpeg' | 'image/png' | 'application/pdf';
 
 export interface MetaMediaRequest {
   providerMediaId: string;
@@ -31,6 +31,7 @@ export type MetaMediaErrorCode =
   | 'MIME_MISMATCH'
   | 'PNG_STRUCTURE_INVALID'
   | 'JPEG_STRUCTURE_INVALID'
+  | 'PDF_STRUCTURE_INVALID'
   | 'FILE_IO_FAILURE'
   | 'NETWORK_FAILURE'
   | 'HTTP_RETRYABLE'

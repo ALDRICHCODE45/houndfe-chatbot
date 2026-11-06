@@ -32,55 +32,31 @@ import { RestockApplicationRuntime } from '../human-decisions/restock-applicatio
 import { SaleFlowModule } from '../sale-flow/sale-flow.module';
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from './application/agent-runner.service';
-import { CostGuardService } from './application/cost-guard.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
 import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
+import { DeliveryZonesModule } from '../delivery-zones/delivery-zones.module';
+import {
+  DELIVERY_ZONE_INTAKE,
+  type DeliveryZoneIntakePort,
+} from '../delivery-zones/application/delivery-zone-intake.service';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
-import type { HumanHandoffService } from '../human-handoff/application/human-handoff.service';
-import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
-import {
-  SHIPPING_QUOTE_PROVIDER,
-  type ShippingQuoteProviderPort,
-} from '../shipping/domain/shipping-quote.port';
-import {
-  MEASURED_DEMO_SHIPPING_CONFIG,
-  type MeasuredDemoShippingConfig,
-} from '../shipping/application/measured-demo-shipping-config';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
 import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { LLM_AGENT } from './domain/llm-agent.port';
 import { SYSTEM_PROMPT, LLM_AGENT_SYSTEM_PROMPT } from './domain/system-prompt';
-import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
+import { TOOL_REGISTRY } from './domain/tool-registry.port';
 import {
   GENERATE_TEXT,
-  generateTextImpl,
   type GenerateTextFn,
 } from './infrastructure/generate-text.provider';
+import { LlmCoreModule } from './infrastructure/llm-core.module';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
 import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instructions';
-
-/**
- * Fail-closed probe for the SQ-5C3d2 boot-time availability binding.
- *
- * Returns `true` only when the real registry exposes `getShippingQuote` as
- * an OWN key of the ToolSet — an inherited key, a non-object `getTools()`
- * result, a throwing `getTools`, and a hostile proxy that throws on
- * property inspection all resolve to `false`.
- */
-function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
-  try {
-    const tools = registry.getTools();
-    if (tools === null || typeof tools !== 'object') return false;
-    return Object.hasOwn(tools, 'getShippingQuote');
-  } catch {
-    return false;
-  }
-}
 
 /**
  * LlmAgentModule
@@ -98,13 +74,6 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
  * is the source of truth. `LLM_AGENT_SYSTEM_PROMPT` is still a sync
  * `useFactory`, now injecting the TOOL_REGISTRY seam.
  *
- * SQ-5C3d2: the `shippingQuoteAvailable` flag is derived at boot from the
- * ACTUAL registered tool key, never from env alone. The factory injects
- * TOOL_REGISTRY (already `useExisting: RealToolRegistry` from SaleFlowModule,
- * no DI cycle) and appends the opt-in shipping fragment only when the
- * registry owns `getShippingQuote`. Default-off composes the exact
- * byte-identical `base + '\n\n' + slice`.
- *
  * SaleFlowModule is imported so RealToolRegistry is reachable.
  * ChatbotApiModule is imported for parity (CHATBOT_API_CLIENT is injected
  * transitively into RealToolRegistry). Rollback to the placeholder
@@ -114,6 +83,8 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
 @Module({
   imports: [
     ConfigModule,
+    // GENERATE_TEXT + the shared CostGuardService (also used by receipts).
+    LlmCoreModule,
     ConversationModule,
     ChatbotApiModule,
     SaleFlowModule,
@@ -122,12 +93,10 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     // RESTOCK markers/coordinator/recovery seams are visible for the bounded
     // confirmation service factory. Nest de-duplicates the shared instance.
     HumanDecisionsModule,
+    // S5: PENDING zones register a DELIVERY_ZONE requester (always on).
+    DeliveryZonesModule,
   ],
   providers: [
-    {
-      provide: GENERATE_TEXT,
-      useValue: generateTextImpl,
-    },
     {
       provide: LLM_AGENT,
       inject: [GENERATE_TEXT, ConfigService],
@@ -151,26 +120,8 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
       // AgentRunner injects the resolved string and never overrides it
       // per turn. The boot-time bank-details seam is gone — the runtime
       // `getPaymentDetails` tool is the source of truth.
-      //
-      // SQ-5C3d2: shipping availability is derived from the registered
-      // tool key (fail-closed on inherited/hostile registries), so the
-      // opt-in fragment is appended only when `getShippingQuote` is
-      // actually wired.
       provide: LLM_AGENT_SYSTEM_PROMPT,
-      inject: [TOOL_REGISTRY],
-      useFactory: (registry: ToolRegistry) =>
-        composeSaleFlowSystemPrompt(SYSTEM_PROMPT, {
-          shippingQuoteAvailable: registryOwnsShippingQuote(registry),
-        }),
-    },
-    {
-      provide: CostGuardService,
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) =>
-        new CostGuardService(
-          config.get<{ monthlyTokenCeiling: number }>('llm')!
-            .monthlyTokenCeiling,
-        ),
+      useFactory: () => composeSaleFlowSystemPrompt(SYSTEM_PROMPT),
     },
     AgentRunner,
     {
@@ -184,36 +135,22 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
     MinimalCheckoutService,
     MinimalOrderService,
     {
+      // Always on: backend-signed quotes back every delivery order (S9).
       provide: MinimalShippingService,
       inject: [
         CONVERSATION_STORE,
         MinimalCartService,
         MinimalCheckoutService,
-        ConfigService,
-        { token: SHIPPING_QUOTE_PROVIDER, optional: true },
-        { token: MEASURED_DEMO_SHIPPING_CONFIG, optional: true },
-        HUMAN_HANDOFF_SERVICE_TOKEN,
+        CHATBOT_API_CLIENT,
+        DELIVERY_ZONE_INTAKE,
       ],
       useFactory: (
         store: ConversationStore,
         cart: MinimalCartService,
         checkout: MinimalCheckoutService,
-        config: ConfigService,
-        provider: ShippingQuoteProviderPort | undefined,
-        measured: MeasuredDemoShippingConfig | null | undefined,
-        handoff: Pick<HumanHandoffService, 'create'>,
-      ) =>
-        config.get<boolean>('minimalCatalogAgent.shippingEnabled') === true &&
-        provider !== undefined
-          ? new MinimalShippingService(
-              store,
-              cart,
-              checkout,
-              provider,
-              measured ?? null,
-              handoff,
-            )
-          : undefined,
+        api: ChatbotApiClient,
+        zones: DeliveryZoneIntakePort,
+      ) => new MinimalShippingService(store, cart, checkout, api, zones),
     },
     {
       provide: MinimalExpirationRequestService,
@@ -221,32 +158,25 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         CHATBOT_API_CLIENT,
         SHARED_RESERVATION,
         ExpirationPostOrchestrator,
-        ConfigService,
       ],
       useFactory: (
         chatbotApi: ChatbotApiClient,
         reservations: SharedReservationPort,
         orchestrator: ExpirationPostOrchestrator,
-        config: ConfigService,
       ) =>
         new MinimalExpirationRequestService({
           chatbotApi,
           reservations,
           orchestrator,
-          enabled:
-            config.get<{ expirationEnabled: boolean }>('minimalCatalogAgent')
-              ?.expirationEnabled === true,
         }),
     },
     {
-      // WU-B: the RESTOCK confirmation gate. The capability is built ONLY when
-      // `humanDecisions.restockEnabled` is exactly true; otherwise it is
-      // `undefined` and the read-only route stays byte-identical.
+      // WU-B: the RESTOCK confirmation gate. Human decisions are always on,
+      // so the capability is always built.
       provide: MinimalRestockRequestService,
       inject: [
         CHATBOT_API_CLIENT,
         CONVERSATION_STORE,
-        ConfigService,
         SHARED_ROUTE_MARKERS,
         RESTOCK_INTAKE_SERVICE,
         RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
@@ -255,7 +185,6 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
       useFactory: (
         chatbotApi: ChatbotApiClient,
         store: ConversationStore,
-        config: ConfigService,
         markers: SharedRouteMarkersPort,
         coordinator: RestockIntakeService,
         recovery: RestockExistingRequestStatusService,
@@ -264,23 +193,18 @@ function registryOwnsShippingQuote(registry: ToolRegistry): boolean {
         new MinimalRestockRequestService({
           chatbotApi,
           store,
-          restock:
-            config.get<boolean>('humanDecisions.restockEnabled') === true
-              ? {
-                  enabled: true,
-                  markers,
-                  coordinator,
-                  recovery,
-                  reconcileExpired: (senderId) =>
-                    runtime.reconcileExpired(senderId),
-                }
-              : undefined,
+          restock: {
+            markers,
+            coordinator,
+            recovery,
+            reconcileExpired: (senderId) => runtime.reconcileExpired(senderId),
+          },
         }),
     },
   ],
   exports: [
     AgentRunner,
-    CostGuardService,
+    LlmCoreModule,
     MinimalCatalogAgentService,
     MinimalRestockRequestService,
     MinimalExpirationRequestService,

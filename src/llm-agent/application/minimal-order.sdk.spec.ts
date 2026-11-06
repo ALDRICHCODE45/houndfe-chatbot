@@ -1,3 +1,6 @@
+import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
+import { MinimalShippingService } from './minimal-shipping.service';
+import { minimalShippingDestination } from '../domain/minimal-shipping';
 import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -39,11 +42,23 @@ const call = (name: string, input: unknown = {}) =>
   ]);
 const say = (text = 'Listo.') => step([{ type: 'text', text }], 'stop');
 
+const placedSale = () => ({
+  saleId: '55555555-5555-4555-8555-555555555555',
+  folio: 'B-0042',
+  paymentStatus: 'CREDIT',
+  channel: 'ONLINE',
+  deliveryStatus: 'PENDING',
+  totalCents: 3000,
+  paidCents: 0,
+  debtCents: 3000,
+  confirmedAt: null,
+  discountCents: 0,
+});
+
 function setup(
   options: {
-    order?: 'on' | 'off' | 'absent';
+    order?: 'on' | 'absent';
     shipping?: boolean;
-    atomic?: boolean;
   } = {},
 ) {
   const mode = options.order ?? 'on';
@@ -106,20 +121,8 @@ function setup(
         nextAfterAddressId: null,
       }),
     ),
-    createSale: jest.fn(() =>
-      Promise.resolve({
-        saleId: '55555555-5555-4555-8555-555555555555',
-        folio: 'B-0042',
-        paymentStatus: 'CREDIT',
-        channel: 'ONLINE',
-        deliveryStatus: 'PENDING',
-        totalCents: 3000,
-        paidCents: 0,
-        debtCents: 3000,
-        confirmedAt: null,
-        discountCents: 0,
-      }),
-    ),
+    // The legacy POST /sales path is gone; it must never be called.
+    createSale: jest.fn(),
     createCheckout: jest.fn(),
     getPaymentDetails: jest.fn(() =>
       Promise.resolve({
@@ -134,21 +137,12 @@ function setup(
     ),
     upsertCustomer: jest.fn(),
   };
-  api.createCheckout.mockImplementation(async () => ({
-    status: 'created',
-    sale: await api.createSale.getMockImplementation()!(),
-  }));
+  api.createCheckout.mockImplementation(() =>
+    Promise.resolve({ status: 'created', sale: placedSale() }),
+  );
   const client = api as unknown as ChatbotApiClient;
   const config = {
     get: (key: string) => {
-      if (key === 'minimalCatalogAgent')
-        return {
-          enabled: true,
-          allowedSenders: [SENDER],
-          orderEnabled: mode === 'on',
-          shippingEnabled: options.shipping === true,
-          atomicCheckoutEnabled: options.atomic === true,
-        };
       if (key === 'chatbotApi.cashierUserId') return CASHIER;
       return { model: 'm', maxSteps: 5, historyTurns: 12 };
     },
@@ -175,7 +169,21 @@ function setup(
   };
   const cart = new MinimalCartService(client, store);
   const checkout = new MinimalCheckoutService(client, store);
-  const order = new MinimalOrderService(client, store, cart, checkout, config);
+  const shipping = new MinimalShippingService(
+    store,
+    cart,
+    checkout,
+    new FakeShippingQuoteClient(),
+    { register: async () => undefined },
+  );
+  const order = new MinimalOrderService(
+    client,
+    store,
+    cart,
+    checkout,
+    config,
+    shipping,
+  );
   const agent = new MinimalCatalogAgentService(
     client,
     generate,
@@ -200,6 +208,8 @@ function setup(
           minimalCart: {
             items: [{ productId: PRODUCT, quantity: 1, unitPriceCents: 1500 }],
             idempotencyKey: '',
+            // No pickup choice: these guidance turns walk the delivery path
+            // (store pickup needs no delivery data, C1).
             expectedTotalCents: 1500,
           },
         },
@@ -234,14 +244,24 @@ function setup(
               ? {
                   shipping: {
                     quoteId: 'quote-1',
-                    rateId: 'rate-1',
-                    carrierName: 'Carrier',
-                    serviceName: 'Ground',
-                    estimatedDeliveryDays: 2,
-                    bestRateCents: 5000,
-                    totalCreditCents: 0,
-                    customerPaysCents: 5000,
-                    cartLines: [
+                    expiresAt: new Date(Date.now() + 60000).toISOString(),
+                    zoneStatus: 'CARRIER_ONLY',
+                    option: {
+                      carrier: 'Carrier',
+                      service: 'Ground',
+                      etaDays: 2,
+                    },
+                    costCents: 5000,
+                    creditCents: 0,
+                    customerChargeCents: 5000,
+                    currency: 'MXN',
+                    eta: null,
+                    destinationPin: {
+                      kind: 'saved',
+                      addressId: ADDRESS,
+                      version: '2026-10-01T00:00:00.000Z',
+                    },
+                    cartPin: [
                       {
                         productId: PRODUCT,
                         quantity: 2,
@@ -249,18 +269,23 @@ function setup(
                         finalPriceCents: 3000,
                       },
                     ],
-                    addressId: ADDRESS,
-                    addressVersion: '2026-10-01T00:00:00.000Z',
-                    createdAt: new Date(Date.now() - 1000).toISOString(),
-                    expiresAt: new Date(Date.now() + 60000).toISOString(),
-                    approval: {
-                      state: 'approved',
-                      requestId: 'approval-1',
-                      decidedAt: new Date().toISOString(),
-                    },
                   },
                 }
-              : {}),
+              : {
+                  // Shipping is always on: without a delivery quote the
+                  // order uses store pickup.
+                  shipping: {
+                    mode: 'pickup',
+                    cartPin: [
+                      {
+                        productId: PRODUCT,
+                        quantity: 2,
+                        unitPriceCents: 1500,
+                        finalPriceCents: 3000,
+                      },
+                    ],
+                  },
+                }),
           },
         },
       });
@@ -312,10 +337,9 @@ describe('checkout next-step guidance through the SDK route', () => {
     const context = await h.api.getCustomerCheckoutContext();
     context.addresses[0].interiorNumber = '130';
     h.api.getCustomerCheckoutContext.mockResolvedValue(context);
-    h.api.createSale.mockResolvedValue({
-      ...(await h.api.createSale.getMockImplementation()!()),
-      totalCents: 1500,
-      debtCents: 1500,
+    h.api.createCheckout.mockResolvedValue({
+      status: 'created',
+      sale: { ...placedSale(), totalCents: 1500, debtCents: 1500 },
     });
     let addressRef = '';
     const lookup = h.checkout.lookup.bind(h.checkout);
@@ -343,7 +367,7 @@ describe('checkout next-step guidance through the SDK route', () => {
     expect(reply).toContain('no crea un pedido');
     expect(reply).not.toContain('Antes de crear el pedido necesito');
     expect(reply).not.toContain('Datos inventados');
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(h.checkout.confirmationStatus(SENDER)).toMatchObject({
       armed: false,
     });
@@ -354,7 +378,28 @@ describe('checkout next-step guidance through the SDK route', () => {
     expect((confirmed as { reply: string }).reply).toContain(
       'Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.',
     );
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+    // The customer then chooses store pickup.
+    const raw = (await h.store.get(SENDER))?.data.minimalCart;
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...(raw as object),
+        shipping: {
+          mode: 'pickup',
+          cartPin: [
+            {
+              productId: PRODUCT,
+              quantity: 1,
+              unitPriceCents: 1500,
+              finalPriceCents: 1500,
+            },
+          ],
+        },
+      },
+      new Date().toISOString(),
+    );
     const order = await h.turn(
       'hacer pedido',
       [call('prepareOrder'), say()],
@@ -364,13 +409,13 @@ describe('checkout next-step guidance through the SDK route', () => {
     (order as { onSent: () => void }).onSent();
     await h.turn('SÍ', [say()], EVENT('order-yes'));
     await h.turn('SÍ', [say()], EVENT('repeat-yes'));
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });
 
   it.each([false, true])(
     'fallback delivery still requires sent-summary strict consent (sent: %s)',
     async (sent) => {
-      const h = setup();
+      const h = setup({ shipping: true });
       await h.ready();
       const draft = await h.checkout.confirmedDraft(SENDER);
       if (draft === null) throw new Error('expected confirmed fixture');
@@ -399,7 +444,7 @@ describe('checkout next-step guidance through the SDK route', () => {
         EVENT('fallback-answer'),
       );
       expect(await h.checkout.confirmedDraft(SENDER)).toBeNull();
-      expect(h.api.createSale).not.toHaveBeenCalled();
+      expect(h.api.createCheckout).not.toHaveBeenCalled();
     },
   );
 
@@ -432,7 +477,7 @@ describe('checkout next-step guidance through the SDK route', () => {
       reply:
         'Para mostrarle el resumen de entrega aún me falta: número exterior o S/N, colonia, código postal, estado, ciudad o municipio.',
     });
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('prepareOrder without an address gives a concrete starting instruction', async () => {
@@ -500,8 +545,25 @@ describe('checkout next-step guidance through the SDK route', () => {
 
 describe('minimal order placement through the SDK route', () => {
   it('S2/S3/S6 new customer order needs armed one-shot summary consent', async () => {
-    const h = setup({ atomic: true });
+    const h = setup({ shipping: true });
     await h.ready(true);
+    // Pin the delivery quote to the confirmed new address.
+    const draft = (await h.checkout.confirmedDraft(SENDER))!;
+    const raw = (await h.store.get(SENDER))?.data.minimalCart as {
+      shipping: object;
+    };
+    await h.store.commitMinimalCart(
+      SENDER,
+      raw,
+      {
+        ...raw,
+        shipping: {
+          ...raw.shipping,
+          destinationPin: minimalShippingDestination(draft.address),
+        },
+      },
+      new Date().toISOString(),
+    );
     const offer = await h.turn(
       'Hacer pedido',
       [call('prepareOrder'), say('Inventado')],
@@ -532,13 +594,13 @@ describe('minimal order placement through the SDK route', () => {
     await h.turn('SÍ', [say()], EVENT('duplicate-yes'));
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });
-  it('atomic S2/S3/S4: armed summary consent creates checkout, not legacy sale', async () => {
-    const h = setup({ atomic: true, shipping: true });
+  it('S1/S2/S3/S4: armed summary consent creates the backend-quoted charged checkout', async () => {
+    const h = setup({ shipping: true });
     await h.ready();
     const offer = await h.turn(
       'Quiero hacer mi pedido',
       [call('prepareOrder'), say('Pedido creado inventado')],
-      EVENT('wamid.atomic1'),
+      EVENT('wamid.checkout1'),
     );
     expect((offer as { reply: string }).reply).toContain(
       'Total a pagar: $80.00 MXN',
@@ -549,7 +611,7 @@ describe('minimal order placement through the SDK route', () => {
     const placed = await h.turn(
       'SÍ',
       [say('inventado')],
-      EVENT('wamid.atomic2'),
+      EVENT('wamid.checkout2'),
     );
     expect(h.seen).toHaveLength(calls);
     expect(h.api.createSale).not.toHaveBeenCalled();
@@ -565,50 +627,24 @@ describe('minimal order placement through the SDK route', () => {
         addressId: ADDRESS,
         expectedVersion: '2026-10-01T00:00:00.000Z',
       },
-      sale: { expectedTotalCents: 8000, shipping: { chargeCents: 5000 } },
+      sale: {
+        expectedTotalCents: 8000,
+        shipping: { quoteId: 'quote-1' },
+      },
     });
     expect((placed as { reply: string }).reply).toContain('folio B-0042');
     expect((placed as { reply: string }).reply).toContain('CLABE');
-    await h.turn('SÍ', [say()], EVENT('wamid.atomic3'));
-    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
-  });
-  it('S1/S4: prepareOrder plus one SÍ creates the approved charged order', async () => {
-    const h = setup({ shipping: true });
-    await h.ready();
-    const offer = await h.turn(
-      'Quiero hacer mi pedido',
-      [call('prepareOrder'), say('inventado')],
-      EVENT('wamid.o1'),
-    );
-    expect((offer as { reply: string }).reply).toContain(
-      'Total a pagar: $80.00 MXN',
-    );
-    expect(h.api.createSale).not.toHaveBeenCalled();
-    (offer as { onSent: () => void }).onSent();
-    const seen = h.seen.length;
-    const result = await h.turn('SÍ', [say()], EVENT('wamid.o2'));
-    expect(h.seen).toHaveLength(seen);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
-    expect(
-      (h.api.createSale.mock.calls[0] as unknown as [unknown])[0],
-    ).toMatchObject({
-      expectedTotalCents: 8000,
-      shipping: {
-        chargeCents: 5000,
-        approvalId: 'approval-1',
-        quoteId: 'quote-1',
-      },
-    });
-    expect((result as { reply: string }).reply).not.toContain(
+    expect((placed as { reply: string }).reply).not.toContain(
       'no está incluido',
     );
+    await h.turn('SÍ', [say()], EVENT('wamid.checkout3'));
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });
   it.each([
     ['on', true],
-    ['off', false],
     ['absent', false],
   ] as const)(
-    'exposes prepareOrder only when the order gate is %s',
+    'exposes prepareOrder only when the order service is %s',
     async (order, exposed) => {
       const h = setup({ order });
       await h.turn('Hola', [say()]);
@@ -630,7 +666,7 @@ describe('minimal order placement through the SDK route', () => {
     const reply = (offer as { reply: string }).reply;
     expect(reply).toContain('Resumen de su pedido:');
     expect(reply).not.toContain('Su pedido ya quedó creado.');
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
     (offer as { onSent: () => void }).onSent();
 
     const calls = h.seen.length;
@@ -640,7 +676,7 @@ describe('minimal order placement through the SDK route', () => {
       EVENT('wamid.o2'),
     );
     expect(h.seen.length).toBe(calls);
-    expect(h.api.createSale).toHaveBeenCalledTimes(1);
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect((placed as { reply: string }).reply).toContain('folio B-0042');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
   });
@@ -661,7 +697,7 @@ describe('minimal order placement through the SDK route', () => {
         EVENT('wamid.o2'),
       ),
     ).toEqual({ kind: 'handled', reply: '¿Cuántas unidades desea?' });
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('never sells the earlier summary on a later SÍ meant for the model', async () => {
@@ -683,7 +719,7 @@ describe('minimal order placement through the SDK route', () => {
       await h.turn('Sí', [say('Listo, ¿algo más?')], EVENT('wamid.o3')),
     ).toEqual({ kind: 'handled', reply: 'Listo, ¿algo más?' });
     expect(h.seen.length).toBe(calls + 1);
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('drops a pending order when a delivery confirmation answers the turn', async () => {
@@ -702,7 +738,7 @@ describe('minimal order placement through the SDK route', () => {
     delivery.onSent?.();
     await h.turn('SÍ', [say('no debería usarse')], EVENT('wamid.d4'));
     await h.turn('SÍ', [say('¿En qué más le ayudo?')], EVENT('wamid.o4'));
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('fails closed when the model sends arguments to prepareOrder', async () => {
@@ -715,7 +751,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     expect((result as { reply: string }).reply).not.toContain('Pedido creado');
     expect(result).not.toHaveProperty('onSent');
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 
   it('a busy-rejected turn cancels the summary of the run it interrupted', async () => {
@@ -734,6 +770,6 @@ describe('minimal order placement through the SDK route', () => {
     );
     (offer as { onSent?: () => void }).onSent?.();
     await h.turn('SÍ', [say('¿En qué le ayudo?')], EVENT('wamid.o2'));
-    expect(h.api.createSale).not.toHaveBeenCalled();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 });

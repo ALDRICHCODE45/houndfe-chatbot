@@ -8,18 +8,17 @@
  * configured token "AABB..." is NOT equal to the request token "aabb...".
  * SHA-256 digests of fixed-size buffers are compared with timingSafeEqual.
  *
- * Guard behavior (metrics enabled only):
+ * Guard behavior (metrics token configured only):
  *   - rawHeaders must be present (non-null object with even-length string[]).
  *   - Exactly one raw Authorization field (case-insensitive name match).
  *   - Raw Authorization value must EXACTLY EQUAL the parsed single-string header.
  *   - Duplicate raw Authorization entries → HTTP 401.
  *   - Malformed rawHeaders (null/non-array/odd-length/non-string elements) → 401.
  *   - Non-string Authorization values (null/number/object) → HTTP 401.
- *   - Missing configured token at boot → enabled requests deny (401).
  *   - Constant-time SHA-256 digest comparison on fixed-size buffers.
  *   - Never log or expose any token value in error messages.
  *
- * Metrics disabled → HTTP 404 before any credential inspection.
+ * No valid configured token → HTTP 404 before any credential inspection.
  */
 import * as crypto from 'node:crypto';
 import {
@@ -42,6 +41,16 @@ const DIGEST_BYTES = 32;
 
 /** ASCII hex digit pattern for validation. */
 const HEX_RE = /^[0-9a-f]{64}$/i;
+
+/** True when the configured value is a servable metrics token (64 ASCII hex).
+ * The metrics endpoint is served and telemetry recorded exactly when true. */
+export function isConfiguredMetricsToken(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length === TOKEN_LENGTH &&
+    HEX_RE.test(value)
+  );
+}
 
 /** Accept Node request instances and null-prototype header records while
  * rejecting null, arrays, and functions without restricting object prototypes. */
@@ -110,8 +119,8 @@ function readParsedAuth(headers: Record<string, unknown>): string | undefined {
 export class ReceiptMetricsAuthGuard implements CanActivate {
   /**
    * SHA-256 digest of the configured token, or undefined if the configured
-   * value is not a non-empty 64-hex string. Guard denies all requests when
-   * the digest is undefined.
+   * value is not a non-empty 64-hex string. The endpoint is served exactly
+   * when the digest is defined; otherwise every request gets 404.
    */
   private readonly configuredDigest: Buffer | undefined;
 
@@ -121,12 +130,8 @@ export class ReceiptMetricsAuthGuard implements CanActivate {
     );
     // Store digest only if the configured value is a valid token string.
     // Any other value (undefined, null, array, object, wrong-length, non-hex)
-    // means enabled requests will deny — the guard never throws here.
-    if (
-      typeof rawToken === 'string' &&
-      rawToken.length === TOKEN_LENGTH &&
-      HEX_RE.test(rawToken)
-    ) {
+    // means the endpoint is not served — the guard never throws here.
+    if (isConfiguredMetricsToken(rawToken)) {
       this.configuredDigest = crypto
         .createHash('sha256')
         .update(rawToken, 'utf8')
@@ -140,12 +145,10 @@ export class ReceiptMetricsAuthGuard implements CanActivate {
     const http = context.switchToHttp();
     const request = http.getRequest<Record<string, unknown>>();
 
-    // Gate 1: metrics must be enabled — before any auth inspection.
-    // Disabled metrics: always 404 regardless of auth state.
-    const metricsEnabled = this.configService.get<boolean>(
-      'receiptMedia.metricsEnabled',
-    );
-    if (metricsEnabled !== true) {
+    // Gate 1: a configured token is required — before any auth inspection.
+    // No token: always 404 regardless of auth state.
+    const configuredDigest = this.configuredDigest;
+    if (configuredDigest === undefined) {
       throw new NotFoundException('Metrics endpoint is not available');
     }
 
@@ -199,12 +202,7 @@ export class ReceiptMetricsAuthGuard implements CanActivate {
       throw new UnauthorizedException('Malformed Bearer token');
     }
 
-    // Gate 7: enabled requests require a valid configured token
-    if (this.configuredDigest === undefined) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
-    // Gate 8: constant-time digest comparison on original UTF-8 bytes.
+    // Gate 7: constant-time digest comparison on original UTF-8 bytes.
     // Comparison is CASE-SENSITIVE — "AABB..." ≠ "aabb...".
     const providedDigest = crypto
       .createHash('sha256')
@@ -213,12 +211,12 @@ export class ReceiptMetricsAuthGuard implements CanActivate {
 
     if (
       providedDigest.length !== DIGEST_BYTES ||
-      this.configuredDigest.length !== DIGEST_BYTES
+      configuredDigest.length !== DIGEST_BYTES
     ) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    if (!crypto.timingSafeEqual(providedDigest, this.configuredDigest)) {
+    if (!crypto.timingSafeEqual(providedDigest, configuredDigest)) {
       throw new UnauthorizedException('Invalid credentials');
     }
 

@@ -2,8 +2,8 @@
 
 import { readFileSync } from 'node:fs';
 import type { FactoryProvider } from '@nestjs/common';
+import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
-import { SHIPPING_QUOTE_PROVIDER } from '../shipping/domain/shipping-quote.port';
 import { join } from 'node:path';
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
@@ -18,10 +18,8 @@ import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { PostgresConversationStore } from '../conversation/infrastructure/postgres-conversation.store';
 import { RealToolRegistry } from '../sale-flow/infrastructure/real-tool-registry';
 import { LLM_AGENT_SYSTEM_PROMPT, SYSTEM_PROMPT } from './domain/system-prompt';
-import {
-  SALE_FLOW_INSTRUCTIONS,
-  SHIPPING_QUOTE_GUIDANCE_FRAGMENT,
-} from '../sale-flow/domain/sale-flow-instructions';
+import { SALE_FLOW_INSTRUCTIONS } from '../sale-flow/domain/sale-flow-instructions';
+import { DELIVERY_ZONE_INTAKE } from '../delivery-zones/application/delivery-zone-intake.service';
 import { LlmAgentModule } from './llm-agent.module';
 import { LLM_AGENT, type LlmAgentPort } from './domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
@@ -59,11 +57,11 @@ describe('LlmAgentModule integration', () => {
     LLM_MODEL: 'anthropic/claude-sonnet-4.5',
     DATABASE_URL: 'postgres://u:p@localhost:5432/d',
     OPS_CHANNEL_PHONE: '5215500000000',
-    // SQ-5C3d2 environment isolation: pin shipping quotes OFF so a host-set
-    // SHIPPING_QUOTES_ENABLED=true cannot enable the shipping module or the
-    // default-off prompt byte-identity assertion. MANAGED_KEYS restores it.
-    SHIPPING_QUOTES_ENABLED: 'false',
-    // WU-B: pin the RESTOCK gate OFF by default; the binding test flips it.
+    // Removed shipping flags (U6): stale values must have no effect.
+    SHIPPING_QUOTES_ENABLED: 'true',
+    MINIMAL_CATALOG_SHIPPING_ENABLED: 'false',
+    // Removed flag: RESTOCK is always on, so this stale value must have no
+    // effect (the binding test below proves the gate is still built).
     HUMAN_DECISIONS_RESTOCK_ENABLED: 'false',
   };
   const MANAGED_KEYS = [...Object.keys(VALID_ENV), 'LLM_MAX_STEPS'];
@@ -98,7 +96,6 @@ describe('LlmAgentModule integration', () => {
       getCustomerByPhone: jest.fn(),
       upsertCustomer: jest.fn(),
       createSale: jest.fn(),
-      attachReceipt: jest.fn(),
       updateDelivery: jest.fn(),
       getOrderHistory: jest.fn(),
     };
@@ -112,39 +109,41 @@ describe('LlmAgentModule integration', () => {
     };
   }
 
-  it.each([
-    [false, undefined, false],
-    [true, undefined, false],
-    [false, { quote: jest.fn() }, false],
-    [true, { quote: jest.fn() }, true],
-  ] as const)(
-    'S5: minimal shipping factory requires gate and provider (%s, %j)',
-    (enabled, provider, available) => {
-      const providers = Reflect.getMetadata(
-        'providers',
-        LlmAgentModule,
-      ) as FactoryProvider[];
-      const factory = providers.find(
-        (entry) => entry.provide === MinimalShippingService,
-      )!;
-      expect(factory.inject).toContainEqual({
-        token: SHIPPING_QUOTE_PROVIDER,
-        optional: true,
-      });
-      const create = factory.useFactory as (...args: unknown[]) => unknown;
-      const service = create(
+  it('[S9] always builds the minimal shipping service over the chatbot API (no flag)', () => {
+    const providers = Reflect.getMetadata(
+      'providers',
+      LlmAgentModule,
+    ) as FactoryProvider[];
+    const factory = providers.find(
+      (entry) => entry.provide === MinimalShippingService,
+    )!;
+    expect(factory.inject).toContain(CHATBOT_API_CLIENT);
+    expect(factory.inject).not.toContain(ConfigService);
+    expect(factory.inject).toContain(DELIVERY_ZONE_INTAKE);
+    const create = factory.useFactory as (...args: unknown[]) => unknown;
+    expect(
+      create(
         {},
         {},
         {},
-        { get: () => enabled },
-        provider,
-        null,
-        { create: jest.fn() },
-      );
-      if (available) expect(service).toBeInstanceOf(MinimalShippingService);
-      else expect(service).toBeUndefined();
-    },
-  );
+        { createShippingQuote: jest.fn() },
+        { register: jest.fn() },
+      ),
+    ).toBeInstanceOf(MinimalShippingService);
+  });
+
+  it('[S6,S9] MinimalOrderService requires the shipping service for re-quotes', () => {
+    const params = Reflect.getMetadata(
+      'design:paramtypes',
+      MinimalOrderService,
+    ) as unknown[];
+    expect(params).toContain(MinimalShippingService);
+    expect(
+      (Reflect.getMetadata('optional:paramtypes', MinimalOrderService) as
+        | number[]
+        | undefined) ?? [],
+    ).not.toContain(params.indexOf(MinimalShippingService));
+  });
 
   it('resolves every symbol binding and exports AgentRunner', async () => {
     const moduleRef = await Test.createTestingModule({
@@ -171,7 +170,7 @@ describe('LlmAgentModule integration', () => {
     const llm = moduleRef.get<LlmAgentPort>(LLM_AGENT);
     expect(llm).toBeInstanceOf(VercelAiLlmAgent);
 
-    // TOOL_REGISTRY resolves to RealToolRegistry with the 12 sale-flow tools.
+    // TOOL_REGISTRY resolves to RealToolRegistry with the 11 sale-flow tools.
     const tools = moduleRef.get<ToolRegistry>(TOOL_REGISTRY);
     expect(tools).toBeInstanceOf(RealToolRegistry);
     const toolKeys = Object.keys(tools.getTools()).sort();
@@ -183,7 +182,6 @@ describe('LlmAgentModule integration', () => {
         'getCustomerByPhone',
         'upsertCustomer',
         'createSale',
-        'attachReceipt',
         'updateDelivery',
         'getOrderHistory',
         'getPaymentDetails',
@@ -199,18 +197,14 @@ describe('LlmAgentModule integration', () => {
     // phrase + the sale-flow slice instruction markers + the new
     // step-12 getPaymentDetails gating substring.
     const composed = moduleRef.get<string>(LLM_AGENT_SYSTEM_PROMPT);
-    // SQ-5C3d2: the default-off assertion runs under the pinned env.
-    expect(process.env.SHIPPING_QUOTES_ENABLED).toBe('false');
     expect(composed).toContain('esa función aún no está disponible');
     expect(composed).toContain('searchCatalog');
     expect(composed).toContain('originalPriceCents');
     expect(composed).toContain(
       'Llama a `getPaymentDetails` después de que `createSale` confirme',
     );
-    // SQ-5C3d2 full-DI default-off graph (no TOOL_REGISTRY override): the
-    // real registry owns no `getShippingQuote`, so the boot-composed prompt
-    // is byte-identical to base + '\n\n' + slice and never mentions the
-    // shipping tool.
+    // The boot-composed prompt is byte-identical to base + '\n\n' + slice
+    // and never mentions a chatbot-side shipping quote tool.
     expect(composed).toBe(SYSTEM_PROMPT + '\n\n' + SALE_FLOW_INSTRUCTIONS);
     expect(composed).not.toContain('getShippingQuote');
 
@@ -236,7 +230,7 @@ describe('LlmAgentModule integration', () => {
     await moduleRef.close();
   });
 
-  it('builds the bounded RESTOCK gate only under the exact restockEnabled flag', async () => {
+  it('always builds the bounded RESTOCK gate, even with the removed flag set to false', async () => {
     const boot = async () => {
       const moduleRef = await Test.createTestingModule({
         imports: [
@@ -271,20 +265,13 @@ describe('LlmAgentModule integration', () => {
           : null;
       await moduleRef.close();
       return {
-        enabled: service.enabled,
         hasCallback: typeof reconcileExpired === 'function',
         bounded,
       };
     };
 
+    expect(process.env.HUMAN_DECISIONS_RESTOCK_ENABLED).toBe('false');
     await expect(boot()).resolves.toEqual({
-      enabled: false,
-      hasCallback: false,
-      bounded: null,
-    });
-    process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
-    await expect(boot()).resolves.toEqual({
-      enabled: true,
       hasCallback: true,
       bounded: false,
     });
@@ -322,100 +309,6 @@ describe('LlmAgentModule integration', () => {
     expect(tools.getTools()).toBe(stubToolSet);
 
     await moduleRef.close();
-  });
-
-  describe('LLM_AGENT_SYSTEM_PROMPT boot-time shipping availability (SQ-5C3d2)', () => {
-    const disabledCanonical = SYSTEM_PROMPT + '\n\n' + SALE_FLOW_INSTRUCTIONS;
-
-    async function composePromptFor(registry: unknown): Promise<string> {
-      const moduleRef = await Test.createTestingModule({
-        imports: [
-          AppConfigModule.forRoot({ ignoreEnvFile: true }),
-          HttpModule,
-          ConversationModule,
-          ChatbotApiModule,
-          SaleFlowModule,
-          LlmAgentModule,
-        ],
-      })
-        .overrideProvider(CHATBOT_API_CLIENT)
-        .useValue(stubChatbotApi())
-        .overrideProvider(ChatbotApiHttpClient)
-        .useValue(stubChatbotApi())
-        .overrideProvider(CONVERSATION_STORE)
-        .useValue(stubStore())
-        .overrideProvider(PostgresConversationStore)
-        .useValue(stubStore())
-        .overrideProvider(TOOL_REGISTRY)
-        .useValue(registry)
-        .compile();
-
-      const composed = moduleRef.get<string>(LLM_AGENT_SYSTEM_PROMPT);
-      await moduleRef.close();
-      return composed;
-    }
-
-    it('appends the shipping fragment only when the registry owns a getShippingQuote key', async () => {
-      const owned = {
-        getTools: () => ({
-          searchCatalog: { description: 'x' },
-          getShippingQuote: { description: 'y' },
-        }),
-      };
-
-      const composed = await composePromptFor(owned);
-
-      expect(composed).toBe(
-        disabledCanonical + SHIPPING_QUOTE_GUIDANCE_FRAGMENT,
-      );
-      expect(composed).toContain('getShippingQuote');
-      expect(composed).not.toBe(disabledCanonical);
-    });
-
-    it('keeps the prompt byte-identical to base + "\\n\\n" + slice when the key is absent', async () => {
-      const absent = {
-        getTools: () => ({ searchCatalog: { description: 'x' } }),
-      };
-
-      const composed = await composePromptFor(absent);
-
-      expect(composed).toBe(disabledCanonical);
-      expect(composed).not.toContain('getShippingQuote');
-    });
-
-    it('fails closed on inherited keys, throwing getTools, hostile proxies, and non-object tools', async () => {
-      const inherited = {
-        getTools: () =>
-          Object.create({ getShippingQuote: {} }) as Record<string, unknown>,
-      };
-      const throwingGetTools = {
-        getTools: () => {
-          throw new Error('hostile getTools');
-        },
-      };
-      const hostileProxy = {
-        getTools: () =>
-          new Proxy(
-            {},
-            {
-              getOwnPropertyDescriptor: () => {
-                throw new Error('hostile proxy');
-              },
-            },
-          ),
-      };
-      const nonObject = { getTools: () => null };
-
-      for (const registry of [
-        inherited,
-        throwingGetTools,
-        hostileProxy,
-        nonObject,
-      ]) {
-        const composed = await composePromptFor(registry);
-        expect(composed).toBe(disabledCanonical);
-      }
-    });
   });
 
   it('confines the `ai` SDK to infrastructure/ (the module itself never imports it)', () => {

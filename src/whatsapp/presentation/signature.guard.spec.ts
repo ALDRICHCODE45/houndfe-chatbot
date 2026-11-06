@@ -74,10 +74,6 @@ describe('SignatureGuard', () => {
   }
 
   describe('verified raw snapshot', () => {
-    beforeEach(() => {
-      configService.set('humanDecisions.restockEnabled', true);
-    });
-
     it('publishes frozen exact bytes with local post-verification UTC milliseconds', () => {
       jest.useFakeTimers().setSystemTime(new Date('2026-07-01T10:00:00.001Z'));
       const request = Object.assign(signedRequest(Buffer.from('¡Hola 🐶!')), {
@@ -179,21 +175,6 @@ describe('SignatureGuard', () => {
           );
           expect(readVerifiedWebhookSnapshot(request)).toBeNull();
         }
-      },
-    );
-
-    it.each([false, undefined, 'true'])(
-      'publishes no snapshot for flag %p and clears earlier proof',
-      (flag) => {
-        const request = signedRequest();
-        guard.canActivate(executionContextFor(request));
-        expect(readVerifiedWebhookSnapshot(request)).not.toBeNull();
-        configService.set('humanDecisions.restockEnabled', flag);
-        expect(guard.canActivate(executionContextFor(request))).toBe(true);
-        expect(readVerifiedWebhookSnapshot(request)).toBeNull();
-        const fresh = signedRequest();
-        expect(guard.canActivate(executionContextFor(fresh))).toBe(true);
-        expect(readVerifiedWebhookSnapshot(fresh)).toBeNull();
       },
     );
   });

@@ -25,8 +25,7 @@ can never render a failed intake as success. `HumanDecisionsModule` provides the
 store and orchestrator inertly; the agent module now injects the gated service. Intake acknowledgements are neutral; only the eventual human answer names
 the original product/presentation, never a fresh catalog label on replay.
 
-Activation is owner-gated by the exact `HUMAN_DECISIONS_EXPIRATION_ENABLED=true`
-(projected at `minimalCatalogAgent.expirationEnabled`); any other value stays off.
+EXPIRATION is **always on**; there is no env flag.
 Intake is not a complete handoff (no polling/copy/send/ACK; E2–E4).
 
 ## E2 recovery discovery (read-only)
@@ -182,8 +181,7 @@ Run the isolated proof (Docker and `postgres:16-alpine` required):
 RUN_DOCKER_TESTS=1 pnpm test --runTestsByPath src/human-decisions/infrastructure/postgres-expiration-application-outcome-coordinator.db.spec.ts --runInBand
 ```
 
-- **Post-deploy test plan (features are tested deployed).** With
-  `HUMAN_DECISIONS_EXPIRATION_ENABLED=true` on the deployed bot, confirm
+- **Post-deploy test plan (features are tested deployed).** On the deployed bot, confirm
   discovery → preparation → send → acceptance → report/ACK → closure on a real
   inquiry, then restart the service mid-outcome and confirm the next sweep
-  resumes reporting without resend. Activation stays an owner decision.
+  resumes reporting without resend.

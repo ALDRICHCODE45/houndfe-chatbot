@@ -714,13 +714,6 @@ export class VercelAiLlmAgent implements LlmAgentPort {
       if (name in sourceTools) toolsContext[name] = catalogContext;
     }
 
-    // SQ-5B2B3: the price-stripped `getShippingQuote` tool also declares
-    // `contextSchema: z.object({ senderId })`. The AI-SDK validates that
-    // every tool with a contextSchema has a matching map entry, so add it
-    // ONLY when the tool is actually present in this run's ToolSet.
-    if ('getShippingQuote' in sourceTools) {
-      toolsContext.getShippingQuote = { senderId: input.senderId };
-    }
     const diagnostic = catalogDiagnostic(this.logger);
     const guard = new InventoryEvidenceGuard();
     const serverTurnId = randomUUID();
@@ -923,12 +916,10 @@ function catalogDiagnostic(logger: Logger) {
     if (name === 'getCustomerByPhone') return 'getCustomerByPhone';
     if (name === 'upsertCustomer') return 'upsertCustomer';
     if (name === 'createSale') return 'createSale';
-    if (name === 'attachReceipt') return 'attachReceipt';
     if (name === 'updateDelivery') return 'updateDelivery';
     if (name === 'getOrderHistory') return 'getOrderHistory';
     if (name === 'getPaymentDetails') return 'getPaymentDetails';
     if (name === 'cancelSale') return 'cancelSale';
-    if (name === 'getShippingQuote') return 'getShippingQuote';
     observationComplete = false;
     return 'other';
   };

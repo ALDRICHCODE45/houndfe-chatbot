@@ -47,13 +47,10 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_LEASE_MS',
     'RECEIPT_MEDIA_WORKER_POLL_MS',
     'RECEIPT_MEDIA_INGESTION_ENABLED',
-    'RECEIPT_MEDIA_METRICS_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
-    // WU2A experimental human-decisions gate
-    'HUMAN_DECISIONS_RESTOCK_ENABLED',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
     'OPS_CHANNEL_PHONE',
-    // SQ-2A shipping quotes
+    // Removed shipping vars (U6): kept here so the test restores them.
     'SHIPPING_QUOTES_ENABLED',
     'SKYDROPX_BASE_URL',
     'SKYDROPX_CLIENT_ID',
@@ -62,13 +59,12 @@ describe('configuration()', () => {
     'SKYDROPX_ORIGIN_STATE',
     'SKYDROPX_ORIGIN_MUNICIPALITY',
     'SKYDROPX_ORIGIN_NEIGHBORHOOD',
-    // SQ-5B2A private measured-demo profile passthrough
     'SHIPPING_DEMO_PARCEL_PROFILE_JSON',
-    // Experimental minimal SDK catalog route
     'MINIMAL_CATALOG_SHIPPING_ENABLED',
-    'MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED',
+    // Removed always-on flags: kept here so the test restores them.
     'MINIMAL_CATALOG_AGENT_ENABLED',
     'MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS',
+    'MINIMAL_CATALOG_ORDER_ENABLED',
   ];
 
   beforeEach(() => {
@@ -88,31 +84,11 @@ describe('configuration()', () => {
     }
   });
 
-  it.each([undefined, 'false', 'TRUE', '1', ' true ', 'true'])(
-    'S5: minimal shipping enables only exact true (%s)',
-    (value) => {
-      if (value === undefined)
-        delete process.env.MINIMAL_CATALOG_SHIPPING_ENABLED;
-      else process.env.MINIMAL_CATALOG_SHIPPING_ENABLED = value;
-      expect(configuration().minimalCatalogAgent).toHaveProperty(
-        'shippingEnabled',
-        value === 'true',
-      );
-    },
-  );
-
-  it.each([undefined, 'false', 'TRUE', '1', ' true ', 'true'])(
-    'S2: minimal atomic checkout enables only exact true (%s)',
-    (value) => {
-      if (value === undefined)
-        delete process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED;
-      else process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = value;
-      expect(configuration().minimalCatalogAgent).toHaveProperty(
-        'atomicCheckoutEnabled',
-        value === 'true',
-      );
-    },
-  );
+  it('S2: the removed atomic checkout flag no longer configures anything', () => {
+    process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED = 'true';
+    expect(configuration()).not.toHaveProperty('minimalCatalogAgent');
+    delete process.env.MINIMAL_CATALOG_ATOMIC_CHECKOUT_ENABLED;
+  });
 
   describe('LLM step budget', () => {
     it('defaults to four steps when LLM_MAX_STEPS is absent', () => {
@@ -196,53 +172,68 @@ describe('configuration()', () => {
 
   // WU1B
   describe('receiptMedia', () => {
-    it.each([
-      { env: undefined, expected: false, label: 'omitted defaults' },
-      { env: 'false', expected: false, label: 'explicit false' },
-      { env: 'true', expected: true, label: 'exact true' },
-    ])('$label', ({ env, expected }) => {
-      if (env === undefined) {
-        delete process.env.RECEIPT_MEDIA_ENABLED;
-      } else {
-        process.env.RECEIPT_MEDIA_ENABLED = env;
-      }
-      const cfg = configuration() as unknown as {
-        receiptMedia: {
-          enabled: boolean;
-          maxBytes: number;
-          meta: { allowedHosts: string[] };
-          storage: { forcePathStyle: boolean };
-          worker: { concurrency: number; leaseMs: number };
-          metricsEnabled: boolean;
-        };
-      };
-      expect(cfg.receiptMedia.enabled).toBe(expected);
+    it('derives the always-on receipt knobs from defaults', () => {
+      for (const key of [
+        'META_MEDIA_ALLOWED_HOSTS',
+        'META_MEDIA_METADATA_TIMEOUT_MS',
+        'META_MEDIA_DOWNLOAD_TIMEOUT_MS',
+        'RECEIPT_MEDIA_WORKER_POLL_MS',
+      ])
+        delete process.env[key];
+      const cfg = configuration();
       expect(cfg.receiptMedia.maxBytes).toBe(10_485_760);
-      expect(cfg.receiptMedia.meta.allowedHosts).toEqual([]);
-      expect(cfg.receiptMedia.storage.forcePathStyle).toBe(false);
-      expect(cfg.receiptMedia.worker.concurrency).toBe(2);
-      expect(cfg.receiptMedia.worker.leaseMs).toBe(60_000);
-      expect(cfg.receiptMedia.metricsEnabled).toBe(false);
+      expect(cfg.receiptMedia.meta).toEqual({
+        allowedHosts: ['lookaside.fbsbx.com'],
+        metadataTimeoutMs: 10_000,
+        downloadTimeoutMs: 30_000,
+      });
+      expect(cfg.receiptMedia.worker).toEqual({
+        concurrency: 2,
+        leaseMs: 60_000,
+        pollIntervalMs: 5_000,
+      });
     });
 
-    // R3-cleanup-rollout-gate: the ingestion rollout gate is surfaced as
-    // `receiptMedia.worker.enabled` and is fail-closed: only the exact string
-    // 'true' enables it; omitted, 'false', and any other casing stay false.
-    it.each([
-      { env: undefined, expected: false, label: 'omitted defaults false' },
-      { env: 'false', expected: false, label: 'explicit false' },
-      { env: 'TRUE', expected: false, label: 'non-exact casing stays false' },
-      { env: 'true', expected: true, label: 'exact true enables' },
-    ])('exposes worker.enabled: $label', ({ env, expected }) => {
-      if (env === undefined) {
-        delete process.env.RECEIPT_MEDIA_INGESTION_ENABLED;
-      } else {
-        process.env.RECEIPT_MEDIA_INGESTION_ENABLED = env;
-      }
-      const cfg = configuration() as unknown as {
-        receiptMedia: { worker: { enabled: boolean } };
-      };
-      expect(cfg.receiptMedia.worker.enabled).toBe(expected);
+    it('reads explicit receipt knobs', () => {
+      process.env.META_MEDIA_ALLOWED_HOSTS = 'a.example.com, .b.example';
+      process.env.META_MEDIA_METADATA_TIMEOUT_MS = '5000';
+      process.env.META_MEDIA_DOWNLOAD_TIMEOUT_MS = '20000';
+      process.env.RECEIPT_MEDIA_WORKER_POLL_MS = '1000';
+      const { meta, worker } = configuration().receiptMedia;
+      expect(meta).toEqual({
+        allowedHosts: ['a.example.com', '.b.example'],
+        metadataTimeoutMs: 5000,
+        downloadTimeoutMs: 20000,
+      });
+      expect(worker.pollIntervalMs).toBe(1000);
+    });
+
+    // R3/S4: the removed flag, storage and capability vars configure nothing.
+    it('ignores the removed receipt flag, storage and capability vars', () => {
+      Object.assign(process.env, {
+        RECEIPT_MEDIA_ENABLED: 'true',
+        RECEIPT_MEDIA_INGESTION_ENABLED: 'true',
+        RECEIPT_STORAGE_ENDPOINT: 'https://s3.example.com',
+        RECEIPT_STORAGE_BUCKET: 'bucket',
+        RECEIPT_MEDIA_PUBLIC_BASE_URL: 'https://media.example.com',
+        RECEIPT_CAPABILITY_KEYS: '1:key',
+        RECEIPT_CAPABILITY_ACTIVE_VERSION: '1',
+        CHATBOT_API_ATTACH_TIMEOUT_MS: '30000',
+      });
+      const receiptMedia = configuration().receiptMedia as Record<
+        string,
+        unknown
+      >;
+      for (const removed of [
+        'enabled',
+        'storage',
+        'publicBaseUrl',
+        'capability',
+        'attachTimeoutMs',
+      ])
+        expect(receiptMedia).not.toHaveProperty(removed);
+      expect(receiptMedia.worker).not.toHaveProperty('enabled');
+      expect(JSON.stringify(receiptMedia)).not.toMatch(/s3\.example|bucket/);
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia
@@ -261,228 +252,32 @@ describe('configuration()', () => {
       };
       expect(cfg.receiptMedia.metricsToken).toBeUndefined();
     });
-
-    // WU15-1: metricsToken is independent of receiptMedia.enabled
-    it('exposes metricsToken when receiptMedia is disabled', () => {
-      process.env.RECEIPT_MEDIA_ENABLED = 'false';
-      process.env.RECEIPT_MEDIA_METRICS_TOKEN = 'independent-token';
-      const cfg = configuration() as unknown as {
-        receiptMedia: {
-          enabled: boolean;
-          metricsToken: string | undefined;
-        };
-      };
-      expect(cfg.receiptMedia.enabled).toBe(false);
-      expect(cfg.receiptMedia.metricsToken).toBe('independent-token');
-    });
-
-    // WU14B: capability versions are canonical decimal strings of arbitrary
-    // magnitude; configuration passes the raw env string through verbatim
-    // (never numeric, never bounded by Number.MAX_SAFE_INTEGER).
-    it.each([
-      '1',
-      '2147483647',
-      '2147483648',
-      '9007199254740991',
-      '9007199254740992',
-      '9223372036854775808',
-    ])(
-      'passes RECEIPT_CAPABILITY_ACTIVE_VERSION %s through verbatim',
-      (env) => {
-        process.env.RECEIPT_CAPABILITY_ACTIVE_VERSION = env;
-        const cfg = configuration() as {
-          receiptMedia: {
-            capability: { activeVersion: string; keys?: string[] };
-          };
-        };
-        expect(cfg.receiptMedia.capability.activeVersion).toBe(env);
-      },
-    );
   });
 
-  // WU2A: explicit experimental RESTOCK gate. The configuration function is
-  // the real activation boundary, so only the exact env string 'true' turns it
-  // on; unset, 'false', and every malformed value stay false. No implicit or
-  // case-insensitive activation is possible here.
-  describe('humanDecisions.restockEnabled', () => {
-    const restockEnabled = () =>
-      (
-        configuration() as {
-          humanDecisions: { restockEnabled: boolean };
-        }
-      ).humanDecisions.restockEnabled;
-
-    it('defaults false when HUMAN_DECISIONS_RESTOCK_ENABLED is absent', () => {
-      delete process.env.HUMAN_DECISIONS_RESTOCK_ENABLED;
-      expect(restockEnabled()).toBe(false);
-    });
-
-    it('is false for the explicit env string "false"', () => {
-      process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'false';
-      expect(restockEnabled()).toBe(false);
-    });
-
-    it.each(['FALSE', 'True', 'TRUE', '1', '0', 'yes', 'on', '', ' true'])(
-      'stays false for the non-exact value %p',
-      (value) => {
-        process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = value;
-        expect(restockEnabled()).toBe(false);
-      },
-    );
-
-    it('is true only for the exact env string "true"', () => {
-      process.env.HUMAN_DECISIONS_RESTOCK_ENABLED = 'true';
-      expect(restockEnabled()).toBe(true);
-    });
-  });
-
-  // SQ-2A: default-off shipping quotes; only exact 'true' enables the feature.
-  describe('shippingQuotes', () => {
-    type Shipping = {
-      shippingQuotes: {
-        enabled: boolean;
-        skydropx: Record<string, string | undefined>;
-        measuredDemoParcelProfileJson?: string;
-      };
-    };
-    const shipping = () => (configuration() as Shipping).shippingQuotes;
-
-    it('returns the typed default-off subtree when SHIPPING_QUOTES_ENABLED is absent', () => {
-      delete process.env.SHIPPING_QUOTES_ENABLED;
-      expect(shipping()).toEqual({
-        enabled: false,
-        skydropx: {
-          baseUrl: 'https://api-pro.skydropx.com',
-          clientId: undefined,
-          clientSecret: undefined,
-          originPostalCode: undefined,
-          originState: undefined,
-          originMunicipality: undefined,
-          originNeighborhood: undefined,
-        },
-      });
-    });
-
-    it.each([
-      [undefined, false],
-      ['true', true],
-      ['false', false],
-      ['TRUE', false],
-      ['False', false],
-      ['1', false],
-      [' true ', false],
-    ])('maps SHIPPING_QUOTES_ENABLED=%s', (env, expected) => {
-      if (env === undefined) {
-        delete process.env.SHIPPING_QUOTES_ENABLED;
-      } else {
-        process.env.SHIPPING_QUOTES_ENABLED = env;
-      }
-      expect(shipping().enabled).toBe(expected);
-    });
-
-    it('passes raw Skydropx provider env values through the factory', () => {
-      process.env.SHIPPING_QUOTES_ENABLED = 'true';
+  // U6: the backend quotes carriers; the removed chatbot-side shipping vars
+  // (Skydropx, demo parcel profile, both shipping flags) configure nothing.
+  describe('removed shipping vars', () => {
+    it.each(['true', 'false'])('have no effect when set (flags=%s)', (flag) => {
+      process.env.SHIPPING_QUOTES_ENABLED = flag;
+      process.env.MINIMAL_CATALOG_SHIPPING_ENABLED = flag;
+      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON = '{"x":1}';
       process.env.SKYDROPX_BASE_URL = 'https://sandbox.skydropx.test';
-      process.env.SKYDROPX_CLIENT_ID = 'client-id-raw';
-      process.env.SKYDROPX_CLIENT_SECRET = 'client-secret-raw';
+      process.env.SKYDROPX_CLIENT_ID = 'id';
+      process.env.SKYDROPX_CLIENT_SECRET = 'secret';
       process.env.SKYDROPX_ORIGIN_POSTAL_CODE = '06000';
-      process.env.SKYDROPX_ORIGIN_STATE = 'CDMX';
-      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = 'Cuauhtemoc';
-      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = 'Centro';
-      expect(shipping()).toEqual({
-        enabled: true,
-        skydropx: {
-          baseUrl: 'https://sandbox.skydropx.test',
-          clientId: 'client-id-raw',
-          clientSecret: 'client-secret-raw',
-          originPostalCode: '06000',
-          originState: 'CDMX',
-          originMunicipality: 'Cuauhtemoc',
-          originNeighborhood: 'Centro',
-        },
-      });
-    });
-
-    // SQ-2A-H: accepted surrounding whitespace is normalized in the factory so
-    // ConfigService sees the same trimmed values that Joi validated.
-    it('trims surrounding whitespace on provider values', () => {
-      process.env.SHIPPING_QUOTES_ENABLED = 'true';
-      process.env.SKYDROPX_BASE_URL = '  https://sandbox.skydropx.test  ';
-      process.env.SKYDROPX_CLIENT_ID = '  client-id  ';
-      process.env.SKYDROPX_CLIENT_SECRET = '  client-secret  ';
-      process.env.SKYDROPX_ORIGIN_POSTAL_CODE = ' 06000 ';
-      process.env.SKYDROPX_ORIGIN_STATE = '  CDMX  ';
-      process.env.SKYDROPX_ORIGIN_MUNICIPALITY = '  Cuauhtemoc  ';
-      process.env.SKYDROPX_ORIGIN_NEIGHBORHOOD = '  Centro  ';
-      expect(shipping()).toEqual({
-        enabled: true,
-        skydropx: {
-          baseUrl: 'https://sandbox.skydropx.test',
-          clientId: 'client-id',
-          clientSecret: 'client-secret',
-          originPostalCode: '06000',
-          originState: 'CDMX',
-          originMunicipality: 'Cuauhtemoc',
-          originNeighborhood: 'Centro',
-        },
-      });
-    });
-
-    // SQ-5B2A: optional private measured-demo profile JSON is a raw string
-    // passthrough; the factory never parses it and blanks become undefined.
-    it.each([undefined, '', '   ', '\n\t '])(
-      'maps absent or blank SHIPPING_DEMO_PARCEL_PROFILE_JSON=%# to undefined',
-      (env) => {
-        if (env === undefined) {
-          delete process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON;
-        } else {
-          process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON = env;
-        }
-        expect(shipping().measuredDemoParcelProfileJson).toBeUndefined();
-      },
-    );
-
-    it('preserves a bounded raw JSON string after outer trim without parsing it', () => {
-      process.env.SHIPPING_DEMO_PARCEL_PROFILE_JSON =
-        '  {"version":1,"items":[]}  ';
-      expect(shipping().measuredDemoParcelProfileJson).toBe(
-        '{"version":1,"items":[]}',
-      );
+      const cfg = configuration() as unknown as Record<string, unknown>;
+      expect(cfg).not.toHaveProperty('shippingQuotes');
+      expect(cfg).not.toHaveProperty('minimalCatalogAgent');
+      expect(JSON.stringify(cfg)).not.toMatch(/skydropx|sandbox\.skydropx/i);
     });
   });
 
-  // Experimental minimal SDK catalog route: default-off; the sender list is
-  // strict and an empty/invalid list enables nobody.
-  describe('minimalCatalogAgent', () => {
-    const minimal = () =>
-      (
-        configuration() as unknown as {
-          minimalCatalogAgent: { enabled: boolean; allowedSenders: string[] };
-        }
-      ).minimalCatalogAgent;
-
-    it('stays disabled unless the flag is exactly "true"', () => {
-      for (const value of [undefined, 'false', 'TRUE', '1', ' true ']) {
-        if (value === undefined)
-          delete process.env.MINIMAL_CATALOG_AGENT_ENABLED;
-        else process.env.MINIMAL_CATALOG_AGENT_ENABLED = value;
-        expect(minimal().enabled).toBe(false);
-      }
-      process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'true';
-      expect(minimal().enabled).toBe(true);
-    });
-
-    it('parses a strict exact wa_id allowlist, else enables nobody', () => {
-      process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS =
-        '5215550001111, 5215550002222';
-      expect(minimal().allowedSenders).toEqual([
-        '5215550001111',
-        '5215550002222',
-      ]);
-      for (const value of ['', '   ', 'owner@example.com', '+5215550001111']) {
-        process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = value;
-        expect(minimal().allowedSenders).toEqual([]);
-      }
-    });
+  // The minimal SDK catalog route is always on for every sender; its former
+  // enable/allowlist/order/shipping env vars are removed and have no effect.
+  it('ignores the removed minimal-route enable, allowlist and order env vars', () => {
+    process.env.MINIMAL_CATALOG_AGENT_ENABLED = 'false';
+    process.env.MINIMAL_CATALOG_AGENT_ALLOWED_SENDERS = '5215550001111';
+    process.env.MINIMAL_CATALOG_ORDER_ENABLED = 'false';
+    expect(configuration()).not.toHaveProperty('minimalCatalogAgent');
   });
 });

@@ -1,24 +1,10 @@
 import {
-  expireApproval,
-  MINIMAL_SHIPPING_UNCONFIRMED,
-} from '../../llm-agent/application/minimal-shipping-approval';
-import { buildMinimalShipping } from '../../llm-agent/domain/minimal-shipping';
-import { ConfigService } from '@nestjs/config';
-import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
-import { shippingApprovalPolicyAdapter } from '../../shipping/application/shipping-approval-policy.adapter';
-import { shippingDigest } from '../../llm-agent/application/minimal-shipping-approval';
-import {
   AgentRunner,
   type AgentRunnerConfig,
 } from '../../llm-agent/application/agent-runner.service';
 import { CostGuardService } from '../../llm-agent/application/cost-guard.service';
 import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
-import {
-  type AgentMessage,
-  type ConversationState,
-  type ConversationStateData,
-  type ConversationStore,
-} from '../../conversation/domain/conversation-store';
+import { type ConversationStore } from '../../conversation/domain/conversation-store';
 import { type LlmAgentPort } from '../../llm-agent/domain/llm-agent.port';
 import { type ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import { SendResult, WhatsappSenderPort } from '../domain/whatsapp-sender.port';
@@ -33,40 +19,20 @@ import type { InboundMessage } from '../domain/inbound-message';
 import {
   ASK_FOR_REF,
   PENDING_HUMAN_REQUEST_REPLY,
-  SHIPPING_DECISION_GRAMMAR,
-  SHIPPING_REQUOTE_REPLY,
-  SHIPPING_RETRY_REPLY,
   HumanHandoffService,
 } from '../../human-handoff/application/human-handoff.service';
-import { ReceiptAmountRouterService } from '../../receipt-media/application/receipt-amount-router.service';
 import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
-import {
-  SHIPPING_CUSTOMER_ACCEPTANCE_KEY,
-  SHIPPING_CUSTOMER_OFFER_KEY,
-} from '../../shipping/application/shipping-customer-acceptance';
-import {
-  shippingAcceptancePair,
-  shippingCustomerAcceptance,
-  shippingCustomerOffer,
-} from '../../../test/fixtures/shipping-customer-acceptance-fixture';
-import type {
-  ReceiptMediaOutboxRow,
-  ReceiptMediaRow,
-} from '../../receipt-media/domain/receipt-media.types';
+import type { ReceiptMediaRow } from '../../receipt-media/domain/receipt-media.types';
 import { type ReceiptIngressService } from '../../receipt-media/application/receipt-ingress.service';
 
 const receiptMediaRowFixture = (id: string): ReceiptMediaRow =>
   ({ id }) as unknown as ReceiptMediaRow;
 
-const receiptMediaOutboxRowFixture = (id: string): ReceiptMediaOutboxRow =>
-  ({ id }) as unknown as ReceiptMediaOutboxRow;
-
 /**
- * Spec rewrite: the dispatcher MUST replace the echo path with
- * AgentRunner.handle(). After each run, both the user and the
- * assistant turns MUST be persisted via ConversationStore.update
- * (UPSERT), and the assistant reply MUST be sent via
- * WhatsappSenderPort.sendText. No proactive sends.
+ * Every customer turn is handled by the minimal SDK route
+ * (MinimalCatalogAgentService.tryHandle) and its reply is sent via
+ * WhatsappSenderPort.sendText. AgentRunner only serves the ops synthetic
+ * "resolved" turn. No proactive sends.
  *
  * Post-incident additions (unsolicited greetings bug):
  *   - A re-delivered (duplicate) message id is skipped before any agent
@@ -87,13 +53,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   let dedup: jest.Mocked<WebhookDedupStore>;
   let recentOutbound: jest.Mocked<RecentOutboundStore>;
   let humanHandoff: jest.Mocked<
-    Pick<
-      HumanHandoffService,
-      'isOpsSender' | 'create' | 'resolveReply' | 'expireMinimalShipping'
-    >
+    Pick<HumanHandoffService, 'isOpsSender' | 'create' | 'resolveReply'>
   >;
   let conversationStore: jest.Mocked<ConversationStore>;
-  let amountRouter: jest.Mocked<ReceiptAmountRouterService>;
   let ingress: jest.Mocked<ReceiptIngressService>;
   let minimalAgent: jest.Mocked<MinimalCatalogAgentService>;
 
@@ -108,8 +70,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       update: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
 
     sender = {
@@ -119,6 +79,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           [Parameters<WhatsappSenderPort['sendText']>[0]]
         >()
         .mockResolvedValue({ providerMessageId: 'wamid.reply' }),
+      sendTemplate: jest.fn(),
     };
 
     llm = {
@@ -154,7 +115,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     humanHandoff = {
       isOpsSender: jest.fn().mockReturnValue(false),
       resolveReply: jest.fn(),
-      expireMinimalShipping: jest.fn(),
       create: jest.fn(),
     };
 
@@ -168,15 +128,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       update: jest.fn(),
       setPendingHumanRequest: jest.fn(),
       clearPendingHumanRequest: jest.fn(),
-      setReceiptAmountPointer: jest.fn(),
-      clearReceiptAmountPointer: jest.fn(),
     };
-
-    // WU13-B1: ReceiptAmountRouter mock. Default fenced so the ordinary
-    // agent path runs. Tests override per scenario.
-    amountRouter = {
-      route: jest.fn().mockResolvedValue({ kind: 'fenced' }),
-    } as unknown as jest.Mocked<ReceiptAmountRouterService>;
 
     // WU13-B2: ReceiptIngressService mock. Default reserved with a minimal
     // receipt fixture — the only valid closed terminal decision that carries
@@ -188,10 +140,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }),
     } as unknown as jest.Mocked<ReceiptIngressService>;
 
-    // Experimental minimal SDK route. Default: not-handled so every existing
-    // scenario continues through the unchanged legacy AgentRunner path.
+    // Minimal SDK route: handles every customer turn. Tests override the
+    // reply per scenario.
     minimalAgent = {
-      tryHandle: jest.fn().mockResolvedValue({ kind: 'not-handled' }),
+      tryHandle: jest
+        .fn()
+        .mockResolvedValue({ kind: 'handled', reply: 'Hola' }),
     } as unknown as jest.Mocked<MinimalCatalogAgentService>;
 
     service = new WebhookDispatcherService(
@@ -201,7 +155,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       recentOutbound,
       humanHandoff as unknown as HumanHandoffService,
       conversationStore,
-      amountRouter,
       ingress,
       minimalAgent,
     );
@@ -211,28 +164,17 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     jest.useRealTimers();
   });
 
+  // Neither the minimal customer route nor the ops AgentRunner ran a model.
+  const expectNoAgentRun = () => {
+    expect(llm.run).not.toHaveBeenCalled();
+    expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+  };
+
   // ─── Scenario: Signed inbound text reaches agent dispatch ───────────
-  it('invokes the agent, persists the assistant turn, and sends the reply', async () => {
-    // ADR-28: after `llm.run` the runner re-fetches state. First
-    // call returns null (first contact); second returns the
-    // just-written state with empty messages.
-    store.get.mockResolvedValueOnce(null).mockResolvedValueOnce({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
+  it('routes the customer turn to the minimal agent and sends its reply', async () => {
+    minimalAgent.tryHandle.mockResolvedValueOnce({
+      kind: 'handled',
       reply: 'Hola, ¿en qué te puedo ayudar?',
-      messages: [
-        { role: 'user', content: 'hola' },
-        { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-      ],
-      usage: { promptTokens: 1, completionTokens: 1 },
     });
 
     const event: WebhookEventDto = {
@@ -261,23 +203,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).toHaveBeenCalledWith(
-      expect.objectContaining({
-        senderId: '5215550001111',
-        text: 'hola',
-      }),
-    );
-
-    expect(store.commitAgentTurn).toHaveBeenCalledWith(
-      '5215550001111',
-      expect.objectContaining({
-        lastMessageAt: '2026-06-23T12:00:00.000Z',
-        messages: [
-          { role: 'user', content: 'hola' },
-          { role: 'assistant', content: 'Hola, ¿en qué te puedo ayudar?' },
-        ],
-      }),
-    );
+    expect(minimalAgent.tryHandle).toHaveBeenCalledWith({
+      senderId: '5215550001111',
+      text: 'hola',
+    });
+    // The legacy AgentRunner never serves a customer turn.
+    expect(llm.run).not.toHaveBeenCalled();
+    expect(store.commitAgentTurn).not.toHaveBeenCalled();
 
     expect(sender.sendText).toHaveBeenCalledWith({
       to: '5215550001111',
@@ -298,77 +230,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await expect(service.dispatch(event)).resolves.toBeUndefined();
     expect(sender.sendText).not.toHaveBeenCalled();
-    expect(llm.run).not.toHaveBeenCalled();
-  });
-
-  it('preserves prior history turns when UPSERTing after a successful run', async () => {
-    const prior: ConversationState = {
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T11:59:30.000Z', // within idle window
-      data: {
-        messages: [
-          { role: 'user', content: 'hola' },
-          { role: 'assistant', content: 'Hola' },
-        ] as AgentMessage[],
-      },
-    };
-    store.get.mockResolvedValue(prior);
-    store.update.mockResolvedValue({
-      ...prior,
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-    });
-    llm.run.mockResolvedValue({
-      reply: 'precio: $100',
-      messages: [
-        ...prior.data.messages!,
-        { role: 'user', content: 'precio?' },
-        { role: 'assistant', content: 'precio: $100' },
-      ],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
-
-    const event: WebhookEventDto = {
-      object: 'whatsapp_business_account',
-      entry: [
-        {
-          changes: [
-            {
-              value: {
-                messages: [
-                  {
-                    id: 'wamid.inbound-2',
-                    from: '5215550001111',
-                    timestamp: '1719000000',
-                    type: 'text',
-                    text: { body: 'precio?' },
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      ],
-    };
-
-    await service.dispatch(event);
-
-    // User + assistant both appended to the prior transcript.
-    expect(store.commitAgentTurn).toHaveBeenCalledWith(
-      '5215550001111',
-      expect.objectContaining({
-        expected: { messages: prior.data.messages },
-        messages: [
-          { role: 'user', content: 'hola' },
-          { role: 'assistant', content: 'Hola' },
-          { role: 'user', content: 'precio?' },
-          { role: 'assistant', content: 'precio: $100' },
-        ],
-      }),
-    );
-    expect(sender.sendText).toHaveBeenCalledWith({
-      to: '5215550001111',
-      text: 'precio: $100',
-    });
+    expectNoAgentRun();
   });
 
   // ─── Scenario: Meta re-delivers a SUCCESSFULLY processed message ──────
@@ -403,7 +265,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).not.toHaveBeenCalled();
+    expectNoAgentRun();
     expect(sender.sendText).not.toHaveBeenCalled();
     expect(store.update).not.toHaveBeenCalled();
   });
@@ -438,27 +300,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).not.toHaveBeenCalled();
+    expectNoAgentRun();
     expect(sender.sendText).not.toHaveBeenCalled();
   });
 
   // ─── Scenario: successful processing records dedup + outbound echo ───
   it('marks the message seen and remembers the outbound wamid after success', async () => {
-    store.get.mockResolvedValue(null);
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
-      reply: 'Hola',
-      messages: [
-        { role: 'user', content: 'hola' },
-        { role: 'assistant', content: 'Hola' },
-      ],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
-
     const event: WebhookEventDto = {
       object: 'whatsapp_business_account',
       entry: [
@@ -490,17 +337,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
   // ─── Scenario: failed SEND → NOT marked seen (retry must reprocess) ──
   it('does NOT mark the message seen when the send fails, so a retry can reprocess', async () => {
-    store.get.mockResolvedValue(null);
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
-      reply: 'Hola',
-      messages: [],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
     sender.sendText.mockRejectedValue(new Error('Meta 131030'));
 
     const event: WebhookEventDto = {
@@ -532,17 +368,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
   // ─── Scenario: one event carries several messages, one already seen ──
   it('processes each new message and skips only the duplicate within one event', async () => {
-    store.get.mockResolvedValue(null);
-    store.update.mockResolvedValue({
-      senderId: '5215550001111',
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: { messages: [] },
-    });
-    llm.run.mockResolvedValue({
-      reply: 'Hola',
-      messages: [],
-      usage: { promptTokens: 1, completionTokens: 1 },
-    });
     dedup.isDuplicate.mockImplementation(
       async (id: string) => id === 'wamid.dup',
     );
@@ -579,8 +404,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await service.dispatch(event);
 
-    expect(llm.run).toHaveBeenCalledTimes(1);
-    expect(llm.run).toHaveBeenCalledWith(
+    expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+    expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'nuevo' }),
     );
     expect(sender.sendText).toHaveBeenCalledTimes(1);
@@ -651,11 +476,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     const input = (index = 0) => llm.run.mock.calls[index][0];
     const hasEvent = (index = 0) =>
       Object.prototype.hasOwnProperty.call(input(index), 'inboundEvent');
+    const customerInput = (index = 0) =>
+      minimalAgent.tryHandle.mock.calls[index][0];
 
     it('forwards the normalized customer identity into the agent run', async () => {
       ready();
       await service.dispatch(inbound('wamid.inbound', 'hola', PHONE_ID));
-      expect(llm.run).toHaveBeenCalledWith(
+      expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
         expect.objectContaining({
           senderId: CUSTOMER,
           text: 'hola',
@@ -667,7 +494,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     it('omits the property when the customer inbound has no phone metadata', async () => {
       ready();
       await service.dispatch(inbound('wamid.inbound', 'hola'));
-      expect(hasEvent()).toBe(false);
+      expect(customerInput()).not.toHaveProperty('inboundEvent');
     });
 
     it('never forwards the ops identity into the synthetic customer turn', async () => {
@@ -688,6 +515,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(humanHandoff.isOpsSender).toHaveBeenCalledWith(OPS_SENDER);
       expect(input().senderId).toBe(CUSTOMER);
       expect(hasEvent()).toBe(false);
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
     });
 
     it('preserves the event identity across a redelivery of the same message', async () => {
@@ -695,8 +523,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       const event = inbound('wamid.inbound', 'hola', PHONE_ID);
       await service.dispatch(event);
       await service.dispatch(event);
-      expect(llm.run).toHaveBeenCalledTimes(2);
-      const [first, second] = llm.run.mock.calls.map((c) => c[0].inboundEvent);
+      expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(2);
+      const [first, second] = minimalAgent.tryHandle.mock.calls.map(
+        (c) => c[0].inboundEvent,
+      );
       expect(first).toEqual(EXPECTED);
       expect(second).toEqual(first);
       expect(second).not.toBe(first);
@@ -729,271 +559,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         },
       ],
     });
-
-    it.each(['APPROVE_SHIPPING', 'REJECT_SHIPPING'])(
-      '[S6] late minimal %s notifies customer once and still answers ops',
-      async (decision) => {
-        const { dispatcher, stateStore } = await expiredMinimalDispatcher();
-        await dispatcher.dispatch(opsEvent('late-ops', decision));
-        expect(sender.sendText.mock.calls.map(([message]) => message)).toEqual([
-          { to: CUSTOMER, text: MINIMAL_SHIPPING_UNCONFIRMED },
-          { to: OPS, text: SHIPPING_REQUOTE_REPLY },
-        ]);
-        expect((await stateStore.get(CUSTOMER))!.data).toMatchObject({
-          pendingHumanRequest: null,
-          minimalCart: { shipping: { approval: { state: 'expired' } } },
-        });
-        await dispatcher.dispatch(opsEvent('later-ops', decision));
-        expect(
-          sender.sendText.mock.calls.filter(([m]) => m.to === CUSTOMER),
-        ).toHaveLength(1);
-        expect(llm.run).not.toHaveBeenCalled();
-      },
-    );
-
-    it('[S6] lazy expiry then late ops does not notify customer twice', async () => {
-      const { dispatcher } = await expiredMinimalDispatcher();
-      const customerEvent = opsEvent('lazy-expiry', 'hola');
-      customerEvent.entry![0].changes![0].value!.messages![0].from = CUSTOMER;
-      await dispatcher.dispatch(customerEvent);
-      await dispatcher.dispatch(
-        opsEvent('late-after-lazy', 'APPROVE_SHIPPING'),
-      );
-      expect(sender.sendText.mock.calls.map(([message]) => message)).toEqual([
-        { to: CUSTOMER, text: MINIMAL_SHIPPING_UNCONFIRMED },
-        { to: OPS, text: SHIPPING_REQUOTE_REPLY },
-      ]);
-      expect(llm.run).not.toHaveBeenCalled();
-    });
-
-    async function expiredMinimalDispatcher() {
-      const stateStore = new InMemoryConversationStore();
-      const createdAt = '2026-06-23T11:30:00.000Z';
-      const requestId = 'abc123def456';
-      const shipping = buildMinimalShipping({
-        quote: {
-          kind: 'quoted',
-          quoteId: 'q1',
-          expiresAt: null,
-          rates: [
-            {
-              rateId: 'r1',
-              carrierName: 'Carrier',
-              serviceName: 'Ground',
-              priceCents: 10000,
-              currency: 'MXN',
-              estimatedDeliveryDays: 2,
-              validUntil: null,
-            },
-          ],
-        },
-        cartLines: [
-          {
-            productId: '11111111-1111-4111-8111-111111111111',
-            quantity: 1,
-            unitPriceCents: 1000,
-            finalPriceCents: 1000,
-          },
-        ],
-        addressId: '22222222-2222-4222-8222-222222222222',
-        addressVersion: createdAt,
-        createdAt,
-      })!;
-      await stateStore.create(CUSTOMER, {
-        lastMessageAt: createdAt,
-        data: {
-          minimalCart: {
-            items: shipping.cartLines.map(
-              ({ productId, quantity, unitPriceCents }) => ({
-                productId,
-                quantity,
-                unitPriceCents,
-              }),
-            ),
-            idempotencyKey: '',
-            shipping: {
-              ...shipping,
-              approval: { state: 'pending', requestId },
-            },
-          },
-          pendingHumanRequest: {
-            requestId,
-            ref: `HF-${requestId}`,
-            createdAt,
-            customerNotifiedAt: createdAt,
-          },
-        },
-      });
-      const target = {
-        id: requestId,
-        customerId: CUSTOMER,
-        agentId: OPS,
-        kind: 'shipping_approval' as const,
-        digest: shippingDigest(shipping),
-        status: 'pending' as const,
-        resolution: null,
-        createdAt,
-        resolvedAt: null,
-      };
-      const rows = {
-        create: jest.fn(),
-        findById: jest.fn().mockResolvedValue(target),
-        findByRef: jest.fn().mockResolvedValue(target),
-        findLatestPendingForAgent: jest.fn().mockResolvedValue(target),
-        resolve: jest.fn(
-          (
-            _id: string,
-            resolution: import('../../human-handoff/domain/human-handoff.types').HumanHandoffResolution,
-          ) =>
-            Promise.resolve({
-              ...target,
-              status: 'resolved' as const,
-              resolution,
-            }),
-        ),
-      };
-      const resolver = new HumanHandoffService(
-        rows,
-        sender,
-        stateStore,
-        {
-          get: (key: string) =>
-            key === 'humanHandoff.opsChannelPhone' ? OPS : true,
-        } as unknown as ConfigService,
-        {
-          reserve: jest.fn(),
-          closeLegacyResolved: jest.fn().mockResolvedValue(true),
-        },
-        shippingApprovalPolicyAdapter,
-      );
-      return {
-        stateStore,
-        dispatcher: new WebhookDispatcherService(
-          runner,
-          sender,
-          dedup,
-          recentOutbound,
-          resolver,
-          stateStore,
-          amountRouter,
-          ingress,
-          minimalAgent,
-        ),
-      };
-    }
-
-    it('[S1,S6] minimal pending waits without amounts, then expires lazily without model', async () => {
-      const createdAt = '2026-06-23T11:40:00.000Z';
-      const productId = '11111111-1111-4111-8111-111111111111';
-      const shipping = buildMinimalShipping({
-        quote: {
-          kind: 'quoted',
-          quoteId: 'q1',
-          expiresAt: null,
-          rates: [
-            {
-              rateId: 'r1',
-              carrierName: 'Carrier',
-              serviceName: 'Ground',
-              priceCents: 10000,
-              currency: 'MXN',
-              estimatedDeliveryDays: 2,
-              validUntil: null,
-            },
-          ],
-        },
-        cartLines: [
-          {
-            productId,
-            quantity: 1,
-            unitPriceCents: 1000,
-            finalPriceCents: 1000,
-          },
-        ],
-        addressId: '22222222-2222-4222-8222-222222222222',
-        addressVersion: createdAt,
-        createdAt,
-      })!;
-      const state: ConversationState = {
-        senderId: CUSTOMER,
-        lastMessageAt: createdAt,
-        data: {
-          minimalCart: {
-            items: [{ productId, quantity: 1, unitPriceCents: 1000 }],
-            idempotencyKey: '',
-            shipping: {
-              ...shipping,
-              approval: { state: 'pending', requestId: 'abc123def456' },
-            },
-          },
-          pendingHumanRequest: {
-            requestId: 'abc123def456',
-            ref: 'HF-abc123def456',
-            createdAt,
-            customerNotifiedAt: createdAt,
-          },
-        },
-      };
-      conversationStore.get.mockResolvedValue(state);
-      conversationStore.commitMinimalCart = jest.fn().mockResolvedValue(true);
-      conversationStore.clearPendingHumanRequest.mockResolvedValue(true);
-      const event = opsEvent('minimal-wait', 'hola');
-      event.entry![0].changes![0].value!.messages![0].from = CUSTOMER;
-      humanHandoff.expireMinimalShipping.mockImplementation((senderId) =>
-        expireApproval(conversationStore, senderId, Date.now()),
-      );
-      await service.dispatch(event);
-      expect(sender.sendText).toHaveBeenLastCalledWith({
-        to: CUSTOMER,
-        text: PENDING_HUMAN_REQUEST_REPLY,
-      });
-      expect(conversationStore.commitMinimalCart).not.toHaveBeenCalled();
-      jest.setSystemTime(new Date('2026-06-23T12:10:00.000Z'));
-      event.entry![0].changes![0].value!.messages![0].id = 'minimal-expired';
-      await service.dispatch(event);
-      expect(sender.sendText).toHaveBeenLastCalledWith({
-        to: CUSTOMER,
-        text: MINIMAL_SHIPPING_UNCONFIRMED,
-      });
-      expect(conversationStore.commitMinimalCart).toHaveBeenCalledWith(
-        CUSTOMER,
-        state.data.minimalCart,
-        expect.objectContaining({
-          shipping: expect.objectContaining({
-            approval: { state: 'expired' },
-          }) as unknown,
-        }),
-        expect.any(String),
-      );
-      expect(conversationStore.clearPendingHumanRequest).toHaveBeenCalledWith(
-        CUSTOMER,
-        'abc123def456',
-      );
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('minimal-expired');
-    });
-    it.each(['SHIPPING_APPROVED', 'SHIPPING_REJECTED'] as const)(
-      '[S1,S2,S7] minimal %s sends one deterministic customer message, no model',
-      async (decision) => {
-        humanHandoff.isOpsSender.mockReturnValue(true);
-        humanHandoff.resolveReply.mockResolvedValue({
-          kind: 'resolved',
-          customerId: CUSTOMER,
-          ref: 'HF-abc123def456',
-          resolution: { decision, draftCreatedAt: '2026-06-23T12:00:00.000Z' },
-          syntheticUserText: '',
-          minimalCustomerReply: 'envío cubierto por su compra',
-        });
-        await service.dispatch(opsEvent('minimal-ops', 'APPROVE_SHIPPING'));
-        expect(sender.sendText).toHaveBeenCalledTimes(1);
-        expect(sender.sendText).toHaveBeenCalledWith({
-          to: CUSTOMER,
-          text: 'envío cubierto por su compra',
-        });
-        expect(llm.run).not.toHaveBeenCalled();
-        expect(dedup.markSeen).toHaveBeenCalledWith('minimal-ops');
-      },
-    );
 
     it('resolved outcome: resolveReply → synthetic customer turn via AgentRunner → reply sent to the CUSTOMER', async () => {
       humanHandoff.isOpsSender.mockReturnValue(true);
@@ -1076,47 +641,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         to: OPS,
         text: ASK_FOR_REF,
       });
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       // The ops path short-circuits BEFORE the pending-marker read.
       expect(conversationStore.get).not.toHaveBeenCalled();
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-nopending');
     });
-
-    // SQ-5C2d: the dispatcher already hands every non-`resolved` ops outcome
-    // the same way (reply to ops, no runner). Characterize the three
-    // data-free shipping outcomes so their exact SHIPPING_* copy is pinned
-    // and can never leak to the customer.
-    it.each([
-      ['needs_decision', SHIPPING_DECISION_GRAMMAR],
-      ['needs_requote', SHIPPING_REQUOTE_REPLY],
-      ['ops_error', SHIPPING_RETRY_REPLY],
-    ] as const)(
-      '%s outcome: the exact data-free SHIPPING_* reply goes to the OPS number with no runner call',
-      async (kind, reply) => {
-        humanHandoff.isOpsSender.mockReturnValue(true);
-        humanHandoff.resolveReply.mockResolvedValue({ kind, reply });
-        const messageId = `wamid.ops-${kind}`;
-
-        await service.dispatch(opsEvent(messageId, 'APPROVE_SHIPPING'));
-
-        expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
-          text: 'APPROVE_SHIPPING',
-          from: OPS,
-        });
-        // Ops-only: the canned shipping reply never reaches the customer.
-        expect(sender.sendText).toHaveBeenCalledTimes(1);
-        expect(sender.sendText).toHaveBeenCalledWith({ to: OPS, text: reply });
-        expect(sender.sendText).not.toHaveBeenCalledWith(
-          expect.objectContaining({ to: CUSTOMER }),
-        );
-        // No customer synthetic turn and no LLM/runner invocation.
-        expect(llm.run).not.toHaveBeenCalled();
-        expect(store.update).not.toHaveBeenCalled();
-        // The ops path short-circuits BEFORE the pending-marker read.
-        expect(conversationStore.get).not.toHaveBeenCalled();
-        expect(dedup.markSeen).toHaveBeenCalledWith(messageId);
-      },
-    );
 
     it('dedup applies to ops inbounds unchanged: a duplicate ops wamid never reaches resolveReply', async () => {
       dedup.isDuplicate.mockResolvedValue(true);
@@ -1132,7 +661,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(dedup.markSeen).not.toHaveBeenCalled();
     });
 
-    it('customer inbound with pending marker: canned reply, NO AgentRunner call, no transcript write', async () => {
+    it('customer inbound with pending marker: canned reply, NO agent call, no transcript write', async () => {
       // Default humanHandoff.isOpsSender → false: customer-side inbound.
       conversationStore.get.mockResolvedValue({
         senderId: CUSTOMER,
@@ -1177,386 +706,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         to: CUSTOMER,
         text: PENDING_HUMAN_REQUEST_REPLY,
       });
-      expect(llm.run).not.toHaveBeenCalled(); // runner never invoked
+      expectNoAgentRun(); // no agent invoked
       expect(store.update).not.toHaveBeenCalled(); // no transcript write
       expect(conversationStore.update).not.toHaveBeenCalled();
       expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reply');
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cust-pending');
     });
   });
-
-  // ─── SCA-3b2: post-approval deterministic shipping disclosure ─────────────
-  describe('SCA-3b2: SHIPPING_APPROVED deterministic price disclosure', () => {
-    const OPS = '5219999888777';
-    const CUSTOMER = '5215550001111';
-    const PIN = '2026-06-23T12:00:00.000Z';
-    const EXPIRES = '2026-06-23T12:30:00.000Z';
-    const REQUEST = 'abcdef123456';
-    const MERCH = 60_000;
-    const CHARGE = 6_900;
-    const CUSTOMER_UUID = '11111111-1111-1111-1111-111111111111';
-    const ADDR = '22222222-2222-2222-2222-222222222222';
-    const PRODUCT = '33333333-3333-3333-3333-333333333333';
-    // Exact deterministic disclosure bytes (merchandise + freight + total).
-    const TEXT = [
-      'Detalle de tu envío (producto medido):',
-      'Mercancía: $600.00 MXN',
-      'Envío: $69.00 MXN',
-      'Total: $669.00 MXN',
-      '',
-      'Verificaremos el precio antes de registrar tu pedido. Si cambia, te mostraremos el nuevo total para que lo confirmes otra vez.',
-      '',
-      'Responde exactamente "SÍ" para aceptar o "NO" para rechazar.',
-    ].join('\n');
-
-    const line = (unitPriceCents = MERCH) => ({
-      productId: PRODUCT,
-      variantId: null,
-      quantity: 1,
-      unitPriceCents,
-    });
-    const data = (
-      over: Record<string, unknown> = {},
-    ): ConversationStateData => ({
-      shippingQuoteDraft: {
-        schemaVersion: 1,
-        draft: {
-          quoteId: 'quote-1',
-          selectedRate: {
-            rateId: 'rate-1',
-            carrierName: 'Skydropx',
-            serviceName: 'Express',
-            priceCents: CHARGE + 12_000,
-            currency: 'MXN',
-            estimatedDeliveryDays: 3,
-            validUntil: null,
-          },
-          providerExpiresAt: null,
-          bestRateCents: CHARGE + 12_000,
-          totalCreditCents: 12_000,
-          appliedCreditCents: 12_000,
-          unusedCreditCents: 0,
-          qualifyingUnitCount: 1,
-          customerPaysCents: CHARGE,
-        },
-        createdAt: PIN,
-        expiresAt: EXPIRES,
-      },
-      shippingQuoteDraftContext: {
-        schemaVersion: 1,
-        draftCreatedAt: PIN,
-        customerId: CUSTOMER_UUID,
-        shippingAddressId: ADDR,
-        cart: [line()],
-        destination: {
-          zipCode: '06700',
-          state: 'Ciudad de México',
-          municipality: 'Cuauhtémoc',
-          neighborhood: 'Roma Norte',
-        },
-      },
-      shippingApproval: {
-        requestId: REQUEST,
-        draftCreatedAt: PIN,
-        decision: 'SHIPPING_APPROVED',
-        decidedAt: '2026-06-23T12:05:00.000Z',
-      },
-      cart: {
-        items: [line()],
-        idempotencyKey: 'key-1',
-        expectedTotalCents: MERCH,
-      },
-      ...over,
-    });
-    const state = (over: Record<string, unknown> = {}): ConversationState => ({
-      senderId: CUSTOMER,
-      lastMessageAt: '2026-06-23T12:00:00.000Z',
-      data: data(over),
-    });
-    const opsEvent = (): WebhookEventDto => ({
-      object: 'whatsapp_business_account',
-      entry: [
-        {
-          changes: [
-            {
-              value: {
-                messages: [
-                  {
-                    id: 'wamid.ops-ship-approve',
-                    from: OPS,
-                    timestamp: '1719000000',
-                    type: 'text',
-                    text: { body: 'HF-abcdef123456 APPROVE_SHIPPING' },
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      ],
-    });
-
-    beforeEach(() => {
-      jest.setSystemTime(new Date('2026-06-23T12:10:00.000Z'));
-      humanHandoff.isOpsSender.mockReturnValue(true);
-      humanHandoff.resolveReply.mockResolvedValue({
-        kind: 'resolved',
-        customerId: CUSTOMER,
-        ref: 'HF-abcdef123456',
-        resolution: { decision: 'SHIPPING_APPROVED', draftCreatedAt: PIN },
-        syntheticUserText: '[Resolución del agente humano]',
-      });
-      conversationStore.update.mockImplementation(
-        (
-          senderId: string,
-          patch: Partial<Omit<ConversationState, 'senderId'>>,
-        ) => Promise.resolve({ senderId, ...patch } as ConversationState),
-      );
-    });
-
-    it('sends the price to the CUSTOMER first, then persists the sent offer with the real provider id', async () => {
-      conversationStore.get.mockResolvedValue(state());
-      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.offer' });
-
-      await service.dispatch(opsEvent());
-
-      expect(sender.sendText).toHaveBeenCalledWith({
-        to: CUSTOMER,
-        text: TEXT,
-      });
-      const sendOrder = sender.sendText.mock.invocationCallOrder[0];
-      const persistOrder = conversationStore.update.mock.invocationCallOrder[0];
-      expect(sendOrder).toBeLessThan(persistOrder);
-      const [, patch] = conversationStore.update.mock.calls[0];
-      expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toEqual({
-        schemaVersion: 1,
-        requestId: REQUEST,
-        draftCreatedAt: PIN,
-        offeredAt: '2026-06-23T12:10:00.000Z',
-        expiresAt: EXPIRES,
-        merchandiseCents: MERCH,
-        chargeCents: CHARGE,
-        expectedTotalCents: MERCH + CHARGE,
-        providerMessageId: 'wamid.offer',
-      });
-      expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
-      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.offer');
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
-    });
-
-    it('never routes the approval through the LLM runner or the transcript store', async () => {
-      conversationStore.get.mockResolvedValue(state());
-
-      await service.dispatch(opsEvent());
-
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(store.update).not.toHaveBeenCalled();
-      expect(humanHandoff.resolveReply).toHaveBeenCalledWith({
-        text: 'HF-abcdef123456 APPROVE_SHIPPING',
-        from: OPS,
-      });
-    });
-
-    it('send failure fails closed: no persist, no remember and no dedup mark', async () => {
-      conversationStore.get.mockResolvedValue(state());
-      sender.sendText.mockRejectedValue(new Error('send-down'));
-
-      await expect(service.dispatch(opsEvent())).rejects.toThrow('send-down');
-
-      expect(conversationStore.update).not.toHaveBeenCalled();
-      expect(recentOutbound.remember).not.toHaveBeenCalled();
-      expect(dedup.markSeen).not.toHaveBeenCalled();
-    });
-
-    it('persist failure fails closed: the send is remembered but never marked seen', async () => {
-      conversationStore.get.mockResolvedValue(state());
-      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.offer' });
-      conversationStore.update.mockResolvedValueOnce(
-        null as unknown as ConversationState,
-      );
-
-      await expect(service.dispatch(opsEvent())).rejects.toThrow();
-
-      expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.offer');
-      expect(dedup.markSeen).not.toHaveBeenCalled();
-    });
-
-    it('replay: an active persisted offer on the same request/pin/amounts skips re-send and marks seen', async () => {
-      conversationStore.get.mockResolvedValue(
-        state({ [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer() }),
-      );
-
-      await service.dispatch(opsEvent());
-
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(conversationStore.update).not.toHaveBeenCalled();
-      expect(recentOutbound.remember).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
-    });
-
-    it('stale cart fails closed: no send, no persist and no dedup mark', async () => {
-      conversationStore.get.mockResolvedValue(
-        state({
-          cart: {
-            items: [line(MERCH + 100)],
-            idempotencyKey: 'key-1',
-            expectedTotalCents: MERCH + 100,
-          },
-        }),
-      );
-
-      await expect(service.dispatch(opsEvent())).rejects.toThrow();
-
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(conversationStore.update).not.toHaveBeenCalled();
-      expect(dedup.markSeen).not.toHaveBeenCalled();
-    });
-
-    it('changed price: distrusts the stale offer, re-sends and clears any prior acceptance', async () => {
-      const stale = shippingCustomerOffer({ chargeCents: CHARGE - 100 });
-      const prior = shippingCustomerAcceptance({ chargeCents: CHARGE - 100 });
-      conversationStore.get.mockResolvedValue(
-        state({
-          [SHIPPING_CUSTOMER_OFFER_KEY]: stale,
-          [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: prior,
-        }),
-      );
-      sender.sendText.mockResolvedValue({ providerMessageId: 'wamid.reprice' });
-
-      await service.dispatch(opsEvent());
-
-      expect(sender.sendText).toHaveBeenCalledWith({
-        to: CUSTOMER,
-        text: TEXT,
-      });
-      const [, patch] = conversationStore.update.mock.calls[0];
-      expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
-        chargeCents: CHARGE,
-        expectedTotalCents: MERCH + CHARGE,
-        providerMessageId: 'wamid.reprice',
-      });
-      expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
-    });
-
-    // ─── SCA-3b3: replay fencing + post-send clock ─────────────────────────
-    describe('SCA-3b3: replay fence and post-send clock', () => {
-      it('re-discloses when the persisted acceptance is malformed, clearing it', async () => {
-        conversationStore.get.mockResolvedValue(
-          state({
-            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
-            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: { schemaVersion: 1 },
-          }),
-        );
-        sender.sendText.mockResolvedValue({
-          providerMessageId: 'wamid.reaccept',
-        });
-
-        await service.dispatch(opsEvent());
-
-        expect(llm.run).not.toHaveBeenCalled();
-        expect(store.update).not.toHaveBeenCalled();
-        expect(sender.sendText).toHaveBeenCalledWith({
-          to: CUSTOMER,
-          text: TEXT,
-        });
-        const [, patch] = conversationStore.update.mock.calls[0];
-        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
-          chargeCents: CHARGE,
-          providerMessageId: 'wamid.reaccept',
-        });
-        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
-        expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.reaccept');
-      });
-
-      it('re-discloses when the persisted acceptance is orphaned from the offer', async () => {
-        conversationStore.get.mockResolvedValue(
-          state({
-            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
-            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
-              requestId: 'ffffffffffff',
-            }),
-          }),
-        );
-        sender.sendText.mockResolvedValue({
-          providerMessageId: 'wamid.reaccept',
-        });
-
-        await service.dispatch(opsEvent());
-
-        expect(llm.run).not.toHaveBeenCalled();
-        expect(store.update).not.toHaveBeenCalled();
-        expect(sender.sendText).toHaveBeenCalledWith({
-          to: CUSTOMER,
-          text: TEXT,
-        });
-        const [, patch] = conversationStore.update.mock.calls[0];
-        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
-          providerMessageId: 'wamid.reaccept',
-        });
-        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
-      });
-
-      it('re-discloses when the persisted acceptance is dated in the future', async () => {
-        conversationStore.get.mockResolvedValue(
-          state({
-            [SHIPPING_CUSTOMER_OFFER_KEY]: shippingCustomerOffer(),
-            [SHIPPING_CUSTOMER_ACCEPTANCE_KEY]: shippingCustomerAcceptance({
-              acceptedAt: '2026-06-23T12:20:00.000Z',
-            }),
-          }),
-        );
-        sender.sendText.mockResolvedValue({
-          providerMessageId: 'wamid.reaccept',
-        });
-
-        await service.dispatch(opsEvent());
-
-        expect(llm.run).not.toHaveBeenCalled();
-        expect(store.update).not.toHaveBeenCalled();
-        expect(sender.sendText).toHaveBeenCalledWith({
-          to: CUSTOMER,
-          text: TEXT,
-        });
-        const [, patch] = conversationStore.update.mock.calls[0];
-        expect(patch.data![SHIPPING_CUSTOMER_OFFER_KEY]).toMatchObject({
-          providerMessageId: 'wamid.reaccept',
-        });
-        expect(patch.data![SHIPPING_CUSTOMER_ACCEPTANCE_KEY]).toBeNull();
-      });
-
-      it('replay: a fully valid charged acceptance keeps the active offer and skips re-send', async () => {
-        conversationStore.get.mockResolvedValue(
-          state(shippingAcceptancePair()),
-        );
-
-        await service.dispatch(opsEvent());
-
-        expect(sender.sendText).not.toHaveBeenCalled();
-        expect(conversationStore.update).not.toHaveBeenCalled();
-        expect(recentOutbound.remember).not.toHaveBeenCalled();
-        expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-ship-approve');
-      });
-
-      it('clock advance during send fails closed: send remembered, no marker write and no markSeen', async () => {
-        conversationStore.get.mockResolvedValue(state());
-        sender.sendText.mockImplementation(async () => {
-          jest.setSystemTime(new Date('2026-06-23T12:31:00.000Z'));
-          return { providerMessageId: 'wamid.late' };
-        });
-
-        await expect(service.dispatch(opsEvent())).rejects.toThrow();
-
-        expect(sender.sendText).toHaveBeenCalledWith({
-          to: CUSTOMER,
-          text: TEXT,
-        });
-        expect(recentOutbound.remember).toHaveBeenCalledWith('wamid.late');
-        expect(conversationStore.update).not.toHaveBeenCalled();
-        expect(dedup.markSeen).not.toHaveBeenCalled();
-      });
-    });
-  });
-
   // ─── WU13-A2: normalizeInboundMessages — image / document media ───────────
   describe('normalizeInboundMessages (image + document media)', () => {
     // Shared sender/metadata anchors
@@ -1744,8 +900,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
   });
 
-  // ─── WU13-B1: ReceiptAmountRouter integration ──────────────────────────────
-  describe('WU13-B1: ReceiptAmountRouter customer-text routing', () => {
+  // ─── R6: the receipt amount dialog is gone ─────────────────────────────────
+  describe('R6: customer text always reaches the agent', () => {
     const CUSTOMER = '5215550001111';
 
     const textEvent = (messageId: string, body: string): WebhookEventDto => ({
@@ -1772,7 +928,6 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
 
     beforeEach(() => {
-      amountRouter.route.mockResolvedValue({ kind: 'fenced' });
       store.get.mockResolvedValue(null);
       store.update.mockResolvedValue({
         senderId: CUSTOMER,
@@ -1789,240 +944,27 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
-    it('calls amountRouter for customer text before agentRunner', async () => {
-      await service.dispatch(textEvent('wamid.route-order', '500 pesos'));
-      expect(amountRouter.route).toHaveBeenCalled();
-      expect(llm.run).toHaveBeenCalled();
-    });
+    it.each(['500 pesos', 'CONFIRMAR', 'cancelar', 'sí'])(
+      'R6: %s goes straight to the minimal agent (no amount dialog)',
+      async (body) => {
+        minimalAgent.tryHandle.mockResolvedValueOnce({
+          kind: 'handled',
+          reply: 'Hola!',
+        });
+        await service.dispatch(textEvent(`wamid.r6.${body}`, body));
+        expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+          expect.objectContaining({ senderId: CUSTOMER, text: body }),
+        );
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledTimes(1);
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Hola!',
+        });
+      },
+    );
 
-    it('fenced: calls AgentRunner and sends reply normally', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'fenced' });
-      await service.dispatch(textEvent('wamid.fenced', 'hola'));
-      expect(llm.run).toHaveBeenCalledWith(
-        expect.objectContaining({ senderId: CUSTOMER, text: 'hola' }),
-      );
-      expect(sender.sendText).toHaveBeenCalledWith({
-        to: CUSTOMER,
-        text: 'Hola!',
-      });
-    });
-
-    // ─── G-2 llm-agent/R2/S1: safe guidance after a terminal receipt ─────
-    it('llm-agent/R2/S1: a definite terminal receipt outcome reaches the normal AgentRunner path with no protected identifiers in the runner input', async () => {
-      // A receipt that already reached a terminal/raced state no longer accepts
-      // the customer's confirmation, so the real router fences it and the
-      // follow-up takes the ordinary LLM path. The canonical pointer's
-      // protected receipt/sale identifiers must reach the real routing
-      // boundary but never cross the llm.run port.
-      const protectedPointer = {
-        receiptMediaId: 'receipt-sentinel-9f2c',
-        saleId: 'sale-sentinel-9f2c',
-        receiptVersion: '7',
-      };
-      conversationStore.get.mockResolvedValue({
-        senderId: CUSTOMER,
-        lastMessageAt: '2026-06-23T11:59:00.000Z',
-        data: { receiptAmountPointer: protectedPointer },
-      });
-      const routerStore = {
-        proposeAmount: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
-        rejectProposedAmount: jest
-          .fn()
-          .mockResolvedValue({ kind: 'fenced' as const }),
-        cancelReceipt: jest.fn().mockResolvedValue({ kind: 'fenced' as const }),
-        startAttachment: jest
-          .fn()
-          .mockResolvedValue({ kind: 'fenced' as const }),
-      };
-      const realRouter = new ReceiptAmountRouterService(
-        { get: conversationStore.get },
-        routerStore,
-      );
-      const realService = new WebhookDispatcherService(
-        runner,
-        sender,
-        dedup,
-        recentOutbound,
-        humanHandoff as unknown as HumanHandoffService,
-        conversationStore,
-        realRouter,
-        ingress,
-        minimalAgent,
-      );
-
-      await realService.dispatch(textEvent('wamid.terminal-followup', 'sí'));
-
-      // The real router propagated the protected identifiers to its store op,
-      // which fenced because the durable row is already terminal/raced.
-      expect(routerStore.startAttachment).toHaveBeenCalledTimes(1);
-      expect(routerStore.startAttachment).toHaveBeenCalledWith({
-        sourceWebhookMessageId: 'wamid.terminal-followup',
-        senderId: CUSTOMER,
-        receiptMediaId: protectedPointer.receiptMediaId,
-        capturedSaleId: protectedPointer.saleId,
-        expectedReceiptVersion: protectedPointer.receiptVersion,
-        expectedPointer: protectedPointer,
-        expectedReceiptStatus: 'AWAITING_CONFIRMATION',
-      });
-      // The fence fell through to the ordinary LLM path.
-      expect(llm.run).toHaveBeenCalledTimes(1);
-      const [runnerInput] = llm.run.mock.calls[0];
-      expect(runnerInput).toEqual({
-        catalogSession: expect.objectContaining({
-          senderId: CUSTOMER,
-        }) as unknown,
-        senderId: CUSTOMER,
-        text: 'sí',
-        history: [],
-        systemPrompt: 'sys',
-        tools: {},
-      });
-      const serialized = JSON.stringify(runnerInput);
-      expect(serialized).not.toContain(protectedPointer.receiptMediaId);
-      expect(serialized).not.toContain(protectedPointer.saleId);
-      expect(runnerInput).not.toHaveProperty('receiptAmountPointer');
-    });
-
-    // ─── ODD-4D: deterministic active-text fallback ────────────────────
-    // An active amount/confirmation flow with malformed or unrecognized
-    // text must never reach the LLM: the dispatcher sends the exact
-    // finish-or-cancel guidance deterministically.
-    const ACTIVE_FLOW_GUIDANCE =
-      'Tienes un proceso abierto: finalízalo o cancélalo.';
-
-    it('ODD-4D unrecognized: exact guidance, one send/remember/markSeen, no LLM', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
-      sender.sendText.mockResolvedValueOnce({
-        providerMessageId: 'wamid.unrecognized-out',
-      });
-      await service.dispatch(textEvent('wamid.unrecognized', 'hola'));
-
-      expect(sender.sendText).toHaveBeenCalledTimes(1);
-      expect(sender.sendText).toHaveBeenCalledWith({
-        to: CUSTOMER,
-        text: ACTIVE_FLOW_GUIDANCE,
-      });
-      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
-      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledWith(
-        'wamid.unrecognized-out',
-      );
-      expect(dedup.markSeen as jest.Mock).toHaveBeenCalledTimes(1);
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.unrecognized');
-      const order = [
-        sender.sendText as jest.Mock,
-        recentOutbound.remember as jest.Mock,
-        dedup.markSeen as jest.Mock,
-      ].map((mock) => mock.mock.invocationCallOrder[0]);
-      expect(order).toEqual([...order].sort((left, right) => left - right));
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(store.update).not.toHaveBeenCalled();
-    });
-
-    it('ODD-4D unrecognized: send failure propagates with no remember/markSeen/LLM', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
-      sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
-      await expect(
-        service.dispatch(textEvent('wamid.unrecognized-fail', 'hola')),
-      ).rejects.toThrow('Meta 131030');
-      expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
-      expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
-    });
-
-    it('ODD-4D unrecognized: markSeen failure is swallowed after a successful send', async () => {
-      amountRouter.route.mockResolvedValue({ kind: 'unrecognized' });
-      dedup.markSeen.mockRejectedValueOnce(new Error('dedup write failed'));
-      await expect(
-        service.dispatch(textEvent('wamid.unrecognized-markseen-fail', 'hola')),
-      ).resolves.toBeUndefined();
-      expect(sender.sendText).toHaveBeenCalledTimes(1);
-      expect(recentOutbound.remember as jest.Mock).toHaveBeenCalledTimes(1);
-      expect(dedup.markSeen).toHaveBeenCalledWith(
-        'wamid.unrecognized-markseen-fail',
-      );
-      expect(llm.run).not.toHaveBeenCalled();
-    });
-
-    it('proposed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'proposed',
-        receipt: receiptMediaRowFixture('r1'),
-        intent: receiptMediaOutboxRowFixture('i1'),
-      });
-      await service.dispatch(textEvent('wamid.proposed', '500 pesos'));
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.proposed');
-    });
-
-    it('started: skips AgentRunner and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'started',
-        receipt: receiptMediaRowFixture('r2'),
-        intent: receiptMediaOutboxRowFixture('i2'),
-      });
-      await service.dispatch(textEvent('wamid.started', 'si'));
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.started');
-    });
-
-    it('rejected: skips AgentRunner and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'rejected',
-        receipt: receiptMediaRowFixture('r3'),
-        intent: receiptMediaOutboxRowFixture('i3'),
-      });
-      await service.dispatch(textEvent('wamid.rejected', 'no'));
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.rejected');
-    });
-
-    it('cancelled: skips AgentRunner and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'cancelled',
-        receipt: receiptMediaRowFixture('r4'),
-        intent: receiptMediaOutboxRowFixture('i4'),
-      });
-      await service.dispatch(textEvent('wamid.cancelled', 'cancelar'));
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.cancelled');
-    });
-
-    it('replayed: skips AgentRunner and sender, marks dedup seen, continues', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'replayed',
-        receipt: receiptMediaRowFixture('r5'),
-        intent: receiptMediaOutboxRowFixture('i5'),
-      });
-      await service.dispatch(textEvent('wamid.replayed', '500 pesos'));
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.replayed');
-    });
-
-    it('terminal outcome with markSeen failure does not throw', async () => {
-      amountRouter.route.mockResolvedValue({
-        kind: 'proposed',
-        receipt: receiptMediaRowFixture('r6'),
-        intent: receiptMediaOutboxRowFixture('i6'),
-      });
-      dedup.markSeen.mockRejectedValue(new Error('dedup write failed'));
-      await expect(
-        service.dispatch(
-          textEvent('wamid.terminal-markseen-fail', '500 pesos'),
-        ),
-      ).resolves.toBeUndefined();
-      expect(llm.run).not.toHaveBeenCalled();
-      expect(sender.sendText).not.toHaveBeenCalled();
-      expect(dedup.markSeen).toHaveBeenCalledWith(
-        'wamid.terminal-markseen-fail',
-      );
-    });
-
-    it('ops inbound: amountRouter is NEVER called', async () => {
+    it('ops inbound: handled before any customer routing', async () => {
       humanHandoff.isOpsSender.mockReturnValue(true);
       humanHandoff.resolveReply.mockResolvedValue({
         kind: 'no_pending',
@@ -2050,12 +992,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           },
         ],
       });
-      expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).toHaveBeenCalled();
     });
 
-    it('pending-human short-circuit: amountRouter is NEVER called', async () => {
+    it('pending-human short-circuit: no agent run', async () => {
       conversationStore.get.mockResolvedValue({
         senderId: CUSTOMER,
         lastMessageAt: '2026-06-23T12:00:00.000Z',
@@ -2069,15 +1010,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         },
       });
       await service.dispatch(textEvent('wamid.pending-bypass', '¿siguen?'));
-      expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
         text: PENDING_HUMAN_REQUEST_REPLY,
       });
     });
 
-    it('media message: amountRouter is NEVER called (media ingress is WU13-B2)', async () => {
+    it('media message: never reaches the agent (media ingress is WU13-B2)', async () => {
       await service.dispatch({
         object: 'whatsapp_business_account',
         entry: [
@@ -2104,8 +1044,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           },
         ],
       });
-      expect(amountRouter.route).not.toHaveBeenCalled();
-      expect(llm.run).not.toHaveBeenCalled();
+      expectNoAgentRun();
     });
 
     // ─── WU13-B2: ReceiptIngressService customer media routing ─────────────────
@@ -2189,8 +1128,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           caption: 'komprobante.png',
         });
         expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
-        expect(amountRouter.route).not.toHaveBeenCalled();
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
       });
 
       it('admit: absent caption still forwards only the 5-field contract', async () => {
@@ -2218,7 +1156,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           caption: undefined,
         });
         expect(Object.keys(captured ?? {}).sort()).toEqual(ADMIT_FIELDS);
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
       });
 
       // Guidance: customer sees guidance text, no agent, dedup marked
@@ -2228,17 +1166,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       }> = [
         {
           decision: {
-            kind: 'disabled',
-            text: 'El servicio no está disponible. Intenta más tarde.',
-          },
-          expected: 'El servicio no está disponible. Intenta más tarde.',
-        },
-        {
-          decision: {
             kind: 'unsupported-media',
-            text: 'Formato no soportado. Envía JPEG o PNG.',
+            text: 'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
           },
-          expected: 'Formato no soportado. Envía JPEG o PNG.',
+          expected:
+            'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
         },
         {
           decision: {
@@ -2250,10 +1182,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         {
           decision: {
             kind: 'sender-active',
-            status: 'AWAITING_AMOUNT',
-            text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+            status: 'DOWNLOADED',
+            text: 'Estamos procesando su comprobante.',
           },
-          expected: 'Tienes un proceso abierto: finalízalo o cancélalo.',
+          expected: 'Estamos procesando su comprobante.',
         },
       ];
 
@@ -2271,7 +1203,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
             to: CUSTOMER,
             text: c.expected,
           });
-          expect(llm.run).not.toHaveBeenCalled();
+          expectNoAgentRun();
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
         },
       );
@@ -2281,18 +1213,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         status: ActiveReceiptStatus;
         text: string;
       }> = [
-        {
-          status: 'AWAITING_AMOUNT',
-          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
-        },
-        {
-          status: 'AWAITING_CONFIRMATION',
-          text: 'Tienes un proceso abierto: finalízalo o cancélalo.',
-        },
-        { status: 'RESERVED', text: 'Estamos procesando tu comprobante.' },
-        { status: 'DOWNLOADED', text: 'Estamos procesando tu comprobante.' },
-        { status: 'STORED', text: 'Estamos procesando tu comprobante.' },
-        { status: 'ATTACHING', text: 'Estamos procesando tu comprobante.' },
+        { status: 'RESERVED', text: 'Estamos procesando su comprobante.' },
+        { status: 'DOWNLOADED', text: 'Estamos procesando su comprobante.' },
       ];
 
       test.each(activeGuidanceCases)(
@@ -2317,8 +1239,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           );
           expect(dedup.markSeen).toHaveBeenCalledTimes(1);
           expect(dedup.markSeen).toHaveBeenCalledWith(wamid);
-          expect(amountRouter.route).not.toHaveBeenCalled();
-          expect(llm.run).not.toHaveBeenCalled();
+          expectNoAgentRun();
         },
       );
 
@@ -2355,7 +1276,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           (ingress.admit as jest.Mock).mockResolvedValueOnce(decision);
           await service.dispatch(mediaEvent(c.wamid, 'image'));
           expect(sender.sendText).not.toHaveBeenCalled();
-          expect(llm.run).not.toHaveBeenCalled();
+          expectNoAgentRun();
           expect(dedup.markSeen).not.toHaveBeenCalled();
         },
       );
@@ -2441,13 +1362,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
         expect(ingress.admit).not.toHaveBeenCalled();
         expect(sender.sendText).not.toHaveBeenCalled();
-        expect(amountRouter.route).not.toHaveBeenCalled();
-        expect(llm.run).not.toHaveBeenCalled();
+        expectNoAgentRun();
         expect(dedup.markSeen).not.toHaveBeenCalled();
       });
 
       it('orders guidance collaborators and remembers the outbound id', async () => {
-        ingress.admit.mockResolvedValueOnce({ kind: 'disabled' });
+        ingress.admit.mockResolvedValueOnce({ kind: 'unsupported-media' });
         sender.sendText.mockResolvedValueOnce({
           providerMessageId: 'wamid.out',
         });
@@ -2470,10 +1390,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
 
       test.each([
-        { kind: 'disabled' } as const,
         { kind: 'unsupported-media' } as const,
         { kind: 'no-placed-sale' } as const,
-        { kind: 'sender-active', status: 'AWAITING_AMOUNT' } as const,
+        { kind: 'sender-active', status: 'DOWNLOADED' } as const,
       ])(
         'guidance marker-write failure after $kind remains terminal',
         async (decision) => {
@@ -2485,13 +1404,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           ).resolves.toBeUndefined();
           expect(sender.sendText as jest.Mock).toHaveBeenCalledTimes(1);
           expect(dedup.markSeen).toHaveBeenCalledWith('wamid.markseen-fail');
-          expect(llm.run.mock.calls).toHaveLength(0);
-          expect(amountRouter.route.mock.calls).toHaveLength(0);
+          expectNoAgentRun();
         },
       );
 
       it('does not remember or mark seen when guidance delivery fails', async () => {
-        ingress.admit.mockResolvedValueOnce({ kind: 'disabled' });
+        ingress.admit.mockResolvedValueOnce({ kind: 'unsupported-media' });
         sender.sendText.mockRejectedValueOnce(new Error('Meta 131030'));
 
         await expect(
@@ -2499,14 +1417,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ).rejects.toThrow('Meta 131030');
         expect(recentOutbound.remember as jest.Mock).not.toHaveBeenCalled();
         expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
-        expect(llm.run.mock.calls).toHaveLength(0);
-        expect(amountRouter.route.mock.calls).toHaveLength(0);
+        expectNoAgentRun();
       });
     });
   });
 
-  // ─── Experimental minimal SDK catalog route (default-off) ────────────────
-  describe('experimental minimal SDK catalog route', () => {
+  // ─── Minimal SDK catalog route (every customer turn) ────────────────────
+  describe('minimal SDK catalog route', () => {
     const CUSTOMER = '5215550001111';
     const event = (id: string): WebhookEventDto => ({
       object: 'whatsapp_business_account',
@@ -2532,7 +1449,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       ],
     });
 
-    it('routes allowlisted senders to the minimal agent, others to legacy', async () => {
+    it('routes every customer to the minimal agent, never the legacy runner', async () => {
       minimalAgent.tryHandle.mockResolvedValueOnce({
         kind: 'handled',
         reply: 'SDK reply',
@@ -2547,25 +1464,28 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           messageId: 'wamid.min.on',
         },
       });
-      expect(llm.run).not.toHaveBeenCalled();
       expect(sender.sendText).toHaveBeenCalledWith({
         to: CUSTOMER,
         text: 'SDK reply',
       });
 
-      store.get.mockResolvedValue(null);
-      llm.run.mockResolvedValue({
-        reply: 'legacy reply',
-        messages: [],
-        usage: { promptTokens: 1, completionTokens: 1 },
+      // A sender that was never on any allowlist takes the same route.
+      const stranger = event('wamid.min.stranger');
+      stranger.entry![0].changes![0].value!.messages![0].from = '5215559998888';
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'SDK reply 2',
       });
-      await service.dispatch(event('wamid.min.off'));
-      expect(llm.run).toHaveBeenCalledTimes(1);
+      await service.dispatch(stranger);
       expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(2);
+      expect(minimalAgent.tryHandle).toHaveBeenLastCalledWith(
+        expect.objectContaining({ senderId: '5215559998888' }),
+      );
       expect(sender.sendText).toHaveBeenLastCalledWith({
-        to: CUSTOMER,
-        text: 'legacy reply',
+        to: '5215559998888',
+        text: 'SDK reply 2',
       });
+      expect(llm.run).not.toHaveBeenCalled();
     });
 
     it('arms onSent only after a successful send, before remember/dedup', async () => {

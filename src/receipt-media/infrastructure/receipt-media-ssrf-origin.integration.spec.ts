@@ -8,14 +8,8 @@ import {
   PostgreSqlContainer,
   StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
-import { CapabilityService } from '../application/capability.service';
 import { ReceiptIngestionProcessor } from '../application/receipt-ingestion.processor';
 import { ReceiptProcessingDispatcher } from '../application/receipt-processing-dispatcher.service';
-import type { ReceiptAttachmentService } from '../application/receipt-attachment.service';
-import type {
-  ObjectStoragePort,
-  PutObjectInput,
-} from '../domain/object-storage.port';
 import {
   MetaMediaClient,
   type MetaHttp,
@@ -59,7 +53,6 @@ const media = (n: number, label: string) => ({
   wamid: `wamid.odd7b2a.${label}`,
   mediaId: `media.odd7b2a.${label}`,
   sender: `sender.odd7b2a.${label}`,
-  objectKey: `receipts/aaaaaaaa-000${n}-4000-8000-00000000000${n}`,
 });
 type Media = ReturnType<typeof media>;
 const REBIND = media(1, 'rebind');
@@ -68,7 +61,7 @@ const BAD_REDIRECT = media(3, 'redirect');
 const EXHAUST = media(4, 'exhaust');
 const COLS = (
   'id webhook_message_id provider_media_id sender_id captured_sale_id' +
-  ' object_key status version declared_mime_type declared_amount_cents' +
+  ' status version declared_mime_type declared_amount_cents' +
   ' lease_owner lease_expires_at'
 ).split(' ');
 const INSERT = `INSERT INTO receipt_media (${COLS.join(
@@ -82,19 +75,10 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
   let store: PostgresReceiptMediaStore;
   let priorDatabaseUrl: string | undefined;
   const workers = new Set<ReceiptMediaIngestionWorker>();
-  const attach = jest.fn();
-  const attachment = { attach } as unknown as Pick<
-    ReceiptAttachmentService,
-    'attach'
-  >;
-  const putCalls: PutObjectInput[] = [];
-  const storage: Pick<ObjectStoragePort, 'put'> = {
-    put: (input) => {
-      putCalls.push(input);
-      input.content.resume();
-      return Promise.resolve({ etag: 'etag.ssrf', versionId: null });
-    },
-  };
+  // Never reached: every case fails at the Meta boundary before any
+  // extraction or backend upload.
+  const extract = jest.fn();
+  const upload = jest.fn();
 
   const harness = (options: {
     graph?: LookupAddress[];
@@ -133,13 +117,14 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
     return { client, requests, resolve, createTempFile };
   };
   const boot = (owner: string, client: MetaMediaClient) => {
-    const capability = new CapabilityService(
-      new Map([['1', Buffer.alloc(32, 3)]]),
-      '1',
-    );
     const dispatcher = new ReceiptProcessingDispatcher(
-      new ReceiptIngestionProcessor(client, storage, store, capability),
-      attachment,
+      new ReceiptIngestionProcessor(
+        client,
+        store,
+        { extract },
+        { upload },
+        { get: () => Promise.resolve(null) },
+      ),
     );
     const worker = new ReceiptMediaIngestionWorker(store, dispatcher, {
       owner,
@@ -161,7 +146,6 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
       provider_media_id: target.mediaId,
       sender_id: target.sender,
       captured_sale_id: SALE,
-      object_key: target.objectKey,
     };
     await pool.query(
       INSERT,
@@ -197,9 +181,7 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
   const assertNoAcceptedEvidence = (row: Row) => {
     const fields = (
       'downloaded_at response_mime_type detected_mime_type byte_count ' +
-      'content_sha256 stored_at object_etag object_version_id ' +
-      'capability_token_hash capability_key_version ' +
-      'capability_key_version_text capability_issued_at capability_revoked_at'
+      'content_sha256'
     ).split(' ');
     for (const field of fields) expect(row[field]).toBeNull();
   };
@@ -215,8 +197,8 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
       expectedResolveHosts,
     );
     expect(h.createTempFile).not.toHaveBeenCalled();
-    expect(putCalls).toHaveLength(0);
-    expect(attach).not.toHaveBeenCalled();
+    expect(extract).not.toHaveBeenCalled();
+    expect(upload).not.toHaveBeenCalled();
   };
   const assertAttemptOne = (row: Row, startedAt: number) => {
     expect(row).toMatchObject({
@@ -271,15 +253,12 @@ ddescribe('receipt-media SSRF origin rejection (ODD-7B2a)', () => {
   afterEach(async () => {
     try {
       await Promise.all([...workers].map((worker) => worker.onModuleDestroy()));
-      expect(attach).not.toHaveBeenCalled();
+      expect(upload).not.toHaveBeenCalled();
     } finally {
       workers.clear();
-      attach.mockClear();
-      putCalls.length = 0;
-      await pool.query(
-        'TRUNCATE receipt_media_cancellation_commands, receipt_media_outbox,' +
-          ' receipt_media',
-      );
+      extract.mockClear();
+      upload.mockClear();
+      await pool.query('TRUNCATE receipt_media_outbox,' + ' receipt_media');
     }
   });
 

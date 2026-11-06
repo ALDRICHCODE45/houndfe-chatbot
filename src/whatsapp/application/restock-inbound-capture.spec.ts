@@ -4,6 +4,11 @@ import { RestockInboundCapture } from './restock-inbound-capture';
 
 const observedAt = '2026-06-22T13:00:00.000Z';
 const phone = '123456789';
+const media = (id: string) => ({
+  id,
+  from: '5215555555555',
+  timestamp: '1782129600',
+});
 const message = (id = 'wamid.first') => ({
   id,
   from: '5215555555555',
@@ -40,7 +45,7 @@ function fixture() {
   expect(row).not.toBeNull();
   return row!;
 }
-function setup(enabled: unknown = true) {
+function setup() {
   const record = jest
     .fn<
       ReturnType<RestockInboundEvidencePort['record']>,
@@ -49,34 +54,45 @@ function setup(enabled: unknown = true) {
     .mockImplementation(async (evidence) => ({ action: 'recorded', evidence }));
   const ops = jest.fn((sender: string) => sender === 'ops');
   const echo = jest.fn((id: string) => id === 'echo');
-  const capture = new RestockInboundCapture(
-    enabled,
-    phone,
-    { record },
-    ops,
-    echo,
-  );
+  const capture = new RestockInboundCapture(phone, { record }, ops, echo);
   const run = (values: unknown[]) => capture.capture(snapshot(event(values)));
   return { record, ops, echo, capture, run };
 }
 
 describe('unwired text-only restock capture', () => {
-  it.each([false, null, 'true', 1])(
-    'strict disabled %p has zero effects',
-    async (flag) => {
-      const s = setup(flag);
-      const raw = {
-        get rawBodyBase64(): string {
-          throw new Error('read');
-        },
-        observedAt,
-      };
-      expect(await s.capture.capture(raw)).toEqual({ action: 'disabled' });
-      expect(s.record).not.toHaveBeenCalled();
-      expect(s.ops).not.toHaveBeenCalled();
-      expect(s.echo).not.toHaveBeenCalled();
+  it.each([
+    { type: 'image', image: { id: 'media' } },
+    { type: 'document', document: { id: 'pdf', mime_type: 'application/pdf' } },
+    { type: 'audio', audio: { id: 'voice' } },
+    { type: 'unsupported', errors: [{ code: 131051 }] },
+    { type: 'order', order: { catalog_id: 'c' } },
+    { type: 'system', system: { body: 'changed number' } },
+    { type: 'future_type' },
+  ])(
+    'skips a well-formed non-text message and captures the rest: %p',
+    async (payload) => {
+      const s = setup();
+      const result = await s.run([
+        value([message(), { ...media('wamid.media'), ...payload }]),
+      ]);
+      expect(result.action).toBe('captured');
+      if (result.action !== 'captured') throw new Error('not captured');
+      expect(result.evidence).toEqual([fixture()]);
+      expect(s.record).toHaveBeenCalledTimes(1);
     },
   );
+  it('captures a batch with only a non-text message without recording evidence', async () => {
+    const s = setup();
+    const result = await s.run([
+      value([
+        { ...media('wamid.only-media'), type: 'image', image: { id: 'm' } },
+      ]),
+    ]);
+    expect(result.action).toBe('captured');
+    if (result.action !== 'captured') throw new Error('not captured');
+    expect(result.evidence).toEqual([]);
+    expect(s.record).not.toHaveBeenCalled();
+  });
   it('preserves UTF8 and provider seconds in detached event and frozen evidence', async () => {
     const s = setup();
     const input = event();
@@ -93,9 +109,13 @@ describe('unwired text-only restock capture', () => {
     value([{ ...message(), timestamp: '01' }]),
     value([{ ...message(), timestamp: '9999999999' }]),
     value([{ ...message(), from: undefined }]),
-    value([{ ...message(), type: 'image', image: { id: 'media' } }]),
     value([{ ...message(), image: { id: 'ambiguous' } }]),
     value([{ ...message(), audio: { id: 'ambiguous' } }]),
+    value([{ ...message(), text: undefined }]),
+    value([{ ...message(), text: { body: 1 } }]),
+    value([{ ...message(), type: undefined }]),
+    value([{ ...message(), type: 7 }]),
+    value([{ ...message(), type: 'unsupported' }]),
     { ...value(), metadata: undefined },
     { ...value(), metadata: { phone_number_id: 'other' } },
     value(null),

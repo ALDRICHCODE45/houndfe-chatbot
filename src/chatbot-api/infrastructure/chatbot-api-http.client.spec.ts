@@ -13,7 +13,6 @@ import {
 } from '../domain/errors';
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
 import { CancelSaleInputSchema } from '../domain/dtos/sales.dto';
-import type { BotSaleShippingInput } from '../domain/dtos/sales.dto';
 import type {
   RestockApplicationOutcomeRequest,
   RestockIntakeInput,
@@ -57,9 +56,8 @@ describe('ChatbotApiHttpClient', () => {
         ),
     };
 
-    // In-memory `ConfigService`: `chatbotApi.*` and
-    // `receiptMedia.attachTimeoutMs` resolve through the internal config via
-    // dot-notation, matching the production runtime contract instead of a
+    // In-memory `ConfigService`: `chatbotApi.*` resolves through the
+    // internal config via dot-notation, matching the production runtime contract instead of a
     // partial mock of the overloaded `getOrThrow`.
     configService = new ConfigService({
       chatbotApi: {
@@ -67,7 +65,6 @@ describe('ChatbotApiHttpClient', () => {
         serviceKey: 'svc_test_key',
         branchId: 'branch-123',
       },
-      receiptMedia: { attachTimeoutMs: 15000 },
     });
 
     sleep = jest.fn<Promise<void>, [number]>().mockResolvedValue(undefined);
@@ -120,6 +117,10 @@ describe('ChatbotApiHttpClient', () => {
         channel: 'ONLINE',
         deliveryStatus: 'PENDING',
         totalCents: 1500,
+        discountCents: 0,
+        subtotalCents: 1500,
+        shippingChargeCents: 0,
+        fulfillmentMode: 'DELIVERY',
         paidCents: 0,
         debtCents: 1500,
         confirmedAt: null,
@@ -446,15 +447,21 @@ describe('ChatbotApiHttpClient', () => {
     expect(url).not.toContain('/555/0001111');
   });
 
-  it('percent-encodes productId, saleId, and order-history phone segments', async () => {
+  it('percent-encodes productId, saleId, receiptId and order-history phone segments', async () => {
     httpService.request.mockReturnValue(of(axiosResponse({})));
 
-    await client.getStock('prod+with/slash');
+    await client.getStock('prod+with/slash').catch(() => undefined);
     await client
-      .attachReceipt('sale+id/1', {
-        mediaUrl: 'https://example.com/r.jpg',
-        declaredAmountCents: 1000,
-      })
+      .uploadReceipt(
+        'sale+id/1',
+        {
+          bytes: Buffer.from('img'),
+          mimeType: 'image/jpeg',
+          filename: 'receipt.jpg',
+        },
+        {},
+        'wa-media-1',
+      )
       .catch(() => undefined);
     await client
       .updateDelivery('sale+id/2', {
@@ -761,34 +768,31 @@ describe('ChatbotApiHttpClient', () => {
     expect(httpService.request).not.toHaveBeenCalled();
   });
 
-  // ─── SQ-5E3 — approved shipping request/response contract
+  // ─── Legacy POST /sales never carries a shipping charge (S2)
 
-  const shippingItem = {
+  const saleItem = {
     productId: 'product-1',
     productName: 'Croquetas',
     quantity: 1,
     unitPriceCents: 10000,
   };
 
-  function saleBody(
-    extra: Record<string, unknown> = {},
-  ): Record<string, unknown> {
+  function saleBody(): Record<string, unknown> {
     return {
       saleId: 'sale-1',
       folio: null,
       paymentStatus: 'CREDIT',
       channel: 'ONLINE',
       deliveryStatus: 'PENDING',
-      totalCents: 12500,
+      totalCents: 10000,
       paidCents: 0,
-      debtCents: 12500,
+      debtCents: 10000,
       confirmedAt: null,
       discountCents: 0,
-      ...extra,
     };
   }
 
-  it('forwards the approved shipping object with quoteId and the freight-inclusive expectedTotalCents', async () => {
+  it('strips a stray shipping charge (chargeCents/approvalId) from the legacy sale wire', async () => {
     httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
 
     await client.createSale(
@@ -796,243 +800,21 @@ describe('ChatbotApiHttpClient', () => {
         cashierUserId: 'cashier-1',
         customerId: 'customer-1',
         shippingAddressId: 'address-1',
-        expectedTotalCents: 12500,
-        shipping: {
-          chargeCents: 2500,
-          approvalId: 'handoff-123',
-          quoteId: 'quote-9',
-        },
-        items: [shippingItem],
-      },
-      'idem-ship-1',
-    );
-
-    const cfg = httpService.request.mock.calls[0]?.[0] as {
-      data: Record<string, unknown>;
-    };
-    expect(cfg.data.shipping).toEqual({
-      chargeCents: 2500,
-      approvalId: 'handoff-123',
-      quoteId: 'quote-9',
-    });
-    expect(cfg.data.expectedTotalCents).toBe(12500);
-  });
-
-  it.each([null, undefined])(
-    'omits the optional shipping.quoteId when it is %p',
-    async (quoteId) => {
-      httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
-
-      await client.createSale(
-        {
-          cashierUserId: 'cashier-1',
-          customerId: 'customer-1',
-          shippingAddressId: 'address-1',
-          expectedTotalCents: 12500,
-          shipping: { chargeCents: 2500, approvalId: 'handoff-123', quoteId },
-          items: [shippingItem],
-        },
-        'idem-ship-2',
-      );
-
-      const cfg = httpService.request.mock.calls[0]?.[0] as {
-        data: Record<string, unknown>;
-      };
-      expect(cfg.data.shipping).toEqual({
-        chargeCents: 2500,
-        approvalId: 'handoff-123',
-      });
-      expect(JSON.stringify(cfg.data)).not.toContain('quoteId');
-    },
-  );
-
-  it.each([null, undefined])(
-    'omits the shipping key entirely when it is %p',
-    async (shipping) => {
-      httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
-
-      await client.createSale(
-        {
-          cashierUserId: 'cashier-1',
-          customerId: 'customer-1',
-          shipping,
-          items: [shippingItem],
-        },
-        'idem-ship-3',
-      );
-
-      const cfg = httpService.request.mock.calls[0]?.[0] as {
-        data: Record<string, unknown>;
-      };
-      expect(cfg.data).not.toHaveProperty('shipping');
-    },
-  );
-
-  it.each([undefined, null, 0, -1, 2 ** 53])(
-    'rejects shipping with a missing, non-positive, or unsafe expectedTotalCents (%p) before HTTP',
-    async (expectedTotalCents) => {
-      let rejected = false;
-      try {
-        await client.createSale(
-          {
-            cashierUserId: 'cashier-1',
-            customerId: 'customer-1',
-            shippingAddressId: 'address-1',
-            expectedTotalCents,
-            shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
-            items: [shippingItem],
-          },
-          'idem-ship-4',
-        );
-      } catch {
-        rejected = true;
-      }
-      expect(rejected).toBe(true);
-      expect(httpService.request).not.toHaveBeenCalled();
-    },
-  );
-
-  it('still forwards expectedTotalCents=0 without shipping (legacy path unchanged)', async () => {
-    httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
-
-    await client.createSale(
-      {
-        cashierUserId: 'cashier-1',
-        customerId: 'customer-1',
         expectedTotalCents: 0,
-        items: [shippingItem],
-      },
-      'idem-ship-5',
+        shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
+        items: [saleItem],
+      } as unknown as Parameters<typeof client.createSale>[0],
+      'idem-sale-1',
     );
 
     const cfg = httpService.request.mock.calls[0]?.[0] as {
       data: Record<string, unknown>;
     };
     expect(cfg.data.expectedTotalCents).toBe(0);
+    expect(cfg.data.shippingAddressId).toBe('address-1');
     expect(cfg.data).not.toHaveProperty('shipping');
+    expect(JSON.stringify(cfg.data)).not.toMatch(/chargeCents|approvalId/);
   });
-
-  it.each<[string, BotSaleShippingInput]>([
-    ['chargeCents 0', { chargeCents: 0, approvalId: 'handoff-1' }],
-    [
-      'chargeCents int32 overflow',
-      { chargeCents: 2_147_483_648, approvalId: 'handoff-1' },
-    ],
-    ['empty approvalId', { chargeCents: 1, approvalId: '' }],
-    ['whitespace-only approvalId', { chargeCents: 1, approvalId: '   ' }],
-    [
-      'approvalId over 200 chars',
-      { chargeCents: 1, approvalId: 'a'.repeat(201) },
-    ],
-    [
-      'whitespace-only quoteId',
-      { chargeCents: 1, approvalId: 'handoff-1', quoteId: ' ' },
-    ],
-  ])(
-    'rejects invalid shipping (%s) before any HTTP call',
-    async (_label, shipping) => {
-      let rejected = false;
-      try {
-        await client.createSale(
-          {
-            cashierUserId: 'cashier-1',
-            customerId: 'customer-1',
-            shippingAddressId: 'address-1',
-            expectedTotalCents: 12500,
-            shipping,
-            items: [shippingItem],
-          },
-          'idem-ship-6',
-        );
-      } catch {
-        rejected = true;
-      }
-      expect(rejected).toBe(true);
-      expect(httpService.request).not.toHaveBeenCalled();
-    },
-  );
-
-  it('forwards optional response subtotalCents and shippingChargeCents verbatim when present', async () => {
-    httpService.request.mockReturnValue(
-      of(
-        axiosResponse(
-          saleBody({ subtotalCents: 10000, shippingChargeCents: 2500 }),
-        ),
-      ),
-    );
-
-    const resolved = await client.createSale(
-      {
-        cashierUserId: 'cashier-1',
-        customerId: 'customer-1',
-        shippingAddressId: 'address-1',
-        expectedTotalCents: 12500,
-        shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
-        items: [shippingItem],
-      },
-      'idem-ship-7',
-    );
-
-    expect(resolved.subtotalCents).toBe(10000);
-    expect(resolved.shippingChargeCents).toBe(2500);
-  });
-
-  it('does not fabricate subtotalCents or shippingChargeCents on an address-only response', async () => {
-    httpService.request.mockReturnValue(of(axiosResponse(saleBody())));
-
-    const resolved = await client.createSale(
-      {
-        cashierUserId: 'cashier-1',
-        customerId: 'customer-1',
-        items: [shippingItem],
-      },
-      'idem-ship-8',
-    );
-
-    expect(resolved).not.toHaveProperty('subtotalCents');
-    expect(resolved).not.toHaveProperty('shippingChargeCents');
-  });
-
-  it.each<[number, string]>([
-    [422, 'SHIPPING_CHARGE_EXCEEDS_MAX'],
-    [422, 'SHIPPING_EXPECTED_TOTAL_REQUIRED'],
-    [409, 'SHIPPING_APPROVAL_ALREADY_USED'],
-  ])(
-    'surfaces backend shipping errorCode %s on HTTP %i',
-    async (status, errorCode) => {
-      httpService.request.mockReturnValue(
-        throwError(() => ({
-          response: {
-            status,
-            data: {
-              statusCode: status,
-              error: errorCode,
-              message: 'shipping',
-            },
-          },
-        })),
-      );
-
-      try {
-        await client.createSale(
-          {
-            cashierUserId: 'cashier-1',
-            customerId: 'customer-1',
-            shippingAddressId: 'address-1',
-            expectedTotalCents: 12500,
-            shipping: { chargeCents: 2500, approvalId: 'handoff-123' },
-            items: [shippingItem],
-          },
-          'idem-ship-9',
-        );
-        fail('Expected ChatbotApiError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).statusCode).toBe(status);
-        expect((error as ChatbotApiError).errorCode).toBe(errorCode);
-      }
-    },
-  );
 
   it('resolves BotSaleResponse.discountCents from the body (100) and defaults to 0 when the body omits it', async () => {
     httpService.request.mockReturnValueOnce(
@@ -1353,155 +1135,6 @@ describe('ChatbotApiHttpClient', () => {
       cashierUserId: 'cashier-1',
     });
     expect(resolved).toEqual(replay);
-  });
-
-  // ─── attachReceipt abortable attachment-only HTTP transport (WU11B)
-
-  describe('attachReceipt (WU11B)', () => {
-    const attachDto = {
-      mediaUrl: 'https://example.com/r.jpg',
-      declaredAmountCents: 1000,
-    };
-    const validBody = { receiptId: 'receipt-1', status: 'PENDING' };
-
-    function mockFulfilled(status: number, data: unknown): void {
-      httpService.request.mockReturnValue(of(axiosResponse(data, status)));
-    }
-
-    it('resolves a valid 201 PENDING body', async () => {
-      mockFulfilled(201, validBody);
-
-      await expect(client.attachReceipt('sale-1', attachDto)).resolves.toEqual(
-        validBody,
-      );
-    });
-
-    it('sends exactly one POST with the configured timeout, the same caller AbortSignal, and auth/branch headers', async () => {
-      mockFulfilled(201, validBody);
-      const controller = new AbortController();
-
-      await client.attachReceipt('sale-1', attachDto, {
-        signal: controller.signal,
-      });
-
-      expect(httpService.request).toHaveBeenCalledTimes(1);
-      const cfg = httpService.request.mock.calls[0][0] as {
-        method: string;
-        url: string;
-        data: unknown;
-        timeout: number;
-        signal: AbortSignal;
-        headers: Record<string, string>;
-      };
-      expect(cfg.method).toBe('POST');
-      expect(cfg.url).toBe('/chatbot-api/sales/sale-1/receipts');
-      expect(cfg.data).toEqual(attachDto);
-      expect(cfg.timeout).toBe(15000);
-      expect(cfg.signal).toBe(controller.signal);
-      expect(cfg.headers['Authorization']).toBe('Bearer svc_test_key');
-      expect(cfg.headers['X-Branch-Id']).toBe('branch-123');
-    });
-
-    it('stays compatible when called without options: no signal is forwarded and the request still succeeds', async () => {
-      mockFulfilled(201, validBody);
-
-      await expect(client.attachReceipt('sale-1', attachDto)).resolves.toEqual(
-        validBody,
-      );
-
-      const cfg = httpService.request.mock.calls[0][0] as {
-        timeout: number;
-        signal?: AbortSignal;
-      };
-      expect(cfg.signal).toBeUndefined();
-      expect(cfg.timeout).toBe(15000);
-    });
-
-    it.each([200, 202])(
-      'rejects a fulfilled HTTP %i response with UpstreamError carrying the observed status and body',
-      async (status) => {
-        mockFulfilled(status, validBody);
-
-        try {
-          await client.attachReceipt('sale-1', attachDto);
-          fail('Expected UpstreamError');
-        } catch (error) {
-          expect(error).toBeInstanceOf(UpstreamError);
-          expect((error as ChatbotApiError).statusCode).toBe(status);
-          expect((error as ChatbotApiError).responseBody).toEqual(validBody);
-        }
-      },
-    );
-
-    it.each([
-      ['missing receiptId', { status: 'PENDING' }],
-      ['non-string receiptId', { receiptId: 123, status: 'PENDING' }],
-      ['non-PENDING status', { receiptId: 'r-1', status: 'CONFIRMED' }],
-      ['null body', null],
-      ['array body', [validBody]],
-    ])(
-      'rejects malformed 201 body (%s) with UpstreamError evidence',
-      async (_label, body) => {
-        mockFulfilled(201, body);
-
-        try {
-          await client.attachReceipt('sale-1', attachDto);
-          fail('Expected UpstreamError');
-        } catch (error) {
-          expect(error).toBeInstanceOf(UpstreamError);
-          expect((error as ChatbotApiError).statusCode).toBe(201);
-          expect((error as ChatbotApiError).responseBody).toEqual(body);
-        }
-      },
-    );
-
-    it('preserves the errorCode evidence from the body on a fulfilled invalid response', async () => {
-      const body = { error: 'ATTACH_REJECTED', receiptId: 5 };
-      mockFulfilled(201, body);
-
-      try {
-        await client.attachReceipt('sale-1', attachDto);
-        fail('Expected UpstreamError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).errorCode).toBe('ATTACH_REJECTED');
-      }
-    });
-
-    it('maps a 5xx rejection through the existing error mapping with exactly one request and no sleep', async () => {
-      httpService.request.mockReturnValue(
-        throwError(() => ({
-          response: { status: 503, data: { error: 'BOOM' } },
-        })),
-      );
-
-      try {
-        await client.attachReceipt('sale-1', attachDto);
-        fail('Expected UpstreamError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).statusCode).toBe(503);
-        expect((error as ChatbotApiError).errorCode).toBe('BOOM');
-      }
-      expect(httpService.request).toHaveBeenCalledTimes(1);
-      expect(sleep).not.toHaveBeenCalled();
-    });
-
-    it('maps an abort/transport rejection through the existing error mapping with exactly one request and no sleep', async () => {
-      httpService.request.mockReturnValue(
-        throwError(() => ({ code: 'ERR_CANCELED', message: 'canceled' })),
-      );
-
-      try {
-        await client.attachReceipt('sale-1', attachDto);
-        fail('Expected UpstreamError');
-      } catch (error) {
-        expect(error).toBeInstanceOf(UpstreamError);
-        expect((error as ChatbotApiError).statusCode).toBeNull();
-      }
-      expect(httpService.request).toHaveBeenCalledTimes(1);
-      expect(sleep).not.toHaveBeenCalled();
-    });
   });
 
   // ─── submitRestockIntake (POST /chatbot-api/human-decisions) — HD-R2b2

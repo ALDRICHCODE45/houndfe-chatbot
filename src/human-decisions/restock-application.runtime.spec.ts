@@ -27,9 +27,8 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-function fixture(flag: unknown, identity = { branch, phone }) {
+function fixture(identity = { branch, phone }) {
   const values: Record<string, unknown> = {
-    'humanDecisions.restockEnabled': flag,
     'chatbotApi.branchId': identity.branch,
     'meta.phoneNumberId': identity.phone,
   };
@@ -39,7 +38,7 @@ function fixture(flag: unknown, identity = { branch, phone }) {
     getRestockDecision: jest.fn(),
     recordRestockApplicationOutcome: jest.fn(),
   };
-  const sender = { sendText: jest.fn() };
+  const sender = { sendText: jest.fn(), sendTemplate: jest.fn() };
   const runtime = new RestockApplicationRuntime(
     config as unknown as ConfigService,
     pool as unknown as Pool,
@@ -67,39 +66,18 @@ describe('RestockApplicationRuntime in isolation', () => {
     jest.useRealTimers();
   });
 
-  it.each([undefined, false, 'true'])(
-    'is inert for strict-OFF %s',
-    async (flag) => {
-      const f = fixture(flag);
-      const start = jest.spyOn(RestockApplicationPoller.prototype, 'start');
-      const close = jest.spyOn(
-        PostgresRestockApplicationCompletionStore.prototype,
-        'closeAcknowledged',
-      );
-      f.runtime.onApplicationBootstrap();
-      expect(f.runtime.enqueue(senderId, source)).toBe(false);
-      expect(start).not.toHaveBeenCalled();
-      expect(close).not.toHaveBeenCalled();
-      expect(
-        (f.runtime as unknown as { poller?: unknown }).poller,
-      ).toBeUndefined();
-      await f.runtime.onModuleDestroy();
-      f.inert();
-    },
-  );
-
   it.each([
     { branch: '', phone },
     { branch, phone: ' ' },
-  ])('rejects invalid enabled identity %s', (identity) => {
-    const f = fixture(true, identity);
+  ])('rejects invalid identity %s', (identity) => {
+    const f = fixture(identity);
     expect(() => f.runtime.onApplicationBootstrap()).toThrow();
     expect(f.runtime.enqueue(senderId, source)).toBe(false);
     f.inert();
   });
 
   it('stays idle, delays synchronous admission, drains fully and never rearms', async () => {
-    const f = fixture(true);
+    const f = fixture();
     let finish!: (value: typeof HOLD) => void;
     const apply = jest
       .spyOn(RestockApplicationCoordinator.prototype, 'applyOnce')
@@ -140,7 +118,7 @@ describe('RestockApplicationRuntime in isolation', () => {
   });
 
   it('drops waiting work on stop without invoking the coordinator', async () => {
-    const f = fixture(true);
+    const f = fixture();
     const apply = jest.spyOn(
       RestockApplicationCoordinator.prototype,
       'applyOnce',
@@ -158,7 +136,7 @@ describe('RestockApplicationRuntime in isolation', () => {
   });
 
   it('latches shutdown before bootstrap', async () => {
-    const f = fixture(true);
+    const f = fixture();
     const start = jest.spyOn(RestockApplicationPoller.prototype, 'start');
     await f.runtime.onModuleDestroy();
     f.runtime.onApplicationBootstrap();
@@ -180,19 +158,8 @@ describe('RestockApplicationRuntime in isolation', () => {
         .spyOn(RestockApplicationCoordinator.prototype, 'reconcileExpiredOnce')
         .mockResolvedValue({ action: 'ack_recorded' });
 
-    it.each([undefined, false])(
-      'is inert while disabled (%s)',
-      async (flag) => {
-        const f = fixture(flag);
-        f.runtime.onApplicationBootstrap();
-        await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
-        f.inert();
-        await f.runtime.onModuleDestroy();
-      },
-    );
-
     it('is inert before bootstrap and after shutdown', async () => {
-      const f = fixture(true);
+      const f = fixture();
       await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
       f.runtime.onApplicationBootstrap();
       await f.runtime.onModuleDestroy();
@@ -201,7 +168,7 @@ describe('RestockApplicationRuntime in isolation', () => {
     });
 
     it('passes only the ORIGINAL recorded request key to the coordinator', async () => {
-      const f = fixture(true);
+      const f = fixture();
       const readMock = read();
       const reconcileMock = reconcile();
       f.runtime.onApplicationBootstrap();
@@ -215,7 +182,7 @@ describe('RestockApplicationRuntime in isolation', () => {
     it.each(['missing', 'hold'])(
       'does not apply on %s context',
       async (action) => {
-        const f = fixture(true);
+        const f = fixture();
         read().mockResolvedValue({ action } as never);
         const reconcileMock = reconcile();
         f.runtime.onApplicationBootstrap();
@@ -227,7 +194,7 @@ describe('RestockApplicationRuntime in isolation', () => {
     );
 
     it('awaits an in-flight recovery before shutdown resolves', async () => {
-      const f = fixture(true);
+      const f = fixture();
       read();
       const gate = deferred<{ action: 'ack_recorded' }>();
       const reconcileMock = jest
@@ -251,7 +218,7 @@ describe('RestockApplicationRuntime in isolation', () => {
   });
 
   it('composes real adapters on one pool with bound receivers and exact identities', async () => {
-    const f = fixture(true);
+    const f = fixture();
     const candidate = jest
       .spyOn(RestockApplicationCandidateService.prototype, 'pollForSender')
       .mockResolvedValue(HOLD);

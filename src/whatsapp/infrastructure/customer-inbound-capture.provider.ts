@@ -36,7 +36,6 @@ export const customerInboundCaptureProvider: FactoryProvider<CustomerInboundCapt
         captureCustomerInboundObservations(
           request,
           {
-            enabled: config.get('humanDecisions.customerInboundEnabled'),
             phone: config.get<string>('meta.phoneNumberId') ?? '',
             isOpsSender: (sender) => handoff.isOpsSender(sender),
             isKnownOutbound: (id) => recent.isKnown(id),
