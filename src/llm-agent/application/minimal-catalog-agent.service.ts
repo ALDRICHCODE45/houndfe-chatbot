@@ -36,7 +36,10 @@ import {
   limitCustomerEmojis,
   type CustomerStyle,
 } from '../domain/customer-style';
-import type { MinimalCatalogTurn } from '../domain/minimal-catalog-session.store';
+import type {
+  MinimalCatalogTurn,
+  ReorderOfferContext,
+} from '../domain/minimal-catalog-session.store';
 import {
   boundProductImageContext,
   checkoutConfirmationButtons,
@@ -45,6 +48,7 @@ import {
   orderConfirmationButtons,
   parseInteractiveReplyId,
   productImageCaption,
+  reorderConfirmationButtons,
   shortMxn,
   type CustomerReply,
   type CustomerReplyInteractive,
@@ -110,6 +114,15 @@ import {
   MINIMAL_EXPIRATION_CAUTIOUS_REPLY,
   MinimalExpirationRequestService,
 } from './minimal-expiration-request.service';
+import {
+  REORDER_BUTTONS_PROMPT,
+  REORDER_CHANGE_REPLY,
+  REORDER_DECLINE_REPLY,
+  REORDER_NEXT_STEP,
+  REORDER_UNAVAILABLE_REPLY,
+  prepareMinimalReorder,
+  type MinimalReorderPresentation,
+} from './minimal-reorder';
 
 // Closed codes only: cart error strings must never become arbitrary log payloads.
 const CART_TRACE_ERROR_CODES = new Set([
@@ -370,6 +383,14 @@ type CartReply = ExpirationReply & {
 
 // One server-owned checkout presentation per SDK run.
 type CheckoutRun = { attempted: boolean; value: MinimalCheckoutReply | null };
+/** S2: one reorder presentation per SDK run. */
+type ReorderRun = {
+  attempted: boolean;
+  value: MinimalReorderPresentation | null;
+};
+
+const REORDER_INSTRUCTIONS_FRAGMENT =
+  ' Si el cliente pide repetir un pedido anterior ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta.';
 
 const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'lookupCheckoutCustomer',
@@ -710,6 +731,18 @@ export class MinimalCatalogAgentService {
         input = tapped.input;
         pick = tapped.pick;
       }
+      // S2: the reply right after a reorder offer answers it first.
+      if (input.interactiveReplyId === undefined) {
+        const offer = this.pendingReorder(input.senderId);
+        const answer =
+          offer === null ? null : classifyConfirmationReply(input.text);
+        if (offer !== null && answer === 'accept')
+          return await this.acceptReorder(input, offer);
+        if (answer === 'decline') {
+          this.order?.dismiss(input.senderId);
+          return this.answerReorder(input, { reply: REORDER_DECLINE_REPLY });
+        }
+      }
       // The busy span covers the free consume and the SDK run. A tapped
       // button or row never answers a RESTOCK question.
       if (
@@ -877,6 +910,17 @@ export class MinimalCatalogAgentService {
           return answer(await this.representAfterStaleButton(input));
         return { input };
       }
+      case 'reorder_confirm': {
+        const offer = this.pendingReorder(senderId);
+        if (offer === null || offer.reference !== intent.reference) {
+          this.order?.dismiss(senderId);
+          return answer({ reply: STALE_BUTTON_FALLBACK });
+        }
+        return { decision: await this.acceptReorder(input, offer) };
+      }
+      case 'reorder_change':
+        this.order?.dismiss(senderId);
+        return answer({ reply: REORDER_CHANGE_REPLY });
       case 'pick': {
         const option = this.sessionStore
           .read(senderId)
@@ -925,6 +969,91 @@ export class MinimalCatalogAgentService {
       // Fall through to the question; nothing was confirmed.
     }
     return { reply: STALE_BUTTON_FALLBACK };
+  }
+
+  /** S2: the reorder offer of the bot's latest message, if any. */
+  private pendingReorder(senderId: string): ReorderOfferContext | null {
+    return this.sessionStore.read(senderId).at(-1)?.reorderOffer ?? null;
+  }
+
+  /** A deterministic reorder reply (recorded without an offer: spends it). */
+  private answerReorder(
+    input: { senderId: string; text: string },
+    result: { reply: string; onSent?: () => void },
+  ): MinimalCatalogAgentDecision {
+    const reply = applyCustomerStyle(
+      result.reply,
+      this.customerStyle(input.senderId, input.text),
+    );
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision(
+      result.onSent === undefined
+        ? { reply }
+        : { reply, onSent: result.onSent },
+    );
+  }
+
+  /**
+   * S2: the customer's yes to the reorder offer. The quantities are the
+   * customer's own last order (server-owned evidence, never model counts):
+   * one all-or-nothing cart write, then the normal cart continuation — the
+   * updated order summary when the checkout already reached shipping or has
+   * confirmed delivery data, else the cart and the next step.
+   */
+  private async acceptReorder(
+    input: { senderId: string; text: string; inboundEvent?: unknown },
+    offer: ReorderOfferContext,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    this.order?.dismiss(senderId);
+    const cart = this.cart;
+    if (cart === undefined)
+      return this.answerReorder(input, { reply: REORDER_UNAVAILABLE_REPLY });
+    const priorShipping = this.shippingAvailable()
+      ? await cart.shippingMode(senderId)
+      : null;
+    const result = await cart.addItems(senderId, offer.items);
+    const code = result.ok
+      ? 'none'
+      : CART_TRACE_ERROR_CODES.has(result.error)
+        ? result.error
+        : 'unrecognized_cart_error';
+    traceLog(
+      this.logger,
+      `minimal_catalog reorder_accept evidence=order_history lines=${offer.items.length} result=${result.ok ? 'ok' : 'error'} code=${code}`,
+    );
+    if (!result.ok)
+      return this.answerReorder(input, { reply: minimalCartReply(result) });
+    let continued: MinimalCheckoutReply | null = null;
+    if (priorShipping !== null)
+      continued = await this.continueAfterCartChange(
+        senderId,
+        input.inboundEvent,
+        priorShipping,
+      );
+    else if (
+      this.orderAvailable() &&
+      this.checkoutAvailable() &&
+      (await this.checkout!.confirmedDraft(senderId)) !== null
+    )
+      continued = await this.continueToOrder(
+        senderId,
+        input.inboundEvent,
+        CART_UPDATED_LEAD,
+      ).catch(() => null);
+    return this.answerReorder(
+      input,
+      continued ?? {
+        reply: `${minimalCartReply(result)}\n\n${REORDER_NEXT_STEP}`,
+      },
+    );
   }
 
   /**
@@ -1123,6 +1252,9 @@ export class MinimalCatalogAgentService {
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
         : null;
+    const reorderRun: ReorderRun | null = this.cart
+      ? { attempted: false, value: null }
+      : null;
     const baseInstructions = instructionsFor(
       restockAvailable,
       expirationAvailable,
@@ -1181,6 +1313,7 @@ export class MinimalCatalogAgentService {
         'No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         CART_VARIANT_GUIDANCE +
+        REORDER_INSTRUCTIONS_FRAGMENT +
         ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
@@ -1229,6 +1362,7 @@ export class MinimalCatalogAgentService {
         cartConversation,
         checkoutRun,
         imageRun,
+        reorderRun,
       ),
       stopWhen: stepCountIs(this.maxSteps),
     };
@@ -1292,6 +1426,42 @@ export class MinimalCatalogAgentService {
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
+    }
+    const reorder = reorderRun?.value ?? null;
+    if (reorder !== null) {
+      // S2: the server-owned reorder presentation; its buttons and its offer
+      // belong to this reply only.
+      const reply = styled(reorder.reply);
+      for (const productId of reorder.productIds) currentIds.add(productId);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+        reorder.offer === null ? {} : { reorderOffer: reorder.offer },
+      );
+      if (reorder.offer === null) return { reply };
+      const interactive = reorderConfirmationButtons(
+        reorder.offer.reference,
+        styled(REORDER_BUTTONS_PROMPT),
+      );
+      return {
+        reply,
+        interactive:
+          interactive.type === 'buttons'
+            ? {
+                ...interactive,
+                buttons: interactive.buttons.map((button) => ({
+                  ...button,
+                  title: applyCustomerRegister(button.title, style),
+                })),
+              }
+            : interactive,
+      };
     }
     const checkoutResult = checkoutRun?.value ?? null;
     if (checkoutResult !== null) {
@@ -1647,6 +1817,7 @@ export class MinimalCatalogAgentService {
     interactive: {
       catalogPrices?: Record<string, number>;
       interactiveChoice?: InteractiveChoiceContext;
+      reorderOffer?: ReorderOfferContext;
     } = {},
   ): void {
     const turns = this.sessionStore.read(senderId);
@@ -1669,6 +1840,9 @@ export class MinimalCatalogAgentService {
         ...(interactive.interactiveChoice === undefined
           ? {}
           : { interactiveChoice: interactive.interactiveChoice }),
+        ...(interactive.reorderOffer === undefined
+          ? {}
+          : { reorderOffer: interactive.reorderOffer }),
       },
     ]);
   }
@@ -1770,6 +1944,7 @@ export class MinimalCatalogAgentService {
     cartConversation: MinimalCartConversation | null,
     checkoutRun: CheckoutRun | null = null,
     imageRun: ProductImageRun | null = null,
+    reorderRun: ReorderRun | null = null,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
@@ -2177,6 +2352,42 @@ export class MinimalCatalogAgentService {
               return result;
             },
           }),
+          ...(reorderRun === null
+            ? {}
+            : {
+                getLastOrder: tool({
+                  description:
+                    'Consulta el último pedido de este cliente (por su número de WhatsApp) y pide a la aplicación presentarlo con existencias y precios de hoy para que el cliente confirme si lo agrega al carrito. No modifica el carrito. No acepta argumentos.',
+                  inputSchema: z.strictObject({}),
+                  strict: true,
+                  execute: async () => {
+                    if (reorderRun.attempted)
+                      return toolError('reorder_presentation_settled');
+                    reorderRun.attempted = true;
+                    try {
+                      reorderRun.value = await prepareMinimalReorder(
+                        chatbotApi,
+                        cart,
+                        context.senderId,
+                        new Date(),
+                      );
+                    } catch {
+                      reorderRun.value = {
+                        reply: REORDER_UNAVAILABLE_REPLY,
+                        offer: null,
+                        productIds: [],
+                      };
+                    }
+                    trace(
+                      `tool getLastOrder result=${reorderRun.value.offer === null ? 'no_offer' : 'offer'} lines=${reorderRun.value.offer?.items.length ?? 0}`,
+                    );
+                    return {
+                      ok: true as const,
+                      presentedByApplication: true as const,
+                    };
+                  },
+                }),
+              }),
           getCart: tool({
             description:
               'Consulta el carrito persistido de este cliente y verifica precios y existencias. No crea pedidos.',

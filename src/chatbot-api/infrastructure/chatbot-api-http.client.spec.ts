@@ -468,7 +468,9 @@ describe('ChatbotApiHttpClient', () => {
         carrierName: 'DHL',
       })
       .catch(() => undefined);
-    await client.getOrderHistory('+52/15550001111', '52');
+    await client
+      .getOrderHistory('+52/15550001111', '52')
+      .catch(() => undefined);
 
     const urls = httpService.request.mock.calls.map(
       ([cfg]) => (cfg as { url: string }).url,

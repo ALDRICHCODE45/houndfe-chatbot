@@ -64,6 +64,8 @@ const ORDER_CONFIRM = 'order_confirm';
 const ORDER_CHANGE = 'order_change';
 const CHECKOUT_CONFIRM = 'checkout_confirm';
 const CHECKOUT_CHANGE = 'checkout_change';
+const REORDER_CONFIRM = 'reorder_confirm';
+const REORDER_CHANGE = 'reorder_change';
 const PICK_VARIANT = 'pick_variant';
 const PICK_PRODUCT = 'pick_product';
 
@@ -81,6 +83,9 @@ export type InteractiveReplyIntent =
       reference: string | null;
     }
   | { kind: 'order_change' | 'checkout_change' }
+  /** S2 reorder offer; the reference is always required. */
+  | { kind: 'reorder_confirm'; reference: string }
+  | { kind: 'reorder_change' }
   | { kind: 'pick'; choice: 'variant' | 'product'; reference: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
@@ -99,7 +104,10 @@ export function parseInteractiveReplyId(
       return { kind: head, reference: tail };
     case ORDER_CHANGE:
     case CHECKOUT_CHANGE:
+    case REORDER_CHANGE:
       return tail === null ? { kind: head } : null;
+    case REORDER_CONFIRM:
+      return tail === null ? null : { kind: head, reference: tail };
     case PICK_VARIANT:
     case PICK_PRODUCT:
       return tail === null
@@ -124,8 +132,10 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
   switch (intent?.kind) {
     case 'order_confirm':
     case 'checkout_confirm':
+    case 'reorder_confirm':
       return INTERACTIVE_CONFIRM_TEXT;
     case 'order_change':
+    case 'reorder_change':
       return INTERACTIVE_ORDER_CHANGE_TEXT;
     case 'checkout_change':
       return INTERACTIVE_CHECKOUT_CHANGE_TEXT;
@@ -184,6 +194,24 @@ export function checkoutConfirmationButtons(
     buttons: [
       { id: `${CHECKOUT_CONFIRM}:${reference}`, title: '✅ Sí, son correctos' },
       { id: CHECKOUT_CHANGE, title: '✏️ Corregir datos' },
+    ],
+    prompt,
+  };
+}
+
+/**
+ * S2: buttons under the server-owned reorder offer, bound to its reference.
+ * Titles are in usted; the caller applies the customer's register.
+ */
+export function reorderConfirmationButtons(
+  reference: string,
+  prompt: string,
+): CustomerReplyInteractive {
+  return {
+    type: 'buttons',
+    buttons: [
+      { id: `${REORDER_CONFIRM}:${reference}`, title: '✅ Sí, agréguelo' },
+      { id: REORDER_CHANGE, title: '✏️ Cambiar algo' },
     ],
     prompt,
   };

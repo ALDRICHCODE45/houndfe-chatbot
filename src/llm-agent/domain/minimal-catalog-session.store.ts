@@ -27,6 +27,16 @@ export type MinimalCartConversationContext = {
 };
 
 /**
+ * S2: the reorder offer a turn presented. Lines come from the customer's own
+ * last order (productId/variantId/quantity only, never historical prices);
+ * they are the evidence a later yes adds to the cart.
+ */
+export type ReorderOfferContext = {
+  reference: string;
+  items: Array<{ productId: string; variantId?: string; quantity: number }>;
+};
+
+/**
  * One whole turn per sender: the user message, the model/tool response
  * messages, and only the productIds a successful fresh search produced.
  *
@@ -37,7 +47,8 @@ export type MinimalCartConversationContext = {
  * S4: `interactiveChoice` is the list THIS turn sent (never inherited, so a
  * pick only counts while it answers the latest message); `catalogPrices`
  * the catalog prices read so far (`productId|variantId` → cents) for row
- * titles.
+ * titles. `reorderOffer` is the reorder offer THIS turn sent (never
+ * inherited, so only the reply right after it can accept it).
  */
 export type MinimalCatalogTurn = {
   messages: ModelMessage[];
@@ -46,6 +57,7 @@ export type MinimalCatalogTurn = {
   productImages?: ProductImageContext;
   interactiveChoice?: InteractiveChoiceContext;
   catalogPrices?: Record<string, number>;
+  reorderOffer?: ReorderOfferContext;
 };
 
 /**

@@ -9,6 +9,7 @@ import type {
   CheckoutStatus,
   CreateCheckoutInput,
 } from '../../../src/chatbot-api/domain/dtos/checkout.dto';
+import type { OrderHistoryResponse } from '../../../src/chatbot-api/domain/dtos/sales.dto';
 import type {
   CreateShippingQuoteInput,
   ShippingQuoteResponse,
@@ -54,6 +55,43 @@ export const ADDRESSES = {
   },
 } as const;
 
+/**
+ * The existing customer's previous order (S2 reorder): Nupec 18 kg × 1 at
+ * today's price and Royal Canin Mini 2 kg × 2 at an older price ($499, today
+ * $529). Historical names on purpose: the bot must show today's names.
+ */
+export const PREVIOUS_ORDER: OrderHistoryResponse = {
+  saleId: SALE_ID(99),
+  folio: 'EV-0099',
+  confirmedAt: '2026-10-20T18:00:00.000Z',
+  channel: 'ONLINE',
+  deliveryStatus: 'DELIVERED',
+  paymentStatus: 'PAID',
+  totalCents: 259700,
+  paidCents: 259700,
+  debtCents: 0,
+  items: [
+    {
+      productId: 'a0000000-0000-4000-8000-000000000001',
+      variantId: null,
+      productName: 'Croquetas Nupec Salmón 18 kg',
+      variantName: null,
+      quantity: 1,
+      unitPriceCents: 159900,
+    },
+    {
+      productId: 'a0000000-0000-4000-8000-000000000003',
+      variantId: 'b0000000-0000-4000-8000-000000000301',
+      productName: 'Croquetas Royal Canin Mini',
+      variantName: '2 kg',
+      quantity: 2,
+      unitPriceCents: 49900,
+    },
+  ],
+  payments: [{ method: 'TRANSFER', amountCents: 259700, reference: null }],
+  shippingAddress: { street: 'Av. Coyoacán', zipCode: '03100' },
+};
+
 const notFound = (method: string) =>
   Promise.reject(new Error(`eval fake: ${method} is not part of the eval`));
 
@@ -62,8 +100,8 @@ export type ApiEvent = string;
 
 /**
  * In-memory ChatbotApiClient for the eval: catalog search, stock, pricing,
- * checkout context, shipping quotes by ZIP, idempotent checkout and payment
- * details. Everything else rejects so an unexpected call is visible.
+ * checkout context, order history, shipping quotes by ZIP, idempotent
+ * checkout and payment details. Everything else rejects so an unexpected call is visible.
  */
 export class EvalFakeApi implements ChatbotApiClient {
   readonly events: ApiEvent[] = [];
@@ -71,8 +109,13 @@ export class EvalFakeApi implements ChatbotApiClient {
   readonly orders = new Map<string, CheckoutResponse>();
   private readonly quotes = new Map<string, number>();
   private quoteSeq = 0;
+  /** Order history (latest first); one previous order for an existing customer. */
+  history: OrderHistoryResponse[];
 
-  constructor(private readonly customer: FixtureCustomer) {}
+  constructor(private readonly customer: FixtureCustomer) {
+    this.history =
+      customer.kind === 'existing' ? [structuredClone(PREVIOUS_ORDER)] : [];
+  }
 
   drainEvents(): ApiEvent[] {
     return this.events.splice(0, this.events.length);
@@ -364,8 +407,11 @@ export class EvalFakeApi implements ChatbotApiClient {
   updateDelivery() {
     return notFound('updateDelivery');
   }
-  getOrderHistory() {
-    return Promise.resolve([]);
+  getOrderHistory(phone: string, phoneCountryCode: string) {
+    this.events.push(
+      `getOrderHistory(${phoneCountryCode} ${phone}) → ${this.history.length} order(s)`,
+    );
+    return Promise.resolve(structuredClone(this.history));
   }
   submitRestockIntake() {
     return notFound('submitRestockIntake');

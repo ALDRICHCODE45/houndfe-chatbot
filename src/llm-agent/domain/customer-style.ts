@@ -160,6 +160,16 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   // S4 interactive prompts and the change-button reply.
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
+  ['¿Qué desea hacer?', '¿Qué quieres hacer?'],
+  // S2 reorder offer, its buttons and replies.
+  ['Su último pedido', 'Tu último pedido'],
+  ['Sí, agréguelo', 'Sí, agrégalo'],
+  [
+    '¿Desea agregar algo más o seguimos con su compra?',
+    '¿Quieres agregar algo más o seguimos con tu compra?',
+  ],
+  ['¿Qué producto busca?', '¿Qué producto buscas?'],
+  ['Disculpe, no pude consultar', 'Disculpa, no pude consultar'],
   ['Elija una opción', 'Elige una opción'],
   [
     'Si vuelve a pedir el resumen y responde SÍ',

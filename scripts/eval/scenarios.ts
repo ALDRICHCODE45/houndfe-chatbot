@@ -174,6 +174,27 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    id: 'reorder',
+    title:
+      'Reorder "lo mismo de la vez pasada" → sí → buy → saved address (03100 FREE)',
+    customer: existing('03100'),
+    expectOrders: 1,
+    turns: [
+      'Hola, quiero lo mismo de la vez pasada',
+      'sí',
+      'quiero comprar',
+      'Sí, a mi dirección de casa',
+      'Sí',
+      // Natural answers if the bot asks how to receive it, then the summary.
+      {
+        text: 'Envío a domicilio',
+        onlyIfPreviousReply: /domicilio|recoger/i,
+      },
+      'sí',
+      { text: 'sí', onlyIfPreviousReply: /^Resumen de su pedido/m },
+    ],
+  },
+  {
     id: 'pickup',
     title: 'Store pickup',
     customer: existing('03100'),
