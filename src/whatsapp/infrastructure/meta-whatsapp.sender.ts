@@ -5,6 +5,7 @@ import { lastValueFrom } from 'rxjs';
 import { AppConfig } from '../../config/configuration';
 import {
   InvalidOutboundTemplateError,
+  OutboundImage,
   OutboundTemplate,
   OutboundText,
   SendResult,
@@ -59,6 +60,21 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       type: 'text',
       text: {
         body: message.text,
+      },
+    });
+  }
+
+  async sendImage(message: OutboundImage): Promise<SendResult> {
+    this.assertImageMessage(message);
+
+    return this.send({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: message.to,
+      type: 'image',
+      image: {
+        link: message.link,
+        ...(message.caption === undefined ? {} : { caption: message.caption }),
       },
     });
   }
@@ -163,6 +179,18 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   private assertTextMessage(message: OutboundText): void {
     if (typeof message?.to !== 'string' || typeof message?.text !== 'string') {
       throw new UnsupportedOutboundError();
+    }
+  }
+
+  private assertImageMessage(message: OutboundImage): void {
+    if (
+      typeof message?.to !== 'string' ||
+      message.to === '' ||
+      typeof message.link !== 'string' ||
+      !message.link.startsWith('https://') ||
+      (message.caption !== undefined && typeof message.caption !== 'string')
+    ) {
+      throw new UnsupportedOutboundError('Invalid outbound image message');
     }
   }
 

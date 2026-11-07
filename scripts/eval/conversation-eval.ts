@@ -61,6 +61,8 @@ interface Usage {
 interface TurnRecord {
   customer: string;
   reply: string;
+  /** S3 product photos sent before the reply text. */
+  images: string[];
   tools: string[];
   llmCalls: number;
   gate: string | null;
@@ -270,6 +272,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     skipped: 0,
   };
   let register: Register = 'usted';
+  const customerTexts: string[] = [];
   for (const [index, raw] of scenario.turns.entries()) {
     const turn: ScenarioTurn = typeof raw === 'string' ? { text: raw } : raw;
     const previousReply = record.turns.at(-1)?.reply ?? '';
@@ -285,10 +288,12 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       break;
     }
     register = nextRegister(register, turn.text);
+    customerTexts.push(turn.text);
     meter.calls = 0;
     meter.tools = [];
     const before = { ...meter.usage };
     let reply = '';
+    let images: string[] = [];
     let error: string | undefined;
     try {
       const decision = await agent.tryHandle({
@@ -301,6 +306,9 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
         },
       });
       reply = decision.reply;
+      images = (decision.media ?? []).map(
+        (media) => `${media.caption ?? '(sin pie)'} <${media.url}>`,
+      );
       // The reply reached WhatsApp: arm any pending confirmation.
       decision.onSent?.();
     } catch (err) {
@@ -318,6 +326,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     record.turns.push({
       customer: turn.text,
       reply,
+      images,
       tools: [...meter.tools],
       llmCalls: meter.calls,
       gate: gateLabel(reply, meter.calls),
@@ -326,6 +335,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
         error === undefined
           ? checkReply({
               customerText: turn.text,
+              recentCustomerTexts: customerTexts,
               reply,
               expected: register,
               refusal: turn.refusal ?? 'forbidden',
@@ -366,6 +376,8 @@ function transcript(records: ScenarioRecord[], startedAt: string): string {
       lines.push(`### Turn ${i + 1}`, '');
       lines.push(`**Cliente:** ${t.customer.replace(/\n/g, '  \n')}`, '');
       lines.push('**Bot:**', '');
+      for (const image of t.images) lines.push(`> 🖼️ Imagen: ${image}`);
+      if (t.images.length > 0) lines.push('>');
       lines.push(
         ...(t.reply === ''
           ? ['> _(no reply)_']

@@ -467,9 +467,10 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     it('follows a customer who tutea and uses emojis across the session', async () => {
       const { service, captured } = build([say('Hola'), say('Claro')]);
       await service.tryHandle({ senderId: SENDER, text: 'hola 🐶' });
+      // S5: emojis need one in the latest message (or 2 of the last 3).
       await service.tryHandle({
         senderId: SENDER,
-        text: '¿tienes croquetas para cachorro?',
+        text: '¿tienes croquetas para cachorro? 😊',
       });
       expect(String(captured[0].system)).toContain(
         'Estilo del cliente: de usted, usa emojis, tono casual.',

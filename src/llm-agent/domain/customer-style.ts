@@ -24,8 +24,12 @@ export const DEFAULT_CUSTOMER_STYLE: CustomerStyle = Object.freeze({
   tone: 'neutral',
 });
 
-/** Emojis are read from the last 1-3 customer messages. */
+/**
+ * Emojis are allowed only when the customer's latest message has one, or at
+ * least 2 of their last 3 do; a single emoji further back is not a style.
+ */
 const EMOJI_WINDOW = 3;
+const EMOJI_WINDOW_MIN = 2;
 const TONE_WINDOW = 3;
 
 const EMOJI = /\p{Extended_Pictographic}/u;
@@ -96,6 +100,16 @@ function toneSignal(raw: string, text: string): CustomerTone {
   return 'neutral';
 }
 
+/** The emoji rule over the customer's own messages, oldest first. */
+export function customerAllowsEmojis(userTexts: readonly string[]): boolean {
+  const recent = userTexts
+    .slice(-EMOJI_WINDOW)
+    .map((raw) => EMOJI.test(raw.replace(SYNTHETIC_IMAGE_BLOCK, '')));
+  return (
+    recent.at(-1) === true || recent.filter(Boolean).length >= EMOJI_WINDOW_MIN
+  );
+}
+
 /** Style of the customer's own messages, oldest first. */
 export function detectCustomerStyle(
   userTexts: readonly string[],
@@ -106,7 +120,7 @@ export function detectCustomerStyle(
   }));
   let register: CustomerRegister = DEFAULT_CUSTOMER_STYLE.register;
   for (const { text } of texts) register = registerSignal(text) ?? register;
-  const emojis = texts.slice(-EMOJI_WINDOW).some(({ raw }) => EMOJI.test(raw));
+  const emojis = customerAllowsEmojis(texts.map(({ raw }) => raw));
   let tone: CustomerTone = DEFAULT_CUSTOMER_STYLE.tone;
   for (const { raw, text } of texts.slice(-TONE_WINDOW).reverse()) {
     const signal = toneSignal(raw, text);

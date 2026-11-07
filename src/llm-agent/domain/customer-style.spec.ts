@@ -3,6 +3,7 @@ import {
   applyCustomerStyle,
   customerStyleDirective,
   detectCustomerStyle,
+  limitCustomerEmojis,
   type CustomerStyle,
 } from './customer-style';
 
@@ -108,14 +109,56 @@ describe('detectCustomerStyle', () => {
       ['none', ['hola', '¿tienen correas?'], false],
       ['in the latest message', ['hola 😊'], true],
       ['skin-tone and ZWJ sequences', ['va 👍🏽'], true],
-      ['within the last three messages', ['hola 🐶', 'ok', 'la de 2 kg'], true],
       [
-        'older than the last three messages',
-        ['hola 🐶', 'ok', 'la de 2 kg', 'gracias'],
+        'only one of the last three, not the latest',
+        ['hola 🐶', 'ok', 'la de 2 kg'],
+        false,
+      ],
+      [
+        'eval buy-new-customer: one of three, latest bare "ok"',
+        ['a domicilio porfa', 'Sí, por favor 🙏', 'ok'],
+        false,
+      ],
+      [
+        'two of the last three, latest without',
+        ['hola 🐶', 'sí 👍', 'la de 2 kg'],
+        true,
+      ],
+      ['latest only', ['hola', 'ok', 'va 👍'], true],
+      [
+        'two emojis older than the last three messages',
+        ['hola 🐶', 'sí 👍', 'ok', 'la de 2 kg', 'gracias'],
         false,
       ],
     ])('%s', (_name, texts, emojis) => {
       expect(detectCustomerStyle(texts).emojis).toBe(emojis);
+    });
+  });
+
+  describe('limitCustomerEmojis agrees with the detected style', () => {
+    it.each<[string, string[], string, string]>([
+      [
+        'strips a 🐾 when the latest message has none',
+        ['a domicilio porfa', 'Sí, por favor 🙏', 'ok'],
+        '¡Perfecto! Espero tu comprobante. 🐾',
+        '¡Perfecto! Espero tu comprobante.',
+      ],
+      [
+        'keeps model emojis when the latest message has one',
+        ['ok', 'va 👍'],
+        '¡Listo! 🐾',
+        '¡Listo! 🐾',
+      ],
+      [
+        'keeps model emojis when two of the last three have one',
+        ['hola 🐶', 'sí 👍', 'la de 2 kg'],
+        '¡Listo! 🐾',
+        '¡Listo! 🐾',
+      ],
+    ])('%s', (_name, texts, text, expected) => {
+      expect(limitCustomerEmojis(text, detectCustomerStyle(texts))).toBe(
+        expected,
+      );
     });
   });
 

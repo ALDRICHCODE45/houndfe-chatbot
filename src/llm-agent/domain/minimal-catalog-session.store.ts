@@ -1,6 +1,7 @@
 import type { ModelMessage } from 'ai';
 import type { MinimalCartSelectionSnapshot } from './minimal-cart-selections';
 import type { MinimalCartPendingRequest } from './minimal-cart-quantity';
+import type { ProductImageContext } from './customer-reply';
 
 /** DI injection token for the MinimalCatalogSessionStore port. */
 export const MINIMAL_CATALOG_SESSION_STORE = Symbol(
@@ -28,12 +29,14 @@ export type MinimalCartConversationContext = {
  *
  * `messages` and `verifiedProductIds` are kept together so a later turn can
  * flatten the retained messages and union the verified identity. `cartContext`
- * carries the owned selection snapshot and pending intent for the cart route.
+ * carries the owned selection snapshot and pending intent for the cart route;
+ * `productImages` the known product photos and the ones already sent (S3).
  */
 export type MinimalCatalogTurn = {
   messages: ModelMessage[];
   verifiedProductIds: string[];
   cartContext?: MinimalCartConversationContext;
+  productImages?: ProductImageContext;
 };
 
 /**

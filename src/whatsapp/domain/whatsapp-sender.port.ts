@@ -8,6 +8,18 @@ export interface OutboundText {
 }
 
 /**
+ * Image message by public link (Graph API `type: 'image'`). Meta accepts
+ * only JPEG/PNG up to 5 MB; a rejected image is a send failure.
+ */
+export interface OutboundImage {
+  to: string;
+  /** Absolute `https://` URL Meta downloads the image from. */
+  link: string;
+  /** Short caption (product name only, no prices). */
+  caption?: string;
+}
+
+/**
  * Pre-approved template message (Meta WhatsApp Manager). Only for sends
  * outside the 24h customer service window, where free-form text is refused.
  */
@@ -47,8 +59,13 @@ export class InvalidOutboundTemplateError extends Error {
   }
 }
 
-/** Port abstraction for outbound WhatsApp text and template delivery. */
+/** Port abstraction for outbound WhatsApp text, image and template delivery. */
 export interface WhatsappSenderPort {
   sendText(message: OutboundText): Promise<SendResult>;
   sendTemplate(message: OutboundTemplate): Promise<SendResult>;
+  /**
+   * Optional so text-only adapters and fakes keep working; callers send the
+   * text alone when it is absent.
+   */
+  sendImage?(message: OutboundImage): Promise<SendResult>;
 }

@@ -303,7 +303,8 @@ export function toCatalogItem(product: FixtureProduct): CatalogItemResponse {
     productId: product.productId,
     name: product.name,
     brand: product.brand,
-    imageUrl: null,
+    // Public JPEG placeholder so the transcript shows S3 product photos.
+    imageUrl: `https://cdn.example.test/products/${product.productId}.jpg`,
     description: product.description,
     price: {
       priceCents: product.priceCents,

@@ -1,3 +1,4 @@
+import { customerAllowsEmojis } from '../../src/llm-agent/domain/customer-style';
 import type { RefusalExpectation } from './scenarios';
 
 /** Deterministic reply heuristics; no LLM judge. */
@@ -172,6 +173,8 @@ export function nextRegister(
 
 export function checkReply(input: {
   customerText: string;
+  /** The customer's messages so far, oldest first (default: this one). */
+  recentCustomerTexts?: readonly string[];
   reply: string;
   expected: Register;
   refusal: RefusalExpectation;
@@ -183,13 +186,17 @@ export function checkReply(input: {
     return [{ check: 'empty', severity: 'fail', detail: 'empty reply' }];
   }
 
+  // Same rule as the service's emoji guard (customer-style.ts).
   const customerEmoji = hasEmoji(customerText);
+  const emojiAllowed = customerAllowsEmojis(
+    input.recentCustomerTexts ?? [customerText],
+  );
   const botEmoji = hasEmoji(reply);
-  if (!customerEmoji && botEmoji)
+  if (!emojiAllowed && botEmoji)
     out.push({
       check: 'emoji',
       severity: 'fail',
-      detail: 'emoji to a customer who used none',
+      detail: 'emoji while the customer has no recent emoji style',
     });
   else if (customerEmoji && !botEmoji)
     out.push({

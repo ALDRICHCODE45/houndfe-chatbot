@@ -337,6 +337,9 @@ function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   ];
 }
 
+/** First line of the server-owned order summary. */
+export const MINIMAL_ORDER_SUMMARY_HEADING = 'Resumen de su pedido:';
+
 /** Server-owned order summary; the model never authors it. */
 export function renderMinimalOrderSummary(
   snapshot: MinimalOrderSnapshot,
@@ -344,7 +347,7 @@ export function renderMinimalOrderSummary(
   const pickup =
     snapshot.shipping !== undefined && !('quoteId' in snapshot.shipping);
   return [
-    'Resumen de su pedido:',
+    MINIMAL_ORDER_SUMMARY_HEADING,
     ...snapshot.items.map(
       (item) =>
         `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,

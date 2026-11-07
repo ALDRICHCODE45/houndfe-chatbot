@@ -5,6 +5,7 @@ import { of, throwError } from 'rxjs';
 import { InboundMessage } from '../domain/inbound-message';
 import {
   InvalidOutboundTemplateError,
+  OutboundImage,
   OutboundTemplate,
   OutboundText,
   UnsupportedOutboundError,
@@ -367,6 +368,124 @@ describe('MetaWhatsappSender', () => {
       httpService.post.mockReturnValue(of(axiosResponse({ messages: [] })));
 
       await expect(sender.sendTemplate(template)).rejects.toThrow(
+        'Meta response did not include a provider message id',
+      );
+    });
+  });
+
+  describe('sendImage', () => {
+    const image: OutboundImage = {
+      to: '5215550001111',
+      link: 'https://cdn.example.test/products/kong.jpg',
+      caption: 'Kong Classic',
+    };
+
+    it('sends one Graph API image message by link with its caption and returns the provider message id', async () => {
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'wamid.IMG1' }] })),
+      );
+
+      await expect(sender.sendImage(image)).resolves.toEqual({
+        providerMessageId: 'wamid.IMG1',
+      });
+
+      expect(httpService.post).toHaveBeenCalledTimes(1);
+      expect(httpService.post).toHaveBeenCalledWith(
+        'https://graph.facebook.com/v23.0/1234567890/messages',
+        {
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: '5215550001111',
+          type: 'image',
+          image: {
+            link: 'https://cdn.example.test/products/kong.jpg',
+            caption: 'Kong Classic',
+          },
+        },
+        {
+          headers: {
+            Authorization: 'Bearer meta-access-token',
+          },
+        },
+      );
+    });
+
+    it('omits an absent caption', async () => {
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'w' }] })),
+      );
+
+      await sender.sendImage({ to: image.to, link: image.link });
+
+      expect(httpService.post).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          type: 'image',
+          image: { link: image.link },
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('rewrites the trunk-1 recipient only when normalization is enabled', async () => {
+      sandboxRecipientNormalizationEnabled = true;
+      httpService.post.mockReturnValue(
+        of(axiosResponse({ messages: [{ id: 'w' }] })),
+      );
+
+      await sender.sendImage(image);
+
+      expect(httpService.post).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.objectContaining({ to: '525550001111' }),
+        expect.anything(),
+      );
+    });
+
+    it.each<[string, Partial<OutboundImage>]>([
+      ['plain http link', { link: 'http://cdn.example.test/kong.jpg' }],
+      ['relative link', { link: '/products/kong.jpg' }],
+      ['empty recipient', { to: '' }],
+      ['non-string caption', { caption: 7 as unknown as string }],
+    ])('rejects %s before any request', async (_label, override) => {
+      await expect(sender.sendImage({ ...image, ...override })).rejects.toThrow(
+        UnsupportedOutboundError,
+      );
+      expect(httpService.post).not.toHaveBeenCalled();
+    });
+
+    it('maps a Graph API rejection to the same sanitized typed error as sendText', async () => {
+      const token = 'meta-access-token';
+      httpService.post.mockReturnValue(
+        throwError(() => ({
+          isAxiosError: true,
+          config: { headers: { Authorization: `Bearer ${token}` } },
+          response: {
+            status: 400,
+            data: {
+              error: { code: 131053, message: 'Media upload error' },
+            },
+          },
+        })),
+      );
+
+      let thrown: unknown;
+      try {
+        await sender.sendImage(image);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(WhatsappSendError);
+      expect((thrown as WhatsappSendError).graphErrorCode).toBe(131053);
+      expect(JSON.stringify(thrown)).not.toContain(token);
+      expect(httpService.post).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails when Meta omits the provider message id', async () => {
+      httpService.post.mockReturnValue(of(axiosResponse({ messages: [] })));
+
+      await expect(sender.sendImage(image)).rejects.toThrow(
         'Meta response did not include a provider message id',
       );
     });

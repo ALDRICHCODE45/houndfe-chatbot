@@ -22,6 +22,7 @@ import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../llm-agent/domain/customer-style';
+import type { CustomerReplyMedia } from '../../llm-agent/domain/customer-reply';
 import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
 import {
   buildProductImageTurnText,
@@ -83,7 +84,8 @@ import {
  *      customer turn runs through the minimal SDK route (no sender
  *      allowlist, no legacy fallback). `AgentRunner` is used only for the
  *      ops synthetic "resolved" turn in step 3.
- *   6. WhatsappSenderPort.sendText — send the reply.
+ *   6. WhatsappSenderPort.sendText — send the reply (S3: any product photo
+ *      first via the optional sendImage; an image failure only warns).
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
  *      successful send, so a failed send lets Meta re-deliver and retry.
  *
@@ -356,6 +358,10 @@ export class WebhookDispatcherService {
             },
           }),
     });
+    // S3: the product photo goes first, then the explanation.
+    for (const media of minimal.media ?? []) {
+      await this.sendReplyImage(message.senderId, media);
+    }
     const { providerMessageId } = await this.whatsappSender.sendText({
       to: message.senderId,
       text: minimal.reply,
@@ -366,6 +372,29 @@ export class WebhookDispatcherService {
     minimal.onSent?.();
     this.recentOutbound.remember(providerMessageId);
     await this.markSeenSafely(message.messageId);
+  }
+
+  /** S3: best effort. A failed or unsupported image never blocks the text
+   * reply (e.g. Meta refuses a >5 MB or non-JPEG/PNG image). */
+  private async sendReplyImage(
+    to: string,
+    media: CustomerReplyMedia,
+  ): Promise<void> {
+    if (this.whatsappSender.sendImage === undefined) return;
+    try {
+      const { providerMessageId } = await this.whatsappSender.sendImage({
+        to,
+        link: media.url,
+        ...(media.caption === undefined ? {} : { caption: media.caption }),
+      });
+      this.recentOutbound.remember(providerMessageId);
+    } catch (error) {
+      this.logger.warn(
+        `reply image failed for ${to}; sending the text only: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   private async replyAndMarkSeen(

@@ -36,6 +36,15 @@ import {
 } from '../domain/customer-style';
 import type { MinimalCatalogTurn } from '../domain/minimal-catalog-session.store';
 import {
+  boundProductImageContext,
+  isSendableProductImageUrl,
+  productImageCaption,
+  type CustomerReply,
+  type CustomerReplyMedia,
+  type ProductImageContext,
+} from '../domain/customer-reply';
+import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
+import {
   GENERATE_TEXT,
   type GenerateTextFn,
 } from '../infrastructure/generate-text.provider';
@@ -137,9 +146,9 @@ const INSTRUCTIONS =
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
-export type MinimalCatalogAgentDecision = {
+/** S3: the structured customer reply (text + optional media) of one turn. */
+export type MinimalCatalogAgentDecision = CustomerReply & {
   kind: 'handled';
-  reply: string;
   onSent?: () => void;
 };
 
@@ -283,6 +292,28 @@ type RestockRun = {
 };
 
 type ExpirationReply = { attempted: boolean; value: string | null };
+
+/**
+ * S3: product photos for one SDK run. `known` and `sent` start from the
+ * session; `presented` collects the products the catalog reads of THIS run
+ * resolved (productId → name) and `added` the products a cart write added.
+ */
+type ProductImageRun = {
+  known: Map<string, { url: string; name: string }>;
+  sent: Set<string>;
+  presented: Map<string, string>;
+  added: Set<string>;
+};
+
+/** Lowercase, accent- and markdown-free text for name matching. */
+function matchable(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[*_`]/g, '')
+    .replace(/\s+/g, ' ');
+}
 type CartReply = ExpirationReply & {
   source?: 'cart' | 'read' | 'reviewCheckout';
   // A real write left a non-empty cart in this run.
@@ -672,6 +703,7 @@ export class MinimalCatalogAgentService {
       return {
         kind: 'handled',
         reply: result.reply,
+        ...(result.media === undefined ? {} : { media: result.media }),
         ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
       };
     } finally {
@@ -686,7 +718,7 @@ export class MinimalCatalogAgentService {
     senderId: string;
     text: string;
     inboundEvent?: unknown;
-  }): Promise<{ reply: string; onSent?: () => void }> {
+  }): Promise<CustomerReply & { onSent?: () => void }> {
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
@@ -721,6 +753,36 @@ export class MinimalCatalogAgentService {
             selections: cartConversation.snapshot(),
             pending: cartConversation.pendingIntent,
           };
+    const previousImages = turns.at(-1)?.productImages;
+    const imageRun: ProductImageRun = {
+      known: new Map(Object.entries(previousImages?.known ?? {})),
+      sent: new Set(previousImages?.sent ?? []),
+      presented: new Map(),
+      added: new Set(),
+    };
+    const persistedImages = (): ProductImageContext =>
+      boundProductImageContext({
+        known: Object.fromEntries(imageRun.known),
+        sent: [...imageRun.sent],
+      });
+    // At most one photo per product per conversation; marked sent here.
+    const productImage = (
+      productId: string | undefined,
+    ): readonly CustomerReplyMedia[] | undefined => {
+      if (productId === undefined || imageRun.sent.has(productId))
+        return undefined;
+      const image = imageRun.known.get(productId);
+      if (image === undefined) return undefined;
+      imageRun.sent.add(productId);
+      const caption = productImageCaption(image.name);
+      return [
+        {
+          kind: 'image',
+          url: image.url,
+          ...(caption === undefined ? {} : { caption }),
+        },
+      ];
+    };
     const allowedIds = new Set<string>();
     for (const turn of prior) {
       for (const id of turn.verifiedProductIds) allowedIds.add(id);
@@ -859,6 +921,7 @@ export class MinimalCatalogAgentService {
         cartReply,
         cartConversation,
         checkoutRun,
+        imageRun,
       ),
       stopWhen: stepCountIs(this.maxSteps),
     };
@@ -917,6 +980,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
@@ -929,7 +993,14 @@ export class MinimalCatalogAgentService {
       // authors a checkout outcome.
       // A plain cart read adds nothing to the checkout presentation, which
       // already states the cart (and would repeat "Su carrito está vacío.").
+      // S5: a cart change re-presented as the order summary leads with the
+      // update instead of repeating the same lines as a cart listing.
+      const cartUpdated =
+        cartReply.source === 'cart' &&
+        cartReply.mutated === true &&
+        checkoutResult.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING);
       const cartPart =
+        (cartUpdated ? CART_UPDATED_LEAD : null) ??
         (cartReply.source === 'cart' &&
         cartReply.value !== null &&
         !checkoutResult.reply.includes(cartReply.value)
@@ -951,6 +1022,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return checkoutResult.onSent === undefined
         ? { reply }
@@ -974,6 +1046,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return continued.onSent === undefined
         ? { reply }
@@ -981,6 +1054,13 @@ export class MinimalCatalogAgentService {
     }
     if (cartReply.value !== null) {
       const reply = styled(cartReply.value);
+      // S3: the one product a cart write just added carries its photo.
+      const media =
+        cartReply.source === 'cart' &&
+        cartReply.mutated === true &&
+        imageRun.added.size === 1
+          ? productImage([...imageRun.added][0])
+          : undefined;
       this.recordTurn(
         input.senderId,
         [
@@ -989,8 +1069,9 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
-      return { reply };
+      return media === undefined ? { reply } : { reply, media };
     }
     if (this.hasInvalidCartToolCall(result)) {
       // A cart tool whose arguments failed SDK validation never executed; the
@@ -1009,6 +1090,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return { reply };
     }
@@ -1026,6 +1108,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return { reply };
     }
@@ -1067,6 +1150,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return real.onSent === undefined
         ? { reply }
@@ -1082,17 +1166,29 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return { reply };
     }
+    // S3: exactly one product presented by this run's catalog reads (the
+    // only hit, or the only one the text names) carries its photo.
+    const named =
+      imageRun.presented.size === 1
+        ? [...imageRun.presented.keys()]
+        : [...imageRun.presented].flatMap(([productId, name]) =>
+            matchable(text).includes(matchable(name)) ? [productId] : [],
+          );
+    const media = named.length === 1 ? productImage(named[0]) : undefined;
     this.recordTurn(
       input.senderId,
       [{ role: 'user', content: input.text }, ...responseMessages],
       [...currentIds],
       persistedCartContext(),
+      persistedImages(),
     );
     // The prompt styles model text; only the emoji guard applies here.
-    return { reply: limitCustomerEmojis(text, style) };
+    const reply = limitCustomerEmojis(text, style);
+    return media === undefined ? { reply } : { reply, media };
   }
 
   /**
@@ -1226,18 +1322,22 @@ export class MinimalCatalogAgentService {
     messages: ModelMessage[],
     verifiedProductIds: string[],
     cartContext?: MinimalCartConversationContext,
+    productImages?: ProductImageContext,
   ): void {
     const turns = this.sessionStore.read(senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
     // Carry the owned cart context forward unless this turn produced a new one,
     // so a non-cart turn never drops an armed request or the registry snapshot.
     const inherited = cartContext ?? turns.at(-1)?.cartContext;
+    // Same for the product photos: a gate turn never forgets a sent photo.
+    const images = productImages ?? turns.at(-1)?.productImages;
     this.sessionStore.write(senderId, [
       ...prior,
       {
         messages,
         verifiedProductIds,
         ...(inherited === undefined ? {} : { cartContext: inherited }),
+        ...(images === undefined ? {} : { productImages: images }),
       },
     ]);
   }
@@ -1338,6 +1438,7 @@ export class MinimalCatalogAgentService {
     cartReply: CartReply,
     cartConversation: MinimalCartConversation | null,
     checkoutRun: CheckoutRun | null = null,
+    imageRun: ProductImageRun | null = null,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
@@ -1465,6 +1566,18 @@ export class MinimalCatalogAgentService {
             for (const item of items) {
               allowedIds.add(item.productId);
               currentIds.add(item.productId);
+              imageRun?.presented.set(item.productId, item.name);
+              if (
+                imageRun !== null &&
+                isSendableProductImageUrl(item.imageUrl)
+              ) {
+                // Re-insert so the bounded context keeps the most recent.
+                imageRun.known.delete(item.productId);
+                imageRun.known.set(item.productId, {
+                  url: item.imageUrl,
+                  name: item.name,
+                });
+              }
             }
             trace(
               `tool searchCatalog result=ok searchResultCount=${items.length}`,
@@ -1499,6 +1612,8 @@ export class MinimalCatalogAgentService {
             const stock = await chatbotApi.getStock(productId);
             const status = safeStatus(stock.stock.status);
             const quantity = safeQuantity(stock.stock.quantity);
+            if (stock.productId === productId)
+              imageRun?.presented.set(stock.productId, stock.name);
             trace(
               `tool checkStock result=ok parentStockStatus=${status} parentStockQuantity=${quantity}`,
             );
@@ -1622,6 +1737,8 @@ export class MinimalCatalogAgentService {
         cartReply.source = 'cart';
         cartReply.mutated = result.ok && result.items.length > 0;
         mutationAcknowledged = true;
+        if (result.ok && intent.operation === 'add' && magnitude > 0)
+          imageRun?.added.add(identity.productId);
         return result;
       }
       const result = await cart.setItem(
@@ -1638,6 +1755,8 @@ export class MinimalCatalogAgentService {
       cartReply.source = 'cart';
       cartReply.mutated = result.ok && result.items.length > 0;
       mutationAcknowledged = true;
+      if (result.ok && intent.operation === 'set' && (intent.quantity ?? 0) > 0)
+        imageRun?.added.add(identity.productId);
       return result;
     };
     // F10: a cart tool on a message with no cart request at all ("Quiero

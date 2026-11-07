@@ -31,3 +31,50 @@ describe('eval duplicate-line check', () => {
     });
   });
 });
+
+describe('eval emoji check (same rule as limitCustomerEmojis)', () => {
+  const emoji = (recentCustomerTexts: string[], reply: string) =>
+    checkReply({
+      customerText: recentCustomerTexts.at(-1) ?? '',
+      recentCustomerTexts,
+      reply,
+      expected: 'tu',
+      refusal: 'forbidden',
+      expectPersona: false,
+    }).find((result) => result.check === 'emoji');
+
+  it.each<[string, string[], string, 'pass' | 'warn' | 'fail']>([
+    [
+      'fails a 🐾 after one emoji two messages back',
+      ['a domicilio porfa', 'Sí, por favor 🙏', 'ok'],
+      'Espero tu comprobante. 🐾',
+      'fail',
+    ],
+    [
+      'passes an emoji when two of the last three had one',
+      ['hola 🐶', 'sí 👍', 'la de 2 kg'],
+      'Listo 🐾',
+      'pass',
+    ],
+    [
+      'passes an emoji when the latest message has one',
+      ['ok', 'va 👍'],
+      'Listo 🐾',
+      'pass',
+    ],
+    [
+      'warns when the latest message has an emoji and the reply none',
+      ['ok', 'va 👍'],
+      'Listo',
+      'warn',
+    ],
+    [
+      'passes no emoji when emojis are not allowed',
+      ['hola 🐶', 'ok', 'la de 2 kg'],
+      'Listo',
+      'pass',
+    ],
+  ])('%s', (_name, texts, reply, severity) => {
+    expect(emoji(texts, reply)?.severity).toBe(severity);
+  });
+});
