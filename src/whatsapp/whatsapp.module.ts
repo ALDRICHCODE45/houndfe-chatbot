@@ -12,6 +12,7 @@ import { DatabaseModule } from '../database/database.module';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
+import { ProductImageModule } from '../product-image/product-image.module';
 import { WebhookDispatcherService } from './application/webhook-dispatcher.service';
 import {
   RECENT_OUTBOUND,
@@ -50,6 +51,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
     HumanHandoffModule,
     WhatsappSenderModule,
     ReceiptMediaModule,
+    ProductImageModule,
   ],
   controllers: [WebhookController],
   providers: [

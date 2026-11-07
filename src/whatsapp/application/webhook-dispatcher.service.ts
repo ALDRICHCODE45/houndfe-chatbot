@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   CONVERSATION_STORE,
   readPendingHumanRequest,
@@ -16,6 +16,17 @@ import {
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
 import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
+import { readPlacedOrder } from '../../receipt-media/domain/placed-order';
+import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
+import {
+  buildProductImageTurnText,
+  isIdentifiableProduct,
+  looksLikeProductQuestion,
+  PRODUCT_IMAGE_UNAVAILABLE_REPLY,
+  PRODUCT_IMAGE_UNCLEAR_REPLY,
+  RECEIPT_IMAGE_WITHOUT_ORDER_REPLY,
+  type ProductImageRecognition,
+} from '../../product-image/domain/product-image';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
@@ -56,6 +67,13 @@ import {
  *      when the customer's `data.pendingHumanRequest` is set, send the
  *      canned byte-identical "seguimos esperando respuesta del agente,
  *      te avisamos en cuanto tengamos" reply and `continue`. No LLM call.
+ *   4b. **Customer media** — documents (PDF) always go to receipt ingress.
+ *      An image goes to receipt ingress only when an order awaits payment
+ *      (`minimalCart.placedSale`) and the caption is not a product question;
+ *      otherwise it is a product photo (S5): download + vision describer,
+ *      then a synthetic agent turn (caption + compact description), a
+ *      label-photo request, a product-name request, or — for a receipt with
+ *      no order — a customer reply asking for the product first.
  *   5. `MinimalCatalogAgentService.tryHandle({ senderId, text })` — every
  *      customer turn runs through the minimal SDK route (no sender
  *      allowlist, no legacy fallback). `AgentRunner` is used only for the
@@ -87,6 +105,10 @@ export class WebhookDispatcherService {
     // Handles every customer turn; AgentRunner only serves the ops synthetic
     // "resolved" turn above.
     private readonly minimalCatalogAgent: MinimalCatalogAgentService,
+    // S5 product photos. Optional only so hand-built harnesses keep
+    // compiling; without it a product photo gets the product-name request.
+    @Optional()
+    private readonly productImage?: ProductImageRecognitionService,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -186,82 +208,44 @@ export class WebhookDispatcherService {
           continue;
         }
 
-        // ─── WU13-B2: ReceiptIngressService — customer media only ─────────────
+        // ─── WU13-B2 / S5: customer media ───────────────────────────────
         if (message.media != null) {
-          // ODD-4A: the normalized optional caption is the only extra field
-          // forwarded. filename/sha256 and every other payload field are
-          // dropped, and the raw caption never reaches the LLM or any
-          // durable type.
-          const decision = await this.ingress.admit({
-            webhookMessageId: message.messageId,
-            providerMediaId: message.media.providerMediaId,
-            senderId: message.senderId,
-            declaredMimeType: message.media.declaredMimeType,
-            caption: message.media.caption,
-          });
-          const guidance = ingressGuidance(decision);
+          const media = message.media;
+          const awaitingPayment = readPlacedOrder(custState) !== null;
+          const receiptFirst =
+            media.kind === 'document' ||
+            (awaitingPayment && !looksLikeProductQuestion(media.caption));
+          if (receiptFirst) {
+            await this.admitReceipt(message, media);
+            continue;
+          }
 
-          if (guidance !== undefined) {
-            const { providerMessageId } = await this.whatsappSender.sendText({
-              to: message.senderId,
-              text: guidance,
-            });
-            this.recentOutbound.remember(providerMessageId);
+          const recognition = await this.recognizeProductImage(media);
+          if (recognition.kind === 'receipt' && awaitingPayment) {
+            await this.admitReceipt(message, media);
+            continue;
           }
-          if (!receiptAdmissionAtomicallyMarksSeen(decision.kind)) {
-            try {
-              await this.dedup.markSeen(message.messageId);
-            } catch (error) {
-              this.logger.warn(
-                `markSeen failed for ${message.messageId}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            }
+          if (
+            recognition.kind !== 'unavailable' &&
+            isIdentifiableProduct(recognition)
+          ) {
+            // The synthetic text is the customer's user turn in history;
+            // the image bytes never reach the agent.
+            await this.runCustomerTurn(
+              message,
+              buildProductImageTurnText(media.caption, recognition),
+            );
+            continue;
           }
+          await this.replyAndMarkSeen(
+            message,
+            productImageFallbackReply(recognition),
+          );
           continue;
         }
 
         // ─── (5) Minimal catalog agent dispatch ────────────────────────
-        // Every customer turn goes to the minimal SDK route. R3b3-c4c1b: a
-        // REAL normalized customer inbound carries its receiving-phone
-        // metadata; forward that inert identity only when it exists. Ops
-        // synthetic turns never reach this branch.
-        const minimal = await this.minimalCatalogAgent.tryHandle({
-          senderId: message.senderId,
-          text: message.text,
-          ...(message.receivingPhoneNumberId === undefined
-            ? {}
-            : {
-                inboundEvent: {
-                  receivingPhoneNumberId: message.receivingPhoneNumberId,
-                  senderId: message.senderId,
-                  messageId: message.messageId,
-                },
-              }),
-        });
-        const { providerMessageId } = await this.whatsappSender.sendText({
-          to: message.senderId,
-          text: minimal.reply,
-        });
-        // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
-        // question, and BEFORE the observational remember/markSeen writes so
-        // an observation failure can never undo the accepted send.
-        minimal.onSent?.();
-        this.recentOutbound.remember(providerMessageId);
-
-        // A dedup-write failure must NOT turn a successful send into a
-        // failed webhook delivery (that would force Meta to re-deliver and
-        // the customer would get the reply twice).
-        try {
-          await this.dedup.markSeen(message.messageId);
-        } catch (error) {
-          this.logger.warn(
-            `markSeen failed for ${message.messageId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
-        }
+        await this.runCustomerTurn(message, message.text);
       } catch (error) {
         this.logger.error(
           `failed to process ${message.messageId} from ${message.senderId}: ${
@@ -271,6 +255,133 @@ export class WebhookDispatcherService {
         throw error;
       }
     }
+  }
+
+  /** WU13-B2 receipt ingress for one customer media message. ODD-4A: the
+   * normalized optional caption is the only extra field forwarded.
+   * filename/sha256 and every other payload field are dropped, and the raw
+   * caption never reaches the LLM or any durable type. */
+  private async admitReceipt(
+    message: InboundMessage,
+    media: InboundMedia,
+  ): Promise<void> {
+    const decision = await this.ingress.admit({
+      webhookMessageId: message.messageId,
+      providerMediaId: media.providerMediaId,
+      senderId: message.senderId,
+      declaredMimeType: media.declaredMimeType,
+      caption: media.caption,
+    });
+    const guidance = ingressGuidance(decision);
+
+    if (guidance !== undefined) {
+      const { providerMessageId } = await this.whatsappSender.sendText({
+        to: message.senderId,
+        text: guidance,
+      });
+      this.recentOutbound.remember(providerMessageId);
+    }
+    if (!receiptAdmissionAtomicallyMarksSeen(decision.kind)) {
+      await this.markSeenSafely(message.messageId);
+    }
+  }
+
+  /** S5: never throws — any failure becomes `unavailable` so the customer
+   * is asked for the product name instead of the webhook failing. */
+  private async recognizeProductImage(
+    media: InboundMedia,
+  ): Promise<ProductImageRecognition> {
+    if (this.productImage === undefined) {
+      return { kind: 'unavailable', reason: 'error' };
+    }
+    try {
+      return await this.productImage.recognize({
+        providerMediaId: media.providerMediaId,
+        declaredMimeType: media.declaredMimeType,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `product image recognition failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return { kind: 'unavailable', reason: 'error' };
+    }
+  }
+
+  /** (5) One customer turn through the minimal SDK route. R3b3-c4c1b: a
+   * REAL normalized customer inbound carries its receiving-phone metadata;
+   * forward that inert identity only when it exists. Ops synthetic turns
+   * never reach this method. */
+  private async runCustomerTurn(
+    message: InboundMessage,
+    text: string,
+  ): Promise<void> {
+    const minimal = await this.minimalCatalogAgent.tryHandle({
+      senderId: message.senderId,
+      text,
+      ...(message.receivingPhoneNumberId === undefined
+        ? {}
+        : {
+            inboundEvent: {
+              receivingPhoneNumberId: message.receivingPhoneNumberId,
+              senderId: message.senderId,
+              messageId: message.messageId,
+            },
+          }),
+    });
+    const { providerMessageId } = await this.whatsappSender.sendText({
+      to: message.senderId,
+      text: minimal.reply,
+    });
+    // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
+    // question, and BEFORE the observational remember/markSeen writes so
+    // an observation failure can never undo the accepted send.
+    minimal.onSent?.();
+    this.recentOutbound.remember(providerMessageId);
+    await this.markSeenSafely(message.messageId);
+  }
+
+  private async replyAndMarkSeen(
+    message: InboundMessage,
+    text: string,
+  ): Promise<void> {
+    const { providerMessageId } = await this.whatsappSender.sendText({
+      to: message.senderId,
+      text,
+    });
+    this.recentOutbound.remember(providerMessageId);
+    await this.markSeenSafely(message.messageId);
+  }
+
+  /** A dedup-write failure must NOT turn a successful send into a failed
+   * webhook delivery (that would force Meta to re-deliver and the customer
+   * would get the reply twice). */
+  private async markSeenSafely(messageId: string): Promise<void> {
+    try {
+      await this.dedup.markSeen(messageId);
+    } catch (error) {
+      this.logger.warn(
+        `markSeen failed for ${messageId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
+/** S5: customer reply for a photo the agent cannot search for. A receipt
+ * with no order asks for the product first (D6: never the operator copy). */
+function productImageFallbackReply(
+  recognition: ProductImageRecognition,
+): string {
+  switch (recognition.kind) {
+    case 'unavailable':
+      return PRODUCT_IMAGE_UNAVAILABLE_REPLY;
+    case 'receipt':
+      return RECEIPT_IMAGE_WITHOUT_ORDER_REPLY;
+    default:
+      return PRODUCT_IMAGE_UNCLEAR_REPLY;
   }
 }
 
@@ -409,7 +520,8 @@ function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
     case 'unsupported-media':
       return UNSUPPORTED_RECEIPT_FORMAT;
     case 'no-placed-sale':
-      return 'Primero registra la venta en el sistema.';
+      // D6: customer copy (PDF before any order), never an operator instruction.
+      return 'Recibí su comprobante. Para registrarlo primero necesitamos confirmar su pedido. ¿Qué producto desea?';
     case 'sender-active':
       // R6: no amount dialog any more, so an active receipt is always still
       // being processed (downloaded, read and uploaded to the backend).
