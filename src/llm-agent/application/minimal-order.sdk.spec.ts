@@ -12,7 +12,10 @@ import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
-import { MinimalOrderService } from './minimal-order.service';
+import {
+  MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
+  MinimalOrderService,
+} from './minimal-order.service';
 
 const SENDER = '5215550001111';
 const CASHIER = '99999999-9999-4999-8999-999999999999';
@@ -364,7 +367,7 @@ describe('checkout next-step guidance through the SDK route', () => {
     expect(reply).toMatch(/^Confirme sus datos de entrega:/);
     expect(reply).toContain('Calle: Av. Juárez 10, int. 130');
     expect(reply.endsWith(deliveryEnding)).toBe(true);
-    expect(reply).toContain('no crea un pedido');
+    expect(reply).not.toContain('no crea un pedido');
     expect(reply).not.toContain('Antes de crear el pedido necesito');
     expect(reply).not.toContain('Datos inventados');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
@@ -375,8 +378,13 @@ describe('checkout next-step guidance through the SDK route', () => {
     const calls = h.seen.length;
     const confirmed = await h.turn('SÍ', [say()], EVENT('delivery-yes'));
     expect(h.seen).toHaveLength(calls);
-    expect((confirmed as { reply: string }).reply).toContain(
-      'Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.',
+    // F1: the confirmation continues by itself; without the shipping tools
+    // (absent here) the order gate asks how the order is received.
+    expect((confirmed as { reply: string }).reply).toBe(
+      `Gracias, sus datos de entrega quedaron confirmados.\n\n${MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY}`,
+    );
+    expect((confirmed as { reply: string }).reply).not.toContain(
+      'hacer pedido',
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     // The customer then chooses store pickup.
@@ -497,7 +505,7 @@ describe('checkout next-step guidance through the SDK route', () => {
   });
 
   it.each([false, true])(
-    'drops reviewCheckout when a delivery presentation is produced (review last: %s)',
+    'drops reviewCheckout when confirmCheckoutDetails continues confirmed data to the order summary (review last: %s)',
     async (reviewLast) => {
       const h = setup();
       await h.ready();
@@ -508,8 +516,9 @@ describe('checkout next-step guidance through the SDK route', () => {
         reviewLast ? [confirm, review, say()] : [review, confirm, say()],
         EVENT('review-delivery'),
       );
+      // F1: confirmed, unchanged delivery data are never re-presented.
       expect((result as { reply: string }).reply).toMatch(
-        /^Confirme sus datos de entrega:/,
+        /^Resumen de su pedido:/,
       );
       expect((result as { reply: string }).reply).not.toContain(
         'Revisión de compra',

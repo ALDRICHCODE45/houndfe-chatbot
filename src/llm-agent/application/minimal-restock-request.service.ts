@@ -22,6 +22,7 @@ import {
   bindRestockInboundEvent,
   type RestockInboundEventIdentity,
 } from '../../human-decisions/domain/restock-source-identity';
+import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import { runRestockRoute } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { RestockToolCapability } from '../../sale-flow/application/tool-deps';
 
@@ -39,33 +40,20 @@ export type RestockReplyClassifier = (
   question: string,
   reply: string,
 ) => Promise<RestockReplyVerdict>;
-const DECLINE_REPLY =
+export const MINIMAL_RESTOCK_DECLINE_REPLY =
   'Entendido, no registraré su consulta de reposición. ¡Gracias!';
-const confirmed = (l: string) =>
+export const minimalRestockConfirmedReply = (l: string) =>
   `¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «${l}». ¡Gracias!`;
-const already = (l: string) =>
+export const minimalRestockAlreadyReply = (l: string) =>
   `Su consulta sobre la reposición de «${l}» ya estaba registrada. ¡Gracias!`;
-const proposal = (l: string) =>
+export const minimalRestockProposal = (l: string) =>
   `Por ahora no tenemos «${l}» 😕. ¿Quiere que consulte si hay una fecha ` +
   `estimada de reposición?`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
-// RESTOCK-LOCAL bounded consent: a whole `SI`/`SÍ`/`NO` (case, outer
-// spaces/tabs and one trailing period tolerated), then exactly one polite
-// affirmative form. No substring, NLP or model inference; every other text
-// (including a polite "NO, por favor") stays `null`.
-const STRICT_DECISION = /^(?:si|sí|no)\.?$/i;
-const POLITE_AFFIRMATIVE = /^(?:si|sí),?[ \t]+por[ \t]+favor\.?$/i;
-const OUTER_SPACING = /^[ \t]+|[ \t]+$/g;
-const NEWLINES = /[\r\n]/;
-
-function parseRestockDecision(raw: unknown): 'accept' | 'decline' | null {
-  if (typeof raw !== 'string' || NEWLINES.test(raw)) return null;
-  const candidate = raw.replace(OUTER_SPACING, '');
-  if (STRICT_DECISION.test(candidate))
-    return candidate.charAt(0).toLowerCase() === 'n' ? 'decline' : 'accept';
-  return POLITE_AFFIRMATIVE.test(candidate) ? 'accept' : null;
-}
+// Deterministic consent comes from the shared closed lexicon; anything else
+// (including a polite "NO, por favor") falls through to the task classifier.
+const parseRestockDecision = classifyConfirmationReply;
 
 export interface MinimalRestockDeps {
   readonly chatbotApi: ChatbotApiClient;
@@ -294,7 +282,7 @@ export class MinimalRestockRequestService {
         resolved.variantId === null
           ? base
           : { ...base, variantId: resolved.variantId };
-      const question = proposal(presentation);
+      const question = minimalRestockProposal(presentation);
       const pending: PendingRestock = {
         originPhoneNumberId: bound.event.receivingPhoneNumberId,
         originMessageId: bound.event.messageId,
@@ -362,7 +350,7 @@ export class MinimalRestockRequestService {
         if (!pending.armed) return ambiguous;
         if (decision === 'decline') {
           this.pending.delete(senderId);
-          return { kind: 'handled', reply: DECLINE_REPLY };
+          return { kind: 'handled', reply: MINIMAL_RESTOCK_DECLINE_REPLY };
         }
         // Consume the slot BEFORE awaiting so a concurrent turn cannot re-enter.
         this.pending.delete(senderId);
@@ -420,7 +408,7 @@ export class MinimalRestockRequestService {
     }
     if (verdict === 'decline') {
       this.pending.delete(senderId);
-      return { kind: 'handled', reply: DECLINE_REPLY };
+      return { kind: 'handled', reply: MINIMAL_RESTOCK_DECLINE_REPLY };
     }
     if (verdict !== 'accept') return clarification;
     // Consume BEFORE awaiting so a concurrent accept cannot double-write.
@@ -449,10 +437,16 @@ export class MinimalRestockRequestService {
       },
     );
     if (result.ok && result.outcome === 'historical_intake_recorded') {
-      return { kind: 'handled', reply: confirmed(pending.presentation) };
+      return {
+        kind: 'handled',
+        reply: minimalRestockConfirmedReply(pending.presentation),
+      };
     }
     if (result.ok && result.outcome === 'existing_restock_recorded') {
-      return { kind: 'handled', reply: already(pending.presentation) };
+      return {
+        kind: 'handled',
+        reply: minimalRestockAlreadyReply(pending.presentation),
+      };
     }
     return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
   }

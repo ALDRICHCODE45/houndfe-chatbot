@@ -26,15 +26,24 @@ import type {
 } from '../domain/minimal-cart-quantity';
 import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { classifyConfirmationReply } from '../domain/confirmation-reply';
+import {
+  applyCustomerStyle,
+  customerStyleDirective,
+  detectCustomerStyle,
+  limitCustomerEmojis,
+  type CustomerStyle,
+} from '../domain/customer-style';
+import type { MinimalCatalogTurn } from '../domain/minimal-catalog-session.store';
 import {
   GENERATE_TEXT,
   type GenerateTextFn,
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  CART_DEFAULT_UNIT_NOTE,
   CART_OPERATION_CLARIFICATION,
   CART_QUANTITY_QUESTION,
-  CART_PRESENTATION_QUESTION,
   CART_TOOL_NAMES,
   CART_UNKNOWN_REFERENCE_REPLY,
   MinimalCartConversation,
@@ -42,6 +51,7 @@ import {
   cartKeepOnlyToolInput,
   cartPrepareToolInput,
   cartSetToolInput,
+  type CartLineIdentity,
   type ResolvedCartSelection,
 } from './minimal-cart-conversation';
 import {
@@ -60,6 +70,7 @@ import {
 } from './minimal-checkout.service';
 import {
   MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
+  MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import {
@@ -103,9 +114,13 @@ const INSTRUCTIONS =
   'si aún no lo está o la identidad expiró, búscalo primero. En productos con variantes ' +
   'informa existencias por variante; no iguales la del producto con la de la variante. ' +
   'No realizas compras, ventas, pagos ni cambios de datos. ' +
-  'Saluda cálido de usted con un emoji ligero, según la base. Un hallazgo se anuncia ' +
+  'Saluda cálido, en el registro y con los emojis del estilo del cliente. Un hallazgo se anuncia ' +
   '"Encontré ... en catálogo", no "tenemos" ni "disponible": eso solo se afirma tras un ' +
-  'checkStock válido. La selección explícita ya es válida: no la repreguntes. ' +
+  'checkStock válido. Tras un checkStock disponible dilo natural ("Sí, lo tenemos disponible"); ' +
+  'menciona la cantidad solo si es baja o el cliente la pide, nunca "una cantidad de N unidades en stock". ' +
+  'La selección explícita ya es válida: no la repreguntes. ' +
+  'Si el cliente menciona o pide un producto, llama searchCatalog ANTES de responder; nunca digas "Encontré" ni des datos del catálogo sin una lectura de este chat. ' +
+  'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 5) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
@@ -113,11 +128,11 @@ const INSTRUCTIONS =
   'prometas registro, contacto o reservación (no existe esa herramienta). Nunca fijes ' +
   'producto, precio ni stock: los ejemplos son condicionales, no respuestas forzadas. ' +
   'Estilo (solo si aplica): si su mensaje abre con saludo, empieza con un saludo recíproco ' +
-  '(usa "¡Hola! 😊" si es neutro; no inventes la hora); identidad de servicio cálida de usted, ' +
+  '(usa "¡Hola!" si es neutro; no inventes la hora); identidad de servicio cálida en el registro del cliente, ' +
   'sin personificar a una persona. Un producto en un párrafo breve y natural, no una lista ' +
   'anidada, y sin "¿en qué puedo ayudarle?" si ya pidió un producto. Ejemplos solo de estilo, ' +
-  'sustituye únicamente datos verificados por herramienta: "¡Hola! 😊 Encontré {nombre} en ' +
-  'nuestro catálogo. ¿Buscaba esa presentación?"; tras out_of_stock verificado: "Por ahora, ' +
+  'sustituye únicamente datos verificados por herramienta: "¡Hola! Encontré {nombre} en ' +
+  'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
@@ -129,11 +144,25 @@ export type MinimalCatalogAgentDecision = {
 };
 
 // Bounded busy reply returned as `handled` for an in-flight turn.
-const BUSY_REPLY =
+export const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
 
-const RESTOCK_CAUTIOUS_REPLY =
+export const RESTOCK_CAUTIOUS_REPLY =
   'Por ahora no puedo preparar esa consulta de reposición.';
+
+// G1: sent when a run ends without any text, even after a tool-free render.
+export const EMPTY_REPLY_FALLBACK =
+  'Disculpe, no alcancé a completar su consulta. ¿Me confirma qué producto y presentación busca?';
+
+// G2: lead before the updated order summary after a cart change.
+export const CART_UPDATED_LEAD = 'Listo, actualicé su carrito.';
+
+/**
+ * Model text imitating the server-owned delivery-data or order summaries.
+ * Only the application presents them (and arms their SÍ gate).
+ */
+const IMITATED_CONFIRMATION =
+  /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“']?\s*s[ií]\b[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
 
@@ -254,7 +283,11 @@ type RestockRun = {
 };
 
 type ExpirationReply = { attempted: boolean; value: string | null };
-type CartReply = ExpirationReply & { source?: 'cart' | 'reviewCheckout' };
+type CartReply = ExpirationReply & {
+  source?: 'cart' | 'read' | 'reviewCheckout';
+  // A real write left a non-empty cart in this run.
+  mutated?: boolean;
+};
 
 // One server-owned checkout presentation per SDK run.
 type CheckoutRun = { attempted: boolean; value: MinimalCheckoutReply | null };
@@ -272,14 +305,12 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
 const SHIPPING_INSTRUCTIONS_FRAGMENT =
   '\n\nEnvío: llame requestShippingQuote sin argumentos solo después de que el cliente confirmó sus datos de entrega y quiere envío a domicilio; la aplicación le informa el costo, el crédito y la fecha estimada. Nunca invente ni calcule costos, créditos, transportistas ni fechas de entrega; no repita montos. ' +
   'Si la entrega a su código postal está en validación o no está disponible, ofrezca recoger el pedido en tienda. Cuando el cliente elija recoger en tienda (puede pedirlo en cualquier momento), llame chooseStorePickup sin argumentos; no tiene costo de envío y no necesita dirección de entrega. Para recoger en tienda solo hace falta el nombre del cliente: si la aplicación lo pide, guárdelo con updateCheckoutDetails (solo firstName y lastName, null en los demás, useNewAddress: false) y llame prepareOrder de nuevo; no pida dirección ni la confirmación de datos de entrega. ' +
-  'Después el cliente pide el resumen con prepareOrder. Nunca diga que existe un pedido.';
+  'Tras una cotización exitosa o la recolección en tienda, la aplicación muestra el resumen del pedido en la misma respuesta. Nunca diga que existe un pedido.';
 
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados (o el cliente eligió recoger en tienda) y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
 const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-const NEXT_STEP =
-  'Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.';
 const zipPhrase = (zipCode: string | null) =>
   zipCode === null ? 'su código postal' : `su código postal ${zipCode}`;
 
@@ -311,8 +342,8 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
                 : []),
               `Usted paga ${shippingMxn(result.customerChargeCents)}.`,
             ]),
+        // F1: the order summary follows in the same reply; no magic phrase.
         ...(eta === null ? [] : [eta]),
-        NEXT_STEP,
       ].join(' ');
     }
     case 'zone_pending':
@@ -368,7 +399,7 @@ function shippingRefusalReply(reason: MinimalShippingRefusal): string {
 /** Server-owned reply for a store pickup choice (S4). */
 export function minimalPickupReply(result: MinimalPickupResult): string {
   if (result.kind === 'pickup')
-    return `Listo, usted recoge su pedido en tienda, sin costo de envío. Dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.`;
+    return 'Listo, usted recoge su pedido en tienda, sin costo de envío.';
   if (result.reason === 'order_unresolved')
     return 'Tengo un pedido suyo pendiente de confirmar, así que por ahora no puedo cambiar cómo lo recibe. Pida de nuevo el resumen y responda SÍ para reintentar ese mismo pedido, o comuníquese con la tienda.';
   if (result.reason === 'empty_cart')
@@ -409,7 +440,8 @@ const CHECKOUT_INSTRUCTIONS_FRAGMENT =
   'Si hay direcciones, muéstrelas con su resumen y pregunte cuál usar; para elegir una llame selectCheckoutAddress con su addressRef EXACTO (nunca invente ni elija una por su cuenta). Use nextPageRef solo si el cliente pide ver más. not_found o ambiguous no impiden capturar una dirección nueva; lookup_unavailable no significa que no exista. ' +
   'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Si el cliente corrige una dirección guardada seleccionada, llame updateCheckoutDetails con SOLO los campos corregidos, null en los demás y useNewAddress: false; conservamos los otros datos y actualizaremos esa dirección al crear el pedido. Si dice que un dato está mal sin dar el valor correcto, pregunte cuál es el correcto. Nunca pida confirmar datos que el cliente dijo que están mal. ' +
   'Se requieren nombre, calle, número exterior o S/N, colonia, código postal, ciudad o municipio y estado; pida lo que falte (missing). ' +
-  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
+  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Cuando el cliente confirma sus datos, la aplicación continúa sola con el envío y el resumen del pedido. Con datos ya confirmados no vuelva a llamar selectCheckoutAddress, updateCheckoutDetails ni confirmCheckoutDetails salvo que el cliente pida cambiar un dato; un mensaje afirmativo o neutral («ok», «va», «envío a domicilio») no cambia datos. Nunca copie la línea «Calle» del resumen en street: el número exterior va solo en exteriorNumber. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío. ' +
+  'Nunca escriba por su cuenta el resumen de datos de entrega ni el resumen del pedido, ni pida al cliente responder «SÍ»: llame confirmCheckoutDetails o prepareOrder y la aplicación los muestra. Si el cliente cambia el carrito con sus datos ya confirmados, solo llame la herramienta de carrito: la aplicación muestra el resumen actualizado.';
 
 const CART_VARIANT_GUIDANCE =
   'Para herramientas de carrito copie en selectionRef el cartSelectionRef EXACTO del producto o presentación elegidos, devuelto por searchCatalog/checkStock/getCart o por el contexto verificado. No envíe productId ni variantId a herramientas de carrito. ' +
@@ -453,6 +485,52 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
       };
     }),
   };
+}
+
+/** "Encontré…"-style catalog claims the model may only make after a read. */
+const CATALOG_CLAIM =
+  /\bencontr[eé]\b|\bvarias opciones\b|\ben (?:el|nuestro) cat[aá]logo\b/i;
+
+/** A reply asserting catalog findings from a run that called no tool. */
+function ungroundedCatalogClaim(result: {
+  text: string;
+  steps?: ReadonlyArray<{ toolCalls?: readonly unknown[] }>;
+}): boolean {
+  const called = (result.steps ?? []).some(
+    (step) => (step.toolCalls?.length ?? 0) > 0,
+  );
+  return !called && CATALOG_CLAIM.test(result.text);
+}
+
+/** Text of the bot's last stored message, or `null`. */
+function lastAssistantText(
+  turns: readonly MinimalCatalogTurn[],
+): string | null {
+  const messages = turns.at(-1)?.messages ?? [];
+  for (const message of [...messages].reverse()) {
+    if (message.role !== 'assistant') continue;
+    const text =
+      typeof message.content === 'string'
+        ? message.content
+        : message.content
+            .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+            .join('\n');
+    if (text.trim().length > 0) return text;
+  }
+  return null;
+}
+
+/** The customer's own text turns, oldest first. */
+function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
+  return turns.flatMap((turn) =>
+    turn.messages.flatMap((message) => {
+      if (message.role !== 'user') return [];
+      if (typeof message.content === 'string') return [message.content];
+      return message.content.flatMap((part) =>
+        part.type === 'text' ? [part.text] : [],
+      );
+    }),
+  );
 }
 
 // Minimal SDK route: in-memory catalog history; optional durable cart and human
@@ -510,7 +588,13 @@ export class MinimalCatalogAgentService {
       // Any turn after a summary spends its consent, even a rejected one.
       this.interrupted.add(input.senderId);
       this.order?.dismiss(input.senderId);
-      return { kind: 'handled', reply: BUSY_REPLY };
+      return {
+        kind: 'handled',
+        reply: applyCustomerStyle(
+          BUSY_REPLY,
+          this.customerStyle(input.senderId, input.text),
+        ),
+      };
     }
     this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
@@ -528,17 +612,21 @@ export class MinimalCatalogAgentService {
         if (consumed !== null) {
           // An order SÍ binds only to the reply right after its summary.
           this.order?.dismiss(input.senderId);
+          const reply = applyCustomerStyle(
+            consumed.reply,
+            this.customerStyle(input.senderId, input.text),
+          );
           this.recordTurn(
             input.senderId,
             [
               { role: 'user', content: input.text },
-              { role: 'assistant', content: consumed.reply },
+              { role: 'assistant', content: reply },
             ],
             [],
           );
           return {
             kind: 'handled',
-            reply: consumed.reply,
+            reply,
             ...(consumed.onSent === undefined
               ? {}
               : { onSent: consumed.onSent }),
@@ -546,23 +634,34 @@ export class MinimalCatalogAgentService {
         }
       }
       if (this.checkoutAvailable()) {
-        const delivery = await this.checkout!.consume(input);
+        let delivery = await this.checkout!.consume(input);
         if (delivery !== null) this.order?.dismiss(input.senderId);
+        // F1: confirmed delivery data continue straight to the order summary.
+        if (delivery?.confirmed === true && this.orderAvailable())
+          delivery = await this.continueToOrder(
+            input.senderId,
+            input.inboundEvent,
+            delivery.reply,
+          );
         const answered =
           delivery ??
           (this.orderAvailable() ? await this.order!.consume(input) : null);
         if (answered !== null) {
+          const reply = applyCustomerStyle(
+            answered.reply,
+            this.customerStyle(input.senderId, input.text),
+          );
           this.recordTurn(
             input.senderId,
             [
               { role: 'user', content: input.text },
-              { role: 'assistant', content: answered.reply },
+              { role: 'assistant', content: reply },
             ],
             [],
           );
           return {
             kind: 'handled',
-            reply: answered.reply,
+            reply,
             ...(answered.onSent === undefined
               ? {}
               : { onSent: answered.onSent }),
@@ -592,6 +691,9 @@ export class MinimalCatalogAgentService {
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
+    // S2: the customer's own turns in this session decide the reply style.
+    const style = detectCustomerStyle([...customerTexts(turns), input.text]);
+    const styled = (text: string) => applyCustomerStyle(text, style);
     // Rebuild this sender's bounded selection registry and pending cart intent
     // from the last stored turn. Refs are deterministic digests, so a restored
     // snapshot resolves exactly the identities the previous turn registered.
@@ -604,6 +706,10 @@ export class MinimalCatalogAgentService {
           ),
           input.text,
           previousCartContext?.pending ?? null,
+          {
+            previousAssistantText: lastAssistantText(turns),
+            recentCustomerTexts: customerTexts(turns).slice(-3),
+          },
         )
       : null;
     const persistedCartContext = ():
@@ -696,13 +802,13 @@ export class MinimalCatalogAgentService {
           'No realizas compras, ventas, pagos ni cambios de datos.',
           'Puede mantener el carrito; no realiza ventas, pagos ni reservas de inventario.',
         ) +
-        '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Use getCart para consultarlo, también después de un reinicio. ' +
+        '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Al encontrar un producto ofrezca un solo siguiente paso claro ("¿Se lo agrego al carrito?"; de tú: "¿Te lo agrego al carrito?"); no pregunte por la entrega ni por recoger en tienda antes de que haya carrito. Use getCart para consultarlo, también después de un reinicio. ' +
         'Las herramientas de carrito usan selectionRef, NO un productId/variantId: copie el cartSelectionRef EXACTO que devolvió searchCatalog/checkStock/getCart para ese producto o presentación; nunca invente ni reutilice una referencia de otro renglón. ' +
         'Use setCartItem con la presentación elegida y la cantidad TOTAL deseada (quantity), no un incremento. ' +
         'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total; un delta positivo también crea un renglón nuevo. ' +
         'En ambas, quantityText debe ser el fragmento LITERAL del mensaje actual que respalda el número (por ejemplo "2", "una"); si no lo cita, la aplicación pedirá aclaración. ' +
         'Interprete lenguaje cotidiano: «Agrega 2» suma dos con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
-        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Solo deja las croquetas», «quita todo lo demás» o «que solo contenga las croquetas»: llame getCart si hace falta, luego keepOnlyCartItems con keepSelectionRefs: los cartSelectionRef de cada renglón que se queda, obtenidos de getCart en este turno; nunca elimine renglones uno por uno para esa solicitud. «Quita el ibuprofeno» elimina un renglón completo: llame setCartItem(quantity: 0, quantityText: null) para ese renglón; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
+        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Solo deja las croquetas», «quita todo lo demás» o «que solo contenga las croquetas»: llame getCart si hace falta, luego keepOnlyCartItems con keepSelectionRefs: los cartSelectionRef de cada renglón que se queda, obtenidos de getCart en este turno; nunca elimine renglones uno por uno para esa solicitud. «Quita el ibuprofeno» elimina un renglón completo: llame setCartItem(quantity: 0, quantityText: null) para ese renglón; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. Cuando el producto y su presentación ya estén identificados (el que acaba de mostrar, el único renglón del carrito o la presentación que eligió el cliente), use directamente adjustCartItem o setCartItem: «Agrégame uno», «agrégalo», «sí, agréguela», «quiero 2», «dame dos» o «sí» a su pregunta "¿Se lo agrego al carrito?" agregan ese producto; si el cliente no dijo cantidad, use delta: null y quantityText: null (la aplicación agrega 1 y lo dice). «Cambia la cantidad a 2» fija el total con setCartItem. prepareCartItem es solo para conservar una cantidad explícita mientras falta elegir la presentación; si la selección ya está resuelta la aplicación la agrega de verdad. Nunca diga que registró la intención ni que algo quedó en el carrito: la aplicación confirma el carrito real. Si mostró varios productos o presentaciones y el cliente no dijo cuál, pregunte cuál, sin elegir por él. ' +
         'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
         'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
         '«Sí, la de 500mg» elige una presentación, NO una cantidad: si no hay cantidad pendiente, use adjustCartItem(delta: null, quantityText: null) para conservar la selección y preguntar cuántas unidades. «Un ibuprofeno de 500» indica una unidad: cite "un", no la dosis. Nunca use setCartItem(quantity: 0) para elegir presentación. ' +
@@ -731,12 +837,17 @@ export class MinimalCatalogAgentService {
         selectionContext +
         pendingContext
       : baseInstructions;
-    const result = await this.generateTextFn({
+    const generateParams = {
       model: openai(this.model),
-      system: SYSTEM_PROMPT + '\n\n' + cartInstructions,
+      system:
+        SYSTEM_PROMPT +
+        '\n\n' +
+        cartInstructions +
+        '\n\n' +
+        customerStyleDirective(style),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
-        { role: 'user', content: input.text },
+        { role: 'user' as const, content: input.text },
       ],
       tools: this.buildTools(
         allowedIds,
@@ -750,20 +861,54 @@ export class MinimalCatalogAgentService {
         checkoutRun,
       ),
       stopWhen: stepCountIs(this.maxSteps),
-    });
+    };
+    // G2: the checkout reached shipping before this run (quote or pickup).
+    const priorShipping =
+      this.cart !== undefined &&
+      checkoutRun !== null &&
+      this.shippingAvailable()
+        ? await this.cart.shippingMode(input.senderId)
+        : null;
+    let result = await this.generateTextFn(generateParams);
     this.costGuard.record({
       promptTokens: result.usage?.inputTokens ?? 0,
       completionTokens: result.usage?.outputTokens ?? 0,
     });
+    if (ungroundedCatalogClaim(result)) {
+      // F8: a catalog claim with no catalog read in this run is unverified.
+      // Rerun once with the first step forced to search; tools are untouched
+      // because no tool ran.
+      traceLog(
+        this.logger,
+        `minimal_catalog catalog_claim_without_read retry=forced_search trace=${traceId}`,
+      );
+      result = await this.generateTextFn({
+        ...generateParams,
+        prepareStep: ({ stepNumber }: { stepNumber: number }) =>
+          stepNumber === 0
+            ? {
+                toolChoice: {
+                  type: 'tool' as const,
+                  toolName: 'searchCatalog' as const,
+                },
+              }
+            : undefined,
+      });
+      this.costGuard.record({
+        promptTokens: result.usage?.inputTokens ?? 0,
+        completionTokens: result.usage?.outputTokens ?? 0,
+      });
+    }
     const prepared = restockRun?.outcome ?? null;
     const expirationResult = expirationReply?.value ?? null;
     if (expirationResult !== null || prepared !== null) {
       // EXPIRATION takes priority; an unsent RESTOCK offer must not be armed.
-      const reply =
+      const reply = styled(
         expirationResult ??
-        (prepared?.kind === 'offer'
-          ? prepared.question
-          : RESTOCK_CAUTIOUS_REPLY);
+          (prepared?.kind === 'offer'
+            ? prepared.question
+            : RESTOCK_CAUTIOUS_REPLY),
+      );
       this.recordTurn(
         input.senderId,
         [
@@ -782,15 +927,22 @@ export class MinimalCatalogAgentService {
       // The server-owned presentation follows any cart acknowledgement or
       // invalid-cart clarification so neither is lost; the model never
       // authors a checkout outcome.
+      // A plain cart read adds nothing to the checkout presentation, which
+      // already states the cart (and would repeat "Su carrito está vacío.").
       const cartPart =
-        (cartReply.source === 'reviewCheckout' ? null : cartReply.value) ??
+        (cartReply.source === 'cart' &&
+        cartReply.value !== null &&
+        !checkoutResult.reply.includes(cartReply.value)
+          ? cartReply.value
+          : null) ??
         (this.hasInvalidCartToolCall(result)
           ? CART_OPERATION_CLARIFICATION
           : null);
-      const reply =
+      const reply = styled(
         cartPart === null
           ? checkoutResult.reply
-          : `${cartPart}\n\n${checkoutResult.reply}`;
+          : `${cartPart}\n\n${checkoutResult.reply}`,
+      );
       this.recordTurn(
         input.senderId,
         [
@@ -804,17 +956,41 @@ export class MinimalCatalogAgentService {
         ? { reply }
         : { reply, onSent: checkoutResult.onSent };
     }
-    if (cartReply.value !== null) {
+    const continued =
+      cartReply.mutated === true && priorShipping !== null
+        ? await this.continueAfterCartChange(
+            input.senderId,
+            input.inboundEvent,
+            priorShipping,
+          )
+        : null;
+    if (continued !== null) {
+      const reply = styled(continued.reply);
       this.recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
-          { role: 'assistant', content: cartReply.value },
+          { role: 'assistant', content: reply },
         ],
         [...currentIds],
         persistedCartContext(),
       );
-      return { reply: cartReply.value };
+      return continued.onSent === undefined
+        ? { reply }
+        : { reply, onSent: continued.onSent };
+    }
+    if (cartReply.value !== null) {
+      const reply = styled(cartReply.value);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return { reply };
     }
     if (this.hasInvalidCartToolCall(result)) {
       // A cart tool whose arguments failed SDK validation never executed; the
@@ -824,40 +1000,196 @@ export class MinimalCatalogAgentService {
         this.logger,
         `minimal_catalog tool cart argument rejected before execute trace=${traceId}`,
       );
+      const reply = styled(CART_OPERATION_CLARIFICATION);
       this.recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
-          { role: 'assistant', content: CART_OPERATION_CLARIFICATION },
+          { role: 'assistant', content: reply },
         ],
         [...currentIds],
         persistedCartContext(),
       );
-      return { reply: CART_OPERATION_CLARIFICATION };
+      return { reply };
     }
     if (this.hasInvalidToolCall(result, CHECKOUT_TOOL_NAMES)) {
       traceLog(
         this.logger,
         `minimal_catalog tool checkout argument rejected before execute trace=${traceId}`,
       );
+      const reply = styled(CHECKOUT_TOOL_CLARIFICATION);
       this.recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
-          { role: 'assistant', content: CHECKOUT_TOOL_CLARIFICATION },
+          { role: 'assistant', content: reply },
         ],
         [...currentIds],
         persistedCartContext(),
       );
-      return { reply: CHECKOUT_TOOL_CLARIFICATION };
+      return { reply };
+    }
+    let text = result.text;
+    let responseMessages: ModelMessage[] = result.responseMessages;
+    if (text.trim() === '') {
+      // G1: the step budget ended on tool calls. One tool-free render with
+      // the gathered results; a customer never gets silence.
+      traceLog(
+        this.logger,
+        `minimal_catalog empty_reply retry=render_without_tools trace=${traceId}`,
+      );
+      const rendered = await this.renderWithoutTools(
+        generateParams,
+        responseMessages,
+      );
+      if (rendered !== null) {
+        text = rendered.text;
+        responseMessages = [...responseMessages, ...rendered.responseMessages];
+      }
+    }
+    if (IMITATED_CONFIRMATION.test(text)) {
+      // The model wrote its own delivery or order summary: no gate is armed
+      // for it, so run the real step instead of sending the imitation.
+      traceLog(
+        this.logger,
+        `minimal_catalog imitated_confirmation replaced=real_step trace=${traceId}`,
+      );
+      const real = await this.realConfirmationStep(
+        input.senderId,
+        input.inboundEvent,
+      );
+      const reply = styled(real.reply);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return real.onSent === undefined
+        ? { reply }
+        : { reply, onSent: real.onSent };
+    }
+    if (text.trim() === '') {
+      const reply = styled(EMPTY_REPLY_FALLBACK);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return { reply };
     }
     this.recordTurn(
       input.senderId,
-      [{ role: 'user', content: input.text }, ...result.responseMessages],
+      [{ role: 'user', content: input.text }, ...responseMessages],
       [...currentIds],
       persistedCartContext(),
     );
-    return { reply: result.text };
+    // The prompt styles model text; only the emoji guard applies here.
+    return { reply: limitCustomerEmojis(text, style) };
+  }
+
+  /**
+   * G1: one extra model call with the run's tool results and no tool
+   * execution possible (tools without `execute`, toolChoice 'none').
+   * `null` when the call fails; usage is booked when it returns.
+   */
+  private async renderWithoutTools(
+    params: Parameters<GenerateTextFn>[0] & {
+      messages: ModelMessage[];
+      tools: Record<string, object>;
+    },
+    gathered: ModelMessage[],
+  ): Promise<{ text: string; responseMessages: ModelMessage[] } | null> {
+    try {
+      const tools = Object.fromEntries(
+        Object.entries(params.tools).map(([name, definition]) => [
+          name,
+          { ...definition, execute: undefined },
+        ]),
+      );
+      const rendered = await this.generateTextFn({
+        ...params,
+        messages: [...params.messages, ...gathered],
+        tools: tools as never,
+        toolChoice: 'none',
+        stopWhen: stepCountIs(1),
+      } as never);
+      this.costGuard.record({
+        promptTokens: rendered.usage?.inputTokens ?? 0,
+        completionTokens: rendered.usage?.outputTokens ?? 0,
+      });
+      return {
+        text: rendered.text,
+        responseMessages: rendered.responseMessages,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * G2: the server-owned step a model-written summary imitated: the order
+   * summary (which presents the delivery-data confirmation itself while the
+   * data are unconfirmed), or the delivery confirmation without orders.
+   */
+  private async realConfirmationStep(
+    senderId: string,
+    inboundEvent: unknown,
+  ): Promise<MinimalCheckoutReply> {
+    try {
+      if (this.orderAvailable())
+        return await this.continueToOrder(senderId, inboundEvent, null);
+      if (this.checkoutAvailable())
+        return await this.checkout!.prepareConfirmation(senderId, inboundEvent);
+    } catch {
+      // Fall through to the clarification; the imitation is never sent.
+    }
+    return { reply: EMPTY_REPLY_FALLBACK };
+  }
+
+  /**
+   * G2: after a cart change, a checkout that already reached shipping
+   * continues to the UPDATED order summary (re-choosing pickup, or
+   * re-quoting delivery because the change dropped the old quote).
+   * `null` keeps the plain cart reply.
+   */
+  private async continueAfterCartChange(
+    senderId: string,
+    inboundEvent: unknown,
+    mode: 'pickup' | 'delivery',
+  ): Promise<MinimalCheckoutReply | null> {
+    try {
+      if (
+        mode === 'pickup' &&
+        (await this.shipping!.chooseStorePickup(senderId)).kind !== 'pickup'
+      )
+        return null;
+      return await this.continueToOrder(
+        senderId,
+        inboundEvent,
+        CART_UPDATED_LEAD,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * S2: the style of this sender's own messages in the current session plus
+   * the current one. The dispatcher uses it for media replies.
+   */
+  customerStyle(senderId: string, currentText?: string): CustomerStyle {
+    const texts = customerTexts(this.sessionStore.read(senderId));
+    return detectCustomerStyle(
+      currentText === undefined ? texts : [...texts, currentText],
+    );
   }
 
   /**
@@ -928,6 +1260,46 @@ export class MinimalCatalogAgentService {
 
   private orderAvailable(): boolean {
     return this.order !== undefined && this.order.enabled;
+  }
+
+  /**
+   * F1: the next deterministic step after confirmed delivery data, a quote or
+   * a pickup choice: the order summary (quoting the confirmed address first
+   * when no current shipping choice exists). `lead` precedes it; the order
+   * gate still needs its own SÍ. Reuses the existing order and shipping gates.
+   */
+  private async continueToOrder(
+    senderId: string,
+    inboundEvent: unknown,
+    lead: string | null,
+  ): Promise<MinimalCheckoutReply> {
+    const join = (...parts: Array<string | null>) =>
+      parts.filter((part): part is string => part !== null).join('\n\n');
+    const withLead = (
+      prefix: string | null,
+      prepared: MinimalCheckoutReply,
+    ): MinimalCheckoutReply =>
+      prepared.onSent === undefined
+        ? { reply: join(prefix, prepared.reply) }
+        : { reply: join(prefix, prepared.reply), onSent: prepared.onSent };
+    const first = await this.order!.prepareOrder(senderId, inboundEvent);
+    if (
+      first.reply !== MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY ||
+      !this.shippingAvailable()
+    )
+      return withLead(lead, first);
+    let quoted: MinimalShippingResult;
+    try {
+      quoted = await this.shipping!.quote(senderId);
+    } catch {
+      quoted = { kind: 'unavailable' };
+    }
+    const shippingLine = minimalShippingReply(quoted);
+    if (quoted.kind !== 'quoted') return { reply: join(lead, shippingLine) };
+    return withLead(
+      join(lead, shippingLine),
+      await this.order!.prepareOrder(senderId, inboundEvent),
+    );
   }
 
   private hasInvalidToolCall(
@@ -1078,6 +1450,7 @@ export class MinimalCatalogAgentService {
               return toolError('restock_unavailable');
             }
           };
+    const stockReads = new Map<string, unknown>();
     const readTools = {
       searchCatalog: tool({
         description:
@@ -1115,6 +1488,12 @@ export class MinimalCatalogAgentService {
           if (!allowedIds.has(productId)) {
             trace('tool checkStock result=denied code=unknown_product');
             return toolError('unknown_product');
+          }
+          // G1: a repeated identical read in one run reuses the first answer.
+          const cached = stockReads.get(productId);
+          if (cached !== undefined) {
+            trace('tool checkStock result=cached');
+            return cached;
           }
           try {
             const stock = await chatbotApi.getStock(productId);
@@ -1166,6 +1545,7 @@ export class MinimalCatalogAgentService {
               // Canonical non-variant input: NO `variantId` field is built.
               await prepareOnce(productId);
             }
+            stockReads.set(productId, result);
             return result;
           } catch {
             trace('tool checkStock result=error code=stock_unavailable');
@@ -1199,12 +1579,18 @@ export class MinimalCatalogAgentService {
       )
         return;
       cartReply.value = message;
-      cartReply.source = kind === 'reviewCheckout' ? 'reviewCheckout' : 'cart';
+      cartReply.source =
+        kind === 'reviewCheckout'
+          ? 'reviewCheckout'
+          : kind === 'read'
+            ? 'read'
+            : 'cart';
       if (kind !== 'read') clarificationAcknowledged = true;
     };
     const applyIntent = async (
       identity: ResolvedCartSelection,
       intent: MinimalCartQuantityIntent,
+      defaulted = false,
     ): Promise<MinimalCartResult> => {
       if (cart === undefined || conversation === null)
         return { ok: false, error: 'cart_unavailable' };
@@ -1229,8 +1615,12 @@ export class MinimalCatalogAgentService {
           traceInvalidVariant('adjustCartItem'),
         );
         traceCartResult('adjustCartItem', result);
-        cartReply.value = minimalCartReply(result);
+        cartReply.value =
+          defaulted && result.ok
+            ? `${CART_DEFAULT_UNIT_NOTE}\n\n${minimalCartReply(result)}`
+            : minimalCartReply(result);
         cartReply.source = 'cart';
+        cartReply.mutated = result.ok && result.items.length > 0;
         mutationAcknowledged = true;
         return result;
       }
@@ -1246,8 +1636,24 @@ export class MinimalCatalogAgentService {
       traceCartResult('setCartItem', result);
       cartReply.value = minimalCartReply(result);
       cartReply.source = 'cart';
+      cartReply.mutated = result.ok && result.items.length > 0;
       mutationAcknowledged = true;
       return result;
+    };
+    // F10: a cart tool on a message with no cart request at all ("Quiero
+    // comprar.", a yes to another question) is a misplaced call, not a
+    // rejected request: with an empty cart and several products still open,
+    // repeat the product question; otherwise tell the model to continue with
+    // the purchase without touching the cart. Never the generic rejection.
+    const misplacedCartCall = (lines: readonly CartLineIdentity[]) => {
+      if (conversation === null || conversation.hasCartRequest()) return null;
+      const question =
+        lines.length === 0 ? conversation.openProductQuestion() : null;
+      if (question !== null) acknowledge(question);
+      trace(`cart_grounding result=no_cart_request reask=${question !== null}`);
+      return toolError(
+        question === null ? 'no_cart_request' : 'cart_target_ambiguous',
+      );
     };
     const handleMutation = async (
       identity: ResolvedCartSelection,
@@ -1264,11 +1670,14 @@ export class MinimalCatalogAgentService {
       // operation in the same run, and it never overwrites the first reply.
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
-      const grounded = conversation.ground(identity, proposal);
+      const lines = (await cart?.storedLines(context.senderId)) ?? [];
+      const grounded = conversation.ground(identity, proposal, lines);
       trace(
         `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
       );
       if (grounded.kind === 'invalid_evidence') {
+        const misplaced = misplacedCartCall(lines);
+        if (misplaced !== null) return misplaced;
         acknowledge(CART_OPERATION_CLARIFICATION);
         return toolError('invalid_cart_evidence');
       }
@@ -1276,7 +1685,17 @@ export class MinimalCatalogAgentService {
         acknowledge(CART_QUANTITY_QUESTION);
         return toolError('cart_quantity_required');
       }
-      return applyIntent(identity, grounded.intent);
+      if (grounded.kind === 'target_required') {
+        acknowledge(grounded.question);
+        return toolError('cart_target_ambiguous');
+      }
+      if (attemptedLines.has(lineKey(grounded.selection)))
+        return toolError('cart_line_settled');
+      return applyIntent(
+        grounded.selection,
+        grounded.intent,
+        grounded.defaulted,
+      );
     };
     const withCart = cart
       ? {
@@ -1386,6 +1805,7 @@ export class MinimalCatalogAgentService {
               );
               cartReply.value = minimalCartReply(result);
               cartReply.source = 'cart';
+              cartReply.mutated = result.ok && result.items.length > 0;
               mutationAcknowledged = true;
               return result;
             },
@@ -1482,7 +1902,7 @@ export class MinimalCatalogAgentService {
               CART_VARIANT_GUIDANCE,
             inputSchema: cartPrepareToolInput,
             strict: true,
-            execute: ({
+            execute: async ({
               selectionRef,
               operation,
               quantity,
@@ -1500,30 +1920,34 @@ export class MinimalCatalogAgentService {
               }
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
-              const grounded = conversation.prepare(identity, {
-                operation,
-                quantity,
-                quantityText,
-                continuation,
-              });
+              const lines = (await cart.storedLines(context.senderId)) ?? [];
+              const grounded = conversation.prepare(
+                identity,
+                { operation, quantity, quantityText, continuation },
+                lines,
+              );
               trace(
                 `cart_grounding tool=prepareCartItem mode=${operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
               );
               if (grounded.kind === 'ready') {
-                if (
-                  identity.variantId === undefined &&
-                  conversation
-                    .snapshot()
-                    .selections.some(
-                      (selection) =>
-                        selection.productId === identity.productId &&
-                        selection.variantId !== undefined,
-                    )
-                )
-                  acknowledge(CART_PRESENTATION_QUESTION);
+                // F7: a resolved selection is a real write, never a silent
+                // "intention" the customer believes is in the cart.
+                if (conversation.isFinalSelection(grounded.selection)) {
+                  if (attemptedLines.has(lineKey(grounded.selection)))
+                    return toolError('cart_line_settled');
+                  return applyIntent(
+                    grounded.selection,
+                    grounded.intent,
+                    grounded.defaulted,
+                  );
+                }
+                acknowledge(
+                  conversation.presentationQuestion(identity.productId),
+                );
                 return {
                   ok: true as const,
                   prepared: true as const,
+                  cartUnchanged: true as const,
                   operation: grounded.intent.operation,
                   quantity: grounded.intent.quantity ?? null,
                 };
@@ -1532,6 +1956,12 @@ export class MinimalCatalogAgentService {
                 acknowledge(CART_QUANTITY_QUESTION);
                 return toolError('cart_quantity_required');
               }
+              if (grounded.kind === 'target_required') {
+                acknowledge(grounded.question);
+                return toolError('cart_target_ambiguous');
+              }
+              const misplaced = misplacedCartCall(lines);
+              if (misplaced !== null) return misplaced;
               acknowledge(CART_OPERATION_CLARIFICATION);
               return toolError('invalid_cart_evidence');
             },
@@ -1587,6 +2017,13 @@ export class MinimalCatalogAgentService {
               inputSchema: checkoutDetailsToolInput,
               strict: true,
               execute: async (patch) => {
+                // F3: a bare affirmative carries no new delivery data.
+                if (classifyConfirmationReply(context.text) === 'accept') {
+                  trace(
+                    'tool updateCheckoutDetails result=error code=no_details_in_message',
+                  );
+                  return toolError('no_details_in_message');
+                }
                 const result = await checkout.updateDetails(
                   context.senderId,
                   patch,
@@ -1606,10 +2043,20 @@ export class MinimalCatalogAgentService {
                 if (checkoutRun.attempted)
                   return toolError('checkout_presentation_settled');
                 checkoutRun.attempted = true;
-                const prepared = await checkout.prepareConfirmation(
-                  context.senderId,
-                  context.inboundEvent,
-                );
+                // F1: confirmed, unchanged data are never re-presented; the
+                // flow moves on to the order summary instead.
+                const prepared =
+                  this.orderAvailable() &&
+                  (await checkout.confirmedDraft(context.senderId)) !== null
+                    ? await this.continueToOrder(
+                        context.senderId,
+                        context.inboundEvent,
+                        null,
+                      )
+                    : await checkout.prepareConfirmation(
+                        context.senderId,
+                        context.inboundEvent,
+                      );
                 checkoutRun.value = prepared;
                 trace(
                   `tool confirmCheckoutDetails result=${prepared.onSent === undefined ? 'blocked' : 'offer'}`,
@@ -1635,9 +2082,14 @@ export class MinimalCatalogAgentService {
                         const result = await this.shipping!.quote(
                           context.senderId,
                         );
-                        checkoutRun.value = {
-                          reply: minimalShippingReply(result),
-                        };
+                        checkoutRun.value =
+                          result.kind === 'quoted'
+                            ? await this.continueToOrder(
+                                context.senderId,
+                                context.inboundEvent,
+                                minimalShippingReply(result),
+                              )
+                            : { reply: minimalShippingReply(result) };
                         return {
                           ok: result.kind === 'quoted',
                           presentedByApplication: true,
@@ -1668,9 +2120,14 @@ export class MinimalCatalogAgentService {
                         const result = await this.shipping!.chooseStorePickup(
                           context.senderId,
                         );
-                        checkoutRun.value = {
-                          reply: minimalPickupReply(result),
-                        };
+                        checkoutRun.value =
+                          result.kind === 'pickup'
+                            ? await this.continueToOrder(
+                                context.senderId,
+                                context.inboundEvent,
+                                minimalPickupReply(result),
+                              )
+                            : { reply: minimalPickupReply(result) };
                         return {
                           ok: result.kind === 'pickup',
                           presentedByApplication: true,

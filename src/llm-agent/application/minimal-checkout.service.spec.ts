@@ -1,3 +1,4 @@
+import { applyCustomerStyle } from '../domain/customer-style';
 import { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -13,6 +14,7 @@ import {
   MINIMAL_CHECKOUT_AMBIGUOUS_REPLY,
   MINIMAL_CHECKOUT_CHANGED_REPLY,
   MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+  MINIMAL_CHECKOUT_DECLINED_REPLY,
   MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
 } from '../domain/minimal-checkout-confirmation';
 import { CostGuardService } from './cost-guard.service';
@@ -564,6 +566,30 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
       expect(fn).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['claro', MINIMAL_CHECKOUT_CONFIRMED_REPLY],
+    ['no gracias', MINIMAL_CHECKOUT_DECLINED_REPLY],
+  ])(
+    '[S3] answers %j to the delivery summary deterministically',
+    async (text, expected) => {
+      const h = setup();
+      await collectComplete(h);
+      const offer = await h.turn(
+        'Listo',
+        [call('confirmCheckoutDetails'), say()],
+        EVENT('wamid.offer'),
+      );
+      (offer as { onSent: () => void }).onSent();
+      // The model would loop with a new summary; the gate answers first.
+      const reply = await h.turn(
+        text,
+        [call('confirmCheckoutDetails'), say('LLM')],
+        EVENT('wamid.reply'),
+      );
+      expect(reply).toEqual({ kind: 'handled', reply: expected });
+    },
+  );
+
   it('lets a mixed correction reach the model instead of confirming', async () => {
     const h = setup();
     await collectComplete(h);
@@ -643,6 +669,77 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     expect(h.checkout().confirmationStatus(SENDER)).toBeNull();
   });
 
+  // F3: the model copied the rendered "Calle: Av. Juárez 10" line back into
+  // `street`; the exterior number must not be duplicated into the street.
+  it.each([
+    ['street already carrying the number', { street: 'Av. Juárez 10' }],
+    ['number sign variant', { street: 'Av. Juárez #10' }],
+    [
+      'street and the same exterior number',
+      { street: 'Av. Juárez 10', exteriorNumber: '10' },
+    ],
+  ])(
+    '[F3] a %s keeps the confirmed saved address unchanged',
+    async (_name, patch) => {
+      const h = setup();
+      await h.turn('Quiero comprar', [lookup(), say()]);
+      const ref = firstRef(h.outputs[0]);
+      const offer = await h.turn(
+        'La primera',
+        [
+          call('selectCheckoutAddress', { addressRef: ref }),
+          call('confirmCheckoutDetails'),
+          say(),
+        ],
+        EVENT('wamid.offer'),
+      );
+      (offer as { onSent: () => void }).onSent();
+      await h.turn('Sí, por favor 🙏', [say()], EVENT('wamid.yes'));
+      const before = await h.draft();
+      await h.checkout().updateDetails(SENDER, details(patch, false));
+      expect(await h.draft()).toEqual(before);
+      expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+        stage: 'confirmed',
+      });
+      expect(await h.checkout().confirmedDraft(SENDER)).not.toBeNull();
+    },
+  );
+
+  it('[F3] a pending summary survives a no-op street echo, so the next SÍ confirms it', async () => {
+    const h = setup();
+    await h.turn('Quiero comprar', [lookup(), say()]);
+    const ref = firstRef(h.outputs[0]);
+    const offer = await h.turn(
+      'La primera',
+      [
+        call('selectCheckoutAddress', { addressRef: ref }),
+        call('confirmCheckoutDetails'),
+        say(),
+      ],
+      EVENT('wamid.offer'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    await h
+      .checkout()
+      .updateDetails(SENDER, details({ street: 'Av. Juárez 10' }, false));
+    expect(await h.turn('ok', [say()], EVENT('wamid.ok'))).toEqual({
+      kind: 'handled',
+      reply: MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+    });
+  });
+
+  it('[F3] an affirmative message never applies model-invented checkout details', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const before = await h.draft();
+    await h.turn('va', [
+      call('updateCheckoutDetails', details({ street: 'Calle 5 5' })),
+      say(),
+    ]);
+    expect(await h.draft()).toEqual(before);
+    expect(h.outputs[0]).toMatchObject({ ok: false });
+  });
+
   it('does not confirm, and re-presents the summary, when the acceptance CAS loses', async () => {
     const h = setup();
     await collectComplete(h);
@@ -707,7 +804,13 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
       EVENT('wamid.offer'),
     );
     const reply = (result as { reply: string }).reply;
-    expect(reply.startsWith(`${CART_OPERATION_CLARIFICATION}\n\n`)).toBe(true);
+    // S2: "Agrega y confirma" tutea, so the fixed copy comes back in tú.
+    const clarification = applyCustomerStyle(CART_OPERATION_CLARIFICATION, {
+      register: 'tu',
+      emojis: false,
+      tone: 'neutral',
+    });
+    expect(reply.startsWith(`${clarification}\n\n`)).toBe(true);
     expect(reply).toContain('Calle: Calle 5 S/N');
     expect(typeof (result as { onSent?: unknown }).onSent).toBe('function');
   });

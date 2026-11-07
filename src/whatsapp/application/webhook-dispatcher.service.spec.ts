@@ -24,6 +24,36 @@ import {
 import type { ActiveReceiptStatus } from '../../receipt-media/domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../../receipt-media/domain/receipt-media.types';
 import { type ReceiptIngressService } from '../../receipt-media/application/receipt-ingress.service';
+import type { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
+import type { ProductImageDescription } from '../../product-image/domain/product-image';
+
+const PLACED_SALE_ID = '5b0a7c1e-3f2d-4c8a-9e61-2d4f8b7a9c10';
+
+/** A customer whose order is placed and awaits the transfer receipt. */
+const placedSaleState = (senderId: string) => ({
+  senderId,
+  lastMessageAt: '2026-06-23T12:00:00.000Z',
+  data: {
+    minimalCart: {
+      items: [],
+      idempotencyKey: '',
+      placedSale: { saleId: PLACED_SALE_ID, folio: null, totalCents: 150_000 },
+    },
+  },
+});
+
+const RECEIPT_DESCRIPTION: ProductImageDescription = {
+  kind: 'receipt',
+  brand: null,
+  productName: null,
+  productType: null,
+  species: null,
+  size: null,
+  flavorOrVariant: null,
+  labelText: null,
+  searchQueries: [],
+  confidence: 'high',
+};
 
 const receiptMediaRowFixture = (id: string): ReceiptMediaRow =>
   ({ id }) as unknown as ReceiptMediaRow;
@@ -58,6 +88,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   let conversationStore: jest.Mocked<ConversationStore>;
   let ingress: jest.Mocked<ReceiptIngressService>;
   let minimalAgent: jest.Mocked<MinimalCatalogAgentService>;
+  let productImage: { recognize: jest.Mock };
 
   beforeEach(() => {
     jest.useFakeTimers();
@@ -148,6 +179,12 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         .mockResolvedValue({ kind: 'handled', reply: 'Hola' }),
     } as unknown as jest.Mocked<MinimalCatalogAgentService>;
 
+    // S5 product image recognition: download + vision describer. Default:
+    // the image is a receipt.
+    productImage = {
+      recognize: jest.fn().mockResolvedValue(RECEIPT_DESCRIPTION),
+    };
+
     service = new WebhookDispatcherService(
       runner,
       sender,
@@ -157,6 +194,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       conversationStore,
       ingress,
       minimalAgent,
+      productImage as unknown as ProductImageRecognitionService,
     );
   });
 
@@ -1017,7 +1055,8 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
-    it('media message: never reaches the agent (media ingress is WU13-B2)', async () => {
+    it('media message with a placed sale: never reaches the agent (media ingress is WU13-B2)', async () => {
+      conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
       await service.dispatch({
         object: 'whatsapp_business_account',
         entry: [
@@ -1049,6 +1088,11 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     // ─── WU13-B2: ReceiptIngressService customer media routing ─────────────────
     describe('WU13-B2: ReceiptIngressService customer media routing', () => {
+      // Images reach the receipt path only while an order awaits payment.
+      beforeEach(() => {
+        conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+      });
+
       const mediaEvent = (
         messageId: string,
         mediaType: 'image' | 'document',
@@ -1173,11 +1217,13 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
             'Envíenos su comprobante como imagen JPEG o PNG, o como PDF, de menos de 10 MB.',
         },
         {
+          // D6: customer copy, never the operator instruction.
           decision: {
             kind: 'no-placed-sale',
-            text: 'Primero registra la venta en el sistema.',
+            text: 'Recibí su comprobante. Para registrarlo primero necesitamos confirmar su pedido. ¿Qué producto desea?',
           },
-          expected: 'Primero registra la venta en el sistema.',
+          expected:
+            'Recibí su comprobante. Para registrarlo primero necesitamos confirmar su pedido. ¿Qué producto desea?',
         },
         {
           decision: {
@@ -1196,7 +1242,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           await service.dispatch(
             mediaEvent(
               `wamid.${c.decision.kind}`,
-              c.decision.kind === 'unsupported-media' ? 'document' : 'image',
+              c.decision.kind === 'unsupported-media' ||
+                c.decision.kind === 'no-placed-sale'
+                ? 'document'
+                : 'image',
             ),
           );
           expect(sender.sendText).toHaveBeenCalledWith({
@@ -1419,6 +1468,338 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expect(dedup.markSeen as jest.Mock).not.toHaveBeenCalled();
         expectNoAgentRun();
       });
+    });
+  });
+
+  // ─── S5: product image recognition routing ──────────────────────────────
+  describe('S5: product image routing', () => {
+    const CUSTOMER = '5215550001111';
+    const PRODUCT: ProductImageDescription = {
+      kind: 'product',
+      brand: 'Nupec',
+      productName: null,
+      productType: 'croquetas',
+      species: 'perro',
+      size: '18 kg',
+      flavorOrVariant: 'salmón',
+      labelText: null,
+      searchQueries: ['Nupec salmón 18 kg', 'croquetas Nupec'],
+      confidence: 'high',
+    };
+    const LABEL_REQUEST =
+      'No alcanzo a identificar el producto en la imagen. ¿Me puede enviar una foto más clara de la etiqueta o decirme el nombre del producto?';
+    const NAME_REQUEST =
+      'Recibí su imagen, pero no pude revisarla en este momento. ¿Me puede decir el nombre del producto que busca?';
+    const RECEIPT_WITHOUT_ORDER =
+      'Recibí su imagen, parece un comprobante de pago. Para registrarlo primero necesitamos confirmar su pedido. ¿Qué producto desea?';
+
+    const mediaEvent = (
+      messageId: string,
+      media:
+        | { type: 'image'; caption?: string; mime?: string }
+        | { type: 'document' },
+    ): WebhookEventDto => ({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: 'PNID-1' },
+                messages: [
+                  {
+                    id: messageId,
+                    from: CUSTOMER,
+                    timestamp: '1719000000',
+                    type: media.type,
+                    ...(media.type === 'image'
+                      ? {
+                          image: {
+                            id: 'media-p1',
+                            mime_type: media.mime ?? 'image/jpeg',
+                            ...(media.caption === undefined
+                              ? {}
+                              : { caption: media.caption }),
+                          },
+                        }
+                      : {
+                          document: {
+                            id: 'media-p1',
+                            mime_type: 'application/pdf',
+                          },
+                        }),
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const agentText = (): string => {
+      const [input] = minimalAgent.tryHandle.mock.calls[0];
+      return input.text;
+    };
+
+    it('no placed sale + product photo: agent turn with the synthetic description, never receipts', async () => {
+      productImage.recognize.mockResolvedValueOnce(PRODUCT);
+      minimalAgent.tryHandle.mockResolvedValueOnce({
+        kind: 'handled',
+        reply: 'Sí, tenemos Nupec salmón 18 kg.',
+      } as never);
+
+      await service.dispatch(
+        mediaEvent('wamid.p1', {
+          type: 'image',
+          caption: '¿Tienen este producto??',
+        }),
+      );
+
+      expect(productImage.recognize).toHaveBeenCalledWith({
+        providerMediaId: 'media-p1',
+        declaredMimeType: 'image/jpeg',
+      });
+      expect(ingress.admit).not.toHaveBeenCalled();
+      expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          senderId: CUSTOMER,
+          inboundEvent: {
+            receivingPhoneNumberId: 'PNID-1',
+            senderId: CUSTOMER,
+            messageId: 'wamid.p1',
+          },
+        }),
+      );
+      const text = agentText();
+      expect(text.startsWith('¿Tienen este producto??\n[Imagen enviada')).toBe(
+        true,
+      );
+      expect(text).toContain('marca Nupec');
+      expect(text).toContain('"Nupec salmón 18 kg"');
+      expect(text).toContain('productos similares reales del catálogo');
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: 'Sí, tenemos Nupec salmón 18 kg.',
+      });
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.p1');
+    });
+
+    it('no caption: defaults the customer text to "¿Tienen este producto?"', async () => {
+      productImage.recognize.mockResolvedValueOnce(PRODUCT);
+
+      await service.dispatch(mediaEvent('wamid.p2', { type: 'image' }));
+
+      expect(agentText().startsWith('¿Tienen este producto?\n[')).toBe(true);
+    });
+
+    it('placed sale + product question caption: product path, not receipts', async () => {
+      conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+      productImage.recognize.mockResolvedValueOnce(PRODUCT);
+
+      await service.dispatch(
+        mediaEvent('wamid.p3', { type: 'image', caption: '¿hay de este?' }),
+      );
+
+      expect(productImage.recognize).toHaveBeenCalledTimes(1);
+      expect(ingress.admit).not.toHaveBeenCalled();
+      expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+    });
+
+    it('placed sale + product question but the image is a receipt: receipt path', async () => {
+      conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+      productImage.recognize.mockResolvedValueOnce(RECEIPT_DESCRIPTION);
+
+      await service.dispatch(
+        mediaEvent('wamid.p4', { type: 'image', caption: '¿lo tienen?' }),
+      );
+
+      expect(ingress.admit).toHaveBeenCalledWith(
+        expect.objectContaining({ webhookMessageId: 'wamid.p4' }),
+      );
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+    });
+
+    it('placed sale + no caption: receipt path unchanged, no vision call', async () => {
+      conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+
+      await service.dispatch(mediaEvent('wamid.p5', { type: 'image' }));
+
+      expect(productImage.recognize).not.toHaveBeenCalled();
+      expect(ingress.admit).toHaveBeenCalledTimes(1);
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+    });
+
+    it('PDF document: receipt path unchanged, no vision call', async () => {
+      await service.dispatch(mediaEvent('wamid.p6', { type: 'document' }));
+
+      expect(productImage.recognize).not.toHaveBeenCalled();
+      expect(ingress.admit).toHaveBeenCalledWith(
+        expect.objectContaining({ declaredMimeType: 'application/pdf' }),
+      );
+    });
+
+    it('no placed sale + receipt-looking image: receipt-without-order reply, never the operator copy', async () => {
+      productImage.recognize.mockResolvedValueOnce(RECEIPT_DESCRIPTION);
+
+      await service.dispatch(mediaEvent('wamid.p7', { type: 'image' }));
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: RECEIPT_WITHOUT_ORDER,
+      });
+      expect(sender.sendText).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: 'Primero registra la venta en el sistema.',
+        }),
+      );
+      expect(ingress.admit).not.toHaveBeenCalled();
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.p7');
+    });
+
+    test.each([
+      ['unclear', { ...PRODUCT, kind: 'unclear' as const }],
+      ['other', { ...PRODUCT, kind: 'other' as const }],
+      [
+        'low confidence without brand or name',
+        {
+          ...PRODUCT,
+          brand: null,
+          productName: null,
+          confidence: 'low' as const,
+        },
+      ],
+    ])('%s: asks for a label photo or the product name', async (_l, desc) => {
+      productImage.recognize.mockResolvedValueOnce(desc);
+
+      await service.dispatch(mediaEvent('wamid.p8', { type: 'image' }));
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: LABEL_REQUEST,
+      });
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+      expect(ingress.admit).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ['timeout', { kind: 'unavailable', reason: 'timeout' }],
+      ['error', { kind: 'unavailable', reason: 'error' }],
+      ['unsupported', { kind: 'unavailable', reason: 'unsupported' }],
+    ])('describer %s: asks for the product name', async (_l, result) => {
+      productImage.recognize.mockResolvedValueOnce(result);
+
+      await service.dispatch(mediaEvent('wamid.p9', { type: 'image' }));
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: NAME_REQUEST,
+      });
+      expect(ingress.admit).not.toHaveBeenCalled();
+      expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.p9');
+    });
+
+    it('describer throwing unexpectedly: still asks for the product name', async () => {
+      productImage.recognize.mockRejectedValueOnce(new Error('boom'));
+
+      await service.dispatch(mediaEvent('wamid.p10', { type: 'image' }));
+
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: NAME_REQUEST,
+      });
+    });
+
+    describe('customer style (S2)', () => {
+      const TU = { register: 'tu', emojis: false, tone: 'casual' } as const;
+      beforeEach(() => {
+        (
+          minimalAgent as unknown as { customerStyle: jest.Mock }
+        ).customerStyle = jest.fn().mockReturnValue(TU);
+      });
+
+      it('answers an unclear product photo in tú for a customer who tutea', async () => {
+        productImage.recognize.mockResolvedValueOnce({
+          ...PRODUCT,
+          kind: 'unclear',
+        });
+
+        await service.dispatch(
+          mediaEvent('wamid.s1', { type: 'image', caption: '¿tienes este?' }),
+        );
+
+        expect(
+          (minimalAgent as unknown as { customerStyle: jest.Mock })
+            .customerStyle,
+        ).toHaveBeenCalledWith(CUSTOMER, '¿tienes este?');
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'No alcanzo a identificar el producto en la imagen. ¿Me puedes enviar una foto más clara de la etiqueta o decirme el nombre del producto?',
+        });
+      });
+
+      it('answers a receipt without order and an unavailable describer in tú', async () => {
+        productImage.recognize.mockResolvedValueOnce(RECEIPT_DESCRIPTION);
+        await service.dispatch(mediaEvent('wamid.s2', { type: 'image' }));
+        productImage.recognize.mockResolvedValueOnce({
+          kind: 'unavailable',
+          reason: 'error',
+        });
+        await service.dispatch(mediaEvent('wamid.s3', { type: 'image' }));
+
+        expect(sender.sendText).toHaveBeenNthCalledWith(1, {
+          to: CUSTOMER,
+          text: 'Recibí tu imagen, parece un comprobante de pago. Para registrarlo primero necesitamos confirmar tu pedido. ¿Qué producto quieres?',
+        });
+        expect(sender.sendText).toHaveBeenNthCalledWith(2, {
+          to: CUSTOMER,
+          text: 'Recibí tu imagen, pero no pude revisarla en este momento. ¿Me puedes decir el nombre del producto que buscas?',
+        });
+      });
+
+      it('answers receipt ingress guidance in tú', async () => {
+        ingress.admit.mockResolvedValueOnce({
+          kind: 'no-placed-sale',
+        } as never);
+        await service.dispatch(mediaEvent('wamid.s4', { type: 'document' }));
+
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Recibí tu comprobante. Para registrarlo primero necesitamos confirmar tu pedido. ¿Qué producto quieres?',
+        });
+      });
+
+      it('sends the pending-human reply in tú', async () => {
+        conversationStore.get.mockResolvedValue({
+          senderId: CUSTOMER,
+          lastMessageAt: '2026-06-23T12:00:00.000Z',
+          data: {
+            pendingHumanRequest: {
+              requestId: 'abc123def456',
+              ref: 'HF-abc123def456',
+              createdAt: '2026-06-23T12:00:00.000Z',
+              customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+            },
+          },
+        });
+        await service.dispatch(mediaEvent('wamid.s5', { type: 'document' }));
+
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Seguimos esperando la respuesta del equipo; te avisamos por aquí en cuanto la tengamos.',
+        });
+      });
+    });
+
+    it('duplicate image message: no vision call, no reply', async () => {
+      dedup.isDuplicate.mockResolvedValueOnce(true);
+
+      await service.dispatch(mediaEvent('wamid.p11', { type: 'image' }));
+
+      expect(productImage.recognize).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
     });
   });
 

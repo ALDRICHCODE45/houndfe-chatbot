@@ -13,10 +13,14 @@ import type { CartEvaluationResult } from '../../chatbot-api/domain/dtos/pricing
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
+  isMinimalPickup,
   minimalPickupSchema,
   minimalShippingQuoteSchema,
 } from '../domain/minimal-shipping';
-import { minimalPromotionSuffix } from '../domain/minimal-order-confirmation';
+import {
+  minimalLineLabel,
+  minimalPromotionSuffix,
+} from '../domain/minimal-order-confirmation';
 
 const lineSchema = z.strictObject({
   productId: z.uuid(),
@@ -130,6 +134,36 @@ export class MinimalCartService {
       return await this.quote(senderId, cart.items, onInvalidVariant);
     } catch {
       return { ok: false, error: 'cart_unavailable' };
+    }
+  }
+
+  /** Stored line identities without a backend read; `[]` when unreadable. */
+  async storedLines(
+    senderId: string,
+  ): Promise<Array<Pick<CartItem, 'productId' | 'variantId'>>> {
+    try {
+      const cart = this.read(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      return (cart?.items ?? []).map(({ productId, variantId }) => ({
+        productId,
+        ...(variantId ? { variantId } : {}),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** The stored shipping choice, if any; `null` when none or unreadable. */
+  async shippingMode(senderId: string): Promise<'pickup' | 'delivery' | null> {
+    try {
+      const shipping = parseMinimalCart(
+        (await this.store.get(senderId))?.data.minimalCart,
+      )?.shipping;
+      if (shipping === undefined) return null;
+      return isMinimalPickup(shipping) ? 'pickup' : 'delivery';
+    } catch {
+      return null;
     }
   }
 
@@ -526,7 +560,7 @@ export function minimalCartReply(result: MinimalCartResult): string {
   const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
   const lines = result.items.map(
     (i) =>
-      `• ${i.name}${i.variantName ? ` — ${i.variantName}` : ''}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}`,
+      `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}`,
   );
   return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`;
 }

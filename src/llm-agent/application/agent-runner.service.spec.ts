@@ -402,7 +402,7 @@ describe('AgentRunner', () => {
 
       expect(result).toEqual({
         reply:
-          'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+          'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.',
       });
       expect(llm.run).not.toHaveBeenCalled();
       expect(costGuard.currentAggregate).toBe(0);
@@ -426,7 +426,7 @@ describe('AgentRunner', () => {
       });
 
       expect(result.reply).toBe(
-        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+        'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.',
       );
       expect(llm.run).not.toHaveBeenCalled();
       expect(store.update).not.toHaveBeenCalled();

@@ -9,7 +9,10 @@ import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
-import { MinimalRestockRequestService } from './minimal-restock-request.service';
+import {
+  MinimalRestockRequestService,
+  minimalRestockProposal,
+} from './minimal-restock-request.service';
 import { deriveRestockSourceRequestId } from '../../human-decisions/domain/restock-source-identity';
 
 const SENDER = '5215550001111';
@@ -166,9 +169,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     ).resolves.toEqual({ kind: 'handled', reply: arbitrary });
     const system = String(captured[0].system);
     expect(system.startsWith(SYSTEM_PROMPT)).toBe(true);
-    expect(system).toContain(
-      '¡Hola! 😊 Encontré {nombre} en nuestro catálogo.',
-    );
+    expect(system).toContain('¡Hola! Encontré {nombre} en nuestro catálogo.');
+    expect(system).toContain('con los emojis del estilo del cliente');
+    expect(system).not.toContain('Saluda cálido de usted con un emoji ligero');
     expect(system).toContain('Por ahora, {nombre} está agotado.');
     expect(system).toContain('sin "¿en qué puedo ayudarle?"');
     expect(system).toContain('Sin cierre automático');
@@ -288,7 +291,12 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
   });
 
   it('logs closed status values and distinct deny/error codes', async () => {
-    const { service, chatbotApi, captured } = build(flow);
+    const { service, chatbotApi, captured } = build(
+      [1, 2, 3].flatMap((n) => [
+        call(`s${n}`, 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+      ]),
+    );
     const notManaged = {
       ...simpleStock,
       stock: { status: 'not_managed' as const, quantity: null },
@@ -306,14 +314,20 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     ).resolves.toMatchObject({
       stock: { status: 'not_managed', quantity: null },
     });
+    // A repeated read in one run reuses its first answer (G1), so each
+    // further outcome is read through a fresh run's tools.
+    const freshCheckStock = async () => {
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      return captured.at(-1)!.tools!.checkStock;
+    };
     chatbotApi.getStock.mockResolvedValueOnce({
       ...notManaged,
       stock: { status: 'bogus', quantity: 'x' },
     } as never);
-    await checkStock.execute({ productId: PRODUCT }, {});
+    await (await freshCheckStock()).execute({ productId: PRODUCT }, {});
     chatbotApi.getStock.mockRejectedValueOnce(new Error('leaked detail'));
     await expect(
-      checkStock.execute({ productId: PRODUCT }, {}),
+      (await freshCheckStock()).execute({ productId: PRODUCT }, {}),
     ).resolves.toEqual({ ok: false, error: 'stock_unavailable' });
     const joined = logs.join('\n');
     expect(joined).toContain(
@@ -393,6 +407,99 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     release();
     await expect(first).resolves.toEqual({ kind: 'handled', reply: 'hola' });
     expect(calls).toBe(1);
+  });
+
+  it('answers the busy reply in the tú style of a customer who tutea', async () => {
+    const model = new MockLanguageModelV4({
+      doGenerate: [say('hola')],
+    } as never);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const generate: GenerateTextFn = async (options) => {
+      await gate;
+      return generateText({ ...options, model });
+    };
+    const service = new MinimalCatalogAgentService(
+      {
+        searchCatalog: jest.fn(),
+        getStock: jest.fn(),
+      } as unknown as ChatbotApiClient,
+      generate,
+      new CostGuardService(1_000),
+      {
+        get: () => ({ model: 'm', maxSteps: 4, historyTurns: 12 }),
+      } as unknown as ConfigService,
+      new InMemoryMinimalCatalogSessionStore(),
+    );
+    const first = service.tryHandle({ senderId: SENDER, text: 'a' });
+    await expect(
+      service.tryHandle({
+        senderId: SENDER,
+        text: 'oye, ¿ya tienes mi respuesta?',
+      }),
+    ).resolves.toEqual({
+      kind: 'handled',
+      reply: 'Ya estoy atendiendo tu consulta; por favor espera mi respuesta.',
+    });
+    release();
+    await first;
+  });
+
+  describe('customer style mirroring (S2)', () => {
+    it('tells the model to stay usted, sober and emoji-free for a serious customer', async () => {
+      const { service, captured } = build([say('Buenos días.')]);
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'Buenos días, ¿me puede decir si tienen arena para gato?',
+      });
+      const system = String(captured[0].system);
+      expect(system.startsWith(SYSTEM_PROMPT)).toBe(true);
+      expect(system).toContain(
+        'Estilo del cliente: de usted, sin emojis, tono formal.',
+      );
+      expect(system).toContain('Responde de usted');
+      expect(system).toContain('tono profesional y sobrio');
+      expect(system).not.toContain('Responde de tú');
+    });
+
+    it('follows a customer who tutea and uses emojis across the session', async () => {
+      const { service, captured } = build([say('Hola'), say('Claro')]);
+      await service.tryHandle({ senderId: SENDER, text: 'hola 🐶' });
+      await service.tryHandle({
+        senderId: SENDER,
+        text: '¿tienes croquetas para cachorro?',
+      });
+      expect(String(captured[0].system)).toContain(
+        'Estilo del cliente: de usted, usa emojis, tono casual.',
+      );
+      const second = String(captured[1].system);
+      expect(second).toContain(
+        'Estilo del cliente: tutea, usa emojis, tono casual.',
+      );
+      expect(second).toContain('Responde de tú');
+      expect(second).toContain('1 emoji natural como máximo por mensaje');
+    });
+
+    it('never sends model emojis to a customer who uses none, and keeps them for one who does', async () => {
+      const { service } = build([
+        say('¡Claro! 😊 Tenemos croquetas.'),
+        say('¡Claro! 😊 Tenemos croquetas.'),
+      ]);
+      await expect(
+        service.tryHandle({ senderId: SENDER, text: '¿tienen croquetas?' }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply: '¡Claro! Tenemos croquetas.',
+      });
+      await expect(
+        service.tryHandle({ senderId: OTHER, text: '¿tienen croquetas? 🐶' }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply: '¡Claro! 😊 Tenemos croquetas.',
+      });
+    });
   });
 
   it('retains each turn through the injected session store, not a private map', async () => {
@@ -586,8 +693,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       ...simpleStock,
       stock: { status: 'out_of_stock', quantity: 0 },
     };
+    // S2: these customers write no emojis, so the fixed copy carries none.
     const QUESTION =
-      'Por ahora no tenemos «Ibuprofeno 400 mg» 😕. ¿Quiere que consulte si hay una fecha estimada de reposición?';
+      'Por ahora no tenemos «Ibuprofeno 400 mg». ¿Quiere que consulte si hay una fecha estimada de reposición?';
 
     const wire = () => {
       const instances: MinimalRestockRequestService[] = [];
@@ -694,7 +802,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       ).resolves.toEqual({
         kind: 'handled',
         reply:
-          '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
+          '¡Listo! Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
       });
       expect(w.coordinate).toHaveBeenCalledTimes(1);
       const [arg] = w.coordinate.mock.calls[0];
@@ -778,7 +886,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       ).resolves.toEqual({
         kind: 'handled',
         reply:
-          '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
+          '¡Listo! Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
       });
       expect(w.coordinate).toHaveBeenCalledTimes(1);
       const [coord] = w.coordinate.mock.calls[0];
@@ -1088,7 +1196,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       ).resolves.toEqual({
         kind: 'handled',
         reply:
-          '¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
+          '¡Listo! Ya quedó registrada su consulta sobre la reposición de «Ibuprofeno 400 mg». ¡Gracias!',
       });
       expect(w.coordinate).toHaveBeenCalledTimes(1);
       // Classifier call is tool-less and history-less, bound to the exact sent
@@ -1096,7 +1204,11 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       const classify = captured[2];
       expect(classify.tools).toBeUndefined();
       expect(classify.messages).toBeUndefined();
-      expect(String(classify.prompt)).toContain(QUESTION);
+      // The classifier reads the canonical pending question (usted copy);
+      // only the sent text is styled for the customer.
+      expect(String(classify.prompt)).toContain(
+        minimalRestockProposal('Ibuprofeno 400 mg'),
+      );
       expect(String(classify.prompt)).toContain(
         'sí, muchas gracias, me ayudaría mucho',
       );

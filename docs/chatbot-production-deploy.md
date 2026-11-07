@@ -16,20 +16,20 @@ Checklist for deploying `houndfe-chatbot` `main` to its VPS against the already-
 
 ## 3. Environment variables on the chatbot VPS
 
-| Variable | Value |
-|---|---|
-| `META_PHONE_NUMBER_ID` | Phone Number ID of the Meta test number |
-| `META_ACCESS_TOKEN` | A valid token (the temporary one lasts 24 h; a System User token is permanent) |
-| `META_APP_SECRET` | App secret (verifies webhook signatures) |
-| `META_VERIFY_TOKEN` | The same value registered in the Meta webhook settings |
-| `META_SANDBOX_RECIPIENT_NORMALIZATION` | `true` for the test number; remove or `false` for the real number |
-| `OPS_CHANNEL_PHONE` | WhatsApp ID (digits only) that receives human-attention notices; with the test number it must be a verified recipient |
-| `CHATBOT_API_BASE_URL` | Production backend URL |
-| `SERVICE_KEY` | The new production `svc_...` key |
-| `CHATBOT_API_BRANCH_ID` | Branch (tenant) id bound to the credential |
-| `CHATBOT_API_CASHIER_USER_ID` | Production cashier user id (member of that branch) |
-| `OPENAI_API_KEY`, `LLM_MODEL` | OpenAI key and model |
-| `DATABASE_URL` | The chatbot's own Postgres |
+| Variable                               | Value                                                                                                                 |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `META_PHONE_NUMBER_ID`                 | Phone Number ID of the Meta test number                                                                               |
+| `META_ACCESS_TOKEN`                    | A valid token (the temporary one lasts 24 h; a System User token is permanent)                                        |
+| `META_APP_SECRET`                      | App secret (verifies webhook signatures)                                                                              |
+| `META_VERIFY_TOKEN`                    | The same value registered in the Meta webhook settings                                                                |
+| `META_SANDBOX_RECIPIENT_NORMALIZATION` | `true` for the test number; remove or `false` for the real number                                                     |
+| `OPS_CHANNEL_PHONE`                    | WhatsApp ID (digits only) that receives human-attention notices; with the test number it must be a verified recipient |
+| `CHATBOT_API_BASE_URL`                 | Production backend URL                                                                                                |
+| `SERVICE_KEY`                          | The new production `svc_...` key                                                                                      |
+| `CHATBOT_API_BRANCH_ID`                | Branch (tenant) id bound to the credential                                                                            |
+| `CHATBOT_API_CASHIER_USER_ID`          | Production cashier user id (member of that branch)                                                                    |
+| `OPENAI_API_KEY`, `LLM_MODEL`          | OpenAI key and model                                                                                                  |
+| `DATABASE_URL`                         | The chatbot's own Postgres                                                                                            |
 
 Obsolete variables that can be deleted (ignored if left): `SKYDROPX_*`, `RECEIPT_STORAGE_*`, every former feature flag, `META_WABA_ID`, `META_API_VERSION`.
 

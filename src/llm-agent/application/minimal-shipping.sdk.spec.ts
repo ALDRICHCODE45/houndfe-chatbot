@@ -209,8 +209,13 @@ describe('minimal shipping SDK public seam', () => {
     expect(h.quotes.calls).toHaveLength(0);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
-  it('S4: earlier delivery presentation prevents quoting in the same run', async () => {
+  it('S4/F1: confirmed data continue to one quote; a second quote in the same run is refused', async () => {
     const h = await setup();
+    await h.turn('Datos y envío', [call('confirmCheckoutDetails'), call('requestShippingQuote'), say()]);
+    expect(h.quotes.calls).toHaveLength(1);
+  });
+  it('S4: an unconfirmed delivery presentation prevents quoting in the same run', async () => {
+    const h = await setup({ unconfirmed: true });
     await h.turn('Datos y envío', [call('confirmCheckoutDetails'), call('requestShippingQuote'), say()]);
     expect(h.quotes.calls).toHaveLength(0);
   });
@@ -239,7 +244,7 @@ describe('U4 customer shipping conversation', () => {
   it('[S3] SURCHARGE shows carrier, cost, credit, customer charge, ETA and the next step', () => {
     expect(quoted()).toBe(
       'Envío a domicilio con Envíos Perros (Estándar): $300.00 MXN. Usted tiene un crédito de $240.00 MXN por sus productos. Usted paga $60.00 MXN. ' +
-      'Llega en aproximadamente 4 días hábiles. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+      'Llega en aproximadamente 4 días hábiles.');
   });
   it('[S3] CARRIER_ONLY without credit or carrier omits those parts', () => {
     const reply = quoted({ zoneStatus: 'CARRIER_ONLY', creditCents: 0, customerChargeCents: 30000, option: null });
@@ -249,7 +254,7 @@ describe('U4 customer shipping conversation', () => {
   });
   it('[S3] FREE says there is no cost for that ZIP, with the ETA line', () => {
     expect(quoted({ zoneStatus: 'FREE', costCents: 0, creditCents: 0, customerChargeCents: 0, option: null, eta: { days: 1, reason: null } })).toBe(
-      'Su envío al código postal 06000 no tiene costo. Llega en aproximadamente 1 día hábil. Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+      'Su envío al código postal 06000 no tiene costo. Llega en aproximadamente 1 día hábil.');
   });
   it('[S7] STOCK_PENDING replaces the day count', () => {
     expect(quoted({ eta: { days: null, reason: 'STOCK_PENDING' } })).toContain(
@@ -291,7 +296,7 @@ describe('U4 customer shipping conversation', () => {
   });
   it('[S4] pickup replies', () => {
     expect(minimalPickupReply({ kind: 'pickup' })).toBe(
-      'Listo, usted recoge su pedido en tienda, sin costo de envío. Dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.');
+      'Listo, usted recoge su pedido en tienda, sin costo de envío.');
     expect(minimalPickupReply({ kind: 'refused', reason: 'cart_changed' })).not.toContain('Listo');
   });
   it('[S4] prompt: quote after confirmation, never invent costs, pickup on DENIED/PENDING, no approval', async () => {

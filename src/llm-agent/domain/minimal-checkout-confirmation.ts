@@ -4,8 +4,8 @@
  *
  * It does NOT register customers, edit saved addresses, create orders, reserve
  * stock or call shipping providers, and it performs no I/O. `prepare` only
- * OFFERS a server-owned summary; `consume` turns a strict, deterministic,
- * sender-bound affirmative into a server-owned CANDIDATE (never a
+ * OFFERS a server-owned summary; `consume` turns a deterministic,
+ * sender-bound affirmative (`classifyConfirmationReply`) into a server-owned CANDIDATE (never a
  * confirmation); `finalize` confirms locally ONLY after the caller reports the
  * real success of the existing `commitMinimalCheckoutDraft` raw-expected →
  * same-validated-draft CAS.
@@ -38,6 +38,7 @@ import {
   type MinimalCheckoutDraft,
 } from '../../conversation/domain/minimal-checkout-draft';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
+import { classifyConfirmationReply } from './confirmation-reply';
 
 /** Pending-confirmation TTL; mirrors the RESTOCK volatile lifecycle. */
 export const MINIMAL_CHECKOUT_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
@@ -47,7 +48,9 @@ export const MINIMAL_CHECKOUT_AMBIGUOUS_REPLY =
 export const MINIMAL_CHECKOUT_CHANGED_REPLY =
   'Sus datos de entrega cambiaron. Le mostraré el resumen actualizado para que lo confirme de nuevo.';
 export const MINIMAL_CHECKOUT_CONFIRMED_REPLY =
-  'Gracias. Confirmé sus datos de entrega para este chat. Esta confirmación no crea un pedido, no registra al cliente ni activa el envío. Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.';
+  'Gracias, sus datos de entrega quedaron confirmados.';
+export const MINIMAL_CHECKOUT_DECLINED_REPLY =
+  'Entendido, no confirmé sus datos de entrega. ¿Qué dato quiere corregir?';
 export const MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY =
   'No pude confirmar sus datos de entrega. Le mostraré el resumen actualizado para que lo confirme de nuevo.';
 
@@ -123,9 +126,8 @@ export function evaluateMinimalCheckoutReadiness(
 }
 
 /**
- * Deterministic server-owned confirmation summary. It states the local-only
- * scope explicitly so no order, registration or shipping activation is
- * implied.
+ * Deterministic server-owned confirmation summary. Short on purpose (F2):
+ * the order summary that follows asks its own explicit SÍ.
  */
 export function renderMinimalCheckoutConfirmation(
   draft: MinimalCheckoutDraft,
@@ -144,28 +146,8 @@ export function renderMinimalCheckoutConfirmation(
     `Ciudad o municipio: ${location ?? ''}`,
     `Estado: ${fields.state ?? ''}`,
     '',
-    'Esta confirmación es solo en este chat: no crea un pedido, no registra al cliente ni activa el envío.',
     'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',
   ].join('\n');
-}
-
-const AFFIRMATIVE = /^(?:si|sí)\.?$/i;
-const OUTER_SPACING = /^[ \t]+|[ \t]+$/g;
-const NEWLINES = /[\r\n]/;
-
-/**
- * Strict deterministic affirmative: only a whole `SI`/`SÍ` with optional outer
- * spaces/tabs and one optional trailing period. Concatenated text, corrections,
- * emoji, amounts, newlines or hostile input are not consent. No model
- * inference.
- */
-export function isAffirmative(raw: unknown): boolean {
-  try {
-    if (typeof raw !== 'string' || NEWLINES.test(raw)) return false;
-    return AFFIRMATIVE.test(raw.replace(OUTER_SPACING, ''));
-  } catch {
-    return false;
-  }
 }
 
 /** Deterministic canonical content used for exact pending binding. */
@@ -421,11 +403,12 @@ export class MinimalCheckoutConfirmation {
   }
 
   /**
-   * Interpret one inbound turn. A strict, trusted, fresh, armed affirmative
+   * Interpret one inbound turn. A deterministic, trusted, fresh, armed affirmative
    * whose current draft still matches the presented binding yields a candidate
    * ticket; it is still pending, not confirmed. A replay of the origin message
    * re-offers with a checked `onSent` and never confirms. Everything else
-   * returns `null` (unhandled) or a handled non-confirmation.
+   * returns `null` (unhandled) or a handled non-confirmation; a deterministic
+   * refusal drops the pending.
    */
   consume(input: MinimalCheckoutConsumeInput): MinimalCheckoutConsumeResult {
     try {
@@ -450,8 +433,14 @@ export class MinimalCheckoutConfirmation {
           onSent: this.armFor(senderId, pending),
         };
       }
-      // Only the current, strict, deterministic affirmative can ever confirm.
-      if (!isAffirmative(input.text)) return null;
+      // Only a deterministic whole-message affirmative can ever confirm; a
+      // refusal drops the offer without confirming anything.
+      const verdict = classifyConfirmationReply(input.text);
+      if (verdict === null) return null;
+      if (verdict === 'decline') {
+        this.pending.delete(senderId);
+        return { kind: 'handled', reply: MINIMAL_CHECKOUT_DECLINED_REPLY };
+      }
       if (expired || !trusted) return handledAmbiguous();
       if (!pending.armed) return handledAmbiguous();
       const current = normalizeMinimalCheckoutDraft(input.draft, senderId);

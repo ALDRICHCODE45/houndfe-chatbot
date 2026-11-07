@@ -1,6 +1,7 @@
 import type { MinimalCheckoutDraft } from '../../conversation/domain/minimal-checkout-draft';
 import {
   MINIMAL_ORDER_AMBIGUOUS_REPLY,
+  MINIMAL_ORDER_DECLINED_REPLY,
   MINIMAL_ORDER_CONFIRMATION_TTL_MS,
   MinimalOrderConfirmation,
   evaluateMinimalOrder,
@@ -483,7 +484,12 @@ describe('MinimalOrderConfirmation', () => {
   });
 
   it('leaves mixed or unrelated text to other routes and drops the offer', () => {
-    for (const text of ['Sí, pero quite uno', 'no', 'SÍ\nSÍ', 'okay']) {
+    for (const text of [
+      'Sí, pero quite uno',
+      'sí y agrega otro',
+      '¿sí incluye envío?',
+      'SÍ\nquite uno',
+    ]) {
       const confirmation = make();
       offer(confirmation).onSent();
       expect(
@@ -504,6 +510,45 @@ describe('MinimalOrderConfirmation', () => {
       ).toBeNull();
     }
   });
+
+  it.each(['Sí, por favor 🙏', 'claro', 'ok', 'okay', 'va', 'SÍ\nSÍ', 'si!'])(
+    'turns the natural affirmative %j into the one-shot candidate',
+    (text) => {
+      const confirmation = make();
+      offer(confirmation).onSent();
+      expect(
+        confirmation.consume({
+          senderId: SENDER,
+          text,
+          inboundEvent: EVENT('wamid.yes'),
+        }),
+      ).toMatchObject({ kind: 'candidate', snapshot: eligible() });
+      expect(confirmation.status(SENDER)).toBeNull();
+    },
+  );
+
+  it.each(['no', 'no gracias', 'Mejor no.', '👎'])(
+    'declines on %j without a candidate and drops the offer',
+    (text) => {
+      const confirmation = make();
+      offer(confirmation).onSent();
+      expect(
+        confirmation.consume({
+          senderId: SENDER,
+          text,
+          inboundEvent: EVENT('wamid.no'),
+        }),
+      ).toEqual({ kind: 'handled', reply: MINIMAL_ORDER_DECLINED_REPLY });
+      expect(confirmation.status(SENDER)).toBeNull();
+      expect(
+        confirmation.consume({
+          senderId: SENDER,
+          text: 'SÍ',
+          inboundEvent: EVENT('wamid.later'),
+        }),
+      ).toBeNull();
+    },
+  );
 
   it('re-offers on an origin replay without confirming', () => {
     const confirmation = make();
