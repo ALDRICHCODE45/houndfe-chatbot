@@ -7,6 +7,7 @@ import type { CustomerProfileStore } from '../../customer-profile/domain/custome
 import { InMemoryCustomerProfileStore } from '../../customer-profile/infrastructure/in-memory-customer-profile.store';
 import { EvalFakeApi } from '../../../scripts/eval/fixtures/fake-api';
 import { applyCustomerStyle } from '../domain/customer-style';
+import { MinimalCartSelections } from '../domain/minimal-cart-selections';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
@@ -23,6 +24,19 @@ import {
  */
 const SENDER = '5215550001111';
 const NOW = new Date('2026-11-07T12:00:00.000Z');
+
+const product = (n: number) =>
+  `a0000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+// Catalog fixture 1: Nupec adult large-breed croquetas 18 kg (no variants).
+const NUPEC = 1;
+const selectionRef = (p: number): string => {
+  const reference = new MinimalCartSelections(SENDER).register({
+    productId: product(p),
+    productName: 'Fixture',
+  });
+  if (reference === null) throw new Error('fixture ref');
+  return reference;
+};
 
 const step = (content: unknown[], finish = 'tool-calls') => ({
   content,
@@ -84,11 +98,17 @@ function harness(profileStore: CustomerProfileStore) {
     scripts = runs.length === 0 ? [[say()]] : runs;
     return agent.tryHandle({ senderId: SENDER, text, ...extra });
   };
+  const cartItems = async () =>
+    (
+      (await store.get(SENDER))?.data.minimalCart as
+        | { items: unknown[] }
+        | undefined
+    )?.items ?? [];
   const system = () => {
     const value = seen.at(-1)?.system;
     return typeof value === 'string' ? value : '';
   };
-  return { agent, seen, system, turn };
+  return { agent, seen, system, turn, cartItems };
 }
 
 describe('S1 persistent customer memory', () => {
@@ -166,12 +186,13 @@ describe('S1 persistent customer memory', () => {
     expect(h.system()).not.toContain(SENDER);
   });
 
-  it('H2: known pet facts reach the prompt with guidance to search directly', async () => {
+  it('H2: known pet facts reach the prompt as a "Mascota conocida" search hint, not duplicated', async () => {
     const profileStore = new InMemoryCustomerProfileStore();
     await profileStore.upsert(
       SENDER,
       {
         register: 'tu',
+        preferredName: 'Mariana',
         pet: {
           name: 'Luna',
           species: 'perro',
@@ -183,17 +204,91 @@ describe('S1 persistent customer memory', () => {
     );
     const h = harness(profileStore);
     await h.turn('busco croquetas para ella');
-    const line = h
-      .system()
-      .split('\n')
-      .find((text) => text.startsWith('Cliente conocido:'));
-    expect(line).toContain('"labrador"');
-    expect(line).toContain('"3 años"');
-    expect(h.system()).toMatch(
-      /mascota[^\n]*relevantes[^\n]*busque directo[^\n]*raza grande adulto/,
-    );
-    expect(h.system()).toMatch(/pregunte solo lo que realmente falte/);
+    const lines = h.system().split('\n');
+    const known = lines.find((text) => text.startsWith('Cliente conocido:'));
+    const pet = lines.find((text) => text.startsWith('Mascota conocida:'));
+    expect(known).toContain('"Mariana"');
+    expect(known).not.toContain('labrador');
+    expect(pet).toContain('"Luna", perro, raza "labrador" (raza grande)');
+    expect(pet).toContain('edad "3 años" (adulto)');
+    expect(pet).toContain('«croquetas perro adulto raza grande»');
+    expect(pet).toMatch(/no pregunte especie, raza ni tamaño ya conocidos/);
   });
+
+  it('captures a pet statement deterministically when the model calls no tool, and uses it after a restart', async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    const h = harness(profileStore);
+    await h.turn('mi perrita Luna es una labrador de 3 años 🐾', [
+      [say('¡Qué linda Luna! 🐾')],
+    ]);
+    await expect(profileStore.read(SENDER)).resolves.toMatchObject({
+      pet: {
+        name: 'Luna',
+        species: 'perro',
+        breed: 'labrador',
+        size: 'grande',
+        ageText: '3 años',
+      },
+    });
+    const next = harness(profileStore);
+    await next.turn('busco croquetas para ella');
+    expect(next.system()).toContain('«croquetas perro adulto raza grande»');
+  });
+
+  it('a product query is never stored as a pet fact', async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    const h = harness(profileStore);
+    await h.turn('busco croquetas para perro grande');
+    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+  });
+
+  it('never mixes another pet into the stored one', async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    await profileStore.upsert(
+      SENDER,
+      { pet: { name: 'Luna', species: 'perro', breed: 'labrador' } },
+      NOW,
+    );
+    const h = harness(profileStore);
+    await h.turn('mi perro Max es un husky');
+    await expect(profileStore.read(SENDER)).resolves.toMatchObject({
+      pet: { name: 'Luna', breed: 'labrador' },
+    });
+  });
+
+  it.each(['adjustCartItem', 'prepareCartItem'])(
+    'a pet statement never writes the cart even if the model calls %s',
+    async (toolName) => {
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore);
+      await h.turn('Holaaa 😄 oye, ¿tienes croquetas para perro? 🐶', [
+        [
+          call('searchCatalog', { q: 'croquetas para perro' }),
+          say('Tengo varias croquetas para perro.'),
+        ],
+      ]);
+      const input =
+        toolName === 'prepareCartItem'
+          ? {
+              selectionRef: selectionRef(NUPEC),
+              operation: 'add',
+              quantity: 3,
+              quantityText: '3',
+              continuation: false,
+            }
+          : {
+              selectionRef: selectionRef(NUPEC),
+              delta: 3,
+              quantityText: '3',
+              continuation: false,
+            };
+      await h.turn('mi perrita Luna es una labrador de 3 años 🐾', [
+        [call(toolName, input), say('¡Listo, agregado!')],
+      ]);
+      expect(await h.cartItems()).toEqual([]);
+      expect((await profileStore.read(SENDER))?.pet?.name).toBe('Luna');
+    },
+  );
 
   it('has no "Cliente conocido" line for an unknown customer', async () => {
     const h = harness(new InMemoryCustomerProfileStore());

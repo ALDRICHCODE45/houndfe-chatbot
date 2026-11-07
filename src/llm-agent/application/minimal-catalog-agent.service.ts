@@ -41,6 +41,11 @@ import {
 } from '../domain/customer-style';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
 import {
+  extractPetFacts,
+  knownPetPromptLine,
+  petFactsConflict,
+} from '../../customer-profile/domain/pet-facts';
+import {
   customerStyleSeed,
   knownCustomerPromptLine,
   type CustomerProfilePatch,
@@ -204,7 +209,7 @@ export const FORGET_MY_DATA_REPLY =
 const PET_MEMORY_INSTRUCTIONS =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
-  'Si la línea "Cliente conocido" trae datos de la mascota relevantes para lo que pide (especie, tamaño o raza, edad), úselos y busque directo con searchCatalog (p. ej. labrador adulto → raza grande adulto) y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte.';
+  'Si hay una línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte.';
 
 /** Generous input cap; the profile store bounds each field again. */
 const PET_FACT = z.string().min(1).max(500).optional();
@@ -1870,8 +1875,12 @@ export class MinimalCatalogAgentService {
   /** S1: pet-memory guidance and the "Cliente conocido" line, if any. */
   private memoryInstructions(senderId: string): string {
     if (this.profiles === undefined) return '';
-    const known = knownCustomerPromptLine(this.profiles.cached(senderId));
-    return `\n\n${PET_MEMORY_INSTRUCTIONS}${known === null ? '' : `\n${known}`}`;
+    const profile = this.profiles.cached(senderId);
+    const known = [
+      knownCustomerPromptLine(profile),
+      knownPetPromptLine(profile?.pet),
+    ].filter((line): line is string => line !== null);
+    return `\n\n${[PET_MEMORY_INSTRUCTIONS, ...known].join('\n')}`;
   }
 
   /** S1: the model tool that remembers facts the customer gave about a pet. */
@@ -1924,6 +1933,14 @@ export class MinimalCatalogAgentService {
         patch.emojis = emojis;
       const name = explicitPreferredName(input.text);
       if (name !== null) patch.preferredName = name;
+      // Deterministic pet capture, in addition to rememberPetDetails; a
+      // different pet is skipped so two pets are never mixed.
+      const pet = extractPetFacts(input.text);
+      if (
+        Object.keys(pet).length > 0 &&
+        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet)
+      )
+        patch.pet = pet;
     }
     await profiles.record(input.senderId, patch);
   }
@@ -2466,6 +2483,8 @@ export class MinimalCatalogAgentService {
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
       const lines = (await cart?.storedLines(context.senderId)) ?? [];
+      // A pet statement is never a cart write, whatever numbers it carries.
+      if (conversation.isPetStatementOnly()) return misplacedCartCall(lines)!;
       const grounded = conversation.ground(identity, proposal, lines);
       trace(
         `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
@@ -2752,6 +2771,8 @@ export class MinimalCatalogAgentService {
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
               const lines = (await cart.storedLines(context.senderId)) ?? [];
+              if (conversation.isPetStatementOnly())
+                return misplacedCartCall(lines)!;
               const grounded = conversation.prepare(
                 identity,
                 { operation, quantity, quantityText, continuation },

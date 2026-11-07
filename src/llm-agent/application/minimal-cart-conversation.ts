@@ -33,9 +33,11 @@ import {
   distinctiveMatches,
   mentionsPhrase,
   nameCoverage,
+  requestsCartAction,
   requestsCartChange,
   statedUnitCount,
 } from '../domain/minimal-cart-request';
+import { extractPetFacts } from '../../customer-profile/domain/pet-facts';
 import {
   groundCartQuantity,
   type MinimalCartQuantityIntent,
@@ -580,6 +582,7 @@ export class MinimalCartConversation {
    * rejected cart request but a misplaced call.
    */
   hasCartRequest(): boolean {
+    if (this.isPetStatementOnly()) return false;
     if (requestsCartChange(this.text, this.dialogue.previousAssistantText))
       return true;
     const selections = this.selections.snapshot().selections;
@@ -597,6 +600,18 @@ export class MinimalCartConversation {
       asksCartChoice(this.dialogue.previousAssistantText) &&
       shown.length >= 2 &&
       this.customerPick(shown) !== null
+    );
+  }
+
+  /**
+   * True for a statement about the customer's pet ("mi perrita Luna es una
+   * labrador de 3 años") that asks for no cart action in words: its numbers
+   * and "una" describe the pet, so a cart tool on it is a misplaced call.
+   */
+  isPetStatementOnly(): boolean {
+    return (
+      Object.keys(extractPetFacts(this.text)).length > 0 &&
+      !requestsCartAction(this.text, this.dialogue.previousAssistantText)
     );
   }
 

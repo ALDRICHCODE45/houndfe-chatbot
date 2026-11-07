@@ -206,9 +206,10 @@ describe('knownCustomerPromptLine', () => {
     expect(line.startsWith('Cliente conocido:')).toBe(true);
     expect(line).toContain('"Anita"');
     expect(line).not.toContain('Ana P');
-    expect(line).toContain('"Luna"');
-    expect(line).toContain('"labrador"');
-    expect(line).toContain('"3 años"');
+    expect(line).toContain('mascota "Luna"');
+    // Searchable pet facts live in the "Mascota conocida" line only.
+    expect(line).not.toContain('labrador');
+    expect(line).not.toContain('3 años');
     expect(line).toContain('A-12');
     expect(line).toContain('2026-11-01');
     expect(line).not.toContain(SENDER);
