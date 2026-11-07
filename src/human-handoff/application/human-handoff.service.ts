@@ -47,7 +47,7 @@ export const UNDER_REVIEW_NOTICE =
  * customer's `pendingHumanRequest` marker is set.
  */
 export const PENDING_HUMAN_REQUEST_REPLY =
-  'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos';
+  'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.';
 
 /**
  * Sent to the ops thread when the resolver cannot find a pending request

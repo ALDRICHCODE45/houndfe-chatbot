@@ -21,8 +21,9 @@ const INBOUND = {
   messageId: 'wamid.E1',
 };
 const SOURCE = deriveExpirationSourceRequestId(INBOUND) as string;
+// S2: the customer writes no emojis, so the fixed acknowledgement has none.
 const REGISTERED =
-  '¡Con gusto! 😊 Voy a consultar la fecha de caducidad con el equipo. En cuanto tenga la respuesta, se la comparto por aquí.';
+  '¡Con gusto! Voy a consultar la fecha de caducidad con el equipo. En cuanto tenga la respuesta, se la comparto por aquí.';
 const usage = {
   inputTokens: { total: 1 },
   outputTokens: { total: 1 },

@@ -7,6 +7,7 @@ import {
   type ChatbotApiClient,
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { BotSaleResponse } from '../../chatbot-api/domain/dtos/sales.dto';
+import type { PaymentDetail } from '../../chatbot-api/domain/dtos/payment-details.dto';
 import {
   CreateCheckoutInputSchema,
   INVALID_CHECKOUT_REQUEST,
@@ -118,7 +119,7 @@ export const MINIMAL_ORDER_UNRESOLVED_REPLY =
   'No pude confirmar si su pedido anterior quedó registrado y no puedo crear otro sin riesgo de duplicarlo. Por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY =
   'No pude confirmar si su pedido quedó registrado. Si vuelve a pedir el resumen y responde SÍ, usaré la misma solicitud para no duplicarlo.';
-const PAYMENT_UNAVAILABLE_REPLY =
+export const MINIMAL_ORDER_PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos para la transferencia en este momento; su pedido sí quedó registrado.';
 
 /** The item no longer matches the product's current variants; nothing was written. */
@@ -217,6 +218,44 @@ function pickupLocationText(
   return location.hours === null
     ? place
     : `${place} Horario: ${location.hours.summary}`;
+}
+
+/** Server-owned order-created copy; amounts and folio come from the sale. */
+export function minimalOrderCreatedReply(
+  sale: PlacedSaleIdentity,
+  shipping: { mode: 'pickup' } | { customerChargeCents: number } | undefined,
+  pickupLocation: CheckoutPickupLocation | null | undefined,
+): string {
+  return (
+    (sale.folio === null
+      ? 'Su pedido quedó registrado.'
+      : `Su pedido quedó registrado con folio ${sale.folio}.`) +
+    (shipping === undefined
+      ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
+      : !('customerChargeCents' in shipping)
+        ? ` Total a pagar: ${mxn(sale.totalCents)}. Recoge en tienda (sin costo de envío).`
+        : shipping.customerChargeCents === 0
+          ? ` Total de productos: ${mxn(sale.totalCents)}. Envío sin costo para usted.`
+          : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`) +
+    pickupLocationText(pickupLocation)
+  );
+}
+
+/** Transfer instructions from the backend's active bank account. */
+export function minimalPaymentInstructions(
+  detail: Pick<
+    PaymentDetail,
+    'bankName' | 'beneficiary' | 'clabe' | 'accountNumber'
+  >,
+): string {
+  return [
+    'Para pagar por transferencia:',
+    `Banco: ${detail.bankName}`,
+    `Beneficiario: ${detail.beneficiary}`,
+    `CLABE: ${detail.clabe}`,
+    `Cuenta: ${detail.accountNumber}`,
+    'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
+  ].join('\n');
 }
 
 /** Deterministic digest of the exact payload sent under one key. */
@@ -993,34 +1032,15 @@ export class MinimalOrderService {
         totalCents: sale.totalCents,
       },
     });
-    const created =
-      (sale.folio === null
-        ? 'Su pedido quedó registrado.'
-        : `Su pedido quedó registrado con folio ${sale.folio}.`) +
-      (shipping === undefined
-        ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
-        : !('customerChargeCents' in shipping)
-          ? ` Total a pagar: ${mxn(sale.totalCents)}. Recoge en tienda (sin costo de envío).`
-          : shipping.customerChargeCents === 0
-            ? ` Total de productos: ${mxn(sale.totalCents)}. Envío sin costo para usted.`
-            : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`) +
-      pickupLocationText(pickupLocation);
+    const created = minimalOrderCreatedReply(sale, shipping, pickupLocation);
     return `${created}\n\n${await this.paymentInstructions()}`;
   }
 
   private async paymentInstructions(): Promise<string> {
     try {
-      const detail = await this.api.getPaymentDetails();
-      return [
-        'Para pagar por transferencia:',
-        `Banco: ${detail.bankName}`,
-        `Beneficiario: ${detail.beneficiary}`,
-        `CLABE: ${detail.clabe}`,
-        `Cuenta: ${detail.accountNumber}`,
-        'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
-      ].join('\n');
+      return minimalPaymentInstructions(await this.api.getPaymentDetails());
     } catch {
-      return PAYMENT_UNAVAILABLE_REPLY;
+      return MINIMAL_ORDER_PAYMENT_UNAVAILABLE_REPLY;
     }
   }
 

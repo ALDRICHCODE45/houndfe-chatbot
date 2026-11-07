@@ -110,7 +110,7 @@ describe('HumanHandoffService', () => {
 
     it('PENDING_HUMAN_REQUEST_REPLY matches the spec literal', () => {
       expect(PENDING_HUMAN_REQUEST_REPLY).toBe(
-        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+        'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.',
       );
     });
 

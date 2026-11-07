@@ -506,7 +506,7 @@ describe('sale-flow-instructions', () => {
       );
       expect(SALE_FLOW_INSTRUCTIONS).toContain('espera indefinidamente');
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+        'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toMatch(/NO sigas intentando avanzar/i);
     });
@@ -608,7 +608,7 @@ describe('sale-flow-instructions', () => {
 
     it('legacy kinds (including default-off out_of_stock) keep the escalation + canned waiting semantics', () => {
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'seguimos esperando respuesta del agente, te avisamos en cuanto tengamos',
+        'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.',
       );
       expect(SALE_FLOW_INSTRUCTIONS).toMatch(
         /kind: 'out_of_stock', digest: { productId, name, variantId\?, quantity\? }/,

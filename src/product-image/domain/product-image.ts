@@ -44,7 +44,8 @@ export interface ProductImageDescriberPort {
   describe(input: ProductImageDescriberInput): Promise<ProductImageRecognition>;
 }
 
-/** Customer replies (usted, short) for photos the agent cannot act on. */
+/** Customer replies (usted, short) for photos the agent cannot act on; the
+ * dispatcher applies the customer style (S2) before sending. */
 export const PRODUCT_IMAGE_UNCLEAR_REPLY =
   'No alcanzo a identificar el producto en la imagen. ¿Me puede enviar una foto más clara de la etiqueta o decirme el nombre del producto?';
 export const PRODUCT_IMAGE_UNAVAILABLE_REPLY =

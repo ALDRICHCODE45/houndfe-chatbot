@@ -8,6 +8,10 @@ import { InMemoryConversationStore } from '../../conversation/infrastructure/in-
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import { MinimalCartSelections } from '../domain/minimal-cart-selections';
 import {
+  applyCustomerStyle,
+  detectCustomerStyle,
+} from '../domain/customer-style';
+import {
   CART_OPERATION_CLARIFICATION,
   CART_UNKNOWN_REFERENCE_REPLY,
   cartKeepOnlyToolInput,
@@ -16,6 +20,10 @@ import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { MinimalCartService } from './minimal-cart.service';
 import { CostGuardService } from './cost-guard.service';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
+
+/** S2: a fixed reply mirrors the register and emojis of the customer turn. */
+const styledFor = (customerText: string, reply: string) =>
+  applyCustomerStyle(reply, detectCustomerStyle([customerText]));
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const SENDER = '5215550001111';
@@ -235,21 +243,22 @@ describe('Minimal cart through the public SDK route', () => {
         say(),
       ]);
       const success = mode === 'keep' || mode === 'repeat';
+      const text =
+        mode === 'evidence'
+          ? 'agrega croquetas'
+          : 'Solo deja las croquetas en mi carrito por favor, quita todo lo demas';
       expect(
-        await f.createAgent().tryHandle({
-          senderId: SENDER,
-          text:
-            mode === 'evidence'
-              ? 'agrega croquetas'
-              : 'Solo deja las croquetas en mi carrito por favor, quita todo lo demas',
-        }),
+        await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
-        reply: success
-          ? 'Su carrito:\n• Croquetas nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $450.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
-          : mode === 'evidence'
-            ? CART_OPERATION_CLARIFICATION
-            : CART_UNKNOWN_REFERENCE_REPLY,
+        reply: styledFor(
+          text,
+          success
+            ? 'Su carrito:\n• Croquetas nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $450.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
+            : mode === 'evidence'
+              ? CART_OPERATION_CLARIFICATION
+              : CART_UNKNOWN_REFERENCE_REPLY,
+        ),
       });
       expect(commit).toHaveBeenCalledTimes(success ? 1 : 0);
       expect(set).not.toHaveBeenCalled();
@@ -406,8 +415,10 @@ describe('Minimal cart through the public SDK route', () => {
         await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          text,
           'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        ),
       });
       expect(domain).toHaveBeenCalledTimes(1);
       expect(domain.mock.calls[0][1]).toEqual(domainInput);
@@ -505,9 +516,12 @@ describe('Minimal cart through the public SDK route', () => {
         await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
-        reply: selected
-          ? 'Su carrito:\n• Product — 250mg: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
-          : '¿Qué presentación desea agregar al carrito?',
+        reply: styledFor(
+          text,
+          selected
+            ? 'Su carrito:\n• Product — 250mg: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
+            : '¿Qué presentación desea agregar al carrito?',
+        ),
       });
       expect(writes).toHaveBeenCalledTimes(selected ? 1 : 0);
       if (selected) {
@@ -622,8 +636,10 @@ describe('Minimal cart through the public SDK route', () => {
         }),
       ).toEqual({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          addText,
           'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+        ),
       });
       expect(writes).not.toHaveBeenCalled();
       expect(await f.cart.view(SENDER)).toEqual(before);
@@ -643,8 +659,10 @@ describe('Minimal cart through the public SDK route', () => {
         }),
       ).toEqual({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          addText,
           'Su carrito:\n• Ibuprofeno — 250mg: 2 × $130.00 MXN; importe $260.00 MXN\n• Croquetas Nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $710.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        ),
       });
       expect(writes).toHaveBeenCalledTimes(1);
       expect(await f.cart.view(SENDER)).toMatchObject({
@@ -895,8 +913,10 @@ describe('Minimal cart through the public SDK route', () => {
           .tryHandle({ senderId: SENDER, text: mutationText }),
       ).toEqual({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          mutationText,
           'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+        ),
       });
       const messages = logs.mock.calls.map(([message]) => String(message));
       const diagnostics = messages.filter((message) =>
@@ -956,10 +976,12 @@ describe('Minimal cart through the public SDK route', () => {
         .tryHandle({ senderId: SENDER, text });
       expect(response).toEqual({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          text,
           quantity === 0
             ? 'Su carrito está vacío.'
             : 'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        ),
       });
       expect(cartLogs(logs)).toEqual([
         expect.stringMatching(
@@ -1009,8 +1031,10 @@ describe('Minimal cart through the public SDK route', () => {
         await f.createAgent().tryHandle({ senderId: SENDER, text }),
       ).toEqual({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          text,
           'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+        ),
       });
       expect(cartLogs(logs)).toEqual([
         expect.stringMatching(
@@ -1067,8 +1091,10 @@ describe('Minimal cart through the public SDK route', () => {
         .tryHandle({ senderId: SENDER, text: 'Agrega dos unidades' }),
     ).toEqual({
       kind: 'handled',
-      reply:
+      reply: styledFor(
+        'Agrega dos unidades',
         'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.',
+      ),
     });
     expect(cartLogs(logs)).toEqual([
       expect.stringMatching(
@@ -1102,10 +1128,12 @@ describe('Minimal cart through the public SDK route', () => {
         .tryHandle({ senderId: SENDER, text });
       expect(response).toMatchObject({
         kind: 'handled',
-        reply:
+        reply: styledFor(
+          text,
           quantity === 0
             ? 'Su carrito está vacío.'
             : 'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        ),
       });
       expect(
         await new MinimalCartService(f.api, f.store).view(SENDER),
@@ -1226,7 +1254,10 @@ describe('Minimal cart through the public SDK route', () => {
         expected === 0
           ? 'Su carrito está vacío.'
           : `Su carrito:\n• Product: ${expected} × $12.00 MXN; importe $${(expected * 12).toFixed(2)} MXN\nTotal de productos: $${(expected * 12).toFixed(2)} MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`;
-      expect(response).toEqual({ kind: 'handled', reply });
+      expect(response).toEqual({
+        kind: 'handled',
+        reply: styledFor(text, reply),
+      });
       expect(
         await new MinimalCartService(f.api, f.store).view(SENDER),
       ).toMatchObject({

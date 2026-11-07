@@ -82,8 +82,31 @@ describe('SYSTEM_PROMPT', () => {
   });
 
   describe('customer voice guidance (presence, not model compliance)', () => {
-    it('requires warm usted without taking a real staff identity or their private data', () => {
-      expect(SYSTEM_PROMPT).toContain('cálido y cercano, siempre de usted');
+    it('presents the bot as the sales assistant of Tienda de mascotas HoundFe (S1)', () => {
+      expect(SYSTEM_PROMPT).toContain(
+        'Eres el asistente de ventas de Tienda de mascotas HoundFe, una tienda de alimento y accesorios para mascotas.',
+      );
+      expect(SYSTEM_PROMPT).not.toMatch(
+        /tecnolog[ií]a|retail|punto de venta|Hound Technologies/i,
+      );
+    });
+
+    it('mirrors the customer register, emojis and formality instead of forcing usted (S2)', () => {
+      for (const rule of [
+        'empieza de "usted"; si el cliente te tutea, responde de tú',
+        'Usa emojis solo si el cliente los usa, nunca más que él',
+        'si es serio, responde serio, profesional y sin emojis',
+        'Nunca uses jerga ni voseo',
+        'en ambos registros mantén un trato cálido y profesional',
+        'Sigue la línea "Estilo del cliente" de cada turno',
+      ]) {
+        expect(SYSTEM_PROMPT).toContain(rule);
+      }
+      expect(SYSTEM_PROMPT).not.toContain('siempre de usted');
+      expect(SYSTEM_PROMPT).not.toContain('nunca de tú');
+    });
+
+    it('keeps a warm voice without taking a real staff identity or their private data', () => {
       expect(SYSTEM_PROMPT).toContain('No te presentes como asesor humano');
       expect(SYSTEM_PROMPT).toContain(
         'identidad de una persona real del equipo',
@@ -103,20 +126,19 @@ describe('SYSTEM_PROMPT', () => {
       }
     });
 
-    it('treats a light friendly emoji as normal service voice, bounded, never celebratory on failures and never inside literals', () => {
+    it('bounds emojis to customers who use them, never celebratory on failures and never inside literals', () => {
       for (const rule of [
-        'es parte de esta voz',
-        'no un extra opcional',
+        'Emojis: solo si el cliente los usa',
+        'como máximo uno natural por mensaje',
         'no en cada turno',
-        'puedes usarlo aunque algo no esté disponible',
         'celebrar un faltante confirmado, un error o un rechazo',
         'ni dentro de mensajes literales',
       ]) {
         expect(SYSTEM_PROMPT).toContain(rule);
       }
-      // The weak "entirely optional" rule is replaced, not kept beside the new one.
+      // The forced-emoji rule is replaced, not kept beside the mirroring one.
+      expect(SYSTEM_PROMPT).not.toContain('no un extra opcional');
       expect(SYSTEM_PROMPT).not.toContain('1–2 emojis discretos');
-      expect(SYSTEM_PROMPT).not.toContain('no son obligatorios');
     });
 
     it('prefers gratitude at a genuine close and patience only after a real wait', () => {

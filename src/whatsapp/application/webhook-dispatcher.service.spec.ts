@@ -1712,6 +1712,87 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
     });
 
+    describe('customer style (S2)', () => {
+      const TU = { register: 'tu', emojis: false, tone: 'casual' } as const;
+      beforeEach(() => {
+        (
+          minimalAgent as unknown as { customerStyle: jest.Mock }
+        ).customerStyle = jest.fn().mockReturnValue(TU);
+      });
+
+      it('answers an unclear product photo in tú for a customer who tutea', async () => {
+        productImage.recognize.mockResolvedValueOnce({
+          ...PRODUCT,
+          kind: 'unclear',
+        });
+
+        await service.dispatch(
+          mediaEvent('wamid.s1', { type: 'image', caption: '¿tienes este?' }),
+        );
+
+        expect(
+          (minimalAgent as unknown as { customerStyle: jest.Mock })
+            .customerStyle,
+        ).toHaveBeenCalledWith(CUSTOMER, '¿tienes este?');
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'No alcanzo a identificar el producto en la imagen. ¿Me puedes enviar una foto más clara de la etiqueta o decirme el nombre del producto?',
+        });
+      });
+
+      it('answers a receipt without order and an unavailable describer in tú', async () => {
+        productImage.recognize.mockResolvedValueOnce(RECEIPT_DESCRIPTION);
+        await service.dispatch(mediaEvent('wamid.s2', { type: 'image' }));
+        productImage.recognize.mockResolvedValueOnce({
+          kind: 'unavailable',
+          reason: 'error',
+        });
+        await service.dispatch(mediaEvent('wamid.s3', { type: 'image' }));
+
+        expect(sender.sendText).toHaveBeenNthCalledWith(1, {
+          to: CUSTOMER,
+          text: 'Recibí tu imagen, parece un comprobante de pago. Para registrarlo primero necesitamos confirmar tu pedido. ¿Qué producto quieres?',
+        });
+        expect(sender.sendText).toHaveBeenNthCalledWith(2, {
+          to: CUSTOMER,
+          text: 'Recibí tu imagen, pero no pude revisarla en este momento. ¿Me puedes decir el nombre del producto que buscas?',
+        });
+      });
+
+      it('answers receipt ingress guidance in tú', async () => {
+        ingress.admit.mockResolvedValueOnce({
+          kind: 'no-placed-sale',
+        } as never);
+        await service.dispatch(mediaEvent('wamid.s4', { type: 'document' }));
+
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Recibí tu comprobante. Para registrarlo primero necesitamos confirmar tu pedido. ¿Qué producto quieres?',
+        });
+      });
+
+      it('sends the pending-human reply in tú', async () => {
+        conversationStore.get.mockResolvedValue({
+          senderId: CUSTOMER,
+          lastMessageAt: '2026-06-23T12:00:00.000Z',
+          data: {
+            pendingHumanRequest: {
+              requestId: 'abc123def456',
+              ref: 'HF-abc123def456',
+              createdAt: '2026-06-23T12:00:00.000Z',
+              customerNotifiedAt: '2026-06-23T12:00:00.000Z',
+            },
+          },
+        });
+        await service.dispatch(mediaEvent('wamid.s5', { type: 'document' }));
+
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Seguimos esperando la respuesta del equipo; te avisamos por aquí en cuanto la tengamos.',
+        });
+      });
+    });
+
     it('duplicate image message: no vision call, no reply', async () => {
       dedup.isDuplicate.mockResolvedValueOnce(true);
 

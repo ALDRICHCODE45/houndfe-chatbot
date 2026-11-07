@@ -70,8 +70,8 @@ export interface ConversationState {
  *
  * The runner calls this BEFORE any LLM turn. A non-null return short-circuits
  * the runner (no `llm.run`, no `costGuard.record`, no `store.update`); the
- * canned "seguimos esperando respuesta del agente, te avisamos en cuanto
- * tengamos" reply is sent by the dispatcher pre-routing hook instead.
+ * canned `PENDING_HUMAN_REQUEST_REPLY` is sent by the dispatcher pre-routing
+ * hook instead.
  *
  * Defensive defaults: returns `null` for missing fields, for structurally
  * malformed shapes, or when the value is explicitly `null` (the cleared

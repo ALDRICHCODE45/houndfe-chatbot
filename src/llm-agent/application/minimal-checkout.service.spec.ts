@@ -1,3 +1,4 @@
+import { applyCustomerStyle } from '../domain/customer-style';
 import { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -732,7 +733,13 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
       EVENT('wamid.offer'),
     );
     const reply = (result as { reply: string }).reply;
-    expect(reply.startsWith(`${CART_OPERATION_CLARIFICATION}\n\n`)).toBe(true);
+    // S2: "Agrega y confirma" tutea, so the fixed copy comes back in tú.
+    const clarification = applyCustomerStyle(CART_OPERATION_CLARIFICATION, {
+      register: 'tu',
+      emojis: false,
+      tone: 'neutral',
+    });
+    expect(reply.startsWith(`${clarification}\n\n`)).toBe(true);
     expect(reply).toContain('Calle: Calle 5 S/N');
     expect(typeof (result as { onSent?: unknown }).onSent).toBe('function');
   });

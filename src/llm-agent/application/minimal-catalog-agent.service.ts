@@ -27,6 +27,14 @@ import type {
 import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import {
+  applyCustomerStyle,
+  customerStyleDirective,
+  detectCustomerStyle,
+  limitCustomerEmojis,
+  type CustomerStyle,
+} from '../domain/customer-style';
+import type { MinimalCatalogTurn } from '../domain/minimal-catalog-session.store';
+import {
   GENERATE_TEXT,
   type GenerateTextFn,
 } from '../infrastructure/generate-text.provider';
@@ -103,7 +111,7 @@ const INSTRUCTIONS =
   'si aún no lo está o la identidad expiró, búscalo primero. En productos con variantes ' +
   'informa existencias por variante; no iguales la del producto con la de la variante. ' +
   'No realizas compras, ventas, pagos ni cambios de datos. ' +
-  'Saluda cálido de usted con un emoji ligero, según la base. Un hallazgo se anuncia ' +
+  'Saluda cálido, en el registro y con los emojis del estilo del cliente. Un hallazgo se anuncia ' +
   '"Encontré ... en catálogo", no "tenemos" ni "disponible": eso solo se afirma tras un ' +
   'checkStock válido. La selección explícita ya es válida: no la repreguntes. ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
@@ -113,11 +121,11 @@ const INSTRUCTIONS =
   'prometas registro, contacto o reservación (no existe esa herramienta). Nunca fijes ' +
   'producto, precio ni stock: los ejemplos son condicionales, no respuestas forzadas. ' +
   'Estilo (solo si aplica): si su mensaje abre con saludo, empieza con un saludo recíproco ' +
-  '(usa "¡Hola! 😊" si es neutro; no inventes la hora); identidad de servicio cálida de usted, ' +
+  '(usa "¡Hola!" si es neutro; no inventes la hora); identidad de servicio cálida en el registro del cliente, ' +
   'sin personificar a una persona. Un producto en un párrafo breve y natural, no una lista ' +
   'anidada, y sin "¿en qué puedo ayudarle?" si ya pidió un producto. Ejemplos solo de estilo, ' +
-  'sustituye únicamente datos verificados por herramienta: "¡Hola! 😊 Encontré {nombre} en ' +
-  'nuestro catálogo. ¿Buscaba esa presentación?"; tras out_of_stock verificado: "Por ahora, ' +
+  'sustituye únicamente datos verificados por herramienta: "¡Hola! Encontré {nombre} en ' +
+  'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
@@ -129,10 +137,10 @@ export type MinimalCatalogAgentDecision = {
 };
 
 // Bounded busy reply returned as `handled` for an in-flight turn.
-const BUSY_REPLY =
+export const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
 
-const RESTOCK_CAUTIOUS_REPLY =
+export const RESTOCK_CAUTIOUS_REPLY =
   'Por ahora no puedo preparar esa consulta de reposición.';
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
@@ -455,6 +463,19 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
   };
 }
 
+/** The customer's own text turns, oldest first. */
+function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
+  return turns.flatMap((turn) =>
+    turn.messages.flatMap((message) => {
+      if (message.role !== 'user') return [];
+      if (typeof message.content === 'string') return [message.content];
+      return message.content.flatMap((part) =>
+        part.type === 'text' ? [part.text] : [],
+      );
+    }),
+  );
+}
+
 // Minimal SDK route: in-memory catalog history; optional durable cart and human
 // inquiry capabilities. No checkout, payment or inventory reservations.
 @Injectable()
@@ -510,7 +531,13 @@ export class MinimalCatalogAgentService {
       // Any turn after a summary spends its consent, even a rejected one.
       this.interrupted.add(input.senderId);
       this.order?.dismiss(input.senderId);
-      return { kind: 'handled', reply: BUSY_REPLY };
+      return {
+        kind: 'handled',
+        reply: applyCustomerStyle(
+          BUSY_REPLY,
+          this.customerStyle(input.senderId, input.text),
+        ),
+      };
     }
     this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
@@ -528,17 +555,21 @@ export class MinimalCatalogAgentService {
         if (consumed !== null) {
           // An order SÍ binds only to the reply right after its summary.
           this.order?.dismiss(input.senderId);
+          const reply = applyCustomerStyle(
+            consumed.reply,
+            this.customerStyle(input.senderId, input.text),
+          );
           this.recordTurn(
             input.senderId,
             [
               { role: 'user', content: input.text },
-              { role: 'assistant', content: consumed.reply },
+              { role: 'assistant', content: reply },
             ],
             [],
           );
           return {
             kind: 'handled',
-            reply: consumed.reply,
+            reply,
             ...(consumed.onSent === undefined
               ? {}
               : { onSent: consumed.onSent }),
@@ -552,17 +583,21 @@ export class MinimalCatalogAgentService {
           delivery ??
           (this.orderAvailable() ? await this.order!.consume(input) : null);
         if (answered !== null) {
+          const reply = applyCustomerStyle(
+            answered.reply,
+            this.customerStyle(input.senderId, input.text),
+          );
           this.recordTurn(
             input.senderId,
             [
               { role: 'user', content: input.text },
-              { role: 'assistant', content: answered.reply },
+              { role: 'assistant', content: reply },
             ],
             [],
           );
           return {
             kind: 'handled',
-            reply: answered.reply,
+            reply,
             ...(answered.onSent === undefined
               ? {}
               : { onSent: answered.onSent }),
@@ -592,6 +627,9 @@ export class MinimalCatalogAgentService {
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
+    // S2: the customer's own turns in this session decide the reply style.
+    const style = detectCustomerStyle([...customerTexts(turns), input.text]);
+    const styled = (text: string) => applyCustomerStyle(text, style);
     // Rebuild this sender's bounded selection registry and pending cart intent
     // from the last stored turn. Refs are deterministic digests, so a restored
     // snapshot resolves exactly the identities the previous turn registered.
@@ -733,7 +771,12 @@ export class MinimalCatalogAgentService {
       : baseInstructions;
     const result = await this.generateTextFn({
       model: openai(this.model),
-      system: SYSTEM_PROMPT + '\n\n' + cartInstructions,
+      system:
+        SYSTEM_PROMPT +
+        '\n\n' +
+        cartInstructions +
+        '\n\n' +
+        customerStyleDirective(style),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
         { role: 'user', content: input.text },
@@ -759,11 +802,12 @@ export class MinimalCatalogAgentService {
     const expirationResult = expirationReply?.value ?? null;
     if (expirationResult !== null || prepared !== null) {
       // EXPIRATION takes priority; an unsent RESTOCK offer must not be armed.
-      const reply =
+      const reply = styled(
         expirationResult ??
-        (prepared?.kind === 'offer'
-          ? prepared.question
-          : RESTOCK_CAUTIOUS_REPLY);
+          (prepared?.kind === 'offer'
+            ? prepared.question
+            : RESTOCK_CAUTIOUS_REPLY),
+      );
       this.recordTurn(
         input.senderId,
         [
@@ -787,10 +831,11 @@ export class MinimalCatalogAgentService {
         (this.hasInvalidCartToolCall(result)
           ? CART_OPERATION_CLARIFICATION
           : null);
-      const reply =
+      const reply = styled(
         cartPart === null
           ? checkoutResult.reply
-          : `${cartPart}\n\n${checkoutResult.reply}`;
+          : `${cartPart}\n\n${checkoutResult.reply}`,
+      );
       this.recordTurn(
         input.senderId,
         [
@@ -805,16 +850,17 @@ export class MinimalCatalogAgentService {
         : { reply, onSent: checkoutResult.onSent };
     }
     if (cartReply.value !== null) {
+      const reply = styled(cartReply.value);
       this.recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
-          { role: 'assistant', content: cartReply.value },
+          { role: 'assistant', content: reply },
         ],
         [...currentIds],
         persistedCartContext(),
       );
-      return { reply: cartReply.value };
+      return { reply };
     }
     if (this.hasInvalidCartToolCall(result)) {
       // A cart tool whose arguments failed SDK validation never executed; the
@@ -824,32 +870,34 @@ export class MinimalCatalogAgentService {
         this.logger,
         `minimal_catalog tool cart argument rejected before execute trace=${traceId}`,
       );
+      const reply = styled(CART_OPERATION_CLARIFICATION);
       this.recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
-          { role: 'assistant', content: CART_OPERATION_CLARIFICATION },
+          { role: 'assistant', content: reply },
         ],
         [...currentIds],
         persistedCartContext(),
       );
-      return { reply: CART_OPERATION_CLARIFICATION };
+      return { reply };
     }
     if (this.hasInvalidToolCall(result, CHECKOUT_TOOL_NAMES)) {
       traceLog(
         this.logger,
         `minimal_catalog tool checkout argument rejected before execute trace=${traceId}`,
       );
+      const reply = styled(CHECKOUT_TOOL_CLARIFICATION);
       this.recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
-          { role: 'assistant', content: CHECKOUT_TOOL_CLARIFICATION },
+          { role: 'assistant', content: reply },
         ],
         [...currentIds],
         persistedCartContext(),
       );
-      return { reply: CHECKOUT_TOOL_CLARIFICATION };
+      return { reply };
     }
     this.recordTurn(
       input.senderId,
@@ -857,7 +905,19 @@ export class MinimalCatalogAgentService {
       [...currentIds],
       persistedCartContext(),
     );
-    return { reply: result.text };
+    // The prompt styles model text; only the emoji guard applies here.
+    return { reply: limitCustomerEmojis(result.text, style) };
+  }
+
+  /**
+   * S2: the style of this sender's own messages in the current session plus
+   * the current one. The dispatcher uses it for media replies.
+   */
+  customerStyle(senderId: string, currentText?: string): CustomerStyle {
+    const texts = customerTexts(this.sessionStore.read(senderId));
+    return detectCustomerStyle(
+      currentText === undefined ? texts : [...texts, currentText],
+    );
   }
 
   /**

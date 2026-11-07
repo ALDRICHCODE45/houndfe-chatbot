@@ -17,6 +17,11 @@ import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
 import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import { readPlacedOrder } from '../../receipt-media/domain/placed-order';
+import {
+  DEFAULT_CUSTOMER_STYLE,
+  applyCustomerStyle,
+  type CustomerStyle,
+} from '../../llm-agent/domain/customer-style';
 import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
 import {
   buildProductImageTurnText,
@@ -65,8 +70,8 @@ import {
  *          customer runner path.
  *   4. **Pending-marker short-circuit** (new, ADR-29 defense-in-depth) —
  *      when the customer's `data.pendingHumanRequest` is set, send the
- *      canned byte-identical "seguimos esperando respuesta del agente,
- *      te avisamos en cuanto tengamos" reply and `continue`. No LLM call.
+ *      canned `PENDING_HUMAN_REQUEST_REPLY` (in the customer's style) and
+ *      `continue`. No LLM call.
  *   4b. **Customer media** — documents (PDF) always go to receipt ingress.
  *      An image goes to receipt ingress only when an order awaits payment
  *      (`minimalCart.placedSale`) and the caption is not a product question;
@@ -193,7 +198,10 @@ export class WebhookDispatcherService {
           );
           const { providerMessageId } = await this.whatsappSender.sendText({
             to: message.senderId,
-            text: PENDING_HUMAN_REQUEST_REPLY,
+            text: applyCustomerStyle(
+              PENDING_HUMAN_REQUEST_REPLY,
+              this.customerStyle(message),
+            ),
           });
           this.recentOutbound.remember(providerMessageId);
           try {
@@ -239,7 +247,10 @@ export class WebhookDispatcherService {
           }
           await this.replyAndMarkSeen(
             message,
-            productImageFallbackReply(recognition),
+            applyCustomerStyle(
+              productImageFallbackReply(recognition),
+              this.customerStyle(message),
+            ),
           );
           continue;
         }
@@ -277,12 +288,27 @@ export class WebhookDispatcherService {
     if (guidance !== undefined) {
       const { providerMessageId } = await this.whatsappSender.sendText({
         to: message.senderId,
-        text: guidance,
+        text: applyCustomerStyle(guidance, this.customerStyle(message)),
       });
       this.recentOutbound.remember(providerMessageId);
     }
     if (!receiptAdmissionAtomicallyMarksSeen(decision.kind)) {
       await this.markSeenSafely(message.messageId);
+    }
+  }
+
+  /** S2: the sender's session style for a fixed media/handoff reply. Never
+   * throws; without a readable style the copy stays in usted. */
+  private customerStyle(message: InboundMessage): CustomerStyle {
+    const agent = this
+      .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
+    if (typeof agent.customerStyle !== 'function') {
+      return DEFAULT_CUSTOMER_STYLE;
+    }
+    try {
+      return agent.customerStyle(message.senderId, message.text);
+    } catch {
+      return DEFAULT_CUSTOMER_STYLE;
     }
   }
 

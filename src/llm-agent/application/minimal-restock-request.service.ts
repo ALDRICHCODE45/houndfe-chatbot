@@ -40,13 +40,13 @@ export type RestockReplyClassifier = (
   question: string,
   reply: string,
 ) => Promise<RestockReplyVerdict>;
-const DECLINE_REPLY =
+export const MINIMAL_RESTOCK_DECLINE_REPLY =
   'Entendido, no registraré su consulta de reposición. ¡Gracias!';
-const confirmed = (l: string) =>
+export const minimalRestockConfirmedReply = (l: string) =>
   `¡Listo! 😊 Ya quedó registrada su consulta sobre la reposición de «${l}». ¡Gracias!`;
-const already = (l: string) =>
+export const minimalRestockAlreadyReply = (l: string) =>
   `Su consulta sobre la reposición de «${l}» ya estaba registrada. ¡Gracias!`;
-const proposal = (l: string) =>
+export const minimalRestockProposal = (l: string) =>
   `Por ahora no tenemos «${l}» 😕. ¿Quiere que consulte si hay una fecha ` +
   `estimada de reposición?`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -282,7 +282,7 @@ export class MinimalRestockRequestService {
         resolved.variantId === null
           ? base
           : { ...base, variantId: resolved.variantId };
-      const question = proposal(presentation);
+      const question = minimalRestockProposal(presentation);
       const pending: PendingRestock = {
         originPhoneNumberId: bound.event.receivingPhoneNumberId,
         originMessageId: bound.event.messageId,
@@ -350,7 +350,7 @@ export class MinimalRestockRequestService {
         if (!pending.armed) return ambiguous;
         if (decision === 'decline') {
           this.pending.delete(senderId);
-          return { kind: 'handled', reply: DECLINE_REPLY };
+          return { kind: 'handled', reply: MINIMAL_RESTOCK_DECLINE_REPLY };
         }
         // Consume the slot BEFORE awaiting so a concurrent turn cannot re-enter.
         this.pending.delete(senderId);
@@ -408,7 +408,7 @@ export class MinimalRestockRequestService {
     }
     if (verdict === 'decline') {
       this.pending.delete(senderId);
-      return { kind: 'handled', reply: DECLINE_REPLY };
+      return { kind: 'handled', reply: MINIMAL_RESTOCK_DECLINE_REPLY };
     }
     if (verdict !== 'accept') return clarification;
     // Consume BEFORE awaiting so a concurrent accept cannot double-write.
@@ -437,10 +437,16 @@ export class MinimalRestockRequestService {
       },
     );
     if (result.ok && result.outcome === 'historical_intake_recorded') {
-      return { kind: 'handled', reply: confirmed(pending.presentation) };
+      return {
+        kind: 'handled',
+        reply: minimalRestockConfirmedReply(pending.presentation),
+      };
     }
     if (result.ok && result.outcome === 'existing_restock_recorded') {
-      return { kind: 'handled', reply: already(pending.presentation) };
+      return {
+        kind: 'handled',
+        reply: minimalRestockAlreadyReply(pending.presentation),
+      };
     }
     return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
   }
