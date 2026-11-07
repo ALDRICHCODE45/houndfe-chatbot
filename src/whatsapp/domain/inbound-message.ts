@@ -22,6 +22,11 @@ export interface InboundMessage {
    * is structurally valid (id + mime present and type matches payload).
    */
   media?: InboundMedia;
+  /**
+   * S4: id of the tapped reply button or list row (`text` then holds what it
+   * stands for: "SÍ", a change intent, or the row title).
+   */
+  interactiveReplyId?: string;
 }
 
 /**

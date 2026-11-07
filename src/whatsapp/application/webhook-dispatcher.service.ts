@@ -22,7 +22,11 @@ import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../llm-agent/domain/customer-style';
-import type { CustomerReplyMedia } from '../../llm-agent/domain/customer-reply';
+import {
+  interactiveReplyText,
+  type CustomerReply,
+  type CustomerReplyMedia,
+} from '../../llm-agent/domain/customer-reply';
 import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
 import {
   buildProductImageTurnText,
@@ -85,7 +89,9 @@ import {
  *      allowlist, no legacy fallback). `AgentRunner` is used only for the
  *      ops synthetic "resolved" turn in step 3.
  *   6. WhatsappSenderPort.sendText — send the reply (S3: any product photo
- *      first via the optional sendImage; an image failure only warns).
+ *      first via the optional sendImage; an image failure only warns). S4:
+ *      a reply with buttons/list goes out through the optional
+ *      sendInteractive; when absent or failing, the same text is sent.
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
  *      successful send, so a failed send lets Meta re-deliver and retry.
  *
@@ -348,6 +354,9 @@ export class WebhookDispatcherService {
     const minimal = await this.minimalCatalogAgent.tryHandle({
       senderId: message.senderId,
       text,
+      ...(message.interactiveReplyId === undefined
+        ? {}
+        : { interactiveReplyId: message.interactiveReplyId }),
       ...(message.receivingPhoneNumberId === undefined
         ? {}
         : {
@@ -362,16 +371,56 @@ export class WebhookDispatcherService {
     for (const media of minimal.media ?? []) {
       await this.sendReplyImage(message.senderId, media);
     }
-    const { providerMessageId } = await this.whatsappSender.sendText({
-      to: message.senderId,
-      text: minimal.reply,
-    });
+    const providerMessageIds = await this.sendReplyText(
+      message.senderId,
+      minimal,
+    );
     // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
     // question, and BEFORE the observational remember/markSeen writes so
     // an observation failure can never undo the accepted send.
     minimal.onSent?.();
-    this.recentOutbound.remember(providerMessageId);
+    for (const id of providerMessageIds) this.recentOutbound.remember(id);
     await this.markSeenSafely(message.messageId);
+  }
+
+  /**
+   * S4: the reply text, with its buttons/list when the sender supports them.
+   * A missing or failed interactive send falls back to the same plain text
+   * (it already says how to answer), so the reply is never lost.
+   */
+  private async sendReplyText(
+    to: string,
+    reply: CustomerReply,
+  ): Promise<string[]> {
+    const interactive = reply.interactive;
+    if (
+      interactive !== undefined &&
+      this.whatsappSender.sendInteractive !== undefined
+    ) {
+      try {
+        const { prompt, ...controls } = interactive;
+        const sent = await this.whatsappSender.sendInteractive({
+          to,
+          body: reply.reply,
+          interactive: controls,
+          ...(prompt === undefined ? {} : { shortBody: prompt }),
+        });
+        return sent.providerMessageIds.length > 0
+          ? sent.providerMessageIds
+          : [sent.providerMessageId];
+      } catch (error) {
+        this.logger.warn(
+          `interactive reply failed for ${to}; sending the text only: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    const { providerMessageId } = await this.whatsappSender.sendText({
+      to,
+      text: reply.reply,
+    });
+    return [providerMessageId];
   }
 
   /** S3: best effort. A failed or unsupported image never blocks the text
@@ -513,6 +562,35 @@ export function normalizeInboundMessages(
           ];
         }
 
+        // ── S4: tapped reply button / list row, legacy template button ─
+        if (
+          (message.type === 'interactive' || message.type === 'button') &&
+          typeof message.id === 'string' &&
+          typeof message.timestamp === 'string'
+        ) {
+          const reply = normalizeInteractiveReply(message);
+          const senderId = message.from ?? fallbackSenderId;
+          if (
+            reply === null ||
+            typeof senderId !== 'string' ||
+            senderId.length === 0
+          ) {
+            return [];
+          }
+          return [
+            {
+              senderId,
+              text: reply.text,
+              messageId: message.id,
+              timestamp: normalizeTimestamp(message.timestamp),
+              receivingPhoneNumberId,
+              ...(reply.id === undefined
+                ? {}
+                : { interactiveReplyId: reply.id }),
+            },
+          ];
+        }
+
         // ── WU13-A2: image / document media ──────────────────────
         if (
           (message.type === 'image' || message.type === 'document') &&
@@ -549,6 +627,31 @@ export function normalizeInboundMessages(
       });
     }),
   );
+}
+
+/**
+ * S4: a tapped `button_reply`/`list_reply` becomes the text its id stands
+ * for (see `interactiveReplyText`) plus the id; a legacy quick-reply
+ * template `button` is just its text. `null` for anything unusable.
+ */
+function normalizeInteractiveReply(
+  message: WebhookMessageDto,
+): { text: string; id?: string } | null {
+  if (message.type === 'button') {
+    const text = message.button?.text;
+    return typeof text === 'string' && text.trim() !== '' ? { text } : null;
+  }
+  const interactive = message.interactive;
+  const reply =
+    interactive?.type === 'button_reply'
+      ? interactive.button_reply
+      : interactive?.type === 'list_reply'
+        ? interactive.list_reply
+        : undefined;
+  const id = reply?.id;
+  if (typeof id !== 'string' || id === '') return null;
+  const text = interactiveReplyText(id, reply?.title);
+  return text.trim() === '' ? null : { text, id };
 }
 
 function normalizeTimestamp(timestamp: string): string {

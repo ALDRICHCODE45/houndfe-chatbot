@@ -20,6 +20,7 @@ import { MinimalCheckoutService } from '../../src/llm-agent/application/minimal-
 import { MinimalOrderService } from '../../src/llm-agent/application/minimal-order.service';
 import { MinimalShippingService } from '../../src/llm-agent/application/minimal-shipping.service';
 import type { GenerateTextFn } from '../../src/llm-agent/infrastructure/generate-text.provider';
+import type { CustomerReplyInteractive } from '../../src/llm-agent/domain/customer-reply';
 import { InMemoryMinimalCatalogSessionStore } from '../../src/llm-agent/infrastructure/in-memory-minimal-catalog-session.store';
 import {
   checkOrders,
@@ -63,6 +64,8 @@ interface TurnRecord {
   reply: string;
   /** S3 product photos sent before the reply text. */
   images: string[];
+  /** S4 buttons/list sent with the reply text, as one transcript line. */
+  interactive: string | null;
   tools: string[];
   llmCalls: number;
   gate: string | null;
@@ -245,6 +248,18 @@ function buildHarness(scenario: Scenario, meter: Meter) {
 }
 
 /** Labels server-owned (deterministic) replies so gate behavior is visible. */
+/** S4: "🔘 Botones: [a] [b]" / "📋 Lista (Ver opciones): a · b", or null. */
+function describeInteractive(
+  interactive: CustomerReplyInteractive | undefined,
+): string | null {
+  if (interactive === undefined) return null;
+  return interactive.type === 'buttons'
+    ? `🔘 Botones: ${interactive.buttons.map((b) => `[${b.title}]`).join(' ')}`
+    : `📋 Lista (${interactive.buttonText}): ${interactive.rows
+        .map((r) => r.title)
+        .join(' · ')}`;
+}
+
 function gateLabel(reply: string, llmCalls: number): string | null {
   const labels: string[] = [];
   if (llmCalls === 0) labels.push('deterministic gate (no LLM call)');
@@ -294,6 +309,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     const before = { ...meter.usage };
     let reply = '';
     let images: string[] = [];
+    let interactive: string | null = null;
     let error: string | undefined;
     try {
       const decision = await agent.tryHandle({
@@ -309,6 +325,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       images = (decision.media ?? []).map(
         (media) => `${media.caption ?? '(sin pie)'} <${media.url}>`,
       );
+      interactive = describeInteractive(decision.interactive);
       // The reply reached WhatsApp: arm any pending confirmation.
       decision.onSent?.();
     } catch (err) {
@@ -327,6 +344,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       customer: turn.text,
       reply,
       images,
+      interactive,
       tools: [...meter.tools],
       llmCalls: meter.calls,
       gate: gateLabel(reply, meter.calls),
@@ -382,6 +400,7 @@ function transcript(records: ScenarioRecord[], startedAt: string): string {
         ...(t.reply === ''
           ? ['> _(no reply)_']
           : t.reply.split('\n').map((l) => `> ${l}`)),
+        ...(t.interactive === null ? [] : ['>', `> ${t.interactive}`]),
         '',
       );
       lines.push(

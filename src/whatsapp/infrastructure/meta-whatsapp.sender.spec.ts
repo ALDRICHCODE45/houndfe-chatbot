@@ -6,6 +6,7 @@ import { InboundMessage } from '../domain/inbound-message';
 import {
   InvalidOutboundTemplateError,
   OutboundImage,
+  OutboundInteractive,
   OutboundTemplate,
   OutboundText,
   UnsupportedOutboundError,
@@ -489,6 +490,267 @@ describe('MetaWhatsappSender', () => {
         'Meta response did not include a provider message id',
       );
     });
+  });
+});
+
+describe('MetaWhatsappSender.sendInteractive (S4)', () => {
+  let post: jest.SpiedFunction<HttpService['post']>;
+  let sender: MetaWhatsappSender;
+  let normalization: boolean;
+  const URL = 'https://graph.facebook.com/v23.0/1234567890/messages';
+  const AUTH = { headers: { Authorization: 'Bearer meta-access-token' } };
+
+  beforeEach(() => {
+    const service = new HttpService();
+    normalization = false;
+    let n = 0;
+    post = jest
+      .spyOn(service, 'post')
+      .mockImplementation(() =>
+        of(axiosResponse({ messages: [{ id: `wamid.${(n += 1)}` }] })),
+      );
+    sender = new MetaWhatsappSender(
+      service,
+      new ConfigService({
+        meta: {
+          accessToken: 'meta-access-token',
+          phoneNumberId: '1234567890',
+          graphApiBaseUrl: 'https://graph.facebook.com/v23.0',
+          get sandboxRecipientNormalizationEnabled() {
+            return normalization;
+          },
+        },
+      }),
+    );
+  });
+
+  const buttons: OutboundInteractive = {
+    to: '5215550001111',
+    body: 'Resumen de su pedido:\n• Kong: 1 × $329.00',
+    interactive: {
+      type: 'buttons',
+      buttons: [
+        { id: 'order_confirm:ref-1', title: '✅ Confirmar pedido' },
+        { id: 'order_change', title: '✏️ Cambiar algo' },
+      ],
+    },
+    shortBody: '¿Confirma su pedido?',
+  };
+
+  it('sends reply buttons as one Graph API interactive message', async () => {
+    await expect(sender.sendInteractive(buttons)).resolves.toEqual({
+      providerMessageId: 'wamid.1',
+      providerMessageIds: ['wamid.1'],
+    });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      URL,
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: '5215550001111',
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: { text: buttons.body },
+          action: {
+            buttons: [
+              {
+                type: 'reply',
+                reply: {
+                  id: 'order_confirm:ref-1',
+                  title: '✅ Confirmar pedido',
+                },
+              },
+              {
+                type: 'reply',
+                reply: { id: 'order_change', title: '✏️ Cambiar algo' },
+              },
+            ],
+          },
+        },
+      },
+      AUTH,
+    );
+  });
+
+  it('sends a list with its button text and one section of rows', async () => {
+    await sender.sendInteractive({
+      to: '5215550001111',
+      body: '¿Qué presentación desea agregar: 10 kg o 20 kg?',
+      interactive: {
+        type: 'list',
+        buttonText: 'Ver opciones',
+        sectionTitle: 'Presentaciones',
+        rows: [
+          { id: 'pick_variant:a', title: '10 kg — $219' },
+          { id: 'pick_variant:b', title: '20 kg — $389', description: 'Arena' },
+        ],
+      },
+    });
+    expect(post).toHaveBeenCalledWith(
+      URL,
+      expect.objectContaining({
+        type: 'interactive',
+        interactive: {
+          type: 'list',
+          body: { text: '¿Qué presentación desea agregar: 10 kg o 20 kg?' },
+          action: {
+            button: 'Ver opciones',
+            sections: [
+              {
+                title: 'Presentaciones',
+                rows: [
+                  { id: 'pick_variant:a', title: '10 kg — $219' },
+                  {
+                    id: 'pick_variant:b',
+                    title: '20 kg — $389',
+                    description: 'Arena',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+      AUTH,
+    );
+  });
+
+  it('shortens titles, descriptions and button text to the Meta limits and keeps at most 3 buttons / 10 rows', async () => {
+    await sender.sendInteractive({
+      ...buttons,
+      interactive: {
+        type: 'buttons',
+        buttons: [
+          { id: 'a', title: '✅ Un título de botón demasiado largo' },
+          { id: 'b', title: 'B' },
+          { id: 'c', title: 'C' },
+          { id: 'd', title: 'D' },
+        ],
+      },
+    });
+    const sentButtons = (
+      post.mock.calls[0][1] as {
+        interactive: {
+          action: { buttons: Array<{ reply: { title: string } }> };
+        };
+      }
+    ).interactive.action.buttons;
+    expect(sentButtons).toHaveLength(3);
+    expect(sentButtons[0].reply.title.length).toBeLessThanOrEqual(20);
+    expect(sentButtons[0].reply.title).toMatch(/^✅ Un título.*…$/);
+
+    await sender.sendInteractive({
+      to: '5215550001111',
+      body: 'Elija',
+      interactive: {
+        type: 'list',
+        buttonText: 'Ver todas las opciones disponibles',
+        rows: Array.from({ length: 12 }, (_, i) => ({
+          id: `pick_product:${i}`,
+          title: `Producto con un nombre muy largo número ${i}`,
+          description: 'd'.repeat(100),
+        })),
+      },
+    });
+    const list = (
+      post.mock.calls[1][1] as {
+        interactive: {
+          action: {
+            button: string;
+            sections: Array<{
+              rows: Array<{ title: string; description?: string }>;
+            }>;
+          };
+        };
+      }
+    ).interactive.action;
+    expect(list.button.length).toBeLessThanOrEqual(20);
+    expect(list.sections[0].rows).toHaveLength(10);
+    for (const row of list.sections[0].rows) {
+      expect(row.title.length).toBeLessThanOrEqual(24);
+      expect((row.description ?? '').length).toBeLessThanOrEqual(72);
+    }
+  });
+
+  it('sends a body over 1024 chars first as text, then the controls with the short body', async () => {
+    const long = `Resumen de su pedido:\n${'• línea\n'.repeat(200)}`;
+    await expect(
+      sender.sendInteractive({ ...buttons, body: long }),
+    ).resolves.toEqual({
+      providerMessageId: 'wamid.2',
+      providerMessageIds: ['wamid.1', 'wamid.2'],
+    });
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ type: 'text', text: { body: long } }),
+    );
+    expect(post.mock.calls[1][1]).toEqual(
+      expect.objectContaining({
+        type: 'interactive',
+        interactive: expect.objectContaining({
+          body: { text: '¿Confirma su pedido?' },
+        }) as unknown,
+      }),
+    );
+  });
+
+  it('keeps the delivered text when the controls after a long body fail', async () => {
+    let n = 0;
+    post.mockImplementation(() =>
+      (n += 1) === 1
+        ? of(axiosResponse({ messages: [{ id: 'wamid.text' }] }))
+        : throwError(() => ({ response: { status: 400, data: {} } })),
+    );
+    await expect(
+      sender.sendInteractive({ ...buttons, body: 'x'.repeat(1100) }),
+    ).resolves.toEqual({
+      providerMessageId: 'wamid.text',
+      providerMessageIds: ['wamid.text'],
+    });
+  });
+
+  it('rewrites the trunk-1 recipient only when normalization is enabled', async () => {
+    normalization = true;
+    await sender.sendInteractive(buttons);
+    expect(post).toHaveBeenLastCalledWith(
+      URL,
+      expect.objectContaining({ to: '525550001111' }),
+      AUTH,
+    );
+  });
+
+  it.each<[string, Partial<OutboundInteractive>]>([
+    ['empty recipient', { to: '' }],
+    ['empty body', { body: '' }],
+    ['no buttons', { interactive: { type: 'buttons', buttons: [] } }],
+    [
+      'an empty button id',
+      { interactive: { type: 'buttons', buttons: [{ id: '', title: 'A' }] } },
+    ],
+    ['no rows', { interactive: { type: 'list', buttonText: 'Ver', rows: [] } }],
+  ])('rejects %s before any request', async (_label, override) => {
+    await expect(
+      sender.sendInteractive({ ...buttons, ...override }),
+    ).rejects.toThrow(UnsupportedOutboundError);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('maps a Graph API rejection to the same sanitized typed error as sendText', async () => {
+    post.mockReturnValue(
+      throwError(() => ({
+        response: {
+          status: 400,
+          data: {
+            error: { code: 131009, message: 'Parameter value is not valid' },
+          },
+        },
+      })),
+    );
+    await expect(sender.sendInteractive(buttons)).rejects.toBeInstanceOf(
+      WhatsappSendError,
+    );
   });
 });
 

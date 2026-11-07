@@ -19,6 +19,39 @@ export interface OutboundImage {
   caption?: string;
 }
 
+/** S4 reply buttons (Graph API `interactive.type: 'button'`). */
+export interface OutboundInteractiveButtons {
+  type: 'buttons';
+  /** 1-3; titles over 20 chars are shortened. */
+  buttons: ReadonlyArray<{ id: string; title: string }>;
+}
+
+/** S4 single-section list (Graph API `interactive.type: 'list'`). */
+export interface OutboundInteractiveList {
+  type: 'list';
+  /** Button that opens the list; shortened to 20 chars. */
+  buttonText: string;
+  /** 1-10; title ≤ 24, description ≤ 72 (longer ones are shortened). */
+  rows: ReadonlyArray<{ id: string; title: string; description?: string }>;
+  sectionTitle?: string;
+}
+
+/**
+ * Interactive message. A `body` over Meta's 1024 chars is sent first as a
+ * plain text message, followed by the controls with `shortBody`.
+ */
+export interface OutboundInteractive {
+  to: string;
+  body: string;
+  interactive: OutboundInteractiveButtons | OutboundInteractiveList;
+  shortBody?: string;
+}
+
+/** Every message Meta accepted for one interactive send, in send order. */
+export interface InteractiveSendResult extends SendResult {
+  providerMessageIds: string[];
+}
+
 /**
  * Pre-approved template message (Meta WhatsApp Manager). Only for sends
  * outside the 24h customer service window, where free-form text is refused.
@@ -68,4 +101,11 @@ export interface WhatsappSenderPort {
    * text alone when it is absent.
    */
   sendImage?(message: OutboundImage): Promise<SendResult>;
+  /**
+   * S4. Optional like `sendImage`; callers send the plain text when it is
+   * absent or fails.
+   */
+  sendInteractive?(
+    message: OutboundInteractive,
+  ): Promise<InteractiveSendResult>;
 }

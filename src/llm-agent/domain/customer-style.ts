@@ -157,6 +157,10 @@ export function customerStyleDirective(style: CustomerStyle): string {
  */
 const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   // Whole clauses whose verbs depend on context.
+  // S4 interactive prompts and the change-button reply.
+  ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
+  ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
+  ['Elija una opción', 'Elige una opción'],
   [
     'Si vuelve a pedir el resumen y responde SÍ',
     'Si vuelves a pedir el resumen y respondes SÍ',
@@ -315,6 +319,17 @@ function limitEmojis(text: string, keep: number): string {
 export function applyCustomerStyle(text: string, style: CustomerStyle): string {
   const registered = style.register === 'tu' ? toTu(text) : text;
   return limitEmojis(registered, style.emojis ? 1 : 0);
+}
+
+/**
+ * S4: register only (usted/tú), emojis untouched. For interactive button
+ * titles, whose emoji is part of the control, not decoration.
+ */
+export function applyCustomerRegister(
+  text: string,
+  style: CustomerStyle,
+): string {
+  return style.register === 'tu' ? toTu(text) : text;
 }
 
 /** Emoji guard only, for model-authored text the prompt already styled. */

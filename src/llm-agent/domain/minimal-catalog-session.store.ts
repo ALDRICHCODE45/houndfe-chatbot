@@ -1,7 +1,10 @@
 import type { ModelMessage } from 'ai';
 import type { MinimalCartSelectionSnapshot } from './minimal-cart-selections';
 import type { MinimalCartPendingRequest } from './minimal-cart-quantity';
-import type { ProductImageContext } from './customer-reply';
+import type {
+  InteractiveChoiceContext,
+  ProductImageContext,
+} from './customer-reply';
 
 /** DI injection token for the MinimalCatalogSessionStore port. */
 export const MINIMAL_CATALOG_SESSION_STORE = Symbol(
@@ -31,12 +34,18 @@ export type MinimalCartConversationContext = {
  * flatten the retained messages and union the verified identity. `cartContext`
  * carries the owned selection snapshot and pending intent for the cart route;
  * `productImages` the known product photos and the ones already sent (S3).
+ * S4: `interactiveChoice` is the list THIS turn sent (never inherited, so a
+ * pick only counts while it answers the latest message); `catalogPrices`
+ * the catalog prices read so far (`productId|variantId` → cents) for row
+ * titles.
  */
 export type MinimalCatalogTurn = {
   messages: ModelMessage[];
   verifiedProductIds: string[];
   cartContext?: MinimalCartConversationContext;
   productImages?: ProductImageContext;
+  interactiveChoice?: InteractiveChoiceContext;
+  catalogPrices?: Record<string, number>;
 };
 
 /**

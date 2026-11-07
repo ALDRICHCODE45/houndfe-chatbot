@@ -40,6 +40,7 @@ import {
   sameMinimalOrder,
   type MinimalOrderIneligibleReason,
   type MinimalOrderSnapshot,
+  type MinimalOrderStatus,
   type MinimalOrderShipping,
 } from '../domain/minimal-order-confirmation';
 import {
@@ -341,6 +342,11 @@ export class MinimalOrderService {
       };
     }
     return this.offer(senderId, inboundEvent, fresh.snapshot);
+  }
+
+  /** S4: the live pending summary (reference + armed), or `null`. */
+  offerStatus(senderId: string): MinimalOrderStatus | null {
+    return this.confirmation.status(senderId);
   }
 
   /** Drop the sender's pending summary when another route answers a turn. */

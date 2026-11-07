@@ -28,6 +28,8 @@ import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
 import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import {
+  DEFAULT_CUSTOMER_STYLE,
+  applyCustomerRegister,
   applyCustomerStyle,
   customerStyleDirective,
   detectCustomerStyle,
@@ -37,13 +39,22 @@ import {
 import type { MinimalCatalogTurn } from '../domain/minimal-catalog-session.store';
 import {
   boundProductImageContext,
+  checkoutConfirmationButtons,
+  choiceList,
   isSendableProductImageUrl,
+  orderConfirmationButtons,
+  parseInteractiveReplyId,
   productImageCaption,
+  shortMxn,
   type CustomerReply,
+  type CustomerReplyInteractive,
   type CustomerReplyMedia,
+  type InteractiveChoiceContext,
+  type InteractiveReplyIntent,
   type ProductImageContext,
 } from '../domain/customer-reply';
 import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
+import { MINIMAL_CHECKOUT_SUMMARY_HEADING } from '../domain/minimal-checkout-confirmation';
 import {
   GENERATE_TEXT,
   type GenerateTextFn,
@@ -60,6 +71,8 @@ import {
   cartKeepOnlyToolInput,
   cartPrepareToolInput,
   cartSetToolInput,
+  presentationLabel,
+  type CartChoice,
   type CartLineIdentity,
   type ResolvedCartSelection,
 } from './minimal-cart-conversation';
@@ -165,6 +178,23 @@ export const EMPTY_REPLY_FALLBACK =
 
 // G2: lead before the updated order summary after a cart change.
 export const CART_UPDATED_LEAD = 'Listo, actualicé su carrito.';
+
+// S4: replies to the interactive buttons.
+export const ORDER_CHANGE_REPLY = 'Claro, ¿qué desea cambiar?';
+export const CHECKOUT_CHANGE_REPLY = '¿Qué dato quiere corregir?';
+/** Lead for a tap on a button whose summary is no longer the current one. */
+export const STALE_BUTTON_LEAD = 'Ese botón ya no está vigente.';
+const STALE_BUTTON_FALLBACK = `${STALE_BUTTON_LEAD} ¿Qué desea hacer?`;
+const ORDER_BUTTONS_PROMPT = '¿Confirma su pedido?';
+const CHECKOUT_BUTTONS_PROMPT = '¿Son correctos sus datos de entrega?';
+const CHOICE_LIST_PROMPT = 'Elija una opción de la lista.';
+const CATALOG_PRICES_MAX = 100;
+
+/** S4: a list row the customer picked from the bot's latest message. */
+type InteractivePick = { reference: string; text: string };
+
+const priceKey = (productId: string, variantId?: string | null) =>
+  `${productId}|${variantId ?? ''}`;
 
 /**
  * Model text imitating the server-owned delivery-data or order summaries.
@@ -303,7 +333,25 @@ type ProductImageRun = {
   sent: Set<string>;
   presented: Map<string, string>;
   added: Set<string>;
+  /** S4: catalog prices (`priceKey` → cents) for list row titles. */
+  prices: Map<string, number>;
 };
+
+/** S4: remember a catalog item's prices, most recent last. */
+function recordPrices(
+  prices: Map<string, number>,
+  item: CatalogItemResponse,
+): void {
+  const put = (key: string, cents: unknown) => {
+    if (typeof cents !== 'number' || !Number.isSafeInteger(cents) || cents < 0)
+      return;
+    prices.delete(key);
+    prices.set(key, cents);
+  };
+  put(priceKey(item.productId), item.price?.priceCents);
+  for (const variant of item.variants ?? [])
+    put(priceKey(item.productId, variant.variantId), variant.priceCents);
+}
 
 /** Lowercase, accent- and markdown-free text for name matching. */
 function matchable(text: string): string {
@@ -614,6 +662,8 @@ export class MinimalCatalogAgentService {
     senderId: string;
     text: string;
     inboundEvent?: unknown;
+    /** S4: id of the tapped reply button / list row, when there is one. */
+    interactiveReplyId?: string;
   }): Promise<MinimalCatalogAgentDecision> {
     if (this.busy.has(input.senderId)) {
       // Any turn after a summary spends its consent, even a rejected one.
@@ -630,8 +680,42 @@ export class MinimalCatalogAgentService {
     this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
     try {
-      // The busy span covers the free consume and the SDK run.
-      if (this.restock !== undefined) {
+      return this.withConfirmationButtons(
+        input.senderId,
+        await this.handleTurn(input),
+      );
+    } finally {
+      if (this.interrupted.delete(input.senderId)) {
+        this.order?.dismiss(input.senderId);
+      }
+      this.busy.delete(input.senderId);
+    }
+  }
+
+  /** One customer turn inside the busy span (gates, then the SDK run). */
+  private async handleTurn(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+    interactiveReplyId?: string;
+  }): Promise<MinimalCatalogAgentDecision> {
+    {
+      let pick: InteractivePick | undefined;
+      if (input.interactiveReplyId !== undefined) {
+        const tapped = await this.consumeInteractive(
+          input,
+          parseInteractiveReplyId(input.interactiveReplyId),
+        );
+        if ('decision' in tapped) return tapped.decision;
+        input = tapped.input;
+        pick = tapped.pick;
+      }
+      // The busy span covers the free consume and the SDK run. A tapped
+      // button or row never answers a RESTOCK question.
+      if (
+        this.restock !== undefined &&
+        input.interactiveReplyId === undefined
+      ) {
         const consumed = await this.restock.consume({
           senderId: input.senderId,
           text: input.text,
@@ -699,26 +783,243 @@ export class MinimalCatalogAgentService {
           };
         }
       }
-      const result = await this.runTurn(input);
-      return {
-        kind: 'handled',
-        reply: result.reply,
-        ...(result.media === undefined ? {} : { media: result.media }),
-        ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
-      };
-    } finally {
-      if (this.interrupted.delete(input.senderId)) {
-        this.order?.dismiss(input.senderId);
-      }
-      this.busy.delete(input.senderId);
+      return this.decision(await this.runTurn(input, pick));
     }
   }
 
-  private async runTurn(input: {
+  private decision(
+    result: CustomerReply & { onSent?: () => void },
+  ): MinimalCatalogAgentDecision {
+    return {
+      kind: 'handled',
+      reply: result.reply,
+      ...(result.media === undefined ? {} : { media: result.media }),
+      ...(result.interactive === undefined
+        ? {}
+        : { interactive: result.interactive }),
+      ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+    };
+  }
+
+  /**
+   * S4: a tapped reply. Change buttons are answered here; a confirm bound to
+   * a summary that is no longer the pending one re-presents the current step
+   * (never confirms); a list pick from the bot's latest message continues
+   * with the full option text and its selection reference; an unknown id
+   * skips every gate. Otherwise the turn continues through the gates.
+   */
+  private async consumeInteractive(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      interactiveReplyId?: string;
+    },
+    intent: InteractiveReplyIntent | null,
+  ): Promise<
+    | { decision: MinimalCatalogAgentDecision }
+    | { input: typeof input; pick?: InteractivePick }
+  > {
+    const { senderId } = input;
+    const style = this.customerStyle(senderId, input.text);
+    const answer = (result: { reply: string; onSent?: () => void }) => {
+      const reply = applyCustomerStyle(result.reply, style);
+      this.recordTurn(
+        senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [],
+      );
+      return {
+        decision: this.decision(
+          result.onSent === undefined
+            ? { reply }
+            : { reply, onSent: result.onSent },
+        ),
+      };
+    };
+    if (intent === null) {
+      this.order?.dismiss(senderId);
+      return { decision: this.decision(await this.runTurn(input)) };
+    }
+    switch (intent.kind) {
+      case 'order_change':
+        this.order?.dismiss(senderId);
+        return answer({ reply: ORDER_CHANGE_REPLY });
+      case 'checkout_change': {
+        this.order?.dismiss(senderId);
+        const declined =
+          this.checkoutAvailable() &&
+          this.checkout!.confirmationStatus(senderId)?.stage === 'pending'
+            ? await this.checkout!.consume({ ...input, text: 'no' })
+            : null;
+        return answer(declined ?? { reply: CHECKOUT_CHANGE_REPLY });
+      }
+      case 'order_confirm':
+        if (
+          intent.reference !== null &&
+          this.order?.offerStatus(senderId)?.reference !== intent.reference
+        )
+          return answer(await this.representAfterStaleButton(input));
+        return { input };
+      case 'checkout_confirm': {
+        const status = this.checkoutAvailable()
+          ? this.checkout!.confirmationStatus(senderId)
+          : null;
+        if (
+          intent.reference !== null &&
+          !(
+            status?.stage === 'pending' && status.reference === intent.reference
+          )
+        )
+          return answer(await this.representAfterStaleButton(input));
+        return { input };
+      }
+      case 'pick': {
+        const option = this.sessionStore
+          .read(senderId)
+          .at(-1)
+          ?.interactiveChoice?.options.find(
+            (candidate) => candidate.id === input.interactiveReplyId,
+          );
+        return option === undefined
+          ? { input }
+          : {
+              input: { ...input, text: option.text },
+              pick: { reference: option.reference, text: option.text },
+            };
+      }
+    }
+  }
+
+  /**
+   * S4: a confirm button from an older summary. Drop any pending order
+   * summary and present the CURRENT step (order summary, or the delivery
+   * data while unconfirmed) for a fresh tap; nothing is confirmed.
+   */
+  private async representAfterStaleButton(input: {
     senderId: string;
-    text: string;
     inboundEvent?: unknown;
-  }): Promise<CustomerReply & { onSent?: () => void }> {
+  }): Promise<MinimalCheckoutReply> {
+    this.order?.dismiss(input.senderId);
+    try {
+      if (this.orderAvailable())
+        return await this.continueToOrder(
+          input.senderId,
+          input.inboundEvent,
+          STALE_BUTTON_LEAD,
+        );
+      if (this.checkoutAvailable()) {
+        const prepared = await this.checkout!.prepareConfirmation(
+          input.senderId,
+          input.inboundEvent,
+        );
+        return {
+          ...prepared,
+          reply: `${STALE_BUTTON_LEAD}\n\n${prepared.reply}`,
+        };
+      }
+    } catch {
+      // Fall through to the question; nothing was confirmed.
+    }
+    return { reply: STALE_BUTTON_FALLBACK };
+  }
+
+  /**
+   * S4: ✅/✏️ buttons on a reply that presents a server-owned summary whose
+   * gate is still waiting to be armed by this send, bound to its reference.
+   * Model text never gets buttons.
+   */
+  private withConfirmationButtons(
+    senderId: string,
+    decision: MinimalCatalogAgentDecision,
+  ): MinimalCatalogAgentDecision {
+    if (decision.onSent === undefined || decision.interactive !== undefined)
+      return decision;
+    const presents = (heading: string) =>
+      decision.reply.includes(heading) ||
+      decision.reply.includes(
+        applyCustomerRegister(heading, {
+          ...DEFAULT_CUSTOMER_STYLE,
+          register: 'tu',
+        }),
+      );
+    const style = this.customerStyle(senderId);
+    let interactive: CustomerReplyInteractive | undefined;
+    const order = this.order?.offerStatus(senderId) ?? null;
+    if (
+      order !== null &&
+      !order.armed &&
+      presents(MINIMAL_ORDER_SUMMARY_HEADING)
+    ) {
+      interactive = orderConfirmationButtons(
+        order.reference,
+        applyCustomerStyle(ORDER_BUTTONS_PROMPT, style),
+      );
+    } else {
+      const checkout = this.checkoutAvailable()
+        ? this.checkout!.confirmationStatus(senderId)
+        : null;
+      if (
+        checkout?.stage === 'pending' &&
+        !checkout.armed &&
+        presents(MINIMAL_CHECKOUT_SUMMARY_HEADING)
+      )
+        interactive = checkoutConfirmationButtons(
+          checkout.reference,
+          applyCustomerStyle(CHECKOUT_BUTTONS_PROMPT, style),
+        );
+    }
+    return interactive === undefined ? decision : { ...decision, interactive };
+  }
+
+  /** S4: the presentation/product question as a list, when 2-10 options. */
+  private choiceInteractive(
+    choice: CartChoice,
+    prices: ReadonlyMap<string, number>,
+    style: CustomerStyle,
+  ): {
+    interactive: CustomerReplyInteractive;
+    context: InteractiveChoiceContext;
+  } | null {
+    return choiceList(
+      choice.kind,
+      choice.options.map((option) => {
+        if (choice.kind === 'variant') {
+          const label = presentationLabel(option);
+          const price = prices.get(
+            priceKey(option.productId, option.variantId),
+          );
+          return {
+            reference: option.reference,
+            title:
+              price === undefined ? label : `${label} — ${shortMxn(price)}`,
+            text: `${option.productName} ${label}`,
+          };
+        }
+        return {
+          reference: option.reference,
+          title: option.productName,
+          ...(option.productName.length > 24
+            ? { description: option.productName }
+            : {}),
+          text: option.productName,
+        };
+      }),
+      applyCustomerStyle(CHOICE_LIST_PROMPT, style),
+    );
+  }
+
+  private async runTurn(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+    },
+    pick?: InteractivePick,
+  ): Promise<CustomerReply & { onSent?: () => void }> {
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
@@ -759,7 +1060,10 @@ export class MinimalCatalogAgentService {
       sent: new Set(previousImages?.sent ?? []),
       presented: new Map(),
       added: new Set(),
+      prices: new Map(Object.entries(turns.at(-1)?.catalogPrices ?? {})),
     };
+    const persistedPrices = (): Record<string, number> =>
+      Object.fromEntries([...imageRun.prices].slice(-CATALOG_PRICES_MAX));
     const persistedImages = (): ProductImageContext =>
       boundProductImageContext({
         known: Object.fromEntries(imageRun.known),
@@ -897,7 +1201,10 @@ export class MinimalCatalogAgentService {
           ? SHIPPING_INSTRUCTIONS_FRAGMENT
           : '') +
         selectionContext +
-        pendingContext
+        pendingContext +
+        (pick === undefined
+          ? ''
+          : `\nEl cliente eligió en la lista del mensaje anterior: ${JSON.stringify(pick.text)} (selectionRef: ${pick.reference}). Continúe su solicitud con esa selectionRef EXACTA; no elija otra.`)
       : baseInstructions;
     const generateParams = {
       model: openai(this.model),
@@ -1054,6 +1361,12 @@ export class MinimalCatalogAgentService {
     }
     if (cartReply.value !== null) {
       const reply = styled(cartReply.value);
+      // S4: a server product/presentation question goes out as a list.
+      const choice = cartConversation?.lastChoice ?? null;
+      const list =
+        choice !== null && choice.question === cartReply.value
+          ? this.choiceInteractive(choice, imageRun.prices, style)
+          : null;
       // S3: the one product a cart write just added carries its photo.
       const media =
         cartReply.source === 'cart' &&
@@ -1070,8 +1383,16 @@ export class MinimalCatalogAgentService {
         [...currentIds],
         persistedCartContext(),
         persistedImages(),
+        {
+          catalogPrices: persistedPrices(),
+          ...(list === null ? {} : { interactiveChoice: list.context }),
+        },
       );
-      return media === undefined ? { reply } : { reply, media };
+      return {
+        reply,
+        ...(media === undefined ? {} : { media }),
+        ...(list === null ? {} : { interactive: list.interactive }),
+      };
     }
     if (this.hasInvalidCartToolCall(result)) {
       // A cart tool whose arguments failed SDK validation never executed; the
@@ -1323,6 +1644,10 @@ export class MinimalCatalogAgentService {
     verifiedProductIds: string[],
     cartContext?: MinimalCartConversationContext,
     productImages?: ProductImageContext,
+    interactive: {
+      catalogPrices?: Record<string, number>;
+      interactiveChoice?: InteractiveChoiceContext;
+    } = {},
   ): void {
     const turns = this.sessionStore.read(senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
@@ -1331,6 +1656,8 @@ export class MinimalCatalogAgentService {
     const inherited = cartContext ?? turns.at(-1)?.cartContext;
     // Same for the product photos: a gate turn never forgets a sent photo.
     const images = productImages ?? turns.at(-1)?.productImages;
+    // S4: prices carry forward; a list only belongs to the turn that sent it.
+    const prices = interactive.catalogPrices ?? turns.at(-1)?.catalogPrices;
     this.sessionStore.write(senderId, [
       ...prior,
       {
@@ -1338,6 +1665,10 @@ export class MinimalCatalogAgentService {
         verifiedProductIds,
         ...(inherited === undefined ? {} : { cartContext: inherited }),
         ...(images === undefined ? {} : { productImages: images }),
+        ...(prices === undefined ? {} : { catalogPrices: prices }),
+        ...(interactive.interactiveChoice === undefined
+          ? {}
+          : { interactiveChoice: interactive.interactiveChoice }),
       },
     ]);
   }
@@ -1567,6 +1898,7 @@ export class MinimalCatalogAgentService {
               allowedIds.add(item.productId);
               currentIds.add(item.productId);
               imageRun?.presented.set(item.productId, item.name);
+              if (imageRun !== null) recordPrices(imageRun.prices, item);
               if (
                 imageRun !== null &&
                 isSendableProductImageUrl(item.imageUrl)

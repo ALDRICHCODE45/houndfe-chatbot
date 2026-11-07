@@ -1,11 +1,17 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { lastValueFrom } from 'rxjs';
 import { AppConfig } from '../../config/configuration';
 import {
+  fitInteractiveText,
+  INTERACTIVE_LIMITS,
+} from '../../llm-agent/domain/customer-reply';
+import {
+  InteractiveSendResult,
   InvalidOutboundTemplateError,
   OutboundImage,
+  OutboundInteractive,
   OutboundTemplate,
   OutboundText,
   SendResult,
@@ -43,8 +49,13 @@ export class WhatsappSendError extends Error {
   }
 }
 
+/** S4 body when the reply text alone exceeds the interactive body limit. */
+const DEFAULT_SHORT_BODY = 'Elija una opción:';
+
 @Injectable()
 export class MetaWhatsappSender implements WhatsappSenderPort {
+  private readonly logger = new Logger(MetaWhatsappSender.name);
+
   constructor(
     private readonly httpService: HttpService,
     private readonly configService: ConfigService,
@@ -77,6 +88,55 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         ...(message.caption === undefined ? {} : { caption: message.caption }),
       },
     });
+  }
+
+  /**
+   * S4 reply buttons or list. Titles are shortened to Meta's limits; a body
+   * over 1024 chars goes out first as plain text, then the controls with the
+   * short body. Once that text is delivered, a failure of the controls only
+   * warns: the text already tells the customer how to answer.
+   */
+  async sendInteractive(
+    message: OutboundInteractive,
+  ): Promise<InteractiveSendResult> {
+    this.assertInteractiveMessage(message);
+    const interactive = buildInteractivePayload(message.interactive);
+
+    if (message.body.length <= INTERACTIVE_LIMITS.body) {
+      const { providerMessageId } = await this.send(
+        interactiveMessage(message.to, message.body, interactive),
+      );
+      return { providerMessageId, providerMessageIds: [providerMessageId] };
+    }
+
+    const text = await this.sendText({ to: message.to, text: message.body });
+    const shortBody = fitInteractiveText(
+      message.shortBody ?? DEFAULT_SHORT_BODY,
+      INTERACTIVE_LIMITS.body,
+    );
+    try {
+      const { providerMessageId } = await this.send(
+        interactiveMessage(
+          message.to,
+          shortBody === '' ? DEFAULT_SHORT_BODY : shortBody,
+          interactive,
+        ),
+      );
+      return {
+        providerMessageId,
+        providerMessageIds: [text.providerMessageId, providerMessageId],
+      };
+    } catch (error) {
+      this.logger.warn(
+        `interactive controls failed after the long text was sent: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return {
+        providerMessageId: text.providerMessageId,
+        providerMessageIds: [text.providerMessageId],
+      };
+    }
   }
 
   async sendTemplate(message: OutboundTemplate): Promise<SendResult> {
@@ -194,6 +254,50 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     }
   }
 
+  private assertInteractiveMessage(message: OutboundInteractive): void {
+    const validId = (id: unknown) =>
+      typeof id === 'string' && id !== '' && id.length <= INTERACTIVE_LIMITS.id;
+    const validTitle = (title: unknown) =>
+      typeof title === 'string' && title.trim() !== '';
+    const interactive = message?.interactive;
+    const valid =
+      typeof message?.to === 'string' &&
+      message.to !== '' &&
+      typeof message.body === 'string' &&
+      message.body.trim() !== '' &&
+      (message.shortBody === undefined ||
+        typeof message.shortBody === 'string') &&
+      ((interactive?.type === 'buttons' &&
+        Array.isArray(interactive.buttons) &&
+        interactive.buttons.length > 0 &&
+        interactive.buttons.every(
+          (button: { id?: unknown; title?: unknown } | null) =>
+            validId(button?.id) && validTitle(button?.title),
+        )) ||
+        (interactive?.type === 'list' &&
+          validTitle(interactive.buttonText) &&
+          Array.isArray(interactive.rows) &&
+          interactive.rows.length > 0 &&
+          interactive.rows.every(
+            (
+              row: {
+                id?: unknown;
+                title?: unknown;
+                description?: unknown;
+              } | null,
+            ) =>
+              validId(row?.id) &&
+              validTitle(row?.title) &&
+              (row?.description === undefined ||
+                typeof row.description === 'string'),
+          )));
+    if (!valid) {
+      throw new UnsupportedOutboundError(
+        'Invalid outbound interactive message',
+      );
+    }
+  }
+
   private assertTemplateMessage(message: OutboundTemplate): void {
     if (typeof message?.to !== 'string' || message.to === '') {
       throw new InvalidOutboundTemplateError('recipient');
@@ -226,6 +330,79 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       }
     }
   }
+}
+
+/** Graph API `interactive` object, shortened to Meta's limits. */
+function buildInteractivePayload(
+  interactive: OutboundInteractive['interactive'],
+): Record<string, unknown> {
+  if (interactive.type === 'buttons') {
+    return {
+      type: 'button',
+      action: {
+        buttons: interactive.buttons
+          .slice(0, INTERACTIVE_LIMITS.buttons)
+          .map((button) => ({
+            type: 'reply',
+            reply: {
+              id: button.id,
+              title: fitInteractiveText(
+                button.title,
+                INTERACTIVE_LIMITS.buttonTitle,
+              ),
+            },
+          })),
+      },
+    };
+  }
+  const rows = interactive.rows.slice(0, INTERACTIVE_LIMITS.rows).map((row) => {
+    const description =
+      row.description === undefined
+        ? ''
+        : fitInteractiveText(
+            row.description,
+            INTERACTIVE_LIMITS.rowDescription,
+          );
+    return {
+      id: row.id,
+      title: fitInteractiveText(row.title, INTERACTIVE_LIMITS.rowTitle),
+      ...(description === '' ? {} : { description }),
+    };
+  });
+  const sectionTitle =
+    interactive.sectionTitle === undefined
+      ? ''
+      : fitInteractiveText(
+          interactive.sectionTitle,
+          INTERACTIVE_LIMITS.rowTitle,
+        );
+  return {
+    type: 'list',
+    action: {
+      button: fitInteractiveText(
+        interactive.buttonText,
+        INTERACTIVE_LIMITS.listButtonText,
+      ),
+      sections: [
+        { ...(sectionTitle === '' ? {} : { title: sectionTitle }), rows },
+      ],
+    },
+  };
+}
+
+function interactiveMessage(
+  to: string,
+  body: string,
+  interactive: Record<string, unknown>,
+): MetaMessagePayload {
+  const { type, action } = interactive;
+  return {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'interactive',
+    interactive: { type, body: { text: body }, action },
+  };
 }
 
 /**
