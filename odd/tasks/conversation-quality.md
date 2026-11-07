@@ -17,11 +17,11 @@ Overnight audit and improvement of the WhatsApp bot's conversation ("alma"), con
 | ID  | Specs  | Route                                                                  | Commit  |
 | --- | ------ | ---------------------------------------------------------------------- | ------- |
 | T1  | S4     | explore: map prompt, confirmation handling, image routing, vision port | —       |
-| T2  | S1, S2 | persona + tone mirroring in prompt and fixed replies                   | —       |
+| T2  | S1, S2 | persona + tone mirroring in prompt and fixed replies (worker)          | acb460e |
 | T3  | S3     | confirmation recognition fixes (worker)                                | 4a687d5 |
 | T4  | S5     | product image recognition (worker)                                     | f2ec186 |
 | T5  | S4, S7 | live conversation eval within budget, fix findings                     | —       |
-| T6  | S6     | proposals doc                                                          | —       |
+| T6  | S6     | proposals doc                                                          | 437178f |
 
 ## Log
 
@@ -32,3 +32,4 @@ Overnight audit and improvement of the WhatsApp bot's conversation ("alma"), con
 - L5: T3 done (4a687d5): shared classifyConfirmationReply lexicon; D1-D4 fixed; decline replies added; related specs green, tsc 0.
 - L6: T4 done (f2ec186): src/product-image describer + dispatcher media routing; D6 fixed; 179 related tests, tsc 0. Eval harness committed (43a33fa); dry-run 14 scenarios ok.
 - L7: Live eval blocked: OPENAI_API_KEY is empty in .env and absent from the shell; the owner is asleep. Not reading other worktrees' secrets without permission. Continue with deterministic tests and dry-run; live run when the owner provides the key.
+- L8: T2 done (acb460e). Full suite after T2-T4: unit 6868 passed / 813 skipped, e2e 125/125, tsc 0, eslint 0, eval dry-run ok. Follow-ups: later notices (receipt worker, outcome poller, zone requester, human-decisions coordinators) stay usted without session style; session style in memory.

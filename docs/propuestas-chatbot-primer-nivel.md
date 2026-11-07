@@ -11,25 +11,25 @@ Ideas priorizadas para que el bot de WhatsApp de Tienda de mascotas HoundFe vend
 
 ## Prioridad alta (siguientes 2 semanas)
 
-| # | Propuesta | Beneficio | Esfuerzo | Backend |
-|---|---|---|---|---|
-| 1 | **Correr la evaluación con OpenAI real** antes de cada deploy y revisar las transcripciones | Detecta respuestas raras antes que el cliente | Bajo | No |
-| 2 | **Memoria de estilo y de cliente persistente** (hoy la sesión vive en memoria y se pierde al reiniciar) | El bot recuerda nombre, trato, mascota y último pedido entre días | Medio | No |
-| 3 | **"Lo mismo de la vez pasada"**: recompra con un mensaje usando el historial de pedidos | Recompra en segundos; ideal para alimento recurrente | Medio | Ya existe el endpoint |
-| 4 | **Perfil de mascota** (especie, raza, tamaño, edad, alergias) preguntado de forma natural una sola vez | Recomendaciones correctas ("croquetas raza grande sin grano") | Medio | Sí, campos en Customer |
-| 5 | **Fotos del producto en la respuesta** (enviar `imageUrl` del catálogo como imagen de WhatsApp) | El cliente confirma visualmente lo que compra | Bajo | No (ya viene `imageUrl`) |
-| 6 | **Botones y listas interactivas de WhatsApp** para confirmar ("Sí, confirmar" / "Cambiar") y elegir presentación | Menos errores de interpretación, conversaciones más cortas | Medio | No |
-| 7 | **Atención humana con contexto**: al escalar, el operador recibe resumen, carrito y última foto | Respuesta humana más rápida | Medio | No |
+| #   | Propuesta                                                                                                        | Beneficio                                                         | Esfuerzo | Backend                  |
+| --- | ---------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- | -------- | ------------------------ |
+| 1   | **Correr la evaluación con OpenAI real** antes de cada deploy y revisar las transcripciones                      | Detecta respuestas raras antes que el cliente                     | Bajo     | No                       |
+| 2   | **Memoria de estilo y de cliente persistente** (hoy la sesión vive en memoria y se pierde al reiniciar)          | El bot recuerda nombre, trato, mascota y último pedido entre días | Medio    | No                       |
+| 3   | **"Lo mismo de la vez pasada"**: recompra con un mensaje usando el historial de pedidos                          | Recompra en segundos; ideal para alimento recurrente              | Medio    | Ya existe el endpoint    |
+| 4   | **Perfil de mascota** (especie, raza, tamaño, edad, alergias) preguntado de forma natural una sola vez           | Recomendaciones correctas ("croquetas raza grande sin grano")     | Medio    | Sí, campos en Customer   |
+| 5   | **Fotos del producto en la respuesta** (enviar `imageUrl` del catálogo como imagen de WhatsApp)                  | El cliente confirma visualmente lo que compra                     | Bajo     | No (ya viene `imageUrl`) |
+| 6   | **Botones y listas interactivas de WhatsApp** para confirmar ("Sí, confirmar" / "Cambiar") y elegir presentación | Menos errores de interpretación, conversaciones más cortas        | Medio    | No                       |
+| 7   | **Atención humana con contexto**: al escalar, el operador recibe resumen, carrito y última foto                  | Respuesta humana más rápida                                       | Medio    | No                       |
 
 ## Prioridad media
 
-| # | Propuesta | Beneficio | Esfuerzo | Backend |
-|---|---|---|---|---|
-| 8 | **Recordatorio de recompra** ("a Max se le está acabando el alimento") con plantilla aprobada y consentimiento | Ventas recurrentes | Medio | Sí, plantillas y opt-in |
-| 9 | **Notas de voz**: transcribir audio y responder como texto | Muchos clientes mandan audios | Medio | No |
-| 10 | **Sugerencias complementarias** discretas (arena + alimento de gato, premios) solo después de resolver la consulta | Ticket promedio mayor sin sonar a vendedor insistente | Bajo | No |
-| 11 | **Búsqueda por similitud de imagen** contra las fotos del catálogo, además de la descripción | Reconocer productos sin etiqueta visible | Alto | Sí, embeddings de imágenes |
-| 12 | **Horario y ubicación** con mapa de la sucursal para recoger | Menos preguntas repetidas | Bajo | Ya existe pickupLocation |
+| #   | Propuesta                                                                                                          | Beneficio                                             | Esfuerzo | Backend                    |
+| --- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------- | -------- | -------------------------- |
+| 8   | **Recordatorio de recompra** ("a Max se le está acabando el alimento") con plantilla aprobada y consentimiento     | Ventas recurrentes                                    | Medio    | Sí, plantillas y opt-in    |
+| 9   | **Notas de voz**: transcribir audio y responder como texto                                                         | Muchos clientes mandan audios                         | Medio    | No                         |
+| 10  | **Sugerencias complementarias** discretas (arena + alimento de gato, premios) solo después de resolver la consulta | Ticket promedio mayor sin sonar a vendedor insistente | Bajo     | No                         |
+| 11  | **Búsqueda por similitud de imagen** contra las fotos del catálogo, además de la descripción                       | Reconocer productos sin etiqueta visible              | Alto     | Sí, embeddings de imágenes |
+| 12  | **Horario y ubicación** con mapa de la sucursal para recoger                                                       | Menos preguntas repetidas                             | Bajo     | Ya existe pickupLocation   |
 
 ## Calidad y operación
 
