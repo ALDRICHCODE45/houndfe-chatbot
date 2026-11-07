@@ -731,8 +731,8 @@ describe('MinimalRestockRequestService', () => {
     it.each([
       'sí, muchas gracias, me ayudaría mucho',
       'por favor',
-      'claro',
-      'adelante',
+      'me encantaría',
+      'avíseme',
     ])(
       'accepts a natural positive (%s) once through the seam',
       async (text) => {
@@ -747,6 +747,26 @@ describe('MinimalRestockRequestService', () => {
         expect(classify).toHaveBeenCalledWith(NATURAL_QUESTION, text);
         expect(spy).toHaveBeenCalledTimes(1);
         expect(h.coordinate).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([
+      ['claro', CONFIRMED],
+      ['Sí, por favor 🙏', CONFIRMED],
+      ['no gracias', DECLINED],
+    ])(
+      'decides the shared-lexicon reply %j without the seam',
+      async (text, expected) => {
+        const spy = restockRoute();
+        const h = hz();
+        const o = await offer(h);
+        o.onSent();
+        const classify = classifier('unclear');
+        await expect(say(h, text, CONFIRM, classify)).resolves.toEqual(
+          expected,
+        );
+        expect(classify).not.toHaveBeenCalled();
+        expect(spy).toHaveBeenCalledTimes(expected === CONFIRMED ? 1 : 0);
       },
     );
 
@@ -780,11 +800,13 @@ describe('MinimalRestockRequestService', () => {
       const h = hz();
       const o = await offer(h);
       o.onSent();
-      await expect(say(h, 'claro')).resolves.toEqual(CLARIFY);
+      await expect(say(h, 'me encantaría')).resolves.toEqual(CLARIFY);
       const boom: Classify = jest.fn(async () => {
         throw new Error('RAW_SENTINEL');
       });
-      await expect(say(h, 'ok', CONFIRM, boom)).resolves.toEqual(CLARIFY);
+      await expect(say(h, 'me interesa', CONFIRM, boom)).resolves.toEqual(
+        CLARIFY,
+      );
       expect(h.coordinate).not.toHaveBeenCalled();
     });
 
@@ -832,7 +854,7 @@ describe('MinimalRestockRequestService', () => {
       await expect(
         say(
           untrusted,
-          'claro',
+          'me encantaría',
           { ...CONFIRM, receivingPhoneNumberId: '9'.repeat(15) },
           classify,
         ),
@@ -840,18 +862,18 @@ describe('MinimalRestockRequestService', () => {
       const unarmed = hz();
       await offer(unarmed);
       await expect(
-        say(unarmed, 'claro', CONFIRM, classify),
+        say(unarmed, 'me encantaría', CONFIRM, classify),
       ).resolves.toBeNull();
       const origin = hz();
       (await offer(origin)).onSent();
       await expect(
-        say(origin, 'claro', PROPOSAL, classify),
+        say(origin, 'me encantaría', PROPOSAL, classify),
       ).resolves.toBeNull();
       const expired = hz();
       (await offer(expired)).onSent();
       expired.advance(MINIMAL_RESTOCK_PENDING_TTL_MS);
       await expect(
-        say(expired, 'claro', newEvent('wamid.E'), classify),
+        say(expired, 'me encantaría', newEvent('wamid.E'), classify),
       ).resolves.toBeNull();
       expect(classify).not.toHaveBeenCalled();
     });
@@ -866,7 +888,7 @@ describe('MinimalRestockRequestService', () => {
         release = resolve;
       });
       const inFlight: Classify = jest.fn(() => gate);
-      const pending = say(h, 'claro', CONFIRM, inFlight);
+      const pending = say(h, 'me encantaría', CONFIRM, inFlight);
       h.advance(MINIMAL_RESTOCK_PENDING_TTL_MS);
       release('accept');
       await expect(pending).resolves.toEqual(CLARIFY);
@@ -881,8 +903,8 @@ describe('MinimalRestockRequestService', () => {
       o.onSent();
       const classify = classifier('accept');
       const [a, b] = await Promise.all([
-        say(h, 'claro', newEvent('wamid.A1'), classify),
-        say(h, 'adelante', newEvent('wamid.A2'), classify),
+        say(h, 'me encantaría', newEvent('wamid.A1'), classify),
+        say(h, 'avíseme', newEvent('wamid.A2'), classify),
       ]);
       expect([a, b].filter((r) => r?.reply === CONFIRMED.reply)).toHaveLength(
         1,
@@ -896,16 +918,16 @@ describe('MinimalRestockRequestService', () => {
       const h = hz();
       const o = await offer(h);
       o.onSent();
-      await expect(say(h, 'claro', CONFIRM)).resolves.toEqual(CLARIFY);
+      await expect(say(h, 'me encantaría', CONFIRM)).resolves.toEqual(CLARIFY);
       const classify = classifier('accept');
-      await expect(say(h, 'claro', CONFIRM, classify)).resolves.toEqual(
+      await expect(say(h, 'me encantaría', CONFIRM, classify)).resolves.toEqual(
         CLARIFY,
       );
       expect(classify).not.toHaveBeenCalled();
       expect(spy).not.toHaveBeenCalled();
       // A genuinely new message can still be classified later.
       await expect(
-        say(h, 'adelante', newEvent('wamid.N2'), classifier('accept')),
+        say(h, 'avíseme', newEvent('wamid.N2'), classifier('accept')),
       ).resolves.toEqual(CONFIRMED);
       expect(spy).toHaveBeenCalledTimes(1);
       expect(h.coordinate).toHaveBeenCalledTimes(1);
@@ -922,7 +944,7 @@ describe('MinimalRestockRequestService', () => {
       });
       const inFlight = say(
         h,
-        'claro',
+        'me encantaría',
         CONFIRM,
         jest.fn(() => gate),
       );
@@ -970,7 +992,7 @@ describe('MinimalRestockRequestService', () => {
       });
       const inFlight = service.consume({
         senderId: SENDER,
-        text: 'claro',
+        text: 'me encantaría',
         inboundEvent: CONFIRM,
         classify: jest.fn(() => gate),
       });

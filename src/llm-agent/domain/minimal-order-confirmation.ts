@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { toMexicanState } from './mexican-state';
 import type { MinimalCheckoutDraft } from '../../conversation/domain/minimal-checkout-draft';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
-import { isAffirmative } from './minimal-checkout-confirmation';
+import { classifyConfirmationReply } from './confirmation-reply';
 import { minimalShippingEtaLine } from './minimal-shipping';
 
 /** Pending-offer TTL; mirrors the checkout and RESTOCK volatile lifecycles. */
@@ -21,6 +21,9 @@ export const MINIMAL_ORDER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 
 export const MINIMAL_ORDER_AMBIGUOUS_REPLY =
   'Por ahora no puedo confirmar su pedido en este chat. Dígame «hacer pedido» para volver a mostrarle el resumen; no se creó ningún pedido.';
+
+export const MINIMAL_ORDER_DECLINED_REPLY =
+  'Entendido, no creé el pedido. ¿Desea cambiar algo del pedido?';
 
 export interface MinimalOrderLine {
   readonly productId: string;
@@ -451,12 +454,13 @@ export class MinimalOrderConfirmation {
   }
 
   /**
-   * Interpret one inbound turn. Only a strict, trusted, armed, unexpired SÍ
+   * Interpret one inbound turn. Only a deterministic affirmative
+   * (`classifyConfirmationReply`) on a trusted, armed, unexpired offer
    * yields a candidate, and it consumes the pending so a second SÍ cannot
    * create another order. Any other turn drops the pending: consent binds to
    * the reply right after the summary, so a later SÍ meant for something else
-   * can never create this order. Everything else is `null` or a handled
-   * refusal.
+   * can never create this order. A deterministic refusal is answered here;
+   * everything else is `null` or a handled refusal.
    */
   consume(input: {
     readonly senderId: string;
@@ -483,9 +487,12 @@ export class MinimalOrderConfirmation {
           onSent: this.armFor(senderId, pending),
         };
       }
-      if (!isAffirmative(input.text)) {
+      const verdict = classifyConfirmationReply(input.text);
+      if (verdict !== 'accept') {
         this.pending.delete(senderId);
-        return null;
+        return verdict === 'decline'
+          ? { kind: 'handled', reply: MINIMAL_ORDER_DECLINED_REPLY }
+          : null;
       }
       // A refused affirmative also spends the offer: consent belongs only to
       // the reply right after the summary, never to a later SÍ.

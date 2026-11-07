@@ -4,6 +4,7 @@ import {
   MINIMAL_CHECKOUT_CHANGED_REPLY,
   MINIMAL_CHECKOUT_CONFIRMATION_TTL_MS,
   MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+  MINIMAL_CHECKOUT_DECLINED_REPLY,
   MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
   MinimalCheckoutConfirmation,
   evaluateMinimalCheckoutReadiness,
@@ -460,6 +461,29 @@ describe('MinimalCheckoutConfirmation consume', () => {
     expect(svc.status(SENDER)).toMatchObject({ stage: 'pending', armed: true });
     expect(say(svc)?.kind).toBe('candidate');
   });
+
+  it.each(['claro', 'Sí, por favor 🙏', 'ok', 'va', 'Está bien!', 'sí\n'])(
+    'treats the natural affirmative %j as the awaited confirmation',
+    (text) => {
+      const svc = make();
+      offer(svc).onSent();
+      expect(say(svc, text)?.kind).toBe('candidate');
+    },
+  );
+
+  it.each(['no gracias', 'No', 'mejor no 🙏'])(
+    'declines on %j without a candidate and drops the pending',
+    (text) => {
+      const svc = make();
+      offer(svc).onSent();
+      expect(say(svc, text)).toEqual({
+        kind: 'handled',
+        reply: MINIMAL_CHECKOUT_DECLINED_REPLY,
+      });
+      expect(svc.status(SENDER)).toBeNull();
+      expect(say(svc)).toBeNull();
+    },
+  );
 
   it('invalidates the pending when content changed at the same revision', () => {
     const svc = make();

@@ -53,7 +53,10 @@ import {
   MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
-import { MINIMAL_ORDER_AMBIGUOUS_REPLY } from '../domain/minimal-order-confirmation';
+import {
+  MINIMAL_ORDER_AMBIGUOUS_REPLY,
+  MINIMAL_ORDER_DECLINED_REPLY,
+} from '../domain/minimal-order-confirmation';
 import { MINIMAL_CHECKOUT_RESELECT_REPLY } from './minimal-checkout.service';
 
 const SENDER = '5215550001111';
@@ -1593,6 +1596,51 @@ describe('MinimalOrderService', () => {
     await confirmSavedDelivery(h);
     await h.order.prepareOrder(SENDER, EVENT('wamid.o1'));
     expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_AMBIGUOUS_REPLY });
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+  });
+
+  it('[S3] a natural "Sí, por favor 🙏" after the summary creates the order once', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    const say = (text: string, id: string) =>
+      h.order.consume({ senderId: SENDER, text, inboundEvent: EVENT(id) });
+    const placed = await say('Sí, por favor 🙏', 'wamid.o2');
+    expect(placed?.reply).toContain('folio B-0042');
+    expect(await say('Sí, por favor 🙏', 'wamid.o3')).toBeNull();
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  it('[S3] "no gracias" declines the summary without creating the order', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    expect(
+      await h.order.consume({
+        senderId: SENDER,
+        text: 'no gracias',
+        inboundEvent: EVENT('wamid.o2'),
+      }),
+    ).toEqual({ reply: MINIMAL_ORDER_DECLINED_REPLY });
+    expect(await yes(h, 'wamid.o3')).toBeNull();
+    expect(h.api.createCheckout).not.toHaveBeenCalled();
+  });
+
+  it('[S3] "sí, pero quite uno" is not consent and creates nothing', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    expect(
+      await h.order.consume({
+        senderId: SENDER,
+        text: 'sí, pero quite uno',
+        inboundEvent: EVENT('wamid.o2'),
+      }),
+    ).toBeNull();
+    expect(await yes(h, 'wamid.o3')).toBeNull();
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
 

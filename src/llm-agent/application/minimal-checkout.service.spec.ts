@@ -13,6 +13,7 @@ import {
   MINIMAL_CHECKOUT_AMBIGUOUS_REPLY,
   MINIMAL_CHECKOUT_CHANGED_REPLY,
   MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+  MINIMAL_CHECKOUT_DECLINED_REPLY,
   MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
 } from '../domain/minimal-checkout-confirmation';
 import { CostGuardService } from './cost-guard.service';
@@ -563,6 +564,30 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     for (const fn of Object.values(h.forbidden))
       expect(fn).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['claro', MINIMAL_CHECKOUT_CONFIRMED_REPLY],
+    ['no gracias', MINIMAL_CHECKOUT_DECLINED_REPLY],
+  ])(
+    '[S3] answers %j to the delivery summary deterministically',
+    async (text, expected) => {
+      const h = setup();
+      await collectComplete(h);
+      const offer = await h.turn(
+        'Listo',
+        [call('confirmCheckoutDetails'), say()],
+        EVENT('wamid.offer'),
+      );
+      (offer as { onSent: () => void }).onSent();
+      // The model would loop with a new summary; the gate answers first.
+      const reply = await h.turn(
+        text,
+        [call('confirmCheckoutDetails'), say('LLM')],
+        EVENT('wamid.reply'),
+      );
+      expect(reply).toEqual({ kind: 'handled', reply: expected });
+    },
+  );
 
   it('lets a mixed correction reach the model instead of confirming', async () => {
     const h = setup();

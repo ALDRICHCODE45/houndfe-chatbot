@@ -22,6 +22,7 @@ import {
   bindRestockInboundEvent,
   type RestockInboundEventIdentity,
 } from '../../human-decisions/domain/restock-source-identity';
+import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import { runRestockRoute } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { RestockToolCapability } from '../../sale-flow/application/tool-deps';
 
@@ -50,22 +51,9 @@ const proposal = (l: string) =>
   `estimada de reposición?`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
-// RESTOCK-LOCAL bounded consent: a whole `SI`/`SÍ`/`NO` (case, outer
-// spaces/tabs and one trailing period tolerated), then exactly one polite
-// affirmative form. No substring, NLP or model inference; every other text
-// (including a polite "NO, por favor") stays `null`.
-const STRICT_DECISION = /^(?:si|sí|no)\.?$/i;
-const POLITE_AFFIRMATIVE = /^(?:si|sí),?[ \t]+por[ \t]+favor\.?$/i;
-const OUTER_SPACING = /^[ \t]+|[ \t]+$/g;
-const NEWLINES = /[\r\n]/;
-
-function parseRestockDecision(raw: unknown): 'accept' | 'decline' | null {
-  if (typeof raw !== 'string' || NEWLINES.test(raw)) return null;
-  const candidate = raw.replace(OUTER_SPACING, '');
-  if (STRICT_DECISION.test(candidate))
-    return candidate.charAt(0).toLowerCase() === 'n' ? 'decline' : 'accept';
-  return POLITE_AFFIRMATIVE.test(candidate) ? 'accept' : null;
-}
+// Deterministic consent comes from the shared closed lexicon; anything else
+// (including a polite "NO, por favor") falls through to the task classifier.
+const parseRestockDecision = classifyConfirmationReply;
 
 export interface MinimalRestockDeps {
   readonly chatbotApi: ChatbotApiClient;
