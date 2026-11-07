@@ -437,8 +437,10 @@ function hasWholeLineRemovalEvidence(
  * Parse a single count from an already-normalized citation. Fails closed when
  * a count is ambiguous, negative, a dosage, or there are several counts.
  */
-function parseCitationCount(citation: string): ParsedCount {
-  if (NEGATIVE_NUMBER.test(citation)) return { status: 'invalid' };
+function parseCitationCount(raw: string): ParsedCount {
+  if (NEGATIVE_NUMBER.test(raw)) return { status: 'invalid' };
+  // "un par" is two units, never the one of its article.
+  const citation = raw.replace(/\bun\s+par\b/g, '2');
 
   const counts: number[] = [];
   let invalid = false;

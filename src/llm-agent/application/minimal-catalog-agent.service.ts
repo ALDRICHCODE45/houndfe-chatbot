@@ -41,9 +41,9 @@ import {
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  CART_DEFAULT_UNIT_NOTE,
   CART_OPERATION_CLARIFICATION,
   CART_QUANTITY_QUESTION,
-  CART_PRESENTATION_QUESTION,
   CART_TOOL_NAMES,
   CART_UNKNOWN_REFERENCE_REPLY,
   MinimalCartConversation,
@@ -118,6 +118,8 @@ const INSTRUCTIONS =
   'checkStock válido. Tras un checkStock disponible dilo natural ("Sí, lo tenemos disponible"); ' +
   'menciona la cantidad solo si es baja o el cliente la pide, nunca "una cantidad de N unidades en stock". ' +
   'La selección explícita ya es válida: no la repreguntes. ' +
+  'Si el cliente menciona o pide un producto, llama searchCatalog ANTES de responder; nunca digas "Encontré" ni des datos del catálogo sin una lectura de este chat. ' +
+  'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 5) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
@@ -266,7 +268,9 @@ type RestockRun = {
 };
 
 type ExpirationReply = { attempted: boolean; value: string | null };
-type CartReply = ExpirationReply & { source?: 'cart' | 'reviewCheckout' };
+type CartReply = ExpirationReply & {
+  source?: 'cart' | 'read' | 'reviewCheckout';
+};
 
 // One server-owned checkout presentation per SDK run.
 type CheckoutRun = { attempted: boolean; value: MinimalCheckoutReply | null };
@@ -465,6 +469,39 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
   };
 }
 
+/** "Encontré…"-style catalog claims the model may only make after a read. */
+const CATALOG_CLAIM =
+  /\bencontr[eé]\b|\bvarias opciones\b|\ben (?:el|nuestro) cat[aá]logo\b/i;
+
+/** A reply asserting catalog findings from a run that called no tool. */
+function ungroundedCatalogClaim(result: {
+  text: string;
+  steps?: ReadonlyArray<{ toolCalls?: readonly unknown[] }>;
+}): boolean {
+  const called = (result.steps ?? []).some(
+    (step) => (step.toolCalls?.length ?? 0) > 0,
+  );
+  return !called && CATALOG_CLAIM.test(result.text);
+}
+
+/** Text of the bot's last stored message, or `null`. */
+function lastAssistantText(
+  turns: readonly MinimalCatalogTurn[],
+): string | null {
+  const messages = turns.at(-1)?.messages ?? [];
+  for (const message of [...messages].reverse()) {
+    if (message.role !== 'assistant') continue;
+    const text =
+      typeof message.content === 'string'
+        ? message.content
+        : message.content
+            .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+            .join('\n');
+    if (text.trim().length > 0) return text;
+  }
+  return null;
+}
+
 /** The customer's own text turns, oldest first. */
 function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
   return turns.flatMap((turn) =>
@@ -651,6 +688,10 @@ export class MinimalCatalogAgentService {
           ),
           input.text,
           previousCartContext?.pending ?? null,
+          {
+            previousAssistantText: lastAssistantText(turns),
+            recentCustomerTexts: customerTexts(turns).slice(-3),
+          },
         )
       : null;
     const persistedCartContext = ():
@@ -749,7 +790,7 @@ export class MinimalCatalogAgentService {
         'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total; un delta positivo también crea un renglón nuevo. ' +
         'En ambas, quantityText debe ser el fragmento LITERAL del mensaje actual que respalda el número (por ejemplo "2", "una"); si no lo cita, la aplicación pedirá aclaración. ' +
         'Interprete lenguaje cotidiano: «Agrega 2» suma dos con adjustCartItem(delta: 2); «Déjame 2» fija dos en total con setCartItem(quantity: 2); ' +
-        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Solo deja las croquetas», «quita todo lo demás» o «que solo contenga las croquetas»: llame getCart si hace falta, luego keepOnlyCartItems con keepSelectionRefs: los cartSelectionRef de cada renglón que se queda, obtenidos de getCart en este turno; nunca elimine renglones uno por uno para esa solicitud. «Quita el ibuprofeno» elimina un renglón completo: llame setCartItem(quantity: 0, quantityText: null) para ese renglón; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. prepareCartItem SOLO registra una intención (operation: add|set|subtract|remove) y NUNCA modifica el carrito; úselo para conservar una cantidad explícita antes de elegir la presentación. ' +
+        '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Solo deja las croquetas», «quita todo lo demás» o «que solo contenga las croquetas»: llame getCart si hace falta, luego keepOnlyCartItems con keepSelectionRefs: los cartSelectionRef de cada renglón que se queda, obtenidos de getCart en este turno; nunca elimine renglones uno por uno para esa solicitud. «Quita el ibuprofeno» elimina un renglón completo: llame setCartItem(quantity: 0, quantityText: null) para ese renglón; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. Cuando el producto y su presentación ya estén identificados (el que acaba de mostrar, el único renglón del carrito o la presentación que eligió el cliente), use directamente adjustCartItem o setCartItem: «Agrégame uno», «agrégalo», «sí, agréguela», «quiero 2», «dame dos» o «sí» a su pregunta "¿Se lo agrego al carrito?" agregan ese producto; si el cliente no dijo cantidad, use delta: null y quantityText: null (la aplicación agrega 1 y lo dice). «Cambia la cantidad a 2» fija el total con setCartItem. prepareCartItem es solo para conservar una cantidad explícita mientras falta elegir la presentación; si la selección ya está resuelta la aplicación la agrega de verdad. Nunca diga que registró la intención ni que algo quedó en el carrito: la aplicación confirma el carrito real. Si mostró varios productos o presentaciones y el cliente no dijo cuál, pregunte cuál, sin elegir por él. ' +
         'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
         'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
         '«Sí, la de 500mg» elige una presentación, NO una cantidad: si no hay cantidad pendiente, use adjustCartItem(delta: null, quantityText: null) para conservar la selección y preguntar cuántas unidades. «Un ibuprofeno de 500» indica una unidad: cite "un", no la dosis. Nunca use setCartItem(quantity: 0) para elegir presentación. ' +
@@ -778,7 +819,7 @@ export class MinimalCatalogAgentService {
         selectionContext +
         pendingContext
       : baseInstructions;
-    const result = await this.generateTextFn({
+    const generateParams = {
       model: openai(this.model),
       system:
         SYSTEM_PROMPT +
@@ -788,7 +829,7 @@ export class MinimalCatalogAgentService {
         customerStyleDirective(style),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
-        { role: 'user', content: input.text },
+        { role: 'user' as const, content: input.text },
       ],
       tools: this.buildTools(
         allowedIds,
@@ -802,11 +843,37 @@ export class MinimalCatalogAgentService {
         checkoutRun,
       ),
       stopWhen: stepCountIs(this.maxSteps),
-    });
+    };
+    let result = await this.generateTextFn(generateParams);
     this.costGuard.record({
       promptTokens: result.usage?.inputTokens ?? 0,
       completionTokens: result.usage?.outputTokens ?? 0,
     });
+    if (ungroundedCatalogClaim(result)) {
+      // F8: a catalog claim with no catalog read in this run is unverified.
+      // Rerun once with the first step forced to search; tools are untouched
+      // because no tool ran.
+      traceLog(
+        this.logger,
+        `minimal_catalog catalog_claim_without_read retry=forced_search trace=${traceId}`,
+      );
+      result = await this.generateTextFn({
+        ...generateParams,
+        prepareStep: ({ stepNumber }: { stepNumber: number }) =>
+          stepNumber === 0
+            ? {
+                toolChoice: {
+                  type: 'tool' as const,
+                  toolName: 'searchCatalog' as const,
+                },
+              }
+            : undefined,
+      });
+      this.costGuard.record({
+        promptTokens: result.usage?.inputTokens ?? 0,
+        completionTokens: result.usage?.outputTokens ?? 0,
+      });
+    }
     const prepared = restockRun?.outcome ?? null;
     const expirationResult = expirationReply?.value ?? null;
     if (expirationResult !== null || prepared !== null) {
@@ -835,8 +902,14 @@ export class MinimalCatalogAgentService {
       // The server-owned presentation follows any cart acknowledgement or
       // invalid-cart clarification so neither is lost; the model never
       // authors a checkout outcome.
+      // A plain cart read adds nothing to the checkout presentation, which
+      // already states the cart (and would repeat "Su carrito está vacío.").
       const cartPart =
-        (cartReply.source === 'reviewCheckout' ? null : cartReply.value) ??
+        (cartReply.source === 'cart' &&
+        cartReply.value !== null &&
+        !checkoutResult.reply.includes(cartReply.value)
+          ? cartReply.value
+          : null) ??
         (this.hasInvalidCartToolCall(result)
           ? CART_OPERATION_CLARIFICATION
           : null);
@@ -1308,12 +1381,18 @@ export class MinimalCatalogAgentService {
       )
         return;
       cartReply.value = message;
-      cartReply.source = kind === 'reviewCheckout' ? 'reviewCheckout' : 'cart';
+      cartReply.source =
+        kind === 'reviewCheckout'
+          ? 'reviewCheckout'
+          : kind === 'read'
+            ? 'read'
+            : 'cart';
       if (kind !== 'read') clarificationAcknowledged = true;
     };
     const applyIntent = async (
       identity: ResolvedCartSelection,
       intent: MinimalCartQuantityIntent,
+      defaulted = false,
     ): Promise<MinimalCartResult> => {
       if (cart === undefined || conversation === null)
         return { ok: false, error: 'cart_unavailable' };
@@ -1338,7 +1417,10 @@ export class MinimalCatalogAgentService {
           traceInvalidVariant('adjustCartItem'),
         );
         traceCartResult('adjustCartItem', result);
-        cartReply.value = minimalCartReply(result);
+        cartReply.value =
+          defaulted && result.ok
+            ? `${CART_DEFAULT_UNIT_NOTE}\n\n${minimalCartReply(result)}`
+            : minimalCartReply(result);
         cartReply.source = 'cart';
         mutationAcknowledged = true;
         return result;
@@ -1373,7 +1455,11 @@ export class MinimalCatalogAgentService {
       // operation in the same run, and it never overwrites the first reply.
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
-      const grounded = conversation.ground(identity, proposal);
+      const grounded = conversation.ground(
+        identity,
+        proposal,
+        (await cart?.storedLines(context.senderId)) ?? [],
+      );
       trace(
         `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
       );
@@ -1385,7 +1471,17 @@ export class MinimalCatalogAgentService {
         acknowledge(CART_QUANTITY_QUESTION);
         return toolError('cart_quantity_required');
       }
-      return applyIntent(identity, grounded.intent);
+      if (grounded.kind === 'target_required') {
+        acknowledge(grounded.question);
+        return toolError('cart_target_ambiguous');
+      }
+      if (attemptedLines.has(lineKey(grounded.selection)))
+        return toolError('cart_line_settled');
+      return applyIntent(
+        grounded.selection,
+        grounded.intent,
+        grounded.defaulted,
+      );
     };
     const withCart = cart
       ? {
@@ -1591,7 +1687,7 @@ export class MinimalCatalogAgentService {
               CART_VARIANT_GUIDANCE,
             inputSchema: cartPrepareToolInput,
             strict: true,
-            execute: ({
+            execute: async ({
               selectionRef,
               operation,
               quantity,
@@ -1609,30 +1705,33 @@ export class MinimalCatalogAgentService {
               }
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
-              const grounded = conversation.prepare(identity, {
-                operation,
-                quantity,
-                quantityText,
-                continuation,
-              });
+              const grounded = conversation.prepare(
+                identity,
+                { operation, quantity, quantityText, continuation },
+                (await cart.storedLines(context.senderId)) ?? [],
+              );
               trace(
                 `cart_grounding tool=prepareCartItem mode=${operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
               );
               if (grounded.kind === 'ready') {
-                if (
-                  identity.variantId === undefined &&
-                  conversation
-                    .snapshot()
-                    .selections.some(
-                      (selection) =>
-                        selection.productId === identity.productId &&
-                        selection.variantId !== undefined,
-                    )
-                )
-                  acknowledge(CART_PRESENTATION_QUESTION);
+                // F7: a resolved selection is a real write, never a silent
+                // "intention" the customer believes is in the cart.
+                if (conversation.isFinalSelection(grounded.selection)) {
+                  if (attemptedLines.has(lineKey(grounded.selection)))
+                    return toolError('cart_line_settled');
+                  return applyIntent(
+                    grounded.selection,
+                    grounded.intent,
+                    grounded.defaulted,
+                  );
+                }
+                acknowledge(
+                  conversation.presentationQuestion(identity.productId),
+                );
                 return {
                   ok: true as const,
                   prepared: true as const,
+                  cartUnchanged: true as const,
                   operation: grounded.intent.operation,
                   quantity: grounded.intent.quantity ?? null,
                 };
@@ -1640,6 +1739,10 @@ export class MinimalCatalogAgentService {
               if (grounded.kind === 'quantity_required') {
                 acknowledge(CART_QUANTITY_QUESTION);
                 return toolError('cart_quantity_required');
+              }
+              if (grounded.kind === 'target_required') {
+                acknowledge(grounded.question);
+                return toolError('cart_target_ambiguous');
               }
               acknowledge(CART_OPERATION_CLARIFICATION);
               return toolError('invalid_cart_evidence');

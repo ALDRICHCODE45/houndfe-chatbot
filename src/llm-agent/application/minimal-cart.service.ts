@@ -133,6 +133,23 @@ export class MinimalCartService {
     }
   }
 
+  /** Stored line identities without a backend read; `[]` when unreadable. */
+  async storedLines(
+    senderId: string,
+  ): Promise<Array<Pick<CartItem, 'productId' | 'variantId'>>> {
+    try {
+      const cart = this.read(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      return (cart?.items ?? []).map(({ productId, variantId }) => ({
+        productId,
+        ...(variantId ? { variantId } : {}),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   /**
    * Quote the stored lines and, when only their prices or total changed,
    * store the fresh unit prices and total in one CAS, keeping shipping and

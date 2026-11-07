@@ -26,7 +26,15 @@ import {
   type MinimalCartSelectionSnapshot,
 } from '../domain/minimal-cart-selections';
 import {
+  cartWords,
+  conversationalAddForm,
+  mentionsPhrase,
+  nameCoverage,
+  statedUnitCount,
+} from '../domain/minimal-cart-request';
+import {
   groundCartQuantity,
+  type MinimalCartQuantityIntent,
   type CartOperation,
   type CartQuantityRejectionReason,
   type CartQuantityEvidenceDetail,
@@ -80,6 +88,10 @@ export const CART_QUANTITY_QUESTION =
 /** A grounded parent quantity is prepared, but its presentation is not chosen. */
 export const CART_PRESENTATION_QUESTION = '¿Qué presentación desea agregar?';
 
+/** States the one unit a countless "agrégalo"/"sí" to a cart offer added. */
+export const CART_DEFAULT_UNIT_NOTE =
+  'Le agregué 1 unidad; si desea otra cantidad, dígame cuántas.';
+
 /** Server-controlled fail-closed reply for a citation/consistency rejection. */
 export const CART_OPERATION_CLARIFICATION =
   'No pude confirmar esa operación con la información de su mensaje. No modifiqué el carrito; ¿puede indicarme de nuevo qué desea?';
@@ -88,17 +100,20 @@ export const CART_OPERATION_CLARIFICATION =
 export const CART_UNKNOWN_REFERENCE_REPLY =
   'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.';
 
-type GroundableSelection = {
-  productId: string;
-  productName: string;
-  variantId?: string;
-  variantName?: string;
-  reference?: string;
-};
-
 /** A verified identity resolved from an opaque reference, with that reference. */
 export type ResolvedCartSelection = MinimalCartSelectionIdentity & {
   reference: string;
+};
+
+/** A stored cart line's identity (no prices), read from the persisted cart. */
+export type CartLineIdentity = { productId: string; variantId?: string };
+
+/** The customer's side of the dialogue the request answers. */
+export type CartDialogue = {
+  /** Text of the bot's previous message, or `null`. */
+  previousAssistantText: string | null;
+  /** The customer's earlier messages, oldest first (current one excluded). */
+  recentCustomerTexts: readonly string[];
 };
 
 type CartProposal = {
@@ -107,6 +122,73 @@ type CartProposal = {
   quantityText: string | null;
   continuation: boolean;
 };
+
+/**
+ * A grounding outcome bound to the selection the write must target (a parent
+ * reference may resolve to the presentation the customer named). `defaulted`
+ * marks the one unit of a countless "agrégalo"/"sí" that the reply must state.
+ */
+export type CartGrounding =
+  | {
+      kind: 'ready';
+      intent: MinimalCartQuantityIntent;
+      selection: ResolvedCartSelection;
+      defaulted: boolean;
+    }
+  | { kind: 'quantity_required'; intent: MinimalCartQuantityIntent }
+  | { kind: 'invalid_evidence' }
+  | { kind: 'target_required'; question: string };
+
+type Target =
+  | { kind: 'ok'; selection: ResolvedCartSelection }
+  | { kind: 'ask'; question: string };
+
+/** A product line is "named" in a text from this share of its name words. */
+const NAME_COVERAGE = 0.6;
+const MAX_OPTIONS = 6;
+
+/** Customer words that turn a count into the line TOTAL ("cambia a 2"). */
+const SET_WORDS: ReadonlySet<string> = new Set([
+  'cambia',
+  'cambiar',
+  'cambiala',
+  'cambialo',
+  'cambiame',
+  'deja',
+  'dejame',
+  'dejala',
+  'dejalo',
+  'ajusta',
+  'total',
+]);
+
+const joinOptions = (options: readonly string[]): string =>
+  options.length === 1
+    ? options[0]
+    : `${options.slice(0, -1).join(', ')} o ${options[options.length - 1]}`;
+
+/** Server-owned question when several shown products could be meant. */
+export function cartProductQuestion(names: readonly string[]): string {
+  return names.length === 0
+    ? '¿A cuál producto se refiere? Dígame el nombre del producto, por favor. No modifiqué el carrito.'
+    : `¿A cuál producto se refiere: ${joinOptions(names.slice(0, MAX_OPTIONS))}? No modifiqué el carrito.`;
+}
+
+/** Server-owned presentation question listing the verified options. */
+export function cartPresentationQuestion(labels: readonly string[]): string {
+  return labels.length === 0
+    ? CART_PRESENTATION_QUESTION
+    : `¿Qué presentación desea agregar: ${joinOptions(labels.slice(0, MAX_OPTIONS))}? No modifiqué el carrito.`;
+}
+
+/** Display label of a presentation: its name without the product prefix. */
+function presentationLabel(selection: MinimalCartSelectionIdentity): string {
+  const name = selection.variantName;
+  if (name === undefined) return '';
+  return name.startsWith(selection.productName)
+    ? name.slice(selection.productName.length).trim()
+    : name;
+}
 
 /**
  * One sender's cart conversation for a single SDK run. The registry snapshot
@@ -131,6 +213,10 @@ export class MinimalCartConversation {
     private readonly selections: MinimalCartSelections,
     private readonly text: string,
     private pending: MinimalCartPendingRequest | null,
+    private readonly dialogue: CartDialogue = {
+      previousAssistantText: null,
+      recentCustomerTexts: [],
+    },
   ) {}
 
   /** Detached copy of the pending intent, or `null` when none is armed. */
@@ -156,14 +242,82 @@ export class MinimalCartConversation {
    * but a `quantity_required` outcome records a no-count pending request bound
    * to the chosen identity/reference so a later explicit quantity can target
    * the same line instead of reconstructing dropped tool messages.
+   *
+   * The strict citation rules decide first. Only when they reject for missing
+   * evidence (or ask for a count) does the conversational reading apply: a
+   * single count in the customer's words, the pending count, or one unit for
+   * a countless "agrégalo"/"sí" to a cart offer — and then only when the
+   * target product and presentation are unambiguous from the conversation.
    */
   ground(
-    selection: GroundableSelection,
+    selection: ResolvedCartSelection,
+    proposal: CartProposal,
+    cartLines: readonly CartLineIdentity[] = [],
+  ): CartGrounding {
+    const strict = this.groundStrict(selection, proposal);
+    let result: CartGrounding;
+    if (strict.kind === 'ready') {
+      result = {
+        kind: 'ready',
+        intent: strict.intent,
+        // Strict path: only a presentation the customer named (or the
+        // pending one) upgrades a parent reference; never a cart guess.
+        selection: this.namedPresentation(selection, []) ?? selection,
+        defaulted: false,
+      };
+    } else if (
+      proposal.operation === 'remove' ||
+      (strict.kind === 'invalid_evidence' &&
+        this.rejection !== 'evidence_rejected')
+    ) {
+      result = strict;
+    } else {
+      result = this.rescue(selection, proposal, cartLines) ?? strict;
+    }
+    if (result.kind === 'quantity_required') {
+      this.pending = {
+        productId: selection.productId,
+        productName: selection.productName,
+        operation: result.intent.operation,
+        ...(selection.variantId === undefined
+          ? {}
+          : { variantId: selection.variantId }),
+        ...(selection.variantName === undefined
+          ? {}
+          : { variantName: selection.variantName }),
+        reference: selection.reference,
+      };
+    }
+    return result;
+  }
+
+  /**
+   * True when the selection is a final cart line: a presentation, or a
+   * product with no verified presentations.
+   */
+  isFinalSelection(selection: ResolvedCartSelection): boolean {
+    return (
+      selection.variantId !== undefined ||
+      this.variantsOf(selection.productId).length === 0
+    );
+  }
+
+  /** Presentation question for a product, listing its verified options. */
+  presentationQuestion(productId: string): string {
+    return cartPresentationQuestion(
+      this.variantsOf(productId)
+        .map(presentationLabel)
+        .filter((label) => label.length > 0),
+    );
+  }
+
+  private groundStrict(
+    selection: ResolvedCartSelection,
     proposal: CartProposal,
   ): CartQuantityGroundingResult {
     this.rejection = null;
     this.detail = 'none';
-    const result = groundCartQuantity({
+    return groundCartQuantity({
       onRejection: (reason, detail) => {
         this.rejection = reason;
         this.detail = detail;
@@ -180,23 +334,203 @@ export class MinimalCartConversation {
       ...(this.pending === null ? {} : { pending: this.pending }),
       continuation: proposal.continuation,
     });
-    if (result.kind === 'quantity_required') {
-      this.pending = {
-        productId: selection.productId,
-        productName: selection.productName,
-        operation: proposal.operation,
-        ...(selection.variantId === undefined
-          ? {}
-          : { variantId: selection.variantId }),
-        ...(selection.variantName === undefined
-          ? {}
-          : { variantName: selection.variantName }),
-        ...(selection.reference === undefined
-          ? {}
-          : { reference: selection.reference }),
-      };
+  }
+
+  private rescue(
+    selection: ResolvedCartSelection,
+    proposal: CartProposal,
+    cartLines: readonly CartLineIdentity[],
+  ): CartGrounding | null {
+    const presentationNumbers = new Set(
+      this.variantsOf(selection.productId).flatMap((variant) =>
+        cartWords(presentationLabel(variant)).filter((word) =>
+          /^\d+$/.test(word),
+        ),
+      ),
+    );
+    const count = statedUnitCount(this.text, presentationNumbers);
+    if (count.status === 'ambiguous') return null;
+    let operation = proposal.operation;
+    let quantity: number | undefined;
+    let defaulted = false;
+    if (count.status === 'ok') {
+      if (
+        proposal.quantity !== null &&
+        Math.abs(proposal.quantity) !== count.value
+      )
+        return null;
+      if (
+        operation === 'add' &&
+        cartWords(this.text).some((word) => SET_WORDS.has(word))
+      )
+        operation = 'set';
+      if (operation === 'set' ? count.value < 0 : count.value <= 0) return null;
+      quantity = count.value;
+    } else {
+      if (operation === 'subtract') return null;
+      const pending = this.pending;
+      const form = conversationalAddForm(
+        this.text,
+        this.dialogue.previousAssistantText,
+      );
+      if (
+        pending !== null &&
+        pending.productId === selection.productId &&
+        typeof pending.quantity === 'number' &&
+        pending.quantity > 0 &&
+        (pending.operation === 'add' || pending.operation === 'set')
+      ) {
+        if (
+          proposal.quantity !== null &&
+          proposal.quantity !== pending.quantity
+        )
+          return null;
+        operation = pending.operation;
+        quantity = pending.quantity;
+      } else if (form === null) {
+        return null;
+      } else {
+        operation = 'add';
+        // A countless singular request is one unit; a plural one or a model
+        // number the customer never said asks for the count instead.
+        if (
+          form === 'singular' &&
+          (proposal.quantity === null || proposal.quantity === 1)
+        ) {
+          quantity = 1;
+          defaulted = true;
+        }
+      }
     }
-    return result;
+    const target = this.resolveTarget(selection, cartLines);
+    if (target.kind === 'ask')
+      return { kind: 'target_required', question: target.question };
+    const intent = { productId: selection.productId, operation };
+    if (quantity === undefined) return { kind: 'quantity_required', intent };
+    return {
+      kind: 'ready',
+      intent: { ...intent, quantity },
+      selection: target.selection,
+      defaulted,
+    };
+  }
+
+  /**
+   * The product and presentation must be unambiguous from the conversation:
+   * the customer named it, it is the one product the bot just showed (or the
+   * pending request / only cart line), and its presentation is the one the
+   * customer chose, the bot showed alone, or the cart already holds.
+   */
+  private resolveTarget(
+    selection: ResolvedCartSelection,
+    cartLines: readonly CartLineIdentity[],
+  ): Target {
+    const productId = selection.productId;
+    const products = new Map<string, string>();
+    for (const entry of this.selections.snapshot().selections)
+      if (!products.has(entry.productId))
+        products.set(entry.productId, entry.productName);
+    const previous = this.dialogue.previousAssistantText ?? '';
+    const mentioned = [...products].filter(
+      ([, name]) => nameCoverage(previous, name) >= NAME_COVERAGE,
+    );
+    const named =
+      nameCoverage(this.text, selection.productName) >= NAME_COVERAGE;
+    const askProduct = (names: string[]): Target => ({
+      kind: 'ask',
+      question: cartProductQuestion(names),
+    });
+    if (!named) {
+      if (mentioned.length >= 2)
+        return askProduct(mentioned.map(([, name]) => name));
+      let inFocus: boolean;
+      if (this.pending?.productId === productId) inFocus = true;
+      else if (mentioned.length === 1) inFocus = mentioned[0][0] === productId;
+      else if (cartLines.length === 1)
+        inFocus = cartLines[0].productId === productId;
+      else if (products.size === 1) inFocus = products.has(productId);
+      else {
+        const scores = [...products].map(
+          ([id, name]) => [id, nameCoverage(previous, name)] as const,
+        );
+        const best = Math.max(0, ...scores.map(([, score]) => score));
+        const top = scores.filter(([, score]) => score === best);
+        inFocus = best > 0 && top.length === 1 && top[0][0] === productId;
+      }
+      if (!inFocus) return askProduct([]);
+    }
+    const variants = this.variantsOf(productId);
+    if (variants.length === 0)
+      return selection.variantId === undefined
+        ? { kind: 'ok', selection }
+        : { kind: 'ask', question: this.presentationQuestion(productId) };
+    const chosen = this.namedPresentation(selection, cartLines, true);
+    if (
+      chosen !== null &&
+      (selection.variantId === undefined ||
+        chosen.variantId === selection.variantId)
+    )
+      return { kind: 'ok', selection: chosen };
+    return { kind: 'ask', question: this.presentationQuestion(productId) };
+  }
+
+  /**
+   * The presentation of the selected product that the conversation fixes:
+   * named in the current message, the pending request's, named alone in the
+   * customer's recent messages, the only cart line of that product, or (with
+   * `includeShown`) the only one the bot's previous message mentioned.
+   * `null` when none or several qualify.
+   */
+  private namedPresentation(
+    selection: ResolvedCartSelection,
+    cartLines: readonly CartLineIdentity[],
+    includeShown = false,
+  ): ResolvedCartSelection | null {
+    const variants = this.variantsOf(selection.productId);
+    if (variants.length === 0) return null;
+    const namedIn = (text: string) =>
+      variants.filter((variant) => {
+        const label = presentationLabel(variant);
+        return label.length > 0 && mentionsPhrase(text, label);
+      });
+    const current = namedIn(this.text);
+    if (current.length === 1) return current[0];
+    if (current.length > 1) return null;
+    if (
+      this.pending?.productId === selection.productId &&
+      this.pending.variantId !== undefined
+    ) {
+      const pendingVariant = this.pending.variantId;
+      return (
+        variants.find((variant) => variant.variantId === pendingVariant) ?? null
+      );
+    }
+    for (const text of [...this.dialogue.recentCustomerTexts].reverse()) {
+      const found = namedIn(text);
+      if (found.length === 1) return found[0];
+      if (found.length > 1) return null;
+    }
+    const lines = cartLines.filter(
+      (line) =>
+        line.productId === selection.productId && line.variantId !== undefined,
+    );
+    if (lines.length === 1)
+      return (
+        variants.find((variant) => variant.variantId === lines[0].variantId) ??
+        null
+      );
+    if (!includeShown) return null;
+    const shown = namedIn(this.dialogue.previousAssistantText ?? '');
+    return shown.length === 1 ? shown[0] : null;
+  }
+
+  private variantsOf(productId: string): ResolvedCartSelection[] {
+    return this.selections
+      .snapshot()
+      .selections.filter(
+        (entry) =>
+          entry.productId === productId && entry.variantId !== undefined,
+      );
   }
 
   /**
@@ -205,23 +539,23 @@ export class MinimalCartConversation {
    * mutation and never produces a cart write.
    */
   prepare(
-    selection: GroundableSelection,
+    selection: ResolvedCartSelection,
     proposal: CartProposal,
-  ): CartQuantityGroundingResult {
-    const result = this.ground(selection, proposal);
+    cartLines: readonly CartLineIdentity[] = [],
+  ): CartGrounding {
+    const result = this.ground(selection, proposal, cartLines);
     if (result.kind === 'ready') {
+      const chosen = result.selection;
       this.pending = {
         ...result.intent,
-        productName: selection.productName,
-        ...(selection.variantId === undefined
+        productName: chosen.productName,
+        ...(chosen.variantId === undefined
           ? {}
-          : { variantId: selection.variantId }),
-        ...(selection.variantName === undefined
+          : { variantId: chosen.variantId }),
+        ...(chosen.variantName === undefined
           ? {}
-          : { variantName: selection.variantName }),
-        ...(selection.reference === undefined
-          ? {}
-          : { reference: selection.reference }),
+          : { variantName: chosen.variantName }),
+        reference: chosen.reference,
       };
     }
     return result;

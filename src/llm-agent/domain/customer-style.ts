@@ -165,6 +165,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ],
   ['Listo, usted recoge su pedido', 'Listo, recoges tu pedido'],
   [
+    'Le agregué 1 unidad; si desea otra cantidad',
+    'Te agregué 1 unidad; si quieres otra cantidad',
+  ],
+  ['¿A cuál producto se refiere', '¿A cuál producto te refieres'],
+  [
     'No pude registrar que recoge su pedido',
     'No pude registrar que recoges tu pedido',
   ],

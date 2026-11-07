@@ -148,6 +148,10 @@ const PERSONA_PET = /mascota/i;
 const LEAK =
   /selectionRef|cartSelectionRef|productId|variantId|quoteId|\bJSON\b|herramienta|Primero registra la venta/i;
 
+const INTENT_CLAIM = /registr\w* la intenci[oó]n/i;
+const VAGUE_OPTIONS = /varias opciones/i;
+const LIST_LINE = /^\s*(?:[-•*]|\d+[.)])\s+\S/m;
+
 const count = (re: RegExp, text: string) => (text.match(re) ?? []).length;
 
 export const hasEmoji = (text: string) => EMOJI.test(text);
@@ -254,6 +258,43 @@ export function checkReply(input: {
       detail: 'does not present the pet store',
     });
   else out.push({ check: 'persona', severity: 'pass' });
+
+  // F7: the cart is server-confirmed; an "intention" claim means no write.
+  out.push(
+    INTENT_CLAIM.test(reply)
+      ? {
+          check: 'cart-claim',
+          severity: 'fail',
+          detail: 'claims a registered intention instead of a cart change',
+        }
+      : { check: 'cart-claim', severity: 'pass' },
+  );
+
+  // F8: "varias opciones" must come with the options themselves.
+  out.push(
+    VAGUE_OPTIONS.test(reply) && !LIST_LINE.test(reply)
+      ? {
+          check: 'options',
+          severity: 'warn',
+          detail: 'mentions several options without listing them',
+        }
+      : { check: 'options', severity: 'pass' },
+  );
+
+  const lines = reply
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const repeated = lines.find((line, i) => lines.indexOf(line) !== i);
+  out.push(
+    repeated === undefined
+      ? { check: 'duplicate-line', severity: 'pass' }
+      : {
+          check: 'duplicate-line',
+          severity: 'fail',
+          detail: `repeated line: ${repeated.slice(0, 60)}`,
+        },
+  );
 
   const leak = reply.match(LEAK);
   out.push(
