@@ -49,6 +49,11 @@ The checks are deterministic heuristics; there is no LLM judge. Treat them as fl
 | `persona` | Mentions technology/retail/punto de venta, or a turn marked `expectPersona` does not mention mascotas. | — |
 | `leak` | Internal text (`selectionRef`, `productId`, `herramienta`, operator copy such as "Primero registra la venta"). | — |
 | `orders` | At the end, the number of distinct checkout idempotency keys ≠ `expectOrders`. Confirm scenarios expect exactly 1; decline and denied-zone scenarios expect 0. | — |
+| `expect` | — | The reply does not match the turn's `expectReply` heuristic (e.g. `returning-customer`: tú after the restart, adult large-breed food for Luna). |
+
+## Customer memory (S1)
+
+Each scenario gets its own in-memory customer-profile store, shared by the agent and the order service like the production `customer_profiles` table. A turn with `restartBefore: true` builds a new agent and session (a bot restart) over the same profile store and backend fake; the transcript marks it `🔄 (bot restart)`. The expected register carries over the restart, the emoji rule restarts with the new session. `returning-customer` uses this: session 1 is casual tú with emojis and mentions Luna; session 2 starts with "hola".
 
 ## Fixtures
 

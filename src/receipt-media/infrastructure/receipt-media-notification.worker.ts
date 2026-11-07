@@ -24,6 +24,10 @@ import type {
   ReceiptTemplateKey,
 } from '../domain/receipt-media.types';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import {
+  applyCustomerStyle,
+  type CustomerStyle,
+} from '../../customer-profile/domain/notice-style';
 
 export interface NotificationStoreSeam {
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaOutboxRow[]>;
@@ -116,8 +120,33 @@ const TEXT: Record<ReceiptTemplateKey, string> = {
 const folioOf = (args: ReceiptMediaOutboxRow['templateArgs']): string | null =>
   typeof args.folio === 'string' && args.folio.length > 0 ? args.folio : null;
 
+/** The customer-safe backend rejection reason, trimmed, no final dots. */
+const rejectionReason = (
+  args: ReceiptMediaOutboxRow['templateArgs'],
+): string =>
+  typeof args.reason === 'string' ? args.reason.trim().replace(/\.+$/, '') : '';
+
+/** Stands in for the backend reason while the fixed copy is styled. */
+const REASON_SLOT = '\u0000reason\u0000';
+
+/**
+ * S1: the canonical usted text, or the customer's stored style applied to
+ * the fixed copy only — the backend rejection reason is never rewritten.
+ * Without a style the text is byte-identical to the usted copy.
+ */
 export const renderNotificationText = (
   row: Pick<ReceiptMediaOutboxRow, 'templateKey' | 'templateArgs'>,
+  style?: CustomerStyle | null,
+): string => {
+  if (style === undefined || style === null) return renderUsted(row);
+  return applyCustomerStyle(renderUsted(row, REASON_SLOT), style)
+    .split(REASON_SLOT)
+    .join(rejectionReason(row.templateArgs));
+};
+
+const renderUsted = (
+  row: Pick<ReceiptMediaOutboxRow, 'templateKey' | 'templateArgs'>,
+  reasonText?: string,
 ): string => {
   const args = row.templateArgs;
   const folio = folioOf(args);
@@ -144,10 +173,7 @@ export const renderNotificationText = (
         : `Confirmamos un pago de ${order}. Puede enviarnos el comprobante del resto cuando lo tenga.`;
     }
     case 'RECEIPT_PAYMENT_REJECTED': {
-      const reason =
-        typeof args.reason === 'string'
-          ? args.reason.trim().replace(/\.+$/, '')
-          : '';
+      const reason = reasonText ?? rejectionReason(args);
       return `No pudimos confirmar su comprobante ${ofOrder(folio)}${reason.length > 0 ? `: ${reason}` : ''}. ¿Me puede enviar otro comprobante?`;
     }
     case 'RECEIPT_NOT_A_RECEIPT':
@@ -194,6 +220,10 @@ export class ReceiptMediaNotificationWorker
     private readonly alert: NotificationAlertSeam,
     options: NotificationWorkerOptions,
     private readonly outcomeWindow?: OutcomeWindowSeam,
+    // S1: the recipient's stored style; null/failure keeps the usted copy.
+    private readonly customerStyle?: (
+      recipientId: string,
+    ) => Promise<CustomerStyle | null>,
   ) {
     const { owner, pollIntervalMs, batchSize, maxConcurrency } = options;
     if (
@@ -305,6 +335,18 @@ export class ReceiptMediaNotificationWorker
       await this.alert.onExhausted(intent).catch(() => undefined);
   }
 
+  /** Never throws: a missing or failed profile read sends the usted copy. */
+  private async recipientStyle(
+    recipientId: string,
+  ): Promise<CustomerStyle | null> {
+    if (this.customerStyle === undefined) return null;
+    try {
+      return await this.customerStyle(recipientId);
+    } catch {
+      return null;
+    }
+  }
+
   private async deliver(intent: ReceiptMediaOutboxRow): Promise<void> {
     const lease = this.leaseToken(intent);
     if (lease === null) return;
@@ -327,11 +369,12 @@ export class ReceiptMediaNotificationWorker
         return;
       }
     }
+    const style = await this.recipientStyle(intent.recipientId);
     let wamid: string;
     try {
       ({ providerMessageId: wamid } = await this.sender.sendText({
         to: intent.recipientId,
-        text: renderNotificationText(intent),
+        text: renderNotificationText(intent, style),
       }));
     } catch {
       return this.retry(intent, lease);

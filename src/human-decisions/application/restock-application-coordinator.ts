@@ -2,6 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import {
+  applyCustomerStyle,
+  type CustomerStyle,
+} from '../../customer-profile/domain/notice-style';
 import type { RestockApplicationCandidateService } from './restock-application-candidate.service';
 import type { PostgresRestockApplicationPreparationStore } from '../infrastructure/postgres-restock-application-preparation.store';
 import type { PostgresRestockApplicationClaimStore } from '../infrastructure/postgres-restock-application-claim.store';
@@ -23,7 +27,10 @@ type Ports = Pick<RestockApplicationCandidateService, 'pollForSender'> &
   Partial<Pick<RestockApplicationLedgerPort, 'readByDecision'>> &
   Pick<PostgresRestockApplicationCompletionStore, 'closeAcknowledged'> &
   Pick<ChatbotApiClient, 'recordRestockApplicationOutcome'> &
-  Pick<WhatsappSenderPort, 'sendText'>;
+  Pick<WhatsappSenderPort, 'sendText'> & {
+    /** S1: the stored customer style; null/failure keeps the usted text. */
+    customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  };
 type TerminalRow = Extract<
   RestockApplicationLedgerRow,
   { state: 'PROVIDER_ACCEPTED' | 'PROVIDER_ACCEPTED_LATE' | 'STALE' }
@@ -53,6 +60,18 @@ function format(decision: RestockDecisionResolved): string {
     `para la reposición de «${subject}», contados desde su confirmación. ` +
     'La fecha puede variar. ¡Que esté muy bien!'
   );
+}
+
+async function readStyle(
+  ports: Ports,
+  senderId: string,
+): Promise<CustomerStyle | null> {
+  if (ports.customerStyle === undefined) return null;
+  try {
+    return await ports.customerStyle(senderId);
+  } catch {
+    return null;
+  }
 }
 
 /** Trusted-adapter orchestration, not Meta fencing/device delivery.
@@ -88,7 +107,13 @@ export class RestockApplicationCoordinator {
         decision.snapshot.branchId !== branchId
       )
         return HOLD;
-      const text = format(decision);
+      // S1: read before the claim; nothing async between the final check
+      // and the send. A missing or failed read keeps the usted copy.
+      const style = await readStyle(ports, senderId);
+      const text =
+        style === null
+          ? format(decision)
+          : applyCustomerStyle(format(decision), style);
       if (!text.trim() || text.length > 4096) return HOLD;
       const prepared = await ports.preparePending(candidate);
       if (prepared.action !== 'prepared') return HOLD;

@@ -7,6 +7,7 @@ import {
   type ChatbotApiClient,
 } from '../chatbot-api/domain/chatbot-api.client';
 import { ConversationModule } from '../conversation/conversation.module';
+import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { PostgresCustomerInboundObservationStore } from '../human-decisions/infrastructure/postgres-customer-inbound-observation.store';
@@ -42,6 +43,7 @@ import { PostgresDeliveryZoneRequesterStore } from './infrastructure/postgres-de
     ChatbotApiModule,
     ConversationModule,
     WhatsappSenderModule,
+    CustomerProfileModule,
   ],
   providers: [
     {

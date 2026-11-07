@@ -27,6 +27,11 @@ export interface InboundMessage {
    * stands for: "SÍ", a change intent, or the row title).
    */
   interactiveReplyId?: string;
+  /**
+   * S1: the sender's WhatsApp contact profile name (`contacts[].profile.name`
+   * for this wa_id), when Meta sent a non-blank one. Customer-controlled text.
+   */
+  profileName?: string;
 }
 
 /**

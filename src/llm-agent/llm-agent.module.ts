@@ -6,6 +6,7 @@ import {
   type ChatbotApiClient,
 } from '../chatbot-api/domain/chatbot-api.client';
 import { ConversationModule } from '../conversation/conversation.module';
+import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import {
   CONVERSATION_STORE,
   type ConversationStore,
@@ -95,6 +96,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     HumanDecisionsModule,
     // S5: PENDING zones register a DELIVERY_ZONE requester (always on).
     DeliveryZonesModule,
+    // S1: persistent customer memory (style, names, pet, last order).
+    CustomerProfileModule,
   ],
   providers: [
     {

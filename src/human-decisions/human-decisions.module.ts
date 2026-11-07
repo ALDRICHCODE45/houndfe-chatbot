@@ -11,6 +11,7 @@ import {
   type ChatbotApiClient,
 } from '../chatbot-api/domain/chatbot-api.client';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
+import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import {
@@ -60,6 +61,7 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
  */
 @Module({
   imports: [
+    CustomerProfileModule,
     ConfigModule,
     DatabaseModule,
     ChatbotApiModule,

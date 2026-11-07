@@ -31,9 +31,13 @@ import {
   CART_UNKNOWN_REFERENCE_REPLY,
 } from './minimal-cart-conversation';
 import { minimalCartReply } from './minimal-cart.service';
+import { renderNotificationText } from '../../receipt-media/infrastructure/receipt-media-notification.worker';
+import { RECEIPT_TEMPLATE_KEYS } from '../../receipt-media/domain/receipt-media.types';
+import { deliveryZoneResolvedText } from '../../delivery-zones/domain/delivery-zone-requester';
 import {
   BUSY_REPLY,
   CHECKOUT_TOOL_CLARIFICATION,
+  FORGET_MY_DATA_REPLY,
   RESTOCK_CAUTIOUS_REPLY,
   minimalPickupReply,
   minimalShippingReply,
@@ -380,6 +384,37 @@ const REPLIES: Record<string, string> = {
   restockProposal: minimalRestockProposal('Collar'),
   MINIMAL_EXPIRATION_CAUTIOUS_REPLY,
   MINIMAL_EXPIRATION_CLARIFY_REPLY,
+  // S1: "olvida mis datos" and the later notices sent in the stored style.
+  FORGET_MY_DATA_REPLY,
+  ...Object.fromEntries(
+    RECEIPT_TEMPLATE_KEYS.flatMap((key) =>
+      [
+        {
+          folio: 'F-1',
+          debtCents: 1000,
+          extractedAmountCents: 500,
+          totalCents: 900,
+        } as Record<string, string | number>,
+        {},
+      ].map((args, index) => [
+        `receipt_${key}_${index}`,
+        renderNotificationText({ templateKey: key, templateArgs: args }),
+      ]),
+    ),
+  ),
+  receiptPdfNotAReceipt: renderNotificationText({
+    templateKey: 'RECEIPT_NOT_A_RECEIPT',
+    templateArgs: { mediaKind: 'pdf' },
+  }),
+  zoneDenied: deliveryZoneResolvedText('06700', 'DENIED'),
+  zoneFree: deliveryZoneResolvedText('06700', 'FREE'),
+  restockEstimate:
+    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!',
+  restockUnavailable:
+    '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar».',
+  // Fixed copy of prepareExpirationReply (unavailable branch).
+  expirationUnavailable:
+    'Sobre el Alimento, el equipo no pudo confirmar la fecha de caducidad. ¿Desea continuar con la compra o prefiere que le ayude con alguna otra consulta?',
 };
 
 describe('customer style over every fixed customer reply (S2)', () => {

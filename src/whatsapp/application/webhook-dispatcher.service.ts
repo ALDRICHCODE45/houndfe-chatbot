@@ -196,6 +196,10 @@ export class WebhookDispatcherService {
           continue;
         }
 
+        // S1: load the stored profile so every reply below (pending
+        // marker, media, the turn) already uses the customer's stored style.
+        await this.prepareCustomer(message.senderId);
+
         // ─── (4) Pending-marker short-circuit (ADR-29 defense-in-depth)
         // The runner has the same gate; this branch keeps the dispatcher
         // consistent even if a caller bypasses the runner.
@@ -305,6 +309,22 @@ export class WebhookDispatcherService {
     }
   }
 
+  /** S1: best effort; a profile failure never blocks the message. */
+  private async prepareCustomer(senderId: string): Promise<void> {
+    const agent = this
+      .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
+    if (typeof agent.prepareCustomer !== 'function') return;
+    try {
+      await agent.prepareCustomer(senderId);
+    } catch (error) {
+      this.logger.warn(
+        `customer profile warm-up failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   /** S2: the sender's session style for a fixed media/handoff reply. Never
    * throws; without a readable style the copy stays in usted. */
   private customerStyle(message: InboundMessage): CustomerStyle {
@@ -357,6 +377,9 @@ export class WebhookDispatcherService {
       ...(message.interactiveReplyId === undefined
         ? {}
         : { interactiveReplyId: message.interactiveReplyId }),
+      ...(message.profileName === undefined
+        ? {}
+        : { profileName: message.profileName }),
       ...(message.receivingPhoneNumberId === undefined
         ? {}
         : {
@@ -535,6 +558,15 @@ export function normalizeInboundMessages(
     (item.changes ?? []).flatMap((change) => {
       const value = change.value;
       const fallbackSenderId = value?.contacts?.[0]?.wa_id;
+      // S1: the contact profile name of each sender (non-blank strings only).
+      const profileNameOf = (senderId: string): { profileName?: string } => {
+        const name = value?.contacts?.find(
+          (contact) => contact.wa_id === senderId,
+        )?.profile?.name;
+        return typeof name === 'string' && name.trim() !== ''
+          ? { profileName: name }
+          : {};
+      };
       const receivingPhoneNumberId =
         typeof value?.metadata?.phone_number_id === 'string'
           ? value.metadata.phone_number_id
@@ -558,6 +590,7 @@ export function normalizeInboundMessages(
               messageId: message.id,
               timestamp: normalizeTimestamp(message.timestamp),
               receivingPhoneNumberId,
+              ...profileNameOf(senderId),
             },
           ];
         }
@@ -584,6 +617,7 @@ export function normalizeInboundMessages(
               messageId: message.id,
               timestamp: normalizeTimestamp(message.timestamp),
               receivingPhoneNumberId,
+              ...profileNameOf(senderId),
               ...(reply.id === undefined
                 ? {}
                 : { interactiveReplyId: reply.id }),
@@ -618,6 +652,7 @@ export function normalizeInboundMessages(
               messageId: message.id,
               timestamp: normalizeTimestamp(message.timestamp),
               receivingPhoneNumberId,
+              ...profileNameOf(senderId),
               media,
             },
           ];

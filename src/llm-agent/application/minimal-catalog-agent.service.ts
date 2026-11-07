@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import { openai } from '@ai-sdk/openai';
-import { Output, stepCountIs, tool, type ModelMessage } from 'ai';
+import { Output, stepCountIs, tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import {
   CHATBOT_API_CLIENT,
@@ -31,11 +31,23 @@ import {
   DEFAULT_CUSTOMER_STYLE,
   applyCustomerRegister,
   applyCustomerStyle,
+  customerAllowsEmojis,
   customerStyleDirective,
   detectCustomerStyle,
+  explicitStyleSignal,
   limitCustomerEmojis,
   type CustomerStyle,
 } from '../domain/customer-style';
+import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
+import {
+  customerStyleSeed,
+  knownCustomerPromptLine,
+  type CustomerProfilePatch,
+} from '../../customer-profile/domain/customer-profile';
+import {
+  explicitPreferredName,
+  isForgetMyDataRequest,
+} from '../../customer-profile/domain/customer-profile-signals';
 import type {
   MinimalCatalogTurn,
   ReorderOfferContext,
@@ -181,6 +193,18 @@ export type MinimalCatalogAgentDecision = CustomerReply & {
 // Bounded busy reply returned as `handled` for an in-flight turn.
 export const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
+
+// S1: confirmation of "olvida mis datos" (the profile row is deleted).
+export const FORGET_MY_DATA_REPLY =
+  'Listo, borré los datos que tenía guardados de usted (nombre, estilo de trato y mascota). Sus pedidos registrados en la tienda no se borran.';
+
+// S1: guidance for the customer-memory tool (pet facts).
+const PET_MEMORY_INSTRUCTIONS =
+  'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
+  'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación.';
+
+/** Generous input cap; the profile store bounds each field again. */
+const PET_FACT = z.string().min(1).max(500).optional();
 
 export const RESTOCK_CAUTIOUS_REPLY =
   'Por ahora no puedo preparar esa consulta de reposición.';
@@ -666,6 +690,9 @@ export class MinimalCatalogAgentService {
     private readonly order?: MinimalOrderService,
     @Optional()
     private readonly shipping?: MinimalShippingService,
+    // S1 persistent customer memory; optional only as a test seam.
+    @Optional()
+    private readonly profiles?: CustomerProfileService,
   ) {
     const llm = config.get<{
       model: string;
@@ -685,6 +712,8 @@ export class MinimalCatalogAgentService {
     inboundEvent?: unknown;
     /** S4: id of the tapped reply button / list row, when there is one. */
     interactiveReplyId?: string;
+    /** S1: the WhatsApp contact profile name, when Meta sent it. */
+    profileName?: string;
   }): Promise<MinimalCatalogAgentDecision> {
     if (this.busy.has(input.senderId)) {
       // Any turn after a summary spends its consent, even a rejected one.
@@ -701,10 +730,13 @@ export class MinimalCatalogAgentService {
     this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
     try {
-      return this.withConfirmationButtons(
+      await this.prepareCustomer(input.senderId);
+      const decision = this.withConfirmationButtons(
         input.senderId,
         await this.handleTurn(input),
       );
+      await this.rememberTurn(input);
+      return decision;
     } finally {
       if (this.interrupted.delete(input.senderId)) {
         this.order?.dismiss(input.senderId);
@@ -721,6 +753,12 @@ export class MinimalCatalogAgentService {
     interactiveReplyId?: string;
   }): Promise<MinimalCatalogAgentDecision> {
     {
+      if (
+        this.profiles !== undefined &&
+        input.interactiveReplyId === undefined &&
+        isForgetMyDataRequest(input.text)
+      )
+        return this.forgetCustomer(input);
       let pick: InteractivePick | undefined;
       if (input.interactiveReplyId !== undefined) {
         const tapped = await this.consumeInteractive(
@@ -1154,7 +1192,10 @@ export class MinimalCatalogAgentService {
     const turns = this.sessionStore.read(input.senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
     // S2: the customer's own turns in this session decide the reply style.
-    const style = detectCustomerStyle([...customerTexts(turns), input.text]);
+    const style = detectCustomerStyle(
+      [...customerTexts(turns), input.text],
+      this.profileSeed(input.senderId),
+    );
     const styled = (text: string) => applyCustomerStyle(text, style);
     // Rebuild this sender's bounded selection registry and pending cart intent
     // from the last stored turn. Refs are deterministic digests, so a restored
@@ -1345,25 +1386,29 @@ export class MinimalCatalogAgentService {
         SYSTEM_PROMPT +
         '\n\n' +
         cartInstructions +
+        this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
         { role: 'user' as const, content: input.text },
       ],
-      tools: this.buildTools(
-        allowedIds,
-        currentIds,
-        traceId,
-        restockRun,
-        expirationReply,
-        input,
-        cartReply,
-        cartConversation,
-        checkoutRun,
-        imageRun,
-        reorderRun,
-      ),
+      tools: {
+        ...this.buildTools(
+          allowedIds,
+          currentIds,
+          traceId,
+          restockRun,
+          expirationReply,
+          input,
+          cartReply,
+          cartConversation,
+          checkoutRun,
+          imageRun,
+          reorderRun,
+        ),
+        ...this.memoryTools(input.senderId),
+      },
       stopWhen: stepCountIs(this.maxSteps),
     };
     // G2: the checkout reached shipping before this run (quote or pickup).
@@ -1776,7 +1821,110 @@ export class MinimalCatalogAgentService {
     const texts = customerTexts(this.sessionStore.read(senderId));
     return detectCustomerStyle(
       currentText === undefined ? texts : [...texts, currentText],
+      this.profileSeed(senderId),
     );
+  }
+
+  /**
+   * S1: loads the stored profile at the start of a session (no in-memory
+   * turns) or when it is not cached yet. Never throws. The dispatcher also
+   * calls it before media/handoff replies so they use the stored style.
+   */
+  async prepareCustomer(senderId: string): Promise<void> {
+    const profiles = this.profiles;
+    if (profiles === undefined) return;
+    if (
+      this.sessionStore.read(senderId).length === 0 ||
+      !profiles.isLoaded(senderId)
+    )
+      await profiles.load(senderId);
+  }
+
+  /** S1: the stored style that seeds this sender's session, if any. */
+  private profileSeed(senderId: string): CustomerStyle | null {
+    const profile = this.profiles?.cached(senderId) ?? null;
+    return profile === null ? null : customerStyleSeed(profile);
+  }
+
+  /** S1: pet-memory guidance and the "Cliente conocido" line, if any. */
+  private memoryInstructions(senderId: string): string {
+    if (this.profiles === undefined) return '';
+    const known = knownCustomerPromptLine(this.profiles.cached(senderId));
+    return `\n\n${PET_MEMORY_INSTRUCTIONS}${known === null ? '' : `\n${known}`}`;
+  }
+
+  /** S1: the model tool that remembers facts the customer gave about a pet. */
+  private memoryTools(senderId: string): ToolSet {
+    const profiles = this.profiles;
+    if (profiles === undefined) return {};
+    return {
+      rememberPetDetails: tool({
+        description:
+          'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
+          'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, notas); omita lo demás. Nunca invente ni deduzca.',
+        inputSchema: z.strictObject({
+          name: PET_FACT,
+          species: PET_FACT,
+          breed: PET_FACT,
+          size: PET_FACT,
+          ageText: PET_FACT,
+          notes: PET_FACT,
+        }),
+        execute: async (pet) => {
+          await profiles.record(senderId, { pet });
+          return { ok: true as const, remembered: true as const };
+        },
+      }),
+    };
+  }
+
+  /**
+   * S1: after each customer turn, the latest explicit style, the WhatsApp
+   * profile name and an explicit "llámame X". Emojis follow the session's
+   * latest messages. Defaults alone never create a profile. Never throws.
+   */
+  private async rememberTurn(input: {
+    senderId: string;
+    text: string;
+    interactiveReplyId?: string;
+    profileName?: string;
+  }): Promise<void> {
+    const profiles = this.profiles;
+    if (profiles === undefined) return;
+    const patch: CustomerProfilePatch = {};
+    if (input.profileName !== undefined) patch.displayName = input.profileName;
+    // A tapped button/row carries app text, not the customer's voice.
+    if (input.interactiveReplyId === undefined) {
+      Object.assign(patch, explicitStyleSignal(input.text));
+      const texts = customerTexts(this.sessionStore.read(input.senderId));
+      if (texts.at(-1) !== input.text) texts.push(input.text);
+      const emojis = customerAllowsEmojis(texts);
+      if (emojis || profiles.cached(input.senderId) !== null)
+        patch.emojis = emojis;
+      const name = explicitPreferredName(input.text);
+      if (name !== null) patch.preferredName = name;
+    }
+    await profiles.record(input.senderId, patch);
+  }
+
+  /** S1: "olvida mis datos" — delete the profile and confirm. */
+  private async forgetCustomer(input: {
+    senderId: string;
+    text: string;
+  }): Promise<MinimalCatalogAgentDecision> {
+    const style = this.customerStyle(input.senderId, input.text);
+    await this.profiles!.forget(input.senderId);
+    this.order?.dismiss(input.senderId);
+    const reply = applyCustomerStyle(FORGET_MY_DATA_REPLY, style);
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision({ reply });
   }
 
   /**

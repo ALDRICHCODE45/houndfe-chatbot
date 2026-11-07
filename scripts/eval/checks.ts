@@ -171,6 +171,21 @@ export function nextRegister(
   return current;
 }
 
+/** S1: a scenario's expected-content heuristic; a warning when unmet. */
+export function checkExpectedReply(
+  reply: string,
+  expected: RegExp | undefined,
+): CheckResult[] {
+  if (expected === undefined || expected.test(reply)) return [];
+  return [
+    {
+      check: 'expect',
+      severity: 'warn',
+      detail: `reply does not match ${String(expected)}`,
+    },
+  ];
+}
+
 export function checkReply(input: {
   customerText: string;
   /** The customer's messages so far, oldest first (default: this one). */

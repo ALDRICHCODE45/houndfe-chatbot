@@ -120,10 +120,22 @@ export class WebhookMessageDto {
   button?: WebhookButtonDto;
 }
 
+/** S1: the contact's WhatsApp profile (only the display name is kept). */
+export class WebhookContactProfileDto {
+  @IsOptional()
+  @IsString()
+  name?: string;
+}
+
 export class WebhookContactDto {
   @IsOptional()
   @IsString()
   wa_id?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookContactProfileDto)
+  profile?: WebhookContactProfileDto;
 }
 
 /**

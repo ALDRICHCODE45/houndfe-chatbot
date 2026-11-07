@@ -75,6 +75,11 @@ const CASUAL_MARKERS = [
 /** The product-photo synthetic block is app text, not the customer's voice. */
 const SYNTHETIC_IMAGE_BLOCK = /\n?\[Imagen enviada por el cliente:[\s\S]*$/;
 
+/** The customer's own words of a turn (the synthetic image block removed). */
+export function customerOwnText(text: string): string {
+  return text.replace(SYNTHETIC_IMAGE_BLOCK, '');
+}
+
 function normalize(text: string): string {
   return text
     .replace(SYNTHETIC_IMAGE_BLOCK, '')
@@ -110,18 +115,24 @@ export function customerAllowsEmojis(userTexts: readonly string[]): boolean {
   );
 }
 
-/** Style of the customer's own messages, oldest first. */
+/**
+ * Style of the customer's own messages, oldest first. S1: `seed` is the
+ * stored profile style; it fills the register and tone until this session
+ * shows an explicit signal. Emojis always follow this session's messages.
+ */
 export function detectCustomerStyle(
   userTexts: readonly string[],
+  seed?: CustomerStyle | null,
 ): CustomerStyle {
   const texts = userTexts.map((raw) => ({
     raw: raw.replace(SYNTHETIC_IMAGE_BLOCK, ''),
     text: normalize(raw),
   }));
-  let register: CustomerRegister = DEFAULT_CUSTOMER_STYLE.register;
+  let register: CustomerRegister =
+    seed?.register ?? DEFAULT_CUSTOMER_STYLE.register;
   for (const { text } of texts) register = registerSignal(text) ?? register;
   const emojis = customerAllowsEmojis(texts.map(({ raw }) => raw));
-  let tone: CustomerTone = DEFAULT_CUSTOMER_STYLE.tone;
+  let tone: CustomerTone = seed?.tone ?? DEFAULT_CUSTOMER_STYLE.tone;
   for (const { raw, text } of texts.slice(-TONE_WINDOW).reverse()) {
     const signal = toneSignal(raw, text);
     if (signal !== 'neutral') {
@@ -130,6 +141,20 @@ export function detectCustomerStyle(
     }
   }
   return { register, emojis, tone };
+}
+
+/** S1: the explicit register/tone signals of one message (none → {}). */
+export function explicitStyleSignal(
+  text: string,
+): Partial<Pick<CustomerStyle, 'register' | 'tone'>> {
+  const raw = text.replace(SYNTHETIC_IMAGE_BLOCK, '');
+  const normalized = normalize(raw);
+  const register = registerSignal(normalized);
+  const tone = toneSignal(raw, normalized);
+  return {
+    ...(register === null ? {} : { register }),
+    ...(tone === 'neutral' ? {} : { tone }),
+  };
 }
 
 const TONE_REPLY: Record<CustomerTone, string> = {
@@ -169,6 +194,36 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Quieres agregar algo más o seguimos con tu compra?',
   ],
   ['¿Qué producto busca?', '¿Qué producto buscas?'],
+  // S1 "olvida mis datos" confirmation.
+  ['tenía guardados de usted', 'tenía guardados de ti'],
+  ['Sus pedidos', 'Tus pedidos'],
+  // S1 later notices: receipt outcomes, zone resolved, restock, expiration.
+  [
+    '¿Desea continuar con la compra o prefiere que le ayude con alguna otra consulta?',
+    '¿Quieres continuar con la compra o prefieres que te ayude con alguna otra consulta?',
+  ],
+  [
+    'Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+    'Si querías enviarnos tu comprobante, mándalo de nuevo; si no, dime en qué te ayudo.',
+  ],
+  ['Escríbanos y le ayudamos.', 'Escríbenos y te ayudamos.'],
+  [
+    'si cree que es un error, escríbanos.',
+    'si crees que es un error, escríbenos.',
+  ],
+  ['Por favor envíelo de nuevo', 'Por favor envíalo de nuevo'],
+  ['Su PDF está protegido', 'Tu PDF está protegido'],
+  ['¿Nos envía una captura', '¿Nos envías una captura'],
+  ['Confirmamos su pago', 'Confirmamos tu pago'],
+  ['Gracias por su compra', 'Gracias por tu compra'],
+  // Third-person verbs that read as usted markers in the tú copy.
+  ['en cuanto se confirme.', 'en cuanto quede confirmado.'],
+  ['contados desde su confirmación', 'contados desde esa confirmación'],
+  ['puede enviarnos el comprobante', 'puedes enviarnos el comprobante'],
+  ['Puede enviarnos el comprobante', 'Puedes enviarnos el comprobante'],
+  ['cuando lo tenga.', 'cuando lo tengas.'],
+  ['¡Que esté muy bien!', '¡Que estés muy bien!'],
+  ['La fecha puede variar.', 'La fecha podría variar.'],
   ['Disculpe, no pude consultar', 'Disculpa, no pude consultar'],
   ['Elija una opción', 'Elige una opción'],
   [

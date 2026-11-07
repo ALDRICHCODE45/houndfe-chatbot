@@ -22,7 +22,11 @@ import { MinimalShippingService } from '../../src/llm-agent/application/minimal-
 import type { GenerateTextFn } from '../../src/llm-agent/infrastructure/generate-text.provider';
 import type { CustomerReplyInteractive } from '../../src/llm-agent/domain/customer-reply';
 import { InMemoryMinimalCatalogSessionStore } from '../../src/llm-agent/infrastructure/in-memory-minimal-catalog-session.store';
+import { CustomerProfileService } from '../../src/customer-profile/application/customer-profile.service';
+import type { CustomerProfileStore } from '../../src/customer-profile/domain/customer-profile';
+import { InMemoryCustomerProfileStore } from '../../src/customer-profile/infrastructure/in-memory-customer-profile.store';
 import {
+  checkExpectedReply,
   checkOrders,
   checkReply,
   nextRegister,
@@ -200,8 +204,18 @@ function meteredGenerate(meter: Meter): GenerateTextFn {
   return wrapped as unknown as GenerateTextFn;
 }
 
-function buildHarness(scenario: Scenario, meter: Meter) {
-  const api = new EvalFakeApi(scenario.customer);
+/**
+ * One bot process. S1: `profiles` is the scenario's customer-profile store
+ * (the database); a restart builds a new harness with the same store and
+ * backend fake, so only the in-memory session is lost.
+ */
+function buildHarness(
+  scenario: Scenario,
+  meter: Meter,
+  profiles: CustomerProfileStore,
+  api = new EvalFakeApi(scenario.customer),
+) {
+  const profileService = new CustomerProfileService(profiles);
   const store = new InMemoryConversationStore();
   const values: Record<string, unknown> = {
     'chatbotApi.cashierUserId': CASHIER,
@@ -230,6 +244,8 @@ function buildHarness(scenario: Scenario, meter: Meter) {
     checkout,
     config,
     shipping,
+    undefined,
+    profileService,
   );
   const agent = new MinimalCatalogAgentService(
     api,
@@ -243,6 +259,7 @@ function buildHarness(scenario: Scenario, meter: Meter) {
     checkout,
     order,
     shipping,
+    profileService,
   );
   return { api, agent };
 }
@@ -276,7 +293,8 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     tools: [],
     usage: { input: 0, cached: 0, output: 0 },
   };
-  const { api, agent } = buildHarness(scenario, meter);
+  const profiles = new InMemoryCustomerProfileStore();
+  let { api, agent } = buildHarness(scenario, meter, profiles);
   const record: ScenarioRecord = {
     scenario,
     turns: [],
@@ -302,6 +320,12 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       record.stopped = true;
       break;
     }
+    if (turn.restartBefore === true) {
+      // S1: same profile store and backend, new process and session. The
+      // expected register carries over (remembered); emojis restart.
+      ({ api, agent } = buildHarness(scenario, meter, profiles, api));
+      customerTexts.length = 0;
+    }
     register = nextRegister(register, turn.text);
     customerTexts.push(turn.text);
     meter.calls = 0;
@@ -315,6 +339,9 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       const decision = await agent.tryHandle({
         senderId: SENDER,
         text: turn.text,
+        ...(scenario.profileName === undefined
+          ? {}
+          : { profileName: scenario.profileName }),
         inboundEvent: {
           receivingPhoneNumberId: '123456789012345',
           senderId: SENDER,
@@ -341,7 +368,10 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     record.usd += turnUsd;
     maxTurnUsd = Math.max(maxTurnUsd, turnUsd);
     record.turns.push({
-      customer: turn.text,
+      customer:
+        turn.restartBefore === true
+          ? `🔄 (bot restart) ${turn.text}`
+          : turn.text,
       reply,
       images,
       interactive,
@@ -351,14 +381,17 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       backend: api.drainEvents(),
       checks:
         error === undefined
-          ? checkReply({
-              customerText: turn.text,
-              recentCustomerTexts: customerTexts,
-              reply,
-              expected: register,
-              refusal: turn.refusal ?? 'forbidden',
-              expectPersona: turn.expectPersona ?? false,
-            })
+          ? [
+              ...checkReply({
+                customerText: turn.text,
+                recentCustomerTexts: customerTexts,
+                reply,
+                expected: register,
+                refusal: turn.refusal ?? 'forbidden',
+                expectPersona: turn.expectPersona ?? false,
+              }),
+              ...checkExpectedReply(reply, turn.expectReply),
+            ]
           : [{ check: 'error', severity: 'fail', detail: error }],
       usd: turnUsd,
       ...(error === undefined ? {} : { error }),

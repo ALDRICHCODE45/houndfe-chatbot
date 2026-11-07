@@ -3,6 +3,7 @@ import {
   applyCustomerStyle,
   customerStyleDirective,
   detectCustomerStyle,
+  explicitStyleSignal,
   limitCustomerEmojis,
   type CustomerStyle,
 } from './customer-style';
@@ -281,5 +282,50 @@ describe('applyCustomerStyle', () => {
         );
       }
     }
+  });
+});
+
+describe('S1 stored style seed', () => {
+  const seed: CustomerStyle = { register: 'tu', emojis: true, tone: 'casual' };
+
+  it('a fresh session starts with the stored register and tone', () => {
+    expect(detectCustomerStyle(['hola'], seed)).toEqual({
+      register: 'tu',
+      // Emojis always follow this session's own messages (S5).
+      emojis: false,
+      tone: 'casual',
+    });
+  });
+
+  it('the current explicit signal wins over the seed', () => {
+    expect(
+      detectCustomerStyle(['Buenas tardes, ¿usted me puede ayudar?'], seed),
+    ).toMatchObject({ register: 'usted', tone: 'formal' });
+  });
+
+  it('without a seed nothing changes', () => {
+    expect(detectCustomerStyle(['hola'])).toEqual(DEFAULT_CUSTOMER_STYLE);
+  });
+});
+
+describe('explicitStyleSignal', () => {
+  it('reports only explicit register and tone signals', () => {
+    expect(explicitStyleSignal('hola')).toEqual({});
+    expect(explicitStyleSignal('oye, ¿tienes croquetas? jaja')).toEqual({
+      register: 'tu',
+      tone: 'casual',
+    });
+    expect(explicitStyleSignal('Disculpe, ¿usted tiene arena?')).toEqual({
+      register: 'usted',
+      tone: 'formal',
+    });
+  });
+
+  it('ignores the synthetic product-image block', () => {
+    expect(
+      explicitStyleSignal(
+        'esto\n[Imagen enviada por el cliente: tienes usted]',
+      ),
+    ).toEqual({});
   });
 });

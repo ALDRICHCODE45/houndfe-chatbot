@@ -6,6 +6,10 @@ import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import type { CustomerInboundObservationStore } from '../../human-decisions/domain/customer-inbound-observation-store.port';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
+  applyCustomerStyle,
+  type CustomerStyle,
+} from '../../customer-profile/domain/notice-style';
+import {
   DELIVERY_ZONE_TEMPLATE,
   deliveryZoneResolvedText,
   type DeliveryZoneDeliveryOutcome,
@@ -13,6 +17,10 @@ import {
   type DeliveryZoneRequesterStore,
 } from '../domain/delivery-zone-requester';
 import type { DeliveryZoneIntakeService } from './delivery-zone-intake.service';
+
+/** The fixed copy in the stored style; unchanged usted without one. */
+const styled = (text: string, style: CustomerStyle | null): string =>
+  style === null ? text : applyCustomerStyle(text, style);
 
 /** WhatsApp customer service window. */
 const CUSTOMER_WINDOW_MS = 86_400_000;
@@ -26,6 +34,8 @@ export type DeliveryZoneNotifierPorts = Pick<
   Pick<DeliveryZoneIntakeService, 'submit'> & {
     /** Drop a stored PENDING-zone quote so the next request re-quotes. */
     clearPendingQuote(senderId: string): Promise<void>;
+    /** S1: the stored customer style; null/failure keeps the usted text. */
+    customerStyle?(senderId: string): Promise<CustomerStyle | null>;
   };
 
 /**
@@ -135,6 +145,8 @@ export class DeliveryZoneNotifier {
       row.senderId,
       Date.parse(attemptedAt),
     );
+    // S1: read before the durable marker; nothing async between it and send.
+    const style = text ? await this.customerStyle(row.senderId) : null;
     // Durable marker BEFORE the provider call: a crash after it never resends.
     const started = await this.store.transition(
       row.sourceRequestId,
@@ -153,7 +165,10 @@ export class DeliveryZoneNotifier {
       const receipt = text
         ? await this.ports.sendText({
             to: row.senderId,
-            text: deliveryZoneResolvedText(row.zipCode, resolution.zoneType),
+            text: styled(
+              deliveryZoneResolvedText(row.zipCode, resolution.zoneType),
+              style,
+            ),
           })
         : await this.ports.sendTemplate({
             to: row.senderId,
@@ -192,6 +207,16 @@ export class DeliveryZoneNotifier {
       // The stale PENDING quote is never orderable; clearing is a courtesy.
     }
     return notified;
+  }
+
+  /** Never throws: a missing or failed profile read sends the usted text. */
+  private async customerStyle(senderId: string): Promise<CustomerStyle | null> {
+    if (this.ports.customerStyle === undefined) return null;
+    try {
+      return await this.ports.customerStyle(senderId);
+    } catch {
+      return null;
+    }
   }
 
   /** SEND_STARTED found on a later pass = crashed mid-send: unknown, no resend. */
