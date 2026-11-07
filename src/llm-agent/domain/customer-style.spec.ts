@@ -77,6 +77,30 @@ describe('detectCustomerStyle', () => {
     ])('%s', (_name, texts, register) => {
       expect(detectCustomerStyle(texts).register).toBe(register);
     });
+
+    // F4: present-tense tú verbs from a curated list, never an -as/-es suffix.
+    it.each<[string, CustomerStyle['register']]>([
+      ['ok y cuál me recomiendas? 🐱', 'tu'],
+      ['¿qué me recomiendas para un cachorro?', 'tu'],
+      ['¿me das el precio?', 'tu'],
+      ['¿cuánto me cobras el envío?', 'tu'],
+      ['¿sabes si llega mañana?', 'tu'],
+      ['¿me mandas la foto?', 'tu'],
+      ['¿qué me sugieres?', 'tu'],
+      ['¿cuál prefieres tú para gato?', 'tu'],
+      ['¿lo haces a domicilio?', 'tu'],
+      ['¿conoces la marca Nupec?', 'tu'],
+      ['¿me ayudas con un pedido?', 'tu'],
+      ['quiero más croquetas', 'usted'],
+      ['¿el tanque de gas?', 'usted'],
+      ['un atlas de razas', 'usted'],
+      ['ya compré tres veces', 'usted'],
+      ['hace dos meses', 'usted'],
+      ['las entregas son en la tarde?', 'usted'],
+      ['¿tienen croquetas de 15 kg?', 'usted'],
+    ])('%s → %s', (text, register) => {
+      expect(detectCustomerStyle([text]).register).toBe(register);
+    });
   });
 
   describe('emojis', () => {

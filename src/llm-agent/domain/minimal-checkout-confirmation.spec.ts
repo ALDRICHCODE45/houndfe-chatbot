@@ -268,9 +268,8 @@ describe('delivery confirmation next-step presentation', () => {
       const raw = kind === 'new' ? withFields(fields) : savedWithFields(fields);
       const summary = renderMinimalCheckoutConfirmation(normalize(raw));
       expect(summary).toContain('Calle: Av. Reforma 123, int. 130');
-      expect(summary).toContain(
-        'no crea un pedido, no registra al cliente ni activa el envío.',
-      );
+      // F2: no bureaucratic scope disclaimer.
+      expect(summary).not.toMatch(/no crea un pedido|solo en este chat/);
       expect(
         summary.endsWith(
           'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',

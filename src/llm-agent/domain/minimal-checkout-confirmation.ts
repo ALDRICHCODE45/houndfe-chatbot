@@ -48,7 +48,7 @@ export const MINIMAL_CHECKOUT_AMBIGUOUS_REPLY =
 export const MINIMAL_CHECKOUT_CHANGED_REPLY =
   'Sus datos de entrega cambiaron. Le mostraré el resumen actualizado para que lo confirme de nuevo.';
 export const MINIMAL_CHECKOUT_CONFIRMED_REPLY =
-  'Gracias. Confirmé sus datos de entrega para este chat. Esta confirmación no crea un pedido, no registra al cliente ni activa el envío. Para continuar, dígame «hacer pedido» y le mostraré el resumen con el total.';
+  'Gracias, sus datos de entrega quedaron confirmados.';
 export const MINIMAL_CHECKOUT_DECLINED_REPLY =
   'Entendido, no confirmé sus datos de entrega. ¿Qué dato quiere corregir?';
 export const MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY =
@@ -126,9 +126,8 @@ export function evaluateMinimalCheckoutReadiness(
 }
 
 /**
- * Deterministic server-owned confirmation summary. It states the local-only
- * scope explicitly so no order, registration or shipping activation is
- * implied.
+ * Deterministic server-owned confirmation summary. Short on purpose (F2):
+ * the order summary that follows asks its own explicit SÍ.
  */
 export function renderMinimalCheckoutConfirmation(
   draft: MinimalCheckoutDraft,
@@ -147,7 +146,6 @@ export function renderMinimalCheckoutConfirmation(
     `Ciudad o municipio: ${location ?? ''}`,
     `Estado: ${fields.state ?? ''}`,
     '',
-    'Esta confirmación es solo en este chat: no crea un pedido, no registra al cliente ni activa el envío.',
     'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',
   ].join('\n');
 }

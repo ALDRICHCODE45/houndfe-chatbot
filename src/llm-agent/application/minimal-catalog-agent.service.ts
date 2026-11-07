@@ -26,6 +26,7 @@ import type {
 } from '../domain/minimal-cart-quantity';
 import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import {
   applyCustomerStyle,
   customerStyleDirective,
@@ -68,6 +69,7 @@ import {
 } from './minimal-checkout.service';
 import {
   MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY,
+  MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY,
   MinimalOrderService,
 } from './minimal-order.service';
 import {
@@ -113,7 +115,9 @@ const INSTRUCTIONS =
   'No realizas compras, ventas, pagos ni cambios de datos. ' +
   'Saluda cálido, en el registro y con los emojis del estilo del cliente. Un hallazgo se anuncia ' +
   '"Encontré ... en catálogo", no "tenemos" ni "disponible": eso solo se afirma tras un ' +
-  'checkStock válido. La selección explícita ya es válida: no la repreguntes. ' +
+  'checkStock válido. Tras un checkStock disponible dilo natural ("Sí, lo tenemos disponible"); ' +
+  'menciona la cantidad solo si es baja o el cliente la pide, nunca "una cantidad de N unidades en stock". ' +
+  'La selección explícita ya es válida: no la repreguntes. ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
@@ -280,14 +284,12 @@ const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
 const SHIPPING_INSTRUCTIONS_FRAGMENT =
   '\n\nEnvío: llame requestShippingQuote sin argumentos solo después de que el cliente confirmó sus datos de entrega y quiere envío a domicilio; la aplicación le informa el costo, el crédito y la fecha estimada. Nunca invente ni calcule costos, créditos, transportistas ni fechas de entrega; no repita montos. ' +
   'Si la entrega a su código postal está en validación o no está disponible, ofrezca recoger el pedido en tienda. Cuando el cliente elija recoger en tienda (puede pedirlo en cualquier momento), llame chooseStorePickup sin argumentos; no tiene costo de envío y no necesita dirección de entrega. Para recoger en tienda solo hace falta el nombre del cliente: si la aplicación lo pide, guárdelo con updateCheckoutDetails (solo firstName y lastName, null en los demás, useNewAddress: false) y llame prepareOrder de nuevo; no pida dirección ni la confirmación de datos de entrega. ' +
-  'Después el cliente pide el resumen con prepareOrder. Nunca diga que existe un pedido.';
+  'Tras una cotización exitosa o la recolección en tienda, la aplicación muestra el resumen del pedido en la misma respuesta. Nunca diga que existe un pedido.';
 
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados (o el cliente eligió recoger en tienda) y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
 const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-const NEXT_STEP =
-  'Si está de acuerdo, dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.';
 const zipPhrase = (zipCode: string | null) =>
   zipCode === null ? 'su código postal' : `su código postal ${zipCode}`;
 
@@ -319,8 +321,8 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
                 : []),
               `Usted paga ${shippingMxn(result.customerChargeCents)}.`,
             ]),
+        // F1: the order summary follows in the same reply; no magic phrase.
         ...(eta === null ? [] : [eta]),
-        NEXT_STEP,
       ].join(' ');
     }
     case 'zone_pending':
@@ -376,7 +378,7 @@ function shippingRefusalReply(reason: MinimalShippingRefusal): string {
 /** Server-owned reply for a store pickup choice (S4). */
 export function minimalPickupReply(result: MinimalPickupResult): string {
   if (result.kind === 'pickup')
-    return `Listo, usted recoge su pedido en tienda, sin costo de envío. Dígame «hacer pedido» y le muestro el resumen para confirmarlo; todavía no se creó ningún pedido.`;
+    return 'Listo, usted recoge su pedido en tienda, sin costo de envío.';
   if (result.reason === 'order_unresolved')
     return 'Tengo un pedido suyo pendiente de confirmar, así que por ahora no puedo cambiar cómo lo recibe. Pida de nuevo el resumen y responda SÍ para reintentar ese mismo pedido, o comuníquese con la tienda.';
   if (result.reason === 'empty_cart')
@@ -417,7 +419,7 @@ const CHECKOUT_INSTRUCTIONS_FRAGMENT =
   'Si hay direcciones, muéstrelas con su resumen y pregunte cuál usar; para elegir una llame selectCheckoutAddress con su addressRef EXACTO (nunca invente ni elija una por su cuenta). Use nextPageRef solo si el cliente pide ver más. not_found o ambiguous no impiden capturar una dirección nueva; lookup_unavailable no significa que no exista. ' +
   'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Si el cliente corrige una dirección guardada seleccionada, llame updateCheckoutDetails con SOLO los campos corregidos, null en los demás y useNewAddress: false; conservamos los otros datos y actualizaremos esa dirección al crear el pedido. Si dice que un dato está mal sin dar el valor correcto, pregunte cuál es el correcto. Nunca pida confirmar datos que el cliente dijo que están mal. ' +
   'Se requieren nombre, calle, número exterior o S/N, colonia, código postal, ciudad o municipio y estado; pida lo que falte (missing). ' +
-  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
+  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Cuando el cliente confirma sus datos, la aplicación continúa sola con el envío y el resumen del pedido. Con datos ya confirmados no vuelva a llamar selectCheckoutAddress, updateCheckoutDetails ni confirmCheckoutDetails salvo que el cliente pida cambiar un dato; un mensaje afirmativo o neutral («ok», «va», «envío a domicilio») no cambia datos. Nunca copie la línea «Calle» del resumen en street: el número exterior va solo en exteriorNumber. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
 
 const CART_VARIANT_GUIDANCE =
   'Para herramientas de carrito copie en selectionRef el cartSelectionRef EXACTO del producto o presentación elegidos, devuelto por searchCatalog/checkStock/getCart o por el contexto verificado. No envíe productId ni variantId a herramientas de carrito. ' +
@@ -577,8 +579,15 @@ export class MinimalCatalogAgentService {
         }
       }
       if (this.checkoutAvailable()) {
-        const delivery = await this.checkout!.consume(input);
+        let delivery = await this.checkout!.consume(input);
         if (delivery !== null) this.order?.dismiss(input.senderId);
+        // F1: confirmed delivery data continue straight to the order summary.
+        if (delivery?.confirmed === true && this.orderAvailable())
+          delivery = await this.continueToOrder(
+            input.senderId,
+            input.inboundEvent,
+            delivery.reply,
+          );
         const answered =
           delivery ??
           (this.orderAvailable() ? await this.order!.consume(input) : null);
@@ -734,7 +743,7 @@ export class MinimalCatalogAgentService {
           'No realizas compras, ventas, pagos ni cambios de datos.',
           'Puede mantener el carrito; no realiza ventas, pagos ni reservas de inventario.',
         ) +
-        '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Use getCart para consultarlo, también después de un reinicio. ' +
+        '\n\nCarrito: solo cambie el carrito si el cliente lo pide explícitamente. Al encontrar un producto ofrezca un solo siguiente paso claro ("¿Se lo agrego al carrito?"; de tú: "¿Te lo agrego al carrito?"); no pregunte por la entrega ni por recoger en tienda antes de que haya carrito. Use getCart para consultarlo, también después de un reinicio. ' +
         'Las herramientas de carrito usan selectionRef, NO un productId/variantId: copie el cartSelectionRef EXACTO que devolvió searchCatalog/checkStock/getCart para ese producto o presentación; nunca invente ni reutilice una referencia de otro renglón. ' +
         'Use setCartItem con la presentación elegida y la cantidad TOTAL deseada (quantity), no un incremento. ' +
         'Use adjustCartItem con un delta firmado para sumar o quitar unidades (delta: 2 agrega, delta: -1 quita). La aplicación calcula el nuevo total; un delta positivo también crea un renglón nuevo. ' +
@@ -988,6 +997,46 @@ export class MinimalCatalogAgentService {
 
   private orderAvailable(): boolean {
     return this.order !== undefined && this.order.enabled;
+  }
+
+  /**
+   * F1: the next deterministic step after confirmed delivery data, a quote or
+   * a pickup choice: the order summary (quoting the confirmed address first
+   * when no current shipping choice exists). `lead` precedes it; the order
+   * gate still needs its own SÍ. Reuses the existing order and shipping gates.
+   */
+  private async continueToOrder(
+    senderId: string,
+    inboundEvent: unknown,
+    lead: string | null,
+  ): Promise<MinimalCheckoutReply> {
+    const join = (...parts: Array<string | null>) =>
+      parts.filter((part): part is string => part !== null).join('\n\n');
+    const withLead = (
+      prefix: string | null,
+      prepared: MinimalCheckoutReply,
+    ): MinimalCheckoutReply =>
+      prepared.onSent === undefined
+        ? { reply: join(prefix, prepared.reply) }
+        : { reply: join(prefix, prepared.reply), onSent: prepared.onSent };
+    const first = await this.order!.prepareOrder(senderId, inboundEvent);
+    if (
+      first.reply !== MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY ||
+      !this.shippingAvailable()
+    )
+      return withLead(lead, first);
+    let quoted: MinimalShippingResult;
+    try {
+      quoted = await this.shipping!.quote(senderId);
+    } catch {
+      quoted = { kind: 'unavailable' };
+    }
+    const shippingLine = minimalShippingReply(quoted);
+    if (quoted.kind !== 'quoted') return { reply: join(lead, shippingLine) };
+    return withLead(
+      join(lead, shippingLine),
+      await this.order!.prepareOrder(senderId, inboundEvent),
+    );
   }
 
   private hasInvalidToolCall(
@@ -1647,6 +1696,13 @@ export class MinimalCatalogAgentService {
               inputSchema: checkoutDetailsToolInput,
               strict: true,
               execute: async (patch) => {
+                // F3: a bare affirmative carries no new delivery data.
+                if (classifyConfirmationReply(context.text) === 'accept') {
+                  trace(
+                    'tool updateCheckoutDetails result=error code=no_details_in_message',
+                  );
+                  return toolError('no_details_in_message');
+                }
                 const result = await checkout.updateDetails(
                   context.senderId,
                   patch,
@@ -1666,10 +1722,20 @@ export class MinimalCatalogAgentService {
                 if (checkoutRun.attempted)
                   return toolError('checkout_presentation_settled');
                 checkoutRun.attempted = true;
-                const prepared = await checkout.prepareConfirmation(
-                  context.senderId,
-                  context.inboundEvent,
-                );
+                // F1: confirmed, unchanged data are never re-presented; the
+                // flow moves on to the order summary instead.
+                const prepared =
+                  this.orderAvailable() &&
+                  (await checkout.confirmedDraft(context.senderId)) !== null
+                    ? await this.continueToOrder(
+                        context.senderId,
+                        context.inboundEvent,
+                        null,
+                      )
+                    : await checkout.prepareConfirmation(
+                        context.senderId,
+                        context.inboundEvent,
+                      );
                 checkoutRun.value = prepared;
                 trace(
                   `tool confirmCheckoutDetails result=${prepared.onSent === undefined ? 'blocked' : 'offer'}`,
@@ -1695,9 +1761,14 @@ export class MinimalCatalogAgentService {
                         const result = await this.shipping!.quote(
                           context.senderId,
                         );
-                        checkoutRun.value = {
-                          reply: minimalShippingReply(result),
-                        };
+                        checkoutRun.value =
+                          result.kind === 'quoted'
+                            ? await this.continueToOrder(
+                                context.senderId,
+                                context.inboundEvent,
+                                minimalShippingReply(result),
+                              )
+                            : { reply: minimalShippingReply(result) };
                         return {
                           ok: result.kind === 'quoted',
                           presentedByApplication: true,
@@ -1728,9 +1799,14 @@ export class MinimalCatalogAgentService {
                         const result = await this.shipping!.chooseStorePickup(
                           context.senderId,
                         );
-                        checkoutRun.value = {
-                          reply: minimalPickupReply(result),
-                        };
+                        checkoutRun.value =
+                          result.kind === 'pickup'
+                            ? await this.continueToOrder(
+                                context.senderId,
+                                context.inboundEvent,
+                                minimalPickupReply(result),
+                              )
+                            : { reply: minimalPickupReply(result) };
                         return {
                           ok: result.kind === 'pickup',
                           presentedByApplication: true,

@@ -435,13 +435,13 @@ describe('customer style over every fixed customer reply (S2)', () => {
 
   it('pins representative tú copy', () => {
     expect(applyCustomerStyle(MINIMAL_CHECKOUT_CONFIRMED_REPLY, tu)).toBe(
-      'Gracias. Confirmé tus datos de entrega para este chat. Esta confirmación no crea un pedido, no registra al cliente ni activa el envío. Para continuar, dime «hacer pedido» y te mostraré el resumen con el total.',
+      'Gracias, tus datos de entrega quedaron confirmados.',
     );
     expect(applyCustomerStyle(MINIMAL_ORDER_DECLINED_REPLY, tu)).toBe(
       'Entendido, no creé el pedido. ¿Quieres cambiar algo del pedido?',
     );
     expect(applyCustomerStyle(REPLIES.pickup, tu)).toBe(
-      'Listo, recoges tu pedido en tienda, sin costo de envío. Dime «hacer pedido» y te muestro el resumen para confirmarlo; todavía no se creó ningún pedido.',
+      'Listo, recoges tu pedido en tienda, sin costo de envío.',
     );
     expect(applyCustomerStyle(BUSY_REPLY, tu)).toBe(
       'Ya estoy atendiendo tu consulta; por favor espera mi respuesta.',

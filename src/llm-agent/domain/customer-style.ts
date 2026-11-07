@@ -42,7 +42,9 @@ const USTED_MARKERS = [
 ];
 const TU_MARKERS = [
   /\b(tu|tus|ti|te|contigo)\b/,
+  // Curated present-tense tú verbs; never an -as/-es suffix (más, gas, veces).
   /\b(tienes|puedes|podrias|quieres|sabes|manejas|vendes|mandas|envias|haces|cobras|aceptas|ocupas|necesitas|crees)\b/,
+  /\b(recomiendas|recomendarias|das|sugieres|aconsejas|conoces|ayudas|prefieres|dices|pides|traes|llevas|buscas|ofreces)\b/,
   /\b(oye|dime|dame|disculpa|checa|fijate|ponme|agrega|ensename)\b/,
   // Tú imperatives of -ar verbs with enclitics: agrégame, mándamelos, pásalo.
   /\b(agrega|manda|pasa|quita|aparta|cotiza|muestra|envia|ayuda|avisa|confirma|regala|cambia)(?:(?:me|te|nos)(?:lo|la|los|las)?|lo|la|los|las)\b/,

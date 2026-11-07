@@ -134,6 +134,8 @@ export type MinimalCheckoutDraftResult =
 export interface MinimalCheckoutReply {
   reply: string;
   onSent?: () => void;
+  /** Set only when this reply confirmed the delivery data (F1 continuation). */
+  confirmed?: true;
 }
 
 export type MinimalCheckoutRevalidation = 'ok' | 'reselect' | 'unavailable';
@@ -379,6 +381,7 @@ export class MinimalCheckoutService {
     const current = await this.readDraft(senderId);
     if (current === null) return { ok: false, error: 'draft_unavailable' };
     const draft = current.draft;
+    dropStreetNumberEcho(values, draft);
     const savedSelected = draft !== undefined && draft.address.kind !== 'new';
     const keepSaved = savedSelected && patch.useNewAddress !== true;
     const customer = {
@@ -506,7 +509,7 @@ export class MinimalCheckoutService {
       committed,
     });
     return finalized.kind === 'confirmed'
-      ? { reply: finalized.reply }
+      ? { reply: finalized.reply, confirmed: true }
       : this.reoffer(
           input.senderId,
           input.inboundEvent,
@@ -668,6 +671,37 @@ export class MinimalCheckoutService {
     this.selected.delete(senderId);
     return 'reselect';
   }
+}
+
+const sameText = (a: string, b: string) =>
+  a.replace(/\s+/g, ' ').toLowerCase() === b.replace(/\s+/g, ' ').toLowerCase();
+
+/**
+ * F3: a street equal to the current street plus the exterior number (the
+ * rendered "Calle:" line copied back) is not a change; keeping it would show
+ * the number twice. Only the current street is compared, so a dictated
+ * street that legitimately ends in a number is kept.
+ */
+function dropStreetNumberEcho(
+  values: Map<string, string>,
+  draft: MinimalCheckoutDraft | undefined,
+): void {
+  const street = values.get('street');
+  if (street === undefined || draft === undefined) return;
+  const current =
+    draft.address.kind === 'saved'
+      ? draft.address.snapshot
+      : draft.address.fields;
+  const exterior = values.get('exteriorNumber') ?? current.exteriorNumber;
+  if (current.street === null || exterior === null) return;
+  if (/^s\/?n$/i.test(exterior.trim())) return;
+  const echoes = [
+    `${current.street} ${exterior}`,
+    `${current.street} #${exterior}`,
+    `${current.street} # ${exterior}`,
+  ];
+  if (echoes.some((echo) => sameText(echo, street)))
+    values.set('street', current.street);
 }
 
 function invalid(): MinimalCheckoutDraftResult {

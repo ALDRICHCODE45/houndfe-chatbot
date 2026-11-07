@@ -669,6 +669,77 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     expect(h.checkout().confirmationStatus(SENDER)).toBeNull();
   });
 
+  // F3: the model copied the rendered "Calle: Av. Juárez 10" line back into
+  // `street`; the exterior number must not be duplicated into the street.
+  it.each([
+    ['street already carrying the number', { street: 'Av. Juárez 10' }],
+    ['number sign variant', { street: 'Av. Juárez #10' }],
+    [
+      'street and the same exterior number',
+      { street: 'Av. Juárez 10', exteriorNumber: '10' },
+    ],
+  ])(
+    '[F3] a %s keeps the confirmed saved address unchanged',
+    async (_name, patch) => {
+      const h = setup();
+      await h.turn('Quiero comprar', [lookup(), say()]);
+      const ref = firstRef(h.outputs[0]);
+      const offer = await h.turn(
+        'La primera',
+        [
+          call('selectCheckoutAddress', { addressRef: ref }),
+          call('confirmCheckoutDetails'),
+          say(),
+        ],
+        EVENT('wamid.offer'),
+      );
+      (offer as { onSent: () => void }).onSent();
+      await h.turn('Sí, por favor 🙏', [say()], EVENT('wamid.yes'));
+      const before = await h.draft();
+      await h.checkout().updateDetails(SENDER, details(patch, false));
+      expect(await h.draft()).toEqual(before);
+      expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
+        stage: 'confirmed',
+      });
+      expect(await h.checkout().confirmedDraft(SENDER)).not.toBeNull();
+    },
+  );
+
+  it('[F3] a pending summary survives a no-op street echo, so the next SÍ confirms it', async () => {
+    const h = setup();
+    await h.turn('Quiero comprar', [lookup(), say()]);
+    const ref = firstRef(h.outputs[0]);
+    const offer = await h.turn(
+      'La primera',
+      [
+        call('selectCheckoutAddress', { addressRef: ref }),
+        call('confirmCheckoutDetails'),
+        say(),
+      ],
+      EVENT('wamid.offer'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    await h
+      .checkout()
+      .updateDetails(SENDER, details({ street: 'Av. Juárez 10' }, false));
+    expect(await h.turn('ok', [say()], EVENT('wamid.ok'))).toEqual({
+      kind: 'handled',
+      reply: MINIMAL_CHECKOUT_CONFIRMED_REPLY,
+    });
+  });
+
+  it('[F3] an affirmative message never applies model-invented checkout details', async () => {
+    const h = setup();
+    await collectComplete(h);
+    const before = await h.draft();
+    await h.turn('va', [
+      call('updateCheckoutDetails', details({ street: 'Calle 5 5' })),
+      say(),
+    ]);
+    expect(await h.draft()).toEqual(before);
+    expect(h.outputs[0]).toMatchObject({ ok: false });
+  });
+
   it('does not confirm, and re-presents the summary, when the acceptance CAS loses', async () => {
     const h = setup();
     await collectComplete(h);
