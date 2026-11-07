@@ -86,6 +86,7 @@ export const REQUIRED_MIGRATIONS = [
   '3400000000000_receipt_media_outcome.js',
   '3500000000000_receipt_media_backend_only.js',
   '3600000000000_receipt_media_upload_fields.js',
+  '3700000000000_customer_profiles.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

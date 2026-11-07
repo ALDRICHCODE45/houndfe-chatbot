@@ -184,6 +184,10 @@ describe('runLaunchPreflight', () => {
     );
   });
 
+  it('requires the customer profile migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain('3700000000000_customer_profiles.js');
+  });
+
   it('fails when a required migration filename is absent from disk', () => {
     const withoutOne = REQUIRED_MIGRATIONS.filter(
       (name: string) => name !== '2000000000000_receipt_media.js',
