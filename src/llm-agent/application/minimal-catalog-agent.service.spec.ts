@@ -291,7 +291,12 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
   });
 
   it('logs closed status values and distinct deny/error codes', async () => {
-    const { service, chatbotApi, captured } = build(flow);
+    const { service, chatbotApi, captured } = build(
+      [1, 2, 3].flatMap((n) => [
+        call(`s${n}`, 'searchCatalog', { q: 'ibuprofeno' }),
+        say('¿Buscaba esa presentación?'),
+      ]),
+    );
     const notManaged = {
       ...simpleStock,
       stock: { status: 'not_managed' as const, quantity: null },
@@ -309,14 +314,20 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     ).resolves.toMatchObject({
       stock: { status: 'not_managed', quantity: null },
     });
+    // A repeated read in one run reuses its first answer (G1), so each
+    // further outcome is read through a fresh run's tools.
+    const freshCheckStock = async () => {
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      return captured.at(-1)!.tools!.checkStock;
+    };
     chatbotApi.getStock.mockResolvedValueOnce({
       ...notManaged,
       stock: { status: 'bogus', quantity: 'x' },
     } as never);
-    await checkStock.execute({ productId: PRODUCT }, {});
+    await (await freshCheckStock()).execute({ productId: PRODUCT }, {});
     chatbotApi.getStock.mockRejectedValueOnce(new Error('leaked detail'));
     await expect(
-      checkStock.execute({ productId: PRODUCT }, {}),
+      (await freshCheckStock()).execute({ productId: PRODUCT }, {}),
     ).resolves.toEqual({ ok: false, error: 'stock_unavailable' });
     const joined = logs.join('\n');
     expect(joined).toContain(

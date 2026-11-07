@@ -244,6 +244,31 @@ export function sameMinimalOrder(
 
 const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 
+/**
+ * "Producto — Presentación" for one line. Backend presentation labels may
+ * already start with the product name ("Collar … Mediana"); only the
+ * remainder is shown so the name is never repeated.
+ */
+export function minimalLineLabel(
+  name: string,
+  variantName?: string | null,
+): string {
+  const presentation = variantName?.trim() ?? '';
+  if (presentation === '') return name;
+  const prefix = name.trim();
+  const rest = presentation.slice(prefix.length);
+  if (
+    presentation
+      .toLocaleLowerCase('es')
+      .startsWith(prefix.toLocaleLowerCase('es')) &&
+    (rest === '' || /^[\s\-–—:,]/.test(rest))
+  ) {
+    const remainder = rest.replace(/^[\s\-–—:,]+/, '');
+    return remainder === '' ? name : `${name} — ${remainder}`;
+  }
+  return `${name} — ${presentation}`;
+}
+
 /** Server-owned display of validated backend savings, never a price calculation. */
 export function minimalPromotionSuffix(
   item: Pick<MinimalOrderLine, 'appliedPromotionTitle' | 'discountAmountCents'>,
@@ -322,7 +347,7 @@ export function renderMinimalOrderSummary(
     'Resumen de su pedido:',
     ...snapshot.items.map(
       (item) =>
-        `• ${item.name}${item.variantName ? ` — ${item.variantName}` : ''}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,
+        `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
     pickup

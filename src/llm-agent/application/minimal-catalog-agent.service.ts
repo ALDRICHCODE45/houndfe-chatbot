@@ -150,6 +150,20 @@ export const BUSY_REPLY =
 export const RESTOCK_CAUTIOUS_REPLY =
   'Por ahora no puedo preparar esa consulta de reposición.';
 
+// G1: sent when a run ends without any text, even after a tool-free render.
+export const EMPTY_REPLY_FALLBACK =
+  'Disculpe, no alcancé a completar su consulta. ¿Me confirma qué producto y presentación busca?';
+
+// G2: lead before the updated order summary after a cart change.
+export const CART_UPDATED_LEAD = 'Listo, actualicé su carrito.';
+
+/**
+ * Model text imitating the server-owned delivery-data or order summaries.
+ * Only the application presents them (and arms their SÍ gate).
+ */
+const IMITATED_CONFIRMATION =
+  /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“']?\s*s[ií]\b[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
+
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
 
 // The read-only prompt denies a registration tool; when `prepareRestock` or
@@ -271,6 +285,8 @@ type RestockRun = {
 type ExpirationReply = { attempted: boolean; value: string | null };
 type CartReply = ExpirationReply & {
   source?: 'cart' | 'read' | 'reviewCheckout';
+  // A real write left a non-empty cart in this run.
+  mutated?: boolean;
 };
 
 // One server-owned checkout presentation per SDK run.
@@ -424,7 +440,8 @@ const CHECKOUT_INSTRUCTIONS_FRAGMENT =
   'Si hay direcciones, muéstrelas con su resumen y pregunte cuál usar; para elegir una llame selectCheckoutAddress con su addressRef EXACTO (nunca invente ni elija una por su cuenta). Use nextPageRef solo si el cliente pide ver más. not_found o ambiguous no impiden capturar una dirección nueva; lookup_unavailable no significa que no exista. ' +
   'Para datos nuevos llame updateCheckoutDetails con SOLO los valores que el cliente dijo en esta conversación y null en los demás; useNewAddress: true cuando dicte una dirección nueva. Si el cliente corrige una dirección guardada seleccionada, llame updateCheckoutDetails con SOLO los campos corregidos, null en los demás y useNewAddress: false; conservamos los otros datos y actualizaremos esa dirección al crear el pedido. Si dice que un dato está mal sin dar el valor correcto, pregunte cuál es el correcto. Nunca pida confirmar datos que el cliente dijo que están mal. ' +
   'Se requieren nombre, calle, número exterior o S/N, colonia, código postal, ciudad o municipio y estado; pida lo que falte (missing). ' +
-  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Cuando el cliente confirma sus datos, la aplicación continúa sola con el envío y el resumen del pedido. Con datos ya confirmados no vuelva a llamar selectCheckoutAddress, updateCheckoutDetails ni confirmCheckoutDetails salvo que el cliente pida cambiar un dato; un mensaje afirmativo o neutral («ok», «va», «envío a domicilio») no cambia datos. Nunca copie la línea «Calle» del resumen en street: el número exterior va solo en exteriorNumber. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío.';
+  'Después de selectCheckoutAddress ok, o cuando updateCheckoutDetails complete los datos (ready: true), llame confirmCheckoutDetails sin argumentos en la MISMA respuesta: la aplicación muestra el resumen y pide al cliente responder SÍ. Si faltan datos, pida solo los campos missing. Nunca llame reviewCheckout mientras haya una dirección seleccionada o esté recopilando datos de entrega, aunque el cliente pida revisar su compra. Cuando el cliente confirma sus datos, la aplicación continúa sola con el envío y el resumen del pedido. Con datos ya confirmados no vuelva a llamar selectCheckoutAddress, updateCheckoutDetails ni confirmCheckoutDetails salvo que el cliente pida cambiar un dato; un mensaje afirmativo o neutral («ok», «va», «envío a domicilio») no cambia datos. Nunca copie la línea «Calle» del resumen en street: el número exterior va solo en exteriorNumber. Usted nunca redacta ni confirma los datos, no registra al cliente, no crea pedidos y no activa el envío. ' +
+  'Nunca escriba por su cuenta el resumen de datos de entrega ni el resumen del pedido, ni pida al cliente responder «SÍ»: llame confirmCheckoutDetails o prepareOrder y la aplicación los muestra. Si el cliente cambia el carrito con sus datos ya confirmados, solo llame la herramienta de carrito: la aplicación muestra el resumen actualizado.';
 
 const CART_VARIANT_GUIDANCE =
   'Para herramientas de carrito copie en selectionRef el cartSelectionRef EXACTO del producto o presentación elegidos, devuelto por searchCatalog/checkStock/getCart o por el contexto verificado. No envíe productId ni variantId a herramientas de carrito. ' +
@@ -845,6 +862,13 @@ export class MinimalCatalogAgentService {
       ),
       stopWhen: stepCountIs(this.maxSteps),
     };
+    // G2: the checkout reached shipping before this run (quote or pickup).
+    const priorShipping =
+      this.cart !== undefined &&
+      checkoutRun !== null &&
+      this.shippingAvailable()
+        ? await this.cart.shippingMode(input.senderId)
+        : null;
     let result = await this.generateTextFn(generateParams);
     this.costGuard.record({
       promptTokens: result.usage?.inputTokens ?? 0,
@@ -932,6 +956,29 @@ export class MinimalCatalogAgentService {
         ? { reply }
         : { reply, onSent: checkoutResult.onSent };
     }
+    const continued =
+      cartReply.mutated === true && priorShipping !== null
+        ? await this.continueAfterCartChange(
+            input.senderId,
+            input.inboundEvent,
+            priorShipping,
+          )
+        : null;
+    if (continued !== null) {
+      const reply = styled(continued.reply);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return continued.onSent === undefined
+        ? { reply }
+        : { reply, onSent: continued.onSent };
+    }
     if (cartReply.value !== null) {
       const reply = styled(cartReply.value);
       this.recordTurn(
@@ -982,14 +1029,156 @@ export class MinimalCatalogAgentService {
       );
       return { reply };
     }
+    let text = result.text;
+    let responseMessages: ModelMessage[] = result.responseMessages;
+    if (text.trim() === '') {
+      // G1: the step budget ended on tool calls. One tool-free render with
+      // the gathered results; a customer never gets silence.
+      traceLog(
+        this.logger,
+        `minimal_catalog empty_reply retry=render_without_tools trace=${traceId}`,
+      );
+      const rendered = await this.renderWithoutTools(
+        generateParams,
+        responseMessages,
+      );
+      if (rendered !== null) {
+        text = rendered.text;
+        responseMessages = [...responseMessages, ...rendered.responseMessages];
+      }
+    }
+    if (IMITATED_CONFIRMATION.test(text)) {
+      // The model wrote its own delivery or order summary: no gate is armed
+      // for it, so run the real step instead of sending the imitation.
+      traceLog(
+        this.logger,
+        `minimal_catalog imitated_confirmation replaced=real_step trace=${traceId}`,
+      );
+      const real = await this.realConfirmationStep(
+        input.senderId,
+        input.inboundEvent,
+      );
+      const reply = styled(real.reply);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return real.onSent === undefined
+        ? { reply }
+        : { reply, onSent: real.onSent };
+    }
+    if (text.trim() === '') {
+      const reply = styled(EMPTY_REPLY_FALLBACK);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+      );
+      return { reply };
+    }
     this.recordTurn(
       input.senderId,
-      [{ role: 'user', content: input.text }, ...result.responseMessages],
+      [{ role: 'user', content: input.text }, ...responseMessages],
       [...currentIds],
       persistedCartContext(),
     );
     // The prompt styles model text; only the emoji guard applies here.
-    return { reply: limitCustomerEmojis(result.text, style) };
+    return { reply: limitCustomerEmojis(text, style) };
+  }
+
+  /**
+   * G1: one extra model call with the run's tool results and no tool
+   * execution possible (tools without `execute`, toolChoice 'none').
+   * `null` when the call fails; usage is booked when it returns.
+   */
+  private async renderWithoutTools(
+    params: Parameters<GenerateTextFn>[0] & {
+      messages: ModelMessage[];
+      tools: Record<string, object>;
+    },
+    gathered: ModelMessage[],
+  ): Promise<{ text: string; responseMessages: ModelMessage[] } | null> {
+    try {
+      const tools = Object.fromEntries(
+        Object.entries(params.tools).map(([name, definition]) => [
+          name,
+          { ...definition, execute: undefined },
+        ]),
+      );
+      const rendered = await this.generateTextFn({
+        ...params,
+        messages: [...params.messages, ...gathered],
+        tools: tools as never,
+        toolChoice: 'none',
+        stopWhen: stepCountIs(1),
+      } as never);
+      this.costGuard.record({
+        promptTokens: rendered.usage?.inputTokens ?? 0,
+        completionTokens: rendered.usage?.outputTokens ?? 0,
+      });
+      return {
+        text: rendered.text,
+        responseMessages: rendered.responseMessages,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * G2: the server-owned step a model-written summary imitated: the order
+   * summary (which presents the delivery-data confirmation itself while the
+   * data are unconfirmed), or the delivery confirmation without orders.
+   */
+  private async realConfirmationStep(
+    senderId: string,
+    inboundEvent: unknown,
+  ): Promise<MinimalCheckoutReply> {
+    try {
+      if (this.orderAvailable())
+        return await this.continueToOrder(senderId, inboundEvent, null);
+      if (this.checkoutAvailable())
+        return await this.checkout!.prepareConfirmation(senderId, inboundEvent);
+    } catch {
+      // Fall through to the clarification; the imitation is never sent.
+    }
+    return { reply: EMPTY_REPLY_FALLBACK };
+  }
+
+  /**
+   * G2: after a cart change, a checkout that already reached shipping
+   * continues to the UPDATED order summary (re-choosing pickup, or
+   * re-quoting delivery because the change dropped the old quote).
+   * `null` keeps the plain cart reply.
+   */
+  private async continueAfterCartChange(
+    senderId: string,
+    inboundEvent: unknown,
+    mode: 'pickup' | 'delivery',
+  ): Promise<MinimalCheckoutReply | null> {
+    try {
+      if (
+        mode === 'pickup' &&
+        (await this.shipping!.chooseStorePickup(senderId)).kind !== 'pickup'
+      )
+        return null;
+      return await this.continueToOrder(
+        senderId,
+        inboundEvent,
+        CART_UPDATED_LEAD,
+      );
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1261,6 +1450,7 @@ export class MinimalCatalogAgentService {
               return toolError('restock_unavailable');
             }
           };
+    const stockReads = new Map<string, unknown>();
     const readTools = {
       searchCatalog: tool({
         description:
@@ -1298,6 +1488,12 @@ export class MinimalCatalogAgentService {
           if (!allowedIds.has(productId)) {
             trace('tool checkStock result=denied code=unknown_product');
             return toolError('unknown_product');
+          }
+          // G1: a repeated identical read in one run reuses the first answer.
+          const cached = stockReads.get(productId);
+          if (cached !== undefined) {
+            trace('tool checkStock result=cached');
+            return cached;
           }
           try {
             const stock = await chatbotApi.getStock(productId);
@@ -1349,6 +1545,7 @@ export class MinimalCatalogAgentService {
               // Canonical non-variant input: NO `variantId` field is built.
               await prepareOnce(productId);
             }
+            stockReads.set(productId, result);
             return result;
           } catch {
             trace('tool checkStock result=error code=stock_unavailable');
@@ -1423,6 +1620,7 @@ export class MinimalCatalogAgentService {
             ? `${CART_DEFAULT_UNIT_NOTE}\n\n${minimalCartReply(result)}`
             : minimalCartReply(result);
         cartReply.source = 'cart';
+        cartReply.mutated = result.ok && result.items.length > 0;
         mutationAcknowledged = true;
         return result;
       }
@@ -1438,6 +1636,7 @@ export class MinimalCatalogAgentService {
       traceCartResult('setCartItem', result);
       cartReply.value = minimalCartReply(result);
       cartReply.source = 'cart';
+      cartReply.mutated = result.ok && result.items.length > 0;
       mutationAcknowledged = true;
       return result;
     };
@@ -1606,6 +1805,7 @@ export class MinimalCatalogAgentService {
               );
               cartReply.value = minimalCartReply(result);
               cartReply.source = 'cart';
+              cartReply.mutated = result.ok && result.items.length > 0;
               mutationAcknowledged = true;
               return result;
             },

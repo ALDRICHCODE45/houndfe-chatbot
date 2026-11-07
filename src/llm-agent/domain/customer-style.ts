@@ -185,6 +185,8 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['Si está de acuerdo', 'Si estás de acuerdo'],
   ['Tengo un pedido suyo', 'Tengo un pedido tuyo'],
   ['el nombre del producto que busca?', 'el nombre del producto que buscas?'],
+  ['presentación busca?', 'presentación buscas?'],
+  ['Disculpe, no alcancé', 'Disculpa, no alcancé'],
   // Questions.
   ['¿Me confirma o corrige', '¿Me confirmas o corriges'],
   ['¿Me confirma', '¿Me confirmas'],

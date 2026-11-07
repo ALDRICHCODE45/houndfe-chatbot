@@ -708,7 +708,10 @@ describe('eval purchase scenarios with scripted tool calls → exactly one order
     ]);
     expect(await h.turn(t5)).toMatch(ORDER_ENDING);
     await h.turn(t6, [call('prepareOrder'), say()]);
-    await h.turn(t7, [setItem(ref(COLLAR, 2), 2), say()]);
+    // G2: the cart change continues to the updated summary in the same reply.
+    expect(await h.turn(t7, [setItem(ref(COLLAR, 2), 2), say()])).toMatch(
+      ORDER_ENDING,
+    );
     expect(await h.lines()).toEqual([
       {
         productId: product(COLLAR),
@@ -716,10 +719,8 @@ describe('eval purchase scenarios with scripted tool calls → exactly one order
         quantity: 2,
       },
     ]);
-    expect(await h.turn(t8, [call('requestShippingQuote'), say()])).toMatch(
-      ORDER_ENDING,
-    );
-    expect(await h.turn(t9)).toContain('folio EV-0001');
+    expect(await h.turn(t8)).toContain('folio EV-0001');
+    await h.turn(t9, [say('Gracias por su compra.')]);
     expect(h.api.orders.size).toBe(1);
   });
 });
