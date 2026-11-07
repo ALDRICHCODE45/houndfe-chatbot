@@ -2,6 +2,11 @@
 
 Ideas priorizadas para que el bot de WhatsApp de Tienda de mascotas HoundFe venda más, se equivoque menos y se sienta humano. Cada propuesta indica el beneficio, el esfuerzo aproximado y si necesita al backend.
 
+## Decisión del dueño (2026-11-07)
+
+- **Empezar ya:** 2 (memoria del cliente), 3 ("lo mismo de la vez pasada"), 5 (foto del producto en la respuesta) y 6 (botones de WhatsApp).
+- **Todas las demás se harán después, en orden.** No se descarta ninguna.
+
 ## Ya hecho en esta ronda
 
 - **Personalidad de tienda de mascotas** y **espejo del estilo del cliente** (tú/usted, emojis, formalidad) en las respuestas de la IA y en los mensajes fijos.

@@ -33,3 +33,4 @@ Overnight audit and improvement of the WhatsApp bot's conversation ("alma"), con
 - L6: T4 done (f2ec186): src/product-image describer + dispatcher media routing; D6 fixed; 179 related tests, tsc 0. Eval harness committed (43a33fa); dry-run 14 scenarios ok.
 - L7: Live eval blocked: OPENAI_API_KEY is empty in .env and absent from the shell; the owner is asleep. Not reading other worktrees' secrets without permission. Continue with deterministic tests and dry-run; live run when the owner provides the key.
 - L8: T2 done (acb460e). Full suite after T2-T4: unit 6868 passed / 813 skipped, e2e 125/125, tsc 0, eslint 0, eval dry-run ok. Follow-ups: later notices (receipt worker, outcome poller, zone requester, human-decisions coordinators) stay usted without session style; session style in memory.
+- L9: Owner approved starting proposals 2, 3, 5, 6; all others stay on the roadmap (Engram roadmap/chatbot-first-class-proposals).
