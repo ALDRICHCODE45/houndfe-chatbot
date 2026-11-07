@@ -14,9 +14,9 @@ Owner-approved proposals 2, 3, 5, 6 plus two cosmetic follow-ups from the live e
 
 | ID  | Specs  | Route                                 | Commit |
 | --- | ------ | ------------------------------------- | ------ |
-| T1  | S5, S3 | worker: cosmetics + product photo     | —      |
-| T2  | S4     | worker: interactive buttons and lists | —      |
-| T3  | S2     | worker: reorder                       | —      |
+| T1  | S5, S3 | worker: cosmetics + product photo     | 2c5b163|
+| T2  | S4     | worker: interactive buttons and lists | 48da0ec|
+| T3  | S2     | worker: reorder                       | 42ae8bb|
 | T4  | S1     | worker: persistent customer memory    | —      |
 | T5  | all    | live eval + full suite                | —      |
 
