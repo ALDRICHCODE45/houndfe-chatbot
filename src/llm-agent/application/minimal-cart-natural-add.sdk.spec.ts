@@ -94,12 +94,16 @@ const prepare = (
     quantityText,
     continuation,
   });
-const scenarioTurns = (id: string): string[] => {
+/** The scenario's turns; conditional ones only with `withConditional`. */
+const scenarioTurns = (id: string, withConditional = false): string[] => {
   const scenario = SCENARIOS.find((candidate) => candidate.id === id);
   if (scenario === undefined) throw new Error(`scenario ${id}`);
-  return scenario.turns.map((turn) =>
-    typeof turn === 'string' ? turn : turn.text,
-  );
+  return scenario.turns.flatMap((turn) => {
+    if (typeof turn === 'string') return [turn];
+    return turn.onlyIfPreviousReply === undefined || withConditional
+      ? [turn.text]
+      : [];
+  });
 };
 
 const ORDER_ENDING = /Respond[ae] "SÍ" para crear el pedido/;
@@ -418,6 +422,161 @@ describe('F6 anti-hallucination still holds', () => {
   });
 });
 
+/** Lists both arenas; `customerText` decides which one the customer meant. */
+async function showBothArenasFor(
+  h: ReturnType<typeof harness>,
+  customerText: string,
+) {
+  await h.turn(customerText, [
+    call('searchCatalog', { q: 'arena para gato' }),
+    say(
+      'Encontré dos opciones:\n1. Arena para Gato de Sílice 3.8 L, $179.00\n2. Arena para Gato Aglomerante Sin Aroma: 10 kg $219.00 o 20 kg $389.00\n¿Se la agrego al carrito?',
+    ),
+  ]);
+}
+
+const GENERIC_REJECTION = /No pude confirmar esa operación/;
+
+describe("F9 the customer's own words pick one of several shown products", () => {
+  it.each([
+    adjust(ref(SILICE), null),
+    adjust(ref(SILICE), 1),
+    prepare(ref(SILICE), 1, 'una'),
+  ])(
+    '"sílice" in the request + "Sí, agréguela" adds one silica arena',
+    async (toolCall) => {
+      const h = harness();
+      await showBothArenasFor(
+        h,
+        'Buen día. Deseo comprar una arena de sílice para gato.',
+      );
+      const reply = await h.turn('Sí, agréguela por favor.', [
+        toolCall,
+        say('Listo.'),
+      ]);
+      expect(await h.lines()).toEqual([
+        { productId: product(SILICE), variantId: null, quantity: 1 },
+      ]);
+      expect(reply).toMatch(/agregué 1 unidad/i);
+      expect(reply).not.toMatch(/A cuál producto/);
+    },
+  );
+
+  it('a size only one product has ("20 kg") picks that product and presentation', async () => {
+    const h = harness();
+    await showBothArenasFor(h, 'Busco arena para gato de 20 kg.');
+    await h.turn('Agréguela, por favor.', [
+      adjust(ref(AGLOMERANTE), null),
+      say('Listo.'),
+    ]);
+    expect(await h.lines()).toEqual([
+      {
+        productId: product(AGLOMERANTE),
+        variantId: variant(AGLOMERANTE, 2),
+        quantity: 1,
+      },
+    ]);
+  });
+
+  it('the product picked by name still asks its presentation when none was named', async () => {
+    const h = harness();
+    await showBothArenasFor(h, 'Busco arena aglomerante para gato.');
+    const reply = await h.turn('Sí, agréguela por favor.', [
+      adjust(ref(AGLOMERANTE), null),
+      say('Listo.'),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    expect(reply).toMatch(/presentación/);
+    expect(reply).toContain('10 kg');
+    expect(reply).toContain('20 kg');
+  });
+
+  it('a model pick that contradicts the customer words asks instead of writing', async () => {
+    const h = harness();
+    await showBothArenasFor(
+      h,
+      'Buen día. Deseo comprar una arena de sílice para gato.',
+    );
+    const reply = await h.turn('Sí, agréguela por favor.', [
+      adjust(ref(AGLOMERANTE, 1), null),
+      say('Listo.'),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    expect(reply).toMatch(NO_CHANGE);
+  });
+
+  it('words both products share ("arena para gato") still ask which one', async () => {
+    const h = harness();
+    await showBothArenasFor(h, 'Buen día. Deseo comprar una arena para gato.');
+    const reply = await h.turn('Sí, agréguela por favor.', [
+      adjust(ref(SILICE), null),
+      say('Listo.'),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    expect(reply).toContain('Arena para Gato de Sílice 3.8 L');
+    expect(reply).toContain('Arena para Gato Aglomerante Sin Aroma');
+  });
+});
+
+describe('F10 cart tools on a message with no cart request', () => {
+  async function askWhichArena(h: ReturnType<typeof harness>) {
+    await showBothArenasFor(h, 'Buen día. Deseo comprar una arena para gato.');
+    const asked = await h.turn('Sí, agréguela por favor.', [
+      adjust(ref(SILICE), null),
+      say('Listo.'),
+    ]);
+    expect(asked).toMatch(/A cuál producto/);
+  }
+
+  it.each([adjust(ref(SILICE), 1, '1'), prepare(ref(SILICE), 1, 'una')])(
+    '"Quiero comprar." with an empty cart re-asks the open product choice',
+    async (toolCall) => {
+      const h = harness();
+      await askWhichArena(h);
+      const reply = await h.turn('Quiero comprar.', [
+        toolCall,
+        say('Listo, agregada.'),
+      ]);
+      expect(await h.lines()).toEqual([]);
+      expect(reply).not.toMatch(GENERIC_REJECTION);
+      expect(reply).toMatch(/A cuál producto/);
+      expect(reply).toContain('Arena para Gato de Sílice 3.8 L');
+      expect(reply).toContain('Arena para Gato Aglomerante Sin Aroma');
+    },
+  );
+
+  it('answering the product question by name ("La de sílice") adds one unit', async () => {
+    const h = harness();
+    await askWhichArena(h);
+    const reply = await h.turn('La de sílice, por favor.', [
+      adjust(ref(SILICE), null),
+      say('Listo.'),
+    ]);
+    expect(await h.lines()).toEqual([
+      { productId: product(SILICE), variantId: null, quantity: 1 },
+    ]);
+    expect(reply).toMatch(/agregué 1 unidad/i);
+  });
+
+  it('pickup with a filled cart proceeds instead of the generic rejection', async () => {
+    const h = harness('03100');
+    await showSilice(h);
+    await h.turn('Sí, agréguela por favor.', [
+      adjust(ref(SILICE), null),
+      say(),
+    ]);
+    const reply = await h.turn('Prefiero recogerlo en tienda.', [
+      adjust(ref(SILICE), 1, '1'),
+      call('chooseStorePickup'),
+      say(),
+    ]);
+    expect(reply).not.toMatch(GENERIC_REJECTION);
+    expect(await h.lines()).toEqual([
+      { productId: product(SILICE), variantId: null, quantity: 1 },
+    ]);
+  });
+});
+
 describe('F8 catalog claims need a catalog read', () => {
   it('"Encontré varias opciones" with no tool call reruns the turn with a forced search', async () => {
     const h = harness();
@@ -493,6 +652,33 @@ describe('eval purchase scenarios with scripted tool calls → exactly one order
     const placed = await h.turn(t5);
     expect(placed).toContain('folio EV-0001');
     await h.turn(t6, [say('Gracias por su compra.')]);
+    expect(h.api.orders.size).toBe(1);
+  });
+
+  it('pickup after the bot asked which product (conditional answer turn)', async () => {
+    const [t1, t2, answer, t3, t4, t5] = scenarioTurns('pickup', true);
+    const h = harness('03100');
+    await showBothArenasFor(h, 'Buen día. Deseo comprar una arena para gato.');
+    expect(t1).toMatch(/sílice/);
+    const asked = await h.turn(t2, [adjust(ref(SILICE), null), say()]);
+    expect(asked).toMatch(/A cuál producto/);
+    const pickupTurn = SCENARIOS.find((s) => s.id === 'pickup')?.turns[2];
+    if (typeof pickupTurn === 'string' || pickupTurn === undefined)
+      throw new Error('conditional turn');
+    expect(pickupTurn.onlyIfPreviousReply).toBeDefined();
+    expect(asked).toMatch(pickupTurn.onlyIfPreviousReply ?? /never/);
+    await h.turn(answer, [adjust(ref(SILICE), null), say()]);
+    expect(await h.lines()).toEqual([
+      { productId: product(SILICE), variantId: null, quantity: 1 },
+    ]);
+    await h.turn(t3, [
+      call('lookupCheckoutCustomer', { nextPageRef: null }),
+      say('Tengo su dirección guardada Casa. ¿La usamos o prefiere recoger?'),
+    ]);
+    expect(await h.turn(t4, [call('chooseStorePickup'), say()])).toMatch(
+      ORDER_ENDING,
+    );
+    expect(await h.turn(t5)).toContain('folio EV-0001');
     expect(h.api.orders.size).toBe(1);
   });
 

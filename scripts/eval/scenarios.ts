@@ -13,6 +13,11 @@ export interface ScenarioTurn {
   refusal?: RefusalExpectation;
   /** The reply must present the business as a pet store. */
   expectPersona?: boolean;
+  /**
+   * Send this turn only when the bot's previous reply matches (a natural
+   * answer to a question the bot may or may not ask); skipped otherwise.
+   */
+  onlyIfPreviousReply?: RegExp;
 }
 
 export interface Scenario {
@@ -176,6 +181,11 @@ export const SCENARIOS: Scenario[] = [
     turns: [
       'Buen día. Deseo comprar una arena de sílice para gato.',
       'Sí, agréguela por favor.',
+      // A natural answer if the bot asks which arena it should add.
+      {
+        text: 'La de sílice, por favor.',
+        onlyIfPreviousReply: /a cu[aá]l producto/i,
+      },
       'Quiero comprar.',
       'Prefiero recogerlo en tienda.',
       'Sí.',

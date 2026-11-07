@@ -15,6 +15,10 @@
  *   - `offersCartAdd`: the bot's previous message asked whether to add.
  *   - `nameCoverage` / `mentionsPhrase`: whether a server-owned product or
  *     presentation label appears in a text.
+ *   - `distinctiveMatches`: which of several shown products the customer's
+ *     words single out (a word or presentation only that product has).
+ *   - `asksCartChoice` / `requestsCartChange`: the bot asked which product or
+ *     presentation to add; the text asks for any cart change at all.
  *
  * No I/O, no model input; the caller decides what a reading authorizes.
  */
@@ -225,4 +229,105 @@ export function mentionsPhrase(text: string, phrase: string): boolean {
   const needle = cartWords(phrase).map(fold);
   if (needle.length === 0) return false;
   return hasPhrase(cartWords(text).map(fold), needle);
+}
+
+const significantWords = (name: string): string[] => [
+  ...new Set(
+    cartWords(name)
+      .filter((word) => word.length >= 3 && !STOPWORDS.has(word))
+      .map(fold),
+  ),
+];
+
+/** A shown product: its name and its presentation labels. */
+export type ShownCandidate = { name: string; labels: readonly string[] };
+
+/**
+ * Indexes of the candidates `text` singles out: it contains a name word
+ * ("sílice", "salmón") or a presentation label ("20 kg") that no other
+ * candidate has. Words every candidate shares ("arena", "gato") never count.
+ */
+export function distinctiveMatches(
+  text: string,
+  candidates: readonly ShownCandidate[],
+): number[] {
+  const words = candidates.map((candidate) => significantWords(candidate.name));
+  const labels = candidates.map((candidate) =>
+    candidate.labels.map((label) => cartWords(label).map(fold).join(' ')),
+  );
+  const present = new Set(cartWords(text).map(fold));
+  return candidates.flatMap((candidate, index) => {
+    const others = (pick: (other: number) => readonly string[]) =>
+      new Set(
+        candidates.flatMap((_, other) => (other === index ? [] : pick(other))),
+      );
+    const otherWords = others((other) => words[other]);
+    const otherLabels = others((other) => labels[other]);
+    const byWord = words[index].some(
+      (word) => !otherWords.has(word) && present.has(word),
+    );
+    const byLabel = candidate.labels.some(
+      (label, at) =>
+        labels[index][at].length > 0 &&
+        !otherLabels.has(labels[index][at]) &&
+        mentionsPhrase(text, label),
+    );
+    return byWord || byLabel ? [index] : [];
+  });
+}
+
+/** The bot's message is the server question about which product/presentation to add. */
+export function asksCartChoice(assistantText: string | null): boolean {
+  if (assistantText === null) return false;
+  return (
+    mentionsPhrase(assistantText, 'a cual producto') ||
+    mentionsPhrase(assistantText, 'presentacion desea agregar') ||
+    mentionsPhrase(assistantText, 'presentacion quieres agregar')
+  );
+}
+
+/** Removal and "one more" words that ask for a cart change without a verb. */
+const CHANGE_WORDS: ReadonlySet<string> = new Set([
+  'quita',
+  'quitar',
+  'quitale',
+  'quitame',
+  'quitalo',
+  'quitala',
+  'elimina',
+  'eliminar',
+  'saca',
+  'sacar',
+  'borra',
+  'borrar',
+  'cambia',
+  'cambiar',
+  'cambiala',
+  'cambialo',
+  'deja',
+  'dejame',
+  'dejala',
+  'dejalo',
+  'ajusta',
+  'otra',
+  'otro',
+  'cantidad',
+  'carrito',
+]);
+
+/**
+ * True when `text` asks for any cart change: a unit count, an add request
+ * (including a yes to a cart offer) or a change/removal word. "Quiero
+ * comprar.", "Prefiero recogerlo en tienda." or a yes to another question
+ * do not.
+ */
+export function requestsCartChange(
+  text: string,
+  previousAssistantText: string | null,
+): boolean {
+  return (
+    statedUnitCount(text).status !== 'none' ||
+    conversationalAddForm(text, previousAssistantText) !== null ||
+    cartWords(text).some((word) => CHANGE_WORDS.has(word))
+  );
 }

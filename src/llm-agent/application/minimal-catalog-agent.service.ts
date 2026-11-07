@@ -51,6 +51,7 @@ import {
   cartKeepOnlyToolInput,
   cartPrepareToolInput,
   cartSetToolInput,
+  type CartLineIdentity,
   type ResolvedCartSelection,
 } from './minimal-cart-conversation';
 import {
@@ -1440,6 +1441,21 @@ export class MinimalCatalogAgentService {
       mutationAcknowledged = true;
       return result;
     };
+    // F10: a cart tool on a message with no cart request at all ("Quiero
+    // comprar.", a yes to another question) is a misplaced call, not a
+    // rejected request: with an empty cart and several products still open,
+    // repeat the product question; otherwise tell the model to continue with
+    // the purchase without touching the cart. Never the generic rejection.
+    const misplacedCartCall = (lines: readonly CartLineIdentity[]) => {
+      if (conversation === null || conversation.hasCartRequest()) return null;
+      const question =
+        lines.length === 0 ? conversation.openProductQuestion() : null;
+      if (question !== null) acknowledge(question);
+      trace(`cart_grounding result=no_cart_request reask=${question !== null}`);
+      return toolError(
+        question === null ? 'no_cart_request' : 'cart_target_ambiguous',
+      );
+    };
     const handleMutation = async (
       identity: ResolvedCartSelection,
       proposal: {
@@ -1455,15 +1471,14 @@ export class MinimalCatalogAgentService {
       // operation in the same run, and it never overwrites the first reply.
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
-      const grounded = conversation.ground(
-        identity,
-        proposal,
-        (await cart?.storedLines(context.senderId)) ?? [],
-      );
+      const lines = (await cart?.storedLines(context.senderId)) ?? [];
+      const grounded = conversation.ground(identity, proposal, lines);
       trace(
         `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
       );
       if (grounded.kind === 'invalid_evidence') {
+        const misplaced = misplacedCartCall(lines);
+        if (misplaced !== null) return misplaced;
         acknowledge(CART_OPERATION_CLARIFICATION);
         return toolError('invalid_cart_evidence');
       }
@@ -1705,10 +1720,11 @@ export class MinimalCatalogAgentService {
               }
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
+              const lines = (await cart.storedLines(context.senderId)) ?? [];
               const grounded = conversation.prepare(
                 identity,
                 { operation, quantity, quantityText, continuation },
-                (await cart.storedLines(context.senderId)) ?? [],
+                lines,
               );
               trace(
                 `cart_grounding tool=prepareCartItem mode=${operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
@@ -1744,6 +1760,8 @@ export class MinimalCatalogAgentService {
                 acknowledge(grounded.question);
                 return toolError('cart_target_ambiguous');
               }
+              const misplaced = misplacedCartCall(lines);
+              if (misplaced !== null) return misplaced;
               acknowledge(CART_OPERATION_CLARIFICATION);
               return toolError('invalid_cart_evidence');
             },

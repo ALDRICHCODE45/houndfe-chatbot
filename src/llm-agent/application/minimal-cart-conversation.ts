@@ -26,10 +26,14 @@ import {
   type MinimalCartSelectionSnapshot,
 } from '../domain/minimal-cart-selections';
 import {
+  addRequestForm,
+  asksCartChoice,
   cartWords,
   conversationalAddForm,
+  distinctiveMatches,
   mentionsPhrase,
   nameCoverage,
+  requestsCartChange,
   statedUnitCount,
 } from '../domain/minimal-cart-request';
 import {
@@ -369,10 +373,9 @@ export class MinimalCartConversation {
     } else {
       if (operation === 'subtract') return null;
       const pending = this.pending;
-      const form = conversationalAddForm(
-        this.text,
-        this.dialogue.previousAssistantText,
-      );
+      const form =
+        conversationalAddForm(this.text, this.dialogue.previousAssistantText) ??
+        this.answeredChoiceForm(selection.productId);
       if (
         pending !== null &&
         pending.productId === selection.productId &&
@@ -426,14 +429,9 @@ export class MinimalCartConversation {
     cartLines: readonly CartLineIdentity[],
   ): Target {
     const productId = selection.productId;
-    const products = new Map<string, string>();
-    for (const entry of this.selections.snapshot().selections)
-      if (!products.has(entry.productId))
-        products.set(entry.productId, entry.productName);
+    const products = this.registeredProducts();
     const previous = this.dialogue.previousAssistantText ?? '';
-    const mentioned = [...products].filter(
-      ([, name]) => nameCoverage(previous, name) >= NAME_COVERAGE,
-    );
+    const mentioned = this.shownProducts();
     const named =
       nameCoverage(this.text, selection.productName) >= NAME_COVERAGE;
     const askProduct = (names: string[]): Target => ({
@@ -441,10 +439,14 @@ export class MinimalCartConversation {
       question: cartProductQuestion(names),
     });
     if (!named) {
-      if (mentioned.length >= 2)
-        return askProduct(mentioned.map(([, name]) => name));
       let inFocus: boolean;
-      if (this.pending?.productId === productId) inFocus = true;
+      if (mentioned.length >= 2) {
+        // Several shown: only the one the customer's own words single out.
+        const picked = this.customerPick(mentioned);
+        if (picked !== productId)
+          return askProduct(mentioned.map(([, name]) => name));
+        inFocus = true;
+      } else if (this.pending?.productId === productId) inFocus = true;
       else if (mentioned.length === 1) inFocus = mentioned[0][0] === productId;
       else if (cartLines.length === 1)
         inFocus = cartLines[0].productId === productId;
@@ -472,6 +474,106 @@ export class MinimalCartConversation {
     )
       return { kind: 'ok', selection: chosen };
     return { kind: 'ask', question: this.presentationQuestion(productId) };
+  }
+
+  /** Distinct registered products, in registration order. */
+  private registeredProducts(): Map<string, string> {
+    const products = new Map<string, string>();
+    for (const entry of this.selections.snapshot().selections)
+      if (!products.has(entry.productId))
+        products.set(entry.productId, entry.productName);
+    return products;
+  }
+
+  /** Registered products the bot's previous message named. */
+  private shownProducts(): Array<[string, string]> {
+    const previous = this.dialogue.previousAssistantText ?? '';
+    return [...this.registeredProducts()].filter(
+      ([, name]) => nameCoverage(previous, name) >= NAME_COVERAGE,
+    );
+  }
+
+  /**
+   * The shown product the customer's words single out, newest message first:
+   * the first message that singles out exactly one decides; one that matches
+   * several, or none at all, leaves it open (`null`).
+   */
+  private customerPick(shown: ReadonlyArray<[string, string]>): string | null {
+    const candidates = shown.map(([id, name]) => ({
+      name,
+      labels: this.variantsOf(id)
+        .map(presentationLabel)
+        .filter((label) => label.length > 0),
+    }));
+    for (const text of [
+      this.text,
+      ...[...this.dialogue.recentCustomerTexts].reverse(),
+    ]) {
+      const matches = distinctiveMatches(text, candidates);
+      if (matches.length === 1) return shown[matches[0]][0];
+      if (matches.length > 1) return null;
+    }
+    return null;
+  }
+
+  /**
+   * The add form of the customer's earlier request when the current message
+   * answers the server's "which product/presentation" question ("La de
+   * sílice" after "Sí, agréguela"); `null` otherwise.
+   */
+  private answeredChoiceForm(productId: string): 'singular' | 'plural' | null {
+    // Only the server "which product" question, and only for one of the
+    // products it listed; a presentation question keeps asking the count.
+    const previous = this.dialogue.previousAssistantText;
+    if (previous === null || !mentionsPhrase(previous, 'a cual producto'))
+      return null;
+    if (!this.shownProducts().some(([id]) => id === productId)) return null;
+    for (const text of [...this.dialogue.recentCustomerTexts].reverse()) {
+      const form = addRequestForm(text);
+      if (form === null) continue;
+      // An earlier count belongs to the pending request, never a default.
+      return statedUnitCount(text).status === 'none' ? form : null;
+    }
+    return null;
+  }
+
+  /**
+   * True when the current message asks for a cart change: a count, an add
+   * request, a change word, a registered product or presentation named, or an
+   * answer that singles out one product of a pending "which product"
+   * question. Cart tools on any other message ("Quiero comprar.") are not a
+   * rejected cart request but a misplaced call.
+   */
+  hasCartRequest(): boolean {
+    if (requestsCartChange(this.text, this.dialogue.previousAssistantText))
+      return true;
+    const selections = this.selections.snapshot().selections;
+    if (
+      selections.some(
+        (entry) =>
+          nameCoverage(this.text, entry.productName) >= NAME_COVERAGE ||
+          (presentationLabel(entry).length > 0 &&
+            mentionsPhrase(this.text, presentationLabel(entry))),
+      )
+    )
+      return true;
+    const shown = this.shownProducts();
+    return (
+      asksCartChoice(this.dialogue.previousAssistantText) &&
+      shown.length >= 2 &&
+      this.customerPick(shown) !== null
+    );
+  }
+
+  /**
+   * The product question to repeat while several products the bot just
+   * listed are still open, or `null` when fewer than two are shown.
+   */
+  openProductQuestion(): string | null {
+    const shown = this.shownProducts();
+    return shown.length >= 2
+      ? cartProductQuestion(shown.map(([, name]) => name))
+      : null;
   }
 
   /**

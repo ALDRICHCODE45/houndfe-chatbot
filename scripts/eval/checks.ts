@@ -151,6 +151,8 @@ const LEAK =
 const INTENT_CLAIM = /registr\w* la intenci[oó]n/i;
 const VAGUE_OPTIONS = /varias opciones/i;
 const LIST_LINE = /^\s*(?:[-•*]|\d+[.)])\s+\S/m;
+/** A short "label: value" list item, e.g. `- **Marca:** Pet's Choice`. */
+const ATTRIBUTE_LINE = /^(?:[-•*]|\d+[.)])\s+\**[^:.!?]{1,30}:\**\s*\S.{0,50}$/;
 
 const count = (re: RegExp, text: string) => (text.match(re) ?? []).length;
 
@@ -285,7 +287,11 @@ export function checkReply(input: {
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  const repeated = lines.find((line, i) => lines.indexOf(line) !== i);
+  // A list attribute ("- **Marca:** Pet's Choice") may legitimately repeat
+  // across products; only repeated sentences/paragraphs are duplicates.
+  const repeated = lines.find(
+    (line, i) => !ATTRIBUTE_LINE.test(line) && lines.indexOf(line) !== i,
+  );
   out.push(
     repeated === undefined
       ? { check: 'duplicate-line', severity: 'pass' }

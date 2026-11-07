@@ -77,6 +77,8 @@ interface ScenarioRecord {
   final: CheckResult[];
   usd: number;
   stopped: boolean;
+  /** Conditional turns not sent because the bot did not ask for them. */
+  skipped: number;
 }
 
 class BudgetStop extends Error {}
@@ -265,10 +267,19 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     final: [],
     usd: 0,
     stopped: false,
+    skipped: 0,
   };
   let register: Register = 'usted';
   for (const [index, raw] of scenario.turns.entries()) {
     const turn: ScenarioTurn = typeof raw === 'string' ? { text: raw } : raw;
+    const previousReply = record.turns.at(-1)?.reply ?? '';
+    if (
+      turn.onlyIfPreviousReply !== undefined &&
+      !turn.onlyIfPreviousReply.test(previousReply)
+    ) {
+      record.skipped += 1;
+      continue;
+    }
     if (!dryRun && spentUsd + maxTurnUsd > maxUsd) {
       record.stopped = true;
       break;
@@ -392,7 +403,7 @@ function summary(records: ScenarioRecord[]): string {
     const warns = all.filter((c) => c.severity === 'warn').length;
     return [
       r.scenario.id,
-      `${r.turns.length}/${r.scenario.turns.length}`,
+      `${r.turns.length}/${r.scenario.turns.length - r.skipped}`,
       String(fails),
       String(warns),
       `${r.orders}/${r.scenario.expectOrders ?? '-'}`,
