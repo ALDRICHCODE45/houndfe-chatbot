@@ -26,6 +26,7 @@ import type {
 } from '../domain/minimal-cart-quantity';
 import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { toWhatsAppText } from '../domain/whatsapp-text';
 import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import {
   DEFAULT_CUSTOMER_STYLE,
@@ -182,7 +183,8 @@ const INSTRUCTIONS =
   'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
-  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
+  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha. ' +
+  'Escribe para WhatsApp: negritas con un solo asterisco (*así*) y solo si ayudan, sin imágenes ni enlaces Markdown (las fotos se envían aparte), sin encabezados y con listas cortas.';
 
 /** S3: the structured customer reply (text + optional media) of one turn. */
 export type MinimalCatalogAgentDecision = CustomerReply & {
@@ -201,7 +203,8 @@ export const FORGET_MY_DATA_REPLY =
 // S1: guidance for the customer-memory tool (pet facts).
 const PET_MEMORY_INSTRUCTIONS =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
-  'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación.';
+  'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
+  'Si la línea "Cliente conocido" trae datos de la mascota relevantes para lo que pide (especie, tamaño o raza, edad), úselos y busque directo con searchCatalog (p. ej. labrador adulto → raza grande adulto) y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte.';
 
 /** Generous input cap; the profile store bounds each field again. */
 const PET_FACT = z.string().min(1).max(500).optional();
@@ -624,6 +627,21 @@ function ungroundedCatalogClaim(result: {
     (step) => (step.toolCalls?.length ?? 0) > 0,
   );
   return !called && CATALOG_CLAIM.test(result.text);
+}
+
+/** H1: an assistant message with its text rewritten for WhatsApp. */
+function formatAssistantText(message: ModelMessage): ModelMessage {
+  if (message.role !== 'assistant') return message;
+  if (typeof message.content === 'string')
+    return { ...message, content: toWhatsAppText(message.content) };
+  return {
+    ...message,
+    content: message.content.map((part) =>
+      part.type === 'text'
+        ? { ...part, text: toWhatsAppText(part.text) }
+        : part,
+    ),
+  };
 }
 
 /** Text of the bot's last stored message, or `null`. */
@@ -1666,6 +1684,9 @@ export class MinimalCatalogAgentService {
         responseMessages = [...responseMessages, ...rendered.responseMessages];
       }
     }
+    // H1: model text goes out (and into history) as WhatsApp text.
+    text = toWhatsAppText(text);
+    responseMessages = responseMessages.map(formatAssistantText);
     if (IMITATED_CONFIRMATION.test(text)) {
       // The model wrote its own delivery or order summary: no gate is armed
       // for it, so run the real step instead of sending the imitation.

@@ -23,6 +23,30 @@ describe('eval duplicate-line check', () => {
     expect(duplicate(reply)?.severity).toBe('pass');
   });
 
+  it('ignores a repeated label-only line', () => {
+    const reply = [
+      'Pro Plan Adulto',
+      'Variantes:',
+      '• 3 kg — $649.00',
+      'Dog Chow Adulto',
+      'Variantes:',
+      '• 4 kg — $389.00',
+    ].join('\n');
+    expect(duplicate(reply)?.severity).toBe('pass');
+  });
+
+  it('ignores repeated image-markdown lines', () => {
+    const image = '![Imagen](https://cdn.example.test/products/a.jpg)';
+    const link = '[Imagen](https://cdn.example.test/products/a.jpg)';
+    const reply = ['A', image, link, 'B', image, link].join('\n');
+    expect(duplicate(reply)?.severity).toBe('pass');
+  });
+
+  it('still flags a long repeated line ending with a colon', () => {
+    const line = 'Estas son las presentaciones que encontré en catálogo:';
+    expect(duplicate(`${line}\nA\n${line}`)?.severity).toBe('fail');
+  });
+
   it('still flags a repeated full sentence', () => {
     const sentence =
       'Le agregué 1 unidad; si desea otra cantidad, dígame cuántas.';

@@ -161,12 +161,16 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     expect(captured).toHaveLength(2);
   });
 
-  it('sends the strengthened voice clauses and examples with the SYSTEM_PROMPT prefix and returns the model reply verbatim', async () => {
+  it('sends the strengthened voice clauses and examples with the SYSTEM_PROMPT prefix and returns the model reply as WhatsApp text', async () => {
     const arbitrary = 'Eco literal del modelo: **{nombre}** 12345';
     const { service, captured } = build([say(arbitrary)]);
     await expect(
       service.tryHandle({ senderId: SENDER, text: 'hola, busco ibuprofeno' }),
-    ).resolves.toEqual({ kind: 'handled', reply: arbitrary });
+    ).resolves.toEqual({
+      kind: 'handled',
+      // H1: only the Markdown bold changes; the content is the model's.
+      reply: 'Eco literal del modelo: *{nombre}* 12345',
+    });
     const system = String(captured[0].system);
     expect(system.startsWith(SYSTEM_PROMPT)).toBe(true);
     expect(system).toContain('¡Hola! Encontré {nombre} en nuestro catálogo.');

@@ -166,6 +166,35 @@ describe('S1 persistent customer memory', () => {
     expect(h.system()).not.toContain(SENDER);
   });
 
+  it('H2: known pet facts reach the prompt with guidance to search directly', async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    await profileStore.upsert(
+      SENDER,
+      {
+        register: 'tu',
+        pet: {
+          name: 'Luna',
+          species: 'perro',
+          breed: 'labrador',
+          ageText: '3 años',
+        },
+      },
+      NOW,
+    );
+    const h = harness(profileStore);
+    await h.turn('busco croquetas para ella');
+    const line = h
+      .system()
+      .split('\n')
+      .find((text) => text.startsWith('Cliente conocido:'));
+    expect(line).toContain('"labrador"');
+    expect(line).toContain('"3 años"');
+    expect(h.system()).toMatch(
+      /mascota[^\n]*relevantes[^\n]*busque directo[^\n]*raza grande adulto/,
+    );
+    expect(h.system()).toMatch(/pregunte solo lo que realmente falte/);
+  });
+
   it('has no "Cliente conocido" line for an unknown customer', async () => {
     const h = harness(new InMemoryCustomerProfileStore());
     await h.turn('hola');
