@@ -14,14 +14,14 @@ Overnight audit and improvement of the WhatsApp bot's conversation ("alma"), con
 
 ## Tasks
 
-| ID  | Specs  | Route                                                                  | Commit |
-| --- | ------ | ---------------------------------------------------------------------- | ------ |
-| T1  | S4     | explore: map prompt, confirmation handling, image routing, vision port | —      |
-| T2  | S1, S2 | persona + tone mirroring in prompt and fixed replies                   | —      |
-| T3  | S3     | confirmation recognition fixes                                         | —      |
-| T4  | S5     | product image recognition                                              | —      |
-| T5  | S4, S7 | live conversation eval within budget, fix findings                     | —      |
-| T6  | S6     | proposals doc                                                          | —      |
+| ID  | Specs  | Route                                                                  | Commit  |
+| --- | ------ | ---------------------------------------------------------------------- | ------- |
+| T1  | S4     | explore: map prompt, confirmation handling, image routing, vision port | —       |
+| T2  | S1, S2 | persona + tone mirroring in prompt and fixed replies                   | —       |
+| T3  | S3     | confirmation recognition fixes (worker)                                | 4a687d5 |
+| T4  | S5     | product image recognition (worker)                                     | f2ec186 |
+| T5  | S4, S7 | live conversation eval within budget, fix findings                     | —       |
+| T6  | S6     | proposals doc                                                          | —       |
 
 ## Log
 
@@ -29,3 +29,6 @@ Overnight audit and improvement of the WhatsApp bot's conversation ("alma"), con
 - L2: Owner answers — business "Tienda de mascotas HoundFe"; address "Reflejar tú o usted"; live eval "Hasta $5 USD"; photo without match "Similares del catálogo" + "Pedir otra foto/etiqueta".
 - L3: Deploy steps saved in docs/chatbot-production-deploy.md (25b23ea on main).
 - L4: T1 map (explorer): customers go through MinimalCatalogAgentService (SYSTEM_PROMPT + INSTRUCTIONS), not SALE_FLOW_INSTRUCTIONS. Persona says "empresa de tecnología…"; usted and emojis are forced. Defects: D1 order gate drops the pending order on "Sí, por favor" (strict /^(si|sí)\.?$/); D2 delivery-data gate loops on non-strict affirmatives; D3 negatives not handled deterministically; D4 trailing !/emoji/newline rejected; D6 an image with no placed sale gets operator copy "Primero registra la venta en el sistema." and product photos are treated as receipts (caption never reaches the LLM). No tone memory. Routing: W1=T3 and W3=T4 in parallel (disjoint), then W2=T2 tone over prompt + fixed replies.
+- L5: T3 done (4a687d5): shared classifyConfirmationReply lexicon; D1-D4 fixed; decline replies added; related specs green, tsc 0.
+- L6: T4 done (f2ec186): src/product-image describer + dispatcher media routing; D6 fixed; 179 related tests, tsc 0. Eval harness committed (43a33fa); dry-run 14 scenarios ok.
+- L7: Live eval blocked: OPENAI_API_KEY is empty in .env and absent from the shell; the owner is asleep. Not reading other worktrees' secrets without permission. Continue with deterministic tests and dry-run; live run when the owner provides the key.
