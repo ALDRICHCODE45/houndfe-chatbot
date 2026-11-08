@@ -161,12 +161,16 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     expect(captured).toHaveLength(2);
   });
 
-  it('sends the strengthened voice clauses and examples with the SYSTEM_PROMPT prefix and returns the model reply verbatim', async () => {
+  it('sends the strengthened voice clauses and examples with the SYSTEM_PROMPT prefix and returns the model reply as WhatsApp text', async () => {
     const arbitrary = 'Eco literal del modelo: **{nombre}** 12345';
     const { service, captured } = build([say(arbitrary)]);
     await expect(
       service.tryHandle({ senderId: SENDER, text: 'hola, busco ibuprofeno' }),
-    ).resolves.toEqual({ kind: 'handled', reply: arbitrary });
+    ).resolves.toEqual({
+      kind: 'handled',
+      // H1: only the Markdown bold changes; the content is the model's.
+      reply: 'Eco literal del modelo: *{nombre}* 12345',
+    });
     const system = String(captured[0].system);
     expect(system.startsWith(SYSTEM_PROMPT)).toBe(true);
     expect(system).toContain('¡Hola! Encontré {nombre} en nuestro catálogo.');
@@ -467,9 +471,10 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     it('follows a customer who tutea and uses emojis across the session', async () => {
       const { service, captured } = build([say('Hola'), say('Claro')]);
       await service.tryHandle({ senderId: SENDER, text: 'hola 🐶' });
+      // S5: emojis need one in the latest message (or 2 of the last 3).
       await service.tryHandle({
         senderId: SENDER,
-        text: '¿tienes croquetas para cachorro?',
+        text: '¿tienes croquetas para cachorro? 😊',
       });
       expect(String(captured[0].system)).toContain(
         'Estilo del cliente: de usted, usa emojis, tono casual.',

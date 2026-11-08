@@ -223,3 +223,41 @@ describe('inactive EXPIRATION customer reply preparation', () => {
     },
   );
 });
+
+describe('EXPIRATION copy in the stored customer style (S1)', () => {
+  const TU = { register: 'tu', emojis: false, tone: 'casual' } as const;
+  const unavailable = () => {
+    const input = decision();
+    return {
+      ...input,
+      resolution: {
+        action: 'REPORT_EXPIRATION_UNAVAILABLE',
+        resolvedAt: AT,
+      },
+    };
+  };
+
+  it('converts only the fixed unavailable copy to tú', () => {
+    expect(prepareExpirationReply(unavailable(), TU)).toEqual({
+      action: 'prepared',
+      text: 'Sobre el Alimento original, el equipo no pudo confirmar la fecha de caducidad. ¿Quieres continuar con la compra o prefieres que te ayude con alguna otra consulta?',
+    });
+  });
+
+  it('never rewrites the human answer, even with usted words or emojis', () => {
+    const input = decision();
+    input.resolution.expirationText =
+      'Le confirmo que su lote vence en 2027 🙂';
+    const result = prepareExpirationReply(input, TU);
+    expect(result).toEqual({
+      action: 'prepared',
+      text: 'Sobre la caducidad de Alimento original:\nEl equipo de HoundFe indicó:\nLe confirmo que su lote vence en 2027 🙂',
+    });
+  });
+
+  it('null style keeps the usted copy byte-identical', () => {
+    expect(prepareExpirationReply(unavailable(), null)).toEqual(
+      prepareExpirationReply(unavailable()),
+    );
+  });
+});

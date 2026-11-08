@@ -125,6 +125,10 @@ export function evaluateMinimalCheckoutReadiness(
   return { ready: missing.length === 0, missing };
 }
 
+/** First line of the server-owned delivery-data summary. */
+export const MINIMAL_CHECKOUT_SUMMARY_HEADING =
+  'Confirme sus datos de entrega:';
+
 /**
  * Deterministic server-owned confirmation summary. Short on purpose (F2):
  * the order summary that follows asks its own explicit SÍ.
@@ -138,7 +142,7 @@ export function renderMinimalCheckoutConfirmation(
     .join(' ');
   const location = isFilled(fields.city) ? fields.city : fields.municipality;
   return [
-    'Confirme sus datos de entrega:',
+    MINIMAL_CHECKOUT_SUMMARY_HEADING,
     `Nombre: ${name}`,
     `Calle: ${fields.street ?? ''} ${fields.exteriorNumber ?? ''}${isFilled(fields.interiorNumber) ? `, int. ${fields.interiorNumber}` : ''}`.trim(),
     `Colonia: ${fields.neighborhood ?? ''}`,

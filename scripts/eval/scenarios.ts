@@ -18,6 +18,13 @@ export interface ScenarioTurn {
    * answer to a question the bot may or may not ask); skipped otherwise.
    */
   onlyIfPreviousReply?: RegExp;
+  /**
+   * S1: simulate a bot restart before this turn — a fresh agent and
+   * in-memory session that share the scenario's customer-profile store.
+   */
+  restartBefore?: boolean;
+  /** A heuristic the reply should match (a warning when it does not). */
+  expectReply?: RegExp;
 }
 
 export interface Scenario {
@@ -27,6 +34,8 @@ export interface Scenario {
   turns: Array<string | ScenarioTurn>;
   /** Orders that must exist at the end (checked exactly). */
   expectOrders?: number;
+  /** WhatsApp contact profile name sent with every turn (S1). */
+  profileName?: string;
 }
 
 /**
@@ -55,6 +64,29 @@ const existing = (zip: '03100' | '04000' | '12000'): FixtureCustomer => ({
 });
 
 export const SCENARIOS: Scenario[] = [
+  {
+    id: 'returning-customer',
+    title:
+      'Returning customer: tú, emojis and pet remembered across a restart (S1)',
+    customer: existing('03100'),
+    profileName: 'Mariana',
+    turns: [
+      'Holaaa 😄 oye, ¿tienes croquetas para perro? 🐶',
+      'mi perrita Luna es una labrador de 3 años 🐾',
+      'va, luego te escribo, gracias!! 🙌',
+      {
+        text: 'hola',
+        restartBefore: true,
+        // tú after the restart (the register check) and, optionally, the name.
+        expectReply: /\b(tú|te|tu|ti)\b|Mariana|Luna/i,
+      },
+      {
+        text: 'busco croquetas para ella',
+        // A large adult dog: adult / large-breed food, not puppy or cat food.
+        expectReply: /adult|raza grande|grande/i,
+      },
+    ],
+  },
   {
     id: 'formal',
     title: 'Serious formal customer (usted, no emojis)',
@@ -171,6 +203,27 @@ export const SCENARIOS: Scenario[] = [
       'sí pero cambia la cantidad a 2',
       'sí',
       'claro',
+    ],
+  },
+  {
+    id: 'reorder',
+    title:
+      'Reorder "lo mismo de la vez pasada" → sí → buy → saved address (03100 FREE)',
+    customer: existing('03100'),
+    expectOrders: 1,
+    turns: [
+      'Hola, quiero lo mismo de la vez pasada',
+      'sí',
+      'quiero comprar',
+      'Sí, a mi dirección de casa',
+      'Sí',
+      // Natural answers if the bot asks how to receive it, then the summary.
+      {
+        text: 'Envío a domicilio',
+        onlyIfPreviousReply: /domicilio|recoger/i,
+      },
+      'sí',
+      { text: 'sí', onlyIfPreviousReply: /^Resumen de su pedido/m },
     ],
   },
   {

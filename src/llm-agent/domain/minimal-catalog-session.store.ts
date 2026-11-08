@@ -1,6 +1,10 @@
 import type { ModelMessage } from 'ai';
 import type { MinimalCartSelectionSnapshot } from './minimal-cart-selections';
 import type { MinimalCartPendingRequest } from './minimal-cart-quantity';
+import type {
+  InteractiveChoiceContext,
+  ProductImageContext,
+} from './customer-reply';
 
 /** DI injection token for the MinimalCatalogSessionStore port. */
 export const MINIMAL_CATALOG_SESSION_STORE = Symbol(
@@ -23,17 +27,37 @@ export type MinimalCartConversationContext = {
 };
 
 /**
+ * S2: the reorder offer a turn presented. Lines come from the customer's own
+ * last order (productId/variantId/quantity only, never historical prices);
+ * they are the evidence a later yes adds to the cart.
+ */
+export type ReorderOfferContext = {
+  reference: string;
+  items: Array<{ productId: string; variantId?: string; quantity: number }>;
+};
+
+/**
  * One whole turn per sender: the user message, the model/tool response
  * messages, and only the productIds a successful fresh search produced.
  *
  * `messages` and `verifiedProductIds` are kept together so a later turn can
  * flatten the retained messages and union the verified identity. `cartContext`
- * carries the owned selection snapshot and pending intent for the cart route.
+ * carries the owned selection snapshot and pending intent for the cart route;
+ * `productImages` the known product photos and the ones already sent (S3).
+ * S4: `interactiveChoice` is the list THIS turn sent (never inherited, so a
+ * pick only counts while it answers the latest message); `catalogPrices`
+ * the catalog prices read so far (`productId|variantId` → cents) for row
+ * titles. `reorderOffer` is the reorder offer THIS turn sent (never
+ * inherited, so only the reply right after it can accept it).
  */
 export type MinimalCatalogTurn = {
   messages: ModelMessage[];
   verifiedProductIds: string[];
   cartContext?: MinimalCartConversationContext;
+  productImages?: ProductImageContext;
+  interactiveChoice?: InteractiveChoiceContext;
+  catalogPrices?: Record<string, number>;
+  reorderOffer?: ReorderOfferContext;
 };
 
 /**

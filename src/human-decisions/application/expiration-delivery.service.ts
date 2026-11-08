@@ -1,4 +1,5 @@
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { CustomerInboundObservationStore } from '../domain/customer-inbound-observation-store.port';
 import type { ExpirationApplicationLedgerPort } from '../domain/expiration-application-ledger.port';
 import type { ExpirationApplicationLedgerRow } from '../domain/expiration-application-ledger-row';
@@ -14,7 +15,10 @@ type AcceptedRow = Extract<
 type Ports = Pick<CustomerInboundObservationStore, 'readLatest'> &
   Pick<PostgresExpirationApplicationClaimStore, 'claimPending'> &
   Pick<ExpirationApplicationLedgerPort, 'recordAcceptance'> &
-  Pick<WhatsappSenderPort, 'sendText'>;
+  Pick<WhatsappSenderPort, 'sendText'> & {
+    /** S1: the stored customer style; null/failure keeps the usted copy. */
+    customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  };
 
 export type ExpirationDeliveryResult =
   | Readonly<{ action: 'accepted'; row: AcceptedRow }>
@@ -40,6 +44,15 @@ export class ExpirationDeliveryService {
     private readonly clock: () => Date,
   ) {}
 
+  private async readStyle(senderId: string): Promise<CustomerStyle | null> {
+    if (this.ports.customerStyle === undefined) return null;
+    try {
+      return await this.ports.customerStyle(senderId);
+    } catch {
+      return null;
+    }
+  }
+
   async deliverOnce(
     candidate: ExpirationPreparationCandidate,
   ): Promise<ExpirationDeliveryResult> {
@@ -47,7 +60,9 @@ export class ExpirationDeliveryService {
       if (candidate.action !== 'candidate') return HOLD;
       const { reservation, backendDecisionId } = candidate.binding;
       const { decision } = candidate;
-      const copy = prepareExpirationReply(decision);
+      // S1: read before the claim; a missing or failed read sends usted.
+      const style = await this.readStyle(reservation.senderId);
+      const copy = prepareExpirationReply(decision, style);
       if (copy.action !== 'prepared') return HOLD;
       const claimed = await this.ports.claimPending(candidate);
       if (claimed.action !== 'claimed') return HOLD;

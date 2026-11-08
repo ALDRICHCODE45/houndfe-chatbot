@@ -1,6 +1,7 @@
 import {
   Inject,
   Injectable,
+  Optional,
   type OnApplicationBootstrap,
   type OnModuleDestroy,
 } from '@nestjs/common';
@@ -15,6 +16,7 @@ import {
   type ConversationStore,
 } from '../conversation/domain/conversation-store';
 import { PG_POOL } from '../database/postgres-pool.provider';
+import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
 import { PostgresCustomerInboundObservationStore } from '../human-decisions/infrastructure/postgres-customer-inbound-observation.store';
 import {
   WHATSAPP_SENDER,
@@ -61,6 +63,8 @@ export class DeliveryZoneRuntime
     private readonly conversations: ConversationStore,
     @Inject(DELIVERY_ZONE_POLLER_OPTIONS)
     private readonly options: DeliveryZonePollerOptions,
+    // S1: the resolved-zone text in the customer's stored style.
+    @Optional() private readonly profiles?: CustomerProfileService,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -83,6 +87,8 @@ export class DeliveryZoneRuntime
         submit: (row) => this.intake.submit(row),
         clearPendingQuote: (senderId) =>
           clearPendingZoneQuote(this.conversations, senderId),
+        customerStyle: (senderId) =>
+          this.profiles?.styleFor(senderId) ?? Promise.resolve(null),
       },
       phone,
     );

@@ -264,3 +264,44 @@ describe('dormant EXPIRATION delivery send boundary', () => {
     expect(input.event.providerAcceptedObservedAt).not.toBe(now);
   });
 });
+
+describe('EXPIRATION notice in the stored customer style (S1)', () => {
+  const TU = { register: 'tu', emojis: false, tone: 'casual' } as const;
+
+  it('reads the style before claiming and sends the styled copy', async () => {
+    const h = setup();
+    const customerStyle = jest.fn().mockResolvedValue(TU);
+    Object.assign(h.ports, { customerStyle });
+    const candidate = buildCandidate();
+    const copy = prepareExpirationReply(candidate.decision, TU);
+    if (copy.action !== 'prepared') throw new Error('copy fixture');
+    await h.service.deliverOnce(candidate);
+    expect(customerStyle).toHaveBeenCalledWith(senderId);
+    expect(customerStyle.mock.invocationCallOrder[0]).toBeLessThan(
+      h.ports.claimPending.mock.invocationCallOrder[0],
+    );
+    expect(h.ports.sendText).toHaveBeenCalledWith({
+      to: senderId,
+      text: copy.text,
+    });
+  });
+
+  it.each([
+    ['missing profile', () => Promise.resolve(null)],
+    ['failed read', () => Promise.reject(new Error('down'))],
+  ])('%s sends the usted copy', async (_label, read) => {
+    const h = setup();
+    const customerStyle = jest.fn(read);
+    Object.assign(h.ports, { customerStyle });
+    const candidate = buildCandidate();
+    const copy = prepareExpirationReply(candidate.decision);
+    if (copy.action !== 'prepared') throw new Error('copy fixture');
+    const result = await h.service.deliverOnce(candidate);
+    expect(customerStyle).toHaveBeenCalledTimes(1);
+    expect(result.action).toBe('accepted');
+    expect(h.ports.sendText).toHaveBeenCalledWith({
+      to: senderId,
+      text: copy.text,
+    });
+  });
+});

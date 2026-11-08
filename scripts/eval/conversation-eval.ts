@@ -20,8 +20,13 @@ import { MinimalCheckoutService } from '../../src/llm-agent/application/minimal-
 import { MinimalOrderService } from '../../src/llm-agent/application/minimal-order.service';
 import { MinimalShippingService } from '../../src/llm-agent/application/minimal-shipping.service';
 import type { GenerateTextFn } from '../../src/llm-agent/infrastructure/generate-text.provider';
+import type { CustomerReplyInteractive } from '../../src/llm-agent/domain/customer-reply';
 import { InMemoryMinimalCatalogSessionStore } from '../../src/llm-agent/infrastructure/in-memory-minimal-catalog-session.store';
+import { CustomerProfileService } from '../../src/customer-profile/application/customer-profile.service';
+import type { CustomerProfileStore } from '../../src/customer-profile/domain/customer-profile';
+import { InMemoryCustomerProfileStore } from '../../src/customer-profile/infrastructure/in-memory-customer-profile.store';
 import {
+  checkExpectedReply,
   checkOrders,
   checkReply,
   nextRegister,
@@ -61,6 +66,10 @@ interface Usage {
 interface TurnRecord {
   customer: string;
   reply: string;
+  /** S3 product photos sent before the reply text. */
+  images: string[];
+  /** S4 buttons/list sent with the reply text, as one transcript line. */
+  interactive: string | null;
   tools: string[];
   llmCalls: number;
   gate: string | null;
@@ -195,8 +204,18 @@ function meteredGenerate(meter: Meter): GenerateTextFn {
   return wrapped as unknown as GenerateTextFn;
 }
 
-function buildHarness(scenario: Scenario, meter: Meter) {
-  const api = new EvalFakeApi(scenario.customer);
+/**
+ * One bot process. S1: `profiles` is the scenario's customer-profile store
+ * (the database); a restart builds a new harness with the same store and
+ * backend fake, so only the in-memory session is lost.
+ */
+function buildHarness(
+  scenario: Scenario,
+  meter: Meter,
+  profiles: CustomerProfileStore,
+  api = new EvalFakeApi(scenario.customer),
+) {
+  const profileService = new CustomerProfileService(profiles);
   const store = new InMemoryConversationStore();
   const values: Record<string, unknown> = {
     'chatbotApi.cashierUserId': CASHIER,
@@ -225,6 +244,8 @@ function buildHarness(scenario: Scenario, meter: Meter) {
     checkout,
     config,
     shipping,
+    undefined,
+    profileService,
   );
   const agent = new MinimalCatalogAgentService(
     api,
@@ -238,11 +259,24 @@ function buildHarness(scenario: Scenario, meter: Meter) {
     checkout,
     order,
     shipping,
+    profileService,
   );
   return { api, agent };
 }
 
 /** Labels server-owned (deterministic) replies so gate behavior is visible. */
+/** S4: "🔘 Botones: [a] [b]" / "📋 Lista (Ver opciones): a · b", or null. */
+function describeInteractive(
+  interactive: CustomerReplyInteractive | undefined,
+): string | null {
+  if (interactive === undefined) return null;
+  return interactive.type === 'buttons'
+    ? `🔘 Botones: ${interactive.buttons.map((b) => `[${b.title}]`).join(' ')}`
+    : `📋 Lista (${interactive.buttonText}): ${interactive.rows
+        .map((r) => r.title)
+        .join(' · ')}`;
+}
+
 function gateLabel(reply: string, llmCalls: number): string | null {
   const labels: string[] = [];
   if (llmCalls === 0) labels.push('deterministic gate (no LLM call)');
@@ -259,7 +293,8 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     tools: [],
     usage: { input: 0, cached: 0, output: 0 },
   };
-  const { api, agent } = buildHarness(scenario, meter);
+  const profiles = new InMemoryCustomerProfileStore();
+  let { api, agent } = buildHarness(scenario, meter, profiles);
   const record: ScenarioRecord = {
     scenario,
     turns: [],
@@ -270,6 +305,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     skipped: 0,
   };
   let register: Register = 'usted';
+  const customerTexts: string[] = [];
   for (const [index, raw] of scenario.turns.entries()) {
     const turn: ScenarioTurn = typeof raw === 'string' ? { text: raw } : raw;
     const previousReply = record.turns.at(-1)?.reply ?? '';
@@ -284,16 +320,28 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       record.stopped = true;
       break;
     }
+    if (turn.restartBefore === true) {
+      // S1: same profile store and backend, new process and session. The
+      // expected register carries over (remembered); emojis restart.
+      ({ api, agent } = buildHarness(scenario, meter, profiles, api));
+      customerTexts.length = 0;
+    }
     register = nextRegister(register, turn.text);
+    customerTexts.push(turn.text);
     meter.calls = 0;
     meter.tools = [];
     const before = { ...meter.usage };
     let reply = '';
+    let images: string[] = [];
+    let interactive: string | null = null;
     let error: string | undefined;
     try {
       const decision = await agent.tryHandle({
         senderId: SENDER,
         text: turn.text,
+        ...(scenario.profileName === undefined
+          ? {}
+          : { profileName: scenario.profileName }),
         inboundEvent: {
           receivingPhoneNumberId: '123456789012345',
           senderId: SENDER,
@@ -301,6 +349,10 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
         },
       });
       reply = decision.reply;
+      images = (decision.media ?? []).map(
+        (media) => `${media.caption ?? '(sin pie)'} <${media.url}>`,
+      );
+      interactive = describeInteractive(decision.interactive);
       // The reply reached WhatsApp: arm any pending confirmation.
       decision.onSent?.();
     } catch (err) {
@@ -316,21 +368,30 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     record.usd += turnUsd;
     maxTurnUsd = Math.max(maxTurnUsd, turnUsd);
     record.turns.push({
-      customer: turn.text,
+      customer:
+        turn.restartBefore === true
+          ? `🔄 (bot restart) ${turn.text}`
+          : turn.text,
       reply,
+      images,
+      interactive,
       tools: [...meter.tools],
       llmCalls: meter.calls,
       gate: gateLabel(reply, meter.calls),
       backend: api.drainEvents(),
       checks:
         error === undefined
-          ? checkReply({
-              customerText: turn.text,
-              reply,
-              expected: register,
-              refusal: turn.refusal ?? 'forbidden',
-              expectPersona: turn.expectPersona ?? false,
-            })
+          ? [
+              ...checkReply({
+                customerText: turn.text,
+                recentCustomerTexts: customerTexts,
+                reply,
+                expected: register,
+                refusal: turn.refusal ?? 'forbidden',
+                expectPersona: turn.expectPersona ?? false,
+              }),
+              ...checkExpectedReply(reply, turn.expectReply),
+            ]
           : [{ check: 'error', severity: 'fail', detail: error }],
       usd: turnUsd,
       ...(error === undefined ? {} : { error }),
@@ -366,10 +427,13 @@ function transcript(records: ScenarioRecord[], startedAt: string): string {
       lines.push(`### Turn ${i + 1}`, '');
       lines.push(`**Cliente:** ${t.customer.replace(/\n/g, '  \n')}`, '');
       lines.push('**Bot:**', '');
+      for (const image of t.images) lines.push(`> 🖼️ Imagen: ${image}`);
+      if (t.images.length > 0) lines.push('>');
       lines.push(
         ...(t.reply === ''
           ? ['> _(no reply)_']
           : t.reply.split('\n').map((l) => `> ${l}`)),
+        ...(t.interactive === null ? [] : ['>', `> ${t.interactive}`]),
         '',
       );
       lines.push(

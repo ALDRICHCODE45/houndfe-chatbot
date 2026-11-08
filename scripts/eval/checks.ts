@@ -1,3 +1,4 @@
+import { customerAllowsEmojis } from '../../src/llm-agent/domain/customer-style';
 import type { RefusalExpectation } from './scenarios';
 
 /** Deterministic reply heuristics; no LLM judge. */
@@ -154,6 +155,11 @@ const LIST_LINE = /^\s*(?:[-•*]|\d+[.)])\s+\S/m;
 /** A short "label: value" list item, e.g. `- **Marca:** Pet's Choice`. */
 const ATTRIBUTE_LINE = /^(?:[-•*]|\d+[.)])\s+\**[^:.!?]{1,30}:\**\s*\S.{0,50}$/;
 
+/** A bare label such as "Variantes:"; repeats legitimately per product. */
+const LABEL_LINE = /^[^:]{1,29}:$/;
+/** A Markdown image or link alone on a line (formatted away before send). */
+const MEDIA_LINE = /^(?:[-•*]\s+)?!?\[[^\]]*\]\([^)]*\)$/;
+
 const count = (re: RegExp, text: string) => (text.match(re) ?? []).length;
 
 export const hasEmoji = (text: string) => EMOJI.test(text);
@@ -170,8 +176,25 @@ export function nextRegister(
   return current;
 }
 
+/** S1: a scenario's expected-content heuristic; a warning when unmet. */
+export function checkExpectedReply(
+  reply: string,
+  expected: RegExp | undefined,
+): CheckResult[] {
+  if (expected === undefined || expected.test(reply)) return [];
+  return [
+    {
+      check: 'expect',
+      severity: 'warn',
+      detail: `reply does not match ${String(expected)}`,
+    },
+  ];
+}
+
 export function checkReply(input: {
   customerText: string;
+  /** The customer's messages so far, oldest first (default: this one). */
+  recentCustomerTexts?: readonly string[];
   reply: string;
   expected: Register;
   refusal: RefusalExpectation;
@@ -183,13 +206,17 @@ export function checkReply(input: {
     return [{ check: 'empty', severity: 'fail', detail: 'empty reply' }];
   }
 
+  // Same rule as the service's emoji guard (customer-style.ts).
   const customerEmoji = hasEmoji(customerText);
+  const emojiAllowed = customerAllowsEmojis(
+    input.recentCustomerTexts ?? [customerText],
+  );
   const botEmoji = hasEmoji(reply);
-  if (!customerEmoji && botEmoji)
+  if (!emojiAllowed && botEmoji)
     out.push({
       check: 'emoji',
       severity: 'fail',
-      detail: 'emoji to a customer who used none',
+      detail: 'emoji while the customer has no recent emoji style',
     });
   else if (customerEmoji && !botEmoji)
     out.push({
@@ -290,7 +317,11 @@ export function checkReply(input: {
   // A list attribute ("- **Marca:** Pet's Choice") may legitimately repeat
   // across products; only repeated sentences/paragraphs are duplicates.
   const repeated = lines.find(
-    (line, i) => !ATTRIBUTE_LINE.test(line) && lines.indexOf(line) !== i,
+    (line, i) =>
+      !ATTRIBUTE_LINE.test(line) &&
+      !LABEL_LINE.test(line) &&
+      !MEDIA_LINE.test(line) &&
+      lines.indexOf(line) !== i,
   );
   out.push(
     repeated === undefined

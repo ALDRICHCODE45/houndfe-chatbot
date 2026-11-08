@@ -33,7 +33,7 @@ The harness checks the budget before every turn and before every model call. A t
 
 ## Output
 
-- `scripts/eval/out/<timestamp>.md` (gitignored): for each turn, the customer text, the bot reply, the tools called, the number of LLM calls and their cost, and the backend activity (searches, quotes, `ORDER CREATED folio …`). It also gives a gate label: `deterministic gate (no LLM call)`, `delivery confirmation`, `order summary` or `order placed`.
+- `scripts/eval/out/<timestamp>.md` (gitignored): for each turn, the customer text, the product photos sent before the reply (`🖼️ Imagen: <caption> <url>`; fixture products have placeholder JPEG URLs), the bot reply, the tools called, the number of LLM calls and their cost, and the backend activity (searches, quotes, `ORDER CREATED folio …`). It also gives a gate label: `deterministic gate (no LLM call)`, `delivery confirmation`, `order summary` or `order placed`.
 - The console prints a summary table (per scenario: fails, warnings, orders, cost) and fail/warn totals for each check.
 
 ## Checks
@@ -42,13 +42,18 @@ The checks are deterministic heuristics; there is no LLM judge. Treat them as fl
 
 | Check | Fail | Warn |
 | --- | --- | --- |
-| `emoji` | Reply has an emoji, but the customer's last message had none. | Customer used emojis; the reply has none. |
+| `emoji` | Reply has an emoji, but neither the customer's last message nor at least 2 of their last 3 had one (same rule as the service's emoji guard). | The customer's last message had an emoji; the reply has none. |
 | `register` | Expected tú, reply uses only usted (or the reverse). Expected register starts as usted and follows the customer's latest tú/usted markers. | Reply mixes both. |
 | `slang` | Voseo, vosotros forms or Mexican slang (`güey`, `chido`, `neta`, …). | — |
 | `refusal` | The literal `esa función aún no está disponible` on a supported request. | Missing on a turn marked `expected`. |
 | `persona` | Mentions technology/retail/punto de venta, or a turn marked `expectPersona` does not mention mascotas. | — |
 | `leak` | Internal text (`selectionRef`, `productId`, `herramienta`, operator copy such as "Primero registra la venta"). | — |
 | `orders` | At the end, the number of distinct checkout idempotency keys ≠ `expectOrders`. Confirm scenarios expect exactly 1; decline and denied-zone scenarios expect 0. | — |
+| `expect` | — | The reply does not match the turn's `expectReply` heuristic (e.g. `returning-customer`: tú after the restart, adult large-breed food for Luna). |
+
+## Customer memory (S1)
+
+Each scenario gets its own in-memory customer-profile store, shared by the agent and the order service like the production `customer_profiles` table. A turn with `restartBefore: true` builds a new agent and session (a bot restart) over the same profile store and backend fake; the transcript marks it `🔄 (bot restart)`. The expected register carries over the restart, the emoji rule restarts with the new session. `returning-customer` uses this: session 1 is casual tú with emojis and mentions Luna; session 2 starts with "hola".
 
 ## Fixtures
 

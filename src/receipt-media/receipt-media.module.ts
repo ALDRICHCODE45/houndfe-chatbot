@@ -18,6 +18,7 @@ import {
   Module,
   OnApplicationBootstrap,
   OnModuleDestroy,
+  Optional,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { ConfigModule, ConfigService } from '@nestjs/config';
@@ -28,6 +29,8 @@ import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
 import { ConversationModule } from '../conversation/conversation.module';
 import type { ConversationStore } from '../conversation/domain/conversation-store';
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
+import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
+import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { PostgresCustomerInboundObservationStore } from '../human-decisions/infrastructure/postgres-customer-inbound-observation.store';
@@ -126,11 +129,14 @@ class ReceiptMediaNotificationLifecycle
     @Inject(PG_POOL) private readonly pool: Pool,
     @Inject(WHATSAPP_SENDER)
     private readonly sender: Pick<WhatsappSenderPort, 'sendText'>,
+    // S1: notices in the recipient's stored style (usted when unknown).
+    @Optional() private readonly profiles?: CustomerProfileService,
   ) {}
 
   onApplicationBootstrap(): void {
     if (this.started || this.stopped) return;
     this.started = true;
+    const profiles = this.profiles;
     const outbox = new PostgresReceiptOutboxStore(this.pool);
     const inbound = new PostgresCustomerInboundObservationStore(this.pool);
     const phone = receivingPhone(this.config);
@@ -146,6 +152,9 @@ class ReceiptMediaNotificationLifecycle
         markNotDelivered: (id, owner, lease) =>
           outbox.markNotDelivered(id, owner, lease),
       },
+      profiles === undefined
+        ? undefined
+        : (recipientId) => profiles.styleFor(recipientId),
     );
     this.worker.onApplicationBootstrap();
   }
@@ -246,6 +255,7 @@ class ReceiptOutcomeLifecycle
     ChatbotApiModule,
     WhatsappSenderModule,
     LlmCoreModule,
+    CustomerProfileModule,
   ],
   controllers: [ReceiptMetricsController],
   providers: [

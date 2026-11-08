@@ -379,3 +379,56 @@ describe('DeliveryZoneNotifier', () => {
     );
   });
 });
+
+describe('DeliveryZoneNotifier customer style (S1)', () => {
+  const resolved = () =>
+    row({
+      status: 'RESOLVED',
+      resolution: resolution({ zoneType: 'DENIED' }),
+      applyBefore: APPLY_BEFORE,
+    });
+  const USTED =
+    'Revisamos su código postal 06700 y por ahora no tenemos entrega ahí. Puede recoger su pedido en tienda sin costo de envío.';
+
+  it('a tú profile gets the tú text', async () => {
+    const t = setup();
+    const customerStyle = jest
+      .fn()
+      .mockResolvedValue({ register: 'tu', emojis: false, tone: 'casual' });
+    Object.assign(t.ports, { customerStyle });
+    t.seed(resolved());
+    await t.notifier.process(t.stored());
+    expect(customerStyle).toHaveBeenCalledWith(SENDER);
+    expect(t.ports.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: 'Revisamos tu código postal 06700 y por ahora no tenemos entrega ahí. Puedes recoger tu pedido en tienda sin costo de envío.',
+    });
+  });
+
+  it.each([
+    ['missing profile', () => Promise.resolve(null)],
+    ['failed read', () => Promise.reject(new Error('down'))],
+  ])('%s keeps the usted text', async (_label, read) => {
+    const t = setup();
+    Object.assign(t.ports, { customerStyle: jest.fn(read) });
+    t.seed(resolved());
+    await t.notifier.process(t.stored());
+    expect(t.ports.sendText).toHaveBeenCalledWith({ to: SENDER, text: USTED });
+    expect(t.stored()).toMatchObject({ status: 'CLOSED' });
+  });
+
+  it('the Meta template outside the window is unchanged', async () => {
+    const t = setup({ latest: { kind: 'not_found' } as never });
+    Object.assign(t.ports, {
+      customerStyle: jest
+        .fn()
+        .mockResolvedValue({ register: 'tu', emojis: false, tone: 'casual' }),
+    });
+    t.seed(resolved());
+    await t.notifier.process(t.stored());
+    expect(t.ports.sendText).not.toHaveBeenCalled();
+    expect(t.ports.sendTemplate).toHaveBeenCalledWith(
+      expect.objectContaining({ to: SENDER, bodyParameters: ['06700'] }),
+    );
+  });
+});

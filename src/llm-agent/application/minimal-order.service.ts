@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
 import { ConfigService } from '@nestjs/config';
+import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   CHATBOT_API_CLIENT,
@@ -40,6 +41,7 @@ import {
   sameMinimalOrder,
   type MinimalOrderIneligibleReason,
   type MinimalOrderSnapshot,
+  type MinimalOrderStatus,
   type MinimalOrderShipping,
 } from '../domain/minimal-order-confirmation';
 import {
@@ -206,6 +208,21 @@ function isSale(value: unknown): value is PlacedSaleIdentity {
   );
 }
 
+/** S1: the sale's confirmedAt, else the placement time. */
+function saleConfirmedAt(sale: PlacedSaleIdentity, nowMs: number): string {
+  const confirmed = (sale as { confirmedAt?: unknown }).confirmedAt;
+  return typeof confirmed === 'string' && !Number.isNaN(Date.parse(confirmed))
+    ? new Date(confirmed).toISOString()
+    : new Date(nowMs).toISOString();
+}
+
+/** S1: the checkout first name of the order (delivery draft or pickup). */
+function checkoutFirstName(snapshot: MinimalOrderSnapshot): string | null {
+  return (
+    snapshot.draft?.customer.firstName ?? snapshot.customer?.firstName ?? null
+  );
+}
+
 /** Backend pickup location (C1); null parts are omitted, never invented. */
 function pickupLocationText(
   location: CheckoutPickupLocation | null | undefined,
@@ -303,6 +320,8 @@ export class MinimalOrderService {
     config: ConfigService,
     private readonly shipping: MinimalShippingService,
     @Optional() @Inject(MINIMAL_ORDER_CLOCK) now?: () => number,
+    // S1: the last-order pointer and checkout name for the customer memory.
+    @Optional() private readonly profiles?: CustomerProfileService,
   ) {
     this.now = now ?? (() => Date.now());
     const cashier = config.get<string>('chatbotApi.cashierUserId');
@@ -341,6 +360,11 @@ export class MinimalOrderService {
       };
     }
     return this.offer(senderId, inboundEvent, fresh.snapshot);
+  }
+
+  /** S4: the live pending summary (reference + armed), or `null`. */
+  offerStatus(senderId: string): MinimalOrderStatus | null {
+    return this.confirmation.status(senderId);
   }
 
   /** Drop the sender's pending summary when another route answers a turn. */
@@ -892,6 +916,7 @@ export class MinimalOrderService {
               own.sale,
               snapshot.shipping,
               own.pickupLocation,
+              checkoutFirstName(snapshot),
             )
           : MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY;
       }
@@ -914,6 +939,7 @@ export class MinimalOrderService {
             own.sale,
             snapshot.shipping,
             own.pickupLocation,
+            checkoutFirstName(snapshot),
           );
         earlierResolved = own.kind === 'absent';
       }
@@ -985,6 +1011,7 @@ export class MinimalOrderService {
       sale,
       snapshot.shipping,
       pickupLocation,
+      checkoutFirstName(snapshot),
     );
   }
 
@@ -1021,6 +1048,7 @@ export class MinimalOrderService {
     sale: PlacedSaleIdentity,
     shipping?: { mode: 'pickup' } | { customerChargeCents: number },
     pickupLocation?: CheckoutPickupLocation | null,
+    firstName?: string | null,
   ): Promise<string> {
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
@@ -1032,6 +1060,17 @@ export class MinimalOrderService {
         totalCents: sale.totalCents,
       },
     });
+    // S1: best effort; the profile never blocks the order-created reply.
+    if (sale.folio !== null)
+      await this.profiles?.recordOrder(
+        senderId,
+        {
+          folio: sale.folio,
+          confirmedAt: saleConfirmedAt(sale, this.now()),
+          totalCents: sale.totalCents,
+        },
+        firstName,
+      );
     const created = minimalOrderCreatedReply(sale, shipping, pickupLocation);
     return `${created}\n\n${await this.paymentInstructions()}`;
   }

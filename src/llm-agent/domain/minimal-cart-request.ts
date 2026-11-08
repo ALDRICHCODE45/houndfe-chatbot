@@ -327,6 +327,20 @@ export function requestsCartChange(
 ): boolean {
   return (
     statedUnitCount(text).status !== 'none' ||
+    requestsCartAction(text, previousAssistantText)
+  );
+}
+
+/**
+ * True when `text` asks for a cart change in words (an add request or a
+ * change/removal word), ignoring bare numbers: in a pet statement ("es una
+ * labrador de 3 años") the numbers describe the pet, not units.
+ */
+export function requestsCartAction(
+  text: string,
+  previousAssistantText: string | null,
+): boolean {
+  return (
     conversationalAddForm(text, previousAssistantText) !== null ||
     cartWords(text).some((word) => CHANGE_WORDS.has(word))
   );

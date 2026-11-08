@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import { openai } from '@ai-sdk/openai';
-import { Output, stepCountIs, tool, type ModelMessage } from 'ai';
+import { Output, stepCountIs, tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import {
   CHATBOT_API_CLIENT,
@@ -26,15 +26,57 @@ import type {
 } from '../domain/minimal-cart-quantity';
 import { hasKeepOnlyCartEvidence } from '../domain/minimal-cart-keep-only';
 import { SYSTEM_PROMPT } from '../domain/system-prompt';
+import { toWhatsAppText } from '../domain/whatsapp-text';
 import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import {
+  DEFAULT_CUSTOMER_STYLE,
+  applyCustomerRegister,
   applyCustomerStyle,
+  customerAllowsEmojis,
   customerStyleDirective,
   detectCustomerStyle,
+  explicitStyleSignal,
   limitCustomerEmojis,
   type CustomerStyle,
 } from '../domain/customer-style';
-import type { MinimalCatalogTurn } from '../domain/minimal-catalog-session.store';
+import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
+import {
+  extractPetFacts,
+  knownPetPromptLine,
+  petFactsConflict,
+} from '../../customer-profile/domain/pet-facts';
+import {
+  customerStyleSeed,
+  knownCustomerPromptLine,
+  type CustomerProfilePatch,
+} from '../../customer-profile/domain/customer-profile';
+import {
+  explicitPreferredName,
+  isForgetMyDataRequest,
+} from '../../customer-profile/domain/customer-profile-signals';
+import type {
+  MinimalCatalogTurn,
+  ReorderOfferContext,
+} from '../domain/minimal-catalog-session.store';
+import {
+  boundProductImageContext,
+  checkoutConfirmationButtons,
+  choiceList,
+  isSendableProductImageUrl,
+  orderConfirmationButtons,
+  parseInteractiveReplyId,
+  productImageCaption,
+  reorderConfirmationButtons,
+  shortMxn,
+  type CustomerReply,
+  type CustomerReplyInteractive,
+  type CustomerReplyMedia,
+  type InteractiveChoiceContext,
+  type InteractiveReplyIntent,
+  type ProductImageContext,
+} from '../domain/customer-reply';
+import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
+import { MINIMAL_CHECKOUT_SUMMARY_HEADING } from '../domain/minimal-checkout-confirmation';
 import {
   GENERATE_TEXT,
   type GenerateTextFn,
@@ -51,6 +93,8 @@ import {
   cartKeepOnlyToolInput,
   cartPrepareToolInput,
   cartSetToolInput,
+  presentationLabel,
+  type CartChoice,
   type CartLineIdentity,
   type ResolvedCartSelection,
 } from './minimal-cart-conversation';
@@ -88,6 +132,15 @@ import {
   MINIMAL_EXPIRATION_CAUTIOUS_REPLY,
   MinimalExpirationRequestService,
 } from './minimal-expiration-request.service';
+import {
+  REORDER_BUTTONS_PROMPT,
+  REORDER_CHANGE_REPLY,
+  REORDER_DECLINE_REPLY,
+  REORDER_NEXT_STEP,
+  REORDER_UNAVAILABLE_REPLY,
+  prepareMinimalReorder,
+  type MinimalReorderPresentation,
+} from './minimal-reorder';
 
 // Closed codes only: cart error strings must never become arbitrary log payloads.
 const CART_TRACE_ERROR_CODES = new Set([
@@ -135,17 +188,31 @@ const INSTRUCTIONS =
   'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
-  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
+  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha. ' +
+  'Escribe para WhatsApp: negritas con un solo asterisco (*así*) y solo si ayudan, sin imágenes ni enlaces Markdown (las fotos se envían aparte), sin encabezados y con listas cortas.';
 
-export type MinimalCatalogAgentDecision = {
+/** S3: the structured customer reply (text + optional media) of one turn. */
+export type MinimalCatalogAgentDecision = CustomerReply & {
   kind: 'handled';
-  reply: string;
   onSent?: () => void;
 };
 
 // Bounded busy reply returned as `handled` for an in-flight turn.
 export const BUSY_REPLY =
   'Ya estoy atendiendo su consulta; por favor espere mi respuesta.';
+
+// S1: confirmation of "olvida mis datos" (the profile row is deleted).
+export const FORGET_MY_DATA_REPLY =
+  'Listo, borré los datos que tenía guardados de usted (nombre, estilo de trato y mascota). Sus pedidos registrados en la tienda no se borran.';
+
+// S1: guidance for the customer-memory tool (pet facts).
+const PET_MEMORY_INSTRUCTIONS =
+  'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
+  'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
+  'Si hay una línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte.';
+
+/** Generous input cap; the profile store bounds each field again. */
+const PET_FACT = z.string().min(1).max(500).optional();
 
 export const RESTOCK_CAUTIOUS_REPLY =
   'Por ahora no puedo preparar esa consulta de reposición.';
@@ -156,6 +223,23 @@ export const EMPTY_REPLY_FALLBACK =
 
 // G2: lead before the updated order summary after a cart change.
 export const CART_UPDATED_LEAD = 'Listo, actualicé su carrito.';
+
+// S4: replies to the interactive buttons.
+export const ORDER_CHANGE_REPLY = 'Claro, ¿qué desea cambiar?';
+export const CHECKOUT_CHANGE_REPLY = '¿Qué dato quiere corregir?';
+/** Lead for a tap on a button whose summary is no longer the current one. */
+export const STALE_BUTTON_LEAD = 'Ese botón ya no está vigente.';
+const STALE_BUTTON_FALLBACK = `${STALE_BUTTON_LEAD} ¿Qué desea hacer?`;
+const ORDER_BUTTONS_PROMPT = '¿Confirma su pedido?';
+const CHECKOUT_BUTTONS_PROMPT = '¿Son correctos sus datos de entrega?';
+const CHOICE_LIST_PROMPT = 'Elija una opción de la lista.';
+const CATALOG_PRICES_MAX = 100;
+
+/** S4: a list row the customer picked from the bot's latest message. */
+type InteractivePick = { reference: string; text: string };
+
+const priceKey = (productId: string, variantId?: string | null) =>
+  `${productId}|${variantId ?? ''}`;
 
 /**
  * Model text imitating the server-owned delivery-data or order summaries.
@@ -283,6 +367,46 @@ type RestockRun = {
 };
 
 type ExpirationReply = { attempted: boolean; value: string | null };
+
+/**
+ * S3: product photos for one SDK run. `known` and `sent` start from the
+ * session; `presented` collects the products the catalog reads of THIS run
+ * resolved (productId → name) and `added` the products a cart write added.
+ */
+type ProductImageRun = {
+  known: Map<string, { url: string; name: string }>;
+  sent: Set<string>;
+  presented: Map<string, string>;
+  added: Set<string>;
+  /** S4: catalog prices (`priceKey` → cents) for list row titles. */
+  prices: Map<string, number>;
+};
+
+/** S4: remember a catalog item's prices, most recent last. */
+function recordPrices(
+  prices: Map<string, number>,
+  item: CatalogItemResponse,
+): void {
+  const put = (key: string, cents: unknown) => {
+    if (typeof cents !== 'number' || !Number.isSafeInteger(cents) || cents < 0)
+      return;
+    prices.delete(key);
+    prices.set(key, cents);
+  };
+  put(priceKey(item.productId), item.price?.priceCents);
+  for (const variant of item.variants ?? [])
+    put(priceKey(item.productId, variant.variantId), variant.priceCents);
+}
+
+/** Lowercase, accent- and markdown-free text for name matching. */
+function matchable(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[*_`]/g, '')
+    .replace(/\s+/g, ' ');
+}
 type CartReply = ExpirationReply & {
   source?: 'cart' | 'read' | 'reviewCheckout';
   // A real write left a non-empty cart in this run.
@@ -291,6 +415,14 @@ type CartReply = ExpirationReply & {
 
 // One server-owned checkout presentation per SDK run.
 type CheckoutRun = { attempted: boolean; value: MinimalCheckoutReply | null };
+/** S2: one reorder presentation per SDK run. */
+type ReorderRun = {
+  attempted: boolean;
+  value: MinimalReorderPresentation | null;
+};
+
+const REORDER_INSTRUCTIONS_FRAGMENT =
+  ' Si el cliente pide repetir un pedido anterior ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta.';
 
 const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'lookupCheckoutCustomer',
@@ -502,6 +634,21 @@ function ungroundedCatalogClaim(result: {
   return !called && CATALOG_CLAIM.test(result.text);
 }
 
+/** H1: an assistant message with its text rewritten for WhatsApp. */
+function formatAssistantText(message: ModelMessage): ModelMessage {
+  if (message.role !== 'assistant') return message;
+  if (typeof message.content === 'string')
+    return { ...message, content: toWhatsAppText(message.content) };
+  return {
+    ...message,
+    content: message.content.map((part) =>
+      part.type === 'text'
+        ? { ...part, text: toWhatsAppText(part.text) }
+        : part,
+    ),
+  };
+}
+
 /** Text of the bot's last stored message, or `null`. */
 function lastAssistantText(
   turns: readonly MinimalCatalogTurn[],
@@ -566,6 +713,9 @@ export class MinimalCatalogAgentService {
     private readonly order?: MinimalOrderService,
     @Optional()
     private readonly shipping?: MinimalShippingService,
+    // S1 persistent customer memory; optional only as a test seam.
+    @Optional()
+    private readonly profiles?: CustomerProfileService,
   ) {
     const llm = config.get<{
       model: string;
@@ -583,6 +733,10 @@ export class MinimalCatalogAgentService {
     senderId: string;
     text: string;
     inboundEvent?: unknown;
+    /** S4: id of the tapped reply button / list row, when there is one. */
+    interactiveReplyId?: string;
+    /** S1: the WhatsApp contact profile name, when Meta sent it. */
+    profileName?: string;
   }): Promise<MinimalCatalogAgentDecision> {
     if (this.busy.has(input.senderId)) {
       // Any turn after a summary spends its consent, even a rejected one.
@@ -599,8 +753,63 @@ export class MinimalCatalogAgentService {
     this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
     try {
-      // The busy span covers the free consume and the SDK run.
-      if (this.restock !== undefined) {
+      await this.prepareCustomer(input.senderId);
+      const decision = this.withConfirmationButtons(
+        input.senderId,
+        await this.handleTurn(input),
+      );
+      await this.rememberTurn(input);
+      return decision;
+    } finally {
+      if (this.interrupted.delete(input.senderId)) {
+        this.order?.dismiss(input.senderId);
+      }
+      this.busy.delete(input.senderId);
+    }
+  }
+
+  /** One customer turn inside the busy span (gates, then the SDK run). */
+  private async handleTurn(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+    interactiveReplyId?: string;
+  }): Promise<MinimalCatalogAgentDecision> {
+    {
+      if (
+        this.profiles !== undefined &&
+        input.interactiveReplyId === undefined &&
+        isForgetMyDataRequest(input.text)
+      )
+        return this.forgetCustomer(input);
+      let pick: InteractivePick | undefined;
+      if (input.interactiveReplyId !== undefined) {
+        const tapped = await this.consumeInteractive(
+          input,
+          parseInteractiveReplyId(input.interactiveReplyId),
+        );
+        if ('decision' in tapped) return tapped.decision;
+        input = tapped.input;
+        pick = tapped.pick;
+      }
+      // S2: the reply right after a reorder offer answers it first.
+      if (input.interactiveReplyId === undefined) {
+        const offer = this.pendingReorder(input.senderId);
+        const answer =
+          offer === null ? null : classifyConfirmationReply(input.text);
+        if (offer !== null && answer === 'accept')
+          return await this.acceptReorder(input, offer);
+        if (answer === 'decline') {
+          this.order?.dismiss(input.senderId);
+          return this.answerReorder(input, { reply: REORDER_DECLINE_REPLY });
+        }
+      }
+      // The busy span covers the free consume and the SDK run. A tapped
+      // button or row never answers a RESTOCK question.
+      if (
+        this.restock !== undefined &&
+        input.interactiveReplyId === undefined
+      ) {
         const consumed = await this.restock.consume({
           senderId: input.senderId,
           text: input.text,
@@ -668,31 +877,348 @@ export class MinimalCatalogAgentService {
           };
         }
       }
-      const result = await this.runTurn(input);
-      return {
-        kind: 'handled',
-        reply: result.reply,
-        ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
-      };
-    } finally {
-      if (this.interrupted.delete(input.senderId)) {
-        this.order?.dismiss(input.senderId);
-      }
-      this.busy.delete(input.senderId);
+      return this.decision(await this.runTurn(input, pick));
     }
   }
 
-  private async runTurn(input: {
+  private decision(
+    result: CustomerReply & { onSent?: () => void },
+  ): MinimalCatalogAgentDecision {
+    return {
+      kind: 'handled',
+      reply: result.reply,
+      ...(result.media === undefined ? {} : { media: result.media }),
+      ...(result.interactive === undefined
+        ? {}
+        : { interactive: result.interactive }),
+      ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+    };
+  }
+
+  /**
+   * S4: a tapped reply. Change buttons are answered here; a confirm bound to
+   * a summary that is no longer the pending one re-presents the current step
+   * (never confirms); a list pick from the bot's latest message continues
+   * with the full option text and its selection reference; an unknown id
+   * skips every gate. Otherwise the turn continues through the gates.
+   */
+  private async consumeInteractive(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      interactiveReplyId?: string;
+    },
+    intent: InteractiveReplyIntent | null,
+  ): Promise<
+    | { decision: MinimalCatalogAgentDecision }
+    | { input: typeof input; pick?: InteractivePick }
+  > {
+    const { senderId } = input;
+    const style = this.customerStyle(senderId, input.text);
+    const answer = (result: { reply: string; onSent?: () => void }) => {
+      const reply = applyCustomerStyle(result.reply, style);
+      this.recordTurn(
+        senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [],
+      );
+      return {
+        decision: this.decision(
+          result.onSent === undefined
+            ? { reply }
+            : { reply, onSent: result.onSent },
+        ),
+      };
+    };
+    if (intent === null) {
+      this.order?.dismiss(senderId);
+      return { decision: this.decision(await this.runTurn(input)) };
+    }
+    switch (intent.kind) {
+      case 'order_change':
+        this.order?.dismiss(senderId);
+        return answer({ reply: ORDER_CHANGE_REPLY });
+      case 'checkout_change': {
+        this.order?.dismiss(senderId);
+        const declined =
+          this.checkoutAvailable() &&
+          this.checkout!.confirmationStatus(senderId)?.stage === 'pending'
+            ? await this.checkout!.consume({ ...input, text: 'no' })
+            : null;
+        return answer(declined ?? { reply: CHECKOUT_CHANGE_REPLY });
+      }
+      case 'order_confirm':
+        if (
+          intent.reference !== null &&
+          this.order?.offerStatus(senderId)?.reference !== intent.reference
+        )
+          return answer(await this.representAfterStaleButton(input));
+        return { input };
+      case 'checkout_confirm': {
+        const status = this.checkoutAvailable()
+          ? this.checkout!.confirmationStatus(senderId)
+          : null;
+        if (
+          intent.reference !== null &&
+          !(
+            status?.stage === 'pending' && status.reference === intent.reference
+          )
+        )
+          return answer(await this.representAfterStaleButton(input));
+        return { input };
+      }
+      case 'reorder_confirm': {
+        const offer = this.pendingReorder(senderId);
+        if (offer === null || offer.reference !== intent.reference) {
+          this.order?.dismiss(senderId);
+          return answer({ reply: STALE_BUTTON_FALLBACK });
+        }
+        return { decision: await this.acceptReorder(input, offer) };
+      }
+      case 'reorder_change':
+        this.order?.dismiss(senderId);
+        return answer({ reply: REORDER_CHANGE_REPLY });
+      case 'pick': {
+        const option = this.sessionStore
+          .read(senderId)
+          .at(-1)
+          ?.interactiveChoice?.options.find(
+            (candidate) => candidate.id === input.interactiveReplyId,
+          );
+        return option === undefined
+          ? { input }
+          : {
+              input: { ...input, text: option.text },
+              pick: { reference: option.reference, text: option.text },
+            };
+      }
+    }
+  }
+
+  /**
+   * S4: a confirm button from an older summary. Drop any pending order
+   * summary and present the CURRENT step (order summary, or the delivery
+   * data while unconfirmed) for a fresh tap; nothing is confirmed.
+   */
+  private async representAfterStaleButton(input: {
     senderId: string;
-    text: string;
     inboundEvent?: unknown;
-  }): Promise<{ reply: string; onSent?: () => void }> {
+  }): Promise<MinimalCheckoutReply> {
+    this.order?.dismiss(input.senderId);
+    try {
+      if (this.orderAvailable())
+        return await this.continueToOrder(
+          input.senderId,
+          input.inboundEvent,
+          STALE_BUTTON_LEAD,
+        );
+      if (this.checkoutAvailable()) {
+        const prepared = await this.checkout!.prepareConfirmation(
+          input.senderId,
+          input.inboundEvent,
+        );
+        return {
+          ...prepared,
+          reply: `${STALE_BUTTON_LEAD}\n\n${prepared.reply}`,
+        };
+      }
+    } catch {
+      // Fall through to the question; nothing was confirmed.
+    }
+    return { reply: STALE_BUTTON_FALLBACK };
+  }
+
+  /** S2: the reorder offer of the bot's latest message, if any. */
+  private pendingReorder(senderId: string): ReorderOfferContext | null {
+    return this.sessionStore.read(senderId).at(-1)?.reorderOffer ?? null;
+  }
+
+  /** A deterministic reorder reply (recorded without an offer: spends it). */
+  private answerReorder(
+    input: { senderId: string; text: string },
+    result: { reply: string; onSent?: () => void },
+  ): MinimalCatalogAgentDecision {
+    const reply = applyCustomerStyle(
+      result.reply,
+      this.customerStyle(input.senderId, input.text),
+    );
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision(
+      result.onSent === undefined
+        ? { reply }
+        : { reply, onSent: result.onSent },
+    );
+  }
+
+  /**
+   * S2: the customer's yes to the reorder offer. The quantities are the
+   * customer's own last order (server-owned evidence, never model counts):
+   * one all-or-nothing cart write, then the normal cart continuation — the
+   * updated order summary when the checkout already reached shipping or has
+   * confirmed delivery data, else the cart and the next step.
+   */
+  private async acceptReorder(
+    input: { senderId: string; text: string; inboundEvent?: unknown },
+    offer: ReorderOfferContext,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    this.order?.dismiss(senderId);
+    const cart = this.cart;
+    if (cart === undefined)
+      return this.answerReorder(input, { reply: REORDER_UNAVAILABLE_REPLY });
+    const priorShipping = this.shippingAvailable()
+      ? await cart.shippingMode(senderId)
+      : null;
+    const result = await cart.addItems(senderId, offer.items);
+    const code = result.ok
+      ? 'none'
+      : CART_TRACE_ERROR_CODES.has(result.error)
+        ? result.error
+        : 'unrecognized_cart_error';
+    traceLog(
+      this.logger,
+      `minimal_catalog reorder_accept evidence=order_history lines=${offer.items.length} result=${result.ok ? 'ok' : 'error'} code=${code}`,
+    );
+    if (!result.ok)
+      return this.answerReorder(input, { reply: minimalCartReply(result) });
+    let continued: MinimalCheckoutReply | null = null;
+    if (priorShipping !== null)
+      continued = await this.continueAfterCartChange(
+        senderId,
+        input.inboundEvent,
+        priorShipping,
+      );
+    else if (
+      this.orderAvailable() &&
+      this.checkoutAvailable() &&
+      (await this.checkout!.confirmedDraft(senderId)) !== null
+    )
+      continued = await this.continueToOrder(
+        senderId,
+        input.inboundEvent,
+        CART_UPDATED_LEAD,
+      ).catch(() => null);
+    return this.answerReorder(
+      input,
+      continued ?? {
+        reply: `${minimalCartReply(result)}\n\n${REORDER_NEXT_STEP}`,
+      },
+    );
+  }
+
+  /**
+   * S4: ✅/✏️ buttons on a reply that presents a server-owned summary whose
+   * gate is still waiting to be armed by this send, bound to its reference.
+   * Model text never gets buttons.
+   */
+  private withConfirmationButtons(
+    senderId: string,
+    decision: MinimalCatalogAgentDecision,
+  ): MinimalCatalogAgentDecision {
+    if (decision.onSent === undefined || decision.interactive !== undefined)
+      return decision;
+    const presents = (heading: string) =>
+      decision.reply.includes(heading) ||
+      decision.reply.includes(
+        applyCustomerRegister(heading, {
+          ...DEFAULT_CUSTOMER_STYLE,
+          register: 'tu',
+        }),
+      );
+    const style = this.customerStyle(senderId);
+    let interactive: CustomerReplyInteractive | undefined;
+    const order = this.order?.offerStatus(senderId) ?? null;
+    if (
+      order !== null &&
+      !order.armed &&
+      presents(MINIMAL_ORDER_SUMMARY_HEADING)
+    ) {
+      interactive = orderConfirmationButtons(
+        order.reference,
+        applyCustomerStyle(ORDER_BUTTONS_PROMPT, style),
+      );
+    } else {
+      const checkout = this.checkoutAvailable()
+        ? this.checkout!.confirmationStatus(senderId)
+        : null;
+      if (
+        checkout?.stage === 'pending' &&
+        !checkout.armed &&
+        presents(MINIMAL_CHECKOUT_SUMMARY_HEADING)
+      )
+        interactive = checkoutConfirmationButtons(
+          checkout.reference,
+          applyCustomerStyle(CHECKOUT_BUTTONS_PROMPT, style),
+        );
+    }
+    return interactive === undefined ? decision : { ...decision, interactive };
+  }
+
+  /** S4: the presentation/product question as a list, when 2-10 options. */
+  private choiceInteractive(
+    choice: CartChoice,
+    prices: ReadonlyMap<string, number>,
+    style: CustomerStyle,
+  ): {
+    interactive: CustomerReplyInteractive;
+    context: InteractiveChoiceContext;
+  } | null {
+    return choiceList(
+      choice.kind,
+      choice.options.map((option) => {
+        if (choice.kind === 'variant') {
+          const label = presentationLabel(option);
+          const price = prices.get(
+            priceKey(option.productId, option.variantId),
+          );
+          return {
+            reference: option.reference,
+            title:
+              price === undefined ? label : `${label} — ${shortMxn(price)}`,
+            text: `${option.productName} ${label}`,
+          };
+        }
+        return {
+          reference: option.reference,
+          title: option.productName,
+          ...(option.productName.length > 24
+            ? { description: option.productName }
+            : {}),
+          text: option.productName,
+        };
+      }),
+      applyCustomerStyle(CHOICE_LIST_PROMPT, style),
+    );
+  }
+
+  private async runTurn(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+    },
+    pick?: InteractivePick,
+  ): Promise<CustomerReply & { onSent?: () => void }> {
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
     // S2: the customer's own turns in this session decide the reply style.
-    const style = detectCustomerStyle([...customerTexts(turns), input.text]);
+    const style = detectCustomerStyle(
+      [...customerTexts(turns), input.text],
+      this.profileSeed(input.senderId),
+    );
     const styled = (text: string) => applyCustomerStyle(text, style);
     // Rebuild this sender's bounded selection registry and pending cart intent
     // from the last stored turn. Refs are deterministic digests, so a restored
@@ -721,6 +1247,39 @@ export class MinimalCatalogAgentService {
             selections: cartConversation.snapshot(),
             pending: cartConversation.pendingIntent,
           };
+    const previousImages = turns.at(-1)?.productImages;
+    const imageRun: ProductImageRun = {
+      known: new Map(Object.entries(previousImages?.known ?? {})),
+      sent: new Set(previousImages?.sent ?? []),
+      presented: new Map(),
+      added: new Set(),
+      prices: new Map(Object.entries(turns.at(-1)?.catalogPrices ?? {})),
+    };
+    const persistedPrices = (): Record<string, number> =>
+      Object.fromEntries([...imageRun.prices].slice(-CATALOG_PRICES_MAX));
+    const persistedImages = (): ProductImageContext =>
+      boundProductImageContext({
+        known: Object.fromEntries(imageRun.known),
+        sent: [...imageRun.sent],
+      });
+    // At most one photo per product per conversation; marked sent here.
+    const productImage = (
+      productId: string | undefined,
+    ): readonly CustomerReplyMedia[] | undefined => {
+      if (productId === undefined || imageRun.sent.has(productId))
+        return undefined;
+      const image = imageRun.known.get(productId);
+      if (image === undefined) return undefined;
+      imageRun.sent.add(productId);
+      const caption = productImageCaption(image.name);
+      return [
+        {
+          kind: 'image',
+          url: image.url,
+          ...(caption === undefined ? {} : { caption }),
+        },
+      ];
+    };
     const allowedIds = new Set<string>();
     for (const turn of prior) {
       for (const id of turn.verifiedProductIds) allowedIds.add(id);
@@ -757,6 +1316,9 @@ export class MinimalCatalogAgentService {
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
         : null;
+    const reorderRun: ReorderRun | null = this.cart
+      ? { attempted: false, value: null }
+      : null;
     const baseInstructions = instructionsFor(
       restockAvailable,
       expirationAvailable,
@@ -815,6 +1377,7 @@ export class MinimalCatalogAgentService {
         'No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         CART_VARIANT_GUIDANCE +
+        REORDER_INSTRUCTIONS_FRAGMENT +
         ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
@@ -835,7 +1398,10 @@ export class MinimalCatalogAgentService {
           ? SHIPPING_INSTRUCTIONS_FRAGMENT
           : '') +
         selectionContext +
-        pendingContext
+        pendingContext +
+        (pick === undefined
+          ? ''
+          : `\nEl cliente eligió en la lista del mensaje anterior: ${JSON.stringify(pick.text)} (selectionRef: ${pick.reference}). Continúe su solicitud con esa selectionRef EXACTA; no elija otra.`)
       : baseInstructions;
     const generateParams = {
       model: openai(this.model),
@@ -843,23 +1409,29 @@ export class MinimalCatalogAgentService {
         SYSTEM_PROMPT +
         '\n\n' +
         cartInstructions +
+        this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),
       messages: [
         ...prior.flatMap((turn) => turn.messages),
         { role: 'user' as const, content: input.text },
       ],
-      tools: this.buildTools(
-        allowedIds,
-        currentIds,
-        traceId,
-        restockRun,
-        expirationReply,
-        input,
-        cartReply,
-        cartConversation,
-        checkoutRun,
-      ),
+      tools: {
+        ...this.buildTools(
+          allowedIds,
+          currentIds,
+          traceId,
+          restockRun,
+          expirationReply,
+          input,
+          cartReply,
+          cartConversation,
+          checkoutRun,
+          imageRun,
+          reorderRun,
+        ),
+        ...this.memoryTools(input.senderId),
+      },
       stopWhen: stepCountIs(this.maxSteps),
     };
     // G2: the checkout reached shipping before this run (quote or pickup).
@@ -917,10 +1489,47 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
+    }
+    const reorder = reorderRun?.value ?? null;
+    if (reorder !== null) {
+      // S2: the server-owned reorder presentation; its buttons and its offer
+      // belong to this reply only.
+      const reply = styled(reorder.reply);
+      for (const productId of reorder.productIds) currentIds.add(productId);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+        reorder.offer === null ? {} : { reorderOffer: reorder.offer },
+      );
+      if (reorder.offer === null) return { reply };
+      const interactive = reorderConfirmationButtons(
+        reorder.offer.reference,
+        styled(REORDER_BUTTONS_PROMPT),
+      );
+      return {
+        reply,
+        interactive:
+          interactive.type === 'buttons'
+            ? {
+                ...interactive,
+                buttons: interactive.buttons.map((button) => ({
+                  ...button,
+                  title: applyCustomerRegister(button.title, style),
+                })),
+              }
+            : interactive,
+      };
     }
     const checkoutResult = checkoutRun?.value ?? null;
     if (checkoutResult !== null) {
@@ -929,7 +1538,14 @@ export class MinimalCatalogAgentService {
       // authors a checkout outcome.
       // A plain cart read adds nothing to the checkout presentation, which
       // already states the cart (and would repeat "Su carrito está vacío.").
+      // S5: a cart change re-presented as the order summary leads with the
+      // update instead of repeating the same lines as a cart listing.
+      const cartUpdated =
+        cartReply.source === 'cart' &&
+        cartReply.mutated === true &&
+        checkoutResult.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING);
       const cartPart =
+        (cartUpdated ? CART_UPDATED_LEAD : null) ??
         (cartReply.source === 'cart' &&
         cartReply.value !== null &&
         !checkoutResult.reply.includes(cartReply.value)
@@ -951,6 +1567,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return checkoutResult.onSent === undefined
         ? { reply }
@@ -974,6 +1591,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return continued.onSent === undefined
         ? { reply }
@@ -981,6 +1599,19 @@ export class MinimalCatalogAgentService {
     }
     if (cartReply.value !== null) {
       const reply = styled(cartReply.value);
+      // S4: a server product/presentation question goes out as a list.
+      const choice = cartConversation?.lastChoice ?? null;
+      const list =
+        choice !== null && choice.question === cartReply.value
+          ? this.choiceInteractive(choice, imageRun.prices, style)
+          : null;
+      // S3: the one product a cart write just added carries its photo.
+      const media =
+        cartReply.source === 'cart' &&
+        cartReply.mutated === true &&
+        imageRun.added.size === 1
+          ? productImage([...imageRun.added][0])
+          : undefined;
       this.recordTurn(
         input.senderId,
         [
@@ -989,8 +1620,17 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
+        {
+          catalogPrices: persistedPrices(),
+          ...(list === null ? {} : { interactiveChoice: list.context }),
+        },
       );
-      return { reply };
+      return {
+        reply,
+        ...(media === undefined ? {} : { media }),
+        ...(list === null ? {} : { interactive: list.interactive }),
+      };
     }
     if (this.hasInvalidCartToolCall(result)) {
       // A cart tool whose arguments failed SDK validation never executed; the
@@ -1009,6 +1649,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return { reply };
     }
@@ -1026,6 +1667,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return { reply };
     }
@@ -1047,6 +1689,9 @@ export class MinimalCatalogAgentService {
         responseMessages = [...responseMessages, ...rendered.responseMessages];
       }
     }
+    // H1: model text goes out (and into history) as WhatsApp text.
+    text = toWhatsAppText(text);
+    responseMessages = responseMessages.map(formatAssistantText);
     if (IMITATED_CONFIRMATION.test(text)) {
       // The model wrote its own delivery or order summary: no gate is armed
       // for it, so run the real step instead of sending the imitation.
@@ -1067,6 +1712,7 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return real.onSent === undefined
         ? { reply }
@@ -1082,17 +1728,29 @@ export class MinimalCatalogAgentService {
         ],
         [...currentIds],
         persistedCartContext(),
+        persistedImages(),
       );
       return { reply };
     }
+    // S3: exactly one product presented by this run's catalog reads (the
+    // only hit, or the only one the text names) carries its photo.
+    const named =
+      imageRun.presented.size === 1
+        ? [...imageRun.presented.keys()]
+        : [...imageRun.presented].flatMap(([productId, name]) =>
+            matchable(text).includes(matchable(name)) ? [productId] : [],
+          );
+    const media = named.length === 1 ? productImage(named[0]) : undefined;
     this.recordTurn(
       input.senderId,
       [{ role: 'user', content: input.text }, ...responseMessages],
       [...currentIds],
       persistedCartContext(),
+      persistedImages(),
     );
     // The prompt styles model text; only the emoji guard applies here.
-    return { reply: limitCustomerEmojis(text, style) };
+    const reply = limitCustomerEmojis(text, style);
+    return media === undefined ? { reply } : { reply, media };
   }
 
   /**
@@ -1189,7 +1847,122 @@ export class MinimalCatalogAgentService {
     const texts = customerTexts(this.sessionStore.read(senderId));
     return detectCustomerStyle(
       currentText === undefined ? texts : [...texts, currentText],
+      this.profileSeed(senderId),
     );
+  }
+
+  /**
+   * S1: loads the stored profile at the start of a session (no in-memory
+   * turns) or when it is not cached yet. Never throws. The dispatcher also
+   * calls it before media/handoff replies so they use the stored style.
+   */
+  async prepareCustomer(senderId: string): Promise<void> {
+    const profiles = this.profiles;
+    if (profiles === undefined) return;
+    if (
+      this.sessionStore.read(senderId).length === 0 ||
+      !profiles.isLoaded(senderId)
+    )
+      await profiles.load(senderId);
+  }
+
+  /** S1: the stored style that seeds this sender's session, if any. */
+  private profileSeed(senderId: string): CustomerStyle | null {
+    const profile = this.profiles?.cached(senderId) ?? null;
+    return profile === null ? null : customerStyleSeed(profile);
+  }
+
+  /** S1: pet-memory guidance and the "Cliente conocido" line, if any. */
+  private memoryInstructions(senderId: string): string {
+    if (this.profiles === undefined) return '';
+    const profile = this.profiles.cached(senderId);
+    const known = [
+      knownCustomerPromptLine(profile),
+      knownPetPromptLine(profile?.pet),
+    ].filter((line): line is string => line !== null);
+    return `\n\n${[PET_MEMORY_INSTRUCTIONS, ...known].join('\n')}`;
+  }
+
+  /** S1: the model tool that remembers facts the customer gave about a pet. */
+  private memoryTools(senderId: string): ToolSet {
+    const profiles = this.profiles;
+    if (profiles === undefined) return {};
+    return {
+      rememberPetDetails: tool({
+        description:
+          'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
+          'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, notas); omita lo demás. Nunca invente ni deduzca.',
+        inputSchema: z.strictObject({
+          name: PET_FACT,
+          species: PET_FACT,
+          breed: PET_FACT,
+          size: PET_FACT,
+          ageText: PET_FACT,
+          notes: PET_FACT,
+        }),
+        execute: async (pet) => {
+          await profiles.record(senderId, { pet });
+          return { ok: true as const, remembered: true as const };
+        },
+      }),
+    };
+  }
+
+  /**
+   * S1: after each customer turn, the latest explicit style, the WhatsApp
+   * profile name and an explicit "llámame X". Emojis follow the session's
+   * latest messages. Defaults alone never create a profile. Never throws.
+   */
+  private async rememberTurn(input: {
+    senderId: string;
+    text: string;
+    interactiveReplyId?: string;
+    profileName?: string;
+  }): Promise<void> {
+    const profiles = this.profiles;
+    if (profiles === undefined) return;
+    const patch: CustomerProfilePatch = {};
+    if (input.profileName !== undefined) patch.displayName = input.profileName;
+    // A tapped button/row carries app text, not the customer's voice.
+    if (input.interactiveReplyId === undefined) {
+      Object.assign(patch, explicitStyleSignal(input.text));
+      const texts = customerTexts(this.sessionStore.read(input.senderId));
+      if (texts.at(-1) !== input.text) texts.push(input.text);
+      const emojis = customerAllowsEmojis(texts);
+      if (emojis || profiles.cached(input.senderId) !== null)
+        patch.emojis = emojis;
+      const name = explicitPreferredName(input.text);
+      if (name !== null) patch.preferredName = name;
+      // Deterministic pet capture, in addition to rememberPetDetails; a
+      // different pet is skipped so two pets are never mixed.
+      const pet = extractPetFacts(input.text);
+      if (
+        Object.keys(pet).length > 0 &&
+        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet)
+      )
+        patch.pet = pet;
+    }
+    await profiles.record(input.senderId, patch);
+  }
+
+  /** S1: "olvida mis datos" — delete the profile and confirm. */
+  private async forgetCustomer(input: {
+    senderId: string;
+    text: string;
+  }): Promise<MinimalCatalogAgentDecision> {
+    const style = this.customerStyle(input.senderId, input.text);
+    await this.profiles!.forget(input.senderId);
+    this.order?.dismiss(input.senderId);
+    const reply = applyCustomerStyle(FORGET_MY_DATA_REPLY, style);
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision({ reply });
   }
 
   /**
@@ -1226,18 +1999,36 @@ export class MinimalCatalogAgentService {
     messages: ModelMessage[],
     verifiedProductIds: string[],
     cartContext?: MinimalCartConversationContext,
+    productImages?: ProductImageContext,
+    interactive: {
+      catalogPrices?: Record<string, number>;
+      interactiveChoice?: InteractiveChoiceContext;
+      reorderOffer?: ReorderOfferContext;
+    } = {},
   ): void {
     const turns = this.sessionStore.read(senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
     // Carry the owned cart context forward unless this turn produced a new one,
     // so a non-cart turn never drops an armed request or the registry snapshot.
     const inherited = cartContext ?? turns.at(-1)?.cartContext;
+    // Same for the product photos: a gate turn never forgets a sent photo.
+    const images = productImages ?? turns.at(-1)?.productImages;
+    // S4: prices carry forward; a list only belongs to the turn that sent it.
+    const prices = interactive.catalogPrices ?? turns.at(-1)?.catalogPrices;
     this.sessionStore.write(senderId, [
       ...prior,
       {
         messages,
         verifiedProductIds,
         ...(inherited === undefined ? {} : { cartContext: inherited }),
+        ...(images === undefined ? {} : { productImages: images }),
+        ...(prices === undefined ? {} : { catalogPrices: prices }),
+        ...(interactive.interactiveChoice === undefined
+          ? {}
+          : { interactiveChoice: interactive.interactiveChoice }),
+        ...(interactive.reorderOffer === undefined
+          ? {}
+          : { reorderOffer: interactive.reorderOffer }),
       },
     ]);
   }
@@ -1338,6 +2129,8 @@ export class MinimalCatalogAgentService {
     cartReply: CartReply,
     cartConversation: MinimalCartConversation | null,
     checkoutRun: CheckoutRun | null = null,
+    imageRun: ProductImageRun | null = null,
+    reorderRun: ReorderRun | null = null,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
@@ -1465,6 +2258,19 @@ export class MinimalCatalogAgentService {
             for (const item of items) {
               allowedIds.add(item.productId);
               currentIds.add(item.productId);
+              imageRun?.presented.set(item.productId, item.name);
+              if (imageRun !== null) recordPrices(imageRun.prices, item);
+              if (
+                imageRun !== null &&
+                isSendableProductImageUrl(item.imageUrl)
+              ) {
+                // Re-insert so the bounded context keeps the most recent.
+                imageRun.known.delete(item.productId);
+                imageRun.known.set(item.productId, {
+                  url: item.imageUrl,
+                  name: item.name,
+                });
+              }
             }
             trace(
               `tool searchCatalog result=ok searchResultCount=${items.length}`,
@@ -1499,6 +2305,8 @@ export class MinimalCatalogAgentService {
             const stock = await chatbotApi.getStock(productId);
             const status = safeStatus(stock.stock.status);
             const quantity = safeQuantity(stock.stock.quantity);
+            if (stock.productId === productId)
+              imageRun?.presented.set(stock.productId, stock.name);
             trace(
               `tool checkStock result=ok parentStockStatus=${status} parentStockQuantity=${quantity}`,
             );
@@ -1622,6 +2430,8 @@ export class MinimalCatalogAgentService {
         cartReply.source = 'cart';
         cartReply.mutated = result.ok && result.items.length > 0;
         mutationAcknowledged = true;
+        if (result.ok && intent.operation === 'add' && magnitude > 0)
+          imageRun?.added.add(identity.productId);
         return result;
       }
       const result = await cart.setItem(
@@ -1638,6 +2448,8 @@ export class MinimalCatalogAgentService {
       cartReply.source = 'cart';
       cartReply.mutated = result.ok && result.items.length > 0;
       mutationAcknowledged = true;
+      if (result.ok && intent.operation === 'set' && (intent.quantity ?? 0) > 0)
+        imageRun?.added.add(identity.productId);
       return result;
     };
     // F10: a cart tool on a message with no cart request at all ("Quiero
@@ -1671,6 +2483,8 @@ export class MinimalCatalogAgentService {
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
       const lines = (await cart?.storedLines(context.senderId)) ?? [];
+      // A pet statement is never a cart write, whatever numbers it carries.
+      if (conversation.isPetStatementOnly()) return misplacedCartCall(lines)!;
       const grounded = conversation.ground(identity, proposal, lines);
       trace(
         `cart_grounding tool=${proposal.operation === 'add' || proposal.operation === 'subtract' ? 'adjustCartItem' : 'setCartItem'} mode=${proposal.operation} result=${grounded.kind} reason=${conversation.rejectionReason ?? 'none'} detail=${conversation.evidenceDetail}`,
@@ -1726,6 +2540,42 @@ export class MinimalCatalogAgentService {
               return result;
             },
           }),
+          ...(reorderRun === null
+            ? {}
+            : {
+                getLastOrder: tool({
+                  description:
+                    'Consulta el último pedido de este cliente (por su número de WhatsApp) y pide a la aplicación presentarlo con existencias y precios de hoy para que el cliente confirme si lo agrega al carrito. No modifica el carrito. No acepta argumentos.',
+                  inputSchema: z.strictObject({}),
+                  strict: true,
+                  execute: async () => {
+                    if (reorderRun.attempted)
+                      return toolError('reorder_presentation_settled');
+                    reorderRun.attempted = true;
+                    try {
+                      reorderRun.value = await prepareMinimalReorder(
+                        chatbotApi,
+                        cart,
+                        context.senderId,
+                        new Date(),
+                      );
+                    } catch {
+                      reorderRun.value = {
+                        reply: REORDER_UNAVAILABLE_REPLY,
+                        offer: null,
+                        productIds: [],
+                      };
+                    }
+                    trace(
+                      `tool getLastOrder result=${reorderRun.value.offer === null ? 'no_offer' : 'offer'} lines=${reorderRun.value.offer?.items.length ?? 0}`,
+                    );
+                    return {
+                      ok: true as const,
+                      presentedByApplication: true as const,
+                    };
+                  },
+                }),
+              }),
           getCart: tool({
             description:
               'Consulta el carrito persistido de este cliente y verifica precios y existencias. No crea pedidos.',
@@ -1921,6 +2771,8 @@ export class MinimalCatalogAgentService {
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
               const lines = (await cart.storedLines(context.senderId)) ?? [];
+              if (conversation.isPetStatementOnly())
+                return misplacedCartCall(lines)!;
               const grounded = conversation.prepare(
                 identity,
                 { operation, quantity, quantityText, continuation },

@@ -3,6 +3,8 @@ import {
   applyCustomerStyle,
   customerStyleDirective,
   detectCustomerStyle,
+  explicitStyleSignal,
+  limitCustomerEmojis,
   type CustomerStyle,
 } from './customer-style';
 
@@ -108,14 +110,56 @@ describe('detectCustomerStyle', () => {
       ['none', ['hola', '¿tienen correas?'], false],
       ['in the latest message', ['hola 😊'], true],
       ['skin-tone and ZWJ sequences', ['va 👍🏽'], true],
-      ['within the last three messages', ['hola 🐶', 'ok', 'la de 2 kg'], true],
       [
-        'older than the last three messages',
-        ['hola 🐶', 'ok', 'la de 2 kg', 'gracias'],
+        'only one of the last three, not the latest',
+        ['hola 🐶', 'ok', 'la de 2 kg'],
+        false,
+      ],
+      [
+        'eval buy-new-customer: one of three, latest bare "ok"',
+        ['a domicilio porfa', 'Sí, por favor 🙏', 'ok'],
+        false,
+      ],
+      [
+        'two of the last three, latest without',
+        ['hola 🐶', 'sí 👍', 'la de 2 kg'],
+        true,
+      ],
+      ['latest only', ['hola', 'ok', 'va 👍'], true],
+      [
+        'two emojis older than the last three messages',
+        ['hola 🐶', 'sí 👍', 'ok', 'la de 2 kg', 'gracias'],
         false,
       ],
     ])('%s', (_name, texts, emojis) => {
       expect(detectCustomerStyle(texts).emojis).toBe(emojis);
+    });
+  });
+
+  describe('limitCustomerEmojis agrees with the detected style', () => {
+    it.each<[string, string[], string, string]>([
+      [
+        'strips a 🐾 when the latest message has none',
+        ['a domicilio porfa', 'Sí, por favor 🙏', 'ok'],
+        '¡Perfecto! Espero tu comprobante. 🐾',
+        '¡Perfecto! Espero tu comprobante.',
+      ],
+      [
+        'keeps model emojis when the latest message has one',
+        ['ok', 'va 👍'],
+        '¡Listo! 🐾',
+        '¡Listo! 🐾',
+      ],
+      [
+        'keeps model emojis when two of the last three have one',
+        ['hola 🐶', 'sí 👍', 'la de 2 kg'],
+        '¡Listo! 🐾',
+        '¡Listo! 🐾',
+      ],
+    ])('%s', (_name, texts, text, expected) => {
+      expect(limitCustomerEmojis(text, detectCustomerStyle(texts))).toBe(
+        expected,
+      );
     });
   });
 
@@ -238,5 +282,50 @@ describe('applyCustomerStyle', () => {
         );
       }
     }
+  });
+});
+
+describe('S1 stored style seed', () => {
+  const seed: CustomerStyle = { register: 'tu', emojis: true, tone: 'casual' };
+
+  it('a fresh session starts with the stored register and tone', () => {
+    expect(detectCustomerStyle(['hola'], seed)).toEqual({
+      register: 'tu',
+      // Emojis always follow this session's own messages (S5).
+      emojis: false,
+      tone: 'casual',
+    });
+  });
+
+  it('the current explicit signal wins over the seed', () => {
+    expect(
+      detectCustomerStyle(['Buenas tardes, ¿usted me puede ayudar?'], seed),
+    ).toMatchObject({ register: 'usted', tone: 'formal' });
+  });
+
+  it('without a seed nothing changes', () => {
+    expect(detectCustomerStyle(['hola'])).toEqual(DEFAULT_CUSTOMER_STYLE);
+  });
+});
+
+describe('explicitStyleSignal', () => {
+  it('reports only explicit register and tone signals', () => {
+    expect(explicitStyleSignal('hola')).toEqual({});
+    expect(explicitStyleSignal('oye, ¿tienes croquetas? jaja')).toEqual({
+      register: 'tu',
+      tone: 'casual',
+    });
+    expect(explicitStyleSignal('Disculpe, ¿usted tiene arena?')).toEqual({
+      register: 'usted',
+      tone: 'formal',
+    });
+  });
+
+  it('ignores the synthetic product-image block', () => {
+    expect(
+      explicitStyleSignal(
+        'esto\n[Imagen enviada por el cliente: tienes usted]',
+      ),
+    ).toEqual({});
   });
 });

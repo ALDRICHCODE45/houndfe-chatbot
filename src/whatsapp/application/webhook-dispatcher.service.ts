@@ -22,6 +22,11 @@ import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../llm-agent/domain/customer-style';
+import {
+  interactiveReplyText,
+  type CustomerReply,
+  type CustomerReplyMedia,
+} from '../../llm-agent/domain/customer-reply';
 import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
 import {
   buildProductImageTurnText,
@@ -83,7 +88,10 @@ import {
  *      customer turn runs through the minimal SDK route (no sender
  *      allowlist, no legacy fallback). `AgentRunner` is used only for the
  *      ops synthetic "resolved" turn in step 3.
- *   6. WhatsappSenderPort.sendText — send the reply.
+ *   6. WhatsappSenderPort.sendText — send the reply (S3: any product photo
+ *      first via the optional sendImage; an image failure only warns). S4:
+ *      a reply with buttons/list goes out through the optional
+ *      sendInteractive; when absent or failing, the same text is sent.
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
  *      successful send, so a failed send lets Meta re-deliver and retry.
  *
@@ -187,6 +195,10 @@ export class WebhookDispatcherService {
           }
           continue;
         }
+
+        // S1: load the stored profile so every reply below (pending
+        // marker, media, the turn) already uses the customer's stored style.
+        await this.prepareCustomer(message.senderId);
 
         // ─── (4) Pending-marker short-circuit (ADR-29 defense-in-depth)
         // The runner has the same gate; this branch keeps the dispatcher
@@ -297,6 +309,22 @@ export class WebhookDispatcherService {
     }
   }
 
+  /** S1: best effort; a profile failure never blocks the message. */
+  private async prepareCustomer(senderId: string): Promise<void> {
+    const agent = this
+      .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
+    if (typeof agent.prepareCustomer !== 'function') return;
+    try {
+      await agent.prepareCustomer(senderId);
+    } catch (error) {
+      this.logger.warn(
+        `customer profile warm-up failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   /** S2: the sender's session style for a fixed media/handoff reply. Never
    * throws; without a readable style the copy stays in usted. */
   private customerStyle(message: InboundMessage): CustomerStyle {
@@ -346,6 +374,12 @@ export class WebhookDispatcherService {
     const minimal = await this.minimalCatalogAgent.tryHandle({
       senderId: message.senderId,
       text,
+      ...(message.interactiveReplyId === undefined
+        ? {}
+        : { interactiveReplyId: message.interactiveReplyId }),
+      ...(message.profileName === undefined
+        ? {}
+        : { profileName: message.profileName }),
       ...(message.receivingPhoneNumberId === undefined
         ? {}
         : {
@@ -356,16 +390,83 @@ export class WebhookDispatcherService {
             },
           }),
     });
-    const { providerMessageId } = await this.whatsappSender.sendText({
-      to: message.senderId,
-      text: minimal.reply,
-    });
+    // S3: the product photo goes first, then the explanation.
+    for (const media of minimal.media ?? []) {
+      await this.sendReplyImage(message.senderId, media);
+    }
+    const providerMessageIds = await this.sendReplyText(
+      message.senderId,
+      minimal,
+    );
     // WU-B: arm the RESTOCK pending ONLY after Meta accepted the
     // question, and BEFORE the observational remember/markSeen writes so
     // an observation failure can never undo the accepted send.
     minimal.onSent?.();
-    this.recentOutbound.remember(providerMessageId);
+    for (const id of providerMessageIds) this.recentOutbound.remember(id);
     await this.markSeenSafely(message.messageId);
+  }
+
+  /**
+   * S4: the reply text, with its buttons/list when the sender supports them.
+   * A missing or failed interactive send falls back to the same plain text
+   * (it already says how to answer), so the reply is never lost.
+   */
+  private async sendReplyText(
+    to: string,
+    reply: CustomerReply,
+  ): Promise<string[]> {
+    const interactive = reply.interactive;
+    if (
+      interactive !== undefined &&
+      this.whatsappSender.sendInteractive !== undefined
+    ) {
+      try {
+        const { prompt, ...controls } = interactive;
+        const sent = await this.whatsappSender.sendInteractive({
+          to,
+          body: reply.reply,
+          interactive: controls,
+          ...(prompt === undefined ? {} : { shortBody: prompt }),
+        });
+        return sent.providerMessageIds.length > 0
+          ? sent.providerMessageIds
+          : [sent.providerMessageId];
+      } catch (error) {
+        this.logger.warn(
+          `interactive reply failed for ${to}; sending the text only: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    const { providerMessageId } = await this.whatsappSender.sendText({
+      to,
+      text: reply.reply,
+    });
+    return [providerMessageId];
+  }
+
+  /** S3: best effort. A failed or unsupported image never blocks the text
+   * reply (e.g. Meta refuses a >5 MB or non-JPEG/PNG image). */
+  private async sendReplyImage(
+    to: string,
+    media: CustomerReplyMedia,
+  ): Promise<void> {
+    if (this.whatsappSender.sendImage === undefined) return;
+    try {
+      const { providerMessageId } = await this.whatsappSender.sendImage({
+        to,
+        link: media.url,
+        ...(media.caption === undefined ? {} : { caption: media.caption }),
+      });
+      this.recentOutbound.remember(providerMessageId);
+    } catch (error) {
+      this.logger.warn(
+        `reply image failed for ${to}; sending the text only: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   private async replyAndMarkSeen(
@@ -457,6 +558,15 @@ export function normalizeInboundMessages(
     (item.changes ?? []).flatMap((change) => {
       const value = change.value;
       const fallbackSenderId = value?.contacts?.[0]?.wa_id;
+      // S1: the contact profile name of each sender (non-blank strings only).
+      const profileNameOf = (senderId: string): { profileName?: string } => {
+        const name = value?.contacts?.find(
+          (contact) => contact.wa_id === senderId,
+        )?.profile?.name;
+        return typeof name === 'string' && name.trim() !== ''
+          ? { profileName: name }
+          : {};
+      };
       const receivingPhoneNumberId =
         typeof value?.metadata?.phone_number_id === 'string'
           ? value.metadata.phone_number_id
@@ -480,6 +590,37 @@ export function normalizeInboundMessages(
               messageId: message.id,
               timestamp: normalizeTimestamp(message.timestamp),
               receivingPhoneNumberId,
+              ...profileNameOf(senderId),
+            },
+          ];
+        }
+
+        // ── S4: tapped reply button / list row, legacy template button ─
+        if (
+          (message.type === 'interactive' || message.type === 'button') &&
+          typeof message.id === 'string' &&
+          typeof message.timestamp === 'string'
+        ) {
+          const reply = normalizeInteractiveReply(message);
+          const senderId = message.from ?? fallbackSenderId;
+          if (
+            reply === null ||
+            typeof senderId !== 'string' ||
+            senderId.length === 0
+          ) {
+            return [];
+          }
+          return [
+            {
+              senderId,
+              text: reply.text,
+              messageId: message.id,
+              timestamp: normalizeTimestamp(message.timestamp),
+              receivingPhoneNumberId,
+              ...profileNameOf(senderId),
+              ...(reply.id === undefined
+                ? {}
+                : { interactiveReplyId: reply.id }),
             },
           ];
         }
@@ -511,6 +652,7 @@ export function normalizeInboundMessages(
               messageId: message.id,
               timestamp: normalizeTimestamp(message.timestamp),
               receivingPhoneNumberId,
+              ...profileNameOf(senderId),
               media,
             },
           ];
@@ -520,6 +662,31 @@ export function normalizeInboundMessages(
       });
     }),
   );
+}
+
+/**
+ * S4: a tapped `button_reply`/`list_reply` becomes the text its id stands
+ * for (see `interactiveReplyText`) plus the id; a legacy quick-reply
+ * template `button` is just its text. `null` for anything unusable.
+ */
+function normalizeInteractiveReply(
+  message: WebhookMessageDto,
+): { text: string; id?: string } | null {
+  if (message.type === 'button') {
+    const text = message.button?.text;
+    return typeof text === 'string' && text.trim() !== '' ? { text } : null;
+  }
+  const interactive = message.interactive;
+  const reply =
+    interactive?.type === 'button_reply'
+      ? interactive.button_reply
+      : interactive?.type === 'list_reply'
+        ? interactive.list_reply
+        : undefined;
+  const id = reply?.id;
+  if (typeof id !== 'string' || id === '') return null;
+  const text = interactiveReplyText(id, reply?.title);
+  return text.trim() === '' ? null : { text, id };
 }
 
 function normalizeTimestamp(timestamp: string): string {

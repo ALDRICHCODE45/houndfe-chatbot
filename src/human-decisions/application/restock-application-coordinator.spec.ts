@@ -1195,3 +1195,52 @@ describe('expired-only reconciliation, never a Meta send (mocked ports only)', (
     expect(p.closeAcknowledged).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('restock notice in the stored customer style (S1)', () => {
+  const USTED =
+    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!';
+
+  it('a tú profile with emojis gets the tú text, emoji kept', async () => {
+    const h = setup();
+    const customerStyle = jest
+      .fn()
+      .mockResolvedValue({ register: 'tu', emojis: true, tone: 'casual' });
+    Object.assign(h.ports, { customerStyle });
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(customerStyle).toHaveBeenCalledWith(SENDER);
+    // Read before the claim: nothing async between the final check and send.
+    expect(customerStyle.mock.invocationCallOrder[0]).toBeLessThan(
+      h.ports.claimPending.mock.invocationCallOrder[0],
+    );
+    expect(h.ports.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde esa confirmación. La fecha podría variar. ¡Que estés muy bien!',
+    });
+  });
+
+  it('a profile without emojis drops the emoji', async () => {
+    const h = setup();
+    Object.assign(h.ports, {
+      customerStyle: jest.fn().mockResolvedValue({
+        register: 'usted',
+        emojis: false,
+        tone: 'formal',
+      }),
+    });
+    await h.run();
+    expect(h.ports.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: USTED.replace(' 😊', ''),
+    });
+  });
+
+  it.each([
+    ['missing profile', () => Promise.resolve(null)],
+    ['failed read', () => Promise.reject(new Error('down'))],
+  ])('%s sends the usted text unchanged', async (_label, read) => {
+    const h = setup();
+    Object.assign(h.ports, { customerStyle: jest.fn(read) });
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.ports.sendText).toHaveBeenCalledWith({ to: SENDER, text: USTED });
+  });
+});

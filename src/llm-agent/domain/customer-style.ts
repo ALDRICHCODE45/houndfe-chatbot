@@ -24,8 +24,12 @@ export const DEFAULT_CUSTOMER_STYLE: CustomerStyle = Object.freeze({
   tone: 'neutral',
 });
 
-/** Emojis are read from the last 1-3 customer messages. */
+/**
+ * Emojis are allowed only when the customer's latest message has one, or at
+ * least 2 of their last 3 do; a single emoji further back is not a style.
+ */
 const EMOJI_WINDOW = 3;
+const EMOJI_WINDOW_MIN = 2;
 const TONE_WINDOW = 3;
 
 const EMOJI = /\p{Extended_Pictographic}/u;
@@ -71,6 +75,11 @@ const CASUAL_MARKERS = [
 /** The product-photo synthetic block is app text, not the customer's voice. */
 const SYNTHETIC_IMAGE_BLOCK = /\n?\[Imagen enviada por el cliente:[\s\S]*$/;
 
+/** The customer's own words of a turn (the synthetic image block removed). */
+export function customerOwnText(text: string): string {
+  return text.replace(SYNTHETIC_IMAGE_BLOCK, '');
+}
+
 function normalize(text: string): string {
   return text
     .replace(SYNTHETIC_IMAGE_BLOCK, '')
@@ -96,18 +105,34 @@ function toneSignal(raw: string, text: string): CustomerTone {
   return 'neutral';
 }
 
-/** Style of the customer's own messages, oldest first. */
+/** The emoji rule over the customer's own messages, oldest first. */
+export function customerAllowsEmojis(userTexts: readonly string[]): boolean {
+  const recent = userTexts
+    .slice(-EMOJI_WINDOW)
+    .map((raw) => EMOJI.test(raw.replace(SYNTHETIC_IMAGE_BLOCK, '')));
+  return (
+    recent.at(-1) === true || recent.filter(Boolean).length >= EMOJI_WINDOW_MIN
+  );
+}
+
+/**
+ * Style of the customer's own messages, oldest first. S1: `seed` is the
+ * stored profile style; it fills the register and tone until this session
+ * shows an explicit signal. Emojis always follow this session's messages.
+ */
 export function detectCustomerStyle(
   userTexts: readonly string[],
+  seed?: CustomerStyle | null,
 ): CustomerStyle {
   const texts = userTexts.map((raw) => ({
     raw: raw.replace(SYNTHETIC_IMAGE_BLOCK, ''),
     text: normalize(raw),
   }));
-  let register: CustomerRegister = DEFAULT_CUSTOMER_STYLE.register;
+  let register: CustomerRegister =
+    seed?.register ?? DEFAULT_CUSTOMER_STYLE.register;
   for (const { text } of texts) register = registerSignal(text) ?? register;
-  const emojis = texts.slice(-EMOJI_WINDOW).some(({ raw }) => EMOJI.test(raw));
-  let tone: CustomerTone = DEFAULT_CUSTOMER_STYLE.tone;
+  const emojis = customerAllowsEmojis(texts.map(({ raw }) => raw));
+  let tone: CustomerTone = seed?.tone ?? DEFAULT_CUSTOMER_STYLE.tone;
   for (const { raw, text } of texts.slice(-TONE_WINDOW).reverse()) {
     const signal = toneSignal(raw, text);
     if (signal !== 'neutral') {
@@ -116,6 +141,20 @@ export function detectCustomerStyle(
     }
   }
   return { register, emojis, tone };
+}
+
+/** S1: the explicit register/tone signals of one message (none → {}). */
+export function explicitStyleSignal(
+  text: string,
+): Partial<Pick<CustomerStyle, 'register' | 'tone'>> {
+  const raw = text.replace(SYNTHETIC_IMAGE_BLOCK, '');
+  const normalized = normalize(raw);
+  const register = registerSignal(normalized);
+  const tone = toneSignal(raw, normalized);
+  return {
+    ...(register === null ? {} : { register }),
+    ...(tone === 'neutral' ? {} : { tone }),
+  };
 }
 
 const TONE_REPLY: Record<CustomerTone, string> = {
@@ -143,6 +182,50 @@ export function customerStyleDirective(style: CustomerStyle): string {
  */
 const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   // Whole clauses whose verbs depend on context.
+  // S4 interactive prompts and the change-button reply.
+  ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
+  ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
+  ['¿Qué desea hacer?', '¿Qué quieres hacer?'],
+  // S2 reorder offer, its buttons and replies.
+  ['Su último pedido', 'Tu último pedido'],
+  ['Sí, agréguelo', 'Sí, agrégalo'],
+  [
+    '¿Desea agregar algo más o seguimos con su compra?',
+    '¿Quieres agregar algo más o seguimos con tu compra?',
+  ],
+  ['¿Qué producto busca?', '¿Qué producto buscas?'],
+  // S1 "olvida mis datos" confirmation.
+  ['tenía guardados de usted', 'tenía guardados de ti'],
+  ['Sus pedidos', 'Tus pedidos'],
+  // S1 later notices: receipt outcomes, zone resolved, restock, expiration.
+  [
+    '¿Desea continuar con la compra o prefiere que le ayude con alguna otra consulta?',
+    '¿Quieres continuar con la compra o prefieres que te ayude con alguna otra consulta?',
+  ],
+  [
+    'Si quería enviarnos su comprobante, mándelo de nuevo; si no, dígame en qué le ayudo.',
+    'Si querías enviarnos tu comprobante, mándalo de nuevo; si no, dime en qué te ayudo.',
+  ],
+  ['Escríbanos y le ayudamos.', 'Escríbenos y te ayudamos.'],
+  [
+    'si cree que es un error, escríbanos.',
+    'si crees que es un error, escríbenos.',
+  ],
+  ['Por favor envíelo de nuevo', 'Por favor envíalo de nuevo'],
+  ['Su PDF está protegido', 'Tu PDF está protegido'],
+  ['¿Nos envía una captura', '¿Nos envías una captura'],
+  ['Confirmamos su pago', 'Confirmamos tu pago'],
+  ['Gracias por su compra', 'Gracias por tu compra'],
+  // Third-person verbs that read as usted markers in the tú copy.
+  ['en cuanto se confirme.', 'en cuanto quede confirmado.'],
+  ['contados desde su confirmación', 'contados desde esa confirmación'],
+  ['puede enviarnos el comprobante', 'puedes enviarnos el comprobante'],
+  ['Puede enviarnos el comprobante', 'Puedes enviarnos el comprobante'],
+  ['cuando lo tenga.', 'cuando lo tengas.'],
+  ['¡Que esté muy bien!', '¡Que estés muy bien!'],
+  ['La fecha puede variar.', 'La fecha podría variar.'],
+  ['Disculpe, no pude consultar', 'Disculpa, no pude consultar'],
+  ['Elija una opción', 'Elige una opción'],
   [
     'Si vuelve a pedir el resumen y responde SÍ',
     'Si vuelves a pedir el resumen y respondes SÍ',
@@ -301,6 +384,17 @@ function limitEmojis(text: string, keep: number): string {
 export function applyCustomerStyle(text: string, style: CustomerStyle): string {
   const registered = style.register === 'tu' ? toTu(text) : text;
   return limitEmojis(registered, style.emojis ? 1 : 0);
+}
+
+/**
+ * S4: register only (usted/tú), emojis untouched. For interactive button
+ * titles, whose emoji is part of the control, not decoration.
+ */
+export function applyCustomerRegister(
+  text: string,
+  style: CustomerStyle,
+): string {
+  return style.register === 'tu' ? toTu(text) : text;
 }
 
 /** Emoji guard only, for model-authored text the prompt already styled. */

@@ -311,6 +311,96 @@ export class MinimalCartService {
     }
   }
 
+  /** Quote lines with today's stock and prices, without writing the cart. */
+  async preview(
+    senderId: string,
+    lines: Array<Pick<CartItem, 'productId' | 'variantId' | 'quantity'>>,
+  ): Promise<MinimalCartResult> {
+    try {
+      return await this.quote(
+        senderId,
+        lines.map((line) => ({ ...line, unitPriceCents: 0 })),
+      );
+    } catch {
+      return { ok: false, error: 'cart_unavailable' };
+    }
+  }
+
+  /**
+   * S2 reorder: add server-owned lines (the customer's own last order) in one
+   * CAS, each quantity on top of the line already in the cart; all or
+   * nothing, never retried. No `allowedIds`: the lines never come from the
+   * model.
+   */
+  async addItems(
+    senderId: string,
+    lines: Array<Pick<CartItem, 'productId' | 'variantId' | 'quantity'>>,
+  ): Promise<MinimalCartResult> {
+    try {
+      if (
+        lines.length === 0 ||
+        lines.some(
+          (line) =>
+            !minimalCartAdjustmentInput.safeParse({
+              productId: line.productId,
+              ...(line.variantId ? { variantId: line.variantId } : {}),
+              delta: line.quantity,
+            }).success || line.quantity < 1,
+        )
+      )
+        return { ok: false, error: 'invalid_quantity_or_identity' };
+      const raw = structuredClone(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      const cart = this.read(raw);
+      if (!cart) return { ok: false, error: 'invalid_cart' };
+      if (cart.idempotencyKey !== '')
+        return { ok: false, error: 'order_unresolved' };
+      const items: CartItem[] = cart.items.map((item) => ({ ...item }));
+      for (const line of lines) {
+        const identity = {
+          productId: line.productId,
+          ...(line.variantId ? { variantId: line.variantId } : {}),
+        };
+        const existing = items.find((item) => sameLine(item, identity));
+        if (existing) existing.quantity += line.quantity;
+        else
+          items.push({
+            ...identity,
+            quantity: line.quantity,
+            unitPriceCents: 0,
+          });
+      }
+      if (items.some((item) => !Number.isSafeInteger(item.quantity)))
+        return { ok: false, error: 'invalid_quantity_or_identity' };
+      const quote = await this.quote(senderId, items);
+      if (!quote.ok) return quote;
+      const next: CartState = {
+        items: quote.items.map(
+          ({ productId, variantId, quantity, unitPriceCents }) => ({
+            productId,
+            ...(variantId ? { variantId } : {}),
+            quantity,
+            unitPriceCents,
+          }),
+        ),
+        idempotencyKey: '',
+        expectedTotalCents: quote.totalCents,
+      };
+      if (!this.store.commitMinimalCart)
+        return { ok: false, error: 'cart_unavailable' };
+      const saved = await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+      return saved ? quote : { ok: false, error: 'cart_changed' };
+    } catch {
+      return { ok: false, error: 'cart_unavailable' };
+    }
+  }
+
   private async changeItem(
     senderId: string,
     input: MinimalCartInput | MinimalCartAdjustmentInput,

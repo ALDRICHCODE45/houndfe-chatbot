@@ -76,6 +76,7 @@ import type {
 import {
   CancelSaleInputSchema,
   CreateSaleInputSchema,
+  parseOrderHistoryResponse,
 } from '../domain/dtos/sales.dto';
 import {
   normalizeExpirationIntake,
@@ -225,7 +226,7 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   /** Unknown-key names already warned about, so each is logged only once. */
   private readonly loggedUnknownKeys = new Set<string>();
 
-  /** Shared by the three tolerant reads: an unexpected status or a body that
+  /** Shared by the tolerant reads: an unexpected status or a body that
    *  breaks the contract is an UpstreamError; unknown keys were stripped and
    *  are warned once per name, never with values. */
   private acceptTolerantRead<T>(
@@ -597,8 +598,21 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
     });
   }
 
-  getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]> {
-    return this.request<OrderHistoryResponse[]>(
+  /** The backend defaults a missing country code to `''` (§4.4.9), so a blank
+   *  one is refused locally; the body is a tolerant read like the catalog. */
+  async getOrderHistory(
+    phone: string,
+    cc: string,
+  ): Promise<OrderHistoryResponse[]> {
+    if (typeof cc !== 'string' || cc.trim() === '') {
+      throw new ChatbotApiError(
+        'Chatbot API order history requires a phoneCountryCode',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>(
       {
         method: 'GET',
         url: `/chatbot-api/customers/by-phone/${encodeURIComponent(phone)}/orders`,
@@ -607,6 +621,12 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
         },
       },
       { retryable: true },
+    );
+    return this.acceptTolerantRead(
+      'order history',
+      response,
+      [200],
+      parseOrderHistoryResponse(response.data),
     );
   }
 

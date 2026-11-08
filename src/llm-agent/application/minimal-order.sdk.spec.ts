@@ -10,6 +10,8 @@ import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
+import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
+import { InMemoryCustomerProfileStore } from '../../customer-profile/infrastructure/in-memory-customer-profile.store';
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 import {
@@ -179,6 +181,11 @@ function setup(
     new FakeShippingQuoteClient(),
     { register: async () => undefined },
   );
+  const profileStore = new InMemoryCustomerProfileStore();
+  const profiles = new CustomerProfileService(
+    profileStore,
+    () => new Date('2026-11-07T12:00:00.000Z'),
+  );
   const order = new MinimalOrderService(
     client,
     store,
@@ -186,6 +193,8 @@ function setup(
     checkout,
     config,
     shipping,
+    undefined,
+    profiles,
   );
   const agent = new MinimalCatalogAgentService(
     client,
@@ -204,6 +213,7 @@ function setup(
     store,
     seen,
     checkout,
+    profileStore,
     seedCart: () =>
       store.create(SENDER, {
         lastMessageAt: new Date().toISOString(),
@@ -688,6 +698,28 @@ describe('minimal order placement through the SDK route', () => {
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect((placed as { reply: string }).reply).toContain('folio B-0042');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
+  });
+
+  it('S1: a placed order stores the last-order pointer and the checkout first name', async () => {
+    const h = setup();
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say('x')],
+      EVENT('wamid.p1'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    await expect(h.profileStore.read(SENDER)).resolves.toBeNull();
+    await h.turn('SÍ', [say('x')], EVENT('wamid.p2'));
+    await expect(h.profileStore.read(SENDER)).resolves.toMatchObject({
+      preferredName: 'Ana',
+      lastOrder: {
+        folio: 'B-0042',
+        // The sale carried no confirmedAt: the placement time is used.
+        confirmedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) as unknown,
+        totalCents: 3000,
+      },
+    });
   });
 
   it('lets a mixed answer reach the model without creating a sale', async () => {

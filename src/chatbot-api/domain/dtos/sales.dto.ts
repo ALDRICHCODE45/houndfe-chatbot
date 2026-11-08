@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseTolerantRead, type TolerantRead } from './tolerant-read';
 
 /**
  * Zod schema for `CancelSaleInput` (chatbot-api
@@ -162,4 +163,53 @@ export interface OrderHistoryResponse {
     street: string | null;
     zipCode: string | null;
   } | null;
+}
+
+/* ---- Runtime parser (tolerant read: unknown keys stripped, see tolerant-read.ts) ---- */
+
+const historyCents = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+
+const orderHistorySchema = z.array(
+  z.object({
+    saleId: z.string().min(1),
+    folio: z.string().nullable(),
+    confirmedAt: z.string().nullable(),
+    channel: z.string(),
+    deliveryStatus: z.string(),
+    paymentStatus: z.string().nullable(),
+    totalCents: historyCents,
+    paidCents: historyCents,
+    debtCents: historyCents,
+    items: z.array(
+      z.object({
+        productId: z.string().min(1),
+        variantId: z.string().min(1).nullable(),
+        productName: z.string(),
+        variantName: z.string().nullable(),
+        quantity: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+        unitPriceCents: historyCents,
+      }),
+    ),
+    payments: z.array(
+      z.object({
+        method: z.string(),
+        amountCents: historyCents,
+        reference: z.string().nullable(),
+      }),
+    ),
+    shippingAddress: z
+      .object({
+        street: z.string().nullable(),
+        zipCode: z.string().nullable(),
+      })
+      .nullable(),
+  }),
+);
+
+/** `GET /chatbot-api/customers/by-phone/:phone/orders`; null on contract breaks.
+ *  Names and unit prices are historical: never a price for a new sale. */
+export function parseOrderHistoryResponse(
+  body: unknown,
+): TolerantRead<OrderHistoryResponse[]> | null {
+  return parseTolerantRead(orderHistorySchema, body);
 }

@@ -35,6 +35,48 @@ export class WebhookMessageMediaDto {
   sha256?: string;
 }
 
+/** S4 tapped reply button / list row (`interactive.button_reply|list_reply`). */
+export class WebhookInteractiveReplyDto {
+  @IsOptional()
+  @IsString()
+  id?: string;
+
+  @IsOptional()
+  @IsString()
+  title?: string;
+
+  @IsOptional()
+  @IsString()
+  description?: string;
+}
+
+export class WebhookInteractiveDto {
+  @IsOptional()
+  @IsString()
+  type?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookInteractiveReplyDto)
+  button_reply?: WebhookInteractiveReplyDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookInteractiveReplyDto)
+  list_reply?: WebhookInteractiveReplyDto;
+}
+
+/** Legacy quick-reply template button (`type: 'button'`). */
+export class WebhookButtonDto {
+  @IsOptional()
+  @IsString()
+  text?: string;
+
+  @IsOptional()
+  @IsString()
+  payload?: string;
+}
+
 export class WebhookMessageDto {
   @IsOptional()
   @IsString()
@@ -66,12 +108,34 @@ export class WebhookMessageDto {
   @ValidateNested()
   @Type(() => WebhookMessageMediaDto)
   document?: WebhookMessageMediaDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookInteractiveDto)
+  interactive?: WebhookInteractiveDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookButtonDto)
+  button?: WebhookButtonDto;
+}
+
+/** S1: the contact's WhatsApp profile (only the display name is kept). */
+export class WebhookContactProfileDto {
+  @IsOptional()
+  @IsString()
+  name?: string;
 }
 
 export class WebhookContactDto {
   @IsOptional()
   @IsString()
   wa_id?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookContactProfileDto)
+  profile?: WebhookContactProfileDto;
 }
 
 /**

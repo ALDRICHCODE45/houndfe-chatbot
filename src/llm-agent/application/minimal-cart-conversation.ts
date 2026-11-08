@@ -33,9 +33,11 @@ import {
   distinctiveMatches,
   mentionsPhrase,
   nameCoverage,
+  requestsCartAction,
   requestsCartChange,
   statedUnitCount,
 } from '../domain/minimal-cart-request';
+import { extractPetFacts } from '../../customer-profile/domain/pet-facts';
 import {
   groundCartQuantity,
   type MinimalCartQuantityIntent,
@@ -143,6 +145,17 @@ export type CartGrounding =
   | { kind: 'invalid_evidence' }
   | { kind: 'target_required'; question: string };
 
+/**
+ * S4: the options of the last server product/presentation question this run
+ * built (its exact text in `question`), so the reply can carry them as a
+ * WhatsApp list. Options are verified registry entries only.
+ */
+export type CartChoice = {
+  kind: 'variant' | 'product';
+  question: string;
+  options: ResolvedCartSelection[];
+};
+
 type Target =
   | { kind: 'ok'; selection: ResolvedCartSelection }
   | { kind: 'ask'; question: string };
@@ -186,7 +199,9 @@ export function cartPresentationQuestion(labels: readonly string[]): string {
 }
 
 /** Display label of a presentation: its name without the product prefix. */
-function presentationLabel(selection: MinimalCartSelectionIdentity): string {
+export function presentationLabel(
+  selection: MinimalCartSelectionIdentity,
+): string {
   const name = selection.variantName;
   if (name === undefined) return '';
   return name.startsWith(selection.productName)
@@ -202,6 +217,12 @@ function presentationLabel(selection: MinimalCartSelectionIdentity): string {
 export class MinimalCartConversation {
   private rejection: CartQuantityRejectionReason | null = null;
   private detail: CartQuantityEvidenceDetail = 'none';
+  private choice: CartChoice | null = null;
+
+  /** S4: the last product/presentation question built in this run. */
+  get lastChoice(): CartChoice | null {
+    return this.choice;
+  }
 
   /** Closed private subcode; no literal evidence or count values. */
   get evidenceDetail(): CartQuantityEvidenceDetail {
@@ -308,11 +329,27 @@ export class MinimalCartConversation {
 
   /** Presentation question for a product, listing its verified options. */
   presentationQuestion(productId: string): string {
-    return cartPresentationQuestion(
-      this.variantsOf(productId)
-        .map(presentationLabel)
-        .filter((label) => label.length > 0),
-    );
+    const options = this.variantsOf(productId)
+      .filter((variant) => presentationLabel(variant).length > 0)
+      .slice(0, MAX_OPTIONS);
+    const question = cartPresentationQuestion(options.map(presentationLabel));
+    this.choice = { kind: 'variant', question, options };
+    return question;
+  }
+
+  /** Product question for shown products, recorded as the S4 choice. */
+  private productQuestion(shown: ReadonlyArray<[string, string]>): string {
+    const question = cartProductQuestion(shown.map(([, name]) => name));
+    const entries = this.selections.snapshot().selections;
+    const options = shown.slice(0, MAX_OPTIONS).flatMap(([id]) => {
+      const entry = entries.find(
+        (candidate) =>
+          candidate.productId === id && candidate.variantId === undefined,
+      );
+      return entry === undefined ? [] : [entry];
+    });
+    this.choice = { kind: 'product', question, options };
+    return question;
   }
 
   private groundStrict(
@@ -444,7 +481,7 @@ export class MinimalCartConversation {
         // Several shown: only the one the customer's own words single out.
         const picked = this.customerPick(mentioned);
         if (picked !== productId)
-          return askProduct(mentioned.map(([, name]) => name));
+          return { kind: 'ask', question: this.productQuestion(mentioned) };
         inFocus = true;
       } else if (this.pending?.productId === productId) inFocus = true;
       else if (mentioned.length === 1) inFocus = mentioned[0][0] === productId;
@@ -545,6 +582,7 @@ export class MinimalCartConversation {
    * rejected cart request but a misplaced call.
    */
   hasCartRequest(): boolean {
+    if (this.isPetStatementOnly()) return false;
     if (requestsCartChange(this.text, this.dialogue.previousAssistantText))
       return true;
     const selections = this.selections.snapshot().selections;
@@ -566,14 +604,24 @@ export class MinimalCartConversation {
   }
 
   /**
+   * True for a statement about the customer's pet ("mi perrita Luna es una
+   * labrador de 3 años") that asks for no cart action in words: its numbers
+   * and "una" describe the pet, so a cart tool on it is a misplaced call.
+   */
+  isPetStatementOnly(): boolean {
+    return (
+      Object.keys(extractPetFacts(this.text)).length > 0 &&
+      !requestsCartAction(this.text, this.dialogue.previousAssistantText)
+    );
+  }
+
+  /**
    * The product question to repeat while several products the bot just
    * listed are still open, or `null` when fewer than two are shown.
    */
   openProductQuestion(): string | null {
     const shown = this.shownProducts();
-    return shown.length >= 2
-      ? cartProductQuestion(shown.map(([, name]) => name))
-      : null;
+    return shown.length >= 2 ? this.productQuestion(shown) : null;
   }
 
   /**

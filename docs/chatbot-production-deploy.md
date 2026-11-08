@@ -12,7 +12,17 @@ Checklist for deploying `houndfe-chatbot` `main` to its VPS against the already-
 ## 2. Push and deploy
 
 1. `git push origin main` from this repo.
-2. Deploy `main` on the chatbot VPS. Chatbot migrations (3200–3600) run automatically at startup.
+2. Deploy `main` on the chatbot VPS. Chatbot migrations (3200–3700) run automatically at startup.
+
+### Customer memory table (migration 3700)
+
+`3700000000000_customer_profiles` creates `customer_profiles`. It is additive and has no backfill. There is one row per WhatsApp sender (`sender_id` = wa_id digits), holding:
+
+- how to address the customer: WhatsApp profile name, the name they asked to be called (or their checkout first name), usted/tú, emojis, tone;
+- pet facts the customer gave, as JSONB;
+- a pointer to their last order: folio, date and total. The order itself stays in the backend.
+
+Writes are merge-only, so a known value is never erased by a later turn. The bot reads the stored style for later notices (receipt outcome, resolved zone, restock and expiration answers); with no row, or if the read fails, those notices go out in usted. A customer who writes "olvida mis datos" or "borra mis datos" has their row deleted. The bot does not write it again until the next restart; after a restart, new messages start a new profile. The down migration refuses to drop a non-empty table.
 
 ## 3. Environment variables on the chatbot VPS
 
