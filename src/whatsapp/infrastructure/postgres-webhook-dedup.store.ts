@@ -5,6 +5,7 @@ import { PG_POOL } from '../../database/postgres-pool.provider';
 import {
   WEBHOOK_CLAIM_LEASE_MS,
   WEBHOOK_DEDUP_CLOCK,
+  WebhookClaimInFlightError,
   type WebhookDedupStore,
 } from '../domain/webhook-dedup.store';
 
@@ -22,6 +23,9 @@ ON CONFLICT (message_id) DO UPDATE
        seen_at = EXCLUDED.seen_at
  WHERE p.status = 'PROCESSING' AND p.lease_expires_at <= EXCLUDED.claimed_at
 RETURNING p.claim_token`;
+
+const STATUS = `
+SELECT status FROM processed_webhook_messages WHERE message_id = $1`;
 
 const MARK_DONE = `
 INSERT INTO processed_webhook_messages AS p (message_id, status, seen_at)
@@ -75,7 +79,14 @@ export class PostgresWebhookDedupStore implements WebhookDedupStore {
       now.toISOString(),
       new Date(now.getTime() + WEBHOOK_CLAIM_LEASE_MS).toISOString(),
     ]);
-    return rows[0]?.claim_token ?? null;
+    if (rows[0] !== undefined) return rows[0].claim_token;
+    // No row back: DONE (a duplicate) or a live claim. Anything but DONE,
+    // including a row released or purged since, is retried by Meta.
+    const status = await this.pool.query<{ status: string }>(STATUS, [
+      messageId,
+    ]);
+    if (status.rows[0]?.status === 'DONE') return null;
+    throw new WebhookClaimInFlightError(messageId);
   }
 
   async markSeen(messageId: string): Promise<void> {

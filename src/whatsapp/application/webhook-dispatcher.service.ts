@@ -62,8 +62,9 @@ import {
  *
  *   1. RECENT_OUTBOUND — skip echoes of the bot's own outbound.
  *   2. WEBHOOK_DEDUP   — S6: claim the message (PROCESSING + lease) before
- *      processing; a DONE message or a live claim is a duplicate. A failure
- *      releases the claim so Meta's redelivery is processed again.
+ *      processing; a DONE message is a duplicate. A live claim held by another
+ *      delivery throws (no 200: Meta retries). A failure releases the claim
+ *      so Meta's redelivery is processed again.
  *   3. **Ops pre-routing hook** (new, human-handoff slice) —
  *      when `message.senderId` matches the configured OPS_CHANNEL_PHONE
  *      (exact by default; both sides apply the same trunk-1 rewrite only
@@ -180,8 +181,10 @@ export class WebhookDispatcherService {
       await this.recordInbound(message, rawTypes.get(message.messageId));
 
       // ─── (2) Dedup claim (S6) ───────────────────────────────────────
-      // Atomic: of two concurrent deliveries only one gets a token. A claim
-      // failure propagates before any processing, so Meta redelivers.
+      // Atomic: of two concurrent deliveries only one gets a token; null
+      // means DONE. A claim failure, or a live claim held by another
+      // delivery (WebhookClaimInFlightError), propagates before any
+      // processing with nothing to release, so Meta redelivers.
       const claimToken = await this.dedup.claim(message.messageId);
       if (claimToken === null) {
         this.logger.log(

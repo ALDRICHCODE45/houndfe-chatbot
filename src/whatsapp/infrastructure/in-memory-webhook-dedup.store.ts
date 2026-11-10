@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   WEBHOOK_CLAIM_LEASE_MS,
+  WebhookClaimInFlightError,
   type WebhookDedupStore,
 } from '../domain/webhook-dedup.store';
 
@@ -29,11 +30,9 @@ export class InMemoryWebhookDedupStore implements WebhookDedupStore {
   claim(messageId: string): Promise<string | null> {
     const now = this.now().getTime();
     const row = this.rows.get(messageId);
-    if (
-      row !== undefined &&
-      (row.status === 'DONE' || row.leaseExpiresAt > now)
-    ) {
-      return Promise.resolve(null);
+    if (row?.status === 'DONE') return Promise.resolve(null);
+    if (row !== undefined && row.leaseExpiresAt > now) {
+      return Promise.reject(new WebhookClaimInFlightError(messageId));
     }
     const claimToken = randomUUID();
     this.rows.set(messageId, {

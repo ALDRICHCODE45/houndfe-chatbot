@@ -10,7 +10,9 @@
  * Semantics (S6, at-least-once with a claim lease; see docs/webhook-dedup.md):
  *   - `claim()` runs BEFORE processing. It atomically records the message as
  *     PROCESSING with a lease; only one of two concurrent deliveries wins.
- *     A DONE message, or a live claim, is a duplicate.
+ *     A DONE message is a duplicate (acknowledged). A live claim throws
+ *     `WebhookClaimInFlightError` so the delivery is NOT acknowledged and
+ *     Meta keeps retrying until the row is DONE or the lease expires.
  *   - `markSeen()` runs AFTER the message was handled (reply sent, mirrored
  *     in HUMAN mode, receipt admitted): the row becomes DONE.
  *   - `release()` runs when handling failed before anything was sent, so
@@ -37,11 +39,21 @@ export const WEBHOOK_CLAIM_LEASE_MS = 10 * 60_000;
 /** Meta retries a delivery for up to 7 days; keep one day of margin. */
 export const WEBHOOK_DEDUP_RETENTION_MS = 8 * 24 * 60 * 60_000;
 
+/** Another delivery holds a live claim; the webhook must not answer 200. */
+export class WebhookClaimInFlightError extends Error {
+  constructor(messageId: string) {
+    super(
+      `webhook message ${messageId} is being processed by another delivery; retry later`,
+    );
+    this.name = 'WebhookClaimInFlightError';
+  }
+}
+
 export interface WebhookDedupStore {
   /**
    * Claims a message for processing. Returns the claim token, or `null`
-   * when the message is a duplicate (DONE, or claimed with a live lease).
-   * An expired claim is taken over.
+   * only when the message is DONE. Throws `WebhookClaimInFlightError` while
+   * another delivery holds a live claim. An expired claim is taken over.
    */
   claim(messageId: string): Promise<string | null>;
 

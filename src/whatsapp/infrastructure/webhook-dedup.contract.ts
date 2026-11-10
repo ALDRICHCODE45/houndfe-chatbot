@@ -1,5 +1,6 @@
 import {
   WEBHOOK_CLAIM_LEASE_MS,
+  WebhookClaimInFlightError,
   type WebhookDedupStore,
 } from '../domain/webhook-dedup.store';
 
@@ -44,17 +45,29 @@ export function runWebhookDedupContract(
       );
     });
 
-    it('reports a live claim as a duplicate', async () => {
+    const inFlight = (messageId: string) =>
+      expect(store.claim(messageId)).rejects.toBeInstanceOf(
+        WebhookClaimInFlightError,
+      );
+
+    it('rejects a live claim as in flight (never a DONE duplicate)', async () => {
       await store.claim('wamid.live');
       advance(WEBHOOK_CLAIM_LEASE_MS - 1000);
-      await expect(store.claim('wamid.live')).resolves.toBeNull();
+      await inFlight('wamid.live');
     });
 
     it('lets exactly one of several concurrent claims win', async () => {
-      const tokens = await Promise.all(
+      const results = await Promise.allSettled(
         Array.from({ length: 8 }, () => store.claim('wamid.race')),
       );
-      expect(tokens.filter((token) => token !== null)).toHaveLength(1);
+      const won = results.filter((r) => r.status === 'fulfilled');
+      expect(won).toHaveLength(1);
+      expect(typeof (won[0] as PromiseFulfilledResult<unknown>).value).toBe(
+        'string',
+      );
+      for (const result of results.filter((r) => r.status === 'rejected')) {
+        expect(result.reason).toBeInstanceOf(WebhookClaimInFlightError);
+      }
     });
 
     it('lets a redelivery take over an expired claim', async () => {
@@ -63,7 +76,7 @@ export function runWebhookDedupContract(
       const second = await store.claim('wamid.crashed');
       expect(second).toEqual(expect.any(String));
       expect(second).not.toBe(first);
-      await expect(store.claim('wamid.crashed')).resolves.toBeNull();
+      await inFlight('wamid.crashed');
     });
 
     it('treats a DONE message as a duplicate forever (until purged)', async () => {
@@ -98,7 +111,7 @@ export function runWebhookDedupContract(
       advance(WEBHOOK_CLAIM_LEASE_MS);
       await store.claim('wamid.slow');
       await store.release('wamid.slow', stale as string);
-      await expect(store.claim('wamid.slow')).resolves.toBeNull();
+      await inFlight('wamid.slow');
     });
 
     it('release never reopens a DONE message', async () => {
@@ -133,7 +146,7 @@ export function runWebhookDedupContract(
         expect.any(String),
       );
       await expect(store.claim('wamid.new-done')).resolves.toBeNull();
-      await expect(store.claim('wamid.new-claim')).resolves.toBeNull();
+      await inFlight('wamid.new-claim');
     });
 
     it('never purges a claim whose lease is still live', async () => {
@@ -141,7 +154,7 @@ export function runWebhookDedupContract(
       await expect(
         store.purgeBefore(new Date(nowMs + 1000), 100),
       ).resolves.toBe(0);
-      await expect(store.claim('wamid.in-flight')).resolves.toBeNull();
+      await inFlight('wamid.in-flight');
     });
 
     it('purges in bounded batches', async () => {

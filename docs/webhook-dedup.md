@@ -10,7 +10,8 @@ once, without losing a message when the process crashes.
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------- |
 | Echo of our own send                                                 | skipped, no row                                                         | —                                                              |
 | Inbound arrives                                                      | `claim(id)`: `INSERT … ON CONFLICT` takes the id                        | `PROCESSING`, `claim_token`, `lease_expires_at = now + 10 min` |
-| Second delivery while the claim is live                              | `claim` returns `null`: duplicate, skipped                              | unchanged                                                      |
+| Second delivery while the claim is live                              | `claim` throws `WebhookClaimInFlightError`: not acknowledged (500)      | unchanged; Meta retries until `DONE` or the lease expires      |
+| Delivery of a `DONE` message                                         | `claim` returns `null`: duplicate, skipped (200)                        | unchanged                                                      |
 | Handled (reply sent, HUMAN-mode mirror, receipt admitted, ops reply) | `markSeen(id)`                                                          | `DONE`                                                         |
 | Error before anything was sent                                       | `release(id, token)` deletes the claim, then the error propagates (500) | gone, the redelivery processes it                              |
 | Process crashes mid-turn                                             | nothing                                                                 | claim expires; the next redelivery takes it over               |
@@ -18,7 +19,8 @@ once, without losing a message when the process crashes.
 - Only one of several concurrent claims wins (row lock + re-checked `WHERE`).
 - `release` only deletes the caller's own `PROCESSING` claim, never a `DONE`
   row or a claim another delivery took over.
-- A failed claim write propagates before any processing (Meta redelivers).
+- A failed claim write, or a live claim, propagates before any processing
+  with nothing to release or mark (Meta redelivers). Only `DONE` gets a 200.
   A failed `markSeen` or `release` only warns.
 - Statuses never create rows. `DONE` stays a duplicate until it is purged.
 - The receipt admission still writes its marker in its own transaction

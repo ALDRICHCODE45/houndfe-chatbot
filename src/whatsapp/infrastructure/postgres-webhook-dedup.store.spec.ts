@@ -5,7 +5,10 @@ import {
   PostgreSqlContainer,
   type StartedPostgreSqlContainer,
 } from '@testcontainers/postgresql';
-import { WEBHOOK_CLAIM_LEASE_MS } from '../domain/webhook-dedup.store';
+import {
+  WEBHOOK_CLAIM_LEASE_MS,
+  WebhookClaimInFlightError,
+} from '../domain/webhook-dedup.store';
 import { PostgresWebhookDedupStore } from './postgres-webhook-dedup.store';
 import { runWebhookDedupContract } from './webhook-dedup.contract';
 
@@ -174,14 +177,17 @@ ddescribe('PostgresWebhookDedupStore + migration 4100 (Testcontainers)', () => {
     it('lets one of two processes win a concurrent claim', async () => {
       const other = new Pool({ connectionString: uri });
       try {
-        const tokens = await Promise.all(
+        const results = await Promise.allSettled(
           Array.from({ length: 6 }, (_, i) =>
             new PostgresWebhookDedupStore(i % 2 === 0 ? pool : other).claim(
               'wamid.two-processes',
             ),
           ),
         );
-        expect(tokens.filter((token) => token !== null)).toHaveLength(1);
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+        for (const result of results.filter((r) => r.status === 'rejected')) {
+          expect(result.reason).toBeInstanceOf(WebhookClaimInFlightError);
+        }
       } finally {
         await other.end();
       }
@@ -193,14 +199,17 @@ ddescribe('PostgresWebhookDedupStore + migration 4100 (Testcontainers)', () => {
       await new PostgresWebhookDedupStore(pool, () => t0).claim(
         'wamid.takeover',
       );
-      const tokens = await Promise.all(
+      const results = await Promise.allSettled(
         Array.from({ length: 6 }, () =>
           new PostgresWebhookDedupStore(pool, () => later).claim(
             'wamid.takeover',
           ),
         ),
       );
-      expect(tokens.filter((token) => token !== null)).toHaveLength(1);
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      for (const result of results.filter((r) => r.status === 'rejected')) {
+        expect(result.reason).toBeInstanceOf(WebhookClaimInFlightError);
+      }
     });
 
     it('completes a claim the receipt admission marker could not insert over', async () => {

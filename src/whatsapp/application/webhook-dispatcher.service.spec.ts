@@ -8,7 +8,10 @@ import { type ConversationStore } from '../../conversation/domain/conversation-s
 import { type LlmAgentPort } from '../../llm-agent/domain/llm-agent.port';
 import { type ToolRegistry } from '../../llm-agent/domain/tool-registry.port';
 import { SendResult, WhatsappSenderPort } from '../domain/whatsapp-sender.port';
-import type { WebhookDedupStore } from '../domain/webhook-dedup.store';
+import {
+  WebhookClaimInFlightError,
+  type WebhookDedupStore,
+} from '../domain/webhook-dedup.store';
 import type { RecentOutboundStore } from '../domain/recent-outbound.store';
 import { WebhookEventDto } from '../presentation/dto/webhook-event.dto';
 import {
@@ -476,6 +479,21 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     ).rejects.toThrow('db down');
     expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
     expect(sender.sendText).not.toHaveBeenCalled();
+    expect(dedup.release).not.toHaveBeenCalled();
+  });
+
+  it('a live claim held by another delivery is not acknowledged (Meta retries)', async () => {
+    dedup.claim.mockRejectedValueOnce(
+      new WebhookClaimInFlightError('wamid.busy'),
+    );
+
+    await expect(
+      service.dispatch(textEvent('wamid.busy', 'hola')),
+    ).rejects.toBeInstanceOf(WebhookClaimInFlightError);
+
+    expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+    expect(sender.sendText).not.toHaveBeenCalled();
+    expect(dedup.markSeen).not.toHaveBeenCalled();
     expect(dedup.release).not.toHaveBeenCalled();
   });
 
