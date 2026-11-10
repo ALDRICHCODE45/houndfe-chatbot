@@ -15,16 +15,16 @@ Product design: `docs/intervencion-humana-diseno.md`. Chatbot contract excerpt: 
 
 ## Tasks
 
-| ID  | Specs | Route                                                 | Commit |
-| --- | ----- | ----------------------------------------------------- | ------ |
-| T1  | S1    | worker: durable transcript                            | —      |
-| T2  | S2    | worker: backend outbox + drain worker behind a port   | —      |
-| T3  | S3    | worker: statuses normalizer into outbox               | —      |
-| T4  | S7    | worker: handoff mode with CAS + dispatcher gate       | —      |
-| T5  | S5    | worker: replace one-active-reservation index          | —      |
-| T6  | S6    | worker: processed_webhook_messages purge and ordering | —      |
-| T7  | S4    | worker: durable conversation gates                    | —      |
-| T8  | all   | full suite + verify                                   | —      |
+| ID  | Specs | Route                                                 | Commit  |
+| --- | ----- | ----------------------------------------------------- | ------- |
+| T1  | S1    | worker: durable transcript                            | —       |
+| T2  | S2    | worker: backend outbox + drain worker behind a port   | 7025ded |
+| T3  | S3    | worker: statuses normalizer into outbox               | —       |
+| T4  | S7    | worker: handoff mode with CAS + dispatcher gate       | —       |
+| T5  | S5    | worker: replace one-active-reservation index          | —       |
+| T6  | S6    | worker: processed_webhook_messages purge and ordering | —       |
+| T7  | S4    | worker: durable conversation gates                    | —       |
+| T8  | all   | full suite + verify                                   | —       |
 
 ## Log
 

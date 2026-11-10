@@ -121,6 +121,17 @@ Response `201` (created) or `200` (identical replay or merged):
 - With several open requests, the bot decides which to cancel; `cancel-batch` only checks they share a `customerKey`.
 - The bot sends a stable `dedupKey` (e.g. `RESTOCK:variant:<id>`, `UNKNOWN_QUESTION:<normalized hash>`). An open request with the same key answers `200 outcome: MERGED` with `mergedIntoId`. The backend never guesses sameness from free text.
 
+## Staff cancellation (contract v1.1, §12)
+
+Staff can cancel a clarification, or a `TALK_TO_HUMAN`/`COMPLAINT` while its session is still WAITING. Reasons: `DUPLICATE | NOT_ACTIONABLE | CUSTOMER_UNREACHABLE | OTHER`. Each cancellation produces the feed item `request.cancelled {requestId, reason, cancelledBy: STAFF}`, ACKed like any other delivery. Bot behavior, agreed 2026-11-10:
+
+- Always clear local pending state for that request.
+- `DUPLICATE`: send nothing, ACK `STALE`.
+- Other reasons: a short fixed notice composed by the bot in the customer's style, ACK `PROVIDER_ACCEPTED`.
+- Window closed: send nothing, ACK `STALE` (never `DEFERRED_WINDOW_CLOSED`).
+- Optional `customerNote` (at most 500 chars, accepted in backend §12.14): when present and the window is open, the bot sends it verbatim with the team-reply prefix instead of the generic notice. Feed item: `request.cancelled {requestId, reason, cancelledBy: STAFF, customerNote?}`.
+- The server rejects staff cancellation of a `TALK_TO_HUMAN`/`COMPLAINT` whose session is STARTING, ACTIVE or ENDING with `409 CANCEL_NOT_ALLOWED`, checked under the request row lock.
+
 ## Live conversation (§4), chatbot obligations
 
 - **Every order carries an epoch** (`handoffEpoch`, incremented each time the conversation goes to a human). The bot ignores orders from an older epoch.
