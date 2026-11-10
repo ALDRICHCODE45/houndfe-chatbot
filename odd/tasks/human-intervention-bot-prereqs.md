@@ -22,8 +22,8 @@ Product design: `docs/intervencion-humana-diseno.md`. Chatbot contract excerpt: 
 | T3  | S3    | worker: statuses normalizer into outbox               | b615d10 |
 | T4  | S7    | worker: handoff mode with CAS + dispatcher gate       | 741b6b7 |
 | T5  | S5    | worker: replace one-active-reservation index          | a7a75da |
-| T6  | S6    | worker: processed_webhook_messages purge and ordering | —       |
-| T7  | S4    | worker: durable conversation gates                    | —       |
+| T6  | S6    | worker: processed_webhook_messages purge and ordering | e2acd7c |
+| T7  | S4    | worker: durable conversation gates                    | 9d33f36 |
 | T8  | all   | full suite + verify                                   | —       |
 
 ## Log
