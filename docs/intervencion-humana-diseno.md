@@ -172,6 +172,11 @@ Cada sesión trabaja en su repositorio, en paralelo. El contrato entre chatbot y
 - Replicar la conversación en el backend.
 - Al final, retirar `OPS_CHANNEL_PHONE` y el canal de WhatsApp de operaciones.
 
+### Propuestas de cada repositorio
+
+- Backend: `houndfe-backend/docs/proposals/human-intervention-backend-proposal.md` (rama `docs/human-intervention-proposal`).
+- Frontend: `frontend-houndfe/docs/redesign/human-intervention-frontend-proposal.md`.
+
 ### Orden sugerido
 
 1. Contrato chatbot ↔ backend y modelo común de solicitud.
@@ -180,3 +185,60 @@ Cada sesión trabaja en su repositorio, en paralelo. El contrato entre chatbot y
 4. Quejas.
 5. Descuentos (segunda etapa).
 6. Retiro del canal de WhatsApp de operaciones.
+7. Agenda de conversaciones fuera de horario (al final, cuando la cola, las respuestas y la conversación en vivo estén probadas).
+
+## 7. Decisiones del dueño posteriores a las propuestas (2026-11-09)
+
+Estas decisiones salieron después de leer las propuestas del backend y del frontend. Donde contradicen algo de las secciones anteriores, mandan estas.
+
+**Tomadas directamente con la sesión del backend:**
+
+- **Horario por sucursal,** con una acción "aplicar a todas" para quien tenga el permiso. Cada sucursal es un tenant aparte, así que no existe un horario global. Esto reemplaza al "horario genérico" de la sección 4.
+- **El bot se calla solo cuando una persona toma la conversación,** no cuando el cliente pide hablar con alguien.
+- **Fuera de horario, "quiero hablar con una persona" se agenda.** El bot da el horario y ofrece programar la atención, y la conversación queda agendada en el sistema (propuesta del backend, §4.9).
+- **A los 12 meses se borra solo la conversación** (mensajes y medios). Las solicitudes y la auditoría se conservan.
+
+**Correos:**
+
+- **Sin nombre ni teléfono del cliente:** solo tipo, sucursal y folio. El correo trae un **link que abre directo la solicitud** en el sistema, sin buscarla.
+- **Los avisos de "solicitud nueva" se juntan en un correo cada 2 minutos.** Las conversaciones en vivo son la excepción: su correo sale solo e inmediato.
+
+**Agenda:**
+
+- **Bloques de 30 minutos.** Se ofrecen 3 horarios: la próxima apertura y 2 más.
+- **Tope de 3 conversaciones por bloque y sucursal,** configurable desde el sistema.
+- **Primero se ofrecen los horarios dentro de la ventana gratis de 24 h.** Si no hay ninguno, se acepta igual con plantilla pagada.
+- **Feriados:** se cargan como días cerrados en la configuración y se pueden cambiar en cualquier momento. Todavía no hay fechas fijas.
+
+**Personal:**
+
+- **Ver el teléfono completo requiere un permiso aparte.** Sin él se ve parcial (`55 **** 5678`).
+- **El personal puede mandar fotos o PDF** en la conversación.
+- **Los audios del cliente se guardan** para escucharlos en la bandeja: tope de 10 MB, se borran a los 12 meses con la conversación. Si llega un audio y no hay una persona atendiendo, el bot le pide al cliente que lo escriba.
+- **El sonido viene activado por defecto** y cada persona lo puede apagar.
+
+**Reglas:**
+
+- **Aprobar una zona resuelve a la vez las solicitudes de todos los clientes** que preguntaron por ese código postal.
+- **Un comprobante que llega cerca del cierre o en día cerrado vence al cierre del siguiente día hábil.**
+- **Las solicitudes resueltas quedan 7 días en la bandeja** y después pasan a un historial aparte.
+- **La plantilla pagada la manda la persona que atiende, con un botón.** El sistema no la manda solo. El texto se redacta y lo aprueba Meta; depende del número real, porque las plantillas se aprueban por cuenta de WhatsApp.
+- **La clasificación de quejas** (devolución, reposición, reembolso, sin acción) **solo se registra.**
+- **Se retira la cola de validación de zonas de "Sistema"** cuando la bandeja común esté lista.
+
+## 8. Segunda versión — no perder
+
+Todo lo que quedó "para después". Pidió el dueño que quede anotado porque se va a retomar.
+
+| Tema | Qué quedó pendiente | Origen |
+|---|---|---|
+| Descuentos | Solicitud de descuento con aprobar, rechazar o contraoferta. Está en el diseño, pero se construye en una segunda etapa. | Bloque 1 |
+| Pago parcial | Política por cliente para pagar una parte y el resto al recibir (idea: basada en `isTrusted`, con porcentaje y tope de deuda). | Bloque 1 |
+| Cancelar o cambiar un pedido | El cliente cancela o modifica un pedido ya creado. | Bloque 1 |
+| Estado o retraso de un pedido | Hoy no hay una fuente confiable de seguimiento. | Bloque 1 |
+| Mayoreo | Pedidos grandes con precio especial o stock de varias sucursales. Probablemente no se integre. | Bloque 1 |
+| Quejas que disparan acciones | Que "reembolso" o "reposición" generen una tarea, un aviso o un movimiento, en vez de solo registrarse. | Pregunta 16 |
+| Respuestas rápidas | Frases guardadas para responder aclaraciones repetidas. | Pregunta 10 |
+| Transcripción de audios | El bot transcribe los audios con IA y sigue la conversación, en vez de pedir que los escriban. Medir antes cuántos audios llegan. | Pregunta 9 |
+| Conversaciones iniciadas por el personal | Que el personal le escriba a un cliente por su cuenta (requiere plantillas pagadas fuera de las 24 h). | Bloque 5 |
+| Tablero de métricas | Tiempos de respuesta, volumen por tipo y cuántas vencieron. Los datos se guardan desde el primer día. | Bloque 5 |
