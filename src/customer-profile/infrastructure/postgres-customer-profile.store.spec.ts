@@ -174,7 +174,13 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
   });
 
   it('rolls back an empty table and re-applies', async () => {
-    migrate('down');
+    // Roll back 3700 and everything applied after it, so later migrations
+    // never make this test roll back the wrong file.
+    const applied = await pool.query<{ n: string }>(
+      `SELECT count(*) AS n FROM pgmigrations
+        WHERE name >= '3700000000000_customer_profiles'`,
+    );
+    migrate('down', applied.rows[0].n);
     const gone = await pool.query(
       "SELECT to_regclass('customer_profiles') AS t",
     );
