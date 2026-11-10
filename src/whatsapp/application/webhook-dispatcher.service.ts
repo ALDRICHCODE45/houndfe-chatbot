@@ -37,6 +37,7 @@ import {
   RECEIPT_IMAGE_WITHOUT_ORDER_REPLY,
   type ProductImageRecognition,
 } from '../../product-image/domain/product-image';
+import { TranscriptRecorder } from '../../conversation-transcript/application/transcript-recorder';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
@@ -122,10 +123,16 @@ export class WebhookDispatcherService {
     // compiling; without it a product photo gets the product-name request.
     @Optional()
     private readonly productImage?: ProductImageRecognitionService,
+    // S1 durable transcript. Optional so hand-built harnesses keep compiling.
+    // Explicit token: a `Pick<>` type would emit `Object` as DI metadata.
+    @Optional()
+    @Inject(TranscriptRecorder)
+    private readonly transcript?: Pick<TranscriptRecorder, 'recordInbound'>,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
     const messages = normalizeInboundMessages(event);
+    const rawTypes = rawMessageTypes(event);
 
     for (const message of messages) {
       // ─── (1) Echo filter ────────────────────────────────────────────
@@ -135,6 +142,11 @@ export class WebhookDispatcherService {
         );
         continue;
       }
+
+      // ─── (1b) S1 durable transcript ────────────────────────────────
+      // Before dedup: append is idempotent on the wamid, so a re-delivery
+      // after a crash still lands in the transcript. Never blocks the reply.
+      await this.recordInbound(message, rawTypes.get(message.messageId));
 
       // ─── (2) Dedup ──────────────────────────────────────────────────
       if (await this.dedup.isDuplicate(message.messageId)) {
@@ -277,6 +289,24 @@ export class WebhookDispatcherService {
         );
         throw error;
       }
+    }
+  }
+
+  /** S1: customer inbounds only (never the ops phone); never throws. */
+  private async recordInbound(
+    message: InboundMessage,
+    rawType: string | undefined,
+  ): Promise<void> {
+    if (this.transcript === undefined) return;
+    try {
+      if (this.humanHandoff.isOpsSender(message.senderId)) return;
+      await this.transcript.recordInbound(message, rawType);
+    } catch (error) {
+      this.logger.warn(
+        `transcript record failed for ${message.messageId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 
@@ -662,6 +692,17 @@ export function normalizeInboundMessages(
       });
     }),
   );
+}
+
+/** S1: Meta's `message.type` per inbound wamid, for the transcript. */
+function rawMessageTypes(event: WebhookEventDto): Map<string, string> {
+  const types = new Map<string, string>();
+  for (const item of event.entry ?? [])
+    for (const change of item.changes ?? [])
+      for (const message of change.value?.messages ?? [])
+        if (typeof message.id === 'string' && typeof message.type === 'string')
+          types.set(message.id, message.type);
+  return types;
 }
 
 /**

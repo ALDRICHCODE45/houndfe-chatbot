@@ -1,6 +1,7 @@
 import { HttpModule } from '@nestjs/axios';
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ConversationTranscriptModule } from '../conversation-transcript/conversation-transcript.module';
 import { MetaWhatsappSender } from './infrastructure/meta-whatsapp.sender';
 import { WHATSAPP_SENDER } from './domain/whatsapp-sender.port';
 
@@ -23,7 +24,8 @@ import { WHATSAPP_SENDER } from './domain/whatsapp-sender.port';
  *                             and the sender; re-exports WHATSAPP_SENDER)
  */
 @Module({
-  imports: [ConfigModule, HttpModule],
+  // ConversationTranscriptModule: every accepted send is recorded (S1).
+  imports: [ConfigModule, HttpModule, ConversationTranscriptModule],
   providers: [
     MetaWhatsappSender,
     { provide: WHATSAPP_SENDER, useExisting: MetaWhatsappSender },

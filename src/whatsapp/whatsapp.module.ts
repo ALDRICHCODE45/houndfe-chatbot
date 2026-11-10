@@ -8,6 +8,7 @@ import type { HumanHandoffService } from '../human-handoff/application/human-han
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
 import { RestockInboundCapture } from './application/restock-inbound-capture';
 import { ConversationModule } from '../conversation/conversation.module';
+import { ConversationTranscriptModule } from '../conversation-transcript/conversation-transcript.module';
 import { DatabaseModule } from '../database/database.module';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
@@ -46,6 +47,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
 @Module({
   imports: [
     ConversationModule,
+    ConversationTranscriptModule,
     LlmAgentModule,
     DatabaseModule,
     HumanHandoffModule,
