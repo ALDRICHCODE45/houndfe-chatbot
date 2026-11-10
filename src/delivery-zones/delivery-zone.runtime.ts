@@ -17,6 +17,7 @@ import {
 } from '../conversation/domain/conversation-store';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
+import { HandoffModeService } from '../conversation/application/handoff-mode.service';
 import { PostgresCustomerInboundObservationStore } from '../human-decisions/infrastructure/postgres-customer-inbound-observation.store';
 import {
   WHATSAPP_SENDER,
@@ -63,6 +64,9 @@ export class DeliveryZoneRuntime
     private readonly conversations: ConversationStore,
     @Inject(DELIVERY_ZONE_POLLER_OPTIONS)
     private readonly options: DeliveryZonePollerOptions,
+    // S7: proactive notices hold while the conversation is HUMAN. Required:
+    // a missing provider fails the boot instead of losing the hold.
+    private readonly handoff: HandoffModeService,
     // S1: the resolved-zone text in the customer's stored style.
     @Optional() private readonly profiles?: CustomerProfileService,
   ) {}
@@ -89,6 +93,7 @@ export class DeliveryZoneRuntime
           clearPendingZoneQuote(this.conversations, senderId),
         customerStyle: (senderId) =>
           this.profiles?.styleFor(senderId) ?? Promise.resolve(null),
+        isHumanMode: (senderId: string) => this.handoff.isHumanMode(senderId),
       },
       phone,
     );

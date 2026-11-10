@@ -79,6 +79,18 @@ const drainMicrotasks = async (): Promise<void> => {
   for (let i = 0; i < 50; i++) await Promise.resolve();
 };
 
+/** CONVERSATION_STORE stub: no state, and the S7 handoff mode read by the
+ * notification drain right before each send (BOT unless stated). */
+const conversationStore = (mode: 'BOT' | 'HUMAN' = 'BOT') => ({
+  get: jest.fn().mockResolvedValue(null),
+  getHandoff: jest.fn().mockResolvedValue({
+    mode,
+    epoch: 1,
+    requestId: mode === 'HUMAN' ? 'request-1' : null,
+    updatedAt: null,
+  }),
+});
+
 /** Waits (microtask hops only, bounded) until a condition holds. */
 const untilMicrotask = async (condition: () => boolean): Promise<void> => {
   for (let i = 0; i < 300 && !condition(); i++) await Promise.resolve();
@@ -225,6 +237,7 @@ const buildModule = (
   env: Record<string, string>,
   pool: unknown,
   sendText?: ReturnType<typeof jest.fn>,
+  mode: 'BOT' | 'HUMAN' = 'BOT',
 ): {
   builder: ReturnType<typeof Test.createTestingModule>;
 } => {
@@ -238,7 +251,7 @@ const buildModule = (
     .overrideProvider(PG_POOL)
     .useValue(pool)
     .overrideProvider(CONVERSATION_STORE)
-    .useValue({ get: jest.fn().mockResolvedValue(null) })
+    .useValue(conversationStore(mode))
     .overrideProvider(CHATBOT_API_CLIENT)
     .useValue(backendClient());
   if (sendText)
@@ -308,7 +321,7 @@ const withModule = async (
     .overrideProvider(PG_POOL)
     .useValue(pool)
     .overrideProvider(CONVERSATION_STORE)
-    .useValue({ get: jest.fn().mockResolvedValue(null) })
+    .useValue(conversationStore())
     .overrideProvider(CHATBOT_API_CLIENT)
     .useValue(backendClient());
   const moduleRef = await builder.compile();
@@ -420,7 +433,7 @@ const buildIngestionModule = (
     .overrideProvider(PG_POOL)
     .useValue(pool)
     .overrideProvider(CONVERSATION_STORE)
-    .useValue({ get: jest.fn().mockResolvedValue(null) })
+    .useValue(conversationStore())
     .overrideProvider(CHATBOT_API_CLIENT)
     .useValue(backendClient())
     .overrideProvider(WHATSAPP_SENDER)
@@ -588,7 +601,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(PG_POOL)
         .useValue(makeOutboxPool().pool)
         .overrideProvider(CONVERSATION_STORE)
-        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .useValue(conversationStore())
         .overrideProvider(CHATBOT_API_CLIENT)
         .useValue({ uploadReceipt })
         .overrideProvider(PostgresReceiptMediaStore)
@@ -706,7 +719,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(PG_POOL)
         .useValue(pool)
         .overrideProvider(CONVERSATION_STORE)
-        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .useValue(conversationStore())
         .overrideProvider(CHATBOT_API_CLIENT)
         .useValue(backendClient());
       const moduleRef = await builder.compile();
@@ -961,6 +974,41 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       }
     });
 
+    it('S7: holds a claimed intent in HUMAN mode with no send, no mark and no reschedule', async () => {
+      const outbox = makeOutboxPool([[outboxRow()]]);
+      const sendText = jest.fn(() =>
+        Promise.resolve({ providerMessageId: 'wamid.NEVER' }),
+      );
+      const { builder } = buildModule(
+        RECEIPT_ENABLED_ENV,
+        outbox.pool,
+        sendText,
+        'HUMAN',
+      );
+      const moduleRef = await builder.compile();
+      try {
+        await moduleRef.init();
+        await untilMicrotask(() => outbox.claims.length >= 2);
+        await drainMicrotasks();
+        // The row was claimed, then left SENDING: its lease expires and a
+        // later claim replays it with `attempts` unchanged.
+        expect(outbox.claims.length).toBeGreaterThanOrEqual(1);
+        expect(sendText).not.toHaveBeenCalled();
+        expect(outbox.marks).toEqual([]);
+        expect(outbox.reschedules).toEqual([]);
+        // The hold comes before the 24 h window read.
+        expect(outbox.pool.query).not.toHaveBeenCalled();
+        const store =
+          moduleRef.get<ReturnType<typeof conversationStore>>(
+            CONVERSATION_STORE,
+          );
+        expect(store.getHandoff).toHaveBeenCalledWith('+525500000000');
+      } finally {
+        await moduleRef.close().catch(() => undefined);
+        await drainMicrotasks();
+      }
+    });
+
     it('uses validated options and one stable owner across claims of one coordinator', async () => {
       const outbox = makeOutboxPool();
       const sendText = jest.fn(() =>
@@ -1150,7 +1198,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(PG_POOL)
         .useValue(outbox.pool)
         .overrideProvider(CONVERSATION_STORE)
-        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .useValue(conversationStore())
         .overrideProvider(CHATBOT_API_CLIENT)
         .useValue(backendClient())
         .overrideProvider(WHATSAPP_SENDER)
@@ -1329,7 +1377,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         .overrideProvider(PG_POOL)
         .useValue(pool.pool)
         .overrideProvider(CONVERSATION_STORE)
-        .useValue({ get: jest.fn().mockResolvedValue(null) })
+        .useValue(conversationStore())
         .overrideProvider(CHATBOT_API_CLIENT)
         .useValue(backendClient())
         .overrideProvider(WHATSAPP_SENDER)

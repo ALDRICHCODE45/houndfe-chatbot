@@ -11,6 +11,7 @@ import {
   type ChatbotApiClient,
 } from '../chatbot-api/domain/chatbot-api.client';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
+import { ConversationModule } from '../conversation/conversation.module';
 import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
@@ -53,8 +54,9 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
  *     already accepted request; it reads the recorded context and polls the
  *     current decision and can never POST, reserve or release.
  *
- * Imports `DatabaseModule` for `PG_POOL` and `ChatbotApiModule` for
- * `CHATBOT_API_CLIENT`; the acyclic sender leaf supplies outbound delivery.
+ * Imports `DatabaseModule` for `PG_POOL`, `ChatbotApiModule` for
+ * `CHATBOT_API_CLIENT` and `ConversationModule` for `HandoffModeService`
+ * (S7 send holds); the acyclic sender leaf supplies outbound delivery.
  * Strict route flags gate the private runtimes. RESTOCK uses receipt hints;
  * EXPIRATION sweeps recorded inquiries for preparation only (no send/ACK).
  * Shared reservation guards remain available independently of that flag.
@@ -65,6 +67,8 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
     ConfigModule,
     DatabaseModule,
     ChatbotApiModule,
+    // S7: `HandoffModeService` holds the proactive notices in HUMAN mode.
+    ConversationModule,
     WhatsappSenderModule,
   ],
   providers: [

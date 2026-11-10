@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
+import { HandoffModeService } from '../conversation/application/handoff-mode.service';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -46,6 +47,9 @@ export class RestockApplicationRuntime
     @Inject(PG_POOL) private readonly pool: Pool,
     @Inject(CHATBOT_API_CLIENT) private readonly client: ChatbotApiClient,
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsappSenderPort,
+    // S7: proactive notices hold while the conversation is HUMAN. Required:
+    // a missing provider fails the boot instead of losing the hold.
+    private readonly handoff: HandoffModeService,
     // S1: the customer notice in the recipient's stored style.
     @Optional() private readonly profiles?: CustomerProfileService,
   ) {}
@@ -102,6 +106,7 @@ export class RestockApplicationRuntime
         sendText: this.sender.sendText.bind(this.sender),
         customerStyle: (senderId: string) =>
           this.profiles?.styleFor(senderId) ?? Promise.resolve(null),
+        isHumanMode: (senderId: string) => this.handoff.isHumanMode(senderId),
       },
       branch,
       phone,

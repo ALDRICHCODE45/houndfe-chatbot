@@ -92,18 +92,32 @@ send. A HUMAN mode holds the send, and so does an unreadable mode (fail
 closed). A held send is deferred through the flow's own retry; it is never
 marked delivered or failed, and never ACKed to the backend.
 
-| Flow                                               | Hold result                                                                                                                                              |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| EXPIRATION notice (`ExpirationDeliveryService`)    | `hold` before `claimPending`; the ledger row stays PENDING and a later sweep retries it. Expiry goes through the stale path, which never sends.          |
-| RESTOCK notice (`RestockApplicationCoordinator`)   | `pending` before `preparePending`; the in-process poller re-queues it (bounded by its 24 h watch). An expired candidate goes on, because it never sends. |
-| DELIVERY_ZONE notice (`DeliveryZoneNotifier`)      | The row stays RESOLVED, with `last_polled_at` touched so it moves behind other due rows; the next tick retries it.                                       |
-| Receipt notices (`ReceiptMediaNotificationWorker`) | Not wired yet (see below).                                                                                                                               |
+| Flow                                               | Hold result and retry                                                                                                                                                                                                                                |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EXPIRATION notice (`ExpirationDeliveryService`)    | `hold` before `claimPending`; the ledger row stays PENDING and a later sweep retries it. Expiry goes through the stale path, which never sends.                                                                                                      |
+| RESTOCK notice (`RestockApplicationCoordinator`)   | `pending` before `preparePending`; the in-process poller re-queues it (bounded by its 24 h watch). An expired candidate goes on, because it never sends.                                                                                             |
+| DELIVERY_ZONE notice (`DeliveryZoneNotifier`)      | The row stays RESOLVED, with `last_polled_at` touched so it moves behind other due rows; the next tick retries it.                                                                                                                                   |
+| Receipt notices (`ReceiptMediaNotificationWorker`) | Checked after the lease check, before the 24 h window gate and the send. The worker returns with no bookkeeping: no `reschedule`, no attempt counted. The 60 s SENDING lease expires and the claim picks the row up again with `attempts` unchanged. |
 
-Each flow takes the reader as an optional `isHumanMode` port.
+Each plain class takes the reader as an optional `isHumanMode` port (the
+worker as an optional last constructor argument), so hand-built test
+harnesses keep compiling; without a reader the send goes ahead.
 
-`HandoffModeService` is injected without `@Optional()`, so a broken DI graph
-fails at boot instead of silently losing the gate. It is optional in
-TypeScript only so hand-built test harnesses keep compiling.
+Production wiring passes `HandoffModeService` in every case:
+
+| Composition root                                           | Builds                           |
+| ---------------------------------------------------------- | -------------------------------- |
+| `ExpirationPreparationRuntime` (`HumanDecisionsModule`)    | `ExpirationDeliveryService`      |
+| `RestockApplicationRuntime` (`HumanDecisionsModule`)       | `RestockApplicationCoordinator`  |
+| `DeliveryZoneRuntime` (`DeliveryZonesModule`)              | `DeliveryZoneNotifier`           |
+| `ReceiptMediaNotificationLifecycle` (`ReceiptMediaModule`) | `ReceiptMediaNotificationWorker` |
+
+Those modules import `ConversationModule`, which exports the service and
+imports only `DatabaseModule`, so there is no import cycle. The runtimes and
+the dispatcher inject `HandoffModeService` without `@Optional()`, so a broken
+DI graph fails at boot instead of silently losing the hold. The dispatcher
+keeps it optional in TypeScript only so hand-built test harnesses keep
+compiling.
 
 ## Ops phone sends
 
@@ -113,14 +127,6 @@ comparison works like `isOpsSender`: exact by default, with both sides
 rewritten only when `META_SANDBOX_RECIPIENT_NORMALIZATION=true`.
 
 ## Not built yet
-
-- Production wiring of the proactive-sender holds. The runtimes that build
-  the EXPIRATION, RESTOCK and DELIVERY_ZONE senders don't pass
-  `HandoffModeService` yet, so those holds are inert. The receipt
-  notification worker has no hold at all. Its `reschedule` counts attempts
-  and fails the row on the third, so a HUMAN hold has to return without
-  bookkeeping and let the SENDING lease expire, which is replayed with
-  `attempts` unchanged.
 
 - The feed consumer (backend unit 5). It will call
   `HandoffModeService.applyStarted(sender, epoch, requestId)` on

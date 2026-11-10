@@ -10,6 +10,8 @@ import { PostgresRestockApplicationPreparationStore } from './infrastructure/pos
 import { PostgresRestockApplicationClaimStore } from './infrastructure/postgres-restock-application-claim.store';
 import { PostgresRestockApplicationLedgerStore } from './infrastructure/postgres-restock-application-ledger.store';
 import { PostgresRestockApplicationCompletionStore } from './infrastructure/postgres-restock-application-completion.store';
+import type { HandoffModeService } from '../conversation/application/handoff-mode.service';
+import type { RestockCandidateResult } from './application/restock-application-candidate.service';
 
 const source = 'ABCDEF12-1234-4234-8234-123456789ABC';
 const senderId = 'synthetic-sender';
@@ -27,7 +29,11 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-function fixture(identity = { branch, phone }) {
+function fixture(
+  identity = { branch, phone },
+  isHumanMode: (senderId: string) => Promise<boolean> = () =>
+    Promise.resolve(false),
+) {
   const values: Record<string, unknown> = {
     'chatbotApi.branchId': identity.branch,
     'meta.phoneNumberId': identity.phone,
@@ -39,11 +45,13 @@ function fixture(identity = { branch, phone }) {
     recordRestockApplicationOutcome: jest.fn(),
   };
   const sender = { sendText: jest.fn(), sendTemplate: jest.fn() };
+  const handoff = { isHumanMode: jest.fn(isHumanMode) };
   const runtime = new RestockApplicationRuntime(
     config as unknown as ConfigService,
     pool as unknown as Pool,
     client as unknown as ChatbotApiClient,
     sender,
+    handoff as unknown as HandoffModeService,
   );
   const inert = () => {
     for (const mock of [
@@ -54,8 +62,35 @@ function fixture(identity = { branch, phone }) {
       expect(mock).not.toHaveBeenCalled();
     expect(jest.getTimerCount()).toBe(0);
   };
-  return { runtime, pool, client, sender, inert };
+  return { runtime, pool, client, sender, handoff, inert };
 }
+
+/** A ready candidate that passes the coordinator's identity checks. */
+const readyCandidate = (): RestockCandidateResult =>
+  ({
+    action: 'candidate',
+    context: {
+      reservation: { senderId, requestKey: source },
+      backendDecisionId: 'decision',
+    },
+    decision: {
+      id: 'decision',
+      sourceRequestId: source,
+      snapshot: { branchId: branch, productName: 'Café', sku: null },
+      resolution: {
+        action: 'PROVIDE_RESTOCK_ESTIMATE',
+        restockDays: 3,
+        resolvedAt: '2026-06-01T10:00:00.000Z',
+      },
+      applyBefore: '2026-06-02T10:00:00.000Z',
+    },
+    classification: {
+      action: 'ready',
+      attemptId: 'attempt',
+      decisionId: 'decision',
+    },
+    checkedAt: '2026-06-01T10:00:00.000Z',
+  }) as unknown as RestockCandidateResult;
 
 // Unit composition/lifecycle proof only: no Nest graph or durable I/O.
 describe('RestockApplicationRuntime in isolation', () => {
@@ -358,5 +393,53 @@ describe('RestockApplicationRuntime in isolation', () => {
     expect(f.pool.query).not.toHaveBeenCalled();
     expect(f.pool.connect).not.toHaveBeenCalled();
     await f.runtime.onModuleDestroy();
+  });
+
+  describe('S7 handoff hold (wired from HandoffModeService)', () => {
+    const run = async (isHumanMode: (id: string) => Promise<boolean>) => {
+      const f = fixture({ branch, phone }, isHumanMode);
+      jest
+        .spyOn(RestockApplicationCandidateService.prototype, 'pollForSender')
+        .mockResolvedValue(readyCandidate());
+      const prepare = jest
+        .spyOn(
+          PostgresRestockApplicationPreparationStore.prototype,
+          'preparePending',
+        )
+        .mockResolvedValue(HOLD);
+      const apply = jest.spyOn(
+        RestockApplicationCoordinator.prototype,
+        'applyOnce',
+      );
+      f.runtime.onApplicationBootstrap();
+      f.runtime.enqueue(senderId, source);
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(apply).toHaveBeenCalledTimes(1);
+      const result: unknown = await (apply.mock.results[0].value as ReturnType<
+        RestockApplicationCoordinator['applyOnce']
+      >);
+      await f.runtime.onModuleDestroy();
+      return { f, prepare, result };
+    };
+
+    it.each([
+      ['HUMAN', () => Promise.resolve(true)],
+      ['an unreadable mode', () => Promise.reject(new Error('db down'))],
+    ])(
+      '%s: a ready notice stays pending before any durable step',
+      async (_label, mode) => {
+        const { f, prepare, result } = await run(mode);
+        expect(f.handoff.isHumanMode).toHaveBeenCalledWith(senderId);
+        expect(result).toEqual({ action: 'pending' });
+        expect(prepare).not.toHaveBeenCalled();
+        expect(f.sender.sendText).not.toHaveBeenCalled();
+      },
+    );
+
+    it('BOT: the ready notice goes on to preparation', async () => {
+      const { f, prepare } = await run(() => Promise.resolve(false));
+      expect(f.handoff.isHumanMode).toHaveBeenCalledWith(senderId);
+      expect(prepare).toHaveBeenCalledTimes(1);
+    });
   });
 });

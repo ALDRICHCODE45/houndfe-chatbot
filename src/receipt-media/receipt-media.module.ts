@@ -26,6 +26,7 @@ import type { Pool } from 'pg';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import type { ChatbotApiClient } from '../chatbot-api/domain/chatbot-api.client';
 import { CHATBOT_API_CLIENT } from '../chatbot-api/domain/chatbot-api.client';
+import { HandoffModeService } from '../conversation/application/handoff-mode.service';
 import { ConversationModule } from '../conversation/conversation.module';
 import type { ConversationStore } from '../conversation/domain/conversation-store';
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
@@ -129,6 +130,9 @@ class ReceiptMediaNotificationLifecycle
     @Inject(PG_POOL) private readonly pool: Pool,
     @Inject(WHATSAPP_SENDER)
     private readonly sender: Pick<WhatsappSenderPort, 'sendText'>,
+    // S7: notices hold while the conversation is HUMAN. Required: a missing
+    // provider fails the boot instead of losing the hold.
+    private readonly handoff: HandoffModeService,
     // S1: notices in the recipient's stored style (usted when unknown).
     @Optional() private readonly profiles?: CustomerProfileService,
   ) {}
@@ -155,6 +159,7 @@ class ReceiptMediaNotificationLifecycle
       profiles === undefined
         ? undefined
         : (recipientId) => profiles.styleFor(recipientId),
+      { isHumanMode: (recipientId) => this.handoff.isHumanMode(recipientId) },
     );
     this.worker.onApplicationBootstrap();
   }
