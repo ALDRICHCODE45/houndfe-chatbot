@@ -87,6 +87,15 @@ export const REQUIRED_MIGRATIONS = [
   '3500000000000_receipt_media_backend_only.js',
   '3600000000000_receipt_media_upload_fields.js',
   '3700000000000_customer_profiles.js',
+  // Human intervention prerequisites: durable transcript and backend outbox.
+  '3800000000000_conversation_transcript.js',
+  '3900000000000_backend_outbox.js',
+  // Several open human requests per customer, one per topic.
+  '4000000000000_human_decision_reservations_per_topic.js',
+  // Durable 5-minute conversation gates (confirmations, address references).
+  '4200000000000_conversation_gates.js',
+  // Webhook dedup claims with a lease, recorded before replying (S6).
+  '4100000000000_processed_webhook_messages_claims.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

@@ -7,6 +7,7 @@ import {
   type RestockApplicationLedgerRow as Row,
 } from '../domain/restock-application-ledger-row';
 import { classifyRestockApplication } from '../domain/restock-application-policy';
+import { reservationTopicKey } from '../domain/shared-reservation';
 import type { RestockInboundEvidence } from '../domain/restock-inbound-evidence';
 import { PostgresRestockApplicationContextStore } from './postgres-restock-application-context.store';
 import { PostgresRestockApplicationLedgerStore } from './postgres-restock-application-ledger.store';
@@ -25,7 +26,7 @@ type Result =
   | Readonly<{ action: 'hold' }>;
 const HOLD = Object.freeze({ action: 'hold' as const });
 const LOCK =
-  "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND status='ACTIVE' FOR UPDATE";
+  "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND route='RESTOCK' AND request_key=$2 AND status='ACTIVE' FOR UPDATE";
 function validText(value: unknown): value is string {
   // eslint-disable-next-line no-control-regex -- reject C0/DEL/C1, preserve bytes
   const controls = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -87,7 +88,10 @@ export class PostgresRestockApplicationClaimStore {
         return HOLD;
       client = await this.pool.connect();
       await client.query('BEGIN');
-      const lock = await client.query<{ sender_id: string }>(LOCK, [senderId]);
+      const lock = await client.query<{ sender_id: string }>(LOCK, [
+        senderId,
+        context.reservation.requestKey,
+      ]);
       if (
         !Array.isArray(lock.rows) ||
         lock.rowCount !== 1 ||
@@ -97,7 +101,9 @@ export class PostgresRestockApplicationClaimStore {
         return HOLD;
       const locked = await new PostgresRestockApplicationContextStore(
         client,
-      ).readRecordedForSender(senderId);
+      ).readRecordedForSender(senderId, {
+        requestKey: context.reservation.requestKey,
+      });
       if (
         locked.action !== 'recorded' ||
         !isDeepStrictEqual(locked.context, context)
@@ -116,9 +122,11 @@ export class PostgresRestockApplicationClaimStore {
       )
         return HOLD;
       const evidence = read.evidence;
+      const topicKey = reservationTopicKey('RESTOCK', reservation.intake);
+      if (topicKey === null) return HOLD;
       const collisions = await new PostgresRestockClaimCollisionsStore(
         client,
-      ).readForSender(senderId);
+      ).readForSender(senderId, topicKey);
       if (collisions.action !== 'clear') return HOLD;
       const now = Date.prototype.toISOString.call(this.clock());
       const nowMs = Date.parse(now);

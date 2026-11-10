@@ -253,7 +253,8 @@ ddescribe('RESTOCK intake coordinator (real PostgreSQL)', () => {
     expect(client.submitRestockIntake).toHaveBeenCalledTimes(1);
   });
 
-  it('suppresses RESTOCK while an ACTIVE LEGACY_OPS reservation exists', async () => {
+  // S5: LEGACY_OPS and a RESTOCK subject are different topics and coexist.
+  it('lets RESTOCK proceed while an ACTIVE LEGACY_OPS reservation exists', async () => {
     await expect(
       reservations.reserve({
         senderId: SENDER,
@@ -262,11 +263,13 @@ ddescribe('RESTOCK intake coordinator (real PostgreSQL)', () => {
         intake: null,
       }),
     ).resolves.toEqual({ action: 'claim', reason: 'single_sender_vacant' });
+    const i = intake();
+    client.submitRestockIntake.mockResolvedValue(receiptFor(i));
     const service = serviceWith();
 
     await expect(
-      service.coordinate({ senderId: SENDER, intake: intake() }),
-    ).resolves.toEqual({ decision: 'blocked', reason: 'occupied' });
-    expect(client.submitRestockIntake).not.toHaveBeenCalled();
+      service.coordinate({ senderId: SENDER, intake: i }),
+    ).resolves.toMatchObject({ decision: 'recorded' });
+    expect(client.submitRestockIntake).toHaveBeenCalledTimes(1);
   });
 });

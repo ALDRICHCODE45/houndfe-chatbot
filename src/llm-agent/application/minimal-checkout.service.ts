@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
 import {
   CHATBOT_API_CLIENT,
@@ -20,12 +20,14 @@ import {
   type MinimalCheckoutDraftNewAddressFields,
 } from '../../conversation/domain/minimal-checkout-draft';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
-import { MinimalCheckoutAddressReferences } from '../domain/minimal-checkout-address-references';
+import { CheckoutAddressGate } from './gates/checkout-address.gate';
+import { DurableCheckoutConfirmation } from './gates/checkout-confirmation.gate';
+import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
+import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
 import {
   MINIMAL_CHECKOUT_AMBIGUOUS_REPLY,
   MINIMAL_CHECKOUT_CHANGED_REPLY,
   MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
-  MinimalCheckoutConfirmation,
   evaluateMinimalCheckoutReadiness,
   type MinimalCheckoutBindingStatus,
   type MinimalCheckoutMissingField,
@@ -195,26 +197,25 @@ const EMPTY_FIELDS = (): MinimalCheckoutDraftNewAddressFields => ({
  * Minimal-route checkout coordinator (T3): read-only sender lookup, saved
  * address selection, local draft collection and explicit local confirmation.
  * It never registers customers, edits saved addresses, creates sales, reserves
- * stock, takes payment or quotes shipping. Presentation, address references
- * and confirmation are volatile; only the validated draft is durable.
+ * stock, takes payment or quotes shipping. The validated draft lives in the
+ * conversation store; the confirmation and the address references are S4
+ * durable gates with their original expiry (process-local when built
+ * without `ConversationGates`).
  */
 @Injectable()
 export class MinimalCheckoutService {
-  private readonly confirmation = new MinimalCheckoutConfirmation();
-  private readonly references = new Map<
-    string,
-    MinimalCheckoutAddressReferences
-  >();
-  private readonly selected = new Map<string, string>();
-  private readonly customers = new Map<
-    string,
-    { customerId: string; firstName: string; lastName: string | null }
-  >();
+  private readonly confirmation: DurableCheckoutConfirmation;
+  private readonly addresses: CheckoutAddressGate;
 
   constructor(
     @Inject(CHATBOT_API_CLIENT) private readonly api: ChatbotApiClient,
     @Inject(CONVERSATION_STORE) private readonly store: ConversationStore,
-  ) {}
+    @Optional() gates?: ConversationGates,
+  ) {
+    const shared = gates ?? processLocalConversationGates();
+    this.confirmation = new DurableCheckoutConfirmation(shared);
+    this.addresses = new CheckoutAddressGate(shared);
+  }
 
   /** Only adapters with the owned draft CAS can host the checkout tools. */
   get available(): boolean {
@@ -238,7 +239,7 @@ export class MinimalCheckoutService {
 
   /** Backend rejected the selected base; a fresh lookup/selection is required. */
   clearSelection(senderId: string): void {
-    this.selected.delete(senderId);
+    this.addresses.unselect(senderId);
     this.confirmation.revokeConfirmation(senderId);
   }
 
@@ -290,7 +291,7 @@ export class MinimalCheckoutService {
   ): Promise<MinimalCheckoutLookupResult> {
     const phone = parseMexicanWhatsAppPhone(senderId);
     if (phone === null) return { ok: false, error: 'identity_unavailable' };
-    const registry = this.registryFor(senderId);
+    const registry = this.addresses.registryFor(senderId);
     let query = FIRST_PAGE;
     if (nextPageRef !== null) {
       const next = registry.resolveNextPage(nextPageRef);
@@ -318,7 +319,8 @@ export class MinimalCheckoutService {
       cursorReference: nextPageRef,
     });
     if (page === null) return { ok: false, error: 'lookup_unavailable' };
-    this.customers.set(senderId, { ...context.customer });
+    this.addresses.rememberCustomer(senderId, context.customer);
+    this.addresses.touch(senderId);
     const addresses: MinimalCheckoutAddressChoice[] = [];
     for (const offer of page.addresses) {
       const resolved = registry.resolveAddress(offer.reference);
@@ -343,11 +345,13 @@ export class MinimalCheckoutService {
     senderId: string,
     addressRef: string,
   ): Promise<MinimalCheckoutDraftResult> {
-    const resolved = this.registryFor(senderId).resolveAddress(addressRef);
+    const resolved = this.addresses
+      .registryFor(senderId)
+      .resolveAddress(addressRef);
     if (resolved === null) return { ok: false, error: 'unknown_reference' };
     const current = await this.readDraft(senderId);
     if (current === null) return { ok: false, error: 'draft_unavailable' };
-    const known = this.customers.get(senderId);
+    const known = this.addresses.customer(senderId);
     const customer =
       current.draft !== undefined && current.draft.customer.firstName !== null
         ? current.draft.customer
@@ -359,7 +363,10 @@ export class MinimalCheckoutService {
       customer,
       address: { kind: 'saved', snapshot: resolved.address },
     });
-    if (result.ok) this.selected.set(senderId, resolved.reference);
+    if (result.ok) {
+      this.addresses.select(senderId, resolved.reference);
+      this.addresses.touch(senderId);
+    }
     return result;
   }
 
@@ -416,7 +423,10 @@ export class MinimalCheckoutService {
       customer,
       address,
     });
-    if (result.ok && !keepSaved) this.selected.delete(senderId);
+    if (result.ok && !keepSaved) {
+      this.addresses.unselect(senderId);
+      this.addresses.touch(senderId);
+    }
     return result;
   }
 
@@ -489,7 +499,7 @@ export class MinimalCheckoutService {
         ? 'unavailable'
         : await this.revalidate(input.senderId, result.draft);
     if (current === null || revalidation !== 'ok') {
-      this.confirmation.finalize({
+      await this.confirmation.finalize({
         senderId: input.senderId,
         candidate: result,
         committed: false,
@@ -503,7 +513,7 @@ export class MinimalCheckoutService {
       current.raw,
       result.draft,
     );
-    const finalized = this.confirmation.finalize({
+    const finalized = await this.confirmation.finalize({
       senderId: input.senderId,
       candidate: result,
       committed,
@@ -531,15 +541,6 @@ export class MinimalCheckoutService {
     return prepared.onSent === undefined
       ? prepared
       : { reply: `${lead}\n\n${prepared.reply}`, onSent: prepared.onSent };
-  }
-
-  private registryFor(senderId: string): MinimalCheckoutAddressReferences {
-    let registry = this.references.get(senderId);
-    if (registry === undefined) {
-      registry = new MinimalCheckoutAddressReferences(senderId);
-      this.references.set(senderId, registry);
-    }
-    return registry;
   }
 
   /**
@@ -628,17 +629,29 @@ export class MinimalCheckoutService {
   }
 
   /**
-   * A saved snapshot is trusted only while its volatile reference is live and a
+   * A saved snapshot is trusted only while its durable reference is live and a
    * fresh bounded read of the same page still holds the exact id and version.
-   * A restart or retired reference requires a new lookup and selection.
+   * An expired or retired reference requires a new lookup and selection.
    */
   private async revalidate(
     senderId: string,
     draft: MinimalCheckoutDraft,
   ): Promise<Revalidation> {
     if (draft.address.kind === 'new') return 'ok';
-    const reference = this.selected.get(senderId);
-    const registry = this.references.get(senderId);
+    try {
+      return await this.revalidateReference(senderId, draft);
+    } finally {
+      this.addresses.touch(senderId);
+    }
+  }
+
+  private async revalidateReference(
+    senderId: string,
+    draft: MinimalCheckoutDraft,
+  ): Promise<Revalidation> {
+    if (draft.address.kind === 'new') return 'ok';
+    const reference = this.addresses.selected(senderId);
+    const registry = this.addresses.registry(senderId);
     const phone = parseMexicanWhatsAppPhone(senderId);
     if (reference === undefined || registry === undefined || phone === null) {
       return 'reselect';
@@ -651,7 +664,7 @@ export class MinimalCheckoutService {
       resolved.address.id !== snapshot.id ||
       resolved.address.version !== snapshot.version
     ) {
-      this.selected.delete(senderId);
+      this.addresses.unselect(senderId);
       return 'reselect';
     }
     let fresh: unknown;
@@ -668,7 +681,7 @@ export class MinimalCheckoutService {
     if (normalizeCustomerCheckoutContext(fresh)?.status !== 'unique') {
       return 'unavailable';
     }
-    this.selected.delete(senderId);
+    this.addresses.unselect(senderId);
     return 'reselect';
   }
 }

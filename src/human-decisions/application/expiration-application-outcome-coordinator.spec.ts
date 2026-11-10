@@ -181,7 +181,9 @@ describe('inactive EXPIRATION terminal outcome coordination', () => {
       const result = await h.run();
       expect(result).toEqual({ action: 'closed' });
       expect(Object.isFrozen(result)).toBe(true);
-      expect(h.ports.readRecordedForSender).toHaveBeenCalledWith('customer');
+      expect(h.ports.readRecordedForSender).toHaveBeenCalledWith('customer', {
+        requestKey: SOURCE,
+      });
       expect(h.ports.readOutcomeByDecision).toHaveBeenCalledWith(ID);
       const report = h.ports.recordRestockApplicationOutcome;
       expect(report).toHaveBeenCalledTimes(hasAck ? 0 : 1);

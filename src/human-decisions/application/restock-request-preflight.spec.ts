@@ -171,7 +171,8 @@ describe('preflightRestockRequest', () => {
     const outcome = await ask(d);
     expect(outcome).toEqual({ route: 'restock', intake: INTAKE });
     expect(d.getStock).toHaveBeenCalledWith(PRODUCT);
-    expect(d.readForSender).toHaveBeenCalledWith(SENDER);
+    // The RESTOCK marker is read for the requested subject only.
+    expect(d.readForSender).toHaveBeenCalledWith(SENDER, `variant:${VARIANT}`);
     expect(d.get).toHaveBeenCalledWith(SENDER);
     expect(Object.keys(INTAKE).sort()).toEqual([
       'observedStockAtRequest',

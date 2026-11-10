@@ -13,7 +13,10 @@
  * has no AbortSignal, so no send cancellation is pretended.
  * Human-outcome intents (R5) may wait in the queue: the 24 h window is
  * re-checked right before sending; closed means not delivered, no retry,
- * while a failed window read is retried like a failed send. */
+ * while a failed window read is retried like a failed send.
+ * S7: while the conversation is HUMAN (or the mode is unreadable) a claimed
+ * intent is left untouched — no send, no reschedule, no attempt counted —
+ * so its SENDING lease expires and a later claim replays it. */
 import {
   Injectable,
   OnApplicationBootstrap,
@@ -28,6 +31,10 @@ import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../customer-profile/domain/notice-style';
+import {
+  checkHandoffSendHold,
+  type HandoffModeReader,
+} from '../../conversation/application/handoff-send-hold';
 
 export interface NotificationStoreSeam {
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaOutboxRow[]>;
@@ -224,6 +231,8 @@ export class ReceiptMediaNotificationWorker
     private readonly customerStyle?: (
       recipientId: string,
     ) => Promise<CustomerStyle | null>,
+    // S7: the handoff mode; absent only in hand-built harnesses.
+    private readonly handoffMode?: HandoffModeReader,
   ) {
     const { owner, pollIntervalMs, batchSize, maxConcurrency } = options;
     if (
@@ -350,6 +359,10 @@ export class ReceiptMediaNotificationWorker
   private async deliver(intent: ReceiptMediaOutboxRow): Promise<void> {
     const lease = this.leaseToken(intent);
     if (lease === null) return;
+    // S7: no bookkeeping on a hold. `reschedule` would count an attempt and
+    // fail the row on the third; the expired lease replays it unchanged.
+    if ((await checkHandoffSendHold(this.handoffMode, intent.recipientId)).hold)
+      return;
     if (
       this.outcomeWindow !== undefined &&
       OUTCOME_TEMPLATE_KEYS.has(intent.templateKey)

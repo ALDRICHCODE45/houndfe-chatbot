@@ -19,7 +19,7 @@ const BRANCH = ' trusted branch ';
 const EMPTY = { rows: [], rowCount: 0 };
 function stage(sql: string): string {
   if (sql.includes('FROM conversation_state')) return 'conversation lock';
-  if (sql.includes('active_count')) return 'markers';
+  if (sql.includes('restock_count')) return 'markers';
   if (sql.includes('FOR UPDATE')) return 'reservation lock';
   if (sql.includes('FROM human_decision_reservations')) return 'context';
   if (sql.includes('FROM restock_inbound_evidence')) return 'evidence';
@@ -85,9 +85,10 @@ async function setup(now = NOW, failure = '', providerOffsetMs = 0) {
     if (step === 'conversation lock')
       return one({ sender_id: SENDER, data: {} });
     if (step === 'markers')
+      // Topic-scoped markers: the claimed subject's RESTOCK row only.
       return one({
-        active_count: 1,
-        active_route: 'RESTOCK',
+        legacy_count: 0,
+        restock_count: 1,
         legacy_pending: false,
       });
     if (step === 'CAS')
@@ -423,14 +424,10 @@ describe('additional claim boundaries (mock SQL, not PostgreSQL proof)', () => {
       'conversation lock',
       { sender_id: SENDER, data: { pendingHumanRequest: {} } },
     ],
-    [
-      'markers',
-      { active_count: 2, active_route: 'RESTOCK', legacy_pending: false },
-    ],
-    [
-      'markers',
-      { active_count: 1, active_route: 'RESTOCK', legacy_pending: true },
-    ],
+    ['markers', { legacy_count: 0, restock_count: 2, legacy_pending: false }],
+    ['markers', { legacy_count: 1, restock_count: 1, legacy_pending: false }],
+    ['markers', { legacy_count: 0, restock_count: 1, legacy_pending: true }],
+    ['markers', { legacy_count: 0, restock_count: 0, legacy_pending: false }],
     ['CAS', undefined],
   ])(
     'holds missing/colliding/advanced state at %s without later queries',

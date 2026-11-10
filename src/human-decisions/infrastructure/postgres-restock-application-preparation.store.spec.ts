@@ -373,7 +373,7 @@ describe('extended preparation boundaries', () => {
           applyBefore: END,
         },
       });
-      expect(f.query.mock.calls[1][1]).toEqual([SENDER]);
+      expect(f.query.mock.calls[1][1]).toEqual([SENDER, SOURCE]);
       expect(f.sql().map(stage)).toEqual(PATH);
       expect(f.release).toHaveBeenCalledTimes(1);
     },
@@ -551,10 +551,10 @@ describe('unwired transactional pending preparation', () => {
         'COMMIT',
       ]);
       expect(f.query.mock.calls[1]).toEqual([
-        "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND status='ACTIVE' FOR UPDATE",
-        [SENDER],
+        "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND route='RESTOCK' AND request_key=$2 AND status='ACTIVE' FOR UPDATE",
+        [SENDER, SOURCE],
       ]);
-      expect(f.query.mock.calls[2][1]).toEqual([SENDER]);
+      expect(f.query.mock.calls[2][1]).toEqual([SENDER, SOURCE]);
       expect(f.clock.mock.invocationCallOrder[0]).toBeGreaterThan(
         f.query.mock.invocationCallOrder[2],
       );

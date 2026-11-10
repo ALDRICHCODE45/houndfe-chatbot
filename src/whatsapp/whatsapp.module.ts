@@ -7,12 +7,15 @@ import { PostgresRestockInboundEvidenceStore } from '../human-decisions/infrastr
 import type { HumanHandoffService } from '../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
 import { RestockInboundCapture } from './application/restock-inbound-capture';
+import { BackendOutboxEnqueueModule } from '../backend-outbox/backend-outbox.module';
 import { ConversationModule } from '../conversation/conversation.module';
+import { ConversationTranscriptModule } from '../conversation-transcript/conversation-transcript.module';
 import { DatabaseModule } from '../database/database.module';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
 import { ProductImageModule } from '../product-image/product-image.module';
+import { WebhookDedupPurgeWorker } from './application/webhook-dedup-purge.worker';
 import { WebhookDispatcherService } from './application/webhook-dispatcher.service';
 import {
   RECENT_OUTBOUND,
@@ -33,7 +36,10 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
  *   - `WebhookDispatcherService` (echo + dedup + ops pre-routing +
  *     pending-marker short-circuit + AgentRunner + send)
  *   - `RECENT_OUTBOUND` (in-memory echo filter)
- *   - `WEBHOOK_DEDUP` (Postgres durable dedup)
+ *   - `WEBHOOK_DEDUP` (Postgres durable dedup claims, S6)
+ *   - `WebhookDedupPurgeWorker` (S6 retention: 8 days; only `AppModule`
+ *     imports this module, so it runs once per process)
+ *   - `BackendOutboxEnqueueModule` (S3 Meta statuses → backend outbox)
  *
  * The outbound sender lives in `WhatsappSenderModule` (ADR-30) and is
  * re-exported here so any existing consumer of `WHATSAPP_SENDER` keeps
@@ -45,7 +51,9 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
  */
 @Module({
   imports: [
+    BackendOutboxEnqueueModule,
     ConversationModule,
+    ConversationTranscriptModule,
     LlmAgentModule,
     DatabaseModule,
     HumanHandoffModule,
@@ -79,10 +87,11 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
         ),
     },
     {
-      // Durable dedup across restarts — Meta re-delivery window spans ~24h.
+      // Durable dedup across restarts — Meta re-delivers for up to 7 days.
       provide: WEBHOOK_DEDUP,
       useClass: PostgresWebhookDedupStore,
     },
+    WebhookDedupPurgeWorker,
     {
       // Echo filter — bounded in-memory window (echoes arrive in seconds).
       provide: RECENT_OUTBOUND,

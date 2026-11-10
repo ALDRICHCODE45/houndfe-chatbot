@@ -8,8 +8,10 @@
  * stay deterministic; any other genuine reply is resolved by an optional
  * semantic seam (accept|decline|unclear) against the EXACT sent question, while
  * an unclear, missing or failed classification keeps the pending and asks for a
- * natural clarification. Pending state is in-memory (one per sender, 5-minute
- * TTL) and is lost on restart.
+ * natural clarification. Pending state is one per sender with a 5-minute TTL,
+ * kept durable through the S4 `restock_pending` gate (process-local when no
+ * `ConversationGates` is wired); accepting it spends the durable row
+ * atomically, so one question authorizes at most one route attempt.
  */
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
@@ -25,6 +27,12 @@ import {
 import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import { runRestockRoute } from '../../sale-flow/application/tools/request-human-assistance.tool';
 import type { RestockToolCapability } from '../../sale-flow/application/tool-deps';
+import type { ConversationGates } from '../../conversation-gates/application/conversation-gates';
+import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
+import {
+  restoreRestockPending,
+  serializeRestockPending,
+} from './gates/restock-pending.gate';
 
 export const MINIMAL_RESTOCK_PENDING_TTL_MS = 5 * 60 * 1000;
 export const MINIMAL_RESTOCK_AMBIGUOUS_REPLY =
@@ -61,6 +69,8 @@ export interface MinimalRestockDeps {
   readonly restock?: RestockToolCapability;
   /** Test seam; production uses `Date.now`. */
   readonly clock?: () => number;
+  /** S4 durable gates; absent means a process-local store. */
+  readonly gates?: ConversationGates;
 }
 
 export interface MinimalRestockPrepareInput {
@@ -221,9 +231,35 @@ function presentationLabel(
 export class MinimalRestockRequestService {
   private readonly clock: () => number;
   private readonly pending = new Map<string, PendingRestock>();
+  private readonly gates: ConversationGates;
 
   constructor(private readonly deps: MinimalRestockDeps) {
     this.clock = deps.clock ?? (() => Date.now());
+    this.gates = deps.gates ?? processLocalConversationGates(this.clock);
+    this.gates.register({
+      kind: 'restock_pending',
+      read: (senderId) => {
+        const pending = this.pending.get(senderId);
+        if (pending === undefined || this.clock() >= pending.expiresAt)
+          return null;
+        return serializeRestockPending(pending);
+      },
+      write: (senderId, state) => {
+        this.pending.delete(senderId);
+        if (state === null) return true;
+        const restored = restoreRestockPending(senderId, state, {
+          ttlMs: MINIMAL_RESTOCK_PENDING_TTL_MS,
+          clock: this.clock,
+          proposal: minimalRestockProposal,
+        });
+        if (restored === null) return false;
+        this.pending.set(senderId, {
+          ...restored,
+          seen: new Set(restored.seen),
+        });
+        return true;
+      },
+    });
   }
 
   async prepare(
@@ -295,12 +331,11 @@ export class MinimalRestockRequestService {
         armed: false,
       };
       this.pending.set(senderId, pending);
+      this.gates.touch(senderId);
       return {
         kind: 'offer',
         reply: question,
-        onSent: () => {
-          if (this.pending.get(senderId) === pending) pending.armed = true;
-        },
+        onSent: this.armFor(senderId, pending),
       };
     } catch {
       return closed('preparation_failed');
@@ -308,6 +343,17 @@ export class MinimalRestockRequestService {
   }
 
   async consume(
+    input: MinimalRestockConsumeInput,
+  ): Promise<MinimalRestockConsumeResult> {
+    if (this.deps.restock === undefined) return null;
+    try {
+      return await this.consumePending(input);
+    } finally {
+      this.gates.touch(input.senderId);
+    }
+  }
+
+  private async consumePending(
     input: MinimalRestockConsumeInput,
   ): Promise<MinimalRestockConsumeResult> {
     try {
@@ -342,9 +388,7 @@ export class MinimalRestockRequestService {
           return {
             kind: 'handled',
             reply: pending.proposal,
-            onSent: () => {
-              if (this.pending.get(senderId) === pending) pending.armed = true;
-            },
+            onSent: this.armFor(senderId, pending),
           };
         }
         if (!pending.armed) return ambiguous;
@@ -354,7 +398,7 @@ export class MinimalRestockRequestService {
         }
         // Consume the slot BEFORE awaiting so a concurrent turn cannot re-enter.
         this.pending.delete(senderId);
-        return await this.write(senderId, pending, event);
+        return await this.spend(senderId, pending, event);
       }
       // Non-exact text: only a trusted, fresh, armed, non-replay turn is
       // interpretable; every other turn stays unhandled with no stale consent.
@@ -413,6 +457,32 @@ export class MinimalRestockRequestService {
     if (verdict !== 'accept') return clarification;
     // Consume BEFORE awaiting so a concurrent accept cannot double-write.
     this.pending.delete(senderId);
+    return await this.spend(senderId, pending, event);
+  }
+
+  /** Arms only the SAME live pending, then persists the arming. */
+  private armFor(senderId: string, pending: PendingRestock): () => void {
+    return () => {
+      if (this.pending.get(senderId) !== pending) return;
+      pending.armed = true;
+      this.gates.touch(senderId);
+    };
+  }
+
+  /**
+   * Spends the durable question atomically before the route runs: a question
+   * another process already accepted gets the cautious reply, never a write.
+   */
+  private async spend(
+    senderId: string,
+    pending: PendingRestock,
+    event: RestockInboundEventIdentity,
+  ): Promise<MinimalRestockConsumeResult> {
+    const won = await this.gates.claim(senderId, 'restock_pending', {
+      originMessageId: pending.originMessageId,
+    });
+    if (!won)
+      return { kind: 'handled', reply: MINIMAL_RESTOCK_AMBIGUOUS_REPLY };
     return await this.write(senderId, pending, event);
   }
 

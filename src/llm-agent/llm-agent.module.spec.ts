@@ -21,6 +21,9 @@ import { LLM_AGENT_SYSTEM_PROMPT, SYSTEM_PROMPT } from './domain/system-prompt';
 import { SALE_FLOW_INSTRUCTIONS } from '../sale-flow/domain/sale-flow-instructions';
 import { DELIVERY_ZONE_INTAKE } from '../delivery-zones/application/delivery-zone-intake.service';
 import { LlmAgentModule } from './llm-agent.module';
+import { ConversationGates } from '../conversation-gates/application/conversation-gates';
+import { PostgresConversationGateStore } from '../conversation-gates/infrastructure/postgres-conversation-gate.store';
+import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { LLM_AGENT, type LlmAgentPort } from './domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
 import { GENERATE_TEXT } from './infrastructure/generate-text.provider';
@@ -275,6 +278,39 @@ describe('LlmAgentModule integration', () => {
       hasCallback: true,
       bounded: false,
     });
+  });
+
+  it('[S4] every gate owner shares the one durable ConversationGates', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        AppConfigModule.forRoot({ ignoreEnvFile: true }),
+        HttpModule,
+        ConversationModule,
+        ChatbotApiModule,
+        SaleFlowModule,
+        LlmAgentModule,
+      ],
+    })
+      .overrideProvider(CHATBOT_API_CLIENT)
+      .useValue(stubChatbotApi())
+      .overrideProvider(ChatbotApiHttpClient)
+      .useValue(stubChatbotApi())
+      .overrideProvider(CONVERSATION_STORE)
+      .useValue(stubStore())
+      .overrideProvider(PostgresConversationStore)
+      .useValue(stubStore())
+      .compile();
+    const gates = moduleRef.get(ConversationGates);
+    expect(gates['store']).toBeInstanceOf(PostgresConversationGateStore);
+    expect(moduleRef.get(MinimalCatalogAgentService)['gates']).toBe(gates);
+    expect([...gates['participants'].keys()].sort()).toEqual([
+      'checkout_address',
+      'checkout_confirmation',
+      'checkout_confirmed',
+      'order_confirmation',
+      'restock_pending',
+    ]);
+    await moduleRef.close();
   });
 
   it('allows tests to override TOOL_REGISTRY with a stub', async () => {

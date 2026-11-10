@@ -406,6 +406,19 @@ export interface MinimalOrderStatus {
   readonly expiresAt: number;
 }
 
+/**
+ * Plain data of one pending offer, for the durable gate adapter (S4). The
+ * presentation is not part of it: it is re-rendered from the snapshot.
+ */
+export interface MinimalOrderPendingState {
+  readonly reference: string;
+  readonly snapshot: MinimalOrderSnapshot;
+  readonly receivingPhoneNumberId: string;
+  readonly originMessageId: string;
+  readonly expiresAt: number;
+  readonly armed: boolean;
+}
+
 interface PendingOrder {
   readonly reference: string;
   readonly snapshot: MinimalOrderSnapshot;
@@ -447,6 +460,44 @@ export class MinimalOrderConfirmation {
   /** Drop any pending offer for the sender. */
   cancel(senderId: string): void {
     this.pending.delete(senderId);
+  }
+
+  /** Detached copy of the live (unexpired) pending offer, or `null`. */
+  exportPending(senderId: string): MinimalOrderPendingState | null {
+    const pending = this.pending.get(senderId);
+    if (pending === undefined || this.now() >= pending.expiresAt) return null;
+    return structuredClone({
+      reference: pending.reference,
+      snapshot: pending.snapshot,
+      receivingPhoneNumberId: pending.receivingPhoneNumberId,
+      originMessageId: pending.originMessageId,
+      expiresAt: pending.expiresAt,
+      armed: pending.armed,
+    });
+  }
+
+  /**
+   * Replace the sender's pending offer with restored data (`null` clears it).
+   * Callbacks handed out for a previous object can no longer arm it.
+   */
+  restorePending(
+    senderId: string,
+    state: MinimalOrderPendingState | null,
+  ): void {
+    if (state === null) {
+      this.pending.delete(senderId);
+      return;
+    }
+    const snapshot = structuredClone(state.snapshot);
+    this.pending.set(senderId, {
+      reference: state.reference,
+      snapshot,
+      receivingPhoneNumberId: state.receivingPhoneNumberId,
+      originMessageId: state.originMessageId,
+      expiresAt: state.expiresAt,
+      presentation: renderMinimalOrderSummary(snapshot),
+      armed: state.armed,
+    });
   }
 
   /**

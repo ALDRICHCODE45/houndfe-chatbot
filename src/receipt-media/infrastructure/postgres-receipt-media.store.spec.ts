@@ -147,6 +147,16 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
       env: { ...process.env, DATABASE_URL: container.getConnectionUri() },
       stdio: 'pipe',
     });
+  // Rolls back every migration applied after the irreversible 3600 and then
+  // asks for one more step, so the down always reaches 3600 no matter how
+  // many migrations were added later.
+  const migrateDownTo3600 = async () => {
+    const { rows } = await pool.query<{ n: string }>(
+      `SELECT count(*) AS n FROM pgmigrations
+        WHERE name > '3600000000000_receipt_media_upload_fields'`,
+    );
+    migrate(`migrate:down ${Number(rows[0].n) + 1}`);
+  };
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
@@ -604,9 +614,9 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   // The chain ends at the irreversible 3600 (receipt media upload fields,
   // `exports.down = false`, like 3300 through 3500), so the first
   // single-step down already refuses and the tables stay in place.
-  const tryMigrateDown = (): string => {
+  const tryMigrateDown = async (): Promise<string> => {
     try {
-      migrate('migrate:down');
+      await migrateDownTo3600();
       return '';
     } catch (err) {
       return String((err as { stderr?: Buffer }).stderr ?? err);
@@ -621,7 +631,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   ])('down refuses when only %s is populated', async (table, row) => {
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
     await pool.query(insertSql(table, row), Object.values(row));
-    expect(tryMigrateDown()).toMatch(
+    expect(await tryMigrateDown()).toMatch(
       /disabled down migration on file: 3600000000000_receipt_media_upload_fields/,
     );
     const { rows } = await pool.query<{ a: boolean; b: boolean }>(
@@ -2034,7 +2044,7 @@ ddescribe('receipt_media core schema (WU2A1, Testcontainers)', () => {
   // gone.
   it('keeps both empty tables when the irreversible down refuses', async () => {
     await pool.query('TRUNCATE receipt_media_outbox, receipt_media');
-    expect(() => migrate('migrate:down')).toThrow();
+    await expect(migrateDownTo3600()).rejects.toThrow();
     migrate('migrate');
     for (const table of ['receipt_media', 'receipt_media_outbox']) {
       const { rows } = await pool.query<{ t: string | null }>(

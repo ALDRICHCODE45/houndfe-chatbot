@@ -18,6 +18,7 @@ import {
   type ExpirationIntakeInput,
 } from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
 import type { PostgresExpirationApplicationContextStore } from '../infrastructure/postgres-expiration-application-context.store';
+import type { RecordedReservationScope } from '../infrastructure/recorded-reservation-scope';
 
 export type ExpirationContextReaderPort = Pick<
   PostgresExpirationApplicationContextStore,
@@ -168,8 +169,11 @@ export class ExpirationExistingDecisionService {
     private readonly branchId: string,
   ) {}
 
+  /** `scope` narrows the read to one request or subject; a sender may hold
+   * several open topics, so an unscoped read fails closed once it does. */
   async readExistingDecision(
     senderId: string,
+    scope?: RecordedReservationScope,
   ): Promise<ExpirationExistingDecisionOutcome> {
     try {
       if (!validSender(senderId) || !validBranch(this.branchId)) return HELD;
@@ -177,7 +181,10 @@ export class ExpirationExistingDecisionService {
         ReturnType<ExpirationContextReaderPort['readRecordedForSender']>
       >;
       try {
-        read = await this.reader.readRecordedForSender(senderId);
+        read =
+          scope === undefined
+            ? await this.reader.readRecordedForSender(senderId)
+            : await this.reader.readRecordedForSender(senderId, scope);
       } catch {
         return QUERY_FAILED;
       }

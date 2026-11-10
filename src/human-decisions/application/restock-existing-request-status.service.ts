@@ -33,6 +33,7 @@ import {
 import { CatalogSession } from '../../conversation/domain/catalog-references';
 import { classifyRestockApplication } from '../domain/restock-application-policy';
 import { bindRestockInboundEvent } from '../domain/restock-source-identity';
+import { reservationTopicKey } from '../domain/shared-reservation';
 import type {
   PostgresRestockApplicationContextStore as ContextStore,
   RecordedRestockContext,
@@ -182,10 +183,13 @@ export class RestockExistingRequestStatusService {
       ) {
         return UNAVAILABLE;
       }
-      // Gate 4: the trusted recorded receipt for THIS sender.
+      // Gate 4: the trusted recorded receipt for THIS sender on THIS subject
+      // (a sender may hold several open topics).
+      const topicKey = reservationTopicKey('RESTOCK', { productId, variantId });
+      if (topicKey === null) return UNAVAILABLE;
       let read: Awaited<ReturnType<ContextStore['readRecordedForSender']>>;
       try {
-        read = await this.reader.readRecordedForSender(senderId);
+        read = await this.reader.readRecordedForSender(senderId, { topicKey });
       } catch {
         return UNAVAILABLE;
       }

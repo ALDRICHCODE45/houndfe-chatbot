@@ -644,4 +644,57 @@ ddescribe('PostgresConversationStore (Testcontainers)', () => {
       }
     });
   });
+
+  // S7: the handoff CAS is serialized per sender under concurrency.
+  describe('handoff mode CAS concurrency (S7)', () => {
+    beforeEach(async () => {
+      await pool.query('TRUNCATE TABLE conversation_state');
+    });
+
+    it('two concurrent applies with different epochs end with the higher epoch', async () => {
+      for (let round = 0; round < 10; round += 1) {
+        const sender = `wa-race-${round}`;
+        const writers = [new Store(pool), new Store(pool)];
+        const orders = [
+          { mode: 'HUMAN' as const, epoch: 3, requestId: 'req-3' },
+          { mode: 'HUMAN' as const, epoch: 4, requestId: 'req-4' },
+        ];
+        if (round % 2 === 1) orders.reverse();
+        const results = await Promise.all(
+          orders.map((order, index) =>
+            writers[index].applyHandoff(sender, order),
+          ),
+        );
+        expect(results.filter((r) => r.applied).length).toBeGreaterThan(0);
+        await expect(new Store(pool).getHandoff(sender)).resolves.toMatchObject(
+          { mode: 'HUMAN', epoch: 4, requestId: 'req-4' },
+        );
+      }
+    });
+
+    it('concurrent end and newer start never regress the epoch', async () => {
+      const store = new Store(pool);
+      await store.applyHandoff('wa-race-end', {
+        mode: 'HUMAN',
+        epoch: 1,
+        requestId: 'req-1',
+      });
+      await Promise.all([
+        new Store(pool).applyHandoff('wa-race-end', {
+          mode: 'BOT',
+          epoch: 1,
+          requestId: null,
+        }),
+        new Store(pool).applyHandoff('wa-race-end', {
+          mode: 'HUMAN',
+          epoch: 2,
+          requestId: 'req-2',
+        }),
+      ]);
+      await expect(store.getHandoff('wa-race-end')).resolves.toMatchObject({
+        mode: 'HUMAN',
+        epoch: 2,
+      });
+    });
+  });
 });

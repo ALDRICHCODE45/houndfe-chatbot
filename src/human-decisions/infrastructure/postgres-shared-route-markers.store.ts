@@ -45,18 +45,38 @@ function validSenderId(value: unknown): value is string {
   );
 }
 
+/**
+ * S5 topic-scoped snapshot: since migration 400 a sender may hold one ACTIVE
+ * reservation per (route, topic), so the RESTOCK marker is read for ONE topic
+ * and other topics (or EXPIRATION requests) never mark it. The LEGACY_OPS
+ * reservation (one per sender) and the pending legacy handoff still count.
+ */
+const TOPIC_SNAPSHOT_SQL = `SELECT
+  (SELECT count(*)::int FROM human_decision_reservations WHERE sender_id = $1 AND status = 'ACTIVE' AND route = 'LEGACY_OPS') AS legacy_count,
+  (SELECT count(*)::int FROM human_decision_reservations WHERE sender_id = $1 AND status = 'ACTIVE' AND route = 'RESTOCK' AND topic_key = $2) AS restock_count,
+  EXISTS (SELECT 1 FROM human_handoff_requests WHERE customer_id = $1 AND status = 'pending') AS legacy_pending`;
+const TOPIC = /^(?:variant|product):[0-9a-f-]{36}$/;
+
 const ROW_KEYS = ['active_count', 'active_route', 'legacy_pending'] as const;
+const TOPIC_ROW_KEYS = [
+  'legacy_count',
+  'restock_count',
+  'legacy_pending',
+] as const;
 
 /** Read own data descriptors only, and reject a Proxy's divergent `get`. */
-function snapshotRow(row: unknown): Record<string, unknown> | null {
+function snapshotRow(
+  row: unknown,
+  expectedKeys: readonly string[] = ROW_KEYS,
+): Record<string, unknown> | null {
   if (typeof row !== 'object' || row === null || Array.isArray(row))
     return null;
   const prototype = Object.getPrototypeOf(row) as unknown;
   if (prototype !== Object.prototype && prototype !== null) return null;
   const keys = Reflect.ownKeys(row);
   if (
-    keys.length !== ROW_KEYS.length ||
-    keys.some((key) => !ROW_KEYS.some((expected) => expected === key))
+    keys.length !== expectedKeys.length ||
+    keys.some((key) => !expectedKeys.some((expected) => expected === key))
   ) {
     return null;
   }
@@ -64,7 +84,7 @@ function snapshotRow(row: unknown): Record<string, unknown> | null {
     string,
     unknown
   >;
-  for (const key of ROW_KEYS) {
+  for (const key of expectedKeys) {
     const descriptor = Reflect.getOwnPropertyDescriptor(row, key);
     if (
       !descriptor ||
@@ -121,13 +141,55 @@ function mapSnapshot(result: {
   return UNKNOWN;
 }
 
+/** Map one verified topic-scoped snapshot row, or `UNKNOWN`. */
+function mapTopicSnapshot(result: {
+  rows: unknown[];
+  rowCount: number | null;
+}): SharedRouteMarkers {
+  const { rows, rowCount } = result;
+  if (
+    !Array.isArray(rows) ||
+    typeof rowCount !== 'number' ||
+    rowCount !== 1 ||
+    rows.length !== 1
+  ) {
+    return UNKNOWN;
+  }
+  const row = snapshotRow(rows[0], TOPIC_ROW_KEYS);
+  if (row === null) return UNKNOWN;
+  const { legacy_count: legacy, restock_count: restock } = row;
+  const pending = row.legacy_pending;
+  const count = (v: unknown): v is 0 | 1 => v === 0 || v === 1;
+  // Both unique indexes keep each count at most 1; anything else is unknown.
+  if (!count(legacy) || !count(restock) || typeof pending !== 'boolean') {
+    return UNKNOWN;
+  }
+  return {
+    legacyRequestPending: legacy === 1 || pending,
+    restockIntentPresent: restock === 1,
+  };
+}
+
 @Injectable()
 export class PostgresSharedRouteMarkersStore implements SharedRouteMarkersPort {
   constructor(@Inject(PG_POOL) private readonly pool: Pick<Pool, 'query'>) {}
 
-  async readForSender(senderId: string): Promise<SharedRouteMarkers> {
+  async readForSender(
+    senderId: string,
+    topicKey?: string,
+  ): Promise<SharedRouteMarkers> {
     if (!validSenderId(senderId)) return UNKNOWN;
     try {
+      if (topicKey !== undefined) {
+        if (typeof topicKey !== 'string' || !TOPIC.test(topicKey)) {
+          return UNKNOWN;
+        }
+        const scoped = await this.pool.query(TOPIC_SNAPSHOT_SQL, [
+          senderId,
+          topicKey,
+        ]);
+        return mapTopicSnapshot(scoped);
+      }
       const result = await this.pool.query(SNAPSHOT_SQL, [senderId]);
       return mapSnapshot(result);
     } catch {

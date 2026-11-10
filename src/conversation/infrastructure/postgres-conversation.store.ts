@@ -11,6 +11,14 @@ import {
   isPendingHumanRequestId,
   PendingHumanRequest,
 } from '../domain/conversation-store';
+import {
+  CorruptHandoffStateError,
+  readHandoffState,
+  resolveHandoffApply,
+  type HandoffApplyResult,
+  type HandoffState,
+  type HandoffTransition,
+} from '../domain/handoff-mode';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 
 interface ConversationRow {
@@ -453,6 +461,71 @@ export class PostgresConversationStore implements ConversationStore {
     return (rowCount ?? 0) === 1;
   }
 
+  async getHandoff(senderId: string): Promise<HandoffState> {
+    const { rows } = await this.pool.query<{ handoff: unknown }>(
+      `SELECT data->'handoff' AS handoff FROM conversation_state WHERE sender_id = $1`,
+      [senderId],
+    );
+    const state = readHandoffState(rows[0]?.handoff);
+    if (state === null) throw new CorruptHandoffStateError(senderId);
+    return state;
+  }
+
+  /**
+   * S7 CAS under the row lock: ensure the row, lock it, decide with the
+   * shared `resolveHandoffApply` rule (same as the memory adapter), and
+   * write only `data.handoff`. A refused order rolls back, so a
+   * first-contact refusal leaves no row behind. Concurrent applies for one
+   * sender serialize on the lock (the INSERT conflict waits too), so the
+   * highest epoch always wins.
+   */
+  async applyHandoff(
+    senderId: string,
+    transition: HandoffTransition,
+  ): Promise<HandoffApplyResult> {
+    if (!isNonEmptyString(senderId)) {
+      return { applied: false, reason: 'INVALID' };
+    }
+    const now = new Date().toISOString();
+    // Validate before any I/O; the stored side is re-checked under the lock.
+    const precheck = resolveHandoffApply(undefined, transition, now);
+    if (!precheck.applied && precheck.reason === 'INVALID') return precheck;
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO conversation_state (sender_id, last_message_at, data)
+         VALUES ($1, $2::timestamptz, '{}'::jsonb)
+         ON CONFLICT (sender_id) DO NOTHING`,
+        [senderId, now],
+      );
+      const { rows } = await client.query<{ handoff: unknown }>(
+        `SELECT data->'handoff' AS handoff FROM conversation_state
+         WHERE sender_id = $1 FOR UPDATE`,
+        [senderId],
+      );
+      const result = resolveHandoffApply(rows[0]?.handoff, transition, now);
+      if (!result.applied) {
+        await client.query('ROLLBACK');
+        return result;
+      }
+      await client.query(
+        `UPDATE conversation_state
+         SET data = data || jsonb_build_object('handoff', $2::jsonb)
+         WHERE sender_id = $1`,
+        [senderId, JSON.stringify(result.state)],
+      );
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async get(senderId: string): Promise<ConversationState | null> {
     const { rows } = await this.pool.query<ConversationRow>(
       'SELECT sender_id, last_message_at, data FROM conversation_state WHERE sender_id = $1',
@@ -490,8 +563,8 @@ export class PostgresConversationStore implements ConversationStore {
     // `{ ...existing, ...patch }` exactly (data REPLACES if patch
     // carries it, PRESERVES if omitted). The CAS-owned
     // `pendingHumanRequest` / `minimalCheckoutDraft`
-    // keys are stripped from the patch and the LIVE values re-applied under
-    // the row lock.
+    // keys (and the S7 `handoff`) are stripped from the patch and the LIVE
+    // values re-applied under the row lock.
     const existing = await this.get(senderId);
     const merged = existing
       ? { ...existing, ...patch }
@@ -504,6 +577,7 @@ export class PostgresConversationStore implements ConversationStore {
     }
     const data = { ...(merged.data ?? {}) };
     delete data.pendingHumanRequest;
+    delete data.handoff;
     delete data.messages;
     delete data.catalogReferences;
     delete data.agentRevision;
@@ -521,7 +595,7 @@ export class PostgresConversationStore implements ConversationStore {
                    ELSE '{}'::jsonb END
                  || (SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
                      FROM jsonb_each(conversation_state.data)
-                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart', 'minimalCheckoutDraft'))
+                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart', 'minimalCheckoutDraft', 'handoff'))
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );

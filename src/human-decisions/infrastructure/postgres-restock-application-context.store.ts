@@ -4,7 +4,14 @@ import {
   normalizeRestockIntake,
   type RestockIntakeInput,
 } from '../../chatbot-api/domain/dtos/human-decisions.dto';
-import type { ActiveReservation } from '../domain/shared-reservation';
+import {
+  SENDER_OPEN_RESERVATION_LIMIT,
+  type ActiveReservation,
+} from '../domain/shared-reservation';
+import {
+  scopedRecordedQuery,
+  type RecordedReservationScope,
+} from './recorded-reservation-scope';
 
 export interface RecordedRestockContext {
   readonly reservation: Omit<ActiveReservation, 'intake'> & {
@@ -21,6 +28,7 @@ export type RestockContextRead =
   | { readonly action: 'hold' };
 
 const SQL = `SELECT sender_id, route, request_key, status, intake, post_state, backend_decision_id, post_attempted_at, receipt_recorded_at, unknown_observed_at FROM human_decision_reservations WHERE sender_id = $1 AND status = 'ACTIVE'`;
+const LIST_SQL = `SELECT request_key FROM human_decision_reservations WHERE sender_id = $1 AND route = 'RESTOCK' AND status = 'ACTIVE' AND post_state = 'RECEIPT_RECORDED' ORDER BY created_at, request_key LIMIT $2`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const INSTANT = z.iso.datetime({ offset: true });
 const isUuid = (v: unknown): v is string =>
@@ -76,7 +84,32 @@ function exactIntake(value: unknown): Readonly<RestockIntakeInput> | null {
 export class PostgresRestockApplicationContextStore {
   constructor(private readonly pool: Pick<Pool, 'query'>) {}
 
-  async readRecordedForSender(senderId: string): Promise<RestockContextRead> {
+  /**
+   * Request keys of this sender's ACTIVE RESTOCK reservations with a recorded
+   * receipt, oldest first (bounded by the per-sender cap). Keys only: each one
+   * must still be re-read with `readRecordedForSender(sender, { requestKey })`.
+   */
+  async listRecordedRequestKeys(senderId: string): Promise<string[]> {
+    if (
+      typeof senderId !== 'string' ||
+      !senderId ||
+      senderId !== senderId.trim()
+    )
+      return [];
+    const { rows } = await this.pool.query<{ request_key: unknown }>(LIST_SQL, [
+      senderId,
+      SENDER_OPEN_RESERVATION_LIMIT,
+    ]);
+    if (!Array.isArray(rows)) throw new Error('inconsistent restock key list');
+    return rows
+      .map((row) => row?.request_key)
+      .filter((key): key is string => isUuid(key));
+  }
+
+  async readRecordedForSender(
+    senderId: string,
+    scope?: RecordedReservationScope,
+  ): Promise<RestockContextRead> {
     if (
       typeof senderId !== 'string' ||
       !senderId ||
@@ -87,9 +120,11 @@ export class PostgresRestockApplicationContextStore {
       })
     )
       return { action: 'hold' };
+    const query = scopedRecordedQuery(SQL, 'RESTOCK', senderId, scope);
+    if (query === null) return { action: 'hold' };
     const { rows, rowCount } = await this.pool.query<Record<string, unknown>>(
-      SQL,
-      [senderId],
+      query.text,
+      query.params,
     );
     if (
       !Array.isArray(rows) ||

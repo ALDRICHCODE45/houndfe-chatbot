@@ -396,6 +396,13 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         get: jest.fn().mockResolvedValue(null),
         create: jest.fn(),
         update: jest.fn(),
+        // Proactive notices hold while a person attends; BOT lets them send.
+        getHandoff: jest.fn().mockResolvedValue({
+          mode: 'BOT',
+          epoch: 0,
+          requestId: null,
+          updatedAt: null,
+        }),
       })
       .overrideProvider(CHATBOT_API_CLIENT)
       .useValue({
@@ -462,6 +469,13 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         get: jest.fn().mockResolvedValue(null),
         create: jest.fn(),
         update: jest.fn(),
+        // Proactive notices hold while a person attends; BOT lets them send.
+        getHandoff: jest.fn().mockResolvedValue({
+          mode: 'BOT',
+          epoch: 0,
+          requestId: null,
+          updatedAt: null,
+        }),
       })
       .overrideProvider(CHATBOT_API_CLIENT)
       .useValue({
@@ -475,7 +489,10 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
       .compile();
     try {
       await moduleRef.init();
-      await untilMicrotask(() => outbox.claims.length >= 1);
+      // The S7 handoff read sits between the claim and the send.
+      await untilMicrotask(
+        () => outbox.claims.length >= 1 && sendText.mock.calls.length >= 1,
+      );
       // The host graph's private lifecycle claimed through the SAME
       // injected PG_POOL (single in-flight claim; its by-design wake
       // re-poll follows once the gated send below resolves).

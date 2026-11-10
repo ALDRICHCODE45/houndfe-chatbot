@@ -40,6 +40,7 @@ import {
   type OutOfStockRouteDecision,
 } from '../domain/restock-route-policy';
 import { bindRestockInboundEvent } from '../domain/restock-source-identity';
+import { reservationTopicKey } from '../domain/shared-reservation';
 import type {
   SharedRouteMarkerState,
   SharedRouteMarkersPort,
@@ -244,8 +245,21 @@ export async function preflightRestockRequest(
   let durableLegacy: SharedRouteMarkerState;
   let durableRestock: SharedRouteMarkerState;
   let state: ConversationState | null;
+  // A sender may hold several open topics: read the RESTOCK marker for the
+  // requested subject only. An unparsable digest keeps the sender-wide read
+  // and is still rejected below.
+  let topicKey: string | undefined;
   try {
-    const markers = await deps.markers.readForSender(senderId);
+    const subject = parseCandidate(input.digest);
+    topicKey =
+      subject === null
+        ? undefined
+        : (reservationTopicKey('RESTOCK', subject) ?? undefined);
+  } catch {
+    topicKey = undefined;
+  }
+  try {
+    const markers = await deps.markers.readForSender(senderId, topicKey);
     durableLegacy = markers.legacyRequestPending;
     durableRestock = markers.restockIntentPresent;
     state = await deps.conversation.get(senderId);

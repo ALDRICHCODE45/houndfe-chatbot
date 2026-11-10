@@ -21,7 +21,7 @@ type Result = Readonly<
 >;
 const HOLD = Object.freeze({ action: 'hold' as const });
 const LOCK_RESERVATION =
-  "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND status='ACTIVE' FOR UPDATE";
+  "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND route='EXPIRATION' AND request_key=$2 AND status='ACTIVE' FOR UPDATE";
 const LOCK_LEDGER =
   'SELECT decision_id FROM expiration_application_ledger WHERE decision_id=$1 FOR UPDATE';
 
@@ -94,7 +94,7 @@ export class PostgresExpirationApplicationClaimStore {
       await client.query('BEGIN');
       const reservationLock = await client.query<{ sender_id: string }>(
         LOCK_RESERVATION,
-        [senderId],
+        [senderId, reservation.requestKey],
       );
       if (
         !Array.isArray(reservationLock.rows) ||
@@ -105,7 +105,9 @@ export class PostgresExpirationApplicationClaimStore {
         return HOLD;
       const locked = await new PostgresExpirationApplicationContextStore(
         client,
-      ).readRecordedForSender(senderId);
+      ).readRecordedForSender(senderId, {
+        requestKey: reservation.requestKey,
+      });
       if (
         locked.action !== 'recorded' ||
         !isDeepStrictEqual(locked.context, context)

@@ -243,6 +243,21 @@ describe('RestockIntakeService.coordinate adversarial', () => {
     expect(client.submitRestockIntake).not.toHaveBeenCalled();
   });
 
+  it('returns a typed open-limit block without a POST at the sender cap', async () => {
+    const { service, ledger, client, reservations } = build();
+    reservations.reserve.mockResolvedValue({
+      action: 'limit_reached',
+      reason: 'sender_open_limit',
+      limit: 20,
+    });
+
+    await expect(
+      service.coordinate({ senderId: SENDER, intake: intake() }),
+    ).resolves.toEqual({ decision: 'blocked', reason: 'open_limit' });
+    expect(ledger.beginPost).not.toHaveBeenCalled();
+    expect(client.submitRestockIntake).not.toHaveBeenCalled();
+  });
+
   it('holds without a POST on a reserve or beginPost error', async () => {
     const reserveError = build();
     reserveError.reservations.reserve.mockRejectedValue(new Error('db down'));

@@ -104,6 +104,7 @@ import {
   type MinimalCartResult,
   type MinimalCartVariantDiagnostic,
 } from './minimal-cart.service';
+import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
 import {
   minimalCheckoutReply,
   reviewMinimalCheckout,
@@ -716,6 +717,9 @@ export class MinimalCatalogAgentService {
     // S1 persistent customer memory; optional only as a test seam.
     @Optional()
     private readonly profiles?: CustomerProfileService,
+    // S4 durable conversation gates; optional only as a test seam.
+    @Optional()
+    private readonly gates?: ConversationGates,
   ) {
     const llm = config.get<{
       model: string;
@@ -753,6 +757,9 @@ export class MinimalCatalogAgentService {
     this.interrupted.delete(input.senderId);
     this.busy.add(input.senderId);
     try {
+      // S4: restore the sender's durable gates (pending summaries,
+      // references, RESTOCK question) before any route reads them.
+      await this.gates?.begin(input.senderId);
       await this.prepareCustomer(input.senderId);
       const decision = this.withConfirmationButtons(
         input.senderId,
@@ -765,6 +772,8 @@ export class MinimalCatalogAgentService {
         this.order?.dismiss(input.senderId);
       }
       this.busy.delete(input.senderId);
+      // The turn's gate changes are durable before its reply is sent.
+      await this.gates?.settle(input.senderId);
     }
   }
 

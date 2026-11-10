@@ -54,7 +54,13 @@ export class RestockApplicationCandidateService {
         })
       )
         return HOLD;
-      const read = await this.reader.readRecordedForSender(senderId);
+      // One sender may hold several topics: narrow to the expected request.
+      const read =
+        expectedSourceRequestId === undefined
+          ? await this.reader.readRecordedForSender(senderId)
+          : await this.reader.readRecordedForSender(senderId, {
+              requestKey: expectedSourceRequestId,
+            });
       if (read?.action !== 'recorded') return HOLD;
       // Trusted validated snapshot port; defensive binding, not a general parser.
       const reservation = { ...read.context.reservation };

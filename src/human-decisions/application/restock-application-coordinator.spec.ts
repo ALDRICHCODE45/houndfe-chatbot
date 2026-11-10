@@ -1244,3 +1244,45 @@ describe('restock notice in the stored customer style (S1)', () => {
     expect(h.ports.sendText).toHaveBeenCalledWith({ to: SENDER, text: USTED });
   });
 });
+
+describe('restock notice while the conversation is HUMAN (S7)', () => {
+  const withMode = (isHumanMode: () => Promise<boolean>) => {
+    const h = setup();
+    const ports = { ...h.ports, isHumanMode: jest.fn(isHumanMode) };
+    const coordinator = new RestockApplicationCoordinator(
+      ports,
+      BRANCH,
+      PHONE,
+      h.clock,
+      h.token,
+    );
+    return {
+      ...h,
+      ports,
+      run: () => coordinator.applyOnce(SENDER, h.f.evidence.sourceRequestId),
+    };
+  };
+
+  it.each([
+    ['HUMAN', () => Promise.resolve(true)],
+    ['an unreadable mode', () => Promise.reject(new Error('db down'))],
+  ])(
+    '%s: returns pending (the poller retries) before any durable step or send',
+    async (_label, isHumanMode) => {
+      const h = withMode(isHumanMode);
+      expect(await h.run()).toEqual({ action: 'pending' });
+      expect(h.ports.isHumanMode).toHaveBeenCalledWith(SENDER);
+      expect(h.ports.preparePending).not.toHaveBeenCalled();
+      expect(h.ports.claimPending).not.toHaveBeenCalled();
+      expect(h.ports.sendText).not.toHaveBeenCalled();
+      expect(h.ports.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+      expect(h.ports.closeAcknowledged).not.toHaveBeenCalled();
+    },
+  );
+
+  it('BOT: sends and ACKs as before', async () => {
+    const h = withMode(() => Promise.resolve(false));
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.ports.sendText).toHaveBeenCalledTimes(1);
+  });
+});

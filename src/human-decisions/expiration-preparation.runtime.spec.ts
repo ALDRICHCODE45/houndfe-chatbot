@@ -19,6 +19,7 @@ import { PostgresExpirationApplicationLedgerStore } from './infrastructure/postg
 import { PostgresExpirationApplicationContextStore } from './infrastructure/postgres-expiration-application-context.store';
 import { PostgresExpirationApplicationCompletionStore } from './infrastructure/postgres-expiration-application-completion.store';
 import { PostgresCustomerInboundObservationStore } from './infrastructure/postgres-customer-inbound-observation.store';
+import type { HandoffModeService } from '../conversation/application/handoff-mode.service';
 
 const senderId = 'customer';
 const branchId = 'branch';
@@ -205,6 +206,8 @@ function compose() {
   };
 }
 
+const bot = () => ({ isHumanMode: jest.fn().mockResolvedValue(false) });
+
 describe('ExpirationPreparationRuntime', () => {
   afterEach(() => {
     jest.useRealTimers();
@@ -217,15 +220,19 @@ describe('ExpirationPreparationRuntime', () => {
     client: ChatbotApiClient = {
       recordRestockApplicationOutcome: jest.fn(),
     } as unknown as ChatbotApiClient,
+    handoff: Pick<HandoffModeService, 'isHumanMode'> = bot(),
   ) {
     const config = {
       get: (key: string) =>
         key === 'meta.phoneNumberId' ? phoneValue : branch,
     } as ConfigService;
-    return new ExpirationPreparationRuntime(config, {} as Pool, client, {
-      ...sender,
-      sendTemplate: jest.fn(),
-    });
+    return new ExpirationPreparationRuntime(
+      config,
+      {} as Pool,
+      client,
+      { ...sender, sendTemplate: jest.fn() },
+      handoff as HandoffModeService,
+    );
   }
   it('starts once with a valid branch and drains the poller on shutdown', async () => {
     const start = jest
@@ -409,6 +416,46 @@ describe('ExpirationPreparationRuntime', () => {
     );
     expect(spies.completion.mock.contexts[0]).toMatchObject({ branchId });
     expect(record.mock.contexts[0]).toBe(client);
+    await runtime.onModuleDestroy();
+  });
+  it.each([
+    ['HUMAN', () => Promise.resolve(true)],
+    ['an unreadable mode', () => Promise.reject(new Error('db down'))],
+  ])(
+    'S7: %s holds the notice before the claim, so a later sweep retries it',
+    async (_label, mode) => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date(now));
+      const spies = compose();
+      const sender = { sendText: jest.fn() };
+      const handoff = { isHumanMode: jest.fn(mode) };
+      const runtime = build(branchId, phone, sender, undefined, handoff);
+      runtime.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(spies.preparation).toHaveBeenCalledTimes(1);
+      expect(handoff.isHumanMode).toHaveBeenCalledWith(senderId);
+      expect(spies.claim).not.toHaveBeenCalled();
+      expect(sender.sendText).not.toHaveBeenCalled();
+      expect(spies.acceptance).not.toHaveBeenCalled();
+      await runtime.onModuleDestroy();
+    },
+  );
+  it('S7: BOT mode reads the handoff service and sends', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date(now));
+    const spies = compose();
+    const sender = {
+      sendText: jest
+        .fn()
+        .mockResolvedValue({ providerMessageId: 'wamid.accepted' }),
+    };
+    const handoff = bot();
+    const runtime = build(branchId, phone, sender, undefined, handoff);
+    runtime.onApplicationBootstrap();
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(handoff.isHumanMode).toHaveBeenCalledWith(senderId);
+    expect(spies.claim).toHaveBeenCalledTimes(1);
+    expect(sender.sendText).toHaveBeenCalledTimes(1);
     await runtime.onModuleDestroy();
   });
 });

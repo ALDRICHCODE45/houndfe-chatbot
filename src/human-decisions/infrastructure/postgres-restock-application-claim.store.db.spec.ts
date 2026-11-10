@@ -140,7 +140,7 @@ ddescribe('restock claim permission after real PostgreSQL COMMIT', () => {
           '--config-value',
           'pg-migrate',
           'up',
-          '2600000000000',
+          '4000000000000',
           '--timestamp',
         ],
         {

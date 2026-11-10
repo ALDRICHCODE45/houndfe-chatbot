@@ -1,8 +1,13 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { lastValueFrom } from 'rxjs';
 import { AppConfig } from '../../config/configuration';
+import {
+  OUTBOUND_TRANSCRIPT_RECORDER,
+  type OutboundTranscriptEntry,
+  type OutboundTranscriptRecorder,
+} from '../../conversation-transcript/application/transcript-recorder';
 import {
   fitInteractiveText,
   INTERACTIVE_LIMITS,
@@ -59,6 +64,10 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   constructor(
     private readonly httpService: HttpService,
     private readonly configService: ConfigService,
+    // S1 durable transcript. Optional so hand-built senders keep working.
+    @Optional()
+    @Inject(OUTBOUND_TRANSCRIPT_RECORDER)
+    private readonly transcript?: OutboundTranscriptRecorder,
   ) {}
 
   async sendText(message: OutboundText): Promise<SendResult> {
@@ -183,7 +192,50 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       throw new Error('Meta response did not include a provider message id');
     }
 
+    await this.recordTranscript(payload, providerMessageId);
     return { providerMessageId };
+  }
+
+  /**
+   * S1: every message Meta accepted, under the raw wa_id (before the
+   * sandbox rewrite), except sends to the ops phone. The recorder never throws; the extra catch keeps a
+   * misbehaving one from failing a send that already happened.
+   */
+  private async recordTranscript(
+    payload: MetaMessagePayload,
+    providerMessageId: string,
+  ): Promise<void> {
+    if (this.transcript === undefined || this.isOpsPhone(payload.to)) return;
+    try {
+      await this.transcript.recordOutbound(
+        transcriptEntry(payload, providerMessageId),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `transcript record failed for ${providerMessageId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * The ops phone is not a customer conversation: its sends are never
+   * recorded (nor mirrored). Same comparison as the dispatcher's
+   * `isOpsSender`: exact by default, both sides rewritten only under
+   * `META_SANDBOX_RECIPIENT_NORMALIZATION`.
+   */
+  private isOpsPhone(to: string): boolean {
+    const ops = this.configService.get<string>('humanHandoff.opsChannelPhone');
+    if (!ops) return false;
+    const sandbox =
+      this.configService.get<boolean>(
+        'meta.sandboxRecipientNormalizationEnabled',
+      ) === true;
+    return (
+      normalizeSandboxRecipient(to, sandbox) ===
+      normalizeSandboxRecipient(ops, sandbox)
+    );
   }
 
   private async postMessage(
@@ -329,6 +381,71 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         throw new InvalidOutboundTemplateError('body_parameter');
       }
     }
+  }
+}
+
+type PayloadField = Record<string, unknown> | undefined;
+
+const field = (value: unknown): PayloadField =>
+  value !== null && typeof value === 'object'
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+const stringOf = (value: unknown): string | undefined =>
+  typeof value === 'string' ? value : undefined;
+
+/** S1 transcript view of one accepted Graph API message payload. */
+function transcriptEntry(
+  payload: MetaMessagePayload,
+  providerMessageId: string,
+): OutboundTranscriptEntry {
+  const type = stringOf(payload.type) ?? 'text';
+  const base = { to: payload.to, providerMessageId, type };
+  switch (type) {
+    case 'text':
+      return { ...base, text: stringOf(field(payload.text)?.body) };
+    case 'image': {
+      const image = field(payload.image);
+      const caption = stringOf(image?.caption);
+      return {
+        ...base,
+        ...(caption === undefined ? {} : { text: caption }),
+        media: { link: stringOf(image?.link) },
+      };
+    }
+    case 'interactive': {
+      const interactive = field(payload.interactive);
+      return {
+        ...base,
+        text: stringOf(field(interactive?.body)?.text),
+        details: {
+          interactive: { type: interactive?.type, action: interactive?.action },
+        },
+      };
+    }
+    case 'template': {
+      const template = field(payload.template);
+      const components = Array.isArray(template?.components)
+        ? (template.components as unknown[])
+        : [];
+      const parameters = components
+        .flatMap((component) => {
+          const list = field(component)?.parameters;
+          return Array.isArray(list) ? (list as unknown[]) : [];
+        })
+        .map((parameter) => stringOf(field(parameter)?.text))
+        .filter((text): text is string => text !== undefined);
+      return {
+        ...base,
+        details: {
+          templateName: template?.name,
+          languageCode: field(template?.language)?.code,
+          bodyParameters: parameters,
+        },
+      };
+    }
+    default:
+      return base;
   }
 }
 

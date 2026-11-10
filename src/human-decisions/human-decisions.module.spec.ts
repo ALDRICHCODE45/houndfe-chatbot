@@ -41,6 +41,8 @@ import { PostgresRestockPostLedgerStore } from './infrastructure/postgres-restoc
 import { PostgresRestockApplicationContextStore } from './infrastructure/postgres-restock-application-context.store';
 import { PostgresSharedReservationStore } from './infrastructure/postgres-shared-reservation.store';
 import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-shared-route-markers.store';
+import { HandoffModeService } from '../conversation/application/handoff-mode.service';
+import { ExpirationPreparationRuntime } from './expiration-preparation.runtime';
 
 /**
  * Synthetic DI wiring test for HumanDecisionsModule: it proves every token
@@ -281,4 +283,37 @@ describe('HumanDecisionsModule binding', () => {
     inert();
     await moduleRef.close();
   });
+
+  it('S7: injects the shared HandoffModeService into both notice runtimes', async () => {
+    const moduleRef = await compile([DatabaseModule, HumanDecisionsModule]);
+    const handoff = moduleRef.get(HandoffModeService, { strict: false });
+    expect(handoff).toBeInstanceOf(HandoffModeService);
+    for (const runtime of [
+      moduleRef.get(RestockApplicationRuntime),
+      moduleRef.get(ExpirationPreparationRuntime),
+    ])
+      // SAFETY: test-only introspection of the private constructor field.
+      expect((runtime as unknown as { handoff: unknown }).handoff).toBe(
+        handoff,
+      );
+    inert();
+    await moduleRef.close();
+  });
+
+  it.each([RestockApplicationRuntime, ExpirationPreparationRuntime])(
+    'S7: %p fails the graph without HandoffModeService (never optional)',
+    async (runtime) => {
+      await expect(
+        Test.createTestingModule({
+          providers: [
+            runtime,
+            { provide: ConfigService, useValue: { get: () => undefined } },
+            { provide: PG_POOL, useValue: fakePool },
+            { provide: CHATBOT_API_CLIENT, useValue: fakeClient },
+            { provide: WHATSAPP_SENDER, useValue: { sendText: jest.fn() } },
+          ],
+        }).compile(),
+      ).rejects.toThrow(/HandoffModeService/);
+    },
+  );
 });
