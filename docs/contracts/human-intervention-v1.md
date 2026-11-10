@@ -132,6 +132,13 @@ Staff can cancel a clarification, or a `TALK_TO_HUMAN`/`COMPLAINT` while its ses
 - Optional `customerNote` (at most 500 chars, accepted in backend §12.14): when present and the window is open, the bot sends it verbatim with the team-reply prefix instead of the generic notice. Feed item: `request.cancelled {requestId, reason, cancelledBy: STAFF, customerNote?}`.
 - The server rejects staff cancellation of a `TALK_TO_HUMAN`/`COMPLAINT` whose session is STARTING, ACTIVE or ENDING with `409 CANCEL_NOT_ALLOWED`, checked under the request row lock.
 
+## Naming confirmed with the backend (2026-11-10)
+
+- The delivery ACK route is `POST /chatbot-api/deliveries/:deliveryId/outcome` (scope `feed:ack`), body `{attemptId, outcome: PROVIDER_ACCEPTED | DELIVERY_UNKNOWN | DEFERRED_WINDOW_CLOSED | STALE, providerMessageId?, attemptedAt}`; errors `404`, `409 OUTCOME_ALREADY_RECORDED`, `409 IDEMPOTENCY_CONFLICT`.
+- Answers arrive as `request.answered` with `{kind, text, prefix}`. Decisions carry the fixed text for the chosen option plus the structured fields of the legacy outcome; a receipt rejection carries `customerReason`. `request.cancelled` is the staff cancellation. There is no `request.resolved` type.
+- Every feed item carries `cursor`, `deliveryId`, `type`, `requestId`, `conversationRef`, `payload`, `notBefore`, `expiresAt`.
+- Slice 5a (create, cancel, limits) is summarized in `docs/contracts/human-intervention-requests-5a.md`.
+
 ## Epoch rules (backend §12.15, confirmed 2026-11-10)
 
 - Every WAITING→STARTING transition increments `handoffEpoch` (N→N+1), including a retried claim after a revert, a release or an end. An epoch is never reused. HUMAN→BOT (end or revert) stays at epoch N. This matches the chatbot's CAS rule in `src/conversation/domain/handoff-mode.ts`.

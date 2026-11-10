@@ -1,0 +1,14 @@
+<!-- Chatbot summary of houndfe-backend docs/chatbot-handoff/chatbot-requests-bot-contract.md at commit 3f0054f5 (slice 5a), received 2026-11-10. The backend file is the source of truth. -->
+
+# Chatbot ↔ backend: human requests (slice 5a)
+
+What the chatbot session consumes. Contract source: `docs/proposals/human-intervention-backend-proposal.md` §3.1–§3.5, §3.9, §6.4, §10.1 R2. Implemented in this slice: **create**, **merge**, **customer cancel**, the **route budgets**. Not yet: the feed and delivery ACKs (slice 5b), `cancel-batch`, `reschedule`, scheduling slots, the conversation mirror, media, `GET /conversations/:ref/state`.
+
+Key chatbot obligations (full detail in the backend file):
+
+- Create: `POST /chatbot-api/requests` (scope `requests:create`, class `write`), `X-Idempotency-Key` equal to the body's `sourceRequestId`. Direct subtypes `UNKNOWN_QUESTION`, `TALK_TO_HUMAN`, `COMPLAINT` require `customer`, `conversationRef`, `lastCustomerMessageAt` (≤ 5 min in the future, ≤ 30 days old) and `summary` (1..140 chars). Wrapped subtypes `RESTOCK`, `EXPIRATION`, `DELIVERY_ZONE` send today's human-decisions body as `detail` (same `sourceRequestId`, `type` = `subtype`) and get `legacy` in the answer. `TRANSFER_RECEIPT`/`DISCOUNT` → `422 SUBTYPE_DISABLED`; `scheduledFor` → `422 SCHEDULING_DISABLED`. Unknown keys → `400`. `context` keys only: `cartRef`, `saleId`, `orderId`, `productIds`, `variantIds` (≤ 20), `quantity`; never prices.
+- Answer `201` CREATED or `200` REPLAYED/MERGED: `{id, folio, status, outcome, mergedIntoId, businessHours}`. `businessHours` is `null` until unit 7: never treat null as "closed". A `DELIVERY_ZONE` already approved returns `id: null`, `status: RESOLVED` with the answer in `legacy`.
+- Errors: `409 CUSTOMER_OPEN_LIMIT {limit: 20, open}`; `429 CUSTOMER_RATE_LIMITED {limit: 10}` + `Retry-After` (10 created per customer per hour; do NOT auto-retry, tell the customer); `429 RATE_LIMITED` + `Retry-After` (credential budget; retry later); `409 IDEMPOTENCY_CONFLICT`; `409 VERSION_CONFLICT` (retry). Error body `{statusCode, code, message, ...}`.
+- Cancel: `POST /chatbot-api/requests/:id/cancel` (scope `requests:cancel`), body `{reason: CUSTOMER_WITHDREW|AUTO_RESOLVED, triggerWaMessageId}`, any UUID key. `200 {id, status: CANCELLED, reason, cancelledAt}`; `409 ALREADY_RESOLVED` carries `resolution` (deliver it instead of "cancelled"); `409 REQUEST_CLOSED`; `409 CANCEL_NOT_ALLOWED` (live conversation); `404`.
+- **After cancelling a wrapped decision, the bot drops its local pending record of the legacy row and ignores any later `GET /chatbot-api/human-decisions/:id` outcome for it (no message, no application-outcome).**
+- Route budgets per credential and class, shared in PostgreSQL: `write` 300/min, `read` 300, `feed` 120, `humanDecisions` and `default` = the credential's `rateLimit` (60) with separate counters; overridable via `ServiceCredential.rateLimits`.
