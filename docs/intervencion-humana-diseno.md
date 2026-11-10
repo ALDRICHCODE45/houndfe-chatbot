@@ -230,15 +230,16 @@ Estas decisiones salieron después de leer las propuestas del backend y del fron
 
 Todo lo que quedó "para después". Pidió el dueño que quede anotado porque se va a retomar.
 
-| Tema                                     | Qué quedó pendiente                                                                                                               | Origen      |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| Descuentos                               | Solicitud de descuento con aprobar, rechazar o contraoferta. Está en el diseño, pero se construye en una segunda etapa.           | Bloque 1    |
-| Pago parcial                             | Política por cliente para pagar una parte y el resto al recibir (idea: basada en `isTrusted`, con porcentaje y tope de deuda).    | Bloque 1    |
-| Cancelar o cambiar un pedido             | El cliente cancela o modifica un pedido ya creado.                                                                                | Bloque 1    |
-| Estado o retraso de un pedido            | Hoy no hay una fuente confiable de seguimiento.                                                                                   | Bloque 1    |
-| Mayoreo                                  | Pedidos grandes con precio especial o stock de varias sucursales. Probablemente no se integre.                                    | Bloque 1    |
-| Quejas que disparan acciones             | Que "reembolso" o "reposición" generen una tarea, un aviso o un movimiento, en vez de solo registrarse.                           | Pregunta 16 |
-| Respuestas rápidas                       | Frases guardadas para responder aclaraciones repetidas.                                                                           | Pregunta 10 |
-| Transcripción de audios                  | El bot transcribe los audios con IA y sigue la conversación, en vez de pedir que los escriban. Medir antes cuántos audios llegan. | Pregunta 9  |
-| Conversaciones iniciadas por el personal | Que el personal le escriba a un cliente por su cuenta (requiere plantillas pagadas fuera de las 24 h).                            | Bloque 5    |
-| Tablero de métricas                      | Tiempos de respuesta, volumen por tipo y cuántas vencieron. Los datos se guardan desde el primer día.                             | Bloque 5    |
+| Tema                                     | Qué quedó pendiente                                                                                                                | Origen      |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| Descuentos                               | Solicitud de descuento con aprobar, rechazar o contraoferta. Está en el diseño, pero se construye en una segunda etapa.            | Bloque 1    |
+| Pago parcial                             | Política por cliente para pagar una parte y el resto al recibir (idea: basada en `isTrusted`, con porcentaje y tope de deuda).     | Bloque 1    |
+| Cancelar o cambiar un pedido             | El cliente cancela o modifica un pedido ya creado.                                                                                 | Bloque 1    |
+| Estado o retraso de un pedido            | Hoy no hay una fuente confiable de seguimiento.                                                                                    | Bloque 1    |
+| Mayoreo                                  | Pedidos grandes con precio especial o stock de varias sucursales. Probablemente no se integre.                                     | Bloque 1    |
+| Quejas que disparan acciones             | Que "reembolso" o "reposición" generen una tarea, un aviso o un movimiento, en vez de solo registrarse.                            | Pregunta 16 |
+| Respuestas rápidas                       | Frases guardadas para responder aclaraciones repetidas.                                                                            | Pregunta 10 |
+| Videos y ubicaciones                     | Guardar los videos y ubicaciones del cliente para verlos en la bandeja. En v1 el bot le pide al cliente que lo describa por texto. | Contrato v1 |
+| Transcripción de audios                  | El bot transcribe los audios con IA y sigue la conversación, en vez de pedir que los escriban. Medir antes cuántos audios llegan.  | Pregunta 9  |
+| Conversaciones iniciadas por el personal | Que el personal le escriba a un cliente por su cuenta (requiere plantillas pagadas fuera de las 24 h).                             | Bloque 5    |
+| Tablero de métricas                      | Tiempos de respuesta, volumen por tipo y cuántas vencieron. Los datos se guardan desde el primer día.                              | Bloque 5    |
