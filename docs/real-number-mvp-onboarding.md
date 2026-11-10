@@ -4,6 +4,75 @@
 > `docs/operations-human-handoff.md`. This document contains **no secrets**
 > and must never be used to carry them.
 
+## 0. Resume here (status 2026-11-09)
+
+Cutover is **paused until the client confirms** the number is available.
+When they do, resume from this checklist; the sections below hold detail.
+
+### Where things stand
+
+- Chatbot `main` is deployed on Dokploy at `https://bot.houndfe.com/webhook`.
+  Checked 2026-11-09: GET verification returns the challenge, and a POST
+  signed with the app secret returns `{"received":true}`. The chatbot side works.
+- The Meta app **lost its test number**: the dashboard shows "No hay números
+  de teléfono disponibles para esta app", so Meta delivers no webhooks (the
+  dashboard Test button reached nothing). The temporary access token can no
+  longer be found. Cause unknown (portfolio change or app/WABA detachment).
+  Instead of recovering it, the owner chose to move to the real number.
+- The chatbot database was emptied for a clean test (all tables except
+  `pgmigrations`; 21 migrations applied).
+- `OPS_CHANNEL_PHONE` holds a placeholder number only so that the app
+  boots. The WhatsApp ops channel is being replaced by in-system requests
+  (see the human-intervention design work).
+
+**Owner preference: do everything from the Meta web UI, no terminal.**
+Meta has no dashboard button for the final _register_ step: it is one
+Graph API call (Meta Help Center: "you'll need a developer to connect your
+phone number"). Do it from the browser with Meta's **Graph API Explorer**
+(`https://developers.facebook.com/tools/explorer/`), which is a Meta web page.
+
+### Checklist (owner and SIM holder present, about 30 minutes plus display-name review)
+
+1. Client answers §4 (send the message in §11). If the number has WhatsApp
+   or WhatsApp Business installed, back up chats, export contacts, then delete
+   that WhatsApp account on the phone **before** step 3 (§5).
+2. Revalidate Meta (§7): Business Settings → the app belongs to the right
+   business portfolio and has a WhatsApp Business Account (WABA). This also
+   explains where the test number went.
+3. Add the number: Meta Business Suite → All tools → WhatsApp Manager →
+   select the WABA → **Phone numbers → Add phone number**. Enter the display
+   name, category and the number, choose SMS or voice call, and type the
+   6-digit code the SIM holder receives. The code expires in minutes.
+4. Display name: wait until it shows approved, or wait for review if Meta asks.
+5. Copy the number's **Phone number ID** (WhatsApp Manager → Phone numbers,
+   or App Dashboard → WhatsApp → API Setup).
+6. Permanent token: Business Settings → Users → **System users** → add or
+   reuse an admin system user → **Assign assets** (the app with full
+   control and the WABA) → **Generate token** for the app with
+   `whatsapp_business_messaging` and `whatsapp_business_management`, expiry
+   **Never**. Store it somewhere safe; Meta shows it only once.
+7. Register (browser): Graph API Explorer → select the app → paste the
+   system-user token → method **POST** → path `<PHONE_NUMBER_ID>/register`
+   → body `{"messaging_product":"whatsapp","pin":"<6 digits you choose>"}`
+   → Submit. Expect `{"success":true}`. The PIN becomes the number's
+   two-step-verification PIN: save it. Limit: 10 attempts per 72 h, so
+   never retry blindly.
+8. Subscribe the WABA to the app (browser, same Explorer): **POST**
+   `<WABA_ID>/subscribed_apps` → `{"success":true}`. Check with **GET** on
+   the same path; the app must appear in `data`.
+9. App Dashboard → WhatsApp → Configuration: the callback URL stays
+   `https://bot.houndfe.com/webhook`, and `messages` must be **Subscribed**.
+10. Dokploy (owner types the values): `META_PHONE_NUMBER_ID` (new),
+    `META_ACCESS_TOKEN` (system-user token),
+    `META_SANDBOX_RECIPIENT_NORMALIZATION=false`. Keep `META_APP_SECRET` and
+    `META_VERIFY_TOKEN` unchanged. Redeploy and check the boot logs.
+11. Smoke test from the owner's phone to the **new number**, following
+    the manual test script: greeting → search → cart → delivery data →
+    shipping → order → bank details → receipt. A valid inbound logs
+    `process <id> from <number>`.
+
+Never paste codes, PINs or tokens into chat, the repo, tickets or screenshots (§8).
+
 ## 1. Scope and current state
 
 A **purchased SIM is not yet a Cloud API number.** The physical SIM is just
