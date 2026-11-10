@@ -69,8 +69,37 @@ HUMAN mode:
   throws. Meta redelivers, and the bot never speaks while it doesn't know
   the mode.
 
-The ops phone is never gated, because it isn't a customer conversation. BOT
-mode behaves exactly as before.
+The ops phone is never gated, because it isn't a customer conversation. But
+when an ops reply resolves a request (`kind: 'resolved'`), the dispatcher
+checks the customer's mode before the synthetic resume turn. In HUMAN mode
+it runs no `AgentRunner` turn and sends nothing to the customer. It still
+marks the ops message seen and logs at info. An unreadable mode is handled
+the same way, with a warning: the request is already resolved, so a
+redelivery could not resume it.
+
+The mode is checked again right before the agent reply is sent. If a
+session started during the turn, the reply (text, images, interactive) is
+dropped, the RESTOCK pending is not armed, and the message is marked seen.
+A read error at this point throws, like the gate does.
+
+BOT mode behaves exactly as before.
+
+## Proactive senders
+
+Flows that message a customer on their own call `checkHandoffSendHold`
+(`src/conversation/application/handoff-send-hold.ts`) right before the
+send. A HUMAN mode holds the send, and so does an unreadable mode (fail
+closed). A held send is deferred through the flow's own retry; it is never
+marked delivered or failed, and never ACKed to the backend.
+
+| Flow                                               | Hold result                                                                                                                                              |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| EXPIRATION notice (`ExpirationDeliveryService`)    | `hold` before `claimPending`; the ledger row stays PENDING and a later sweep retries it. Expiry goes through the stale path, which never sends.          |
+| RESTOCK notice (`RestockApplicationCoordinator`)   | `pending` before `preparePending`; the in-process poller re-queues it (bounded by its 24 h watch). An expired candidate goes on, because it never sends. |
+| DELIVERY_ZONE notice (`DeliveryZoneNotifier`)      | The row stays RESOLVED, with `last_polled_at` touched so it moves behind other due rows; the next tick retries it.                                       |
+| Receipt notices (`ReceiptMediaNotificationWorker`) | Not wired yet (see below).                                                                                                                               |
+
+Each flow takes the reader as an optional `isHumanMode` port.
 
 `HandoffModeService` is injected without `@Optional()`, so a broken DI graph
 fails at boot instead of silently losing the gate. It is optional in
@@ -84,6 +113,14 @@ comparison works like `isOpsSender`: exact by default, with both sides
 rewritten only when `META_SANDBOX_RECIPIENT_NORMALIZATION=true`.
 
 ## Not built yet
+
+- Production wiring of the proactive-sender holds. The runtimes that build
+  the EXPIRATION, RESTOCK and DELIVERY_ZONE senders don't pass
+  `HandoffModeService` yet, so those holds are inert. The receipt
+  notification worker has no hold at all. Its `reschedule` counts attempts
+  and fails the row on the third, so a HUMAN hold has to return without
+  bookkeeping and let the SENDING lease expire, which is replayed with
+  `attempts` unchanged.
 
 - The feed consumer (backend unit 5). It will call
   `HandoffModeService.applyStarted(sender, epoch, requestId)` on

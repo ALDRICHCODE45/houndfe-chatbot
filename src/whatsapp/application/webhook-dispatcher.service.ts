@@ -41,6 +41,7 @@ import { TranscriptRecorder } from '../../conversation-transcript/application/tr
 import { BackendOutboxService } from '../../backend-outbox/application/backend-outbox.service';
 import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
 import { HandoffModeService } from '../../conversation/application/handoff-mode.service';
+import { checkHandoffSendHold } from '../../conversation/application/handoff-send-hold';
 import { normalizeMetaStatuses } from './meta-status-normalizer';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
@@ -72,8 +73,10 @@ import {
  *          decision (or `HF-<id>` token, or newest-pending fallback) and
  *          resolves the durable row + clears the customer's marker.
  *        - `{ kind: 'resolved', customerId, syntheticUserText, ... }` →
- *          inject the synthetic user turn into `AgentRunner.handle` with
- *          `senderId = customerId` (NOT the ops phone) so the customer's
+ *          when the customer is in HUMAN mode (or the mode is unreadable)
+ *          nothing is run or sent, the ops message is only marked seen
+ *          (S7); otherwise inject the synthetic user turn into
+ *          `AgentRunner.handle` with `senderId = customerId` (NOT the ops phone) so the customer's
  *          resume gets the right transcript context. The runner's reply
  *          is then sent to the customer (NOT the ops phone).
  *        - `{ kind: 'no_pending', reply }` → reply to the ops phone with
@@ -102,8 +105,10 @@ import {
  *      customer turn runs through the minimal SDK route (no sender
  *      allowlist, no legacy fallback). `AgentRunner` is used only for the
  *      ops synthetic "resolved" turn in step 3.
- *   6. WhatsappSenderPort.sendText — send the reply (S3: any product photo
- *      first via the optional sendImage; an image failure only warns). S4:
+ *   6. WhatsappSenderPort.sendText — send the reply. S7: the mode is
+ *      re-checked first; a switch to HUMAN mid-turn drops the reply (still
+ *      marked seen). S3: any product photo goes first via the optional
+ *      sendImage (an image failure only warns). S4:
  *      a reply with buttons/list goes out through the optional
  *      sendInteractive; when absent or failing, the same text is sent.
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen (claim → DONE) —
@@ -170,7 +175,8 @@ export class WebhookDispatcherService {
 
       // ─── (1b) S1 durable transcript ────────────────────────────────
       // Before dedup: append is idempotent on the wamid, so a re-delivery
-      // after a crash still lands in the transcript. Never blocks the reply.
+      // after a crash still lands in the transcript. A failed write throws
+      // before any claim or reply, so Meta redelivers the message.
       await this.recordInbound(message, rawTypes.get(message.messageId));
 
       // ─── (2) Dedup claim (S6) ───────────────────────────────────────
@@ -201,6 +207,25 @@ export class WebhookDispatcherService {
           });
 
           if (result.kind === 'resolved') {
+            // S7: a customer in HUMAN mode gets no bot turn (no LLM, no
+            // send). An unreadable mode holds too: the request is already
+            // resolved, so a redelivery could not resume it anyway.
+            const hold = await checkHandoffSendHold(
+              this.handoffMode,
+              result.customerId,
+            );
+            if (hold.hold) {
+              if (hold.reason === 'HUMAN')
+                this.logger.log(
+                  `handoff HUMAN: skip resume turn for ${result.customerId} (ops ${message.messageId})`,
+                );
+              else
+                this.logger.warn(
+                  `handoff mode unreadable: skip resume turn for ${result.customerId} (ops ${message.messageId}): ${hold.error}`,
+                );
+              await this.markSeenSafely(message.messageId);
+              continue;
+            }
             // Synthetic-turn injection through the runner. The marker
             // was cleared by `resolveReply` so the runner's gate
             // (ADR-29) does NOT suppress this turn; the customer resumes
@@ -376,21 +401,24 @@ export class WebhookDispatcherService {
     return this.handoffMode.isHumanMode(senderId);
   }
 
-  /** S1: customer inbounds only (never the ops phone); never throws. */
+  /** S1: customer inbounds only (never the ops phone). A store failure
+   * propagates: the webhook fails and Meta redelivers, so a customer
+   * message is never lost from the transcript. */
   private async recordInbound(
     message: InboundMessage,
     rawType: string | undefined,
   ): Promise<void> {
     if (this.transcript === undefined) return;
+    if (this.humanHandoff.isOpsSender(message.senderId)) return;
     try {
-      if (this.humanHandoff.isOpsSender(message.senderId)) return;
       await this.transcript.recordInbound(message, rawType);
     } catch (error) {
-      this.logger.warn(
+      this.logger.error(
         `transcript record failed for ${message.messageId}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      throw error;
     }
   }
 
@@ -504,6 +532,16 @@ export class WebhookDispatcherService {
             },
           }),
     });
+    // S7 (W2): the mode may have switched to HUMAN during the turn; the
+    // reply is then dropped. A read error propagates (fail closed, Meta
+    // redelivers), like the gate.
+    if (await this.isHumanMode(message.senderId)) {
+      this.logger.log(
+        `handoff HUMAN mid-turn: drop reply for ${message.messageId} from ${message.senderId}`,
+      );
+      await this.markSeenSafely(message.messageId);
+      return;
+    }
     // S3: the product photo goes first, then the explanation.
     for (const media of minimal.media ?? []) {
       await this.sendReplyImage(message.senderId, media);

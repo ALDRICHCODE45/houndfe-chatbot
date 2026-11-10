@@ -115,6 +115,48 @@ describe('BackendOutboxDrainWorker', () => {
     });
   });
 
+  it('a delivery that outlives the timeout is retryable', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await enqueue(store, A, 'a1');
+    const hanging: BackendOutboxDeliveryPort = {
+      deliver: () => new Promise<BackendOutboxDeliveryResult>(() => {}),
+    };
+    const drain = new BackendOutboxDrainWorker(store, hanging, {
+      owner: 'o',
+      deliveryTimeoutMs: 20,
+      random: () => 1,
+    });
+    await drain.tick();
+    expect(store.snapshot()[0]).toMatchObject({
+      status: 'PENDING',
+      attempts: 1,
+      lastError: 'backend outbox delivery timed out after 20 ms',
+    });
+  });
+
+  it('the delivery timeout defaults below the lease and must stay below it', () => {
+    const store = new InMemoryBackendOutboxStore();
+    const delivery = new ScriptedDelivery(() => ({ outcome: 'DELIVERED' }));
+    expect(
+      new BackendOutboxDrainWorker(store, delivery, { owner: 'o' })
+        .deliveryTimeoutMs,
+    ).toBe(45_000);
+    expect(
+      new BackendOutboxDrainWorker(store, delivery, {
+        owner: 'o',
+        leaseMs: 20_000,
+      }).deliveryTimeoutMs,
+    ).toBe(15_000);
+    expect(
+      () =>
+        new BackendOutboxDrainWorker(store, delivery, {
+          owner: 'o',
+          leaseMs: 1_000,
+          deliveryTimeoutMs: 1_000,
+        }),
+    ).toThrow(RangeError);
+  });
+
   it('honors Retry-After', async () => {
     const store = new InMemoryBackendOutboxStore();
     await enqueue(store, A, 'a1');

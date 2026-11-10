@@ -6,6 +6,10 @@ import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import type { CustomerInboundObservationStore } from '../../human-decisions/domain/customer-inbound-observation-store.port';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
+  checkHandoffSendHold,
+  type HandoffModeReader,
+} from '../../conversation/application/handoff-send-hold';
+import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../customer-profile/domain/notice-style';
@@ -36,7 +40,7 @@ export type DeliveryZoneNotifierPorts = Pick<
     clearPendingQuote(senderId: string): Promise<void>;
     /** S1: the stored customer style; null/failure keeps the usted text. */
     customerStyle?(senderId: string): Promise<CustomerStyle | null>;
-  };
+  } & Partial<HandoffModeReader>;
 
 /**
  * Advances one requester row by one step chain:
@@ -140,6 +144,17 @@ export class DeliveryZoneNotifier {
   ): Promise<DeliveryZoneRequesterRow | null> {
     const { resolution, applyBefore } = row;
     if (resolution === null || applyBefore === null) return null;
+    // S7: no notice while the conversation is HUMAN (or the mode is
+    // unreadable). The row stays RESOLVED, so a later tick retries it; the
+    // poll time only moves it behind the other due rows.
+    if ((await this.handoffHold(row.senderId)).hold) {
+      const now = this.now();
+      await this.store.transition(row.sourceRequestId, 'RESOLVED', {
+        lastPolledAt: now,
+        updatedAt: now,
+      });
+      return null;
+    }
     const attemptedAt = this.now();
     const text = await this.insideCustomerWindow(
       row.senderId,
@@ -207,6 +222,16 @@ export class DeliveryZoneNotifier {
       // The stale PENDING quote is never orderable; clearing is a courtesy.
     }
     return notified;
+  }
+
+  private handoffHold(senderId: string) {
+    const { isHumanMode } = this.ports;
+    return checkHandoffSendHold(
+      isHumanMode === undefined
+        ? undefined
+        : { isHumanMode: (id) => isHumanMode.call(this.ports, id) },
+      senderId,
+    );
   }
 
   /** Never throws: a missing or failed profile read sends the usted text. */

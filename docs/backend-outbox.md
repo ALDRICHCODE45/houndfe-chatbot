@@ -59,7 +59,7 @@ The delivery port (`BackendOutboxDeliveryPort.deliver`) returns one of three res
 - 408, 429 and 5xx are retried.
 - Every other 4xx is permanent, including `409 IDEMPOTENCY_CONFLICT` and `409 STALE_EPOCH`.
 
-Network errors and timeouts should be thrown or returned as `RETRY`.
+Network errors and timeouts should be thrown or returned as `RETRY`. The drain worker also bounds every `deliver` call with `deliveryTimeoutMs` (default: 3/4 of the lease, 45 s for the 60 s lease; it must stay below the lease). A call that runs out of time is rescheduled as `RETRY` (`backend outbox delivery timed out after N ms`) before its lease can be reclaimed, and its late result is ignored.
 
 DEAD rows are never purged and never retried automatically. To inspect them:
 

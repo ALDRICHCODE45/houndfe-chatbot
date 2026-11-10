@@ -1,4 +1,8 @@
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import {
+  checkHandoffSendHold,
+  type HandoffModeReader,
+} from '../../conversation/application/handoff-send-hold';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { CustomerInboundObservationStore } from '../domain/customer-inbound-observation-store.port';
 import type { ExpirationApplicationLedgerPort } from '../domain/expiration-application-ledger.port';
@@ -18,7 +22,7 @@ type Ports = Pick<CustomerInboundObservationStore, 'readLatest'> &
   Pick<WhatsappSenderPort, 'sendText'> & {
     /** S1: the stored customer style; null/failure keeps the usted copy. */
     customerStyle?(senderId: string): Promise<CustomerStyle | null>;
-  };
+  } & Partial<HandoffModeReader>;
 
 export type ExpirationDeliveryResult =
   | Readonly<{ action: 'accepted'; row: AcceptedRow }>
@@ -53,6 +57,16 @@ export class ExpirationDeliveryService {
     }
   }
 
+  private handoffHold(senderId: string) {
+    const { isHumanMode } = this.ports;
+    return checkHandoffSendHold(
+      isHumanMode === undefined
+        ? undefined
+        : { isHumanMode: (id) => isHumanMode.call(this.ports, id) },
+      senderId,
+    );
+  }
+
   async deliverOnce(
     candidate: ExpirationPreparationCandidate,
   ): Promise<ExpirationDeliveryResult> {
@@ -64,6 +78,10 @@ export class ExpirationDeliveryService {
       const style = await this.readStyle(reservation.senderId);
       const copy = prepareExpirationReply(decision, style);
       if (copy.action !== 'prepared') return HOLD;
+      // S7: no notice while the conversation is HUMAN (or the mode is
+      // unreadable). Held BEFORE the claim, so the row stays PENDING and a
+      // later sweep retries it; expiry is left to the stale path.
+      if ((await this.handoffHold(reservation.senderId)).hold) return HOLD;
       const claimed = await this.ports.claimPending(candidate);
       if (claimed.action !== 'claimed') return HOLD;
       const row = claimed.row;

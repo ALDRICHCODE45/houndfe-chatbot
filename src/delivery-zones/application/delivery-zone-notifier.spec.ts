@@ -432,3 +432,54 @@ describe('DeliveryZoneNotifier customer style (S1)', () => {
     );
   });
 });
+
+describe('DeliveryZoneNotifier while the conversation is HUMAN (S7)', () => {
+  const withMode = (isHumanMode: () => Promise<boolean>) => {
+    const t = setup();
+    const ports = { ...t.ports, isHumanMode: jest.fn(isHumanMode) };
+    const notifier = new DeliveryZoneNotifier(
+      t.store,
+      ports,
+      PHONE_ID,
+      () => new Date(INSIDE),
+      () => ATTEMPT,
+    );
+    return { ...t, ports, notifier };
+  };
+  const resolvedRow = () =>
+    row({
+      status: 'RESOLVED',
+      resolution: resolution(),
+      applyBefore: APPLY_BEFORE,
+    });
+
+  it.each([
+    ['HUMAN', () => Promise.resolve(true)],
+    ['an unreadable mode', () => Promise.reject(new Error('db down'))],
+  ])(
+    '%s: no send, the row stays RESOLVED (retried on a later tick), moved to the back',
+    async (_label, isHumanMode) => {
+      const t = withMode(isHumanMode);
+      t.seed(resolvedRow());
+      await t.notifier.process(resolvedRow());
+      expect(t.ports.isHumanMode).toHaveBeenCalledWith(SENDER);
+      expect(t.ports.sendText).not.toHaveBeenCalled();
+      expect(t.ports.sendTemplate).not.toHaveBeenCalled();
+      expect(t.ports.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+      expect(t.stored()).toMatchObject({
+        status: 'RESOLVED',
+        attemptId: null,
+        deliveryOutcome: null,
+        lastPolledAt: INSIDE,
+      });
+    },
+  );
+
+  it('BOT: sends and is notified as before', async () => {
+    const t = withMode(() => Promise.resolve(false));
+    t.seed(resolvedRow());
+    await t.notifier.process(resolvedRow());
+    expect(t.ports.sendText).toHaveBeenCalledTimes(1);
+    expect(t.stored().deliveryOutcome).toBe('PROVIDER_ACCEPTED');
+  });
+});

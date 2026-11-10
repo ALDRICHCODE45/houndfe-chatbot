@@ -27,7 +27,13 @@ All times are ISO-8601 UTC.
 - **Inbound:** `WebhookDispatcherService` records each normalized customer message right after the echo filter and before dedup and the reply. Ops-phone messages and echoes of the bot's own sends are not recorded.
 - **Outbound:** `MetaWhatsappSender` records every message Meta accepted: text, image, interactive (both messages of a long split send) and template. Rows use the raw `wa_id`, before any sandbox recipient rewrite. This covers every caller of `WHATSAPP_SENDER`: replies, receipt notices, restock and delivery-zone notices.
 
-Recording is best-effort. A database error or an invalid message only logs a warning; it never blocks or fails the customer reply.
+Failures are handled per direction:
+
+- **Inbound is durable.** A store or outbox failure makes `TranscriptRecorder.recordInbound` throw. The dispatcher records before it takes the dedup claim, so the webhook fails before any claim or reply, and Meta redelivers the message. A customer message is never marked seen without its transcript row and mirror.
+- **Outbound is best-effort.** Meta already accepted the message, so a store or outbox failure only logs a warning. It is not retried, and that row and its mirror are lost.
+- **Messages that can never be stored only warn, in both directions.** These are a sender that is not a WhatsApp `wa_id`, or an invalid field. A redelivery would fail the same way forever, so the inbound still gets its reply.
+
+The sender is checked against the outbox `conversationRef` format (`^wa:[0-9]{6,20}$`) before anything is written. A sender that doesn't match is rejected with a warning (`sender is not a WhatsApp wa_id`), so a valid transcript row is never rolled back silently by an invalid mirror. The transcript accepts exactly the same `wa_id` format, so rejecting is the only consistent choice: such a row could not be stored either.
 
 The LLM still reads its history from `conversation_state`. The transcript is write-only for now.
 
@@ -37,7 +43,7 @@ Every row that is actually inserted is also queued in the backend outbox (see `d
 
 - `conversationRef` is `wa:<sender_id>` and the idempotency key is `mirror:<wa_message_id>`.
 - The payload is the contract `messages:batch` item built from the stored row: `waMessageId`, `direction`, `author`, `type`, `text?`, `media?`, `providerTimestamp?`, `observedAt`. Null fields are left out. `media` is the provider reference as stored; the future HTTP adapter uploads it and sends `mediaId` instead.
-- The transcript insert and the enqueue run in one Postgres transaction (`append(message, onInserted)` hands its client to the outbox). If the enqueue fails, both roll back and a warning is logged, so a mirror is never lost or duplicated. An inbound is recorded again on Meta's re-delivery.
+- The transcript insert and the enqueue run in one Postgres transaction (`append(message, onInserted)` hands its client to the outbox). If the enqueue fails, both roll back, so a mirror is never lost or duplicated. For an inbound the failure is rethrown and Meta's re-delivery records both again; for an outbound it is only logged.
 - A duplicate wamid inserts nothing and queues nothing.
 - The same exclusions apply as for the transcript: echoes and ops-phone inbounds are never recorded, so they are never mirrored.
 

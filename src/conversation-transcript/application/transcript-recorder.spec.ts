@@ -109,7 +109,17 @@ describe('TranscriptRecorder', () => {
     ]);
   });
 
-  it('never throws: a failing or refusing store only warns', async () => {
+  it('a failing store fails an inbound record so Meta redelivers it', async () => {
+    const failing: ConversationTranscriptStore = {
+      append: () => Promise.reject(new Error('db down')),
+      listRecent: () => Promise.resolve([]),
+      purgeExpired: () => Promise.resolve(0),
+    };
+    const broken = new TranscriptRecorder(failing, () => NOW);
+    await expect(broken.recordInbound(text, 'text')).rejects.toThrow('db down');
+  });
+
+  it('outbound stays best effort: a failing store only warns', async () => {
     const failing: ConversationTranscriptStore = {
       append: () => Promise.reject(new Error('db down')),
       listRecent: () => Promise.resolve([]),
@@ -119,7 +129,6 @@ describe('TranscriptRecorder', () => {
     const warn = jest
       .spyOn(broken['logger'], 'warn')
       .mockImplementation(() => undefined);
-    await expect(broken.recordInbound(text, 'text')).resolves.toBeUndefined();
     await expect(
       broken.recordOutbound({
         to: SENDER,
@@ -127,10 +136,35 @@ describe('TranscriptRecorder', () => {
         type: 'text',
       }),
     ).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain('db down');
+  });
+
+  it('rejects a sender that is not a wa_id clearly, without throwing (a redelivery could never succeed)', async () => {
+    const warn = jest
+      .spyOn(recorder['logger'], 'warn')
+      .mockImplementation(() => undefined);
     await expect(
       recorder.recordInbound({ ...text, senderId: 'not-a-wa-id' }, 'text'),
     ).resolves.toBeUndefined();
+    await expect(
+      recorder.recordOutbound({
+        to: '+52 1',
+        providerMessageId: 'w2',
+        type: 'text',
+      }),
+    ).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalledTimes(2);
-    expect(String(warn.mock.calls[0][0])).toContain('db down');
+    expect(String(warn.mock.calls[0][0])).toContain('not a WhatsApp wa_id');
+  });
+
+  it('an invalid message (not a store failure) only warns, inbound included', async () => {
+    const warn = jest
+      .spyOn(recorder['logger'], 'warn')
+      .mockImplementation(() => undefined);
+    await expect(
+      recorder.recordInbound({ ...text, messageId: '' }, 'text'),
+    ).resolves.toBeUndefined();
+    expect(String(warn.mock.calls[0][0])).toContain('waMessageId');
   });
 });

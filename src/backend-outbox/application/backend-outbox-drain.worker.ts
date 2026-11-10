@@ -14,6 +14,12 @@ export interface BackendOutboxDrainOptions {
   /** Conversation heads claimed (and delivered concurrently) per tick. */
   batchSize?: number;
   leaseMs?: number;
+  /**
+   * Upper bound for one delivery call; must stay below `leaseMs` so a hung
+   * call is rescheduled before its lease can be reclaimed. Default: 3/4 of
+   * the lease (45 s for the default 60 s).
+   */
+  deliveryTimeoutMs?: number;
   /** Delay before the next tick when the last one claimed less than a batch. */
   idleDelayMs?: number;
   purgeIntervalMs?: number;
@@ -41,6 +47,7 @@ export class BackendOutboxDrainWorker {
   private readonly logger = new Logger(BackendOutboxDrainWorker.name);
   private readonly batchSize: number;
   private readonly leaseMs: number;
+  readonly deliveryTimeoutMs: number;
   private readonly idleDelayMs: number;
   private readonly purgeIntervalMs: number;
   private readonly retentionMs: number;
@@ -61,6 +68,8 @@ export class BackendOutboxDrainWorker {
   ) {
     this.batchSize = options.batchSize ?? 20;
     this.leaseMs = options.leaseMs ?? 60_000;
+    this.deliveryTimeoutMs =
+      options.deliveryTimeoutMs ?? Math.floor((this.leaseMs * 3) / 4);
     this.idleDelayMs = options.idleDelayMs ?? 1_000;
     this.purgeIntervalMs = options.purgeIntervalMs ?? 3_600_000;
     this.retentionMs = options.retentionMs ?? 7 * DAY_MS;
@@ -73,6 +82,7 @@ export class BackendOutboxDrainWorker {
     for (const value of [
       this.batchSize,
       this.leaseMs,
+      this.deliveryTimeoutMs,
       this.idleDelayMs,
       this.purgeIntervalMs,
       this.retentionMs,
@@ -81,6 +91,10 @@ export class BackendOutboxDrainWorker {
     ])
       if (!Number.isSafeInteger(value) || value <= 0)
         throw new RangeError('backend outbox: bounds must be positive');
+    if (this.deliveryTimeoutMs >= this.leaseMs)
+      throw new RangeError(
+        'backend outbox: delivery timeout must be below the lease',
+      );
   }
 
   /** The first tick runs immediately; never restarts after `stop`. */
@@ -119,7 +133,7 @@ export class BackendOutboxDrainWorker {
   private async process(entry: ClaimedBackendOutboxEntry): Promise<void> {
     let result: BackendOutboxDeliveryResult;
     try {
-      result = await this.delivery.deliver(entry);
+      result = await this.deliverWithTimeout(entry);
     } catch (error) {
       result = { outcome: 'RETRY', error: describe(error) };
     }
@@ -133,6 +147,29 @@ export class BackendOutboxDrainWorker {
     } catch (error) {
       // The lease expires and the row is reclaimed; delivery is idempotent.
       this.logger.warn(`backend outbox completion failed: ${describe(error)}`);
+    }
+  }
+
+  /** A timeout rejects (→ RETRY); the late result of the call is ignored. */
+  private async deliverWithTimeout(
+    entry: ClaimedBackendOutboxEntry,
+  ): Promise<BackendOutboxDeliveryResult> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new DeliveryTimeoutError(
+              `backend outbox delivery timed out after ${this.deliveryTimeoutMs} ms`,
+            ),
+          ),
+        this.deliveryTimeoutMs,
+      );
+    });
+    try {
+      return await Promise.race([this.delivery.deliver(entry), timeout]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -200,5 +237,11 @@ export class BackendOutboxDrainWorker {
   }
 }
 
+class DeliveryTimeoutError extends Error {}
+
 const describe = (error: unknown): string =>
-  error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error';
+  error instanceof DeliveryTimeoutError
+    ? error.message
+    : error instanceof Error
+      ? `${error.name}: ${error.message}`
+      : 'unknown error';

@@ -68,17 +68,18 @@ function setup(
       Promise.resolve({ kind: 'no_pending', reply: 'ref?' }),
     ),
   };
+  const dedup = {
+    claim: jest.fn(() =>
+      Promise.resolve(options.duplicate === true ? null : 'claim-token'),
+    ),
+    release: jest.fn(() => Promise.resolve()),
+    purgeBefore: jest.fn(() => Promise.resolve(0)),
+    markSeen: jest.fn(() => Promise.resolve()),
+  };
   const service = new WebhookDispatcherService(
     {} as AgentRunner,
     sender,
-    {
-      claim: jest.fn(() =>
-        Promise.resolve(options.duplicate === true ? null : 'claim-token'),
-      ),
-      release: jest.fn(() => Promise.resolve()),
-      purgeBefore: jest.fn(() => Promise.resolve(0)),
-      markSeen: jest.fn(() => Promise.resolve()),
-    },
+    dedup,
     { remember: jest.fn(), isKnown: () => options.echo === true },
     handoff as unknown as HumanHandoffService,
     {
@@ -89,7 +90,7 @@ function setup(
     undefined,
     recorder,
   );
-  return { service, order, recorded, recorder, sender };
+  return { service, order, recorded, recorder, sender, dedup };
 }
 
 describe('WebhookDispatcherService transcript (S1)', () => {
@@ -138,19 +139,16 @@ describe('WebhookDispatcherService transcript (S1)', () => {
     expect(ops.recorder.recordInbound).not.toHaveBeenCalled();
   });
 
-  it('a failing recorder never blocks the reply', async () => {
+  it('a failing inbound record fails the delivery before any claim or reply', async () => {
     const h = setup({
       recordInbound: () => Promise.reject(new Error('db down')),
     });
-    const warn = jest
-      .spyOn(h.service['logger'], 'warn')
-      .mockImplementation(() => undefined);
-    await h.service.dispatch(event([textMessage('wamid.in-2')]));
-    expect(h.sender.sendText).toHaveBeenCalledWith({
-      to: SENDER,
-      text: 'Hola',
-    });
-    expect(String(warn.mock.calls[0][0])).toContain('db down');
+    await expect(
+      h.service.dispatch(event([textMessage('wamid.in-2')])),
+    ).rejects.toThrow('db down');
+    expect(h.dedup.claim).not.toHaveBeenCalled();
+    expect(h.dedup.markSeen).not.toHaveBeenCalled();
+    expect(h.sender.sendText).not.toHaveBeenCalled();
   });
 });
 

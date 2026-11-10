@@ -122,7 +122,10 @@ ddescribe('transcript + outbox mirror atomicity (real PostgreSQL)', () => {
         },
       },
     );
-    await recorder.recordInbound(inbound('wamid.in-2'), 'text');
+    // W5: an inbound record fails so Meta redelivers it.
+    await expect(
+      recorder.recordInbound(inbound('wamid.in-2'), 'text'),
+    ).rejects.toThrow('outbox down');
     await expect(counts()).resolves.toEqual({ messages: 0, outbox: 0 });
     const { rows } = await pool.query<{ n: string }>(
       'SELECT count(*) AS n FROM backend_outbox_sequences',
@@ -143,7 +146,10 @@ ddescribe('transcript + outbox mirror atomicity (real PostgreSQL)', () => {
         },
       },
     );
-    await recorder.recordInbound(inbound('wamid.in-3'), 'text');
+    // W5: an inbound record fails so Meta redelivers it.
+    await expect(
+      recorder.recordInbound(inbound('wamid.in-3'), 'text'),
+    ).rejects.toThrow('outbox down');
     expect(seen).toHaveLength(1);
     expect(seen[0]).toBeDefined();
     await expect(counts()).resolves.toEqual({ messages: 0, outbox: 0 });

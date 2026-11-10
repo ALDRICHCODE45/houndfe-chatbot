@@ -139,7 +139,21 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
     expect(outbox.snapshot()).toEqual([]);
   });
 
-  it('a failed enqueue rolls the transcript row back and only warns', async () => {
+  it('a failed enqueue rolls the inbound row back and fails the record (Meta redelivers)', async () => {
+    const failing = new TranscriptRecorder(store, () => NOW, {
+      enqueue: () => Promise.reject(new Error('outbox down')),
+    });
+    await expect(failing.recordInbound(inbound, 'text')).rejects.toThrow(
+      'outbox down',
+    );
+    await expect(store.listRecent(SENDER, 5)).resolves.toEqual([]);
+    // Meta's re-delivery then records and mirrors it once.
+    await recorder.recordInbound(inbound, 'text');
+    await expect(store.listRecent(SENDER, 5)).resolves.toHaveLength(1);
+    expect(outbox.snapshot()).toHaveLength(1);
+  });
+
+  it('a failed outbound enqueue rolls the row back and only warns', async () => {
     const warn = jest
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
@@ -147,14 +161,15 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
       enqueue: () => Promise.reject(new Error('outbox down')),
     });
     await expect(
-      failing.recordInbound(inbound, 'text'),
+      failing.recordOutbound({
+        to: SENDER,
+        providerMessageId: 'wamid.out-x',
+        type: 'text',
+        text: 'hola',
+      }),
     ).resolves.toBeUndefined();
     await expect(store.listRecent(SENDER, 5)).resolves.toEqual([]);
     expect(String(warn.mock.calls[0][0])).toContain('outbox down');
-    // Meta's re-delivery then records and mirrors it once.
-    await recorder.recordInbound(inbound, 'text');
-    await expect(store.listRecent(SENDER, 5)).resolves.toHaveLength(1);
-    expect(outbox.snapshot()).toHaveLength(1);
   });
 
   it('without an outbox the recorder only writes the transcript', async () => {

@@ -1,9 +1,13 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { BackendOutboxService } from '../../backend-outbox/application/backend-outbox.service';
-import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
+import {
+  conversationRefFor,
+  isConversationRef,
+} from '../../backend-outbox/domain/backend-outbox';
 import type { InboundMessage } from '../../whatsapp/domain/inbound-message';
 import {
   CONVERSATION_TRANSCRIPT,
+  InvalidTranscriptMessageError,
   type ConversationTranscriptStore,
   type TranscriptInsertHook,
   type TranscriptMedia,
@@ -35,14 +39,22 @@ export interface OutboundTranscriptRecorder {
 }
 
 /**
- * S1 best-effort writer for the durable transcript. Recording never throws:
- * a store failure or an invalid message only warns, so the customer reply
- * is never blocked or broken by the transcript.
+ * S1 writer for the durable transcript.
+ *
+ * Inbound: a store or outbox failure THROWS, so the dispatcher fails the
+ * webhook delivery before any claim or reply and Meta redelivers it; a
+ * customer message is never lost from the transcript. A message that can
+ * never be stored (a sender that is not a wa_id, an invalid field) only
+ * warns: a redelivery would fail the same way forever.
+ *
+ * Outbound: best effort. Meta already accepted the message, so a failure
+ * only warns and is not retried (that row and its mirror are lost).
  *
  * S1→S2: with the backend outbox, every row actually inserted is enqueued
  * as one MESSAGE_MIRROR in the same transaction, so a mirror is never lost
- * or duplicated; a failed enqueue rolls the row back too, and Meta's
- * re-delivery (inbound) records both again.
+ * or duplicated; a failed enqueue rolls the row back too. The sender is
+ * checked against the outbox `conversationRef` format up front, so a valid
+ * transcript row is never rolled back by an invalid mirror.
  */
 @Injectable()
 export class TranscriptRecorder implements OutboundTranscriptRecorder {
@@ -67,7 +79,7 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
     rawType?: string,
   ): Promise<void> {
     const media = message.media;
-    await this.append(message.messageId, (onInserted) =>
+    await this.append('IN', message.senderId, message.messageId, (onInserted) =>
       this.store.append(
         {
           senderId: message.senderId,
@@ -97,7 +109,7 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
   }
 
   async recordOutbound(entry: OutboundTranscriptEntry): Promise<void> {
-    await this.append(entry.providerMessageId, (onInserted) =>
+    await this.append('OUT', entry.to, entry.providerMessageId, (onInserted) =>
       this.store.append(
         {
           senderId: entry.to,
@@ -116,12 +128,25 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
   }
 
   private async append(
+    direction: 'IN' | 'OUT',
+    senderId: string,
     waMessageId: string,
     write: (onInserted?: TranscriptInsertHook) => Promise<boolean>,
   ): Promise<void> {
+    if (!isConversationRef(conversationRefFor(senderId))) {
+      this.logger.warn(
+        `transcript record rejected for ${waMessageId}: sender is not a WhatsApp wa_id`,
+      );
+      return;
+    }
     try {
       await write(this.mirrorHook());
     } catch (error) {
+      if (
+        direction === 'IN' &&
+        !(error instanceof InvalidTranscriptMessageError)
+      )
+        throw error;
       this.logger.warn(
         `transcript write failed for ${waMessageId}: ${
           error instanceof Error ? error.message : String(error)

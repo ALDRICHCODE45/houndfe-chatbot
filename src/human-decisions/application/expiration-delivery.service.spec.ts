@@ -305,3 +305,45 @@ describe('EXPIRATION notice in the stored customer style (S1)', () => {
     });
   });
 });
+
+describe('EXPIRATION notice while the conversation is HUMAN (S7)', () => {
+  const withMode = (isHumanMode: () => Promise<boolean>) => {
+    const h = setup();
+    const ports = { ...h.ports, isHumanMode: jest.fn(isHumanMode) };
+    const service = new ExpirationDeliveryService(
+      ports,
+      branchId,
+      phone,
+      h.clock,
+    );
+    return { ...h, ports, service };
+  };
+
+  it('HUMAN: holds before claiming, so the PENDING row is retried on a later sweep', async () => {
+    const h = withMode(() => Promise.resolve(true));
+    await expect(h.service.deliverOnce(buildCandidate())).resolves.toEqual({
+      action: 'hold',
+    });
+    expect(h.ports.isHumanMode).toHaveBeenCalledWith(senderId);
+    expect(h.ports.claimPending).not.toHaveBeenCalled();
+    expect(h.ports.sendText).not.toHaveBeenCalled();
+    expect(h.ports.recordAcceptance).not.toHaveBeenCalled();
+  });
+
+  it('an unreadable mode holds too (fail closed)', async () => {
+    const h = withMode(() => Promise.reject(new Error('db down')));
+    await expect(h.service.deliverOnce(buildCandidate())).resolves.toEqual({
+      action: 'hold',
+    });
+    expect(h.ports.claimPending).not.toHaveBeenCalled();
+    expect(h.ports.sendText).not.toHaveBeenCalled();
+  });
+
+  it('BOT: claims, sends and records acceptance as before', async () => {
+    const h = withMode(() => Promise.resolve(false));
+    const result = await h.service.deliverOnce(buildCandidate());
+    expect(result.action).toBe('accepted');
+    expect(h.ports.claimPending).toHaveBeenCalledTimes(1);
+    expect(h.ports.sendText).toHaveBeenCalledTimes(1);
+  });
+});

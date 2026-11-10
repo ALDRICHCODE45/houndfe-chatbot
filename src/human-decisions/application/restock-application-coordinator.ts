@@ -3,6 +3,10 @@ import { isDeepStrictEqual } from 'node:util';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
+  checkHandoffSendHold,
+  type HandoffModeReader,
+} from '../../conversation/application/handoff-send-hold';
+import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../customer-profile/domain/notice-style';
@@ -30,7 +34,7 @@ type Ports = Pick<RestockApplicationCandidateService, 'pollForSender'> &
   Pick<WhatsappSenderPort, 'sendText'> & {
     /** S1: the stored customer style; null/failure keeps the usted text. */
     customerStyle?(senderId: string): Promise<CustomerStyle | null>;
-  };
+  } & Partial<HandoffModeReader>;
 type TerminalRow = Extract<
   RestockApplicationLedgerRow,
   { state: 'PROVIDER_ACCEPTED' | 'PROVIDER_ACCEPTED_LATE' | 'STALE' }
@@ -86,6 +90,16 @@ export class RestockApplicationCoordinator {
     private readonly tokenFactory: () => string = randomUUID,
   ) {}
 
+  private handoffHold(senderId: string) {
+    const { isHumanMode } = this.ports;
+    return checkHandoffSendHold(
+      isHumanMode === undefined
+        ? undefined
+        : { isHumanMode: (id) => isHumanMode.call(this.ports, id) },
+      senderId,
+    );
+  }
+
   async applyOnce(
     senderId: string,
     sourceRequestId: string,
@@ -107,6 +121,14 @@ export class RestockApplicationCoordinator {
         decision.snapshot.branchId !== branchId
       )
         return HOLD;
+      // S7: no notice while the conversation is HUMAN (or the mode is
+      // unreadable). `pending` before any durable step makes the poller
+      // retry; an already expired candidate goes on (it never sends).
+      if (
+        candidate.classification.action === 'ready' &&
+        (await this.handoffHold(senderId)).hold
+      )
+        return PENDING;
       // S1: read before the claim; nothing async between the final check
       // and the send. A missing or failed read keeps the usted copy.
       const style = await readStyle(ports, senderId);

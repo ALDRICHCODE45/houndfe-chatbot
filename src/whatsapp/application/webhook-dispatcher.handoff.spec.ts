@@ -49,6 +49,9 @@ function setup(
     handoffError?: Error;
     pendingMarker?: boolean;
     awaitingPayment?: boolean;
+    /** Successive isHumanMode answers (the last one repeats). */
+    modes?: boolean[];
+    opsResolved?: boolean;
   } = {},
 ) {
   const order: string[] = [];
@@ -69,7 +72,12 @@ function setup(
       return Promise.resolve({ kind: 'handled', reply: 'Hola' });
     }),
   };
-  const runner = { handle: jest.fn() };
+  const runner = {
+    handle: jest.fn(() => {
+      order.push('runner');
+      return Promise.resolve({ reply: 'Retomamos' });
+    }),
+  };
   const dedup = {
     claim: jest.fn(() => Promise.resolve<string | null>('claim-token')),
     release: jest.fn(() => Promise.resolve()),
@@ -82,7 +90,15 @@ function setup(
   const handoff = {
     isOpsSender: (id: string) => id === OPS,
     resolveReply: jest.fn(() =>
-      Promise.resolve({ kind: 'no_pending', reply: 'ref?' }),
+      Promise.resolve(
+        options.opsResolved
+          ? {
+              kind: 'resolved',
+              customerId: SENDER,
+              syntheticUserText: 'agent said yes',
+            }
+          : { kind: 'no_pending', reply: 'ref?' },
+      ),
     ),
   };
   const store = {
@@ -122,12 +138,14 @@ function setup(
       return Promise.resolve();
     }),
   };
+  const modes = [...(options.modes ?? [])];
   const handoffMode = {
     isHumanMode: jest.fn((senderId: string) => {
       order.push(`mode ${senderId}`);
-      return options.handoffError
-        ? Promise.reject(options.handoffError)
-        : Promise.resolve(options.human === true);
+      if (options.handoffError) return Promise.reject(options.handoffError);
+      if (modes.length > 0)
+        return Promise.resolve(modes.length > 1 ? modes.shift()! : modes[0]);
+      return Promise.resolve(options.human === true);
     }),
   };
   const service = new WebhookDispatcherService(
@@ -218,6 +236,7 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
       'record wamid.b1',
       `mode ${SENDER}`,
       'turn',
+      `mode ${SENDER}`,
       'send',
       'seen wamid.b1',
     ]);
@@ -237,5 +256,68 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     ).rejects.toThrow('db down');
     expectSilent(h);
     expect(h.dedup.markSeen).not.toHaveBeenCalled();
+  });
+
+  it('ops resolved while the customer is HUMAN: no runner turn, no customer send, ops message completed', async () => {
+    const h = setup({ human: true, opsResolved: true });
+    const log = jest
+      .spyOn(h.service['logger'], 'log')
+      .mockImplementation(() => undefined);
+    await h.service.dispatch(event([text('wamid.ops-r', OPS)]));
+    expect(h.handoffMode.isHumanMode).toHaveBeenCalledWith(SENDER);
+    expectSilent(h);
+    expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.ops-r');
+    expect(
+      log.mock.calls.some(([line]) => String(line).includes('HUMAN')),
+    ).toBe(true);
+  });
+
+  it('ops resolved with an unreadable customer mode fails closed (no turn, no send)', async () => {
+    const h = setup({ handoffError: new Error('db down'), opsResolved: true });
+    jest.spyOn(h.service['logger'], 'warn').mockImplementation(() => undefined);
+    await h.service.dispatch(event([text('wamid.ops-e', OPS)]));
+    expectSilent(h);
+    expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.ops-e');
+  });
+
+  it('ops resolved while the customer is BOT: the resume turn runs as before', async () => {
+    const h = setup({ human: false, opsResolved: true });
+    await h.service.dispatch(event([text('wamid.ops-b', OPS)]));
+    expect(h.order).toEqual([
+      `mode ${SENDER}`,
+      'runner',
+      'send',
+      'seen wamid.ops-b',
+    ]);
+    expect(h.sender.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: 'Retomamos',
+    });
+  });
+
+  it('switched to HUMAN mid-turn: the agent reply is dropped, the message is still marked seen', async () => {
+    const h = setup({ modes: [false, true] });
+    const onSent = jest.fn();
+    h.agent.tryHandle.mockImplementation(() => {
+      h.order.push('turn');
+      return Promise.resolve({
+        kind: 'handled',
+        reply: 'Hola',
+        media: [{ url: 'https://cdn.example.com/p.jpg' }],
+        onSent,
+      } as never);
+    });
+    await h.service.dispatch(event([text('wamid.mid')]));
+    expect(h.order).toEqual([
+      'record wamid.mid',
+      `mode ${SENDER}`,
+      'turn',
+      `mode ${SENDER}`,
+      'seen wamid.mid',
+    ]);
+    expect(h.sender.sendText).not.toHaveBeenCalled();
+    expect(h.sender.sendImage).not.toHaveBeenCalled();
+    expect(h.sender.sendInteractive).not.toHaveBeenCalled();
+    expect(onSent).not.toHaveBeenCalled();
   });
 });
