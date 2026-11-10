@@ -315,6 +315,150 @@ export function runConversationStoreContract(
       expect(fetched!.data.cart).toEqual(['sku-1']);
     });
 
+    // S7 handoff mode: epoch-monotonic CAS on the protected `data.handoff`.
+    describe('handoff mode CAS (S7)', () => {
+      const human = (epoch: number, requestId = `req-${epoch}`) => ({
+        mode: 'HUMAN' as const,
+        epoch,
+        requestId,
+      });
+      const bot = (epoch: number) => ({
+        mode: 'BOT' as const,
+        epoch,
+        requestId: null,
+      });
+
+      it('defaults to BOT at epoch 0 without creating a row', async () => {
+        await expect(store.getHandoff!('h0')).resolves.toEqual({
+          mode: 'BOT',
+          epoch: 0,
+          requestId: null,
+          updatedAt: null,
+        });
+        expect(await store.get('h0')).toBeNull();
+      });
+
+      it('starts a session at a newer epoch and preserves siblings', async () => {
+        await store.create('h1', { lastMessageAt: T, data: { cart: ['a'] } });
+        const result = await store.applyHandoff!('h1', human(1));
+        expect(result).toMatchObject({
+          applied: true,
+          state: { mode: 'HUMAN', epoch: 1, requestId: 'req-1' },
+        });
+        const state = await store.getHandoff!('h1');
+        expect(state).toMatchObject(human(1));
+        expect(typeof state.updatedAt).toBe('string');
+        const row = await store.get('h1');
+        expect(row!.data.cart).toEqual(['a']);
+        expect(row!.lastMessageAt).toBe(T);
+      });
+
+      it('treats a same-epoch replay as an idempotent DUPLICATE', async () => {
+        await store.applyHandoff!('h2', human(1));
+        const before = await store.get('h2');
+        await expect(store.applyHandoff!('h2', human(1))).resolves.toEqual({
+          applied: false,
+          reason: 'DUPLICATE',
+        });
+        await store.applyHandoff!('h2', bot(1));
+        await expect(store.applyHandoff!('h2', bot(1))).resolves.toEqual({
+          applied: false,
+          reason: 'DUPLICATE',
+        });
+        expect(before!.data.handoff).toMatchObject(human(1));
+      });
+
+      it('ends the session with BOT at the same epoch and never restarts it', async () => {
+        await store.applyHandoff!('h3', human(2));
+        await expect(store.applyHandoff!('h3', bot(2))).resolves.toMatchObject({
+          applied: true,
+        });
+        await expect(store.getHandoff!('h3')).resolves.toMatchObject(bot(2));
+        await expect(store.applyHandoff!('h3', human(2))).resolves.toEqual({
+          applied: false,
+          reason: 'STALE_EPOCH',
+        });
+        await expect(store.getHandoff!('h3')).resolves.toMatchObject(bot(2));
+      });
+
+      it('starts a new session at epoch N+1 after N ended', async () => {
+        await store.applyHandoff!('h4', human(2));
+        await store.applyHandoff!('h4', bot(2));
+        await expect(
+          store.applyHandoff!('h4', human(3)),
+        ).resolves.toMatchObject({ applied: true });
+        await expect(store.getHandoff!('h4')).resolves.toMatchObject(human(3));
+      });
+
+      it('ignores an older epoch in either mode', async () => {
+        await store.applyHandoff!('h5', human(5));
+        for (const order of [bot(4), human(4), bot(0)]) {
+          await expect(store.applyHandoff!('h5', order)).resolves.toEqual({
+            applied: false,
+            reason: 'STALE_EPOCH',
+          });
+        }
+        await expect(store.getHandoff!('h5')).resolves.toMatchObject(human(5));
+      });
+
+      it('refuses HUMAN with another requestId at the same epoch', async () => {
+        await store.applyHandoff!('h6', human(1, 'req-a'));
+        await expect(
+          store.applyHandoff!('h6', human(1, 'req-b')),
+        ).resolves.toEqual({ applied: false, reason: 'STALE_EPOCH' });
+      });
+
+      it('refuses HUMAN at the default epoch 0 and creates no row', async () => {
+        await expect(store.applyHandoff!('h7', human(0))).resolves.toEqual({
+          applied: false,
+          reason: 'STALE_EPOCH',
+        });
+        expect(await store.get('h7')).toBeNull();
+      });
+
+      it.each([
+        ['negative epoch', { mode: 'HUMAN', epoch: -1, requestId: 'r' }],
+        ['fractional epoch', { mode: 'HUMAN', epoch: 1.5, requestId: 'r' }],
+        ['HUMAN without request', { mode: 'HUMAN', epoch: 1, requestId: null }],
+        ['unknown mode', { mode: 'PAUSED', epoch: 1, requestId: 'r' }],
+      ])('rejects a malformed order (%s) without writes', async (_, order) => {
+        // SAFETY: deliberately malformed runtime input to prove fail-closed.
+        const malformed = order as unknown as ReturnType<typeof bot>;
+        await expect(store.applyHandoff!('h8', malformed)).resolves.toEqual({
+          applied: false,
+          reason: 'INVALID',
+        });
+        expect(await store.get('h8')).toBeNull();
+      });
+
+      it('fails closed on a corrupt stored value', async () => {
+        await store.create('h9', {
+          lastMessageAt: T,
+          data: { handoff: { mode: 'HUMAN' } as never },
+        });
+        await expect(store.getHandoff!('h9')).rejects.toThrow(/handoff/);
+        await expect(store.applyHandoff!('h9', human(9))).resolves.toEqual({
+          applied: false,
+          reason: 'INVALID',
+        });
+      });
+
+      it('survives ordinary update() writes (protected key)', async () => {
+        await store.applyHandoff!('h10', human(1));
+        await store.update('h10', {
+          lastMessageAt: T,
+          data: { cart: ['b'], handoff: bot(7) as never },
+        });
+        await store.update('h10', { lastMessageAt: T, data: {} });
+        await expect(store.getHandoff!('h10')).resolves.toMatchObject(human(1));
+        await store.update('h11', {
+          lastMessageAt: T,
+          data: { handoff: human(4) as never },
+        });
+        await expect(store.getHandoff!('h11')).resolves.toMatchObject(bot(0));
+      });
+    });
+
     it('update() cannot resurrect a cleared marker', async () => {
       const m = casMarker('bbbb22223333');
       await setCas('u2', m);

@@ -26,6 +26,7 @@ describe('MetaWhatsappSender transcript (S1)', () => {
   let recorder: OutboundTranscriptRecorder;
   let sender: MetaWhatsappSender;
   let sandbox: boolean;
+  let opsPhone: string | undefined;
 
   const accept = (...ids: string[]) => {
     for (const id of ids)
@@ -47,7 +48,13 @@ describe('MetaWhatsappSender transcript (S1)', () => {
       }),
     };
     sandbox = false;
+    opsPhone = undefined;
     const config = new ConfigService({
+      humanHandoff: {
+        get opsChannelPhone() {
+          return opsPhone;
+        },
+      },
       meta: {
         accessToken: 't',
         phoneNumberId: '1',
@@ -139,6 +146,27 @@ describe('MetaWhatsappSender transcript (S1)', () => {
         },
       },
     });
+  });
+
+  it('never records a send to the ops phone (it is not a customer conversation)', async () => {
+    opsPhone = '5215500000000';
+    accept('wamid.ops', 'wamid.customer');
+    await sender.sendText({ to: '5215500000000', text: 'HF-1 pendiente' });
+    await sender.sendText({ to: TO, text: 'hola' });
+    expect(entries.map((entry) => entry.providerMessageId)).toEqual([
+      'wamid.customer',
+    ]);
+  });
+
+  it('matches the ops phone under the sandbox normalization only when enabled', async () => {
+    opsPhone = '525500000000';
+    accept('wamid.exact');
+    await sender.sendText({ to: '5215500000000', text: 'x' });
+    expect(entries).toHaveLength(1);
+    sandbox = true;
+    accept('wamid.sandbox');
+    await sender.sendText({ to: '5215500000000', text: 'x' });
+    expect(entries).toHaveLength(1);
   });
 
   it('records nothing when Meta refuses the send', async () => {

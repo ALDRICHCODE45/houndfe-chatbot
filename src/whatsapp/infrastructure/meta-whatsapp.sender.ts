@@ -198,14 +198,14 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
 
   /**
    * S1: every message Meta accepted, under the raw wa_id (before the
-   * sandbox rewrite). The recorder never throws; the extra catch keeps a
+   * sandbox rewrite), except sends to the ops phone. The recorder never throws; the extra catch keeps a
    * misbehaving one from failing a send that already happened.
    */
   private async recordTranscript(
     payload: MetaMessagePayload,
     providerMessageId: string,
   ): Promise<void> {
-    if (this.transcript === undefined) return;
+    if (this.transcript === undefined || this.isOpsPhone(payload.to)) return;
     try {
       await this.transcript.recordOutbound(
         transcriptEntry(payload, providerMessageId),
@@ -217,6 +217,25 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         }`,
       );
     }
+  }
+
+  /**
+   * The ops phone is not a customer conversation: its sends are never
+   * recorded (nor mirrored). Same comparison as the dispatcher's
+   * `isOpsSender`: exact by default, both sides rewritten only under
+   * `META_SANDBOX_RECIPIENT_NORMALIZATION`.
+   */
+  private isOpsPhone(to: string): boolean {
+    const ops = this.configService.get<string>('humanHandoff.opsChannelPhone');
+    if (!ops) return false;
+    const sandbox =
+      this.configService.get<boolean>(
+        'meta.sandboxRecipientNormalizationEnabled',
+      ) === true;
+    return (
+      normalizeSandboxRecipient(to, sandbox) ===
+      normalizeSandboxRecipient(ops, sandbox)
+    );
   }
 
   private async postMessage(

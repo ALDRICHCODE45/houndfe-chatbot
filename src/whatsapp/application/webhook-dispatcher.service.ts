@@ -40,6 +40,7 @@ import {
 import { TranscriptRecorder } from '../../conversation-transcript/application/transcript-recorder';
 import { BackendOutboxService } from '../../backend-outbox/application/backend-outbox.service';
 import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
+import { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import { normalizeMetaStatuses } from './meta-status-normalizer';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
@@ -77,6 +78,13 @@ import {
  *          the ASK_FOR_REF message.
  *        - The hook `continue`s past the pending-marker short-circuit +
  *          customer runner path.
+ *   3b. **S7 handoff gate** — when the customer conversation is in HUMAN
+ *      mode (`data.handoff`), nothing below runs: no profile warm-up, no
+ *      canned reply, no receipt ingress, no vision, no agent, no send. The
+ *      inbound was already recorded in step 1b (so T3 mirrors it to the
+ *      backend outbox, receipt images/documents included); it is only
+ *      marked seen. An unreadable mode throws (fail closed: Meta
+ *      redelivers, the bot never speaks while the mode is unknown).
  *   4. **Pending-marker short-circuit** (new, ADR-29 defense-in-depth) —
  *      when the customer's `data.pendingHumanRequest` is set, send the
  *      canned `PENDING_HUMAN_REQUEST_REPLY` (in the customer's style) and
@@ -135,6 +143,10 @@ export class WebhookDispatcherService {
     @Optional()
     @Inject(BackendOutboxService)
     private readonly outbox?: Pick<BackendOutboxService, 'enqueue'>,
+    // S7 handoff gate. Required by DI (no @Optional: the runtime graph must
+    // never silently lose the gate); optional in TS only for harnesses.
+    @Inject(HandoffModeService)
+    private readonly handoffMode?: Pick<HandoffModeService, 'isHumanMode'>,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -215,6 +227,15 @@ export class WebhookDispatcherService {
               }`,
             );
           }
+          continue;
+        }
+
+        // ─── (3b) S7 handoff gate: HUMAN mode never reaches the bot ────
+        if (await this.isHumanMode(message.senderId)) {
+          this.logger.debug(
+            `handoff HUMAN: mirror-only ${message.messageId} from ${message.senderId}`,
+          );
+          await this.markSeenSafely(message.messageId);
           continue;
         }
 
@@ -340,6 +361,12 @@ export class WebhookDispatcherService {
         );
       }
     }
+  }
+
+  /** S7: false without a wired service (harnesses); read errors propagate. */
+  private async isHumanMode(senderId: string): Promise<boolean> {
+    if (this.handoffMode === undefined) return false;
+    return this.handoffMode.isHumanMode(senderId);
   }
 
   /** S1: customer inbounds only (never the ops phone); never throws. */

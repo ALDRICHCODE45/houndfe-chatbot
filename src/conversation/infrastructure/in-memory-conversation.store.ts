@@ -3,6 +3,14 @@ import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { AgentTurnCommit } from '../domain/conversation-store';
+import {
+  CorruptHandoffStateError,
+  readHandoffState,
+  resolveHandoffApply,
+  type HandoffApplyResult,
+  type HandoffState,
+  type HandoffTransition,
+} from '../domain/handoff-mode';
 import { normalizeMinimalCheckoutDraft } from '../domain/minimal-checkout-draft';
 import {
   ConversationState,
@@ -205,6 +213,38 @@ export class InMemoryConversationStore implements ConversationStore {
     return true;
   }
 
+  async getHandoff(senderId: string): Promise<HandoffState> {
+    const state = readHandoffState(this.map.get(senderId)?.data.handoff);
+    if (state === null) throw new CorruptHandoffStateError(senderId);
+    return state;
+  }
+
+  async applyHandoff(
+    senderId: string,
+    transition: HandoffTransition,
+  ): Promise<HandoffApplyResult> {
+    if (!isNonEmptyString(senderId)) {
+      return { applied: false, reason: 'INVALID' };
+    }
+    const live = this.map.get(senderId);
+    const result = resolveHandoffApply(
+      live?.data.handoff,
+      transition,
+      new Date().toISOString(),
+    );
+    if (!result.applied) return result;
+    if (live) {
+      live.data = { ...live.data, handoff: { ...result.state } };
+    } else {
+      this.map.set(senderId, {
+        senderId,
+        lastMessageAt: result.state.updatedAt!,
+        data: { handoff: { ...result.state } },
+      });
+    }
+    return result;
+  }
+
   async get(senderId: string): Promise<ConversationState | null> {
     const state = this.map.get(senderId);
     return state ? this.checkoutSnapshot(state) : null;
@@ -273,6 +313,7 @@ export class InMemoryConversationStore implements ConversationStore {
     // The handoff marker is CAS-owned; strip any stale patch value and
     // reapply the LIVE one (including explicit JSON null) below.
     delete data.pendingHumanRequest;
+    delete data.handoff;
     delete data.messages;
     delete data.catalogReferences;
     delete data.agentRevision;
@@ -301,6 +342,7 @@ export class InMemoryConversationStore implements ConversationStore {
             'agentRevision',
             'minimalCart',
             'minimalCheckoutDraft',
+            'handoff',
           ]
             .filter((key) => existing && Object.hasOwn(existing.data, key))
             .map((key) => [key, existing!.data[key]]),

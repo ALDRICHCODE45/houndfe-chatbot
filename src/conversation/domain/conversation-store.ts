@@ -1,4 +1,9 @@
 import type { CatalogReferences } from './catalog-references';
+import type {
+  HandoffApplyResult,
+  HandoffState,
+  HandoffTransition,
+} from './handoff-mode';
 
 /** DI injection token for the ConversationStore port. */
 export const CONVERSATION_STORE = Symbol('CONVERSATION_STORE');
@@ -50,6 +55,8 @@ export interface ConversationStateData {
   placedSaleId?: string;
   /** Human-handoff marker; null when no escalation is pending. */
   pendingHumanRequest?: PendingHumanRequest | null;
+  /** S7 handoff mode; CAS-owned (see `ConversationStore.applyHandoff`). */
+  handoff?: HandoffState | null;
   [key: string]: unknown;
 }
 
@@ -271,6 +278,26 @@ export interface ConversationStore {
     senderId: string,
     requestId: string,
   ): Promise<boolean>;
+
+  /**
+   * S7: the sender's handoff mode; the BOT/epoch 0 default when none was
+   * ever applied. Throws `CorruptHandoffStateError` for a corrupt value so
+   * a caller never guesses the mode. Optional only for older adapters and
+   * hand-built mocks; both real adapters implement it, and
+   * `HandoffModeService` fails closed when it is absent.
+   */
+  getHandoff?(senderId: string): Promise<HandoffState>;
+
+  /**
+   * S7 epoch-monotonic CAS write of `data.handoff` (rule:
+   * `decideHandoffTransition`). Atomic per sender; sibling keys and
+   * `lastMessageAt` of an existing row are preserved. A refused order
+   * writes nothing (no row is created either), so replays are idempotent.
+   */
+  applyHandoff?(
+    senderId: string,
+    transition: HandoffTransition,
+  ): Promise<HandoffApplyResult>;
 
   /**
    * Returns the current state for a sender, or null if none exists.
