@@ -15,19 +15,20 @@ Product design: `docs/intervencion-humana-diseno.md`. Chatbot contract excerpt: 
 
 ## Tasks
 
-| ID  | Specs | Route                                                 | Commit                         |
-| --- | ----- | ----------------------------------------------------- | ------------------------------ |
-| T1  | S1    | worker: durable transcript                            | 2fa42a4                        |
-| T2  | S2    | worker: backend outbox + drain worker behind a port   | 7025ded                        |
-| T3  | S3    | worker: statuses normalizer into outbox               | b615d10                        |
-| T4  | S7    | worker: handoff mode with CAS + dispatcher gate       | 741b6b7                        |
-| T5  | S5    | worker: replace one-active-reservation index          | a7a75da                        |
-| T6  | S6    | worker: processed_webhook_messages purge and ordering | e2acd7c                        |
-| T7  | S4    | worker: durable conversation gates                    | 9d33f36                        |
-| T8  | all   | full suite + verify                                   | full suite 8476 pass (19954be) |
+| ID  | Specs | Route                                                 | Commit  |
+| --- | ----- | ----------------------------------------------------- | ------- |
+| T1  | S1    | worker: durable transcript                            | 2fa42a4 |
+| T2  | S2    | worker: backend outbox + drain worker behind a port   | 7025ded |
+| T3  | S3    | worker: statuses normalizer into outbox               | b615d10 |
+| T4  | S7    | worker: handoff mode with CAS + dispatcher gate       | 741b6b7 |
+| T5  | S5    | worker: replace one-active-reservation index          | a7a75da |
+| T6  | S6    | worker: processed_webhook_messages purge and ordering | e2acd7c |
+| T7  | S4    | worker: durable conversation gates                    | 9d33f36 |
+| T8  | all   | full suite + verify                                   | fbc3e62 |
 
 ## Log
 
 - L1 — Owner, 2026-11-09, after the design: "Si hermano, me parece bien, y el backend tambien puede tener inferencia en el cierre del contrato o en el cierre de las desiciones que se tomen antes de iniciar a implementar, aun no sabemos lo que necesite el backend o que es lo que proponga para el tema de la conversacion completa con el humano, esa parte hay que disenarla muy bien para poder hacer algo que aguante y que sea seguro. por lo demas, adelante, coordinense cuando queiran."
 - L2 — 2026-11-10: contract v1 closed by backend (b2fe56af); chatbot confirmed reconciliation (unit 0). Owner on current-code risks (via backend): "hay que tnerlos bien encuenta y muy presentes, porque si o si esto debe ser optimo y con un buen performance."
 - L3 — 2026-11-10: T1–T7 committed (2fa42a4, 7025ded, b615d10, 741b6b7, a7a75da, e2acd7c, 9d33f36). Pre-existing Docker specs that rolled back "one step" assumed their migration was last; fixed to roll back by count (outbox in b615d10, 03fc762 receipt-media, 19954be customer-profile). Full suite with RUN_DOCKER_TESTS=1: 330 suites, 8476 passed, 23 skipped, 0 failed. Preflight requires migrations 3800, 3900, 4000, 4100, 4200. Follow-ups: restock open-limit customer wording (sale-flow), legacy pendingHumanRequest still blocks restock until the ops channel is retired, backend to confirm epoch increments on every claim.
+- L4 — 2026-11-10: independent verify (gentle-ai-verify): no blockers; D1 (ops reply resumed a customer turn without the HUMAN check), D2 (proactive notices ignored HUMAN mode), W1, W2, W5 fixed in ce51987 and fbc3e62 (holds wired into expiration, restock, delivery-zone and receipt notices; fail closed; no attempt consumed). Remaining low warnings accepted and documented: at-least-once duplicate reply on crash after send (W3), cross-process gate put/delete ordering (W4, consent stays safe). Full suite with RUN_DOCKER_TESTS=1 at fbc3e62: 334 suites, 8520 passed, 23 skipped, 0 failed. Native review assess: high (reviewDue); the branch is too large for one review, so the native review should run per work-unit commit (T4 741b6b7, T6 e2acd7c first) under the owner's consent.
