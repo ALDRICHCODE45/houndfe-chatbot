@@ -132,6 +132,12 @@ Staff can cancel a clarification, or a `TALK_TO_HUMAN`/`COMPLAINT` while its ses
 - Optional `customerNote` (at most 500 chars, accepted in backend §12.14): when present and the window is open, the bot sends it verbatim with the team-reply prefix instead of the generic notice. Feed item: `request.cancelled {requestId, reason, cancelledBy: STAFF, customerNote?}`.
 - The server rejects staff cancellation of a `TALK_TO_HUMAN`/`COMPLAINT` whose session is STARTING, ACTIVE or ENDING with `409 CANCEL_NOT_ALLOWED`, checked under the request row lock.
 
+## Epoch rules (backend §12.15, confirmed 2026-11-10)
+
+- Every WAITING→STARTING transition increments `handoffEpoch` (N→N+1), including a retried claim after a revert, a release or an end. An epoch is never reused. HUMAN→BOT (end or revert) stays at epoch N. This matches the chatbot's CAS rule in `src/conversation/domain/handoff-mode.ts`.
+- When STARTING gets no `session-ack STARTED` within 60 s, the backend reverts to WAITING and, in the same transaction, enqueues `conversation.ended {requestId, handoffEpoch: N, reason: START_TIMEOUT}`. The bot unmutes right away; no farewell, because the session never became active.
+- A late `session-ack STARTED` for epoch N after that gets `409 STALE_EPOCH`; the bot is already in BOT mode from the `conversation.ended`.
+
 ## Live conversation (§4), chatbot obligations
 
 - **Every order carries an epoch** (`handoffEpoch`, incremented each time the conversation goes to a human). The bot ignores orders from an older epoch.
