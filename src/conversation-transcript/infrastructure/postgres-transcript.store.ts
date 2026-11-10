@@ -8,6 +8,7 @@ import {
   normalizeTranscriptMessage,
   type ConversationTranscriptStore,
   type TranscriptAuthor,
+  type TranscriptInsertHook,
   type TranscriptDirection,
   type TranscriptMedia,
   type TranscriptMessage,
@@ -28,7 +29,7 @@ interface TranscriptRow {
   purge_after: Date;
 }
 
-type Queryable = Pick<Pool, 'query'>;
+type Queryable = Pick<Pool, 'query' | 'connect'>;
 
 const COLUMNS =
   'sender_id, wa_message_id, direction, author, type, text, media, details, ' +
@@ -82,9 +83,33 @@ function toMessage(row: TranscriptRow): TranscriptMessage {
 export class PostgresTranscriptStore implements ConversationTranscriptStore {
   constructor(@Inject(PG_POOL) private readonly pool: Queryable) {}
 
-  async append(message: TranscriptMessageInput): Promise<boolean> {
+  async append(
+    message: TranscriptMessageInput,
+    onInserted?: TranscriptInsertHook,
+  ): Promise<boolean> {
     const row = normalizeTranscriptMessage(message);
-    const result = await this.pool.query(APPEND, [
+    if (onInserted === undefined) return this.insert(this.pool, row);
+    // Insert and hook share one transaction; a hook failure undoes both.
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const inserted = await this.insert(client, row);
+      if (inserted) await onInserted(row, client);
+      await client.query('COMMIT');
+      return inserted;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async insert(
+    db: Pick<Pool, 'query'>,
+    row: TranscriptMessage,
+  ): Promise<boolean> {
+    const result = await db.query(APPEND, [
       row.senderId,
       row.waMessageId,
       row.direction,

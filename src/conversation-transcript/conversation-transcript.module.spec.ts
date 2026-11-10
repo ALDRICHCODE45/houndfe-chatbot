@@ -1,5 +1,7 @@
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
+import { BackendOutboxService } from '../backend-outbox/application/backend-outbox.service';
+import { BackendOutboxDrainLifecycle } from '../backend-outbox/backend-outbox.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import { MetaWhatsappSender } from '../whatsapp/infrastructure/meta-whatsapp.sender';
@@ -37,8 +39,13 @@ describe('ConversationTranscriptModule wiring (S1)', () => {
     expect(moduleRef.get(OUTBOUND_TRANSCRIPT_RECORDER)).toBe(
       moduleRef.get(TranscriptRecorder),
     );
-    // Feature graphs never start the purge timer.
+    // S1→S2: the recorder mirrors through the shared outbox service.
+    expect(moduleRef.get(TranscriptRecorder)['outbox']).toBe(
+      moduleRef.get(BackendOutboxService),
+    );
+    // Feature graphs never start the purge timer or the outbox drain.
     expect(() => moduleRef.get(TranscriptPurgeWorker)).toThrow();
+    expect(() => moduleRef.get(BackendOutboxDrainLifecycle)).toThrow();
     await moduleRef.close();
   });
 

@@ -13,10 +13,26 @@ await backendOutbox.enqueue({
 });
 ```
 
-- Import `BackendOutboxModule` and inject `BackendOutboxService`.
+- Import `BackendOutboxEnqueueModule` and inject `BackendOutboxService`.
 - The idempotency key is unique across the table. Enqueueing the same key again is a no-op and returns the existing row, even if that row is DONE or DEAD.
 - Pass `{ client }` to enqueue inside your own open transaction. The row then commits or rolls back with your write. Without it, the call uses its own transaction.
 - Invalid input throws: a bad `conversationRef`, unknown kind, empty or oversized key, or a payload that is not an object. Nothing is dropped silently.
+
+## Kinds enqueued today
+
+| Kind             | Producer                                                     | conversationRef     | Idempotency key                       | Payload                                                                                 |
+| ---------------- | ------------------------------------------------------------ | ------------------- | ------------------------------------- | --------------------------------------------------------------------------------------- |
+| `MESSAGE_MIRROR` | `TranscriptRecorder`, same transaction as the transcript row | `wa:<sender_id>`    | `mirror:<wa_message_id>`              | `{waMessageId, direction, author, type, text?, media?, providerTimestamp?, observedAt}` |
+| `MESSAGE_STATUS` | `WebhookDispatcherService`, from Meta `value.statuses[]`     | `wa:<recipient_id>` | `status:<providerMessageId>:<status>` | `{providerMessageId, status, occurredAt, errorCode?}` (statuses:batch item)             |
+
+Statuses (`normalizeMetaStatuses` in `src/whatsapp/application/meta-status-normalizer.ts`):
+
+- Only `sent`, `delivered`, `read` and `failed` are kept. Other values and malformed items are skipped with a debug log.
+- `occurredAt` is Meta's seconds timestamp as ISO-8601 UTC with ms. `errorCode` is the first `errors[].code` as a string.
+- Statuses never reach the LLM and never trigger a reply. A statuses-only webhook answers 200 after one enqueue per status.
+- Statuses for the ops phone are skipped. An enqueue failure only logs a warning; the messages in the same webhook are still processed.
+
+Feature modules import `BackendOutboxEnqueueModule` (store and `BackendOutboxService` only). `BackendOutboxModule`, imported only by `AppModule`, adds the delivery port and the single drain worker.
 
 ## Ordering
 

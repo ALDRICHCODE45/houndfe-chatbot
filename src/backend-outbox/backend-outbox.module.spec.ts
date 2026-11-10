@@ -4,6 +4,7 @@ import { PG_POOL } from '../database/postgres-pool.provider';
 import { BackendOutboxService } from './application/backend-outbox.service';
 import {
   BackendOutboxDrainLifecycle,
+  BackendOutboxEnqueueModule,
   BackendOutboxModule,
 } from './backend-outbox.module';
 import {
@@ -41,6 +42,21 @@ describe('BackendOutboxModule', () => {
     expect(moduleRef.get(BackendOutboxService)).toBeInstanceOf(
       BackendOutboxService,
     );
+    await moduleRef.close();
+  });
+
+  it('the enqueue-only module never runs a drain worker', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [BackendOutboxEnqueueModule],
+    })
+      .overrideProvider(PG_POOL)
+      .useValue(fakePool())
+      .compile();
+    expect(moduleRef.get(BackendOutboxService)).toBeInstanceOf(
+      BackendOutboxService,
+    );
+    expect(() => moduleRef.get(BackendOutboxDrainLifecycle)).toThrow();
+    expect(() => moduleRef.get<unknown>(BACKEND_OUTBOX_DELIVERY)).toThrow();
     await moduleRef.close();
   });
 

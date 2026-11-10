@@ -5,6 +5,7 @@ import {
   isValidTranscriptSenderId,
   normalizeTranscriptMessage,
   type ConversationTranscriptStore,
+  type TranscriptInsertHook,
   type TranscriptMessage,
   type TranscriptMessageInput,
 } from '../domain/transcript.port';
@@ -15,18 +16,22 @@ export class InMemoryTranscriptStore implements ConversationTranscriptStore {
   // Insertion order breaks observed_at ties, like the Postgres id.
   private readonly rows = new Map<string, TranscriptMessage>();
 
-  append(message: TranscriptMessageInput): Promise<boolean> {
-    let row: TranscriptMessage;
-    try {
-      row = normalizeTranscriptMessage(message);
-    } catch (error) {
-      return Promise.reject(
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    }
-    if (this.rows.has(row.waMessageId)) return Promise.resolve(false);
+  async append(
+    message: TranscriptMessageInput,
+    onInserted?: TranscriptInsertHook,
+  ): Promise<boolean> {
+    const row = normalizeTranscriptMessage(message);
+    if (this.rows.has(row.waMessageId)) return false;
     this.rows.set(row.waMessageId, structuredClone(row));
-    return Promise.resolve(true);
+    if (onInserted === undefined) return true;
+    try {
+      await onInserted(structuredClone(row));
+    } catch (error) {
+      // Same outcome as the Postgres rollback.
+      this.rows.delete(row.waMessageId);
+      throw error;
+    }
+    return true;
   }
 
   listRecent(senderId: string, limit: number): Promise<TranscriptMessage[]> {

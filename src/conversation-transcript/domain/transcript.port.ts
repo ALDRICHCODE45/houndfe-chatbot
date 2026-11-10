@@ -1,3 +1,5 @@
+import type { PoolClient } from 'pg';
+
 /** DI token for the durable conversation transcript (S1). */
 export const CONVERSATION_TRANSCRIPT = Symbol('CONVERSATION_TRANSCRIPT');
 
@@ -48,9 +50,23 @@ export interface TranscriptMessage {
   purgeAfter: string;
 }
 
+/**
+ * Runs only when `append` actually inserted the row, inside the same
+ * transaction: the Postgres adapter passes its open client, and a throw
+ * rolls the row back (the in-memory adapter removes it) before `append`
+ * rethrows. Used to enqueue the backend mirror atomically (S1→S2).
+ */
+export type TranscriptInsertHook = (
+  row: TranscriptMessage,
+  client?: PoolClient,
+) => Promise<void>;
+
 export interface ConversationTranscriptStore {
   /** Idempotent on `waMessageId`: true only when a new row was written. */
-  append(message: TranscriptMessageInput): Promise<boolean>;
+  append(
+    message: TranscriptMessageInput,
+    onInserted?: TranscriptInsertHook,
+  ): Promise<boolean>;
   /** The newest `limit` messages of one sender, oldest first. */
   listRecent(senderId: string, limit: number): Promise<TranscriptMessage[]>;
   /** Deletes at most `batchSize` rows whose purge time is due; returns the count. */

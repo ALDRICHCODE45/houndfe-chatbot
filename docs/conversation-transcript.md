@@ -31,6 +31,16 @@ Recording is best-effort. A database error or an invalid message only logs a war
 
 The LLM still reads its history from `conversation_state`. The transcript is write-only for now.
 
+## Backend mirror
+
+Every row that is actually inserted is also queued in the backend outbox (see `docs/backend-outbox.md`) as one `MESSAGE_MIRROR`:
+
+- `conversationRef` is `wa:<sender_id>` and the idempotency key is `mirror:<wa_message_id>`.
+- The payload is the contract `messages:batch` item built from the stored row: `waMessageId`, `direction`, `author`, `type`, `text?`, `media?`, `providerTimestamp?`, `observedAt`. Null fields are left out. `media` is the provider reference as stored; the future HTTP adapter uploads it and sends `mediaId` instead.
+- The transcript insert and the enqueue run in one Postgres transaction (`append(message, onInserted)` hands its client to the outbox). If the enqueue fails, both roll back and a warning is logged, so a mirror is never lost or duplicated. An inbound is recorded again on Meta's re-delivery.
+- A duplicate wamid inserts nothing and queues nothing.
+- The same exclusions apply as for the transcript: echoes and ops-phone inbounds are never recorded, so they are never mirrored.
+
 ## Retention and purge
 
 The owner decided a conversation is deleted after 12 months. `TranscriptPurgeWorker` (in `TranscriptPurgeModule`, imported only by `AppModule`) works like this:

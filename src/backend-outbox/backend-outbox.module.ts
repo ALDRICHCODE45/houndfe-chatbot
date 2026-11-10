@@ -55,12 +55,10 @@ export class BackendOutboxDrainLifecycle
 }
 
 /**
- * BackendOutboxModule (S2, human-intervention contract v1 §10.1)
+ * BackendOutboxEnqueueModule: the enqueue side only, for feature graphs
+ * (transcript mirror, webhook statuses). It never starts the drain worker.
  *
  *   - `BACKEND_OUTBOX_STORE` → `backend_outbox` (migration 3900).
- *   - `BACKEND_OUTBOX_DELIVERY` → not-wired adapter until backend unit 5
- *     exists (every row retries; nothing is lost). Swap in the HTTP adapter
- *     here.
  *   - `BackendOutboxService` → enqueue API for other modules.
  */
 @Module({
@@ -71,13 +69,31 @@ export class BackendOutboxDrainLifecycle
       useFactory: (pool: Pool) => new PostgresBackendOutboxStore(pool),
       inject: [PG_POOL],
     },
+    BackendOutboxService,
+  ],
+  exports: [BackendOutboxService, BACKEND_OUTBOX_STORE],
+})
+export class BackendOutboxEnqueueModule {}
+
+/**
+ * BackendOutboxModule (S2, human-intervention contract v1 §10.1)
+ *
+ *   - Re-exports `BackendOutboxEnqueueModule` (store + enqueue API).
+ *   - `BACKEND_OUTBOX_DELIVERY` → not-wired adapter until backend unit 5
+ *     exists (every row retries; nothing is lost). Swap in the HTTP adapter
+ *     here.
+ *   - Runs the drain worker; imported only by `AppModule`, so there is one
+ *     worker per process.
+ */
+@Module({
+  imports: [BackendOutboxEnqueueModule],
+  providers: [
     {
       provide: BACKEND_OUTBOX_DELIVERY,
       useFactory: () => new NotWiredBackendOutboxDelivery(),
     },
-    BackendOutboxService,
     BackendOutboxDrainLifecycle,
   ],
-  exports: [BackendOutboxService, BACKEND_OUTBOX_STORE],
+  exports: [BackendOutboxEnqueueModule],
 })
 export class BackendOutboxModule {}

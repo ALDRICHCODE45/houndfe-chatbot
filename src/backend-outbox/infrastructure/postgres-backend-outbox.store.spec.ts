@@ -205,9 +205,19 @@ ddescribe('backend_outbox migration 3900 + store (real PostgreSQL)', () => {
       idempotencyKey: 'keep',
       payload: {},
     });
-    expect(() => migrate('down')).toThrow();
+    // Roll back 3900 and everything applied after it, so later migrations
+    // never make this test roll back the wrong file.
+    const appliedFrom3900 = async () => {
+      const applied = await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM pgmigrations
+          WHERE name >= '3900000000000_backend_outbox'`,
+      );
+      return applied.rows[0].n;
+    };
+    const count = await appliedFrom3900();
+    expect(() => migrate('down', count)).toThrow();
     await truncate();
-    migrate('down');
+    migrate('down', await appliedFrom3900());
     const gone = await pool.query("SELECT to_regclass('backend_outbox') AS t");
     expect(gone.rows[0]).toEqual({ t: null });
     migrate('up');

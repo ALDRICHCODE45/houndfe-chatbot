@@ -38,6 +38,9 @@ import {
   type ProductImageRecognition,
 } from '../../product-image/domain/product-image';
 import { TranscriptRecorder } from '../../conversation-transcript/application/transcript-recorder';
+import { BackendOutboxService } from '../../backend-outbox/application/backend-outbox.service';
+import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
+import { normalizeMetaStatuses } from './meta-status-normalizer';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
@@ -128,9 +131,16 @@ export class WebhookDispatcherService {
     @Optional()
     @Inject(TranscriptRecorder)
     private readonly transcript?: Pick<TranscriptRecorder, 'recordInbound'>,
+    // S3 Meta statuses go to the backend outbox. Optional for harnesses.
+    @Optional()
+    @Inject(BackendOutboxService)
+    private readonly outbox?: Pick<BackendOutboxService, 'enqueue'>,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
+    // ─── (0) S3 statuses → outbox; never the agent or a reply ─────────
+    await this.enqueueStatuses(event);
+
     const messages = normalizeInboundMessages(event);
     const rawTypes = rawMessageTypes(event);
 
@@ -288,6 +298,46 @@ export class WebhookDispatcherService {
           }`,
         );
         throw error;
+      }
+    }
+  }
+
+  /**
+   * S3: one MESSAGE_STATUS row per (wamid, status); a re-delivery is an
+   * outbox no-op. Ops-phone statuses are skipped like ops inbounds. Never
+   * throws: a failed enqueue only warns so the messages still get a reply.
+   */
+  private async enqueueStatuses(event: WebhookEventDto): Promise<void> {
+    if (this.outbox === undefined) return;
+    const { statuses, ignored } = normalizeMetaStatuses(event);
+    for (const item of ignored)
+      this.logger.debug(
+        `ignore Meta status ${String(item.status)} for ${
+          item.providerMessageId ?? '?'
+        } (${item.reason})`,
+      );
+    for (const update of statuses) {
+      try {
+        if (this.humanHandoff.isOpsSender(update.recipientWaId)) continue;
+        await this.outbox.enqueue({
+          conversationRef: conversationRefFor(update.recipientWaId),
+          kind: 'MESSAGE_STATUS',
+          idempotencyKey: `status:${update.providerMessageId}:${update.status}`,
+          payload: {
+            providerMessageId: update.providerMessageId,
+            status: update.status,
+            occurredAt: update.occurredAt,
+            ...(update.errorCode === undefined
+              ? {}
+              : { errorCode: update.errorCode }),
+          },
+        });
+      } catch (error) {
+        this.logger.warn(
+          `status enqueue failed for ${update.providerMessageId} ${
+            update.status
+          }: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
   }

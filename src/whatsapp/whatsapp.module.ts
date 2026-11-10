@@ -7,6 +7,7 @@ import { PostgresRestockInboundEvidenceStore } from '../human-decisions/infrastr
 import type { HumanHandoffService } from '../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../sale-flow/infrastructure/real-tool-registry';
 import { RestockInboundCapture } from './application/restock-inbound-capture';
+import { BackendOutboxEnqueueModule } from '../backend-outbox/backend-outbox.module';
 import { ConversationModule } from '../conversation/conversation.module';
 import { ConversationTranscriptModule } from '../conversation-transcript/conversation-transcript.module';
 import { DatabaseModule } from '../database/database.module';
@@ -35,6 +36,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
  *     pending-marker short-circuit + AgentRunner + send)
  *   - `RECENT_OUTBOUND` (in-memory echo filter)
  *   - `WEBHOOK_DEDUP` (Postgres durable dedup)
+ *   - `BackendOutboxEnqueueModule` (S3 Meta statuses → backend outbox)
  *
  * The outbound sender lives in `WhatsappSenderModule` (ADR-30) and is
  * re-exported here so any existing consumer of `WHATSAPP_SENDER` keeps
@@ -46,6 +48,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
  */
 @Module({
   imports: [
+    BackendOutboxEnqueueModule,
     ConversationModule,
     ConversationTranscriptModule,
     LlmAgentModule,
