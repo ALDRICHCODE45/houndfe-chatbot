@@ -41,6 +41,7 @@ export type RestockIntakeHoldReason =
 export type RestockIntakeBlockReason =
   | 'malformed_input'
   | 'occupied'
+  | 'open_limit'
   | 'collision'
   | 'reservation_blocked';
 
@@ -90,6 +91,10 @@ export class RestockIntakeService {
       reservation.action === 'occupied_legacy'
     ) {
       return { decision: 'blocked', reason: 'occupied' };
+    }
+    // The sender already holds the maximum number of open requests.
+    if (reservation.action === 'limit_reached') {
+      return { decision: 'blocked', reason: 'open_limit' };
     }
     if (reservation.action === 'conflict') {
       return { decision: 'blocked', reason: 'collision' };

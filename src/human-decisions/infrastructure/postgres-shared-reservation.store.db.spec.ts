@@ -12,8 +12,8 @@ import { PostgresSharedReservationStore } from './postgres-shared-reservation.st
 /**
  * HD-R3b2b3a real-PostgreSQL contract suite for the shared reservation adapter.
  *
- * It starts a disposable `postgres:16-alpine` container, migrates through 270
- * to that container's URI only (never an ambient `DATABASE_URL`), connects a
+ * It starts a disposable `postgres:16-alpine` container, migrates through 400
+ * (per-topic ACTIVE index) to that container's URI only (never an ambient `DATABASE_URL`), connects a
  * pool exclusively to it, and drives the real adapter against real unique
  * indexes and CHECK constraints. It covers same-sender cross-route concurrency,
  * exact replay / differing-intake conflict, other-sender mismatch, a legacy
@@ -82,7 +82,7 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
         '--config-value',
         'pg-migrate',
         'up',
-        '2700000000000',
+        '4000000000000',
         '--timestamp',
       ],
       {
@@ -144,8 +144,8 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
     intake: { sourceRequestId: A, type: 'EXPIRATION', productId: B, variantId },
   });
 
-  // Both real transactions observe vacancy before either may INSERT.
-  // No rows are fabricated: only delivery of the first SELECT result is gated.
+  // Both real transactions reach the per-sender lock together, so they truly
+  // contend for it; no rows are fabricated, only the lock call is gated.
   const race = async (
     left: ReservationProposal,
     right: ReservationProposal,
@@ -169,14 +169,12 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
         let first = true;
         return {
           query: async (text: string, values?: unknown[]) => {
-            const result = await client.query(text, values);
-            if (first && text.includes("status = 'ACTIVE'")) {
+            if (first && text.includes('pg_advisory_xact_lock')) {
               first = false;
-              expect(result.rows).toEqual([]);
               if (++arrivals === 2) open();
               await gate;
             }
-            return result;
+            return client.query(text, values);
           },
           release: () => client.release(),
         };
@@ -240,39 +238,45 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
       },
       'occupied',
     ],
-    ['RESTOCK same key', restock(), 'conflict'],
+    // Other routes are other topics since migration 400: both claim.
+    ['RESTOCK same key', restock(), 'claim'],
     [
       'RESTOCK different key',
       restock(SENDER, {
         requestKey: DECISION,
         intake: intake({ sourceRequestId: DECISION }),
       }),
-      'occupied',
+      'claim',
     ],
-    ['legacy', legacy(), 'occupied'],
+    ['legacy', legacy(), 'claim'],
   ] as const)(
     'arbitrates concurrent EXPIRATION / %s',
-    async (_name, right, loser) => {
+    async (_name, right, other) => {
       const left = expiration();
       const decisions = await race(left, right as ReservationProposal);
       expect(decisions.map((d) => d.action).sort()).toEqual(
-        ['claim', loser].sort(),
+        ['claim', other].sort(),
       );
-      const winner = decisions[0].action === 'claim' ? left : right;
       const { rows } = await pool.query(
-        'SELECT route, request_key, intake FROM human_decision_reservations',
+        'SELECT route, request_key, intake FROM human_decision_reservations ORDER BY route',
       );
-      expect(rows).toEqual([
-        {
-          route: winner.route,
-          request_key: winner.requestKey,
-          intake: winner.intake,
-        },
-      ]);
+      const row = (p: ReservationProposal) => ({
+        route: p.route,
+        request_key: p.requestKey,
+        intake: p.intake,
+      });
+      if (other === 'claim') {
+        expect(rows).toEqual(
+          [left, right].map(row).sort((a, b) => a.route.localeCompare(b.route)),
+        );
+        return;
+      }
+      const winner = decisions[0].action === 'claim' ? left : right;
+      expect(rows).toEqual([row(winner as ReservationProposal)]);
     },
   );
 
-  it('holds foreign senders, CLOSED keys and pending legacy for EXPIRATION', async () => {
+  it('holds foreign senders and CLOSED keys; pending legacy is another topic', async () => {
     const proposal = expiration();
     await store.reserve(proposal);
     expect(await store.reserve({ ...proposal, senderId: OTHER })).toEqual({
@@ -288,19 +292,17 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
     });
     await pool.query('TRUNCATE human_decision_reservations');
     await addHandoff(LEGACY_KEY, SENDER, 'pending');
-    expect((await store.reserve(proposal)).action).toBe('occupied_legacy');
-    expect(await activeRows()).toEqual([]);
+    expect((await store.reserve(proposal)).action).toBe('claim');
+    expect(await activeRows()).toHaveLength(1);
   });
 
-  it('lets exactly one of two concurrent same-sender routes claim', async () => {
+  it('lets two concurrent same-sender routes (different topics) both claim', async () => {
     const decisions = await Promise.all([
       store.reserve(legacy()),
       store.reserve(restock()),
     ]);
-    expect(decisions.filter((d) => d.action === 'claim')).toHaveLength(1);
-    expect(decisions.filter((d) => d.action === 'occupied')).toHaveLength(1);
-    expect(decisions.filter((d) => d.action === 'replay')).toHaveLength(0);
-    expect(await activeRows()).toHaveLength(1);
+    expect(decisions.map((d) => d.action)).toEqual(['claim', 'claim']);
+    expect(await activeRows()).toHaveLength(2);
   });
 
   it('replays an exact RESTOCK retry and conflicts on differing intake', async () => {
@@ -341,11 +343,17 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
        VALUES ($1, $2, 'OPS', 'out_of_stock', '{}'::jsonb, 'pending')`,
       [LEGACY_KEY, SENDER],
     );
-    await expect(store.reserve(restock())).resolves.toEqual({
+    await expect(
+      store.reserve({ ...legacy(), requestKey: NEW_KEY }),
+    ).resolves.toEqual({
       action: 'occupied_legacy',
       reason: 'legacy_marker_present',
     });
     expect(await activeRows()).toHaveLength(0);
+    // The legacy marker only occupies the LEGACY_OPS topic.
+    await expect(store.reserve(restock())).resolves.toMatchObject({
+      action: 'claim',
+    });
   });
 
   it('rejects a RESTOCK intake without a real sourceRequestId (DB CHECK)', async () => {
@@ -362,21 +370,27 @@ ddescribe('PostgresSharedReservationStore (real PostgreSQL)', () => {
     );
   });
 
-  it('enforces one ACTIVE sender across routes (partial unique index)', async () => {
+  it('enforces one ACTIVE per sender topic (partial unique index)', async () => {
     await pool.query(
       `INSERT INTO human_decision_reservations
          (sender_id, route, request_key, status, intake)
        VALUES ($1, 'LEGACY_OPS', $2, 'ACTIVE', NULL)`,
       [SENDER, LEGACY_KEY],
     );
+    await pool.query(
+      `INSERT INTO human_decision_reservations
+         (sender_id, route, request_key, status, intake, post_state)
+       VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb, 'RESERVED')`,
+      [SENDER, A, JSON.stringify(intake())],
+    );
     await expect(
       pool.query(
         `INSERT INTO human_decision_reservations
-           (sender_id, route, request_key, status, intake, post_state)
-         VALUES ($1, 'RESTOCK', $2, 'ACTIVE', $3::jsonb, 'RESERVED')`,
-        [SENDER, A, JSON.stringify(intake())],
+           (sender_id, route, request_key, status, intake)
+         VALUES ($1, 'LEGACY_OPS', $2, 'ACTIVE', NULL)`,
+        [SENDER, NEW_KEY],
       ),
-    ).rejects.toThrow(/active_sender_idx/);
+    ).rejects.toThrow(/active_topic_idx/);
   });
 
   it('rejects a RESTOCK row without a post_state (DB CHECK)', async () => {

@@ -17,6 +17,8 @@
 | Bot      | Local request intent/pending identity, revalidation, application ledger, outbound attempt | Must not treat a provider send or a fake store as cross-store atomicity or exactly-once delivery. |
 | Frontend | Display and commands only                                                                 | Never derives an action from free text or performs domain side effects.                           |
 
+**Open requests per customer (S5, migration 400):** the bot holds at most one ACTIVE reservation per (customer, route, topic). The topic is the subject: `variant:<id>` when a variant is named, else `product:<id>`; the retired LEGACY_OPS route keeps one per customer (`legacy`). Different subjects of the same customer coexist; a second request key for the SAME subject is still `occupied`, and an exact retry still replays (no duplicate backend POST). A customer may hold at most 20 ACTIVE reservations across all routes (the backend's `CUSTOMER_OPEN_LIMIT`); the 21st returns a typed `limit_reached` result and nothing is reserved or POSTed.
+
 Backend RESTOCK persistence and API both use **`PENDING|RESOLVED`**; `resolution` is null iff PENDING and non-null iff RESOLVED. `REPORT_RESTOCK_ESTIMATE_UNAVAILABLE` is an informative resolution, **not** rejection. There is no request expiry or `EXPIRED` state in RESTOCK v1. `PENDING_DELIVERY|PROVIDER_ACCEPTED|DELIVERY_UNKNOWN|STALE` belongs to a separate bot outcome, not to the human decision or v1 FE projection. No `BLOCKED` collision row is created in v1; the existing shipping/receipt collision remains blocked in the bot.
 
 ## Proposed RESTOCK payloads

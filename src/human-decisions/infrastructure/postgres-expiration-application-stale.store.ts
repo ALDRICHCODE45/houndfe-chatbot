@@ -147,8 +147,8 @@ export class PostgresExpirationApplicationStaleStore {
       client = await this.pool.connect();
       await client.query('BEGIN');
       const locked = await client.query<{ sender_id: string }>(
-        "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND status='ACTIVE' FOR UPDATE",
-        [senderId],
+        "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND route='EXPIRATION' AND request_key=$2 AND status='ACTIVE' FOR UPDATE",
+        [senderId, reservation.requestKey],
       );
       if (
         locked.rowCount !== 1 ||
@@ -159,7 +159,9 @@ export class PostgresExpirationApplicationStaleStore {
         return HOLD;
       const current = await new PostgresExpirationApplicationContextStore(
         client,
-      ).readRecordedForSender(senderId);
+      ).readRecordedForSender(senderId, {
+        requestKey: reservation.requestKey,
+      });
       if (
         current.action !== 'recorded' ||
         !isDeepStrictEqual(current.context, context)

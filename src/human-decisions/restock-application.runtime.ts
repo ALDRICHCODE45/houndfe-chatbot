@@ -118,9 +118,10 @@ export class RestockApplicationRuntime
   }
 
   /**
-   * Bounded on-demand expired-only reconciliation for ONE sender. It reads
-   * only that sender's trusted recorded context (never a scan) and delegates
-   * the recorded request identity to the expiry coordinator.
+   * Bounded on-demand expired-only reconciliation for ONE sender. It lists
+   * only that sender's recorded RESTOCK requests (at most the per-sender cap,
+   * never a global scan) and delegates each request identity to the expiry
+   * coordinator, which re-reads it scoped and acts only when it expired.
    *
    * Returns `true` only when the old reservation was durably ACKed and closed.
    * Inert (no query) while disabled, before bootstrap or after shutdown; a
@@ -134,13 +135,20 @@ export class RestockApplicationRuntime
     if (!coordinator || !context || this.recovery) return false;
     const run = (async (): Promise<boolean> => {
       try {
-        const read = await context.readRecordedForSender(senderId);
-        if (read.action !== 'recorded') return false;
-        const result = await coordinator.reconcileExpiredOnce(
+        // A sender may hold several open topics: try each recorded request
+        // once (bounded by the per-sender cap; shutdown awaits this run);
+        // only a durable ACK/close of one of them reports `true`.
+        let closed = false;
+        for (const requestKey of await context.listRecordedRequestKeys(
           senderId,
-          read.context.reservation.requestKey,
-        );
-        return result.action === 'ack_recorded';
+        )) {
+          const result = await coordinator.reconcileExpiredOnce(
+            senderId,
+            requestKey,
+          );
+          if (result.action === 'ack_recorded') closed = true;
+        }
+        return closed;
       } catch {
         return false;
       }

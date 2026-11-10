@@ -1,16 +1,21 @@
 /**
- * HD-R3b2b offline Postgres adapter for SharedReservationPort: one pooled client,
- * one transaction (BEGIN → read one ACTIVE sender + legacy pending → classify →
- * `INSERT ... ON CONFLICT DO NOTHING` on the ACTIVE-sender and route+request_key
+ * Postgres adapter for SharedReservationPort: one pooled client, one
+ * transaction (BEGIN → per-sender advisory lock → read the ACTIVE row on the
+ * proposal's own (route, topic) + legacy pending → classify → per-sender cap →
+ * `INSERT ... ON CONFLICT DO NOTHING` on the ACTIVE-topic and route+request_key
  * unique indexes → COMMIT); a zero-row insert re-reads durable rows and no winner
  * or CLOSED replay key fails closed. No release, retry, or store CAS.
+ * Since migration 400 different topics of one sender coexist; the advisory lock
+ * serializes one sender's claims so the cap of SENDER_OPEN_RESERVATION_LIMIT
+ * ACTIVE rows holds under concurrency. The legacy pending marker only gates the
+ * LEGACY_OPS route (its own topic); RESTOCK/EXPIRATION topics ignore it.
  * Defensive: the RAW proposal is classified before normalization (present-null
  * omissions, explicit `undefined`, extra keys, throwing getters reject
  * pre-connection); LIMIT-1 reads require an array with an integer rowCount equal
  * to `rows.length` and <= 1; a non-ACTIVE row under an ACTIVE filter throws. Only
  * then is a frozen canonical snapshot re-classified and serialized.
  * Route-exclusivity gap: absence of a pending legacy row is NOT a CAS against a
- * pre-R3b3 legacy writer; exclusivity holds only after R3b3 routes both entries.
+ * pre-R3b3 legacy writer.
  */
 import { Inject, Injectable } from '@nestjs/common';
 import type { Pool, PoolClient } from 'pg';
@@ -19,6 +24,8 @@ import { normalizeExpirationIntake } from '../../chatbot-api/domain/dtos/human-d
 import { PG_POOL } from '../../database/postgres-pool.provider';
 import {
   classifyReservation,
+  reservationTopicKey,
+  SENDER_OPEN_RESERVATION_LIMIT,
   type ActiveReservation,
   type ReservationBlockedReason,
   type ReservationDecision,
@@ -161,14 +168,32 @@ const readOne = async (
   const rows = singleRow(result);
   return rows.length === 0 ? null : rows[0];
 };
+/** The ACTIVE row on the proposal's own (sender, route, topic), if any. */
 async function readActive(
   client: PoolClient,
-  senderId: string,
+  proposal: ReservationProposal,
+  topicKey: string,
 ): Promise<ActiveReservation | 'absent'> {
-  const row = await readOne(client, "sender_id = $1 AND status = 'ACTIVE'", [
-    senderId,
-  ]);
+  const row = await readOne(
+    client,
+    "sender_id = $1 AND route = $2 AND topic_key = $3 AND status = 'ACTIVE'",
+    [proposal.senderId, proposal.route, topicKey],
+  );
   return row === null ? 'absent' : toActive(row);
+}
+/** Serializes one sender's claims until COMMIT/ROLLBACK (cap + topic CAS). */
+const LOCK_SENDER_SQL = `SELECT pg_advisory_xact_lock(hashtextextended('human_decision_reservations:' || $1, 0))`;
+const COUNT_ACTIVE_SQL = `SELECT count(*)::int AS active FROM human_decision_reservations WHERE sender_id = $1 AND status = 'ACTIVE'`;
+async function countActive(
+  client: PoolClient,
+  senderId: string,
+): Promise<number> {
+  const rows = singleRow(await client.query(COUNT_ACTIVE_SQL, [senderId]));
+  const active = rows[0]?.active;
+  if (typeof active !== 'number' || !Number.isInteger(active) || active < 0) {
+    throw new Error('inconsistent reservation read');
+  }
+  return active;
 }
 async function readLegacyPending(
   client: PoolClient,
@@ -204,6 +229,7 @@ const isClaim = (proposal: ReservationProposal): boolean =>
 async function arbitrate(
   client: PoolClient,
   proposal: ReservationProposal,
+  topicKey: string,
   pending: boolean,
 ): Promise<ReservationDecision> {
   const keyRow = await readOne(client, 'route = $1 AND request_key = $2', [
@@ -217,7 +243,7 @@ async function arbitrate(
     }
     return reclassify(toActive(keyRow), proposal, pending);
   }
-  const active = await readActive(client, proposal.senderId);
+  const active = await readActive(client, proposal, topicKey);
   return active === 'absent'
     ? blocked('unknown_existing')
     : reclassify(active, proposal, pending);
@@ -232,11 +258,17 @@ export class PostgresSharedReservationStore implements SharedReservationPort {
     if (canonical === null || !isClaim(canonical)) {
       return blocked('malformed_proposal');
     }
+    const topicKey = reservationTopicKey(canonical.route, canonical.intake);
+    if (topicKey === null) return blocked('malformed_proposal');
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const active = await readActive(client, canonical.senderId);
-      const pending = await readLegacyPending(client, canonical.senderId);
+      await client.query(LOCK_SENDER_SQL, [canonical.senderId]);
+      const active = await readActive(client, canonical, topicKey);
+      // A pending legacy handoff only occupies the LEGACY_OPS topic.
+      const pending =
+        canonical.route === 'LEGACY_OPS' &&
+        (await readLegacyPending(client, canonical.senderId));
       const decision = classifyReservation({
         proposal: canonical,
         existing: active,
@@ -245,6 +277,17 @@ export class PostgresSharedReservationStore implements SharedReservationPort {
       if (decision.action !== 'claim') {
         await client.query('ROLLBACK');
         return decision;
+      }
+      if (
+        (await countActive(client, canonical.senderId)) >=
+        SENDER_OPEN_RESERVATION_LIMIT
+      ) {
+        await client.query('ROLLBACK');
+        return {
+          action: 'limit_reached',
+          reason: 'sender_open_limit',
+          limit: SENDER_OPEN_RESERVATION_LIMIT,
+        };
       }
       const inserted = await client.query(
         `INSERT INTO human_decision_reservations
@@ -263,7 +306,7 @@ export class PostgresSharedReservationStore implements SharedReservationPort {
         await client.query('COMMIT');
         return { action: 'claim', reason: 'single_sender_vacant' };
       }
-      const arbitration = await arbitrate(client, canonical, pending);
+      const arbitration = await arbitrate(client, canonical, topicKey, pending);
       await client.query('ROLLBACK');
       return arbitration;
     } catch (error) {

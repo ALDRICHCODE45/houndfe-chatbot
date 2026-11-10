@@ -194,7 +194,10 @@ describe('RestockExistingRequestStatusService', () => {
     const f = setup();
     await expect(ask(f)).resolves.toEqual(recorded('pending'));
     expect(f.readRecordedForSender).toHaveBeenCalledTimes(1);
-    expect(f.readRecordedForSender).toHaveBeenCalledWith(SENDER);
+    // Scoped to the requested subject: a sender may hold several topics.
+    expect(f.readRecordedForSender).toHaveBeenCalledWith(SENDER, {
+      topicKey: `variant:${VARIANT}`,
+    });
     expect(f.getRestockDecision).toHaveBeenCalledTimes(1);
     expect(f.getRestockDecision).toHaveBeenCalledWith(DECISION_ID);
   });

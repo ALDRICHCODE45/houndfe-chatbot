@@ -15,8 +15,17 @@ export const MINIMAL_EXPIRATION_CAUTIOUS_REPLY =
 export const MINIMAL_EXPIRATION_CLARIFY_REPLY =
   '¿Me confirma la presentación exacta del producto?';
 
+export const MINIMAL_EXPIRATION_OPEN_LIMIT_REPLY =
+  'Ya tiene varias consultas abiertas con el equipo. En cuanto se resuelva ' +
+  'alguna, con gusto registro esta.';
+
 export type MinimalExpirationOutcome = {
-  readonly kind: 'registered' | 'existing' | 'clarify' | 'unavailable';
+  readonly kind:
+    | 'registered'
+    | 'existing'
+    | 'clarify'
+    | 'open_limit'
+    | 'unavailable';
   readonly reply: string;
 };
 
@@ -126,6 +135,15 @@ export class MinimalExpirationRequestService {
         requestKey: intake.sourceRequestId,
         intake,
       });
+      if (reserved.action === 'limit_reached') {
+        this.logger.warn(
+          'expiration_intake stage=reservation reason=sender_open_limit',
+        );
+        return {
+          kind: 'open_limit',
+          reply: MINIMAL_EXPIRATION_OPEN_LIMIT_REPLY,
+        };
+      }
       if (reserved.action !== 'claim' && reserved.action !== 'replay') {
         return reject('reservation_not_claimed');
       }

@@ -98,6 +98,10 @@ describe('queued source binding', () => {
       });
       expect(f.getRestockDecision).toHaveBeenCalledWith(ID);
       expect(f.clock).toHaveBeenCalledTimes(1);
+      // An expected request scopes the read: a sender may hold several topics.
+      expect(f.readRecordedForSender).toHaveBeenCalledWith(S, {
+        requestKey: SRC,
+      });
     },
   );
 });

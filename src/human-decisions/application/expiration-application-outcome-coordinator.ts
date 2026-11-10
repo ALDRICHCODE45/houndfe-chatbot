@@ -61,7 +61,9 @@ export class ExpirationApplicationOutcomeCoordinator {
         expected.applyBefore !== original.decision.applyBefore
       )
         return HOLD;
-      const current = await ports.readRecordedForSender(expected.senderId);
+      const current = await ports.readRecordedForSender(expected.senderId, {
+        requestKey: expected.sourceRequestId,
+      });
       if (
         current.action !== 'recorded' ||
         !isDeepStrictEqual(current.context, context)

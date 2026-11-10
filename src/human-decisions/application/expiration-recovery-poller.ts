@@ -94,6 +94,7 @@ export class ExpirationRecoveryPoller {
         if (this.stopped) return;
         const outcome = await this.decisions.readExistingDecision(
           hint.senderId,
+          { requestKey: hint.requestKey },
         );
         if (
           this.stopped ||

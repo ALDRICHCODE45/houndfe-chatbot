@@ -146,13 +146,15 @@ describe('RestockApplicationRuntime in isolation', () => {
   });
 
   describe('expired-only on-demand reconciliation', () => {
-    const read = () =>
+    // S5: a sender may hold several open topics; the runtime lists their
+    // recorded request keys and the coordinator re-reads each one scoped.
+    const read = (keys: string[] = [RECORDED.context.reservation.requestKey]) =>
       jest
         .spyOn(
           PostgresRestockApplicationContextStore.prototype,
-          'readRecordedForSender',
+          'listRecordedRequestKeys',
         )
-        .mockResolvedValue(RECORDED as never);
+        .mockResolvedValue(keys);
     const reconcile = () =>
       jest
         .spyOn(RestockApplicationCoordinator.prototype, 'reconcileExpiredOnce')
@@ -179,19 +181,46 @@ describe('RestockApplicationRuntime in isolation', () => {
       await f.runtime.onModuleDestroy();
     });
 
-    it.each(['missing', 'hold'])(
-      'does not apply on %s context',
-      async (action) => {
-        const f = fixture();
-        read().mockResolvedValue({ action } as never);
-        const reconcileMock = reconcile();
-        f.runtime.onApplicationBootstrap();
-        await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
-        expect(reconcileMock).not.toHaveBeenCalled();
-        f.inert();
-        await f.runtime.onModuleDestroy();
-      },
-    );
+    it('does not apply without a recorded request', async () => {
+      const f = fixture();
+      read([]);
+      const reconcileMock = reconcile();
+      f.runtime.onApplicationBootstrap();
+      await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
+      expect(reconcileMock).not.toHaveBeenCalled();
+      f.inert();
+      await f.runtime.onModuleDestroy();
+    });
+
+    it('tries each open topic once and reports a close of any of them', async () => {
+      const f = fixture();
+      const other = 'aaaaaaaa-0000-4000-8000-000000000001';
+      read([source, other]);
+      const reconcileMock = jest
+        .spyOn(RestockApplicationCoordinator.prototype, 'reconcileExpiredOnce')
+        .mockResolvedValueOnce({ action: 'hold' } as never)
+        .mockResolvedValueOnce({ action: 'ack_recorded' });
+      f.runtime.onApplicationBootstrap();
+      await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(true);
+      expect(reconcileMock.mock.calls).toEqual([
+        [senderId, source],
+        [senderId, other],
+      ]);
+      f.inert();
+      await f.runtime.onModuleDestroy();
+    });
+
+    it('reports false when no open topic was closed', async () => {
+      const f = fixture();
+      read([source]);
+      jest
+        .spyOn(RestockApplicationCoordinator.prototype, 'reconcileExpiredOnce')
+        .mockResolvedValue({ action: 'hold' } as never);
+      f.runtime.onApplicationBootstrap();
+      await expect(f.runtime.reconcileExpired(senderId)).resolves.toBe(false);
+      f.inert();
+      await f.runtime.onModuleDestroy();
+    });
 
     it('awaits an in-flight recovery before shutdown resolves', async () => {
       const f = fixture();

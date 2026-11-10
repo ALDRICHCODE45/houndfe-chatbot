@@ -27,8 +27,11 @@ function isPlainObject(value: unknown): boolean {
 export class PostgresRestockClaimCollisionsStore {
   constructor(private readonly client: Pick<PoolClient, 'query'>) {}
 
+  /** `topicKey` scopes the RESTOCK marker to the claimed subject (a sender may
+   * hold several open topics); omitted keeps the sender-wide reading. */
   async readForSender(
     senderId: string,
+    topicKey?: string,
   ): Promise<Readonly<{ action: 'clear' | 'hold' }>> {
     if (
       typeof senderId !== 'string' ||
@@ -81,7 +84,7 @@ export class PostgresRestockClaimCollisionsStore {
       // All conversation values are consumed before the next await; none escape.
       const markers = await new PostgresSharedRouteMarkersStore(
         this.client,
-      ).readForSender(senderId);
+      ).readForSender(senderId, topicKey);
       return markers.legacyRequestPending === false &&
         markers.restockIntentPresent === true
         ? CLEAR

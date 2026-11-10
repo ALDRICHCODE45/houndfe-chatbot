@@ -34,6 +34,15 @@ export interface SharedRouteMarkersPort {
    * invalid sender id, a driver anomaly, an inconsistent snapshot, or a query
    * error all yield the explicit blocked reading
    * `{ legacyRequestPending: 'unknown', restockIntentPresent: 'unknown' }`.
+   *
+   * With `topicKey` (see `reservationTopicKey`) the RESTOCK marker covers only
+   * that subject, so other open topics of the same sender never mark it; the
+   * legacy marker still covers the sender. Without it the legacy one-ACTIVE-
+   * per-sender reading is kept and turns `'unknown'` once a sender holds
+   * several ACTIVE reservations.
    */
-  readForSender(senderId: string): Promise<SharedRouteMarkers>;
+  readForSender(
+    senderId: string,
+    topicKey?: string,
+  ): Promise<SharedRouteMarkers>;
 }

@@ -154,6 +154,14 @@ describe('ExpirationExistingDecisionService', () => {
     expect(f.getExpirationDecision).toHaveBeenCalledWith(ID);
   });
 
+  it('narrows the context read to the given request scope', async () => {
+    const f = setup();
+    await f.service.readExistingDecision(SENDER, { requestKey: SRC });
+    expect(f.readRecordedForSender).toHaveBeenCalledWith(SENDER, {
+      requestKey: SRC,
+    });
+  });
+
   it('rejects intake mutation through the public type and at runtime', async () => {
     const result = await ask(setup());
     if (result.outcome !== 'pending') throw new Error('unreachable');

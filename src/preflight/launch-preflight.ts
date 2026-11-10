@@ -90,6 +90,8 @@ export const REQUIRED_MIGRATIONS = [
   // Human intervention prerequisites: durable transcript and backend outbox.
   '3800000000000_conversation_transcript.js',
   '3900000000000_backend_outbox.js',
+  // Several open human requests per customer, one per topic.
+  '4000000000000_human_decision_reservations_per_topic.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

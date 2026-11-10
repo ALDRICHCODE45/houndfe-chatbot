@@ -6,6 +6,7 @@ import type { Pool } from 'pg';
 import type { RestockIntakeInput } from '../../chatbot-api/domain/dtos/human-decisions.dto';
 import {
   classifyReservation,
+  SENDER_OPEN_RESERVATION_LIMIT,
   type ReservationProposal,
 } from '../domain/shared-reservation';
 import { PostgresSharedReservationStore } from './postgres-shared-reservation.store';
@@ -14,6 +15,7 @@ const SENDER = 'whatsapp:+5215500000001';
 const LEGACY_KEY = 'a1b2c3d4e5f6';
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
+const C = '33333333-3333-4333-8333-333333333333';
 const expiration = (): ReservationProposal => ({
   senderId: SENDER,
   route: 'EXPIRATION',
@@ -66,6 +68,7 @@ type Canned = {
   key?: Result | Error;
   insert?: Result | Error;
   pending?: Result | Error;
+  count?: Result | Error;
   commit?: Error;
   close?: Result | Error;
   closeExisting?: Result | Error;
@@ -79,7 +82,14 @@ const pick = (reply?: Result | Error): Result => {
 };
 
 const ACTIVE_SQL =
-  "SELECT route, request_key, status, sender_id, intake FROM human_decision_reservations WHERE sender_id = $1 AND status = 'ACTIVE' LIMIT 1";
+  "SELECT route, request_key, status, sender_id, intake FROM human_decision_reservations WHERE sender_id = $1 AND route = $2 AND topic_key = $3 AND status = 'ACTIVE' LIMIT 1";
+const LOCK_SQL =
+  "SELECT pg_advisory_xact_lock(hashtextextended('human_decision_reservations:' || $1, 0))";
+const COUNT_SQL =
+  "SELECT count(*)::int AS active FROM human_decision_reservations WHERE sender_id = $1 AND status = 'ACTIVE'";
+/** Topic of every fixture proposal (variant-less product B, or legacy). */
+const topicOf = (route: string) =>
+  route === 'LEGACY_OPS' ? 'legacy' : `product:${B}`;
 const KEY_SQL =
   'SELECT route, request_key, status, sender_id, intake FROM human_decision_reservations WHERE route = $1 AND request_key = $2 LIMIT 1';
 const PENDING_SQL =
@@ -108,9 +118,19 @@ function strictReply(
       if (sql === 'COMMIT' && canned.commit) throw canned.commit;
       return EMPTY;
     }
+    if (sql === LOCK_SQL) {
+      if (!sameParams(params, [SENDER])) fault('sender lock params');
+      return ROWS({ pg_advisory_xact_lock: '' });
+    }
     if (sql === ACTIVE_SQL) {
-      if (!sameParams(params, [SENDER])) fault('active SELECT params');
+      if (!sameParams(params, [SENDER, target.route, topicOf(target.route)])) {
+        fault('active SELECT params');
+      }
       return pick(canned.active);
+    }
+    if (sql === COUNT_SQL) {
+      if (!sameParams(params, [SENDER])) fault('active COUNT params');
+      return pick(canned.count ?? ROWS({ active: 0 }));
     }
     if (sql === KEY_SQL) {
       if (!sameParams(params, [target.route, target.key])) {
@@ -218,15 +238,17 @@ describe('PostgresSharedReservationStore.reserve', () => {
   it('binds a RESTOCK claim inside one transaction', async () => {
     const h = harness({ insert: CLAIMED });
     await expect(h.store.reserve(restock())).resolves.toEqual(CLAIM);
+    // RESTOCK ignores the legacy pending marker: it only gates LEGACY_OPS.
     expect(h.sqls()).toEqual([
       'BEGIN',
-      expect.stringContaining('FROM human_decision_reservations'),
-      expect.stringContaining('human_handoff_requests'),
+      LOCK_SQL,
+      ACTIVE_SQL,
+      COUNT_SQL,
       expect.stringContaining('INSERT INTO human_decision_reservations'),
       'COMMIT',
     ]);
-    expect(h.client.calls[3].sql).toContain('ON CONFLICT DO NOTHING');
-    expect(h.client.calls[3].params).toEqual([
+    expect(h.client.calls[4].sql).toContain('ON CONFLICT DO NOTHING');
+    expect(h.client.calls[4].params).toEqual([
       SENDER,
       'RESTOCK',
       A,
@@ -242,11 +264,21 @@ describe('PostgresSharedReservationStore.reserve', () => {
       { active: ROWS(undefined) },
       { active: { rows: [], rowCount: 1 } },
       { active: { rows: [row({ status: 'CLOSED' })], rowCount: 1 } },
+      { count: ROWS({ active: -1 }) },
+      { count: ROWS({ active: '3' }) },
       { pending: { rows: undefined as never, rowCount: 0 } },
     ];
     for (const canned of anomalies) {
-      const h = harness(canned);
-      await expect(h.store.reserve(restock())).rejects.toThrow();
+      const legacyCase = canned.pending !== undefined;
+      const h = harness(
+        canned,
+        legacyCase
+          ? { route: 'LEGACY_OPS', key: LEGACY_KEY }
+          : { route: 'RESTOCK', key: A },
+      );
+      await expect(
+        h.store.reserve(legacyCase ? base('LEGACY_OPS', {}) : restock()),
+      ).rejects.toThrow();
       expect(h.sqls()).toContain('ROLLBACK');
       expect(h.sqls()).not.toContain('COMMIT');
       expect(h.sqls().filter((s) => s === 'BEGIN')).toHaveLength(1);
@@ -270,6 +302,14 @@ describe('PostgresSharedReservationStore.reserve — deferred adapter cases', ()
       proposal?: ReservationProposal;
     }> = [
       {
+        canned: { count: ROWS({ active: SENDER_OPEN_RESERVATION_LIMIT }) },
+        expected: {
+          action: 'limit_reached',
+          reason: 'sender_open_limit',
+          limit: SENDER_OPEN_RESERVATION_LIMIT,
+        },
+      },
+      {
         canned: { active: ROWS(row()) },
         expected: { action: 'replay', reason: 'exact_active_replay' },
         proposal: legacy(),
@@ -285,12 +325,26 @@ describe('PostgresSharedReservationStore.reserve — deferred adapter cases', ()
         expected: { action: 'conflict', reason: 'same_key_different_payload' },
       },
       {
-        canned: { active: ROWS(row()) },
+        // Same topic (product B) held under a different request key.
+        canned: {
+          active: ROWS(
+            held({ request_key: C, intake: intake({ sourceRequestId: C }) }),
+          ),
+        },
+        expected: {
+          action: 'occupied',
+          reason: 'different_active_key',
+          activeRoute: 'RESTOCK',
+        },
+      },
+      {
+        canned: { active: ROWS(row({ request_key: 'bbbbbbbbbbbb' })) },
         expected: {
           action: 'occupied',
           reason: 'different_active_key',
           activeRoute: 'LEGACY_OPS',
         },
+        proposal: legacy(),
       },
       {
         canned: { pending: ROWS({ one: 1 }) },
@@ -298,14 +352,16 @@ describe('PostgresSharedReservationStore.reserve — deferred adapter cases', ()
           action: 'occupied_legacy',
           reason: 'legacy_marker_present',
         },
-      },
-      {
-        canned: { active: ROWS(held()), pending: ROWS({ one: 1 }) },
-        expected: { action: 'blocked', reason: 'ambiguous_active_hold' },
+        proposal: legacy(),
       },
     ];
     for (const { canned, expected, proposal } of cases) {
-      const h = harness(canned);
+      const h = harness(
+        canned,
+        proposal?.route === 'LEGACY_OPS'
+          ? { route: 'LEGACY_OPS', key: LEGACY_KEY }
+          : { route: 'RESTOCK', key: A },
+      );
       const decision = await h.store.reserve(proposal ?? restock());
       expect(decision).toEqual(expected);
       expect(h.sqls()[0]).toBe('BEGIN');
@@ -391,10 +447,19 @@ describe('PostgresSharedReservationStore.reserve — deferred adapter cases', ()
       { pending: { rows: [], rowCount: 1 } },
       { active: { rows: [held(), held()], rowCount: 2 } },
       { active: new Error('connection reset') },
+      { count: new Error('connection reset') },
     ];
     for (const canned of failures) {
-      const h = harness(canned);
-      await expect(h.store.reserve(restock())).rejects.toThrow();
+      const legacyCase = canned.pending !== undefined;
+      const h = harness(
+        canned,
+        legacyCase
+          ? { route: 'LEGACY_OPS', key: LEGACY_KEY }
+          : { route: 'RESTOCK', key: A },
+      );
+      await expect(
+        h.store.reserve(legacyCase ? legacy() : restock()),
+      ).rejects.toThrow();
       expect(h.sqls()).toContain('ROLLBACK');
       expect(h.sqls()).not.toContain('COMMIT');
       expect(h.client.releases).toBe(1);

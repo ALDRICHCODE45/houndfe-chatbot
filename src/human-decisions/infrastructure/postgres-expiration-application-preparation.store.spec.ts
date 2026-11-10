@@ -150,8 +150,10 @@ describe('inactive EXPIRATION transactional preparation', () => {
     expect(
       h.query.mock.calls.slice(0, 5).map(([sql]) => sql.split(' ')[0]),
     ).toEqual(['BEGIN', 'SELECT', 'SELECT', 'INSERT', 'COMMIT']);
-    expect(h.query.mock.calls[1][0]).toContain("status='ACTIVE' FOR UPDATE");
-    expect(h.query.mock.calls[1][1]).toEqual([senderId]);
+    expect(h.query.mock.calls[1][0]).toContain(
+      "route='EXPIRATION' AND request_key=$2 AND status='ACTIVE' FOR UPDATE",
+    );
+    expect(h.query.mock.calls[1][1]).toEqual([senderId, sourceRequestId]);
     expect(h.poolQuery).not.toHaveBeenCalled();
     expect(h.release).toHaveBeenCalledTimes(2);
     expect(

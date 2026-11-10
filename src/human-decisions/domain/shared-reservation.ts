@@ -68,8 +68,42 @@ export type ReservationBlockedReason =
   | 'sender_mismatch'
   | 'indeterminate_legacy_marker';
 
+/** Total ACTIVE reservations one sender may hold across every route and topic
+ * (matches the backend CUSTOMER_OPEN_LIMIT). */
+export const SENDER_OPEN_RESERVATION_LIMIT = 20;
+
+/**
+ * Subject of one reservation, mirroring the generated `topic_key` column of
+ * migration 400: `legacy` for LEGACY_OPS, else `variant:<id>` when the intake
+ * names a variant, else `product:<id>` (ids lowercased). At most one ACTIVE
+ * reservation exists per (sender, route, topic). Null when the intake carries
+ * no usable subject id.
+ */
+export function reservationTopicKey(
+  route: ReservationRoute,
+  intake: unknown,
+): string | null {
+  if (route === 'LEGACY_OPS') return 'legacy';
+  if (typeof intake !== 'object' || intake === null) return null;
+  const { variantId, productId } = intake as Record<string, unknown>;
+  if (typeof variantId === 'string' && variantId.length > 0) {
+    return `variant:${variantId.toLowerCase()}`;
+  }
+  if (variantId !== null && variantId !== undefined) return null;
+  return typeof productId === 'string' && productId.length > 0
+    ? `product:${productId.toLowerCase()}`
+    : null;
+}
+
 export type ReservationDecision =
   | { readonly action: 'claim'; readonly reason: 'single_sender_vacant' }
+  | {
+      /** The sender already holds the maximum number of ACTIVE requests on
+       * other topics; nothing was reserved. */
+      readonly action: 'limit_reached';
+      readonly reason: 'sender_open_limit';
+      readonly limit: number;
+    }
   | { readonly action: 'replay'; readonly reason: 'exact_active_replay' }
   | {
       readonly action: 'conflict';
@@ -225,9 +259,11 @@ export function classifyReservation(
 }
 
 /**
- * Atomic single-sender claim port (contract only; no adapter, no wiring).
- * A later adapter MUST provide one durable compare-and-set across BOTH routes;
- * never `ConversationStore.update`, and no release in v1.
+ * Atomic per-topic claim port. The adapter MUST provide one durable
+ * compare-and-set per (sender, route, topic) plus the per-sender total cap;
+ * never `ConversationStore.update`, and no release in v1. `existing` passed to
+ * `classifyReservation` is the ACTIVE row on the proposal's own topic, so an
+ * `occupied` decision means the same subject under a different request key.
  */
 export interface SharedReservationPort {
   reserve(proposal: SupportedReservationProposal): Promise<ReservationDecision>;

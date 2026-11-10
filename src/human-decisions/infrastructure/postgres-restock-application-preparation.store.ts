@@ -19,7 +19,7 @@ type Result = Readonly<
 >;
 const HOLD = Object.freeze({ action: 'hold' as const });
 const LOCK =
-  "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND status='ACTIVE' FOR UPDATE";
+  "SELECT sender_id FROM human_decision_reservations WHERE sender_id=$1 AND route='RESTOCK' AND request_key=$2 AND status='ACTIVE' FOR UPDATE";
 
 function releaseClient(client: PoolClient, poisoned?: Error): void {
   try {
@@ -82,7 +82,10 @@ export class PostgresRestockApplicationPreparationStore {
         return HOLD;
       client = await this.pool.connect();
       await client.query('BEGIN');
-      const lock = await client.query<{ sender_id: string }>(LOCK, [senderId]);
+      const lock = await client.query<{ sender_id: string }>(LOCK, [
+        senderId,
+        context.reservation.requestKey,
+      ]);
       if (
         !Array.isArray(lock.rows) ||
         lock.rowCount !== 1 ||
@@ -92,7 +95,9 @@ export class PostgresRestockApplicationPreparationStore {
         return HOLD;
       const locked = await new PostgresRestockApplicationContextStore(
         client,
-      ).readRecordedForSender(senderId);
+      ).readRecordedForSender(senderId, {
+        requestKey: context.reservation.requestKey,
+      });
       if (
         locked.action !== 'recorded' ||
         !isDeepStrictEqual(locked.context, context)

@@ -5,6 +5,10 @@ import {
   type ExpirationIntakeInput,
 } from '../../chatbot-api/domain/dtos/human-decisions-expiration.dto';
 import type { ActiveReservation } from '../domain/shared-reservation';
+import {
+  scopedRecordedQuery,
+  type RecordedReservationScope,
+} from './recorded-reservation-scope';
 
 export interface RecordedExpirationContext {
   readonly reservation: Omit<ActiveReservation, 'intake'> & {
@@ -88,6 +92,7 @@ export class PostgresExpirationApplicationContextStore {
 
   async readRecordedForSender(
     senderId: string,
+    scope?: RecordedReservationScope,
   ): Promise<ExpirationContextRead> {
     if (
       typeof senderId !== 'string' ||
@@ -99,9 +104,11 @@ export class PostgresExpirationApplicationContextStore {
       })
     )
       return { action: 'hold' };
+    const query = scopedRecordedQuery(SQL, 'EXPIRATION', senderId, scope);
+    if (query === null) return { action: 'hold' };
     const { rows, rowCount } = await this.pool.query<Record<string, unknown>>(
-      SQL,
-      [senderId],
+      query.text,
+      query.params,
     );
     if (
       !Array.isArray(rows) ||

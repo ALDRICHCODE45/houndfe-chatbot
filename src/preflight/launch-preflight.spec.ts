@@ -197,6 +197,12 @@ describe('runLaunchPreflight', () => {
     );
   });
 
+  it('requires the per-topic human reservation migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain(
+      '4000000000000_human_decision_reservations_per_topic.js',
+    );
+  });
+
   it('fails when a required migration filename is absent from disk', () => {
     const withoutOne = REQUIRED_MIGRATIONS.filter(
       (name: string) => name !== '2000000000000_receipt_media.js',

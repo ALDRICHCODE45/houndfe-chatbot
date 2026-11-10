@@ -163,8 +163,11 @@ describe('inactive EXPIRATION transactional claim', () => {
       'cas',
       'COMMIT',
     ]);
-    expect(h.query.mock.calls[1][0]).toContain("status='ACTIVE' FOR UPDATE");
-    expect(h.query.mock.calls[1][1]).toEqual([senderId]);
+    // Locks only the exact request: a sender may hold several topics.
+    expect(h.query.mock.calls[1][0]).toContain(
+      "route='EXPIRATION' AND request_key=$2 AND status='ACTIVE' FOR UPDATE",
+    );
+    expect(h.query.mock.calls[1][1]).toEqual([senderId, sourceRequestId]);
     expect(h.query.mock.calls[3][1]).toEqual([decisionId]);
     expect(await h.store.claimPending(h.candidate)).toEqual(hold);
     expect(h.events.filter((event) => event === 'cas')).toHaveLength(1);

@@ -180,7 +180,7 @@ describe('inactive transactional EXPIRATION STALE', () => {
       JSON.stringify(h.expected),
       JSON.stringify({ ...h.expected, state: 'STALE', staleObservedAt: end }),
     ]);
-    expect(h.read).toHaveBeenCalledWith('customer');
+    expect(h.read).toHaveBeenCalledWith('customer', { requestKey: source });
     expect(await h.store.expirePending(h.candidate)).toEqual(hold);
     expect(h.events.filter((tag) => tag === 'cas')).toHaveLength(1);
     expect(h.release).toHaveBeenCalledTimes(2);

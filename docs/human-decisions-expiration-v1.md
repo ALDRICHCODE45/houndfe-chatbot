@@ -121,14 +121,14 @@ No push/deploy/activation/production. These are ordered phases, not a promise of
 
 ## Rehearsal invariants (manual, six cases)
 
-| Case                  | Expected invariant                                                                            |
-| --------------------- | --------------------------------------------------------------------------------------------- |
-| Available             | `PROVIDE_EXPIRATION_TEXT` delivered as plain text; stock/cart/pricing/sale/payment unchanged. |
-| Unavailable           | Team could not confirm the date; never expired/unsafe/out-of-stock.                           |
-| Ambiguous subject     | Clarify before intake; nothing registered.                                                    |
-| Duplicate and timeout | No duplicate ops handoff; an ambiguous send is unknown, not auto-retried.                     |
-| Pending browse        | Constrained read-only catalog/price/stock continue; no global block.                          |
-| Late or collision     | Changed browsing does not cancel/rebind the original inquiry; no concurrent reservation.      |
+| Case                  | Expected invariant                                                                                                                                                 |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Available             | `PROVIDE_EXPIRATION_TEXT` delivered as plain text; stock/cart/pricing/sale/payment unchanged.                                                                      |
+| Unavailable           | Team could not confirm the date; never expired/unsafe/out-of-stock.                                                                                                |
+| Ambiguous subject     | Clarify before intake; nothing registered.                                                                                                                         |
+| Duplicate and timeout | No duplicate ops handoff; an ambiguous send is unknown, not auto-retried.                                                                                          |
+| Pending browse        | Constrained read-only catalog/price/stock continue; no global block.                                                                                               |
+| Late or collision     | Changed browsing does not cancel/rebind the original inquiry; no concurrent reservation for the same subject (other subjects coexist, up to 20 open per customer). |
 
 ## References
 

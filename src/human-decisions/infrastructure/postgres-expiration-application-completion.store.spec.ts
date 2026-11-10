@@ -217,7 +217,9 @@ describe('inactive transactional EXPIRATION completion (mocked PostgreSQL)', () 
         'cas',
         'COMMIT',
       ]);
-      expect(h.readContext).toHaveBeenCalledWith('customer');
+      expect(h.readContext).toHaveBeenCalledWith('customer', {
+        requestKey: source,
+      });
       expect(h.readOutcome).toHaveBeenCalledWith(id);
       const [sql, values] = h.query.mock.calls.find(([text]) =>
         text.startsWith('UPDATE'),
