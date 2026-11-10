@@ -35,7 +35,6 @@ import {
 } from '../../conversation/domain/conversation-store';
 import {
   MINIMAL_ORDER_AMBIGUOUS_REPLY,
-  MinimalOrderConfirmation,
   evaluateMinimalOrder,
   evaluateMinimalPickupOrder,
   sameMinimalOrder,
@@ -64,6 +63,9 @@ import {
   type MinimalCheckoutReply,
 } from './minimal-checkout.service';
 import { MinimalShippingService } from './minimal-shipping.service';
+import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
+import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
+import { DurableOrderConfirmation } from './gates/order-confirmation.gate';
 
 export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
   MinimalOrderIneligibleReason,
@@ -307,7 +309,8 @@ function sameCartLines(
  */
 @Injectable()
 export class MinimalOrderService {
-  private readonly confirmation = new MinimalOrderConfirmation();
+  // S4: durable pending summary (process-local without ConversationGates).
+  private readonly confirmation: DurableOrderConfirmation;
   private readonly logger = new Logger(MinimalOrderService.name);
   private readonly cashierUserId: string;
   private readonly now: () => number;
@@ -322,8 +325,12 @@ export class MinimalOrderService {
     @Optional() @Inject(MINIMAL_ORDER_CLOCK) now?: () => number,
     // S1: the last-order pointer and checkout name for the customer memory.
     @Optional() private readonly profiles?: CustomerProfileService,
+    @Optional() gates?: ConversationGates,
   ) {
     this.now = now ?? (() => Date.now());
+    this.confirmation = new DurableOrderConfirmation(
+      gates ?? processLocalConversationGates(),
+    );
     const cashier = config.get<string>('chatbotApi.cashierUserId');
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
   }
@@ -388,7 +395,7 @@ export class MinimalOrderService {
       return { reply: recovery.reply };
     }
     if (this.confirmation.status(input.senderId) === null) return null;
-    const result = this.confirmation.consume({
+    const result = await this.confirmation.consume({
       senderId: input.senderId,
       text: input.text,
       inboundEvent: input.inboundEvent,

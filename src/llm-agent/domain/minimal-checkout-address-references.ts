@@ -21,9 +21,10 @@
  *   - Only `status: 'unique'` pages register. `not_found`, `ambiguous`, a
  *     malformed envelope and a malformed query are not authorizers, and no
  *     binding changes when any of them is rejected.
- *   - Retention is volatile, bounded and expiring. Restarting the process (or a
- *     new instance) forgets every reference; there is no snapshot/restore API
- *     and a model-supplied snapshot is never trusted. When the bounded capacity
+ *   - Retention is bounded and expiring. The only snapshot/restore path is
+ *     `exportState`/`restore`, used by the server-owned durable gate (S4) so
+ *     references survive a restart within their five minutes; a
+ *     model-supplied snapshot is never trusted. When the bounded capacity
  *     needs room for forward paging, the oldest page is retired and its
  *     references become stale (they resolve to `null`), so later pages stay
  *     reachable one bounded page at a time.
@@ -33,8 +34,8 @@
  *   - Every returned snapshot, query, offer and resolution is a defensive copy;
  *     a caller cannot mutate an internal binding.
  *
- * Page-query provenance is as volatile as the bindings themselves. After a
- * restart, a durable draft that only holds an address id plus a cached version
+ * Page-query provenance lives exactly as long as the bindings. Once they
+ * expire, a durable draft that only holds an address id plus a cached version
  * cannot be freshness-revalidated in place: the coordinator must run a fresh,
  * explicit, sender-bound lookup page and re-select, then `revalidateAddress`
  * against that live page. There is no by-id endpoint, no unlimited scan and no
@@ -106,7 +107,8 @@ export interface MinimalCheckoutNextPage {
   readonly query: NormalizedCheckoutContextQuery;
 }
 
-interface AddressBinding {
+/** One retained saved address, as exported for the durable gate (S4). */
+export interface AddressBinding {
   reference: string;
   customerId: string;
   address: CheckoutContextAddress;
@@ -115,7 +117,8 @@ interface AddressBinding {
   expiresAt: number;
 }
 
-interface PageBinding {
+/** One retained page, as exported for the durable gate (S4). */
+export interface PageBinding {
   reference: string;
   customerId: string;
   query: NormalizedCheckoutContextQuery;
@@ -124,11 +127,22 @@ interface PageBinding {
   expiresAt: number;
 }
 
-interface NextPageBinding {
+/** One retained next-page cursor, as exported for the durable gate (S4). */
+export interface NextPageBinding {
   reference: string;
   customerId: string;
   query: NormalizedCheckoutContextQuery;
   expiresAt: number;
+}
+
+/**
+ * Plain data of every live binding in insertion (retirement) order, for the
+ * durable `checkout_address` gate. Restoring it rebuilds the same registry.
+ */
+export interface MinimalCheckoutAddressReferencesState {
+  readonly addresses: readonly AddressBinding[];
+  readonly pages: readonly PageBinding[];
+  readonly nextPages: readonly NextPageBinding[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -191,6 +205,63 @@ export class MinimalCheckoutAddressReferences {
   constructor(senderId: string, clock: () => number = () => Date.now()) {
     this.#senderId = typeof senderId === 'string' ? senderId : '';
     this.#clock = clock;
+  }
+
+  /**
+   * Rebuild a registry from exported state. The caller validates the shape;
+   * bindings keep their own expiry and are purged on the next read.
+   */
+  static restore(
+    senderId: string,
+    state: MinimalCheckoutAddressReferencesState,
+    clock: () => number = () => Date.now(),
+  ): MinimalCheckoutAddressReferences {
+    const registry = new MinimalCheckoutAddressReferences(senderId, clock);
+    for (const binding of state.addresses)
+      registry.#addresses.set(binding.reference, {
+        ...binding,
+        address: copyAddress(binding.address),
+        query: copyQuery(binding.query),
+      });
+    for (const page of state.pages)
+      registry.#pages.set(page.reference, {
+        ...page,
+        query: copyQuery(page.query),
+        addressReferences: [...page.addressReferences],
+      });
+    for (const next of state.nextPages)
+      registry.#nextPages.set(next.reference, {
+        ...next,
+        query: copyQuery(next.query),
+      });
+    return registry;
+  }
+
+  /** Detached live bindings, or `null` when nothing is retained. */
+  exportState(): MinimalCheckoutAddressReferencesState | null {
+    this.#purgeExpired(this.#clock());
+    if (
+      this.#addresses.size === 0 &&
+      this.#pages.size === 0 &&
+      this.#nextPages.size === 0
+    )
+      return null;
+    return {
+      addresses: [...this.#addresses.values()].map((binding) => ({
+        ...binding,
+        address: copyAddress(binding.address),
+        query: copyQuery(binding.query),
+      })),
+      pages: [...this.#pages.values()].map((page) => ({
+        ...page,
+        query: copyQuery(page.query),
+        addressReferences: [...page.addressReferences],
+      })),
+      nextPages: [...this.#nextPages.values()].map((next) => ({
+        ...next,
+        query: copyQuery(next.query),
+      })),
+    };
   }
 
   /**

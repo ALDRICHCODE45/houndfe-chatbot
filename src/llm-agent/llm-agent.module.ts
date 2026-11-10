@@ -6,6 +6,8 @@ import {
   type ChatbotApiClient,
 } from '../chatbot-api/domain/chatbot-api.client';
 import { ConversationModule } from '../conversation/conversation.module';
+import { ConversationGates } from '../conversation-gates/application/conversation-gates';
+import { ConversationGatesModule } from '../conversation-gates/conversation-gates.module';
 import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import {
   CONVERSATION_STORE,
@@ -87,6 +89,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     // GENERATE_TEXT + the shared CostGuardService (also used by receipts).
     LlmCoreModule,
     ConversationModule,
+    // S4: one shared ConversationGates for the minimal route's durable gates.
+    ConversationGatesModule,
     ChatbotApiModule,
     SaleFlowModule,
     HumanHandoffModule,
@@ -184,6 +188,7 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         RESTOCK_INTAKE_SERVICE,
         RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
         RestockApplicationRuntime,
+        ConversationGates,
       ],
       useFactory: (
         chatbotApi: ChatbotApiClient,
@@ -192,10 +197,12 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         coordinator: RestockIntakeService,
         recovery: RestockExistingRequestStatusService,
         runtime: RestockApplicationRuntime,
+        gates: ConversationGates,
       ) =>
         new MinimalRestockRequestService({
           chatbotApi,
           store,
+          gates,
           restock: {
             markers,
             coordinator,

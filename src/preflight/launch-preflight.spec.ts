@@ -197,6 +197,12 @@ describe('runLaunchPreflight', () => {
     );
   });
 
+  it('requires the durable conversation gates migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain(
+      '4200000000000_conversation_gates.js',
+    );
+  });
+
   it('requires the per-topic human reservation migration', () => {
     expect(REQUIRED_MIGRATIONS).toContain(
       '4000000000000_human_decision_reservations_per_topic.js',

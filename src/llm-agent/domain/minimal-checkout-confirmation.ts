@@ -256,6 +256,23 @@ interface ConfirmedCheckoutConfirmation {
   readonly revision: number;
 }
 
+/**
+ * Plain data of one pending offer, for the durable gate adapter (S4). The
+ * presentation is re-rendered from the bound draft on restore.
+ */
+export interface MinimalCheckoutPendingState {
+  readonly reference: string;
+  readonly binding: string;
+  readonly revision: number;
+  readonly receivingPhoneNumberId: string;
+  readonly originMessageId: string;
+  readonly expiresAt: number;
+  readonly armed: boolean;
+}
+
+/** Plain data of one local confirmation, for the durable gate adapter. */
+export type MinimalCheckoutConfirmedState = ConfirmedCheckoutConfirmation;
+
 const handledAmbiguous = (): MinimalCheckoutConsumeResult => ({
   kind: 'handled',
   reply: MINIMAL_CHECKOUT_AMBIGUOUS_REPLY,
@@ -319,6 +336,69 @@ export class MinimalCheckoutConfirmation {
    */
   revokeConfirmation(senderId: string): void {
     this.confirmed.delete(senderId);
+  }
+
+  /** Detached copy of the live (unexpired) pending offer, or `null`. */
+  exportPending(senderId: string): MinimalCheckoutPendingState | null {
+    const pending = this.pending.get(senderId);
+    if (pending === undefined || this.now() >= pending.expiresAt) return null;
+    return {
+      reference: pending.reference,
+      binding: pending.binding,
+      revision: pending.revision,
+      receivingPhoneNumberId: pending.receivingPhoneNumberId,
+      originMessageId: pending.originMessageId,
+      expiresAt: pending.expiresAt,
+      armed: pending.armed,
+    };
+  }
+
+  /**
+   * Replace the sender's pending offer with restored data (`null` clears it).
+   * Returns `false`, leaving no pending, when the binding is not a valid
+   * draft of this sender at the stated revision.
+   */
+  restorePending(
+    senderId: string,
+    state: MinimalCheckoutPendingState | null,
+  ): boolean {
+    this.pending.delete(senderId);
+    if (state === null) return true;
+    let draft: MinimalCheckoutDraft | null;
+    try {
+      draft = normalizeMinimalCheckoutDraft(
+        JSON.parse(state.binding),
+        senderId,
+      );
+    } catch {
+      return false;
+    }
+    if (
+      draft === null ||
+      canonicalize(draft) !== state.binding ||
+      draft.revision !== state.revision
+    )
+      return false;
+    this.pending.set(senderId, {
+      ...state,
+      presentation: renderMinimalCheckoutConfirmation(draft),
+    });
+    return true;
+  }
+
+  /** Detached copy of the local confirmation, or `null`. */
+  exportConfirmed(senderId: string): MinimalCheckoutConfirmedState | null {
+    const confirmed = this.confirmed.get(senderId);
+    return confirmed === undefined ? null : { ...confirmed };
+  }
+
+  /** Replace the sender's local confirmation (`null` clears it). */
+  restoreConfirmed(
+    senderId: string,
+    state: MinimalCheckoutConfirmedState | null,
+  ): void {
+    if (state === null) this.confirmed.delete(senderId);
+    else this.confirmed.set(senderId, { ...state });
   }
 
   /**
