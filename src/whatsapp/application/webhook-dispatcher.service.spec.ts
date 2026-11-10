@@ -58,6 +58,30 @@ const RECEIPT_DESCRIPTION: ProductImageDescription = {
 const receiptMediaRowFixture = (id: string): ReceiptMediaRow =>
   ({ id }) as unknown as ReceiptMediaRow;
 
+/** One customer text message in a Meta webhook event. */
+const textEvent = (id: string, body: string): WebhookEventDto => ({
+  object: 'whatsapp_business_account',
+  entry: [
+    {
+      changes: [
+        {
+          value: {
+            messages: [
+              {
+                id,
+                from: '5215550001111',
+                timestamp: '1719000000',
+                type: 'text',
+                text: { body },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ],
+});
+
 /**
  * Every customer turn is handled by the minimal SDK route
  * (MinimalCatalogAgentService.tryHandle) and its reply is sent via
@@ -131,7 +155,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     runner = AgentRunner.forTest(store, llm, tools, costGuard, cfg);
 
     dedup = {
-      isDuplicate: jest.fn().mockResolvedValue(false),
+      claim: jest.fn().mockResolvedValue('claim-token'),
+      release: jest.fn().mockResolvedValue(undefined),
+      purgeBefore: jest.fn().mockResolvedValue(0),
       markSeen: jest.fn().mockResolvedValue(undefined),
     };
 
@@ -275,7 +301,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
   // The observed production bug: a webhook re-delivery (retry) was
   // re-processed as a new message, producing unsolicited greetings.
   it('skips a duplicate delivery (dedup) — no agent run, no reply', async () => {
-    dedup.isDuplicate.mockResolvedValue(true);
+    dedup.claim.mockResolvedValue(null);
     store.get.mockResolvedValue(null);
 
     const event: WebhookEventDto = {
@@ -402,12 +428,61 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     await expect(service.dispatch(event)).rejects.toThrow('Meta 131030');
     expect(dedup.markSeen).not.toHaveBeenCalled();
+    expect(dedup.release).toHaveBeenCalledWith('wamid.failsend', 'claim-token');
+  });
+
+  // ─── S6: the claim is taken BEFORE any processing ─────────────────
+  it('claims the message before the agent runs and the reply is sent', async () => {
+    await service.dispatch(textEvent('wamid.claim-first', 'hola'));
+
+    expect(dedup.claim).toHaveBeenCalledWith('wamid.claim-first');
+    const claimed = dedup.claim.mock.invocationCallOrder[0];
+    expect(claimed).toBeLessThan(
+      minimalAgent.tryHandle.mock.invocationCallOrder[0],
+    );
+    expect(claimed).toBeLessThan(sender.sendText.mock.invocationCallOrder[0]);
+    expect(dedup.markSeen).toHaveBeenCalledWith('wamid.claim-first');
+    expect(dedup.release).not.toHaveBeenCalled();
+  });
+
+  it('a failure before any send releases the claim; the redelivery is processed', async () => {
+    minimalAgent.tryHandle.mockRejectedValueOnce(new Error('LLM down'));
+    await expect(
+      service.dispatch(textEvent('wamid.redeliver', 'hola')),
+    ).rejects.toThrow('LLM down');
+    expect(sender.sendText).not.toHaveBeenCalled();
+    expect(dedup.release).toHaveBeenCalledWith(
+      'wamid.redeliver',
+      'claim-token',
+    );
+
+    await service.dispatch(textEvent('wamid.redeliver', 'hola'));
+    expect(sender.sendText).toHaveBeenCalledTimes(1);
+    expect(dedup.markSeen).toHaveBeenCalledWith('wamid.redeliver');
+  });
+
+  it('a failed release never masks the processing error', async () => {
+    minimalAgent.tryHandle.mockRejectedValueOnce(new Error('LLM down'));
+    dedup.release.mockRejectedValueOnce(new Error('db down'));
+    await expect(
+      service.dispatch(textEvent('wamid.release-fail', 'hola')),
+    ).rejects.toThrow('LLM down');
+  });
+
+  it('a claim failure propagates before any processing (Meta redelivers)', async () => {
+    dedup.claim.mockRejectedValueOnce(new Error('db down'));
+    await expect(
+      service.dispatch(textEvent('wamid.claim-fail', 'hola')),
+    ).rejects.toThrow('db down');
+    expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+    expect(sender.sendText).not.toHaveBeenCalled();
+    expect(dedup.release).not.toHaveBeenCalled();
   });
 
   // ─── Scenario: one event carries several messages, one already seen ──
   it('processes each new message and skips only the duplicate within one event', async () => {
-    dedup.isDuplicate.mockImplementation(
-      async (id: string) => id === 'wamid.dup',
+    dedup.claim.mockImplementation(async (id: string) =>
+      id === 'wamid.dup' ? null : 'claim-token',
     );
 
     const event: WebhookEventDto = {
@@ -686,14 +761,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
 
     it('dedup applies to ops inbounds unchanged: a duplicate ops wamid never reaches resolveReply', async () => {
-      dedup.isDuplicate.mockResolvedValue(true);
+      dedup.claim.mockResolvedValue(null);
       humanHandoff.isOpsSender.mockReturnValue(true);
 
       await service.dispatch(
         opsEvent('wamid.ops-dup', 'HF-abc123def456 NO_RESTOCK'),
       );
 
-      expect(dedup.isDuplicate).toHaveBeenCalledWith('wamid.ops-dup');
+      expect(dedup.claim).toHaveBeenCalledWith('wamid.ops-dup');
       expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
       expect(sender.sendText).not.toHaveBeenCalled();
       expect(dedup.markSeen).not.toHaveBeenCalled();
@@ -1292,8 +1367,9 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         },
       );
 
-      // Atomic outcomes: no send, no agent, no extra dedup write. Their
-      // admission transaction already persists the inbound marker.
+      // Atomic outcomes: no send, no agent. Their admission transaction
+      // persists the marker, but the dispatcher's claim already holds the
+      // row (PROCESSING), so S6 completes it once admission committed.
       const silentCases: Array<{
         decision: { kind: string; receiptId?: string };
         wamid: string;
@@ -1317,7 +1393,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       ];
 
       test.each(silentCases)(
-        '$decision.kind: no sendText, no LLM, no extra marker write',
+        '$decision.kind: no sendText, no LLM, completes the claim',
         async (c) => {
           const decision = c.decision.receiptId
             ? { kind: c.decision.kind, receipt: { id: c.decision.receiptId } }
@@ -1326,11 +1402,14 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
           await service.dispatch(mediaEvent(c.wamid, 'image'));
           expect(sender.sendText).not.toHaveBeenCalled();
           expectNoAgentRun();
-          expect(dedup.markSeen).not.toHaveBeenCalled();
+          expect(dedup.markSeen).toHaveBeenCalledTimes(1);
+          expect(dedup.markSeen).toHaveBeenCalledWith(c.wamid);
+          expect(dedup.release).not.toHaveBeenCalled();
         },
       );
 
-      // Error: admit rejection propagates; no send, no markSeen
+      // Error: admit rejection propagates; no send, no markSeen, and the
+      // claim is released so Meta's redelivery is processed again (S6).
       it('admit rejection: propagates, no sendText, no markSeen', async () => {
         (ingress.admit as jest.Mock).mockRejectedValueOnce(
           new Error('admission unavailable'),
@@ -1340,6 +1419,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         ).rejects.toThrow('admission unavailable');
         expect(sender.sendText).not.toHaveBeenCalled();
         expect(dedup.markSeen).not.toHaveBeenCalled();
+        expect(dedup.release).toHaveBeenCalledWith('wamid.fail', 'claim-token');
       });
 
       // Ops media bypasses ingress entirely
@@ -1405,7 +1485,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       });
 
       it('marker-only duplicate: skips ingress and every downstream processor', async () => {
-        (dedup.isDuplicate as jest.Mock).mockResolvedValueOnce(true);
+        dedup.claim.mockResolvedValueOnce(null);
 
         await service.dispatch(mediaEvent('wamid.marker-only', 'image'));
 
@@ -1424,7 +1504,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         await service.dispatch(mediaEvent('wamid.guidance-order', 'image'));
 
         const order = [
-          dedup.isDuplicate,
+          dedup.claim,
           humanHandoff.isOpsSender,
           conversationStore.get,
           ingress.admit,
@@ -1794,7 +1874,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     });
 
     it('duplicate image message: no vision call, no reply', async () => {
-      dedup.isDuplicate.mockResolvedValueOnce(true);
+      dedup.claim.mockResolvedValueOnce(null);
 
       await service.dispatch(mediaEvent('wamid.p11', { type: 'image' }));
 

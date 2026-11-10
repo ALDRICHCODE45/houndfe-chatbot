@@ -72,7 +72,11 @@ function setup(
     {} as AgentRunner,
     sender,
     {
-      isDuplicate: jest.fn(() => Promise.resolve(options.duplicate === true)),
+      claim: jest.fn(() =>
+        Promise.resolve(options.duplicate === true ? null : 'claim-token'),
+      ),
+      release: jest.fn(() => Promise.resolve()),
+      purgeBefore: jest.fn(() => Promise.resolve(0)),
       markSeen: jest.fn(() => Promise.resolve()),
     },
     { remember: jest.fn(), isKnown: () => options.echo === true },

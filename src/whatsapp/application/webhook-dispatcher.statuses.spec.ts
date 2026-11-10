@@ -53,7 +53,9 @@ function setup(
   };
   const runner = { handle: jest.fn() };
   const dedup = {
-    isDuplicate: jest.fn(() => Promise.resolve(false)),
+    claim: jest.fn(() => Promise.resolve<string | null>('claim-token')),
+    release: jest.fn(() => Promise.resolve()),
+    purgeBefore: jest.fn(() => Promise.resolve(0)),
     markSeen: jest.fn(() => Promise.resolve()),
   };
   const service = new WebhookDispatcherService(
@@ -119,7 +121,7 @@ describe('WebhookDispatcherService statuses (S3)', () => {
     expect(h.runner.handle).not.toHaveBeenCalled();
     expect(h.sender.sendText).not.toHaveBeenCalled();
     expect(h.sender.sendTemplate).not.toHaveBeenCalled();
-    expect(h.dedup.isDuplicate).not.toHaveBeenCalled();
+    expect(h.dedup.claim).not.toHaveBeenCalled();
   });
 
   it('a failed status carries the Meta error code', async () => {

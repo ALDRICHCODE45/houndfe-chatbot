@@ -92,6 +92,8 @@ export const REQUIRED_MIGRATIONS = [
   '3900000000000_backend_outbox.js',
   // Several open human requests per customer, one per topic.
   '4000000000000_human_decision_reservations_per_topic.js',
+  // Webhook dedup claims with a lease, recorded before replying (S6).
+  '4100000000000_processed_webhook_messages_claims.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

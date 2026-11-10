@@ -89,7 +89,9 @@ describe('S1 dispatcher wiring', () => {
       {} as AgentRunner,
       sender,
       {
-        isDuplicate: jest.fn(async () => false),
+        claim: jest.fn(async () => 'claim-token'),
+        release: jest.fn(async () => undefined),
+        purgeBefore: jest.fn(async () => 0),
         markSeen: jest.fn(async () => undefined),
       },
       { remember: jest.fn(), isKnown: () => false },

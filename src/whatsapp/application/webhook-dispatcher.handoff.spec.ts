@@ -71,7 +71,9 @@ function setup(
   };
   const runner = { handle: jest.fn() };
   const dedup = {
-    isDuplicate: jest.fn(() => Promise.resolve(false)),
+    claim: jest.fn(() => Promise.resolve<string | null>('claim-token')),
+    release: jest.fn(() => Promise.resolve()),
+    purgeBefore: jest.fn(() => Promise.resolve(0)),
     markSeen: jest.fn((id: string) => {
       order.push(`seen ${id}`);
       return Promise.resolve();

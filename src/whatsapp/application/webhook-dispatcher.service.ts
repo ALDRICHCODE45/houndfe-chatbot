@@ -60,7 +60,9 @@ import {
  * Inbound-driven dispatch order (each step is conditional on the prior):
  *
  *   1. RECENT_OUTBOUND — skip echoes of the bot's own outbound.
- *   2. WEBHOOK_DEDUP   — skip re-deliveries of already-processed msgs.
+ *   2. WEBHOOK_DEDUP   — S6: claim the message (PROCESSING + lease) before
+ *      processing; a DONE message or a live claim is a duplicate. A failure
+ *      releases the claim so Meta's redelivery is processed again.
  *   3. **Ops pre-routing hook** (new, human-handoff slice) —
  *      when `message.senderId` matches the configured OPS_CHANNEL_PHONE
  *      (exact by default; both sides apply the same trunk-1 rewrite only
@@ -104,8 +106,9 @@ import {
  *      first via the optional sendImage; an image failure only warns). S4:
  *      a reply with buttons/list goes out through the optional
  *      sendInteractive; when absent or failing, the same text is sent.
- *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen — only after a
- *      successful send, so a failed send lets Meta re-deliver and retry.
+ *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen (claim → DONE) —
+ *      only after the message was handled; a failed send releases the claim
+ *      so Meta re-delivers and retries.
  *
  * Spec: `openspec/changes/human-handoff/specs/whatsapp-webhook/delta.md`.
  * Test: `webhook-dispatcher.service.spec.ts`.
@@ -170,8 +173,11 @@ export class WebhookDispatcherService {
       // after a crash still lands in the transcript. Never blocks the reply.
       await this.recordInbound(message, rawTypes.get(message.messageId));
 
-      // ─── (2) Dedup ──────────────────────────────────────────────────
-      if (await this.dedup.isDuplicate(message.messageId)) {
+      // ─── (2) Dedup claim (S6) ───────────────────────────────────────
+      // Atomic: of two concurrent deliveries only one gets a token. A claim
+      // failure propagates before any processing, so Meta redelivers.
+      const claimToken = await this.dedup.claim(message.messageId);
+      if (claimToken === null) {
         this.logger.log(
           `skip duplicate ${message.messageId} from ${message.senderId}`,
         );
@@ -318,6 +324,7 @@ export class WebhookDispatcherService {
             error instanceof Error ? error.message : String(error)
           }`,
         );
+        await this.releaseSafely(message.messageId, claimToken);
         throw error;
       }
     }
@@ -411,9 +418,9 @@ export class WebhookDispatcherService {
       });
       this.recentOutbound.remember(providerMessageId);
     }
-    if (!receiptAdmissionAtomicallyMarksSeen(decision.kind)) {
-      await this.markSeenSafely(message.messageId);
-    }
+    // S6: atomic outcomes already wrote the marker inside admission, but the
+    // claim holds the row as PROCESSING there, so it is completed here.
+    await this.markSeenSafely(message.messageId);
   }
 
   /** S1: best effort; a profile failure never blocks the message. */
@@ -586,6 +593,23 @@ export class WebhookDispatcherService {
     });
     this.recentOutbound.remember(providerMessageId);
     await this.markSeenSafely(message.messageId);
+  }
+
+  /** S6: a failed release only leaves the claim to expire (the redelivery
+   * after the lease is processed); it never masks the processing error. */
+  private async releaseSafely(
+    messageId: string,
+    claimToken: string,
+  ): Promise<void> {
+    try {
+      await this.dedup.release(messageId, claimToken);
+    } catch (error) {
+      this.logger.warn(
+        `release failed for ${messageId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /** A dedup-write failure must NOT turn a successful send into a failed
@@ -843,17 +867,6 @@ function ingressGuidance(decision: ReceiptIngressDecision): string | undefined {
     case 'webhook-media-conflict':
       return undefined;
   }
-}
-
-function receiptAdmissionAtomicallyMarksSeen(
-  kind: ReceiptIngressDecision['kind'],
-): boolean {
-  return (
-    kind === 'reserved' ||
-    kind === 'webhook-replayed' ||
-    kind === 'provider-media-reused' ||
-    kind === 'webhook-media-conflict'
-  );
 }
 
 // Re-export the AgentMessage type for any downstream consumers that

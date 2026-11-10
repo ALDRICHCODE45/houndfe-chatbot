@@ -60,7 +60,9 @@ function setup(decision: Record<string, unknown>) {
   };
   const recentOutbound = { remember: jest.fn(), isKnown: () => false };
   const dedup = {
-    isDuplicate: jest.fn(async () => false),
+    claim: jest.fn(async () => 'claim-token'),
+    release: jest.fn(async () => undefined),
+    purgeBefore: jest.fn(async () => 0),
     markSeen: jest.fn(async () => undefined),
   };
   const service = new WebhookDispatcherService(
