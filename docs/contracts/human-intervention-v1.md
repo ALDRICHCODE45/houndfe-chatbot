@@ -16,22 +16,22 @@ Source of truth: `houndfe-backend/docs/proposals/human-intervention-backend-prop
 
 All use `Authorization: Bearer svc_…` and `X-Branch-Id`, and answer with `Cache-Control: no-store`. Common errors: `401`, `403 INSUFFICIENT_SCOPE`, `429 RATE_LIMITED` (with `Retry-After`), `400 VALIDATION_ERROR`.
 
-| Method and route | Scope | Idempotency | Main payload | Typed errors |
-| --- | --- | --- | --- | --- |
-| `POST /chatbot-api/requests` | `requests:create` | `X-Idempotency-Key` = `sourceRequestId` + hash | Common envelope (§3.2) + `scheduledFor?` + `detail` | `409 IDEMPOTENCY_CONFLICT`, `409 CUSTOMER_OPEN_LIMIT`, `409 SLOT_UNAVAILABLE`, `422 SUBTYPE_DISABLED` |
-| `POST /chatbot-api/requests/:id/cancel` | `requests:cancel` | `X-Idempotency-Key` | `{reason, triggerWaMessageId}` | `404`, `409 ALREADY_RESOLVED` (includes the answer), `409 IDEMPOTENCY_CONFLICT` |
-| `POST /chatbot-api/requests/cancel-batch` (optional) | `requests:cancel` | `X-Idempotency-Key` | `{ids[], reason}` | `409 MIXED_CUSTOMERS` |
-| `POST /chatbot-api/requests/:id/reschedule` | `requests:create` | `X-Idempotency-Key` | `{scheduledFor}` | `409 SLOT_UNAVAILABLE`, `409 REQUEST_CLOSED` |
-| `GET /chatbot-api/scheduling/slots?conversationRef=` | `requests:read` | — | → `{timeZone, whatsappWindowClosesAt, slots[]}` | `422 SCHEDULING_DISABLED` |
-| `GET /chatbot-api/requests?status=open&updatedSince=` | `requests:read` | — | Recovery after `410 CURSOR_EXPIRED` | — |
-| `GET /chatbot-api/requests/pending-deliveries?conversationRef=` | `feed:read` | — | Deliveries in `DEFERRED_WINDOW_CLOSED` | — |
-| `GET /chatbot-api/feed?after=&limit=50&waitSeconds=25` | `feed:read` | Cursor | → `{items[], nextCursor}` | `410 CURSOR_EXPIRED` |
-| `POST /chatbot-api/deliveries/:deliveryId/outcome` | `feed:ack` | `attemptId` + evidence hash | `{attemptId, outcome, providerMessageId?, attemptedAt}` | `404`, `409 OUTCOME_ALREADY_RECORDED`, `409 IDEMPOTENCY_CONFLICT` |
-| `POST /chatbot-api/conversations/:ref/messages:batch` | `conversation:write` | Per `waMessageId` | `{messages:[{waMessageId, direction, author, type, text?, mediaId?, providerTimestamp, observedAt}]}` (≤ 50) | `413 BATCH_TOO_LARGE` |
-| `POST /chatbot-api/messages/statuses:batch` | `conversation:write` | Per `(providerMessageId, status)` | `{statuses:[{providerMessageId, status, occurredAt, errorCode?}]}` | — |
-| `POST /chatbot-api/conversations/:ref/session-ack` | `conversation:write` | Per `(epoch, state)` | `{epoch, state: STARTED \| ENDED, providerMessageId?}` | `409 STALE_EPOCH` |
-| `GET /chatbot-api/conversations/:ref/state` | `requests:read` | — | → `{mode, handoffEpoch, requestId, assigneeFirstName}` | `404` |
-| `POST /chatbot-api/media` | `media:write` | `X-Idempotency-Key` (+ `sha256`) | multipart image, PDF or audio up to 10 MB → `{mediaId}` | `413 MEDIA_TOO_LARGE`, `415 MEDIA_TYPE_NOT_ALLOWED` |
+| Method and route                                                | Scope                | Idempotency                                    | Main payload                                                                                                 | Typed errors                                                                                          |
+| --------------------------------------------------------------- | -------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `POST /chatbot-api/requests`                                    | `requests:create`    | `X-Idempotency-Key` = `sourceRequestId` + hash | Common envelope (§3.2) + `scheduledFor?` + `detail`                                                          | `409 IDEMPOTENCY_CONFLICT`, `409 CUSTOMER_OPEN_LIMIT`, `409 SLOT_UNAVAILABLE`, `422 SUBTYPE_DISABLED` |
+| `POST /chatbot-api/requests/:id/cancel`                         | `requests:cancel`    | `X-Idempotency-Key`                            | `{reason, triggerWaMessageId}`                                                                               | `404`, `409 ALREADY_RESOLVED` (includes the answer), `409 IDEMPOTENCY_CONFLICT`                       |
+| `POST /chatbot-api/requests/cancel-batch` (optional)            | `requests:cancel`    | `X-Idempotency-Key`                            | `{ids[], reason}`                                                                                            | `409 MIXED_CUSTOMERS`                                                                                 |
+| `POST /chatbot-api/requests/:id/reschedule`                     | `requests:create`    | `X-Idempotency-Key`                            | `{scheduledFor}`                                                                                             | `409 SLOT_UNAVAILABLE`, `409 REQUEST_CLOSED`                                                          |
+| `GET /chatbot-api/scheduling/slots?conversationRef=`            | `requests:read`      | —                                              | → `{timeZone, whatsappWindowClosesAt, slots[]}`                                                              | `422 SCHEDULING_DISABLED`                                                                             |
+| `GET /chatbot-api/requests?status=open&updatedSince=`           | `requests:read`      | —                                              | Recovery after `410 CURSOR_EXPIRED`                                                                          | —                                                                                                     |
+| `GET /chatbot-api/requests/pending-deliveries?conversationRef=` | `feed:read`          | —                                              | Deliveries in `DEFERRED_WINDOW_CLOSED`                                                                       | —                                                                                                     |
+| `GET /chatbot-api/feed?after=&limit=50&waitSeconds=25`          | `feed:read`          | Cursor                                         | → `{items[], nextCursor}`                                                                                    | `410 CURSOR_EXPIRED`                                                                                  |
+| `POST /chatbot-api/deliveries/:deliveryId/outcome`              | `feed:ack`           | `attemptId` + evidence hash                    | `{attemptId, outcome, providerMessageId?, attemptedAt}`                                                      | `404`, `409 OUTCOME_ALREADY_RECORDED`, `409 IDEMPOTENCY_CONFLICT`                                     |
+| `POST /chatbot-api/conversations/:ref/messages:batch`           | `conversation:write` | Per `waMessageId`                              | `{messages:[{waMessageId, direction, author, type, text?, mediaId?, providerTimestamp, observedAt}]}` (≤ 50) | `413 BATCH_TOO_LARGE`                                                                                 |
+| `POST /chatbot-api/messages/statuses:batch`                     | `conversation:write` | Per `(providerMessageId, status)`              | `{statuses:[{providerMessageId, status, occurredAt, errorCode?}]}`                                           | —                                                                                                     |
+| `POST /chatbot-api/conversations/:ref/session-ack`              | `conversation:write` | Per `(epoch, state)`                           | `{epoch, state: STARTED \| ENDED, providerMessageId?}`                                                       | `409 STALE_EPOCH`                                                                                     |
+| `GET /chatbot-api/conversations/:ref/state`                     | `requests:read`      | —                                              | → `{mode, handoffEpoch, requestId, assigneeFirstName}`                                                       | `404`                                                                                                 |
+| `POST /chatbot-api/media`                                       | `media:write`        | `X-Idempotency-Key` (+ `sha256`)               | multipart image, PDF or audio up to 10 MB → `{mediaId}`                                                      | `413 MEDIA_TOO_LARGE`, `415 MEDIA_TYPE_NOT_ALLOWED`                                                   |
 
 Unchanged during the per-subtype migration: `POST/GET /chatbot-api/human-decisions[/:id]`, `POST …/:id/application-outcome`, `POST /chatbot-api/sales/:id/receipts`, `GET /chatbot-api/receipts/:id`.
 
@@ -43,7 +43,11 @@ Common envelope plus a per-subtype `detail`. For RESTOCK, EXPIRATION and DELIVER
 {
   "sourceRequestId": "5d0c…",
   "subtype": "UNKNOWN_QUESTION",
-  "customer": { "phoneCountryCode": "52", "phone": "5512345678", "displayName": "Juan" },
+  "customer": {
+    "phoneCountryCode": "52",
+    "phone": "5512345678",
+    "displayName": "Juan"
+  },
   "conversationRef": "wa:5215512345678",
   "lastCustomerMessageAt": "2026-11-09T16:02:11Z",
   "summary": "¿El shampoo X sirve para cachorros de 2 meses?",
@@ -58,8 +62,13 @@ Common envelope plus a per-subtype `detail`. For RESTOCK, EXPIRATION and DELIVER
 Response `201` (created) or `200` (identical replay or merged):
 
 ```json
-{ "id": "…", "status": "NEW", "outcome": "CREATED | REPLAYED | MERGED",
-  "mergedIntoId": null, "businessHours": { "openNow": false, "nextOpenAt": "2026-11-10T15:00:00Z" } }
+{
+  "id": "…",
+  "status": "NEW",
+  "outcome": "CREATED | REPLAYED | MERGED",
+  "mergedIntoId": null,
+  "businessHours": { "openNow": false, "nextOpenAt": "2026-11-10T15:00:00Z" }
+}
 ```
 
 - The bot picks the out-of-hours message from `businessHours`; it never computes hours itself.
@@ -71,16 +80,32 @@ Response `201` (created) or `200` (identical replay or merged):
 `GET /chatbot-api/feed?after=<cursor>&limit=50&waitSeconds=25`:
 
 ```json
-{ "items": [
-    { "cursor": "000000001842", "deliveryId": "b1…", "type": "request.answered",
-      "requestId": "…", "conversationRef": "wa:52155…",
-      "payload": { "kind": "CLARIFICATION", "text": "Sí, es apto desde las 8 semanas.",
-                   "prefix": "Le comparto la respuesta del equipo:" },
-      "notBefore": null, "expiresAt": null },
-    { "cursor": "000000001843", "deliveryId": "b2…", "type": "conversation.staff_message",
-      "requestId": "…", "payload": { "handoffEpoch": 3, "seq": 17, "messageId": "…", "text": "…" } }
+{
+  "items": [
+    {
+      "cursor": "000000001842",
+      "deliveryId": "b1…",
+      "type": "request.answered",
+      "requestId": "…",
+      "conversationRef": "wa:52155…",
+      "payload": {
+        "kind": "CLARIFICATION",
+        "text": "Sí, es apto desde las 8 semanas.",
+        "prefix": "Le comparto la respuesta del equipo:"
+      },
+      "notBefore": null,
+      "expiresAt": null
+    },
+    {
+      "cursor": "000000001843",
+      "deliveryId": "b2…",
+      "type": "conversation.staff_message",
+      "requestId": "…",
+      "payload": { "handoffEpoch": 3, "seq": 17, "messageId": "…", "text": "…" }
+    }
   ],
-  "nextCursor": "000000001843" }
+  "nextCursor": "000000001843"
+}
 ```
 
 - **Item types:** `request.answered` (decision with fixed text per option, clarification verbatim, receipt rejection with `customerReason`), `request.overdue_notice` (once), `request.cancel_ack`, `conversation.started`, `conversation.staff_message`, `conversation.ended`, `conversation.scheduled_reminder`, `conversation.rescheduled`, `template.requested` (only from the staff command, never automatic).
