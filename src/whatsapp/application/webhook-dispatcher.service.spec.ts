@@ -273,6 +273,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     expect(minimalAgent.tryHandle).toHaveBeenCalledWith({
       senderId: '5215550001111',
       text: 'hola',
+      inboundAt: '2024-06-21T20:00:00.000Z',
     });
     // The legacy AgentRunner never serves a customer turn.
     expect(llm.run).not.toHaveBeenCalled();
@@ -1937,6 +1938,7 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(minimalAgent.tryHandle).toHaveBeenCalledWith({
         senderId: CUSTOMER,
         text: 'hola',
+        inboundAt: '2024-06-21T20:00:00.000Z',
         inboundEvent: {
           receivingPhoneNumberId: '123456789012345',
           senderId: CUSTOMER,

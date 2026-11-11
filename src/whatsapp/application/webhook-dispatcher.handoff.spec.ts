@@ -52,6 +52,8 @@ function setup(
     /** Successive isHumanMode answers (the last one repeats). */
     modes?: boolean[];
     opsResolved?: boolean;
+    /** S5: what onCustomerInbound does (default: resolves). */
+    inbound?: 'never' | 'reject' | 'throw';
   } = {},
 ) {
   const order: string[] = [];
@@ -148,6 +150,17 @@ function setup(
       return Promise.resolve(options.human === true);
     }),
   };
+  const humanRequests = {
+    onCustomerInbound: jest.fn((ref: string) => {
+      order.push(`inbound ${ref}`);
+      if (options.inbound === 'throw') throw new Error('sync boom');
+      if (options.inbound === 'reject')
+        return Promise.reject(new Error('async boom'));
+      if (options.inbound === 'never')
+        return new Promise<void>(() => undefined);
+      return Promise.resolve();
+    }),
+  };
   const service = new WebhookDispatcherService(
     runner as unknown as AgentRunner,
     sender,
@@ -161,8 +174,10 @@ function setup(
     recorder,
     undefined,
     handoffMode,
+    humanRequests,
   );
   return {
+    humanRequests,
     service,
     order,
     sender,
@@ -235,6 +250,7 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     expect(h.order).toEqual([
       'record wamid.b1',
       `mode ${SENDER}`,
+      `inbound wa:${SENDER}`,
       'turn',
       `mode ${SENDER}`,
       'send',
@@ -311,6 +327,7 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     expect(h.order).toEqual([
       'record wamid.mid',
       `mode ${SENDER}`,
+      `inbound wa:${SENDER}`,
       'turn',
       `mode ${SENDER}`,
       'seen wamid.mid',
@@ -319,5 +336,59 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     expect(h.sender.sendImage).not.toHaveBeenCalled();
     expect(h.sender.sendInteractive).not.toHaveBeenCalled();
     expect(onSent).not.toHaveBeenCalled();
+  });
+});
+
+describe('WebhookDispatcherService pending deliveries hook (S5)', () => {
+  it('BOT: calls onCustomerInbound after the gate, before the turn', async () => {
+    const h = setup();
+    await h.service.dispatch(event([text('wamid.p1')]));
+    expect(h.humanRequests.onCustomerInbound).toHaveBeenCalledWith(
+      `wa:${SENDER}`,
+    );
+    const at = h.order.indexOf(`inbound wa:${SENDER}`);
+    expect(at).toBeGreaterThan(h.order.indexOf(`mode ${SENDER}`));
+    expect(at).toBeLessThan(h.order.indexOf('turn'));
+    expect(h.sender.sendText).toHaveBeenCalledTimes(1);
+  });
+
+  it('never awaits it: a hook that never settles does not delay the reply', async () => {
+    const h = setup({ inbound: 'never' });
+    await h.service.dispatch(event([text('wamid.p2')]));
+    expect(h.sender.sendText).toHaveBeenCalledTimes(1);
+    expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.p2');
+  });
+
+  it.each(['reject', 'throw'] as const)(
+    'a hook that fails (%s) never breaks the reply',
+    async (inbound) => {
+      const h = setup({ inbound });
+      await expect(
+        h.service.dispatch(event([text('wamid.p3')])),
+      ).resolves.toBeUndefined();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(h.sender.sendText).toHaveBeenCalledTimes(1);
+      expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.p3');
+    },
+  );
+
+  it('HUMAN: not called (the gate returns first)', async () => {
+    const h = setup({ human: true });
+    await h.service.dispatch(event([text('wamid.p4')]));
+    expect(h.humanRequests.onCustomerInbound).not.toHaveBeenCalled();
+  });
+
+  it('forwards the inbound time to the turn (S6 askTeam)', async () => {
+    const h = setup();
+    await h.service.dispatch(event([text('wamid.p5')]));
+    expect(h.agent.tryHandle).toHaveBeenCalledWith(
+      expect.objectContaining({ inboundAt: '2024-06-21T20:00:00.000Z' }),
+    );
+  });
+
+  it('ops messages never call it', async () => {
+    const h = setup();
+    await h.service.dispatch(event([text('wamid.p6', OPS)]));
+    expect(h.humanRequests.onCustomerInbound).not.toHaveBeenCalled();
   });
 });

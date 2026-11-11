@@ -58,7 +58,27 @@ The 24 h window for cancellation notices is read from the customer inbound obser
 
 ## Window replay (S5)
 
-`HumanRequestDeliveryService.onCustomerInbound(conversationRef)` fetches `listPendingDeliveries({conversationRef})`, records unknown items, re-handles deferred ones with a new `attempt_id`, then re-handles this conversation's `HELD_HUMAN` rows if it is BOT. It never throws. **Not wired yet**: the WhatsApp dispatcher must call it on each customer inbound that reaches the bot (after the S7 HUMAN gate), without awaiting it on the reply path.
+`HumanRequestDeliveryService.onCustomerInbound(conversationRef)` fetches `listPendingDeliveries({conversationRef})`, records unknown items, re-handles deferred ones with a new `attempt_id`, then re-handles this conversation's `HELD_HUMAN` rows if it is BOT. It never throws. The WhatsApp dispatcher calls it with `wa:<sender_id>` on each customer inbound that passes the S7 HUMAN gate, next to the profile warm-up, without awaiting it; a rejection or a sync throw is only logged and never delays or breaks the reply.
+
+## Create path (S6, `askTeam`)
+
+The minimal LLM route exposes the tool `askTeam` when `HumanRequestCreateService` is wired. The prompt fragment tells the model never to invent what a person decides (dates, discounts, returns, technical answers): when the catalog and the tools have no data it calls `askTeam` instead of guessing, and keeps helping with other things. Tool input: `question` (the customer's words, 1..1000), `summary` (one Spanish line, 1..140), optional `productIds` / `variantIds` (UUIDs, ≤ 20). One create per turn.
+
+Envelope (`buildUnknownQuestionRequest`, `src/human-requests/domain/human-request-create.ts`): `subtype: UNKNOWN_QUESTION`, `sourceRequestId` UUID v4 (also the idempotency key), `customer` from `parseMexicanWhatsAppPhone(senderId)` (`52` + 10 digits), `conversationRef: wa:<raw sender id>`, `lastCustomerMessageAt` = the triggering inbound's time in ISO UTC (now when missing or outside the backend bounds), `summary`, `needs` = the question, `context {productIds?, variantIds?}`, `dedupKey: UNKNOWN_QUESTION:<first 24 hex of sha256(normalized question)>` (NFKC, lowercase, whitespace collapsed), `triggerWaMessageId` = the inbound wamid when bound.
+
+The create is synchronous. The customer reply is fixed copy, styled tú/usted (the model's text is dropped):
+
+| Create result                                                     | Local effect                                     | Reply (usted)                                                                                |
+| ----------------------------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `201`/`200` CREATED, REPLAYED, MERGED                             | Registry row `OPEN` (`mergedIntoId ?? id`)       | "Ya le pregunté al equipo, le aviso por aquí en cuanto me respondan."                        |
+| `CUSTOMER_OPEN_LIMIT`                                             | none                                             | "Ya tiene varias consultas abiertas con el equipo; en cuanto respondan le aviso por aquí."   |
+| `CUSTOMER_RATE_LIMITED` (no auto-retry)                           | none                                             | "El equipo ya tiene sus consultas recientes; por favor espere un poco antes de enviar otra." |
+| Throw (network, 5xx, timeout), `RATE_LIMITED`, `VERSION_CONFLICT` | `REQUEST_CREATE` enqueued with the same envelope | "Estoy registrando su consulta con el equipo; le aviso por aquí." (never "ya le pregunté")   |
+| Other documented errors, or the enqueue also fails                | error log                                        | "Por ahora no puedo registrar esa consulta de información."                                  |
+
+A queued create is delivered by the backend outbox adapter, which sends the one-time confirmation when the window is open and the conversation is BOT (`docs/backend-outbox.md`, including the head-of-line limitation). The tú variants of all this copy, the team prefix and the cancel notice are curated pairs in `src/llm-agent/domain/customer-style.ts`.
+
+`HumanRequestsServicesModule` holds the store and both services (imported by `WhatsappModule` and `LlmAgentModule`); `HumanRequestsModule`, imported by `AppModule` only, adds the feed consumer, the sweeps and the outbox route registration.
 
 ## Durable ACKs
 
@@ -76,5 +96,5 @@ All ledger writes are compare-and-set on `(local_state, attempt_id)`, so the con
 - Delivering wrapped decisions from the feed and retiring the legacy poll paths (T2b, backend unit 13).
 - `conversation.started` / `conversation.ended` items and the session ACKs (backend unit 11); today they are ACKed `STALE` as unknown types.
 - The 410 recovery route (`GET /chatbot-api/requests?status=open&updatedSince=`).
-- The dispatcher call to `onCustomerInbound`, and the create path that writes `OPEN` registry rows (T3).
+- `TALK_TO_HUMAN` / `COMPLAINT` creates and customer cancels from the conversation (the outbox adapter already delivers `REQUEST_CANCEL`).
 - No feature flag: the consumer starts with the app; a backend without `feed:read` keeps it in backoff with error logs.

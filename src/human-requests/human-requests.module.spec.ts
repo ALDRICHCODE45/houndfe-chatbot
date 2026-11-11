@@ -8,11 +8,15 @@ import {
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
+import type { BackendOutboxEntry } from '../backend-outbox/domain/backend-outbox';
+import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
+import { HumanRequestCreateService } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
 import { HUMAN_REQUEST_FEED_STORE } from './domain/human-request-feed';
 import {
   HumanRequestFeedLifecycle,
   HumanRequestsModule,
+  HumanRequestsServicesModule,
 } from './human-requests.module';
 import { PostgresHumanRequestFeedStore } from './infrastructure/postgres-human-request-feed.store';
 
@@ -34,7 +38,14 @@ const fakePool = () => {
   };
 };
 
-const compile = (pool: ReturnType<typeof fakePool>['pool']) =>
+const createHumanRequest = jest.fn(() =>
+  Promise.resolve({ kind: 'NOT_FOUND' as const }),
+);
+
+const compile = (
+  pool: ReturnType<typeof fakePool>['pool'],
+  feature: typeof HumanRequestsModule = HumanRequestsModule,
+) =>
   Test.createTestingModule({
     imports: [
       ConfigModule.forRoot({
@@ -42,7 +53,7 @@ const compile = (pool: ReturnType<typeof fakePool>['pool']) =>
         ignoreEnvFile: true,
         load: [() => ({ meta: { phoneNumberId: 'phone-1' } })],
       }),
-      HumanRequestsModule,
+      feature,
     ],
   })
     .overrideProvider(PG_POOL)
@@ -56,6 +67,8 @@ const compile = (pool: ReturnType<typeof fakePool>['pool']) =>
       readFeed: jest.fn(() => new Promise(() => undefined)),
       recordDeliveryOutcome: jest.fn(),
       listPendingDeliveries: jest.fn(),
+      createHumanRequest,
+      cancelHumanRequest: jest.fn(),
     })
     .overrideProvider(WHATSAPP_SENDER)
     .useValue({ sendText: jest.fn() })
@@ -77,7 +90,63 @@ describe('HumanRequestsModule', () => {
     expect(moduleRef.get(HumanRequestDeliveryService)).toBeInstanceOf(
       HumanRequestDeliveryService,
     );
+    expect(moduleRef.get(HumanRequestCreateService)).toBeInstanceOf(
+      HumanRequestCreateService,
+    );
     expect(moduleRef.get(HumanRequestFeedLifecycle)).toBeDefined();
+    await moduleRef.close();
+  });
+
+  it('the services-only module never runs the feed consumer', async () => {
+    const { pool } = fakePool();
+    const moduleRef = await compile(pool, HumanRequestsServicesModule);
+    expect(moduleRef.get(HumanRequestCreateService)).toBeInstanceOf(
+      HumanRequestCreateService,
+    );
+    expect(moduleRef.get(HumanRequestDeliveryService)).toBeInstanceOf(
+      HumanRequestDeliveryService,
+    );
+    expect(() => moduleRef.get(HumanRequestFeedLifecycle)).toThrow();
+    await moduleRef.init();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pool.connect).not.toHaveBeenCalled();
+    await moduleRef.close();
+  });
+
+  it('registers REQUEST_CREATE / REQUEST_CANCEL on the outbox router at init', async () => {
+    const { pool } = fakePool();
+    const moduleRef = await compile(pool);
+    await moduleRef.init();
+    const router = moduleRef.get(RoutingBackendOutboxDelivery);
+    const entry = (kind: BackendOutboxEntry['kind']): BackendOutboxEntry => ({
+      id: '1',
+      conversationRef: 'wa:5215550001111',
+      seq: 9,
+      kind,
+      idempotencyKey: 'k',
+      payload: { subtype: 'NOPE' },
+      status: 'IN_FLIGHT',
+      attempts: 0,
+      nextAttemptAt: new Date(),
+      leaseOwner: 'o',
+      leaseExpiresAt: new Date(),
+      lastError: null,
+      createdAt: new Date(),
+      doneAt: null,
+    });
+    // Routed to the create adapter: a malformed envelope is PERMANENT.
+    await expect(router.deliver(entry('REQUEST_CREATE'))).resolves.toEqual({
+      outcome: 'PERMANENT',
+      error: 'invalid payload',
+    });
+    await expect(router.deliver(entry('REQUEST_CANCEL'))).resolves.toEqual({
+      outcome: 'PERMANENT',
+      error: 'invalid payload',
+    });
+    // Other kinds keep the not-wired retry.
+    await expect(
+      router.deliver(entry('MESSAGE_MIRROR')),
+    ).resolves.toMatchObject({ outcome: 'RETRY' });
     await moduleRef.close();
   });
 

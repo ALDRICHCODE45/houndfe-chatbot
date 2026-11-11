@@ -238,6 +238,36 @@ describe('applyCustomerStyle', () => {
     expect(tu).not.toMatch(USTED_MARKERS);
   });
 
+  it.each([
+    [
+      'Le comparto la respuesta del equipo:',
+      'Te comparto la respuesta del equipo:',
+    ],
+    [
+      'El equipo cerró su consulta. Si necesita algo más, escríbame por aquí.',
+      'El equipo cerró tu consulta. Si necesitas algo más, escríbeme por aquí.',
+    ],
+    [
+      'Ya le pregunté al equipo, le aviso por aquí en cuanto me respondan.',
+      'Ya le pregunté al equipo, te aviso por aquí en cuanto me respondan.',
+    ],
+    [
+      'Ya tiene varias consultas abiertas con el equipo; en cuanto respondan le aviso por aquí.',
+      'Ya tienes varias consultas abiertas con el equipo; en cuanto respondan te aviso por aquí.',
+    ],
+    [
+      'El equipo ya tiene sus consultas recientes; por favor espere un poco antes de enviar otra.',
+      'El equipo ya tiene tus consultas recientes; por favor espera un poco antes de enviar otra.',
+    ],
+    [
+      'Estoy registrando su consulta con el equipo; le aviso por aquí.',
+      'Estoy registrando tu consulta con el equipo; te aviso por aquí.',
+    ],
+  ])('converts the human-request copy %j to tú', (usted, tu) => {
+    expect(applyCustomerStyle(usted, style({ register: 'tu' }))).toBe(tu);
+    expect(applyCustomerStyle(usted, style())).toBe(usted);
+  });
+
   it('never rewrites amounts, folios or interpolated data', () => {
     const tu = applyCustomerStyle(
       'Su pedido quedó registrado con folio A-12. Total a pagar: $1,250.00 MXN.\nCLABE: 012345678901234567',

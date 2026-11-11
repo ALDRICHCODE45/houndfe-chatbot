@@ -182,6 +182,31 @@ export function customerStyleDirective(style: CustomerStyle): string {
  */
 const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   // Whole clauses whose verbs depend on context.
+  // Human requests: team answers, staff cancel notice and the askTeam copy.
+  [
+    'Le comparto la respuesta del equipo:',
+    'Te comparto la respuesta del equipo:',
+  ],
+  [
+    'El equipo cerró su consulta. Si necesita algo más, escríbame por aquí.',
+    'El equipo cerró tu consulta. Si necesitas algo más, escríbeme por aquí.',
+  ],
+  [
+    'Ya le pregunté al equipo, le aviso por aquí en cuanto me respondan.',
+    'Ya le pregunté al equipo, te aviso por aquí en cuanto me respondan.',
+  ],
+  [
+    'Ya tiene varias consultas abiertas con el equipo; en cuanto respondan le aviso por aquí.',
+    'Ya tienes varias consultas abiertas con el equipo; en cuanto respondan te aviso por aquí.',
+  ],
+  [
+    'El equipo ya tiene sus consultas recientes; por favor espere un poco antes de enviar otra.',
+    'El equipo ya tiene tus consultas recientes; por favor espera un poco antes de enviar otra.',
+  ],
+  [
+    'Estoy registrando su consulta con el equipo; le aviso por aquí.',
+    'Estoy registrando tu consulta con el equipo; te aviso por aquí.',
+  ],
   // S4 interactive prompts and the change-button reply.
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],

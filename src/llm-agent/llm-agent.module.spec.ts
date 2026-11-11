@@ -5,6 +5,7 @@ import type { FactoryProvider } from '@nestjs/common';
 import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
 import { join } from 'node:path';
+import { HumanRequestCreateService } from '../human-requests/application/human-request-create.service';
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { HttpModule } from '@nestjs/axios';
@@ -224,6 +225,12 @@ describe('LlmAgentModule integration', () => {
     // in-memory adapter (no hidden fallback constructed inside the service).
     const sessionStore = moduleRef.get(MINIMAL_CATALOG_SESSION_STORE);
     expect(sessionStore).toBeInstanceOf(InMemoryMinimalCatalogSessionStore);
+
+    // S6: the askTeam create path is injected into the minimal route.
+    const minimal = moduleRef.get(MinimalCatalogAgentService);
+    expect((minimal as unknown as { team?: unknown }).team).toBeInstanceOf(
+      HumanRequestCreateService,
+    );
 
     // The config is also wired correctly (used by VercelAiLlmAgent ctor).
     const config = moduleRef.get(ConfigService);

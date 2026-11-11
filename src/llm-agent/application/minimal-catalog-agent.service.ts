@@ -12,6 +12,18 @@ import type { CatalogItemResponse } from '../../chatbot-api/domain/dtos/catalog.
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { bindExpirationInboundEvent } from '../../human-decisions/domain/expiration-source-identity';
 import {
+  HumanRequestCreateService,
+  type AskTeamOutcome,
+} from '../../human-requests/application/human-request-create.service';
+import {
+  ASK_TEAM_OPEN_LIMIT_REPLY,
+  ASK_TEAM_QUESTION_MAX_LENGTH,
+  ASK_TEAM_QUEUED_REPLY,
+  ASK_TEAM_RATE_LIMITED_REPLY,
+  ASK_TEAM_REGISTERED_REPLY,
+} from '../../human-requests/domain/human-request-create';
+import { HUMAN_REQUEST_SUMMARY_MAX_LENGTH } from '../../chatbot-api/domain/dtos/human-requests.dto';
+import {
   MINIMAL_CATALOG_SESSION_STORE,
   type MinimalCartConversationContext,
   type MinimalCatalogSessionStore,
@@ -299,6 +311,38 @@ const EXPIRATION_INSTRUCTIONS_FRAGMENT =
   'cuando la presentación importe y nunca elijas una variante por tu cuenta. ' +
   'Si el producto no tiene variantes, omite variantId; no envíes valores de relleno. ' +
   'No afirmes que quedó registrada: la aplicación responde el resultado.';
+
+// S6: questions only a person can answer become an UNKNOWN_QUESTION request.
+const ASK_TEAM_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta askTeam: Nunca inventes lo que decide una persona del ' +
+  'equipo: no prometas fechas, descuentos, devoluciones ni respuestas ' +
+  'técnicas. Si el cliente pregunta algo que el catálogo y las herramientas ' +
+  'no responden (uso o compatibilidad de un producto, políticas, dudas ' +
+  'técnicas), llama a askTeam en vez de adivinar, con su pregunta en sus ' +
+  'palabras (question), un resumen de una línea en español (summary) y los ' +
+  'productIds/variantIds EXACTOS ya identificados si aplica. Es la única ' +
+  'forma de consultar al equipo; no la uses para precios, existencias, ' +
+  'reposición, caducidad, carrito, envío ni pedidos. La aplicación responde ' +
+  'el resultado: nunca afirmes que el equipo ya respondió. Mientras el ' +
+  'cliente espera, sigue ayudando con lo demás.';
+
+const ASK_TEAM_TOOL_UUID = z.uuid();
+
+/** S6: the fixed usted copy for each create outcome (styled per customer). */
+function askTeamReply(outcome: AskTeamOutcome): string {
+  switch (outcome.kind) {
+    case 'registered':
+      return ASK_TEAM_REGISTERED_REPLY;
+    case 'open_limit':
+      return ASK_TEAM_OPEN_LIMIT_REPLY;
+    case 'customer_rate_limited':
+      return ASK_TEAM_RATE_LIMITED_REPLY;
+    case 'queued':
+      return ASK_TEAM_QUEUED_REPLY;
+    case 'failed':
+      return MINIMAL_EXPIRATION_CAUTIOUS_REPLY;
+  }
+}
 
 function instructionsFor(
   restockAvailable: boolean,
@@ -720,6 +764,11 @@ export class MinimalCatalogAgentService {
     // S4 durable conversation gates; optional only as a test seam.
     @Optional()
     private readonly gates?: ConversationGates,
+    // S6 UNKNOWN_QUESTION create path; optional only as a test seam.
+    // Explicit token: a `Pick<>` type would emit `Object` as DI metadata.
+    @Optional()
+    @Inject(HumanRequestCreateService)
+    private readonly team?: Pick<HumanRequestCreateService, 'askTeam'>,
   ) {
     const llm = config.get<{
       model: string;
@@ -741,6 +790,8 @@ export class MinimalCatalogAgentService {
     interactiveReplyId?: string;
     /** S1: the WhatsApp contact profile name, when Meta sent it. */
     profileName?: string;
+    /** S6: the triggering inbound's time (ISO UTC), when known. */
+    inboundAt?: string;
   }): Promise<MinimalCatalogAgentDecision> {
     if (this.busy.has(input.senderId)) {
       // Any turn after a summary spends its consent, even a rejected one.
@@ -783,6 +834,7 @@ export class MinimalCatalogAgentService {
     text: string;
     inboundEvent?: unknown;
     interactiveReplyId?: string;
+    inboundAt?: string;
   }): Promise<MinimalCatalogAgentDecision> {
     {
       if (
@@ -1216,6 +1268,7 @@ export class MinimalCatalogAgentService {
       senderId: string;
       text: string;
       inboundEvent?: unknown;
+      inboundAt?: string;
     },
     pick?: InteractivePick,
   ): Promise<CustomerReply & { onSent?: () => void }> {
@@ -1321,6 +1374,8 @@ export class MinimalCatalogAgentService {
       ? { attempted: false, value: null }
       : null;
     const cartReply: CartReply = { attempted: false, value: null };
+    const askTeamRun: ExpirationReply | null =
+      this.team === undefined ? null : { attempted: false, value: null };
     const checkoutRun: CheckoutRun | null =
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
@@ -1418,6 +1473,7 @@ export class MinimalCatalogAgentService {
         SYSTEM_PROMPT +
         '\n\n' +
         cartInstructions +
+        (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
         this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),
@@ -1440,6 +1496,7 @@ export class MinimalCatalogAgentService {
           reorderRun,
         ),
         ...this.memoryTools(input.senderId),
+        ...this.askTeamTools(input, askTeamRun, traceId),
       },
       stopWhen: stepCountIs(this.maxSteps),
     };
@@ -1503,6 +1560,22 @@ export class MinimalCatalogAgentService {
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
+    }
+    const teamReply = askTeamRun?.value ?? null;
+    if (teamReply !== null) {
+      // S6: the server-owned create outcome; model text never claims it.
+      const reply = styled(teamReply);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+      );
+      return { reply };
     }
     const reorder = reorderRun?.value ?? null;
     if (reorder !== null) {
@@ -1893,6 +1966,70 @@ export class MinimalCatalogAgentService {
   }
 
   /** S1: the model tool that remembers facts the customer gave about a pet. */
+  /** S6: one UNKNOWN_QUESTION create per run; the reply is fixed copy. */
+  private askTeamTools(
+    input: { senderId: string; inboundEvent?: unknown; inboundAt?: string },
+    run: ExpirationReply | null,
+    traceId: string,
+  ): ToolSet {
+    const team = this.team;
+    if (team === undefined || run === null) return {};
+    const trigger = bindExpirationInboundEvent(
+      input.inboundEvent,
+      input.senderId,
+    )?.event.messageId;
+    return {
+      askTeam: tool({
+        description:
+          'Registra con el equipo una pregunta del cliente que el catálogo y ' +
+          'las herramientas no responden (uso, compatibilidad, políticas o ' +
+          'dudas técnicas). La aplicación responde el resultado al cliente.',
+        inputSchema: z.strictObject({
+          question: z.string().trim().min(1).max(ASK_TEAM_QUESTION_MAX_LENGTH),
+          summary: z
+            .string()
+            .trim()
+            .min(1)
+            .max(HUMAN_REQUEST_SUMMARY_MAX_LENGTH),
+          productIds: z.array(ASK_TEAM_TOOL_UUID).max(20).optional(),
+          variantIds: z.array(ASK_TEAM_TOOL_UUID).max(20).optional(),
+        }),
+        execute: async ({ question, summary, productIds, variantIds }) => {
+          if (run.attempted) return toolError('ask_team_settled');
+          run.attempted = true;
+          let outcome: AskTeamOutcome;
+          try {
+            outcome = await team.askTeam({
+              senderId: input.senderId,
+              question,
+              summary,
+              ...(productIds === undefined ? {} : { productIds }),
+              ...(variantIds === undefined ? {} : { variantIds }),
+              ...(input.inboundAt === undefined
+                ? {}
+                : { inboundAt: input.inboundAt }),
+              ...(trigger === undefined ? {} : { triggerWaMessageId: trigger }),
+            });
+          } catch {
+            outcome = { kind: 'failed', reason: 'unavailable' };
+          }
+          run.value = askTeamReply(outcome);
+          traceLog(
+            this.logger,
+            `minimal_catalog tool askTeam result=${outcome.kind} trace=${traceId}`,
+          );
+          return outcome.kind === 'registered'
+            ? {
+                ok: true as const,
+                registered: true as const,
+                presentedByApplication: true as const,
+              }
+            : { ...toolError(outcome.kind), presentedByApplication: true };
+        },
+      }),
+    };
+  }
+
   private memoryTools(senderId: string): ToolSet {
     const profiles = this.profiles;
     if (profiles === undefined) return {};

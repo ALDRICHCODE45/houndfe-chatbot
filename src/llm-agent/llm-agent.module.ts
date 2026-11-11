@@ -46,6 +46,7 @@ import {
   type DeliveryZoneIntakePort,
 } from '../delivery-zones/application/delivery-zone-intake.service';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
+import { HumanRequestsServicesModule } from '../human-requests/human-requests.module';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
@@ -102,6 +103,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     DeliveryZonesModule,
     // S1: persistent customer memory (style, names, pet, last order).
     CustomerProfileModule,
+    // S6: askTeam → HumanRequestCreateService (services only, no consumer).
+    HumanRequestsServicesModule,
   ],
   providers: [
     {

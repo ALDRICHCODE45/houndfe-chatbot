@@ -20,10 +20,11 @@ await backendOutbox.enqueue({
 
 ## Kinds enqueued today
 
-| Kind             | Producer                                                     | conversationRef     | Idempotency key                       | Payload                                                                                 |
-| ---------------- | ------------------------------------------------------------ | ------------------- | ------------------------------------- | --------------------------------------------------------------------------------------- |
-| `MESSAGE_MIRROR` | `TranscriptRecorder`, same transaction as the transcript row | `wa:<sender_id>`    | `mirror:<wa_message_id>`              | `{waMessageId, direction, author, type, text?, media?, providerTimestamp?, observedAt}` |
-| `MESSAGE_STATUS` | `WebhookDispatcherService`, from Meta `value.statuses[]`     | `wa:<recipient_id>` | `status:<providerMessageId>:<status>` | `{providerMessageId, status, occurredAt, errorCode?}` (statuses:batch item)             |
+| Kind             | Producer                                                                                                                             | conversationRef     | Idempotency key                        | Payload                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
+| `MESSAGE_MIRROR` | `TranscriptRecorder`, same transaction as the transcript row                                                                         | `wa:<sender_id>`    | `mirror:<wa_message_id>`               | `{waMessageId, direction, author, type, text?, media?, providerTimestamp?, observedAt}` |
+| `MESSAGE_STATUS` | `WebhookDispatcherService`, from Meta `value.statuses[]`                                                                             | `wa:<recipient_id>` | `status:<providerMessageId>:<status>`  | `{providerMessageId, status, occurredAt, errorCode?}` (statuses:batch item)             |
+| `REQUEST_CREATE` | `HumanRequestCreateService.askTeam`, only when the synchronous create failed transiently (throw, `RATE_LIMITED`, `VERSION_CONFLICT`) | `wa:<sender_id>`    | the body's `sourceRequestId` (UUID v4) | the full `POST /chatbot-api/requests` body (see `docs/human-request-feed.md`)           |
 
 Statuses (`normalizeMetaStatuses` in `src/whatsapp/application/meta-status-normalizer.ts`):
 
@@ -72,16 +73,25 @@ To replay a DEAD row after a fix, set `status = 'PENDING', next_attempt_at = now
 
 ## Wiring a kind
 
-Backend unit 5 does not exist yet. Until it does, `BACKEND_OUTBOX_DELIVERY` is `NotWiredBackendOutboxDelivery`:
+`BACKEND_OUTBOX_DELIVERY` is `RoutingBackendOutboxDelivery` (`src/backend-outbox/infrastructure/`). It lives in `BackendOutboxEnqueueModule`, so feature modules register adapters on the same instance at `onModuleInit`, before the drain starts on bootstrap. This keeps `backend-outbox.module.ts` free of feature imports (no module cycle).
 
-- Every row is retried, so rows accumulate safely and nothing is lost.
-- It logs `backend outbox delivery not wired for kind X; will retry` at most once per kind per minute.
-- It never makes an HTTP call.
+| Kinds                              | Adapter                                                                                                                                                                                                                  |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `REQUEST_CREATE`, `REQUEST_CANCEL` | `HumanRequestCreateService` (registered by `HumanRequestsModule`): `createHumanRequest` / `cancelHumanRequest` through `HUMAN_REQUESTS_CLIENT`. Mapping below.                                                           |
+| every other kind                   | `NotWiredBackendOutboxDelivery` (backend endpoints not built): every row is retried, nothing is lost, no HTTP call. It logs `backend outbox delivery not wired for kind X; will retry` at most once per kind per minute. |
 
-When an endpoint exists:
+Request result mapping:
 
-1. Write an HTTP adapter implementing `BackendOutboxDeliveryPort`. Dispatch on `entry.kind` and send `entry.idempotencyKey` as `X-Idempotency-Key` where the contract asks for it. Map responses with `classifyBackendResponse`.
-2. Return `RETRY` for kinds the adapter does not handle yet, so those rows stay queued.
-3. Replace the `BACKEND_OUTBOX_DELIVERY` provider in `backend-outbox.module.ts`.
+- Create `201`/`200` (CREATED, REPLAYED, MERGED) → `DELIVERED`, after the registry row is written `OPEN` (a failed registry write throws, so the row is retried and the replay answers REPLAYED). Then the customer gets one "Ya le pregunté al equipo, le aviso por aquí en cuanto me respondan." (styled), only if the conversation is not in HUMAN mode and the 24 h window is open; otherwise it is skipped silently. A failed send never undoes the delivery.
+- `RATE_LIMITED`, `CUSTOMER_RATE_LIMITED` → `RETRY` after `Retry-After`; `VERSION_CONFLICT` → `RETRY`.
+- Cancel `200` → `DELIVERED` and the registry row `CANCELLED`; `ALREADY_RESOLVED` → `DELIVERED` and the row `RESOLVED`.
+- Every other documented error (`CUSTOMER_OPEN_LIMIT`, `IDEMPOTENCY_CONFLICT`, `SUBTYPE_DISABLED`, `VALIDATION_ERROR`, `REQUEST_CLOSED`, `CANCEL_NOT_ALLOWED`, `NOT_FOUND`, …) and a malformed stored payload → `PERMANENT`.
+- A throw (network, 5xx, timeout, malformed answer) → retried by the drain worker.
+
+To wire another kind: implement `BackendOutboxDeliveryPort` for it and call `router.register([kind], adapter)` from the owning module at init. Send `entry.idempotencyKey` as `X-Idempotency-Key` where the contract asks for it; `classifyBackendResponse` holds the generic HTTP rules.
 
 Delivery must be idempotent: a crash after delivery, or an expired lease, replays the same row.
+
+### Known limitation: head-of-line blocking
+
+The drain only claims each conversation's head, and every inbound already enqueues a `MESSAGE_MIRROR` for `wa:<sender_id>` that stays `RETRY` while that kind is not wired. A queued `REQUEST_CREATE` (or `REQUEST_CANCEL`) for the same conversation therefore waits behind those mirrors and is not delivered until they are. The synchronous create path is not affected. Fixed by request lanes (next task).

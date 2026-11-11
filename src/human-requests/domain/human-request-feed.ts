@@ -168,25 +168,13 @@ export const TEAM_PREFIX = 'Le comparto la respuesta del equipo:';
 export const CANCEL_NOTICE =
   'El equipo cerró su consulta. Si necesita algo más, escríbame por aquí.';
 
-/** tú copy for the fixed texts of this module. The shared curated pairs do
- *  not cover these whole sentences yet, and a partial conversion would mix
- *  registers. */
-const TU_COPY: ReadonlyMap<string, string> = new Map([
-  [TEAM_PREFIX, 'Te comparto la respuesta del equipo:'],
-  [
-    CANCEL_NOTICE,
-    'El equipo cerró tu consulta. Si necesitas algo más, escríbeme por aquí.',
-  ],
-]);
-
-/** Fixed usted copy in the customer's stored style (usted when unknown). */
+/** Fixed usted copy in the customer's stored style (usted when unknown);
+ *  the tú variants are whole-sentence curated pairs in `customer-style.ts`. */
 export function styleFixedCopy(
   usted: string,
   style: CustomerStyle | null,
 ): string {
-  if (style === null) return usted;
-  const base = style.register === 'tu' ? (TU_COPY.get(usted) ?? usted) : usted;
-  return applyCustomerStyle(base, style);
+  return style === null ? usted : applyCustomerStyle(usted, style);
 }
 
 /** Styled prefix + staff text verbatim (never restyled). */

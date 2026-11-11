@@ -33,6 +33,11 @@ import { WebhookDispatcherService } from './application/webhook-dispatcher.servi
 import { WHATSAPP_SENDER } from './domain/whatsapp-sender.port';
 import { MetaWhatsappSender } from './infrastructure/meta-whatsapp.sender';
 import { WhatsappModule } from './whatsapp.module';
+import { HumanRequestDeliveryService } from '../human-requests/application/human-request-delivery.service';
+import {
+  HumanRequestsModule,
+  HumanRequestsServicesModule,
+} from '../human-requests/human-requests.module';
 
 /** Tokens the receipt composition must never register, in either mode,
  * including when composed through the host. Both the ODD-3A ingestion worker
@@ -329,6 +334,12 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
       );
       // The outbound sender alias keeps resolving through the sender module.
       expect(moduleRef.get(WHATSAPP_SENDER)).toBeDefined();
+      // S5: the dispatcher replays pending team deliveries on each inbound.
+      const dispatcher = moduleRef.get(WebhookDispatcherService);
+      expect(
+        (dispatcher as unknown as { humanRequestDelivery?: unknown })
+          .humanRequestDelivery,
+      ).toBe(moduleRef.get(HumanRequestDeliveryService));
     });
   });
 
@@ -654,6 +665,13 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
       pool,
     );
     expect(pool.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('imports the human-request services, never the feed consumer', () => {
+    const imported = (Reflect.getMetadata('imports', WhatsappModule) ??
+      []) as unknown[];
+    expect(imported).toContain(HumanRequestsServicesModule);
+    expect(imported).not.toContain(HumanRequestsModule);
   });
 
   it('declares ReceiptMediaModule among the host imports', () => {
