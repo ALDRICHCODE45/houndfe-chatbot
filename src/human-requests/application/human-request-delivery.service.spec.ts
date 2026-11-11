@@ -12,7 +12,10 @@ import {
   cancelledItem,
 } from '../infrastructure/human-request-feed-store.contract';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
-import { HumanRequestDeliveryService } from './human-request-delivery.service';
+import {
+  HumanRequestDeliveryService,
+  type HumanRequestDeliveryOptions,
+} from './human-request-delivery.service';
 
 const SENDER = '5215550001111';
 const NOW = new Date('2026-11-10T16:20:00.000Z');
@@ -102,8 +105,9 @@ class FakeSender {
   }
 }
 
-const setup = () => {
+const setup = (options: HumanRequestDeliveryOptions = {}) => {
   const store = new InMemoryHumanRequestFeedStore();
+  const modeChecks: string[] = [];
   const client = new FakeClient();
   const sender = new FakeSender();
   const human = { value: false };
@@ -116,11 +120,17 @@ const setup = () => {
       store,
       client,
       sender,
-      handoff: { isHumanMode: () => Promise.resolve(human.value) },
+      handoff: {
+        isHumanMode: (senderId: string) => {
+          modeChecks.push(senderId);
+          return Promise.resolve(human.value);
+        },
+      },
       isWindowOpen: () => Promise.resolve(window.open),
       customerStyle: () => Promise.resolve(style),
     },
     {
+      ...options,
       clock: () => time.now,
       random: () => 1,
       newAttemptId: () => {
@@ -137,6 +147,7 @@ const setup = () => {
     window,
     time,
     service,
+    modeChecks,
     setStyle: (next: CustomerStyle | null) => {
       style = next;
     },
@@ -618,6 +629,164 @@ describe('HumanRequestDeliveryService', () => {
     await expect(service.accept(cancelledItem('t1'))).rejects.toThrow('db');
     await expect(store.getDelivery('t1')).resolves.toMatchObject({
       localState: 'RECEIVED',
+    });
+  });
+
+  describe('held replay fairness', () => {
+    it('rows still held are moved behind the others, so every held row is checked', async () => {
+      const { service, human, modeChecks } = setup({ batchSize: 2 });
+      human.value = true;
+      const senders = ['5215550000001', '5215550000002', '5215550000003'];
+      for (const [i, senderId] of senders.entries())
+        await service.accept({
+          ...clarification(`fair${i}`),
+          conversationRef: `wa:${senderId}`,
+        });
+      modeChecks.length = 0;
+      await service.replayHeld();
+      await service.replayHeld();
+      expect(new Set(modeChecks)).toEqual(new Set(senders));
+    });
+  });
+
+  describe('local DEFERRED_WINDOW replay', () => {
+    it('a deferred row the backend does not list is re-delivered on the next inbound', async () => {
+      const { service, sender, client, store } = setup();
+      sender.script = [new WhatsappSendError(400, '131047', 'Re-engagement')];
+      client.ackScript = [new Error('502')]; // the deferral ACK stays PENDING
+      await service.accept(clarification('dw1'));
+      await expect(store.getDelivery('dw1')).resolves.toMatchObject({
+        localState: 'DEFERRED_WINDOW',
+        ackState: 'PENDING',
+      });
+      client.pending = { kind: 'ok', items: [] };
+      await service.onCustomerInbound(REF);
+      expect(sender.sent).toHaveLength(2);
+      await expect(store.getDelivery('dw1')).resolves.toMatchObject({
+        localState: 'SENT',
+        attemptId: attemptId(2),
+        ackState: 'ACKED',
+        ackOutcome: 'PROVIDER_ACCEPTED',
+      });
+    });
+
+    it('a deferred row also listed by the backend is delivered once', async () => {
+      const { service, sender, client } = setup();
+      sender.script = [new WhatsappSendError(400, '131047', 'Re-engagement')];
+      await service.accept(clarification('dw2'));
+      client.pending = { kind: 'ok', items: [clarification('dw2')] };
+      await service.onCustomerInbound(REF);
+      expect(sender.sent).toHaveLength(2);
+      expect(
+        client.acks.filter((a) => a.body.outcome === 'PROVIDER_ACCEPTED'),
+      ).toHaveLength(1);
+    });
+
+    it('deferred rows of other conversations are left alone', async () => {
+      const { service, sender } = setup();
+      sender.script = [new WhatsappSendError(400, '131047', 'Re-engagement')];
+      await service.accept(clarification('dw3'));
+      await service.onCustomerInbound('wa:5215550009999');
+      expect(sender.sent).toHaveLength(1);
+    });
+  });
+
+  describe('logs', () => {
+    it('never print the customer phone (only its last 4 digits)', async () => {
+      const { service, client, store } = setup();
+      client.pending = new Error('backend down');
+      await service.onCustomerInbound(REF);
+      client.pending = { kind: 'RATE_LIMITED', retryAfterSeconds: 1 };
+      await service.onCustomerInbound(REF);
+      jest.spyOn(store, 'listHeld').mockRejectedValueOnce(new Error('db down'));
+      await service.onCustomerInbound(REF);
+      const calls: unknown[][] = [
+        ...(warn.mock.calls as unknown[][]),
+        ...(error.mock.calls as unknown[][]),
+      ];
+      const lines = calls.map((call) => String(call[0]));
+      expect(lines.length).toBeGreaterThanOrEqual(3);
+      for (const line of lines) {
+        expect(line).not.toContain(SENDER);
+        expect(line).toContain('1111');
+      }
+    });
+  });
+
+  describe('abandon (poison feed item)', () => {
+    it('a RECEIVED row becomes STALE / LOCAL_FAILURE, ACK STALE, nothing sent', async () => {
+      const { service, store, client, sender } = setup();
+      await store.insertDelivery(cancelledItem('z1'));
+      await service.abandon(cancelledItem('z1'), 'Error: boom');
+      expect(sender.sent).toEqual([]);
+      await expect(store.getDelivery('z1')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'LOCAL_FAILURE',
+        ackState: 'ACKED',
+        ackOutcome: 'STALE',
+      });
+      expect(client.acks).toEqual([
+        {
+          deliveryId: 'z1',
+          body: {
+            outcome: 'STALE',
+            attemptId: attemptId(1),
+            attemptedAt: NOW.toISOString(),
+          },
+        },
+      ]);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('z1'));
+    });
+
+    it('with no ledger row (the insert itself fails) it ACKs STALE once, nothing sent', async () => {
+      const { service, store, client, sender } = setup();
+      await service.abandon(cancelledItem('z2'), 'Error: insert');
+      expect(sender.sent).toEqual([]);
+      await expect(store.getDelivery('z2')).resolves.toBeNull();
+      expect(client.acks).toEqual([
+        {
+          deliveryId: 'z2',
+          body: {
+            outcome: 'STALE',
+            attemptId: attemptId(1),
+            attemptedAt: NOW.toISOString(),
+          },
+        },
+      ]);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('z2'));
+    });
+
+    it('a SENDING row is left to the stuck-send sweep (DELIVERY_UNKNOWN), never resent', async () => {
+      const { service, store, client, sender } = setup();
+      await store.insertDelivery(cancelledItem('z3'));
+      await store.transition(
+        'z3',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'SENDING',
+          decision: 'CANCEL_NOTICE',
+          attemptId: attemptId(9),
+          attemptedAt: NOW.toISOString(),
+          providerMessageId: null,
+          ack: null,
+        },
+      );
+      await service.abandon(cancelledItem('z3'), 'Error: boom');
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toEqual([]);
+      await expect(store.getDelivery('z3')).resolves.toMatchObject({
+        localState: 'SENDING',
+        attemptId: attemptId(9),
+      });
+    });
+
+    it('rejects when the ledger cannot be read (not a poison item: the page stays stuck)', async () => {
+      const { service, store, client } = setup();
+      jest.spyOn(store, 'getDelivery').mockRejectedValueOnce(new Error('db'));
+      await expect(
+        service.abandon(cancelledItem('z4'), 'Error: db'),
+      ).rejects.toThrow('db');
+      expect(client.acks).toEqual([]);
     });
   });
 });

@@ -3,7 +3,7 @@ import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.c
 import {
   FEED_MAX_LIMIT,
   FEED_MAX_WAIT_SECONDS,
-  type ReadFeedResult,
+  type FeedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import {
   RETRY_AFTER_MAX_MS,
@@ -15,7 +15,7 @@ import type { HumanRequestDeliveryService } from './human-request-delivery.servi
 export interface HumanRequestFeedConsumerPorts {
   store: Pick<HumanRequestFeedStore, 'readCursor' | 'saveCursor'>;
   client: Pick<HumanRequestsClient, 'readFeed'>;
-  delivery: Pick<HumanRequestDeliveryService, 'accept'>;
+  delivery: Pick<HumanRequestDeliveryService, 'accept' | 'abandon'>;
   lock: FeedConsumerLock;
 }
 
@@ -27,6 +27,8 @@ export interface HumanRequestFeedConsumerOptions {
   maxBackoffMs?: number;
   /** Consecutive failures at one cursor before an error log. */
   stuckPageThreshold?: number;
+  /** Consecutive failures of one deliveryId before it is abandoned. */
+  poisonItemThreshold?: number;
   random?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -54,19 +56,23 @@ export class HumanRequestFeedConsumer {
   private readonly lockRetryMs: number;
   private readonly maxBackoffMs: number;
   private readonly stuckPageThreshold: number;
+  private readonly poisonItemThreshold: number;
   private readonly random: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private started = false;
   private stopped = false;
   private loopDone: Promise<void> = Promise.resolve();
   private wake?: () => void;
-  private readonly stopSignal: Promise<typeof STOPPED>;
-  private signalStop!: () => void;
+  /** One listener per pending wait, removed when the wait settles (a single
+   *  long-lived promise in Promise.race would retain every page). */
+  private readonly stopListeners = new Set<() => void>();
   private lockHeld = false;
   private failures = 0;
   private failedCursor: string | null | undefined;
   private failedCount = 0;
   private lastCursor: string | null = null;
+  private failingItem: string | undefined;
+  private failingItemCount = 0;
 
   constructor(
     private readonly ports: HumanRequestFeedConsumerPorts,
@@ -77,11 +83,9 @@ export class HumanRequestFeedConsumer {
     this.lockRetryMs = options.lockRetryMs ?? 15_000;
     this.maxBackoffMs = options.maxBackoffMs ?? 60_000;
     this.stuckPageThreshold = options.stuckPageThreshold ?? 3;
+    this.poisonItemThreshold = options.poisonItemThreshold ?? 5;
     this.random = options.random ?? Math.random;
     this.sleepFn = options.sleep ?? ((ms) => this.interruptibleSleep(ms));
-    this.stopSignal = new Promise((resolve) => {
-      this.signalStop = () => resolve(STOPPED);
-    });
   }
 
   /** Starts the loop once; never restarts after `stop`. */
@@ -91,13 +95,14 @@ export class HumanRequestFeedConsumer {
     this.loopDone = this.loop();
   }
 
-  /** Stops the loop without waiting for an open long-poll (its page is
-   *  dropped unsaved); resolves after the page being handled and the lock
-   *  release. */
+  /** Idempotent. Stops the loop without waiting for an open long-poll (its
+   *  page is dropped unsaved); an item being handled is finished, the rest of
+   *  its page is left unsaved (handled items are in the ledger and replay
+   *  without a resend). Resolves after the lock release. */
   async stop(): Promise<void> {
     if (!this.stopped) {
       this.stopped = true;
-      this.signalStop();
+      for (const listener of [...this.stopListeners]) listener();
       this.wake?.();
     }
     await this.loopDone;
@@ -111,18 +116,17 @@ export class HumanRequestFeedConsumer {
   /** One long-poll and its page. Throws when the page could not be handled
    *  (the cursor is left where it was). */
   async runOnce(): Promise<FeedPassResult> {
+    if (this.stopped) return { kind: 'stopped' };
     const cursor = await this.ports.store.readCursor();
     this.lastCursor = cursor;
+    if (this.stopped) return { kind: 'stopped' };
     const read = this.ports.client.readFeed({
       ...(cursor === null ? {} : { after: cursor }),
       limit: this.limit,
       waitSeconds: this.waitSeconds,
     });
     read.catch(() => undefined); // a dropped poll must not reject unhandled
-    const result: ReadFeedResult | typeof STOPPED = await Promise.race([
-      read,
-      this.stopSignal,
-    ]);
+    const result = await this.untilStopped(read);
     if (result === STOPPED || this.stopped) return { kind: 'stopped' };
     switch (result.kind) {
       case 'CURSOR_EXPIRED':
@@ -140,11 +144,51 @@ export class HumanRequestFeedConsumer {
           ),
         };
       case 'ok':
-        for (const item of result.items) await this.ports.delivery.accept(item);
+        for (const item of result.items) {
+          if (this.stopped) return { kind: 'stopped' };
+          await this.handle(item);
+        }
         if (result.nextCursor !== '' && result.nextCursor !== cursor)
           await this.ports.store.saveCursor(result.nextCursor);
         return { kind: 'page', items: result.items.length };
     }
+  }
+
+  /** One item; a deliveryId that keeps failing is abandoned (recorded as a
+   *  terminal local failure, never resent) so it cannot block the feed. */
+  private async handle(item: FeedItem): Promise<void> {
+    try {
+      await this.ports.delivery.accept(item);
+    } catch (error) {
+      if (this.failingItem === item.deliveryId) this.failingItemCount += 1;
+      else {
+        this.failingItem = item.deliveryId;
+        this.failingItemCount = 1;
+      }
+      if (this.failingItemCount < this.poisonItemThreshold) throw error;
+      // Throws when the ledger is unreadable: the page stays stuck.
+      await this.ports.delivery.abandon(item, describe(error));
+      this.logger.error(
+        `feed item ${item.deliveryId} abandoned after ${this.failingItemCount} consecutive failures: ${describe(error)}`,
+      );
+    }
+    if (this.failingItem === item.deliveryId) {
+      this.failingItem = undefined;
+      this.failingItemCount = 0;
+    }
+  }
+
+  /** Resolves with the work's result, or STOPPED as soon as stop is called. */
+  private untilStopped<T>(work: Promise<T>): Promise<T | typeof STOPPED> {
+    if (this.stopped) return Promise.resolve(STOPPED);
+    let listener!: () => void;
+    const stopped = new Promise<typeof STOPPED>((resolve) => {
+      listener = () => resolve(STOPPED);
+      this.stopListeners.add(listener);
+    });
+    return Promise.race([work, stopped]).finally(() => {
+      this.stopListeners.delete(listener);
+    });
   }
 
   private async loop(): Promise<void> {
@@ -153,6 +197,7 @@ export class HumanRequestFeedConsumer {
         if (!this.stopped) await this.sleepFn(this.lockRetryMs);
         continue;
       }
+      if (this.stopped) break;
       let result: FeedPassResult;
       try {
         result = await this.runOnce();

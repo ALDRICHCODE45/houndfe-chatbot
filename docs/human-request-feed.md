@@ -4,7 +4,7 @@ The chatbot side of backend unit 5b (`docs/contracts/human-intervention-bot-cont
 
 > The cursor is for reading; the ACK is for delivering.
 
-## Tables (migration 4300)
+## Tables (migrations 4300, 4500)
 
 | Table                       | Purpose                                                                                                                                                                                                                                                                                                                          |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -12,9 +12,9 @@ The chatbot side of backend unit 5b (`docs/contracts/human-intervention-bot-cont
 | `human_request_deliveries`  | Delivery ledger. `delivery_id` is the primary key, inserted **before** any Meta call. `payload` keeps the whole parsed feed item. Local state, decision, the current attempt (`attempt_id`, `attempted_at`, `provider_message_id`) and the durable ACK (`ack_state`, `ack_outcome`, `ack_attempts`, `next_ack_at`, `ack_error`). |
 | `human_request_registry`    | Requests the bot created or that staff cancelled: `request_id`, `conversation_ref`, `subtype`, `legacy_id`, `status` (`OPEN`, `CANCELLED`, `RESOLVED`). The create path (T3) writes `OPEN` rows; a staff `request.cancelled` closes them.                                                                                        |
 
-`local_state`: `RECEIVED`, `SENDING`, `SENT`, `STALE`, `UNKNOWN`, `DEFERRED_WINDOW`, `HELD_HUMAN`. `decision`: `LEGACY_PATH_DELIVERS`, `DUPLICATE`, `WINDOW_CLOSED`, `CANCEL_NOTICE`, `CLARIFICATION`, `UNKNOWN_TYPE`, `UNKNOWN_KIND`, `NO_CONVERSATION`. `ack_state`: NULL (nothing owed), `PENDING`, `ACKED`, `FAILED_PERMANENT`.
+`local_state`: `RECEIVED`, `SENDING`, `SENT`, `STALE`, `UNKNOWN`, `DEFERRED_WINDOW`, `HELD_HUMAN`. `decision`: `LEGACY_PATH_DELIVERS`, `DUPLICATE`, `WINDOW_CLOSED`, `CANCEL_NOTICE`, `CLARIFICATION`, `UNKNOWN_TYPE`, `UNKNOWN_KIND`, `NO_CONVERSATION`, `LOCAL_FAILURE` (4500: a poison item the consumer gave up). `ack_state`: NULL (nothing owed), `PENDING`, `ACKED`, `FAILED_PERMANENT`.
 
-Indexes: due ACKs (`next_ack_at` where `ack_state = 'PENDING'`), per-conversation replay (`conversation_ref, local_state`), and the global sweeps of `HELD_HUMAN`/`SENDING` rows. `down` refuses while a delivery owes work (PENDING ACK, SENDING, HELD_HUMAN) or a request is OPEN.
+Indexes: due ACKs (`next_ack_at` where `ack_state = 'PENDING'`), per-conversation replay (`conversation_ref, local_state`), the global sweeps of `HELD_HUMAN`/`SENDING` rows, and the retention purge (4500: `updated_at` where `local_state IN ('SENT', 'STALE', 'UNKNOWN')`). The 4500 `down` refuses while a `LOCAL_FAILURE` row exists. `down` refuses while a delivery owes work (PENDING ACK, SENDING, HELD_HUMAN) or a request is OPEN.
 
 ## Consumer loop
 
@@ -24,8 +24,9 @@ Indexes: due ACKs (`next_ack_at` where `ack_state = 'PENDING'`), per-conversatio
 2. `readFeed({after: cursor, limit: 50, waitSeconds: 25})`.
 3. Each item in order: insert the ledger row (`ON CONFLICT DO NOTHING`; an existing row keeps its stored state and is never sent again), then handle it.
 4. After the whole page is handled, save `nextCursor`. If an item throws, the cursor stays put and the page is read again.
+   - Poison item: after 5 consecutive failures of the same `deliveryId`, `HumanRequestDeliveryService.abandon` records it and the page moves on, with an error log naming the `deliveryId`. A `RECEIVED` row (nothing sent) becomes `STALE` / `LOCAL_FAILURE` + ACK `STALE`. A `SENDING` row is left to the stuck-send sweep (`DELIVERY_UNKNOWN`). An already decided row keeps its state. With no ledger row (the insert itself fails), one inline ACK `STALE` is sent. If the ledger cannot be read, `abandon` throws and the page stays stuck. Never a resend. A page the client rejects as a whole (malformed) keeps the stuck-page behavior below.
 5. Throws back off exponentially (1 s doubling, up to 60 s). After 3 failures at the same cursor, each further failure logs an **error** with the count; the page is never skipped. `RATE_LIMITED` sleeps `Retry-After`. `CURSOR_EXPIRED` logs a warning and restarts with cursor NULL (the ledger de-duplicates).
-6. Stop does not wait for an open long-poll: that page is dropped unsaved and read again later.
+6. `stop` is idempotent and does not wait for an open long-poll: that page is dropped unsaved and read again later. In the middle of a page, it finishes only the item in progress. The cursor stays at the last whole page; the items already handled are in the ledger and replay without a resend. A stop during the lock acquisition opens no long-poll, and the lock connection is always released. Each wait races a per-call stop listener that is removed when the wait settles; one long-lived stop promise would retain every page. The HTTP long-poll itself is not aborted (the client has no abort signal): it ends on its own (≤ 35 s) and its result is discarded.
 
 ## Handling
 
@@ -54,11 +55,11 @@ The 24 h window for cancellation notices is read from the customer inbound obser
 - Held clarification: `HELD_HUMAN`, ACK `DEFERRED_HUMAN_SESSION`. If the backend answers `VALIDATION_ERROR` (slice 5c not live yet), the hold stays local (`ack_state` NULL), without an error.
 - Held cancellation: `HELD_HUMAN` with no ACK at all; it is decided (notice or `STALE`) once the conversation is BOT again.
 - An unreadable mode fails the item (retried), never sends.
-- The sweep re-handles `HELD_HUMAN` rows when the conversation is BOT again, with a new `attempt_id`.
+- The sweep re-handles `HELD_HUMAN` rows when the conversation is BOT again, with a new `attempt_id`. It reads them least recently checked first (`updated_at`). A row still held, or one whose check failed, is touched (`updated_at = now()`, guarded by state and attempt) so it moves behind the others. Conversations that stay HUMAN therefore never starve the rest.
 
 ## Window replay (S5)
 
-`HumanRequestDeliveryService.onCustomerInbound(conversationRef)` fetches `listPendingDeliveries({conversationRef})`, records unknown items, re-handles deferred ones with a new `attempt_id`, then re-handles this conversation's `HELD_HUMAN` rows if it is BOT. It never throws. The WhatsApp dispatcher calls it with `wa:<sender_id>` on each customer inbound that passes the S7 HUMAN gate, next to the profile warm-up, without awaiting it; a rejection or a sync throw is only logged and never delays or breaks the reply.
+`HumanRequestDeliveryService.onCustomerInbound(conversationRef)` fetches `listPendingDeliveries({conversationRef})`, records unknown items and re-handles deferred ones with a new `attempt_id`. Then it re-handles this conversation's local `DEFERRED_WINDOW` rows: the backend does not list a deferral whose ACK is still pending or failed. Last come its `HELD_HUMAN` rows, if the conversation is BOT. Each `deliveryId` is handled at most once per call, and every claim is the compare-and-set transition. It never throws. The WhatsApp dispatcher calls it with `wa:<sender_id>` on each customer inbound that passes the S7 HUMAN gate, next to the profile warm-up, without awaiting it; a rejection or a sync throw is only logged and never delays or breaks the reply.
 
 ## Create path (S6, `askTeam`)
 
@@ -90,6 +91,16 @@ The ACK body is rebuilt from the row (`attemptId`, `outcome`, `attemptedAt`, `pr
 - `IDEMPOTENCY_CONFLICT`, `OUTCOME_ALREADY_RECORDED`, `OUTCOME_NOT_ALLOWED`, `NOT_FOUND`, other `VALIDATION_ERROR` → `FAILED_PERMANENT` with an error log.
 
 All ledger writes are compare-and-set on `(local_state, attempt_id)`, so the consumer, a replay and the sweeps on several instances never claim the same send twice.
+
+## Retention
+
+`HumanRequestMaintenanceWorker` also purges ledger rows in a terminal local state (`SENT`, `STALE`, `UNKNOWN`) last updated more than 35 days ago (feed retention is 30 days, so the backend can no longer re-serve them), at most 500 of each kind per tick (`FOR UPDATE SKIP LOCKED`):
+
+- `ack_state = 'ACKED'`: deleted.
+- `ack_state = 'FAILED_PERMANENT'`: only the payload is replaced by a stub (`{type: 'unknown', rawType, cursor, deliveryId, raw: {purged: true}}`); the row keeps its dedup key and ACK evidence. The backend never recorded that outcome; after a deferral it could still list the delivery in pending-deliveries, and a deleted row would be sent again.
+- Rows owing work (`RECEIVED`, `SENDING`, `HELD_HUMAN`, `DEFERRED_WINDOW`, a `PENDING` ACK) are never touched.
+
+Logs of this module show a conversation as `wa:…<last 4 digits>`, never the full phone.
 
 ## Not built yet
 

@@ -28,6 +28,7 @@ import {
   type UnknownQuestionInput,
 } from '../domain/human-request-create';
 import {
+  maskConversationRef,
   senderIdFromRef,
   styleFixedCopy,
   type HumanRequestFeedStore,
@@ -121,7 +122,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       result = await this.ports.client.createHumanRequest(request);
     } catch (error) {
       this.logger.warn(
-        `askTeam create failed for ${request.conversationRef}, queueing: ${describe(error)}`,
+        `askTeam create failed for ${maskConversationRef(request.conversationRef)}, queueing: ${describe(error)}`,
       );
       return this.queue(request);
     }
@@ -140,7 +141,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
         return this.queue(request);
       default:
         this.logger.error(
-          `askTeam create for ${request.conversationRef} refused: ${result.kind}`,
+          `askTeam create for ${maskConversationRef(request.conversationRef)} refused: ${result.kind}`,
         );
         return { kind: 'failed', reason: result.kind };
     }
@@ -170,7 +171,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       return { kind: 'queued' };
     } catch (error) {
       this.logger.error(
-        `askTeam queue failed for ${request.conversationRef}: ${describe(error)}`,
+        `askTeam queue failed for ${maskConversationRef(request.conversationRef)}: ${describe(error)}`,
       );
       return { kind: 'failed', reason: 'queue_failed' };
     }
@@ -283,7 +284,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       });
     } catch (error) {
       this.logger.warn(
-        `queued create confirmation skipped for ${conversationRef}: ${describe(error)}`,
+        `queued create confirmation skipped for ${maskConversationRef(conversationRef)}: ${describe(error)}`,
       );
     }
   }

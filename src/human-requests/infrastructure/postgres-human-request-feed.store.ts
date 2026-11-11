@@ -110,6 +110,28 @@ const HELD_SQL = `SELECT * FROM human_request_deliveries
 const HELD_FOR_SQL = `SELECT * FROM human_request_deliveries
  WHERE conversation_ref = $1 AND local_state = 'HELD_HUMAN'
  ORDER BY updated_at LIMIT $2`;
+/** A check moves the row behind the other held rows (fair replay). */
+const TOUCH_HELD_SQL = `UPDATE human_request_deliveries SET updated_at = now()
+ WHERE delivery_id = $1 AND local_state = 'HELD_HUMAN'
+   AND attempt_id IS NOT DISTINCT FROM $2::uuid`;
+const DEFERRED_FOR_SQL = `SELECT * FROM human_request_deliveries
+ WHERE conversation_ref = $1 AND local_state = 'DEFERRED_WINDOW'
+ ORDER BY updated_at LIMIT $2`;
+/** Retention (migration 4500 purge index). Terminal rows never transition
+ *  again; SKIP LOCKED keeps concurrent instances apart. */
+const PURGE_WHERE = `local_state IN ('SENT', 'STALE', 'UNKNOWN') AND updated_at < $1`;
+const PURGE_ACKED_SQL = `DELETE FROM human_request_deliveries WHERE delivery_id IN (
+  SELECT delivery_id FROM human_request_deliveries
+   WHERE ${PURGE_WHERE} AND ack_state = 'ACKED'
+   ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED)`;
+const SCRUB_FAILED_SQL = `UPDATE human_request_deliveries SET payload = jsonb_build_object(
+    'type', 'unknown', 'rawType', type, 'cursor', cursor,
+    'deliveryId', delivery_id, 'raw', jsonb_build_object('purged', true))
+ WHERE delivery_id IN (
+  SELECT delivery_id FROM human_request_deliveries
+   WHERE ${PURGE_WHERE} AND ack_state = 'FAILED_PERMANENT'
+     AND payload->'raw'->'purged' IS NULL
+   ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED)`;
 const STUCK_SENDING_SQL = `SELECT * FROM human_request_deliveries
  WHERE local_state = 'SENDING' AND attempted_at < $1
  ORDER BY attempted_at LIMIT $2`;
@@ -238,6 +260,33 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
             filter.limit,
           ]);
     return result.rows.map(toDelivery);
+  }
+
+  async touchHeld(deliveryId: string, attemptId: string | null): Promise<void> {
+    await this.pool.query(TOUCH_HELD_SQL, [deliveryId, attemptId]);
+  }
+
+  async listDeferredWindow(filter: {
+    conversationRef: string;
+    limit: number;
+  }): Promise<DeliveryRow[]> {
+    const result = await this.pool.query<Row>(DEFERRED_FOR_SQL, [
+      filter.conversationRef,
+      filter.limit,
+    ]);
+    return result.rows.map(toDelivery);
+  }
+
+  async purgeTerminal(
+    before: Date,
+    limit: number,
+  ): Promise<{ deleted: number; scrubbed: number }> {
+    const deleted = await this.pool.query(PURGE_ACKED_SQL, [before, limit]);
+    const scrubbed = await this.pool.query(SCRUB_FAILED_SQL, [before, limit]);
+    return {
+      deleted: deleted.rowCount ?? 0,
+      scrubbed: scrubbed.rowCount ?? 0,
+    };
   }
 
   async listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {

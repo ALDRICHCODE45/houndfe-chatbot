@@ -11,6 +11,7 @@ describe('HumanRequestMaintenanceWorker', () => {
     sweepAcks: jest.fn(() => Promise.resolve(0)),
     recoverStuckSending: jest.fn(() => Promise.resolve(0)),
     replayHeld: jest.fn(() => Promise.resolve(0)),
+    purgeLedger: jest.fn(() => Promise.resolve({ deleted: 0, scrubbed: 0 })),
   });
 
   it('a tick recovers stuck sends, retries ACKs and replays held rows', async () => {
@@ -19,6 +20,7 @@ describe('HumanRequestMaintenanceWorker', () => {
     expect(ports.recoverStuckSending).toHaveBeenCalledTimes(1);
     expect(ports.sweepAcks).toHaveBeenCalledTimes(1);
     expect(ports.replayHeld).toHaveBeenCalledTimes(1);
+    expect(ports.purgeLedger).toHaveBeenCalledTimes(1);
   });
 
   it('one failing step does not skip the others', async () => {

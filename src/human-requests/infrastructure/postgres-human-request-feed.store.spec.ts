@@ -20,6 +20,60 @@ import {
 import { PostgresFeedConsumerLock } from './postgres-feed-consumer.lock';
 import { PostgresHumanRequestFeedStore } from './postgres-human-request-feed.store';
 
+describe('PostgresHumanRequestFeedStore.insertDelivery fallbacks (stubbed pool)', () => {
+  const storedRow = {
+    delivery_id: 'c1',
+    cursor: cancelledItem('c1').cursor,
+    type: 'request.cancelled',
+    request_id: 'req-c1',
+    conversation_ref: REF,
+    payload: cancelledItem('c1'),
+    local_state: 'STALE',
+    decision: 'DUPLICATE',
+    attempt_id: null,
+    provider_message_id: null,
+    attempted_at: null,
+    ack_state: null,
+    ack_outcome: null,
+    ack_attempts: 0,
+    next_ack_at: null,
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+  const stub = (second: unknown[]) => {
+    const query = jest
+      .fn()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: second });
+    return {
+      query,
+      store: new PostgresHumanRequestFeedStore({ query } as unknown as Pool),
+    };
+  };
+
+  it('a concurrent insert outside the statement snapshot is read back as not inserted', async () => {
+    const { store, query } = stub([storedRow]);
+    await expect(
+      store.insertDelivery(cancelledItem('c1')),
+    ).resolves.toMatchObject({
+      row: { deliveryId: 'c1', localState: 'STALE' },
+      inserted: false,
+    });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1]).toEqual([
+      expect.stringMatching(/SELECT/),
+      ['c1'],
+    ]);
+  });
+
+  it('throws when the row vanished between the insert and the read-back', async () => {
+    const { store } = stub([]);
+    await expect(store.insertDelivery(cancelledItem('c1'))).rejects.toThrow(
+      'delivery c1 vanished after insert',
+    );
+  });
+});
+
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
 const ROOT = join(__dirname, '..', '..', '..');
@@ -149,17 +203,80 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
         ack: 'STALE',
       },
     );
-    expect(() => migrate('down', '1')).toThrow();
+    const applied = async () =>
+      (
+        await pool.query<{ n: string }>(
+          `SELECT count(*) AS n FROM pgmigrations
+            WHERE name >= '4300000000000_human_request_feed'`,
+        )
+      ).rows[0].n;
+    // Rolled back by count (later migrations first); 4300 refuses.
+    const n = await applied();
+    expect(() => migrate('down', n)).toThrow();
     await truncate();
-    const applied = await pool.query<{ n: string }>(
-      `SELECT count(*) AS n FROM pgmigrations
-        WHERE name >= '4300000000000_human_request_feed'`,
-    );
-    migrate('down', applied.rows[0].n);
+    migrate('down', await applied());
     const gone = await pool.query(
       "SELECT to_regclass('human_request_deliveries') AS t",
     );
     expect(gone.rows[0]).toEqual({ t: null });
+    migrate('up');
+  });
+
+  it('a concurrent insert committed while the statement waited is returned as not inserted', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    const other = await pool.connect();
+    try {
+      await other.query('BEGIN');
+      await other.query(
+        `INSERT INTO human_request_deliveries
+           (delivery_id, cursor, type, payload, local_state)
+         VALUES ('race1', '5', 'request.cancelled', $1::jsonb, 'RECEIVED')`,
+        [JSON.stringify(cancelledItem('race1'))],
+      );
+      const pending = store.insertDelivery(cancelledItem('race1'));
+      // Let the INSERT block on the uncommitted key, then commit.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await other.query('COMMIT');
+      await expect(pending).resolves.toMatchObject({
+        inserted: false,
+        row: { deliveryId: 'race1', cursor: '5' },
+      });
+    } finally {
+      other.release();
+    }
+    await truncate();
+  });
+
+  it('migration 4500: purge index and the LOCAL_FAILURE decision', async () => {
+    const indexes = await pool.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+        WHERE indexname = 'human_request_deliveries_purge_idx'`,
+    );
+    expect(indexes.rows[0]?.indexdef).toMatch(/\(updated_at\) WHERE/);
+    const store = new PostgresHumanRequestFeedStore(pool);
+    await store.insertDelivery(cancelledItem('lf1'));
+    await expect(
+      store.transition(
+        'lf1',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'STALE',
+          decision: 'LOCAL_FAILURE',
+          attemptId: '0b8f5c0e-6d7a-4c1e-9a52-3f1d2b6a7c10',
+          attemptedAt: '2026-11-10T16:20:00.000Z',
+          providerMessageId: null,
+          ack: null,
+        },
+      ),
+    ).resolves.toMatchObject({ decision: 'LOCAL_FAILURE' });
+    // down refuses while a LOCAL_FAILURE row exists.
+    expect(() => migrate('down', '1')).toThrow();
+    await truncate();
+    migrate('down', '1');
+    const gone = await pool.query(
+      `SELECT 1 FROM pg_indexes WHERE indexname = 'human_request_deliveries_purge_idx'`,
+    );
+    expect(gone.rowCount).toBe(0);
     migrate('up');
   });
 
@@ -202,7 +319,10 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
               } satisfies ReadFeedResult;
             },
           },
-          delivery: { accept: () => Promise.resolve() },
+          delivery: {
+            accept: () => Promise.resolve(),
+            abandon: () => Promise.resolve(),
+          },
           lock: new PostgresFeedConsumerLock(pool),
         },
         { lockRetryMs: 25 },

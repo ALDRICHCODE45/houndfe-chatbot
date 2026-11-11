@@ -1,4 +1,6 @@
 import { Logger } from '@nestjs/common';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import type {
   FeedItem,
   ReadFeedOptions,
@@ -80,6 +82,7 @@ describe('HumanRequestFeedConsumer', () => {
             await accept(item);
             accepted.push(item.deliveryId);
           },
+          abandon: () => Promise.resolve(),
         },
         lock,
       },
@@ -245,7 +248,10 @@ describe('HumanRequestFeedConsumer', () => {
         {
           store,
           client: { readFeed: () => never },
-          delivery: { accept: () => Promise.resolve() },
+          delivery: {
+            accept: () => Promise.resolve(),
+            abandon: () => Promise.resolve(),
+          },
           lock,
         },
         { sleep: () => Promise.resolve() },
@@ -254,6 +260,190 @@ describe('HumanRequestFeedConsumer', () => {
       await new Promise((resolve) => setImmediate(resolve));
       await consumer.stop();
       expect(lock.released).toBe(1);
+    });
+
+    it('stop during an in-flight lock acquisition never opens a long-poll', async () => {
+      let grant!: (held: boolean) => void;
+      const lock = new FakeLock();
+      jest.spyOn(lock, 'tryAcquire').mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            grant = (held) => {
+              lock.held = held;
+              resolve(held);
+            };
+          }),
+      );
+      const { feed, consumer } = build([], undefined, lock);
+      consumer.start();
+      await new Promise((resolve) => setImmediate(resolve));
+      const stopping = consumer.stop();
+      grant(true);
+      await stopping;
+      expect(feed.calls).toEqual([]);
+      expect(lock.released).toBe(1);
+    });
+  });
+
+  describe('stop mid-page', () => {
+    it('finishes only the item in progress and keeps the cursor of the last whole page', async () => {
+      let release!: () => void;
+      const { store, accepted, consumer } = build(
+        [
+          page(
+            [cancelledItem('a'), cancelledItem('b'), cancelledItem('c')],
+            '3',
+          ),
+        ],
+        (item) =>
+          item.deliveryId === 'a'
+            ? new Promise<void>((resolve) => {
+                release = resolve;
+              })
+            : Promise.resolve(),
+      );
+      await store.saveCursor('0');
+      consumer.start();
+      while (release === undefined)
+        await new Promise((resolve) => setImmediate(resolve));
+      const stopping = consumer.stop();
+      release();
+      await stopping;
+      expect(accepted).toEqual(['a']);
+      await expect(store.readCursor()).resolves.toBe('0');
+    });
+  });
+
+  describe('Promise.race leak', () => {
+    it('a handled page is not retained by the stop signal', async () => {
+      setFlagsFromString('--expose-gc');
+      const gc = runInNewContext('gc') as () => void;
+      let ref: WeakRef<object> | undefined;
+      const store = new InMemoryHumanRequestFeedStore();
+      const consumer = new HumanRequestFeedConsumer(
+        {
+          store,
+          client: {
+            readFeed: () => {
+              const result: ReadFeedResult = page([], '1');
+              ref = new WeakRef(result);
+              return Promise.resolve(result);
+            },
+          },
+          delivery: {
+            accept: () => Promise.resolve(),
+            abandon: () => Promise.resolve(),
+          },
+          lock: new FakeLock(),
+        },
+        { sleep: () => Promise.resolve() },
+      );
+      await consumer.runOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      gc();
+      expect(ref?.deref()).toBeUndefined();
+      await consumer.stop();
+    });
+  });
+
+  describe('poison item', () => {
+    it('after 5 consecutive failures of one deliveryId it is abandoned and the page moves on', async () => {
+      const abandoned: string[] = [];
+      const store = new InMemoryHumanRequestFeedStore();
+      const items = [
+        cancelledItem('ok1'),
+        cancelledItem('bad'),
+        cancelledItem('ok2'),
+      ];
+      const feed = new ScriptedFeed(
+        Array.from({ length: 6 }, () => page(items, '9')),
+      );
+      const accepted: string[] = [];
+      const consumer = new HumanRequestFeedConsumer(
+        {
+          store,
+          client: feed,
+          delivery: {
+            accept: (item) => {
+              if (item.deliveryId === 'bad')
+                return Promise.reject(new Error('handoff mode unreadable'));
+              accepted.push(item.deliveryId);
+              return Promise.resolve();
+            },
+            abandon: (item) => {
+              abandoned.push(item.deliveryId);
+              return Promise.resolve();
+            },
+          },
+          lock: new FakeLock(),
+        },
+        { sleep: () => Promise.resolve() },
+      );
+      for (let i = 0; i < 4; i += 1)
+        await expect(consumer.runOnce()).rejects.toThrow('unreadable');
+      expect(abandoned).toEqual([]);
+      await expect(store.readCursor()).resolves.toBeNull();
+      await expect(consumer.runOnce()).resolves.toEqual({
+        kind: 'page',
+        items: 3,
+      });
+      expect(abandoned).toEqual(['bad']);
+      expect(accepted.at(-1)).toBe('ok2');
+      await expect(store.readCursor()).resolves.toBe('9');
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('bad'));
+    });
+
+    it('a different failing item restarts the count', async () => {
+      const abandoned: string[] = [];
+      let failing = 'x';
+      const consumer = new HumanRequestFeedConsumer(
+        {
+          store: new InMemoryHumanRequestFeedStore(),
+          client: new ScriptedFeed(
+            Array.from({ length: 6 }, () =>
+              page([cancelledItem('x'), cancelledItem('y')], '2'),
+            ),
+          ),
+          delivery: {
+            accept: (item) =>
+              item.deliveryId === failing
+                ? Promise.reject(new Error('boom'))
+                : Promise.resolve(),
+            abandon: (item) => {
+              abandoned.push(item.deliveryId);
+              return Promise.resolve();
+            },
+          },
+          lock: new FakeLock(),
+        },
+        { sleep: () => Promise.resolve() },
+      );
+      for (let i = 0; i < 4; i += 1)
+        await expect(consumer.runOnce()).rejects.toThrow();
+      failing = 'y';
+      await expect(consumer.runOnce()).rejects.toThrow();
+      expect(abandoned).toEqual([]);
+    });
+
+    it('a failing abandon keeps the page stuck (the cursor stays)', async () => {
+      const store = new InMemoryHumanRequestFeedStore();
+      const consumer = new HumanRequestFeedConsumer(
+        {
+          store,
+          client: new ScriptedFeed(
+            Array.from({ length: 6 }, () => page([cancelledItem('p')], '1')),
+          ),
+          delivery: {
+            accept: () => Promise.reject(new Error('db down')),
+            abandon: () => Promise.reject(new Error('db down')),
+          },
+          lock: new FakeLock(),
+        },
+        { sleep: () => Promise.resolve() },
+      );
+      for (let i = 0; i < 5; i += 1)
+        await expect(consumer.runOnce()).rejects.toThrow('db down');
+      await expect(store.readCursor()).resolves.toBeNull();
     });
   });
 });

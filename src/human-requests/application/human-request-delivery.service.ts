@@ -14,11 +14,13 @@ import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
   CANCEL_NOTICE,
+  LEDGER_RETENTION_MS,
   RETRY_AFTER_MAX_MS,
   ackBackoffMs,
   ackBodyFor,
   canonicalNow,
   isWindowClosedSendError,
+  maskConversationRef,
   senderIdFromRef,
   styleFixedCopy,
   withTeamPrefix,
@@ -51,6 +53,8 @@ export interface HumanRequestDeliveryOptions {
   /** A SENDING attempt older than this is a crash leftover (sweep only). */
   stuckSendingMs?: number;
   batchSize?: number;
+  /** Terminal ledger rows older than this are purged (default 35 days). */
+  retentionMs?: number;
 }
 
 type Plan =
@@ -79,6 +83,7 @@ export class HumanRequestDeliveryService {
   private readonly newAttemptId: () => string;
   private readonly stuckSendingMs: number;
   private readonly batchSize: number;
+  private readonly retentionMs: number;
 
   constructor(
     private readonly ports: HumanRequestDeliveryPorts,
@@ -89,6 +94,7 @@ export class HumanRequestDeliveryService {
     this.newAttemptId = options.newAttemptId ?? randomUUID;
     this.stuckSendingMs = options.stuckSendingMs ?? 10 * 60_000;
     this.batchSize = options.batchSize ?? 50;
+    this.retentionMs = options.retentionMs ?? LEDGER_RETENTION_MS;
   }
 
   /** Feed consumer entry: records the item (or finds it) and handles it.
@@ -100,12 +106,20 @@ export class HumanRequestDeliveryService {
 
   /**
    * S5 window replay, called when the customer writes again: delivers the
-   * backend's deferred deliveries for the conversation (new attemptId) and
-   * the rows held locally for a HUMAN session if the conversation is BOT
-   * again. Never throws.
+   * backend's deferred deliveries for the conversation, then this
+   * conversation's local DEFERRED_WINDOW rows (also those whose deferral the
+   * backend never recorded) and HELD_HUMAN rows if it is BOT again; each
+   * deliveryId at most once per call, with a new attemptId. Never throws.
    */
   async onCustomerInbound(conversationRef: string): Promise<void> {
     if (senderIdFromRef(conversationRef) === null) return;
+    const masked = maskConversationRef(conversationRef);
+    const handled = new Set<string>();
+    const replay = async (row: DeliveryRow) => {
+      if (handled.has(row.deliveryId)) return;
+      handled.add(row.deliveryId);
+      await this.safely(row.deliveryId, () => this.process(row, 'replay'));
+    };
     try {
       const pending = await this.ports.client.listPendingDeliveries({
         conversationRef,
@@ -114,30 +128,91 @@ export class HumanRequestDeliveryService {
         for (const item of pending.items)
           await this.safely(item.deliveryId, async () => {
             const { row } = await this.ports.store.insertDelivery(item);
-            await this.process(row, 'replay');
+            await replay(row);
           });
       } else {
-        this.logger.warn(
-          `pending deliveries rate limited for ${conversationRef}`,
-        );
+        this.logger.warn(`pending deliveries rate limited for ${masked}`);
       }
     } catch (error) {
       this.logger.warn(
-        `pending deliveries read failed for ${conversationRef}: ${describe(error)}`,
+        `pending deliveries read failed for ${masked}: ${describe(error)}`,
       );
     }
-    try {
-      const held = await this.ports.store.listHeld({
-        conversationRef,
-        limit: this.batchSize,
-      });
-      for (const row of held)
-        await this.safely(row.deliveryId, () => this.process(row, 'replay'));
-    } catch (error) {
-      this.logger.warn(
-        `held deliveries read failed for ${conversationRef}: ${describe(error)}`,
-      );
+    const filter = { conversationRef, limit: this.batchSize };
+    for (const [name, list] of [
+      ['deferred', () => this.ports.store.listDeferredWindow(filter)],
+      ['held', () => this.ports.store.listHeld(filter)],
+    ] as const) {
+      try {
+        for (const row of await list()) await replay(row);
+      } catch (error) {
+        this.logger.warn(
+          `${name} deliveries read failed for ${masked}: ${describe(error)}`,
+        );
+      }
     }
+  }
+
+  /**
+   * A feed item whose handling keeps failing (poison item): records a
+   * terminal local failure so the feed can move on, never resending. A
+   * RECEIVED row (nothing sent) becomes STALE / LOCAL_FAILURE with an ACK
+   * STALE; a SENDING row is left to `recoverStuckSending` (DELIVERY_UNKNOWN);
+   * an already decided row keeps its state. With no ledger row at all (the
+   * insert itself fails) nothing can have been sent: one inline ACK STALE.
+   * Rejects when the ledger cannot be read, so the page stays stuck.
+   */
+  async abandon(item: FeedItem, reason: string): Promise<void> {
+    const row = await this.ports.store.getDelivery(item.deliveryId);
+    const attemptedAt = canonicalNow(this.clock);
+    if (row === null) {
+      this.logger.error(
+        `feed item ${item.deliveryId} abandoned with no ledger row after repeated failures (${reason}): ACK STALE`,
+      );
+      const body = {
+        outcome: 'STALE' as const,
+        attemptId: this.newAttemptId(),
+        attemptedAt,
+      };
+      try {
+        await this.ports.client.recordDeliveryOutcome(item.deliveryId, body);
+      } catch (error) {
+        this.logger.warn(
+          `delivery ${item.deliveryId} abandon ACK failed: ${describe(error)}`,
+        );
+      }
+      return;
+    }
+    if (row.localState !== 'RECEIVED') {
+      this.logger.error(
+        `feed item ${item.deliveryId} abandoned after repeated failures (${reason}); its ${row.localState} row is left as is`,
+      );
+      return;
+    }
+    const next = await this.ports.store.transition(
+      row.deliveryId,
+      { localState: 'RECEIVED', attemptId: row.attemptId },
+      {
+        localState: 'STALE',
+        decision: 'LOCAL_FAILURE',
+        attemptId: this.newAttemptId(),
+        attemptedAt,
+        providerMessageId: null,
+        ack: 'STALE',
+      },
+    );
+    this.logger.error(
+      `feed item ${item.deliveryId} abandoned after repeated failures (${reason}): STALE / LOCAL_FAILURE`,
+    );
+    if (next !== null) await this.flushAck(next);
+  }
+
+  /** Retention: purges terminal ledger rows older than the retention. */
+  purgeLedger(): Promise<{ deleted: number; scrubbed: number }> {
+    return this.ports.store.purgeTerminal(
+      new Date(this.clock().getTime() - this.retentionMs),
+      this.batchSize * 10,
+    );
   }
 
   /** Retries due PENDING ACKs with their stored body; returns how many. */
@@ -155,10 +230,19 @@ export class HumanRequestDeliveryService {
   async replayHeld(): Promise<number> {
     const held = await this.ports.store.listHeld({ limit: this.batchSize });
     let released = 0;
-    for (const row of held)
+    for (const row of held) {
+      let left = false;
       await this.safely(row.deliveryId, async () => {
-        if (await this.process(row, 'replay')) released += 1;
+        left = await this.process(row, 'replay');
       });
+      if (left) released += 1;
+      // Still held (or failed): move it behind the others, so held rows of
+      // conversations that stay HUMAN never starve the rest.
+      else
+        await this.safely(row.deliveryId, () =>
+          this.ports.store.touchHeld(row.deliveryId, row.attemptId),
+        );
+    }
     return released;
   }
 

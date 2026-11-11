@@ -1,20 +1,30 @@
 import type { FeedItem } from '../../chatbot-api/domain/dtos/human-requests.dto';
-import type {
-  AckCompletion,
-  DeliveryExpectation,
-  DeliveryRow,
-  DeliveryTransition,
-  HumanRequestFeedStore,
-  HumanRequestRecord,
-  HumanRequestStatus,
-  OpenHumanRequestInput,
+import {
+  purgedItem,
+  type AckCompletion,
+  type DeliveryExpectation,
+  type DeliveryRow,
+  type DeliveryTransition,
+  type HumanRequestFeedStore,
+  type HumanRequestRecord,
+  type HumanRequestStatus,
+  type OpenHumanRequestInput,
 } from '../domain/human-request-feed';
+
+const TERMINAL = new Set(['SENT', 'STALE', 'UNKNOWN']);
 
 /** Test double with the Postgres store's semantics (shared contract). */
 export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
   private cursor: string | null = null;
   private readonly rows = new Map<string, DeliveryRow>();
   private readonly requests = new Map<string, HumanRequestRecord>();
+  private lastStamp = 0;
+
+  /** Strictly increasing write time, so ordering by `updatedAt` is exact. */
+  private stamp(): Date {
+    this.lastStamp = Math.max(Date.now(), this.lastStamp + 1);
+    return new Date(this.lastStamp);
+  }
 
   readCursor(): Promise<string | null> {
     return Promise.resolve(this.cursor);
@@ -31,7 +41,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     const existing = this.rows.get(item.deliveryId);
     if (existing)
       return Promise.resolve({ row: copy(existing), inserted: false });
-    const now = new Date();
+    const now = this.stamp();
     const row: DeliveryRow = {
       deliveryId: item.deliveryId,
       cursor: item.cursor,
@@ -72,7 +82,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       row.attemptId !== expected.attemptId
     )
       return Promise.resolve(null);
-    const now = new Date();
+    const now = this.stamp();
     Object.assign(row, {
       localState: next.localState,
       decision: next.decision,
@@ -116,7 +126,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
         row.nextAckAt = null;
         break;
     }
-    row.updatedAt = new Date();
+    row.updatedAt = this.stamp();
     return Promise.resolve(true);
   }
 
@@ -147,9 +157,59 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
             (filter.conversationRef === undefined ||
               row.conversationRef === filter.conversationRef),
         )
+        .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime())
         .slice(0, filter.limit)
         .map(copy),
     );
+  }
+
+  touchHeld(deliveryId: string, attemptId: string | null): Promise<void> {
+    const row = this.rows.get(deliveryId);
+    if (row?.localState === 'HELD_HUMAN' && row.attemptId === attemptId)
+      row.updatedAt = this.stamp();
+    return Promise.resolve();
+  }
+
+  listDeferredWindow(filter: {
+    conversationRef: string;
+    limit: number;
+  }): Promise<DeliveryRow[]> {
+    return Promise.resolve(
+      [...this.rows.values()]
+        .filter(
+          (row) =>
+            row.localState === 'DEFERRED_WINDOW' &&
+            row.conversationRef === filter.conversationRef,
+        )
+        .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime())
+        .slice(0, filter.limit)
+        .map(copy),
+    );
+  }
+
+  purgeTerminal(
+    before: Date,
+    limit: number,
+  ): Promise<{ deleted: number; scrubbed: number }> {
+    const old = [...this.rows.values()]
+      .filter(
+        (row) =>
+          TERMINAL.has(row.localState) &&
+          row.updatedAt.getTime() < before.getTime(),
+      )
+      .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
+    const acked = old.filter((row) => row.ackState === 'ACKED').slice(0, limit);
+    for (const row of acked) this.rows.delete(row.deliveryId);
+    const failed = old
+      .filter(
+        (row) =>
+          row.ackState === 'FAILED_PERMANENT' &&
+          (row.item.type !== 'unknown' || row.item.raw.purged !== true),
+      )
+      .slice(0, limit);
+    for (const row of failed)
+      row.item = purgedItem(row.deliveryId, row.cursor, row.type);
+    return Promise.resolve({ deleted: acked.length, scrubbed: failed.length });
   }
 
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {
@@ -168,7 +228,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
 
   recordOpenRequest(input: OpenHumanRequestInput): Promise<void> {
     if (!this.requests.has(input.requestId)) {
-      const now = new Date();
+      const now = this.stamp();
       this.requests.set(input.requestId, {
         requestId: input.requestId,
         conversationRef: input.conversationRef,

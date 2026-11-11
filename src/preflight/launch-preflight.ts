@@ -100,6 +100,8 @@ export const REQUIRED_MIGRATIONS = [
   '4300000000000_human_request_feed.js',
   // Backend outbox ordering lanes (requests never wait behind mirror rows).
   '4400000000000_backend_outbox_lanes.js',
+  // Feed ledger retention index and the LOCAL_FAILURE (poison item) decision.
+  '4500000000000_human_request_feed_retention.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

@@ -38,7 +38,9 @@ export type DeliveryDecision =
   | 'CLARIFICATION'
   | 'UNKNOWN_TYPE'
   | 'UNKNOWN_KIND'
-  | 'NO_CONVERSATION';
+  | 'NO_CONVERSATION'
+  /** A feed item that kept failing locally and was given up (poison item). */
+  | 'LOCAL_FAILURE';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 
@@ -137,10 +139,26 @@ export interface HumanRequestFeedStore {
     completion: AckCompletion,
   ): Promise<boolean>;
   listDueAcks(now: Date, limit: number): Promise<DeliveryRow[]>;
+  /** HELD_HUMAN rows, least recently checked first. */
   listHeld(filter: {
     conversationRef?: string;
     limit: number;
   }): Promise<DeliveryRow[]>;
+  /** Marks a held row as checked (moves it behind the other held rows);
+   *  applies only while the row is still HELD_HUMAN for this attempt. */
+  touchHeld(deliveryId: string, attemptId: string | null): Promise<void>;
+  listDeferredWindow(filter: {
+    conversationRef: string;
+    limit: number;
+  }): Promise<DeliveryRow[]>;
+  /** Retention: terminal rows (SENT, STALE, UNKNOWN) last updated before
+   *  `before`, at most `limit` of each kind: ACKED rows are deleted;
+   *  FAILED_PERMANENT rows keep their dedup key and ACK evidence but lose the
+   *  payload. Rows owing work are never touched. */
+  purgeTerminal(
+    before: Date,
+    limit: number,
+  ): Promise<{ deleted: number; scrubbed: number }>;
   /** SENDING rows whose attempt started before `before` (crash leftovers). */
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]>;
 
@@ -195,6 +213,31 @@ export function senderIdFromRef(ref: string | null): string | null {
   if (ref === null) return null;
   return CONVERSATION_REF.exec(ref)?.[1] ?? null;
 }
+
+/** `wa:5215550001111` → `wa:…1111`: logs keep only the last 4 digits. */
+export function maskConversationRef(ref: string | null): string {
+  if (ref === null) return '(no conversation)';
+  const digits = ref.replace(/[^0-9]/g, '');
+  return `wa:…${digits.slice(-4)}`;
+}
+
+/** Ledger payload of a purged FAILED_PERMANENT row: the customer text is
+ *  gone, the row still de-duplicates its deliveryId. */
+export const purgedItem = (
+  deliveryId: string,
+  cursor: string,
+  type: string,
+): FeedItem => ({
+  type: 'unknown',
+  rawType: type,
+  cursor,
+  deliveryId,
+  raw: { purged: true },
+});
+
+/** Ledger rows are purged this long after their last update (the backend
+ *  keeps feed items 30 days, so a later re-read is impossible). */
+export const LEDGER_RETENTION_MS = 35 * 24 * 3_600_000;
 
 // ---------------------------------------------------------------- Meta
 

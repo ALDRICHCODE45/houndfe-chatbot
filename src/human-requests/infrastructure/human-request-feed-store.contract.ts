@@ -264,6 +264,139 @@ export function runHumanRequestFeedStoreContract(
       expect(mine.map((row) => row.deliveryId)).toEqual(['h1']);
     });
 
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 5));
+    const putIn = async (
+      id: string,
+      localState: 'HELD_HUMAN' | 'DEFERRED_WINDOW' | 'STALE' | 'SENT',
+      ack: 'STALE' | 'PROVIDER_ACCEPTED' | null,
+      ref: string = REF,
+    ) => {
+      await store.insertDelivery(cancelledItem(id, { conversationRef: ref }));
+      await store.transition(
+        id,
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState,
+          decision: 'CANCEL_NOTICE',
+          attemptId: ATTEMPT_A,
+          attemptedAt: AT,
+          providerMessageId: localState === 'SENT' ? 'wamid.p' : null,
+          ack,
+        },
+      );
+    };
+
+    it('lists held rows least recently checked first; a check moves a row last', async () => {
+      for (const id of ['f1', 'f2', 'f3']) {
+        await putIn(id, 'HELD_HUMAN', null);
+        await tick();
+      }
+      const ids = async () =>
+        (await store.listHeld({ limit: 2 })).map((row) => row.deliveryId);
+      await expect(ids()).resolves.toEqual(['f1', 'f2']);
+      // A stale attempt does not count as a check.
+      await store.touchHeld('f1', ATTEMPT_B);
+      await expect(ids()).resolves.toEqual(['f1', 'f2']);
+      await store.touchHeld('f1', ATTEMPT_A);
+      await expect(ids()).resolves.toEqual(['f2', 'f3']);
+      await tick();
+      await store.touchHeld('f2', ATTEMPT_A);
+      await expect(ids()).resolves.toEqual(['f3', 'f1']);
+      await expect(store.getDelivery('f1')).resolves.toMatchObject({
+        localState: 'HELD_HUMAN',
+        attemptId: ATTEMPT_A,
+      });
+    });
+
+    it('touchHeld leaves a row that is no longer held untouched', async () => {
+      await putIn('f4', 'STALE', 'STALE');
+      const before = await store.getDelivery('f4');
+      await tick();
+      await store.touchHeld('f4', ATTEMPT_A);
+      const after = await store.getDelivery('f4');
+      expect(after?.updatedAt.getTime()).toBe(before?.updatedAt.getTime());
+    });
+
+    it('lists DEFERRED_WINDOW rows of one conversation', async () => {
+      await putIn('w1', 'DEFERRED_WINDOW', null);
+      await putIn('w2', 'DEFERRED_WINDOW', null, 'wa:5215550002222');
+      await putIn('w3', 'HELD_HUMAN', null);
+      const rows = await store.listDeferredWindow({
+        conversationRef: REF,
+        limit: 10,
+      });
+      expect(rows.map((row) => row.deliveryId)).toEqual(['w1']);
+    });
+
+    it('purges old terminal rows: deletes ACKED ones, scrubs FAILED_PERMANENT payloads, keeps owed work', async () => {
+      await putIn('p1', 'STALE', 'STALE');
+      await store.completeAck('p1', ATTEMPT_A, { ackState: 'ACKED' });
+      await putIn('p2', 'SENT', 'PROVIDER_ACCEPTED');
+      await store.completeAck('p2', ATTEMPT_A, {
+        ackState: 'FAILED_PERMANENT',
+        error: 'VALIDATION_ERROR',
+      });
+      await putIn('p3', 'STALE', 'STALE'); // ACK still PENDING
+      await putIn('p4', 'HELD_HUMAN', null);
+      await putIn('p5', 'DEFERRED_WINDOW', null);
+      await store.insertDelivery(cancelledItem('p6')); // RECEIVED
+
+      // Nothing is old enough yet.
+      await expect(
+        store.purgeTerminal(new Date(Date.now() - 3_600_000), 10),
+      ).resolves.toEqual({ deleted: 0, scrubbed: 0 });
+
+      const cutoff = new Date(Date.now() + 60_000);
+      await expect(store.purgeTerminal(cutoff, 10)).resolves.toEqual({
+        deleted: 1,
+        scrubbed: 1,
+      });
+      await expect(store.getDelivery('p1')).resolves.toBeNull();
+      const scrubbed = await store.getDelivery('p2');
+      expect(scrubbed).toMatchObject({
+        localState: 'SENT',
+        ackState: 'FAILED_PERMANENT',
+        providerMessageId: 'wamid.p',
+        conversationRef: REF,
+      });
+      expect(scrubbed?.item).toEqual({
+        type: 'unknown',
+        rawType: 'request.cancelled',
+        cursor: cancelledItem('p2').cursor,
+        deliveryId: 'p2',
+        raw: { purged: true },
+      });
+      // The scrubbed row still de-duplicates: never handled again.
+      await expect(
+        store.insertDelivery(cancelledItem('p2')),
+      ).resolves.toMatchObject({ inserted: false });
+      for (const id of ['p3', 'p4', 'p5', 'p6'])
+        await expect(store.getDelivery(id)).resolves.toMatchObject({
+          item: cancelledItem(id),
+        });
+      // Idempotent: a scrubbed row is not counted again.
+      await expect(store.purgeTerminal(cutoff, 10)).resolves.toEqual({
+        deleted: 0,
+        scrubbed: 0,
+      });
+    });
+
+    it('purges in batches of at most `limit` rows per kind', async () => {
+      for (const id of ['b1', 'b2', 'b3']) {
+        await putIn(id, 'STALE', 'STALE');
+        await store.completeAck(id, ATTEMPT_A, { ackState: 'ACKED' });
+      }
+      const cutoff = new Date(Date.now() + 60_000);
+      await expect(store.purgeTerminal(cutoff, 2)).resolves.toEqual({
+        deleted: 2,
+        scrubbed: 0,
+      });
+      await expect(store.purgeTerminal(cutoff, 2)).resolves.toEqual({
+        deleted: 1,
+        scrubbed: 0,
+      });
+    });
+
     it('lists SENDING rows whose attempt started before a cutoff', async () => {
       await store.insertDelivery(cancelledItem('s1'));
       await store.transition(

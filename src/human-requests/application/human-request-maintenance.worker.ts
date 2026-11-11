@@ -9,7 +9,8 @@ export interface HumanRequestMaintenanceOptions {
  * Periodic sweeps of the delivery ledger, on every instance (each step is
  * compare-and-set or an exact ACK replay, so concurrent instances are safe):
  * crash-left SENDING rows → DELIVERY_UNKNOWN, due PENDING ACKs retried with
- * the same body, and HELD_HUMAN rows re-handled once the conversation is BOT.
+ * the same body, HELD_HUMAN rows re-handled once the conversation is BOT,
+ * and the 35-day retention purge of terminal ledger rows.
  */
 export class HumanRequestMaintenanceWorker {
   private readonly logger = new Logger(HumanRequestMaintenanceWorker.name);
@@ -22,7 +23,7 @@ export class HumanRequestMaintenanceWorker {
   constructor(
     private readonly delivery: Pick<
       HumanRequestDeliveryService,
-      'sweepAcks' | 'recoverStuckSending' | 'replayHeld'
+      'sweepAcks' | 'recoverStuckSending' | 'replayHeld' | 'purgeLedger'
     >,
     options: HumanRequestMaintenanceOptions = {},
   ) {
@@ -50,9 +51,12 @@ export class HumanRequestMaintenanceWorker {
     );
     await this.step('ACK sweep', () => this.delivery.sweepAcks());
     await this.step('held replay', () => this.delivery.replayHeld());
+    await this.step('ledger retention purge', () =>
+      this.delivery.purgeLedger(),
+    );
   }
 
-  private async step(name: string, run: () => Promise<number>): Promise<void> {
+  private async step(name: string, run: () => Promise<unknown>): Promise<void> {
     try {
       await run();
     } catch (error) {
