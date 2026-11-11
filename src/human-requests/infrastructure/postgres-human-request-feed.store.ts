@@ -5,6 +5,7 @@ import type {
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import {
   FEED_CONSUMER_NAME,
+  FEED_SYNCED_AT_NAME,
   type AckCompletion,
   type AckState,
   type DeliveryDecision,
@@ -51,6 +52,10 @@ interface RegistryRow {
 const READ_CURSOR_SQL = `SELECT cursor FROM human_request_feed_cursor WHERE consumer = $1`;
 const SAVE_CURSOR_SQL = `INSERT INTO human_request_feed_cursor (consumer, cursor)
 VALUES ($1, $2)
+ON CONFLICT (consumer) DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()`;
+/** Cursor and synced_at in one statement (one atomic write). */
+const SAVE_CURSOR_SYNCED_SQL = `INSERT INTO human_request_feed_cursor (consumer, cursor)
+VALUES ($1, $2), ($3, $4)
 ON CONFLICT (consumer) DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()`;
 
 /** The row is written before any Meta call; an existing deliveryId keeps
@@ -144,9 +149,12 @@ const CLOSE_REQUEST_SQL = `UPDATE human_request_registry
   SET status = $2, updated_at = now()
 WHERE request_id = $1 AND status = 'OPEN'`;
 const SELECT_REQUEST_SQL = `SELECT * FROM human_request_registry WHERE request_id = $1`;
+const OPEN_REQUEST_IDS_SQL = `SELECT request_id FROM human_request_registry
+ WHERE status = 'OPEN' AND created_at < $1`;
 
 /** `human_request_feed_cursor`, `human_request_deliveries` and
- *  `human_request_registry` (migration 4300). */
+ *  `human_request_registry` (migration 4300). The consumer's synced_at is a
+ *  second cursor-table row (`FEED_SYNCED_AT_NAME`), so no schema change. */
 export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
   constructor(private readonly pool: Pool) {}
 
@@ -158,8 +166,24 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
     return result.rows[0]?.cursor ?? null;
   }
 
-  async saveCursor(cursor: string | null): Promise<void> {
-    await this.pool.query(SAVE_CURSOR_SQL, [FEED_CONSUMER_NAME, cursor]);
+  async saveCursor(cursor: string | null, syncedAt?: string): Promise<void> {
+    if (syncedAt === undefined)
+      await this.pool.query(SAVE_CURSOR_SQL, [FEED_CONSUMER_NAME, cursor]);
+    else
+      await this.pool.query(SAVE_CURSOR_SYNCED_SQL, [
+        FEED_CONSUMER_NAME,
+        cursor,
+        FEED_SYNCED_AT_NAME,
+        syncedAt,
+      ]);
+  }
+
+  async readSyncedAt(): Promise<string | null> {
+    const result = await this.pool.query<{ cursor: string | null }>(
+      READ_CURSOR_SQL,
+      [FEED_SYNCED_AT_NAME],
+    );
+    return result.rows[0]?.cursor ?? null;
   }
 
   async insertDelivery(
@@ -333,6 +357,14 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
           updatedAt: row.updated_at,
         }
       : null;
+  }
+
+  async listOpenRequestIds(createdBefore: Date): Promise<string[]> {
+    const result = await this.pool.query<{ request_id: string }>(
+      OPEN_REQUEST_IDS_SQL,
+      [createdBefore],
+    );
+    return result.rows.map((row) => row.request_id);
   }
 }
 

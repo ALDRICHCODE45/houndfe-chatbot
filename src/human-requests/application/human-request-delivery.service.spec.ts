@@ -515,17 +515,59 @@ describe('HumanRequestDeliveryService', () => {
       });
     });
 
-    it('VALIDATION_ERROR on the deferral (5c not live) keeps the hold local', async () => {
-      const { service, client, store, human } = setup();
+    it('VALIDATION_ERROR on the deferral is a real error: FAILED_PERMANENT, the hold stays and still replays', async () => {
+      const { service, sender, client, store, human } = setup();
       human.value = true;
       client.ackScript = [{ kind: 'VALIDATION_ERROR', message: 'outcome' }];
       await service.accept(clarification('h2'));
       await expect(store.getDelivery('h2')).resolves.toMatchObject({
         localState: 'HELD_HUMAN',
-        ackState: null,
+        ackState: 'FAILED_PERMANENT',
+        ackOutcome: 'DEFERRED_HUMAN_SESSION',
       });
-      expect(error).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith(
+        expect.stringMatching(/DEFERRED_HUMAN_SESSION.*VALIDATION_ERROR/),
+      );
       await expect(service.sweepAcks()).resolves.toBe(0);
+      expect(client.acks).toHaveLength(1);
+
+      human.value = false;
+      await expect(service.replayHeld()).resolves.toBe(1);
+      expect(sender.sent).toHaveLength(1);
+      expect(client.acks[1].body).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        attemptId: attemptId(2),
+      });
+    });
+
+    it('next bot-mode turn: a HUMAN_SESSION pending delivery and its local HELD_HUMAN row are delivered once', async () => {
+      const { service, sender, client, store, human } = setup();
+      human.value = true;
+      await service.accept(clarification('h5'));
+      await service.accept(clarification('h6'));
+      human.value = false;
+      client.pending = {
+        kind: 'ok',
+        items: [
+          { ...clarification('h5'), deferredReason: 'HUMAN_SESSION' },
+          // Unknown locally (e.g. a restored database): recorded and sent.
+          { ...clarification('h7'), deferredReason: 'HUMAN_SESSION' },
+        ],
+      };
+      await service.onCustomerInbound(REF);
+      expect(sender.sent).toHaveLength(3);
+      const accepted = client.acks
+        .filter((a) => a.body.outcome === 'PROVIDER_ACCEPTED')
+        .map((a) => a.deliveryId);
+      expect(accepted.sort()).toEqual(['h5', 'h6', 'h7']);
+      for (const id of ['h5', 'h6', 'h7'])
+        await expect(store.getDelivery(id)).resolves.toMatchObject({
+          localState: 'SENT',
+          ackState: 'ACKED',
+        });
+      // A second turn sends nothing again.
+      await service.onCustomerInbound(REF);
+      expect(sender.sent).toHaveLength(3);
     });
 
     it('a held cancellation never sends a deferral and is decided once BOT', async () => {

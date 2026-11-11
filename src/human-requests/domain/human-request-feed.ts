@@ -19,6 +19,9 @@ export const HUMAN_REQUEST_FEED_STORE = Symbol('HUMAN_REQUEST_FEED_STORE');
 
 /** The single cursor row and the advisory lock key both use this name. */
 export const FEED_CONSUMER_NAME = 'human_request_feed:consumer';
+/** Cursor-table row holding the consumer's synced_at (canonical UTC ms in
+ *  the `cursor` column), written in the same statement as the cursor. */
+export const FEED_SYNCED_AT_NAME = 'human_request_feed:consumer:synced_at';
 
 export type DeliveryLocalState =
   | 'RECEIVED'
@@ -90,7 +93,7 @@ export type AckCompletion =
   | { ackState: 'ACKED' }
   | { ackState: 'FAILED_PERMANENT'; error: string }
   | { ackState: 'PENDING'; retryAt: Date; error: string }
-  /** The deferral is not supported yet (5c): the hold stays local only. */
+  /** Drops the owed ACK; the row keeps its local state. */
   | { ackState: null };
 
 export type HumanRequestStatus = 'OPEN' | 'CANCELLED' | 'RESOLVED';
@@ -118,7 +121,12 @@ export interface OpenHumanRequestInput {
 export interface HumanRequestFeedStore {
   /** `null`: start from the oldest retained item. */
   readCursor(): Promise<string | null>;
-  saveCursor(cursor: string | null): Promise<void>;
+  /** With `syncedAt` (canonical UTC ms: the last instant the local state
+   *  was complete), both are saved atomically; without it the stored
+   *  synced_at is kept. */
+  saveCursor(cursor: string | null, syncedAt?: string): Promise<void>;
+  /** `null` when unknown (never saved). */
+  readSyncedAt(): Promise<string | null>;
 
   /** Inserts the item as RECEIVED unless its `deliveryId` exists; returns the
    *  stored row either way (an existing row is never overwritten). */
@@ -170,6 +178,8 @@ export interface HumanRequestFeedStore {
     status: Exclude<HumanRequestStatus, 'OPEN'>,
   ): Promise<boolean>;
   getRequest(requestId: string): Promise<HumanRequestRecord | null>;
+  /** Ids of OPEN registry rows created before `createdBefore`. */
+  listOpenRequestIds(createdBefore: Date): Promise<string[]>;
 }
 
 /** Advisory lock held on a dedicated connection while consuming. */

@@ -3,17 +3,40 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import type {
   FeedItem,
+  ListOpenRequestsOptions,
+  ListOpenRequestsResult,
+  OpenHumanRequest,
   ReadFeedOptions,
   ReadFeedResult,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type { FeedConsumerLock } from '../domain/human-request-feed';
-import { cancelledItem } from '../infrastructure/human-request-feed-store.contract';
+import {
+  REF,
+  cancelledItem,
+} from '../infrastructure/human-request-feed-store.contract';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
 import { HumanRequestFeedConsumer } from './human-request-feed.consumer';
 
+type OpenStep =
+  | ListOpenRequestsResult
+  | Error
+  | (() => Promise<ListOpenRequestsResult>);
+
 class ScriptedFeed {
   readonly calls: ReadFeedOptions[] = [];
+  readonly openCalls: ListOpenRequestsOptions[] = [];
+  openScript: OpenStep[] = [];
   constructor(private readonly script: Array<ReadFeedResult | Error>) {}
+  listOpenRequests(
+    options: ListOpenRequestsOptions = {},
+  ): Promise<ListOpenRequestsResult> {
+    this.openCalls.push(options);
+    const next = this.openScript.shift();
+    if (next === undefined)
+      return Promise.reject(new Error('unexpected listOpenRequests'));
+    if (typeof next === 'function') return next();
+    return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+  }
   readFeed(options: ReadFeedOptions = {}): Promise<ReadFeedResult> {
     this.calls.push(options);
     const next = this.script.shift();
@@ -50,6 +73,34 @@ const page = (items: FeedItem[], nextCursor: string): ReadFeedResult => ({
   items,
   nextCursor,
 });
+
+const openRequest = (
+  id: string,
+  patch: Partial<OpenHumanRequest> = {},
+): OpenHumanRequest => ({
+  id,
+  folio: `S-${id}`,
+  kind: 'DIRECT',
+  subtype: 'UNKNOWN_QUESTION',
+  status: 'NEW',
+  conversationRef: REF,
+  legacyId: null,
+  whatsappWindowClosesAt: null,
+  cancelReason: null,
+  createdAt: '2026-11-10T10:00:00.000Z',
+  updatedAt: '2026-11-10T16:00:00.000Z',
+  closedAt: null,
+  pendingDeliveries: [],
+  undeliveredTruncated: false,
+  undeliveredResumeAfter: null,
+  ...patch,
+});
+
+const openPage = (
+  items: OpenHumanRequest[],
+  nextCursor: string,
+  nextPage: string | null,
+): ListOpenRequestsResult => ({ kind: 'ok', items, nextCursor, nextPage });
 
 describe('HumanRequestFeedConsumer', () => {
   let warn: jest.SpyInstance;
@@ -140,14 +191,415 @@ describe('HumanRequestFeedConsumer', () => {
     await expect(store.readCursor()).resolves.toBe('000000000002');
   });
 
-  it('CURSOR_EXPIRED restarts from the oldest item with a warning', async () => {
-    const { store, consumer } = build([{ kind: 'CURSOR_EXPIRED' }]);
-    await store.saveCursor('000000000009');
-    await expect(consumer.runOnce()).resolves.toEqual({ kind: 'restarted' });
-    await expect(store.readCursor()).resolves.toBeNull();
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('CURSOR_EXPIRED'),
+  it('a handled page saves the instant read began as synced_at, also when empty', async () => {
+    const clock = { now: Date.parse('2026-11-11T10:00:00.000Z') };
+    const store = new InMemoryHumanRequestFeedStore();
+    const feed = new ScriptedFeed([
+      page([cancelledItem('a')], '000000000002'),
+      page([], '000000000002'),
+    ]);
+    const consumer = new HumanRequestFeedConsumer(
+      {
+        store,
+        client: feed,
+        delivery: {
+          accept: () => {
+            clock.now += 60_000; // handling takes time
+            return Promise.resolve();
+          },
+          abandon: () => Promise.resolve(),
+        },
+        lock: new FakeLock(),
+      },
+      { clock: () => clock.now },
     );
+    await consumer.runOnce();
+    await expect(store.readSyncedAt()).resolves.toBe(
+      '2026-11-11T10:00:00.000Z',
+    );
+    clock.now = Date.parse('2026-11-11T11:00:00.000Z');
+    await consumer.runOnce();
+    await expect(store.readCursor()).resolves.toBe('000000000002');
+    await expect(store.readSyncedAt()).resolves.toBe(
+      '2026-11-11T11:00:00.000Z',
+    );
+  });
+
+  it('a failed page does not move synced_at', async () => {
+    const { store, consumer } = build(
+      [page([cancelledItem('a')], '000000000002')],
+      () => Promise.reject(new Error('db')),
+    );
+    await store.saveCursor('000000000000', '2026-11-01T00:00:00.000Z');
+    await expect(consumer.runOnce()).rejects.toThrow('db');
+    await expect(store.readSyncedAt()).resolves.toBe(
+      '2026-11-01T00:00:00.000Z',
+    );
+  });
+
+  describe('CURSOR_EXPIRED recovery (5c)', () => {
+    const SYNCED = '2026-11-01T00:00:00.000Z';
+    /** The walk starts 2 minutes after the local rows were written, so
+     *  they are older than the recovery grace. */
+    const later = () => Date.now() + 120_000;
+    const buildRecovery = (
+      accept: (item: FeedItem) => Promise<void> = () => Promise.resolve(),
+      clock: () => number = later,
+    ) => {
+      const store = new InMemoryHumanRequestFeedStore();
+      const feed = new ScriptedFeed([{ kind: 'CURSOR_EXPIRED' }]);
+      const accepted: string[] = [];
+      const sleeps: number[] = [];
+      const consumer = new HumanRequestFeedConsumer(
+        {
+          store,
+          client: feed,
+          delivery: {
+            accept: async (item) => {
+              await accept(item);
+              accepted.push(item.deliveryId);
+            },
+            abandon: () => Promise.resolve(),
+          },
+          lock: new FakeLock(),
+        },
+        {
+          clock,
+          random: () => 1,
+          sleep: (ms) => {
+            sleeps.push(ms);
+            return Promise.resolve();
+          },
+        },
+      );
+      return { store, feed, accepted, sleeps, consumer };
+    };
+
+    it('walks every page, reconciles the registry, handles pending deliveries and resumes from nextCursor', async () => {
+      const { store, feed, accepted, consumer } = buildRecovery();
+      await store.saveCursor('000000000009', SYNCED);
+      await store.recordOpenRequest({
+        requestId: 'resolved',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      await store.recordOpenRequest({
+        requestId: 'cancelled',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      await store.recordOpenRequest({
+        requestId: 'gone',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      await store.recordOpenRequest({
+        requestId: 'still-open',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      feed.openScript = [
+        openPage(
+          [
+            openRequest('new', {
+              subtype: 'RESTOCK',
+              legacyId: 'legacy-new',
+              pendingDeliveries: [cancelledItem('p1')],
+            }),
+            openRequest('still-open', { status: 'IN_PROGRESS' }),
+            openRequest('no-conversation', { conversationRef: null }),
+          ],
+          '000000001900',
+          'page-2',
+        ),
+        openPage(
+          [
+            openRequest('resolved', {
+              status: 'RESOLVED',
+              pendingDeliveries: [cancelledItem('p2'), cancelledItem('p3')],
+            }),
+            openRequest('cancelled', {
+              status: 'CANCELLED',
+              cancelReason: 'DUPLICATE',
+            }),
+          ],
+          // Every page of one walk carries the first page's position.
+          '000000001950',
+          null,
+        ),
+      ];
+
+      await expect(consumer.runOnce()).resolves.toEqual({
+        kind: 'recovered',
+        requests: 5,
+        deliveries: 3,
+      });
+      expect(feed.openCalls).toEqual([
+        { updatedSince: SYNCED, limit: 50 },
+        { updatedSince: SYNCED, cursor: 'page-2', limit: 50 },
+      ]);
+      expect(accepted).toEqual(['p1', 'p2', 'p3']);
+      await expect(store.getRequest('new')).resolves.toMatchObject({
+        status: 'OPEN',
+        subtype: 'RESTOCK',
+        legacyId: 'legacy-new',
+        conversationRef: REF,
+      });
+      await expect(store.getRequest('no-conversation')).resolves.toBeNull();
+      for (const [id, status] of [
+        ['still-open', 'OPEN'],
+        ['resolved', 'RESOLVED'],
+        ['cancelled', 'CANCELLED'],
+        ['gone', 'RESOLVED'],
+      ] as const)
+        await expect(store.getRequest(id)).resolves.toMatchObject({ status });
+      await expect(store.readCursor()).resolves.toBe('000000001900');
+      // The feed resumes from the recovered position.
+      await consumer.runOnce();
+      expect(feed.calls.at(-1)).toEqual({
+        after: '000000001900',
+        limit: 50,
+        waitSeconds: 25,
+      });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('CURSOR_EXPIRED'),
+      );
+    });
+
+    it('saves the walk start as synced_at and omits updatedSince when unknown', async () => {
+      const start = Date.parse('2026-11-11T12:00:00.000Z');
+      let now = start;
+      const { store, feed, consumer } = buildRecovery(
+        () => {
+          now += 1_000;
+          return Promise.resolve();
+        },
+        () => now,
+      );
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage(
+          [openRequest('r', { pendingDeliveries: [cancelledItem('p1')] })],
+          '000000000100',
+          null,
+        ),
+      ];
+      await consumer.runOnce();
+      expect(feed.openCalls).toEqual([{ limit: 50 }]);
+      await expect(store.readSyncedAt()).resolves.toBe(
+        new Date(start).toISOString(),
+      );
+    });
+
+    it('truncated: resumes from the smallest undeliveredResumeAfter (string comparison)', async () => {
+      const { store, feed, consumer } = buildRecovery();
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage(
+          [
+            openRequest('a', {
+              undeliveredTruncated: true,
+              undeliveredResumeAfter: '000000001700',
+            }),
+          ],
+          '000000001900',
+          'p2',
+        ),
+        openPage(
+          [
+            openRequest('b', {
+              undeliveredTruncated: true,
+              undeliveredResumeAfter: '000000000980',
+            }),
+            openRequest('c', {
+              undeliveredTruncated: true,
+              undeliveredResumeAfter: '000000001200',
+            }),
+          ],
+          '000000001900',
+          null,
+        ),
+      ];
+      await consumer.runOnce();
+      await expect(store.readCursor()).resolves.toBe('000000000980');
+    });
+
+    it('nextCursor is kept when it is the smallest', async () => {
+      const { store, feed, consumer } = buildRecovery();
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage(
+          [
+            openRequest('a', {
+              undeliveredTruncated: true,
+              undeliveredResumeAfter: '000000002000',
+            }),
+          ],
+          '000000001900',
+          null,
+        ),
+      ];
+      await consumer.runOnce();
+      await expect(store.readCursor()).resolves.toBe('000000001900');
+    });
+
+    it('a page failing mid-walk never moves the cursor, synced_at or the registry; the next pass walks again', async () => {
+      const { store, feed, accepted, consumer } = buildRecovery();
+      await store.saveCursor('000000000009', SYNCED);
+      await store.recordOpenRequest({
+        requestId: 'gone',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      const first = openPage(
+        [openRequest('a', { pendingDeliveries: [cancelledItem('p1')] })],
+        '000000001900',
+        'p2',
+      );
+      feed.openScript = [first, new Error('502')];
+      await expect(consumer.runOnce()).rejects.toThrow('502');
+      await expect(store.readCursor()).resolves.toBe('000000000009');
+      await expect(store.readSyncedAt()).resolves.toBe(SYNCED);
+      await expect(store.getRequest('gone')).resolves.toMatchObject({
+        status: 'OPEN',
+      });
+
+      // The expired cursor answers 410 again: the walk restarts at page 1.
+      feed.calls.length = 0;
+      (feed as unknown as { script: ReadFeedResult[] }).script.push({
+        kind: 'CURSOR_EXPIRED',
+      });
+      feed.openScript = [
+        first,
+        openPage([openRequest('b')], '000000001900', null),
+      ];
+      await expect(consumer.runOnce()).resolves.toMatchObject({
+        kind: 'recovered',
+      });
+      expect(feed.calls[0]).toEqual({
+        after: '000000000009',
+        limit: 50,
+        waitSeconds: 25,
+      });
+      expect(feed.openCalls.at(-2)).toEqual({
+        updatedSince: SYNCED,
+        limit: 50,
+      });
+      expect(accepted).toEqual(['p1', 'p1']);
+      await expect(store.readCursor()).resolves.toBe('000000001900');
+      await expect(store.getRequest('gone')).resolves.toMatchObject({
+        status: 'RESOLVED',
+      });
+    });
+
+    it('a pending delivery failing mid-walk leaves the cursor on the expired value', async () => {
+      const { store, feed, consumer } = buildRecovery((item) =>
+        item.deliveryId === 'p2'
+          ? Promise.reject(new Error('handoff mode unreadable'))
+          : Promise.resolve(),
+      );
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage(
+          [
+            openRequest('a', {
+              pendingDeliveries: [cancelledItem('p1'), cancelledItem('p2')],
+            }),
+          ],
+          '000000001900',
+          null,
+        ),
+      ];
+      await expect(consumer.runOnce()).rejects.toThrow('unreadable');
+      await expect(store.readCursor()).resolves.toBe('000000000009');
+    });
+
+    it('RATE_LIMITED mid-walk waits Retry-After and asks for the same page again', async () => {
+      const { store, feed, sleeps, consumer } = buildRecovery();
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage([openRequest('a')], '000000001900', 'p2'),
+        { kind: 'RATE_LIMITED', retryAfterSeconds: 4 },
+        openPage([openRequest('b')], '000000001900', null),
+      ];
+      await expect(consumer.runOnce()).resolves.toMatchObject({
+        kind: 'recovered',
+        requests: 2,
+      });
+      expect(sleeps).toEqual([4_000]);
+      expect(feed.openCalls.map((call) => call.cursor)).toEqual([
+        undefined,
+        'p2',
+        'p2',
+      ]);
+      await expect(store.readCursor()).resolves.toBe('000000001900');
+    });
+
+    it('VALIDATION_ERROR fails the pass with an error log; the cursor stays', async () => {
+      const { store, feed, consumer } = buildRecovery();
+      await store.saveCursor('000000000009', SYNCED);
+      feed.openScript = [{ kind: 'VALIDATION_ERROR', message: 'updatedSince' }];
+      await expect(consumer.runOnce()).rejects.toThrow('VALIDATION_ERROR');
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining('VALIDATION_ERROR'),
+      );
+      await expect(store.readCursor()).resolves.toBe('000000000009');
+    });
+
+    it('a local request recorded during the walk is not closed as "not listed"', async () => {
+      const { store, feed, consumer } = buildRecovery(
+        () => Promise.resolve(),
+        Date.now,
+      );
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage([], '000000001900', 'p2'),
+        async () => {
+          await store.recordOpenRequest({
+            requestId: 'fresh',
+            conversationRef: REF,
+            subtype: 'UNKNOWN_QUESTION',
+          });
+          return openPage([], '000000001900', null);
+        },
+      ];
+      await consumer.runOnce();
+      await expect(store.getRequest('fresh')).resolves.toMatchObject({
+        status: 'OPEN',
+      });
+    });
+
+    it('stop during the walk saves nothing', async () => {
+      const { store, feed, consumer } = buildRecovery();
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        async () => {
+          void consumer.stop();
+          return openPage([openRequest('a')], '000000001900', null);
+        },
+      ];
+      await expect(consumer.runOnce()).resolves.toEqual({ kind: 'stopped' });
+      await expect(store.readCursor()).resolves.toBe('000000000009');
+    });
+
+    it('never logs a conversationRef unmasked', async () => {
+      const { store, feed, consumer } = buildRecovery();
+      await store.saveCursor('000000000009');
+      feed.openScript = [
+        openPage(
+          [openRequest('a', { pendingDeliveries: [cancelledItem('p1')] })],
+          '000000001900',
+          null,
+        ),
+      ];
+      await consumer.runOnce();
+      const calls: unknown[][] = [
+        ...(warn.mock.calls as unknown[][]),
+        ...(error.mock.calls as unknown[][]),
+      ];
+      const logged = calls.flat().map(String).join('\n');
+      expect(logged).not.toContain('5215550001111');
+    });
   });
 
   it('RATE_LIMITED reports the Retry-After delay', async () => {
@@ -247,7 +699,10 @@ describe('HumanRequestFeedConsumer', () => {
       const consumer = new HumanRequestFeedConsumer(
         {
           store,
-          client: { readFeed: () => never },
+          client: {
+            readFeed: () => never,
+            listOpenRequests: () => Promise.reject(new Error('unused')),
+          },
           delivery: {
             accept: () => Promise.resolve(),
             abandon: () => Promise.resolve(),
@@ -329,6 +784,7 @@ describe('HumanRequestFeedConsumer', () => {
               ref = new WeakRef(result);
               return Promise.resolve(result);
             },
+            listOpenRequests: () => Promise.reject(new Error('unused')),
           },
           delivery: {
             accept: () => Promise.resolve(),

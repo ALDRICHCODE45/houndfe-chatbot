@@ -116,12 +116,15 @@ import type {
 import {
   FEED_MAX_LIMIT,
   FEED_MAX_WAIT_SECONDS,
+  OPEN_REQUESTS_MAX_LIMIT,
+  isCanonicalUtcMs,
   isCreateHumanRequestInput,
   normalizeDeliveryOutcome,
   parseDeliveryOutcomeAck,
   parseFeedPage,
   parseHumanRequestCancelled,
   parseHumanRequestCreated,
+  parseOpenRequestsPage,
   parsePendingDeliveries,
   toCreateHumanRequestBody,
   type CancelHumanRequestInput,
@@ -129,6 +132,8 @@ import {
   type CreateHumanRequestInput,
   type CreateHumanRequestResult,
   type DeliveryOutcomeInput,
+  type ListOpenRequestsOptions,
+  type ListOpenRequestsResult,
   type PendingDeliveriesFilter,
   type PendingDeliveriesResult,
   type ReadFeedOptions,
@@ -1374,6 +1379,69 @@ export class ChatbotApiHttpClient
       );
     }
     return { kind: 'ok', items };
+  }
+
+  /** `GET /chatbot-api/requests?status=open` (5c recovery): one page with
+   *  `updatedSince` (canonical UTC ms), `cursor` (`nextPage`) and `limit`
+   *  validated before any HTTP; safe GET retry policy. A page with any
+   *  malformed request rejects with `UpstreamError`. */
+  async listOpenRequests(
+    options: ListOpenRequestsOptions = {},
+  ): Promise<ListOpenRequestsResult> {
+    const { updatedSince, cursor, limit = OPEN_REQUESTS_MAX_LIMIT } = options;
+    if (
+      (updatedSince !== undefined && !isCanonicalUtcMs(updatedSince)) ||
+      (cursor !== undefined && (typeof cursor !== 'string' || cursor === '')) ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > OPEN_REQUESTS_MAX_LIMIT
+    ) {
+      throw new ChatbotApiError(
+        'Open requests options are out of contract',
+        null,
+        undefined,
+        null,
+      );
+    }
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>(
+        {
+          method: 'GET',
+          url: '/chatbot-api/requests',
+          params: {
+            status: 'open',
+            ...(updatedSince === undefined ? {} : { updatedSince }),
+            ...(cursor === undefined ? {} : { cursor }),
+            limit,
+          },
+        },
+        { retryable: true },
+      );
+    } catch (error) {
+      const failure = documentedFailure(error);
+      if (failure?.status === 429)
+        return {
+          kind: 'RATE_LIMITED',
+          retryAfterSeconds: failure.retryAfterSeconds,
+        };
+      if (failure?.status === 400)
+        return {
+          kind: 'VALIDATION_ERROR',
+          message: messageField(failure.body),
+        };
+      throw error;
+    }
+    const page = parseOpenRequestsPage(response.data);
+    if (response.status !== 200 || page === null) {
+      throw new UpstreamError(
+        'Chatbot API open requests response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return { kind: 'ok', ...page };
   }
 
   /**

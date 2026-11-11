@@ -265,7 +265,8 @@ interface FeedItemEnvelope {
   conversationRef: string | null;
   notBefore: string | null;
   expiresAt: string | null;
-  /** Pending deliveries only, once slice 5c lands. */
+  /** Pending deliveries and recovery items only; absent when no deferral
+   *  was reported (`null` on the wire). */
   deferredReason?: DeferredReason;
 }
 
@@ -317,7 +318,7 @@ export type DeliveryOutcomeInput =
       attemptId: string;
       attemptedAt: string;
     }
-  /** Slice 5c: may be a 400 VALIDATION_ERROR until it lands. */
+  /** Slice 5c; `422 OUTCOME_NOT_ALLOWED` on `request.cancelled`. */
   | {
       outcome: 'DEFERRED_HUMAN_SESSION';
       attemptId: string;
@@ -353,6 +354,59 @@ export type PendingDeliveriesFilter =
 export type PendingDeliveriesResult =
   | { kind: 'ok'; items: FeedItem[] }
   | RateLimitedResult;
+
+// ---------------------------------------------------------------- recovery
+
+export const OPEN_REQUESTS_MAX_LIMIT = 50;
+
+export interface ListOpenRequestsOptions {
+  /** Canonical UTC ms; adds requests closed at or after it. */
+  updatedSince?: string;
+  /** The previous page's `nextPage`. */
+  cursor?: string;
+  /** 1..50, default 50. */
+  limit?: number;
+}
+
+export type HumanRequestLifecycleStatus =
+  | 'NEW'
+  | 'IN_PROGRESS'
+  | 'RESOLVED'
+  | 'CANCELLED';
+
+/** One request of the 5c recovery route. `conversationRef` carries the
+ *  customer's phone: never log it unmasked. */
+export interface OpenHumanRequest {
+  id: string;
+  folio: string | null;
+  kind: string;
+  subtype: string;
+  status: HumanRequestLifecycleStatus;
+  conversationRef: string | null;
+  legacyId: string | null;
+  whatsappWindowClosesAt: string | null;
+  cancelReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+  /** Latest undelivered feed items of the request (at most 5), oldest first. */
+  pendingDeliveries: FeedItem[];
+  undeliveredTruncated: boolean;
+  /** Feed `after` re-serving the oldest undelivered item when truncated. */
+  undeliveredResumeAfter: string | null;
+}
+
+export type ListOpenRequestsResult =
+  | {
+      kind: 'ok';
+      items: OpenHumanRequest[];
+      /** Tenant feed position when the walk's first page was served. */
+      nextCursor: string;
+      /** `null` on the last page. */
+      nextPage: string | null;
+    }
+  | RateLimitedResult
+  | ValidationErrorResult;
 
 // ---------------------------------------------------------------- parsing
 
@@ -764,6 +818,99 @@ export function parseFeedPage(
 
 export function parsePendingDeliveries(body: unknown): FeedItem[] | null {
   return isRecord(body) ? parseItems(body.items) : null;
+}
+
+const LIFECYCLE_STATUSES: ReadonlySet<unknown> = new Set([
+  'NEW',
+  'IN_PROGRESS',
+  'RESOLVED',
+  'CANCELLED',
+]);
+
+function parseOpenRequest(raw: unknown): OpenHumanRequest | null {
+  if (!isRecord(raw)) return null;
+  const {
+    id,
+    folio,
+    kind,
+    subtype,
+    status,
+    conversationRef,
+    legacyId,
+    whatsappWindowClosesAt,
+    cancelReason,
+    createdAt,
+    updatedAt,
+    closedAt,
+    undeliveredTruncated,
+    undeliveredResumeAfter,
+  } = raw;
+  if (
+    !isText(id) ||
+    !isNullableString(folio) ||
+    !isText(kind) ||
+    !isText(subtype) ||
+    !LIFECYCLE_STATUSES.has(status) ||
+    !isNullableString(conversationRef) ||
+    !isNullableString(legacyId) ||
+    !isNullableString(whatsappWindowClosesAt) ||
+    !isNullableString(cancelReason) ||
+    !isText(createdAt) ||
+    !isText(updatedAt) ||
+    !isNullableString(closedAt) ||
+    typeof undeliveredTruncated !== 'boolean' ||
+    !(undeliveredResumeAfter === null || isText(undeliveredResumeAfter)) ||
+    (undeliveredTruncated && undeliveredResumeAfter === null)
+  )
+    return null;
+  const pendingDeliveries = parseItems(raw.pendingDeliveries);
+  // A known item must belong to this request.
+  if (
+    pendingDeliveries === null ||
+    pendingDeliveries.some(
+      (item) => item.type !== 'unknown' && item.requestId !== id,
+    )
+  )
+    return null;
+  return {
+    id,
+    folio,
+    kind,
+    subtype,
+    status: status as HumanRequestLifecycleStatus,
+    conversationRef,
+    legacyId,
+    whatsappWindowClosesAt,
+    cancelReason,
+    createdAt,
+    updatedAt,
+    closedAt,
+    pendingDeliveries,
+    undeliveredTruncated,
+    undeliveredResumeAfter,
+  };
+}
+
+/** A recovery page; null when the page or any request breaks the contract. */
+export function parseOpenRequestsPage(body: unknown): {
+  items: OpenHumanRequest[];
+  nextCursor: string;
+  nextPage: string | null;
+} | null {
+  if (
+    !isRecord(body) ||
+    !Array.isArray(body.items) ||
+    !isText(body.nextCursor) ||
+    !(body.nextPage === null || isText(body.nextPage))
+  )
+    return null;
+  const items: OpenHumanRequest[] = [];
+  for (const raw of body.items) {
+    const request = parseOpenRequest(raw);
+    if (request === null) return null;
+    items.push(request);
+  }
+  return { items, nextCursor: body.nextCursor, nextPage: body.nextPage };
 }
 
 /** Local create check; the backend owns the full validation (400). */
