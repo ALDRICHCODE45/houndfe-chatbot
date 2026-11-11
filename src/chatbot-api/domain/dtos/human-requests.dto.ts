@@ -1,0 +1,817 @@
+import type { DeliveryZoneIntakeInput } from './human-decisions-delivery-zone.dto';
+import type { ExpirationIntakeInput } from './human-decisions-expiration.dto';
+import type { RestockIntakeInput } from './human-decisions.dto';
+
+/**
+ * Human requests (docs/contracts/human-intervention-requests-5a.md) and the
+ * feed, delivery outcome and pending deliveries
+ * (docs/contracts/human-intervention-bot-contract-5b.md).
+ *
+ * Error style: every documented business answer (409/410/422/429/404/400 with
+ * a known code) is a typed result discriminated by `kind`, so callers must
+ * decide on each one. Anything else — 401/403, 5xx, network/timeouts, an
+ * undocumented code, or a success body that breaks the contract — still
+ * throws the existing `ChatbotApiError` subclasses.
+ *
+ * Parsing is fail-closed on missing keys, wrong types and enums; unknown
+ * extra keys are dropped (the backend adds fields over time). Never throws.
+ */
+
+// ---------------------------------------------------------------- create
+
+export type DirectHumanRequestSubtype =
+  | 'UNKNOWN_QUESTION'
+  | 'TALK_TO_HUMAN'
+  | 'COMPLAINT';
+
+export interface HumanRequestCustomer {
+  phoneCountryCode: string;
+  phone: string;
+  displayName?: string | null;
+}
+
+/** Only these keys are accepted by the backend; never prices. */
+export interface HumanRequestContext {
+  cartRef?: string;
+  saleId?: string;
+  orderId?: string;
+  productIds?: string[];
+  variantIds?: string[];
+  quantity?: number;
+}
+
+interface CreateHumanRequestCommon {
+  /** Also sent as `X-Idempotency-Key`. */
+  sourceRequestId: string;
+  needs?: string;
+  context?: HumanRequestContext;
+  dedupKey?: string;
+  triggerWaMessageId?: string;
+}
+
+/** Direct subtypes require the conversation envelope. */
+export type CreateDirectHumanRequestInput = CreateHumanRequestCommon & {
+  subtype: DirectHumanRequestSubtype;
+  customer: HumanRequestCustomer;
+  conversationRef: string;
+  lastCustomerMessageAt: string;
+  /** 1..140 chars. */
+  summary: string;
+  detail?: Record<string, never>;
+};
+
+/** Wrapped subtypes send today's human-decisions body as `detail`. */
+type WrappedEnvelope = Partial<
+  Pick<
+    CreateDirectHumanRequestInput,
+    'customer' | 'conversationRef' | 'lastCustomerMessageAt' | 'summary'
+  >
+>;
+export type CreateWrappedHumanRequestInput = CreateHumanRequestCommon &
+  WrappedEnvelope &
+  (
+    | { subtype: 'RESTOCK'; detail: RestockIntakeInput }
+    | { subtype: 'EXPIRATION'; detail: ExpirationIntakeInput }
+    | { subtype: 'DELIVERY_ZONE'; detail: DeliveryZoneIntakeInput }
+  );
+
+export type CreateHumanRequestInput =
+  | CreateDirectHumanRequestInput
+  | CreateWrappedHumanRequestInput;
+
+export const HUMAN_REQUEST_SUMMARY_MAX_LENGTH = 140;
+
+export interface HumanRequestBusinessHours {
+  openNow: boolean;
+  nextOpenAt: string | null;
+}
+
+export interface HumanRequestCreated {
+  /** `null` for a DELIVERY_ZONE already approved (answer in `legacy`). */
+  id: string | null;
+  folio: string | null;
+  status: string;
+  outcome: 'CREATED' | 'REPLAYED' | 'MERGED';
+  mergedIntoId: string | null;
+  /** `null` until backend unit 7: never treat null as "closed". */
+  businessHours: HumanRequestBusinessHours | null;
+  /** Wrapped subtypes only: the legacy human-decision answer, kept raw. */
+  legacy?: Record<string, unknown>;
+}
+
+export type RateLimitedResult = {
+  kind: 'RATE_LIMITED';
+  retryAfterSeconds: number | null;
+};
+export type ValidationErrorResult = {
+  kind: 'VALIDATION_ERROR';
+  message: string | null;
+};
+
+export type CreateHumanRequestResult =
+  | { kind: 'ok'; status: 201 | 200; response: HumanRequestCreated }
+  | { kind: 'CUSTOMER_OPEN_LIMIT'; limit: number | null; open: number | null }
+  | {
+      kind: 'CUSTOMER_RATE_LIMITED';
+      limit: number | null;
+      retryAfterSeconds: number | null;
+    }
+  | RateLimitedResult
+  | { kind: 'IDEMPOTENCY_CONFLICT' }
+  | { kind: 'SUBTYPE_DISABLED' }
+  | { kind: 'SCHEDULING_DISABLED' }
+  | { kind: 'VERSION_CONFLICT' }
+  | ValidationErrorResult
+  | { kind: 'NOT_FOUND' };
+
+// ---------------------------------------------------------------- cancel
+
+export interface CancelHumanRequestInput {
+  reason: 'CUSTOMER_WITHDREW' | 'AUTO_RESOLVED';
+  triggerWaMessageId: string;
+}
+
+export interface HumanRequestCancelled {
+  id: string;
+  status: 'CANCELLED';
+  reason: string;
+  cancelledAt: string;
+}
+
+export type CancelHumanRequestResult =
+  | { kind: 'ok'; response: HumanRequestCancelled }
+  /** Deliver `resolution` instead of "cancelled". Kept raw. */
+  | { kind: 'ALREADY_RESOLVED'; resolution: unknown }
+  | { kind: 'REQUEST_CLOSED' }
+  | { kind: 'CANCEL_NOT_ALLOWED' }
+  | { kind: 'NOT_FOUND' }
+  | { kind: 'IDEMPOTENCY_CONFLICT' }
+  | RateLimitedResult;
+
+// ---------------------------------------------------------------- feed
+
+export const FEED_MAX_LIMIT = 50;
+export const FEED_MAX_WAIT_SECONDS = 25;
+
+export interface ReadFeedOptions {
+  after?: string;
+  /** 1..50, default 50. */
+  limit?: number;
+  /** 0..25, default 25. */
+  waitSeconds?: number;
+}
+
+export type DeferredReason = 'HUMAN_SESSION' | 'WINDOW_CLOSED';
+export type DeliveryZoneType = 'FREE' | 'SURCHARGE' | 'CARRIER_ONLY' | 'DENIED';
+
+interface DecisionCommon {
+  kind: 'DECISION';
+  legacyId: string | null;
+  /** usted fallback; compose from the structured fields first. */
+  text: string;
+  /** Team prefix only when `text` is staff wording, else null. */
+  prefix: string | null;
+}
+
+export type RestockAnswer = DecisionCommon & { subtype: 'RESTOCK' } & (
+    | {
+        action: 'PROVIDE_RESTOCK_ESTIMATE';
+        productName: string;
+        restockDays: number;
+      }
+    | { action: 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE'; productName: string }
+  );
+
+export type ExpirationAnswer = DecisionCommon & { subtype: 'EXPIRATION' } & (
+    | {
+        action: 'PROVIDE_EXPIRATION_TEXT';
+        productName: string;
+        expirationText: string;
+        staffText: string;
+      }
+    | { action: 'REPORT_EXPIRATION_UNAVAILABLE'; productName: string }
+  );
+
+export type DeliveryZoneAnswer = DecisionCommon & {
+  subtype: 'DELIVERY_ZONE';
+  action: 'APPROVE_DELIVERY_ZONE' | 'REJECT_DELIVERY_ZONE';
+  zipCode: string;
+  zoneType: DeliveryZoneType;
+  /** Present only when it applies. */
+  surchargeCents?: number;
+  etaDays?: number;
+};
+
+export type TransferReceiptAnswer = DecisionCommon & {
+  subtype: 'TRANSFER_RECEIPT';
+} & (
+    | { action: 'CONFIRM_RECEIPT' }
+    | {
+        action: 'REJECT_RECEIPT';
+        customerReason: string;
+        reasonSource: 'STAFF';
+        /** Relay as written, with the team prefix. */
+        staffText: string;
+      }
+    | {
+        action: 'REJECT_RECEIPT';
+        customerReason: string;
+        /** No staff wording: compose your own in the customer's register. */
+        reasonSource: 'DEFAULT';
+      }
+  );
+
+export interface ClarificationAnswer {
+  kind: 'CLARIFICATION';
+  /** Delivered verbatim with the team prefix. */
+  text: string;
+  prefix: string | null;
+}
+
+/** Unknown kind/subtype/action: the raw payload plus the fallback text. */
+export interface UnrecognizedAnswer {
+  kind: 'unrecognized';
+  text: string | null;
+  prefix: string | null;
+  raw: Record<string, unknown>;
+}
+
+export type RequestAnsweredPayload =
+  | RestockAnswer
+  | ExpirationAnswer
+  | DeliveryZoneAnswer
+  | TransferReceiptAnswer
+  | ClarificationAnswer
+  | UnrecognizedAnswer;
+
+export type StaffCancelReason =
+  | 'DUPLICATE'
+  | 'NOT_ACTIONABLE'
+  | 'CUSTOMER_UNREACHABLE'
+  | 'OTHER';
+
+export interface RequestCancelledPayload {
+  requestId: string;
+  reason: StaffCancelReason;
+  cancelledBy: 'STAFF';
+  /** Sent verbatim with the team prefix when present. */
+  customerNote?: string;
+}
+
+interface FeedItemEnvelope {
+  cursor: string;
+  deliveryId: string;
+  requestId: string;
+  conversationRef: string | null;
+  notBefore: string | null;
+  expiresAt: string | null;
+  /** Pending deliveries only, once slice 5c lands. */
+  deferredReason?: DeferredReason;
+}
+
+export type RequestAnsweredItem = FeedItemEnvelope & {
+  type: 'request.answered';
+  payload: RequestAnsweredPayload;
+};
+export type RequestCancelledItem = FeedItemEnvelope & {
+  type: 'request.cancelled';
+  payload: RequestCancelledPayload;
+};
+/** A type this bot does not know (e.g. unit 11 `conversation.*`): ACK or skip
+ *  it by `deliveryId`, never crash. */
+export interface UnknownFeedItem {
+  type: 'unknown';
+  rawType: string;
+  cursor: string;
+  deliveryId: string;
+  raw: Record<string, unknown>;
+}
+
+export type FeedItem =
+  | RequestAnsweredItem
+  | RequestCancelledItem
+  | UnknownFeedItem;
+
+export type ReadFeedResult =
+  | { kind: 'ok'; items: FeedItem[]; nextCursor: string }
+  | { kind: 'CURSOR_EXPIRED' }
+  | RateLimitedResult;
+
+// ---------------------------------------------------------------- outcome
+
+export type DeliveryOutcomeInput =
+  | {
+      outcome: 'PROVIDER_ACCEPTED';
+      attemptId: string;
+      providerMessageId: string;
+      attemptedAt: string;
+    }
+  | {
+      outcome: 'DELIVERY_UNKNOWN';
+      attemptId: string;
+      attemptedAt: string;
+      providerMessageId?: string;
+    }
+  | {
+      outcome: 'DEFERRED_WINDOW_CLOSED';
+      attemptId: string;
+      attemptedAt: string;
+    }
+  /** Slice 5c: may be a 400 VALIDATION_ERROR until it lands. */
+  | {
+      outcome: 'DEFERRED_HUMAN_SESSION';
+      attemptId: string;
+      attemptedAt: string;
+    }
+  | { outcome: 'STALE'; attemptId: string; attemptedAt?: string };
+
+export type DeliveryOutcome = DeliveryOutcomeInput['outcome'];
+
+export interface DeliveryOutcomeAck {
+  deliveryId: string;
+  outcome: DeliveryOutcome;
+  attemptId: string;
+  /** `null` for a deferral. */
+  ackReceivedAt: string | null;
+}
+
+export type RecordDeliveryOutcomeResult =
+  | { kind: 'ok'; response: DeliveryOutcomeAck }
+  | { kind: 'IDEMPOTENCY_CONFLICT' }
+  | { kind: 'OUTCOME_ALREADY_RECORDED' }
+  | { kind: 'OUTCOME_NOT_ALLOWED' }
+  | { kind: 'NOT_FOUND' }
+  | RateLimitedResult
+  | ValidationErrorResult;
+
+// ---------------------------------------------------------------- pending
+
+export type PendingDeliveriesFilter =
+  | { conversationRef: string; requestId?: never }
+  | { requestId: string; conversationRef?: never };
+
+export type PendingDeliveriesResult =
+  | { kind: 'ok'; items: FeedItem[] }
+  | RateLimitedResult;
+
+// ---------------------------------------------------------------- parsing
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+const isText = (value: unknown): value is string =>
+  typeof value === 'string' && value.length > 0;
+const isNullableString = (value: unknown): value is string | null =>
+  value === null || typeof value === 'string';
+const isCount = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
+
+/** Lowercase RFC UUID (the outcome contract requires lowercase). */
+export const LOWERCASE_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const CANONICAL_UTC_MS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+/** `YYYY-MM-DDTHH:mm:ss.sssZ` naming a real instant. */
+export const isCanonicalUtcMs = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  CANONICAL_UTC_MS.test(value) &&
+  !Number.isNaN(Date.parse(value)) &&
+  new Date(value).toISOString() === value;
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+const isProviderMessageId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length >= 1 &&
+  value.length <= 512 &&
+  value.trim() === value &&
+  !CONTROL_CHARS.test(value);
+
+const OUTCOME_KEYS: Record<
+  DeliveryOutcome,
+  { required: string[]; optional: string[] }
+> = {
+  PROVIDER_ACCEPTED: {
+    required: ['attemptId', 'outcome', 'providerMessageId', 'attemptedAt'],
+    optional: [],
+  },
+  DELIVERY_UNKNOWN: {
+    required: ['attemptId', 'outcome', 'attemptedAt'],
+    optional: ['providerMessageId'],
+  },
+  DEFERRED_WINDOW_CLOSED: {
+    required: ['attemptId', 'outcome', 'attemptedAt'],
+    optional: [],
+  },
+  DEFERRED_HUMAN_SESSION: {
+    required: ['attemptId', 'outcome', 'attemptedAt'],
+    optional: [],
+  },
+  STALE: { required: ['attemptId', 'outcome'], optional: ['attemptedAt'] },
+};
+
+/** Exact outcome body for the wire, or null when it breaks the contract. */
+export function normalizeDeliveryOutcome(
+  input: unknown,
+): DeliveryOutcomeInput | null {
+  if (!isRecord(input) || typeof input.outcome !== 'string') return null;
+  const keys = OUTCOME_KEYS[input.outcome as DeliveryOutcome] as
+    | (typeof OUTCOME_KEYS)[DeliveryOutcome]
+    | undefined;
+  if (keys === undefined) return null;
+  const present = Object.keys(input).filter((key) => input[key] !== undefined);
+  if (
+    !keys.required.every((key) => present.includes(key)) ||
+    !present.every(
+      (key) => keys.required.includes(key) || keys.optional.includes(key),
+    )
+  )
+    return null;
+  if (
+    typeof input.attemptId !== 'string' ||
+    !LOWERCASE_UUID.test(input.attemptId)
+  )
+    return null;
+  if ('attemptedAt' in input && input.attemptedAt !== undefined)
+    if (!isCanonicalUtcMs(input.attemptedAt)) return null;
+  if ('providerMessageId' in input && input.providerMessageId !== undefined)
+    if (!isProviderMessageId(input.providerMessageId)) return null;
+  const body: Record<string, unknown> = {};
+  for (const key of present) body[key] = input[key];
+  return body as DeliveryOutcomeInput;
+}
+
+export function parseDeliveryOutcomeAck(
+  body: unknown,
+): DeliveryOutcomeAck | null {
+  if (!isRecord(body)) return null;
+  const { deliveryId, outcome, attemptId, ackReceivedAt } = body;
+  if (
+    !isText(deliveryId) ||
+    typeof outcome !== 'string' ||
+    !(outcome in OUTCOME_KEYS) ||
+    !isText(attemptId) ||
+    !isNullableString(ackReceivedAt)
+  )
+    return null;
+  return {
+    deliveryId,
+    outcome: outcome as DeliveryOutcome,
+    attemptId,
+    ackReceivedAt,
+  };
+}
+
+const CREATE_OUTCOMES: ReadonlySet<unknown> = new Set([
+  'CREATED',
+  'REPLAYED',
+  'MERGED',
+]);
+
+export function parseHumanRequestCreated(
+  body: unknown,
+): HumanRequestCreated | null {
+  if (!isRecord(body)) return null;
+  const { id, status, outcome, mergedIntoId, businessHours, legacy } = body;
+  // `folio` is tolerated when absent (the 5a summary omits it).
+  const folio = body.folio ?? null;
+  if (
+    !isNullableString(id) ||
+    id === '' ||
+    !isNullableString(folio) ||
+    !isText(status) ||
+    !CREATE_OUTCOMES.has(outcome) ||
+    !isNullableString(mergedIntoId)
+  )
+    return null;
+  let hours: HumanRequestBusinessHours | null = null;
+  if (businessHours !== null) {
+    if (
+      !isRecord(businessHours) ||
+      typeof businessHours.openNow !== 'boolean' ||
+      !isNullableString(businessHours.nextOpenAt ?? null)
+    )
+      return null;
+    hours = {
+      openNow: businessHours.openNow,
+      nextOpenAt:
+        (businessHours.nextOpenAt as string | null | undefined) ?? null,
+    };
+  }
+  if (legacy !== undefined && legacy !== null && !isRecord(legacy)) return null;
+  return {
+    id,
+    folio,
+    status,
+    outcome: outcome as HumanRequestCreated['outcome'],
+    mergedIntoId,
+    businessHours: hours,
+    ...(isRecord(legacy) ? { legacy } : {}),
+  };
+}
+
+export function parseHumanRequestCancelled(
+  body: unknown,
+): HumanRequestCancelled | null {
+  if (!isRecord(body)) return null;
+  const { id, status, reason, cancelledAt } = body;
+  if (
+    !isText(id) ||
+    status !== 'CANCELLED' ||
+    !isText(reason) ||
+    !isText(cancelledAt)
+  )
+    return null;
+  return { id, status, reason, cancelledAt };
+}
+
+const ZONE_TYPES: ReadonlySet<unknown> = new Set([
+  'FREE',
+  'SURCHARGE',
+  'CARRIER_ONLY',
+  'DENIED',
+]);
+const KNOWN_ACTIONS: Record<string, readonly string[]> = {
+  RESTOCK: ['PROVIDE_RESTOCK_ESTIMATE', 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE'],
+  EXPIRATION: ['PROVIDE_EXPIRATION_TEXT', 'REPORT_EXPIRATION_UNAVAILABLE'],
+  DELIVERY_ZONE: ['APPROVE_DELIVERY_ZONE', 'REJECT_DELIVERY_ZONE'],
+  TRANSFER_RECEIPT: ['CONFIRM_RECEIPT', 'REJECT_RECEIPT'],
+};
+
+/** `undefined` = malformed (rejects the page). */
+function parseAnswered(
+  p: Record<string, unknown>,
+): RequestAnsweredPayload | undefined {
+  const prefix = p.prefix ?? null;
+  if (!isNullableString(prefix)) return undefined;
+  const unrecognized = (): RequestAnsweredPayload | undefined =>
+    p.text === undefined || isNullableString(p.text)
+      ? {
+          kind: 'unrecognized',
+          text: p.text ?? null,
+          prefix,
+          raw: p,
+        }
+      : undefined;
+
+  if (p.kind === 'CLARIFICATION') {
+    if (!isText(p.text)) return undefined;
+    return { kind: 'CLARIFICATION', text: p.text, prefix };
+  }
+  if (
+    p.kind !== 'DECISION' ||
+    typeof p.subtype !== 'string' ||
+    typeof p.action !== 'string' ||
+    !KNOWN_ACTIONS[p.subtype]?.includes(p.action)
+  )
+    return unrecognized();
+
+  const legacyId = p.legacyId ?? null;
+  if (!isNullableString(legacyId) || !isText(p.text)) return undefined;
+  const common = { kind: 'DECISION' as const, legacyId, text: p.text, prefix };
+
+  switch (p.action) {
+    case 'PROVIDE_RESTOCK_ESTIMATE':
+      if (
+        !isText(p.productName) ||
+        !isCount(p.restockDays) ||
+        p.restockDays < 1
+      )
+        return undefined;
+      return {
+        ...common,
+        subtype: 'RESTOCK',
+        action: p.action,
+        productName: p.productName,
+        restockDays: p.restockDays,
+      };
+    case 'REPORT_RESTOCK_ESTIMATE_UNAVAILABLE':
+      if (!isText(p.productName)) return undefined;
+      return {
+        ...common,
+        subtype: 'RESTOCK',
+        action: p.action,
+        productName: p.productName,
+      };
+    case 'PROVIDE_EXPIRATION_TEXT':
+      if (
+        !isText(p.productName) ||
+        !isText(p.expirationText) ||
+        !isText(p.staffText)
+      )
+        return undefined;
+      return {
+        ...common,
+        subtype: 'EXPIRATION',
+        action: p.action,
+        productName: p.productName,
+        expirationText: p.expirationText,
+        staffText: p.staffText,
+      };
+    case 'REPORT_EXPIRATION_UNAVAILABLE':
+      if (!isText(p.productName)) return undefined;
+      return {
+        ...common,
+        subtype: 'EXPIRATION',
+        action: p.action,
+        productName: p.productName,
+      };
+    case 'APPROVE_DELIVERY_ZONE':
+    case 'REJECT_DELIVERY_ZONE': {
+      const surcharge = p.surchargeCents ?? undefined;
+      const eta = p.etaDays ?? undefined;
+      if (
+        !isText(p.zipCode) ||
+        !ZONE_TYPES.has(p.zoneType) ||
+        (surcharge !== undefined && !isCount(surcharge)) ||
+        (eta !== undefined && !isCount(eta))
+      )
+        return undefined;
+      return {
+        ...common,
+        subtype: 'DELIVERY_ZONE',
+        action: p.action,
+        zipCode: p.zipCode,
+        zoneType: p.zoneType as DeliveryZoneType,
+        ...(surcharge === undefined ? {} : { surchargeCents: surcharge }),
+        ...(eta === undefined ? {} : { etaDays: eta }),
+      };
+    }
+    case 'CONFIRM_RECEIPT':
+      return { ...common, subtype: 'TRANSFER_RECEIPT', action: p.action };
+    case 'REJECT_RECEIPT': {
+      if (!isText(p.customerReason)) return undefined;
+      const base = {
+        ...common,
+        subtype: 'TRANSFER_RECEIPT' as const,
+        action: 'REJECT_RECEIPT' as const,
+        customerReason: p.customerReason,
+      };
+      if (p.reasonSource === 'STAFF')
+        return isText(p.staffText)
+          ? { ...base, reasonSource: 'STAFF', staffText: p.staffText }
+          : undefined;
+      if (p.reasonSource === 'DEFAULT')
+        return p.staffText === undefined || p.staffText === null
+          ? { ...base, reasonSource: 'DEFAULT' }
+          : undefined;
+      return undefined;
+    }
+    default:
+      return unrecognized();
+  }
+}
+
+const CANCEL_REASONS: ReadonlySet<unknown> = new Set([
+  'DUPLICATE',
+  'NOT_ACTIONABLE',
+  'CUSTOMER_UNREACHABLE',
+  'OTHER',
+]);
+
+function parseCancelled(
+  p: Record<string, unknown>,
+): RequestCancelledPayload | undefined {
+  const note = p.customerNote ?? undefined;
+  if (
+    !isText(p.requestId) ||
+    !CANCEL_REASONS.has(p.reason) ||
+    p.cancelledBy !== 'STAFF' ||
+    (note !== undefined && typeof note !== 'string')
+  )
+    return undefined;
+  return {
+    requestId: p.requestId,
+    reason: p.reason as StaffCancelReason,
+    cancelledBy: 'STAFF',
+    ...(note === undefined ? {} : { customerNote: note }),
+  };
+}
+
+const DEFERRED_REASONS: ReadonlySet<unknown> = new Set([
+  'HUMAN_SESSION',
+  'WINDOW_CLOSED',
+]);
+
+/** One feed / pending-deliveries item; null when malformed. */
+export function parseFeedItem(item: unknown): FeedItem | null {
+  if (
+    !isRecord(item) ||
+    !isText(item.cursor) ||
+    !isText(item.deliveryId) ||
+    !isText(item.type)
+  )
+    return null;
+  if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
+    return {
+      type: 'unknown',
+      rawType: item.type,
+      cursor: item.cursor,
+      deliveryId: item.deliveryId,
+      raw: item,
+    };
+  const { deferredReason } = item;
+  if (
+    !isText(item.requestId) ||
+    !isNullableString(item.conversationRef) ||
+    !isNullableString(item.notBefore) ||
+    !isNullableString(item.expiresAt) ||
+    !isRecord(item.payload) ||
+    (deferredReason !== undefined &&
+      deferredReason !== null &&
+      !DEFERRED_REASONS.has(deferredReason))
+  )
+    return null;
+  const envelope: FeedItemEnvelope = {
+    cursor: item.cursor,
+    deliveryId: item.deliveryId,
+    requestId: item.requestId,
+    conversationRef: item.conversationRef,
+    notBefore: item.notBefore,
+    expiresAt: item.expiresAt,
+    ...(deferredReason === undefined || deferredReason === null
+      ? {}
+      : { deferredReason: deferredReason as DeferredReason }),
+  };
+  if (item.type === 'request.answered') {
+    const payload = parseAnswered(item.payload);
+    return payload === undefined
+      ? null
+      : { ...envelope, type: 'request.answered', payload };
+  }
+  const payload = parseCancelled(item.payload);
+  return payload === undefined
+    ? null
+    : { ...envelope, type: 'request.cancelled', payload };
+}
+
+function parseItems(items: unknown): FeedItem[] | null {
+  if (!Array.isArray(items)) return null;
+  const parsed: FeedItem[] = [];
+  for (const raw of items) {
+    const item = parseFeedItem(raw);
+    if (item === null) return null;
+    parsed.push(item);
+  }
+  return parsed;
+}
+
+/** A whole page; null when the page or any item breaks the contract. */
+export function parseFeedPage(
+  body: unknown,
+): { items: FeedItem[]; nextCursor: string } | null {
+  if (!isRecord(body) || typeof body.nextCursor !== 'string') return null;
+  const items = parseItems(body.items);
+  return items === null ? null : { items, nextCursor: body.nextCursor };
+}
+
+export function parsePendingDeliveries(body: unknown): FeedItem[] | null {
+  return isRecord(body) ? parseItems(body.items) : null;
+}
+
+/** Local create check; the backend owns the full validation (400). */
+export function isCreateHumanRequestInput(
+  input: unknown,
+): input is CreateHumanRequestInput {
+  if (!isRecord(input) || !isText(input.sourceRequestId)) return false;
+  if (
+    input.subtype === 'RESTOCK' ||
+    input.subtype === 'EXPIRATION' ||
+    input.subtype === 'DELIVERY_ZONE'
+  )
+    return isRecord(input.detail);
+  if (
+    input.subtype !== 'UNKNOWN_QUESTION' &&
+    input.subtype !== 'TALK_TO_HUMAN' &&
+    input.subtype !== 'COMPLAINT'
+  )
+    return false;
+  return (
+    isRecord(input.customer) &&
+    isText(input.conversationRef) &&
+    isText(input.lastCustomerMessageAt) &&
+    isText(input.summary) &&
+    input.summary.length <= HUMAN_REQUEST_SUMMARY_MAX_LENGTH
+  );
+}
+
+/** Wire body: only defined keys, so an unknown key never reaches the backend. */
+export function toCreateHumanRequestBody(
+  input: CreateHumanRequestInput,
+): Record<string, unknown> {
+  const keys = [
+    'sourceRequestId',
+    'subtype',
+    'customer',
+    'conversationRef',
+    'lastCustomerMessageAt',
+    'summary',
+    'needs',
+    'context',
+    'dedupKey',
+    'triggerWaMessageId',
+    'detail',
+  ] as const;
+  const source = input as Partial<Record<(typeof keys)[number], unknown>>;
+  const body: Record<string, unknown> = {};
+  for (const key of keys)
+    if (source[key] !== undefined) body[key] = source[key];
+  return body;
+}

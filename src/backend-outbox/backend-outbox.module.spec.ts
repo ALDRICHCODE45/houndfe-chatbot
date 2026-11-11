@@ -12,7 +12,7 @@ import {
   BACKEND_OUTBOX_STORE,
 } from './domain/backend-outbox';
 import { InMemoryBackendOutboxStore } from './infrastructure/in-memory-backend-outbox.store';
-import { NotWiredBackendOutboxDelivery } from './infrastructure/not-wired-backend-outbox.delivery';
+import { RoutingBackendOutboxDelivery } from './infrastructure/routing-backend-outbox.delivery';
 import { PostgresBackendOutboxStore } from './infrastructure/postgres-backend-outbox.store';
 
 const fakePool = () => ({
@@ -26,7 +26,7 @@ describe('BackendOutboxModule', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
-  it('wires the Postgres store and the not-wired delivery by default', async () => {
+  it('wires the Postgres store and the per-kind delivery router', async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [BackendOutboxModule],
     })
@@ -36,9 +36,10 @@ describe('BackendOutboxModule', () => {
     expect(moduleRef.get(BACKEND_OUTBOX_STORE)).toBeInstanceOf(
       PostgresBackendOutboxStore,
     );
-    expect(moduleRef.get(BACKEND_OUTBOX_DELIVERY)).toBeInstanceOf(
-      NotWiredBackendOutboxDelivery,
-    );
+    const router = moduleRef.get<unknown>(BACKEND_OUTBOX_DELIVERY);
+    expect(router).toBeInstanceOf(RoutingBackendOutboxDelivery);
+    // Feature modules register on the same router instance.
+    expect(moduleRef.get(RoutingBackendOutboxDelivery)).toBe(router);
     expect(moduleRef.get(BackendOutboxService)).toBeInstanceOf(
       BackendOutboxService,
     );
@@ -57,6 +58,10 @@ describe('BackendOutboxModule', () => {
     );
     expect(() => moduleRef.get(BackendOutboxDrainLifecycle)).toThrow();
     expect(() => moduleRef.get<unknown>(BACKEND_OUTBOX_DELIVERY)).toThrow();
+    // The router is shared so feature modules can register their kinds.
+    expect(moduleRef.get(RoutingBackendOutboxDelivery)).toBeInstanceOf(
+      RoutingBackendOutboxDelivery,
+    );
     await moduleRef.close();
   });
 

@@ -42,6 +42,7 @@ import { BackendOutboxService } from '../../backend-outbox/application/backend-o
 import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
 import { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import { checkHandoffSendHold } from '../../conversation/application/handoff-send-hold';
+import { HumanRequestDeliveryService } from '../../human-requests/application/human-request-delivery.service';
 import { normalizeMetaStatuses } from './meta-status-normalizer';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
@@ -156,6 +157,13 @@ export class WebhookDispatcherService {
     // never silently lose the gate); optional in TS only for harnesses.
     @Inject(HandoffModeService)
     private readonly handoffMode?: Pick<HandoffModeService, 'isHumanMode'>,
+    // S5 pending deliveries (window / HUMAN replay). Optional for harnesses.
+    @Optional()
+    @Inject(HumanRequestDeliveryService)
+    private readonly humanRequestDelivery?: Pick<
+      HumanRequestDeliveryService,
+      'onCustomerInbound'
+    >,
   ) {}
 
   async dispatch(event: WebhookEventDto): Promise<void> {
@@ -276,6 +284,8 @@ export class WebhookDispatcherService {
         // S1: load the stored profile so every reply below (pending
         // marker, media, the turn) already uses the customer's stored style.
         await this.prepareCustomer(message.senderId);
+        // S5: replay pending/held team deliveries; never awaited.
+        this.notifyHumanRequests(message.senderId);
 
         // ─── (4) Pending-marker short-circuit (ADR-29 defense-in-depth)
         // The runner has the same gate; this branch keeps the dispatcher
@@ -454,6 +464,27 @@ export class WebhookDispatcherService {
     await this.markSeenSafely(message.messageId);
   }
 
+  /** S5: fire-and-forget; it never delays or breaks the reply. */
+  private notifyHumanRequests(senderId: string): void {
+    try {
+      void this.humanRequestDelivery
+        ?.onCustomerInbound(conversationRefFor(senderId))
+        ?.catch((error: unknown) =>
+          this.logger.warn(
+            `pending deliveries replay failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    } catch (error) {
+      this.logger.warn(
+        `pending deliveries replay failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   /** S1: best effort; a profile failure never blocks the message. */
   private async prepareCustomer(senderId: string): Promise<void> {
     const agent = this
@@ -525,6 +556,9 @@ export class WebhookDispatcherService {
       ...(message.profileName === undefined
         ? {}
         : { profileName: message.profileName }),
+      ...(Number.isNaN(Date.parse(message.timestamp))
+        ? {}
+        : { inboundAt: new Date(message.timestamp).toISOString() }),
       ...(message.receivingPhoneNumberId === undefined
         ? {}
         : {

@@ -1,0 +1,115 @@
+<!-- Chatbot copy of houndfe-backend docs/chatbot-handoff/chatbot-requests-bot-contract.md at aab7fb6e (slices 5a and 5b), received 2026-11-10, plus the agreed DEFERRED_HUMAN_SESSION addition (slice 5c, pending on the dev backend). The backend file is the source of truth. -->
+
+# Chatbot ↔ backend: human requests (slices 5a and 5b)
+
+Create, merge, customer cancel and route budgets (5a) are summarized in `docs/contracts/human-intervention-requests-5a.md`. This file records the feed, the delivery outcome and pending deliveries (5b), which the chatbot feed consumer implements.
+
+## Feed — `GET /chatbot-api/feed?after=<cursor>&limit=50&waitSeconds=25`
+
+Scope `feed:read`, class `feed` (120/min, spent once when the long-poll opens; at most 2 waiting long-polls per credential, a third gets `429 RATE_LIMITED` with `Retry-After: 1`). `after` = previous `nextCursor` (omit to start from the oldest retained item); `limit` 1..50; `waitSeconds` 0..25. Out-of-range values are `400`, not clamped.
+
+```json
+{
+  "items": [
+    {
+      "cursor": "000000001842",
+      "deliveryId": "b1c0…",
+      "type": "request.answered",
+      "requestId": "9a7e…",
+      "conversationRef": "wa:5215512345678",
+      "payload": {
+        "kind": "DECISION",
+        "subtype": "RESTOCK",
+        "action": "PROVIDE_RESTOCK_ESTIMATE",
+        "legacyId": "5d0c…",
+        "text": "El producto «Croquetas 20 kg» estará disponible en aproximadamente 7 días.",
+        "prefix": null,
+        "productName": "Croquetas 20 kg",
+        "restockDays": 7
+      },
+      "notBefore": null,
+      "expiresAt": null
+    }
+  ],
+  "nextCursor": "000000001842"
+}
+```
+
+- Items arrive in ascending cursor order, and cursor order is commit order. Store `nextCursor` **after** the page is handled. An empty page returns the `after` you sent. The cursor is per tenant and opaque. Reading never acknowledges anything.
+- With no item, the request waits up to `waitSeconds` and answers `{items: [], nextCursor: <after>}`, or returns as soon as an item commits. Reconnect immediately. On a backend restart, waiting long-polls answer empty at once; keep the cursor.
+- `410 CURSOR_EXPIRED` after 30 days of retention. The recovery route `GET /chatbot-api/requests?status=open&updatedSince=` is not built yet; until then restart with no `after` and de-duplicate by `deliveryId`.
+- The same `after` returns the same items again: de-duplicate by `deliveryId`, stored as a unique key **before** calling Meta.
+- Run one consumer per branch (advisory lock).
+
+## Item types (5b)
+
+| `type`              | When                                                                                                                                         | `payload`                                                              |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `request.answered`  | Staff resolved a wrapped decision (stock, expiration, delivery zone, transfer receipt), from the new resolve command or the old staff routes | `{kind: "DECISION", subtype, action, legacyId, text, prefix, …fields}` |
+| `request.cancelled` | Staff cancelled a request (§12.14)                                                                                                           | `{requestId, reason, cancelledBy: "STAFF", customerNote?}`             |
+
+`conversationRef` is `null` when the request has none (e.g. a stock request created without one). `legacyId` is the id the bot already tracks from the create answer (`legacy.id`).
+
+**The bot composes the message from the structured fields in the customer's tú/usted register; `text`/`prefix` are only an usted fallback.** `prefix` is `"Le comparto la respuesta del equipo:"` only when `text` is what staff wrote for the customer, else `null`.
+
+| `subtype`          | `action`                                                           | Fields                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `RESTOCK`          | `PROVIDE_RESTOCK_ESTIMATE` / `REPORT_RESTOCK_ESTIMATE_UNAVAILABLE` | `productName`; `restockDays` only for the first                                                                            |
+| `EXPIRATION`       | `PROVIDE_EXPIRATION_TEXT` / `REPORT_EXPIRATION_UNAVAILABLE`        | `productName`; `expirationText` and `staffText` (same staff string) only for the first                                     |
+| `DELIVERY_ZONE`    | `APPROVE_DELIVERY_ZONE` / `REJECT_DELIVERY_ZONE`                   | `zipCode`, `zoneType` (`FREE`, `SURCHARGE`, `CARRIER_ONLY`, `DENIED`); `surchargeCents` and `etaDays` only when they apply |
+| `TRANSFER_RECEIPT` | `CONFIRM_RECEIPT` / `REJECT_RECEIPT`                               | a rejection carries `customerReason`, `reasonSource` and, only for `STAFF`, `staffText`                                    |
+
+Examples:
+
+```json
+{ "kind": "DECISION", "subtype": "RESTOCK", "action": "REPORT_RESTOCK_ESTIMATE_UNAVAILABLE", "legacyId": "…", "text": "Por ahora no tenemos una fecha estimada de reposición para «Croquetas 20 kg».", "prefix": null, "productName": "Croquetas 20 kg" }
+{ "kind": "DECISION", "subtype": "EXPIRATION", "action": "PROVIDE_EXPIRATION_TEXT", "legacyId": "…", "text": "Caduca en marzo 2027", "prefix": "Le comparto la respuesta del equipo:", "productName": "Leche", "expirationText": "Caduca en marzo 2027", "staffText": "Caduca en marzo 2027" }
+{ "kind": "DECISION", "subtype": "DELIVERY_ZONE", "action": "APPROVE_DELIVERY_ZONE", "legacyId": "…", "text": "Sí entregamos en su código postal (64000) con un cargo de envío de $1,250.00 MXN. Tiempo estimado: 3 días.", "prefix": null, "zipCode": "64000", "zoneType": "SURCHARGE", "surchargeCents": 125000, "etaDays": 3 }
+{ "kind": "DECISION", "subtype": "TRANSFER_RECEIPT", "action": "REJECT_RECEIPT", "legacyId": "…", "text": "El monto no coincide, envíenos otro comprobante.", "prefix": "Le comparto la respuesta del equipo:", "customerReason": "El monto no coincide, envíenos otro comprobante.", "reasonSource": "STAFF", "staffText": "El monto no coincide, envíenos otro comprobante." }
+```
+
+- **`reasonSource`.** `STAFF`: relay `staffText` as written, with the team prefix. `DEFAULT`: no staff wording, no `staffText`, `prefix` null; compose your own "we could not validate your receipt, please send it again" in the customer's register.
+- **Fallback texts** (verbatim; `«…»` productName, `N` days, `$X` es-MX amount like `$1,250.00 MXN`, `Z` postal code):
+  - `RESTOCK` with estimate: `El producto «…» estará disponible en aproximadamente N días.` (`1 día` for one day); without: `Por ahora no tenemos una fecha estimada de reposición para «…».`
+  - `EXPIRATION` with text: the staff text (with the team prefix); without: `Por ahora no tenemos la fecha de caducidad de «…».`
+  - `FREE`: `Sí entregamos en su código postal (Z), sin costo de envío.` · `SURCHARGE`: `Sí entregamos en su código postal (Z) con un cargo de envío de $X.` (no amount or 0: `… con un cargo de envío adicional.`, never `$0.00`) · `CARRIER_ONLY`: `En su código postal (Z) el envío es solo por paquetería.` plus ` El cargo de envío es de $X.` when a surcharge is set · `DENIED`: `Por ahora no entregamos en su código postal (Z).` Every approval ends with ` Tiempo estimado: N días.` when `etaDays` is set.
+  - `CONFIRM_RECEIPT`: `Le confirmamos la recepción de su comprobante de pago. ¡Gracias!`
+  - `REJECT_RECEIPT` with a staff reason: that reason; default: `No pudimos validar tu comprobante. Por favor envíanos uno nuevo o contáctanos.` (in tú: the one fallback that is not usted).
+- A zone answer is **one item per customer**, each with its own `conversationRef` and `deliveryId`.
+- A customer who cancelled gets **no** item when staff later resolves the old row.
+- **`request.cancelled`.** `reason` is `DUPLICATE`, `NOT_ACTIONABLE`, `CUSTOMER_UNREACHABLE` or `OTHER`. Forget the request's pending state. `DUPLICATE`: send nothing, ACK `STALE`. Others: a short notice (`customerNote` as written with the team prefix when present) if the window is open, ACK `PROVIDER_ACCEPTED`; window closed: send nothing, ACK `STALE`. Never `DEFERRED_WINDOW_CLOSED` (or `DEFERRED_HUMAN_SESSION`) for this type: `422 OUTCOME_NOT_ALLOWED`.
+
+## Delivery outcome — `POST /chatbot-api/deliveries/:deliveryId/outcome`
+
+Scope `feed:ack`, class `write`. Send it **after** the local effect. One call per attempt:
+
+```json
+{
+  "attemptId": "0b8f5c0e-6d7a-4c1e-9a52-3f1d2b6a7c10",
+  "outcome": "PROVIDER_ACCEPTED",
+  "providerMessageId": "wamid.HBg…",
+  "attemptedAt": "2026-11-10T16:20:00.000Z"
+}
+```
+
+| `outcome`                | Meaning                                                                                                                                                                                                                  | Body                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| `PROVIDER_ACCEPTED`      | Meta accepted the message                                                                                                                                                                                                | `providerMessageId` and `attemptedAt` required                    |
+| `DELIVERY_UNKNOWN`       | Unknown whether it was sent; **do not retry**                                                                                                                                                                            | `attemptedAt` required, `providerMessageId` optional              |
+| `DEFERRED_WINDOW_CLOSED` | 24 h window closed; stays pending. Not for `request.cancelled`                                                                                                                                                           | `attemptedAt` required, no `providerMessageId`                    |
+| `DEFERRED_HUMAN_SESSION` | **Slice 5c, pending on the dev backend.** A person is attending; same non-terminal semantics as `DEFERRED_WINDOW_CLOSED`; served by pending-deliveries with `deferredReason: HUMAN_SESSION`. Not for `request.cancelled` | as `DEFERRED_WINDOW_CLOSED`                                       |
+| `STALE`                  | Nothing was sent and nothing needs to be                                                                                                                                                                                 | `attemptId` only (`attemptedAt` optional, no `providerMessageId`) |
+
+Exactly those keys; anything else is `400`. `attemptId` is a lowercase UUID; `attemptedAt` canonical UTC `YYYY-MM-DDTHH:mm:ss.sssZ`; `providerMessageId` 1..512 chars, trimmed, no control characters.
+
+`200 {deliveryId, outcome, attemptId, ackReceivedAt}` (`ackReceivedAt` null for a deferral). An exact replay (same `attemptId` and evidence) answers `200`, even for an older attempt. `409 IDEMPOTENCY_CONFLICT`: same `attemptId`, other evidence. `409 OUTCOME_ALREADY_RECORDED`: a new `attemptId` after a terminal outcome. `422 OUTCOME_NOT_ALLOWED`: a deferral for `request.cancelled`. `404` (`Delivery not found`). Retry a lost ACK with the **same body**. A new send after a deferral uses a **new `attemptId`**.
+
+## Pending deliveries — `GET /chatbot-api/requests/pending-deliveries?conversationRef=` (or `?requestId=`)
+
+Scope `feed:read`, class `read`. Exactly one filter. Returns `{items: [...]}` (feed item shape, up to 50, ascending cursor) whose last outcome is a deferral and that have no terminal outcome. Ask when the customer writes again (or, for HUMAN_SESSION, after the session ends or on the next bot-mode turn), deliver, and ACK each with a new `attemptId`. Use `requestId` for requests without a `conversationRef`.
+
+## No double delivery
+
+- Store `deliveryId` as a unique key before calling Meta; if a send is uncertain, report `DELIVERY_UNKNOWN` and do not retry.
+- While both paths exist (feed and legacy poll of the same decision), track by `legacyId`: whichever arrives first is delivered; the other is ACKed `STALE` (feed) or ignored (poll).
+- One consumer per branch.

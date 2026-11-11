@@ -1,5 +1,6 @@
 import {
   assertEnqueueInput,
+  laneForKind,
   truncateError,
   type BackendOutboxEnqueueInput,
   type BackendOutboxEnqueueResult,
@@ -12,6 +13,11 @@ const copy = <T extends BackendOutboxEntry>(entry: T): T => ({
   ...entry,
   payload: structuredClone(entry.payload),
 });
+
+/** Seq counters and heads are keyed per (conversation, lane). */
+const laneKey = (
+  entry: Pick<BackendOutboxEntry, 'conversationRef' | 'kind'>,
+): string => `${entry.conversationRef}|${laneForKind(entry.kind)}`;
 
 /** Test/dev adapter with the same head-of-line and lease semantics as the
  * Postgres store; time comes from the injected clock. */
@@ -35,8 +41,9 @@ export class InMemoryBackendOutboxStore implements BackendOutboxStore {
     );
     if (existing)
       return Promise.resolve({ entry: copy(existing), created: false });
-    const seq = this.nextSeq.get(input.conversationRef) ?? 1;
-    this.nextSeq.set(input.conversationRef, seq + 1);
+    const key = laneKey(input);
+    const seq = this.nextSeq.get(key) ?? 1;
+    this.nextSeq.set(key, seq + 1);
     const now = new Date(this.clock());
     const entry: BackendOutboxEntry = {
       id: String(this.nextId++),
@@ -67,8 +74,9 @@ export class InMemoryBackendOutboxStore implements BackendOutboxStore {
     const heads = new Map<string, BackendOutboxEntry>();
     for (const row of this.rows) {
       if (row.status !== 'PENDING' && row.status !== 'IN_FLIGHT') continue;
-      const head = heads.get(row.conversationRef);
-      if (!head || row.seq < head.seq) heads.set(row.conversationRef, row);
+      const key = laneKey(row);
+      const head = heads.get(key);
+      if (!head || row.seq < head.seq) heads.set(key, row);
     }
     const due = [...heads.values()]
       .filter((row) =>

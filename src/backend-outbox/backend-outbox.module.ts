@@ -17,8 +17,8 @@ import {
   type BackendOutboxDeliveryPort,
   type BackendOutboxStore,
 } from './domain/backend-outbox';
-import { NotWiredBackendOutboxDelivery } from './infrastructure/not-wired-backend-outbox.delivery';
 import { PostgresBackendOutboxStore } from './infrastructure/postgres-backend-outbox.store';
+import { RoutingBackendOutboxDelivery } from './infrastructure/routing-backend-outbox.delivery';
 
 /**
  * Owns the drain worker (always on): starts once on bootstrap, never
@@ -60,6 +60,8 @@ export class BackendOutboxDrainLifecycle
  *
  *   - `BACKEND_OUTBOX_STORE` → `backend_outbox` (migration 3900).
  *   - `BackendOutboxService` → enqueue API for other modules.
+ *   - `RoutingBackendOutboxDelivery` → the per-kind delivery router; feature
+ *     modules register their adapters on it at init (no import back here).
  */
 @Module({
   imports: [DatabaseModule],
@@ -70,8 +72,16 @@ export class BackendOutboxDrainLifecycle
       inject: [PG_POOL],
     },
     BackendOutboxService,
+    {
+      provide: RoutingBackendOutboxDelivery,
+      useFactory: () => new RoutingBackendOutboxDelivery(),
+    },
   ],
-  exports: [BackendOutboxService, BACKEND_OUTBOX_STORE],
+  exports: [
+    BackendOutboxService,
+    BACKEND_OUTBOX_STORE,
+    RoutingBackendOutboxDelivery,
+  ],
 })
 export class BackendOutboxEnqueueModule {}
 
@@ -79,9 +89,10 @@ export class BackendOutboxEnqueueModule {}
  * BackendOutboxModule (S2, human-intervention contract v1 §10.1)
  *
  *   - Re-exports `BackendOutboxEnqueueModule` (store + enqueue API).
- *   - `BACKEND_OUTBOX_DELIVERY` → not-wired adapter until backend unit 5
- *     exists (every row retries; nothing is lost). Swap in the HTTP adapter
- *     here.
+ *   - `BACKEND_OUTBOX_DELIVERY` → the shared `RoutingBackendOutboxDelivery`:
+ *     REQUEST_CREATE / REQUEST_CANCEL go to the adapter `HumanRequestsModule`
+ *     registers; every other kind keeps the not-wired retry (nothing is
+ *     lost).
  *   - Runs the drain worker; imported only by `AppModule`, so there is one
  *     worker per process.
  */
@@ -90,7 +101,7 @@ export class BackendOutboxEnqueueModule {}
   providers: [
     {
       provide: BACKEND_OUTBOX_DELIVERY,
-      useFactory: () => new NotWiredBackendOutboxDelivery(),
+      useExisting: RoutingBackendOutboxDelivery,
     },
     BackendOutboxDrainLifecycle,
   ],

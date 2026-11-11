@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
 import {
   assertEnqueueInput,
+  laneForKind,
   truncateError,
   type BackendOutboxEnqueueInput,
   type BackendOutboxEnqueueResult,
@@ -31,30 +32,30 @@ interface Row {
 const SELECT_BY_KEY_SQL = `SELECT * FROM backend_outbox WHERE idempotency_key = $1`;
 
 /** The counter row lock is held until the enqueue transaction commits, so
- * commit order equals seq order within a conversation. */
-const NEXT_SEQ_SQL = `INSERT INTO backend_outbox_sequences (conversation_ref, next_seq)
-VALUES ($1, 2)
-ON CONFLICT (conversation_ref) DO UPDATE
+ * commit order equals seq order within a (conversation, lane). */
+const NEXT_SEQ_SQL = `INSERT INTO backend_outbox_sequences (conversation_ref, lane, next_seq)
+VALUES ($1, $2, 2)
+ON CONFLICT (conversation_ref, lane) DO UPDATE
   SET next_seq = backend_outbox_sequences.next_seq + 1
 RETURNING next_seq - 1 AS seq`;
 
 const INSERT_SQL = `INSERT INTO backend_outbox
-  (conversation_ref, seq, kind, idempotency_key, payload)
-VALUES ($1, $2, $3, $4, $5::jsonb)
+  (conversation_ref, lane, seq, kind, idempotency_key, payload)
+VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING *`;
 
-/** Strict head-of-line claim: per conversation only the lowest open seq is
- * a candidate. A head another worker holds is skipped (SKIP LOCKED) and the
+/** Strict head-of-line claim: per (conversation, lane) only the lowest
+ * open seq is a candidate. A head another worker holds is skipped (SKIP LOCKED) and the
  * row-level predicates are re-checked after locking, so a committed claim
  * or completion by another worker is never double-claimed and seq N+1 is
  * never picked while seq N is open. The lease is truncated to ms so the
  * JS Date fencing token compares exactly. */
 const CLAIM_SQL = `WITH heads AS (
-  SELECT DISTINCT ON (conversation_ref) id
+  SELECT DISTINCT ON (conversation_ref, lane) id
   FROM backend_outbox
   WHERE status IN ('PENDING', 'IN_FLIGHT')
-  ORDER BY conversation_ref, seq
+  ORDER BY conversation_ref, lane, seq
 ), due AS (
   SELECT o.id FROM backend_outbox o
   JOIN heads h ON h.id = o.id
@@ -191,11 +192,14 @@ export class PostgresBackendOutboxStore implements BackendOutboxStore {
     ]);
     if (existing.rows[0])
       return { entry: toEntry(existing.rows[0]), created: false };
+    const lane = laneForKind(input.kind);
     const seq = await c.query<{ seq: string }>(NEXT_SEQ_SQL, [
       input.conversationRef,
+      lane,
     ]);
     const inserted = await c.query<Row>(INSERT_SQL, [
       input.conversationRef,
+      lane,
       seq.rows[0].seq,
       input.kind,
       input.idempotencyKey,

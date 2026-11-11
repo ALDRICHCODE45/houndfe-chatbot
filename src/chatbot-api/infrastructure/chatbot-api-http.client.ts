@@ -4,7 +4,10 @@ import { ConfigService } from '@nestjs/config';
 import type { AxiosRequestConfig, AxiosResponse } from 'axios';
 import { lastValueFrom } from 'rxjs';
 import type { AppConfig } from '../../config/configuration';
-import { ChatbotApiClient } from '../domain/chatbot-api.client';
+import type {
+  ChatbotApiClient,
+  HumanRequestsClient,
+} from '../domain/chatbot-api.client';
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
 import {
   parseCatalogSearchResponse,
@@ -111,6 +114,28 @@ import type {
   RestockIntakeReceipt,
 } from '../domain/dtos/human-decisions.dto';
 import {
+  FEED_MAX_LIMIT,
+  FEED_MAX_WAIT_SECONDS,
+  isCreateHumanRequestInput,
+  normalizeDeliveryOutcome,
+  parseDeliveryOutcomeAck,
+  parseFeedPage,
+  parseHumanRequestCancelled,
+  parseHumanRequestCreated,
+  parsePendingDeliveries,
+  toCreateHumanRequestBody,
+  type CancelHumanRequestInput,
+  type CancelHumanRequestResult,
+  type CreateHumanRequestInput,
+  type CreateHumanRequestResult,
+  type DeliveryOutcomeInput,
+  type PendingDeliveriesFilter,
+  type PendingDeliveriesResult,
+  type ReadFeedOptions,
+  type ReadFeedResult,
+  type RecordDeliveryOutcomeResult,
+} from '../domain/dtos/human-requests.dto';
+import {
   AuthError,
   BranchMismatchError,
   ChatbotApiError,
@@ -142,6 +167,9 @@ export const CHATBOT_API_TIMEOUTS_MS = {
   shippingQuote: 45_000,
   receiptUpload: RECEIPT_UPLOAD_TIMEOUT_MS,
 } as const;
+/** The feed long-poll timeout is `waitSeconds * 1000 + FEED_TIMEOUT_SLACK_MS`,
+ *  so a healthy empty long-poll (25 s) never times out (≈35 s). */
+export const FEED_TIMEOUT_SLACK_MS = 10_000;
 const DECISION_ID_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Canonical lowercase RFC UUID v1–v8 with variant bits 8/9/a/b (nil uppercase/whitespace rejected). */
@@ -150,7 +178,9 @@ const EXPIRATION_DECISION_ID_UUID =
 export const CHATBOT_API_SLEEP = Symbol('CHATBOT_API_SLEEP');
 
 @Injectable()
-export class ChatbotApiHttpClient implements ChatbotApiClient {
+export class ChatbotApiHttpClient
+  implements ChatbotApiClient, HumanRequestsClient
+{
   constructor(
     private readonly httpService: HttpService,
     private readonly configService: ConfigService,
@@ -1044,6 +1074,309 @@ export class ChatbotApiHttpClient implements ChatbotApiClient {
   }
 
   /**
+   * `POST /chatbot-api/requests` (5a). The input is checked locally (the
+   * backend owns full validation) and only known keys go on the wire, with
+   * `X-Idempotency-Key` = `sourceRequestId`. Exactly one POST; documented
+   * errors resolve as typed results, transport failures reject.
+   */
+  async createHumanRequest(
+    input: CreateHumanRequestInput,
+  ): Promise<CreateHumanRequestResult> {
+    if (!isCreateHumanRequestInput(input)) {
+      throw new ChatbotApiError(
+        'Human request input failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>({
+        method: 'POST',
+        url: '/chatbot-api/requests',
+        data: toCreateHumanRequestBody(input),
+        headers: { 'X-Idempotency-Key': input.sourceRequestId },
+      });
+    } catch (error) {
+      const failure = documentedFailure(error);
+      if (failure === null) throw error;
+      const { status, code, body, retryAfterSeconds } = failure;
+      if (status === 409 && code === 'CUSTOMER_OPEN_LIMIT')
+        return {
+          kind: code,
+          limit: numberField(body, 'limit'),
+          open: numberField(body, 'open'),
+        };
+      if (status === 429 && code === 'CUSTOMER_RATE_LIMITED')
+        return {
+          kind: code,
+          limit: numberField(body, 'limit'),
+          retryAfterSeconds,
+        };
+      if (status === 429) return { kind: 'RATE_LIMITED', retryAfterSeconds };
+      if (
+        (status === 409 &&
+          (code === 'IDEMPOTENCY_CONFLICT' || code === 'VERSION_CONFLICT')) ||
+        (status === 422 &&
+          (code === 'SUBTYPE_DISABLED' || code === 'SCHEDULING_DISABLED'))
+      )
+        return { kind: code };
+      if (status === 400)
+        return { kind: 'VALIDATION_ERROR', message: messageField(body) };
+      if (status === 404) return { kind: 'NOT_FOUND' };
+      throw error;
+    }
+    const created = parseHumanRequestCreated(response.data);
+    if ((response.status !== 201 && response.status !== 200) || !created) {
+      throw new UpstreamError(
+        'Chatbot API create request response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return { kind: 'ok', status: response.status, response: created };
+  }
+
+  /** `POST /chatbot-api/requests/:id/cancel` (5a): exactly one POST with the
+   *  caller's key; the 200 must bind to the requested id. */
+  async cancelHumanRequest(
+    requestId: string,
+    input: CancelHumanRequestInput,
+    idempotencyKey: string,
+  ): Promise<CancelHumanRequestResult> {
+    if (requestId.trim() === '' || idempotencyKey.trim() === '') {
+      throw new ChatbotApiError(
+        'Human request cancel needs a request id and an idempotency key',
+        null,
+        undefined,
+        null,
+      );
+    }
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>({
+        method: 'POST',
+        url: `/chatbot-api/requests/${encodeURIComponent(requestId)}/cancel`,
+        data: {
+          reason: input.reason,
+          triggerWaMessageId: input.triggerWaMessageId,
+        },
+        headers: { 'X-Idempotency-Key': idempotencyKey },
+      });
+    } catch (error) {
+      const failure = documentedFailure(error);
+      if (failure === null) throw error;
+      const { status, code, body, retryAfterSeconds } = failure;
+      if (status === 409 && code === 'ALREADY_RESOLVED')
+        return {
+          kind: code,
+          resolution: (body as { resolution?: unknown })?.resolution ?? null,
+        };
+      if (
+        status === 409 &&
+        (code === 'REQUEST_CLOSED' ||
+          code === 'CANCEL_NOT_ALLOWED' ||
+          code === 'IDEMPOTENCY_CONFLICT')
+      )
+        return { kind: code };
+      if (status === 404) return { kind: 'NOT_FOUND' };
+      if (status === 429) return { kind: 'RATE_LIMITED', retryAfterSeconds };
+      throw error;
+    }
+    const cancelled = parseHumanRequestCancelled(response.data);
+    if (
+      response.status !== 200 ||
+      !cancelled ||
+      cancelled.id.toLowerCase() !== requestId.toLowerCase()
+    ) {
+      throw new UpstreamError(
+        'Chatbot API cancel request response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return { kind: 'ok', response: cancelled };
+  }
+
+  /**
+   * `GET /chatbot-api/feed` long-poll (5b). Options are validated locally
+   * (never clamped). Single attempt — the consumer loop owns reconnects and
+   * backoff — with a timeout of `waitSeconds * 1000 + FEED_TIMEOUT_SLACK_MS`.
+   * A page with any malformed item rejects with `UpstreamError`.
+   */
+  async readFeed(options: ReadFeedOptions = {}): Promise<ReadFeedResult> {
+    const {
+      after,
+      limit = FEED_MAX_LIMIT,
+      waitSeconds = FEED_MAX_WAIT_SECONDS,
+    } = options;
+    if (
+      (after !== undefined && (typeof after !== 'string' || after === '')) ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > FEED_MAX_LIMIT ||
+      !Number.isInteger(waitSeconds) ||
+      waitSeconds < 0 ||
+      waitSeconds > FEED_MAX_WAIT_SECONDS
+    ) {
+      throw new ChatbotApiError(
+        'Feed read options are out of contract',
+        null,
+        undefined,
+        null,
+      );
+    }
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>({
+        method: 'GET',
+        url: '/chatbot-api/feed',
+        params: {
+          ...(after === undefined ? {} : { after }),
+          limit,
+          waitSeconds,
+        },
+        timeout: waitSeconds * 1000 + FEED_TIMEOUT_SLACK_MS,
+      });
+    } catch (error) {
+      const failure = documentedFailure(error);
+      if (failure?.status === 410 && failure.code === 'CURSOR_EXPIRED')
+        return { kind: 'CURSOR_EXPIRED' };
+      if (failure?.status === 429)
+        return {
+          kind: 'RATE_LIMITED',
+          retryAfterSeconds: failure.retryAfterSeconds,
+        };
+      throw error;
+    }
+    const page = parseFeedPage(response.data);
+    if (response.status !== 200 || page === null) {
+      throw new UpstreamError(
+        'Chatbot API feed response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return { kind: 'ok', ...page };
+  }
+
+  /** `POST /chatbot-api/deliveries/:deliveryId/outcome` (5b). The exact
+   *  variant body is validated before any HTTP; exactly one POST; the 200 must
+   *  bind to the delivery, `attemptId` and outcome sent. */
+  async recordDeliveryOutcome(
+    deliveryId: string,
+    input: DeliveryOutcomeInput,
+  ): Promise<RecordDeliveryOutcomeResult> {
+    const sent = normalizeDeliveryOutcome(input);
+    if (deliveryId.trim() === '' || sent === null) {
+      throw new ChatbotApiError(
+        'Delivery outcome failed local validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>({
+        method: 'POST',
+        url: `/chatbot-api/deliveries/${encodeURIComponent(deliveryId)}/outcome`,
+        data: sent,
+      });
+    } catch (error) {
+      const failure = documentedFailure(error);
+      if (failure === null) throw error;
+      const { status, code, body, retryAfterSeconds } = failure;
+      if (
+        status === 409 &&
+        (code === 'IDEMPOTENCY_CONFLICT' || code === 'OUTCOME_ALREADY_RECORDED')
+      )
+        return { kind: code };
+      if (status === 422 && code === 'OUTCOME_NOT_ALLOWED')
+        return { kind: code };
+      if (status === 404) return { kind: 'NOT_FOUND' };
+      if (status === 429) return { kind: 'RATE_LIMITED', retryAfterSeconds };
+      if (status === 400)
+        return { kind: 'VALIDATION_ERROR', message: messageField(body) };
+      throw error;
+    }
+    const ack = parseDeliveryOutcomeAck(response.data);
+    if (
+      response.status !== 200 ||
+      ack === null ||
+      ack.deliveryId.toLowerCase() !== deliveryId.toLowerCase() ||
+      ack.attemptId !== sent.attemptId ||
+      ack.outcome !== sent.outcome
+    ) {
+      throw new UpstreamError(
+        'Chatbot API delivery outcome response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return { kind: 'ok', response: ack };
+  }
+
+  /** `GET /chatbot-api/requests/pending-deliveries` (5b) with exactly one
+   *  non-empty filter; safe GET retry policy; feed item validation. */
+  async listPendingDeliveries(
+    filter: PendingDeliveriesFilter,
+  ): Promise<PendingDeliveriesResult> {
+    const { conversationRef, requestId } = filter as {
+      conversationRef?: unknown;
+      requestId?: unknown;
+    };
+    const given = [conversationRef, requestId].filter((v) => v !== undefined);
+    if (
+      given.length !== 1 ||
+      typeof given[0] !== 'string' ||
+      given[0].trim() === ''
+    ) {
+      throw new ChatbotApiError(
+        'Pending deliveries needs exactly one of conversationRef or requestId',
+        null,
+        undefined,
+        null,
+      );
+    }
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>(
+        {
+          method: 'GET',
+          url: '/chatbot-api/requests/pending-deliveries',
+          params:
+            conversationRef === undefined ? { requestId } : { conversationRef },
+        },
+        { retryable: true },
+      );
+    } catch (error) {
+      const failure = documentedFailure(error);
+      if (failure?.status === 429)
+        return {
+          kind: 'RATE_LIMITED',
+          retryAfterSeconds: failure.retryAfterSeconds,
+        };
+      throw error;
+    }
+    const items = parsePendingDeliveries(response.data);
+    if (response.status !== 200 || items === null) {
+      throw new UpstreamError(
+        'Chatbot API pending deliveries response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return { kind: 'ok', items };
+  }
+
+  /**
    * Shared single-branch auth envelope: base URL + `Authorization` and
    * `X-Branch-Id` headers (ADR-16), applied identically to every
    * chatbot-api request including the attachment-only transport. A request
@@ -1249,6 +1582,54 @@ function defaultSleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
+}
+
+/**
+ * The status, scoped `code` and Retry-After of a mapped HTTP error, or null
+ * for a transport failure (no status). The scoped `{statusCode, code}`
+ * envelope wins over a NestJS `error` label such as `"Conflict"`.
+ */
+function documentedFailure(error: unknown): {
+  status: number;
+  code: string | null;
+  body: unknown;
+  retryAfterSeconds: number | null;
+} | null {
+  if (!(error instanceof ChatbotApiError) || error.statusCode === null)
+    return null;
+  const body = error.responseBody;
+  const scoped =
+    typeof body === 'object' && body !== null
+      ? (body as { code?: unknown }).code
+      : undefined;
+  return {
+    status: error.statusCode,
+    code:
+      typeof scoped === 'string' && scoped !== '' ? scoped : error.errorCode,
+    body,
+    retryAfterSeconds:
+      error instanceof RateLimitError ? error.retryAfterSeconds : null,
+  };
+}
+
+function numberField(body: unknown, key: string): number | null {
+  const value =
+    typeof body === 'object' && body !== null
+      ? (body as Record<string, unknown>)[key]
+      : undefined;
+  return Number.isSafeInteger(value) ? (value as number) : null;
+}
+
+/** The backend's validation message (a string or class-validator list). */
+function messageField(body: unknown): string | null {
+  const value =
+    typeof body === 'object' && body !== null
+      ? (body as { message?: unknown }).message
+      : undefined;
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.every((m) => typeof m === 'string'))
+    return value.join('; ');
+  return null;
 }
 
 /** Module-level flag so the legacy-omission warning logs at most once. */

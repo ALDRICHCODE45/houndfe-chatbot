@@ -36,8 +36,8 @@ const DAY_MS = 24 * 3_600_000;
 
 /**
  * Drains `backend_outbox` (S2): each tick claims up to `batchSize`
- * conversation heads under a lease and delivers them concurrently (they
- * belong to different conversations, so order is preserved). DELIVERED →
+ * lane heads under a lease and delivers them concurrently (they belong to
+ * different (conversation, lane) pairs, so order is preserved). DELIVERED →
  * DONE; RETRY or a thrown error → PENDING again with capped exponential
  * backoff and jitter (or the backend's Retry-After), retried forever;
  * PERMANENT → DEAD with an error log, which unblocks the next seq. DONE rows

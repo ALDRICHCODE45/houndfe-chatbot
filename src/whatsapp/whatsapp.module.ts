@@ -12,6 +12,7 @@ import { ConversationModule } from '../conversation/conversation.module';
 import { ConversationTranscriptModule } from '../conversation-transcript/conversation-transcript.module';
 import { DatabaseModule } from '../database/database.module';
 import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
+import { HumanRequestsServicesModule } from '../human-requests/human-requests.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
 import { ProductImageModule } from '../product-image/product-image.module';
@@ -40,6 +41,9 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
  *   - `WebhookDedupPurgeWorker` (S6 retention: 8 days; only `AppModule`
  *     imports this module, so it runs once per process)
  *   - `BackendOutboxEnqueueModule` (S3 Meta statuses → backend outbox)
+ *   - `HumanRequestsServicesModule` (S5: the dispatcher replays pending team
+ *     deliveries on each customer inbound; services only, the feed consumer
+ *     runs from `AppModule`)
  *
  * The outbound sender lives in `WhatsappSenderModule` (ADR-30) and is
  * re-exported here so any existing consumer of `WHATSAPP_SENDER` keeps
@@ -60,6 +64,7 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
     WhatsappSenderModule,
     ReceiptMediaModule,
     ProductImageModule,
+    HumanRequestsServicesModule,
   ],
   controllers: [WebhookController],
   providers: [

@@ -48,6 +48,18 @@ import type {
   ReceiptUploadResponse,
 } from './dtos/receipt-upload.dto';
 import type { ReceiptOutcome } from './dtos/receipt-outcome.dto';
+import type {
+  CancelHumanRequestInput,
+  CancelHumanRequestResult,
+  CreateHumanRequestInput,
+  CreateHumanRequestResult,
+  DeliveryOutcomeInput,
+  PendingDeliveriesFilter,
+  PendingDeliveriesResult,
+  ReadFeedOptions,
+  ReadFeedResult,
+  RecordDeliveryOutcomeResult,
+} from './dtos/human-requests.dto';
 
 export const CHATBOT_API_CLIENT = Symbol('CHATBOT_API_CLIENT');
 
@@ -183,4 +195,47 @@ export interface ChatbotApiClient {
   /** DELIVERY_ZONE poll: `GET /chatbot-api/human-decisions/:id` by requester id
    *  (scope `human-decisions:read`), safe GET retry policy. */
   getDeliveryZoneRequester(requesterId: string): Promise<DeliveryZoneRequester>;
+}
+
+export const HUMAN_REQUESTS_CLIENT = Symbol('HUMAN_REQUESTS_CLIENT');
+
+/**
+ * Human requests and feed (docs/contracts/human-intervention-requests-5a.md,
+ * docs/contracts/human-intervention-bot-contract-5b.md), a separate port so
+ * existing `ChatbotApiClient` fakes stay valid. Implemented by the same HTTP
+ * adapter. Documented business errors resolve as typed results discriminated
+ * by `kind`; transport failures (401/403, 5xx, network, undocumented codes,
+ * malformed bodies) reject with `ChatbotApiError` subclasses as everywhere
+ * else.
+ */
+export interface HumanRequestsClient {
+  /** `POST /chatbot-api/requests` (scope `requests:create`), single attempt,
+   *  `X-Idempotency-Key` = `sourceRequestId`. `CUSTOMER_RATE_LIMITED` must
+   *  not be auto-retried. */
+  createHumanRequest(
+    input: CreateHumanRequestInput,
+  ): Promise<CreateHumanRequestResult>;
+  /** `POST /chatbot-api/requests/:id/cancel` (scope `requests:cancel`),
+   *  single attempt with the caller's idempotency key. */
+  cancelHumanRequest(
+    requestId: string,
+    input: CancelHumanRequestInput,
+    idempotencyKey: string,
+  ): Promise<CancelHumanRequestResult>;
+  /** `GET /chatbot-api/feed` long-poll (scope `feed:read`). No retries: the
+   *  consumer loop decides. The request timeout exceeds `waitSeconds` by
+   *  `FEED_TIMEOUT_SLACK_MS`. Unknown item types surface as `type: 'unknown'`;
+   *  a malformed item rejects the page with `UpstreamError`. */
+  readFeed(options?: ReadFeedOptions): Promise<ReadFeedResult>;
+  /** `POST /chatbot-api/deliveries/:deliveryId/outcome` (scope `feed:ack`),
+   *  single attempt; retry a lost ACK with the same body. */
+  recordDeliveryOutcome(
+    deliveryId: string,
+    input: DeliveryOutcomeInput,
+  ): Promise<RecordDeliveryOutcomeResult>;
+  /** `GET /chatbot-api/requests/pending-deliveries` (scope `feed:read`) with
+   *  exactly one filter; safe GET retry policy. */
+  listPendingDeliveries(
+    filter: PendingDeliveriesFilter,
+  ): Promise<PendingDeliveriesResult>;
 }
