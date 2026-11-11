@@ -113,3 +113,73 @@ Scope `feed:read`, class `read`. Exactly one filter. Returns `{items: [...]}` (f
 - Store `deliveryId` as a unique key before calling Meta; if a send is uncertain, report `DELIVERY_UNKNOWN` and do not retry.
 - While both paths exist (feed and legacy poll of the same decision), track by `legacyId`: whichever arrives first is delivered; the other is ACKed `STALE` (feed) or ignored (poll).
 - One consumer per branch.
+
+## Slice 5c (live on the dev backend at ce503ea2, 2026-11-11)
+
+### `DEFERRED_HUMAN_SESSION` and `deferredReason`
+
+`DEFERRED_HUMAN_SESSION` is live: non-terminal, same body as `DEFERRED_WINDOW_CLOSED` (`attemptId`, `attemptedAt`, no `providerMessageId`), `422 OUTCOME_NOT_ALLOWED` on `request.cancelled`. Pending deliveries now return both deferrals (up to 50, ascending cursor), in the feed item shape plus `deferredReason`:
+
+| `deferredReason` | Replay it when                                                                                                                            |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `WINDOW_CLOSED`  | The customer writes again (the 24 h window is open). Deliver and ACK with a new `attemptId`.                                              |
+| `HUMAN_SESSION`  | The human session ended (`conversation.ended`, unit 11) or the conversation's next bot-mode turn. Deliver and ACK with a new `attemptId`. |
+
+### Recovery after `410 CURSOR_EXPIRED` — `GET /chatbot-api/requests?status=open&updatedSince=<ISO>&cursor=&limit=50`
+
+Scope `requests:read`, class `read`.
+
+| Param          | Rule                                                                                                                                                                                                                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`       | Required, exactly `open`.                                                                                                                                                                                                                                                                                |
+| `updatedSince` | Optional, canonical UTC `YYYY-MM-DDTHH:mm:ss.sssZ`. Adds requests **closed at or after** it (`RESOLVED`/`CANCELLED`); the backend reaches 5 s earlier (replica clock skew), so dedupe by `id`. Open requests are always all returned. Send an instant earlier than your last complete sync, never later. |
+| `cursor`       | The previous page's `nextPage`; omit for the first page. Opaque.                                                                                                                                                                                                                                         |
+| `limit`        | 1..50, default 50.                                                                                                                                                                                                                                                                                       |
+
+Anything else is `400 VALIDATION_ERROR`. Pages ordered by `(updatedAt, id)`, keyset-paginated; a request updated during the walk may be seen again, none is skipped.
+
+```json
+{
+  "items": [
+    {
+      "id": "9a7e…",
+      "folio": "S-000123",
+      "kind": "DECISION",
+      "subtype": "RESTOCK",
+      "status": "RESOLVED",
+      "conversationRef": "wa:5215512345678",
+      "legacyId": "5d0c…",
+      "whatsappWindowClosesAt": "2026-11-11T16:20:00.000Z",
+      "cancelReason": null,
+      "createdAt": "2026-11-10T10:00:00.000Z",
+      "updatedAt": "2026-11-10T16:00:00.000Z",
+      "closedAt": "2026-11-10T16:00:00.000Z",
+      "pendingDeliveries": [
+        {
+          "cursor": "000000001842",
+          "deliveryId": "b1c0…",
+          "type": "request.answered",
+          "requestId": "9a7e…",
+          "conversationRef": "wa:5215512345678",
+          "payload": { "kind": "DECISION", "…": "…" },
+          "notBefore": null,
+          "expiresAt": null,
+          "deferredReason": null
+        }
+      ],
+      "undeliveredTruncated": false,
+      "undeliveredResumeAfter": null
+    }
+  ],
+  "nextCursor": "000000001900",
+  "nextPage": "eyJ1Ijoi…"
+}
+```
+
+- `conversationRef` contains the customer's phone: keep it out of logs.
+- `pendingDeliveries`: the request's latest 5 feed items with no terminal outcome, oldest first, feed shape plus `deferredReason` (`null` if no attempt was reported). A closed request keeps showing its answer until acknowledged.
+- `undeliveredTruncated` / `undeliveredResumeAfter`: when more than 5 are undelivered, `true` and the feed `after` that re-serves the oldest one; otherwise `false`/`null`. Resume from the **smallest** of every `undeliveredResumeAfter` and `nextCursor`, comparing the fixed-width strings (no arithmetic); dedupe by `deliveryId`. Do not use pending-deliveries for this.
+- `nextCursor`: the tenant feed position when the first page was served; the same on every page of one walk; never below the retention watermark.
+- `nextPage`: next page cursor, `null` on the last page.
+
+Procedure: (1) stop using the expired cursor; (2) call with `status=open` and `updatedSince` = the last instant your state was complete (omit if unknown); (3) walk every page until `nextPage` is null, keeping the first page's `nextCursor`; (4) reconcile records: `NEW`/`IN_PROGRESS` → hold a pending record; `RESOLVED`/`CANCELLED`, or a local record not listed as open → drop it; handle each `pendingDeliveries` item as a feed item (dedupe by `deliveryId`, ACK each); (5) only after every page is processed and saved, store as the feed position `nextCursor` (or the smaller `undeliveredResumeAfter`) and resume `GET /chatbot-api/feed?after=<that>`.
