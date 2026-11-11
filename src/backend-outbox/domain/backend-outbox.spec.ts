@@ -1,12 +1,33 @@
 import {
+  BACKEND_OUTBOX_KINDS,
   BACKOFF_MAX_MS,
   RETRY_AFTER_MAX_MS,
   backoffDelayMs,
   classifyBackendResponse,
   conversationRefFor,
   isConversationRef,
+  laneForKind,
   parseRetryAfterMs,
 } from './backend-outbox';
+
+describe('laneForKind', () => {
+  it('puts transcript facts in MIRROR and request/session facts in CONTROL', () => {
+    expect(
+      Object.fromEntries(BACKEND_OUTBOX_KINDS.map((k) => [k, laneForKind(k)])),
+    ).toEqual({
+      MESSAGE_MIRROR: 'MIRROR',
+      MESSAGE_STATUS: 'MIRROR',
+      REQUEST_CREATE: 'CONTROL',
+      REQUEST_CANCEL: 'CONTROL',
+      SESSION_ACK: 'CONTROL',
+      DELIVERY_OUTCOME: 'CONTROL',
+    });
+  });
+
+  it('throws on an unknown kind', () => {
+    expect(() => laneForKind('NOPE' as never)).toThrow(RangeError);
+  });
+});
 
 describe('backoffDelayMs', () => {
   it('doubles from ~1 s with equal jitter', () => {

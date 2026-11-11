@@ -5,7 +5,7 @@ import type { PoolClient } from 'pg';
  * backend must learn from the bot (transcript mirror, outbound wamids,
  * statuses, request creations/cancellations, session ACKs, feed delivery
  * outcomes) is committed here first and drained by a worker, in strict
- * per-conversation `seq` order, through `BackendOutboxDeliveryPort`.
+ * `seq` order per (conversation, lane), through `BackendOutboxDeliveryPort`.
  */
 export const BACKEND_OUTBOX_KINDS = [
   'MESSAGE_MIRROR',
@@ -16,6 +16,29 @@ export const BACKEND_OUTBOX_KINDS = [
   'DELIVERY_OUTCOME',
 ] as const;
 export type BackendOutboxKind = (typeof BACKEND_OUTBOX_KINDS)[number];
+
+/**
+ * Ordering lanes. Order is strict within (conversation, lane) and lanes of
+ * one conversation never block each other, so a request create/cancel is
+ * not stuck behind transcript rows that keep retrying.
+ */
+export type BackendOutboxLane = 'MIRROR' | 'CONTROL';
+
+const LANE_BY_KIND: Readonly<Record<BackendOutboxKind, BackendOutboxLane>> = {
+  MESSAGE_MIRROR: 'MIRROR',
+  MESSAGE_STATUS: 'MIRROR',
+  REQUEST_CREATE: 'CONTROL',
+  REQUEST_CANCEL: 'CONTROL',
+  SESSION_ACK: 'CONTROL',
+  DELIVERY_OUTCOME: 'CONTROL',
+};
+
+/** The lane a kind is ordered in (mirrored by the 4400 migration CHECK). */
+export function laneForKind(kind: BackendOutboxKind): BackendOutboxLane {
+  if (!Object.prototype.hasOwnProperty.call(LANE_BY_KIND, kind))
+    throw new RangeError('backend outbox: unknown kind');
+  return LANE_BY_KIND[kind];
+}
 
 export type BackendOutboxStatus = 'PENDING' | 'IN_FLIGHT' | 'DONE' | 'DEAD';
 
@@ -62,7 +85,8 @@ export const BACKEND_OUTBOX_STORE = Symbol('BACKEND_OUTBOX_STORE');
 
 export interface BackendOutboxStore {
   /**
-   * Allocates the next per-conversation `seq` and inserts a PENDING row.
+   * Allocates the next `seq` of the (conversation, lane of the kind) and
+   * inserts a PENDING row.
    * A duplicate idempotency key returns the existing row untouched. With a
    * `client`, the write joins the caller's open transaction (the caller
    * commits); without one it runs in its own transaction.
@@ -73,7 +97,7 @@ export interface BackendOutboxStore {
   ): Promise<BackendOutboxEnqueueResult>;
 
   /**
-   * Claims up to `limit` conversation heads: per conversation only the
+   * Claims up to `limit` lane heads: per (conversation, lane) only the
    * lowest seq that is neither DONE nor DEAD, and only when it is due
    * (PENDING with `next_attempt_at <= now`) or its lease expired.
    */

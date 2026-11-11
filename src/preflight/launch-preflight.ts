@@ -98,6 +98,8 @@ export const REQUIRED_MIGRATIONS = [
   '4100000000000_processed_webhook_messages_claims.js',
   // Human request feed consumer: cursor, delivery ledger, request registry.
   '4300000000000_human_request_feed.js',
+  // Backend outbox ordering lanes (requests never wait behind mirror rows).
+  '4400000000000_backend_outbox_lanes.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

@@ -215,6 +215,12 @@ describe('runLaunchPreflight', () => {
     );
   });
 
+  it('requires the backend outbox lanes migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain(
+      '4400000000000_backend_outbox_lanes.js',
+    );
+  });
+
   it('requires the webhook dedup claims migration', () => {
     expect(REQUIRED_MIGRATIONS).toContain(
       '4100000000000_processed_webhook_messages_claims.js',

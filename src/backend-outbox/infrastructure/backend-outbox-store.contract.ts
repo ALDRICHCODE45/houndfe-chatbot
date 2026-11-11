@@ -1,13 +1,15 @@
 import type {
   BackendOutboxEnqueueInput,
+  BackendOutboxKind,
   BackendOutboxStore,
 } from '../domain/backend-outbox';
 
 /**
- * Shared contract for every `BackendOutboxStore` adapter: per-conversation
- * seq allocation, idempotent enqueue, strict head-of-line claiming (a
- * failing head blocks only its own conversation), lease fencing and
- * expiry, backoff scheduling, DEAD letting the next seq proceed, purge.
+ * Shared contract for every `BackendOutboxStore` adapter: seq allocation
+ * per (conversation, lane), idempotent enqueue, strict head-of-line
+ * claiming per lane (a failing head blocks only its own conversation lane),
+ * lease fencing and expiry, backoff scheduling, DEAD letting the next seq
+ * proceed, purge.
  */
 export type BackendOutboxStoreFactory = () => Promise<{
   store: BackendOutboxStore;
@@ -27,12 +29,20 @@ const input = (
   conversationRef: string,
   idempotencyKey: string,
   payload: Record<string, unknown> = { n: idempotencyKey },
+  kind: BackendOutboxKind = 'MESSAGE_MIRROR',
 ): BackendOutboxEnqueueInput => ({
   conversationRef,
-  kind: 'MESSAGE_MIRROR',
+  kind,
   idempotencyKey,
   payload,
 });
+
+const control = (
+  conversationRef: string,
+  idempotencyKey: string,
+  kind: BackendOutboxKind,
+): BackendOutboxEnqueueInput =>
+  input(conversationRef, idempotencyKey, { n: idempotencyKey }, kind);
 
 export function runBackendOutboxStoreContract(
   label: string,
@@ -70,6 +80,66 @@ export function runBackendOutboxStoreContract(
       });
       expect(a1.entry.createdAt).toBeInstanceOf(Date);
       expect(a1.entry.nextAttemptAt).toBeInstanceOf(Date);
+    });
+
+    it('allocates seq per lane: mirror and control lanes both start at 1', async () => {
+      const m1 = await store.enqueue(input(A, 'm1'));
+      const c1 = await store.enqueue(control(A, 'c1', 'REQUEST_CREATE'));
+      const s2 = await store.enqueue(input(A, 's2', {}, 'MESSAGE_STATUS'));
+      const c2 = await store.enqueue(control(A, 'c2', 'SESSION_ACK'));
+      const c3 = await store.enqueue(control(A, 'c3', 'DELIVERY_OUTCOME'));
+      expect(
+        [m1, c1, s2, c2, c3].map((r) => [r.entry.idempotencyKey, r.entry.seq]),
+      ).toEqual([
+        ['m1', 1],
+        ['c1', 1],
+        ['s2', 2],
+        ['c2', 2],
+        ['c3', 3],
+      ]);
+    });
+
+    it('a control head is claimable while a mirror head of the same conversation is stuck retrying', async () => {
+      await store.enqueue(input(A, 'm1'));
+      await store.enqueue(input(A, 'm2', {}, 'MESSAGE_STATUS'));
+      await store.enqueue(control(A, 'c1', 'REQUEST_CREATE'));
+      await store.enqueue(control(A, 'c2', 'REQUEST_CANCEL'));
+      const first = await store.claimHeads(20, OWNER, LEASE_MS);
+      expect(first.map((e) => e.idempotencyKey).sort()).toEqual(['c1', 'm1']);
+      const m1 = first.find((e) => e.idempotencyKey === 'm1')!;
+      const c1 = first.find((e) => e.idempotencyKey === 'c1')!;
+      // The mirror lane keeps retrying (not wired) far into the future.
+      await expect(store.reschedule(m1, 60_000, 'not wired')).resolves.toBe(
+        true,
+      );
+      await expect(store.claimHeads(20, OWNER, LEASE_MS)).resolves.toEqual([]);
+      await expect(store.markDone(c1)).resolves.toBe(true);
+      // Control order is kept within its lane; m2 still waits behind m1.
+      const second = await store.claimHeads(20, OWNER, LEASE_MS);
+      expect(second.map((e) => e.idempotencyKey)).toEqual(['c2']);
+      await expect(store.markDone(second[0])).resolves.toBe(true);
+      await expect(store.claimHeads(20, OWNER, LEASE_MS)).resolves.toEqual([]);
+    });
+
+    it('keeps strict order within each lane of one conversation', async () => {
+      for (let n = 1; n <= 3; n++) {
+        await store.enqueue(input(A, `m${n}`));
+        await store.enqueue(control(A, `c${n}`, 'REQUEST_CREATE'));
+      }
+      const delivered: string[][] = [];
+      for (let round = 0; round < 3; round++) {
+        const claimed = await store.claimHeads(20, OWNER, LEASE_MS);
+        delivered.push(claimed.map((e) => e.idempotencyKey).sort());
+        for (const entry of claimed)
+          if (entry.idempotencyKey === 'c2') await store.markDead(entry, '422');
+          else await store.markDone(entry);
+      }
+      expect(delivered).toEqual([
+        ['c1', 'm1'],
+        ['c2', 'm2'],
+        ['c3', 'm3'],
+      ]);
+      await expect(store.claimHeads(20, OWNER, LEASE_MS)).resolves.toEqual([]);
     });
 
     it('a duplicate idempotency key is a no-op returning the existing row', async () => {
