@@ -396,6 +396,13 @@ export class HumanRequestDeliveryService {
   private async plan(row: DeliveryRow): Promise<Plan> {
     const item = row.item;
     if (item.type === 'unknown') {
+      if (item.rawType === 'request.merged') {
+        // Never log the raw item: it carries the customer's conversationRef.
+        this.logger.warn(
+          `feed item ${row.deliveryId} request.merged was malformed: ACK STALE; the merged request may stay open in the registry`,
+        );
+        return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+      }
       this.logger.warn(
         `feed item ${row.deliveryId} of unknown type ${item.rawType}: STALE`,
       );
