@@ -96,6 +96,8 @@ export const REQUIRED_MIGRATIONS = [
   '4200000000000_conversation_gates.js',
   // Webhook dedup claims with a lease, recorded before replying (S6).
   '4100000000000_processed_webhook_messages_claims.js',
+  // Human request feed consumer: cursor, delivery ledger, request registry.
+  '4300000000000_human_request_feed.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

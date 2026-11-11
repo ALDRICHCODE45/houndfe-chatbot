@@ -209,6 +209,12 @@ describe('runLaunchPreflight', () => {
     );
   });
 
+  it('requires the human request feed migration', () => {
+    expect(REQUIRED_MIGRATIONS).toContain(
+      '4300000000000_human_request_feed.js',
+    );
+  });
+
   it('requires the webhook dedup claims migration', () => {
     expect(REQUIRED_MIGRATIONS).toContain(
       '4100000000000_processed_webhook_messages_claims.js',

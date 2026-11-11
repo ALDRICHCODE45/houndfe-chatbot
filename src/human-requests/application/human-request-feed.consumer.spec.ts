@@ -1,0 +1,259 @@
+import { Logger } from '@nestjs/common';
+import type {
+  FeedItem,
+  ReadFeedOptions,
+  ReadFeedResult,
+} from '../../chatbot-api/domain/dtos/human-requests.dto';
+import type { FeedConsumerLock } from '../domain/human-request-feed';
+import { cancelledItem } from '../infrastructure/human-request-feed-store.contract';
+import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
+import { HumanRequestFeedConsumer } from './human-request-feed.consumer';
+
+class ScriptedFeed {
+  readonly calls: ReadFeedOptions[] = [];
+  constructor(private readonly script: Array<ReadFeedResult | Error>) {}
+  readFeed(options: ReadFeedOptions = {}): Promise<ReadFeedResult> {
+    this.calls.push(options);
+    const next = this.script.shift();
+    if (next === undefined)
+      return Promise.resolve({
+        kind: 'ok',
+        items: [],
+        nextCursor: options.after ?? '',
+      });
+    return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
+  }
+}
+
+class FakeLock implements FeedConsumerLock {
+  held = false;
+  released = 0;
+  constructor(private readonly grants: boolean[] = []) {}
+  tryAcquire(): Promise<boolean> {
+    this.held = this.grants.shift() ?? true;
+    return Promise.resolve(this.held);
+  }
+  isHeld(): Promise<boolean> {
+    return Promise.resolve(this.held);
+  }
+  release(): Promise<void> {
+    this.held = false;
+    this.released += 1;
+    return Promise.resolve();
+  }
+}
+
+const page = (items: FeedItem[], nextCursor: string): ReadFeedResult => ({
+  kind: 'ok',
+  items,
+  nextCursor,
+});
+
+describe('HumanRequestFeedConsumer', () => {
+  let warn: jest.SpyInstance;
+  let error: jest.SpyInstance;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    error = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const build = (
+    script: Array<ReadFeedResult | Error>,
+    accept: (item: FeedItem) => Promise<void> = () => Promise.resolve(),
+    lock = new FakeLock(),
+  ) => {
+    const store = new InMemoryHumanRequestFeedStore();
+    const feed = new ScriptedFeed(script);
+    const accepted: string[] = [];
+    const sleeps: number[] = [];
+    const consumer = new HumanRequestFeedConsumer(
+      {
+        store,
+        client: feed,
+        delivery: {
+          accept: async (item) => {
+            await accept(item);
+            accepted.push(item.deliveryId);
+          },
+        },
+        lock,
+      },
+      {
+        random: () => 1,
+        sleep: (ms) => {
+          sleeps.push(ms);
+          return Promise.resolve();
+        },
+      },
+    );
+    return { store, feed, accepted, sleeps, consumer, lock };
+  };
+
+  it('long-polls from the stored cursor and saves nextCursor after the page', async () => {
+    const { store, feed, accepted, consumer } = build([
+      page([cancelledItem('a'), cancelledItem('b')], '000000000002'),
+    ]);
+    await store.saveCursor('000000000000');
+    await expect(consumer.runOnce()).resolves.toEqual({
+      kind: 'page',
+      items: 2,
+    });
+    expect(feed.calls).toEqual([
+      { after: '000000000000', limit: 50, waitSeconds: 25 },
+    ]);
+    expect(accepted).toEqual(['a', 'b']);
+    await expect(store.readCursor()).resolves.toBe('000000000002');
+  });
+
+  it('starts from the oldest item with no stored cursor', async () => {
+    const { feed, consumer } = build([page([], '')]);
+    await consumer.runOnce();
+    expect(feed.calls[0]).toEqual({ limit: 50, waitSeconds: 25 });
+  });
+
+  it('a failing item leaves the cursor where it was (the page is re-read)', async () => {
+    let fail = true;
+    const { store, accepted, consumer } = build(
+      [
+        page([cancelledItem('a'), cancelledItem('b')], '000000000002'),
+        page([cancelledItem('a'), cancelledItem('b')], '000000000002'),
+      ],
+      (item) =>
+        item.deliveryId === 'b' && fail
+          ? Promise.reject(new Error('db'))
+          : Promise.resolve(),
+    );
+    await store.saveCursor('000000000000');
+    await expect(consumer.runOnce()).rejects.toThrow('db');
+    await expect(store.readCursor()).resolves.toBe('000000000000');
+    fail = false;
+    await consumer.runOnce();
+    expect(accepted).toEqual(['a', 'a', 'b']);
+    await expect(store.readCursor()).resolves.toBe('000000000002');
+  });
+
+  it('CURSOR_EXPIRED restarts from the oldest item with a warning', async () => {
+    const { store, consumer } = build([{ kind: 'CURSOR_EXPIRED' }]);
+    await store.saveCursor('000000000009');
+    await expect(consumer.runOnce()).resolves.toEqual({ kind: 'restarted' });
+    await expect(store.readCursor()).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('CURSOR_EXPIRED'),
+    );
+  });
+
+  it('RATE_LIMITED reports the Retry-After delay', async () => {
+    const { consumer } = build([
+      { kind: 'RATE_LIMITED', retryAfterSeconds: 3 },
+    ]);
+    await expect(consumer.runOnce()).resolves.toEqual({
+      kind: 'rate_limited',
+      retryAfterMs: 3000,
+    });
+  });
+
+  describe('loop', () => {
+    it('consumes only while it holds the advisory lock; releases it on stop', async () => {
+      const lock = new FakeLock([false, true]);
+      const { feed, consumer, sleeps } = build(
+        [page([cancelledItem('a')], '1')],
+        undefined,
+        lock,
+      );
+      let ticks = 0;
+      // Stop after a few loop iterations.
+      const origRun = consumer.runOnce.bind(consumer);
+      jest.spyOn(consumer, 'runOnce').mockImplementation(async () => {
+        ticks += 1;
+        const result = await origRun();
+        if (ticks >= 2) void consumer.stop();
+        return result;
+      });
+      consumer.start();
+      await consumer.whenStopped();
+      // First acquisition failed: slept the lock retry, no read meanwhile.
+      expect(sleeps[0]).toBe(15_000);
+      expect(feed.calls.length).toBeGreaterThanOrEqual(1);
+      expect(lock.released).toBe(1);
+    });
+
+    it('backs off on throws and logs an error with the count for a stuck page', async () => {
+      const { consumer, sleeps } = build([
+        new Error('502'),
+        new Error('502'),
+        new Error('502'),
+        new Error('502'),
+      ]);
+      let ticks = 0;
+      const origRun = consumer.runOnce.bind(consumer);
+      jest.spyOn(consumer, 'runOnce').mockImplementation(async () => {
+        ticks += 1;
+        if (ticks >= 4) void consumer.stop();
+        return origRun();
+      });
+      consumer.start();
+      await consumer.whenStopped();
+      expect(sleeps.slice(0, 3)).toEqual([1_000, 2_000, 4_000]);
+      expect(error).toHaveBeenCalledWith(
+        expect.stringMatching(/stuck.*3 consecutive failures/),
+      );
+    });
+
+    it('honors Retry-After on RATE_LIMITED', async () => {
+      const { consumer, sleeps } = build([
+        { kind: 'RATE_LIMITED', retryAfterSeconds: 7 },
+      ]);
+      let ticks = 0;
+      const origRun = consumer.runOnce.bind(consumer);
+      jest.spyOn(consumer, 'runOnce').mockImplementation(async () => {
+        ticks += 1;
+        if (ticks >= 2) void consumer.stop();
+        return origRun();
+      });
+      consumer.start();
+      await consumer.whenStopped();
+      expect(sleeps).toEqual([7_000]);
+    });
+
+    it('reacquires when the lock is lost', async () => {
+      const lock = new FakeLock([true, true]);
+      const { consumer } = build([page([], '')], undefined, lock);
+      let ticks = 0;
+      const origRun = consumer.runOnce.bind(consumer);
+      const acquire = jest.spyOn(lock, 'tryAcquire');
+      jest.spyOn(consumer, 'runOnce').mockImplementation(async () => {
+        ticks += 1;
+        lock.held = false; // the lock connection dropped
+        if (ticks >= 2) void consumer.stop();
+        return origRun();
+      });
+      consumer.start();
+      await consumer.whenStopped();
+      expect(acquire).toHaveBeenCalledTimes(2);
+    });
+
+    it('stop does not wait for an open long-poll', async () => {
+      const store = new InMemoryHumanRequestFeedStore();
+      const never = new Promise<ReadFeedResult>(() => undefined);
+      const lock = new FakeLock();
+      const consumer = new HumanRequestFeedConsumer(
+        {
+          store,
+          client: { readFeed: () => never },
+          delivery: { accept: () => Promise.resolve() },
+          lock,
+        },
+        { sleep: () => Promise.resolve() },
+      );
+      consumer.start();
+      await new Promise((resolve) => setImmediate(resolve));
+      await consumer.stop();
+      expect(lock.released).toBe(1);
+    });
+  });
+});
