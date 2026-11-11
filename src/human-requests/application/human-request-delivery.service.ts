@@ -428,6 +428,16 @@ export class HumanRequestDeliveryService {
       };
     }
 
+    if (item.type === 'request.merged') {
+      // Informational: staff folded this request into another open one; the
+      // target keeps the customer's question, so nothing is sent.
+      await this.ports.store.closeRequest(item.requestId, 'CANCELLED');
+      this.logger.log(
+        `request ${item.requestId} merged into ${item.payload.intoRequestId}: STALE`,
+      );
+      return { action: 'stale', decision: 'DUPLICATE' };
+    }
+
     // request.cancelled: forget the request's pending state first.
     const payload = item.payload;
     await this.ports.store.closeRequest(payload.requestId, 'CANCELLED');
