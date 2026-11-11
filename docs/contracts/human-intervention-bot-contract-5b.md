@@ -183,3 +183,10 @@ Anything else is `400 VALIDATION_ERROR`. Pages ordered by `(updatedAt, id)`, key
 - `nextPage`: next page cursor, `null` on the last page.
 
 Procedure: (1) stop using the expired cursor; (2) call with `status=open` and `updatedSince` = the last instant your state was complete (omit if unknown); (3) walk every page until `nextPage` is null, keeping the first page's `nextCursor`; (4) reconcile records: `NEW`/`IN_PROGRESS` → hold a pending record; `RESOLVED`/`CANCELLED`, or a local record not listed as open → drop it; handle each `pendingDeliveries` item as a feed item (dedupe by `deliveryId`, ACK each); (5) only after every page is processed and saved, store as the feed position `nextCursor` (or the smaller `undeliveredResumeAfter`) and resume `GET /chatbot-api/feed?after=<that>`.
+
+## Staff merge — `request.merged` (agreed 2026-11-11, backend slice 4b, pending on the dev backend)
+
+- When staff merges a repeated request A into B (same customer, same subtype, both open, **same `conversationRef`**; otherwise `409 MERGE_NOT_ALLOWED`), the backend enqueues `request.merged {requestId: A, intoRequestId: B, conversationRef}` in the same transaction. A closes as `CANCELLED`/`SUPERSEDED`.
+- Informational: the bot sends nothing to the customer, closes A in its registry (pointing to B) and ACKs `STALE`. `PROVIDER_ACCEPTED`, `DELIVERY_UNKNOWN` and any deferral answer `422 OUTCOME_NOT_ALLOWED`.
+- When B is answered, only B gets `request.answered`; A gets nothing more.
+- Until the chatbot handler lands, the consumer ACKs unknown item types `STALE` without sending, which is already correct for this type.
