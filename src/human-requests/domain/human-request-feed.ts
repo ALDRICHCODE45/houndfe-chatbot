@@ -42,6 +42,11 @@ export type DeliveryDecision =
   | 'UNKNOWN_TYPE'
   | 'UNKNOWN_KIND'
   | 'NO_CONVERSATION'
+  /** request.overdue_notice sent to the customer (4600). */
+  | 'OVERDUE_NOTICE'
+  /** request.overdue_notice not sent: the conversation is in a human
+   *  session (4600). */
+  | 'HUMAN_SESSION'
   /** A feed item that kept failing locally and was given up (poison item). */
   | 'LOCAL_FAILURE';
 
@@ -195,6 +200,9 @@ export interface FeedConsumerLock {
 export const TEAM_PREFIX = 'Le comparto la respuesta del equipo:';
 export const CANCEL_NOTICE =
   'El equipo cerró su consulta. Si necesita algo más, escríbame por aquí.';
+/** request.overdue_notice: told once; the request stays open. */
+export const OVERDUE_NOTICE =
+  'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.';
 
 /** Fixed usted copy in the customer's stored style (usted when unknown);
  *  the tú variants are whole-sentence curated pairs in `customer-style.ts`. */

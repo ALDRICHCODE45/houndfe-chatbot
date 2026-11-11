@@ -1,6 +1,7 @@
 import type {
   FeedItem,
   RequestCancelledItem,
+  RequestOverdueNoticeItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type { HumanRequestFeedStore } from '../domain/human-request-feed';
 
@@ -24,6 +25,29 @@ export const cancelledItem = (
     requestId: `req-${deliveryId}`,
     reason: 'OTHER',
     cancelledBy: 'STAFF',
+  },
+  ...patch,
+});
+
+export const overdueItem = (
+  deliveryId: string,
+  patch: Partial<RequestOverdueNoticeItem> = {},
+): RequestOverdueNoticeItem => ({
+  cursor: `00000000000${deliveryId.length}`,
+  deliveryId,
+  type: 'request.overdue_notice',
+  requestId: `req-${deliveryId}`,
+  conversationRef: REF,
+  notBefore: null,
+  expiresAt: null,
+  payload: {
+    requestId: `req-${deliveryId}`,
+    folio: 'SOL-0042',
+    kind: 'CLARIFICATION',
+    subtype: 'UNKNOWN_QUESTION',
+    clock: 'CLAIM',
+    overdueAt: AT,
+    assigned: false,
   },
   ...patch,
 });
@@ -142,6 +166,37 @@ export function runHumanRequestFeedStoreContract(
         conversationRef: null,
       });
     });
+
+    it.each([
+      ['SENT', 'OVERDUE_NOTICE', 'PROVIDER_ACCEPTED', 'wamid.9'],
+      ['STALE', 'HUMAN_SESSION', 'STALE', null],
+    ] as const)(
+      'stores a request.overdue_notice as %s with decision %s',
+      async (localState, decision, ack, providerMessageId) => {
+        await store.insertDelivery(overdueItem('od1'));
+        const next = await store.transition(
+          'od1',
+          { localState: 'RECEIVED', attemptId: null },
+          {
+            localState,
+            decision,
+            attemptId: ATTEMPT_A,
+            attemptedAt: AT,
+            providerMessageId,
+            ack,
+          },
+        );
+        expect(next).toMatchObject({
+          type: 'request.overdue_notice',
+          localState,
+          decision,
+          ackOutcome: ack,
+        });
+        await expect(store.getDelivery('od1')).resolves.toMatchObject({
+          decision,
+        });
+      },
+    );
 
     it('transitions only from the expected state and attempt', async () => {
       await store.insertDelivery(cancelledItem('d2'));

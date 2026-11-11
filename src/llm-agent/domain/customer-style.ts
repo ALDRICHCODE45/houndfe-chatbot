@@ -192,6 +192,10 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'El equipo cerró tu consulta. Si necesitas algo más, escríbeme por aquí.',
   ],
   [
+    'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.',
+    'Todavía no tengo respuesta del equipo; sigue pendiente y te aviso en cuanto la tenga.',
+  ],
+  [
     'Ya le pregunté al equipo, le aviso por aquí en cuanto me respondan.',
     'Ya le pregunté al equipo, te aviso por aquí en cuanto me respondan.',
   ],

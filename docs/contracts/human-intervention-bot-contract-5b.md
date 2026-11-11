@@ -192,3 +192,18 @@ Procedure: (1) stop using the expired cursor; (2) call with `status=open` and `u
 - Informational: the bot sends nothing to the customer, closes A in its registry (pointing to B) and ACKs `STALE`. `PROVIDER_ACCEPTED`, `DELIVERY_UNKNOWN` and any deferral answer `422 OUTCOME_NOT_ALLOWED`.
 - When B is answered, only B gets `request.answered`; A gets nothing more.
 - Chatbot handler (landed 2026-11-11): `parseFeedItem` reads `request.merged` (`requestId` accepted at the top level or in the payload — the top level wins when it is valid text; `intoRequestId` is the first valid text of the payload, then the top level, until the backend shape is final; missing `conversationRef`/`notBefore`/`expiresAt` read as `null`; a malformed one falls back to an unknown item, ACKed `STALE` with ledger decision `UNKNOWN_TYPE`, never rejecting the page, and logs a distinct warning — `request.merged was malformed` with the `deliveryId`, never the customer phone — because the merged request may stay open in the registry). The delivery service closes A as `CANCELLED` in the registry, keeps B open, logs the A → B pointer (the registry has no pointer column), sends nothing and ACKs `STALE` with ledger decision `DUPLICATE`.
+
+## Overdue notice — `request.overdue_notice` (backend unit 7c)
+
+- Created once per request ever, when the backend SLA sweep first marks it overdue. Envelope like the other items (`cursor`, `deliveryId`, `requestId`, `conversationRef`, `notBefore`, `expiresAt`, `deferredReason?`).
+- Payload: `{requestId, folio, kind, subtype, clock ("CLAIM" | "RESOLVE"), overdueAt (ISO UTC), assigned (boolean)}`.
+- ACK outcomes accepted: `PROVIDER_ACCEPTED`, `DELIVERY_UNKNOWN`, `STALE`. `DEFERRED_WINDOW_CLOSED` and `DEFERRED_HUMAN_SESSION` answer `422 OUTCOME_NOT_ALLOWED` (as for `request.cancelled`), so the bot never defers it.
+- Owner-approved copy (`docs/intervencion-humana-diseno.md`, "Vencimiento"): the customer is told once "Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga." (tú variant: "…y te aviso…", a whole-sentence pair in `customer-style.ts`). The request stays open.
+- Chatbot handler:
+  - `parseFeedItem` needs the envelope `requestId` and a payload record with `clock` `CLAIM` or `RESOLVE`; `folio`/`kind`/`subtype`/`overdueAt` read as `string | null` and `assigned` as a boolean (default `false`); missing `conversationRef`/`notBefore`/`expiresAt` read as `null`. A malformed item falls back to an `unknown` item (ACK `STALE`, decision `UNKNOWN_TYPE`), never rejecting the page.
+  - No usable `conversationRef`: ACK `STALE`, decision `NO_CONVERSATION`.
+  - Window closed (inbound observations, or Meta error `131047` on send): ACK `STALE`, decision `WINDOW_CLOSED`.
+  - Conversation in HUMAN mode: ACK `STALE` right away, decision `HUMAN_SESSION`; no local hold, no deferral, nothing replayed later. An unreadable mode fails the item (retried) like any other send.
+  - Otherwise: send the styled notice (decision `OVERDUE_NOTICE`) and ACK `PROVIDER_ACCEPTED`; an uncertain send is `UNKNOWN` + `DELIVERY_UNKNOWN`, never retried. A replayed `deliveryId` is sent once.
+  - The registry row is not touched: the request stays `OPEN`.
+- Ledger: migration `4600000000000_human_request_feed_overdue_decisions.js` widens the `decision` CHECK with `OVERDUE_NOTICE` and `HUMAN_SESSION`; `down` refuses while a row uses either.

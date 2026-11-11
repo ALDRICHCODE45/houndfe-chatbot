@@ -633,6 +633,104 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       },
     );
 
+    describe('request.overdue_notice', () => {
+      const overdueRaw = (patch: Record<string, unknown> = {}) => ({
+        cursor: '000000001850',
+        deliveryId: 'd9',
+        type: 'request.overdue_notice',
+        requestId: 'req-o',
+        conversationRef: 'wa:5215550001111',
+        notBefore: null,
+        expiresAt: null,
+        payload: {
+          requestId: 'req-o',
+          folio: 'SOL-0042',
+          kind: 'CLARIFICATION',
+          subtype: 'UNKNOWN_QUESTION',
+          clock: 'RESOLVE',
+          overdueAt: '2026-11-11T10:00:00.000Z',
+          assigned: true,
+        },
+        ...patch,
+      });
+      const read = async (raw: unknown) => {
+        request.mockReturnValue(
+          of(response({ items: [raw], nextCursor: '000000001850' })),
+        );
+        const result = await client.readFeed({ after: 'c' });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        return result.items;
+      };
+
+      it('parses a valid item', async () => {
+        await expect(read(overdueRaw())).resolves.toEqual([
+          {
+            type: 'request.overdue_notice',
+            cursor: '000000001850',
+            deliveryId: 'd9',
+            requestId: 'req-o',
+            conversationRef: 'wa:5215550001111',
+            notBefore: null,
+            expiresAt: null,
+            payload: {
+              requestId: 'req-o',
+              folio: 'SOL-0042',
+              kind: 'CLARIFICATION',
+              subtype: 'UNKNOWN_QUESTION',
+              clock: 'RESOLVE',
+              overdueAt: '2026-11-11T10:00:00.000Z',
+              assigned: true,
+            },
+          },
+        ]);
+      });
+
+      it('is tolerant: only the clock is required in the payload', async () => {
+        const items = await read(
+          overdueRaw({
+            payload: { clock: 'CLAIM', assigned: 'yes', folio: 7 },
+          }),
+        );
+        expect(items).toEqual([
+          expect.objectContaining({
+            type: 'request.overdue_notice',
+            payload: {
+              requestId: 'req-o',
+              folio: null,
+              kind: null,
+              subtype: null,
+              clock: 'CLAIM',
+              overdueAt: null,
+              assigned: false,
+            },
+          }),
+        ]);
+      });
+
+      it.each([
+        ['an unknown clock', { payload: { clock: 'SOON' } }],
+        ['a missing clock', { payload: { folio: 'SOL-1' } }],
+        ['a payload that is not an object', { payload: 'x' }],
+        ['a missing payload', { payload: undefined }],
+        ['a missing requestId', { requestId: undefined }],
+        ['a numeric conversationRef', { conversationRef: 5 }],
+      ])(
+        'falls back to "unknown" for %s without rejecting the page',
+        async (_label, patch) => {
+          const raw = overdueRaw(patch);
+          await expect(read(raw)).resolves.toEqual([
+            {
+              type: 'unknown',
+              rawType: 'request.overdue_notice',
+              cursor: '000000001850',
+              deliveryId: 'd9',
+              raw,
+            },
+          ]);
+        },
+      );
+    });
+
     it('surfaces a malformed request.merged as "unknown" instead of rejecting the page', async () => {
       const raw = {
         cursor: '000000001845',
