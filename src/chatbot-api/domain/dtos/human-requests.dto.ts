@@ -820,8 +820,10 @@ export function parseFeedItem(item: unknown): FeedItem | null {
 }
 
 /** `request.merged` (backend slice 4b): tolerant of the envelope fields the
- *  informational item may omit; `intoRequestId` may arrive in the payload or
- *  at the top level until the backend shape is final. */
+ *  informational item may omit; `requestId` and `intoRequestId` may arrive in
+ *  the payload or at the top level until the backend shape is final (top-level
+ *  `requestId` wins; `intoRequestId` is the first valid text of payload, then
+ *  top level). */
 function parseMerged(
   item: Record<string, unknown>,
   cursor: string,
@@ -829,22 +831,23 @@ function parseMerged(
 ): RequestMergedItem | null {
   const optional = (value: unknown): value is string | null | undefined =>
     value === undefined || isNullableString(value);
-  const intoRequestId = isRecord(item.payload)
-    ? (item.payload.intoRequestId ?? item.intoRequestId)
-    : item.intoRequestId;
   if (
-    !isText(item.requestId) ||
-    !isText(intoRequestId) ||
     !optional(item.conversationRef) ||
     !optional(item.notBefore) ||
     !optional(item.expiresAt) ||
     (item.payload !== undefined && !isRecord(item.payload))
   )
     return null;
+  const payload = isRecord(item.payload) ? item.payload : {};
+  const requestId = [item.requestId, payload.requestId].find(isText);
+  const intoRequestId = [payload.intoRequestId, item.intoRequestId].find(
+    isText,
+  );
+  if (requestId === undefined || intoRequestId === undefined) return null;
   return {
     cursor,
     deliveryId,
-    requestId: item.requestId,
+    requestId,
     conversationRef: item.conversationRef ?? null,
     notBefore: item.notBefore ?? null,
     expiresAt: item.expiresAt ?? null,

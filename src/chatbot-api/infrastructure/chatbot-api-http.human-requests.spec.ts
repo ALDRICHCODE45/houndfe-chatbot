@@ -518,6 +518,121 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       });
     });
 
+    it('parses request.merged with requestId only in the payload', async () => {
+      const raw = {
+        cursor: '000000001846',
+        deliveryId: 'd5',
+        type: 'request.merged',
+        payload: { requestId: 'req-a', intoRequestId: 'req-b' },
+      };
+      request.mockReturnValue(
+        of(response({ items: [raw], nextCursor: '000000001846' })),
+      );
+      await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+        kind: 'ok',
+        nextCursor: '000000001846',
+        items: [
+          {
+            type: 'request.merged',
+            cursor: '000000001846',
+            deliveryId: 'd5',
+            requestId: 'req-a',
+            conversationRef: null,
+            notBefore: null,
+            expiresAt: null,
+            payload: { intoRequestId: 'req-b' },
+          },
+        ],
+      });
+    });
+
+    it('request.merged: the top-level requestId wins over the payload one', async () => {
+      const raw = {
+        cursor: '000000001847',
+        deliveryId: 'd6',
+        type: 'request.merged',
+        requestId: 'req-top',
+        payload: { requestId: 'req-payload', intoRequestId: 'req-b' },
+      };
+      request.mockReturnValue(
+        of(response({ items: [raw], nextCursor: '000000001847' })),
+      );
+      await expect(client.readFeed({ after: 'c' })).resolves.toMatchObject({
+        kind: 'ok',
+        items: [{ type: 'request.merged', requestId: 'req-top' }],
+      });
+    });
+
+    it('request.merged: an invalid payload intoRequestId yields to a valid top-level one', async () => {
+      const raw = {
+        cursor: '000000001848',
+        deliveryId: 'd7',
+        type: 'request.merged',
+        requestId: 'req-a',
+        intoRequestId: 'req-top-b',
+        payload: { intoRequestId: 42 },
+      };
+      request.mockReturnValue(
+        of(response({ items: [raw], nextCursor: '000000001848' })),
+      );
+      await expect(client.readFeed({ after: 'c' })).resolves.toMatchObject({
+        kind: 'ok',
+        items: [
+          {
+            type: 'request.merged',
+            requestId: 'req-a',
+            payload: { intoRequestId: 'req-top-b' },
+          },
+        ],
+      });
+    });
+
+    it.each([
+      ['no intoRequestId anywhere', { requestId: 'req-a' }],
+      [
+        'payload not an object',
+        { requestId: 'req-a', intoRequestId: 'req-b', payload: 'x' },
+      ],
+      [
+        'numeric conversationRef',
+        { requestId: 'req-a', intoRequestId: 'req-b', conversationRef: 5 },
+      ],
+      [
+        'numeric notBefore',
+        { requestId: 'req-a', intoRequestId: 'req-b', notBefore: 5 },
+      ],
+      [
+        'numeric expiresAt',
+        { requestId: 'req-a', intoRequestId: 'req-b', expiresAt: 5 },
+      ],
+    ])(
+      'surfaces a request.merged with %s as "unknown" without rejecting the page',
+      async (_label, shape) => {
+        const raw = {
+          cursor: '000000001849',
+          deliveryId: 'd8',
+          type: 'request.merged',
+          ...shape,
+        };
+        request.mockReturnValue(
+          of(response({ items: [raw], nextCursor: '000000001849' })),
+        );
+        await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+          kind: 'ok',
+          nextCursor: '000000001849',
+          items: [
+            {
+              type: 'unknown',
+              rawType: 'request.merged',
+              cursor: '000000001849',
+              deliveryId: 'd8',
+              raw,
+            },
+          ],
+        });
+      },
+    );
+
     it('surfaces a malformed request.merged as "unknown" instead of rejecting the page', async () => {
       const raw = {
         cursor: '000000001845',

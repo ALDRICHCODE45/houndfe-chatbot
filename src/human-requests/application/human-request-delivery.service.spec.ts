@@ -4,6 +4,7 @@ import type {
   PendingDeliveriesResult,
   RecordDeliveryOutcomeResult,
   RequestAnsweredItem,
+  RequestMergedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import { WhatsappSendError } from '../../whatsapp/infrastructure/meta-whatsapp.sender';
@@ -34,6 +35,21 @@ const answered = (
   notBefore: null,
   expiresAt: null,
   payload,
+  ...patch,
+});
+
+const mergedItem = (
+  deliveryId: string,
+  patch: Partial<RequestMergedItem> = {},
+): RequestMergedItem => ({
+  cursor: `c-${deliveryId}`,
+  deliveryId,
+  type: 'request.merged',
+  requestId: 'req-a',
+  conversationRef: REF,
+  notBefore: null,
+  expiresAt: null,
+  payload: { intoRequestId: 'req-b' },
   ...patch,
 });
 
@@ -293,6 +309,68 @@ describe('HumanRequestDeliveryService', () => {
       await expect(store.getDelivery('m1')).resolves.toMatchObject({
         decision: 'DUPLICATE',
       });
+    });
+  });
+
+  describe('request.merged edge cases', () => {
+    it('A not in the registry: no throw, nothing sent, one ACK STALE, DUPLICATE', async () => {
+      const { service, sender, client, store } = setup();
+      await expect(service.accept(mergedItem('m2'))).resolves.not.toThrow();
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getRequest('req-a')).resolves.toBeNull();
+      await expect(store.getDelivery('m2')).resolves.toMatchObject({
+        decision: 'DUPLICATE',
+      });
+    });
+
+    it('A already RESOLVED stays RESOLVED and ACKs STALE', async () => {
+      const { service, sender, client, store } = setup();
+      await store.recordOpenRequest({
+        requestId: 'req-a',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      await store.closeRequest('req-a', 'RESOLVED');
+      await service.accept(mergedItem('m3'));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getRequest('req-a')).resolves.toMatchObject({
+        status: 'RESOLVED',
+      });
+    });
+
+    it('the same merged deliveryId accepted twice ACKs exactly once', async () => {
+      const { service, sender, client } = setup();
+      await service.accept(mergedItem('m4'));
+      await service.accept(mergedItem('m4'));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('a malformed merged item (unknown) ACKs STALE and warns distinctly', async () => {
+      const { service, sender, client, store } = setup();
+      await service.accept({
+        type: 'unknown',
+        rawType: 'request.merged',
+        cursor: '10',
+        deliveryId: 'm5',
+        raw: { type: 'request.merged' },
+      });
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getDelivery('m5')).resolves.toMatchObject({
+        decision: 'UNKNOWN_TYPE',
+      });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /request\.merged.*malformed|malformed.*request\.merged/,
+        ),
+      );
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('m5'));
     });
   });
 
