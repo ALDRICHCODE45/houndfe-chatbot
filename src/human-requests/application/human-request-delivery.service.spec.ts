@@ -262,6 +262,40 @@ describe('HumanRequestDeliveryService', () => {
     });
   });
 
+  describe('request.merged', () => {
+    it('closes the merged request, keeps the target open, sends nothing and ACKs STALE', async () => {
+      const { service, sender, client, store } = setup();
+      for (const requestId of ['req-a', 'req-b'])
+        await store.recordOpenRequest({
+          requestId,
+          conversationRef: REF,
+          subtype: 'UNKNOWN_QUESTION',
+        });
+      await service.accept({
+        cursor: '000000000002',
+        deliveryId: 'm1',
+        type: 'request.merged',
+        requestId: 'req-a',
+        conversationRef: REF,
+        notBefore: null,
+        expiresAt: null,
+        payload: { intoRequestId: 'req-b' },
+      });
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getRequest('req-a')).resolves.toMatchObject({
+        status: 'CANCELLED',
+      });
+      await expect(store.getRequest('req-b')).resolves.toMatchObject({
+        status: 'OPEN',
+      });
+      await expect(store.getDelivery('m1')).resolves.toMatchObject({
+        decision: 'DUPLICATE',
+      });
+    });
+  });
+
   describe('request.cancelled', () => {
     it('closes the registry row; DUPLICATE sends nothing and ACKs STALE', async () => {
       const { service, sender, client, store } = setup();

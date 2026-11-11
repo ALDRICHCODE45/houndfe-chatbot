@@ -278,6 +278,16 @@ export type RequestCancelledItem = FeedItemEnvelope & {
   type: 'request.cancelled';
   payload: RequestCancelledPayload;
 };
+export interface RequestMergedPayload {
+  /** The open request that absorbed this one (B in "merge A into B"). */
+  intoRequestId: string;
+}
+/** Staff merged this request (A) into another one (B); informational only:
+ *  the bot sends nothing and ACKs STALE. */
+export type RequestMergedItem = FeedItemEnvelope & {
+  type: 'request.merged';
+  payload: RequestMergedPayload;
+};
 /** A type this bot does not know (e.g. unit 11 `conversation.*`): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
@@ -290,6 +300,7 @@ export interface UnknownFeedItem {
 
 export type FeedItem =
   | RequestAnsweredItem
+  | RequestMergedItem
   | RequestCancelledItem
   | UnknownFeedItem;
 
@@ -753,6 +764,18 @@ export function parseFeedItem(item: unknown): FeedItem | null {
     !isText(item.type)
   )
     return null;
+  // Informational and its backend shape is not final: a malformed one is
+  // ACKed STALE as unknown rather than rejecting the whole page.
+  if (item.type === 'request.merged')
+    return (
+      parseMerged(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
   if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
     return {
       type: 'unknown',
@@ -794,6 +817,40 @@ export function parseFeedItem(item: unknown): FeedItem | null {
   return payload === undefined
     ? null
     : { ...envelope, type: 'request.cancelled', payload };
+}
+
+/** `request.merged` (backend slice 4b): tolerant of the envelope fields the
+ *  informational item may omit; `intoRequestId` may arrive in the payload or
+ *  at the top level until the backend shape is final. */
+function parseMerged(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): RequestMergedItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const intoRequestId = isRecord(item.payload)
+    ? (item.payload.intoRequestId ?? item.intoRequestId)
+    : item.intoRequestId;
+  if (
+    !isText(item.requestId) ||
+    !isText(intoRequestId) ||
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    (item.payload !== undefined && !isRecord(item.payload))
+  )
+    return null;
+  return {
+    cursor,
+    deliveryId,
+    requestId: item.requestId,
+    conversationRef: item.conversationRef ?? null,
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+    type: 'request.merged',
+    payload: { intoRequestId },
+  };
 }
 
 function parseItems(items: unknown): FeedItem[] | null {

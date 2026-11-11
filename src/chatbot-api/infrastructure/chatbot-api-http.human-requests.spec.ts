@@ -486,6 +486,64 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
     });
 
     it.each([
+      ['intoRequestId in the payload', { payload: { intoRequestId: 'req-b' } }],
+      ['intoRequestId at the top level', { intoRequestId: 'req-b' }],
+    ])('parses request.merged with %s', async (_label, shape) => {
+      const raw = {
+        cursor: '000000001844',
+        deliveryId: 'd3',
+        type: 'request.merged',
+        requestId: 'req-a',
+        conversationRef: 'wa:5215550001111',
+        ...shape,
+      };
+      request.mockReturnValue(
+        of(response({ items: [raw], nextCursor: '000000001844' })),
+      );
+      await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+        kind: 'ok',
+        nextCursor: '000000001844',
+        items: [
+          {
+            type: 'request.merged',
+            cursor: '000000001844',
+            deliveryId: 'd3',
+            requestId: 'req-a',
+            conversationRef: 'wa:5215550001111',
+            notBefore: null,
+            expiresAt: null,
+            payload: { intoRequestId: 'req-b' },
+          },
+        ],
+      });
+    });
+
+    it('surfaces a malformed request.merged as "unknown" instead of rejecting the page', async () => {
+      const raw = {
+        cursor: '000000001845',
+        deliveryId: 'd4',
+        type: 'request.merged',
+        payload: { intoRequestId: 'req-b' },
+      };
+      request.mockReturnValue(
+        of(response({ items: [raw], nextCursor: '000000001845' })),
+      );
+      await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+        kind: 'ok',
+        nextCursor: '000000001845',
+        items: [
+          {
+            type: 'unknown',
+            rawType: 'request.merged',
+            cursor: '000000001845',
+            deliveryId: 'd4',
+            raw,
+          },
+        ],
+      });
+    });
+
+    it.each([
       ['missing deliveryId', { ...answeredItem, deliveryId: undefined }],
       ['numeric cursor', { ...answeredItem, cursor: 1842 }],
       ['missing notBefore', { ...answeredItem, notBefore: undefined }],
