@@ -714,22 +714,23 @@ describe('HumanRequestDeliveryService', () => {
   });
 
   describe('abandon (poison feed item)', () => {
-    it('a RECEIVED row becomes STALE / LOCAL_FAILURE, ACK STALE, nothing sent', async () => {
+    it('a RECEIVED row becomes UNKNOWN / LOCAL_FAILURE, ACK DELIVERY_UNKNOWN (to reconcile), nothing sent', async () => {
       const { service, store, client, sender } = setup();
       await store.insertDelivery(cancelledItem('z1'));
       await service.abandon(cancelledItem('z1'), 'Error: boom');
       expect(sender.sent).toEqual([]);
       await expect(store.getDelivery('z1')).resolves.toMatchObject({
-        localState: 'STALE',
+        localState: 'UNKNOWN',
         decision: 'LOCAL_FAILURE',
+        providerMessageId: null,
         ackState: 'ACKED',
-        ackOutcome: 'STALE',
+        ackOutcome: 'DELIVERY_UNKNOWN',
       });
       expect(client.acks).toEqual([
         {
           deliveryId: 'z1',
           body: {
-            outcome: 'STALE',
+            outcome: 'DELIVERY_UNKNOWN',
             attemptId: attemptId(1),
             attemptedAt: NOW.toISOString(),
           },

@@ -347,42 +347,64 @@ describe('HumanRequestFeedConsumer', () => {
   });
 
   describe('poison item', () => {
-    it('after 5 consecutive failures of one deliveryId it is abandoned and the page moves on', async () => {
+    const MINUTE = 60_000;
+    const buildPoison = (
+      items: FeedItem[],
+      failing: () => string,
+      abandon: (item: FeedItem) => Promise<void> = () => Promise.resolve(),
+    ) => {
       const abandoned: string[] = [];
-      const store = new InMemoryHumanRequestFeedStore();
-      const items = [
-        cancelledItem('ok1'),
-        cancelledItem('bad'),
-        cancelledItem('ok2'),
-      ];
-      const feed = new ScriptedFeed(
-        Array.from({ length: 6 }, () => page(items, '9')),
-      );
       const accepted: string[] = [];
+      const store = new InMemoryHumanRequestFeedStore();
+      const clock = { now: 0 };
       const consumer = new HumanRequestFeedConsumer(
         {
           store,
-          client: feed,
+          client: new ScriptedFeed(
+            Array.from({ length: 20 }, () => page(items, '9')),
+          ),
           delivery: {
             accept: (item) => {
-              if (item.deliveryId === 'bad')
+              if (item.deliveryId === failing())
                 return Promise.reject(new Error('handoff mode unreadable'));
               accepted.push(item.deliveryId);
               return Promise.resolve();
             },
-            abandon: (item) => {
+            abandon: async (item) => {
+              await abandon(item);
               abandoned.push(item.deliveryId);
-              return Promise.resolve();
             },
           },
           lock: new FakeLock(),
         },
-        { sleep: () => Promise.resolve() },
+        { sleep: () => Promise.resolve(), clock: () => clock.now },
       );
-      for (let i = 0; i < 4; i += 1)
+      return { store, consumer, clock, abandoned, accepted };
+    };
+
+    it('5 fast failures within 10 minutes do not abandon the item', async () => {
+      const { store, consumer, clock, abandoned } = buildPoison(
+        [cancelledItem('bad')],
+        () => 'bad',
+      );
+      for (let i = 0; i < 8; i += 1) {
+        clock.now = i * MINUTE;
         await expect(consumer.runOnce()).rejects.toThrow('unreadable');
+      }
       expect(abandoned).toEqual([]);
       await expect(store.readCursor()).resolves.toBeNull();
+    });
+
+    it('failures spanning 10 minutes and 5 attempts abandon the item and the page moves on', async () => {
+      const { store, consumer, clock, abandoned, accepted } = buildPoison(
+        [cancelledItem('ok1'), cancelledItem('bad'), cancelledItem('ok2')],
+        () => 'bad',
+      );
+      for (let i = 0; i < 4; i += 1) {
+        clock.now = i * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow('unreadable');
+      }
+      clock.now = 10 * MINUTE;
       await expect(consumer.runOnce()).resolves.toEqual({
         kind: 'page',
         items: 3,
@@ -393,56 +415,70 @@ describe('HumanRequestFeedConsumer', () => {
       expect(error).toHaveBeenCalledWith(expect.stringContaining('bad'));
     });
 
-    it('a different failing item restarts the count', async () => {
-      const abandoned: string[] = [];
-      let failing = 'x';
-      const consumer = new HumanRequestFeedConsumer(
-        {
-          store: new InMemoryHumanRequestFeedStore(),
-          client: new ScriptedFeed(
-            Array.from({ length: 6 }, () =>
-              page([cancelledItem('x'), cancelledItem('y')], '2'),
-            ),
-          ),
-          delivery: {
-            accept: (item) =>
-              item.deliveryId === failing
-                ? Promise.reject(new Error('boom'))
-                : Promise.resolve(),
-            abandon: (item) => {
-              abandoned.push(item.deliveryId);
-              return Promise.resolve();
-            },
-          },
-          lock: new FakeLock(),
-        },
-        { sleep: () => Promise.resolve() },
+    it('10 minutes of failures with fewer than 5 attempts do not abandon', async () => {
+      const { consumer, clock, abandoned } = buildPoison(
+        [cancelledItem('bad')],
+        () => 'bad',
       );
-      for (let i = 0; i < 4; i += 1)
+      for (const at of [0, 5, 10, 20]) {
+        clock.now = at * MINUTE;
         await expect(consumer.runOnce()).rejects.toThrow();
+      }
+      expect(abandoned).toEqual([]);
+    });
+
+    it('a different failing item restarts the count and the first-failure time', async () => {
+      let failing = 'x';
+      const { consumer, clock, abandoned } = buildPoison(
+        [cancelledItem('x'), cancelledItem('y')],
+        () => failing,
+      );
+      for (let i = 0; i < 6; i += 1) {
+        clock.now = i * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow();
+      }
       failing = 'y';
-      await expect(consumer.runOnce()).rejects.toThrow();
+      for (let i = 6; i < 15; i += 1) {
+        clock.now = i * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow();
+      }
+      expect(abandoned).toEqual([]);
+      clock.now = 16 * MINUTE;
+      await consumer.runOnce();
+      expect(abandoned).toEqual(['y']);
+    });
+
+    it('a success resets the count and the first-failure time', async () => {
+      let failing = 'x';
+      const { consumer, clock, abandoned } = buildPoison(
+        [cancelledItem('x')],
+        () => failing,
+      );
+      for (let i = 0; i < 6; i += 1) {
+        clock.now = i * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow();
+      }
+      failing = '';
+      clock.now = 7 * MINUTE;
+      await consumer.runOnce();
+      failing = 'x';
+      for (let i = 8; i < 17; i += 1) {
+        clock.now = i * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow();
+      }
       expect(abandoned).toEqual([]);
     });
 
     it('a failing abandon keeps the page stuck (the cursor stays)', async () => {
-      const store = new InMemoryHumanRequestFeedStore();
-      const consumer = new HumanRequestFeedConsumer(
-        {
-          store,
-          client: new ScriptedFeed(
-            Array.from({ length: 6 }, () => page([cancelledItem('p')], '1')),
-          ),
-          delivery: {
-            accept: () => Promise.reject(new Error('db down')),
-            abandon: () => Promise.reject(new Error('db down')),
-          },
-          lock: new FakeLock(),
-        },
-        { sleep: () => Promise.resolve() },
+      const { store, consumer, clock } = buildPoison(
+        [cancelledItem('p')],
+        () => 'p',
+        () => Promise.reject(new Error('db down')),
       );
-      for (let i = 0; i < 5; i += 1)
-        await expect(consumer.runOnce()).rejects.toThrow('db down');
+      for (let i = 0; i < 6; i += 1) {
+        clock.now = i * 3 * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow();
+      }
       await expect(store.readCursor()).resolves.toBeNull();
     });
   });

@@ -156,8 +156,9 @@ export class HumanRequestDeliveryService {
   /**
    * A feed item whose handling keeps failing (poison item): records a
    * terminal local failure so the feed can move on, never resending. A
-   * RECEIVED row (nothing sent) becomes STALE / LOCAL_FAILURE with an ACK
-   * STALE; a SENDING row is left to `recoverStuckSending` (DELIVERY_UNKNOWN);
+   * RECEIVED row (nothing sent, but a delivery may still be owed) becomes
+   * UNKNOWN / LOCAL_FAILURE with an ACK DELIVERY_UNKNOWN, so staff sees it
+   * "to reconcile" (STALE would mean nothing needs to be sent); a SENDING row is left to `recoverStuckSending` (DELIVERY_UNKNOWN);
    * an already decided row keeps its state. With no ledger row at all (the
    * insert itself fails) nothing can have been sent: one inline ACK STALE.
    * Rejects when the ledger cannot be read, so the page stays stuck.
@@ -193,16 +194,16 @@ export class HumanRequestDeliveryService {
       row.deliveryId,
       { localState: 'RECEIVED', attemptId: row.attemptId },
       {
-        localState: 'STALE',
+        localState: 'UNKNOWN',
         decision: 'LOCAL_FAILURE',
         attemptId: this.newAttemptId(),
         attemptedAt,
         providerMessageId: null,
-        ack: 'STALE',
+        ack: 'DELIVERY_UNKNOWN',
       },
     );
     this.logger.error(
-      `feed item ${item.deliveryId} abandoned after repeated failures (${reason}): STALE / LOCAL_FAILURE`,
+      `feed item ${item.deliveryId} abandoned after repeated failures (${reason}): nothing sent, DELIVERY_UNKNOWN / LOCAL_FAILURE for staff to reconcile`,
     );
     if (next !== null) await this.flushAck(next);
   }

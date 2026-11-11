@@ -27,8 +27,14 @@ export interface HumanRequestFeedConsumerOptions {
   maxBackoffMs?: number;
   /** Consecutive failures at one cursor before an error log. */
   stuckPageThreshold?: number;
-  /** Consecutive failures of one deliveryId before it is abandoned. */
+  /** Consecutive failures of one deliveryId before it may be abandoned. */
   poisonItemThreshold?: number;
+  /** How long one deliveryId must keep failing before it may be abandoned
+   *  (default 10 minutes), so a short dependency outage never gives up a
+   *  valid delivery. Both this and `poisonItemThreshold` must be reached. */
+  poisonItemMinMs?: number;
+  /** Milliseconds since the epoch (default `Date.now`). */
+  clock?: () => number;
   random?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -57,6 +63,8 @@ export class HumanRequestFeedConsumer {
   private readonly maxBackoffMs: number;
   private readonly stuckPageThreshold: number;
   private readonly poisonItemThreshold: number;
+  private readonly poisonItemMinMs: number;
+  private readonly clock: () => number;
   private readonly random: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private started = false;
@@ -73,6 +81,7 @@ export class HumanRequestFeedConsumer {
   private lastCursor: string | null = null;
   private failingItem: string | undefined;
   private failingItemCount = 0;
+  private failingItemSince = 0;
 
   constructor(
     private readonly ports: HumanRequestFeedConsumerPorts,
@@ -84,6 +93,8 @@ export class HumanRequestFeedConsumer {
     this.maxBackoffMs = options.maxBackoffMs ?? 60_000;
     this.stuckPageThreshold = options.stuckPageThreshold ?? 3;
     this.poisonItemThreshold = options.poisonItemThreshold ?? 5;
+    this.poisonItemMinMs = options.poisonItemMinMs ?? 10 * 60_000;
+    this.clock = options.clock ?? Date.now;
     this.random = options.random ?? Math.random;
     this.sleepFn = options.sleep ?? ((ms) => this.interruptibleSleep(ms));
   }
@@ -154,22 +165,30 @@ export class HumanRequestFeedConsumer {
     }
   }
 
-  /** One item; a deliveryId that keeps failing is abandoned (recorded as a
-   *  terminal local failure, never resent) so it cannot block the feed. */
+  /** One item; a deliveryId that keeps failing for `poisonItemMinMs` and
+   *  `poisonItemThreshold` attempts is abandoned (recorded for staff to
+   *  reconcile, never resent) so it cannot block the feed. */
   private async handle(item: FeedItem): Promise<void> {
     try {
       await this.ports.delivery.accept(item);
     } catch (error) {
+      const now = this.clock();
       if (this.failingItem === item.deliveryId) this.failingItemCount += 1;
       else {
         this.failingItem = item.deliveryId;
         this.failingItemCount = 1;
+        this.failingItemSince = now;
       }
-      if (this.failingItemCount < this.poisonItemThreshold) throw error;
+      const failingMs = now - this.failingItemSince;
+      if (
+        this.failingItemCount < this.poisonItemThreshold ||
+        failingMs < this.poisonItemMinMs
+      )
+        throw error;
       // Throws when the ledger is unreadable: the page stays stuck.
       await this.ports.delivery.abandon(item, describe(error));
       this.logger.error(
-        `feed item ${item.deliveryId} abandoned after ${this.failingItemCount} consecutive failures: ${describe(error)}`,
+        `feed item ${item.deliveryId} abandoned after ${this.failingItemCount} consecutive failures over ${Math.round(failingMs / 1000)} s: ${describe(error)}`,
       );
     }
     if (this.failingItem === item.deliveryId) {
