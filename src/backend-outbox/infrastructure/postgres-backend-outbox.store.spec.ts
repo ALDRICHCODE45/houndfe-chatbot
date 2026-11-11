@@ -286,7 +286,9 @@ ddescribe(
         );
         return applied.rows[0].n;
       };
-      expect(() => migrate('down', '1')).toThrow();
+      // Later migrations roll back cleanly; 4400 itself must refuse.
+      const withRows = await appliedFrom4400();
+      expect(() => migrate('down', withRows)).toThrow();
       await pool.query('DELETE FROM backend_outbox');
       migrate('down', await appliedFrom4400());
       const lane = await pool.query(
