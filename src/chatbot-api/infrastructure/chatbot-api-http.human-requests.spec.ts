@@ -821,4 +821,196 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       });
     });
   });
+
+  describe('listOpenRequests (5c recovery)', () => {
+    const openRequest = (patch: Record<string, unknown> = {}) => ({
+      id: REQUEST,
+      folio: 'S-000123',
+      kind: 'DECISION',
+      subtype: 'RESTOCK',
+      status: 'RESOLVED',
+      conversationRef: 'wa:5215512345678',
+      legacyId: SOURCE,
+      whatsappWindowClosesAt: '2026-11-11T16:20:00.000Z',
+      cancelReason: null,
+      createdAt: '2026-11-10T10:00:00.000Z',
+      updatedAt: '2026-11-10T16:00:00.000Z',
+      closedAt: '2026-11-10T16:00:00.000Z',
+      pendingDeliveries: [{ ...answeredItem, deferredReason: null }],
+      undeliveredTruncated: false,
+      undeliveredResumeAfter: null,
+      ...patch,
+    });
+    const body = (
+      items: unknown[] = [openRequest()],
+      nextPage: string | null = 'eyJ1Ijoi',
+    ) => ({ items, nextCursor: '000000001900', nextPage });
+
+    it('GETs status=open with updatedSince/cursor/limit (safe retry) and parses the page', async () => {
+      request
+        .mockReturnValueOnce(httpError(503, {}))
+        .mockReturnValueOnce(of(response(body())));
+      const result = await client.listOpenRequests({
+        updatedSince: AT,
+        cursor: 'abc',
+        limit: 20,
+      });
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(sent()).toEqual(
+        expect.objectContaining({
+          method: 'GET',
+          url: '/chatbot-api/requests',
+          params: {
+            status: 'open',
+            updatedSince: AT,
+            cursor: 'abc',
+            limit: 20,
+          },
+        }),
+      );
+      expect(result).toEqual({
+        kind: 'ok',
+        nextCursor: '000000001900',
+        nextPage: 'eyJ1Ijoi',
+        items: [
+          {
+            ...openRequest(),
+            pendingDeliveries: [
+              expect.objectContaining({
+                type: 'request.answered',
+                deliveryId: DELIVERY,
+                cursor: '000000001842',
+              }),
+            ],
+          },
+        ],
+      });
+      const item = result.kind === 'ok' ? result.items[0] : undefined;
+      expect(item?.pendingDeliveries[0]).not.toHaveProperty('deferredReason');
+    });
+
+    it('defaults to status=open&limit=50 without updatedSince or cursor', async () => {
+      request.mockReturnValue(of(response(body([], null))));
+      await expect(client.listOpenRequests()).resolves.toEqual({
+        kind: 'ok',
+        items: [],
+        nextCursor: '000000001900',
+        nextPage: null,
+      });
+      expect(sent().params).toEqual({ status: 'open', limit: 50 });
+    });
+
+    it('keeps a HUMAN_SESSION deferral, nullable fields and a truncated request', async () => {
+      request.mockReturnValue(
+        of(
+          response(
+            body([
+              openRequest({
+                status: 'NEW',
+                folio: null,
+                conversationRef: null,
+                legacyId: null,
+                whatsappWindowClosesAt: null,
+                closedAt: null,
+                pendingDeliveries: [
+                  { ...answeredItem, deferredReason: 'HUMAN_SESSION' },
+                ],
+                undeliveredTruncated: true,
+                undeliveredResumeAfter: '000000001700',
+              }),
+            ]),
+          ),
+        ),
+      );
+      const result = await client.listOpenRequests();
+      expect(result.kind === 'ok' && result.items[0]).toMatchObject({
+        status: 'NEW',
+        conversationRef: null,
+        undeliveredTruncated: true,
+        undeliveredResumeAfter: '000000001700',
+        pendingDeliveries: [{ deferredReason: 'HUMAN_SESSION' }],
+      });
+    });
+
+    it.each([
+      ['updatedSince not canonical', { updatedSince: '2026-11-10T16:20:00Z' }],
+      ['updatedSince not a date', { updatedSince: 'yesterday' }],
+      ['empty cursor', { cursor: '' }],
+      ['limit 0', { limit: 0 }],
+      ['limit 51', { limit: 51 }],
+      ['limit 1.5', { limit: 1.5 }],
+    ])('rejects %s before any HTTP', async (_name, options) => {
+      await expect(client.listOpenRequests(options)).rejects.toBeInstanceOf(
+        ChatbotApiError,
+      );
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an unknown status', { status: 'MERGED' }],
+      ['a missing folio', { folio: undefined }],
+      ['a non-boolean truncated flag', { undeliveredTruncated: 'no' }],
+      [
+        'truncated without a resume cursor',
+        { undeliveredTruncated: true, undeliveredResumeAfter: null },
+      ],
+      ['a malformed pending delivery', { pendingDeliveries: [{ x: 1 }] }],
+      [
+        'an unknown deferredReason',
+        {
+          pendingDeliveries: [{ ...answeredItem, deferredReason: 'LATER' }],
+        },
+      ],
+      [
+        'a pending delivery of another request',
+        { pendingDeliveries: [{ ...answeredItem, requestId: SOURCE }] },
+      ],
+      ['pendingDeliveries not an array', { pendingDeliveries: null }],
+      ['a missing updatedAt', { updatedAt: undefined }],
+    ])('rejects a page with %s as UpstreamError', async (_name, patch) => {
+      request.mockReturnValue(of(response(body([openRequest(patch)]))));
+      await expect(client.listOpenRequests()).rejects.toBeInstanceOf(
+        UpstreamError,
+      );
+    });
+
+    it.each([
+      ['no nextCursor', { items: [], nextPage: null }],
+      ['an empty nextCursor', { items: [], nextCursor: '', nextPage: null }],
+      ['no nextPage', { items: [], nextCursor: '1' }],
+      ['items not an array', { items: {}, nextCursor: '1', nextPage: null }],
+    ])('rejects a page with %s as UpstreamError', async (_name, page) => {
+      request.mockReturnValue(of(response(page)));
+      await expect(client.listOpenRequests()).rejects.toBeInstanceOf(
+        UpstreamError,
+      );
+    });
+
+    it('maps 400 VALIDATION_ERROR and 429 RATE_LIMITED to typed results', async () => {
+      request.mockReturnValueOnce(
+        httpError(400, {
+          code: 'VALIDATION_ERROR',
+          message: 'updatedSince must be canonical',
+        }),
+      );
+      await expect(client.listOpenRequests()).resolves.toEqual({
+        kind: 'VALIDATION_ERROR',
+        message: 'updatedSince must be canonical',
+      });
+      request.mockReturnValueOnce(
+        httpError(429, { code: 'RATE_LIMITED' }, { 'retry-after': '3' }),
+      );
+      await expect(client.listOpenRequests()).resolves.toEqual({
+        kind: 'RATE_LIMITED',
+        retryAfterSeconds: 3,
+      });
+    });
+
+    it('still throws 403 (missing requests:read scope)', async () => {
+      request.mockReturnValue(httpError(403, { message: 'Forbidden' }));
+      await expect(client.listOpenRequests()).rejects.toBeInstanceOf(
+        ForbiddenError,
+      );
+    });
+  });
 });

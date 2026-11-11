@@ -55,6 +55,40 @@ export function runHumanRequestFeedStoreContract(
       await expect(store.readCursor()).resolves.toBeNull();
     });
 
+    it('saves synced_at together with the cursor and keeps it when omitted', async () => {
+      await expect(store.readSyncedAt()).resolves.toBeNull();
+      await store.saveCursor('000000000010', '2026-11-11T10:00:00.000Z');
+      await expect(store.readCursor()).resolves.toBe('000000000010');
+      await expect(store.readSyncedAt()).resolves.toBe(
+        '2026-11-11T10:00:00.000Z',
+      );
+      await store.saveCursor('000000000011');
+      await expect(store.readCursor()).resolves.toBe('000000000011');
+      await expect(store.readSyncedAt()).resolves.toBe(
+        '2026-11-11T10:00:00.000Z',
+      );
+      await store.saveCursor(null, '2026-11-11T11:00:00.000Z');
+      await expect(store.readCursor()).resolves.toBeNull();
+      await expect(store.readSyncedAt()).resolves.toBe(
+        '2026-11-11T11:00:00.000Z',
+      );
+    });
+
+    it('lists OPEN request ids created before an instant', async () => {
+      for (const id of ['o1', 'o2', 'o3'])
+        await store.recordOpenRequest({
+          requestId: id,
+          conversationRef: REF,
+          subtype: 'UNKNOWN_QUESTION',
+        });
+      await store.closeRequest('o2', 'RESOLVED');
+      await expect(
+        store.listOpenRequestIds(new Date(Date.now() - 3_600_000)),
+      ).resolves.toEqual([]);
+      const ids = await store.listOpenRequestIds(new Date(Date.now() + 60_000));
+      expect([...ids].sort()).toEqual(['o1', 'o3']);
+    });
+
     it('inserts a delivery once and returns the stored row on replay', async () => {
       const first = await store.insertDelivery(cancelledItem('d1'));
       expect(first.inserted).toBe(true);

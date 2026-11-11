@@ -16,6 +16,7 @@ const TERMINAL = new Set(['SENT', 'STALE', 'UNKNOWN']);
 /** Test double with the Postgres store's semantics (shared contract). */
 export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
   private cursor: string | null = null;
+  private syncedAt: string | null = null;
   private readonly rows = new Map<string, DeliveryRow>();
   private readonly requests = new Map<string, HumanRequestRecord>();
   private lastStamp = 0;
@@ -30,9 +31,14 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     return Promise.resolve(this.cursor);
   }
 
-  saveCursor(cursor: string | null): Promise<void> {
+  saveCursor(cursor: string | null, syncedAt?: string): Promise<void> {
     this.cursor = cursor;
+    if (syncedAt !== undefined) this.syncedAt = syncedAt;
     return Promise.resolve();
+  }
+
+  readSyncedAt(): Promise<string | null> {
+    return Promise.resolve(this.syncedAt);
   }
 
   insertDelivery(
@@ -256,6 +262,18 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
   getRequest(requestId: string): Promise<HumanRequestRecord | null> {
     const record = this.requests.get(requestId);
     return Promise.resolve(record ? { ...record } : null);
+  }
+
+  listOpenRequestIds(createdBefore: Date): Promise<string[]> {
+    return Promise.resolve(
+      [...this.requests.values()]
+        .filter(
+          (record) =>
+            record.status === 'OPEN' &&
+            record.createdAt.getTime() < createdBefore.getTime(),
+        )
+        .map((record) => record.requestId),
+    );
   }
 }
 

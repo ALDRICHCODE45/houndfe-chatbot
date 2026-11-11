@@ -318,6 +318,7 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
                 nextCursor: options.after ?? '',
               } satisfies ReadFeedResult;
             },
+            listOpenRequests: () => Promise.reject(new Error('unused')),
           },
           delivery: {
             accept: () => Promise.resolve(),

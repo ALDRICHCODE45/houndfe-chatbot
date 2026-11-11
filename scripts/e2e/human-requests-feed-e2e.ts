@@ -5,7 +5,9 @@
  * WhatsApp sender is a fake that only records sends: no real message is ever
  * sent and the chatbot Postgres DB is never touched. WRITES DEV DATA on the
  * backend (a request and the outcome ACKs). Never prints the service key or
- * request headers. See scripts/e2e/README.md. */
+ * request headers. `--phase recovery` only reads the 5c recovery route
+ * (`GET /chatbot-api/requests?status=open`, every page) and prints a masked
+ * summary: no ACK, no write. See scripts/e2e/README.md. */
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { HttpService } from '@nestjs/axios';
@@ -16,12 +18,16 @@ import { ChatbotApiError } from '../../src/chatbot-api/domain/errors';
 import type {
   CreateHumanRequestInput,
   FeedItem,
+  OpenHumanRequest,
   ReadFeedResult,
   RecordDeliveryOutcomeResult,
 } from '../../src/chatbot-api/domain/dtos/human-requests.dto';
 import { HumanRequestDeliveryService } from '../../src/human-requests/application/human-request-delivery.service';
 import { HumanRequestFeedConsumer } from '../../src/human-requests/application/human-request-feed.consumer';
-import type { FeedConsumerLock } from '../../src/human-requests/domain/human-request-feed';
+import {
+  maskConversationRef,
+  type FeedConsumerLock,
+} from '../../src/human-requests/domain/human-request-feed';
 import { InMemoryHumanRequestFeedStore } from '../../src/human-requests/infrastructure/in-memory-human-request-feed.store';
 import { DEFAULT_CUSTOMER_STYLE } from '../../src/llm-agent/domain/customer-style';
 import type {
@@ -36,7 +42,7 @@ const TOKEN_FILE = '/tmp/houndfe-dev-bot-token.txt';
 const TAIL_PAGE_LIMIT = 50;
 const MAX_CONSECUTIVE_FAILURES = 5;
 
-type Phase = 'create' | 'consume' | 'all';
+type Phase = 'create' | 'consume' | 'all' | 'recovery';
 
 interface Args {
   phase: Phase;
@@ -45,11 +51,12 @@ interface Args {
   after: string | null;
   withRestock: string | null;
   requests: string[];
+  updatedSince: string | null;
 }
 
 function usage(message: string): never {
   process.stderr.write(
-    `${message}\nusage: human-requests-feed-e2e [--phase create|consume|all] [--phone 5550001111] [--minutes 15] [--after <cursor>] [--with-restock <productId>] [--request <requestId>]...\n`,
+    `${message}\nusage: human-requests-feed-e2e [--phase create|consume|all|recovery] [--phone 5550001111] [--minutes 15] [--after <cursor>] [--with-restock <productId>] [--request <requestId>]... [--updated-since <ISO ms Z>]\n`,
   );
   process.exit(2);
 }
@@ -62,6 +69,7 @@ function parseArgs(argv: string[]): Args {
     after: null,
     withRestock: null,
     requests: [],
+    updatedSince: null,
   };
   const rest = argv.filter((arg) => arg !== '--');
   for (let i = 0; i < rest.length; i += 1) {
@@ -72,7 +80,12 @@ function parseArgs(argv: string[]): Args {
     i += 1;
     switch (flag) {
       case '--phase':
-        if (value !== 'create' && value !== 'consume' && value !== 'all')
+        if (
+          value !== 'create' &&
+          value !== 'consume' &&
+          value !== 'all' &&
+          value !== 'recovery'
+        )
           usage(`invalid --phase ${value}`);
         args.phase = value;
         break;
@@ -93,6 +106,9 @@ function parseArgs(argv: string[]): Args {
         break;
       case '--request':
         args.requests.push(value);
+        break;
+      case '--updated-since':
+        args.updatedSince = value;
         break;
       default:
         usage(`unknown argument ${flag}`);
@@ -234,6 +250,11 @@ async function main(): Promise<void> {
     minutes: args.minutes,
   });
 
+  if (args.phase === 'recovery') {
+    await recovery(client, args.updatedSince);
+    return;
+  }
+
   // Tail first (phase all), so the created request's items come after it.
   let start: string | null = args.after;
   if (args.phase !== 'create' && start === null) {
@@ -280,6 +301,91 @@ async function main(): Promise<void> {
   if (missing.length > 0)
     line('summary', 'requests without a handled item', { missing });
   if (failedAcks.length > 0 || missing.length > 0) process.exitCode = 1;
+}
+
+/** 5c recovery route, every page, read only (nothing is ACKed). Prints
+ *  counts and masked conversation refs; never the phone or payload text. */
+async function recovery(
+  client: ChatbotApiHttpClient,
+  updatedSince: string | null,
+): Promise<void> {
+  const requests: OpenHumanRequest[] = [];
+  const nextCursors = new Set<string>();
+  let page: string | undefined;
+  let pages = 0;
+  for (;;) {
+    const result = await client.listOpenRequests({
+      ...(updatedSince === null ? {} : { updatedSince }),
+      ...(page === undefined ? {} : { cursor: page }),
+      limit: 50,
+    });
+    if (result.kind === 'RATE_LIMITED') {
+      line('recovery', 'rate limited', {
+        retryAfterSeconds: result.retryAfterSeconds,
+      });
+      await sleep((result.retryAfterSeconds ?? 1) * 1000);
+      continue;
+    }
+    if (result.kind === 'VALIDATION_ERROR') {
+      line('recovery', 'FAILED', { result });
+      process.exitCode = 1;
+      return;
+    }
+    pages += 1;
+    nextCursors.add(result.nextCursor);
+    requests.push(...result.items);
+    if (result.nextPage === null) break;
+    page = result.nextPage;
+  }
+  const byStatus: Record<string, number> = {};
+  const byDeferral: Record<string, number> = {};
+  let pending = 0;
+  let resume: string | null = null;
+  for (const request of requests) {
+    byStatus[request.status] = (byStatus[request.status] ?? 0) + 1;
+    pending += request.pendingDeliveries.length;
+    for (const item of request.pendingDeliveries) {
+      const key =
+        item.type === 'unknown' ? 'unknown' : (item.deferredReason ?? 'none');
+      byDeferral[key] = (byDeferral[key] ?? 0) + 1;
+    }
+    const after = request.undeliveredResumeAfter;
+    if (after !== null && (resume === null || after < resume)) resume = after;
+    line('recovery', 'request', {
+      id: request.id,
+      folio: request.folio,
+      kind: request.kind,
+      subtype: request.subtype,
+      status: request.status,
+      conversation: maskConversationRef(request.conversationRef),
+      pendingDeliveries: request.pendingDeliveries.map((item) => ({
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        type: item.type === 'unknown' ? `unknown:${item.rawType}` : item.type,
+        deferredReason:
+          item.type === 'unknown' ? null : (item.deferredReason ?? null),
+      })),
+      undeliveredTruncated: request.undeliveredTruncated,
+      undeliveredResumeAfter: request.undeliveredResumeAfter,
+    });
+  }
+  const [nextCursor] = nextCursors;
+  line('recovery', 'summary', {
+    pages,
+    requests: requests.length,
+    distinctIds: new Set(requests.map((request) => request.id)).size,
+    byStatus,
+    pendingDeliveries: pending,
+    byDeferredReason: byDeferral,
+    truncated: requests.filter((request) => request.undeliveredTruncated)
+      .length,
+    nextCursor: nextCursor ?? null,
+    nextCursorStableAcrossPages: nextCursors.size <= 1,
+    resumeFrom:
+      resume !== null && nextCursor !== undefined && resume < nextCursor
+        ? resume
+        : (nextCursor ?? null),
+  });
 }
 
 /** Reads with waitSeconds 0 until a page is empty; returns the last cursor. */
@@ -402,6 +508,10 @@ async function consume(
         if (result.kind === 'CURSOR_EXPIRED') cursorExpired = true;
         return result;
       },
+      // The 5c recovery would ACK unrelated dev deliveries: use
+      // `--phase recovery` to inspect it read-only instead.
+      listOpenRequests: () =>
+        Promise.reject(new Error('recovery disabled in the e2e run')),
     },
     delivery: {
       accept: async (item: FeedItem) => {
@@ -466,6 +576,12 @@ async function consume(
       if (retried > 0) line('consume', 'ACK sweep', { retried });
       if (result.kind === 'rate_limited') await sleep(result.retryAfterMs);
     } catch (error) {
+      if (cursorExpired) {
+        line('consume', 'CURSOR_EXPIRED', {
+          note: 'stopping; inspect with --phase recovery',
+        });
+        break;
+      }
       failures += 1;
       line('consume', 'page failed', { failures, ...describeError(error) });
       if (failures >= MAX_CONSECUTIVE_FAILURES) break;

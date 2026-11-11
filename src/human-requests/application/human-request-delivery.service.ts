@@ -532,14 +532,10 @@ export class HumanRequestDeliveryService {
         ),
         error: 'RATE_LIMITED',
       };
-    // 5c not live yet: the HUMAN hold stays local, without failing.
-    if (
-      result.kind === 'VALIDATION_ERROR' &&
-      row.ackOutcome === 'DEFERRED_HUMAN_SESSION'
-    )
-      return { ackState: null };
     // IDEMPOTENCY_CONFLICT, OUTCOME_ALREADY_RECORDED, OUTCOME_NOT_ALLOWED,
     // NOT_FOUND or a rejected body: retrying the same body cannot succeed.
+    // A rejected DEFERRED_HUMAN_SESSION (live since 5c) is a real error too;
+    // the row stays HELD_HUMAN locally and is still replayed once BOT.
     const reason =
       result.kind === 'VALIDATION_ERROR'
         ? `VALIDATION_ERROR ${result.message ?? ''}`.trim()

@@ -54,6 +54,8 @@ import type {
   CreateHumanRequestInput,
   CreateHumanRequestResult,
   DeliveryOutcomeInput,
+  ListOpenRequestsOptions,
+  ListOpenRequestsResult,
   PendingDeliveriesFilter,
   PendingDeliveriesResult,
   ReadFeedOptions,
@@ -238,4 +240,10 @@ export interface HumanRequestsClient {
   listPendingDeliveries(
     filter: PendingDeliveriesFilter,
   ): Promise<PendingDeliveriesResult>;
+  /** `GET /chatbot-api/requests?status=open` (5c recovery after a
+   *  `410 CURSOR_EXPIRED`, scope `requests:read`), one page; safe GET retry
+   *  policy. Options are validated locally (never clamped). */
+  listOpenRequests(
+    options?: ListOpenRequestsOptions,
+  ): Promise<ListOpenRequestsResult>;
 }
