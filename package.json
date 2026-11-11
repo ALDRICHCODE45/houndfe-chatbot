@@ -21,7 +21,8 @@
     "migrate": "node-pg-migrate --config-file package.json --config-value pg-migrate up",
     "migrate:down": "node-pg-migrate --config-file package.json --config-value pg-migrate down",
     "preflight:launch": "ts-node src/preflight/launch-preflight.cli.ts",
-    "eval:conversation": "ts-node -r tsconfig-paths/register scripts/eval/conversation-eval.ts"
+    "eval:conversation": "ts-node -r tsconfig-paths/register scripts/eval/conversation-eval.ts",
+    "e2e:human-requests": "ts-node -r tsconfig-paths/register scripts/e2e/human-requests-feed-e2e.ts"
   },
   "pg-migrate": {
     "databaseUrl": "DATABASE_URL",
