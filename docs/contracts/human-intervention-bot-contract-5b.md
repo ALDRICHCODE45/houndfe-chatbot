@@ -195,6 +195,8 @@ Procedure: (1) stop using the expired cursor; (2) call with `status=open` and `u
 
 ## Overdue notice — `request.overdue_notice` (backend unit 7c)
 
+- E2E 2026-11-11 against dev :3003 (backend HEAD 6ec625a0, UNKNOWN_QUESTION claimMinutes 1, hours widened, settings restored after): request 5f35aff8… (S-000004) left unclaimed; the sweep marked CLAIM overdue 8 s after the deadline (SLA_MILESTONE HALF, ESCALATION, OVERDUE; only OVERDUE notifies). Cursor 4 arrived as `request.overdue_notice` (payload `{requestId, folio, kind, subtype, clock: CLAIM, overdueAt, assigned: false}`); the consumer sent the usted notice via the fake sender, decision `OVERDUE_NOTICE`, ACK `PROVIDER_ACCEPTED` → HTTP 200 `ACKED`.
+
 - Created once per request ever, when the backend SLA sweep first marks it overdue. Envelope like the other items (`cursor`, `deliveryId`, `requestId`, `conversationRef`, `notBefore`, `expiresAt`, `deferredReason?`).
 - Payload: `{requestId, folio, kind, subtype, clock ("CLAIM" | "RESOLVE"), overdueAt (ISO UTC), assigned (boolean)}`.
 - ACK outcomes accepted: `PROVIDER_ACCEPTED`, `DELIVERY_UNKNOWN`, `STALE`. `DEFERRED_WINDOW_CLOSED` and `DEFERRED_HUMAN_SESSION` answer `422 OUTCOME_NOT_ALLOWED` (as for `request.cancelled`), so the bot never defers it.
