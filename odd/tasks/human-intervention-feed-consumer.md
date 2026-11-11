@@ -22,7 +22,7 @@ Dev test backend: `http://localhost:3003`, branch id `ced6cc10-a037-4f41-92af-ee
 | T2a | S2, S3, S4, S5 | worker: feed consumer core, delivery ledger, request registry, cancelled + window + HUMAN holds   | 7dda17b              |
 | T2b | S3             | later (backend unit 13): deliver wrapped decisions from the feed and retire the legacy poll paths | —                    |
 | T3  | S6             | worker: outbox HTTP adapter + UNKNOWN_QUESTION create path                                        | 70189c3              |
-| T3b | S6             | worker: outbox ordering lanes (control vs mirror)                                                 | —                    |
+| T3b | S6             | worker: outbox ordering lanes (control vs mirror)                                                 | cc7a91e              |
 | T4  | S7             | parent: e2e run against the dev backend + full suite                                              | 307a9b2 (e2e passed) |
 
 ## Log
