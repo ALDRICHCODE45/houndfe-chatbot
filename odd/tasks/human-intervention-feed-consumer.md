@@ -16,14 +16,16 @@ Dev test backend: `http://localhost:3003`, branch id `ced6cc10-a037-4f41-92af-ee
 
 ## Tasks
 
-| ID  | Specs          | Route                                                      | Commit |
-| --- | -------------- | ---------------------------------------------------------- | ------ |
-| T1  | S1             | worker: chatbot-api client for requests/feed/outcome       | —      |
-| T2  | S2, S3, S4, S5 | worker: feed consumer + delivery                           | —      |
-| T3  | S6             | worker: outbox HTTP adapter + UNKNOWN_QUESTION create path | —      |
-| T4  | S7             | parent: e2e run against the dev backend + full suite       | —      |
+| ID  | Specs          | Route                                                                                            | Commit  |
+| --- | -------------- | ------------------------------------------------------------------------------------------------ | ------- |
+| T1  | S1             | worker: chatbot-api client for requests/feed/outcome                                             | 5969a90 |
+| T2a | S2, S3, S4, S5 | worker: feed consumer core, delivery ledger, request registry, cancelled + window + HUMAN holds  | —       |
+| T2b | S3             | worker: wrapped decisions reconciled with the legacy delivery paths (first one wins by legacyId) | —       |
+| T3  | S6             | worker: outbox HTTP adapter + UNKNOWN_QUESTION create path                                       | —       |
+| T4  | S7             | parent: e2e run against the dev backend + full suite                                             | —       |
 
 ## Log
 
 - L1 — Owner, 2026-11-10: "2. Si, merge a main de lo que recomiendes." (after recommending to connect the chatbot once the backend's unit 5 is on a test backend).
 - L2 — Backend, 2026-11-10: dev test backend up at http://localhost:3003 (feat/human-intervention aab7fb6e); unit 5 closes after an end-to-end run where the chatbot feed consumer drives create → staff resolve/cancel → feed item → outcome ACK. Not built yet: the 410 recovery route and conversation.\* items (unit 11).
+- L3 — 2026-11-10: T1 client committed 5969a90 (HUMAN_REQUESTS_CLIENT port; documented errors as typed results; feed timeout waitSeconds+10 s). Design note: in 5b the feed only carries wrapped DECISION answers (the legacy poll paths already deliver them) and staff cancellations; clarification answers arrive with backend unit 10. So T2 is split: T2a core consumer, T2b reconciliation with the legacy paths so the customer never gets the same answer twice (contract: "Track the answer by the request's legacyId: whichever arrives first is delivered, and the other is ACKed STALE (feed) or ignored (poll).").
