@@ -16,14 +16,14 @@ Dev test backend: `http://localhost:3003`, branch id `ced6cc10-a037-4f41-92af-ee
 
 ## Tasks
 
-| ID  | Specs          | Route                                                                                             | Commit  |
-| --- | -------------- | ------------------------------------------------------------------------------------------------- | ------- |
-| T1  | S1             | worker: chatbot-api client for requests/feed/outcome                                              | 5969a90 |
-| T2a | S2, S3, S4, S5 | worker: feed consumer core, delivery ledger, request registry, cancelled + window + HUMAN holds   | 7dda17b |
-| T2b | S3             | later (backend unit 13): deliver wrapped decisions from the feed and retire the legacy poll paths | —       |
-| T3  | S6             | worker: outbox HTTP adapter + UNKNOWN_QUESTION create path                                        | 70189c3 |
-| T3b | S6             | worker: outbox ordering lanes (control vs mirror)                                                 | —       |
-| T4  | S7             | parent: e2e run against the dev backend + full suite                                              | —       |
+| ID  | Specs          | Route                                                                                             | Commit               |
+| --- | -------------- | ------------------------------------------------------------------------------------------------- | -------------------- |
+| T1  | S1             | worker: chatbot-api client for requests/feed/outcome                                              | 5969a90              |
+| T2a | S2, S3, S4, S5 | worker: feed consumer core, delivery ledger, request registry, cancelled + window + HUMAN holds   | 7dda17b              |
+| T2b | S3             | later (backend unit 13): deliver wrapped decisions from the feed and retire the legacy poll paths | —                    |
+| T3  | S6             | worker: outbox HTTP adapter + UNKNOWN_QUESTION create path                                        | 70189c3              |
+| T3b | S6             | worker: outbox ordering lanes (control vs mirror)                                                 | —                    |
+| T4  | S7             | parent: e2e run against the dev backend + full suite                                              | 307a9b2 (e2e passed) |
 
 ## Log
 
@@ -32,3 +32,4 @@ Dev test backend: `http://localhost:3003`, branch id `ced6cc10-a037-4f41-92af-ee
 - L3 — 2026-11-10: T1 client committed 5969a90 (HUMAN_REQUESTS_CLIENT port; documented errors as typed results; feed timeout waitSeconds+10 s). Design note: in 5b the feed only carries wrapped DECISION answers (the legacy poll paths already deliver them) and staff cancellations; clarification answers arrive with backend unit 10. So T2 is split: T2a core consumer, T2b reconciliation with the legacy paths so the customer never gets the same answer twice (contract: "Track the answer by the request's legacyId: whichever arrives first is delivered, and the other is ACKed STALE (feed) or ignored (poll).").
 - L4 — 2026-11-10 decision (coordinator): while both paths exist, the legacy poll paths stay the ONLY delivery path for wrapped decisions (stock, expiration, zone, receipt), exactly as today; the feed consumer ACKs those `request.answered` DECISION items `STALE` and records `LEGACY_PATH_DELIVERS` locally. Reason: no risk of a double message and no change to customer-visible behavior; the contract allows it ("The bot can consume the feed and keep polling until it trusts it"). The feed delivers what has no legacy path: staff `request.cancelled` and `CLARIFICATION` answers (backend unit 10). T2b moves to backend unit 13. Staff-cancel generic notice (usted, styled per customer): "El equipo cerró su consulta. Si necesita algo más, escríbame por aquí."
 - L5 — 2026-11-10: T3 committed 70189c3 (askTeam tool + UNKNOWN_QUESTION create, outbox router for REQUEST_CREATE/REQUEST_CANCEL, tú pairs, dispatcher hook for pending deliveries). Found head-of-line blocking: a queued REQUEST_CREATE waits behind unwired MESSAGE_MIRROR rows of the same conversation. T3b adds ordering lanes. Known follow-ups: a queued create later rejected permanently leaves the customer with only "Estoy registrando…"; a combined catalog+team question answers only the team part that turn.
+- L6 — 2026-11-11: T2c e02eeb1 (review advisories), T2d aafa7da (poison items abandoned only after 10 min and >=5 attempts, flagged DELIVERY_UNKNOWN for staff), T3b cc7a91e (outbox lanes). Native review of T2a (7dda17b) approved with advisories, fixed in T2c. E2E against the dev backend (:3003) passed: UNKNOWN_QUESTION S-000001 created (201), staff cancel with customerNote, request.cancelled feed item, customerNote sent verbatim with the team prefix through the fake sender, outcome PROVIDER_ACCEPTED acked (200); backend confirmed the feed item, the DELIVERY_OUTCOME audit event, and recorded unit 5 e2e as passed. Full suite with RUN_DOCKER_TESTS=1 at 0ddbb20: 345 suites, 8798 passed, 23 skipped, 0 failed. Pending: DEFERRED_HUMAN_SESSION once backend 5c is live on :3003 (owner runs the dev update); T2b at backend unit 13.
