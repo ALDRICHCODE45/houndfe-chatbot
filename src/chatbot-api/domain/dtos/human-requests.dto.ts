@@ -288,6 +288,23 @@ export type RequestMergedItem = FeedItemEnvelope & {
   type: 'request.merged';
   payload: RequestMergedPayload;
 };
+export interface RequestOverdueNoticePayload {
+  requestId: string;
+  folio: string | null;
+  kind: string | null;
+  subtype: string | null;
+  /** Which SLA clock ran out (claim or resolve). */
+  clock: 'CLAIM' | 'RESOLVE';
+  overdueAt: string | null;
+  assigned: boolean;
+}
+/** Backend unit 7c: the SLA sweep first marked the request overdue (once per
+ *  request ever). The bot tells the customer once; the request stays open and
+ *  the item is never deferred (422 OUTCOME_NOT_ALLOWED). */
+export type RequestOverdueNoticeItem = FeedItemEnvelope & {
+  type: 'request.overdue_notice';
+  payload: RequestOverdueNoticePayload;
+};
 /** A type this bot does not know (e.g. unit 11 `conversation.*`): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
@@ -302,6 +319,7 @@ export type FeedItem =
   | RequestAnsweredItem
   | RequestMergedItem
   | RequestCancelledItem
+  | RequestOverdueNoticeItem
   | UnknownFeedItem;
 
 export type ReadFeedResult =
@@ -776,6 +794,17 @@ export function parseFeedItem(item: unknown): FeedItem | null {
         raw: item,
       }
     );
+  // Informational too: a malformed one is ACKed STALE as unknown.
+  if (item.type === 'request.overdue_notice')
+    return (
+      parseOverdueNotice(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
   if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
     return {
       type: 'unknown',
@@ -853,6 +882,53 @@ function parseMerged(
     expiresAt: item.expiresAt ?? null,
     type: 'request.merged',
     payload: { intoRequestId },
+  };
+}
+
+/** `request.overdue_notice` (backend unit 7c): needs the envelope
+ *  `requestId` and a payload with a known `clock`; every other field is
+ *  tolerated (the bot only needs the request and its conversation). */
+function parseOverdueNotice(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): RequestOverdueNoticeItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const { payload } = item;
+  if (
+    !isText(item.requestId) ||
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    !isRecord(payload) ||
+    (payload.clock !== 'CLAIM' && payload.clock !== 'RESOLVE')
+  )
+    return null;
+  const text = (value: unknown): string | null =>
+    typeof value === 'string' ? value : null;
+  const { deferredReason } = item;
+  return {
+    cursor,
+    deliveryId,
+    requestId: item.requestId,
+    conversationRef: item.conversationRef ?? null,
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+    ...(typeof deferredReason === 'string' &&
+    DEFERRED_REASONS.has(deferredReason)
+      ? { deferredReason: deferredReason as DeferredReason }
+      : {}),
+    type: 'request.overdue_notice',
+    payload: {
+      requestId: item.requestId,
+      folio: text(payload.folio),
+      kind: text(payload.kind),
+      subtype: text(payload.subtype),
+      clock: payload.clock,
+      overdueAt: text(payload.overdueAt),
+      assigned: payload.assigned === true,
+    },
   };
 }
 

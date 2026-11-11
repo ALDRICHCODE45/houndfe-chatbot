@@ -263,6 +263,10 @@ describe('applyCustomerStyle', () => {
       'Estoy registrando su consulta con el equipo; le aviso por aquí.',
       'Estoy registrando tu consulta con el equipo; te aviso por aquí.',
     ],
+    [
+      'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.',
+      'Todavía no tengo respuesta del equipo; sigue pendiente y te aviso en cuanto la tenga.',
+    ],
   ])('converts the human-request copy %j to tú', (usted, tu) => {
     expect(applyCustomerStyle(usted, style({ register: 'tu' }))).toBe(tu);
     expect(applyCustomerStyle(usted, style())).toBe(usted);

@@ -15,6 +15,7 @@ import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.p
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
+  OVERDUE_NOTICE,
   RETRY_AFTER_MAX_MS,
   ackBackoffMs,
   ackBodyFor,
@@ -64,8 +65,12 @@ type Plan =
       decision: DeliveryDecision;
       senderId: string;
       text: string;
-      /** request.cancelled: never a deferral (422 OUTCOME_NOT_ALLOWED). */
+      /** request.cancelled / request.overdue_notice: never a deferral (422
+       *  OUTCOME_NOT_ALLOWED); a closed window is STALE. */
       cancellation: boolean;
+      /** request.overdue_notice: a HUMAN-mode hold is an immediate STALE
+       *  (HUMAN_SESSION), never a local hold. */
+      overdue?: boolean;
     };
 
 /**
@@ -320,6 +325,18 @@ export class HumanRequestDeliveryService {
     const hold = await checkHandoffSendHold(this.ports.handoff, plan.senderId);
     if (hold.hold && hold.reason === 'MODE_UNREADABLE')
       throw new Error(`handoff mode unreadable: ${hold.error}`);
+    if (hold.hold && plan.overdue === true) {
+      const next = await this.ports.store.transition(row.deliveryId, expected, {
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+        attemptId: this.newAttemptId(),
+        attemptedAt,
+        providerMessageId: null,
+        ack: 'STALE',
+      });
+      if (next !== null) await this.flushAck(next);
+      return next !== null;
+    }
     if (hold.hold) {
       if (row.localState === 'HELD_HUMAN') return false;
       const next = await this.ports.store.transition(row.deliveryId, expected, {
@@ -443,6 +460,24 @@ export class HumanRequestDeliveryService {
         `request ${item.requestId} merged into ${item.payload.intoRequestId}: STALE`,
       );
       return { action: 'stale', decision: 'DUPLICATE' };
+    }
+
+    if (item.type === 'request.overdue_notice') {
+      // The request stays open in the registry; the customer is told once.
+      const senderId = this.recipient(row);
+      if (senderId === null)
+        return { action: 'stale', decision: 'NO_CONVERSATION' };
+      if (!(await this.ports.isWindowOpen(senderId)))
+        return { action: 'stale', decision: 'WINDOW_CLOSED' };
+      const style = await this.readStyle(senderId);
+      return {
+        action: 'send',
+        decision: 'OVERDUE_NOTICE',
+        senderId,
+        text: styleFixedCopy(OVERDUE_NOTICE, style),
+        cancellation: true,
+        overdue: true,
+      };
     }
 
     // request.cancelled: forget the request's pending state first.

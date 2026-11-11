@@ -11,6 +11,7 @@ import { WhatsappSendError } from '../../whatsapp/infrastructure/meta-whatsapp.s
 import {
   REF,
   cancelledItem,
+  overdueItem,
 } from '../infrastructure/human-request-feed-store.contract';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
 import {
@@ -456,6 +457,136 @@ describe('HumanRequestDeliveryService', () => {
       sender.script = [new WhatsappSendError(400, 131047, 'Re-engagement')];
       await service.accept(cancelledItem('c6'));
       expect(client.acks[0].body.outcome).toBe('STALE');
+    });
+  });
+
+  describe('request.overdue_notice', () => {
+    const NOTICE_USTED =
+      'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.';
+
+    it('usted: sends the notice once, PROVIDER_ACCEPTED, OVERDUE_NOTICE, the request stays open', async () => {
+      const { service, sender, client, store } = setup();
+      await store.recordOpenRequest({
+        requestId: 'req-o1',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      await service.accept(overdueItem('o1'));
+      expect(sender.sent).toEqual([{ to: SENDER, text: NOTICE_USTED }]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('PROVIDER_ACCEPTED');
+      await expect(store.getDelivery('o1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'OVERDUE_NOTICE',
+      });
+      await expect(store.getRequest('req-o1')).resolves.toMatchObject({
+        status: 'OPEN',
+      });
+    });
+
+    it('tú: sends the tú copy', async () => {
+      const { service, sender, client, setStyle } = setup();
+      setStyle(TU);
+      await service.accept(overdueItem('o2'));
+      expect(sender.sent).toEqual([
+        {
+          to: SENDER,
+          text: 'Todavía no tengo respuesta del equipo; sigue pendiente y te aviso en cuanto la tenga.',
+        },
+      ]);
+      expect(client.acks[0].body.outcome).toBe('PROVIDER_ACCEPTED');
+    });
+
+    it('window closed: no send, ACK STALE / WINDOW_CLOSED, never a deferral', async () => {
+      const { service, sender, client, store, window } = setup();
+      window.open = false;
+      await service.accept(overdueItem('o3'));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('o3')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'WINDOW_CLOSED',
+      });
+    });
+
+    it("Meta's window error is STALE, not a deferral", async () => {
+      const { service, sender, client, store } = setup();
+      sender.script = [new WhatsappSendError(400, 131047, 'Re-engagement')];
+      await service.accept(overdueItem('o4'));
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('o4')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'WINDOW_CLOSED',
+      });
+    });
+
+    it('no conversationRef: ACK STALE / NO_CONVERSATION', async () => {
+      const { service, sender, client, store } = setup();
+      await service.accept(overdueItem('o5', { conversationRef: null }));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('o5')).resolves.toMatchObject({
+        decision: 'NO_CONVERSATION',
+      });
+    });
+
+    it('HUMAN mode: ACK STALE / HUMAN_SESSION right away, nothing sent, no deferral, no hold', async () => {
+      const { service, sender, client, store, human } = setup();
+      human.value = true;
+      await service.accept(overdueItem('o6'));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('o6')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+        ackState: 'ACKED',
+      });
+      // Back in BOT mode nothing is replayed.
+      human.value = false;
+      await service.onCustomerInbound(REF);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('an unreadable mode fails the item (retried), never sends', async () => {
+      const store = new InMemoryHumanRequestFeedStore();
+      const sender = new FakeSender();
+      const client = new FakeClient();
+      const service = new HumanRequestDeliveryService(
+        {
+          store,
+          client,
+          sender,
+          handoff: { isHumanMode: () => Promise.reject(new Error('db')) },
+          isWindowOpen: () => Promise.resolve(true),
+        },
+        { clock: () => NOW },
+      );
+      await expect(service.accept(overdueItem('o7'))).rejects.toThrow();
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toEqual([]);
+      await expect(store.getDelivery('o7')).resolves.toMatchObject({
+        localState: 'RECEIVED',
+      });
+    });
+
+    it('a replayed deliveryId is sent once', async () => {
+      const { service, sender, client } = setup();
+      await service.accept(overdueItem('o8'));
+      await service.accept(overdueItem('o8'));
+      expect(sender.sent).toHaveLength(1);
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('an uncertain send is DELIVERY_UNKNOWN, never retried', async () => {
+      const { service, sender, client } = setup();
+      sender.script = [new Error('socket hang up')];
+      await service.accept(overdueItem('o9'));
+      expect(client.acks.map((a) => a.body.outcome)).toEqual([
+        'DELIVERY_UNKNOWN',
+      ]);
+      await service.accept(overdueItem('o9'));
+      expect(sender.sent).toHaveLength(1);
     });
   });
 

@@ -15,6 +15,7 @@ import { HumanRequestFeedConsumer } from '../application/human-request-feed.cons
 import {
   REF,
   cancelledItem,
+  overdueItem,
   runHumanRequestFeedStoreContract,
 } from './human-request-feed-store.contract';
 import { PostgresFeedConsumerLock } from './postgres-feed-consumer.lock';
@@ -269,14 +270,55 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
         },
       ),
     ).resolves.toMatchObject({ decision: 'LOCAL_FAILURE' });
-    // down refuses while a LOCAL_FAILURE row exists.
-    expect(() => migrate('down', '1')).toThrow();
+    // down (4600 first, then 4500) refuses while a LOCAL_FAILURE row exists.
+    expect(() => migrate('down', '2')).toThrow();
     await truncate();
-    migrate('down', '1');
+    migrate('down', '2');
     const gone = await pool.query(
       `SELECT 1 FROM pg_indexes WHERE indexname = 'human_request_deliveries_purge_idx'`,
     );
     expect(gone.rowCount).toBe(0);
+    migrate('up');
+  });
+
+  it('migration 4600: OVERDUE_NOTICE and HUMAN_SESSION decisions', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    for (const decision of ['OVERDUE_NOTICE', 'HUMAN_SESSION'] as const) {
+      await store.insertDelivery(overdueItem(`ov-${decision}`));
+      await expect(
+        store.transition(
+          `ov-${decision}`,
+          { localState: 'RECEIVED', attemptId: null },
+          {
+            localState: 'STALE',
+            decision,
+            attemptId: '0b8f5c0e-6d7a-4c1e-9a52-3f1d2b6a7c10',
+            attemptedAt: '2026-11-10T16:20:00.000Z',
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        ),
+      ).resolves.toMatchObject({ decision });
+    }
+    // down refuses while a row uses a new decision.
+    expect(() => migrate('down', '1')).toThrow();
+    await truncate();
+    migrate('down', '1');
+    await store.insertDelivery(overdueItem('ov-old'));
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'OVERDUE_NOTICE'
+          WHERE delivery_id = 'ov-old'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    // The previous decisions still pass the restored CHECK.
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'LOCAL_FAILURE'
+          WHERE delivery_id = 'ov-old'`,
+      ),
+    ).resolves.toBeDefined();
+    await truncate();
     migrate('up');
   });
 
