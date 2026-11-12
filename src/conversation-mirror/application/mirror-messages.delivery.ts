@@ -145,6 +145,15 @@ export class MirrorMessagesDelivery implements BackendOutboxBatchDeliveryPort {
         carriesMedia: (item) => item.value.media !== undefined,
         mediaRetriesExhausted: (item) =>
           item.value.attempts >= MEDIA_NOT_FOUND_MAX_ATTEMPTS,
+        carriesStaffReply: (item) =>
+          item.value.message.staffReplyId !== undefined,
+        dropStaffReply: (item) => {
+          // Fixed text: no phone, no reply id (S6).
+          this.logger.warn(
+            `mirror staffReplyId not found by the backend (${maskConversationRef(item.value.conversationRef)}#${item.index}): message mirrored as BOT (REPLY_NOT_FOUND)`,
+          );
+          delete item.value.message.staffReplyId;
+        },
         degradeMedia: (item) => {
           this.logger.warn(
             `mirror media still not found after ${item.value.attempts} retries (${maskConversationRef(item.value.conversationRef)}#${item.index}): message mirrored as UNSUPPORTED`,

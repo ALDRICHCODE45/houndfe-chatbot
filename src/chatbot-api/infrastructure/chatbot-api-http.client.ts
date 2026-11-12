@@ -1514,6 +1514,8 @@ export class ChatbotApiHttpClient
         return { kind: 'MEDIA_NOT_FOUND' };
       if (status === 422 && code === 'MEDIA_TYPE_MISMATCH')
         return { kind: 'MEDIA_TYPE_MISMATCH' };
+      if (status === 422 && code === 'REPLY_NOT_FOUND')
+        return { kind: 'REPLY_NOT_FOUND' };
       return classifyMirrorFailure(outcome.failure);
     }
     const ack = parseMirrorBatchAck(outcome.response.data);

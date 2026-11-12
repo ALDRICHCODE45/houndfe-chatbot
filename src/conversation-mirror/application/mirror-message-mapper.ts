@@ -27,6 +27,8 @@ const FUTURE_SLACK_MS = 4 * 60_000;
 const MIN_TIMESTAMP_MS = Date.UTC(2020, 0, 1);
 const ISO_8601 =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+const REPLY_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const WA_MESSAGE_ID = /^[A-Za-z0-9._=+/:-]{1,255}$/;
 
 const CONTRACT_TYPES: readonly string[] = [
@@ -183,6 +185,14 @@ export function mapMirrorEntry(
     if (text.trim() === '')
       return { ok: false, reason: 'TEXT message has no text' };
     message.text = text;
+    // Unit 10: only the OUT TEXT that delivered a staff reply; anything
+    // malformed just loses the attribution (still mirrored, as BOT).
+    if (
+      direction === 'OUT' &&
+      typeof payload.staffReplyId === 'string' &&
+      REPLY_ID.test(payload.staffReplyId)
+    )
+      message.staffReplyId = payload.staffReplyId;
     return { ok: true, message };
   }
 

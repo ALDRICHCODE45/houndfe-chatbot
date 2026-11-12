@@ -83,6 +83,27 @@ describe('MetaWhatsappSender transcript (S1)', () => {
     ]);
   });
 
+  it('records staffReplyId in the details of that text only', async () => {
+    accept('wamid.reply', 'wamid.plain');
+    await sender.sendText({
+      to: TO,
+      text: 'Le comparto la respuesta del equipo:\nSí',
+      staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09',
+    });
+    await sender.sendText({ to: TO, text: 'otro' });
+    expect(entries[0]).toEqual({
+      to: TO,
+      providerMessageId: 'wamid.reply',
+      type: 'text',
+      text: 'Le comparto la respuesta del equipo:\nSí',
+      details: { staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09' },
+      acceptedAt: anyDate,
+    });
+    expect(entries[1]).not.toHaveProperty('details');
+    // Meta never sees the attribution.
+    expect(JSON.stringify(post.mock.calls[0][1])).not.toContain('staffReplyId');
+  });
+
   it('records an image with its caption and link', async () => {
     accept('wamid.img');
     await sender.sendImage({

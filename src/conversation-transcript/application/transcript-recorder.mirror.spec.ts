@@ -138,6 +138,40 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
     });
   });
 
+  it('an outbound text sent for a staff reply mirrors staffReplyId (that row only)', async () => {
+    await recorder.recordOutbound({
+      to: SENDER,
+      providerMessageId: 'wamid.out-reply',
+      type: 'text',
+      text: 'Le comparto la respuesta del equipo:\nSí',
+      details: { staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09' },
+      acceptedAt: new Date('2026-11-09T16:02:12.100Z'),
+    });
+    await recorder.recordOutbound({
+      to: SENDER,
+      providerMessageId: 'wamid.out-plain',
+      type: 'text',
+      text: 'otro',
+    });
+    const [reply, plain] = mirrors(outbox).map((m) => m.payload);
+    expect(reply).toMatchObject({
+      staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09',
+      direction: 'OUT',
+    });
+    expect(plain).not.toHaveProperty('staffReplyId');
+  });
+
+  it('staffReplyId is never mirrored for an inbound or a non-text outbound', async () => {
+    await recorder.recordOutbound({
+      to: SENDER,
+      providerMessageId: 'wamid.out-img',
+      type: 'image',
+      media: { link: 'https://cdn.example.com/a.jpg' },
+      details: { staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09' },
+    });
+    expect(mirrors(outbox)[0].payload).not.toHaveProperty('staffReplyId');
+  });
+
   it('an interactive outbound mirrors its body plus the offered option titles', async () => {
     await recorder.recordOutbound({
       to: SENDER,

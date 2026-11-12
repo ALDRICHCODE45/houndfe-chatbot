@@ -223,9 +223,13 @@ export type TransferReceiptAnswer = DecisionCommon & {
 
 export interface ClarificationAnswer {
   kind: 'CLARIFICATION';
-  /** Delivered verbatim with the team prefix. */
+  /** The staff text (`staffText`, else `text`), delivered verbatim with the
+   *  team prefix. */
   text: string;
   prefix: string | null;
+  /** Unit 10: the id to mirror the sent message with (`staffReplyId`).
+   *  Absent on items that predate it: delivered with no attribution. */
+  replyId?: string;
 }
 
 /** Unknown kind/subtype/action: the raw payload plus the fallback text. */
@@ -618,6 +622,11 @@ const KNOWN_ACTIONS: Record<string, readonly string[]> = {
   TRANSFER_RECEIPT: ['CONFIRM_RECEIPT', 'REJECT_RECEIPT'],
 };
 
+const REPLY_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isReplyId = (value: unknown): value is string =>
+  typeof value === 'string' && REPLY_ID.test(value);
+
 /** `undefined` = malformed (rejects the page). */
 function parseAnswered(
   p: Record<string, unknown>,
@@ -635,8 +644,18 @@ function parseAnswered(
       : undefined;
 
   if (p.kind === 'CLARIFICATION') {
-    if (!isText(p.text)) return undefined;
-    return { kind: 'CLARIFICATION', text: p.text, prefix };
+    // Contract: relay `staffText` as written; `text` (same string) is the
+    // fallback. A malformed `replyId` only loses the attribution: it must
+    // never reject the page and block the feed.
+    const staff = isText(p.staffText) ? p.staffText : p.text;
+    if (!isText(staff)) return undefined;
+    const replyId = isReplyId(p.replyId) ? p.replyId : undefined;
+    return {
+      kind: 'CLARIFICATION',
+      text: staff,
+      prefix,
+      ...(replyId === undefined ? {} : { replyId }),
+    };
   }
   if (
     p.kind !== 'DECISION' ||

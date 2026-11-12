@@ -232,6 +232,21 @@ function offeredOptions(
   return titles.length === 0 ? null : titles;
 }
 
+/** Unit 10: the staff reply an OUT text message delivered, if any. */
+function sentStaffReplyId(
+  row: TranscriptMessage,
+  contractType: MirrorContractType,
+): string | null {
+  const id = row.details?.staffReplyId;
+  return row.direction === 'OUT' &&
+    row.type === 'text' &&
+    contractType === 'TEXT' &&
+    typeof id === 'string' &&
+    id !== ''
+    ? id
+    : null;
+}
+
 /**
  * Contract `messages:batch` item from the stored row. Fields only get added
  * over time (rows already in the outbox keep their `media` object and Meta's
@@ -247,6 +262,7 @@ function offeredOptions(
 export function mirrorPayload(row: TranscriptMessage): Record<string, unknown> {
   const contractType = mirrorContractType(row.type);
   const options = offeredOptions(row.details);
+  const staffReplyId = sentStaffReplyId(row, contractType);
   return {
     waMessageId: row.waMessageId,
     direction: row.direction,
@@ -258,6 +274,7 @@ export function mirrorPayload(row: TranscriptMessage): Record<string, unknown> {
       : {}),
     ...(row.text === null ? {} : { text: row.text }),
     ...(options === null ? {} : { options }),
+    ...(staffReplyId === null ? {} : { staffReplyId }),
     ...(row.media === null ? {} : { media: row.media }),
     ...(row.providerTimestamp === null
       ? {}

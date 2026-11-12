@@ -394,6 +394,75 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       expect(FEED_TIMEOUT_SLACK_MS).toBe(10_000);
     });
 
+    describe('request.answered CLARIFICATION (unit 10)', () => {
+      const REPLY = '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09';
+      const clarificationRaw = (payload: Record<string, unknown>) => ({
+        ...answeredItem,
+        payload: {
+          kind: 'CLARIFICATION',
+          subtype: 'UNKNOWN_QUESTION',
+          action: 'REPLY',
+          text: 'Sí, es apto desde las 8 semanas.',
+          prefix: 'Le comparto la respuesta del equipo:',
+          staffText: 'Sí, es apto desde las 8 semanas.',
+          ...payload,
+        },
+      });
+      const readPayload = async (raw: unknown) => {
+        request.mockReturnValue(
+          of(response({ items: [raw], nextCursor: '000000001842' })),
+        );
+        const result = await client.readFeed({ after: 'c' });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        return (result.items[0] as { payload: unknown }).payload;
+      };
+
+      it('parses replyId and relays staffText', async () => {
+        await expect(
+          readPayload(clarificationRaw({ replyId: REPLY })),
+        ).resolves.toEqual({
+          kind: 'CLARIFICATION',
+          text: 'Sí, es apto desde las 8 semanas.',
+          prefix: 'Le comparto la respuesta del equipo:',
+          replyId: REPLY,
+        });
+      });
+
+      it('an item without replyId still parses (no attribution)', async () => {
+        const payload = await readPayload(clarificationRaw({}));
+        expect(payload).toEqual({
+          kind: 'CLARIFICATION',
+          text: 'Sí, es apto desde las 8 semanas.',
+          prefix: 'Le comparto la respuesta del equipo:',
+        });
+        expect(payload).not.toHaveProperty('replyId');
+      });
+
+      it('staffText wins over text; text is the fallback when staffText is absent', async () => {
+        await expect(
+          readPayload(
+            clarificationRaw({
+              text: 'otro',
+              staffText: 'tal cual',
+              replyId: REPLY,
+            }),
+          ),
+        ).resolves.toMatchObject({ text: 'tal cual' });
+        await expect(
+          readPayload(clarificationRaw({ staffText: undefined })),
+        ).resolves.toMatchObject({ text: 'Sí, es apto desde las 8 semanas.' });
+      });
+
+      it.each([[null], [''], [42], ['not-a-uuid']])(
+        'a malformed replyId (%j) is ignored, never rejects the page',
+        async (replyId) => {
+          const payload = await readPayload(clarificationRaw({ replyId }));
+          expect(payload).toMatchObject({ kind: 'CLARIFICATION' });
+          expect(payload).not.toHaveProperty('replyId');
+        },
+      );
+    });
+
     it('defaults to limit 50 / waitSeconds 25 and omits after', async () => {
       request.mockReturnValue(of(response({ items: [], nextCursor: '' })));
       await expect(client.readFeed()).resolves.toEqual({

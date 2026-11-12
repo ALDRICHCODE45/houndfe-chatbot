@@ -73,15 +73,18 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   async sendText(message: OutboundText): Promise<SendResult> {
     this.assertTextMessage(message);
 
-    return this.send({
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: message.to,
-      type: 'text',
-      text: {
-        body: message.text,
+    return this.send(
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: message.to,
+        type: 'text',
+        text: {
+          body: message.text,
+        },
       },
-    });
+      message.staffReplyId,
+    );
   }
 
   async sendImage(message: OutboundImage): Promise<SendResult> {
@@ -174,7 +177,10 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     });
   }
 
-  private async send(payload: MetaMessagePayload): Promise<SendResult> {
+  private async send(
+    payload: MetaMessagePayload,
+    staffReplyId?: string,
+  ): Promise<SendResult> {
     // Explicit, default-off sandbox compatibility mode (see below).
     const sandboxNormalization =
       this.configService.get<boolean>(
@@ -194,7 +200,12 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       throw new Error('Meta response did not include a provider message id');
     }
 
-    await this.recordTranscript(payload, providerMessageId, acceptedAt);
+    await this.recordTranscript(
+      payload,
+      providerMessageId,
+      acceptedAt,
+      staffReplyId,
+    );
     return { providerMessageId };
   }
 
@@ -207,11 +218,16 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     payload: MetaMessagePayload,
     providerMessageId: string,
     acceptedAt: Date,
+    staffReplyId?: string,
   ): Promise<void> {
     if (this.transcript === undefined || this.isOpsPhone(payload.to)) return;
     try {
+      const entry = transcriptEntry(payload, providerMessageId);
       await this.transcript.recordOutbound({
-        ...transcriptEntry(payload, providerMessageId),
+        ...entry,
+        ...(staffReplyId === undefined
+          ? {}
+          : { details: { ...entry.details, staffReplyId } }),
         acceptedAt,
       });
     } catch (error) {

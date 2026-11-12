@@ -5,6 +5,12 @@ export const WHATSAPP_SENDER = Symbol('WHATSAPP_SENDER');
 export interface OutboundText {
   to: string;
   text: string;
+  /**
+   * Unit 10: the `replyId` of a staff clarification reply this text delivers.
+   * Never sent to Meta; recorded with the transcript row so the mirror can
+   * attribute the message to the staff member.
+   */
+  staffReplyId?: string;
 }
 
 /**
