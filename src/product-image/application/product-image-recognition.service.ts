@@ -9,6 +9,7 @@ import type {
   ProductImageMimeType,
   ProductImageRecognition,
 } from '../domain/product-image';
+import { describeError } from '../../common/log-safe';
 
 /** Overall bound on the Meta metadata + download hops (each hop also has
  * its own configured timeout inside the client). */
@@ -66,7 +67,7 @@ export class ProductImageRecognitionService {
       return await this.describer.describe({ bytes, mimeType });
     } catch (error) {
       this.logger.warn(
-        `Product image recognition failed: ${error instanceof Error ? error.message : String(error)}`,
+        `Product image recognition failed: ${describeError(error)}`,
       );
       return { kind: 'unavailable', reason: 'error' };
     } finally {

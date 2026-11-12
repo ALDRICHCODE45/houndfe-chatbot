@@ -11,6 +11,7 @@ import {
   type BackendOutboxStore,
   type ClaimedBackendOutboxEntry,
 } from '../domain/backend-outbox';
+import { describeError, sanitizeErrorText } from '../../common/log-safe';
 
 export interface BackendOutboxDrainOptions {
   /** Stable per-process lease owner. */
@@ -135,7 +136,7 @@ export class BackendOutboxDrainWorker {
         this.leaseMs,
       );
     } catch (error) {
-      this.logger.warn(`backend outbox claim failed: ${describe(error)}`);
+      this.logger.warn(`backend outbox claim failed: ${describeError(error)}`);
       return 0;
     }
     this.fullBatch = false;
@@ -159,7 +160,9 @@ export class BackendOutboxDrainWorker {
       );
     } catch (error) {
       // Deliver the head alone rather than leave it leased until expiry.
-      this.logger.warn(`backend outbox run claim failed: ${describe(error)}`);
+      this.logger.warn(
+        `backend outbox run claim failed: ${describeError(error)}`,
+      );
       return this.process(head);
     }
     if (run.length === 0) {
@@ -202,7 +205,9 @@ export class BackendOutboxDrainWorker {
       });
     } catch (error) {
       // The leases expire and the rows are reclaimed; delivery is idempotent.
-      this.logger.warn(`backend outbox completion failed: ${describe(error)}`);
+      this.logger.warn(
+        `backend outbox completion failed: ${describeError(error)}`,
+      );
     }
   }
 
@@ -248,7 +253,7 @@ export class BackendOutboxDrainWorker {
         return { entry, outcome: 'DONE' };
       case 'PERMANENT':
         this.logger.error(
-          `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${result.error}`,
+          `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${sanitizeErrorText(result.error)}`,
         );
         return { entry, outcome: 'DEAD', error: result.error };
       case 'RETRY':
@@ -286,7 +291,9 @@ export class BackendOutboxDrainWorker {
         );
     } catch (error) {
       // The lease expires and the row is reclaimed; delivery is idempotent.
-      this.logger.warn(`backend outbox completion failed: ${describe(error)}`);
+      this.logger.warn(
+        `backend outbox completion failed: ${describeError(error)}`,
+      );
     }
   }
 
@@ -322,7 +329,7 @@ export class BackendOutboxDrainWorker {
         return this.store.markDone(entry);
       case 'PERMANENT':
         this.logger.error(
-          `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${result.error}`,
+          `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${sanitizeErrorText(result.error)}`,
         );
         return this.store.markDead(entry, result.error);
       case 'RETRY':
@@ -351,7 +358,7 @@ export class BackendOutboxDrainWorker {
         if (deleted < this.purgeBatchSize || this.stopped) return;
       }
     } catch (error) {
-      this.logger.warn(`backend outbox purge failed: ${describe(error)}`);
+      this.logger.warn(`backend outbox purge failed: ${describeError(error)}`);
     }
   }
 
@@ -365,7 +372,9 @@ export class BackendOutboxDrainWorker {
           claimed = count;
         })
         .catch((error) => {
-          this.logger.warn(`backend outbox tick failed: ${describe(error)}`);
+          this.logger.warn(
+            `backend outbox tick failed: ${describeError(error)}`,
+          );
         })
         .finally(() => {
           this.inFlight = undefined;

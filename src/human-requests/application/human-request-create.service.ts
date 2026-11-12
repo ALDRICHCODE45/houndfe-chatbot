@@ -33,6 +33,7 @@ import {
   styleFixedCopy,
   type HumanRequestFeedStore,
 } from '../domain/human-request-feed';
+import { describeError } from '../../common/log-safe';
 
 /** The outbox kinds this adapter delivers. */
 export const HUMAN_REQUEST_OUTBOX_KINDS: readonly BackendOutboxKind[] = [
@@ -122,7 +123,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       result = await this.ports.client.createHumanRequest(request);
     } catch (error) {
       this.logger.warn(
-        `askTeam create failed for ${maskConversationRef(request.conversationRef)}, queueing: ${describe(error)}`,
+        `askTeam create failed for ${maskConversationRef(request.conversationRef)}, queueing: ${describeError(error)}`,
       );
       return this.queue(request);
     }
@@ -171,7 +172,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       return { kind: 'queued' };
     } catch (error) {
       this.logger.error(
-        `askTeam queue failed for ${maskConversationRef(request.conversationRef)}: ${describe(error)}`,
+        `askTeam queue failed for ${maskConversationRef(request.conversationRef)}: ${describeError(error)}`,
       );
       return { kind: 'failed', reason: 'queue_failed' };
     }
@@ -196,7 +197,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
     } catch (error) {
       if (strict) throw error;
       this.logger.warn(
-        `request ${requestId} created but its registry row failed: ${describe(error)}`,
+        `request ${requestId} created but its registry row failed: ${describeError(error)}`,
       );
     }
     return requestId;
@@ -284,7 +285,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       });
     } catch (error) {
       this.logger.warn(
-        `queued create confirmation skipped for ${maskConversationRef(conversationRef)}: ${describe(error)}`,
+        `queued create confirmation skipped for ${maskConversationRef(conversationRef)}: ${describeError(error)}`,
       );
     }
   }
@@ -297,8 +298,4 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       return null;
     }
   }
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

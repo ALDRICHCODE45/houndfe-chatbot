@@ -86,8 +86,23 @@ RETURNING o.*`;
  * is of another kind or not due, i.e. the contiguous run; the id lookups that
  * lock and update it use the primary key. Followers cannot be claimed by any
  * other worker meanwhile: they are never lane heads while the head is leased.
- * All rows receive the same ms-truncated lease, the head included. */
-const CLAIM_RUN_SQL = `WITH head AS (
+ * All rows receive the same ms-truncated lease, the head included.
+ * The spec asserts through EXPLAIN that the lateral scan uses that index.
+ *
+ * Races with a stale holder (its lease expired, its `completeMany` still
+ * running): `cand`/`run` read one snapshot, so a follower may be completed
+ * or rescheduled while we wait for its row lock. The `locked` step therefore
+ * repeats the row predicates (same kind, open, due or expired lease; the
+ * head repeats its fence: IN_FLIGHT, caller's owner and lease): after a lock
+ * wait Postgres re-checks them against the newest row version and drops a row
+ * that no longer qualifies. The `head` step already holds the head's row lock
+ * for the whole statement, so its fence cannot change afterwards; the repeat
+ * is defense in depth. A head that changed hands drops out first in
+ * `claimable` (nothing precedes it), so the whole run returns empty. `claimable` then cuts the run at the first dropped row, so a
+ * follower is never claimed past a row that is not claimable any more
+ * (head-of-line). Rows are locked in ascending seq, the order
+ * `COMPLETE_MANY_SQL` uses, so the two statements cannot deadlock. */
+export const CLAIM_RUN_SQL = `WITH head AS (
   SELECT id, conversation_ref, lane, seq, kind FROM backend_outbox
   WHERE id = $1 AND status = 'IN_FLIGHT' AND lease_owner = $2
     AND lease_expires_at = $3::timestamptz
@@ -108,37 +123,64 @@ const CLAIM_RUN_SQL = `WITH head AS (
     LIMIT $4::int
   ) o
 ), run AS (
-  SELECT id FROM cand WHERE in_run ORDER BY seq LIMIT $4::int
+  SELECT id, seq FROM cand WHERE in_run ORDER BY seq LIMIT $4::int
 ), locked AS (
-  SELECT o.id FROM backend_outbox o WHERE o.id IN (SELECT id FROM run)
-  ORDER BY o.seq FOR UPDATE
+  SELECT o.id, o.seq FROM backend_outbox o
+  CROSS JOIN head h
+  WHERE o.id IN (SELECT id FROM run)
+    AND o.kind = h.kind
+    AND ((o.id = h.id AND o.status = 'IN_FLIGHT' AND o.lease_owner = $2
+        AND o.lease_expires_at = $3::timestamptz)
+      OR (o.status = 'PENDING' AND o.next_attempt_at <= now())
+      OR (o.status = 'IN_FLIGHT' AND o.lease_expires_at <= now()))
+  ORDER BY o.seq FOR UPDATE OF o
+), claimable AS (
+  SELECT l.id FROM locked l
+  WHERE NOT EXISTS (
+    SELECT 1 FROM run r
+    WHERE r.seq < l.seq AND r.id NOT IN (SELECT id FROM locked))
 )
 UPDATE backend_outbox o
 SET status = 'IN_FLIGHT', lease_owner = $5,
   lease_expires_at = date_trunc('milliseconds', now())
     + make_interval(secs => $6::double precision / 1000.0)
-FROM locked WHERE o.id = locked.id
+FROM claimable WHERE o.id = claimable.id
 RETURNING o.*`;
 
 /** DONE / RETRY / DEAD for many claimed rows in one statement, each row
  * fenced by its own (owner, lease). Same column effects as the single-row
- * statements below. */
-const COMPLETE_MANY_SQL = `UPDATE backend_outbox o
-SET status = CASE v.outcome
+ * statements below.
+ *
+ * Deadlock avoidance: rows are locked first, in (conversation, lane, seq)
+ * order whatever the input order, which is the order `CLAIM_RUN_SQL` locks
+ * its run in. The fence is part of the locking scan, so after a lock wait
+ * Postgres re-evaluates it against the row's newest version: a row another
+ * worker re-leased or completed meanwhile is skipped (reported `false`). */
+export const COMPLETE_MANY_SQL = `WITH v AS (
+  SELECT * FROM unnest($1::bigint[], $2::text[], $3::timestamptz[], $4::text[],
+    $5::text[], $6::double precision[])
+    WITH ORDINALITY AS t(id, owner, lease, outcome, error, delay_ms, ord)
+), locked AS (
+  SELECT o.id, v.outcome, v.error, v.delay_ms, v.ord
+  FROM backend_outbox o JOIN v ON o.id = v.id
+  WHERE o.status = 'IN_FLIGHT' AND o.lease_owner = v.owner
+    AND o.lease_expires_at = v.lease
+  ORDER BY o.conversation_ref, o.lane, o.seq
+  FOR UPDATE OF o
+)
+UPDATE backend_outbox o
+SET status = CASE l.outcome
     WHEN 'DONE' THEN 'DONE' WHEN 'DEAD' THEN 'DEAD' ELSE 'PENDING' END,
   attempts = o.attempts + 1,
-  done_at = CASE WHEN v.outcome = 'DONE' THEN now() ELSE o.done_at END,
-  last_error = CASE WHEN v.outcome = 'DONE' THEN o.last_error ELSE v.error END,
-  next_attempt_at = CASE WHEN v.outcome = 'RETRY'
-    THEN now() + make_interval(secs => v.delay_ms / 1000.0)
+  done_at = CASE WHEN l.outcome = 'DONE' THEN now() ELSE o.done_at END,
+  last_error = CASE WHEN l.outcome = 'DONE' THEN o.last_error ELSE l.error END,
+  next_attempt_at = CASE WHEN l.outcome = 'RETRY'
+    THEN now() + make_interval(secs => l.delay_ms / 1000.0)
     ELSE o.next_attempt_at END,
   lease_owner = NULL, lease_expires_at = NULL
-FROM unnest($1::bigint[], $2::text[], $3::timestamptz[], $4::text[],
-  $5::text[], $6::double precision[])
-  WITH ORDINALITY AS v(id, owner, lease, outcome, error, delay_ms, ord)
-WHERE o.id = v.id AND o.status = 'IN_FLIGHT' AND o.lease_owner = v.owner
-  AND o.lease_expires_at = v.lease
-RETURNING v.ord`;
+FROM locked l
+WHERE o.id = l.id
+RETURNING l.ord`;
 
 const FENCE = `WHERE id = $1 AND status = 'IN_FLIGHT' AND lease_owner = $2
   AND lease_expires_at = $3::timestamptz`;

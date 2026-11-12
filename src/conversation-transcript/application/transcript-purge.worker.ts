@@ -11,6 +11,7 @@ import {
   type ConversationTranscriptStore,
 } from '../domain/transcript.port';
 import { TRANSCRIPT_CLOCK } from './transcript-recorder';
+import { describeError } from '../../common/log-safe';
 
 export const TRANSCRIPT_PURGE_OPTIONS = Symbol('TRANSCRIPT_PURGE_OPTIONS');
 
@@ -86,11 +87,7 @@ export class TranscriptPurgeWorker
         if (count < this.options.batchSize || this.stopped) break;
       }
     } catch (error) {
-      this.logger.warn(
-        `transcript purge failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      this.logger.warn(`transcript purge failed: ${describeError(error)}`);
     }
     if (deleted > 0) this.logger.log(`purged ${deleted} transcript messages`);
     return deleted;

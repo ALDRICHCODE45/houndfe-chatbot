@@ -7,10 +7,14 @@ import {
 } from '@testcontainers/postgresql';
 import {
   laneForKind,
+  type BackendOutboxCompletion,
   type ClaimedBackendOutboxEntry,
 } from '../domain/backend-outbox';
 import { runBackendOutboxStoreContract } from './backend-outbox-store.contract';
-import { PostgresBackendOutboxStore } from './postgres-backend-outbox.store';
+import {
+  CLAIM_RUN_SQL,
+  PostgresBackendOutboxStore,
+} from './postgres-backend-outbox.store';
 
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
@@ -562,6 +566,410 @@ ddescribe(
               .map((d) => d.seq),
           ).toEqual(Array.from({ length: perLane }, (_, i) => i + 1));
       await truncate();
+    });
+
+    describe('claimRun / completeMany races (separate connections)', () => {
+      const sleep = (ms: number) =>
+        new Promise<void>((resolve) => setTimeout(resolve, ms));
+      const CLAIM_RUN_PATTERN = '%WITH head AS%';
+      const COMPLETE_MANY_PATTERN = '%unnest(%';
+
+      afterEach(async () => {
+        await truncate();
+      });
+
+      /** Waits until `count` backends run a statement matching `pattern` and
+       * are blocked on a lock: forces the interleaving without sleeping. */
+      const waitForLockWaiters = async (count: number, pattern: string) => {
+        for (let attempt = 0; attempt < 200; attempt++) {
+          const { rows } = await pool.query<{ n: number }>(
+            `SELECT count(*)::int AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND wait_event_type = 'Lock'
+              AND query LIKE $1`,
+            [pattern],
+          );
+          if (rows[0].n >= count) return;
+          await sleep(25);
+        }
+        throw new Error(`no ${count} lock waiter(s) for ${pattern}`);
+      };
+
+      /** A transaction on its own connection that holds row locks (the "gate"). */
+      const openGate = async (ids: string[]) => {
+        const client = await pool.connect();
+        await client.query('BEGIN');
+        for (const id of ids)
+          await client.query(
+            'SELECT id FROM backend_outbox WHERE id = $1 FOR UPDATE',
+            [id],
+          );
+        return {
+          lock: (id: string) =>
+            client.query(
+              'SELECT id FROM backend_outbox WHERE id = $1 FOR UPDATE',
+              [id],
+            ),
+          release: async () => {
+            try {
+              await client.query('COMMIT');
+            } finally {
+              client.release();
+            }
+          },
+        };
+      };
+
+      const mirrors = async (
+        store: PostgresBackendOutboxStore,
+        ref: string,
+        count: number,
+      ) => {
+        for (let n = 1; n <= count; n++)
+          await store.enqueue({
+            conversationRef: ref,
+            kind: 'MESSAGE_MIRROR',
+            idempotencyKey: `${ref}:${n}`,
+            payload: { n },
+          });
+      };
+
+      /** W1 leased the whole run and stalled past its lease; W2 reclaimed the
+       * head. W1 still holds fencing tokens that match every follower. */
+      const staleRun = async (
+        store: PostgresBackendOutboxStore,
+        ref: string,
+        followers = 3,
+      ) => {
+        await mirrors(store, ref, followers + 1);
+        const first = (await store.claimHeads(50, 'w1', 60_000)).find(
+          (e) => e.conversationRef === ref,
+        )!;
+        const run1 = await store.claimRun(first, 'w1', 1, 50);
+        expect(run1).toHaveLength(followers + 1);
+        await sleep(15);
+        const head2 = (await store.claimHeads(50, 'w2', 60_000)).find(
+          (e) => e.conversationRef === ref,
+        )!;
+        expect(head2.id).toBe(run1[0].id);
+        return { stale: run1.slice(1), head2 };
+      };
+
+      const states = async (ids: string[]) => {
+        const { rows } = await pool.query<{
+          id: string;
+          status: string;
+          lease_owner: string | null;
+          delayed: boolean;
+        }>(
+          `SELECT id::text, status, lease_owner, next_attempt_at > now() AS delayed
+          FROM backend_outbox WHERE id = ANY($1::bigint[])`,
+          [ids],
+        );
+        return new Map(rows.map((row) => [row.id, row]));
+      };
+
+      const FINAL = { DONE: 'DONE', DEAD: 'DEAD', RETRY: 'PENDING' } as const;
+      const complete = (
+        entry: ClaimedBackendOutboxEntry,
+        outcome: keyof typeof FINAL,
+      ): BackendOutboxCompletion =>
+        outcome === 'DONE'
+          ? { entry, outcome }
+          : outcome === 'DEAD'
+            ? { entry, outcome, error: 'boom' }
+            : { entry, outcome, error: 'later', delayMs: 60_000 };
+
+      /** Exactly one owner per row: either the stale holder's completion was
+       * applied (row final, never re-leased) or it was fenced and the new
+       * holder owns the row under its own lease. */
+      const expectExclusive = async (
+        stale: ClaimedBackendOutboxEntry[],
+        results: boolean[],
+        outcome: keyof typeof FINAL,
+        run2: ClaimedBackendOutboxEntry[],
+      ) => {
+        const inRun2 = new Set(run2.map((e) => e.id));
+        const rows = await states(stale.map((e) => e.id));
+        stale.forEach((entry, index) => {
+          const row = rows.get(entry.id)!;
+          if (results[index]) {
+            expect(inRun2.has(entry.id)).toBe(false);
+            expect(row.status).toBe(FINAL[outcome]);
+            expect(row.lease_owner).toBeNull();
+            if (outcome === 'RETRY') expect(row.delayed).toBe(true);
+          } else {
+            expect(inRun2.has(entry.id)).toBe(true);
+            expect(row.status).toBe('IN_FLIGHT');
+            expect(row.lease_owner).toBe('w2');
+          }
+        });
+      };
+
+      it('two claimRun calls on the same head: one owner claims the whole run, the loser gets none', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        await mirrors(store, A, 6);
+        const [head] = await store.claimHeads(50, 'w0', 60_000);
+        const gate = await openGate([head.id]);
+        const runs = [
+          store.claimRun(head, 'wa', 60_000, 50),
+          store.claimRun(head, 'wb', 60_000, 50),
+        ];
+        await waitForLockWaiters(2, CLAIM_RUN_PATTERN);
+        await gate.release();
+        const [a, b] = await Promise.all(runs);
+        const [winner, loser] = a.length > 0 ? [a, b] : [b, a];
+        const winnerOwner = a.length > 0 ? 'wa' : 'wb';
+        expect(loser).toHaveLength(0);
+        expect(winner).toHaveLength(6);
+        expect(winner.map((e) => e.id)).toContain(head.id);
+        const owned = await pool.query<{ id: string; lease_owner: string }>(
+          'SELECT id::text, lease_owner FROM backend_outbox ORDER BY seq',
+        );
+        expect(owned.rows).toHaveLength(6);
+        expect(new Set(owned.rows.map((r) => r.lease_owner))).toEqual(
+          new Set([winnerOwner]),
+        );
+      });
+
+      it('a claimRun that waited on the head lock drops the run when the head was re-leased meanwhile', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        await mirrors(store, A, 4);
+        const [head] = await store.claimHeads(50, 'w1', 60_000);
+        // Another worker re-leases the head (and commits) while the stale
+        // claimRun (fence: w1 + old lease) is blocked on the head row lock.
+        const other = await pool.connect();
+        await other.query('BEGIN');
+        await other.query(
+          `UPDATE backend_outbox SET lease_owner = 'w2',
+            lease_expires_at = date_trunc('milliseconds', now()) + interval '60 seconds'
+          WHERE id = $1`,
+          [head.id],
+        );
+        const stale = store.claimRun(head, 'w1', 60_000, 50);
+        await waitForLockWaiters(1, CLAIM_RUN_PATTERN);
+        await other.query('COMMIT');
+        other.release();
+        expect(await stale).toEqual([]);
+        const rows = await pool.query<{
+          seq: string;
+          status: string;
+          lease_owner: string | null;
+        }>('SELECT seq, status, lease_owner FROM backend_outbox ORDER BY seq');
+        expect(rows.rows.map((r) => [r.status, r.lease_owner])).toEqual([
+          ['IN_FLIGHT', 'w2'],
+          ['PENDING', null],
+          ['PENDING', null],
+          ['PENDING', null],
+        ]);
+      });
+
+      it('two workers draining the same lanes in runs never overlap nor skip an open seq', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        const refs = Array.from({ length: 4 }, (_, i) => `wa:52155500001${i}0`);
+        const perRef = 24;
+        for (const ref of refs) await mirrors(store, ref, perRef);
+        const total = refs.length * perRef;
+        const held = new Set<string>();
+        const delivered: Array<{ ref: string; seq: number }> = [];
+        const violations: string[] = [];
+        const worker = async (owner: string) => {
+          let idle = 0;
+          while (delivered.length < total && idle < 50) {
+            const heads = await store.claimHeads(3, owner, 60_000);
+            if (heads.length === 0) {
+              idle++;
+              await sleep(2);
+              continue;
+            }
+            idle = 0;
+            for (const head of heads) {
+              const run = await store.claimRun(head, owner, 60_000, 5);
+              if (run.length === 0) violations.push(`empty run ${head.id}`);
+              for (const entry of run) {
+                if (held.has(entry.id))
+                  violations.push(`double claim ${entry.id}`);
+                held.add(entry.id);
+              }
+              const open = await pool.query<{ n: number }>(
+                `SELECT count(*)::int AS n FROM backend_outbox
+                WHERE conversation_ref = $1 AND seq < $2
+                  AND status NOT IN ('DONE', 'DEAD')`,
+                [head.conversationRef, run[0]?.seq ?? head.seq],
+              );
+              if (open.rows[0].n !== 0)
+                violations.push(`${head.conversationRef} skipped an open seq`);
+              await sleep(Math.random() * 3);
+              const results = await store.completeMany(
+                run.map((entry) => ({ entry, outcome: 'DONE' as const })),
+              );
+              run.forEach((entry, index) => {
+                if (!results[index]) violations.push(`lost lease ${entry.id}`);
+                held.delete(entry.id);
+                delivered.push({ ref: entry.conversationRef, seq: entry.seq });
+              });
+            }
+          }
+        };
+        await Promise.all([worker('wa'), worker('wb')]);
+        expect(violations).toEqual([]);
+        expect(delivered).toHaveLength(total);
+        for (const ref of refs)
+          expect(
+            delivered.filter((d) => d.ref === ref).map((d) => d.seq),
+          ).toEqual(Array.from({ length: perRef }, (_, i) => i + 1));
+      });
+
+      it.each(['DONE', 'DEAD', 'RETRY'] as const)(
+        'a follower the stale holder completed (%s) is never re-leased by the new holder',
+        async (outcome) => {
+          const store = new PostgresBackendOutboxStore(pool);
+          const { stale, head2 } = await staleRun(store, A);
+          const gate = await openGate([stale[0].id]);
+          const w1 = store.completeMany(
+            stale.map((entry) => complete(entry, outcome)),
+          );
+          await waitForLockWaiters(1, COMPLETE_MANY_PATTERN);
+          const w2 = store.claimRun(head2, 'w2', 60_000, 50);
+          await waitForLockWaiters(1, CLAIM_RUN_PATTERN);
+          await gate.release();
+          const [results, run2] = await Promise.all([w1, w2]);
+          expect(results).toEqual([true, true, true]);
+          await expectExclusive(stale, results, outcome, run2);
+          // Nothing past a row that is no longer claimable may be taken.
+          expect(run2.map((e) => e.id)).toEqual([head2.id]);
+        },
+      );
+
+      it.each(['DONE', 'DEAD', 'RETRY'] as const)(
+        'once the new holder claimed the run first, the stale holder is fenced (%s)',
+        async (outcome) => {
+          const store = new PostgresBackendOutboxStore(pool);
+          const { stale, head2 } = await staleRun(store, A);
+          const gate = await openGate([stale[0].id]);
+          const w2 = store.claimRun(head2, 'w2', 60_000, 50);
+          await waitForLockWaiters(1, CLAIM_RUN_PATTERN);
+          const w1 = store.completeMany(
+            stale.map((entry) => complete(entry, outcome)),
+          );
+          await waitForLockWaiters(1, COMPLETE_MANY_PATTERN);
+          await gate.release();
+          const [results, run2] = await Promise.all([w1, w2]);
+          expect(results).toEqual([false, false, false]);
+          expect(run2.map((e) => e.id)).toEqual([
+            head2.id,
+            ...stale.map((e) => e.id),
+          ]);
+          await expectExclusive(stale, results, outcome, run2);
+        },
+      );
+
+      it('does not claim rows behind a follower the stale holder rescheduled (head-of-line)', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        const { stale, head2 } = await staleRun(store, A);
+        const gate = await openGate([stale[0].id]);
+        const w1 = store.completeMany([complete(stale[0], 'RETRY')]);
+        await waitForLockWaiters(1, COMPLETE_MANY_PATTERN);
+        const w2 = store.claimRun(head2, 'w2', 60_000, 50);
+        await waitForLockWaiters(1, CLAIM_RUN_PATTERN);
+        await gate.release();
+        const [results, run2] = await Promise.all([w1, w2]);
+        expect(results).toEqual([true]);
+        expect(run2.map((e) => e.id)).toEqual([head2.id]);
+        const rows = await states(stale.map((e) => e.id));
+        expect(rows.get(stale[0].id)).toMatchObject({
+          status: 'PENDING',
+          delayed: true,
+        });
+        for (const entry of stale.slice(1))
+          expect(rows.get(entry.id)).toMatchObject({
+            status: 'IN_FLIGHT',
+            lease_owner: 'w1',
+          });
+      });
+
+      it('the run query reads the lane through backend_outbox_open_heads_idx', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        for (const ref of [A, 'wa:5215550002222', 'wa:5215550003333'])
+          await mirrors(store, ref, 20);
+        await pool.query('ANALYZE backend_outbox');
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          // Tiny tables prefer a seq scan; this asks which index would serve.
+          await client.query('SET LOCAL enable_seqscan = off');
+          await client.query(
+            `PREPARE run_plan(bigint, text, timestamptz, int, text, double precision)
+            AS ${CLAIM_RUN_SQL}`,
+          );
+          const plan = await client.query<{ 'QUERY PLAN': string }>(
+            `EXPLAIN EXECUTE run_plan(1, 'w', now(), 50, 'w', 60000)`,
+          );
+          const text = plan.rows.map((r) => r['QUERY PLAN']).join('\n');
+          expect(text).toMatch(/backend_outbox_open_heads_idx/);
+        } finally {
+          await client.query('ROLLBACK');
+          client.release();
+        }
+      });
+
+      it('completeMany locks rows in ascending seq whatever the input order (no deadlock with a claimRun-style locker)', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        await mirrors(store, A, 3);
+        const [head] = await store.claimHeads(50, 'w1', 60_000);
+        const run = await store.claimRun(head, 'w1', 60_000, 50);
+        expect(run).toHaveLength(3);
+        // The other locker takes seq 2 then seq 3, like claimRun does.
+        const gate = await openGate([run[1].id]);
+        const completion = store.completeMany(
+          [...run]
+            .reverse()
+            .map((entry) => ({ entry, outcome: 'DONE' as const })),
+        );
+        await waitForLockWaiters(1, COMPLETE_MANY_PATTERN);
+        // Descending-order locking would already hold seq 3 here: deadlock.
+        await gate.lock(run[2].id);
+        await gate.release();
+        await expect(completion).resolves.toEqual([true, true, true]);
+      });
+
+      it('concurrent stale completeMany (descending) and claimRun never deadlock and stay consistent', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        const refs = Array.from({ length: 16 }, (_, i) => `wa:52155500002${i}`);
+        for (const ref of refs) await mirrors(store, ref, 7);
+        const first = await store.claimHeads(50, 'w1', 60_000);
+        const runs1 = await Promise.all(
+          first.map((head) => store.claimRun(head, 'w1', 1, 50)),
+        );
+        await sleep(15);
+        const heads2 = await store.claimHeads(50, 'w2', 60_000);
+        expect(heads2).toHaveLength(refs.length);
+        const outcomes = ['DONE', 'DEAD', 'RETRY'] as const;
+        const jobs = runs1.map((run1, index) => {
+          const stale = run1.slice(1);
+          const outcome = outcomes[index % outcomes.length];
+          const head2 = heads2.find((h) => h.id === run1[0].id)!;
+          return {
+            stale,
+            outcome,
+            w1: store.completeMany(
+              [...stale].reverse().map((entry) => complete(entry, outcome)),
+            ),
+            w2: store.claimRun(head2, 'w2', 60_000, 50),
+          };
+        });
+        const settled = await Promise.allSettled(
+          jobs.flatMap((job) => [job.w1, job.w2]),
+        );
+        const rejected = settled.flatMap((s) =>
+          s.status === 'rejected' ? [String(s.reason)] : [],
+        );
+        expect(rejected).toEqual([]);
+        for (const job of jobs) {
+          const reversed = await job.w1;
+          const results = [...reversed].reverse();
+          await expectExclusive(job.stale, results, job.outcome, await job.w2);
+        }
+      });
     });
   },
 );

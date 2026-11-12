@@ -66,6 +66,7 @@ import { MinimalShippingService } from './minimal-shipping.service';
 import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
 import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
 import { DurableOrderConfirmation } from './gates/order-confirmation.gate';
+import { sanitizeErrorText } from '../../common/log-safe';
 
 export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
   MinimalOrderIneligibleReason,
@@ -952,7 +953,7 @@ export class MinimalOrderService {
       }
       if (code === INVALID_CHECKOUT_REQUEST)
         this.logger.warn(
-          `checkout rejected ${INVALID_CHECKOUT_REQUEST}: ${error instanceof Error ? error.message : ''}`,
+          `checkout rejected ${INVALID_CHECKOUT_REQUEST}: ${error instanceof Error ? sanitizeErrorText(error.message) : ''}`,
         );
       const customerMismatch =
         code === SHIPPING_QUOTE_MISMATCH &&

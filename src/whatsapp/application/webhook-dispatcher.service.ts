@@ -61,6 +61,11 @@ import {
   WebhookEventDto,
   WebhookMessageDto,
 } from '../presentation/dto/webhook-event.dto';
+import {
+  describeError,
+  fingerprintMessageId,
+  sanitizeErrorText,
+} from '../../common/log-safe';
 
 /**
  * WebhookDispatcherService (agent + human-handoff router)
@@ -183,7 +188,7 @@ export class WebhookDispatcherService {
       // ─── (1) Echo filter ────────────────────────────────────────────
       if (this.recentOutbound.isKnown(message.messageId)) {
         this.logger.log(
-          `skip echo ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+          `skip echo ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
         );
         continue;
       }
@@ -204,7 +209,7 @@ export class WebhookDispatcherService {
           this.humanHandoff.isOpsSender(message.senderId))
       ) {
         this.logger.debug(
-          `mirror-only ${message.mirrorOnly.type} ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+          `mirror-only ${message.mirrorOnly.type} ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
         );
         continue;
       }
@@ -217,13 +222,13 @@ export class WebhookDispatcherService {
       const claimToken = await this.dedup.claim(message.messageId);
       if (claimToken === null) {
         this.logger.log(
-          `skip duplicate ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+          `skip duplicate ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
         );
         continue;
       }
 
       this.logger.log(
-        `process ${message.messageId} from ${maskConversationRef(message.senderId)} (${message.text.length} chars)`,
+        `process ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)} (${message.text.length} chars)`,
       );
 
       try {
@@ -249,11 +254,11 @@ export class WebhookDispatcherService {
             if (hold.hold) {
               if (hold.reason === 'HUMAN')
                 this.logger.log(
-                  `handoff HUMAN: skip resume turn for ${maskConversationRef(result.customerId)} (ops ${message.messageId})`,
+                  `handoff HUMAN: skip resume turn for ${maskConversationRef(result.customerId)} (ops ${fingerprintMessageId(message.messageId)})`,
                 );
               else
                 this.logger.warn(
-                  `handoff mode unreadable: skip resume turn for ${maskConversationRef(result.customerId)} (ops ${message.messageId}): ${hold.error}`,
+                  `handoff mode unreadable: skip resume turn for ${maskConversationRef(result.customerId)} (ops ${fingerprintMessageId(message.messageId)}): ${sanitizeErrorText(hold.error)}`,
                 );
               await this.markSeenSafely(message.messageId);
               continue;
@@ -285,9 +290,7 @@ export class WebhookDispatcherService {
             await this.dedup.markSeen(message.messageId);
           } catch (error) {
             this.logger.warn(
-              `markSeen failed for ${message.messageId}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
+              `markSeen failed for ${fingerprintMessageId(message.messageId)}: ${describeError(error)}`,
             );
           }
           continue;
@@ -296,7 +299,7 @@ export class WebhookDispatcherService {
         // ─── (3b) S7 handoff gate: HUMAN mode never reaches the bot ────
         if (await this.isHumanMode(message.senderId)) {
           this.logger.debug(
-            `handoff HUMAN: mirror-only ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+            `handoff HUMAN: mirror-only ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
           );
           await this.markSeenSafely(message.messageId);
           continue;
@@ -314,7 +317,7 @@ export class WebhookDispatcherService {
         const custState = await this.conversationStore.get(message.senderId);
         if (readPendingHumanRequest(custState) !== null) {
           this.logger.log(
-            `short-circuit pending-marker for ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+            `short-circuit pending-marker for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
           );
           const { providerMessageId } = await this.whatsappSender.sendText({
             to: message.senderId,
@@ -328,9 +331,7 @@ export class WebhookDispatcherService {
             await this.dedup.markSeen(message.messageId);
           } catch (error) {
             this.logger.warn(
-              `markSeen failed for ${message.messageId}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
+              `markSeen failed for ${fingerprintMessageId(message.messageId)}: ${describeError(error)}`,
             );
           }
           continue;
@@ -393,9 +394,7 @@ export class WebhookDispatcherService {
         await this.runCustomerTurn(message, message.text);
       } catch (error) {
         this.logger.error(
-          `failed to process ${message.messageId} from ${maskConversationRef(message.senderId)}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `failed to process ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}: ${describeError(error)}`,
         );
         await this.releaseSafely(message.messageId, claimToken);
         throw error;
@@ -413,9 +412,7 @@ export class WebhookDispatcherService {
     const { statuses, ignored } = normalizeMetaStatuses(event);
     for (const item of ignored)
       this.logger.debug(
-        `ignore Meta status ${String(item.status)} for ${
-          item.providerMessageId ?? '?'
-        } (${item.reason})`,
+        `ignore Meta status ${String(item.status)} for ${fingerprintMessageId(item.providerMessageId)} (${item.reason})`,
       );
     for (const update of statuses) {
       try {
@@ -435,9 +432,9 @@ export class WebhookDispatcherService {
         });
       } catch (error) {
         this.logger.warn(
-          `status enqueue failed for ${update.providerMessageId} ${
+          `status enqueue failed for ${fingerprintMessageId(update.providerMessageId)} ${
             update.status
-          }: ${error instanceof Error ? error.message : String(error)}`,
+          }: ${describeError(error)}`,
         );
       }
     }
@@ -462,9 +459,7 @@ export class WebhookDispatcherService {
       await this.transcript.recordInbound(message, rawType);
     } catch (error) {
       this.logger.error(
-        `transcript record failed for ${message.messageId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `transcript record failed for ${fingerprintMessageId(message.messageId)}: ${describeError(error)}`,
       );
       throw error;
     }
@@ -506,16 +501,12 @@ export class WebhookDispatcherService {
         ?.onCustomerInbound(conversationRefFor(senderId))
         ?.catch((error: unknown) =>
           this.logger.warn(
-            `pending deliveries replay failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            `pending deliveries replay failed: ${describeError(error)}`,
           ),
         );
     } catch (error) {
       this.logger.warn(
-        `pending deliveries replay failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `pending deliveries replay failed: ${describeError(error)}`,
       );
     }
   }
@@ -529,9 +520,7 @@ export class WebhookDispatcherService {
       await agent.prepareCustomer(senderId);
     } catch (error) {
       this.logger.warn(
-        `customer profile warm-up failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `customer profile warm-up failed: ${describeError(error)}`,
       );
     }
   }
@@ -566,9 +555,7 @@ export class WebhookDispatcherService {
       });
     } catch (error) {
       this.logger.warn(
-        `product image recognition failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `product image recognition failed: ${describeError(error)}`,
       );
       return { kind: 'unavailable', reason: 'error' };
     }
@@ -609,7 +596,7 @@ export class WebhookDispatcherService {
     // redelivers), like the gate.
     if (await this.isHumanMode(message.senderId)) {
       this.logger.log(
-        `handoff HUMAN mid-turn: drop reply for ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+        `handoff HUMAN mid-turn: drop reply for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
       );
       await this.markSeenSafely(message.messageId);
       return;
@@ -657,9 +644,7 @@ export class WebhookDispatcherService {
           : [sent.providerMessageId];
       } catch (error) {
         this.logger.warn(
-          `interactive reply failed for ${maskConversationRef(to)}; sending the text only: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `interactive reply failed for ${maskConversationRef(to)}; sending the text only: ${describeError(error)}`,
         );
       }
     }
@@ -686,9 +671,7 @@ export class WebhookDispatcherService {
       this.recentOutbound.remember(providerMessageId);
     } catch (error) {
       this.logger.warn(
-        `reply image failed for ${maskConversationRef(to)}; sending the text only: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `reply image failed for ${maskConversationRef(to)}; sending the text only: ${describeError(error)}`,
       );
     }
   }
@@ -715,9 +698,7 @@ export class WebhookDispatcherService {
       await this.dedup.release(messageId, claimToken);
     } catch (error) {
       this.logger.warn(
-        `release failed for ${messageId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `release failed for ${fingerprintMessageId(messageId)}: ${describeError(error)}`,
       );
     }
   }
@@ -730,9 +711,7 @@ export class WebhookDispatcherService {
       await this.dedup.markSeen(messageId);
     } catch (error) {
       this.logger.warn(
-        `markSeen failed for ${messageId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `markSeen failed for ${fingerprintMessageId(messageId)}: ${describeError(error)}`,
       );
     }
   }

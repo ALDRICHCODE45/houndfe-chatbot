@@ -30,6 +30,11 @@ import {
   type DeliveryRow,
   type HumanRequestFeedStore,
 } from '../domain/human-request-feed';
+import {
+  describeError,
+  fingerprintMessageId,
+  sanitizeErrorText,
+} from '../../common/log-safe';
 
 export interface HumanRequestDeliveryPorts {
   store: HumanRequestFeedStore;
@@ -142,7 +147,7 @@ export class HumanRequestDeliveryService {
       }
     } catch (error) {
       this.logger.warn(
-        `pending deliveries read failed for ${masked}: ${describe(error)}`,
+        `pending deliveries read failed for ${masked}: ${describeError(error)}`,
       );
     }
     const filter = { conversationRef, limit: this.batchSize };
@@ -154,7 +159,7 @@ export class HumanRequestDeliveryService {
         for (const row of await list()) await replay(row);
       } catch (error) {
         this.logger.warn(
-          `${name} deliveries read failed for ${masked}: ${describe(error)}`,
+          `${name} deliveries read failed for ${masked}: ${describeError(error)}`,
         );
       }
     }
@@ -186,7 +191,7 @@ export class HumanRequestDeliveryService {
         await this.ports.client.recordDeliveryOutcome(item.deliveryId, body);
       } catch (error) {
         this.logger.warn(
-          `delivery ${item.deliveryId} abandon ACK failed: ${describe(error)}`,
+          `delivery ${item.deliveryId} abandon ACK failed: ${describeError(error)}`,
         );
       }
       return;
@@ -383,7 +388,7 @@ export class HumanRequestDeliveryService {
       const windowClosed = isWindowClosedSendError(error);
       if (!windowClosed)
         this.logger.warn(
-          `delivery ${row.deliveryId} send uncertain: ${describe(error)}`,
+          `delivery ${row.deliveryId} send uncertain: ${describeError(error)}`,
         );
       const next = await this.ports.store.transition(row.deliveryId, claimed, {
         ...base,
@@ -409,7 +414,7 @@ export class HumanRequestDeliveryService {
     });
     if (sent === null)
       this.logger.error(
-        `delivery ${row.deliveryId} sent (${providerMessageId}) but its row moved on`,
+        `delivery ${row.deliveryId} sent (${fingerprintMessageId(providerMessageId)}) but its row moved on`,
       );
     else await this.flushAck(sent);
     return true;
@@ -426,7 +431,7 @@ export class HumanRequestDeliveryService {
         return { action: 'stale', decision: 'UNKNOWN_TYPE' };
       }
       this.logger.warn(
-        `feed item ${row.deliveryId} of unknown type ${item.rawType}: STALE`,
+        `feed item ${row.deliveryId} of unknown type ${sanitizeErrorText(item.rawType)}: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }
@@ -438,9 +443,7 @@ export class HumanRequestDeliveryService {
         return { action: 'stale', decision: 'LEGACY_PATH_DELIVERS' };
       if (payload.kind !== 'CLARIFICATION') {
         this.logger.warn(
-          `feed item ${row.deliveryId} with unrecognized answer kind ${String(
-            payload.raw.kind,
-          )}: STALE`,
+          `feed item ${row.deliveryId} with unrecognized answer kind ${sanitizeErrorText(String(payload.raw.kind))}: STALE`,
         );
         return { action: 'stale', decision: 'UNKNOWN_KIND' };
       }
@@ -568,7 +571,7 @@ export class HumanRequestDeliveryService {
       );
     } catch (error) {
       this.logger.warn(
-        `delivery ${row.deliveryId} ACK state not saved: ${describe(error)}`,
+        `delivery ${row.deliveryId} ACK state not saved: ${describeError(error)}`,
       );
     }
   }
@@ -580,7 +583,7 @@ export class HumanRequestDeliveryService {
     const retryAt = (ms: number) => new Date(this.clock().getTime() + ms);
     if (result instanceof Error) {
       this.logger.warn(
-        `delivery ${row.deliveryId} ACK failed, will retry: ${describe(result)}`,
+        `delivery ${row.deliveryId} ACK failed, will retry: ${describeError(result)}`,
       );
       return {
         ackState: 'PENDING',
@@ -608,7 +611,7 @@ export class HumanRequestDeliveryService {
         ? `VALIDATION_ERROR ${result.message ?? ''}`.trim()
         : result.kind;
     this.logger.error(
-      `delivery ${row.deliveryId} ${row.ackOutcome} ACK rejected (${reason}): FAILED_PERMANENT`,
+      `delivery ${row.deliveryId} ${row.ackOutcome} ACK rejected (${sanitizeErrorText(reason)}): FAILED_PERMANENT`,
     );
     return { ackState: 'FAILED_PERMANENT', error: reason };
   }
@@ -617,7 +620,7 @@ export class HumanRequestDeliveryService {
     try {
       await work();
     } catch (error) {
-      this.logger.warn(`delivery ${id} replay failed: ${describe(error)}`);
+      this.logger.warn(`delivery ${id} replay failed: ${describeError(error)}`);
     }
   }
 }

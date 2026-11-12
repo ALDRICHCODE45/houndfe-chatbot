@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { fingerprintMessageId } from '../../common/log-safe';
 import {
   AgentRunner,
   type AgentRunnerConfig,
@@ -390,7 +391,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       const spies = spyAll();
       await service.dispatch(textEvent('wamid.mask-process', 'hola'));
       const out = lines(spies.log);
-      expect(out).toContain('process wamid.mask-process');
+      expect(out).toContain(
+        `process ${fingerprintMessageId('wamid.mask-process')}`,
+      );
+      expect(out).not.toContain('wamid.mask-process');
       expect(out).not.toContain(PHONE);
       expect(out).toContain(MASKED);
     });
@@ -400,7 +404,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       dedup.claim.mockResolvedValue(null);
       await service.dispatch(textEvent('wamid.mask-dup', 'hola'));
       const out = lines(spies.log);
-      expect(out).toContain('skip duplicate wamid.mask-dup');
+      expect(out).toContain(
+        `skip duplicate ${fingerprintMessageId('wamid.mask-dup')}`,
+      );
+      expect(out).not.toContain('wamid.mask-dup');
       expect(out).not.toContain(PHONE);
       expect(out).toContain(MASKED);
     });
@@ -410,7 +417,10 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       recentOutbound.isKnown.mockReturnValue(true);
       await service.dispatch(textEvent('wamid.mask-echo', 'hola'));
       const out = lines(spies.log);
-      expect(out).toContain('skip echo wamid.mask-echo');
+      expect(out).toContain(
+        `skip echo ${fingerprintMessageId('wamid.mask-echo')}`,
+      );
+      expect(out).not.toContain('wamid.mask-echo');
       expect(out).not.toContain(PHONE);
       expect(out).toContain(MASKED);
     });
@@ -422,9 +432,40 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         service.dispatch(textEvent('wamid.mask-fail', 'hola')),
       ).rejects.toThrow('LLM down');
       const out = lines(spies.error);
-      expect(out).toContain('failed to process wamid.mask-fail');
+      expect(out).toContain(
+        `failed to process ${fingerprintMessageId('wamid.mask-fail')}`,
+      );
+      expect(out).not.toContain('wamid.mask-fail');
       expect(out).not.toContain(PHONE);
       expect(out).toContain(MASKED);
+    });
+
+    it('a raw error quoting the phone or a wamid is sanitized in the log', async () => {
+      const spies = spyAll();
+      const wamid = 'wamid.HBgMNTIxNTU1MDAwMTExMQ';
+      minimalAgent.tryHandle.mockRejectedValueOnce(
+        new Error(`Meta 131030: ${PHONE} not allowed (${wamid})`),
+      );
+      await expect(
+        service.dispatch(textEvent('wamid.mask-err', 'hola')),
+      ).rejects.toThrow('Meta 131030');
+      const out = lines(spies.error);
+      expect(out).toContain('Meta 131030');
+      expect(out).not.toContain(PHONE);
+      expect(out).not.toContain(wamid);
+      expect(out).not.toContain('HBgM');
+    });
+
+    it('a failing markSeen logs a fingerprint and sanitized error', async () => {
+      const spies = spyAll();
+      dedup.markSeen.mockRejectedValueOnce(new Error(`db down for ${PHONE}`));
+      await service.dispatch(textEvent('wamid.mask-seen', 'hola'));
+      const out = lines(spies.warn);
+      expect(out).toContain(
+        `markSeen failed for ${fingerprintMessageId('wamid.mask-seen')}`,
+      );
+      expect(out).not.toContain('wamid.mask-seen');
+      expect(out).not.toContain(PHONE);
     });
   });
 
