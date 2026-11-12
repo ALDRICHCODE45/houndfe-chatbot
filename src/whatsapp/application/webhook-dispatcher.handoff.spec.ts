@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import type { AgentRunner } from '../../llm-agent/application/agent-runner.service';
 import type { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
@@ -390,5 +391,61 @@ describe('WebhookDispatcherService pending deliveries hook (S5)', () => {
     const h = setup();
     await h.service.dispatch(event([text('wamid.p6', OPS)]));
     expect(h.humanRequests.onCustomerInbound).not.toHaveBeenCalled();
+  });
+});
+
+describe('WebhookDispatcherService handoff logs mask the phone (S6)', () => {
+  const MASKED = 'wa:…1111';
+  const spyAll = () => ({
+    log: jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {}),
+    warn: jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {}),
+    debug: jest.spyOn(Logger.prototype, 'debug').mockImplementation(() => {}),
+  });
+  const lines = (spy: jest.SpyInstance) =>
+    spy.mock.calls.map(([line]) => String(line)).join('\n');
+  const expectMasked = (out: string, needle: string) => {
+    expect(out).toContain(needle);
+    expect(out).not.toContain(SENDER);
+    expect(out).toContain(MASKED);
+  };
+  afterEach(() => jest.restoreAllMocks());
+
+  it('HUMAN mirror-only line', async () => {
+    const spies = spyAll();
+    const h = setup({ human: true });
+    await h.service.dispatch(event([text('wamid.m1')]));
+    expectMasked(lines(spies.debug), 'mirror-only wamid.m1');
+  });
+
+  it('HUMAN skip-resume-turn line', async () => {
+    const spies = spyAll();
+    const h = setup({ human: true, opsResolved: true });
+    await h.service.dispatch(event([text('wamid.m2', OPS)]));
+    expectMasked(lines(spies.log), 'skip resume turn');
+  });
+
+  it('unreadable-mode skip-resume-turn line', async () => {
+    const spies = spyAll();
+    const h = setup({ handoffError: new Error('db down'), opsResolved: true });
+    await h.service.dispatch(event([text('wamid.m3', OPS)]));
+    expectMasked(lines(spies.warn), 'handoff mode unreadable');
+  });
+
+  it('mid-turn drop-reply line', async () => {
+    const spies = spyAll();
+    const h = setup({ modes: [false, true] });
+    await h.service.dispatch(event([text('wamid.m4')]));
+    expectMasked(lines(spies.log), 'drop reply for wamid.m4');
+  });
+
+  it('pending-marker short-circuit line', async () => {
+    const spies = spyAll();
+    const h = setup({ pendingMarker: true });
+    h.agent.customerStyle.mockReturnValue({
+      register: 'usted',
+      emojis: false,
+    } as never);
+    await h.service.dispatch(event([text('wamid.m5')]));
+    expectMasked(lines(spies.log), 'short-circuit pending-marker');
   });
 });

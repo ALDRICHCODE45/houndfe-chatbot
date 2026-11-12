@@ -42,6 +42,7 @@ import { BackendOutboxService } from '../../backend-outbox/application/backend-o
 import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
 import { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import { checkHandoffSendHold } from '../../conversation/application/handoff-send-hold';
+import { maskConversationRef } from '../../human-requests/domain/human-request-feed';
 import { HumanRequestDeliveryService } from '../../human-requests/application/human-request-delivery.service';
 import { normalizeMetaStatuses } from './meta-status-normalizer';
 import { InboundMessage, InboundMedia } from '../domain/inbound-message';
@@ -177,7 +178,7 @@ export class WebhookDispatcherService {
       // ─── (1) Echo filter ────────────────────────────────────────────
       if (this.recentOutbound.isKnown(message.messageId)) {
         this.logger.log(
-          `skip echo ${message.messageId} from ${message.senderId}`,
+          `skip echo ${message.messageId} from ${maskConversationRef(message.senderId)}`,
         );
         continue;
       }
@@ -196,13 +197,13 @@ export class WebhookDispatcherService {
       const claimToken = await this.dedup.claim(message.messageId);
       if (claimToken === null) {
         this.logger.log(
-          `skip duplicate ${message.messageId} from ${message.senderId}`,
+          `skip duplicate ${message.messageId} from ${maskConversationRef(message.senderId)}`,
         );
         continue;
       }
 
       this.logger.log(
-        `process ${message.messageId} from ${message.senderId} (${message.text.length} chars)`,
+        `process ${message.messageId} from ${maskConversationRef(message.senderId)} (${message.text.length} chars)`,
       );
 
       try {
@@ -228,11 +229,11 @@ export class WebhookDispatcherService {
             if (hold.hold) {
               if (hold.reason === 'HUMAN')
                 this.logger.log(
-                  `handoff HUMAN: skip resume turn for ${result.customerId} (ops ${message.messageId})`,
+                  `handoff HUMAN: skip resume turn for ${maskConversationRef(result.customerId)} (ops ${message.messageId})`,
                 );
               else
                 this.logger.warn(
-                  `handoff mode unreadable: skip resume turn for ${result.customerId} (ops ${message.messageId}): ${hold.error}`,
+                  `handoff mode unreadable: skip resume turn for ${maskConversationRef(result.customerId)} (ops ${message.messageId}): ${hold.error}`,
                 );
               await this.markSeenSafely(message.messageId);
               continue;
@@ -275,7 +276,7 @@ export class WebhookDispatcherService {
         // ─── (3b) S7 handoff gate: HUMAN mode never reaches the bot ────
         if (await this.isHumanMode(message.senderId)) {
           this.logger.debug(
-            `handoff HUMAN: mirror-only ${message.messageId} from ${message.senderId}`,
+            `handoff HUMAN: mirror-only ${message.messageId} from ${maskConversationRef(message.senderId)}`,
           );
           await this.markSeenSafely(message.messageId);
           continue;
@@ -293,7 +294,7 @@ export class WebhookDispatcherService {
         const custState = await this.conversationStore.get(message.senderId);
         if (readPendingHumanRequest(custState) !== null) {
           this.logger.log(
-            `short-circuit pending-marker for ${message.messageId} from ${message.senderId}`,
+            `short-circuit pending-marker for ${message.messageId} from ${maskConversationRef(message.senderId)}`,
           );
           const { providerMessageId } = await this.whatsappSender.sendText({
             to: message.senderId,
@@ -358,7 +359,7 @@ export class WebhookDispatcherService {
         await this.runCustomerTurn(message, message.text);
       } catch (error) {
         this.logger.error(
-          `failed to process ${message.messageId} from ${message.senderId}: ${
+          `failed to process ${message.messageId} from ${maskConversationRef(message.senderId)}: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -574,7 +575,7 @@ export class WebhookDispatcherService {
     // redelivers), like the gate.
     if (await this.isHumanMode(message.senderId)) {
       this.logger.log(
-        `handoff HUMAN mid-turn: drop reply for ${message.messageId} from ${message.senderId}`,
+        `handoff HUMAN mid-turn: drop reply for ${message.messageId} from ${maskConversationRef(message.senderId)}`,
       );
       await this.markSeenSafely(message.messageId);
       return;
@@ -622,7 +623,7 @@ export class WebhookDispatcherService {
           : [sent.providerMessageId];
       } catch (error) {
         this.logger.warn(
-          `interactive reply failed for ${to}; sending the text only: ${
+          `interactive reply failed for ${maskConversationRef(to)}; sending the text only: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -651,7 +652,7 @@ export class WebhookDispatcherService {
       this.recentOutbound.remember(providerMessageId);
     } catch (error) {
       this.logger.warn(
-        `reply image failed for ${to}; sending the text only: ${
+        `reply image failed for ${maskConversationRef(to)}; sending the text only: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );

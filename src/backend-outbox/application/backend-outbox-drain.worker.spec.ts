@@ -189,12 +189,34 @@ describe('BackendOutboxDrainWorker', () => {
     expect(Logger.prototype.error).toHaveBeenCalledWith(
       expect.stringContaining('DEAD'),
     );
+    const dead = (Logger.prototype.error as jest.Mock).mock.calls
+      .map(([line]) => String(line))
+      .join('\n');
+    expect(dead).not.toContain('5215550001111');
+    expect(dead).toContain('wa:…1111#');
     await drain.tick();
     expect(store.snapshot().map((e) => [e.idempotencyKey, e.status])).toEqual([
       ['a1', 'DEAD'],
       ['a2', 'DONE'],
     ]);
     expect(store.snapshot()[0].lastError).toBe('422 VALIDATION_ERROR');
+  });
+
+  it('a lost lease is logged with the masked conversation only', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await enqueue(store, A, 'a1');
+    jest.spyOn(store, 'markDone').mockResolvedValue(false);
+    const drain = worker(
+      store,
+      new ScriptedDelivery(() => ({ outcome: 'DELIVERED' })),
+    );
+    await drain.tick();
+    const lost = (Logger.prototype.warn as jest.Mock).mock.calls
+      .map(([line]) => String(line))
+      .join('\n');
+    expect(lost).toContain('lease lost');
+    expect(lost).not.toContain('5215550001111');
+    expect(lost).toContain('wa:…1111#');
   });
 
   it('a failing claim does not crash the tick', async () => {

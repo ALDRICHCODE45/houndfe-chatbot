@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { maskConversationRef } from '../../human-requests/domain/human-request-feed';
 import {
   RETRY_AFTER_MAX_MS,
   backoffDelayMs,
@@ -142,7 +143,7 @@ export class BackendOutboxDrainWorker {
       if (!applied)
         // Lease lost (expired and reclaimed): the new owner redelivers.
         this.logger.warn(
-          `backend outbox lease lost for ${entry.kind} ${entry.conversationRef}#${entry.seq}`,
+          `backend outbox lease lost for ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq}`,
         );
     } catch (error) {
       // The lease expires and the row is reclaimed; delivery is idempotent.
@@ -182,7 +183,7 @@ export class BackendOutboxDrainWorker {
         return this.store.markDone(entry);
       case 'PERMANENT':
         this.logger.error(
-          `backend outbox row DEAD: ${entry.kind} ${entry.conversationRef}#${entry.seq} (id ${entry.id}): ${result.error}`,
+          `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${result.error}`,
         );
         return this.store.markDead(entry, result.error);
       case 'RETRY': {
