@@ -65,6 +65,8 @@ type Plan =
       decision: DeliveryDecision;
       senderId: string;
       text: string;
+      /** Unit 10: clarification reply id, recorded with the sent message. */
+      staffReplyId?: string;
       /** request.cancelled / request.overdue_notice: never a deferral (422
        *  OUTCOME_NOT_ALLOWED); a closed window is STALE. */
       cancellation: boolean;
@@ -373,6 +375,9 @@ export class HumanRequestDeliveryService {
       ({ providerMessageId } = await this.ports.sender.sendText({
         to: plan.senderId,
         text: plan.text,
+        ...(plan.staffReplyId === undefined
+          ? {}
+          : { staffReplyId: plan.staffReplyId }),
       }));
     } catch (error) {
       const windowClosed = isWindowClosedSendError(error);
@@ -443,11 +448,16 @@ export class HumanRequestDeliveryService {
       if (senderId === null)
         return { action: 'stale', decision: 'NO_CONVERSATION' };
       const style = await this.readStyle(senderId);
+      // The question is answered (the request is already RESOLVED upstream).
+      await this.ports.store.closeRequest(item.requestId, 'RESOLVED');
       return {
         action: 'send',
         decision: 'CLARIFICATION',
         senderId,
         text: withTeamPrefix(payload.text, payload.prefix, style),
+        ...(payload.replyId === undefined
+          ? {}
+          : { staffReplyId: payload.replyId }),
         cancellation: false,
       };
     }

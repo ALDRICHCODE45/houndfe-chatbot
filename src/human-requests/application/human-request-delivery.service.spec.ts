@@ -66,12 +66,18 @@ const decision = (deliveryId: string) =>
     restockDays: 7,
   });
 
-const clarification = (deliveryId: string, text = 'Sí, lo tenemos en azul.') =>
+const clarification = (
+  deliveryId: string,
+  text = 'Sí, lo tenemos en azul.',
+  replyId?: string,
+) =>
   answered(deliveryId, {
     kind: 'CLARIFICATION',
     text,
     prefix: 'Le comparto la respuesta del equipo:',
+    ...(replyId === undefined ? {} : { replyId }),
   });
+const REPLY_ID = '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09';
 
 class FakeClient {
   readonly acks: Array<{ deliveryId: string; body: DeliveryOutcomeInput }> = [];
@@ -110,10 +116,11 @@ class FakeClient {
 }
 
 class FakeSender {
-  readonly sent: Array<{ to: string; text: string }> = [];
+  readonly sent: Array<{ to: string; text: string; staffReplyId?: string }> =
+    [];
   script: Array<Error | string> = [];
   private n = 0;
-  sendText(message: { to: string; text: string }) {
+  sendText(message: { to: string; text: string; staffReplyId?: string }) {
     this.sent.push(message);
     const next = this.script.shift();
     if (next instanceof Error) return Promise.reject(next);
@@ -246,6 +253,64 @@ describe('HumanRequestDeliveryService', () => {
       expect(sender.sent[0].text).toBe(
         'Le comparto la respuesta del equipo:\nSí, lo tenemos en azul.',
       );
+    });
+
+    it('CLARIFICATION with a replyId hands it to the sender (staffReplyId) on the one message', async () => {
+      const { service, sender } = setup();
+      await service.accept(clarification('d5', 'Sí, es apto.', REPLY_ID));
+      expect(sender.sent).toEqual([
+        {
+          to: SENDER,
+          text: 'Le comparto la respuesta del equipo:\nSí, es apto.',
+          staffReplyId: REPLY_ID,
+        },
+      ]);
+    });
+
+    it('CLARIFICATION without a replyId sends no staffReplyId key at all', async () => {
+      const { service, sender } = setup();
+      await service.accept(clarification('d6'));
+      expect(sender.sent).toHaveLength(1);
+      expect(sender.sent[0]).not.toHaveProperty('staffReplyId');
+    });
+
+    it('CLARIFICATION closes the pending question in the local registry', async () => {
+      const { service, store } = setup();
+      await store.recordOpenRequest({
+        requestId: 'req-d7',
+        conversationRef: REF,
+        subtype: 'UNKNOWN_QUESTION',
+      });
+      await service.accept(clarification('d7', 'ok', REPLY_ID));
+      await expect(store.getRequest('req-d7')).resolves.toMatchObject({
+        status: 'RESOLVED',
+      });
+    });
+
+    it('a deferred CLARIFICATION keeps its replyId when it is replayed', async () => {
+      const { service, sender, client } = setup();
+      sender.script = [new WhatsappSendError(400, '131047', 'Re-engagement')];
+      const item = clarification('d8', 'luego', REPLY_ID);
+      await service.accept(item);
+      expect(sender.sent[0].staffReplyId).toBe(REPLY_ID);
+      client.pending = { kind: 'ok', items: [item] };
+      await service.onCustomerInbound(REF);
+      expect(sender.sent).toHaveLength(2);
+      expect(sender.sent[1]).toMatchObject({ staffReplyId: REPLY_ID });
+    });
+
+    it('a CLARIFICATION without a conversationRef is STALE NO_CONVERSATION and never sent', async () => {
+      const { service, sender, client, store } = setup();
+      await service.accept(
+        answered('d9', clarification('d9', 'x', REPLY_ID).payload, {
+          conversationRef: null,
+        }),
+      );
+      expect(sender.sent).toEqual([]);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getDelivery('d9')).resolves.toMatchObject({
+        decision: 'NO_CONVERSATION',
+      });
     });
 
     it('an unrecognized kind is not sent: ACK STALE with a warning', async () => {

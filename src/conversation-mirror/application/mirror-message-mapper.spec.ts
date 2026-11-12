@@ -280,3 +280,48 @@ describe('mapMirrorEntry', () => {
     }
   });
 });
+
+describe('mapMirrorEntry staffReplyId (unit 10)', () => {
+  const REPLY = '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09';
+  const out = {
+    ...base,
+    direction: 'OUT',
+    author: 'BOT',
+    text: 'Le comparto…',
+  };
+
+  it('is sent on an OUT TEXT message together with the text we sent', () => {
+    const { message } = ok(
+      mapMirrorEntry(entry({ ...out, staffReplyId: REPLY }), NOW),
+    );
+    expect(message).toMatchObject({
+      direction: 'OUT',
+      type: 'TEXT',
+      text: 'Le comparto…',
+      staffReplyId: REPLY,
+    });
+  });
+
+  it('old payloads without it are unaffected', () => {
+    const { message } = ok(mapMirrorEntry(entry(out), NOW));
+    expect(message).not.toHaveProperty('staffReplyId');
+  });
+
+  it.each([
+    ['an IN message', { ...base, staffReplyId: REPLY }],
+    [
+      'a non-text OUT',
+      {
+        ...out,
+        type: 'template',
+        contractType: 'TEMPLATE',
+        staffReplyId: REPLY,
+      },
+    ],
+    ['a malformed id', { ...out, staffReplyId: 'nope' }],
+    ['a non-string id', { ...out, staffReplyId: 7 }],
+  ])('is dropped (row still mapped) for %s', (_name, payload) => {
+    const { message } = ok(mapMirrorEntry(entry(payload), NOW));
+    expect(message).not.toHaveProperty('staffReplyId');
+  });
+});

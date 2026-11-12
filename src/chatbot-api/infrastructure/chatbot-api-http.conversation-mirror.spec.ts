@@ -131,6 +131,78 @@ describe('conversation mirror client (mocked HTTP)', () => {
       });
     });
 
+    it('sends staffReplyId on an OUT TEXT message and omits it elsewhere', async () => {
+      request.mockReturnValue(of(response({ accepted: [], duplicates: [] })));
+      const out: MirrorMessageInput = {
+        waMessageId: 'wamid.OUT1',
+        direction: 'OUT',
+        type: 'TEXT',
+        text: 'Le comparto…',
+        staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09',
+        providerTimestamp: iso(-2000),
+        observedAt: iso(-1000),
+      };
+      await client.mirrorMessages(REF, [out, text(2)]);
+      const wire = (sent().data as { messages: Record<string, unknown>[] })
+        .messages;
+      expect(wire[0].staffReplyId).toBe('7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09');
+      expect(wire[1]).not.toHaveProperty('staffReplyId');
+    });
+
+    it.each([
+      [
+        'on an IN message',
+        () => [
+          { ...text(1), staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09' },
+        ],
+      ],
+      [
+        'on an OUT non-text',
+        () => [
+          {
+            ...text(1),
+            direction: 'OUT' as const,
+            type: 'TEMPLATE' as const,
+            staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09',
+          },
+        ],
+      ],
+      [
+        'malformed',
+        () => [
+          { ...text(1), direction: 'OUT' as const, staffReplyId: 'not-a-uuid' },
+        ],
+      ],
+      [
+        'repeated in the batch',
+        () => [
+          {
+            ...text(1),
+            direction: 'OUT' as const,
+            staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09',
+          },
+          {
+            ...text(2),
+            direction: 'OUT' as const,
+            staffReplyId: '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09',
+          },
+        ],
+      ],
+    ])('rejects locally a staffReplyId %s', async (_name, build) => {
+      const result = await client.mirrorMessages(REF, build());
+      expect(result).toMatchObject({ kind: 'VALIDATION_ERROR', local: true });
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it('types 422 REPLY_NOT_FOUND', async () => {
+      request.mockReturnValue(
+        throwError(() => httpError(422, apiError(422, 'REPLY_NOT_FOUND'))),
+      );
+      await expect(client.mirrorMessages(REF, [text(1)])).resolves.toEqual({
+        kind: 'REPLY_NOT_FOUND',
+      });
+    });
+
     it('sends media, UNSUPPORTED kind and OUT template messages', async () => {
       request.mockReturnValue(of(response({ accepted: [], duplicates: [] })));
       const base = { providerTimestamp: iso(-10), observedAt: iso(-5) };

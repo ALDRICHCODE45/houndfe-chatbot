@@ -93,6 +93,9 @@ export interface MirrorMessageInput {
   mediaId?: string;
   /** UNSUPPORTED only. */
   kind?: MirrorUnsupportedKind;
+  /** Unit 10: the `replyId` of the clarification reply this OUT TEXT message
+   *  delivered. The backend stores the message as STAFF with its own text. */
+  staffReplyId?: string;
   providerTimestamp: string;
   observedAt: string;
 }
@@ -119,7 +122,10 @@ export type MirrorMessagesResult =
    *  item: re-upload every media of the batch and resend the same batch. */
   | { kind: 'MEDIA_NOT_FOUND' }
   /** 422: file kind does not match the message type. Park and alert. */
-  | { kind: 'MEDIA_TYPE_MISMATCH' };
+  | { kind: 'MEDIA_TYPE_MISMATCH' }
+  /** 422 (unit 10), whole batch: a `staffReplyId` is unknown, foreign or of
+   *  another chat. Isolate it and resend that row without it (BOT). */
+  | { kind: 'REPLY_NOT_FOUND' };
 
 export function isValidConversationRef(ref: unknown): ref is string {
   return typeof ref === 'string' && CONVERSATION_REF.test(ref);
@@ -181,6 +187,7 @@ export function mirrorMessageProblem(
   // Extra keys are dropped on the wire, never forwarded (tenant, seq, … are
   // not ours to set), so they are not a violation here.
   const { waMessageId, direction, author, type, text, mediaId, kind } = message;
+  const { staffReplyId } = message;
   if (typeof waMessageId !== 'string' || !WA_MESSAGE_ID.test(waMessageId))
     return 'waMessageId is out of contract';
   if (direction !== 'IN' && direction !== 'OUT')
@@ -215,6 +222,12 @@ export function mirrorMessageProblem(
   } else if (kind !== undefined) {
     return 'kind is only valid for UNSUPPORTED';
   }
+  if (staffReplyId !== undefined) {
+    if (direction !== 'OUT' || type !== 'TEXT')
+      return 'staffReplyId is only valid on an OUT TEXT message';
+    if (typeof staffReplyId !== 'string' || !UUID.test(staffReplyId))
+      return 'staffReplyId must be a uuid';
+  }
   const providerProblem = timestampProblem(message.providerTimestamp, nowMs);
   if (providerProblem !== null) return `providerTimestamp ${providerProblem}`;
   const observedProblem = timestampProblem(message.observedAt, nowMs);
@@ -239,14 +252,22 @@ export function validateMirrorMessages(
   if (messages.length > MIRROR_MAX_MESSAGES)
     return { kind: 'BATCH_TOO_LARGE', limit: MIRROR_MAX_MESSAGES, local: true };
   const seen = new Set<string>();
+  const seenReplies = new Set<string>();
   for (let index = 0; index < messages.length; index += 1) {
     const problem = mirrorMessageProblem(messages[index], nowMs);
     if (problem !== null)
       return localValidation(`messages[${index}] ${problem}`);
-    const id = (messages[index] as MirrorMessageInput).waMessageId;
+    const { waMessageId: id, staffReplyId } = messages[
+      index
+    ] as MirrorMessageInput;
     if (seen.has(id))
       return localValidation(`messages[${index}] repeats a waMessageId`);
     seen.add(id);
+    if (staffReplyId !== undefined) {
+      if (seenReplies.has(staffReplyId))
+        return localValidation(`messages[${index}] repeats a staffReplyId`);
+      seenReplies.add(staffReplyId);
+    }
   }
   return null;
 }
@@ -272,6 +293,7 @@ export function toMirrorMessagesBody(messages: readonly MirrorMessageInput[]): {
       if (m.text !== undefined) wire.text = m.text;
       if (m.mediaId !== undefined) wire.mediaId = m.mediaId;
       if (m.kind !== undefined) wire.kind = m.kind;
+      if (m.staffReplyId !== undefined) wire.staffReplyId = m.staffReplyId;
       wire.providerTimestamp = m.providerTimestamp;
       wire.observedAt = m.observedAt;
       return wire;

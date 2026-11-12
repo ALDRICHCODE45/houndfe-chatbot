@@ -14,6 +14,10 @@ import type { MirrorDeliveryGate } from './mirror-delivery-gate';
  *                             and degrade THAT row (never DEAD) so it cannot
  *                             block its lane; a below-cap offender RETRYs
  *                             with everything after it (seq order is kept)
+ *   422 REPLY_NOT_FOUND     → a `staffReplyId` is unknown (whole batch stored
+ *                             nothing): bisect to the row(s) carrying one and
+ *                             resend THAT row without it (mirrored as BOT),
+ *                             never DEAD; a batch with none RETRYs (alert)
  *   400 / 409 / 422 type    → isolate: bisect to the offending row(s), DEAD
  *                             only those, deliver the rest. A failing batch
  *                             whose left half succeeded knows the right half
@@ -70,6 +74,10 @@ export interface BatchReactorDeps<T> {
   mediaRetriesExhausted?(item: BatchItem<T>): boolean;
   /** Mirror only: strip the media so the row is mirrored as UNSUPPORTED. */
   degradeMedia?(item: BatchItem<T>): void;
+  /** Mirror only: does this row still carry a `staffReplyId`? */
+  carriesStaffReply?(item: BatchItem<T>): boolean;
+  /** Mirror only: strip the `staffReplyId` (the row is mirrored as BOT). */
+  dropStaffReply?(item: BatchItem<T>): void;
 }
 
 export const DEFAULT_MAX_CALLS = 30;
@@ -172,6 +180,8 @@ export class BatchReactor<T> {
         return this.mediaNotFound(items);
       case 'MEDIA_TYPE_MISMATCH':
         return this.isolateOrDie(items, '422 MEDIA_TYPE_MISMATCH');
+      case 'REPLY_NOT_FOUND':
+        return this.replyNotFound(items);
       case 'MESSAGE_ID_CONFLICT':
         return this.isolateOrDie(items, '409 MESSAGE_ID_CONFLICT');
       case 'VALIDATION_ERROR':
@@ -206,6 +216,27 @@ export class BatchReactor<T> {
   }
 
   private async split(items: BatchItem<T>[]): Promise<void> {
+    const mid = Math.ceil(items.length / 2);
+    await this.process(items.slice(0, mid));
+    await this.process(items.slice(mid));
+  }
+
+  /** Only rows carrying a `staffReplyId` can cause it. One carrier: strip
+   *  it and resend the same run. Several: bisect (each half is handled the
+   *  same way, so only the unknown ones end up stripped). */
+  private async replyNotFound(items: BatchItem<T>[]): Promise<void> {
+    const { deps } = this;
+    const carriers =
+      deps.carriesStaffReply === undefined
+        ? []
+        : items.filter((item) => deps.carriesStaffReply!(item));
+    if (carriers.length === 0 || deps.dropStaffReply === undefined)
+      // Nothing of ours can explain it: never DEAD for that.
+      return this.stop(items, '422 REPLY_NOT_FOUND', false);
+    if (carriers.length === 1) {
+      deps.dropStaffReply(carriers[0]);
+      return this.process(items);
+    }
     const mid = Math.ceil(items.length / 2);
     await this.process(items.slice(0, mid));
     await this.process(items.slice(mid));

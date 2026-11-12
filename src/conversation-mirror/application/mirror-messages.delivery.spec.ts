@@ -620,6 +620,73 @@ describe('MirrorMessagesDelivery (T4)', () => {
       });
     });
 
+    describe('422 REPLY_NOT_FOUND (unit 10)', () => {
+      const REPLY = '7d1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a09';
+      const REPLY_2 = '9a1f0c52-3a8e-4b6f-9c21-5e4d3c2b1a0a';
+      const reply = (seq: number, id: string) =>
+        rowEntry(
+          seq,
+          textPayload(`wamid.${seq}`, {
+            direction: 'OUT',
+            author: 'BOT',
+            staffReplyId: id,
+          }),
+        );
+      const hasReply = (call: Call) =>
+        call.messages.some((m) => m.staffReplyId !== undefined);
+
+      it('sends staffReplyId and DELIVERs when the backend accepts it', async () => {
+        const { delivery, calls } = build();
+        const results = await delivery.deliverBatch([reply(1, REPLY)]);
+        expect(outcomes(results)).toEqual(['DELIVERED']);
+        expect(calls[0].messages[0].staffReplyId).toBe(REPLY);
+      });
+
+      it('resends the offender WITHOUT staffReplyId (never DEAD) and keeps the rest', async () => {
+        const { delivery, calls } = build((call) =>
+          hasReply(call) ? { kind: 'REPLY_NOT_FOUND' } : okAck(call.messages),
+        );
+        const entries = [...texts(3), reply(4, REPLY), ...texts(3, 5)];
+        const results = await delivery.deliverBatch(entries);
+        expect(outcomes(results)).toEqual(Array(7).fill('DELIVERED'));
+        expect(calls).toHaveLength(2);
+        expect(calls[1].messages).toHaveLength(7);
+        expect(hasReply(calls[1])).toBe(false);
+        // our own text is still mirrored (as BOT)
+        expect(calls[1].messages[3].text).toBe('texto wamid.4');
+        expect(warnLog).toHaveBeenCalledWith(contains('REPLY_NOT_FOUND'));
+        const logged = JSON.stringify(warnLog.mock.calls);
+        expect(logged).not.toContain('5215550001111');
+        expect(logged).not.toContain(REPLY);
+      });
+
+      it('with two staff replies and only one unknown, bisects and strips just that one', async () => {
+        const { delivery, calls } = build((call) =>
+          call.messages.some((m) => m.staffReplyId === REPLY_2)
+            ? { kind: 'REPLY_NOT_FOUND' }
+            : okAck(call.messages),
+        );
+        const entries = [reply(1, REPLY), ...texts(2, 2), reply(4, REPLY_2)];
+        const results = await delivery.deliverBatch(entries);
+        expect(outcomes(results)).toEqual(Array(4).fill('DELIVERED'));
+        const last = calls[calls.length - 1];
+        const sentIds = calls
+          .flatMap((c) => c.messages)
+          .filter((m) => m.staffReplyId !== undefined)
+          .map((m) => m.staffReplyId);
+        expect(sentIds).toContain(REPLY);
+        expect(last.messages.some((m) => m.staffReplyId === REPLY_2)).toBe(
+          false,
+        );
+      });
+
+      it('a REPLY_NOT_FOUND with no staffReplyId in the batch is not a DEAD row (RETRY)', async () => {
+        const { delivery } = build(() => ({ kind: 'REPLY_NOT_FOUND' }));
+        const results = await delivery.deliverBatch(texts(2));
+        expect(outcomes(results)).toEqual(['RETRY', 'RETRY']);
+      });
+    });
+
     describe.each([
       ['422 MEDIA_TYPE_MISMATCH', { kind: 'MEDIA_TYPE_MISMATCH' } as const],
       ['409 MESSAGE_ID_CONFLICT', { kind: 'MESSAGE_ID_CONFLICT' } as const],
