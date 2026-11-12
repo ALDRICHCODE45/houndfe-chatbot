@@ -40,6 +40,16 @@ Writes are merge-only, so a known value is never erased by a later turn. The bot
 | `CHATBOT_API_CASHIER_USER_ID`          | Production cashier user id (member of that branch)                                                                    |
 | `OPENAI_API_KEY`, `LLM_MODEL`          | OpenAI key and model                                                                                                  |
 | `DATABASE_URL`                         | The chatbot's own Postgres                                                                                            |
+| `CONVERSATION_MIRROR_DELIVERY_ENABLED` | Default `false` (off unless exactly `true`). See "Conversation mirror delivery flag" below                            |
+
+### Conversation mirror delivery flag
+
+`CONVERSATION_MIRROR_DELIVERY_ENABLED` (default `false`) controls whether the chatbot sends the conversation mirror (messages, media and delivery statuses) to the backend. Capture always runs: the transcript is written and the mirror rows are enqueued in the outbox. While the flag is off, no call is made to the backend; the rows wait in the outbox and retry with the usual backoff, so nothing is lost. The boot log shows "conversation mirror delivery disabled (CONVERSATION_MIRROR_DELIVERY_ENABLED=false): mirror rows are kept until enabled", and the not-wired fallback warns at most once per kind per minute.
+
+Enable it (`true`, then restart) only after the backend has unit 9 (`messages:batch`, `statuses:batch`, `POST /media`) in production. Before that:
+
+- The service credential needs the `conversation:write` and `media:write` scopes.
+- Migrations 4600, 4700 and 4800 must have run on the chatbot database.
 
 Obsolete variables that can be deleted (ignored if left): `SKYDROPX_*`, `RECEIPT_STORAGE_*`, every former feature flag, `META_WABA_ID`, `META_API_VERSION`.
 

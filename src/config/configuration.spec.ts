@@ -49,6 +49,7 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_INGESTION_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
+    'CONVERSATION_MIRROR_DELIVERY_ENABLED',
     'OPS_CHANNEL_PHONE',
     // Removed shipping vars (U6): kept here so the test restores them.
     'SHIPPING_QUOTES_ENABLED',
@@ -146,6 +147,24 @@ describe('configuration()', () => {
       meta: { sandboxRecipientNormalizationEnabled: boolean };
     };
     expect(cfg.meta.sandboxRecipientNormalizationEnabled).toBe(expected);
+  });
+
+  it.each([
+    [undefined, false],
+    ['true', true],
+    ['false', false],
+    ['TRUE', false],
+    ['1', false],
+  ])('maps CONVERSATION_MIRROR_DELIVERY_ENABLED=%s', (env, expected) => {
+    if (env === undefined) {
+      delete process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED;
+    } else {
+      process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED = env;
+    }
+    const cfg = configuration() as unknown as {
+      conversationMirror: { deliveryEnabled: boolean };
+    };
+    expect(cfg.conversationMirror.deliveryEnabled).toBe(expected);
   });
 
   // MVP-1: the ops wa_id is retained verbatim; no boot-time rewrite.

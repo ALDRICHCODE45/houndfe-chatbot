@@ -1,4 +1,4 @@
-import { Injectable, Module, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, Module, OnModuleInit } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { BackendOutboxService } from '../backend-outbox/application/backend-outbox.service';
@@ -34,17 +34,31 @@ import { MetaMirrorDownloader } from './infrastructure/meta-mirror-downloader';
 import { PostgresMirrorMediaCacheStore } from './infrastructure/postgres-mirror-media-cache.store';
 
 /** Registers the MESSAGE_MIRROR / MESSAGE_STATUS batch adapters on the outbox
- *  router; runs at init, before the drain worker starts on bootstrap. Other
- *  kinds keep their adapters or the not-wired fallback. */
+ *  router when `conversationMirror.deliveryEnabled` is true
+ *  (CONVERSATION_MIRROR_DELIVERY_ENABLED, default off); runs at init, before
+ *  the drain worker starts on bootstrap. When off, those kinds keep the
+ *  not-wired fallback (no HTTP call; rows stay in the outbox and retry), like
+ *  every other unregistered kind. */
 @Injectable()
 export class MirrorOutboxRoutes implements OnModuleInit {
+  private readonly logger = new Logger(MirrorOutboxRoutes.name);
+
   constructor(
     private readonly router: RoutingBackendOutboxDelivery,
     private readonly messages: MirrorMessagesDelivery,
     private readonly statuses: MirrorStatusesDelivery,
+    private readonly config: ConfigService,
   ) {}
 
   onModuleInit(): void {
+    if (
+      this.config.get<boolean>('conversationMirror.deliveryEnabled') !== true
+    ) {
+      this.logger.log(
+        'conversation mirror delivery disabled (CONVERSATION_MIRROR_DELIVERY_ENABLED=false): mirror rows are kept until enabled',
+      );
+      return;
+    }
     this.router.register(['MESSAGE_MIRROR'], this.messages);
     this.router.register(['MESSAGE_STATUS'], this.statuses);
   }
@@ -65,7 +79,8 @@ export class MirrorOutboxRoutes implements OnModuleInit {
  *
  * Delivery (T4/T5): `MirrorMessagesDelivery` (MESSAGE_MIRROR, ≤ 50 per call)
  * and `MirrorStatusesDelivery` (MESSAGE_STATUS, ≤ 100 per call) are
- * registered on the shared outbox router at init. They share one
+ * registered on the shared outbox router at init, only when
+ * CONVERSATION_MIRROR_DELIVERY_ENABLED=true (default off). They share one
  * `MirrorDeliveryGate` (the `conversation:write` credential policy).
  *
  * No worker or timer starts here; the drain worker belongs to

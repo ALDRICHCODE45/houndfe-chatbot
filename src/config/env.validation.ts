@@ -164,6 +164,16 @@ const innerEnvValidationSchema = Joi.object({
    */
   META_SANDBOX_RECIPIENT_NORMALIZATION: Joi.boolean().default(false),
 
+  /**
+   * Conversation mirror delivery (backend unit 9: messages:batch,
+   * statuses:batch, POST /media). Default: false. Capture (transcript +
+   * outbox enqueue) always runs; when false the MESSAGE_MIRROR /
+   * MESSAGE_STATUS rows stay in the outbox (no HTTP call) until enabled.
+   * Enable only once the backend has unit 9 in production and the
+   * credential has `conversation:write` and `media:write`.
+   */
+  CONVERSATION_MIRROR_DELIVERY_ENABLED: Joi.boolean().default(false),
+
   // ─── Durable conversation store (Postgres) ──────────────────────────────
   DATABASE_URL: Joi.string().uri().required(),
   DB_POOL_MAX: Joi.number().integer().min(1).default(5),

@@ -514,6 +514,30 @@ describe('envValidationSchema', () => {
     });
   });
 
+  describe('CONVERSATION_MIRROR_DELIVERY_ENABLED', () => {
+    it.each([
+      [undefined, false, false],
+      ['true', true, false],
+      ['false', false, false],
+      ['yes', undefined, true],
+    ])('validates flag=%s', (flag, expected, invalid) => {
+      const { error, value } = envValidationSchema.validate(
+        flag === undefined
+          ? { ...validEnv }
+          : { ...validEnv, CONVERSATION_MIRROR_DELIVERY_ENABLED: flag },
+        { abortEarly: false },
+      ) as { error?: Joi.ValidationError; value: Record<string, unknown> };
+      expect(Boolean(error)).toBe(invalid);
+      if (invalid) {
+        expect(error!.details[0].path).toContain(
+          'CONVERSATION_MIRROR_DELIVERY_ENABLED',
+        );
+      } else {
+        expect(value.CONVERSATION_MIRROR_DELIVERY_ENABLED).toBe(expected);
+      }
+    });
+  });
+
   // ─── WU1C1 + WU1C2A: Receipt media conditional validation foundation ───
   // Disabled (default) MUST be permissive; enabled MUST strictly validate
   // the listed receipt-media fields. WU1C2A extends enabledBase once with
