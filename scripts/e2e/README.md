@@ -4,7 +4,7 @@ These scripts call a running **dev** backend. They write dev data, so never poin
 
 - `contract-smoke.ts`: live contract smoke test of `ChatbotApiHttpClient`. See `docs/e2e-contract-smoke.md`.
 - `human-requests-feed-e2e.ts`: spec S7 run of the human request feed (create → staff resolve/cancel → feed item → outcome ACK), plus a read-only look at the 5c recovery route.
-- `conversation-mirror-e2e.ts`: spec S8 run of the conversation mirror and media (backend unit 9): upload, mirror, idempotent resend and delivery statuses.
+- `conversation-mirror-e2e.ts`: spec S8 run of the conversation mirror and media (backend unit 9): upload, mirror, idempotent resend and delivery statuses. `--phase outbox` runs the full delivery stack (outbox, drain worker, adapters, media service) instead.
 
 ## human-requests-feed-e2e
 
@@ -70,11 +70,13 @@ Same config as the feed script: `CHATBOT_API_BASE_URL` (default `http://localhos
 ```bash
 pnpm e2e:conversation-mirror
 pnpm e2e:conversation-mirror --phone 5550004444
+pnpm e2e:conversation-mirror --phase outbox --phone 5550005555
 ```
 
-| Flag      | Default      | Meaning                                                    |
-| --------- | ------------ | ---------------------------------------------------------- |
-| `--phone` | `5550004444` | 10-digit test number. `conversationRef` is `wa:521<phone>` |
+| Flag      | Default      | Meaning                                                                                |
+| --------- | ------------ | -------------------------------------------------------------------------------------- |
+| `--phase` | `client`     | `client`: the client-level flow below. `outbox`: the full delivery stack (see the end) |
+| `--phone` | `5550004444` | 10-digit test number. `conversationRef` is `wa:521<phone>`                             |
 
 Steps (every id is unique per run: `e2e-image-<runId>`, `wamid.e2e-<runId>-<n>`):
 
@@ -85,3 +87,27 @@ Steps (every id is unique per run: `e2e-image-<runId>`, `wamid.e2e-<runId>-<n>`)
 5. `[summary]` prints the masked conversation, the `mediaId` and the `waMessageId`s, so the backend can check the staff read.
 
 The exit code is 1 when a step returns a non-ok typed result (the line shows `kind` and any status/code, never the phone) or when an idempotency expectation fails (replay `created=true`, resend not all duplicates, unknown id not reported). The generated PNG is left in a temp directory under the OS temp dir.
+
+### `--phase outbox`: the real delivery stack
+
+Builds the production pieces by hand, with no Nest app and no chatbot Postgres:
+
+- `InMemoryBackendOutboxStore` and `BackendOutboxService.enqueue`, the same enqueue API production uses. Mirror payloads come from the production `mirrorPayload` builder.
+- `BackendOutboxDrainWorker` (driven through `tick()`), `RoutingBackendOutboxDelivery`, and the real `MirrorMessagesDelivery` and `MirrorStatusesDelivery` with one `MirrorDeliveryGate`.
+- `MirrorMediaService` with an `InMemoryMirrorMediaCacheStore` and the real `LinkMirrorFetcher`. The Meta downloader is a stub that fails the run if it is ever called (no inbound media here).
+- The real `ChatbotApiHttpClient` over an axios instance whose interceptors count every HTTP call per route (the conversation ref is replaced by `:ref`).
+
+Rows enqueued for `wa:521<phone>`, in this order:
+
+1. A `DELIVERED` status for OUT message 14, before its mirror row (the race).
+2. 55 `MESSAGE_MIRROR` rows (50 + 5, so two batches): IN/OUT text, one OUT interactive with `options` (message 10), one OUT product photo with `media.link` (message 20, a public `raw.githubusercontent.com` PNG, printed in `[config]`), one IN `location` (30) and one old-style OUT row with no `providerTimestamp` or `contractType` (40, the backfill path).
+3. Statuses: `DELIVERED` for 2, 4, 6, 10, 20; `READ` for 2, 10, 20; `FAILED` (131026) for 8; `SENT` for 12; and `DELIVERED` for an id that is never mirrored.
+
+The worker is ticked until nothing is PENDING/IN_FLIGHT or 3 minutes pass. Output:
+
+- `[pass1] rows`: final state counts (`DONE`, `RETRY` = pending with attempts, `DEAD`, leftover `PENDING`/`IN_FLIGHT`), and any row that is not DONE with its (truncated) last error. The total includes the rows the status adapter re-enqueued for unknown ids.
+- `[pass1] http`: calls per route with the HTTP statuses seen. Expected: 2 `messages:batch` calls, 1 `POST /media`, and a few `statuses:batch` calls (the race, the main batch, and the retries of the never-mirrored id until the adapter gives up after 3 attempts).
+- `[pass1] media`: the uploaded product photo `mediaId`, link opens and Meta downloads.
+- `[pass2]`: a new OUT product-photo row with the same URL is enqueued and drained. It must resolve from the cache with the same `mediaId` and no new `POST /media`.
+
+Exit code 1 on any DEAD row, any row left open (RETRY/PENDING/IN_FLIGHT), no photo `mediaId`, a cache miss in pass 2, or a Meta download. It writes dev data on the backend (one media file, the conversation and its messages). The default Nest logger prints the adapters' log lines, with the conversation masked.
