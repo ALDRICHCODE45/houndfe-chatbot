@@ -3,6 +3,9 @@ import { maskConversationRef } from '../../human-requests/domain/human-request-f
 import {
   RETRY_AFTER_MAX_MS,
   backoffDelayMs,
+  isBatchDelivery,
+  type BackendOutboxBatchDeliveryPort,
+  type BackendOutboxCompletion,
   type BackendOutboxDeliveryPort,
   type BackendOutboxDeliveryResult,
   type BackendOutboxStore,
@@ -43,6 +46,12 @@ const DAY_MS = 24 * 3_600_000;
  * backoff and jitter (or the backend's Retry-After), retried forever;
  * PERMANENT → DEAD with an error log, which unblocks the next seq. DONE rows
  * older than the retention are purged in bounded batches.
+ *
+ * Batches (backend unit 9): when the delivery port offers `deliverBatch` and
+ * `batchLimit(kind) > 1` for a claimed head, the contiguous same-kind run
+ * behind it (one conversation lane, leased together) is delivered in ONE
+ * call and each row ends DONE / DEAD / RETRY atomically. Other kinds and
+ * plain ports keep the single-row path.
  */
 export class BackendOutboxDrainWorker {
   private readonly logger = new Logger(BackendOutboxDrainWorker.name);
@@ -59,6 +68,8 @@ export class BackendOutboxDrainWorker {
   private lastPurgeAt: number | undefined;
   private started = false;
   private stopped = false;
+  /** A batch filled its limit in the last tick: more rows likely wait. */
+  private fullBatch = false;
   private timer?: ReturnType<typeof setTimeout>;
   private inFlight?: Promise<void>;
 
@@ -127,8 +138,136 @@ export class BackendOutboxDrainWorker {
       this.logger.warn(`backend outbox claim failed: ${describe(error)}`);
       return 0;
     }
-    await Promise.all(claimed.map((entry) => this.process(entry)));
+    this.fullBatch = false;
+    await Promise.all(claimed.map((entry) => this.processHead(entry)));
     return claimed.length;
+  }
+
+  private async processHead(head: ClaimedBackendOutboxEntry): Promise<void> {
+    const limit = isBatchDelivery(this.delivery)
+      ? this.delivery.batchLimit(head.kind)
+      : 1;
+    if (!isBatchDelivery(this.delivery) || limit <= 1)
+      return this.process(head);
+    let run: ClaimedBackendOutboxEntry[];
+    try {
+      run = await this.store.claimRun(
+        head,
+        this.options.owner,
+        this.leaseMs,
+        limit,
+      );
+    } catch (error) {
+      // Deliver the head alone rather than leave it leased until expiry.
+      this.logger.warn(`backend outbox run claim failed: ${describe(error)}`);
+      return this.process(head);
+    }
+    if (run.length === 0) {
+      this.logger.warn(
+        `backend outbox lease lost for ${head.kind} ${maskConversationRef(head.conversationRef)}#${head.seq}`,
+      );
+      return;
+    }
+    if (run.length >= limit) this.fullBatch = true;
+    await this.processBatch(this.delivery, run);
+  }
+
+  private async processBatch(
+    delivery: BackendOutboxBatchDeliveryPort,
+    run: ClaimedBackendOutboxEntry[],
+  ): Promise<void> {
+    let results: BackendOutboxDeliveryResult[];
+    try {
+      results = await this.deliverBatchWithTimeout(delivery, run);
+      if (!Array.isArray(results) || results.length !== run.length)
+        throw new Error('backend outbox batch result does not match the rows');
+    } catch (error) {
+      const failure: BackendOutboxDeliveryResult = {
+        outcome: 'RETRY',
+        error: describe(error),
+      };
+      results = run.map(() => failure);
+    }
+    const items = run.map((entry, index) =>
+      this.completionFor(entry, results[index]),
+    );
+    try {
+      const applied = await this.store.completeMany(items);
+      applied.forEach((ok, index) => {
+        if (!ok)
+          // Lease lost (expired and reclaimed): the new owner redelivers.
+          this.logger.warn(
+            `backend outbox lease lost for ${run[index].kind} ${maskConversationRef(run[index].conversationRef)}#${run[index].seq}`,
+          );
+      });
+    } catch (error) {
+      // The leases expire and the rows are reclaimed; delivery is idempotent.
+      this.logger.warn(`backend outbox completion failed: ${describe(error)}`);
+    }
+  }
+
+  /** The signal fires at 80% of the budget so the adapter can return the
+   *  unfinished rows as RETRY before the hard timeout discards its result. */
+  private async deliverBatchWithTimeout(
+    delivery: BackendOutboxBatchDeliveryPort,
+    run: ClaimedBackendOutboxEntry[],
+  ): Promise<BackendOutboxDeliveryResult[]> {
+    const controller = new AbortController();
+    const softTimer = setTimeout(
+      () => controller.abort(),
+      Math.floor(this.deliveryTimeoutMs * 0.8),
+    );
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      hardTimer = setTimeout(() => {
+        controller.abort();
+        reject(
+          new DeliveryTimeoutError(
+            `backend outbox delivery timed out after ${this.deliveryTimeoutMs} ms`,
+          ),
+        );
+      }, this.deliveryTimeoutMs);
+    });
+    try {
+      return await Promise.race([
+        delivery.deliverBatch(run, { signal: controller.signal }),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(softTimer);
+      clearTimeout(hardTimer);
+    }
+  }
+
+  private completionFor(
+    entry: ClaimedBackendOutboxEntry,
+    result: BackendOutboxDeliveryResult,
+  ): BackendOutboxCompletion {
+    switch (result.outcome) {
+      case 'DELIVERED':
+        return { entry, outcome: 'DONE' };
+      case 'PERMANENT':
+        this.logger.error(
+          `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${result.error}`,
+        );
+        return { entry, outcome: 'DEAD', error: result.error };
+      case 'RETRY':
+        return {
+          entry,
+          outcome: 'RETRY',
+          delayMs: this.retryDelayMs(entry, result),
+          error: result.error,
+        };
+    }
+  }
+
+  private retryDelayMs(
+    entry: ClaimedBackendOutboxEntry,
+    result: Extract<BackendOutboxDeliveryResult, { outcome: 'RETRY' }>,
+  ): number {
+    return result.retryAfterMs !== undefined
+      ? Math.min(Math.max(result.retryAfterMs, 0), RETRY_AFTER_MAX_MS)
+      : backoffDelayMs(entry.attempts + 1, this.random);
   }
 
   private async process(entry: ClaimedBackendOutboxEntry): Promise<void> {
@@ -186,13 +325,12 @@ export class BackendOutboxDrainWorker {
           `backend outbox row DEAD: ${entry.kind} ${maskConversationRef(entry.conversationRef)}#${entry.seq} (id ${entry.id}): ${result.error}`,
         );
         return this.store.markDead(entry, result.error);
-      case 'RETRY': {
-        const delayMs =
-          result.retryAfterMs !== undefined
-            ? Math.min(Math.max(result.retryAfterMs, 0), RETRY_AFTER_MAX_MS)
-            : backoffDelayMs(entry.attempts + 1, this.random);
-        return this.store.reschedule(entry, delayMs, result.error);
-      }
+      case 'RETRY':
+        return this.store.reschedule(
+          entry,
+          this.retryDelayMs(entry, result),
+          result.error,
+        );
     }
   }
 
@@ -232,7 +370,9 @@ export class BackendOutboxDrainWorker {
         .finally(() => {
           this.inFlight = undefined;
           // A full batch means more work is likely waiting: go again now.
-          this.schedule(claimed >= this.batchSize ? 0 : this.idleDelayMs);
+          this.schedule(
+            claimed >= this.batchSize || this.fullBatch ? 0 : this.idleDelayMs,
+          );
         });
     }, delayMs);
   }

@@ -1,8 +1,10 @@
-import type {
-  BackendOutboxDeliveryPort,
-  BackendOutboxDeliveryResult,
-  BackendOutboxEntry,
-  BackendOutboxKind,
+import {
+  isBatchDelivery,
+  type BackendOutboxBatchDeliveryPort,
+  type BackendOutboxDeliveryPort,
+  type BackendOutboxDeliveryResult,
+  type BackendOutboxEntry,
+  type BackendOutboxKind,
 } from '../domain/backend-outbox';
 import { NotWiredBackendOutboxDelivery } from './not-wired-backend-outbox.delivery';
 
@@ -13,7 +15,7 @@ import { NotWiredBackendOutboxDelivery } from './not-wired-backend-outbox.delive
  * rows stay queued. Registration at runtime keeps this module free of
  * feature imports (no module cycle).
  */
-export class RoutingBackendOutboxDelivery implements BackendOutboxDeliveryPort {
+export class RoutingBackendOutboxDelivery implements BackendOutboxBatchDeliveryPort {
   private readonly routes = new Map<
     BackendOutboxKind,
     BackendOutboxDeliveryPort
@@ -38,5 +40,26 @@ export class RoutingBackendOutboxDelivery implements BackendOutboxDeliveryPort {
 
   deliver(entry: BackendOutboxEntry): Promise<BackendOutboxDeliveryResult> {
     return (this.routes.get(entry.kind) ?? this.fallback).deliver(entry);
+  }
+
+  /** The adapter's batch limit for the kind; `1` when it has no batching. */
+  batchLimit(kind: BackendOutboxKind): number {
+    const adapter = this.routes.get(kind);
+    return adapter !== undefined && isBatchDelivery(adapter)
+      ? adapter.batchLimit(kind)
+      : 1;
+  }
+
+  /** A run is always of one kind. An adapter without batching (not expected:
+   *  the worker only batches kinds with a limit above 1) goes row by row. */
+  async deliverBatch(
+    entries: readonly BackendOutboxEntry[],
+    options?: { signal?: AbortSignal },
+  ): Promise<BackendOutboxDeliveryResult[]> {
+    const adapter = this.routes.get(entries[0]?.kind) ?? this.fallback;
+    if (isBatchDelivery(adapter)) return adapter.deliverBatch(entries, options);
+    const results: BackendOutboxDeliveryResult[] = [];
+    for (const entry of entries) results.push(await adapter.deliver(entry));
+    return results;
   }
 }

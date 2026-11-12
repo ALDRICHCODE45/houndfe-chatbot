@@ -1,4 +1,5 @@
 import type {
+  BackendOutboxBatchDeliveryPort,
   BackendOutboxDeliveryPort,
   BackendOutboxEntry,
 } from '../domain/backend-outbox';
@@ -67,5 +68,56 @@ describe('RoutingBackendOutboxDelivery', () => {
     expect(() => router.register(['REQUEST_CREATE'], port())).toThrow(
       /REQUEST_CREATE/,
     );
+  });
+
+  describe('batches', () => {
+    const batchPort = (): jest.Mocked<BackendOutboxBatchDeliveryPort> => ({
+      deliver: jest.fn().mockResolvedValue({ outcome: 'DELIVERED' }),
+      batchLimit: jest.fn().mockReturnValue(50),
+      deliverBatch: jest
+        .fn()
+        .mockResolvedValue([
+          { outcome: 'DELIVERED' },
+          { outcome: 'DELIVERED' },
+        ]),
+    });
+
+    it('reports the adapter batch limit for its kinds and 1 for the rest', () => {
+      const router = new RoutingBackendOutboxDelivery(port());
+      const mirror = batchPort();
+      router.register(['MESSAGE_MIRROR'], mirror);
+      router.register(['REQUEST_CREATE'], port());
+      expect(router.batchLimit('MESSAGE_MIRROR')).toBe(50);
+      expect(mirror.batchLimit).toHaveBeenCalledWith('MESSAGE_MIRROR');
+      expect(router.batchLimit('REQUEST_CREATE')).toBe(1);
+      expect(router.batchLimit('SESSION_ACK')).toBe(1);
+    });
+
+    it('delegates a batch to the adapter of the run kind with the options', async () => {
+      const router = new RoutingBackendOutboxDelivery(port());
+      const mirror = batchPort();
+      router.register(['MESSAGE_MIRROR'], mirror);
+      const entries = [entry('MESSAGE_MIRROR'), entry('MESSAGE_MIRROR')];
+      const signal = new AbortController().signal;
+      await expect(router.deliverBatch(entries, { signal })).resolves.toEqual([
+        { outcome: 'DELIVERED' },
+        { outcome: 'DELIVERED' },
+      ]);
+      expect(mirror.deliverBatch).toHaveBeenCalledWith(entries, { signal });
+    });
+
+    it('a batch for a kind without a batch adapter falls back row by row', async () => {
+      const fallback = port();
+      fallback.deliver
+        .mockResolvedValueOnce({ outcome: 'RETRY', error: 'nw' })
+        .mockResolvedValueOnce({ outcome: 'DELIVERED' });
+      const router = new RoutingBackendOutboxDelivery(fallback);
+      await expect(
+        router.deliverBatch([entry('SESSION_ACK'), entry('SESSION_ACK')]),
+      ).resolves.toEqual([
+        { outcome: 'RETRY', error: 'nw' },
+        { outcome: 'DELIVERED' },
+      ]);
+    });
   });
 });

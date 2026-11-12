@@ -253,6 +253,227 @@ export function runBackendOutboxStoreContract(
       });
     });
 
+    describe('batched claim (claimRun / completeMany)', () => {
+      const mirrors = async (conversation: string, count: number) => {
+        for (let n = 1; n <= count; n++)
+          await store.enqueue(input(conversation, `${conversation}-m${n}`));
+      };
+      const head = async () => {
+        const [claimed] = await store.claimHeads(20, OWNER, LEASE_MS);
+        return claimed;
+      };
+
+      it('claims the contiguous same-kind run after the head, leased together', async () => {
+        await mirrors(A, 5);
+        await store.enqueue(input(B, 'b1'));
+        const heads = await store.claimHeads(20, OWNER, LEASE_MS);
+        const a1 = heads.find((e) => e.conversationRef === A)!;
+        const run = await store.claimRun(a1, OWNER, LEASE_MS, 3);
+        expect(run.map((e) => e.seq)).toEqual([1, 2, 3]);
+        expect(new Set(run.map((e) => e.leaseExpiresAt.getTime())).size).toBe(
+          1,
+        );
+        for (const entry of run) {
+          expect(entry.status).toBe('IN_FLIGHT');
+          expect(entry.leaseOwner).toBe(OWNER);
+        }
+        // Everything of A is leased: nothing else of A is claimable.
+        await expect(
+          store.claimHeads(20, OTHER_OWNER, LEASE_MS),
+        ).resolves.toEqual([]);
+      });
+
+      it('the head carries the refreshed lease (the old head token is fenced)', async () => {
+        await mirrors(A, 2);
+        const a1 = await head();
+        const run = await store.claimRun(a1, OWNER, 120_000, 5);
+        expect(run).toHaveLength(2);
+        await expect(store.markDone(a1)).resolves.toBe(false);
+        await expect(store.markDone(run[1])).resolves.toBe(true);
+      });
+
+      it('a run of one is just the head', async () => {
+        await mirrors(A, 3);
+        const a1 = await head();
+        const run = await store.claimRun(a1, OWNER, LEASE_MS, 1);
+        expect(run.map((e) => e.seq)).toEqual([1]);
+        await store.markDone(run[0]);
+        const next = await head();
+        expect(next.seq).toBe(2);
+      });
+
+      it('stops at the first row of another kind', async () => {
+        await store.enqueue(input(A, 'm1'));
+        await store.enqueue(input(A, 'm2'));
+        await store.enqueue(input(A, 's3', {}, 'MESSAGE_STATUS'));
+        await store.enqueue(input(A, 's4', {}, 'MESSAGE_STATUS'));
+        await store.enqueue(input(A, 'm5'));
+        const a1 = await head();
+        const first = await store.claimRun(a1, OWNER, LEASE_MS, 50);
+        expect(first.map((e) => e.idempotencyKey)).toEqual(['m1', 'm2']);
+        for (const entry of first) await store.markDone(entry);
+        const s3 = await head();
+        const second = await store.claimRun(s3, OWNER, LEASE_MS, 100);
+        expect(second.map((e) => e.idempotencyKey)).toEqual(['s3', 's4']);
+        for (const entry of second) await store.markDone(entry);
+        const m5 = await head();
+        const third = await store.claimRun(m5, OWNER, LEASE_MS, 50);
+        expect(third.map((e) => e.idempotencyKey)).toEqual(['m5']);
+      });
+
+      it('ignores rows of the control lane (other lanes never break the run)', async () => {
+        await store.enqueue(input(A, 'm1'));
+        await store.enqueue(control(A, 'c1', 'REQUEST_CREATE'));
+        await store.enqueue(input(A, 'm2'));
+        const claimed = await store.claimHeads(20, OWNER, LEASE_MS);
+        const m1 = claimed.find((e) => e.idempotencyKey === 'm1')!;
+        const run = await store.claimRun(m1, OWNER, LEASE_MS, 50);
+        expect(run.map((e) => e.idempotencyKey)).toEqual(['m1', 'm2']);
+      });
+
+      it('stops at a follower that is not due yet', async () => {
+        await mirrors(A, 3);
+        const a1 = await head();
+        const all = await store.claimRun(a1, OWNER, LEASE_MS, 3);
+        await expect(
+          store.completeMany([
+            { entry: all[0], outcome: 'RETRY', delayMs: 0, error: 'x' },
+            { entry: all[1], outcome: 'RETRY', delayMs: 60_000, error: 'x' },
+            { entry: all[2], outcome: 'RETRY', delayMs: 0, error: 'x' },
+          ]),
+        ).resolves.toEqual([true, true, true]);
+        const again = await head();
+        expect(again.seq).toBe(1);
+        const run = await store.claimRun(again, OWNER, LEASE_MS, 50);
+        expect(run.map((e) => e.seq)).toEqual([1]);
+      });
+
+      it('skips DONE and DEAD rows between open rows', async () => {
+        await mirrors(A, 4);
+        const a1 = await head();
+        const all = await store.claimRun(a1, OWNER, LEASE_MS, 4);
+        await store.completeMany([
+          { entry: all[0], outcome: 'RETRY', delayMs: 0, error: 'x' },
+          { entry: all[1], outcome: 'DONE' },
+          { entry: all[2], outcome: 'DEAD', error: 'bad' },
+          { entry: all[3], outcome: 'RETRY', delayMs: 0, error: 'x' },
+        ]);
+        const again = await head();
+        const run = await store.claimRun(again, OWNER, LEASE_MS, 50);
+        expect(run.map((e) => e.seq)).toEqual([1, 4]);
+      });
+
+      it('never crosses conversations', async () => {
+        await mirrors(A, 2);
+        await mirrors(B, 2);
+        const heads = await store.claimHeads(20, OWNER, LEASE_MS);
+        const a1 = heads.find((e) => e.conversationRef === A)!;
+        const run = await store.claimRun(a1, OWNER, LEASE_MS, 50);
+        expect(new Set(run.map((e) => e.conversationRef))).toEqual(
+          new Set([A]),
+        );
+      });
+
+      it('takes over a crashed batch: expired followers are re-leased with the head', async () => {
+        await mirrors(A, 3);
+        const a1 = await head();
+        await store.claimRun(a1, OWNER, 1, 3);
+        await sleep(25);
+        const [reclaimed] = await store.claimHeads(20, OTHER_OWNER, LEASE_MS);
+        expect(reclaimed.idempotencyKey).toBe(`${A}-m1`);
+        const run = await store.claimRun(reclaimed, OTHER_OWNER, LEASE_MS, 50);
+        expect(run.map((e) => e.seq)).toEqual([1, 2, 3]);
+        expect(run.every((e) => e.leaseOwner === OTHER_OWNER)).toBe(true);
+      });
+
+      it('a head whose lease was lost claims nothing', async () => {
+        await mirrors(A, 2);
+        const [stale] = await store.claimHeads(20, OWNER, 1);
+        await sleep(25);
+        await store.claimHeads(20, OTHER_OWNER, LEASE_MS);
+        await expect(
+          store.claimRun(stale, OWNER, LEASE_MS, 10),
+        ).resolves.toEqual([]);
+      });
+
+      it('rejects nonsense limits without claiming', async () => {
+        await mirrors(A, 2);
+        const a1 = await head();
+        await expect(store.claimRun(a1, OWNER, LEASE_MS, 0)).resolves.toEqual(
+          [],
+        );
+        await expect(
+          store.claimRun(a1, OWNER, LEASE_MS, Number.NaN),
+        ).resolves.toEqual([]);
+        // The head is still ours.
+        await expect(store.markDone(a1)).resolves.toBe(true);
+      });
+
+      it('completes a mixed batch per row and fences stale tokens', async () => {
+        await mirrors(A, 4);
+        const a1 = await head();
+        const run = await store.claimRun(a1, OWNER, 120_000, 4);
+        const results = await store.completeMany([
+          { entry: run[0], outcome: 'DONE' },
+          { entry: run[1], outcome: 'DEAD', error: '422 MEDIA_TYPE_MISMATCH' },
+          { entry: run[2], outcome: 'RETRY', delayMs: 60_000, error: '503' },
+          { entry: a1, outcome: 'DONE' },
+        ]);
+        // The 4th item reuses the head's stale (pre-claimRun) token.
+        expect(results).toEqual([true, true, true, false]);
+        const open = await store.enqueue(input(A, 'probe'));
+        expect(open.entry.seq).toBe(5);
+        await expect(store.completeMany([])).resolves.toEqual([]);
+      });
+
+      it('applies attempts, errors and backoff like the single-row calls', async () => {
+        await mirrors(A, 2);
+        const a1 = await head();
+        const run = await store.claimRun(a1, OWNER, LEASE_MS, 2);
+        await store.completeMany([
+          { entry: run[0], outcome: 'DEAD', error: 'dead-reason' },
+          { entry: run[1], outcome: 'RETRY', delayMs: 0, error: 'later' },
+        ]);
+        const next = await head();
+        expect(next).toMatchObject({
+          seq: 2,
+          attempts: 1,
+          lastError: 'later',
+        });
+        const dead = await store.enqueue(input(A, `${A}-m1`));
+        expect(dead.entry).toMatchObject({
+          status: 'DEAD',
+          attempts: 1,
+          lastError: 'dead-reason',
+          leaseOwner: null,
+        });
+      });
+
+      it('mirror/status runs hold at most the requested rows (120 rows, 50 per run)', async () => {
+        await mirrors(A, 120);
+        const sizes: number[] = [];
+        for (let round = 0; round < 4; round++) {
+          const h = await head();
+          if (!h) break;
+          const run = await store.claimRun(h, OWNER, LEASE_MS, 50);
+          sizes.push(run.length);
+          await store.completeMany(
+            run.map((entry) => ({ entry, outcome: 'DONE' as const })),
+          );
+        }
+        expect(sizes).toEqual([50, 50, 20]);
+      });
+    });
+
+    it('enqueue with delayMs makes the row due only later (lane tail, head-of-line)', async () => {
+      await store.enqueue({ ...input(A, 'late'), delayMs: 400 });
+      await store.enqueue(input(A, 'after'));
+      await expect(store.claimHeads(20, OWNER, LEASE_MS)).resolves.toEqual([]);
+      await sleep(450);
+      const [late] = await store.claimHeads(20, OWNER, LEASE_MS);
+      expect(late.idempotencyKey).toBe('late');
+    });
+
     it('purges DONE rows older than the retention, in batches', async () => {
       await store.enqueue(input(A, 'a1'));
       await store.enqueue(input(B, 'b1'));
