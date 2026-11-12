@@ -4,7 +4,11 @@ import { ChatbotApiHttpClient } from '../chatbot-api/infrastructure/chatbot-api-
 import { CONVERSATION_MIRROR_CLIENT } from '../chatbot-api/domain/conversation-mirror.port';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
+import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
+import { MirrorDeliveryGate } from './application/mirror-delivery-gate';
 import { MirrorMediaService } from './application/mirror-media.service';
+import { MirrorMessagesDelivery } from './application/mirror-messages.delivery';
+import { MirrorStatusesDelivery } from './application/mirror-statuses.delivery';
 import { ConversationMirrorModule } from './conversation-mirror.module';
 import {
   MIRROR_LINK_FETCHER,
@@ -81,6 +85,69 @@ describe('ConversationMirrorModule wiring (T3)', () => {
       .useValue(pool())
       .compile();
     expect(moduleRef.get(Consumer).media).toBeInstanceOf(MirrorMediaService);
+    await moduleRef.close();
+  });
+
+  it('registers the MESSAGE_MIRROR and MESSAGE_STATUS batch adapters on the outbox router at init (T4/T5)', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        ConfigModule.forRoot({ ignoreEnvFile: true, isGlobal: true }),
+        ConversationMirrorModule,
+      ],
+    })
+      .overrideProvider(PG_POOL)
+      .useValue(pool())
+      .compile();
+    await moduleRef.init();
+    const router = moduleRef.get(RoutingBackendOutboxDelivery);
+    expect(router.batchLimit('MESSAGE_MIRROR')).toBe(50);
+    expect(router.batchLimit('MESSAGE_STATUS')).toBe(100);
+    // Everything else is untouched: single rows, not-wired fallback.
+    expect(router.batchLimit('REQUEST_CREATE')).toBe(1);
+    expect(router.batchLimit('SESSION_ACK')).toBe(1);
+    await expect(
+      router.deliver({
+        id: '1',
+        conversationRef: 'wa:5215550001111',
+        seq: 1,
+        kind: 'SESSION_ACK',
+        idempotencyKey: 'k',
+        payload: {},
+        status: 'IN_FLIGHT',
+        attempts: 0,
+        nextAttemptAt: new Date(),
+        leaseOwner: 'o',
+        leaseExpiresAt: new Date(),
+        lastError: null,
+        createdAt: new Date(),
+        doneAt: null,
+      }),
+    ).resolves.toMatchObject({
+      outcome: 'RETRY',
+      error: 'backend outbox delivery not wired for kind SESSION_ACK',
+    });
+    await moduleRef.close();
+  });
+
+  it('both adapters share one credential gate and the outbox enqueue service', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        ConfigModule.forRoot({ ignoreEnvFile: true, isGlobal: true }),
+        ConversationMirrorModule,
+      ],
+    })
+      .overrideProvider(PG_POOL)
+      .useValue(pool())
+      .compile();
+    expect(moduleRef.get(MirrorDeliveryGate)).toBeInstanceOf(
+      MirrorDeliveryGate,
+    );
+    expect(moduleRef.get(MirrorMessagesDelivery)).toBeInstanceOf(
+      MirrorMessagesDelivery,
+    );
+    expect(moduleRef.get(MirrorStatusesDelivery)).toBeInstanceOf(
+      MirrorStatusesDelivery,
+    );
     await moduleRef.close();
   });
 });
