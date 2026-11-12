@@ -10,6 +10,7 @@ import {
   type ReceiptExtractionInput,
   type ReceiptExtractionPort,
 } from '../domain/receipt-extraction.port';
+import { describeError } from '../../common/log-safe';
 
 export const DEFAULT_RECEIPT_EXTRACTION_TIMEOUT_MS = 15_000;
 const MAX_TEXT_FIELD_LENGTH = 64;
@@ -94,9 +95,7 @@ export class LlmReceiptExtractionAdapter implements ReceiptExtractionPort {
       if (error instanceof ExtractionTimeoutError) {
         return { kind: 'unavailable', reason: 'timeout' };
       }
-      this.logger.warn(
-        `Receipt extraction failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      this.logger.warn(`Receipt extraction failed: ${describeError(error)}`);
       return { kind: 'unavailable', reason: 'error' };
     }
     return toExtraction(raw, input.expectedAmountCents);

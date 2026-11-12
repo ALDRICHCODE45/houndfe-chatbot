@@ -1,5 +1,6 @@
 import type { BackendOutboxDeliveryResult } from '../../backend-outbox/domain/backend-outbox';
 import type { MirrorDeliveryGate } from './mirror-delivery-gate';
+import { sanitizeErrorText } from '../../common/log-safe';
 
 /**
  * The S4 reactions to a `messages:batch` / `statuses:batch` answer, shared by
@@ -337,7 +338,7 @@ export class BatchReactor<T> {
       : gate.stopDelayMs();
     gate.alert(
       `${label}:${error}`,
-      `conversation mirror ${label} stopped (${error}): rows kept, retrying in ${Math.round(delay / 60_000)} min; check the credential or the backend`,
+      `conversation mirror ${label} stopped (${sanitizeErrorText(error)}): rows kept, retrying in ${Math.round(delay / 60_000)} min; check the credential or the backend`,
     );
     this.halt(items, { outcome: 'RETRY', error, retryAfterMs: delay });
   }

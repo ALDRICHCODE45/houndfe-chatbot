@@ -13,6 +13,7 @@ import {
   type TranscriptMedia,
   type TranscriptMessage,
 } from '../domain/transcript.port';
+import { describeError, fingerprintMessageId } from '../../common/log-safe';
 
 /** DI token the WhatsApp sender records accepted outbound messages through. */
 export const OUTBOUND_TRANSCRIPT_RECORDER = Symbol(
@@ -137,7 +138,7 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
   ): Promise<void> {
     if (!isConversationRef(conversationRefFor(senderId))) {
       this.logger.warn(
-        `transcript record rejected for ${waMessageId}: sender is not a WhatsApp wa_id`,
+        `transcript record rejected for ${fingerprintMessageId(waMessageId)}: sender is not a WhatsApp wa_id`,
       );
       return;
     }
@@ -150,9 +151,7 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
       )
         throw error;
       this.logger.warn(
-        `transcript write failed for ${waMessageId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `transcript write failed for ${fingerprintMessageId(waMessageId)}: ${describeError(error)}`,
       );
     }
   }

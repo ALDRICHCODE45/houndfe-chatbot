@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type { HumanRequestDeliveryService } from './human-request-delivery.service';
+import { describeError } from '../../common/log-safe';
 
 export interface HumanRequestMaintenanceOptions {
   intervalMs?: number;
@@ -60,11 +61,7 @@ export class HumanRequestMaintenanceWorker {
     try {
       await run();
     } catch (error) {
-      this.logger.warn(
-        `human request ${name} failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      this.logger.warn(`human request ${name} failed: ${describeError(error)}`);
     }
   }
 

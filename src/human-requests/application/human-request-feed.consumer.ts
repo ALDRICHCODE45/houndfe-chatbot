@@ -14,6 +14,7 @@ import {
   type HumanRequestFeedStore,
 } from '../domain/human-request-feed';
 import type { HumanRequestDeliveryService } from './human-request-delivery.service';
+import { describeError } from '../../common/log-safe';
 
 export interface HumanRequestFeedConsumerPorts {
   store: Pick<
@@ -308,9 +309,9 @@ export class HumanRequestFeedConsumer {
       )
         throw error;
       // Throws when the ledger is unreadable: the page stays stuck.
-      await this.ports.delivery.abandon(item, describe(error));
+      await this.ports.delivery.abandon(item, describeError(error));
       this.logger.error(
-        `feed item ${item.deliveryId} abandoned after ${this.failingItemCount} consecutive failures over ${Math.round(failingMs / 1000)} s: ${describe(error)}`,
+        `feed item ${item.deliveryId} abandoned after ${this.failingItemCount} consecutive failures over ${Math.round(failingMs / 1000)} s: ${describeError(error)}`,
       );
     }
     if (this.failingItem === item.deliveryId) {
@@ -362,7 +363,7 @@ export class HumanRequestFeedConsumer {
     try {
       await this.ports.lock.release();
     } catch (error) {
-      this.logger.warn(`feed lock release failed: ${describe(error)}`);
+      this.logger.warn(`feed lock release failed: ${describeError(error)}`);
     }
   }
 
@@ -376,7 +377,7 @@ export class HumanRequestFeedConsumer {
       this.lockHeld = await this.ports.lock.tryAcquire();
     } catch (error) {
       this.lockHeld = false;
-      this.logger.warn(`feed advisory lock failed: ${describe(error)}`);
+      this.logger.warn(`feed advisory lock failed: ${describeError(error)}`);
     }
     return this.lockHeld;
   }
@@ -391,11 +392,11 @@ export class HumanRequestFeedConsumer {
     const at = this.lastCursor ?? '(start)';
     if (this.failedCount >= this.stuckPageThreshold)
       this.logger.error(
-        `feed page at cursor ${at} stuck: ${this.failedCount} consecutive failures (${describe(error)})`,
+        `feed page at cursor ${at} stuck: ${this.failedCount} consecutive failures (${describeError(error)})`,
       );
     else
       this.logger.warn(
-        `feed page at cursor ${at} failed, retrying: ${describe(error)}`,
+        `feed page at cursor ${at} failed, retrying: ${describeError(error)}`,
       );
   }
 
@@ -419,6 +420,3 @@ export class HumanRequestFeedConsumer {
     });
   }
 }
-
-const describe = (error: unknown): string =>
-  error instanceof Error ? `${error.name}: ${error.message}` : String(error);

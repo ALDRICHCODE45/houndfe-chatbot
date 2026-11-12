@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { fingerprintMessageId } from '../../common/log-safe';
 import type { AgentRunner } from '../../llm-agent/application/agent-runner.service';
 import type { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
@@ -406,6 +407,7 @@ describe('WebhookDispatcherService handoff logs mask the phone (S6)', () => {
   const expectMasked = (out: string, needle: string) => {
     expect(out).toContain(needle);
     expect(out).not.toContain(SENDER);
+    expect(out).not.toMatch(/wamid\.m\d/);
     expect(out).toContain(MASKED);
   };
   afterEach(() => jest.restoreAllMocks());
@@ -414,7 +416,10 @@ describe('WebhookDispatcherService handoff logs mask the phone (S6)', () => {
     const spies = spyAll();
     const h = setup({ human: true });
     await h.service.dispatch(event([text('wamid.m1')]));
-    expectMasked(lines(spies.debug), 'mirror-only wamid.m1');
+    expectMasked(
+      lines(spies.debug),
+      `mirror-only ${fingerprintMessageId('wamid.m1')}`,
+    );
   });
 
   it('HUMAN skip-resume-turn line', async () => {
@@ -435,7 +440,10 @@ describe('WebhookDispatcherService handoff logs mask the phone (S6)', () => {
     const spies = spyAll();
     const h = setup({ modes: [false, true] });
     await h.service.dispatch(event([text('wamid.m4')]));
-    expectMasked(lines(spies.log), 'drop reply for wamid.m4');
+    expectMasked(
+      lines(spies.log),
+      `drop reply for ${fingerprintMessageId('wamid.m4')}`,
+    );
   });
 
   it('pending-marker short-circuit line', async () => {

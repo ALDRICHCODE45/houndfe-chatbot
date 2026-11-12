@@ -12,6 +12,7 @@ import {
   WEBHOOK_DEDUP_RETENTION_MS,
   type WebhookDedupStore,
 } from '../domain/webhook-dedup.store';
+import { describeError } from '../../common/log-safe';
 
 export const WEBHOOK_DEDUP_PURGE_OPTIONS = Symbol(
   'WEBHOOK_DEDUP_PURGE_OPTIONS',
@@ -91,11 +92,7 @@ export class WebhookDedupPurgeWorker
         if (count < this.options.batchSize || this.stopped) break;
       }
     } catch (error) {
-      this.logger.warn(
-        `webhook dedup purge failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      this.logger.warn(`webhook dedup purge failed: ${describeError(error)}`);
     }
     if (deleted > 0) this.logger.log(`purged ${deleted} webhook dedup rows`);
     return deleted;

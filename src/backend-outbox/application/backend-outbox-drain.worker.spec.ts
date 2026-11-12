@@ -176,6 +176,25 @@ describe('BackendOutboxDrainWorker', () => {
     );
   });
 
+  it('a DEAD row log sanitizes a phone in the error text; the stored error stays raw', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await enqueue(store, A, 'a1');
+    const raw = '422 recipient 5215550001111 rejected wa:5215550001111';
+    const delivery = new ScriptedDelivery(() => ({
+      outcome: 'PERMANENT',
+      error: raw,
+    }));
+    await worker(store, delivery).tick();
+    const dead = (Logger.prototype.error as jest.Mock).mock.calls
+      .map(([line]) => String(line))
+      .join('\n');
+    expect(dead).toContain('DEAD');
+    expect(dead).toContain('422 recipient');
+    expect(dead).not.toContain('5215550001111');
+    expect(dead).not.toMatch(/\d{8}/);
+    expect(store.snapshot()[0].lastError).toBe(raw);
+  });
+
   it('a permanent failure marks DEAD, logs an error and lets the next seq proceed', async () => {
     const store = new InMemoryBackendOutboxStore();
     await enqueue(store, A, 'a1');

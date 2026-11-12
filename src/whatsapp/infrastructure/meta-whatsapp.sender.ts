@@ -23,6 +23,7 @@ import {
   UnsupportedOutboundError,
   WhatsappSenderPort,
 } from '../domain/whatsapp-sender.port';
+import { describeError, fingerprintMessageId } from '../../common/log-safe';
 
 type MetaSendResponse = {
   messages?: Array<{ id: string }>;
@@ -140,9 +141,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       };
     } catch (error) {
       this.logger.warn(
-        `interactive controls failed after the long text was sent: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `interactive controls failed after the long text was sent: ${describeError(error)}`,
       );
       return {
         providerMessageId: text.providerMessageId,
@@ -232,9 +231,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       });
     } catch (error) {
       this.logger.warn(
-        `transcript record failed for ${providerMessageId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `transcript record failed for ${fingerprintMessageId(providerMessageId)}: ${describeError(error)}`,
       );
     }
   }

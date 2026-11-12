@@ -10,6 +10,7 @@ import type {
   ProductImageKind,
   ProductImageRecognition,
 } from '../domain/product-image';
+import { describeError } from '../../common/log-safe';
 
 export const DEFAULT_PRODUCT_IMAGE_TIMEOUT_MS = 15_000;
 const MAX_TEXT_FIELD_LENGTH = 80;
@@ -123,7 +124,7 @@ export class LlmProductImageDescriberAdapter implements ProductImageDescriberPor
         return { kind: 'unavailable', reason: 'timeout' };
       }
       this.logger.warn(
-        `Product image description failed: ${error instanceof Error ? error.message : String(error)}`,
+        `Product image description failed: ${describeError(error)}`,
       );
       return { kind: 'unavailable', reason: 'error' };
     }
