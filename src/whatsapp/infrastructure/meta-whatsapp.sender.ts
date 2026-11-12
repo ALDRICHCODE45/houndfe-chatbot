@@ -1,3 +1,4 @@
+import { createReadStream, promises as fsPromises } from 'node:fs';
 import { HttpService } from '@nestjs/axios';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -15,8 +16,13 @@ import {
 import {
   InteractiveSendResult,
   InvalidOutboundTemplateError,
+  MediaSendResult,
+  OUTBOUND_MEDIA_MIME_TYPES,
+  OutboundDocument,
   OutboundImage,
   OutboundInteractive,
+  OutboundMediaFile,
+  OutboundOrigin,
   OutboundTemplate,
   OutboundText,
   SendResult,
@@ -24,10 +30,32 @@ import {
   WhatsappSenderPort,
 } from '../domain/whatsapp-sender.port';
 import { describeError, fingerprintMessageId } from '../../common/log-safe';
+import {
+  createMetaMediaMultipart,
+  safeUploadFilename,
+} from './media-upload-multipart';
 
 type MetaSendResponse = {
   messages?: Array<{ id: string }>;
 };
+
+type MetaMediaUploadResponse = { id?: unknown };
+
+/** Send-time options that never reach Meta. */
+interface SendOptions {
+  staffReplyId?: string;
+  origin?: OutboundOrigin;
+  /** Media mime type, recorded with a media-id send. */
+  mimeType?: string;
+}
+
+const ORIGINS: ReadonlySet<string> = new Set(['BOT', 'STAFF', 'TEMPLATE']);
+/** Meta limits: images 5 MB, documents 100 MB. */
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const DOCUMENT_MAX_BYTES = 100 * 1024 * 1024;
+/** The upload streams a file between VPSs; message sends keep their defaults. */
+const MEDIA_UPLOAD_TIMEOUT_MS = 60_000;
+const DEFAULT_DOCUMENT_FILENAME = 'documento.pdf';
 
 type MetaMessagePayload = Record<string, unknown> & { to: string };
 
@@ -49,6 +77,12 @@ export class WhatsappSendError extends Error {
     public readonly status: number | null,
     public readonly graphErrorCode: string | number | null,
     public readonly graphErrorMessage: string | null,
+    /**
+     * `upload`: the media upload failed, so nothing reached the customer
+     * (a definite failure even with a null status). `send`: the message
+     * request itself failed; a null status there is uncertain.
+     */
+    public readonly stage: 'send' | 'upload' = 'send',
   ) {
     super(graphErrorMessage ?? 'Failed to send WhatsApp message');
     this.name = 'WhatsappSendError';
@@ -84,23 +118,96 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
           body: message.text,
         },
       },
-      message.staffReplyId,
+      { staffReplyId: message.staffReplyId, origin: message.origin },
     );
   }
 
   async sendImage(message: OutboundImage): Promise<SendResult> {
     this.assertImageMessage(message);
 
-    return this.send({
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: message.to,
-      type: 'image',
-      image: {
-        link: message.link,
-        ...(message.caption === undefined ? {} : { caption: message.caption }),
+    return this.send(
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: message.to,
+        type: 'image',
+        image: {
+          ...(message.link === undefined
+            ? { id: message.mediaId }
+            : { link: message.link }),
+          ...(message.caption === undefined
+            ? {}
+            : { caption: message.caption }),
+        },
       },
-    });
+      { origin: message.origin },
+    );
+  }
+
+  /** Document by link or media id, with the name the customer sees. */
+  async sendDocument(message: OutboundDocument): Promise<SendResult> {
+    this.assertDocumentMessage(message);
+
+    return this.send(
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: message.to,
+        type: 'document',
+        document: {
+          ...(message.link === undefined
+            ? { id: message.mediaId }
+            : { link: message.link }),
+          filename: message.filename,
+          ...(message.caption === undefined
+            ? {}
+            : { caption: message.caption }),
+        },
+      },
+      { origin: message.origin },
+    );
+  }
+
+  /**
+   * Uploads a local file to Meta (`POST /{phone-number-id}/media`, multipart
+   * streamed from disk, never buffered) and sends it by the returned media
+   * id: `image/*` as an image, `application/pdf` as a document. A failed
+   * upload throws `WhatsappSendError` with `stage: 'upload'` (nothing was
+   * sent); a failed send keeps `stage: 'send'` like every other send.
+   */
+  async sendMediaFile(message: OutboundMediaFile): Promise<MediaSendResult> {
+    const sizeBytes = await this.assertMediaFile(message);
+    const providerMediaId = await this.uploadMedia(message, sizeBytes);
+    const { providerMessageId } = await this.send(
+      message.mimeType === 'application/pdf'
+        ? {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: message.to,
+            type: 'document',
+            document: {
+              id: providerMediaId,
+              filename: message.filename ?? DEFAULT_DOCUMENT_FILENAME,
+              ...(message.caption === undefined
+                ? {}
+                : { caption: message.caption }),
+            },
+          }
+        : {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: message.to,
+            type: 'image',
+            image: {
+              id: providerMediaId,
+              ...(message.caption === undefined
+                ? {}
+                : { caption: message.caption }),
+            },
+          },
+      { origin: message.origin, mimeType: message.mimeType },
+    );
+    return { providerMessageId, providerMediaId };
   }
 
   /**
@@ -153,33 +260,87 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   async sendTemplate(message: OutboundTemplate): Promise<SendResult> {
     this.assertTemplateMessage(message);
 
-    return this.send({
-      messaging_product: 'whatsapp',
-      to: message.to,
-      type: 'template',
-      template: {
-        name: message.templateName,
-        language: { code: message.languageCode },
-        // A template without variables carries no body component.
-        ...(message.bodyParameters.length > 0 && {
-          components: [
-            {
-              type: 'body',
-              parameters: message.bodyParameters.map((text) => ({
-                type: 'text',
-                text,
-              })),
-            },
-          ],
-        }),
+    return this.send(
+      {
+        messaging_product: 'whatsapp',
+        to: message.to,
+        type: 'template',
+        template: {
+          name: message.templateName,
+          language: { code: message.languageCode },
+          // A template without variables carries no body component.
+          ...(message.bodyParameters.length > 0 && {
+            components: [
+              {
+                type: 'body',
+                parameters: message.bodyParameters.map((text) => ({
+                  type: 'text',
+                  text,
+                })),
+              },
+            ],
+          }),
+        },
       },
+      { origin: message.origin },
+    );
+  }
+
+  private async uploadMedia(
+    message: OutboundMediaFile,
+    sizeBytes: number,
+  ): Promise<string> {
+    const source = createReadStream(message.filePath);
+    const multipart = createMetaMediaMultipart({
+      source,
+      filename: safeUploadFilename(message.filename),
+      mimeType: message.mimeType,
+      sizeBytes,
     });
+    let data: MetaMediaUploadResponse;
+    try {
+      const response = await lastValueFrom(
+        this.httpService.post<MetaMediaUploadResponse>(
+          this.buildGraphUrl('media'),
+          multipart.body,
+          {
+            headers: {
+              Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['meta']['accessToken']>('meta.accessToken')}`,
+              'Content-Type': multipart.contentType,
+              'Content-Length': multipart.contentLength,
+            },
+            timeout: MEDIA_UPLOAD_TIMEOUT_MS,
+            // Native transport: follow-redirects would buffer the body.
+            maxRedirects: 0,
+            maxBodyLength: Infinity,
+          },
+        ),
+      );
+      data = response.data;
+    } catch (error) {
+      // The request failed before (or without) consuming the body.
+      multipart.body.destroy();
+      source.destroy();
+      throw this.toWhatsappSendError(error, 'upload');
+    }
+    if (typeof data?.id !== 'string' || data.id === '') {
+      multipart.body.destroy();
+      source.destroy();
+      throw new WhatsappSendError(
+        200,
+        null,
+        'Meta media upload response did not include a media id',
+        'upload',
+      );
+    }
+    return data.id;
   }
 
   private async send(
     payload: MetaMessagePayload,
-    staffReplyId?: string,
+    options: SendOptions = {},
   ): Promise<SendResult> {
+    this.assertOrigin(options.origin);
     // Explicit, default-off sandbox compatibility mode (see below).
     const sandboxNormalization =
       this.configService.get<boolean>(
@@ -203,7 +364,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       payload,
       providerMessageId,
       acceptedAt,
-      staffReplyId,
+      options,
     );
     return { providerMessageId };
   }
@@ -217,16 +378,30 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     payload: MetaMessagePayload,
     providerMessageId: string,
     acceptedAt: Date,
-    staffReplyId?: string,
+    options: SendOptions,
   ): Promise<void> {
     if (this.transcript === undefined || this.isOpsPhone(payload.to)) return;
     try {
       const entry = transcriptEntry(payload, providerMessageId);
+      const { staffReplyId, mimeType } = options;
+      const origin = options.origin ?? 'BOT';
+      const details = {
+        ...entry.details,
+        ...(staffReplyId === undefined ? {} : { staffReplyId }),
+        // BOT rows keep their details exactly as before.
+        ...(origin === 'BOT' ? {} : { origin }),
+      };
       await this.transcript.recordOutbound({
         ...entry,
-        ...(staffReplyId === undefined
+        ...(mimeType === undefined || entry.media == null
           ? {}
-          : { details: { ...entry.details, staffReplyId } }),
+          : { media: { ...entry.media, mimeType } }),
+        ...(Object.keys(details).length === 0 ? {} : { details }),
+        // The wire shape of a TEMPLATE row stays BOT (the author column only
+        // knows CUSTOMER/BOT/STAFF); `details.origin` tells them apart.
+        ...(origin === 'STAFF' ? { author: 'STAFF' as const } : {}),
+        // Staff messages and templates are local history only.
+        ...(origin === 'BOT' ? {} : { mirror: false }),
         acceptedAt,
       });
     } catch (error) {
@@ -278,6 +453,10 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   }
 
   private buildMessagesUrl(): string {
+    return this.buildGraphUrl('messages');
+  }
+
+  private buildGraphUrl(edge: 'messages' | 'media'): string {
     const baseUrl = this.configService.getOrThrow<
       AppConfig['meta']['graphApiBaseUrl']
     >('meta.graphApiBaseUrl');
@@ -286,10 +465,13 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         'meta.phoneNumberId',
       );
 
-    return `${baseUrl}/${phoneNumberId}/messages`;
+    return `${baseUrl}/${phoneNumberId}/${edge}`;
   }
 
-  private toWhatsappSendError(error: unknown): WhatsappSendError {
+  private toWhatsappSendError(
+    error: unknown,
+    stage: 'send' | 'upload' = 'send',
+  ): WhatsappSendError {
     const maybeAxiosError = error as {
       response?: {
         status?: number;
@@ -302,25 +484,89 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       maybeAxiosError.response?.status ?? null,
       graphError?.code ?? null,
       graphError?.message ?? null,
+      stage,
     );
+  }
+
+  /** An unknown origin would silently change whether the backend mirrors. */
+  private assertOrigin(origin: unknown): void {
+    if (origin !== undefined && !ORIGINS.has(origin as string)) {
+      throw new UnsupportedOutboundError('Invalid outbound origin');
+    }
   }
 
   private assertTextMessage(message: OutboundText): void {
     if (typeof message?.to !== 'string' || typeof message?.text !== 'string') {
       throw new UnsupportedOutboundError();
     }
+    this.assertOrigin(message.origin);
+  }
+
+  private assertDocumentMessage(message: OutboundDocument): void {
+    if (
+      typeof message?.to !== 'string' ||
+      message.to === '' ||
+      !hasExactlyOneMediaSource(message) ||
+      typeof message.filename !== 'string' ||
+      message.filename.trim() === '' ||
+      (message.caption !== undefined && typeof message.caption !== 'string')
+    ) {
+      throw new UnsupportedOutboundError('Invalid outbound document message');
+    }
+    this.assertOrigin(message.origin);
+  }
+
+  /** Validates before any request; returns the file size in bytes. */
+  private async assertMediaFile(message: OutboundMediaFile): Promise<number> {
+    const invalid = (reason: string) =>
+      new UnsupportedOutboundError(`Invalid outbound media file: ${reason}`);
+    if (
+      typeof message?.to !== 'string' ||
+      message.to === '' ||
+      typeof message.filePath !== 'string' ||
+      message.filePath === '' ||
+      (message.caption !== undefined && typeof message.caption !== 'string') ||
+      (message.filename !== undefined && typeof message.filename !== 'string')
+    ) {
+      throw invalid('fields');
+    }
+    if (
+      !(OUTBOUND_MEDIA_MIME_TYPES as readonly string[]).includes(
+        message.mimeType,
+      )
+    ) {
+      throw invalid('mime type');
+    }
+    this.assertOrigin(message.origin);
+    let sizeBytes: number;
+    try {
+      const stats = await fsPromises.stat(message.filePath);
+      if (!stats.isFile()) throw invalid('not a file');
+      sizeBytes = stats.size;
+    } catch (error) {
+      if (error instanceof UnsupportedOutboundError) throw error;
+      // The path is deliberately not echoed.
+      throw invalid('not readable');
+    }
+    if (sizeBytes === 0) throw invalid('empty');
+    const max =
+      message.mimeType === 'application/pdf'
+        ? DOCUMENT_MAX_BYTES
+        : IMAGE_MAX_BYTES;
+    if (sizeBytes > max) throw invalid('too large');
+    return sizeBytes;
   }
 
   private assertImageMessage(message: OutboundImage): void {
     if (
       typeof message?.to !== 'string' ||
       message.to === '' ||
-      typeof message.link !== 'string' ||
-      !message.link.startsWith('https://') ||
+      !hasExactlyOneMediaSource(message) ||
       (message.caption !== undefined && typeof message.caption !== 'string')
     ) {
       throw new UnsupportedOutboundError('Invalid outbound image message');
     }
+    this.assertOrigin(message.origin);
   }
 
   private assertInteractiveMessage(message: OutboundInteractive): void {
@@ -387,6 +633,9 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     if (!Array.isArray(parameters)) {
       throw new InvalidOutboundTemplateError('body_parameters');
     }
+    if (message.origin !== undefined && !ORIGINS.has(message.origin)) {
+      throw new InvalidOutboundTemplateError('origin');
+    }
     for (const parameter of parameters as unknown[]) {
       if (
         typeof parameter !== 'string' ||
@@ -399,6 +648,19 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       }
     }
   }
+}
+
+/** Exactly one of an `https://` link and a non-empty Meta media id. */
+function hasExactlyOneMediaSource(message: {
+  link?: unknown;
+  mediaId?: unknown;
+}): boolean {
+  const hasLink = message.link !== undefined;
+  const hasId = message.mediaId !== undefined;
+  if (hasLink === hasId) return false;
+  return hasLink
+    ? typeof message.link === 'string' && message.link.startsWith('https://')
+    : typeof message.mediaId === 'string' && message.mediaId !== '';
 }
 
 type PayloadField = Record<string, unknown> | undefined;
@@ -424,10 +686,29 @@ function transcriptEntry(
     case 'image': {
       const image = field(payload.image);
       const caption = stringOf(image?.caption);
+      const mediaId = stringOf(image?.id);
       return {
         ...base,
         ...(caption === undefined ? {} : { text: caption }),
-        media: { link: stringOf(image?.link) },
+        media:
+          mediaId === undefined
+            ? { link: stringOf(image?.link) }
+            : { providerMediaId: mediaId },
+      };
+    }
+    case 'document': {
+      const document = field(payload.document);
+      const caption = stringOf(document?.caption);
+      const mediaId = stringOf(document?.id);
+      return {
+        ...base,
+        ...(caption === undefined ? {} : { text: caption }),
+        media: {
+          ...(mediaId === undefined
+            ? { link: stringOf(document?.link) }
+            : { providerMediaId: mediaId }),
+          filename: stringOf(document?.filename),
+        },
       };
     }
     case 'interactive': {
