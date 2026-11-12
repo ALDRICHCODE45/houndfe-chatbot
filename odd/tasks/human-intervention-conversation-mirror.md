@@ -16,18 +16,19 @@ Contract: houndfe-backend `docs/chatbot-handoff/chatbot-requests-bot-contract.md
 
 ## Tasks
 
-| ID  | Specs          | Route                                                                                                                                        | Commit |
-| --- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| T1  | S3, S4, S1     | worker: chatbot-api client for messages:batch, statuses:batch, POST /media (typed results per documented code)                               | —      |
-| T6  | S6             | worker: mask conversationRef/phone in the webhook dispatcher, sender and outbox drain logs                                                   | 19d8146      |
-| T2  | S3, S5, S7     | capture every inbound type (audio, sticker, video, location, button/list replies) and OUT providerTimestamp in the transcript/mirror payload | —      |
-| T3  | S1, S3, S4, S5 | media pipeline: Meta download (wider allowlist) → upload; outbound product photo fetch → upload (UUIDv5 key)                                 | —      |
-| T4  | S1, S3, S4, S5 | batched MESSAGE_MIRROR delivery per conversation (≤50) with the S4 reactions                                                                 | —      |
-| T5  | S1, S3, S5     | batched MESSAGE_STATUS delivery (≤100), unknown retry after mirror ACK, 24 h give-up                                                         | —      |
-| T7  | S8             | E2E against dev with the backend                                                                                                             | —      |
+| ID  | Specs          | Route                                                                                                                                        | Commit  |
+| --- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| T1  | S3, S4, S1     | worker: chatbot-api client for messages:batch, statuses:batch, POST /media (typed results per documented code)                               | 41d772d |
+| T6  | S6             | worker: mask conversationRef/phone in the webhook dispatcher, sender and outbox drain logs                                                   | 19d8146 |
+| T2  | S3, S5, S7     | capture every inbound type (audio, sticker, video, location, button/list replies) and OUT providerTimestamp in the transcript/mirror payload | —       |
+| T3  | S1, S3, S4, S5 | media pipeline: Meta download (wider allowlist) → upload; outbound product photo fetch → upload (UUIDv5 key)                                 | —       |
+| T4  | S1, S3, S4, S5 | batched MESSAGE_MIRROR delivery per conversation (≤50) with the S4 reactions                                                                 | —       |
+| T5  | S1, S3, S5     | batched MESSAGE_STATUS delivery (≤100), unknown retry after mirror ACK, 24 h give-up                                                         | —       |
+| T7  | S8             | E2E against dev with the backend                                                                                                             | —       |
 
 ## Log
 
 - **L1 (owner, 2026-11-12):** "Claro hermano, estoy de acuerdo, algunas cosas que recordarte antes de iniciar, quiero que esto se haga bien, con calma, siempre teniendo como prioridad la performance del sistema, recuerda como esta desplegado esto, el chatbot en un server, el sistema(frontend/backend) en otro server de hostinger con especificaciones diferentes, hay siempre que tener en cuenta la performance de toda la comunicacion entre sistemas y de cada sistema en particular, y recuerda, algo importante, todo lo que tenemos localmente es DESECHABLE, no hace falta cuidar lo que tenemos en este entorno de desarrollo, no hace falta cuidar los datos, hacer respaldos, etc.. no importaa, en verdad, dicho esto. Continuamos."
 - **L2:** Exploration map (2026-11-12): outbox kinds/lanes `src/backend-outbox/domain/backend-outbox.ts:10-34`; enqueue `src/transcript/…/transcript-recorder.ts:155-191` (payload uses Meta lowercase types and a `media` object, OUT has no providerTimestamp); delivery falls back to `NotWiredBackendOutboxDelivery`; drain delivers one row at a time; inbound audio/sticker/video/location never reach the transcript; `MetaMediaClient` accepts jpeg/png/pdf only; product photos are sent by public link; phone appears in several logs.
 - **L3 (T6 done, 2026-11-12):** 13 log sites masked with `maskConversationRef` (11 in the webhook dispatcher, 2 in the outbox drain); sender logs carry no recipient. RED 13 failing assertions before the change; related tests 296 passed. Follow-ups noted, not in S6: `wamid.*` ids and raw error text in logs could embed a phone.
+- **L4 (T1 done, 2026-11-12):** client 41d772d — `ConversationMirrorClient` port (`CONVERSATION_MIRROR_CLIENT`) implemented by `ChatbotApiHttpClient`: `mirrorMessages`, `recordMessageStatuses`, streamed `uploadMedia` (createReadStream, 10 MiB cap, no redirects), `mediaIdempotencyKey(source, version?)` UUIDv5. 91 new tests (RED 85/85 before the methods existed; DTO/port/uuid written before their tests). Failures never throw; undocumented statuses or malformed 2xx → `UNEXPECTED`. Decisions (parent): `UNEXPECTED` is parked by the outbox (no retry loop); `ChatbotApiModule` must provide/export `CONVERSATION_MIRROR_CLIENT` (useExisting ChatbotApiHttpClient) — done in T4. Slice boundary: T1 alone is ~1.9k lines (mostly 85 contract tests); review it as its own candidate.
