@@ -47,6 +47,9 @@ export type DeliveryDecision =
   /** request.overdue_notice not sent: the conversation is in a human
    *  session (4600). */
   | 'HUMAN_SESSION'
+  /** request.overdue_notice not sent: the bot's registry already has the
+   *  request CANCELLED or RESOLVED (4700). */
+  | 'REQUEST_CLOSED'
   /** A feed item that kept failing locally and was given up (poison item). */
   | 'LOCAL_FAILURE';
 
