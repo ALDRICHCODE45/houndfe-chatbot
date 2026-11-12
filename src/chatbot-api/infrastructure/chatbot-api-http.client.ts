@@ -1,5 +1,9 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, promises as fsPromises } from 'node:fs';
-import type { Readable } from 'node:stream';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { HttpService } from '@nestjs/axios';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -12,6 +16,27 @@ import type {
 } from '../domain/chatbot-api.client';
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
 import type { ConversationMirrorClient } from '../domain/conversation-mirror.port';
+import type { LiveConversationClient } from '../domain/live-conversation.port';
+import {
+  STAFF_MEDIA_MAX_BYTES,
+  UNKNOWN_CONVERSATION_STATE,
+  isStaffMediaId,
+  isStaffMediaMimeType,
+  listHumanConversationsProblem,
+  parseConversationState,
+  parseHumanConversationList,
+  parseSessionAckOk,
+  parseStaleEpoch,
+  sessionAckProblem,
+  toSessionAckBody,
+  type DownloadStaffMediaOptions,
+  type DownloadStaffMediaResult,
+  type GetConversationStateResult,
+  type ListHumanConversationsOptions,
+  type ListHumanConversationsResult,
+  type SessionAckInput,
+  type SessionAckResult,
+} from '../domain/dtos/live-conversation.dto';
 import {
   MEDIA_MAX_BYTES,
   MIRROR_CONVERSATION_REF_MAX_CHARS,
@@ -206,6 +231,17 @@ export const CONVERSATION_MIRROR_TIMEOUTS_MS = {
   batch: 20_000,
   mediaUpload: 60_000,
 } as const;
+/** Unit 11 timeouts. `sessionAck` sits on the greeting path (the customer
+ *  waits behind it), so it fails fast; the media download streams up to
+ *  10 MiB between VPSs and is bounded as a whole. */
+export const LIVE_CONVERSATION_TIMEOUTS_MS = {
+  sessionAck: 10_000,
+  read: 10_000,
+  mediaDownload: 60_000,
+} as const;
+/** Largest error body read back from a failed streamed download. */
+const STREAMED_ERROR_BODY_MAX_BYTES = 4096;
+const STREAMED_ERROR_BODY_READ_MS = 2_000;
 /** The feed long-poll timeout is `waitSeconds * 1000 + FEED_TIMEOUT_SLACK_MS`,
  *  so a healthy empty long-poll (25 s) never times out (≈35 s). */
 export const FEED_TIMEOUT_SLACK_MS = 10_000;
@@ -218,7 +254,11 @@ export const CHATBOT_API_SLEEP = Symbol('CHATBOT_API_SLEEP');
 
 @Injectable()
 export class ChatbotApiHttpClient
-  implements ChatbotApiClient, HumanRequestsClient, ConversationMirrorClient
+  implements
+    ChatbotApiClient,
+    HumanRequestsClient,
+    ConversationMirrorClient,
+    LiveConversationClient
 {
   constructor(
     private readonly httpService: HttpService,
@@ -1691,6 +1731,285 @@ export class ChatbotApiHttpClient
     return { kind: 'ok', ...uploaded };
   }
 
+  // ------------------------------------------------ live conversation (u11)
+
+  /**
+   * `POST /chatbot-api/conversations/:conversationRef/session-ack` (unit 11).
+   * Exactly one POST with a short timeout: 409 `STALE_EPOCH` /
+   * `SESSION_NOT_ENDING` are reconcile signals, never retried here. Never
+   * throws; the ref never appears in a result or a log.
+   */
+  async sessionAck(
+    conversationRef: string,
+    input: SessionAckInput,
+  ): Promise<SessionAckResult> {
+    if (!isValidConversationRef(conversationRef))
+      return localValidation(
+        `conversationRef is out of contract (1 to ${MIRROR_CONVERSATION_REF_MAX_CHARS} characters of A-Z a-z 0-9 : _ . @ + -)`,
+      );
+    const problem = sessionAckProblem(input);
+    if (problem !== null) return localValidation(problem);
+    const outcome = await this.mirrorPost({
+      method: 'POST',
+      url: `/chatbot-api/conversations/${encodeURIComponent(conversationRef)}/session-ack`,
+      data: toSessionAckBody(input),
+      timeout: LIVE_CONVERSATION_TIMEOUTS_MS.sessionAck,
+    });
+    if (!outcome.ok) {
+      const { status, code, body } = outcome.failure;
+      if (status === 409 && code === 'STALE_EPOCH')
+        return parseStaleEpoch(body) ?? { kind: 'UNEXPECTED', status, code };
+      if (status === 409 && code === 'SESSION_NOT_ENDING')
+        return { kind: 'SESSION_NOT_ENDING' };
+      if (status === 404) return { kind: 'NOT_FOUND' };
+      return classifyMirrorFailure(outcome.failure);
+    }
+    const ok =
+      outcome.response.status === 200
+        ? parseSessionAckOk(outcome.response.data)
+        : null;
+    if (ok === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return ok;
+  }
+
+  /**
+   * `GET /chatbot-api/conversations/:conversationRef/state` (unit 11). A 404
+   * (a conversation the backend never saw) reads as BOT, epoch 0.
+   */
+  async getConversationState(
+    conversationRef: string,
+  ): Promise<GetConversationStateResult> {
+    if (!isValidConversationRef(conversationRef))
+      return localValidation(
+        `conversationRef is out of contract (1 to ${MIRROR_CONVERSATION_REF_MAX_CHARS} characters of A-Z a-z 0-9 : _ . @ + -)`,
+      );
+    const outcome = await this.mirrorPost({
+      method: 'GET',
+      url: `/chatbot-api/conversations/${encodeURIComponent(conversationRef)}/state`,
+      timeout: LIVE_CONVERSATION_TIMEOUTS_MS.read,
+    });
+    if (!outcome.ok) {
+      if (outcome.failure.status === 404)
+        return { kind: 'ok', ...UNKNOWN_CONVERSATION_STATE };
+      return classifyMirrorFailure(outcome.failure);
+    }
+    const state =
+      outcome.response.status === 200
+        ? parseConversationState(outcome.response.data)
+        : null;
+    if (state === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return { kind: 'ok', ...state };
+  }
+
+  /** `GET /chatbot-api/conversations/state?mode=HUMAN` (unit 11): one page. */
+  async listHumanConversations(
+    options: ListHumanConversationsOptions = {},
+  ): Promise<ListHumanConversationsResult> {
+    const problem = listHumanConversationsProblem(options);
+    if (problem !== null) return localValidation(problem);
+    const params: Record<string, string | number> = { mode: 'HUMAN' };
+    if (options.limit !== undefined) params.limit = options.limit;
+    if (options.cursor !== undefined) params.cursor = options.cursor;
+    const outcome = await this.mirrorPost({
+      method: 'GET',
+      url: '/chatbot-api/conversations/state',
+      params,
+      timeout: LIVE_CONVERSATION_TIMEOUTS_MS.read,
+    });
+    if (!outcome.ok) return classifyMirrorFailure(outcome.failure);
+    const page =
+      outcome.response.status === 200
+        ? parseHumanConversationList(outcome.response.data)
+        : null;
+    if (page === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return { kind: 'ok', ...page };
+  }
+
+  /**
+   * `GET /chatbot-api/media/:id` (unit 11, scope `media:read`). The body is
+   * streamed through a byte counter + SHA-256 into a mode-0600 temp file
+   * (never buffered whole); the cap is checked against the declared
+   * `Content-Length` and again while streaming. One GET, no retries; any
+   * failure leaves nothing on disk.
+   */
+  async downloadStaffMedia(
+    mediaId: string,
+    options: DownloadStaffMediaOptions = {},
+  ): Promise<DownloadStaffMediaResult> {
+    const maxBytes = options.maxBytes ?? STAFF_MEDIA_MAX_BYTES;
+    if (!isStaffMediaId(mediaId))
+      return localValidation('mediaId must be a UUID');
+    if (
+      !Number.isSafeInteger(maxBytes) ||
+      maxBytes < 1 ||
+      maxBytes > STAFF_MEDIA_MAX_BYTES
+    )
+      return localValidation(
+        `maxBytes must be an integer from 1 to ${STAFF_MEDIA_MAX_BYTES}`,
+      );
+
+    const deadline = new AbortController();
+    const timer = setTimeout(
+      () => deadline.abort(),
+      LIVE_CONVERSATION_TIMEOUTS_MS.mediaDownload,
+    );
+    const transportFailure = (): Extract<
+      DownloadStaffMediaResult,
+      { kind: 'RETRYABLE' }
+    > => ({
+      kind: 'RETRYABLE',
+      cause: deadline.signal.aborted ? 'timeout' : 'network',
+      status: null,
+      retryAfterSeconds: null,
+    });
+    try {
+      const outcome = await this.mirrorPost({
+        method: 'GET',
+        url: `/chatbot-api/media/${mediaId}`,
+        responseType: 'stream',
+        timeout: LIVE_CONVERSATION_TIMEOUTS_MS.mediaDownload,
+        // Native transport: follow-redirects would buffer the streamed body.
+        maxRedirects: 0,
+        signal: deadline.signal,
+      });
+      if (!outcome.ok) {
+        const failure = await readStreamedErrorBody(outcome.failure);
+        if (failure.status === 404 && failure.code === 'MEDIA_NOT_FOUND')
+          return { kind: 'MEDIA_NOT_FOUND' };
+        if (failure.status === null && deadline.signal.aborted)
+          return transportFailure();
+        return classifyMirrorFailure(failure);
+      }
+
+      const { response } = outcome;
+      const source = response.data;
+      const unexpected = (): DownloadStaffMediaResult => {
+        if (source instanceof Readable) source.destroy();
+        return { kind: 'UNEXPECTED', status: response.status, code: null };
+      };
+      if (response.status !== 200 || !(source instanceof Readable))
+        return unexpected();
+      const mimeType = headerValue(response.headers, 'content-type')
+        ?.split(';')[0]
+        .trim()
+        .toLowerCase();
+      if (!isStaffMediaMimeType(mimeType)) return unexpected();
+      const declaredRaw = headerValue(response.headers, 'content-length');
+      const declared =
+        declaredRaw !== undefined && /^\d+$/.test(declaredRaw)
+          ? Number(declaredRaw)
+          : null;
+      if (declared !== null && declared > maxBytes) {
+        source.destroy();
+        return { kind: 'MEDIA_TOO_LARGE' };
+      }
+      // A transformed (compressed) body legitimately differs from the header.
+      const encoding = headerValue(response.headers, 'content-encoding');
+      const lengthIsExact =
+        declared !== null &&
+        (encoding === undefined || encoding.toLowerCase() === 'identity');
+      const filename = safeMediaFilename(
+        contentDispositionFilename(
+          headerValue(response.headers, 'content-disposition'),
+        ),
+      );
+
+      let handle: fsPromises.FileHandle;
+      let filePath: string;
+      try {
+        filePath = join(
+          tmpdir(),
+          `staff-media-${randomBytes(12).toString('hex')}`,
+        );
+        handle = await fsPromises.open(filePath, 'wx', 0o600);
+      } catch {
+        // The path is deliberately not echoed.
+        source.destroy();
+        return { kind: 'LOCAL_IO_ERROR' };
+      }
+      const removeFile = async (): Promise<void> => {
+        try {
+          await fsPromises.unlink(filePath);
+        } catch {
+          // Already gone (or never fully created): nothing left to remove.
+        }
+      };
+
+      const hash = createHash('sha256');
+      let total = 0;
+      let capped = false;
+      const meter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          total += chunk.length;
+          if (total > maxBytes) {
+            capped = true;
+            callback(new Error('Staff media exceeds the byte cap'));
+            return;
+          }
+          hash.update(chunk);
+          callback(null, chunk);
+        },
+      });
+      const sink = handle.createWriteStream();
+      let firstFailure: 'source' | 'sink' | null = null;
+      source.once('error', () => {
+        firstFailure ??= 'source';
+      });
+      sink.once('error', () => {
+        firstFailure ??= 'sink';
+      });
+      try {
+        await pipeline(source, meter, sink);
+      } catch {
+        // pipeline destroyed every stream; the sink closed the handle.
+        await removeFile();
+        if (capped) return { kind: 'MEDIA_TOO_LARGE' };
+        if (firstFailure === 'sink') return { kind: 'LOCAL_IO_ERROR' };
+        return transportFailure();
+      }
+      if (total === 0) {
+        await removeFile();
+        return { kind: 'UNEXPECTED', status: response.status, code: null };
+      }
+      if (lengthIsExact && total !== declared) {
+        // Truncated (or padded) transfer: retry the whole download.
+        await removeFile();
+        return {
+          kind: 'RETRYABLE',
+          cause: 'network',
+          status: null,
+          retryAfterSeconds: null,
+        };
+      }
+      return {
+        kind: 'ok',
+        filePath,
+        mimeType,
+        filename,
+        sizeBytes: total,
+        sha256: hash.digest('hex'),
+        cleanup: removeFile,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /**
    * One POST for the unit 9 routes, never retried here. Failures are reduced
    * to status / backend code / Retry-After / transport cause: the axios error
@@ -2000,6 +2319,81 @@ interface MirrorRawFailure {
   body: unknown;
   retryAfterSeconds: number | null;
   transportCode: string | null;
+}
+
+/** A response header as one string (axios lowercases Node header names). */
+function headerValue(headers: unknown, name: string): string | undefined {
+  if (typeof headers !== 'object' || headers === null) return undefined;
+  const raw = (headers as Record<string, unknown>)[name];
+  const value: unknown = Array.isArray(raw) ? (raw as unknown[])[0] : raw;
+  return typeof value === 'string' ? value : undefined;
+}
+
+/** The (unsanitized) `filename` of a `Content-Disposition` value. */
+function contentDispositionFilename(
+  disposition: string | undefined,
+): string | undefined {
+  if (disposition === undefined) return undefined;
+  const quoted = /filename="([^"]*)"/i.exec(disposition);
+  if (quoted !== null) return quoted[1];
+  const bare = /filename=([^;]+)/i.exec(disposition);
+  return bare === null ? undefined : bare[1].trim();
+}
+
+/**
+ * A streamed (`responseType: 'stream'`) request that failed carries its error
+ * body as an unread stream: read at most 4 KiB of it (bounded in time), parse
+ * the scoped `{statusCode, code, message}` envelope and release the stream.
+ * Anything unreadable leaves `code` null; a non-stream body is left as is.
+ */
+async function readStreamedErrorBody(
+  failure: MirrorRawFailure,
+): Promise<MirrorRawFailure> {
+  const stream = failure.body;
+  if (!(stream instanceof Readable)) return failure;
+  let text = '';
+  try {
+    const read = (async () => {
+      let size = 0;
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) {
+        const buffer = Buffer.isBuffer(chunk)
+          ? chunk
+          : Buffer.from(chunk as Uint8Array | string);
+        size += buffer.length;
+        if (size > STREAMED_ERROR_BODY_MAX_BYTES) break;
+        chunks.push(buffer);
+      }
+      return size > STREAMED_ERROR_BODY_MAX_BYTES
+        ? ''
+        : Buffer.concat(chunks).toString('utf8');
+    })();
+    text = await Promise.race([
+      read,
+      new Promise<string>((resolve) => {
+        setTimeout(() => resolve(''), STREAMED_ERROR_BODY_READ_MS).unref();
+      }),
+    ]);
+  } catch {
+    text = '';
+  } finally {
+    stream.destroy();
+  }
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = null;
+  }
+  const scoped =
+    typeof body === 'object' && body !== null
+      ? (body as { code?: unknown }).code
+      : undefined;
+  return {
+    ...failure,
+    body,
+    code: typeof scoped === 'string' && scoped !== '' ? scoped : null,
+  };
 }
 
 const TIMEOUT_TRANSPORT_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT']);
