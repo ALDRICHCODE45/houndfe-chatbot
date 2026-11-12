@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import {
   AgentRunner,
   type AgentRunnerConfig,
@@ -370,6 +371,61 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
 
     expectNoAgentRun();
     expect(sender.sendText).not.toHaveBeenCalled();
+  });
+
+  // ─── S6: the customer phone never reaches the logs ──────────────────
+  describe('log masking (S6)', () => {
+    const PHONE = '5215550001111';
+    const MASKED = 'wa:…1111';
+    const spyAll = () => ({
+      log: jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {}),
+      warn: jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {}),
+      error: jest.spyOn(Logger.prototype, 'error').mockImplementation(() => {}),
+    });
+    const lines = (spy: jest.SpyInstance) =>
+      spy.mock.calls.map(([line]) => String(line)).join('\n');
+    afterEach(() => jest.restoreAllMocks());
+
+    it('the "process" line carries the masked sender only', async () => {
+      const spies = spyAll();
+      await service.dispatch(textEvent('wamid.mask-process', 'hola'));
+      const out = lines(spies.log);
+      expect(out).toContain('process wamid.mask-process');
+      expect(out).not.toContain(PHONE);
+      expect(out).toContain(MASKED);
+    });
+
+    it('the "skip duplicate" line carries the masked sender only', async () => {
+      const spies = spyAll();
+      dedup.claim.mockResolvedValue(null);
+      await service.dispatch(textEvent('wamid.mask-dup', 'hola'));
+      const out = lines(spies.log);
+      expect(out).toContain('skip duplicate wamid.mask-dup');
+      expect(out).not.toContain(PHONE);
+      expect(out).toContain(MASKED);
+    });
+
+    it('the "skip echo" line carries the masked sender only', async () => {
+      const spies = spyAll();
+      recentOutbound.isKnown.mockReturnValue(true);
+      await service.dispatch(textEvent('wamid.mask-echo', 'hola'));
+      const out = lines(spies.log);
+      expect(out).toContain('skip echo wamid.mask-echo');
+      expect(out).not.toContain(PHONE);
+      expect(out).toContain(MASKED);
+    });
+
+    it('the "failed to process" line carries the masked sender only', async () => {
+      const spies = spyAll();
+      minimalAgent.tryHandle.mockRejectedValueOnce(new Error('LLM down'));
+      await expect(
+        service.dispatch(textEvent('wamid.mask-fail', 'hola')),
+      ).rejects.toThrow('LLM down');
+      const out = lines(spies.error);
+      expect(out).toContain('failed to process wamid.mask-fail');
+      expect(out).not.toContain(PHONE);
+      expect(out).toContain(MASKED);
+    });
   });
 
   // ─── Scenario: successful processing records dedup + outbound echo ───

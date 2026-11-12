@@ -1,7 +1,9 @@
 import { Type } from 'class-transformer';
 import {
   IsArray,
+  IsBoolean,
   IsNotEmpty,
+  IsNumber,
   IsOptional,
   IsString,
   ValidateNested,
@@ -33,6 +35,54 @@ export class WebhookMessageMediaDto {
   @IsOptional()
   @IsString()
   sha256?: string;
+}
+
+/** T2 audio (`voice: true` marks a recorded voice note). */
+export class WebhookMessageAudioDto {
+  @IsOptional()
+  @IsString()
+  id?: string;
+
+  @IsOptional()
+  @IsString()
+  mime_type?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  voice?: boolean;
+}
+
+/** T2 sticker (webp). */
+export class WebhookMessageStickerDto {
+  @IsOptional()
+  @IsString()
+  id?: string;
+
+  @IsOptional()
+  @IsString()
+  mime_type?: string;
+}
+
+/** T2 video: only its presence matters, it is mirrored as a marker. */
+export class WebhookMessageVideoDto {
+  @IsOptional()
+  @IsString()
+  id?: string;
+
+  @IsOptional()
+  @IsString()
+  mime_type?: string;
+}
+
+/** T2 shared location: only its presence matters, it is mirrored as a marker. */
+export class WebhookMessageLocationDto {
+  @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
 }
 
 /** S4 tapped reply button / list row (`interactive.button_reply|list_reply`). */
@@ -108,6 +158,26 @@ export class WebhookMessageDto {
   @ValidateNested()
   @Type(() => WebhookMessageMediaDto)
   document?: WebhookMessageMediaDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMessageAudioDto)
+  audio?: WebhookMessageAudioDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMessageStickerDto)
+  sticker?: WebhookMessageStickerDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMessageVideoDto)
+  video?: WebhookMessageVideoDto;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => WebhookMessageLocationDto)
+  location?: WebhookMessageLocationDto;
 
   @IsOptional()
   @ValidateNested()

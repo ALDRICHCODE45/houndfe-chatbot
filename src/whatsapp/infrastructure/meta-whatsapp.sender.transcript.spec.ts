@@ -9,6 +9,7 @@ import type {
 import { MetaWhatsappSender } from './meta-whatsapp.sender';
 
 const TO = '5215550001111';
+const anyDate = expect.any(Date) as Date;
 
 function axiosResponse<T>(data: T): AxiosResponse<T> {
   return {
@@ -72,7 +73,13 @@ describe('MetaWhatsappSender transcript (S1)', () => {
     accept('wamid.text');
     await sender.sendText({ to: TO, text: 'hola' });
     expect(entries).toEqual([
-      { to: TO, providerMessageId: 'wamid.text', type: 'text', text: 'hola' },
+      {
+        to: TO,
+        providerMessageId: 'wamid.text',
+        type: 'text',
+        text: 'hola',
+        acceptedAt: anyDate,
+      },
     ]);
   });
 
@@ -90,6 +97,7 @@ describe('MetaWhatsappSender transcript (S1)', () => {
         type: 'image',
         text: 'Croquetas',
         media: { link: 'https://cdn.example.com/a.jpg' },
+        acceptedAt: anyDate,
       },
     ]);
   });
@@ -112,6 +120,7 @@ describe('MetaWhatsappSender transcript (S1)', () => {
           languageCode: 'es_MX',
           bodyParameters: ['F-1'],
         },
+        acceptedAt: anyDate,
       },
     ]);
   });
@@ -145,6 +154,62 @@ describe('MetaWhatsappSender transcript (S1)', () => {
           },
         },
       },
+    });
+  });
+
+  it('stamps each entry with the time Meta accepted the send', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    try {
+      jest.setSystemTime(new Date('2026-11-12T10:00:00.000Z'));
+      post.mockImplementationOnce(() => {
+        jest.setSystemTime(new Date('2026-11-12T10:00:00.250Z'));
+        return of(axiosResponse({ messages: [{ id: 'wamid.t' }] }));
+      });
+      await sender.sendText({ to: TO, text: 'hola' });
+      expect(entries[0].acceptedAt?.toISOString()).toBe(
+        '2026-11-12T10:00:00.250Z',
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('records the offered option titles of a button message (as sent to Meta)', async () => {
+    accept('wamid.btns');
+    await sender.sendInteractive({
+      to: TO,
+      body: '¿Confirma su pedido?',
+      interactive: {
+        type: 'buttons',
+        buttons: [
+          { id: 'a', title: 'Sí' },
+          { id: 'b', title: 'No' },
+          { id: 'c', title: 'Hablar con alguien especial hoy' },
+        ],
+      },
+    });
+    expect(entries[0].details).toMatchObject({
+      options: ['Sí', 'No', 'Hablar con alguien…'],
+    });
+    expect(entries[0].text).toBe('¿Confirma su pedido?');
+  });
+
+  it('records the row titles of a list message, not its descriptions or ids', async () => {
+    accept('wamid.list');
+    await sender.sendInteractive({
+      to: TO,
+      body: 'Elija una presentación',
+      interactive: {
+        type: 'list',
+        buttonText: 'Ver opciones',
+        rows: [
+          { id: 'r1', title: 'Croquetas 1 kg', description: 'MX$ 120' },
+          { id: 'r2', title: 'Croquetas 5 kg' },
+        ],
+      },
+    });
+    expect(entries[0].details).toMatchObject({
+      options: ['Croquetas 1 kg', 'Croquetas 5 kg'],
     });
   });
 

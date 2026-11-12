@@ -119,6 +119,9 @@ describe('WebhookDispatcherService reply media (S3)', () => {
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('reply image failed'),
     );
+    const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
+    expect(logged).not.toContain(SENDER);
+    expect(logged).toContain('wa:…1111');
     expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.in');
   });
 

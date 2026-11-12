@@ -2,6 +2,7 @@ import {
   assertEnqueueInput,
   laneForKind,
   truncateError,
+  type BackendOutboxCompletion,
   type BackendOutboxEnqueueInput,
   type BackendOutboxEnqueueResult,
   type BackendOutboxEntry,
@@ -54,7 +55,7 @@ export class InMemoryBackendOutboxStore implements BackendOutboxStore {
       payload: structuredClone(input.payload),
       status: 'PENDING',
       attempts: 0,
-      nextAttemptAt: now,
+      nextAttemptAt: new Date(now.getTime() + Math.max(0, input.delayMs ?? 0)),
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: null,
@@ -96,6 +97,69 @@ export class InMemoryBackendOutboxStore implements BackendOutboxStore {
         row.leaseOwner = owner;
         row.leaseExpiresAt = new Date(now + leaseMs);
         return copy(row as ClaimedBackendOutboxEntry);
+      }),
+    );
+  }
+
+  claimRun(
+    head: ClaimedBackendOutboxEntry,
+    owner: string,
+    leaseMs: number,
+    maxRows: number,
+  ): Promise<ClaimedBackendOutboxEntry[]> {
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1)
+      return Promise.resolve([]);
+    const headRow = this.rows.find((r) => r.id === head.id);
+    if (
+      !headRow ||
+      headRow.status !== 'IN_FLIGHT' ||
+      headRow.leaseOwner !== head.leaseOwner ||
+      headRow.leaseExpiresAt?.getTime() !== head.leaseExpiresAt.getTime()
+    )
+      return Promise.resolve([]);
+    const now = this.clock();
+    const lane = laneForKind(headRow.kind);
+    const run: BackendOutboxEntry[] = [headRow];
+    const followers = this.rows
+      .filter(
+        (row) =>
+          row.conversationRef === headRow.conversationRef &&
+          row.seq > headRow.seq &&
+          (row.status === 'PENDING' || row.status === 'IN_FLIGHT') &&
+          laneForKind(row.kind) === lane,
+      )
+      .sort((a, b) => a.seq - b.seq);
+    for (const row of followers) {
+      if (run.length >= maxRows) break;
+      const due =
+        row.status === 'PENDING'
+          ? row.nextAttemptAt.getTime() <= now
+          : (row.leaseExpiresAt?.getTime() ?? 0) <= now;
+      if (row.kind !== headRow.kind || !due) break;
+      run.push(row);
+    }
+    const leaseExpiresAt = new Date(now + leaseMs);
+    return Promise.resolve(
+      run.map((row) => {
+        row.status = 'IN_FLIGHT';
+        row.leaseOwner = owner;
+        row.leaseExpiresAt = leaseExpiresAt;
+        return copy(row as ClaimedBackendOutboxEntry);
+      }),
+    );
+  }
+
+  completeMany(items: readonly BackendOutboxCompletion[]): Promise<boolean[]> {
+    return Promise.all(
+      items.map((item) => {
+        switch (item.outcome) {
+          case 'DONE':
+            return this.markDone(item.entry);
+          case 'RETRY':
+            return this.reschedule(item.entry, item.delayMs, item.error);
+          case 'DEAD':
+            return this.markDead(item.entry, item.error);
+        }
       }),
     );
   }

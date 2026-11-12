@@ -83,6 +83,7 @@ describe('PostgresBackendOutboxStore SQL (no database)', () => {
       'REQUEST_CREATE',
       'k',
       '{"a":1}',
+      0,
     ]);
     expect(sqls[4]).toBe('COMMIT');
   });
@@ -123,6 +124,82 @@ describe('PostgresBackendOutboxStore SQL (no database)', () => {
     expect(sql).toMatch(/FOR UPDATE OF o SKIP LOCKED/);
     expect(sql).toMatch(/date_trunc\('milliseconds', now\(\)\)/);
     expect(params).toEqual([20, 'o', 60_000]);
+  });
+
+  const claimed = (id: string, lease: Date) =>
+    ({
+      id,
+      leaseOwner: 'o',
+      leaseExpiresAt: lease,
+    }) as ClaimedBackendOutboxEntry;
+
+  it('claims a run behind a head with one statement (window run, same lease, head fence)', async () => {
+    const lease = new Date('2026-11-09T00:01:00.000Z');
+    const { pool, store } = fake([
+      [
+        dbRow({ id: '9', seq: '5', status: 'IN_FLIGHT' }),
+        dbRow({ id: '8', seq: '4', status: 'IN_FLIGHT' }),
+      ],
+    ]);
+    const run = await store.claimRun(claimed('8', lease), 'o2', 60_000, 50);
+    expect(run.map((e) => e.seq)).toEqual([4, 5]);
+    expect(pool.calls).toHaveLength(1);
+    const { sql, params } = pool.calls[0];
+    expect(sql).toMatch(/WHERE id = \$1 AND status = 'IN_FLIGHT'/);
+    expect(sql).toMatch(/lease_expires_at = \$3::timestamptz\s+FOR UPDATE/);
+    expect(sql).toMatch(/bool_and\(/);
+    expect(sql).toMatch(/OVER \(ORDER BY o\.seq ROWS UNBOUNDED PRECEDING\)/);
+    expect(sql).toMatch(/x\.lane = h\.lane/);
+    expect(sql).toMatch(/LIMIT \$4::int/);
+    expect(sql).toMatch(/date_trunc\('milliseconds', now\(\)\)/);
+    expect(params).toEqual(['8', 'o', lease, 50, 'o2', 60_000]);
+  });
+
+  it('claimRun refuses invalid limits and tokens without a query', async () => {
+    const { pool, store } = fake();
+    const lease = new Date();
+    await expect(
+      store.claimRun(claimed('1', lease), 'o', 1, 0),
+    ).resolves.toEqual([]);
+    await expect(
+      store.claimRun(claimed('1', new Date(Number.NaN)), 'o', 1, 5),
+    ).resolves.toEqual([]);
+    await expect(
+      store.claimRun(claimed('1', lease), '', 1, 5),
+    ).resolves.toEqual([]);
+    expect(pool.calls).toHaveLength(0);
+  });
+
+  it('completes a mixed batch in ONE statement and reports per-row fencing', async () => {
+    const lease = new Date('2026-11-09T00:01:00.000Z');
+    const { pool, store } = fake([[{ ord: '1' }, { ord: '3' }]]);
+    const result = await store.completeMany([
+      { entry: claimed('1', lease), outcome: 'DONE' },
+      { entry: claimed('2', lease), outcome: 'DEAD', error: 'bad' },
+      {
+        entry: claimed('3', lease),
+        outcome: 'RETRY',
+        delayMs: 1500.4,
+        error: 'x',
+      },
+    ]);
+    expect(result).toEqual([true, false, true]);
+    expect(pool.calls).toHaveLength(1);
+    const { sql, params } = pool.calls[0];
+    expect(sql).toMatch(/FROM unnest\(\$1::bigint\[\]/);
+    expect(sql).toMatch(
+      /o\.lease_owner = v\.owner\s+AND o\.lease_expires_at = v\.lease/,
+    );
+    expect(params).toEqual([
+      ['1', '2', '3'],
+      ['o', 'o', 'o'],
+      [lease.toISOString(), lease.toISOString(), lease.toISOString()],
+      ['DONE', 'DEAD', 'RETRY'],
+      ['', 'bad', 'x'],
+      [0, 0, 1500],
+    ]);
+    await expect(store.completeMany([])).resolves.toEqual([]);
+    expect(pool.calls).toHaveLength(1);
   });
 
   it('fences completion by owner and lease token', async () => {

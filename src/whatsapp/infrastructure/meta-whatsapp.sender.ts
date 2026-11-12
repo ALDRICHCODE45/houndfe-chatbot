@@ -186,13 +186,15 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       to: normalizeSandboxRecipient(payload.to, sandboxNormalization),
     });
 
+    // T2: the moment Meta accepted the send, before any local bookkeeping.
+    const acceptedAt = new Date();
     const providerMessageId = response.messages?.[0]?.id;
 
     if (!providerMessageId) {
       throw new Error('Meta response did not include a provider message id');
     }
 
-    await this.recordTranscript(payload, providerMessageId);
+    await this.recordTranscript(payload, providerMessageId, acceptedAt);
     return { providerMessageId };
   }
 
@@ -204,12 +206,14 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
   private async recordTranscript(
     payload: MetaMessagePayload,
     providerMessageId: string,
+    acceptedAt: Date,
   ): Promise<void> {
     if (this.transcript === undefined || this.isOpsPhone(payload.to)) return;
     try {
-      await this.transcript.recordOutbound(
-        transcriptEntry(payload, providerMessageId),
-      );
+      await this.transcript.recordOutbound({
+        ...transcriptEntry(payload, providerMessageId),
+        acceptedAt,
+      });
     } catch (error) {
       this.logger.warn(
         `transcript record failed for ${providerMessageId}: ${
@@ -420,6 +424,8 @@ function transcriptEntry(
         text: stringOf(field(interactive?.body)?.text),
         details: {
           interactive: { type: interactive?.type, action: interactive?.action },
+          // T2: the titles as sent, so the inbox can show what was offered.
+          options: interactiveOptionTitles(interactive),
         },
       };
     }
@@ -447,6 +453,26 @@ function transcriptEntry(
     default:
       return base;
   }
+}
+
+/** T2: the button titles or list row titles of a Graph API interactive. */
+function interactiveOptionTitles(interactive: PayloadField): string[] {
+  const action = field(interactive?.action);
+  const titleOf = (item: unknown): string | undefined =>
+    stringOf(field(field(item)?.reply)?.title) ?? stringOf(field(item)?.title);
+  const buttons = Array.isArray(action?.buttons)
+    ? (action.buttons as unknown[])
+    : [];
+  const sections = Array.isArray(action?.sections)
+    ? (action.sections as unknown[])
+    : [];
+  const rows = sections.flatMap((section) => {
+    const list = field(section)?.rows;
+    return Array.isArray(list) ? (list as unknown[]) : [];
+  });
+  return [...buttons, ...rows]
+    .map(titleOf)
+    .filter((title): title is string => title !== undefined && title !== '');
 }
 
 /** Graph API `interactive` object, shortened to Meta's limits. */

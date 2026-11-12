@@ -76,6 +76,69 @@ export interface MetaMediaMetadata {
   providerDeclaredBytes: number;
 }
 
+/** What a download pipeline accepts. The receipt and product-image paths use
+ *  the narrow RECEIPT_MEDIA_PROFILE; the conversation mirror injects a wider
+ *  one (parameterized, never widened globally). */
+/** Head bytes a sniff-only profile reads back (magic numbers fit in 64). */
+const SNIFF_HEAD_BYTES = 64;
+
+async function readHead(filePath: string, length: number): Promise<Buffer> {
+  const file = await fs.promises.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await file.read(buffer, 0, length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await file.close();
+  }
+}
+
+export interface MetaMediaProfile {
+  /** Canonical mime for the raw metadata `mime_type`, or undefined when the
+   *  profile does not accept it (rejected before any download request). */
+  canonicalMime(raw: string): string | undefined;
+  /** Magic-byte sniffing over the bounded read-back; the bytes decide. */
+  sniff(bytes: Buffer): string | undefined;
+  /** Optional deep validation of the downloaded bytes (throws MetaMediaError). */
+  validate?(bytes: Buffer, mimeType: string): void;
+  /** When true the download Content-Type (parameters stripped) must equal the
+   *  metadata mime; when false the sniffed bytes are the only authority. */
+  strictContentType: boolean;
+}
+
+/** The request the profiled pipeline needs: no declared mime. */
+export type MetaMediaProfileRequest = Pick<
+  MetaMediaRequest,
+  'providerMediaId' | 'signal'
+>;
+
+/** A downloaded, sniffed temp file; the mime is the profile's canonical one. */
+export interface ProfiledMediaFile {
+  filePath: string;
+  mimeType: string;
+  byteCount: number;
+  providerDeclaredBytes: number;
+  sha256: Buffer;
+  cleanup(): Promise<void>;
+}
+
+interface ProfiledMetadata {
+  downloadUrl: string;
+  mimeType: string;
+  providerDeclaredBytes: number;
+}
+
+/** HTTP status behind a fixed safe HTTP_RETRYABLE/HTTP_PERMANENT error, kept
+ *  out of the error itself (a safe projection) and readable only through
+ *  metaHttpStatusOf (e.g. to tell an expired token from an expired media). */
+const HTTP_STATUS_OF = new WeakMap<MetaMediaError, number>();
+
+export function metaHttpStatusOf(error: unknown): number | undefined {
+  return error instanceof MetaMediaError
+    ? HTTP_STATUS_OF.get(error)
+    : undefined;
+}
+
 const transportFailure = (): MetaMediaError =>
   new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE');
 
@@ -131,7 +194,10 @@ function detectMagic(bytes: Buffer): ReceiptMimeType | undefined {
  *  progress is retried on the unwritten remainder, while void, zero, negative,
  *  non-safe-integer, or over-length progress fails closed immediately so no
  *  write loop can ever hang. */
-async function writeAll(temp: MetaTempFile, chunk: Buffer): Promise<void> {
+export async function writeAll(
+  temp: MetaTempFile,
+  chunk: Buffer,
+): Promise<void> {
   let written = 0;
   while (written < chunk.length) {
     const progress = await ioStep(() => temp.write(chunk.subarray(written)));
@@ -198,6 +264,15 @@ const CANONICAL_MIME_TYPES: ReadonlySet<string> = new Set([
   'application/pdf',
 ]);
 
+/** The unchanged receipt/product-image rules: exact canonical mime (no
+ *  parameters), jpeg/png/pdf magic, strict structure and Content-Type. */
+export const RECEIPT_MEDIA_PROFILE: MetaMediaProfile = {
+  canonicalMime: (raw) => (CANONICAL_MIME_TYPES.has(raw) ? raw : undefined),
+  sniff: (bytes) => detectMagic(bytes),
+  validate: (bytes, mimeType) => validateMediaStructure(bytes, mimeType),
+  strictContentType: true,
+};
+
 /** Design byte bound: provider-declared size must be 1..10_485_760. */
 const MAX_PROVIDER_BYTES = 10_485_760;
 
@@ -237,10 +312,12 @@ function mapTransportError(error: unknown): MetaMediaError {
  *  non-2xx permanent; no status, URL, or response body detail attached). */
 function httpStatusError(status: number): MetaMediaError {
   const retryable = status === 408 || status === 429 || status >= 500;
-  return new MetaMediaError(
+  const error = new MetaMediaError(
     'META_TRANSPORT',
     retryable ? 'HTTP_RETRYABLE' : 'HTTP_PERMANENT',
   );
+  HTTP_STATUS_OF.set(error, status);
+  return error;
 }
 
 function metadataString(data: unknown, field: string): string | undefined {
@@ -264,12 +341,12 @@ function extractDownloadUrl(data: unknown): string {
   throw new MetaMediaError('META_TRANSPORT', 'HTTP_PERMANENT');
 }
 
-/** The metadata mime_type must already be a canonical media type; anything
+/** The metadata mime_type must be accepted by the profile; anything
  *  missing, non-string, or unsupported fails closed. */
-function extractMetadataMime(data: unknown): ReceiptMimeType {
-  const mime = metadataString(data, 'mime_type');
-  if (mime !== undefined && CANONICAL_MIME_TYPES.has(mime))
-    return mime as ReceiptMimeType;
+function extractMetadataMime(data: unknown, profile: MetaMediaProfile): string {
+  const raw = metadataString(data, 'mime_type');
+  const mime = raw === undefined ? undefined : profile.canonicalMime(raw);
+  if (mime !== undefined) return mime;
   throw new MetaMediaError('MEDIA_VALIDATION', 'UNSUPPORTED_MIME');
 }
 
@@ -288,16 +365,18 @@ function extractProviderBytes(data: unknown): number {
   return size;
 }
 
-/** WU4B3B1a: validates the metadata body against the declared MIME and
- *  projects the B3B1b contract; declared/provider disagreement and any
- *  invalid size are rejected before any download request can exist. */
+/** WU4B3B1a: validates the metadata body against the profile (and the
+ *  declared MIME when the caller has one) and projects the B3B1b contract;
+ *  declared/provider disagreement and any invalid size are rejected before
+ *  any download request can exist. */
 function projectMetadata(
   data: unknown,
-  declaredMimeType: ReceiptMimeType,
-): MetaMediaMetadata {
+  declaredMimeType: string | undefined,
+  profile: MetaMediaProfile,
+): ProfiledMetadata {
   const downloadUrl = extractDownloadUrl(data);
-  const mimeType = extractMetadataMime(data);
-  if (mimeType !== declaredMimeType)
+  const mimeType = extractMetadataMime(data, profile);
+  if (declaredMimeType !== undefined && mimeType !== declaredMimeType)
     throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
   return {
     downloadUrl,
@@ -356,7 +435,9 @@ export class MetaMediaClient {
   /** One composed, policy-validated, bearer-after-pinning metadata hop
    *  returning the raw 2xx body; shared by the WU4B1B URL resolution and
    *  the WU4B3B1a projection. */
-  private async fetchMetadata(request: MetaMediaRequest): Promise<unknown> {
+  private async fetchMetadata(
+    request: MetaMediaProfileRequest,
+  ): Promise<unknown> {
     try {
       const url = composeMetadataUrl(
         this.config.graphApiBaseUrl,
@@ -408,10 +489,23 @@ export class MetaMediaClient {
   async resolveMetadata(request: MetaMediaRequest): Promise<MetaMediaMetadata> {
     if (!CANONICAL_MIME_TYPES.has(request.declaredMimeType))
       throw new MetaMediaError('MEDIA_VALIDATION', 'UNSUPPORTED_MIME');
+    return (await this.resolveProfiledMetadata(
+      request,
+      RECEIPT_MEDIA_PROFILE,
+      request.declaredMimeType,
+    )) as MetaMediaMetadata;
+  }
+
+  private async resolveProfiledMetadata(
+    request: MetaMediaProfileRequest,
+    profile: MetaMediaProfile,
+    declaredMimeType: string | undefined,
+  ): Promise<ProfiledMetadata> {
     try {
       return projectMetadata(
         await this.fetchMetadata(request),
-        request.declaredMimeType,
+        declaredMimeType,
+        profile,
       );
     } catch (error) {
       throw mapTransportError(error);
@@ -427,7 +521,7 @@ export class MetaMediaClient {
    *  before handing the agent back. No stream is read, inspected, or bounded
    *  here. */
   async downloadStream(
-    request: MetaMediaRequest,
+    request: MetaMediaProfileRequest,
     downloadUrl: string,
   ): Promise<MetaDownloadHandle> {
     try {
@@ -507,16 +601,47 @@ export class MetaMediaClient {
   async resolveAndDownload(
     request: MetaMediaRequest,
   ): Promise<ValidatedMediaFile> {
+    if (!CANONICAL_MIME_TYPES.has(request.declaredMimeType))
+      throw new MetaMediaError('MEDIA_VALIDATION', 'UNSUPPORTED_MIME');
+    return (await this.runPipeline(
+      request,
+      RECEIPT_MEDIA_PROFILE,
+      request.declaredMimeType,
+    )) as ValidatedMediaFile;
+  }
+
+  /** The same bounded pipeline under an injected profile (T3: the conversation
+   *  mirror's wider type set). No declared mime is compared: the metadata
+   *  mime must be accepted by the profile and the sniffed bytes must agree. */
+  async downloadWithProfile(
+    request: MetaMediaProfileRequest,
+    profile: MetaMediaProfile,
+  ): Promise<ProfiledMediaFile> {
+    return this.runPipeline(request, profile, undefined);
+  }
+
+  private async runPipeline(
+    request: MetaMediaProfileRequest,
+    profile: MetaMediaProfile,
+    declaredMimeType: string | undefined,
+  ): Promise<ProfiledMediaFile> {
     let handle: MetaDownloadHandle | undefined;
     let source: Readable | undefined;
     let temp: MetaTempFile | undefined;
     try {
-      const metadata = await this.resolveMetadata(request);
+      const metadata = await this.resolveProfiledMetadata(
+        request,
+        profile,
+        declaredMimeType,
+      );
       handle = await this.downloadStream(request, metadata.downloadUrl);
       source = handle.response.data as Readable;
       // WU4B3B2 header agreement guards, before any byte is consumed: the
       // response Content-Type must strip to exactly the agreed metadata MIME.
-      if (responseMimeOf(handle.response.headers) !== metadata.mimeType)
+      if (
+        profile.strictContentType &&
+        responseMimeOf(handle.response.headers) !== metadata.mimeType
+      )
         throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
       const contentLength = responseLengthOf(handle.response.headers);
       // WU4B3B2R2 source-error-lifecycle: the observation is registered BEFORE
@@ -557,12 +682,18 @@ export class MetaMediaClient {
         if (contentLength !== undefined && contentLength !== byteCount)
           throw invalidSize();
         // Bounded read-back: the enforced cap guarantees at most 10 MiB here.
-        const bytes = await ioStep(() => fs.promises.readFile(tempPath));
+        // A profile without deep validation only sniffs, so it reads just the
+        // head bytes instead of buffering the whole file (mirror S1).
+        const bytes = await ioStep(() =>
+          profile.validate === undefined
+            ? readHead(tempPath, SNIFF_HEAD_BYTES)
+            : fs.promises.readFile(tempPath),
+        );
         // A live abort in the close/read-back windows must still settle ABORTED.
         if (request.signal.aborted) throw canceled();
-        if (detectMagic(bytes) !== metadata.mimeType)
+        if (profile.sniff(bytes) !== metadata.mimeType)
           throw new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH');
-        validateMediaStructure(bytes, metadata.mimeType);
+        profile.validate?.(bytes, metadata.mimeType);
         handle.release(); // settlement complete: final agent released exactly once
         return {
           filePath: tempPath,

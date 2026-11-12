@@ -171,6 +171,9 @@ describe('WebhookDispatcherService interactive replies (S4)', () => {
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('interactive reply failed'),
     );
+    const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
+    expect(logged).not.toContain(SENDER);
+    expect(logged).toContain('wa:…1111');
   });
 
   it('a failed fallback text still fails the webhook (Meta re-delivers)', async () => {
@@ -240,6 +243,7 @@ describe('normalizeInboundMessages interactive replies (S4)', () => {
         timestamp: new Date(1719000000 * 1000).toISOString(),
         receivingPhoneNumberId: '123456789012345',
         interactiveReplyId: id,
+        interactiveReplyTitle: title,
       },
     ]);
   });

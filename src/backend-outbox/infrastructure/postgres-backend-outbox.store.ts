@@ -3,6 +3,7 @@ import {
   assertEnqueueInput,
   laneForKind,
   truncateError,
+  type BackendOutboxCompletion,
   type BackendOutboxEnqueueInput,
   type BackendOutboxEnqueueResult,
   type BackendOutboxEntry,
@@ -40,8 +41,9 @@ ON CONFLICT (conversation_ref, lane) DO UPDATE
 RETURNING next_seq - 1 AS seq`;
 
 const INSERT_SQL = `INSERT INTO backend_outbox
-  (conversation_ref, lane, seq, kind, idempotency_key, payload)
-VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+  (conversation_ref, lane, seq, kind, idempotency_key, payload, next_attempt_at)
+VALUES ($1, $2, $3, $4, $5, $6::jsonb,
+  now() + make_interval(secs => $7::double precision / 1000.0))
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING *`;
 
@@ -71,6 +73,72 @@ SET status = 'IN_FLIGHT', lease_owner = $2,
     + make_interval(secs => $3::double precision / 1000.0)
 FROM due WHERE o.id = due.id
 RETURNING o.*`;
+
+/** Batched claim: the run behind an already claimed head.
+ *
+ * EXPLAIN reasoning (no migration): the lateral scan filters
+ * (conversation_ref = h.conversation_ref, lane, open status, seq >= h.seq)
+ * ORDER BY seq LIMIT n, which `backend_outbox_open_heads_idx`
+ * (conversation_ref, lane, seq) WHERE status IN ('PENDING','IN_FLIGHT')
+ * (migrations/4400000000000_backend_outbox_lanes.js) serves as an ordered
+ * index range scan of at most n rows of that (conversation, lane). The
+ * window `bool_and(...) OVER (ORDER BY seq)` is true up to the first row that
+ * is of another kind or not due, i.e. the contiguous run; the id lookups that
+ * lock and update it use the primary key. Followers cannot be claimed by any
+ * other worker meanwhile: they are never lane heads while the head is leased.
+ * All rows receive the same ms-truncated lease, the head included. */
+const CLAIM_RUN_SQL = `WITH head AS (
+  SELECT id, conversation_ref, lane, seq, kind FROM backend_outbox
+  WHERE id = $1 AND status = 'IN_FLIGHT' AND lease_owner = $2
+    AND lease_expires_at = $3::timestamptz
+  FOR UPDATE
+), cand AS (
+  SELECT o.id, o.seq,
+    bool_and(o.kind = h.kind AND (o.id = h.id
+      OR (o.status = 'PENDING' AND o.next_attempt_at <= now())
+      OR (o.status = 'IN_FLIGHT' AND o.lease_expires_at <= now())))
+      OVER (ORDER BY o.seq ROWS UNBOUNDED PRECEDING) AS in_run
+  FROM head h
+  CROSS JOIN LATERAL (
+    SELECT x.id, x.seq, x.kind, x.status, x.next_attempt_at, x.lease_expires_at
+    FROM backend_outbox x
+    WHERE x.conversation_ref = h.conversation_ref AND x.lane = h.lane
+      AND x.status IN ('PENDING', 'IN_FLIGHT') AND x.seq >= h.seq
+    ORDER BY x.seq
+    LIMIT $4::int
+  ) o
+), run AS (
+  SELECT id FROM cand WHERE in_run ORDER BY seq LIMIT $4::int
+), locked AS (
+  SELECT o.id FROM backend_outbox o WHERE o.id IN (SELECT id FROM run)
+  ORDER BY o.seq FOR UPDATE
+)
+UPDATE backend_outbox o
+SET status = 'IN_FLIGHT', lease_owner = $5,
+  lease_expires_at = date_trunc('milliseconds', now())
+    + make_interval(secs => $6::double precision / 1000.0)
+FROM locked WHERE o.id = locked.id
+RETURNING o.*`;
+
+/** DONE / RETRY / DEAD for many claimed rows in one statement, each row
+ * fenced by its own (owner, lease). Same column effects as the single-row
+ * statements below. */
+const COMPLETE_MANY_SQL = `UPDATE backend_outbox o
+SET status = CASE v.outcome
+    WHEN 'DONE' THEN 'DONE' WHEN 'DEAD' THEN 'DEAD' ELSE 'PENDING' END,
+  attempts = o.attempts + 1,
+  done_at = CASE WHEN v.outcome = 'DONE' THEN now() ELSE o.done_at END,
+  last_error = CASE WHEN v.outcome = 'DONE' THEN o.last_error ELSE v.error END,
+  next_attempt_at = CASE WHEN v.outcome = 'RETRY'
+    THEN now() + make_interval(secs => v.delay_ms / 1000.0)
+    ELSE o.next_attempt_at END,
+  lease_owner = NULL, lease_expires_at = NULL
+FROM unnest($1::bigint[], $2::text[], $3::timestamptz[], $4::text[],
+  $5::text[], $6::double precision[])
+  WITH ORDINALITY AS v(id, owner, lease, outcome, error, delay_ms, ord)
+WHERE o.id = v.id AND o.status = 'IN_FLIGHT' AND o.lease_owner = v.owner
+  AND o.lease_expires_at = v.lease
+RETURNING v.ord`;
 
 const FENCE = `WHERE id = $1 AND status = 'IN_FLIGHT' AND lease_owner = $2
   AND lease_expires_at = $3::timestamptz`;
@@ -151,6 +219,68 @@ export class PostgresBackendOutboxStore implements BackendOutboxStore {
     return rows.map((row) => toEntry(row) as ClaimedBackendOutboxEntry);
   }
 
+  async claimRun(
+    head: ClaimedBackendOutboxEntry,
+    owner: string,
+    leaseMs: number,
+    maxRows: number,
+  ): Promise<ClaimedBackendOutboxEntry[]> {
+    if (
+      !Number.isSafeInteger(maxRows) ||
+      maxRows < 1 ||
+      owner.length === 0 ||
+      owner.length > 100 ||
+      !(head.leaseExpiresAt instanceof Date) ||
+      Number.isNaN(head.leaseExpiresAt.getTime())
+    )
+      return [];
+    const { rows } = await this.pool.query<Row>(CLAIM_RUN_SQL, [
+      head.id,
+      head.leaseOwner,
+      head.leaseExpiresAt,
+      maxRows,
+      owner,
+      boundedMs(leaseMs),
+    ]);
+    return rows
+      .map((row) => toEntry(row) as ClaimedBackendOutboxEntry)
+      .sort((a, b) => a.seq - b.seq);
+  }
+
+  async completeMany(
+    items: readonly BackendOutboxCompletion[],
+  ): Promise<boolean[]> {
+    if (items.length === 0) return [];
+    const valid = items.map(
+      ({ entry }) =>
+        entry.leaseExpiresAt instanceof Date &&
+        !Number.isNaN(entry.leaseExpiresAt.getTime()),
+    );
+    const usable = items.filter((_, index) => valid[index]);
+    // 1-based position (in `usable`) of every item that was applied.
+    const applied = new Set<number>();
+    if (usable.length > 0) {
+      const { rows } = await this.pool.query<{ ord: string }>(
+        COMPLETE_MANY_SQL,
+        [
+          usable.map((item) => item.entry.id),
+          usable.map((item) => item.entry.leaseOwner),
+          usable.map((item) => item.entry.leaseExpiresAt.toISOString()),
+          usable.map((item) => item.outcome),
+          usable.map((item) =>
+            item.outcome === 'DONE' ? '' : truncateError(item.error),
+          ),
+          usable.map((item) =>
+            item.outcome === 'RETRY' ? boundedMs(item.delayMs) : 0,
+          ),
+        ],
+      );
+      for (const row of rows) applied.add(Number(row.ord));
+    }
+    let position = 0;
+    return valid.map((ok) => (ok ? applied.has(++position) : false));
+  }
+
   async markDone(entry: ClaimedBackendOutboxEntry): Promise<boolean> {
     return this.fenced(MARK_DONE_SQL, entry, []);
   }
@@ -204,6 +334,7 @@ export class PostgresBackendOutboxStore implements BackendOutboxStore {
       input.kind,
       input.idempotencyKey,
       JSON.stringify(input.payload),
+      boundedMs(input.delayMs ?? 0),
     ]);
     if (inserted.rows[0])
       return { entry: toEntry(inserted.rows[0]), created: true };

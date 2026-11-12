@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type {
+  BackendOutboxBatchDeliveryPort,
   BackendOutboxDeliveryPort,
   BackendOutboxDeliveryResult,
   BackendOutboxEntry,
@@ -189,12 +190,34 @@ describe('BackendOutboxDrainWorker', () => {
     expect(Logger.prototype.error).toHaveBeenCalledWith(
       expect.stringContaining('DEAD'),
     );
+    const dead = (Logger.prototype.error as jest.Mock).mock.calls
+      .map(([line]) => String(line))
+      .join('\n');
+    expect(dead).not.toContain('5215550001111');
+    expect(dead).toContain('wa:…1111#');
     await drain.tick();
     expect(store.snapshot().map((e) => [e.idempotencyKey, e.status])).toEqual([
       ['a1', 'DEAD'],
       ['a2', 'DONE'],
     ]);
     expect(store.snapshot()[0].lastError).toBe('422 VALIDATION_ERROR');
+  });
+
+  it('a lost lease is logged with the masked conversation only', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await enqueue(store, A, 'a1');
+    jest.spyOn(store, 'markDone').mockResolvedValue(false);
+    const drain = worker(
+      store,
+      new ScriptedDelivery(() => ({ outcome: 'DELIVERED' })),
+    );
+    await drain.tick();
+    const lost = (Logger.prototype.warn as jest.Mock).mock.calls
+      .map(([line]) => String(line))
+      .join('\n');
+    expect(lost).toContain('lease lost');
+    expect(lost).not.toContain('5215550001111');
+    expect(lost).toContain('wa:…1111#');
   });
 
   it('a failing claim does not crash the tick', async () => {
@@ -238,5 +261,254 @@ describe('BackendOutboxDrainWorker', () => {
     drain.start();
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(store.snapshot()[1].status).toBe('PENDING');
+  });
+});
+
+class ScriptedBatchDelivery implements BackendOutboxBatchDeliveryPort {
+  readonly calls: BackendOutboxEntry[][] = [];
+  readonly singles: string[] = [];
+  readonly signals: Array<AbortSignal | undefined> = [];
+  constructor(
+    private readonly limits: Partial<Record<string, number>>,
+    private readonly script: (
+      entries: readonly BackendOutboxEntry[],
+    ) => BackendOutboxDeliveryResult[] | Error = (entries) =>
+      entries.map(() => ({ outcome: 'DELIVERED' as const })),
+  ) {}
+  batchLimit(kind: string): number {
+    return this.limits[kind] ?? 1;
+  }
+  deliver(entry: BackendOutboxEntry): Promise<BackendOutboxDeliveryResult> {
+    this.singles.push(entry.idempotencyKey);
+    return Promise.resolve({ outcome: 'DELIVERED' });
+  }
+  deliverBatch(
+    entries: readonly BackendOutboxEntry[],
+    options?: { signal?: AbortSignal },
+  ): Promise<BackendOutboxDeliveryResult[]> {
+    this.calls.push([...entries]);
+    this.signals.push(options?.signal);
+    const out = this.script(entries);
+    return out instanceof Error ? Promise.reject(out) : Promise.resolve(out);
+  }
+}
+
+describe('BackendOutboxDrainWorker batches (unit 9)', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const fill = async (
+    store: InMemoryBackendOutboxStore,
+    count: number,
+    conversation = A,
+  ) => {
+    for (let n = 1; n <= count; n++)
+      await enqueue(store, conversation, `${conversation}-${n}`);
+  };
+
+  it('delivers 120 mirror rows of one conversation in 3 calls (50 + 50 + 20)', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 120);
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 });
+    const drain = worker(store, delivery);
+    await drain.tick();
+    await drain.tick();
+    await drain.tick();
+    await expect(drain.tick()).resolves.toBe(0);
+    expect(delivery.calls.map((call) => call.length)).toEqual([50, 50, 20]);
+    expect(delivery.singles).toEqual([]);
+    // Seq order is kept inside and across batches.
+    expect(delivery.calls.flat().map((e) => e.seq)).toEqual(
+      Array.from({ length: 120 }, (_, i) => i + 1),
+    );
+    expect(store.snapshot().every((e) => e.status === 'DONE')).toBe(true);
+  });
+
+  it('applies DELIVERED / PERMANENT / RETRY per row of a batch', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 4);
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 }, () => [
+      { outcome: 'DELIVERED' },
+      { outcome: 'PERMANENT', error: '422 MEDIA_TYPE_MISMATCH' },
+      { outcome: 'RETRY', error: '503', retryAfterMs: 90_000 },
+      { outcome: 'DELIVERED' },
+    ]);
+    const drain = worker(store, delivery);
+    const before = Date.now();
+    await drain.tick();
+    const rows = store.snapshot();
+    expect(rows.map((r) => r.status)).toEqual([
+      'DONE',
+      'DEAD',
+      'PENDING',
+      'DONE',
+    ]);
+    expect(rows[1].lastError).toBe('422 MEDIA_TYPE_MISMATCH');
+    expect(rows[2].nextAttemptAt.getTime() - before).toBeGreaterThanOrEqual(
+      89_000,
+    );
+    expect(rows[2].lastError).toBe('503');
+    expect(Logger.prototype.error).toHaveBeenCalledWith(
+      expect.stringContaining('wa:…1111#2'),
+    );
+    expect(Logger.prototype.error).not.toHaveBeenCalledWith(
+      expect.stringContaining('5215550001111'),
+    );
+  });
+
+  it('a thrown batch call retries every row with backoff', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 3);
+    const delivery = new ScriptedBatchDelivery(
+      { MESSAGE_MIRROR: 50 },
+      () => new Error('socket hang up'),
+    );
+    await worker(store, delivery).tick();
+    const rows = store.snapshot();
+    expect(rows.map((r) => r.status)).toEqual([
+      'PENDING',
+      'PENDING',
+      'PENDING',
+    ]);
+    expect(rows.every((r) => r.attempts === 1)).toBe(true);
+    expect(rows[0].lastError).toMatch(/socket hang up/);
+  });
+
+  it('a result array of the wrong length retries every row (never trusts it)', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 3);
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 }, () => [
+      { outcome: 'DELIVERED' },
+    ]);
+    await worker(store, delivery).tick();
+    expect(store.snapshot().map((r) => r.status)).toEqual([
+      'PENDING',
+      'PENDING',
+      'PENDING',
+    ]);
+  });
+
+  it('a batch call that hangs is aborted and retried (signal fires before the hard timeout)', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 2);
+    let seen: AbortSignal | undefined;
+    const delivery: BackendOutboxBatchDeliveryPort = {
+      batchLimit: () => 50,
+      deliver: () => Promise.reject(new Error('unused')),
+      deliverBatch: (_entries, options) => {
+        seen = options?.signal;
+        return new Promise(() => undefined);
+      },
+    };
+    const drain = new BackendOutboxDrainWorker(store, delivery, {
+      owner: 'backend-outbox:test',
+      leaseMs: 400,
+      deliveryTimeoutMs: 100,
+      random: () => 1,
+    });
+    await drain.tick();
+    expect(seen?.aborted).toBe(true);
+    expect(store.snapshot().map((r) => r.status)).toEqual([
+      'PENDING',
+      'PENDING',
+    ]);
+    expect(store.snapshot()[0].lastError).toMatch(/timed out/);
+  });
+
+  it('kinds without a batch limit keep the single-row path', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await store.enqueue({
+      conversationRef: A,
+      kind: 'REQUEST_CREATE',
+      idempotencyKey: 'c1',
+      payload: {},
+    });
+    await store.enqueue({
+      conversationRef: A,
+      kind: 'REQUEST_CREATE',
+      idempotencyKey: 'c2',
+      payload: {},
+    });
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 });
+    const drain = worker(store, delivery);
+    await drain.tick();
+    await drain.tick();
+    expect(delivery.calls).toEqual([]);
+    expect(delivery.singles).toEqual(['c1', 'c2']);
+  });
+
+  it('a plain delivery port (no deliverBatch) stays on the single-row path', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 3);
+    const delivery = new ScriptedDelivery(() => ({ outcome: 'DELIVERED' }));
+    const drain = worker(store, delivery);
+    await drain.tick();
+    expect(delivery.delivered).toEqual([`${A}-1`]);
+  });
+
+  it('different conversations batch independently in one tick', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 3, A);
+    await fill(store, 2, B);
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 });
+    await expect(worker(store, delivery).tick()).resolves.toBe(2);
+    expect(
+      delivery.calls
+        .map((call) => [call[0].conversationRef, call.length])
+        .sort(),
+    ).toEqual([
+      [A, 3],
+      [B, 2],
+    ]);
+  });
+
+  it('a lost lease on one row of a batch is logged and does not undo the others', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 2);
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 });
+    const original = store.completeMany.bind(store);
+    jest.spyOn(store, 'completeMany').mockImplementation(async (items) => {
+      const results = await original(items);
+      return results.map((ok, index) => (index === 0 ? false : ok));
+    });
+    await worker(store, delivery).tick();
+    expect(Logger.prototype.warn).toHaveBeenCalledWith(
+      expect.stringContaining('lease lost'),
+    );
+  });
+
+  it('a failing run claim falls back to delivering the head alone (no stuck lease)', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 3);
+    jest.spyOn(store, 'claimRun').mockRejectedValue(new Error('db down'));
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 50 });
+    await worker(store, delivery).tick();
+    expect(delivery.calls).toEqual([]);
+    expect(delivery.singles).toEqual([`${A}-1`]);
+    expect(store.snapshot().map((r) => r.status)).toEqual([
+      'DONE',
+      'PENDING',
+      'PENDING',
+    ]);
+  });
+
+  it('a full batch makes the loop go again immediately', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await fill(store, 4);
+    const delivery = new ScriptedBatchDelivery({ MESSAGE_MIRROR: 2 });
+    const drain = new BackendOutboxDrainWorker(store, delivery, {
+      owner: 'backend-outbox:test',
+      idleDelayMs: 60_000,
+      random: () => 1,
+    });
+    drain.start();
+    for (let i = 0; i < 200 && delivery.calls.length < 2; i++)
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    await drain.stop();
+    // Two full batches ran back to back although the idle delay is 60 s.
+    expect(delivery.calls.map((c) => c.length)).toEqual([2, 2]);
   });
 });

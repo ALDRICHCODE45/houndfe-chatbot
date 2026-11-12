@@ -66,6 +66,11 @@ export interface BackendOutboxEnqueueInput {
   kind: BackendOutboxKind;
   idempotencyKey: string;
   payload: Record<string, unknown>;
+  /**
+   * The row is not due before this many ms (default: due now). Order stays
+   * strict: it delays only the rows queued behind it in its lane.
+   */
+  delayMs?: number;
 }
 
 export interface BackendOutboxEnqueueResult {
@@ -80,6 +85,17 @@ export type ClaimedBackendOutboxEntry = BackendOutboxEntry & {
   leaseOwner: string;
   leaseExpiresAt: Date;
 };
+
+/** How one row of a claimed batch ends (applied atomically with its peers). */
+export type BackendOutboxCompletion =
+  | { entry: ClaimedBackendOutboxEntry; outcome: 'DONE' }
+  | {
+      entry: ClaimedBackendOutboxEntry;
+      outcome: 'RETRY';
+      delayMs: number;
+      error: string;
+    }
+  | { entry: ClaimedBackendOutboxEntry; outcome: 'DEAD'; error: string };
 
 export const BACKEND_OUTBOX_STORE = Symbol('BACKEND_OUTBOX_STORE');
 
@@ -106,6 +122,30 @@ export interface BackendOutboxStore {
     owner: string,
     leaseMs: number,
   ): Promise<ClaimedBackendOutboxEntry[]>;
+
+  /**
+   * Batched claim (backend unit 9): for the lane of an already claimed
+   * `head`, claims the contiguous run of open rows of the SAME kind behind it
+   * (seq order, DONE/DEAD rows and rows of other lanes skipped; the run stops
+   * at the first open row of another kind or one that is not due), at most
+   * `maxRows` including the head. The head and every follower get the same
+   * fresh lease, so the whole run is one unit for expiry. Returns `[]` when
+   * the head's own lease was lost or `maxRows` is invalid. Followers whose
+   * lease expired (a crashed batch) are taken over together with the head.
+   */
+  claimRun(
+    head: ClaimedBackendOutboxEntry,
+    owner: string,
+    leaseMs: number,
+    maxRows: number,
+  ): Promise<ClaimedBackendOutboxEntry[]>;
+
+  /**
+   * Applies DONE / RETRY / DEAD to many claimed rows in one atomic statement,
+   * each fenced by its own (owner, leaseExpiresAt). The result is aligned
+   * with `items`: `false` means that row's lease was lost (not applied).
+   */
+  completeMany(items: readonly BackendOutboxCompletion[]): Promise<boolean[]>;
 
   /** The completion calls are fenced by (owner, leaseExpiresAt). */
   markDone(entry: ClaimedBackendOutboxEntry): Promise<boolean>;
@@ -136,6 +176,30 @@ export interface BackendOutboxDeliveryPort {
   deliver(entry: BackendOutboxEntry): Promise<BackendOutboxDeliveryResult>;
 }
 
+/** Optional batch extension of the delivery port (one HTTP call per run). */
+export interface BackendOutboxBatchDeliveryPort extends BackendOutboxDeliveryPort {
+  /** Max rows delivered per call for a kind; `1` (or less) means single rows. */
+  batchLimit(kind: BackendOutboxKind): number;
+  /**
+   * Delivers a contiguous same-kind run of ONE conversation lane, in seq
+   * order; the result is aligned with `entries`. A thrown error or timeout
+   * counts as RETRY for every row. `signal` aborts when the worker's budget
+   * for the call is nearly spent: return the unfinished rows as RETRY.
+   */
+  deliverBatch(
+    entries: readonly BackendOutboxEntry[],
+    options?: { signal?: AbortSignal },
+  ): Promise<BackendOutboxDeliveryResult[]>;
+}
+
+export const isBatchDelivery = (
+  delivery: BackendOutboxDeliveryPort,
+): delivery is BackendOutboxBatchDeliveryPort =>
+  typeof (delivery as Partial<BackendOutboxBatchDeliveryPort>).deliverBatch ===
+    'function' &&
+  typeof (delivery as Partial<BackendOutboxBatchDeliveryPort>).batchLimit ===
+    'function';
+
 const CONVERSATION_REF = /^wa:[0-9]{6,20}$/;
 export const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
 export const MAX_LAST_ERROR_LENGTH = 1000;
@@ -164,6 +228,11 @@ export function assertEnqueueInput(input: BackendOutboxEnqueueInput): void {
     Array.isArray(input.payload)
   )
     throw new TypeError('backend outbox: payload must be a JSON object');
+  if (
+    input.delayMs !== undefined &&
+    (!Number.isFinite(input.delayMs) || input.delayMs < 0)
+  )
+    throw new RangeError('backend outbox: invalid delayMs');
 }
 
 export const truncateError = (error: string): string =>

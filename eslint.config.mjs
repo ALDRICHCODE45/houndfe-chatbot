@@ -33,6 +33,12 @@ export default tseslint.config(
     },
   },
   {
+    // node-pg-migrate migrations are plain CommonJS outside the TS project:
+    // lint them without type information.
+    files: ['migrations/**/*.js'],
+    ...tseslint.configs.disableTypeChecked,
+  },
+  {
     files: ['**/*.spec.ts', 'test/**/*.ts'],
     rules: {
       '@typescript-eslint/unbound-method': 'off',
