@@ -33,7 +33,11 @@ exports.up = (pgm) => {
     digest: { type: 'jsonb', notNull: true },
     status: { type: 'text', notNull: true, default: 'pending' },
     resolution: { type: 'jsonb' },
-    created_at: { type: 'timestamptz', notNull: true, default: pgm.func('now()') },
+    created_at: {
+      type: 'timestamptz',
+      notNull: true,
+      default: pgm.func('now()'),
+    },
     resolved_at: { type: 'timestamptz' },
   });
   pgm.createIndex('human_handoff_requests', ['status', 'created_at']);
