@@ -447,6 +447,136 @@ describe('MirrorMessagesDelivery (T4)', () => {
       ]);
     });
 
+    describe('persistent MEDIA_NOT_FOUND never blocks the lane', () => {
+      /** The backend keeps refusing the media of these messages. */
+      const failing = (bad: string[]) => (call: Call) =>
+        call.messages.some((m) => bad.includes(m.waMessageId) && m.mediaId)
+          ? ({ kind: 'MEDIA_NOT_FOUND' } as const)
+          : okAck(call.messages);
+      const withAttempts = (
+        seq: number,
+        payload: Record<string, unknown>,
+        attempts: number,
+      ) => rowEntry(seq, payload, 'MESSAGE_MIRROR', { attempts });
+
+      it('below the attempt cap (2 retries) every row keeps the plain RETRY, no isolation calls', async () => {
+        const { delivery, calls } = build(failing(['wamid.2']));
+        const results = await delivery.deliverBatch([
+          rowEntry(1, textPayload('wamid.1')),
+          withAttempts(2, imagePayload('wamid.2'), 2),
+          rowEntry(3, textPayload('wamid.3')),
+        ]);
+        expect(results).toEqual([
+          { outcome: 'RETRY', error: contains('MEDIA_NOT_FOUND') },
+          { outcome: 'RETRY', error: contains('MEDIA_NOT_FOUND') },
+          { outcome: 'RETRY', error: contains('MEDIA_NOT_FOUND') },
+        ]);
+        expect(calls).toHaveLength(2);
+        expect(warnLog).not.toHaveBeenCalled();
+      });
+
+      it('at the cap (3 retries) that message is mirrored as UNSUPPORTED OTHER and the rest of the batch is DELIVERED', async () => {
+        const { delivery, calls } = build(failing(['wamid.2']));
+        const results = await delivery.deliverBatch([
+          rowEntry(1, textPayload('wamid.1')),
+          withAttempts(2, imagePayload('wamid.2'), 3),
+          rowEntry(3, textPayload('wamid.3')),
+          rowEntry(4, imagePayload('wamid.4', 'meta-4')),
+        ]);
+        expect(outcomes(results)).toEqual([
+          'DELIVERED',
+          'DELIVERED',
+          'DELIVERED',
+          'DELIVERED',
+        ]);
+        const delivered = calls
+          .filter(
+            (c) =>
+              !c.messages.some((m) => m.waMessageId === 'wamid.2' && m.mediaId),
+          )
+          .flatMap((c) => c.messages);
+        const degraded = delivered.find((m) => m.waMessageId === 'wamid.2');
+        expect(degraded).toMatchObject({ type: 'UNSUPPORTED', kind: 'OTHER' });
+        expect(degraded?.mediaId).toBeUndefined();
+        expect(degraded?.text).toBeUndefined();
+        // the good photo of the same batch still goes out as an image
+        expect(
+          delivered.find((m) => m.waMessageId === 'wamid.4'),
+        ).toMatchObject({ type: 'IMAGE', mediaId: MEDIA_ID });
+        expect(calls.length).toBeLessThanOrEqual(30);
+      });
+
+      it('a single row at the cap is mirrored as UNSUPPORTED OTHER, never DEAD', async () => {
+        const { delivery } = build(failing(['wamid.1']));
+        const results = await delivery.deliverBatch([
+          withAttempts(1, imagePayload('wamid.1'), 7),
+        ]);
+        expect(results).toEqual([{ outcome: 'DELIVERED' }]);
+      });
+
+      it('rows after a below-cap offender are RETRY too (backend seq order is kept)', async () => {
+        const { delivery, calls } = build(failing(['wamid.2', 'wamid.3']));
+        const results = await delivery.deliverBatch([
+          rowEntry(1, textPayload('wamid.1')),
+          withAttempts(2, imagePayload('wamid.2'), 0),
+          withAttempts(3, imagePayload('wamid.3'), 3),
+        ]);
+        expect(outcomes(results)).toEqual(['DELIVERED', 'RETRY', 'RETRY']);
+        const sentLast = calls.flatMap((c) => c.messages);
+        expect(
+          calls
+            .filter((c) => c.messages.some((m) => m.waMessageId === 'wamid.3'))
+            .every((c) => c.messages.some((m) => m.waMessageId === 'wamid.2')),
+        ).toBe(true);
+        expect(sentLast.length).toBeGreaterThan(0);
+      });
+
+      it('the lane is not blocked afterwards: the row retries, is mirrored as UNSUPPORTED, and a later row of the lane is delivered', async () => {
+        const { delivery } = build(failing(['wamid.1']));
+        const attempts = [0, 1, 2, 3];
+        const seen: string[] = [];
+        for (const attempt of attempts) {
+          const [result] = await delivery.deliverBatch([
+            withAttempts(1, imagePayload('wamid.1'), attempt),
+          ]);
+          seen.push(result.outcome);
+        }
+        expect(seen).toEqual(['RETRY', 'RETRY', 'RETRY', 'DELIVERED']);
+        const later = await delivery.deliverBatch([
+          rowEntry(2, textPayload('wamid.2')),
+        ]);
+        expect(outcomes(later)).toEqual(['DELIVERED']);
+        expect(seen).not.toContain('PERMANENT');
+      });
+
+      it('finds the offender among 50 media rows inside the 30-call budget', async () => {
+        const entries = Array.from({ length: 50 }, (_, i) =>
+          withAttempts(
+            i + 1,
+            imagePayload(`wamid.${i + 1}`),
+            i + 1 === 37 ? 3 : 0,
+          ),
+        );
+        const { delivery, calls } = build(failing(['wamid.37']));
+        const results = await delivery.deliverBatch(entries);
+        expect(outcomes(results)).toEqual(entries.map(() => 'DELIVERED'));
+        expect(calls.length).toBeLessThanOrEqual(30);
+      });
+
+      it('logs a masked warning: no phone, no wamid', async () => {
+        const { delivery } = build(failing(['wamid.2']));
+        await delivery.deliverBatch([
+          withAttempts(2, imagePayload('wamid.2'), 3),
+        ]);
+        expect(warnLog).toHaveBeenCalledTimes(1);
+        const text = String((warnLog.mock.calls as unknown[][])[0][0]);
+        expect(text).toContain('wa:…1111');
+        expect(text).not.toContain('5550001111');
+        expect(text).not.toContain('wamid');
+        expect(text).toContain('UNSUPPORTED');
+      });
+    });
+
     it('MEDIA_NOT_FOUND where the forced upload says unsupported mirrors that row as UNSUPPORTED', async () => {
       let first = true;
       const { delivery, calls } = build(

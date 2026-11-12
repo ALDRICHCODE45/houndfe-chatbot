@@ -5,6 +5,7 @@ import type {
   BackendOutboxEntry,
   BackendOutboxKind,
 } from '../../backend-outbox/domain/backend-outbox';
+import { maskConversationRef } from '../../human-requests/domain/human-request-feed';
 import type { ConversationMirrorClient } from '../../chatbot-api/domain/conversation-mirror.port';
 import {
   MIRROR_MAX_MESSAGES,
@@ -24,8 +25,19 @@ import type { MirrorDeliveryGate } from './mirror-delivery-gate';
 import { mapMirrorEntry } from './mirror-message-mapper';
 import type { MirrorMediaService } from './mirror-media.service';
 
+/**
+ * A media row whose file the backend keeps answering `422 MEDIA_NOT_FOUND`
+ * for, after a forced re-upload and a resend, is retried this many times (the
+ * outbox row's attempts); then it is mirrored as UNSUPPORTED OTHER so it
+ * cannot block the rest of its conversation lane.
+ */
+export const MEDIA_NOT_FOUND_MAX_ATTEMPTS = 3;
+
 interface MirrorItem {
   message: MirrorMessageInput;
+  /** Attempts the outbox row has already used. */
+  attempts: number;
+  conversationRef: string;
   media?: { payload: unknown; type: MirrorMediaContractType };
   /** The media was already re-uploaded with `force` in this run. */
   forced: boolean;
@@ -91,7 +103,13 @@ export class MirrorMessagesDelivery implements BackendOutboxBatchDeliveryPort {
       }
       items.push({
         index,
-        value: { message: mapped.message, media: mapped.media, forced: false },
+        value: {
+          message: mapped.message,
+          media: mapped.media,
+          forced: false,
+          attempts: entry.attempts,
+          conversationRef: entry.conversationRef,
+        },
       });
     });
 
@@ -124,6 +142,15 @@ export class MirrorMessagesDelivery implements BackendOutboxBatchDeliveryPort {
         needsMediaRefresh: (batch) =>
           batch.some((i) => i.value.media !== undefined && !i.value.forced),
         refreshMedia: (batch) => this.resolveMedia(batch, true, options.signal),
+        carriesMedia: (item) => item.value.media !== undefined,
+        mediaRetriesExhausted: (item) =>
+          item.value.attempts >= MEDIA_NOT_FOUND_MAX_ATTEMPTS,
+        degradeMedia: (item) => {
+          this.logger.warn(
+            `mirror media still not found after ${item.value.attempts} retries (${maskConversationRef(item.value.conversationRef)}#${item.index}): message mirrored as UNSUPPORTED`,
+          );
+          toUnsupported(item.value);
+        },
       },
       entries.length,
       preset,

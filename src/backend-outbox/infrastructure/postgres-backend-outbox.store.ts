@@ -79,9 +79,9 @@ RETURNING o.*`;
  * EXPLAIN reasoning (no migration): the lateral scan filters
  * (conversation_ref = h.conversation_ref, lane, open status, seq >= h.seq)
  * ORDER BY seq LIMIT n, which `backend_outbox_open_heads_idx`
- * (conversation_ref, seq) WHERE status IN ('PENDING','IN_FLIGHT') serves as
- * an ordered index range scan of at most n rows of one conversation (the lane
- * is a cheap filter: only that conversation's open rows are visited). The
+ * (conversation_ref, lane, seq) WHERE status IN ('PENDING','IN_FLIGHT')
+ * (migrations/4400000000000_backend_outbox_lanes.js) serves as an ordered
+ * index range scan of at most n rows of that (conversation, lane). The
  * window `bool_and(...) OVER (ORDER BY seq)` is true up to the first row that
  * is of another kind or not due, i.e. the contiguous run; the id lookups that
  * lock and update it use the primary key. Followers cannot be claimed by any

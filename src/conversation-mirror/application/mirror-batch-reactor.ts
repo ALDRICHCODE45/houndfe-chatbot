@@ -9,7 +9,11 @@ import type { MirrorDeliveryGate } from './mirror-delivery-gate';
  *   413 BATCH_TOO_LARGE /
  *   413 BODY_TOO_LARGE      → halve and resend (a single row is DEAD)
  *   422 MEDIA_NOT_FOUND     → re-upload every media (force) and resend once,
- *                             then RETRY (bounded)
+ *                             then RETRY (bounded). When a media row has been
+ *                             retried up to its cap, bisect to the offender
+ *                             and degrade THAT row (never DEAD) so it cannot
+ *                             block its lane; a below-cap offender RETRYs
+ *                             with everything after it (seq order is kept)
  *   400 / 409 / 422 type    → isolate: bisect to the offending row(s), DEAD
  *                             only those, deliver the rest. A failing batch
  *                             whose left half succeeded knows the right half
@@ -60,16 +64,30 @@ export interface BatchReactorDeps<T> {
   refreshMedia?(
     items: BatchItem<T>[],
   ): Promise<BackendOutboxDeliveryResult | undefined>;
+  /** Mirror only: does this row still carry a media file? */
+  carriesMedia?(item: BatchItem<T>): boolean;
+  /** Mirror only: has this media row been retried up to its cap? */
+  mediaRetriesExhausted?(item: BatchItem<T>): boolean;
+  /** Mirror only: strip the media so the row is mirrored as UNSUPPORTED. */
+  degradeMedia?(item: BatchItem<T>): void;
 }
 
 export const DEFAULT_MAX_CALLS = 30;
 
 export const DELIVERED: BackendOutboxDeliveryResult = { outcome: 'DELIVERED' };
 
+const MEDIA_NOT_FOUND_RETRY: BackendOutboxDeliveryResult = {
+  outcome: 'RETRY',
+  error: '422 MEDIA_NOT_FOUND',
+};
+
 export class BatchReactor<T> {
   private readonly results: Array<BackendOutboxDeliveryResult | undefined>;
   private halted: BackendOutboxDeliveryResult | undefined;
   private calls = 0;
+  /** Media rows degraded to UNSUPPORTED in this run. */
+  private degraded = 0;
+  private isolatingMedia = false;
   private readonly maxCalls: number;
 
   constructor(
@@ -218,17 +236,63 @@ export class BatchReactor<T> {
   private async mediaNotFound(items: BatchItem<T>[]): Promise<void> {
     const { deps } = this;
     if (
-      deps.refreshMedia === undefined ||
-      deps.needsMediaRefresh === undefined ||
-      !deps.needsMediaRefresh(items)
-    )
-      return this.setAll(items, {
-        outcome: 'RETRY',
-        error: '422 MEDIA_NOT_FOUND',
-      });
-    const halted = await deps.refreshMedia(items);
-    if (halted !== undefined) return this.halt(items, halted);
-    return this.process(items);
+      deps.refreshMedia !== undefined &&
+      deps.needsMediaRefresh !== undefined &&
+      deps.needsMediaRefresh(items)
+    ) {
+      const halted = await deps.refreshMedia(items);
+      if (halted !== undefined) return this.halt(items, halted);
+      return this.process(items);
+    }
+    // Still not found after the forced re-upload. Isolating only pays when a
+    // media row may be degraded; below every cap the whole run just retries.
+    if (
+      deps.carriesMedia !== undefined &&
+      deps.mediaRetriesExhausted !== undefined &&
+      deps.degradeMedia !== undefined &&
+      // once isolating, keep bisecting: a prefix may still go through
+      (this.isolatingMedia ||
+        items.some(
+          (item) =>
+            deps.carriesMedia!(item) && deps.mediaRetriesExhausted!(item),
+        ))
+    ) {
+      this.isolatingMedia = true;
+      return this.isolateMedia(items);
+    }
+    // halt: rows after these must not overtake them (backend seq = order)
+    return this.halt(items, MEDIA_NOT_FOUND_RETRY);
+  }
+
+  /** Bisect a run whose media is still not found. When the left half goes
+   *  through cleanly the right half holds the offender, so it is bisected
+   *  without being sent whole (one call per level). */
+  private async isolateMedia(items: BatchItem<T>[]): Promise<void> {
+    const { deps } = this;
+    if (this.halted !== undefined) return this.setAll(items, this.halted);
+    if (items.length === 1) {
+      const [item] = items;
+      if (!deps.carriesMedia!(item))
+        return this.halt(items, MEDIA_NOT_FOUND_RETRY);
+      if (!deps.mediaRetriesExhausted!(item))
+        // Later rows must not overtake it: backend seq follows array order.
+        return this.halt(items, MEDIA_NOT_FOUND_RETRY);
+      deps.degradeMedia!(item);
+      this.degraded += 1;
+      return this.process(items);
+    }
+    const mid = Math.ceil(items.length / 2);
+    const left = items.slice(0, mid);
+    const right = items.slice(mid);
+    const degradedBefore = this.degraded;
+    await this.process(left);
+    // Known bad only when the left went through untouched: a degraded row in
+    // it may have been the offender (the right half is then sent whole).
+    const leftClean =
+      this.degraded === degradedBefore &&
+      left.every((item) => this.results[item.index]?.outcome === 'DELIVERED');
+    if (leftClean) return this.isolateMedia(right);
+    return this.process(right);
   }
 
   private stop(
