@@ -16,9 +16,10 @@ Contract: houndfe-backend `docs/chatbot-handoff/chatbot-requests-bot-contract.md
 | ID  | Specs  | Route                                                                                                                               | Commit  |
 | --- | ------ | ----------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | T1  | S1–S3  | worker: parse `replyId`, carry it to the OUT mirror row as `staffReplyId`, send it in messages:batch, isolate `422 REPLY_NOT_FOUND` | bea1411 |
-| T2  | S4, S5 | E2E with the backend on dev                                                                                                         | —       |
+| T2  | S4, S5 | E2E with the backend on dev                                                                                                         | da26d71 |
 
 ## Log
 
 - **L1 (owner, 2026-11-12):** "Como tu lo recomiendes hermano." — in reply to the recommendation to do unit 10 first (handler must ship before staff reply on dev).
 - **L2 (T1 done, 2026-11-12):** bea1411 — replyId → sendText → transcript details → mirror payload → staffReplyId; REPLY_NOT_FOUND isolation resends as BOT. Contract gaps fixed: CLARIFICATION now closes the registry row (RESOLVED); relay staffText (fallback text). A clarification without conversationRef stays STALE NO_CONVERSATION (cannot be sent, so never mirrored). RED 17 failing before; full suite 8481 passed.
+- **L3 (T2 E2E passed on both sides, 2026-11-12):** da26d71 — dev :3003 (backend d9986b9b). Request 7075e9b6 (S-000007) replied by manager (implicit claim, RESOLVED); cursor 7 request.answered CLARIFICATION handled by the real consumer + delivery + MetaWhatsappSender (stub transport), ACK PROVIDER_ACCEPTED 200; sent text with the usted team prefix; one messages:batch call 200 with staffReplyId on the OUT TEXT; staffReplyId never in the Meta payload. Backend staff read: author STAFF (Manager Centro), text exactly the staff reply without our prefix, no phone in the response. Unit 10 closed.

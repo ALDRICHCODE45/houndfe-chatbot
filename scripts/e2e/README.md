@@ -50,6 +50,24 @@ Arguments:
 | `--request <id>`                         | none             | Repeatable. Request ids to wait for in `--phase consume`                                                     |
 | `--updated-since <ISO>`                  | none             | `--phase recovery` only: `updatedSince` (canonical UTC ms, e.g. `2026-11-10T00:00:00.000Z`)                  |
 
+### `--phase clarification` (unit 10 T2)
+
+Consumes the staff clarification reply (`request.answered`, kind `CLARIFICATION`) of ONE request created earlier, sends it, ACKs it and mirrors it with `staffReplyId`:
+
+```sh
+pnpm e2e:human-requests --phase create --phone 5550006666
+# ... staff replies on the backend (give them the cursor just before the item) ...
+pnpm -s e2e:human-requests --phase clarification --request <requestId> --phone 5550006666 --minutes 10
+pnpm -s e2e:human-requests --phase clarification --request <requestId> --phone 5550006666 --after <cursor-before-the-item>
+```
+
+- `--request` is required (exactly one). `--minutes` defaults to 10. `--after` starts right after that feed cursor (12 digits, e.g. `000000000006`) instead of the tail, so a reply that arrives before the consumer is listening is not missed.
+- `[consume] listening cursor=…` is written with `writeSync` as soon as the start cursor is known, so a background log shows it at once.
+- Sender: the REAL `MetaWhatsappSender` over a stub `HttpService.post` that returns `wamid.e2e-<runId>-<n>` (Meta is never called). Its production transcript path runs unchanged (`staffReplyId` → `details.staffReplyId`), into the real `TranscriptRecorder` (in-memory transcript store, `InMemoryBackendOutboxStore`). The 24 h window is a stub (always open).
+- Once the item is handled and ACKed, the outbox is drained with the real `BackendOutboxDrainWorker`, `RoutingBackendOutboxDelivery`, `MirrorMessagesDelivery`, `MirrorStatusesDelivery` and `MirrorMediaService` against the real `ChatbotApiHttpClient`. An axios interceptor records the `messages:batch` status and whether each message body carried `staffReplyId` (never headers or keys).
+- Output: `[result] item` (type, kind, replyId), `[result] ack` (outcome, state, HTTP), `[result] sent` (text, and whether `staffReplyId` leaked into the Meta payload), `[outbox]` final states, `[mirror]` the batch call, `[result] mirror` (OUT `waMessageId`, `staffReplyIdPresent`), `[summary]`.
+- Exit code 1 when the item kind is not `CLARIFICATION`, the ACK is not `PROVIDER_ACCEPTED` with HTTP 200, no `messages:batch` call returned 200, `staffReplyId` is missing from the mirror body or leaked into the Meta payload, or an outbox row is not DONE.
+
 Output lines:
 
 - `[create.*]`: the request id and folio.
