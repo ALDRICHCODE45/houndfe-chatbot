@@ -13,11 +13,12 @@ Contract: houndfe-backend `docs/chatbot-handoff/chatbot-requests-bot-contract.md
 
 ## Tasks
 
-| ID  | Specs  | Route                                                                                                                               | Commit |
-| --- | ------ | ----------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| T1  | S1–S3  | worker: parse `replyId`, carry it to the OUT mirror row as `staffReplyId`, send it in messages:batch, isolate `422 REPLY_NOT_FOUND` | —      |
-| T2  | S4, S5 | E2E with the backend on dev                                                                                                         | —      |
+| ID  | Specs  | Route                                                                                                                               | Commit  |
+| --- | ------ | ----------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| T1  | S1–S3  | worker: parse `replyId`, carry it to the OUT mirror row as `staffReplyId`, send it in messages:batch, isolate `422 REPLY_NOT_FOUND` | bea1411 |
+| T2  | S4, S5 | E2E with the backend on dev                                                                                                         | —       |
 
 ## Log
 
 - **L1 (owner, 2026-11-12):** "Como tu lo recomiendes hermano." — in reply to the recommendation to do unit 10 first (handler must ship before staff reply on dev).
+- **L2 (T1 done, 2026-11-12):** bea1411 — replyId → sendText → transcript details → mirror payload → staffReplyId; REPLY_NOT_FOUND isolation resends as BOT. Contract gaps fixed: CLARIFICATION now closes the registry row (RESOLVED); relay staffText (fallback text). A clarification without conversationRef stays STALE NO_CONVERSATION (cannot be sent, so never mirrored). RED 17 failing before; full suite 8481 passed.
