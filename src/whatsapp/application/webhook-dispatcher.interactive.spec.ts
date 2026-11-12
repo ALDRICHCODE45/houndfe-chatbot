@@ -243,6 +243,7 @@ describe('normalizeInboundMessages interactive replies (S4)', () => {
         timestamp: new Date(1719000000 * 1000).toISOString(),
         receivingPhoneNumberId: '123456789012345',
         interactiveReplyId: id,
+        interactiveReplyTitle: title,
       },
     ]);
   });

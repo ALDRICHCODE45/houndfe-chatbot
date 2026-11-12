@@ -45,7 +45,12 @@ import { checkHandoffSendHold } from '../../conversation/application/handoff-sen
 import { maskConversationRef } from '../../human-requests/domain/human-request-feed';
 import { HumanRequestDeliveryService } from '../../human-requests/application/human-request-delivery.service';
 import { normalizeMetaStatuses } from './meta-status-normalizer';
-import { InboundMessage, InboundMedia } from '../domain/inbound-message';
+import {
+  InboundMessage,
+  InboundMedia,
+  InboundMirrorOnly,
+} from '../domain/inbound-message';
+import { AUDIO_UNSUPPORTED_REPLY } from '../domain/inbound-reply-copy';
 import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import { RECENT_OUTBOUND } from '../domain/recent-outbound.store';
@@ -189,6 +194,21 @@ export class WebhookDispatcherService {
       // before any claim or reply, so Meta redelivers the message.
       await this.recordInbound(message, rawTypes.get(message.messageId));
 
+      // ─── (1c) T2 mirror-only silent types ─────────────────────────
+      // Sticker, video and location (and any ops-phone audio) are recorded
+      // for the inbox only: no claim, no reply, never the agent. The mirror
+      // is idempotent on the wamid, so a redelivery needs no dedup row.
+      if (
+        message.mirrorOnly !== undefined &&
+        (message.mirrorOnly.type !== 'audio' ||
+          this.humanHandoff.isOpsSender(message.senderId))
+      ) {
+        this.logger.debug(
+          `mirror-only ${message.mirrorOnly.type} ${message.messageId} from ${maskConversationRef(message.senderId)}`,
+        );
+        continue;
+      }
+
       // ─── (2) Dedup claim (S6) ───────────────────────────────────────
       // Atomic: of two concurrent deliveries only one gets a token; null
       // means DONE. A claim failure, or a live claim held by another
@@ -313,6 +333,20 @@ export class WebhookDispatcherService {
               }`,
             );
           }
+          continue;
+        }
+
+        // ─── T2 / S7: voice note, nobody attending ─────────────────────
+        // The audio is already mirrored; the bot only asks the customer to
+        // write it. It never reaches the agent, ingress or vision.
+        if (message.mirrorOnly?.type === 'audio') {
+          await this.replyAndMarkSeen(
+            message,
+            applyCustomerStyle(
+              AUDIO_UNSUPPORTED_REPLY,
+              this.customerStyle(message),
+            ),
+          );
           continue;
         }
 
@@ -828,6 +862,40 @@ export function normalizeInboundMessages(
               ...(reply.id === undefined
                 ? {}
                 : { interactiveReplyId: reply.id }),
+              ...(reply.title === undefined
+                ? {}
+                : { interactiveReplyTitle: reply.title }),
+            },
+          ];
+        }
+
+        // ── T2: audio / sticker / video / location (mirror only) ───
+        if (
+          (message.type === 'audio' ||
+            message.type === 'sticker' ||
+            message.type === 'video' ||
+            message.type === 'location') &&
+          typeof message.id === 'string' &&
+          typeof message.timestamp === 'string'
+        ) {
+          const mirrorOnly = normalizeMirrorOnly(message, message.type);
+          const senderId = message.from ?? fallbackSenderId;
+          if (
+            mirrorOnly === null ||
+            typeof senderId !== 'string' ||
+            senderId.length === 0
+          ) {
+            return [];
+          }
+          return [
+            {
+              senderId,
+              text: '',
+              messageId: message.id,
+              timestamp: normalizeTimestamp(message.timestamp),
+              receivingPhoneNumberId,
+              ...profileNameOf(senderId),
+              mirrorOnly,
             },
           ];
         }
@@ -889,10 +957,12 @@ function rawMessageTypes(event: WebhookEventDto): Map<string, string> {
  */
 function normalizeInteractiveReply(
   message: WebhookMessageDto,
-): { text: string; id?: string } | null {
+): { text: string; id?: string; title?: string } | null {
   if (message.type === 'button') {
     const text = message.button?.text;
-    return typeof text === 'string' && text.trim() !== '' ? { text } : null;
+    return typeof text === 'string' && text.trim() !== ''
+      ? { text, title: text }
+      : null;
   }
   const interactive = message.interactive;
   const reply =
@@ -904,7 +974,45 @@ function normalizeInteractiveReply(
   const id = reply?.id;
   if (typeof id !== 'string' || id === '') return null;
   const text = interactiveReplyText(id, reply?.title);
-  return text.trim() === '' ? null : { text, id };
+  const title = reply?.title;
+  return text.trim() === ''
+    ? null
+    : {
+        text,
+        id,
+        ...(typeof title === 'string' && title.trim() !== '' ? { title } : {}),
+      };
+}
+
+/**
+ * T2: the mirror marker of an audio, sticker, video or location message.
+ * Audio and sticker need the Meta media id and mime type (the media pipeline
+ * downloads them); without them the message is dropped like a malformed
+ * image. Video and location are markers only.
+ */
+function normalizeMirrorOnly(
+  message: WebhookMessageDto,
+  type: InboundMirrorOnly['type'],
+): InboundMirrorOnly | null {
+  if (type === 'video' || type === 'location') return { type };
+  const payload = type === 'audio' ? message.audio : message.sticker;
+  if (
+    !payload ||
+    typeof payload.id !== 'string' ||
+    payload.id.length === 0 ||
+    typeof payload.mime_type !== 'string' ||
+    payload.mime_type.length === 0
+  ) {
+    return null;
+  }
+  return {
+    type,
+    providerMediaId: payload.id,
+    mimeType: payload.mime_type,
+    ...(type === 'audio' && message.audio?.voice === true
+      ? { voice: true }
+      : {}),
+  };
 }
 
 function normalizeTimestamp(timestamp: string): string {

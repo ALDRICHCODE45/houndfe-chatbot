@@ -28,6 +28,18 @@ export interface InboundMessage {
    */
   interactiveReplyId?: string;
   /**
+   * T2: the title of the tapped button or list row exactly as the customer
+   * saw it (`text` may stand for something else, e.g. "SÍ"). The mirror
+   * records this one.
+   */
+  interactiveReplyTitle?: string;
+  /**
+   * T2: audio, sticker, video or location. Recorded and mirrored for the
+   * human inbox, never given to the agent, receipt ingress or vision (`text`
+   * is empty and `media` stays unset).
+   */
+  mirrorOnly?: InboundMirrorOnly;
+  /**
    * S1: the sender's WhatsApp contact profile name (`contacts[].profile.name`
    * for this wa_id), when Meta sent a non-blank one. Customer-controlled text.
    */
@@ -46,4 +58,17 @@ export interface InboundMedia {
   readonly caption?: string;
   readonly filename?: string;
   readonly sha256?: string;
+}
+
+/**
+ * T2: a customer message the bot cannot process but staff must see. The Meta
+ * media id and mime type are kept for audio and sticker so the media pipeline
+ * can download them; video and location are markers only.
+ */
+export interface InboundMirrorOnly {
+  readonly type: 'audio' | 'sticker' | 'video' | 'location';
+  readonly providerMediaId?: string;
+  readonly mimeType?: string;
+  /** Audio only: Meta flags a recorded voice note with `voice: true`. */
+  readonly voice?: boolean;
 }

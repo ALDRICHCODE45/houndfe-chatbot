@@ -3,7 +3,7 @@ import { BackendOutboxService } from '../../backend-outbox/application/backend-o
 import { InMemoryBackendOutboxStore } from '../../backend-outbox/infrastructure/in-memory-backend-outbox.store';
 import type { InboundMessage } from '../../whatsapp/domain/inbound-message';
 import { InMemoryTranscriptStore } from '../infrastructure/in-memory-transcript.store';
-import { TranscriptRecorder } from './transcript-recorder';
+import { mirrorPayload, TranscriptRecorder } from './transcript-recorder';
 
 /** S1→S2: every inserted transcript row is mirrored through the outbox. */
 const SENDER = '5215550001111';
@@ -55,6 +55,7 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
           direction: 'IN',
           author: 'CUSTOMER',
           type: 'text',
+          contractType: 'TEXT',
           text: 'hola',
           providerTimestamp: '2026-11-09T16:02:11.000Z',
           observedAt: '2026-11-09T16:02:12.345Z',
@@ -84,6 +85,7 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
       direction: 'IN',
       author: 'CUSTOMER',
       type: 'document',
+      contractType: 'DOCUMENT',
       media: {
         providerMediaId: 'media-9',
         mimeType: 'application/pdf',
@@ -94,7 +96,7 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
     });
   });
 
-  it('an inserted outbound enqueues one OUT/BOT mirror without a provider time', async () => {
+  it('an inserted outbound enqueues one OUT/BOT mirror stamped with the time Meta accepted it', async () => {
     await recorder.recordOutbound({
       to: SENDER,
       providerMessageId: 'wamid.out-1',
@@ -102,6 +104,7 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
       text: 'Aquí está',
       media: { link: 'https://cdn.example.com/p.jpg' },
       details: { template: 'x' },
+      acceptedAt: new Date('2026-11-09T16:02:12.100Z'),
     });
     expect(mirrors(outbox)).toEqual([
       {
@@ -113,12 +116,151 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
           direction: 'OUT',
           author: 'BOT',
           type: 'image',
+          contractType: 'IMAGE',
           text: 'Aquí está',
           media: { link: 'https://cdn.example.com/p.jpg' },
+          providerTimestamp: '2026-11-09T16:02:12.100Z',
           observedAt: '2026-11-09T16:02:12.345Z',
         },
       },
     ]);
+  });
+
+  it('an outbound without an acceptance time falls back to the recorder clock', async () => {
+    await recorder.recordOutbound({
+      to: SENDER,
+      providerMessageId: 'wamid.out-2',
+      type: 'text',
+      text: 'hola',
+    });
+    expect(mirrors(outbox)[0].payload).toMatchObject({
+      providerTimestamp: '2026-11-09T16:02:12.345Z',
+    });
+  });
+
+  it('an interactive outbound mirrors its body plus the offered option titles', async () => {
+    await recorder.recordOutbound({
+      to: SENDER,
+      providerMessageId: 'wamid.out-int',
+      type: 'interactive',
+      text: '¿Confirma su pedido?',
+      details: {
+        interactive: { type: 'button' },
+        options: ['Sí', 'No', 'Hablar con alguien'],
+      },
+      acceptedAt: new Date('2026-11-09T16:02:12.100Z'),
+    });
+    expect(mirrors(outbox)[0].payload).toEqual({
+      waMessageId: 'wamid.out-int',
+      direction: 'OUT',
+      author: 'BOT',
+      type: 'interactive',
+      contractType: 'TEXT',
+      text: '¿Confirma su pedido?',
+      options: ['Sí', 'No', 'Hablar con alguien'],
+      providerTimestamp: '2026-11-09T16:02:12.100Z',
+      observedAt: '2026-11-09T16:02:12.345Z',
+    });
+  });
+
+  it('a template outbound maps to the TEMPLATE contract type', async () => {
+    await recorder.recordOutbound({
+      to: SENDER,
+      providerMessageId: 'wamid.out-tpl',
+      type: 'template',
+      details: { templateName: 'order_ready' },
+    });
+    expect(mirrors(outbox)[0].payload).toMatchObject({
+      type: 'template',
+      contractType: 'TEMPLATE',
+    });
+  });
+
+  it('an inbound button reply mirrors the title the customer saw, keeping the reply id as a detail', async () => {
+    await recorder.recordInbound(
+      {
+        ...inbound,
+        messageId: 'wamid.btn',
+        text: 'SÍ',
+        interactiveReplyId: 'order_confirm:r1',
+        interactiveReplyTitle: 'Sí, confirmar',
+      },
+      'interactive',
+    );
+    expect(mirrors(outbox)[0].payload).toMatchObject({
+      type: 'interactive',
+      contractType: 'TEXT',
+      text: 'Sí, confirmar',
+    });
+    const [row] = await store.listRecent(SENDER, 5);
+    expect(row.details).toEqual({ replyId: 'order_confirm:r1' });
+  });
+
+  it.each([
+    ['audio', 'AUDIO', { providerMediaId: 'm1', mimeType: 'audio/ogg' }],
+    ['sticker', 'STICKER', { providerMediaId: 'm2', mimeType: 'image/webp' }],
+  ] as const)(
+    'a mirror-only %s keeps its Meta media reference',
+    async (type, contractType, media) => {
+      await recorder.recordInbound(
+        {
+          ...inbound,
+          messageId: `wamid.${type}`,
+          text: '',
+          mirrorOnly: { type, ...media },
+        },
+        type,
+      );
+      expect(mirrors(outbox)[0].payload).toEqual({
+        waMessageId: `wamid.${type}`,
+        direction: 'IN',
+        author: 'CUSTOMER',
+        type,
+        contractType,
+        media,
+        providerTimestamp: '2026-11-09T16:02:11.000Z',
+        observedAt: '2026-11-09T16:02:12.345Z',
+      });
+    },
+  );
+
+  it.each([
+    ['video', 'VIDEO'],
+    ['location', 'LOCATION'],
+  ] as const)(
+    'a mirror-only %s is an UNSUPPORTED marker without text or media',
+    async (type, unsupportedKind) => {
+      await recorder.recordInbound(
+        {
+          ...inbound,
+          messageId: `wamid.${type}`,
+          text: '',
+          mirrorOnly: { type },
+        },
+        type,
+      );
+      expect(mirrors(outbox)[0].payload).toEqual({
+        waMessageId: `wamid.${type}`,
+        direction: 'IN',
+        author: 'CUSTOMER',
+        type,
+        contractType: 'UNSUPPORTED',
+        unsupportedKind,
+        providerTimestamp: '2026-11-09T16:02:11.000Z',
+        observedAt: '2026-11-09T16:02:12.345Z',
+      });
+    },
+  );
+
+  it('infers the type of a mirror-only message when no raw type is given', async () => {
+    await recorder.recordInbound({
+      ...inbound,
+      messageId: 'wamid.v',
+      text: '',
+      mirrorOnly: { type: 'video' },
+    });
+    const [row] = await store.listRecent(SENDER, 5);
+    expect(row.type).toBe('video');
   });
 
   it('a duplicate wamid enqueues nothing', async () => {
@@ -176,6 +318,54 @@ describe('TranscriptRecorder mirror (S1→S2)', () => {
     const plain = new TranscriptRecorder(store, () => NOW);
     await plain.recordInbound(inbound, 'text');
     await expect(store.listRecent(SENDER, 5)).resolves.toHaveLength(1);
+  });
+});
+
+describe('mirrorPayload backward compatibility', () => {
+  it('still serializes a row written before the new fields (media object, no options)', () => {
+    expect(
+      mirrorPayload({
+        senderId: SENDER,
+        waMessageId: 'wamid.old',
+        direction: 'IN',
+        author: 'CUSTOMER',
+        type: 'image',
+        text: null,
+        media: { providerMediaId: 'm', mimeType: 'image/jpeg' },
+        details: null,
+        providerTimestamp: null,
+        observedAt: '2026-11-09T16:02:12.345Z',
+        purgeAfter: '2027-11-09T16:02:12.345Z',
+      }),
+    ).toEqual({
+      waMessageId: 'wamid.old',
+      direction: 'IN',
+      author: 'CUSTOMER',
+      type: 'image',
+      contractType: 'IMAGE',
+      media: { providerMediaId: 'm', mimeType: 'image/jpeg' },
+      observedAt: '2026-11-09T16:02:12.345Z',
+    });
+  });
+
+  it('maps an unknown provider type to UNSUPPORTED/OTHER', () => {
+    const payload = mirrorPayload({
+      senderId: SENDER,
+      waMessageId: 'wamid.x',
+      direction: 'IN',
+      author: 'CUSTOMER',
+      type: 'reaction',
+      text: null,
+      media: null,
+      details: null,
+      providerTimestamp: null,
+      observedAt: '2026-11-09T16:02:12.345Z',
+      purgeAfter: '2027-11-09T16:02:12.345Z',
+    });
+    expect(payload).toMatchObject({
+      contractType: 'UNSUPPORTED',
+      unsupportedKind: 'OTHER',
+    });
   });
 });
 

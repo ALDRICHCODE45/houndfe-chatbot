@@ -103,7 +103,8 @@ describe('TranscriptRecorder', () => {
         direction: 'OUT',
         author: 'BOT',
         type: 'template',
-        providerTimestamp: null,
+        // No acceptance time from the sender: the recorder clock stands in.
+        providerTimestamp: '2026-11-09T16:02:12.345Z',
         observedAt: '2026-11-09T16:02:12.345Z',
       },
     ]);
