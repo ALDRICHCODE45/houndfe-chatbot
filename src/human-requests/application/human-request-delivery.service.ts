@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
+  isLiveConversationItem,
   normalizeDeliveryOutcome,
   type FeedItem,
   type RecordDeliveryOutcomeResult,
@@ -432,6 +433,18 @@ export class HumanRequestDeliveryService {
       }
       this.logger.warn(
         `feed item ${row.deliveryId} of unknown type ${sanitizeErrorText(item.rawType)}: STALE`,
+      );
+      return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+    }
+
+    if (isLiveConversationItem(item)) {
+      // TODO(live conversation T4/T5): the handlers for conversation.started
+      // / reassigned / ended / staff_message and template.requested replace
+      // this branch. Until they land these items behave exactly as before
+      // the parser knew them (unknown type: nothing sent, ACK STALE), which
+      // is safe for a claim: the backend reverts it after the start timeout.
+      this.logger.warn(
+        `feed item ${row.deliveryId} of live conversation type ${item.type} has no handler yet: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }

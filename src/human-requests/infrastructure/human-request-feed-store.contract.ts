@@ -1,9 +1,16 @@
 import type {
+  ConversationEndedItem,
+  ConversationStaffMessageItem,
+  ConversationStartedItem,
   FeedItem,
   RequestCancelledItem,
   RequestOverdueNoticeItem,
+  TemplateRequestedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
-import type { HumanRequestFeedStore } from '../domain/human-request-feed';
+import type {
+  DeliveryDecision,
+  HumanRequestFeedStore,
+} from '../domain/human-request-feed';
 
 export const REF = 'wa:5215550001111';
 const ATTEMPT_A = '0b8f5c0e-6d7a-4c1e-9a52-3f1d2b6a7c10';
@@ -51,6 +58,86 @@ export const overdueItem = (
   },
   ...patch,
 });
+
+const liveBase = (deliveryId: string) => ({
+  cursor: `00000000000${deliveryId.length}`,
+  deliveryId,
+  requestId: `req-${deliveryId}`,
+  conversationRef: REF,
+  notBefore: null,
+  expiresAt: null,
+});
+
+export const staffMessageItem = (
+  deliveryId: string,
+  messageId = `msg-${deliveryId}`,
+): ConversationStaffMessageItem => ({
+  ...liveBase(deliveryId),
+  type: 'conversation.staff_message',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: 3,
+    seq: 18,
+    messageId,
+    type: 'TEXT',
+    text: 'Hola, le confirmo su pedido',
+  },
+});
+
+export const templateItem = (
+  deliveryId: string,
+  messageId = `msg-${deliveryId}`,
+): TemplateRequestedItem => ({
+  ...liveBase(deliveryId),
+  type: 'template.requested',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: 3,
+    seq: 19,
+    messageId,
+    templateName: 'seguimiento',
+    languageCode: 'es_MX',
+  },
+});
+
+export const startedItem = (deliveryId: string): ConversationStartedItem => ({
+  ...liveBase(deliveryId),
+  type: 'conversation.started',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: 3,
+    staffFirstName: 'Ana',
+    whatsappWindowClosesAt: null,
+  },
+});
+
+export const endedItem = (deliveryId: string): ConversationEndedItem => ({
+  ...liveBase(deliveryId),
+  type: 'conversation.ended',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: 3,
+    reason: 'FINISHED',
+    farewell: true,
+    resumeNotice: false,
+  },
+});
+
+/** Decisions of the live conversation (migration 4900). */
+export const LIVE_DECISIONS: DeliveryDecision[] = [
+  'SESSION_STARTED',
+  'SESSION_REVERTED',
+  'SESSION_ENDED',
+  'FAREWELL',
+  'RESUME_NOTICE',
+  'REASSIGNED_NOTICE',
+  'STAFF_MESSAGE',
+  'TEMPLATE_SENT',
+  'STALE_EPOCH',
+  'SESSION_NOT_ACTIVE',
+  'MEDIA_NOT_FOUND',
+  'SEND_REFUSED',
+];
 
 /** Behavior every HumanRequestFeedStore adapter must share. */
 export function runHumanRequestFeedStoreContract(
@@ -166,6 +253,128 @@ export function runHumanRequestFeedStoreContract(
         conversationRef: null,
       });
     });
+
+    it.each([
+      [startedItem('lv-s'), 'conversation.started', null],
+      [staffMessageItem('lv-m'), 'conversation.staff_message', 'msg-lv-m'],
+      [templateItem('lv-t'), 'template.requested', 'msg-lv-t'],
+      [endedItem('lv-e'), 'conversation.ended', null],
+    ] as const)(
+      'stores a live item (%#) typed, with its messageId only for messages',
+      async (item, type, messageId) => {
+        const { row, inserted } = await store.insertDelivery(item);
+        expect(inserted).toBe(true);
+        expect(row).toMatchObject({
+          type,
+          requestId: item.requestId,
+          conversationRef: REF,
+          localState: 'RECEIVED',
+          messageId,
+        });
+        expect(row.item).toEqual(item);
+        await expect(store.getDelivery(item.deliveryId)).resolves.toMatchObject(
+          { messageId },
+        );
+      },
+    );
+
+    it('a live item replayed by deliveryId is not inserted again and reports no duplicate', async () => {
+      await store.insertDelivery(staffMessageItem('lv-r'));
+      const replay = await store.insertDelivery(staffMessageItem('lv-r'));
+      expect(replay).toMatchObject({
+        inserted: false,
+        row: { deliveryId: 'lv-r', messageId: 'msg-lv-r' },
+      });
+      expect(replay.duplicateOf).toBeUndefined();
+    });
+
+    it.each([
+      ['staff message', staffMessageItem],
+      ['template', templateItem],
+    ] as const)(
+      'dedupes a %s by messageId under another deliveryId: stored without the key, owner reported',
+      async (_label, make) => {
+        await store.insertDelivery(make('lv-a', 'msg-same'));
+        const dup = await store.insertDelivery(make('lv-b', 'msg-same'));
+        expect(dup).toMatchObject({
+          inserted: true,
+          duplicateOf: 'lv-a',
+          row: { deliveryId: 'lv-b', messageId: null, localState: 'RECEIVED' },
+        });
+        // The owner keeps the key; the duplicate is its own ledger row
+        // (it still needs an ACK) and a replay of it is a plain replay.
+        await expect(store.getDelivery('lv-a')).resolves.toMatchObject({
+          messageId: 'msg-same',
+        });
+        await expect(
+          store.insertDelivery(make('lv-b', 'msg-same')),
+        ).resolves.toMatchObject({ inserted: false });
+        // A third delivery of the same message is also a duplicate of the owner.
+        await expect(
+          store.insertDelivery(make('lv-c', 'msg-same')),
+        ).resolves.toMatchObject({ inserted: true, duplicateOf: 'lv-a' });
+      },
+    );
+
+    it('a staff message and a template with different messageIds are independent', async () => {
+      const a = await store.insertDelivery(staffMessageItem('lv-x', 'm1'));
+      const b = await store.insertDelivery(templateItem('lv-y', 'm2'));
+      expect(a.duplicateOf).toBeUndefined();
+      expect(b.duplicateOf).toBeUndefined();
+    });
+
+    it('the messageId key survives the retention purge of the payload', async () => {
+      await store.insertDelivery(staffMessageItem('lv-p1', 'msg-keep'));
+      await store.transition(
+        'lv-p1',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'SENT',
+          decision: 'STAFF_MESSAGE',
+          attemptId: ATTEMPT_A,
+          attemptedAt: AT,
+          providerMessageId: 'wamid.lv',
+          ack: 'PROVIDER_ACCEPTED',
+        },
+      );
+      await store.completeAck('lv-p1', ATTEMPT_A, {
+        ackState: 'FAILED_PERMANENT',
+        error: 'VALIDATION_ERROR',
+      });
+      await expect(
+        store.purgeTerminal(new Date(Date.now() + 60_000), 10),
+      ).resolves.toEqual({ deleted: 0, scrubbed: 1 });
+      await expect(store.getDelivery('lv-p1')).resolves.toMatchObject({
+        messageId: 'msg-keep',
+        item: { type: 'unknown', raw: { purged: true } },
+      });
+      await expect(
+        store.insertDelivery(staffMessageItem('lv-p2', 'msg-keep')),
+      ).resolves.toMatchObject({ inserted: true, duplicateOf: 'lv-p1' });
+    });
+
+    it.each(LIVE_DECISIONS)(
+      'records the live decision %s on a transition',
+      async (decision) => {
+        await store.insertDelivery(staffMessageItem('lv-d'));
+        const next = await store.transition(
+          'lv-d',
+          { localState: 'RECEIVED', attemptId: null },
+          {
+            localState: 'STALE',
+            decision,
+            attemptId: ATTEMPT_A,
+            attemptedAt: AT,
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        );
+        expect(next).toMatchObject({ decision, localState: 'STALE' });
+        await expect(store.getDelivery('lv-d')).resolves.toMatchObject({
+          decision,
+        });
+      },
+    );
 
     it.each([
       ['SENT', 'OVERDUE_NOTICE', 'PROVIDER_ACCEPTED', 'wamid.9'],

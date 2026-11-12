@@ -1,6 +1,8 @@
 import type { FeedItem } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import {
+  messageIdOf,
   purgedItem,
+  type InsertDeliveryResult,
   type AckCompletion,
   type DeliveryExpectation,
   type DeliveryRow,
@@ -18,6 +20,8 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
   private cursor: string | null = null;
   private syncedAt: string | null = null;
   private readonly rows = new Map<string, DeliveryRow>();
+  /** messageId → owning deliveryId (the unique partial index). */
+  private readonly messageOwners = new Map<string, string>();
   private readonly requests = new Map<string, HumanRequestRecord>();
   private lastStamp = 0;
 
@@ -41,12 +45,13 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     return Promise.resolve(this.syncedAt);
   }
 
-  insertDelivery(
-    item: FeedItem,
-  ): Promise<{ row: DeliveryRow; inserted: boolean }> {
+  insertDelivery(item: FeedItem): Promise<InsertDeliveryResult> {
     const existing = this.rows.get(item.deliveryId);
     if (existing)
       return Promise.resolve({ row: copy(existing), inserted: false });
+    const wanted = messageIdOf(item);
+    const owner = wanted === null ? undefined : this.messageOwners.get(wanted);
+    const messageId = owner === undefined ? wanted : null;
     const now = this.stamp();
     const row: DeliveryRow = {
       deliveryId: item.deliveryId,
@@ -55,6 +60,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       requestId: item.type === 'unknown' ? null : item.requestId,
       conversationRef: item.type === 'unknown' ? null : item.conversationRef,
       item: structuredClone(item),
+      messageId,
       localState: 'RECEIVED',
       decision: null,
       attemptId: null,
@@ -68,7 +74,12 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       updatedAt: now,
     };
     this.rows.set(row.deliveryId, row);
-    return Promise.resolve({ row: copy(row), inserted: true });
+    if (messageId !== null) this.messageOwners.set(messageId, row.deliveryId);
+    return Promise.resolve({
+      row: copy(row),
+      inserted: true,
+      ...(owner === undefined ? {} : { duplicateOf: owner }),
+    });
   }
 
   getDelivery(deliveryId: string): Promise<DeliveryRow | null> {
@@ -205,7 +216,10 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       )
       .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
     const acked = old.filter((row) => row.ackState === 'ACKED').slice(0, limit);
-    for (const row of acked) this.rows.delete(row.deliveryId);
+    for (const row of acked) {
+      this.rows.delete(row.deliveryId);
+      if (row.messageId !== null) this.messageOwners.delete(row.messageId);
+    }
     const failed = old
       .filter(
         (row) =>

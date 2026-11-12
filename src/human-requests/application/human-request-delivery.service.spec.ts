@@ -11,7 +11,11 @@ import { WhatsappSendError } from '../../whatsapp/infrastructure/meta-whatsapp.s
 import {
   REF,
   cancelledItem,
+  endedItem,
   overdueItem,
+  staffMessageItem,
+  startedItem,
+  templateItem,
 } from '../infrastructure/human-request-feed-store.contract';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
 import {
@@ -696,6 +700,70 @@ describe('HumanRequestDeliveryService', () => {
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('conversation.started'),
     );
+  });
+
+  // TODO(T4/T5): replaced by the real handlers; until then a typed live
+  // item behaves exactly like an unknown one.
+  describe('typed live conversation items (no handler yet)', () => {
+    it.each([
+      ['conversation.started', startedItem('lv1')],
+      ['conversation.staff_message', staffMessageItem('lv2')],
+      ['template.requested', templateItem('lv3')],
+      [
+        'conversation.reassigned',
+        {
+          ...startedItem('lv4'),
+          type: 'conversation.reassigned' as const,
+          payload: {
+            requestId: 'req-lv4',
+            handoffEpoch: 3,
+            staffFirstName: null,
+          },
+        },
+      ],
+      ['conversation.ended', endedItem('lv5')],
+    ])('%s is not sent, ACKs STALE and is ledgered', async (type, item) => {
+      const { service, sender, client, store } = setup();
+      await store.recordOpenRequest({
+        requestId: item.requestId,
+        conversationRef: REF,
+        subtype: 'TALK_TO_HUMAN',
+      });
+      await service.accept(item);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getDelivery(item.deliveryId)).resolves.toMatchObject({
+        type,
+        localState: 'STALE',
+        decision: 'UNKNOWN_TYPE',
+        ackState: 'ACKED',
+      });
+      // The registry is untouched.
+      await expect(store.getRequest(item.requestId)).resolves.toMatchObject({
+        status: 'OPEN',
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(type));
+    });
+
+    it('a replayed live deliveryId is not handled or ACKed twice', async () => {
+      const { service, client } = setup();
+      await service.accept(staffMessageItem('lv6'));
+      await service.accept(staffMessageItem('lv6'));
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('a staff message duplicated under another deliveryId is still ACKed STALE, never sent', async () => {
+      const { service, sender, client, store } = setup();
+      await service.accept(staffMessageItem('lv7', 'msg-dup'));
+      await service.accept(staffMessageItem('lv8', 'msg-dup'));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((ack) => ack.deliveryId)).toEqual(['lv7', 'lv8']);
+      await expect(store.getDelivery('lv8')).resolves.toMatchObject({
+        localState: 'STALE',
+        messageId: null,
+      });
+    });
   });
 
   describe('no double delivery', () => {

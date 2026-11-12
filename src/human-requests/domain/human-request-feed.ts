@@ -51,7 +51,36 @@ export type DeliveryDecision =
    *  request CANCELLED or RESOLVED (4700). */
   | 'REQUEST_CLOSED'
   /** A feed item that kept failing locally and was given up (poison item). */
-  | 'LOCAL_FAILURE';
+  | 'LOCAL_FAILURE'
+  // ---- live conversation (unit 11, migration 4900) ----
+  /** conversation.started: durable HUMAN taken, session-ack STARTED sent;
+   *  the ACK outcome says whether the greeting went out. */
+  | 'SESSION_STARTED'
+  /** conversation.ended START_TIMEOUT: back to BOT, nothing sent (STALE). */
+  | 'SESSION_REVERTED'
+  /** conversation.ended applied without a farewell (farewell false, window
+   *  closed, or a reconcile): durable BOT, ACK STALE. */
+  | 'SESSION_ENDED'
+  /** conversation.ended: the farewell was sent. */
+  | 'FAREWELL'
+  /** conversation.ended START_TIMEOUT: the resume notice was sent. */
+  | 'RESUME_NOTICE'
+  /** conversation.reassigned: the "Ahora le atiende ..." notice was sent. */
+  | 'REASSIGNED_NOTICE'
+  /** conversation.staff_message relayed to the customer. */
+  | 'STAFF_MESSAGE'
+  /** template.requested: the approved template was sent. */
+  | 'TEMPLATE_SENT'
+  /** A live item of an epoch that is not the conversation's current HUMAN
+   *  epoch (or a 409 STALE_EPOCH on the session-ack): STALE. */
+  | 'STALE_EPOCH'
+  /** Same epoch but the session is over (mode BOT): not sent, STALE. */
+  | 'SESSION_NOT_ACTIVE'
+  /** conversation.staff_message media: GET /media/:id answered 404 (STALE). */
+  | 'MEDIA_NOT_FOUND'
+  /** A live message Meta refused synchronously (definite, nothing sent):
+   *  STALE. Never used for an uncertain send (that is UNKNOWN). */
+  | 'SEND_REFUSED';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 
@@ -65,6 +94,11 @@ export interface DeliveryRow {
   requestId: string | null;
   conversationRef: string | null;
   item: FeedItem;
+  /** Dedupe key of a staff message / template (`payload.messageId`), stored
+   *  with the row before any Meta call and kept when the payload is purged.
+   *  `null`: other items, or a duplicate of a messageId another delivery
+   *  already owns (see `duplicateOf` of `insertDelivery`). */
+  messageId: string | null;
   localState: DeliveryLocalState;
   decision: DeliveryDecision | null;
   attemptId: string | null;
@@ -123,6 +157,21 @@ export interface OpenHumanRequestInput {
   legacyId?: string | null;
 }
 
+export interface InsertDeliveryResult {
+  row: DeliveryRow;
+  inserted: boolean;
+  /** deliveryId owning the item's `messageId`, when it is not this one. */
+  duplicateOf?: string;
+}
+
+/** The `messageId` dedupe key of a feed item (staff message, template). */
+export function messageIdOf(item: FeedItem): string | null {
+  return item.type === 'conversation.staff_message' ||
+    item.type === 'template.requested'
+    ? item.payload.messageId
+    : null;
+}
+
 /** Durable state of the feed consumer. Every write is a single atomic
  *  statement; ledger transitions are compare-and-set so two actors (the
  *  consumer, a replay, the sweeper) never both claim one send. */
@@ -137,10 +186,15 @@ export interface HumanRequestFeedStore {
   readSyncedAt(): Promise<string | null>;
 
   /** Inserts the item as RECEIVED unless its `deliveryId` exists; returns the
-   *  stored row either way (an existing row is never overwritten). */
-  insertDelivery(
-    item: FeedItem,
-  ): Promise<{ row: DeliveryRow; inserted: boolean }>;
+   *  stored row either way (an existing row is never overwritten).
+   *
+   *  A staff message / template also de-duplicates by `messageId`: when
+   *  another delivery already owns that messageId the item is still stored
+   *  (it needs its own ACK; `messageId` null on the row) and the owner's
+   *  deliveryId is reported in `duplicateOf` (only on that first insert; a
+   *  replay of the duplicate's deliveryId is a plain `inserted: false`).
+   *  The caller must not send a `duplicateOf` item. */
+  insertDelivery(item: FeedItem): Promise<InsertDeliveryResult>;
   getDelivery(deliveryId: string): Promise<DeliveryRow | null>;
   /** `null` when the row moved on (another actor won). */
   transition(

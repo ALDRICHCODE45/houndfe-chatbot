@@ -13,10 +13,13 @@ import type {
 import { HumanRequestDeliveryService } from '../application/human-request-delivery.service';
 import { HumanRequestFeedConsumer } from '../application/human-request-feed.consumer';
 import {
+  LIVE_DECISIONS,
   REF,
   cancelledItem,
   overdueItem,
   runHumanRequestFeedStoreContract,
+  staffMessageItem,
+  templateItem,
 } from './human-request-feed-store.contract';
 import { PostgresFeedConsumerLock } from './postgres-feed-consumer.lock';
 import { PostgresHumanRequestFeedStore } from './postgres-human-request-feed.store';
@@ -96,6 +99,9 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
         'package.json',
         '--config-value',
         'pg-migrate',
+        // migrations/tsconfig.json (d6ba09b) is not a migration.
+        '--ignore-pattern',
+        '(\\..*|tsconfig\\.json)',
         direction,
         ...args,
       ],
@@ -107,6 +113,25 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       },
     );
   const truncate = () => pool.query(TRUNCATE_SQL);
+  /** A ledger row written without the store: the store's INSERT names
+   *  columns of the latest migration, so it cannot run on a rolled-back
+   *  schema. */
+  const rawInsert = (id: string) =>
+    pool.query(
+      `INSERT INTO human_request_deliveries
+         (delivery_id, cursor, type, payload, local_state)
+       VALUES ($1, '1', 'request.cancelled', '{}'::jsonb, 'RECEIVED')`,
+      [id],
+    );
+  /** How many migrations to roll back to undo `prefix` (and every later
+   *  one), so the counts never go stale when a migration is added. */
+  const since = async (prefix: string) =>
+    (
+      await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM pgmigrations WHERE name >= $1`,
+        [prefix],
+      )
+    ).rows[0].n;
 
   beforeAll(async () => {
     container = await new PostgreSqlContainer('postgres:16-alpine').start();
@@ -144,6 +169,7 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       'decision',
       'delivery_id',
       'local_state',
+      'message_id',
       'next_ack_at',
       'payload',
       'provider_message_id',
@@ -270,10 +296,11 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
         },
       ),
     ).resolves.toMatchObject({ decision: 'LOCAL_FAILURE' });
-    // down (4700, 4600, then 4500) refuses while a LOCAL_FAILURE row exists.
-    expect(() => migrate('down', '3')).toThrow();
+    // down (every later migration, then 4500) refuses while a LOCAL_FAILURE row exists.
+    const count4500 = await since('4500000000000');
+    expect(() => migrate('down', count4500)).toThrow();
     await truncate();
-    migrate('down', '3');
+    migrate('down', count4500);
     const gone = await pool.query(
       `SELECT 1 FROM pg_indexes WHERE indexname = 'human_request_deliveries_purge_idx'`,
     );
@@ -301,10 +328,11 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       ).resolves.toMatchObject({ decision });
     }
     // down refuses while a row uses a new decision.
-    expect(() => migrate('down', '2')).toThrow();
+    const count4600 = await since('4600000000000');
+    expect(() => migrate('down', count4600)).toThrow();
     await truncate();
-    migrate('down', '2');
-    await store.insertDelivery(overdueItem('ov-old'));
+    migrate('down', count4600);
+    await rawInsert('ov-old');
     await expect(
       pool.query(
         `UPDATE human_request_deliveries SET decision = 'OVERDUE_NOTICE'
@@ -340,10 +368,11 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       ),
     ).resolves.toMatchObject({ decision: 'REQUEST_CLOSED' });
     // down refuses while a row uses the new decision.
-    expect(() => migrate('down', '1')).toThrow();
+    const count4700 = await since('4700000000000');
+    expect(() => migrate('down', count4700)).toThrow();
     await truncate();
-    migrate('down', '1');
-    await store.insertDelivery(overdueItem('rc-old'));
+    migrate('down', count4700);
+    await rawInsert('rc-old');
     await expect(
       pool.query(
         `UPDATE human_request_deliveries SET decision = 'REQUEST_CLOSED'
@@ -359,6 +388,98 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     ).resolves.toBeDefined();
     await truncate();
     migrate('up');
+  });
+
+  it('migration 4900: live conversation decisions, message_id key and guarded down', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    const columns = await pool.query<{ is_nullable: string }>(
+      `SELECT is_nullable FROM information_schema.columns
+        WHERE table_name = 'human_request_deliveries' AND column_name = 'message_id'`,
+    );
+    expect(columns.rows[0]).toEqual({ is_nullable: 'YES' });
+    const indexes = await pool.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+        WHERE indexname = 'human_request_deliveries_message_id_uidx'`,
+    );
+    expect(indexes.rows[0]?.indexdef).toMatch(
+      /UNIQUE INDEX .*\(message_id\) WHERE \(message_id IS NOT NULL\)/,
+    );
+    // The CHECKs: every new decision is accepted, an unknown one is not, and
+    // an empty message_id is refused.
+    await store.insertDelivery(cancelledItem('m-1'));
+    for (const decision of LIVE_DECISIONS)
+      await expect(
+        pool.query(
+          `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'm-1'`,
+          [decision],
+        ),
+      ).resolves.toBeDefined();
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'NOPE' WHERE delivery_id = 'm-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET message_id = '' WHERE delivery_id = 'm-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    // The unique index is the dedupe: a second row cannot take the key, and
+    // NULL keys never collide.
+    await store.insertDelivery(staffMessageItem('m-2', 'same-key'));
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET message_id = 'same-key' WHERE delivery_id = 'm-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23505' });
+    // Staff message and template of the same messageId collide too.
+    await expect(
+      store.insertDelivery(templateItem('m-3', 'same-key')),
+    ).resolves.toMatchObject({
+      inserted: true,
+      duplicateOf: 'm-2',
+      row: { messageId: null },
+    });
+    await expect(
+      store.insertDelivery(cancelledItem('m-4')),
+    ).resolves.toMatchObject({
+      inserted: true,
+    });
+    await truncate();
+
+    // down refuses while a row has a message_id or a live decision.
+    await store.insertDelivery(staffMessageItem('m-5', 'key-5'));
+    expect(() => migrate('down', '1')).toThrow(/refusing to roll back/);
+    await truncate();
+    await store.insertDelivery(cancelledItem('m-6'));
+    await pool.query(
+      `UPDATE human_request_deliveries SET decision = 'FAREWELL' WHERE delivery_id = 'm-6'`,
+    );
+    expect(() => migrate('down', '1')).toThrow(/refusing to roll back/);
+    await truncate();
+
+    // Empty ledger: down restores the old CHECK and drops the column.
+    migrate('down', '1');
+    const gone = await pool.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'human_request_deliveries' AND column_name = 'message_id'`,
+    );
+    expect(gone.rowCount).toBe(0);
+    await rawInsert('m-7');
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'FAREWELL' WHERE delivery_id = 'm-7'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    // The 4700 decisions still pass the restored CHECK.
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'REQUEST_CLOSED' WHERE delivery_id = 'm-7'`,
+      ),
+    ).resolves.toBeDefined();
+    await truncate();
+    migrate('up');
+    expect((await since('4900000000000')) === '1').toBe(true);
   });
 
   runHumanRequestFeedStoreContract('postgres', () =>
