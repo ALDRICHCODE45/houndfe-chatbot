@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { ChatbotApiHttpClient } from '../chatbot-api/infrastructure/chatbot-api-http.client';
@@ -88,10 +89,14 @@ describe('ConversationMirrorModule wiring (T3)', () => {
     await moduleRef.close();
   });
 
-  it('registers the MESSAGE_MIRROR and MESSAGE_STATUS batch adapters on the outbox router at init (T4/T5)', async () => {
+  it('registers the MESSAGE_MIRROR and MESSAGE_STATUS batch adapters on the outbox router at init when delivery is enabled (T4/T5)', async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [
-        ConfigModule.forRoot({ ignoreEnvFile: true, isGlobal: true }),
+        ConfigModule.forRoot({
+          ignoreEnvFile: true,
+          isGlobal: true,
+          load: [() => ({ conversationMirror: { deliveryEnabled: true } })],
+        }),
         ConversationMirrorModule,
       ],
     })
@@ -149,5 +154,94 @@ describe('ConversationMirrorModule wiring (T3)', () => {
       MirrorStatusesDelivery,
     );
     await moduleRef.close();
+  });
+
+  describe('CONVERSATION_MIRROR_DELIVERY_ENABLED flag', () => {
+    const row = (kind: string) => ({
+      id: '1',
+      conversationRef: 'wa:5215550001111',
+      seq: 1,
+      kind: kind as never,
+      idempotencyKey: 'k',
+      payload: {},
+      status: 'IN_FLIGHT' as const,
+      attempts: 0,
+      nextAttemptAt: new Date(),
+      leaseOwner: 'o',
+      leaseExpiresAt: new Date(),
+      lastError: null,
+      createdAt: new Date(),
+      doneAt: null,
+    });
+    const boot = async (load: Array<() => Record<string, unknown>>) => {
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          ConfigModule.forRoot({ ignoreEnvFile: true, isGlobal: true, load }),
+          ConversationMirrorModule,
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(pool())
+        .compile();
+      await moduleRef.init();
+      return moduleRef;
+    };
+
+    it.each([
+      ['false', [() => ({ conversationMirror: { deliveryEnabled: false } })]],
+      ['unset (default off)', []],
+    ])(
+      'flag %s: adapters are not registered; mirror/status rows fall back to not-wired and logs once at info',
+      async (_label, load) => {
+        const info = jest
+          .spyOn(Logger.prototype, 'log')
+          .mockImplementation(() => undefined);
+        const moduleRef = await boot(load);
+        const router = moduleRef.get(RoutingBackendOutboxDelivery);
+        expect(router.batchLimit('MESSAGE_MIRROR')).toBe(1);
+        expect(router.batchLimit('MESSAGE_STATUS')).toBe(1);
+        await expect(
+          router.deliver(row('MESSAGE_MIRROR')),
+        ).resolves.toMatchObject({
+          outcome: 'RETRY',
+          error: 'backend outbox delivery not wired for kind MESSAGE_MIRROR',
+        });
+        await expect(
+          router.deliver(row('MESSAGE_STATUS')),
+        ).resolves.toMatchObject({
+          outcome: 'RETRY',
+          error: 'backend outbox delivery not wired for kind MESSAGE_STATUS',
+        });
+        const disabledLogs = info.mock.calls.filter(([m]) =>
+          String(m).includes('conversation mirror delivery disabled'),
+        );
+        expect(disabledLogs).toEqual([
+          [
+            'conversation mirror delivery disabled (CONVERSATION_MIRROR_DELIVERY_ENABLED=false): mirror rows are kept until enabled',
+          ],
+        ]);
+        await moduleRef.close();
+        info.mockRestore();
+      },
+    );
+
+    it('flag true: registers the adapters and does not log the disabled notice', async () => {
+      const info = jest
+        .spyOn(Logger.prototype, 'log')
+        .mockImplementation(() => undefined);
+      const moduleRef = await boot([
+        () => ({ conversationMirror: { deliveryEnabled: true } }),
+      ]);
+      const router = moduleRef.get(RoutingBackendOutboxDelivery);
+      expect(router.batchLimit('MESSAGE_MIRROR')).toBe(50);
+      expect(router.batchLimit('MESSAGE_STATUS')).toBe(100);
+      expect(
+        info.mock.calls.some(([m]) =>
+          String(m).includes('conversation mirror delivery disabled'),
+        ),
+      ).toBe(false);
+      await moduleRef.close();
+      info.mockRestore();
+    });
   });
 });

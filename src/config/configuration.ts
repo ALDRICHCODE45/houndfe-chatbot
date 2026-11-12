@@ -27,6 +27,12 @@ const configuration = () => ({
     sandboxRecipientNormalizationEnabled:
       process.env.META_SANDBOX_RECIPIENT_NORMALIZATION === 'true',
   },
+  conversationMirror: {
+    // Default off: only the exact string 'true' sends mirror rows to the
+    // backend (unit 9). Capture and enqueue are unaffected.
+    deliveryEnabled:
+      process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED === 'true',
+  },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,
     serviceKey: process.env.SERVICE_KEY as string,
