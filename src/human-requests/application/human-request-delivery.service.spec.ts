@@ -484,6 +484,30 @@ describe('HumanRequestDeliveryService', () => {
       });
     });
 
+    it.each(['CANCELLED', 'RESOLVED'] as const)(
+      'a request already %s in the registry is not told "sigue pendiente": ACK STALE, REQUEST_CLOSED',
+      async (status) => {
+        const { service, sender, client, store } = setup();
+        await store.recordOpenRequest({
+          requestId: 'req-oc',
+          conversationRef: REF,
+          subtype: 'UNKNOWN_QUESTION',
+        });
+        await store.closeRequest('req-oc', status);
+        await service.accept(overdueItem('oc'));
+        expect(sender.sent).toEqual([]);
+        expect(client.acks).toHaveLength(1);
+        expect(client.acks[0].body.outcome).toBe('STALE');
+        await expect(store.getDelivery('oc')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'REQUEST_CLOSED',
+        });
+        await expect(store.getRequest('req-oc')).resolves.toMatchObject({
+          status,
+        });
+      },
+    );
+
     it('tú: sends the tú copy', async () => {
       const { service, sender, client, setStyle } = setup();
       setStyle(TU);

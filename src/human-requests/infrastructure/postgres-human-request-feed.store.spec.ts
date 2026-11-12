@@ -270,10 +270,10 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
         },
       ),
     ).resolves.toMatchObject({ decision: 'LOCAL_FAILURE' });
-    // down (4600 first, then 4500) refuses while a LOCAL_FAILURE row exists.
-    expect(() => migrate('down', '2')).toThrow();
+    // down (4700, 4600, then 4500) refuses while a LOCAL_FAILURE row exists.
+    expect(() => migrate('down', '3')).toThrow();
     await truncate();
-    migrate('down', '2');
+    migrate('down', '3');
     const gone = await pool.query(
       `SELECT 1 FROM pg_indexes WHERE indexname = 'human_request_deliveries_purge_idx'`,
     );
@@ -301,9 +301,9 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       ).resolves.toMatchObject({ decision });
     }
     // down refuses while a row uses a new decision.
-    expect(() => migrate('down', '1')).toThrow();
+    expect(() => migrate('down', '2')).toThrow();
     await truncate();
-    migrate('down', '1');
+    migrate('down', '2');
     await store.insertDelivery(overdueItem('ov-old'));
     await expect(
       pool.query(
@@ -316,6 +316,45 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       pool.query(
         `UPDATE human_request_deliveries SET decision = 'LOCAL_FAILURE'
           WHERE delivery_id = 'ov-old'`,
+      ),
+    ).resolves.toBeDefined();
+    await truncate();
+    migrate('up');
+  });
+
+  it('migration 4700: REQUEST_CLOSED decision', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    await store.insertDelivery(overdueItem('rc-1'));
+    await expect(
+      store.transition(
+        'rc-1',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'STALE',
+          decision: 'REQUEST_CLOSED',
+          attemptId: '0b8f5c0e-6d7a-4c1e-9a52-3f1d2b6a7c10',
+          attemptedAt: '2026-11-10T16:20:00.000Z',
+          providerMessageId: null,
+          ack: 'STALE',
+        },
+      ),
+    ).resolves.toMatchObject({ decision: 'REQUEST_CLOSED' });
+    // down refuses while a row uses the new decision.
+    expect(() => migrate('down', '1')).toThrow();
+    await truncate();
+    migrate('down', '1');
+    await store.insertDelivery(overdueItem('rc-old'));
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'REQUEST_CLOSED'
+          WHERE delivery_id = 'rc-old'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    // The 4600 decisions still pass the restored CHECK.
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'HUMAN_SESSION'
+          WHERE delivery_id = 'rc-old'`,
       ),
     ).resolves.toBeDefined();
     await truncate();

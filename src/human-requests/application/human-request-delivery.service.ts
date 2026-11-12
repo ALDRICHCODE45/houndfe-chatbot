@@ -464,6 +464,11 @@ export class HumanRequestDeliveryService {
 
     if (item.type === 'request.overdue_notice') {
       // The request stays open in the registry; the customer is told once.
+      // A request this bot already saw closed (cancelled, merged, answered)
+      // must not get "sigue pendiente", e.g. when a backlog drains late.
+      const known = await this.ports.store.getRequest(item.requestId);
+      if (known !== null && known.status !== 'OPEN')
+        return { action: 'stale', decision: 'REQUEST_CLOSED' };
       const senderId = this.recipient(row);
       if (senderId === null)
         return { action: 'stale', decision: 'NO_CONVERSATION' };
