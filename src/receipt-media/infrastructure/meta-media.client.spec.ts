@@ -19,6 +19,7 @@ import {
   MetaMediaClient,
   defaultAgentFactory,
   defaultTempFileFactory,
+  metaHttpStatusOf,
   type MetaHttp,
   type MetaTempFileFactory,
 } from './meta-media.client';
@@ -1556,5 +1557,215 @@ describe('MetaMediaClient.resolveAndDownload (WU4B3B2 failure matrix and cleanup
   afterAll(async () => {
     // Residue guard: every real temp path this describe created is unlinked.
     for (const filePath of CREATED) await expectUnlinked(filePath);
+  });
+});
+
+/** T3 (conversation mirror): the download pipeline is parameterized by a
+ *  profile so the mirror can accept a wider type set while the receipt and
+ *  product-image paths keep their narrow allowlist unchanged. */
+describe('MetaMediaClient.downloadWithProfile (conversation mirror profile)', () => {
+  const OGG = Buffer.concat([
+    Buffer.from('OggS'),
+    Buffer.from('0002000000000000000000', 'hex'),
+  ]);
+  const WEBP = Buffer.concat([
+    Buffer.from('RIFF'),
+    Buffer.from([0x1a, 0, 0, 0]),
+    Buffer.from('WEBPVP8 '),
+  ]);
+  const strip = (raw: string): string | undefined => {
+    const mime = raw.split(';')[0].trim().toLowerCase();
+    return ['audio/ogg', 'image/webp', 'image/jpeg'].includes(mime)
+      ? mime
+      : undefined;
+  };
+  const sniff = (bytes: Buffer): string | undefined => {
+    if (bytes.toString('latin1', 0, 4) === 'OggS') return 'audio/ogg';
+    if (bytes.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+    return undefined;
+  };
+  const profile = (validate?: jest.Mock) => ({
+    canonicalMime: strip,
+    sniff,
+    validate,
+    strictContentType: false,
+  });
+  const mirrorReq = () => ({
+    providerMediaId: 'media-123',
+    signal: new AbortController().signal,
+  });
+  const sniffed: string[] = [];
+  afterAll(async () => {
+    for (const filePath of sniffed) await expectUnlinked(filePath);
+  });
+
+  it('downloads a type outside the receipt allowlist through a wider profile, with parameters on the mime', async () => {
+    const { client, created } = makePipeline({
+      metadata: {
+        url: DOWNLOAD_URL,
+        mime_type: 'audio/ogg; codecs=opus',
+        file_size: OGG.length,
+      },
+      hops: [
+        { data: streamOf([OGG]), headers: { 'content-type': 'audio/ogg' } },
+      ],
+    });
+    const file = await client.downloadWithProfile(mirrorReq(), profile());
+    sniffed.push(...created);
+    try {
+      expect(file.mimeType).toBe('audio/ogg');
+      expect(file.byteCount).toBe(OGG.length);
+      expect(sha256Matches(file, OGG)).toBe(true);
+      const stats = await fs.promises.stat(file.filePath);
+      expect(stats.mode & 0o777).toBe(0o600);
+    } finally {
+      await file.cleanup();
+    }
+  });
+
+  it('does not require the download Content-Type to match when the profile is not strict (the bytes decide)', async () => {
+    const { client, created } = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'image/webp', file_size: 99 },
+      hops: [
+        {
+          data: streamOf([WEBP]),
+          headers: { 'content-type': 'application/octet-stream' },
+        },
+      ],
+    });
+    const file = await client.downloadWithProfile(mirrorReq(), profile());
+    sniffed.push(...created);
+    await file.cleanup();
+    expect(file.mimeType).toBe('image/webp');
+  });
+
+  it('rejects before any download when the metadata mime is outside the profile', async () => {
+    const { client, calls } = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'video/mp4', file_size: 10 },
+    });
+    await safeError(
+      client.downloadWithProfile(mirrorReq(), profile()),
+      'UNSUPPORTED_MIME',
+      'MEDIA_VALIDATION',
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  it('rejects bytes that sniff to another type than the metadata mime, and unsniffable bytes', async () => {
+    const mismatch = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'audio/ogg', file_size: 5 },
+      hops: [{ data: streamOf([WEBP]) }],
+    });
+    await safeError(
+      mismatch.client.downloadWithProfile(mirrorReq(), profile()),
+      'MIME_MISMATCH',
+      'MEDIA_VALIDATION',
+    );
+    sniffed.push(...mismatch.created);
+    const unknown = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'audio/ogg', file_size: 5 },
+      hops: [{ data: streamOf([Buffer.from('not media at all')]) }],
+    });
+    await safeError(
+      unknown.client.downloadWithProfile(mirrorReq(), profile()),
+      'MIME_MISMATCH',
+      'MEDIA_VALIDATION',
+    );
+    sniffed.push(...unknown.created);
+  });
+
+  it('runs the profile validation hook on the downloaded bytes, and skips it when absent', async () => {
+    const validate = jest.fn();
+    const { client, created } = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'audio/ogg', file_size: 5 },
+      hops: [{ data: streamOf([OGG]) }],
+    });
+    const file = await client.downloadWithProfile(
+      mirrorReq(),
+      profile(validate),
+    );
+    sniffed.push(...created);
+    await file.cleanup();
+    expect(validate).toHaveBeenCalledWith(OGG, 'audio/ogg');
+  });
+
+  it('keeps the 10 MiB cap and unlinks the temp file when the stream overruns it', async () => {
+    const chunk = Buffer.alloc(1024 * 1024, 0x4f);
+    chunk.write('OggS', 0);
+    const { client, created } = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'audio/ogg', file_size: 1000 },
+      hops: [{ data: streamOf(Array.from({ length: 11 }, () => chunk)) }],
+    });
+    await safeError(
+      client.downloadWithProfile(mirrorReq(), profile()),
+      'INVALID_MEDIA_SIZE',
+      'MEDIA_VALIDATION',
+    );
+    sniffed.push(...created);
+    for (const filePath of created) await expectUnlinked(filePath);
+  });
+
+  it('exposes the HTTP status of a permanent failure without changing the safe error', async () => {
+    const calls: AxiosRequestConfig[] = [];
+    const http: MetaHttp = (config) => {
+      calls.push(config);
+      return Promise.resolve({ status: 401, data: { error: 'token' } });
+    };
+    const client = new MetaMediaClient(
+      {
+        graphApiBaseUrl: BASE,
+        allowedHosts: [HOST, LOOKASIDE_HOST],
+        metadataTimeoutMs: 5000,
+        downloadTimeoutMs: 20000,
+      },
+      () => TOKEN,
+      {
+        http,
+        resolve: publicDns,
+        createAgent: () => ({ destroy: jest.fn() }) as unknown as Agent,
+      },
+    );
+    const err = await safeError(
+      client.downloadWithProfile(mirrorReq(), profile()),
+      'HTTP_PERMANENT',
+    );
+    expect(metaHttpStatusOf(err)).toBe(401);
+    expect(JSON.stringify(err)).not.toContain('401');
+    expect(metaHttpStatusOf(new Error('x'))).toBeUndefined();
+  });
+
+  it('leaves the receipt path narrow: audio and webp metadata are still unsupported there', async () => {
+    const audio = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'audio/ogg', file_size: 5 },
+    });
+    await safeError(
+      audio.client.resolveAndDownload({
+        ...req(),
+        declaredMimeType: 'audio/ogg' as never,
+      }),
+      'UNSUPPORTED_MIME',
+      'MEDIA_VALIDATION',
+    );
+    const webp = makePipeline({
+      metadata: { url: DOWNLOAD_URL, mime_type: 'image/webp', file_size: 5 },
+    });
+    await safeError(
+      webp.client.resolveAndDownload(req()),
+      'UNSUPPORTED_MIME',
+      'MEDIA_VALIDATION',
+    );
+    const params = makePipeline({
+      metadata: {
+        url: DOWNLOAD_URL,
+        mime_type: 'image/jpeg; charset=binary',
+        file_size: 5,
+      },
+    });
+    await safeError(
+      params.client.resolveAndDownload(req()),
+      'UNSUPPORTED_MIME',
+      'MEDIA_VALIDATION',
+    );
   });
 });

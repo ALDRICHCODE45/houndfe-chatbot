@@ -456,6 +456,12 @@ export type UploadMediaResult =
   | { kind: 'MEDIA_TYPE_NOT_ALLOWED' }
   /** 503: storage was down, nothing recorded; retry with the same key. */
   | { kind: 'MEDIA_STORAGE_FAILED'; retryAfterSeconds: number | null }
+  /** Local, deterministic failure of the caller's source (the stream's length
+   *  differs from the declared size, or the source errored). Nothing the
+   *  backend did: never a network retry on the shared write budget. */
+  | { kind: 'LOCAL_SOURCE_ERROR' }
+  /** The caller's `signal` aborted the upload. */
+  | { kind: 'ABORTED' }
   | Exclude<ConversationMirrorCommonFailure, { kind: 'VALIDATION_ERROR' }>;
 
 export function isLowercaseUuid(value: unknown): value is string {
@@ -508,6 +514,10 @@ export function createMediaMultipart(options: {
   /** Known source size → exact `contentLength`; unknown → chunked. */
   sizeBytes?: number;
   onCapExceeded: () => void;
+  /** The source ended with a length different from `sizeBytes`. */
+  onSizeMismatch?: () => void;
+  /** The source stream itself errored (not a consumer cancel). */
+  onSourceError?: () => void;
 }): { body: Readable; contentType: string; contentLength: number | null } {
   const boundary = `houndfe-${randomBytes(16).toString('hex')}`;
   const head = Buffer.from(
@@ -519,11 +529,22 @@ export function createMediaMultipart(options: {
   const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
   const { source, sizeBytes, onCapExceeded } = options;
 
+  /** Reports a failure of the source itself, apart from the consumer closing
+   *  the generator (which ends the loop without throwing). */
+  async function* guarded(stream: Readable): AsyncGenerator<unknown> {
+    try {
+      yield* stream;
+    } catch (error) {
+      options.onSourceError?.();
+      throw error;
+    }
+  }
+
   async function* generate(): AsyncGenerator<Buffer> {
     yield head;
     let total = 0;
     try {
-      for await (const chunk of source) {
+      for await (const chunk of guarded(source)) {
         const buffer = Buffer.isBuffer(chunk)
           ? chunk
           : Buffer.from(chunk as Uint8Array | string);
@@ -537,8 +558,10 @@ export function createMediaMultipart(options: {
     } finally {
       source.destroy();
     }
-    if (sizeBytes !== undefined && total !== sizeBytes)
+    if (sizeBytes !== undefined && total !== sizeBytes) {
+      options.onSizeMismatch?.();
       throw new Error('Media stream length differs from the declared size');
+    }
     yield tail;
   }
 

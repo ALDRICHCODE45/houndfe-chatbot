@@ -4,6 +4,7 @@ import {
   CHATBOT_API_CLIENT,
   HUMAN_REQUESTS_CLIENT,
 } from './domain/chatbot-api.client';
+import { CONVERSATION_MIRROR_CLIENT } from './domain/conversation-mirror.port';
 import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
 
 @Module({
@@ -18,7 +19,16 @@ import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
       provide: HUMAN_REQUESTS_CLIENT,
       useExisting: ChatbotApiHttpClient,
     },
+    {
+      provide: CONVERSATION_MIRROR_CLIENT,
+      useExisting: ChatbotApiHttpClient,
+    },
   ],
-  exports: [CHATBOT_API_CLIENT, HUMAN_REQUESTS_CLIENT, ChatbotApiHttpClient],
+  exports: [
+    CHATBOT_API_CLIENT,
+    HUMAN_REQUESTS_CLIENT,
+    CONVERSATION_MIRROR_CLIENT,
+    ChatbotApiHttpClient,
+  ],
 })
 export class ChatbotApiModule {}

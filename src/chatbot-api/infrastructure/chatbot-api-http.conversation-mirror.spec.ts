@@ -7,7 +7,7 @@ import { Readable } from 'node:stream';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { AxiosHeaders } from 'axios';
-import { of, throwError } from 'rxjs';
+import { from, of, throwError } from 'rxjs';
 import {
   MEDIA_MAX_BYTES,
   type MirrorMessageInput,
@@ -680,6 +680,106 @@ describe('conversation mirror client (mocked HTTP)', () => {
       });
       await expect(result).resolves.toBeDefined();
       expect(pulled).toBeLessThan(40);
+    });
+
+    /** A transport that really consumes the multipart body (as the native
+     *  one does) and then fails, the way a request with a broken body ends. */
+    const consumingTransport = (code = 'ECONNRESET') =>
+      request.mockImplementation((config) =>
+        from(
+          (async () => {
+            await drain(config.data as Readable).catch(() => undefined);
+            throw Object.assign(new Error('socket hang up'), { code });
+          })(),
+        ),
+      );
+
+    it('proves the mid-stream 10 MiB cap: a stream passing it yields MEDIA_TOO_LARGE {local:true}, not a retryable network failure', async () => {
+      let pulled = 0;
+      const endless = new Readable({
+        read() {
+          pulled += 1;
+          this.push(Buffer.alloc(1024 * 1024));
+        },
+      });
+      consumingTransport();
+      await expect(
+        client.uploadMedia({ stream: endless, idempotencyKey: KEY }),
+      ).resolves.toEqual({ kind: 'MEDIA_TOO_LARGE', local: true });
+      expect(request).toHaveBeenCalledTimes(1);
+      // The body is cut right after the cap (bounded read-ahead), not drained.
+      expect(pulled).toBeLessThan(MEDIA_MAX_BYTES / (1024 * 1024) + 30);
+      expect(endless.destroyed).toBe(true);
+    });
+
+    it.each([
+      ['fewer bytes than declared', 'abc', 10],
+      ['more bytes than declared', 'abcdefghij', 3],
+    ])(
+      'a declared-size mismatch (%s) is a non-retryable local failure, never RETRYABLE network (L7a)',
+      async (_name, content, declared) => {
+        consumingTransport();
+        const result = await client.uploadMedia({
+          stream: stream(content),
+          sizeBytes: declared,
+          idempotencyKey: KEY,
+        });
+        expect(result).toEqual({ kind: 'LOCAL_SOURCE_ERROR' });
+        expect(request).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('a failing source stream is a non-retryable local failure', async () => {
+      const broken = new Readable({
+        read() {
+          this.destroy(new Error(`disk failure at ${PHONE}`));
+        },
+      });
+      consumingTransport();
+      const result = await client.uploadMedia({
+        stream: broken,
+        idempotencyKey: KEY,
+      });
+      expect(result).toEqual({ kind: 'LOCAL_SOURCE_ERROR' });
+      expect(JSON.stringify(result)).not.toContain(PHONE);
+    });
+
+    it('a caller abort is ABORTED, not a retryable network failure (L7a)', async () => {
+      const controller = new AbortController();
+      request.mockImplementation(() => {
+        controller.abort();
+        return throwError(() =>
+          Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }),
+        );
+      });
+      await expect(
+        client.uploadMedia({
+          stream: stream('abc'),
+          idempotencyKey: KEY,
+          signal: controller.signal,
+        }),
+      ).resolves.toEqual({ kind: 'ABORTED' });
+      // An already-aborted signal never reaches the network.
+      request.mockClear();
+      await expect(
+        client.uploadMedia({
+          stream: stream('abc'),
+          idempotencyKey: KEY,
+          signal: controller.signal,
+        }),
+      ).resolves.toEqual({ kind: 'ABORTED' });
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it('a genuine network failure with an intact source stays RETRYABLE', async () => {
+      consumingTransport('ECONNRESET');
+      await expect(
+        client.uploadMedia({
+          stream: stream('abc'),
+          sizeBytes: 3,
+          idempotencyKey: KEY,
+        }),
+      ).resolves.toMatchObject({ kind: 'RETRYABLE', cause: 'network' });
     });
 
     it.each([

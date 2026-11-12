@@ -141,8 +141,31 @@ function tinyPng(): Buffer {
   ]);
 }
 
+/** L7c: the service key and the (masked) conversation travel to this URL, so
+ * a cleartext `http:` base is refused unless the host is loopback (the local
+ * dev backend). Checked before the token file is read. */
+export function assertSecureBaseUrl(raw: string): void {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    usage('CHATBOT_API_BASE_URL is not a valid URL');
+  }
+  if (url.username !== '' || url.password !== '')
+    usage('CHATBOT_API_BASE_URL must not carry credentials');
+  if (url.protocol === 'https:') return;
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const loopback =
+    host === 'localhost' || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
+  if (url.protocol === 'http:' && loopback) return;
+  usage(
+    'CHATBOT_API_BASE_URL must be https (http is only allowed for a loopback host)',
+  );
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  assertSecureBaseUrl(BASE_URL);
   const serviceKey = readFileSync(TOKEN_FILE, 'utf8').trim();
   if (serviceKey === '') usage(`empty token file ${TOKEN_FILE}`);
 

@@ -1604,7 +1604,13 @@ export class ChatbotApiHttpClient
 
     const source: Readable =
       input.stream ?? createReadStream(input.filePath as string);
+    // A caller that already aborted never reaches the network.
+    if (input.signal?.aborted) {
+      source.destroy();
+      return { kind: 'ABORTED' };
+    }
     let capExceeded = false;
+    let sourceFailed = false;
     const multipart = createMediaMultipart({
       source,
       filename: safeMediaFilename(input.filename),
@@ -1612,6 +1618,12 @@ export class ChatbotApiHttpClient
       sizeBytes,
       onCapExceeded: () => {
         capExceeded = true;
+      },
+      onSizeMismatch: () => {
+        sourceFailed = true;
+      },
+      onSourceError: () => {
+        sourceFailed = true;
       },
     });
     const headers: Record<string, string | number> = {
@@ -1636,6 +1648,10 @@ export class ChatbotApiHttpClient
       multipart.body.destroy();
       source.destroy();
       if (capExceeded) return { kind: 'MEDIA_TOO_LARGE', local: true };
+      // Local deterministic failures are not transport failures: a retry would
+      // fail the same way and burn the shared `write` budget (L7a).
+      if (sourceFailed) return { kind: 'LOCAL_SOURCE_ERROR' };
+      if (input.signal?.aborted) return { kind: 'ABORTED' };
       const failure = outcome.failure;
       const { status, code } = failure;
       if (status === 400)
