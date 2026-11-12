@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   describeError,
   fingerprintMessageId,
@@ -75,6 +76,52 @@ describe('sanitizeErrorText', () => {
     expect(out).toContain(fingerprintMessageId(REAL_SHAPED));
   });
 
+  it('keeps a fingerprint whose 8 hex chars are all digits intact', () => {
+    let id = '';
+    for (let n = 0; n < 100_000 && id === ''; n++) {
+      const candidate = `wamid.AllDigits${n}`;
+      if (
+        /^\d{8}$/.test(
+          createHash('sha256').update(candidate).digest('hex').slice(0, 8),
+        )
+      )
+        id = candidate;
+    }
+    expect(id).not.toBe('');
+    const fp = fingerprintMessageId(id);
+    expect(fp).toMatch(/^wamid#\d{8}$/);
+    expect(sanitizeErrorText(`message ${id} rejected`)).toBe(
+      `message ${fp} rejected`,
+    );
+    expect(sanitizeErrorText(`${fp} then ${fp} 12`)).toBe(
+      `${fp} then ${fp} 12`,
+    );
+  });
+
+  it.each([
+    ['52 155 5000 1111'],
+    ['52-155-5000-1111'],
+    ['(55) 5000.1111'],
+    ['52.155.5000.1111'],
+    ['521 555 000 1111'],
+  ])('masks a separated phone without + (%s)', (phone) => {
+    const out = sanitizeErrorText(`to ${phone} failed`);
+    expect(out).toBe('to [number] failed');
+  });
+
+  it.each([
+    ['price 1,250.00 MXN', 'price 1,250.00 MXN'],
+    ['total $12,345.67 and 3 items', 'total $12,345.67 and 3 items'],
+    ['date 2026-11-12', 'date 2026-11-12'],
+    ['on 2026-11-12 10 items', 'on 2026-11-12 10 items'],
+    ['at 2026-11-12 14:30:05', 'at 2026-11-12 14:30:05'],
+    ['time 10:30 or 9.45', 'time 10:30 or 9.45'],
+    ['status 400, code 7', 'status 400, code 7'],
+    ['version 1.2.3 build 45', 'version 1.2.3 build 45'],
+  ])('keeps ordinary numbers (%s)', (input, expected) => {
+    expect(sanitizeErrorText(input)).toBe(expected);
+  });
+
   it('truncates long text', () => {
     const out = sanitizeErrorText('x'.repeat(1000));
     expect(out.length).toBeLessThanOrEqual(201);
@@ -95,8 +142,28 @@ describe('describeError', () => {
 
   it('sanitizes non-Error values and never throws on odd input', () => {
     expect(describeError(`raw ${PHONE}`)).not.toContain(PHONE);
-    expect(describeError(undefined)).toBe('unknown error');
-    expect(describeError({ a: 1 })).toBe('unknown error');
-    expect(describeError(null)).toBe('unknown error');
+    expect(describeError(undefined)).toBe('undefined');
+    expect(describeError(null)).toBe('null');
+    expect(describeError(42)).toBe('42');
+    expect(describeError({ a: 1 })).toBe('[object Object]');
+  });
+
+  it('sanitizes the stringified form of non-Error values', () => {
+    const value = {
+      toString: () => `failed for wa:${PHONE} / +52 155 5000 1111`,
+    };
+    const out = describeError(value);
+    expect(out).not.toContain(PHONE);
+    expect(out).not.toMatch(/5000/);
+  });
+
+  it('falls back to a constant when String(value) throws', () => {
+    const hostile = {
+      toString: () => {
+        throw new Error('nope');
+      },
+    };
+    expect(describeError(hostile)).toBe('unknown error');
+    expect(describeError(Object.create(null))).toBe('unknown error');
   });
 });

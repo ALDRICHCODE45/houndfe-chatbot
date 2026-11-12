@@ -807,7 +807,9 @@ describe('HumanRequestFeedConsumer', () => {
     const buildPoison = (
       items: FeedItem[],
       failing: () => string,
-      abandon: (item: FeedItem) => Promise<void> = () => Promise.resolve(),
+      abandon: (item: FeedItem, reason: string) => Promise<void> = () =>
+        Promise.resolve(),
+      failureMessage = 'handoff mode unreadable',
     ) => {
       const abandoned: string[] = [];
       const accepted: string[] = [];
@@ -822,12 +824,12 @@ describe('HumanRequestFeedConsumer', () => {
           delivery: {
             accept: (item) => {
               if (item.deliveryId === failing())
-                return Promise.reject(new Error('handoff mode unreadable'));
+                return Promise.reject(new Error(failureMessage));
               accepted.push(item.deliveryId);
               return Promise.resolve();
             },
-            abandon: async (item) => {
-              await abandon(item);
+            abandon: async (item, reason) => {
+              await abandon(item, reason);
               abandoned.push(item.deliveryId);
             },
           },
@@ -869,6 +871,33 @@ describe('HumanRequestFeedConsumer', () => {
       expect(accepted.at(-1)).toBe('ok2');
       await expect(store.readCursor()).resolves.toBe('9');
       expect(error).toHaveBeenCalledWith(expect.stringContaining('bad'));
+    });
+
+    it('persists the RAW failure reason on abandon while the log line is sanitized', async () => {
+      const phone = '5215550001111';
+      const reasons: string[] = [];
+      const { consumer, clock } = buildPoison(
+        [cancelledItem('bad')],
+        () => 'bad',
+        (_item, reason) => {
+          reasons.push(reason);
+          return Promise.resolve();
+        },
+        `recipient ${phone} unreadable`,
+      );
+      for (let i = 0; i < 4; i += 1) {
+        clock.now = i * MINUTE;
+        await expect(consumer.runOnce()).rejects.toThrow('unreadable');
+      }
+      clock.now = 10 * MINUTE;
+      await consumer.runOnce();
+      expect(reasons).toEqual([`Error: recipient ${phone} unreadable`]);
+      const logged = (error.mock.calls as unknown[][])
+        .map((c) => String(c[0]))
+        .join('\n');
+      expect(logged).toContain('abandoned');
+      expect(logged).not.toContain(phone);
+      expect(logged).toContain('[number]');
     });
 
     it('10 minutes of failures with fewer than 5 attempts do not abandon', async () => {

@@ -11,8 +11,7 @@ import {
   type BackendOutboxStore,
   type ClaimedBackendOutboxEntry,
 } from '../domain/backend-outbox';
-import { sanitizeErrorText } from '../../common/log-safe';
-import { describeError } from '../../common/log-safe';
+import { describeError, sanitizeErrorText } from '../../common/log-safe';
 
 export interface BackendOutboxDrainOptions {
   /** Stable per-process lease owner. */

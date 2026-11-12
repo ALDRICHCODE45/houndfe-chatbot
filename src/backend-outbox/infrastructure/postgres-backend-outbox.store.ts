@@ -93,9 +93,12 @@ RETURNING o.*`;
  * running): `cand`/`run` read one snapshot, so a follower may be completed
  * or rescheduled while we wait for its row lock. The `locked` step therefore
  * repeats the row predicates (same kind, open, due or expired lease; the
- * head is exempt, it is fenced above): after a lock wait Postgres re-checks
- * them against the newest row version and drops a row that no longer
- * qualifies. `claimable` then cuts the run at the first dropped row, so a
+ * head repeats its fence: IN_FLIGHT, caller's owner and lease): after a lock
+ * wait Postgres re-checks them against the newest row version and drops a row
+ * that no longer qualifies. The `head` step already holds the head's row lock
+ * for the whole statement, so its fence cannot change afterwards; the repeat
+ * is defense in depth. A head that changed hands drops out first in
+ * `claimable` (nothing precedes it), so the whole run returns empty. `claimable` then cuts the run at the first dropped row, so a
  * follower is never claimed past a row that is not claimable any more
  * (head-of-line). Rows are locked in ascending seq, the order
  * `COMPLETE_MANY_SQL` uses, so the two statements cannot deadlock. */
@@ -126,7 +129,8 @@ export const CLAIM_RUN_SQL = `WITH head AS (
   CROSS JOIN head h
   WHERE o.id IN (SELECT id FROM run)
     AND o.kind = h.kind
-    AND (o.id = h.id
+    AND ((o.id = h.id AND o.status = 'IN_FLIGHT' AND o.lease_owner = $2
+        AND o.lease_expires_at = $3::timestamptz)
       OR (o.status = 'PENDING' AND o.next_attempt_at <= now())
       OR (o.status = 'IN_FLIGHT' AND o.lease_expires_at <= now()))
   ORDER BY o.seq FOR UPDATE OF o

@@ -309,7 +309,8 @@ export class HumanRequestFeedConsumer {
       )
         throw error;
       // Throws when the ledger is unreadable: the page stays stuck.
-      await this.ports.delivery.abandon(item, describeError(error));
+      // The raw description is persisted for staff; only the log line is sanitized.
+      await this.ports.delivery.abandon(item, describe(error));
       this.logger.error(
         `feed item ${item.deliveryId} abandoned after ${this.failingItemCount} consecutive failures over ${Math.round(failingMs / 1000)} s: ${describeError(error)}`,
       );
@@ -420,3 +421,7 @@ export class HumanRequestFeedConsumer {
     });
   }
 }
+
+/** Raw description persisted as the abandon reason (never use for logs). */
+const describe = (error: unknown): string =>
+  error instanceof Error ? `${error.name}: ${error.message}` : String(error);

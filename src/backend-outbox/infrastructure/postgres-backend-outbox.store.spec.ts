@@ -705,7 +705,7 @@ ddescribe(
         });
       };
 
-      it('two claimRun calls on the same head claim disjoint rows (the loser gets none)', async () => {
+      it('two claimRun calls on the same head: one owner claims the whole run, the loser gets none', async () => {
         const store = new PostgresBackendOutboxStore(pool);
         await mirrors(store, A, 6);
         const [head] = await store.claimHeads(50, 'w0', 60_000);
@@ -716,14 +716,51 @@ ddescribe(
         ];
         await waitForLockWaiters(2, CLAIM_RUN_PATTERN);
         await gate.release();
-        const [first, second] = await Promise.all(runs);
-        const ids = [...first, ...second].map((e) => e.id);
-        expect(new Set(ids).size).toBe(ids.length);
-        expect([first.length, second.length].sort()).toEqual([0, 6]);
-        const owned = await pool.query<{ lease_owner: string }>(
-          'SELECT DISTINCT lease_owner FROM backend_outbox',
+        const [a, b] = await Promise.all(runs);
+        const [winner, loser] = a.length > 0 ? [a, b] : [b, a];
+        const winnerOwner = a.length > 0 ? 'wa' : 'wb';
+        expect(loser).toHaveLength(0);
+        expect(winner).toHaveLength(6);
+        expect(winner.map((e) => e.id)).toContain(head.id);
+        const owned = await pool.query<{ id: string; lease_owner: string }>(
+          'SELECT id::text, lease_owner FROM backend_outbox ORDER BY seq',
         );
-        expect(owned.rows).toHaveLength(1);
+        expect(owned.rows).toHaveLength(6);
+        expect(new Set(owned.rows.map((r) => r.lease_owner))).toEqual(
+          new Set([winnerOwner]),
+        );
+      });
+
+      it('a claimRun that waited on the head lock drops the run when the head was re-leased meanwhile', async () => {
+        const store = new PostgresBackendOutboxStore(pool);
+        await mirrors(store, A, 4);
+        const [head] = await store.claimHeads(50, 'w1', 60_000);
+        // Another worker re-leases the head (and commits) while the stale
+        // claimRun (fence: w1 + old lease) is blocked on the head row lock.
+        const other = await pool.connect();
+        await other.query('BEGIN');
+        await other.query(
+          `UPDATE backend_outbox SET lease_owner = 'w2',
+            lease_expires_at = date_trunc('milliseconds', now()) + interval '60 seconds'
+          WHERE id = $1`,
+          [head.id],
+        );
+        const stale = store.claimRun(head, 'w1', 60_000, 50);
+        await waitForLockWaiters(1, CLAIM_RUN_PATTERN);
+        await other.query('COMMIT');
+        other.release();
+        expect(await stale).toEqual([]);
+        const rows = await pool.query<{
+          seq: string;
+          status: string;
+          lease_owner: string | null;
+        }>('SELECT seq, status, lease_owner FROM backend_outbox ORDER BY seq');
+        expect(rows.rows.map((r) => [r.status, r.lease_owner])).toEqual([
+          ['IN_FLIGHT', 'w2'],
+          ['PENDING', null],
+          ['PENDING', null],
+          ['PENDING', null],
+        ]);
       });
 
       it('two workers draining the same lanes in runs never overlap nor skip an open seq', async () => {
