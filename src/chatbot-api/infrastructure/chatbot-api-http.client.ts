@@ -1,3 +1,5 @@
+import { createReadStream, promises as fsPromises } from 'node:fs';
+import type { Readable } from 'node:stream';
 import { HttpService } from '@nestjs/axios';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -9,6 +11,31 @@ import type {
   HumanRequestsClient,
 } from '../domain/chatbot-api.client';
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
+import type { ConversationMirrorClient } from '../domain/conversation-mirror.port';
+import {
+  MEDIA_MAX_BYTES,
+  MIRROR_CONVERSATION_REF_MAX_CHARS,
+  createMediaMultipart,
+  isLowercaseUuid,
+  isSha256Hex,
+  isValidConversationRef,
+  localValidation,
+  parseMirrorBatchAck,
+  parseMirrorStatusAck,
+  parseUploadedMedia,
+  safeMediaFilename,
+  toMirrorMessagesBody,
+  toMirrorStatusesBody,
+  validateMirrorMessages,
+  validateMirrorStatuses,
+  type ConversationMirrorCommonFailure,
+  type MirrorMessageInput,
+  type MirrorMessagesResult,
+  type MirrorStatusInput,
+  type MirrorStatusesResult,
+  type UploadMediaInput,
+  type UploadMediaResult,
+} from '../domain/dtos/conversation-mirror.dto';
 import {
   parseCatalogSearchResponse,
   parseStockCheckResponse,
@@ -172,6 +199,13 @@ export const CHATBOT_API_TIMEOUTS_MS = {
   shippingQuote: 45_000,
   receiptUpload: RECEIPT_UPLOAD_TIMEOUT_MS,
 } as const;
+/** Unit 9 timeouts, kept apart from `CHATBOT_API_TIMEOUTS_MS` (its shape is
+ *  pinned by the timeouts spec): `messages:batch` / `statuses:batch` bodies
+ *  reach a few MiB; a media upload streams up to 10 MiB between VPSs. */
+export const CONVERSATION_MIRROR_TIMEOUTS_MS = {
+  batch: 20_000,
+  mediaUpload: 60_000,
+} as const;
 /** The feed long-poll timeout is `waitSeconds * 1000 + FEED_TIMEOUT_SLACK_MS`,
  *  so a healthy empty long-poll (25 s) never times out (≈35 s). */
 export const FEED_TIMEOUT_SLACK_MS = 10_000;
@@ -184,7 +218,7 @@ export const CHATBOT_API_SLEEP = Symbol('CHATBOT_API_SLEEP');
 
 @Injectable()
 export class ChatbotApiHttpClient
-  implements ChatbotApiClient, HumanRequestsClient
+  implements ChatbotApiClient, HumanRequestsClient, ConversationMirrorClient
 {
   constructor(
     private readonly httpService: HttpService,
@@ -1445,6 +1479,247 @@ export class ChatbotApiHttpClient
   }
 
   /**
+   * `POST /chatbot-api/conversations/:conversationRef/messages:batch`
+   * (unit 9). Validated locally, exactly one POST (the outbox owns retries),
+   * every documented answer a typed result. The ref is URL-encoded and never
+   * appears in a result or a log.
+   */
+  async mirrorMessages(
+    conversationRef: string,
+    messages: readonly MirrorMessageInput[],
+  ): Promise<MirrorMessagesResult> {
+    if (!isValidConversationRef(conversationRef))
+      return localValidation(
+        `conversationRef is out of contract (1 to ${MIRROR_CONVERSATION_REF_MAX_CHARS} characters of A-Z a-z 0-9 : _ . @ + -)`,
+      );
+    const invalid = validateMirrorMessages(messages, Date.now());
+    if (invalid !== null) return invalid;
+    const outcome = await this.mirrorPost({
+      method: 'POST',
+      url: `/chatbot-api/conversations/${encodeURIComponent(conversationRef)}/messages:batch`,
+      data: toMirrorMessagesBody(messages),
+      timeout: CONVERSATION_MIRROR_TIMEOUTS_MS.batch,
+    });
+    if (!outcome.ok) {
+      const { status, code, body } = outcome.failure;
+      if (status === 409 && code === 'MESSAGE_ID_CONFLICT')
+        return { kind: 'MESSAGE_ID_CONFLICT' };
+      if (status === 413 && code === 'BATCH_TOO_LARGE')
+        return {
+          kind: 'BATCH_TOO_LARGE',
+          limit: numberField(body, 'limit') ?? 50,
+          local: false,
+        };
+      if (status === 422 && code === 'MEDIA_NOT_FOUND')
+        return { kind: 'MEDIA_NOT_FOUND' };
+      if (status === 422 && code === 'MEDIA_TYPE_MISMATCH')
+        return { kind: 'MEDIA_TYPE_MISMATCH' };
+      return classifyMirrorFailure(outcome.failure);
+    }
+    const ack = parseMirrorBatchAck(outcome.response.data);
+    if (outcome.response.status !== 200 || ack === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return { kind: 'ok', ...ack };
+  }
+
+  /** `POST /chatbot-api/messages/statuses:batch` (unit 9), 1–100 statuses. */
+  async recordMessageStatuses(
+    statuses: readonly MirrorStatusInput[],
+  ): Promise<MirrorStatusesResult> {
+    const invalid = validateMirrorStatuses(statuses, Date.now());
+    if (invalid !== null) return invalid;
+    const outcome = await this.mirrorPost({
+      method: 'POST',
+      url: '/chatbot-api/messages/statuses:batch',
+      data: toMirrorStatusesBody(statuses),
+      timeout: CONVERSATION_MIRROR_TIMEOUTS_MS.batch,
+    });
+    if (!outcome.ok) {
+      const { status, code, body } = outcome.failure;
+      if (status === 413 && code === 'BATCH_TOO_LARGE')
+        return {
+          kind: 'BATCH_TOO_LARGE',
+          limit: numberField(body, 'limit') ?? 100,
+          local: false,
+        };
+      return classifyMirrorFailure(outcome.failure);
+    }
+    const ack = parseMirrorStatusAck(outcome.response.data);
+    if (outcome.response.status !== 200 || ack === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return { kind: 'ok', ...ack };
+  }
+
+  /**
+   * `POST /chatbot-api/media` (unit 9): one streamed multipart `file` part
+   * (S1: the file is never buffered whole; a 10 MiB cap is enforced before and
+   * while streaming) with the caller's lowercase-UUID `X-Idempotency-Key`.
+   * Exactly one POST; the caller retries 5xx/503 with the same key.
+   */
+  async uploadMedia(input: UploadMediaInput): Promise<UploadMediaResult> {
+    const shaSent = input.sha256 !== undefined;
+    const rejectLocally = (
+      message: string,
+    ): Extract<UploadMediaResult, { kind: 'VALIDATION_ERROR' }> => {
+      // The caller's stream is ours to release once the upload is refused.
+      input.stream?.destroy();
+      return { ...localValidation(message), shaSent };
+    };
+    if (!isLowercaseUuid(input.idempotencyKey))
+      return rejectLocally('idempotencyKey must be a lowercase UUID');
+    if ((input.filePath === undefined) === (input.stream === undefined))
+      return rejectLocally('Exactly one of filePath or stream is required');
+    if (shaSent && !isSha256Hex(input.sha256))
+      return rejectLocally('sha256 must be 64 lowercase hex characters');
+    if (
+      input.sizeBytes !== undefined &&
+      (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0)
+    )
+      return rejectLocally('sizeBytes must be a non-negative integer');
+
+    let sizeBytes = input.sizeBytes;
+    if (input.filePath !== undefined) {
+      try {
+        const stats = await fsPromises.stat(input.filePath);
+        if (!stats.isFile()) return rejectLocally('Media path is not a file');
+        sizeBytes = stats.size;
+      } catch {
+        // The path is deliberately not echoed.
+        return rejectLocally('Media file is not readable');
+      }
+    }
+    if (sizeBytes !== undefined && sizeBytes > MEDIA_MAX_BYTES) {
+      input.stream?.destroy();
+      return { kind: 'MEDIA_TOO_LARGE', local: true };
+    }
+    if (sizeBytes === 0) return rejectLocally('Media file is empty');
+
+    const source: Readable =
+      input.stream ?? createReadStream(input.filePath as string);
+    let capExceeded = false;
+    const multipart = createMediaMultipart({
+      source,
+      filename: safeMediaFilename(input.filename),
+      sha256: input.sha256,
+      sizeBytes,
+      onCapExceeded: () => {
+        capExceeded = true;
+      },
+    });
+    const headers: Record<string, string | number> = {
+      'Content-Type': multipart.contentType,
+      'X-Idempotency-Key': input.idempotencyKey,
+    };
+    if (multipart.contentLength !== null)
+      headers['Content-Length'] = multipart.contentLength;
+
+    const outcome = await this.mirrorPost({
+      method: 'POST',
+      url: '/chatbot-api/media',
+      data: multipart.body,
+      headers,
+      timeout: CONVERSATION_MIRROR_TIMEOUTS_MS.mediaUpload,
+      // Native transport: follow-redirects would buffer the streamed body.
+      maxRedirects: 0,
+      signal: input.signal,
+    });
+    if (!outcome.ok) {
+      // The request failed before (or without) consuming the body: release it.
+      multipart.body.destroy();
+      source.destroy();
+      if (capExceeded) return { kind: 'MEDIA_TOO_LARGE', local: true };
+      const failure = outcome.failure;
+      const { status, code } = failure;
+      if (status === 400)
+        return {
+          kind: 'VALIDATION_ERROR',
+          message: messageField(failure.body),
+          local: false,
+          shaSent,
+        };
+      if (status === 409 && code === 'IDEMPOTENCY_CONFLICT')
+        return { kind: 'IDEMPOTENCY_CONFLICT' };
+      if (status === 413 && (code === null || code === 'MEDIA_TOO_LARGE'))
+        return { kind: 'MEDIA_TOO_LARGE', local: false };
+      if (
+        status === 415 &&
+        (code === null || code === 'MEDIA_TYPE_NOT_ALLOWED')
+      )
+        return { kind: 'MEDIA_TYPE_NOT_ALLOWED' };
+      if (status === 503 && code === 'MEDIA_STORAGE_FAILED')
+        return {
+          kind: 'MEDIA_STORAGE_FAILED',
+          retryAfterSeconds: failure.retryAfterSeconds,
+        };
+      return classifyMirrorFailure(failure) as Exclude<
+        UploadMediaResult,
+        { kind: 'VALIDATION_ERROR' }
+      >;
+    }
+    const { status } = outcome.response;
+    const uploaded =
+      status === 201 || status === 200
+        ? parseUploadedMedia(outcome.response.data, status === 201)
+        : null;
+    if (uploaded === null) return { kind: 'UNEXPECTED', status, code: null };
+    return { kind: 'ok', ...uploaded };
+  }
+
+  /**
+   * One POST for the unit 9 routes, never retried here. Failures are reduced
+   * to status / backend code / Retry-After / transport cause: the axios error
+   * (whose message could carry a URL with the conversation ref) is dropped.
+   */
+  private async mirrorPost(
+    config: AxiosRequestConfig,
+  ): Promise<
+    | { ok: true; response: AxiosResponse<unknown> }
+    | { ok: false; failure: MirrorRawFailure }
+  > {
+    const requestConfig = this.buildAuthedRequestConfig(config);
+    try {
+      const response = await lastValueFrom(
+        this.httpService.request<unknown>(requestConfig),
+      );
+      return { ok: true, response };
+    } catch (error) {
+      const raw = error as {
+        code?: unknown;
+        response?: {
+          status?: unknown;
+          data?: unknown;
+          headers?: Record<string, string | string[] | undefined>;
+        };
+      };
+      const status =
+        typeof raw.response?.status === 'number' ? raw.response.status : null;
+      const body = raw.response?.data;
+      const scoped =
+        typeof body === 'object' && body !== null
+          ? (body as { code?: unknown }).code
+          : undefined;
+      return {
+        ok: false,
+        failure: {
+          status,
+          code: typeof scoped === 'string' && scoped !== '' ? scoped : null,
+          body,
+          retryAfterSeconds: this.parseRetryAfter(raw.response?.headers),
+          transportCode: typeof raw.code === 'string' ? raw.code : null,
+        },
+      };
+    }
+  }
+
+  /**
    * Shared single-branch auth envelope: base URL + `Authorization` and
    * `X-Branch-Id` headers (ADR-16), applied identically to every
    * chatbot-api request including the attachment-only transport. A request
@@ -1698,6 +1973,59 @@ function messageField(body: unknown): string | null {
   if (Array.isArray(value) && value.every((m) => typeof m === 'string'))
     return value.join('; ');
   return null;
+}
+
+/** A unit 9 request failure reduced to the facts the outbox needs (S6). */
+interface MirrorRawFailure {
+  status: number | null;
+  code: string | null;
+  body: unknown;
+  retryAfterSeconds: number | null;
+  transportCode: string | null;
+}
+
+const TIMEOUT_TRANSPORT_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT']);
+
+/** Route-independent reactions (S4): 400, 401/403, 429, 5xx/transport, a
+ *  too-large body; anything else is UNEXPECTED (park, do not loop). */
+function classifyMirrorFailure(
+  failure: MirrorRawFailure,
+): ConversationMirrorCommonFailure {
+  const { status, code } = failure;
+  if (status === null)
+    return {
+      kind: 'RETRYABLE',
+      cause:
+        failure.transportCode !== null &&
+        TIMEOUT_TRANSPORT_CODES.has(failure.transportCode)
+          ? 'timeout'
+          : 'network',
+      status: null,
+      retryAfterSeconds: null,
+    };
+  if (status === 400)
+    return {
+      kind: 'VALIDATION_ERROR',
+      message: messageField(failure.body),
+      local: false,
+    };
+  if (status === 401) return { kind: 'UNAUTHORIZED' };
+  if (status === 403) return { kind: 'FORBIDDEN', code };
+  if (status === 429)
+    return {
+      kind: 'RATE_LIMITED',
+      retryAfterSeconds: failure.retryAfterSeconds,
+    };
+  if (status === 413 && code === 'BODY_TOO_LARGE')
+    return { kind: 'BODY_TOO_LARGE' };
+  if (status >= 500)
+    return {
+      kind: 'RETRYABLE',
+      cause: 'http_5xx',
+      status,
+      retryAfterSeconds: failure.retryAfterSeconds,
+    };
+  return { kind: 'UNEXPECTED', status, code };
 }
 
 /** Module-level flag so the legacy-omission warning logs at most once. */
