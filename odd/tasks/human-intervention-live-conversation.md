@@ -16,20 +16,21 @@ Contract: houndfe-backend `docs/chatbot-handoff/chatbot-requests-bot-contract.md
 
 ## Tasks
 
-| ID  | Specs      | Route                                                                                                                                | Commit |
-| --- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------ |
-| T1  | S2, S3     | worker: parse the five feed items; ledger migration for the new decisions/states; dedupe keys (messageId)                            | —      |
-| T2  | S3, S1     | worker: client for session-ack, GET state (single + bulk), GET media/:id (streamed), `messages:batch` mode hint                      | —      |
-| T3  | S3, S4     | worker: sender no-mirror path, document send, image/document by uploaded media, template with languageCode                           | —      |
-| T4  | S2, S4, S5 | started / reassigned / ended / START_TIMEOUT handlers (CAS mode, inline ack, greeting after 200, farewell, replay order)             | —      |
-| T5  | S2, S3, S4 | staff_message (text/image/document) and template.requested handlers                                                                  | —      |
-| T6  | S2         | total silence while HUMAN (overdue/answered/cancelled, audio prompt), re-check mode before every send, replayHeld after the farewell | —      |
-| T7  | S2, S5     | reconcile worker (start-up + 5 min, bulk state, batch hint) and the safety notice                                                    | —      |
-| T8  | S5, S6     | talk-to-human: detection, TALK_TO_HUMAN create, texts, out of hours                                                                  | —      |
-| T9  | S8         | docs (`docs/contracts/human-intervention-v1.md` still says greeting before ack) and E2E                                              | —      |
+| ID  | Specs      | Route                                                                                                                                | Commit  |
+| --- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| T1  | S2, S3     | worker: parse the five feed items; ledger migration for the new decisions/states; dedupe keys (messageId)                            | —       |
+| T2  | S3, S1     | worker: client for session-ack, GET state (single + bulk), GET media/:id (streamed), `messages:batch` mode hint                      | —       |
+| T3  | S3, S4     | worker: sender no-mirror path, document send, image/document by uploaded media, template with languageCode                           | 7c95cf9 |
+| T4  | S2, S4, S5 | started / reassigned / ended / START_TIMEOUT handlers (CAS mode, inline ack, greeting after 200, farewell, replay order)             | —       |
+| T5  | S2, S3, S4 | staff_message (text/image/document) and template.requested handlers                                                                  | —       |
+| T6  | S2         | total silence while HUMAN (overdue/answered/cancelled, audio prompt), re-check mode before every send, replayHeld after the farewell | —       |
+| T7  | S2, S5     | reconcile worker (start-up + 5 min, bulk state, batch hint) and the safety notice                                                    | —       |
+| T8  | S5, S6     | talk-to-human: detection, TALK_TO_HUMAN create, texts, out of hours                                                                  | —       |
+| T9  | S8         | docs (`docs/contracts/human-intervention-v1.md` still says greeting before ack) and E2E                                              | —       |
 
 ## Log
 
 - **L1 (owner, 2026-11-12):** "si hermano, adelante con tus siguientes recomendaciones."
 - **L2 (owner answers, 2026-11-12):** texts in S5 approved as proposed ("Así están bien"); talk-to-human: "Directo, con esos textos"; safety notice: "Así está bien". Earlier answers via the backend: Q1 resume notice only if the handover was announced; Q2 reassignment notice with first name; Q3 no release of a live session; Q4 template name from the backend, language from config; Q5 staff photos/PDF in unit 11; Q6 complaint outcome → unit 12.
 - **L3 (map, 2026-11-12):** today the sender auto-mirrors every send as BOT; `HandoffModeService.applyStarted/applyEnded` exist but are unused; `SESSION_ACK`/`DELIVERY_OUTCOME` outbox kinds have no adapter (the ack must be inline anyway); no TALK_TO_HUMAN create flow; no document or media-id send; mid-turn mode check happens before the image/text sends (TOCTOU); `replayHeld` releases held rows as soon as the mode reads BOT, regardless of the farewell.
+- **L4 (T3 done, 2026-11-12):** 7c95cf9 — origin BOT|STAFF|TEMPLATE on every send (STAFF/TEMPLATE recorded locally, never mirrored; templates keep author BOT with details.origin TEMPLATE because the transcript author CHECK allows CUSTOMER/BOT/STAFF only); sendDocument, send by media id, sendMediaFile (streamed upload, image ≤5 MiB, document ≤100 MiB); WhatsappSendError.stage send|upload (upload failure = definite non-send). Note for T5: Meta accepts only JPEG/PNG as image messages — send a staff image/webp as a document (or convert), never as image.
