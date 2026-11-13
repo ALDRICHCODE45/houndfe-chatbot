@@ -11,6 +11,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { BackendOutboxService } from '../backend-outbox/application/backend-outbox.service';
 import { BackendOutboxEnqueueModule } from '../backend-outbox/backend-outbox.module';
+import {
+  OUTBOX_DRAIN_WAKER,
+  type OutboxDrainWaker,
+} from '../backend-outbox/domain/backend-outbox';
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import {
@@ -86,6 +90,10 @@ export class HumanRequestFeedLifecycle
     private readonly config: ConfigService,
     @Inject(LIVE_RECONCILE_REF) private readonly reconcileRef: LiveReconcileRef,
     @Optional() private readonly profiles?: CustomerProfileService,
+    // Wakes the outbox drain after the safety notice (optional: no-op).
+    @Optional()
+    @Inject(OUTBOX_DRAIN_WAKER)
+    private readonly waker?: OutboxDrainWaker,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -111,6 +119,7 @@ export class HumanRequestFeedLifecycle
       this.profiles,
     );
     const sender = this.sender;
+    const waker = this.waker;
     const safety = new LiveConversationSafety({
       feedSyncedAt: () => this.store.readSyncedAt(),
       listHuman: (limit) => this.handoff.listHuman(limit),
@@ -124,6 +133,7 @@ export class HumanRequestFeedLifecycle
       ...(ports.customerStyle === undefined
         ? {}
         : { customerStyle: ports.customerStyle }),
+      ...(waker === undefined ? {} : { wake: () => waker.wake() }),
     });
     this.reconcile = new LiveConversationReconcileWorker({
       mode: this.handoff,
@@ -239,6 +249,7 @@ const CUSTOMER_PORT_TOKENS = [
         config: ConfigService,
         pool: Pool,
         profiles?: CustomerProfileService,
+        waker?: OutboxDrainWaker,
       ) => {
         const ports = customerPorts(handoff, config, pool, profiles);
         return new HumanRequestDeliveryService({
@@ -262,6 +273,8 @@ const CUSTOMER_PORT_TOKENS = [
             onAckRefused: (ref: string) => {
               void reconcile.current?.reconcileOne(ref);
             },
+            // Bot live notices mirror right away (ordering vs staff).
+            ...(waker === undefined ? {} : { wakeOutbox: () => waker.wake() }),
           }),
         });
       },
@@ -272,6 +285,7 @@ const CUSTOMER_PORT_TOKENS = [
         WHATSAPP_SENDER,
         LIVE_RECONCILE_REF,
         ...CUSTOMER_PORT_TOKENS,
+        { token: OUTBOX_DRAIN_WAKER, optional: true },
       ],
     },
     {

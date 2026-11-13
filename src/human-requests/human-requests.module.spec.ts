@@ -9,6 +9,10 @@ import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import type { BackendOutboxEntry } from '../backend-outbox/domain/backend-outbox';
+import {
+  OUTBOX_DRAIN_WAKER,
+  type OutboxDrainWaker,
+} from '../backend-outbox/domain/backend-outbox';
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
 import {
   LIVE_RECONCILE_REF,
@@ -188,6 +192,47 @@ describe('HumanRequestsModule', () => {
     expect(pool.connect).toHaveBeenCalled();
     await moduleRef.close();
     expect(pool.end).toHaveBeenCalled();
+  });
+
+  describe('outbox drain waker (ordering of bot live notices)', () => {
+    const wakerOf = (moduleRef: Awaited<ReturnType<typeof compile>>) =>
+      moduleRef.get<OutboxDrainWaker & { target?: OutboxDrainWaker }>(
+        OUTBOX_DRAIN_WAKER,
+        { strict: false },
+      );
+
+    it('the waker is provided and injected into the live conversation service', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const waker = wakerOf(moduleRef);
+      const target = { wake: jest.fn() };
+      waker.target = target; // what the drain lifecycle does on bootstrap
+      const delivery: unknown = moduleRef.get(HumanRequestDeliveryService);
+      const live = (
+        delivery as {
+          ports: { live: { ports: { wakeOutbox?: () => void } } };
+        }
+      ).ports.live;
+      expect(typeof live.ports.wakeOutbox).toBe('function');
+      live.ports.wakeOutbox!();
+      expect(target.wake).toHaveBeenCalledTimes(1);
+      await moduleRef.close();
+    });
+
+    it('the feed lifecycle (safety notice) receives the same waker', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      const lifecycle = moduleRef.get(HumanRequestFeedLifecycle);
+      expect(Reflect.get(lifecycle, 'waker')).toBe(wakerOf(moduleRef));
+      await moduleRef.close();
+    });
+
+    it('without a worker bound the injected waker is a harmless no-op', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      expect(() => wakerOf(moduleRef).wake()).not.toThrow();
+      await moduleRef.close();
+    });
   });
 
   describe('live conversation reconcile wiring (T6/T7)', () => {

@@ -18,6 +18,7 @@ function build(
     sendFails?: boolean;
     customerStyle?: LiveSafetyPorts['customerStyle'];
     store?: InMemoryConversationStore;
+    wake?: LiveSafetyPorts['wake'];
   } = {},
 ) {
   const store = options.store ?? new InMemoryConversationStore();
@@ -42,6 +43,7 @@ function build(
     ...(options.customerStyle === undefined
       ? {}
       : { customerStyle: options.customerStyle }),
+    ...(options.wake === undefined ? {} : { wake: options.wake }),
   };
   const safety = new LiveConversationSafety(ports, { clock: () => NOW });
   return { safety, mode, ports, sent, store };
@@ -182,5 +184,66 @@ describe('LiveConversationSafety (rule 8)', () => {
     await mode.applyStarted('5215550001111', 1, 'req-1');
     await safety.run();
     expect(sent[0].text).toBe(SAFETY_NOTICE);
+  });
+
+  describe('outbox wake (ordering of bot live notices)', () => {
+    it('wakes once per notice, right after a successful send', async () => {
+      const order: string[] = [];
+      const wake = jest.fn(() => {
+        order.push('wake');
+      });
+      const { safety, mode, ports } = build({ wake });
+      (ports.send as jest.Mock).mockImplementation(async () => {
+        order.push('send');
+      });
+      await mode.applyStarted('5215550001111', 2, 'req-1');
+      await mode.applyStarted('5215550002222', 1, 'req-2');
+      await safety.run();
+      expect(wake).toHaveBeenCalledTimes(2);
+      expect(order).toEqual(['send', 'wake', 'send', 'wake']);
+    });
+
+    it('does not wake for a failed send, a closed window, a lost claim or a healthy feed', async () => {
+      const wake = jest.fn();
+      const failed = build({ wake, sendFails: true });
+      await failed.mode.applyStarted('5215550001111', 2, 'req-1');
+      await failed.safety.run();
+
+      const closed = build({ wake, windowOpen: false });
+      await closed.mode.applyStarted('5215550001111', 2, 'req-1');
+      await closed.safety.run();
+
+      const healthy = build({ wake, syncedAgoMs: 60_000 });
+      await healthy.mode.applyStarted('5215550001111', 2, 'req-1');
+      await healthy.safety.run();
+
+      const again = build({ wake });
+      await again.mode.applyStarted('5215550001111', 2, 'req-1');
+      await again.safety.run();
+      expect(wake).toHaveBeenCalledTimes(1);
+      await again.safety.run(); // same epoch: claim already taken
+      expect(wake).toHaveBeenCalledTimes(1);
+    });
+
+    it('a waker that throws never counts the notice as failed or stops the pass', async () => {
+      const wake = jest.fn(() => {
+        throw new Error('wake failed');
+      });
+      const { safety, mode } = build({ wake });
+      await mode.applyStarted('5215550001111', 2, 'req-1');
+      await mode.applyStarted('5215550002222', 1, 'req-2');
+      await expect(safety.run()).resolves.toEqual({
+        kind: 'down',
+        sent: 2,
+        failed: 0,
+      });
+      expect(wake).toHaveBeenCalledTimes(2);
+    });
+
+    it('works without a waker', async () => {
+      const { safety, mode } = build();
+      await mode.applyStarted('5215550001111', 2, 'req-1');
+      await expect(safety.run()).resolves.toMatchObject({ sent: 1 });
+    });
   });
 });

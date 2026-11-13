@@ -168,6 +168,19 @@ export type BackendOutboxDeliveryResult =
 export const BACKEND_OUTBOX_DELIVERY = Symbol('BACKEND_OUTBOX_DELIVERY');
 
 /**
+ * Wakes the outbox drain right away instead of waiting for its next tick
+ * (a bot live notice was just sent and its MESSAGE_MIRROR row enqueued: the
+ * backend assigns `seq` on arrival, so it must arrive before any later staff
+ * message). Synchronous, coalescing, never throws; a no-op when no drain
+ * worker runs in this process. Consumers inject it optionally.
+ */
+export interface OutboxDrainWaker {
+  wake(): void;
+}
+
+export const OUTBOX_DRAIN_WAKER = Symbol('OUTBOX_DRAIN_WAKER');
+
+/**
  * Delivers one row to the backend. A thrown error counts as RETRY
  * (network, timeout). Delivery must be idempotent on `idempotencyKey`: an
  * expired lease or a crash after delivery replays the same row.

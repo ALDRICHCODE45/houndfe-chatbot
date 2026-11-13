@@ -35,6 +35,10 @@ export interface LiveSafetyPorts {
   send(senderId: string, text: string): Promise<void>;
   /** Stored customer style; null/failure keeps the usted copy. */
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  /** Wakes the backend outbox drain right after a notice was sent (its
+   *  mirror row is already enqueued), so it reaches the backend before any
+   *  later staff message. Optional; a throw is swallowed. */
+  wake?(): void;
 }
 
 export type SafetyRunResult =
@@ -83,6 +87,7 @@ export class LiveConversationSafety {
         try {
           await this.ports.send(human.senderId, text);
           sent += 1;
+          this.wake();
         } catch (error) {
           failed += 1;
           this.logger.warn(
@@ -100,6 +105,14 @@ export class LiveConversationSafety {
         `feed down for more than ${FEED_DOWN_AFTER_MS / 60_000} min: safety notice sent to ${sent} conversation(s), ${failed} failed`,
       );
     return { kind: 'down', sent, failed };
+  }
+
+  private wake(): void {
+    try {
+      this.ports.wake?.();
+    } catch (error) {
+      this.logger.warn(`outbox wake failed: ${describeError(error)}`);
+    }
   }
 
   private async readStyle(senderId: string): Promise<CustomerStyle | null> {

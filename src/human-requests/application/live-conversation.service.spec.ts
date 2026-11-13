@@ -116,9 +116,15 @@ const okAck = (input: SessionAckInput): SessionAckResult => ({
 });
 
 const setup = (
-  options: { refuseThrows?: boolean; noRefuse?: boolean } = {},
+  options: {
+    refuseThrows?: boolean;
+    noRefuse?: boolean;
+    /** Wires the optional outbox waker; `throws` makes it throw. */
+    wake?: boolean | 'throws';
+  } = {},
 ) => {
   const events: string[] = [];
+  const wakes: string[] = [];
   const conversation = new InMemoryConversationStore();
   const modeService = new HandoffModeService(conversation);
   /** One entry is consumed after each `getState` read resolves (a mode
@@ -290,6 +296,15 @@ const setup = (
         sender,
         isWindowOpen,
         customerStyle,
+        ...(options.wake === undefined || options.wake === false
+          ? {}
+          : {
+              wakeOutbox: () => {
+                events.push('wake');
+                wakes.push('wake');
+                if (options.wake === 'throws') throw new Error('wake failed');
+              },
+            }),
         ...(options.noRefuse === true
           ? {}
           : {
@@ -315,6 +330,7 @@ const setup = (
     service,
     store,
     events,
+    wakes,
     sent,
     templates,
     mediaSends,
@@ -2211,6 +2227,199 @@ describe('LiveConversationService (T4)', () => {
       await h.mode.applyEnded(SENDER, 3);
       await expect(h.service.replayHeld()).resolves.toBe(1);
       expect(texts(h)).toHaveLength(1);
+    });
+  });
+});
+
+describe('LiveConversationService outbox wake (ordering of bot live notices)', () => {
+  beforeEach(() => {
+    for (const level of ['log', 'warn', 'error', 'debug'] as const)
+      jest.spyOn(Logger.prototype, level).mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const humanAt = (h: Harness, epoch = 3) =>
+    h.mode.applyStarted(SENDER, epoch, 'req-x');
+
+  describe('greeting', () => {
+    it('wakes the drain once, right after the greeting is sent', async () => {
+      const h = setup({ wake: true });
+      await h.service.accept(started('w1'));
+      expect(h.wakes).toHaveLength(1);
+      const at = h.events.indexOf('wake');
+      expect(h.events.indexOf(`send:${GREETING}`)).toBeLessThan(at);
+      // After the ack STARTED (the greeting only goes out after a 200).
+      expect(h.events.indexOf('ack:STARTED')).toBeLessThan(at);
+    });
+
+    it('does not wake for an uncertain send, a closed window, or a Meta window refusal', async () => {
+      const uncertain = setup({ wake: true });
+      uncertain.sendScript.push(sendError(500));
+      await uncertain.service.accept(started('w2'));
+      expect(uncertain.sent).toHaveLength(1);
+      expect(uncertain.wakes).toEqual([]);
+
+      const closed = setup({ wake: true });
+      closed.window.open = false;
+      await closed.service.accept(started('w3'));
+      expect(closed.sent).toEqual([]);
+      expect(closed.wakes).toEqual([]);
+
+      const refused = setup({ wake: true });
+      refused.sendScript.push(sendError(400, 131047));
+      await refused.service.accept(started('w4'));
+      expect(refused.wakes).toEqual([]);
+    });
+
+    it('does not wake for a refused ack (no greeting) or a replayed delivery', async () => {
+      const refused = setup({ wake: true });
+      refused.ackScript.push({
+        kind: 'STALE_EPOCH',
+        currentEpoch: 4,
+        mode: 'BOT',
+        sessionState: 'ENDED',
+      });
+      await refused.service.accept(started('w5'));
+      expect(refused.wakes).toEqual([]);
+
+      const h = setup({ wake: true });
+      await h.service.accept(started('w6'));
+      await h.service.accept(started('w6'));
+      expect(h.wakes).toHaveLength(1);
+    });
+  });
+
+  describe('reassignment', () => {
+    it('wakes once after the notice is sent', async () => {
+      const h = setup({ wake: true });
+      await humanAt(h);
+      await h.service.accept(reassigned('w7'));
+      expect(h.wakes).toHaveLength(1);
+      expect(h.events.indexOf(`send:${REASSIGNED}`)).toBeLessThan(
+        h.events.indexOf('wake'),
+      );
+    });
+
+    it('does not wake for a closed window, a stale epoch or a failed send', async () => {
+      const closed = setup({ wake: true });
+      await humanAt(closed);
+      closed.window.open = false;
+      await closed.service.accept(reassigned('w8'));
+      expect(closed.wakes).toEqual([]);
+
+      const stale = setup({ wake: true });
+      await humanAt(stale, 4);
+      await stale.service.accept(reassigned('w9'));
+      expect(stale.wakes).toEqual([]);
+
+      const failed = setup({ wake: true });
+      await humanAt(failed);
+      failed.sendScript.push(sendError(500));
+      await failed.service.accept(reassigned('w10'));
+      expect(failed.wakes).toEqual([]);
+    });
+  });
+
+  describe('farewell', () => {
+    it('wakes once after the farewell is sent, before the session-ack ENDED', async () => {
+      const h = setup({ wake: true });
+      await humanAt(h);
+      h.events.length = 0;
+      await h.service.accept(ended('w11'));
+      expect(h.events).toEqual([
+        'cas:ended',
+        `send:${FAREWELL}`,
+        'outcome:PROVIDER_ACCEPTED',
+        'wake',
+        'ack:ENDED',
+        'replay:pending',
+      ]);
+      expect(h.wakes).toHaveLength(1);
+    });
+
+    it('does not wake without a farewell, with a closed window or a failed send', async () => {
+      const none = setup({ wake: true });
+      await humanAt(none);
+      await none.service.accept(ended('w12', { farewell: false }));
+      expect(none.wakes).toEqual([]);
+
+      const closed = setup({ wake: true });
+      await humanAt(closed);
+      closed.window.open = false;
+      await closed.service.accept(ended('w13'));
+      expect(closed.wakes).toEqual([]);
+
+      const failed = setup({ wake: true });
+      await humanAt(failed);
+      failed.sendScript.push(sendError(500));
+      await failed.service.accept(ended('w14'));
+      expect(failed.sent).toHaveLength(1);
+      expect(failed.wakes).toEqual([]);
+      // The ack ENDED and the replay still ran.
+      expect(failed.acks).toHaveLength(1);
+    });
+  });
+
+  describe('resume notice (START_TIMEOUT)', () => {
+    const timeoutItem = (id: string, resumeNotice = true) =>
+      ended(id, { reason: 'START_TIMEOUT', farewell: false, resumeNotice });
+
+    it('wakes once after the resume text is sent (the greeting already woke once)', async () => {
+      const h = setup({ wake: true });
+      await h.service.accept(started('w15'));
+      expect(h.wakes).toHaveLength(1);
+      await h.service.accept(timeoutItem('w16'));
+      expect(texts(h)).toEqual([GREETING, RESUME]);
+      expect(h.wakes).toHaveLength(2);
+    });
+
+    it('does not wake when nothing is sent (no greeting, resumeNotice false, failed send)', async () => {
+      const noGreeting = setup({ wake: true });
+      await noGreeting.service.accept(timeoutItem('w17'));
+      expect(noGreeting.wakes).toEqual([]);
+
+      const off = setup({ wake: true });
+      await off.service.accept(started('w18'));
+      await off.service.accept(timeoutItem('w19', false));
+      expect(off.wakes).toHaveLength(1);
+
+      const failed = setup({ wake: true });
+      await failed.service.accept(started('w20'));
+      failed.sendScript.push(sendError(500));
+      await failed.service.accept(timeoutItem('w21'));
+      expect(failed.wakes).toHaveLength(1);
+    });
+  });
+
+  describe('staff relays and the optional dependency', () => {
+    it('never wakes for staff messages or templates (never mirrored)', async () => {
+      const h = setup({ wake: true });
+      await humanAt(h);
+      await h.service.accept(staffText('w22'));
+      await h.service.accept(templateRequested('w23'));
+      expect(h.sent).toHaveLength(1);
+      expect(h.templates).toHaveLength(1);
+      expect(h.wakes).toEqual([]);
+    });
+
+    it('works without a waker (absent → no-op)', async () => {
+      const h = setup();
+      await h.service.accept(started('w24'));
+      await h.service.accept(reassigned('w25'));
+      await h.service.accept(ended('w26'));
+      expect(texts(h)).toEqual([GREETING, REASSIGNED, FAREWELL]);
+    });
+
+    it('a waker that throws never breaks the item, its outcome or the ENDED ack', async () => {
+      const h = setup({ wake: 'throws' });
+      await humanAt(h);
+      await h.service.accept(ended('w27'));
+      expect(h.wakes).toHaveLength(1);
+      expect(h.acks).toHaveLength(1);
+      await expect(row(h, 'w27')).resolves.toMatchObject({
+        localState: 'SENT',
+        ackState: 'ACKED',
+      });
     });
   });
 });

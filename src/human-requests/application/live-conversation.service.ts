@@ -117,6 +117,13 @@ export interface LiveConversationPorts {
    *  SESSION_NOT_ENDING): asks the reconcile worker to read the backend's
    *  state of this conversation now. Fire-and-forget; a throw is logged. */
   onAckRefused?(conversationRef: string): void;
+  /**
+   * Wakes the backend outbox drain right after a bot live notice (greeting,
+   * reassignment, farewell, resume) was sent, so its MESSAGE_MIRROR row
+   * reaches the backend before any later staff message (the backend assigns
+   * `seq` on arrival). Optional: absent → no-op; a throw is swallowed.
+   */
+  wakeOutbox?(): void;
 }
 
 /**
@@ -392,6 +399,7 @@ export class LiveConversationService implements LiveConversationHandler {
       // A greeting that really went out is what a START_TIMEOUT resume
       // notice depends on (an uncertain one does not count).
       after: async (result) => {
+        this.wake(result);
         if (result.kind === 'ACCEPTED')
           await this.recordGreeting(senderId, epoch);
       },
@@ -424,6 +432,10 @@ export class LiveConversationService implements LiveConversationHandler {
         style,
       ),
       guard: this.guard(senderId, epoch, 'HUMAN'),
+      after: (result) => {
+        this.wake(result);
+        return Promise.resolve();
+      },
     };
   }
 
@@ -470,6 +482,10 @@ export class LiveConversationService implements LiveConversationHandler {
             senderId,
             text: styleFixedCopy(LIVE_RESUME, style),
             guard: this.guard(senderId, epoch, 'BOT'),
+            after: (result) => {
+              this.wake(result);
+              return Promise.resolve();
+            },
             replay: true,
           };
         }
@@ -479,8 +495,10 @@ export class LiveConversationService implements LiveConversationHandler {
 
     // The ack comes after the outcome; the replay after the ack, so the
     // farewell always precedes any replayed delivery.
-    const after = (result: LiveSendResult) =>
-      this.ackEnded(ref, epoch, result.providerMessageId);
+    const after = (result: LiveSendResult) => {
+      this.wake(result);
+      return this.ackEnded(ref, epoch, result.providerMessageId);
+    };
     if (farewell && (await this.ports.isWindowOpen(senderId))) {
       const style = await this.readStyle(senderId);
       return {
@@ -521,6 +539,18 @@ export class LiveConversationService implements LiveConversationHandler {
       if (state.mode !== expected) return 'SESSION_NOT_ACTIVE';
       return null;
     };
+  }
+
+  /** Wakes the outbox drain after a notice that was really accepted by Meta
+   *  (its mirror row is already enqueued). Never throws. */
+  private wake(result: LiveSendResult): void {
+    if (result.kind !== 'ACCEPTED' || this.ports.wakeOutbox === undefined)
+      return;
+    try {
+      this.ports.wakeOutbox();
+    } catch (error) {
+      this.logger.warn(`outbox wake failed: ${describeError(error)}`);
+    }
   }
 
   /** Records that the greeting of `epoch` went out (L10 c: a START_TIMEOUT

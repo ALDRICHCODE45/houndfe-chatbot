@@ -72,7 +72,11 @@ export class BackendOutboxDrainWorker {
   /** A batch filled its limit in the last tick: more rows likely wait. */
   private fullBatch = false;
   private timer?: ReturnType<typeof setTimeout>;
+  /** Delay the pending timer was armed with (undefined: none pending). */
+  private timerDelayMs?: number;
   private inFlight?: Promise<void>;
+  /** `wake()` arrived while a tick was running: go again right after it. */
+  private wakePending = false;
 
   constructor(
     private readonly store: BackendOutboxStore,
@@ -122,7 +126,34 @@ export class BackendOutboxDrainWorker {
     this.stopped = true;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
+    this.timerDelayMs = undefined;
+    this.wakePending = false;
     return this.inFlight ?? Promise.resolve();
+  }
+
+  /**
+   * Drains as soon as possible instead of waiting for the next tick (a bot
+   * live notice was just mirrored into the outbox and must reach the backend
+   * before any later staff message). While a tick runs it marks "run again
+   * right after it"; otherwise the pending timer is brought forward to 0 ms.
+   * Bursts coalesce into at most one extra tick; a no-op before `start` and
+   * after `stop`; never throws. Backoff (row `next_attempt_at`) and the
+   * full-batch loop are untouched.
+   */
+  wake(): void {
+    try {
+      if (!this.started || this.stopped) return;
+      if (this.inFlight !== undefined) {
+        this.wakePending = true;
+        return;
+      }
+      if (this.timer === undefined || this.timerDelayMs === 0) return;
+      clearTimeout(this.timer);
+      this.timer = undefined;
+      this.schedule(0);
+    } catch {
+      // A wake is only an optimisation: the regular tick still runs.
+    }
   }
 
   /** One drain pass; resolves to the number of claimed rows. */
@@ -364,8 +395,11 @@ export class BackendOutboxDrainWorker {
 
   private schedule(delayMs: number): void {
     if (this.stopped) return;
+    this.timerDelayMs = delayMs;
     this.timer = setTimeout(() => {
       this.timer = undefined;
+      this.timerDelayMs = undefined;
+      this.wakePending = false;
       let claimed = 0;
       this.inFlight = this.tick()
         .then((count) => {
@@ -379,8 +413,13 @@ export class BackendOutboxDrainWorker {
         .finally(() => {
           this.inFlight = undefined;
           // A full batch means more work is likely waiting: go again now.
+          // So does a wake that arrived while this tick was running.
+          const again = this.wakePending;
+          this.wakePending = false;
           this.schedule(
-            claimed >= this.batchSize || this.fullBatch ? 0 : this.idleDelayMs,
+            again || claimed >= this.batchSize || this.fullBatch
+              ? 0
+              : this.idleDelayMs,
           );
         });
     }, delayMs);
