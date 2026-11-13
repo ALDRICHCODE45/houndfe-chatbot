@@ -591,6 +591,142 @@ describe('live conversation client (mocked HTTP)', () => {
     });
   });
 
+  describe('scheduledRequest on the state routes (unit 14)', () => {
+    const SCHEDULED = {
+      requestId: '9a7e0000-1111-4222-8333-444455556666',
+      subtype: 'TALK_TO_HUMAN',
+      scheduledFor: '2026-11-10T15:00:00.000Z',
+      needsReschedule: false,
+      scheduleVersion: 2,
+    };
+    const botState = {
+      mode: 'BOT',
+      handoffEpoch: 0,
+      sessionState: null,
+      requestId: null,
+      assigneeFirstName: null,
+    };
+
+    it('getConversationState parses scheduledRequest (extra keys dropped)', async () => {
+      request.mockReturnValue(
+        of(
+          response({
+            ...botState,
+            scheduledRequest: { ...SCHEDULED, extra: 'dropped' },
+          }),
+        ),
+      );
+      const result = await client.getConversationState(REF);
+      expect(result).toEqual({
+        kind: 'ok',
+        ...botState,
+        scheduledRequest: SCHEDULED,
+      });
+      expectNoPhone(result);
+    });
+
+    it('getConversationState reads an unseen chat with a booking (200, BOT, epoch 0)', async () => {
+      request.mockReturnValue(
+        of(
+          response({
+            ...botState,
+            scheduledRequest: { ...SCHEDULED, needsReschedule: true },
+          }),
+        ),
+      );
+      await expect(client.getConversationState(REF)).resolves.toMatchObject({
+        kind: 'ok',
+        mode: 'BOT',
+        handoffEpoch: 0,
+        scheduledRequest: { needsReschedule: true },
+      });
+    });
+
+    it('getConversationState reads an explicit null as null', async () => {
+      request.mockReturnValue(
+        of(response({ ...botState, scheduledRequest: null })),
+      );
+      await expect(client.getConversationState(REF)).resolves.toEqual({
+        kind: 'ok',
+        ...botState,
+        scheduledRequest: null,
+      });
+    });
+
+    it('getConversationState keeps working when the key is absent (pre-unit-14 backend)', async () => {
+      request.mockReturnValue(of(response(botState)));
+      const result = await client.getConversationState(REF);
+      expect(result).toEqual({ kind: 'ok', ...botState });
+      expect(result).not.toHaveProperty('scheduledRequest');
+    });
+
+    it.each([
+      ['a non-object', 'soon'],
+      ['no requestId', { ...SCHEDULED, requestId: undefined }],
+      ['a bad scheduledFor', { ...SCHEDULED, scheduledFor: 'x' }],
+      ['a non-boolean needsReschedule', { ...SCHEDULED, needsReschedule: 1 }],
+      ['a zero scheduleVersion', { ...SCHEDULED, scheduleVersion: 0 }],
+    ])(
+      'a malformed scheduledRequest (%s) reads as null and never breaks the mode/epoch read',
+      async (_label, bad) => {
+        request.mockReturnValue(
+          of(
+            response({
+              mode: 'HUMAN',
+              handoffEpoch: 3,
+              sessionState: 'ACTIVE',
+              requestId: 'r',
+              assigneeFirstName: null,
+              scheduledRequest: bad,
+            }),
+          ),
+        );
+        await expect(client.getConversationState(REF)).resolves.toMatchObject({
+          kind: 'ok',
+          mode: 'HUMAN',
+          handoffEpoch: 3,
+          scheduledRequest: null,
+        });
+      },
+    );
+
+    it('listHumanConversations parses scheduledRequest per item', async () => {
+      const base = {
+        mode: 'HUMAN',
+        handoffEpoch: 1,
+        sessionState: 'ACTIVE',
+        requestId: 'req-1',
+        assigneeFirstName: null,
+      };
+      request.mockReturnValue(
+        of(
+          response({
+            items: [
+              {
+                conversationRef: 'wa:a',
+                ...base,
+                scheduledRequest: SCHEDULED,
+              },
+              { conversationRef: 'wa:b', ...base, scheduledRequest: null },
+              { conversationRef: 'wa:c', ...base },
+            ],
+            nextCursor: null,
+          }),
+        ),
+      );
+      const result = await client.listHumanConversations();
+      expect(result).toEqual({
+        kind: 'ok',
+        items: [
+          { conversationRef: 'wa:a', ...base, scheduledRequest: SCHEDULED },
+          { conversationRef: 'wa:b', ...base, scheduledRequest: null },
+          { conversationRef: 'wa:c', ...base },
+        ],
+        nextCursor: null,
+      });
+    });
+  });
+
   describe('downloadStaffMedia', () => {
     let dir: string;
     let tmpdirSpy: jest.SpyInstance<string, []>;

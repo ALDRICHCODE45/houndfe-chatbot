@@ -126,6 +126,21 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       );
     });
 
+    it('keeps the unscheduled answer free of scheduling fields and passes the branch zone through (unit 14)', async () => {
+      const withZone = {
+        ...created,
+        businessHours: {
+          openNow: false,
+          nextOpenAt: AT,
+          timeZone: 'America/Mexico_City',
+        },
+      };
+      request.mockReturnValue(of(response(withZone, 201)));
+      const result = await client.createHumanRequest(createInput);
+      expect(result).toEqual({ kind: 'ok', status: 201, response: withZone });
+      expect(sent().data).not.toHaveProperty('scheduledFor');
+    });
+
     it('resolves a 200 merge with mergedIntoId and the legacy answer', async () => {
       const merged = {
         ...created,

@@ -1,6 +1,17 @@
 import type { DeliveryZoneIntakeInput } from './human-decisions-delivery-zone.dto';
 import type { ExpirationIntakeInput } from './human-decisions-expiration.dto';
 import type { RestockIntakeInput } from './human-decisions.dto';
+import {
+  parseAlreadyScheduled,
+  parseScheduledBookingFields,
+  parseSlotUnavailable,
+  type AlreadyScheduled,
+  type ScheduledBookingFields,
+  type SlotUnavailable,
+} from './scheduling.dto';
+
+export type { AlreadyScheduled, SlotUnavailable };
+export { parseAlreadyScheduled, parseSlotUnavailable };
 
 /**
  * Human requests (docs/contracts/human-intervention-requests-5a.md) and the
@@ -58,6 +69,10 @@ export type CreateDirectHumanRequestInput = CreateHumanRequestCommon & {
   /** 1..140 chars. */
   summary: string;
   detail?: Record<string, never>;
+  /** Unit 14: exactly the `startsAt` of a bookable slot (TALK_TO_HUMAN /
+   *  COMPLAINT only; the backend rejects it on other subtypes). `null` or
+   *  absent is the unscheduled create. */
+  scheduledFor?: string | null;
 };
 
 /** Wrapped subtypes send today's human-decisions body as `detail`. */
@@ -84,6 +99,8 @@ export const HUMAN_REQUEST_SUMMARY_MAX_LENGTH = 140;
 export interface HumanRequestBusinessHours {
   openNow: boolean;
   nextOpenAt: string | null;
+  /** Unit 14: the branch's IANA zone, present when the backend sends it. */
+  timeZone?: string;
 }
 
 export interface HumanRequestCreated {
@@ -97,6 +114,12 @@ export interface HumanRequestCreated {
   businessHours: HumanRequestBusinessHours | null;
   /** Wrapped subtypes only: the legacy human-decision answer, kept raw. */
   legacy?: Record<string, unknown>;
+  /** Unit 14: set (with the three fields below) only when the answer is for
+   *  a scheduled booking. */
+  scheduledFor?: ScheduledBookingFields['scheduledFor'];
+  scheduleVersion?: ScheduledBookingFields['scheduleVersion'];
+  requiresTemplateAtStart?: ScheduledBookingFields['requiresTemplateAtStart'];
+  whatsappWindowClosesAt?: ScheduledBookingFields['whatsappWindowClosesAt'];
 }
 
 export type RateLimitedResult = {
@@ -121,6 +144,10 @@ export type CreateHumanRequestResult =
   | { kind: 'SUBTYPE_DISABLED' }
   | { kind: 'SCHEDULING_DISABLED' }
   | { kind: 'VERSION_CONFLICT' }
+  /** Unit 14, 409: re-offer the fresh `slots`; never retry the same slot. */
+  | SlotUnavailable
+  /** Unit 14, 409: the customer already holds a time; offer to reschedule. */
+  | AlreadyScheduled
   | ValidationErrorResult
   | { kind: 'NOT_FOUND' };
 
@@ -668,13 +695,20 @@ export function parseHumanRequestCreated(
       !isNullableString(businessHours.nextOpenAt ?? null)
     )
       return null;
+    if (businessHours.timeZone !== undefined && !isText(businessHours.timeZone))
+      return null;
     hours = {
       openNow: businessHours.openNow,
       nextOpenAt:
         (businessHours.nextOpenAt as string | null | undefined) ?? null,
+      ...(businessHours.timeZone === undefined
+        ? {}
+        : { timeZone: businessHours.timeZone }),
     };
   }
   if (legacy !== undefined && legacy !== null && !isRecord(legacy)) return null;
+  const scheduled = parseScheduledBookingFields(body);
+  if (scheduled === null) return null;
   return {
     id,
     folio,
@@ -683,6 +717,7 @@ export function parseHumanRequestCreated(
     mergedIntoId,
     businessHours: hours,
     ...(isRecord(legacy) ? { legacy } : {}),
+    ...(scheduled === undefined ? {} : scheduled),
   };
 }
 
@@ -1384,7 +1419,10 @@ export function isCreateHumanRequestInput(
     isText(input.conversationRef) &&
     isText(input.lastCustomerMessageAt) &&
     isText(input.summary) &&
-    input.summary.length <= HUMAN_REQUEST_SUMMARY_MAX_LENGTH
+    input.summary.length <= HUMAN_REQUEST_SUMMARY_MAX_LENGTH &&
+    (input.scheduledFor === undefined ||
+      input.scheduledFor === null ||
+      isText(input.scheduledFor))
   );
 }
 
@@ -1404,10 +1442,12 @@ export function toCreateHumanRequestBody(
     'dedupKey',
     'triggerWaMessageId',
     'detail',
+    'scheduledFor',
   ] as const;
   const source = input as Partial<Record<(typeof keys)[number], unknown>>;
   const body: Record<string, unknown> = {};
   for (const key of keys)
-    if (source[key] !== undefined) body[key] = source[key];
+    if (source[key] !== undefined && source[key] !== null)
+      body[key] = source[key];
   return body;
 }
