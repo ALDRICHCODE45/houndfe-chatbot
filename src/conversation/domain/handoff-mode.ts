@@ -25,6 +25,21 @@ export interface HandoffTransition {
   silent?: boolean;
 }
 
+/**
+ * Short per-conversation ENDING marker (human-intervention follow-ups S4,
+ * live conversation L15 f): the session `epoch` is known to be ending but
+ * its farewell is not decided yet, so neither a bot turn nor a replay of
+ * held deliveries may go out before it. Always bounded: it holds only until
+ * `until` (ISO 8601), never permanently.
+ */
+export interface HandoffEnding {
+  epoch: number;
+  until: string;
+}
+
+/** Default bound of an ENDING marker. */
+export const ENDING_BOUND_MS = 2 * 60_000;
+
 /** Persisted shape of `data.handoff`. */
 export interface HandoffState extends Omit<HandoffTransition, 'silent'> {
   /** ISO 8601 — when this state was applied; null only for the default. */
@@ -48,6 +63,19 @@ export interface HandoffState extends Omit<HandoffTransition, 'silent'> {
    * epoch ends, dropped by a newer epoch.
    */
   greetingSkippedEpoch?: number;
+  /**
+   * ENDING marker (see `HandoffEnding`). Kept while the session of that same
+   * epoch is applied (the durable BOT of its `ended`), dropped by any other
+   * epoch; cleared explicitly once the farewell outcome is known.
+   */
+  ending?: HandoffEnding;
+}
+
+/** True while the marker is set and its bound has not passed. */
+export function isEndingActive(state: HandoffState, now: Date): boolean {
+  return (
+    state.ending !== undefined && Date.parse(state.ending.until) > now.getTime()
+  );
 }
 
 /** A conversation the bot itself holds in HUMAN mode (reconcile, T7). */
@@ -109,6 +137,19 @@ export function isHandoffTransition(
   );
 }
 
+/** A malformed marker is dropped (never fatal), like the other markers. */
+function readEnding(raw: unknown): HandoffEnding | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const { epoch, until } = raw as Record<string, unknown>;
+  if (!isEpoch(epoch) || typeof until !== 'string') return undefined;
+  if (!Number.isFinite(Date.parse(until))) return undefined;
+  return { epoch, until };
+}
+
+/** True for a usable ENDING marker value. */
+export const isEndingMarker = (value: unknown): value is HandoffEnding =>
+  readEnding(value) !== undefined;
+
 /**
  * Reads a stored `data.handoff` value: the default when absent or JSON null,
  * a detached copy when valid, and `null` when present but corrupt.
@@ -125,11 +166,13 @@ export function readHandoffState(raw: unknown): HandoffState | null {
     .safetyNoticeEpoch;
   const greetingSkippedEpoch = (raw as unknown as Record<string, unknown>)
     .greetingSkippedEpoch;
+  const ending = readEnding((raw as unknown as Record<string, unknown>).ending);
   return {
     mode: raw.mode,
     epoch: raw.epoch,
     requestId: raw.requestId,
     updatedAt,
+    ...(ending === undefined ? {} : { ending }),
     ...(isEpoch(greetedEpoch) ? { greetedEpoch } : {}),
     ...(isEpoch(safetyNoticeEpoch) ? { safetyNoticeEpoch } : {}),
     ...(isEpoch(greetingSkippedEpoch) ? { greetingSkippedEpoch } : {}),
@@ -183,6 +226,9 @@ export function resolveHandoffApply(
       epoch: next.epoch,
       requestId: next.requestId,
       updatedAt: now,
+      ...(stored.ending !== undefined && stored.ending.epoch === next.epoch
+        ? { ending: stored.ending }
+        : {}),
       ...(stored.greetedEpoch !== undefined && stored.epoch === next.epoch
         ? { greetedEpoch: stored.greetedEpoch }
         : {}),

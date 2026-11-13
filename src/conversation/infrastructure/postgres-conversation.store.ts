@@ -18,6 +18,7 @@ import {
 } from '../domain/conversation-store';
 import {
   CorruptHandoffStateError,
+  isEndingMarker,
   isGreetedEpoch,
   readHandoffState,
   resolveHandoffApply,
@@ -643,6 +644,46 @@ export class PostgresConversationStore implements ConversationStore {
          AND data->'handoff'->>'mode' = 'HUMAN'
          AND data->'handoff'->>'epoch' = $2::text
          AND COALESCE(data->'handoff'->>'safetyNoticeEpoch', '') <> $2::text`,
+      [senderId, epoch],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  /**
+   * Single statement (row lock, serializes with `applyHandoff`): writes only
+   * `data.handoff.ending`, and only while a handoff value exists whose
+   * stored epoch is not newer than `epoch`.
+   */
+  async markHandoffEnding(
+    senderId: string,
+    epoch: number,
+    until: string,
+  ): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    if (!isEndingMarker({ epoch, until })) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = jsonb_set(data, '{handoff,ending}', $3::jsonb, true)
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND jsonb_typeof(data->'handoff'->'updatedAt') = 'string'
+         AND CASE WHEN jsonb_typeof(data->'handoff'->'epoch') = 'number'
+                  THEN (data->'handoff'->>'epoch')::numeric <= $2::numeric
+                  ELSE false END`,
+      [senderId, epoch, JSON.stringify({ epoch, until })],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  /** Removes `data.handoff.ending` when it is the marker of `epoch`. */
+  async clearHandoffEnding(senderId: string, epoch: number): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = data #- '{handoff,ending}'
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND data->'handoff'->'ending'->>'epoch' = $2::text`,
       [senderId, epoch],
     );
     return (rowCount ?? 0) === 1;

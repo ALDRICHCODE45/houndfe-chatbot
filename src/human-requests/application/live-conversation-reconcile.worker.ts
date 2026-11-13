@@ -28,7 +28,10 @@ export interface LiveReconcilePorts {
   mode: Pick<
     HandoffModeService,
     'getState' | 'applyStarted' | 'applyEnded' | 'listHuman'
-  >;
+  > &
+    /** Follow-ups S4: the ENDING marker (see below). Optional: absent → no
+     *  marker, the replay goes out right away (hand-built harnesses). */
+    Partial<Pick<HandoffModeService, 'markEnding' | 'clearEnding'>>;
   client: Pick<
     LiveConversationClient,
     'listHumanConversations' | 'getConversationState' | 'sessionAck'
@@ -102,7 +105,10 @@ const HINT_MAP_PRUNE_AT = 2000;
  *     (confirmed by one single read, bounded) → a missed `ended` with
  *     farewell=false: durable BOT keeping the (higher) epoch, then the replay
  *     of the held deliveries; no farewell and no ack (a backend BOT means the
- *     session is already ENDED there).
+ *     session is already ENDED there). The `conversation.ended` item may
+ *     still be on its way (its farewell must come first), so the revert sets
+ *     a short ENDING marker (bounded, 2 min) that the replay paths honour: it
+ *     is cleared by that item's handling or released by its bound.
  *
  * The compare-and-set is epoch-monotonic, so a stale read can never move the
  * state backwards, and every step is idempotent. No phone reaches a log.
@@ -487,8 +493,14 @@ export class LiveConversationReconcileWorker {
       // Missed `ended` with farewell=false: keep the higher epoch (the CAS
       // is monotonic, so a lower backend epoch must not lose the local one).
       const epoch = Math.max(local.epoch, backend.handoffEpoch);
+      // ENDING marker BEFORE the durable BOT (it survives that write), so no
+      // window exists where the conversation is BOT without it.
+      const marked = await this.markEnding(senderId, epoch);
       const applied = await this.ports.mode.applyEnded(senderId, epoch);
-      if (!applied.applied) return 'in_sync';
+      if (!applied.applied) {
+        if (marked) await this.clearEnding(senderId, epoch);
+        return 'in_sync';
+      }
       this.logger.log(
         `missed conversation.ended applied for ${masked}: back to BOT at epoch ${epoch}, no farewell`,
       );
@@ -507,6 +519,30 @@ export class LiveConversationReconcileWorker {
       await this.ports.mode.applyEnded(senderId, backend.handoffEpoch);
     }
     return 'in_sync';
+  }
+
+  /** Best effort: a failure is logged and the revert goes on without the
+   *  marker (the order of a late farewell is not worth losing the revert). */
+  private async markEnding(senderId: string, epoch: number): Promise<boolean> {
+    if (this.ports.mode.markEnding === undefined) return false;
+    try {
+      return await this.ports.mode.markEnding(senderId, epoch);
+    } catch (error) {
+      this.logger.warn(
+        `ENDING marker not set for ${maskConversationRef(senderId)}: ${describeError(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private async clearEnding(senderId: string, epoch: number): Promise<void> {
+    try {
+      await this.ports.mode.clearEnding?.(senderId, epoch);
+    } catch (error) {
+      this.logger.warn(
+        `ENDING marker not cleared for ${maskConversationRef(senderId)}, its bound releases it: ${describeError(error)}`,
+      );
+    }
   }
 
   /** session-ack STARTED, best effort: a refusal is logged (the next run

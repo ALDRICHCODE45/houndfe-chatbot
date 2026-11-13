@@ -322,6 +322,26 @@ export interface ConversationStore {
   claimHandoffSafetyNotice?(senderId: string, epoch: number): Promise<boolean>;
 
   /**
+   * Follow-ups S4 (ENDING marker): sets `data.handoff.ending = {epoch,
+   * until}` (replacing an earlier one). Applies only while a handoff value
+   * exists and its stored epoch is <= `epoch` (a newer session is never
+   * touched); never creates a row. `until` is an ISO 8601 instant. `true`
+   * when written. The marker is kept by the `applyHandoff` of that same
+   * epoch and dropped by any other epoch.
+   */
+  markHandoffEnding?(
+    senderId: string,
+    epoch: number,
+    until: string,
+  ): Promise<boolean>;
+
+  /**
+   * Follow-ups S4: removes the ENDING marker, only when it is the one of
+   * `epoch`. `true` when a marker was removed.
+   */
+  clearHandoffEnding?(senderId: string, epoch: number): Promise<boolean>;
+
+  /**
    * Live conversation T7 (reconcile): the conversations held in HUMAN mode,
    * ordered by sender id, at most `limit`.
    */

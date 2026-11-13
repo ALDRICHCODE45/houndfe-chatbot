@@ -181,7 +181,8 @@ export class WebhookDispatcherService {
     // S7 handoff gate. Required by DI (no @Optional: the runtime graph must
     // never silently lose the gate); optional in TS only for harnesses.
     @Inject(HandoffModeService)
-    private readonly handoffMode?: Pick<HandoffModeService, 'isHumanMode'>,
+    private readonly handoffMode?: Pick<HandoffModeService, 'isHumanMode'> &
+      Partial<Pick<HandoffModeService, 'isSilenced'>>,
     // S5 pending deliveries (window / HUMAN replay). Optional for harnesses.
     @Optional()
     @Inject(HumanRequestDeliveryService)
@@ -597,9 +598,15 @@ export class WebhookDispatcherService {
     return true;
   }
 
-  /** S7: false without a wired service (harnesses); read errors propagate. */
+  /**
+   * S7: false without a wired service (harnesses); read errors propagate.
+   * Follow-ups S4: also true while the session is ENDING (durable BOT, the
+   * farewell not decided yet), from the same single local read.
+   */
   private async isHumanMode(senderId: string): Promise<boolean> {
     if (this.handoffMode === undefined) return false;
+    if (this.handoffMode.isSilenced !== undefined)
+      return this.handoffMode.isSilenced(senderId);
     return this.handoffMode.isHumanMode(senderId);
   }
 

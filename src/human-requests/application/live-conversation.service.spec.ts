@@ -123,9 +123,19 @@ const setup = (
     wake?: boolean | 'throws';
     /** Wires the optional scheduling port (T4 L7: clear a pending offer). */
     scheduling?: boolean | 'throws';
+    /** Follow-ups S4: `markEnding` rejects. */
+    markEndingFails?: boolean;
   } = {},
 ) => {
   const events: string[] = [];
+  const markEndingCalls: Array<{
+    id: string;
+    epoch: number;
+    modeThen: Promise<string>;
+  }> = [];
+  const clearEndingCalls: Array<{ id: string; epoch: number }> = [];
+  /** Each entry makes one `clearEnding` call reject. */
+  const clearEndingFailures: Array<true> = [];
   const clearedOffers: string[] = [];
   const wakes: string[] = [];
   const conversation = new InMemoryConversationStore();
@@ -155,6 +165,24 @@ const setup = (
     applyEnded: (id: string, epoch: number) => {
       events.push('cas:ended');
       return modeService.applyEnded(id, epoch);
+    },
+    markEnding: (id: string, epoch: number) => {
+      markEndingCalls.push({
+        id,
+        epoch,
+        modeThen: modeService.getState(id).then((st) => st.mode),
+      });
+      if (options.markEndingFails === true)
+        return Promise.reject(new Error('db down'));
+      return modeService.markEnding(id, epoch);
+    },
+    clearEnding: (id: string, epoch: number) => {
+      clearEndingCalls.push({ id, epoch });
+      if (clearEndingFailures.length > 0) {
+        clearEndingFailures.shift();
+        return Promise.reject(new Error('db down'));
+      }
+      return modeService.clearEnding(id, epoch);
     },
     markGreeted: (id: string, epoch: number) => {
       events.push('greeted');
@@ -290,7 +318,10 @@ const setup = (
       store,
       client: feedClient,
       sender,
-      handoff: { isHumanMode: (id: string) => modeService.isHumanMode(id) },
+      handoff: {
+        isHumanMode: (id: string) => modeService.isHumanMode(id),
+        isEnding: (id: string) => modeService.isEnding(id),
+      },
       isWindowOpen,
       customerStyle,
       live: new LiveConversationService({
@@ -344,6 +375,9 @@ const setup = (
   );
   return {
     clearedOffers,
+    markEndingCalls,
+    clearEndingCalls,
+    clearEndingFailures,
     service,
     store,
     events,
@@ -2469,5 +2503,150 @@ describe('LiveConversationService outbox wake (ordering of bot live notices)', (
         ackState: 'ACKED',
       });
     });
+  });
+});
+
+describe('ENDING marker around the ended handler (follow-ups S4)', () => {
+  beforeEach(() => {
+    for (const level of ['log', 'warn', 'error', 'debug'] as const)
+      jest.spyOn(Logger.prototype, level).mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const timeoutItem = (id: string, resumeNotice = true) =>
+    ended(id, { reason: 'START_TIMEOUT', farewell: false, resumeNotice });
+
+  it('a DUPLICATE ended after a reconcile revert sends the farewell before any replayed row', async () => {
+    const h = setup();
+    await muted(h);
+    await h.service.accept(clarification('r1'));
+    // What the reconcile worker does for a missed ended: marker, then BOT.
+    await h.mode.markEnding(SENDER, 3);
+    await h.mode.applyEnded(SENDER, 3);
+    // The reconcile replay, a customer inbound and the 15 s sweep all land
+    // before the ended item does: none releases anything.
+    await h.service.onCustomerInbound(REF);
+    await expect(h.service.replayHeld()).resolves.toBe(0);
+    await h.service.onCustomerInbound(REF);
+    expect(h.sent).toEqual([]);
+
+    await h.service.accept(ended('r2'));
+    expect(texts(h)).toEqual([
+      FAREWELL,
+      'Le comparto la respuesta del equipo:\nSí, lo tenemos en azul.',
+    ]);
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(false);
+  });
+
+  it('sets the marker BEFORE the durable BOT and clears it after the farewell outcome', async () => {
+    const h = setup();
+    await muted(h);
+    await h.service.accept(ended('m1'));
+    expect(h.markEndingCalls).toHaveLength(1);
+    expect(h.markEndingCalls[0]).toMatchObject({ id: SENDER, epoch: 3 });
+    // Still HUMAN when the marker was written.
+    await expect(h.markEndingCalls[0].modeThen).resolves.toBe('HUMAN');
+    expect(h.clearEndingCalls).toEqual([{ id: SENDER, epoch: 3 }]);
+    expect(h.events.indexOf(`send:${FAREWELL}`)).toBeLessThan(
+      h.events.indexOf('ack:ENDED'),
+    );
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(false);
+  });
+
+  it('a customer message between the durable BOT and the farewell is silenced (isSilenced) and released after', async () => {
+    const h = setup();
+    await muted(h);
+    const seen: boolean[] = [];
+    h.window.hook = async () => {
+      h.window.hook = undefined;
+      // The gap: BOT is durable, the farewell is not out yet.
+      seen.push(
+        (await h.mode.isHumanMode(SENDER)) === false &&
+          (await h.mode.isSilenced(SENDER)),
+      );
+    };
+    await h.service.accept(ended('g1'));
+    expect(seen).toEqual([true]);
+    await expect(h.mode.isSilenced(SENDER)).resolves.toBe(false);
+  });
+
+  it('is cleared when the end is STALE (older epoch), without ever silencing the newer session', async () => {
+    const h = setup();
+    await muted(h, 5);
+    await h.service.accept(ended('s1', { handoffEpoch: 3 }));
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(false);
+    await expect(handoff(h)).resolves.toMatchObject({
+      mode: 'HUMAN',
+      epoch: 5,
+    });
+  });
+
+  it('is cleared without a farewell (farewell false, closed window) and on a START_TIMEOUT revert', async () => {
+    const none = setup();
+    await muted(none);
+    await none.service.accept(ended('n1', { farewell: false }));
+    await expect(none.mode.isEnding(SENDER)).resolves.toBe(false);
+    expect(none.clearEndingCalls).toHaveLength(1);
+
+    const closed = setup();
+    await muted(closed);
+    closed.window.open = false;
+    await closed.service.accept(ended('n2'));
+    await expect(closed.mode.isEnding(SENDER)).resolves.toBe(false);
+
+    const timeout = setup();
+    await timeout.service.accept(timeoutItem('n3', false));
+    await expect(timeout.mode.isEnding(SENDER)).resolves.toBe(false);
+
+    const resume = setup();
+    await resume.service.accept(started('n4'));
+    await resume.service.accept(timeoutItem('n5'));
+    expect(texts(resume)).toContain(RESUME);
+    await expect(resume.mode.isEnding(SENDER)).resolves.toBe(false);
+  });
+
+  it('a failed send still clears it (the outcome is known) and the ack ENDED still runs', async () => {
+    const h = setup();
+    await muted(h);
+    h.sendScript.push(sendError(500));
+    await h.service.accept(ended('f1'));
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(false);
+    expect(h.acks).toHaveLength(1);
+  });
+
+  it('a clear that fails once is retried; two failures leave it to the bound and never fail the item', async () => {
+    const once = setup();
+    await muted(once);
+    once.clearEndingFailures.push(true);
+    await once.service.accept(ended('c1'));
+    expect(once.clearEndingCalls).toHaveLength(2);
+    await expect(once.mode.isEnding(SENDER)).resolves.toBe(false);
+
+    const twice = setup();
+    await muted(twice);
+    twice.clearEndingFailures.push(true, true);
+    await expect(twice.service.accept(ended('c2'))).resolves.toBeUndefined();
+    expect(twice.acks).toHaveLength(1);
+    // Left set; its bound (2 min) is what releases it.
+    await expect(twice.mode.isEnding(SENDER)).resolves.toBe(true);
+  });
+
+  it('a marker that cannot be set never blocks the farewell', async () => {
+    const h = setup({ markEndingFails: true });
+    await muted(h);
+    await h.service.accept(ended('k1'));
+    expect(texts(h)).toEqual([FAREWELL]);
+  });
+
+  it('a retried ended (the first attempt threw) re-arms the marker and still sends the farewell once', async () => {
+    const h = setup();
+    await muted(h);
+    h.window.fail = true;
+    await expect(h.service.accept(ended('t1'))).rejects.toThrow();
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(true);
+    h.window.fail = false;
+    await h.service.accept(ended('t1'));
+    expect(texts(h)).toEqual([FAREWELL]);
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(false);
   });
 });

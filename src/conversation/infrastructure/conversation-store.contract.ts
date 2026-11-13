@@ -646,6 +646,96 @@ export function runConversationStoreContract(
         });
       });
 
+      // Follow-ups S4: the ENDING marker lives inside the CAS-owned handoff.
+      describe('ENDING marker (follow-ups S4)', () => {
+        const UNTIL = '2026-11-12T10:02:00.000Z';
+
+        it('is refused without a handoff value and creates no row', async () => {
+          await expect(store.markHandoffEnding!('n0', 1, UNTIL)).resolves.toBe(
+            false,
+          );
+          expect(await store.get('n0')).toBeNull();
+        });
+
+        it('is set for the current or a newer epoch, never for an older one', async () => {
+          await store.applyHandoff!('n1', human(3));
+          await expect(store.markHandoffEnding!('n1', 2, UNTIL)).resolves.toBe(
+            false,
+          );
+          await expect(store.getHandoff!('n1')).resolves.not.toHaveProperty(
+            'ending',
+          );
+          await expect(store.markHandoffEnding!('n1', 3, UNTIL)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n1')).resolves.toMatchObject({
+            ...human(3),
+            ending: { epoch: 3, until: UNTIL },
+          });
+          await expect(store.markHandoffEnding!('n1', 4, UNTIL)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n1')).resolves.toMatchObject({
+            ending: { epoch: 4, until: UNTIL },
+          });
+        });
+
+        it('survives the durable BOT of that epoch and is dropped by another epoch', async () => {
+          await store.applyHandoff!('n2', human(2));
+          await store.markHandoffEnding!('n2', 2, UNTIL);
+          await store.applyHandoff!('n2', bot(2));
+          await expect(store.getHandoff!('n2')).resolves.toMatchObject({
+            ...bot(2),
+            ending: { epoch: 2, until: UNTIL },
+          });
+          await store.applyHandoff!('n2', human(3));
+          await expect(store.getHandoff!('n2')).resolves.not.toHaveProperty(
+            'ending',
+          );
+
+          await store.applyHandoff!('n3', human(2));
+          await store.markHandoffEnding!('n3', 5, UNTIL);
+          await store.applyHandoff!('n3', bot(4));
+          await expect(store.getHandoff!('n3')).resolves.not.toHaveProperty(
+            'ending',
+          );
+        });
+
+        it('is cleared only for its own epoch and survives update() writes', async () => {
+          await store.applyHandoff!('n4', human(1));
+          await store.markHandoffEnding!('n4', 1, UNTIL);
+          await store.update('n4', {
+            lastMessageAt: T,
+            data: { cart: ['x'], handoff: bot(9) as never },
+          });
+          await expect(store.getHandoff!('n4')).resolves.toMatchObject({
+            ending: { epoch: 1, until: UNTIL },
+          });
+          await expect(store.clearHandoffEnding!('n4', 2)).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n4', 1)).resolves.toBe(true);
+          await expect(store.clearHandoffEnding!('n4', 1)).resolves.toBe(false);
+          await expect(store.getHandoff!('n4')).resolves.toMatchObject(
+            human(1),
+          );
+          await expect(store.getHandoff!('n4')).resolves.not.toHaveProperty(
+            'ending',
+          );
+        });
+
+        it('refuses a bad epoch or instant', async () => {
+          await store.applyHandoff!('n5', human(1));
+          await expect(
+            store.markHandoffEnding!('n5', 1.5, UNTIL),
+          ).resolves.toBe(false);
+          await expect(
+            store.markHandoffEnding!('n5', 1, 'not-a-date'),
+          ).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n5', -1)).resolves.toBe(
+            false,
+          );
+        });
+      });
+
       describe('listing HUMAN conversations (live conversation T7)', () => {
         it('lists only HUMAN handoffs, ordered, bounded by the limit', async () => {
           await store.applyHandoff!('l-c', human(2, 'req-c'));

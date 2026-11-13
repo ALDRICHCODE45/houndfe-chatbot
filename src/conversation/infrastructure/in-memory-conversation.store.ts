@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { AgentTurnCommit } from '../domain/conversation-store';
 import {
   CorruptHandoffStateError,
+  isEndingMarker,
   isGreetedEpoch,
   readHandoffState,
   resolveHandoffApply,
@@ -336,6 +337,37 @@ export class InMemoryConversationStore implements ConversationStore {
       ...live.data,
       handoff: { ...state, safetyNoticeEpoch: epoch },
     };
+    return true;
+  }
+
+  async markHandoffEnding(
+    senderId: string,
+    epoch: number,
+    until: string,
+  ): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    if (!isEndingMarker({ epoch, until })) return false;
+    const live = this.map.get(senderId);
+    if (live === undefined) return false;
+    const state = readHandoffState(live.data.handoff);
+    if (state === null || state.updatedAt === null || state.epoch > epoch)
+      return false;
+    live.data = {
+      ...live.data,
+      handoff: { ...state, ending: { epoch, until } },
+    };
+    return true;
+  }
+
+  async clearHandoffEnding(senderId: string, epoch: number): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const live = this.map.get(senderId);
+    if (live === undefined) return false;
+    const state = readHandoffState(live.data.handoff);
+    if (state === null || state.ending?.epoch !== epoch) return false;
+    const rest = { ...state };
+    delete rest.ending;
+    live.data = { ...live.data, handoff: rest };
     return true;
   }
 

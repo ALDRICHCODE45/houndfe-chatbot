@@ -157,6 +157,46 @@ describe('LiveConversationReconcileWorker (rule 9)', () => {
       expect(t.sessionAck).not.toHaveBeenCalled();
     });
 
+    it('ENDING marker (follow-ups S4): set with the revert (before the replay runs), at the reverted epoch, bounded', async () => {
+      const t = build({ states: { [REF_A]: botState(4) } });
+      await t.mode.applyStarted(PHONE_A, 3, 'req-3');
+      let endingAtReplay: boolean | undefined;
+      t.replay.mockImplementation(async () => {
+        endingAtReplay = await t.mode.isEnding(PHONE_A);
+      });
+      await t.worker.reconcileAll();
+      expect(endingAtReplay).toBe(true);
+      const state = await t.mode.getState(PHONE_A);
+      expect(state).toMatchObject({ mode: 'BOT', epoch: 4 });
+      expect(state.ending?.epoch).toBe(4);
+      // Bounded: about 2 minutes ahead, never permanent.
+      const ahead = Date.parse(state.ending!.until) - Date.now();
+      expect(ahead).toBeGreaterThan(60_000);
+      expect(ahead).toBeLessThanOrEqual(2 * 60_000);
+      // The ended item's own handling clears it.
+      await t.mode.clearEnding(PHONE_A, 4);
+      await expect(t.mode.isEnding(PHONE_A)).resolves.toBe(false);
+    });
+
+    it('sets no marker when nothing was reverted (already in sync) and one that cannot be set never blocks the revert', async () => {
+      const synced = build({ states: { [REF_A]: botState(0) } });
+      await synced.worker.reconcileAll();
+      await expect(synced.mode.isEnding(PHONE_A)).resolves.toBe(false);
+
+      const t = build({ states: { [REF_A]: botState(4) } });
+      await t.mode.applyStarted(PHONE_A, 3, 'req-3');
+      jest
+        .spyOn(HandoffModeService.prototype, 'markEnding')
+        .mockRejectedValueOnce(new Error('db down'));
+      const result = await t.worker.reconcileAll();
+      expect(result).toMatchObject({ kind: 'ok', ended: 1 });
+      await expect(t.mode.getState(PHONE_A)).resolves.toMatchObject({
+        mode: 'BOT',
+        epoch: 4,
+      });
+      expect(t.replay).toHaveBeenCalledTimes(1);
+    });
+
     it('an unknown conversation on the backend (404 → BOT/0) still reverts a local HUMAN, keeping the local epoch', async () => {
       const t = build({ states: { [REF_A]: botState(0) } });
       await t.mode.applyStarted(PHONE_A, 2, 'req-2');
