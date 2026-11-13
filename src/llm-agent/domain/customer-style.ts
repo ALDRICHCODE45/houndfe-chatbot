@@ -237,6 +237,29 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Seguimos por aquí, ¿en qué le ayudo?',
     'Seguimos por aquí, ¿en qué te ayudo?',
   ],
+  // Scheduled conversations (unit 14, owner-approved S3 copy). Phrase-level
+  // on purpose: these texts interpolate day/time pieces, so the pairs only
+  // cover the fixed usted wording around them.
+  [
+    '¿Quiere que una persona le atienda en alguno',
+    '¿Quieres que una persona te atienda en alguno',
+  ],
+  ['Responda con el número', 'Responde con el número'],
+  ['qué horario prefiere', 'qué horario prefieres'],
+  ['le escribe por aquí', 'te escribe por aquí'],
+  ['le atiende por aquí', 'te atiende por aquí'],
+  ['A esa hora le escribimos', 'A esa hora te escribimos'],
+  ['cuando le llegue el mensaje', 'cuando te llegue el mensaje'],
+  ['respóndanos', 'respóndenos'],
+  [
+    'Ya dejé su solicitud y le escriben en cuanto abramos',
+    'Ya dejé tu solicitud y te escriben en cuanto abramos',
+  ],
+  ['Ya tiene una cita', 'Ya tienes una cita'],
+  ['¿Quiere cambiarla?', '¿Quieres cambiarla?'],
+  ['Le recuerdo que', 'Te recuerdo que'],
+  ['Su cita', 'Tu cita'],
+  ['su cita', 'tu cita'],
   // Live conversation safety notice (contract rule 8, owner-approved).
   [
     'Tenemos una falla técnica, en cuanto se resuelva le respondemos.',
