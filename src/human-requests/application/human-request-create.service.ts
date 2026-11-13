@@ -6,6 +6,7 @@ import {
   type CancelHumanRequestInput,
   type CreateDirectHumanRequestInput,
   type CreateHumanRequestInput,
+  type HumanRequestBusinessHours,
   type HumanRequestCreated,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type { BackendOutboxService } from '../../backend-outbox/application/backend-outbox.service';
@@ -24,7 +25,9 @@ import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
   ASK_TEAM_REGISTERED_REPLY,
+  buildTalkToHumanRequest,
   buildUnknownQuestionRequest,
+  type TalkToHumanInput,
   type UnknownQuestionInput,
 } from '../domain/human-request-create';
 import {
@@ -70,6 +73,18 @@ export type AskTeamOutcome =
   /** Transient failure: the create is in the outbox (REQUEST_CREATE). */
   | { kind: 'queued' }
   | { kind: 'failed'; reason: string };
+
+/** T8: a TALK_TO_HUMAN create. `merged` = it joined an already open request;
+ *  `businessHours` is the create answer's calendar verdict (null = unknown,
+ *  never "closed"). */
+export type TalkToHumanOutcome =
+  | {
+      kind: 'registered';
+      requestId: string | null;
+      merged: boolean;
+      businessHours: HumanRequestBusinessHours | null;
+    }
+  | Exclude<AskTeamOutcome, { kind: 'registered' }>;
 
 const CANCEL_REASONS: ReadonlySet<unknown> = new Set([
   'CUSTOMER_WITHDREW',
@@ -118,20 +133,60 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       now: this.clock(),
     });
     if (request === null) return { kind: 'failed', reason: 'invalid_envelope' };
+    const result = await this.submit('askTeam', request);
+    return result.kind === 'created'
+      ? { kind: 'registered', requestId: result.requestId }
+      : result;
+  }
+
+  /** T8 / S6: creates a TALK_TO_HUMAN request (merging into the customer's
+   *  open one) without asking first. Never throws. */
+  async requestTalkToHuman(
+    input: TalkToHumanInput,
+  ): Promise<TalkToHumanOutcome> {
+    const request = buildTalkToHumanRequest(input, {
+      sourceRequestId: this.newSourceRequestId(),
+      now: this.clock(),
+    });
+    if (request === null) return { kind: 'failed', reason: 'invalid_envelope' };
+    const result = await this.submit('talk-to-human', request);
+    return result.kind === 'created'
+      ? {
+          kind: 'registered',
+          requestId: result.requestId,
+          merged: result.response.outcome === 'MERGED',
+          businessHours: result.response.businessHours,
+        }
+      : result;
+  }
+
+  /** The synchronous create shared by every direct subtype. */
+  private async submit(
+    label: string,
+    request: CreateDirectHumanRequestInput,
+  ): Promise<
+    | {
+        kind: 'created';
+        requestId: string | null;
+        response: HumanRequestCreated;
+      }
+    | Exclude<AskTeamOutcome, { kind: 'registered' }>
+  > {
     let result;
     try {
       result = await this.ports.client.createHumanRequest(request);
     } catch (error) {
       this.logger.warn(
-        `askTeam create failed for ${maskConversationRef(request.conversationRef)}, queueing: ${describeError(error)}`,
+        `${label} create failed for ${maskConversationRef(request.conversationRef)}, queueing: ${describeError(error)}`,
       );
-      return this.queue(request);
+      return this.queue(request, label);
     }
     switch (result.kind) {
       case 'ok':
         return {
-          kind: 'registered',
+          kind: 'created',
           requestId: await this.recordOpen(request, result.response, false),
+          response: result.response,
         };
       case 'CUSTOMER_OPEN_LIMIT':
         return { kind: 'open_limit' };
@@ -139,10 +194,10 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
         return { kind: 'customer_rate_limited' };
       case 'RATE_LIMITED':
       case 'VERSION_CONFLICT':
-        return this.queue(request);
+        return this.queue(request, label);
       default:
         this.logger.error(
-          `askTeam create for ${maskConversationRef(request.conversationRef)} refused: ${result.kind}`,
+          `${label} create for ${maskConversationRef(request.conversationRef)} refused: ${result.kind}`,
         );
         return { kind: 'failed', reason: result.kind };
     }
@@ -159,7 +214,8 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
 
   private async queue(
     request: CreateDirectHumanRequestInput,
-  ): Promise<AskTeamOutcome> {
+    label: string,
+  ): Promise<Exclude<AskTeamOutcome, { kind: 'registered' }>> {
     try {
       await this.ports.outbox.enqueue({
         conversationRef: request.conversationRef,
@@ -172,7 +228,7 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       return { kind: 'queued' };
     } catch (error) {
       this.logger.error(
-        `askTeam queue failed for ${maskConversationRef(request.conversationRef)}: ${describeError(error)}`,
+        `${label} queue failed for ${maskConversationRef(request.conversationRef)}: ${describeError(error)}`,
       );
       return { kind: 'failed', reason: 'queue_failed' };
     }
@@ -214,7 +270,10 @@ export class HumanRequestCreateService implements BackendOutboxDeliveryPort {
       case 'ok':
         // A registry failure throws: the replay answers REPLAYED.
         await this.recordOpen(request, result.response, true);
-        await this.confirmQueued(request.conversationRef ?? null);
+        // The "Ya le pregunté al equipo" copy is wrong for a talk-to-human
+        // request; its customer already got the queued notice.
+        if (request.subtype !== 'TALK_TO_HUMAN')
+          await this.confirmQueued(request.conversationRef ?? null);
         return { outcome: 'DELIVERED' };
       case 'RATE_LIMITED':
       case 'CUSTOMER_RATE_LIMITED':

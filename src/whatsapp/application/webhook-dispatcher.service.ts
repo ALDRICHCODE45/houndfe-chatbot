@@ -44,6 +44,13 @@ import { HandoffModeService } from '../../conversation/application/handoff-mode.
 import { checkHandoffSendHold } from '../../conversation/application/handoff-send-hold';
 import { maskConversationRef } from '../../human-requests/domain/human-request-feed';
 import { HumanRequestDeliveryService } from '../../human-requests/application/human-request-delivery.service';
+import { HumanRequestCreateService } from '../../human-requests/application/human-request-create.service';
+import { TalkToHumanService } from './talk-to-human.service';
+import { isTalkToHumanRequest } from '../domain/talk-to-human-intent';
+import {
+  OUT_OF_HOURS_POLICY,
+  type OutOfHoursPolicy,
+} from '../domain/out-of-hours-policy';
 import { normalizeMetaStatuses } from './meta-status-normalizer';
 import {
   InboundMessage,
@@ -175,7 +182,26 @@ export class WebhookDispatcherService {
       HumanRequestDeliveryService,
       'onCustomerInbound'
     >,
-  ) {}
+    // T8 / S6 talk to a person. Optional for harnesses: without the team
+    // service the turn runs as before. `OUT_OF_HOURS_POLICY` is the unit 14
+    // branch point; nothing provides it yet, so the fixed text applies.
+    @Optional()
+    @Inject(HumanRequestCreateService)
+    team?: Pick<HumanRequestCreateService, 'requestTalkToHuman'>,
+    @Optional()
+    @Inject(OUT_OF_HOURS_POLICY)
+    outOfHours?: OutOfHoursPolicy,
+  ) {
+    this.talkToHuman =
+      team === undefined
+        ? undefined
+        : new TalkToHumanService({
+            team,
+            ...(outOfHours === undefined ? {} : { policy: outOfHours }),
+          });
+  }
+
+  private readonly talkToHuman?: TalkToHumanService;
 
   async dispatch(event: WebhookEventDto): Promise<void> {
     // ─── (0) S3 statuses → outbox; never the agent or a reply ─────────
@@ -311,6 +337,13 @@ export class WebhookDispatcherService {
         // S5: replay pending/held team deliveries; never awaited.
         this.notifyHumanRequests(message.senderId);
 
+        // ─── (3c) T8 / S6: a clear "quiero hablar con una persona" ──────
+        // Plain text only. Creates the TALK_TO_HUMAN request and answers the
+        // approved copy without an LLM turn; the mode is re-checked before
+        // the send (a claim may have landed meanwhile). A create that
+        // promised nothing falls through to the normal turn.
+        if (await this.tryTalkToHuman(message)) continue;
+
         // ─── (4) Pending-marker short-circuit (ADR-29 defense-in-depth)
         // The runner has the same gate; this branch keeps the dispatcher
         // consistent even if a caller bypasses the runner.
@@ -438,6 +471,42 @@ export class WebhookDispatcherService {
         );
       }
     }
+  }
+
+  /** T8 / S6. True when the message was handled (replied or dropped). */
+  private async tryTalkToHuman(message: InboundMessage): Promise<boolean> {
+    if (
+      this.talkToHuman === undefined ||
+      message.media != null ||
+      message.mirrorOnly !== undefined ||
+      message.interactiveReplyId !== undefined ||
+      !isTalkToHumanRequest(message.text)
+    )
+      return false;
+    const reply = await this.talkToHuman.handle({
+      senderId: message.senderId,
+      text: message.text,
+      ...(Number.isNaN(Date.parse(message.timestamp))
+        ? {}
+        : { inboundAt: new Date(message.timestamp).toISOString() }),
+      triggerWaMessageId: message.messageId,
+    });
+    if (reply === null) return false;
+    if (await this.isHumanMode(message.senderId)) {
+      this.logger.log(
+        `handoff HUMAN mid-turn: drop talk-to-human reply for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+      );
+      await this.markSeenSafely(message.messageId);
+      return true;
+    }
+    this.logger.log(
+      `talk-to-human handled ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+    );
+    await this.replyAndMarkSeen(
+      message,
+      applyCustomerStyle(reply, this.customerStyle(message)),
+    );
+    return true;
   }
 
   /** S7: false without a wired service (harnesses); read errors propagate. */
