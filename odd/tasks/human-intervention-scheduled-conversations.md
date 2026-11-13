@@ -1,0 +1,31 @@
+# Human intervention — scheduled conversations (backend unit 14)
+
+When the customer asks for a person out of hours, the bot offers up to 3 slots, books one, and lets the customer reschedule, cancel or ask about it; the bot relays the reminder and staff reschedules. From the claim on, unit 11 applies unchanged.
+Contract: houndfe-backend `docs/chatbot-handoff/chatbot-requests-bot-contract.md` §"Scheduled conversations (unit 14)" (commit 5b549e18). Branch: `feat/scheduled-conversations`.
+
+## Specs
+
+- **S1 — Owner directives (unit 9 L1):** performance first across both servers; local/dev disposable.
+- **S2 — Contract (final, 5b549e18):** slots `GET /chatbot-api/scheduling/slots?conversationRef=&lastCustomerMessageAt=` (≤3 slots `{startsAt, withinWindow}`, `timeZone`, `whatsappWindowClosesAt`, `businessHours {openNow, nextOpenAt, timeZone}`, weekly open ranges + closed dates for 14 days; `422 SCHEDULING_DISABLED` → fall back to the unit 11 out-of-hours create; `slots: []` → no free time). Book: `POST /chatbot-api/requests` + `scheduledFor` (TALK_TO_HUMAN / COMPLAINT; `409 SLOT_UNAVAILABLE {slots, timeZone, whatsappWindowClosesAt}` → re-offer, don't retry the same slot; `409 ALREADY_SCHEDULED {requestId, scheduledFor}`; identity = canonical phone, one open scheduled request per phone and subtype; only 2xx stored for replay; answer adds `scheduledFor, requiresTemplateAtStart, whatsappWindowClosesAt, businessHours, scheduleVersion`). Reschedule `POST /requests/:id/reschedule {scheduledFor, lastCustomerMessageAt?, triggerWaMessageId?}` + `X-Idempotency-Key` (own receipt kind RESCHEDULE; `UNCHANGED` for the same slot; only while WAITING). Cancel: existing route (frees the seat). State routes carry `scheduledRequest {requestId, subtype, scheduledFor, needsReschedule, scheduleVersion}` (nearest open one). Feed: `conversation.scheduled_reminder {requestId, scheduledFor, scheduleVersion}` (10 min before; never <3 min; never while needsReschedule) and `conversation.rescheduled {…, previousScheduledFor, scheduleVersion}`; ACK PROVIDER_ACCEPTED | DELIVERY_UNKNOWN | STALE only; send only with the window open and not HUMAN, else STALE; ignore a stale scheduleVersion. Always send `lastCustomerMessageAt` (unknown window = closed). Staff can claim from T−5; from the claim unit 11 applies.
+- **S3 — Approved customer texts (owner, 2026-11-13, "Así están bien" ×4; usted, tú derived by the existing styling):** offer «Ahorita nuestro equipo no está disponible (abrimos {cuándo}). ¿Quiere que una persona le atienda en alguno de estos horarios?\n1. {día} a las {hora}\n2. …\n3. …\nResponda con el número.»; not understood «No entendí qué horario prefiere. Responda con el número de la opción.»; booked «Listo, quedó agendado para {día} a las {hora}. A esa hora una persona del equipo le escribe por aquí.»; booked out of window «Listo, quedó agendado para {día} a las {hora}. A esa hora le escribimos; cuando le llegue el mensaje, respóndanos para continuar.»; slot taken «Ese horario se acaba de ocupar. Estos siguen disponibles:\n1. …»; no slots «Por ahora no tenemos horarios disponibles en los próximos días. Ya dejé su solicitud y le escriben en cuanto abramos ({cuándo}).»; already booked «Ya tiene una cita para {día} a las {hora}. ¿Quiere cambiarla?»; rescheduled «Listo, cambié su cita para {día} a las {hora}.»; cancelled «Listo, cancelé su cita. Si necesita algo más, aquí sigo para ayudarle.»; what time «Su cita es {día} a las {hora}. Una persona del equipo le escribe por aquí a esa hora.»; reminder «Le recuerdo que a las {hora} una persona del equipo le atiende por aquí.»; staff changed «El equipo cambió su cita para {día} a las {hora}.» (staff cancel uses the existing cancellation notice). Max 3 customer reschedules per conversation.
+- **S4 — Time formatting:** in the branch time zone from the API (`Intl.DateTimeFormat('es-MX', {timeZone})`), "hoy"/"mañana" computed in that zone, never a fixed offset; absolute times (never "en 10 minutos").
+- **S5 — No phone in logs** (`src/common/log-safe.ts`).
+- **S6 — E2E with the backend on dev** once unit 14 is deployed and scheduling is enabled for a branch.
+
+## Tasks
+
+| ID  | Specs  | Route                                                                                                                                              | Commit |
+| --- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| T1  | S2, S1 | worker: client for slots, create with scheduledFor (+409 bodies, extended answer), reschedule (idempotency key), state scheduledRequest            | —      |
+| T6  | S3, S4 | worker: branch-zone time formatting + the S3 texts (usted + tú pairs) as a pure domain module                                                      | —      |
+| T2  | S2     | durable per-conversation offer/appointment state (offer expires ~30 min) + recovery from the state route                                           | —      |
+| T3  | S2, S3 | out-of-hours branch: OutOfHoursPolicy implementation — slots → offer → parse choice → book; 409 re-offer; empty list; SCHEDULING_DISABLED fallback | —      |
+| T4  | S2, S3 | customer reschedule / cancel / "¿a qué hora quedé?" intents (cap 3 reschedules)                                                                    | —      |
+| T5  | S2, S3 | feed handlers: scheduled_reminder and rescheduled (window/HUMAN/version checks)                                                                    | —      |
+| T7  | S6     | E2E with the backend on dev                                                                                                                        | —      |
+
+## Log
+
+- **L1 (owner, 2026-11-12):** "si hermano, adelante con tus siguientes recomendaciones."
+- **L2 (owner, 2026-11-13):** all S3 texts approved as proposed ("Así están bien" for the four groups).
+- **L3 (backend, 2026-11-13):** unit 14 merged on feat/human-intervention (5b549e18), not on dev yet; all 11 chatbot concerns accepted; ALREADY_SCHEDULED identity = canonical phone; unknown window = closed (always send lastCustomerMessageAt); perf slots p95 11 ms, booking 19 ms, same-key replay 6 ms, reschedule 15–17 ms.
