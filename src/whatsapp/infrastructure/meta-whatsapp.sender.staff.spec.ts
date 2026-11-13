@@ -258,6 +258,27 @@ describe('MetaWhatsappSender staff / template / media (unit 11)', () => {
       ]);
     });
 
+    it('asDocument sends an image file (e.g. webp) as a document', async () => {
+      acceptUpload('media-webp');
+      accept('wamid.webp');
+      await sender.sendMediaFile({
+        to: TO,
+        filePath: FILE,
+        mimeType: 'image/webp',
+        filename: 'foto.webp',
+        asDocument: true,
+        origin: 'STAFF',
+      });
+      expect(calls()[1][1]).toEqual({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: TO,
+        type: 'document',
+        document: { id: 'media-webp', filename: 'foto.webp' },
+      });
+      expect(mirrorKeys()).toEqual([]);
+    });
+
     it('sends a PDF as a document with its filename and caption', async () => {
       acceptUpload('media-pdf');
       accept('wamid.doc');

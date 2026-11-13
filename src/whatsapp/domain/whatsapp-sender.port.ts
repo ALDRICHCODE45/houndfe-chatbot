@@ -74,6 +74,11 @@ export interface OutboundMediaFile extends OutboundOriginOption {
   /** Document name (default `documento.pdf`); ignored for images. */
   filename?: string;
   caption?: string;
+  /**
+   * Send as a `document` even when the mime type is an image (Meta accepts
+   * only JPEG/PNG as image messages, so a staff `image/webp` goes as a file).
+   */
+  asDocument?: boolean;
 }
 
 /** The media id Meta assigned to the upload, next to the wamid. */

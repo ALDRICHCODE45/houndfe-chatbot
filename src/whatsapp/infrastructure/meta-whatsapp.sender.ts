@@ -179,7 +179,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
     const sizeBytes = await this.assertMediaFile(message);
     const providerMediaId = await this.uploadMedia(message, sizeBytes);
     const { providerMessageId } = await this.send(
-      message.mimeType === 'application/pdf'
+      sendsAsDocument(message)
         ? {
             messaging_product: 'whatsapp',
             recipient_type: 'individual',
@@ -549,10 +549,13 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       throw invalid('not readable');
     }
     if (sizeBytes === 0) throw invalid('empty');
-    const max =
-      message.mimeType === 'application/pdf'
-        ? DOCUMENT_MAX_BYTES
-        : IMAGE_MAX_BYTES;
+    if (
+      message.asDocument !== undefined &&
+      typeof message.asDocument !== 'boolean'
+    ) {
+      throw invalid('fields');
+    }
+    const max = sendsAsDocument(message) ? DOCUMENT_MAX_BYTES : IMAGE_MAX_BYTES;
     if (sizeBytes > max) throw invalid('too large');
     return sizeBytes;
   }
@@ -879,4 +882,9 @@ export function normalizeSandboxRecipient(
   }
 
   return to;
+}
+
+/** A PDF, or any accepted file the caller asks to send as a document. */
+function sendsAsDocument(message: OutboundMediaFile): boolean {
+  return message.mimeType === 'application/pdf' || message.asDocument === true;
 }
