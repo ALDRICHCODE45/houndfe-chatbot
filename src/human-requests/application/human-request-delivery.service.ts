@@ -81,6 +81,7 @@ export interface HumanRequestDeliveryOptions {
 interface LiveHooks {
   after?: LivePlan['after'];
   replay?: boolean;
+  guard?: LivePlan['guard'];
 }
 
 type Plan =
@@ -331,10 +332,10 @@ export class HumanRequestDeliveryService {
   ): Promise<boolean> {
     switch (row.localState) {
       case 'RECEIVED':
-        return this.run(row);
+        return this.run(row, mode === 'replay');
       case 'HELD_HUMAN':
       case 'DEFERRED_WINDOW':
-        if (mode === 'replay') return this.run(row);
+        if (mode === 'replay') return this.run(row, true);
         break;
       // SENDING: in flight elsewhere or a crash leftover (the sweep decides).
       default:
@@ -344,10 +345,10 @@ export class HumanRequestDeliveryService {
     return false;
   }
 
-  private async run(row: DeliveryRow): Promise<boolean> {
+  private async run(row: DeliveryRow, replay: boolean): Promise<boolean> {
     const plan = await this.plan(row);
     try {
-      return await this.execute(row, plan);
+      return await this.execute(row, plan, replay);
     } finally {
       if (plan.action === 'relay' && plan.dispose !== undefined) {
         try {
@@ -361,7 +362,11 @@ export class HumanRequestDeliveryService {
     }
   }
 
-  private async execute(row: DeliveryRow, plan: Plan): Promise<boolean> {
+  private async execute(
+    row: DeliveryRow,
+    plan: Plan,
+    replay: boolean,
+  ): Promise<boolean> {
     const expected = { localState: row.localState, attemptId: row.attemptId };
     const attemptedAt = canonicalNow(this.clock);
 
@@ -390,7 +395,14 @@ export class HumanRequestDeliveryService {
         : await checkHandoffSendHold(this.ports.handoff, plan.senderId);
     if (hold.hold && hold.reason === 'MODE_UNREADABLE')
       throw new Error(`handoff mode unreadable: ${hold.error}`);
-    if (hold.hold && plan.action === 'send' && plan.overdue === true) {
+    // Rule 2: a delivery that may not wait (a cancellation notice, an overdue
+    // notice) is never held: the backend refuses its deferral (422) and a
+    // closure notice hours later only annoys, so it is STALE right away.
+    if (
+      hold.hold &&
+      plan.action === 'send' &&
+      (plan.overdue === true || plan.cancellation)
+    ) {
       const next = await this.ports.store.transition(row.deliveryId, expected, {
         localState: 'STALE',
         decision: 'HUMAN_SESSION',
@@ -410,13 +422,58 @@ export class HumanRequestDeliveryService {
         attemptId: this.newAttemptId(),
         attemptedAt,
         providerMessageId: null,
-        ack:
-          plan.action === 'send' && plan.cancellation
-            ? null
-            : 'DEFERRED_HUMAN_SESSION',
+        ack: 'DEFERRED_HUMAN_SESSION',
       });
       if (next?.ackState === 'PENDING') await this.flushAck(next);
       return false;
+    }
+
+    // Rule 6 order: a conversation whose `ended` is still being handled is
+    // already BOT, but its farewell may not be out. A replay (the maintenance
+    // sweep, the customer's next message) waits: the row stays as it is and
+    // the ended item's own replay releases it after the farewell.
+    if (
+      replay &&
+      plan.action === 'send' &&
+      plan.live !== true &&
+      row.conversationRef !== null &&
+      (await this.ports.store.hasUnfinishedEnd(row.conversationRef))
+    )
+      return false;
+
+    // T6 (L10 a): live sends re-read the mode/epoch right before the
+    // sender, one local read. The read sits just before the SENDING claim
+    // (a failed read throws with nothing claimed, so the item is retried).
+    if (
+      (plan.action === 'relay' || plan.live === true) &&
+      plan.guard !== undefined
+    ) {
+      const changed = await plan.guard();
+      if (changed !== null) {
+        const next = await this.ports.store.transition(
+          row.deliveryId,
+          expected,
+          {
+            localState: 'STALE',
+            decision: changed,
+            attemptId: this.newAttemptId(),
+            attemptedAt,
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        );
+        this.logger.log(
+          `delivery ${row.deliveryId} ${row.type} not sent: the conversation changed after planning (${changed})`,
+        );
+        if (next !== null) {
+          await this.flushAck(next);
+          await this.finishLive(plan, row, {
+            kind: 'NOT_SENT',
+            providerMessageId: null,
+          });
+        }
+        return next !== null;
+      }
     }
 
     const attemptId = this.newAttemptId();
@@ -555,8 +612,15 @@ export class HumanRequestDeliveryService {
         );
       }
     }
-    if (plan.replay === true && row.conversationRef !== null)
-      await this.onCustomerInbound(row.conversationRef);
+    if (plan.replay === true && row.conversationRef !== null) {
+      try {
+        await this.onCustomerInbound(row.conversationRef);
+      } catch (error) {
+        this.logger.warn(
+          `delivery ${row.deliveryId} held deliveries replay failed: ${describeError(error)}`,
+        );
+      }
+    }
   }
 
   private async plan(row: DeliveryRow): Promise<Plan> {

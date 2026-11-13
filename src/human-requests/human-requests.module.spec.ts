@@ -10,6 +10,11 @@ import { PG_POOL } from '../database/postgres-pool.provider';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import type { BackendOutboxEntry } from '../backend-outbox/domain/backend-outbox';
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
+import {
+  LIVE_RECONCILE_REF,
+  type LiveReconcileRef,
+} from '../conversation/domain/live-reconcile-ref';
+import { LiveConversationReconcileWorker } from './application/live-conversation-reconcile.worker';
 import { HumanRequestCreateService } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
 import { LiveConversationService } from './application/live-conversation.service';
@@ -183,5 +188,84 @@ describe('HumanRequestsModule', () => {
     expect(pool.connect).toHaveBeenCalled();
     await moduleRef.close();
     expect(pool.end).toHaveBeenCalled();
+  });
+
+  describe('live conversation reconcile wiring (T6/T7)', () => {
+    const liveOf = (moduleRef: Awaited<ReturnType<typeof compile>>) => {
+      const delivery: unknown = moduleRef.get(HumanRequestDeliveryService);
+      return (
+        delivery as {
+          ports: { live: { ports: { onAckRefused: (ref: string) => void } } };
+        }
+      ).ports.live;
+    };
+    const holderOf = (moduleRef: Awaited<ReturnType<typeof compile>>) =>
+      moduleRef.get<LiveReconcileRef>(LIVE_RECONCILE_REF, { strict: false });
+
+    it('binds the reconcile worker into the shared holder on bootstrap and releases it on shutdown', async () => {
+      const start = jest.spyOn(
+        LiveConversationReconcileWorker.prototype,
+        'start',
+      );
+      const stop = jest.spyOn(
+        LiveConversationReconcileWorker.prototype,
+        'stop',
+      );
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      expect(holderOf(moduleRef).current).toBeUndefined();
+      await moduleRef.init();
+      const holder = holderOf(moduleRef);
+      expect(holder.current).toBeInstanceOf(LiveConversationReconcileWorker);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(stop).not.toHaveBeenCalled();
+      await moduleRef.close();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(holder.current).toBeUndefined();
+    });
+
+    it('runs whatever CONVERSATION_MIRROR_DELIVERY_ENABLED says (unit 11, not unit 9)', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      await moduleRef.init();
+      expect(holderOf(moduleRef).current).toBeInstanceOf(
+        LiveConversationReconcileWorker,
+      );
+      await moduleRef.close();
+    });
+
+    it('a refused session-ack asks the bound worker to reconcile that conversation', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      await moduleRef.init();
+      const worker = holderOf(moduleRef)
+        .current as LiveConversationReconcileWorker;
+      const reconcileOne = jest
+        .spyOn(worker, 'reconcileOne')
+        .mockResolvedValue({ kind: 'in_sync' });
+      const live = liveOf(moduleRef);
+      live.ports.onAckRefused('wa:5215550001111');
+      expect(reconcileOne).toHaveBeenCalledWith('wa:5215550001111');
+      await moduleRef.close();
+      // After shutdown the signal is a no-op, never an error.
+      expect(() => live.ports.onAckRefused('wa:5215550001111')).not.toThrow();
+      expect(reconcileOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('the services-only module never builds the worker', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      await moduleRef.init();
+      expect(holderOf(moduleRef).current).toBeUndefined();
+      await moduleRef.close();
+    });
+
+    it('a signal before the worker exists is a no-op', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const live = liveOf(moduleRef);
+      expect(() => live.ports.onAckRefused('wa:5215550001111')).not.toThrow();
+      await moduleRef.close();
+    });
   });
 });

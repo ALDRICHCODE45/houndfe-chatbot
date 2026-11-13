@@ -304,6 +304,7 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     expect(h.order).toEqual([
       `mode ${SENDER}`,
       'runner',
+      `mode ${SENDER}`, // T6: re-read right before the customer send
       'send',
       'seen wamid.ops-b',
     ]);

@@ -63,6 +63,14 @@ interface LivePlanBase {
   after?: (result: LiveSendResult) => Promise<void>;
   /** Replay the conversation's held / deferred deliveries after `after`. */
   replay?: boolean;
+  /**
+   * T6 (L10 a): re-reads the conversation's mode and epoch right before the
+   * send (relays and notices only). `null` = still as planned, send; a
+   * decision = it changed meanwhile (an `ended`, START_TIMEOUT or a newer
+   * `started` landed after planning): nothing is sent and the item is STALE
+   * with that decision. Rejects when the read fails (the item is retried).
+   */
+  guard?: () => Promise<DeliveryDecision | null>;
 }
 
 /** The delivery service executes the plan: notices are BOT messages, never
@@ -105,6 +113,10 @@ export interface LiveConversationPorts {
   isWindowOpen(senderId: string): Promise<boolean>;
   /** Stored customer style; null/failure keeps the usted copy. */
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  /** A started whose session-ack was refused (NOT_FOUND / STALE_EPOCH /
+   *  SESSION_NOT_ENDING): asks the reconcile worker to read the backend's
+   *  state of this conversation now. Fire-and-forget; a throw is logged. */
+  onAckRefused?(conversationRef: string): void;
 }
 
 /**
@@ -180,6 +192,7 @@ export class LiveConversationService implements LiveConversationHandler {
         decision: 'TEMPLATE_SENT',
         senderId,
         deferrable: false,
+        guard: this.guard(senderId, item.payload.handoffEpoch, 'HUMAN'),
         deliver: () =>
           this.ports.sender.sendTemplate({
             to: senderId,
@@ -198,6 +211,7 @@ export class LiveConversationService implements LiveConversationHandler {
         decision: 'STAFF_MESSAGE',
         senderId,
         deferrable: true,
+        guard: this.guard(senderId, item.payload.handoffEpoch, 'HUMAN'),
         deliver: () =>
           this.ports.sender.sendText({
             to: senderId,
@@ -254,6 +268,7 @@ export class LiveConversationService implements LiveConversationHandler {
       decision: 'STAFF_MESSAGE',
       senderId,
       deferrable: true,
+      guard: this.guard(senderId, message.handoffEpoch, 'HUMAN'),
       deliver: () => sendMediaFile(file),
       dispose: () => media.cleanup(),
     };
@@ -297,11 +312,37 @@ export class LiveConversationService implements LiveConversationHandler {
         ack.kind === 'SESSION_NOT_ENDING' ||
         ack.kind === 'NOT_FOUND'
       ) {
-        // A reconcile signal, never a retry: no greeting.
+        // A reconcile signal, never a retry: no greeting. When the answer
+        // itself proves the session is gone (the backend does not know the
+        // conversation, or says it is BOT), the mute is reverted at once
+        // (durable, no farewell) instead of waiting for the reconcile; the
+        // held deliveries then replay after this item's outcome. Any other
+        // refusal is not proof: the reconcile decides.
+        let reverted = false;
+        if (
+          ack.kind === 'NOT_FOUND' ||
+          (ack.kind === 'STALE_EPOCH' && ack.mode === 'BOT')
+        ) {
+          const at =
+            ack.kind === 'STALE_EPOCH'
+              ? Math.max(epoch, ack.currentEpoch)
+              : epoch;
+          const back = await this.ports.mode.applyEnded(senderId, at);
+          if (!back.applied && back.reason === 'INVALID')
+            throw new Error(
+              'handoff state unusable: corrupt value or bad order',
+            );
+          reverted = back.applied;
+        }
         this.logger.warn(
-          `session-ack STARTED epoch ${epoch} answered ${ack.kind} (${maskConversationRef(ref)}): no greeting, STALE; reconcile decides`,
+          `session-ack STARTED epoch ${epoch} answered ${ack.kind} (${maskConversationRef(ref)}): no greeting, STALE; ${reverted ? 'reverted to BOT' : 'reconcile decides'}`,
         );
-        return { action: 'stale', decision: 'STALE_EPOCH' };
+        this.notifyAckRefused(ref);
+        return {
+          action: 'stale',
+          decision: 'STALE_EPOCH',
+          ...(reverted ? { replay: true } : {}),
+        };
       }
       // Retryable (5xx, 429, timeout, network) or a credential problem: the
       // item is retried later, nothing is sent and nothing is ACKed yet.
@@ -322,11 +363,12 @@ export class LiveConversationService implements LiveConversationHandler {
         staffFirstName,
         style,
       ),
+      guard: this.guard(senderId, epoch, 'HUMAN'),
       // A greeting that really went out is what a START_TIMEOUT resume
       // notice depends on (an uncertain one does not count).
       after: async (result) => {
         if (result.kind === 'ACCEPTED')
-          await this.ports.mode.markGreeted(senderId, epoch);
+          await this.recordGreeting(senderId, epoch);
       },
     };
   }
@@ -356,6 +398,7 @@ export class LiveConversationService implements LiveConversationHandler {
         staffFirstName,
         style,
       ),
+      guard: this.guard(senderId, epoch, 'HUMAN'),
     };
   }
 
@@ -401,6 +444,7 @@ export class LiveConversationService implements LiveConversationHandler {
             decision: 'RESUME_NOTICE',
             senderId,
             text: styleFixedCopy(LIVE_RESUME, style),
+            guard: this.guard(senderId, epoch, 'BOT'),
             replay: true,
           };
         }
@@ -419,6 +463,7 @@ export class LiveConversationService implements LiveConversationHandler {
         decision: 'FAREWELL',
         senderId,
         text: styleFixedCopy(LIVE_FAREWELL, style),
+        guard: this.guard(senderId, epoch, 'BOT'),
         after,
         replay: true,
       };
@@ -429,6 +474,56 @@ export class LiveConversationService implements LiveConversationHandler {
       after,
       replay: true,
     };
+  }
+
+  /**
+   * The guard of a send (T6, L10 a): one local read of the mode and epoch
+   * right before the sender is called. A notice planned while HUMAN expects
+   * HUMAN on its epoch; the farewell and the resume notice follow a durable
+   * BOT and expect BOT on that same epoch. A different epoch (a newer
+   * `started` or `ended`) is STALE_EPOCH; the same epoch in another mode is
+   * SESSION_NOT_ACTIVE. Never stale for a conversation still as planned
+   * (rule 10).
+   */
+  private guard(
+    senderId: string,
+    epoch: number,
+    expected: 'HUMAN' | 'BOT',
+  ): () => Promise<DeliveryDecision | null> {
+    return async () => {
+      const state = await this.ports.mode.getState(senderId);
+      if (state.epoch !== epoch) return 'STALE_EPOCH';
+      if (state.mode !== expected) return 'SESSION_NOT_ACTIVE';
+      return null;
+    };
+  }
+
+  /** Records that the greeting of `epoch` went out (L10 c: a START_TIMEOUT
+   *  resume notice relies on it): one immediate retry, then an error log.
+   *  Never throws (the greeting is already sent and its outcome recorded). */
+  private async recordGreeting(senderId: string, epoch: number): Promise<void> {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await this.ports.mode.markGreeted(senderId, epoch);
+        return;
+      } catch (error) {
+        if (attempt === 2)
+          this.logger.error(
+            `greeting of epoch ${epoch} went out but was not recorded (a START_TIMEOUT resume notice will be skipped): ${describeError(error)}`,
+          );
+      }
+    }
+  }
+
+  /** Never throws: the refusal is already handled locally. */
+  private notifyAckRefused(ref: string): void {
+    try {
+      this.ports.onAckRefused?.(ref);
+    } catch (error) {
+      this.logger.warn(
+        `reconcile request after a refused session-ack failed (${maskConversationRef(ref)}): ${describeError(error)}`,
+      );
+    }
   }
 
   /** session-ack ENDED, best effort: a 409 is a reconcile signal and a

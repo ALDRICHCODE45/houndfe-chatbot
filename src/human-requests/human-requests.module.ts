@@ -5,6 +5,7 @@ import {
   OnApplicationBootstrap,
   OnModuleDestroy,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
@@ -19,6 +20,10 @@ import {
 import { LIVE_CONVERSATION_CLIENT } from '../chatbot-api/domain/live-conversation.port';
 import type { LiveConversationClient } from '../chatbot-api/domain/live-conversation.port';
 import { HandoffModeService } from '../conversation/application/handoff-mode.service';
+import {
+  LIVE_RECONCILE_REF,
+  type LiveReconcileRef,
+} from '../conversation/domain/live-reconcile-ref';
 import { ConversationModule } from '../conversation/conversation.module';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
 import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
@@ -36,6 +41,11 @@ import {
   HumanRequestCreateService,
 } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
+import {
+  LIVE_RECONCILE_LOCK_KEY,
+  LiveConversationReconcileWorker,
+} from './application/live-conversation-reconcile.worker';
+import { LiveConversationSafety } from './application/live-conversation-safety';
 import { LiveConversationService } from './application/live-conversation.service';
 import { HumanRequestFeedConsumer } from './application/human-request-feed.consumer';
 import { HumanRequestMaintenanceWorker } from './application/human-request-maintenance.worker';
@@ -58,6 +68,7 @@ export class HumanRequestFeedLifecycle
 {
   private consumer: HumanRequestFeedConsumer | undefined;
   private maintenance: HumanRequestMaintenanceWorker | undefined;
+  private reconcile: LiveConversationReconcileWorker | undefined;
   private stopped = false;
 
   constructor(
@@ -67,6 +78,14 @@ export class HumanRequestFeedLifecycle
     @Inject(HUMAN_REQUESTS_CLIENT)
     private readonly client: HumanRequestsClient,
     private readonly delivery: HumanRequestDeliveryService,
+    // Live conversation T7 (reconcile + safety notice).
+    private readonly handoff: HandoffModeService,
+    @Inject(LIVE_CONVERSATION_CLIENT)
+    private readonly live: LiveConversationClient,
+    @Inject(WHATSAPP_SENDER) private readonly sender: WhatsappSenderPort,
+    private readonly config: ConfigService,
+    @Inject(LIVE_RECONCILE_REF) private readonly reconcileRef: LiveReconcileRef,
+    @Optional() private readonly profiles?: CustomerProfileService,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -80,11 +99,56 @@ export class HumanRequestFeedLifecycle
     this.maintenance = new HumanRequestMaintenanceWorker(this.delivery);
     this.consumer.start();
     this.maintenance.start();
+
+    // Unit 11 T7: the reconcile (start-up + every ~5 min) and the safety
+    // notice run whatever CONVERSATION_MIRROR_DELIVERY_ENABLED says (they
+    // are unit 11, not unit 9). The worker is bound into the shared holder
+    // so the refused-ack signal and the messages:batch hint can reach it.
+    const ports = customerPorts(
+      this.handoff,
+      this.config,
+      this.pool,
+      this.profiles,
+    );
+    const sender = this.sender;
+    const safety = new LiveConversationSafety({
+      feedSyncedAt: () => this.store.readSyncedAt(),
+      listHuman: (limit) => this.handoff.listHuman(limit),
+      isWindowOpen: ports.isWindowOpen,
+      claim: (senderId, epoch) =>
+        this.handoff.claimSafetyNotice(senderId, epoch),
+      // A BOT message (default origin): mirrored like any bot message.
+      send: async (senderId, text) => {
+        await sender.sendText({ to: senderId, text });
+      },
+      ...(ports.customerStyle === undefined
+        ? {}
+        : { customerStyle: ports.customerStyle }),
+    });
+    this.reconcile = new LiveConversationReconcileWorker({
+      mode: this.handoff,
+      client: this.live,
+      replay: (ref) => this.delivery.onCustomerInbound(ref),
+      lock: new PostgresFeedConsumerLock(this.pool, LIVE_RECONCILE_LOCK_KEY),
+      safety,
+    });
+    this.reconcileRef.current = this.reconcile;
+    this.reconcile.start();
   }
 
   async onModuleDestroy(): Promise<void> {
     this.stopped = true;
-    await Promise.all([this.consumer?.stop(), this.maintenance?.stop()]);
+    // Signals stop reaching the worker before it stops.
+    if (
+      this.reconcile !== undefined &&
+      this.reconcileRef.current === this.reconcile
+    )
+      this.reconcileRef.current = undefined;
+    await Promise.all([
+      this.consumer?.stop(),
+      this.maintenance?.stop(),
+      this.reconcile?.stop(),
+    ]);
   }
 }
 
@@ -170,6 +234,7 @@ const CUSTOMER_PORT_TOKENS = [
         client: HumanRequestsClient,
         live: LiveConversationClient,
         sender: WhatsappSenderPort,
+        reconcile: LiveReconcileRef,
         handoff: HandoffModeService,
         config: ConfigService,
         pool: Pool,
@@ -191,6 +256,12 @@ const CUSTOMER_PORT_TOKENS = [
             ...(ports.customerStyle === undefined
               ? {}
               : { customerStyle: ports.customerStyle }),
+            // A refused session-ack STARTED: reconcile that conversation
+            // now (late-bound; a no-op before the worker exists / after it
+            // stops). reconcileOne never rejects.
+            onAckRefused: (ref: string) => {
+              void reconcile.current?.reconcileOne(ref);
+            },
           }),
         });
       },
@@ -199,6 +270,7 @@ const CUSTOMER_PORT_TOKENS = [
         HUMAN_REQUESTS_CLIENT,
         LIVE_CONVERSATION_CLIENT,
         WHATSAPP_SENDER,
+        LIVE_RECONCILE_REF,
         ...CUSTOMER_PORT_TOKENS,
       ],
     },
@@ -247,8 +319,12 @@ export class HumanRequestsServicesModule {}
 @Module({
   imports: [
     HumanRequestsServicesModule,
+    ConfigModule,
     DatabaseModule,
+    ConversationModule,
     ChatbotApiModule,
+    WhatsappSenderModule,
+    CustomerProfileModule,
     BackendOutboxEnqueueModule,
   ],
   providers: [HumanRequestFeedLifecycle, HumanRequestOutboxRoutes],

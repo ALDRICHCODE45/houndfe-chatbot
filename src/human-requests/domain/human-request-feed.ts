@@ -231,6 +231,11 @@ export interface HumanRequestFeedStore {
   ): Promise<{ deleted: number; scrubbed: number }>;
   /** SENDING rows whose attempt started before `before` (crash leftovers). */
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]>;
+  /** T6 (rule 6 order): true while a `conversation.ended` of this
+   *  conversation is still being handled (RECEIVED or SENDING): its durable
+   *  BOT is already set, but its farewell may not be out yet, so no held or
+   *  deferred delivery may be released before it is decided. */
+  hasUnfinishedEnd(conversationRef: string): Promise<boolean>;
 
   /** Idempotent: an existing request row is left as is. */
   recordOpenRequest(input: OpenHumanRequestInput): Promise<void>;

@@ -232,6 +232,17 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     return Promise.resolve({ deleted: acked.length, scrubbed: failed.length });
   }
 
+  hasUnfinishedEnd(conversationRef: string): Promise<boolean> {
+    return Promise.resolve(
+      [...this.rows.values()].some(
+        (row) =>
+          row.conversationRef === conversationRef &&
+          row.item.type === 'conversation.ended' &&
+          (row.localState === 'RECEIVED' || row.localState === 'SENDING'),
+      ),
+    );
+  }
+
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {
     return Promise.resolve(
       [...this.rows.values()]

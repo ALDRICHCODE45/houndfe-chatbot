@@ -298,6 +298,14 @@ export class WebhookDispatcherService {
               senderId: result.customerId,
               text: result.syntheticUserText,
             });
+            // Rule 2: a claim may have landed during the turn.
+            if (await this.isHumanMode(result.customerId)) {
+              this.logger.log(
+                `handoff HUMAN mid-turn: drop resume reply for ${maskConversationRef(result.customerId)} (ops ${fingerprintMessageId(message.messageId)})`,
+              );
+              await this.markSeenSafely(message.messageId);
+              continue;
+            }
             const { providerMessageId } = await this.whatsappSender.sendText({
               to: result.customerId,
               text: reply,
@@ -352,6 +360,10 @@ export class WebhookDispatcherService {
           this.logger.log(
             `short-circuit pending-marker for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
           );
+          if (await this.mutedBeforeSend(message, 'pending-marker reply')) {
+            await this.markSeenSafely(message.messageId);
+            continue;
+          }
           const { providerMessageId } = await this.whatsappSender.sendText({
             to: message.senderId,
             text: applyCustomerStyle(
@@ -505,6 +517,7 @@ export class WebhookDispatcherService {
     await this.replyAndMarkSeen(
       message,
       applyCustomerStyle(reply, this.customerStyle(message)),
+      false,
     );
     return true;
   }
@@ -513,6 +526,23 @@ export class WebhookDispatcherService {
   private async isHumanMode(senderId: string): Promise<boolean> {
     if (this.handoffMode === undefined) return false;
     return this.handoffMode.isHumanMode(senderId);
+  }
+
+  /**
+   * Rule 2 (total silence while HUMAN): one local mode read right before a
+   * bot send to the customer, closing the gap since the gate (the turn, the
+   * profile warm-up and the ingress all take time). `true` = HUMAN: the send
+   * must be dropped. A read error propagates (fail closed, Meta redelivers).
+   */
+  private async mutedBeforeSend(
+    message: InboundMessage,
+    what: string,
+  ): Promise<boolean> {
+    if (!(await this.isHumanMode(message.senderId))) return false;
+    this.logger.log(
+      `handoff HUMAN mid-turn: drop ${what} for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+    );
+    return true;
   }
 
   /** S1: customer inbounds only (never the ops phone). A store failure
@@ -552,6 +582,10 @@ export class WebhookDispatcherService {
     const guidance = ingressGuidance(decision);
 
     if (guidance !== undefined) {
+      if (await this.mutedBeforeSend(message, 'receipt guidance')) {
+        await this.markSeenSafely(message.messageId);
+        return;
+      }
       const { providerMessageId } = await this.whatsappSender.sendText({
         to: message.senderId,
         text: applyCustomerStyle(guidance, this.customerStyle(message)),
@@ -660,19 +694,21 @@ export class WebhookDispatcherService {
             },
           }),
     });
-    // S7 (W2): the mode may have switched to HUMAN during the turn; the
-    // reply is then dropped. A read error propagates (fail closed, Meta
-    // redelivers), like the gate.
-    if (await this.isHumanMode(message.senderId)) {
-      this.logger.log(
-        `handoff HUMAN mid-turn: drop reply for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
-      );
-      await this.markSeenSafely(message.messageId);
-      return;
-    }
+    // S7 (W2) / rule 2: the mode may switch to HUMAN during the turn, or
+    // between the photo and the text; the mode is read right before EACH
+    // send and the rest of the reply is dropped. A read error propagates
+    // (fail closed, Meta redelivers), like the gate.
     // S3: the product photo goes first, then the explanation.
     for (const media of minimal.media ?? []) {
+      if (await this.mutedBeforeSend(message, 'reply')) {
+        await this.markSeenSafely(message.messageId);
+        return;
+      }
       await this.sendReplyImage(message.senderId, media);
+    }
+    if (await this.mutedBeforeSend(message, 'reply')) {
+      await this.markSeenSafely(message.messageId);
+      return;
     }
     const providerMessageIds = await this.sendReplyText(
       message.senderId,
@@ -745,10 +781,17 @@ export class WebhookDispatcherService {
     }
   }
 
+  /** The fixed reply of a path. Rule 2: the mode is read right before the
+   *  send unless the caller just did (`recheck: false`). */
   private async replyAndMarkSeen(
     message: InboundMessage,
     text: string,
+    recheck = true,
   ): Promise<void> {
+    if (recheck && (await this.mutedBeforeSend(message, 'reply'))) {
+      await this.markSeenSafely(message.messageId);
+      return;
+    }
     const { providerMessageId } = await this.whatsappSender.sendText({
       to: message.senderId,
       text,

@@ -1104,20 +1104,60 @@ describe('HumanRequestDeliveryService', () => {
       expect(sender.sent).toHaveLength(3);
     });
 
-    it('a held cancellation never sends a deferral and is decided once BOT', async () => {
-      const { service, sender, client, store, human, window } = setup();
+    it('rule 2: a cancellation notice while HUMAN is STALE / HUMAN_SESSION right away (it may not wait), never held, never replayed', async () => {
+      const { service, sender, client, store, human } = setup();
       human.value = true;
       await service.accept(cancelledItem('h3'));
-      expect(client.acks).toEqual([]);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
       await expect(store.getDelivery('h3')).resolves.toMatchObject({
-        localState: 'HELD_HUMAN',
-        ackState: null,
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+        ackState: 'ACKED',
       });
       human.value = false;
-      window.open = false;
       await service.onCustomerInbound(REF);
+      await expect(service.replayHeld()).resolves.toBe(0);
       expect(sender.sent).toEqual([]);
-      expect(client.acks[0].body.outcome).toBe('STALE');
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('a cancellation notice held by an older version (HELD_HUMAN, no ACK) is settled STALE while still HUMAN', async () => {
+      const { service, sender, client, store, human } = setup();
+      human.value = false;
+      await store.insertDelivery(cancelledItem('h8'));
+      await store.transition(
+        'h8',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'HELD_HUMAN',
+          decision: 'CANCEL_NOTICE',
+          attemptId: attemptId(90),
+          attemptedAt: NOW.toISOString(),
+          providerMessageId: null,
+          ack: null,
+        },
+      );
+      human.value = true;
+      await service.replayHeld();
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('h8')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+      });
+    });
+
+    it('the answered clarification may wait: HELD_HUMAN with DEFERRED_HUMAN_SESSION (contrast with the cancellation)', async () => {
+      const { service, client, store, human } = setup();
+      human.value = true;
+      await service.accept(clarification('h9'));
+      expect(client.acks.map((a) => a.body.outcome)).toEqual([
+        'DEFERRED_HUMAN_SESSION',
+      ]);
+      await expect(store.getDelivery('h9')).resolves.toMatchObject({
+        localState: 'HELD_HUMAN',
+      });
     });
 
     it('an unreadable mode fails the item (retried), never sends', async () => {

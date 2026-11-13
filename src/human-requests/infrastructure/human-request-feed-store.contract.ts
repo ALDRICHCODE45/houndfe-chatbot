@@ -719,6 +719,45 @@ export function runHumanRequestFeedStoreContract(
       expect(stuck.map((row) => row.deliveryId)).toEqual(['s1']);
     });
 
+    it('hasUnfinishedEnd is true only while a conversation.ended of that conversation is RECEIVED or SENDING', async () => {
+      const other = 'wa:5215550002222';
+      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
+      await store.insertDelivery(endedItem('u1'));
+      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(true);
+      await expect(store.hasUnfinishedEnd(other)).resolves.toBe(false);
+      await store.transition(
+        'u1',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'SENDING',
+          decision: 'FAREWELL',
+          attemptId: ATTEMPT_A,
+          attemptedAt: AT,
+          providerMessageId: null,
+          ack: null,
+        },
+      );
+      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(true);
+      await store.transition(
+        'u1',
+        { localState: 'SENDING', attemptId: ATTEMPT_A },
+        {
+          localState: 'SENT',
+          decision: 'FAREWELL',
+          attemptId: ATTEMPT_A,
+          attemptedAt: AT,
+          providerMessageId: 'wamid.u1',
+          ack: 'PROVIDER_ACCEPTED',
+        },
+      );
+      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
+    });
+
+    it('hasUnfinishedEnd ignores other item types in flight', async () => {
+      await store.insertDelivery(cancelledItem('u2'));
+      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
+    });
+
     it('records open requests idempotently and closes them once', async () => {
       await store.recordOpenRequest({
         requestId: 'r1',

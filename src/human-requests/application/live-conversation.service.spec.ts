@@ -115,12 +115,25 @@ const okAck = (input: SessionAckInput): SessionAckResult => ({
   sessionState: input.state === 'STARTED' ? 'ACTIVE' : 'ENDED',
 });
 
-const setup = () => {
+const setup = (
+  options: { refuseThrows?: boolean; noRefuse?: boolean } = {},
+) => {
   const events: string[] = [];
   const conversation = new InMemoryConversationStore();
   const modeService = new HandoffModeService(conversation);
+  /** One entry is consumed after each `getState` read resolves (a mode
+   *  change landing right after the read: the TOCTOU the guard closes). */
+  const afterGetState: Array<() => Promise<unknown>> = [];
+  /** Failures of successive `markGreeted` calls (undefined = succeeds). */
+  const greetScript: Array<Error | undefined> = [];
+  const refused: string[] = [];
   const mode = {
-    getState: (id: string) => modeService.getState(id),
+    getState: async (id: string) => {
+      const state = await modeService.getState(id);
+      const hook = afterGetState.shift();
+      if (hook !== undefined) await hook();
+      return state;
+    },
     applyStarted: (id: string, epoch: number, requestId: string) => {
       events.push('cas:started');
       return modeService.applyStarted(id, epoch, requestId);
@@ -131,6 +144,8 @@ const setup = () => {
     },
     markGreeted: (id: string, epoch: number) => {
       events.push('greeted');
+      const failure = greetScript.shift();
+      if (failure !== undefined) return Promise.reject(failure);
       return modeService.markGreeted(id, epoch);
     },
   };
@@ -240,12 +255,19 @@ const setup = () => {
     },
   };
 
-  const window = { open: true, fail: false };
+  const window = {
+    open: true,
+    fail: false,
+    /** Runs on every window read, before it answers (a mode change landing
+     *  between the planning reads and the send). */
+    hook: undefined as undefined | (() => Promise<unknown>),
+  };
   let style: CustomerStyle | null = null;
-  const isWindowOpen = () =>
-    window.fail
-      ? Promise.reject(new Error('window read failed'))
-      : Promise.resolve(window.open);
+  const isWindowOpen = async () => {
+    if (window.hook !== undefined) await window.hook();
+    if (window.fail) throw new Error('window read failed');
+    return window.open;
+  };
   const customerStyle = () => Promise.resolve(style);
   const store = new InMemoryHumanRequestFeedStore();
   let attempt = 0;
@@ -263,6 +285,16 @@ const setup = () => {
         sender,
         isWindowOpen,
         customerStyle,
+        ...(options.noRefuse === true
+          ? {}
+          : {
+              onAckRefused: (ref: string) => {
+                events.push('ack-refused');
+                refused.push(ref);
+                if (options.refuseThrows === true)
+                  throw new Error('reconcile exploded');
+              },
+            }),
       }),
     },
     {
@@ -291,6 +323,9 @@ const setup = () => {
     ackScript,
     outcomes,
     window,
+    afterGetState,
+    greetScript,
+    refused,
     mode: modeService,
     setStyle: (next: CustomerStyle | null) => {
       style = next;
@@ -1795,6 +1830,335 @@ describe('LiveConversationService (T4)', () => {
       await expect(row(h, 't12')).resolves.toMatchObject({
         localState: 'SENT',
       });
+    });
+  });
+
+  // ------------------------------------------------------------- T6
+
+  describe('re-read the mode right before every live send (L10 a)', () => {
+    const flipToBot = (h: Harness) => () => h.mode.applyEnded(SENDER, 3);
+    const flipToNewer = (h: Harness) => () =>
+      h.mode.applyStarted(SENDER, 4, 'req-newer');
+
+    it('greeting: an ended applied after planning cancels it (STALE / SESSION_NOT_ACTIVE), no greeting recorded', async () => {
+      const h = setup();
+      h.window.hook = flipToBot(h);
+      await h.service.accept(started('g1'));
+      expect(h.sent).toEqual([]);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+      await expect(row(h, 'g1')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SESSION_NOT_ACTIVE',
+      });
+      expect(h.events).not.toContain('greeted');
+    });
+
+    it('greeting: a newer epoch applied after planning cancels it (STALE / STALE_EPOCH)', async () => {
+      const h = setup();
+      h.window.hook = flipToNewer(h);
+      await h.service.accept(started('g2'));
+      expect(h.sent).toEqual([]);
+      await expect(row(h, 'g2')).resolves.toMatchObject({
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it('reassignment notice: cancelled when the session ended meanwhile', async () => {
+      const h = setup();
+      await muted(h);
+      h.window.hook = flipToBot(h);
+      await h.service.accept(reassigned('g3'));
+      expect(h.sent).toEqual([]);
+      await expect(row(h, 'g3')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SESSION_NOT_ACTIVE',
+      });
+    });
+
+    it('farewell: a newer session started after planning cancels it, but the ENDED ack and the replay still run', async () => {
+      const h = setup();
+      await muted(h);
+      h.window.hook = flipToNewer(h);
+      await h.service.accept(ended('g4'));
+      expect(h.sent).toEqual([]);
+      await expect(row(h, 'g4')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'STALE_EPOCH',
+      });
+      expect(h.acks.map((a) => a.state)).toEqual(['ENDED']);
+      expect(h.events).toContain('replay:pending');
+      await expect(handoff(h)).resolves.toMatchObject({
+        mode: 'HUMAN',
+        epoch: 4,
+      });
+    });
+
+    it('farewell: still BOT on that epoch is sent (the guard expects BOT after an ended)', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(ended('g5'));
+      expect(texts(h)).toEqual([FAREWELL]);
+    });
+
+    it('resume notice: cancelled when a newer session started after planning', async () => {
+      const h = setup();
+      await muted(h);
+      await h.mode.markGreeted(SENDER, 3);
+      h.window.hook = flipToNewer(h);
+      await h.service.accept(
+        ended('g6', {
+          reason: 'START_TIMEOUT',
+          farewell: false,
+          resumeNotice: true,
+        }),
+      );
+      expect(h.sent).toEqual([]);
+      await expect(row(h, 'g6')).resolves.toMatchObject({
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it('staff text: an ended landing right after the planning read is never sent', async () => {
+      const h = setup();
+      await muted(h);
+      h.afterGetState.push(flipToBot(h));
+      await h.service.accept(staffText('g7'));
+      expect(h.sent).toEqual([]);
+      await expect(row(h, 'g7')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SESSION_NOT_ACTIVE',
+      });
+    });
+
+    it('staff media: the session ending during the download cancels the upload, the file is still cleaned up', async () => {
+      const h = setup();
+      await muted(h);
+      downloaded(h);
+      h.afterGetState.push(flipToNewer(h));
+      await h.service.accept(staffMedia('g8'));
+      expect(h.mediaSends).toEqual([]);
+      expect(h.cleanups).toEqual(['file']);
+      await expect(row(h, 'g8')).resolves.toMatchObject({
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it('template: cancelled when the session ended meanwhile', async () => {
+      const h = setup();
+      await muted(h);
+      h.afterGetState.push(flipToBot(h));
+      await h.service.accept(templateRequested('g9'));
+      expect(h.templates).toEqual([]);
+      await expect(row(h, 'g9')).resolves.toMatchObject({
+        decision: 'SESSION_NOT_ACTIVE',
+      });
+    });
+
+    it('rule 10: a conversation still muted on that epoch is never ACKed STALE by the guard', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(staffText('g10'));
+      expect(texts(h)).toHaveLength(1);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'PROVIDER_ACCEPTED' });
+    });
+
+    it('an unreadable mode at the guard sends nothing and the item is retried, then sent once', async () => {
+      const h = setup();
+      await muted(h);
+      h.afterGetState.push(
+        () => Promise.resolve(),
+        () => Promise.reject(new Error('mode read failed')),
+      );
+      const item = staffText('g11');
+      await expect(h.service.accept(item)).rejects.toThrow(/mode read failed/);
+      expect(h.sent).toEqual([]);
+      expect(h.outcomes).toEqual([]);
+      await expect(row(h, 'g11')).resolves.toMatchObject({
+        localState: 'RECEIVED',
+      });
+      await h.service.accept(item);
+      expect(texts(h)).toHaveLength(1);
+    });
+  });
+
+  describe('finishLive never throws (L10 b)', () => {
+    it('a replay that rejects is logged and the item stays decided', async () => {
+      const h = setup();
+      await muted(h);
+      jest
+        .spyOn(h.service, 'onCustomerInbound')
+        .mockRejectedValue(new Error('replay exploded'));
+      await expect(h.service.accept(ended('f1'))).resolves.toBeUndefined();
+      await expect(row(h, 'f1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'FAREWELL',
+      });
+      expect(logs.some((line) => /replay.*failed/i.test(line))).toBe(true);
+      expect(logs.join('\n')).not.toContain(SENDER);
+    });
+  });
+
+  describe('markGreeted after an accepted greeting (L10 c)', () => {
+    it('one failure is retried immediately and the greeting is recorded', async () => {
+      const h = setup();
+      h.greetScript.push(new Error('db blip'));
+      await h.service.accept(started('m1'));
+      expect(h.events.filter((e) => e === 'greeted')).toHaveLength(2);
+      await expect(handoff(h)).resolves.toMatchObject({ greetedEpoch: 3 });
+    });
+
+    it('two failures: logged at error level, the item is not failed, no further retry', async () => {
+      const h = setup();
+      h.greetScript.push(new Error('db down'), new Error('db down'));
+      const error = jest.mocked(Logger.prototype.error);
+      error.mockClear();
+      await expect(h.service.accept(started('m2'))).resolves.toBeUndefined();
+      expect(h.events.filter((e) => e === 'greeted')).toHaveLength(2);
+      expect(texts(h)).toEqual([GREETING]);
+      expect(error).toHaveBeenCalledWith(
+        expect.stringMatching(/greeting.*not recorded/i),
+      );
+      expect(logs.join('\n')).not.toContain(SENDER);
+    });
+
+    it('a greeting that was never accepted is not recorded and not retried', async () => {
+      const h = setup();
+      h.sendScript.push(new Error('socket hang up'));
+      await h.service.accept(started('m3'));
+      expect(h.events).not.toContain('greeted');
+    });
+  });
+
+  describe('a refused session-ack STARTED (L10 d)', () => {
+    it('NOT_FOUND: back to BOT at that epoch at once, onAckRefused, no greeting, held rows replayed', async () => {
+      const h = setup();
+      await muted(h, 2);
+      await h.service.accept(clarification('d0'));
+      h.ackScript.push({ kind: 'NOT_FOUND' });
+      await h.service.accept(started('d1'));
+      await expect(handoff(h)).resolves.toMatchObject({
+        mode: 'BOT',
+        epoch: 3,
+      });
+      expect(h.refused).toEqual([REF]);
+      expect(texts(h)).toEqual([
+        'Le comparto la respuesta del equipo:\nSí, lo tenemos en azul.',
+      ]);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'PROVIDER_ACCEPTED' });
+      await expect(row(h, 'd1')).resolves.toMatchObject({
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it('STALE_EPOCH whose body says BOT: back to BOT at the backend epoch', async () => {
+      const h = setup();
+      h.ackScript.push({
+        kind: 'STALE_EPOCH',
+        currentEpoch: 4,
+        mode: 'BOT',
+        sessionState: null,
+      });
+      await h.service.accept(started('d2'));
+      await expect(handoff(h)).resolves.toMatchObject({
+        mode: 'BOT',
+        epoch: 4,
+      });
+      expect(h.refused).toEqual([REF]);
+      expect(h.sent).toEqual([]);
+    });
+
+    it('STALE_EPOCH whose body says HUMAN (a newer session): stays HUMAN, reconcile decides, no replay', async () => {
+      const h = setup();
+      h.ackScript.push({
+        kind: 'STALE_EPOCH',
+        currentEpoch: 5,
+        mode: 'HUMAN',
+        sessionState: 'ACTIVE',
+      });
+      h.events.length = 0;
+      await h.service.accept(started('d3'));
+      await expect(handoff(h)).resolves.toMatchObject({
+        mode: 'HUMAN',
+        epoch: 3,
+      });
+      expect(h.refused).toEqual([REF]);
+      expect(h.events).not.toContain('replay:pending');
+    });
+
+    it('SESSION_NOT_ENDING: not proof, stays HUMAN, onAckRefused', async () => {
+      const h = setup();
+      h.ackScript.push({ kind: 'SESSION_NOT_ENDING' });
+      await h.service.accept(started('d4'));
+      await expect(handoff(h)).resolves.toMatchObject({
+        mode: 'HUMAN',
+        epoch: 3,
+      });
+      expect(h.refused).toEqual([REF]);
+    });
+
+    it('a retryable ack failure is not a refusal: no revert, no onAckRefused', async () => {
+      const h = setup();
+      h.ackScript.push(failure('RETRYABLE'));
+      await expect(h.service.accept(started('d5'))).rejects.toThrow();
+      expect(h.refused).toEqual([]);
+      await expect(handoff(h)).resolves.toMatchObject({ mode: 'HUMAN' });
+    });
+
+    it('an onAckRefused that throws never fails the item', async () => {
+      const h = setup({ refuseThrows: true });
+      h.ackScript.push({ kind: 'NOT_FOUND' });
+      await expect(h.service.accept(started('d6'))).resolves.toBeUndefined();
+      await expect(handoff(h)).resolves.toMatchObject({ mode: 'BOT' });
+    });
+
+    it('without the port the service still reverts when the answer proves it', async () => {
+      const h = setup({ noRefuse: true });
+      h.ackScript.push({ kind: 'NOT_FOUND' });
+      await h.service.accept(started('d7'));
+      await expect(handoff(h)).resolves.toMatchObject({ mode: 'BOT' });
+    });
+  });
+
+  describe('maintenance replays wait for the farewell (rule 6 order)', () => {
+    it('a replayHeld tick that lands between the durable BOT and the farewell releases nothing', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(clarification('o1'));
+      let during: number | undefined;
+      h.window.hook = async () => {
+        h.window.hook = undefined;
+        during = await h.service.replayHeld();
+        expect(h.sent).toEqual([]);
+      };
+      await h.service.accept(ended('o2'));
+      expect(during).toBe(0);
+      expect(texts(h)).toEqual([
+        FAREWELL,
+        'Le comparto la respuesta del equipo:\nSí, lo tenemos en azul.',
+      ]);
+    });
+
+    it('a customer-inbound replay in that gap releases nothing either', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(clarification('o3'));
+      h.window.hook = async () => {
+        h.window.hook = undefined;
+        await h.service.onCustomerInbound(REF);
+        expect(h.sent).toEqual([]);
+      };
+      await h.service.accept(ended('o4'));
+      expect(texts(h)[0]).toBe(FAREWELL);
+      expect(texts(h)).toHaveLength(2);
+    });
+
+    it('once the ended is decided, the next tick releases the held row (no stuck hold)', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(clarification('o5'));
+      await h.mode.applyEnded(SENDER, 3);
+      await expect(h.service.replayHeld()).resolves.toBe(1);
+      expect(texts(h)).toHaveLength(1);
     });
   });
 });
