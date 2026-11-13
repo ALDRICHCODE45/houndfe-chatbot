@@ -74,6 +74,13 @@ import {
   sanitizeErrorText,
 } from '../../common/log-safe';
 
+/** Customer media that reopens the WhatsApp window and so triggers replays. */
+const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
+  'sticker',
+  'video',
+  'location',
+]);
+
 /**
  * WebhookDispatcherService (agent + human-handoff router)
  *
@@ -242,8 +249,13 @@ export class WebhookDispatcherService {
         );
         // S2: a customer sticker/video/location reopens the 24 h window like
         // text, so it triggers the same replays. Still no bot reply.
-        if (!this.humanHandoff.isOpsSender(message.senderId))
-          await this.replayOnMediaInbound(message);
+        // Fire-and-forget: the mode read must never delay later messages of
+        // the batch or the webhook answer.
+        if (
+          !this.humanHandoff.isOpsSender(message.senderId) &&
+          WINDOW_REOPENING_MIRROR_TYPES.has(message.mirrorOnly.type)
+        )
+          void this.replayOnMediaInbound(message);
         continue;
       }
 
@@ -689,6 +701,7 @@ export class WebhookDispatcherService {
    * customer, which must not happen while the mode is unknown) and never
    * rejects the message: it is already mirrored.
    */
+  /** Never rejects: called fire-and-forget from the dispatch loop. */
   private async replayOnMediaInbound(message: InboundMessage): Promise<void> {
     let human: boolean;
     try {

@@ -164,6 +164,7 @@ describe('WebhookDispatcherService media inbound replays (S2)', () => {
     async (_kind, build) => {
       const h = setup({ human: true });
       await h.service.dispatch(event([build('wamid.h1')]));
+      await new Promise((resolve) => setImmediate(resolve));
       expect(h.humanRequests.onHumanCustomerInbound).toHaveBeenCalledTimes(1);
       expect(h.humanRequests.onHumanCustomerInbound).toHaveBeenCalledWith(
         `wa:${SENDER}`,
@@ -178,6 +179,7 @@ describe('WebhookDispatcherService media inbound replays (S2)', () => {
     async (_kind, build) => {
       const h = setup();
       await h.service.dispatch(event([build('wamid.b1')]));
+      await new Promise((resolve) => setImmediate(resolve));
       expect(h.humanRequests.onCustomerInbound).toHaveBeenCalledTimes(1);
       expect(h.humanRequests.onCustomerInbound).toHaveBeenCalledWith(
         `wa:${SENDER}`,
@@ -204,6 +206,7 @@ describe('WebhookDispatcherService media inbound replays (S2)', () => {
     await h.service.dispatch(
       event([sticker('wamid.m1'), video('wamid.m2'), location('wamid.m3')]),
     );
+    await new Promise((resolve) => setImmediate(resolve));
     expect(h.humanRequests.onCustomerInbound).toHaveBeenCalledTimes(3);
   });
 
