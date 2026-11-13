@@ -181,10 +181,12 @@ const CUSTOMER_PORT_TOKENS = [
           client,
           sender,
           ...ports,
-          // Live conversation T4: started / reassigned / ended.
+          // Live conversation T4/T5: started / reassigned / ended and the
+          // staff message / template relays.
           live: new LiveConversationService({
             mode: handoff,
             client: live,
+            sender,
             isWindowOpen: ports.isWindowOpen,
             ...(ports.customerStyle === undefined
               ? {}

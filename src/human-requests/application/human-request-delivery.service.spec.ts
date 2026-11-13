@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import type {
   DeliveryOutcomeInput,
   PendingDeliveriesResult,
@@ -17,11 +18,13 @@ import {
   startedItem,
   templateItem,
 } from '../infrastructure/human-request-feed-store.contract';
+import type { DeliveryRow } from '../domain/human-request-feed';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
 import {
   HumanRequestDeliveryService,
   type HumanRequestDeliveryOptions,
 } from './human-request-delivery.service';
+import type { LivePlan } from './live-conversation.service';
 
 const SENDER = '5215550001111';
 const NOW = new Date('2026-11-10T16:20:00.000Z');
@@ -764,6 +767,135 @@ describe('HumanRequestDeliveryService', () => {
       await expect(store.getDelivery('lv8')).resolves.toMatchObject({
         localState: 'STALE',
         messageId: null,
+      });
+    });
+  });
+
+  // Relay plans (live conversation T5): the delivery service executes what a
+  // live handler plans; the handler's own rules are in
+  // live-conversation.service.spec.ts.
+  describe('relay plans from a live handler', () => {
+    const relayService = (
+      plan: (row: DeliveryRow) => Promise<LivePlan>,
+      human = true,
+    ) => {
+      const base = setup();
+      const service = new HumanRequestDeliveryService(
+        {
+          store: base.store,
+          client: base.client,
+          sender: base.sender,
+          handoff: { isHumanMode: () => Promise.resolve(human) },
+          isWindowOpen: () => Promise.resolve(true),
+          live: { plan },
+        },
+        {
+          clock: () => NOW,
+          random: () => 1,
+          newAttemptId: () => randomUUID(),
+        },
+      );
+      return { ...base, service };
+    };
+
+    it('sends through `deliver`, never through sender.sendText, and is not held by HUMAN mode', async () => {
+      const deliver = jest.fn(() =>
+        Promise.resolve({ providerMessageId: 'wamid.R1' }),
+      );
+      const { service, sender, client, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'STAFF_MESSAGE',
+          senderId: SENDER,
+          deferrable: true,
+          deliver,
+        }),
+      );
+      await service.accept(staffMessageItem('rp1'));
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks[0].body).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.R1',
+      });
+      await expect(store.getDelivery('rp1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'STAFF_MESSAGE',
+      });
+    });
+
+    it('runs `dispose` after the attempt, also when the send fails and when the row moved on', async () => {
+      const dispose = jest.fn(() => Promise.resolve());
+      const { service, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'STAFF_MESSAGE',
+          senderId: SENDER,
+          deferrable: true,
+          deliver: () => Promise.reject(new Error('boom')),
+          dispose,
+        }),
+      );
+      await service.accept(staffMessageItem('rp2'));
+      expect(dispose).toHaveBeenCalledTimes(1);
+      await expect(store.getDelivery('rp2')).resolves.toMatchObject({
+        localState: 'UNKNOWN',
+      });
+
+      const moved = jest.fn(() => Promise.resolve());
+      const other = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'STAFF_MESSAGE',
+          senderId: SENDER,
+          deferrable: true,
+          deliver: () => Promise.resolve({ providerMessageId: 'w' }),
+          dispose: moved,
+        }),
+      );
+      jest.spyOn(other.store, 'transition').mockResolvedValueOnce(null);
+      await other.service.accept(staffMessageItem('rp3'));
+      expect(moved).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failing `dispose` never breaks the delivery', async () => {
+      const { service, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'TEMPLATE_SENT',
+          senderId: SENDER,
+          deferrable: false,
+          deliver: () => Promise.resolve({ providerMessageId: 'w' }),
+          dispose: () => Promise.reject(new Error('unlink failed')),
+        }),
+      );
+      await service.accept(templateItem('rp4'));
+      await expect(store.getDelivery('rp4')).resolves.toMatchObject({
+        localState: 'SENT',
+      });
+    });
+
+    it('a non-deferrable relay (template) whose window is closed is STALE / SEND_REFUSED, never deferred', async () => {
+      const closed = Object.assign(new Error('closed'), {
+        name: 'WhatsappSendError',
+        status: 400,
+        graphErrorCode: 131047,
+        stage: 'send',
+      });
+      const { service, client, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'TEMPLATE_SENT',
+          senderId: SENDER,
+          deferrable: false,
+          deliver: () => Promise.reject(closed),
+        }),
+      );
+      await service.accept(templateItem('rp5'));
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getDelivery('rp5')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SEND_REFUSED',
       });
     });
   });

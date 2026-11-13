@@ -2,18 +2,25 @@ import { Logger } from '@nestjs/common';
 import type {
   ConversationEndedItem,
   ConversationReassignedItem,
+  ConversationStaffMessageItem,
   ConversationStartedItem,
   DeliveryOutcomeInput,
   RecordDeliveryOutcomeResult,
   RequestAnsweredItem,
+  TemplateRequestedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type {
+  DownloadStaffMediaResult,
   SessionAckInput,
   SessionAckResult,
 } from '../../chatbot-api/domain/dtos/live-conversation.dto';
 import { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
+import type {
+  OutboundMediaFile,
+  OutboundTemplate,
+} from '../../whatsapp/domain/whatsapp-sender.port';
 import { WhatsappSendError } from '../../whatsapp/infrastructure/meta-whatsapp.sender';
 import { REF } from '../infrastructure/human-request-feed-store.contract';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
@@ -128,6 +135,9 @@ const setup = () => {
     },
   };
 
+  const downloads: string[] = [];
+  const cleanups: string[] = [];
+  const downloadScript: DownloadStaffMediaResult[] = [];
   const acks: SessionAckInput[] = [];
   const modeAtAck: string[] = [];
   const ackScript: Array<SessionAckResult | Error> = [];
@@ -144,10 +154,32 @@ const setup = () => {
       if (next instanceof Error) throw next;
       return next ?? okAck(input);
     },
+    downloadStaffMedia: (
+      mediaId: string,
+    ): Promise<DownloadStaffMediaResult> => {
+      events.push(`download:${mediaId}`);
+      downloads.push(mediaId);
+      const next = downloadScript.shift();
+      if (next !== undefined) return Promise.resolve(next);
+      return Promise.resolve({
+        kind: 'ok',
+        filePath: `/tmp/staff-${mediaId}`,
+        mimeType: 'image/jpeg',
+        filename: 'foto.jpg',
+        sizeBytes: 10,
+        sha256: 'a'.repeat(64),
+        cleanup: () => {
+          events.push(`cleanup:${mediaId}`);
+          cleanups.push(mediaId);
+          return Promise.resolve();
+        },
+      });
+    },
   };
 
   const outcomes: Array<{ deliveryId: string; body: DeliveryOutcomeInput }> =
     [];
+  const outcomeScript: RecordDeliveryOutcomeResult[] = [];
   const feedClient = {
     recordDeliveryOutcome: (
       deliveryId: string,
@@ -155,6 +187,8 @@ const setup = () => {
     ): Promise<RecordDeliveryOutcomeResult> => {
       events.push(`outcome:${body.outcome}`);
       outcomes.push({ deliveryId, body });
+      const scripted = outcomeScript.shift();
+      if (scripted !== undefined) return Promise.resolve(scripted);
       return Promise.resolve({
         kind: 'ok',
         response: {
@@ -172,6 +206,8 @@ const setup = () => {
   };
 
   const sent: Array<Record<string, unknown>> = [];
+  const templates: Array<Record<string, unknown>> = [];
+  const mediaSends: Array<Record<string, unknown>> = [];
   const sendScript: Array<Error | string> = [];
   let wamid = 0;
   const sender = {
@@ -182,6 +218,25 @@ const setup = () => {
       if (next instanceof Error) return Promise.reject(next);
       wamid += 1;
       return Promise.resolve({ providerMessageId: next ?? `wamid.${wamid}` });
+    },
+    sendTemplate: (message: OutboundTemplate) => {
+      events.push(`template:${String(message.templateName)}`);
+      templates.push({ ...message });
+      const next = sendScript.shift();
+      if (next instanceof Error) return Promise.reject(next);
+      wamid += 1;
+      return Promise.resolve({ providerMessageId: next ?? `wamid.${wamid}` });
+    },
+    sendMediaFile: (message: OutboundMediaFile) => {
+      events.push(`media:${String(message.mimeType)}`);
+      mediaSends.push({ ...message });
+      const next = sendScript.shift();
+      if (next instanceof Error) return Promise.reject(next);
+      wamid += 1;
+      return Promise.resolve({
+        providerMessageId: next ?? `wamid.${wamid}`,
+        providerMediaId: 'media.1',
+      });
     },
   };
 
@@ -205,6 +260,7 @@ const setup = () => {
       live: new LiveConversationService({
         mode,
         client: live,
+        sender,
         isWindowOpen,
         customerStyle,
       }),
@@ -223,6 +279,12 @@ const setup = () => {
     store,
     events,
     sent,
+    templates,
+    mediaSends,
+    downloads,
+    cleanups,
+    downloadScript,
+    outcomeScript,
     sendScript,
     acks,
     modeAtAck,
@@ -260,6 +322,106 @@ const failure = (kind: string): SessionAckResult =>
     RATE_LIMITED: { kind: 'RATE_LIMITED', retryAfterSeconds: 2 },
     UNAUTHORIZED: { kind: 'UNAUTHORIZED' },
   })[kind] as SessionAckResult;
+
+const staffText = (
+  deliveryId: string,
+  payload: Partial<{
+    handoffEpoch: number;
+    seq: number;
+    messageId: string;
+    text: string;
+  }> = {},
+): ConversationStaffMessageItem => ({
+  ...envelope(deliveryId),
+  type: 'conversation.staff_message',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: 3,
+    seq: 18,
+    messageId: `msg-${deliveryId}`,
+    type: 'TEXT',
+    text: 'Hola, le confirmo su pedido\nSaldo: $1,200 *gracias*',
+    ...payload,
+  },
+});
+
+const staffMedia = (
+  deliveryId: string,
+  payload: {
+    type?: 'IMAGE' | 'DOCUMENT';
+    mimeType?: string;
+    caption?: string | null;
+    mediaId?: string;
+    filename?: string;
+    handoffEpoch?: number;
+  } = {},
+): ConversationStaffMessageItem => ({
+  ...envelope(deliveryId),
+  type: 'conversation.staff_message',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: payload.handoffEpoch ?? 3,
+    seq: 20,
+    messageId: `msg-${deliveryId}`,
+    type: payload.type ?? 'IMAGE',
+    mediaId: payload.mediaId ?? `media-${deliveryId}`,
+    mimeType: payload.mimeType ?? 'image/jpeg',
+    filename: payload.filename ?? 'foto.jpg',
+    caption: payload.caption === undefined ? 'Su pedido' : payload.caption,
+  },
+});
+
+const templateRequested = (
+  deliveryId: string,
+  payload: Partial<{
+    handoffEpoch: number;
+    messageId: string;
+    languageCode: string;
+    templateName: string;
+  }> = {},
+): TemplateRequestedItem => ({
+  ...envelope(deliveryId),
+  type: 'template.requested',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    handoffEpoch: 3,
+    seq: 19,
+    messageId: `msg-${deliveryId}`,
+    templateName: 'seguimiento_pedido',
+    languageCode: 'es_MX',
+    ...payload,
+  },
+});
+
+/** Mutes the conversation on epoch 3 the way a handled `started` does. */
+const muted = async (h: Harness, epoch = 3) => {
+  await h.mode.applyStarted(SENDER, epoch, 'req-live');
+};
+
+const downloaded = (
+  h: Harness,
+  patch: { mimeType?: string; filename?: string } = {},
+): void => {
+  h.downloadScript.push({
+    kind: 'ok',
+    filePath: '/tmp/staff-file',
+    mimeType: patch.mimeType ?? 'image/jpeg',
+    filename: patch.filename ?? 'servidor.bin',
+    sizeBytes: 10,
+    sha256: 'b'.repeat(64),
+    cleanup: () => {
+      h.events.push('cleanup:file');
+      h.cleanups.push('file');
+      return Promise.resolve();
+    },
+  });
+};
+
+const sendError = (
+  status: number | null,
+  code: string | number | null = null,
+  stage: 'send' | 'upload' = 'send',
+) => new WhatsappSendError(status, code, 'meta said no', stage);
 
 describe('LiveConversationService (T4)', () => {
   let logs: string[];
@@ -990,6 +1152,649 @@ describe('LiveConversationService (T4)', () => {
       h.sendScript.push(new Error('socket hang up'));
       await h.service.accept(timeout('t19'));
       expect(lastOutcome(h)).toMatchObject({ outcome: 'DELIVERY_UNKNOWN' });
+    });
+  });
+
+  describe('conversation.staff_message (T5)', () => {
+    it('relays the text verbatim as STAFF while HUMAN on the same epoch and reports the wamid', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push('wamid.STAFF1');
+      const item = staffText('s1');
+      await h.service.accept(item);
+      expect(h.sent).toEqual([
+        {
+          to: SENDER,
+          text: 'Hola, le confirmo su pedido\nSaldo: $1,200 *gracias*',
+          origin: 'STAFF',
+        },
+      ]);
+      expect(lastOutcome(h)).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.STAFF1',
+      });
+      await expect(row(h, 's1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'STAFF_MESSAGE',
+        providerMessageId: 'wamid.STAFF1',
+        ackState: 'ACKED',
+      });
+    });
+
+    it('never mirrors: nothing but the STAFF-origin send happens and no notice is added', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(staffText('s2'));
+      expect(h.events.filter((e) => e.startsWith('send:'))).toHaveLength(1);
+      expect(h.sent.every((m) => m.origin === 'STAFF')).toBe(true);
+      expect(h.acks).toEqual([]);
+    });
+
+    it('does not read the 24 h window locally: Meta is the source of truth', async () => {
+      const h = setup();
+      await muted(h);
+      h.window.fail = true;
+      await h.service.accept(staffText('s3'));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it.each([
+      ['an older item epoch', 2, 3],
+      ['a newer item epoch (never muted for it)', 5, 3],
+    ])('%s is STALE, nothing is sent', async (_name, itemEpoch, ours) => {
+      const h = setup();
+      await muted(h, ours);
+      await h.service.accept(staffText('s4', { handoffEpoch: itemEpoch }));
+      expect(h.sent).toEqual([]);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+      await expect(row(h, 's4')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it('same epoch but already BOT again is STALE (session over)', async () => {
+      const h = setup();
+      await muted(h);
+      await h.mode.applyEnded(SENDER, 3);
+      await h.service.accept(staffText('s5'));
+      expect(h.sent).toEqual([]);
+      await expect(row(h, 's5')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SESSION_NOT_ACTIVE',
+      });
+    });
+
+    it('never started at all (epoch 0, BOT) is STALE', async () => {
+      const h = setup();
+      await h.service.accept(staffText('s6'));
+      expect(h.sent).toEqual([]);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+    });
+
+    it('rule 10: muted on that epoch, no outcome is ever the STALE of an epoch/session mismatch', async () => {
+      const failures: Array<[string, Error | string]> = [
+        ['ok', 'wamid.R10'],
+        ['closed', sendError(400, 131047)],
+        ['uncertain', sendError(null)],
+        ['refused', sendError(400, 100)],
+        ['plain', new Error('boom')],
+      ];
+      for (const [name, script] of failures) {
+        const h = setup();
+        await muted(h);
+        h.sendScript.push(script);
+        await h.service.accept(staffText(`r10-${name}`));
+        const stored = await row(h, `r10-${name}`);
+        expect(stored?.decision).not.toBe('STALE_EPOCH');
+        expect(stored?.decision).not.toBe('SESSION_NOT_ACTIVE');
+      }
+    });
+
+    it('rule 10: an unreadable handoff state is retried, never ACKed STALE', async () => {
+      const h = setup();
+      await muted(h);
+      jest
+        .spyOn(HandoffModeService.prototype, 'getState')
+        .mockRejectedValueOnce(new Error('db down'));
+      await expect(h.service.accept(staffText('s7'))).rejects.toThrow();
+      expect(h.outcomes).toEqual([]);
+      await expect(row(h, 's7')).resolves.toMatchObject({
+        localState: 'RECEIVED',
+      });
+      await h.service.accept(staffText('s7'));
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it('a closed window (131047) is DEFERRED_WINDOW_CLOSED, kept locally, never STALE', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 131047));
+      await h.service.accept(staffText('s8'));
+      expect(lastOutcome(h)).toMatchObject({
+        outcome: 'DEFERRED_WINDOW_CLOSED',
+      });
+      await expect(row(h, 's8')).resolves.toMatchObject({
+        localState: 'DEFERRED_WINDOW',
+        decision: 'STAFF_MESSAGE',
+      });
+    });
+
+    it('a deferred message is resent on the next customer message while the same epoch is HUMAN, with a new attemptId', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 131047), 'wamid.LATE');
+      await h.service.accept(staffText('s9'));
+      const first = (await row(h, 's9'))!.attemptId;
+      await h.service.onCustomerInbound(REF);
+      expect(h.sent).toHaveLength(2);
+      expect(h.sent[1]).toMatchObject({ origin: 'STAFF' });
+      expect(lastOutcome(h)).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.LATE',
+      });
+      const second = await row(h, 's9');
+      expect(second).toMatchObject({ localState: 'SENT' });
+      expect(second!.attemptId).not.toBe(first);
+    });
+
+    it('a deferred message whose epoch already ended is NOT resent: STALE, and a 409 OUTCOME_ALREADY_RECORDED means "not coming"', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 131047));
+      await h.service.accept(staffText('s10'));
+      await h.mode.applyEnded(SENDER, 3);
+      h.outcomeScript.push({ kind: 'OUTCOME_ALREADY_RECORDED' });
+      await h.service.onCustomerInbound(REF);
+      expect(h.sent).toHaveLength(1);
+      await expect(row(h, 's10')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SESSION_NOT_ACTIVE',
+        ackState: 'FAILED_PERMANENT',
+      });
+      // Stops: a further inbound does nothing more.
+      const outcomesBefore = h.outcomes.length;
+      await h.service.onCustomerInbound(REF);
+      expect(h.outcomes).toHaveLength(outcomesBefore);
+      expect(h.sent).toHaveLength(1);
+    });
+
+    it('a deferred message of an older epoch is not resent under a newer HUMAN epoch', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 131047));
+      await h.service.accept(staffText('s11'));
+      await h.mode.applyEnded(SENDER, 3);
+      await h.mode.applyStarted(SENDER, 4, 'req-next');
+      await h.service.onCustomerInbound(REF);
+      expect(h.sent).toHaveLength(1);
+      await expect(row(h, 's11')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it.each([
+      ['a network error (no status)', () => sendError(null)],
+      ['a 5xx', () => sendError(503)],
+      ['a timeout (408)', () => sendError(408)],
+      ['a non-Meta error', () => new Error('socket hang up')],
+    ])(
+      'an uncertain send (%s) is DELIVERY_UNKNOWN, never retried',
+      async (_n, make) => {
+        const h = setup();
+        await muted(h);
+        h.sendScript.push(make());
+        await h.service.accept(staffText('s12'));
+        expect(lastOutcome(h)).toMatchObject({ outcome: 'DELIVERY_UNKNOWN' });
+        await expect(row(h, 's12')).resolves.toMatchObject({
+          localState: 'UNKNOWN',
+        });
+        await h.service.onCustomerInbound(REF);
+        expect(h.sent).toHaveLength(1);
+      },
+    );
+
+    it.each([
+      ['400 with a Graph code', () => sendError(400, 131009)],
+      ['a 429 throttle', () => sendError(429, 130429)],
+      ['a 401', () => sendError(401, 190)],
+    ])(
+      'Meta refusing synchronously (%s) is STALE / SEND_REFUSED',
+      async (_n, make) => {
+        const h = setup();
+        await muted(h);
+        h.sendScript.push(make());
+        await h.service.accept(staffText('s13'));
+        expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+        await expect(row(h, 's13')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'SEND_REFUSED',
+        });
+      },
+    );
+
+    describe('dedupe by messageId', () => {
+      it('a second delivery of the same messageId (first insert) is never sent: STALE / DUPLICATE', async () => {
+        const h = setup();
+        await muted(h);
+        await h.service.accept(staffText('d1', { messageId: 'msg-same' }));
+        await h.service.accept(staffText('d2', { messageId: 'msg-same' }));
+        expect(h.sent).toHaveLength(1);
+        expect(h.outcomes.map((o) => o.deliveryId)).toEqual(['d1', 'd2']);
+        expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+        await expect(row(h, 'd2')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'DUPLICATE',
+          messageId: null,
+        });
+      });
+
+      it('a duplicate row found again on replay (messageId null on a row that has one) is never sent', async () => {
+        const h = setup();
+        await muted(h);
+        await h.store.insertDelivery(
+          staffText('d3', { messageId: 'msg-owner' }),
+        );
+        const dup = staffText('d4', { messageId: 'msg-owner' });
+        const inserted = await h.store.insertDelivery(dup);
+        expect(inserted.duplicateOf).toBe('d3');
+        // The consumer re-reads the page after a crash: only the replay sees it.
+        await h.service.accept(dup);
+        expect(h.sent).toEqual([]);
+        await expect(row(h, 'd4')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'DUPLICATE',
+        });
+      });
+
+      it('the duplicate is not sent even when the conversation is HUMAN on its epoch', async () => {
+        const h = setup();
+        await muted(h);
+        await h.service.accept(staffText('d5', { messageId: 'm5' }));
+        h.sendScript.push('wamid.NEVER');
+        await h.service.accept(staffText('d6', { messageId: 'm5' }));
+        expect(h.sendScript).toEqual(['wamid.NEVER']);
+      });
+
+      it('the same deliveryId accepted twice is sent once', async () => {
+        const h = setup();
+        await muted(h);
+        await h.service.accept(staffText('d7'));
+        await h.service.accept(staffText('d7'));
+        expect(h.sent).toHaveLength(1);
+        expect(h.outcomes).toHaveLength(1);
+      });
+    });
+
+    describe('media', () => {
+      it.each([
+        ['IMAGE', 'image/jpeg', 'foto.jpg'],
+        ['IMAGE', 'image/png', 'foto.png'],
+        ['DOCUMENT', 'application/pdf', 'cotizacion.pdf'],
+      ] as const)(
+        '%s %s: downloads by mediaId, uploads from disk with the caption and cleans up',
+        async (type, mimeType, filename) => {
+          const h = setup();
+          await muted(h);
+          downloaded(h, { mimeType });
+          h.sendScript.push('wamid.MEDIA');
+          await h.service.accept(
+            staffMedia('m1', {
+              type,
+              mimeType,
+              filename,
+              mediaId: 'media-abc',
+              caption: 'Su pedido',
+            }),
+          );
+          expect(h.downloads).toEqual(['media-abc']);
+          expect(h.mediaSends).toEqual([
+            {
+              to: SENDER,
+              filePath: '/tmp/staff-file',
+              mimeType,
+              filename,
+              caption: 'Su pedido',
+              origin: 'STAFF',
+            },
+          ]);
+          expect(h.sent).toEqual([]);
+          expect(h.cleanups).toEqual(['file']);
+          expect(h.events.indexOf('cleanup:file')).toBeGreaterThan(
+            h.events.indexOf(`media:${mimeType}`),
+          );
+          expect(lastOutcome(h)).toMatchObject({
+            outcome: 'PROVIDER_ACCEPTED',
+            providerMessageId: 'wamid.MEDIA',
+          });
+        },
+      );
+
+      it('a null caption sends no caption at all', async () => {
+        const h = setup();
+        await muted(h);
+        downloaded(h);
+        await h.service.accept(staffMedia('m2', { caption: null }));
+        expect(h.mediaSends).toHaveLength(1);
+        expect('caption' in h.mediaSends[0]).toBe(false);
+      });
+
+      it('image/webp goes as a document (Meta image messages are JPEG/PNG only), never as an image', async () => {
+        const h = setup();
+        await muted(h);
+        downloaded(h, { mimeType: 'image/webp' });
+        await h.service.accept(
+          staffMedia('m3', {
+            type: 'IMAGE',
+            mimeType: 'image/webp',
+            filename: 'foto.webp',
+          }),
+        );
+        expect(h.mediaSends).toEqual([
+          expect.objectContaining({
+            mimeType: 'image/webp',
+            filename: 'foto.webp',
+            asDocument: true,
+            origin: 'STAFF',
+          }),
+        ]);
+      });
+
+      it('a DOCUMENT that is not a PDF also goes as a document', async () => {
+        const h = setup();
+        await muted(h);
+        downloaded(h, { mimeType: 'image/png' });
+        await h.service.accept(
+          staffMedia('m4', { type: 'DOCUMENT', mimeType: 'image/png' }),
+        );
+        expect(h.mediaSends[0]).toMatchObject({ asDocument: true });
+      });
+
+      it('jpeg/png/pdf are not flagged as documents beyond their own type', async () => {
+        const h = setup();
+        await muted(h);
+        downloaded(h);
+        await h.service.accept(staffMedia('m5'));
+        expect('asDocument' in h.mediaSends[0]).toBe(false);
+      });
+
+      it('MEDIA_NOT_FOUND is STALE / MEDIA_NOT_FOUND, nothing is sent', async () => {
+        const h = setup();
+        await muted(h);
+        h.downloadScript.push({ kind: 'MEDIA_NOT_FOUND' });
+        await h.service.accept(staffMedia('m6'));
+        expect(h.mediaSends).toEqual([]);
+        expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+        await expect(row(h, 'm6')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'MEDIA_NOT_FOUND',
+        });
+      });
+
+      it('a file over the cap is a definite non-send: STALE / SEND_REFUSED', async () => {
+        const h = setup();
+        await muted(h);
+        h.downloadScript.push({ kind: 'MEDIA_TOO_LARGE' });
+        await h.service.accept(staffMedia('m7'));
+        expect(h.mediaSends).toEqual([]);
+        await expect(row(h, 'm7')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'SEND_REFUSED',
+        });
+      });
+
+      it.each([
+        [
+          'a transient backend failure',
+          {
+            kind: 'RETRYABLE',
+            cause: 'http_5xx',
+            status: 503,
+            retryAfterSeconds: null,
+          },
+        ],
+        ['a local disk error', { kind: 'LOCAL_IO_ERROR' }],
+        ['a credential problem', { kind: 'UNAUTHORIZED' }],
+      ] as const)(
+        '%s while downloading is retried (row stays RECEIVED, nothing ACKed)',
+        async (_n, result) => {
+          const h = setup();
+          await muted(h);
+          h.downloadScript.push(result);
+          await expect(h.service.accept(staffMedia('m8'))).rejects.toThrow();
+          expect(h.outcomes).toEqual([]);
+          expect(h.mediaSends).toEqual([]);
+          await expect(row(h, 'm8')).resolves.toMatchObject({
+            localState: 'RECEIVED',
+          });
+          downloaded(h);
+          await h.service.accept(staffMedia('m8'));
+          expect(h.mediaSends).toHaveLength(1);
+        },
+      );
+
+      it('does not download for an item that is STALE by epoch or duplicate', async () => {
+        const h = setup();
+        await muted(h);
+        await h.service.accept(staffMedia('m9', { handoffEpoch: 2 }));
+        expect(h.downloads).toEqual([]);
+      });
+
+      it.each([
+        ['accepted', undefined, 'PROVIDER_ACCEPTED'],
+        ['window closed', sendError(400, 131047), 'DEFERRED_WINDOW_CLOSED'],
+        ['uncertain', sendError(null), 'DELIVERY_UNKNOWN'],
+        ['refused', sendError(400, 131009), 'STALE'],
+        ['upload failed', sendError(null, null, 'upload'), 'STALE'],
+      ] as const)(
+        'the temp file is cleaned up when the send is %s',
+        async (_n, script, outcome) => {
+          const h = setup();
+          await muted(h);
+          downloaded(h);
+          if (script !== undefined) h.sendScript.push(script);
+          await h.service.accept(staffMedia('m10'));
+          expect(lastOutcome(h)).toMatchObject({ outcome });
+          expect(h.cleanups).toEqual(['file']);
+        },
+      );
+
+      it('an upload-stage failure (nothing reached the customer) is STALE / SEND_REFUSED, even with a 5xx or no status', async () => {
+        for (const status of [null, 503]) {
+          const h = setup();
+          await muted(h);
+          h.sendScript.push(sendError(status, null, 'upload'));
+          await h.service.accept(staffMedia('m11'));
+          await expect(row(h, 'm11')).resolves.toMatchObject({
+            localState: 'STALE',
+            decision: 'SEND_REFUSED',
+          });
+        }
+      });
+
+      it('a deferred media message is downloaded again on replay and cleaned up each time', async () => {
+        const h = setup();
+        await muted(h);
+        h.sendScript.push(sendError(400, 131047));
+        await h.service.accept(staffMedia('m12'));
+        await h.service.onCustomerInbound(REF);
+        expect(h.downloads).toHaveLength(2);
+        expect(h.cleanups).toHaveLength(2);
+        expect(h.mediaSends).toHaveLength(2);
+        await expect(row(h, 'm12')).resolves.toMatchObject({
+          localState: 'SENT',
+        });
+      });
+
+      it('a replay under an ended epoch downloads nothing', async () => {
+        const h = setup();
+        await muted(h);
+        h.sendScript.push(sendError(400, 131047));
+        await h.service.accept(staffMedia('m13'));
+        await h.mode.applyEnded(SENDER, 3);
+        await h.service.onCustomerInbound(REF);
+        expect(h.downloads).toHaveLength(1);
+      });
+    });
+
+    it('messages of one conversation go out in the order they are accepted (seq order from the feed)', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(staffText('o1', { seq: 18, text: 'uno' }));
+      await h.service.accept(staffText('o2', { seq: 19, text: 'dos' }));
+      expect(texts(h)).toEqual(['uno', 'dos']);
+    });
+
+    it('never logs the phone or a wamid', async () => {
+      const h = setup();
+      await muted(h);
+      downloaded(h);
+      const cases: Array<[Error | string | undefined, string]> = [
+        ['wamid.SECRET1', 'l1'],
+        [sendError(400, 131047), 'l2'],
+        [sendError(null), 'l3'],
+        [sendError(400, 131009), 'l4'],
+        [sendError(null, null, 'upload'), 'l5'],
+      ];
+      for (const [script, id] of cases) {
+        if (script !== undefined) h.sendScript.push(script);
+        downloaded(h);
+        await h.service.accept(staffMedia(id));
+      }
+      await h.service.accept(staffText('l6', { handoffEpoch: 9 }));
+      await h.service.onCustomerInbound(REF);
+      expect(logs.length).toBeGreaterThan(0);
+      for (const line of logs) {
+        expect(line).not.toContain(SENDER);
+        expect(line).not.toContain('wamid.SECRET1');
+      }
+    });
+  });
+
+  describe('template.requested (T5)', () => {
+    it('sends the approved template as TEMPLATE with no variables and reports the wamid', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push('wamid.TPL1');
+      await h.service.accept(templateRequested('t1'));
+      expect(h.templates).toEqual([
+        {
+          to: SENDER,
+          templateName: 'seguimiento_pedido',
+          languageCode: 'es_MX',
+          bodyParameters: [],
+          origin: 'TEMPLATE',
+        },
+      ]);
+      expect(h.sent).toEqual([]);
+      expect(lastOutcome(h)).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.TPL1',
+      });
+      await expect(row(h, 't1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'TEMPLATE_SENT',
+      });
+    });
+
+    it('uses the language code of the item', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(templateRequested('t2', { languageCode: 'en' }));
+      expect(h.templates[0]).toMatchObject({ languageCode: 'en' });
+    });
+
+    it('is sent even when the 24 h window is closed (that is what a template is for)', async () => {
+      const h = setup();
+      await muted(h);
+      h.window.open = false;
+      await h.service.accept(templateRequested('t3'));
+      expect(h.templates).toHaveLength(1);
+    });
+
+    it.each([
+      ['an older epoch', 2],
+      ['a newer epoch', 4],
+    ])('%s is STALE, nothing is sent', async (_n, epoch) => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(templateRequested('t4', { handoffEpoch: epoch }));
+      expect(h.templates).toEqual([]);
+      await expect(row(h, 't4')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'STALE_EPOCH',
+      });
+    });
+
+    it('same epoch but BOT again is STALE / SESSION_NOT_ACTIVE', async () => {
+      const h = setup();
+      await muted(h);
+      await h.mode.applyEnded(SENDER, 3);
+      await h.service.accept(templateRequested('t5'));
+      expect(h.templates).toEqual([]);
+      await expect(row(h, 't5')).resolves.toMatchObject({
+        decision: 'SESSION_NOT_ACTIVE',
+      });
+    });
+
+    it('an uncertain send is DELIVERY_UNKNOWN (never retried)', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(null));
+      await h.service.accept(templateRequested('t6'));
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'DELIVERY_UNKNOWN' });
+      await h.service.onCustomerInbound(REF);
+      expect(h.templates).toHaveLength(1);
+    });
+
+    it('Meta refusing synchronously is STALE / SEND_REFUSED', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 132001));
+      await h.service.accept(templateRequested('t7'));
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+      await expect(row(h, 't7')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SEND_REFUSED',
+      });
+    });
+
+    it('is never DEFERRED, not even for 131047 (the backend answers 422 to it)', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 131047));
+      await h.service.accept(templateRequested('t8'));
+      expect(h.outcomes.map((o) => o.body.outcome)).not.toContain(
+        'DEFERRED_WINDOW_CLOSED',
+      );
+      await expect(row(h, 't8')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SEND_REFUSED',
+      });
+    });
+
+    it('a duplicate messageId is never sent: STALE / DUPLICATE', async () => {
+      const h = setup();
+      await muted(h);
+      await h.service.accept(templateRequested('t9', { messageId: 'same' }));
+      await h.service.accept(templateRequested('t10', { messageId: 'same' }));
+      expect(h.templates).toHaveLength(1);
+      await expect(row(h, 't10')).resolves.toMatchObject({
+        decision: 'DUPLICATE',
+      });
+    });
+
+    it('a retried template (new messageId and deliveryId) after a refusal is a new item and is sent', async () => {
+      const h = setup();
+      await muted(h);
+      h.sendScript.push(sendError(400, 132001));
+      await h.service.accept(templateRequested('t11'));
+      await h.service.accept(templateRequested('t12'));
+      expect(h.templates).toHaveLength(2);
+      await expect(row(h, 't12')).resolves.toMatchObject({
+        localState: 'SENT',
+      });
     });
   });
 });

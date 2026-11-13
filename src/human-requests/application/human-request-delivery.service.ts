@@ -18,6 +18,7 @@ import type {
   LivePlan,
   LiveSendResult,
 } from './live-conversation.service';
+import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -26,6 +27,7 @@ import {
   ackBackoffMs,
   ackBodyFor,
   canonicalNow,
+  classifyRelaySendError,
   isWindowClosedSendError,
   maskConversationRef,
   senderIdFromRef,
@@ -33,6 +35,7 @@ import {
   withTeamPrefix,
   type AckCompletion,
   type DeliveryDecision,
+  type DeliveryExpectation,
   type DeliveryRow,
   type HumanRequestFeedStore,
 } from '../domain/human-request-feed';
@@ -56,9 +59,10 @@ export interface HumanRequestDeliveryPorts {
   isWindowOpen(senderId: string): Promise<boolean>;
   /** Stored customer style; null/failure keeps the usted copy. */
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
-  /** Live conversation (T4): started / reassigned / ended. Without it those
-   *  items stay the safe STALE of T1 (a claim reverts after its start
-   *  timeout), so hand-built harnesses keep working. */
+  /** Live conversation (T4/T5): started / reassigned / ended and the staff
+   *  message / template relays. Without it those items stay the safe STALE
+   *  of T1 (a claim reverts after its start timeout), so hand-built
+   *  harnesses keep working. */
   live?: LiveConversationHandler;
 }
 
@@ -97,6 +101,16 @@ type Plan =
       /** Live notice (greeting, reassignment, farewell, resume): sent while
        *  the mode is HUMAN, so the HUMAN hold does not apply. */
       live?: boolean;
+    } & LiveHooks)
+  | ({
+      /** Staff message / template: sent by `deliver` (never mirrored), never
+       *  held by HUMAN mode; see `LivePlan`. */
+      action: 'relay';
+      decision: DeliveryDecision;
+      senderId: string;
+      deliver: () => Promise<SendResult>;
+      dispose?: () => Promise<void>;
+      deferrable: boolean;
     } & LiveHooks);
 
 /**
@@ -332,6 +346,22 @@ export class HumanRequestDeliveryService {
 
   private async run(row: DeliveryRow): Promise<boolean> {
     const plan = await this.plan(row);
+    try {
+      return await this.execute(row, plan);
+    } finally {
+      if (plan.action === 'relay' && plan.dispose !== undefined) {
+        try {
+          await plan.dispose();
+        } catch (error) {
+          this.logger.warn(
+            `delivery ${row.deliveryId} cleanup failed: ${describeError(error)}`,
+          );
+        }
+      }
+    }
+  }
+
+  private async execute(row: DeliveryRow, plan: Plan): Promise<boolean> {
     const expected = { localState: row.localState, attemptId: row.attemptId };
     const attemptedAt = canonicalNow(this.clock);
 
@@ -355,12 +385,12 @@ export class HumanRequestDeliveryService {
     }
 
     const hold =
-      plan.live === true
+      plan.action === 'relay' || plan.live === true
         ? ({ hold: false } as const)
         : await checkHandoffSendHold(this.ports.handoff, plan.senderId);
     if (hold.hold && hold.reason === 'MODE_UNREADABLE')
       throw new Error(`handoff mode unreadable: ${hold.error}`);
-    if (hold.hold && plan.overdue === true) {
+    if (hold.hold && plan.action === 'send' && plan.overdue === true) {
       const next = await this.ports.store.transition(row.deliveryId, expected, {
         localState: 'STALE',
         decision: 'HUMAN_SESSION',
@@ -380,7 +410,10 @@ export class HumanRequestDeliveryService {
         attemptId: this.newAttemptId(),
         attemptedAt,
         providerMessageId: null,
-        ack: plan.cancellation ? null : 'DEFERRED_HUMAN_SESSION',
+        ack:
+          plan.action === 'send' && plan.cancellation
+            ? null
+            : 'DEFERRED_HUMAN_SESSION',
       });
       if (next?.ackState === 'PENDING') await this.flushAck(next);
       return false;
@@ -405,14 +438,19 @@ export class HumanRequestDeliveryService {
 
     let providerMessageId: string;
     try {
-      ({ providerMessageId } = await this.ports.sender.sendText({
-        to: plan.senderId,
-        text: plan.text,
-        ...(plan.staffReplyId === undefined
-          ? {}
-          : { staffReplyId: plan.staffReplyId }),
-      }));
+      ({ providerMessageId } =
+        plan.action === 'relay'
+          ? await plan.deliver()
+          : await this.ports.sender.sendText({
+              to: plan.senderId,
+              text: plan.text,
+              ...(plan.staffReplyId === undefined
+                ? {}
+                : { staffReplyId: plan.staffReplyId }),
+            }));
     } catch (error) {
+      if (plan.action === 'relay')
+        return this.relayFailed(row, plan, claimed, base, error);
       const windowClosed = isWindowClosedSendError(error);
       if (!windowClosed)
         this.logger.warn(
@@ -450,6 +488,52 @@ export class HumanRequestDeliveryService {
       );
     else await this.flushAck(sent);
     await this.finishLive(plan, row, { kind: 'ACCEPTED', providerMessageId });
+    return true;
+  }
+
+  /** A relay (staff message / template) whose send failed: a closed window
+   *  defers a staff message (never a template); a definite non-send (upload
+   *  failure, Meta's synchronous refusal) is STALE / SEND_REFUSED so the
+   *  attendee sees "No enviado"; anything else is DELIVERY_UNKNOWN. Never
+   *  resent by the bot. */
+  private async relayFailed(
+    row: DeliveryRow,
+    plan: Extract<Plan, { action: 'relay' }>,
+    claimed: DeliveryExpectation,
+    base: {
+      decision: DeliveryDecision;
+      attemptId: string;
+      attemptedAt: string;
+    },
+    error: unknown,
+  ): Promise<boolean> {
+    const failure = classifyRelaySendError(error);
+    const deferred = failure === 'WINDOW_CLOSED' && plan.deferrable;
+    const outcome = deferred
+      ? ({
+          localState: 'DEFERRED_WINDOW',
+          ack: 'DEFERRED_WINDOW_CLOSED',
+        } as const)
+      : failure === 'UNCERTAIN'
+        ? ({ localState: 'UNKNOWN', ack: 'DELIVERY_UNKNOWN' } as const)
+        : ({
+            localState: 'STALE',
+            decision: 'SEND_REFUSED',
+            ack: 'STALE',
+          } as const);
+    this.logger.warn(
+      `delivery ${row.deliveryId} ${row.type} send ${deferred ? 'deferred (window closed)' : failure === 'UNCERTAIN' ? 'uncertain' : 'refused'}: ${describeError(error)}`,
+    );
+    const next = await this.ports.store.transition(row.deliveryId, claimed, {
+      ...base,
+      providerMessageId: null,
+      ...outcome,
+    });
+    if (next !== null) await this.flushAck(next);
+    await this.finishLive(plan, row, {
+      kind: outcome.localState === 'UNKNOWN' ? 'UNKNOWN' : 'NOT_SENT',
+      providerMessageId: null,
+    });
     return true;
   }
 
@@ -492,25 +576,17 @@ export class HumanRequestDeliveryService {
     }
 
     if (isLiveConversationItem(item)) {
-      if (
-        this.ports.live !== undefined &&
-        (item.type === 'conversation.started' ||
-          item.type === 'conversation.reassigned' ||
-          item.type === 'conversation.ended')
-      ) {
+      if (this.ports.live !== undefined) {
         const live = await this.ports.live.plan(row, item);
-        return live.action === 'stale'
-          ? live
-          : { ...live, cancellation: true, live: true };
+        return live.action === 'send'
+          ? { ...live, cancellation: true, live: true }
+          : live;
       }
-      // TODO(live conversation T5): conversation.staff_message and
-      // template.requested get their handler. Until then (and for the three
-      // lifecycle items when no handler is wired) these items behave exactly
-      // as before the parser knew them (unknown type: nothing sent, ACK
-      // STALE), which is safe for a claim: the backend reverts it after the
-      // start timeout.
+      // Without a handler wired, live items behave exactly as before the
+      // parser knew them (unknown type: nothing sent, ACK STALE), which is
+      // safe for a claim: the backend reverts it after the start timeout.
       this.logger.warn(
-        `feed item ${row.deliveryId} of live conversation type ${item.type} has no handler yet: STALE`,
+        `feed item ${row.deliveryId} of live conversation type ${item.type} has no handler wired: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }

@@ -107,6 +107,19 @@ describe('HumanRequestsModule', () => {
     await moduleRef.close();
   });
 
+  it('gives the live conversation handler the WhatsApp sender for staff relays (T5)', async () => {
+    const { pool } = fakePool();
+    const moduleRef = await compile(pool, HumanRequestsServicesModule);
+    const delivery = moduleRef.get(HumanRequestDeliveryService);
+    const live = (
+      delivery as unknown as {
+        ports: { live: { ports: { sender: unknown } } };
+      }
+    ).ports.live;
+    expect(live.ports.sender).toBe(moduleRef.get(WHATSAPP_SENDER));
+    await moduleRef.close();
+  });
+
   it('the services-only module never runs the feed consumer', async () => {
     const { pool } = fakePool();
     const moduleRef = await compile(pool, HumanRequestsServicesModule);

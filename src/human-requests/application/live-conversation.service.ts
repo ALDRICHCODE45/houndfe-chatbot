@@ -2,7 +2,9 @@ import { Logger } from '@nestjs/common';
 import type {
   ConversationEndedItem,
   ConversationReassignedItem,
+  ConversationStaffMessageItem,
   ConversationStartedItem,
+  TemplateRequestedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type {
   SessionAckInput,
@@ -11,6 +13,11 @@ import type {
 import type { LiveConversationClient } from '../../chatbot-api/domain/live-conversation.port';
 import type { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
+import type {
+  OutboundMediaFile,
+  SendResult,
+  WhatsappSenderPort,
+} from '../../whatsapp/domain/whatsapp-sender.port';
 import { describeError } from '../../common/log-safe';
 import {
   LIVE_FAREWELL,
@@ -21,18 +28,26 @@ import {
   LIVE_RESUME,
   liveNotice,
   maskConversationRef,
+  messageIdOf,
   senderIdFromRef,
   styleFixedCopy,
   type DeliveryDecision,
   type DeliveryRow,
 } from '../domain/human-request-feed';
 
-/** The three live items this service handles (staff messages and templates
- *  belong to the relay handler). */
+/** The three lifecycle items (notices sent as BOT messages). */
 export type ConversationLifecycleItem =
   | ConversationStartedItem
   | ConversationReassignedItem
   | ConversationEndedItem;
+
+/** The two relay items (a person's words, never the bot's). */
+export type ConversationRelayItem =
+  | ConversationStaffMessageItem
+  | TemplateRequestedItem;
+
+/** Every live item this service plans. */
+export type LiveItem = ConversationLifecycleItem | ConversationRelayItem;
 
 /** What happened to the notice, reported to `LivePlan.after` once the
  *  delivery outcome is durably recorded. */
@@ -51,13 +66,28 @@ interface LivePlanBase {
 }
 
 /** The delivery service executes the plan: notices are BOT messages, never
- *  held by HUMAN mode and never deferred (a closed window is STALE). */
+ *  held by HUMAN mode and never deferred (a closed window is STALE). A
+ *  relay (staff message / template) is sent by `deliver` (origin STAFF /
+ *  TEMPLATE, so the sender never mirrors it), never held by HUMAN mode. */
 export type LivePlan =
   | ({ action: 'stale' } & LivePlanBase)
-  | ({ action: 'send'; senderId: string; text: string } & LivePlanBase);
+  | ({ action: 'send'; senderId: string; text: string } & LivePlanBase)
+  | ({
+      action: 'relay';
+      senderId: string;
+      /** Performs the Meta send(s). Rejects with the sender's error; the
+       *  delivery service classifies it (`classifyRelaySendError`). */
+      deliver: () => Promise<SendResult>;
+      /** Runs once the attempt is over, whatever happened (temp file
+       *  cleanup). Never throws into the caller. */
+      dispose?: () => Promise<void>;
+      /** A closed window defers the delivery (staff messages only; a
+       *  template is never DEFERRED). */
+      deferrable: boolean;
+    } & LivePlanBase);
 
 export interface LiveConversationHandler {
-  plan(row: DeliveryRow, item: ConversationLifecycleItem): Promise<LivePlan>;
+  plan(row: DeliveryRow, item: LiveItem): Promise<LivePlan>;
 }
 
 export interface LiveConversationPorts {
@@ -65,7 +95,12 @@ export interface LiveConversationPorts {
     HandoffModeService,
     'getState' | 'applyStarted' | 'applyEnded' | 'markGreeted'
   >;
-  client: Pick<LiveConversationClient, 'sessionAck'>;
+  client: Pick<LiveConversationClient, 'sessionAck' | 'downloadStaffMedia'>;
+  /** Staff relays: text, uploaded media files and templates. */
+  sender: Pick<
+    WhatsappSenderPort,
+    'sendText' | 'sendTemplate' | 'sendMediaFile'
+  >;
   /** Rejects when the read fails (transient, never "closed"). */
   isWindowOpen(senderId: string): Promise<boolean>;
   /** Stored customer style; null/failure keeps the usted copy. */
@@ -73,8 +108,9 @@ export interface LiveConversationPorts {
 }
 
 /**
- * Silence protocol, bot side (live conversation T4, contract rules 1, 6, 7
- * and the reassignment notice): started / reassigned / ended items.
+ * Silence protocol, bot side (live conversation T4/T5, contract rules 1, 4,
+ * 6, 7 and the reassignment notice): started / reassigned / ended items and
+ * the staff relays (staff_message, template.requested).
  *
  * The inline, pre-send steps (durable mode compare-and-set, session-ack
  * STARTED, the window check) happen in `plan`, so a throw leaves the ledger
@@ -87,10 +123,7 @@ export class LiveConversationService implements LiveConversationHandler {
 
   constructor(private readonly ports: LiveConversationPorts) {}
 
-  async plan(
-    row: DeliveryRow,
-    item: ConversationLifecycleItem,
-  ): Promise<LivePlan> {
+  async plan(row: DeliveryRow, item: LiveItem): Promise<LivePlan> {
     const senderId = senderIdFromRef(row.conversationRef);
     if (senderId === null || row.conversationRef === null) {
       this.logger.warn(
@@ -105,7 +138,125 @@ export class LiveConversationService implements LiveConversationHandler {
         return this.reassigned(senderId, item);
       case 'conversation.ended':
         return this.ended(row.conversationRef, senderId, item);
+      case 'conversation.staff_message':
+      case 'template.requested':
+        return this.relay(row, senderId, item);
     }
+  }
+
+  // -------------------------------------------------------------- relay
+
+  /**
+   * Staff message / template (rules 4 and 10). Sent only while the
+   * conversation is HUMAN on the item's epoch; an epoch or session mismatch
+   * is the only STALE (rule 10: never for a conversation actually muted on
+   * that epoch). An unreadable mode throws, so the item is retried. A closed
+   * window is not read locally: Meta's verdict (131047) is the truth.
+   */
+  private async relay(
+    row: DeliveryRow,
+    senderId: string,
+    item: ConversationRelayItem,
+  ): Promise<LivePlan> {
+    // Dedupe by messageId (stored before any Meta call): a row that should
+    // carry one but does not lost the race to another delivery. It is
+    // ACKed, never sent, on the first insert and on every replay.
+    if (messageIdOf(item) !== null && row.messageId === null) {
+      this.logger.log(
+        `${item.type} ${item.deliveryId} repeats a messageId another delivery owns: STALE, not sent`,
+      );
+      return { action: 'stale', decision: 'DUPLICATE' };
+    }
+    const state = await this.ports.mode.getState(senderId);
+    if (state.epoch !== item.payload.handoffEpoch)
+      return { action: 'stale', decision: 'STALE_EPOCH' };
+    if (state.mode !== 'HUMAN')
+      return { action: 'stale', decision: 'SESSION_NOT_ACTIVE' };
+
+    if (item.type === 'template.requested') {
+      const { templateName, languageCode } = item.payload;
+      return {
+        action: 'relay',
+        decision: 'TEMPLATE_SENT',
+        senderId,
+        deferrable: false,
+        deliver: () =>
+          this.ports.sender.sendTemplate({
+            to: senderId,
+            templateName,
+            languageCode,
+            bodyParameters: [],
+            origin: 'TEMPLATE',
+          }),
+      };
+    }
+
+    const message = item.payload;
+    if (message.type === 'TEXT')
+      return {
+        action: 'relay',
+        decision: 'STAFF_MESSAGE',
+        senderId,
+        deferrable: true,
+        deliver: () =>
+          this.ports.sender.sendText({
+            to: senderId,
+            text: message.text,
+            origin: 'STAFF',
+          }),
+      };
+
+    // IMAGE / DOCUMENT: fetch the bytes before anything is claimed. A
+    // transient failure throws (the item stays RECEIVED and is retried).
+    const media = await this.ports.client.downloadStaffMedia(message.mediaId);
+    switch (media.kind) {
+      case 'MEDIA_NOT_FOUND':
+        return { action: 'stale', decision: 'MEDIA_NOT_FOUND' };
+      case 'MEDIA_TOO_LARGE':
+        this.logger.warn(
+          `${item.type} ${item.deliveryId} media is over the size cap: STALE, not sent`,
+        );
+        return { action: 'stale', decision: 'SEND_REFUSED' };
+      case 'ok':
+        break;
+      default:
+        throw new Error(`staff media download failed: ${media.kind}`);
+    }
+    const sendMediaFile = this.ports.sender.sendMediaFile?.bind(
+      this.ports.sender,
+    );
+    if (sendMediaFile === undefined) {
+      // A text-only sender adapter: nothing can be uploaded, definite non-send.
+      await media.cleanup();
+      this.logger.warn(
+        `${item.type} ${item.deliveryId} needs a media upload the sender cannot do: STALE, not sent`,
+      );
+      return { action: 'stale', decision: 'SEND_REFUSED' };
+    }
+    // Meta image messages accept only JPEG/PNG: anything else (webp, or a
+    // DOCUMENT that is not a PDF) goes as a document.
+    const asDocument =
+      (message.type === 'DOCUMENT' && media.mimeType !== 'application/pdf') ||
+      (media.mimeType !== 'image/jpeg' &&
+        media.mimeType !== 'image/png' &&
+        media.mimeType !== 'application/pdf');
+    const file: OutboundMediaFile & { asDocument?: true } = {
+      to: senderId,
+      filePath: media.filePath,
+      mimeType: media.mimeType,
+      filename: message.filename,
+      ...(message.caption === null ? {} : { caption: message.caption }),
+      ...(asDocument ? { asDocument: true as const } : {}),
+      origin: 'STAFF',
+    };
+    return {
+      action: 'relay',
+      decision: 'STAFF_MESSAGE',
+      senderId,
+      deferrable: true,
+      deliver: () => sendMediaFile(file),
+      dispose: () => media.cleanup(),
+    };
   }
 
   // ------------------------------------------------------------ started

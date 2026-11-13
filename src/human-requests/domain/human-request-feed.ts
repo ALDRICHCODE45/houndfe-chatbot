@@ -355,6 +355,42 @@ export function isWindowClosedSendError(error: unknown): boolean {
   return Number(code) === META_WINDOW_CLOSED_CODE;
 }
 
+/** What a failed live relay send (staff message / template) means. */
+export type RelaySendFailure =
+  /** 131047 on the send: the 24 h window is closed (nothing sent). */
+  | 'WINDOW_CLOSED'
+  /** Definite non-send: the upload failed, Meta refused the request
+   *  synchronously (4xx) or the sender rejected it locally. */
+  | 'REFUSED'
+  /** The send request may or may not have reached Meta. */
+  | 'UNCERTAIN';
+
+/**
+ * Classifies a sender error by its shape (`WhatsappSendError`:
+ * `status`, `graphErrorCode`, `stage`; `UnsupportedOutboundError` and
+ * `InvalidOutboundTemplateError` are local rejections before any request).
+ * Uncertain is the default: a send is never assumed not to have happened
+ * without evidence (an upload-stage failure, a 4xx answer, a local check).
+ */
+export function classifyRelaySendError(error: unknown): RelaySendFailure {
+  if (typeof error !== 'object' || error === null) return 'UNCERTAIN';
+  const { name, stage, status } = error as {
+    name?: unknown;
+    stage?: unknown;
+    status?: unknown;
+  };
+  if (name === 'UnsupportedOutboundError') return 'REFUSED';
+  if (name === 'InvalidOutboundTemplateError') return 'REFUSED';
+  if (name !== 'WhatsappSendError') return 'UNCERTAIN';
+  // Nothing reached the customer, whatever the status (even a 5xx or none).
+  if (stage === 'upload') return 'REFUSED';
+  if (isWindowClosedSendError(error)) return 'WINDOW_CLOSED';
+  // 408 is a timeout: Meta may still have accepted the message.
+  if (typeof status === 'number' && status >= 400 && status < 500)
+    return status === 408 ? 'UNCERTAIN' : 'REFUSED';
+  return 'UNCERTAIN';
+}
+
 // ---------------------------------------------------------------- ACK
 
 /** The exact outcome body of the row's current attempt (replayed verbatim
