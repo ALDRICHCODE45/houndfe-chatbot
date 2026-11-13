@@ -7,6 +7,7 @@ import type {
   HandoffApplyResult,
   HandoffState,
   HandoffTransition,
+  HumanHandoffRef,
 } from '../domain/handoff-mode';
 
 /**
@@ -64,6 +65,25 @@ export class HandoffModeService {
       throw new Error('ConversationStore does not support handoff mode');
     }
     return this.store.markHandoffGreeted(senderId, epoch);
+  }
+
+  /**
+   * Live conversation T7: claims the safety notice of `epoch` (true only for
+   * the single winner; HUMAN at exactly that epoch).
+   */
+  async claimSafetyNotice(senderId: string, epoch: number): Promise<boolean> {
+    if (this.store.claimHandoffSafetyNotice === undefined) {
+      throw new Error('ConversationStore does not support handoff mode');
+    }
+    return this.store.claimHandoffSafetyNotice(senderId, epoch);
+  }
+
+  /** Live conversation T7: the conversations this bot holds in HUMAN. */
+  async listHuman(limit: number): Promise<HumanHandoffRef[]> {
+    if (this.store.listHumanHandoffs === undefined) {
+      throw new Error('ConversationStore does not support handoff mode');
+    }
+    return this.store.listHumanHandoffs(limit);
   }
 
   private async apply(

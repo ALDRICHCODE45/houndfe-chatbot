@@ -28,6 +28,20 @@ export interface HandoffState extends HandoffTransition {
    * START_TIMEOUT resume notice depends on it), dropped by a newer epoch.
    */
   greetedEpoch?: number;
+  /**
+   * Live conversation T7: the epoch whose safety notice (contract rule 8,
+   * "feed down > 10 min") was already claimed, so a restart or another
+   * replica never repeats it. Kept while that same epoch ends, dropped by a
+   * newer epoch.
+   */
+  safetyNoticeEpoch?: number;
+}
+
+/** A conversation the bot itself holds in HUMAN mode (reconcile, T7). */
+export interface HumanHandoffRef {
+  senderId: string;
+  epoch: number;
+  requestId: string;
 }
 
 /** State of a conversation that never had a handoff order. */
@@ -94,12 +108,15 @@ export function readHandoffState(raw: unknown): HandoffState | null {
   if (updatedAt !== null && typeof updatedAt !== 'string') return null;
   // A malformed marker is dropped, never fatal: the mode is what fails closed.
   const greetedEpoch = (raw as unknown as Record<string, unknown>).greetedEpoch;
+  const safetyNoticeEpoch = (raw as unknown as Record<string, unknown>)
+    .safetyNoticeEpoch;
   return {
     mode: raw.mode,
     epoch: raw.epoch,
     requestId: raw.requestId,
     updatedAt,
     ...(isEpoch(greetedEpoch) ? { greetedEpoch } : {}),
+    ...(isEpoch(safetyNoticeEpoch) ? { safetyNoticeEpoch } : {}),
   };
 }
 
@@ -152,6 +169,9 @@ export function resolveHandoffApply(
       updatedAt: now,
       ...(stored.greetedEpoch !== undefined && stored.epoch === next.epoch
         ? { greetedEpoch: stored.greetedEpoch }
+        : {}),
+      ...(stored.safetyNoticeEpoch !== undefined && stored.epoch === next.epoch
+        ? { safetyNoticeEpoch: stored.safetyNoticeEpoch }
         : {}),
     },
   };

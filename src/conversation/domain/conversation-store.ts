@@ -2,6 +2,7 @@ import type { CatalogReferences } from './catalog-references';
 import type {
   HandoffApplyResult,
   HandoffState,
+  HumanHandoffRef,
   HandoffTransition,
 } from './handoff-mode';
 
@@ -306,6 +307,21 @@ export interface ConversationStore {
    * row. `true` when recorded (also an idempotent repeat).
    */
   markHandoffGreeted?(senderId: string, epoch: number): Promise<boolean>;
+
+  /**
+   * Live conversation T7: atomically claims the safety notice of `epoch`
+   * (`data.handoff.safetyNoticeEpoch`). `true` only for the one caller that
+   * wins: the stored handoff is HUMAN at exactly `epoch` and no notice was
+   * claimed for it yet. Never creates a row. At-most-once by design: the
+   * claim happens BEFORE the send.
+   */
+  claimHandoffSafetyNotice?(senderId: string, epoch: number): Promise<boolean>;
+
+  /**
+   * Live conversation T7 (reconcile): the conversations held in HUMAN mode,
+   * ordered by sender id, at most `limit`.
+   */
+  listHumanHandoffs?(limit: number): Promise<HumanHandoffRef[]>;
 
   /**
    * Returns the current state for a sender, or null if none exists.

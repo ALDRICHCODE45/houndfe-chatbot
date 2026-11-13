@@ -11,6 +11,7 @@ import {
   type HandoffApplyResult,
   type HandoffState,
   type HandoffTransition,
+  type HumanHandoffRef,
 } from '../domain/handoff-mode';
 import { normalizeMinimalCheckoutDraft } from '../domain/minimal-checkout-draft';
 import {
@@ -258,6 +259,43 @@ export class InMemoryConversationStore implements ConversationStore {
       handoff: { ...state, greetedEpoch: epoch },
     };
     return true;
+  }
+
+  async claimHandoffSafetyNotice(
+    senderId: string,
+    epoch: number,
+  ): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const live = this.map.get(senderId);
+    if (live === undefined) return false;
+    const state = readHandoffState(live.data.handoff);
+    if (
+      state === null ||
+      state.mode !== 'HUMAN' ||
+      state.epoch !== epoch ||
+      state.safetyNoticeEpoch === epoch
+    )
+      return false;
+    live.data = {
+      ...live.data,
+      handoff: { ...state, safetyNoticeEpoch: epoch },
+    };
+    return true;
+  }
+
+  async listHumanHandoffs(limit: number): Promise<HumanHandoffRef[]> {
+    const found: HumanHandoffRef[] = [];
+    for (const [senderId, live] of this.map) {
+      const state = readHandoffState(live.data.handoff);
+      if (state?.mode === 'HUMAN' && state.requestId !== null)
+        found.push({
+          senderId,
+          epoch: state.epoch,
+          requestId: state.requestId,
+        });
+    }
+    found.sort((a, b) => (a.senderId < b.senderId ? -1 : 1));
+    return found.slice(0, Math.max(0, limit));
   }
 
   async get(senderId: string): Promise<ConversationState | null> {

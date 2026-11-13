@@ -292,6 +292,11 @@ describe('applyCustomerStyle', () => {
       'Seguimos por aquí, ¿en qué le ayudo?',
       'Seguimos por aquí, ¿en qué te ayudo?',
     ],
+    // Safety notice (contract rule 8).
+    [
+      'Tenemos una falla técnica, en cuanto se resuelva le respondemos.',
+      'Tenemos una falla técnica, en cuanto se resuelva te respondemos.',
+    ],
     // Talk-to-human flow (S5/S6).
     [
       'Con gusto, ya le pedí a una persona del equipo que le atienda. En cuanto alguien esté disponible, le escribe por aquí.',

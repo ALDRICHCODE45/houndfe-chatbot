@@ -237,6 +237,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Seguimos por aquí, ¿en qué le ayudo?',
     'Seguimos por aquí, ¿en qué te ayudo?',
   ],
+  // Live conversation safety notice (contract rule 8, owner-approved).
+  [
+    'Tenemos una falla técnica, en cuanto se resuelva le respondemos.',
+    'Tenemos una falla técnica, en cuanto se resuelva te respondemos.',
+  ],
   // S4 interactive prompts and the change-button reply.
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],

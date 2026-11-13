@@ -518,6 +518,106 @@ export function runConversationStoreContract(
           );
         });
       });
+
+      // T7: the safety notice (rule 8) is claimed once per epoch, durably.
+      describe('safety notice claim (live conversation T7)', () => {
+        it('refuses a conversation that is not HUMAN and creates no row', async () => {
+          await expect(store.claimHandoffSafetyNotice!('s0', 1)).resolves.toBe(
+            false,
+          );
+          expect(await store.get('s0')).toBeNull();
+          await store.applyHandoff!('s0b', bot(2));
+          await expect(store.claimHandoffSafetyNotice!('s0b', 2)).resolves.toBe(
+            false,
+          );
+        });
+
+        it('is granted once for the current HUMAN epoch', async () => {
+          await store.applyHandoff!('s1', human(3));
+          await expect(store.claimHandoffSafetyNotice!('s1', 2)).resolves.toBe(
+            false,
+          );
+          await expect(store.claimHandoffSafetyNotice!('s1', 3)).resolves.toBe(
+            true,
+          );
+          await expect(store.claimHandoffSafetyNotice!('s1', 3)).resolves.toBe(
+            false,
+          );
+          await expect(store.getHandoff!('s1')).resolves.toMatchObject({
+            ...human(3),
+            safetyNoticeEpoch: 3,
+          });
+        });
+
+        it('is dropped by a newer epoch, so that epoch may be claimed again', async () => {
+          await store.applyHandoff!('s2', human(1));
+          await store.claimHandoffSafetyNotice!('s2', 1);
+          await store.applyHandoff!('s2', bot(1));
+          await expect(store.getHandoff!('s2')).resolves.toMatchObject({
+            ...bot(1),
+            safetyNoticeEpoch: 1,
+          });
+          await store.applyHandoff!('s2', human(2));
+          await expect(store.getHandoff!('s2')).resolves.not.toHaveProperty(
+            'safetyNoticeEpoch',
+          );
+          await expect(store.claimHandoffSafetyNotice!('s2', 2)).resolves.toBe(
+            true,
+          );
+        });
+
+        it('survives update() writes and keeps the greeting marker', async () => {
+          await store.applyHandoff!('s3', human(1));
+          await store.markHandoffGreeted!('s3', 1);
+          await store.claimHandoffSafetyNotice!('s3', 1);
+          await store.update('s3', {
+            lastMessageAt: T,
+            data: { cart: ['x'], handoff: bot(9) as never },
+          });
+          await expect(store.getHandoff!('s3')).resolves.toMatchObject({
+            ...human(1),
+            greetedEpoch: 1,
+            safetyNoticeEpoch: 1,
+          });
+        });
+
+        it('grants exactly one of two concurrent claims', async () => {
+          await store.applyHandoff!('s4', human(1));
+          const results = await Promise.all([
+            store.claimHandoffSafetyNotice!('s4', 1),
+            store.claimHandoffSafetyNotice!('s4', 1),
+          ]);
+          expect(results.filter(Boolean)).toHaveLength(1);
+        });
+
+        it('refuses a non-integer or negative epoch', async () => {
+          await store.applyHandoff!('s5', human(1));
+          await expect(
+            store.claimHandoffSafetyNotice!('s5', 1.5),
+          ).resolves.toBe(false);
+          await expect(store.claimHandoffSafetyNotice!('s5', -1)).resolves.toBe(
+            false,
+          );
+        });
+      });
+
+      describe('listing HUMAN conversations (live conversation T7)', () => {
+        it('lists only HUMAN handoffs, ordered, bounded by the limit', async () => {
+          await store.applyHandoff!('l-c', human(2, 'req-c'));
+          await store.applyHandoff!('l-a', human(1, 'req-a'));
+          await store.applyHandoff!('l-b', human(3, 'req-b'));
+          await store.applyHandoff!('l-b', bot(3));
+          await store.update('l-none', { lastMessageAt: T, data: {} });
+          const all = (await store.listHumanHandoffs!(10)).filter((h) =>
+            h.senderId.startsWith('l-'),
+          );
+          expect(all).toEqual([
+            { senderId: 'l-a', epoch: 1, requestId: 'req-a' },
+            { senderId: 'l-c', epoch: 2, requestId: 'req-c' },
+          ]);
+          await expect(store.listHumanHandoffs!(1)).resolves.toHaveLength(1);
+        });
+      });
     });
 
     it('update() cannot resurrect a cleared marker', async () => {
