@@ -722,6 +722,84 @@ export function runConversationStoreContract(
           );
         });
 
+        // R4-ended-retry-rearms-bound: the bound is a cap per epoch.
+        it('re-marking the SAME epoch keeps the first bound (live or expired); another epoch replaces it', async () => {
+          const FIRST = '2026-11-12T10:01:00.000Z';
+          const LATER = '2026-11-12T10:09:00.000Z';
+          await store.applyHandoff!('n6', human(2));
+          await expect(store.markHandoffEnding!('n6', 2, FIRST)).resolves.toBe(
+            true,
+          );
+          // Live or expired makes no difference: never extended.
+          await expect(store.markHandoffEnding!('n6', 2, LATER)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n6')).resolves.toMatchObject({
+            ending: { epoch: 2, until: FIRST },
+          });
+          // A different epoch replaces it.
+          await expect(store.markHandoffEnding!('n6', 3, LATER)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n6')).resolves.toMatchObject({
+            ending: { epoch: 3, until: LATER },
+          });
+          // The cap also holds once the session is BOT at that epoch.
+          await store.applyHandoff!('n6', bot(3));
+          await store.markHandoffEnding!('n6', 3, '2026-11-12T11:00:00.000Z');
+          await expect(store.getHandoff!('n6')).resolves.toMatchObject({
+            ending: { epoch: 3, until: LATER },
+          });
+        });
+
+        // R3-reconcile-epoch-mismatch: a reconcile revert covers the lower
+        // epoch of the `ended` item that is still to come.
+        it('a marker that covers a lower epoch is cleared by that epoch too, never by another', async () => {
+          await store.applyHandoff!('n7', human(3));
+          await expect(
+            store.markHandoffEnding!('n7', 3, UNTIL, 2),
+          ).resolves.toBe(true);
+          await expect(store.getHandoff!('n7')).resolves.toMatchObject({
+            ending: { epoch: 3, until: UNTIL, coversEpoch: 2 },
+          });
+          await expect(store.clearHandoffEnding!('n7', 1)).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n7', 4)).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n7', 2)).resolves.toBe(true);
+          await expect(store.getHandoff!('n7')).resolves.not.toHaveProperty(
+            'ending',
+          );
+          // Without `coversEpoch` a lower epoch never clears the marker.
+          await store.markHandoffEnding!('n7', 3, UNTIL);
+          await expect(store.clearHandoffEnding!('n7', 2)).resolves.toBe(false);
+          await expect(store.getHandoff!('n7')).resolves.toMatchObject({
+            ending: { epoch: 3, until: UNTIL },
+          });
+        });
+
+        // R3-pg-inmem-validation-divergence: a corrupt handoff is refused
+        // (and left untouched) by every adapter.
+        it('is refused on a corrupt handoff value, which stays untouched', async () => {
+          const corrupt = [
+            { mode: 'WAT', epoch: 1, requestId: null, updatedAt: T },
+            { mode: 'HUMAN', epoch: 1, requestId: null, updatedAt: T },
+            { mode: 'BOT', epoch: 1, updatedAt: T },
+            { mode: 'BOT', epoch: -1, requestId: null, updatedAt: T },
+            { mode: 'BOT', epoch: 1.5, requestId: null, updatedAt: T },
+            { mode: 'BOT', epoch: 1, requestId: null, updatedAt: 7 },
+          ];
+          for (const [index, handoff] of corrupt.entries()) {
+            const id = `n8-${index}`;
+            await store.create(id, {
+              lastMessageAt: T,
+              data: { handoff: handoff as never },
+            });
+            await expect(store.markHandoffEnding!(id, 5, UNTIL)).resolves.toBe(
+              false,
+            );
+            expect((await store.get(id))?.data.handoff).toEqual(handoff);
+          }
+        });
+
         it('refuses a bad epoch or instant', async () => {
           await store.applyHandoff!('n5', human(1));
           await expect(

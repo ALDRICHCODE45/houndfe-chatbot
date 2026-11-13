@@ -494,8 +494,19 @@ export class LiveConversationReconcileWorker {
       // is monotonic, so a lower backend epoch must not lose the local one).
       const epoch = Math.max(local.epoch, backend.handoffEpoch);
       // ENDING marker BEFORE the durable BOT (it survives that write), so no
-      // window exists where the conversation is BOT without it.
-      const marked = await this.markEnding(senderId, epoch);
+      // window exists where the conversation is BOT without it. Only when a
+      // `conversation.ended` item can still come: a backend that does not
+      // know the conversation (404 → BOT/0, epoch 0 never had a session)
+      // sends none, so a marker would silence the customer for its full
+      // bound. When the item will carry a LOWER epoch than the one marked,
+      // the marker records it (`coversEpoch`) so that item can clear it.
+      const marked =
+        backend.handoffEpoch > 0 &&
+        (await this.markEnding(
+          senderId,
+          epoch,
+          backend.handoffEpoch < epoch ? backend.handoffEpoch : undefined,
+        ));
       const applied = await this.ports.mode.applyEnded(senderId, epoch);
       if (!applied.applied) {
         if (marked) await this.clearEnding(senderId, epoch);
@@ -523,10 +534,19 @@ export class LiveConversationReconcileWorker {
 
   /** Best effort: a failure is logged and the revert goes on without the
    *  marker (the order of a late farewell is not worth losing the revert). */
-  private async markEnding(senderId: string, epoch: number): Promise<boolean> {
+  private async markEnding(
+    senderId: string,
+    epoch: number,
+    coversEpoch?: number,
+  ): Promise<boolean> {
     if (this.ports.mode.markEnding === undefined) return false;
     try {
-      return await this.ports.mode.markEnding(senderId, epoch);
+      return await this.ports.mode.markEnding(
+        senderId,
+        epoch,
+        undefined,
+        coversEpoch,
+      );
     } catch (error) {
       this.logger.warn(
         `ENDING marker not set for ${maskConversationRef(senderId)}: ${describeError(error)}`,

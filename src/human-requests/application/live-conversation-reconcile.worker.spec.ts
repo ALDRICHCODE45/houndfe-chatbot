@@ -178,6 +178,40 @@ describe('LiveConversationReconcileWorker (rule 9)', () => {
       await expect(t.mode.isEnding(PHONE_A)).resolves.toBe(false);
     });
 
+    // R3-reconcile-epoch-mismatch: the ended item will carry the backend
+    // epoch, so the marker records the one it covers.
+    it('ENDING marker of a revert at the local epoch covers the lower backend epoch', async () => {
+      const t = build({ states: { [REF_A]: botState(2) } });
+      await t.mode.applyStarted(PHONE_A, 3, 'req-3');
+      await t.worker.reconcileAll();
+      const state = await t.mode.getState(PHONE_A);
+      expect(state).toMatchObject({ mode: 'BOT', epoch: 3 });
+      expect(state.ending).toMatchObject({ epoch: 3, coversEpoch: 2 });
+      // The ended item of epoch 2 clears it.
+      await expect(t.mode.clearEnding(PHONE_A, 2)).resolves.toBe(true);
+      await expect(t.mode.isEnding(PHONE_A)).resolves.toBe(false);
+    });
+
+    // R4-reconcile-marker-full-bound: no ended item will ever come.
+    it('sets no marker when the backend does not know the conversation (404 → BOT/0), yet reverts and replays', async () => {
+      const t = build({ states: { [REF_A]: botState(0) } });
+      await t.mode.applyStarted(PHONE_A, 2, 'req-2');
+      let endingAtReplay: boolean | undefined;
+      t.replay.mockImplementation(async () => {
+        endingAtReplay = await t.mode.isEnding(PHONE_A);
+      });
+      await t.worker.reconcileAll();
+      await expect(t.mode.getState(PHONE_A)).resolves.toMatchObject({
+        mode: 'BOT',
+        epoch: 2,
+      });
+      await expect(t.mode.getState(PHONE_A)).resolves.not.toHaveProperty(
+        'ending',
+      );
+      expect(endingAtReplay).toBe(false);
+      expect(t.replay).toHaveBeenCalledWith(REF_A);
+    });
+
     it('sets no marker when nothing was reverted (already in sync) and one that cannot be set never blocks the revert', async () => {
       const synced = build({ states: { [REF_A]: botState(0) } });
       await synced.worker.reconcileAll();

@@ -166,7 +166,12 @@ const setup = (
       events.push('cas:ended');
       return modeService.applyEnded(id, epoch);
     },
-    markEnding: (id: string, epoch: number) => {
+    markEnding: (
+      id: string,
+      epoch: number,
+      boundMs?: number,
+      coversEpoch?: number,
+    ) => {
       markEndingCalls.push({
         id,
         epoch,
@@ -174,7 +179,7 @@ const setup = (
       });
       if (options.markEndingFails === true)
         return Promise.reject(new Error('db down'));
-      return modeService.markEnding(id, epoch);
+      return modeService.markEnding(id, epoch, boundMs, coversEpoch);
     },
     clearEnding: (id: string, epoch: number) => {
       clearEndingCalls.push({ id, epoch });
@@ -2636,6 +2641,51 @@ describe('ENDING marker around the ended handler (follow-ups S4)', () => {
     await muted(h);
     await h.service.accept(ended('k1'));
     expect(texts(h)).toEqual([FAREWELL]);
+  });
+
+  // R4-ended-retry-rearms-bound: every attempt of the ended handler marks,
+  // but the bound is a cap per epoch, never extended by a redelivery.
+  it('an ended attempt on an epoch that is already marked keeps the first bound', async () => {
+    const h = setup();
+    await muted(h);
+    await h.mode.markEnding(SENDER, 3, 30_000);
+    const first = (await handoff(h)).ending!.until;
+    // The clear fails, so the marker is still there to inspect.
+    h.clearEndingFailures.push(true, true);
+    await h.service.accept(ended('b1'));
+    const state = await handoff(h);
+    expect(state.ending).toEqual({ epoch: 3, until: first });
+  });
+
+  // R3-reconcile-epoch-mismatch: the revert marked the higher local epoch,
+  // the `ended` item carries the lower backend one.
+  it('an ended item of the lower backend epoch clears the reconcile marker and releases the held rows', async () => {
+    const h = setup();
+    await muted(h, 3);
+    await h.service.accept(clarification('e1'));
+    // What the reconcile worker did (local epoch 3, backend epoch 2).
+    await h.mode.markEnding(SENDER, 3, undefined, 2);
+    await h.mode.applyEnded(SENDER, 3);
+    await h.service.onCustomerInbound(REF);
+    expect(h.sent).toEqual([]);
+
+    await h.service.accept(ended('e2', { handoffEpoch: 2 }));
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(false);
+    // The farewell is decided (none: the revert already ended the session)
+    // and the held row goes out.
+    expect(texts(h)).toEqual([
+      'Le comparto la respuesta del equipo:\nSí, lo tenemos en azul.',
+    ]);
+    expect(h.acks).toEqual([]);
+  });
+
+  it('a STALE ended never clears the marker of a newer epoch that was not set for it', async () => {
+    const h = setup();
+    await muted(h, 3);
+    await h.mode.markEnding(SENDER, 3);
+    await h.mode.applyEnded(SENDER, 3);
+    await h.service.accept(ended('e3', { handoffEpoch: 2 }));
+    await expect(h.mode.isEnding(SENDER)).resolves.toBe(true);
   });
 
   it('a retried ended (the first attempt threw) re-arms the marker and still sends the farewell once', async () => {

@@ -89,26 +89,35 @@ export class HandoffModeService {
 
   /**
    * Follow-ups S4: marks the session of `epoch` as ending, for at most
-   * `boundMs` (default 2 min). Applies while a handoff value exists and its
-   * epoch is not newer; `false` otherwise (nothing to protect). The marker
-   * survives the durable BOT (`applyEnded`) of that same epoch.
+   * `boundMs` (default 2 min). Applies while a valid handoff value exists and
+   * its epoch is not newer; `false` otherwise (nothing to protect). The
+   * bound is a cap per epoch: marking the SAME epoch again (a redelivery)
+   * keeps the first bound. The marker survives the durable BOT
+   * (`applyEnded`) of that same epoch. `coversEpoch`: see `HandoffEnding`.
    */
   async markEnding(
     senderId: string,
     epoch: number,
     boundMs: number = ENDING_BOUND_MS,
+    coversEpoch?: number,
   ): Promise<boolean> {
     if (this.store.markHandoffEnding === undefined) {
       throw new Error('ConversationStore does not support handoff mode');
     }
     const until = new Date(this.clock().getTime() + boundMs).toISOString();
-    const set = await this.store.markHandoffEnding(senderId, epoch, until);
+    const set = await this.store.markHandoffEnding(
+      senderId,
+      epoch,
+      until,
+      coversEpoch,
+    );
     if (set) this.expiredLogged.delete(senderId);
     return set;
   }
 
   /** Follow-ups S4: the farewell is decided (or the end is moot): releases
-   *  the marker of `epoch`. `false` when there was none. */
+   *  the marker of `epoch` (or the one that covers it). `false` when there
+   *  was none. */
   async clearEnding(senderId: string, epoch: number): Promise<boolean> {
     if (this.store.clearHandoffEnding === undefined) {
       throw new Error('ConversationStore does not support handoff mode');

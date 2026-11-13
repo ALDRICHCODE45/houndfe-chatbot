@@ -323,21 +323,28 @@ export interface ConversationStore {
 
   /**
    * Follow-ups S4 (ENDING marker): sets `data.handoff.ending = {epoch,
-   * until}` (replacing an earlier one). Applies only while a handoff value
-   * exists and its stored epoch is <= `epoch` (a newer session is never
-   * touched); never creates a row. `until` is an ISO 8601 instant. `true`
-   * when written. The marker is kept by the `applyHandoff` of that same
-   * epoch and dropped by any other epoch.
+   * until}`. Applies only while a VALID handoff value exists and its stored
+   * epoch is <= `epoch` (a newer session is never touched, a corrupt value
+   * is refused untouched); never creates a row. `until` is an ISO 8601
+   * instant. The bound is a cap per epoch: when a valid marker of this SAME
+   * epoch already exists (live or expired) it is kept as is (the first
+   * `until` is never extended) and the call still answers `true`; a marker
+   * of another epoch is replaced. `coversEpoch` (a reconcile revert at a
+   * higher local epoch) records the lower epoch of the `ended` item still to
+   * come. `true` when the marker for `epoch` is in place. The marker is kept
+   * by the `applyHandoff` of that same epoch and dropped by any other epoch.
    */
   markHandoffEnding?(
     senderId: string,
     epoch: number,
     until: string,
+    coversEpoch?: number,
   ): Promise<boolean>;
 
   /**
    * Follow-ups S4: removes the ENDING marker, only when it is the one of
-   * `epoch`. `true` when a marker was removed.
+   * `epoch` or the one that covers `epoch` (`coversEpoch`). `true` when a
+   * marker was removed.
    */
   clearHandoffEnding?(senderId: string, epoch: number): Promise<boolean>;
 

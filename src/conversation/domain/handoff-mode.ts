@@ -30,11 +30,20 @@ export interface HandoffTransition {
  * live conversation L15 f): the session `epoch` is known to be ending but
  * its farewell is not decided yet, so neither a bot turn nor a replay of
  * held deliveries may go out before it. Always bounded: it holds only until
- * `until` (ISO 8601), never permanently.
+ * `until` (ISO 8601), never permanently. The bound is a cap per epoch: a
+ * second mark of the same epoch never extends it.
  */
 export interface HandoffEnding {
   epoch: number;
   until: string;
+  /**
+   * Set only by a reconcile revert that applied the BOT at a HIGHER epoch
+   * than the backend reported (the CAS keeps the larger local epoch): the
+   * `conversation.ended` item still to come carries this lower backend epoch.
+   * Such an item clears the marker (`clearHandoffEnding`) even though it is
+   * older than the stored epoch; no other lower epoch ever does.
+   */
+  coversEpoch?: number;
 }
 
 /** Default bound of an ENDING marker. */
@@ -140,10 +149,10 @@ export function isHandoffTransition(
 /** A malformed marker is dropped (never fatal), like the other markers. */
 function readEnding(raw: unknown): HandoffEnding | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined;
-  const { epoch, until } = raw as Record<string, unknown>;
+  const { epoch, until, coversEpoch } = raw as Record<string, unknown>;
   if (!isEpoch(epoch) || typeof until !== 'string') return undefined;
   if (!Number.isFinite(Date.parse(until))) return undefined;
-  return { epoch, until };
+  return { epoch, until, ...(isEpoch(coversEpoch) ? { coversEpoch } : {}) };
 }
 
 /** True for a usable ENDING marker value. */

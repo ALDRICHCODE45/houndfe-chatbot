@@ -492,8 +492,16 @@ export class LiveConversationService implements LiveConversationHandler {
         this.logger.log(
           `conversation.ended ${item.deliveryId} epoch ${epoch} is older than ours (${maskConversationRef(ref)}): STALE, no ack`,
         );
-        await this.clearEnding(senderId, epoch);
-        return { action: 'stale', decision: 'STALE_EPOCH' };
+        // A reconcile revert marked a higher local epoch for this lower
+        // item: clearing it decides the (absent) farewell, so the rows it
+        // held go out now instead of waiting for the sweep. A marker of a
+        // newer session that was not set for this item is never cleared.
+        const cleared = await this.clearEnding(senderId, epoch);
+        return {
+          action: 'stale',
+          decision: 'STALE_EPOCH',
+          ...(cleared ? { replay: true } : {}),
+        };
       }
       // DUPLICATE: already BOT at this epoch (a retry of this item).
     }
@@ -525,7 +533,9 @@ export class LiveConversationService implements LiveConversationHandler {
       return {
         action: 'stale',
         decision: 'SESSION_REVERTED',
-        after: () => this.clearEnding(senderId, epoch),
+        after: async () => {
+          await this.clearEnding(senderId, epoch);
+        },
         replay: true,
       };
     }
@@ -573,13 +583,13 @@ export class LiveConversationService implements LiveConversationHandler {
   }
 
   /** Releases the ENDING marker of `epoch`: one immediate retry, then a
-   *  warning (the bound releases it anyway). Never throws. */
-  private async clearEnding(senderId: string, epoch: number): Promise<void> {
-    if (this.ports.mode.clearEnding === undefined) return;
+   *  warning (the bound releases it anyway). Never throws; `true` when a
+   *  marker was removed. */
+  private async clearEnding(senderId: string, epoch: number): Promise<boolean> {
+    if (this.ports.mode.clearEnding === undefined) return false;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        await this.ports.mode.clearEnding(senderId, epoch);
-        return;
+        return await this.ports.mode.clearEnding(senderId, epoch);
       } catch (error) {
         if (attempt === 2)
           this.logger.warn(
@@ -587,6 +597,7 @@ export class LiveConversationService implements LiveConversationHandler {
           );
       }
     }
+    return false;
   }
 
   /**

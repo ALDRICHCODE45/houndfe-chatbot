@@ -344,17 +344,25 @@ export class InMemoryConversationStore implements ConversationStore {
     senderId: string,
     epoch: number,
     until: string,
+    coversEpoch?: number,
   ): Promise<boolean> {
     if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
-    if (!isEndingMarker({ epoch, until })) return false;
+    const marker = {
+      epoch,
+      until,
+      ...(coversEpoch === undefined ? {} : { coversEpoch }),
+    };
+    if (!isEndingMarker(marker)) return false;
     const live = this.map.get(senderId);
     if (live === undefined) return false;
     const state = readHandoffState(live.data.handoff);
     if (state === null || state.updatedAt === null || state.epoch > epoch)
       return false;
+    // The bound is a cap per epoch: the first marker of an epoch stays.
+    if (state.ending?.epoch === epoch) return true;
     live.data = {
       ...live.data,
-      handoff: { ...state, ending: { epoch, until } },
+      handoff: { ...state, ending: marker },
     };
     return true;
   }
@@ -364,7 +372,12 @@ export class InMemoryConversationStore implements ConversationStore {
     const live = this.map.get(senderId);
     if (live === undefined) return false;
     const state = readHandoffState(live.data.handoff);
-    if (state === null || state.ending?.epoch !== epoch) return false;
+    if (
+      state === null ||
+      state.ending === undefined ||
+      (state.ending.epoch !== epoch && state.ending.coversEpoch !== epoch)
+    )
+      return false;
     const rest = { ...state };
     delete rest.ending;
     live.data = { ...live.data, handoff: rest };
