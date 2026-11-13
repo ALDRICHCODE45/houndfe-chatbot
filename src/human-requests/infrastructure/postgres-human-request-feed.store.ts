@@ -149,11 +149,9 @@ const STUCK_SENDING_SQL = `SELECT * FROM human_request_deliveries
  ORDER BY attempted_at LIMIT $2`;
 
 /** Uses the (conversation_ref, local_state) index. */
-const UNFINISHED_END_SQL = `SELECT 1 FROM human_request_deliveries
+const NEWEST_UNFINISHED_END_SQL = `SELECT max(updated_at) AS newest FROM human_request_deliveries
  WHERE conversation_ref = $1 AND local_state IN ('RECEIVED', 'SENDING')
-   AND type = 'conversation.ended'
-   AND ($2::timestamptz IS NULL OR updated_at >= $2::timestamptz)
- LIMIT 1`;
+   AND type = 'conversation.ended'`;
 
 const OPEN_REQUEST_SQL = `INSERT INTO human_request_registry
   (request_id, conversation_ref, subtype, legacy_id)
@@ -348,15 +346,12 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
     };
   }
 
-  async hasUnfinishedEnd(
-    conversationRef: string,
-    notBefore?: Date,
-  ): Promise<boolean> {
-    const result = await this.pool.query(UNFINISHED_END_SQL, [
-      conversationRef,
-      notBefore ?? null,
-    ]);
-    return (result.rowCount ?? 0) > 0;
+  async newestUnfinishedEndAt(conversationRef: string): Promise<Date | null> {
+    const result = await this.pool.query<{ newest: Date | null }>(
+      NEWEST_UNFINISHED_END_SQL,
+      [conversationRef],
+    );
+    return result.rows[0]?.newest ?? null;
   }
 
   async listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {

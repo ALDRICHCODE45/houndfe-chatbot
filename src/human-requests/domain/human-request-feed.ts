@@ -231,13 +231,15 @@ export interface HumanRequestFeedStore {
   ): Promise<{ deleted: number; scrubbed: number }>;
   /** SENDING rows whose attempt started before `before` (crash leftovers). */
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]>;
-  /** T6 (rule 6 order): true while a `conversation.ended` of this
-   *  conversation is still being handled (RECEIVED or SENDING): its durable
-   *  BOT is already set, but its farewell may not be out yet, so no held or
-   *  deferred delivery may be released before it is decided. With
-   *  `notBefore`, a row last written before it no longer counts (a poison or
-   *  crash-stuck ended must not hold a conversation forever). */
-  hasUnfinishedEnd(conversationRef: string, notBefore?: Date): Promise<boolean>;
+  /** T6 (rule 6 order): the newest write time (`updated_at`) among this
+   *  conversation's `conversation.ended` rows that are still being handled
+   *  (RECEIVED or SENDING), or `null` when none is. One bounded query: a
+   *  `conversation.ended` is still unfinished (its durable BOT is already
+   *  set, but its farewell may not be out), so no held or deferred delivery
+   *  may be released before it is decided, unless the caller finds it too
+   *  old to count (a poison or crash-stuck ended must not hold a
+   *  conversation forever). */
+  newestUnfinishedEndAt(conversationRef: string): Promise<Date | null>;
 
   /** Idempotent: an existing request row is left as is. */
   recordOpenRequest(input: OpenHumanRequestInput): Promise<void>;

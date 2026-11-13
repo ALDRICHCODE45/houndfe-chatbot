@@ -25,9 +25,12 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
   private readonly requests = new Map<string, HumanRequestRecord>();
   private lastStamp = 0;
 
+  /** `now` lets a spec drive the write times with its own fake clock. */
+  constructor(private readonly now: () => number = Date.now) {}
+
   /** Strictly increasing write time, so ordering by `updatedAt` is exact. */
   private stamp(): Date {
-    this.lastStamp = Math.max(Date.now(), this.lastStamp + 1);
+    this.lastStamp = Math.max(this.now(), this.lastStamp + 1);
     return new Date(this.lastStamp);
   }
 
@@ -232,20 +235,19 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     return Promise.resolve({ deleted: acked.length, scrubbed: failed.length });
   }
 
-  hasUnfinishedEnd(
-    conversationRef: string,
-    notBefore?: Date,
-  ): Promise<boolean> {
-    return Promise.resolve(
-      [...this.rows.values()].some(
-        (row) =>
-          row.conversationRef === conversationRef &&
-          row.item.type === 'conversation.ended' &&
-          (row.localState === 'RECEIVED' || row.localState === 'SENDING') &&
-          (notBefore === undefined ||
-            row.updatedAt.getTime() >= notBefore.getTime()),
-      ),
-    );
+  newestUnfinishedEndAt(conversationRef: string): Promise<Date | null> {
+    let newest: Date | null = null;
+    for (const row of this.rows.values()) {
+      if (
+        row.conversationRef !== conversationRef ||
+        row.item.type !== 'conversation.ended' ||
+        (row.localState !== 'RECEIVED' && row.localState !== 'SENDING')
+      )
+        continue;
+      if (newest === null || row.updatedAt.getTime() > newest.getTime())
+        newest = row.updatedAt;
+    }
+    return Promise.resolve(newest === null ? null : new Date(newest));
   }
 
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {

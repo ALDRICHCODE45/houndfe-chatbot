@@ -40,18 +40,25 @@ const message = (
  * builds for a staff message while HUMAN on the item's epoch) + a fake
  * backend. `deliveries` scripts what Meta answers to each relay send.
  */
-const setup = () => {
-  const store = new InMemoryHumanRequestFeedStore();
+const setup = (options: { unfinishedEndMaxMs?: number } = {}) => {
+  const time = { now: NOW };
+  // The store stamps its writes with the same fake clock as the service, so
+  // "written after the lookup started" is deterministic.
+  const store = new InMemoryHumanRequestFeedStore(() => time.now.getTime());
   const acks: Array<{ deliveryId: string; body: DeliveryOutcomeInput }> = [];
   const ackScript: Array<RecordDeliveryOutcomeResult | Error> = [];
   const pendingCalls: string[] = [];
-  const backend: { pending: PendingDeliveriesResult | Error } = {
+  const backend: {
+    pending: PendingDeliveriesResult | Error;
+    /** Runs while a listing is in flight (after the backend answered, before
+     *  the caller sees it): a concurrent replayer's writes go here. */
+    duringList?: () => Promise<void>;
+  } = {
     pending: { kind: 'ok', items: [] },
   };
   const delivered: string[] = [];
   const metaScript: Array<Error | string> = [];
   const textSent: string[] = [];
-  const time = { now: NOW };
   const human = { value: true };
   let wamid = 0;
   let attempt = 0;
@@ -92,11 +99,12 @@ const setup = () => {
             },
           );
         },
-        listPendingDeliveries: (filter) => {
+        listPendingDeliveries: async (filter) => {
           pendingCalls.push(filter.conversationRef ?? '');
-          return backend.pending instanceof Error
-            ? Promise.reject(backend.pending)
-            : Promise.resolve(backend.pending);
+          const answer = backend.pending;
+          await backend.duringList?.();
+          if (answer instanceof Error) throw answer;
+          return answer;
         },
       },
       sender: {
@@ -112,6 +120,7 @@ const setup = () => {
     {
       clock: () => time.now,
       random: () => 1,
+      unfinishedEndMaxMs: options.unfinishedEndMaxMs,
       newAttemptId: () => {
         attempt += 1;
         return `00000000-0000-4000-8000-${String(attempt).padStart(12, '0')}`;
@@ -132,6 +141,8 @@ const setup = () => {
     human,
   };
 };
+
+const later = (ms: number) => new Date(NOW.getTime() + ms);
 
 const attemptId = (n: number) =>
   `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -331,6 +342,8 @@ describe('a staff message failed with 131047 after Meta accepted it (B2)', () =>
       providerMessageId: 'wamid.1',
       ackState: 'ACKED',
     });
+    // Later, the customer writes again (after the ACK was recorded).
+    harness.time.now = later(60_000);
     return harness;
   };
 
@@ -387,6 +400,7 @@ describe('a staff message failed with 131047 after Meta accepted it (B2)', () =>
       localState: 'UNKNOWN',
       ackState: 'ACKED',
     });
+    harness.time.now = later(60_000);
     harness.backend.pending = { kind: 'ok', items: [message('x2', 18, true)] };
     await harness.service.onHumanCustomerInbound(REF);
     expect(harness.delivered).toEqual(['x2', 'x2']);
@@ -416,8 +430,16 @@ describe('a staff message failed with 131047 after Meta accepted it (B2)', () =>
   });
 
   it('a resend answered 409 OUTCOME_ALREADY_RECORDED means "not coming": the ACK is permanently failed and the row is never resent', async () => {
-    const { service, store, ackScript, delivered, backend, acks } =
-      await sentAndAcked();
+    const {
+      service,
+      store,
+      ackScript,
+      delivered,
+      backend,
+      acks,
+      time,
+      pendingCalls,
+    } = await sentAndAcked();
     backend.pending = { kind: 'ok', items: [message('x1', 18, true)] };
     ackScript.push({ kind: 'OUTCOME_ALREADY_RECORDED' } as never);
     await service.onHumanCustomerInbound(REF);
@@ -425,13 +447,129 @@ describe('a staff message failed with 131047 after Meta accepted it (B2)', () =>
     await expect(store.getDelivery('x1')).resolves.toMatchObject({
       ackState: 'FAILED_PERMANENT',
     });
-    // Even if the backend (wrongly) listed it again, we stop.
+    // Even if the backend (wrongly) listed it again, we stop. The clock moves
+    // past the throttle so the backend really is queried each time.
     const before = acks.length;
+    const queried = pendingCalls.length;
     backend.pending = { kind: 'ok', items: [message('x1', 18, true)] };
+    time.now = later(5 * 60_000);
     await service.onHumanCustomerInbound(REF);
+    time.now = later(10 * 60_000);
     await service.onHumanCustomerInbound(REF);
+    expect(pendingCalls).toHaveLength(queried + 2);
     expect(delivered).toEqual(['x1', 'x1']);
     expect(acks).toHaveLength(before);
+    await expect(store.getDelivery('x1')).resolves.toMatchObject({
+      localState: 'SENT',
+      ackState: 'FAILED_PERMANENT',
+    });
+  });
+
+  it('stale listing: a listing fetched before a concurrent replayer resent and ACKed the row does not reopen it (no double send)', async () => {
+    const { service, store, delivered, backend, acks, time } =
+      await sentAndAcked();
+    backend.pending = { kind: 'ok', items: [message('x1', 18, true)] };
+    // While our listing is in flight, another replayer finishes the resend
+    // (SENT → SENT with a new attempt) and its ACK is recorded.
+    backend.duringList = async () => {
+      backend.duringList = undefined;
+      const row = await store.getDelivery('x1');
+      const next = await store.transition(
+        'x1',
+        { localState: 'SENT', attemptId: row!.attemptId },
+        {
+          localState: 'SENT',
+          decision: 'STAFF_MESSAGE',
+          attemptId: attemptId(50),
+          attemptedAt: time.now.toISOString(),
+          providerMessageId: 'wamid.other',
+          ack: 'PROVIDER_ACCEPTED',
+        },
+      );
+      await store.completeAck('x1', next!.attemptId!, { ackState: 'ACKED' });
+    };
+    const before = acks.length;
+
+    await service.onHumanCustomerInbound(REF);
+
+    expect(delivered).toEqual(['x1']);
+    expect(acks).toHaveLength(before);
+    await expect(store.getDelivery('x1')).resolves.toMatchObject({
+      localState: 'SENT',
+      attemptId: attemptId(50),
+      providerMessageId: 'wamid.other',
+      ackState: 'ACKED',
+    });
+  });
+
+  it('a row ACKed before the lookup started is reopened (the guard only blocks a newer write)', async () => {
+    const { service, delivered, backend, time, store } = await sentAndAcked();
+    const row = await store.getDelivery('x1');
+    // The ACK landed strictly before the lookup starts.
+    time.now = new Date(row!.updatedAt.getTime() + 1);
+    backend.pending = { kind: 'ok', items: [message('x1', 18, true)] };
+    await service.onHumanCustomerInbound(REF);
+    expect(delivered).toEqual(['x1', 'x1']);
+  });
+});
+
+describe('the HUMAN pending-deliveries throttle (L16 a, verify adv. 5)', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('a failed lookup does not arm the throttle: the next inbound inside the window asks again', async () => {
+    const { service, pendingCalls, backend, time } = setup();
+    backend.pending = new Error('backend down');
+    await service.onHumanCustomerInbound(REF);
+    time.now = later(1_000);
+    await service.onHumanCustomerInbound(REF);
+    expect(pendingCalls).toEqual([REF, REF]);
+  });
+
+  it('a rate-limited lookup does not arm the throttle either', async () => {
+    const { service, pendingCalls, backend, time } = setup();
+    backend.pending = { kind: 'RATE_LIMITED', retryAfterSeconds: 5 };
+    await service.onHumanCustomerInbound(REF);
+    time.now = later(1_000);
+    await service.onHumanCustomerInbound(REF);
+    expect(pendingCalls).toEqual([REF, REF]);
+  });
+
+  it('a successful lookup still throttles the next inbound inside the window', async () => {
+    const { service, pendingCalls, time } = setup();
+    await service.onHumanCustomerInbound(REF);
+    time.now = later(1_000);
+    await service.onHumanCustomerInbound(REF);
+    expect(pendingCalls).toEqual([REF]);
+  });
+
+  it('a backend-only deferral that appears inside the throttle window is resent on a later inbound after the window', async () => {
+    const { service, store, pendingCalls, backend, delivered, time } = setup();
+    // First inbound: nothing deferred yet; the lookup arms the throttle.
+    await service.onHumanCustomerInbound(REF);
+    // Staff message sent; Meta accepts, then 131047 makes the backend defer
+    // it again (the local row stays SENT/ACKED).
+    await service.accept(message('bo1', 18));
+    expect(delivered).toEqual(['bo1']);
+    backend.pending = { kind: 'ok', items: [message('bo1', 18, true)] };
+    // Inside the window: no backend call, nothing resent.
+    time.now = later(5_000);
+    await service.onHumanCustomerInbound(REF);
+    expect(pendingCalls).toEqual([REF]);
+    expect(delivered).toEqual(['bo1']);
+    // After the window: the backend is asked again and the row is resent.
+    time.now = later(60_000);
+    await service.onHumanCustomerInbound(REF);
+    expect(pendingCalls).toEqual([REF, REF]);
+    expect(delivered).toEqual(['bo1', 'bo1']);
+    await expect(store.getDelivery('bo1')).resolves.toMatchObject({
+      localState: 'SENT',
+      ackState: 'ACKED',
+    });
   });
 });
 
@@ -475,7 +613,7 @@ describe('the unfinished-ended hold is bounded and logged once (L13 a)', () => {
     const harness = setup();
     await heldCancel(harness);
     await harness.store.insertDelivery(endedItem('e1'));
-    harness.time.now = new Date();
+    harness.time.now = later(MIN);
     await harness.service.onCustomerInbound(REF);
     await harness.service.onCustomerInbound(REF);
     expect(harness.textSent).toEqual([]);
@@ -492,7 +630,7 @@ describe('the unfinished-ended hold is bounded and logged once (L13 a)', () => {
     const harness = setup();
     await heldCancel(harness);
     await harness.store.insertDelivery(endedItem('e2'));
-    harness.time.now = new Date(Date.now() + 11 * MIN);
+    harness.time.now = later(11 * MIN);
     await harness.service.onCustomerInbound(REF);
     expect(harness.textSent).toHaveLength(1);
     await expect(harness.store.getDelivery('hc1')).resolves.toMatchObject({
@@ -519,12 +657,21 @@ describe('the unfinished-ended hold is bounded and logged once (L13 a)', () => {
     expect(expired[0]).not.toContain(SENDER);
   });
 
-  it('the bound is configurable', async () => {
-    const harness = setup();
-    await heldCancel(harness);
-    await harness.store.insertDelivery(endedItem('e3'));
-    harness.time.now = new Date(Date.now() + 2 * MIN);
-    await harness.service.onCustomerInbound(REF);
-    expect(harness.textSent).toEqual([]);
+  it('the bound is configurable: a 1 minute bound releases an ended older than that, the default 10 minute bound still holds it', async () => {
+    const short = setup({ unfinishedEndMaxMs: MIN });
+    await heldCancel(short);
+    await short.store.insertDelivery(endedItem('e3'));
+    // 2 minutes after the ended was written: inside the default bound, past
+    // the configured one.
+    short.time.now = later(2 * MIN);
+    await short.service.onCustomerInbound(REF);
+    expect(short.textSent).toHaveLength(1);
+
+    const dflt = setup();
+    await heldCancel(dflt);
+    await dflt.store.insertDelivery(endedItem('e4'));
+    dflt.time.now = later(2 * MIN);
+    await dflt.service.onCustomerInbound(REF);
+    expect(dflt.textSent).toEqual([]);
   });
 });

@@ -719,12 +719,15 @@ export function runHumanRequestFeedStoreContract(
       expect(stuck.map((row) => row.deliveryId)).toEqual(['s1']);
     });
 
-    it('hasUnfinishedEnd is true only while a conversation.ended of that conversation is RECEIVED or SENDING', async () => {
+    it('newestUnfinishedEndAt is a date only while a conversation.ended of that conversation is RECEIVED or SENDING', async () => {
       const other = 'wa:5215550002222';
-      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
+      await expect(store.newestUnfinishedEndAt(REF)).resolves.toBeNull();
       await store.insertDelivery(endedItem('u1'));
-      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(true);
-      await expect(store.hasUnfinishedEnd(other)).resolves.toBe(false);
+      const inserted = await store.getDelivery('u1');
+      const received = await store.newestUnfinishedEndAt(REF);
+      expect(received).toBeInstanceOf(Date);
+      expect(received?.getTime()).toBe(inserted?.updatedAt.getTime());
+      await expect(store.newestUnfinishedEndAt(other)).resolves.toBeNull();
       await store.transition(
         'u1',
         { localState: 'RECEIVED', attemptId: null },
@@ -737,7 +740,9 @@ export function runHumanRequestFeedStoreContract(
           ack: null,
         },
       );
-      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(true);
+      const sending = await store.getDelivery('u1');
+      const whileSending = await store.newestUnfinishedEndAt(REF);
+      expect(whileSending?.getTime()).toBe(sending?.updatedAt.getTime());
       await store.transition(
         'u1',
         { localState: 'SENDING', attemptId: ATTEMPT_A },
@@ -750,24 +755,24 @@ export function runHumanRequestFeedStoreContract(
           ack: 'PROVIDER_ACCEPTED',
         },
       );
-      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
+      await expect(store.newestUnfinishedEndAt(REF)).resolves.toBeNull();
     });
 
-    it('hasUnfinishedEnd with notBefore ignores an ended last written before it (bounded hold)', async () => {
+    it('newestUnfinishedEndAt returns the newest write time among several unfinished ended rows', async () => {
       await store.insertDelivery(endedItem('u3'));
-      const hour = 3_600_000;
-      await expect(
-        store.hasUnfinishedEnd(REF, new Date(Date.now() - hour)),
-      ).resolves.toBe(true);
-      await expect(
-        store.hasUnfinishedEnd(REF, new Date(Date.now() + hour)),
-      ).resolves.toBe(false);
-      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(true);
+      await store.insertDelivery(endedItem('u4'));
+      const older = await store.getDelivery('u3');
+      const newer = await store.getDelivery('u4');
+      expect(newer?.updatedAt.getTime()).toBeGreaterThanOrEqual(
+        older?.updatedAt.getTime() ?? Infinity,
+      );
+      const newest = await store.newestUnfinishedEndAt(REF);
+      expect(newest?.getTime()).toBe(newer?.updatedAt.getTime());
     });
 
-    it('hasUnfinishedEnd ignores other item types in flight', async () => {
+    it('newestUnfinishedEndAt ignores other item types in flight', async () => {
       await store.insertDelivery(cancelledItem('u2'));
-      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
+      await expect(store.newestUnfinishedEndAt(REF)).resolves.toBeNull();
     });
 
     it('records open requests idempotently and closes them once', async () => {

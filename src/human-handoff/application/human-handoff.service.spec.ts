@@ -501,25 +501,50 @@ describe('HumanHandoffService', () => {
       updatedAt: null,
     });
 
-    it('HUMAN right before the send: no notice (total silence), the request itself is still created', async () => {
+    it('HUMAN right before the send: no notice (total silence), the request itself is still created, and the customer was not notified', async () => {
       conversationStore.getHandoff = jest
         .fn()
         .mockResolvedValue(handoffState('HUMAN'));
       const result = await createOnce();
-      expect(result.ok).toBe(true);
+      expect(result).toMatchObject({ ok: true, customerNotified: false });
       expect(customerSends()).toEqual([]);
+      expect(conversationStore.getHandoff).toHaveBeenCalledTimes(1);
       expect(conversationStore.setPendingHumanRequest).toHaveBeenCalledTimes(1);
       expect(
         whatsappSender.sendText.mock.calls.filter((c) => c[0].to === OPS),
       ).toHaveLength(1);
     });
 
-    it('an unreadable mode fails closed: no notice, no throw', async () => {
+    it('an unreadable mode is read once more; still unreadable: no notice, no throw, customerNotified false', async () => {
       conversationStore.getHandoff = jest
         .fn()
         .mockRejectedValue(new Error('db down'));
       const result = await createOnce();
-      expect(result.ok).toBe(true);
+      expect(result).toMatchObject({ ok: true, customerNotified: false });
+      expect(customerSends()).toEqual([]);
+      expect(conversationStore.getHandoff).toHaveBeenCalledTimes(2);
+    });
+
+    it('a transient read failure that recovers on the retry (BOT) still sends the notice', async () => {
+      conversationStore.getHandoff = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('blip'))
+        .mockResolvedValueOnce(handoffState('BOT'));
+      const result = await createOnce();
+      expect(result).toMatchObject({ ok: true, customerNotified: true });
+      expect(customerSends().map((c) => c[0].text)).toEqual([
+        UNDER_REVIEW_NOTICE,
+      ]);
+      expect(conversationStore.getHandoff).toHaveBeenCalledTimes(2);
+    });
+
+    it('a transient read failure that recovers on the retry (HUMAN) stays silent and reports false', async () => {
+      conversationStore.getHandoff = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('blip'))
+        .mockResolvedValueOnce(handoffState('HUMAN'));
+      const result = await createOnce();
+      expect(result).toMatchObject({ ok: true, customerNotified: false });
       expect(customerSends()).toEqual([]);
     });
 

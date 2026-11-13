@@ -184,6 +184,7 @@ export class HumanRequestDeliveryService {
       await this.safely(row.deliveryId, () => this.process(row, 'replay'));
     };
     try {
+      const lookupStartedAt = this.clock();
       const pending = await this.ports.client.listPendingDeliveries({
         conversationRef,
       });
@@ -191,7 +192,7 @@ export class HumanRequestDeliveryService {
         for (const item of pending.items)
           await this.safely(item.deliveryId, async () => {
             const { row } = await this.ports.store.insertDelivery(item);
-            await replay(await this.reopenDeferred(row, item));
+            await replay(await this.reopenDeferred(row, item, lookupStartedAt));
           });
       } else {
         this.logger.warn(`pending deliveries rate limited for ${masked}`);
@@ -246,6 +247,7 @@ export class HumanRequestDeliveryService {
     }
     if (this.humanLookupDue(conversationRef)) {
       try {
+        const lookupStartedAt = this.clock();
         const pending = await this.ports.client.listPendingDeliveries({
           conversationRef,
         });
@@ -258,13 +260,19 @@ export class HumanRequestDeliveryService {
               continue;
             await this.safely(item.deliveryId, async () => {
               const { row } = await this.ports.store.insertDelivery(item);
-              rows.set(row.deliveryId, await this.reopenDeferred(row, item));
+              rows.set(
+                row.deliveryId,
+                await this.reopenDeferred(row, item, lookupStartedAt),
+              );
             });
           }
         } else {
+          // Not answered: the next inbound asks again.
+          this.humanLookupAfter.delete(conversationRef);
           this.logger.warn(`pending deliveries rate limited for ${masked}`);
         }
       } catch (error) {
+        this.humanLookupAfter.delete(conversationRef);
         this.logger.warn(
           `pending deliveries read failed for ${masked}: ${describeError(error)}`,
         );
@@ -303,10 +311,20 @@ export class HumanRequestDeliveryService {
    * has not heard of the outcome yet (resending would duplicate the message),
    * and a FAILED_PERMANENT one (409 OUTCOME_ALREADY_RECORDED: "not coming")
    * stops it for good. Anything else is returned untouched.
+   *
+   * Stale listing guard: the listed item carries no attempt evidence (no
+   * attemptId / attemptedAt), so a listing fetched before another replayer
+   * resent the row and ACKed it would reopen a message that was just resent
+   * (a double send). The row is only reopened when it was last written
+   * strictly before the lookup started: a write at or after that instant
+   * (the resend, its ACK) may already answer the listed deferral, so the
+   * row is left alone and the next lookup, which proves the deferral again
+   * if it still stands, decides.
    */
   private async reopenDeferred(
     row: DeliveryRow,
     listed: FeedItem,
+    lookupStartedAt: Date,
   ): Promise<DeliveryRow> {
     if (
       listed.type !== 'conversation.staff_message' ||
@@ -315,6 +333,7 @@ export class HumanRequestDeliveryService {
       row.ackState !== 'ACKED'
     )
       return row;
+    if (row.updatedAt.getTime() >= lookupStartedAt.getTime()) return row;
     const next = await this.ports.store.transition(
       row.deliveryId,
       { localState: row.localState, attemptId: row.attemptId },
@@ -469,27 +488,26 @@ export class HumanRequestDeliveryService {
    * conversation (no phone: masked ref).
    */
   private async endHolds(conversationRef: string): Promise<boolean> {
-    const notBefore = new Date(
-      this.clock().getTime() - this.unfinishedEndMaxMs,
-    );
+    const newest =
+      await this.ports.store.newestUnfinishedEndAt(conversationRef);
+    if (newest === null) {
+      this.endHoldLogged.delete(conversationRef);
+      return false;
+    }
     const masked = maskConversationRef(conversationRef);
-    if (await this.ports.store.hasUnfinishedEnd(conversationRef, notBefore)) {
+    const minutes = Math.round(this.unfinishedEndMaxMs / 60_000);
+    if (newest.getTime() >= this.clock().getTime() - this.unfinishedEndMaxMs) {
       if (this.rememberOnce(this.endHoldLogged, conversationRef))
         this.logger.log(
-          `deliveries of ${masked} wait: a conversation.ended is still being handled (held for at most ${Math.round(this.unfinishedEndMaxMs / 60_000)} min)`,
+          `deliveries of ${masked} wait: a conversation.ended is still being handled (held for at most ${minutes} min)`,
         );
       return true;
     }
     this.endHoldLogged.delete(conversationRef);
-    if (
-      !this.endHoldExpiredLogged.has(conversationRef) &&
-      (await this.ports.store.hasUnfinishedEnd(conversationRef))
-    ) {
-      this.rememberOnce(this.endHoldExpiredLogged, conversationRef);
+    if (this.rememberOnce(this.endHoldExpiredLogged, conversationRef))
       this.logger.warn(
-        `a conversation.ended of ${masked} has been unfinished for over ${Math.round(this.unfinishedEndMaxMs / 60_000)} min: it no longer holds the replays`,
+        `a conversation.ended of ${masked} has been unfinished for over ${minutes} min: it no longer holds the replays`,
       );
-    }
     return false;
   }
 
