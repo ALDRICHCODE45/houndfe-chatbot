@@ -43,6 +43,19 @@ describe('HandoffModeService (S7)', () => {
     });
   });
 
+  it('applyStarted with silent records that the greeting of that epoch is skipped', async () => {
+    await service.applyStarted('wa-1', 2, 'req-2', { silent: true });
+    await expect(service.getState('wa-1')).resolves.toMatchObject({
+      mode: 'HUMAN',
+      epoch: 2,
+      greetingSkippedEpoch: 2,
+    });
+    await service.applyStarted('wa-3', 2, 'req-2');
+    await expect(service.getState('wa-3')).resolves.not.toHaveProperty(
+      'greetingSkippedEpoch',
+    );
+  });
+
   it('markGreeted records that the greeting of the current epoch went out', async () => {
     await service.applyStarted('wa-1', 2, 'req-2');
     await expect(service.markGreeted('wa-1', 1)).resolves.toBe(false);

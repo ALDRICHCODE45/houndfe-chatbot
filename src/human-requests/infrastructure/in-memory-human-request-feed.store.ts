@@ -232,13 +232,18 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     return Promise.resolve({ deleted: acked.length, scrubbed: failed.length });
   }
 
-  hasUnfinishedEnd(conversationRef: string): Promise<boolean> {
+  hasUnfinishedEnd(
+    conversationRef: string,
+    notBefore?: Date,
+  ): Promise<boolean> {
     return Promise.resolve(
       [...this.rows.values()].some(
         (row) =>
           row.conversationRef === conversationRef &&
           row.item.type === 'conversation.ended' &&
-          (row.localState === 'RECEIVED' || row.localState === 'SENDING'),
+          (row.localState === 'RECEIVED' || row.localState === 'SENDING') &&
+          (notBefore === undefined ||
+            row.updatedAt.getTime() >= notBefore.getTime()),
       ),
     );
   }

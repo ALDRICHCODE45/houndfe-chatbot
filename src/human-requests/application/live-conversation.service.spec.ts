@@ -134,9 +134,14 @@ const setup = (
       if (hook !== undefined) await hook();
       return state;
     },
-    applyStarted: (id: string, epoch: number, requestId: string) => {
+    applyStarted: (
+      id: string,
+      epoch: number,
+      requestId: string,
+      options?: { silent?: boolean },
+    ) => {
       events.push('cas:started');
-      return modeService.applyStarted(id, epoch, requestId);
+      return modeService.applyStarted(id, epoch, requestId, options);
     },
     applyEnded: (id: string, epoch: number) => {
       events.push('cas:ended');
@@ -742,6 +747,53 @@ describe('LiveConversationService (T4)', () => {
         expect(line).not.toContain(SENDER);
         expect(line).not.toContain('wamid');
       }
+    });
+  });
+
+  describe('a started that finds its epoch already muted (L14 c)', () => {
+    it('a second started item of an epoch already greeted acks but never greets again', async () => {
+      const h = setup();
+      await h.service.accept(started('g1'));
+      expect(texts(h)).toEqual([GREETING]);
+      await h.service.accept(started('g2', { requestId: 'req-g1' }));
+      expect(texts(h)).toEqual([GREETING]);
+      expect(h.acks.map((a) => a.state)).toEqual(['STARTED', 'STARTED']);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+      await expect(row(h, 'g2')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'DUPLICATE',
+      });
+    });
+
+    it('a mute applied silently (reconcile of a missed started) is acked but never greeted by a later started of that epoch', async () => {
+      const h = setup();
+      await h.mode.applyStarted(SENDER, 3, 'req-g3', { silent: true });
+      await h.service.accept(started('g3'));
+      expect(h.sent).toEqual([]);
+      expect(h.acks).toEqual([{ epoch: 3, state: 'STARTED' }]);
+      expect(lastOutcome(h)).toMatchObject({ outcome: 'STALE' });
+      await expect(row(h, 'g3')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SESSION_STARTED',
+      });
+      await expect(handoff(h)).resolves.not.toHaveProperty('greetedEpoch');
+    });
+
+    it('a retry of an item that muted us but never decided (no greeting out yet) still greets', async () => {
+      const h = setup();
+      await h.mode.applyStarted(SENDER, 3, 'req-g4');
+      await h.service.accept(started('g4'));
+      expect(texts(h)).toEqual([GREETING]);
+      await expect(handoff(h)).resolves.toMatchObject({ greetedEpoch: 3 });
+    });
+
+    it('a newer epoch is not blocked by the markers of the previous one', async () => {
+      const h = setup();
+      await h.mode.applyStarted(SENDER, 3, 'req-g5', { silent: true });
+      await h.service.accept(
+        started('g5', { handoffEpoch: 4 }, { requestId: 'req-g5b' }),
+      );
+      expect(texts(h)).toEqual([GREETING]);
     });
   });
 

@@ -39,15 +39,19 @@ export class HandoffModeService {
     return this.store.getHandoff(senderId);
   }
 
+  /** `silent`: the mute is applied without a greeting (reconcile of a
+   *  missed `started`); a later `started` of this epoch must not greet. */
   applyStarted(
     senderId: string,
     epoch: number,
     requestId: string,
+    options: { silent?: boolean } = {},
   ): Promise<HandoffApplyResult> {
     return this.apply(senderId, {
       mode: 'HUMAN',
       epoch,
       requestId,
+      ...(options.silent === true ? { silent: true } : {}),
     });
   }
 

@@ -753,6 +753,18 @@ export function runHumanRequestFeedStoreContract(
       await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);
     });
 
+    it('hasUnfinishedEnd with notBefore ignores an ended last written before it (bounded hold)', async () => {
+      await store.insertDelivery(endedItem('u3'));
+      const hour = 3_600_000;
+      await expect(
+        store.hasUnfinishedEnd(REF, new Date(Date.now() - hour)),
+      ).resolves.toBe(true);
+      await expect(
+        store.hasUnfinishedEnd(REF, new Date(Date.now() + hour)),
+      ).resolves.toBe(false);
+      await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(true);
+    });
+
     it('hasUnfinishedEnd ignores other item types in flight', async () => {
       await store.insertDelivery(cancelledItem('u2'));
       await expect(store.hasUnfinishedEnd(REF)).resolves.toBe(false);

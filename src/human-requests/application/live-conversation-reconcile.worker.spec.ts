@@ -310,6 +310,8 @@ describe('LiveConversationReconcileWorker (rule 9)', () => {
         mode: 'HUMAN',
         epoch: 3,
         requestId: 'req-3',
+        // L14 c: a later `started` item of this epoch must not greet.
+        greetingSkippedEpoch: 3,
       });
       expect(t.sessionAck).toHaveBeenCalledTimes(1);
       expect(t.sessionAck).toHaveBeenCalledWith(REF_A, {

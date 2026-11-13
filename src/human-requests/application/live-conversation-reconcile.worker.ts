@@ -472,6 +472,7 @@ export class LiveConversationReconcileWorker {
         senderId,
         backend.handoffEpoch,
         backend.requestId,
+        { silent: true },
       );
       if (!applied.applied) return 'in_sync';
       this.logger.log(

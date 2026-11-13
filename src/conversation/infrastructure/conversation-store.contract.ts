@@ -458,6 +458,51 @@ export function runConversationStoreContract(
         await expect(store.getHandoff!('h11')).resolves.toMatchObject(bot(0));
       });
 
+      // (c) A mute applied by a reconcile (a missed `started`, rule 9) is
+      // marked as "no greeting" for that epoch, so a later `started` item of
+      // the same epoch never greets either.
+      describe('greeting skipped marker (reconcile mute)', () => {
+        it('a silent HUMAN order records the epoch whose greeting is skipped', async () => {
+          await expect(
+            store.applyHandoff!('k1', { ...human(3), silent: true }),
+          ).resolves.toMatchObject({ applied: true });
+          await expect(store.getHandoff!('k1')).resolves.toMatchObject({
+            ...human(3),
+            greetingSkippedEpoch: 3,
+          });
+        });
+
+        it('an ordinary order records nothing', async () => {
+          await store.applyHandoff!('k2', human(3));
+          await expect(store.getHandoff!('k2')).resolves.not.toHaveProperty(
+            'greetingSkippedEpoch',
+          );
+        });
+
+        it('a replay of the same order does not add the marker to an already greeted epoch', async () => {
+          await store.applyHandoff!('k3', human(3));
+          await expect(
+            store.applyHandoff!('k3', { ...human(3), silent: true }),
+          ).resolves.toMatchObject({ applied: false, reason: 'DUPLICATE' });
+          await expect(store.getHandoff!('k3')).resolves.not.toHaveProperty(
+            'greetingSkippedEpoch',
+          );
+        });
+
+        it('is kept when the same epoch ends and dropped by a newer epoch', async () => {
+          await store.applyHandoff!('k4', { ...human(2), silent: true });
+          await store.applyHandoff!('k4', bot(2));
+          await expect(store.getHandoff!('k4')).resolves.toMatchObject({
+            ...bot(2),
+            greetingSkippedEpoch: 2,
+          });
+          await store.applyHandoff!('k4', human(3));
+          await expect(store.getHandoff!('k4')).resolves.not.toHaveProperty(
+            'greetingSkippedEpoch',
+          );
+        });
+      });
+
       // T4: the greeting marker lives inside the CAS-owned handoff value, so
       // it survives every writer that already preserves `handoff`.
       describe('greeting marker (live conversation T4)', () => {

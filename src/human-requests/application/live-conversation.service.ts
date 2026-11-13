@@ -283,6 +283,7 @@ export class LiveConversationService implements LiveConversationHandler {
   ): Promise<LivePlan> {
     const { handoffEpoch: epoch, requestId, staffFirstName } = item.payload;
     // 1. One durable compare-and-set to HUMAN, BEFORE the ack.
+    let duplicate = false;
     const applied = await this.ports.mode.applyStarted(
       senderId,
       epoch,
@@ -297,8 +298,11 @@ export class LiveConversationService implements LiveConversationHandler {
         );
         return { action: 'stale', decision: 'STALE_EPOCH' };
       }
-      // DUPLICATE: an earlier attempt of this same item already muted us
-      // and then failed before deciding it; carry on with the ack.
+      // DUPLICATE: our epoch is already this one. Either an earlier attempt
+      // of this same item muted us and failed before deciding it, or the
+      // mute came from elsewhere (another started item of the epoch, a
+      // reconcile). Carry on with the ack; step 3 decides about the greeting.
+      duplicate = true;
     }
 
     // 2. Inline session-ack STARTED (never waits for Meta).
@@ -349,7 +353,28 @@ export class LiveConversationService implements LiveConversationHandler {
       throw new Error(`session-ack STARTED failed: ${ack.kind}`);
     }
 
-    // 3. Only after the 200: the greeting, if the window is open.
+    // 3. Only after the 200: the greeting, if the window is open, and if
+    // none is owed: not when this epoch's greeting already went out, and not
+    // when the mute came from a reconcile (missed started, rule 9: no
+    // greeting). A retry of an item that muted us but never greeted still
+    // greets.
+    if (duplicate) {
+      const state = await this.ports.mode.getState(senderId);
+      if (state.epoch === epoch) {
+        if (state.greetedEpoch === epoch) {
+          this.logger.log(
+            `conversation.started ${item.deliveryId} epoch ${epoch}: the greeting already went out (${maskConversationRef(ref)}), not repeated`,
+          );
+          return { action: 'stale', decision: 'DUPLICATE' };
+        }
+        if (state.greetingSkippedEpoch === epoch) {
+          this.logger.log(
+            `conversation.started ${item.deliveryId} epoch ${epoch}: muted by a reconcile (${maskConversationRef(ref)}), no greeting`,
+          );
+          return { action: 'stale', decision: 'SESSION_STARTED' };
+        }
+      }
+    }
     if (!(await this.ports.isWindowOpen(senderId)))
       return { action: 'stale', decision: 'SESSION_STARTED' };
     const style = await this.readStyle(senderId);

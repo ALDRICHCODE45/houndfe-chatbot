@@ -181,7 +181,8 @@ export class WebhookDispatcherService {
     private readonly humanRequestDelivery?: Pick<
       HumanRequestDeliveryService,
       'onCustomerInbound'
-    >,
+    > &
+      Partial<Pick<HumanRequestDeliveryService, 'onHumanCustomerInbound'>>,
     // T8 / S6 talk to a person. Optional for harnesses: without the team
     // service the turn runs as before. `OUT_OF_HOURS_POLICY` is the unit 14
     // branch point; nothing provides it yet, so the fixed text applies.
@@ -335,6 +336,10 @@ export class WebhookDispatcherService {
           this.logger.debug(
             `handoff HUMAN: mirror-only ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
           );
+          // B1: the customer writing reopens the 24 h window, so staff
+          // messages deferred for a closed window are resent now. Still no
+          // bot reply, and the held request.* rows stay held.
+          this.notifyHumanDeferred(message.senderId);
           await this.markSeenSafely(message.messageId);
           continue;
         }
@@ -545,6 +550,27 @@ export class WebhookDispatcherService {
     return true;
   }
 
+  /**
+   * `mutedBeforeSend` for a turn that may already have sent part of its
+   * reply: with `partial` a failed mode read is a drop (`true`, logged),
+   * never a throw; before any send it fails closed as always.
+   */
+  private async mutedAfterPartial(
+    message: InboundMessage,
+    what: string,
+    partial: boolean,
+  ): Promise<boolean> {
+    if (!partial) return this.mutedBeforeSend(message, what);
+    try {
+      return await this.mutedBeforeSend(message, what);
+    } catch (error) {
+      this.logger.warn(
+        `handoff mode unreadable after a partial send: drop the rest of the ${what} for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}: ${describeError(error)}`,
+      );
+      return true;
+    }
+  }
+
   /** S1: customer inbounds only (never the ops phone). A store failure
    * propagates: the webhook fails and Meta redelivers, so a customer
    * message is never lost from the transcript. */
@@ -610,6 +636,24 @@ export class WebhookDispatcherService {
     } catch (error) {
       this.logger.warn(
         `pending deliveries replay failed: ${describeError(error)}`,
+      );
+    }
+  }
+
+  /** B1: fire-and-forget, like `notifyHumanRequests`; only the deferred
+   *  live staff messages are replayed (nothing is released, nothing said). */
+  private notifyHumanDeferred(senderId: string): void {
+    try {
+      void this.humanRequestDelivery
+        ?.onHumanCustomerInbound?.(conversationRefFor(senderId))
+        ?.catch((error: unknown) =>
+          this.logger.warn(
+            `deferred staff messages replay failed: ${describeError(error)}`,
+          ),
+        );
+    } catch (error) {
+      this.logger.warn(
+        `deferred staff messages replay failed: ${describeError(error)}`,
       );
     }
   }
@@ -699,14 +743,18 @@ export class WebhookDispatcherService {
     // send and the rest of the reply is dropped. A read error propagates
     // (fail closed, Meta redelivers), like the gate.
     // S3: the product photo goes first, then the explanation.
+    // L13 b: once a photo went out the turn is partially delivered, so an
+    // unreadable mode can no longer be a redelivery (the photo and the LLM
+    // turn would repeat): it stops the turn and marks the message seen.
+    let partial = false;
     for (const media of minimal.media ?? []) {
-      if (await this.mutedBeforeSend(message, 'reply')) {
+      if (await this.mutedAfterPartial(message, 'reply', partial)) {
         await this.markSeenSafely(message.messageId);
         return;
       }
-      await this.sendReplyImage(message.senderId, media);
+      if (await this.sendReplyImage(message.senderId, media)) partial = true;
     }
-    if (await this.mutedBeforeSend(message, 'reply')) {
+    if (await this.mutedAfterPartial(message, 'reply', partial)) {
       await this.markSeenSafely(message.messageId);
       return;
     }
@@ -765,8 +813,8 @@ export class WebhookDispatcherService {
   private async sendReplyImage(
     to: string,
     media: CustomerReplyMedia,
-  ): Promise<void> {
-    if (this.whatsappSender.sendImage === undefined) return;
+  ): Promise<boolean> {
+    if (this.whatsappSender.sendImage === undefined) return false;
     try {
       const { providerMessageId } = await this.whatsappSender.sendImage({
         to,
@@ -774,10 +822,12 @@ export class WebhookDispatcherService {
         ...(media.caption === undefined ? {} : { caption: media.caption }),
       });
       this.recentOutbound.remember(providerMessageId);
+      return true;
     } catch (error) {
       this.logger.warn(
         `reply image failed for ${maskConversationRef(to)}; sending the text only: ${describeError(error)}`,
       );
+      return false;
     }
   }
 

@@ -465,6 +465,85 @@ describe('HumanHandoffService', () => {
       ]);
     });
   });
+  describe('create: the under-review notice re-checks the handoff mode (L14 d)', () => {
+    const createOnce = async () => {
+      conversationStore.get.mockResolvedValue(null);
+      store.create.mockImplementation(
+        async (input: CreateHumanHandoffInput) => ({
+          id: input.id,
+          customerId: input.customerId,
+          agentId: input.agentId,
+          kind: input.kind,
+          digest: input.digest,
+          status: 'pending',
+          resolution: null,
+          createdAt: '2026-06-23T12:00:00.000Z',
+          resolvedAt: null,
+        }),
+      );
+      return service.create({
+        senderId: CUSTOMER,
+        kind: 'out_of_stock',
+        digest: {
+          kind: 'out_of_stock',
+          productId: '00000000-0000-4000-8000-000000000001',
+          name: 'Croquetas',
+          quantity: 1,
+        },
+      });
+    };
+    const customerSends = () =>
+      whatsappSender.sendText.mock.calls.filter((c) => c[0].to === CUSTOMER);
+    const handoffState = (mode: 'BOT' | 'HUMAN') => ({
+      mode,
+      epoch: 3,
+      requestId: mode === 'HUMAN' ? 'req-1' : null,
+      updatedAt: null,
+    });
+
+    it('HUMAN right before the send: no notice (total silence), the request itself is still created', async () => {
+      conversationStore.getHandoff = jest
+        .fn()
+        .mockResolvedValue(handoffState('HUMAN'));
+      const result = await createOnce();
+      expect(result.ok).toBe(true);
+      expect(customerSends()).toEqual([]);
+      expect(conversationStore.setPendingHumanRequest).toHaveBeenCalledTimes(1);
+      expect(
+        whatsappSender.sendText.mock.calls.filter((c) => c[0].to === OPS),
+      ).toHaveLength(1);
+    });
+
+    it('an unreadable mode fails closed: no notice, no throw', async () => {
+      conversationStore.getHandoff = jest
+        .fn()
+        .mockRejectedValue(new Error('db down'));
+      const result = await createOnce();
+      expect(result.ok).toBe(true);
+      expect(customerSends()).toEqual([]);
+    });
+
+    it('BOT: the notice goes out, after the marker is set', async () => {
+      conversationStore.getHandoff = jest
+        .fn()
+        .mockResolvedValue(handoffState('BOT'));
+      await createOnce();
+      expect(customerSends().map((c) => c[0].text)).toEqual([
+        UNDER_REVIEW_NOTICE,
+      ]);
+      expect(
+        conversationStore.setPendingHumanRequest.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        (conversationStore.getHandoff as jest.Mock).mock.invocationCallOrder[0],
+      );
+    });
+
+    it('a store without handoff support keeps sending the notice (harnesses)', async () => {
+      await createOnce();
+      expect(customerSends()).toHaveLength(1);
+    });
+  });
+
   describe('resolveReply', () => {
     const customerStateFor = (
       customerId: string,

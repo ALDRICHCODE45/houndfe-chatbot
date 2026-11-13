@@ -16,10 +16,17 @@ export interface HandoffTransition {
   epoch: number;
   /** The human request of the session; required (non-empty) for HUMAN. */
   requestId: string | null;
+  /**
+   * HUMAN only: this mute was applied without a greeting (a reconcile of a
+   * missed `started`, contract rule 9). Stored as `greetingSkippedEpoch`, so
+   * a later `started` item of the same epoch does not greet either. Never
+   * stored as such.
+   */
+  silent?: boolean;
 }
 
 /** Persisted shape of `data.handoff`. */
-export interface HandoffState extends HandoffTransition {
+export interface HandoffState extends Omit<HandoffTransition, 'silent'> {
   /** ISO 8601 — when this state was applied; null only for the default. */
   updatedAt: string | null;
   /**
@@ -35,6 +42,12 @@ export interface HandoffState extends HandoffTransition {
    * newer epoch.
    */
   safetyNoticeEpoch?: number;
+  /**
+   * The epoch whose HUMAN mute was applied without a greeting (reconcile
+   * of a missed `started`): no greeting is owed for it. Kept while that same
+   * epoch ends, dropped by a newer epoch.
+   */
+  greetingSkippedEpoch?: number;
 }
 
 /** A conversation the bot itself holds in HUMAN mode (reconcile, T7). */
@@ -110,6 +123,8 @@ export function readHandoffState(raw: unknown): HandoffState | null {
   const greetedEpoch = (raw as unknown as Record<string, unknown>).greetedEpoch;
   const safetyNoticeEpoch = (raw as unknown as Record<string, unknown>)
     .safetyNoticeEpoch;
+  const greetingSkippedEpoch = (raw as unknown as Record<string, unknown>)
+    .greetingSkippedEpoch;
   return {
     mode: raw.mode,
     epoch: raw.epoch,
@@ -117,6 +132,7 @@ export function readHandoffState(raw: unknown): HandoffState | null {
     updatedAt,
     ...(isEpoch(greetedEpoch) ? { greetedEpoch } : {}),
     ...(isEpoch(safetyNoticeEpoch) ? { safetyNoticeEpoch } : {}),
+    ...(isEpoch(greetingSkippedEpoch) ? { greetingSkippedEpoch } : {}),
   };
 }
 
@@ -173,6 +189,12 @@ export function resolveHandoffApply(
       ...(stored.safetyNoticeEpoch !== undefined && stored.epoch === next.epoch
         ? { safetyNoticeEpoch: stored.safetyNoticeEpoch }
         : {}),
+      ...(next.mode === 'HUMAN' && next.silent === true
+        ? { greetingSkippedEpoch: next.epoch }
+        : stored.greetingSkippedEpoch !== undefined &&
+            stored.epoch === next.epoch
+          ? { greetingSkippedEpoch: stored.greetingSkippedEpoch }
+          : {}),
     },
   };
 }

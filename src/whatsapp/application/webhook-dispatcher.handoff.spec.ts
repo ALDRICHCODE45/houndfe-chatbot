@@ -49,6 +49,8 @@ function setup(
   options: {
     human?: boolean;
     handoffError?: Error;
+    /** The nth isHumanMode call (1-based) rejects; the others answer false. */
+    failReadAt?: number;
     pendingMarker?: boolean;
     awaitingPayment?: boolean;
     /** Successive isHumanMode answers (the last one repeats). */
@@ -56,6 +58,8 @@ function setup(
     opsResolved?: boolean;
     /** S5: what onCustomerInbound does (default: resolves). */
     inbound?: 'never' | 'reject' | 'throw';
+    /** B1: what onHumanCustomerInbound does (default: resolves). */
+    humanInbound?: 'never' | 'reject' | 'throw';
   } = {},
 ) {
   const order: string[] = [];
@@ -143,9 +147,13 @@ function setup(
     }),
   };
   const modes = [...(options.modes ?? [])];
+  let reads = 0;
   const handoffMode = {
     isHumanMode: jest.fn((senderId: string) => {
       order.push(`mode ${senderId}`);
+      reads += 1;
+      if (reads === options.failReadAt)
+        return Promise.reject(new Error('mode read failed'));
       if (options.handoffError) return Promise.reject(options.handoffError);
       if (modes.length > 0)
         return Promise.resolve(modes.length > 1 ? modes.shift()! : modes[0]);
@@ -163,6 +171,17 @@ function setup(
       return Promise.resolve();
     }),
   };
+  const humanRequestsHuman = {
+    onHumanCustomerInbound: jest.fn((ref: string) => {
+      order.push(`human-inbound ${ref}`);
+      if (options.humanInbound === 'throw') throw new Error('sync boom');
+      if (options.humanInbound === 'reject')
+        return Promise.reject(new Error('async boom'));
+      if (options.humanInbound === 'never')
+        return new Promise<void>(() => undefined);
+      return Promise.resolve();
+    }),
+  };
   const service = new WebhookDispatcherService(
     runner as unknown as AgentRunner,
     sender,
@@ -176,10 +195,10 @@ function setup(
     recorder,
     undefined,
     handoffMode,
-    humanRequests,
+    { ...humanRequests, ...humanRequestsHuman },
   );
   return {
-    humanRequests,
+    humanRequests: { ...humanRequests, ...humanRequestsHuman },
     service,
     order,
     sender,
@@ -211,6 +230,7 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     expect(h.order).toEqual([
       'record wamid.h1',
       `mode ${SENDER}`,
+      `human-inbound wa:${SENDER}`,
       'seen wamid.h1',
     ]);
   });
@@ -314,6 +334,68 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     });
   });
 
+  describe('a mode-read failure after a partial send (L13 b)', () => {
+    const withPhoto = (h: ReturnType<typeof setup>, onSent = jest.fn()) =>
+      h.agent.tryHandle.mockImplementation(() => {
+        h.order.push('turn');
+        return Promise.resolve({
+          kind: 'handled',
+          reply: 'Hola',
+          media: [{ url: 'https://cdn.example.com/p.jpg' }],
+          onSent,
+        } as never);
+      });
+    beforeEach(() => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {});
+      jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => {});
+    });
+    afterEach(() => jest.restoreAllMocks());
+
+    it('after the photo went out, an unreadable mode stops the turn and marks seen: no throw, no release, no text, no repeat', async () => {
+      // reads: 1 gate, 2 before the photo, 3 before the text (fails)
+      const h = setup({ failReadAt: 3 });
+      const onSent = jest.fn();
+      withPhoto(h, onSent);
+      h.sender.sendImage.mockResolvedValue({ providerMessageId: 'wamid.img' });
+      await expect(
+        h.service.dispatch(event([text('wamid.pp1')])),
+      ).resolves.toBeUndefined();
+      expect(h.sender.sendImage).toHaveBeenCalledTimes(1);
+      expect(h.sender.sendText).not.toHaveBeenCalled();
+      expect(onSent).not.toHaveBeenCalled();
+      expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.pp1');
+      expect(h.dedup.release).not.toHaveBeenCalled();
+      // A redelivery is a duplicate: the turn does not run again.
+      h.dedup.claim.mockResolvedValueOnce(null);
+      await h.service.dispatch(event([text('wamid.pp1')]));
+      expect(h.agent.tryHandle).toHaveBeenCalledTimes(1);
+      expect(h.sender.sendImage).toHaveBeenCalledTimes(1);
+    });
+
+    it('before anything was sent, an unreadable mode still fails closed (throws, releases the claim, sends nothing)', async () => {
+      const h = setup({ failReadAt: 2 });
+      withPhoto(h);
+      await expect(
+        h.service.dispatch(event([text('wamid.pp2')])),
+      ).rejects.toThrow('mode read failed');
+      expect(h.sender.sendImage).not.toHaveBeenCalled();
+      expect(h.sender.sendText).not.toHaveBeenCalled();
+      expect(h.dedup.release).toHaveBeenCalled();
+      expect(h.dedup.markSeen).not.toHaveBeenCalled();
+    });
+
+    it('a photo that failed to send is not a partial send: an unreadable mode still fails closed', async () => {
+      const h = setup({ failReadAt: 3 });
+      withPhoto(h);
+      h.sender.sendImage.mockRejectedValue(new Error('meta 400'));
+      await expect(
+        h.service.dispatch(event([text('wamid.pp3')])),
+      ).rejects.toThrow('mode read failed');
+      expect(h.sender.sendText).not.toHaveBeenCalled();
+    });
+  });
+
   it('switched to HUMAN mid-turn: the agent reply is dropped, the message is still marked seen', async () => {
     const h = setup({ modes: [false, true] });
     const onSent = jest.fn();
@@ -375,10 +457,46 @@ describe('WebhookDispatcherService pending deliveries hook (S5)', () => {
     },
   );
 
-  it('HUMAN: not called (the gate returns first)', async () => {
+  it('HUMAN: the held request.* replay is not called (they stay held) but the deferred staff messages are resent (B1)', async () => {
     const h = setup({ human: true });
     await h.service.dispatch(event([text('wamid.p4')]));
     expect(h.humanRequests.onCustomerInbound).not.toHaveBeenCalled();
+    expect(h.humanRequests.onHumanCustomerInbound).toHaveBeenCalledTimes(1);
+    expect(h.humanRequests.onHumanCustomerInbound).toHaveBeenCalledWith(
+      `wa:${SENDER}`,
+    );
+    expectSilent(h);
+    expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.p4');
+  });
+
+  it('BOT: the HUMAN-mode replay is not called', async () => {
+    const h = setup();
+    await h.service.dispatch(event([text('wamid.p4b')]));
+    expect(h.humanRequests.onHumanCustomerInbound).not.toHaveBeenCalled();
+  });
+
+  it('HUMAN: never awaits it, and a hook that fails never breaks the turn', async () => {
+    const never = setup({ human: true, humanInbound: 'never' });
+    await never.service.dispatch(event([text('wamid.p4c')]));
+    expect(never.dedup.markSeen).toHaveBeenCalledWith('wamid.p4c');
+    for (const humanInbound of ['reject', 'throw'] as const) {
+      const h = setup({ human: true, humanInbound });
+      await expect(
+        h.service.dispatch(event([text('wamid.p4d')])),
+      ).resolves.toBeUndefined();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.p4d');
+      expect(h.dedup.release).not.toHaveBeenCalled();
+    }
+  });
+
+  it('HUMAN: an unreadable mode still fails closed and calls neither replay', async () => {
+    const h = setup({ handoffError: new Error('db down') });
+    await expect(
+      h.service.dispatch(event([text('wamid.p4e')])),
+    ).rejects.toThrow('db down');
+    expect(h.humanRequests.onCustomerInbound).not.toHaveBeenCalled();
+    expect(h.humanRequests.onHumanCustomerInbound).not.toHaveBeenCalled();
   });
 
   it('forwards the inbound time to the turn (S6 askTeam)', async () => {
@@ -393,6 +511,7 @@ describe('WebhookDispatcherService pending deliveries hook (S5)', () => {
     const h = setup();
     await h.service.dispatch(event([text('wamid.p6', OPS)]));
     expect(h.humanRequests.onCustomerInbound).not.toHaveBeenCalled();
+    expect(h.humanRequests.onHumanCustomerInbound).not.toHaveBeenCalled();
   });
 });
 
