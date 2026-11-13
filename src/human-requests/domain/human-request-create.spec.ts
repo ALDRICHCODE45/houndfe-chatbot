@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import {
   ASK_TEAM_QUESTION_MAX_LENGTH,
+  TALK_TO_HUMAN_DEDUP_KEY,
+  TALK_TO_HUMAN_QUEUED_REPLY,
+  TALK_TO_HUMAN_SUMMARY,
+  buildTalkToHumanRequest,
   buildUnknownQuestionRequest,
   unknownQuestionDedupKey,
 } from './human-request-create';
@@ -134,5 +138,86 @@ describe('buildUnknownQuestionRequest', () => {
         { sourceRequestId: SOURCE, now: NOW },
       ),
     ).toBeNull();
+  });
+});
+
+describe('buildTalkToHumanRequest (T8 / S6)', () => {
+  const input = {
+    senderId: SENDER,
+    text: '  Quiero hablar con una persona  ',
+    inboundAt: '2026-11-10T16:19:30Z',
+    triggerWaMessageId: 'wamid.T1',
+  };
+
+  it('builds the exact TALK_TO_HUMAN envelope', () => {
+    expect(
+      buildTalkToHumanRequest(input, { sourceRequestId: SOURCE, now: NOW }),
+    ).toEqual({
+      sourceRequestId: SOURCE,
+      subtype: 'TALK_TO_HUMAN',
+      customer: { phoneCountryCode: '52', phone: '5550001111' },
+      conversationRef: `wa:${SENDER}`,
+      lastCustomerMessageAt: '2026-11-10T16:19:30.000Z',
+      summary: TALK_TO_HUMAN_SUMMARY,
+      needs: 'Quiero hablar con una persona',
+      dedupKey: TALK_TO_HUMAN_DEDUP_KEY,
+      triggerWaMessageId: 'wamid.T1',
+    });
+  });
+
+  it('uses one fixed dedup key so a repeated ask merges into the open request', () => {
+    expect(TALK_TO_HUMAN_DEDUP_KEY).toBe('TALK_TO_HUMAN');
+    expect(TALK_TO_HUMAN_DEDUP_KEY).toMatch(/^[A-Za-z0-9:_.-]{1,200}$/);
+    const other = buildTalkToHumanRequest(
+      { ...input, text: 'pásame con alguien' },
+      { sourceRequestId: SOURCE, now: NOW },
+    );
+    expect(other?.dedupKey).toBe(TALK_TO_HUMAN_DEDUP_KEY);
+  });
+
+  it('has a summary within the backend bound (1..140, no control chars)', () => {
+    expect(TALK_TO_HUMAN_SUMMARY.length).toBeGreaterThan(0);
+    expect(TALK_TO_HUMAN_SUMMARY.length).toBeLessThanOrEqual(140);
+    // eslint-disable-next-line no-control-regex
+    expect(TALK_TO_HUMAN_SUMMARY).not.toMatch(/[\u0000-\u001f]/);
+  });
+
+  it('omits a missing trigger and bounds the quoted text', () => {
+    const request = buildTalkToHumanRequest(
+      { ...input, text: 'a'.repeat(1200), triggerWaMessageId: undefined },
+      { sourceRequestId: SOURCE, now: NOW },
+    );
+    expect(request).not.toHaveProperty('triggerWaMessageId');
+    expect(request?.needs).toHaveLength(ASK_TEAM_QUESTION_MAX_LENGTH);
+  });
+
+  it('uses now when the inbound time is out of bounds', () => {
+    expect(
+      buildTalkToHumanRequest(
+        { ...input, inboundAt: '2026-10-01T00:00:00.000Z' },
+        { sourceRequestId: SOURCE, now: NOW },
+      )?.lastCustomerMessageAt,
+    ).toBe('2026-11-10T16:20:00.000Z');
+  });
+
+  it('keeps no needs when the text is empty, and null for a non-Mexican sender', () => {
+    expect(
+      buildTalkToHumanRequest(
+        { ...input, text: '   ' },
+        { sourceRequestId: SOURCE, now: NOW },
+      ),
+    ).not.toHaveProperty('needs');
+    expect(
+      buildTalkToHumanRequest(
+        { ...input, senderId: '15550001111' },
+        { sourceRequestId: SOURCE, now: NOW },
+      ),
+    ).toBeNull();
+  });
+
+  it('has a queued reply that never claims the team was asked', () => {
+    expect(TALK_TO_HUMAN_QUEUED_REPLY).toBe(
+      'Estoy registrando su solicitud para que le atienda una persona del equipo; le aviso por aquí.',
+    );
   });
 });

@@ -309,7 +309,98 @@ export type RequestOverdueNoticeItem = FeedItemEnvelope & {
   type: 'request.overdue_notice';
   payload: RequestOverdueNoticePayload;
 };
-/** A type this bot does not know (e.g. unit 11 `conversation.*`): ACK or skip
+// ---------------------------------------------------- live conversation
+
+/** Backend unit 11 (contract "Live conversation"). `handoffEpoch` is the
+ *  conversation's integer epoch (>= 1); `seq` its message counter. */
+export interface ConversationStartedPayload {
+  requestId: string;
+  handoffEpoch: number;
+  /** First word of the attendee's name; `null` when the account has none. */
+  staffFirstName: string | null;
+  /** Backend estimate (ISO UTC) or `null`; informational, Meta decides. */
+  whatsappWindowClosesAt: string | null;
+}
+/** The claim of a live request committed: mute, session-ack STARTED, then
+ *  (after the 200) the greeting. */
+export type ConversationStartedItem = FeedItemEnvelope & {
+  type: 'conversation.started';
+  payload: ConversationStartedPayload;
+};
+
+interface StaffMessageCommon {
+  requestId: string;
+  handoffEpoch: number;
+  seq: number;
+  /** The backend's message row id: a dedupe key next to `deliveryId`. */
+  messageId: string;
+}
+export type StaffMessagePayload =
+  | (StaffMessageCommon & { type: 'TEXT'; text: string })
+  | (StaffMessageCommon & {
+      type: 'IMAGE' | 'DOCUMENT';
+      mediaId: string;
+      mimeType: string;
+      filename: string;
+      /** `null`: send no caption. */
+      caption: string | null;
+    });
+/** One staff message to relay verbatim (never mirrored by the bot). */
+export type ConversationStaffMessageItem = FeedItemEnvelope & {
+  type: 'conversation.staff_message';
+  payload: StaffMessagePayload;
+};
+
+export interface TemplateRequestedPayload {
+  requestId: string;
+  handoffEpoch: number;
+  seq: number;
+  messageId: string;
+  templateName: string;
+  /** `xx` or `xx_YY`; `es_MX` when the backend omits it. */
+  languageCode: string;
+}
+/** The attendee pressed "Enviar plantilla"; no variables in v1. */
+export type TemplateRequestedItem = FeedItemEnvelope & {
+  type: 'template.requested';
+  payload: TemplateRequestedPayload;
+};
+
+export interface ConversationReassignedPayload {
+  requestId: string;
+  handoffEpoch: number;
+  staffFirstName: string | null;
+}
+export type ConversationReassignedItem = FeedItemEnvelope & {
+  type: 'conversation.reassigned';
+  payload: ConversationReassignedPayload;
+};
+
+export type ConversationEndReason =
+  | 'FINISHED'
+  | 'FORCED'
+  | 'IDLE_TIMEOUT'
+  | 'START_TIMEOUT';
+export interface ConversationEndedPayload {
+  requestId: string;
+  handoffEpoch: number;
+  reason: ConversationEndReason;
+  farewell: boolean;
+  resumeNotice: boolean;
+}
+export type ConversationEndedItem = FeedItemEnvelope & {
+  type: 'conversation.ended';
+  payload: ConversationEndedPayload;
+};
+
+export type LiveConversationItem =
+  | ConversationStartedItem
+  | ConversationStaffMessageItem
+  | TemplateRequestedItem
+  | ConversationReassignedItem
+  | ConversationEndedItem;
+
+/** A type this bot does not know (or a malformed known one): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
   type: 'unknown';
@@ -324,6 +415,7 @@ export type FeedItem =
   | RequestMergedItem
   | RequestCancelledItem
   | RequestOverdueNoticeItem
+  | LiveConversationItem
   | UnknownFeedItem;
 
 export type ReadFeedResult =
@@ -824,6 +916,18 @@ export function parseFeedItem(item: unknown): FeedItem | null {
         raw: item,
       }
     );
+  // Unit 11: a malformed live item is ACKed STALE as unknown rather than
+  // rejecting the page (a rejected page would block the whole feed).
+  if (LIVE_TYPES.has(item.type))
+    return (
+      parseLiveItem(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
   if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
     return {
       type: 'unknown',
@@ -949,6 +1053,196 @@ function parseOverdueNotice(
       assigned: payload.assigned === true,
     },
   };
+}
+
+const LIVE_TYPES: ReadonlySet<string> = new Set([
+  'conversation.started',
+  'conversation.staff_message',
+  'template.requested',
+  'conversation.reassigned',
+  'conversation.ended',
+]);
+const END_REASONS: ReadonlySet<unknown> = new Set([
+  'FINISHED',
+  'FORCED',
+  'IDLE_TIMEOUT',
+  'START_TIMEOUT',
+]);
+/** True for the five typed unit 11 items (`conversation.*`,
+ *  `template.requested`). */
+export const isLiveConversationItem = (
+  item: FeedItem,
+): item is LiveConversationItem =>
+  item.type !== 'unknown' && LIVE_TYPES.has(item.type);
+/** Contract: staff text is 1 to 4096 characters. */
+export const STAFF_TEXT_MAX_LENGTH = 4096;
+const DEFAULT_TEMPLATE_LANGUAGE = 'es_MX';
+const LANGUAGE_CODE = /^[a-z]{2}(_[A-Z]{2})?$/;
+const isEpoch = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 1;
+
+/** `null` when the key is not a string; an empty name is no name. */
+const nameOrNull = (value: unknown): string | null | undefined =>
+  value === undefined || value === null || value === ''
+    ? null
+    : typeof value === 'string'
+      ? value
+      : undefined;
+
+function parseLiveItem(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): LiveConversationItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const { payload, deferredReason } = item;
+  if (
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    !isRecord(payload) ||
+    (deferredReason !== undefined &&
+      deferredReason !== null &&
+      !DEFERRED_REASONS.has(deferredReason))
+  )
+    return null;
+  // The envelope and the payload name the same request.
+  const requestId = [item.requestId, payload.requestId].find(isText);
+  if (
+    requestId === undefined ||
+    (item.requestId !== undefined && item.requestId !== requestId) ||
+    (payload.requestId !== undefined && payload.requestId !== requestId) ||
+    !isEpoch(payload.handoffEpoch)
+  )
+    return null;
+  const handoffEpoch = payload.handoffEpoch;
+  const envelope: FeedItemEnvelope = {
+    cursor,
+    deliveryId,
+    requestId,
+    conversationRef: item.conversationRef ?? null,
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+    ...(typeof deferredReason === 'string'
+      ? { deferredReason: deferredReason as DeferredReason }
+      : {}),
+  };
+
+  switch (item.type) {
+    case 'conversation.started': {
+      const staffFirstName = nameOrNull(payload.staffFirstName);
+      if (staffFirstName === undefined) return null;
+      return {
+        ...envelope,
+        type: 'conversation.started',
+        payload: {
+          requestId,
+          handoffEpoch,
+          staffFirstName,
+          // Informational only: a malformed estimate never costs the item.
+          whatsappWindowClosesAt: isText(payload.whatsappWindowClosesAt)
+            ? payload.whatsappWindowClosesAt
+            : null,
+        },
+      };
+    }
+    case 'conversation.reassigned': {
+      const staffFirstName = nameOrNull(payload.staffFirstName);
+      if (staffFirstName === undefined) return null;
+      return {
+        ...envelope,
+        type: 'conversation.reassigned',
+        payload: { requestId, handoffEpoch, staffFirstName },
+      };
+    }
+    case 'conversation.ended':
+      if (
+        !END_REASONS.has(payload.reason) ||
+        typeof payload.farewell !== 'boolean' ||
+        typeof payload.resumeNotice !== 'boolean'
+      )
+        return null;
+      return {
+        ...envelope,
+        type: 'conversation.ended',
+        payload: {
+          requestId,
+          handoffEpoch,
+          reason: payload.reason as ConversationEndReason,
+          farewell: payload.farewell,
+          resumeNotice: payload.resumeNotice,
+        },
+      };
+    case 'conversation.staff_message': {
+      if (!isCount(payload.seq) || !isText(payload.messageId)) return null;
+      const common = {
+        requestId,
+        handoffEpoch,
+        seq: payload.seq,
+        messageId: payload.messageId,
+      };
+      if (payload.type === 'TEXT') {
+        // Verbatim: never trimmed or rewritten.
+        if (
+          !isText(payload.text) ||
+          payload.text.length > STAFF_TEXT_MAX_LENGTH
+        )
+          return null;
+        return {
+          ...envelope,
+          type: 'conversation.staff_message',
+          payload: { ...common, type: 'TEXT', text: payload.text },
+        };
+      }
+      if (payload.type !== 'IMAGE' && payload.type !== 'DOCUMENT') return null;
+      const caption = payload.caption ?? null;
+      if (
+        !isText(payload.mediaId) ||
+        !isText(payload.mimeType) ||
+        !isText(payload.filename) ||
+        !isNullableString(caption)
+      )
+        return null;
+      return {
+        ...envelope,
+        type: 'conversation.staff_message',
+        payload: {
+          ...common,
+          type: payload.type,
+          mediaId: payload.mediaId,
+          mimeType: payload.mimeType,
+          filename: payload.filename,
+          caption,
+        },
+      };
+    }
+    case 'template.requested': {
+      const languageCode = payload.languageCode ?? DEFAULT_TEMPLATE_LANGUAGE;
+      if (
+        !isCount(payload.seq) ||
+        !isText(payload.messageId) ||
+        !isText(payload.templateName) ||
+        typeof languageCode !== 'string' ||
+        !LANGUAGE_CODE.test(languageCode)
+      )
+        return null;
+      return {
+        ...envelope,
+        type: 'template.requested',
+        payload: {
+          requestId,
+          handoffEpoch,
+          seq: payload.seq,
+          messageId: payload.messageId,
+          templateName: payload.templateName,
+          languageCode,
+        },
+      };
+    }
+    default:
+      return null;
+  }
 }
 
 function parseItems(items: unknown): FeedItem[] | null {

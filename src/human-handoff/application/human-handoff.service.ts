@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'node:crypto';
 import {
@@ -64,7 +64,15 @@ export interface HumanHandoffCreateInput {
 }
 
 export type HumanHandoffCreateResult =
-  | { ok: true; requestId: string; ref: string; customerNotified: true }
+  | {
+      ok: true;
+      requestId: string;
+      ref: string;
+      /** `false`: the request stands but no under-review notice went out
+       *  (the conversation is in a human session, or its mode could not be
+       *  read), so the customer was not told. */
+      customerNotified: boolean;
+    }
   | { ok: false; error: { kind: 'disabled'; retryable: false } }
   | { ok: false; error: { kind: 'unavailable'; retryable: false } };
 
@@ -98,6 +106,8 @@ export type HumanHandoffResolveReplyResult =
  */
 @Injectable()
 export class HumanHandoffService {
+  private readonly logger = new Logger(HumanHandoffService.name);
+
   constructor(
     @Inject(HUMAN_HANDOFF_STORE)
     private readonly store: HumanHandoffStore,
@@ -219,12 +229,45 @@ export class HumanHandoffService {
       return { ok: false, error: { kind: 'unavailable', retryable: false } };
     }
 
+    // Total silence while a person attends the customer: a claim may have
+    // landed during the turn, so the mode is re-read right before this
+    // proactive send. HUMAN, or a mode that is still unreadable after one
+    // retry → no notice and `customerNotified: false` (the request and the
+    // marker stand; the marker's canned reply covers later messages).
+    if (await this.mutedBeforeNotice(input.senderId)) {
+      return { ok: true, requestId: id, ref, customerNotified: false };
+    }
+
     await this.whatsappSender.sendText({
       to: input.senderId,
       text: UNDER_REVIEW_NOTICE,
     });
 
     return { ok: true, requestId: id, ref, customerNotified: true };
+  }
+
+  /** `true` when the under-review notice must not be sent: the
+   *  conversation is HUMAN, or its mode cannot be read (fail closed, after
+   *  one retry of a transient read failure). A store without handoff
+   *  support (hand-built harnesses) never mutes. */
+  private async mutedBeforeNotice(senderId: string): Promise<boolean> {
+    if (this.conversationStore.getHandoff === undefined) return false;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const state = await this.conversationStore.getHandoff(senderId);
+        if (state.mode !== 'HUMAN') return false;
+        this.logger.log(
+          'under-review notice dropped: the conversation is in a human session',
+        );
+        return true;
+      } catch (error) {
+        if (attempt === 2)
+          this.logger.warn(
+            `under-review notice dropped: the handoff mode is unreadable (${error instanceof Error ? error.name : 'error'})`,
+          );
+      }
+    }
+    return true;
   }
 
   async resolveReply(args: {

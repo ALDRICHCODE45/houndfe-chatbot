@@ -109,6 +109,11 @@ export interface MirrorAcceptedMessage {
 export interface MirrorBatchAck {
   accepted: MirrorAcceptedMessage[];
   duplicates: string[];
+  /** Unit 11 reconciliation hint (S16 7b): the chat's handoff state as of the
+   *  call. Present only when the 200 carried both fields in contract; a
+   *  malformed or absent hint is dropped and never fails the ack. */
+  mode?: 'BOT' | 'HUMAN';
+  handoffEpoch?: number;
 }
 
 export type MirrorMessagesResult =
@@ -321,7 +326,20 @@ export function parseMirrorBatchAck(body: unknown): MirrorBatchAck | null {
       return null;
     parsed.push({ waMessageId, messageId, seq: seq as number });
   }
-  return { accepted: parsed, duplicates: duplicates as string[] };
+  const ack: MirrorBatchAck = {
+    accepted: parsed,
+    duplicates: duplicates as string[],
+  };
+  const { mode, handoffEpoch } = body;
+  if (
+    (mode === 'BOT' || mode === 'HUMAN') &&
+    Number.isSafeInteger(handoffEpoch) &&
+    (handoffEpoch as number) >= 0
+  ) {
+    ack.mode = mode;
+    ack.handoffEpoch = handoffEpoch as number;
+  }
+  return ack;
 }
 
 // ------------------------------------------------------- statuses:batch

@@ -9,6 +9,11 @@ import {
   CONVERSATION_MIRROR_CLIENT,
   type ConversationMirrorClient,
 } from '../chatbot-api/domain/conversation-mirror.port';
+import { ConversationModule } from '../conversation/conversation.module';
+import {
+  LIVE_RECONCILE_REF,
+  type LiveReconcileRef,
+} from '../conversation/domain/live-reconcile-ref';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import {
@@ -90,6 +95,9 @@ export class MirrorOutboxRoutes implements OnModuleInit {
   imports: [
     ConfigModule,
     DatabaseModule,
+    // Only for the late-bound reconcile holder (LIVE_RECONCILE_REF): the
+    // lowest shared module, so the hint never needs `human-requests`.
+    ConversationModule,
     ChatbotApiModule,
     BackendOutboxEnqueueModule,
   ],
@@ -151,11 +159,33 @@ export class MirrorOutboxRoutes implements OnModuleInit {
         client: ConversationMirrorClient,
         media: MirrorMediaService,
         gate: MirrorDeliveryGate,
-      ) => new MirrorMessagesDelivery({ client, media, gate }),
+        config: ConfigService,
+        reconcile: LiveReconcileRef,
+      ) =>
+        new MirrorMessagesDelivery({
+          client,
+          media,
+          gate,
+          // Live conversation T7 (rule 9): the `{mode, handoffEpoch}` of a
+          // `messages:batch` is a free reconcile hint. Only while mirror
+          // delivery is on (nothing is mirrored otherwise); the worker is
+          // bound later by `HumanRequestFeedLifecycle`, so until then and
+          // after it stops the hint is a no-op.
+          ...(config.get<boolean>('conversationMirror.deliveryEnabled') === true
+            ? {
+                onHandoffHint: (
+                  ref: string,
+                  hint: { mode: 'BOT' | 'HUMAN'; handoffEpoch: number },
+                ) => reconcile.current?.hint(ref, hint),
+              }
+            : {}),
+        }),
       inject: [
         CONVERSATION_MIRROR_CLIENT,
         MirrorMediaService,
         MirrorDeliveryGate,
+        ConfigService,
+        LIVE_RECONCILE_REF,
       ],
     },
     {

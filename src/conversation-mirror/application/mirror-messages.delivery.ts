@@ -5,6 +5,7 @@ import type {
   BackendOutboxEntry,
   BackendOutboxKind,
 } from '../../backend-outbox/domain/backend-outbox';
+import { describeError } from '../../common/log-safe';
 import { maskConversationRef } from '../../human-requests/domain/human-request-feed';
 import type { ConversationMirrorClient } from '../../chatbot-api/domain/conversation-mirror.port';
 import {
@@ -51,6 +52,16 @@ export interface MirrorMessagesDeliveryDeps {
   maxCalls?: number;
   /** Media resolved at once inside one run (the service also caps it). */
   mediaConcurrency?: number;
+  /**
+   * Live conversation T7 (rule 9): the `{mode, handoffEpoch}` an ok
+   * `messages:batch` answered, as a free reconciliation hint. Must be cheap
+   * and synchronous (it schedules, never awaits); a throw is swallowed and
+   * never changes the delivery outcome.
+   */
+  onHandoffHint?: (
+    conversationRef: string,
+    hint: { mode: 'BOT' | 'HUMAN'; handoffEpoch: number },
+  ) => void;
 }
 
 /**
@@ -171,10 +182,36 @@ export class MirrorMessagesDelivery implements BackendOutboxBatchDeliveryPort {
     conversationRef: string,
     batch: BatchItem<MirrorItem>[],
   ): Promise<ReactorResult> {
-    return this.deps.client.mirrorMessages(
+    const result = await this.deps.client.mirrorMessages(
       conversationRef,
       batch.map((item) => item.value.message),
     );
+    this.emitHint(conversationRef, result);
+    return result;
+  }
+
+  private emitHint(
+    conversationRef: string,
+    result: Awaited<ReturnType<ConversationMirrorClient['mirrorMessages']>>,
+  ): void {
+    const hook = this.deps.onHandoffHint;
+    if (
+      hook === undefined ||
+      result.kind !== 'ok' ||
+      result.mode === undefined ||
+      result.handoffEpoch === undefined
+    )
+      return;
+    try {
+      hook(conversationRef, {
+        mode: result.mode,
+        handoffEpoch: result.handoffEpoch,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `mirror handoff hint hook failed: ${describeError(error)}`,
+      );
+    }
   }
 
   /**

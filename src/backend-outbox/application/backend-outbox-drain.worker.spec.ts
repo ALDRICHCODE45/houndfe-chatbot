@@ -283,6 +283,146 @@ describe('BackendOutboxDrainWorker', () => {
   });
 });
 
+const waitFor = async (cond: () => boolean, ms = 1_000): Promise<void> => {
+  for (let i = 0; i < ms / 5 && !cond(); i++)
+    await new Promise((resolve) => setTimeout(resolve, 5));
+};
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe('BackendOutboxDrainWorker.wake (ordering of bot live notices)', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const idleWorker = (
+    store: InMemoryBackendOutboxStore,
+    delivery: BackendOutboxDeliveryPort,
+  ) =>
+    new BackendOutboxDrainWorker(store, delivery, {
+      owner: 'backend-outbox:test',
+      idleDelayMs: 60_000,
+      random: () => 1,
+    });
+
+  it('an idle worker runs the next tick immediately instead of after the idle delay', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    const delivery = new ScriptedDelivery(() => ({ outcome: 'DELIVERED' }));
+    const claim = jest.spyOn(store, 'claimHeads');
+    const drain = idleWorker(store, delivery);
+    drain.start();
+    await waitFor(() => claim.mock.calls.length === 1);
+    await pause(10); // the first tick is over; the next is 60 s away
+    await enqueue(store, A, 'notice');
+    drain.wake();
+    await waitFor(() => delivery.delivered.length === 1);
+    await drain.stop();
+    expect(delivery.delivered).toEqual(['notice']);
+    expect(claim).toHaveBeenCalledTimes(2);
+  });
+
+  it('a wake during a tick runs exactly one follow-up tick right after it', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await enqueue(store, A, 'first');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const delivered: string[] = [];
+    const delivery: BackendOutboxDeliveryPort = {
+      deliver: async (entry) => {
+        delivered.push(entry.idempotencyKey);
+        if (entry.idempotencyKey === 'first') await gate;
+        return { outcome: 'DELIVERED' };
+      },
+    };
+    const claim = jest.spyOn(store, 'claimHeads');
+    const drain = idleWorker(store, delivery);
+    drain.start();
+    await waitFor(() => delivered.length === 1); // tick 1 is busy
+    await enqueue(store, B, 'late');
+    drain.wake();
+    release();
+    await waitFor(() => delivered.length === 2);
+    await pause(20);
+    await drain.stop();
+    expect(delivered).toEqual(['first', 'late']);
+    expect(claim).toHaveBeenCalledTimes(2);
+  });
+
+  it('a burst of wakes coalesces into at most one extra tick', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    const claim = jest.spyOn(store, 'claimHeads');
+    const drain = idleWorker(
+      store,
+      new ScriptedDelivery(() => ({ outcome: 'DELIVERED' })),
+    );
+    drain.start();
+    await waitFor(() => claim.mock.calls.length === 1);
+    await pause(10);
+    for (let i = 0; i < 25; i++) drain.wake();
+    await waitFor(() => claim.mock.calls.length >= 2);
+    await pause(30);
+    expect(claim).toHaveBeenCalledTimes(2);
+
+    // Same while a tick is running.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    claim.mockImplementationOnce(async () => {
+      await gate;
+      return [];
+    });
+    drain.wake();
+    await waitFor(() => claim.mock.calls.length === 3);
+    for (let i = 0; i < 25; i++) drain.wake();
+    release();
+    await pause(40);
+    await drain.stop();
+    expect(claim).toHaveBeenCalledTimes(4);
+  });
+
+  it('is a no-op before start and after stop, and never throws', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    const claim = jest.spyOn(store, 'claimHeads');
+    const drain = idleWorker(
+      store,
+      new ScriptedDelivery(() => ({ outcome: 'DELIVERED' })),
+    );
+    expect(() => drain.wake()).not.toThrow();
+    await pause(20);
+    expect(claim).not.toHaveBeenCalled();
+
+    drain.start();
+    await waitFor(() => claim.mock.calls.length === 1);
+    await drain.stop();
+    expect(() => drain.wake()).not.toThrow();
+    await pause(20);
+    expect(claim).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the backoff: a wake never retries a backed-off row earlier than its schedule', async () => {
+    const store = new InMemoryBackendOutboxStore();
+    await enqueue(store, A, 'a1');
+    const delivery = new ScriptedDelivery(() => ({
+      outcome: 'RETRY',
+      error: '503',
+    }));
+    const drain = idleWorker(store, delivery);
+    drain.start();
+    await waitFor(() => delivery.delivered.length === 1);
+    await pause(10);
+    drain.wake();
+    drain.wake();
+    await pause(40);
+    await drain.stop();
+    // The extra tick ran but the row is not due yet (1 s backoff).
+    expect(delivery.delivered).toEqual(['a1']);
+    expect(store.snapshot()[0]).toMatchObject({
+      status: 'PENDING',
+      attempts: 1,
+    });
+  });
+});
+
 class ScriptedBatchDelivery implements BackendOutboxBatchDeliveryPort {
   readonly calls: BackendOutboxEntry[][] = [];
   readonly singles: string[] = [];

@@ -23,6 +23,15 @@ export const ASK_TEAM_RATE_LIMITED_REPLY =
 export const ASK_TEAM_QUEUED_REPLY =
   'Estoy registrando su consulta con el equipo; le aviso por aquí.';
 
+/** TALK_TO_HUMAN created, but the create is still in the outbox. */
+export const TALK_TO_HUMAN_QUEUED_REPLY =
+  'Estoy registrando su solicitud para que le atienda una persona del equipo; le aviso por aquí.';
+
+/** One-line staff summary of a "quiero hablar con una persona" request. */
+export const TALK_TO_HUMAN_SUMMARY = 'El cliente pide hablar con una persona.';
+/** One open TALK_TO_HUMAN per customer: a repeated ask merges into it. */
+export const TALK_TO_HUMAN_DEDUP_KEY = 'TALK_TO_HUMAN';
+
 export const ASK_TEAM_QUESTION_MAX_LENGTH = 1000;
 const CONTEXT_MAX_IDS = 20;
 const DEDUP_HASH_LENGTH = 24;
@@ -100,6 +109,43 @@ export function buildUnknownQuestionRequest(
     needs: question,
     ...(Object.keys(context).length === 0 ? {} : { context }),
     dedupKey: unknownQuestionDedupKey(question),
+    ...(typeof trigger === 'string' && trigger !== ''
+      ? { triggerWaMessageId: trigger }
+      : {}),
+  };
+}
+
+export interface TalkToHumanInput {
+  /** Raw Meta wa_id. */
+  senderId: string;
+  /** The customer's own words, quoted to staff as `needs`. */
+  text: string;
+  /** The triggering inbound's time; `now` when absent or out of bounds. */
+  inboundAt?: string | null;
+  triggerWaMessageId?: string | null;
+}
+
+/** The TALK_TO_HUMAN create body, or null when the sender is unusable. */
+export function buildTalkToHumanRequest(
+  input: TalkToHumanInput,
+  options: { sourceRequestId: string; now: Date },
+): CreateDirectHumanRequestInput | null {
+  const phone = parseMexicanWhatsAppPhone(input.senderId);
+  if (phone === null) return null;
+  const needs = input.text.trim().slice(0, ASK_TEAM_QUESTION_MAX_LENGTH);
+  const trigger = input.triggerWaMessageId;
+  return {
+    sourceRequestId: options.sourceRequestId,
+    subtype: 'TALK_TO_HUMAN',
+    customer: {
+      phoneCountryCode: phone.phoneCountryCode,
+      phone: phone.phone,
+    },
+    conversationRef: conversationRefFor(input.senderId),
+    lastCustomerMessageAt: lastMessageAt(input.inboundAt, options.now),
+    summary: TALK_TO_HUMAN_SUMMARY,
+    ...(needs === '' ? {} : { needs }),
+    dedupKey: TALK_TO_HUMAN_DEDUP_KEY,
     ...(typeof trigger === 'string' && trigger !== ''
       ? { triggerWaMessageId: trigger }
       : {}),

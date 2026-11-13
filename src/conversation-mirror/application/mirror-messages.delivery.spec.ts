@@ -906,6 +906,80 @@ describe('MirrorMessagesDelivery (T4)', () => {
     });
   });
 
+  describe('handoff hint (live conversation T7, rule 9)', () => {
+    const buildWithHint = (
+      answer: Partial<{ mode: 'BOT' | 'HUMAN'; handoffEpoch: number }>,
+      onHandoffHint: jest.Mock,
+    ) => {
+      const mirrorMessages = jest.fn(
+        (_ref: string, messages: Array<{ waMessageId: string }>) =>
+          Promise.resolve({ ...okAck(messages), ...answer }),
+      );
+      const delivery = new MirrorMessagesDelivery({
+        client: { mirrorMessages } as never,
+        media: { resolveMedia: jest.fn() },
+        gate: new MirrorDeliveryGate({ random: () => 0 }),
+        clock: () => NOW,
+        onHandoffHint,
+      });
+      return { delivery, mirrorMessages };
+    };
+
+    it('hands the answered {mode, handoffEpoch} of an ok batch to the hook, with the conversation ref', async () => {
+      const onHandoffHint = jest.fn();
+      const { delivery } = buildWithHint(
+        { mode: 'HUMAN', handoffEpoch: 4 },
+        onHandoffHint,
+      );
+      const results = await delivery.deliverBatch(texts(2));
+      expect(outcomes(results)).toEqual(['DELIVERED', 'DELIVERED']);
+      expect(onHandoffHint).toHaveBeenCalledTimes(1);
+      expect(onHandoffHint).toHaveBeenCalledWith(REF, {
+        mode: 'HUMAN',
+        handoffEpoch: 4,
+      });
+    });
+
+    it('calls nothing when the answer carries no hint, and never without a hook', async () => {
+      const onHandoffHint = jest.fn();
+      const { delivery } = buildWithHint({}, onHandoffHint);
+      await delivery.deliverBatch(texts(1));
+      expect(onHandoffHint).not.toHaveBeenCalled();
+      const plain = build();
+      await expect(
+        plain.delivery.deliverBatch(texts(1)),
+      ).resolves.toBeDefined();
+    });
+
+    it('does not call it for a failed batch', async () => {
+      const onHandoffHint = jest.fn();
+      const mirrorMessages = jest.fn(() =>
+        Promise.resolve({ kind: 'UNAUTHORIZED' as const }),
+      );
+      const delivery = new MirrorMessagesDelivery({
+        client: { mirrorMessages },
+        media: { resolveMedia: jest.fn() },
+        gate: new MirrorDeliveryGate({ random: () => 0 }),
+        clock: () => NOW,
+        onHandoffHint,
+      });
+      await delivery.deliverBatch(texts(1));
+      expect(onHandoffHint).not.toHaveBeenCalled();
+    });
+
+    it('a throwing hook never changes the delivery outcome', async () => {
+      const onHandoffHint = jest.fn(() => {
+        throw new Error('hook down');
+      });
+      const { delivery } = buildWithHint(
+        { mode: 'BOT', handoffEpoch: 1 },
+        onHandoffHint,
+      );
+      const results = await delivery.deliverBatch(texts(2));
+      expect(outcomes(results)).toEqual(['DELIVERED', 'DELIVERED']);
+    });
+  });
+
   it('S6: neither results nor logs carry the phone or the conversationRef', async () => {
     const { delivery } = build(
       () => ({ kind: 'UNEXPECTED', status: 500, code: 'X' }),

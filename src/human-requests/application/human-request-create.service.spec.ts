@@ -3,11 +3,16 @@ import type {
   CancelHumanRequestResult,
   CreateHumanRequestInput,
   CreateHumanRequestResult,
+  HumanRequestBusinessHours,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type { BackendOutboxEntry } from '../../backend-outbox/domain/backend-outbox';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
-import { unknownQuestionDedupKey } from '../domain/human-request-create';
+import {
+  TALK_TO_HUMAN_DEDUP_KEY,
+  TALK_TO_HUMAN_SUMMARY,
+  unknownQuestionDedupKey,
+} from '../domain/human-request-create';
 import {
   HumanRequestCreateService,
   type HumanRequestCreatePorts,
@@ -23,7 +28,11 @@ const QUESTION = '¿Este collar sirve para un gato de 3 kg?';
 
 const created = (
   outcome: 'CREATED' | 'REPLAYED' | 'MERGED' = 'CREATED',
-  patch: { id?: string | null; mergedIntoId?: string | null } = {},
+  patch: {
+    id?: string | null;
+    mergedIntoId?: string | null;
+    businessHours?: HumanRequestBusinessHours | null;
+  } = {},
 ): CreateHumanRequestResult => ({
   kind: 'ok',
   status: outcome === 'CREATED' ? 201 : 200,
@@ -33,7 +42,7 @@ const created = (
     status: 'OPEN',
     outcome,
     mergedIntoId: patch.mergedIntoId ?? null,
-    businessHours: null,
+    businessHours: patch.businessHours ?? null,
   },
 });
 
@@ -479,5 +488,155 @@ describe('HumanRequestCreateService.deliver (outbox adapter)', () => {
       h.service.deliver(outboxEntry('MESSAGE_MIRROR', {})),
     ).resolves.toMatchObject({ outcome: 'RETRY' });
     expect(h.createHumanRequest).not.toHaveBeenCalled();
+  });
+});
+
+const TALK_ENVELOPE = {
+  sourceRequestId: SOURCE,
+  subtype: 'TALK_TO_HUMAN',
+  customer: { phoneCountryCode: '52', phone: '5550001111' },
+  conversationRef: REF,
+  lastCustomerMessageAt: '2026-11-10T16:19:30.000Z',
+  summary: TALK_TO_HUMAN_SUMMARY,
+  needs: 'quiero hablar con una persona',
+  dedupKey: TALK_TO_HUMAN_DEDUP_KEY,
+  triggerWaMessageId: 'wamid.T1',
+};
+
+const talk = (service: HumanRequestCreateService) =>
+  service.requestTalkToHuman({
+    senderId: SENDER,
+    text: 'quiero hablar con una persona',
+    inboundAt: '2026-11-10T16:19:30.000Z',
+    triggerWaMessageId: 'wamid.T1',
+  });
+
+describe('HumanRequestCreateService.requestTalkToHuman', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('CREATED: sends the TALK_TO_HUMAN envelope, records it OPEN, returns businessHours', async () => {
+    const hours = { openNow: false, nextOpenAt: '2026-11-11T15:00:00.000Z' };
+    const h = harness({ create: created('CREATED', { businessHours: hours }) });
+    await expect(talk(h.service)).resolves.toEqual({
+      kind: 'registered',
+      requestId: REQUEST,
+      merged: false,
+      businessHours: hours,
+    });
+    expect(h.createHumanRequest).toHaveBeenCalledWith(TALK_ENVELOPE);
+    await expect(h.store.getRequest(REQUEST)).resolves.toMatchObject({
+      conversationRef: REF,
+      subtype: 'TALK_TO_HUMAN',
+      status: 'OPEN',
+    });
+    expect(h.enqueue).not.toHaveBeenCalled();
+    expect(h.sendText).not.toHaveBeenCalled();
+  });
+
+  it('a null businessHours is passed through (never "closed")', async () => {
+    const h = harness();
+    await expect(talk(h.service)).resolves.toMatchObject({
+      kind: 'registered',
+      businessHours: null,
+    });
+  });
+
+  it('MERGED: a repeated ask lands on the open request (same dedupKey)', async () => {
+    const open = '00000000-1111-4222-8333-444444444444';
+    const h = harness({ create: created('MERGED', { mergedIntoId: open }) });
+    await expect(talk(h.service)).resolves.toEqual({
+      kind: 'registered',
+      requestId: open,
+      merged: true,
+      businessHours: null,
+    });
+    await expect(talk(h.service)).resolves.toMatchObject({ merged: true });
+    for (const call of h.createHumanRequest.mock.calls)
+      expect(call[0]).toMatchObject({ dedupKey: TALK_TO_HUMAN_DEDUP_KEY });
+    await expect(h.store.getRequest(open)).resolves.toMatchObject({
+      status: 'OPEN',
+      subtype: 'TALK_TO_HUMAN',
+    });
+  });
+
+  it('limits: open_limit and customer_rate_limited, no retry', async () => {
+    const limit = harness({
+      create: { kind: 'CUSTOMER_OPEN_LIMIT', limit: 20, open: 20 },
+    });
+    await expect(talk(limit.service)).resolves.toEqual({ kind: 'open_limit' });
+    const rate = harness({
+      create: {
+        kind: 'CUSTOMER_RATE_LIMITED',
+        limit: 10,
+        retryAfterSeconds: 600,
+      },
+    });
+    await expect(talk(rate.service)).resolves.toEqual({
+      kind: 'customer_rate_limited',
+    });
+    expect(limit.enqueue).not.toHaveBeenCalled();
+    expect(rate.enqueue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a thrown transport error', new Error('timeout')],
+    ['RATE_LIMITED', { kind: 'RATE_LIMITED', retryAfterSeconds: 30 } as const],
+    ['VERSION_CONFLICT', { kind: 'VERSION_CONFLICT' } as const],
+  ])('%s: queues the same REQUEST_CREATE envelope', async (_l, create) => {
+    const h = harness({ create });
+    await expect(talk(h.service)).resolves.toEqual({ kind: 'queued' });
+    expect(h.enqueue).toHaveBeenCalledWith({
+      conversationRef: REF,
+      kind: 'REQUEST_CREATE',
+      idempotencyKey: SOURCE,
+      payload: TALK_ENVELOPE,
+    });
+  });
+
+  it('a refused create fails without queueing', async () => {
+    const h = harness({ create: { kind: 'SUBTYPE_DISABLED' } });
+    await expect(talk(h.service)).resolves.toEqual({
+      kind: 'failed',
+      reason: 'SUBTYPE_DISABLED',
+    });
+    expect(h.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('a non-Mexican sender is an invalid envelope, nothing is sent', async () => {
+    const h = harness();
+    await expect(
+      h.service.requestTalkToHuman({ senderId: '15550001111', text: 'hola' }),
+    ).resolves.toEqual({ kind: 'failed', reason: 'invalid_envelope' });
+    expect(h.createHumanRequest).not.toHaveBeenCalled();
+  });
+
+  it('never logs the phone number', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn');
+    const error = jest.spyOn(Logger.prototype, 'error');
+    const h = harness({
+      create: new Error('timeout'),
+      enqueue: new Error('x'),
+    });
+    await talk(h.service);
+    const refused = harness({ create: { kind: 'SUBTYPE_DISABLED' } });
+    await talk(refused.service);
+    const logged = [...warn.mock.calls, ...error.mock.calls]
+      .map((call) => String(call[0]))
+      .join('\n');
+    expect(logged).not.toContain(SENDER);
+    expect(logged).not.toContain('5550001111');
+  });
+
+  it('the queued create that finally lands sends no "Ya le pregunté" confirmation', async () => {
+    const h = harness();
+    await h.service.deliver(outboxEntry('REQUEST_CREATE', TALK_ENVELOPE));
+    expect(h.sendText).not.toHaveBeenCalled();
+    await expect(h.store.getRequest(REQUEST)).resolves.toMatchObject({
+      subtype: 'TALK_TO_HUMAN',
+    });
   });
 });

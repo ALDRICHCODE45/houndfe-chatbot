@@ -16,12 +16,45 @@ export interface HandoffTransition {
   epoch: number;
   /** The human request of the session; required (non-empty) for HUMAN. */
   requestId: string | null;
+  /**
+   * HUMAN only: this mute was applied without a greeting (a reconcile of a
+   * missed `started`, contract rule 9). Stored as `greetingSkippedEpoch`, so
+   * a later `started` item of the same epoch does not greet either. Never
+   * stored as such.
+   */
+  silent?: boolean;
 }
 
 /** Persisted shape of `data.handoff`. */
-export interface HandoffState extends HandoffTransition {
+export interface HandoffState extends Omit<HandoffTransition, 'silent'> {
   /** ISO 8601 — when this state was applied; null only for the default. */
   updatedAt: string | null;
+  /**
+   * Live conversation T4: the epoch whose greeting actually went out to the
+   * customer (absent until one did). Kept while that same epoch ends (a
+   * START_TIMEOUT resume notice depends on it), dropped by a newer epoch.
+   */
+  greetedEpoch?: number;
+  /**
+   * Live conversation T7: the epoch whose safety notice (contract rule 8,
+   * "feed down > 10 min") was already claimed, so a restart or another
+   * replica never repeats it. Kept while that same epoch ends, dropped by a
+   * newer epoch.
+   */
+  safetyNoticeEpoch?: number;
+  /**
+   * The epoch whose HUMAN mute was applied without a greeting (reconcile
+   * of a missed `started`): no greeting is owed for it. Kept while that same
+   * epoch ends, dropped by a newer epoch.
+   */
+  greetingSkippedEpoch?: number;
+}
+
+/** A conversation the bot itself holds in HUMAN mode (reconcile, T7). */
+export interface HumanHandoffRef {
+  senderId: string;
+  epoch: number;
+  requestId: string;
 }
 
 /** State of a conversation that never had a handoff order. */
@@ -86,13 +119,25 @@ export function readHandoffState(raw: unknown): HandoffState | null {
   // SAFETY: isHandoffTransition proved `raw` is a non-null object.
   const updatedAt = (raw as unknown as Record<string, unknown>).updatedAt;
   if (updatedAt !== null && typeof updatedAt !== 'string') return null;
+  // A malformed marker is dropped, never fatal: the mode is what fails closed.
+  const greetedEpoch = (raw as unknown as Record<string, unknown>).greetedEpoch;
+  const safetyNoticeEpoch = (raw as unknown as Record<string, unknown>)
+    .safetyNoticeEpoch;
+  const greetingSkippedEpoch = (raw as unknown as Record<string, unknown>)
+    .greetingSkippedEpoch;
   return {
     mode: raw.mode,
     epoch: raw.epoch,
     requestId: raw.requestId,
     updatedAt,
+    ...(isEpoch(greetedEpoch) ? { greetedEpoch } : {}),
+    ...(isEpoch(safetyNoticeEpoch) ? { safetyNoticeEpoch } : {}),
+    ...(isEpoch(greetingSkippedEpoch) ? { greetingSkippedEpoch } : {}),
   };
 }
+
+/** True for an epoch value usable as `greetedEpoch` (integer >= 0). */
+export const isGreetedEpoch = isEpoch;
 
 /**
  * The epoch-monotonic CAS rule shared by every adapter:
@@ -138,6 +183,18 @@ export function resolveHandoffApply(
       epoch: next.epoch,
       requestId: next.requestId,
       updatedAt: now,
+      ...(stored.greetedEpoch !== undefined && stored.epoch === next.epoch
+        ? { greetedEpoch: stored.greetedEpoch }
+        : {}),
+      ...(stored.safetyNoticeEpoch !== undefined && stored.epoch === next.epoch
+        ? { safetyNoticeEpoch: stored.safetyNoticeEpoch }
+        : {}),
+      ...(next.mode === 'HUMAN' && next.silent === true
+        ? { greetingSkippedEpoch: next.epoch }
+        : stored.greetingSkippedEpoch !== undefined &&
+            stored.epoch === next.epoch
+          ? { greetingSkippedEpoch: stored.greetingSkippedEpoch }
+          : {}),
     },
   };
 }

@@ -1,11 +1,23 @@
 import { Logger } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
+import {
+  CHATBOT_API_CLIENT,
+  HUMAN_REQUESTS_CLIENT,
+} from '../chatbot-api/domain/chatbot-api.client';
 import { ChatbotApiHttpClient } from '../chatbot-api/infrastructure/chatbot-api-http.client';
+import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
+import { LiveConversationReconcileWorker } from '../human-requests/application/live-conversation-reconcile.worker';
+import { HumanRequestsModule } from '../human-requests/human-requests.module';
+import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import { CONVERSATION_MIRROR_CLIENT } from '../chatbot-api/domain/conversation-mirror.port';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
+import {
+  LIVE_RECONCILE_REF,
+  type LiveReconcileRef,
+} from '../conversation/domain/live-reconcile-ref';
 import { MirrorDeliveryGate } from './application/mirror-delivery-gate';
 import { MirrorMediaService } from './application/mirror-media.service';
 import { MirrorMessagesDelivery } from './application/mirror-messages.delivery';
@@ -154,6 +166,160 @@ describe('ConversationMirrorModule wiring (T3)', () => {
       MirrorStatusesDelivery,
     );
     await moduleRef.close();
+  });
+
+  interface HintDeps {
+    deps: {
+      onHandoffHint?: (
+        ref: string,
+        hint: { mode: 'BOT' | 'HUMAN'; handoffEpoch: number },
+      ) => void;
+    };
+  }
+
+  describe('messages:batch handoff hint wiring (live conversation T7)', () => {
+    const boot = async (enabled: boolean) => {
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          ConfigModule.forRoot({
+            ignoreEnvFile: true,
+            isGlobal: true,
+            load: [
+              () => ({ conversationMirror: { deliveryEnabled: enabled } }),
+            ],
+          }),
+          ConversationMirrorModule,
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(pool())
+        .compile();
+      const delivery: unknown = moduleRef.get(MirrorMessagesDelivery);
+      const hook = (delivery as HintDeps).deps.onHandoffHint;
+      return {
+        moduleRef,
+        hook,
+        holder: moduleRef.get<LiveReconcileRef>(LIVE_RECONCILE_REF, {
+          strict: false,
+        }),
+      };
+    };
+
+    it('delivery on: the hint reaches the worker bound later in the shared holder', async () => {
+      const { moduleRef, hook, holder } = await boot(true);
+      expect(hook).toBeDefined();
+      const worker = { hint: jest.fn(), reconcileOne: jest.fn() };
+      // Before the worker exists (and after it stops) a hint is a no-op.
+      expect(() =>
+        hook?.('wa:1', { mode: 'HUMAN', handoffEpoch: 2 }),
+      ).not.toThrow();
+      holder.current = worker;
+      hook?.('wa:5215550001111', { mode: 'HUMAN', handoffEpoch: 4 });
+      expect(worker.hint).toHaveBeenCalledWith('wa:5215550001111', {
+        mode: 'HUMAN',
+        handoffEpoch: 4,
+      });
+      holder.current = undefined;
+      hook?.('wa:5215550001111', { mode: 'BOT', handoffEpoch: 5 });
+      expect(worker.hint).toHaveBeenCalledTimes(1);
+      await moduleRef.close();
+    });
+
+    it('delivery off: the hint hook does not exist (rows are not mirrored, so nothing to hint)', async () => {
+      const { moduleRef, hook } = await boot(false);
+      expect(hook).toBeUndefined();
+      await moduleRef.close();
+    });
+
+    // L13 d: the singleton is only proven when BOTH modules boot together:
+    // the mirror delivery's hook must reach the worker the human-requests
+    // lifecycle binds on bootstrap.
+    it('booted with HumanRequestsModule: a messages:batch hint reaches the worker bound on bootstrap (one LIVE_RECONCILE_REF)', async () => {
+      const log = jest
+        .spyOn(Logger.prototype, 'log')
+        .mockImplementation(() => undefined);
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const client = {
+        query: jest.fn(() => Promise.resolve({ rows: [{ locked: false }] })),
+        on: jest.fn(),
+        off: jest.fn(),
+        removeAllListeners: jest.fn(),
+        release: jest.fn(),
+      };
+      const livePool = {
+        end: jest.fn(() => Promise.resolve()),
+        query: jest.fn(() => Promise.resolve({ rows: [], rowCount: 0 })),
+        connect: jest.fn(() => Promise.resolve(client)),
+      };
+      const moduleRef = await Test.createTestingModule({
+        imports: [
+          ConfigModule.forRoot({
+            ignoreEnvFile: true,
+            isGlobal: true,
+            load: [
+              () => ({
+                conversationMirror: { deliveryEnabled: true },
+                meta: { phoneNumberId: 'phone-1' },
+              }),
+            ],
+          }),
+          ConversationMirrorModule,
+          HumanRequestsModule,
+        ],
+      })
+        .overrideProvider(PG_POOL)
+        .useValue(livePool)
+        .overrideProvider(CONVERSATION_STORE)
+        .useValue({ get: jest.fn(), getHandoff: jest.fn() })
+        .overrideProvider(CHATBOT_API_CLIENT)
+        .useValue({})
+        .overrideProvider(HUMAN_REQUESTS_CLIENT)
+        .useValue({
+          readFeed: jest.fn(() => new Promise(() => undefined)),
+          recordDeliveryOutcome: jest.fn(),
+          listPendingDeliveries: jest.fn(),
+          createHumanRequest: jest.fn(),
+          cancelHumanRequest: jest.fn(),
+        })
+        .overrideProvider(WHATSAPP_SENDER)
+        .useValue({ sendText: jest.fn() })
+        .compile();
+      await moduleRef.init();
+      const holder = moduleRef.get<LiveReconcileRef>(LIVE_RECONCILE_REF, {
+        strict: false,
+      });
+      const worker = holder.current;
+      expect(worker).toBeInstanceOf(LiveConversationReconcileWorker);
+      const hint = jest
+        .spyOn(worker as LiveConversationReconcileWorker, 'hint')
+        .mockImplementation(() => undefined);
+      const delivery: unknown = moduleRef.get(MirrorMessagesDelivery);
+      (delivery as HintDeps).deps.onHandoffHint?.('wa:5215550001111', {
+        mode: 'HUMAN',
+        handoffEpoch: 6,
+      });
+      expect(hint).toHaveBeenCalledWith('wa:5215550001111', {
+        mode: 'HUMAN',
+        handoffEpoch: 6,
+      });
+      await moduleRef.close();
+      // Released on shutdown: the same hook is a no-op afterwards.
+      (delivery as HintDeps).deps.onHandoffHint?.('wa:5215550001111', {
+        mode: 'BOT',
+        handoffEpoch: 7,
+      });
+      expect(hint).toHaveBeenCalledTimes(1);
+      log.mockRestore();
+      warn.mockRestore();
+    });
+
+    it('the holder is the single instance of ConversationModule (no cycle with human-requests)', async () => {
+      const { moduleRef, holder } = await boot(true);
+      expect(holder).toEqual({});
+      await moduleRef.close();
+    });
   });
 
   describe('CONVERSATION_MIRROR_DELIVERY_ENABLED flag', () => {

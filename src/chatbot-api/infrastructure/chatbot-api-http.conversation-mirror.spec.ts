@@ -131,6 +131,42 @@ describe('conversation mirror client (mocked HTTP)', () => {
       });
     });
 
+    it('returns the unit 11 {mode, handoffEpoch} hint when the 200 carries it', async () => {
+      request.mockReturnValue(
+        of(response({ ...ack, mode: 'HUMAN', handoffEpoch: 3 })),
+      );
+      await expect(client.mirrorMessages(REF, [text(1)])).resolves.toEqual({
+        kind: 'ok',
+        ...ack,
+        mode: 'HUMAN',
+        handoffEpoch: 3,
+      });
+      // A hint that breaks the contract is dropped; the ack itself still counts.
+      request.mockReturnValue(
+        of(response({ ...ack, mode: 'ROBOT', handoffEpoch: 3 })),
+      );
+      await expect(client.mirrorMessages(REF, [text(1)])).resolves.toEqual({
+        kind: 'ok',
+        ...ack,
+      });
+      request.mockReturnValue(
+        of(response({ ...ack, mode: 'BOT', handoffEpoch: -1 })),
+      );
+      await expect(client.mirrorMessages(REF, [text(1)])).resolves.toEqual({
+        kind: 'ok',
+        ...ack,
+      });
+      request.mockReturnValue(
+        of(response({ ...ack, mode: 'BOT', handoffEpoch: 0 })),
+      );
+      await expect(client.mirrorMessages(REF, [text(1)])).resolves.toEqual({
+        kind: 'ok',
+        ...ack,
+        mode: 'BOT',
+        handoffEpoch: 0,
+      });
+    });
+
     it('sends staffReplyId on an OUT TEXT message and omits it elsewhere', async () => {
       request.mockReturnValue(of(response({ accepted: [], duplicates: [] })));
       const out: MirrorMessageInput = {

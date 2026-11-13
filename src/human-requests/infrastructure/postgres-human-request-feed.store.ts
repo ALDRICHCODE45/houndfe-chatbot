@@ -16,7 +16,9 @@ import {
   type HumanRequestFeedStore,
   type HumanRequestRecord,
   type HumanRequestStatus,
+  type InsertDeliveryResult,
   type OpenHumanRequestInput,
+  messageIdOf,
 } from '../domain/human-request-feed';
 
 interface Row {
@@ -26,6 +28,7 @@ interface Row {
   request_id: string | null;
   conversation_ref: string | null;
   payload: FeedItem;
+  message_id?: string | null;
   local_state: DeliveryLocalState;
   decision: DeliveryDecision | null;
   attempt_id: string | null;
@@ -59,18 +62,22 @@ VALUES ($1, $2), ($3, $4)
 ON CONFLICT (consumer) DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()`;
 
 /** The row is written before any Meta call; an existing deliveryId keeps
- *  its stored row untouched. */
+ *  its stored row untouched. A `message_id` already owned by another delivery
+ *  (unique partial index, migration 4900) inserts nothing either: the store
+ *  then records the item without the key (`insertDelivery`). */
 const INSERT_DELIVERY_SQL = `WITH ins AS (
   INSERT INTO human_request_deliveries
-    (delivery_id, cursor, type, request_id, conversation_ref, payload)
-  VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-  ON CONFLICT (delivery_id) DO NOTHING
+    (delivery_id, cursor, type, request_id, conversation_ref, payload, message_id)
+  VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+  ON CONFLICT DO NOTHING
   RETURNING *
 )
 SELECT *, true AS inserted FROM ins
 UNION ALL
 SELECT *, false AS inserted FROM human_request_deliveries
  WHERE delivery_id = $1 AND NOT EXISTS (SELECT 1 FROM ins)`;
+const MESSAGE_OWNER_SQL = `SELECT delivery_id FROM human_request_deliveries
+ WHERE message_id = $1 AND delivery_id <> $2`;
 const SELECT_DELIVERY_SQL = `SELECT * FROM human_request_deliveries WHERE delivery_id = $1`;
 
 /** Compare-and-set on (local_state, attempt_id). */
@@ -141,6 +148,11 @@ const STUCK_SENDING_SQL = `SELECT * FROM human_request_deliveries
  WHERE local_state = 'SENDING' AND attempted_at < $1
  ORDER BY attempted_at LIMIT $2`;
 
+/** Uses the (conversation_ref, local_state) index. */
+const NEWEST_UNFINISHED_END_SQL = `SELECT max(updated_at) AS newest FROM human_request_deliveries
+ WHERE conversation_ref = $1 AND local_state IN ('RECEIVED', 'SENDING')
+   AND type = 'conversation.ended'`;
+
 const OPEN_REQUEST_SQL = `INSERT INTO human_request_registry
   (request_id, conversation_ref, subtype, legacy_id)
 VALUES ($1, $2, $3, $4)
@@ -186,24 +198,45 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
     return result.rows[0]?.cursor ?? null;
   }
 
-  async insertDelivery(
-    item: FeedItem,
-  ): Promise<{ row: DeliveryRow; inserted: boolean }> {
+  async insertDelivery(item: FeedItem): Promise<InsertDeliveryResult> {
     const known = item.type !== 'unknown';
-    const result = await this.pool.query<Row & { inserted: boolean }>(
-      INSERT_DELIVERY_SQL,
-      [
+    const messageId = messageIdOf(item);
+    const insert = (key: string | null) =>
+      this.pool.query<Row & { inserted: boolean }>(INSERT_DELIVERY_SQL, [
         item.deliveryId,
         item.cursor,
         known ? item.type : item.rawType,
         known ? item.requestId : null,
         known ? item.conversationRef : null,
         JSON.stringify(item),
-      ],
-    );
-    const found = result.rows[0];
+        key,
+      ]);
+    const found = (await insert(messageId)).rows[0];
     if (found) return { row: toDelivery(found), inserted: found.inserted };
-    // A concurrent insert committed after this statement's snapshot.
+    // Nothing inserted and nothing returned: a concurrent insert committed
+    // after this statement's snapshot, or the messageId has another owner.
+    const existing = await this.getDelivery(item.deliveryId);
+    if (existing !== null) return { row: existing, inserted: false };
+    if (messageId === null)
+      throw new Error(`delivery ${item.deliveryId} vanished after insert`);
+    const owner = (
+      await this.pool.query<{ delivery_id: string }>(MESSAGE_OWNER_SQL, [
+        messageId,
+        item.deliveryId,
+      ])
+    ).rows[0]?.delivery_id;
+    if (owner === undefined)
+      // The owner was purged in between: the key is free again.
+      throw new Error(`delivery ${item.deliveryId} lost a messageId race`);
+    // A duplicate of an already handled message: kept as its own row (it
+    // still needs an ACK) without the key; the caller must not send it.
+    const dup = (await insert(null)).rows[0];
+    if (dup)
+      return {
+        row: toDelivery(dup),
+        inserted: dup.inserted,
+        duplicateOf: owner,
+      };
     const row = await this.getDelivery(item.deliveryId);
     if (row === null)
       throw new Error(`delivery ${item.deliveryId} vanished after insert`);
@@ -313,6 +346,14 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
     };
   }
 
+  async newestUnfinishedEndAt(conversationRef: string): Promise<Date | null> {
+    const result = await this.pool.query<{ newest: Date | null }>(
+      NEWEST_UNFINISHED_END_SQL,
+      [conversationRef],
+    );
+    return result.rows[0]?.newest ?? null;
+  }
+
   async listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {
     const result = await this.pool.query<Row>(STUCK_SENDING_SQL, [
       before,
@@ -375,6 +416,7 @@ const toDelivery = (row: Row): DeliveryRow => ({
   requestId: row.request_id,
   conversationRef: row.conversation_ref,
   item: row.payload,
+  messageId: row.message_id ?? null,
   localState: row.local_state,
   decision: row.decision,
   attemptId: row.attempt_id,

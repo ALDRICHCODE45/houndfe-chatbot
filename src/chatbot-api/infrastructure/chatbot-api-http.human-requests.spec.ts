@@ -800,6 +800,430 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       );
     });
 
+    describe('live conversation items (unit 11)', () => {
+      const envelope = (type: string, payload: unknown, extra = {}) => ({
+        cursor: '000000001900',
+        deliveryId: 'd-live',
+        type,
+        requestId: 'req-l',
+        conversationRef: 'wa:5215550001111',
+        notBefore: null,
+        expiresAt: null,
+        payload,
+        ...extra,
+      });
+      const read = async (raw: unknown) => {
+        request.mockReturnValue(
+          of(response({ items: [raw], nextCursor: '000000001900' })),
+        );
+        const result = await client.readFeed({ after: 'c' });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        return result.items;
+      };
+      const base = {
+        cursor: '000000001900',
+        deliveryId: 'd-live',
+        requestId: 'req-l',
+        conversationRef: 'wa:5215550001111',
+        notBefore: null,
+        expiresAt: null,
+      };
+      const startedPayload = {
+        requestId: 'req-l',
+        handoffEpoch: 3,
+        staffFirstName: 'Ana',
+        whatsappWindowClosesAt: '2026-11-13T10:00:00.000Z',
+      };
+      const textPayload = {
+        requestId: 'req-l',
+        handoffEpoch: 3,
+        seq: 18,
+        messageId: 'msg-1',
+        type: 'TEXT',
+        text: 'Hola\nLe confirmo su pedido',
+      };
+      const mediaPayload = {
+        requestId: 'req-l',
+        handoffEpoch: 3,
+        seq: 19,
+        messageId: 'msg-2',
+        type: 'IMAGE',
+        mediaId: 'media-1',
+        mimeType: 'image/jpeg',
+        filename: 'foto.jpg',
+        caption: 'Así se ve',
+      };
+      const templatePayload = {
+        requestId: 'req-l',
+        handoffEpoch: 3,
+        seq: 20,
+        messageId: 'msg-3',
+        templateName: 'seguimiento',
+        languageCode: 'es_MX',
+      };
+      const reassignedPayload = {
+        requestId: 'req-l',
+        handoffEpoch: 3,
+        staffFirstName: 'Luis',
+      };
+      const endedPayload = {
+        requestId: 'req-l',
+        handoffEpoch: 3,
+        reason: 'FINISHED',
+        farewell: true,
+        resumeNotice: false,
+      };
+
+      it('parses conversation.started', async () => {
+        await expect(
+          read(envelope('conversation.started', startedPayload)),
+        ).resolves.toEqual([
+          { ...base, type: 'conversation.started', payload: startedPayload },
+        ]);
+      });
+
+      it('conversation.started: null name and null window are kept as null', async () => {
+        const payload = {
+          ...startedPayload,
+          staffFirstName: null,
+          whatsappWindowClosesAt: null,
+        };
+        await expect(
+          read(envelope('conversation.started', payload)),
+        ).resolves.toEqual([
+          { ...base, type: 'conversation.started', payload },
+        ]);
+      });
+
+      it('conversation.started: an empty name is no name and a malformed window is informational only', async () => {
+        const items = await read(
+          envelope('conversation.started', {
+            ...startedPayload,
+            staffFirstName: '',
+            whatsappWindowClosesAt: 42,
+          }),
+        );
+        expect(items).toEqual([
+          {
+            ...base,
+            type: 'conversation.started',
+            payload: {
+              ...startedPayload,
+              staffFirstName: null,
+              whatsappWindowClosesAt: null,
+            },
+          },
+        ]);
+      });
+
+      it('parses a TEXT conversation.staff_message verbatim (no trimming)', async () => {
+        const payload = { ...textPayload, text: '  Hola  \n' };
+        await expect(
+          read(envelope('conversation.staff_message', payload)),
+        ).resolves.toEqual([
+          { ...base, type: 'conversation.staff_message', payload },
+        ]);
+      });
+
+      it.each(['IMAGE', 'DOCUMENT'])(
+        'parses a %s conversation.staff_message with media fields',
+        async (kind) => {
+          const payload = {
+            ...mediaPayload,
+            type: kind,
+            mimeType: kind === 'IMAGE' ? 'image/png' : 'application/pdf',
+            filename: kind === 'IMAGE' ? 'a.png' : 'lista.pdf',
+          };
+          await expect(
+            read(envelope('conversation.staff_message', payload)),
+          ).resolves.toEqual([
+            { ...base, type: 'conversation.staff_message', payload },
+          ]);
+        },
+      );
+
+      it('a media staff_message with a null or absent caption keeps caption null', async () => {
+        const { caption: _drop, ...noCaption } = mediaPayload;
+        void _drop;
+        for (const payload of [{ ...mediaPayload, caption: null }, noCaption])
+          await expect(
+            read(envelope('conversation.staff_message', payload)),
+          ).resolves.toEqual([
+            {
+              ...base,
+              type: 'conversation.staff_message',
+              payload: { ...mediaPayload, caption: null },
+            },
+          ]);
+      });
+
+      it('parses template.requested and defaults the language to es_MX when absent', async () => {
+        await expect(
+          read(envelope('template.requested', templatePayload)),
+        ).resolves.toEqual([
+          { ...base, type: 'template.requested', payload: templatePayload },
+        ]);
+        const { languageCode: _drop, ...noLanguage } = templatePayload;
+        void _drop;
+        await expect(
+          read(envelope('template.requested', noLanguage)),
+        ).resolves.toEqual([
+          {
+            ...base,
+            type: 'template.requested',
+            payload: { ...templatePayload, languageCode: 'es_MX' },
+          },
+        ]);
+      });
+
+      it('parses template.requested with a two-letter language', async () => {
+        const payload = { ...templatePayload, languageCode: 'es' };
+        await expect(
+          read(envelope('template.requested', payload)),
+        ).resolves.toEqual([{ ...base, type: 'template.requested', payload }]);
+      });
+
+      it('parses conversation.reassigned, with and without a name', async () => {
+        await expect(
+          read(envelope('conversation.reassigned', reassignedPayload)),
+        ).resolves.toEqual([
+          {
+            ...base,
+            type: 'conversation.reassigned',
+            payload: reassignedPayload,
+          },
+        ]);
+        const payload = { ...reassignedPayload, staffFirstName: null };
+        await expect(
+          read(envelope('conversation.reassigned', payload)),
+        ).resolves.toEqual([
+          { ...base, type: 'conversation.reassigned', payload },
+        ]);
+      });
+
+      it.each([
+        ['FINISHED', true, false],
+        ['FORCED', true, false],
+        ['IDLE_TIMEOUT', true, false],
+        ['START_TIMEOUT', false, true],
+      ])(
+        'parses conversation.ended %s',
+        async (reason, farewell, resumeNotice) => {
+          const payload = { ...endedPayload, reason, farewell, resumeNotice };
+          await expect(
+            read(envelope('conversation.ended', payload)),
+          ).resolves.toEqual([
+            { ...base, type: 'conversation.ended', payload },
+          ]);
+        },
+      );
+
+      it('keeps the deferredReason of a pending staff_message', async () => {
+        const items = await read(
+          envelope('conversation.staff_message', textPayload, {
+            deferredReason: 'WINDOW_CLOSED',
+          }),
+        );
+        expect(items).toEqual([
+          expect.objectContaining({
+            type: 'conversation.staff_message',
+            deferredReason: 'WINDOW_CLOSED',
+          }),
+        ]);
+      });
+
+      const MALFORMED: Array<[string, string, Record<string, unknown>]> = [
+        ['started: epoch 0', 'conversation.started', { handoffEpoch: 0 }],
+        [
+          'started: epoch as text',
+          'conversation.started',
+          { handoffEpoch: '3' },
+        ],
+        [
+          'started: fractional epoch',
+          'conversation.started',
+          { handoffEpoch: 1.5 },
+        ],
+        [
+          'started: numeric name',
+          'conversation.started',
+          { staffFirstName: 7 },
+        ],
+        [
+          'started: payload requestId differs',
+          'conversation.started',
+          { requestId: 'other' },
+        ],
+        [
+          'staff: missing messageId',
+          'conversation.staff_message',
+          { messageId: undefined },
+        ],
+        [
+          'staff: missing seq',
+          'conversation.staff_message',
+          { seq: undefined },
+        ],
+        ['staff: negative seq', 'conversation.staff_message', { seq: -1 }],
+        [
+          'staff: unknown type',
+          'conversation.staff_message',
+          { type: 'AUDIO' },
+        ],
+        ['staff: empty text', 'conversation.staff_message', { text: '' }],
+        [
+          'staff: text over 4096',
+          'conversation.staff_message',
+          { text: 'x'.repeat(4097) },
+        ],
+        ['staff: numeric text', 'conversation.staff_message', { text: 5 }],
+        [
+          'staff: epoch missing',
+          'conversation.staff_message',
+          { handoffEpoch: undefined },
+        ],
+        [
+          'template: missing templateName',
+          'template.requested',
+          { templateName: undefined },
+        ],
+        [
+          'template: bad language',
+          'template.requested',
+          { languageCode: 'espanol' },
+        ],
+        [
+          'template: missing messageId',
+          'template.requested',
+          { messageId: undefined },
+        ],
+        ['template: missing seq', 'template.requested', { seq: undefined }],
+        [
+          'reassigned: epoch missing',
+          'conversation.reassigned',
+          { handoffEpoch: undefined },
+        ],
+        [
+          'reassigned: numeric name',
+          'conversation.reassigned',
+          { staffFirstName: 1 },
+        ],
+        ['ended: unknown reason', 'conversation.ended', { reason: 'BORED' }],
+        ['ended: farewell as text', 'conversation.ended', { farewell: 'yes' }],
+        [
+          'ended: missing resumeNotice',
+          'conversation.ended',
+          { resumeNotice: undefined },
+        ],
+        ['ended: epoch as text', 'conversation.ended', { handoffEpoch: 'x' }],
+      ];
+      const validPayload: Record<string, Record<string, unknown>> = {
+        'conversation.started': startedPayload,
+        'conversation.staff_message': textPayload,
+        'template.requested': templatePayload,
+        'conversation.reassigned': reassignedPayload,
+        'conversation.ended': endedPayload,
+      };
+      it.each(MALFORMED)(
+        'falls back to "unknown" for %s without rejecting the page',
+        async (_label, type, patch) => {
+          const raw = envelope(type, { ...validPayload[type], ...patch });
+          await expect(read(raw)).resolves.toEqual([
+            {
+              type: 'unknown',
+              rawType: type,
+              cursor: '000000001900',
+              deliveryId: 'd-live',
+              raw,
+            },
+          ]);
+        },
+      );
+
+      it.each([
+        ['IMAGE missing mediaId', { mediaId: undefined }],
+        ['IMAGE missing mimeType', { mimeType: undefined }],
+        ['IMAGE missing filename', { filename: undefined }],
+        ['IMAGE numeric caption', { caption: 4 }],
+        ['IMAGE with text instead of media', { mediaId: '' }],
+      ])('staff_message %s falls back to "unknown"', async (_label, patch) => {
+        const raw = envelope('conversation.staff_message', {
+          ...mediaPayload,
+          ...patch,
+        });
+        await expect(read(raw)).resolves.toEqual([
+          expect.objectContaining({
+            type: 'unknown',
+            rawType: 'conversation.staff_message',
+          }),
+        ]);
+      });
+
+      it.each([
+        ['a missing payload', { payload: undefined }],
+        ['a payload that is not an object', { payload: 'x' }],
+        ['a missing requestId and payload requestId', { requestId: undefined }],
+        ['a numeric conversationRef', { conversationRef: 5 }],
+        ['a numeric notBefore', { notBefore: 5 }],
+        ['an unknown deferredReason', { deferredReason: 'LATER' }],
+      ])(
+        'an envelope with %s falls back to "unknown"',
+        async (_label, patch) => {
+          const payload =
+            'requestId' in patch
+              ? { ...endedPayload, requestId: undefined }
+              : endedPayload;
+          const raw = envelope('conversation.ended', payload, patch);
+          const items = await read(raw);
+          expect(items).toHaveLength(1);
+          expect(items[0]).toMatchObject({
+            type: 'unknown',
+            rawType: 'conversation.ended',
+          });
+        },
+      );
+
+      it('a bad live item never rejects a page that carries other items', async () => {
+        const good = envelope('conversation.ended', endedPayload);
+        const bad = envelope(
+          'conversation.staff_message',
+          { ...textPayload, seq: 'x' },
+          { deliveryId: 'd-bad', cursor: '000000001901' },
+        );
+        request.mockReturnValue(
+          of(response({ items: [good, bad], nextCursor: '000000001901' })),
+        );
+        const result = await client.readFeed({ after: 'c' });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        expect(result.items.map((i) => i.type)).toEqual([
+          'conversation.ended',
+          'unknown',
+        ]);
+      });
+
+      it('a live item arrives typed through pending deliveries too', async () => {
+        request.mockReturnValue(
+          of(
+            response({
+              items: [
+                envelope('conversation.staff_message', textPayload, {
+                  deferredReason: 'WINDOW_CLOSED',
+                }),
+              ],
+            }),
+          ),
+        );
+        const result = await client.listPendingDeliveries({
+          conversationRef: 'wa:5215550001111',
+        });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        expect(result.items[0]).toMatchObject({
+          type: 'conversation.staff_message',
+          deferredReason: 'WINDOW_CLOSED',
+        });
+      });
+    });
+
     it('surfaces a malformed request.merged as "unknown" instead of rejecting the page', async () => {
       const raw = {
         cursor: '000000001845',

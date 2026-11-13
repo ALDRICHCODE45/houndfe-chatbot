@@ -1,6 +1,8 @@
 import type { FeedItem } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import {
+  messageIdOf,
   purgedItem,
+  type InsertDeliveryResult,
   type AckCompletion,
   type DeliveryExpectation,
   type DeliveryRow,
@@ -18,12 +20,17 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
   private cursor: string | null = null;
   private syncedAt: string | null = null;
   private readonly rows = new Map<string, DeliveryRow>();
+  /** messageId → owning deliveryId (the unique partial index). */
+  private readonly messageOwners = new Map<string, string>();
   private readonly requests = new Map<string, HumanRequestRecord>();
   private lastStamp = 0;
 
+  /** `now` lets a spec drive the write times with its own fake clock. */
+  constructor(private readonly now: () => number = Date.now) {}
+
   /** Strictly increasing write time, so ordering by `updatedAt` is exact. */
   private stamp(): Date {
-    this.lastStamp = Math.max(Date.now(), this.lastStamp + 1);
+    this.lastStamp = Math.max(this.now(), this.lastStamp + 1);
     return new Date(this.lastStamp);
   }
 
@@ -41,12 +48,13 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     return Promise.resolve(this.syncedAt);
   }
 
-  insertDelivery(
-    item: FeedItem,
-  ): Promise<{ row: DeliveryRow; inserted: boolean }> {
+  insertDelivery(item: FeedItem): Promise<InsertDeliveryResult> {
     const existing = this.rows.get(item.deliveryId);
     if (existing)
       return Promise.resolve({ row: copy(existing), inserted: false });
+    const wanted = messageIdOf(item);
+    const owner = wanted === null ? undefined : this.messageOwners.get(wanted);
+    const messageId = owner === undefined ? wanted : null;
     const now = this.stamp();
     const row: DeliveryRow = {
       deliveryId: item.deliveryId,
@@ -55,6 +63,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       requestId: item.type === 'unknown' ? null : item.requestId,
       conversationRef: item.type === 'unknown' ? null : item.conversationRef,
       item: structuredClone(item),
+      messageId,
       localState: 'RECEIVED',
       decision: null,
       attemptId: null,
@@ -68,7 +77,12 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       updatedAt: now,
     };
     this.rows.set(row.deliveryId, row);
-    return Promise.resolve({ row: copy(row), inserted: true });
+    if (messageId !== null) this.messageOwners.set(messageId, row.deliveryId);
+    return Promise.resolve({
+      row: copy(row),
+      inserted: true,
+      ...(owner === undefined ? {} : { duplicateOf: owner }),
+    });
   }
 
   getDelivery(deliveryId: string): Promise<DeliveryRow | null> {
@@ -205,7 +219,10 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       )
       .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
     const acked = old.filter((row) => row.ackState === 'ACKED').slice(0, limit);
-    for (const row of acked) this.rows.delete(row.deliveryId);
+    for (const row of acked) {
+      this.rows.delete(row.deliveryId);
+      if (row.messageId !== null) this.messageOwners.delete(row.messageId);
+    }
     const failed = old
       .filter(
         (row) =>
@@ -216,6 +233,21 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
     for (const row of failed)
       row.item = purgedItem(row.deliveryId, row.cursor, row.type);
     return Promise.resolve({ deleted: acked.length, scrubbed: failed.length });
+  }
+
+  newestUnfinishedEndAt(conversationRef: string): Promise<Date | null> {
+    let newest: Date | null = null;
+    for (const row of this.rows.values()) {
+      if (
+        row.conversationRef !== conversationRef ||
+        row.item.type !== 'conversation.ended' ||
+        (row.localState !== 'RECEIVED' && row.localState !== 'SENDING')
+      )
+        continue;
+      if (newest === null || row.updatedAt.getTime() > newest.getTime())
+        newest = row.updatedAt;
+    }
+    return Promise.resolve(newest === null ? null : new Date(newest));
   }
 
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]> {

@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import type {
   DeliveryOutcomeInput,
   PendingDeliveriesResult,
@@ -11,13 +12,19 @@ import { WhatsappSendError } from '../../whatsapp/infrastructure/meta-whatsapp.s
 import {
   REF,
   cancelledItem,
+  endedItem,
   overdueItem,
+  staffMessageItem,
+  startedItem,
+  templateItem,
 } from '../infrastructure/human-request-feed-store.contract';
+import type { DeliveryRow } from '../domain/human-request-feed';
 import { InMemoryHumanRequestFeedStore } from '../infrastructure/in-memory-human-request-feed.store';
 import {
   HumanRequestDeliveryService,
   type HumanRequestDeliveryOptions,
 } from './human-request-delivery.service';
+import type { LivePlan } from './live-conversation.service';
 
 const SENDER = '5215550001111';
 const NOW = new Date('2026-11-10T16:20:00.000Z');
@@ -698,6 +705,201 @@ describe('HumanRequestDeliveryService', () => {
     );
   });
 
+  // The lifecycle handlers (started / reassigned / ended) are covered in
+  // live-conversation.service.spec.ts. Without a handler wired, and for the
+  // staff_message / template items (T5), a typed live item behaves exactly
+  // like an unknown one.
+  describe('typed live conversation items (no handler wired)', () => {
+    it.each([
+      ['conversation.started', startedItem('lv1')],
+      ['conversation.staff_message', staffMessageItem('lv2')],
+      ['template.requested', templateItem('lv3')],
+      [
+        'conversation.reassigned',
+        {
+          ...startedItem('lv4'),
+          type: 'conversation.reassigned' as const,
+          payload: {
+            requestId: 'req-lv4',
+            handoffEpoch: 3,
+            staffFirstName: null,
+          },
+        },
+      ],
+      ['conversation.ended', endedItem('lv5')],
+    ])('%s is not sent, ACKs STALE and is ledgered', async (type, item) => {
+      const { service, sender, client, store } = setup();
+      await store.recordOpenRequest({
+        requestId: item.requestId,
+        conversationRef: REF,
+        subtype: 'TALK_TO_HUMAN',
+      });
+      await service.accept(item);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getDelivery(item.deliveryId)).resolves.toMatchObject({
+        type,
+        localState: 'STALE',
+        decision: 'UNKNOWN_TYPE',
+        ackState: 'ACKED',
+      });
+      // The registry is untouched.
+      await expect(store.getRequest(item.requestId)).resolves.toMatchObject({
+        status: 'OPEN',
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(type));
+    });
+
+    it('a replayed live deliveryId is not handled or ACKed twice', async () => {
+      const { service, client } = setup();
+      await service.accept(staffMessageItem('lv6'));
+      await service.accept(staffMessageItem('lv6'));
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('a staff message duplicated under another deliveryId is still ACKed STALE, never sent', async () => {
+      const { service, sender, client, store } = setup();
+      await service.accept(staffMessageItem('lv7', 'msg-dup'));
+      await service.accept(staffMessageItem('lv8', 'msg-dup'));
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((ack) => ack.deliveryId)).toEqual(['lv7', 'lv8']);
+      await expect(store.getDelivery('lv8')).resolves.toMatchObject({
+        localState: 'STALE',
+        messageId: null,
+      });
+    });
+  });
+
+  // Relay plans (live conversation T5): the delivery service executes what a
+  // live handler plans; the handler's own rules are in
+  // live-conversation.service.spec.ts.
+  describe('relay plans from a live handler', () => {
+    const relayService = (
+      plan: (row: DeliveryRow) => Promise<LivePlan>,
+      human = true,
+    ) => {
+      const base = setup();
+      const service = new HumanRequestDeliveryService(
+        {
+          store: base.store,
+          client: base.client,
+          sender: base.sender,
+          handoff: { isHumanMode: () => Promise.resolve(human) },
+          isWindowOpen: () => Promise.resolve(true),
+          live: { plan },
+        },
+        {
+          clock: () => NOW,
+          random: () => 1,
+          newAttemptId: () => randomUUID(),
+        },
+      );
+      return { ...base, service };
+    };
+
+    it('sends through `deliver`, never through sender.sendText, and is not held by HUMAN mode', async () => {
+      const deliver = jest.fn(() =>
+        Promise.resolve({ providerMessageId: 'wamid.R1' }),
+      );
+      const { service, sender, client, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'STAFF_MESSAGE',
+          senderId: SENDER,
+          deferrable: true,
+          deliver,
+        }),
+      );
+      await service.accept(staffMessageItem('rp1'));
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks[0].body).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.R1',
+      });
+      await expect(store.getDelivery('rp1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'STAFF_MESSAGE',
+      });
+    });
+
+    it('runs `dispose` after the attempt, also when the send fails and when the row moved on', async () => {
+      const dispose = jest.fn(() => Promise.resolve());
+      const { service, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'STAFF_MESSAGE',
+          senderId: SENDER,
+          deferrable: true,
+          deliver: () => Promise.reject(new Error('boom')),
+          dispose,
+        }),
+      );
+      await service.accept(staffMessageItem('rp2'));
+      expect(dispose).toHaveBeenCalledTimes(1);
+      await expect(store.getDelivery('rp2')).resolves.toMatchObject({
+        localState: 'UNKNOWN',
+      });
+
+      const moved = jest.fn(() => Promise.resolve());
+      const other = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'STAFF_MESSAGE',
+          senderId: SENDER,
+          deferrable: true,
+          deliver: () => Promise.resolve({ providerMessageId: 'w' }),
+          dispose: moved,
+        }),
+      );
+      jest.spyOn(other.store, 'transition').mockResolvedValueOnce(null);
+      await other.service.accept(staffMessageItem('rp3'));
+      expect(moved).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failing `dispose` never breaks the delivery', async () => {
+      const { service, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'TEMPLATE_SENT',
+          senderId: SENDER,
+          deferrable: false,
+          deliver: () => Promise.resolve({ providerMessageId: 'w' }),
+          dispose: () => Promise.reject(new Error('unlink failed')),
+        }),
+      );
+      await service.accept(templateItem('rp4'));
+      await expect(store.getDelivery('rp4')).resolves.toMatchObject({
+        localState: 'SENT',
+      });
+    });
+
+    it('a non-deferrable relay (template) whose window is closed is STALE / SEND_REFUSED, never deferred', async () => {
+      const closed = Object.assign(new Error('closed'), {
+        name: 'WhatsappSendError',
+        status: 400,
+        graphErrorCode: 131047,
+        stage: 'send',
+      });
+      const { service, client, store } = relayService(() =>
+        Promise.resolve({
+          action: 'relay',
+          decision: 'TEMPLATE_SENT',
+          senderId: SENDER,
+          deferrable: false,
+          deliver: () => Promise.reject(closed),
+        }),
+      );
+      await service.accept(templateItem('rp5'));
+      expect(client.acks[0].body.outcome).toBe('STALE');
+      await expect(store.getDelivery('rp5')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'SEND_REFUSED',
+      });
+    });
+  });
+
   describe('no double delivery', () => {
     it('a replayed deliveryId is never sent again', async () => {
       const { service, sender, client } = setup();
@@ -902,20 +1104,60 @@ describe('HumanRequestDeliveryService', () => {
       expect(sender.sent).toHaveLength(3);
     });
 
-    it('a held cancellation never sends a deferral and is decided once BOT', async () => {
-      const { service, sender, client, store, human, window } = setup();
+    it('rule 2: a cancellation notice while HUMAN is STALE / HUMAN_SESSION right away (it may not wait), never held, never replayed', async () => {
+      const { service, sender, client, store, human } = setup();
       human.value = true;
       await service.accept(cancelledItem('h3'));
-      expect(client.acks).toEqual([]);
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
       await expect(store.getDelivery('h3')).resolves.toMatchObject({
-        localState: 'HELD_HUMAN',
-        ackState: null,
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+        ackState: 'ACKED',
       });
       human.value = false;
-      window.open = false;
       await service.onCustomerInbound(REF);
+      await expect(service.replayHeld()).resolves.toBe(0);
       expect(sender.sent).toEqual([]);
-      expect(client.acks[0].body.outcome).toBe('STALE');
+      expect(client.acks).toHaveLength(1);
+    });
+
+    it('a cancellation notice held by an older version (HELD_HUMAN, no ACK) is settled STALE while still HUMAN', async () => {
+      const { service, sender, client, store, human } = setup();
+      human.value = false;
+      await store.insertDelivery(cancelledItem('h8'));
+      await store.transition(
+        'h8',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'HELD_HUMAN',
+          decision: 'CANCEL_NOTICE',
+          attemptId: attemptId(90),
+          attemptedAt: NOW.toISOString(),
+          providerMessageId: null,
+          ack: null,
+        },
+      );
+      human.value = true;
+      await service.replayHeld();
+      expect(sender.sent).toEqual([]);
+      expect(client.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('h8')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+      });
+    });
+
+    it('the answered clarification may wait: HELD_HUMAN with DEFERRED_HUMAN_SESSION (contrast with the cancellation)', async () => {
+      const { service, client, store, human } = setup();
+      human.value = true;
+      await service.accept(clarification('h9'));
+      expect(client.acks.map((a) => a.body.outcome)).toEqual([
+        'DEFERRED_HUMAN_SESSION',
+      ]);
+      await expect(store.getDelivery('h9')).resolves.toMatchObject({
+        localState: 'HELD_HUMAN',
+      });
     });
 
     it('an unreadable mode fails the item (retried), never sends', async () => {

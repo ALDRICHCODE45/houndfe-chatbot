@@ -34,6 +34,14 @@ export interface OutboundTranscriptEntry {
   details?: Record<string, unknown> | null;
   /** When Meta accepted the send; becomes the row's providerTimestamp. */
   acceptedAt?: Date;
+  /** Row author; default `BOT`. A relayed staff message is `STAFF`. */
+  author?: 'BOT' | 'STAFF';
+  /**
+   * Default true. False keeps the row in the local transcript but enqueues no
+   * MESSAGE_MIRROR (staff messages and templates: the backend already has
+   * them and gets the wamid in the delivery outcome).
+   */
+  mirror?: boolean;
 }
 
 /** What the sender adapter needs; kept narrow so fakes stay trivial. */
@@ -111,22 +119,27 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
   }
 
   async recordOutbound(entry: OutboundTranscriptEntry): Promise<void> {
-    await this.append('OUT', entry.to, entry.providerMessageId, (onInserted) =>
-      this.store.append(
-        {
-          senderId: entry.to,
-          waMessageId: entry.providerMessageId,
-          direction: 'OUT',
-          author: 'BOT',
-          type: entry.type,
-          text: entry.text ?? null,
-          media: entry.media ?? null,
-          details: entry.details ?? null,
-          providerTimestamp: (entry.acceptedAt ?? this.now()).toISOString(),
-          observedAt: this.now(),
-        },
-        onInserted,
-      ),
+    await this.append(
+      'OUT',
+      entry.to,
+      entry.providerMessageId,
+      (onInserted) =>
+        this.store.append(
+          {
+            senderId: entry.to,
+            waMessageId: entry.providerMessageId,
+            direction: 'OUT',
+            author: entry.author ?? 'BOT',
+            type: entry.type,
+            text: entry.text ?? null,
+            media: entry.media ?? null,
+            details: entry.details ?? null,
+            providerTimestamp: (entry.acceptedAt ?? this.now()).toISOString(),
+            observedAt: this.now(),
+          },
+          onInserted,
+        ),
+      entry.mirror !== false,
     );
   }
 
@@ -135,6 +148,7 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
     senderId: string,
     waMessageId: string,
     write: (onInserted?: TranscriptInsertHook) => Promise<boolean>,
+    mirror = true,
   ): Promise<void> {
     if (!isConversationRef(conversationRefFor(senderId))) {
       this.logger.warn(
@@ -143,7 +157,7 @@ export class TranscriptRecorder implements OutboundTranscriptRecorder {
       return;
     }
     try {
-      await write(this.mirrorHook());
+      await write(mirror ? this.mirrorHook() : undefined);
     } catch (error) {
       if (
         direction === 'IN' &&

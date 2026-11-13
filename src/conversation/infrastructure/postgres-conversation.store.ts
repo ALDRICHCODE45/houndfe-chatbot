@@ -13,11 +13,13 @@ import {
 } from '../domain/conversation-store';
 import {
   CorruptHandoffStateError,
+  isGreetedEpoch,
   readHandoffState,
   resolveHandoffApply,
   type HandoffApplyResult,
   type HandoffState,
   type HandoffTransition,
+  type HumanHandoffRef,
 } from '../domain/handoff-mode';
 import { PG_POOL } from '../../database/postgres-pool.provider';
 
@@ -524,6 +526,70 @@ export class PostgresConversationStore implements ConversationStore {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Single statement, so it takes the row lock itself and serializes with
+   * `applyHandoff`: writes only `data.handoff.greetedEpoch`, and only while
+   * the stored epoch is the one greeted.
+   */
+  async markHandoffGreeted(senderId: string, epoch: number): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = jsonb_set(data, '{handoff,greetedEpoch}', to_jsonb($2::int), true)
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND data->'handoff'->>'epoch' = $2::text`,
+      [senderId, epoch],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  /**
+   * Single conditional statement (row lock): claims the safety notice only
+   * while the stored handoff is HUMAN at exactly `epoch` and was not yet
+   * claimed for it; of two concurrent callers exactly one gets rowCount 1.
+   */
+  async claimHandoffSafetyNotice(
+    senderId: string,
+    epoch: number,
+  ): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = jsonb_set(data, '{handoff,safetyNoticeEpoch}', to_jsonb($2::int), true)
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND data->'handoff'->>'mode' = 'HUMAN'
+         AND data->'handoff'->>'epoch' = $2::text
+         AND COALESCE(data->'handoff'->>'safetyNoticeEpoch', '') <> $2::text`,
+      [senderId, epoch],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  async listHumanHandoffs(limit: number): Promise<HumanHandoffRef[]> {
+    const { rows } = await this.pool.query<{
+      sender_id: string;
+      epoch: string;
+      request_id: string;
+    }>(
+      `SELECT sender_id,
+              data->'handoff'->>'epoch' AS epoch,
+              data->'handoff'->>'requestId' AS request_id
+       FROM conversation_state
+       WHERE data->'handoff'->>'mode' = 'HUMAN'
+         AND jsonb_typeof(data->'handoff'->'requestId') = 'string'
+       ORDER BY sender_id
+       LIMIT $1`,
+      [Math.max(0, Math.trunc(limit))],
+    );
+    return rows.map((row) => ({
+      senderId: row.sender_id,
+      epoch: Number(row.epoch),
+      requestId: row.request_id,
+    }));
   }
 
   async get(senderId: string): Promise<ConversationState | null> {

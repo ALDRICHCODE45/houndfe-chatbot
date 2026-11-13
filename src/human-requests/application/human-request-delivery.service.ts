@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
+  isLiveConversationItem,
   normalizeDeliveryOutcome,
   type FeedItem,
   type RecordDeliveryOutcomeResult,
@@ -12,6 +13,12 @@ import {
 } from '../../conversation/application/handoff-send-hold';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import type {
+  LiveConversationHandler,
+  LivePlan,
+  LiveSendResult,
+} from './live-conversation.service';
+import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -20,6 +27,7 @@ import {
   ackBackoffMs,
   ackBodyFor,
   canonicalNow,
+  classifyRelaySendError,
   isWindowClosedSendError,
   maskConversationRef,
   senderIdFromRef,
@@ -27,6 +35,7 @@ import {
   withTeamPrefix,
   type AckCompletion,
   type DeliveryDecision,
+  type DeliveryExpectation,
   type DeliveryRow,
   type HumanRequestFeedStore,
 } from '../domain/human-request-feed';
@@ -50,6 +59,11 @@ export interface HumanRequestDeliveryPorts {
   isWindowOpen(senderId: string): Promise<boolean>;
   /** Stored customer style; null/failure keeps the usted copy. */
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  /** Live conversation (T4/T5): started / reassigned / ended and the staff
+   *  message / template relays. Without it those items stay the safe STALE
+   *  of T1 (a claim reverts after its start timeout), so hand-built
+   *  harnesses keep working. */
+  live?: LiveConversationHandler;
 }
 
 export interface HumanRequestDeliveryOptions {
@@ -61,11 +75,26 @@ export interface HumanRequestDeliveryOptions {
   batchSize?: number;
   /** Terminal ledger rows older than this are purged (default 35 days). */
   retentionMs?: number;
+  /** A `conversation.ended` still RECEIVED/SENDING for longer than this no
+   *  longer holds the replays (a poison or crash-stuck item must not block
+   *  a conversation forever). Default 10 min (the backend's ENDING timeout). */
+  unfinishedEndMaxMs?: number;
+  /** While HUMAN, at most one pending-deliveries read per conversation in
+   *  this window (default 10 s): a customer typing several messages in a row
+   *  costs one backend call. */
+  humanLookupMinIntervalMs?: number;
+}
+
+/** Live conversation hooks of a plan: see `LivePlan`. */
+interface LiveHooks {
+  after?: LivePlan['after'];
+  replay?: boolean;
+  guard?: LivePlan['guard'];
 }
 
 type Plan =
-  | { action: 'stale'; decision: DeliveryDecision }
-  | {
+  | ({ action: 'stale'; decision: DeliveryDecision } & LiveHooks)
+  | ({
       action: 'send';
       decision: DeliveryDecision;
       senderId: string;
@@ -78,7 +107,20 @@ type Plan =
       /** request.overdue_notice: a HUMAN-mode hold is an immediate STALE
        *  (HUMAN_SESSION), never a local hold. */
       overdue?: boolean;
-    };
+      /** Live notice (greeting, reassignment, farewell, resume): sent while
+       *  the mode is HUMAN, so the HUMAN hold does not apply. */
+      live?: boolean;
+    } & LiveHooks)
+  | ({
+      /** Staff message / template: sent by `deliver` (never mirrored), never
+       *  held by HUMAN mode; see `LivePlan`. */
+      action: 'relay';
+      decision: DeliveryDecision;
+      senderId: string;
+      deliver: () => Promise<SendResult>;
+      dispose?: () => Promise<void>;
+      deferrable: boolean;
+    } & LiveHooks);
 
 /**
  * Handles one feed item locally and owns its outcome ACK (S2–S5,
@@ -96,6 +138,13 @@ export class HumanRequestDeliveryService {
   private readonly stuckSendingMs: number;
   private readonly batchSize: number;
   private readonly retentionMs: number;
+  private readonly unfinishedEndMaxMs: number;
+  private readonly humanLookupMinIntervalMs: number;
+  /** conversationRef → earliest time of the next HUMAN-mode backend read. */
+  private readonly humanLookupAfter = new Map<string, number>();
+  /** Conversations whose unfinished-end hold was already logged (once). */
+  private readonly endHoldLogged = new Set<string>();
+  private readonly endHoldExpiredLogged = new Set<string>();
 
   constructor(
     private readonly ports: HumanRequestDeliveryPorts,
@@ -107,6 +156,8 @@ export class HumanRequestDeliveryService {
     this.stuckSendingMs = options.stuckSendingMs ?? 10 * 60_000;
     this.batchSize = options.batchSize ?? 50;
     this.retentionMs = options.retentionMs ?? LEDGER_RETENTION_MS;
+    this.unfinishedEndMaxMs = options.unfinishedEndMaxMs ?? 10 * 60_000;
+    this.humanLookupMinIntervalMs = options.humanLookupMinIntervalMs ?? 10_000;
   }
 
   /** Feed consumer entry: records the item (or finds it) and handles it.
@@ -133,6 +184,7 @@ export class HumanRequestDeliveryService {
       await this.safely(row.deliveryId, () => this.process(row, 'replay'));
     };
     try {
+      const lookupStartedAt = this.clock();
       const pending = await this.ports.client.listPendingDeliveries({
         conversationRef,
       });
@@ -140,7 +192,7 @@ export class HumanRequestDeliveryService {
         for (const item of pending.items)
           await this.safely(item.deliveryId, async () => {
             const { row } = await this.ports.store.insertDelivery(item);
-            await replay(row);
+            await replay(await this.reopenDeferred(row, item, lookupStartedAt));
           });
       } else {
         this.logger.warn(`pending deliveries rate limited for ${masked}`);
@@ -163,6 +215,142 @@ export class HumanRequestDeliveryService {
         );
       }
     }
+  }
+
+  /**
+   * Live conversation (rule 4, contract "Deferred staff messages"): the
+   * customer wrote while the conversation is HUMAN. The bot says nothing and
+   * releases no held `request.*` row, but a staff message deferred because
+   * the 24 h window was closed is resent now (the customer just reopened
+   * it): the backend's `WINDOW_CLOSED` deferrals (also a message Meta
+   * accepted and later failed with 131047, whose local row is SENT) plus the
+   * local DEFERRED_WINDOW staff messages, in `seq` order, each with a new
+   * attemptId. Cost (S1): one local read, and at most one pending-deliveries
+   * call per conversation per `humanLookupMinIntervalMs`. Never throws.
+   */
+  async onHumanCustomerInbound(conversationRef: string): Promise<void> {
+    if (senderIdFromRef(conversationRef) === null) return;
+    const masked = maskConversationRef(conversationRef);
+    const rows = new Map<string, DeliveryRow>();
+    try {
+      const local = await this.ports.store.listDeferredWindow({
+        conversationRef,
+        limit: this.batchSize,
+      });
+      for (const row of local)
+        if (row.item.type === 'conversation.staff_message')
+          rows.set(row.deliveryId, row);
+    } catch (error) {
+      this.logger.warn(
+        `deferred deliveries read failed for ${masked}: ${describeError(error)}`,
+      );
+    }
+    if (this.humanLookupDue(conversationRef)) {
+      try {
+        const lookupStartedAt = this.clock();
+        const pending = await this.ports.client.listPendingDeliveries({
+          conversationRef,
+        });
+        if (pending.kind === 'ok') {
+          for (const item of pending.items) {
+            if (
+              item.type !== 'conversation.staff_message' ||
+              item.deferredReason !== 'WINDOW_CLOSED'
+            )
+              continue;
+            await this.safely(item.deliveryId, async () => {
+              const { row } = await this.ports.store.insertDelivery(item);
+              rows.set(
+                row.deliveryId,
+                await this.reopenDeferred(row, item, lookupStartedAt),
+              );
+            });
+          }
+        } else {
+          // Not answered: the next inbound asks again.
+          this.humanLookupAfter.delete(conversationRef);
+          this.logger.warn(`pending deliveries rate limited for ${masked}`);
+        }
+      } catch (error) {
+        this.humanLookupAfter.delete(conversationRef);
+        this.logger.warn(
+          `pending deliveries read failed for ${masked}: ${describeError(error)}`,
+        );
+      }
+    }
+    const ordered = [...rows.values()].sort(
+      (a, b) => seqOf(a.item) - seqOf(b.item),
+    );
+    for (const row of ordered)
+      await this.safely(row.deliveryId, () => this.process(row, 'replay'));
+  }
+
+  /** `true` (and arms the throttle) when this conversation's pending
+   *  deliveries may be read now while HUMAN. */
+  private humanLookupDue(conversationRef: string): boolean {
+    const now = this.clock().getTime();
+    const after = this.humanLookupAfter.get(conversationRef);
+    if (after !== undefined && now < after) return false;
+    if (this.humanLookupAfter.size >= 500)
+      for (const [ref, until] of this.humanLookupAfter)
+        if (until <= now) this.humanLookupAfter.delete(ref);
+    this.humanLookupAfter.set(
+      conversationRef,
+      now + this.humanLookupMinIntervalMs,
+    );
+    return true;
+  }
+
+  /**
+   * B2: the backend lists a live staff message as deferred (WINDOW_CLOSED)
+   * although the local row is SENT/UNKNOWN: Meta accepted it and later
+   * failed it with 131047, which the backend turned into a deferral again.
+   * The row moves to DEFERRED_WINDOW (compare-and-set, no ACK owed: the
+   * backend already knows) so the next replay resends it with a new
+   * attemptId. Only a settled ACK counts: a PENDING ACK means the backend
+   * has not heard of the outcome yet (resending would duplicate the message),
+   * and a FAILED_PERMANENT one (409 OUTCOME_ALREADY_RECORDED: "not coming")
+   * stops it for good. Anything else is returned untouched.
+   *
+   * Stale listing guard: the listed item carries no attempt evidence (no
+   * attemptId / attemptedAt), so a listing fetched before another replayer
+   * resent the row and ACKed it would reopen a message that was just resent
+   * (a double send). The row is only reopened when it was last written
+   * strictly before the lookup started: a write at or after that instant
+   * (the resend, its ACK) may already answer the listed deferral, so the
+   * row is left alone and the next lookup, which proves the deferral again
+   * if it still stands, decides.
+   */
+  private async reopenDeferred(
+    row: DeliveryRow,
+    listed: FeedItem,
+    lookupStartedAt: Date,
+  ): Promise<DeliveryRow> {
+    if (
+      listed.type !== 'conversation.staff_message' ||
+      listed.deferredReason !== 'WINDOW_CLOSED' ||
+      (row.localState !== 'SENT' && row.localState !== 'UNKNOWN') ||
+      row.ackState !== 'ACKED'
+    )
+      return row;
+    if (row.updatedAt.getTime() >= lookupStartedAt.getTime()) return row;
+    const next = await this.ports.store.transition(
+      row.deliveryId,
+      { localState: row.localState, attemptId: row.attemptId },
+      {
+        localState: 'DEFERRED_WINDOW',
+        decision: row.decision,
+        attemptId: this.newAttemptId(),
+        attemptedAt: canonicalNow(this.clock),
+        providerMessageId: null,
+        ack: null,
+      },
+    );
+    if (next === null) return row;
+    this.logger.log(
+      `staff message ${row.deliveryId} failed after Meta accepted it (window closed): deferred again`,
+    );
+    return next;
   }
 
   /**
@@ -291,6 +479,46 @@ export class HumanRequestDeliveryService {
     return recovered;
   }
 
+  /**
+   * Rule 6 hold with a bound (L13 a): `true` while a `conversation.ended` of
+   * the conversation is still RECEIVED/SENDING and was written less than
+   * `unfinishedEndMaxMs` ago. An older one (a poison item, a crash leftover)
+   * stops holding, so the conversation's held and deferred rows are never
+   * blocked forever. Applying and expiring the hold are each logged once per
+   * conversation (no phone: masked ref).
+   */
+  private async endHolds(conversationRef: string): Promise<boolean> {
+    const newest =
+      await this.ports.store.newestUnfinishedEndAt(conversationRef);
+    if (newest === null) {
+      this.endHoldLogged.delete(conversationRef);
+      return false;
+    }
+    const masked = maskConversationRef(conversationRef);
+    const minutes = Math.round(this.unfinishedEndMaxMs / 60_000);
+    if (newest.getTime() >= this.clock().getTime() - this.unfinishedEndMaxMs) {
+      if (this.rememberOnce(this.endHoldLogged, conversationRef))
+        this.logger.log(
+          `deliveries of ${masked} wait: a conversation.ended is still being handled (held for at most ${minutes} min)`,
+        );
+      return true;
+    }
+    this.endHoldLogged.delete(conversationRef);
+    if (this.rememberOnce(this.endHoldExpiredLogged, conversationRef))
+      this.logger.warn(
+        `a conversation.ended of ${masked} has been unfinished for over ${minutes} min: it no longer holds the replays`,
+      );
+    return false;
+  }
+
+  /** Adds to a bounded set; `true` when it was not there yet. */
+  private rememberOnce(set: Set<string>, key: string): boolean {
+    if (set.has(key)) return false;
+    if (set.size >= 1000) set.clear();
+    set.add(key);
+    return true;
+  }
+
   /** `true` when the row was (re)decided. */
   private async process(
     row: DeliveryRow,
@@ -298,10 +526,10 @@ export class HumanRequestDeliveryService {
   ): Promise<boolean> {
     switch (row.localState) {
       case 'RECEIVED':
-        return this.run(row);
+        return this.run(row, mode === 'replay');
       case 'HELD_HUMAN':
       case 'DEFERRED_WINDOW':
-        if (mode === 'replay') return this.run(row);
+        if (mode === 'replay') return this.run(row, true);
         break;
       // SENDING: in flight elsewhere or a crash leftover (the sweep decides).
       default:
@@ -311,8 +539,28 @@ export class HumanRequestDeliveryService {
     return false;
   }
 
-  private async run(row: DeliveryRow): Promise<boolean> {
+  private async run(row: DeliveryRow, replay: boolean): Promise<boolean> {
     const plan = await this.plan(row);
+    try {
+      return await this.execute(row, plan, replay);
+    } finally {
+      if (plan.action === 'relay' && plan.dispose !== undefined) {
+        try {
+          await plan.dispose();
+        } catch (error) {
+          this.logger.warn(
+            `delivery ${row.deliveryId} cleanup failed: ${describeError(error)}`,
+          );
+        }
+      }
+    }
+  }
+
+  private async execute(
+    row: DeliveryRow,
+    plan: Plan,
+    replay: boolean,
+  ): Promise<boolean> {
     const expected = { localState: row.localState, attemptId: row.attemptId };
     const attemptedAt = canonicalNow(this.clock);
 
@@ -325,14 +573,30 @@ export class HumanRequestDeliveryService {
         providerMessageId: null,
         ack: 'STALE',
       });
-      if (next !== null) await this.flushAck(next);
+      if (next !== null) {
+        await this.flushAck(next);
+        await this.finishLive(plan, row, {
+          kind: 'NOT_SENT',
+          providerMessageId: null,
+        });
+      }
       return next !== null;
     }
 
-    const hold = await checkHandoffSendHold(this.ports.handoff, plan.senderId);
+    const hold =
+      plan.action === 'relay' || plan.live === true
+        ? ({ hold: false } as const)
+        : await checkHandoffSendHold(this.ports.handoff, plan.senderId);
     if (hold.hold && hold.reason === 'MODE_UNREADABLE')
       throw new Error(`handoff mode unreadable: ${hold.error}`);
-    if (hold.hold && plan.overdue === true) {
+    // Rule 2: a delivery that may not wait (a cancellation notice, an overdue
+    // notice) is never held: the backend refuses its deferral (422) and a
+    // closure notice hours later only annoys, so it is STALE right away.
+    if (
+      hold.hold &&
+      plan.action === 'send' &&
+      (plan.overdue === true || plan.cancellation)
+    ) {
       const next = await this.ports.store.transition(row.deliveryId, expected, {
         localState: 'STALE',
         decision: 'HUMAN_SESSION',
@@ -352,10 +616,58 @@ export class HumanRequestDeliveryService {
         attemptId: this.newAttemptId(),
         attemptedAt,
         providerMessageId: null,
-        ack: plan.cancellation ? null : 'DEFERRED_HUMAN_SESSION',
+        ack: 'DEFERRED_HUMAN_SESSION',
       });
       if (next?.ackState === 'PENDING') await this.flushAck(next);
       return false;
+    }
+
+    // Rule 6 order: a conversation whose `ended` is still being handled is
+    // already BOT, but its farewell may not be out. A replay (the maintenance
+    // sweep, the customer's next message) waits: the row stays as it is and
+    // the ended item's own replay releases it after the farewell.
+    if (
+      replay &&
+      plan.action === 'send' &&
+      plan.live !== true &&
+      row.conversationRef !== null &&
+      (await this.endHolds(row.conversationRef))
+    )
+      return false;
+
+    // T6 (L10 a): live sends re-read the mode/epoch right before the
+    // sender, one local read. The read sits just before the SENDING claim
+    // (a failed read throws with nothing claimed, so the item is retried).
+    if (
+      (plan.action === 'relay' || plan.live === true) &&
+      plan.guard !== undefined
+    ) {
+      const changed = await plan.guard();
+      if (changed !== null) {
+        const next = await this.ports.store.transition(
+          row.deliveryId,
+          expected,
+          {
+            localState: 'STALE',
+            decision: changed,
+            attemptId: this.newAttemptId(),
+            attemptedAt,
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        );
+        this.logger.log(
+          `delivery ${row.deliveryId} ${row.type} not sent: the conversation changed after planning (${changed})`,
+        );
+        if (next !== null) {
+          await this.flushAck(next);
+          await this.finishLive(plan, row, {
+            kind: 'NOT_SENT',
+            providerMessageId: null,
+          });
+        }
+        return next !== null;
+      }
     }
 
     const attemptId = this.newAttemptId();
@@ -377,14 +689,19 @@ export class HumanRequestDeliveryService {
 
     let providerMessageId: string;
     try {
-      ({ providerMessageId } = await this.ports.sender.sendText({
-        to: plan.senderId,
-        text: plan.text,
-        ...(plan.staffReplyId === undefined
-          ? {}
-          : { staffReplyId: plan.staffReplyId }),
-      }));
+      ({ providerMessageId } =
+        plan.action === 'relay'
+          ? await plan.deliver()
+          : await this.ports.sender.sendText({
+              to: plan.senderId,
+              text: plan.text,
+              ...(plan.staffReplyId === undefined
+                ? {}
+                : { staffReplyId: plan.staffReplyId }),
+            }));
     } catch (error) {
+      if (plan.action === 'relay')
+        return this.relayFailed(row, plan, claimed, base, error);
       const windowClosed = isWindowClosedSendError(error);
       if (!windowClosed)
         this.logger.warn(
@@ -404,6 +721,10 @@ export class HumanRequestDeliveryService {
             : { localState: 'DEFERRED_WINDOW', ack: 'DEFERRED_WINDOW_CLOSED' }),
       });
       if (next !== null) await this.flushAck(next);
+      await this.finishLive(plan, row, {
+        kind: windowClosed ? 'NOT_SENT' : 'UNKNOWN',
+        providerMessageId: null,
+      });
       return true;
     }
     const sent = await this.ports.store.transition(row.deliveryId, claimed, {
@@ -417,7 +738,83 @@ export class HumanRequestDeliveryService {
         `delivery ${row.deliveryId} sent (${fingerprintMessageId(providerMessageId)}) but its row moved on`,
       );
     else await this.flushAck(sent);
+    await this.finishLive(plan, row, { kind: 'ACCEPTED', providerMessageId });
     return true;
+  }
+
+  /** A relay (staff message / template) whose send failed: a closed window
+   *  defers a staff message (never a template); a definite non-send (upload
+   *  failure, Meta's synchronous refusal) is STALE / SEND_REFUSED so the
+   *  attendee sees "No enviado"; anything else is DELIVERY_UNKNOWN. Never
+   *  resent by the bot. */
+  private async relayFailed(
+    row: DeliveryRow,
+    plan: Extract<Plan, { action: 'relay' }>,
+    claimed: DeliveryExpectation,
+    base: {
+      decision: DeliveryDecision;
+      attemptId: string;
+      attemptedAt: string;
+    },
+    error: unknown,
+  ): Promise<boolean> {
+    const failure = classifyRelaySendError(error);
+    const deferred = failure === 'WINDOW_CLOSED' && plan.deferrable;
+    const outcome = deferred
+      ? ({
+          localState: 'DEFERRED_WINDOW',
+          ack: 'DEFERRED_WINDOW_CLOSED',
+        } as const)
+      : failure === 'UNCERTAIN'
+        ? ({ localState: 'UNKNOWN', ack: 'DELIVERY_UNKNOWN' } as const)
+        : ({
+            localState: 'STALE',
+            decision: 'SEND_REFUSED',
+            ack: 'STALE',
+          } as const);
+    this.logger.warn(
+      `delivery ${row.deliveryId} ${row.type} send ${deferred ? 'deferred (window closed)' : failure === 'UNCERTAIN' ? 'uncertain' : 'refused'}: ${describeError(error)}`,
+    );
+    const next = await this.ports.store.transition(row.deliveryId, claimed, {
+      ...base,
+      providerMessageId: null,
+      ...outcome,
+    });
+    if (next !== null) await this.flushAck(next);
+    await this.finishLive(plan, row, {
+      kind: outcome.localState === 'UNKNOWN' ? 'UNKNOWN' : 'NOT_SENT',
+      providerMessageId: null,
+    });
+    return true;
+  }
+
+  /** Live conversation tail of a decided item, in contract order: the hook
+   *  (greeting record, session-ack ENDED) and then the replay of what the
+   *  HUMAN session held back. The outcome is already recorded, so a failure
+   *  here is logged and never re-runs the item. Never throws. */
+  private async finishLive(
+    plan: Plan,
+    row: DeliveryRow,
+    result: LiveSendResult,
+  ): Promise<void> {
+    if (plan.after !== undefined) {
+      try {
+        await plan.after(result);
+      } catch (error) {
+        this.logger.warn(
+          `delivery ${row.deliveryId} live follow-up failed: ${describeError(error)}`,
+        );
+      }
+    }
+    if (plan.replay === true && row.conversationRef !== null) {
+      try {
+        await this.onCustomerInbound(row.conversationRef);
+      } catch (error) {
+        this.logger.warn(
+          `delivery ${row.deliveryId} held deliveries replay failed: ${describeError(error)}`,
+        );
+      }
+    }
   }
 
   private async plan(row: DeliveryRow): Promise<Plan> {
@@ -432,6 +829,22 @@ export class HumanRequestDeliveryService {
       }
       this.logger.warn(
         `feed item ${row.deliveryId} of unknown type ${sanitizeErrorText(item.rawType)}: STALE`,
+      );
+      return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+    }
+
+    if (isLiveConversationItem(item)) {
+      if (this.ports.live !== undefined) {
+        const live = await this.ports.live.plan(row, item);
+        return live.action === 'send'
+          ? { ...live, cancellation: true, live: true }
+          : live;
+      }
+      // Without a handler wired, live items behave exactly as before the
+      // parser knew them (unknown type: nothing sent, ACK STALE), which is
+      // safe for a claim: the backend reverts it after the start timeout.
+      this.logger.warn(
+        `feed item ${row.deliveryId} of live conversation type ${item.type} has no handler wired: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }
@@ -624,6 +1037,12 @@ export class HumanRequestDeliveryService {
     }
   }
 }
+
+/** `seq` of a live staff message (ordering key; others sort last). */
+const seqOf = (item: FeedItem): number =>
+  item.type === 'conversation.staff_message'
+    ? item.payload.seq
+    : Number.MAX_SAFE_INTEGER;
 
 const describe = (error: unknown): string =>
   error instanceof Error ? `${error.name}: ${error.message}` : String(error);

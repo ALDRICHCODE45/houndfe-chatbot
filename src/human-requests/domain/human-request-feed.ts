@@ -51,7 +51,36 @@ export type DeliveryDecision =
    *  request CANCELLED or RESOLVED (4700). */
   | 'REQUEST_CLOSED'
   /** A feed item that kept failing locally and was given up (poison item). */
-  | 'LOCAL_FAILURE';
+  | 'LOCAL_FAILURE'
+  // ---- live conversation (unit 11, migration 4900) ----
+  /** conversation.started: durable HUMAN taken, session-ack STARTED sent;
+   *  the ACK outcome says whether the greeting went out. */
+  | 'SESSION_STARTED'
+  /** conversation.ended START_TIMEOUT: back to BOT, nothing sent (STALE). */
+  | 'SESSION_REVERTED'
+  /** conversation.ended applied without a farewell (farewell false, window
+   *  closed, or a reconcile): durable BOT, ACK STALE. */
+  | 'SESSION_ENDED'
+  /** conversation.ended: the farewell was sent. */
+  | 'FAREWELL'
+  /** conversation.ended START_TIMEOUT: the resume notice was sent. */
+  | 'RESUME_NOTICE'
+  /** conversation.reassigned: the "Ahora le atiende ..." notice was sent. */
+  | 'REASSIGNED_NOTICE'
+  /** conversation.staff_message relayed to the customer. */
+  | 'STAFF_MESSAGE'
+  /** template.requested: the approved template was sent. */
+  | 'TEMPLATE_SENT'
+  /** A live item of an epoch that is not the conversation's current HUMAN
+   *  epoch (or a 409 STALE_EPOCH on the session-ack): STALE. */
+  | 'STALE_EPOCH'
+  /** Same epoch but the session is over (mode BOT): not sent, STALE. */
+  | 'SESSION_NOT_ACTIVE'
+  /** conversation.staff_message media: GET /media/:id answered 404 (STALE). */
+  | 'MEDIA_NOT_FOUND'
+  /** A live message Meta refused synchronously (definite, nothing sent):
+   *  STALE. Never used for an uncertain send (that is UNKNOWN). */
+  | 'SEND_REFUSED';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 
@@ -65,6 +94,11 @@ export interface DeliveryRow {
   requestId: string | null;
   conversationRef: string | null;
   item: FeedItem;
+  /** Dedupe key of a staff message / template (`payload.messageId`), stored
+   *  with the row before any Meta call and kept when the payload is purged.
+   *  `null`: other items, or a duplicate of a messageId another delivery
+   *  already owns (see `duplicateOf` of `insertDelivery`). */
+  messageId: string | null;
   localState: DeliveryLocalState;
   decision: DeliveryDecision | null;
   attemptId: string | null;
@@ -123,6 +157,21 @@ export interface OpenHumanRequestInput {
   legacyId?: string | null;
 }
 
+export interface InsertDeliveryResult {
+  row: DeliveryRow;
+  inserted: boolean;
+  /** deliveryId owning the item's `messageId`, when it is not this one. */
+  duplicateOf?: string;
+}
+
+/** The `messageId` dedupe key of a feed item (staff message, template). */
+export function messageIdOf(item: FeedItem): string | null {
+  return item.type === 'conversation.staff_message' ||
+    item.type === 'template.requested'
+    ? item.payload.messageId
+    : null;
+}
+
 /** Durable state of the feed consumer. Every write is a single atomic
  *  statement; ledger transitions are compare-and-set so two actors (the
  *  consumer, a replay, the sweeper) never both claim one send. */
@@ -137,10 +186,15 @@ export interface HumanRequestFeedStore {
   readSyncedAt(): Promise<string | null>;
 
   /** Inserts the item as RECEIVED unless its `deliveryId` exists; returns the
-   *  stored row either way (an existing row is never overwritten). */
-  insertDelivery(
-    item: FeedItem,
-  ): Promise<{ row: DeliveryRow; inserted: boolean }>;
+   *  stored row either way (an existing row is never overwritten).
+   *
+   *  A staff message / template also de-duplicates by `messageId`: when
+   *  another delivery already owns that messageId the item is still stored
+   *  (it needs its own ACK; `messageId` null on the row) and the owner's
+   *  deliveryId is reported in `duplicateOf` (only on that first insert; a
+   *  replay of the duplicate's deliveryId is a plain `inserted: false`).
+   *  The caller must not send a `duplicateOf` item. */
+  insertDelivery(item: FeedItem): Promise<InsertDeliveryResult>;
   getDelivery(deliveryId: string): Promise<DeliveryRow | null>;
   /** `null` when the row moved on (another actor won). */
   transition(
@@ -177,6 +231,15 @@ export interface HumanRequestFeedStore {
   ): Promise<{ deleted: number; scrubbed: number }>;
   /** SENDING rows whose attempt started before `before` (crash leftovers). */
   listStuckSending(before: Date, limit: number): Promise<DeliveryRow[]>;
+  /** T6 (rule 6 order): the newest write time (`updated_at`) among this
+   *  conversation's `conversation.ended` rows that are still being handled
+   *  (RECEIVED or SENDING), or `null` when none is. One bounded query: a
+   *  `conversation.ended` is still unfinished (its durable BOT is already
+   *  set, but its farewell may not be out), so no held or deferred delivery
+   *  may be released before it is decided, unless the caller finds it too
+   *  old to count (a poison or crash-stuck ended must not hold a
+   *  conversation forever). */
+  newestUnfinishedEndAt(conversationRef: string): Promise<Date | null>;
 
   /** Idempotent: an existing request row is left as is. */
   recordOpenRequest(input: OpenHumanRequestInput): Promise<void>;
@@ -206,6 +269,35 @@ export const CANCEL_NOTICE =
 /** request.overdue_notice: told once; the request stays open. */
 export const OVERDUE_NOTICE =
   'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.';
+
+// Live conversation (unit 11) customer notices, S5 (owner-approved usted
+// copy; the tú variants are curated pairs in `customer-style.ts`). `{nombre}`
+// is replaced AFTER styling, so the staff name is never rewritten.
+export const LIVE_NAME_PLACEHOLDER = '{nombre}';
+export const LIVE_GREETING = 'Le atiende {nombre} del equipo HoundFe.';
+export const LIVE_GREETING_NO_NAME =
+  'Le atiende una persona del equipo HoundFe.';
+export const LIVE_REASSIGNED = 'Ahora le atiende {nombre}, del equipo HoundFe.';
+export const LIVE_REASSIGNED_NO_NAME =
+  'Ahora le atiende otra persona del equipo HoundFe.';
+export const LIVE_FAREWELL =
+  'Listo, terminó la atención con el equipo. Si necesita algo más, aquí sigo para ayudarle.';
+export const LIVE_RESUME = 'Seguimos por aquí, ¿en qué le ayudo?';
+
+/** A live notice in the customer's style; `name` null/blank → `noName`. */
+export function liveNotice(
+  withName: string,
+  noName: string,
+  name: string | null,
+  style: CustomerStyle | null,
+): string {
+  const trimmed = name?.trim() ?? '';
+  if (trimmed === '') return styleFixedCopy(noName, style);
+  return styleFixedCopy(withName, style).replace(
+    LIVE_NAME_PLACEHOLDER,
+    () => trimmed,
+  );
+}
 
 /** Fixed usted copy in the customer's stored style (usted when unknown);
  *  the tú variants are whole-sentence curated pairs in `customer-style.ts`. */
@@ -270,6 +362,42 @@ export function isWindowClosedSendError(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false;
   const code = (error as { graphErrorCode?: unknown }).graphErrorCode;
   return Number(code) === META_WINDOW_CLOSED_CODE;
+}
+
+/** What a failed live relay send (staff message / template) means. */
+export type RelaySendFailure =
+  /** 131047 on the send: the 24 h window is closed (nothing sent). */
+  | 'WINDOW_CLOSED'
+  /** Definite non-send: the upload failed, Meta refused the request
+   *  synchronously (4xx) or the sender rejected it locally. */
+  | 'REFUSED'
+  /** The send request may or may not have reached Meta. */
+  | 'UNCERTAIN';
+
+/**
+ * Classifies a sender error by its shape (`WhatsappSendError`:
+ * `status`, `graphErrorCode`, `stage`; `UnsupportedOutboundError` and
+ * `InvalidOutboundTemplateError` are local rejections before any request).
+ * Uncertain is the default: a send is never assumed not to have happened
+ * without evidence (an upload-stage failure, a 4xx answer, a local check).
+ */
+export function classifyRelaySendError(error: unknown): RelaySendFailure {
+  if (typeof error !== 'object' || error === null) return 'UNCERTAIN';
+  const { name, stage, status } = error as {
+    name?: unknown;
+    stage?: unknown;
+    status?: unknown;
+  };
+  if (name === 'UnsupportedOutboundError') return 'REFUSED';
+  if (name === 'InvalidOutboundTemplateError') return 'REFUSED';
+  if (name !== 'WhatsappSendError') return 'UNCERTAIN';
+  // Nothing reached the customer, whatever the status (even a 5xx or none).
+  if (stage === 'upload') return 'REFUSED';
+  if (isWindowClosedSendError(error)) return 'WINDOW_CLOSED';
+  // 408 is a timeout: Meta may still have accepted the message.
+  if (typeof status === 'number' && status >= 400 && status < 500)
+    return status === 408 ? 'UNCERTAIN' : 'REFUSED';
+  return 'UNCERTAIN';
 }
 
 // ---------------------------------------------------------------- ACK

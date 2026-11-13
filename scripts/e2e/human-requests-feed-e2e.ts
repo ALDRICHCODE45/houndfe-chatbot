@@ -9,30 +9,42 @@
  * (`GET /chatbot-api/requests?status=open`, every page) and prints a masked
  * summary: no ACK, no write. `--phase clarification` (unit 10 T2) consumes a
  * staff clarification reply for a request created earlier and drives the
- * real transcript + mirror stack: see `runClarification`. See
- * scripts/e2e/README.md. */
+ * real transcript + mirror stack: see `runClarification`. `--phase
+ * live-create` / `--phase live` (unit 11 T9) create a TALK_TO_HUMAN request
+ * and consume a whole live conversation (started → staff messages →
+ * ended) through the real silence-protocol stack: see `runLiveCreate` /
+ * `runLive`. See scripts/e2e/README.md. */
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { writeSync } from 'node:fs';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import axios, { type AxiosError, type AxiosResponse } from 'axios';
-import { of } from 'rxjs';
+import { defer, of } from 'rxjs';
 import { ChatbotApiHttpClient } from '../../src/chatbot-api/infrastructure/chatbot-api-http.client';
 import { ChatbotApiError } from '../../src/chatbot-api/domain/errors';
 import type {
   CreateHumanRequestInput,
   FeedItem,
+  HumanRequestCreated,
   OpenHumanRequest,
   ReadFeedResult,
   RecordDeliveryOutcomeResult,
 } from '../../src/chatbot-api/domain/dtos/human-requests.dto';
 import { HumanRequestDeliveryService } from '../../src/human-requests/application/human-request-delivery.service';
 import { HumanRequestFeedConsumer } from '../../src/human-requests/application/human-request-feed.consumer';
+import { HumanRequestCreateService } from '../../src/human-requests/application/human-request-create.service';
+import { LiveConversationService } from '../../src/human-requests/application/live-conversation.service';
 import {
+  LIVE_FAREWELL,
   maskConversationRef,
+  styleFixedCopy,
   type FeedConsumerLock,
 } from '../../src/human-requests/domain/human-request-feed';
+import type { LiveConversationClient } from '../../src/chatbot-api/domain/live-conversation.port';
+import { HandoffModeService } from '../../src/conversation/application/handoff-mode.service';
+import { InMemoryConversationStore } from '../../src/conversation/infrastructure/in-memory-conversation.store';
+import type { OutboundTranscriptRecorder } from '../../src/conversation-transcript/application/transcript-recorder';
 import { BackendOutboxDrainWorker } from '../../src/backend-outbox/application/backend-outbox-drain.worker';
 import { BackendOutboxService } from '../../src/backend-outbox/application/backend-outbox.service';
 import { InMemoryBackendOutboxStore } from '../../src/backend-outbox/infrastructure/in-memory-backend-outbox.store';
@@ -61,7 +73,14 @@ const TOKEN_FILE = '/tmp/houndfe-dev-bot-token.txt';
 const TAIL_PAGE_LIMIT = 50;
 const MAX_CONSECUTIVE_FAILURES = 5;
 
-type Phase = 'create' | 'consume' | 'all' | 'recovery' | 'clarification';
+type Phase =
+  | 'create'
+  | 'consume'
+  | 'all'
+  | 'recovery'
+  | 'clarification'
+  | 'live'
+  | 'live-create';
 
 interface Args {
   phase: Phase;
@@ -72,11 +91,13 @@ interface Args {
   withRestock: string | null;
   requests: string[];
   updatedSince: string | null;
+  /** `--phase live`: the window stub answers "closed". */
+  windowClosed: boolean;
 }
 
 function usage(message: string): never {
   process.stderr.write(
-    `${message}\nusage: human-requests-feed-e2e [--phase create|consume|all|recovery|clarification] [--phone 5550001111] [--minutes 15] [--after <cursor>] [--with-restock <productId>] [--request <requestId>]... [--updated-since <ISO ms Z>]\n`,
+    `${message}\nusage: human-requests-feed-e2e [--phase create|consume|all|recovery|clarification|live|live-create] [--phone 5550001111] [--minutes 15] [--after <cursor>] [--with-restock <productId>] [--request <requestId>]... [--updated-since <ISO ms Z>] [--window-closed]\n`,
   );
   process.exit(2);
 }
@@ -91,10 +112,15 @@ function parseArgs(argv: string[]): Args {
     withRestock: null,
     requests: [],
     updatedSince: null,
+    windowClosed: false,
   };
   const rest = argv.filter((arg) => arg !== '--');
   for (let i = 0; i < rest.length; i += 1) {
     const flag = rest[i];
+    if (flag === '--window-closed') {
+      args.windowClosed = true;
+      continue;
+    }
     const value = rest[i + 1];
     if (value === undefined || value.startsWith('--'))
       usage(`missing value for ${flag}`);
@@ -106,7 +132,9 @@ function parseArgs(argv: string[]): Args {
           value !== 'consume' &&
           value !== 'all' &&
           value !== 'recovery' &&
-          value !== 'clarification'
+          value !== 'clarification' &&
+          value !== 'live' &&
+          value !== 'live-create'
         )
           usage(`invalid --phase ${value}`);
         args.phase = value;
@@ -142,6 +170,13 @@ function parseArgs(argv: string[]): Args {
       usage('--phase clarification needs exactly one --request <id>');
     if (!args.minutesGiven) args.minutes = 10;
   }
+  if (args.phase === 'live') {
+    if (args.requests.length !== 1)
+      usage('--phase live needs exactly one --request <id>');
+    if (!args.minutesGiven) args.minutes = 10;
+  }
+  if (args.windowClosed && args.phase !== 'live')
+    usage('--window-closed is only for --phase live');
   return args;
 }
 
@@ -223,6 +258,14 @@ async function main(): Promise<void> {
 
   if (args.phase === 'clarification') {
     await runClarification(args, serviceKey);
+    return;
+  }
+  if (args.phase === 'live-create') {
+    await runLiveCreate(args, serviceKey);
+    return;
+  }
+  if (args.phase === 'live') {
+    await runLive(args, serviceKey);
     return;
   }
 
@@ -529,6 +572,9 @@ async function consume(
   start: string | null,
   watched: Set<string>,
   ackResults: Map<string, RecordDeliveryOutcomeResult | string>,
+  /** `--phase live` only: another stop condition and a filter for the items
+   *  of other conversations (never handled, never ACKed). */
+  liveMode?: { done: () => boolean; skip: (item: FeedItem) => boolean },
 ): Promise<void> {
   await store.saveCursor(start);
   let cursorExpired = false;
@@ -548,6 +594,7 @@ async function consume(
     },
     delivery: {
       accept: async (item: FeedItem) => {
+        if (liveMode?.skip(item) === true) return;
         await delivery.accept(item);
         await report(item);
       },
@@ -590,8 +637,10 @@ async function consume(
   });
 
   const deadline = Date.now() + args.minutes * 60_000;
-  const done = () =>
-    watched.size > 0 && [...watched].every((id) => handledRequests.has(id));
+  const done =
+    liveMode?.done ??
+    (() =>
+      watched.size > 0 && [...watched].every((id) => handledRequests.has(id)));
   line('consume', 'start', { after: start, watched: [...watched] });
   let failures = 0;
   while (!interrupted && !done() && Date.now() < deadline) {
@@ -981,6 +1030,881 @@ async function runClarification(args: Args, serviceKey: string): Promise<void> {
     problems,
   });
   if (problems.length > 0) process.exitCode = 1;
+}
+
+/* ======================================================================
+ * --phase live-create / --phase live (unit 11 T9): the silence protocol
+ * ====================================================================== */
+
+const SESSION_ACK_URL = /\/chatbot-api\/conversations\/[^/]+\/session-ack$/;
+const MEDIA_DOWNLOAD_URL = /\/chatbot-api\/media\/([^/?]+)$/;
+
+/** `--phase live-create`: a TALK_TO_HUMAN request through the REAL create
+ *  path (`HumanRequestCreateService.requestTalkToHuman` → the real client),
+ *  then the feed tail, so the parent can claim it and `--phase live` can
+ *  start right after that cursor. WRITES a request on the dev backend. */
+async function runLiveCreate(args: Args, serviceKey: string): Promise<void> {
+  const conversationRef = `wa:521${args.phone}`;
+  const client = new ChatbotApiHttpClient(
+    new HttpService(axios.create()),
+    new ConfigService({
+      chatbotApi: { baseUrl: BASE_URL, serviceKey, branchId: BRANCH_ID },
+    }),
+  );
+  line('config', 'ok', {
+    phase: 'live-create',
+    baseUrl: BASE_URL,
+    branchId: BRANCH_ID,
+    conversation: maskConversationRef(conversationRef),
+  });
+
+  // The create answer carries the folio, which the outcome type does not.
+  const captured: { response: HumanRequestCreated | null } = { response: null };
+  const sends: string[] = [];
+  const create = new HumanRequestCreateService({
+    client: {
+      createHumanRequest: async (input) => {
+        const result = await client.createHumanRequest(input);
+        if (result.kind === 'ok') captured.response = result.response;
+        return result;
+      },
+      cancelHumanRequest: (...rest) => client.cancelHumanRequest(...rest),
+    },
+    store: new InMemoryHumanRequestFeedStore(),
+    outbox: new BackendOutboxService(new InMemoryBackendOutboxStore()),
+    sender: {
+      sendText: (message: OutboundText) => {
+        sends.push(message.text);
+        return Promise.resolve({
+          providerMessageId: `wamid.e2e-live-create-${sends.length}`,
+        });
+      },
+    },
+    handoff: { isHumanMode: () => Promise.resolve(false) },
+    isWindowOpen: () => Promise.resolve(true),
+  });
+
+  const outcome = await create.requestTalkToHuman({
+    senderId: `521${args.phone}`,
+    text: 'E2E unit 11: quiero hablar con una persona',
+  });
+  const response = captured.response;
+  if (outcome.kind !== 'registered' || response === null) {
+    line('live-create', 'FAILED', { outcome });
+    process.exitCode = 1;
+    return;
+  }
+  const cursor = await readTail(client);
+  line('live-create', 'ok', {
+    requestId: outcome.requestId,
+    folio: response.folio,
+    outcome: response.outcome,
+    merged: outcome.merged,
+    mergedIntoId: response.mergedIntoId,
+    requestStatus: response.status,
+    cursor,
+    customerNotifiedByThisRun: sends.length,
+  });
+}
+
+type LiveOrigin = 'BOT' | 'STAFF' | 'TEMPLATE';
+
+/** The feed item being handled when an event happens. */
+interface LiveContext {
+  type: string;
+  epoch: number | null;
+  deliveryId: string;
+}
+
+interface LiveEventBase {
+  seq: number;
+  during: LiveContext | null;
+}
+interface LiveAckEvent extends LiveEventBase {
+  kind: 'ack';
+  epoch: number | null;
+  state: string | null;
+  providerMessageId: string | null;
+  http: number | null;
+}
+interface LiveOutcomeEvent extends LiveEventBase {
+  kind: 'outcome';
+  deliveryId: string;
+  outcome: string | null;
+  http: number | null;
+}
+interface LiveSendEvent extends LiveEventBase {
+  kind: 'send';
+  wamid: string;
+  wireType: string;
+  text: string | null;
+  modeAtSend: string | null;
+  epochAtSend: number | null;
+  /** Set by the transcript recorder wrapper; null = never recorded. */
+  origin: LiveOrigin | null;
+  /** Whether the transcript row is enqueued for the mirror. */
+  mirror: boolean | null;
+}
+type LiveEvent = LiveAckEvent | LiveOutcomeEvent | LiveSendEvent;
+
+interface LiveMirrorMessage {
+  waMessageId: string;
+  direction: string;
+  /** The wire `author`, or the backend default (OUT → BOT). */
+  author: string;
+  authorSent: boolean;
+  type: string;
+  hasStaffReplyId: boolean;
+  text: string | null;
+}
+interface LiveMirrorCall {
+  status: number | null;
+  code: string | null;
+  hint: { mode: unknown; handoffEpoch: unknown } | null;
+  messages: LiveMirrorMessage[];
+}
+
+interface MetaStubPayload {
+  to: string;
+  type: string;
+  text?: { body?: string };
+  image?: { caption?: string };
+  document?: { filename?: string; caption?: string };
+  template?: { name?: string; language?: { code?: string } };
+}
+
+function jsonObject(data: unknown): Record<string, unknown> {
+  let body: unknown = data;
+  if (typeof data === 'string') {
+    try {
+      body = JSON.parse(data);
+    } catch {
+      return {};
+    }
+  }
+  return typeof body === 'object' && body !== null && !Array.isArray(body)
+    ? (body as Record<string, unknown>)
+    : {};
+}
+
+function pick(
+  source: Record<string, unknown>,
+  keys: readonly string[],
+): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const key of keys) if (key in source) picked[key] = source[key];
+  return picked;
+}
+
+function itemEpoch(item: FeedItem): number | null {
+  switch (item.type) {
+    case 'conversation.started':
+    case 'conversation.staff_message':
+    case 'template.requested':
+    case 'conversation.reassigned':
+    case 'conversation.ended':
+      return item.payload.handoffEpoch;
+    default:
+      return null;
+  }
+}
+
+/** What distinguishes the items of a live conversation in the log. */
+function liveDetail(item: FeedItem): Record<string, unknown> {
+  switch (item.type) {
+    case 'conversation.started':
+    case 'conversation.reassigned':
+      return { staffFirstName: item.payload.staffFirstName };
+    case 'conversation.staff_message':
+      return { seq: item.payload.seq, messageType: item.payload.type };
+    case 'template.requested':
+      return {
+        seq: item.payload.seq,
+        templateName: item.payload.templateName,
+        languageCode: item.payload.languageCode,
+      };
+    case 'conversation.ended':
+      return {
+        reason: item.payload.reason,
+        farewell: item.payload.farewell,
+        resumeNotice: item.payload.resumeNotice,
+      };
+    default:
+      return {};
+  }
+}
+
+async function drainBody(body: unknown): Promise<number> {
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    !(Symbol.asyncIterator in body)
+  )
+    return 0;
+  let bytes = 0;
+  for await (const chunk of body as AsyncIterable<Buffer | string>)
+    bytes += chunk.length;
+  return bytes;
+}
+
+/**
+ * `--phase live` (unit 11 T9, S2–S5, S8): consumes a whole live conversation
+ * of ONE request through the REAL production pieces: `HumanRequestFeedConsumer`
+ * (`runOnce`), `HumanRequestDeliveryService`, `LiveConversationService` with
+ * `HandoffModeService` over an in-memory conversation store, the real
+ * `ChatbotApiHttpClient` (feed, session-ack, staff media download, outcome
+ * ACKs, `messages:batch`), the real `MetaWhatsappSender` over a stub transport
+ * (fake wamids and fake Meta media ids: Meta is never called), the real
+ * `TranscriptRecorder` and an in-memory outbox that is drained at the end
+ * through the real mirror delivery.
+ *
+ * Items of OTHER conversations are skipped (never handled or ACKed): a live
+ * item would otherwise session-ack somebody else's session on dev.
+ */
+async function runLive(args: Args, serviceKey: string): Promise<void> {
+  const runId = `${Date.now().toString(36)}${randomUUID().slice(0, 4)}`;
+  const [requestId] = args.requests;
+  const watched = new Set([requestId]);
+  const senderId = `521${args.phone}`;
+  const conversationRef = `wa:${senderId}`;
+  const masked = maskConversationRef(conversationRef);
+
+  /* ---- the ordered event log (every HTTP call and every Meta send) ---- */
+  const events: LiveEvent[] = [];
+  const mirrorCalls: LiveMirrorCall[] = [];
+  let seq = 0;
+  let during: LiveContext | null = null;
+  let lastDownload: {
+    mimeType: string;
+    filename: string;
+    sizeBytes: number;
+    sha256: string;
+  } | null = null;
+
+  const observeHttp = (
+    config: { url?: string; data?: unknown },
+    status: number | null,
+    data: unknown,
+  ) => {
+    const url = config.url ?? '';
+    if (SESSION_ACK_URL.test(url)) {
+      const request = jsonObject(config.data);
+      const answer = jsonObject(data);
+      const event: LiveAckEvent = {
+        kind: 'ack',
+        seq: (seq += 1),
+        during,
+        epoch: typeof request.epoch === 'number' ? request.epoch : null,
+        state: typeof request.state === 'string' ? request.state : null,
+        providerMessageId:
+          typeof request.providerMessageId === 'string'
+            ? request.providerMessageId
+            : null,
+        http: status,
+      };
+      events.push(event);
+      line('live', 'session-ack', {
+        state: event.state,
+        epoch: event.epoch,
+        providerMessageId: event.providerMessageId,
+        http: status,
+        answer: pick(answer, [
+          'epoch',
+          'state',
+          'sessionState',
+          'code',
+          'errorCode',
+          'currentEpoch',
+          'mode',
+        ]),
+        during: during?.type ?? null,
+      });
+    } else if (OUTCOME_URL.test(url)) {
+      const match = OUTCOME_URL.exec(url);
+      const request = jsonObject(config.data);
+      const event: LiveOutcomeEvent = {
+        kind: 'outcome',
+        seq: (seq += 1),
+        during,
+        deliveryId: match === null ? '' : decodeURIComponent(match[1]),
+        outcome: typeof request.outcome === 'string' ? request.outcome : null,
+        http: status,
+      };
+      events.push(event);
+      line('live', 'outcome-ack', {
+        deliveryId: event.deliveryId,
+        outcome: event.outcome,
+        http: status,
+        code: bodyCode(data),
+        during: during?.type ?? null,
+      });
+    } else if (MEDIA_DOWNLOAD_URL.test(url)) {
+      line('live', 'staff media GET', { http: status, during: during?.type });
+    } else if (MESSAGES_ROUTE.test(url)) {
+      const answer = jsonObject(data);
+      mirrorCalls.push({
+        status,
+        code: bodyCode(data),
+        hint:
+          'mode' in answer || 'handoffEpoch' in answer
+            ? { mode: answer.mode, handoffEpoch: answer.handoffEpoch }
+            : null,
+        messages: summarizeLiveMirrorBody(config.data),
+      });
+    }
+  };
+  const http = axios.create();
+  http.interceptors.response.use(
+    (response: AxiosResponse) => {
+      recordAckHttp(response.config.url, {
+        status: response.status,
+        code: null,
+      });
+      observeHttp(response.config, response.status, response.data);
+      return response;
+    },
+    (error: AxiosError) => {
+      recordAckHttp(error.config?.url, {
+        status: error.response?.status ?? null,
+        code: bodyCode(error.response?.data),
+      });
+      observeHttp(
+        error.config ?? {},
+        error.response?.status ?? null,
+        error.response?.data,
+      );
+      return Promise.reject(error);
+    },
+  );
+  const client = new ChatbotApiHttpClient(
+    new HttpService(http),
+    new ConfigService({
+      chatbotApi: { baseUrl: BASE_URL, serviceKey, branchId: BRANCH_ID },
+    }),
+  );
+
+  /* ---- local state: in-memory conversation store behind the real
+   *      HandoffModeService, in-memory feed ledger ---- */
+  const handoff = new HandoffModeService(new InMemoryConversationStore());
+  const feedStore = new InMemoryHumanRequestFeedStore();
+  const modeNow = async () => {
+    try {
+      const state = await handoff.getState(senderId);
+      return { mode: state.mode as string, epoch: state.epoch };
+    } catch {
+      return { mode: null, epoch: null };
+    }
+  };
+
+  /* ---- transcript → in-memory outbox (production recorder), wrapped only
+   *      to learn each send's origin and whether it is enqueued ---- */
+  const outboxStore = new InMemoryBackendOutboxStore();
+  const outbox = new BackendOutboxService(outboxStore);
+  const realRecorder = new TranscriptRecorder(
+    new InMemoryTranscriptStore(),
+    undefined,
+    outbox,
+  );
+  const recorder: OutboundTranscriptRecorder = {
+    recordOutbound: async (entry) => {
+      const send = events.find(
+        (event): event is LiveSendEvent =>
+          event.kind === 'send' && event.wamid === entry.providerMessageId,
+      );
+      const details = entry.details ?? {};
+      const origin: LiveOrigin =
+        entry.author === 'STAFF'
+          ? 'STAFF'
+          : details.origin === 'TEMPLATE'
+            ? 'TEMPLATE'
+            : 'BOT';
+      const mirror = entry.mirror !== false;
+      if (send !== undefined) {
+        send.origin = origin;
+        send.mirror = mirror;
+        const media = entry.media ?? null;
+        line('live', 'would send', {
+          to: `…${senderId.slice(-4)}`,
+          wamid: send.wamid,
+          origin,
+          wouldMirror: mirror,
+          wireType: send.wireType,
+          text: send.text,
+          ...(media === null
+            ? {}
+            : {
+                mimeType: media.mimeType ?? null,
+                sentAs: send.wireType === 'document' ? 'document' : 'image',
+                downloadedSha256: lastDownload?.sha256 ?? null,
+              }),
+          modeAtSend: send.modeAtSend,
+          epochAtSend: send.epochAtSend,
+          during: send.during?.type ?? null,
+        });
+      }
+      await realRecorder.recordOutbound(entry);
+    },
+  };
+
+  /* ---- the real Meta sender over a stub transport ---- */
+  let wamidCounter = 0;
+  let mediaCounter = 0;
+  const transport = new HttpService();
+  (transport as { post: unknown }).post = (url: string, payload: unknown) =>
+    defer(async () => {
+      const reply = (data: unknown) => ({
+        data,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config: {},
+      });
+      if (url.endsWith('/media')) {
+        mediaCounter += 1;
+        const mediaId = `e2e-media-${runId}-${mediaCounter}`;
+        const bytes = await drainBody(payload);
+        line('live', 'meta upload (stub)', {
+          mediaId,
+          multipartBytes: bytes,
+          during: during?.type ?? null,
+        });
+        return reply({ id: mediaId });
+      }
+      const body = payload as MetaStubPayload;
+      wamidCounter += 1;
+      const wamid = `wamid.e2e-${runId}-${wamidCounter}`;
+      const state = await modeNow();
+      const text =
+        body.text?.body ??
+        body.image?.caption ??
+        body.document?.caption ??
+        body.document?.filename ??
+        (body.template === undefined
+          ? null
+          : `template ${body.template.name ?? ''} ${body.template.language?.code ?? ''}`.trim()) ??
+        null;
+      events.push({
+        kind: 'send',
+        seq: (seq += 1),
+        during,
+        wamid,
+        wireType: body.type,
+        text: text ?? null,
+        modeAtSend: state.mode,
+        epochAtSend: state.epoch,
+        origin: null,
+        mirror: null,
+      });
+      return reply({ messages: [{ id: wamid }] });
+    });
+  const sender = new MetaWhatsappSender(
+    transport,
+    new ConfigService({
+      meta: {
+        accessToken: 'e2e-not-a-token',
+        phoneNumberId: 'e2e',
+        graphApiBaseUrl: 'https://meta.invalid/e2e',
+        sandboxRecipientNormalizationEnabled: false,
+      },
+    }),
+    recorder,
+  );
+
+  /* ---- the real client behind LIVE_CONVERSATION_CLIENT, observed ---- */
+  const live: LiveConversationClient = {
+    sessionAck: (ref, input) => client.sessionAck(ref, input),
+    getConversationState: (ref) => client.getConversationState(ref),
+    listHumanConversations: (options) => client.listHumanConversations(options),
+    downloadStaffMedia: async (mediaId, options) => {
+      const result = await client.downloadStaffMedia(mediaId, options);
+      if (result.kind === 'ok') {
+        lastDownload = {
+          mimeType: result.mimeType,
+          filename: result.filename,
+          sizeBytes: result.sizeBytes,
+          sha256: result.sha256,
+        };
+        line('live', 'staff media downloaded', {
+          mediaId,
+          mimeType: result.mimeType,
+          filename: result.filename,
+          sizeBytes: result.sizeBytes,
+          sha256: result.sha256,
+        });
+      } else line('live', 'staff media download failed', { kind: result.kind });
+      return result;
+    },
+  };
+
+  /* ---- the production service graph (window stub, usted style) ---- */
+  const isWindowOpen = () => Promise.resolve(!args.windowClosed);
+  const customerStyle = () => Promise.resolve(DEFAULT_CUSTOMER_STYLE);
+  const ackResults = new Map<string, RecordDeliveryOutcomeResult | string>();
+  const delivery = new HumanRequestDeliveryService({
+    store: feedStore,
+    client: {
+      recordDeliveryOutcome: async (deliveryId, input) => {
+        try {
+          const result = await client.recordDeliveryOutcome(deliveryId, input);
+          ackResults.set(deliveryId, result);
+          return result;
+        } catch (error) {
+          ackResults.set(
+            deliveryId,
+            error instanceof Error ? error.name : 'error',
+          );
+          throw error;
+        }
+      },
+      listPendingDeliveries: (filter) => client.listPendingDeliveries(filter),
+    },
+    sender,
+    handoff: { isHumanMode: (id: string) => handoff.isHumanMode(id) },
+    isWindowOpen,
+    customerStyle,
+    live: new LiveConversationService({
+      mode: handoff,
+      client: live,
+      sender,
+      isWindowOpen,
+      customerStyle,
+    }),
+  });
+
+  /* ---- observation around each handled item ---- */
+  const handled: Array<{
+    deliveryId: string;
+    type: string;
+    epoch: number | null;
+    decision: string | null;
+  }> = [];
+  let endedHandled = false;
+  let skipped = 0;
+  const isWatched = (item: FeedItem): boolean =>
+    item.type !== 'unknown' &&
+    (item.conversationRef === conversationRef ||
+      (item.conversationRef === null && watched.has(item.requestId)));
+  const observed = {
+    accept: async (item: FeedItem) => {
+      const type =
+        item.type === 'unknown' ? `unknown:${item.rawType}` : item.type;
+      during = { type, epoch: itemEpoch(item), deliveryId: item.deliveryId };
+      lastDownload = null;
+      try {
+        await delivery.accept(item);
+        const row = await feedStore.getDelivery(item.deliveryId);
+        const after = await modeNow();
+        const ack = ackHttp.get(item.deliveryId);
+        line('live', 'item', {
+          cursor: item.cursor,
+          type,
+          epoch: during.epoch,
+          ...liveDetail(item),
+          requestId: item.type === 'unknown' ? null : item.requestId,
+          deliveryId: item.deliveryId,
+          decision: row?.decision ?? null,
+          localState: row?.localState ?? null,
+          ackOutcome: row?.ackOutcome ?? null,
+          ackState: row?.ackState ?? null,
+          ackHttp: ack?.status ?? null,
+          ackCode: ack?.code ?? null,
+          ackResult: renderAckResult(ackResults.get(item.deliveryId)),
+          modeAfter: after.mode,
+          epochAfter: after.epoch,
+        });
+        handled.push({
+          deliveryId: item.deliveryId,
+          type,
+          epoch: during.epoch,
+          decision: row?.decision ?? null,
+        });
+        if (item.type === 'conversation.ended' && watched.has(item.requestId))
+          endedHandled = true;
+      } finally {
+        during = null;
+      }
+    },
+    abandon: (item: FeedItem, reason: Parameters<typeof delivery.abandon>[1]) =>
+      delivery.abandon(item, reason),
+    sweepAcks: () => delivery.sweepAcks(),
+    // SAFETY: `consume` only calls accept / abandon / sweepAcks on the delivery
+    // service; the object above implements exactly those three.
+  } as unknown as HumanRequestDeliveryService;
+
+  line('config', 'ok', {
+    phase: 'live',
+    baseUrl: BASE_URL,
+    branchId: BRANCH_ID,
+    runId,
+    conversation: masked,
+    request: requestId,
+    minutes: args.minutes,
+    windowStub: args.windowClosed ? 'closed' : 'open',
+    sender: 'real MetaWhatsappSender over a stub transport (no Meta call)',
+  });
+
+  let start = args.after;
+  if (start === null) start = await readTail(client);
+  // writeSync: a background log shows the line immediately.
+  writeSync(
+    1,
+    `[consume] listening cursor=${JSON.stringify(start)} request=${JSON.stringify(requestId)}\n`,
+  );
+
+  await consume(args, client, feedStore, observed, start, watched, ackResults, {
+    done: () => endedHandled,
+    skip: (item) => {
+      if (isWatched(item)) return false;
+      skipped += 1;
+      if (skipped <= 20)
+        line('live', 'skipped item of another conversation', {
+          cursor: item.cursor,
+          type: item.type === 'unknown' ? `unknown:${item.rawType}` : item.type,
+          conversation:
+            item.type === 'unknown' || item.conversationRef === null
+              ? null
+              : maskConversationRef(item.conversationRef),
+        });
+      return true;
+    },
+  });
+  if (skipped > 0) line('live', 'skipped items', { count: skipped });
+
+  /* ---- drain the in-memory outbox through the real mirror stack ---- */
+  const gate = new MirrorDeliveryGate();
+  // No inbound media in this run: a Meta download would be a script bug.
+  const meta: MirrorMetaDownloader = {
+    download: () =>
+      Promise.resolve({
+        kind: 'unsupported' as const,
+        reason: 'media_unavailable' as const,
+      }),
+  };
+  const media = new MirrorMediaService({
+    client,
+    meta,
+    links: new LinkMirrorFetcher({ timeoutMs: 20_000 }),
+    cache: new InMemoryMirrorMediaCacheStore(),
+  });
+  const router = new RoutingBackendOutboxDelivery();
+  router.register(
+    ['MESSAGE_MIRROR'],
+    new MirrorMessagesDelivery({ client, media, gate }),
+  );
+  router.register(
+    ['MESSAGE_STATUS'],
+    new MirrorStatusesDelivery({ client, outbox, gate }),
+  );
+  const worker = new BackendOutboxDrainWorker(outboxStore, router, {
+    owner: `e2e-${runId}`,
+  });
+  const enqueued = outboxStore.snapshot();
+  line('outbox', 'enqueued', {
+    rows: enqueued.length,
+    kinds: enqueued.map((row) => row.kind),
+  });
+  const drainDeadline = Date.now() + DRAIN_BOUND_MS;
+  let ticks = 0;
+  while (Date.now() < drainDeadline) {
+    const open = outboxStore
+      .snapshot()
+      .some((row) => row.status === 'PENDING' || row.status === 'IN_FLIGHT');
+    if (!open) break;
+    const claimed = await worker.tick();
+    ticks += 1;
+    if (claimed === 0) await sleep(500);
+  }
+  const rows = outboxStore.snapshot();
+  line('outbox', 'drained', {
+    ticks,
+    states: rows.map((row) => ({
+      kind: row.kind,
+      status: row.status,
+      attempts: row.attempts,
+      lastError: row.lastError?.slice(0, 200) ?? null,
+    })),
+  });
+  for (const call of mirrorCalls)
+    line('mirror', 'messages:batch', {
+      http: call.status,
+      code: call.code,
+      hint: call.hint,
+      messages: call.messages.map((message) => ({
+        waMessageId: message.waMessageId,
+        direction: message.direction,
+        author: message.author,
+        authorSent: message.authorSent,
+        type: message.type,
+        staffReplyIdPresent: message.hasStaffReplyId,
+        text: message.author === 'BOT' ? message.text : null,
+      })),
+    });
+
+  /* ---- the assertions ---- */
+  const problems: string[] = [];
+  const sends = events.filter((e): e is LiveSendEvent => e.kind === 'send');
+  const acks = events.filter((e): e is LiveAckEvent => e.kind === 'ack');
+
+  if (!endedHandled)
+    problems.push('no conversation.ended handled for the request (time bound)');
+  for (const send of sends)
+    if (send.origin === null)
+      problems.push(`send ${send.wamid} was never recorded in the transcript`);
+
+  // 1. The greeting follows a 200 session-ack STARTED of its epoch.
+  for (const send of sends) {
+    if (send.origin !== 'BOT' || send.during?.type !== 'conversation.started')
+      continue;
+    const epoch = send.during.epoch;
+    const prior = acks.filter(
+      (ack) =>
+        ack.state === 'STARTED' && ack.epoch === epoch && ack.seq < send.seq,
+    );
+    const last = prior[prior.length - 1];
+    if (last === undefined)
+      problems.push(
+        `greeting of epoch ${String(epoch)} sent without a prior session-ack STARTED`,
+      );
+    else if (last.http !== 200)
+      problems.push(
+        `greeting of epoch ${String(epoch)} sent after a non-200 session-ack STARTED (${String(last.http)})`,
+      );
+  }
+
+  // 2. Staff messages and templates are never mirrored; every BOT message is.
+  const relayed = sends.filter(
+    (send) => send.origin === 'STAFF' || send.origin === 'TEMPLATE',
+  );
+  const relayedWamids = new Set(relayed.map((send) => send.wamid));
+  const relayedTexts = new Set(
+    relayed.flatMap((send) => (send.text ? [send.text] : [])),
+  );
+  for (const send of relayed)
+    if (send.mirror !== false)
+      problems.push(
+        `${String(send.origin)} message ${send.wamid} was enqueued for the mirror`,
+      );
+  const mirroredBot = new Set<string>();
+  for (const call of mirrorCalls)
+    for (const message of call.messages) {
+      if (relayedWamids.has(message.waMessageId))
+        problems.push(
+          `staff/template message ${message.waMessageId} was mirrored (messages:batch)`,
+        );
+      if (message.text !== null && relayedTexts.has(message.text))
+        problems.push(
+          `a mirrored message carries staff text (${message.waMessageId})`,
+        );
+      if (message.hasStaffReplyId)
+        problems.push(
+          `a mirrored message carries a staffReplyId (${message.waMessageId})`,
+        );
+      if (
+        call.status === 200 &&
+        message.direction === 'OUT' &&
+        message.author === 'BOT'
+      )
+        mirroredBot.add(message.waMessageId);
+    }
+  for (const send of sends)
+    if (send.origin === 'BOT' && !mirroredBot.has(send.wamid))
+      problems.push(
+        `BOT message ${send.wamid} (${send.during?.type ?? 'no item'}) was not mirrored as BOT`,
+      );
+  if (rows.some((row) => row.status !== 'DONE'))
+    problems.push('outbox rows not DONE');
+
+  // 3. A staff message / template is only sent while HUMAN on its epoch.
+  for (const send of relayed) {
+    if (send.modeAtSend !== 'HUMAN')
+      problems.push(
+        `${String(send.origin)} message ${send.wamid} sent while the mode was ${String(send.modeAtSend)}`,
+      );
+    const item = send.during;
+    if (
+      item !== null &&
+      (item.type === 'conversation.staff_message' ||
+        item.type === 'template.requested') &&
+      item.epoch !== send.epochAtSend
+    )
+      problems.push(
+        `${String(send.origin)} message ${send.wamid} of epoch ${String(item.epoch)} sent on epoch ${String(send.epochAtSend)}`,
+      );
+  }
+
+  // 4. The farewell comes before anything replayed (a send or an ACK of
+  //    another delivery) and before the session-ack ENDED.
+  const farewellText = styleFixedCopy(LIVE_FAREWELL, DEFAULT_CUSTOMER_STYLE);
+  for (const item of handled) {
+    if (item.type !== 'conversation.ended' || item.decision !== 'FAREWELL')
+      continue;
+    const inItem = events.filter(
+      (event) => event.during?.deliveryId === item.deliveryId,
+    );
+    const first = inItem.find((e): e is LiveSendEvent => e.kind === 'send');
+    if (
+      first === undefined ||
+      first.origin !== 'BOT' ||
+      first.text !== farewellText
+    ) {
+      problems.push(
+        `the farewell of ${item.deliveryId} was not the first send of its item`,
+      );
+      continue;
+    }
+    const early = inItem.find(
+      (event) =>
+        event.seq < first.seq &&
+        ((event.kind === 'outcome' && event.deliveryId !== item.deliveryId) ||
+          (event.kind === 'ack' && event.state === 'ENDED')),
+    );
+    if (early !== undefined)
+      problems.push(
+        `a replayed ${early.kind} came before the farewell of ${item.deliveryId}`,
+      );
+  }
+
+  line('summary', problems.length === 0 ? 'ok' : 'FAILED', {
+    conversation: masked,
+    items: handled.length,
+    sends: sends.map((send) => ({
+      wamid: send.wamid,
+      origin: send.origin,
+      wouldMirror: send.mirror,
+      during: send.during?.type ?? null,
+    })),
+    sessionAcks: acks.map((ack) => ({
+      state: ack.state,
+      epoch: ack.epoch,
+      http: ack.http,
+    })),
+    problems,
+  });
+  if (problems.length > 0) process.exitCode = 1;
+}
+
+/** The serialized messages:batch body for the live report: keeps the text
+ *  (for the staff-text assertion) but never headers or the conversation ref. */
+function summarizeLiveMirrorBody(data: unknown): LiveMirrorMessage[] {
+  const body = jsonObject(data);
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return [];
+  const text = (value: unknown): string =>
+    typeof value === 'string' ? value : '';
+  return messages.map((raw: unknown) => {
+    const m = jsonObject(raw);
+    const direction = text(m.direction);
+    const author = text(m.author);
+    return {
+      waMessageId: text(m.waMessageId),
+      direction,
+      author: author !== '' ? author : direction === 'OUT' ? 'BOT' : 'CUSTOMER',
+      authorSent: author !== '',
+      type: text(m.type),
+      hasStaffReplyId: text(m.staffReplyId) !== '',
+      text: typeof m.text === 'string' ? m.text : null,
+    };
+  });
 }
 
 main().catch((error: unknown) => {

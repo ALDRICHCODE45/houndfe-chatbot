@@ -7,6 +7,7 @@ import type {
   HandoffApplyResult,
   HandoffState,
   HandoffTransition,
+  HumanHandoffRef,
 } from '../domain/handoff-mode';
 
 /**
@@ -38,20 +39,55 @@ export class HandoffModeService {
     return this.store.getHandoff(senderId);
   }
 
+  /** `silent`: the mute is applied without a greeting (reconcile of a
+   *  missed `started`); a later `started` of this epoch must not greet. */
   applyStarted(
     senderId: string,
     epoch: number,
     requestId: string,
+    options: { silent?: boolean } = {},
   ): Promise<HandoffApplyResult> {
     return this.apply(senderId, {
       mode: 'HUMAN',
       epoch,
       requestId,
+      ...(options.silent === true ? { silent: true } : {}),
     });
   }
 
   applyEnded(senderId: string, epoch: number): Promise<HandoffApplyResult> {
     return this.apply(senderId, { mode: 'BOT', epoch, requestId: null });
+  }
+
+  /**
+   * Live conversation T4: records that the greeting of `epoch` went out (a
+   * START_TIMEOUT resume notice is only sent for a greeting that did).
+   * `false` when the stored epoch is not `epoch`.
+   */
+  async markGreeted(senderId: string, epoch: number): Promise<boolean> {
+    if (this.store.markHandoffGreeted === undefined) {
+      throw new Error('ConversationStore does not support handoff mode');
+    }
+    return this.store.markHandoffGreeted(senderId, epoch);
+  }
+
+  /**
+   * Live conversation T7: claims the safety notice of `epoch` (true only for
+   * the single winner; HUMAN at exactly that epoch).
+   */
+  async claimSafetyNotice(senderId: string, epoch: number): Promise<boolean> {
+    if (this.store.claimHandoffSafetyNotice === undefined) {
+      throw new Error('ConversationStore does not support handoff mode');
+    }
+    return this.store.claimHandoffSafetyNotice(senderId, epoch);
+  }
+
+  /** Live conversation T7: the conversations this bot holds in HUMAN. */
+  async listHuman(limit: number): Promise<HumanHandoffRef[]> {
+    if (this.store.listHumanHandoffs === undefined) {
+      throw new Error('ConversationStore does not support handoff mode');
+    }
+    return this.store.listHumanHandoffs(limit);
   }
 
   private async apply(

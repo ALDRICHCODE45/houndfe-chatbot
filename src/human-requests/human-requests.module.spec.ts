@@ -9,9 +9,19 @@ import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
 import { PG_POOL } from '../database/postgres-pool.provider';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import type { BackendOutboxEntry } from '../backend-outbox/domain/backend-outbox';
+import {
+  OUTBOX_DRAIN_WAKER,
+  type OutboxDrainWaker,
+} from '../backend-outbox/domain/backend-outbox';
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
+import {
+  LIVE_RECONCILE_REF,
+  type LiveReconcileRef,
+} from '../conversation/domain/live-reconcile-ref';
+import { LiveConversationReconcileWorker } from './application/live-conversation-reconcile.worker';
 import { HumanRequestCreateService } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
+import { LiveConversationService } from './application/live-conversation.service';
 import { HUMAN_REQUEST_FEED_STORE } from './domain/human-request-feed';
 import {
   HumanRequestFeedLifecycle,
@@ -97,6 +107,28 @@ describe('HumanRequestsModule', () => {
     await moduleRef.close();
   });
 
+  it('wires the live conversation handler into the delivery service (T4)', async () => {
+    const { pool } = fakePool();
+    const moduleRef = await compile(pool, HumanRequestsServicesModule);
+    const delivery = moduleRef.get(HumanRequestDeliveryService);
+    const ports = (delivery as unknown as { ports: { live: unknown } }).ports;
+    expect(ports.live).toBeInstanceOf(LiveConversationService);
+    await moduleRef.close();
+  });
+
+  it('gives the live conversation handler the WhatsApp sender for staff relays (T5)', async () => {
+    const { pool } = fakePool();
+    const moduleRef = await compile(pool, HumanRequestsServicesModule);
+    const delivery = moduleRef.get(HumanRequestDeliveryService);
+    const live = (
+      delivery as unknown as {
+        ports: { live: { ports: { sender: unknown } } };
+      }
+    ).ports.live;
+    expect(live.ports.sender).toBe(moduleRef.get(WHATSAPP_SENDER));
+    await moduleRef.close();
+  });
+
   it('the services-only module never runs the feed consumer', async () => {
     const { pool } = fakePool();
     const moduleRef = await compile(pool, HumanRequestsServicesModule);
@@ -160,5 +192,125 @@ describe('HumanRequestsModule', () => {
     expect(pool.connect).toHaveBeenCalled();
     await moduleRef.close();
     expect(pool.end).toHaveBeenCalled();
+  });
+
+  describe('outbox drain waker (ordering of bot live notices)', () => {
+    const wakerOf = (moduleRef: Awaited<ReturnType<typeof compile>>) =>
+      moduleRef.get<OutboxDrainWaker & { target?: OutboxDrainWaker }>(
+        OUTBOX_DRAIN_WAKER,
+        { strict: false },
+      );
+
+    it('the waker is provided and injected into the live conversation service', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const waker = wakerOf(moduleRef);
+      const target = { wake: jest.fn() };
+      waker.target = target; // what the drain lifecycle does on bootstrap
+      const delivery: unknown = moduleRef.get(HumanRequestDeliveryService);
+      const live = (
+        delivery as {
+          ports: { live: { ports: { wakeOutbox?: () => void } } };
+        }
+      ).ports.live;
+      expect(typeof live.ports.wakeOutbox).toBe('function');
+      live.ports.wakeOutbox!();
+      expect(target.wake).toHaveBeenCalledTimes(1);
+      await moduleRef.close();
+    });
+
+    it('the feed lifecycle (safety notice) receives the same waker', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      const lifecycle = moduleRef.get(HumanRequestFeedLifecycle);
+      expect(Reflect.get(lifecycle, 'waker')).toBe(wakerOf(moduleRef));
+      await moduleRef.close();
+    });
+
+    it('without a worker bound the injected waker is a harmless no-op', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      expect(() => wakerOf(moduleRef).wake()).not.toThrow();
+      await moduleRef.close();
+    });
+  });
+
+  describe('live conversation reconcile wiring (T6/T7)', () => {
+    const liveOf = (moduleRef: Awaited<ReturnType<typeof compile>>) => {
+      const delivery: unknown = moduleRef.get(HumanRequestDeliveryService);
+      return (
+        delivery as {
+          ports: { live: { ports: { onAckRefused: (ref: string) => void } } };
+        }
+      ).ports.live;
+    };
+    const holderOf = (moduleRef: Awaited<ReturnType<typeof compile>>) =>
+      moduleRef.get<LiveReconcileRef>(LIVE_RECONCILE_REF, { strict: false });
+
+    it('binds the reconcile worker into the shared holder on bootstrap and releases it on shutdown', async () => {
+      const start = jest.spyOn(
+        LiveConversationReconcileWorker.prototype,
+        'start',
+      );
+      const stop = jest.spyOn(
+        LiveConversationReconcileWorker.prototype,
+        'stop',
+      );
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      expect(holderOf(moduleRef).current).toBeUndefined();
+      await moduleRef.init();
+      const holder = holderOf(moduleRef);
+      expect(holder.current).toBeInstanceOf(LiveConversationReconcileWorker);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(stop).not.toHaveBeenCalled();
+      await moduleRef.close();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(holder.current).toBeUndefined();
+    });
+
+    it('runs whatever CONVERSATION_MIRROR_DELIVERY_ENABLED says (unit 11, not unit 9)', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      await moduleRef.init();
+      expect(holderOf(moduleRef).current).toBeInstanceOf(
+        LiveConversationReconcileWorker,
+      );
+      await moduleRef.close();
+    });
+
+    it('a refused session-ack asks the bound worker to reconcile that conversation', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      await moduleRef.init();
+      const worker = holderOf(moduleRef)
+        .current as LiveConversationReconcileWorker;
+      const reconcileOne = jest
+        .spyOn(worker, 'reconcileOne')
+        .mockResolvedValue({ kind: 'in_sync' });
+      const live = liveOf(moduleRef);
+      live.ports.onAckRefused('wa:5215550001111');
+      expect(reconcileOne).toHaveBeenCalledWith('wa:5215550001111');
+      await moduleRef.close();
+      // After shutdown the signal is a no-op, never an error.
+      expect(() => live.ports.onAckRefused('wa:5215550001111')).not.toThrow();
+      expect(reconcileOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('the services-only module never builds the worker', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      await moduleRef.init();
+      expect(holderOf(moduleRef).current).toBeUndefined();
+      await moduleRef.close();
+    });
+
+    it('a signal before the worker exists is a no-op', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const live = liveOf(moduleRef);
+      expect(() => live.ports.onAckRefused('wa:5215550001111')).not.toThrow();
+      await moduleRef.close();
+    });
   });
 });
