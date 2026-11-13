@@ -659,6 +659,63 @@ describe('sale-flow-instructions', () => {
     });
   });
 
+  describe('legacy customerNotified: false (notice not sent; text contract only)', () => {
+    const shape = '`{ ok: true, customerNotified: false }` sin `outcome`';
+    const notSent =
+      'el aviso de revisión NO se envió porque una persona atiende la conversación o no se pudo leer el modo de atención';
+    const noClaim =
+      'NO digas al cliente que su caso fue escalado ni que fue notificado';
+    const carryOn = 'continúa ayudándole con normalidad';
+    const humanGate =
+      'si una persona atiende, el bot ya guarda silencio por su propia compuerta HUMAN';
+
+    it('the requestHumanAssistance tool description covers the not-notified legacy result', () => {
+      const tool = makeRequestHumanAssistanceTool({} as never);
+      for (const fragment of [shape, notSent, noClaim, carryOn, humanGate]) {
+        expect(tool.description).toContain(fragment);
+      }
+    });
+
+    it('step 5 covers the not-notified legacy result after the notified legacy bullet', () => {
+      for (const fragment of [shape, notSent, noClaim, carryOn, humanGate]) {
+        expect(SALE_FLOW_INSTRUCTIONS).toContain(fragment);
+      }
+      const notified = SALE_FLOW_INSTRUCTIONS.indexOf(
+        'Ruta legado (`{ ok: true, customerNotified: true }`)',
+      );
+      const notNotified = SALE_FLOW_INSTRUCTIONS.indexOf(
+        'Ruta legado sin aviso (' + shape + ')',
+      );
+      const restockRoute = SALE_FLOW_INSTRUCTIONS.indexOf('Ruta RESTOCK —');
+      expect(notified).toBeGreaterThan(-1);
+      expect(notNotified).toBeGreaterThan(notified);
+      expect(restockRoute).toBeGreaterThan(notNotified);
+    });
+
+    it('the wait paragraph does not trigger the indefinite wait for the not-notified result', () => {
+      const carveOut = SALE_FLOW_INSTRUCTIONS.indexOf(
+        'Esta espera indefinida aplica SOLO a la ruta legado',
+      );
+      const noWait = SALE_FLOW_INSTRUCTIONS.indexOf(
+        'NO actives esa espera ni la respuesta automática del runner',
+      );
+      expect(carveOut).toBeGreaterThan(-1);
+      expect(noWait).toBeGreaterThan(carveOut);
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'el cliente no fue notificado y no hay nada que esperar de tu parte',
+      );
+    });
+
+    it('does not weaken the notified legacy path or the RESTOCK carve-out', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'confirma al cliente que su caso fue escalado a un agente humano',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Seguimos esperando la respuesta del equipo; le avisamos por aquí en cuanto la tengamos.',
+      );
+    });
+  });
+
   describe('step 13 terminal receipt guidance (WU12, server-owned workflow)', () => {
     function step13(): string {
       const line = SALE_FLOW_INSTRUCTIONS.split('\n').find((l) =>
