@@ -147,10 +147,9 @@ export class InMemoryConversationStore implements ConversationStore {
     }
     this.map.set(senderId, {
       senderId,
-      lastMessageAt:
-        live && Date.parse(live.lastMessageAt) > Date.parse(lastMessageAt)
-          ? live.lastMessageAt
-          : lastMessageAt,
+      // A scheduling write is not a customer message: an existing row keeps
+      // its time (`lastMessageAt` only stamps a row this write creates).
+      lastMessageAt: live ? live.lastMessageAt : lastMessageAt,
       data: { ...live?.data, scheduling: copy },
     });
     return true;

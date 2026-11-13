@@ -66,11 +66,12 @@ export interface SchedulingPolicyPorts {
     | 'adoptKnownAppointment'
     | 'getAppointment'
     | 'markChangeAsked'
+    | 'clearAppointment'
   >;
   /** The unscheduled create, for "no free slot" outcomes. */
   team: Pick<HumanRequestCreateService, 'requestTalkToHuman'>;
   /** The local open-request registry row of a booked request. */
-  registry: Pick<HumanRequestFeedStore, 'recordOpenRequest'>;
+  registry: Pick<HumanRequestFeedStore, 'recordOpenRequest' | 'getRequest'>;
   /** Unit 14 T4: "¿a qué hora quedé?", change and cancel, before the offer
    *  logic. Absent → those messages are not intercepted. */
   appointments?: Pick<AppointmentIntentService, 'handle'>;
@@ -85,10 +86,13 @@ export interface SchedulingPolicyOptions {
 
 /** Transient booking failures: at most this many attempts of the SAME key… */
 const MAX_BOOKING_ATTEMPTS = 3;
-/** …with these pauses, and never more than ~10 s of wall-clock in total
- *  (call latency + pauses): a webhook dispatch is never held longer. */
+/** …with these pauses. The TOTAL wall-clock (call latency + pauses) never
+ *  exceeds RETRY_BUDGET_MS: each attempt gets the remaining budget as its own
+ *  deadline (`timeoutMs`) and none starts below RETRY_FLOOR_MS, so a webhook
+ *  dispatch is never held longer. */
 const BACKOFF_MS = [1_000, 3_000];
 const RETRY_BUDGET_MS = 10_000;
+const RETRY_FLOOR_MS = 1_000;
 /** The write guard rejects more than this many slots in an offer. */
 const MAX_OFFERED = 3;
 /** A second unclear answer drops the offer. */
@@ -435,9 +439,10 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
   }
 
   /**
-   * The same key (a replay is safe) up to 3 times; the elapsed wall-clock
-   * (call latency + pauses + any Retry-After) stays within ~10 s, and a
-   * pause that would exceed it stops at once.
+   * The same key (a replay is safe) up to 3 times. The total elapsed time
+   * (calls + pauses + any Retry-After) is bounded by RETRY_BUDGET_MS: every
+   * call receives the remaining budget as its timeout, and a pause after
+   * which less than RETRY_FLOOR_MS would remain stops at once.
    */
   private async createWithRetry(
     request: NonNullable<ReturnType<typeof buildScheduledRequest>>,
@@ -447,7 +452,12 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
     for (let attempt = 1; attempt <= MAX_BOOKING_ATTEMPTS; attempt += 1) {
       let retryAfterMs = 0;
       try {
-        const result = await this.ports.requests.createHumanRequest(request);
+        const remaining =
+          RETRY_BUDGET_MS - (this.clock().getTime() - startedAt);
+        const result = await this.ports.requests.createHumanRequest({
+          ...request,
+          timeoutMs: remaining,
+        });
         if (result.kind === 'RATE_LIMITED') {
           retryAfterMs = (result.retryAfterSeconds ?? 0) * 1000;
         } else if (result.kind !== 'VERSION_CONFLICT') {
@@ -459,7 +469,7 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
       if (attempt === MAX_BOOKING_ATTEMPTS) break;
       const delay = Math.max(BACKOFF_MS[attempt - 1] ?? 0, retryAfterMs);
       const elapsed = this.clock().getTime() - startedAt;
-      if (elapsed + delay > RETRY_BUDGET_MS) break;
+      if (elapsed + delay + RETRY_FLOOR_MS > RETRY_BUDGET_MS) break;
       await this.sleep(delay);
     }
     this.logger.warn(
@@ -479,7 +489,7 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
     now: Date,
   ): Promise<ReplyOutcome> {
     const { senderId } = context;
-    const appointment = await this.ports.state.getAppointment(senderId);
+    const appointment = await this.openAppointment(senderId);
     if (appointment !== null) {
       await this.dropOffer(senderId);
       await this.recordOpen(senderId, appointment.requestId, offer.subtype);
@@ -504,6 +514,30 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
     };
     await this.ports.state.storeOffer(senderId, fresh);
     return this.book(context, fresh, startsAt, now, false);
+  }
+
+  /** The stored appointment, unless its request is known to be closed
+   *  (CANCELLED / RESOLVED in the local registry): such a stale appointment
+   *  is dropped and never recovered. An unknown or unreadable registry row
+   *  does not disqualify it. */
+  private async openAppointment(senderId: string) {
+    const appointment = await this.ports.state.getAppointment(senderId);
+    if (appointment === null) return null;
+    try {
+      const record = await this.ports.registry.getRequest(
+        appointment.requestId,
+      );
+      if (record === null || record.status === 'OPEN') return appointment;
+    } catch (error) {
+      this.warn('registry status not read', senderId, error);
+      return appointment;
+    }
+    try {
+      await this.ports.state.clearAppointment(senderId, appointment.requestId);
+    } catch (error) {
+      this.warn('stale appointment not dropped', senderId, error);
+    }
+    return null;
   }
 
   /** «¿Quiere cambiarla?» was asked: the next "sí" is the answer. */

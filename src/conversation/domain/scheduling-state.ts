@@ -62,6 +62,19 @@ export interface SchedulingAppointment {
 export interface SchedulingState {
   offer: SchedulingOffer | null;
   appointment: SchedulingAppointment | null;
+  /** Unit 14 F5: customer reschedules in this conversation (cap 3). A sibling
+   *  of offer/appointment, so it survives clearing the appointment, a new
+   *  booking and a recovery. Absent = 0; see `effectiveRescheduleCount`. */
+  rescheduleCount?: number;
+}
+
+/** The reschedules used so far: the conversation count, or the legacy
+ *  per-appointment field when that is larger (older stored documents). */
+export function effectiveRescheduleCount(state: SchedulingState): number {
+  return Math.max(
+    state.rescheduleCount ?? 0,
+    state.appointment?.rescheduleCount ?? 0,
+  );
 }
 
 export const EMPTY_SCHEDULING_STATE: Readonly<SchedulingState> = Object.freeze({
@@ -165,6 +178,9 @@ export function readSchedulingState(raw: unknown): SchedulingState {
   return {
     offer: readOffer(raw.offer),
     appointment: readAppointment(raw.appointment),
+    ...(isCount(raw.rescheduleCount)
+      ? { rescheduleCount: raw.rescheduleCount }
+      : {}),
   };
 }
 
@@ -174,14 +190,19 @@ export function normalizeSchedulingState(
   value: unknown,
 ): SchedulingState | null {
   if (!isRecord(value)) return null;
-  const { offer, appointment } = value;
+  const { offer, appointment, rescheduleCount } = value;
   if (offer === undefined || appointment === undefined) return null;
+  if (rescheduleCount !== undefined && !isCount(rescheduleCount)) return null;
   const normalizedOffer = offer === null ? null : readOffer(offer);
   const normalizedAppointment =
     appointment === null ? null : readAppointment(appointment);
   if (offer !== null && normalizedOffer === null) return null;
   if (appointment !== null && normalizedAppointment === null) return null;
-  return { offer: normalizedOffer, appointment: normalizedAppointment };
+  return {
+    offer: normalizedOffer,
+    appointment: normalizedAppointment,
+    ...(rescheduleCount === undefined ? {} : { rescheduleCount }),
+  };
 }
 
 /** Expired at `offeredAt + OFFER_TTL_MS`; an unparsable instant is expired. */

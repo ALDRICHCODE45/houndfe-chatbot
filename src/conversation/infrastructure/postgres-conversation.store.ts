@@ -367,8 +367,9 @@ export class PostgresConversationStore implements ConversationStore {
       return false;
     }
     const owned = JSON.stringify(copy);
-    const merge = `data = conversation_state.data || jsonb_build_object('scheduling', $3::jsonb),
-      last_message_at = GREATEST(conversation_state.last_message_at, $2::timestamptz)`;
+    // `last_message_at` is NOT touched on an existing row (a scheduling write
+    // is not a customer message); `$2` only stamps a row this write inserts.
+    const merge = `data = conversation_state.data || jsonb_build_object('scheduling', $3::jsonb)`;
     if (expected === undefined) {
       const { rowCount } = await this.pool.query(
         `INSERT INTO conversation_state (sender_id, last_message_at, data)
@@ -387,9 +388,10 @@ export class PostgresConversationStore implements ConversationStore {
     }
     if (typeof current !== 'string') return false;
     const { rowCount } = await this.pool.query(
-      `UPDATE conversation_state SET ${merge}
-       WHERE sender_id = $1 AND conversation_state.data->'scheduling' = $4::jsonb`,
-      [senderId, lastMessageAt, owned, current],
+      `UPDATE conversation_state
+       SET data = conversation_state.data || jsonb_build_object('scheduling', $2::jsonb)
+       WHERE sender_id = $1 AND conversation_state.data->'scheduling' = $3::jsonb`,
+      [senderId, owned, current],
     );
     return (rowCount ?? 0) === 1;
   }

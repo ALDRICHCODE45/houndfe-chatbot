@@ -406,6 +406,29 @@ describe('AppointmentIntentService (T4)', () => {
       expect((await h.state.read(SENDER)).offer).toBeNull();
     });
 
+    it('the cap is per conversation: three used reschedules block a different (re)booked appointment (F5)', async () => {
+      const h = setup();
+      await h.ready;
+      await h.store.commitScheduling(
+        SENDER,
+        (await h.store.getScheduling(SENDER)).raw,
+        {
+          offer: null,
+          appointment: {
+            ...APPOINTMENT,
+            requestId: 'req-88',
+            rescheduleCount: 0,
+          },
+          rescheduleCount: 3,
+        },
+        NOW.toISOString(),
+      );
+      await expect(h.handle('quiero cambiar mi cita')).resolves.toEqual({
+        kind: 'pass',
+      });
+      expect(h.listSlots).not.toHaveBeenCalled();
+    });
+
     it('two reschedules is still allowed', async () => {
       const h = setup({ appointment: { ...APPOINTMENT, rescheduleCount: 2 } });
       const outcome = await h.handle('quiero cambiar mi cita');
@@ -522,6 +545,7 @@ describe('AppointmentIntentService (T4)', () => {
           scheduleVersion: 2,
           rescheduleCount: 1,
         },
+        rescheduleCount: 1,
       });
     });
 
@@ -638,7 +662,7 @@ describe('AppointmentIntentService (T4)', () => {
       });
     });
 
-    it.each([['IDEMPOTENCY_CONFLICT'], ['SCHEDULING_DISABLED']])(
+    it.each([['SCHEDULING_DISABLED']])(
       '%s: the offer is dropped, nothing is promised',
       async (kind) => {
         const h = setup({
@@ -651,6 +675,134 @@ describe('AppointmentIntentService (T4)', () => {
         expect(appointment).toEqual(APPOINTMENT);
       },
     );
+
+    describe('IDEMPOTENCY_CONFLICT after an uncertain send (F2)', () => {
+      const conflict: RescheduleRequestResult = {
+        kind: 'IDEMPOTENCY_CONFLICT',
+      };
+      const route = (
+        scheduledFor: string,
+        scheduleVersion = 2,
+        id = 'req-77',
+      ) =>
+        stateRoute({
+          requestId: id,
+          subtype: 'TALK_TO_HUMAN',
+          scheduledFor,
+          needsReschedule: false,
+          scheduleVersion,
+        });
+      const keys = (h: ReturnType<typeof setup>) =>
+        h.rescheduleRequest.mock.calls.map((call) => call[2]);
+
+      it('the backend already holds the chosen slot: it is stored and answered as rescheduled', async () => {
+        const h = setup({
+          offer: rescheduleOffer(),
+          reschedule: [conflict],
+          route: route(SLOT_2),
+        });
+        await expect(h.handle('2')).resolves.toEqual({
+          kind: 'reply',
+          text: rescheduledText(label(SLOT_2)),
+        });
+        expect(h.rescheduleRequest).toHaveBeenCalledTimes(1);
+        const state = await h.state.read(SENDER);
+        expect(state.offer).toBeNull();
+        expect(state.appointment).toMatchObject({
+          requestId: 'req-77',
+          scheduledFor: SLOT_2,
+          scheduleVersion: 2,
+          rescheduleCount: 1,
+        });
+        expect(state.rescheduleCount).toBe(1);
+      });
+
+      it('the backend holds ANOTHER newer time (an earlier choice committed): stored, answered with the what-time text, offer dropped', async () => {
+        const h = setup({
+          offer: rescheduleOffer(),
+          reschedule: [conflict],
+          route: route(SLOT_3),
+        });
+        await expect(h.handle('1')).resolves.toEqual({
+          kind: 'reply',
+          text: whatTimeText(label(SLOT_3)),
+        });
+        expect(h.rescheduleRequest).toHaveBeenCalledTimes(1);
+        const state = await h.state.read(SENDER);
+        expect(state.offer).toBeNull();
+        expect(state.appointment).toMatchObject({
+          scheduledFor: SLOT_3,
+          scheduleVersion: 2,
+        });
+      });
+
+      it.each([
+        ['no scheduled request', stateRoute(null)],
+        ['another request', route(SLOT_2, 2, 'req-other')],
+        ['nothing newer than the local appointment', route(BOOKED_AT, 1)],
+      ])(
+        '%s: a fresh key is stored first and the choice retried once',
+        async (_name, answer) => {
+          const h = setup({
+            offer: rescheduleOffer(),
+            reschedule: [conflict, rescheduled()],
+            route: answer,
+          });
+          await expect(h.handle('2')).resolves.toEqual({
+            kind: 'reply',
+            text: rescheduledText(label(SLOT_2)),
+          });
+          const [first, second] = keys(h);
+          expect(first).toBe('11111111-1111-4111-8111-111111111111');
+          expect(second).toMatch(UUID);
+          expect(second).not.toBe(first);
+          const state = await h.state.read(SENDER);
+          expect(state.offer).toBeNull();
+          expect(state.appointment).toMatchObject({
+            scheduledFor: SLOT_2,
+            rescheduleCount: 1,
+          });
+        },
+      );
+
+      it('the fresh key is stored BEFORE the retry', async () => {
+        const h = setup({
+          offer: rescheduleOffer(),
+          reschedule: [conflict, new Error('network')],
+          route: stateRoute(null),
+        });
+        await expect(h.handle('2')).resolves.toEqual({ kind: 'pass' });
+        const { offer } = await h.state.read(SENDER);
+        expect(offer?.sourceRequestId).toBe(keys(h)[1]);
+        expect(offer?.sourceRequestId).not.toBe(
+          '11111111-1111-4111-8111-111111111111',
+        );
+        expect(offer?.rescheduleRequestId).toBe('req-77');
+      });
+
+      it('a failing recovery read also rotates the key', async () => {
+        const h = setup({
+          offer: rescheduleOffer(),
+          reschedule: [conflict, rescheduled()],
+        });
+        h.getConversationState.mockRejectedValue(new Error('down'));
+        await expect(h.handle('2')).resolves.toMatchObject({ kind: 'reply' });
+        expect(h.rescheduleRequest).toHaveBeenCalledTimes(2);
+      });
+
+      it('a second conflict on the fresh key drops the offer (the appointment is kept) and the agent answers', async () => {
+        const h = setup({
+          offer: rescheduleOffer(),
+          reschedule: [conflict],
+          route: stateRoute(null),
+        });
+        await expect(h.handle('2')).resolves.toEqual({ kind: 'pass' });
+        expect(h.rescheduleRequest).toHaveBeenCalledTimes(2);
+        const state = await h.state.read(SENDER);
+        expect(state.offer).toBeNull();
+        expect(state.appointment).toEqual(APPOINTMENT);
+      });
+    });
 
     it('a transient failure keeps the offer and its key so the retry reuses it', async () => {
       const h = setup({
@@ -759,12 +911,22 @@ describe('AppointmentIntentService (T4)', () => {
       expect(keys[2]).not.toBe(keys[0]);
     });
 
-    it('"ya no voy a poder" cancels too, and a reschedule offer of that request goes with it', async () => {
+    it('a bare "ya no voy a poder" is ambiguous: no cancel call, the message goes on (F4)', async () => {
+      const h = setup();
+      await expect(h.handle('ya no voy a poder')).resolves.toBeNull();
+      await expect(h.handle('ya no puedo ir')).resolves.toBeNull();
+      expect(h.cancelHumanRequest).not.toHaveBeenCalled();
+      expect((await h.state.read(SENDER)).appointment).not.toBeNull();
+    });
+
+    it('"ya no voy a poder ir a la cita" cancels too, and a reschedule offer of that request goes with it', async () => {
       const h = setup({ offer: rescheduleOffer() });
-      await expect(h.handle('ya no voy a poder')).resolves.toEqual({
-        kind: 'reply',
-        text: cancelledText(),
-      });
+      await expect(h.handle('ya no voy a poder ir a la cita')).resolves.toEqual(
+        {
+          kind: 'reply',
+          text: cancelledText(),
+        },
+      );
       await expect(h.state.read(SENDER)).resolves.toEqual({
         offer: null,
         appointment: null,

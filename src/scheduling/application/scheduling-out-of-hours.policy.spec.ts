@@ -11,6 +11,7 @@ import type {
   RescheduleRequestResult,
 } from '../../chatbot-api/domain/dtos/scheduling.dto';
 import type { GetConversationStateResult } from '../../chatbot-api/domain/dtos/live-conversation.dto';
+import type { HumanRequestFeedStore } from '../../human-requests/domain/human-request-feed';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import {
   OFFER_TTL_MS,
@@ -134,6 +135,8 @@ function setup(
     createLatencyMs?: number;
     reschedule?: RescheduleRequestResult;
     cancel?: CancelHumanRequestResult;
+    /** Registry status per request id (unknown ids have no row). */
+    registryStatus?: Record<string, string>;
   } = {},
 ) {
   const store = new InMemoryConversationStore();
@@ -152,8 +155,12 @@ function setup(
       : Promise.resolve(options.slots ?? slotsOk(THREE)),
   );
   const queue = [...(options.create ?? [booked()])];
-  const createHumanRequest = jest.fn(() => {
-    nowMs += options.createLatencyMs ?? 0;
+  const createHumanRequest = jest.fn((input?: { timeoutMs?: number }) => {
+    // A call never outlives the deadline the policy passes (like the client).
+    nowMs += Math.min(
+      options.createLatencyMs ?? 0,
+      input?.timeoutMs ?? Number.POSITIVE_INFINITY,
+    );
     const next = queue.length > 1 ? queue.shift()! : queue[0];
     return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
   });
@@ -168,6 +175,24 @@ function setup(
     ),
   );
   const recordOpenRequest = jest.fn(() => Promise.resolve());
+  const getRequest = jest.fn((requestId: string) => {
+    const status = options.registryStatus?.[requestId];
+    return Promise.resolve(
+      status === undefined
+        ? null
+        : ({
+            requestId,
+            conversationRef: REF,
+            subtype: 'TALK_TO_HUMAN',
+            legacyId: null,
+            status,
+            createdAt: NOW,
+            updatedAt: NOW,
+          } as unknown as Awaited<
+            ReturnType<HumanRequestFeedStore['getRequest']>
+          >),
+    );
+  });
   const sleep = jest.fn((ms: number) => {
     nowMs += ms;
     return Promise.resolve();
@@ -226,7 +251,7 @@ function setup(
       requests: { createHumanRequest },
       state,
       team: { requestTalkToHuman },
-      registry: { recordOpenRequest },
+      registry: { recordOpenRequest, getRequest },
       appointments,
     },
     {
@@ -244,6 +269,7 @@ function setup(
     createHumanRequest,
     requestTalkToHuman,
     recordOpenRequest,
+    getRequest,
     sleep,
     getConversationState,
     rescheduleRequest,
@@ -466,6 +492,7 @@ describe('SchedulingOutOfHoursPolicy.handleReply (T3: the customer answers the o
       summary: expect.any(String) as string,
       scheduledFor: SLOT_2,
       triggerWaMessageId: 'wamid.CHOICE',
+      timeoutMs: 10_000,
     });
     const body = (
       h.createHumanRequest.mock.calls as unknown as [Record<string, unknown>][]
@@ -721,7 +748,7 @@ describe('SchedulingOutOfHoursPolicy.handleReply (T3: the customer answers the o
       expect(h.sleep).toHaveBeenCalledWith(7000);
     });
 
-    it('a Retry-After beyond the ~30 s budget stops at once: offer kept, pass', async () => {
+    it('a Retry-After beyond the 10 s budget stops at once: offer kept, pass', async () => {
       const h = setup({
         create: [{ kind: 'RATE_LIMITED', retryAfterSeconds: 120 }],
       });
@@ -1121,6 +1148,67 @@ describe('SchedulingOutOfHoursPolicy review advisories (T4 fold-in)', () => {
       ).toBeGreaterThanOrEqual(NOW.getTime());
     });
 
+    describe('a stored appointment whose request is already closed (F5)', () => {
+      const stale = {
+        requestId: 'req-old',
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: SLOT_1,
+        scheduleVersion: 1,
+        timeZone: ZONE,
+        rescheduleCount: 0,
+      };
+      const withStaleAppointment = async (h: ReturnType<typeof setup>) => {
+        const offer = await withOffer(h);
+        const { raw } = await h.store.getScheduling(SENDER);
+        await h.store.commitScheduling(
+          SENDER,
+          raw,
+          { offer, appointment: stale },
+          NOW.toISOString(),
+        );
+        return offer;
+      };
+
+      it.each(['RESOLVED', 'CANCELLED'])(
+        'a %s request is not recovered: the choice is booked under a fresh key',
+        async (status) => {
+          const h = setup({
+            create: [{ kind: 'IDEMPOTENCY_CONFLICT' }, booked({}, SLOT_2)],
+            registryStatus: { 'req-old': status },
+          });
+          const before = await withStaleAppointment(h);
+          await expect(h.policy.handleReply(reply('2'))).resolves.toEqual({
+            kind: 'reply',
+            text: bookedText(label(SLOT_2)),
+          });
+          expect(h.createHumanRequest).toHaveBeenCalledTimes(2);
+          const keys = (
+            h.createHumanRequest.mock.calls as unknown as [
+              { sourceRequestId: string },
+            ][]
+          ).map((call) => call[0].sourceRequestId);
+          expect(keys[1]).not.toBe(before.sourceRequestId);
+          expect((await h.state.read(SENDER)).appointment).toMatchObject({
+            requestId: 'req-77',
+            scheduledFor: SLOT_2,
+          });
+        },
+      );
+
+      it('an OPEN request is still recovered as the appointment', async () => {
+        const h = setup({
+          create: [{ kind: 'IDEMPOTENCY_CONFLICT' }],
+          registryStatus: { 'req-old': 'OPEN' },
+        });
+        await withStaleAppointment(h);
+        await expect(h.policy.handleReply(reply('2'))).resolves.toEqual({
+          kind: 'reply',
+          text: alreadyBookedText(label(SLOT_1)),
+        });
+        expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('nothing committed on the backend: a fresh key is stored and used for the chosen slot', async () => {
       const h = setup({
         create: [
@@ -1185,7 +1273,46 @@ describe('SchedulingOutOfHoursPolicy review advisories (T4 fold-in)', () => {
         kind: 'pass',
       });
       expect(h.createHumanRequest).toHaveBeenCalledTimes(2);
-      expect(h.elapsedMs()).toBeLessThanOrEqual(10_000 + 6_000);
+      // Calls + pauses together stay within the 10 s budget.
+      expect(h.elapsedMs()).toBeLessThanOrEqual(10_000);
+    });
+
+    it('every attempt gets the remaining budget as its deadline (timeoutMs)', async () => {
+      const h = setup({
+        create: [new Error('timeout')],
+        createLatencyMs: 2_000,
+      });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      const deadlines = (
+        h.createHumanRequest.mock.calls as unknown as [{ timeoutMs?: number }][]
+      ).map((call) => call[0].timeoutMs);
+      // 10 s; after 2 s + 1 s pause: 7 s; after 2 s + 1 s + 2 s + 3 s: 2 s.
+      expect(deadlines).toEqual([10_000, 7_000, 2_000]);
+      expect(h.elapsedMs()).toBeLessThanOrEqual(10_000);
+    });
+
+    it('a slow worst case never exceeds the budget in total', async () => {
+      const h = setup({
+        create: [new Error('timeout')],
+        createLatencyMs: 10_000,
+      });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      expect(h.elapsedMs()).toBeLessThanOrEqual(10_000);
+    });
+
+    it('does not start an attempt when the remaining budget is below the floor', async () => {
+      // Attempt 1 uses 8.5 s; the 1 s pause would leave 0.5 s (< 1 s floor).
+      const h = setup({
+        create: [new Error('timeout')],
+        createLatencyMs: 8_500,
+      });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+      expect(h.sleep).not.toHaveBeenCalled();
+      expect(h.elapsedMs()).toBeLessThanOrEqual(10_000);
     });
 
     it('a call that already used the budget gets no pause and no retry', async () => {
@@ -1329,7 +1456,10 @@ describe('SchedulingOutOfHoursPolicy review advisories (T4 fold-in)', () => {
         requests: { createHumanRequest: h.createHumanRequest },
         state: h.state,
         team: { requestTalkToHuman: h.requestTalkToHuman },
-        registry: { recordOpenRequest: h.recordOpenRequest },
+        registry: {
+          recordOpenRequest: h.recordOpenRequest,
+          getRequest: h.getRequest,
+        },
       });
       await expect(bare.handleReply(reply('1'))).resolves.toEqual({
         kind: 'pass',

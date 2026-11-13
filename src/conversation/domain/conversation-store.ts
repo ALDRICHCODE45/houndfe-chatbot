@@ -340,8 +340,9 @@ export interface ConversationStore {
   /**
    * Unit 14 T2: compare-and-set of `data.scheduling`. `expected` is the `raw`
    * of the read (`undefined` = the key must be absent: first contact creates
-   * the row). Replaces only this key; siblings and the newer `lastMessageAt`
-   * are kept. `next` must pass `normalizeSchedulingState` and
+   * the row). Replaces only this key; siblings and an existing row's
+   * `lastMessageAt` are kept (a scheduling write is not a customer message:
+   * `lastMessageAt` only stamps a row this write creates). `next` must pass `normalizeSchedulingState` and
    * `lastMessageAt` must be a valid instant, else `false` with no write.
    * `false` also means "someone else wrote first": re-read, never blind retry.
    */

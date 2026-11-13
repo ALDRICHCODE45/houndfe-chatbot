@@ -4,6 +4,7 @@ import type { LiveConversationClient } from '../../chatbot-api/domain/live-conve
 import { describeError } from '../../common/log-safe';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
 import {
+  effectiveRescheduleCount,
   normalizeSchedulingState,
   type SchedulingAppointment,
   type SchedulingOffer,
@@ -147,7 +148,11 @@ export class SchedulingStateService {
     senderId: string,
     appointment: SchedulingAppointment,
   ): Promise<void> {
-    await this.mutate(senderId, () => ({ offer: null, appointment }));
+    await this.mutate(senderId, (state) => ({
+      ...state,
+      offer: null,
+      appointment,
+    }));
   }
 
   /** Drops the appointment only when it is still `requestId`'s, and with it
@@ -158,6 +163,7 @@ export class SchedulingStateService {
       const dropOffer = state.offer?.rescheduleRequestId === requestId;
       if (!dropAppointment && !dropOffer) return null;
       return {
+        ...state,
         offer: dropOffer ? null : state.offer,
         appointment: dropAppointment ? null : state.appointment,
       };
@@ -229,6 +235,7 @@ export class SchedulingStateService {
     offer: SchedulingOffer,
   ): Promise<void> {
     await this.mutate(senderId, (state) => ({
+      ...state,
       offer,
       appointment:
         state.appointment === null
@@ -254,16 +261,24 @@ export class SchedulingStateService {
           : null;
       const newer =
         base === null || update.scheduleVersion >= base.scheduleVersion;
+      const rescheduleCount =
+        effectiveRescheduleCount(state) + (update.counted ? 1 : 0);
       const next: SchedulingAppointment = {
         requestId: update.requestId,
         subtype: base?.subtype ?? update.subtype,
         scheduledFor: newer ? update.scheduledFor : base.scheduledFor,
         scheduleVersion: newer ? update.scheduleVersion : base.scheduleVersion,
         timeZone: update.timeZone ?? base?.timeZone ?? null,
-        rescheduleCount:
-          (base?.rescheduleCount ?? 0) + (update.counted ? 1 : 0),
+        rescheduleCount,
       };
-      return { offer: null, appointment: next };
+      // The count lives at the conversation level too (F5): it survives
+      // this appointment being cleared or replaced.
+      return {
+        ...state,
+        offer: null,
+        appointment: next,
+        ...(rescheduleCount > 0 ? { rescheduleCount } : {}),
+      };
     });
   }
 
@@ -351,6 +366,14 @@ export class SchedulingStateService {
       this.warn('recovered appointment not stored', senderId, error);
       return recovered;
     }
+  }
+
+  /** One read of the backend's nearest scheduled request, only when it is
+   *  `requestId` (never the local state). Null when none, another request,
+   *  or the backend is unreachable. */
+  async readBackendSchedule(senderId: string, requestId: string) {
+    const summary = await this.readScheduledRequest(senderId);
+    return summary?.requestId === requestId ? summary : null;
   }
 
   private async readScheduledRequest(senderId: string) {

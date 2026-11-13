@@ -54,12 +54,13 @@ const CHANGE = anchored(
   '(?:reagendar|reprogramar)(?: mi cita| la cita)?',
 );
 
+// Every cancel phrasing must NAME the appointment ("cita"): a bare "ya no voy
+// a poder" / "ya no puedo ir" may be about a pickup, an order or a delivery,
+// so it goes to the agent.
 const CANCEL = anchored(
   `(?:(?:${WANT}|voy a) )?(?:cancelar|cancela|cancele|cancelen|anular|anula)(?: me)? (?:mi |la |esa |el )?cita`,
-  'ya no (?:voy a poder|podre|podremos|voy a ir)(?: ir| asistir| atender| hablar| llegar| conectarme)?',
-  'ya no (?:puedo|podemos) (?:ir|asistir|atender|llegar)',
   'ya no (?:quiero|necesito|voy a necesitar) (?:mi |la |esa )?cita',
-  'no voy a poder (?:ir|asistir)(?: a (?:mi|la) cita)?',
+  '(?:ya )?no (?:voy a poder|puedo|podre|podremos|podemos) (?:ir|asistir|llegar|atender) a (?:mi|la|esa) cita',
 );
 
 /** Which appointment intent the whole message is, or null. */

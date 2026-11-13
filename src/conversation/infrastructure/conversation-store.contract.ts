@@ -828,6 +828,29 @@ export function runConversationStoreContract(
         ]);
       });
 
+      it('never bumps lastMessageAt of an existing row (a feed-driven write must not keep stale history alive)', async () => {
+        const OLD = '2026-11-01T00:00:00.000Z';
+        await store.create('sch-7b', {
+          lastMessageAt: OLD,
+          data: { messages: [{ role: 'user', content: 'hola' }] },
+        });
+        await store.commitScheduling!(
+          'sch-7b',
+          undefined,
+          { offer, appointment: null },
+          '2026-12-05T00:00:00.000Z',
+        );
+        expect((await store.get('sch-7b'))!.lastMessageAt).toBe(OLD);
+        const { raw } = await store.getScheduling!('sch-7b');
+        await store.commitScheduling!(
+          'sch-7b',
+          raw,
+          { offer: null, appointment },
+          '2026-12-06T00:00:00.000Z',
+        );
+        expect((await store.get('sch-7b'))!.lastMessageAt).toBe(OLD);
+      });
+
       it('survives update() writes (CAS-owned, never replaced by a stale patch)', async () => {
         await store.commitScheduling!(
           'sch-8',

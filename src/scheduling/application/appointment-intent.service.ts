@@ -5,6 +5,7 @@ import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.c
 import type { SchedulingClient } from '../../chatbot-api/domain/scheduling.port';
 import { describeError } from '../../common/log-safe';
 import {
+  effectiveRescheduleCount,
   isOfferExpired,
   type SchedulingAppointment,
   type SchedulingOffer,
@@ -50,6 +51,7 @@ export interface AppointmentIntentPorts {
     | 'recordCustomerReschedule'
     | 'learnTimeZone'
     | 'clearAppointment'
+    | 'readBackendSchedule'
   >;
   /** The local open-request registry: a cancelled request is closed in it,
    *  like the cancel outbox adapter does. */
@@ -128,13 +130,13 @@ export class AppointmentIntentService {
       return null;
 
     if (intent === 'cancel') return this.cancel(context);
-    if (intent === 'change') return this.startChange(context, now);
+    if (intent === 'change') return this.startChange(context, now, state);
     if (intent === 'what_time') {
       if (questionStored) await this.dropQuestion(senderId);
       return this.whatTime(context, now);
     }
     if (questionFresh && isChangeConfirmation(text))
-      return this.startChange(context, now);
+      return this.startChange(context, now, state);
     if (questionStored) await this.dropQuestion(senderId);
     if (rescheduleOffer !== null)
       return this.chooseSlot(context, rescheduleOffer, appointment, now);
@@ -204,11 +206,17 @@ export class AppointmentIntentService {
   private async startChange(
     context: ReplyContext,
     now: Date,
+    state: SchedulingState,
   ): Promise<ReplyOutcome | null> {
     const { senderId } = context;
     const appointment = await this.ports.state.getAppointment(senderId);
     if (appointment === null) return null;
-    if (appointment.rescheduleCount >= MAX_CUSTOMER_RESCHEDULES) return PASS;
+    // The cap is per conversation (F5), not per appointment.
+    if (
+      Math.max(effectiveRescheduleCount(state), appointment.rescheduleCount) >=
+      MAX_CUSTOMER_RESCHEDULES
+    )
+      return PASS;
     let answer;
     try {
       answer = await this.ports.scheduling.listSlots({
@@ -277,12 +285,28 @@ export class AppointmentIntentService {
       await this.ports.state.bumpUnclear(senderId);
       return { kind: 'reply', text: notUnderstoodText() };
     }
+    return this.reschedule(context, offer, appointment, choice.startsAt, now);
+  }
+
+  /** The reschedule call under the offer's key. An IDEMPOTENCY_CONFLICT (the
+   *  key already holds a call, e.g. one that timed out after committing) gets
+   *  ONE recovery read, then ONE retry under a fresh key. */
+  private async reschedule(
+    context: ReplyContext,
+    offer: SchedulingOffer,
+    appointment: SchedulingAppointment | null,
+    startsAt: string,
+    now: Date,
+    mayRotateKey = true,
+  ): Promise<ReplyOutcome> {
+    const { senderId } = context;
+    const requestId = offer.rescheduleRequestId as string;
     let result;
     try {
       result = await this.ports.scheduling.rescheduleRequest(
         requestId,
         {
-          scheduledFor: choice.startsAt,
+          scheduledFor: startsAt,
           lastCustomerMessageAt: lastCustomerMessageAtFor(
             context.inboundAt,
             now,
@@ -303,6 +327,14 @@ export class AppointmentIntentService {
         return this.onRescheduled(senderId, offer, appointment, result, now);
       case 'SLOT_UNAVAILABLE':
         return this.onSlotTaken(senderId, offer, result, now);
+      case 'IDEMPOTENCY_CONFLICT':
+        if (mayRotateKey)
+          return this.onKeyConflict(context, offer, appointment, startsAt, now);
+        this.logger.error(
+          `reschedule refused (${result.kind}) for ${this.masked(senderId)}`,
+        );
+        await this.ports.state.clearOffer(senderId);
+        return PASS;
       case 'REQUEST_CLOSED':
       case 'NOT_SCHEDULED':
       case 'NOT_FOUND':
@@ -323,6 +355,63 @@ export class AppointmentIntentService {
         await this.ports.state.clearOffer(senderId);
         return PASS;
     }
+  }
+
+  /** Mirrors the booking path: one recovery read of the backend's schedule.
+   *  A newer appointment found is stored (answered as rescheduled when it is
+   *  the chosen slot, else with the what-time text); otherwise the choice is
+   *  retried ONCE under a fresh key, stored first. */
+  private async onKeyConflict(
+    context: ReplyContext,
+    offer: SchedulingOffer,
+    appointment: SchedulingAppointment | null,
+    startsAt: string,
+    now: Date,
+  ): Promise<ReplyOutcome> {
+    const { senderId } = context;
+    const requestId = offer.rescheduleRequestId as string;
+    const found = await this.ports.state.readBackendSchedule(
+      senderId,
+      requestId,
+    );
+    if (found !== null) {
+      const foundMs = Date.parse(found.scheduledFor);
+      const matchesChoice = foundMs === Date.parse(startsAt);
+      const moved =
+        appointment === null ||
+        foundMs !== Date.parse(appointment.scheduledFor) ||
+        (appointment.scheduleVersion !== 0 &&
+          found.scheduleVersion > appointment.scheduleVersion);
+      if (matchesChoice || moved) {
+        try {
+          await this.ports.state.recordCustomerReschedule(senderId, {
+            requestId,
+            subtype: appointment?.subtype ?? found.subtype,
+            scheduledFor: found.scheduledFor,
+            scheduleVersion: found.scheduleVersion,
+            timeZone: offer.timeZone,
+            // The chosen move committed: it counts. Another time is only
+            // learned (whoever moved it was counted when it happened).
+            counted: matchesChoice && moved,
+          });
+        } catch (error) {
+          this.warn('recovered appointment not stored', senderId, error);
+          try {
+            await this.ports.state.clearAppointment(senderId, requestId);
+          } catch (clearError) {
+            this.warn('stale appointment not dropped', senderId, clearError);
+          }
+        }
+        const label = slotLabel(found.scheduledFor, offer.timeZone, now);
+        return {
+          kind: 'reply',
+          text: matchesChoice ? rescheduledText(label) : whatTimeText(label),
+        };
+      }
+    }
+    const fresh: SchedulingOffer = { ...offer, sourceRequestId: this.newKey() };
+    await this.ports.state.storeOffer(senderId, fresh);
+    return this.reschedule(context, fresh, appointment, startsAt, now, false);
   }
 
   private async onRescheduled(

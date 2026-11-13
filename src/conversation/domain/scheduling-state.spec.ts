@@ -1,5 +1,6 @@
 import {
   EMPTY_SCHEDULING_STATE,
+  effectiveRescheduleCount,
   OFFER_TTL_MS,
   isOfferExpired,
   normalizeSchedulingState,
@@ -212,5 +213,49 @@ describe('isOfferExpired', () => {
 
   it('an unparsable offeredAt is expired (fail closed)', () => {
     expect(isOfferExpired({ ...OFFER, offeredAt: 'x' }, now(0))).toBe(true);
+  });
+});
+
+describe('F5: the conversation-level reschedule count', () => {
+  it('round-trips as a sibling of offer and appointment, absent by default', () => {
+    const raw = { offer: null, appointment: APPOINTMENT, rescheduleCount: 2 };
+    expect(readSchedulingState(raw)).toEqual(raw);
+    expect(normalizeSchedulingState(raw)).toEqual(raw);
+    expect(readSchedulingState({ offer: null, appointment: null })).toEqual(
+      EMPTY_SCHEDULING_STATE,
+    );
+    expect(
+      Object.hasOwn(
+        normalizeSchedulingState({ offer: null, appointment: null }) ?? {},
+        'rescheduleCount',
+      ),
+    ).toBe(false);
+  });
+
+  it('a malformed count is ignored by the reader and refused by the write guard', () => {
+    for (const bad of [-1, 1.5, '2', null, NaN]) {
+      const raw = { offer: null, appointment: null, rescheduleCount: bad };
+      expect(readSchedulingState(raw).rescheduleCount).toBeUndefined();
+      expect(normalizeSchedulingState(raw)).toBeNull();
+    }
+  });
+
+  it('the effective count is the larger of the conversation count and the legacy appointment field', () => {
+    const base = { offer: null, appointment: null };
+    expect(effectiveRescheduleCount(base)).toBe(0);
+    expect(effectiveRescheduleCount({ ...base, rescheduleCount: 2 })).toBe(2);
+    expect(
+      effectiveRescheduleCount({
+        ...base,
+        appointment: { ...APPOINTMENT, rescheduleCount: 3 },
+      }),
+    ).toBe(3);
+    expect(
+      effectiveRescheduleCount({
+        ...base,
+        rescheduleCount: 1,
+        appointment: { ...APPOINTMENT, rescheduleCount: 0 },
+      }),
+    ).toBe(1);
   });
 });

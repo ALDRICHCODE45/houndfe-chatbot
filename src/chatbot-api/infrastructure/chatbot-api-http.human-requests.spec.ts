@@ -126,6 +126,24 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       );
     });
 
+    it("uses the caller's timeoutMs as the request timeout and never sends it (F1)", async () => {
+      request.mockReturnValue(of(response(created, 201)));
+      await client.createHumanRequest({ ...createInput, timeoutMs: 3_200 });
+      expect(sent().timeout).toBe(3_200);
+      expect(sent().data).toEqual(createInput);
+      expect(sent().data).not.toHaveProperty('timeoutMs');
+    });
+
+    it('falls back to the default timeout for an absent or invalid timeoutMs', async () => {
+      request.mockReturnValue(of(response(created, 201)));
+      await client.createHumanRequest(createInput);
+      await client.createHumanRequest({ ...createInput, timeoutMs: 0 });
+      await client.createHumanRequest({ ...createInput, timeoutMs: NaN });
+      expect(sent(0).timeout).toBe(10_000);
+      expect(sent(1).timeout).toBe(10_000);
+      expect(sent(2).timeout).toBe(10_000);
+    });
+
     it('keeps the unscheduled answer free of scheduling fields and passes the branch zone through (unit 14)', async () => {
       const withZone = {
         ...created,

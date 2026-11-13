@@ -58,6 +58,9 @@ interface CreateHumanRequestCommon {
   context?: HumanRequestContext;
   dedupKey?: string;
   triggerWaMessageId?: string;
+  /** Transport hint, never sent on the wire: this call's timeout in ms (the
+   *  caller's remaining deadline); absent = the client's default. */
+  timeoutMs?: number;
 }
 
 /** Direct subtypes require the conversation envelope. */

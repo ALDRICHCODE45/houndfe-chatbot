@@ -54,12 +54,14 @@ describe('parseAppointmentIntent (unit 14 T4: conservative, anchored)', () => {
       'quiero cancelar mi cita',
       'cancelar la cita',
       'favor de cancelar mi cita',
-      'ya no voy a poder',
-      'Ya no voy a poder ir',
-      'ya no podré asistir',
+      'ya no voy a poder ir a la cita',
+      'Ya no voy a poder ir a mi cita',
+      'ya no podré asistir a la cita',
+      'ya no puedo ir a la cita',
+      'no voy a poder asistir a mi cita',
       'ya no quiero la cita',
       'ya no necesito mi cita',
-      'hola, ya no voy a poder',
+      'hola, ya no voy a poder ir a la cita',
     ])('%s', (text) => {
       expect(parseAppointmentIntent(text)).toBe('cancel');
     });
@@ -93,6 +95,20 @@ describe('parseAppointmentIntent (unit 14 T4: conservative, anchored)', () => {
       'cambiar',
       'mover',
       'quiero cancelar',
+      // F4: generic phrasings that do not mention the appointment (a pickup,
+      // an order or a delivery may be what the customer cannot attend).
+      'ya no voy a poder',
+      'Ya no voy a poder ir',
+      'ya no puedo ir',
+      'ya no puedo ir a recoger mi pedido',
+      'ya no podré',
+      'ya no podré asistir',
+      'ya no podemos ir',
+      'ya no voy a ir',
+      'no voy a poder ir',
+      'no voy a poder asistir',
+      'hola, ya no voy a poder',
+      'ya no voy a poder pasar por mi pedido',
     ])('%j', (text) => {
       expect(parseAppointmentIntent(text)).toBeNull();
     });

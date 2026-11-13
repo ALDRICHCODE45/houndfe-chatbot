@@ -291,6 +291,7 @@ describe('SchedulingStateService (offer / appointment state)', () => {
           timeZone: 'America/Mexico_City',
           rescheduleCount: 1,
         },
+        rescheduleCount: 1,
       });
     });
 
@@ -561,5 +562,126 @@ describe('SchedulingStateService (offer / appointment state)', () => {
       expect(logged).not.toContain(SENDER);
       log.mockRestore();
     });
+  });
+});
+
+describe('scheduling writes never touch lastMessageAt (F3)', () => {
+  const OLD = '2026-11-01T00:00:00.000Z';
+  const seeded = async () => {
+    const h = setup();
+    await h.store.create(SENDER, {
+      lastMessageAt: OLD,
+      data: { messages: [{ role: 'user', content: 'hola' }] },
+    });
+    return h;
+  };
+  const lastMessageAt = async (h: Awaited<ReturnType<typeof seeded>>) =>
+    (await h.store.get(SENDER))!.lastMessageAt;
+
+  it('offer, booking, staff reschedule and clear leave the stored time alone', async () => {
+    const h = await seeded();
+    await h.service.storeOffer(SENDER, OFFER);
+    expect(await lastMessageAt(h)).toBe(OLD);
+    await h.service.bookAppointment(SENDER, APPOINTMENT);
+    expect(await lastMessageAt(h)).toBe(OLD);
+    await h.service.recordStaffReschedule(SENDER, {
+      requestId: APPOINTMENT.requestId,
+      scheduledFor: '2026-11-14T15:00:00.000Z',
+      scheduleVersion: 2,
+      timeZone: null,
+    });
+    expect(await lastMessageAt(h)).toBe(OLD);
+    await h.service.clearAppointment(SENDER, APPOINTMENT.requestId);
+    expect(await lastMessageAt(h)).toBe(OLD);
+  });
+
+  it('a first-contact write still creates the row with the clock time', async () => {
+    const h = setup();
+    await h.service.storeOffer(SENDER, OFFER);
+    expect(await lastMessageAt(h as never)).toBe(NOW.toISOString());
+  });
+});
+
+describe('the reschedule count is per conversation (F5)', () => {
+  const rescheduleOnce = (
+    h: ReturnType<typeof setup>,
+    patch: Record<string, unknown> = {},
+  ) =>
+    h.service.recordCustomerReschedule(SENDER, {
+      requestId: APPOINTMENT.requestId,
+      subtype: 'TALK_TO_HUMAN',
+      scheduledFor: '2026-11-14T16:00:00.000Z',
+      scheduleVersion: 2,
+      timeZone: 'America/Mexico_City',
+      counted: true,
+      ...patch,
+    });
+
+  it('a customer reschedule counts at the conversation level', async () => {
+    const h = setup();
+    await h.service.bookAppointment(SENDER, APPOINTMENT);
+    await rescheduleOnce(h);
+    expect((await h.service.read(SENDER)).rescheduleCount).toBe(1);
+  });
+
+  it('survives clearing the appointment and booking a new one (cancel and rebook)', async () => {
+    const h = setup();
+    await h.service.bookAppointment(SENDER, APPOINTMENT);
+    await rescheduleOnce(h);
+    await rescheduleOnce(h, { scheduleVersion: 3 });
+    await h.service.clearAppointment(SENDER, APPOINTMENT.requestId);
+    expect((await h.service.read(SENDER)).rescheduleCount).toBe(2);
+    await h.service.bookAppointment(SENDER, {
+      ...APPOINTMENT,
+      requestId: 'req-2',
+      rescheduleCount: 0,
+    });
+    const state = await h.service.read(SENDER);
+    expect(state.rescheduleCount).toBe(2);
+    // The next counted change continues from 2, not from the new request's 0.
+    await rescheduleOnce(h, { requestId: 'req-2', scheduleVersion: 2 });
+    expect((await h.service.read(SENDER)).rescheduleCount).toBe(3);
+  });
+
+  it('survives the offer writes and a recovered appointment', async () => {
+    const h = setup({ ...emptyState, kind: 'ok', scheduledRequest: summary });
+    await h.store.commitScheduling(
+      SENDER,
+      undefined,
+      { offer: null, appointment: null, rescheduleCount: 3 },
+      NOW.toISOString(),
+    );
+    await h.service.storeOffer(SENDER, OFFER);
+    await h.service.clearOffer(SENDER);
+    const recovered = await h.service.getAppointment(SENDER);
+    expect(recovered?.requestId).toBe(summary.requestId);
+    expect(recovered?.rescheduleCount).toBe(0);
+    const state = await h.service.read(SENDER);
+    expect(state.rescheduleCount).toBe(3);
+    await h.service.startReschedule(SENDER, {
+      ...OFFER,
+      rescheduleRequestId: summary.requestId,
+    });
+    await h.service.clearAppointment(SENDER, summary.requestId);
+    expect((await h.service.read(SENDER)).rescheduleCount).toBe(3);
+  });
+
+  it('keeps reading the legacy per-appointment field', async () => {
+    const h = setup();
+    await h.service.bookAppointment(SENDER, {
+      ...APPOINTMENT,
+      rescheduleCount: 2,
+    });
+    await rescheduleOnce(h);
+    const state = await h.service.read(SENDER);
+    expect(state.rescheduleCount).toBe(3);
+    expect(state.appointment?.rescheduleCount).toBe(3);
+  });
+
+  it('UNCHANGED (not counted) leaves the conversation count alone', async () => {
+    const h = setup();
+    await h.service.bookAppointment(SENDER, APPOINTMENT);
+    await rescheduleOnce(h, { counted: false });
+    expect((await h.service.read(SENDER)).rescheduleCount ?? 0).toBe(0);
   });
 });

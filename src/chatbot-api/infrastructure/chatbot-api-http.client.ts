@@ -1198,6 +1198,12 @@ export class ChatbotApiHttpClient
         url: '/chatbot-api/requests',
         data: toCreateHumanRequestBody(input),
         headers: { 'X-Idempotency-Key': input.sourceRequestId },
+        // The caller's remaining deadline, when it gives one.
+        ...(typeof input.timeoutMs === 'number' &&
+        Number.isFinite(input.timeoutMs) &&
+        input.timeoutMs > 0
+          ? { timeout: Math.ceil(input.timeoutMs) }
+          : {}),
       });
     } catch (error) {
       const failure = documentedFailure(error);
