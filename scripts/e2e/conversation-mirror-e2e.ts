@@ -536,7 +536,12 @@ interface DeliveryStack {
   outbox: BackendOutboxService;
   worker: BackendOutboxDrainWorker;
   /** Every mediaId resolution the mirror adapter asked for. */
-  resolved: Array<{ outcome: string; mediaId?: string; from?: string }>;
+  resolved: Array<{
+    outcome: string;
+    mediaId?: string;
+    mimeType?: string;
+    from?: string;
+  }>;
 }
 
 /** The production delivery pieces wired by hand (no Nest app): in-memory
@@ -563,7 +568,12 @@ function buildDeliveryStack(deps: {
       const outcome = await mediaService.resolveMedia(...params);
       resolved.push(
         outcome.kind === 'ok'
-          ? { outcome: 'ok', mediaId: outcome.mediaId, from: outcome.from }
+          ? {
+              outcome: 'ok',
+              mediaId: outcome.mediaId,
+              mimeType: outcome.mimeType,
+              from: outcome.from,
+            }
           : { outcome: outcome.kind },
       );
       return outcome;
@@ -1338,9 +1348,11 @@ async function runSeedFePhase(args: Args): Promise<void> {
   const tally = summarizeStore(store, 'rows');
   printRouteCalls(routes, 'http');
 
+  // Uploads finish concurrently, so each id is printed with the mime type the
+  // backend confirmed instead of being inferred from the generation order.
   const mediaIds = resolved
     .filter((r) => r.outcome === 'ok')
-    .map((r) => r.mediaId);
+    .map((r) => `${r.mediaId} (${r.mimeType})`);
   line('media', 'ids', {
     resolved: resolved.length,
     metaDownloadsServed: downloads.count,
