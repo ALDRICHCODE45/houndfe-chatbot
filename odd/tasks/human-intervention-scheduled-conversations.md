@@ -14,18 +14,19 @@ Contract: houndfe-backend `docs/chatbot-handoff/chatbot-requests-bot-contract.md
 
 ## Tasks
 
-| ID  | Specs  | Route                                                                                                                                              | Commit |
-| --- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| T1  | S2, S1 | worker: client for slots, create with scheduledFor (+409 bodies, extended answer), reschedule (idempotency key), state scheduledRequest            | —      |
-| T6  | S3, S4 | worker: branch-zone time formatting + the S3 texts (usted + tú pairs) as a pure domain module                                                      | —      |
-| T2  | S2     | durable per-conversation offer/appointment state (offer expires ~30 min) + recovery from the state route                                           | —      |
-| T3  | S2, S3 | out-of-hours branch: OutOfHoursPolicy implementation — slots → offer → parse choice → book; 409 re-offer; empty list; SCHEDULING_DISABLED fallback | —      |
-| T4  | S2, S3 | customer reschedule / cancel / "¿a qué hora quedé?" intents (cap 3 reschedules)                                                                    | —      |
-| T5  | S2, S3 | feed handlers: scheduled_reminder and rescheduled (window/HUMAN/version checks)                                                                    | —      |
-| T7  | S6     | E2E with the backend on dev                                                                                                                        | —      |
+| ID  | Specs  | Route                                                                                                                                              | Commit  |
+| --- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| T1  | S2, S1 | worker: client for slots, create with scheduledFor (+409 bodies, extended answer), reschedule (idempotency key), state scheduledRequest            | —       |
+| T6  | S3, S4 | worker: branch-zone time formatting + the S3 texts (usted + tú pairs) as a pure domain module                                                      | c0b0b77 |
+| T2  | S2     | durable per-conversation offer/appointment state (offer expires ~30 min) + recovery from the state route                                           | —       |
+| T3  | S2, S3 | out-of-hours branch: OutOfHoursPolicy implementation — slots → offer → parse choice → book; 409 re-offer; empty list; SCHEDULING_DISABLED fallback | —       |
+| T4  | S2, S3 | customer reschedule / cancel / "¿a qué hora quedé?" intents (cap 3 reschedules)                                                                    | —       |
+| T5  | S2, S3 | feed handlers: scheduled_reminder and rescheduled (window/HUMAN/version checks)                                                                    | —       |
+| T7  | S6     | E2E with the backend on dev                                                                                                                        | —       |
 
 ## Log
 
 - **L1 (owner, 2026-11-12):** "si hermano, adelante con tus siguientes recomendaciones."
 - **L2 (owner, 2026-11-13):** all S3 texts approved as proposed ("Así están bien" for the four groups).
 - **L3 (backend, 2026-11-13):** unit 14 merged on feat/human-intervention (5b549e18), not on dev yet; all 11 chatbot concerns accepted; ALREADY_SCHEDULED identity = canonical phone; unknown window = closed (always send lastCustomerMessageAt); perf slots p95 11 ms, booking 19 ms, same-key replay 6 ms, reschedule 15–17 ms.
+- **L4 (T6 done, 2026-11-13):** c0b0b77 — src/scheduling/domain (slot-time, scheduling-copy, slot-choice). Time style: 12 h "9:30 a. m." / "4:00 p. m.", {día} hoy/mañana/"el lunes 16 de noviembre", {cuándo} "mañana a las 9:00 a. m."; at one o'clock "a la 1:00 p. m." (correct Spanish; every other hour "a las"). Slot-taken copy kept exactly as approved (no extra "Responda con el número." line). 14 phrase-level tú pairs. RED: 3 suites + 10 style tests before.
