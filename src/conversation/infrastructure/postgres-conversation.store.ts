@@ -4,6 +4,11 @@ import { randomUUID } from 'node:crypto';
 import type { AgentTurnCommit } from '../domain/conversation-store';
 import { normalizeMinimalCheckoutDraft } from '../domain/minimal-checkout-draft';
 import {
+  normalizeSchedulingState,
+  readSchedulingState,
+  type SchedulingState,
+} from '../domain/scheduling-state';
+import {
   ConversationState,
   ConversationStore,
   isNonEmptyString,
@@ -313,6 +318,80 @@ export class PostgresConversationStore implements ConversationStore {
        WHERE sender_id = $1
          AND conversation_state.data->'minimalCheckoutDraft' = $4::jsonb`,
       [senderId, lastMessageAt, owned, current],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  /**
+   * Unit 14 T2: one narrow column read (not the history). `present`
+   * distinguishes an absent key from a stored JSON null, so the raw value
+   * round-trips into `commitScheduling`'s expectation.
+   */
+  async getScheduling(
+    senderId: string,
+  ): Promise<{ state: SchedulingState; raw: unknown }> {
+    const { rows } = await this.pool.query<{
+      present: boolean;
+      scheduling: unknown;
+    }>(
+      `SELECT (data ? 'scheduling') AS present, data->'scheduling' AS scheduling
+       FROM conversation_state WHERE sender_id = $1`,
+      [senderId],
+    );
+    const row = rows[0];
+    const raw = row?.present ? row.scheduling : undefined;
+    return { state: readSchedulingState(raw), raw };
+  }
+
+  /**
+   * Unit 14 T2: one guarded statement, never a read-modify-write: an absent
+   * expectation takes the first-contact UPSERT branch gated on the key being
+   * ABSENT; a present one is an UPDATE gated on JSONB equality with the raw
+   * the caller read. Replaces only `scheduling`; siblings and the newer
+   * `last_message_at` (GREATEST) are kept. A malformed `next` or timestamp
+   * returns false before any query.
+   */
+  async commitScheduling(
+    senderId: string,
+    expected: unknown,
+    next: SchedulingState,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    const copy = normalizeSchedulingState(next);
+    if (
+      copy === null ||
+      !isNonEmptyString(senderId) ||
+      !isNonEmptyString(lastMessageAt) ||
+      !Number.isFinite(Date.parse(lastMessageAt))
+    ) {
+      return false;
+    }
+    const owned = JSON.stringify(copy);
+    // `last_message_at` is NOT touched on an existing row (a scheduling write
+    // is not a customer message); `$2` only stamps a row this write inserts.
+    const merge = `data = conversation_state.data || jsonb_build_object('scheduling', $3::jsonb)`;
+    if (expected === undefined) {
+      const { rowCount } = await this.pool.query(
+        `INSERT INTO conversation_state (sender_id, last_message_at, data)
+         VALUES ($1, $2::timestamptz, jsonb_build_object('scheduling', $3::jsonb))
+         ON CONFLICT (sender_id) DO UPDATE SET ${merge}
+         WHERE NOT (conversation_state.data ? 'scheduling')`,
+        [senderId, lastMessageAt, owned],
+      );
+      return (rowCount ?? 0) === 1;
+    }
+    let current: string;
+    try {
+      current = JSON.stringify(expected);
+    } catch {
+      return false;
+    }
+    if (typeof current !== 'string') return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = conversation_state.data || jsonb_build_object('scheduling', $2::jsonb)
+       WHERE sender_id = $1 AND conversation_state.data->'scheduling' = $3::jsonb`,
+      [senderId, owned, current],
     );
     return (rowCount ?? 0) === 1;
   }
@@ -649,6 +728,7 @@ export class PostgresConversationStore implements ConversationStore {
     delete data.agentRevision;
     delete data.minimalCart;
     delete data.minimalCheckoutDraft;
+    delete data.scheduling;
 
     const { rows } = await this.pool.query<ConversationRow>(
       `INSERT INTO conversation_state (sender_id, last_message_at, data)
@@ -661,7 +741,7 @@ export class PostgresConversationStore implements ConversationStore {
                    ELSE '{}'::jsonb END
                  || (SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
                      FROM jsonb_each(conversation_state.data)
-                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart', 'minimalCheckoutDraft', 'handoff'))
+                     WHERE key IN ('messages', 'catalogReferences', 'agentRevision', 'minimalCart', 'minimalCheckoutDraft', 'handoff', 'scheduling'))
        RETURNING sender_id, last_message_at, data`,
       [senderId, merged.lastMessageAt, JSON.stringify(data)],
     );

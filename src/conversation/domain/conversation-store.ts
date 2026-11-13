@@ -5,6 +5,7 @@ import type {
   HumanHandoffRef,
   HandoffTransition,
 } from './handoff-mode';
+import type { SchedulingState } from './scheduling-state';
 
 /** DI injection token for the ConversationStore port. */
 export const CONVERSATION_STORE = Symbol('CONVERSATION_STORE');
@@ -58,6 +59,9 @@ export interface ConversationStateData {
   pendingHumanRequest?: PendingHumanRequest | null;
   /** S7 handoff mode; CAS-owned (see `ConversationStore.applyHandoff`). */
   handoff?: HandoffState | null;
+  /** Unit 14 offer/appointment; CAS-owned (see `commitScheduling`). Read it
+   *  through `readSchedulingState`: the stored value may be malformed. */
+  scheduling?: unknown;
   [key: string]: unknown;
 }
 
@@ -322,6 +326,32 @@ export interface ConversationStore {
    * ordered by sender id, at most `limit`.
    */
   listHumanHandoffs?(limit: number): Promise<HumanHandoffRef[]>;
+
+  /**
+   * Unit 14 T2: the sender's scheduling state, read narrowly (one column, not
+   * the whole history). `state` is the lenient normalized read (empty when
+   * absent or malformed); `raw` is exactly what is stored (`undefined` when
+   * the key is absent) and is what `commitScheduling` compares against.
+   */
+  getScheduling?(
+    senderId: string,
+  ): Promise<{ state: SchedulingState; raw: unknown }>;
+
+  /**
+   * Unit 14 T2: compare-and-set of `data.scheduling`. `expected` is the `raw`
+   * of the read (`undefined` = the key must be absent: first contact creates
+   * the row). Replaces only this key; siblings and an existing row's
+   * `lastMessageAt` are kept (a scheduling write is not a customer message:
+   * `lastMessageAt` only stamps a row this write creates). `next` must pass `normalizeSchedulingState` and
+   * `lastMessageAt` must be a valid instant, else `false` with no write.
+   * `false` also means "someone else wrote first": re-read, never blind retry.
+   */
+  commitScheduling?(
+    senderId: string,
+    expected: unknown,
+    next: SchedulingState,
+    lastMessageAt: string,
+  ): Promise<boolean>;
 
   /**
    * Returns the current state for a sender, or null if none exists.

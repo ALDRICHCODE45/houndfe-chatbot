@@ -665,6 +665,227 @@ export function runConversationStoreContract(
       });
     });
 
+    // Unit 14 T2: the per-conversation offer / appointment, CAS-owned like
+    // the handoff and the cart (`data.scheduling`).
+    describe('scheduling state CAS (unit 14 T2)', () => {
+      const offer = {
+        slots: [
+          { startsAt: '2026-11-13T15:00:00.000Z', withinWindow: true },
+          { startsAt: '2026-11-13T15:30:00.000Z', withinWindow: false },
+        ],
+        timeZone: 'America/Mexico_City',
+        offeredAt: '2026-11-12T20:00:00.000Z',
+        subtype: 'TALK_TO_HUMAN' as const,
+        sourceRequestId: '0b0f7c58-6f55-4f4f-a1c4-9a2b7d6a4e11',
+        unclearCount: 0,
+      };
+      const appointment = {
+        requestId: 'req-1',
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: '2026-11-13T15:00:00.000Z',
+        scheduleVersion: 1,
+        timeZone: 'America/Mexico_City',
+        rescheduleCount: 0,
+      };
+      const empty = { offer: null, appointment: null };
+
+      it('reads the empty state for an unknown sender or a row without it', async () => {
+        const missing = await store.getScheduling!('sch-0');
+        expect(missing.state).toEqual(empty);
+        expect(missing.raw).toBeUndefined();
+        await store.create('sch-0b', { lastMessageAt: T, data: { a: 1 } });
+        const row = await store.getScheduling!('sch-0b');
+        expect(row.state).toEqual(empty);
+        expect(row.raw).toBeUndefined();
+      });
+
+      it('first contact: an absent expectation creates the row', async () => {
+        const next = { offer, appointment: null };
+        await expect(
+          store.commitScheduling!('sch-1', undefined, next, T),
+        ).resolves.toBe(true);
+        const read = await store.getScheduling!('sch-1');
+        expect(read.state).toEqual(next);
+        expect((await store.get('sch-1'))!.lastMessageAt).toBe(T);
+      });
+
+      it('an absent expectation is refused once the key exists', async () => {
+        await store.commitScheduling!(
+          'sch-2',
+          undefined,
+          { offer, appointment: null },
+          T,
+        );
+        await expect(
+          store.commitScheduling!('sch-2', undefined, empty, T),
+        ).resolves.toBe(false);
+        expect((await store.getScheduling!('sch-2')).state.offer).toEqual(
+          offer,
+        );
+      });
+
+      it('compares and sets against the raw value it returned', async () => {
+        await store.commitScheduling!(
+          'sch-3',
+          undefined,
+          { offer, appointment: null },
+          T,
+        );
+        const read = await store.getScheduling!('sch-3');
+        const booked = { offer: null, appointment };
+        await expect(
+          store.commitScheduling!('sch-3', read.raw, booked, T),
+        ).resolves.toBe(true);
+        // The same (now stale) expectation loses.
+        await expect(
+          store.commitScheduling!(
+            'sch-3',
+            read.raw,
+            { offer, appointment: null },
+            T,
+          ),
+        ).resolves.toBe(false);
+        expect((await store.getScheduling!('sch-3')).state).toEqual(booked);
+      });
+
+      it('exactly one of two concurrent writers wins the same expectation', async () => {
+        await store.commitScheduling!(
+          'sch-4',
+          undefined,
+          { offer, appointment: null },
+          T,
+        );
+        const { raw } = await store.getScheduling!('sch-4');
+        const results = await Promise.all([
+          store.commitScheduling!(
+            'sch-4',
+            raw,
+            { offer: null, appointment },
+            T,
+          ),
+          store.commitScheduling!(
+            'sch-4',
+            raw,
+            { offer: { ...offer, unclearCount: 1 }, appointment: null },
+            T,
+          ),
+        ]);
+        expect(results.filter(Boolean)).toHaveLength(1);
+      });
+
+      it('refuses a malformed next without touching the row', async () => {
+        await expect(
+          store.commitScheduling!(
+            'sch-5',
+            undefined,
+            { offer: { ...offer, slots: [] }, appointment: null },
+            T,
+          ),
+        ).resolves.toBe(false);
+        expect(await store.get('sch-5')).toBeNull();
+        await expect(
+          store.commitScheduling!('sch-5', undefined, empty, 'not a date'),
+        ).resolves.toBe(false);
+      });
+
+      it('a corrupt stored value reads as empty and can be overwritten with its raw', async () => {
+        await store.create('sch-6', {
+          lastMessageAt: T,
+          data: { scheduling: 'garbage' },
+        });
+        const read = await store.getScheduling!('sch-6');
+        expect(read.state).toEqual(empty);
+        expect(read.raw).toBe('garbage');
+        await expect(
+          store.commitScheduling!(
+            'sch-6',
+            read.raw,
+            { offer, appointment: null },
+            T,
+          ),
+        ).resolves.toBe(true);
+        expect((await store.getScheduling!('sch-6')).state.offer).toEqual(
+          offer,
+        );
+      });
+
+      it('keeps the newer lastMessageAt and every sibling key', async () => {
+        await store.create('sch-7', {
+          lastMessageAt: '2026-12-01T00:00:00.000Z',
+          data: { messages: [{ role: 'user', content: 'hola' }], x: 1 },
+        });
+        await store.commitScheduling!(
+          'sch-7',
+          undefined,
+          { offer, appointment: null },
+          T,
+        );
+        const fetched = await store.get('sch-7');
+        expect(fetched!.lastMessageAt).toBe('2026-12-01T00:00:00.000Z');
+        expect(fetched!.data.x).toBe(1);
+        expect(fetched!.data.messages).toEqual([
+          { role: 'user', content: 'hola' },
+        ]);
+      });
+
+      it('never bumps lastMessageAt of an existing row (a feed-driven write must not keep stale history alive)', async () => {
+        const OLD = '2026-11-01T00:00:00.000Z';
+        await store.create('sch-7b', {
+          lastMessageAt: OLD,
+          data: { messages: [{ role: 'user', content: 'hola' }] },
+        });
+        await store.commitScheduling!(
+          'sch-7b',
+          undefined,
+          { offer, appointment: null },
+          '2026-12-05T00:00:00.000Z',
+        );
+        expect((await store.get('sch-7b'))!.lastMessageAt).toBe(OLD);
+        const { raw } = await store.getScheduling!('sch-7b');
+        await store.commitScheduling!(
+          'sch-7b',
+          raw,
+          { offer: null, appointment },
+          '2026-12-06T00:00:00.000Z',
+        );
+        expect((await store.get('sch-7b'))!.lastMessageAt).toBe(OLD);
+      });
+
+      it('survives update() writes (CAS-owned, never replaced by a stale patch)', async () => {
+        await store.commitScheduling!(
+          'sch-8',
+          undefined,
+          { offer, appointment },
+          T,
+        );
+        await store.update('sch-8', {
+          lastMessageAt: T,
+          data: { cart: ['x'], scheduling: empty },
+        });
+        const read = await store.getScheduling!('sch-8');
+        expect(read.state).toEqual({ offer, appointment });
+        expect((await store.get('sch-8'))!.data.cart).toEqual(['x']);
+      });
+
+      it('does not disturb the handoff mode or the pending marker', async () => {
+        await store.applyHandoff!('sch-9', {
+          mode: 'HUMAN',
+          epoch: 1,
+          requestId: 'req-1',
+        });
+        await store.commitScheduling!(
+          'sch-9',
+          undefined,
+          { offer, appointment: null },
+          T,
+        );
+        await expect(store.getHandoff!('sch-9')).resolves.toMatchObject({
+          mode: 'HUMAN',
+          epoch: 1,
+        });
+      });
+    });
+
     it('update() cannot resurrect a cleared marker', async () => {
       const m = casMarker('bbbb22223333');
       await setCas('u2', m);

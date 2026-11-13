@@ -52,6 +52,16 @@ import {
 import { LiveConversationSafety } from './application/live-conversation-safety';
 import { LiveConversationService } from './application/live-conversation.service';
 import { HumanRequestFeedConsumer } from './application/human-request-feed.consumer';
+import {
+  SCHEDULED_APPOINTMENT_READER,
+  SCHEDULED_APPOINTMENT_WRITER,
+  ScheduledConversationService,
+  type ScheduledAppointmentReader,
+  type ScheduledAppointmentWriter,
+} from './application/scheduled-conversation.service';
+import { SchedulingStateService } from '../scheduling/application/scheduling-state.service';
+import { StoredAppointmentReader } from '../scheduling/application/stored-appointment.reader';
+import { SchedulingStateModule } from '../scheduling/scheduling-state.module';
 import { HumanRequestMaintenanceWorker } from './application/human-request-maintenance.worker';
 import {
   HUMAN_REQUEST_FEED_STORE,
@@ -230,12 +240,27 @@ const CUSTOMER_PORT_TOKENS = [
     WhatsappSenderModule,
     CustomerProfileModule,
     BackendOutboxEnqueueModule,
+    SchedulingStateModule,
   ],
   providers: [
     {
       provide: HUMAN_REQUEST_FEED_STORE,
       useFactory: (pool: Pool) => new PostgresHumanRequestFeedStore(pool),
       inject: [PG_POOL],
+    },
+    // Unit 14 T4/T5: the stored-appointment ports over the scheduling state.
+    {
+      provide: SCHEDULED_APPOINTMENT_READER,
+      useFactory: (
+        state: SchedulingStateService,
+        registry: HumanRequestFeedStore,
+      ): ScheduledAppointmentReader =>
+        new StoredAppointmentReader({ state, registry }),
+      inject: [SchedulingStateService, HUMAN_REQUEST_FEED_STORE],
+    },
+    {
+      provide: SCHEDULED_APPOINTMENT_WRITER,
+      useExisting: SchedulingStateService,
     },
     {
       provide: HumanRequestDeliveryService,
@@ -250,6 +275,9 @@ const CUSTOMER_PORT_TOKENS = [
         pool: Pool,
         profiles?: CustomerProfileService,
         waker?: OutboxDrainWaker,
+        appointments?: ScheduledAppointmentReader,
+        appointmentWriter?: ScheduledAppointmentWriter,
+        scheduling?: SchedulingStateService,
       ) => {
         const ports = customerPorts(handoff, config, pool, profiles);
         return new HumanRequestDeliveryService({
@@ -257,6 +285,20 @@ const CUSTOMER_PORT_TOKENS = [
           client,
           sender,
           ...ports,
+          // Scheduled conversations (unit 14): reminder / reschedule
+          // notices. The stored-appointment reader is optional (parent
+          // wires it): without it the version check is skipped.
+          scheduled: new ScheduledConversationService({
+            store,
+            isWindowOpen: ports.isWindowOpen,
+            ...(ports.customerStyle === undefined
+              ? {}
+              : { customerStyle: ports.customerStyle }),
+            ...(appointments === undefined ? {} : { appointments }),
+            ...(appointmentWriter === undefined ? {} : { appointmentWriter }),
+          }),
+          // A staff cancel drops the request's stored appointment.
+          ...(scheduling === undefined ? {} : { schedule: scheduling }),
           // Live conversation T4/T5: started / reassigned / ended and the
           // staff message / template relays.
           live: new LiveConversationService({
@@ -275,6 +317,8 @@ const CUSTOMER_PORT_TOKENS = [
             },
             // Bot live notices mirror right away (ordering vs staff).
             ...(waker === undefined ? {} : { wakeOutbox: () => waker.wake() }),
+            // A started session voids a pending slot offer (T4 L7).
+            ...(scheduling === undefined ? {} : { scheduling }),
           }),
         });
       },
@@ -286,6 +330,9 @@ const CUSTOMER_PORT_TOKENS = [
         LIVE_RECONCILE_REF,
         ...CUSTOMER_PORT_TOKENS,
         { token: OUTBOX_DRAIN_WAKER, optional: true },
+        { token: SCHEDULED_APPOINTMENT_READER, optional: true },
+        { token: SCHEDULED_APPOINTMENT_WRITER, optional: true },
+        { token: SchedulingStateService, optional: true },
       ],
     },
     {

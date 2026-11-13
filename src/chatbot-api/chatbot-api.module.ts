@@ -6,6 +6,7 @@ import {
 } from './domain/chatbot-api.client';
 import { CONVERSATION_MIRROR_CLIENT } from './domain/conversation-mirror.port';
 import { LIVE_CONVERSATION_CLIENT } from './domain/live-conversation.port';
+import { SCHEDULING_CLIENT } from './domain/scheduling.port';
 import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
 
 @Module({
@@ -28,12 +29,17 @@ import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
       provide: LIVE_CONVERSATION_CLIENT,
       useExisting: ChatbotApiHttpClient,
     },
+    {
+      provide: SCHEDULING_CLIENT,
+      useExisting: ChatbotApiHttpClient,
+    },
   ],
   exports: [
     CHATBOT_API_CLIENT,
     HUMAN_REQUESTS_CLIENT,
     CONVERSATION_MIRROR_CLIENT,
     LIVE_CONVERSATION_CLIENT,
+    SCHEDULING_CLIENT,
     ChatbotApiHttpClient,
   ],
 })

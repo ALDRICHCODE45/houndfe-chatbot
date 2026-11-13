@@ -15,6 +15,7 @@ import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { HumanRequestsServicesModule } from '../human-requests/human-requests.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
+import { SchedulingModule } from '../scheduling/scheduling.module';
 import { ProductImageModule } from '../product-image/product-image.module';
 import { WebhookDedupPurgeWorker } from './application/webhook-dedup-purge.worker';
 import { WebhookDispatcherService } from './application/webhook-dispatcher.service';
@@ -65,6 +66,8 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
     ReceiptMediaModule,
     ProductImageModule,
     HumanRequestsServicesModule,
+    // Unit 14: provides OUT_OF_HOURS_POLICY (slot offers).
+    SchedulingModule,
   ],
   controllers: [WebhookController],
   providers: [

@@ -126,6 +126,39 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       );
     });
 
+    it("uses the caller's timeoutMs as the request timeout and never sends it (F1)", async () => {
+      request.mockReturnValue(of(response(created, 201)));
+      await client.createHumanRequest({ ...createInput, timeoutMs: 3_200 });
+      expect(sent().timeout).toBe(3_200);
+      expect(sent().data).toEqual(createInput);
+      expect(sent().data).not.toHaveProperty('timeoutMs');
+    });
+
+    it('falls back to the default timeout for an absent or invalid timeoutMs', async () => {
+      request.mockReturnValue(of(response(created, 201)));
+      await client.createHumanRequest(createInput);
+      await client.createHumanRequest({ ...createInput, timeoutMs: 0 });
+      await client.createHumanRequest({ ...createInput, timeoutMs: NaN });
+      expect(sent(0).timeout).toBe(10_000);
+      expect(sent(1).timeout).toBe(10_000);
+      expect(sent(2).timeout).toBe(10_000);
+    });
+
+    it('keeps the unscheduled answer free of scheduling fields and passes the branch zone through (unit 14)', async () => {
+      const withZone = {
+        ...created,
+        businessHours: {
+          openNow: false,
+          nextOpenAt: AT,
+          timeZone: 'America/Mexico_City',
+        },
+      };
+      request.mockReturnValue(of(response(withZone, 201)));
+      const result = await client.createHumanRequest(createInput);
+      expect(result).toEqual({ kind: 'ok', status: 201, response: withZone });
+      expect(sent().data).not.toHaveProperty('scheduledFor');
+    });
+
     it('resolves a 200 merge with mergedIntoId and the legacy answer', async () => {
       const merged = {
         ...created,
@@ -1220,6 +1253,255 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
         expect(result.items[0]).toMatchObject({
           type: 'conversation.staff_message',
           deferredReason: 'WINDOW_CLOSED',
+        });
+      });
+    });
+
+    describe('scheduled conversation items (unit 14)', () => {
+      const envelope = (type: string, payload: unknown, extra = {}) => ({
+        cursor: '000000002000',
+        deliveryId: 'd-sch',
+        type,
+        requestId: 'req-s',
+        conversationRef: 'wa:5215550001111',
+        notBefore: null,
+        expiresAt: null,
+        payload,
+        ...extra,
+      });
+      const base = {
+        cursor: '000000002000',
+        deliveryId: 'd-sch',
+        requestId: 'req-s',
+        conversationRef: 'wa:5215550001111',
+        notBefore: null,
+        expiresAt: null,
+      };
+      const read = async (raw: unknown) => {
+        request.mockReturnValue(
+          of(response({ items: [raw], nextCursor: '000000002000' })),
+        );
+        const result = await client.readFeed({ after: 'c' });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        return result.items;
+      };
+      // The contract's full payloads (extra keys are tolerated, not kept).
+      const reminderWire = {
+        requestId: 'req-s',
+        scheduledFor: '2026-11-10T15:00:00.000Z',
+        scheduleVersion: 2,
+        minutesBefore: 10,
+        timeZone: 'America/Mexico_City',
+        whatsappWindowClosesAt: '2026-11-10T21:02:11.000Z',
+        requiresTemplateAtStart: false,
+      };
+      const rescheduledWire = {
+        requestId: 'req-s',
+        scheduledFor: '2026-11-11T15:30:00.000Z',
+        previousScheduledFor: '2026-11-10T15:00:00.000Z',
+        scheduleVersion: 3,
+        timeZone: 'America/Mexico_City',
+        whatsappWindowClosesAt: '2026-11-11T21:02:11.000Z',
+        requiresTemplateAtStart: false,
+      };
+      const reminderPayload = {
+        requestId: 'req-s',
+        scheduledFor: '2026-11-10T15:00:00.000Z',
+        scheduleVersion: 2,
+        timeZone: 'America/Mexico_City',
+        whatsappWindowClosesAt: '2026-11-10T21:02:11.000Z',
+      };
+      const rescheduledPayload = {
+        requestId: 'req-s',
+        scheduledFor: '2026-11-11T15:30:00.000Z',
+        previousScheduledFor: '2026-11-10T15:00:00.000Z',
+        scheduleVersion: 3,
+        timeZone: 'America/Mexico_City',
+        whatsappWindowClosesAt: '2026-11-11T21:02:11.000Z',
+      };
+
+      it('parses conversation.scheduled_reminder', async () => {
+        await expect(
+          read(envelope('conversation.scheduled_reminder', reminderWire)),
+        ).resolves.toEqual([
+          {
+            ...base,
+            type: 'conversation.scheduled_reminder',
+            payload: reminderPayload,
+          },
+        ]);
+      });
+
+      it('parses conversation.rescheduled', async () => {
+        await expect(
+          read(envelope('conversation.rescheduled', rescheduledWire)),
+        ).resolves.toEqual([
+          {
+            ...base,
+            type: 'conversation.rescheduled',
+            payload: rescheduledPayload,
+          },
+        ]);
+      });
+
+      it('timeZone and window are informational: absent, null, a bad zone or a wrong type become null', async () => {
+        for (const extra of [
+          { timeZone: undefined, whatsappWindowClosesAt: undefined },
+          { timeZone: null, whatsappWindowClosesAt: null },
+          { timeZone: 'Mars/Olympus', whatsappWindowClosesAt: 'later' },
+          { timeZone: 42, whatsappWindowClosesAt: 7 },
+        ]) {
+          const items = await read(
+            envelope('conversation.scheduled_reminder', {
+              ...reminderWire,
+              ...extra,
+            }),
+          );
+          expect(items).toEqual([
+            {
+              ...base,
+              type: 'conversation.scheduled_reminder',
+              payload: {
+                ...reminderPayload,
+                timeZone: null,
+                whatsappWindowClosesAt: null,
+              },
+            },
+          ]);
+        }
+      });
+
+      it('takes the requestId from the payload when the envelope omits it', async () => {
+        const raw = envelope('conversation.scheduled_reminder', reminderWire);
+        delete (raw as { requestId?: string }).requestId;
+        await expect(read(raw)).resolves.toMatchObject([
+          { type: 'conversation.scheduled_reminder', requestId: 'req-s' },
+        ]);
+      });
+
+      it.each<[string, string, Record<string, unknown>]>([
+        [
+          'reminder: no scheduledFor',
+          'conversation.scheduled_reminder',
+          { scheduledFor: undefined },
+        ],
+        [
+          'reminder: scheduledFor not a date',
+          'conversation.scheduled_reminder',
+          { scheduledFor: 'mañana' },
+        ],
+        [
+          'reminder: scheduledFor a number',
+          'conversation.scheduled_reminder',
+          { scheduledFor: 1762786800000 },
+        ],
+        [
+          'reminder: no scheduleVersion',
+          'conversation.scheduled_reminder',
+          { scheduleVersion: undefined },
+        ],
+        [
+          'reminder: scheduleVersion 0',
+          'conversation.scheduled_reminder',
+          { scheduleVersion: 0 },
+        ],
+        [
+          'reminder: scheduleVersion fractional',
+          'conversation.scheduled_reminder',
+          { scheduleVersion: 1.5 },
+        ],
+        [
+          'reminder: scheduleVersion a string',
+          'conversation.scheduled_reminder',
+          { scheduleVersion: '2' },
+        ],
+        [
+          'reminder: payload requestId disagrees',
+          'conversation.scheduled_reminder',
+          { requestId: 'req-other' },
+        ],
+        [
+          'rescheduled: no previousScheduledFor',
+          'conversation.rescheduled',
+          { previousScheduledFor: undefined },
+        ],
+        [
+          'rescheduled: previousScheduledFor not a date',
+          'conversation.rescheduled',
+          { previousScheduledFor: 'antes' },
+        ],
+        [
+          'rescheduled: scheduleVersion negative',
+          'conversation.rescheduled',
+          { scheduleVersion: -1 },
+        ],
+        [
+          'rescheduled: scheduledFor null',
+          'conversation.rescheduled',
+          { scheduledFor: null },
+        ],
+      ])('%s → unknown, never a rejected page', async (_name, type, patch) => {
+        const wire =
+          type === 'conversation.rescheduled' ? rescheduledWire : reminderWire;
+        const raw = envelope(type, { ...wire, ...patch });
+        await expect(read(raw)).resolves.toEqual([
+          {
+            type: 'unknown',
+            rawType: type,
+            cursor: '000000002000',
+            deliveryId: 'd-sch',
+            raw,
+          },
+        ]);
+      });
+
+      it('a missing payload or requestId is unknown too', async () => {
+        for (const raw of [
+          envelope('conversation.scheduled_reminder', null),
+          envelope('conversation.rescheduled', 'x'),
+          envelope(
+            'conversation.scheduled_reminder',
+            { ...reminderWire, requestId: undefined },
+            { requestId: undefined },
+          ),
+        ])
+          await expect(read(raw)).resolves.toMatchObject([{ type: 'unknown' }]);
+      });
+
+      it('a bad scheduled item never rejects a page that carries other items', async () => {
+        const good = envelope('conversation.rescheduled', rescheduledWire);
+        const bad = envelope(
+          'conversation.scheduled_reminder',
+          { ...reminderWire, scheduleVersion: 'x' },
+          { deliveryId: 'd-bad', cursor: '000000002001' },
+        );
+        request.mockReturnValue(
+          of(response({ items: [good, bad], nextCursor: '000000002001' })),
+        );
+        const result = await client.readFeed({ after: 'c' });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        expect(result.items.map((i) => i.type)).toEqual([
+          'conversation.rescheduled',
+          'unknown',
+        ]);
+      });
+
+      it('a scheduled item arrives typed through pending deliveries too', async () => {
+        request.mockReturnValue(
+          of(
+            response({
+              items: [
+                envelope('conversation.scheduled_reminder', reminderWire),
+              ],
+            }),
+          ),
+        );
+        const result = await client.listPendingDeliveries({
+          conversationRef: 'wa:5215550001111',
+        });
+        if (result.kind !== 'ok') throw new Error('expected ok');
+        expect(result.items[0]).toMatchObject({
+          type: 'conversation.scheduled_reminder',
         });
       });
     });

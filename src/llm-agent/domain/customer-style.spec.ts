@@ -362,6 +362,50 @@ describe('applyCustomerStyle', () => {
   });
 });
 
+describe('applyCustomerStyle: scheduled-conversation phrases (unit 14)', () => {
+  const tu = style({ register: 'tu' });
+
+  it.each([
+    [
+      '¿Quiere que una persona le atienda en alguno de estos horarios?',
+      '¿Quieres que una persona te atienda en alguno de estos horarios?',
+    ],
+    ['Responda con el número.', 'Responde con el número.'],
+    [
+      'No entendí qué horario prefiere. Responda con el número de la opción.',
+      'No entendí qué horario prefieres. Responde con el número de la opción.',
+    ],
+    [
+      'A esa hora una persona del equipo le escribe por aquí.',
+      'A esa hora una persona del equipo te escribe por aquí.',
+    ],
+    [
+      'A esa hora le escribimos; cuando le llegue el mensaje, respóndanos para continuar.',
+      'A esa hora te escribimos; cuando te llegue el mensaje, respóndenos para continuar.',
+    ],
+    [
+      'Ya dejé su solicitud y le escriben en cuanto abramos (mañana a las 9:00 a. m.).',
+      'Ya dejé tu solicitud y te escriben en cuanto abramos (mañana a las 9:00 a. m.).',
+    ],
+    [
+      'Ya tiene una cita para hoy a las 4:00 p. m. ¿Quiere cambiarla?',
+      'Ya tienes una cita para hoy a las 4:00 p. m. ¿Quieres cambiarla?',
+    ],
+    [
+      'Listo, cambié su cita para hoy a las 4:00 p. m.',
+      'Listo, cambié tu cita para hoy a las 4:00 p. m.',
+    ],
+    ['Su cita es hoy a las 4:00 p. m.', 'Tu cita es hoy a las 4:00 p. m.'],
+    [
+      'Le recuerdo que a las 4:00 p. m. una persona del equipo le atiende por aquí.',
+      'Te recuerdo que a las 4:00 p. m. una persona del equipo te atiende por aquí.',
+    ],
+  ])('%s', (usted, expected) => {
+    expect(applyCustomerStyle(usted, tu)).toBe(expected);
+    expect(applyCustomerStyle(usted, style())).toBe(usted);
+  });
+});
+
 describe('S1 stored style seed', () => {
   const seed: CustomerStyle = { register: 'tu', emojis: true, tone: 'casual' };
 

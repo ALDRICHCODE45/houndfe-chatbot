@@ -1,4 +1,8 @@
 import type { ConversationMirrorCommonFailure } from './conversation-mirror.dto';
+import {
+  parseScheduledRequestSummary,
+  type ScheduledRequestSummary,
+} from './scheduling.dto';
 
 /**
  * Live conversation (backend unit 11, houndfe-backend
@@ -171,6 +175,12 @@ export interface ConversationHandoffState {
   sessionState: LiveSessionState | null;
   requestId: string | null;
   assigneeFirstName: string | null;
+  /** Unit 14: the chat's nearest open scheduled request, or `null`. Set by
+   *  the parsers whenever the backend sends the key (it always does from
+   *  unit 14 on); absent only on a pre-unit-14 backend or a 404, which read
+   *  as `null`. A malformed value reads as `null`: it is informational and
+   *  never breaks the mode/epoch read. */
+  scheduledRequest?: ScheduledRequestSummary | null;
 }
 
 /** What the backend answers for a conversation it has never seen (404). */
@@ -202,6 +212,11 @@ export function parseConversationState(
     sessionState: parseSessionState(sessionState),
     requestId: nullableString(requestId),
     assigneeFirstName: nullableString(assigneeFirstName),
+    ...('scheduledRequest' in body
+      ? {
+          scheduledRequest: parseScheduledRequestSummary(body.scheduledRequest),
+        }
+      : {}),
   };
 }
 

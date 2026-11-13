@@ -15,8 +15,11 @@ import { HumanRequestFeedConsumer } from '../application/human-request-feed.cons
 import {
   LIVE_DECISIONS,
   REF,
+  SCHEDULE_DECISIONS,
   cancelledItem,
   overdueItem,
+  reminderItem,
+  rescheduledItem,
   runHumanRequestFeedStoreContract,
   staffMessageItem,
   templateItem,
@@ -447,19 +450,21 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     });
     await truncate();
 
-    // down refuses while a row has a message_id or a live decision.
+    // down refuses while a row has a message_id or a live decision (every
+    // later migration is rolled back first, in one transaction).
+    const count4900 = await since('4900000000000');
     await store.insertDelivery(staffMessageItem('m-5', 'key-5'));
-    expect(() => migrate('down', '1')).toThrow(/refusing to roll back/);
+    expect(() => migrate('down', count4900)).toThrow(/refusing to roll back/);
     await truncate();
     await store.insertDelivery(cancelledItem('m-6'));
     await pool.query(
       `UPDATE human_request_deliveries SET decision = 'FAREWELL' WHERE delivery_id = 'm-6'`,
     );
-    expect(() => migrate('down', '1')).toThrow(/refusing to roll back/);
+    expect(() => migrate('down', count4900)).toThrow(/refusing to roll back/);
     await truncate();
 
     // Empty ledger: down restores the old CHECK and drops the column.
-    migrate('down', '1');
+    migrate('down', count4900);
     const gone = await pool.query(
       `SELECT 1 FROM information_schema.columns
         WHERE table_name = 'human_request_deliveries' AND column_name = 'message_id'`,
@@ -479,7 +484,76 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     ).resolves.toBeDefined();
     await truncate();
     migrate('up');
-    expect((await since('4900000000000')) === '1').toBe(true);
+    expect(Number(await since('4900000000000'))).toBeGreaterThanOrEqual(1);
+  });
+
+  it('migration 5000: scheduling decisions, every older one kept, guarded down', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    await store.insertDelivery(reminderItem('sc-1'));
+    // Every new decision is accepted, and the old ones (4900's included)
+    // still are; an unknown one is not.
+    for (const decision of [
+      ...SCHEDULE_DECISIONS,
+      ...LIVE_DECISIONS,
+      'HUMAN_SESSION',
+      'REQUEST_CLOSED',
+      'WINDOW_CLOSED',
+      'LOCAL_FAILURE',
+    ])
+      await expect(
+        pool.query(
+          `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'sc-1'`,
+          [decision],
+        ),
+      ).resolves.toBeDefined();
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'NOPE' WHERE delivery_id = 'sc-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    // A scheduled item goes through the store like any other.
+    await store.insertDelivery(rescheduledItem('sc-2'));
+    await expect(store.getDelivery('sc-2')).resolves.toMatchObject({
+      type: 'conversation.rescheduled',
+      requestId: 'req-sc-2',
+      item: { type: 'conversation.rescheduled' },
+    });
+    await truncate();
+
+    // down refuses while a row uses a scheduling decision (and leaves the
+    // schema as it was: one transaction).
+    const count5000 = await since('5000000000000');
+    for (const decision of SCHEDULE_DECISIONS) {
+      await store.insertDelivery(reminderItem('sc-3'));
+      await pool.query(
+        `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'sc-3'`,
+        [decision],
+      );
+      expect(() => migrate('down', count5000)).toThrow(/refusing to roll back/);
+      await expect(since('5000000000000')).resolves.toBe(count5000);
+      await truncate();
+    }
+
+    // A row with an older decision does not block it; the old CHECK is back.
+    await store.insertDelivery(reminderItem('sc-4'));
+    await pool.query(
+      `UPDATE human_request_deliveries SET decision = 'FAREWELL' WHERE delivery_id = 'sc-4'`,
+    );
+    migrate('down', count5000);
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'REMINDER_SENT' WHERE delivery_id = 'sc-4'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    // 4900's decisions still pass the restored CHECK.
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'SEND_REFUSED' WHERE delivery_id = 'sc-4'`,
+      ),
+    ).resolves.toBeDefined();
+    await truncate();
+    migrate('up');
+    await expect(since('5000000000000')).resolves.toBe('1');
   });
 
   runHumanRequestFeedStoreContract('postgres', () =>

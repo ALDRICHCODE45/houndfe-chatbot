@@ -29,6 +29,9 @@ import {
   HumanRequestsServicesModule,
 } from './human-requests.module';
 import { PostgresHumanRequestFeedStore } from './infrastructure/postgres-human-request-feed.store';
+import { SCHEDULED_APPOINTMENT_READER } from './application/scheduled-conversation.service';
+import { SchedulingStateService } from '../scheduling/application/scheduling-state.service';
+import { StoredAppointmentReader } from '../scheduling/application/stored-appointment.reader';
 
 const fakePool = () => {
   const client = {
@@ -114,6 +117,57 @@ describe('HumanRequestsModule', () => {
     const ports = (delivery as unknown as { ports: { live: unknown } }).ports;
     expect(ports.live).toBeInstanceOf(LiveConversationService);
     await moduleRef.close();
+  });
+
+  describe('unit 14 T4 wiring (scheduling state ports)', () => {
+    it('provides SCHEDULED_APPOINTMENT_READER backed by the scheduling state and hands it to the scheduled handler', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const reader = moduleRef.get<unknown>(SCHEDULED_APPOINTMENT_READER);
+      expect(reader).toBeInstanceOf(StoredAppointmentReader);
+      const delivery = moduleRef.get(HumanRequestDeliveryService);
+      const scheduled = (
+        delivery as unknown as {
+          ports: {
+            scheduled: {
+              ports: { appointments: unknown; appointmentWriter: unknown };
+            };
+          };
+        }
+      ).ports.scheduled;
+      expect(scheduled.ports.appointments).toBe(reader);
+      expect(scheduled.ports.appointmentWriter).toBe(
+        moduleRef.get(SchedulingStateService),
+      );
+      await moduleRef.close();
+    });
+
+    it('gives the live handler and the delivery service the scheduling state (offer / appointment clears)', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const state = moduleRef.get(SchedulingStateService);
+      const delivery = moduleRef.get(HumanRequestDeliveryService);
+      const ports = (
+        delivery as unknown as {
+          ports: {
+            schedule: unknown;
+            live: { ports: { scheduling: unknown } };
+          };
+        }
+      ).ports;
+      expect(ports.schedule).toBe(state);
+      expect(ports.live.ports.scheduling).toBe(state);
+      await moduleRef.close();
+    });
+
+    it('SchedulingModule and the human requests share ONE scheduling state service', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      expect(moduleRef.get(SchedulingStateService)).toBeInstanceOf(
+        SchedulingStateService,
+      );
+      await moduleRef.close();
+    });
   });
 
   it('gives the live conversation handler the WhatsApp sender for staff relays (T5)', async () => {

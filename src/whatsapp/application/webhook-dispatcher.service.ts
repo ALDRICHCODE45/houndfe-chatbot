@@ -193,6 +193,7 @@ export class WebhookDispatcherService {
     @Inject(OUT_OF_HOURS_POLICY)
     outOfHours?: OutOfHoursPolicy,
   ) {
+    this.outOfHours = outOfHours;
     this.talkToHuman =
       team === undefined
         ? undefined
@@ -203,6 +204,7 @@ export class WebhookDispatcherService {
   }
 
   private readonly talkToHuman?: TalkToHumanService;
+  private readonly outOfHours?: OutOfHoursPolicy;
 
   async dispatch(event: WebhookEventDto): Promise<void> {
     // ─── (0) S3 statuses → outbox; never the agent or a reply ─────────
@@ -357,6 +359,13 @@ export class WebhookDispatcherService {
         // promised nothing falls through to the normal turn.
         if (await this.tryTalkToHuman(message)) continue;
 
+        // ─── (3d) Unit 14 T3: the answer to a slot offer ────────────────
+        // Plain text only, BEFORE the LLM turn: with an active offer the
+        // policy parses the choice and books inline. `pass` (no offer, an
+        // expired one, a second unclear answer, a transient booking failure)
+        // falls through to the normal turn.
+        if (await this.trySchedulingReply(message)) continue;
+
         // ─── (4) Pending-marker short-circuit (ADR-29 defense-in-depth)
         // The runner has the same gate; this branch keeps the dispatcher
         // consistent even if a caller bypasses the runner.
@@ -509,15 +518,60 @@ export class WebhookDispatcherService {
       triggerWaMessageId: message.messageId,
     });
     if (reply === null) return false;
+    return this.sendPolicyReply(message, reply, 'talk-to-human');
+  }
+
+  /**
+   * Unit 14 T3: the scheduling policy answers the customer's plain text
+   * while an offer may be active. True when the message was handled. A
+   * throwing policy never blocks the message (the normal turn runs).
+   */
+  private async trySchedulingReply(message: InboundMessage): Promise<boolean> {
+    const policy = this.outOfHours;
+    if (
+      policy?.handleReply === undefined ||
+      message.media != null ||
+      message.mirrorOnly !== undefined ||
+      message.interactiveReplyId !== undefined ||
+      message.text.trim() === ''
+    )
+      return false;
+    let outcome;
+    try {
+      outcome = await policy.handleReply({
+        senderId: message.senderId,
+        text: message.text,
+        inboundAt: Number.isNaN(Date.parse(message.timestamp))
+          ? null
+          : new Date(message.timestamp).toISOString(),
+        messageId: message.messageId,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `scheduling reply failed for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}: ${describeError(error)}`,
+      );
+      return false;
+    }
+    if (outcome.kind === 'pass') return false;
+    return this.sendPolicyReply(message, outcome.text, 'scheduling');
+  }
+
+  /** Mode re-check right before the send (a claim may have landed during the
+   *  create/booking), then the styled reply. Always handled. */
+  private async sendPolicyReply(
+    message: InboundMessage,
+    reply: string,
+    what: string,
+  ): Promise<boolean> {
     if (await this.isHumanMode(message.senderId)) {
       this.logger.log(
-        `handoff HUMAN mid-turn: drop talk-to-human reply for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+        `handoff HUMAN mid-turn: drop ${what} reply for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
       );
       await this.markSeenSafely(message.messageId);
       return true;
     }
     this.logger.log(
-      `talk-to-human handled ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+      `${what} handled ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
     );
     await this.replyAndMarkSeen(
       message,

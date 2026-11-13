@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   isLiveConversationItem,
+  isScheduledConversationItem,
   normalizeDeliveryOutcome,
   type FeedItem,
   type RecordDeliveryOutcomeResult,
@@ -19,6 +20,7 @@ import type {
   LiveSendResult,
 } from './live-conversation.service';
 import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
+import type { ScheduledConversationHandler } from './scheduled-conversation.service';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -64,6 +66,15 @@ export interface HumanRequestDeliveryPorts {
    *  of T1 (a claim reverts after its start timeout), so hand-built
    *  harnesses keep working. */
   live?: LiveConversationHandler;
+  /** Scheduled conversations (unit 14): `conversation.scheduled_reminder`
+   *  and `conversation.rescheduled`. Without it those items stay the safe
+   *  STALE / UNKNOWN_TYPE (nothing is sent). */
+  scheduled?: ScheduledConversationHandler;
+  /** Unit 14 T4: a staff cancel drops the cancelled request's stored
+   *  appointment. Optional; a failure is logged, never blocks the notice. */
+  schedule?: {
+    clearAppointment(senderId: string, requestId: string): Promise<void>;
+  };
 }
 
 export interface HumanRequestDeliveryOptions {
@@ -638,10 +649,9 @@ export class HumanRequestDeliveryService {
     // T6 (L10 a): live sends re-read the mode/epoch right before the
     // sender, one local read. The read sits just before the SENDING claim
     // (a failed read throws with nothing claimed, so the item is retried).
-    if (
-      (plan.action === 'relay' || plan.live === true) &&
-      plan.guard !== undefined
-    ) {
+    // Scheduled notices carry a guard too (window and schedule re-read), but
+    // are not live: the HUMAN hold above already ran for them.
+    if (plan.guard !== undefined) {
       const changed = await plan.guard();
       if (changed !== null) {
         const next = await this.ports.store.transition(
@@ -849,6 +859,23 @@ export class HumanRequestDeliveryService {
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }
 
+    if (isScheduledConversationItem(item)) {
+      if (this.ports.scheduled !== undefined) {
+        const planned = await this.ports.scheduled.plan(row, item);
+        // A notice that may not wait: HUMAN mode is an immediate STALE
+        // (HUMAN_SESSION), a closed window is STALE, never a deferral.
+        return planned.action === 'send'
+          ? { ...planned, cancellation: true }
+          : planned.action === 'stale'
+            ? planned
+            : { action: 'stale', decision: 'UNKNOWN_TYPE' };
+      }
+      this.logger.warn(
+        `feed item ${row.deliveryId} of type ${item.type} has no handler wired: STALE`,
+      );
+      return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+    }
+
     if (item.type === 'request.answered') {
       const payload = item.payload;
       // L4: the legacy poll paths deliver wrapped decisions.
@@ -914,6 +941,7 @@ export class HumanRequestDeliveryService {
     // request.cancelled: forget the request's pending state first.
     const payload = item.payload;
     await this.ports.store.closeRequest(payload.requestId, 'CANCELLED');
+    await this.forgetAppointment(row, payload.requestId);
     if (payload.reason === 'DUPLICATE')
       return { action: 'stale', decision: 'DUPLICATE' };
     const senderId = this.recipient(row);
@@ -933,6 +961,24 @@ export class HumanRequestDeliveryService {
           : withTeamPrefix(note, null, style),
       cancellation: true,
     };
+  }
+
+  /** The cancelled request's appointment must not answer "¿a qué hora
+   *  quedé?" any more. Best-effort. */
+  private async forgetAppointment(
+    row: DeliveryRow,
+    requestId: string,
+  ): Promise<void> {
+    if (this.ports.schedule === undefined) return;
+    const senderId = senderIdFromRef(row.conversationRef);
+    if (senderId === null) return;
+    try {
+      await this.ports.schedule.clearAppointment(senderId, requestId);
+    } catch (error) {
+      this.logger.warn(
+        `feed item ${row.deliveryId}: stored appointment of ${requestId} not cleared: ${describeError(error)}`,
+      );
+    }
   }
 
   private recipient(row: DeliveryRow): string | null {

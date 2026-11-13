@@ -1,6 +1,17 @@
 import type { DeliveryZoneIntakeInput } from './human-decisions-delivery-zone.dto';
 import type { ExpirationIntakeInput } from './human-decisions-expiration.dto';
 import type { RestockIntakeInput } from './human-decisions.dto';
+import {
+  parseAlreadyScheduled,
+  parseScheduledBookingFields,
+  parseSlotUnavailable,
+  type AlreadyScheduled,
+  type ScheduledBookingFields,
+  type SlotUnavailable,
+} from './scheduling.dto';
+
+export type { AlreadyScheduled, SlotUnavailable };
+export { parseAlreadyScheduled, parseSlotUnavailable };
 
 /**
  * Human requests (docs/contracts/human-intervention-requests-5a.md) and the
@@ -47,6 +58,9 @@ interface CreateHumanRequestCommon {
   context?: HumanRequestContext;
   dedupKey?: string;
   triggerWaMessageId?: string;
+  /** Transport hint, never sent on the wire: this call's timeout in ms (the
+   *  caller's remaining deadline); absent = the client's default. */
+  timeoutMs?: number;
 }
 
 /** Direct subtypes require the conversation envelope. */
@@ -58,6 +72,10 @@ export type CreateDirectHumanRequestInput = CreateHumanRequestCommon & {
   /** 1..140 chars. */
   summary: string;
   detail?: Record<string, never>;
+  /** Unit 14: exactly the `startsAt` of a bookable slot (TALK_TO_HUMAN /
+   *  COMPLAINT only; the backend rejects it on other subtypes). `null` or
+   *  absent is the unscheduled create. */
+  scheduledFor?: string | null;
 };
 
 /** Wrapped subtypes send today's human-decisions body as `detail`. */
@@ -84,6 +102,8 @@ export const HUMAN_REQUEST_SUMMARY_MAX_LENGTH = 140;
 export interface HumanRequestBusinessHours {
   openNow: boolean;
   nextOpenAt: string | null;
+  /** Unit 14: the branch's IANA zone, present when the backend sends it. */
+  timeZone?: string;
 }
 
 export interface HumanRequestCreated {
@@ -97,6 +117,12 @@ export interface HumanRequestCreated {
   businessHours: HumanRequestBusinessHours | null;
   /** Wrapped subtypes only: the legacy human-decision answer, kept raw. */
   legacy?: Record<string, unknown>;
+  /** Unit 14: set (with the three fields below) only when the answer is for
+   *  a scheduled booking. */
+  scheduledFor?: ScheduledBookingFields['scheduledFor'];
+  scheduleVersion?: ScheduledBookingFields['scheduleVersion'];
+  requiresTemplateAtStart?: ScheduledBookingFields['requiresTemplateAtStart'];
+  whatsappWindowClosesAt?: ScheduledBookingFields['whatsappWindowClosesAt'];
 }
 
 export type RateLimitedResult = {
@@ -121,6 +147,10 @@ export type CreateHumanRequestResult =
   | { kind: 'SUBTYPE_DISABLED' }
   | { kind: 'SCHEDULING_DISABLED' }
   | { kind: 'VERSION_CONFLICT' }
+  /** Unit 14, 409: re-offer the fresh `slots`; never retry the same slot. */
+  | SlotUnavailable
+  /** Unit 14, 409: the customer already holds a time; offer to reschedule. */
+  | AlreadyScheduled
   | ValidationErrorResult
   | { kind: 'NOT_FOUND' };
 
@@ -400,6 +430,46 @@ export type LiveConversationItem =
   | ConversationReassignedItem
   | ConversationEndedItem;
 
+// ------------------------------------------------ scheduled conversations
+
+/** Backend unit 14 (contract "Scheduled conversations"): about 10 minutes
+ *  before `scheduledFor`, only for an open request still waiting. Sent to
+ *  the customer only while the 24 h window is open and the chat is not
+ *  HUMAN; otherwise ACK STALE (never deferred). `timeZone` (the branch's
+ *  IANA zone) and `whatsappWindowClosesAt` (the backend's estimate, Meta
+ *  decides) are informational: a missing or malformed one is `null`. */
+export interface ScheduledReminderPayload {
+  requestId: string;
+  scheduledFor: string;
+  /** Monotonic per request (>= 1): the reminder is for this version. */
+  scheduleVersion: number;
+  timeZone: string | null;
+  whatsappWindowClosesAt: string | null;
+}
+export type ScheduledReminderItem = FeedItemEnvelope & {
+  type: 'conversation.scheduled_reminder';
+  payload: ScheduledReminderPayload;
+};
+
+/** Staff changed the time. Same send rules and ACK outcomes as the
+ *  reminder. */
+export interface ConversationRescheduledPayload {
+  requestId: string;
+  scheduledFor: string;
+  previousScheduledFor: string;
+  scheduleVersion: number;
+  timeZone: string | null;
+  whatsappWindowClosesAt: string | null;
+}
+export type ConversationRescheduledItem = FeedItemEnvelope & {
+  type: 'conversation.rescheduled';
+  payload: ConversationRescheduledPayload;
+};
+
+export type ScheduledConversationItem =
+  | ScheduledReminderItem
+  | ConversationRescheduledItem;
+
 /** A type this bot does not know (or a malformed known one): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
@@ -416,6 +486,7 @@ export type FeedItem =
   | RequestCancelledItem
   | RequestOverdueNoticeItem
   | LiveConversationItem
+  | ScheduledConversationItem
   | UnknownFeedItem;
 
 export type ReadFeedResult =
@@ -668,13 +739,20 @@ export function parseHumanRequestCreated(
       !isNullableString(businessHours.nextOpenAt ?? null)
     )
       return null;
+    if (businessHours.timeZone !== undefined && !isText(businessHours.timeZone))
+      return null;
     hours = {
       openNow: businessHours.openNow,
       nextOpenAt:
         (businessHours.nextOpenAt as string | null | undefined) ?? null,
+      ...(businessHours.timeZone === undefined
+        ? {}
+        : { timeZone: businessHours.timeZone }),
     };
   }
   if (legacy !== undefined && legacy !== null && !isRecord(legacy)) return null;
+  const scheduled = parseScheduledBookingFields(body);
+  if (scheduled === null) return null;
   return {
     id,
     folio,
@@ -683,6 +761,7 @@ export function parseHumanRequestCreated(
     mergedIntoId,
     businessHours: hours,
     ...(isRecord(legacy) ? { legacy } : {}),
+    ...(scheduled === undefined ? {} : scheduled),
   };
 }
 
@@ -921,6 +1000,17 @@ export function parseFeedItem(item: unknown): FeedItem | null {
   if (LIVE_TYPES.has(item.type))
     return (
       parseLiveItem(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
+  // Unit 14: a malformed scheduled item is ACKed STALE as unknown too.
+  if (SCHEDULE_TYPES.has(item.type))
+    return (
+      parseScheduleItem(item, item.cursor, item.deliveryId) ?? {
         type: 'unknown',
         rawType: item.type,
         cursor: item.cursor,
@@ -1245,6 +1335,95 @@ function parseLiveItem(
   }
 }
 
+const SCHEDULE_TYPES: ReadonlySet<string> = new Set([
+  'conversation.scheduled_reminder',
+  'conversation.rescheduled',
+]);
+/** True for the two typed unit 14 items. */
+export const isScheduledConversationItem = (
+  item: FeedItem,
+): item is ScheduledConversationItem =>
+  item.type !== 'unknown' && SCHEDULE_TYPES.has(item.type);
+
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+const isInstantText = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  ISO_INSTANT.test(value) &&
+  !Number.isNaN(Date.parse(value));
+const isScheduleVersion = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 1;
+/** An IANA zone this runtime can format with; anything else is no zone. */
+const zoneOrNull = (value: unknown): string | null => {
+  if (!isText(value)) return null;
+  try {
+    new Intl.DateTimeFormat('es-MX', { timeZone: value });
+    return value;
+  } catch {
+    return null;
+  }
+};
+
+/** `conversation.scheduled_reminder` / `conversation.rescheduled` (unit 14):
+ *  needs the request, `scheduledFor` and `scheduleVersion` (and
+ *  `previousScheduledFor` for a reschedule); the zone and the window estimate
+ *  are informational. Null (→ unknown) when malformed. */
+function parseScheduleItem(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): ScheduledConversationItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const { payload } = item;
+  if (
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    !isRecord(payload)
+  )
+    return null;
+  // The envelope and the payload name the same request.
+  const requestId = [item.requestId, payload.requestId].find(isText);
+  if (
+    requestId === undefined ||
+    (item.requestId !== undefined && item.requestId !== requestId) ||
+    (payload.requestId !== undefined && payload.requestId !== requestId) ||
+    !isInstantText(payload.scheduledFor) ||
+    !isScheduleVersion(payload.scheduleVersion)
+  )
+    return null;
+  const envelope: FeedItemEnvelope = {
+    cursor,
+    deliveryId,
+    requestId,
+    conversationRef: item.conversationRef ?? null,
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+  };
+  const common = {
+    requestId,
+    scheduledFor: payload.scheduledFor,
+    scheduleVersion: payload.scheduleVersion,
+    timeZone: zoneOrNull(payload.timeZone),
+    whatsappWindowClosesAt: isInstantText(payload.whatsappWindowClosesAt)
+      ? payload.whatsappWindowClosesAt
+      : null,
+  };
+  if (item.type === 'conversation.scheduled_reminder')
+    return {
+      ...envelope,
+      type: 'conversation.scheduled_reminder',
+      payload: common,
+    };
+  if (item.type !== 'conversation.rescheduled') return null;
+  if (!isInstantText(payload.previousScheduledFor)) return null;
+  return {
+    ...envelope,
+    type: 'conversation.rescheduled',
+    payload: { ...common, previousScheduledFor: payload.previousScheduledFor },
+  };
+}
+
 function parseItems(items: unknown): FeedItem[] | null {
   if (!Array.isArray(items)) return null;
   const parsed: FeedItem[] = [];
@@ -1384,7 +1563,10 @@ export function isCreateHumanRequestInput(
     isText(input.conversationRef) &&
     isText(input.lastCustomerMessageAt) &&
     isText(input.summary) &&
-    input.summary.length <= HUMAN_REQUEST_SUMMARY_MAX_LENGTH
+    input.summary.length <= HUMAN_REQUEST_SUMMARY_MAX_LENGTH &&
+    (input.scheduledFor === undefined ||
+      input.scheduledFor === null ||
+      isText(input.scheduledFor))
   );
 }
 
@@ -1404,10 +1586,12 @@ export function toCreateHumanRequestBody(
     'dedupKey',
     'triggerWaMessageId',
     'detail',
+    'scheduledFor',
   ] as const;
   const source = input as Partial<Record<(typeof keys)[number], unknown>>;
   const body: Record<string, unknown> = {};
   for (const key of keys)
-    if (source[key] !== undefined) body[key] = source[key];
+    if (source[key] !== undefined && source[key] !== null)
+      body[key] = source[key];
   return body;
 }

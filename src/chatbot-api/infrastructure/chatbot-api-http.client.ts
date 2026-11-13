@@ -17,6 +17,21 @@ import type {
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
 import type { ConversationMirrorClient } from '../domain/conversation-mirror.port';
 import type { LiveConversationClient } from '../domain/live-conversation.port';
+import type { SchedulingClient } from '../domain/scheduling.port';
+import {
+  isSchedulingIdempotencyKey,
+  listSlotsProblem,
+  parseAlreadyScheduled,
+  parseRescheduleOk,
+  parseSlotUnavailable,
+  parseSlotsAnswer,
+  rescheduleProblem,
+  toRescheduleBody,
+  type ListSlotsInput,
+  type ListSlotsResult,
+  type RescheduleRequestInput,
+  type RescheduleRequestResult,
+} from '../domain/dtos/scheduling.dto';
 import {
   STAFF_MEDIA_MAX_BYTES,
   UNKNOWN_CONVERSATION_STATE,
@@ -239,6 +254,12 @@ export const LIVE_CONVERSATION_TIMEOUTS_MS = {
   read: 10_000,
   mediaDownload: 60_000,
 } as const;
+/** Unit 14 timeouts: both calls sit on the customer's reply path, and the
+ *  backend answers in ~10–20 ms (p95), so they fail fast. */
+export const SCHEDULING_TIMEOUTS_MS = {
+  slots: 10_000,
+  reschedule: 10_000,
+} as const;
 /** Largest error body read back from a failed streamed download. */
 const STREAMED_ERROR_BODY_MAX_BYTES = 4096;
 const STREAMED_ERROR_BODY_READ_MS = 2_000;
@@ -258,7 +279,8 @@ export class ChatbotApiHttpClient
     ChatbotApiClient,
     HumanRequestsClient,
     ConversationMirrorClient,
-    LiveConversationClient
+    LiveConversationClient,
+    SchedulingClient
 {
   constructor(
     private readonly httpService: HttpService,
@@ -1176,6 +1198,12 @@ export class ChatbotApiHttpClient
         url: '/chatbot-api/requests',
         data: toCreateHumanRequestBody(input),
         headers: { 'X-Idempotency-Key': input.sourceRequestId },
+        // The caller's remaining deadline, when it gives one.
+        ...(typeof input.timeoutMs === 'number' &&
+        Number.isFinite(input.timeoutMs) &&
+        input.timeoutMs > 0
+          ? { timeout: Math.ceil(input.timeoutMs) }
+          : {}),
       });
     } catch (error) {
       const failure = documentedFailure(error);
@@ -1201,6 +1229,15 @@ export class ChatbotApiHttpClient
           (code === 'SUBTYPE_DISABLED' || code === 'SCHEDULING_DISABLED'))
       )
         return { kind: code };
+      if (status === 409 && code === 'SLOT_UNAVAILABLE') {
+        // A body that breaks the contract falls through to the throw below.
+        const unavailable = parseSlotUnavailable(body);
+        if (unavailable !== null) return unavailable;
+      }
+      if (status === 409 && code === 'ALREADY_SCHEDULED') {
+        const already = parseAlreadyScheduled(body);
+        if (already !== null) return already;
+      }
       if (status === 400)
         return { kind: 'VALIDATION_ERROR', message: messageField(body) };
       if (status === 404) return { kind: 'NOT_FOUND' };
@@ -1838,6 +1875,102 @@ export class ChatbotApiHttpClient
         code: null,
       };
     return { kind: 'ok', ...page };
+  }
+
+  // ------------------------------------------------ scheduling (unit 14)
+
+  /**
+   * `GET /chatbot-api/scheduling/slots` (unit 14). One GET, never retried
+   * here; `422 SCHEDULING_DISABLED` is its own kind (fall back to the unit 11
+   * out-of-hours create). Never throws; the ref never appears in a result or
+   * a log.
+   */
+  async listSlots(input: ListSlotsInput): Promise<ListSlotsResult> {
+    if (!isValidConversationRef(input?.conversationRef))
+      return localValidation(
+        `conversationRef is out of contract (1 to ${MIRROR_CONVERSATION_REF_MAX_CHARS} characters of A-Z a-z 0-9 : _ . @ + -)`,
+      );
+    const problem = listSlotsProblem(input);
+    if (problem !== null) return localValidation(problem);
+    const outcome = await this.mirrorPost({
+      method: 'GET',
+      url: '/chatbot-api/scheduling/slots',
+      params: {
+        conversationRef: input.conversationRef,
+        lastCustomerMessageAt: input.lastCustomerMessageAt,
+      },
+      timeout: SCHEDULING_TIMEOUTS_MS.slots,
+    });
+    if (!outcome.ok) {
+      const { status, code } = outcome.failure;
+      if (status === 422 && code === 'SCHEDULING_DISABLED')
+        return { kind: 'SCHEDULING_DISABLED' };
+      return classifyMirrorFailure(outcome.failure);
+    }
+    const answer =
+      outcome.response.status === 200
+        ? parseSlotsAnswer(outcome.response.data)
+        : null;
+    if (answer === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return { kind: 'ok', ...answer };
+  }
+
+  /**
+   * `POST /chatbot-api/requests/:id/reschedule` (unit 14) with the caller's
+   * `X-Idempotency-Key`. Exactly one POST, never retried here (a
+   * SLOT_UNAVAILABLE means re-offer; the key may be reused after any 4xx).
+   * Never throws.
+   */
+  async rescheduleRequest(
+    requestId: string,
+    input: RescheduleRequestInput,
+    idempotencyKey: string,
+  ): Promise<RescheduleRequestResult> {
+    const problem = rescheduleProblem(requestId, input, idempotencyKey);
+    if (problem !== null || !isSchedulingIdempotencyKey(idempotencyKey))
+      return localValidation(problem ?? 'idempotencyKey must be a UUID');
+    const outcome = await this.mirrorPost({
+      method: 'POST',
+      url: `/chatbot-api/requests/${encodeURIComponent(requestId)}/reschedule`,
+      data: toRescheduleBody(input),
+      headers: { 'X-Idempotency-Key': idempotencyKey },
+      timeout: SCHEDULING_TIMEOUTS_MS.reschedule,
+    });
+    if (!outcome.ok) {
+      const { status, code, body } = outcome.failure;
+      if (status === 409 && code === 'SLOT_UNAVAILABLE')
+        return (
+          parseSlotUnavailable(body) ?? { kind: 'UNEXPECTED', status, code }
+        );
+      if (
+        status === 409 &&
+        (code === 'REQUEST_CLOSED' ||
+          code === 'NOT_SCHEDULED' ||
+          code === 'RESCHEDULE_NOT_ALLOWED' ||
+          code === 'IDEMPOTENCY_CONFLICT')
+      )
+        return { kind: code };
+      if (status === 422 && code === 'SCHEDULING_DISABLED')
+        return { kind: 'SCHEDULING_DISABLED' };
+      if (status === 404) return { kind: 'NOT_FOUND' };
+      return classifyMirrorFailure(outcome.failure);
+    }
+    const ok =
+      outcome.response.status === 200
+        ? parseRescheduleOk(outcome.response.data, requestId)
+        : null;
+    if (ok === null)
+      return {
+        kind: 'UNEXPECTED',
+        status: outcome.response.status,
+        code: null,
+      };
+    return ok;
   }
 
   /**
