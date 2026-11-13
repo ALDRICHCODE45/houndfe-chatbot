@@ -7,7 +7,7 @@ Source of truth: `houndfe-backend/docs/proposals/human-intervention-backend-prop
 - `409 CUSTOMER_OPEN_LIMIT`: at most 20 open requests per customer, counting all subtypes together. The body carries `{limit, open}`.
 - The mirror carries all traffic in both directions from cutover, bot-mode turns included. A bot outbound message is sent as `direction: OUT` plus `author: BOT`; there is no `OUTBOUND_BOT` value. `messages:batch` carries no epoch. The epoch travels only in `session-ack` and in feed events.
 - New credential scopes, on top of the existing ones: `requests:create`, `requests:read`, `requests:cancel`, `feed:read`, `feed:ack`, `conversation:write`, `media:write`.
-- `session-ack STARTED` is sent as soon as muted mode is durably saved, without waiting on Meta. A failed greeting is reported separately.
+- `session-ack STARTED` is sent as soon as muted mode is durably saved, without waiting on Meta. The greeting goes out only after the ack returns 200 (final unit 11 contract, 5b1ce241); a failed greeting is reported in the item outcome.
 - Audio is always uploaded and mirrored. With nobody attending, the bot also asks the customer to write it. Video and location are not stored in v1.
 - Scheduling slots carry no `label`. They always include the branch IANA `timeZone`, and the bot formats `startsAt` itself in the customer's tú/usted style.
 - Traffic budgets are sized for 60 inbound/min per branch with headroom, configurable.
@@ -148,11 +148,11 @@ Staff can cancel a clarification, or a `TALK_TO_HUMAN`/`COMPLAINT` while its ses
 ## Live conversation (§4), chatbot obligations
 
 - **Every order carries an epoch** (`handoffEpoch`, incremented each time the conversation goes to a human). The bot ignores orders from an older epoch.
-- **Session states:** WAITING (bot keeps helping, no promises) → STARTING (claim; feed `conversation.started{epoch, staffFirstName}`) → ACTIVE (after the bot's `session-ack STARTED`) → ENDING (finish, 2 h auto-return or forced) → ENDED (after `session-ack ENDED`). Without an ACK within 60 s, STARTING reverts to WAITING.
-- **On `conversation.started`:** durably persist muted mode with the epoch, send "Le atiende <nombre>…" in the customer's style, then `session-ack STARTED` with `providerMessageId` when available.
+- **Session states:** WAITING (bot keeps helping, no promises) → STARTING (claim; feed `conversation.started{epoch, staffFirstName}`) → ACTIVE (after the bot's `session-ack STARTED`) → ENDING (finish, 2 h auto-return or forced) → ENDED (after `session-ack ENDED`). Without an ACK within the per-tenant start timeout (default 120 s), STARTING reverts to WAITING.
+- **On `conversation.started`:** durably persist muted mode with the epoch, then `session-ack STARTED`, and only after a 200 send "Le atiende <nombre>…" in the customer's style (a 409 means no greeting). Superseded order: the earlier draft sent the greeting before the ack. Implementation and full rules: `odd/tasks/human-intervention-live-conversation.md` (S2).
 - **While muted:** never call the LLM. Mirror customer messages through the outbox (deduplicated by `waMessageId`).
 - **Staff messages:** reject stale epochs, deduplicate by `messageId`, send in `seq` order (hold a later `seq` up to 30 s waiting for the missing one), send the text verbatim with no prefix, then ACK the delivery with the `providerMessageId`.
-- **On `conversation.ended`:** unmute, send the farewell, then `session-ack ENDED`.
+- **On `conversation.ended`:** unmute durably (keep the epoch), send the farewell when `farewell` is true and the window is open, report the outcome, then `session-ack ENDED`, then replay held deliveries (farewell first). START_TIMEOUT reverts silently; the resume notice goes out only if a greeting did.
 - **Safety rule:** if the feed fails for more than 10 min while muted, send once "Tenemos una falla técnica, en cuanto se resuelva le respondemos" and stay muted. Never speak on its own while the epoch is HUMAN.
 - **Reconcile mode** with `GET /chatbot-api/conversations/:ref/state` at startup and every 5 min while muted. The backend always wins.
 - **Window:** Meta is the source of truth. If Meta rejects for a closed window, report `DEFERRED_WINDOW_CLOSED`.
