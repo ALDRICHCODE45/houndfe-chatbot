@@ -16,6 +16,8 @@ import {
   HUMAN_REQUESTS_CLIENT,
   type HumanRequestsClient,
 } from '../chatbot-api/domain/chatbot-api.client';
+import { LIVE_CONVERSATION_CLIENT } from '../chatbot-api/domain/live-conversation.port';
+import type { LiveConversationClient } from '../chatbot-api/domain/live-conversation.port';
 import { HandoffModeService } from '../conversation/application/handoff-mode.service';
 import { ConversationModule } from '../conversation/conversation.module';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
@@ -34,6 +36,7 @@ import {
   HumanRequestCreateService,
 } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
+import { LiveConversationService } from './application/live-conversation.service';
 import { HumanRequestFeedConsumer } from './application/human-request-feed.consumer';
 import { HumanRequestMaintenanceWorker } from './application/human-request-maintenance.worker';
 import {
@@ -165,21 +168,34 @@ const CUSTOMER_PORT_TOKENS = [
       useFactory: (
         store: HumanRequestFeedStore,
         client: HumanRequestsClient,
+        live: LiveConversationClient,
         sender: WhatsappSenderPort,
         handoff: HandoffModeService,
         config: ConfigService,
         pool: Pool,
         profiles?: CustomerProfileService,
-      ) =>
-        new HumanRequestDeliveryService({
+      ) => {
+        const ports = customerPorts(handoff, config, pool, profiles);
+        return new HumanRequestDeliveryService({
           store,
           client,
           sender,
-          ...customerPorts(handoff, config, pool, profiles),
-        }),
+          ...ports,
+          // Live conversation T4: started / reassigned / ended.
+          live: new LiveConversationService({
+            mode: handoff,
+            client: live,
+            isWindowOpen: ports.isWindowOpen,
+            ...(ports.customerStyle === undefined
+              ? {}
+              : { customerStyle: ports.customerStyle }),
+          }),
+        });
+      },
       inject: [
         HUMAN_REQUEST_FEED_STORE,
         HUMAN_REQUESTS_CLIENT,
+        LIVE_CONVERSATION_CLIENT,
         WHATSAPP_SENDER,
         ...CUSTOMER_PORT_TOKENS,
       ],

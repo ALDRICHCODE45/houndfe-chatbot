@@ -300,6 +300,14 @@ export interface ConversationStore {
   ): Promise<HandoffApplyResult>;
 
   /**
+   * Live conversation T4: durably records that the greeting of `epoch` went
+   * out (`data.handoff.greetedEpoch`). Atomic per sender; applies only while
+   * the stored handoff epoch equals `epoch` (any mode), and never creates a
+   * row. `true` when recorded (also an idempotent repeat).
+   */
+  markHandoffGreeted?(senderId: string, epoch: number): Promise<boolean>;
+
+  /**
    * Returns the current state for a sender, or null if none exists.
    */
   get(senderId: string): Promise<ConversationState | null>;

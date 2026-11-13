@@ -54,6 +54,18 @@ export class HandoffModeService {
     return this.apply(senderId, { mode: 'BOT', epoch, requestId: null });
   }
 
+  /**
+   * Live conversation T4: records that the greeting of `epoch` went out (a
+   * START_TIMEOUT resume notice is only sent for a greeting that did).
+   * `false` when the stored epoch is not `epoch`.
+   */
+  async markGreeted(senderId: string, epoch: number): Promise<boolean> {
+    if (this.store.markHandoffGreeted === undefined) {
+      throw new Error('ConversationStore does not support handoff mode');
+    }
+    return this.store.markHandoffGreeted(senderId, epoch);
+  }
+
   private async apply(
     senderId: string,
     transition: HandoffTransition,

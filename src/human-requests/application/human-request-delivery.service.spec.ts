@@ -702,9 +702,11 @@ describe('HumanRequestDeliveryService', () => {
     );
   });
 
-  // TODO(T4/T5): replaced by the real handlers; until then a typed live
-  // item behaves exactly like an unknown one.
-  describe('typed live conversation items (no handler yet)', () => {
+  // The lifecycle handlers (started / reassigned / ended) are covered in
+  // live-conversation.service.spec.ts. Without a handler wired, and for the
+  // staff_message / template items (T5), a typed live item behaves exactly
+  // like an unknown one.
+  describe('typed live conversation items (no handler wired)', () => {
     it.each([
       ['conversation.started', startedItem('lv1')],
       ['conversation.staff_message', staffMessageItem('lv2')],

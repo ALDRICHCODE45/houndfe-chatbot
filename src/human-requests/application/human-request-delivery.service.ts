@@ -13,6 +13,11 @@ import {
 } from '../../conversation/application/handoff-send-hold';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import type {
+  LiveConversationHandler,
+  LivePlan,
+  LiveSendResult,
+} from './live-conversation.service';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -51,6 +56,10 @@ export interface HumanRequestDeliveryPorts {
   isWindowOpen(senderId: string): Promise<boolean>;
   /** Stored customer style; null/failure keeps the usted copy. */
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  /** Live conversation (T4): started / reassigned / ended. Without it those
+   *  items stay the safe STALE of T1 (a claim reverts after its start
+   *  timeout), so hand-built harnesses keep working. */
+  live?: LiveConversationHandler;
 }
 
 export interface HumanRequestDeliveryOptions {
@@ -64,9 +73,15 @@ export interface HumanRequestDeliveryOptions {
   retentionMs?: number;
 }
 
+/** Live conversation hooks of a plan: see `LivePlan`. */
+interface LiveHooks {
+  after?: LivePlan['after'];
+  replay?: boolean;
+}
+
 type Plan =
-  | { action: 'stale'; decision: DeliveryDecision }
-  | {
+  | ({ action: 'stale'; decision: DeliveryDecision } & LiveHooks)
+  | ({
       action: 'send';
       decision: DeliveryDecision;
       senderId: string;
@@ -79,7 +94,10 @@ type Plan =
       /** request.overdue_notice: a HUMAN-mode hold is an immediate STALE
        *  (HUMAN_SESSION), never a local hold. */
       overdue?: boolean;
-    };
+      /** Live notice (greeting, reassignment, farewell, resume): sent while
+       *  the mode is HUMAN, so the HUMAN hold does not apply. */
+      live?: boolean;
+    } & LiveHooks);
 
 /**
  * Handles one feed item locally and owns its outcome ACK (S2–S5,
@@ -326,11 +344,20 @@ export class HumanRequestDeliveryService {
         providerMessageId: null,
         ack: 'STALE',
       });
-      if (next !== null) await this.flushAck(next);
+      if (next !== null) {
+        await this.flushAck(next);
+        await this.finishLive(plan, row, {
+          kind: 'NOT_SENT',
+          providerMessageId: null,
+        });
+      }
       return next !== null;
     }
 
-    const hold = await checkHandoffSendHold(this.ports.handoff, plan.senderId);
+    const hold =
+      plan.live === true
+        ? ({ hold: false } as const)
+        : await checkHandoffSendHold(this.ports.handoff, plan.senderId);
     if (hold.hold && hold.reason === 'MODE_UNREADABLE')
       throw new Error(`handoff mode unreadable: ${hold.error}`);
     if (hold.hold && plan.overdue === true) {
@@ -405,6 +432,10 @@ export class HumanRequestDeliveryService {
             : { localState: 'DEFERRED_WINDOW', ack: 'DEFERRED_WINDOW_CLOSED' }),
       });
       if (next !== null) await this.flushAck(next);
+      await this.finishLive(plan, row, {
+        kind: windowClosed ? 'NOT_SENT' : 'UNKNOWN',
+        providerMessageId: null,
+      });
       return true;
     }
     const sent = await this.ports.store.transition(row.deliveryId, claimed, {
@@ -418,7 +449,30 @@ export class HumanRequestDeliveryService {
         `delivery ${row.deliveryId} sent (${fingerprintMessageId(providerMessageId)}) but its row moved on`,
       );
     else await this.flushAck(sent);
+    await this.finishLive(plan, row, { kind: 'ACCEPTED', providerMessageId });
     return true;
+  }
+
+  /** Live conversation tail of a decided item, in contract order: the hook
+   *  (greeting record, session-ack ENDED) and then the replay of what the
+   *  HUMAN session held back. The outcome is already recorded, so a failure
+   *  here is logged and never re-runs the item. Never throws. */
+  private async finishLive(
+    plan: Plan,
+    row: DeliveryRow,
+    result: LiveSendResult,
+  ): Promise<void> {
+    if (plan.after !== undefined) {
+      try {
+        await plan.after(result);
+      } catch (error) {
+        this.logger.warn(
+          `delivery ${row.deliveryId} live follow-up failed: ${describeError(error)}`,
+        );
+      }
+    }
+    if (plan.replay === true && row.conversationRef !== null)
+      await this.onCustomerInbound(row.conversationRef);
   }
 
   private async plan(row: DeliveryRow): Promise<Plan> {
@@ -438,11 +492,23 @@ export class HumanRequestDeliveryService {
     }
 
     if (isLiveConversationItem(item)) {
-      // TODO(live conversation T4/T5): the handlers for conversation.started
-      // / reassigned / ended / staff_message and template.requested replace
-      // this branch. Until they land these items behave exactly as before
-      // the parser knew them (unknown type: nothing sent, ACK STALE), which
-      // is safe for a claim: the backend reverts it after the start timeout.
+      if (
+        this.ports.live !== undefined &&
+        (item.type === 'conversation.started' ||
+          item.type === 'conversation.reassigned' ||
+          item.type === 'conversation.ended')
+      ) {
+        const live = await this.ports.live.plan(row, item);
+        return live.action === 'stale'
+          ? live
+          : { ...live, cancellation: true, live: true };
+      }
+      // TODO(live conversation T5): conversation.staff_message and
+      // template.requested get their handler. Until then (and for the three
+      // lifecycle items when no handler is wired) these items behave exactly
+      // as before the parser knew them (unknown type: nothing sent, ACK
+      // STALE), which is safe for a claim: the backend reverts it after the
+      // start timeout.
       this.logger.warn(
         `feed item ${row.deliveryId} of live conversation type ${item.type} has no handler yet: STALE`,
       );

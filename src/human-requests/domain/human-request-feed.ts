@@ -261,6 +261,35 @@ export const CANCEL_NOTICE =
 export const OVERDUE_NOTICE =
   'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.';
 
+// Live conversation (unit 11) customer notices, S5 (owner-approved usted
+// copy; the tú variants are curated pairs in `customer-style.ts`). `{nombre}`
+// is replaced AFTER styling, so the staff name is never rewritten.
+export const LIVE_NAME_PLACEHOLDER = '{nombre}';
+export const LIVE_GREETING = 'Le atiende {nombre} del equipo HoundFe.';
+export const LIVE_GREETING_NO_NAME =
+  'Le atiende una persona del equipo HoundFe.';
+export const LIVE_REASSIGNED = 'Ahora le atiende {nombre}, del equipo HoundFe.';
+export const LIVE_REASSIGNED_NO_NAME =
+  'Ahora le atiende otra persona del equipo HoundFe.';
+export const LIVE_FAREWELL =
+  'Listo, terminó la atención con el equipo. Si necesita algo más, aquí sigo para ayudarle.';
+export const LIVE_RESUME = 'Seguimos por aquí, ¿en qué le ayudo?';
+
+/** A live notice in the customer's style; `name` null/blank → `noName`. */
+export function liveNotice(
+  withName: string,
+  noName: string,
+  name: string | null,
+  style: CustomerStyle | null,
+): string {
+  const trimmed = name?.trim() ?? '';
+  if (trimmed === '') return styleFixedCopy(noName, style);
+  return styleFixedCopy(withName, style).replace(
+    LIVE_NAME_PLACEHOLDER,
+    () => trimmed,
+  );
+}
+
 /** Fixed usted copy in the customer's stored style (usted when unknown);
  *  the tú variants are whole-sentence curated pairs in `customer-style.ts`. */
 export function styleFixedCopy(

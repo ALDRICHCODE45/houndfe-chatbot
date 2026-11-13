@@ -43,6 +43,22 @@ describe('HandoffModeService (S7)', () => {
     });
   });
 
+  it('markGreeted records that the greeting of the current epoch went out', async () => {
+    await service.applyStarted('wa-1', 2, 'req-2');
+    await expect(service.markGreeted('wa-1', 1)).resolves.toBe(false);
+    await expect(service.markGreeted('wa-1', 2)).resolves.toBe(true);
+    await expect(service.getState('wa-1')).resolves.toMatchObject({
+      mode: 'HUMAN',
+      epoch: 2,
+      greetedEpoch: 2,
+    });
+  });
+
+  it('markGreeted fails closed when the store cannot record it', async () => {
+    const bare = new HandoffModeService({} as never);
+    await expect(bare.markGreeted('wa-1', 1)).rejects.toThrow(/handoff/);
+  });
+
   it('never sends messages (it only owns the store)', () => {
     expect(Object.getOwnPropertyNames(HandoffModeService.prototype)).toEqual([
       'constructor',
@@ -50,6 +66,7 @@ describe('HandoffModeService (S7)', () => {
       'getState',
       'applyStarted',
       'applyEnded',
+      'markGreeted',
       'apply',
     ]);
   });

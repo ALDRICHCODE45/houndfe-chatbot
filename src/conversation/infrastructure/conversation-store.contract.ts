@@ -457,6 +457,67 @@ export function runConversationStoreContract(
         });
         await expect(store.getHandoff!('h11')).resolves.toMatchObject(bot(0));
       });
+
+      // T4: the greeting marker lives inside the CAS-owned handoff value, so
+      // it survives every writer that already preserves `handoff`.
+      describe('greeting marker (live conversation T4)', () => {
+        it('records the greeted epoch only for the current epoch', async () => {
+          await store.applyHandoff!('g1', human(3));
+          await expect(store.markHandoffGreeted!('g1', 2)).resolves.toBe(false);
+          await expect(store.markHandoffGreeted!('g1', 4)).resolves.toBe(false);
+          await expect(store.getHandoff!('g1')).resolves.not.toHaveProperty(
+            'greetedEpoch',
+          );
+          await expect(store.markHandoffGreeted!('g1', 3)).resolves.toBe(true);
+          await expect(store.getHandoff!('g1')).resolves.toMatchObject({
+            ...human(3),
+            greetedEpoch: 3,
+          });
+        });
+
+        it('creates no row and refuses a conversation without handoff', async () => {
+          await expect(store.markHandoffGreeted!('g2', 1)).resolves.toBe(false);
+          expect(await store.get('g2')).toBeNull();
+        });
+
+        it('is kept when the same epoch ends and dropped by a newer epoch', async () => {
+          await store.applyHandoff!('g3', human(2));
+          await store.markHandoffGreeted!('g3', 2);
+          await store.applyHandoff!('g3', bot(2));
+          await expect(store.getHandoff!('g3')).resolves.toMatchObject({
+            ...bot(2),
+            greetedEpoch: 2,
+          });
+          await store.applyHandoff!('g3', human(3));
+          await expect(store.getHandoff!('g3')).resolves.not.toHaveProperty(
+            'greetedEpoch',
+          );
+        });
+
+        it('is idempotent and survives update() writes', async () => {
+          await store.applyHandoff!('g4', human(1));
+          await store.markHandoffGreeted!('g4', 1);
+          await expect(store.markHandoffGreeted!('g4', 1)).resolves.toBe(true);
+          await store.update('g4', {
+            lastMessageAt: T,
+            data: { cart: ['x'], handoff: bot(9) as never },
+          });
+          await expect(store.getHandoff!('g4')).resolves.toMatchObject({
+            ...human(1),
+            greetedEpoch: 1,
+          });
+        });
+
+        it('refuses a non-integer or negative epoch', async () => {
+          await store.applyHandoff!('g5', human(1));
+          await expect(store.markHandoffGreeted!('g5', 1.5)).resolves.toBe(
+            false,
+          );
+          await expect(store.markHandoffGreeted!('g5', -1)).resolves.toBe(
+            false,
+          );
+        });
+      });
     });
 
     it('update() cannot resurrect a cleared marker', async () => {

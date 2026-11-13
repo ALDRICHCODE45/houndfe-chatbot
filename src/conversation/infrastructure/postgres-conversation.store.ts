@@ -13,6 +13,7 @@ import {
 } from '../domain/conversation-store';
 import {
   CorruptHandoffStateError,
+  isGreetedEpoch,
   readHandoffState,
   resolveHandoffApply,
   type HandoffApplyResult,
@@ -524,6 +525,24 @@ export class PostgresConversationStore implements ConversationStore {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Single statement, so it takes the row lock itself and serializes with
+   * `applyHandoff`: writes only `data.handoff.greetedEpoch`, and only while
+   * the stored epoch is the one greeted.
+   */
+  async markHandoffGreeted(senderId: string, epoch: number): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = jsonb_set(data, '{handoff,greetedEpoch}', to_jsonb($2::int), true)
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND data->'handoff'->>'epoch' = $2::text`,
+      [senderId, epoch],
+    );
+    return (rowCount ?? 0) === 1;
   }
 
   async get(senderId: string): Promise<ConversationState | null> {

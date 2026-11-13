@@ -202,7 +202,7 @@ describe('WebhookDispatcherService talk to a person (T8 / S6)', () => {
     });
   });
 
-  it('a tú customer gets the styled copy (curated pair or the usted fallback)', async () => {
+  it('a tú customer gets the curated tú copy', async () => {
     const h = setup({
       style: { register: 'tu', emojis: false, tone: 'casual' },
     });
@@ -210,7 +210,9 @@ describe('WebhookDispatcherService talk to a person (T8 / S6)', () => {
     const sent = h.sender.sendText.mock.calls[0] as unknown as [
       { text: string },
     ];
-    expect(sent[0].text).toMatch(/^Con gusto, ya le pedí/);
+    expect(sent[0].text).toBe(
+      'Con gusto, ya le pedí a una persona del equipo que te atienda. En cuanto alguien esté disponible, te escribe por aquí.',
+    );
   });
 
   it('a repeated ask merges into the same request and is answered again', async () => {

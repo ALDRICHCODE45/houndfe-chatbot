@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { AgentTurnCommit } from '../domain/conversation-store';
 import {
   CorruptHandoffStateError,
+  isGreetedEpoch,
   readHandoffState,
   resolveHandoffApply,
   type HandoffApplyResult,
@@ -243,6 +244,20 @@ export class InMemoryConversationStore implements ConversationStore {
       });
     }
     return result;
+  }
+
+  async markHandoffGreeted(senderId: string, epoch: number): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const live = this.map.get(senderId);
+    if (live === undefined) return false;
+    const state = readHandoffState(live.data.handoff);
+    if (state === null || state.updatedAt === null || state.epoch !== epoch)
+      return false;
+    live.data = {
+      ...live.data,
+      handoff: { ...state, greetedEpoch: epoch },
+    };
+    return true;
   }
 
   async get(senderId: string): Promise<ConversationState | null> {

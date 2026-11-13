@@ -267,6 +267,44 @@ describe('applyCustomerStyle', () => {
       'Todavía no tengo respuesta del equipo; sigue pendiente y le aviso en cuanto la tenga.',
       'Todavía no tengo respuesta del equipo; sigue pendiente y te aviso en cuanto la tenga.',
     ],
+    // Live conversation (unit 11) notices, S5.
+    [
+      'Le atiende Ana del equipo HoundFe.',
+      'Te atiende Ana del equipo HoundFe.',
+    ],
+    [
+      'Le atiende una persona del equipo HoundFe.',
+      'Te atiende una persona del equipo HoundFe.',
+    ],
+    [
+      'Ahora le atiende Luis, del equipo HoundFe.',
+      'Ahora te atiende Luis, del equipo HoundFe.',
+    ],
+    [
+      'Ahora le atiende otra persona del equipo HoundFe.',
+      'Ahora te atiende otra persona del equipo HoundFe.',
+    ],
+    [
+      'Listo, terminó la atención con el equipo. Si necesita algo más, aquí sigo para ayudarle.',
+      'Listo, terminó la atención con el equipo. Si necesitas algo más, aquí sigo para ayudarte.',
+    ],
+    [
+      'Seguimos por aquí, ¿en qué le ayudo?',
+      'Seguimos por aquí, ¿en qué te ayudo?',
+    ],
+    // Talk-to-human flow (S5/S6).
+    [
+      'Con gusto, ya le pedí a una persona del equipo que le atienda. En cuanto alguien esté disponible, le escribe por aquí.',
+      'Con gusto, ya le pedí a una persona del equipo que te atienda. En cuanto alguien esté disponible, te escribe por aquí.',
+    ],
+    [
+      'Nuestro equipo atiende de lunes a sábado de 9 a 19 h. Ya dejé su solicitud y le escriben en cuanto abramos.',
+      'Nuestro equipo atiende de lunes a sábado de 9 a 19 h. Ya dejé tu solicitud y te escriben en cuanto abramos.',
+    ],
+    [
+      'Estoy registrando su solicitud para que le atienda una persona del equipo; le aviso por aquí.',
+      'Estoy registrando tu solicitud para que te atienda una persona del equipo; te aviso por aquí.',
+    ],
   ])('converts the human-request copy %j to tú', (usted, tu) => {
     expect(applyCustomerStyle(usted, style({ register: 'tu' }))).toBe(tu);
     expect(applyCustomerStyle(usted, style())).toBe(usted);

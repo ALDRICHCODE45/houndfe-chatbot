@@ -12,6 +12,7 @@ import type { BackendOutboxEntry } from '../backend-outbox/domain/backend-outbox
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
 import { HumanRequestCreateService } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
+import { LiveConversationService } from './application/live-conversation.service';
 import { HUMAN_REQUEST_FEED_STORE } from './domain/human-request-feed';
 import {
   HumanRequestFeedLifecycle,
@@ -94,6 +95,15 @@ describe('HumanRequestsModule', () => {
       HumanRequestCreateService,
     );
     expect(moduleRef.get(HumanRequestFeedLifecycle)).toBeDefined();
+    await moduleRef.close();
+  });
+
+  it('wires the live conversation handler into the delivery service (T4)', async () => {
+    const { pool } = fakePool();
+    const moduleRef = await compile(pool, HumanRequestsServicesModule);
+    const delivery = moduleRef.get(HumanRequestDeliveryService);
+    const ports = (delivery as unknown as { ports: { live: unknown } }).ports;
+    expect(ports.live).toBeInstanceOf(LiveConversationService);
     await moduleRef.close();
   });
 

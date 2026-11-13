@@ -211,6 +211,32 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Estoy registrando su consulta con el equipo; le aviso por aquí.',
     'Estoy registrando tu consulta con el equipo; te aviso por aquí.',
   ],
+  // Talk-to-human flow: the request is created, queued out of hours, or
+  // still being registered (owner-approved whole sentences).
+  [
+    'Con gusto, ya le pedí a una persona del equipo que le atienda. En cuanto alguien esté disponible, le escribe por aquí.',
+    'Con gusto, ya le pedí a una persona del equipo que te atienda. En cuanto alguien esté disponible, te escribe por aquí.',
+  ],
+  [
+    'Nuestro equipo atiende de lunes a sábado de 9 a 19 h. Ya dejé su solicitud y le escriben en cuanto abramos.',
+    'Nuestro equipo atiende de lunes a sábado de 9 a 19 h. Ya dejé tu solicitud y te escriben en cuanto abramos.',
+  ],
+  [
+    'Estoy registrando su solicitud para que le atienda una persona del equipo; le aviso por aquí.',
+    'Estoy registrando tu solicitud para que te atienda una persona del equipo; te aviso por aquí.',
+  ],
+  // Live conversation (unit 11) notices: start, reassignment, end, resume.
+  // The staff first name sits between the phrases and is never rewritten.
+  ['Ahora le atiende ', 'Ahora te atiende '],
+  ['Le atiende ', 'Te atiende '],
+  [
+    'Si necesita algo más, aquí sigo para ayudarle.',
+    'Si necesitas algo más, aquí sigo para ayudarte.',
+  ],
+  [
+    'Seguimos por aquí, ¿en qué le ayudo?',
+    'Seguimos por aquí, ¿en qué te ayudo?',
+  ],
   // S4 interactive prompts and the change-button reply.
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
