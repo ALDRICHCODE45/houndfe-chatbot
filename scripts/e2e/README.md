@@ -79,6 +79,30 @@ The run stops when every created (or `--request`) request has had an item handle
 
 Every item from the starting cursor on is handled and ACKed, including items for other dev requests. That is how the real consumer behaves.
 
+### `--phase live-create` and `--phase live` (unit 11 T9)
+
+Drive the live conversation (silence protocol: started → staff messages → ended) against the dev backend. Needs the credential scopes `media:read` and `conversation:write` (plus `media:write` for the mirror).
+
+```sh
+# 1. Create a TALK_TO_HUMAN request through the real create path (writes a dev request)
+pnpm -s e2e:human-requests --phase live-create --phone 5550007777
+#    prints: [live-create] ok requestId=… folio=… cursor=…   (cursor = the feed tail after the create)
+
+# 2. Start consuming right after that cursor, then let staff claim / write / end on the backend
+pnpm -s e2e:human-requests --phase live --phone 5550007777 --request <requestId> --after <cursor> --minutes 10
+pnpm -s e2e:human-requests --phase live --phone 5550007777 --request <requestId> --after <cursor> --window-closed
+```
+
+`--phase live-create` uses `HumanRequestCreateService.requestTalkToHuman` over the real `ChatbotApiHttpClient` (dedupKey merges a repeat into the open request: then `outcome=MERGED`). It prints `requestId`, `folio` and the feed `cursor`, and sends nothing to the customer. It exits 1 when the create is not registered.
+
+`--phase live` wires the real production pieces: `HumanRequestFeedConsumer` (`runOnce`, no advisory lock), `HumanRequestDeliveryService`, `LiveConversationService` with the real `HandoffModeService` over an `InMemoryConversationStore`, the real `ChatbotApiHttpClient` (feed, session-ack, state, staff media download, outcome ACKs, `messages:batch`), the real `MetaWhatsappSender` over a stub transport (fake wamids `wamid.e2e-<runId>-<n>` and fake Meta media ids `e2e-media-<runId>-<n>`: Meta is never called), the real `TranscriptRecorder` with an in-memory outbox, and, at the end, the real mirror drain. The 24 h window is a stub: open, or closed with `--window-closed` (it only affects the local window checks; the stub transport always accepts a send).
+
+- `--request` is required (exactly one). `--minutes` defaults to 10. `--after` starts right after that cursor (without it, the current tail). `[consume] listening …` is written with `writeSync` as soon as the start cursor is known.
+- Only items of the conversation `wa:521<phone>` are handled. Items of other conversations are skipped (logged as `skipped item of another conversation`, never handled or ACKed), because a live item would session-ack somebody else's session on dev.
+- The run stops when a `conversation.ended` of the watched request was handled, or at the time bound (Ctrl-C also stops it).
+- Output, in order of occurrence: `[live] session-ack` (state, epoch, HTTP, the answer), `[live] outcome-ack` (including replayed deliveries), `[live] staff media downloaded` (mimeType, filename, size, sha256) and `[live] meta upload (stub)`, `[live] would send` (origin BOT|STAFF|TEMPLATE, `wouldMirror`, text verbatim, for media the mimeType, `sentAs` image|document and the downloaded sha256, mode and epoch at send time), and per item `[live] item` (type, epoch, decision, local state, ACK outcome and HTTP, `modeAfter`, `epochAfter`). Then `[outbox]` and `[mirror] messages:batch` (per message: direction, author, type, whether `staffReplyId` was present, text only for BOT messages; plus the `{mode, handoffEpoch}` hint) and `[summary]`.
+- Exit code 1 when: no `conversation.ended` was handled; a greeting went out without a prior session-ack STARTED of its epoch, or after a non-200 one; a staff message or template was enqueued for the mirror or appears in a `messages:batch` (by wamid, by text, or with a `staffReplyId`); a BOT message (greeting, farewell, reassignment, resume) was not mirrored as BOT in a 200 call; a staff message or template was sent while the mode was not HUMAN (or, for a staff item handled directly, on another epoch than the item's); the farewell was not the first send of its `ended` item, or a replayed outcome ACK or the session-ack ENDED came before it; a send was never recorded in the transcript; or an outbox row is not DONE.
+
 ## conversation-mirror-e2e
 
 Drives the real `ChatbotApiHttpClient` methods `uploadMedia`, `mirrorMessages` and `recordMessageStatuses` (with `mediaIdempotencyKey`) against the dev backend. It needs the credential scopes `conversation:write` and `media:write`. No chatbot Postgres, no WhatsApp: only the backend is called, and it **writes dev data** (a media file, a conversation `wa:521<phone>` and its messages).
