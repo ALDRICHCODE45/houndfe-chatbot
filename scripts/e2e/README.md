@@ -4,6 +4,7 @@ These scripts call a running **dev** backend. They write dev data, so never poin
 
 - `contract-smoke.ts`: live contract smoke test of `ChatbotApiHttpClient`. See `docs/e2e-contract-smoke.md`.
 - `human-requests-feed-e2e.ts`: spec S7 run of the human request feed (create → staff resolve/cancel → feed item → outcome ACK), plus a read-only look at the 5c recovery route.
+- `human-requests-feed-e2e.ts --phase schedule` / `schedule-feed`: unit 14 scheduled conversations (offer, booking, change, cancel, reminder and staff reschedule items).
 - `conversation-mirror-e2e.ts`: spec S8 run of the conversation mirror and media (backend unit 9): upload, mirror, idempotent resend and delivery statuses. `--phase outbox` runs the full delivery stack (outbox, drain worker, adapters, media service) instead.
 
 ## human-requests-feed-e2e
@@ -102,6 +103,40 @@ pnpm -s e2e:human-requests --phase live --phone 5550007777 --request <requestId>
 - The run stops when a `conversation.ended` of the watched request was handled, or at the time bound (Ctrl-C also stops it).
 - Output, in order of occurrence: `[live] session-ack` (state, epoch, HTTP, the answer), `[live] outcome-ack` (including replayed deliveries), `[live] staff media downloaded` (mimeType, filename, size, sha256) and `[live] meta upload (stub)`, `[live] would send` (origin BOT|STAFF|TEMPLATE, `wouldMirror`, text verbatim, for media the mimeType, `sentAs` image|document and the downloaded sha256, mode and epoch at send time), and per item `[live] item` (type, epoch, decision, local state, ACK outcome and HTTP, `modeAfter`, `epochAfter`). Then `[outbox]` and `[mirror] messages:batch` (per message: direction, author, type, whether `staffReplyId` was present, text only for BOT messages; plus the `{mode, handoffEpoch}` hint) and `[summary]`.
 - Exit code 1 when: no `conversation.ended` was handled; a greeting went out without a prior session-ack STARTED of its epoch, or after a non-200 one; a staff message or template was enqueued for the mirror or appears in a `messages:batch` (by wamid, by text, or with a `staffReplyId`); a BOT message (greeting, farewell, reassignment, resume) was not mirrored as BOT in a 200 call; a staff message or template was sent while the mode was not HUMAN (or, for a staff item handled directly, on another epoch than the item's); the farewell was not the first send of its `ended` item, or a replayed outcome ACK or the session-ack ENDED came before it; a send was never recorded in the transcript; or an outbox row is not DONE.
+
+### `--phase schedule` and `--phase schedule-feed` (unit 14 T7)
+
+Drive scheduled conversations against the dev backend (branch with scheduling ON). Both WRITE dev data.
+
+```sh
+# 1. Simulated customer: ask for a person → offer → book → "¿a qué hora quedé?" → change. Books a real dev appointment.
+pnpm -s e2e:human-requests --phase schedule --phone 5550008888
+pnpm -s e2e:human-requests --phase schedule --phone 5550008888 --cancel      # also "cancela mi cita" at the end
+pnpm -s e2e:human-requests --phase schedule --phone 5550008888 --no-drill    # skip the lost-answer retry drill
+#    prints: [e] … requestId=… cursor=… scheduledFor=… scheduleVersion=…   (use them below)
+
+# 2. Staff reschedules (or the reminder comes due) on the backend, then consume the feed item:
+pnpm -s e2e:human-requests --phase schedule-feed --phone 5550008888 --request <requestId> --after <cursor> \
+  --scheduled-for <ISO from [e]> --version <n from [e]> --minutes 10
+```
+
+`--phase schedule` wires the real `SchedulingOutOfHoursPolicy`, `AppointmentIntentService` and `SchedulingStateService` over an `InMemoryConversationStore`, the real `ChatbotApiHttpClient` (also behind `SCHEDULING_CLIENT`) and the real customer styling. Nothing is sent to WhatsApp: each bot reply is printed as `text` (usted, as the dispatcher sends it) and `tuText`. Every backend call is printed as `[backend] <METHOD> <route>` (conversation ref masked, only the first 8 characters of an idempotency key, never headers).
+
+Steps:
+
+- `a`: "quiero hablar con una persona" → `planAsk` → `listSlots` (`openNow`, `nextOpenAt`, `timeZone`, `slots`) → the offer text. If the branch is OPEN now, the out-of-hours offer cannot be exercised: the script says so and stores an offer built from the first slots, so change / cancel still run.
+- `b`: "2" (or "1" when open) → inline booking (`requestId`, `folio`, `scheduledFor`, `scheduleVersion`, `requiresTemplateAtStart`) → booked text. A phone that already holds a scheduled request gets `ALREADY_SCHEDULED` and the run continues with that request.
+- `c`: "¿a qué hora quedé?" → what-time text.
+- `d`: "quiero cambiar mi cita" → reschedule offer → a slot other than the current one → reschedule → rescheduled text. By default a **retry drill** runs: the first reschedule call is processed by the backend but its answer is replaced by `RETRYABLE` (a timeout after the commit); the bot must keep the offer and key, and the same message is then redelivered (same timestamp) and must reuse the same `X-Idempotency-Key`. `--no-drill` skips it.
+- `e`: prints the feed tail `cursor`, `requestId` and the stored appointment, so staff can reschedule it on the backend; stops (exit 0) unless `--cancel`, which sends "cancela mi cita" and expects the cancelled text and no stored appointment.
+
+Exit code 1 when: the booking was not an inline 2xx scheduled answer, the backend outbox was used, or the unscheduled create was called; any scheduling call (`slots`, scheduled create, reschedule) lacks `lastCustomerMessageAt` (checked on the typed input and on the wire); a reply is not the output of an approved builder (`scheduling-copy.ts`, recomputed from what the backend answered); a reschedule retry did not reuse its key; the stored appointment does not hold the chosen slot.
+
+`--phase schedule-feed` consumes from `--after` with the real `HumanRequestFeedConsumer` (`runOnce`, no advisory lock), `HumanRequestDeliveryService` and `ScheduledConversationService`, whose reader / writer are `StoredAppointmentReader` / `SchedulingStateService` over an in-memory store seeded with the appointment of `--scheduled-for` and `--version`. The real `ChatbotApiHttpClient` and the real `MetaWhatsappSender` over a stub transport are used (Meta is never called); the 24 h window is a stub (open, or closed with `--window-closed`). Required: `--request`, `--after`, `--scheduled-for`, `--version`; `--minutes` defaults to 10.
+
+- Only `conversation.rescheduled` / `conversation.scheduled_reminder` of the request are handled; everything else (other requests, live items) is skipped and never ACKed.
+- Per item it prints type, `scheduledFor`, `previousScheduledFor`, `scheduleVersion`, decision, local state, ACK outcome and HTTP, the text sent, and the stored appointment before and after. It stops after the first handled item of the request, or at the time bound.
+- Exit code 1 when: an ACK outcome is not `PROVIDER_ACCEPTED` / `DELIVERY_UNKNOWN` / `STALE` or its HTTP is not 200; nothing was sent and the ACK is not `STALE`; the sent text is not the approved builder's output; a `rescheduled` item left the stored appointment without the item's time and version; or no item was handled before the time bound.
 
 ## conversation-mirror-e2e
 
