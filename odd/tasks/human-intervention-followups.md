@@ -11,10 +11,10 @@ Small open items recorded while closing the live conversation (unit 11) and sche
 
 ## Tasks
 
-| ID  | Specs  | Route                                     | Commit |
-| --- | ------ | ----------------------------------------- | ------ |
-| T1  | S2, S3 | worker: media inbound replays + tool text | —      |
-| T2  | S4     | worker: ENDING marker                     | —      |
+| ID  | Specs  | Route                                     | Commit                    |
+| --- | ------ | ----------------------------------------- | ------------------------- |
+| T1  | S2, S3 | worker: media inbound replays + tool text | fab70ac, b40d3be, 1836f9a |
+| T2  | S4     | worker: ENDING marker                     | c5d0700, e9a13c2          |
 
 ## Log
 
