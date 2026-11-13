@@ -427,6 +427,46 @@ export type LiveConversationItem =
   | ConversationReassignedItem
   | ConversationEndedItem;
 
+// ------------------------------------------------ scheduled conversations
+
+/** Backend unit 14 (contract "Scheduled conversations"): about 10 minutes
+ *  before `scheduledFor`, only for an open request still waiting. Sent to
+ *  the customer only while the 24 h window is open and the chat is not
+ *  HUMAN; otherwise ACK STALE (never deferred). `timeZone` (the branch's
+ *  IANA zone) and `whatsappWindowClosesAt` (the backend's estimate, Meta
+ *  decides) are informational: a missing or malformed one is `null`. */
+export interface ScheduledReminderPayload {
+  requestId: string;
+  scheduledFor: string;
+  /** Monotonic per request (>= 1): the reminder is for this version. */
+  scheduleVersion: number;
+  timeZone: string | null;
+  whatsappWindowClosesAt: string | null;
+}
+export type ScheduledReminderItem = FeedItemEnvelope & {
+  type: 'conversation.scheduled_reminder';
+  payload: ScheduledReminderPayload;
+};
+
+/** Staff changed the time. Same send rules and ACK outcomes as the
+ *  reminder. */
+export interface ConversationRescheduledPayload {
+  requestId: string;
+  scheduledFor: string;
+  previousScheduledFor: string;
+  scheduleVersion: number;
+  timeZone: string | null;
+  whatsappWindowClosesAt: string | null;
+}
+export type ConversationRescheduledItem = FeedItemEnvelope & {
+  type: 'conversation.rescheduled';
+  payload: ConversationRescheduledPayload;
+};
+
+export type ScheduledConversationItem =
+  | ScheduledReminderItem
+  | ConversationRescheduledItem;
+
 /** A type this bot does not know (or a malformed known one): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
@@ -443,6 +483,7 @@ export type FeedItem =
   | RequestCancelledItem
   | RequestOverdueNoticeItem
   | LiveConversationItem
+  | ScheduledConversationItem
   | UnknownFeedItem;
 
 export type ReadFeedResult =
@@ -963,6 +1004,17 @@ export function parseFeedItem(item: unknown): FeedItem | null {
         raw: item,
       }
     );
+  // Unit 14: a malformed scheduled item is ACKed STALE as unknown too.
+  if (SCHEDULE_TYPES.has(item.type))
+    return (
+      parseScheduleItem(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
   if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
     return {
       type: 'unknown',
@@ -1278,6 +1330,95 @@ function parseLiveItem(
     default:
       return null;
   }
+}
+
+const SCHEDULE_TYPES: ReadonlySet<string> = new Set([
+  'conversation.scheduled_reminder',
+  'conversation.rescheduled',
+]);
+/** True for the two typed unit 14 items. */
+export const isScheduledConversationItem = (
+  item: FeedItem,
+): item is ScheduledConversationItem =>
+  item.type !== 'unknown' && SCHEDULE_TYPES.has(item.type);
+
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+const isInstantText = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  ISO_INSTANT.test(value) &&
+  !Number.isNaN(Date.parse(value));
+const isScheduleVersion = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 1;
+/** An IANA zone this runtime can format with; anything else is no zone. */
+const zoneOrNull = (value: unknown): string | null => {
+  if (!isText(value)) return null;
+  try {
+    new Intl.DateTimeFormat('es-MX', { timeZone: value });
+    return value;
+  } catch {
+    return null;
+  }
+};
+
+/** `conversation.scheduled_reminder` / `conversation.rescheduled` (unit 14):
+ *  needs the request, `scheduledFor` and `scheduleVersion` (and
+ *  `previousScheduledFor` for a reschedule); the zone and the window estimate
+ *  are informational. Null (→ unknown) when malformed. */
+function parseScheduleItem(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): ScheduledConversationItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const { payload } = item;
+  if (
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    !isRecord(payload)
+  )
+    return null;
+  // The envelope and the payload name the same request.
+  const requestId = [item.requestId, payload.requestId].find(isText);
+  if (
+    requestId === undefined ||
+    (item.requestId !== undefined && item.requestId !== requestId) ||
+    (payload.requestId !== undefined && payload.requestId !== requestId) ||
+    !isInstantText(payload.scheduledFor) ||
+    !isScheduleVersion(payload.scheduleVersion)
+  )
+    return null;
+  const envelope: FeedItemEnvelope = {
+    cursor,
+    deliveryId,
+    requestId,
+    conversationRef: item.conversationRef ?? null,
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+  };
+  const common = {
+    requestId,
+    scheduledFor: payload.scheduledFor,
+    scheduleVersion: payload.scheduleVersion,
+    timeZone: zoneOrNull(payload.timeZone),
+    whatsappWindowClosesAt: isInstantText(payload.whatsappWindowClosesAt)
+      ? payload.whatsappWindowClosesAt
+      : null,
+  };
+  if (item.type === 'conversation.scheduled_reminder')
+    return {
+      ...envelope,
+      type: 'conversation.scheduled_reminder',
+      payload: common,
+    };
+  if (item.type !== 'conversation.rescheduled') return null;
+  if (!isInstantText(payload.previousScheduledFor)) return null;
+  return {
+    ...envelope,
+    type: 'conversation.rescheduled',
+    payload: { ...common, previousScheduledFor: payload.previousScheduledFor },
+  };
 }
 
 function parseItems(items: unknown): FeedItem[] | null {

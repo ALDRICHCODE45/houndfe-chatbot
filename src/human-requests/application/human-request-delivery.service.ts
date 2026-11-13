@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   isLiveConversationItem,
+  isScheduledConversationItem,
   normalizeDeliveryOutcome,
   type FeedItem,
   type RecordDeliveryOutcomeResult,
@@ -19,6 +20,7 @@ import type {
   LiveSendResult,
 } from './live-conversation.service';
 import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
+import type { ScheduledConversationHandler } from './scheduled-conversation.service';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -64,6 +66,10 @@ export interface HumanRequestDeliveryPorts {
    *  of T1 (a claim reverts after its start timeout), so hand-built
    *  harnesses keep working. */
   live?: LiveConversationHandler;
+  /** Scheduled conversations (unit 14): `conversation.scheduled_reminder`
+   *  and `conversation.rescheduled`. Without it those items stay the safe
+   *  STALE / UNKNOWN_TYPE (nothing is sent). */
+  scheduled?: ScheduledConversationHandler;
 }
 
 export interface HumanRequestDeliveryOptions {
@@ -638,10 +644,9 @@ export class HumanRequestDeliveryService {
     // T6 (L10 a): live sends re-read the mode/epoch right before the
     // sender, one local read. The read sits just before the SENDING claim
     // (a failed read throws with nothing claimed, so the item is retried).
-    if (
-      (plan.action === 'relay' || plan.live === true) &&
-      plan.guard !== undefined
-    ) {
+    // Scheduled notices carry a guard too (window and schedule re-read), but
+    // are not live: the HUMAN hold above already ran for them.
+    if (plan.guard !== undefined) {
       const changed = await plan.guard();
       if (changed !== null) {
         const next = await this.ports.store.transition(
@@ -845,6 +850,23 @@ export class HumanRequestDeliveryService {
       // safe for a claim: the backend reverts it after the start timeout.
       this.logger.warn(
         `feed item ${row.deliveryId} of live conversation type ${item.type} has no handler wired: STALE`,
+      );
+      return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+    }
+
+    if (isScheduledConversationItem(item)) {
+      if (this.ports.scheduled !== undefined) {
+        const planned = await this.ports.scheduled.plan(row, item);
+        // A notice that may not wait: HUMAN mode is an immediate STALE
+        // (HUMAN_SESSION), a closed window is STALE, never a deferral.
+        return planned.action === 'send'
+          ? { ...planned, cancellation: true }
+          : planned.action === 'stale'
+            ? planned
+            : { action: 'stale', decision: 'UNKNOWN_TYPE' };
+      }
+      this.logger.warn(
+        `feed item ${row.deliveryId} of type ${item.type} has no handler wired: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }

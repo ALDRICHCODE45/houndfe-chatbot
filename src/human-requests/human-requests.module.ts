@@ -52,6 +52,11 @@ import {
 import { LiveConversationSafety } from './application/live-conversation-safety';
 import { LiveConversationService } from './application/live-conversation.service';
 import { HumanRequestFeedConsumer } from './application/human-request-feed.consumer';
+import {
+  SCHEDULED_APPOINTMENT_READER,
+  ScheduledConversationService,
+  type ScheduledAppointmentReader,
+} from './application/scheduled-conversation.service';
 import { HumanRequestMaintenanceWorker } from './application/human-request-maintenance.worker';
 import {
   HUMAN_REQUEST_FEED_STORE,
@@ -250,6 +255,7 @@ const CUSTOMER_PORT_TOKENS = [
         pool: Pool,
         profiles?: CustomerProfileService,
         waker?: OutboxDrainWaker,
+        appointments?: ScheduledAppointmentReader,
       ) => {
         const ports = customerPorts(handoff, config, pool, profiles);
         return new HumanRequestDeliveryService({
@@ -257,6 +263,17 @@ const CUSTOMER_PORT_TOKENS = [
           client,
           sender,
           ...ports,
+          // Scheduled conversations (unit 14): reminder / reschedule
+          // notices. The stored-appointment reader is optional (parent
+          // wires it): without it the version check is skipped.
+          scheduled: new ScheduledConversationService({
+            store,
+            isWindowOpen: ports.isWindowOpen,
+            ...(ports.customerStyle === undefined
+              ? {}
+              : { customerStyle: ports.customerStyle }),
+            ...(appointments === undefined ? {} : { appointments }),
+          }),
           // Live conversation T4/T5: started / reassigned / ended and the
           // staff message / template relays.
           live: new LiveConversationService({
@@ -286,6 +303,7 @@ const CUSTOMER_PORT_TOKENS = [
         LIVE_RECONCILE_REF,
         ...CUSTOMER_PORT_TOKENS,
         { token: OUTBOX_DRAIN_WAKER, optional: true },
+        { token: SCHEDULED_APPOINTMENT_READER, optional: true },
       ],
     },
     {

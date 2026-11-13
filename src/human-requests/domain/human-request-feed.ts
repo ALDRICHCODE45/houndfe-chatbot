@@ -80,7 +80,17 @@ export type DeliveryDecision =
   | 'MEDIA_NOT_FOUND'
   /** A live message Meta refused synchronously (definite, nothing sent):
    *  STALE. Never used for an uncertain send (that is UNKNOWN). */
-  | 'SEND_REFUSED';
+  | 'SEND_REFUSED'
+  // ---- scheduled conversations (unit 14, migration 5000) ----
+  /** conversation.scheduled_reminder sent to the customer. */
+  | 'REMINDER_SENT'
+  /** conversation.rescheduled: the "El equipo cambió su cita" notice sent. */
+  | 'RESCHEDULE_NOTICE'
+  /** A scheduled item the bot no longer needs to say: the bot holds a newer
+   *  schedule for the request (a version or time that is not the item's),
+   *  or it changed after planning. Never used for a closed window or a
+   *  HUMAN chat (those keep WINDOW_CLOSED / HUMAN_SESSION). */
+  | 'STALE_SCHEDULE';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 

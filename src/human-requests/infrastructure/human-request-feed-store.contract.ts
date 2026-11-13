@@ -3,8 +3,10 @@ import type {
   ConversationStaffMessageItem,
   ConversationStartedItem,
   FeedItem,
+  ConversationRescheduledItem,
   RequestCancelledItem,
   RequestOverdueNoticeItem,
+  ScheduledReminderItem,
   TemplateRequestedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type {
@@ -122,6 +124,46 @@ export const endedItem = (deliveryId: string): ConversationEndedItem => ({
     resumeNotice: false,
   },
 });
+
+export const reminderItem = (
+  deliveryId: string,
+  patch: Partial<ScheduledReminderItem> = {},
+): ScheduledReminderItem => ({
+  ...liveBase(deliveryId),
+  type: 'conversation.scheduled_reminder',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    scheduledFor: '2026-11-10T15:00:00.000Z',
+    scheduleVersion: 1,
+    timeZone: 'America/Mexico_City',
+    whatsappWindowClosesAt: '2026-11-10T21:00:00.000Z',
+  },
+  ...patch,
+});
+
+export const rescheduledItem = (
+  deliveryId: string,
+  patch: Partial<ConversationRescheduledItem> = {},
+): ConversationRescheduledItem => ({
+  ...liveBase(deliveryId),
+  type: 'conversation.rescheduled',
+  payload: {
+    requestId: `req-${deliveryId}`,
+    scheduledFor: '2026-11-11T15:30:00.000Z',
+    previousScheduledFor: '2026-11-10T15:00:00.000Z',
+    scheduleVersion: 2,
+    timeZone: 'America/Mexico_City',
+    whatsappWindowClosesAt: '2026-11-11T21:00:00.000Z',
+  },
+  ...patch,
+});
+
+/** Decisions of the scheduled conversations (migration 5000). */
+export const SCHEDULE_DECISIONS: DeliveryDecision[] = [
+  'REMINDER_SENT',
+  'RESCHEDULE_NOTICE',
+  'STALE_SCHEDULE',
+];
 
 /** Decisions of the live conversation (migration 4900). */
 export const LIVE_DECISIONS: DeliveryDecision[] = [
@@ -351,6 +393,40 @@ export function runHumanRequestFeedStoreContract(
       await expect(
         store.insertDelivery(staffMessageItem('lv-p2', 'msg-keep')),
       ).resolves.toMatchObject({ inserted: true, duplicateOf: 'lv-p1' });
+    });
+
+    it.each(SCHEDULE_DECISIONS)(
+      'records the scheduling decision %s on a transition',
+      async (decision) => {
+        await store.insertDelivery(reminderItem('sc-d'));
+        const next = await store.transition(
+          'sc-d',
+          { localState: 'RECEIVED', attemptId: null },
+          {
+            localState: 'STALE',
+            decision,
+            attemptId: ATTEMPT_A,
+            attemptedAt: AT,
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        );
+        expect(next).toMatchObject({ decision, localState: 'STALE' });
+        await expect(store.getDelivery('sc-d')).resolves.toMatchObject({
+          decision,
+          item: { type: 'conversation.scheduled_reminder' },
+        });
+      },
+    );
+
+    it('stores a scheduled item with its request and conversation', async () => {
+      await store.insertDelivery(rescheduledItem('sc-r'));
+      await expect(store.getDelivery('sc-r')).resolves.toMatchObject({
+        type: 'conversation.rescheduled',
+        requestId: 'req-sc-r',
+        conversationRef: REF,
+        messageId: null,
+      });
     });
 
     it.each(LIVE_DECISIONS)(
