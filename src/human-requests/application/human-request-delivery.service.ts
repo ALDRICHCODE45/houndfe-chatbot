@@ -12,6 +12,7 @@ import {
   checkHandoffSendHold,
   type HandoffModeReader,
 } from '../../conversation/application/handoff-send-hold';
+import type { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import type {
@@ -55,7 +56,12 @@ export interface HumanRequestDeliveryPorts {
   >;
   sender: Pick<WhatsappSenderPort, 'sendText'>;
   /** S4: required, so a missing reader can never skip the hold. */
-  handoff: HandoffModeReader;
+  handoff: HandoffModeReader &
+    /** Follow-ups S4: the ENDING marker (a session known to be ending whose
+     *  farewell is not decided yet). While it is live no replay releases a
+     *  non-lifecycle row. Optional: without it only the unfinished-ended
+     *  hold applies. */
+    Partial<Pick<HandoffModeService, 'isEnding'>>;
   /** 24 h window from the customer inbound observations; rejects when the
    *  read fails (transient, not a closed window). */
   isWindowOpen(senderId: string): Promise<boolean>;
@@ -95,6 +101,13 @@ export interface HumanRequestDeliveryOptions {
    *  costs one backend call. */
   humanLookupMinIntervalMs?: number;
 }
+
+/** The session lifecycle items: the farewell path, never held by ENDING. */
+const LIFECYCLE_TYPES: ReadonlySet<string> = new Set([
+  'conversation.started',
+  'conversation.reassigned',
+  'conversation.ended',
+]);
 
 /** Live conversation hooks of a plan: see `LivePlan`. */
 interface LiveHooks {
@@ -188,11 +201,18 @@ export class HumanRequestDeliveryService {
   async onCustomerInbound(conversationRef: string): Promise<void> {
     if (senderIdFromRef(conversationRef) === null) return;
     const masked = maskConversationRef(conversationRef);
+    // ENDING (follow-ups S4): the farewell is not decided yet; nothing is
+    // looked up or released now (one local read, no backend call). The ended
+    // item's own replay, the sweep or the next inbound releases the rows.
+    const endingCache = new Map<string, boolean>();
+    if (await this.endingHolds(conversationRef, endingCache)) return;
     const handled = new Set<string>();
     const replay = async (row: DeliveryRow) => {
       if (handled.has(row.deliveryId)) return;
       handled.add(row.deliveryId);
-      await this.safely(row.deliveryId, () => this.process(row, 'replay'));
+      await this.safely(row.deliveryId, () =>
+        this.processReplay(row, endingCache),
+      );
     };
     try {
       const lookupStartedAt = this.clock();
@@ -292,8 +312,11 @@ export class HumanRequestDeliveryService {
     const ordered = [...rows.values()].sort(
       (a, b) => seqOf(a.item) - seqOf(b.item),
     );
+    const endingCache = new Map<string, boolean>();
     for (const row of ordered)
-      await this.safely(row.deliveryId, () => this.process(row, 'replay'));
+      await this.safely(row.deliveryId, () =>
+        this.processReplay(row, endingCache),
+      );
   }
 
   /** `true` (and arms the throttle) when this conversation's pending
@@ -442,10 +465,11 @@ export class HumanRequestDeliveryService {
   async replayHeld(): Promise<number> {
     const held = await this.ports.store.listHeld({ limit: this.batchSize });
     let released = 0;
+    const endingCache = new Map<string, boolean>();
     for (const row of held) {
       let left = false;
       await this.safely(row.deliveryId, async () => {
-        left = await this.process(row, 'replay');
+        left = await this.processReplay(row, endingCache);
       });
       if (left) released += 1;
       // Still held (or failed): move it behind the others, so held rows of
@@ -520,6 +544,49 @@ export class HumanRequestDeliveryService {
         `a conversation.ended of ${masked} has been unfinished for over ${minutes} min: it no longer holds the replays`,
       );
     return false;
+  }
+
+  /**
+   * ENDING hold (follow-ups S4): `true` while the conversation carries a
+   * live ENDING marker. One local read per conversation per call (`cache`).
+   * An unreadable marker holds too (fail closed: the next tick retries).
+   * Without a reader that knows `isEnding` nothing is held.
+   */
+  private async endingHolds(
+    conversationRef: string | null,
+    cache: Map<string, boolean>,
+  ): Promise<boolean> {
+    const isEnding = this.ports.handoff.isEnding;
+    if (isEnding === undefined || conversationRef === null) return false;
+    const senderId = senderIdFromRef(conversationRef);
+    if (senderId === null) return false;
+    const known = cache.get(conversationRef);
+    if (known !== undefined) return known;
+    let holds: boolean;
+    try {
+      holds = await isEnding.call(this.ports.handoff, senderId);
+    } catch (error) {
+      holds = true;
+      this.logger.warn(
+        `ENDING marker of ${maskConversationRef(conversationRef)} unreadable, replay held: ${describeError(error)}`,
+      );
+    }
+    cache.set(conversationRef, holds);
+    return holds;
+  }
+
+  /** A replayed row: held (left as it is) while its conversation is ENDING,
+   *  except the lifecycle items, which are the farewell path itself. */
+  private async processReplay(
+    row: DeliveryRow,
+    endingCache: Map<string, boolean>,
+  ): Promise<boolean> {
+    if (
+      !LIFECYCLE_TYPES.has(row.item.type) &&
+      (await this.endingHolds(row.conversationRef, endingCache))
+    )
+      return false;
+    return this.process(row, 'replay');
   }
 
   /** Adds to a bounded set; `true` when it was not there yet. */

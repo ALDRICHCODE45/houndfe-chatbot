@@ -102,7 +102,11 @@ export interface LiveConversationPorts {
   mode: Pick<
     HandoffModeService,
     'getState' | 'applyStarted' | 'applyEnded' | 'markGreeted'
-  >;
+  > &
+    /** Follow-ups S4: the ENDING marker (set before the durable BOT of an
+     *  `ended`, cleared once its farewell outcome is known). Optional: absent
+     *  → no marker (hand-built harnesses). */
+    Partial<Pick<HandoffModeService, 'markEnding' | 'clearEnding'>>;
   client: Pick<LiveConversationClient, 'sessionAck' | 'downloadStaffMedia'>;
   /** Staff relays: text, uploaded media files and templates. */
   sender: Pick<
@@ -474,6 +478,11 @@ export class LiveConversationService implements LiveConversationHandler {
       farewell,
       resumeNotice,
     } = item.payload;
+    // 0. ENDING marker (follow-ups S4) BEFORE the durable BOT: from here on
+    // neither a bot turn nor a replay of held rows may go out until the
+    // farewell is decided (cleared in `after`; bounded if that never runs).
+    // Best effort: a failure here must not block the farewell itself.
+    await this.markEnding(senderId, epoch);
     // 1. Durable BOT (the epoch is kept) BEFORE anything is sent.
     const applied = await this.ports.mode.applyEnded(senderId, epoch);
     if (!applied.applied) {
@@ -483,7 +492,16 @@ export class LiveConversationService implements LiveConversationHandler {
         this.logger.log(
           `conversation.ended ${item.deliveryId} epoch ${epoch} is older than ours (${maskConversationRef(ref)}): STALE, no ack`,
         );
-        return { action: 'stale', decision: 'STALE_EPOCH' };
+        // A reconcile revert marked a higher local epoch for this lower
+        // item: clearing it decides the (absent) farewell, so the rows it
+        // held go out now instead of waiting for the sweep. A marker of a
+        // newer session that was not set for this item is never cleared.
+        const cleared = await this.clearEnding(senderId, epoch);
+        return {
+          action: 'stale',
+          decision: 'STALE_EPOCH',
+          ...(cleared ? { replay: true } : {}),
+        };
       }
       // DUPLICATE: already BOT at this epoch (a retry of this item).
     }
@@ -504,22 +522,32 @@ export class LiveConversationService implements LiveConversationHandler {
             senderId,
             text: styleFixedCopy(LIVE_RESUME, style),
             guard: this.guard(senderId, epoch, 'BOT'),
-            after: (result) => {
+            after: async (result) => {
+              await this.clearEnding(senderId, epoch);
               this.wake(result);
-              return Promise.resolve();
             },
             replay: true,
           };
         }
       }
-      return { action: 'stale', decision: 'SESSION_REVERTED', replay: true };
+      return {
+        action: 'stale',
+        decision: 'SESSION_REVERTED',
+        after: async () => {
+          await this.clearEnding(senderId, epoch);
+        },
+        replay: true,
+      };
     }
 
     // The ack comes after the outcome; the replay after the ack, so the
     // farewell always precedes any replayed delivery.
-    const after = (result: LiveSendResult) => {
+    // The marker is released as soon as the farewell outcome is known (before
+    // the ack round trip), so the customer is not left unanswered meanwhile.
+    const after = async (result: LiveSendResult) => {
+      await this.clearEnding(senderId, epoch);
       this.wake(result);
-      return this.ackEnded(ref, epoch, result.providerMessageId);
+      await this.ackEnded(ref, epoch, result.providerMessageId);
     };
     if (farewell && (await this.ports.isWindowOpen(senderId))) {
       const style = await this.readStyle(senderId);
@@ -539,6 +567,37 @@ export class LiveConversationService implements LiveConversationHandler {
       after,
       replay: true,
     };
+  }
+
+  /** Sets the ENDING marker of `epoch`; a failure is logged, never thrown
+   *  (the marker only protects the order, it must not block the farewell). */
+  private async markEnding(senderId: string, epoch: number): Promise<void> {
+    if (this.ports.mode.markEnding === undefined) return;
+    try {
+      await this.ports.mode.markEnding(senderId, epoch);
+    } catch (error) {
+      this.logger.warn(
+        `ENDING marker of epoch ${epoch} not set (${maskConversationRef(senderId)}): ${describeError(error)}`,
+      );
+    }
+  }
+
+  /** Releases the ENDING marker of `epoch`: one immediate retry, then a
+   *  warning (the bound releases it anyway). Never throws; `true` when a
+   *  marker was removed. */
+  private async clearEnding(senderId: string, epoch: number): Promise<boolean> {
+    if (this.ports.mode.clearEnding === undefined) return false;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        return await this.ports.mode.clearEnding(senderId, epoch);
+      } catch (error) {
+        if (attempt === 2)
+          this.logger.warn(
+            `ENDING marker of epoch ${epoch} not cleared (${maskConversationRef(senderId)}), its bound releases it: ${describeError(error)}`,
+          );
+      }
+    }
+    return false;
   }
 
   /**

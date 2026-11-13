@@ -18,6 +18,7 @@ import {
 } from '../domain/conversation-store';
 import {
   CorruptHandoffStateError,
+  isEndingMarker,
   isGreetedEpoch,
   readHandoffState,
   resolveHandoffApply,
@@ -643,6 +644,70 @@ export class PostgresConversationStore implements ConversationStore {
          AND data->'handoff'->>'mode' = 'HUMAN'
          AND data->'handoff'->>'epoch' = $2::text
          AND COALESCE(data->'handoff'->>'safetyNoticeEpoch', '') <> $2::text`,
+      [senderId, epoch],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  /**
+   * Single statement (row lock, serializes with `applyHandoff`): writes only
+   * `data.handoff.ending`, and only while a VALID handoff value exists (the
+   * same shape `readHandoffState` accepts: mode, requestId, integer epoch
+   * and `updatedAt`) whose stored epoch is not newer than `epoch`. A marker
+   * of this same epoch is kept as is (the bound is a cap per epoch); the row
+   * still matches, so the answer is `true` like in-memory.
+   */
+  async markHandoffEnding(
+    senderId: string,
+    epoch: number,
+    until: string,
+    coversEpoch?: number,
+  ): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const marker = {
+      epoch,
+      until,
+      ...(coversEpoch === undefined ? {} : { coversEpoch }),
+    };
+    if (!isEndingMarker(marker)) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = CASE
+         WHEN data->'handoff'->'ending'->>'epoch' = $2::text
+              AND jsonb_typeof(data->'handoff'->'ending'->'until') = 'string'
+           THEN data
+         ELSE jsonb_set(data, '{handoff,ending}', $3::jsonb, true)
+       END
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND jsonb_typeof(data->'handoff'->'updatedAt') = 'string'
+         AND data->'handoff'->>'mode' IN ('BOT', 'HUMAN')
+         AND CASE jsonb_typeof(data->'handoff'->'requestId')
+               WHEN 'null' THEN data->'handoff'->>'mode' = 'BOT'
+               WHEN 'string' THEN length(data->'handoff'->>'requestId') > 0
+               ELSE false END
+         AND CASE WHEN jsonb_typeof(data->'handoff'->'epoch') = 'number'
+                  THEN (data->'handoff'->>'epoch')::numeric >= 0
+                   AND (data->'handoff'->>'epoch')::numeric
+                       = trunc((data->'handoff'->>'epoch')::numeric)
+                   AND (data->'handoff'->>'epoch')::numeric <= $2::numeric
+                  ELSE false END`,
+      [senderId, epoch, JSON.stringify(marker)],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  /** Removes `data.handoff.ending` when it is the marker of `epoch` or the
+   *  one that covers `epoch` (a reconcile revert at a higher local epoch). */
+  async clearHandoffEnding(senderId: string, epoch: number): Promise<boolean> {
+    if (!isNonEmptyString(senderId) || !isGreetedEpoch(epoch)) return false;
+    const { rowCount } = await this.pool.query(
+      `UPDATE conversation_state
+       SET data = data #- '{handoff,ending}'
+       WHERE sender_id = $1
+         AND jsonb_typeof(data->'handoff') = 'object'
+         AND (data->'handoff'->'ending'->>'epoch' = $2::text
+              OR data->'handoff'->'ending'->>'coversEpoch' = $2::text)`,
       [senderId, epoch],
     );
     return (rowCount ?? 0) === 1;

@@ -646,6 +646,174 @@ export function runConversationStoreContract(
         });
       });
 
+      // Follow-ups S4: the ENDING marker lives inside the CAS-owned handoff.
+      describe('ENDING marker (follow-ups S4)', () => {
+        const UNTIL = '2026-11-12T10:02:00.000Z';
+
+        it('is refused without a handoff value and creates no row', async () => {
+          await expect(store.markHandoffEnding!('n0', 1, UNTIL)).resolves.toBe(
+            false,
+          );
+          expect(await store.get('n0')).toBeNull();
+        });
+
+        it('is set for the current or a newer epoch, never for an older one', async () => {
+          await store.applyHandoff!('n1', human(3));
+          await expect(store.markHandoffEnding!('n1', 2, UNTIL)).resolves.toBe(
+            false,
+          );
+          await expect(store.getHandoff!('n1')).resolves.not.toHaveProperty(
+            'ending',
+          );
+          await expect(store.markHandoffEnding!('n1', 3, UNTIL)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n1')).resolves.toMatchObject({
+            ...human(3),
+            ending: { epoch: 3, until: UNTIL },
+          });
+          await expect(store.markHandoffEnding!('n1', 4, UNTIL)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n1')).resolves.toMatchObject({
+            ending: { epoch: 4, until: UNTIL },
+          });
+        });
+
+        it('survives the durable BOT of that epoch and is dropped by another epoch', async () => {
+          await store.applyHandoff!('n2', human(2));
+          await store.markHandoffEnding!('n2', 2, UNTIL);
+          await store.applyHandoff!('n2', bot(2));
+          await expect(store.getHandoff!('n2')).resolves.toMatchObject({
+            ...bot(2),
+            ending: { epoch: 2, until: UNTIL },
+          });
+          await store.applyHandoff!('n2', human(3));
+          await expect(store.getHandoff!('n2')).resolves.not.toHaveProperty(
+            'ending',
+          );
+
+          await store.applyHandoff!('n3', human(2));
+          await store.markHandoffEnding!('n3', 5, UNTIL);
+          await store.applyHandoff!('n3', bot(4));
+          await expect(store.getHandoff!('n3')).resolves.not.toHaveProperty(
+            'ending',
+          );
+        });
+
+        it('is cleared only for its own epoch and survives update() writes', async () => {
+          await store.applyHandoff!('n4', human(1));
+          await store.markHandoffEnding!('n4', 1, UNTIL);
+          await store.update('n4', {
+            lastMessageAt: T,
+            data: { cart: ['x'], handoff: bot(9) as never },
+          });
+          await expect(store.getHandoff!('n4')).resolves.toMatchObject({
+            ending: { epoch: 1, until: UNTIL },
+          });
+          await expect(store.clearHandoffEnding!('n4', 2)).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n4', 1)).resolves.toBe(true);
+          await expect(store.clearHandoffEnding!('n4', 1)).resolves.toBe(false);
+          await expect(store.getHandoff!('n4')).resolves.toMatchObject(
+            human(1),
+          );
+          await expect(store.getHandoff!('n4')).resolves.not.toHaveProperty(
+            'ending',
+          );
+        });
+
+        // R4-ended-retry-rearms-bound: the bound is a cap per epoch.
+        it('re-marking the SAME epoch keeps the first bound (live or expired); another epoch replaces it', async () => {
+          const FIRST = '2026-11-12T10:01:00.000Z';
+          const LATER = '2026-11-12T10:09:00.000Z';
+          await store.applyHandoff!('n6', human(2));
+          await expect(store.markHandoffEnding!('n6', 2, FIRST)).resolves.toBe(
+            true,
+          );
+          // Live or expired makes no difference: never extended.
+          await expect(store.markHandoffEnding!('n6', 2, LATER)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n6')).resolves.toMatchObject({
+            ending: { epoch: 2, until: FIRST },
+          });
+          // A different epoch replaces it.
+          await expect(store.markHandoffEnding!('n6', 3, LATER)).resolves.toBe(
+            true,
+          );
+          await expect(store.getHandoff!('n6')).resolves.toMatchObject({
+            ending: { epoch: 3, until: LATER },
+          });
+          // The cap also holds once the session is BOT at that epoch.
+          await store.applyHandoff!('n6', bot(3));
+          await store.markHandoffEnding!('n6', 3, '2026-11-12T11:00:00.000Z');
+          await expect(store.getHandoff!('n6')).resolves.toMatchObject({
+            ending: { epoch: 3, until: LATER },
+          });
+        });
+
+        // R3-reconcile-epoch-mismatch: a reconcile revert covers the lower
+        // epoch of the `ended` item that is still to come.
+        it('a marker that covers a lower epoch is cleared by that epoch too, never by another', async () => {
+          await store.applyHandoff!('n7', human(3));
+          await expect(
+            store.markHandoffEnding!('n7', 3, UNTIL, 2),
+          ).resolves.toBe(true);
+          await expect(store.getHandoff!('n7')).resolves.toMatchObject({
+            ending: { epoch: 3, until: UNTIL, coversEpoch: 2 },
+          });
+          await expect(store.clearHandoffEnding!('n7', 1)).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n7', 4)).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n7', 2)).resolves.toBe(true);
+          await expect(store.getHandoff!('n7')).resolves.not.toHaveProperty(
+            'ending',
+          );
+          // Without `coversEpoch` a lower epoch never clears the marker.
+          await store.markHandoffEnding!('n7', 3, UNTIL);
+          await expect(store.clearHandoffEnding!('n7', 2)).resolves.toBe(false);
+          await expect(store.getHandoff!('n7')).resolves.toMatchObject({
+            ending: { epoch: 3, until: UNTIL },
+          });
+        });
+
+        // R3-pg-inmem-validation-divergence: a corrupt handoff is refused
+        // (and left untouched) by every adapter.
+        it('is refused on a corrupt handoff value, which stays untouched', async () => {
+          const corrupt = [
+            { mode: 'WAT', epoch: 1, requestId: null, updatedAt: T },
+            { mode: 'HUMAN', epoch: 1, requestId: null, updatedAt: T },
+            { mode: 'BOT', epoch: 1, updatedAt: T },
+            { mode: 'BOT', epoch: -1, requestId: null, updatedAt: T },
+            { mode: 'BOT', epoch: 1.5, requestId: null, updatedAt: T },
+            { mode: 'BOT', epoch: 1, requestId: null, updatedAt: 7 },
+          ];
+          for (const [index, handoff] of corrupt.entries()) {
+            const id = `n8-${index}`;
+            await store.create(id, {
+              lastMessageAt: T,
+              data: { handoff: handoff as never },
+            });
+            await expect(store.markHandoffEnding!(id, 5, UNTIL)).resolves.toBe(
+              false,
+            );
+            expect((await store.get(id))?.data.handoff).toEqual(handoff);
+          }
+        });
+
+        it('refuses a bad epoch or instant', async () => {
+          await store.applyHandoff!('n5', human(1));
+          await expect(
+            store.markHandoffEnding!('n5', 1.5, UNTIL),
+          ).resolves.toBe(false);
+          await expect(
+            store.markHandoffEnding!('n5', 1, 'not-a-date'),
+          ).resolves.toBe(false);
+          await expect(store.clearHandoffEnding!('n5', -1)).resolves.toBe(
+            false,
+          );
+        });
+      });
+
       describe('listing HUMAN conversations (live conversation T7)', () => {
         it('lists only HUMAN handoffs, ordered, bounded by the limit', async () => {
           await store.applyHandoff!('l-c', human(2, 'req-c'));

@@ -74,6 +74,13 @@ import {
   sanitizeErrorText,
 } from '../../common/log-safe';
 
+/** Customer media that reopens the WhatsApp window and so triggers replays. */
+const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
+  'sticker',
+  'video',
+  'location',
+]);
+
 /**
  * WebhookDispatcherService (agent + human-handoff router)
  *
@@ -174,7 +181,8 @@ export class WebhookDispatcherService {
     // S7 handoff gate. Required by DI (no @Optional: the runtime graph must
     // never silently lose the gate); optional in TS only for harnesses.
     @Inject(HandoffModeService)
-    private readonly handoffMode?: Pick<HandoffModeService, 'isHumanMode'>,
+    private readonly handoffMode?: Pick<HandoffModeService, 'isHumanMode'> &
+      Partial<Pick<HandoffModeService, 'isSilenced'>>,
     // S5 pending deliveries (window / HUMAN replay). Optional for harnesses.
     @Optional()
     @Inject(HumanRequestDeliveryService)
@@ -240,6 +248,15 @@ export class WebhookDispatcherService {
         this.logger.debug(
           `mirror-only ${message.mirrorOnly.type} ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
         );
+        // S2: a customer sticker/video/location reopens the 24 h window like
+        // text, so it triggers the same replays. Still no bot reply.
+        // Fire-and-forget: the mode read must never delay later messages of
+        // the batch or the webhook answer.
+        if (
+          !this.humanHandoff.isOpsSender(message.senderId) &&
+          WINDOW_REOPENING_MIRROR_TYPES.has(message.mirrorOnly.type)
+        )
+          void this.replayOnMediaInbound(message);
         continue;
       }
 
@@ -581,9 +598,15 @@ export class WebhookDispatcherService {
     return true;
   }
 
-  /** S7: false without a wired service (harnesses); read errors propagate. */
+  /**
+   * S7: false without a wired service (harnesses); read errors propagate.
+   * Follow-ups S4: also true while the session is ENDING (durable BOT, the
+   * farewell not decided yet), from the same single local read.
+   */
   private async isHumanMode(senderId: string): Promise<boolean> {
     if (this.handoffMode === undefined) return false;
+    if (this.handoffMode.isSilenced !== undefined)
+      return this.handoffMode.isSilenced(senderId);
     return this.handoffMode.isHumanMode(senderId);
   }
 
@@ -675,6 +698,29 @@ export class WebhookDispatcherService {
     // S6: atomic outcomes already wrote the marker inside admission, but the
     // claim holds the row as PROCESSING there, so it is completed here.
     await this.markSeenSafely(message.messageId);
+  }
+
+  /**
+   * S2: replays for a mirror-only customer message (sticker, video,
+   * location): HUMAN → deferred staff messages, BOT → pending deliveries,
+   * both fire-and-forget. There is no reply to fail closed on, so an
+   * unreadable mode only skips the replays (a replay may send to the
+   * customer, which must not happen while the mode is unknown) and never
+   * rejects the message: it is already mirrored.
+   */
+  /** Never rejects: called fire-and-forget from the dispatch loop. */
+  private async replayOnMediaInbound(message: InboundMessage): Promise<void> {
+    let human: boolean;
+    try {
+      human = await this.isHumanMode(message.senderId);
+    } catch (error) {
+      this.logger.warn(
+        `handoff mode unreadable: skip replays for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}: ${describeError(error)}`,
+      );
+      return;
+    }
+    if (human) this.notifyHumanDeferred(message.senderId);
+    else this.notifyHumanRequests(message.senderId);
   }
 
   /** S5: fire-and-forget; it never delays or breaks the reply. */

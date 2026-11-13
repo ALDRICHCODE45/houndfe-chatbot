@@ -60,6 +60,8 @@ function setup(
     inbound?: 'never' | 'reject' | 'throw';
     /** B1: what onHumanCustomerInbound does (default: resolves). */
     humanInbound?: 'never' | 'reject' | 'throw';
+    /** S4: isSilenced answer (ENDING marker); absent = the reader lacks it. */
+    silenced?: boolean;
   } = {},
 ) {
   const order: string[] = [];
@@ -149,6 +151,14 @@ function setup(
   const modes = [...(options.modes ?? [])];
   let reads = 0;
   const handoffMode = {
+    ...(options.silenced === undefined
+      ? {}
+      : {
+          isSilenced: jest.fn((senderId: string) => {
+            order.push(`silenced ${senderId}`);
+            return Promise.resolve(options.silenced === true);
+          }),
+        }),
     isHumanMode: jest.fn((senderId: string) => {
       order.push(`mode ${senderId}`);
       reads += 1;
@@ -264,6 +274,20 @@ describe('WebhookDispatcherService handoff gate (S7)', () => {
     await h.service.dispatch(event([text('wamid.h5')]));
     expect(h.agent.prepareCustomer).not.toHaveBeenCalled();
     expect(h.store.get).not.toHaveBeenCalled();
+  });
+
+  it('ENDING: a silenced conversation (durable BOT, farewell pending) gets no bot reply', async () => {
+    const h = setup({ human: false, silenced: true });
+    await h.service.dispatch(event([text('wamid.e1')]));
+    expectSilent(h);
+    expect(h.order).toContain(`silenced ${SENDER}`);
+    expect(h.order).toContain('seen wamid.e1');
+  });
+
+  it('BOT and not ENDING: the silenced read lets the turn run', async () => {
+    const h = setup({ human: false, silenced: false });
+    await h.service.dispatch(event([text('wamid.e2')]));
+    expect(h.agent.tryHandle).toHaveBeenCalled();
   });
 
   it('BOT: the customer turn runs exactly as before', async () => {

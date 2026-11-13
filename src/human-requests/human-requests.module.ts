@@ -196,7 +196,11 @@ function customerPorts(
 ) {
   const inbound = new PostgresCustomerInboundObservationStore(pool);
   return {
-    handoff: { isHumanMode: (id: string) => handoff.isHumanMode(id) },
+    handoff: {
+      isHumanMode: (id: string) => handoff.isHumanMode(id),
+      // Follow-ups S4: replays wait while a farewell is undecided.
+      isEnding: (id: string) => handoff.isEnding(id),
+    },
     isWindowOpen: (senderId: string) => {
       const phone = config.get<string>('meta.phoneNumberId');
       if (typeof phone !== 'string' || !phone.trim())
