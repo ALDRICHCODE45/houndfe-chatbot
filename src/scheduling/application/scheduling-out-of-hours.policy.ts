@@ -48,6 +48,7 @@ import {
 } from '../domain/scheduling-copy';
 import { parseSlotChoice } from '../domain/slot-choice';
 import { formatWhen, slotLabel } from '../domain/slot-time';
+import type { AppointmentIntentService } from './appointment-intent.service';
 import type { SchedulingStateService } from './scheduling-state.service';
 
 export interface SchedulingPolicyPorts {
@@ -63,11 +64,16 @@ export interface SchedulingPolicyPorts {
     | 'clearOffer'
     | 'bookAppointment'
     | 'adoptKnownAppointment'
+    | 'getAppointment'
+    | 'markChangeAsked'
   >;
   /** The unscheduled create, for "no free slot" outcomes. */
   team: Pick<HumanRequestCreateService, 'requestTalkToHuman'>;
   /** The local open-request registry row of a booked request. */
   registry: Pick<HumanRequestFeedStore, 'recordOpenRequest'>;
+  /** Unit 14 T4: "¿a qué hora quedé?", change and cancel, before the offer
+   *  logic. Absent → those messages are not intercepted. */
+  appointments?: Pick<AppointmentIntentService, 'handle'>;
 }
 
 export interface SchedulingPolicyOptions {
@@ -79,9 +85,12 @@ export interface SchedulingPolicyOptions {
 
 /** Transient booking failures: at most this many attempts of the SAME key… */
 const MAX_BOOKING_ATTEMPTS = 3;
-/** …with these pauses, and never more than ~30 s in total. */
+/** …with these pauses, and never more than ~10 s of wall-clock in total
+ *  (call latency + pauses): a webhook dispatch is never held longer. */
 const BACKOFF_MS = [1_000, 3_000];
-const RETRY_BUDGET_MS = 30_000;
+const RETRY_BUDGET_MS = 10_000;
+/** The write guard rejects more than this many slots in an offer. */
+const MAX_OFFERED = 3;
 /** A second unclear answer drops the offer. */
 const MAX_UNCLEAR = 2;
 
@@ -159,7 +168,7 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
       return { kind: 'create_then_reply', closedReply: noSlotsText(openWhen) };
 
     const offer: SchedulingOffer = {
-      slots: answer.slots.map((slot) => ({
+      slots: answer.slots.slice(0, MAX_OFFERED).map((slot) => ({
         startsAt: slot.startsAt,
         withinWindow: slot.withinWindow,
       })),
@@ -191,9 +200,16 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
   async handleReply(context: ReplyContext): Promise<ReplyOutcome> {
     const { senderId } = context;
     try {
-      const { offer } = await this.ports.state.read(senderId);
-      if (offer === null) return PASS;
+      const state = await this.ports.state.read(senderId);
       const now = this.clock();
+      if (this.ports.appointments !== undefined) {
+        const intent = await this.ports.appointments.handle(context, state);
+        if (intent !== null) return intent;
+      }
+      const { offer } = state;
+      if (offer === null) return PASS;
+      // A reschedule offer belongs to the appointment intents: never book it.
+      if (offer.rescheduleRequestId !== undefined) return PASS;
       if (isOfferExpired(offer, now)) {
         await this.ports.state.clearOffer(senderId);
         return PASS;
@@ -228,6 +244,7 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
     offer: SchedulingOffer,
     startsAt: string,
     now: Date,
+    mayRotateKey = true,
   ): Promise<ReplyOutcome> {
     const { senderId } = context;
     const request = buildScheduledRequest({
@@ -264,6 +281,7 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
             timeZone: offer.timeZone,
           },
         );
+        await this.armChangeQuestion(senderId, appointment.requestId, now);
         return {
           kind: 'reply',
           text: alreadyBookedText(
@@ -275,6 +293,14 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
           ),
         };
       }
+      case 'IDEMPOTENCY_CONFLICT':
+        if (mayRotateKey)
+          return this.onKeyConflict(context, offer, startsAt, now);
+        this.logger.error(
+          `scheduled booking refused (${result.kind}) for ${this.masked(senderId)}`,
+        );
+        await this.ports.state.clearOffer(senderId);
+        return PASS;
       case 'CUSTOMER_OPEN_LIMIT':
         await this.ports.state.clearOffer(senderId);
         return { kind: 'reply', text: ASK_TEAM_OPEN_LIMIT_REPLY };
@@ -282,8 +308,8 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
         await this.ports.state.clearOffer(senderId);
         return { kind: 'reply', text: ASK_TEAM_RATE_LIMITED_REPLY };
       default:
-        // SCHEDULING_DISABLED, SUBTYPE_DISABLED, IDEMPOTENCY_CONFLICT,
-        // VALIDATION_ERROR, NOT_FOUND: nothing was promised.
+        // SCHEDULING_DISABLED, SUBTYPE_DISABLED, VALIDATION_ERROR,
+        // NOT_FOUND: nothing was promised.
         this.logger.error(
           `scheduled booking refused (${result.kind}) for ${this.masked(senderId)}`,
         );
@@ -310,31 +336,29 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
       this.logger.error(
         `booking answer for ${this.masked(senderId)} carries no schedule; answering the out-of-hours copy`,
       );
-      await this.ports.state.clearOffer(senderId);
+      await this.dropOffer(senderId);
       return { kind: 'reply', text: TALK_TO_HUMAN_OUT_OF_HOURS_REPLY };
     }
+    await this.recordOpen(senderId, requestId, offer.subtype);
+    // The backend confirmed the booking: whatever happens to the LOCAL
+    // write, the customer is told (never `pass` after a confirmed booking).
     try {
-      await this.ports.registry.recordOpenRequest({
+      await this.ports.state.bookAppointment(senderId, {
         requestId,
-        conversationRef: conversationRefFor(senderId),
         subtype: offer.subtype,
-        legacyId: null,
+        scheduledFor: response.scheduledFor,
+        scheduleVersion: response.scheduleVersion,
+        timeZone: offer.timeZone,
+        rescheduleCount: 0,
       });
     } catch (error) {
       this.warn(
-        `request ${requestId} booked but its registry row failed`,
+        `request ${requestId} booked but the appointment was not stored`,
         senderId,
         error,
       );
+      await this.dropOffer(senderId);
     }
-    await this.ports.state.bookAppointment(senderId, {
-      requestId,
-      subtype: offer.subtype,
-      scheduledFor: response.scheduledFor,
-      scheduleVersion: response.scheduleVersion,
-      timeZone: offer.timeZone,
-      rescheduleCount: 0,
-    });
     const chosen = offer.slots.find((slot) => slot.startsAt === startsAt);
     const outOfWindow =
       response.requiresTemplateAtStart === true ||
@@ -361,7 +385,7 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
   ): Promise<ReplyOutcome> {
     if (slots.length === 0) return this.onNothingFree(senderId, offer);
     const fresh: SchedulingOffer = {
-      slots: slots.map((slot) => ({
+      slots: slots.slice(0, MAX_OFFERED).map((slot) => ({
         startsAt: slot.startsAt,
         withinWindow: slot.withinWindow,
       })),
@@ -411,15 +435,15 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
   }
 
   /**
-   * The same key (a replay is safe) up to 3 times; the pauses and any
-   * Retry-After stay within ~30 s in total, and a Retry-After that would
-   * exceed it stops at once.
+   * The same key (a replay is safe) up to 3 times; the elapsed wall-clock
+   * (call latency + pauses + any Retry-After) stays within ~10 s, and a
+   * pause that would exceed it stops at once.
    */
   private async createWithRetry(
     request: NonNullable<ReturnType<typeof buildScheduledRequest>>,
     senderId: string,
   ): Promise<Booking> {
-    let waited = 0;
+    const startedAt = this.clock().getTime();
     for (let attempt = 1; attempt <= MAX_BOOKING_ATTEMPTS; attempt += 1) {
       let retryAfterMs = 0;
       try {
@@ -434,14 +458,99 @@ export class SchedulingOutOfHoursPolicy implements OutOfHoursPolicy {
       }
       if (attempt === MAX_BOOKING_ATTEMPTS) break;
       const delay = Math.max(BACKOFF_MS[attempt - 1] ?? 0, retryAfterMs);
-      if (waited + delay > RETRY_BUDGET_MS) break;
-      waited += delay;
+      const elapsed = this.clock().getTime() - startedAt;
+      if (elapsed + delay > RETRY_BUDGET_MS) break;
       await this.sleep(delay);
     }
     this.logger.warn(
       `booking for ${this.masked(senderId)} not confirmed, keeping the offer`,
     );
     return { kind: 'gave_up' };
+  }
+
+  /** The backend already holds a request under this key (an earlier attempt
+   *  that gave up may have committed it, or the key was used for another
+   *  slot): one recovery read. An appointment found is stored and answered;
+   *  otherwise the choice is retried ONCE under a fresh key (stored first). */
+  private async onKeyConflict(
+    context: ReplyContext,
+    offer: SchedulingOffer,
+    startsAt: string,
+    now: Date,
+  ): Promise<ReplyOutcome> {
+    const { senderId } = context;
+    const appointment = await this.ports.state.getAppointment(senderId);
+    if (appointment !== null) {
+      await this.dropOffer(senderId);
+      await this.recordOpen(senderId, appointment.requestId, offer.subtype);
+      const zone = appointment.timeZone ?? offer.timeZone;
+      const label = slotLabel(appointment.scheduledFor, zone, now);
+      if (Date.parse(appointment.scheduledFor) === Date.parse(startsAt)) {
+        const chosen = offer.slots.find((slot) => slot.startsAt === startsAt);
+        return {
+          kind: 'reply',
+          text:
+            chosen?.withinWindow === false
+              ? bookedOutOfWindowText(label)
+              : bookedText(label),
+        };
+      }
+      await this.armChangeQuestion(senderId, appointment.requestId, now);
+      return { kind: 'reply', text: alreadyBookedText(label) };
+    }
+    const fresh: SchedulingOffer = {
+      ...offer,
+      sourceRequestId: this.newSourceRequestId(),
+    };
+    await this.ports.state.storeOffer(senderId, fresh);
+    return this.book(context, fresh, startsAt, now, false);
+  }
+
+  /** «¿Quiere cambiarla?» was asked: the next "sí" is the answer. */
+  private async armChangeQuestion(
+    senderId: string,
+    requestId: string,
+    now: Date,
+  ): Promise<void> {
+    try {
+      await this.ports.state.markChangeAsked(
+        senderId,
+        requestId,
+        now.toISOString(),
+      );
+    } catch (error) {
+      this.warn('change question not armed', senderId, error);
+    }
+  }
+
+  private async recordOpen(
+    senderId: string,
+    requestId: string,
+    subtype: SchedulingOffer['subtype'],
+  ): Promise<void> {
+    try {
+      await this.ports.registry.recordOpenRequest({
+        requestId,
+        conversationRef: conversationRefFor(senderId),
+        subtype,
+        legacyId: null,
+      });
+    } catch (error) {
+      this.warn(
+        `request ${requestId} booked but its registry row failed`,
+        senderId,
+        error,
+      );
+    }
+  }
+
+  /** Best-effort offer drop (the customer was already answered). */
+  private async dropOffer(senderId: string): Promise<void> {
+    try {
+      await this.ports.state.clearOffer(senderId);
+    } catch (error) {
+      this.warn('offer not dropped', senderId, error);
+    }
   }
 
   private masked(senderId: string): string {

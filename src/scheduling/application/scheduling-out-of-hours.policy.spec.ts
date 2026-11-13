@@ -1,7 +1,15 @@
 import { Logger } from '@nestjs/common';
+import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
+import type { SchedulingClient } from '../../chatbot-api/domain/scheduling.port';
 import { conversationRefFor } from '../../backend-outbox/domain/backend-outbox';
-import type { CreateHumanRequestResult } from '../../chatbot-api/domain/dtos/human-requests.dto';
-import type { ListSlotsResult } from '../../chatbot-api/domain/dtos/scheduling.dto';
+import type {
+  CancelHumanRequestResult,
+  CreateHumanRequestResult,
+} from '../../chatbot-api/domain/dtos/human-requests.dto';
+import type {
+  ListSlotsResult,
+  RescheduleRequestResult,
+} from '../../chatbot-api/domain/dtos/scheduling.dto';
 import type { GetConversationStateResult } from '../../chatbot-api/domain/dtos/live-conversation.dto';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import {
@@ -10,6 +18,7 @@ import {
 } from '../../conversation/domain/scheduling-state';
 import {
   ASK_TEAM_OPEN_LIMIT_REPLY,
+  ASK_TEAM_RATE_LIMITED_REPLY,
   TALK_TO_HUMAN_QUEUED_REPLY,
 } from '../../human-requests/domain/human-request-create';
 import { TALK_TO_HUMAN_OUT_OF_HOURS_REPLY } from '../../whatsapp/domain/out-of-hours-policy';
@@ -20,11 +29,17 @@ import {
   noSlotsText,
   notUnderstoodText,
   offerText,
+  rescheduledText,
   slotTakenText,
+  whatTimeText,
 } from '../domain/scheduling-copy';
 import { formatWhen, slotLabel } from '../domain/slot-time';
+import { AppointmentIntentService } from './appointment-intent.service';
 import { SchedulingOutOfHoursPolicy } from './scheduling-out-of-hours.policy';
-import { SchedulingStateService } from './scheduling-state.service';
+import {
+  SchedulingStateConflictError,
+  SchedulingStateService,
+} from './scheduling-state.service';
 
 const SENDER = '5215550001111';
 const REF = conversationRefFor(SENDER);
@@ -115,10 +130,15 @@ function setup(
     >;
     state?: GetConversationStateResult;
     now?: Date;
+    /** Wall-clock cost of every create call (ms), to bound the retry. */
+    createLatencyMs?: number;
+    reschedule?: RescheduleRequestResult;
+    cancel?: CancelHumanRequestResult;
   } = {},
 ) {
   const store = new InMemoryConversationStore();
-  const clock = () => options.now ?? NOW;
+  let nowMs = (options.now ?? NOW).getTime();
+  const clock = () => new Date(nowMs);
   const getConversationState = jest.fn(() =>
     Promise.resolve(options.state ?? stateOk()),
   );
@@ -133,6 +153,7 @@ function setup(
   );
   const queue = [...(options.create ?? [booked()])];
   const createHumanRequest = jest.fn(() => {
+    nowMs += options.createLatencyMs ?? 0;
     const next = queue.length > 1 ? queue.shift()! : queue[0];
     return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
   });
@@ -147,8 +168,58 @@ function setup(
     ),
   );
   const recordOpenRequest = jest.fn(() => Promise.resolve());
-  const sleep = jest.fn(() => Promise.resolve());
+  const sleep = jest.fn((ms: number) => {
+    nowMs += ms;
+    return Promise.resolve();
+  });
+  const rescheduleRequest = jest.fn<
+    ReturnType<SchedulingClient['rescheduleRequest']>,
+    Parameters<SchedulingClient['rescheduleRequest']>
+  >(() =>
+    Promise.resolve<RescheduleRequestResult>(
+      options.reschedule ?? {
+        kind: 'ok',
+        status: 'RESCHEDULED',
+        requestId: 'req-77',
+        scheduledFor: SLOT_2,
+        previousScheduledFor: SLOT_1,
+        scheduleVersion: 2,
+        requiresTemplateAtStart: false,
+        whatsappWindowClosesAt: null,
+      },
+    ),
+  );
+  const cancelHumanRequest = jest.fn<
+    ReturnType<HumanRequestsClient['cancelHumanRequest']>,
+    Parameters<HumanRequestsClient['cancelHumanRequest']>
+  >(() =>
+    Promise.resolve<CancelHumanRequestResult>(
+      options.cancel ?? {
+        kind: 'ok',
+        response: {
+          id: 'req-77',
+          status: 'CANCELLED',
+          reason: 'CUSTOMER_WITHDREW',
+          cancelledAt: NOW.toISOString(),
+        },
+      },
+    ),
+  );
+  const closeRequest = jest.fn(() => Promise.resolve(true));
   let seq = 0;
+  const appointments = new AppointmentIntentService(
+    {
+      scheduling: { listSlots, rescheduleRequest },
+      requests: { cancelHumanRequest },
+      state,
+      registry: { closeRequest },
+    },
+    {
+      clock,
+      newKey: () =>
+        `99999999-0000-4000-8000-${String(++seq).padStart(12, '0')}`,
+    },
+  );
   const policy = new SchedulingOutOfHoursPolicy(
     {
       scheduling: { listSlots },
@@ -156,6 +227,7 @@ function setup(
       state,
       team: { requestTalkToHuman },
       registry: { recordOpenRequest },
+      appointments,
     },
     {
       clock,
@@ -174,6 +246,9 @@ function setup(
     recordOpenRequest,
     sleep,
     getConversationState,
+    rescheduleRequest,
+    cancelHumanRequest,
+    elapsedMs: () => nowMs - (options.now ?? NOW).getTime(),
   };
 }
 
@@ -586,6 +661,8 @@ describe('SchedulingOutOfHoursPolicy.handleReply (T3: the customer answers the o
       scheduleVersion: 5,
       timeZone: ZONE,
       rescheduleCount: 0,
+      // T4: «¿Quiere cambiarla?» is armed for the next "sí".
+      changeAskedAt: NOW.toISOString(),
     });
   });
 
@@ -850,6 +927,423 @@ describe('SchedulingOutOfHoursPolicy.handleReply (T3: the customer answers the o
       const text = plan.kind === 'reply' ? plan.text : '';
       expect(text).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
       expect(text).not.toMatch(/UTC|GMT|[+-]\d{2}:\d{2}/);
+    });
+  });
+});
+
+describe('SchedulingOutOfHoursPolicy review advisories (T4 fold-in)', () => {
+  const logs: string[] = [];
+  beforeEach(() => {
+    logs.length = 0;
+    for (const level of ['log', 'warn', 'error', 'debug'] as const)
+      jest
+        .spyOn(Logger.prototype, level)
+        .mockImplementation((message: unknown) => {
+          logs.push(String(message));
+        });
+  });
+  afterEach(() => {
+    expect(logs.join('\n')).not.toContain(SENDER);
+    jest.restoreAllMocks();
+  });
+
+  describe('(1) a confirmed booking is never "pass"', () => {
+    it('a failing local appointment write still sends the booked text and drops the offer best-effort', async () => {
+      const h = setup();
+      await withOffer(h);
+      jest
+        .spyOn(h.state, 'bookAppointment')
+        .mockRejectedValue(new Error(`db ${SENDER}`));
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'reply',
+        text: bookedText(label(SLOT_1)),
+      });
+      expect((await h.state.read(SENDER)).offer).toBeNull();
+      expect(h.recordOpenRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('a CAS loss on the appointment write is the same: the out-of-window text when it applies', async () => {
+      const h = setup({ create: [booked({}, SLOT_3)] });
+      await withOffer(h);
+      jest
+        .spyOn(h.state, 'bookAppointment')
+        .mockRejectedValue(new SchedulingStateConflictError());
+      await expect(h.policy.handleReply(reply('3'))).resolves.toEqual({
+        kind: 'reply',
+        text: bookedOutOfWindowText(label(SLOT_3)),
+      });
+    });
+
+    it('even when dropping the offer fails too', async () => {
+      const h = setup();
+      await withOffer(h);
+      jest.spyOn(h.state, 'bookAppointment').mockRejectedValue(new Error('x'));
+      jest.spyOn(h.state, 'clearOffer').mockRejectedValue(new Error('y'));
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'reply',
+        text: bookedText(label(SLOT_1)),
+      });
+    });
+
+    it('a booking answer with no schedule still answers the fixed copy when the offer cannot be dropped', async () => {
+      const h = setup({
+        create: [
+          {
+            kind: 'ok',
+            status: 201,
+            response: {
+              id: 'req-77',
+              folio: null,
+              status: 'NEW',
+              outcome: 'CREATED',
+              mergedIntoId: null,
+              businessHours: null,
+            },
+          },
+        ],
+      });
+      await withOffer(h);
+      jest.spyOn(h.state, 'clearOffer').mockRejectedValue(new Error('y'));
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'reply',
+        text: TALK_TO_HUMAN_OUT_OF_HOURS_REPLY,
+      });
+    });
+  });
+
+  describe('(2) never more than 3 slots in an offer', () => {
+    const FOUR = [
+      ...THREE,
+      { startsAt: '2026-11-13T16:30:00.000Z', withinWindow: false },
+    ];
+
+    it('planAsk truncates to 3 before storing and offering', async () => {
+      const h = setup({ slots: slotsOk(FOUR) });
+      const plan = await h.policy.planAsk(ASK);
+      expect(plan).toEqual({
+        kind: 'reply',
+        text: offerText(
+          OPEN_WHEN,
+          THREE.map((slot) => label(slot.startsAt)),
+        ),
+      });
+      expect((await h.state.read(SENDER)).offer?.slots).toEqual(THREE);
+    });
+
+    it('the SLOT_UNAVAILABLE re-offer truncates to 3', async () => {
+      const h = setup({
+        create: [
+          {
+            kind: 'SLOT_UNAVAILABLE',
+            slots: FOUR,
+            timeZone: ZONE,
+            whatsappWindowClosesAt: WINDOW_CLOSES,
+          },
+        ],
+      });
+      await withOffer(h);
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'reply',
+        text: slotTakenText(THREE.map((slot) => label(slot.startsAt))),
+      });
+      expect((await h.state.read(SENDER)).offer?.slots).toEqual(THREE);
+    });
+  });
+
+  describe('(3) the key of a booking that gave up', () => {
+    const giveUp = async (h: ReturnType<typeof setup>) => {
+      await withOffer(h);
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'pass',
+      });
+    };
+    const committedRoute = (at = SLOT_2, requestId = 'req-77') =>
+      stateOk({
+        requestId,
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: at,
+        needsReschedule: false,
+        scheduleVersion: 3,
+      });
+
+    it('IDEMPOTENCY_CONFLICT + the backend holds the chosen slot: stored, registered, booked text', async () => {
+      const h = setup({
+        create: [
+          new Error('timeout'),
+          new Error('timeout'),
+          new Error('timeout'),
+          { kind: 'IDEMPOTENCY_CONFLICT' },
+        ],
+        state: committedRoute(SLOT_2),
+      });
+      await giveUp(h);
+      const result = await h.policy.handleReply(reply('2', 'wamid.NEXT'));
+      expect(result).toEqual({
+        kind: 'reply',
+        text: bookedText(label(SLOT_2)),
+      });
+      expect(h.getConversationState).toHaveBeenCalledTimes(1);
+      const read = await h.state.read(SENDER);
+      expect(read.offer).toBeNull();
+      expect(read.appointment).toMatchObject({
+        requestId: 'req-77',
+        scheduledFor: SLOT_2,
+        scheduleVersion: 3,
+      });
+      expect(h.recordOpenRequest).toHaveBeenCalledWith({
+        requestId: 'req-77',
+        conversationRef: REF,
+        subtype: 'TALK_TO_HUMAN',
+        legacyId: null,
+      });
+    });
+
+    it('the recovered appointment is at another time: "ya tiene una cita" and the change question is armed', async () => {
+      const h = setup({
+        create: [
+          new Error('timeout'),
+          new Error('timeout'),
+          new Error('timeout'),
+          { kind: 'IDEMPOTENCY_CONFLICT' },
+        ],
+        state: committedRoute(SLOT_1),
+      });
+      await giveUp(h);
+      await expect(h.policy.handleReply(reply('3'))).resolves.toEqual({
+        kind: 'reply',
+        text: alreadyBookedText(label(SLOT_1)),
+      });
+      const read = await h.state.read(SENDER);
+      expect(read.offer).toBeNull();
+      // (The clock moved by the retry pauses before the conflict.)
+      expect(
+        Date.parse(read.appointment?.changeAskedAt ?? ''),
+      ).toBeGreaterThanOrEqual(NOW.getTime());
+    });
+
+    it('nothing committed on the backend: a fresh key is stored and used for the chosen slot', async () => {
+      const h = setup({
+        create: [
+          new Error('timeout'),
+          new Error('timeout'),
+          new Error('timeout'),
+          { kind: 'IDEMPOTENCY_CONFLICT' },
+          booked({}, SLOT_2),
+        ],
+        state: stateOk(null),
+      });
+      const before = await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      const result = await h.policy.handleReply(reply('2'));
+      expect(result).toEqual({
+        kind: 'reply',
+        text: bookedText(label(SLOT_2)),
+      });
+      const keys = (
+        h.createHumanRequest.mock.calls as unknown as [
+          { sourceRequestId: string },
+        ][]
+      ).map((call) => call[0].sourceRequestId);
+      expect(keys).toHaveLength(5);
+      expect(new Set(keys.slice(0, 4))).toEqual(
+        new Set([before.sourceRequestId]),
+      );
+      expect(keys[4]).not.toBe(before.sourceRequestId);
+      expect((await h.state.read(SENDER)).appointment).toMatchObject({
+        scheduledFor: SLOT_2,
+      });
+    });
+
+    it('a second conflict on the fresh key drops the offer and the agent answers', async () => {
+      const h = setup({
+        create: [
+          new Error('timeout'),
+          new Error('timeout'),
+          new Error('timeout'),
+          { kind: 'IDEMPOTENCY_CONFLICT' },
+        ],
+        state: stateOk(null),
+      });
+      await giveUp(h);
+      await expect(h.policy.handleReply(reply('2'))).resolves.toEqual({
+        kind: 'pass',
+      });
+      expect((await h.state.read(SENDER)).offer).toBeNull();
+      // 3 attempts + the conflict + one fresh-key attempt that conflicts again.
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(5);
+    });
+  });
+
+  describe('(4) the inline retry is bounded by elapsed wall-clock (≤ 10 s)', () => {
+    it('slow calls count: two 6 s failures stop the loop before a third attempt', async () => {
+      const h = setup({
+        create: [new Error('timeout')],
+        createLatencyMs: 6_000,
+      });
+      await withOffer(h);
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'pass',
+      });
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(2);
+      expect(h.elapsedMs()).toBeLessThanOrEqual(10_000 + 6_000);
+    });
+
+    it('a call that already used the budget gets no pause and no retry', async () => {
+      const h = setup({
+        create: [new Error('timeout')],
+        createLatencyMs: 10_000,
+      });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+      expect(h.sleep).not.toHaveBeenCalled();
+    });
+
+    it('fast failures still get the 3 attempts (1 s + 3 s pauses)', async () => {
+      const h = setup({ create: [new Error('timeout')] });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(3);
+      expect(h.sleep.mock.calls.map((call) => call[0])).toEqual([1_000, 3_000]);
+    });
+
+    it('a Retry-After above the 10 s budget stops at once', async () => {
+      const h = setup({
+        create: [{ kind: 'RATE_LIMITED', retryAfterSeconds: 11 }],
+      });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+      expect(h.sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('(5) other booking outcomes', () => {
+    it('CUSTOMER_RATE_LIMITED: the approved rate-limit copy, offer dropped, no retry', async () => {
+      const h = setup({
+        create: [
+          { kind: 'CUSTOMER_RATE_LIMITED', limit: null, retryAfterSeconds: 30 },
+        ],
+      });
+      await withOffer(h);
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'reply',
+        text: ASK_TEAM_RATE_LIMITED_REPLY,
+      });
+      expect((await h.state.read(SENDER)).offer).toBeNull();
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+      expect(h.sleep).not.toHaveBeenCalled();
+    });
+
+    it('VALIDATION_ERROR: nothing is promised, offer dropped, error logged without the phone', async () => {
+      const h = setup({
+        create: [{ kind: 'VALIDATION_ERROR', message: `bad ${SENDER}` }],
+      });
+      await withOffer(h);
+      await expect(h.policy.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'pass',
+      });
+      expect((await h.state.read(SENDER)).offer).toBeNull();
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+      expect(logs.some((line) => line.includes('VALIDATION_ERROR'))).toBe(true);
+    });
+  });
+
+  describe('T4 delegation to the appointment intents', () => {
+    it('"¿a qué hora quedé?" answers from the stored appointment', async () => {
+      const h = setup();
+      await h.state.bookAppointment(SENDER, {
+        requestId: 'req-77',
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: SLOT_3,
+        scheduleVersion: 1,
+        timeZone: ZONE,
+        rescheduleCount: 0,
+      });
+      await expect(
+        h.policy.handleReply(reply('¿a qué hora quedé?')),
+      ).resolves.toEqual({
+        kind: 'reply',
+        text: whatTimeText(label(SLOT_3)),
+      });
+    });
+
+    it('ALREADY_SCHEDULED arms the question: "sí" then starts the change and the choice reschedules (never a second booking)', async () => {
+      const h = setup({
+        create: [
+          {
+            kind: 'ALREADY_SCHEDULED',
+            requestId: 'req-77',
+            scheduledFor: SLOT_3,
+          },
+        ],
+        state: stateOk({
+          requestId: 'req-77',
+          subtype: 'TALK_TO_HUMAN',
+          scheduledFor: SLOT_3,
+          needsReschedule: false,
+          scheduleVersion: 2,
+        }),
+      });
+      await withOffer(h);
+      await h.policy.handleReply(reply('1'));
+      expect((await h.state.read(SENDER)).appointment?.changeAskedAt).toBe(
+        NOW.toISOString(),
+      );
+      const offered = await h.policy.handleReply(reply('sí'));
+      expect(offered.kind).toBe('reply');
+      expect((await h.state.read(SENDER)).offer?.rescheduleRequestId).toBe(
+        'req-77',
+      );
+      const done = await h.policy.handleReply(reply('2'));
+      expect(done).toEqual({
+        kind: 'reply',
+        text: rescheduledText(label(SLOT_2)),
+      });
+      expect(h.rescheduleRequest).toHaveBeenCalledTimes(1);
+      // Only the first (ALREADY_SCHEDULED) create ever happened.
+      expect(h.createHumanRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('a reschedule offer is never mistaken for a booking offer when the intents are not wired', async () => {
+      const h = setup();
+      await h.state.bookAppointment(SENDER, {
+        requestId: 'req-77',
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: SLOT_3,
+        scheduleVersion: 1,
+        timeZone: ZONE,
+        rescheduleCount: 0,
+      });
+      await h.state.storeOffer(SENDER, {
+        slots: THREE,
+        timeZone: ZONE,
+        offeredAt: NOW.toISOString(),
+        subtype: 'TALK_TO_HUMAN',
+        sourceRequestId: '11111111-1111-4111-8111-111111111111',
+        unclearCount: 0,
+        rescheduleRequestId: 'req-77',
+      });
+      const bare = new SchedulingOutOfHoursPolicy({
+        scheduling: { listSlots: h.listSlots },
+        requests: { createHumanRequest: h.createHumanRequest },
+        state: h.state,
+        team: { requestTalkToHuman: h.requestTalkToHuman },
+        registry: { recordOpenRequest: h.recordOpenRequest },
+      });
+      await expect(bare.handleReply(reply('1'))).resolves.toEqual({
+        kind: 'pass',
+      });
+      expect(h.createHumanRequest).not.toHaveBeenCalled();
+    });
+
+    it('a cancel while a booking offer is open and no appointment exists falls to the booking offer logic', async () => {
+      const h = setup();
+      await withOffer(h);
+      const result = await h.policy.handleReply(reply('cancela mi cita'));
+      // No appointment anywhere: the offer logic ("cancel" is not a slot).
+      expect(h.cancelHumanRequest).not.toHaveBeenCalled();
+      expect(result).toEqual({ kind: 'reply', text: notUnderstoodText() });
     });
   });
 });

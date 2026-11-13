@@ -29,8 +29,14 @@ const REMINDER_USTED =
 const CHANGED_USTED = 'El equipo cambió su cita para mañana a las 9:30 a. m.';
 
 const harness = (
-  options: { withHandler?: boolean; withReader?: boolean } = {},
+  options: {
+    withHandler?: boolean;
+    withReader?: boolean;
+    withWriter?: boolean;
+    writerFails?: boolean;
+  } = {},
 ) => {
+  const writes: Array<{ senderId: string; update: unknown }> = [];
   const withHandler = options.withHandler ?? true;
   const withReader = options.withReader ?? true;
   const store = new InMemoryHumanRequestFeedStore();
@@ -70,6 +76,18 @@ const harness = (
                   : script[Math.min(calls.known, script.length - 1)];
               calls.known += 1;
               return Promise.resolve(value);
+            },
+          },
+        }
+      : {}),
+    ...(options.withWriter
+      ? {
+          appointmentWriter: {
+            recordStaffReschedule: (senderId: string, update: unknown) => {
+              writes.push({ senderId, update });
+              return options.writerFails
+                ? Promise.reject(new Error('db down'))
+                : Promise.resolve();
             },
           },
         }
@@ -124,7 +142,7 @@ const harness = (
       },
     },
   );
-  return { store, acks, sent, state, calls, service, handler };
+  return { store, acks, sent, state, calls, service, handler, writes };
 };
 
 const ACK_ALLOWED = ['PROVIDER_ACCEPTED', 'DELIVERY_UNKNOWN', 'STALE'];
@@ -531,6 +549,76 @@ describe('ScheduledConversationService through the delivery ledger (unit 14)', (
       await expect(store.getDelivery('s8')).resolves.toMatchObject({
         decision: 'STALE_SCHEDULE',
       });
+    });
+  });
+
+  describe('T4 L6: a staff reschedule updates the stored appointment', () => {
+    const UPDATE = {
+      requestId: 'req-w1',
+      scheduledFor: '2026-11-11T15:30:00.000Z',
+      scheduleVersion: 2,
+      timeZone: 'America/Mexico_City',
+    };
+
+    it('when the notice is sent', async () => {
+      const { service, sent, writes } = harness({ withWriter: true });
+      await service.accept(rescheduledItem('w1'));
+      expect(sent).toHaveLength(1);
+      expect(writes).toEqual([{ senderId: SENDER, update: UPDATE }]);
+    });
+
+    it('when the notice is STALE because the window is closed', async () => {
+      const { service, sent, writes, state, store } = harness({
+        withWriter: true,
+      });
+      state.windowScript = [false];
+      await service.accept(rescheduledItem('w1'));
+      expect(sent).toEqual([]);
+      await expect(store.getDelivery('w1')).resolves.toMatchObject({
+        decision: 'WINDOW_CLOSED',
+      });
+      expect(writes).toEqual([{ senderId: SENDER, update: UPDATE }]);
+    });
+
+    it('when the chat is HUMAN (notice STALE)', async () => {
+      const { service, writes, state } = harness({ withWriter: true });
+      state.human = true;
+      await service.accept(rescheduledItem('w1'));
+      expect(writes).toHaveLength(1);
+    });
+
+    it('passes the item zone as null when it names none', async () => {
+      const { service, writes } = harness({ withWriter: true });
+      const item = rescheduledItem('w1');
+      await service.accept({
+        ...item,
+        payload: { ...item.payload, timeZone: null },
+      });
+      expect(writes[0].update).toEqual({ ...UPDATE, timeZone: null });
+    });
+
+    it('a reminder never writes', async () => {
+      const { service, writes } = harness({ withWriter: true });
+      await service.accept(reminderItem('w2'));
+      expect(writes).toEqual([]);
+    });
+
+    it('a failing write fails the item (retried): nothing sent, nothing ACKed', async () => {
+      const { service, sent, acks } = harness({
+        withWriter: true,
+        writerFails: true,
+      });
+      await expect(service.accept(rescheduledItem('w1'))).rejects.toThrow(
+        'db down',
+      );
+      expect(sent).toEqual([]);
+      expect(acks).toEqual([]);
+    });
+
+    it('without a writer the notice is sent as before', async () => {
+      const { service, sent } = harness();
+      await service.accept(rescheduledItem('w3'));
+      expect(sent).toHaveLength(1);
     });
   });
 

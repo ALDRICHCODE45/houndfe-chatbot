@@ -136,8 +136,12 @@ class FakeSender {
   }
 }
 
-const setup = (options: HumanRequestDeliveryOptions = {}) => {
+const setup = (
+  options: HumanRequestDeliveryOptions = {},
+  schedule?: 'ok' | 'throws',
+) => {
   const store = new InMemoryHumanRequestFeedStore();
+  const cleared: Array<{ senderId: string; requestId: string }> = [];
   const modeChecks: string[] = [];
   const client = new FakeClient();
   const sender = new FakeSender();
@@ -159,6 +163,18 @@ const setup = (options: HumanRequestDeliveryOptions = {}) => {
       },
       isWindowOpen: () => Promise.resolve(window.open),
       customerStyle: () => Promise.resolve(style),
+      ...(schedule === undefined
+        ? {}
+        : {
+            schedule: {
+              clearAppointment: (senderId: string, requestId: string) => {
+                cleared.push({ senderId, requestId });
+                return schedule === 'throws'
+                  ? Promise.reject(new Error('db down'))
+                  : Promise.resolve();
+              },
+            },
+          }),
     },
     {
       ...options,
@@ -171,6 +187,7 @@ const setup = (options: HumanRequestDeliveryOptions = {}) => {
     },
   );
   return {
+    cleared,
     store,
     client,
     sender,
@@ -444,6 +461,39 @@ describe('HumanRequestDeliveryService', () => {
         ),
       );
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('m5'));
+    });
+  });
+
+  describe('request.cancelled (T4: the stored appointment goes with it)', () => {
+    it('clears the stored appointment of the cancelled request, even for DUPLICATE', async () => {
+      const { service, cleared } = setup({}, 'ok');
+      await service.accept(
+        cancelledItem('ca1', {
+          payload: {
+            requestId: 'req-ca1',
+            reason: 'DUPLICATE',
+            cancelledBy: 'STAFF',
+          },
+        }),
+      );
+      await service.accept(cancelledItem('ca2'));
+      expect(cleared).toEqual([
+        { senderId: SENDER, requestId: 'req-ca1' },
+        { senderId: SENDER, requestId: expect.any(String) as string },
+      ]);
+    });
+
+    it('a failing clear is logged and never blocks the notice', async () => {
+      const { service, sender, client } = setup({}, 'throws');
+      await service.accept(cancelledItem('ca3'));
+      expect(sender.sent).toHaveLength(1);
+      expect(client.acks[0].body.outcome).toBe('PROVIDER_ACCEPTED');
+    });
+
+    it('without the schedule port nothing changes', async () => {
+      const { service, sender } = setup();
+      await service.accept(cancelledItem('ca4'));
+      expect(sender.sent).toHaveLength(1);
     });
   });
 

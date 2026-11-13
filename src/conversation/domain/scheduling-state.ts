@@ -41,6 +41,9 @@ export interface SchedulingOffer {
   openWhen?: string;
   /** How many answers were not understood (the second drops the offer). */
   unclearCount: number;
+  /** Unit 14 T4: present when this is a RESCHEDULE offer for that request
+   *  (`sourceRequestId` is then the reschedule's idempotency key). */
+  rescheduleRequestId?: string;
 }
 
 export interface SchedulingAppointment {
@@ -51,6 +54,9 @@ export interface SchedulingAppointment {
   scheduleVersion: number;
   timeZone: string | null;
   rescheduleCount: number;
+  /** Unit 14 T4: when «¿Quiere cambiarla?» was asked (the next "sí" is the
+   *  answer, for a few minutes). */
+  changeAskedAt?: string;
 }
 
 export interface SchedulingState {
@@ -107,7 +113,8 @@ function readOffer(raw: unknown): SchedulingOffer | null {
     !isText(raw.timeZone) ||
     !isInstant(raw.offeredAt) ||
     (raw.subtype !== 'TALK_TO_HUMAN' && raw.subtype !== 'COMPLAINT') ||
-    !isText(raw.sourceRequestId)
+    !isText(raw.sourceRequestId) ||
+    (raw.rescheduleRequestId !== undefined && !isText(raw.rescheduleRequestId))
   )
     return null;
   const unclearCount = raw.unclearCount === undefined ? 0 : raw.unclearCount;
@@ -120,6 +127,9 @@ function readOffer(raw: unknown): SchedulingOffer | null {
     sourceRequestId: raw.sourceRequestId,
     ...(isText(raw.openWhen) ? { openWhen: raw.openWhen } : {}),
     unclearCount,
+    ...(raw.rescheduleRequestId === undefined
+      ? {}
+      : { rescheduleRequestId: raw.rescheduleRequestId }),
   };
 }
 
@@ -131,7 +141,8 @@ function readAppointment(raw: unknown): SchedulingAppointment | null {
     !isInstant(raw.scheduledFor) ||
     !isCount(raw.scheduleVersion) ||
     !(raw.timeZone === null || isText(raw.timeZone)) ||
-    !isCount(raw.rescheduleCount)
+    !isCount(raw.rescheduleCount) ||
+    (raw.changeAskedAt !== undefined && !isInstant(raw.changeAskedAt))
   )
     return null;
   return {
@@ -141,6 +152,9 @@ function readAppointment(raw: unknown): SchedulingAppointment | null {
     scheduleVersion: raw.scheduleVersion,
     timeZone: raw.timeZone,
     rescheduleCount: raw.rescheduleCount,
+    ...(raw.changeAskedAt === undefined
+      ? {}
+      : { changeAskedAt: raw.changeAskedAt }),
   };
 }
 

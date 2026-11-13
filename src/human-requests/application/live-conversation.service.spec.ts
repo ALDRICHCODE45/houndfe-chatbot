@@ -121,9 +121,12 @@ const setup = (
     noRefuse?: boolean;
     /** Wires the optional outbox waker; `throws` makes it throw. */
     wake?: boolean | 'throws';
+    /** Wires the optional scheduling port (T4 L7: clear a pending offer). */
+    scheduling?: boolean | 'throws';
   } = {},
 ) => {
   const events: string[] = [];
+  const clearedOffers: string[] = [];
   const wakes: string[] = [];
   const conversation = new InMemoryConversationStore();
   const modeService = new HandoffModeService(conversation);
@@ -296,6 +299,19 @@ const setup = (
         sender,
         isWindowOpen,
         customerStyle,
+        ...(options.scheduling === undefined || options.scheduling === false
+          ? {}
+          : {
+              scheduling: {
+                clearOffer: (senderId: string) => {
+                  events.push('clear-offer');
+                  clearedOffers.push(senderId);
+                  return options.scheduling === 'throws'
+                    ? Promise.reject(new Error('db down'))
+                    : Promise.resolve();
+                },
+              },
+            }),
         ...(options.wake === undefined || options.wake === false
           ? {}
           : {
@@ -327,6 +343,7 @@ const setup = (
     },
   );
   return {
+    clearedOffers,
     service,
     store,
     events,
@@ -492,6 +509,37 @@ describe('LiveConversationService (T4)', () => {
   afterEach(() => jest.restoreAllMocks());
 
   describe('conversation.started', () => {
+    it('T4 L7: a pending scheduling offer is cleared once the mute is durable, before the ack', async () => {
+      const h = setup({ scheduling: true });
+      await h.service.accept(started('so1'));
+      expect(h.clearedOffers).toEqual([SENDER]);
+      expect(h.events.slice(0, 3)).toEqual([
+        'cas:started',
+        'clear-offer',
+        'ack:STARTED',
+      ]);
+    });
+
+    it('T4 L7: a failing offer clear never blocks the session (greeting still sent)', async () => {
+      const h = setup({ scheduling: 'throws' });
+      await h.service.accept(started('so2'));
+      expect(h.sent).toEqual([{ to: SENDER, text: GREETING }]);
+    });
+
+    it('T4 L7: a stale started (older epoch) clears nothing', async () => {
+      const h = setup({ scheduling: true });
+      await h.service.accept(started('so3', { handoffEpoch: 5 }));
+      h.clearedOffers.length = 0;
+      await h.service.accept(started('so4', { handoffEpoch: 2 }));
+      expect(h.clearedOffers).toEqual([]);
+    });
+
+    it('T4 L7: without the scheduling port nothing changes', async () => {
+      const h = setup();
+      await h.service.accept(started('so5'));
+      expect(h.sent).toEqual([{ to: SENDER, text: GREETING }]);
+    });
+
     it('CAS to HUMAN first, then session-ack STARTED, and only then the greeting', async () => {
       const h = setup();
       await h.service.accept(started('s1'));

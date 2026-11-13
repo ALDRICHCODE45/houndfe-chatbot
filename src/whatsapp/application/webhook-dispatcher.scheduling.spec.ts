@@ -253,6 +253,50 @@ describe('WebhookDispatcherService scheduling (unit 14 T3)', () => {
       expect(h.handleReply).not.toHaveBeenCalled();
     });
 
+    it('T4: the appointment replies (time, reschedule, cancel) are styled in tú and mode-checked before the send', async () => {
+      const texts = [
+        [
+          'Su cita es mañana a las 9:00 a. m. Una persona del equipo le escribe por aquí a esa hora.',
+          'Tu cita es mañana a las 9:00 a. m. Una persona del equipo te escribe por aquí a esa hora.',
+        ],
+        [
+          'Listo, cambié su cita para mañana a las 9:30 a. m.',
+          'Listo, cambié tu cita para mañana a las 9:30 a. m.',
+        ],
+        [
+          'Listo, cancelé su cita. Si necesita algo más, aquí sigo para ayudarle.',
+          'Listo, cancelé tu cita. Si necesitas algo más, aquí sigo para ayudarte.',
+        ],
+        [
+          'Ya tiene una cita para mañana a las 9:00 a. m. ¿Quiere cambiarla?',
+          'Ya tienes una cita para mañana a las 9:00 a. m. ¿Quieres cambiarla?',
+        ],
+      ];
+      for (const [usted, tu] of texts) {
+        const h = setup({
+          reply: { kind: 'reply', text: usted },
+          style: { register: 'tu', emojis: false, tone: 'casual' },
+        });
+        await h.service.dispatch(
+          event([text('wamid.t4', '¿a qué hora quedé?')]),
+        );
+        expect(h.sender.sendText).toHaveBeenCalledWith({
+          to: SENDER,
+          text: tu,
+        });
+      }
+      const human = setup({
+        reply: { kind: 'reply', text: 'Listo, cancelé su cita.' },
+      });
+      human.handoffMode.isHumanMode
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+      await human.service.dispatch(
+        event([text('wamid.t5', 'cancela mi cita')]),
+      );
+      expect(human.sender.sendText).not.toHaveBeenCalled();
+    });
+
     it('HUMAN mode: the policy is not even asked (nothing is booked or sent)', async () => {
       const h = setup({ human: true, reply: { kind: 'reply', text: 'x' } });
       await h.service.dispatch(event([text('wamid.r6', '1')]));

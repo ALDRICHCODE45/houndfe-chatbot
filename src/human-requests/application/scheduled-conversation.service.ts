@@ -36,8 +36,39 @@ export interface KnownSchedule {
  * (transient: the feed retries the item, nothing is sent).
  */
 export interface ScheduledAppointmentReader {
-  knownSchedule(requestId: string): Promise<KnownSchedule | null>;
+  /** `senderId` (when the caller has it) saves the registry lookup. */
+  knownSchedule(
+    requestId: string,
+    senderId?: string | null,
+  ): Promise<KnownSchedule | null>;
 }
+
+/** What a staff reschedule item tells the bot to remember. */
+export interface StaffRescheduleSync {
+  requestId: string;
+  scheduledFor: string;
+  scheduleVersion: number;
+  /** The item's zone, `null` when it names none. */
+  timeZone: string | null;
+}
+
+/**
+ * Write port over the same state (unit 14 T4, L6): a `conversation.rescheduled`
+ * item updates the stored appointment (only when its version is newer; the
+ * implementation decides). Rejects when the write fails: the feed retries
+ * the item.
+ */
+export interface ScheduledAppointmentWriter {
+  recordStaffReschedule(
+    senderId: string,
+    update: StaffRescheduleSync,
+  ): Promise<void>;
+}
+
+/** Nest injection token for an optional `ScheduledAppointmentWriter`. */
+export const SCHEDULED_APPOINTMENT_WRITER = Symbol(
+  'SCHEDULED_APPOINTMENT_WRITER',
+);
 
 /** Nest injection token for an optional `ScheduledAppointmentReader`. */
 export const SCHEDULED_APPOINTMENT_READER = Symbol(
@@ -53,6 +84,8 @@ export interface ScheduledConversationPorts {
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
   /** Optional version check; absent → the check is skipped. */
   appointments?: ScheduledAppointmentReader;
+  /** Optional: a staff reschedule updates the stored appointment. */
+  appointmentWriter?: ScheduledAppointmentWriter;
   clock?: () => Date;
 }
 
@@ -123,6 +156,16 @@ export class ScheduledConversationService implements ScheduledConversationHandle
       );
       return { action: 'stale', decision: 'NO_CONVERSATION' };
     }
+    // A staff reschedule is the new truth whether or not the customer can be
+    // told now (closed window, HUMAN chat): "¿a qué hora quedé?" must never
+    // answer the old time. Rejects → the item is retried.
+    if (item.type === 'conversation.rescheduled')
+      await this.ports.appointmentWriter?.recordStaffReschedule(senderId, {
+        requestId: item.payload.requestId,
+        scheduledFor: item.payload.scheduledFor,
+        scheduleVersion: item.payload.scheduleVersion,
+        timeZone: usableZone(item.payload.timeZone),
+      });
     const stale = await this.staleReason(senderId, item);
     if (stale !== null) {
       this.logger.log(
@@ -130,7 +173,7 @@ export class ScheduledConversationService implements ScheduledConversationHandle
       );
       return { action: 'stale', decision: stale };
     }
-    const known = await this.known(item.payload.requestId);
+    const known = await this.known(item.payload.requestId, senderId);
     const timeZone =
       usableZone(item.payload.timeZone) ??
       usableZone(known?.timeZone) ??
@@ -165,16 +208,21 @@ export class ScheduledConversationService implements ScheduledConversationHandle
     if (request !== null && request.status !== 'OPEN') return 'REQUEST_CLOSED';
     if (instant(scheduledFor) <= this.clock().getTime())
       return 'STALE_SCHEDULE';
-    if (isSupersededSchedule(await this.known(requestId), item.payload))
+    if (
+      isSupersededSchedule(await this.known(requestId, senderId), item.payload)
+    )
       return 'STALE_SCHEDULE';
     if (!(await this.ports.isWindowOpen(senderId))) return 'WINDOW_CLOSED';
     return null;
   }
 
-  private known(requestId: string): Promise<KnownSchedule | null> {
+  private known(
+    requestId: string,
+    senderId: string,
+  ): Promise<KnownSchedule | null> {
     return this.ports.appointments === undefined
       ? Promise.resolve(null)
-      : this.ports.appointments.knownSchedule(requestId);
+      : this.ports.appointments.knownSchedule(requestId, senderId);
   }
 
   private async readStyle(senderId: string): Promise<CustomerStyle | null> {

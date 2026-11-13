@@ -124,6 +124,13 @@ export interface LiveConversationPorts {
    * `seq` on arrival). Optional: absent → no-op; a throw is swallowed.
    */
   wakeOutbox?(): void;
+  /**
+   * Unit 14 T4 (L7): a pending slot offer must not survive a HUMAN session
+   * (the customer's "1" would book/reschedule behind the attendee's back).
+   * Called once the mute is durable on a started item; failures are logged
+   * and never block the session. Optional.
+   */
+  scheduling?: { clearOffer(senderId: string): Promise<void> };
 }
 
 /**
@@ -312,6 +319,9 @@ export class LiveConversationService implements LiveConversationHandler {
       duplicate = true;
     }
 
+    // The session owns the conversation now: a pending slot offer is void.
+    await this.dropPendingOffer(ref, senderId);
+
     // 2. Inline session-ack STARTED (never waits for Meta).
     const ack = await this.ports.client.sessionAck(ref, {
       epoch,
@@ -404,6 +414,18 @@ export class LiveConversationService implements LiveConversationHandler {
           await this.recordGreeting(senderId, epoch);
       },
     };
+  }
+
+  /** Best-effort: never blocks the session (the offer also expires). */
+  private async dropPendingOffer(ref: string, senderId: string): Promise<void> {
+    if (this.ports.scheduling === undefined) return;
+    try {
+      await this.ports.scheduling.clearOffer(senderId);
+    } catch (error) {
+      this.logger.warn(
+        `pending scheduling offer not cleared (${maskConversationRef(ref)}): ${describeError(error)}`,
+      );
+    }
   }
 
   // --------------------------------------------------------- reassigned

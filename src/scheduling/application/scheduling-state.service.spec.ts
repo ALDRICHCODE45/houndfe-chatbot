@@ -3,7 +3,11 @@ import type {
   SchedulingAppointment,
   SchedulingOffer,
 } from '../../conversation/domain/scheduling-state';
-import { SchedulingStateService } from './scheduling-state.service';
+import {
+  SchedulingStateConflictError,
+  SchedulingStateInvalidError,
+  SchedulingStateService,
+} from './scheduling-state.service';
 
 const SENDER = '5215550001111';
 const NOW = new Date('2026-11-12T20:00:00.000Z');
@@ -194,6 +198,290 @@ describe('SchedulingStateService (offer / appointment state)', () => {
     await h.service.storeOffer(SENDER, OFFER);
     jest.spyOn(h.store, 'commitScheduling').mockResolvedValue(false);
     await expect(h.service.clearOffer(SENDER)).rejects.toThrow(/conflict/i);
+  });
+
+  it('an invalid state is rejected at once as a validation error, never spun through the CAS rounds', async () => {
+    const h = setup();
+    const commit = jest.spyOn(h.store, 'commitScheduling');
+    const tooMany = {
+      ...OFFER,
+      slots: Array.from({ length: 4 }, () => OFFER.slots[0]),
+    };
+    await expect(h.service.storeOffer(SENDER, tooMany)).rejects.toBeInstanceOf(
+      SchedulingStateInvalidError,
+    );
+    expect(commit).not.toHaveBeenCalled();
+    // A CAS loss stays a different error.
+    commit.mockResolvedValue(false);
+    await expect(h.service.storeOffer(SENDER, OFFER)).rejects.toBeInstanceOf(
+      SchedulingStateConflictError,
+    );
+    expect(commit).toHaveBeenCalledTimes(3);
+  });
+
+  describe('T4: customer intents', () => {
+    it('markChangeAsked / clearChangeAsked set and drop the question flag of the appointment', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, APPOINTMENT);
+      await h.service.markChangeAsked(
+        SENDER,
+        APPOINTMENT.requestId,
+        NOW.toISOString(),
+      );
+      expect((await h.service.read(SENDER)).appointment).toEqual({
+        ...APPOINTMENT,
+        changeAskedAt: NOW.toISOString(),
+      });
+      await h.service.clearChangeAsked(SENDER);
+      expect((await h.service.read(SENDER)).appointment).not.toHaveProperty(
+        'changeAskedAt',
+      );
+    });
+
+    it('markChangeAsked ignores another request; clearChangeAsked without the flag writes nothing', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, APPOINTMENT);
+      const commit = jest.spyOn(h.store, 'commitScheduling');
+      await h.service.markChangeAsked(SENDER, 'other', NOW.toISOString());
+      await h.service.clearChangeAsked(SENDER);
+      expect(commit).not.toHaveBeenCalled();
+    });
+
+    it('startReschedule stores the offer and drops the question flag in one write', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        changeAskedAt: NOW.toISOString(),
+      });
+      const commit = jest.spyOn(h.store, 'commitScheduling');
+      const offer = { ...OFFER, rescheduleRequestId: APPOINTMENT.requestId };
+      await h.service.startReschedule(SENDER, offer);
+      expect(commit).toHaveBeenCalledTimes(1);
+      await expect(h.service.read(SENDER)).resolves.toEqual({
+        offer,
+        appointment: APPOINTMENT,
+      });
+    });
+
+    it('recordCustomerReschedule updates time, version and zone, counts the change, drops the offer and the flag', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        timeZone: null,
+        changeAskedAt: NOW.toISOString(),
+      });
+      await h.service.storeOffer(SENDER, {
+        ...OFFER,
+        rescheduleRequestId: APPOINTMENT.requestId,
+      });
+      await h.service.recordCustomerReschedule(SENDER, {
+        requestId: APPOINTMENT.requestId,
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: '2026-11-14T16:00:00.000Z',
+        scheduleVersion: 2,
+        timeZone: 'America/Mexico_City',
+        counted: true,
+      });
+      await expect(h.service.read(SENDER)).resolves.toEqual({
+        offer: null,
+        appointment: {
+          ...APPOINTMENT,
+          scheduledFor: '2026-11-14T16:00:00.000Z',
+          scheduleVersion: 2,
+          timeZone: 'America/Mexico_City',
+          rescheduleCount: 1,
+        },
+      });
+    });
+
+    it('recordCustomerReschedule with counted:false (UNCHANGED) does not count', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, APPOINTMENT);
+      await h.service.recordCustomerReschedule(SENDER, {
+        requestId: APPOINTMENT.requestId,
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: APPOINTMENT.scheduledFor,
+        scheduleVersion: 1,
+        timeZone: 'America/Mexico_City',
+        counted: false,
+      });
+      expect((await h.service.read(SENDER)).appointment?.rescheduleCount).toBe(
+        0,
+      );
+    });
+
+    it('recordCustomerReschedule never moves the version backwards (a staff change landed first)', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        scheduleVersion: 5,
+        scheduledFor: '2026-11-20T15:00:00.000Z',
+      });
+      await h.service.recordCustomerReschedule(SENDER, {
+        requestId: APPOINTMENT.requestId,
+        subtype: 'TALK_TO_HUMAN',
+        scheduledFor: '2026-11-14T16:00:00.000Z',
+        scheduleVersion: 2,
+        timeZone: 'America/Mexico_City',
+        counted: true,
+      });
+      const { appointment } = await h.service.read(SENDER);
+      expect(appointment).toMatchObject({
+        scheduledFor: '2026-11-20T15:00:00.000Z',
+        scheduleVersion: 5,
+        rescheduleCount: 1,
+      });
+    });
+
+    it('recordCustomerReschedule without a local appointment of that request builds it from the answer', async () => {
+      const h = setup();
+      await h.service.recordCustomerReschedule(SENDER, {
+        requestId: 'req-1',
+        subtype: 'COMPLAINT',
+        scheduledFor: '2026-11-14T16:00:00.000Z',
+        scheduleVersion: 2,
+        timeZone: 'America/Mexico_City',
+        counted: true,
+      });
+      expect((await h.service.read(SENDER)).appointment).toEqual({
+        requestId: 'req-1',
+        subtype: 'COMPLAINT',
+        scheduledFor: '2026-11-14T16:00:00.000Z',
+        scheduleVersion: 2,
+        timeZone: 'America/Mexico_City',
+        rescheduleCount: 1,
+      });
+    });
+
+    it('learnTimeZone fills only a missing zone of that request', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        timeZone: null,
+      });
+      await h.service.learnTimeZone(SENDER, 'other', 'America/Tijuana');
+      expect((await h.service.read(SENDER)).appointment?.timeZone).toBeNull();
+      await h.service.learnTimeZone(
+        SENDER,
+        APPOINTMENT.requestId,
+        'America/Mexico_City',
+      );
+      expect((await h.service.read(SENDER)).appointment?.timeZone).toBe(
+        'America/Mexico_City',
+      );
+      const commit = jest.spyOn(h.store, 'commitScheduling');
+      await h.service.learnTimeZone(
+        SENDER,
+        APPOINTMENT.requestId,
+        'America/Tijuana',
+      );
+      expect(commit).not.toHaveBeenCalled();
+    });
+
+    it('clearAppointment also drops a reschedule offer of that request (never an unrelated booking offer)', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, APPOINTMENT);
+      await h.service.storeOffer(SENDER, {
+        ...OFFER,
+        rescheduleRequestId: APPOINTMENT.requestId,
+      });
+      await h.service.clearAppointment(SENDER, APPOINTMENT.requestId);
+      await expect(h.service.read(SENDER)).resolves.toEqual({
+        offer: null,
+        appointment: null,
+      });
+
+      await h.service.bookAppointment(SENDER, APPOINTMENT);
+      await h.service.storeOffer(SENDER, OFFER);
+      await h.service.clearAppointment(SENDER, APPOINTMENT.requestId);
+      expect((await h.service.read(SENDER)).offer).toEqual(OFFER);
+    });
+  });
+
+  describe('T5 writer: recordStaffReschedule', () => {
+    const update = (patch: Record<string, unknown> = {}) => ({
+      requestId: APPOINTMENT.requestId,
+      scheduledFor: '2026-11-14T16:30:00.000Z',
+      scheduleVersion: 2,
+      timeZone: 'America/Mexico_City' as string | null,
+      ...patch,
+    });
+
+    it('a newer version replaces the time and the version (the count and the offer are untouched)', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        rescheduleCount: 2,
+      });
+      await h.service.recordStaffReschedule(SENDER, update());
+      expect((await h.service.read(SENDER)).appointment).toEqual({
+        ...APPOINTMENT,
+        scheduledFor: '2026-11-14T16:30:00.000Z',
+        scheduleVersion: 2,
+        rescheduleCount: 2,
+      });
+    });
+
+    it('an unknown local version (0) is replaced by any item', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        scheduleVersion: 0,
+        timeZone: null,
+      });
+      await h.service.recordStaffReschedule(SENDER, update());
+      expect((await h.service.read(SENDER)).appointment).toMatchObject({
+        scheduleVersion: 2,
+        scheduledFor: '2026-11-14T16:30:00.000Z',
+        timeZone: 'America/Mexico_City',
+      });
+    });
+
+    it('an older or equal version, another request or no appointment writes nothing', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, {
+        ...APPOINTMENT,
+        scheduleVersion: 3,
+      });
+      const commit = jest.spyOn(h.store, 'commitScheduling');
+      await h.service.recordStaffReschedule(SENDER, update());
+      await h.service.recordStaffReschedule(
+        SENDER,
+        update({ scheduleVersion: 3 }),
+      );
+      await h.service.recordStaffReschedule(
+        SENDER,
+        update({ requestId: 'other', scheduleVersion: 9 }),
+      );
+      expect(commit).not.toHaveBeenCalled();
+      const empty = setup();
+      const none = jest.spyOn(empty.store, 'commitScheduling');
+      await empty.service.recordStaffReschedule(SENDER, update());
+      expect(none).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the store fails (the feed retries the item)', async () => {
+      const h = setup();
+      await h.service.bookAppointment(SENDER, APPOINTMENT);
+      jest
+        .spyOn(h.store, 'getScheduling')
+        .mockRejectedValue(new Error('db down'));
+      await expect(
+        h.service.recordStaffReschedule(SENDER, update()),
+      ).rejects.toThrow('db down');
+    });
+  });
+
+  it('findAppointment reads the local appointment only (never the backend) and rejects on a store failure', async () => {
+    const h = setup(okState(summary));
+    await expect(h.service.findAppointment(SENDER)).resolves.toBeNull();
+    expect(h.getConversationState).not.toHaveBeenCalled();
+    await h.service.bookAppointment(SENDER, APPOINTMENT);
+    await expect(h.service.findAppointment(SENDER)).resolves.toEqual(
+      APPOINTMENT,
+    );
+    jest.spyOn(h.store, 'getScheduling').mockRejectedValue(new Error('db'));
+    await expect(h.service.findAppointment(SENDER)).rejects.toThrow('db');
   });
 
   describe('getAppointment (recovery from the state route)', () => {

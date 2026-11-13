@@ -70,6 +70,11 @@ export interface HumanRequestDeliveryPorts {
    *  and `conversation.rescheduled`. Without it those items stay the safe
    *  STALE / UNKNOWN_TYPE (nothing is sent). */
   scheduled?: ScheduledConversationHandler;
+  /** Unit 14 T4: a staff cancel drops the cancelled request's stored
+   *  appointment. Optional; a failure is logged, never blocks the notice. */
+  schedule?: {
+    clearAppointment(senderId: string, requestId: string): Promise<void>;
+  };
 }
 
 export interface HumanRequestDeliveryOptions {
@@ -936,6 +941,7 @@ export class HumanRequestDeliveryService {
     // request.cancelled: forget the request's pending state first.
     const payload = item.payload;
     await this.ports.store.closeRequest(payload.requestId, 'CANCELLED');
+    await this.forgetAppointment(row, payload.requestId);
     if (payload.reason === 'DUPLICATE')
       return { action: 'stale', decision: 'DUPLICATE' };
     const senderId = this.recipient(row);
@@ -955,6 +961,24 @@ export class HumanRequestDeliveryService {
           : withTeamPrefix(note, null, style),
       cancellation: true,
     };
+  }
+
+  /** The cancelled request's appointment must not answer "¿a qué hora
+   *  quedé?" any more. Best-effort. */
+  private async forgetAppointment(
+    row: DeliveryRow,
+    requestId: string,
+  ): Promise<void> {
+    if (this.ports.schedule === undefined) return;
+    const senderId = senderIdFromRef(row.conversationRef);
+    if (senderId === null) return;
+    try {
+      await this.ports.schedule.clearAppointment(senderId, requestId);
+    } catch (error) {
+      this.logger.warn(
+        `feed item ${row.deliveryId}: stored appointment of ${requestId} not cleared: ${describeError(error)}`,
+      );
+    }
   }
 
   private recipient(row: DeliveryRow): string | null {

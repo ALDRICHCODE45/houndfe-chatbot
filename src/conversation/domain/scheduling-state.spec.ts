@@ -124,6 +124,53 @@ describe('readSchedulingState', () => {
   });
 });
 
+describe('T4 fields: rescheduleRequestId and changeAskedAt', () => {
+  const RESCHEDULE = {
+    ...OFFER,
+    rescheduleRequestId: 'req-1',
+  };
+  const ASKED = {
+    ...APPOINTMENT,
+    changeAskedAt: '2026-11-12T20:00:00.000Z',
+  };
+
+  it('round-trips a reschedule offer and an appointment with a pending change question', () => {
+    const raw = { offer: RESCHEDULE, appointment: ASKED };
+    expect(readSchedulingState(raw)).toEqual(raw);
+    expect(normalizeSchedulingState(raw)).toEqual(raw);
+  });
+
+  it('both stay optional and absent (never written as undefined)', () => {
+    const state = readSchedulingState({
+      offer: OFFER,
+      appointment: APPOINTMENT,
+    });
+    expect(state.offer).not.toHaveProperty('rescheduleRequestId');
+    expect(state.appointment).not.toHaveProperty('changeAskedAt');
+  });
+
+  it('malformed values drop their half, never half-read', () => {
+    expect(
+      readSchedulingState({
+        offer: { ...OFFER, rescheduleRequestId: '' },
+        appointment: APPOINTMENT,
+      }).offer,
+    ).toBeNull();
+    expect(
+      readSchedulingState({
+        offer: OFFER,
+        appointment: { ...APPOINTMENT, changeAskedAt: 'ayer' },
+      }).appointment,
+    ).toBeNull();
+    expect(
+      normalizeSchedulingState({
+        offer: { ...OFFER, rescheduleRequestId: 7 },
+        appointment: null,
+      }),
+    ).toBeNull();
+  });
+});
+
 describe('normalizeSchedulingState (write guard)', () => {
   it('returns the canonical document with both keys', () => {
     expect(

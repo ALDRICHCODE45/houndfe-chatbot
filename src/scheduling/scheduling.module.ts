@@ -5,18 +5,9 @@ import {
   type HumanRequestsClient,
 } from '../chatbot-api/domain/chatbot-api.client';
 import {
-  LIVE_CONVERSATION_CLIENT,
-  type LiveConversationClient,
-} from '../chatbot-api/domain/live-conversation.port';
-import {
   SCHEDULING_CLIENT,
   type SchedulingClient,
 } from '../chatbot-api/domain/scheduling.port';
-import { ConversationModule } from '../conversation/conversation.module';
-import {
-  CONVERSATION_STORE,
-  type ConversationStore,
-} from '../conversation/domain/conversation-store';
 import { HumanRequestCreateService } from '../human-requests/application/human-request-create.service';
 import {
   HUMAN_REQUEST_FEED_STORE,
@@ -25,7 +16,9 @@ import {
 import { HumanRequestsServicesModule } from '../human-requests/human-requests.module';
 import { OUT_OF_HOURS_POLICY } from '../whatsapp/domain/out-of-hours-policy';
 import { SchedulingOutOfHoursPolicy } from './application/scheduling-out-of-hours.policy';
+import { AppointmentIntentService } from './application/appointment-intent.service';
 import { SchedulingStateService } from './application/scheduling-state.service';
+import { SchedulingStateModule } from './scheduling-state.module';
 
 /**
  * Unit 14 (scheduled conversations): the durable offer/appointment state and
@@ -35,16 +28,12 @@ import { SchedulingStateService } from './application/scheduling-state.service';
  * back to the unit 11 out-of-hours behavior).
  */
 @Module({
-  imports: [ConversationModule, ChatbotApiModule, HumanRequestsServicesModule],
+  imports: [
+    ChatbotApiModule,
+    HumanRequestsServicesModule,
+    SchedulingStateModule,
+  ],
   providers: [
-    {
-      provide: SchedulingStateService,
-      useFactory: (
-        store: ConversationStore,
-        live: LiveConversationClient,
-      ): SchedulingStateService => new SchedulingStateService({ store, live }),
-      inject: [CONVERSATION_STORE, LIVE_CONVERSATION_CLIENT],
-    },
     {
       provide: OUT_OF_HOURS_POLICY,
       useFactory: (
@@ -60,6 +49,13 @@ import { SchedulingStateService } from './application/scheduling-state.service';
           state,
           team,
           registry,
+          // T4: appointment questions, change and cancel.
+          appointments: new AppointmentIntentService({
+            scheduling,
+            requests,
+            state,
+            registry,
+          }),
         }),
       inject: [
         SCHEDULING_CLIENT,
@@ -70,6 +66,6 @@ import { SchedulingStateService } from './application/scheduling-state.service';
       ],
     },
   ],
-  exports: [OUT_OF_HOURS_POLICY, SchedulingStateService],
+  exports: [OUT_OF_HOURS_POLICY, SchedulingStateModule],
 })
 export class SchedulingModule {}

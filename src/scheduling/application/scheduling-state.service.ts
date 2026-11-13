@@ -4,6 +4,7 @@ import type { LiveConversationClient } from '../../chatbot-api/domain/live-conve
 import { describeError } from '../../common/log-safe';
 import type { ConversationStore } from '../../conversation/domain/conversation-store';
 import {
+  normalizeSchedulingState,
   type SchedulingAppointment,
   type SchedulingOffer,
   type SchedulingState,
@@ -28,7 +29,43 @@ export class SchedulingStateConflictError extends Error {
   }
 }
 
+/** The state to write is malformed (never a CAS loss): nothing was written
+ *  and retrying cannot help. */
+export class SchedulingStateInvalidError extends Error {
+  constructor() {
+    super('scheduling state rejected by the write guard');
+    this.name = 'SchedulingStateInvalidError';
+  }
+}
+
 const MAX_ATTEMPTS = 3;
+
+/** What a customer reschedule leaves in the appointment. */
+export interface CustomerRescheduleUpdate {
+  requestId: string;
+  subtype: string;
+  scheduledFor: string;
+  scheduleVersion: number;
+  timeZone: string | null;
+  /** RESCHEDULED counts toward the cap; UNCHANGED does not. */
+  counted: boolean;
+}
+
+/** What a staff reschedule (`conversation.rescheduled`) says. */
+export interface StaffRescheduleUpdate {
+  requestId: string;
+  scheduledFor: string;
+  scheduleVersion: number;
+  timeZone: string | null;
+}
+
+const withoutChangeAsked = (
+  appointment: SchedulingAppointment,
+): SchedulingAppointment => {
+  const { changeAskedAt: _asked, ...rest } = appointment;
+  void _asked;
+  return rest;
+};
 
 /** What the bot knows about an appointment the backend just named. */
 export interface KnownAppointment {
@@ -113,13 +150,18 @@ export class SchedulingStateService {
     await this.mutate(senderId, () => ({ offer: null, appointment }));
   }
 
-  /** Drops the appointment only when it is still `requestId`'s. */
+  /** Drops the appointment only when it is still `requestId`'s, and with it
+   *  a reschedule offer of that request (never an unrelated booking offer). */
   async clearAppointment(senderId: string, requestId: string): Promise<void> {
-    await this.mutate(senderId, (state) =>
-      state.appointment?.requestId === requestId
-        ? { ...state, appointment: null }
-        : null,
-    );
+    await this.mutate(senderId, (state) => {
+      const dropAppointment = state.appointment?.requestId === requestId;
+      const dropOffer = state.offer?.rescheduleRequestId === requestId;
+      if (!dropAppointment && !dropOffer) return null;
+      return {
+        offer: dropOffer ? null : state.offer,
+        appointment: dropAppointment ? null : state.appointment,
+      };
+    });
   }
 
   /**
@@ -149,6 +191,127 @@ export class SchedulingStateService {
     };
     await this.bookAppointment(senderId, appointment);
     return appointment;
+  }
+
+  /** The local appointment only (never the backend). Rejects when the store
+   *  fails: the T5 reader port wants "unknown" to be retried, not guessed. */
+  async findAppointment(
+    senderId: string,
+  ): Promise<SchedulingAppointment | null> {
+    return (await this.read(senderId)).appointment;
+  }
+
+  /** «¿Quiere cambiarla?» was just asked for `requestId`'s appointment. */
+  async markChangeAsked(
+    senderId: string,
+    requestId: string,
+    at: string,
+  ): Promise<void> {
+    await this.mutate(senderId, (state) =>
+      state.appointment?.requestId === requestId
+        ? { ...state, appointment: { ...state.appointment, changeAskedAt: at } }
+        : null,
+    );
+  }
+
+  /** Drops the pending question; writes nothing when there is none. */
+  async clearChangeAsked(senderId: string): Promise<void> {
+    await this.mutate(senderId, (state) =>
+      state.appointment?.changeAskedAt === undefined
+        ? null
+        : { ...state, appointment: withoutChangeAsked(state.appointment) },
+    );
+  }
+
+  /** One write: the reschedule offer is stored and the question dropped. */
+  async startReschedule(
+    senderId: string,
+    offer: SchedulingOffer,
+  ): Promise<void> {
+    await this.mutate(senderId, (state) => ({
+      offer,
+      appointment:
+        state.appointment === null
+          ? null
+          : withoutChangeAsked(state.appointment),
+    }));
+  }
+
+  /**
+   * The backend accepted the customer's reschedule: time, version and zone
+   * are updated (a version never moves backwards), the change counted, the
+   * offer and the question dropped. With no local appointment of that
+   * request it is built from the answer.
+   */
+  async recordCustomerReschedule(
+    senderId: string,
+    update: CustomerRescheduleUpdate,
+  ): Promise<void> {
+    await this.mutate(senderId, (state) => {
+      const base =
+        state.appointment?.requestId === update.requestId
+          ? state.appointment
+          : null;
+      const newer =
+        base === null || update.scheduleVersion >= base.scheduleVersion;
+      const next: SchedulingAppointment = {
+        requestId: update.requestId,
+        subtype: base?.subtype ?? update.subtype,
+        scheduledFor: newer ? update.scheduledFor : base.scheduledFor,
+        scheduleVersion: newer ? update.scheduleVersion : base.scheduleVersion,
+        timeZone: update.timeZone ?? base?.timeZone ?? null,
+        rescheduleCount:
+          (base?.rescheduleCount ?? 0) + (update.counted ? 1 : 0),
+      };
+      return { offer: null, appointment: next };
+    });
+  }
+
+  /** Fills a missing zone of `requestId`'s appointment (never replaces one). */
+  async learnTimeZone(
+    senderId: string,
+    requestId: string,
+    timeZone: string,
+  ): Promise<void> {
+    await this.mutate(senderId, (state) =>
+      state.appointment?.requestId === requestId &&
+      state.appointment.timeZone === null
+        ? { ...state, appointment: { ...state.appointment, timeZone } }
+        : null,
+    );
+  }
+
+  /**
+   * Staff moved the appointment (feed `conversation.rescheduled`): the time
+   * and version are replaced only when the item's version is newer (0 =
+   * unknown locally: any item wins). No local appointment of that request:
+   * nothing is invented (the next question recovers it from the backend).
+   * The reschedule count and any offer are untouched. Rejects on a store
+   * failure (the feed retries the item).
+   */
+  async recordStaffReschedule(
+    senderId: string,
+    update: StaffRescheduleUpdate,
+  ): Promise<void> {
+    await this.mutate(senderId, (state) => {
+      const current = state.appointment;
+      if (
+        current === null ||
+        current.requestId !== update.requestId ||
+        (current.scheduleVersion !== 0 &&
+          update.scheduleVersion <= current.scheduleVersion)
+      )
+        return null;
+      return {
+        ...state,
+        appointment: {
+          ...current,
+          scheduledFor: update.scheduledFor,
+          scheduleVersion: update.scheduleVersion,
+          timeZone: update.timeZone ?? current.timeZone,
+        },
+      };
+    });
   }
 
   /**
@@ -216,6 +379,9 @@ export class SchedulingStateService {
       const snapshot = await getScheduling.call(this.ports.store, senderId);
       const next = transform(snapshot.state);
       if (next === null) return snapshot.state;
+      // A malformed state is a bug, not a lost race: never spin the CAS.
+      if (normalizeSchedulingState(next) === null)
+        throw new SchedulingStateInvalidError();
       const committed = await commitScheduling.call(
         this.ports.store,
         senderId,
