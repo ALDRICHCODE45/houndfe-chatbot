@@ -240,6 +240,10 @@ export class WebhookDispatcherService {
         this.logger.debug(
           `mirror-only ${message.mirrorOnly.type} ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
         );
+        // S2: a customer sticker/video/location reopens the 24 h window like
+        // text, so it triggers the same replays. Still no bot reply.
+        if (!this.humanHandoff.isOpsSender(message.senderId))
+          await this.replayOnMediaInbound(message);
         continue;
       }
 
@@ -675,6 +679,28 @@ export class WebhookDispatcherService {
     // S6: atomic outcomes already wrote the marker inside admission, but the
     // claim holds the row as PROCESSING there, so it is completed here.
     await this.markSeenSafely(message.messageId);
+  }
+
+  /**
+   * S2: replays for a mirror-only customer message (sticker, video,
+   * location): HUMAN → deferred staff messages, BOT → pending deliveries,
+   * both fire-and-forget. There is no reply to fail closed on, so an
+   * unreadable mode only skips the replays (a replay may send to the
+   * customer, which must not happen while the mode is unknown) and never
+   * rejects the message: it is already mirrored.
+   */
+  private async replayOnMediaInbound(message: InboundMessage): Promise<void> {
+    let human: boolean;
+    try {
+      human = await this.isHumanMode(message.senderId);
+    } catch (error) {
+      this.logger.warn(
+        `handoff mode unreadable: skip replays for ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}: ${describeError(error)}`,
+      );
+      return;
+    }
+    if (human) this.notifyHumanDeferred(message.senderId);
+    else this.notifyHumanRequests(message.senderId);
   }
 
   /** S5: fire-and-forget; it never delays or breaks the reply. */
