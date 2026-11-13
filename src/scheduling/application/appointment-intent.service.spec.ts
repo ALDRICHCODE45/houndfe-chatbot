@@ -17,7 +17,7 @@ import { InMemoryConversationStore } from '../../conversation/infrastructure/in-
 import {
   cancelledText,
   notUnderstoodText,
-  offerText,
+  rescheduleOfferText,
   rescheduledText,
   slotTakenText,
   whatTimeText,
@@ -347,7 +347,7 @@ describe('AppointmentIntentService (T4)', () => {
   });
 
   describe('change the appointment', () => {
-    it('offers the free slots with the approved offer text and stores a reschedule offer with its own key', async () => {
+    it('offers the free slots with the approved reschedule offer text (not the out-of-hours one) and stores a reschedule offer with its own key', async () => {
       const h = setup();
       const outcome = await h.handle('quiero cambiar mi cita');
       expect(h.listSlots).toHaveBeenCalledWith({
@@ -356,10 +356,7 @@ describe('AppointmentIntentService (T4)', () => {
       });
       expect(outcome).toEqual({
         kind: 'reply',
-        text: offerText(
-          formatWhen(NEXT_OPEN, ZONE, NOW),
-          THREE.map((slot) => label(slot.startsAt)),
-        ),
+        text: rescheduleOfferText(THREE.map((slot) => label(slot.startsAt))),
       });
       const { offer } = await h.state.read(SENDER);
       expect(offer).toMatchObject({
@@ -377,10 +374,7 @@ describe('AppointmentIntentService (T4)', () => {
       const outcome = await h.handle('¿la puedo mover?');
       expect(outcome).toEqual({
         kind: 'reply',
-        text: offerText(
-          formatWhen(SLOT_1, ZONE, NOW),
-          THREE.map((slot) => label(slot.startsAt)),
-        ),
+        text: rescheduleOfferText(THREE.map((slot) => label(slot.startsAt))),
       });
     });
 

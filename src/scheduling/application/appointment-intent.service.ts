@@ -26,7 +26,7 @@ import { lastCustomerMessageAtFor } from '../domain/scheduled-booking';
 import {
   cancelledText,
   notUnderstoodText,
-  offerText,
+  rescheduleOfferText,
   rescheduledText,
   slotTakenText,
   whatTimeText,
@@ -247,8 +247,7 @@ export class AppointmentIntentService {
     await this.learnZone(senderId, appointment, answer.timeZone);
     return {
       kind: 'reply',
-      text: offerText(
-        openWhen,
+      text: rescheduleOfferText(
         slots.map((slot) => slotLabel(slot.startsAt, offer.timeZone, now)),
       ),
     };

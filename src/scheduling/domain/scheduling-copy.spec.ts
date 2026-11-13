@@ -11,6 +11,7 @@ import {
   noSlotsText,
   notUnderstoodText,
   offerText,
+  rescheduleOfferText,
   rescheduledText,
   reminderText,
   slotTakenText,
@@ -52,6 +53,30 @@ describe('S3 texts (usted), byte-identical with the placeholders filled', () => 
   it('offer rejects an empty or oversized list', () => {
     expect(() => offerText('x', [])).toThrow(RangeError);
     expect(() => offerText('x', [...SLOTS, ...SLOTS])).toThrow(RangeError);
+  });
+
+  it('reschedule offer', () => {
+    expect(rescheduleOfferText(SLOTS)).toBe(
+      'Estos son los horarios disponibles para su cita:\n' +
+        '1. hoy a las 4:00 p. m.\n' +
+        '2. mañana a las 9:30 a. m.\n' +
+        '3. el lunes 16 de noviembre a las 10:00 a. m.\n' +
+        'Responda con el número.',
+    );
+  });
+
+  it('reschedule offer numbers only the slots given and rejects 0 or more than 3', () => {
+    expect(rescheduleOfferText(SLOTS.slice(0, 1))).toBe(
+      'Estos son los horarios disponibles para su cita:\n' +
+        '1. hoy a las 4:00 p. m.\n' +
+        'Responda con el número.',
+    );
+    expect(rescheduleOfferText(SLOTS.slice(0, 2))).not.toContain('3.');
+    expect(() => rescheduleOfferText([])).toThrow(RangeError);
+    expect(() => rescheduleOfferText([...SLOTS, ...SLOTS])).toThrow(RangeError);
+    expect(rescheduleOfferText([{ day: 'hoy', time: '1:00 p. m.' }])).toContain(
+      '\n1. hoy a la 1:00 p. m.\n',
+    );
   });
 
   it('not understood', () => {
@@ -141,6 +166,15 @@ describe('tú variants through the curated phrase pairs', () => {
       'offer',
       () => offerText('hoy a las 4:00 p. m.', SLOTS),
       'Ahorita nuestro equipo no está disponible (abrimos hoy a las 4:00 p. m.). ¿Quieres que una persona te atienda en alguno de estos horarios?\n' +
+        '1. hoy a las 4:00 p. m.\n' +
+        '2. mañana a las 9:30 a. m.\n' +
+        '3. el lunes 16 de noviembre a las 10:00 a. m.\n' +
+        'Responde con el número.',
+    ],
+    [
+      'reschedule offer',
+      () => rescheduleOfferText(SLOTS),
+      'Estos son los horarios disponibles para tu cita:\n' +
         '1. hoy a las 4:00 p. m.\n' +
         '2. mañana a las 9:30 a. m.\n' +
         '3. el lunes 16 de noviembre a las 10:00 a. m.\n' +

@@ -40,6 +40,18 @@ export function offerText(
   );
 }
 
+/**
+ * The offer when the customer CHANGES an existing appointment: the branch may
+ * well be open, so the out-of-hours wording of `offerText` does not apply.
+ */
+export function rescheduleOfferText(slots: readonly SlotLabel[]): string {
+  return (
+    'Estos son los horarios disponibles para su cita:\n' +
+    `${numbered(slots)}\n` +
+    'Responda con el número.'
+  );
+}
+
 export function notUnderstoodText(): string {
   return 'No entendí qué horario prefiere. Responda con el número de la opción.';
 }
