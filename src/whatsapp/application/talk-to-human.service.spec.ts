@@ -149,6 +149,138 @@ describe('TalkToHumanService.handle', () => {
     await expect(h.service.handle(INPUT)).resolves.toBeNull();
   });
 
+  describe('unit 14 branch point: OutOfHoursPolicy.planAsk (before the create)', () => {
+    const closed = {
+      openNow: false,
+      nextOpenAt: '2026-11-13T15:00:00.000Z',
+    };
+
+    it('asks the policy first with the sender, the inbound time and the trigger', async () => {
+      const planAsk = jest.fn(() =>
+        Promise.resolve({ kind: 'default' as const }),
+      );
+      const h = setup(registered(), {
+        outOfHoursReply: () => Promise.resolve('x'),
+        planAsk,
+      });
+      await h.service.handle(INPUT);
+      expect(planAsk).toHaveBeenCalledWith({
+        senderId: SENDER,
+        inboundAt: INPUT.inboundAt,
+        triggerWaMessageId: INPUT.triggerWaMessageId,
+      });
+    });
+
+    it('missing inbound time / trigger reach the policy as null', async () => {
+      const planAsk = jest.fn(() =>
+        Promise.resolve({ kind: 'default' as const }),
+      );
+      const h = setup(registered(), {
+        outOfHoursReply: () => Promise.resolve('x'),
+        planAsk,
+      });
+      await h.service.handle({ senderId: SENDER, text: 'quiero un asesor' });
+      expect(planAsk).toHaveBeenCalledWith({
+        senderId: SENDER,
+        inboundAt: null,
+        triggerWaMessageId: null,
+      });
+    });
+
+    it("default plan: today's flow (create, then the usual copy)", async () => {
+      const h = setup(registered({ businessHours: closed }), {
+        outOfHoursReply: () => Promise.resolve('texto fijo'),
+        planAsk: () => Promise.resolve({ kind: 'default' }),
+      });
+      await expect(h.service.handle(INPUT)).resolves.toBe('texto fijo');
+      expect(h.requestTalkToHuman).toHaveBeenCalledTimes(1);
+    });
+
+    it('reply plan: the policy answered (offer sent); NO request is created', async () => {
+      const h = setup(registered(), {
+        outOfHoursReply: () => Promise.resolve('x'),
+        planAsk: () => Promise.resolve({ kind: 'reply', text: 'oferta' }),
+      });
+      await expect(h.service.handle(INPUT)).resolves.toBe('oferta');
+      expect(h.requestTalkToHuman).not.toHaveBeenCalled();
+    });
+
+    it('create_then_reply: creates the unscheduled request and, closed, answers the plan copy', async () => {
+      const outOfHoursReply = jest.fn(() => Promise.resolve('texto fijo'));
+      const h = setup(registered({ businessHours: closed }), {
+        outOfHoursReply,
+        planAsk: () =>
+          Promise.resolve({
+            kind: 'create_then_reply',
+            closedReply: 'sin horarios',
+          }),
+      });
+      await expect(h.service.handle(INPUT)).resolves.toBe('sin horarios');
+      expect(h.requestTalkToHuman).toHaveBeenCalledTimes(1);
+      expect(outOfHoursReply).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['open now', { openNow: true, nextOpenAt: null }],
+      ['calendar unknown (null)', null],
+    ])(
+      'create_then_reply but the create answer says %s: the in-hours copy',
+      async (_c, businessHours) => {
+        const h = setup(registered({ businessHours }), {
+          outOfHoursReply: () => Promise.resolve('x'),
+          planAsk: () =>
+            Promise.resolve({
+              kind: 'create_then_reply',
+              closedReply: 'sin horarios',
+            }),
+        });
+        await expect(h.service.handle(INPUT)).resolves.toBe(
+          TALK_TO_HUMAN_IN_HOURS_REPLY,
+        );
+      },
+    );
+
+    it('create_then_reply keeps the fixed copies for queued / open limit', async () => {
+      const h = setup(
+        { kind: 'queued' },
+        {
+          outOfHoursReply: () => Promise.resolve('x'),
+          planAsk: () =>
+            Promise.resolve({
+              kind: 'create_then_reply',
+              closedReply: 'sin horarios',
+            }),
+        },
+      );
+      await expect(h.service.handle(INPUT)).resolves.toBe(
+        TALK_TO_HUMAN_QUEUED_REPLY,
+      );
+    });
+
+    it('a throwing planAsk falls back to the default flow', async () => {
+      const h = setup(registered({ businessHours: closed }), {
+        outOfHoursReply: () => Promise.resolve('texto fijo'),
+        planAsk: () => Promise.reject(new Error(`boom ${SENDER}`)),
+      });
+      await expect(h.service.handle(INPUT)).resolves.toBe('texto fijo');
+      expect(h.requestTalkToHuman).toHaveBeenCalledTimes(1);
+    });
+
+    it('a policy without planAsk behaves exactly as before', async () => {
+      const h = setup(registered({ businessHours: closed }), {
+        outOfHoursReply: () => Promise.resolve('texto fijo'),
+      });
+      await expect(h.service.handle(INPUT)).resolves.toBe('texto fijo');
+    });
+
+    it('the default policy (none provided) never asks a plan', async () => {
+      const h = setup(registered({ businessHours: closed }));
+      await expect(h.service.handle(INPUT)).resolves.toBe(
+        TALK_TO_HUMAN_OUT_OF_HOURS_REPLY,
+      );
+    });
+  });
+
   it('a throwing team service also yields null and never the phone in logs', async () => {
     const warn = jest.spyOn(Logger.prototype, 'warn');
     const h = setup(new Error(`boom ${SENDER}`));

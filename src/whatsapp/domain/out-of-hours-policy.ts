@@ -21,17 +21,57 @@ export interface OutOfHoursContext {
   businessHours: HumanRequestBusinessHours;
 }
 
+/** A clear talk-to-human ask, before anything is created. */
+export interface AskContext {
+  /** Raw Meta wa_id. */
+  senderId: string;
+  /** The inbound's time (ISO), null when absent or unparsable. */
+  inboundAt: string | null;
+  triggerWaMessageId: string | null;
+}
+
 /**
- * The branch point for out-of-hours talk-to-human requests. The request is
- * ALWAYS created first; the policy only decides what the customer is told
- * next. Unit 14 (scheduled conversations: offering slots from
- * `businessHours.nextOpenAt`) replaces the default by providing
- * `OUT_OF_HOURS_POLICY`; nothing else in the flow changes. It returns the
- * usted copy (the dispatcher styles it) and may throw: the caller then falls
- * back to the fixed text.
+ * What the policy decides BEFORE the unscheduled create (unit 14: it needs
+ * to know whether the branch is open before creating anything):
+ *  - `default`: today's flow (create, then in-hours / out-of-hours copy).
+ *  - `reply`: the policy answered (e.g. the slot offer); NO request is
+ *    created now.
+ *  - `create_then_reply`: create the unscheduled request as today; when the
+ *    create answer says the branch is closed, answer `closedReply` instead of
+ *    `outOfHoursReply` (e.g. "no hay horarios, le escriben cuando abramos").
+ * Texts are usted (the dispatcher styles them).
+ */
+export type AskPlan =
+  | { kind: 'default' }
+  | { kind: 'reply'; text: string }
+  | { kind: 'create_then_reply'; closedReply: string };
+
+/** A plain customer text while the policy may hold an open offer. */
+export interface ReplyContext {
+  senderId: string;
+  text: string;
+  inboundAt: string | null;
+  messageId: string;
+}
+
+/** `pass`: not for the policy, run the normal turn. */
+export type ReplyOutcome = { kind: 'pass' } | { kind: 'reply'; text: string };
+
+/**
+ * The branch point for out-of-hours talk-to-human requests. `outOfHoursReply`
+ * is called AFTER an unscheduled request was created (the unit 11 behavior,
+ * and the default). Unit 14 (scheduled conversations) provides
+ * `OUT_OF_HOURS_POLICY` with the optional hooks: `planAsk` runs BEFORE the
+ * create and may take over the ask (offer slots), and `handleReply` sees the
+ * customer's next plain text BEFORE the LLM turn (the slot choice). All
+ * return usted copy (the dispatcher styles it) and may throw: the callers
+ * then fall back (`planAsk` → default flow, `handleReply` → normal turn,
+ * `outOfHoursReply` → the fixed text).
  */
 export interface OutOfHoursPolicy {
   outOfHoursReply(context: OutOfHoursContext): Promise<string>;
+  planAsk?(context: AskContext): Promise<AskPlan>;
+  handleReply?(context: ReplyContext): Promise<ReplyOutcome>;
 }
 
 export const OUT_OF_HOURS_POLICY = Symbol('OUT_OF_HOURS_POLICY');

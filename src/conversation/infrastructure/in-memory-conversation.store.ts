@@ -15,6 +15,11 @@ import {
 } from '../domain/handoff-mode';
 import { normalizeMinimalCheckoutDraft } from '../domain/minimal-checkout-draft';
 import {
+  normalizeSchedulingState,
+  readSchedulingState,
+  type SchedulingState,
+} from '../domain/scheduling-state';
+import {
   ConversationState,
   ConversationStore,
   isNonEmptyString,
@@ -95,6 +100,58 @@ export class InMemoryConversationStore implements ConversationStore {
           ? live.lastMessageAt
           : lastMessageAt,
       data: { ...live?.data, minimalCart: structuredClone(next) },
+    });
+    return true;
+  }
+
+  async getScheduling(
+    senderId: string,
+  ): Promise<{ state: SchedulingState; raw: unknown }> {
+    const live = this.map.get(senderId);
+    const present = !!live && Object.hasOwn(live.data, 'scheduling');
+    const raw = present ? structuredClone(live.data.scheduling) : undefined;
+    return { state: readSchedulingState(raw), raw };
+  }
+
+  async commitScheduling(
+    senderId: string,
+    expected: unknown,
+    next: SchedulingState,
+    lastMessageAt: string,
+  ): Promise<boolean> {
+    const copy = normalizeSchedulingState(next);
+    if (
+      copy === null ||
+      !isNonEmptyString(senderId) ||
+      !isNonEmptyString(lastMessageAt) ||
+      !Number.isFinite(Date.parse(lastMessageAt))
+    ) {
+      return false;
+    }
+    const live = this.map.get(senderId);
+    const present = !!live && Object.hasOwn(live.data, 'scheduling');
+    if (expected === undefined ? present : !present) return false;
+    if (expected !== undefined) {
+      try {
+        if (
+          !isDeepStrictEqual(
+            structuredClone(live!.data.scheduling),
+            structuredClone(expected),
+          )
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    this.map.set(senderId, {
+      senderId,
+      lastMessageAt:
+        live && Date.parse(live.lastMessageAt) > Date.parse(lastMessageAt)
+          ? live.lastMessageAt
+          : lastMessageAt,
+      data: { ...live?.data, scheduling: copy },
     });
     return true;
   }
@@ -372,6 +429,7 @@ export class InMemoryConversationStore implements ConversationStore {
     delete data.agentRevision;
     delete data.minimalCart;
     delete data.minimalCheckoutDraft;
+    delete data.scheduling;
     const safePatch = Object.hasOwn(patch, 'data') ? { ...patch, data } : patch;
     const merged = existing
       ? { ...existing, ...safePatch }
@@ -396,6 +454,7 @@ export class InMemoryConversationStore implements ConversationStore {
             'minimalCart',
             'minimalCheckoutDraft',
             'handoff',
+            'scheduling',
           ]
             .filter((key) => existing && Object.hasOwn(existing.data, key))
             .map((key) => [key, existing!.data[key]]),

@@ -16,12 +16,14 @@ import {
   FixedHoursOutOfHoursPolicy,
   TALK_TO_HUMAN_IN_HOURS_REPLY,
   TALK_TO_HUMAN_OUT_OF_HOURS_REPLY,
+  type AskPlan,
   type OutOfHoursPolicy,
 } from '../domain/out-of-hours-policy';
 
 export interface TalkToHumanPorts {
   team: Pick<HumanRequestCreateService, 'requestTalkToHuman'>;
-  /** The unit 14 branch point; defaults to the fixed hours text. */
+  /** The unit 14 branch point; defaults to the fixed hours text (and never
+   *  plans an ask). */
   policy?: OutOfHoursPolicy;
 }
 
@@ -43,6 +45,10 @@ export class TalkToHumanService {
 
   /** Never throws. */
   async handle(input: TalkToHumanInput): Promise<string | null> {
+    const plan = await this.planAsk(input);
+    if (plan.kind === 'reply') return plan.text;
+    const closedReply =
+      plan.kind === 'create_then_reply' ? plan.closedReply : null;
     let outcome: TalkToHumanOutcome;
     try {
       outcome = await this.ports.team.requestTalkToHuman(input);
@@ -57,6 +63,7 @@ export class TalkToHumanService {
         const hours = outcome.businessHours;
         if (hours === null || hours.openNow !== false)
           return TALK_TO_HUMAN_IN_HOURS_REPLY;
+        if (closedReply !== null) return closedReply;
         try {
           return await this.policy.outOfHoursReply({
             senderId: input.senderId,
@@ -79,6 +86,24 @@ export class TalkToHumanService {
         return ASK_TEAM_RATE_LIMITED_REPLY;
       case 'failed':
         return null;
+    }
+  }
+
+  /** The policy's pre-create plan; a missing hook or a failure is today's
+   *  flow. */
+  private async planAsk(input: TalkToHumanInput): Promise<AskPlan> {
+    if (this.policy.planAsk === undefined) return { kind: 'default' };
+    try {
+      return await this.policy.planAsk({
+        senderId: input.senderId,
+        inboundAt: input.inboundAt ?? null,
+        triggerWaMessageId: input.triggerWaMessageId ?? null,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `out-of-hours plan failed for ${maskConversationRef(conversationRefFor(input.senderId))}, using the default flow: ${describeError(error)}`,
+      );
+      return { kind: 'default' };
     }
   }
 }
