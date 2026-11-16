@@ -14,10 +14,10 @@ Every customer media download from Meta fails in production with `NETWORK_FAILUR
 
 ## Tasks
 
-| ID  | Specs | Route                                    | Commit |
-| --- | ----- | ---------------------------------------- | ------ |
+| ID  | Specs | Route                                    | Commit                      |
+| --- | ----- | ---------------------------------------- | --------------------------- |
 | T1  | S2–S7 | worker: origin policy, IPv4, logs, tests | 1f5c1a5 (+1d6263d refactor) |
-| T2  | S2–S5 | gentle-ai-verify (risk item 2: SSRF)     |        |
+| T2  | S2–S5 | gentle-ai-verify (risk item 2: SSRF)     | verified (no commit) |
 
 ## Log
 
@@ -25,3 +25,4 @@ Every customer media download from Meta fails in production with `NETWORK_FAILUR
 - **L2 (prod evidence):** `receipt_media` row FAILED, `failure_stage` `META_EXHAUSTED_PRE_STORAGE`, `META_TRANSPORT`/`NETWORK_FAILURE`, 3 attempts in 11 s, no log line. Container: `dns.lookup('lookaside.fbsbx.com',{all,verbatim})` → `[57.144.134.128 (v4), 2a03:2880:f343:80:face:b00c:0:3 (v6)]`; https family 6 → `ENETUNREACH`.
 - **L3 (explorer evidence):** `fetchMetadata` validates the Graph URL against `allowedHosts` (`meta-media.client.ts:448-452`), default only `lookaside.fbsbx.com` (`config/env.validation.ts:15,25`; `configuration.ts:66-68`) → always rejected (`meta-media-origin.policy.ts:81-82`). Policy rejects any `?`/`#` (`:62,:77`) applied to download hops (`meta-media.client.ts:529-533`). `pinnedLookup` rotates through resolved addresses (`policy :116-122`), resolver `verbatim: true` (`:44-46`). No logger in `receipt-ingestion.processor.ts` `metaFailure` (`:283-307`) / `retryPass` (`:195-205`). Mirror (`meta-mirror-downloader.ts:27-30`, `conversation-mirror.module.ts:118-119`) and `product-image.module.ts:32-33` share the client/allowlist. Tests always passed both hosts and query-free URLs.
 - **L4 (T1 worker, 2026-11-16):** S2–S7 implemented in `1f5c1a5` (shared client factory refactor `1d6263d`). Policy: Graph host derived from `graphApiBaseUrl` for the metadata hop only; `allowQuery` opt-in on download/redirect hops only; pinned lookup IPv4-first; safe reason side-channel (`meta-media-failure-reason.ts`) + `warn` in `ReceiptIngestionProcessor`. Related tests 379 passed / 17 skipped (docker SSRF integration suites skipped, not run), tsc and eslint clean. No existing download-query rejection test needed updating (only the pinnedLookup IPv6-rotation test was changed to the IPv4-first rule). Awaiting T2 verification.
+- **L5 (T2 verify, 2026-11-16):** independent gentle-ai-verify: S2–S7 PASS, no blocking findings, no bypass found for the query opt-in (backslash, `@`, userinfo/query host smuggling, trailing dot, IDN, empty allowlist entries); related tests 379 passed, 4 Docker suites skipped (real-network SSRF suite not run). Full suite 9992 passed, build ok. Advisories: Docker SSRF fixtures still use both hosts and query-free URLs; production-shape tests stop at the factory (no Nest DI/Joi); Graph host suffix match unreachable; bearer still sent to allowlisted download hops (needed by Meta).
