@@ -17,7 +17,7 @@ Every customer media download from Meta fails in production with `NETWORK_FAILUR
 | ID  | Specs | Route                                    | Commit                      |
 | --- | ----- | ---------------------------------------- | --------------------------- |
 | T1  | S2–S7 | worker: origin policy, IPv4, logs, tests | 1f5c1a5 (+1d6263d refactor) |
-| T2  | S2–S5 | gentle-ai-verify (risk item 2: SSRF)     | verified (no commit) |
+| T2  | S2–S5 | gentle-ai-verify (risk item 2: SSRF)     | verified (no commit)        |
 
 ## Log
 
