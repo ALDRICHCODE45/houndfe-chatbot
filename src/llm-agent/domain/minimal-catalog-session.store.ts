@@ -58,6 +58,8 @@ export type MinimalCatalogTurn = {
   interactiveChoice?: InteractiveChoiceContext;
   catalogPrices?: Record<string, number>;
   reorderOffer?: ReorderOfferContext;
+  /** The payment offer THIS turn made (never inherited, like `reorderOffer`). */
+  paymentOffer?: { saleId: string };
 };
 
 /**

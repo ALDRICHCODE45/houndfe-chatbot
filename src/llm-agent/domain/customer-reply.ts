@@ -1,3 +1,5 @@
+import { PAYMENT_METHODS, paymentMethodById } from './payment-methods';
+
 /**
  * S3: the structured reply the customer route returns. `reply` is the text
  * (also what the session history stores); `media` goes out BEFORE it.
@@ -68,6 +70,7 @@ const REORDER_CONFIRM = 'reorder_confirm';
 const REORDER_CHANGE = 'reorder_change';
 const PICK_VARIANT = 'pick_variant';
 const PICK_PRODUCT = 'pick_product';
+const PAYMENT_METHOD = 'pay';
 
 /** Customer text a confirm button stands for (the gates' affirmative). */
 export const INTERACTIVE_CONFIRM_TEXT = 'SÍ';
@@ -86,7 +89,9 @@ export type InteractiveReplyIntent =
   /** S2 reorder offer; the reference is always required. */
   | { kind: 'reorder_confirm'; reference: string }
   | { kind: 'reorder_change' }
-  | { kind: 'pick'; choice: 'variant' | 'product'; reference: string };
+  | { kind: 'pick'; choice: 'variant' | 'product'; reference: string }
+  /** Payment-step method button; the reference is the placed sale id. */
+  | { kind: 'payment_method'; method: string; reference: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -108,6 +113,15 @@ export function parseInteractiveReplyId(
       return tail === null ? { kind: head } : null;
     case REORDER_CONFIRM:
       return tail === null ? null : { kind: head, reference: tail };
+    case PAYMENT_METHOD: {
+      // Tail is `<method>:<saleId>`; both parts are required.
+      const split = tail === null ? -1 : tail.indexOf(':');
+      if (tail === null || split <= 0 || split === tail.length - 1) return null;
+      const method = tail.slice(0, split);
+      return paymentMethodById(method) === null
+        ? null
+        : { kind: 'payment_method', method, reference: tail.slice(split + 1) };
+    }
     case PICK_VARIANT:
     case PICK_PRODUCT:
       return tail === null
@@ -195,6 +209,26 @@ export function checkoutConfirmationButtons(
       { id: `${CHECKOUT_CONFIRM}:${reference}`, title: '✅ Sí, son correctos' },
       { id: CHECKOUT_CHANGE, title: '✏️ Corregir datos' },
     ],
+    prompt,
+  };
+}
+
+/**
+ * Buttons under the payment offer: one per payment method, bound to the
+ * placed sale. Titles are the same in usted and tú.
+ */
+export function paymentMethodButtons(
+  saleId: string,
+  prompt: string,
+): CustomerReplyInteractive {
+  return {
+    type: 'buttons',
+    buttons: PAYMENT_METHODS.slice(0, INTERACTIVE_LIMITS.buttons).map(
+      (method) => ({
+        id: `${PAYMENT_METHOD}:${method.id}:${saleId}`,
+        title: method.title,
+      }),
+    ),
     prompt,
   };
 }

@@ -8,7 +8,6 @@ import {
   type ChatbotApiClient,
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { BotSaleResponse } from '../../chatbot-api/domain/dtos/sales.dto';
-import type { PaymentDetail } from '../../chatbot-api/domain/dtos/payment-details.dto';
 import {
   CreateCheckoutInputSchema,
   INVALID_CHECKOUT_REQUEST,
@@ -67,6 +66,13 @@ import { ConversationGates } from '../../conversation-gates/application/conversa
 import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
 import { DurableOrderConfirmation } from './gates/order-confirmation.gate';
 import { sanitizeErrorText } from '../../common/log-safe';
+import { paymentMethodButtons } from '../domain/customer-reply';
+import {
+  MINIMAL_PAYMENT_BUTTONS_PROMPT,
+  MINIMAL_PAYMENT_QUESTION,
+} from './minimal-payment.service';
+
+export { minimalPaymentInstructions } from './minimal-payment.service';
 
 export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
   MinimalOrderIneligibleReason,
@@ -124,8 +130,6 @@ export const MINIMAL_ORDER_UNRESOLVED_REPLY =
   'No pude confirmar si su pedido anterior quedó registrado y no puedo crear otro sin riesgo de duplicarlo. Por favor comuníquese con la tienda para revisarlo.';
 export const MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY =
   'No pude confirmar si su pedido quedó registrado. Si vuelve a pedir el resumen y responde SÍ, usaré la misma solicitud para no duplicarlo.';
-export const MINIMAL_ORDER_PAYMENT_UNAVAILABLE_REPLY =
-  'No pude obtener los datos para la transferencia en este momento; su pedido sí quedó registrado.';
 
 /** The item no longer matches the product's current variants; nothing was written. */
 const VARIANT_REJECTION_CODES: ReadonlySet<string> = new Set([
@@ -261,21 +265,23 @@ export function minimalOrderCreatedReply(
   );
 }
 
-/** Transfer instructions from the backend's active bank account. */
-export function minimalPaymentInstructions(
-  detail: Pick<
-    PaymentDetail,
-    'bankName' | 'beneficiary' | 'clabe' | 'accountNumber'
-  >,
-): string {
-  return [
-    'Para pagar por transferencia:',
-    `Banco: ${detail.bankName}`,
-    `Beneficiario: ${detail.beneficiary}`,
-    `CLABE: ${detail.clabe}`,
-    `Cuenta: ${detail.accountNumber}`,
-    'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
-  ].join('\n');
+/** A created order whose reply asks how to pay (buttons, then details). */
+interface OrderPlaced {
+  reply: string;
+  saleId: string;
+}
+
+/** The customer reply for a created order: text plus one button per method. */
+function orderReply(value: string | OrderPlaced): MinimalCheckoutReply {
+  if (typeof value === 'string') return { reply: value };
+  return {
+    reply: value.reply,
+    interactive: paymentMethodButtons(
+      value.saleId,
+      MINIMAL_PAYMENT_BUTTONS_PROMPT,
+    ),
+    paymentOffer: { saleId: value.saleId },
+  };
 }
 
 /** Deterministic digest of the exact payload sent under one key. */
@@ -354,7 +360,7 @@ export class MinimalOrderService {
     const recovery = await this.recoverOutstanding(senderId);
     if (recovery.reply !== undefined) {
       this.confirmation.cancel(senderId);
-      return { reply: recovery.reply };
+      return orderReply(recovery.reply);
     }
     const fresh = await this.freshOrder(senderId);
     if (!fresh.ok) {
@@ -393,7 +399,7 @@ export class MinimalOrderService {
     const recovery = await this.recoverOutstanding(input.senderId);
     if (recovery.reply !== undefined) {
       this.confirmation.cancel(input.senderId);
-      return { reply: recovery.reply };
+      return orderReply(recovery.reply);
     }
     if (this.confirmation.status(input.senderId) === null) return null;
     const result = await this.confirmation.consume({
@@ -436,6 +442,7 @@ export class MinimalOrderService {
           };
     }
     const reply = await this.place(input.senderId, fresh.snapshot);
+    if (typeof reply !== 'string') return orderReply(reply);
     // This reply only follows a cleared key (first attempt, or a later one
     // whose earlier attempt the status read resolved), so re-quoting is safe.
     if (reply === MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY)
@@ -502,7 +509,7 @@ export class MinimalOrderService {
   /** Resolve an earlier POST before consulting mutable stock/address/shipping. */
   private async recoverOutstanding(
     senderId: string,
-  ): Promise<{ outstanding: boolean; reply?: string }> {
+  ): Promise<{ outstanding: boolean; reply?: string | OrderPlaced }> {
     try {
       const raw: unknown = (await this.store.get(senderId))?.data.minimalCart;
       const cart = parseMinimalCart(raw);
@@ -730,7 +737,7 @@ export class MinimalOrderService {
   private async place(
     senderId: string,
     snapshot: MinimalOrderSnapshot,
-  ): Promise<string> {
+  ): Promise<string | OrderPlaced> {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     const phone = parseMexicanWhatsAppPhone(senderId);
     if (phone === null) return unverified;
@@ -855,7 +862,7 @@ export class MinimalOrderService {
     senderId: string,
     snapshot: MinimalOrderSnapshot,
     checkoutPayload: CreateCheckoutInput,
-  ): Promise<string> {
+  ): Promise<string | OrderPlaced> {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     const digest = fingerprint(checkoutPayload);
     // `keyed` is the parsed cart; `stored` is the exact value now in the slot,
@@ -951,9 +958,14 @@ export class MinimalOrderService {
           );
         earlierResolved = own.kind === 'absent';
       }
-      if (code === INVALID_CHECKOUT_REQUEST)
+      // S6: a definite rejection (the key is rotated) is never silent. Status
+      // and code only; the message is added solely for the request-shape code.
+      if (classifyFailure(error) === 'rotate')
         this.logger.warn(
-          `checkout rejected ${INVALID_CHECKOUT_REQUEST}: ${error instanceof Error ? sanitizeErrorText(error.message) : ''}`,
+          `checkout rejected status=${error instanceof ChatbotApiError ? (error.statusCode ?? 'none') : 'none'} code=${code ?? 'none'}` +
+            (code === INVALID_CHECKOUT_REQUEST && error instanceof Error
+              ? `: ${sanitizeErrorText(error.message)}`
+              : ''),
         );
       const customerMismatch =
         code === SHIPPING_QUOTE_MISMATCH &&
@@ -1057,7 +1069,7 @@ export class MinimalOrderService {
     shipping?: { mode: 'pickup' } | { customerChargeCents: number },
     pickupLocation?: CheckoutPickupLocation | null,
     firstName?: string | null,
-  ): Promise<string> {
+  ): Promise<OrderPlaced> {
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
       items: [],
@@ -1079,16 +1091,11 @@ export class MinimalOrderService {
         },
         firstName,
       );
-    const created = minimalOrderCreatedReply(sale, shipping, pickupLocation);
-    return `${created}\n\n${await this.paymentInstructions()}`;
-  }
-
-  private async paymentInstructions(): Promise<string> {
-    try {
-      return minimalPaymentInstructions(await this.api.getPaymentDetails());
-    } catch {
-      return MINIMAL_ORDER_PAYMENT_UNAVAILABLE_REPLY;
-    }
+    // Bank details are fetched when the customer chooses how to pay.
+    return {
+      reply: `¡Listo! ${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
+      saleId: sale.saleId,
+    };
   }
 
   /** One CAS attempt on the owned cart slot; `false` never retries. */

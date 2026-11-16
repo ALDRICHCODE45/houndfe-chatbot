@@ -834,7 +834,7 @@ describe('atomic checkout order S1–S5', () => {
         : await h.order.prepareOrder(SENDER, EVENT('wamid.recover'));
       clock?.mockRestore();
       expect(result?.reply).toContain('B-0042');
-      expect(result?.reply).toContain('CLABE');
+      expect(result?.reply).toContain('¿Cómo desea pagar?');
       expect(result?.onSent).toBeUndefined();
       expect(h.api.getCheckoutStatus).toHaveBeenCalledWith(
         (locked as { idempotencyKey: string }).idempotencyKey,
@@ -928,7 +928,7 @@ describe('atomic checkout order S1–S5', () => {
       placedSale: { saleId: SALE },
     });
     expect(result.reply).toContain('B-0042');
-    expect(result.reply).toContain('CLABE');
+    expect(result.reply).toContain('¿Cómo desea pagar?');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(await h.minimalCart()).toEqual(locked);
   });
@@ -1152,7 +1152,7 @@ describe('atomic checkout order S1–S5', () => {
         expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
       } else {
         expect(reply).toContain('B-0042');
-        expect(reply).toContain('CLABE');
+        expect(reply).toContain('¿Cómo desea pagar?');
         expect(await h.minimalCart()).toMatchObject({
           items: [],
           placedSale: { saleId: SALE },
@@ -1537,7 +1537,7 @@ describe('MinimalOrderService', () => {
     expect(setup().order.enabled).toBe(true);
   });
 
-  it('creates exactly one sale for a strict armed SÍ and sends payment details', async () => {
+  it('creates exactly one sale for a strict armed SÍ and offers the payment methods', async () => {
     const h = setup();
     await h.seedCart();
     await confirmSavedDelivery(h);
@@ -1575,7 +1575,8 @@ describe('MinimalOrderService', () => {
     expect(key).toMatch(UUID);
     expect(placed?.reply).toContain('folio B-0042');
     expect(placed?.reply).toContain('$30.00 MXN');
-    expect(placed?.reply).toContain('CLABE: 012180001234567891');
+    expect(placed?.reply).toContain('¿Cómo desea pagar?');
+    expect(placed?.reply).not.toContain('CLABE');
     expect(placed?.onSent).toBeUndefined();
     expect(await h.minimalCart()).toEqual({
       items: [],
@@ -2204,22 +2205,6 @@ describe('MinimalOrderService', () => {
     expect(await h.minimalCart()).toMatchObject({
       idempotencyKey: (h.api.createCheckout.mock.calls[0] as unknown[])[1],
     });
-  });
-
-  it('still reports the created order when payment details are unavailable', async () => {
-    const h = setup();
-    await h.seedCart();
-    await confirmSavedDelivery(h);
-    await offerOrder(h);
-    h.api.getPaymentDetails.mockImplementationOnce(() =>
-      Promise.reject(new UpstreamError('down', 503)),
-    );
-    const placed = await yes(h);
-    expect(placed?.reply).toContain('folio B-0042');
-    expect(placed?.reply).not.toContain('CLABE');
-    expect(placed?.reply).toContain(
-      'No pude obtener los datos para la transferencia',
-    );
   });
 
   it('refuses when the cart changed between presentation and the key write', async () => {
@@ -2878,5 +2863,76 @@ describe('checkout quote errors (C1)', () => {
       expect.stringContaining(INVALID_CHECKOUT_REQUEST),
     );
     warn.mockRestore();
+  });
+});
+
+describe('payment step offer after the folio (S2)', () => {
+  it('replies ¡Listo! + the created text + the payment question with one Transferencia button and no bank data', async () => {
+    const h = setup();
+    await h.seedCart();
+    await confirmSavedDelivery(h);
+    await offerOrder(h);
+    const placed = await yes(h);
+    expect(placed).toEqual({
+      reply:
+        '¡Listo! Su pedido quedó registrado con folio B-0042. Total a pagar: $30.00 MXN. Recoge en tienda (sin costo de envío).\n\nPara terminar solo falta el pago. ¿Cómo desea pagar?',
+      interactive: {
+        type: 'buttons',
+        buttons: [{ id: `pay:transfer:${SALE}`, title: 'Transferencia' }],
+        prompt: '¿Cómo desea pagar?',
+      },
+      paymentOffer: { saleId: SALE },
+    });
+    // Bank details are fetched when the customer chooses, never at order time.
+    expect(h.api.getPaymentDetails).not.toHaveBeenCalled();
+    expect(await h.minimalCart()).toMatchObject({
+      items: [],
+      placedSale: { saleId: SALE, folio: 'B-0042', totalCents: 3000 },
+    });
+    expect(
+      (await h.minimalCart()) as { placedSale: object },
+    ).not.toHaveProperty('placedSale.paymentPending');
+  });
+});
+
+describe('checkout rejection observability (S6)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('warns with status and error code for a rotating rejection of any code', async () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const h = setup();
+    await h.seedCart();
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(
+      new ChatbotApiError(
+        'cashier secret-detail',
+        404,
+        { statusCode: 404, error: 'CASHIER_NOT_FOUND' },
+        'CASHIER_NOT_FOUND',
+      ),
+    );
+    expect(await yes(h)).toEqual({ reply: MINIMAL_ORDER_REJECTED_REPLY });
+    expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls[0][0]);
+    expect(line).toMatch(/status=404/);
+    expect(line).toContain('CASHIER_NOT_FOUND');
+    expect(line).not.toContain('secret-detail');
+  });
+
+  it('does not warn about a kept-key (ambiguous) failure', async () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const h = setup();
+    await h.seedCart();
+    await offerOrder(h);
+    h.api.createCheckout.mockRejectedValueOnce(new UpstreamError('down', 503));
+    expect(await yes(h)).toEqual({
+      reply: MINIMAL_ORDER_AMBIGUOUS_OUTCOME_REPLY,
+    });
+    expect(warn).not.toHaveBeenCalled();
   });
 });

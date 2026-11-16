@@ -33,6 +33,9 @@ const placedSaleSchema = z.strictObject({
   saleId: z.string().min(1),
   folio: z.string().nullable(),
   totalCents: z.number().int().nonnegative(),
+  // The customer chose to pay but the bank details could not be read; the
+  // team was asked once. Absent in orders stored before the payment step.
+  paymentPending: z.literal(true).optional(),
 });
 const cartSchema = z.strictObject({
   items: z.array(lineSchema),
