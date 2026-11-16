@@ -325,6 +325,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Cuando haga la transferencia, envíe aquí',
     'Cuando hagas la transferencia, envía aquí',
   ],
+  ['¿Cómo desea pagar?', '¿Cómo deseas pagar?'],
+  [
+    'ya le avisé al equipo y se los comparto',
+    'ya te avisé al equipo y te los comparto',
+  ],
   [
     'Ya estoy atendiendo su consulta; por favor espere',
     'Ya estoy atendiendo tu consulta; por favor espera',

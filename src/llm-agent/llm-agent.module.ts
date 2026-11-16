@@ -39,6 +39,7 @@ import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.
 import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
 import { MinimalOrderService } from './application/minimal-order.service';
+import { MinimalPaymentService } from './application/minimal-payment.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
 import { DeliveryZonesModule } from '../delivery-zones/delivery-zones.module';
 import {
@@ -144,6 +145,8 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     MinimalCartService,
     MinimalCheckoutService,
     MinimalOrderService,
+    // Payment step after an order: bank details on demand.
+    MinimalPaymentService,
     {
       // Always on: backend-signed quotes back every delivery order (S9).
       provide: MinimalShippingService,

@@ -87,6 +87,7 @@ import {
   type InteractiveReplyIntent,
   type ProductImageContext,
 } from '../domain/customer-reply';
+import { PAYMENT_METHODS, matchPaymentMethod } from '../domain/payment-methods';
 import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
 import { MINIMAL_CHECKOUT_SUMMARY_HEADING } from '../domain/minimal-checkout-confirmation';
 import {
@@ -94,6 +95,10 @@ import {
   type GenerateTextFn,
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
+import {
+  MinimalPaymentService,
+  type MinimalPaymentReply,
+} from './minimal-payment.service';
 import {
   CART_DEFAULT_UNIT_NOTE,
   CART_OPERATION_CLARIFICATION,
@@ -322,9 +327,18 @@ const ASK_TEAM_INSTRUCTIONS_FRAGMENT =
   'palabras (question), un resumen de una línea en español (summary) y los ' +
   'productIds/variantIds EXACTOS ya identificados si aplica. Es la única ' +
   'forma de consultar al equipo; no la uses para precios, existencias, ' +
-  'reposición, caducidad, carrito, envío ni pedidos. La aplicación responde ' +
+  'reposición, caducidad, carrito, envío, pedidos ni pagos (cómo pagar, ' +
+  'datos de transferencia, CLABE, cuenta o banco). La aplicación responde ' +
   'el resultado: nunca afirmes que el equipo ya respondió. Mientras el ' +
   'cliente espera, sigue ayudando con lo demás.';
+
+// Payment questions after an order: the application owns the bank details.
+const PAYMENT_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta getPaymentDetails: el cliente ya tiene un pedido registrado. ' +
+  'Si pregunta cómo pagar, a qué cuenta transferir, por la CLABE, el banco o ' +
+  'los datos de pago, llame getPaymentDetails sin argumentos. La aplicación ' +
+  'responde con los datos; nunca los escriba ni los invente, y nunca use ' +
+  'askTeam para esto.';
 
 const ASK_TEAM_TOOL_UUID = z.uuid();
 
@@ -412,6 +426,17 @@ type RestockRun = {
 };
 
 type ExpirationReply = { attempted: boolean; value: string | null };
+type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
+
+/** Style only the short body used when the text exceeds Meta's limit. */
+function styleInteractivePrompt(
+  interactive: CustomerReplyInteractive,
+  style: CustomerStyle,
+): CustomerReplyInteractive {
+  return interactive.prompt === undefined
+    ? interactive
+    : { ...interactive, prompt: applyCustomerStyle(interactive.prompt, style) };
+}
 
 /**
  * S3: product photos for one SDK run. `known` and `sent` start from the
@@ -769,6 +794,9 @@ export class MinimalCatalogAgentService {
     @Optional()
     @Inject(HumanRequestCreateService)
     private readonly team?: Pick<HumanRequestCreateService, 'askTeam'>,
+    // Payment step after an order; optional only as a test seam.
+    @Optional()
+    private readonly payment?: MinimalPaymentService,
   ) {
     const llm = config.get<{
       model: string;
@@ -865,6 +893,19 @@ export class MinimalCatalogAgentService {
           return this.answerReorder(input, { reply: REORDER_DECLINE_REPLY });
         }
       }
+      // Payment step: the reply right after the payment offer answers it.
+      if (input.interactiveReplyId === undefined) {
+        const offer = this.pendingPaymentOffer(input.senderId);
+        if (
+          offer !== null &&
+          ((PAYMENT_METHODS.length === 1 &&
+            classifyConfirmationReply(input.text) === 'accept') ||
+            matchPaymentMethod(input.text) !== null)
+        ) {
+          const decision = await this.sendPaymentDetails(input, offer.saleId);
+          if (decision !== null) return decision;
+        }
+      }
       // The busy span covers the free consume and the SDK run. A tapped
       // button or row never answers a RESTOCK question.
       if (
@@ -917,10 +958,8 @@ export class MinimalCatalogAgentService {
           delivery ??
           (this.orderAvailable() ? await this.order!.consume(input) : null);
         if (answered !== null) {
-          const reply = applyCustomerStyle(
-            answered.reply,
-            this.customerStyle(input.senderId, input.text),
-          );
+          const style = this.customerStyle(input.senderId, input.text);
+          const reply = applyCustomerStyle(answered.reply, style);
           this.recordTurn(
             input.senderId,
             [
@@ -928,6 +967,11 @@ export class MinimalCatalogAgentService {
               { role: 'assistant', content: reply },
             ],
             [],
+            undefined,
+            undefined,
+            answered.paymentOffer === undefined
+              ? {}
+              : { paymentOffer: answered.paymentOffer },
           );
           return {
             kind: 'handled',
@@ -935,6 +979,14 @@ export class MinimalCatalogAgentService {
             ...(answered.onSent === undefined
               ? {}
               : { onSent: answered.onSent }),
+            ...(answered.interactive === undefined
+              ? {}
+              : {
+                  interactive: styleInteractivePrompt(
+                    answered.interactive,
+                    style,
+                  ),
+                }),
           };
         }
       }
@@ -969,6 +1021,7 @@ export class MinimalCatalogAgentService {
       text: string;
       inboundEvent?: unknown;
       interactiveReplyId?: string;
+      inboundAt?: string;
     },
     intent: InteractiveReplyIntent | null,
   ): Promise<
@@ -1043,6 +1096,13 @@ export class MinimalCatalogAgentService {
       case 'reorder_change':
         this.order?.dismiss(senderId);
         return answer({ reply: REORDER_CHANGE_REPLY });
+      case 'payment_method': {
+        // Only transfer exists today; a new method adds its own handler.
+        const decision = await this.sendPaymentDetails(input, intent.reference);
+        return decision === null
+          ? answer({ reply: STALE_BUTTON_FALLBACK })
+          : { decision };
+      }
       case 'pick': {
         const option = this.sessionStore
           .read(senderId)
@@ -1091,6 +1151,70 @@ export class MinimalCatalogAgentService {
       // Fall through to the question; nothing was confirmed.
     }
     return { reply: STALE_BUTTON_FALLBACK };
+  }
+
+  /** The payment offer of the bot's latest message, if any. */
+  private pendingPaymentOffer(senderId: string): { saleId: string } | null {
+    return this.sessionStore.read(senderId).at(-1)?.paymentOffer ?? null;
+  }
+
+  /**
+   * The bank details for the customer's placed order, answered here without
+   * the model. `saleId` binds a button or a yes to the order it was offered
+   * for; `null` when there is no such placed order (nothing is fetched).
+   */
+  private async sendPaymentDetails(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      inboundAt?: string;
+    },
+    saleId: string,
+  ): Promise<MinimalCatalogAgentDecision | null> {
+    const payment = this.payment;
+    if (payment === undefined) return null;
+    const { senderId } = input;
+    this.order?.dismiss(senderId);
+    if ((await payment.placedSale(senderId))?.saleId !== saleId) return null;
+    const result = await payment.paymentDetails(
+      senderId,
+      this.paymentTrigger(input),
+    );
+    if (result === null) return null;
+    const reply = applyCustomerStyle(
+      result.reply,
+      this.customerStyle(senderId, input.text),
+    );
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+      undefined,
+      undefined,
+      result.paymentOffer === undefined
+        ? {}
+        : { paymentOffer: result.paymentOffer },
+    );
+    return this.decision({ reply });
+  }
+
+  private paymentTrigger(input: {
+    senderId: string;
+    inboundEvent?: unknown;
+    inboundAt?: string;
+  }): { inboundAt?: string; triggerWaMessageId?: string } {
+    const trigger = bindExpirationInboundEvent(
+      input.inboundEvent,
+      input.senderId,
+    )?.event.messageId;
+    return {
+      ...(input.inboundAt === undefined ? {} : { inboundAt: input.inboundAt }),
+      ...(trigger === undefined ? {} : { triggerWaMessageId: trigger }),
+    };
   }
 
   /** S2: the reorder offer of the bot's latest message, if any. */
@@ -1376,6 +1500,12 @@ export class MinimalCatalogAgentService {
     const cartReply: CartReply = { attempted: false, value: null };
     const askTeamRun: ExpirationReply | null =
       this.team === undefined ? null : { attempted: false, value: null };
+    // Only a customer with a placed order can ask for its payment details.
+    const paymentRun: PaymentRun | null =
+      this.payment !== undefined &&
+      (await this.payment.placedSale(input.senderId)) !== null
+        ? { attempted: false, value: null }
+        : null;
     const checkoutRun: CheckoutRun | null =
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
@@ -1474,6 +1604,7 @@ export class MinimalCatalogAgentService {
         '\n\n' +
         cartInstructions +
         (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
+        (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
         this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),
@@ -1497,6 +1628,7 @@ export class MinimalCatalogAgentService {
         ),
         ...this.memoryTools(input.senderId),
         ...this.askTeamTools(input, askTeamRun, traceId),
+        ...this.paymentTools(input, paymentRun, traceId),
       },
       stopWhen: stepCountIs(this.maxSteps),
     };
@@ -1560,6 +1692,26 @@ export class MinimalCatalogAgentService {
       return expirationResult === null && prepared?.kind === 'offer'
         ? { reply, onSent: prepared.onSent }
         : { reply };
+    }
+    const paymentReply = paymentRun?.value ?? null;
+    if (paymentReply !== null) {
+      // The server-owned bank details (or the unavailable notice); model text
+      // never carries them.
+      const reply = styled(paymentReply.reply);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+        paymentReply.paymentOffer === undefined
+          ? {}
+          : { paymentOffer: paymentReply.paymentOffer },
+      );
+      return { reply };
     }
     const teamReply = askTeamRun?.value ?? null;
     if (teamReply !== null) {
@@ -2030,6 +2182,40 @@ export class MinimalCatalogAgentService {
     };
   }
 
+  /** One payment-details answer per run; the reply is application-owned. */
+  private paymentTools(
+    input: { senderId: string; inboundEvent?: unknown; inboundAt?: string },
+    run: PaymentRun | null,
+    traceId: string,
+  ): ToolSet {
+    const payment = this.payment;
+    if (payment === undefined || run === null) return {};
+    return {
+      getPaymentDetails: tool({
+        description:
+          'Datos de pago (transferencia) del pedido ya registrado del cliente. ' +
+          'Llámela cuando pregunte cómo pagar o por la cuenta, CLABE o banco. ' +
+          'La aplicación responde al cliente.',
+        inputSchema: z.strictObject({}),
+        execute: async () => {
+          if (run.attempted) return toolError('payment_details_settled');
+          run.attempted = true;
+          const result = await payment.paymentDetails(
+            input.senderId,
+            this.paymentTrigger(input),
+          );
+          if (result === null) return toolError('no_placed_order');
+          run.value = result;
+          traceLog(
+            this.logger,
+            `minimal_catalog tool getPaymentDetails trace=${traceId}`,
+          );
+          return { ok: true as const, presentedByApplication: true as const };
+        },
+      }),
+    };
+  }
+
   private memoryTools(senderId: string): ToolSet {
     const profiles = this.profiles;
     if (profiles === undefined) return {};
@@ -2150,6 +2336,7 @@ export class MinimalCatalogAgentService {
       catalogPrices?: Record<string, number>;
       interactiveChoice?: InteractiveChoiceContext;
       reorderOffer?: ReorderOfferContext;
+      paymentOffer?: { saleId: string };
     } = {},
   ): void {
     const turns = this.sessionStore.read(senderId);
@@ -2175,6 +2362,9 @@ export class MinimalCatalogAgentService {
         ...(interactive.reorderOffer === undefined
           ? {}
           : { reorderOffer: interactive.reorderOffer }),
+        ...(interactive.paymentOffer === undefined
+          ? {}
+          : { paymentOffer: interactive.paymentOffer }),
       },
     ]);
   }

@@ -1,5 +1,6 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
+import type { CustomerReplyInteractive } from '../domain/customer-reply';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -138,6 +139,10 @@ export interface MinimalCheckoutReply {
   onSent?: () => void;
   /** Set only when this reply confirmed the delivery data (F1 continuation). */
   confirmed?: true;
+  /** Buttons that go with the reply (payment methods after an order). */
+  interactive?: CustomerReplyInteractive;
+  /** The payment offer this reply made; a later yes answers it. */
+  paymentOffer?: { saleId: string };
 }
 
 export type MinimalCheckoutRevalidation = 'ok' | 'reselect' | 'unavailable';

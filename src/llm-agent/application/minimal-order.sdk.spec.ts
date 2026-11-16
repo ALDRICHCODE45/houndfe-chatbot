@@ -607,7 +607,7 @@ describe('minimal order placement through the SDK route', () => {
       },
     });
     expect((placed as { reply: string }).reply).toContain('folio B-0042');
-    expect((placed as { reply: string }).reply).toContain('CLABE');
+    expect((placed as { reply: string }).reply).toContain('¿Cómo desea pagar?');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
     await h.turn('SÍ', [say()], EVENT('duplicate-yes'));
@@ -652,7 +652,7 @@ describe('minimal order placement through the SDK route', () => {
       },
     });
     expect((placed as { reply: string }).reply).toContain('folio B-0042');
-    expect((placed as { reply: string }).reply).toContain('CLABE');
+    expect((placed as { reply: string }).reply).toContain('¿Cómo desea pagar?');
     expect((placed as { reply: string }).reply).not.toContain(
       'no está incluido',
     );

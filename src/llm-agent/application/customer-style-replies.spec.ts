@@ -74,9 +74,13 @@ import {
   MINIMAL_ORDER_UNRESOLVED_REPLY,
   MINIMAL_ORDER_VARIANT_CHANGED_REPLY,
   minimalOrderCreatedReply,
-  minimalPaymentInstructions,
-  MINIMAL_ORDER_PAYMENT_UNAVAILABLE_REPLY,
 } from './minimal-order.service';
+import {
+  MINIMAL_PAYMENT_BUTTONS_PROMPT,
+  MINIMAL_PAYMENT_QUESTION,
+  MINIMAL_PAYMENT_UNAVAILABLE_REPLY,
+  minimalPaymentInstructions,
+} from './minimal-payment.service';
 import {
   MINIMAL_RESTOCK_AMBIGUOUS_REPLY,
   MINIMAL_RESTOCK_CLARIFY_REPLY,
@@ -236,7 +240,9 @@ const REPLIES: Record<string, string> = {
     null,
   ),
   paymentInstructions: minimalPaymentInstructions(payment),
-  MINIMAL_ORDER_PAYMENT_UNAVAILABLE_REPLY,
+  MINIMAL_PAYMENT_QUESTION,
+  MINIMAL_PAYMENT_BUTTONS_PROMPT,
+  MINIMAL_PAYMENT_UNAVAILABLE_REPLY,
   ...Object.fromEntries(
     Object.entries(MINIMAL_ORDER_INELIGIBLE_REPLIES).map(([k, v]) => [
       `ineligible_${k}`,

@@ -291,7 +291,11 @@ describe('S4 order summary buttons', () => {
     const placed = await h.turn('SÍ', [say('no')], 'o2', confirm);
     expect(h.seen).toHaveLength(calls);
     expect(placed.reply).toContain('folio B-0042');
-    expect(placed.interactive).toBeUndefined();
+    // Only the payment-method button; never a confirm button.
+    expect(placed.interactive).toMatchObject({
+      type: 'buttons',
+      buttons: [{ title: 'Transferencia' }],
+    });
     // A double tap never creates a second order.
     await h.turn('SÍ', [say('¿Algo más?')], 'o3', confirm);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
