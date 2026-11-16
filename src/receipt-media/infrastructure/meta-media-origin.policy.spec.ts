@@ -94,6 +94,89 @@ describe('validateMetaMediaOrigin', () => {
   });
 });
 
+/** S3: Meta's real download URLs carry a query string; only download hops on
+ *  allowlisted hosts may opt in, everything else stays rejected. */
+describe('validateMetaMediaOrigin download hops with a query (S3)', () => {
+  const LOOKASIDE = 'lookaside.fbsbx.com';
+  const download: MetaMediaOriginPolicyConfig = { allowedHosts: [LOOKASIDE] };
+  const REAL = `https://${LOOKASIDE}/whatsapp_business/attachments/?mid=123&ext=456&hash=abc`;
+  const OPT_IN = { allowQuery: true };
+
+  const downloadAccepts = (url: string, cfg = download, resolve = publicDns) =>
+    expect(validateMetaMediaOrigin(url, cfg, resolve, OPT_IN)).resolves.toEqual(
+      PINNED,
+    );
+
+  const downloadRejects = async (
+    url: string,
+    cfg = download,
+    resolve = publicDns,
+  ) => {
+    const err: unknown = await validateMetaMediaOrigin(
+      url,
+      cfg,
+      resolve,
+      OPT_IN,
+    ).catch((error: unknown) => error);
+    expect(err).toBeInstanceOf(MetaMediaError);
+    expect(err).toMatchObject({
+      category: 'META_TRANSPORT',
+      code: 'NETWORK_FAILURE',
+      message: 'receipt-media:META_TRANSPORT/NETWORK_FAILURE',
+    });
+  };
+
+  it('accepts the real lookaside shape and an empty-path query on an allowlisted host', async () => {
+    await downloadAccepts(REAL);
+    await downloadAccepts(`https://${LOOKASIDE}/x?a=1`);
+    await downloadAccepts(`https://sub.${LOOKASIDE}/x?a=1&b=%2F`);
+  });
+
+  it('keeps the query rejected unless the hop explicitly opts in', async () => {
+    await rejects(REAL, download);
+    await expect(
+      validateMetaMediaOrigin(REAL, download, publicDns, { allowQuery: false }),
+    ).rejects.toBeInstanceOf(MetaMediaError);
+  });
+
+  it.each([
+    ['non-HTTPS', `http://${LOOKASIDE}/x?mid=1`],
+    ['userinfo', `https://user:pass@${LOOKASIDE}/x?mid=1`],
+    ['password-less userinfo', `https://user@${LOOKASIDE}/x?mid=1`],
+    ['fragment after query', `https://${LOOKASIDE}/x?mid=1#frag`],
+    ['bare fragment', `https://${LOOKASIDE}/x#frag`],
+    ['non-443 port', `https://${LOOKASIDE}:8443/x?mid=1`],
+    ['host not allowlisted', 'https://evil.example.com/x?mid=1'],
+    ['label-boundary suffix lookalike', `https://not${LOOKASIDE}/x?mid=1`],
+    ['allowlisted host as a prefix', `https://${LOOKASIDE}.evil.example/x?a=1`],
+    [
+      'allowlisted host smuggled in the query',
+      `https://evil.example/?h=${LOOKASIDE}`,
+    ],
+    [
+      'allowlisted host smuggled as userinfo',
+      `https://${LOOKASIDE}@evil.example/x?a=1`,
+    ],
+    ['backslash host confusion', `https://evil.example\\@${LOOKASIDE}/x?a=1`],
+    ['unparseable', 'not-a-url?mid=1'],
+  ])('still rejects %s', async (_label, url) => {
+    await downloadRejects(url);
+  });
+
+  it('still requires every resolved address to be public, incl. IPv4-mapped IPv6', async () => {
+    await downloadRejects(REAL, download, () =>
+      Promise.resolve([addr('10.0.0.5')]),
+    );
+    await downloadRejects(REAL, download, () =>
+      Promise.resolve([addr('::ffff:10.0.0.5', 6)]),
+    );
+    await downloadRejects(REAL, download, () =>
+      Promise.resolve([addr('8.8.8.8'), addr('::1', 6)]),
+    );
+    await downloadRejects(REAL, download, () => Promise.resolve([]));
+  });
+});
+
 describe('isPublicAddress', () => {
   it.each([
     ['8.8.8.8', undefined, true],
@@ -122,10 +205,10 @@ describe('isPublicAddress', () => {
 
 describe('pinnedLookup', () => {
   it('serves only the pinned addresses in scalar and options.all callbacks', () => {
-    const addresses = [addr('8.8.8.8'), addr('2606:4700::1111', 6)];
+    const addresses = [addr('8.8.8.8'), addr('1.1.1.1')];
     const lookup = pinnedLookup(HOST, addresses);
     const scalar: Array<[string, number]> = [];
-    for (let call = 0; call < 2; call += 1) {
+    for (let call = 0; call < 3; call += 1) {
       lookup(HOST, {}, (err, address, family) => {
         expect(err).toBeNull();
         scalar.push([address as string, family as number]);
@@ -133,11 +216,67 @@ describe('pinnedLookup', () => {
     }
     expect(scalar).toEqual([
       ['8.8.8.8', 4],
-      ['2606:4700::1111', 6],
+      ['1.1.1.1', 4],
+      ['8.8.8.8', 4],
     ]);
     lookup(HOST, { all: true }, (err, list) => {
       expect(err).toBeNull();
       expect(list).toEqual(addresses);
+    });
+  });
+
+  describe('IPv4 preference (S4)', () => {
+    const V6 = addr('2606:4700::1111', 6);
+    const V4 = addr('8.8.8.8');
+
+    const scalarOf = (
+      lookup: ReturnType<typeof pinnedLookup>,
+      calls = 3,
+    ): Array<[string, number]> => {
+      const out: Array<[string, number]> = [];
+      for (let call = 0; call < calls; call += 1)
+        lookup(HOST, {}, (err, address, family) => {
+          expect(err).toBeNull();
+          out.push([address as string, family as number]);
+        });
+      return out;
+    };
+
+    it.each([
+      ['AAAA first (verbatim resolver order)', [V6, V4]],
+      ['A first', [V4, V6]],
+    ])('never hands IPv6 while a validated IPv4 exists: %s', (_l, set) => {
+      const lookup = pinnedLookup(HOST, set);
+      expect(scalarOf(lookup)).toEqual([
+        ['8.8.8.8', 4],
+        ['8.8.8.8', 4],
+        ['8.8.8.8', 4],
+      ]);
+      lookup(HOST, { all: true }, (err, list) => {
+        expect(err).toBeNull();
+        expect(list).toEqual([V4]);
+      });
+    });
+
+    it('still serves a validated public IPv6 when it is the only family', () => {
+      const lookup = pinnedLookup(HOST, [V6]);
+      expect(scalarOf(lookup, 2)).toEqual([
+        ['2606:4700::1111', 6],
+        ['2606:4700::1111', 6],
+      ]);
+      lookup(HOST, { all: true }, (err, list) => {
+        expect(err).toBeNull();
+        expect(list).toEqual([V6]);
+      });
+    });
+
+    it('does not weaken validation: a non-public AAAA beside a public A is still rejected', async () => {
+      await rejects(`https://${HOST}/media`, config, () =>
+        Promise.resolve([V4, addr('fc00::1', 6)]),
+      );
+      await rejects(`https://${HOST}/media`, config, () =>
+        Promise.resolve([addr('10.0.0.5'), V6]),
+      );
     });
   });
 

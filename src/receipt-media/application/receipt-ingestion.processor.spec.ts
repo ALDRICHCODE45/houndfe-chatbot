@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import {
   MetaMediaError,
@@ -21,6 +22,8 @@ import type {
   ReceiptAttachmentService,
   UploadInvocation,
 } from './receipt-attachment.service';
+import { withMetaFailureReason } from '../infrastructure/meta-media-failure-reason';
+import { MetaMediaClient } from '../infrastructure/meta-media.client';
 import { ReceiptIngestionProcessor } from './receipt-ingestion.processor';
 
 const RECEIPT_ID = '11111111-1111-4111-8111-111111111111';
@@ -431,5 +434,150 @@ describe('ReceiptIngestionProcessor (R2: download → extract → backend upload
       status: 'ATTACHED',
     });
     expect(f.resolveAndDownload).not.toHaveBeenCalled();
+  });
+});
+
+/** S5: a Meta media failure is observable with a safe reason; the log text
+ *  never carries the media id, any URL/query, or a token. */
+describe('ReceiptIngestionProcessor Meta failure logging (S5)', () => {
+  const MEDIA_ID = 'wa-media-1';
+  const TOKEN = 'EAAG-token-sentinel';
+  const URLISH = 'https://lookaside.fbsbx.com/x?mid=wa-media-1&hash=zzz';
+  let warn: jest.SpyInstance<void, [message: unknown, ...rest: unknown[]]>;
+
+  beforeEach(() => {
+    warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+  });
+  afterEach(() => warn.mockRestore());
+
+  const netFailure = (reason: string) =>
+    withMetaFailureReason(
+      Object.assign(
+        new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE'),
+        {},
+      ),
+      reason,
+    );
+
+  const logged = (): string =>
+    warn.mock.calls.map(([message]) => String(message)).join('\n');
+
+  const expectClean = (text: string) => {
+    expect(text).not.toContain(MEDIA_ID);
+    expect(text).not.toContain(TOKEN);
+    expect(text).not.toMatch(/https?:|\?|lookaside|mid=|hash=/i);
+  };
+
+  it('warns with reason, receipt id, category/code and attempt when a retry is scheduled', async () => {
+    const f = fixture({
+      download: () => Promise.reject(netFailure('ENETUNREACH')),
+    });
+    f.store.commitMetaFailureDisposition.mockResolvedValue({
+      kind: 'retry-scheduled',
+      attempt: 2,
+      version: '5',
+      receipt: row(),
+    });
+    await expect(f.processor.process(row(), OWNER)).resolves.toMatchObject({
+      kind: 'meta-retry-scheduled',
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    const text = logged();
+    expect(text).toContain(`receiptId=${RECEIPT_ID}`);
+    expect(text).toContain('outcome=retry-scheduled');
+    expect(text).toContain('category=META_TRANSPORT');
+    expect(text).toContain('code=NETWORK_FAILURE');
+    expect(text).toContain('attempt=2');
+    expect(text).toContain('reason=ENETUNREACH');
+    expectClean(text);
+  });
+
+  it('warns on a terminal Meta failure with the failure stage and attempt', async () => {
+    const f = fixture({
+      download: () => Promise.reject(netFailure('HOST_NOT_ALLOWED')),
+    });
+    f.store.commitMetaFailureDisposition.mockResolvedValue({
+      kind: 'terminal',
+      failureStage: 'META_EXHAUSTED_PRE_STORAGE',
+      version: '6',
+      receipt: row({ metaAttempts: 3 }),
+      intent: {} as never,
+    });
+    await expect(
+      f.processor.process(row({ metaAttempts: 2 }), OWNER),
+    ).resolves.toMatchObject({ kind: 'meta-terminal' });
+    const text = logged();
+    expect(text).toContain(`receiptId=${RECEIPT_ID}`);
+    expect(text).toContain('outcome=terminal');
+    expect(text).toContain('failureStage=META_EXHAUSTED_PRE_STORAGE');
+    expect(text).toContain('code=NETWORK_FAILURE');
+    expect(text).toContain('attempt=3');
+    expect(text).toContain('reason=HOST_NOT_ALLOWED');
+    expectClean(text);
+  });
+
+  it('includes the HTTP status (from its side-channel) and never an unsafe error message', async () => {
+    const client = new MetaMediaClient(
+      {
+        graphApiBaseUrl: 'https://graph.facebook.com/v23.0',
+        allowedHosts: ['lookaside.fbsbx.com'],
+        metadataTimeoutMs: 1000,
+        downloadTimeoutMs: 1000,
+      },
+      () => TOKEN,
+      {
+        http: () => Promise.resolve({ status: 503, data: URLISH }),
+        resolve: () => Promise.resolve([{ address: '8.8.8.8', family: 4 }]),
+        createAgent: () => ({ destroy: jest.fn() }) as never,
+      },
+    );
+    const f = fixture({
+      download: () =>
+        client.resolveAndDownload({
+          providerMediaId: MEDIA_ID,
+          declaredMimeType: 'image/jpeg',
+          signal: new AbortController().signal,
+        }),
+    });
+    f.store.commitMetaFailureDisposition.mockResolvedValue({
+      kind: 'retry-scheduled',
+      attempt: 1,
+      version: '5',
+      receipt: row(),
+    });
+    await f.processor.process(row(), OWNER);
+    const text = logged();
+    expect(text).toContain('code=HTTP_RETRYABLE');
+    expect(text).toContain('httpStatus=503');
+    expectClean(text);
+  });
+
+  it('warns for a download failure on the same-key retry pass too', async () => {
+    const f = fixture({
+      download: () => Promise.reject(netFailure('ECONNRESET')),
+    });
+    await f.processor.process(
+      row({ status: 'DOWNLOADED', version: '9', storageAttempts: 1 }),
+      OWNER,
+    );
+    const text = logged();
+    expect(text).toContain(`receiptId=${RECEIPT_ID}`);
+    expect(text).toContain('outcome=upload-retry-download-failed');
+    expect(text).toContain('reason=ECONNRESET');
+    expectClean(text);
+  });
+
+  it('does not warn on abort, a fenced loser, or a successful pass', async () => {
+    const aborted = fixture({
+      download: () =>
+        Promise.reject(new MetaMediaError('META_TRANSPORT', 'ABORTED')),
+    });
+    await aborted.processor.process(row(), OWNER);
+    const fenced = fixture({
+      download: () => Promise.reject(netFailure('ENETUNREACH')),
+    });
+    await fenced.processor.process(row(), OWNER); // default store → fenced
+    await fixture().processor.process(row(), OWNER);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

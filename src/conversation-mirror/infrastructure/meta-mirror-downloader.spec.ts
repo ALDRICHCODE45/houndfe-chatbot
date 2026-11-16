@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto';
+import { ConfigService } from '@nestjs/config';
 import { Readable } from 'node:stream';
 import type { Agent } from 'node:https';
+import type { LookupFunction } from 'node:net';
 import type { AxiosRequestConfig } from 'axios';
+import configuration from '../../config/configuration';
 import { MetaMediaError } from '../../receipt-media/domain/meta-media.port';
+import { createMetaMediaClient } from '../../receipt-media/infrastructure/meta-media-client.factory';
 import {
   MetaMediaClient,
   type MetaHttp,
@@ -150,5 +154,80 @@ describe('MetaMirrorDownloader', () => {
         real(status).download({ providerMediaId: PROVIDER_ID, signal }),
       ).resolves.toEqual({ kind: 'retry', cause: 'source_transient' });
     });
+  });
+});
+
+describe('MetaMirrorDownloader on the shipped default config (S7)', () => {
+  const REAL_URL =
+    'https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=meta-media-123&ext=1763300000&hash=ATh';
+  const ENV = [
+    'META_MEDIA_ALLOWED_HOSTS',
+    'META_GRAPH_API_BASE_URL',
+    'META_MEDIA_METADATA_TIMEOUT_MS',
+    'META_MEDIA_DOWNLOAD_TIMEOUT_MS',
+  ];
+  const saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const key of ENV) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+  afterEach(() => {
+    for (const key of ENV) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  it('downloads media from a real-shaped lookaside URL with a query, over the validated IPv4', async () => {
+    const urls: Array<string | undefined> = [];
+    const lookups: LookupFunction[] = [];
+    const http: MetaHttp = (config: AxiosRequestConfig) => {
+      urls.push(config.url);
+      return Promise.resolve(
+        config.responseType === 'stream'
+          ? { status: 200, data: Readable.from([OGG]), headers: {} }
+          : {
+              status: 200,
+              data: {
+                url: REAL_URL,
+                mime_type: 'audio/ogg',
+                file_size: OGG.length,
+              },
+            },
+      );
+    };
+    const client = createMetaMediaClient(new ConfigService(configuration()), {
+      http,
+      resolve: () =>
+        Promise.resolve([
+          { address: '2a03:2880:f343:80:face:b00c:0:3', family: 6 },
+          { address: '57.144.134.128', family: 4 },
+        ]),
+      createAgent: (lookup) => {
+        lookups.push(lookup);
+        return { destroy: jest.fn() } as unknown as Agent;
+      },
+    });
+    const result = await new MetaMirrorDownloader(client).download({
+      providerMediaId: PROVIDER_ID,
+      signal,
+    });
+    if (result.kind !== 'ok') throw new Error(result.kind);
+    try {
+      expect(result.value.mimeType).toBe('audio/ogg');
+      expect(urls).toEqual([
+        `https://graph.facebook.com/v23.0/${PROVIDER_ID}`,
+        REAL_URL,
+      ]);
+      const handed: string[] = [];
+      lookups[1]('lookaside.fbsbx.com', {}, (_e, address) =>
+        handed.push(address as string),
+      );
+      expect(handed).toEqual(['57.144.134.128']);
+    } finally {
+      await result.value.cleanup();
+    }
   });
 });
