@@ -147,6 +147,49 @@ effect. The remaining knobs all have defaults:
 The service credential needs `sales:write` (upload) and `sales:read`
 (outcome); `sales:write` alone answers 403 on the outcome read.
 
+#### Meta media origin policy (SSRF) and `META_MEDIA_ALLOWED_HOSTS`
+
+Every Meta media hop (receipts, product photos and the conversation mirror
+share one client) is validated before any request or bearer exists:
+HTTPS only, no userinfo, no fragment, port 443, then every resolved A/AAAA
+address must be a public global address (IPv4-mapped IPv6 is decoded and
+re-checked). Anything else fails closed to `META_TRANSPORT/NETWORK_FAILURE`.
+
+- **Metadata hop** (`GET <META_GRAPH_API_BASE_URL>/<media id>`): allowed for
+  exactly the host of `META_GRAPH_API_BASE_URL` (default `graph.facebook.com`),
+  derived from that setting. It does **not** need to be in
+  `META_MEDIA_ALLOWED_HOSTS`, and it stays query-free.
+- **Download hops** (the returned media URL and every redirect): the host must
+  match `META_MEDIA_ALLOWED_HOSTS` (exact or whole-label suffix; default
+  `lookaside.fbsbx.com`). The Graph host is **not** implicitly added here.
+  Meta's real download URLs carry a query
+  (`.../whatsapp_business/attachments/?mid=…&ext=…&hash=…`), so a query string
+  is accepted on download hops of allowlisted hosts only. Redirects to any
+  non-allowlisted host are still rejected, as is any fragment.
+- **IPv4 preference**: the connection is pinned to the validated addresses and
+  never uses an IPv6 address while a validated IPv4 address exists (the
+  production container has no IPv6 route and an AAAA record would fail with
+  `ENETUNREACH`). An IPv6-only public host still works. All resolved addresses
+  must still be public; a private AAAA next to a public A is rejected.
+
+#### Meta media failure logs
+
+A Meta media failure is logged as a `warn` from `ReceiptIngestionProcessor`:
+
+```text
+receipt media failure receiptId=<uuid> outcome=<retry-scheduled|terminal|upload-retry-download-failed> category=<META_TRANSPORT|MEDIA_VALIDATION> code=<code> attempt=<n> reason=<REASON|NONE> [httpStatus=<n>] [failureStage=<stage>]
+```
+
+`reason` is a fixed token: a policy rejection (`URL_INVALID`,
+`SCHEME_NOT_HTTPS`, `USERINFO_NOT_ALLOWED`, `QUERY_NOT_ALLOWED`,
+`FRAGMENT_NOT_ALLOWED`, `PORT_NOT_ALLOWED`, `HOST_NOT_ALLOWED`, `DNS_FAILED`,
+`NON_PUBLIC_ADDRESS`) or a raw errno such as `ENETUNREACH` / `ECONNRESET`;
+`NONE` means no safe reason was captured (HTTP status, timeout, validation
+codes, or the synthetic exhaustion path). Terminal failures
+(`failureStage=META_EXHAUSTED_PRE_STORAGE`) and scheduled retries are logged;
+aborts and fenced losers are not. The media URL, query string, token and media
+id are never logged and are never part of the error object.
+
 ### Backend upload and unknown outcome (R2)
 
 The backend stores receipt files (receipt-payment-flow S2). The worker

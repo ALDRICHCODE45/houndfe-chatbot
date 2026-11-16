@@ -56,10 +56,7 @@ import {
   type ReceiptExtractionPort,
 } from './domain/receipt-extraction.port';
 import { LlmReceiptExtractionAdapter } from './infrastructure/llm-receipt-extraction.adapter';
-import {
-  MetaMediaClient,
-  type MetaMediaClientConfig,
-} from './infrastructure/meta-media.client';
+import { createMetaMediaClient } from './infrastructure/meta-media-client.factory';
 import { PostgresReceiptMediaStore } from './infrastructure/postgres-receipt-media.store';
 import { PostgresReceiptOutboxStore } from './infrastructure/postgres-receipt-outbox.store';
 import {
@@ -272,18 +269,7 @@ class ReceiptOutcomeLifecycle
     {
       provide: META_MEDIA,
       useFactory: (config: ConfigService): MetaMediaPort =>
-        new MetaMediaClient(
-          {
-            graphApiBaseUrl: config.get<string>('meta.graphApiBaseUrl') ?? '',
-            allowedHosts:
-              config.get<string[]>('receiptMedia.meta.allowedHosts') ?? [],
-            metadataTimeoutMs:
-              config.get<number>('receiptMedia.meta.metadataTimeoutMs') ?? 0,
-            downloadTimeoutMs:
-              config.get<number>('receiptMedia.meta.downloadTimeoutMs') ?? 0,
-          } satisfies MetaMediaClientConfig,
-          () => config.get<string>('meta.accessToken') ?? '',
-        ),
+        createMetaMediaClient(config),
       inject: [ConfigService],
     },
     {

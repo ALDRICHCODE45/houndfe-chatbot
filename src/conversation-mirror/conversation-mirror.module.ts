@@ -16,10 +16,7 @@ import {
 } from '../conversation/domain/live-reconcile-ref';
 import { DatabaseModule } from '../database/database.module';
 import { PG_POOL } from '../database/postgres-pool.provider';
-import {
-  MetaMediaClient,
-  type MetaMediaClientConfig,
-} from '../receipt-media/infrastructure/meta-media.client';
+import { createMetaMediaClient } from '../receipt-media/infrastructure/meta-media-client.factory';
 import { MirrorDeliveryGate } from './application/mirror-delivery-gate';
 import { MirrorMediaService } from './application/mirror-media.service';
 import { MirrorMessagesDelivery } from './application/mirror-messages.delivery';
@@ -111,20 +108,7 @@ export class MirrorOutboxRoutes implements OnModuleInit {
     {
       provide: MIRROR_META_DOWNLOADER,
       useFactory: (config: ConfigService): MirrorMetaDownloader =>
-        new MetaMirrorDownloader(
-          new MetaMediaClient(
-            {
-              graphApiBaseUrl: config.get<string>('meta.graphApiBaseUrl') ?? '',
-              allowedHosts:
-                config.get<string[]>('receiptMedia.meta.allowedHosts') ?? [],
-              metadataTimeoutMs:
-                config.get<number>('receiptMedia.meta.metadataTimeoutMs') ?? 0,
-              downloadTimeoutMs:
-                config.get<number>('receiptMedia.meta.downloadTimeoutMs') ?? 0,
-            } satisfies MetaMediaClientConfig,
-            () => config.get<string>('meta.accessToken') ?? '',
-          ),
-        ),
+        new MetaMirrorDownloader(createMetaMediaClient(config)),
       inject: [ConfigService],
     },
     {

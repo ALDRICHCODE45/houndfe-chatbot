@@ -12,6 +12,7 @@
  * The lease (60 s) is renewed while the extraction and the upload (up to
  * 90 s for a PDF) run. The bot never confirms or rejects a payment (S1). */
 import { promises as fs } from 'node:fs';
+import { Logger } from '@nestjs/common';
 import type { ReceiptUploadFields } from '../../chatbot-api/domain/dtos/receipt-upload.dto';
 import type { ConversationState } from '../../conversation/domain/conversation-store';
 import {
@@ -33,6 +34,8 @@ import {
 } from '../domain/receipt-media-store.port';
 import type { ReceiptMediaRow } from '../domain/receipt-media.types';
 import { isEncryptedPdf } from '../infrastructure/media-structure.validator';
+import { metaFailureReasonOf } from '../infrastructure/meta-media-failure-reason';
+import { metaHttpStatusOf } from '../infrastructure/meta-media.client';
 import {
   toUploadFields,
   type ReceiptAttachmentService,
@@ -85,7 +88,30 @@ type IngestionStore = Pick<
 const PROCESSABLE: ReadonlySet<string> = new Set(['RESERVED', 'DOWNLOADED']);
 const DEFAULT_HEARTBEAT_MS = 20_000;
 
+/** Safe, fixed-vocabulary log fields only (S5): the receipt id, the Meta
+ *  category/code, the attempt, a policy/errno reason and an HTTP status —
+ *  never the media id, a URL or query, or a token. */
+function metaFailureLog(
+  receiptId: string,
+  outcome: string,
+  err: MetaMediaError,
+  code: string,
+  attempt: number,
+  category: string = err.category,
+  extra = '',
+): string {
+  const status = metaHttpStatusOf(err);
+  return (
+    `receipt media failure receiptId=${receiptId} outcome=${outcome}` +
+    ` category=${category} code=${code} attempt=${attempt}` +
+    ` reason=${metaFailureReasonOf(err) ?? 'NONE'}` +
+    (status === undefined ? '' : ` httpStatus=${status}`) +
+    extra
+  );
+}
+
 export class ReceiptIngestionProcessor {
+  private readonly logger = new Logger(ReceiptIngestionProcessor.name);
   private readonly heartbeatMs: number;
   private readonly readFile: (path: string) => Promise<Buffer>;
 
@@ -194,6 +220,15 @@ export class ReceiptIngestionProcessor {
         file = await this.download(receipt, signal);
       } catch (err) {
         if (!(err instanceof MetaMediaError)) throw err;
+        this.logger.warn(
+          metaFailureLog(
+            receipt.id,
+            'upload-retry-download-failed',
+            err,
+            err.code,
+            receipt.storageAttempts,
+          ),
+        );
         return {
           kind: 'upload-unknown',
           outcome: await this.store.commitUploadUnknown({
@@ -284,12 +319,37 @@ export class ReceiptIngestionProcessor {
     err: MetaMediaError,
     code: string = err.code,
   ): Promise<ReceiptIngestionOutcome> {
+    const category =
+      code === 'META_EXHAUSTED' ? 'META_TRANSPORT' : err.category;
     const disposition = await this.store.commitMetaFailureDisposition({
       ...fence,
-      category: code === 'META_EXHAUSTED' ? 'META_TRANSPORT' : err.category,
+      category,
       code: code as MetaMediaError['code'] | 'META_EXHAUSTED',
     });
     if (code === 'ABORTED') return { kind: 'aborted', stage: 'meta' };
+    if (disposition.kind === 'terminal')
+      this.logger.warn(
+        metaFailureLog(
+          fence.id,
+          'terminal',
+          err,
+          code,
+          disposition.receipt.metaAttempts,
+          category,
+          ` failureStage=${disposition.failureStage}`,
+        ),
+      );
+    if (disposition.kind === 'retry-scheduled')
+      this.logger.warn(
+        metaFailureLog(
+          fence.id,
+          'retry-scheduled',
+          err,
+          code,
+          disposition.attempt,
+          category,
+        ),
+      );
     if (disposition.kind === 'terminal' || disposition.kind === 'replayed')
       return {
         kind: 'meta-terminal',

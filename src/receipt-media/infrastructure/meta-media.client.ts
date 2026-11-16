@@ -22,6 +22,10 @@ import {
 } from '../domain/meta-media.port';
 import { validateMediaStructure } from './media-structure.validator';
 import {
+  safeErrnoOf,
+  withMetaFailureReason,
+} from './meta-media-failure-reason';
+import {
   defaultResolver,
   pinnedLookup,
   validateMetaMediaOrigin,
@@ -291,6 +295,20 @@ function composeMetadataUrl(
   return `${graphApiBaseUrl.replace(/\/+$/, '')}/${encodeURIComponent(providerMediaId)}`;
 }
 
+/** S2: the Graph metadata hop is allowed for exactly the host of the
+ *  configured Graph base URL — nothing else — so the shipped default download
+ *  allowlist never has to contain it and the download allowlist is never
+ *  widened by it. An unparseable base fails closed to the safe transport error. */
+function graphMetadataHost(graphApiBaseUrl: string): string {
+  try {
+    const host = new URL(graphApiBaseUrl).hostname;
+    if (host !== '') return host;
+  } catch {
+    // fall through to the fixed safe failure
+  }
+  throw transportFailure();
+}
+
 /** Axios maps its own bounded timeout to ECONNABORTED and a caller-signal
  *  abort to ERR_CANCELED; everything else is a plain network failure.
  *  Classification duck-types only the transport code — plain code strings
@@ -305,7 +323,9 @@ function mapTransportError(error: unknown): MetaMediaError {
     return new MetaMediaError('META_TRANSPORT', 'ABORTED');
   if (code === 'ECONNABORTED')
     return new MetaMediaError('META_TRANSPORT', 'TIMEOUT');
-  return transportFailure();
+  // The raw errno (ENETUNREACH, ECONNRESET, ...) goes to the safe side-channel
+  // only when it is a bare token; the error itself stays the fixed projection.
+  return withMetaFailureReason(transportFailure(), safeErrnoOf(error));
 }
 
 /** Fixed safe HTTP disposition (design: 408/429/5xx retryable, every other
@@ -443,11 +463,16 @@ export class MetaMediaClient {
         this.config.graphApiBaseUrl,
         request.providerMediaId,
       );
-      // Validates the full hop URL (HTTPS, no userinfo/query/fragment, port,
-      // allowlist) and requires public A/AAAA records; failures fail closed.
+      // Validates the full hop URL (HTTPS, no userinfo/query/fragment, port)
+      // against the Graph host ONLY (derived from the configured base URL,
+      // never from the download allowlist) and requires public A/AAAA
+      // records; failures fail closed. The query is never allowed here.
       const addresses = await validateMetaMediaOrigin(
         url,
-        this.config,
+        {
+          ...this.config,
+          allowedHosts: [graphMetadataHost(this.config.graphApiBaseUrl)],
+        },
         this.resolve,
       );
       const parsed = new URL(url);
@@ -529,10 +554,13 @@ export class MetaMediaClient {
       for (let followed = 0; ; followed += 1) {
         // Per-hop policy before any request construction or bearer on this hop;
         // a rejected target receives no bearer value and no network call.
+        // Download hops (and every redirect hop) use the download allowlist
+        // only and may carry Meta's signed query string; nothing else relaxes.
         const addresses = await validateMetaMediaOrigin(
           target,
           this.config,
           this.resolve,
+          { allowQuery: true },
         );
         const parsed = new URL(target);
         // A fresh pinned agent per hop: completed redirect and error hops are
