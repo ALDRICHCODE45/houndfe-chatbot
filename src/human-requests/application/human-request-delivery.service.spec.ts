@@ -240,6 +240,72 @@ describe('HumanRequestDeliveryService', () => {
       });
     });
 
+    // The receipt poller owns the customer notice (exactly-once via
+    // receipt_media.outcome_notified_at); a TRANSFER_RECEIPT decision that
+    // arrives with a conversationRef must never send a second message.
+    it.each<[string, RequestAnsweredItem['payload']]>([
+      [
+        'CONFIRM_RECEIPT',
+        {
+          kind: 'DECISION',
+          subtype: 'TRANSFER_RECEIPT',
+          action: 'CONFIRM_RECEIPT',
+          legacyId: 'receipt-1',
+          text: 'Confirmamos su pago.',
+          prefix: null,
+        },
+      ],
+      [
+        'REJECT_RECEIPT (STAFF)',
+        {
+          kind: 'DECISION',
+          subtype: 'TRANSFER_RECEIPT',
+          action: 'REJECT_RECEIPT',
+          legacyId: 'receipt-1',
+          text: 'No pudimos confirmar su comprobante.',
+          prefix: 'Te comparto la respuesta del equipo:',
+          customerReason: 'El monto no coincide.',
+          reasonSource: 'STAFF',
+          staffText: 'El monto no coincide.',
+        },
+      ],
+      [
+        'REJECT_RECEIPT (DEFAULT)',
+        {
+          kind: 'DECISION',
+          subtype: 'TRANSFER_RECEIPT',
+          action: 'REJECT_RECEIPT',
+          legacyId: 'receipt-1',
+          text: 'No pudimos confirmar su comprobante.',
+          prefix: null,
+          customerReason: 'El monto no coincide.',
+          reasonSource: 'DEFAULT',
+        },
+      ],
+    ])(
+      'TRANSFER_RECEIPT %s with a conversationRef: no send, LEGACY_PATH_DELIVERS, ACK STALE',
+      async (_label, payload) => {
+        const { service, sender, client, store } = setup();
+        await service.accept(answered('r1', payload));
+        expect(sender.sent).toEqual([]);
+        expect(client.acks).toEqual([
+          {
+            deliveryId: 'r1',
+            body: {
+              outcome: 'STALE',
+              attemptId: attemptId(1),
+              attemptedAt: NOW.toISOString(),
+            },
+          },
+        ]);
+        await expect(store.getDelivery('r1')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'LEGACY_PATH_DELIVERS',
+          ackState: 'ACKED',
+        });
+      },
+    );
+
     it('CLARIFICATION: styled prefix + verbatim text, ACK PROVIDER_ACCEPTED', async () => {
       const { service, sender, client, store, setStyle } = setup();
       setStyle(TU);
