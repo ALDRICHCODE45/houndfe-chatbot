@@ -14,6 +14,10 @@ import {
   type AskTeamOutcome,
 } from '../../human-requests/application/human-request-create.service';
 import {
+  paymentMethodButtons,
+  type CustomerReplyInteractive,
+} from '../domain/customer-reply';
+import {
   parseMinimalCart,
   type MinimalCartState,
 } from './minimal-cart.service';
@@ -23,6 +27,8 @@ export const MINIMAL_PAYMENT_QUESTION =
   'Para terminar solo falta el pago. ¿Cómo desea pagar?';
 /** Short body for the buttons when the reply text exceeds Meta's limit. */
 export const MINIMAL_PAYMENT_BUTTONS_PROMPT = '¿Cómo desea pagar?';
+/** The order is paid: no methods, no details, no team request (S6). */
+export const MINIMAL_PAYMENT_ALREADY_PAID_REPLY = 'Su pedido ya está pagado.';
 export const MINIMAL_PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos en este momento; ya le avisé al equipo y se los comparto en cuanto estén.';
 
@@ -51,6 +57,11 @@ type PlacedSale = NonNullable<MinimalCartState['placedSale']>;
 export interface MinimalPaymentReply {
   reply: string;
   paymentOffer?: { saleId: string };
+}
+
+/** The placed order as the customer sees it (S5); buttons only when unpaid. */
+export interface MinimalPlacedOrderStatus extends MinimalPaymentReply {
+  interactive?: CustomerReplyInteractive;
 }
 
 /** Where the request is anchored: the triggering inbound, when known. */
@@ -83,7 +94,32 @@ export class MinimalPaymentService {
   }
 
   /**
+   * S5: the sender's placed order (folio, total, payment status / next step).
+   * Unpaid: the payment-step lead and the method question, bound to the sale.
+   * `null`: no placed order.
+   */
+  async placedOrderStatus(
+    senderId: string,
+  ): Promise<MinimalPlacedOrderStatus | null> {
+    const sale = (await this.read(senderId))?.cart.placedSale;
+    if (sale === undefined) return null;
+    if (sale.paid === true)
+      return {
+        reply: `Pedido ${orderLabel(sale)}. Total: ${mxn(sale.totalCents)}.\n${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}`,
+      };
+    return {
+      reply: `${paymentLead(sale)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
+      interactive: paymentMethodButtons(
+        sale.saleId,
+        MINIMAL_PAYMENT_BUTTONS_PROMPT,
+      ),
+      paymentOffer: { saleId: sale.saleId },
+    };
+  }
+
+  /**
    * Bank details for the sender's placed order (`null`: no placed order).
+   * A paid order answers that it is paid: no details, marker or request.
    * A failed read tells the customer the team was notified, persists the
    * marker and creates ONE request per sale; a later success clears it.
    */
@@ -94,6 +130,8 @@ export class MinimalPaymentService {
     const read = await this.read(senderId);
     const sale = read?.cart.placedSale;
     if (sale === undefined) return null;
+    if (sale.paid === true)
+      return { reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY };
     let detail: PaymentDetail;
     try {
       detail = await this.api.getPaymentDetails();

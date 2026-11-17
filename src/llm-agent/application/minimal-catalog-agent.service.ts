@@ -89,6 +89,10 @@ import {
   type ProductImageContext,
 } from '../domain/customer-reply';
 import { PAYMENT_METHODS, matchPaymentMethod } from '../domain/payment-methods';
+import {
+  isOrderSummaryRequest,
+  isPaymentQuestion,
+} from '../domain/minimal-order-requests';
 import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
 import { MINIMAL_CHECKOUT_SUMMARY_HEADING } from '../domain/minimal-checkout-confirmation';
 import {
@@ -97,6 +101,7 @@ import {
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  MINIMAL_PAYMENT_ALREADY_PAID_REPLY,
   MinimalPaymentService,
   type MinimalPaymentReply,
 } from './minimal-payment.service';
@@ -345,6 +350,13 @@ const PAYMENT_INSTRUCTIONS_FRAGMENT =
   'responde con los datos; nunca los escriba ni los invente, y nunca use ' +
   'askTeam para esto.';
 
+// S6: the registered order is already paid; nothing to offer or escalate.
+const PAID_ORDER_INSTRUCTIONS_FRAGMENT =
+  '\n\nEl pedido registrado del cliente ya está pagado. Si pregunta cómo pagar, ' +
+  'por la cuenta, la CLABE, el banco o los datos de pago, responda ' +
+  `«${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}»; no ofrezca métodos de pago, no ` +
+  'invente datos y nunca use askTeam para esto.';
+
 const ASK_TEAM_TOOL_UUID = z.uuid();
 
 /** S6: the fixed usted copy for each create outcome (styled per customer). */
@@ -497,7 +509,8 @@ type ReorderRun = {
 };
 
 const REORDER_INSTRUCTIONS_FRAGMENT =
-  ' Si el cliente pide repetir un pedido anterior ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta.';
+  ' Use getLastOrder solo para un pedido ANTERIOR ya entregado o cerrado: si el cliente pide repetirlo ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta. ' +
+  'Si el cliente pide ver el resumen o el estado de SU pedido actual ("el resumen de mi pedido", "mi resumen", "ver mi pedido"), no llame getLastOrder: la aplicación muestra el resumen del pedido o carrito actual, o el pedido que ya registró; si no hay ninguno, dígalo y ofrezca ayudarle a armar su compra.';
 
 const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'lookupCheckoutCustomer',
@@ -949,6 +962,12 @@ export class MinimalCatalogAgentService {
           };
         }
       }
+      // S5/S6: the current order and a paid order are answered without the
+      // model; a typed message only (a tapped button has its own route).
+      if (input.interactiveReplyId === undefined) {
+        const answered = await this.answerOrderRequest(input);
+        if (answered !== null) return answered;
+      }
       if (this.checkoutAvailable()) {
         let delivery = await this.checkout!.consume(input);
         if (delivery !== null) this.order?.dismiss(input.senderId);
@@ -1195,15 +1214,19 @@ export class MinimalCatalogAgentService {
     senderId: string,
     text: string,
     style: CustomerStyle,
+    // S5: the same presentation without the stale-button lead.
+    lead: string | null = STALE_BUTTON_LEAD,
   ): Promise<MinimalCatalogAgentDecision> {
     const result = await this.cart?.view(senderId);
     const summary = result === undefined ? null : minimalCartReply(result);
+    const withLead = (body: string) =>
+      lead === null ? body : `${lead}\n\n${body}`;
     const reply = applyCustomerStyle(
       result?.ok === true && summary?.endsWith(MINIMAL_CART_SUMMARY_TAIL)
-        ? `${STALE_BUTTON_LEAD}\n\n${summary}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
+        ? `${withLead(summary)}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
         : summary === null || result?.ok !== true
           ? STALE_BUTTON_FALLBACK
-          : `${STALE_BUTTON_LEAD}\n\n${summary}`,
+          : withLead(summary),
       style,
     );
     const interactive =
@@ -1243,6 +1266,103 @@ export class MinimalCatalogAgentService {
           })),
         }
       : interactive;
+  }
+
+  /** True without a cart capability or when the stored cart has no lines. */
+  private async cartIsEmpty(senderId: string): Promise<boolean> {
+    return this.cart === undefined
+      ? true
+      : (await this.cart.storedLines(senderId)).length === 0;
+  }
+
+  /**
+   * S5/S6: typed requests about the customer's order, answered by the
+   * application once an order summary is pending or an order was placed.
+   * «Mi resumen» / «ver mi pedido» show the pending order summary (confirm
+   * button), else the current cart (next-step buttons) when one was started
+   * after an earlier order, else the order already placed (folio, total, paid
+   * or the payment step). A previous-order request is NOT one of them
+   * (getLastOrder keeps it), and neither is a cart-only customer (the model
+   * and its cart/checkout tools keep it). A payment question on a paid order
+   * answers that it is paid. `null` leaves the turn to the other routes.
+   */
+  private async answerOrderRequest(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const { senderId, text } = input;
+    const summaryAsked = isOrderSummaryRequest(text);
+    const paymentAsked = isPaymentQuestion(text);
+    if (!summaryAsked && !paymentAsked) return null;
+    // A delivery-data summary waiting for SÍ keeps the turn.
+    if (
+      this.checkoutAvailable() &&
+      this.checkout!.confirmationStatus(senderId)?.stage === 'pending'
+    )
+      return null;
+    const style = this.customerStyle(senderId, text);
+    const answer = (
+      result: MinimalCheckoutReply,
+      paymentOffer?: { saleId: string },
+    ): MinimalCatalogAgentDecision => {
+      const reply = applyCustomerStyle(result.reply, style);
+      this.recordTurn(
+        senderId,
+        [
+          { role: 'user', content: text },
+          { role: 'assistant', content: reply },
+        ],
+        [],
+        undefined,
+        undefined,
+        paymentOffer === undefined ? {} : { paymentOffer },
+      );
+      return {
+        kind: 'handled',
+        reply,
+        ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+        ...(result.interactive === undefined
+          ? {}
+          : { interactive: styleInteractivePrompt(result.interactive, style) }),
+      };
+    };
+    const pendingSummary =
+      this.orderAvailable() && this.order!.offerStatus(senderId) !== null;
+    const cartEmpty = await this.cartIsEmpty(senderId);
+    const placed =
+      this.payment === undefined
+        ? null
+        : await this.payment.placedSale(senderId);
+    if (paymentAsked && placed?.paid === true && cartEmpty && !pendingSummary) {
+      this.order?.dismiss(senderId);
+      return answer({ reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY });
+    }
+    if (!summaryAsked) return null;
+    // Without a pending summary or a placed order the model keeps the turn.
+    if (!pendingSummary && placed === null) return null;
+    if (pendingSummary) {
+      try {
+        return answer(
+          await this.order!.prepareOrder(senderId, input.inboundEvent),
+        );
+      } catch {
+        return null;
+      }
+    }
+    if (!cartEmpty) {
+      this.order?.dismiss(senderId);
+      return await this.representCartAfterStaleButton(
+        senderId,
+        text,
+        style,
+        null,
+      );
+    }
+    const status = await this.payment?.placedOrderStatus(senderId);
+    if (status === undefined || status === null) return null;
+    this.order?.dismiss(senderId);
+    return answer(status, status.paymentOffer);
   }
 
   /** The payment offer of the bot's latest message, if any. */
@@ -1603,10 +1723,16 @@ export class MinimalCatalogAgentService {
     const cartReply: CartReply = { attempted: false, value: null };
     const askTeamRun: ExpirationReply | null =
       this.team === undefined ? null : { attempted: false, value: null };
-    // Only a customer with a placed order can ask for its payment details.
+    // Only a customer with an unpaid placed order can ask for its payment
+    // details; once it is paid there is no payment tool (S6).
+    const placed =
+      this.payment === undefined
+        ? null
+        : await this.payment.placedSale(input.senderId);
+    const paidOrder =
+      placed?.paid === true && (await this.cartIsEmpty(input.senderId));
     const paymentRun: PaymentRun | null =
-      this.payment !== undefined &&
-      (await this.payment.placedSale(input.senderId)) !== null
+      placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
         : null;
     const checkoutRun: CheckoutRun | null =
@@ -1680,7 +1806,7 @@ export class MinimalCatalogAgentService {
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
         (checkoutRun === null
           ? 'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. '
-          : 'Si el cliente quiere comprar o continuar con la compra, NO llame reviewCheckout: llame lookupCheckoutCustomer (ver Datos de entrega). Llame reviewCheckout sin argumentos solo si pide revisar su compra o cuánto lleva. ') +
+          : 'Si el cliente quiere comprar o continuar con la compra, NO llame reviewCheckout: llame lookupCheckoutCustomer (ver Datos de entrega). Llame reviewCheckout sin argumentos solo si pide revisar cuánto lleva su carrito; el resumen de su pedido pendiente o ya registrado lo muestra la aplicación, no esta herramienta. ') +
         'reviewCheckout es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
         (checkoutRun === null ? '' : CHECKOUT_INSTRUCTIONS_FRAGMENT) +
         (checkoutRun !== null && this.orderAvailable()
@@ -1708,6 +1834,7 @@ export class MinimalCatalogAgentService {
         cartInstructions +
         (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
+        (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),

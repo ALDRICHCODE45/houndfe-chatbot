@@ -134,3 +134,22 @@ The order-created reply no longer carries bank data. It is `¡Listo! ` + the cre
 | A later payment question or yes while the marker is set                                                                                                               | The fetch is retried; repeated failures create no second request; a success clears the marker and sends the details                                                                                                                                                                                                                                   |
 
 The marker is written before the request is created; if the request cannot be created (`failed`), the marker is removed so the next failure tries again. `placedSale` stays strict, with `paymentPending` optional, so orders stored before this change keep parsing and the receipt routing (`readPlacedOrder`) ignores the marker.
+
+### Order summary requests (S5)
+
+"Muéstrame el resumen de mi pedido", "mi resumen", "ver mi pedido" are answered by the application, without the model, once an order summary is pending or an order was placed (`isOrderSummaryRequest`, `src/llm-agent/domain/minimal-order-requests.ts`; typed messages only):
+
+| State                                                              | Reply                                                                                                                                                                                           |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| An order summary is pending (waiting for SÍ)                       | The current summary again (`prepareOrder`: fresh prices, new confirm reference) with the confirm buttons; a SÍ or tap confirms it as usual                                                      |
+| A new cart exists after an earlier order and no summary is pending | The cart with the next-step buttons (no stale-button lead)                                                                                                                                      |
+| An order was placed (`placedSale`) and the cart is empty           | `Pedido con folio <folio>. Total a pagar: <total>.` + the payment question with the method button (unpaid), or `Pedido con folio <folio>. Total: <total>.` + `Su pedido ya está pagado.` (paid) |
+| A delivery-data summary is pending, or none of the above           | Not answered here; the model keeps the turn                                                                                                                                                     |
+
+Only a previous-order request ("pedido anterior", "la última vez", "lo mismo que la vez pasada", "lo de siempre") uses `getLastOrder` (reorder flow, unchanged). "Revisar mi compra" keeps the `reviewCheckout` flow. The model prompt tells it to use `getLastOrder` only for a previous order and that the current summary is shown by the application.
+
+### Paid orders (S6)
+
+When the receipt outcome poller (see `docs/receipt-media-operations.md`, "Human outcome") records a `CONFIRMED` receipt with `debtCents = 0`, it marks that conversation's `placedSale` as paid: `placedSale.paid: true` (optional in `placedSaleSchema`, so orders stored before this field read as unpaid) and `paymentPending` is cleared. The write is one CAS on the cart slot (`markPlacedSalePaid`, one retry), keeps the rest of the cart and the idle clock, and is best effort: it runs after the notice is recorded and never delays or fails it. A `PARTIAL` confirmation (`debtCents > 0`) and a `REJECTED` receipt leave the order unpaid. A new order replaces `placedSale`, so it starts unpaid.
+
+While the order is paid (and the cart is empty): no payment-method offer, no `getPaymentDetails` tool, and a payment question ("¿cómo pago?", "datos de pago", "la CLABE", "transferencia", a stale `Transferencia` button) is answered `Su pedido ya está pagado.` (`Tu pedido ya está pagado.` for a tú customer) without the model, without fetching bank details and without an `askTeam` request. The model prompt says the same for any other phrasing.

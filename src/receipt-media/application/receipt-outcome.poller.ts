@@ -14,7 +14,13 @@ export type ReceiptOutcomePollerPorts = Pick<
   ChatbotApiClient,
   'getReceiptOutcome'
 > &
-  Pick<CustomerInboundObservationStore, 'readLatest'>;
+  Pick<CustomerInboundObservationStore, 'readLatest'> & {
+    /**
+     * S6: the placed sale of this conversation is fully paid. Best effort and
+     * optional: its result is ignored and it never delays the notice.
+     */
+    markSalePaid?: (senderId: string, saleId: string) => Promise<unknown>;
+  };
 
 export interface ReceiptOutcomePollerOptions {
   /** Tick period; also the base gap between reads of one receipt. */
@@ -135,7 +141,7 @@ export class ReceiptOutcomePoller {
       this.logger.warn(
         'receipt outcome recorded outside the 24 h window; not delivered',
       );
-    await this.store.commitOutcome({
+    const committed = await this.store.commitOutcome({
       id: row.id,
       status: outcome.status,
       customerReason: outcome.customerReason,
@@ -143,6 +149,29 @@ export class ReceiptOutcomePoller {
       delivery: inside ? 'QUEUED' : 'OUTSIDE_WINDOW',
       ...template,
     });
+    // Debt-free CONFIRMED (the same rule as RECEIPT_PAYMENT_CONFIRMED): the
+    // conversation's placed order is paid. After the notice is recorded, and
+    // fire-and-forget so a slow or failing write never blocks it.
+    if (
+      committed.kind === 'committed' &&
+      outcome.status === 'CONFIRMED' &&
+      outcome.sale.debtCents === 0
+    )
+      this.markSalePaid(row);
+  }
+
+  private markSalePaid(row: ReceiptOutcomeCandidate): void {
+    const mark = this.ports.markSalePaid;
+    if (mark === undefined) return;
+    const failed = () =>
+      this.logger.warn('placed sale paid mark failed; order stays unpaid');
+    try {
+      void Promise.resolve(mark(row.senderId, row.capturedSaleId)).catch(
+        failed,
+      );
+    } catch {
+      failed();
+    }
   }
 
   private insideCustomerWindow(senderId: string): Promise<boolean> {

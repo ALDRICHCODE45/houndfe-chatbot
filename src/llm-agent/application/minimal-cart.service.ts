@@ -37,6 +37,9 @@ const placedSaleSchema = z.strictObject({
   // The customer chose to pay but the bank details could not be read; the
   // team was asked once. Absent in orders stored before the payment step.
   paymentPending: z.literal(true).optional(),
+  // The receipt outcome poller saw a CONFIRMED receipt with no debt left.
+  // Absent in orders stored before this field: absent means unpaid.
+  paid: z.literal(true).optional(),
 });
 const cartSchema = z.strictObject({
   items: z.array(lineSchema),

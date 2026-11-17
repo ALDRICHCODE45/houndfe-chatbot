@@ -437,7 +437,7 @@ const isUploadTemplateArgs = (args: UploadTemplateArgs): boolean =>
  * receipt without a recorded outcome is due when never polled, or when its
  * last read is older than the gap (slow gap once long-pending). */
 const OUTCOME_DUE_SQL = `SELECT id, sender_id, backend_receipt_id, sale_folio,
-    attached_at, outcome_polled_at FROM receipt_media
+    captured_sale_id, attached_at, outcome_polled_at FROM receipt_media
   WHERE status = 'ATTACHED' AND outcome_notified_at IS NULL
     AND backend_receipt_id IS NOT NULL
     AND (outcome_polled_at IS NULL OR outcome_polled_at <= now() -
@@ -1201,6 +1201,7 @@ export class PostgresReceiptMediaStore
       senderId: r.sender_id as string,
       backendReceiptId: r.backend_receipt_id as string,
       saleFolio: (r.sale_folio as string | null) ?? null,
+      capturedSaleId: r.captured_sale_id as string,
       attachedAt: r.attached_at as Date,
       outcomePolledAt: (r.outcome_polled_at as Date | null) ?? null,
     }));

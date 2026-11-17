@@ -30,6 +30,8 @@ export interface ReceiptOutcomeCandidate {
   senderId: string;
   backendReceiptId: string;
   saleFolio: string | null;
+  /** The sale the receipt was captured for (the conversation's placed sale). */
+  capturedSaleId: string;
   attachedAt: Date;
   outcomePolledAt: Date | null;
 }
