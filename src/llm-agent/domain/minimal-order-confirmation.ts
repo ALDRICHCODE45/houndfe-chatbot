@@ -308,13 +308,20 @@ function deliveryLine(snapshot: MinimalOrderSnapshot): string {
     .join(', ');
 }
 
-/** Shipping block of the summary: carrier, charge, credit and ETA (S3/S7). */
+/**
+ * Shipping block of the summary: carrier, charge, credit and ETA (S3/S7),
+ * always closed by «Total a pagar» (products + the customer's shipping
+ * charge; free shipping and store pickup included).
+ */
 function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   const shipping = snapshot.shipping;
   // Every presented snapshot carries a quote or pickup (`freshOrder`).
   if (shipping === undefined) return [];
   if (!('quoteId' in shipping))
-    return ['Recoge en tienda (sin costo de envío)'];
+    return [
+      'Recoge en tienda (sin costo de envío)',
+      `Total a pagar: ${mxn(snapshot.totalCents)}`,
+    ];
   const carrier = shipping.option
     ? ` con ${shipping.option.carrier} (${shipping.option.service})`
     : '';
@@ -329,11 +336,7 @@ function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
         ]
       : []),
     ...(eta === null ? [] : [eta]),
-    ...(shipping.customerChargeCents === 0
-      ? []
-      : [
-          `Total a pagar: ${mxn(snapshot.totalCents + shipping.customerChargeCents)}`,
-        ]),
+    `Total a pagar: ${mxn(snapshot.totalCents + shipping.customerChargeCents)}`,
   ];
 }
 

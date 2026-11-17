@@ -1230,7 +1230,7 @@ describe('minimal shipping order safety', () => {
     await shippingRecord(h, { creditCents: 5000, customerChargeCents: 0 });
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('sin costo para usted');
-    expect(offer.reply).not.toContain('Total a pagar');
+    expect(offer.reply).toContain('Total a pagar: $1200.00 MXN');
     expect(offer.reply).not.toContain('no está incluido');
     const result = await yes(h);
     const payload = (
@@ -2315,7 +2315,7 @@ describe('minimal store pickup order (U4, S4)', () => {
     const offer = await offerOrder(h);
     expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
     expect(offer.reply).toContain('Total de productos: $30.00 MXN');
-    expect(offer.reply).not.toContain('Total a pagar');
+    expect(offer.reply).toContain('Total a pagar: $30.00 MXN');
     const result = await yes(h);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     const payload = (

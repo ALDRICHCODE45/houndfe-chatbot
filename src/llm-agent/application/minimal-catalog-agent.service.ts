@@ -2399,6 +2399,12 @@ export class MinimalCatalogAgentService {
     senderId: string,
     inboundEvent: unknown,
     lead: string | null,
+    /**
+     * S3: the shipping notice of a quote that just succeeded. The summary
+     * repeats the cost and the ETA, so it is sent only when no summary
+     * follows (the customer must still hear the quote).
+     */
+    quoteNotice: string | null = null,
   ): Promise<MinimalCheckoutReply> {
     const join = (...parts: Array<string | null>) =>
       parts.filter((part): part is string => part !== null).join('\n\n');
@@ -2414,7 +2420,12 @@ export class MinimalCatalogAgentService {
       first.reply !== MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY ||
       !this.shippingAvailable()
     )
-      return withLead(lead, first);
+      return withLead(
+        first.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING)
+          ? lead
+          : join(lead, quoteNotice),
+        first,
+      );
     let quoted: MinimalShippingResult;
     try {
       quoted = await this.shipping!.quote(senderId);
@@ -2423,9 +2434,12 @@ export class MinimalCatalogAgentService {
     }
     const shippingLine = minimalShippingReply(quoted);
     if (quoted.kind !== 'quoted') return { reply: join(lead, shippingLine) };
+    const summary = await this.order!.prepareOrder(senderId, inboundEvent);
     return withLead(
-      join(lead, shippingLine),
-      await this.order!.prepareOrder(senderId, inboundEvent),
+      summary.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING)
+        ? lead
+        : join(lead, shippingLine),
+      summary,
     );
   }
 
@@ -3275,6 +3289,7 @@ export class MinimalCatalogAgentService {
                             ? await this.continueToOrder(
                                 context.senderId,
                                 context.inboundEvent,
+                                null,
                                 minimalShippingReply(result),
                               )
                             : { reply: minimalShippingReply(result) };
