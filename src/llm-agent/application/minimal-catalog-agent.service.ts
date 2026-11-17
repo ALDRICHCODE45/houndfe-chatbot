@@ -758,8 +758,21 @@ function availabilityInstruction(
   );
   if (!agotado && !unverified) return null;
   const parts: string[] = [];
+  // Owner choice «Vendedor» (2026-11-17): sell what is in stock first; the
+  // restock offer names only the agotado product, in its own sentence.
+  const someAvailable = availability.some(
+    (a) =>
+      a.status === 'available' ||
+      a.status === 'low_stock' ||
+      a.status === 'not_managed',
+  );
   if (agotado)
     parts.push(
+      ...(someAvailable && restockOffer
+        ? [
+            'La pregunta principal del cierre es sobre las opciones DISPONIBLES; la reposición va en una frase aparte que nombra solo el producto agotado, nunca preguntes por la reposición de «estas opciones». Cierra con este estilo: «¿Cuál le gustaría llevar? Y si la que busca es {producto agotado}, con gusto le averiguo cuándo nos vuelve a llegar.»',
+          ]
+        : []),
       'Existencias tomadas de la lectura en vivo del catálogo. Un producto con availability.status "out_of_stock" está AGOTADO: dilo explícitamente con la palabra «agotado», nunca lo presentes como disponible y nunca lo agregues al carrito. Con variantes, di cuáles presentaciones están agotadas (agotado_presentations) y cuáles no.',
       restockOffer
         ? 'Ofrece el aviso de reposición: pregunta si quiere que se le consulte al equipo cuándo vuelve a llegar, sin prometer fecha ni aviso; si acepta, llama prepareRestock con su productId EXACTO (y variantId si la presentación importa). No llames prepareRestock en esta respuesta.'

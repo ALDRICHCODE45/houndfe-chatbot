@@ -689,6 +689,25 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(withRestock.out.availability_instruction).toContain('equipo');
     });
 
+    it('with available options next to an agotado one, the closing question sells the available ones and offers restock only for the agotado product (owner choice «Vendedor»)', async () => {
+      const mixed = await search([product(1, AVAILABLE), product(2, OUT)], {
+        restock: true,
+      });
+      expect(mixed.out.availability_instruction).toContain(
+        'La pregunta principal del cierre es sobre las opciones DISPONIBLES',
+      );
+      expect(mixed.out.availability_instruction).toContain(
+        '«¿Cuál le gustaría llevar? Y si la que busca es {producto agotado}, con gusto le averiguo cuándo nos vuelve a llegar.»',
+      );
+      expect(mixed.out.availability_instruction).toContain(
+        'nunca preguntes por la reposición de «estas opciones»',
+      );
+      const onlyAgotado = await search([product(1, OUT)], { restock: true });
+      expect(onlyAgotado.out.availability_instruction).not.toContain(
+        'La pregunta principal del cierre',
+      );
+    });
+
     it('available matches come first: an agotado product does not displace an available one from the 3', async () => {
       const { out, chatbotApi } = await search([
         product(1, OUT),
