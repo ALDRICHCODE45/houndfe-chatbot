@@ -249,7 +249,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     await expect(
       checkStock.execute({ productId: OUTSIDE }, {}),
     ).resolves.toEqual({ ok: false, error: 'unknown_product' });
-    expect(chatbotApi.getStock).not.toHaveBeenCalled();
+    // S11: searches read fresh stock for the shown products; an unknown id is
+    // still never read.
+    expect(chatbotApi.getStock).not.toHaveBeenCalledWith(OUTSIDE);
 
     await expect(
       checkStock.execute({ productId: PRODUCT }, {}),
@@ -513,6 +515,282 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     });
   });
 
+  describe('S11 out-of-stock options (code-derived availability)', () => {
+    const pid = (n: number) =>
+      `bbbbbbbb-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    type S11Out = {
+      ok: boolean;
+      results: Array<{
+        productId: string;
+        availability: { status: string; agotado_presentations?: string[] };
+        variants: Array<{ availability: string }>;
+      }>;
+      availability_instruction?: string;
+      more_results?: number;
+    };
+    const OUT = { status: 'out_of_stock', quantity: 0 };
+    const AVAILABLE = { status: 'available', quantity: 7 };
+    const product = (
+      n: number,
+      stock: { status: string; quantity: number | null },
+      extra: Record<string, unknown> = {},
+    ) => ({
+      ...simpleItem,
+      productId: pid(n),
+      name: `Pedigree ${n}`,
+      description: `Alimento ${n}`,
+      stock,
+      variants: [],
+      ...extra,
+    });
+    const freshFor =
+      (reads: Record<string, unknown>) =>
+      async (productId: string): Promise<unknown> => {
+        const read = reads[productId];
+        if (read === undefined) throw new Error('leaked detail');
+        return read;
+      };
+    const stockOf = (
+      n: number,
+      stock: { status: string; quantity: number | null },
+      variants: unknown[] = [],
+    ) => ({ productId: pid(n), name: `Pedigree ${n}`, stock, variants });
+    const INBOUND = {
+      receivingPhoneNumberId: '123456789012345',
+      senderId: SENDER,
+      messageId: 'wamid.S11',
+    };
+    const restockWiring = (api: ChatbotApiClient) =>
+      new MinimalRestockRequestService({
+        chatbotApi: api,
+        store: { get: jest.fn(async () => null) } as never,
+        restock: {
+          markers: {
+            readForSender: jest.fn(async () => ({
+              legacyRequestPending: false,
+              restockIntentPresent: false,
+            })),
+          },
+          coordinator: { coordinate: jest.fn() },
+          recovery: { recover: jest.fn() },
+        },
+      });
+    const search = async (
+      items: unknown[],
+      reads: Record<string, unknown>,
+      opts: { restock?: boolean; q?: string } = {},
+    ) => {
+      const { service, chatbotApi, captured } = build(
+        flow,
+        opts.restock === true ? { restock: restockWiring } : {},
+      );
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'busca',
+        ...(opts.restock === true ? { inboundEvent: INBOUND } : {}),
+      });
+      chatbotApi.searchCatalog.mockReset().mockResolvedValue(items as never);
+      chatbotApi.getStock
+        .mockReset()
+        .mockImplementation(freshFor(reads) as never);
+      const out = (await captured[0].tools!.searchCatalog.execute(
+        { q: opts.q ?? 'croquetas pedigree' },
+        {},
+      )) as S11Out;
+      return { out, chatbotApi, captured };
+    };
+    const ids = (out: S11Out) =>
+      (out.results as Array<{ productId: string }>).map((r) => r.productId);
+
+    it('prod case: croquetas pedigree whose lata has 0 units is marked out_of_stock with an agotado instruction', async () => {
+      const lata = product(1, OUT, {
+        name: 'Pedigree Adulto Trozos de Res en Salsa lata',
+      });
+      const { out, chatbotApi } = await search([lata], {
+        [pid(1)]: stockOf(1, OUT),
+      });
+      expect(chatbotApi.getStock).toHaveBeenCalledWith(pid(1));
+      expect(out.results[0].availability).toMatchObject({
+        status: 'out_of_stock',
+      });
+      expect(out.availability_instruction).toEqual(
+        expect.stringContaining('agotado'),
+      );
+      expect(out.availability_instruction).toEqual(
+        expect.stringContaining('nunca'),
+      );
+      // The stock-stripping boundary is unchanged: no stock/quantity leaks.
+      expect(JSON.stringify(out)).not.toContain('"stock"');
+      expect(JSON.stringify(out)).not.toContain('quantity');
+    });
+
+    it('offers the existing restock flow only when it exists; never promises it otherwise', async () => {
+      const read = { [pid(1)]: stockOf(1, OUT) };
+      const without = await search([product(1, OUT)], read);
+      expect(without.out.availability_instruction).not.toContain(
+        'prepareRestock',
+      );
+      expect(without.out.availability_instruction).toContain('no prometas');
+      const withRestock = await search([product(1, OUT)], read, {
+        restock: true,
+      });
+      expect(withRestock.captured[0].tools).toHaveProperty('prepareRestock');
+      expect(withRestock.out.availability_instruction).toContain(
+        'prepareRestock',
+      );
+      expect(withRestock.out.availability_instruction).toContain('equipo');
+    });
+
+    it('with presentations: availability per variant and the agotado ones named', async () => {
+      const item = product(1, AVAILABLE, {
+        variants: [
+          { ...variant, variantId: VARIANT, name: 'Lata', stock: OUT },
+          { ...variant, variantId: OUTSIDE, name: 'Bolsa', stock: AVAILABLE },
+        ],
+      });
+      const { out } = await search([item], {
+        [pid(1)]: stockOf(1, AVAILABLE, [
+          {
+            variantId: VARIANT,
+            name: 'Lata',
+            option: null,
+            value: null,
+            stock: OUT,
+          },
+          {
+            variantId: OUTSIDE,
+            name: 'Bolsa',
+            option: null,
+            value: null,
+            stock: AVAILABLE,
+          },
+        ]),
+      });
+      expect(out.results[0].availability).toEqual({
+        status: 'available',
+        agotado_presentations: ['Lata'],
+      });
+      expect(out.results[0].variants.map((v) => v.availability)).toEqual([
+        'out_of_stock',
+        'available',
+      ]);
+      expect(out.availability_instruction).toEqual(
+        expect.stringContaining('presentaciones'),
+      );
+    });
+
+    it('available matches come first: an agotado product does not displace an available one from the 3', async () => {
+      const items = [
+        product(1, OUT),
+        product(2, AVAILABLE),
+        product(3, AVAILABLE),
+        product(4, AVAILABLE),
+      ];
+      const reads = Object.fromEntries(
+        [1, 2, 3, 4].map((n) => [
+          pid(n),
+          stockOf(n, n === 1 ? OUT : AVAILABLE),
+        ]),
+      );
+      const { out, chatbotApi } = await search(items, reads);
+      expect(ids(out)).toEqual([pid(2), pid(3), pid(4)]);
+      expect(out.more_results).toBe(1);
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(3);
+    });
+
+    it('an agotado product is still shown (last) when there is room', async () => {
+      const { out } = await search([product(1, OUT), product(2, AVAILABLE)], {
+        [pid(1)]: stockOf(1, OUT),
+        [pid(2)]: stockOf(2, AVAILABLE),
+      });
+      expect(ids(out)).toEqual([pid(2), pid(1)]);
+      expect(out.results[1].availability.status).toBe('out_of_stock');
+    });
+
+    it('a full match that is agotado still precedes a partial alternative', async () => {
+      const { out } = await search(
+        [
+          product(1, AVAILABLE, { match: 'partial' }),
+          product(2, OUT, { match: 'all' }),
+        ],
+        { [pid(1)]: stockOf(1, AVAILABLE), [pid(2)]: stockOf(2, OUT) },
+      );
+      expect(ids(out)).toEqual([pid(2), pid(1)]);
+    });
+
+    it('reads fresh stock in parallel and only for the offered products (bounded)', async () => {
+      const items = Array.from({ length: 10 }, (_, n) => product(n, AVAILABLE));
+      const { service, chatbotApi, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      chatbotApi.searchCatalog.mockReset().mockResolvedValue(items as never);
+      let started = 0;
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => (release = resolve));
+      chatbotApi.getStock.mockReset().mockImplementation((async (
+        id: string,
+      ) => {
+        started += 1;
+        if (started === 3) release();
+        await barrier; // sequential reads would never reach 3 and hang
+        return stockOf(Number(id.slice(-12)), AVAILABLE);
+      }) as never);
+      const out = (await captured[0].tools!.searchCatalog.execute(
+        { q: 'croquetas' },
+        {},
+      )) as S11Out;
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(3);
+      expect(out.results).toHaveLength(3);
+    });
+
+    it('a failed fresh read is unverified (neither agotado nor available) and leaks nothing', async () => {
+      const { out } = await search([product(1, OUT), product(2, AVAILABLE)], {
+        [pid(2)]: stockOf(2, AVAILABLE),
+      });
+      expect(out.ok).toBe(true);
+      const byId = Object.fromEntries(
+        out.results.map((r) => [r.productId, r.availability.status]),
+      );
+      expect(byId).toEqual({ [pid(1)]: 'unverified', [pid(2)]: 'available' });
+      expect(out.availability_instruction).toEqual(
+        expect.stringContaining('unverified'),
+      );
+      expect(JSON.stringify(out)).not.toContain('leaked');
+    });
+
+    it('adds no availability instruction when everything shown is available', async () => {
+      const { out } = await search([product(1, AVAILABLE)], {
+        [pid(1)]: stockOf(1, AVAILABLE),
+      });
+      expect(out.results[0].availability).toEqual({ status: 'available' });
+      expect(out).not.toHaveProperty('availability_instruction');
+    });
+
+    it('traces only counts for the availability read, never ids or names', async () => {
+      const logs = captureLogs();
+      await search([product(1, OUT), product(2, AVAILABLE)], {
+        [pid(1)]: stockOf(1, OUT),
+      });
+      const line = logs
+        .filter((l) => l.includes('searchCatalog availability'))
+        .at(-1);
+      expect(line).toMatch(
+        /tool searchCatalog availability checked=2 agotado=1 unverified=1 trace=[0-9a-f-]+$/,
+      );
+      expect(line).not.toContain(pid(1));
+      expect(line).not.toContain('Pedigree');
+    });
+
+    it('the prompt demands agotado, the restock offer and no agotado cart adds', async () => {
+      const { service, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      const system = JSON.stringify(captured[0].system);
+      expect(system).toContain('availability');
+      expect(system).toContain('agotado');
+      expect(system).toContain('nunca lo agregues al carrito');
+      expect(system).toContain('cuáles presentaciones');
+    });
+  });
+
   it('traces route entry and tool outcomes with one generated id per run, no raw data', async () => {
     const { service } = build(flow);
     const logs = captureLogs();
@@ -562,7 +840,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     await expect(
       checkStock.execute({ productId: OUTSIDE }, {}),
     ).resolves.toEqual({ ok: false, error: 'unknown_product' });
-    expect(chatbotApi.getStock).not.toHaveBeenCalled();
+    // S11: searches read fresh stock for the shown products; an unknown id is
+    // still never read.
+    expect(chatbotApi.getStock).not.toHaveBeenCalledWith(OUTSIDE);
     await expect(
       checkStock.execute({ productId: PRODUCT }, {}),
     ).resolves.toMatchObject({
@@ -574,14 +854,18 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       await service.tryHandle({ senderId: SENDER, text: 'busca' });
       return captured.at(-1)!.tools!.checkStock;
     };
+    // S11: each fresh run's search also reads stock, so the one-off outcomes
+    // are queued only AFTER the run's tools are obtained.
+    const bogusRun = await freshCheckStock();
     chatbotApi.getStock.mockResolvedValueOnce({
       ...notManaged,
       stock: { status: 'bogus', quantity: 'x' },
     } as never);
-    await (await freshCheckStock()).execute({ productId: PRODUCT }, {});
+    await bogusRun.execute({ productId: PRODUCT }, {});
+    const failingRun = await freshCheckStock();
     chatbotApi.getStock.mockRejectedValueOnce(new Error('leaked detail'));
     await expect(
-      (await freshCheckStock()).execute({ productId: PRODUCT }, {}),
+      failingRun.execute({ productId: PRODUCT }, {}),
     ).resolves.toEqual({ ok: false, error: 'stock_unavailable' });
     const joined = logs.join('\n');
     expect(joined).toContain(
@@ -614,7 +898,8 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       reply: 'Revisé las existencias del producto.',
     });
     expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(2);
-    expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+    // S11: one fresh availability read per search + the checkStock read.
+    expect(chatbotApi.getStock).toHaveBeenCalledTimes(3);
     expect(captured[1].messages!.map((m) => m.role)).toEqual([
       'user',
       'assistant',
@@ -811,7 +1096,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       await service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' });
       await service.tryHandle({ senderId: OTHER, text: 'esa' });
       expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
-      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+      // S11: only the searching sender's availability read; the other sender's
+      // checkStock never reaches the backend.
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
       expect(JSON.stringify(results[1].responseMessages)).toContain(
         'unknown_product',
       );
@@ -834,7 +1121,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       await service.tryHandle({ senderId: SENDER, text: 'bu' });
       await service.tryHandle({ senderId: SENDER, text: 'sí' });
       await service.tryHandle({ senderId: SENDER, text: 'y el stock' });
-      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+      // S11: the turn-1 search availability read + the one checkStock read (the
+      // expired identity in turn 3 reads nothing).
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(2);
       expect(chatbotApi.getStock).toHaveBeenCalledWith(PRODUCT);
       expect(JSON.stringify(results[1].responseMessages)).toContain(
         '"out_of_stock"',
@@ -932,7 +1221,9 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       ).rejects.toThrow('model down');
       await service.tryHandle({ senderId: SENDER, text: 'b' });
       expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
-      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+      // S11: only the failed turn's availability read; the unpersisted
+      // identity is never checked.
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1030,7 +1321,8 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       });
       expect(second).toMatchObject({ kind: 'handled', reply: QUESTION });
       expect(String(captured[1].system)).toContain('prepareRestock');
-      expect(chatbotApi.getStock).toHaveBeenCalledTimes(2);
+      // S11: turn-1 search availability read + the two turn-2 reads.
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(3);
       expect(w.coordinate).not.toHaveBeenCalled();
       if (second.kind !== 'handled') throw new Error('expected handled');
       second.onSent?.();

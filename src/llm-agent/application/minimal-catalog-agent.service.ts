@@ -156,6 +156,11 @@ import {
   searchWithBroadening,
   type BroadenedSearchInfo,
 } from '../domain/minimal-catalog-search-broadening';
+import {
+  deriveAvailability,
+  preferInStock,
+  type ItemAvailability,
+} from '../domain/minimal-catalog-availability';
 import { limitCatalogOptions } from '../domain/minimal-catalog-relevance';
 import {
   MinimalRestockRequestService,
@@ -195,7 +200,7 @@ const CART_TRACE_ERROR_CODES = new Set([
 
 const INSTRUCTIONS =
   'Ruta experimental de solo lectura: usa searchCatalog para localizar productos por nombre; ' +
-  'la búsqueda NUNCA prueba existencias. Cuando el cliente confirme un producto ya ' +
+  'la búsqueda no prueba por sí sola que un producto esté disponible. Cuando el cliente confirme un producto ya ' +
   'identificado en esta conversación, llama checkStock directo con su productId EXACTO; ' +
   'si aún no lo está o la identidad expiró, búscalo primero. En productos con variantes ' +
   'informa existencias por variante; no iguales la del producto con la de la variante. ' +
@@ -211,6 +216,7 @@ const INSTRUCTIONS =
   'Si searchCatalog no devuelve resultados, no concluyas que no existe: la aplicación ya reintenta sola con las palabras clave. Si aun así queda vacío, haz UNA sola búsqueda más amplia con el nombre principal (marca o producto, sin dosis, presentación ni palabras genéricas) y nunca repitas la misma consulta; si sigue vacío, di que no lo encontraste y pregunta qué producto busca. ' +
   'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: dilo claro ("Croquetas Pedigree no encontré; de Pedigree tengo …") y enumera esas opciones como alternativas, sin afirmar que son lo solicitado. Un error de lectura no es "sin resultados". ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada"; un producto que coincide y resulta agotado se sigue mostrando, como agotado, como alternativa. ' +
+  'Cada producto de searchCatalog trae availability, verificada por la aplicación en esa lectura (por presentación si tiene variantes): si es out_of_stock, o una presentación aparece en agotado_presentations, di explícitamente que está agotado, indicando cuáles presentaciones están agotadas y cuáles no, nunca lo presentes como disponible y nunca lo agregues al carrito; sigue availability_instruction para ofrecer el aviso de reposición cuando exista. availability "unverified" no es agotado ni disponible: no lo afirmes, confírmalo con checkStock. ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
   'no una aprobación humana previa a existencias. No inventes fechas de reposición ni ' +
@@ -303,7 +309,9 @@ const RESTOCK_INSTRUCTIONS_FRAGMENT =
   'checkStock lo devuelva agotado (out_of_stock con cantidad 0), sin esperar a ' +
   'que pregunte por una fecha. No la uses para una simple búsqueda inicial ' +
   'del catálogo, ni cuando el stock sea not_managed o available, ni cuando la ' +
-  'lectura falle; la selección del producto NO autoriza el registro. Incluye ' +
+  'lectura falle; la selección del producto NO autoriza el registro. Excepción: ' +
+  'si searchCatalog marcó un producto como agotado y tú ofreciste consultar al ' +
+  'equipo, cuando el cliente acepte llama a prepareRestock. Incluye ' +
   'el variantId cuando la presentación importe. Ella no registra: solo ' +
   'PREPARA la confirmación y la aplicación pide el consentimiento; nunca ' +
   'afirmes que la consulta ya quedó registrada. No inventes una fecha de ' +
@@ -688,7 +696,8 @@ const CART_VARIANT_GUIDANCE =
   'Si falta la referencia, haga una lectura verificada antes de preparar o modificar; nunca invente una referencia ni copie la de otro renglón. Si falta la presentación elegida, pregunte; no la deduzca. ' +
   'Tras invalid_variant, no repita la llamada con la misma identidad ni pruebe IDs al azar; consulte el catálogo o solicite aclaración. Un rechazo no confirma ningún cambio.';
 
-// Identity + price projection with product and variant stock stripped. Each
+// Identity + price projection with product and variant stock stripped; the
+// only availability it carries is the app-derived one (S11). Each
 // verified identity is registered through `register` (the sender's opaque
 // selection registry) so the model can reference it without ever seeing or
 // inventing a cart UUID.
@@ -732,16 +741,58 @@ const CATALOG_PARTIAL_ALTERNATIVE_NOTE =
 const CATALOG_NO_FULL_MATCH_NOTE =
   'Ningún producto cumple todo lo pedido (todos son match "partial"). Dilo claro y ofrece lo más cercano etiquetado como alternativa, no como lo solicitado.';
 
-function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
+/** S11: shipped when an offered product is agotado or could not be verified. */
+function availabilityInstruction(
+  availability: readonly ItemAvailability[],
+  restockOffer: boolean,
+): string | null {
+  const agotado = availability.some(
+    (a) => a.status === 'out_of_stock' || a.agotadoPresentations.length > 0,
+  );
+  const unverified = availability.some(
+    (a) =>
+      a.status === 'unverified' ||
+      a.variants.some((v) => v.status === 'unverified'),
+  );
+  if (!agotado && !unverified) return null;
+  const parts: string[] = [];
+  if (agotado)
+    parts.push(
+      'Existencias verificadas por la aplicación en esta lectura. Un producto con availability.status "out_of_stock" está AGOTADO: dilo explícitamente con la palabra «agotado», nunca lo presentes como disponible y nunca lo agregues al carrito. Con variantes, di cuáles presentaciones están agotadas (agotado_presentations) y cuáles no.',
+      restockOffer
+        ? 'Ofrece el aviso de reposición: pregunta si quiere que se le consulte al equipo cuándo vuelve a llegar, sin prometer fecha ni aviso; si acepta, llama prepareRestock con su productId EXACTO (y variantId si la presentación importa). No llames prepareRestock en esta respuesta.'
+        : 'Di solo que está agotado; no prometas aviso, fecha de reposición ni contacto.',
+    );
+  if (unverified)
+    parts.push(
+      'Lo marcado "unverified" no se pudo confirmar: no lo des por disponible ni por agotado; confírmalo con checkStock.',
+    );
+  return parts.join(' ');
+}
+
+function projectItem(
+  item: CatalogItemResponse,
+  register: RegisterSelection,
+  availability: ItemAvailability,
+) {
   const { stock, variants, ...identity } = item;
   void stock;
   const productRef = register({
     productId: item.productId,
     productName: item.name,
   });
+  const variantStatus = new Map(
+    availability.variants.map((v) => [v.variantId, v.status]),
+  );
   return {
     ...identity,
     ...(productRef === null ? {} : { cartSelectionRef: productRef }),
+    availability: {
+      status: availability.status,
+      ...(availability.agotadoPresentations.length === 0
+        ? {}
+        : { agotado_presentations: availability.agotadoPresentations }),
+    },
     variants: variants.map((variant) => {
       const { stock: variantStock, ...label } = variant;
       void variantStock;
@@ -753,6 +804,7 @@ function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
       });
       return {
         ...label,
+        availability: variantStatus.get(variant.variantId) ?? 'unverified',
         ...(variantRef === null ? {} : { cartSelectionRef: variantRef }),
       };
     }),
@@ -2901,7 +2953,7 @@ export class MinimalCatalogAgentService {
     const readTools = {
       searchCatalog: tool({
         description:
-          'Busca productos por nombre. Devuelve identidad y precios reales, pero NUNCA existencias.',
+          'Busca productos por nombre. Devuelve identidad, precios reales y availability (existencias verificadas por la aplicación, sin cantidades) de los productos mostrados.',
         inputSchema: z.object({ q: z.string().min(1) }),
         execute: async ({ q }) => {
           try {
@@ -2914,10 +2966,33 @@ export class MinimalCatalogAgentService {
             // S10b/S10d: only the capped, flag-ordered options reach the model
             // and the registries (checkStock, cart refs, photos), so nothing
             // beyond them can be presented to the customer.
-            const limited = limitCatalogOptions(items);
+            // S11: agotado hints go last BEFORE the cap, so an agotado product
+            // never displaces an available match from the 3.
+            const limited = limitCatalogOptions(preferInStock(items));
             const offered = limited.offered;
-            const results = offered.map((item) =>
-              projectItem(item, registerSelection('searchCatalog')),
+            // S11: fresh authenticated stock for the shown products only
+            // (≤ 4), in parallel; a failed read is `unverified`, never a
+            // search error. The search payload's own stock is not evidence.
+            const reads = await Promise.all(
+              offered.map((item) =>
+                Promise.resolve()
+                  .then(() => chatbotApi.getStock(item.productId))
+                  .catch(() => null),
+              ),
+            );
+            const availability = offered.map((item, index) =>
+              deriveAvailability(item, reads[index]),
+            );
+            const results = offered.map((item, index) =>
+              projectItem(
+                item,
+                registerSelection('searchCatalog'),
+                availability[index],
+              ),
+            );
+            const availabilityNote = availabilityInstruction(
+              availability,
+              run !== null,
             );
             for (const item of offered) {
               allowedIds.add(item.productId);
@@ -2936,6 +3011,14 @@ export class MinimalCatalogAgentService {
                 });
               }
             }
+            if (offered.length > 0)
+              trace(
+                `tool searchCatalog availability checked=${offered.length} agotado=${
+                  availability.filter((a) => a.status === 'out_of_stock').length
+                } unverified=${
+                  availability.filter((a) => a.status === 'unverified').length
+                }`,
+              );
             trace(
               `tool searchCatalog result=ok searchResultCount=${items.length}` +
                 (limited.moreResults > 0
@@ -2953,6 +3036,9 @@ export class MinimalCatalogAgentService {
               ...(results.length === 0
                 ? {}
                 : { relevance_check: CATALOG_RELEVANCE_CHECK }),
+              ...(availabilityNote === null
+                ? {}
+                : { availability_instruction: availabilityNote }),
               ...(limited.moreResults > 0
                 ? {
                     more_results: limited.moreResults,
