@@ -1,20 +1,24 @@
 import type {
   CatalogItemResponse,
-  StockCheckResponse,
   StockStatus,
 } from '../../chatbot-api/domain/dtos/catalog.dto';
 
 /**
- * S11: code-derived availability for the products a catalog read offers.
+ * S11/S12: code-derived availability for the products a catalog read offers.
  *
- * Boundary (odd/tasks/inventory-evidence-boundary.md, stock-conversation-
- * boundary*.md): the search payload is NOT inventory evidence. Its stock is
- * used only as an ORDERING hint (`hintsOutOfStock`/`preferInStock`); the
- * availability the model sees comes from a fresh authenticated stock read of
- * the offered products (`deriveAvailability`). Pure functions, no I/O.
+ * Evidence (backend, 2026-11-17): the search payload and `/catalog/:id/stock`
+ * read the same live columns with the same thresholds (no cache), so the
+ * search's stock status is live evidence for availability LABELS and costs no
+ * extra backend call. They differ only for products WITH variants: the
+ * product-level quantity is not a usable figure there (search: raw
+ * product.quantity; /stock: ignores variants). Rule implemented here:
+ *   - simple / not-managed product -> its own `stock.status`;
+ *   - product with variants -> each variant's status, product-level status is
+ *     derived from them; the product-level stock and quantity are NEVER used.
+ * Pure functions, no I/O.
  */
 
-/** A fresh read that cannot be trusted or never happened is `unverified`. */
+/** A status that cannot be trusted or is missing is `unverified`. */
 export type AvailabilityStatus = StockStatus | 'unverified';
 
 export interface ItemAvailability {
@@ -22,50 +26,24 @@ export interface ItemAvailability {
   status: AvailabilityStatus;
   /** One entry per presentation of the offered item, in catalog order. */
   variants: Array<{ variantId: string; status: AvailabilityStatus }>;
-  /** Names of the presentations verified as agotado. */
+  /** Names of the presentations marked agotado. */
   agotadoPresentations: string[];
 }
 
-type Hintable = Pick<CatalogItemResponse, 'stock' | 'variants'>;
-
-/**
- * Ordering hint only: does the (untrusted-for-claims) search payload say the
- * item has nothing to sell? With presentations, only when every one is agotado.
- */
-export function hintsOutOfStock(item: Hintable): boolean {
-  // Optional chaining: this is a hint, so an item without stock data is simply
-  // "no hint" and must never fail the whole search.
-  const status = (stock: Hintable['stock'] | undefined) => stock?.status;
-  if (item.variants.length > 0)
-    return item.variants.every(
-      (variant) => status(variant.stock) === 'out_of_stock',
-    );
-  return status(item.stock) === 'out_of_stock';
-}
-
-/**
- * Stable partition: items the payload hints are agotado go after the rest, so
- * an agotado product never takes the place of an available match in the cap.
- * Nothing is dropped.
- */
-export function preferInStock<T extends Hintable>(items: readonly T[]): T[] {
-  return [
-    ...items.filter((item) => !hintsOutOfStock(item)),
-    ...items.filter((item) => hintsOutOfStock(item)),
-  ];
-}
+type StockLike = { status?: unknown; quantity?: unknown } | null | undefined;
 
 /** A stock status is trusted only when its quantity agrees with it. */
-function verifiedStatus(stock: {
-  status: StockStatus;
-  quantity: number | null;
-}): AvailabilityStatus {
+export function verifiedStockStatus(stock: StockLike): AvailabilityStatus {
+  if (stock === null || stock === undefined || typeof stock !== 'object')
+    return 'unverified';
+  const quantity = stock.quantity;
+  const known = typeof quantity === 'number' && Number.isFinite(quantity);
   switch (stock.status) {
     case 'out_of_stock':
-      return stock.quantity === 0 ? 'out_of_stock' : 'unverified';
+      return known && quantity === 0 ? 'out_of_stock' : 'unverified';
     case 'available':
     case 'low_stock':
-      return stock.quantity === null || stock.quantity > 0
+      return quantity === null || (known && quantity > 0)
         ? stock.status
         : 'unverified';
     case 'not_managed':
@@ -75,56 +53,69 @@ function verifiedStatus(stock: {
   }
 }
 
-/**
- * Availability of one offered item from a fresh stock read (`null` = the read
- * failed). A mismatched product, an inconsistent quantity or a presentation
- * missing from the read is `unverified` — never agotado, never available.
- */
-export function deriveAvailability(
-  item: Pick<CatalogItemResponse, 'productId' | 'stock' | 'variants'>,
-  fresh: StockCheckResponse | null,
+/** Product-level status from the presentations' statuses (never a quantity). */
+export function aggregateVariantStatus(
+  statuses: readonly AvailabilityStatus[],
+): AvailabilityStatus {
+  if (statuses.length === 0) return 'unverified';
+  if (statuses.includes('available')) return 'available';
+  if (statuses.includes('low_stock')) return 'low_stock';
+  if (statuses.every((status) => status === 'out_of_stock'))
+    return 'out_of_stock';
+  return statuses.includes('unverified') ? 'unverified' : 'not_managed';
+}
+
+interface PresentationStock {
+  variantId: string;
+  name: string;
+  stock?: StockLike;
+}
+
+/** Availability of an item with presentations, from THEIR statuses only. */
+export function availabilityFromVariants(
+  variants: readonly PresentationStock[],
 ): ItemAvailability {
-  const trusted = fresh !== null && fresh.productId === item.productId;
-  const freshVariants = new Map(
-    (trusted ? fresh.variants : []).map((v) => [v.variantId, v.stock]),
-  );
-  const variants = item.variants.map((variant) => {
-    const stock = freshVariants.get(variant.variantId);
-    return {
-      variantId: variant.variantId,
-      name: variant.name,
-      status:
-        stock === undefined ? ('unverified' as const) : verifiedStatus(stock),
-    };
-  });
-  const agotadoPresentations = variants
-    .filter((variant) => variant.status === 'out_of_stock')
-    .map((variant) => variant.name);
-  const publicVariants = variants.map(({ variantId, status }) => ({
-    variantId,
-    status,
+  const derived = variants.map((variant) => ({
+    variantId: variant.variantId,
+    name: variant.name,
+    status: verifiedStockStatus(variant.stock),
   }));
-  if (!trusted)
-    return {
-      status: 'unverified',
-      variants: publicVariants,
-      agotadoPresentations,
-    };
-  if (variants.length === 0)
-    return {
-      status: verifiedStatus(fresh.stock),
-      variants: publicVariants,
-      agotadoPresentations,
-    };
-  const statuses = variants.map((variant) => variant.status);
-  const status: AvailabilityStatus = statuses.includes('available')
-    ? 'available'
-    : statuses.includes('low_stock')
-      ? 'low_stock'
-      : statuses.every((s) => s === 'out_of_stock')
-        ? 'out_of_stock'
-        : statuses.includes('unverified')
-          ? 'unverified'
-          : 'not_managed';
-  return { status, variants: publicVariants, agotadoPresentations };
+  return {
+    status: aggregateVariantStatus(derived.map((v) => v.status)),
+    variants: derived.map(({ variantId, status }) => ({ variantId, status })),
+    agotadoPresentations: derived
+      .filter((v) => v.status === 'out_of_stock')
+      .map((v) => v.name),
+  };
+}
+
+type Offered = Pick<CatalogItemResponse, 'stock' | 'variants'>;
+
+/**
+ * Availability of one offered search item, from the search payload alone.
+ * Simple / not-managed -> own status; with presentations -> theirs.
+ */
+export function deriveAvailability(item: Offered): ItemAvailability {
+  if (item.variants.length > 0) return availabilityFromVariants(item.variants);
+  return {
+    status: verifiedStockStatus(item.stock),
+    variants: [],
+    agotadoPresentations: [],
+  };
+}
+
+/** Is the item agotado (every presentation when it has them)? */
+export function isOutOfStock(item: Offered): boolean {
+  return deriveAvailability(item).status === 'out_of_stock';
+}
+
+/**
+ * Stable partition: agotado items go after the rest, so an agotado product
+ * never takes the place of an available match in the cap. Nothing is dropped.
+ */
+export function preferInStock<T extends Offered>(items: readonly T[]): T[] {
+  return [
+    ...items.filter((item) => !isOutOfStock(item)),
+    ...items.filter((item) => isOutOfStock(item)),
+  ];
 }

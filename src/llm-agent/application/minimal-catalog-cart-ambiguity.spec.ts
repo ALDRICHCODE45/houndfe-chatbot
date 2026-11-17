@@ -1689,7 +1689,7 @@ describe('private selection-stage rejection diagnostics', () => {
         expect(reply).toMatchObject({ kind: 'handled', reply: REJECTION });
         expect(adjust).not.toHaveBeenCalled();
         expect(set).not.toHaveBeenCalled();
-        expect(f.api.getStock).toHaveBeenCalledTimes(products.length); // S11: only the search's availability reads
+        expect(f.api.getStock).not.toHaveBeenCalled();
         expect(f.api.evaluateCart).not.toHaveBeenCalled();
         expect(await f.cart.view(SENDER)).toEqual(before);
         const lines = logs.mock.calls.map((args) => String(args[0]));
@@ -1746,7 +1746,7 @@ describe('private selection-stage rejection diagnostics', () => {
       });
       expect(reply).toMatchObject({ kind: 'handled', reply: REJECTION });
       expect(await f.cart.view(SENDER)).toMatchObject({ ok: true, items: [] });
-      expect(f.api.getStock).toHaveBeenCalledTimes(products.length); // S11: only the search's availability reads
+      expect(f.api.getStock).not.toHaveBeenCalled();
       expect(f.api.evaluateCart).not.toHaveBeenCalled();
       expect(f.api.createSale).not.toHaveBeenCalled();
       expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
@@ -1787,7 +1787,7 @@ describe('private selection-stage rejection diagnostics', () => {
         reply: 'Productos encontrados',
       });
       expect(f.api.searchCatalog).toHaveBeenCalledTimes(1);
-      expect(f.api.getStock).toHaveBeenCalledTimes(1); // S11: the one shown product's availability read
+      expect(f.api.getStock).not.toHaveBeenCalled();
       expect(f.api.evaluateCart).not.toHaveBeenCalled();
       expect(await f.cart.view(SENDER)).toMatchObject({ ok: true, items: [] });
       const diagnostics = logs.mock.calls
