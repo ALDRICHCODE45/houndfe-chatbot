@@ -321,9 +321,11 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         {},
       );
       expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
+      // S10a: the stated query now travels with the (empty) result.
       expect(miss).toEqual({
         ok: true,
         stock_verified: false,
+        query: 'pedigree',
         results: [],
       });
     });
@@ -348,6 +350,166 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       const system = JSON.stringify(captured[0].system);
       expect(system).toContain('broadened_search');
       expect(system).toContain('UNA sola búsqueda más amplia');
+    });
+  });
+
+  describe('S10 catalog relevance', () => {
+    const pid = (n: number) =>
+      `aaaaaaaa-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const product = (n: number, extra: Record<string, unknown> = {}) => ({
+      ...simpleItem,
+      productId: pid(n),
+      name: `Croquetas ${n}`,
+      description: `Descripción ${n}`,
+      ...extra,
+    });
+    const search = async (items: unknown[], q = 'croquetas para cachorro') => {
+      const { service, chatbotApi, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      chatbotApi.searchCatalog.mockReset().mockResolvedValue(items as never);
+      const out = (await captured[0].tools!.searchCatalog.execute(
+        { q },
+        {},
+      )) as Record<string, unknown>;
+      return { out, captured };
+    };
+    const resultIds = (out: Record<string, unknown>) =>
+      (out.results as Array<{ productId: string }>).map((r) => r.productId);
+
+    it('S10a/c: prompt requires every stated attribute, alternatives only separately, plain no-match', async () => {
+      const { service, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      const system = JSON.stringify(captured[0].system);
+      expect(system).toContain('TODOS los atributos');
+      for (const attribute of [
+        'cachorro',
+        'adulto',
+        'senior',
+        'especie',
+        'marca',
+        'tamaño de raza',
+        'sabor',
+      ])
+        expect(system).toContain(attribute);
+      expect(system).toContain('nunca lo presentes como coincidencia');
+      expect(system).toContain('UNA sola vez');
+      expect(system).toContain('di claro que no hay');
+      expect(system).toContain('la alternativa más cercana');
+    });
+
+    it('S10b: prompt says at most 3 options and one narrowing question, not 5', async () => {
+      const { service, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      const system = JSON.stringify(captured[0].system);
+      expect(system).toContain('máximo 3');
+      expect(system).not.toContain('máximo 5');
+      expect(system).toContain('more_results');
+      expect(system).toContain('UNA sola pregunta');
+    });
+
+    it('S10a: the tool result carries the stated query, descriptions and a relevance check', async () => {
+      const { out } = await search([product(1), product(2)]);
+      expect(out).toMatchObject({
+        ok: true,
+        query: 'croquetas para cachorro',
+        results: [
+          { productId: pid(1), description: 'Descripción 1' },
+          { productId: pid(2), description: 'Descripción 2' },
+        ],
+      });
+      expect(out.relevance_check).toEqual(expect.stringContaining('query'));
+      expect(out).not.toHaveProperty('more_results');
+      expect(out).not.toHaveProperty('narrowing_instruction');
+    });
+
+    it('S10b: 10 results offer at most 3, with more_results and a narrowing instruction', async () => {
+      const { out } = await search(
+        Array.from({ length: 10 }, (_, i) => product(i + 1)),
+      );
+      expect(resultIds(out)).toEqual([pid(1), pid(2), pid(3)]);
+      expect(out.more_results).toBe(7);
+      expect(out.narrowing_instruction).toEqual(
+        expect.stringContaining('UNA sola pregunta'),
+      );
+    });
+
+    it('S10b: 3 or fewer results are unchanged (no more_results, no narrowing)', async () => {
+      const { out } = await search([product(1), product(2), product(3)]);
+      expect(resultIds(out)).toEqual([pid(1), pid(2), pid(3)]);
+      expect(out).not.toHaveProperty('more_results');
+      expect(out).not.toHaveProperty('narrowing_instruction');
+    });
+
+    it('S10b: hidden results are not registered (checkStock denies them, cart refs absent)', async () => {
+      const { out, captured } = await search(
+        Array.from({ length: 5 }, (_, i) => product(i + 1)),
+      );
+      const { checkStock } = captured[0].tools!;
+      await expect(
+        checkStock.execute({ productId: pid(4) }, {}),
+      ).resolves.toEqual({ ok: false, error: 'unknown_product' });
+      await expect(
+        checkStock.execute({ productId: pid(3) }, {}),
+      ).resolves.not.toEqual({ ok: false, error: 'unknown_product' });
+      expect(JSON.stringify(out)).not.toContain(pid(4));
+    });
+
+    it('S10b: the cap also bounds a broadened search', async () => {
+      const { service, chatbotApi, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      chatbotApi.searchCatalog
+        .mockReset()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(
+          Array.from({ length: 6 }, (_, i) => product(i + 1)) as never,
+        );
+      const out = (await captured[0].tools!.searchCatalog.execute(
+        { q: 'croquetas pedigree' },
+        {},
+      )) as Record<string, unknown>;
+      expect(resultIds(out)).toHaveLength(3);
+      expect(out.more_results).toBe(3);
+      expect(out).toHaveProperty('broadened_search');
+    });
+
+    it('S10d: partial matches go after full ones, labelled as alternatives, outside the 3 matches', async () => {
+      const { out } = await search([
+        product(1, { match: 'partial' }),
+        product(2, { match: 'all' }),
+        product(3, { match: 'all' }),
+        product(4, { match: 'all' }),
+        product(5, { match: 'all' }),
+        product(6, { match: 'partial' }),
+      ]);
+      expect(resultIds(out)).toEqual([pid(2), pid(3), pid(4), pid(1)]);
+      const results = out.results as Array<{ match?: string }>;
+      expect(results.map((r) => r.match)).toEqual([
+        'all',
+        'all',
+        'all',
+        'partial',
+      ]);
+      expect(out.more_results).toBe(1);
+      expect(out.match_note).toEqual(expect.stringContaining('partial'));
+      expect(out.match_note).toEqual(expect.stringContaining('alternativa'));
+    });
+
+    it('S10d: when only partial matches exist the model is told nothing matches fully', async () => {
+      const { out } = await search([
+        product(1, { match: 'partial' }),
+        product(2, { match: 'partial' }),
+      ]);
+      expect(resultIds(out)).toEqual([pid(1), pid(2)]);
+      expect(out.match_note).toEqual(
+        expect.stringContaining('Ningún producto cumple'),
+      );
+    });
+
+    it('S10d: an absent flag adds no match note and no match key', async () => {
+      const absent = await search([product(1), product(2)]);
+      expect(absent.out).not.toHaveProperty('match_note');
+      for (const result of absent.out.results as object[])
+        expect(result).not.toHaveProperty('match');
     });
   });
 

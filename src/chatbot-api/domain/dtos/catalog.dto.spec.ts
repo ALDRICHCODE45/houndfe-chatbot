@@ -61,6 +61,41 @@ describe('parseCatalogSearchResponse', () => {
     });
   });
 
+  describe('optional per-item match flag (S10d)', () => {
+    it.each(['all', 'partial'] as const)('accepts match: %s', (match) => {
+      const parsed = parseCatalogSearchResponse([{ ...catalogItem(), match }]);
+      expect(parsed?.value[0].match).toBe(match);
+      expect(parsed?.unknownKeys).toEqual([]);
+    });
+
+    it('treats an absent flag as unknown (no key at all)', () => {
+      const parsed = parseCatalogSearchResponse([catalogItem()]);
+      expect(parsed?.value[0]).not.toHaveProperty('match');
+      expect(parsed?.value[0].match).toBeUndefined();
+    });
+
+    it.each(['exact', '', 'PARTIAL', 1, null, {}])(
+      'ignores the unknown value %p without rejecting the item',
+      (match) => {
+        const parsed = parseCatalogSearchResponse([
+          { ...catalogItem(), match },
+        ]);
+        expect(parsed).not.toBeNull();
+        expect(parsed?.value[0].match).toBeUndefined();
+        expect(parsed?.value[0].productId).toBe(catalogItem().productId);
+        expect(parsed?.unknownKeys).toEqual([]);
+      },
+    );
+
+    it('keeps rejecting broken existing fields next to a valid flag', () => {
+      expect(
+        parseCatalogSearchResponse([
+          { ...catalogItem(), match: 'all', name: 7 },
+        ]),
+      ).toBeNull();
+    });
+  });
+
   it('strips unknown keys and reports their paths once, never values', () => {
     const item = {
       ...catalogItem(),

@@ -40,7 +40,15 @@ export interface CatalogItemResponse {
     dimensions: null;
   };
   variants: CatalogItemVariantResponse[];
+  /**
+   * Optional backend relevance flag (S10d): `all` = the item matches every
+   * search term, `partial` = only some. Absent = unknown (older backend or an
+   * unrecognized value, which the parser drops).
+   */
+  match?: CatalogMatchFlag;
 }
+
+export type CatalogMatchFlag = 'all' | 'partial';
 
 export interface StockCheckResponse {
   productId: string;
@@ -87,6 +95,15 @@ const variantBase = {
   stock: stockSchema,
 };
 
+// Optional and forgiving: an absent or unrecognized value means "unknown"
+// and the key is left off the parsed item; it never rejects the item.
+const matchFlag = z
+  .unknown()
+  .transform((value): CatalogMatchFlag | undefined =>
+    value === 'all' || value === 'partial' ? value : undefined,
+  )
+  .optional();
+
 const catalogItemSchema = z.object({
   productId: id,
   name: z.string(),
@@ -102,6 +119,7 @@ const catalogItemSchema = z.object({
   stock: stockSchema,
   packageInfo: z.object({ weightGrams: z.null(), dimensions: z.null() }),
   variants: z.array(z.object({ ...variantBase, priceCents: nullableCents })),
+  match: matchFlag,
 });
 
 const stockCheckSchema = z.object({
