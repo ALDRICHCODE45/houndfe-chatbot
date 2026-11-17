@@ -152,6 +152,10 @@ import {
 } from './minimal-shipping.service';
 import { minimalShippingEtaLine } from '../domain/minimal-shipping';
 import {
+  searchWithBroadening,
+  type BroadenedSearchInfo,
+} from '../domain/minimal-catalog-search-broadening';
+import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
 } from './minimal-restock-request.service';
@@ -201,7 +205,9 @@ const INSTRUCTIONS =
   'La selección explícita ya es válida: no la repreguntes. ' +
   'Si el cliente menciona o pide un producto, llama searchCatalog ANTES de responder; nunca digas "Encontré" ni des datos del catálogo sin una lectura de este chat. ' +
   'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 5) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. ' +
-  'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
+  'Si searchCatalog no devuelve resultados, no concluyas que no existe: la aplicación ya reintenta sola con las palabras clave. Si aun así queda vacío, haz UNA sola búsqueda más amplia con el nombre principal (marca o producto, sin dosis, presentación ni palabras genéricas) y nunca repitas la misma consulta; si sigue vacío, di que no lo encontraste y pregunta qué producto busca. ' +
+  'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: dilo claro ("Croquetas Pedigree no encontré; de Pedigree tengo …") y enumera esas opciones como alternativas, sin afirmar que son lo solicitado. Un error de lectura no es "sin resultados". ' +
+  'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada"; un producto que coincide y resulta agotado se sigue mostrando, como agotado, como alternativa. ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
   'no una aprobación humana previa a existencias. No inventes fechas de reposición ni ' +
@@ -679,6 +685,23 @@ type RegisterSelection = (identity: {
   productName: string;
   variantName?: string;
 }) => string | null;
+
+/**
+ * S7: tells the model the results of a 0-result query came from a broader
+ * search, so it presents them as alternatives instead of the exact request.
+ * Only the customer's own words and the retried words are echoed.
+ */
+function broadenedSearchNote(info: BroadenedSearchInfo) {
+  return {
+    original_query: info.originalQuery,
+    queries_tried: info.attempted,
+    matched_query: info.matchedQuery,
+    note:
+      info.matchedQuery === null
+        ? `Sin resultados para "${info.originalQuery}" ni con una búsqueda ampliada (${info.attempted.join(', ')}). No digas que existe; pide al cliente que indique qué producto busca.`
+        : `Sin resultados exactos para "${info.originalQuery}"; estos productos salieron de una búsqueda ampliada con "${info.matchedQuery}". No son exactamente lo pedido: preséntalos como alternativas y dilo claro.`,
+  };
+}
 
 function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
   const { stock, variants, ...identity } = item;
@@ -2844,7 +2867,12 @@ export class MinimalCatalogAgentService {
         inputSchema: z.object({ q: z.string().min(1) }),
         execute: async ({ q }) => {
           try {
-            const items = await chatbotApi.searchCatalog(q);
+            // S7: a 0-result multi-word query is retried (bounded) with its
+            // significant words; a retry error is an ordinary search error.
+            const { items, broadened } = await searchWithBroadening(
+              (query) => chatbotApi.searchCatalog(query),
+              q,
+            );
             const results = items.map((item) =>
               projectItem(item, registerSelection('searchCatalog')),
             );
@@ -2866,12 +2894,18 @@ export class MinimalCatalogAgentService {
               }
             }
             trace(
-              `tool searchCatalog result=ok searchResultCount=${items.length}`,
+              `tool searchCatalog result=ok searchResultCount=${items.length}` +
+                (broadened === null
+                  ? ''
+                  : ` broadenedCalls=${broadened.attempted.length}`),
             );
             return {
               ok: true as const,
               stock_verified: false as const,
               results,
+              ...(broadened === null
+                ? {}
+                : { broadened_search: broadenedSearchNote(broadened) }),
             };
           } catch {
             trace('tool searchCatalog result=error code=catalog_unavailable');

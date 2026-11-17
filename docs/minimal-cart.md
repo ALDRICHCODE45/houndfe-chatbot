@@ -44,6 +44,16 @@ Placing the order after this preflight is always available; see `docs/minimal-or
 
 No transfer or order is needed. Use controlled catalog data; this route reads the backend catalog, stock and pricing, but only writes the local conversation cart.
 
+## Catalog search broadening
+
+The backend matches the whole `q` as a substring, so `croquetas pedigree` returns nothing although `Pedigree Dentastix …` exists. The `searchCatalog` tool (`MinimalCatalogAgentService`, pure logic in `domain/minimal-catalog-search-broadening.ts`) therefore retries on its own:
+
+- The first search is authoritative. Any result, or a single-word query, means **no retry** (stays correct if the backend later adds token matching).
+- On 0 results for a multi-word query it drops generic words (articles/prepositions, request filler such as `quiero`/`tienen`, and `alimento`/`comida`/`croqueta(s)`, plus bare numbers and units) and retries, in order: all significant words together (when 2+), then each significant word alone, longest (most brand-like) first. Species words (`perro`, `gato`) are kept because they appear in product names. At most **3 extra backend calls**; stops at the first retry with results; results are deduped by `productId` in backend order.
+- When results came from a retry, the tool result carries `broadened_search` (`original_query`, `queries_tried`, `matched_query`, `note`) so the model presents them as alternatives ("Croquetas Pedigree no tenemos; de Pedigree tenemos …"). A broadened search that is also empty says so, so the model asks what product the customer wants.
+- A retry error is handled exactly like an error of the original search (`catalog_unavailable`); no extra customer-facing failure and never "no results". Out-of-stock matches stay in the results; the model reports their status after `checkStock` (search never proves stock).
+- The prompt also asks for at most one further, broader model-driven search (main product name, no dose/presentation/generic words) and never repeating the same query. Safe traces add only `broadenedCalls=<n>`.
+
 ## Tools and guarantees
 
 | Tool              | Input                                                                   | Behavior                                                                                                                                                                                                                 |

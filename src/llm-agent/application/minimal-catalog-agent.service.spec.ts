@@ -263,6 +263,94 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     expect(JSON.stringify(failed)).not.toContain('leaked');
   });
 
+  describe('S7 search broadening', () => {
+    const SECOND = '33333333-3333-4333-8333-333333333333';
+    const other = {
+      ...simpleItem,
+      productId: SECOND,
+      name: 'Pedigree Dentastix',
+    };
+
+    it('retries a 0-result multi-word query with the significant word and tells the model', async () => {
+      const { service, chatbotApi, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      chatbotApi.searchCatalog
+        .mockReset()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([other as never]);
+      const out = (await captured[0].tools!.searchCatalog.execute(
+        { q: 'croquetas pedigree' },
+        {},
+      )) as Record<string, unknown>;
+      expect(chatbotApi.searchCatalog.mock.calls.map((c) => c[0])).toEqual([
+        'croquetas pedigree',
+        'pedigree',
+      ]);
+      expect(out).toMatchObject({
+        ok: true,
+        stock_verified: false,
+        broadened_search: {
+          original_query: 'croquetas pedigree',
+          matched_query: 'pedigree',
+          queries_tried: ['pedigree'],
+        },
+      });
+      expect(JSON.stringify(out)).toContain(SECOND);
+      expect((out.broadened_search as { note: string }).note).toContain(
+        'croquetas pedigree',
+      );
+      // Broadened results are registered as presented: checkStock may use them.
+      await expect(
+        captured[0].tools!.checkStock.execute({ productId: SECOND }, {}),
+      ).resolves.not.toEqual({ ok: false, error: 'unknown_product' });
+    });
+
+    it('does not retry when the first search has results or the query is a single word', async () => {
+      const { service, chatbotApi, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      chatbotApi.searchCatalog.mockClear();
+      const hit = (await captured[0].tools!.searchCatalog.execute(
+        { q: 'croquetas pedigree' },
+        {},
+      )) as Record<string, unknown>;
+      expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
+      expect(hit).not.toHaveProperty('broadened_search');
+      chatbotApi.searchCatalog.mockClear().mockResolvedValue([]);
+      const miss = await captured[0].tools!.searchCatalog.execute(
+        { q: 'pedigree' },
+        {},
+      );
+      expect(chatbotApi.searchCatalog).toHaveBeenCalledTimes(1);
+      expect(miss).toEqual({
+        ok: true,
+        stock_verified: false,
+        results: [],
+      });
+    });
+
+    it('reports a failed retry as the ordinary catalog_unavailable error', async () => {
+      const { service, chatbotApi, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      chatbotApi.searchCatalog
+        .mockReset()
+        .mockResolvedValueOnce([])
+        .mockRejectedValueOnce(new Error('leaked detail'));
+      const out = await captured[0].tools!.searchCatalog.execute(
+        { q: 'croquetas pedigree' },
+        {},
+      );
+      expect(out).toEqual({ ok: false, error: 'catalog_unavailable' });
+    });
+
+    it('instructs the model to use one broader refinement and present the broadened words', async () => {
+      const { service, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      const system = JSON.stringify(captured[0].system);
+      expect(system).toContain('broadened_search');
+      expect(system).toContain('UNA sola búsqueda más amplia');
+    });
+  });
+
   it('traces route entry and tool outcomes with one generated id per run, no raw data', async () => {
     const { service } = build(flow);
     const logs = captureLogs();
