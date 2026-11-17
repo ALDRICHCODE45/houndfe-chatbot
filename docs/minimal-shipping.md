@@ -75,12 +75,21 @@ When a quote comes back `zoneStatus: PENDING`, the customer gets the PENDING rep
    - An intake failure never changes the customer reply. A transient failure (network, 5xx, 429) is retried by the poller with the same `sourceRequestId`. A 400/404/409/422 closes the requester as `FAILED`.
    - If the ZIP already has an active zone, the backend resolves the intake at once (`EXISTING_ZONE`). The bot stores it as resolved and the poller delivers it on its next tick, like any poll result.
 2. **Poll.** The poller runs on boot and every 60 s (`DeliveryZonePoller` option `intervalMs`). Each tick reads a batch of up to 20 due requesters from the database and calls `GET /chatbot-api/human-decisions/:id` with the requester id. A requester is polled at most once per minute during its first hour, then every 5 minutes. There is no time horizon: a validation can stay pending for days.
-3. **Notify.** On `RESOLVED` the bot sends exactly one message:
+3. **Notify.** On `RESOLVED` the bot sends the notice:
    - **Inside the customer's 24 h WhatsApp window** (latest verified inbound less than 24 h old), it sends a text:
-     - `FREE`, `SURCHARGE` or `CARRIER_ONLY`: “¡Listo! Ya tenemos entrega a su código postal {CP}. Pídame de nuevo el envío y le muestro el costo actualizado.” The surcharge is not quoted, because the backend quote applies the product credit; only the new quote shows what the customer pays.
+     - `FREE` or `SURCHARGE`, when the checkout can resume (see below): “¡Listo! Ya tenemos entrega a su código postal {CP}: {frase de envío}.” followed by the order summary with the ✅ Confirmar pedido / ✏️ Cambiar algo buttons. The shipping sentence comes from a fresh backend quote: “el envío no tiene costo” or “el envío cuesta $X MXN” (what the customer pays after the credit), plus “y llega en aproximadamente N días hábiles” (or “…depende de la reposición de existencias”) when the quote has an ETA. Styled tú/usted like the other notices.
+     - `FREE` or `SURCHARGE` when the checkout cannot resume, and always for `CARRIER_ONLY`: “¡Listo! Ya tenemos entrega a su código postal {CP}. Pídame de nuevo el envío y le muestro el costo actualizado.” The surcharge is not quoted here, because the backend quote applies the product credit; only a quote shows what the customer pays.
      - `DENIED`: “Revisamos su código postal {CP} y por ahora no tenemos entrega ahí. Puede recoger su pedido en tienda sin costo de envío.”
-   - **Outside that window, or with no inbound evidence,** it sends the utility template `zona_entrega_revisada` (`es_MX`) with one body parameter, the ZIP.
-   - A stored PENDING-zone quote for that sender is then removed, so the next shipping request re-quotes.
+   - **Outside that window, or with no inbound evidence,** it sends the utility template `zona_entrega_revisada` (`es_MX`) with one body parameter, the ZIP. The checkout is never resumed there.
+   - A stored PENDING-zone quote for that sender is then removed (a no-op after a resume, which already replaced it), so the next shipping request re-quotes.
+
+   **Checkout resume (N4).** For `FREE` / `SURCHARGE` inside the window, after the `SEND_STARTED` marker and before the text, the notifier asks the checkout resume capability (`MinimalZoneResumeService`, registered by the LLM agent module in `DeliveryZoneResumeRegistry`) to prepare it. It resumes only when all of this still holds, read from the stored state:
+   - the cart is non-empty and has no unresolved order attempt;
+   - the cart still holds the PENDING quote that registered the zone request, pinned to the same products, variants and quantities and to the same confirmed destination;
+   - the confirmed delivery data still have that ZIP.
+
+   It then re-quotes through `MinimalShippingService` (one cart CAS; the answer must be a deliverable `FREE` / `SURCHARGE`) and prepares the order summary through `MinimalOrderService`, with the same pending-summary gate as a summary sent in a turn: the pending summary is **armed only after Meta accepts the summary message**, so a later «SÍ» or a tap on ✅ Confirmar pedido creates the order. Any failed precondition (cart empty or changed, ZIP changed, no confirmed delivery data, store pickup chosen, quote failed or not deliverable, cart write lost, no capability) sends the plain notice with no summary. After the notice the summary is sent as buttons (plain text if buttons fail or are unsupported); if the conversation turned HUMAN in between, or the summary cannot be sent, it is dropped without arming and the notice outcome stands. The two messages belong to the same requester row, so a redelivered row sends neither again.
+
 4. **ACK.** `POST /chatbot-api/human-decisions/:id/application-outcome`, with the same body as the RESTOCK ACK (the same client call):
    - `PROVIDER_ACCEPTED` when Meta accepted the text or template before `applyBefore` (`resolvedAt + 24 h`).
    - `DELIVERY_UNKNOWN` when the send failed (for example, the template is not approved yet) or the bot crashed mid-send.

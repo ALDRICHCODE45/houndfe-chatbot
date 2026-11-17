@@ -33,7 +33,11 @@ import {
 import { minimalCartReply } from './minimal-cart.service';
 import { renderNotificationText } from '../../receipt-media/infrastructure/receipt-media-notification.worker';
 import { RECEIPT_TEMPLATE_KEYS } from '../../receipt-media/domain/receipt-media.types';
-import { deliveryZoneResolvedText } from '../../delivery-zones/domain/delivery-zone-requester';
+import {
+  deliveryZoneResolvedText,
+  deliveryZoneResumedText,
+} from '../../delivery-zones/domain/delivery-zone-requester';
+import { minimalZoneResumeShippingSentence } from '../domain/minimal-shipping';
 import {
   BUSY_REPLY,
   CHECKOUT_TOOL_CLARIFICATION,
@@ -414,6 +418,31 @@ const REPLIES: Record<string, string> = {
   }),
   zoneDenied: deliveryZoneResolvedText('06700', 'DENIED'),
   zoneFree: deliveryZoneResolvedText('06700', 'FREE'),
+  // S4: the zone-approved notice that resumes the checkout.
+  zoneResumedFree: deliveryZoneResumedText(
+    '06700',
+    minimalZoneResumeShippingSentence({
+      customerChargeCents: 0,
+      eta: { days: 2 },
+      option: null,
+    }),
+  ),
+  zoneResumedCharged: deliveryZoneResumedText(
+    '06700',
+    minimalZoneResumeShippingSentence({
+      customerChargeCents: 12500,
+      eta: { days: 1 },
+      option: null,
+    }),
+  ),
+  zoneResumedStockPending: deliveryZoneResumedText(
+    '06700',
+    minimalZoneResumeShippingSentence({
+      customerChargeCents: 0,
+      eta: { days: null, reason: 'STOCK_PENDING' },
+      option: null,
+    }),
+  ),
   restockEstimate:
     '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!',
   restockUnavailable:

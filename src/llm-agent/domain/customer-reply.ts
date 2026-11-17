@@ -199,6 +199,9 @@ export function fitInteractiveText(text: string, max: number): string {
   return `${out.trimEnd()}…`;
 }
 
+/** Short body of the order-summary buttons (usted; styled by the sender). */
+export const ORDER_BUTTONS_PROMPT = '¿Confirma su pedido?';
+
 /** Buttons under the server-owned order summary, bound to its reference. */
 export function orderConfirmationButtons(
   reference: string,

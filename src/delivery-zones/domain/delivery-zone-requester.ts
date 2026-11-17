@@ -155,3 +155,15 @@ export function deliveryZoneResolvedText(
     return `Revisamos su código postal ${zipCode} y por ahora no tenemos entrega ahí. Puede recoger su pedido en tienda sin costo de envío.`;
   return `¡Listo! Ya tenemos entrega a su código postal ${zipCode}. Pídame de nuevo el envío y le muestro el costo actualizado.`;
 }
+
+/**
+ * S4: the approved-zone notice when the checkout resumes by itself. The
+ * shipping sentence comes from the fresh backend quote (free or charged, ETA);
+ * the order summary follows as its own message.
+ */
+export function deliveryZoneResumedText(
+  zipCode: string,
+  shippingSentence: string,
+): string {
+  return `¡Listo! Ya tenemos entrega a su código postal ${zipCode}: ${shippingSentence}.`;
+}

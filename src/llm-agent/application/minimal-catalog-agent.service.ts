@@ -76,6 +76,7 @@ import {
   choiceList,
   isSendableProductImageUrl,
   orderConfirmationButtons,
+  ORDER_BUTTONS_PROMPT,
   parseInteractiveReplyId,
   productImageCaption,
   reorderConfirmationButtons,
@@ -258,7 +259,6 @@ export const STALE_BUTTON_LEAD = 'Ese botón ya no está vigente.';
 const STALE_BUTTON_FALLBACK = `${STALE_BUTTON_LEAD} ¿Qué desea hacer?`;
 /** S2: reply to «Agregar algo más» (no model call). */
 export const CART_ADD_MORE_REPLY = 'Claro, ¿qué producto desea agregar?';
-const ORDER_BUTTONS_PROMPT = '¿Confirma su pedido?';
 const CHECKOUT_BUTTONS_PROMPT = '¿Son correctos sus datos de entrega?';
 const CHOICE_LIST_PROMPT = 'Elija una opción de la lista.';
 const CATALOG_PRICES_MAX = 100;

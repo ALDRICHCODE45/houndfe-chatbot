@@ -36,6 +36,7 @@ import {
   DELIVERY_ZONE_REQUESTER_STORE,
   type DeliveryZoneRequesterStore,
 } from './domain/delivery-zone-requester';
+import { DeliveryZoneResumeRegistry } from './domain/delivery-zone-resume';
 import { clearPendingZoneQuote } from './infrastructure/clear-pending-zone-quote';
 
 export const DELIVERY_ZONE_POLLER_OPTIONS = Symbol(
@@ -69,6 +70,8 @@ export class DeliveryZoneRuntime
     private readonly handoff: HandoffModeService,
     // S1: the resolved-zone text in the customer's stored style.
     @Optional() private readonly profiles?: CustomerProfileService,
+    // S4: the checkout resume capability, registered by the LLM agent module.
+    @Optional() private readonly resume?: DeliveryZoneResumeRegistry,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -86,6 +89,16 @@ export class DeliveryZoneRuntime
           this.client.recordRestockApplicationOutcome(id, request),
         sendText: (message) => this.sender.sendText(message),
         sendTemplate: (message) => this.sender.sendTemplate(message),
+        // Optional like the sender's own capability: absent → plain text.
+        ...(this.sender.sendInteractive === undefined
+          ? {}
+          : {
+              sendInteractive: (message) =>
+                this.sender.sendInteractive!(message),
+            }),
+        // Late-bound: the resumer registers at boot, resolves at call time.
+        resumeCheckout: (input) =>
+          this.resume?.current()?.prepare(input) ?? Promise.resolve(null),
         readLatest: (senderId, phoneId) =>
           inbound.readLatest(senderId, phoneId),
         submit: (row) => this.intake.submit(row),

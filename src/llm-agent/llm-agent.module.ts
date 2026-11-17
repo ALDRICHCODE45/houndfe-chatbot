@@ -42,6 +42,8 @@ import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalPaymentService } from './application/minimal-payment.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
 import { DeliveryZonesModule } from '../delivery-zones/delivery-zones.module';
+import { DeliveryZoneResumeRegistry } from '../delivery-zones/domain/delivery-zone-resume';
+import { MinimalZoneResumeService } from './application/minimal-zone-resume.service';
 import {
   DELIVERY_ZONE_INTAKE,
   type DeliveryZoneIntakePort,
@@ -164,6 +166,35 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         api: ChatbotApiClient,
         zones: DeliveryZoneIntakePort,
       ) => new MinimalShippingService(store, cart, checkout, api, zones),
+    },
+    {
+      // S4: an approved delivery zone resumes the customer's checkout. The
+      // delivery-zone runtime (which this module imports, not the reverse)
+      // resolves it through the registry at call time.
+      provide: MinimalZoneResumeService,
+      inject: [
+        CONVERSATION_STORE,
+        MinimalCheckoutService,
+        MinimalShippingService,
+        MinimalOrderService,
+        DeliveryZoneResumeRegistry,
+      ],
+      useFactory: (
+        store: ConversationStore,
+        checkout: MinimalCheckoutService,
+        shipping: MinimalShippingService,
+        order: MinimalOrderService,
+        registry: DeliveryZoneResumeRegistry,
+      ) => {
+        const resume = new MinimalZoneResumeService(
+          store,
+          checkout,
+          shipping,
+          order,
+        );
+        registry.register(resume);
+        return resume;
+      },
     },
     {
       provide: MinimalExpirationRequestService,

@@ -155,7 +155,7 @@ describe('DeliveryZoneNotifier', () => {
     expect(t.ports.sendText).not.toHaveBeenCalled();
   });
 
-  it('resolved inside both windows: sends the text and ACKs PROVIDER_ACCEPTED', async () => {
+  it('resolved inside both windows without a resume capability: sends the current text and ACKs PROVIDER_ACCEPTED', async () => {
     const t = setup();
     t.seed(row());
     t.ports.getDeliveryZoneRequester.mockResolvedValue(resolvedPoll());
@@ -481,5 +481,302 @@ describe('DeliveryZoneNotifier while the conversation is HUMAN (S7)', () => {
     await t.notifier.process(resolvedRow());
     expect(t.ports.sendText).toHaveBeenCalledTimes(1);
     expect(t.stored().deliveryOutcome).toBe('PROVIDER_ACCEPTED');
+  });
+});
+
+describe('DeliveryZoneNotifier checkout resume (S4)', () => {
+  const resolvedRow = (
+    zoneType: 'FREE' | 'SURCHARGE' | 'CARRIER_ONLY' | 'DENIED' = 'FREE',
+  ) =>
+    row({
+      status: 'RESOLVED',
+      resolution: resolution({ zoneType }),
+      applyBefore: APPLY_BEFORE,
+    });
+  const OLD =
+    '¡Listo! Ya tenemos entrega a su código postal 06700. Pídame de nuevo el envío y le muestro el costo actualizado.';
+  const SUMMARY =
+    'Resumen de su pedido:\n• Ibuprofeno\nTotal a pagar: $30.00 MXN';
+  const BUTTONS = [
+    { id: 'order_confirm:ref-1', title: '✅ Confirmar pedido' },
+    { id: 'order_change', title: '✏️ Cambiar algo' },
+  ];
+  const NOTICE =
+    '¡Listo! Ya tenemos entrega a su código postal 06700: el envío no tiene costo y llega en aproximadamente 2 días hábiles.';
+
+  function withResume(
+    options: {
+      now?: string;
+      latest?: CustomerInboundObservationLatest;
+      resume?: 'ok' | 'null' | 'throws';
+    } = {},
+  ) {
+    const t = setup(options);
+    const events: string[] = [];
+    const arm = jest.fn(() => void events.push('arm'));
+    const discard = jest.fn(() => void events.push('discard'));
+    const statusAtPrepare: string[] = [];
+    const resumeCheckout = jest.fn(async () => {
+      statusAtPrepare.push(t.stored().status);
+      events.push('prepare');
+      if (options.resume === 'throws') throw new Error('boom');
+      if (options.resume === 'null') return null;
+      return {
+        shippingSentence:
+          'el envío no tiene costo y llega en aproximadamente 2 días hábiles',
+        summary: {
+          text: SUMMARY,
+          buttons: BUTTONS,
+          prompt: '¿Confirma su pedido?',
+        },
+        arm,
+        discard,
+      };
+    });
+    const sendInteractive = jest.fn(async () => {
+      events.push('interactive');
+      return {
+        providerMessageId: 'wamid.sum',
+        providerMessageIds: ['wamid.sum'],
+      };
+    });
+    t.ports.sendText.mockImplementation(() => {
+      events.push('text');
+      return Promise.resolve({ providerMessageId: 'wamid.text' });
+    });
+    Object.assign(t.ports, { resumeCheckout, sendInteractive });
+    return {
+      ...t,
+      resumeCheckout,
+      sendInteractive,
+      arm,
+      discard,
+      events,
+      statusAtPrepare,
+    };
+  }
+
+  it('FREE: sends the resumed notice, then the summary with the confirm buttons, then arms it', async () => {
+    const t = withResume();
+    t.seed(resolvedRow('FREE'));
+    await t.notifier.process(t.stored());
+    expect(t.resumeCheckout).toHaveBeenCalledWith({
+      senderId: SENDER,
+      zipCode: '06700',
+      zoneType: 'FREE',
+      sourceRequestId: SOURCE,
+      receivingPhoneNumberId: PHONE_ID,
+    });
+    expect(t.ports.sendText).toHaveBeenCalledTimes(1);
+    expect(t.ports.sendText).toHaveBeenCalledWith({ to: SENDER, text: NOTICE });
+    expect(t.sendInteractive).toHaveBeenCalledWith({
+      to: SENDER,
+      body: SUMMARY,
+      interactive: { type: 'buttons', buttons: BUTTONS },
+      shortBody: '¿Confirma su pedido?',
+    });
+    expect(t.events).toEqual(['prepare', 'text', 'interactive', 'arm']);
+    expect(t.discard).not.toHaveBeenCalled();
+    expect(t.ports.recordRestockApplicationOutcome).toHaveBeenCalledWith(
+      REQUESTER,
+      expect.objectContaining({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.text',
+      }),
+    );
+    expect(t.stored()).toMatchObject({ status: 'CLOSED', channel: 'TEXT' });
+  });
+
+  it('SURCHARGE resumes too', async () => {
+    const t = withResume();
+    t.seed(resolvedRow('SURCHARGE'));
+    await t.notifier.process(t.stored());
+    expect(t.resumeCheckout).toHaveBeenCalledWith(
+      expect.objectContaining({ zoneType: 'SURCHARGE' }),
+    );
+    expect(t.events).toEqual(['prepare', 'text', 'interactive', 'arm']);
+  });
+
+  it('prepares only after the durable SEND_STARTED marker', async () => {
+    const t = withResume();
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.statusAtPrepare).toEqual(['SEND_STARTED']);
+  });
+
+  it('a tú profile gets the notice, the summary and the button prompt in tú', async () => {
+    const t = withResume();
+    Object.assign(t.ports, {
+      customerStyle: jest
+        .fn()
+        .mockResolvedValue({ register: 'tu', emojis: false, tone: 'casual' }),
+    });
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.ports.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: '¡Listo! Ya tenemos entrega a tu código postal 06700: el envío no tiene costo y llega en aproximadamente 2 días hábiles.',
+    });
+    expect(t.sendInteractive).toHaveBeenCalledWith(
+      expect.objectContaining({ shortBody: '¿Confirmas tu pedido?' }),
+    );
+  });
+
+  it.each([
+    ['no resume capability', undefined],
+    ['a failed precondition', 'null'],
+    ['a throwing resume', 'throws'],
+  ] as const)(
+    '%s: sends the current notice text and no summary',
+    async (_label, resume) => {
+      const t = resume === undefined ? setup() : withResume({ resume });
+      t.seed(resolvedRow());
+      await t.notifier.process(t.stored());
+      expect(t.ports.sendText).toHaveBeenCalledTimes(1);
+      expect(t.ports.sendText).toHaveBeenCalledWith({ to: SENDER, text: OLD });
+      if ('sendInteractive' in t)
+        expect(t.sendInteractive).not.toHaveBeenCalled();
+      expect(t.stored()).toMatchObject({
+        status: 'CLOSED',
+        deliveryOutcome: 'PROVIDER_ACCEPTED',
+      });
+    },
+  );
+
+  it.each(['CARRIER_ONLY', 'DENIED'] as const)(
+    '%s keeps the current behaviour: no resume',
+    async (zoneType) => {
+      const t = withResume();
+      t.seed(resolvedRow(zoneType));
+      await t.notifier.process(t.stored());
+      expect(t.resumeCheckout).not.toHaveBeenCalled();
+      expect(t.sendInteractive).not.toHaveBeenCalled();
+      expect(t.ports.sendText).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('outside the 24 h window the template goes out and nothing is resumed', async () => {
+    const t = withResume({ latest: inbound('2026-11-04T10:00:00.000Z') });
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.resumeCheckout).not.toHaveBeenCalled();
+    expect(t.sendInteractive).not.toHaveBeenCalled();
+    expect(t.ports.sendTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it('a redelivery of the same row sends the notice and the summary once', async () => {
+    const t = withResume();
+    t.seed(resolvedRow());
+    const stale = t.stored();
+    await t.notifier.process(stale);
+    await t.notifier.process(stale);
+    await t.notifier.process(t.stored());
+    expect(t.resumeCheckout).toHaveBeenCalledTimes(1);
+    expect(t.ports.sendText).toHaveBeenCalledTimes(1);
+    expect(t.sendInteractive).toHaveBeenCalledTimes(1);
+    expect(t.arm).toHaveBeenCalledTimes(1);
+  });
+
+  it('a row found in SEND_STARTED (crash) sends and resumes nothing', async () => {
+    const t = withResume();
+    t.seed(
+      row({
+        status: 'SEND_STARTED',
+        resolution: resolution(),
+        applyBefore: APPLY_BEFORE,
+        channel: 'TEXT',
+        attemptId: ATTEMPT,
+        attemptedAt: INSIDE,
+      }),
+    );
+    await t.notifier.process(t.stored());
+    expect(t.resumeCheckout).not.toHaveBeenCalled();
+    expect(t.ports.sendText).not.toHaveBeenCalled();
+    expect(t.sendInteractive).not.toHaveBeenCalled();
+  });
+
+  it('a conversation in HUMAN mode gets neither notice nor resume', async () => {
+    const t = withResume();
+    Object.assign(t.ports, { isHumanMode: jest.fn().mockResolvedValue(true) });
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.resumeCheckout).not.toHaveBeenCalled();
+    expect(t.ports.sendText).not.toHaveBeenCalled();
+  });
+
+  it('the conversation turns HUMAN between the notice and the summary: no summary, pending dropped', async () => {
+    const t = withResume();
+    Object.assign(t.ports, {
+      isHumanMode: jest
+        .fn()
+        .mockResolvedValueOnce(false)
+        .mockResolvedValue(true),
+    });
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.ports.sendText).toHaveBeenCalledWith({ to: SENDER, text: NOTICE });
+    expect(t.sendInteractive).not.toHaveBeenCalled();
+    expect(t.arm).not.toHaveBeenCalled();
+    expect(t.discard).toHaveBeenCalledTimes(1);
+    expect(t.stored()).toMatchObject({
+      status: 'CLOSED',
+      deliveryOutcome: 'PROVIDER_ACCEPTED',
+    });
+  });
+
+  it('a failed notice send sends no summary and drops the pending one', async () => {
+    const t = withResume();
+    t.ports.sendText.mockRejectedValue(new Error('provider down'));
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.sendInteractive).not.toHaveBeenCalled();
+    expect(t.arm).not.toHaveBeenCalled();
+    expect(t.discard).toHaveBeenCalledTimes(1);
+    expect(t.stored()).toMatchObject({
+      status: 'CLOSED',
+      deliveryOutcome: 'DELIVERY_UNKNOWN',
+    });
+  });
+
+  it('an interactive failure falls back to the summary as plain text and still arms it', async () => {
+    const t = withResume();
+    t.sendInteractive.mockRejectedValue(new Error('no buttons'));
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.ports.sendText).toHaveBeenNthCalledWith(2, {
+      to: SENDER,
+      text: SUMMARY,
+    });
+    expect(t.arm).toHaveBeenCalledTimes(1);
+    expect(t.discard).not.toHaveBeenCalled();
+  });
+
+  it('a sender without interactive support sends the summary as plain text', async () => {
+    const t = withResume();
+    delete (t.ports as { sendInteractive?: unknown }).sendInteractive;
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.ports.sendText).toHaveBeenNthCalledWith(2, {
+      to: SENDER,
+      text: SUMMARY,
+    });
+    expect(t.arm).toHaveBeenCalledTimes(1);
+  });
+
+  it('a summary that cannot be sent at all is dropped, never armed, and the notice outcome stands', async () => {
+    const t = withResume();
+    t.sendInteractive.mockRejectedValue(new Error('no buttons'));
+    t.ports.sendText
+      .mockResolvedValueOnce({ providerMessageId: 'wamid.text' })
+      .mockRejectedValueOnce(new Error('down'));
+    t.seed(resolvedRow());
+    await t.notifier.process(t.stored());
+    expect(t.arm).not.toHaveBeenCalled();
+    expect(t.discard).toHaveBeenCalledTimes(1);
+    expect(t.stored()).toMatchObject({
+      status: 'CLOSED',
+      deliveryOutcome: 'PROVIDER_ACCEPTED',
+      providerMessageId: 'wamid.text',
+    });
   });
 });
