@@ -121,6 +121,7 @@ ddescribe('R5 receipt outcome store (Testcontainers)', () => {
         senderId: sender,
         backendReceiptId,
         saleFolio: 'F-12',
+        capturedSaleId: SALE,
         outcomePolledAt: null,
       }),
     ]);

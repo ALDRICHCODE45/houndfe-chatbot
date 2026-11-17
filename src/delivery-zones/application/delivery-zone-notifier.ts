@@ -16,10 +16,15 @@ import {
 import {
   DELIVERY_ZONE_TEMPLATE,
   deliveryZoneResolvedText,
+  deliveryZoneResumedText,
   type DeliveryZoneDeliveryOutcome,
   type DeliveryZoneRequesterRow,
   type DeliveryZoneRequesterStore,
 } from '../domain/delivery-zone-requester';
+import type {
+  DeliveryZoneCheckoutResume,
+  DeliveryZoneResumeInput,
+} from '../domain/delivery-zone-resume';
 import type { DeliveryZoneIntakeService } from './delivery-zone-intake.service';
 
 /** The fixed copy in the stored style; unchanged usted without one. */
@@ -33,13 +38,21 @@ export type DeliveryZoneNotifierPorts = Pick<
   ChatbotApiClient,
   'getDeliveryZoneRequester' | 'recordRestockApplicationOutcome'
 > &
-  Pick<WhatsappSenderPort, 'sendText' | 'sendTemplate'> &
+  Pick<WhatsappSenderPort, 'sendText' | 'sendTemplate' | 'sendInteractive'> &
   Pick<CustomerInboundObservationStore, 'readLatest'> &
   Pick<DeliveryZoneIntakeService, 'submit'> & {
     /** Drop a stored PENDING-zone quote so the next request re-quotes. */
     clearPendingQuote(senderId: string): Promise<void>;
     /** S1: the stored customer style; null/failure keeps the usted text. */
     customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+    /**
+     * S4: re-quote shipping and prepare the order summary for a customer
+     * whose confirmed delivery data still match an approved zone; `null`
+     * (or absent) keeps the plain notice.
+     */
+    resumeCheckout?(
+      input: DeliveryZoneResumeInput,
+    ): Promise<DeliveryZoneCheckoutResume | null>;
   } & Partial<HandoffModeReader>;
 
 /**
@@ -176,12 +189,19 @@ export class DeliveryZoneNotifier {
     );
     if (started === null) return null;
     let providerMessageId: string | null = null;
+    // S4: prepared after the durable marker so only the single winner of the
+    // CAS quotes and arms a summary; null keeps the plain notice.
+    const resume = text
+      ? await this.prepareResume(row, resolution.zoneType)
+      : null;
     try {
       const receipt = text
         ? await this.ports.sendText({
             to: row.senderId,
             text: styled(
-              deliveryZoneResolvedText(row.zipCode, resolution.zoneType),
+              resume === null
+                ? deliveryZoneResolvedText(row.zipCode, resolution.zoneType)
+                : deliveryZoneResumedText(row.zipCode, resume.shippingSentence),
               style,
             ),
           })
@@ -216,12 +236,93 @@ export class DeliveryZoneNotifier {
         updatedAt: observed,
       },
     );
+    if (resume !== null) {
+      if (providerMessageId === null) this.discardResume(resume);
+      else await this.sendSummary(row.senderId, resume, style);
+    }
     try {
       await this.ports.clearPendingQuote(row.senderId);
     } catch {
       // The stale PENDING quote is never orderable; clearing is a courtesy.
     }
     return notified;
+  }
+
+  /**
+   * S4: FREE / SURCHARGE only. Any failure (or no capability) is `null`, so
+   * the customer still gets the current notice text.
+   */
+  private async prepareResume(
+    row: DeliveryZoneRequesterRow,
+    zoneType: DeliveryZoneResumeInput['zoneType'],
+  ): Promise<DeliveryZoneCheckoutResume | null> {
+    if (
+      this.ports.resumeCheckout === undefined ||
+      (zoneType !== 'FREE' && zoneType !== 'SURCHARGE')
+    )
+      return null;
+    try {
+      return await this.ports.resumeCheckout({
+        senderId: row.senderId,
+        zipCode: row.zipCode,
+        zoneType,
+        sourceRequestId: row.sourceRequestId,
+        receivingPhoneNumberId: this.receivingPhoneNumberId,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * S4: the order summary right after the accepted notice. Buttons when the
+   * sender supports them, the same text otherwise. The pending summary is
+   * armed only once Meta accepted it, exactly like a summary sent in a turn.
+   */
+  private async sendSummary(
+    senderId: string,
+    resume: DeliveryZoneCheckoutResume,
+    style: CustomerStyle | null,
+  ): Promise<void> {
+    try {
+      // Rule 2 (S7): the mode is read right before each send.
+      if ((await this.handoffHold(senderId)).hold) {
+        this.discardResume(resume);
+        return;
+      }
+      const body = styled(resume.summary.text, style);
+      let accepted = false;
+      if (this.ports.sendInteractive !== undefined) {
+        try {
+          await this.ports.sendInteractive({
+            to: senderId,
+            body,
+            interactive: { type: 'buttons', buttons: resume.summary.buttons },
+            shortBody: styled(resume.summary.prompt, style),
+          });
+          accepted = true;
+        } catch (error) {
+          this.logger.warn(
+            `DELIVERY_ZONE summary buttons failed; sending text: ${error instanceof Error ? error.name : 'unknown'}`,
+          );
+        }
+      }
+      if (!accepted) await this.ports.sendText({ to: senderId, text: body });
+      resume.arm();
+    } catch (error) {
+      this.discardResume(resume);
+      this.logger.warn(
+        `DELIVERY_ZONE summary send failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    }
+  }
+
+  private discardResume(resume: DeliveryZoneCheckoutResume): void {
+    try {
+      resume.discard();
+    } catch {
+      // A pending summary that cannot be dropped still expires by itself.
+    }
   }
 
   private handoffHold(senderId: string) {

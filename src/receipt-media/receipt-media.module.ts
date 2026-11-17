@@ -30,6 +30,7 @@ import { HandoffModeService } from '../conversation/application/handoff-mode.ser
 import { ConversationModule } from '../conversation/conversation.module';
 import type { ConversationStore } from '../conversation/domain/conversation-store';
 import { CONVERSATION_STORE } from '../conversation/domain/conversation-store';
+import { markPlacedSalePaid } from '../llm-agent/application/minimal-paid-sale';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
 import { CustomerProfileModule } from '../customer-profile/customer-profile.module';
 import { DatabaseModule } from '../database/database.module';
@@ -225,6 +226,8 @@ class ReceiptOutcomeLifecycle
     @Inject(PG_POOL) private readonly pool: Pool,
     private readonly store: PostgresReceiptMediaStore,
     @Inject(CHATBOT_API_CLIENT) private readonly client: ChatbotApiClient,
+    @Inject(CONVERSATION_STORE)
+    private readonly conversations: ConversationStore,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -237,6 +240,9 @@ class ReceiptOutcomeLifecycle
         getReceiptOutcome: (id) => this.client.getReceiptOutcome(id),
         readLatest: (senderId, phoneId) =>
           inbound.readLatest(senderId, phoneId),
+        // S6: best effort CAS on the conversation's placed sale.
+        markSalePaid: (senderId, saleId) =>
+          markPlacedSalePaid(this.conversations, senderId, saleId),
       },
       receivingPhone(this.config),
     );

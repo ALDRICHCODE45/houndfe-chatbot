@@ -76,9 +76,11 @@ import {
   choiceList,
   isSendableProductImageUrl,
   orderConfirmationButtons,
+  ORDER_BUTTONS_PROMPT,
   parseInteractiveReplyId,
   productImageCaption,
   reorderConfirmationButtons,
+  cartNextStepButtons,
   shortMxn,
   type CustomerReply,
   type CustomerReplyInteractive,
@@ -88,6 +90,10 @@ import {
   type ProductImageContext,
 } from '../domain/customer-reply';
 import { PAYMENT_METHODS, matchPaymentMethod } from '../domain/payment-methods';
+import {
+  isOrderSummaryRequest,
+  isPaymentQuestion,
+} from '../domain/minimal-order-requests';
 import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
 import { MINIMAL_CHECKOUT_SUMMARY_HEADING } from '../domain/minimal-checkout-confirmation';
 import {
@@ -96,6 +102,8 @@ import {
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  MINIMAL_PAYMENT_ALREADY_PAID_REPLY,
+  MINIMAL_PAYMENT_NEW_ORDER_REPLY,
   MinimalPaymentService,
   type MinimalPaymentReply,
 } from './minimal-payment.service';
@@ -118,6 +126,8 @@ import {
 import {
   MinimalCartService,
   minimalCartReply,
+  MINIMAL_CART_NEXT_STEP_QUESTION,
+  MINIMAL_CART_SUMMARY_TAIL,
   type MinimalCartResult,
   type MinimalCartVariantDiagnostic,
 } from './minimal-cart.service';
@@ -142,6 +152,10 @@ import {
   type MinimalShippingResult,
 } from './minimal-shipping.service';
 import { minimalShippingEtaLine } from '../domain/minimal-shipping';
+import {
+  searchWithBroadening,
+  type BroadenedSearchInfo,
+} from '../domain/minimal-catalog-search-broadening';
 import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
@@ -192,7 +206,9 @@ const INSTRUCTIONS =
   'La selección explícita ya es válida: no la repreguntes. ' +
   'Si el cliente menciona o pide un producto, llama searchCatalog ANTES de responder; nunca digas "Encontré" ni des datos del catálogo sin una lectura de este chat. ' +
   'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 5) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. ' +
-  'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada". ' +
+  'Si searchCatalog no devuelve resultados, no concluyas que no existe: la aplicación ya reintenta sola con las palabras clave. Si aun así queda vacío, haz UNA sola búsqueda más amplia con el nombre principal (marca o producto, sin dosis, presentación ni palabras genéricas) y nunca repitas la misma consulta; si sigue vacío, di que no lo encontraste y pregunta qué producto busca. ' +
+  'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: dilo claro ("Croquetas Pedigree no encontré; de Pedigree tengo …") y enumera esas opciones como alternativas, sin afirmar que son lo solicitado. Un error de lectura no es "sin resultados". ' +
+  'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada"; un producto que coincide y resulta agotado se sigue mostrando, como agotado, como alternativa. ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
   'no una aprobación humana previa a existencias. No inventes fechas de reposición ni ' +
@@ -248,7 +264,8 @@ export const CHECKOUT_CHANGE_REPLY = '¿Qué dato quiere corregir?';
 /** Lead for a tap on a button whose summary is no longer the current one. */
 export const STALE_BUTTON_LEAD = 'Ese botón ya no está vigente.';
 const STALE_BUTTON_FALLBACK = `${STALE_BUTTON_LEAD} ¿Qué desea hacer?`;
-const ORDER_BUTTONS_PROMPT = '¿Confirma su pedido?';
+/** S2: reply to «Agregar algo más» (no model call). */
+export const CART_ADD_MORE_REPLY = 'Claro, ¿qué producto desea agregar?';
 const CHECKOUT_BUTTONS_PROMPT = '¿Son correctos sus datos de entrega?';
 const CHOICE_LIST_PROMPT = 'Elija una opción de la lista.';
 const CATALOG_PRICES_MAX = 100;
@@ -339,6 +356,23 @@ const PAYMENT_INSTRUCTIONS_FRAGMENT =
   'los datos de pago, llame getPaymentDetails sin argumentos. La aplicación ' +
   'responde con los datos; nunca los escriba ni los invente, y nunca use ' +
   'askTeam para esto.';
+
+// S6: the registered order is already paid; nothing to offer or escalate.
+const PAID_ORDER_INSTRUCTIONS_FRAGMENT =
+  '\n\nEl pedido registrado del cliente ya está pagado. Si pregunta cómo pagar, ' +
+  'por la cuenta, la CLABE, el banco o los datos de pago, responda ' +
+  `«${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}»; no ofrezca métodos de pago, no ` +
+  'invente datos y nunca use askTeam para esto.';
+
+// S6: a paid order plus a NEW cart: a payment question is about the new order,
+// which is not registered yet (no details exist); never the paid one's.
+const PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT =
+  '\n\nEl pedido registrado anterior del cliente ya está pagado y tiene un ' +
+  'pedido nuevo en curso que aún no está registrado. Si pregunta cómo pagar, ' +
+  'por la cuenta, la CLABE, el banco o los datos de pago, se refiere al pedido ' +
+  `nuevo: respóndale «${MINIMAL_PAYMENT_NEW_ORDER_REPLY}»; no dé datos ni ` +
+  'métodos de pago del pedido anterior, no diga que el pedido nuevo ya está ' +
+  'pagado y nunca use askTeam para esto.';
 
 const ASK_TEAM_TOOL_UUID = z.uuid();
 
@@ -492,7 +526,8 @@ type ReorderRun = {
 };
 
 const REORDER_INSTRUCTIONS_FRAGMENT =
-  ' Si el cliente pide repetir un pedido anterior ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta.';
+  ' Use getLastOrder solo para un pedido ANTERIOR ya entregado o cerrado: si el cliente pide repetirlo ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta. ' +
+  'Si el cliente pide ver el resumen o el estado de SU pedido actual ("el resumen de mi pedido", "mi resumen", "ver mi pedido"), no llame getLastOrder: la aplicación muestra el resumen del pedido o carrito actual, o el pedido que ya registró; si no hay ninguno, dígalo y ofrezca ayudarle a armar su compra.';
 
 const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'lookupCheckoutCustomer',
@@ -661,6 +696,23 @@ type RegisterSelection = (identity: {
   productName: string;
   variantName?: string;
 }) => string | null;
+
+/**
+ * S7: tells the model the results of a 0-result query came from a broader
+ * search, so it presents them as alternatives instead of the exact request.
+ * Only the customer's own words and the retried words are echoed.
+ */
+function broadenedSearchNote(info: BroadenedSearchInfo) {
+  return {
+    original_query: info.originalQuery,
+    queries_tried: info.attempted,
+    matched_query: info.matchedQuery,
+    note:
+      info.matchedQuery === null
+        ? `Sin resultados para "${info.originalQuery}" ni con una búsqueda ampliada (${info.attempted.join(', ')}). No digas que existe; pide al cliente que indique qué producto busca.`
+        : `Sin resultados exactos para "${info.originalQuery}"; estos productos salieron de una búsqueda ampliada con "${info.matchedQuery}". No son exactamente lo pedido: preséntalos como alternativas y dilo claro.`,
+  };
+}
 
 function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
   const { stock, variants, ...identity } = item;
@@ -944,6 +996,12 @@ export class MinimalCatalogAgentService {
           };
         }
       }
+      // S5/S6: the current order and a paid order are answered without the
+      // model; a typed message only (a tapped button has its own route).
+      if (input.interactiveReplyId === undefined) {
+        const answered = await this.answerOrderRequest(input);
+        if (answered !== null) return answered;
+      }
       if (this.checkoutAvailable()) {
         let delivery = await this.checkout!.consume(input);
         if (delivery !== null) this.order?.dismiss(input.senderId);
@@ -1096,6 +1154,35 @@ export class MinimalCatalogAgentService {
       case 'reorder_change':
         this.order?.dismiss(senderId);
         return answer({ reply: REORDER_CHANGE_REPLY });
+      case 'cart_continue':
+      case 'cart_add_more': {
+        // S2: a cart button is honoured only for the cart it was sent with.
+        if ((await this.cart?.fingerprint(senderId)) !== intent.reference)
+          return {
+            decision: await this.representCartAfterStaleButton(
+              senderId,
+              input.text,
+              style,
+            ),
+          };
+        this.order?.dismiss(senderId);
+        if (intent.kind === 'cart_add_more')
+          return answer({ reply: CART_ADD_MORE_REPLY });
+        // «Seguir con la compra» is the customer asking to buy: the turn
+        // continues exactly like the typed «quiero comprar».
+        return {
+          input: {
+            senderId,
+            text: input.text,
+            ...(input.inboundEvent === undefined
+              ? {}
+              : { inboundEvent: input.inboundEvent }),
+            ...(input.inboundAt === undefined
+              ? {}
+              : { inboundAt: input.inboundAt }),
+          },
+        };
+      }
       case 'payment_method': {
         // Only transfer exists today; a new method adds its own handler.
         const decision = await this.sendPaymentDetails(input, intent.reference);
@@ -1151,6 +1238,171 @@ export class MinimalCatalogAgentService {
       // Fall through to the question; nothing was confirmed.
     }
     return { reply: STALE_BUTTON_FALLBACK };
+  }
+
+  /**
+   * S2: a cart button from a cart that has since changed. Nothing starts;
+   * the CURRENT cart is shown again with fresh buttons.
+   */
+  private async representCartAfterStaleButton(
+    senderId: string,
+    text: string,
+    style: CustomerStyle,
+    // S5: the same presentation without the stale-button lead.
+    lead: string | null = STALE_BUTTON_LEAD,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const result = await this.cart?.view(senderId);
+    const summary = result === undefined ? null : minimalCartReply(result);
+    const withLead = (body: string) =>
+      lead === null ? body : `${lead}\n\n${body}`;
+    const reply = applyCustomerStyle(
+      result?.ok === true && summary?.endsWith(MINIMAL_CART_SUMMARY_TAIL)
+        ? `${withLead(summary)}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
+        : summary === null || result?.ok !== true
+          ? STALE_BUTTON_FALLBACK
+          : withLead(summary),
+      style,
+    );
+    const interactive =
+      result?.ok === true && summary?.endsWith(MINIMAL_CART_SUMMARY_TAIL)
+        ? await this.cartNextStepInteractive(senderId, style)
+        : undefined;
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision(
+      interactive === undefined ? { reply } : { reply, interactive },
+    );
+  }
+
+  /** S2: the two next-step buttons bound to the cart as stored right now. */
+  private async cartNextStepInteractive(
+    senderId: string,
+    style: CustomerStyle,
+  ): Promise<CustomerReplyInteractive | undefined> {
+    const reference = await this.cart?.fingerprint(senderId);
+    if (reference === undefined || reference === null) return undefined;
+    const interactive = cartNextStepButtons(
+      reference,
+      applyCustomerStyle(MINIMAL_CART_NEXT_STEP_QUESTION, style),
+    );
+    return interactive.type === 'buttons'
+      ? {
+          ...interactive,
+          buttons: interactive.buttons.map((button) => ({
+            ...button,
+            title: applyCustomerRegister(button.title, style),
+          })),
+        }
+      : interactive;
+  }
+
+  /** True without a cart capability or when the stored cart has no lines. */
+  private async cartIsEmpty(senderId: string): Promise<boolean> {
+    return this.cart === undefined
+      ? true
+      : (await this.cart.storedLines(senderId)).length === 0;
+  }
+
+  /**
+   * S5/S6: typed requests about the customer's order, answered by the
+   * application once an order summary is pending or an order was placed.
+   * «Mi resumen» / «ver mi pedido» show the pending order summary (confirm
+   * button), else the current cart (next-step buttons) when one was started
+   * after an earlier order, else the order already placed (folio, total, paid
+   * or the payment step). A previous-order request is NOT one of them
+   * (getLastOrder keeps it), and neither is a cart-only customer (the model
+   * and its cart/checkout tools keep it). A payment question on a paid order
+   * answers that it is paid. `null` leaves the turn to the other routes.
+   */
+  private async answerOrderRequest(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const { senderId, text } = input;
+    const summaryAsked = isOrderSummaryRequest(text);
+    const paymentAsked = isPaymentQuestion(text);
+    if (!summaryAsked && !paymentAsked) return null;
+    // A delivery-data summary waiting for SÍ keeps the turn.
+    if (
+      this.checkoutAvailable() &&
+      this.checkout!.confirmationStatus(senderId)?.stage === 'pending'
+    )
+      return null;
+    const style = this.customerStyle(senderId, text);
+    const answer = (
+      result: MinimalCheckoutReply,
+      paymentOffer?: { saleId: string },
+    ): MinimalCatalogAgentDecision => {
+      const reply = applyCustomerStyle(result.reply, style);
+      this.recordTurn(
+        senderId,
+        [
+          { role: 'user', content: text },
+          { role: 'assistant', content: reply },
+        ],
+        [],
+        undefined,
+        undefined,
+        paymentOffer === undefined ? {} : { paymentOffer },
+      );
+      return {
+        kind: 'handled',
+        reply,
+        ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+        ...(result.interactive === undefined
+          ? {}
+          : { interactive: styleInteractivePrompt(result.interactive, style) }),
+      };
+    };
+    const pendingSummary =
+      this.orderAvailable() && this.order!.offerStatus(senderId) !== null;
+    const cartEmpty = await this.cartIsEmpty(senderId);
+    const placed =
+      this.payment === undefined
+        ? null
+        : await this.payment.placedSale(senderId);
+    if (paymentAsked && placed?.paid === true) {
+      if (cartEmpty && !pendingSummary) {
+        this.order?.dismiss(senderId);
+        return answer({ reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY });
+      }
+      // A new order in progress: it may be the one being asked about. Its
+      // details do not exist yet and the paid one has none to give; a pending
+      // summary for the new order stays untouched.
+      return answer({ reply: MINIMAL_PAYMENT_NEW_ORDER_REPLY });
+    }
+    if (!summaryAsked) return null;
+    // Without a pending summary or a placed order the model keeps the turn.
+    if (!pendingSummary && placed === null) return null;
+    if (pendingSummary) {
+      try {
+        return answer(
+          await this.order!.prepareOrder(senderId, input.inboundEvent),
+        );
+      } catch {
+        return null;
+      }
+    }
+    if (!cartEmpty) {
+      this.order?.dismiss(senderId);
+      return await this.representCartAfterStaleButton(
+        senderId,
+        text,
+        style,
+        null,
+      );
+    }
+    const status = await this.payment?.placedOrderStatus(senderId);
+    if (status === undefined || status === null) return null;
+    this.order?.dismiss(senderId);
+    return answer(status, status.paymentOffer);
   }
 
   /** The payment offer of the bot's latest message, if any. */
@@ -1225,7 +1477,11 @@ export class MinimalCatalogAgentService {
   /** A deterministic reorder reply (recorded without an offer: spends it). */
   private answerReorder(
     input: { senderId: string; text: string },
-    result: { reply: string; onSent?: () => void },
+    result: {
+      reply: string;
+      onSent?: () => void;
+      interactive?: CustomerReplyInteractive;
+    },
   ): MinimalCatalogAgentDecision {
     const reply = applyCustomerStyle(
       result.reply,
@@ -1239,11 +1495,13 @@ export class MinimalCatalogAgentService {
       ],
       [],
     );
-    return this.decision(
-      result.onSent === undefined
-        ? { reply }
-        : { reply, onSent: result.onSent },
-    );
+    return this.decision({
+      reply,
+      ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+      ...(result.interactive === undefined
+        ? {}
+        : { interactive: result.interactive }),
+    });
   }
 
   /**
@@ -1298,6 +1556,11 @@ export class MinimalCatalogAgentService {
       input,
       continued ?? {
         reply: `${minimalCartReply(result)}\n\n${REORDER_NEXT_STEP}`,
+        // The same next-step buttons as any cart summary.
+        interactive: await this.cartNextStepInteractive(
+          senderId,
+          this.customerStyle(senderId, input.text),
+        ),
       },
     );
   }
@@ -1500,10 +1763,18 @@ export class MinimalCatalogAgentService {
     const cartReply: CartReply = { attempted: false, value: null };
     const askTeamRun: ExpirationReply | null =
       this.team === undefined ? null : { attempted: false, value: null };
-    // Only a customer with a placed order can ask for its payment details.
+    // Only a customer with an unpaid placed order can ask for its payment
+    // details; once it is paid there is no payment tool (S6).
+    const placed =
+      this.payment === undefined
+        ? null
+        : await this.payment.placedSale(input.senderId);
+    const paidPlaced = placed?.paid === true;
+    const cartEmptyNow = paidPlaced && (await this.cartIsEmpty(input.senderId));
+    const paidOrder = paidPlaced && cartEmptyNow;
+    const paidOrderNewCart = paidPlaced && !cartEmptyNow;
     const paymentRun: PaymentRun | null =
-      this.payment !== undefined &&
-      (await this.payment.placedSale(input.senderId)) !== null
+      placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
         : null;
     const checkoutRun: CheckoutRun | null =
@@ -1577,7 +1848,7 @@ export class MinimalCatalogAgentService {
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
         (checkoutRun === null
           ? 'Cuando el cliente quiera comprar, continuar o revisar su compra, llame reviewCheckout sin argumentos. '
-          : 'Si el cliente quiere comprar o continuar con la compra, NO llame reviewCheckout: llame lookupCheckoutCustomer (ver Datos de entrega). Llame reviewCheckout sin argumentos solo si pide revisar su compra o cuánto lleva. ') +
+          : 'Si el cliente quiere comprar o continuar con la compra, NO llame reviewCheckout: llame lookupCheckoutCustomer (ver Datos de entrega). Llame reviewCheckout sin argumentos solo si pide revisar cuánto lleva su carrito; el resumen de su pedido pendiente o ya registrado lo muestra la aplicación, no esta herramienta. ') +
         'reviewCheckout es solo una revisión con precios y existencias frescos; no recopila ni guarda datos del cliente, no cotiza envío ni registra pedidos. La aplicación comunica el subtotal y lo que falta; nunca interprete incomplete como una compra lista o confirmada.' +
         (checkoutRun === null ? '' : CHECKOUT_INSTRUCTIONS_FRAGMENT) +
         (checkoutRun !== null && this.orderAvailable()
@@ -1605,6 +1876,8 @@ export class MinimalCatalogAgentService {
         cartInstructions +
         (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
+        (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
+        (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
         this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),
@@ -1832,7 +2105,16 @@ export class MinimalCatalogAgentService {
         : { reply, onSent: continued.onSent };
     }
     if (cartReply.value !== null) {
-      const reply = styled(cartReply.value);
+      // S2: a cart summary closes with the next-step question and buttons.
+      const invites = cartReply.value.endsWith(MINIMAL_CART_SUMMARY_TAIL);
+      const reply = styled(
+        invites
+          ? `${cartReply.value}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
+          : cartReply.value,
+      );
+      const nextStep = invites
+        ? await this.cartNextStepInteractive(input.senderId, style)
+        : undefined;
       // S4: a server product/presentation question goes out as a list.
       const choice = cartConversation?.lastChoice ?? null;
       const list =
@@ -1863,7 +2145,11 @@ export class MinimalCatalogAgentService {
       return {
         reply,
         ...(media === undefined ? {} : { media }),
-        ...(list === null ? {} : { interactive: list.interactive }),
+        ...(list === null
+          ? nextStep === undefined
+            ? {}
+            : { interactive: nextStep }
+          : { interactive: list.interactive }),
       };
     }
     if (this.hasInvalidCartToolCall(result)) {
@@ -2399,6 +2685,12 @@ export class MinimalCatalogAgentService {
     senderId: string,
     inboundEvent: unknown,
     lead: string | null,
+    /**
+     * S3: the shipping notice of a quote that just succeeded. The summary
+     * repeats the cost and the ETA, so it is sent only when no summary
+     * follows (the customer must still hear the quote).
+     */
+    quoteNotice: string | null = null,
   ): Promise<MinimalCheckoutReply> {
     const join = (...parts: Array<string | null>) =>
       parts.filter((part): part is string => part !== null).join('\n\n');
@@ -2414,7 +2706,12 @@ export class MinimalCatalogAgentService {
       first.reply !== MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY ||
       !this.shippingAvailable()
     )
-      return withLead(lead, first);
+      return withLead(
+        first.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING)
+          ? lead
+          : join(lead, quoteNotice),
+        first,
+      );
     let quoted: MinimalShippingResult;
     try {
       quoted = await this.shipping!.quote(senderId);
@@ -2423,9 +2720,12 @@ export class MinimalCatalogAgentService {
     }
     const shippingLine = minimalShippingReply(quoted);
     if (quoted.kind !== 'quoted') return { reply: join(lead, shippingLine) };
+    const summary = await this.order!.prepareOrder(senderId, inboundEvent);
     return withLead(
-      join(lead, shippingLine),
-      await this.order!.prepareOrder(senderId, inboundEvent),
+      summary.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING)
+        ? lead
+        : join(lead, shippingLine),
+      summary,
     );
   }
 
@@ -2587,7 +2887,12 @@ export class MinimalCatalogAgentService {
         inputSchema: z.object({ q: z.string().min(1) }),
         execute: async ({ q }) => {
           try {
-            const items = await chatbotApi.searchCatalog(q);
+            // S7: a 0-result multi-word query is retried (bounded) with its
+            // significant words; a retry error is an ordinary search error.
+            const { items, broadened } = await searchWithBroadening(
+              (query) => chatbotApi.searchCatalog(query),
+              q,
+            );
             const results = items.map((item) =>
               projectItem(item, registerSelection('searchCatalog')),
             );
@@ -2609,12 +2914,18 @@ export class MinimalCatalogAgentService {
               }
             }
             trace(
-              `tool searchCatalog result=ok searchResultCount=${items.length}`,
+              `tool searchCatalog result=ok searchResultCount=${items.length}` +
+                (broadened === null
+                  ? ''
+                  : ` broadenedCalls=${broadened.attempted.length}`),
             );
             return {
               ok: true as const,
               stock_verified: false as const,
               results,
+              ...(broadened === null
+                ? {}
+                : { broadened_search: broadenedSearchNote(broadened) }),
             };
           } catch {
             trace('tool searchCatalog result=error code=catalog_unavailable');
@@ -3275,6 +3586,7 @@ export class MinimalCatalogAgentService {
                             ? await this.continueToOrder(
                                 context.senderId,
                                 context.inboundEvent,
+                                null,
                                 minimalShippingReply(result),
                               )
                             : { reply: minimalShippingReply(result) };

@@ -228,6 +228,8 @@ describe('normalizeInboundMessages interactive replies (S4)', () => {
     ['checkout_confirm:ref-2', '✅ Sí, son correctos', 'SÍ'],
     ['order_change', '✏️ Cambiar algo', 'Quiero cambiar algo'],
     ['checkout_change', '✏️ Corregir datos', 'Quiero corregir mis datos'],
+    ['cart_continue:ref-3', 'Seguir con la compra', 'Quiero comprar'],
+    ['cart_add:ref-3', 'Agregar algo más', 'Agregar algo más'],
     ['something_else', 'Otra cosa', 'Otra cosa'],
   ])('button_reply %s → "%s" text', (id, title, text) => {
     expect(

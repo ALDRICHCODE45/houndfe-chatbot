@@ -340,7 +340,14 @@ describe('S2 reorder: accepting or declining', () => {
     expect(added.reply).toMatch(
       /¿Desea agregar algo más o seguimos con su compra\?$/,
     );
-    expect(added.interactive).toBeUndefined();
+    // S2: the reorder result closes with the same two cart buttons.
+    expect(added.interactive).toMatchObject({
+      type: 'buttons',
+      buttons: [
+        { id: expect.stringMatching(/^cart_continue:/) as string },
+        { id: expect.stringMatching(/^cart_add:/) as string },
+      ],
+    });
 
     const again = await h.turn('SÍ', [say('¿Algo más?')], confirm);
     expect(again.reply).toContain(STALE_BUTTON_LEAD);

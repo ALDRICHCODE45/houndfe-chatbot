@@ -245,6 +245,14 @@ notification drain). Outside the 24 h WhatsApp customer window a free-text
 message cannot be sent: the outcome is recorded as `OUTSIDE_WINDOW`, nothing
 is sent and nothing loops (a Meta template for this case is a leftover).
 
+After a `CONFIRMED` outcome with `debtCents = 0` is recorded (inside or outside
+the window; not when another worker already recorded it), the poller marks the
+conversation's placed sale as paid (`markSalePaid` port →
+`markPlacedSalePaid`, one CAS on `minimalCart.placedSale`). It is fire-and-forget
+and best effort: a failure logs `placed sale paid mark failed; order stays
+unpaid` and never affects the notice. `PARTIAL` and `REJECTED` do not mark it.
+See `docs/minimal-order-placement.md` ("Paid orders").
+
 A queued outcome message can wait in the outbox (retries, a busy drain), so
 the notification drain checks the window again right before sending, using the
 same inbound-observation evidence. If the window is confirmed closed, nothing

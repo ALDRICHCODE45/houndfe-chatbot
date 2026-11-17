@@ -249,12 +249,12 @@ describe('Minimal cart through the public SDK route', () => {
           : 'Solo deja las croquetas en mi carrito por favor, quita todo lo demas';
       expect(
         await f.createAgent().tryHandle({ senderId: SENDER, text }),
-      ).toEqual({
+      ).toMatchObject({
         kind: 'handled',
         reply: styledFor(
           text,
           success
-            ? 'Su carrito:\n• Croquetas nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $450.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
+            ? 'Su carrito:\n• Croquetas nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $450.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?'
             : mode === 'evidence'
               ? CART_OPERATION_CLARIFICATION
               : CART_UNKNOWN_REFERENCE_REPLY,
@@ -413,11 +413,11 @@ describe('Minimal cart through the public SDK route', () => {
       ]);
       expect(
         await f.createAgent().tryHandle({ senderId: SENDER, text }),
-      ).toEqual({
+      ).toMatchObject({
         kind: 'handled',
         reply: styledFor(
           text,
-          'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+          'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
         ),
       });
       expect(domain).toHaveBeenCalledTimes(1);
@@ -514,12 +514,12 @@ describe('Minimal cart through the public SDK route', () => {
       ]);
       expect(
         await f.createAgent().tryHandle({ senderId: SENDER, text }),
-      ).toEqual({
+      ).toMatchObject({
         kind: 'handled',
         reply: styledFor(
           text,
           selected
-            ? 'Su carrito:\n• Product — 250mg: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.'
+            ? 'Su carrito:\n• Product — 250mg: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?'
             : '¿Qué presentación desea agregar al carrito?',
         ),
       });
@@ -657,11 +657,11 @@ describe('Minimal cart through the public SDK route', () => {
           senderId: SENDER,
           text: addText,
         }),
-      ).toEqual({
+      ).toMatchObject({
         kind: 'handled',
         reply: styledFor(
           addText,
-          'Su carrito:\n• Ibuprofeno — 250mg: 2 × $130.00 MXN; importe $260.00 MXN\n• Croquetas Nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $710.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+          'Su carrito:\n• Ibuprofeno — 250mg: 2 × $130.00 MXN; importe $260.00 MXN\n• Croquetas Nupec: 1 × $450.00 MXN; importe $450.00 MXN\nTotal de productos: $710.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
         ),
       });
       expect(writes).toHaveBeenCalledTimes(1);
@@ -974,13 +974,13 @@ describe('Minimal cart through the public SDK route', () => {
       const response = await f
         .createAgent()
         .tryHandle({ senderId: SENDER, text });
-      expect(response).toEqual({
+      expect(response).toMatchObject({
         kind: 'handled',
         reply: styledFor(
           text,
           quantity === 0
             ? 'Su carrito está vacío.'
-            : 'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+            : 'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
         ),
       });
       expect(cartLogs(logs)).toEqual([
@@ -1132,7 +1132,7 @@ describe('Minimal cart through the public SDK route', () => {
           text,
           quantity === 0
             ? 'Su carrito está vacío.'
-            : 'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+            : 'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
         ),
       });
       expect(
@@ -1163,10 +1163,10 @@ describe('Minimal cart through the public SDK route', () => {
       senderId: SENDER,
       text: 'Agregue dos productos al carrito',
     });
-    expect(first).toEqual({
+    expect(first).toMatchObject({
       kind: 'handled',
       reply:
-        'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        'Su carrito:\n• Product: 2 × $12.00 MXN; importe $24.00 MXN\nTotal de productos: $24.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
     });
     f.steps([call('getCart', {}), say()]);
     expect(
@@ -1253,8 +1253,8 @@ describe('Minimal cart through the public SDK route', () => {
       const reply =
         expected === 0
           ? 'Su carrito está vacío.'
-          : `Su carrito:\n• Product: ${expected} × $12.00 MXN; importe $${(expected * 12).toFixed(2)} MXN\nTotal de productos: $${(expected * 12).toFixed(2)} MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`;
-      expect(response).toEqual({
+          : `Su carrito:\n• Product: ${expected} × $12.00 MXN; importe $${(expected * 12).toFixed(2)} MXN\nTotal de productos: $${(expected * 12).toFixed(2)} MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?`;
+      expect(response).toMatchObject({
         kind: 'handled',
         reply: styledFor(text, reply),
       });

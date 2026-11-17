@@ -11,6 +11,7 @@ import type { HandoffModeService } from '../conversation/application/handoff-mod
 import { PostgresCustomerInboundObservationStore } from '../human-decisions/infrastructure/postgres-customer-inbound-observation.store';
 import type { DeliveryZoneRequesterRow } from './domain/delivery-zone-requester';
 import type { DeliveryZoneNotifier } from './application/delivery-zone-notifier';
+import { DeliveryZoneResumeRegistry } from './domain/delivery-zone-resume';
 
 function build(
   phone: unknown = '123456789',
@@ -18,6 +19,7 @@ function build(
     store?: InMemoryDeliveryZoneRequesterStore;
     sender?: WhatsappSenderPort;
     handoff?: Pick<HandoffModeService, 'isHumanMode'>;
+    resume?: DeliveryZoneResumeRegistry;
   } = {},
 ) {
   const config = { get: () => phone } as unknown as ConfigService;
@@ -35,6 +37,8 @@ function build(
     (overrides.handoff ?? {
       isHumanMode: () => Promise.resolve(false),
     }) as HandoffModeService,
+    undefined,
+    overrides.resume,
   );
 }
 
@@ -163,4 +167,94 @@ describe('DeliveryZoneRuntime', () => {
       expect(store.rows.get(SOURCE)?.status).not.toBe('RESOLVED');
     });
   });
+});
+
+describe('DeliveryZoneRuntime S4 checkout resume wiring', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  const run = async (registry: DeliveryZoneResumeRegistry | undefined) => {
+    let notifier!: Pick<DeliveryZoneNotifier, 'process'>;
+    jest
+      .spyOn(DeliveryZonePoller.prototype, 'start')
+      .mockImplementation(function (this: DeliveryZonePoller) {
+        notifier = (this as unknown as { notifier: typeof notifier }).notifier;
+      });
+    jest.spyOn(DeliveryZonePoller.prototype, 'stop').mockResolvedValue();
+    jest
+      .spyOn(PostgresCustomerInboundObservationStore.prototype, 'readLatest')
+      .mockResolvedValue({
+        kind: 'found',
+        observation: {
+          senderId: SENDER,
+          receivingPhoneNumberId: '123456789',
+          messageId: 'wamid.in',
+          providerTimestampSeconds: String(Math.floor(Date.now() / 1000) - 60),
+          observedAt: new Date().toISOString(),
+        },
+      });
+    const store = new InMemoryDeliveryZoneRequesterStore();
+    store.rows.set(SOURCE, resolvedRow());
+    const sender = {
+      sendText: jest.fn().mockResolvedValue({ providerMessageId: 'w.t' }),
+      sendTemplate: jest.fn().mockResolvedValue({ providerMessageId: 'w.tpl' }),
+      sendInteractive: jest.fn().mockResolvedValue({
+        providerMessageId: 'w.i',
+        providerMessageIds: ['w.i'],
+      }),
+    };
+    const runtime = build('123456789', {
+      store,
+      sender: sender as unknown as WhatsappSenderPort,
+      ...(registry === undefined ? {} : { resume: registry }),
+    });
+    runtime.onApplicationBootstrap();
+    await notifier.process(resolvedRow());
+    await runtime.onModuleDestroy();
+    return { sender };
+  };
+
+  it('resolves the registered resumer at call time and sends the summary with buttons', async () => {
+    const registry = new DeliveryZoneResumeRegistry();
+    const arm = jest.fn();
+    const prepare = jest.fn().mockResolvedValue({
+      shippingSentence: 'el envío no tiene costo',
+      summary: {
+        text: 'Resumen de su pedido:',
+        buttons: [{ id: 'order_confirm:r', title: '✅ Confirmar pedido' }],
+        prompt: '¿Confirma su pedido?',
+      },
+      arm,
+      discard: jest.fn(),
+    });
+    registry.register({ prepare });
+    const { sender } = await run(registry);
+    expect(prepare).toHaveBeenCalledWith({
+      senderId: SENDER,
+      zipCode: '06700',
+      zoneType: 'FREE',
+      sourceRequestId: SOURCE,
+      receivingPhoneNumberId: '123456789',
+    });
+    expect(sender.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: '¡Listo! Ya tenemos entrega a su código postal 06700: el envío no tiene costo.',
+    });
+    expect(sender.sendInteractive).toHaveBeenCalledTimes(1);
+    expect(arm).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['no registry', undefined],
+    ['no registered resumer', new DeliveryZoneResumeRegistry()],
+  ] as const)(
+    '%s: the current notice text, no summary',
+    async (_label, registry) => {
+      const { sender } = await run(registry);
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: SENDER,
+        text: '¡Listo! Ya tenemos entrega a su código postal 06700. Pídame de nuevo el envío y le muestro el costo actualizado.',
+      });
+      expect(sender.sendInteractive).not.toHaveBeenCalled();
+    },
+  );
 });

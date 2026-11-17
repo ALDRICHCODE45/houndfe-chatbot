@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
 import { z } from 'zod';
 import {
@@ -36,6 +37,9 @@ const placedSaleSchema = z.strictObject({
   // The customer chose to pay but the bank details could not be read; the
   // team was asked once. Absent in orders stored before the payment step.
   paymentPending: z.literal(true).optional(),
+  // The receipt outcome poller saw a CONFIRMED receipt with no debt left.
+  // Absent in orders stored before this field: absent means unpaid.
+  paid: z.literal(true).optional(),
 });
 const cartSchema = z.strictObject({
   items: z.array(lineSchema),
@@ -154,6 +158,22 @@ export class MinimalCartService {
       }));
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * S2: identity of the stored cart lines (product, presentation, quantity),
+   * so a cart-summary button is honoured only for the cart it was sent with.
+   * `null` when the cart is unreadable.
+   */
+  async fingerprint(senderId: string): Promise<string | null> {
+    try {
+      const cart = this.read(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      return cart === null ? null : minimalCartFingerprint(cart.items);
+    } catch {
+      return null;
     }
   }
 
@@ -638,6 +658,27 @@ export class MinimalCartService {
   }
 }
 
+/** Stable short digest of cart lines; order-independent. */
+export function minimalCartFingerprint(
+  items: ReadonlyArray<Pick<CartItem, 'productId' | 'variantId' | 'quantity'>>,
+): string {
+  const lines = items
+    .map((item) => `${item.productId}|${item.variantId ?? ''}|${item.quantity}`)
+    .sort();
+  return createHash('sha256')
+    .update(JSON.stringify(lines))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+/** Last sentence of a non-empty cart summary (see `minimalCartReply`). */
+export const MINIMAL_CART_SUMMARY_TAIL =
+  'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.';
+
+/** S2: the question that closes a cart summary (usted; styled per customer). */
+export const MINIMAL_CART_NEXT_STEP_QUESTION =
+  '¿Desea agregar algo más o seguimos con su compra?';
+
 /** Server-owned acknowledgement: failed persistence must never look successful. */
 export function minimalCartReply(result: MinimalCartResult): string {
   if (!result.ok) {
@@ -655,5 +696,5 @@ export function minimalCartReply(result: MinimalCartResult): string {
     (i) =>
       `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}`,
   );
-  return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`;
+  return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\n${MINIMAL_CART_SUMMARY_TAIL}`;
 }

@@ -222,6 +222,7 @@ function orderHarness() {
     api,
     seen,
     checkout,
+    cart,
     store,
     turn: async (
       text: string,
@@ -253,6 +254,20 @@ function orderHarness() {
     unconfirmed: async () => {
       await seed(false);
       await selectAddress();
+    },
+    /** A concurrent cart edit: same line, new quantity. */
+    setQuantity: async (quantity: number) => {
+      const raw = (await store.get(SENDER))?.data.minimalCart;
+      await store.commitMinimalCart(
+        SENDER,
+        raw,
+        {
+          items: [{ productId: PRODUCT, quantity, unitPriceCents: 1500 }],
+          idempotencyKey: '',
+          expectedTotalCents: 1500 * quantity,
+        },
+        new Date().toISOString(),
+      );
     },
     cartItems: async () =>
       (
@@ -405,6 +420,176 @@ describe('S4 order summary buttons', () => {
       prompt: '¿Confirmas tu pedido?',
       buttons: [{ title: '✅ Confirmar pedido' }, { title: '✏️ Cambiar algo' }],
     });
+  });
+});
+
+const CART_QUESTION = '¿Desea agregar algo más o seguimos con su compra?';
+const CART_TAIL =
+  'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.';
+
+describe('S2 cart summary invites the customer to continue', () => {
+  const viewCart = (
+    h: ReturnType<typeof orderHarness>,
+    text: string,
+    id: string,
+  ) => h.turn(text, [call('getCart'), say('texto del modelo')], id);
+
+  it('ends with the exact question and exactly the two buttons, bound to the cart', async () => {
+    const h = orderHarness();
+    await h.unconfirmed();
+    const view = await viewCart(h, '¿Qué llevo en mi carrito?', 'c1');
+    expect(view.reply).toContain('Su carrito:');
+    expect(view.reply.endsWith(`${CART_TAIL}\n\n${CART_QUESTION}`)).toBe(true);
+    expect(view.interactive).toEqual({
+      type: 'buttons',
+      buttons: [
+        {
+          id: expect.stringMatching(/^cart_continue:.+/) as string,
+          title: 'Seguir con la compra',
+        },
+        {
+          id: expect.stringMatching(/^cart_add:.+/) as string,
+          title: 'Agregar algo más',
+        },
+      ],
+      prompt: CART_QUESTION,
+    });
+  });
+
+  it('a tú customer gets the question in tú; titles are unchanged', async () => {
+    const h = orderHarness();
+    await h.unconfirmed();
+    const view = await viewCart(h, 'oye, ¿me puedes mostrar mi carrito?', 'c1');
+    expect(
+      view.reply.endsWith(
+        '¿Quieres agregar algo más o seguimos con tu compra?',
+      ),
+    ).toBe(true);
+    expect(view.interactive).toMatchObject({
+      type: 'buttons',
+      prompt: '¿Quieres agregar algo más o seguimos con tu compra?',
+      buttons: [
+        { title: 'Seguir con la compra' },
+        { title: 'Agregar algo más' },
+      ],
+    });
+  });
+
+  it('an empty cart or a non-cart reply gets no buttons', async () => {
+    const h = orderHarness();
+    const empty = await viewCart(h, '¿Qué llevo en mi carrito?', 'c1');
+    expect(empty.reply).toBe('Su carrito está vacío.');
+    expect(empty.interactive).toBeUndefined();
+    const other = await h.turn('hola', [say('¡Hola!')], 'c2');
+    expect(other.interactive).toBeUndefined();
+  });
+
+  it('tapping «Seguir con la compra» starts checkout exactly like «quiero comprar»', async () => {
+    const lookup = [
+      call('lookupCheckoutCustomer', { nextPageRef: null }),
+      say('Veo su dirección guardada en Av. Juárez. ¿La usamos?'),
+    ];
+    const typedHarness = orderHarness();
+    await typedHarness.unconfirmed();
+    const typed = await typedHarness.turn('Quiero comprar', lookup, 'b1');
+
+    const tapHarness = orderHarness();
+    await tapHarness.unconfirmed();
+    const view = await viewCart(tapHarness, '¿Qué llevo en mi carrito?', 'c1');
+    const callsBefore = tapHarness.seen.length;
+    const tapped = await tapHarness.turn(
+      'Quiero comprar',
+      lookup,
+      'b1',
+      buttonIds(view)[0],
+    );
+
+    expect(tapped.reply).toBe(typed.reply);
+    expect(tapped.interactive).toEqual(typed.interactive);
+    // The model saw the same user turn and the same checkout read ran.
+    expect(tapHarness.seen).toHaveLength(callsBefore + 1);
+    const lastUser = (seen: unknown) =>
+      (seen as { messages: Array<{ role: string; content: string }> }).messages
+        .filter((message) => message.role === 'user')
+        .at(-1)?.content;
+    expect(lastUser(tapHarness.seen.at(-1))).toBe('Quiero comprar');
+    expect(lastUser(typedHarness.seen.at(-1))).toBe('Quiero comprar');
+    expect(tapHarness.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(
+      typedHarness.api.getCustomerCheckoutContext.mock.calls.length,
+    );
+    expect(await tapHarness.cartItems()).toEqual(
+      await typedHarness.cartItems(),
+    );
+  });
+
+  it('tapping «Agregar algo más» invites naming a product without calling the model', async () => {
+    const h = orderHarness();
+    await h.unconfirmed();
+    const view = await viewCart(h, '¿Qué llevo en mi carrito?', 'c1');
+    const before = await h.cartItems();
+    const calls = h.seen.length;
+    const lookups = h.api.getCustomerCheckoutContext.mock.calls.length;
+    const added = await h.turn(
+      'Agregar algo más',
+      [say('no debería usarse')],
+      'c2',
+      buttonIds(view)[1],
+    );
+    expect(h.seen).toHaveLength(calls);
+    expect(added.reply).toBe('Claro, ¿qué producto desea agregar?');
+    expect(added.interactive).toBeUndefined();
+    expect(await h.cartItems()).toEqual(before);
+    expect(h.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(lookups);
+  });
+
+  it('a tú customer gets the add-more invitation in tú', async () => {
+    const h = orderHarness();
+    await h.unconfirmed();
+    const view = await viewCart(h, 'oye, ¿me puedes mostrar mi carrito?', 'c1');
+    const added = await h.turn(
+      'Agregar algo más',
+      [say('x')],
+      'c2',
+      buttonIds(view)[1],
+    );
+    expect(added.reply).toBe('Claro, ¿qué producto quieres agregar?');
+  });
+
+  it('a button from a cart that changed re-presents the current cart instead of acting', async () => {
+    const h = orderHarness();
+    await h.unconfirmed();
+    const first = await viewCart(h, '¿Qué llevo en mi carrito?', 'c1');
+    await h.setQuantity(3);
+    const calls = h.seen.length;
+    const lookups = h.api.getCustomerCheckoutContext.mock.calls.length;
+
+    const stale = await h.turn(
+      'Quiero comprar',
+      [say('no debería usarse')],
+      'c2',
+      buttonIds(first)[0],
+    );
+    expect(h.seen).toHaveLength(calls);
+    expect(h.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(lookups);
+    expect(stale.reply).toMatch(/^Ese botón ya no está vigente\./);
+    expect(stale.reply).toContain('3 × $15.00 MXN');
+    expect(stale.reply.endsWith(CART_QUESTION)).toBe(true);
+    const current = buttonIds(stale);
+    expect(current).toHaveLength(2);
+    expect(current).not.toContain(buttonIds(first)[0]);
+
+    // The same stale «Agregar algo más» does not act either.
+    const staleAdd = await h.turn(
+      'Agregar algo más',
+      [say('x')],
+      'c3',
+      buttonIds(first)[1],
+    );
+    expect(staleAdd.reply).toMatch(/^Ese botón ya no está vigente\./);
+
+    // The fresh button works.
+    const ok = await h.turn('Agregar algo más', [say('x')], 'c4', current[1]);
+    expect(ok.reply).toBe('Claro, ¿qué producto desea agregar?');
   });
 });
 

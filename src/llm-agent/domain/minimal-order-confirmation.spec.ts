@@ -111,12 +111,46 @@ describe('shipping summary and exact binding', () => {
       'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
     );
   });
-  it('[S3] presents a zero charge as shipping without cost and no extra total', () => {
+  it('[S3] presents a zero charge as shipping without cost and still ends with the total to pay', () => {
     const summary = renderMinimalOrderSummary(withShipping(0));
     expect(summary).toContain('Total de productos: $27.00 MXN');
     expect(summary).toContain('Envío: sin costo para usted');
-    expect(summary).not.toContain('Total a pagar');
+    expect(summary).toContain('Total a pagar: $27.00 MXN');
     expect(summary).not.toContain('no está incluido');
+  });
+  it.each([
+    ['charged', withShipping(5000), 'Total a pagar: $77.00 MXN'],
+    ['free', withShipping(0), 'Total a pagar: $27.00 MXN'],
+    [
+      'pickup',
+      { ...eligible(), shipping: { mode: 'pickup' as const } },
+      'Total a pagar: $27.00 MXN',
+    ],
+  ])(
+    '[S3] %s: «Total a pagar» is the last line before the SÍ prompt',
+    (_name, snapshot, total) => {
+      const lines = renderMinimalOrderSummary(snapshot).split('\n');
+      expect(lines.slice(-3)).toEqual([
+        total,
+        '',
+        'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
+      ]);
+      expect(
+        lines.filter((line) => line.startsWith('Total a pagar')),
+      ).toHaveLength(1);
+    },
+  );
+  it('[S3] shows the shipping charge and the ETA exactly once', () => {
+    const summary = renderMinimalOrderSummary({
+      ...eligible(),
+      shipping: {
+        quoteId: 'quote-1',
+        customerChargeCents: 0,
+        eta: { days: 1 },
+      },
+    });
+    expect(summary.match(/Llega en/g)).toHaveLength(1);
+    expect(summary.match(/Envío/g)).toHaveLength(1);
   });
   it('[S3,S7] shows carrier, charge, credit and the ETA line', () => {
     const summary = renderMinimalOrderSummary({
@@ -164,7 +198,7 @@ describe('shipping summary and exact binding', () => {
     expect(summary).toContain('Recoge en tienda (sin costo de envío)');
     expect(summary).toContain('Total de productos: $27.00 MXN');
     expect(summary).not.toContain('Entrega a:');
-    expect(summary).not.toContain('Total a pagar');
+    expect(summary).toContain('Total a pagar: $27.00 MXN');
     expect(summary).not.toContain('no está incluido');
     expect(sameMinimalOrder(snapshot, structuredClone(snapshot))).toBe(true);
     expect(sameMinimalOrder(snapshot, withShipping(0))).toBe(false);

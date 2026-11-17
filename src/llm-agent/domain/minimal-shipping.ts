@@ -239,6 +239,37 @@ export function minimalShippingEtaLine(
     : `Llega en aproximadamente ${eta.days} días hábiles.`;
 }
 
+const resumeMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
+
+/**
+ * S4: the shipping clause of the «zone approved» notice, from the fresh
+ * quote only: free (the customer's charge is 0, credit included) or the
+ * amount the customer pays, plus the ETA when the backend gave one. No
+ * trailing period.
+ */
+export function minimalZoneResumeShippingSentence(
+  quote: Pick<MinimalShippingQuote, 'eta' | 'option'> & {
+    customerChargeCents: number;
+  },
+): string {
+  const eta = minimalShippingEta(quote);
+  const arrival =
+    eta === null
+      ? ''
+      : eta.reason === 'STOCK_PENDING'
+        ? ' y la fecha de entrega depende de la reposición de existencias'
+        : eta.days === null
+          ? ''
+          : eta.days === 1
+            ? ' y llega en aproximadamente 1 día hábil'
+            : ` y llega en aproximadamente ${eta.days} días hábiles`;
+  return `${
+    quote.customerChargeCents === 0
+      ? 'el envío no tiene costo'
+      : `el envío cuesta ${resumeMxn(quote.customerChargeCents)}`
+  }${arrival}`;
+}
+
 /**
  * `current` only for a deliverable zone with a quoteId, strictly before the
  * backend `expiresAt`, whose cart and destination pins match exactly.

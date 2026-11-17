@@ -266,10 +266,18 @@ describe('F1 checkout continues to the order summary by itself', () => {
     expect(h.llmCalls()).toBe(before);
     expect(summary).not.toContain('hacer pedido');
     expect(summary).not.toMatch(/no crea un pedido|solo en este chat/);
-    expect(summary).toContain(
-      'Su envío al código postal 03100 no tiene costo.',
+    // S3: the cost and the ETA appear once, inside the summary; no shipping
+    // block precedes it and the total to pay closes it.
+    expect(summary).not.toContain('Su envío al código postal');
+    expect(summary).not.toContain('no tiene costo.');
+    expect(summary).toMatch(
+      /^Gracias, sus datos de entrega quedaron confirmados\.\n\nResumen de su pedido:/,
     );
-    expect(summary.endsWith(ORDER_ENDING)).toBe(true);
+    expect(summary.match(/Llega en aproximadamente/g)).toHaveLength(1);
+    expect(summary).toContain('Envío: sin costo para usted');
+    expect(
+      summary.endsWith(`Total a pagar: $15.00 MXN\n\n${ORDER_ENDING}`),
+    ).toBe(true);
     expect(h.quotes.calls).toHaveLength(1);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
 

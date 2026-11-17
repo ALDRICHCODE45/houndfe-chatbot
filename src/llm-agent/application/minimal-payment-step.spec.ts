@@ -17,6 +17,7 @@ import { MinimalCartService, parseMinimalCart } from './minimal-cart.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
 import { MinimalOrderService } from './minimal-order.service';
+import { markPlacedSalePaid } from './minimal-paid-sale';
 import { MinimalPaymentService } from './minimal-payment.service';
 import { MinimalShippingService } from './minimal-shipping.service';
 
@@ -435,6 +436,25 @@ describe('details unavailable (S5, S6)', () => {
     expect(reply(await tap(h))).toBe(UNAVAILABLE);
     expect(h.api.getPaymentDetails).toHaveBeenCalledTimes(2);
     expect(h.team.askTeam).toHaveBeenCalledTimes(1);
+  });
+
+  it('a paid mark that lands while the details fail sets no marker, creates no request and says it is paid', async () => {
+    const h = setup();
+    await h.seedPlacedSale();
+    h.api.getPaymentDetails.mockImplementation(async () => {
+      // The receipt poller confirms the payment while the read is in flight.
+      expect(await markPlacedSalePaid(h.store, SENDER, SALE)).toBe(true);
+      throw new UpstreamError('down', 503);
+    });
+    const answer = await tap(h);
+    expect(reply(answer)).toBe('Su pedido ya está pagado.');
+    expect(h.team.askTeam).not.toHaveBeenCalled();
+    expect(await h.placedSale()).toEqual({
+      saleId: SALE,
+      folio: 'B-0042',
+      totalCents: 3000,
+      paid: true,
+    });
   });
 
   it('a later yes retries; success clears the marker and sends the details', async () => {

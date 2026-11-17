@@ -277,6 +277,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Quieres agregar algo más o seguimos con tu compra?',
   ],
   ['¿Qué producto busca?', '¿Qué producto buscas?'],
+  // S2 cart summary «Agregar algo más» reply.
+  [
+    'Claro, ¿qué producto desea agregar?',
+    'Claro, ¿qué producto quieres agregar?',
+  ],
   // S1 "olvida mis datos" confirmation.
   ['tenía guardados de usted', 'tenía guardados de ti'],
   ['Sus pedidos', 'Tus pedidos'],
@@ -329,6 +334,10 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   [
     'ya le avisé al equipo y se los comparto',
     'ya te avisé al equipo y te los comparto',
+  ],
+  [
+    'Los datos de pago de su nuevo pedido se los comparto en cuanto lo confirme.',
+    'Los datos de pago de tu nuevo pedido te los comparto en cuanto lo confirmes.',
   ],
   [
     'Ya estoy atendiendo su consulta; por favor espere',

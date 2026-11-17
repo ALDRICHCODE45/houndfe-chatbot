@@ -20,6 +20,7 @@ import {
   DELIVERY_ZONE_REQUESTER_STORE,
   type DeliveryZoneRequesterStore,
 } from './domain/delivery-zone-requester';
+import { DeliveryZoneResumeRegistry } from './domain/delivery-zone-resume';
 import {
   DELIVERY_ZONE_POLLER_OPTIONS,
   DeliveryZoneRuntime,
@@ -35,6 +36,8 @@ import { PostgresDeliveryZoneRequesterStore } from './infrastructure/postgres-de
  *   - `DeliveryZoneRuntime` → durable poller: poll, notify (text or the
  *     `zona_entrega_revisada` template) and ACK.
  *   - `DELIVERY_ZONE_REQUESTER_STORE` → `delivery_zone_requesters` table.
+ *   - `DeliveryZoneResumeRegistry` → holder of the S4 checkout resume
+ *     capability (registered by `LlmAgentModule`, which owns cart/order).
  */
 @Module({
   imports: [
@@ -51,6 +54,8 @@ import { PostgresDeliveryZoneRequesterStore } from './infrastructure/postgres-de
       useClass: PostgresDeliveryZoneRequesterStore,
     },
     { provide: DELIVERY_ZONE_POLLER_OPTIONS, useValue: {} },
+    // S4: the LLM agent module registers the checkout resume capability here.
+    DeliveryZoneResumeRegistry,
     {
       provide: DELIVERY_ZONE_INTAKE,
       inject: [
@@ -74,6 +79,6 @@ import { PostgresDeliveryZoneRequesterStore } from './infrastructure/postgres-de
     },
     DeliveryZoneRuntime,
   ],
-  exports: [DELIVERY_ZONE_INTAKE],
+  exports: [DELIVERY_ZONE_INTAKE, DeliveryZoneResumeRegistry],
 })
 export class DeliveryZonesModule {}

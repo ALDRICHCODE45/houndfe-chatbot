@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import type { CustomerInboundObservationLatest } from '../../human-decisions/domain/customer-inbound-observation-store.port';
 import type { ReceiptOutcome } from '../../chatbot-api/domain/dtos/receipt-outcome.dto';
@@ -19,6 +20,7 @@ const candidate = (
   senderId: '5215512345678',
   backendReceiptId: '33333333-3333-4333-8333-333333333333',
   saleFolio: 'F-12',
+  capturedSaleId: '44444444-4444-4444-8444-444444444444',
   attachedAt: new Date('2026-11-05T10:00:00.000Z'),
   outcomePolledAt: null,
   ...over,
@@ -197,5 +199,126 @@ describe('ReceiptOutcomePoller', () => {
     expect(
       () => new ReceiptOutcomePoller(store, ports, PHONE, { batchSize: 0 }),
     ).toThrow(RangeError);
+  });
+
+  describe('paid sale in the conversation (S6)', () => {
+    let markSalePaid: jest.Mock<Promise<unknown>, [string, string]>;
+    beforeEach(() => {
+      markSalePaid = jest
+        .fn<Promise<unknown>, [string, string]>()
+        .mockResolvedValue(true);
+      poller = new ReceiptOutcomePoller(
+        store,
+        { ...ports, markSalePaid },
+        PHONE,
+        { intervalMs: 1000, batchSize: 5 },
+        () => NOW,
+      );
+    });
+
+    it('marks the placed sale paid after committing a CONFIRMED outcome with no debt', async () => {
+      await poller.process(candidate());
+      expect(markSalePaid).toHaveBeenCalledWith(
+        '5215512345678',
+        '44444444-4444-4444-8444-444444444444',
+      );
+      expect(store.commitOutcome.mock.invocationCallOrder[0]).toBeLessThan(
+        markSalePaid.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('marks it paid also when the 24 h window is closed (the fact is the same)', async () => {
+      ports.readLatest.mockResolvedValue(
+        inbound(86_400) as unknown as CustomerInboundObservationLatest,
+      );
+      await poller.process(candidate());
+      expect(store.commitOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({ delivery: 'OUTSIDE_WINDOW' }),
+      );
+      expect(markSalePaid).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the order unpaid for a PARTIAL confirmation', async () => {
+      ports.getReceiptOutcome.mockResolvedValue(
+        outcome({ sale: { debtCents: 150000, paymentStatus: 'PARTIAL' } }),
+      );
+      await poller.process(candidate());
+      expect(store.commitOutcome).toHaveBeenCalledTimes(1);
+      expect(markSalePaid).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['REJECTED', outcome({ status: 'REJECTED', customerReason: 'No' })],
+      ['PENDING', outcome({ status: 'PENDING' })],
+    ])('never marks it paid for %s', async (_label, result) => {
+      ports.getReceiptOutcome.mockResolvedValue(result);
+      await poller.process(candidate());
+      expect(markSalePaid).not.toHaveBeenCalled();
+    });
+
+    it('does not mark it when another worker already recorded the outcome', async () => {
+      store.commitOutcome.mockResolvedValue({ kind: 'already-notified' });
+      await poller.process(candidate());
+      expect(markSalePaid).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['rejects', () => Promise.reject(new Error('cas'))],
+      [
+        'throws synchronously',
+        () => {
+          throw new Error('cas');
+        },
+      ],
+    ])(
+      'never blocks or fails the notice when the mark %s',
+      async (_l, fail) => {
+        markSalePaid.mockImplementation(fail);
+        await expect(poller.process(candidate())).resolves.toBeUndefined();
+        expect(store.commitOutcome).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    describe('a mark that resolves false (lost race, unreadable state)', () => {
+      let warn: jest.SpyInstance<void, [message: unknown]>;
+      beforeEach(() => {
+        warn = jest
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation(() => undefined) as unknown as typeof warn;
+      });
+      afterEach(() => warn.mockRestore());
+      const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+      it('logs a warn with the receipt id and no sender data', async () => {
+        markSalePaid.mockResolvedValue(false);
+        await poller.process(candidate());
+        await flush();
+        const lines = warn.mock.calls.map((args) => String(args[0]));
+        const line = lines.find((text) => text.includes('paid mark'));
+        expect(line).toBeDefined();
+        expect(line).toContain(candidate().id);
+        expect(line).not.toContain('5215512345678');
+        expect(line).not.toContain(candidate().capturedSaleId);
+      });
+
+      it('stays silent when the mark succeeds', async () => {
+        markSalePaid.mockResolvedValue(true);
+        await poller.process(candidate());
+        await flush();
+        expect(
+          warn.mock.calls.some((args) => String(args[0]).includes('paid mark')),
+        ).toBe(false);
+      });
+    });
+
+    it('does not wait for a slow mark', async () => {
+      markSalePaid.mockReturnValue(new Promise(() => undefined));
+      await expect(poller.process(candidate())).resolves.toBeUndefined();
+    });
+
+    it('works without the optional port', async () => {
+      poller = new ReceiptOutcomePoller(store, ports, PHONE, {}, () => NOW);
+      await expect(poller.process(candidate())).resolves.toBeUndefined();
+    });
   });
 });

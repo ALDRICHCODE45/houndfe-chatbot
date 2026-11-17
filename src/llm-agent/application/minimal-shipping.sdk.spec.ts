@@ -117,7 +117,7 @@ async function setup(options: { absent?: boolean; free?: boolean; unconfirmed?: 
   const offer = await checkout.prepareConfirmation(SENDER, event('d1')); offer.onSent?.();
   if (!options.unconfirmed) await checkout.consume({ senderId: SENDER, text: 'SÍ', inboundEvent: event('d2') });
   const turn = (text: string, steps: unknown[]) => { script = steps; return agent.tryHandle({ senderId: SENDER, text, inboundEvent: event(`wamid.${Math.random()}`) }); };
-  return { api, store, quotes, seen, models, turn };
+  return { api, store, quotes, seen, models, turn, agent, setScript: (steps: unknown[]) => { script = steps; } };
 }
 
 // prettier-ignore
@@ -137,7 +137,12 @@ describe('minimal shipping SDK public seam', () => {
     h.quotes.enqueue(backendQuote(free ? { zoneStatus: 'FREE', option: null, creditCents: 20000, customerChargeCents: 0 } : {}));
     const quoted = await h.turn('Quiero envío a domicilio', [call('requestShippingQuote'), say()]);
     if (quoted.kind !== 'handled') throw new Error('reply');
-    expect(quoted.reply).toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
+    // S3: the summary that follows the quote carries the cost once; the quote
+    // sentence is not repeated before it.
+    expect(quoted.reply.startsWith('Resumen de su pedido:')).toBe(true);
+    expect(quoted.reply).toContain(free ? 'Envío: sin costo para usted' : 'Envío con Carrier (Ground): $200.00 MXN');
+    expect(quoted.reply).not.toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
+    expect(quoted.reply).toMatch(/Total a pagar: \$\d[\d,.]* MXN\n\nResponda/);
     expect(quoted.reply).not.toMatch(/aprobaci|999/);
     expect(h.quotes.calls).toHaveLength(1);
     expect(h.seen[0].tools).toHaveProperty('chooseStorePickup');
@@ -176,6 +181,16 @@ describe('minimal shipping SDK public seam', () => {
     expect(prompts).toContain('"ok":false');
     await h.turn('Pedido', [call('prepareOrder'), say()]);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
+  });
+  it('[S3] a successful quote is still told when no order summary can follow it', async () => {
+    const h = await setup();
+    h.quotes.enqueue(backendQuote({ zoneStatus: 'FREE', option: null, creditCents: 0, customerChargeCents: 0 }));
+    h.setScript([call('requestShippingQuote'), say()]);
+    // No trusted inbound identity: the summary cannot be presented.
+    const result = await h.agent.tryHandle({ senderId: SENDER, text: 'Quiero envío a domicilio' });
+    if (result.kind !== 'handled') throw new Error('reply');
+    expect(result.reply).not.toContain('Resumen de su pedido:');
+    expect(result.reply).toContain('Su envío al código postal 06000 no tiene costo.');
   });
   it('[S7] a STOCK_PENDING eta says the delivery date depends on restock', async () => {
     const h = await setup();

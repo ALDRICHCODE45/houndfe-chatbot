@@ -136,7 +136,13 @@ describe('configuration()', () => {
     [undefined, false],
     ['true', true],
     ['false', false],
-    ['TRUE', false],
+    ['TRUE', true],
+    ['True', true],
+    [' true ', true],
+    ['FALSE', false],
+    ['False', false],
+    ['1', false],
+    ['', false],
   ])('maps META_SANDBOX_RECIPIENT_NORMALIZATION=%s', (env, expected) => {
     if (env === undefined) {
       delete process.env.META_SANDBOX_RECIPIENT_NORMALIZATION;
@@ -153,8 +159,13 @@ describe('configuration()', () => {
     [undefined, false],
     ['true', true],
     ['false', false],
-    ['TRUE', false],
+    ['TRUE', true],
+    ['True', true],
+    [' true ', true],
+    ['FALSE', false],
+    ['False', false],
     ['1', false],
+    ['', false],
   ])('maps CONVERSATION_MIRROR_DELIVERY_ENABLED=%s', (env, expected) => {
     if (env === undefined) {
       delete process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED;

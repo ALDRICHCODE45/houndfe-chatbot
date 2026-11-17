@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs';
 import type { FactoryProvider } from '@nestjs/common';
 import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalShippingService } from './application/minimal-shipping.service';
+import { MinimalZoneResumeService } from './application/minimal-zone-resume.service';
+import { DeliveryZoneResumeRegistry } from '../delivery-zones/domain/delivery-zone-resume';
 import { join } from 'node:path';
 import { HumanRequestCreateService } from '../human-requests/application/human-request-create.service';
 import { Test } from '@nestjs/testing';
@@ -134,6 +136,23 @@ describe('LlmAgentModule integration', () => {
         { register: jest.fn() },
       ),
     ).toBeInstanceOf(MinimalShippingService);
+  });
+
+  it('[S4] registers the zone-approved checkout resume in the delivery-zone registry', () => {
+    const providers = Reflect.getMetadata(
+      'providers',
+      LlmAgentModule,
+    ) as FactoryProvider[];
+    const factory = providers.find(
+      (entry) => entry.provide === MinimalZoneResumeService,
+    )!;
+    expect(factory.inject).toContain(DeliveryZoneResumeRegistry);
+    const registry = new DeliveryZoneResumeRegistry();
+    expect(registry.current()).toBeNull();
+    const create = factory.useFactory as (...args: unknown[]) => unknown;
+    const service = create({}, {}, {}, {}, registry);
+    expect(service).toBeInstanceOf(MinimalZoneResumeService);
+    expect(registry.current()).toBe(service);
   });
 
   it('[S6,S9] MinimalOrderService requires the shipping service for re-quotes', () => {
