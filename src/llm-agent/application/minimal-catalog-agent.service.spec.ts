@@ -378,6 +378,19 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     const resultIds = (out: Record<string, unknown>) =>
       (out.results as Array<{ productId: string }>).map((r) => r.productId);
 
+    it('brand rule (owner 2026-11-17): the brand is kept when it has the product type; otherwise the same type of another brand, labelled, comes before the same brand of another type', async () => {
+      const { service, captured } = build(flow);
+      await service.tryHandle({ senderId: SENDER, text: 'busca' });
+      const system = JSON.stringify(captured[0].system);
+      expect(system).toContain(
+        'Marca: si la marca pedida tiene productos del tipo pedido, ofrece SOLO esa marca',
+      );
+      expect(system).toContain('de otra marca');
+      expect(system).toContain(
+        'el mismo tipo de producto de otra marca va ANTES que otro tipo de producto de la misma marca',
+      );
+    });
+
     it('S10a/c: prompt requires every stated attribute, alternatives only separately, plain no-match', async () => {
       const { service, captured } = build(flow);
       await service.tryHandle({ senderId: SENDER, text: 'busca' });
