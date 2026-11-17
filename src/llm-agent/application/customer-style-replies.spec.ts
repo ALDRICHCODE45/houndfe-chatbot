@@ -81,6 +81,7 @@ import {
 } from './minimal-order.service';
 import {
   MINIMAL_PAYMENT_BUTTONS_PROMPT,
+  MINIMAL_PAYMENT_NEW_ORDER_REPLY,
   MINIMAL_PAYMENT_QUESTION,
   MINIMAL_PAYMENT_UNAVAILABLE_REPLY,
   minimalPaymentInstructions,
@@ -247,6 +248,7 @@ const REPLIES: Record<string, string> = {
   MINIMAL_PAYMENT_QUESTION,
   MINIMAL_PAYMENT_BUTTONS_PROMPT,
   MINIMAL_PAYMENT_UNAVAILABLE_REPLY,
+  MINIMAL_PAYMENT_NEW_ORDER_REPLY,
   ...Object.fromEntries(
     Object.entries(MINIMAL_ORDER_INELIGIBLE_REPLIES).map(([k, v]) => [
       `ineligible_${k}`,

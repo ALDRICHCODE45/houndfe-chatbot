@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import type { CustomerInboundObservationLatest } from '../../human-decisions/domain/customer-inbound-observation-store.port';
 import type { ReceiptOutcome } from '../../chatbot-api/domain/dtos/receipt-outcome.dto';
@@ -277,6 +278,38 @@ describe('ReceiptOutcomePoller', () => {
         expect(store.commitOutcome).toHaveBeenCalledTimes(1);
       },
     );
+
+    describe('a mark that resolves false (lost race, unreadable state)', () => {
+      let warn: jest.SpyInstance<void, [message: unknown]>;
+      beforeEach(() => {
+        warn = jest
+          .spyOn(Logger.prototype, 'warn')
+          .mockImplementation(() => undefined) as unknown as typeof warn;
+      });
+      afterEach(() => warn.mockRestore());
+      const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+      it('logs a warn with the receipt id and no sender data', async () => {
+        markSalePaid.mockResolvedValue(false);
+        await poller.process(candidate());
+        await flush();
+        const lines = warn.mock.calls.map((args) => String(args[0]));
+        const line = lines.find((text) => text.includes('paid mark'));
+        expect(line).toBeDefined();
+        expect(line).toContain(candidate().id);
+        expect(line).not.toContain('5215512345678');
+        expect(line).not.toContain(candidate().capturedSaleId);
+      });
+
+      it('stays silent when the mark succeeds', async () => {
+        markSalePaid.mockResolvedValue(true);
+        await poller.process(candidate());
+        await flush();
+        expect(
+          warn.mock.calls.some((args) => String(args[0]).includes('paid mark')),
+        ).toBe(false);
+      });
+    });
 
     it('does not wait for a slow mark', async () => {
       markSalePaid.mockReturnValue(new Promise(() => undefined));

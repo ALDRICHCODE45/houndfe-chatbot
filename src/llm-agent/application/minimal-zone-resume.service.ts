@@ -77,6 +77,10 @@ export class MinimalZoneResumeService implements DeliveryZoneCheckoutResumer {
     input: DeliveryZoneResumeInput,
   ): Promise<DeliveryZoneCheckoutResume | null> {
     const { senderId } = input;
+    // The reference of the summary THIS resume prepared; only that one is
+    // ever dropped (a customer turn may have armed its own meanwhile).
+    let ownReference: string | null = null;
+    const discardOwn = () => this.dismissOwn(senderId, ownReference);
     try {
       if (input.zoneType !== 'FREE' && input.zoneType !== 'SURCHARGE')
         return null;
@@ -96,13 +100,15 @@ export class MinimalZoneResumeService implements DeliveryZoneCheckoutResumer {
         messageId: `zone-resume:${input.sourceRequestId}`,
       });
       const status = this.order.offerStatus(senderId);
+      if (prepared.onSent !== undefined && status !== null && !status.armed)
+        ownReference = status.reference;
       if (
         prepared.onSent === undefined ||
         status === null ||
         status.armed ||
         !prepared.reply.includes(MINIMAL_ORDER_SUMMARY_HEADING)
       ) {
-        this.order.dismiss(senderId);
+        discardOwn();
         return null;
       }
       const arm = prepared.onSent;
@@ -118,16 +124,23 @@ export class MinimalZoneResumeService implements DeliveryZoneCheckoutResumer {
           prompt: ORDER_BUTTONS_PROMPT,
         },
         arm,
-        discard: () => this.order.dismiss(senderId),
+        discard: discardOwn,
       };
     } catch {
       try {
-        this.order.dismiss(senderId);
+        discardOwn();
       } catch {
         // Nothing pending to drop.
       }
       return null;
     }
+  }
+
+  /** Dismiss the pending summary only while it is still the one prepared here. */
+  private dismissOwn(senderId: string, reference: string | null): void {
+    if (reference === null) return;
+    if (this.order.offerStatus(senderId)?.reference === reference)
+      this.order.dismiss(senderId);
   }
 
   /** The preconditions that need no backend call. */

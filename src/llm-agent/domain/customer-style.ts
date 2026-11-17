@@ -336,6 +336,10 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'ya te avisé al equipo y te los comparto',
   ],
   [
+    'Los datos de pago de su nuevo pedido se los comparto en cuanto lo confirme.',
+    'Los datos de pago de tu nuevo pedido te los comparto en cuanto lo confirmes.',
+  ],
+  [
     'Ya estoy atendiendo su consulta; por favor espere',
     'Ya estoy atendiendo tu consulta; por favor espera',
   ],

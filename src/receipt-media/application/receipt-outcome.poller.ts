@@ -166,7 +166,14 @@ export class ReceiptOutcomePoller {
     const failed = () =>
       this.logger.warn('placed sale paid mark failed; order stays unpaid');
     try {
-      void Promise.resolve(mark(row.senderId, row.capturedSaleId)).catch(
+      void Promise.resolve(mark(row.senderId, row.capturedSaleId)).then(
+        (written) => {
+          // `false`: nothing was written (lost race, unreadable state).
+          if (written === false)
+            this.logger.warn(
+              `placed sale paid mark not written: receipt=${row.id}; order stays unpaid`,
+            );
+        },
         failed,
       );
     } catch {

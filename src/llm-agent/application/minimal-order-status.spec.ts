@@ -611,6 +611,69 @@ describe('paid placed sale (S6)', () => {
     expect(reply(cart)).toContain('Su carrito:');
     const question = await h.turn('¿cómo pago?', [say('Con gusto.')]);
     expect(reply(question)).not.toBe(PAID_REPLY);
-    expect(h.seen).toHaveLength(1);
+  });
+
+  describe('a payment question with a new cart after a paid order', () => {
+    const withNewCart = async (h: Harness) => {
+      await h.store.create(SENDER, {
+        lastMessageAt: new Date().toISOString(),
+        data: {
+          minimalCart: {
+            items: [{ productId: PRODUCT, quantity: 1, unitPriceCents: 1500 }],
+            idempotencyKey: '',
+            placedSale: {
+              saleId: SALE,
+              folio: 'B-0042',
+              totalCents: 3000,
+              paid: true,
+            },
+          },
+        },
+      });
+    };
+
+    it('never creates a team request: the model is not asked, no bank details of the paid order, the new cart is not called paid', async () => {
+      const h = setup();
+      await withNewCart(h);
+      const decision = await h.turn('¿a qué cuenta transfiero?', [
+        call('askTeam', {
+          question: '¿A qué cuenta transfiero?',
+          summary: 'Cuenta de pago',
+        }),
+        say('Inventado'),
+      ]);
+      expect(h.team.askTeam).not.toHaveBeenCalled();
+      expect(h.api.getPaymentDetails).not.toHaveBeenCalled();
+      const text = reply(decision);
+      expect(text).not.toContain('CLABE');
+      expect(text).not.toContain('BBVA');
+      expect(text).not.toBe(PAID_REPLY);
+      expect(text).toContain('anterior');
+      expect(text).toContain('nuevo pedido');
+      expect(text).not.toMatch(/nuevo pedido (?:ya )?está pagado/i);
+    });
+
+    it('keeps a pending order summary for the new order untouched', async () => {
+      const h = setup();
+      await withNewCart(h);
+      const llmCalls = h.seen.length;
+      const decision = await h.turn('datos de pago', [say('Inventado')]);
+      expect(h.seen).toHaveLength(llmCalls);
+      expect(reply(decision)).toContain('anterior');
+      expect(h.team.askTeam).not.toHaveBeenCalled();
+    });
+
+    it('other turns with a new cart keep the model, and its prompt says payment questions are about the new order and never askTeam', async () => {
+      const h = setup();
+      await withNewCart(h);
+      await h.turn('Gracias', [say('Con gusto.')]);
+      const system = String(h.seen[0].system);
+      expect(system).toContain('pedido nuevo en curso');
+      expect(system).not.toContain(PAID_REPLY);
+      expect(system).toMatch(/nunca use askTeam/i);
+      expect(Object.keys(h.seen[0].tools ?? {})).not.toContain(
+        'getPaymentDetails',
+      );
+    });
   });
 });

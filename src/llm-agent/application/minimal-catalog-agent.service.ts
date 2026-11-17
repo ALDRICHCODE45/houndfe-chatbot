@@ -103,6 +103,7 @@ import {
 import { CostGuardService } from './cost-guard.service';
 import {
   MINIMAL_PAYMENT_ALREADY_PAID_REPLY,
+  MINIMAL_PAYMENT_NEW_ORDER_REPLY,
   MinimalPaymentService,
   type MinimalPaymentReply,
 } from './minimal-payment.service';
@@ -362,6 +363,16 @@ const PAID_ORDER_INSTRUCTIONS_FRAGMENT =
   'por la cuenta, la CLABE, el banco o los datos de pago, responda ' +
   `«${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}»; no ofrezca métodos de pago, no ` +
   'invente datos y nunca use askTeam para esto.';
+
+// S6: a paid order plus a NEW cart: a payment question is about the new order,
+// which is not registered yet (no details exist); never the paid one's.
+const PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT =
+  '\n\nEl pedido registrado anterior del cliente ya está pagado y tiene un ' +
+  'pedido nuevo en curso que aún no está registrado. Si pregunta cómo pagar, ' +
+  'por la cuenta, la CLABE, el banco o los datos de pago, se refiere al pedido ' +
+  `nuevo: respóndale «${MINIMAL_PAYMENT_NEW_ORDER_REPLY}»; no dé datos ni ` +
+  'métodos de pago del pedido anterior, no diga que el pedido nuevo ya está ' +
+  'pagado y nunca use askTeam para esto.';
 
 const ASK_TEAM_TOOL_UUID = z.uuid();
 
@@ -1357,9 +1368,15 @@ export class MinimalCatalogAgentService {
       this.payment === undefined
         ? null
         : await this.payment.placedSale(senderId);
-    if (paymentAsked && placed?.paid === true && cartEmpty && !pendingSummary) {
-      this.order?.dismiss(senderId);
-      return answer({ reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY });
+    if (paymentAsked && placed?.paid === true) {
+      if (cartEmpty && !pendingSummary) {
+        this.order?.dismiss(senderId);
+        return answer({ reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY });
+      }
+      // A new order in progress: it may be the one being asked about. Its
+      // details do not exist yet and the paid one has none to give; a pending
+      // summary for the new order stays untouched.
+      return answer({ reply: MINIMAL_PAYMENT_NEW_ORDER_REPLY });
     }
     if (!summaryAsked) return null;
     // Without a pending summary or a placed order the model keeps the turn.
@@ -1752,8 +1769,10 @@ export class MinimalCatalogAgentService {
       this.payment === undefined
         ? null
         : await this.payment.placedSale(input.senderId);
-    const paidOrder =
-      placed?.paid === true && (await this.cartIsEmpty(input.senderId));
+    const paidPlaced = placed?.paid === true;
+    const cartEmptyNow = paidPlaced && (await this.cartIsEmpty(input.senderId));
+    const paidOrder = paidPlaced && cartEmptyNow;
+    const paidOrderNewCart = paidPlaced && !cartEmptyNow;
     const paymentRun: PaymentRun | null =
       placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
@@ -1858,6 +1877,7 @@ export class MinimalCatalogAgentService {
         (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
+        (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
         this.memoryInstructions(input.senderId) +
         '\n\n' +
         customerStyleDirective(style),

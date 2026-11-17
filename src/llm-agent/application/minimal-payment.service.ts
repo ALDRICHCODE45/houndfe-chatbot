@@ -29,6 +29,13 @@ export const MINIMAL_PAYMENT_QUESTION =
 export const MINIMAL_PAYMENT_BUTTONS_PROMPT = '¿Cómo desea pagar?';
 /** The order is paid: no methods, no details, no team request (S6). */
 export const MINIMAL_PAYMENT_ALREADY_PAID_REPLY = 'Su pedido ya está pagado.';
+/**
+ * S6: a payment question while a NEW cart exists after a paid order. The paid
+ * order has nothing to pay and the new one is not registered yet, so no bank
+ * details exist to share; the team is never asked for them.
+ */
+export const MINIMAL_PAYMENT_NEW_ORDER_REPLY =
+  'Su pedido anterior ya está pagado. Los datos de pago de su nuevo pedido se los comparto en cuanto lo confirme.';
 export const MINIMAL_PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos en este momento; ya le avisé al equipo y se los comparto en cuanto estén.';
 
@@ -164,7 +171,10 @@ export class MinimalPaymentService {
     // One request per sale: the marker is written first, so a failed write
     // creates nothing and the next attempt tries again.
     if (sale.paymentPending === true || this.team === undefined) return reply;
-    if (!(await this.setMarker(senderId, sale.saleId, true))) return reply;
+    const marked = await this.setMarker(senderId, sale.saleId, true);
+    // The order was paid while the read failed: no marker, no request.
+    if (marked === 'paid') return { reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY };
+    if (marked === 'failed') return reply;
     let outcome: AskTeamOutcome;
     try {
       outcome = await this.team.askTeam({
@@ -201,21 +211,25 @@ export class MinimalPaymentService {
     }
   }
 
-  /** One CAS attempt on the owned cart slot; `false` never retries. */
+  /**
+   * One CAS attempt on the owned cart slot; `failed` never retries. Setting
+   * the marker on a sale the fresh read shows as paid is refused (`paid`).
+   */
   private async setMarker(
     senderId: string,
     saleId: string,
     pending: boolean,
-  ): Promise<boolean> {
-    if (typeof this.store.commitMinimalCart !== 'function') return false;
+  ): Promise<'written' | 'paid' | 'failed'> {
+    if (typeof this.store.commitMinimalCart !== 'function') return 'failed';
     const read = await this.read(senderId);
     const sale = read?.cart.placedSale;
     if (read === null || sale === undefined || sale.saleId !== saleId)
-      return false;
+      return 'failed';
+    if (pending && sale.paid === true) return 'paid';
     const { paymentPending: _previous, ...rest } = sale;
     void _previous;
     try {
-      return await this.store.commitMinimalCart(
+      const saved = await this.store.commitMinimalCart(
         senderId,
         read.raw,
         {
@@ -224,8 +238,9 @@ export class MinimalPaymentService {
         },
         new Date().toISOString(),
       );
+      return saved ? 'written' : 'failed';
     } catch {
-      return false;
+      return 'failed';
     }
   }
 }

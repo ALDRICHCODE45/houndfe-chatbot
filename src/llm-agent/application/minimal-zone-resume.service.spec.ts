@@ -375,6 +375,32 @@ describe('MinimalZoneResumeService (S4: zone approved resumes checkout)', () => 
     expect(h.order.offerStatus(SENDER)).toBeNull();
   });
 
+  it('discard() keeps a summary the customer armed meanwhile (it only drops its own)', async () => {
+    const h = await setup();
+    h.quotes.enqueue(backendQuote());
+    const resume = (await h.prepare('FREE'))!;
+    const ownReference = h.order.offerStatus(SENDER)!.reference;
+    // The customer's own turn prepared and sent a newer summary.
+    const theirs = await h.order.prepareOrder(SENDER, EVENT('customer-turn'));
+    theirs.onSent?.();
+    const theirReference = h.order.offerStatus(SENDER)!.reference;
+    expect(theirReference).not.toBe(ownReference);
+    resume.discard();
+    expect(h.order.offerStatus(SENDER)).toMatchObject({
+      reference: theirReference,
+      armed: true,
+    });
+  });
+
+  it('discard() still drops its own summary when it is the pending one', async () => {
+    const h = await setup();
+    h.quotes.enqueue(backendQuote());
+    const resume = (await h.prepare('FREE'))!;
+    resume.discard();
+    resume.discard();
+    expect(h.order.offerStatus(SENDER)).toBeNull();
+  });
+
   describe('fallback: any failed precondition returns null and no summary stays pending', () => {
     const expectFallback = async (
       h: Awaited<ReturnType<typeof setup>>,
