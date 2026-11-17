@@ -48,3 +48,12 @@ Writer: 149 focused tests, TypeScript noEmit, scoped eslint and diff check passe
 ## Deferred priorities
 
 Staff estimate/no-estimate to WhatsApp restart-safe admission remains separate D1. Earlier mutating effects plus later stock failure require a separately scoped outcome renderer if a universal guarantee is needed. Neither limitation should be hidden in completion claims.
+
+## Amendment S12 (2026-11-17): search stock status is live evidence for availability labels
+
+Backend evidence (intercom 2026-11-17): the catalog search and `GET /catalog/:id/stock` read the same live columns (no cache/replica), use the same `deriveStockState` thresholds, one balance per tenant, and both exclude expired lots and OFF variants. This refines "Search is not inventory evidence" above for the **chatbot minimal route** (`searchCatalog` in `minimal-catalog-agent.service.ts`):
+
+- The search payload's stock **status** is live evidence for **availability labels** (agotado / available / low_stock / not_managed) of the products shown, derived in code (`domain/minimal-catalog-availability.ts`) with zero extra backend calls. No per-search `getStock` read (the S11/T7 reads in a263816 were removed). Quantities remain hidden from the model and the customer; the projection still carries no `stock` key.
+- **Variant rule.** Simple or not-managed product → the item's own `stock.status`. Product with variants → **each variant's status**; the product-level availability is derived from the variants (any available → available; all agotado → agotado). The product-level quantity/status of a product with variants is never used, from either endpoint: search's product quantity is the raw `product.quantity`, and `/stock`'s product-level status/quantity ignore variants (backend asked to fix both).
+- `checkStock` (explicit tool, fresh read) is unchanged for products without variants; for products with variants it does not expose the product-level `/stock` stock and derives `availability` from the variants' statuses.
+- Unchanged: stock facts for purchase decisions (cart adds, `insufficient_stock`) keep their own fresh authenticated reads; a missing/inconsistent status is `unverified` and is neither claimed as exhausted nor as available; the "Encontré…, no «tenemos»" wording and the guard/tool-batch rules of R2 are untouched.

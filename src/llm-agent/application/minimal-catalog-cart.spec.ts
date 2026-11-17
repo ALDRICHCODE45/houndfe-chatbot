@@ -877,12 +877,6 @@ describe('Minimal cart through the public SDK route', () => {
           searchQueue.splice(1, 0, healthy());
           stockQueue.unshift(inventory(ID, false));
         }
-        // S11: the scripted search also reads fresh stock for each shown
-        // product (2) before any cart read consumes the queue.
-        stockQueue.unshift(
-          inventory(ID, false),
-          inventory(secondProduct, false),
-        );
       }
       f.api.searchCatalog.mockImplementation(
         async () => searchQueue.shift() as never,

@@ -157,6 +157,7 @@ import {
   type BroadenedSearchInfo,
 } from '../domain/minimal-catalog-search-broadening';
 import {
+  availabilityFromVariants,
   deriveAvailability,
   preferInStock,
   type ItemAvailability,
@@ -203,7 +204,7 @@ const INSTRUCTIONS =
   'la búsqueda no prueba por sí sola que un producto esté disponible. Cuando el cliente confirme un producto ya ' +
   'identificado en esta conversación, llama checkStock directo con su productId EXACTO; ' +
   'si aún no lo está o la identidad expiró, búscalo primero. En productos con variantes ' +
-  'informa existencias por variante; no iguales la del producto con la de la variante. ' +
+  'informa existencias por variante (en checkStock, el producto con variantes trae availability derivada de ellas y no trae stock propio: nunca afirmes existencias del producto por su cantidad); no iguales la del producto con la de la variante. ' +
   'No realizas compras, ventas, pagos ni cambios de datos. ' +
   'Saluda cálido, en el registro y con los emojis del estilo del cliente. Un hallazgo se anuncia ' +
   '"Encontré ... en catálogo", no "tenemos" ni "disponible": eso solo se afirma tras un ' +
@@ -216,7 +217,7 @@ const INSTRUCTIONS =
   'Si searchCatalog no devuelve resultados, no concluyas que no existe: la aplicación ya reintenta sola con las palabras clave. Si aun así queda vacío, haz UNA sola búsqueda más amplia con el nombre principal (marca o producto, sin dosis, presentación ni palabras genéricas) y nunca repitas la misma consulta; si sigue vacío, di que no lo encontraste y pregunta qué producto busca. ' +
   'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: dilo claro ("Croquetas Pedigree no encontré; de Pedigree tengo …") y enumera esas opciones como alternativas, sin afirmar que son lo solicitado. Un error de lectura no es "sin resultados". ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada"; un producto que coincide y resulta agotado se sigue mostrando, como agotado, como alternativa. ' +
-  'Cada producto de searchCatalog trae availability, verificada por la aplicación en esa lectura (por presentación si tiene variantes): si es out_of_stock, o una presentación aparece en agotado_presentations, di explícitamente que está agotado, indicando cuáles presentaciones están agotadas y cuáles no, nunca lo presentes como disponible y nunca lo agregues al carrito; sigue availability_instruction para ofrecer el aviso de reposición cuando exista. availability "unverified" no es agotado ni disponible: no lo afirmes, confírmalo con checkStock. ' +
+  'Cada producto de searchCatalog trae availability, tomada de la lectura en vivo del catálogo (por presentación si tiene variantes): si es out_of_stock, o una presentación aparece en agotado_presentations, di explícitamente que está agotado, indicando cuáles presentaciones están agotadas y cuáles no, nunca lo presentes como disponible y nunca lo agregues al carrito; sigue availability_instruction para ofrecer el aviso de reposición cuando exista. availability "unverified" no es agotado ni disponible: no lo afirmes, confírmalo con checkStock. ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
   'no prueba el de la variante. needs_human_review es revisión de promoción o precio, ' +
   'no una aprobación humana previa a existencias. No inventes fechas de reposición ni ' +
@@ -697,7 +698,8 @@ const CART_VARIANT_GUIDANCE =
   'Tras invalid_variant, no repita la llamada con la misma identidad ni pruebe IDs al azar; consulte el catálogo o solicite aclaración. Un rechazo no confirma ningún cambio.';
 
 // Identity + price projection with product and variant stock stripped; the
-// only availability it carries is the app-derived one (S11). Each
+// only availability it carries is the one derived in code from the search
+// payload (S11/S12). Each
 // verified identity is registered through `register` (the sender's opaque
 // selection registry) so the model can reference it without ever seeing or
 // inventing a cart UUID.
@@ -758,7 +760,7 @@ function availabilityInstruction(
   const parts: string[] = [];
   if (agotado)
     parts.push(
-      'Existencias verificadas por la aplicación en esta lectura. Un producto con availability.status "out_of_stock" está AGOTADO: dilo explícitamente con la palabra «agotado», nunca lo presentes como disponible y nunca lo agregues al carrito. Con variantes, di cuáles presentaciones están agotadas (agotado_presentations) y cuáles no.',
+      'Existencias tomadas de la lectura en vivo del catálogo. Un producto con availability.status "out_of_stock" está AGOTADO: dilo explícitamente con la palabra «agotado», nunca lo presentes como disponible y nunca lo agregues al carrito. Con variantes, di cuáles presentaciones están agotadas (agotado_presentations) y cuáles no.',
       restockOffer
         ? 'Ofrece el aviso de reposición: pregunta si quiere que se le consulte al equipo cuándo vuelve a llegar, sin prometer fecha ni aviso; si acepta, llama prepareRestock con su productId EXACTO (y variantId si la presentación importa). No llames prepareRestock en esta respuesta.'
         : 'Di solo que está agotado; no prometas aviso, fecha de reposición ni contacto.',
@@ -2953,7 +2955,7 @@ export class MinimalCatalogAgentService {
     const readTools = {
       searchCatalog: tool({
         description:
-          'Busca productos por nombre. Devuelve identidad, precios reales y availability (existencias verificadas por la aplicación, sin cantidades) de los productos mostrados.',
+          'Busca productos por nombre. Devuelve identidad, precios reales y availability (estado de existencias de la lectura en vivo, sin cantidades) de los productos mostrados.',
         inputSchema: z.object({ q: z.string().min(1) }),
         execute: async ({ q }) => {
           try {
@@ -2966,22 +2968,17 @@ export class MinimalCatalogAgentService {
             // S10b/S10d: only the capped, flag-ordered options reach the model
             // and the registries (checkStock, cart refs, photos), so nothing
             // beyond them can be presented to the customer.
-            // S11: agotado hints go last BEFORE the cap, so an agotado product
-            // never displaces an available match from the 3.
+            // S11/S12: agotado products go last BEFORE the cap, so an agotado
+            // product never displaces an available match from the 3.
             const limited = limitCatalogOptions(preferInStock(items));
             const offered = limited.offered;
-            // S11: fresh authenticated stock for the shown products only
-            // (≤ 4), in parallel; a failed read is `unverified`, never a
-            // search error. The search payload's own stock is not evidence.
-            const reads = await Promise.all(
-              offered.map((item) =>
-                Promise.resolve()
-                  .then(() => chatbotApi.getStock(item.productId))
-                  .catch(() => null),
-              ),
-            );
-            const availability = offered.map((item, index) =>
-              deriveAvailability(item, reads[index]),
+            // S12: availability labels come from the search payload (live
+            // backend evidence, zero extra calls): simple/not-managed -> own
+            // status; with variants -> each variant's status, never the
+            // product-level quantity. Missing/inconsistent data is
+            // `unverified`, never a search error.
+            const availability = offered.map((item) =>
+              deriveAvailability(item),
             );
             const results = offered.map((item, index) =>
               projectItem(
@@ -3087,11 +3084,30 @@ export class MinimalCatalogAgentService {
             trace(
               `tool checkStock result=ok parentStockStatus=${status} parentStockQuantity=${quantity}`,
             );
+            // S12: with presentations, the product-level stock/quantity from
+            // /stock is not evidence (it ignores variants): it is not exposed
+            // and availability comes from the presentations' statuses only.
+            const productAvailability =
+              stock.variants.length > 0
+                ? availabilityFromVariants(stock.variants)
+                : null;
             const result = {
               ok: true as const,
               productId: stock.productId,
               name: stock.name,
-              stock: stock.stock,
+              ...(productAvailability === null
+                ? { stock: stock.stock }
+                : {
+                    availability: {
+                      status: productAvailability.status,
+                      ...(productAvailability.agotadoPresentations.length === 0
+                        ? {}
+                        : {
+                            agotado_presentations:
+                              productAvailability.agotadoPresentations,
+                          }),
+                    },
+                  }),
               ...(() => {
                 const ref = registerSelection('checkStock')({
                   productId: stock.productId,
