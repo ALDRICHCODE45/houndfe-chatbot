@@ -2,6 +2,7 @@ import {
   META_GRAPH_API_BASE_URL_DEFAULT,
   META_MEDIA_ALLOWED_HOSTS_DEFAULT,
 } from './env.validation';
+import { envBoolean } from './env-boolean';
 
 const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
   if (!v) return def;
@@ -22,16 +23,19 @@ const configuration = () => ({
     phoneNumberId: process.env.META_PHONE_NUMBER_ID as string,
     graphApiBaseUrl:
       process.env.META_GRAPH_API_BASE_URL ?? META_GRAPH_API_BASE_URL_DEFAULT,
-    // Explicit, default-off sandbox compatibility mode. Only the exact
-    // string 'true' enables the historical Mexican trunk-1 rewrite.
-    sandboxRecipientNormalizationEnabled:
-      process.env.META_SANDBOX_RECIPIENT_NORMALIZATION === 'true',
+    // Explicit, default-off sandbox compatibility mode. Any value
+    // Joi.boolean() accepts as true (true/TRUE/True) enables the historical
+    // Mexican trunk-1 rewrite.
+    sandboxRecipientNormalizationEnabled: envBoolean(
+      process.env.META_SANDBOX_RECIPIENT_NORMALIZATION,
+    ),
   },
   conversationMirror: {
-    // Default off: only the exact string 'true' sends mirror rows to the
-    // backend (unit 9). Capture and enqueue are unaffected.
-    deliveryEnabled:
-      process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED === 'true',
+    // Default off: any value Joi.boolean() accepts as true sends mirror
+    // rows to the backend (unit 9). Capture and enqueue are unaffected.
+    deliveryEnabled: envBoolean(
+      process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED,
+    ),
   },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,

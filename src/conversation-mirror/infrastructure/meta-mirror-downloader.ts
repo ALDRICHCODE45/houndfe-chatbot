@@ -1,8 +1,10 @@
+import { Logger } from '@nestjs/common';
 import { MetaMediaError } from '../../receipt-media/domain/meta-media.port';
 import {
   metaHttpStatusOf,
   type MetaMediaClient,
 } from '../../receipt-media/infrastructure/meta-media.client';
+import { metaFailureReasonOf } from '../../receipt-media/infrastructure/meta-media-failure-reason';
 import type {
   MirrorMetaDownloader,
   MirrorSourceFailure,
@@ -17,6 +19,9 @@ import { MIRROR_MEDIA_PROFILE } from './mirror-media-profile';
 export class MetaMirrorDownloader implements MirrorMetaDownloader {
   constructor(
     private readonly client: Pick<MetaMediaClient, 'downloadWithProfile'>,
+    private readonly logger: Pick<Logger, 'warn'> = new Logger(
+      MetaMirrorDownloader.name,
+    ),
   ) {}
 
   async download(input: {
@@ -39,8 +44,24 @@ export class MetaMirrorDownloader implements MirrorMetaDownloader {
         },
       };
     } catch (error) {
+      this.logFailure(error);
       return mapMetaError(error);
     }
+  }
+
+  /** Operator diagnostic: only fixed tokens (category, code, safe reason,
+   *  HTTP status). Never the URL, query, token, media id or error message. */
+  private logFailure(error: unknown): void {
+    if (!(error instanceof MetaMediaError)) {
+      this.logger.warn('mirror media download failed category=UNKNOWN');
+      return;
+    }
+    const status = metaHttpStatusOf(error);
+    this.logger.warn(
+      `mirror media download failed category=${error.category} code=${error.code}` +
+        ` reason=${metaFailureReasonOf(error) ?? 'NONE'}` +
+        (status === undefined ? '' : ` httpStatus=${status}`),
+    );
   }
 }
 

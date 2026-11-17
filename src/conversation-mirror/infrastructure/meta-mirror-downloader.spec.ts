@@ -11,6 +11,7 @@ import {
   MetaMediaClient,
   type MetaHttp,
 } from '../../receipt-media/infrastructure/meta-media.client';
+import { withMetaFailureReason } from '../../receipt-media/infrastructure/meta-media-failure-reason';
 import { MetaMirrorDownloader } from './meta-mirror-downloader';
 import { MIRROR_MEDIA_PROFILE } from './mirror-media-profile';
 
@@ -102,6 +103,112 @@ describe('MetaMirrorDownloader', () => {
     });
     expect(result).toEqual({ kind: 'park', reason: 'unexpected_response' });
     expect(JSON.stringify(result)).not.toContain(PROVIDER_ID);
+  });
+
+  describe('failure warn log (S8b)', () => {
+    const SECRET_URL =
+      'https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=meta-media-123&hash=SECRET';
+    const logged = (warn: jest.Mock<void, [string]>) =>
+      warn.mock.calls.map((c) => c[0]).join('\n');
+    const withLogger = (impl: () => Promise<unknown>) => {
+      const warn = jest.fn<void, [string]>();
+      const downloadWithProfile = jest.fn(impl);
+      const downloader = new MetaMirrorDownloader(
+        {
+          downloadWithProfile:
+            downloadWithProfile as unknown as MetaMediaClient['downloadWithProfile'],
+        },
+        { warn },
+      );
+      return { warn, downloader };
+    };
+
+    it('warns with category, code and the safe reason, never URL/query/token/media id', async () => {
+      const error = withMetaFailureReason(
+        new MetaMediaError('META_TRANSPORT', 'NETWORK_FAILURE'),
+        'ECONNRESET',
+      );
+      // Hostile message must never reach the log.
+      error.message = `${SECRET_URL} Bearer secret-token ${PROVIDER_ID}`;
+      const { warn, downloader } = withLogger(() => Promise.reject(error));
+      await downloader.download({ providerMediaId: PROVIDER_ID, signal });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const text = logged(warn);
+      expect(text).toContain('category=META_TRANSPORT');
+      expect(text).toContain('code=NETWORK_FAILURE');
+      expect(text).toContain('reason=ECONNRESET');
+      for (const forbidden of [
+        PROVIDER_ID,
+        'lookaside',
+        'SECRET',
+        'secret-token',
+        'Bearer',
+        'mid=',
+        '?',
+      ])
+        expect(text).not.toContain(forbidden);
+    });
+
+    it('uses reason=NONE when no safe reason was recorded', async () => {
+      const { warn, downloader } = withLogger(() =>
+        Promise.reject(new MetaMediaError('MEDIA_VALIDATION', 'MIME_MISMATCH')),
+      );
+      await downloader.download({ providerMediaId: PROVIDER_ID, signal });
+      expect(logged(warn)).toContain('reason=NONE');
+    });
+
+    it('warns without leaking the message of an unknown error', async () => {
+      const { warn, downloader } = withLogger(() =>
+        Promise.reject(new Error(`boom ${SECRET_URL} ${PROVIDER_ID}`)),
+      );
+      await downloader.download({ providerMediaId: PROVIDER_ID, signal });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const text = logged(warn);
+      expect(text).toContain('category=UNKNOWN');
+      expect(text).not.toContain(PROVIDER_ID);
+      expect(text).not.toContain('SECRET');
+    });
+
+    it('does not warn on success', async () => {
+      const { warn, downloader } = withLogger(() =>
+        Promise.resolve({
+          filePath: '/tmp/m',
+          mimeType: 'audio/ogg',
+          byteCount: 1,
+          sha256: Buffer.alloc(32),
+          cleanup: jest.fn(),
+        }),
+      );
+      await downloader.download({ providerMediaId: PROVIDER_ID, signal });
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('records the HTTP status of a permanent failure from the real client', async () => {
+      const http: MetaHttp = () => Promise.resolve({ status: 401, data: {} });
+      const client = new MetaMediaClient(
+        {
+          graphApiBaseUrl: 'https://graph.facebook.com/v23.0',
+          allowedHosts: ['graph.facebook.com'],
+          metadataTimeoutMs: 1000,
+          downloadTimeoutMs: 1000,
+        },
+        () => 'token',
+        {
+          http,
+          resolve: () => Promise.resolve([{ address: '8.8.8.8', family: 4 }]),
+          createAgent: () => ({ destroy: jest.fn() }) as unknown as Agent,
+        },
+      );
+      const warn = jest.fn<void, [string]>();
+      await new MetaMirrorDownloader(client, { warn }).download({
+        providerMediaId: PROVIDER_ID,
+        signal,
+      });
+      const text = logged(warn);
+      expect(text).toContain('code=HTTP_PERMANENT');
+      expect(text).toContain('httpStatus=401');
+      expect(text).not.toContain(PROVIDER_ID);
+    });
   });
 
   describe('against the real client (HTTP status decides the permanent case)', () => {
