@@ -54,6 +54,16 @@ The backend matches the whole `q` as a substring, so `croquetas pedigree` return
 - A retry error is handled exactly like an error of the original search (`catalog_unavailable`); no extra customer-facing failure and never "no results". Out-of-stock matches stay in the results; the model reports their status after `checkStock` (search never proves stock).
 - The prompt also asks for at most one further, broader model-driven search (main product name, no dose/presentation/generic words) and never repeating the same query. Safe traces add only `broadenedCalls=<n>`.
 
+## Catalog relevance and the 3-option cap
+
+The backend can OR-match words (a search for `croquetas para cachorro` also returned an adult large-breed product), so the minimal `searchCatalog` tool bounds and annotates what the model sees. Product options are written by the model (there is no deterministic renderer), but everything it can present, check stock for, add to the cart or send a photo of comes from the `searchCatalog` result, so the cap is applied there (`domain/minimal-catalog-relevance.ts`, `limitCatalogOptions`).
+
+- **At most 3 options per reply.** Only the first 3 results (backend order = relevance order) are projected into the tool result and registered (`checkStock` identity, cart `cartSelectionRef`, product photos). The rest are neither shown to the model nor registered. When any are left out the result adds `more_results: <n>` and `narrowing_instruction` (ask ONE narrowing question: size, brand or presentation; do not list more). ≤3 results are returned unchanged. The cap also applies to broadened searches.
+- **The result carries what the model needs to judge relevance:** `query` (the searched text), each item's `name`, `brand` and `description`, and a `relevance_check` reminder.
+- **Prompt rules (model-judged).** Offer only products consistent with every attribute the customer stated (life stage cachorro/adulto/senior, species, brand, breed size, flavour/type). A contradicting product is never presented as a match; at most it is mentioned once, separately, as an alternative. When nothing matches, say so plainly and label the closest alternative as such. At most 3 options, never more.
+- **Optional backend match flag.** The catalog DTO accepts `match: 'all' | 'partial'` per item (`CatalogItemResponse.match`); an absent or unrecognized value is dropped (= unknown) and never rejects the item or counts as an unknown key. When present, `partial` items are ordered after the rest, never count toward the 3 matches, and at most **one** is shown next to full matches, with `match: 'partial'` on the item and a `match_note` telling the model to present it once, apart, as an alternative. When every item is `partial`, the closest 3 are returned with a `match_note` saying nothing fully matches. Without flags the behaviour is the cap alone.
+- Safe trace: `offeredCount=<n>` is added only when results were cut.
+
 ## Tools and guarantees
 
 | Tool              | Input                                                                   | Behavior                                                                                                                                                                                                                 |

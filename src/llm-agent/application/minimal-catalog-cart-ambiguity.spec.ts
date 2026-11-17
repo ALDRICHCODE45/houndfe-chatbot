@@ -1761,12 +1761,19 @@ describe('private selection-stage rejection diagnostics', () => {
       .mockImplementation(() => undefined);
     try {
       const f = fixture();
-      f.api.searchCatalog.mockResolvedValue(
-        Array.from({ length: 51 }, (_, index) => ({
+      // S10b caps a search at 3 options, so the 50-reference registry is
+      // filled by one product with 50 variants (1 product ref + 50 variant refs).
+      f.api.searchCatalog.mockResolvedValue([
+        {
           ...products[1],
-          productId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`,
-        })) as never,
-      );
+          variants: Array.from({ length: 50 }, (_, index) => ({
+            variantId: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`,
+            name: `Presentación ${index + 1}`,
+            priceCents: 45000,
+            stock,
+          })),
+        },
+      ] as never);
       f.steps([
         call('searchCatalog', { q: 'croquetas' }),
         say('Productos encontrados'),

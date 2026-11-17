@@ -156,6 +156,7 @@ import {
   searchWithBroadening,
   type BroadenedSearchInfo,
 } from '../domain/minimal-catalog-search-broadening';
+import { limitCatalogOptions } from '../domain/minimal-catalog-relevance';
 import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
@@ -205,7 +206,8 @@ const INSTRUCTIONS =
   'menciona la cantidad solo si es baja o el cliente la pide, nunca "una cantidad de N unidades en stock". ' +
   'La selección explícita ya es válida: no la repreguntes. ' +
   'Si el cliente menciona o pide un producto, llama searchCatalog ANTES de responder; nunca digas "Encontré" ni des datos del catálogo sin una lectura de este chat. ' +
-  'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 5) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. ' +
+  'Relevancia: ofrece como opciones SOLO productos que cumplan TODOS los atributos que el cliente dijo: etapa de vida (cachorro, adulto, senior), especie (perro, gato), marca, tamaño de raza (pequeña, mediana, grande), sabor o tipo. Compara cada producto del resultado (nombre, marca y description) con el query y con lo dicho en el chat; el buscador puede traer productos que solo coinciden con una palabra suelta. Un producto que contradice un atributo pedido (por ejemplo para adulto o raza grande cuando pidió cachorro) nunca lo presentes como coincidencia; como mucho menciónalo UNA sola vez, aparte y como alternativa distinta ("también tengo uno para adulto, por si le sirve"). Si ningún resultado cumple lo pedido, di claro que no hay lo que pidió y ofrece la alternativa más cercana diciendo que es una alternativa, no lo solicitado. Si el resultado marca match "partial" en un producto, es alternativa, nunca coincidencia. ' +
+  'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 3) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. Si el resultado trae more_results, hay más productos que no se muestran: no los menciones ni los listes, haz UNA sola pregunta para acotar (tamaño, marca o presentación). Nunca ofrezcas más de 3 opciones en una respuesta. ' +
   'Si searchCatalog no devuelve resultados, no concluyas que no existe: la aplicación ya reintenta sola con las palabras clave. Si aun así queda vacío, haz UNA sola búsqueda más amplia con el nombre principal (marca o producto, sin dosis, presentación ni palabras genéricas) y nunca repitas la misma consulta; si sigue vacío, di que no lo encontraste y pregunta qué producto busca. ' +
   'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: dilo claro ("Croquetas Pedigree no encontré; de Pedigree tengo …") y enumera esas opciones como alternativas, sin afirmar que son lo solicitado. Un error de lectura no es "sin resultados". ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada"; un producto que coincide y resulta agotado se sigue mostrando, como agotado, como alternativa. ' +
@@ -713,6 +715,22 @@ function broadenedSearchNote(info: BroadenedSearchInfo) {
         : `Sin resultados exactos para "${info.originalQuery}"; estos productos salieron de una búsqueda ampliada con "${info.matchedQuery}". No son exactamente lo pedido: preséntalos como alternativas y dilo claro.`,
   };
 }
+
+/** S10a: reminder shipped with every non-empty catalog result. */
+const CATALOG_RELEVANCE_CHECK =
+  'Antes de presentar, compara cada producto (name, brand, description) con TODO lo que pidió el cliente (query y chat): etapa de vida, especie, marca, tamaño de raza, sabor o tipo. Presenta solo los que cumplen; uno que contradice un atributo no es coincidencia (menciónalo una sola vez, aparte, como alternativa). Si ninguno cumple, dilo claro y etiqueta la alternativa más cercana.';
+
+/** S10b: shipped when matches beyond the 3 shown were left out. */
+const CATALOG_NARROWING_INSTRUCTION =
+  'Solo se muestran los 3 más relevantes; hay más productos que no se enseñan. Presenta máximo estos 3 y haz UNA sola pregunta para acotar (tamaño, marca o presentación) en lugar de listar más.';
+
+/** S10d: a partial match sits next to full matches. */
+const CATALOG_PARTIAL_ALTERNATIVE_NOTE =
+  'Los productos con match "partial" solo coinciden con parte de lo pedido: son una alternativa, no una coincidencia. Preséntalos aparte, una sola vez y etiquetados como alternativa, después de las coincidencias.';
+
+/** S10d: every item is a partial match. */
+const CATALOG_NO_FULL_MATCH_NOTE =
+  'Ningún producto cumple todo lo pedido (todos son match "partial"). Dilo claro y ofrece lo más cercano etiquetado como alternativa, no como lo solicitado.';
 
 function projectItem(item: CatalogItemResponse, register: RegisterSelection) {
   const { stock, variants, ...identity } = item;
@@ -2893,10 +2911,15 @@ export class MinimalCatalogAgentService {
               (query) => chatbotApi.searchCatalog(query),
               q,
             );
-            const results = items.map((item) =>
+            // S10b/S10d: only the capped, flag-ordered options reach the model
+            // and the registries (checkStock, cart refs, photos), so nothing
+            // beyond them can be presented to the customer.
+            const limited = limitCatalogOptions(items);
+            const offered = limited.offered;
+            const results = offered.map((item) =>
               projectItem(item, registerSelection('searchCatalog')),
             );
-            for (const item of items) {
+            for (const item of offered) {
               allowedIds.add(item.productId);
               currentIds.add(item.productId);
               imageRun?.presented.set(item.productId, item.name);
@@ -2915,6 +2938,9 @@ export class MinimalCatalogAgentService {
             }
             trace(
               `tool searchCatalog result=ok searchResultCount=${items.length}` +
+                (limited.moreResults > 0
+                  ? ` offeredCount=${offered.length}`
+                  : '') +
                 (broadened === null
                   ? ''
                   : ` broadenedCalls=${broadened.attempted.length}`),
@@ -2922,7 +2948,25 @@ export class MinimalCatalogAgentService {
             return {
               ok: true as const,
               stock_verified: false as const,
+              query: q,
               results,
+              ...(results.length === 0
+                ? {}
+                : { relevance_check: CATALOG_RELEVANCE_CHECK }),
+              ...(limited.moreResults > 0
+                ? {
+                    more_results: limited.moreResults,
+                    narrowing_instruction: CATALOG_NARROWING_INSTRUCTION,
+                  }
+                : {}),
+              ...(limited.flagged &&
+              offered.some((item) => item.match === 'partial')
+                ? {
+                    match_note: limited.noFullMatch
+                      ? CATALOG_NO_FULL_MATCH_NOTE
+                      : CATALOG_PARTIAL_ALTERNATIVE_NOTE,
+                  }
+                : {}),
               ...(broadened === null
                 ? {}
                 : { broadened_search: broadenedSearchNote(broadened) }),
