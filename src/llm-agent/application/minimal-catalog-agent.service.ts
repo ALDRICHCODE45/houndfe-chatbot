@@ -79,6 +79,7 @@ import {
   parseInteractiveReplyId,
   productImageCaption,
   reorderConfirmationButtons,
+  cartNextStepButtons,
   shortMxn,
   type CustomerReply,
   type CustomerReplyInteractive,
@@ -118,6 +119,8 @@ import {
 import {
   MinimalCartService,
   minimalCartReply,
+  MINIMAL_CART_NEXT_STEP_QUESTION,
+  MINIMAL_CART_SUMMARY_TAIL,
   type MinimalCartResult,
   type MinimalCartVariantDiagnostic,
 } from './minimal-cart.service';
@@ -248,6 +251,8 @@ export const CHECKOUT_CHANGE_REPLY = '¿Qué dato quiere corregir?';
 /** Lead for a tap on a button whose summary is no longer the current one. */
 export const STALE_BUTTON_LEAD = 'Ese botón ya no está vigente.';
 const STALE_BUTTON_FALLBACK = `${STALE_BUTTON_LEAD} ¿Qué desea hacer?`;
+/** S2: reply to «Agregar algo más» (no model call). */
+export const CART_ADD_MORE_REPLY = 'Claro, ¿qué producto desea agregar?';
 const ORDER_BUTTONS_PROMPT = '¿Confirma su pedido?';
 const CHECKOUT_BUTTONS_PROMPT = '¿Son correctos sus datos de entrega?';
 const CHOICE_LIST_PROMPT = 'Elija una opción de la lista.';
@@ -1096,6 +1101,35 @@ export class MinimalCatalogAgentService {
       case 'reorder_change':
         this.order?.dismiss(senderId);
         return answer({ reply: REORDER_CHANGE_REPLY });
+      case 'cart_continue':
+      case 'cart_add_more': {
+        // S2: a cart button is honoured only for the cart it was sent with.
+        if ((await this.cart?.fingerprint(senderId)) !== intent.reference)
+          return {
+            decision: await this.representCartAfterStaleButton(
+              senderId,
+              input.text,
+              style,
+            ),
+          };
+        this.order?.dismiss(senderId);
+        if (intent.kind === 'cart_add_more')
+          return answer({ reply: CART_ADD_MORE_REPLY });
+        // «Seguir con la compra» is the customer asking to buy: the turn
+        // continues exactly like the typed «quiero comprar».
+        return {
+          input: {
+            senderId,
+            text: input.text,
+            ...(input.inboundEvent === undefined
+              ? {}
+              : { inboundEvent: input.inboundEvent }),
+            ...(input.inboundAt === undefined
+              ? {}
+              : { inboundAt: input.inboundAt }),
+          },
+        };
+      }
       case 'payment_method': {
         // Only transfer exists today; a new method adds its own handler.
         const decision = await this.sendPaymentDetails(input, intent.reference);
@@ -1151,6 +1185,64 @@ export class MinimalCatalogAgentService {
       // Fall through to the question; nothing was confirmed.
     }
     return { reply: STALE_BUTTON_FALLBACK };
+  }
+
+  /**
+   * S2: a cart button from a cart that has since changed. Nothing starts;
+   * the CURRENT cart is shown again with fresh buttons.
+   */
+  private async representCartAfterStaleButton(
+    senderId: string,
+    text: string,
+    style: CustomerStyle,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const result = await this.cart?.view(senderId);
+    const summary = result === undefined ? null : minimalCartReply(result);
+    const reply = applyCustomerStyle(
+      result?.ok === true && summary?.endsWith(MINIMAL_CART_SUMMARY_TAIL)
+        ? `${STALE_BUTTON_LEAD}\n\n${summary}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
+        : summary === null || result?.ok !== true
+          ? STALE_BUTTON_FALLBACK
+          : `${STALE_BUTTON_LEAD}\n\n${summary}`,
+      style,
+    );
+    const interactive =
+      result?.ok === true && summary?.endsWith(MINIMAL_CART_SUMMARY_TAIL)
+        ? await this.cartNextStepInteractive(senderId, style)
+        : undefined;
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision(
+      interactive === undefined ? { reply } : { reply, interactive },
+    );
+  }
+
+  /** S2: the two next-step buttons bound to the cart as stored right now. */
+  private async cartNextStepInteractive(
+    senderId: string,
+    style: CustomerStyle,
+  ): Promise<CustomerReplyInteractive | undefined> {
+    const reference = await this.cart?.fingerprint(senderId);
+    if (reference === undefined || reference === null) return undefined;
+    const interactive = cartNextStepButtons(
+      reference,
+      applyCustomerStyle(MINIMAL_CART_NEXT_STEP_QUESTION, style),
+    );
+    return interactive.type === 'buttons'
+      ? {
+          ...interactive,
+          buttons: interactive.buttons.map((button) => ({
+            ...button,
+            title: applyCustomerRegister(button.title, style),
+          })),
+        }
+      : interactive;
   }
 
   /** The payment offer of the bot's latest message, if any. */
@@ -1225,7 +1317,11 @@ export class MinimalCatalogAgentService {
   /** A deterministic reorder reply (recorded without an offer: spends it). */
   private answerReorder(
     input: { senderId: string; text: string },
-    result: { reply: string; onSent?: () => void },
+    result: {
+      reply: string;
+      onSent?: () => void;
+      interactive?: CustomerReplyInteractive;
+    },
   ): MinimalCatalogAgentDecision {
     const reply = applyCustomerStyle(
       result.reply,
@@ -1239,11 +1335,13 @@ export class MinimalCatalogAgentService {
       ],
       [],
     );
-    return this.decision(
-      result.onSent === undefined
-        ? { reply }
-        : { reply, onSent: result.onSent },
-    );
+    return this.decision({
+      reply,
+      ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+      ...(result.interactive === undefined
+        ? {}
+        : { interactive: result.interactive }),
+    });
   }
 
   /**
@@ -1298,6 +1396,11 @@ export class MinimalCatalogAgentService {
       input,
       continued ?? {
         reply: `${minimalCartReply(result)}\n\n${REORDER_NEXT_STEP}`,
+        // The same next-step buttons as any cart summary.
+        interactive: await this.cartNextStepInteractive(
+          senderId,
+          this.customerStyle(senderId, input.text),
+        ),
       },
     );
   }
@@ -1832,7 +1935,16 @@ export class MinimalCatalogAgentService {
         : { reply, onSent: continued.onSent };
     }
     if (cartReply.value !== null) {
-      const reply = styled(cartReply.value);
+      // S2: a cart summary closes with the next-step question and buttons.
+      const invites = cartReply.value.endsWith(MINIMAL_CART_SUMMARY_TAIL);
+      const reply = styled(
+        invites
+          ? `${cartReply.value}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
+          : cartReply.value,
+      );
+      const nextStep = invites
+        ? await this.cartNextStepInteractive(input.senderId, style)
+        : undefined;
       // S4: a server product/presentation question goes out as a list.
       const choice = cartConversation?.lastChoice ?? null;
       const list =
@@ -1863,7 +1975,11 @@ export class MinimalCatalogAgentService {
       return {
         reply,
         ...(media === undefined ? {} : { media }),
-        ...(list === null ? {} : { interactive: list.interactive }),
+        ...(list === null
+          ? nextStep === undefined
+            ? {}
+            : { interactive: nextStep }
+          : { interactive: list.interactive }),
       };
     }
     if (this.hasInvalidCartToolCall(result)) {

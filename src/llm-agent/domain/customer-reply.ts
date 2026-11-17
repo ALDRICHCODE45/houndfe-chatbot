@@ -71,12 +71,16 @@ const REORDER_CHANGE = 'reorder_change';
 const PICK_VARIANT = 'pick_variant';
 const PICK_PRODUCT = 'pick_product';
 const PAYMENT_METHOD = 'pay';
+const CART_CONTINUE = 'cart_continue';
+const CART_ADD_MORE = 'cart_add';
 
 /** Customer text a confirm button stands for (the gates' affirmative). */
 export const INTERACTIVE_CONFIRM_TEXT = 'SÍ';
 /** Change intents: never an affirmative for the confirmation gates. */
 export const INTERACTIVE_ORDER_CHANGE_TEXT = 'Quiero cambiar algo';
 export const INTERACTIVE_CHECKOUT_CHANGE_TEXT = 'Quiero corregir mis datos';
+/** «Seguir con la compra» is the customer asking to buy (starts checkout). */
+export const INTERACTIVE_CART_CONTINUE_TEXT = 'Quiero comprar';
 
 /** What a tapped button or list row means, from its id. */
 export type InteractiveReplyIntent =
@@ -91,7 +95,9 @@ export type InteractiveReplyIntent =
   | { kind: 'reorder_change' }
   | { kind: 'pick'; choice: 'variant' | 'product'; reference: string }
   /** Payment-step method button; the reference is the placed sale id. */
-  | { kind: 'payment_method'; method: string; reference: string };
+  | { kind: 'payment_method'; method: string; reference: string }
+  /** Cart-summary buttons; the reference identifies the cart they were sent with. */
+  | { kind: 'cart_continue' | 'cart_add_more'; reference: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -113,6 +119,14 @@ export function parseInteractiveReplyId(
       return tail === null ? { kind: head } : null;
     case REORDER_CONFIRM:
       return tail === null ? null : { kind: head, reference: tail };
+    case CART_CONTINUE:
+    case CART_ADD_MORE:
+      return tail === null
+        ? null
+        : {
+            kind: head === CART_CONTINUE ? 'cart_continue' : 'cart_add_more',
+            reference: tail,
+          };
     case PAYMENT_METHOD: {
       // Tail is `<method>:<saleId>`; both parts are required.
       const split = tail === null ? -1 : tail.indexOf(':');
@@ -153,6 +167,8 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
       return INTERACTIVE_ORDER_CHANGE_TEXT;
     case 'checkout_change':
       return INTERACTIVE_CHECKOUT_CHANGE_TEXT;
+    case 'cart_continue':
+      return INTERACTIVE_CART_CONTINUE_TEXT;
     default:
       return fallback;
   }
@@ -229,6 +245,24 @@ export function paymentMethodButtons(
         title: method.title,
       }),
     ),
+    prompt,
+  };
+}
+
+/**
+ * S2 (N1): buttons under the server-owned cart summary, bound to the cart
+ * they were sent with. Titles are the same in usted and tú.
+ */
+export function cartNextStepButtons(
+  reference: string,
+  prompt: string,
+): CustomerReplyInteractive {
+  return {
+    type: 'buttons',
+    buttons: [
+      { id: `${CART_CONTINUE}:${reference}`, title: 'Seguir con la compra' },
+      { id: `${CART_ADD_MORE}:${reference}`, title: 'Agregar algo más' },
+    ],
     prompt,
   };
 }

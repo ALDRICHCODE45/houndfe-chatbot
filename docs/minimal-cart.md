@@ -68,6 +68,18 @@ No transfer or order is needed. Use controlled catalog data; this route reads th
 - A fresh `getCart` quote is read-only; saved prices are snapshots, not a checkout price guarantee.
 - Replies following cart tools come from the server result, not an unsupported model success claim. Existing EXPIRATION/RESTOCK acknowledgement priority remains unchanged.
 
+## Cart summary next step
+
+A non-empty cart summary (`Su carrito: … No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.`) ends with the question `¿Desea agregar algo más o seguimos con su compra?` (tú: `¿Quieres agregar algo más o seguimos con tu compra?`) and two WhatsApp reply buttons, the same in usted and tú: `Seguir con la compra` and `Agregar algo más`. The same two buttons close the cart shown after a "same as last time" reorder. An empty cart, a cart error or a clarification question carries no buttons, and a cart change that continues to the order summary shows that summary instead.
+
+The button ids are `cart_continue:<ref>` and `cart_add:<ref>`, where `<ref>` is a short digest of the stored lines (product, presentation, quantity) the buttons were sent with.
+
+| Tap | Result |
+| --- | --- |
+| `Seguir con la compra`, cart unchanged | The turn continues as the customer's own typed `Quiero comprar`: the same model turn, delivery-data / shipping / pickup steps and state as typing it. |
+| `Agregar algo más`, cart unchanged | `Claro, ¿qué producto desea agregar?` (tú: `…quieres agregar?`), without a model call and without touching the cart. |
+| Either button, cart changed since it was sent | `Ese botón ya no está vigente.` followed by the current cart and fresh buttons; nothing starts. |
+
 ### Bounded context
 
 - The selection registry holds at most **50 bindings per sender**. Registration beyond that returns `null`, so an unregistered pair cannot resolve; the model is asked to re-read rather than have a pending request silently rebound to another product.

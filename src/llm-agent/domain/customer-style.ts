@@ -277,6 +277,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Quieres agregar algo más o seguimos con tu compra?',
   ],
   ['¿Qué producto busca?', '¿Qué producto buscas?'],
+  // S2 cart summary «Agregar algo más» reply.
+  [
+    'Claro, ¿qué producto desea agregar?',
+    'Claro, ¿qué producto quieres agregar?',
+  ],
   // S1 "olvida mis datos" confirmation.
   ['tenía guardados de usted', 'tenía guardados de ti'],
   ['Sus pedidos', 'Tus pedidos'],
