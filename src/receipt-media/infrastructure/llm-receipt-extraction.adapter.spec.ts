@@ -317,9 +317,37 @@ describe('LlmReceiptExtractionAdapter', () => {
 
     await adapterWith(generate, { costGuard }).extract(PNG_INPUT);
 
-    expect(costGuard.record).toHaveBeenCalledWith({
-      promptTokens: 700,
-      completionTokens: 40,
-    });
+    expect(costGuard.record).toHaveBeenCalledWith(
+      { promptTokens: 700, completionTokens: 40 },
+      'receipt_vision',
+    );
+  });
+
+  it('caps the output tokens (S3; default 600, configurable)', async () => {
+    const generate = fakeModel(RECEIPT_OUTPUT);
+    await adapterWith(generate).extract(PNG_INPUT);
+    expect(
+      (callArgs(generate) as CallArgs & { maxOutputTokens?: number })
+        .maxOutputTokens,
+    ).toBe(600);
+    const capped = fakeModel(RECEIPT_OUTPUT);
+    await adapterWith(capped, { maxOutputTokens: 300 }).extract(PNG_INPUT);
+    expect(
+      (callArgs(capped) as CallArgs & { maxOutputTokens?: number })
+        .maxOutputTokens,
+    ).toBe(300);
+  });
+
+  it('skips the vision call when the LLM budget is spent (S2)', async () => {
+    const generate = fakeModel(RECEIPT_OUTPUT);
+    const costGuard = {
+      record: jest.fn(),
+      llmAllowed: jest.fn().mockResolvedValue(false),
+    };
+    await expect(
+      adapterWith(generate, { costGuard }).extract(PNG_INPUT),
+    ).resolves.toEqual({ kind: 'unavailable', reason: 'budget' });
+    expect(generate).not.toHaveBeenCalled();
+    expect(costGuard.record).not.toHaveBeenCalled();
   });
 });

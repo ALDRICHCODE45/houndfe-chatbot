@@ -13,6 +13,8 @@ import type {
 import { describeError } from '../../common/log-safe';
 
 export const DEFAULT_PRODUCT_IMAGE_TIMEOUT_MS = 15_000;
+/** Cost protection S3: LLM_MAX_OUTPUT_TOKENS default when none is wired. */
+export const DEFAULT_VISION_MAX_OUTPUT_TOKENS = 600;
 const MAX_TEXT_FIELD_LENGTH = 80;
 const MAX_LABEL_TEXT_LENGTH = 120;
 const MAX_QUERY_LENGTH = 60;
@@ -83,14 +85,21 @@ const PRODUCT_IMAGE_INSTRUCTIONS = [
   'confidence: high when brand and product are legible, medium when partly legible, low when guessing.',
 ].join('\n');
 
-/** Structural slice of the LLM cost guard; it only records usage. */
+/** Structural slice of the LLM cost guard: books usage, gates the call. */
 export interface ProductImageUsageRecorder {
-  record(usage: { promptTokens: number; completionTokens: number }): void;
+  record(
+    usage: { promptTokens: number; completionTokens: number },
+    source?: 'product_image',
+  ): void;
+  /** Cost protection S2: false once the LLM budget is spent. */
+  llmAllowed?(): Promise<boolean>;
 }
 
 export interface LlmProductImageDescriberOptions {
   timeoutMs?: number;
   costGuard?: ProductImageUsageRecorder;
+  /** Cost protection S3: output cap (LLM_MAX_OUTPUT_TOKENS). */
+  maxOutputTokens?: number;
 }
 
 class DescriberTimeoutError extends Error {}
@@ -103,6 +112,7 @@ export class LlmProductImageDescriberAdapter implements ProductImageDescriberPor
   private readonly logger = new Logger(LlmProductImageDescriberAdapter.name);
   private readonly timeoutMs: number;
   private readonly costGuard?: ProductImageUsageRecorder;
+  private readonly maxOutputTokens: number;
 
   constructor(
     private readonly generateTextFn: GenerateTextFn,
@@ -111,11 +121,18 @@ export class LlmProductImageDescriberAdapter implements ProductImageDescriberPor
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_PRODUCT_IMAGE_TIMEOUT_MS;
     this.costGuard = options.costGuard;
+    this.maxOutputTokens =
+      options.maxOutputTokens ?? DEFAULT_VISION_MAX_OUTPUT_TOKENS;
   }
 
   async describe(
     input: ProductImageDescriberInput,
   ): Promise<ProductImageRecognition> {
+    // Cost protection S2: a spent budget skips the description.
+    if (this.costGuard?.llmAllowed !== undefined) {
+      if (!(await this.costGuard.llmAllowed()))
+        return { kind: 'unavailable', reason: 'budget' };
+    }
     let raw: unknown;
     try {
       raw = await this.callModel(input);
@@ -161,13 +178,17 @@ export class LlmProductImageDescriberAdapter implements ProductImageDescriberPor
       ],
       output: Output.object({ schema: descriptionSchema }),
       abortSignal: controller.signal,
+      maxOutputTokens: this.maxOutputTokens,
     });
     try {
       const result = await Promise.race([call, timeout]);
-      this.costGuard?.record({
-        promptTokens: result.usage?.inputTokens ?? 0,
-        completionTokens: result.usage?.outputTokens ?? 0,
-      });
+      this.costGuard?.record(
+        {
+          promptTokens: result.usage?.inputTokens ?? 0,
+          completionTokens: result.usage?.outputTokens ?? 0,
+        },
+        'product_image',
+      );
       return result.output;
     } catch (error) {
       if (controller.signal.aborted) throw new DescriberTimeoutError();

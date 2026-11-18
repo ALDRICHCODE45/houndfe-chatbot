@@ -105,7 +105,16 @@ describe('AppConfigModule integration', () => {
       );
       expect(config.get<number>('llm.maxSteps')).toBe(4);
       expect(config.get<number>('llm.historyTurns')).toBe(12);
-      expect(config.get<number>('llm.monthlyTokenCeiling')).toBe(8_000_000);
+      expect(config.get<number>('llm.maxOutputTokens')).toBe(600);
+      expect(config.get<number>('llm.inboundTextMaxChars')).toBe(1000);
+      expect(config.get('llm.costGuard')).toEqual({
+        priceInputUsdPerMtok: 0.15,
+        priceOutputUsdPerMtok: 0.6,
+        dailyBudgetUsd: 10,
+        monthlyBudgetUsd: 200,
+        senderLimitPerHour: 40,
+        senderLimitPerDay: 120,
+      });
       expect(config.get<number>('llm.idleTimeoutMs')).toBe(10_800_000);
 
       await moduleRef.close();

@@ -140,8 +140,26 @@ const innerEnvValidationSchema = Joi.object({
   LLM_MODEL: Joi.string().required(),
   LLM_MAX_STEPS: Joi.number().integer().min(1).default(4),
   LLM_HISTORY_TURNS: Joi.number().integer().min(1).default(12),
-  LLM_MONTHLY_TOKEN_CEILING: Joi.number().integer().min(1).default(8_000_000),
   LLM_IDLE_TIMEOUT_MS: Joi.number().integer().min(1).default(10_800_000),
+
+  // ─── Cost protection phase 1 (odd/tasks/cost-and-abuse-phase1.md) ───────
+  /**
+   * USD per million tokens used to estimate spend. Defaults are the OpenAI
+   * list prices of gpt-4o-mini (the production LLM_MODEL); update both when
+   * the model changes. Image inputs are billed as input tokens.
+   */
+  LLM_PRICE_INPUT_USD_PER_MTOK: Joi.number().min(0).default(0.15),
+  LLM_PRICE_OUTPUT_USD_PER_MTOK: Joi.number().min(0).default(0.6),
+  /** Spend caps per calendar day / month in America/Mexico_City. */
+  LLM_DAILY_BUDGET_USD: Joi.number().positive().default(10),
+  LLM_MONTHLY_BUDGET_USD: Joi.number().positive().default(200),
+  /** maxOutputTokens of every production LLM call. */
+  LLM_MAX_OUTPUT_TOKENS: Joi.number().integer().min(1).default(600),
+  /** Customer text is cut to this length before any LLM use. */
+  INBOUND_TEXT_MAX_CHARS: Joi.number().integer().min(1).default(1000),
+  /** LLM-using turns per sender, rolling hour / rolling 24 h. */
+  SENDER_LLM_LIMIT_PER_HOUR: Joi.number().integer().min(1).default(40),
+  SENDER_LLM_LIMIT_PER_DAY: Joi.number().integer().min(1).default(120),
 
   // ─── Human-handoff slice (R7 + needs_human_review + R14) ─────────────────
   /**

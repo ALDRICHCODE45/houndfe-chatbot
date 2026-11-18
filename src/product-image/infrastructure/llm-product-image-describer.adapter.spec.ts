@@ -173,9 +173,32 @@ describe('LlmProductImageDescriberAdapter', () => {
 
     await adapterWith(generate, { costGuard }).describe(JPEG_INPUT);
 
-    expect(costGuard.record).toHaveBeenCalledWith({
-      promptTokens: 900,
-      completionTokens: 60,
-    });
+    expect(costGuard.record).toHaveBeenCalledWith(
+      { promptTokens: 900, completionTokens: 60 },
+      'product_image',
+    );
+  });
+
+  it('caps the output tokens (S3; default 600, configurable)', async () => {
+    const generate = fakeModel(PRODUCT_OUTPUT);
+    await adapterWith(generate, { maxOutputTokens: 200 }).describe(JPEG_INPUT);
+    const [[args]] = generate.mock.calls as [[{ maxOutputTokens?: number }]];
+    expect(args.maxOutputTokens).toBe(200);
+    const plain = fakeModel(PRODUCT_OUTPUT);
+    await adapterWith(plain).describe(JPEG_INPUT);
+    const [[defaults]] = plain.mock.calls as [[{ maxOutputTokens?: number }]];
+    expect(defaults.maxOutputTokens).toBe(600);
+  });
+
+  it('skips the description when the LLM budget is spent (S2)', async () => {
+    const generate = fakeModel(PRODUCT_OUTPUT);
+    const costGuard = {
+      record: jest.fn(),
+      llmAllowed: jest.fn().mockResolvedValue(false),
+    };
+    await expect(
+      adapterWith(generate, { costGuard }).describe(JPEG_INPUT),
+    ).resolves.toEqual({ kind: 'unavailable', reason: 'budget' });
+    expect(generate).not.toHaveBeenCalled();
   });
 });

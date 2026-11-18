@@ -74,7 +74,7 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
  *   - TOOL_REGISTRY          -> RealToolRegistry (the 10 sale-flow tools incl. getPaymentDetails)
  *   - LLM_AGENT_SYSTEM_PROMPT -> composed at boot (base + slice; no bank block)
  *   - GENERATE_TEXT          -> generateTextImpl re-exported from infrastructure
- *   - CostGuardService       (process-local monthly token counter)
+ *   - CostGuardService       (persistent LLM spend cap + per-number limit)
  *   - AgentRunner            (load -> idle -> truncate -> port -> cost-guard -> persist)
  *
  * Q1 / R11: bank details no longer flow through a boot-time seam. The
@@ -118,9 +118,14 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         const llm = config.get<{
           model: string;
           maxSteps: number;
-          monthlyTokenCeiling: number;
+          maxOutputTokens: number;
         }>('llm')!;
-        return new VercelAiLlmAgent(generateTextFn, llm.model, llm.maxSteps);
+        return new VercelAiLlmAgent(
+          generateTextFn,
+          llm.model,
+          llm.maxSteps,
+          llm.maxOutputTokens,
+        );
       },
     },
     {

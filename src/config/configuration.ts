@@ -14,6 +14,8 @@ const csv = (v: string | undefined, def: string[] | undefined = undefined) => {
 };
 const int = (v: string | undefined, def?: number) =>
   v ? parseInt(v, 10) : def;
+const num = (v: string | undefined, def: number) =>
+  v === undefined || v.trim() === '' ? def : Number(v);
 const configuration = () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
   meta: {
@@ -48,11 +50,21 @@ const configuration = () => ({
     model: process.env.LLM_MODEL as string,
     maxSteps: parseInt(process.env.LLM_MAX_STEPS ?? '4', 10),
     historyTurns: parseInt(process.env.LLM_HISTORY_TURNS ?? '12', 10),
-    monthlyTokenCeiling: parseInt(
-      process.env.LLM_MONTHLY_TOKEN_CEILING ?? '8000000',
-      10,
-    ),
     idleTimeoutMs: parseInt(process.env.LLM_IDLE_TIMEOUT_MS ?? '10800000', 10),
+    // Cost protection phase 1; defaults mirror env.validation.
+    maxOutputTokens: int(process.env.LLM_MAX_OUTPUT_TOKENS, 600)!,
+    inboundTextMaxChars: int(process.env.INBOUND_TEXT_MAX_CHARS, 1000)!,
+    costGuard: {
+      priceInputUsdPerMtok: num(process.env.LLM_PRICE_INPUT_USD_PER_MTOK, 0.15),
+      priceOutputUsdPerMtok: num(
+        process.env.LLM_PRICE_OUTPUT_USD_PER_MTOK,
+        0.6,
+      ),
+      dailyBudgetUsd: num(process.env.LLM_DAILY_BUDGET_USD, 10),
+      monthlyBudgetUsd: num(process.env.LLM_MONTHLY_BUDGET_USD, 200),
+      senderLimitPerHour: int(process.env.SENDER_LLM_LIMIT_PER_HOUR, 40)!,
+      senderLimitPerDay: int(process.env.SENDER_LLM_LIMIT_PER_DAY, 120)!,
+    },
   },
   database: {
     url: process.env.DATABASE_URL as string,

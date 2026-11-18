@@ -553,7 +553,8 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     ).resolves.toBeDefined();
     await truncate();
     migrate('up');
-    await expect(since('5000000000000')).resolves.toBe('1');
+    // Later migrations (5100+) re-apply with it.
+    expect(Number(await since('5000000000000'))).toBeGreaterThanOrEqual(1);
   });
 
   runHumanRequestFeedStoreContract('postgres', () =>

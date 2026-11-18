@@ -1103,6 +1103,26 @@ describe('VercelAiLlmAgent', () => {
       });
     });
 
+    it('caps the output tokens when configured (cost protection S3)', async () => {
+      const capped = new VercelAiLlmAgent(generateTextFn, 'm', 3, 250);
+      generateTextFn.mockResolvedValueOnce({
+        text: 'Hola',
+        usage: { inputTokens: 1, outputTokens: 1 },
+        content: [],
+        steps: [],
+        responseMessages: [],
+      } as never);
+      await capped.run({
+        senderId: 's',
+        text: 'hola',
+        history: [],
+        systemPrompt: SYSTEM_PROMPT,
+        tools: {},
+      });
+      const args = generateTextFn.mock.calls[0][0] as Record<string, unknown>;
+      expect(args.maxOutputTokens).toBe(250);
+    });
+
     it('forwards the configured stopWhen: stepCountIs(MAX_STEPS)', async () => {
       generateTextFn.mockResolvedValueOnce({
         text: 'Hola',

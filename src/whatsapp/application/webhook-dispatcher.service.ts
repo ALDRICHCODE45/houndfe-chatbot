@@ -838,6 +838,16 @@ export class WebhookDispatcherService {
             },
           }),
     });
+    // Cost protection S5/S6: a silent decision (a closing after a closing,
+    // a limited number after its first notice) sends nothing; the inbound is
+    // already recorded/mirrored (step 1b), so the message is just completed.
+    if (minimal.silent === true) {
+      this.logger.log(
+        `silent turn ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+      );
+      await this.markSeenSafely(message.messageId);
+      return;
+    }
     // S7 (W2) / rule 2: the mode may switch to HUMAN during the turn, or
     // between the photo and the text; the mode is read right before EACH
     // send and the rest of the reply is dropped. A read error propagates

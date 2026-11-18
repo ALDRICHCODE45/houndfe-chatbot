@@ -18,6 +18,7 @@ import { LLM_AGENT, type LlmAgentPort } from '../domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from '../domain/tool-registry.port';
 import { LLM_AGENT_SYSTEM_PROMPT } from '../domain/system-prompt';
 import { CostGuardService } from './cost-guard.service';
+import { LLM_BUDGET_EXHAUSTED_REPLY } from '../domain/llm-spend';
 
 export interface AgentRunnerConfig {
   systemPrompt: string;
@@ -176,6 +177,12 @@ export class AgentRunner {
       return { reply: PENDING_HUMAN_REQUEST_REPLY };
     }
 
+    // 1b) Cost protection S2: a spent budget starts no LLM call (one
+    // primary-key read; fails open).
+    if (!(await this.costGuard.llmAllowed())) {
+      return { reply: LLM_BUDGET_EXHAUSTED_REPLY };
+    }
+
     // 2) Idle-check + 3) truncate in memory.
     const idleExpired =
       state !== null &&
@@ -233,7 +240,7 @@ export class AgentRunner {
     });
 
     // 5) Cost guard.
-    this.costGuard.record(result.usage);
+    this.costGuard.record(result.usage, 'ops_resume');
 
     // Final persistence CAS does not roll back tool effects or the reply.
     const nextTurns: AgentMessage[] = [

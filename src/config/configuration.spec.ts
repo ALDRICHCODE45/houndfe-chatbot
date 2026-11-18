@@ -24,6 +24,14 @@ describe('configuration()', () => {
     'LLM_MAX_STEPS',
     'LLM_HISTORY_TURNS',
     'LLM_MONTHLY_TOKEN_CEILING',
+    'LLM_PRICE_INPUT_USD_PER_MTOK',
+    'LLM_PRICE_OUTPUT_USD_PER_MTOK',
+    'LLM_DAILY_BUDGET_USD',
+    'LLM_MONTHLY_BUDGET_USD',
+    'LLM_MAX_OUTPUT_TOKENS',
+    'INBOUND_TEXT_MAX_CHARS',
+    'SENDER_LLM_LIMIT_PER_HOUR',
+    'SENDER_LLM_LIMIT_PER_DAY',
     'LLM_IDLE_TIMEOUT_MS',
     'DATABASE_URL',
     'DB_POOL_MAX',
@@ -105,6 +113,54 @@ describe('configuration()', () => {
         expect(configuration().llm.maxSteps).toBe(Number(steps));
       },
     );
+  });
+
+  describe('cost protection (phase 1)', () => {
+    it('reads the cost guard knobs, with documented defaults', () => {
+      for (const key of [
+        'LLM_PRICE_INPUT_USD_PER_MTOK',
+        'LLM_PRICE_OUTPUT_USD_PER_MTOK',
+        'LLM_DAILY_BUDGET_USD',
+        'LLM_MONTHLY_BUDGET_USD',
+        'LLM_MAX_OUTPUT_TOKENS',
+        'INBOUND_TEXT_MAX_CHARS',
+        'SENDER_LLM_LIMIT_PER_HOUR',
+        'SENDER_LLM_LIMIT_PER_DAY',
+      ])
+        delete process.env[key];
+      const llm = configuration().llm;
+      expect(llm.maxOutputTokens).toBe(600);
+      expect(llm.inboundTextMaxChars).toBe(1000);
+      expect(llm.costGuard).toEqual({
+        priceInputUsdPerMtok: 0.15,
+        priceOutputUsdPerMtok: 0.6,
+        dailyBudgetUsd: 10,
+        monthlyBudgetUsd: 200,
+        senderLimitPerHour: 40,
+        senderLimitPerDay: 120,
+      });
+      Object.assign(process.env, {
+        LLM_PRICE_INPUT_USD_PER_MTOK: '2.5',
+        LLM_PRICE_OUTPUT_USD_PER_MTOK: '10',
+        LLM_DAILY_BUDGET_USD: '3.5',
+        LLM_MONTHLY_BUDGET_USD: '90',
+        LLM_MAX_OUTPUT_TOKENS: '400',
+        INBOUND_TEXT_MAX_CHARS: '800',
+        SENDER_LLM_LIMIT_PER_HOUR: '20',
+        SENDER_LLM_LIMIT_PER_DAY: '60',
+      });
+      const custom = configuration().llm;
+      expect(custom.maxOutputTokens).toBe(400);
+      expect(custom.inboundTextMaxChars).toBe(800);
+      expect(custom.costGuard).toEqual({
+        priceInputUsdPerMtok: 2.5,
+        priceOutputUsdPerMtok: 10,
+        dailyBudgetUsd: 3.5,
+        monthlyBudgetUsd: 90,
+        senderLimitPerHour: 20,
+        senderLimitPerDay: 60,
+      });
+    });
   });
 
   it('exposes database.url sourced from DATABASE_URL', () => {

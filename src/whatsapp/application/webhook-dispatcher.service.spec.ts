@@ -291,6 +291,39 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
   });
 
+  it('sends nothing for a silent decision but completes the message (cost protection S5/S6)', async () => {
+    minimalAgent.tryHandle.mockResolvedValueOnce({
+      kind: 'handled',
+      reply: '',
+      silent: true,
+    });
+    await service.dispatch({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id: 'wamid.silent',
+                    from: '5215550001111',
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body: 'ok' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+    expect(sender.sendText).not.toHaveBeenCalled();
+    expect(dedup.markSeen).toHaveBeenCalledWith('wamid.silent');
+  });
+
   it('does NOT send any message outside the inbound-driven path (no proactive sends)', async () => {
     // Empty webhook event: no messages at all.
     const event: WebhookEventDto = {

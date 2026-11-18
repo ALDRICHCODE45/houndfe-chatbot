@@ -1,6 +1,8 @@
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { Logger } from '@nestjs/common';
 import { CostGuardService } from './cost-guard.service';
+import { LLM_BUDGET_EXHAUSTED_REPLY } from '../domain/llm-spend';
+import { InMemoryLlmSpendStore } from '../infrastructure/in-memory-llm-spend.store';
 import { AgentRunner } from './agent-runner.service';
 import {
   CONVERSATION_STORE,
@@ -334,6 +336,42 @@ describe('AgentRunner', () => {
   // Scenario: cost guard aggregates per-turn usage
   // ────────────────────────────────────────────────────────────────────
   describe('cost guard', () => {
+    it('starts no LLM call once the budget is spent and answers the fixed copy (S2)', async () => {
+      store.get.mockResolvedValue(null);
+      const spent = new CostGuardService({
+        store: new InMemoryLlmSpendStore(),
+        dailyBudgetUsd: 1,
+      });
+      jest.spyOn(spent, 'llmAllowed').mockResolvedValue(false);
+      const guarded = AgentRunner.forTest(store, llm, tools, spent, {
+        systemPrompt: SYSTEM_PROMPT,
+        historyTurns: 4,
+        idleTimeoutMs: TEN_MIN_MS,
+      });
+      await expect(
+        guarded.handle({ senderId: 's', text: 'a' }),
+      ).resolves.toEqual({
+        reply: LLM_BUDGET_EXHAUSTED_REPLY,
+      });
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(store.commitAgentTurn).not.toHaveBeenCalled();
+    });
+
+    it('books the ops resume run under its own source', async () => {
+      store.get.mockResolvedValue(null);
+      llm.run.mockResolvedValue({
+        reply: 'ok',
+        messages: [],
+        usage: { promptTokens: 1, completionTokens: 2 },
+      });
+      const record = jest.spyOn(costGuard, 'record');
+      await runner.handle({ senderId: 's', text: 'a' });
+      expect(record).toHaveBeenCalledWith(
+        { promptTokens: 1, completionTokens: 2 },
+        'ops_resume',
+      );
+    });
+
     it('records per-turn usage on every run', async () => {
       store.get.mockResolvedValue(null);
       store.update.mockResolvedValue({

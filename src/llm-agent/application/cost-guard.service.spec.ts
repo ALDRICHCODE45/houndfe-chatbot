@@ -1,120 +1,176 @@
 import { Logger } from '@nestjs/common';
-import { CostGuardService } from './cost-guard.service';
+import type { LlmSpendStore } from '../domain/llm-spend';
+import { InMemoryLlmSpendStore } from '../infrastructure/in-memory-llm-spend.store';
+import { CostGuardService, type CostGuardOptions } from './cost-guard.service';
 
 /**
- * Unit tests for CostGuardService.
- *
- * Spec scenarios:
- *   - 80% threshold emits ONE warn log and still returns reply.
- *   - 100% threshold emits ONE warn log and still returns reply.
- *   - Never throws when the ceiling is exceeded.
- *   - NaN-safe aggregate (defensive against undefined fields).
+ * S2 persistent spend cap + S5 per-number limit (cost protection phase 1).
+ * The guard prices each call, books it in the shared ledger (store) and
+ * answers one admission per LLM turn. A ledger failure fails open.
  */
-describe('CostGuardService', () => {
-  const CEILING = 1_000;
-  let warnSpy: jest.SpyInstance;
+describe('CostGuardService (persistent spend cap)', () => {
+  const NOW = new Date('2026-11-18T18:00:00.000Z'); // 12:00 in Mexico City
+  let warn: jest.SpyInstance;
+  let error: jest.SpyInstance;
 
   beforeEach(() => {
-    jest.clearAllMocks();
-    warnSpy = jest
+    warn = jest
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
+    error = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const guard = (
+    store: LlmSpendStore = new InMemoryLlmSpendStore(),
+    settings: Partial<CostGuardOptions> = {},
+  ) =>
+    new CostGuardService({
+      store,
+      clock: () => NOW,
+      priceInputUsdPerMtok: 1,
+      priceOutputUsdPerMtok: 2,
+      dailyBudgetUsd: 1,
+      monthlyBudgetUsd: 200,
+      senderLimitPerHour: 2,
+      senderLimitPerDay: 3,
+      ...settings,
+    });
+
+  it('defaults to the documented caps and gpt-4o-mini prices', () => {
+    expect(new CostGuardService().settings).toEqual({
+      priceInputUsdPerMtok: 0.15,
+      priceOutputUsdPerMtok: 0.6,
+      dailyBudgetUsd: 10,
+      monthlyBudgetUsd: 200,
+      senderLimitPerHour: 40,
+      senderLimitPerDay: 120,
+    });
   });
 
-  afterEach(() => {
-    warnSpy.mockRestore();
+  it('books each call with its source, tokens, priced USD and Mexico City periods', async () => {
+    const store = new InMemoryLlmSpendStore();
+    const record = jest.spyOn(store, 'record');
+    const g = guard(store);
+    g.record(
+      { promptTokens: 100_000, completionTokens: 50_000 },
+      'receipt_vision',
+    );
+    await g.flush();
+    expect(record).toHaveBeenCalledWith({
+      source: 'receipt_vision',
+      inputTokens: 100_000,
+      outputTokens: 50_000,
+      usd: 0.2,
+      at: NOW,
+      periods: { day: '2026-11-18', month: '2026-11' },
+      caps: { dayUsd: 1, monthUsd: 200 },
+    });
+    expect(g.currentAggregate).toBe(150_000);
+    await expect(
+      store.totals({ day: '2026-11-18', month: '2026-11' }),
+    ).resolves.toEqual({
+      dayUsd: 0.2,
+      monthUsd: 0.2,
+    });
   });
 
-  function newGuard(ceiling = CEILING): CostGuardService {
-    return new CostGuardService(ceiling);
-  }
-
-  // ────────────────────────────────────────────────────────────────────
-  // Scenario: 80% and 100% thresholds log warn without blocking
-  // ────────────────────────────────────────────────────────────────────
-  it('does NOT warn below 80%', () => {
-    const guard = newGuard();
-    guard.record({ promptTokens: 700, completionTokens: 0 }); // 70%
-    expect(warnSpy).not.toHaveBeenCalled();
+  it('warns once at 80% of a period and logs once at 100%', async () => {
+    const g = guard();
+    g.record({ promptTokens: 700_000, completionTokens: 0 }); // $0.70
+    await g.flush();
+    expect(warn).not.toHaveBeenCalled();
+    g.record({ promptTokens: 150_000, completionTokens: 0 }); // $0.85
+    g.record({ promptTokens: 10_000, completionTokens: 0 }); // $0.86
+    await g.flush();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String((warn.mock.calls[0] as unknown[])[0])).toMatch(
+      />=80%.*daily/,
+    );
+    g.record({ promptTokens: 200_000, completionTokens: 0 }); // $1.06
+    g.record({ promptTokens: 200_000, completionTokens: 0 });
+    await g.flush();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(String((warn.mock.calls[1] as unknown[])[0])).toMatch(
+      />=100%.*daily/,
+    );
   });
 
-  it('emits exactly ONE >=80% warn log when crossing 80%', () => {
-    const guard = newGuard();
-    guard.record({ promptTokens: 600, completionTokens: 0 }); // 60%
-    expect(warnSpy).not.toHaveBeenCalled();
-
-    guard.record({ promptTokens: 210, completionTokens: 0 }); // 81%
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy).toHaveBeenLastCalledWith(expect.stringMatching(/>=80%/));
+  it('stops new LLM calls once a budget is spent (local and shared reads)', async () => {
+    const store = new InMemoryLlmSpendStore();
+    const g = guard(store);
+    expect(g.llmAllowedNow()).toBe(true);
+    await expect(g.llmAllowed()).resolves.toBe(true);
+    g.record({ promptTokens: 1_000_000, completionTokens: 0 }); // $1 = cap
+    await g.flush();
+    expect(g.llmAllowedNow()).toBe(false);
+    await expect(g.llmAllowed()).resolves.toBe(false);
+    // Another process (fresh guard, same ledger) sees it on its next read.
+    const other = guard(store);
+    expect(other.llmAllowedNow()).toBe(true);
+    await expect(other.llmAllowed()).resolves.toBe(false);
+    expect(other.llmAllowedNow()).toBe(false);
   });
 
-  it('does NOT re-emit the >=80% warn on subsequent turns above 80%', () => {
-    const guard = newGuard();
-    guard.record({ promptTokens: 600, completionTokens: 0 }); // 60%
-    guard.record({ promptTokens: 210, completionTokens: 0 }); // 81% → warn once
-    guard.record({ promptTokens: 100, completionTokens: 0 }); // 91% → no new warn
-
-    expect(warnSpy).toHaveBeenCalledTimes(1);
+  it('admits a turn with one store call carrying the caps and limits', async () => {
+    const store = new InMemoryLlmSpendStore();
+    const admit = jest.spyOn(store, 'admitTurn');
+    const g = guard(store);
+    await expect(g.admitTurn('5215550001111')).resolves.toEqual({
+      kind: 'allowed',
+    });
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledWith({
+      senderId: '5215550001111',
+      at: NOW,
+      periods: { day: '2026-11-18', month: '2026-11' },
+      caps: { dayUsd: 1, monthUsd: 200 },
+      limits: { perHour: 2, perDay: 3 },
+    });
+    await g.admitTurn('5215550001111');
+    await expect(g.admitTurn('5215550001111')).resolves.toEqual({
+      kind: 'sender_limited',
+      window: 'hour',
+      firstNotice: true,
+    });
   });
 
-  it('emits exactly ONE >=100% warn log when reaching the ceiling', () => {
-    const guard = newGuard();
-    guard.record({ promptTokens: 600, completionTokens: 0 }); // 60%
-    guard.record({ promptTokens: 210, completionTokens: 0 }); // 81% → 80% warn
-    guard.record({ promptTokens: 200, completionTokens: 0 }); // 101% → 100% warn
-
-    expect(warnSpy).toHaveBeenCalledTimes(2);
-    expect(warnSpy).toHaveBeenLastCalledWith(expect.stringMatching(/>=100%/));
-  });
-
-  it('does NOT throw when the ceiling is exceeded (soft-only contract)', () => {
-    const guard = newGuard();
+  it('fails open and logs an error when the ledger cannot be read or written', async () => {
+    const broken: LlmSpendStore = {
+      record: jest.fn().mockRejectedValue(new Error('db down')),
+      totals: jest.fn().mockRejectedValue(new Error('db down')),
+      admitTurn: jest.fn().mockRejectedValue(new Error('db down')),
+    };
+    const g = guard(broken);
+    await expect(g.admitTurn('5215550001111')).resolves.toEqual({
+      kind: 'allowed',
+    });
+    await expect(g.llmAllowed()).resolves.toBe(true);
     expect(() =>
-      guard.record({ promptTokens: 999_999, completionTokens: 999_999 }),
+      g.record({ promptTokens: 1, completionTokens: 1 }),
     ).not.toThrow();
+    await g.flush();
+    expect(g.llmAllowedNow()).toBe(true);
+    expect(error).toHaveBeenCalledTimes(3);
   });
 
-  it('keeps recording past the ceiling (aggregate keeps growing)', () => {
-    const guard = newGuard();
-    guard.record({ promptTokens: 2000, completionTokens: 0 });
-    expect(guard.currentAggregate).toBe(2000);
-    guard.record({ promptTokens: 500, completionTokens: 0 });
-    expect(guard.currentAggregate).toBe(2500);
+  it('without a store (test harnesses) it allows everything and only counts tokens', async () => {
+    const g = new CostGuardService();
+    g.record({ promptTokens: 2, completionTokens: 3 });
+    await g.flush();
+    expect(g.currentAggregate).toBe(5);
+    await expect(g.admitTurn('5215550001111')).resolves.toEqual({
+      kind: 'allowed',
+    });
+    await expect(g.llmAllowed()).resolves.toBe(true);
   });
 
-  // ────────────────────────────────────────────────────────────────────
-  // Defensive: undefined fields or NaN inputs do not poison the aggregate
-  // ────────────────────────────────────────────────────────────────────
-  it('treats undefined promptTokens/completionTokens as 0', () => {
-    const guard = newGuard();
-    // The adapter contract guarantees this is unreachable, but cost guard
-    // is the last line of defence.
-    expect(() =>
-      guard.record({
-        promptTokens: undefined as unknown as number,
-        completionTokens: undefined as unknown as number,
-      }),
-    ).not.toThrow();
-    expect(guard.currentAggregate).toBe(0);
-  });
-
-  it('rejects an invalid ceiling at construction time', () => {
-    expect(() => new CostGuardService(0)).toThrow();
-    expect(() => new CostGuardService(-1)).toThrow();
-    expect(() => new CostGuardService(Number.NaN)).toThrow();
-  });
-
-  it('reset() clears the aggregate and the warned-once flags', () => {
-    const guard = newGuard();
-    guard.record({ promptTokens: 600, completionTokens: 0 });
-    guard.record({ promptTokens: 210, completionTokens: 0 }); // 81% → warn
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-
-    guard.reset();
-    expect(guard.currentAggregate).toBe(0);
-
-    guard.record({ promptTokens: 600, completionTokens: 0 });
-    guard.record({ promptTokens: 210, completionTokens: 0 }); // 81% again
-    expect(warnSpy).toHaveBeenCalledTimes(2); // new warn after reset
+  it('is NaN-safe', async () => {
+    const g = guard();
+    g.record({ promptTokens: Number.NaN, completionTokens: 4 });
+    await g.flush();
+    expect(g.currentAggregate).toBe(4);
   });
 });
