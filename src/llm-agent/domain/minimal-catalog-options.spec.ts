@@ -709,9 +709,19 @@ describe('S13c follow-up (L31): opening, {lo pedido}, emoji', () => {
   });
 
   it('«alimento para gato» with cat products → «Encontré estas opciones:»', () => {
+    // L33: species + type — a cat item must also carry a type word (food
+    // words interchangeable), so the fixtures carry their food description.
     const plan = planCatalogOptions('alimento para gato', [
-      item(310, { name: 'Inaba Churu Atún para Gato', brand: 'Inaba' }),
-      item(311, { name: 'Whiskas Gato Adulto Pollo', brand: 'Whiskas' }),
+      item(310, {
+        name: 'Inaba Churu Atún para Gato',
+        brand: 'Inaba',
+        description: 'Alimento complementario cremoso para gatos.',
+      }),
+      item(311, {
+        name: 'Whiskas Gato Adulto Pollo',
+        brand: 'Whiskas',
+        description: 'Alimento húmedo para gatos adultos.',
+      }),
     ])!;
     expect(
       renderCatalogOptions([plan], {
@@ -797,5 +807,203 @@ describe('S13c follow-up (L31): opening, {lo pedido}, emoji', () => {
     expect(withEmoji.text.replace(/ \p{Extended_Pictographic}$/u, '')).toBe(
       without.text,
     );
+  });
+});
+
+describe('L33: species groups and species + type requests', () => {
+  // Production evidence (2026-11-17): «alimento para aves manejan?😊».
+  const jaula = item(400, {
+    name: 'Vision Jaula para Aves',
+    brand: 'Vision',
+    description: 'Jaula metálica para aves pequeñas.',
+  });
+  const tetra = item(401, {
+    name: 'TetraMin Hojuelas para Peces Tropicales',
+    brand: 'Tetra',
+    description: 'Alimento en hojuelas para peces tropicales.',
+  });
+  const hills = item(402, {
+    name: "Hill's Science Diet Felino Adult 7+",
+    brand: "Hill's",
+    description: 'Alimento seco para gatos sénior.',
+  });
+  const prodItems = [jaula, tetra, hills];
+
+  it('an item naming only another species contradicts (ave, pez, felino); accents/case/plural folded', () => {
+    expect(classifyCatalogItem('alimento para aves', tetra, prodItems)).toBe(
+      'contradicts',
+    );
+    expect(classifyCatalogItem('alimento para AVES', hills, prodItems)).toBe(
+      'contradicts',
+    );
+    expect(
+      classifyCatalogItem(
+        'comida para pájaros',
+        item(403, { name: 'Alimento para Peces' }),
+        [],
+      ),
+    ).toBe('contradicts');
+    expect(
+      classifyCatalogItem(
+        'alimento para pez',
+        item(404, { name: 'Mezcla de Semillas para Perico y Canario' }),
+        [],
+      ),
+    ).toBe('contradicts');
+  });
+
+  it('every new group: roedor/hámster/cuyo, conejo, reptil/tortuga, bird/fish', () => {
+    const cases: Array<[string, string]> = [
+      ['alimento para hamster', 'Alimento para Conejos'],
+      ['alimento para cuyo', 'Alimento para Tortugas'],
+      ['alimento para conejo', 'Alimento para Roedores'],
+      ['alimento para tortuga', 'Pellets para Hámster'],
+      ['alimento para reptiles', 'Food for Birds'],
+      ['alimento para roedores', 'Fish Food'],
+      ['alimento para perro', 'Alimento para Canarios'],
+      ['alimento para canario', 'Croquetas para Perro'],
+    ];
+    cases.forEach(([q, name], n) =>
+      expect([q, classifyCatalogItem(q, item(410 + n, { name }), [])]).toEqual([
+        q,
+        'contradicts',
+      ]),
+    );
+  });
+
+  it('an item naming the requested species (even alongside others) does not contradict', () => {
+    const shared = item(420, {
+      name: 'Jaula para Aves y Roedores',
+      description: null,
+    });
+    expect(classifyCatalogItem('jaula hámster', shared, [])).not.toBe(
+      'contradicts',
+    );
+    expect(
+      planCatalogOptions('jaula para hamster', [shared])!.options,
+    ).toHaveLength(1);
+  });
+
+  it('species + type: a species-only item (the jaula for «alimento para aves») is never offered nor mentioned', () => {
+    expect(classifyCatalogItem('alimento para aves', jaula, prodItems)).toBe(
+      'mismatch',
+    );
+    const birdFood = item(430, {
+      name: 'Alimento para Aves Mezcla Premium',
+      brand: 'Vision',
+    });
+    const plan = planCatalogOptions('alimento para aves', [jaula, birdFood])!;
+    const out = renderCatalogOptions([plan], {
+      restockAvailable: true,
+      style: usted,
+    });
+    expect(out.shown.map((i) => i.productId)).toEqual([birdFood.productId]);
+    expect(out.text).not.toContain('Jaula');
+  });
+
+  it("prod case: jaula + TetraMin + Hill's for «alimento para aves manejan?😊» → dead end, nothing listed", () => {
+    const plan = planCatalogOptions(
+      'alimento aves',
+      prodItems,
+      'alimento para aves manejan?😊',
+    );
+    expect(plan).not.toBeNull();
+    const out = renderCatalogOptions([plan!], {
+      restockAvailable: true,
+      style: tu,
+      emoji: true,
+    });
+    expect(out.text).toBe(
+      'Alimento para aves no tengo por ahora. ¿Quieres que le pregunte al equipo si lo pueden conseguir, o te busco otra cosa? 😊',
+    );
+    expect(out.shown).toEqual([]);
+  });
+
+  it('only a species-only item → dead end too (the model never gets the jaula to mention)', () => {
+    const plan = planCatalogOptions('alimento para aves', [jaula]);
+    expect(plan).not.toBeNull();
+    expect(
+      renderCatalogOptions([plan!], { restockAvailable: true, style: usted })
+        .text,
+    ).toBe(
+      'Alimento para aves no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
+    );
+  });
+
+  it('species alone (no type word) keeps species-only items: «algo para aves» still offers the jaula', () => {
+    expect(
+      planCatalogOptions('algo para aves', [jaula])!.options.map(
+        (o) => o.item.productId,
+      ),
+    ).toEqual([jaula.productId]);
+  });
+
+  it('the species must be named: a food naming no species is not offered for «alimento para aves»', () => {
+    const generic = item(440, { name: 'Alimento Mix Semillas Premium' });
+    expect(classifyCatalogItem('alimento para aves', generic, [generic])).toBe(
+      'mismatch',
+    );
+  });
+
+  it('a requested brand exempts the species mention, not the type word', () => {
+    const pedigree = item(450, {
+      name: 'Croquetas Pedigree Adulto Pollo',
+      brand: 'Pedigree',
+    });
+    const brandOnly = item(451, {
+      name: 'Pedigree Correa Retráctil',
+      brand: 'Pedigree',
+    });
+    const items = [pedigree, brandOnly];
+    expect(
+      classifyCatalogItem('croquetas pedigree para perro', pedigree, items),
+    ).toBe('same_type');
+    expect(
+      classifyCatalogItem('croquetas pedigree para perro', brandOnly, items),
+    ).toBe('mismatch');
+  });
+
+  it('food words are interchangeable for the type check: «croquetas para perro» keeps «Alimento seco para perros»', () => {
+    const nupecAdulto = item(460, {
+      name: 'Nupec Adulto Razas Medianas',
+      brand: 'Nupec',
+      description: 'Alimento seco para perros adultos.',
+    });
+    expect(
+      planCatalogOptions('croquetas para perro', [nupecAdulto])!.options,
+    ).toHaveLength(1);
+  });
+
+  it('«tiene alimento para gato?» keeps Whiskas and Cat Chow (descriptions say gatos / gatitos)', () => {
+    const whiskas = item(470, {
+      name: 'Whiskas Pouch Pollo 85 g',
+      brand: 'Whiskas',
+      description: 'Alimento húmedo para gatos adultos.',
+    });
+    const catChow = item(471, {
+      name: 'Cat Chow Delimix',
+      brand: 'Purina',
+      description: 'Alimento completo para gatitos.',
+    });
+    const dog = item(472, {
+      name: 'Alimento para Perro Adulto',
+      description: null,
+    });
+    expect(
+      planCatalogOptions(
+        'alimento para gato',
+        [whiskas, dog, catChow],
+        'tiene alimento para gato?',
+      )!.options.map((o) => o.item.productId),
+    ).toEqual([whiskas.productId, catChow.productId]);
+    // «gatitos» alone (no gato/cat word) still names the cat species.
+    const kittenOnly = item(473, {
+      name: 'Purina Croquetas Pollo',
+      brand: 'Purina',
+      description: 'Para gatitos.',
+    });
+    expect(
+      planCatalogOptions('alimento para gato', [kittenOnly])!.options,
+    ).toHaveLength(1);
   });
 });
