@@ -15,12 +15,14 @@ import { HumanRequestFeedConsumer } from '../application/human-request-feed.cons
 import {
   LIVE_DECISIONS,
   REF,
+  SALE_PICKUP_DECISIONS,
   SCHEDULE_DECISIONS,
   cancelledItem,
   overdueItem,
   reminderItem,
   rescheduledItem,
   runHumanRequestFeedStoreContract,
+  salePickupItem,
   staffMessageItem,
   templateItem,
 } from './human-request-feed-store.contract';
@@ -553,8 +555,74 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     ).resolves.toBeDefined();
     await truncate();
     migrate('up');
-    // Later migrations (5100+) re-apply with it.
+    // Later migrations (5100, 5200) re-apply with it.
     expect(Number(await since('5000000000000'))).toBeGreaterThanOrEqual(1);
+  });
+
+  it('migration 5200: pay in store decisions, every older one kept, guarded down', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    await store.insertDelivery(salePickupItem('ps-1'));
+    for (const decision of [
+      ...SALE_PICKUP_DECISIONS,
+      ...SCHEDULE_DECISIONS,
+      ...LIVE_DECISIONS,
+      'UNKNOWN_TYPE',
+      'NO_CONVERSATION',
+      'HUMAN_SESSION',
+      'WINDOW_CLOSED',
+    ])
+      await expect(
+        pool.query(
+          `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'ps-1'`,
+          [decision],
+        ),
+      ).resolves.toBeDefined();
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'NOPE' WHERE delivery_id = 'ps-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(store.getDelivery('ps-1')).resolves.toMatchObject({
+      type: 'sale.pickup_reminder',
+      requestId: null,
+      conversationRef: REF,
+      item: {
+        type: 'sale.pickup_reminder',
+        saleId: expect.any(String) as unknown,
+      },
+    });
+    await truncate();
+
+    const count5200 = await since('5200000000000');
+    for (const decision of SALE_PICKUP_DECISIONS) {
+      await store.insertDelivery(salePickupItem('ps-2'));
+      await pool.query(
+        `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'ps-2'`,
+        [decision],
+      );
+      expect(() => migrate('down', count5200)).toThrow(/refusing to roll back/);
+      await expect(since('5200000000000')).resolves.toBe(count5200);
+      await truncate();
+    }
+
+    await store.insertDelivery(salePickupItem('ps-3'));
+    await pool.query(
+      `UPDATE human_request_deliveries SET decision = 'STALE_SCHEDULE' WHERE delivery_id = 'ps-3'`,
+    );
+    migrate('down', count5200);
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'PICKUP_REMINDER' WHERE delivery_id = 'ps-3'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'REMINDER_SENT' WHERE delivery_id = 'ps-3'`,
+      ),
+    ).resolves.toBeDefined();
+    await truncate();
+    migrate('up');
+    await expect(since('5200000000000')).resolves.toBe(count5200);
   });
 
   runHumanRequestFeedStoreContract('postgres', () =>

@@ -90,7 +90,21 @@ export type DeliveryDecision =
    *  schedule for the request (a version or time that is not the item's),
    *  or it changed after planning. Never used for a closed window or a
    *  HUMAN chat (those keep WINDOW_CLOSED / HUMAN_SESSION). */
-  | 'STALE_SCHEDULE';
+  | 'STALE_SCHEDULE'
+  // ---- pay in store sale notices (migration 5200) ----
+  /** sale.pickup_reminder sent to the customer. */
+  | 'PICKUP_REMINDER'
+  /** sale.pickup_expired: the "se canceló" notice sent. */
+  | 'PICKUP_EXPIRED_NOTICE'
+  /** sale.pickup_extended: the new deadline sent. */
+  | 'PICKUP_EXTENDED_NOTICE'
+  /** A sale item of a hold version below the live one: overtaken. */
+  | 'HOLD_SUPERSEDED'
+  /** The sale is paid, or cancelled (a reminder / extension is moot). */
+  | 'SALE_CLOSED'
+  /** The bot cannot verify the sale: not the conversation's placed order,
+   *  no checkout key to read the live hold, or no hold reported. */
+  | 'SALE_UNKNOWN';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 

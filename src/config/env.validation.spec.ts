@@ -568,6 +568,29 @@ describe('envValidationSchema', () => {
     });
   });
 
+  // Pay in store S3: default off until the backend confirms its deploy.
+  describe('PAY_IN_STORE_ENABLED', () => {
+    it.each([
+      [undefined, false, false],
+      ['true', true, false],
+      ['false', false, false],
+      ['yes', undefined, true],
+    ])('validates flag=%s', (flag, expected, invalid) => {
+      const { error, value } = envValidationSchema.validate(
+        flag === undefined
+          ? { ...validEnv }
+          : { ...validEnv, PAY_IN_STORE_ENABLED: flag },
+        { abortEarly: false },
+      ) as { error?: Joi.ValidationError; value: Record<string, unknown> };
+      expect(Boolean(error)).toBe(invalid);
+      if (invalid) {
+        expect(error!.details[0].path).toContain('PAY_IN_STORE_ENABLED');
+      } else {
+        expect(value.PAY_IN_STORE_ENABLED).toBe(expected);
+      }
+    });
+  });
+
   describe('CONVERSATION_MIRROR_DELIVERY_ENABLED', () => {
     it.each([
       [undefined, false, false],

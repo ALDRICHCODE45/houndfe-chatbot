@@ -49,6 +49,7 @@ Writes are merge-only, so a known value is never erased by a later turn. The bot
 | `INBOUND_TEXT_MAX_CHARS`               | Default `1000`. Customer text is cut to this length before any LLM use (the transcript keeps the original)            |
 | `SENDER_LLM_LIMIT_PER_HOUR`            | Default `40`. LLM-using turns per WhatsApp number in a rolling hour                                                   |
 | `SENDER_LLM_LIMIT_PER_DAY`             | Default `120`. LLM-using turns per WhatsApp number in a rolling 24 h                                                  |
+| `PAY_IN_STORE_ENABLED`                 | Default `false` (on for `true`, `TRUE` or `True`). «Pagar en tienda» for pickup orders and the `sale.pickup_*` notices; turn on only after the backend's pay-in-store deploy and chatbot migration 5200 (docs/minimal-order-placement.md, "Pay in store") |
 
 ### Conversation mirror delivery flag
 

@@ -12,6 +12,7 @@ import {
   CreateCheckoutInputSchema,
   INVALID_CHECKOUT_REQUEST,
   SHIPPING_QUOTE_ALREADY_USED,
+  CheckoutPickupLocationSchema,
   checkoutErrorMismatches,
   type CheckoutPickupLocation,
   type CreateCheckoutInput,
@@ -67,6 +68,7 @@ import { processLocalConversationGates } from '../../conversation-gates/infrastr
 import { DurableOrderConfirmation } from './gates/order-confirmation.gate';
 import { sanitizeErrorText } from '../../common/log-safe';
 import { paymentMethodButtons } from '../domain/customer-reply';
+import { paymentMethodsFor } from '../domain/payment-methods';
 import {
   MINIMAL_PAYMENT_BUTTONS_PROMPT,
   MINIMAL_PAYMENT_QUESTION,
@@ -269,6 +271,8 @@ export function minimalOrderCreatedReply(
 interface OrderPlaced {
   reply: string;
   saleId: string;
+  /** Pay in store S3: a pickup order with PAY_IN_STORE_ENABLED. */
+  payInStore: boolean;
 }
 
 /** The customer reply for a created order: text plus one button per method. */
@@ -279,9 +283,17 @@ function orderReply(value: string | OrderPlaced): MinimalCheckoutReply {
     interactive: paymentMethodButtons(
       value.saleId,
       MINIMAL_PAYMENT_BUTTONS_PROMPT,
+      paymentMethodsFor({ payInStore: value.payInStore }),
     ),
     paymentOffer: { saleId: value.saleId },
   };
+}
+
+/** The checkout key a cart slot was placed under ('' / absent → null). */
+function checkoutKeyOf(stored: unknown): string | null {
+  if (typeof stored !== 'object' || stored === null) return null;
+  const key = (stored as { idempotencyKey?: unknown }).idempotencyKey;
+  return typeof key === 'string' && key !== '' ? key : null;
 }
 
 /** Deterministic digest of the exact payload sent under one key. */
@@ -321,6 +333,8 @@ export class MinimalOrderService {
   private readonly logger = new Logger(MinimalOrderService.name);
   private readonly cashierUserId: string;
   private readonly now: () => number;
+  /** Pay in store S3 (PAY_IN_STORE_ENABLED, exactly `true`). */
+  private readonly payInStoreEnabled: boolean;
 
   constructor(
     @Inject(CHATBOT_API_CLIENT) private readonly api: ChatbotApiClient,
@@ -340,6 +354,7 @@ export class MinimalOrderService {
     );
     const cashier = config.get<string>('chatbotApi.cashierUserId');
     this.cashierUserId = typeof cashier === 'string' ? cashier.trim() : '';
+    this.payInStoreEnabled = config.get<unknown>('payInStore.enabled') === true;
   }
 
   /** Server-owned cashier and the owned CAS capabilities. */
@@ -1070,6 +1085,14 @@ export class MinimalOrderService {
     pickupLocation?: CheckoutPickupLocation | null,
     firstName?: string | null,
   ): Promise<OrderPlaced> {
+    // Pay in store S3: a pickup order keeps its checkout key (the feed
+    // notices read the live hold with it) and its branch.
+    const checkoutKey = checkoutKeyOf(stored);
+    const payInStore =
+      this.payInStoreEnabled &&
+      shipping !== undefined &&
+      !('customerChargeCents' in shipping) &&
+      checkoutKey !== null;
     // The sale exists; a lost cart write must not hide it from the customer.
     await this.commitCart(senderId, stored, {
       items: [],
@@ -1078,6 +1101,19 @@ export class MinimalOrderService {
         saleId: sale.saleId,
         folio: sale.folio,
         totalCents: sale.totalCents,
+        ...(payInStore
+          ? {
+              pickup: {
+                checkoutKey,
+                // Only a contract-valid location is stored: a bad one would
+                // make the whole cart slot unreadable.
+                location: CheckoutPickupLocationSchema.safeParse(pickupLocation)
+                  .success
+                  ? (pickupLocation ?? null)
+                  : null,
+              },
+            }
+          : {}),
       },
     });
     // S1: best effort; the profile never blocks the order-created reply.
@@ -1095,6 +1131,7 @@ export class MinimalOrderService {
     return {
       reply: `¡Listo! ${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
       saleId: sale.saleId,
+      payInStore,
     };
   }
 

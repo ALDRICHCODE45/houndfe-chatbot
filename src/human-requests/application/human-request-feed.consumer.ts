@@ -191,8 +191,9 @@ export class HumanRequestFeedConsumer {
    * (docs/contracts/human-intervention-bot-contract-5b.md, "Slice 5c"): walks
    * every page of the open requests route from the stored synced_at,
    * reconciles the registry, hands every pending delivery to the same path as
-   * a feed item, and only then saves the smallest of `nextCursor` and every
-   * `undeliveredResumeAfter` (plain fixed-width string comparison) with the
+   * a feed item, and only then saves the smallest of `nextCursor`, every
+   * `undeliveredResumeAfter` and every `saleUndeliveredResumeAfter` (pay in
+   * store; plain fixed-width string comparison) with the
    * walk start as synced_at. Any failure leaves the expired cursor in place,
    * so the next pass gets 410 again and walks from the first page.
    */
@@ -228,6 +229,13 @@ export class HumanRequestFeedConsumer {
         throw new Error(`feed recovery rejected: ${reason}`);
       }
       nextCursor ??= result.nextCursor;
+      // Pay in store: sale items belong to no request, so the walk cannot
+      // list them; the backend names the feed position re-serving the
+      // oldest one without a terminal outcome. It is read live on every
+      // page (ACKs in between may raise it), so the minimum seen is kept.
+      const sale = result.saleUndeliveredResumeAfter ?? null;
+      if (sale !== null && (resume === undefined || sale < resume))
+        resume = sale;
       for (const request of result.items) {
         requests += 1;
         await this.reconcile(request, listedOpen);

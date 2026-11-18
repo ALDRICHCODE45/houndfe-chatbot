@@ -12,12 +12,39 @@ export interface PaymentMethod {
   aliases: readonly string[];
 }
 
+const TRANSFER: PaymentMethod = Object.freeze({
+  id: 'transfer',
+  title: 'Transferencia',
+  aliases: Object.freeze(['transferencia']),
+});
+
+/** Pay in store (S3): pickup orders only, behind PAY_IN_STORE_ENABLED. */
+export const PAY_IN_STORE_METHOD: PaymentMethod = Object.freeze({
+  id: 'in_store',
+  title: 'Pagar en tienda',
+  aliases: Object.freeze(['tienda', 'sucursal']),
+});
+
+/** The default offer (every order): today's single method. */
 export const PAYMENT_METHODS: readonly PaymentMethod[] = Object.freeze([
-  { id: 'transfer', title: 'Transferencia', aliases: ['transferencia'] },
+  TRANSFER,
 ]);
 
+/** Every method a button id may name (an offer shows a subset). */
+const KNOWN_METHODS: readonly PaymentMethod[] = Object.freeze([
+  TRANSFER,
+  PAY_IN_STORE_METHOD,
+]);
+
+/** The methods offered for one placed order. */
+export function paymentMethodsFor(options: {
+  payInStore: boolean;
+}): readonly PaymentMethod[] {
+  return options.payInStore ? KNOWN_METHODS : PAYMENT_METHODS;
+}
+
 export function paymentMethodById(id: string): PaymentMethod | null {
-  return PAYMENT_METHODS.find((method) => method.id === id) ?? null;
+  return KNOWN_METHODS.find((method) => method.id === id) ?? null;
 }
 
 const normalize = (text: string): string =>
@@ -32,9 +59,12 @@ const normalize = (text: string): string =>
 const LEAD_IN =
   /^(?:(?:quiero|prefiero|deseo|voy a|me gustaria)\s+)?(?:(?:pagar|pago)\s+)?(?:(?:por|con|mediante|en)\s+)?(?:la\s+)?/;
 
-/** The method a whole-message answer names, else `null`. */
-export function matchPaymentMethod(text: unknown): PaymentMethod | null {
+/** The offered method a whole-message answer names, else `null`. */
+export function matchPaymentMethod(
+  text: unknown,
+  methods: readonly PaymentMethod[] = PAYMENT_METHODS,
+): PaymentMethod | null {
   if (typeof text !== 'string' || text.length > 80) return null;
   const rest = normalize(text).replace(LEAD_IN, '');
-  return PAYMENT_METHODS.find((m) => m.aliases.includes(rest)) ?? null;
+  return methods.find((m) => m.aliases.includes(rest)) ?? null;
 }

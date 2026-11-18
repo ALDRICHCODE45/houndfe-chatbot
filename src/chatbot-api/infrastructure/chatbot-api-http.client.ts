@@ -111,6 +111,10 @@ import {
 } from '../domain/dtos/checkout.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
 import {
+  normalizePayInStoreHold,
+  type PayInStoreHold,
+} from '../domain/dtos/pay-in-store.dto';
+import {
   isReceiptUploadResponse,
   RECEIPT_UPLOAD_ERROR,
   RECEIPT_UPLOAD_KEY_MAX_LENGTH,
@@ -716,6 +720,41 @@ export class ChatbotApiHttpClient
       );
     }
     return outcome;
+  }
+
+  /**
+   * Pay in store S3: `PATCH /chatbot-api/sales/:saleId/payment-intent`
+   * (scope `sales:write`). The backend call is idempotent (a repeat returns
+   * the current hold), but exactly one PATCH is made per call (no retry):
+   * the customer's tap is the retry. The sale id is UUID-validated before
+   * any HTTP; only a 200 whose body binds to the requested sale resolves.
+   * Refusals reject with `ChatbotApiError` carrying `statusCode` and
+   * `errorCode` (`body.error`, e.g. `PAY_IN_STORE_SALE_ALREADY_PAID`).
+   */
+  async setPayInStoreIntent(saleId: string): Promise<PayInStoreHold> {
+    if (!DECISION_ID_UUID.test(saleId)) {
+      throw new ChatbotApiError(
+        'Sale id failed local UUID validation',
+        null,
+        undefined,
+        null,
+      );
+    }
+    const response = await this.requestWithResponse<unknown>({
+      method: 'PATCH',
+      url: `/chatbot-api/sales/${encodeURIComponent(saleId)}/payment-intent`,
+      data: { method: 'IN_STORE' },
+    });
+    const hold = normalizePayInStoreHold(response.data, saleId);
+    if (response.status !== 200 || hold === null) {
+      throw new UpstreamError(
+        'Chatbot API payment intent response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    }
+    return hold;
   }
 
   async updateDelivery(

@@ -245,9 +245,17 @@ ddescribe('llm cost guard migration 5100 + store (real PostgreSQL)', () => {
       periods: { day: '2026-11-18', month: '2026-11' },
       caps: { dayUsd: 10, monthUsd: 200 },
     });
-    expect(() => migrate('down', '1')).toThrow(/refusing to roll back/);
+    // Roll back 5100 and every later migration (e.g. 5200), then re-apply.
+    const fromCostGuard = (
+      await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM pgmigrations WHERE name >= '5100000000000'`,
+      )
+    ).rows[0].n;
+    expect(() => migrate('down', fromCostGuard)).toThrow(
+      /refusing to roll back/,
+    );
     await pool.query(`DELETE FROM llm_usage_ledger`);
-    migrate('down', '1');
+    migrate('down', fromCostGuard);
     const left = await pool.query(
       `SELECT 1 FROM information_schema.tables WHERE table_name = 'llm_usage_ledger'`,
     );

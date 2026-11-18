@@ -1,9 +1,11 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { PaymentDetail } from '../../chatbot-api/domain/dtos/payment-details.dto';
+import { PAY_IN_STORE_SALE_ALREADY_PAID } from '../../chatbot-api/domain/dtos/pay-in-store.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import {
   CONVERSATION_STORE,
@@ -18,6 +20,15 @@ import {
   type CustomerReplyInteractive,
 } from '../domain/customer-reply';
 import { isPayRemainderRequest } from '../domain/minimal-order-requests';
+import {
+  PAY_IN_STORE_FAILED_REPLY,
+  payInStoreHeldReply,
+} from '../../pay-in-store/domain/pay-in-store-copy';
+import {
+  PAYMENT_METHODS,
+  paymentMethodsFor,
+  type PaymentMethod,
+} from '../domain/payment-methods';
 import {
   ReceiptReviewStatusRegistry,
   type ReceiptReviewStatusPort,
@@ -110,7 +121,81 @@ export class MinimalPaymentService {
     @Optional()
     @Inject(ReceiptReviewStatusRegistry)
     private readonly receipts?: ReceiptReviewStatusPort,
-  ) {}
+    // Pay in store S3: PAY_IN_STORE_ENABLED (exactly `true`); absent → off.
+    @Optional()
+    @Inject(ConfigService)
+    config?: Pick<ConfigService, 'get'>,
+  ) {
+    this.payInStoreEnabled =
+      config?.get<unknown>('payInStore.enabled') === true;
+  }
+
+  private readonly payInStoreEnabled: boolean;
+
+  /** Pay in store S3: an unpaid pickup order placed with the flag on. */
+  private canPayInStore(sale: PlacedSale): boolean {
+    return (
+      this.payInStoreEnabled && sale.paid !== true && sale.pickup !== undefined
+    );
+  }
+
+  /**
+   * The methods the sender's placed order is offered (the buttons and the
+   * typed answer to them): «Pagar en tienda» joins only for a pickup order
+   * with pay in store on; otherwise today's list.
+   */
+  async offeredMethods(senderId: string): Promise<readonly PaymentMethod[]> {
+    const sale = (await this.read(senderId))?.cart.placedSale;
+    return sale === undefined
+      ? PAYMENT_METHODS
+      : paymentMethodsFor({ payInStore: this.canPayInStore(sale) });
+  }
+
+  /**
+   * Pay in store S3: «Pagar en tienda» for the sender's placed order
+   * `saleId`. Exactly one PATCH payment-intent per call (the backend is
+   * idempotent: a re-tap gets the current hold and the same text). The
+   * paid and receipt-in-review rules keep priority (no PATCH). `null`: not
+   * offered for this order (another or no placed order, not pickup, flag
+   * off), so the caller answers as for a stale button.
+   */
+  async payInStore(
+    senderId: string,
+    saleId: string,
+  ): Promise<MinimalPaymentReply | null> {
+    const sale = (await this.read(senderId))?.cart.placedSale;
+    if (sale === undefined || sale.saleId !== saleId) return null;
+    if (sale.paid === true)
+      return { reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY };
+    if (!this.canPayInStore(sale) || sale.pickup === undefined) return null;
+    if (await this.receiptInReview(senderId, sale))
+      return { reply: minimalReceiptInReviewReply(sale.folio) };
+    const failed = {
+      reply: PAY_IN_STORE_FAILED_REPLY,
+      // A later «transferencia» still answers this offer.
+      paymentOffer: { saleId: sale.saleId },
+    };
+    if (typeof this.api.setPayInStoreIntent !== 'function') return failed;
+    try {
+      const hold = await this.api.setPayInStoreIntent(sale.saleId);
+      return {
+        reply: payInStoreHeldReply({
+          folio: hold.folio ?? sale.folio,
+          holdUntil: hold.holdUntil,
+          location: sale.pickup.location,
+        }),
+      };
+    } catch (error) {
+      const status = error instanceof ChatbotApiError ? error.statusCode : null;
+      const code = error instanceof ChatbotApiError ? error.errorCode : null;
+      this.logger.warn(
+        `pay in store not set: status=${status ?? 'none'} code=${code ?? 'none'}`,
+      );
+      if (status === 409 && code === PAY_IN_STORE_SALE_ALREADY_PAID)
+        return { reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY };
+      return failed;
+    }
+  }
 
   /** The sender's last placed order, or `null`. */
   async placedSale(senderId: string): Promise<PlacedSale | null> {
@@ -136,6 +221,7 @@ export class MinimalPaymentService {
       interactive: paymentMethodButtons(
         sale.saleId,
         MINIMAL_PAYMENT_BUTTONS_PROMPT,
+        paymentMethodsFor({ payInStore: this.canPayInStore(sale) }),
       ),
       paymentOffer: { saleId: sale.saleId },
     };

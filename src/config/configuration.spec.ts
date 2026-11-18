@@ -59,6 +59,7 @@ describe('configuration()', () => {
     'RECEIPT_DESTINATION_FIELDS_ENABLED',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
     'CONVERSATION_MIRROR_DELIVERY_ENABLED',
+    'PAY_IN_STORE_ENABLED',
     'OPS_CHANNEL_PHONE',
     // Removed shipping vars (U6): kept here so the test restores them.
     'SHIPPING_QUOTES_ENABLED',
@@ -338,6 +339,19 @@ describe('configuration()', () => {
       expect(configuration().receiptMedia.destinationFieldsEnabled).toBe(
         expected,
       );
+    });
+
+    // Pay in store S3: default off; only an explicit true enables it.
+    it.each([
+      [undefined, false],
+      ['true', true],
+      ['TRUE', true],
+      ['false', false],
+      ['', false],
+    ])('maps PAY_IN_STORE_ENABLED=%s', (env, expected) => {
+      if (env === undefined) delete process.env.PAY_IN_STORE_ENABLED;
+      else process.env.PAY_IN_STORE_ENABLED = env;
+      expect(configuration().payInStore.enabled).toBe(expected);
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia
