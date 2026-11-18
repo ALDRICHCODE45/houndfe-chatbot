@@ -43,6 +43,10 @@ const configuration = () => ({
     // Default off: only a value Joi.boolean() accepts as true enables the
     // «Pagar en tienda» button and the sale.pickup_* notices (S3).
     enabled: envBoolean(process.env.PAY_IN_STORE_ENABLED),
+    // Default off (pay-in-store-templates S4): the owner turns it on once
+    // Meta approved apartado_recordatorio / apartado_vencido /
+    // apartado_plazo_actualizado. Off → a closed window stays STALE.
+    templatesEnabled: envBoolean(process.env.PAY_IN_STORE_TEMPLATES_ENABLED),
   },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,

@@ -315,6 +315,10 @@ const CUSTOMER_PORT_TOKENS = [
                   ...(ports.customerStyle === undefined
                     ? {}
                     : { customerStyle: ports.customerStyle }),
+                  // Templates S4: Meta templates outside the 24 h window
+                  // only with PAY_IN_STORE_TEMPLATES_ENABLED exactly true.
+                  templatesEnabled:
+                    config.get<unknown>('payInStore.templatesEnabled') === true,
                 }),
               }
             : {}),

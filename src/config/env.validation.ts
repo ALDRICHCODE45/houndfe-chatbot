@@ -246,6 +246,10 @@ const innerEnvValidationSchema = Joi.object({
   // pickup orders and the sale.pickup_* feed notices. Default off until the
   // backend (feat/pay-in-store-hold) is deployed.
   PAY_IN_STORE_ENABLED: Joi.boolean().default(false),
+  // odd/tasks/pay-in-store-templates.md S4: the sale.pickup_* notices go
+  // out as Meta utility templates when the 24 h window is closed. Default
+  // off until Meta approves the three templates.
+  PAY_IN_STORE_TEMPLATES_ENABLED: Joi.boolean().default(false),
 
   // N18: destination/origin receipt fields inside `extracted` (backend
   // aebb60ef). Kill switch only; default on.

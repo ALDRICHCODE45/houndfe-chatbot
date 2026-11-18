@@ -36,7 +36,9 @@ const saleWire = (
   payload: {
     saleId: SALE,
     folio: 'V-000123',
-    ...(type === 'sale.pickup_expired' ? {} : { holdUntil: HOLD_UNTIL }),
+    ...(type === 'sale.pickup_expired' || type === 'sale.pickup_expired_review'
+      ? {}
+      : { holdUntil: HOLD_UNTIL }),
     holdVersion: 2,
     conversationRef: REF,
     ...payloadPatch,
@@ -232,6 +234,125 @@ describe('sale feed items (pay in store S2)', () => {
     });
   });
 
+  it('pay-in-store-templates S2: the new fields parse when present (previousHoldUntil, direction, branchName) and sale.pickup_expired_review is typed', async () => {
+    const { client, feedPages } = setup();
+    const PREVIOUS = '2026-11-20T18:30:00.000Z';
+    feedPages.push({
+      items: [
+        saleWire(
+          '1',
+          'sale.pickup_extended',
+          {},
+          {
+            previousHoldUntil: PREVIOUS,
+            direction: 'SHORTENED',
+            branchName: 'Sucursal Centro',
+          },
+        ),
+        saleWire(
+          '2',
+          'sale.pickup_reminder',
+          {},
+          { branchName: 'Sucursal Centro' },
+        ),
+        saleWire('3', 'sale.pickup_expired', {}, { branchName: null }),
+        saleWire(
+          '4',
+          'sale.pickup_expired_review',
+          { conversationRef: null },
+          { conversationRef: null, branchName: 'Sucursal Centro' },
+        ),
+        saleWire('5', 'sale.pickup_expired_review'),
+      ],
+      nextCursor: '000000000009',
+    });
+    const envelope = (deliveryId: string, conversationRef: string | null) => ({
+      cursor: `00000000${deliveryId.padStart(4, '0')}`,
+      deliveryId,
+      requestId: null,
+      saleId: SALE,
+      conversationRef,
+      notBefore: null,
+      expiresAt: null,
+    });
+    const common = { saleId: SALE, folio: 'V-000123', holdVersion: 2 };
+    await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+      kind: 'ok',
+      nextCursor: '000000000009',
+      items: [
+        {
+          ...envelope('1', REF),
+          type: 'sale.pickup_extended',
+          payload: {
+            ...common,
+            holdUntil: HOLD_UNTIL,
+            previousHoldUntil: PREVIOUS,
+            direction: 'SHORTENED',
+            branchName: 'Sucursal Centro',
+          },
+        },
+        {
+          ...envelope('2', REF),
+          type: 'sale.pickup_reminder',
+          payload: {
+            ...common,
+            holdUntil: HOLD_UNTIL,
+            branchName: 'Sucursal Centro',
+          },
+        },
+        {
+          ...envelope('3', REF),
+          type: 'sale.pickup_expired',
+          payload: { ...common, branchName: null },
+        },
+        {
+          ...envelope('4', null),
+          type: 'sale.pickup_expired_review',
+          payload: { ...common, branchName: 'Sucursal Centro' },
+        },
+        {
+          ...envelope('5', REF),
+          type: 'sale.pickup_expired_review',
+          payload: common,
+        },
+      ],
+    });
+  });
+
+  it('pay-in-store-templates S2: an out-of-contract optional field is dropped, never the item', async () => {
+    const { client, feedPages } = setup();
+    feedPages.push({
+      items: [
+        saleWire(
+          '1',
+          'sale.pickup_extended',
+          {},
+          {
+            previousHoldUntil: 'yesterday',
+            direction: 'SIDEWAYS',
+            branchName: 42,
+          },
+        ),
+      ],
+      nextCursor: '000000000009',
+    });
+    await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+      kind: 'ok',
+      nextCursor: '000000000009',
+      items: [
+        expect.objectContaining({
+          type: 'sale.pickup_extended',
+          payload: {
+            saleId: SALE,
+            folio: 'V-000123',
+            holdUntil: HOLD_UNTIL,
+            holdVersion: 2,
+          },
+        }),
+      ],
+    });
+  });
+
   it('a sale item whose top-level conversationRef is missing takes the payload one', async () => {
     const { client, feedPages } = setup();
     feedPages.push({
@@ -316,14 +437,15 @@ describe('sale feed items (pay in store S2)', () => {
         ),
         saleWire('4', 'sale.pickup_extended'),
         saleWire('5', 'sale.something_new'),
+        saleWire('6', 'sale.pickup_expired_review'),
       ],
-      nextCursor: '000000000005',
+      nextCursor: '000000000006',
     });
     await expect(consumer.runOnce()).resolves.toEqual({
       kind: 'page',
-      items: 5,
+      items: 6,
     });
-    await expect(store.readCursor()).resolves.toBe('000000000005');
+    await expect(store.readCursor()).resolves.toBe('000000000006');
     // Only the request.cancelled reached the customer.
     expect(sent).toHaveLength(1);
     expect(sent[0].to).toBe('5215550001111');
@@ -333,8 +455,9 @@ describe('sale feed items (pay in store S2)', () => {
       ['3', 'STALE'],
       ['4', 'STALE'],
       ['5', 'STALE'],
+      ['6', 'STALE'],
     ]);
-    for (const id of ['1', '3', '4'])
+    for (const id of ['1', '3', '4', '6'])
       await expect(store.getDelivery(id)).resolves.toMatchObject({
         requestId: null,
         localState: 'STALE',
@@ -360,7 +483,7 @@ describe('sale feed items (pay in store S2)', () => {
       logged.filter((line) =>
         line.includes('pay in store notices are not enabled'),
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
     // Never log the customer's ref.
     expect([...warned, ...logged].join('\n')).not.toContain('5215550001111');
   });

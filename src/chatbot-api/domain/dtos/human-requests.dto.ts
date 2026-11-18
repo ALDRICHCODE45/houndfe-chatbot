@@ -479,6 +479,7 @@ export const SALE_PICKUP_TYPES = [
   'sale.pickup_reminder',
   'sale.pickup_expired',
   'sale.pickup_extended',
+  'sale.pickup_expired_review',
 ] as const;
 export type SalePickupType = (typeof SALE_PICKUP_TYPES)[number];
 
@@ -511,6 +512,10 @@ export interface SalePickupHoldPayload {
   holdUntil: string;
   /** The hold version (>= 1); a later change bumps it. */
   holdVersion: number;
+  /** odd/tasks/pay-in-store-templates.md S2 (additive): the sale's branch
+   *  name, the store text fallback. Absent from older backends (and when
+   *  out of contract); `null` when the backend has none. */
+  branchName?: string | null;
 }
 
 export type SalePickupReminderItem = SaleFeedItemEnvelope & {
@@ -523,15 +528,28 @@ export type SalePickupExpiredItem = SaleFeedItemEnvelope & {
 };
 export type SalePickupExtendedItem = SaleFeedItemEnvelope & {
   type: 'sale.pickup_extended';
-  payload: SalePickupHoldPayload;
+  payload: SalePickupHoldPayload & {
+    /** Templates S2 (additive): the deadline before this change (ISO). */
+    previousHoldUntil?: string;
+    /** Templates S2 (additive): EXTENDED (later or equal) / SHORTENED. */
+    direction?: 'EXTENDED' | 'SHORTENED';
+  };
 };
-/** Pay in store notices (backend T3): reminder, expiry, staff extension. */
+/** Templates S2: the hold expired with a partial payment or a pending
+ *  receipt and the sale was NOT cancelled (staff closes it). */
+export type SalePickupExpiredReviewItem = SaleFeedItemEnvelope & {
+  type: 'sale.pickup_expired_review';
+  payload: Omit<SalePickupHoldPayload, 'holdUntil'>;
+};
+/** Pay in store notices (backend T3): reminder, expiry, staff extension,
+ *  expiry kept for review. */
 export type SalePickupItem =
   | SalePickupReminderItem
   | SalePickupExpiredItem
-  | SalePickupExtendedItem;
+  | SalePickupExtendedItem
+  | SalePickupExpiredReviewItem;
 
-/** True for the three typed pay-in-store sale items. */
+/** True for the typed pay-in-store sale items. */
 export const isSalePickupItem = (item: FeedItem): item is SalePickupItem =>
   item.type !== 'unknown' && isSalePickupType(item.type);
 
@@ -1509,11 +1527,13 @@ function parseScheduleItem(
   };
 }
 
-/** `sale.pickup_reminder` / `_expired` / `_extended` (pay in store): needs
- *  `requestId` null (or absent), the envelope `saleId` (a payload copy must
- *  agree),
- *  a nullable folio, `holdVersion` >= 1 and, except for the expiry, an ISO
- *  `holdUntil`. Null (→ unknown) when malformed. */
+/** `sale.pickup_reminder` / `_expired` / `_extended` / `_expired_review`
+ *  (pay in store): needs `requestId` null (or absent), the envelope
+ *  `saleId` (a payload copy must agree), a nullable folio, `holdVersion`
+ *  >= 1 and, except for the two expiries, an ISO `holdUntil`. Null (→
+ *  unknown) when malformed. The additive fields of the templates change
+ *  (`branchName`, `previousHoldUntil`, `direction`) are optional: absent or
+ *  out of contract → left out, never a lost item. */
 function parseSalePickupItem(
   item: Record<string, unknown>,
   cursor: string,
@@ -1554,15 +1574,33 @@ function parseSalePickupItem(
     saleId,
     folio: isText(payload.folio) ? payload.folio : null,
     holdVersion: payload.holdVersion,
+    ...(isNullableString(payload.branchName)
+      ? { branchName: payload.branchName }
+      : {}),
   };
   if (item.type === 'sale.pickup_expired')
     return { ...envelope, type: 'sale.pickup_expired', payload: common };
+  if (item.type === 'sale.pickup_expired_review')
+    return { ...envelope, type: 'sale.pickup_expired_review', payload: common };
   if (!isInstantText(payload.holdUntil)) return null;
   const withDeadline = { ...common, holdUntil: payload.holdUntil };
   if (item.type === 'sale.pickup_reminder')
     return { ...envelope, type: 'sale.pickup_reminder', payload: withDeadline };
   if (item.type === 'sale.pickup_extended')
-    return { ...envelope, type: 'sale.pickup_extended', payload: withDeadline };
+    return {
+      ...envelope,
+      type: 'sale.pickup_extended',
+      payload: {
+        ...withDeadline,
+        ...(isInstantText(payload.previousHoldUntil)
+          ? { previousHoldUntil: payload.previousHoldUntil }
+          : {}),
+        ...(payload.direction === 'EXTENDED' ||
+        payload.direction === 'SHORTENED'
+          ? { direction: payload.direction }
+          : {}),
+      },
+    };
   return null;
 }
 

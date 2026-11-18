@@ -7,8 +7,13 @@ import type {
 import type { SalePickupItem } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import {
+  PAY_IN_STORE_TEMPLATES,
+  payInStoreTemplateStoreText,
+  pickupExpiredReviewText,
   pickupExpiredText,
   pickupExtendedText,
+  pickupNewDeadline,
+  pickupReminderDeadline,
   pickupReminderText,
 } from '../../pay-in-store/domain/pay-in-store-copy';
 import {
@@ -17,7 +22,7 @@ import {
   type DeliveryDecision,
   type DeliveryRow,
 } from '../domain/human-request-feed';
-import type { LivePlan } from './live-conversation.service';
+import type { LivePlan, NoticeTemplate } from './live-conversation.service';
 
 /** What the bot keeps about the conversation's placed order. */
 export interface PayInStoreSaleRecord {
@@ -41,6 +46,10 @@ export interface SalePickupNoticePorts {
   isWindowOpen(senderId: string): Promise<boolean>;
   /** Stored customer style; null/failure keeps the usted copy. */
   customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+  /** PAY_IN_STORE_TEMPLATES_ENABLED (exactly true): outside the 24 h window
+   *  the reminder / expiry / deadline change go out as Meta templates.
+   *  Absent or false → a closed window is STALE (WINDOW_CLOSED). */
+  templatesEnabled?: boolean;
   clock?: () => Date;
 }
 
@@ -52,6 +61,7 @@ const SEND_DECISION: Record<SalePickupItem['type'], DeliveryDecision> = {
   'sale.pickup_reminder': 'PICKUP_REMINDER',
   'sale.pickup_expired': 'PICKUP_EXPIRED_NOTICE',
   'sale.pickup_extended': 'PICKUP_EXTENDED_NOTICE',
+  'sale.pickup_expired_review': 'PICKUP_EXPIRED_REVIEW_NOTICE',
 };
 
 /** `undefined`: the backend did not report a hold (older answer). */
@@ -67,8 +77,11 @@ type LiveHold = CheckoutSaleHold | null | undefined;
  * DELIVERY_UNKNOWN or STALE. STALE: no conversation, a sale the bot cannot
  * verify (not the chat's placed order, no checkout key, no hold), a paid
  * sale, a hold version below the live one, a reminder or extension of a
- * cancelled (expired) hold, or a closed window (this bot has no approved
- * template for these notices).
+ * cancelled (expired) hold, or a closed window. With
+ * PAY_IN_STORE_TEMPLATES_ENABLED a closed window sends the reminder, the
+ * expiry and the deadline change as Meta templates
+ * (odd/tasks/pay-in-store-templates.md S4); the expired-with-payment notice
+ * has no template (staff contacts the customer) and stays STALE.
  *
  * Nothing here logs the conversation ref or the phone.
  */
@@ -101,13 +114,37 @@ export class SalePickupNoticeService implements SalePickupHandler {
       return stale('SALE_UNKNOWN', 'no live hold reported');
     if (hold.version > item.payload.holdVersion)
       return stale('HOLD_SUPERSEDED', 'a later hold version exists');
-    if (item.type !== 'sale.pickup_expired' && hold.stage >= 2)
+    // Both expiries describe an expired hold (stage 2); the review one keeps
+    // the sale open, so stage 2 does not close it.
+    if (
+      (item.type === 'sale.pickup_reminder' ||
+        item.type === 'sale.pickup_extended') &&
+      hold.stage >= 2
+    )
       return stale(
         'SALE_CLOSED',
         'the hold expired and the sale was cancelled',
       );
-    if (!(await this.ports.isWindowOpen(senderId)))
-      return stale('WINDOW_CLOSED', 'the 24 h window is closed (no template)');
+    if (!(await this.ports.isWindowOpen(senderId))) {
+      if (this.ports.templatesEnabled !== true)
+        return stale(
+          'WINDOW_CLOSED',
+          'the 24 h window is closed (templates off)',
+        );
+      const template = this.template(item, record);
+      if (template === null)
+        return stale(
+          'WINDOW_CLOSED',
+          'the 24 h window is closed (no template for this notice)',
+        );
+      return {
+        action: 'send',
+        decision: SEND_DECISION[item.type],
+        senderId,
+        text: this.usted(item, record),
+        template,
+      };
+    }
     const style = await this.readStyle(senderId);
     return {
       action: 'send',
@@ -117,6 +154,59 @@ export class SalePickupNoticeService implements SalePickupHandler {
     };
   }
 
+  /**
+   * The approved template of the notice (S4), `null` when there is none:
+   * the expired-with-payment notice (staff contacts the customer) and an
+   * item without a folio ({{1}} is required).
+   */
+  private template(
+    item: SalePickupItem,
+    record: PayInStoreSaleRecord,
+  ): NoticeTemplate | null {
+    const folio = item.payload.folio;
+    if (folio === null || folio.trim() === '') return null;
+    const base = {
+      languageCode: PAY_IN_STORE_TEMPLATES.languageCode,
+      // Meta refused it (not approved, missing): today's STALE.
+      refusedDecision: 'WINDOW_CLOSED' as const,
+    };
+    const store = () =>
+      payInStoreTemplateStoreText(
+        record.pickupLocation,
+        item.payload.branchName,
+      );
+    switch (item.type) {
+      case 'sale.pickup_reminder':
+        return {
+          ...base,
+          templateName: PAY_IN_STORE_TEMPLATES.reminder,
+          bodyParameters: [
+            folio,
+            pickupReminderDeadline(item.payload.holdUntil, this.clock()),
+            store(),
+          ],
+        };
+      case 'sale.pickup_expired':
+        return {
+          ...base,
+          templateName: PAY_IN_STORE_TEMPLATES.expired,
+          bodyParameters: [folio],
+        };
+      case 'sale.pickup_extended':
+        return {
+          ...base,
+          templateName: PAY_IN_STORE_TEMPLATES.updated,
+          bodyParameters: [
+            folio,
+            pickupNewDeadline(item.payload.holdUntil),
+            store(),
+          ],
+        };
+      case 'sale.pickup_expired_review':
+        return null;
+    }
+  }
+
   private usted(item: SalePickupItem, record: PayInStoreSaleRecord): string {
     switch (item.type) {
       case 'sale.pickup_reminder':
@@ -124,6 +214,7 @@ export class SalePickupNoticeService implements SalePickupHandler {
           folio: item.payload.folio,
           holdUntil: item.payload.holdUntil,
           location: record.pickupLocation,
+          branchName: item.payload.branchName,
           now: this.clock(),
         });
       case 'sale.pickup_expired':
@@ -132,7 +223,15 @@ export class SalePickupNoticeService implements SalePickupHandler {
         return pickupExtendedText({
           folio: item.payload.folio,
           holdUntil: item.payload.holdUntil,
+          ...(item.payload.previousHoldUntil === undefined
+            ? {}
+            : { previousHoldUntil: item.payload.previousHoldUntil }),
+          ...(item.payload.direction === undefined
+            ? {}
+            : { direction: item.payload.direction }),
         });
+      case 'sale.pickup_expired_review':
+        return pickupExpiredReviewText(item.payload.folio);
     }
   }
 

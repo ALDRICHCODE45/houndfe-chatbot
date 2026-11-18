@@ -383,6 +383,14 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Si todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
   ],
   ['Le ampliamos el plazo de su pedido', 'Te ampliamos el plazo de tu pedido'],
+  // pay-in-store-templates S3: a shortened deadline and the expired hold
+  // with a payment registered.
+  ['Actualizamos el plazo de su pedido', 'Actualizamos el plazo de tu pedido'],
+  ['El plazo de su pedido', 'El plazo de tu pedido'],
+  [
+    'Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.',
+    'Como tienes un pago registrado, alguien del equipo te va a contactar para cerrarlo.',
+  ],
   [': ahora puede recogerlo y pagarlo', ': ahora puedes recogerlo y pagarlo'],
   [
     'ya le avisé al equipo y se los comparto',

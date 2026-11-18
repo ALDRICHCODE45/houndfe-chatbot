@@ -137,6 +137,28 @@ describe('HumanRequestsModule', () => {
       await on.close();
     });
 
+    // pay-in-store-templates S4: templates only with
+    // PAY_IN_STORE_TEMPLATES_ENABLED exactly true.
+    it.each([
+      ['on', { enabled: true, templatesEnabled: true }, true],
+      ['off', { enabled: true, templatesEnabled: false }, false],
+      ['unset', { enabled: true }, false],
+      ['a string', { enabled: true, templatesEnabled: 'true' }, false],
+    ])(
+      'templates flag %s: the handler gets templatesEnabled only when exactly true',
+      async (_name, payInStore, expected) => {
+        const { pool } = fakePool();
+        const moduleRef = await compile(pool, HumanRequestsServicesModule, {
+          payInStore,
+        });
+        const handler = salePickupOf(
+          moduleRef.get(HumanRequestDeliveryService),
+        ) as { ports: { templatesEnabled?: boolean } };
+        expect(handler.ports.templatesEnabled === true).toBe(expected);
+        await moduleRef.close();
+      },
+    );
+
     it.each([
       ['off', { payInStore: { enabled: false } }],
       ['unset', {}],

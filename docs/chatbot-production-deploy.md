@@ -50,6 +50,7 @@ Writes are merge-only, so a known value is never erased by a later turn. The bot
 | `SENDER_LLM_LIMIT_PER_HOUR`            | Default `40`. LLM-using turns per WhatsApp number in a rolling hour                                                   |
 | `SENDER_LLM_LIMIT_PER_DAY`             | Default `120`. LLM-using turns per WhatsApp number in a rolling 24 h                                                  |
 | `PAY_IN_STORE_ENABLED`                 | Default `false` (on for `true`, `TRUE` or `True`). «Pagar en tienda» for pickup orders and the `sale.pickup_*` notices; turn on only after the backend's pay-in-store deploy and chatbot migration 5200 (docs/minimal-order-placement.md, "Pay in store") |
+| `PAY_IN_STORE_TEMPLATES_ENABLED`       | Default `false` (on for `true`, `TRUE` or `True`; needs `PAY_IN_STORE_ENABLED`). Outside the 24 h window the `sale.pickup_*` reminder / expiry / deadline change go out as the Meta utility templates `apartado_recordatorio`, `apartado_vencido`, `apartado_plazo_actualizado` (`es_MX`); turn on only once Meta approved all three and migration 5300 ran. Off, or a template Meta refuses → `STALE` / `WINDOW_CLOSED` as before (docs/minimal-order-placement.md, "Pay in store") |
 
 ### Conversation mirror delivery flag
 
