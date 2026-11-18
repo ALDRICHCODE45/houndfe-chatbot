@@ -1,0 +1,23 @@
+# Cost protection (security phase 1)
+
+Hard limits so abuse or chatter cannot burn the LLM budget. Phase 2 (abuse detection, blocklist with human confirmation) and phase 3 (prompt injection) follow in their own documents. Branch: `feat/cost-guard`. Audit: Engram `security/abuse-cost-injection-audit`.
+
+## Specs
+
+- **S1 — Owner (verbatim):** "personas mal intensionadas que no van a comprar y van a mandar mensajes sin sentido…" / "cada respuestas del bot es dinero, si el bot se la pasa respondiendo todo, aunque no tenga mucho sentido, eso es dinero que pudo haberse evitado gastar" / "que pasa con el prompt injection??". Decisions: «$200 al mes + tope diario»; per-number limit «la primera opcion suena bien»; «lo subiria a 40 por hora y 120 al dia.»; «Persona confirma (recomendado)» for blocking (phase 2); «Fase 1 (plata) primero».
+- **S2 — Persistent spend cap.** Replace the in-memory, warn-only `CostGuardService` (`src/llm-agent/application/cost-guard.service.ts`) with a Postgres-backed ledger (new additive migration) that records input/output tokens and estimated USD per LLM call (agent turns, render call, restock classifier, receipt vision, product-image description), surviving restarts. USD = tokens × configurable prices `LLM_PRICE_INPUT_USD_PER_MTOK` / `LLM_PRICE_OUTPUT_USD_PER_MTOK` (documented; defaults stated in docs and flagged for the owner to set to the production model's real price). Caps: `LLM_DAILY_BUDGET_USD` (default 10) per calendar day in America/Mexico_City and `LLM_MONTHLY_BUDGET_USD` (default 200) per calendar month. At 80% of either: one `warn` per period. At 100%: no new LLM call is started; the customer gets verbatim «En este momento no puedo atenderle por aquí; ya le avisé al equipo y le escriben en cuanto puedan.» (tú via customer-style) and one team request per sender per period through the existing human-request creation path; receipt vision and product-image description are skipped (receipt upload continues without extraction). Deterministic flows (buttons, SÍ, payment details, receipts upload, human handoff) keep working. A ledger read/write failure fails open for the customer (LLM allowed) and logs `error`.
+- **S3 — Output cap.** Every production LLM call sets `maxOutputTokens` from `LLM_MAX_OUTPUT_TOKENS` (default 600; vision/description keep their own smaller bound if lower).
+- **S4 — Inbound text cap.** Customer text longer than `INBOUND_TEXT_MAX_CHARS` (default 1000) is cut to that length before any LLM use; the transcript/mirror keeps the original.
+- **S5 — Per-number limit.** Rolling windows per sender of LLM-using turns: `SENDER_LLM_LIMIT_PER_HOUR` (default 40) and `SENDER_LLM_LIMIT_PER_DAY` (default 120), persisted (survives restarts, works across processes). Only turns that would call the LLM count; buttons, deterministic replies, SÍ confirmations, receipts and human-handoff turns do not. When a turn would exceed a limit: the first time in that window the bot sends verbatim «Estamos revisando tus mensajes; en un momento te atiende alguien del equipo.» (usted: «Estamos revisando sus mensajes; en un momento le atiende alguien del equipo.» — usted is the default register) and creates one team request (summary states the number exceeded the message limit); further messages in the window get no reply and no LLM call; messages are still recorded/mirrored. When the window frees, normal service resumes.
+- **S6 — Closings without LLM.** Pure closing/acknowledgement messages («gracias», «muchas gracias», «ok», «va», «perfecto», «listo», «👍», «🙏», «gracias, buen día», «nos vemos», combos of these with emojis/punctuation) are answered without the LLM: if the bot's previous message was already a farewell/closing or one of these replies, send nothing; otherwise one fixed reply «¡Con gusto! Aquí estoy si necesita algo más.» (tú styled; emoji mirrored per existing rule). Never applied while a confirmation, offer or question from the bot is pending (e.g. order summary SÍ, payment offer, delivery/pickup question), where «ok/va/listo» keep today's meaning. Chit-chat that is not a closing still goes to the model (phase 3 may add a redirect).
+- **S7 — Evidence.** RED test per rule; DB specs with `RUN_DOCKER_TESTS=1` for new stores; full suite before merge; docs updated (env table in docs/chatbot-production-deploy.md and the relevant docs).
+
+## Tasks
+
+| ID  | Specs      | Route                                   | Commit |
+| --- | ---------- | --------------------------------------- | ------ |
+| T1  | S2–S7      | worker: cost guard, limits, caps, closings | |
+
+## Log
+
+- **L1 (owner, 2026-11-18):** decisions quoted in S1; per-number limits «lo subiria a 40 por hora y 120 al dia.»
