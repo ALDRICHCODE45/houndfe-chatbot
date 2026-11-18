@@ -409,6 +409,21 @@ export function staffAnswerText(text: string): string {
 }
 
 /**
+ * Follow-ups S2: true when the staff text carries a structured decision that
+ * `parseResolution` reads (same keywords, case-insensitive, anywhere). Such a
+ * text is a machine keyword for the bot, never customer copy.
+ */
+export function isStructuredStaffDecision(text: string): boolean {
+  const stripped = staffAnswerText(text);
+  return (
+    /YES_RESTOCK_IN_X_DAYS\s*:\s*\d+/i.test(stripped) ||
+    /APPROVED_PROMO\s*:\s*\d+/i.test(stripped) ||
+    /NO_RESTOCK/i.test(stripped) ||
+    /EXPIRATION\s*:\s*\S/i.test(stripped)
+  );
+}
+
+/**
  * Parse the agent's reply text into a `HumanHandoffResolution`.
  *
  * Strategy (case/whitespace tolerant):

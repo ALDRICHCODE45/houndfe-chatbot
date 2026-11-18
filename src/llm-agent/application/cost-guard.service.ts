@@ -56,7 +56,7 @@ const NOTICE_BACKOFF_RETENTION_MS = 24 * 60 * 60_000;
  * Where a refusal stands against the notice retry backoff:
  *   - `none`: no failed notice on record (today's behaviour);
  *   - `within`: a notice was released less than 15 min ago: behave as
- *     already notified (the claim this refusal took is kept);
+ *     already notified (the claim this refusal took is given back);
  *   - `elapsed`: the last failed notice is 15 min old or more: a refusal
  *     that is not a first notice retries the notice and the request.
  */

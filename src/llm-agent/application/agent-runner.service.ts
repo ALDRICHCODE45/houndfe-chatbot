@@ -9,7 +9,10 @@ import {
   type AgentMessage,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import { PENDING_HUMAN_REQUEST_REPLY } from '../../human-handoff/application/human-handoff.service';
+import {
+  PENDING_HUMAN_REQUEST_REPLY,
+  isStructuredStaffDecision,
+} from '../../human-handoff/application/human-handoff.service';
 import {
   bindRestockInboundEvent,
   type RestockInboundEventIdentity,
@@ -209,9 +212,7 @@ export class AgentRunner {
       const staffAnswer = input.staffAnswer?.trim() ?? '';
       // A structured staff decision («NO_RESTOCK», «YES_RESTOCK_IN_X_DAYS:3»)
       // is a machine keyword, never customer copy: keep the budget reply.
-      const structuredKeyword = /^[A-Z][A-Z0-9_]*(?:\s*:.*)?$/s.test(
-        staffAnswer,
-      );
+      const structuredKeyword = isStructuredStaffDecision(staffAnswer);
       if (staffAnswer !== '' && !structuredKeyword)
         return {
           reply: withTeamPrefix(staffAnswer, null, input.style ?? null),

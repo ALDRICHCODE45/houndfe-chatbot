@@ -401,7 +401,14 @@ describe('AgentRunner', () => {
         });
       });
 
-      it.each(['YES_RESTOCK_IN_X_DAYS:3', 'NO_RESTOCK', 'APPROVED_PROMO: 10%'])(
+      it.each([
+        'YES_RESTOCK_IN_X_DAYS:3',
+        'NO_RESTOCK',
+        'APPROVED_PROMO: 1000',
+        'no_restock',
+        'Gracias. YES_RESTOCK_IN_X_DAYS:3',
+        'expiration: vence el 20',
+      ])(
         'never relays a structured staff keyword (%p) to the customer; keeps the budget reply',
         async (keyword) => {
           store.get.mockResolvedValue(null);
@@ -413,6 +420,22 @@ describe('AgentRunner', () => {
             }),
           ).resolves.toEqual({ reply: LLM_BUDGET_EXHAUSTED_REPLY });
           expect(llm.run).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each(['OK', 'NO: ya no hay', 'LISTO'])(
+        'relays a short free staff answer (%p) the bot does not read as a decision',
+        async (answer) => {
+          store.get.mockResolvedValue(null);
+          await expect(
+            spentRunner().handle({
+              senderId: 's',
+              text: 'x',
+              staffAnswer: answer,
+            }),
+          ).resolves.toEqual({
+            reply: `Le comparto la respuesta del equipo:\n${answer}`,
+          });
         },
       );
 
