@@ -17,12 +17,13 @@ Fixes from the owner's production retest on the Meta test number (Engram `smoke-
 
 | ID  | Specs   | Route                                    | Commit |
 | --- | ------- | ---------------------------------------- | ------ |
-| T2  | S4, S5, S6 | worker: pickup choice + default quantity + store data in summary | |
+| T2  | S4, S5, S6 | worker: pickup choice + default quantity + store data in summary | 6db0783 (S6 deferred) |
 | T1  | S2, S3  | (done) | f7c87da |
-| T3  | S8      | worker: destination fields in receipt extraction | |
+| T3  | S8      | worker: destination fields in receipt extraction | ed3972f |
 
 ## Log
 
 - **L1 (owner, 2026-11-18):** "si hermano, adelante." after the retest summary (N14–N19, N17 and N19 first).
 - **L2 (worker, 2026-11-18):** T1 implemented, uncommitted. S2: `chooseStorePickup` dismisses a pending delivery-data confirmation (`dismissPendingConfirmation`, durable); a SÍ/confirm tap goes to an order summary presented after the delivery-data summary. RED 4/5 in `minimal-pickup-over-delivery.sdk.spec.ts` (first tap printed «datos de entrega quedaron confirmados», no order) → GREEN. S3: `ReceiptReviewStatusPort` + `PostgresReceiptMediaStore.hasReceiptInReview` (ATTACHED, no outcome), late-bound registry wired by `WhatsappModule`; in-review reply verbatim (usted/tú) for tap / offer yes / typed question (no model) / tool; pay-the-rest phrases still get details. RED 5/12 in `minimal-payment-receipt-review.spec.ts` (full bank details) → GREEN; DB spec 15/15 with Docker. Related tests 3157 passed, tsc and eslint clean. Docs: minimal-order-placement, minimal-shipping, minimal-checkout-confirmation.
 - **L3 (parent, 2026-11-18):** T1 committed `f7c87da`; full suite 10410 passed, build/tsc clean. Backend N18 deployed (owner, via backend session); S8 added.
+- **L4 (parent, 2026-11-18):** T3 `ed3972f` (N18 bot side; kill switch default true; fallback without destination fields on INVALID_RECEIPT_EXTRACTED; docs/contracts/transfer-receipts.md updated). T2 `6db0783`: S4 pickup question with buttons, S5 one unit for a countless presentation pick (supersedes the old «ask the quantity» rule; 7 ambiguity tests updated with owner approval). S6 deferred: the store data only arrives after the sale; needs a backend read (e.g. GET /chatbot-api/pickup-location). Follow-up: scripts/eval/scenarios.ts sends «Quiero comprar» then «Sí, a mi dirección de casa» and must answer the S4 question now.
