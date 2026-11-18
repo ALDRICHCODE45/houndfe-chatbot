@@ -137,11 +137,64 @@ describe('CostGuardService (persistent spend cap)', () => {
     });
   });
 
+  it('releases the notice of a refusal so the next refusal is a first notice again', async () => {
+    const store = new InMemoryLlmSpendStore();
+    const g = guard(store);
+    const sender = '5215550001111';
+    await g.admitTurn(sender);
+    await g.admitTurn(sender);
+    const refused = await g.admitTurn(sender);
+    expect(refused).toMatchObject({ firstNotice: true });
+    await g.releaseNotice(sender, refused);
+    await expect(g.admitTurn(sender)).resolves.toMatchObject({
+      kind: 'sender_limited',
+      firstNotice: true,
+    });
+    // Budget notice: the key of the refused period.
+    const spentStore = new InMemoryLlmSpendStore();
+    const spent = guard(spentStore);
+    spent.record({ promptTokens: 1_000_000, completionTokens: 0 });
+    await spent.flush();
+    const budget = await spent.admitTurn(sender);
+    expect(budget).toEqual({
+      kind: 'budget_exhausted',
+      period: 'day',
+      firstNotice: true,
+    });
+    const release = jest.spyOn(spentStore, 'releaseNotice');
+    await spent.releaseNotice(sender, budget);
+    expect(release).toHaveBeenCalledWith(sender, 'budget:day:2026-11-18');
+    await expect(spent.admitTurn(sender)).resolves.toMatchObject({
+      firstNotice: true,
+    });
+  });
+
+  it('never touches the store to release an allowed verdict and fails soft on a release error', async () => {
+    const store = new InMemoryLlmSpendStore();
+    const release = jest
+      .spyOn(store, 'releaseNotice')
+      .mockRejectedValue(new Error('db down'));
+    const g = guard(store);
+    await g.releaseNotice('5215550001111', { kind: 'allowed' });
+    expect(release).not.toHaveBeenCalled();
+    await expect(
+      g.releaseNotice('5215550001111', {
+        kind: 'sender_limited',
+        window: 'hour',
+        firstNotice: true,
+      }),
+    ).resolves.toBeUndefined();
+    expect(error).toHaveBeenCalledTimes(1);
+    const [logged] = error.mock.calls[0] as [unknown];
+    expect(String(logged)).not.toMatch(/5215550001111/);
+  });
+
   it('fails open and logs an error when the ledger cannot be read or written', async () => {
     const broken: LlmSpendStore = {
       record: jest.fn().mockRejectedValue(new Error('db down')),
       totals: jest.fn().mockRejectedValue(new Error('db down')),
       admitTurn: jest.fn().mockRejectedValue(new Error('db down')),
+      releaseNotice: jest.fn().mockRejectedValue(new Error('db down')),
     };
     const g = guard(broken);
     await expect(g.admitTurn('5215550001111')).resolves.toEqual({

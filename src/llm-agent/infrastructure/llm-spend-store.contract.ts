@@ -1,4 +1,9 @@
-import type { LlmSpendStore, LlmTurnRequest } from '../domain/llm-spend';
+import {
+  budgetNoticeKey,
+  SENDER_LIMIT_NOTICE_KEY,
+  type LlmSpendStore,
+  type LlmTurnRequest,
+} from '../domain/llm-spend';
 
 /**
  * Shared behaviour of every LlmSpendStore (in-memory and PostgreSQL). Each
@@ -135,6 +140,51 @@ export function runLlmSpendStoreContract(
       });
       // 24 h after the first turns the day frees again.
       expect(await at('2031-01-02T11:30:00.000Z')).toEqual({ kind: 'allowed' });
+    });
+
+    it('claims the sender-limit notice again after it was released (failed team request)', async () => {
+      const store = await make();
+      const { sender, periods } = fresh();
+      const ask = () => store.admitTurn(turn({ senderId: sender, periods }));
+      for (let i = 0; i < 3; i += 1) await ask();
+      expect(await ask()).toMatchObject({ firstNotice: true });
+      await store.releaseNotice(sender, SENDER_LIMIT_NOTICE_KEY);
+      expect(await ask()).toEqual({
+        kind: 'sender_limited',
+        window: 'hour',
+        firstNotice: true,
+      });
+      expect(await ask()).toMatchObject({ firstNotice: false });
+      // Releasing a notice that is not claimed is a no-op.
+      await expect(
+        store.releaseNotice(`${sender}5`, SENDER_LIMIT_NOTICE_KEY),
+      ).resolves.toBeUndefined();
+    });
+
+    it('claims the budget notice again after it was released, only for that sender', async () => {
+      const store = await make();
+      const { sender, periods } = fresh();
+      const caps = { dayUsd: 1, monthUsd: 100 };
+      await store.record({
+        source: 'agent_turn',
+        inputTokens: 1,
+        outputTokens: 1,
+        usd: 1,
+        at: new Date('2031-01-01T12:00:00.000Z'),
+        periods,
+        caps,
+      });
+      const ask = (senderId: string) =>
+        store.admitTurn(turn({ senderId, periods, caps }));
+      expect(await ask(sender)).toMatchObject({ firstNotice: true });
+      expect(await ask(`${sender}3`)).toMatchObject({ firstNotice: true });
+      await store.releaseNotice(sender, budgetNoticeKey('day', periods));
+      expect(await ask(sender)).toEqual({
+        kind: 'budget_exhausted',
+        period: 'day',
+        firstNotice: true,
+      });
+      expect(await ask(`${sender}3`)).toMatchObject({ firstNotice: false });
     });
 
     it('refuses every turn once a budget is spent, noticing once per sender and period', async () => {

@@ -111,6 +111,10 @@ SELECT v.budget_period, v.limit_window,
        (SELECT count(*) FROM noticed)::int AS noticed
   FROM verdict v`;
 
+/** Gives back one claimed notice (its team request failed). */
+const RELEASE_NOTICE = `
+DELETE FROM llm_guard_notices WHERE sender_id = $1::text AND notice_key = $2::text`;
+
 interface AdmitRow {
   budget_period: LlmBudgetPeriod | null;
   limit_window: 'hour' | 'day' | null;
@@ -195,6 +199,10 @@ export class PostgresLlmSpendStore implements LlmSpendStore {
     if (row.limit_window !== null)
       return { kind: 'sender_limited', window: row.limit_window, firstNotice };
     return { kind: 'allowed' };
+  }
+
+  async releaseNotice(senderId: string, noticeKey: string): Promise<void> {
+    await this.pool.query(RELEASE_NOTICE, [senderId, noticeKey]);
   }
 }
 

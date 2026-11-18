@@ -438,6 +438,9 @@ const PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT =
 
 const ASK_TEAM_TOOL_UUID = z.uuid();
 
+/** R1-001: the user turn recorded for a refused photo without caption. */
+const PHOTO_TURN_PLACEHOLDER = '[Imagen enviada]';
+
 /** S6: the fixed usted copy for each create outcome (styled per customer). */
 function askTeamReply(outcome: AskTeamOutcome): string {
   switch (outcome.kind) {
@@ -1039,6 +1042,12 @@ export class MinimalCatalogAgentService {
     profileName?: string;
     /** S6: the triggering inbound's time (ISO UTC), when known. */
     inboundAt?: string;
+    /**
+     * R1-001 (cost protection): the turn was already admitted by
+     * `admitPhotoTurn` before its vision call; the model turn is not
+     * admitted (counted) a second time.
+     */
+    llmAdmitted?: true;
   }): Promise<MinimalCatalogAgentDecision> {
     // S4 (cost protection): long text is cut before any LLM use; the
     // transcript/mirror already holds the original (dispatcher step 1b).
@@ -1088,6 +1097,7 @@ export class MinimalCatalogAgentService {
     inboundEvent?: unknown;
     interactiveReplyId?: string;
     inboundAt?: string;
+    llmAdmitted?: true;
   }): Promise<MinimalCatalogAgentDecision> {
     {
       if (
@@ -1436,6 +1446,27 @@ export class MinimalCatalogAgentService {
   }
 
   /**
+   * R1-001 (cost protection): the admission of a product-photo turn, asked
+   * by the dispatcher BEFORE the vision call so a number over its limit (or
+   * a spent budget) never reaches vision. It counts the turn once; the agent
+   * turn that follows carries `llmAdmitted` and is not counted again. `null`
+   * = admitted; otherwise the same refusal as a text turn (first notice with
+   * its team request, or silence). `text` is the photo caption, if any.
+   */
+  async admitPhotoTurn(input: {
+    senderId: string;
+    text: string;
+    inboundAt?: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const text = capInboundText(input.text, this.inboundTextMaxChars);
+    const refused = await this.admitLlmTurn({
+      ...input,
+      text: text.trim() === '' ? PHOTO_TURN_PLACEHOLDER : text,
+    });
+    return refused === null ? null : this.decision(refused);
+  }
+
+  /**
    * S2/S5 (cost protection): the one admission of an LLM-using turn. `null`
    * lets the turn call the model; otherwise the fixed reply (budget spent,
    * or the first refusal of a limited number, each with one team request)
@@ -1461,7 +1492,11 @@ export class MinimalCatalogAgentService {
             perHour: this.costGuard.settings.senderLimitPerHour,
             perDay: this.costGuard.settings.senderLimitPerDay,
           });
-    if (verdict.firstNotice) await this.notifyTeam(input, summary);
+    // R4: a notice whose team request failed is given back, so the next turn
+    // retries the notice and the request instead of a silent window (sender
+    // limit) or a «ya le avisé» that nobody received (budget).
+    if (verdict.firstNotice && !(await this.notifyTeam(input, summary)))
+      await this.costGuard.releaseNotice(input.senderId, verdict);
     this.logger.warn(
       verdict.kind === 'budget_exhausted'
         ? `llm budget spent (${verdict.period}): fixed reply, no LLM call`
@@ -1484,12 +1519,16 @@ export class MinimalCatalogAgentService {
     return { reply };
   }
 
-  /** One team request through the existing create path. Never throws. */
+  /**
+   * One team request through the existing create path. Never throws. False
+   * only when the request could not be created or queued (throw or
+   * `failed`); without a team capability there is nothing to retry (true).
+   */
   private async notifyTeam(
     input: { senderId: string; text: string; inboundAt?: string },
     summary: string,
-  ): Promise<void> {
-    if (this.team === undefined) return;
+  ): Promise<boolean> {
+    if (this.team === undefined) return true;
     try {
       const outcome = await this.team.askTeam({
         senderId: input.senderId,
@@ -1499,11 +1538,19 @@ export class MinimalCatalogAgentService {
           ? {}
           : { inboundAt: input.inboundAt }),
       });
+      if (outcome.kind === 'failed') {
+        this.logger.warn(
+          `cost guard team request failed: ${outcome.reason}; notice released for retry`,
+        );
+        return false;
+      }
       this.logger.log(`cost guard team request: ${outcome.kind}`);
+      return true;
     } catch (error) {
       this.logger.warn(
-        `cost guard team request failed: ${error instanceof Error ? error.name : 'unknown'}`,
+        `cost guard team request failed: ${error instanceof Error ? error.name : 'unknown'}; notice released for retry`,
       );
+      return false;
     }
   }
 
@@ -2212,12 +2259,16 @@ export class MinimalCatalogAgentService {
       text: string;
       inboundEvent?: unknown;
       inboundAt?: string;
+      llmAdmitted?: true;
     },
     pick?: InteractivePick,
   ): Promise<CustomerReply & { onSent?: () => void; silent?: true }> {
-    // S2/S5 (cost protection): budget + per-number limit, one store call.
-    const refused = await this.admitLlmTurn(input);
-    if (refused !== null) return refused;
+    // S2/S5 (cost protection): budget + per-number limit, one store call
+    // (skipped when the photo turn was admitted before its vision call).
+    if (input.llmAdmitted !== true) {
+      const refused = await this.admitLlmTurn(input);
+      if (refused !== null) return refused;
+    }
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);

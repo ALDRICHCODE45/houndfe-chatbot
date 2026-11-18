@@ -15,7 +15,10 @@ import {
 } from '../../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
-import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
+import {
+  MinimalCatalogAgentService,
+  type MinimalCatalogAgentDecision,
+} from '../../llm-agent/application/minimal-catalog-agent.service';
 import { readPlacedOrder } from '../../receipt-media/domain/placed-order';
 import {
   DEFAULT_CUSTOMER_STYLE,
@@ -439,6 +442,17 @@ export class WebhookDispatcherService {
             continue;
           }
 
+          // R1-001 (cost protection): the vision call is an LLM use, so a
+          // product photo is admitted (budget + per-number limit) BEFORE it;
+          // a refused photo gets the same reply/silence as a text turn and
+          // never reaches vision. The admitted agent turn is not counted
+          // again. Receipts of a placed sale (above) are never gated.
+          const refused = await this.admitPhotoTurn(message, media);
+          if (refused !== null) {
+            await this.deliverCustomerDecision(message, refused);
+            continue;
+          }
+
           const recognition = await this.recognizeProductImage(media);
           if (recognition.kind === 'receipt' && awaitingPayment) {
             await this.admitReceipt(message, media);
@@ -453,6 +467,7 @@ export class WebhookDispatcherService {
             await this.runCustomerTurn(
               message,
               buildProductImageTurnText(media.caption, recognition),
+              true,
             );
             continue;
           }
@@ -815,10 +830,13 @@ export class WebhookDispatcherService {
   private async runCustomerTurn(
     message: InboundMessage,
     text: string,
+    /** R1-001: the photo turn was admitted before its vision call. */
+    llmAdmitted = false,
   ): Promise<void> {
     const minimal = await this.minimalCatalogAgent.tryHandle({
       senderId: message.senderId,
       text,
+      ...(llmAdmitted ? { llmAdmitted: true as const } : {}),
       ...(message.interactiveReplyId === undefined
         ? {}
         : { interactiveReplyId: message.interactiveReplyId }),
@@ -838,6 +856,35 @@ export class WebhookDispatcherService {
             },
           }),
     });
+    await this.deliverCustomerDecision(message, minimal);
+  }
+
+  /**
+   * R1-001: the cost-guard admission of a product photo before its vision
+   * call. `null` = admitted (or no vision/agent capability to gate).
+   */
+  private async admitPhotoTurn(
+    message: InboundMessage,
+    media: InboundMedia,
+  ): Promise<MinimalCatalogAgentDecision | null> {
+    if (this.productImage === undefined) return null;
+    const agent = this
+      .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
+    if (typeof agent.admitPhotoTurn !== 'function') return null;
+    return agent.admitPhotoTurn({
+      senderId: message.senderId,
+      text: media.caption ?? '',
+      ...(Number.isNaN(Date.parse(message.timestamp))
+        ? {}
+        : { inboundAt: new Date(message.timestamp).toISOString() }),
+    });
+  }
+
+  /** (5) Sends one customer decision (media, text, buttons) or nothing. */
+  private async deliverCustomerDecision(
+    message: InboundMessage,
+    minimal: MinimalCatalogAgentDecision,
+  ): Promise<void> {
     // Cost protection S5/S6: a silent decision (a closing after a closing,
     // a limited number after its first notice) sends nothing; the inbound is
     // already recorded/mirrored (step 1b), so the message is just completed.

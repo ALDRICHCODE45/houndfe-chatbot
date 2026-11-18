@@ -102,6 +102,12 @@ export interface LlmSpendStore {
   record(call: LlmCallRecord): Promise<LlmRecordResult>;
   totals(periods: LlmSpendPeriods): Promise<LlmSpendTotals>;
   admitTurn(request: LlmTurnRequest): Promise<LlmTurnVerdict>;
+  /**
+   * Gives back a notice claimed by `admitTurn` (the team request it stood
+   * for could not be created), so the next refusal is a first notice again.
+   * Releasing a notice that is not claimed is a no-op.
+   */
+  releaseNotice(senderId: string, noticeKey: string): Promise<void>;
 }
 
 export const LLM_SPEND_STORE = Symbol('LLM_SPEND_STORE');
@@ -114,6 +120,21 @@ export const budgetNoticeKey = (
   periods: LlmSpendPeriods,
 ) => `budget:${period === 'day' ? dayKey(periods) : monthKey(periods)}`;
 export const SENDER_LIMIT_NOTICE_KEY = 'sender_limit';
+
+/** The notice key a refusal claimed; `null` for an allowed turn. */
+export function noticeKeyOf(
+  verdict: LlmTurnVerdict,
+  periods: LlmSpendPeriods,
+): string | null {
+  switch (verdict.kind) {
+    case 'allowed':
+      return null;
+    case 'budget_exhausted':
+      return budgetNoticeKey(verdict.period, periods);
+    case 'sender_limited':
+      return SENDER_LIMIT_NOTICE_KEY;
+  }
+}
 
 const MEXICO_CITY_DAY = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'America/Mexico_City',

@@ -3,6 +3,7 @@ import { describeError } from '../../common/log-safe';
 import {
   estimateLlmUsd,
   llmSpendPeriods,
+  noticeKeyOf,
   type LlmBudgetPeriod,
   type LlmCallSource,
   type LlmRecordResult,
@@ -164,6 +165,29 @@ export class CostGuardService {
         `LLM turn admission failed; allowing the turn: ${describeError(error)}`,
       );
       return { kind: 'allowed' };
+    }
+  }
+
+  /**
+   * R4: gives back the notice a refusal claimed when the team request it
+   * stood for failed, so the next turn retries the notice and the request.
+   * The key is recomputed from the clock: after a period change the claimed
+   * key is stale anyway and the new period starts with a fresh notice.
+   * Never throws; a failure logs `error` (no sender id).
+   */
+  async releaseNotice(
+    senderId: string,
+    verdict: LlmTurnVerdict,
+  ): Promise<void> {
+    if (this.store === undefined) return;
+    const key = noticeKeyOf(verdict, llmSpendPeriods(this.clock()));
+    if (key === null) return;
+    try {
+      await this.store.releaseNotice(senderId, key);
+    } catch (error) {
+      this.logger.error(
+        `LLM guard notice release failed (${verdict.kind}): ${describeError(error)}`,
+      );
     }
   }
 

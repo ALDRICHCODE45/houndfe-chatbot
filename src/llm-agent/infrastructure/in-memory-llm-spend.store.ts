@@ -102,6 +102,11 @@ export class InMemoryLlmSpendStore implements LlmSpendStore {
     );
   }
 
+  releaseNotice(senderId: string, noticeKey: string): Promise<void> {
+    this.notices.delete(`${senderId}|${noticeKey}`);
+    return Promise.resolve();
+  }
+
   private readTotals(periods: LlmSpendPeriods): LlmSpendTotals {
     return {
       dayUsd: this.periods.get(dayKey(periods))?.usd ?? 0,

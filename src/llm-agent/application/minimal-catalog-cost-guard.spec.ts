@@ -268,6 +268,98 @@ describe('MinimalCatalogAgentService cost protection (phase 1)', () => {
     });
   });
 
+  describe('R1-001 product photo admission', () => {
+    it('counts the photo turn once: the admitted agent turn does not admit again', async () => {
+      const store = new InMemoryLlmSpendStore();
+      const admit = jest.spyOn(store, 'admitTurn');
+      const { service, captured } = build({ guard: guardWith(store) });
+      await expect(
+        service.admitPhotoTurn({ senderId: SENDER, text: '' }),
+      ).resolves.toBeNull();
+      await service.tryHandle({
+        senderId: SENDER,
+        text: '¿Tienen este producto?\n[Imagen enviada]',
+        llmAdmitted: true,
+      });
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(captured).toHaveLength(1);
+    });
+
+    it('a limited sender gets the first notice, then silence, without any LLM call', async () => {
+      const store = new InMemoryLlmSpendStore();
+      const { service, captured, team } = build({ guard: guardWith(store) });
+      await say1(service, 'uno');
+      await say1(service, 'dos');
+      await expect(
+        service.admitPhotoTurn({ senderId: SENDER, text: '¿hay?' }),
+      ).resolves.toEqual({ kind: 'handled', reply: SENDER_LIMIT_REPLY });
+      await expect(
+        service.admitPhotoTurn({ senderId: SENDER, text: '' }),
+      ).resolves.toEqual({ kind: 'handled', reply: '', silent: true });
+      expect(team.askTeam).toHaveBeenCalledTimes(1);
+      expect(captured).toHaveLength(2);
+    });
+  });
+
+  describe('S2/S5 notice released when the team request fails (R4)', () => {
+    it.each([
+      ['throws', () => Promise.reject(new Error('db down'))],
+      [
+        'returns failed',
+        () => Promise.resolve({ kind: 'failed', reason: 'insert_failed' }),
+      ],
+    ])(
+      'sender limit: askTeam %s → the next turn retries the notice and the request',
+      async (_label, failure) => {
+        const store = new InMemoryLlmSpendStore();
+        const { service, captured, team } = build({ guard: guardWith(store) });
+        await say1(service, 'uno');
+        await say1(service, 'dos');
+        team.askTeam.mockImplementationOnce(failure as never);
+        await expect(say1(service, 'tres')).resolves.toEqual({
+          kind: 'handled',
+          reply: SENDER_LIMIT_REPLY,
+        });
+        // Not silenced: the notice was released, so it is retried.
+        await expect(say1(service, 'cuatro')).resolves.toEqual({
+          kind: 'handled',
+          reply: SENDER_LIMIT_REPLY,
+        });
+        expect(team.askTeam).toHaveBeenCalledTimes(2);
+        // Once a request is created, later refusals are silent.
+        await expect(say1(service, 'cinco')).resolves.toMatchObject({
+          silent: true,
+        });
+        expect(team.askTeam).toHaveBeenCalledTimes(2);
+        expect(captured).toHaveLength(2);
+      },
+    );
+
+    it('budget: a failed request is retried on the next turn, then once per period', async () => {
+      const store = new InMemoryLlmSpendStore();
+      await spend(store, 1);
+      const { service, team } = build({ guard: guardWith(store) });
+      team.askTeam.mockRejectedValueOnce(new Error('db down'));
+      await say1(service, 'busco croquetas');
+      await say1(service, 'y para gato?');
+      await say1(service, 'hola?');
+      expect(team.askTeam).toHaveBeenCalledTimes(2);
+    });
+
+    it('logs the failure without the phone number or the text', async () => {
+      const warn = jest.spyOn(Logger.prototype, 'warn');
+      const store = new InMemoryLlmSpendStore();
+      await spend(store, 1);
+      const { service, team } = build({ guard: guardWith(store) });
+      team.askTeam.mockRejectedValueOnce(new Error(`boom ${SENDER}`));
+      await say1(service, 'busco croquetas secretas');
+      const logged = warn.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(logged).toMatch(/team request failed/);
+      expect(logged).not.toMatch(new RegExp(SENDER));
+      expect(logged).not.toMatch(/secretas/);
+    });
+  });
+
   describe('S6 closings without the LLM', () => {
     it('answers a closing with the fixed reply, then nothing after a closing', async () => {
       const { service, captured } = build({

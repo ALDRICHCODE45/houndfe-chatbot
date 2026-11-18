@@ -34,6 +34,16 @@ const fake = (results: Array<{ rows: unknown[]; rowCount: number }> = []) => {
 };
 
 describe('PostgresLlmSpendStore SQL (no database)', () => {
+  it('releases one notice by its (sender, key) primary key', async () => {
+    const { pool, store } = fake();
+    await store.releaseNotice(SENDER, 'sender_limit');
+    expect(pool.calls).toHaveLength(1);
+    expect(pool.calls[0].sql).toMatch(
+      /DELETE FROM llm_guard_notices WHERE sender_id = \$1::text AND notice_key = \$2::text/,
+    );
+    expect(pool.calls[0].params).toEqual([SENDER, 'sender_limit']);
+  });
+
   it('admits a turn in ONE statement keyed by the sender and period keys', async () => {
     const { pool, store } = fake([
       {

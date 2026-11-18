@@ -179,6 +179,16 @@ export class AgentRunner {
 
     // 1b) Cost protection S2: a spent budget starts no LLM call (one
     // primary-key read; fails open).
+    //
+    // Ops-only route (cost-and-abuse-phase1 T2, R3/R4): the only production
+    // caller is the webhook dispatcher's ops "resolved" branch (step 3),
+    // which injects the staff's synthetic resume turn for a customer; every
+    // customer-authored text, photo and button goes through
+    // MinimalCatalogAgentService. So this route applies neither the
+    // per-number limit (`admitTurn`, which counts customer turns) nor a
+    // budget team request: a person already handled the request this turn
+    // resumes. A new customer-facing caller MUST use `admitTurn` and the
+    // team request like the minimal route.
     if (!(await this.costGuard.llmAllowed())) {
       return { reply: LLM_BUDGET_EXHAUSTED_REPLY };
     }
