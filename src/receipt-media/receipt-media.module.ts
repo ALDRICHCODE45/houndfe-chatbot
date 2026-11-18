@@ -256,6 +256,10 @@ class ReceiptOutcomeLifecycle
   }
 }
 
+/** Cost protection S3: the shared LLM_MAX_OUTPUT_TOKENS, when configured. */
+const optionalMaxOutputTokens = (value: number | undefined) =>
+  value === undefined ? {} : { maxOutputTokens: value };
+
 @Module({
   imports: [
     ConfigModule,
@@ -309,7 +313,12 @@ class ReceiptOutcomeLifecycle
         new LlmReceiptExtractionAdapter(
           generateTextFn,
           config.get<string>('llm.model') ?? '',
-          { costGuard },
+          {
+            costGuard,
+            ...optionalMaxOutputTokens(
+              config.get<number>('llm.maxOutputTokens'),
+            ),
+          },
         ),
       inject: [GENERATE_TEXT, ConfigService, CostGuardService],
     },

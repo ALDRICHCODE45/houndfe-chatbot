@@ -15,7 +15,10 @@ import {
 } from '../../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
-import { MinimalCatalogAgentService } from '../../llm-agent/application/minimal-catalog-agent.service';
+import {
+  MinimalCatalogAgentService,
+  type MinimalCatalogAgentDecision,
+} from '../../llm-agent/application/minimal-catalog-agent.service';
 import { readPlacedOrder } from '../../receipt-media/domain/placed-order';
 import {
   DEFAULT_CUSTOMER_STYLE,
@@ -439,6 +442,17 @@ export class WebhookDispatcherService {
             continue;
           }
 
+          // R1-001 (cost protection): the vision call is an LLM use, so a
+          // product photo is admitted (budget + per-number limit) BEFORE it;
+          // a refused photo gets the same reply/silence as a text turn and
+          // never reaches vision. The admitted agent turn is not counted
+          // again. Receipts of a placed sale (above) are never gated.
+          const admission = await this.admitPhotoTurn(message, media);
+          if (admission.kind === 'refused') {
+            await this.deliverCustomerDecision(message, admission.decision);
+            continue;
+          }
+
           const recognition = await this.recognizeProductImage(media);
           if (recognition.kind === 'receipt' && awaitingPayment) {
             await this.admitReceipt(message, media);
@@ -453,6 +467,8 @@ export class WebhookDispatcherService {
             await this.runCustomerTurn(
               message,
               buildProductImageTurnText(media.caption, recognition),
+              // Only an actually admitted photo skips the agent's admission.
+              admission.kind === 'admitted',
             );
             continue;
           }
@@ -815,10 +831,13 @@ export class WebhookDispatcherService {
   private async runCustomerTurn(
     message: InboundMessage,
     text: string,
+    /** R1-001: the photo turn was admitted before its vision call. */
+    llmAdmitted = false,
   ): Promise<void> {
     const minimal = await this.minimalCatalogAgent.tryHandle({
       senderId: message.senderId,
       text,
+      ...(llmAdmitted ? { llmAdmitted: true as const } : {}),
       ...(message.interactiveReplyId === undefined
         ? {}
         : { interactiveReplyId: message.interactiveReplyId }),
@@ -838,6 +857,53 @@ export class WebhookDispatcherService {
             },
           }),
     });
+    await this.deliverCustomerDecision(message, minimal);
+  }
+
+  /**
+   * R1-001: the cost-guard admission of a product photo before its vision
+   * call. `admitted` = counted here (the agent skips its own admission);
+   * `ungated` = nothing was admitted (no vision/agent capability), so the
+   * agent turn keeps its own budget and per-number admission (review R3).
+   */
+  private async admitPhotoTurn(
+    message: InboundMessage,
+    media: InboundMedia,
+  ): Promise<
+    | { kind: 'admitted' | 'ungated' }
+    | { kind: 'refused'; decision: MinimalCatalogAgentDecision }
+  > {
+    if (this.productImage === undefined) return { kind: 'ungated' };
+    const agent = this
+      .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
+    if (typeof agent.admitPhotoTurn !== 'function') return { kind: 'ungated' };
+    const refused = await agent.admitPhotoTurn({
+      senderId: message.senderId,
+      text: media.caption ?? '',
+      ...(Number.isNaN(Date.parse(message.timestamp))
+        ? {}
+        : { inboundAt: new Date(message.timestamp).toISOString() }),
+    });
+    return refused === null
+      ? { kind: 'admitted' }
+      : { kind: 'refused', decision: refused };
+  }
+
+  /** (5) Sends one customer decision (media, text, buttons) or nothing. */
+  private async deliverCustomerDecision(
+    message: InboundMessage,
+    minimal: MinimalCatalogAgentDecision,
+  ): Promise<void> {
+    // Cost protection S5/S6: a silent decision (a closing after a closing,
+    // a limited number after its first notice) sends nothing; the inbound is
+    // already recorded/mirrored (step 1b), so the message is just completed.
+    if (minimal.silent === true) {
+      this.logger.log(
+        `silent turn ${fingerprintMessageId(message.messageId)} from ${maskConversationRef(message.senderId)}`,
+      );
+      await this.markSeenSafely(message.messageId);
+      return;
+    }
     // S7 (W2) / rule 2: the mode may switch to HUMAN during the turn, or
     // between the photo and the text; the mode is read right before EACH
     // send and the rest of the reply is dropped. A read error propagates

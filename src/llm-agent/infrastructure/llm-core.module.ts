@@ -1,26 +1,34 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { CostGuardService } from '../application/cost-guard.service';
+import { DatabaseModule } from '../../database/database.module';
+import {
+  CostGuardService,
+  type CostGuardSettings,
+} from '../application/cost-guard.service';
+import { LLM_SPEND_STORE, type LlmSpendStore } from '../domain/llm-spend';
 import { GENERATE_TEXT, generateTextImpl } from './generate-text.provider';
+import { PostgresLlmSpendStore } from './postgres-llm-spend.store';
 
 /**
  * Shared LLM seams: the GENERATE_TEXT network seam and the single
- * process-local CostGuardService. Imported by LlmAgentModule (agent turns)
- * and ReceiptMediaModule (receipt vision pre-fill) so both spend against
- * the same monthly budget counter.
+ * CostGuardService over the persistent spend ledger (migration 5100).
+ * Imported by LlmAgentModule (agent turns), ReceiptMediaModule (receipt
+ * vision) and ProductImageModule (product photos), so every call books
+ * against the same daily/monthly budget, across restarts and processes.
  */
 @Module({
-  imports: [ConfigModule],
+  imports: [ConfigModule, DatabaseModule],
   providers: [
     { provide: GENERATE_TEXT, useValue: generateTextImpl },
+    { provide: LLM_SPEND_STORE, useClass: PostgresLlmSpendStore },
     {
       provide: CostGuardService,
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) =>
-        new CostGuardService(
-          config.get<{ monthlyTokenCeiling: number }>('llm')!
-            .monthlyTokenCeiling,
-        ),
+      inject: [ConfigService, LLM_SPEND_STORE],
+      useFactory: (config: ConfigService, store: LlmSpendStore) =>
+        new CostGuardService({
+          ...config.get<{ costGuard?: CostGuardSettings }>('llm')?.costGuard,
+          store,
+        }),
     },
   ],
   exports: [GENERATE_TEXT, CostGuardService],

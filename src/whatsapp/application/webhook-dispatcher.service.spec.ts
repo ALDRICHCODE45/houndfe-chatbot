@@ -291,6 +291,39 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
     expect(humanHandoff.resolveReply).not.toHaveBeenCalled();
   });
 
+  it('sends nothing for a silent decision but completes the message (cost protection S5/S6)', async () => {
+    minimalAgent.tryHandle.mockResolvedValueOnce({
+      kind: 'handled',
+      reply: '',
+      silent: true,
+    });
+    await service.dispatch({
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    id: 'wamid.silent',
+                    from: '5215550001111',
+                    timestamp: '1719000000',
+                    type: 'text',
+                    text: { body: 'ok' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+    expect(sender.sendText).not.toHaveBeenCalled();
+    expect(dedup.markSeen).toHaveBeenCalledWith('wamid.silent');
+  });
+
   it('does NOT send any message outside the inbound-driven path (no proactive sends)', async () => {
     // Empty webhook event: no messages at all.
     const event: WebhookEventDto = {
@@ -1824,6 +1857,93 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(productImage.recognize).not.toHaveBeenCalled();
       expect(ingress.admit).toHaveBeenCalledTimes(1);
       expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+    });
+
+    describe('R1-001: the per-number limit gates the photo vision call', () => {
+      let admitPhotoTurn: jest.Mock;
+      beforeEach(() => {
+        admitPhotoTurn = jest.fn().mockResolvedValue(null);
+        (
+          minimalAgent as unknown as { admitPhotoTurn: jest.Mock }
+        ).admitPhotoTurn = admitPhotoTurn;
+      });
+
+      it('a limited sender (later refusal): no vision call, no agent turn, no reply; the message is completed', async () => {
+        admitPhotoTurn.mockResolvedValueOnce({
+          kind: 'handled',
+          reply: '',
+          silent: true,
+        });
+        await service.dispatch(
+          mediaEvent('wamid.lim1', { type: 'image', caption: '¿hay?' }),
+        );
+        expect(admitPhotoTurn).toHaveBeenCalledWith(
+          expect.objectContaining({ senderId: CUSTOMER, text: '¿hay?' }),
+        );
+        expect(productImage.recognize).not.toHaveBeenCalled();
+        expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+        expect(sender.sendText).not.toHaveBeenCalled();
+        expect(dedup.markSeen).toHaveBeenCalledWith('wamid.lim1');
+      });
+
+      it('the first refusal sends its fixed reply and skips the vision call', async () => {
+        admitPhotoTurn.mockResolvedValueOnce({
+          kind: 'handled',
+          reply:
+            'Estamos revisando sus mensajes; en un momento le atiende alguien del equipo.',
+        });
+        await service.dispatch(mediaEvent('wamid.lim2', { type: 'image' }));
+        expect(productImage.recognize).not.toHaveBeenCalled();
+        expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
+        expect(sender.sendText).toHaveBeenCalledWith({
+          to: CUSTOMER,
+          text: 'Estamos revisando sus mensajes; en un momento le atiende alguien del equipo.',
+        });
+        expect(dedup.markSeen).toHaveBeenCalledWith('wamid.lim2');
+      });
+
+      it('an admitted photo runs vision and the agent turn once, marked as already admitted (no double count)', async () => {
+        productImage.recognize.mockResolvedValueOnce(PRODUCT);
+        await service.dispatch(mediaEvent('wamid.lim3', { type: 'image' }));
+        expect(admitPhotoTurn).toHaveBeenCalledTimes(1);
+        expect(productImage.recognize).toHaveBeenCalledTimes(1);
+        expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+          expect.objectContaining({ senderId: CUSTOMER, llmAdmitted: true }),
+        );
+      });
+
+      it('review R3: an agent without photo admission runs the turn UNADMITTED, so the agent still applies the budget and per-number limit', async () => {
+        delete (minimalAgent as unknown as { admitPhotoTurn?: jest.Mock })
+          .admitPhotoTurn;
+        productImage.recognize.mockResolvedValueOnce(PRODUCT);
+        await service.dispatch(mediaEvent('wamid.lim7', { type: 'image' }));
+        expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+        expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+          expect.not.objectContaining({ llmAdmitted: true }),
+        );
+      });
+
+      it('a placed-sale receipt and a PDF never ask for admission (receipt flow keeps working)', async () => {
+        conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+        await service.dispatch(mediaEvent('wamid.lim4', { type: 'image' }));
+        await service.dispatch(mediaEvent('wamid.lim5', { type: 'document' }));
+        expect(admitPhotoTurn).not.toHaveBeenCalled();
+        expect(ingress.admit).toHaveBeenCalledTimes(2);
+      });
+
+      it('placed sale + product caption from a limited sender: no vision call (not the receipt flow)', async () => {
+        conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+        admitPhotoTurn.mockResolvedValueOnce({
+          kind: 'handled',
+          reply: '',
+          silent: true,
+        });
+        await service.dispatch(
+          mediaEvent('wamid.lim6', { type: 'image', caption: '¿hay de este?' }),
+        );
+        expect(productImage.recognize).not.toHaveBeenCalled();
+        expect(ingress.admit).not.toHaveBeenCalled();
+      });
     });
 
     it('PDF document: receipt path unchanged, no vision call', async () => {

@@ -554,7 +554,8 @@ describe('paid placed sale (S6)', () => {
   it('does not expose the payment tool and tells the model it is paid', async () => {
     const h = setup();
     await h.seedPlacedSale({ paid: true });
-    await h.turn('Gracias', [say('Con gusto.')]);
+    // Not a pure closing (S6 answers «Gracias» without the model).
+    await h.turn('Gracias, ¿cuándo llega?', [say('Con gusto.')]);
     expect(Object.keys(h.seen[0].tools ?? {})).not.toContain(
       'getPaymentDetails',
     );

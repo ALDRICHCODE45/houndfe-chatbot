@@ -115,6 +115,18 @@ import {
 } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import {
+  budgetTeamSummary,
+  capInboundText,
+  LLM_BUDGET_EXHAUSTED_REPLY,
+  SENDER_LIMIT_REPLY,
+  senderLimitTeamSummary,
+} from '../domain/llm-spend';
+import {
+  CLOSING_REPLY,
+  isClosingMessage,
+  isFarewellOrClosingReply,
+} from '../domain/closing-message';
+import {
   MINIMAL_PAYMENT_ALREADY_PAID_REPLY,
   MINIMAL_PAYMENT_NEW_ORDER_REPLY,
   MinimalPaymentService,
@@ -269,7 +281,15 @@ const INSTRUCTIONS =
 export type MinimalCatalogAgentDecision = CustomerReply & {
   kind: 'handled';
   onSent?: () => void;
+  /** Cost protection: send nothing (closing after a closing, a limited
+   *  number after its first notice). The inbound is still recorded. */
+  silent?: true;
 };
+
+/** S3 (cost protection): default output cap per LLM call. */
+export const DEFAULT_LLM_MAX_OUTPUT_TOKENS = 600;
+/** S4 (cost protection): default inbound text cap before any LLM use. */
+export const DEFAULT_INBOUND_TEXT_MAX_CHARS = 1000;
 
 // Bounded busy reply returned as `handled` for an in-flight turn.
 export const BUSY_REPLY =
@@ -417,6 +437,9 @@ const PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT =
   'pagado y nunca use askTeam para esto.';
 
 const ASK_TEAM_TOOL_UUID = z.uuid();
+
+/** R1-001: the user turn recorded for a refused photo without caption. */
+const PHOTO_TURN_PLACEHOLDER = '[Imagen enviada]';
 
 /** S6: the fixed usted copy for each create outcome (styled per customer). */
 function askTeamReply(outcome: AskTeamOutcome): string {
@@ -949,6 +972,8 @@ export class MinimalCatalogAgentService {
   private readonly model: string;
   private readonly maxSteps: number;
   private readonly historyTurns: number;
+  private readonly maxOutputTokens: number;
+  private readonly inboundTextMaxChars: number;
   private readonly busy = new Set<string>();
   // Senders whose in-flight run was interrupted by a busy-rejected turn; that
   // run's order summary must not outlive the interruption.
@@ -994,10 +1019,15 @@ export class MinimalCatalogAgentService {
       model: string;
       maxSteps: number;
       historyTurns: number;
+      maxOutputTokens?: number;
+      inboundTextMaxChars?: number;
     }>('llm')!;
     this.model = llm.model;
     this.maxSteps = llm.maxSteps;
     this.historyTurns = llm.historyTurns;
+    this.maxOutputTokens = llm.maxOutputTokens ?? DEFAULT_LLM_MAX_OUTPUT_TOKENS;
+    this.inboundTextMaxChars =
+      llm.inboundTextMaxChars ?? DEFAULT_INBOUND_TEXT_MAX_CHARS;
   }
 
   // Handles every customer turn; a same-sender run already in flight is
@@ -1012,7 +1042,19 @@ export class MinimalCatalogAgentService {
     profileName?: string;
     /** S6: the triggering inbound's time (ISO UTC), when known. */
     inboundAt?: string;
+    /**
+     * R1-001 (cost protection): the turn was already admitted by
+     * `admitPhotoTurn` before its vision call; the model turn is not
+     * admitted (counted) a second time.
+     */
+    llmAdmitted?: true;
   }): Promise<MinimalCatalogAgentDecision> {
+    // S4 (cost protection): long text is cut before any LLM use; the
+    // transcript/mirror already holds the original (dispatcher step 1b).
+    input = {
+      ...input,
+      text: capInboundText(input.text, this.inboundTextMaxChars),
+    };
     if (this.busy.has(input.senderId)) {
       // Any turn after a summary spends its consent, even a rejected one.
       this.interrupted.add(input.senderId);
@@ -1055,6 +1097,7 @@ export class MinimalCatalogAgentService {
     inboundEvent?: unknown;
     interactiveReplyId?: string;
     inboundAt?: string;
+    llmAdmitted?: true;
   }): Promise<MinimalCatalogAgentDecision> {
     {
       if (
@@ -1216,6 +1259,11 @@ export class MinimalCatalogAgentService {
         const asked = await this.askFulfilment(input);
         if (asked !== null) return asked;
       }
+      // S6 (cost protection): a pure closing is answered without the model.
+      if (pick === undefined && input.interactiveReplyId === undefined) {
+        const closing = await this.answerClosing(input);
+        if (closing !== null) return closing;
+      }
       return this.decision(await this.runTurn(input, pick));
     }
   }
@@ -1335,7 +1383,7 @@ export class MinimalCatalogAgentService {
   }
 
   private decision(
-    result: CustomerReply & { onSent?: () => void },
+    result: CustomerReply & { onSent?: () => void; silent?: true },
   ): MinimalCatalogAgentDecision {
     return {
       kind: 'handled',
@@ -1345,7 +1393,165 @@ export class MinimalCatalogAgentService {
         ? {}
         : { interactive: result.interactive }),
       ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+      ...(result.silent === true ? { silent: true as const } : {}),
     };
+  }
+
+  /**
+   * S6 (cost protection): «gracias», «ok», «👍»… with nothing pending from
+   * the bot get the fixed closing reply without the LLM, or nothing when the
+   * bot's previous message already closed. `null` sends the turn on as
+   * today (not a closing, or a confirmation/offer/question is pending; a
+   * purchase in progress — a non-empty cart — counts as pending, so «ok» /
+   * «listo» while giving delivery data keep their meaning).
+   */
+  private async answerClosing(input: {
+    senderId: string;
+    text: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    if (!isClosingMessage(input.text)) return null;
+    const { senderId } = input;
+    const turns = this.sessionStore.read(senderId);
+    const last = turns.at(-1);
+    const previous = lastAssistantText(turns);
+    const pending =
+      (previous !== null && /[?¿]/.test(previous)) ||
+      last?.reorderOffer !== undefined ||
+      last?.paymentOffer !== undefined ||
+      last?.catalogRestockOffer !== undefined ||
+      last?.interactiveChoice !== undefined ||
+      (last?.cartContext?.pending ?? null) !== null ||
+      (this.order?.offerStatus(senderId) ?? null) !== null ||
+      (this.checkoutAvailable() &&
+        this.checkout!.confirmationStatus(senderId)?.stage === 'pending');
+    if (pending || (await this.purchaseInProgress(senderId))) return null;
+    if (isFarewellOrClosingReply(previous)) {
+      traceLog(this.logger, 'minimal_catalog closing silent');
+      return { kind: 'handled', reply: '', silent: true };
+    }
+    const reply = applyCustomerStyle(
+      CLOSING_REPLY,
+      this.customerStyle(senderId, input.text),
+    );
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    traceLog(this.logger, 'minimal_catalog closing answered');
+    return { kind: 'handled', reply };
+  }
+
+  /**
+   * R1-001 (cost protection): the admission of a product-photo turn, asked
+   * by the dispatcher BEFORE the vision call so a number over its limit (or
+   * a spent budget) never reaches vision. It counts the turn once; the agent
+   * turn that follows carries `llmAdmitted` and is not counted again. `null`
+   * = admitted; otherwise the same refusal as a text turn (first notice with
+   * its team request, or silence). `text` is the photo caption, if any.
+   */
+  async admitPhotoTurn(input: {
+    senderId: string;
+    text: string;
+    inboundAt?: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const text = capInboundText(input.text, this.inboundTextMaxChars);
+    const refused = await this.admitLlmTurn({
+      ...input,
+      text: text.trim() === '' ? PHOTO_TURN_PLACEHOLDER : text,
+    });
+    return refused === null ? null : this.decision(refused);
+  }
+
+  /**
+   * S2/S5 (cost protection): the one admission of an LLM-using turn. `null`
+   * lets the turn call the model; otherwise the fixed reply (budget spent,
+   * or the first refusal of a limited number, each with one team request)
+   * or silence (later refusals of a limited number).
+   */
+  private async admitLlmTurn(input: {
+    senderId: string;
+    text: string;
+    inboundAt?: string;
+  }): Promise<(CustomerReply & { silent?: true }) | null> {
+    const verdict = await this.costGuard.admitTurn(input.senderId);
+    if (verdict.kind === 'allowed') return null;
+    if (verdict.kind === 'sender_limited' && !verdict.firstNotice) {
+      this.logger.log(
+        `llm sender limit (${verdict.window}): no reply, no LLM call`,
+      );
+      return { reply: '', silent: true };
+    }
+    const summary =
+      verdict.kind === 'budget_exhausted'
+        ? budgetTeamSummary(verdict.period)
+        : senderLimitTeamSummary(verdict.window, {
+            perHour: this.costGuard.settings.senderLimitPerHour,
+            perDay: this.costGuard.settings.senderLimitPerDay,
+          });
+    // R4: a notice whose team request failed is given back, so the next turn
+    // retries the notice and the request instead of a silent window (sender
+    // limit) or a «ya le avisé» that nobody received (budget).
+    if (verdict.firstNotice && !(await this.notifyTeam(input, summary)))
+      await this.costGuard.releaseNotice(input.senderId, verdict);
+    this.logger.warn(
+      verdict.kind === 'budget_exhausted'
+        ? `llm budget spent (${verdict.period}): fixed reply, no LLM call`
+        : `llm sender limit (${verdict.window}): first notice, no LLM call`,
+    );
+    const reply = applyCustomerStyle(
+      verdict.kind === 'budget_exhausted'
+        ? LLM_BUDGET_EXHAUSTED_REPLY
+        : SENDER_LIMIT_REPLY,
+      this.customerStyle(input.senderId, input.text),
+    );
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return { reply };
+  }
+
+  /**
+   * One team request through the existing create path. Never throws. False
+   * only when the request could not be created or queued (throw or
+   * `failed`); without a team capability there is nothing to retry (true).
+   */
+  private async notifyTeam(
+    input: { senderId: string; text: string; inboundAt?: string },
+    summary: string,
+  ): Promise<boolean> {
+    if (this.team === undefined) return true;
+    try {
+      const outcome = await this.team.askTeam({
+        senderId: input.senderId,
+        question: input.text.trim() === '' ? summary : input.text,
+        summary,
+        ...(input.inboundAt === undefined
+          ? {}
+          : { inboundAt: input.inboundAt }),
+      });
+      if (outcome.kind === 'failed') {
+        this.logger.warn(
+          `cost guard team request failed: ${outcome.reason}; notice released for retry`,
+        );
+        return false;
+      }
+      this.logger.log(`cost guard team request: ${outcome.kind}`);
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `cost guard team request failed: ${error instanceof Error ? error.name : 'unknown'}; notice released for retry`,
+      );
+      return false;
+    }
   }
 
   /**
@@ -1615,6 +1821,26 @@ export class MinimalCatalogAgentService {
   }
 
   /** True without a cart capability or when the stored cart has no lines. */
+  /**
+   * S6: a purchase is under way (items in the cart, or delivery data being
+   * collected for an order not placed yet). Any read failure counts as in
+   * progress, so the turn keeps the model route.
+   */
+  private async purchaseInProgress(senderId: string): Promise<boolean> {
+    try {
+      if (!(await this.cartIsEmpty(senderId))) return true;
+      if (!this.checkoutAvailable()) return false;
+      if (!(await this.checkout!.hasDraft(senderId))) return false;
+      const placed =
+        this.payment === undefined
+          ? null
+          : await this.payment.placedSale(senderId);
+      return placed === null;
+    } catch {
+      return true;
+    }
+  }
+
   private async cartIsEmpty(senderId: string): Promise<boolean> {
     return this.cart === undefined
       ? true
@@ -2033,9 +2259,16 @@ export class MinimalCatalogAgentService {
       text: string;
       inboundEvent?: unknown;
       inboundAt?: string;
+      llmAdmitted?: true;
     },
     pick?: InteractivePick,
-  ): Promise<CustomerReply & { onSent?: () => void }> {
+  ): Promise<CustomerReply & { onSent?: () => void; silent?: true }> {
+    // S2/S5 (cost protection): budget + per-number limit, one store call
+    // (skipped when the photo turn was admitted before its vision call).
+    if (input.llmAdmitted !== true) {
+      const refused = await this.admitLlmTurn(input);
+      if (refused !== null) return refused;
+    }
     const traceId = newTraceId();
     traceLog(this.logger, `minimal_catalog route_enter trace=${traceId}`);
     const turns = this.sessionStore.read(input.senderId);
@@ -2318,6 +2551,8 @@ export class MinimalCatalogAgentService {
         ...this.paymentTools(input, paymentRun, traceId),
       },
       stopWhen: stepCountIs(this.maxSteps),
+      // S3 (cost protection): every production call is output-capped.
+      maxOutputTokens: this.maxOutputTokens,
     };
     // G2: the checkout reached shipping before this run (quote or pickup).
     const priorShipping =
@@ -2327,11 +2562,15 @@ export class MinimalCatalogAgentService {
         ? await this.cart.shippingMode(input.senderId)
         : null;
     let result = await this.generateTextFn(generateParams);
-    this.costGuard.record({
-      promptTokens: result.usage?.inputTokens ?? 0,
-      completionTokens: result.usage?.outputTokens ?? 0,
-    });
-    if (ungroundedCatalogClaim(result)) {
+    this.costGuard.record(
+      {
+        promptTokens: result.usage?.inputTokens ?? 0,
+        completionTokens: result.usage?.outputTokens ?? 0,
+      },
+      'agent_turn',
+    );
+    // S2: no new LLM call once the budget is spent (local check, no I/O).
+    if (ungroundedCatalogClaim(result) && this.costGuard.llmAllowedNow()) {
       // F8: a catalog claim with no catalog read in this run is unverified.
       // Rerun once with the first step forced to search; tools are untouched
       // because no tool ran.
@@ -2351,10 +2590,13 @@ export class MinimalCatalogAgentService {
               }
             : undefined,
       });
-      this.costGuard.record({
-        promptTokens: result.usage?.inputTokens ?? 0,
-        completionTokens: result.usage?.outputTokens ?? 0,
-      });
+      this.costGuard.record(
+        {
+          promptTokens: result.usage?.inputTokens ?? 0,
+          completionTokens: result.usage?.outputTokens ?? 0,
+        },
+        'agent_retry',
+      );
     }
     const prepared = restockRun?.outcome ?? null;
     const expirationResult = expirationReply?.value ?? null;
@@ -2738,6 +2980,8 @@ export class MinimalCatalogAgentService {
     },
     gathered: ModelMessage[],
   ): Promise<{ text: string; responseMessages: ModelMessage[] } | null> {
+    // S2: no new LLM call once the budget is spent (local check, no I/O).
+    if (!this.costGuard.llmAllowedNow()) return null;
     try {
       const tools = Object.fromEntries(
         Object.entries(params.tools).map(([name, definition]) => [
@@ -2752,10 +2996,13 @@ export class MinimalCatalogAgentService {
         toolChoice: 'none',
         stopWhen: stepCountIs(1),
       } as never);
-      this.costGuard.record({
-        promptTokens: rendered.usage?.inputTokens ?? 0,
-        completionTokens: rendered.usage?.outputTokens ?? 0,
-      });
+      this.costGuard.record(
+        {
+          promptTokens: rendered.usage?.inputTokens ?? 0,
+          completionTokens: rendered.usage?.outputTokens ?? 0,
+        },
+        'agent_render',
+      );
       return {
         text: rendered.text,
         responseMessages: rendered.responseMessages,
@@ -3053,7 +3300,11 @@ export class MinimalCatalogAgentService {
     const model = this.model;
     const generate = this.generateTextFn;
     const costGuard = this.costGuard;
+    const maxOutputTokens = this.maxOutputTokens;
     return async (question, reply) => {
+      // S2: a spent budget starts no call; the gate fails closed to its
+      // natural clarification.
+      if (!(await costGuard.llmAllowed())) throw new Error('LLM budget spent');
       const result = await generate({
         model: openai(model),
         system: RESTOCK_CLASSIFY_INSTRUCTIONS,
@@ -3062,11 +3313,15 @@ export class MinimalCatalogAgentService {
           options: ['accept', 'decline', 'unclear'] as const,
         }),
         abortSignal: AbortSignal.timeout(RESTOCK_CLASSIFY_TIMEOUT_MS),
+        maxOutputTokens,
       });
-      costGuard.record({
-        promptTokens: result.usage?.inputTokens ?? 0,
-        completionTokens: result.usage?.outputTokens ?? 0,
-      });
+      costGuard.record(
+        {
+          promptTokens: result.usage?.inputTokens ?? 0,
+          completionTokens: result.usage?.outputTokens ?? 0,
+        },
+        'restock_classifier',
+      );
       return result.output;
     };
   }

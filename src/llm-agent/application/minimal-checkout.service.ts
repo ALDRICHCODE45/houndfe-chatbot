@@ -233,6 +233,16 @@ export class MinimalCheckoutService {
   }
 
   /**
+   * Cost protection S6: delivery data are being collected (a stored draft).
+   * An unreadable store counts as a draft, so the caller stays on the
+   * model route.
+   */
+  async hasDraft(senderId: string): Promise<boolean> {
+    const current = await this.readDraft(senderId);
+    return current === null || current.draft !== undefined;
+  }
+
+  /**
    * The durable draft only while it still equals, byte for byte, the content
    * the sender confirmed; any outside change or an unreadable store is `null`.
    */

@@ -181,6 +181,19 @@ export function customerStyleDirective(style: CustomerStyle): string {
  * a missing pair degrades to the safe default, never to broken grammar.
  */
 const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
+  // Cost protection phase 1: budget spent, number limited, closing reply.
+  [
+    'En este momento no puedo atenderle por aquí; ya le avisé al equipo y le escriben en cuanto puedan.',
+    'En este momento no puedo atenderte por aquí; ya le avisé al equipo y te escriben en cuanto puedan.',
+  ],
+  [
+    'Estamos revisando sus mensajes; en un momento le atiende alguien del equipo.',
+    'Estamos revisando tus mensajes; en un momento te atiende alguien del equipo.',
+  ],
+  [
+    '¡Con gusto! Aquí estoy si necesita algo más.',
+    '¡Con gusto! Aquí estoy si necesitas algo más.',
+  ],
   // Whole clauses whose verbs depend on context.
   // Human requests: team answers, staff cancel notice and the askTeam copy.
   [

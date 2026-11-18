@@ -641,10 +641,10 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
             model: expect.objectContaining({ modelId: 'm' }) as unknown,
           }),
         );
-        expect(record).toHaveBeenCalledWith({
-          promptTokens: 10,
-          completionTokens: 5,
-        });
+        expect(record).toHaveBeenCalledWith(
+          { promptTokens: 10, completionTokens: 5 },
+          'receipt_vision',
+        );
         const report = await moduleRef.get(ReceiptAttachmentService).upload({
           receipt: {
             id: '11111111-1111-4111-8111-111111111111',

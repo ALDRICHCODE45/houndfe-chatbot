@@ -25,6 +25,10 @@ import { LlmProductImageDescriberAdapter } from './infrastructure/llm-product-im
 const metaMediaClient = (config: ConfigService): MetaMediaPort =>
   createMetaMediaClient(config);
 
+/** Cost protection S3: the shared LLM_MAX_OUTPUT_TOKENS, when configured. */
+const optionalMaxOutputTokens = (value: number | undefined) =>
+  value === undefined ? {} : { maxOutputTokens: value };
+
 @Module({
   imports: [ConfigModule, LlmCoreModule],
   providers: [
@@ -38,7 +42,12 @@ const metaMediaClient = (config: ConfigService): MetaMediaPort =>
         new LlmProductImageDescriberAdapter(
           generateTextFn,
           config.get<string>('llm.model') ?? '',
-          { costGuard },
+          {
+            costGuard,
+            ...optionalMaxOutputTokens(
+              config.get<number>('llm.maxOutputTokens'),
+            ),
+          },
         ),
       inject: [GENERATE_TEXT, ConfigService, CostGuardService],
     },

@@ -278,8 +278,38 @@ describe('envValidationSchema', () => {
       expect(error).toBeUndefined();
       expect(value.LLM_MAX_STEPS).toBe(4);
       expect(value.LLM_HISTORY_TURNS).toBe(12);
-      expect(value.LLM_MONTHLY_TOKEN_CEILING).toBe(8_000_000);
       expect(value.LLM_IDLE_TIMEOUT_MS).toBe(10_800_000);
+    });
+
+    it('applies the cost protection defaults (phase 1)', () => {
+      const { error, value } = envValidationSchema.validate(validEnv, {
+        abortEarly: false,
+      }) as { error?: undefined; value: Record<string, unknown> };
+      expect(error).toBeUndefined();
+      expect(value.LLM_PRICE_INPUT_USD_PER_MTOK).toBe(0.15);
+      expect(value.LLM_PRICE_OUTPUT_USD_PER_MTOK).toBe(0.6);
+      expect(value.LLM_DAILY_BUDGET_USD).toBe(10);
+      expect(value.LLM_MONTHLY_BUDGET_USD).toBe(200);
+      expect(value.LLM_MAX_OUTPUT_TOKENS).toBe(600);
+      expect(value.INBOUND_TEXT_MAX_CHARS).toBe(1000);
+      expect(value.SENDER_LLM_LIMIT_PER_HOUR).toBe(40);
+      expect(value.SENDER_LLM_LIMIT_PER_DAY).toBe(120);
+    });
+
+    it.each([
+      ['LLM_DAILY_BUDGET_USD', '0'],
+      ['LLM_MONTHLY_BUDGET_USD', '-5'],
+      ['LLM_PRICE_INPUT_USD_PER_MTOK', '-1'],
+      ['LLM_MAX_OUTPUT_TOKENS', '0'],
+      ['INBOUND_TEXT_MAX_CHARS', '12.5'],
+      ['SENDER_LLM_LIMIT_PER_HOUR', '0'],
+      ['SENDER_LLM_LIMIT_PER_DAY', 'many'],
+    ])('rejects %s=%s', (key, raw) => {
+      const { error } = envValidationSchema.validate(
+        { ...validEnv, [key]: raw },
+        { abortEarly: false },
+      );
+      expect(error?.details.some((d) => d.path.includes(key))).toBe(true);
     });
   });
 

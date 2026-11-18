@@ -13,6 +13,8 @@ import {
 import { describeError } from '../../common/log-safe';
 
 export const DEFAULT_RECEIPT_EXTRACTION_TIMEOUT_MS = 15_000;
+/** Cost protection S3: LLM_MAX_OUTPUT_TOKENS default when none is wired. */
+export const DEFAULT_VISION_MAX_OUTPUT_TOKENS = 600;
 const MAX_TEXT_FIELD_LENGTH = 64;
 /** Backend `extracted` bounds (N18): a longer value is omitted, never cut. */
 const MAX_DESTINATION_BANK_LENGTH = 80;
@@ -84,14 +86,21 @@ const RECEIPT_EXTRACTION_INSTRUCTIONS = [
 const PDF_PAGE_LIMIT_INSTRUCTION =
   'This is a PDF. Consider at most the first 2 pages and ignore any later pages.';
 
-/** Structural slice of the LLM cost guard; it only records usage. */
+/** Structural slice of the LLM cost guard: books usage, gates the call. */
 export interface ReceiptExtractionUsageRecorder {
-  record(usage: { promptTokens: number; completionTokens: number }): void;
+  record(
+    usage: { promptTokens: number; completionTokens: number },
+    source?: 'receipt_vision',
+  ): void;
+  /** Cost protection S2: false once the LLM budget is spent. */
+  llmAllowed?(): Promise<boolean>;
 }
 
 export interface LlmReceiptExtractionOptions {
   timeoutMs?: number;
   costGuard?: ReceiptExtractionUsageRecorder;
+  /** Cost protection S3: output cap (LLM_MAX_OUTPUT_TOKENS). */
+  maxOutputTokens?: number;
 }
 
 class ExtractionTimeoutError extends Error {}
@@ -104,6 +113,7 @@ export class LlmReceiptExtractionAdapter implements ReceiptExtractionPort {
   private readonly logger = new Logger(LlmReceiptExtractionAdapter.name);
   private readonly timeoutMs: number;
   private readonly costGuard?: ReceiptExtractionUsageRecorder;
+  private readonly maxOutputTokens: number;
 
   constructor(
     private readonly generateTextFn: GenerateTextFn,
@@ -112,9 +122,17 @@ export class LlmReceiptExtractionAdapter implements ReceiptExtractionPort {
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_RECEIPT_EXTRACTION_TIMEOUT_MS;
     this.costGuard = options.costGuard;
+    this.maxOutputTokens =
+      options.maxOutputTokens ?? DEFAULT_VISION_MAX_OUTPUT_TOKENS;
   }
 
   async extract(input: ReceiptExtractionInput): Promise<ReceiptExtraction> {
+    // Cost protection S2: a spent budget skips the vision pre-fill; the
+    // receipt upload continues without extraction.
+    if (this.costGuard?.llmAllowed !== undefined) {
+      if (!(await this.costGuard.llmAllowed()))
+        return { kind: 'unavailable', reason: 'budget' };
+    }
     let raw: unknown;
     try {
       raw = await this.callModel(input);
@@ -165,13 +183,17 @@ export class LlmReceiptExtractionAdapter implements ReceiptExtractionPort {
       ],
       output: Output.object({ schema: extractionSchema }),
       abortSignal: controller.signal,
+      maxOutputTokens: this.maxOutputTokens,
     });
     try {
       const result = await Promise.race([call, timeout]);
-      this.costGuard?.record({
-        promptTokens: result.usage?.inputTokens ?? 0,
-        completionTokens: result.usage?.outputTokens ?? 0,
-      });
+      this.costGuard?.record(
+        {
+          promptTokens: result.usage?.inputTokens ?? 0,
+          completionTokens: result.usage?.outputTokens ?? 0,
+        },
+        'receipt_vision',
+      );
       return result.output;
     } catch (error) {
       if (controller.signal.aborted) throw new ExtractionTimeoutError();

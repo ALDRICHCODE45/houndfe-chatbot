@@ -663,6 +663,8 @@ export class VercelAiLlmAgent implements LlmAgentPort {
     @Inject(GENERATE_TEXT) private readonly generateTextFn: GenerateTextFn,
     private readonly modelId: string,
     private readonly maxSteps: number,
+    /** Cost protection S3: output cap of every call (unset = SDK default). */
+    private readonly maxOutputTokens?: number,
   ) {}
 
   async run(input: LlmRunInput): Promise<LlmRunResult> {
@@ -751,6 +753,9 @@ export class VercelAiLlmAgent implements LlmAgentPort {
         toolsContext,
         // The caller's configured cap is honored exactly.
         stopWhen: stepCountIs(this.maxSteps),
+        ...(this.maxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: this.maxOutputTokens }),
         // Batch metadata is captured BEFORE any approval/execution and the
         // generic approval runs against it (the SDK never shows siblings).
         onLanguageModelCallEnd: (event: unknown) => separation.capture(event),

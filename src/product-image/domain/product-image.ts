@@ -36,7 +36,10 @@ export interface ProductImageDescription {
 
 export type ProductImageRecognition =
   | ProductImageDescription
-  | { kind: 'unavailable'; reason: 'timeout' | 'error' | 'unsupported' };
+  | {
+      kind: 'unavailable';
+      reason: 'timeout' | 'error' | 'unsupported' | 'budget';
+    };
 
 /** Describes a customer photo. Implementations never throw; failures
  * surface as `{ kind: 'unavailable' }`. */

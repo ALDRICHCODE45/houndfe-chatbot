@@ -34,6 +34,8 @@ import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.
 import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { AgentRunner } from './application/agent-runner.service';
 import { CostGuardService } from './application/cost-guard.service';
+import { LLM_SPEND_STORE } from './domain/llm-spend';
+import { PostgresLlmSpendStore } from './infrastructure/postgres-llm-spend.store';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { VercelAiLlmAgent } from './infrastructure/vercel-ai-llm-agent';
 
@@ -239,6 +241,11 @@ describe('LlmAgentModule integration', () => {
 
     const costGuard = moduleRef.get(CostGuardService);
     expect(costGuard).toBeInstanceOf(CostGuardService);
+    // Cost protection S2: the guard books into the persistent ledger.
+    expect(moduleRef.get(LLM_SPEND_STORE)).toBeInstanceOf(
+      PostgresLlmSpendStore,
+    );
+    expect(costGuard.settings.monthlyBudgetUsd).toBe(200);
 
     // The read-only catalog route's per-sender history resolves to the
     // in-memory adapter (no hidden fallback constructed inside the service).
