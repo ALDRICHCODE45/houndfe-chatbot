@@ -23,7 +23,7 @@ const withoutFinalDot = (text: string): string =>
 
 /**
  * The Meta utility templates of the sale.pickup_* notices sent outside the
- * 24 h window (odd/tasks/pay-in-store-templates.md S4; bodies in its L1).
+ * 24 h window (odd/tasks/pay-in-store-templates.md S4; revised bodies in its L3).
  */
 export const PAY_IN_STORE_TEMPLATES = {
   languageCode: 'es_MX',
