@@ -93,8 +93,8 @@ export class CostGuardService {
   private readonly spent = new Set<string>();
   /**
    * S4: `sender \0 noticeKey` → when its notice was last released. In
-   * process only (documented): a restart forgets it, which costs at most one
-   * extra notice + request.
+   * process only (documented): a restart forgets it; the persistent claim is
+   * never kept during the backoff, so the next refusal simply retries.
    */
   private readonly released = new Map<string, number>();
 
@@ -204,13 +204,17 @@ export class CostGuardService {
   async releaseNotice(
     senderId: string,
     verdict: LlmTurnVerdict,
+    /** Review R3-001: give back a claim taken inside the backoff without
+     *  restarting the backoff (the failed request's time stays). */
+    options: { keepBackoff?: boolean } = {},
   ): Promise<void> {
     if (this.store === undefined) return;
     const at = this.clock();
     const key = noticeKeyOf(verdict, llmSpendPeriods(at));
     if (key === null) return;
     this.pruneReleased(at.getTime());
-    this.released.set(backoffKey(senderId, key), at.getTime());
+    if (options.keepBackoff !== true)
+      this.released.set(backoffKey(senderId, key), at.getTime());
     try {
       await this.store.releaseNotice(senderId, key);
     } catch (error) {

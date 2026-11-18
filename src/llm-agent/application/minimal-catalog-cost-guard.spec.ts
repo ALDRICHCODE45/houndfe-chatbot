@@ -371,6 +371,32 @@ describe('MinimalCatalogAgentService cost protection (phase 1)', () => {
       const failing = (team: { askTeam: jest.Mock }) =>
         team.askTeam.mockRejectedValue(new Error('db down'));
 
+      it('review R3-001/R4-001: a restart inside the backoff never strands the sender (the store claim is not kept while backing off)', async () => {
+        const clock = movingClock();
+        const store = new InMemoryLlmSpendStore();
+        const first = build({
+          guard: guardWith(store, { clock: clock.now }),
+        });
+        await say1(first.service, 'uno');
+        await say1(first.service, 'dos');
+        failing(first.team);
+        await say1(first.service, 'tres'); // notice; request fails; released
+        await say1(first.service, 'cuatro'); // within the backoff: silent
+        // Restart: a new process, same persistent store, empty memory.
+        const second = build({
+          guard: guardWith(store, { clock: clock.now }),
+        });
+        second.team.askTeam.mockResolvedValue({
+          kind: 'registered',
+          requestId: 'r',
+        });
+        await expect(say1(second.service, 'cinco')).resolves.toEqual({
+          kind: 'handled',
+          reply: SENDER_LIMIT_REPLY,
+        });
+        expect(second.team.askTeam).toHaveBeenCalledTimes(1);
+      });
+
       it('sender limit: a request that keeps failing costs one notice + one request per 15 minutes; silence in between', async () => {
         const clock = movingClock();
         const { service, captured, team } = build({

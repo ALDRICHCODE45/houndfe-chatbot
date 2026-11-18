@@ -1497,9 +1497,15 @@ export class MinimalCatalogAgentService {
     if (verdict.kind === 'allowed') return null;
     // Follow-ups S4: a team request that keeps failing costs at most one
     // notice + request per 15 minutes. Within the backoff a first notice
-    // behaves as already notified (its claim is kept); once it elapses, a
-    // later refusal retries the notice and the request.
+    // behaves as already notified, but its persistent claim is given back
+    // (review R3-001/R4-001): the backoff lives only in process memory, so a
+    // kept claim would strand the sender after a restart or on another
+    // process. Once the backoff elapses, a later refusal retries both.
     const backoff = this.costGuard.noticeBackoff(input.senderId, verdict);
+    if (verdict.firstNotice && backoff === 'within')
+      await this.costGuard.releaseNotice(input.senderId, verdict, {
+        keepBackoff: true,
+      });
     const firstNotice = verdict.firstNotice
       ? backoff !== 'within'
       : backoff === 'elapsed';
