@@ -22,24 +22,68 @@ const withoutFinalDot = (text: string): string =>
   text.trim().replace(/\.+$/, '');
 
 /**
+ * The Meta utility templates of the sale.pickup_* notices sent outside the
+ * 24 h window (odd/tasks/pay-in-store-templates.md S4; bodies in its L1).
+ */
+export const PAY_IN_STORE_TEMPLATES = {
+  languageCode: 'es_MX',
+  /** {{1}} folio, {{2}} deadline («hoy a las …»), {{3}} store. */
+  reminder: 'apartado_recordatorio',
+  /** {{1}} folio. */
+  expired: 'apartado_vencido',
+  /** {{1}} folio, {{2}} «el {fecha y hora}», {{3}} store. */
+  updated: 'apartado_plazo_actualizado',
+} as const;
+
+/** The feed item's `branchName` when usable, else `null`. */
+const branchNameText = (
+  branchName: string | null | undefined,
+): string | null =>
+  typeof branchName === 'string' && branchName.trim() !== ''
+    ? withoutFinalDot(branchName)
+    : null;
+
+/** "Sucursal Centro: Av. Juárez 123, Centro" (no final dot). */
+const placeText = (location: CheckoutPickupLocation): string =>
+  withoutFinalDot(
+    location.address === null
+      ? location.name
+      : `${location.name}: ${withoutFinalDot(location.address.formatted)}`,
+  );
+
+/**
  * `{tienda}`: name, address and hours of the pickup branch, the same
  * pieces the order-created reply shows ("Sucursal Centro: Av. Juárez 123,
  * Centro. Horario: Lunes a sábado: 09:00–18:00"), without the final dot
- * (the sentence adds it). Unknown → "la tienda"; null parts are omitted.
+ * (the sentence adds it). Null parts are omitted. Unknown location → the
+ * feed item's `branchName` (templates S2), else "la tienda".
  */
 export function payInStoreStoreText(
   location: CheckoutPickupLocation | null | undefined,
+  branchName?: string | null,
 ): string {
-  if (location === null || location === undefined) return 'la tienda';
-  const place =
-    location.address === null
-      ? location.name
-      : `${location.name}: ${withoutFinalDot(location.address.formatted)}`;
+  if (location === null || location === undefined)
+    return branchNameText(branchName) ?? 'la tienda';
+  const place = placeText(location);
   return withoutFinalDot(
     location.hours === null
       ? place
       : `${place}. Horario: ${location.hours.summary}`,
   );
+}
+
+/**
+ * Template {{3}} (S4): branch name + address of the stored pickup location
+ * (no hours: the template sentence is short); fallback `branchName`, then
+ * "la tienda".
+ */
+export function payInStoreTemplateStoreText(
+  location: CheckoutPickupLocation | null | undefined,
+  branchName: string | null | undefined,
+): string {
+  if (location === null || location === undefined)
+    return branchNameText(branchName) ?? 'la tienda';
+  return placeText(location);
 }
 
 /** `{fecha y hora}`: "jueves 19 de noviembre a las 12:30 p. m." */
@@ -91,15 +135,23 @@ export function pickupReminderText(input: {
   folio: string | null;
   holdUntil: string;
   location: CheckoutPickupLocation | null | undefined;
+  branchName?: string | null;
   now: Date;
 }): string {
-  const day = formatDay(input.holdUntil, PAY_IN_STORE_TIME_ZONE, input.now);
-  // Follow-ups S5: «a la 1:00» (singular) / «a las 2:00».
-  const at = atTime(formatClock(input.holdUntil, PAY_IN_STORE_TIME_ZONE));
+  const deadline = pickupReminderDeadline(input.holdUntil, input.now);
   return (
-    `${endSentence(`Le recordamos que ${order(input.folio)} está apartado hasta ${day} ${at}`)} ` +
-    `Páselo a recoger y pagar en ${payInStoreStoreText(input.location)}.`
+    `${endSentence(`Le recordamos que ${order(input.folio)} está apartado hasta ${deadline}`)} ` +
+    `Páselo a recoger y pagar en ${payInStoreStoreText(input.location, input.branchName)}.`
   );
+}
+
+/** The reminder deadline, «hoy a las 4:18 p. m.» / «mañana a las …» / the
+ *  date (also template {{2}} of `apartado_recordatorio`). */
+export function pickupReminderDeadline(holdUntil: string, now: Date): string {
+  const day = formatDay(holdUntil, PAY_IN_STORE_TIME_ZONE, now);
+  // Follow-ups S5: «a la 1:00» (singular) / «a las 2:00».
+  const at = atTime(formatClock(holdUntil, PAY_IN_STORE_TIME_ZONE));
+  return `${day} ${at}`;
 }
 
 /** sale.pickup_expired: the order was cancelled. */
@@ -111,12 +163,56 @@ export function pickupExpiredText(folio: string | null): string {
   );
 }
 
-/** sale.pickup_extended: staff moved the deadline. */
+/** The direction of a staff deadline change (backend S2). */
+export type PickupHoldDirection = 'EXTENDED' | 'SHORTENED';
+
+/**
+ * True when the deadline moved earlier: `direction` SHORTENED, or (no
+ * direction, an older backend) a `previousHoldUntil` later than the new
+ * deadline. Equal deadlines and missing data read as an extension.
+ */
+export function pickupHoldShortened(input: {
+  holdUntil: string;
+  previousHoldUntil?: string;
+  direction?: PickupHoldDirection;
+}): boolean {
+  if (input.direction !== undefined) return input.direction === 'SHORTENED';
+  if (input.previousHoldUntil === undefined) return false;
+  return Date.parse(input.previousHoldUntil) > Date.parse(input.holdUntil);
+}
+
+/**
+ * sale.pickup_extended: staff moved the deadline. Later → «Le ampliamos el
+ * plazo …»; earlier → «Actualizamos el plazo …» (templates S3).
+ */
 export function pickupExtendedText(input: {
   folio: string | null;
   holdUntil: string;
+  previousHoldUntil?: string;
+  direction?: PickupHoldDirection;
 }): string {
+  const lead = pickupHoldShortened(input)
+    ? 'Actualizamos el plazo de'
+    : 'Le ampliamos el plazo de';
   return endSentence(
-    `Le ampliamos el plazo de ${order(input.folio)}: ahora puede recogerlo y pagarlo hasta el ${payInStoreDateTime(input.holdUntil)}`,
+    `${lead} ${order(input.folio)}: ahora puede recogerlo y pagarlo hasta ${pickupNewDeadline(input.holdUntil)}`,
+  );
+}
+
+/** «el {fecha y hora}» (also template {{2}} of
+ *  `apartado_plazo_actualizado`). */
+export function pickupNewDeadline(holdUntil: string): string {
+  return `el ${payInStoreDateTime(holdUntil)}`;
+}
+
+/**
+ * sale.pickup_expired_review (templates S2/S3): the hold expired with a
+ * partial payment or a receipt in review, the sale is NOT cancelled and
+ * staff will contact the customer.
+ */
+export function pickupExpiredReviewText(folio: string | null): string {
+  return (
+    `El plazo de ${order(folio)} venció. ` +
+    'Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.'
   );
 }

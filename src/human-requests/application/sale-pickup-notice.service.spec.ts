@@ -62,12 +62,18 @@ const EXTENDED =
 type SaleType =
   | 'sale.pickup_reminder'
   | 'sale.pickup_expired'
-  | 'sale.pickup_extended';
+  | 'sale.pickup_extended'
+  | 'sale.pickup_expired_review';
 
 const saleItem = (
   deliveryId: string,
   type: SaleType,
-  patch: { holdVersion?: number; conversationRef?: string | null } = {},
+  patch: {
+    holdVersion?: number;
+    conversationRef?: string | null;
+    folio?: string | null;
+    payload?: Record<string, unknown>;
+  } = {},
 ): FeedItem => {
   const conversationRef =
     patch.conversationRef === undefined ? REF : patch.conversationRef;
@@ -81,20 +87,22 @@ const saleItem = (
     notBefore: null,
     expiresAt: null,
   };
-  return type === 'sale.pickup_expired'
+  const folio = patch.folio === undefined ? 'B-0042' : patch.folio;
+  return type === 'sale.pickup_expired' || type === 'sale.pickup_expired_review'
     ? {
         ...envelope,
         type,
-        payload: { saleId: SALE, folio: 'B-0042', holdVersion },
+        payload: { saleId: SALE, folio, holdVersion, ...patch.payload },
       }
     : {
         ...envelope,
         type,
         payload: {
           saleId: SALE,
-          folio: 'B-0042',
+          folio,
           holdUntil: HOLD_UNTIL,
           holdVersion,
+          ...patch.payload,
         },
       };
 };
@@ -107,10 +115,21 @@ interface Hold {
   version: number;
 }
 
-const harness = (options: { withHandler?: boolean } = {}) => {
+interface SentTemplate {
+  to: string;
+  templateName: string;
+  languageCode: string;
+  bodyParameters: string[];
+  origin?: string;
+}
+
+const harness = (
+  options: { withHandler?: boolean; templates?: boolean } = {},
+) => {
   const store = new InMemoryHumanRequestFeedStore();
   const acks: Array<{ deliveryId: string; body: DeliveryOutcomeInput }> = [];
   const sent: Array<{ to: string; text: string }> = [];
+  const templates: SentTemplate[] = [];
   const state = {
     human: false,
     window: true,
@@ -131,6 +150,7 @@ const harness = (options: { withHandler?: boolean } = {}) => {
     } as Hold | null | undefined,
     holdFails: false,
     sendScript: [] as Error[],
+    templateScript: [] as Error[],
   };
   const statusReads: string[] = [];
   let attempt = 0;
@@ -178,6 +198,9 @@ const harness = (options: { withHandler?: boolean } = {}) => {
     isWindowOpen: () => Promise.resolve(state.window),
     customerStyle: () => Promise.resolve(state.style),
     clock: () => NOW,
+    ...(options.templates === undefined
+      ? {}
+      : { templatesEnabled: options.templates }),
   });
   const service = new HumanRequestDeliveryService(
     {
@@ -204,6 +227,14 @@ const harness = (options: { withHandler?: boolean } = {}) => {
           if (next !== undefined) return Promise.reject(next);
           return Promise.resolve({ providerMessageId: `wamid.${sent.length}` });
         },
+        sendTemplate: (message: SentTemplate) => {
+          templates.push(message);
+          const next = state.templateScript.shift();
+          if (next !== undefined) return Promise.reject(next);
+          return Promise.resolve({
+            providerMessageId: `wamid.tpl.${templates.length}`,
+          });
+        },
       },
       handoff: { isHumanMode: () => Promise.resolve(state.human) },
       isWindowOpen: () => Promise.resolve(state.window),
@@ -219,7 +250,7 @@ const harness = (options: { withHandler?: boolean } = {}) => {
       },
     },
   );
-  return { store, acks, sent, state, service, statusReads };
+  return { store, acks, sent, templates, state, service, statusReads };
 };
 
 describe('pay in store sale notices (S3)', () => {
@@ -464,26 +495,323 @@ describe('pay in store sale notices (S3)', () => {
     },
   );
 
+  // ---------------------------------------------------------------------
+  // odd/tasks/pay-in-store-templates.md S2–S4
+  // ---------------------------------------------------------------------
+
+  const UPDATED =
+    'Actualizamos el plazo de su pedido B-0042: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a las 12:30 p. m.';
+  const REVIEW =
+    'El plazo de su pedido B-0042 venció. Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.';
+  const EARLIER = '2026-11-19T15:00:00.000Z';
+  const LATER = '2026-11-20T18:30:00.000Z';
+
+  it.each<[string, Record<string, unknown>, string]>([
+    [
+      'direction EXTENDED',
+      { direction: 'EXTENDED', previousHoldUntil: EARLIER },
+      EXTENDED,
+    ],
+    [
+      'direction SHORTENED',
+      { direction: 'SHORTENED', previousHoldUntil: LATER },
+      UPDATED,
+    ],
+    ['direction absent, previous deadline absent', {}, EXTENDED],
+    [
+      'direction absent, a later previous deadline',
+      { previousHoldUntil: LATER },
+      UPDATED,
+    ],
+    [
+      'direction absent, an earlier previous deadline',
+      { previousHoldUntil: EARLIER },
+      EXTENDED,
+    ],
+  ])(
+    'sale.pickup_extended with %s sends its text (PICKUP_EXTENDED_NOTICE)',
+    async (_name, payload, text) => {
+      const h = harness();
+      await h.service.accept(
+        saleItem('1', 'sale.pickup_extended', { payload }),
+      );
+      expect(h.sent).toEqual([{ to: SENDER, text }]);
+      await expect(h.store.getDelivery('1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision: 'PICKUP_EXTENDED_NOTICE',
+      });
+    },
+  );
+
+  it('sale.pickup_expired_review sends the exact text and ACKs PROVIDER_ACCEPTED (PICKUP_EXPIRED_REVIEW_NOTICE)', async () => {
+    const h = harness({ templates: true });
+    // The hold is past its deadline (stage 2) but the sale is not cancelled.
+    h.state.hold = { ...h.state.hold!, stage: 2 };
+    await h.service.accept(
+      saleItem('1', 'sale.pickup_expired_review', {
+        payload: { branchName: 'Sucursal Centro' },
+      }),
+    );
+    expect(h.sent).toEqual([{ to: SENDER, text: REVIEW }]);
+    expect(h.templates).toEqual([]);
+    expect(h.acks.map((a) => a.body.outcome)).toEqual(['PROVIDER_ACCEPTED']);
+    await expect(h.store.getDelivery('1')).resolves.toMatchObject({
+      localState: 'SENT',
+      decision: 'PICKUP_EXPIRED_REVIEW_NOTICE',
+      ackState: 'ACKED',
+    });
+    expectLogsSafe();
+  });
+
+  it.each<[SaleType, Record<string, unknown>, string]>([
+    [
+      'sale.pickup_extended',
+      { direction: 'SHORTENED' },
+      'Actualizamos el plazo de tu pedido B-0042: ahora puedes recogerlo y pagarlo hasta el jueves 19 de noviembre a las 12:30 p. m.',
+    ],
+    [
+      'sale.pickup_expired_review',
+      {},
+      'El plazo de tu pedido B-0042 venció. Como tienes un pago registrado, alguien del equipo te va a contactar para cerrarlo.',
+    ],
+  ])('%s in tú for a tú customer', async (type, payload, text) => {
+    const h = harness();
+    h.state.style = TU;
+    await h.service.accept(saleItem('1', type, { payload }));
+    expect(h.sent).toEqual([{ to: SENDER, text }]);
+  });
+
+  it.each([true, false])(
+    'sale.pickup_expired_review with the window closed is STALE (WINDOW_CLOSED), no template (templates %s)',
+    async (templates) => {
+      const h = harness({ templates });
+      h.state.window = false;
+      await h.service.accept(saleItem('1', 'sale.pickup_expired_review'));
+      await expectStale(h, 'WINDOW_CLOSED');
+      expect(h.templates).toEqual([]);
+    },
+  );
+
+  it.each<SaleType>(['sale.pickup_expired_review'])(
+    '%s of a superseded hold or a paid sale is STALE',
+    async (type) => {
+      const superseded = harness();
+      superseded.state.hold = { ...superseded.state.hold!, version: 3 };
+      await superseded.service.accept(saleItem('1', type));
+      await expectStale(superseded, 'HOLD_SUPERSEDED');
+      const paid = harness();
+      paid.state.record = { ...paid.state.record!, paid: true };
+      await paid.service.accept(saleItem('1', type));
+      await expectStale(paid, 'SALE_CLOSED');
+    },
+  );
+
+  it('the store text falls back to the item branchName when the location is unknown', async () => {
+    const h = harness();
+    h.state.record = { ...h.state.record!, pickupLocation: null };
+    await h.service.accept(
+      saleItem('1', 'sale.pickup_reminder', {
+        payload: { branchName: 'Sucursal Norte' },
+      }),
+    );
+    expect(h.sent[0].text).toBe(
+      'Le recordamos que su pedido B-0042 está apartado hasta hoy a las 12:30 p. m. Páselo a recoger y pagar en Sucursal Norte.',
+    );
+  });
+
+  const TEMPLATE_STORE =
+    'Sucursal Centro: Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000';
+
+  it.each<[SaleType, Record<string, unknown>, string, string[], string]>([
+    [
+      'sale.pickup_reminder',
+      {},
+      'apartado_recordatorio',
+      ['B-0042', 'hoy a las 12:30 p. m.', TEMPLATE_STORE],
+      'PICKUP_REMINDER',
+    ],
+    [
+      'sale.pickup_expired',
+      {},
+      'apartado_vencido',
+      ['B-0042'],
+      'PICKUP_EXPIRED_NOTICE',
+    ],
+    [
+      'sale.pickup_extended',
+      { direction: 'EXTENDED' },
+      'apartado_plazo_actualizado',
+      ['B-0042', 'el jueves 19 de noviembre a las 12:30 p. m.', TEMPLATE_STORE],
+      'PICKUP_EXTENDED_NOTICE',
+    ],
+    [
+      'sale.pickup_extended',
+      { direction: 'SHORTENED' },
+      'apartado_plazo_actualizado',
+      ['B-0042', 'el jueves 19 de noviembre a las 12:30 p. m.', TEMPLATE_STORE],
+      'PICKUP_EXTENDED_NOTICE',
+    ],
+  ])(
+    '%s (%j) outside the window (templates on) sends its template once, ACK PROVIDER_ACCEPTED',
+    async (type, payload, templateName, bodyParameters, decision) => {
+      const h = harness({ templates: true });
+      h.state.window = false;
+      await h.service.accept(saleItem('1', type, { payload }));
+      expect(h.sent).toEqual([]);
+      expect(h.templates).toEqual([
+        { to: SENDER, templateName, languageCode: 'es_MX', bodyParameters },
+      ]);
+      expect(h.acks).toEqual([
+        {
+          deliveryId: '1',
+          body: expect.objectContaining({
+            outcome: 'PROVIDER_ACCEPTED',
+            providerMessageId: 'wamid.tpl.1',
+          }) as unknown,
+        },
+      ]);
+      await expect(h.store.getDelivery('1')).resolves.toMatchObject({
+        localState: 'SENT',
+        decision,
+        ackState: 'ACKED',
+      });
+      // Redelivered: never sent twice.
+      await h.service.accept(saleItem('1', type, { payload }));
+      expect(h.templates).toHaveLength(1);
+      expectLogsSafe();
+    },
+  );
+
+  it('the template store text falls back to the item branchName', async () => {
+    const h = harness({ templates: true });
+    h.state.window = false;
+    h.state.record = { ...h.state.record!, pickupLocation: null };
+    await h.service.accept(
+      saleItem('1', 'sale.pickup_reminder', {
+        payload: { branchName: 'Sucursal Norte' },
+      }),
+    );
+    expect(h.templates[0].bodyParameters).toEqual([
+      'B-0042',
+      'hoy a las 12:30 p. m.',
+      'Sucursal Norte',
+    ]);
+  });
+
+  it('the window open with templates on still sends the free text', async () => {
+    const h = harness({ templates: true });
+    await h.service.accept(saleItem('1', 'sale.pickup_reminder'));
+    expect(h.sent).toEqual([{ to: SENDER, text: REMINDER }]);
+    expect(h.templates).toEqual([]);
+  });
+
+  it.each<SaleType>([
+    'sale.pickup_reminder',
+    'sale.pickup_expired',
+    'sale.pickup_extended',
+  ])(
+    '%s outside the window with templates off is STALE (WINDOW_CLOSED), no template',
+    async (type) => {
+      const h = harness({ templates: false });
+      h.state.window = false;
+      await h.service.accept(saleItem('1', type));
+      await expectStale(h, 'WINDOW_CLOSED');
+      expect(h.templates).toEqual([]);
+    },
+  );
+
+  it.each<[string, Error]>([
+    [
+      'template not approved / missing (132001)',
+      new WhatsappSendError(
+        404,
+        132001,
+        'Template name does not exist in the translation',
+      ),
+    ],
+    [
+      'parameter mismatch (132000)',
+      new WhatsappSendError(400, 132000, 'Number of parameters does not match'),
+    ],
+  ])(
+    'a Meta template refusal (%s) is STALE (WINDOW_CLOSED) with a warn carrying the code; no retry',
+    async (_name, error) => {
+      const h = harness({ templates: true });
+      h.state.window = false;
+      h.state.templateScript = [error];
+      await h.service.accept(saleItem('1', 'sale.pickup_reminder'));
+      expect(h.acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(h.store.getDelivery('1')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'WINDOW_CLOSED',
+        ackState: 'ACKED',
+      });
+      const code = String((error as WhatsappSendError).graphErrorCode);
+      expect(
+        logged.some(
+          (l) => l.includes('apartado_recordatorio') && l.includes(code),
+        ),
+      ).toBe(true);
+      // Redelivered: no second attempt.
+      await h.service.accept(saleItem('1', 'sale.pickup_reminder'));
+      expect(h.templates).toHaveLength(1);
+      expect(h.sent).toEqual([]);
+      expectLogsSafe();
+    },
+  );
+
+  it('an uncertain template send ACKs DELIVERY_UNKNOWN and is never resent', async () => {
+    const h = harness({ templates: true });
+    h.state.window = false;
+    h.state.templateScript = [new Error('socket hang up')];
+    await h.service.accept(saleItem('1', 'sale.pickup_expired'));
+    await h.service.accept(saleItem('1', 'sale.pickup_expired'));
+    expect(h.templates).toHaveLength(1);
+    expect(h.acks.map((a) => a.body.outcome)).toEqual(['DELIVERY_UNKNOWN']);
+  });
+
+  it('a HUMAN session outside the window is STALE (HUMAN_SESSION), no template', async () => {
+    const h = harness({ templates: true });
+    h.state.window = false;
+    h.state.human = true;
+    await h.service.accept(saleItem('1', 'sale.pickup_reminder'));
+    await expectStale(h, 'HUMAN_SESSION');
+    expect(h.templates).toEqual([]);
+  });
+
+  it('a template needs the folio: none → STALE (WINDOW_CLOSED), nothing sent', async () => {
+    const h = harness({ templates: true });
+    h.state.window = false;
+    await h.service.accept(
+      saleItem('1', 'sale.pickup_expired', { folio: null }),
+    );
+    await expectStale(h, 'WINDOW_CLOSED');
+    expect(h.templates).toEqual([]);
+  });
+
   it('flag off (no handler wired): typed sale items are STALE as in T1, no message', async () => {
     const h = harness({ withHandler: false });
     for (const [id, type] of [
       ['1', 'sale.pickup_reminder'],
       ['2', 'sale.pickup_expired'],
       ['3', 'sale.pickup_extended'],
+      ['4', 'sale.pickup_expired_review'],
     ] as const)
       await h.service.accept(saleItem(id, type));
     expect(h.sent).toEqual([]);
+    expect(h.templates).toEqual([]);
     expect(h.statusReads).toEqual([]);
     expect(h.acks.map((a) => [a.deliveryId, a.body.outcome])).toEqual([
       ['1', 'STALE'],
       ['2', 'STALE'],
       ['3', 'STALE'],
+      ['4', 'STALE'],
     ]);
     await expect(h.store.getDelivery('1')).resolves.toMatchObject({
       decision: 'UNKNOWN_TYPE',
     });
     expect(
       logged.filter((l) => l.includes('pay in store notices are not enabled')),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
   });
 });

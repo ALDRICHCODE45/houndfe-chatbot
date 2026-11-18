@@ -591,6 +591,31 @@ describe('envValidationSchema', () => {
     });
   });
 
+  // pay-in-store-templates S4: default off until Meta approves them.
+  describe('PAY_IN_STORE_TEMPLATES_ENABLED', () => {
+    it.each([
+      [undefined, false, false],
+      ['true', true, false],
+      ['false', false, false],
+      ['yes', undefined, true],
+    ])('validates flag=%s', (flag, expected, invalid) => {
+      const { error, value } = envValidationSchema.validate(
+        flag === undefined
+          ? { ...validEnv }
+          : { ...validEnv, PAY_IN_STORE_TEMPLATES_ENABLED: flag },
+        { abortEarly: false },
+      ) as { error?: Joi.ValidationError; value: Record<string, unknown> };
+      expect(Boolean(error)).toBe(invalid);
+      if (invalid) {
+        expect(error!.details[0].path).toContain(
+          'PAY_IN_STORE_TEMPLATES_ENABLED',
+        );
+      } else {
+        expect(value.PAY_IN_STORE_TEMPLATES_ENABLED).toBe(expected);
+      }
+    });
+  });
+
   describe('CONVERSATION_MIRROR_DELIVERY_ENABLED', () => {
     it.each([
       [undefined, false, false],

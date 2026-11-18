@@ -175,6 +175,11 @@ export const SALE_PICKUP_DECISIONS: DeliveryDecision[] = [
   'SALE_UNKNOWN',
 ];
 
+/** Decisions of the pay in store templates change (migration 5300). */
+export const SALE_PICKUP_REVIEW_DECISIONS: DeliveryDecision[] = [
+  'PICKUP_EXPIRED_REVIEW_NOTICE',
+];
+
 /** A typed pay-in-store sale item (requestId null, a saleId). */
 export const salePickupItem = (deliveryId: string): FeedItem => ({
   type: 'sale.pickup_reminder',
@@ -500,7 +505,7 @@ export function runHumanRequestFeedStoreContract(
       });
     });
 
-    it.each(SALE_PICKUP_DECISIONS)(
+    it.each([...SALE_PICKUP_DECISIONS, ...SALE_PICKUP_REVIEW_DECISIONS])(
       'records the pay in store decision %s on a transition',
       async (decision) => {
         await store.insertDelivery(salePickupItem('sale-d'));

@@ -15,6 +15,7 @@ import type { HandoffModeService } from '../../conversation/application/handoff-
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type {
   OutboundMediaFile,
+  OutboundTemplate,
   SendResult,
   WhatsappSenderPort,
 } from '../../whatsapp/domain/whatsapp-sender.port';
@@ -73,13 +74,30 @@ interface LivePlanBase {
   guard?: () => Promise<DeliveryDecision | null>;
 }
 
+/** An approved template a BOT notice is sent as (recipient and origin are
+ *  the plan's: `senderId`, BOT). */
+export type NoticeTemplate = Omit<OutboundTemplate, 'to' | 'origin'> & {
+  /** The decision recorded when Meta (or the local check) definitely
+   *  refuses the template (not approved, missing, wrong parameters). */
+  refusedDecision: DeliveryDecision;
+};
+
 /** The delivery service executes the plan: notices are BOT messages, never
  *  held by HUMAN mode and never deferred (a closed window is STALE). A
  *  relay (staff message / template) is sent by `deliver` (origin STAFF /
  *  TEMPLATE, so the sender never mirrors it), never held by HUMAN mode. */
 export type LivePlan =
   | ({ action: 'stale' } & LivePlanBase)
-  | ({ action: 'send'; senderId: string; text: string } & LivePlanBase)
+  | ({
+      action: 'send';
+      senderId: string;
+      text: string;
+      /** A BOT notice sent as an approved template instead of `text` (the
+       *  24 h window is closed; pay-in-store-templates S4). Mirrored like
+       *  any BOT send. A definite refusal is STALE with
+       *  `templateRefusedDecision`. */
+      template?: NoticeTemplate;
+    } & LivePlanBase)
   | ({
       action: 'relay';
       senderId: string;

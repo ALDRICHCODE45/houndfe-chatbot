@@ -16,11 +16,15 @@ import {
 } from '../../conversation/application/handoff-send-hold';
 import type { HandoffModeService } from '../../conversation/application/handoff-mode.service';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
-import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
+import {
+  UnsupportedOutboundError,
+  type WhatsappSenderPort,
+} from '../../whatsapp/domain/whatsapp-sender.port';
 import type {
   LiveConversationHandler,
   LivePlan,
   LiveSendResult,
+  NoticeTemplate,
 } from './live-conversation.service';
 import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
 import type { ScheduledConversationHandler } from './scheduled-conversation.service';
@@ -57,7 +61,11 @@ export interface HumanRequestDeliveryPorts {
     HumanRequestsClient,
     'recordDeliveryOutcome' | 'listPendingDeliveries'
   >;
-  sender: Pick<WhatsappSenderPort, 'sendText'>;
+  sender: Pick<WhatsappSenderPort, 'sendText'> &
+    /** Pay-in-store templates S4: BOT notices outside the 24 h window.
+     *  Optional for hand-built harnesses: absent → a template plan is a
+     *  definite non-send (its refused decision). */
+    Partial<Pick<WhatsappSenderPort, 'sendTemplate'>>;
   /** S4: required, so a missing reader can never skip the hold. */
   handoff: HandoffModeReader &
     /** Follow-ups S4: the ENDING marker (a session known to be ending whose
@@ -132,6 +140,8 @@ type Plan =
       text: string;
       /** Unit 10: clarification reply id, recorded with the sent message. */
       staffReplyId?: string;
+      /** Pay-in-store templates S4: sent as this template, not `text`. */
+      template?: NoticeTemplate;
       /** request.cancelled / request.overdue_notice: never a deferral (422
        *  OUTCOME_NOT_ALLOWED); a closed window is STALE. */
       cancellation: boolean;
@@ -776,16 +786,27 @@ export class HumanRequestDeliveryService {
       ({ providerMessageId } =
         plan.action === 'relay'
           ? await plan.deliver()
-          : await this.ports.sender.sendText({
-              to: plan.senderId,
-              text: plan.text,
-              ...(plan.staffReplyId === undefined
-                ? {}
-                : { staffReplyId: plan.staffReplyId }),
-            }));
+          : plan.template !== undefined
+            ? await this.sendNoticeTemplate(plan.senderId, plan.template)
+            : await this.ports.sender.sendText({
+                to: plan.senderId,
+                text: plan.text,
+                ...(plan.staffReplyId === undefined
+                  ? {}
+                  : { staffReplyId: plan.staffReplyId }),
+              }));
     } catch (error) {
       if (plan.action === 'relay')
         return this.relayFailed(row, plan, claimed, base, error);
+      if (plan.template !== undefined)
+        return this.templateFailed(
+          row,
+          plan,
+          plan.template,
+          claimed,
+          base,
+          error,
+        );
       const windowClosed = isWindowClosedSendError(error);
       if (!windowClosed)
         this.logger.warn(
@@ -823,6 +844,74 @@ export class HumanRequestDeliveryService {
       );
     else await this.flushAck(sent);
     await this.finishLive(plan, row, { kind: 'ACCEPTED', providerMessageId });
+    return true;
+  }
+
+  /** A BOT notice template (pay-in-store templates S4), mirrored like any
+   *  BOT send. No sender able to send templates → a local refusal. */
+  private sendNoticeTemplate(
+    to: string,
+    template: NoticeTemplate,
+  ): Promise<SendResult> {
+    const sendTemplate = this.ports.sender.sendTemplate?.bind(
+      this.ports.sender,
+    );
+    if (sendTemplate === undefined)
+      return Promise.reject(
+        new UnsupportedOutboundError('the sender cannot send templates'),
+      );
+    return sendTemplate({
+      to,
+      templateName: template.templateName,
+      languageCode: template.languageCode,
+      bodyParameters: template.bodyParameters,
+    });
+  }
+
+  /** A BOT notice template whose send failed: a definite refusal (template
+   *  not approved / missing / bad parameters, any 4xx or a local check) is
+   *  STALE with the template's refused decision and a warn carrying Meta's
+   *  code; anything else is DELIVERY_UNKNOWN. Never resent by the bot. */
+  private async templateFailed(
+    row: DeliveryRow,
+    plan: Plan,
+    template: NoticeTemplate,
+    claimed: DeliveryExpectation,
+    base: {
+      decision: DeliveryDecision;
+      attemptId: string;
+      attemptedAt: string;
+    },
+    error: unknown,
+  ): Promise<boolean> {
+    const uncertain = classifyRelaySendError(error) === 'UNCERTAIN';
+    const code =
+      typeof error === 'object' && error !== null
+        ? (error as { graphErrorCode?: unknown }).graphErrorCode
+        : undefined;
+    const metaCode =
+      typeof code === 'number' || typeof code === 'string'
+        ? sanitizeErrorText(String(code))
+        : 'none';
+    this.logger.warn(
+      `delivery ${row.deliveryId} ${row.type} template ${template.templateName} ${uncertain ? 'send uncertain' : 'refused'} (Meta code ${metaCode}): ${describeError(error)}`,
+    );
+    const next = await this.ports.store.transition(row.deliveryId, claimed, {
+      ...base,
+      providerMessageId: null,
+      ...(uncertain
+        ? ({ localState: 'UNKNOWN', ack: 'DELIVERY_UNKNOWN' } as const)
+        : ({
+            localState: 'STALE',
+            decision: template.refusedDecision,
+            ack: 'STALE',
+          } as const)),
+    });
+    if (next !== null) await this.flushAck(next);
+    await this.finishLive(plan, row, {
+      kind: uncertain ? 'UNKNOWN' : 'NOT_SENT',
+      providerMessageId: null,
+    });
     return true;
   }
 

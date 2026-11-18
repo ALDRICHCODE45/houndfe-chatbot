@@ -104,7 +104,11 @@ export type DeliveryDecision =
   | 'SALE_CLOSED'
   /** The bot cannot verify the sale: not the conversation's placed order,
    *  no checkout key to read the live hold, or no hold reported. */
-  | 'SALE_UNKNOWN';
+  | 'SALE_UNKNOWN'
+  // ---- pay in store templates (migration 5300) ----
+  /** sale.pickup_expired_review: the "alguien del equipo le va a contactar"
+   *  notice sent (free text only; no template exists for it). */
+  | 'PICKUP_EXPIRED_REVIEW_NOTICE';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 

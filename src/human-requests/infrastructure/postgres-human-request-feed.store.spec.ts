@@ -23,6 +23,7 @@ import {
   rescheduledItem,
   runHumanRequestFeedStoreContract,
   salePickupItem,
+  SALE_PICKUP_REVIEW_DECISIONS,
   staffMessageItem,
   templateItem,
 } from './human-request-feed-store.contract';
@@ -623,6 +624,59 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     await truncate();
     migrate('up');
     await expect(since('5200000000000')).resolves.toBe(count5200);
+  });
+
+  it('migration 5300: the expired-review decision, every older one kept, guarded down', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    await store.insertDelivery(salePickupItem('pr-1'));
+    for (const decision of [
+      ...SALE_PICKUP_REVIEW_DECISIONS,
+      ...SALE_PICKUP_DECISIONS,
+      ...SCHEDULE_DECISIONS,
+      ...LIVE_DECISIONS,
+      'UNKNOWN_TYPE',
+      'WINDOW_CLOSED',
+    ])
+      await expect(
+        pool.query(
+          `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'pr-1'`,
+          [decision],
+        ),
+      ).resolves.toBeDefined();
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'NOPE' WHERE delivery_id = 'pr-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    await truncate();
+
+    const count5300 = await since('5300000000000');
+    expect(Number(count5300)).toBeGreaterThanOrEqual(1);
+    for (const decision of SALE_PICKUP_REVIEW_DECISIONS) {
+      await store.insertDelivery(salePickupItem('pr-2'));
+      await pool.query(
+        `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'pr-2'`,
+        [decision],
+      );
+      expect(() => migrate('down', count5300)).toThrow(/refusing to roll back/);
+      await expect(since('5300000000000')).resolves.toBe(count5300);
+      await truncate();
+    }
+
+    // A row with a 5200 decision does not block it; the 5200 CHECK is back.
+    await store.insertDelivery(salePickupItem('pr-3'));
+    await pool.query(
+      `UPDATE human_request_deliveries SET decision = 'PICKUP_REMINDER' WHERE delivery_id = 'pr-3'`,
+    );
+    migrate('down', count5300);
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'PICKUP_EXPIRED_REVIEW_NOTICE' WHERE delivery_id = 'pr-3'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    await truncate();
+    migrate('up');
+    await expect(since('5300000000000')).resolves.toBe(count5300);
   });
 
   runHumanRequestFeedStoreContract('postgres', () =>
