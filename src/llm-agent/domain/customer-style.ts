@@ -282,6 +282,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['¿Se lo agrego al carrito?', '¿Te lo agrego al carrito?'],
   ['Y si la que busca es ', 'Y si la que buscas es '],
   [', con gusto le averiguo cuándo', ', con gusto te averiguo cuándo'],
+  // L26 dead end: longer pair first, so its «te busco» wins over the short one.
+  [
+    '¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
+    '¿Quieres que le pregunte al equipo si lo pueden conseguir, o te busco otra cosa?',
+  ],
   ['¿Quiere que le pregunte al equipo', '¿Quieres que le pregunte al equipo'],
   // S2 cart summary «Agregar algo más» reply.
   [
@@ -340,10 +345,6 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   [
     'ya le avisé al equipo y se los comparto',
     'ya te avisé al equipo y te los comparto',
-  ],
-  [
-    '¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
-    '¿Quieres que le pregunte al equipo si lo pueden conseguir, o te busco otra cosa?',
   ],
   [
     'Los datos de pago de su nuevo pedido se los comparto en cuanto lo confirme.',
