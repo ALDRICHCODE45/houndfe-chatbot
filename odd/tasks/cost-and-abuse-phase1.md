@@ -16,9 +16,11 @@ Hard limits so abuse or chatter cannot burn the LLM budget. Phase 2 (abuse detec
 
 | ID  | Specs      | Route                                   | Commit |
 | --- | ---------- | --------------------------------------- | ------ |
-| T1  | S2–S7      | worker: cost guard, limits, caps, closings | |
+| T1  | S2–S7      | worker: cost guard, limits, caps, closings | 75d385e, 8e78c8c |
+| T2  | S2, S5, S6 | worker: review advisories (notice release, photo limit, purchase guard, AgentRunner) | |
 
 ## Log
 
 - **L1 (owner, 2026-11-18):** decisions quoted in S1; per-number limits «lo subiria a 40 por hora y 120 al dia.»
 - **L2 (worker T1, 2026-11-18):** S2–S7 implemented on `feat/cost-guard`, uncommitted. Persistent `CostGuardService` over migration 5100 (`llm_usage_ledger`, `llm_spend_periods`, `llm_sender_turns`, `llm_guard_notices`); one `admitTurn` statement per LLM turn covers the budget and the per-number limit. Every LLM call is output-capped and booked by source, and failures fail open with an `error` log. Price defaults are gpt-4o-mini (0.15/0.60 USD per Mtok). S6 closings are answered before the model; while a question, offer or confirmation is pending, or a purchase is in progress (cart or checkout draft), they go to the model. Evidence: RED observed for the new specs. Green: `pnpm test --findRelatedTests` (3904 passed), the new Postgres spec with `RUN_DOCKER_TESTS=1` (11/11), `tsc` and `eslint`. Docker suites with migration rollbacks: 14/15 pass. The exception is `postgres-mirror-media-cache.store.spec.ts`: its `down 1` assumes 4800 is the latest migration, which has not been true since 4900. Full suite not run (main agent).
+- **L3 (native review, 2026-11-18):** lineage review-32cfae347a29ec9a (lenses risk, resilience, reliability) required one correction: R3-greeting-as-closing (opening greetings «Buenas tardes» were answered as closings / silenced). Fixed in `8e78c8c` (greeting-only phrases need a real closing word; RED 6 → GREEN). Approved and acknowledged. Advisories to address next as T2: R4-notice-claimed-before-team-request (failed team request permanently consumes the notice → up to 24 h silence), R1-001 (photo vision bypasses the per-number limit), R3-purchase-in-progress-unproved (hasDraft null semantics untested with real services), R3/R4 AgentRunner route (budget reply without team request; confirm ops-only), R1-002/R3-admit-race and R3-retry-render-overshoot accepted (bounded overshoot).
