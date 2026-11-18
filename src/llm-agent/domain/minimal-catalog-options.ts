@@ -30,7 +30,14 @@ import {
  *     mentioned.
  *   - mismatch (L33, checked next): the query names a species AND a type
  *     word, and the item lacks one of them ("Jaula para aves" for
- *     "alimento para aves"). Treated exactly like contradicts.
+ *     "alimento para aves"), or (S14) its category names only another
+ *     product type ("Premios y snacks" for "alimento para gato").
+ *     Treated exactly like contradicts.
+ *
+ * S14: the item's `category.name` (when present) counts as item text with
+ * name/description for every check (species, life stage, type, exact), so
+ * "Alpiste 1 kg" in «Alimento para aves» is bird food. A null category keeps
+ * the word behaviour.
  */
 
 export type CatalogOptionClass =
@@ -116,6 +123,40 @@ const FOOD_STEMS: ReadonlySet<string> = stemSet([
   'croqueta',
 ]);
 
+/**
+ * S14: product-type groups a POS category can name. A category naming only
+ * groups other than the requested type's ("Premios y snacks" when food was
+ * asked) makes the item a mismatch for a species + type request.
+ */
+const TYPE_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
+  FOOD_STEMS,
+  stemSet([
+    'premio',
+    'premios',
+    'snack',
+    'snacks',
+    'golosina',
+    'golosinas',
+    'treat',
+    'treats',
+  ]),
+  stemSet([
+    'jaula',
+    'jaulas',
+    'accesorio',
+    'accesorios',
+    'juguete',
+    'juguetes',
+    'correa',
+    'correas',
+    'collar',
+    'collares',
+    'cama',
+    'camas',
+  ]),
+  stemSet(['arena', 'arenas']),
+];
+
 /** Attribute stems in a text, plus the "7+" marker. */
 function attributeStems(text: string | null | undefined): Set<string> {
   const out = stems(text);
@@ -127,8 +168,35 @@ function attributeStems(text: string | null | undefined): Set<string> {
 const hasAny = (set: ReadonlySet<string>, terms: ReadonlySet<string>) =>
   [...terms].some((term) => set.has(term));
 
+/** S14: the item's category name (null/absent/malformed → none). */
+const categoryName = (item: Partial<CatalogItemResponse>): string | null =>
+  typeof item.category?.name === 'string' ? item.category.name : null;
+
+/** Name, description and (S14) category name stems of an item. */
 const itemTextStems = (item: Partial<CatalogItemResponse>) =>
-  new Set([...attributeStems(item.name), ...attributeStems(item.description)]);
+  new Set([
+    ...attributeStems(item.name),
+    ...attributeStems(item.description),
+    ...attributeStems(categoryName(item)),
+  ]);
+
+/**
+ * S14: the category names product-type groups and none of them is a group
+ * of the requested type words (no category, no known group → false).
+ */
+function categoryOtherType(
+  types: readonly string[],
+  item: Partial<CatalogItemResponse>,
+): boolean {
+  const requested = TYPE_GROUPS.filter((group) =>
+    types.some((t) => group.has(t)),
+  );
+  if (requested.length === 0) return false;
+  const named = TYPE_GROUPS.filter((group) =>
+    hasAny(stems(categoryName(item)), group),
+  );
+  return named.length > 0 && !named.some((group) => requested.includes(group));
+}
 
 /** Species groups a stem set names. */
 const speciesGroups = (set: ReadonlySet<string>) =>
@@ -178,6 +246,9 @@ function speciesTypeCheck(
   const asked = speciesGroups(new Set(tokens.type));
   const types = tokens.type.filter((t) => !SPECIES_STEMS.has(t));
   if (asked.length === 0 || types.length === 0) return 'inactive';
+  // S14: a category of another type wins over the backend flag (category
+  // tokens take part in the backend match).
+  if (categoryOtherType(types, item)) return 'fail';
   if (item.match === 'all') return 'pass';
   const text = itemTextStems(item);
   const itemBrand = stems(item.brand);
@@ -284,8 +355,9 @@ function classify(
   if (speciesType === 'fail') return 'mismatch';
   const name = stems(item.name);
   const description = stems(item.description);
+  const category = stems(categoryName(item));
   const brand = stems(item.brand);
-  const everywhere = new Set([...name, ...description, ...brand]);
+  const everywhere = new Set([...name, ...description, ...category, ...brand]);
   if (
     item.match !== 'partial' &&
     (item.match === 'all' || all.every((t) => everywhere.has(t)))
@@ -293,7 +365,9 @@ function classify(
     return 'exact';
   if (
     speciesType === 'pass' ||
-    tokens.type.some((t) => name.has(t) || description.has(t))
+    tokens.type.some(
+      (t) => name.has(t) || description.has(t) || category.has(t),
+    )
   )
     return 'same_type';
   if (tokens.brand.some((t) => brand.has(t) || name.has(t)))
@@ -406,7 +480,11 @@ export function planCatalogOptions(
     const availability = deriveAvailability(item);
     const itemBrand = stems(item.brand);
     const hasBrand = tokens.brand.some((t) => itemBrand.has(t));
-    const itemText = new Set([...stems(item.name), ...stems(item.description)]);
+    const itemText = new Set([
+      ...stems(item.name),
+      ...stems(item.description),
+      ...stems(categoryName(item)),
+    ]);
     const hasType =
       tokens.type.length === 0 || tokens.type.some((t) => itemText.has(t));
     relevant.push({

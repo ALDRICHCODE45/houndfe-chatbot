@@ -1007,3 +1007,113 @@ describe('L33: species groups and species + type requests', () => {
     ).toHaveLength(1);
   });
 });
+
+describe('S14: category name joins name/description/brand', () => {
+  const cat = (id: string, name: string) => ({ id, name });
+  const alpiste = item(500, {
+    name: 'Alpiste 1 kg',
+    category: cat('c-aves', 'Alimento para aves'),
+  });
+  const jaula = item(501, {
+    name: 'Vision jaula para aves',
+    brand: 'Vision',
+    category: cat('c-jaulas', 'Jaulas y accesorios'),
+  });
+
+  it('«alimento para aves» + "Alpiste 1 kg" (no description) in «Alimento para aves» → offered with «Encontré estas opciones:»', () => {
+    expect(classifyCatalogItem('alimento para aves', alpiste, [alpiste])).toBe(
+      'exact',
+    );
+    const plan = planCatalogOptions('alimento aves', [jaula, alpiste])!;
+    const out = renderCatalogOptions([plan], {
+      restockAvailable: true,
+      style: usted,
+    });
+    expect(out.shown.map((i) => i.productId)).toEqual([alpiste.productId]);
+    expect(out.text.startsWith('Encontré estas opciones:')).toBe(true);
+    expect(out.text).toContain('*Alpiste 1 kg*');
+    expect(out.text).not.toContain('jaula');
+  });
+
+  it('"Vision jaula para aves" in «Jaulas y accesorios» → mismatch for «alimento para aves»', () => {
+    expect(classifyCatalogItem('alimento para aves', jaula, [jaula])).toBe(
+      'mismatch',
+    );
+  });
+
+  it('«alimento para gato»: Inaba Churu in «Premios y snacks» is not offered as food, Whiskas in «Alimento para gato» is', () => {
+    const inaba = item(510, {
+      name: 'Inaba Churu Atún',
+      brand: 'Inaba',
+      description: 'Premio cremoso, alimento complementario para gatos.',
+      category: cat('c-premios', 'Premios y snacks'),
+    });
+    const whiskas = item(511, {
+      name: 'Whiskas Pouch Pollo 85 g',
+      brand: 'Whiskas',
+      category: cat('c-gato', 'Alimento para gato'),
+    });
+    const items = [inaba, whiskas];
+    expect(classifyCatalogItem('alimento para gato', inaba, items)).toBe(
+      'mismatch',
+    );
+    // A backend `match: 'all'` (category tokens matched) does not override a
+    // category naming another type.
+    expect(
+      classifyCatalogItem(
+        'alimento para gato',
+        { ...inaba, match: 'all' },
+        items,
+      ),
+    ).toBe('mismatch');
+    expect(
+      planCatalogOptions('alimento para gato', items)!.options.map(
+        (o) => o.item.productId,
+      ),
+    ).toEqual([whiskas.productId]);
+  });
+
+  it('«croquetas para perro» + a name with no species in «Alimento para perro» → offered', () => {
+    const nupec = item(520, {
+      name: 'Nupec Adulto Razas Medianas 2 kg',
+      brand: 'Nupec',
+      category: cat('c-perro', 'Alimento para perro'),
+    });
+    expect(classifyCatalogItem('croquetas para perro', nupec, [nupec])).toBe(
+      'same_type',
+    );
+    expect(
+      planCatalogOptions('croquetas para perro', [nupec])!.options,
+    ).toHaveLength(1);
+  });
+
+  it('a category naming another species contradicts', () => {
+    const croquetas = item(530, {
+      name: 'Croquetas Adulto Pollo 3 kg',
+      category: cat('c-gato', 'Alimento para gato'),
+    });
+    expect(
+      classifyCatalogItem('croquetas para perro', croquetas, [croquetas]),
+    ).toBe('contradicts');
+    const plan = planCatalogOptions('croquetas para perro', [croquetas])!;
+    expect(plan.options).toEqual([]);
+    expect(plan.contradicted).toBe(true);
+  });
+
+  it('a category naming the opposing life stage contradicts', () => {
+    const adulto = item(540, {
+      name: 'Nupec Razas Pequeñas',
+      category: cat('c-adulto', 'Alimento perro adulto'),
+    });
+    expect(
+      classifyCatalogItem('croquetas para cachorro', adulto, [adulto]),
+    ).toBe('contradicts');
+  });
+
+  it('category null keeps the word behaviour (no category, no change)', () => {
+    const bare = item(550, { name: 'Alpiste 1 kg', category: null });
+    expect(classifyCatalogItem('alimento para aves', bare, [bare])).toBe(
+      'mismatch',
+    );
+  });
+});
