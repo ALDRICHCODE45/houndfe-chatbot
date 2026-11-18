@@ -24,9 +24,13 @@ import {
  *   - brand_only: a brand token in its brand (or name), no type token;
  *   - other: nothing matches (never offered);
  *   - contradicts (checked first): the query names a life stage or species
- *     and the item's name/description names only the opposing one
- *     (adult croquetas for "croquetas para cachorro"). Never offered, never
- *     counted, never mentioned.
+ *     and the item's name/description names only the opposing one / only
+ *     other species (adult croquetas for "croquetas para cachorro", fish
+ *     food for "alimento para aves"). Never offered, never counted, never
+ *     mentioned.
+ *   - mismatch (L33, checked next): the query names a species AND a type
+ *     word, and the item lacks one of them ("Jaula para aves" for
+ *     "alimento para aves"). Treated exactly like contradicts.
  */
 
 export type CatalogOptionClass =
@@ -34,21 +38,83 @@ export type CatalogOptionClass =
   | 'same_type'
   | 'brand_only'
   | 'other'
-  | 'contradicts';
+  | 'contradicts'
+  | 'mismatch';
+
+const stemSet = (words: readonly string[]) => new Set(words.map(stem));
 
 /**
- * S10/S13: opposing attribute groups, as folded singular stems. "7+" is
+ * S10/S13: opposing life-stage groups, as folded singular stems. "7+" is
  * matched on the raw text (it is not a word).
  */
-const CONTRADICTION_GROUPS: ReadonlyArray<
+const STAGE_GROUPS: ReadonlyArray<
   readonly [ReadonlySet<string>, ReadonlySet<string>]
 > = [
   [
     new Set(['cachorro', 'puppy', 'junior', 'gatito', 'kitten']),
     new Set(['adulto', 'adult', 'senior', '7+']),
   ],
-  [new Set(['perro', 'canino', 'dog']), new Set(['gato', 'felino', 'cat'])],
 ];
+
+/**
+ * L33: species groups (folded singular stems). An item naming only species
+ * of other groups contradicts the requested one. gatito/kitten and puppy
+ * also name their species ("Para gatitos" is cat food).
+ */
+const SPECIES_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
+  stemSet(['perro', 'perros', 'canino', 'caninos', 'dog', 'dogs', 'puppy']),
+  stemSet([
+    'gato',
+    'gatos',
+    'felino',
+    'felinos',
+    'cat',
+    'cats',
+    'gatito',
+    'gatitos',
+    'kitten',
+  ]),
+  stemSet([
+    'ave',
+    'aves',
+    'pájaro',
+    'pájaros',
+    'pajaro',
+    'pajaros',
+    'perico',
+    'pericos',
+    'canario',
+    'canarios',
+    'bird',
+    'birds',
+  ]),
+  stemSet(['pez', 'peces', 'fish']),
+  stemSet([
+    'roedor',
+    'roedores',
+    'hámster',
+    'hámsters',
+    'hamster',
+    'hamsters',
+    'cuyo',
+    'cuyos',
+  ]),
+  stemSet(['conejo', 'conejos']),
+  stemSet(['reptil', 'reptiles', 'tortuga', 'tortugas']),
+];
+const SPECIES_STEMS: ReadonlySet<string> = new Set(
+  SPECIES_GROUPS.flatMap((group) => [...group]),
+);
+
+/**
+ * L33: generic food words, interchangeable for the species + type check
+ * («croquetas para perro» keeps «Alimento seco para perros»).
+ */
+const FOOD_STEMS: ReadonlySet<string> = stemSet([
+  'alimento',
+  'comida',
+  'croqueta',
+]);
 
 /** Attribute stems in a text, plus the "7+" marker. */
 function attributeStems(text: string | null | undefined): Set<string> {
@@ -61,16 +127,23 @@ function attributeStems(text: string | null | undefined): Set<string> {
 const hasAny = (set: ReadonlySet<string>, terms: ReadonlySet<string>) =>
   [...terms].some((term) => set.has(term));
 
-/** The item names only the opposing side of a group the query asked for. */
+const itemTextStems = (item: Partial<CatalogItemResponse>) =>
+  new Set([...attributeStems(item.name), ...attributeStems(item.description)]);
+
+/** Species groups a stem set names. */
+const speciesGroups = (set: ReadonlySet<string>) =>
+  SPECIES_GROUPS.filter((group) => hasAny(set, group));
+
+/**
+ * The item names only the opposing side of a life-stage group the query
+ * asked for, or only species other than the requested ones.
+ */
 function contradicts(
   query: ReadonlySet<string>,
   item: Partial<CatalogItemResponse>,
 ): boolean {
-  const text = new Set([
-    ...attributeStems(item.name),
-    ...attributeStems(item.description),
-  ]);
-  return CONTRADICTION_GROUPS.some(([a, b]) =>
+  const text = itemTextStems(item);
+  const stage = STAGE_GROUPS.some(([a, b]) =>
     [
       [a, b],
       [b, a],
@@ -82,6 +155,41 @@ function contradicts(
         !hasAny(text, asked),
     ),
   );
+  if (stage) return true;
+  const asked = speciesGroups(query);
+  const named = speciesGroups(text);
+  return (
+    asked.length > 0 &&
+    named.length > 0 &&
+    !named.some((group) => asked.includes(group))
+  );
+}
+
+/**
+ * L33: the query names a species AND a type word (any significant word that
+ * is neither a brand nor a species): the item must name a requested species
+ * (unless it is of a requested brand) AND carry a type word (food words
+ * interchangeable). A backend `match: 'all'` is trusted.
+ */
+function speciesTypeCheck(
+  tokens: QueryTokens,
+  item: Partial<CatalogItemResponse>,
+): 'inactive' | 'pass' | 'fail' {
+  const asked = speciesGroups(new Set(tokens.type));
+  const types = tokens.type.filter((t) => !SPECIES_STEMS.has(t));
+  if (asked.length === 0 || types.length === 0) return 'inactive';
+  if (item.match === 'all') return 'pass';
+  const text = itemTextStems(item);
+  const itemBrand = stems(item.brand);
+  const brandExempt = tokens.brand.some((t) => itemBrand.has(t));
+  const speciesOk =
+    brandExempt || speciesGroups(text).some((group) => asked.includes(group));
+  const typeOk = types.some(
+    (t) =>
+      text.has(t) ||
+      (FOOD_STEMS.has(t) && [...FOOD_STEMS].some((f) => text.has(f))),
+  );
+  return speciesOk && typeOk ? 'pass' : 'fail';
 }
 
 /** S13c/d: fixed copy (usted; tú via customer-style phrase pairs). */
@@ -112,10 +220,12 @@ const DESCRIPTION_MAX = 90;
 /** Presentations listed per option line; the rest are counted. */
 const PRESENTATIONS_MAX = 6;
 
-const RANK: Record<
-  Exclude<CatalogOptionClass, 'other' | 'contradicts'>,
-  number
-> = {
+type OfferedClass = Exclude<
+  CatalogOptionClass,
+  'other' | 'contradicts' | 'mismatch'
+>;
+
+const RANK: Record<OfferedClass, number> = {
   exact: 0,
   same_type: 1,
   brand_only: 2,
@@ -170,6 +280,8 @@ function classify(
   const all = [...tokens.brand, ...tokens.type];
   if (all.length === 0) return 'other';
   if (contradicts(tokens.attributes, item)) return 'contradicts';
+  const speciesType = speciesTypeCheck(tokens, item);
+  if (speciesType === 'fail') return 'mismatch';
   const name = stems(item.name);
   const description = stems(item.description);
   const brand = stems(item.brand);
@@ -179,7 +291,10 @@ function classify(
     (item.match === 'all' || all.every((t) => everywhere.has(t)))
   )
     return 'exact';
-  if (tokens.type.some((t) => name.has(t) || description.has(t)))
+  if (
+    speciesType === 'pass' ||
+    tokens.type.some((t) => name.has(t) || description.has(t))
+  )
     return 'same_type';
   if (tokens.brand.some((t) => brand.has(t) || name.has(t)))
     return 'brand_only';
@@ -197,7 +312,7 @@ export function classifyCatalogItem(
 
 export interface CatalogOption {
   item: CatalogItemResponse;
-  cls: Exclude<CatalogOptionClass, 'other' | 'contradicts'>;
+  cls: OfferedClass;
   availability: ItemAvailability;
   agotado: boolean;
   /** A brand was requested and this item's brand is a different one. */
@@ -219,8 +334,9 @@ export interface CatalogOptionsPlan {
   /** Relevant products not shown (S13f narrowing question). */
   moreResults: number;
   /**
-   * Some items contradicted a stated life stage / species. With no option
-   * left the section is «{lo pedido} no tengo.» alone (no false match).
+   * Some items contradicted a stated life stage / species, or missed a
+   * species + type request (L33 mismatch). With no option left the section
+   * is the «{lo pedido} no tengo por ahora…» dead end (no false match).
    */
   contradicted: boolean;
 }
@@ -284,8 +400,9 @@ export function planCatalogOptions(
   let contradicted = false;
   for (const item of items) {
     const cls = classify(tokens, item);
-    if (cls === 'contradicts') contradicted = true;
-    if (cls === 'other' || cls === 'contradicts') continue;
+    if (cls === 'contradicts' || cls === 'mismatch') contradicted = true;
+    if (cls === 'other' || cls === 'contradicts' || cls === 'mismatch')
+      continue;
     const availability = deriveAvailability(item);
     const itemBrand = stems(item.brand);
     const hasBrand = tokens.brand.some((t) => itemBrand.has(t));

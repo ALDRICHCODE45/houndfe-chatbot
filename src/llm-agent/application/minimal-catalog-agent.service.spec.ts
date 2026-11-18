@@ -1381,6 +1381,53 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         );
       });
 
+      it("L33 prod case «alimento para aves manejan?😊»: jaula (species only), TetraMin (peces), Hill's (felino) → dead end with emoji, nothing listed", async () => {
+        const jaula = {
+          ...dentastix,
+          productId: pid(30),
+          name: 'Vision jaula para aves',
+          brand: 'Vision',
+          description: 'Jaula metálica para aves pequeñas.',
+        };
+        const tetra = {
+          ...dentastix,
+          productId: pid(31),
+          name: 'TetraMin Hojuelas para Peces Tropicales',
+          brand: 'Tetra',
+          description: 'Alimento en hojuelas para peces tropicales.',
+        };
+        const hills = {
+          ...dentastix,
+          productId: pid(32),
+          name: "Hill's Science Diet Felino Adult 7+",
+          brand: "Hill's",
+          description: 'Alimento seco para gatos sénior.',
+        };
+        const built = build(
+          [
+            call('s1', 'searchCatalog', { q: 'alimento para aves' }),
+            say('Encontré estas opciones: Vision jaula para aves.'),
+          ],
+          {},
+          { item: jaula, stock: lataStock },
+        );
+        built.chatbotApi.searchCatalog.mockResolvedValue([
+          jaula,
+          tetra,
+          hills,
+        ] as never);
+        await expect(
+          built.service.tryHandle({
+            senderId: SENDER,
+            text: 'alimento para aves manejan?😊',
+          }),
+        ).resolves.toEqual({
+          kind: 'handled',
+          reply:
+            'Alimento para aves no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa? 😊',
+        });
+      });
+
       it('no emoji in the customer style → no emoji in the rendered message', async () => {
         const { first } = await prodTurn([
           call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
