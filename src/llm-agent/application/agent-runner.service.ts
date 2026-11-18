@@ -19,6 +19,8 @@ import { TOOL_REGISTRY, type ToolRegistry } from '../domain/tool-registry.port';
 import { LLM_AGENT_SYSTEM_PROMPT } from '../domain/system-prompt';
 import { CostGuardService } from './cost-guard.service';
 import { LLM_BUDGET_EXHAUSTED_REPLY } from '../domain/llm-spend';
+import { withTeamPrefix } from '../../human-requests/domain/human-request-feed';
+import type { CustomerStyle } from '../domain/customer-style';
 
 export interface AgentRunnerConfig {
   systemPrompt: string;
@@ -43,6 +45,14 @@ export interface AgentRunnerHandleInput {
    * is silently omitted (never thrown, never defaulted).
    */
   inboundEvent?: RestockInboundEventIdentity;
+  /**
+   * Follow-ups S2: the text the staff member typed (routing ref stripped).
+   * Used only when the LLM budget is spent: it is relayed verbatim under the
+   * team prefix instead of the budget reply. Ignored while the budget lasts.
+   */
+  staffAnswer?: string;
+  /** The customer's style for the relay prefix (usted when absent). */
+  style?: CustomerStyle;
 }
 
 /**
@@ -189,7 +199,23 @@ export class AgentRunner {
     // budget team request: a person already handled the request this turn
     // resumes. A new customer-facing caller MUST use `admitTurn` and the
     // team request like the minimal route.
+    //
+    // Follow-ups S2 (owner): with the budget spent, the staff answer still
+    // reaches the customer without the LLM: the text the person typed,
+    // verbatim, under the styled team prefix (the same shape as the human
+    // request feed). Nothing is persisted (no model turn happened). Without
+    // a staff text there is nothing to relay: the budget reply stays.
     if (!(await this.costGuard.llmAllowed())) {
+      const staffAnswer = input.staffAnswer?.trim() ?? '';
+      // A structured staff decision («NO_RESTOCK», «YES_RESTOCK_IN_X_DAYS:3»)
+      // is a machine keyword, never customer copy: keep the budget reply.
+      const structuredKeyword = /^[A-Z][A-Z0-9_]*(?:\s*:.*)?$/s.test(
+        staffAnswer,
+      );
+      if (staffAnswer !== '' && !structuredKeyword)
+        return {
+          reply: withTeamPrefix(staffAnswer, null, input.style ?? null),
+        };
       return { reply: LLM_BUDGET_EXHAUSTED_REPLY };
     }
 

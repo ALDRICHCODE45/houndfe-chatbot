@@ -44,6 +44,24 @@ export type CostGuardOptions = Partial<CostGuardSettings> & {
   clock?: () => Date;
 };
 
+/**
+ * Follow-ups S4: after a notice was released (its team request failed), the
+ * next notice + request for the same sender and notice key waits this long.
+ */
+export const NOTICE_RELEASE_BACKOFF_MS = 15 * 60_000;
+/** Backoff entries older than this are dropped (bounded memory). */
+const NOTICE_BACKOFF_RETENTION_MS = 24 * 60 * 60_000;
+
+/**
+ * Where a refusal stands against the notice retry backoff:
+ *   - `none`: no failed notice on record (today's behaviour);
+ *   - `within`: a notice was released less than 15 min ago: behave as
+ *     already notified (the claim this refusal took is kept);
+ *   - `elapsed`: the last failed notice is 15 min old or more: a refusal
+ *     that is not a first notice retries the notice and the request.
+ */
+export type NoticeBackoff = 'none' | 'within' | 'elapsed';
+
 const PERIOD_LABEL: Record<LlmBudgetPeriod, string> = {
   day: 'daily',
   month: 'monthly',
@@ -73,6 +91,12 @@ export class CostGuardService {
   private readonly pending = new Set<Promise<void>>();
   /** Period keys (`day:…` / `month:…`) this process saw spent. */
   private readonly spent = new Set<string>();
+  /**
+   * S4: `sender \0 noticeKey` → when its notice was last released. In
+   * process only (documented): a restart forgets it, which costs at most one
+   * extra notice + request.
+   */
+  private readonly released = new Map<string, number>();
 
   /**
    * A bare number is the retired token ceiling (LLM_MONTHLY_TOKEN_CEILING),
@@ -173,15 +197,20 @@ export class CostGuardService {
    * stood for failed, so the next turn retries the notice and the request.
    * The key is recomputed from the clock: after a period change the claimed
    * key is stale anyway and the new period starts with a fresh notice.
-   * Never throws; a failure logs `error` (no sender id).
+   * Follow-ups S4: the release time is remembered (in process) so the
+   * caller can hold the next notice for `NOTICE_RELEASE_BACKOFF_MS`
+   * (`noticeBackoff`). Never throws; a failure logs `error` (no sender id).
    */
   async releaseNotice(
     senderId: string,
     verdict: LlmTurnVerdict,
   ): Promise<void> {
     if (this.store === undefined) return;
-    const key = noticeKeyOf(verdict, llmSpendPeriods(this.clock()));
+    const at = this.clock();
+    const key = noticeKeyOf(verdict, llmSpendPeriods(at));
     if (key === null) return;
+    this.pruneReleased(at.getTime());
+    this.released.set(backoffKey(senderId, key), at.getTime());
     try {
       await this.store.releaseNotice(senderId, key);
     } catch (error) {
@@ -189,6 +218,33 @@ export class CostGuardService {
         `LLM guard notice release failed (${verdict.kind}): ${describeError(error)}`,
       );
     }
+  }
+
+  /**
+   * S4: where this refusal stands against the 15-minute notice backoff. No
+   * I/O, never throws; `none` without a store or for an allowed turn.
+   */
+  noticeBackoff(senderId: string, verdict: LlmTurnVerdict): NoticeBackoff {
+    if (this.store === undefined) return 'none';
+    const at = this.clock();
+    const key = noticeKeyOf(verdict, llmSpendPeriods(at));
+    if (key === null) return 'none';
+    const releasedAt = this.released.get(backoffKey(senderId, key));
+    if (releasedAt === undefined) return 'none';
+    return at.getTime() - releasedAt < NOTICE_RELEASE_BACKOFF_MS
+      ? 'within'
+      : 'elapsed';
+  }
+
+  /** S4: the team request of this notice was created; forget the backoff. */
+  noticeDelivered(senderId: string, verdict: LlmTurnVerdict): void {
+    const key = noticeKeyOf(verdict, llmSpendPeriods(this.clock()));
+    if (key !== null) this.released.delete(backoffKey(senderId, key));
+  }
+
+  private pruneReleased(now: number): void {
+    for (const [key, at] of this.released)
+      if (now - at >= NOTICE_BACKOFF_RETENTION_MS) this.released.delete(key);
   }
 
   private async persist(
@@ -262,6 +318,9 @@ export class CostGuardService {
 
 const periodKey = (period: LlmBudgetPeriod, periods: LlmSpendPeriods) =>
   `${period}:${periods[period]}`;
+
+const backoffKey = (senderId: string, noticeKey: string) =>
+  `${senderId}\u0000${noticeKey}`;
 
 const safeTokens = (value: number) =>
   Number.isFinite(value) && value > 0 ? value : 0;

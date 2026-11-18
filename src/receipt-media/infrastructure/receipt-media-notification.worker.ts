@@ -191,6 +191,11 @@ const renderUsted = (
       return folio === null
         ? TEXT.RECEIPT_SALE_ALREADY_PAID
         : `Su pedido ${folio} ya está pagado.`;
+    // Follow-ups S7: the order was a pay-in-store hold the sweep cancelled.
+    case 'RECEIPT_SALE_NOT_PAYABLE':
+      return args.payInStoreHold === true
+        ? `${folio === null ? 'Su pedido' : `Su pedido ${folio}`} se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.`
+        : TEXT.RECEIPT_SALE_NOT_PAYABLE;
     default:
       return TEXT[row.templateKey];
   }

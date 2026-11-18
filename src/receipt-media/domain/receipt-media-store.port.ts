@@ -131,6 +131,9 @@ export interface UploadTemplateArgs {
   /** Present with `totalCents` only when the extracted amount differs. */
   extractedAmountCents?: number;
   totalCents?: number;
+  /** Follow-ups S7: only on a `RECEIPT_SALE_NOT_PAYABLE` refusal of an
+   * order the customer held to pay in store (the hold sweep cancelled it). */
+  payInStoreHold?: true;
 }
 
 /** The customer messages a definite (4xx) upload failure can produce. */

@@ -171,7 +171,7 @@ export class ReceiptAttachmentService {
 
   private async failure(
     error: unknown,
-    { fence, signal }: UploadInvocation,
+    { fence, signal, order }: UploadInvocation,
     folioArgs: UploadTemplateArgs,
     replacedFields: ReceiptUploadFields | undefined,
   ): Promise<UploadReport> {
@@ -188,7 +188,9 @@ export class ReceiptAttachmentService {
           templateKey:
             (errorCode === null ? undefined : DEFINITE_TEMPLATE[errorCode]) ??
             'RECEIPT_ATTACH_DEFINITE_FAILURE',
-          templateArgs: folioArgs,
+          templateArgs: notPayableHold(errorCode, order)
+            ? { ...folioArgs, payInStoreHold: true }
+            : folioArgs,
         }),
       };
     }
@@ -204,6 +206,15 @@ export class ReceiptAttachmentService {
     };
   }
 }
+
+/** Follow-ups S7: a 409 SALE_NOT_PAYABLE on an order the customer held to
+ * pay in store means the hold sweep cancelled it (HOLD_EXPIRED). */
+const notPayableHold = (
+  errorCode: string | null,
+  order: PlacedOrder | null,
+): boolean =>
+  errorCode === RECEIPT_UPLOAD_ERROR.SALE_NOT_PAYABLE &&
+  order?.payInStoreHold === true;
 
 /** N18 fallback trigger: the backend refused the `extracted` part. */
 const isInvalidExtracted = (error: unknown): boolean => {

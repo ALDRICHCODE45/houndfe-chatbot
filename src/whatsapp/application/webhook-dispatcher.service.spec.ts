@@ -886,6 +886,44 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
       expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-resolve');
     });
 
+    it('follow-ups S2: budget spent → the staff text (ref stripped) reaches the CUSTOMER under the styled team prefix, no LLM', async () => {
+      humanHandoff.isOpsSender.mockReturnValue(true);
+      humanHandoff.resolveReply.mockResolvedValue({
+        kind: 'resolved',
+        customerId: CUSTOMER,
+        ref: 'HF-abc123def456',
+        resolution: {
+          decision: 'GENERIC',
+          text: 'Sí hay, le llega el jueves.',
+        },
+        syntheticUserText:
+          '[Resolución del agente humano (HF-abc123def456)] El agente responde: "Sí hay, le llega el jueves.". Comparte esa respuesta con el cliente.',
+      });
+      store.get.mockResolvedValue(null);
+      jest.spyOn(costGuard, 'llmAllowed').mockResolvedValue(false);
+      const customerStyle = jest
+        .fn()
+        .mockReturnValue({ register: 'tu', emojis: false, tone: 'neutral' });
+      (minimalAgent as unknown as { customerStyle: jest.Mock }).customerStyle =
+        customerStyle;
+
+      await service.dispatch(
+        opsEvent(
+          'wamid.ops-spent',
+          'HF-abc123def456  Sí hay, le llega el jueves.',
+        ),
+      );
+
+      expect(llm.run).not.toHaveBeenCalled();
+      expect(customerStyle).toHaveBeenCalledWith(CUSTOMER);
+      expect(sender.sendText).toHaveBeenCalledTimes(1);
+      expect(sender.sendText).toHaveBeenCalledWith({
+        to: CUSTOMER,
+        text: 'Te comparto la respuesta del equipo:\nSí hay, le llega el jueves.',
+      });
+      expect(dedup.markSeen).toHaveBeenCalledWith('wamid.ops-spent');
+    });
+
     it('no_pending outcome: ASK_FOR_REF goes back to the OPS number, no agent run', async () => {
       humanHandoff.isOpsSender.mockReturnValue(true);
       humanHandoff.resolveReply.mockResolvedValue({
@@ -1931,18 +1969,80 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         expect(ingress.admit).toHaveBeenCalledTimes(2);
       });
 
-      it('placed sale + product caption from a limited sender: no vision call (not the receipt flow)', async () => {
-        conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
-        admitPhotoTurn.mockResolvedValueOnce({
-          kind: 'handled',
-          reply: '',
-          silent: true,
+      describe('follow-ups S3: a placed sale skips the photo admission', () => {
+        const refuseAll = () =>
+          admitPhotoTurn.mockResolvedValue({
+            kind: 'handled',
+            reply: '',
+            silent: true,
+          });
+
+        it('captioned receipt from a limited sender: never admitted, vision sees a receipt → receipt flow', async () => {
+          conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+          refuseAll();
+          productImage.recognize.mockResolvedValueOnce(RECEIPT_DESCRIPTION);
+          await service.dispatch(
+            mediaEvent('wamid.s3a', {
+              type: 'image',
+              caption: '¿tienen este?',
+            }),
+          );
+          expect(admitPhotoTurn).not.toHaveBeenCalled();
+          expect(ingress.admit).toHaveBeenCalledWith(
+            expect.objectContaining({ webhookMessageId: 'wamid.s3a' }),
+          );
+          expect(minimalAgent.tryHandle).not.toHaveBeenCalled();
         });
-        await service.dispatch(
-          mediaEvent('wamid.lim6', { type: 'image', caption: '¿hay de este?' }),
-        );
-        expect(productImage.recognize).not.toHaveBeenCalled();
-        expect(ingress.admit).not.toHaveBeenCalled();
+
+        it('budget spent (vision skipped for budget): the photo goes to receipt intake, which uploads without extraction', async () => {
+          conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+          refuseAll();
+          productImage.recognize.mockResolvedValueOnce({
+            kind: 'unavailable',
+            reason: 'budget',
+          });
+          await service.dispatch(
+            mediaEvent('wamid.s3b', { type: 'image', caption: '¿lo tienen?' }),
+          );
+          expect(admitPhotoTurn).not.toHaveBeenCalled();
+          expect(ingress.admit).toHaveBeenCalledWith(
+            expect.objectContaining({ webhookMessageId: 'wamid.s3b' }),
+          );
+          expect(sender.sendText).not.toHaveBeenCalledWith(
+            expect.objectContaining({
+              text: expect.stringMatching(/no puedo atenderle/) as unknown,
+            }),
+          );
+        });
+
+        it('a product photo with a placed sale runs the turn UNADMITTED, so the agent applies the limit once', async () => {
+          conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
+          productImage.recognize.mockResolvedValueOnce(PRODUCT);
+          await service.dispatch(
+            mediaEvent('wamid.s3c', {
+              type: 'image',
+              caption: '¿hay de este?',
+            }),
+          );
+          expect(admitPhotoTurn).not.toHaveBeenCalled();
+          expect(ingress.admit).not.toHaveBeenCalled();
+          expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+            expect.not.objectContaining({ llmAdmitted: true }),
+          );
+        });
+
+        it('no placed sale: a product question photo from a limited sender is still refused before vision', async () => {
+          refuseAll();
+          await service.dispatch(
+            mediaEvent('wamid.s3d', {
+              type: 'image',
+              caption: '¿hay de este?',
+            }),
+          );
+          expect(admitPhotoTurn).toHaveBeenCalledTimes(1);
+          expect(productImage.recognize).not.toHaveBeenCalled();
+          expect(ingress.admit).not.toHaveBeenCalled();
+        });
       });
     });
 

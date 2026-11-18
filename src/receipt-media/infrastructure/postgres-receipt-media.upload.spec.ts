@@ -160,6 +160,34 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
     },
   );
 
+  it('follow-ups S7: commits SALE_NOT_PAYABLE of a held order with the hold flag; any other flag value is fenced', async () => {
+    const { id, fence } = await downloaded();
+    const args = { folio: 'F-12', payInStoreHold: true } as const;
+    await expect(
+      store.commitUploadDefiniteFailure({
+        ...fence,
+        httpStatus: 409,
+        errorCode: 'SALE_NOT_PAYABLE',
+        templateKey: 'RECEIPT_SALE_NOT_PAYABLE',
+        templateArgs: { folio: 'F-12', payInStoreHold: false as never },
+      }),
+    ).resolves.toEqual({ kind: 'fenced' });
+    const out = await store.commitUploadDefiniteFailure({
+      ...fence,
+      httpStatus: 409,
+      errorCode: 'SALE_NOT_PAYABLE',
+      templateKey: 'RECEIPT_SALE_NOT_PAYABLE',
+      templateArgs: args,
+    });
+    expect(out).toMatchObject({
+      kind: 'committed',
+      receipt: { status: 'FAILED', lastErrorCode: 'SALE_NOT_PAYABLE' },
+      intent: { templateKey: 'RECEIPT_SALE_NOT_PAYABLE', templateArgs: args },
+    });
+    const rows = await intents(id);
+    expect(rows).toHaveLength(1);
+  });
+
   it('retries an unknown outcome with backoff, sends the registering message once, and terminalizes at the cap', async () => {
     const { id, fence: first } = await downloaded();
     let fence = first;

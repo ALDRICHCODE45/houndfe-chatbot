@@ -400,6 +400,15 @@ function renderDigest(request: HumanHandoffRequest): string {
 }
 
 /**
+ * Follow-ups S2: the text the staff member typed, without the `HF-<id>`
+ * routing ref, trimmed. Relayed verbatim to the customer when the LLM budget
+ * is spent (the resume turn cannot be phrased by the model).
+ */
+export function staffAnswerText(text: string): string {
+  return text.replace(/\bHF-[A-Za-z0-9_-]{4,32}\b/gi, '').trim();
+}
+
+/**
  * Parse the agent's reply text into a `HumanHandoffResolution`.
  *
  * Strategy (case/whitespace tolerant):
@@ -414,7 +423,7 @@ function parseResolution(
   text: string,
   kind: HumanHandoffKind,
 ): HumanHandoffResolution {
-  const stripped = text.replace(/\bHF-[A-Za-z0-9_-]{4,32}\b/gi, '').trim();
+  const stripped = staffAnswerText(text);
 
   const restockMatch = /YES_RESTOCK_IN_X_DAYS\s*:\s*(\d+)/i.exec(stripped);
   if (restockMatch) {

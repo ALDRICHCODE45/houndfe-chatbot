@@ -15,6 +15,9 @@ export interface PlacedOrder {
   totalCents: number | null;
   /** Backend order folio shown to the customer; `null` when absent. */
   folio: string | null;
+  /** Follow-ups S7: the customer held this pickup order to pay in store
+   * (`placedSale.pickup.held`, recorded by the tap). Absent otherwise. */
+  payInStoreHold?: true;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -25,9 +28,11 @@ export function readPlacedOrder(
 ): PlacedOrder | null {
   const cart = state?.data?.minimalCart;
   if (!isRecord(cart) || !isRecord(cart.placedSale)) return null;
-  const { saleId, totalCents, folio } = cart.placedSale;
+  const { saleId, totalCents, folio, pickup } = cart.placedSale;
   if (typeof saleId !== 'string' || !UUID.test(saleId)) return null;
+  const held = isRecord(pickup) && pickup.held === true;
   return {
+    ...(held ? { payInStoreHold: true as const } : {}),
     saleId,
     totalCents:
       Number.isSafeInteger(totalCents) && (totalCents as number) >= 0

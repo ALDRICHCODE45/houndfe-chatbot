@@ -178,6 +178,7 @@ export class MinimalPaymentService {
     if (typeof this.api.setPayInStoreIntent !== 'function') return failed;
     try {
       const hold = await this.api.setPayInStoreIntent(sale.saleId);
+      if (sale.pickup.held !== true) await this.markHeld(senderId, sale.saleId);
       return {
         reply: payInStoreHeldReply({
           folio: hold.folio ?? sale.folio,
@@ -216,12 +217,18 @@ export class MinimalPaymentService {
       return {
         reply: `Pedido ${orderLabel(sale)}. Total: ${mxn(sale.totalCents)}.\n${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}`,
       };
+    // Follow-ups S6: no «Pagar en tienda» button while a receipt of this
+    // order is in review (a tap or a typed «en tienda» still gets the
+    // in-review reply). Read only when the button could be shown; an
+    // unreadable receipt state keeps today's offer (fails open).
+    const payInStore =
+      this.canPayInStore(sale) && !(await this.receiptInReview(senderId, sale));
     return {
       reply: `${paymentLead(sale)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
       interactive: paymentMethodButtons(
         sale.saleId,
         MINIMAL_PAYMENT_BUTTONS_PROMPT,
-        paymentMethodsFor({ payInStore: this.canPayInStore(sale) }),
+        paymentMethodsFor({ payInStore }),
       ),
       paymentOffer: { saleId: sale.saleId },
     };
@@ -326,6 +333,38 @@ export class MinimalPaymentService {
       await this.setMarker(senderId, sale.saleId, false);
     }
     return reply;
+  }
+
+  /**
+   * Follow-ups S7: records that the customer held `saleId` to pay in store
+   * (`placedSale.pickup.held`). One CAS attempt, never retried and never
+   * thrown: without the record a later SALE_NOT_PAYABLE receipt refusal
+   * keeps today's generic text.
+   */
+  private async markHeld(senderId: string, saleId: string): Promise<void> {
+    let saved = false;
+    try {
+      const read = await this.read(senderId);
+      const sale = read?.cart.placedSale;
+      if (
+        read !== null &&
+        sale?.saleId === saleId &&
+        sale.pickup !== undefined &&
+        typeof this.store.commitMinimalCart === 'function'
+      )
+        saved = await this.store.commitMinimalCart(
+          senderId,
+          read.raw,
+          {
+            ...read.cart,
+            placedSale: { ...sale, pickup: { ...sale.pickup, held: true } },
+          },
+          new Date().toISOString(),
+        );
+    } catch {
+      saved = false;
+    }
+    if (!saved) this.logger.warn('pay in store hold not recorded locally');
   }
 
   /** Fails open: an unreadable receipt state never withholds the details. */

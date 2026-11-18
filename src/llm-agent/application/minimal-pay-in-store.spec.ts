@@ -442,6 +442,33 @@ describe('pay in store: the offer (S3)', () => {
     ]);
   });
 
+  it('follow-ups S6: a receipt in review hides [Pagar en tienda] from the placed-order status', async () => {
+    const h = setup();
+    await h.seedPlacedSale(PICKUP);
+    h.receipts.hasReceiptInReview.mockResolvedValue(true);
+    const decision = await h.turn('mi resumen');
+    expect(buttons(decision)?.map((b) => b.id)).toEqual([
+      `pay:transfer:${SALE}`,
+    ]);
+    expect(h.receipts.hasReceiptInReview).toHaveBeenCalledWith(SENDER, SALE);
+    // A typed «en tienda» is still answered with the in-review text.
+    expect(reply(await h.turn('en tienda'))).toContain(
+      'Ya recibimos su comprobante del pedido B-0042',
+    );
+    expect(h.api.setPayInStoreIntent).not.toHaveBeenCalled();
+  });
+
+  it('follow-ups S6: an unreadable receipt state keeps today’s offer (fails open)', async () => {
+    const h = setup();
+    await h.seedPlacedSale(PICKUP);
+    h.receipts.hasReceiptInReview.mockRejectedValue(new Error('db down'));
+    const decision = await h.turn('mi resumen');
+    expect(buttons(decision)?.map((b) => b.id)).toEqual([
+      `pay:transfer:${SALE}`,
+      `pay:in_store:${SALE}`,
+    ]);
+  });
+
   it('a paid pickup order never shows [Pagar en tienda] (paid rule keeps priority)', async () => {
     const h = setup();
     await h.seedPlacedSale({ ...PICKUP, paid: true });
@@ -480,6 +507,31 @@ describe('pay in store: the tap (S3)', () => {
     expect(h.api.setPayInStoreIntent).toHaveBeenCalledWith(SALE);
     expect(h.api.getPaymentDetails).not.toHaveBeenCalled();
     expect(h.seen).toHaveLength(llmCalls);
+  });
+
+  it('follow-ups S7: a held order is recorded on placedSale.pickup (held) so a later receipt refusal can explain the expiry', async () => {
+    const h = setup();
+    await h.seedPlacedSale(PICKUP);
+    expect(reply(await tapInStore(h))).toBe(HELD);
+    expect((await h.placedSale())?.pickup).toEqual({
+      checkoutKey: KEY,
+      location: LOCATION,
+      held: true,
+    });
+    // A re-tap keeps it; the order still reads and offers as before.
+    expect(reply(await tapInStore(h))).toBe(HELD);
+    expect((await h.placedSale())?.pickup?.held).toBe(true);
+  });
+
+  it('follow-ups S7: a failed PATCH records no hold', async () => {
+    const h = setup();
+    await h.seedPlacedSale(PICKUP);
+    h.api.setPayInStoreIntent.mockRejectedValueOnce(new Error('boom'));
+    expect(reply(await tapInStore(h))).toBe(FAILED);
+    expect((await h.placedSale())?.pickup).toEqual({
+      checkoutKey: KEY,
+      location: LOCATION,
+    });
   });
 
   it('a re-tap calls PATCH once more (idempotent upstream) and repeats the same text', async () => {

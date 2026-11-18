@@ -1,7 +1,11 @@
 import { Logger } from '@nestjs/common';
 import type { LlmSpendStore } from '../domain/llm-spend';
 import { InMemoryLlmSpendStore } from '../infrastructure/in-memory-llm-spend.store';
-import { CostGuardService, type CostGuardOptions } from './cost-guard.service';
+import {
+  CostGuardService,
+  NOTICE_RELEASE_BACKOFF_MS,
+  type CostGuardOptions,
+} from './cost-guard.service';
 
 /**
  * S2 persistent spend cap + S5 per-number limit (cost protection phase 1).
@@ -167,6 +171,38 @@ describe('CostGuardService (persistent spend cap)', () => {
     await expect(spent.admitTurn(sender)).resolves.toMatchObject({
       firstNotice: true,
     });
+  });
+
+  it('follow-ups S4: a released notice is in backoff for 15 minutes per sender and notice key', async () => {
+    let at = NOW.getTime();
+    const g = guard(new InMemoryLlmSpendStore(), { clock: () => new Date(at) });
+    const limited = {
+      kind: 'sender_limited',
+      window: 'hour',
+      firstNotice: true,
+    } as const;
+    const budget = {
+      kind: 'budget_exhausted',
+      period: 'day',
+      firstNotice: true,
+    } as const;
+    const sender = '5215550001111';
+    expect(g.noticeBackoff(sender, limited)).toBe('none');
+    await g.releaseNotice(sender, limited);
+    expect(g.noticeBackoff(sender, limited)).toBe('within');
+    expect(g.noticeBackoff(sender, budget)).toBe('none');
+    expect(g.noticeBackoff(`${sender}9`, limited)).toBe('none');
+    expect(g.noticeBackoff(sender, { kind: 'allowed' })).toBe('none');
+    at += NOTICE_RELEASE_BACKOFF_MS - 1;
+    expect(g.noticeBackoff(sender, limited)).toBe('within');
+    at += 1;
+    expect(g.noticeBackoff(sender, limited)).toBe('elapsed');
+    g.noticeDelivered(sender, limited);
+    expect(g.noticeBackoff(sender, limited)).toBe('none');
+    // Without a store (harnesses) there is never a backoff.
+    const bare = new CostGuardService();
+    await bare.releaseNotice(sender, limited);
+    expect(bare.noticeBackoff(sender, limited)).toBe('none');
   });
 
   it('never touches the store to release an allowed verdict and fails soft on a release error', async () => {

@@ -298,6 +298,61 @@ describe('ReceiptAttachmentService.upload (R2)', () => {
     },
   );
 
+  describe('follow-ups S7: a receipt on an expired pay-in-store hold', () => {
+    const HOLD = {
+      saleId: SALE_ID,
+      totalCents: 150000,
+      folio: 'F-0042',
+      payInStoreHold: true,
+    } as const;
+
+    it('409 SALE_NOT_PAYABLE on a held order marks the notice as a hold expiry', async () => {
+      const { service, client, store } = fixture();
+      client.uploadReceipt.mockRejectedValue(
+        new ChatbotApiError(
+          'refused',
+          409,
+          {},
+          RECEIPT_UPLOAD_ERROR.SALE_NOT_PAYABLE,
+        ),
+      );
+      await service.upload(invocation({ order: HOLD }));
+      expect(store.commitUploadDefiniteFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          templateKey: 'RECEIPT_SALE_NOT_PAYABLE',
+          templateArgs: { folio: 'F-0042', payInStoreHold: true },
+        }),
+      );
+    });
+
+    it.each([
+      [
+        'another refusal of a held order',
+        RECEIPT_UPLOAD_ERROR.SALE_ALREADY_PAID,
+      ],
+      ['an order without a hold', RECEIPT_UPLOAD_ERROR.SALE_NOT_PAYABLE],
+    ])('%s keeps today’s args', async (name, code) => {
+      const { service, client, store } = fixture();
+      client.uploadReceipt.mockRejectedValue(
+        new ChatbotApiError('refused', 409, {}, code),
+      );
+      await service.upload(
+        name.startsWith('another') ? invocation({ order: HOLD }) : invocation(),
+      );
+      expect(
+        store.commitUploadDefiniteFailure.mock.calls[0][0].templateArgs,
+      ).toEqual({ folio: 'F-0042' });
+    });
+
+    it('an accepted upload of a held order carries no hold flag', async () => {
+      const { service, store } = fixture();
+      await service.upload(invocation({ order: HOLD }));
+      expect(store.commitUploadSuccess.mock.calls[0][0].templateArgs).toEqual({
+        folio: 'F-0042',
+      });
+    });
+  });
+
   it.each([
     [
       '502 RECEIPT_STORAGE_FAILED',

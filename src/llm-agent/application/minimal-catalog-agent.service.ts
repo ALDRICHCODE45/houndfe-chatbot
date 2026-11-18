@@ -1495,7 +1495,15 @@ export class MinimalCatalogAgentService {
   }): Promise<(CustomerReply & { silent?: true }) | null> {
     const verdict = await this.costGuard.admitTurn(input.senderId);
     if (verdict.kind === 'allowed') return null;
-    if (verdict.kind === 'sender_limited' && !verdict.firstNotice) {
+    // Follow-ups S4: a team request that keeps failing costs at most one
+    // notice + request per 15 minutes. Within the backoff a first notice
+    // behaves as already notified (its claim is kept); once it elapses, a
+    // later refusal retries the notice and the request.
+    const backoff = this.costGuard.noticeBackoff(input.senderId, verdict);
+    const firstNotice = verdict.firstNotice
+      ? backoff !== 'within'
+      : backoff === 'elapsed';
+    if (verdict.kind === 'sender_limited' && !firstNotice) {
       this.logger.log(
         `llm sender limit (${verdict.window}): no reply, no LLM call`,
       );
@@ -1511,8 +1519,11 @@ export class MinimalCatalogAgentService {
     // R4: a notice whose team request failed is given back, so the next turn
     // retries the notice and the request instead of a silent window (sender
     // limit) or a «ya le avisé» that nobody received (budget).
-    if (verdict.firstNotice && !(await this.notifyTeam(input, summary)))
-      await this.costGuard.releaseNotice(input.senderId, verdict);
+    if (firstNotice) {
+      if (await this.notifyTeam(input, summary))
+        this.costGuard.noticeDelivered(input.senderId, verdict);
+      else await this.costGuard.releaseNotice(input.senderId, verdict);
+    }
     this.logger.warn(
       verdict.kind === 'budget_exhausted'
         ? `llm budget spent (${verdict.period}): fixed reply, no LLM call`

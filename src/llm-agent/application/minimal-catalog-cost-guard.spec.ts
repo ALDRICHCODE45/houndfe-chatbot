@@ -117,6 +117,17 @@ const spend = async (store: InMemoryLlmSpendStore, usd: number) =>
     caps: { dayUsd: 1, monthUsd: 200 },
   });
 
+const BACKOFF_MS = 15 * 60_000;
+const movingClock = () => {
+  let at = NOW.getTime();
+  return {
+    now: () => new Date(at),
+    advance: (ms: number) => {
+      at += ms;
+    },
+  };
+};
+
 const say1 = (service: MinimalCatalogAgentService, text: string) =>
   service.tryHandle({
     senderId: SENDER,
@@ -309,10 +320,13 @@ describe('MinimalCatalogAgentService cost protection (phase 1)', () => {
         () => Promise.resolve({ kind: 'failed', reason: 'insert_failed' }),
       ],
     ])(
-      'sender limit: askTeam %s → the next turn retries the notice and the request',
+      'sender limit: askTeam %s → the notice and the request are retried after the 15-minute backoff (S4)',
       async (_label, failure) => {
         const store = new InMemoryLlmSpendStore();
-        const { service, captured, team } = build({ guard: guardWith(store) });
+        const clock = movingClock();
+        const { service, captured, team } = build({
+          guard: guardWith(store, { clock: clock.now }),
+        });
         await say1(service, 'uno');
         await say1(service, 'dos');
         team.askTeam.mockImplementationOnce(failure as never);
@@ -320,7 +334,8 @@ describe('MinimalCatalogAgentService cost protection (phase 1)', () => {
           kind: 'handled',
           reply: SENDER_LIMIT_REPLY,
         });
-        // Not silenced: the notice was released, so it is retried.
+        clock.advance(BACKOFF_MS);
+        // Not silenced for good: the notice was released, so it is retried.
         await expect(say1(service, 'cuatro')).resolves.toEqual({
           kind: 'handled',
           reply: SENDER_LIMIT_REPLY,
@@ -335,15 +350,94 @@ describe('MinimalCatalogAgentService cost protection (phase 1)', () => {
       },
     );
 
-    it('budget: a failed request is retried on the next turn, then once per period', async () => {
+    it('budget: a failed request is retried after the backoff, then once per period', async () => {
       const store = new InMemoryLlmSpendStore();
       await spend(store, 1);
-      const { service, team } = build({ guard: guardWith(store) });
+      const clock = movingClock();
+      const { service, team } = build({
+        guard: guardWith(store, { clock: clock.now }),
+      });
       team.askTeam.mockRejectedValueOnce(new Error('db down'));
       await say1(service, 'busco croquetas');
+      clock.advance(BACKOFF_MS);
       await say1(service, 'y para gato?');
       await say1(service, 'hola?');
+      clock.advance(BACKOFF_MS);
+      await say1(service, '¿sigue?');
       expect(team.askTeam).toHaveBeenCalledTimes(2);
+    });
+
+    describe('follow-ups S4: notice retry backoff', () => {
+      const failing = (team: { askTeam: jest.Mock }) =>
+        team.askTeam.mockRejectedValue(new Error('db down'));
+
+      it('sender limit: a request that keeps failing costs one notice + one request per 15 minutes; silence in between', async () => {
+        const clock = movingClock();
+        const { service, captured, team } = build({
+          guard: guardWith(new InMemoryLlmSpendStore(), { clock: clock.now }),
+        });
+        await say1(service, 'uno');
+        await say1(service, 'dos');
+        failing(team);
+        await expect(say1(service, 'tres')).resolves.toEqual({
+          kind: 'handled',
+          reply: SENDER_LIMIT_REPLY,
+        });
+        const silent = { kind: 'handled', reply: '', silent: true };
+        await expect(say1(service, 'cuatro')).resolves.toEqual(silent);
+        clock.advance(BACKOFF_MS - 1);
+        await expect(say1(service, 'cinco')).resolves.toEqual(silent);
+        expect(team.askTeam).toHaveBeenCalledTimes(1);
+        clock.advance(1);
+        await expect(say1(service, 'seis')).resolves.toEqual({
+          kind: 'handled',
+          reply: SENDER_LIMIT_REPLY,
+        });
+        await expect(say1(service, 'siete')).resolves.toEqual(silent);
+        expect(team.askTeam).toHaveBeenCalledTimes(2);
+        // The request finally goes through: later refusals stay silent.
+        team.askTeam.mockResolvedValue({ kind: 'registered', requestId: 'r' });
+        clock.advance(BACKOFF_MS);
+        await expect(say1(service, 'ocho')).resolves.toEqual({
+          kind: 'handled',
+          reply: SENDER_LIMIT_REPLY,
+        });
+        clock.advance(BACKOFF_MS);
+        await expect(say1(service, 'nueve')).resolves.toEqual(silent);
+        expect(team.askTeam).toHaveBeenCalledTimes(3);
+        expect(captured).toHaveLength(2);
+      });
+
+      it('budget: within the backoff the fixed reply goes out without a new request', async () => {
+        const store = new InMemoryLlmSpendStore();
+        await spend(store, 1);
+        const clock = movingClock();
+        const { service, captured, team } = build({
+          guard: guardWith(store, { clock: clock.now }),
+        });
+        failing(team);
+        for (const text of ['a', 'b', 'c'])
+          await expect(say1(service, text)).resolves.toEqual({
+            kind: 'handled',
+            reply: LLM_BUDGET_EXHAUSTED_REPLY,
+          });
+        expect(team.askTeam).toHaveBeenCalledTimes(1);
+        clock.advance(BACKOFF_MS);
+        await say1(service, 'd');
+        await say1(service, 'e');
+        expect(team.askTeam).toHaveBeenCalledTimes(2);
+        expect(captured).toHaveLength(0);
+      });
+
+      it('the backoff is per sender: another number still gets its own first notice and request', async () => {
+        const store = new InMemoryLlmSpendStore();
+        await spend(store, 1);
+        const { service, team } = build({ guard: guardWith(store) });
+        failing(team);
+        await say1(service, 'a');
+        await service.tryHandle({ senderId: `${SENDER}9`, text: 'hola' });
+        expect(team.askTeam).toHaveBeenCalledTimes(2);
+      });
     });
 
     it('logs the failure without the phone number or the text', async () => {

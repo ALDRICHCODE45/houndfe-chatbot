@@ -16,6 +16,22 @@ describe('readPlacedOrder (S7 compatibility)', () => {
     ).toEqual({ saleId: SALE, folio: 'B-0042', totalCents: 3000 });
   });
 
+  it('follow-ups S7: flags a pay-in-store hold (the tap recorded pickup.held)', () => {
+    const base = { saleId: SALE, folio: 'B-0042', totalCents: 3000 };
+    const pickup = {
+      checkoutKey: '66666666-6666-4666-8666-666666666666',
+      location: null,
+    };
+    expect(
+      readPlacedOrder(state({ ...base, pickup: { ...pickup, held: true } })),
+    ).toEqual({ ...base, payInStoreHold: true });
+    // A pickup order the customer never held, or a malformed flag: no hold.
+    expect(readPlacedOrder(state({ ...base, pickup }))).toEqual(base);
+    expect(
+      readPlacedOrder(state({ ...base, pickup: { ...pickup, held: 'yes' } })),
+    ).toEqual(base);
+  });
+
   it('is unaffected by the payment-pending marker', () => {
     expect(
       readPlacedOrder(
