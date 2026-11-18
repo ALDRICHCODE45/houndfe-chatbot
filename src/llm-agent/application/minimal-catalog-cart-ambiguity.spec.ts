@@ -1308,7 +1308,9 @@ describe('reported presentation-only confirmation after the full cart sequence',
   it.each([
     ['adjustCartItem', { delta: 1, quantityText: '500mg' }, 'one'],
     ['adjustCartItem', { delta: 1, quantityText: null }, 'one'],
-    ['adjustCartItem', { delta: 500, quantityText: '500mg' }, 'ask'],
+    // odd/tasks/presentation-pick-grounding.md S2: the presentation's own
+    // number proposed as the count, with no count said, is a one-unit pick.
+    ['adjustCartItem', { delta: 500, quantityText: '500mg' }, 'one'],
     ['adjustCartItem', { delta: 2, quantityText: null }, 'ask'],
     ['setCartItem', { quantity: 0, quantityText: null }, 'ask'],
   ])(

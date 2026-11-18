@@ -14,7 +14,11 @@
  *     "agréguela", "agrégamelos"), singular or plural.
  *   - `offersCartAdd`: the bot's previous message asked whether to add.
  *   - `nameCoverage` / `mentionsPhrase`: whether a server-owned product or
- *     presentation label appears in a text.
+ *     phrase appears in a text.
+ *   - `presentationMentions` / `countOutsidePresentations`: which
+ *     presentation a customer names in natural words («la caja de 12
+ *     sobres», «la de 12», «el sobre») and the counts left once those
+ *     presentation numbers are set aside.
  *   - `distinctiveMatches`: which of several shown products the customer's
  *     words single out (a word or presentation only that product has).
  *   - `asksCartChoice` / `requestsCartChange`: the bot asked which product or
@@ -251,14 +255,23 @@ export function presentationPickForm(
   if (/[?¿]/.test(text)) return null;
   const words = cartWords(text).map(fold);
   if (words.some((word) => NEGATION_TOKENS.has(word))) return null;
-  const needle = cartWords(label).map(fold);
-  const at = words.findIndex((_, index) =>
-    needle.every((part, offset) => words[index + offset] === part),
-  );
-  if (at === -1) return null;
-  // «los de 2 kg» / «las de 7 piezas» ask for several: the count is asked.
+  const [mention] = presentationMentions(text, [label], true);
+  if (mention === undefined) return null;
+  const at = mention.at;
+  // «los de 2 kg» / «las de 7 piezas» / «las cajas de 12 sobres» ask for
+  // several: the count is asked.
   const article = words[at - 1] === 'de' ? words[at - 2] : words[at - 1];
   if (article === 'los' || article === 'las') return null;
+  // Without a singular article, a plural head word («cajas de 12 sobres»)
+  // asks for several too.
+  const head = cartWords(text)[at];
+  if (
+    article !== 'la' &&
+    article !== 'el' &&
+    UNIT_SPELLINGS[head] === undefined &&
+    fold(head) !== head
+  )
+    return null;
   return words.some((word) => WANT_WORDS.has(word)) ||
     offersCartChoice(previousAssistantText)
     ? 'singular'
@@ -267,6 +280,153 @@ export function presentationPickForm(
 
 const fold = (word: string) =>
   word.length > 4 && word.endsWith('s') ? word.slice(0, -1) : word;
+
+/**
+ * Connector words a customer puts inside a presentation name («la caja de 12
+ * sobres» for «Caja 12 sobres»); they never distinguish a presentation.
+ */
+const PRESENTATION_CONNECTORS: ReadonlySet<string> = new Set([
+  'de',
+  'del',
+  'la',
+  'el',
+  'los',
+  'las',
+]);
+
+/** Articles that open a short presentation reference («la de 12», «el sobre»). */
+const PRESENTATION_ARTICLES: ReadonlySet<string> = new Set([
+  'la',
+  'el',
+  'los',
+  'las',
+]);
+
+/** Unit spellings folded to one form (g/gr/gramos, kg/kilo/kilos…). */
+const UNIT_SPELLINGS: Readonly<Record<string, string>> = {
+  gr: 'g',
+  grs: 'g',
+  gramo: 'g',
+  gramos: 'g',
+  kilo: 'kg',
+  kilos: 'kg',
+  kilogramo: 'kg',
+  kilogramos: 'kg',
+  kgs: 'kg',
+  mililitro: 'ml',
+  mililitros: 'ml',
+  lt: 'l',
+  lts: 'l',
+  litro: 'l',
+  litros: 'l',
+  pz: 'pieza',
+  pza: 'pieza',
+  pzas: 'pieza',
+  pzs: 'pieza',
+};
+
+const presentationWord = (word: string): string =>
+  UNIT_SPELLINGS[word] ?? fold(word);
+
+/** A label's words without connectors, units and plurals folded. */
+function presentationWords(label: string): string[] {
+  return cartWords(label)
+    .filter((word) => !PRESENTATION_CONNECTORS.has(word))
+    .map(presentationWord);
+}
+
+/** One presentation found in a text and the word index it starts at. */
+export type PresentationMention = { index: number; at: number };
+
+/**
+ * Which of a product's presentation `labels` the text names (presentation
+ * pick grounding, S2). Matching ignores connector words, accents, case,
+ * singular/plural and unit spellings: «la caja de 12 sobres» names «Caja 12
+ * sobres», «el sobre de 85 gramos» names «Sobre 85 g». When no label is named
+ * in full and `short` is set, a short reference after an article also names
+ * one: its head word («el sobre» → «Sobre 85 g») or its number, with the
+ * label's next word if any («la de 12» → «Caja 12 sobres»). Every match is
+ * returned; the caller treats several as ambiguous.
+ */
+export function presentationMentions(
+  text: string,
+  labels: readonly string[],
+  short = false,
+): PresentationMention[] {
+  const words = cartWords(text).map(presentationWord);
+  // Content words with their original index, connectors dropped.
+  const content = words
+    .map((word, index) => ({ word, index }))
+    .filter(({ word }) => !PRESENTATION_CONNECTORS.has(word));
+  const needles = labels.map(presentationWords);
+  const full = needles.flatMap((needle, index) => {
+    if (needle.length === 0) return [];
+    const start = content.findIndex((_, from) =>
+      needle.every((part, offset) => content[from + offset]?.word === part),
+    );
+    return start === -1 ? [] : [{ index, at: content[start].index }];
+  });
+  if (full.length > 0 || !short) return full;
+  const found = new Map<number, number>();
+  words.forEach((word, at) => {
+    if (!PRESENTATION_ARTICLES.has(word)) return;
+    let from = at + 1;
+    if (words[from] === 'de') from += 1;
+    const run: string[] = [];
+    for (
+      let cursor = from;
+      cursor < words.length && !PRESENTATION_CONNECTORS.has(words[cursor]);
+      cursor += 1
+    )
+      run.push(words[cursor]);
+    if (run.length === 0) return;
+    needles.forEach((needle, index) => {
+      if (needle.length === 0 || found.has(index)) return;
+      const byHead = run[0] === needle[0] && !/^\d+$/.test(run[0]);
+      const number = /^\d+$/.test(run[0]) ? needle.indexOf(run[0]) : -1;
+      const byNumber =
+        number !== -1 && (run.length === 1 || run[1] === needle[number + 1]);
+      if (byHead || byNumber) found.set(index, at + 1);
+    });
+  });
+  return [...found].map(([index, at]) => ({ index, at }));
+}
+
+/**
+ * The unit counts the customer stated, leaving out numbers that name a
+ * presentation: a number followed by a measurement unit, by the word that
+ * follows it in one of the `labels` («12 sobres»), or closing a short
+ * reference («la de 12»). Several counts are ambiguous.
+ */
+export function countOutsidePresentations(
+  text: string,
+  labels: readonly string[],
+): StatedUnitCount {
+  const words = cartWords(text);
+  const folded = words.map(presentationWord);
+  const needles = labels.map(presentationWords);
+  const roles = new Set<number>();
+  folded.forEach((word, index) => {
+    if (!/^\d+$/.test(word)) return;
+    let next = index + 1;
+    while (PRESENTATION_CONNECTORS.has(folded[next] ?? '')) next += 1;
+    const followed = needles.some((needle) => {
+      const at = needle.indexOf(word);
+      return (
+        at !== -1 &&
+        needle[at + 1] !== undefined &&
+        needle[at + 1] === folded[next]
+      );
+    });
+    const closesReference =
+      folded[index - 1] === 'de' &&
+      PRESENTATION_ARTICLES.has(folded[index - 2] ?? '') &&
+      needles.some((needle) => needle.includes(word));
+    if (followed || closesReference) roles.add(index);
+  });
+  const kept = words.filter((_, index) => !roles.has(index)).join(' ');
+  return statedUnitCount(kept);
+}
 
 /** Share (0..1) of a product name's significant words present in `text`. */
 export function nameCoverage(text: string, name: string): number {
@@ -330,7 +490,7 @@ export function distinctiveMatches(
       (label, at) =>
         labels[index][at].length > 0 &&
         !otherLabels.has(labels[index][at]) &&
-        mentionsPhrase(text, label),
+        presentationMentions(text, [label], true).length > 0,
     );
     return byWord || byLabel ? [index] : [];
   });

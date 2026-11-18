@@ -30,9 +30,11 @@ import {
   asksCartChoice,
   cartWords,
   conversationalAddForm,
+  countOutsidePresentations,
   distinctiveMatches,
   mentionsPhrase,
   nameCoverage,
+  presentationMentions,
   presentationPickForm,
   requestsCartAction,
   requestsCartChange,
@@ -282,7 +284,18 @@ export class MinimalCartConversation {
   ): CartGrounding {
     const strict = this.groundStrict(selection, proposal);
     let result: CartGrounding;
-    if (strict.kind === 'ready') {
+    if (strict.kind === 'ready' && this.presentationNumberAsCount(strict)) {
+      // Presentation pick grounding (S2): a cited number that only names a
+      // presentation («la de 12», «12 sobres») is never the count; read the
+      // pick conversationally, or ask the count.
+      result = this.rescue(selection, proposal, cartLines) ?? {
+        kind: 'quantity_required',
+        intent: {
+          productId: selection.productId,
+          operation: proposal.operation,
+        },
+      };
+    } else if (strict.kind === 'ready') {
       result = {
         kind: 'ready',
         intent: strict.intent,
@@ -415,6 +428,15 @@ export class MinimalCartConversation {
         conversationalAddForm(this.text, this.dialogue.previousAssistantText) ??
         this.answeredChoiceForm(selection.productId) ??
         this.presentationPick(selection.productId);
+      // A model number that is the picked presentation's own number («12»
+      // of «Caja 12 sobres») is not a count the customer said: one unit.
+      const proposed =
+        proposal.quantity !== null &&
+        this.pickedPresentationNumbers(selection.productId).has(
+          String(Math.abs(proposal.quantity)),
+        )
+          ? null
+          : proposal.quantity;
       if (
         pending !== null &&
         pending.productId === selection.productId &&
@@ -422,11 +444,7 @@ export class MinimalCartConversation {
         pending.quantity > 0 &&
         (pending.operation === 'add' || pending.operation === 'set')
       ) {
-        if (
-          proposal.quantity !== null &&
-          proposal.quantity !== pending.quantity
-        )
-          return null;
+        if (proposed !== null && proposed !== pending.quantity) return null;
         operation = pending.operation;
         quantity = pending.quantity;
       } else if (form === null) {
@@ -435,10 +453,7 @@ export class MinimalCartConversation {
         operation = 'add';
         // A countless singular request is one unit; a plural one or a model
         // number the customer never said asks for the count instead.
-        if (
-          form === 'singular' &&
-          (proposal.quantity === null || proposal.quantity === 1)
-        ) {
+        if (form === 'singular' && (proposed === null || proposed === 1)) {
           quantity = 1;
           defaulted = true;
         }
@@ -582,9 +597,7 @@ export class MinimalCartConversation {
    * that is one unit, like a countless «agrégalo». `null` otherwise.
    */
   private presentationPick(productId: string): 'singular' | null {
-    const named = this.variantsOf(productId)
-      .map(presentationLabel)
-      .filter((label) => label.length > 0 && mentionsPhrase(this.text, label));
+    const named = this.namedLabels(productId, this.text);
     return named.length === 1
       ? presentationPickForm(
           this.text,
@@ -592,6 +605,53 @@ export class MinimalCartConversation {
           this.dialogue.previousAssistantText,
         )
       : null;
+  }
+
+  /**
+   * Presentation labels of the product a customer text names, tolerant to
+   * connector words, plurals and unit spellings («la caja de 12 sobres»), with
+   * short references («la de 12», «el sobre») when none is named in full.
+   */
+  private namedLabels(productId: string, text: string): string[] {
+    const labels = this.variantsOf(productId)
+      .map(presentationLabel)
+      .filter((label) => label.length > 0);
+    return presentationMentions(text, labels, true).map(
+      ({ index }) => labels[index],
+    );
+  }
+
+  /** Digits of the one presentation the current text picks, if any. */
+  private pickedPresentationNumbers(productId: string): Set<string> {
+    const named = this.namedLabels(productId, this.text);
+    return new Set(
+      named.length === 1
+        ? cartWords(named[0]).filter((word) => /^\d+$/.test(word))
+        : [],
+    );
+  }
+
+  /**
+   * True when a strictly grounded count is only a number that names one of
+   * the product's presentations in the current text («la de 12», «12
+   * sobres»): the customer stated no count of their own equal to it.
+   */
+  private presentationNumberAsCount(
+    strict: Extract<CartQuantityGroundingResult, { kind: 'ready' }>,
+  ): boolean {
+    const quantity = strict.intent.quantity;
+    if (quantity === undefined || quantity <= 0) return false;
+    const labels = this.variantsOf(strict.intent.productId)
+      .map(presentationLabel)
+      .filter((label) => label.length > 0);
+    const numbers = new Set(
+      labels.flatMap((label) =>
+        cartWords(label).filter((word) => /^\d+$/.test(word)),
+      ),
+    );
+    if (!numbers.has(String(quantity))) return false;
+    const count = countOutsidePresentations(this.text, labels);
+    return !(count.status === 'ok' && count.value === quantity);
   }
 
   /**
@@ -611,7 +671,8 @@ export class MinimalCartConversation {
         (entry) =>
           nameCoverage(this.text, entry.productName) >= NAME_COVERAGE ||
           (presentationLabel(entry).length > 0 &&
-            mentionsPhrase(this.text, presentationLabel(entry))),
+            presentationMentions(this.text, [presentationLabel(entry)], true)
+              .length > 0),
       )
     )
       return true;
@@ -658,11 +719,18 @@ export class MinimalCartConversation {
   ): ResolvedCartSelection | null {
     const variants = this.variantsOf(selection.productId);
     if (variants.length === 0) return null;
-    const namedIn = (text: string) =>
-      variants.filter((variant) => {
-        const label = presentationLabel(variant);
-        return label.length > 0 && mentionsPhrase(text, label);
-      });
+    // Customer words name a presentation tolerantly, short references
+    // included; the bot's own listing only by full label.
+    const namedIn = (text: string, short = true) => {
+      const labeled = variants.filter(
+        (variant) => presentationLabel(variant).length > 0,
+      );
+      return presentationMentions(
+        text,
+        labeled.map(presentationLabel),
+        short,
+      ).map(({ index }) => labeled[index]);
+    };
     const current = namedIn(this.text);
     if (current.length === 1) return current[0];
     if (current.length > 1) return null;
@@ -690,7 +758,7 @@ export class MinimalCartConversation {
         null
       );
     if (!includeShown) return null;
-    const shown = namedIn(this.dialogue.previousAssistantText ?? '');
+    const shown = namedIn(this.dialogue.previousAssistantText ?? '', false);
     return shown.length === 1 ? shown[0] : null;
   }
 

@@ -3799,7 +3799,22 @@ export class MinimalCatalogAgentService {
         description:
           'Consulta existencias por productId ya identificado en esta conversación. No acepta variantId.',
         inputSchema: z.strictObject({ productId: z.uuid() }),
-        execute: async ({ productId }) => {
+        execute: async ({ productId: requested }) => {
+          // Presentation pick grounding: the model may pass the id of a
+          // presentation it was shown («Caja 12 sobres»); a server-registered
+          // variant of an allowed product reads that product, never more.
+          const parent = allowedIds.has(requested)
+            ? undefined
+            : cartConversation
+                ?.snapshot()
+                .selections.find(
+                  (entry) =>
+                    entry.variantId === requested &&
+                    allowedIds.has(entry.productId),
+                )?.productId;
+          if (parent !== undefined)
+            trace('tool checkStock variant_id_mapped=product');
+          const productId = parent ?? requested;
           if (!allowedIds.has(productId)) {
             trace('tool checkStock result=denied code=unknown_product');
             return toolError('unknown_product');
