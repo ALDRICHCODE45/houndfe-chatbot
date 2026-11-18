@@ -1,0 +1,21 @@
+# Pay in store (pickup hold)
+
+Customers who pick up in store can choose to pay at the store; the order is held for a limited time and cancelled automatically if not paid. Backend branch `feat/pay-in-store-hold` (3 stages, NOT deployed yet). Chatbot branch `feat/pay-in-store` (worktree `../houndfe-chatbot-pay-in-store`). Engram `features/pay-in-store`.
+
+## Specs
+
+- **S1 — Owner (verbatim):** "quisiera que hubiera la posibilidad de pagar directamente en la tienda, peroo en ese caso el produco solo se aguanta cierto tiempo, si no vas a recogerlo y a pagar, entonces ya no se aguantan los productos ni la venta." Decisions: «por defecto 24hr pero se puede configurar desde el sistema por venta»; reminder «Sí, unas horas antes» (backend: 3 h before, none if the hold is shorter than 3 h); «Se cancela automáticamente» (backend: not when a payment or receipt is pending — staff is notified); «Todos los clientes».
+- **S2 — Feed tolerance (URGENT, before backend stage 3 deploys).** Backend contract change: feed items for sales carry `requestId: null` and a `saleId`; new types `sale.pickup_reminder` {saleId, folio, holdUntil, holdVersion, conversationRef|null}, `sale.pickup_expired` {saleId, folio, holdVersion, conversationRef|null}, `sale.pickup_extended` {saleId, folio, holdUntil, holdVersion, conversationRef|null}. Valid ACK outcomes for these: PROVIDER_ACCEPTED, DELIVERY_UNKNOWN, STALE (DEFERRED_* → 422). After a 410 the recovery response adds `saleUndeliveredResumeAfter`. Rule: the feed consumer parses these items without rejecting the page (requestId null allowed only for sale.* types; existing request.* items keep requiring requestId) and, until S3 is enabled, ACKs every sale.pickup_* item STALE with no customer message. Unknown sale.* types → STALE as well. The recovery field is accepted and ignored safely.
+- **S3 — Bot flow (behind `PAY_IN_STORE_ENABLED`, default false until the backend confirms deploy).** For pickup orders the payment question offers [Transferencia] and [Pagar en tienda]. Tapping «Pagar en tienda» calls PATCH /chatbot-api/sales/:saleId/payment-intent {"method":"IN_STORE"} (idempotent, scope sales:write) and replies «Listo, le apartamos su pedido {folio} hasta el {fecha y hora en hora de Ciudad de México}. Páselo a recoger y pagar en {tienda: nombre, dirección, horario}. Si no pasa antes de esa fecha, el pedido se cancela.» (tú styled). Errors: 409 PAY_IN_STORE_SALE_ALREADY_PAID → «Su pedido ya está pagado.»; other errors → fixed «No pude apartar su pedido en este momento; puede pagar por transferencia o intentarlo de nuevo en unos minutos.». Feed: sale.pickup_reminder → «Le recordamos que su pedido {folio} está apartado hasta hoy a las {hora}. Páselo a recoger y pagar en {tienda}.»; sale.pickup_expired → «Su pedido {folio} se canceló porque venció el plazo para recogerlo y pagarlo en tienda. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.»; sale.pickup_extended → «Le ampliamos el plazo de su pedido {folio}: ahora puede recogerlo y pagarlo hasta el {fecha y hora}.». ACK STALE when the item's holdVersion is below the current hold, the sale is paid or cancelled, there is no conversation, or the 24 h window is closed and no template exists; otherwise PROVIDER_ACCEPTED / DELIVERY_UNKNOWN per the existing delivery pattern. The paid-order and receipt-in-review rules keep priority (a paid order never shows [Pagar en tienda]).
+- **S4 — Evidence.** RED test per rule; existing feed tests green; docs updated; full suite before merge.
+
+## Tasks
+
+| ID  | Specs | Route                                  | Commit |
+| --- | ----- | -------------------------------------- | ------ |
+| T1  | S2    | worker: feed tolerance for sale.* items | |
+| T2  | S3    | worker: pay-in-store flow behind flag  | |
+
+## Log
+
+- **L1 (backend session, 2026-11-18):** contract above; "ANTES del deploy, tu consumidor tiene que aceptar requestId null y los tipos sale.pickup_*: si los rechaza por esquema, se traba el feed". Backend docs: docs/chatbot-handoff/pay-in-store-hold-bot-contract.md.
